@@ -270,6 +270,25 @@ async def lifespan(app: FastAPI):
         except Exception:
             log.exception("stale env activity write failed")
 
+    # Захваты, оставленные мёртвым процессом (#1195). Место — ДО поллера, и
+    # это не вкусовщина: первый же тик читает открытые заказы, и метка,
+    # снятая после него, стоила бы поколению ещё одного круга ожидания.
+    #
+    # Признак точный, а не «наверное»: процесс, который только что поднялся,
+    # не может иметь своих незавершённых вызовов к провайдеру, значит любая
+    # метка захвата в базе оставлена тем, кого больше нет.
+    #
+    # Best effort, как и соседний сигнал о мёртвых env: сигнал не имеет права
+    # уронить подъём. Но молчать нельзя — за меткой стоит, возможно,
+    # оплаченный агент, и лог здесь последняя инстанция, если событие лечь не
+    # смогло.
+    try:
+        from hub.services.steward_shadow import recover_dead_process_claims
+
+        await recover_dead_process_claims(app.state.db)
+    except Exception:
+        log.exception("steward claim recovery failed at startup")
+
     poll_task = start_poller(app)
 
     # Drive the MCP session manager lifespan inside ours so /mcp/* requests
