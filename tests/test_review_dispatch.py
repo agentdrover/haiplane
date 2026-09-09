@@ -7,9 +7,11 @@ report whose tokens disagree with the provider's usage is flagged.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import re
+from pathlib import Path
 
 import aiosqlite
 from httpx import AsyncClient
@@ -4018,3 +4020,221 @@ async def test_a_body_of_the_wrong_shape_is_not_an_empty_answer(
     )
     alerts = " ".join(dict(r)["content"] for r in rows)
     assert "СПРОСИТЬ" in alerts, "состояние названо как есть, а не как пустота"
+
+
+# --- #1208: документ выката и охват стражей песочницы -------------------------
+#
+# Найдено ВЫКАТОМ 08.09.2026, а не чтением: развёртывание локального ревьюера
+# по собственному документу #1180 остановилось четырежды. Имена настроек в
+# документе стояли без префикса HAIPLANE_, который подставляет config.env_get,
+# — и это не ломало запуск, а МОЛЧА выключало локальный путь. Рекомендованная
+# строка systemd-run --uid= от непривилегированного хаба не запускалась вовсе.
+# А стражи знали ровно ту форму записи, которой на рабочей конфигурации нет.
+
+_HUB_ROOT = Path(__file__).resolve().parents[1]
+_CONFIG_SOURCE = _HUB_ROOT / "hub/config.py"
+_DEPLOY_DOC = _HUB_ROOT / "deploy/LOCAL-REVIEW.md"
+_ENV_EXAMPLE = _HUB_ROOT / "deploy/local-hub.env.example"
+
+# Строка вида ``Environment=ИМЯ=…``, ``# ИМЯ=…`` или просто ``ИМЯ=…`` — то, что
+# оператор КОПИРУЕТ к себе. Именно она и разошлась с кодом.
+_ASSIGNED = re.compile(r"^\s*(?:#\s*)?(?:Environment=)?([A-Z][A-Z0-9_]*)=")
+# Имя настройки локального ревьюера БЕЗ префикса: \b не срабатывает внутри
+# HAIPLANE_LOCAL_REVIEW…, поэтому лишний lookbehind не нужен.
+_BARE_NAME = re.compile(r"\bLOCAL_REVIEW[A-Z0-9_]*")
+
+
+def _suffixes_read_by_config() -> set[str]:
+    """Суффиксы env_get(...) из ИСХОДНИКА hub/config.py, а не из списка в тесте.
+
+    Список имён, переписанный в тест, — третье описание тех же имён, и оно
+    разойдётся следующим ровно так же, как разошёлся документ.
+    """
+    tree = ast.parse(_CONFIG_SOURCE.read_text())
+    found = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id != "env_get" or not node.args:
+            continue
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            found.add(arg.value)
+    return {name for name in found if name.startswith("LOCAL_REVIEW")}
+
+
+def _names_assigned_in(path: Path) -> set[str]:
+    return {
+        m.group(1)
+        for line in path.read_text().splitlines()
+        if (m := _ASSIGNED.match(line)) and "LOCAL_REVIEW" in m.group(1)
+    }
+
+
+def test_the_deploy_doc_names_the_settings_the_code_reads() -> None:
+    """AC-1: имена в документе сверяются С ИСХОДНИКОМ машиной, а не глазами.
+
+    Расхождение уже случилось один раз и было незаметным ровно потому, что
+    глазами оно не ловится: HAIPLANE_HUB_HOST двумя строками выше в том же
+    файле выглядит так же убедительно, как LOCAL_REVIEW_CMD без префикса.
+    """
+    read_by_code = _suffixes_read_by_config()
+    assert read_by_code, (
+        "разбор hub/config.py не нашёл ни одного env_get с именем "
+        "LOCAL_REVIEW* — сверка была бы пустой и зелёной на любом документе"
+    )
+    expected = {config.brand.ENV_PREFIX + suffix for suffix in read_by_code}
+
+    for path in (_DEPLOY_DOC, _ENV_EXAMPLE):
+        named = _names_assigned_in(path)
+        assert named == expected, (
+            f"{path.name} называет настройки локального ревьюера как "
+            f"{sorted(named)}, а код читает {sorted(expected)}. Разница в "
+            "префиксе не ломает запуск, а МОЛЧА выключает локальный путь: в "
+            "карточке встанет «локальный не настроен» при верной во всём "
+            "остальном конфигурации (найдено выкатом 08.09.2026, #1208)"
+        )
+
+    # Ни одного упоминания без префикса — включая прозу: оператор, который
+    # грепает по имени из текста, обязан найти то же самое имя.
+    for path in (_DEPLOY_DOC, _ENV_EXAMPLE):
+        bare = _BARE_NAME.findall(path.read_text())
+        assert not bare, (
+            f"{path.name} упоминает {sorted(set(bare))} без префикса "
+            f"{config.brand.ENV_PREFIX} — а config.env_get читает только с ним"
+        )
+
+
+def test_the_guard_reads_the_sudo_form_of_the_sandbox_user(monkeypatch) -> None:
+    """AC-2: форма sudo видна стражу так же, как --uid= от systemd-run.
+
+    Рабочий рецепт выката использует ``sudo -n -u haiplane-reviewer``, а
+    страж знал только ``--uid``. Он возвращал пустую строку, и проверка
+    членства в группе каталога прогонов (заведённая ради находки ревью
+    45971e09) на этой конфигурации не срабатывала ВОВСЕ — то есть создавала
+    впечатление проверки там, где её нет.
+    """
+    cases = {
+        # Новые формы sudo — то, чем песочницу настраивают на самом деле.
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run": "haiplane-reviewer",
+        "/usr/bin/sudo -n --user haiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
+        "/usr/bin/sudo -n --user=haiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
+        "sudo -u 1234 /usr/local/bin/wrap": "1234",
+        # Старая форма НЕ сломана — иначе починено одно ценой другого.
+        "/usr/bin/systemd-run --scope --uid=haiplane-reviewer --": "haiplane-reviewer",
+        "/usr/bin/systemd-run --scope --uid haiplane-reviewer --": "haiplane-reviewer",
+        "/usr/bin/systemd-run --scope --uid=65534 --": "65534",
+        # --user за podman/docker — пользователь ВНУТРИ контейнера, а не на
+        # хосте: принять его за хостового значило бы проверить членство в
+        # группе каталога совсем не того пользователя.
+        "/usr/bin/podman run --rm -i --timeout 60 --user 1000 img": "",
+        "/usr/bin/docker run --user haiplane-reviewer img": "",
+        # Хостовый пользователь назван до контейнера — его и берём.
+        "sudo -u haiplane-reviewer podman run --timeout 60 --user 1000 img": "haiplane-reviewer",
+        # А вот здесь sudo хостового пользователя НЕ называет, и --user за
+        # podman — единственный на строке. Принять его значило бы проверить
+        # членство в группе каталога у пользователя другой машины.
+        "sudo -n /usr/local/bin/wrap podman run --timeout 60 --user 1000 img": "",
+        "sudo -n /usr/local/bin/wrap docker run --user haiplane-reviewer img": "",
+        # Обёртка, о которой страж ничего не знает, пропускается молча — это
+        # сказано в документе прямым требованием к обёртке.
+        "/usr/bin/env": "",
+        "": "",
+    }
+    for sandbox, expected in cases.items():
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_uid() == expected, (
+            f"песочница «{sandbox}» называет пользователя «{expected}», а "
+            f"страж вернул «{local_reviewer.sandbox_uid()}»: пустая строка "
+            "здесь означает, что проверка группы каталога прогонов молча не "
+            "сработает вовсе"
+        )
+
+
+def test_a_container_launch_without_its_own_deadline_is_refused(monkeypatch) -> None:
+    """AC-3: контейнер без собственного срока жизни отвергнут ПО ИМЕНИ ФЛАГА.
+
+    Требование «прямой потомок хаба» для контейнеров недостижимо: измерено
+    08.09.2026 — podman run переживает kill -KILL по группе, через 7 с
+    контейнер «Up», потому что conmon отсоединён от клиента намеренно. Зато
+    с --timeout 5 контейнер умирает сам (через 12 с живых нет). Поэтому
+    правило звучит «потомок ИЛИ свой срок жизни», а отказ обязан называть
+    НЕДОСТАЮЩИЙ ФЛАГ, а не «песочница неверна».
+    """
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/podman run --rm -i img"
+    )
+    reasons = local_reviewer.detaching_sandbox()
+    assert reasons and all("--timeout" in r for r in reasons), (
+        f"podman run без своего срока жизни обязан назвать --timeout: {reasons}"
+    )
+
+    for ok in (
+        "/usr/bin/podman run --rm -i --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout=1800 img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", ok)
+        assert local_reviewer.detaching_sandbox() == [], (
+            f"«{ok}» имеет собственный срок жизни и отвергаться не должен"
+        )
+
+    # У docker штатного аналога --timeout нет вовсе, поэтому честнее назвать
+    # неподходящим весь запуск — и сказать, чем его заменить.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/docker run --rm -i --timeout 60 img"
+    )
+    reasons = local_reviewer.detaching_sandbox()
+    assert reasons and any("docker" in r and "podman" in r for r in reasons), (
+        f"docker run обязан быть отвергнут с названной заменой: {reasons}"
+    )
+
+    # Старое требование не ослаблено: systemd-run без --scope — прежний отказ.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/systemd-run --quiet --pipe --uid=x --"
+    )
+    reasons = local_reviewer.detaching_sandbox()
+    assert reasons and all("--scope" in r for r in reasons), (
+        f"systemd-run без --scope остаётся отказом: {reasons}"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/systemd-run --scope --uid=x --"
+    )
+    assert local_reviewer.detaching_sandbox() == []
+
+    # ``podman ps`` — не запуск контейнера, и судить о нём нечего.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/podman ps")
+    assert local_reviewer.detaching_sandbox() == []
+
+
+def test_the_doc_recommends_only_sandboxes_the_hub_accepts(monkeypatch) -> None:
+    """AC-4: строки песочницы ИЗ ДОКУМЕНТА прогоняются через самих стражей.
+
+    Документ, рекомендующий то, что хаб сам же отклонит, хуже отсутствующего.
+    Строки берутся из файлов, а не переписываются сюда: переписанная строка
+    проверяла бы тест, а не документ.
+    """
+    key = config.brand.ENV_PREFIX + "LOCAL_REVIEW_SANDBOX"
+    # Значение — всё после первого '<ИМЯ>=' в строке.
+    recommended = [
+        line.split(key + "=", 1)[1]
+        for path in (_DEPLOY_DOC, _ENV_EXAMPLE)
+        for line in path.read_text().splitlines()
+        if key + "=" in line
+    ]
+    assert len(recommended) >= 2, (
+        "в документе и примере окружения не нашлось рекомендованных строк "
+        f"{key}= — проверка была бы пустой и зелёной при любом их содержании"
+    )
+
+    for sandbox in recommended:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.detaching_sandbox() == [], (
+            f"документ рекомендует «{sandbox}», а хаб её отвергает: "
+            f"{local_reviewer.detaching_sandbox()}"
+        )
+        assert local_reviewer.sandbox_uid(), (
+            f"в рекомендованной строке «{sandbox}» страж не видит "
+            "пользователя — значит проверка его членства в группе каталога "
+            "прогонов на этой конфигурации молча не сработает вовсе, ровно "
+            "как было до #1208"
+        )
