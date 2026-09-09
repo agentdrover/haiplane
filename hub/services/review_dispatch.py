@@ -1072,6 +1072,85 @@ async def _policy_and_novelty_allow(
     return not await _this_code_was_already_read(db, task)
 
 
+#: Метка записи об отсутствующем ревьюере, по которой она находится снова.
+#: Внутри — номер поколения сдачи: дедуп обязан быть в его пределах, иначе
+#: одна запись за всю жизнь задачи молчала бы про каждую следующую сдачу
+#: (ровно так #443 пролежала неделю). Образец — stale_rung_raised: ключ
+#: разбирается из текста, а не хранится второй колонкой.
+NO_REVIEWER_MARK = "[без ревьюера: сдача {generation}]"
+
+
+async def _name_the_missing_reviewer(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    project: Any,
+) -> bool:
+    """Сказать в карточке, что второго читателя не будет, и почему. Всегда False.
+
+    #1216, измерено на #1202: проект snip-portal (форж gitverse, gate_policy
+    без ключа review) сдавался дважды, и обе сдачи встали в review без единой
+    записи про диспетч. Отказ по политике стоит РАНЬШЕ развилки по форжу, где
+    #1180 научила хаб называть причину, — то есть механизм именованного отказа
+    построен, а управление до него не доходит.
+
+    Отказ остаётся отказом: политика по-прежнему имеет право не звать
+    ревьюера, и диспетч здесь не включается. Меняется только одно — карточка
+    больше не выдаёт «не позвали» за «не потребовалось».
+
+    Причина складывается из двух, и они разного рода. Первая — политика: про
+    неё review_reach не знает ничего, и она пишется своими словами. Вторая —
+    досягаемость канала, и вот её текст берётся у review_reach целиком, слово
+    в слово с тем, что человек видит в форме проекта и в отказе на записи
+    политики (#1188). Второй копии этого знания не заводим.
+    """
+    if review_dispatch_enabled(gate_policy_of(project)):
+        # Отказала не политика, а проверка новизны: код уже читали, и она
+        # говорит об этом сама (#1152). Накрывать её вторым алертом значило бы
+        # объяснить одно состояние двумя разными причинами.
+        return False
+    task_id = int(task["id"])
+    generation = int(task.get("submission_generation") or 0)
+    mark = NO_REVIEWER_MARK.format(generation=generation)
+    if await _already_told_about_the_missing_reviewer(db, task_id, mark):
+        return False
+    reach = await review_reach(db, project_policy.forge_of(project))
+    # Досягаемость канала добирается только когда её нет: на github с
+    # выключенной политикой человеку достаточно знать, что дело в политике —
+    # включит, и ревьюер придёт.
+    channel = "" if reach.runnable else f" К тому же {reach.reason}."
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Машинное ревью НЕ вызвано: политика проекта не просит диспетча "
+        f"(ключ review в gate_policy), поэтому второго читателя у этой сдачи "
+        f"не будет.{channel} Вердикт остаётся человеку — и он выносится без "
+        f"машинного отчёта (#757, #1216). {mark}",
+    )
+    await db.commit()
+    log.info(
+        "task #%s gen %s stands in review with no reviewer: policy does not "
+        "ask for a dispatch",
+        task_id,
+        generation,
+    )
+    return False
+
+
+async def _already_told_about_the_missing_reviewer(
+    db: aiosqlite.Connection, task_id: int, mark: str
+) -> bool:
+    """Была ли запись про ЭТУ сдачу. Свип ходит по карточке снова и снова."""
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM task_updates WHERE task_id=? AND kind='alert' "
+        "AND content LIKE ? LIMIT 1",
+        (task_id, f"%{mark}%"),
+    )
+    return bool(rows)
+
+
 async def _this_code_was_already_read(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> bool:
@@ -1515,7 +1594,11 @@ async def maybe_dispatch_review(
     if project is None:
         return False
     if not await _policy_and_novelty_allow(db, task, project, force_profile):
-        return False
+        # #1216: тихий отказ по политике перестаёт быть тихим. Помощник сам
+        # разбирает, КТО отказал: у проверки новизны своя запись, и вторую
+        # писать поверх неё нечего. Строка остаётся одной — функция стоит на
+        # потолке в 60 операторов, и он тут верен.
+        return await _name_the_missing_reviewer(db, task, project)
 
     gh_repo = (dict(project).get("repo") or "").strip()
 
