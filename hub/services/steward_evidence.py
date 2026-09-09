@@ -808,3 +808,280 @@ def pinned_generation(identity: Any, task: dict[str, Any], asked: int | None) ->
             detail=steward_stale_pin_detail(task_id, pin, current),
         )
     return pin
+
+
+# ---------------------------------------------------------------------------
+# Тот же пакет, собранный по истории (#1167)
+# ---------------------------------------------------------------------------
+#
+# Всё выше собирает пакет о ЖИВОЙ сдаче: ветка на месте, отчёт последний,
+# база отвечает по сети. По завершённой сдаче ни одно из этих условий не
+# держится, и главное — ветки нет. ``_tip_fact`` идёт в ``resolve_branch_tip``
+# по ИМЕНИ ветки, ``_surface_fact`` — по диффу той же ветки; после мержа и
+# уборки обе вернут ``absent``, а absent по здешней конвенции означает
+# эскалацию. Историческая выборка, собранная наивно, состояла бы из
+# эскалаций-артефактов и мерила бы уборку веток, а не политику.
+#
+# Поэтому здесь всё восстанавливается по ``submission_sha``: коммит переживает
+# удаление ветки, и `git diff base...<sha>` отвечает ровно про ту сдачу,
+# которую судили. Сдача, чей sha больше не резолвится, из корпуса ВЫБЫВАЕТ с
+# названной причиной — не входит в него с пустыми фактами.
+#
+# И второе, дороже первого: ПАКЕТ НЕ СМЕЕТ СОДЕРЖАТЬ БУДУЩЕЕ. Живой сборщик
+# кладёт в пакет брифинг, а брифинг несёт ``latest_review`` — человеческий
+# вердикт. Реплей над таким пакетом мерил бы способность списать ответ, и
+# мерил бы её на отлично. Поэтому у исторического пакета есть РУБЕЖ, каждый
+# прочитанный источник едет с отметкой времени, и строка не старше рубежа
+# роняет сборку — а не молча в неё попадает.
+#
+# Рубеж — момент ЧЕЛОВЕЧЕСКОГО ВЕРДИКТА, а не самой сдачи, и это осознанно:
+# между сдачей и вердиктом ложатся отчёт харнесса и прогон CI, то есть ровно
+# то, на что смотрит гейт. Пакет по состоянию «на сдачу» не содержал бы
+# отчёта и мерил бы политику без её главного входа. Рубеж на вердикте
+# означает: судье показывают то же, что лежало на столе у человека, и ни
+# строкой больше.
+
+HISTORICAL_NO_SHA = "no_submission_sha"
+HISTORICAL_SHA_UNRESOLVED = "sha_unresolved"
+HISTORICAL_NO_WORKSPACE = "no_workspace"
+HISTORICAL_DIFF_UNREADABLE = "historical_diff_unreadable"
+# Факты, которые сегодняшнее состояние мира восстановить не может в принципе:
+# локаторы разрешаются против нынешнего дерева, база живёт сейчас, а зависимости
+# давно доставлены. Каждый — честная дыра, а не выдуманное значение.
+NOT_RECONSTRUCTIBLE = "not_reconstructible"
+
+#: Источники, которые читает детерминированная лестница (gate_grounds.decide).
+#: Перечень публичный, потому что по нему считается доля восстановленного:
+#: «пакет собрался» и «в пакете есть то, по чему решают» — разные утверждения.
+DECIDABLE_SOURCES: tuple[str, ...] = (
+    "machine_review_report",
+    "ci_pinned_sha",
+    "branch_tip",
+    "diff_vs_areas",
+    "risk_class",
+)
+
+
+class CorpusExclusion(Exception):
+    """Эта сдача в корпус не входит, и вот почему.
+
+    Исключение, а не ``None``: причина обязана доехать до отчёта поимённо.
+    Доля исключённых — условие пересмотра всей задачи, и посчитать её можно
+    только если каждый отказ назвал себя.
+    """
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+        self.detail = detail
+
+
+class PacketLeak(Exception):
+    """В пакет попало то, чего на рубеже ещё не было.
+
+    Громко и без права на продолжение. Тихая склейка здесь означала бы
+    реплей, который списывает ответ у человека, и отчёт с прекрасными
+    числами, не значащими ничего.
+    """
+
+    def __init__(self, source: str, stamp: str, cutoff: str) -> None:
+        super().__init__(
+            f"утечка будущего: источник {source!r} записан {stamp!r}, "
+            f"рубеж пакета {cutoff!r}"
+        )
+        self.source = source
+        self.stamp = stamp
+        self.cutoff = cutoff
+
+
+def _stamp(value: Any) -> str:
+    """Отметку времени — к одному написанию, чтобы сравнение было сравнением.
+
+    SQLite пишет ``datetime('now')`` как ``YYYY-MM-DD HH:MM:SS``, а часть
+    полей приезжает в ISO с ``T`` и хвостом зоны. Строки сравниваются
+    лексикографически, поэтому одна и та же секунда в двух написаниях
+    сравнилась бы неверно — и сторож утечки промолчал бы там, где должен
+    кричать.
+    """
+    text = str(value or "").strip().replace("T", " ")
+    for suffix in ("Z", "+00:00"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+    return text.strip()
+
+
+def assert_within(cutoff: str, provenance: list[tuple[str, str]]) -> None:
+    """Ни одна прочитанная строка не моложе рубежа. Иначе — PacketLeak.
+
+    Рубеж исключающий: строка, записанная В ТУ ЖЕ секунду, что и вердикт,
+    могла быть его следствием, и различить это по метке в секундах нельзя.
+    Спорную секунду отдаём в сторону отказа — это дешевле, чем пакет, про
+    который потом нельзя сказать, знал он ответ или нет.
+    """
+    edge = _stamp(cutoff)
+    if not edge:
+        raise PacketLeak("cutoff", "", "")
+    for source, raw in provenance:
+        stamp = _stamp(raw)
+        if stamp and stamp >= edge:
+            raise PacketLeak(source, stamp, edge)
+
+
+async def _historical_report_fact(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> tuple[EvidenceFact, list[tuple[str, str]]]:
+    """Отчёт этой генерации плюс отметка времени для сторожа."""
+    fact = await _report_fact(db, task_id, generation)
+    if fact.is_absent:
+        return fact, []
+    row = await repo.get_latest_machine_review(db, task_id)
+    created = dict(row).get("created_at") if row is not None else ""
+    return fact, [("machine_review_report", created or "")]
+
+
+def _historical_tip_fact(pinned_sha: str) -> EvidenceFact:
+    """Вершина, восстановленная из коммита, — и честно названная таковой.
+
+    Ветки нет, поэтому вопрос «уехала ли вершина после сдачи» исторически
+    НЕНАБЛЮДАЕМ. Здесь он не подменяется нулём и не выдаётся за наблюдение:
+    ``moved`` равно False потому, что предметом суждения был именно этот
+    коммит, а ``observed`` равно False потому, что посмотреть было некуда.
+    Реплей, который захочет считать иначе, увидит оба поля.
+    """
+    return present(
+        "branch_tip",
+        f"вершина восстановлена из закреплённого коммита {pinned_sha[:12]}: "
+        "ветка удалена после мержа, движение вершины исторически ненаблюдаемо",
+        tip=pinned_sha,
+        pinned_sha=pinned_sha,
+        moved=False,
+        reconstructed=True,
+        observed=False,
+    )
+
+
+async def build_historical_packet(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    cutoff: str,
+) -> EvidencePacket:
+    """Пакет завершённой сдачи, восстановленный по sha и обрезанный рубежом.
+
+    Поднимает :class:`CorpusExclusion`, когда сдачу восстановить нечем, и
+    :class:`PacketLeak`, когда в неё попало будущее. Ни одного ``None``: обе
+    ситуации обязаны доехать до отчёта с причиной, а не раствориться в
+    пустом ответе.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.orchestration import project_git_context
+
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        raise CorpusExclusion("no_task", f"задачи #{task_id} нет")
+    task = dict(row)
+    pinned_sha = (task.get("submission_sha") or "").strip()
+    if not pinned_sha:
+        raise CorpusExclusion(HISTORICAL_NO_SHA, "сдача не закрепила коммит")
+
+    ctx = await project_git_context(db, task_id)
+    workspace = (ctx.get("repo") or "").strip()
+    if not workspace:
+        raise CorpusExclusion(
+            HISTORICAL_NO_WORKSPACE, "у проекта нет клона, из которого смотреть"
+        )
+    exists = await plugins.git_ops.commit_exists(workspace, pinned_sha)
+    if exists is None:
+        raise CorpusExclusion(HISTORICAL_NO_WORKSPACE, f"клон {workspace} не прочитать")
+    if not exists:
+        raise CorpusExclusion(
+            HISTORICAL_SHA_UNRESOLVED,
+            f"коммит {pinned_sha[:12]} в репозитории не найден",
+        )
+
+    # Дифф — ПО SHA, а не по имени ветки. ``branch_diff_paths`` резолвит и то
+    # и другое одним резолвером (#1055), поэтому нового git-слоя здесь нет:
+    # меняется аргумент, а не механизм.
+    diff_paths = await plugins.git_ops.branch_diff_paths(
+        pinned_sha, base_branch=ctx.get("base_branch"), repo=workspace
+    )
+    diff_reason = (
+        "" if diff_paths is not None else f"дифф по {pinned_sha[:12]} не прочитать"
+    )
+
+    provenance: list[tuple[str, str]] = []
+    report_fact, report_provenance = await _historical_report_fact(
+        db, task_id, generation
+    )
+    provenance.extend(report_provenance)
+
+    ci_fact = await _ci_fact(db, task_id, pinned_sha)
+    ci_row = await repo.get_ci_run_report(db, task_id, pinned_sha)
+    if ci_row is not None:
+        # ``reported_at``, а не ``created_at``: у этой таблицы своё имя
+        # колонки, и промах в нём означал бы пустую отметку — то есть
+        # сторожа, который молчит всегда.
+        provenance.append(("ci_pinned_sha", dict(ci_row).get("reported_at") or ""))
+
+    facts = {
+        f.source: f
+        for f in [
+            report_fact,
+            ci_fact,
+            _historical_tip_fact(pinned_sha),
+            _surface_fact(task, diff_paths, diff_reason),
+            await _risk_fact(db, task, diff_paths, diff_reason),
+            # Три дыры ниже — не поломка сборки, а отказ выдумывать. Локаторы
+            # разрешаются против СЕГОДНЯШНЕГО дерева, состояние базы — это
+            # сегодняшняя база, а зависимости давно доставлены: любой ответ
+            # на них был бы ответом про сегодня, выданным за апрель.
+            absent(
+                "ac_locator",
+                NOT_RECONSTRUCTIBLE,
+                "локаторы разрешаются против нынешнего дерева — это будущее "
+                "относительно судимой сдачи",
+            ),
+            absent(
+                "red_base",
+                NOT_RECONSTRUCTIBLE,
+                "состояние базовой ветки на тот момент не сохранено",
+            ),
+            absent(
+                "dependency_state",
+                NOT_RECONSTRUCTIBLE,
+                "доставка блокеров читается на сегодня, а не на рубеж",
+            ),
+        ]
+    }
+
+    # Сторож последним: сначала собрали, потом доказали, что не списали.
+    assert_within(cutoff, provenance)
+
+    return EvidencePacket(
+        task_id=task_id,
+        generation=generation,
+        # brief=None намеренно и это несущее решение, а не экономия. Брифинг
+        # несёт ``latest_review`` — человеческий вердикт, то есть ровно ту
+        # метку, против которой считается таблица 2x2. Пакет с ней внутри
+        # мерил бы списывание.
+        brief=None,
+        facts=facts,
+        quotes=_quotes(task, None, facts["machine_review_report"]),
+    )
+
+
+def reconstructed_share(packets: list[EvidencePacket]) -> float | None:
+    """Доля пакетов, где восстановились ОБА факта о коде: вершина и дифф.
+
+    None на пустом входе, а не ноль: пустая выборка — это отсутствие
+    измерения, и печатать её как «ничего не восстановилось» значит обвинять
+    механизм там, где его не запускали (#762).
+    """
+    if not packets:
+        return None
+    good = sum(
+        1
+        for p in packets
+        if p.fact("branch_tip").is_present and p.fact("diff_vs_areas").is_present
+    )
+    return good / len(packets)

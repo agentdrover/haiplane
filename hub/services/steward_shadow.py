@@ -1228,3 +1228,507 @@ async def _announce_corridor_state_once(
         log.warning("коридор эскалаций нарушен (%s): %s", state, detail)
     else:
         log.info("коридор эскалаций (%s): %s", state, detail)
+
+
+# ---------------------------------------------------------------------------
+# Реплей истории: стенд для политики гейтов (#1167)
+# ---------------------------------------------------------------------------
+#
+# Фаза тени смотрит только вперёд, и это её встроенная цена: выборку наполняют
+# человеческие возвраты, их доля 0.119, и десять штук набираются месяцами. При
+# этом за то же окно в базе уже лежат сотни вердиктов, каждый привязан к
+# submission_sha с сохранённым отчётом. Разметка есть — она просто не читалась.
+#
+# Здесь два механизма, разделённые по ЦЕНЕ, и это разделение несущее:
+#
+# ОФФЛАЙН-РЕПЛЕЙ прогоняет детерминированный слой политики
+# (``gate_grounds.decide``) по историческим пакетам. Стоит ноль: ни одного
+# обращения к провайдеру, ни одной модели. Это то, чем можно проверять правку
+# порога — сегодня такой петли нет вовсе, и пороги меняются аргументом.
+#
+# БЭКФИЛЛ заказывает НАСТОЯЩИЕ суждения стюарда по историческим пакетам. Стоит
+# 1.5-2.7M provider-токенов за прогон, поэтому не стартует без потолка и
+# называет цену ДО запуска, а не в отчёте после.
+#
+# И правило, которое дороже обоих: ИСТОРИЯ НЕ СНИМАЕТ ЗАЩИТНЫЙ ОТКАЗ.
+# ``act_refusals`` читает ``shadow_table``, а та — строки ``kind='verdict'``.
+# Исторические суждения пишутся под ДРУГИМ kind, поэтому для отказа их не
+# существует ПО ПОСТРОЕНИЮ, а не по фильтру, который можно забыть дописать.
+# Разница именно в этом: фильтр — обещание, отдельный ключ — устройство.
+# Зачесть историческую выборку для act может только человек (#585).
+
+KIND_VERDICT_HISTORICAL = "verdict_historical"
+
+#: Наблюдаемая цена одного прогона стюарда, в provider-токенах. Порядок, а не
+#: точность: считать среднее по трём прогонам — значит объявить точность,
+#: которой нет. Число служит одному: назвать цену бэкфилла ДО запуска.
+BACKFILL_TOKENS_PER_RUN = 2_000_000
+
+#: Ниже этого числа доли не печатаются вовсе (#1153). Не «печатаются с
+#: оговоркой»: доля, названная числом, читается как измерение, и приписка
+#: мелким шрифтом этого не отменяет.
+REPLAY_MIN_SAMPLE = 20
+
+
+@dataclass(frozen=True)
+class CorpusEntry:
+    """Одна завершённая сдача с человеческой меткой."""
+
+    task_id: int
+    generation: int
+    human_verdict: str
+    decided_at: str
+    submission_sha: str
+    review_id: int | None = None
+    profile: str = ""
+    reviewer_model: str = ""
+    implementer_model: str = ""
+    review_tokens: int = 0
+    sibling_mismatch: bool = False
+
+
+@dataclass(frozen=True)
+class Excluded:
+    """Сдача, не вошедшая в корпус, и причина."""
+
+    task_id: int
+    generation: int
+    reason: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class ReplayCase:
+    """Пакет плюс метка: всё, что нужно одному прогону политики."""
+
+    entry: CorpusEntry
+    packet: Any
+
+
+@dataclass(frozen=True)
+class ReplayReport:
+    """Что политика сказала бы против того, что сделал человек."""
+
+    policy: str
+    window_days: int
+    table: ShadowTable
+    excluded: tuple[Excluded, ...] = ()
+    reconstructed: float | None = None
+    corpus_tokens: int = 0
+    #: Обращений к провайдеру за прогон. Поле, а не обещание в докстроке:
+    #: утверждение «реплей бесплатен» должно быть проверяемым числом.
+    provider_calls: int = 0
+    reasons: tuple[tuple[str, int], ...] = ()
+
+    @property
+    def sample(self) -> int:
+        return self.table.judged
+
+    @property
+    def excluded_share(self) -> float | None:
+        total = self.sample + len(self.excluded)
+        return (len(self.excluded) / total) if total else None
+
+
+async def _human_verdict_rows(
+    db: aiosqlite.Connection, days: int
+) -> list[dict[str, Any]]:
+    """Человеческие вердикты окна с ОТМЕТКОЙ ВРЕМЕНИ.
+
+    ``_human_verdicts`` выше возвращает только сам вердикт: таблице 2x2 время
+    не нужно. Реплею нужно — это рубеж пакета, и без него сборка не сможет
+    доказать, что не заглянула в будущее.
+    """
+    placeholders, actors = sql_in(NON_HUMAN_GATE_ACTORS)
+    rows = await fetchall(
+        db,
+        "SELECT task_id, payload, created_at FROM events "
+        "WHERE kind='review_verdict_recorded' "
+        f"AND actor NOT IN ({placeholders}) "
+        "AND created_at >= datetime('now', ?) "
+        "ORDER BY id ASC",  # nosec B608 - placeholders from module constants
+        (*actors, f"-{int(days)} days"),
+    )
+    out: dict[tuple[int, int], dict[str, Any]] = {}
+    for row in rows:
+        item = dict(row)
+        try:
+            payload = json.loads(item.get("payload") or "{}")
+        except ValueError:
+            continue
+        generation = int(payload.get("submission_generation") or 0)
+        verdict = (payload.get("verdict") or "").strip()
+        if not generation or verdict not in {"approved", "changes_requested"}:
+            continue
+        out[(int(item["task_id"]), generation)] = {
+            "task_id": int(item["task_id"]),
+            "generation": generation,
+            "verdict": verdict,
+            "created_at": item.get("created_at") or "",
+        }
+    return sorted(out.values(), key=lambda r: (r["task_id"], r["generation"]))
+
+
+async def _sibling_mismatch(
+    db: aiosqlite.Connection, task_id: int, generation: int, review_id: int | None
+) -> bool:
+    """Соседний отчёт этой же сдачи нёс находки, а судимый — нет.
+
+    Считается ОДИН РАЗ на выгрузке, а не на каждом прогоне политики: это
+    свойство сдачи, оно не меняется от того, какой порог мы примеряем, и
+    запрос в базу внутри реплея сделал бы реплей не чистой функцией.
+    """
+    if review_id is None:
+        return False
+    siblings = await fetchall(
+        db,
+        "SELECT findings_confirmed FROM machine_reviews "
+        "WHERE task_id=? AND submission_generation=? AND id != ?",
+        (task_id, generation, review_id),
+    )
+    return any(json.loads(dict(s)["findings_confirmed"] or "[]") for s in siblings)
+
+
+async def collect_corpus(db: aiosqlite.Connection, days: int = 60) -> list[CorpusEntry]:
+    """Завершённые сдачи окна с человеческой меткой, отсортированные.
+
+    Сортировка — часть контракта, а не вкус: отчёт обязан совпадать побайтово
+    между прогонами (AC-6), а порядок, взятый из порядка выдачи базы, этого
+    не гарантирует.
+    """
+    entries: list[CorpusEntry] = []
+    for row in await _human_verdict_rows(db, days):
+        task_row = await repo.get_task(db, row["task_id"])
+        if task_row is None:
+            continue
+        task = dict(task_row)
+        review_row = await repo.get_latest_machine_review(db, row["task_id"])
+        review = dict(review_row) if review_row is not None else {}
+        review_id = review.get("id")
+        if (review.get("submission_generation") or 0) != row["generation"]:
+            review = {}
+            review_id = None
+        entries.append(
+            CorpusEntry(
+                task_id=row["task_id"],
+                generation=row["generation"],
+                human_verdict=row["verdict"],
+                decided_at=row["created_at"],
+                submission_sha=(task.get("submission_sha") or "").strip(),
+                review_id=review_id,
+                profile=(review.get("profile") or "").strip(),
+                reviewer_model=(review.get("model") or "").strip(),
+                implementer_model=(task.get("submission_model") or "").strip(),
+                review_tokens=int(review.get("provider_tokens") or 0),
+                sibling_mismatch=await _sibling_mismatch(
+                    db, row["task_id"], row["generation"], review_id
+                ),
+            )
+        )
+    return entries
+
+
+async def build_cases(
+    db: aiosqlite.Connection, entries: list[CorpusEntry]
+) -> tuple[list[ReplayCase], list[Excluded]]:
+    """Пакеты по корпусу. Каждая невошедшая сдача называет причину."""
+    from hub.services.steward_evidence import (
+        CorpusExclusion,
+        PacketLeak,
+        build_historical_packet,
+    )
+
+    cases: list[ReplayCase] = []
+    excluded: list[Excluded] = []
+    for entry in entries:
+        try:
+            packet = await build_historical_packet(
+                db, entry.task_id, entry.generation, entry.decided_at
+            )
+        except CorpusExclusion as exc:
+            excluded.append(
+                Excluded(entry.task_id, entry.generation, exc.reason, exc.detail)
+            )
+            continue
+        except PacketLeak as exc:
+            excluded.append(
+                Excluded(entry.task_id, entry.generation, "packet_leak", str(exc))
+            )
+            continue
+        cases.append(ReplayCase(entry=entry, packet=packet))
+    return cases, excluded
+
+
+def replay(
+    cases: list[ReplayCase],
+    policy: Any = None,
+    *,
+    window_days: int = 60,
+    excluded: list[Excluded] | None = None,
+) -> ReplayReport:
+    """Прогнать политику по корпусу. Чистая функция: без базы и без сети.
+
+    Ни соединения, ни клиента провайдера в сигнатуре нет — и это и есть
+    доказательство, что прогон бесплатен. ``provider_calls`` в отчёте всегда
+    ноль не потому, что мы их не считали, а потому что сделать их отсюда
+    нечем.
+    """
+    from hub.services import gate_grounds as grounds
+    from hub.services.steward_evidence import reconstructed_share
+
+    policy = policy or grounds.GatePolicy()
+    cells = {
+        "both_approve": 0,
+        "steward_approve_human_changes": 0,
+        "steward_changes_human_approve": 0,
+        "both_changes": 0,
+    }
+    escalated = 0
+    reasons: dict[str, int] = {}
+    for case in cases:
+        decision = grounds.decide(
+            case.packet,
+            grounds.PolicyInputs(
+                implementer_model=case.entry.implementer_model,
+                reviewer_model=case.entry.reviewer_model,
+                sibling_mismatch=case.entry.sibling_mismatch,
+            ),
+            policy,
+        )
+        if decision.reason:
+            reasons[decision.reason] = reasons.get(decision.reason, 0) + 1
+        if decision.verdict == grounds.VERDICT_ESCALATE:
+            escalated += 1
+            continue
+        human_approved = case.entry.human_verdict == "approved"
+        if decision.is_approve:
+            key = "both_approve" if human_approved else "steward_approve_human_changes"
+        else:
+            key = "steward_changes_human_approve" if human_approved else "both_changes"
+        cells[key] += 1
+    return ReplayReport(
+        policy=policy.name,
+        window_days=window_days,
+        table=ShadowTable(escalated=escalated, **cells),
+        excluded=tuple(excluded or ()),
+        reconstructed=reconstructed_share([c.packet for c in cases]),
+        corpus_tokens=sum(c.entry.review_tokens for c in cases),
+        provider_calls=0,
+        reasons=tuple(sorted(reasons.items())),
+    )
+
+
+def _share_line(label: str, value: float | None, sample: int) -> str:
+    """Доля — или причина, по которой её здесь нет.
+
+    Три исхода, а не два: измеренная доля, «выборка мала» и «выборки нет».
+    Слить два последних значило бы сказать «ноль эскалаций» там, где не
+    судили ни разу, — та самая подмена пустоты чистотой (#762), от которой
+    ``escalation_share`` уже отказалась, возвращая None.
+    """
+    if value is None:
+        return f"{label}: не измерена — судить не по чему (выборка {sample})"
+    if sample < REPLAY_MIN_SAMPLE:
+        return (
+            f"{label}: НЕ ПЕЧАТАЕТСЯ — выборка {sample} меньше порога "
+            f"{REPLAY_MIN_SAMPLE} (#1153)"
+        )
+    return f"{label}: {value:.0%} (выборка {sample})"
+
+
+def render_report(report: ReplayReport) -> str:
+    """Отчёт реплея. Побайтово одинаков на одном корпусе и одной политике.
+
+    Ни времени прогона, ни путей, ни порядка выдачи базы — всё, что могло бы
+    отличаться между двумя одинаковыми прогонами, сюда не попадает. Это не
+    аккуратность, а требование AC-6: стенд, чей вывод шевелится сам по себе,
+    нельзя использовать как доказательство про правку политики.
+    """
+    t = report.table
+    lines = [
+        f"РЕПЛЕЙ ПОЛИТИКИ «{report.policy}» по окну {report.window_days} дней",
+        "",
+        "Таблица 2x2 против ЧЕЛОВЕЧЕСКОЙ метки:",
+        f"  оба approve                        {t.both_approve}",
+        f"  политика approve / человек вернул  {t.false_approve}"
+        "   <- единственная неприемлемая",
+        f"  политика вернула / человек approve {t.steward_changes_human_approve}",
+        f"  оба changes_requested              {t.both_changes}",
+        f"  эскалаций                          {t.escalated}",
+        "",
+        f"Размер выборки: судимых {t.judged}, из них человеческих "
+        f"changes_requested {t.human_changes}",
+        _share_line("Доля эскалаций", t.escalation_share, t.judged),
+    ]
+    excluded_share = report.excluded_share
+    lines.append(
+        f"Исключено из корпуса: {len(report.excluded)}"
+        + (
+            f" ({excluded_share:.0%} от всех сдач окна)"
+            if excluded_share is not None
+            else ""
+        )
+    )
+    by_reason: dict[str, int] = {}
+    for item in report.excluded:
+        by_reason[item.reason] = by_reason.get(item.reason, 0) + 1
+    for reason, count in sorted(by_reason.items()):
+        lines.append(f"  {reason}: {count}")
+    lines.append(
+        _share_line(
+            "Доля восстановленных фактов о коде (вершина и дифф)",
+            report.reconstructed,
+            t.judged,
+        )
+    )
+    lines.append("")
+    lines.append("Цена:")
+    lines.append(f"  обращений к провайдеру за этот прогон: {report.provider_calls}")
+    lines.append(
+        f"  provider-токенов, потраченных на корпус когда-то: {report.corpus_tokens}"
+    )
+    if report.reasons:
+        lines.append("")
+        lines.append("Основания, названные политикой:")
+        for reason, count in report.reasons:
+            lines.append(f"  {reason}: {count}")
+    lines.append("")
+    lines.append(
+        "Метка — человеческий changes_requested. Уровень НАХОДКИ не размечен: "
+        "диспозиции считает #1171, и без них этот отчёт судит политику над "
+        "отчётами, а не качество самих находок."
+    )
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Историческая выборка: отдельный счётчик, отказ не снимает
+# ---------------------------------------------------------------------------
+
+
+async def historical_table(db: aiosqlite.Connection) -> ShadowTable:
+    """Та же 2x2, но по историческим суждениям — и только по ним.
+
+    Отдельная функция, а не параметр ``shadow_table``: параметр со значением
+    по умолчанию — это одна строка кода между защитным отказом и выборкой,
+    под которую он не проектировался. Две функции разъехаться не могут.
+    """
+    judgements = await fetchall(
+        db,
+        "SELECT task_id, generation, verdict FROM steward_judgements "
+        "WHERE kind=? ORDER BY id ASC",
+        (KIND_VERDICT_HISTORICAL,),
+    )
+    humans = await _human_verdicts(db)
+    cells = {
+        "both_approve": 0,
+        "steward_approve_human_changes": 0,
+        "steward_changes_human_approve": 0,
+        "both_changes": 0,
+    }
+    escalated = 0
+    unpaired = 0
+    for row in judgements:
+        item = dict(row)
+        verdict = (item.get("verdict") or "").strip()
+        if verdict == "escalate":
+            escalated += 1
+            continue
+        human = humans.get((int(item["task_id"]), int(item["generation"])))
+        if human is None:
+            unpaired += 1
+            continue
+        if verdict == "approve":
+            key = (
+                "both_approve"
+                if human == "approved"
+                else "steward_approve_human_changes"
+            )
+        else:
+            key = (
+                "steward_changes_human_approve"
+                if human == "approved"
+                else "both_changes"
+            )
+        cells[key] += 1
+    return ShadowTable(escalated=escalated, unpaired=unpaired, **cells)
+
+
+@dataclass(frozen=True)
+class BackfillPlan:
+    """Сколько прогонов, по чему и почём — ДО того, как деньги потрачены."""
+
+    runs: int
+    tokens_estimate: int
+    targets: tuple[tuple[int, int], ...]
+    refusal: str = ""
+
+    @property
+    def refused(self) -> bool:
+        return bool(self.refusal)
+
+
+def plan_backfill(cases: list[ReplayCase], cap: int) -> BackfillPlan:
+    """Что бэкфилл сделал бы и во сколько это встанет.
+
+    Отказывается стартовать без потолка. Не «берёт разумное значение по
+    умолчанию»: умолчание здесь — это цена, которую никто не назвал вслух, а
+    один прогон стоит порядка двух миллионов provider-токенов. Потолок
+    обязан прийти от того, кто платит.
+
+    Порядок целей — от свежих к старым по (task_id, generation), потому что
+    план обязан быть воспроизводимым: два одинаковых плана, отличающиеся
+    выбором сдач, нельзя сравнить между собой.
+    """
+    if cap <= 0:
+        return BackfillPlan(
+            runs=0,
+            tokens_estimate=0,
+            targets=(),
+            refusal=(
+                "бэкфилл не стартует без потолка по числу прогонов: один "
+                f"прогон стоит порядка {BACKFILL_TOKENS_PER_RUN} "
+                "provider-токенов, и умолчание здесь — это неназванная цена"
+            ),
+        )
+    targets = sorted(
+        ((c.entry.task_id, c.entry.generation) for c in cases), reverse=True
+    )[:cap]
+    return BackfillPlan(
+        runs=len(targets),
+        tokens_estimate=len(targets) * BACKFILL_TOKENS_PER_RUN,
+        targets=tuple(targets),
+    )
+
+
+async def record_historical_judgement(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    verdict: str,
+    *,
+    model: str = "",
+    escalate_reason: str = "",
+) -> None:
+    """Записать историческое суждение — под своим kind, в свой счётчик.
+
+    ``kind=KIND_VERDICT_HISTORICAL`` — это и есть механизм из #585: строка,
+    которую ``shadow_table`` не увидит никогда, потому что она спрашивает
+    ``kind='verdict'``. Уникальный индекс (task_id, generation, kind)
+    продолжает держать «не более одного» — отдельно для каждого вида.
+    """
+    await db.execute(
+        "INSERT OR REPLACE INTO steward_judgements "
+        "(task_id, generation, kind, submitted_verdict, verdict, "
+        "escalate_reason, model, submitted_by) "
+        "VALUES (?, ?, ?, '', ?, ?, ?, 'backfill')",
+        (
+            task_id,
+            generation,
+            KIND_VERDICT_HISTORICAL,
+            verdict,
+            escalate_reason,
+            model,
+        ),
+    )
+    await db.commit()

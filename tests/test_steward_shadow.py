@@ -1438,3 +1438,352 @@ async def test_the_working_deadline_starts_when_work_does(
     run = (await _runs(db, task_id))[0]
     assert run["status"] == RUN_OPEN
     assert run["agent_id"] == "agent-1"
+
+
+# ---------------------------------------------------------------------------
+# Реплей истории сдач (#1167)
+# ---------------------------------------------------------------------------
+
+_SHA = "c" * 40
+
+
+class _HistoricalGitOps:
+    """Клон, в котором ветки уже нет, а коммит есть.
+
+    Ровно то состояние, из-за которого наивная сборка выродилась бы в
+    эскалации: ``head_sha`` и ``fetch_base`` по ИМЕНИ ветки не отвечают,
+    ``commit_exists`` по sha — отвечает, и ``branch_diff_paths`` принимает
+    sha там, где живой сборщик передавал бы имя.
+    """
+
+    def __init__(self, paths: list[str], *, commit_here: bool = True) -> None:
+        self.paths = paths
+        self.commit_here = commit_here
+        self.asked = []
+
+    async def commit_exists(self, repo, sha):
+        return self.commit_here
+
+    async def branch_diff_paths(self, branch, base_branch=None, repo=None):
+        self.asked.append(branch)
+        # Ветки нет: спросили по имени — ответа нет. Спросили по коммиту — есть.
+        if branch != _SHA:
+            return None
+        return list(self.paths)
+
+    async def head_sha(self, repo, base):
+        return ""
+
+    async def fetch_base(self, repo, base):
+        return (False, "ветка удалена после мержа")
+
+    async def branch_ci_runs(self, branch, repo=None, gh_repo=None, forge=""):
+        return None
+
+
+async def _historical_project(db: aiosqlite.Connection, slug: str) -> int:
+    project_id = await repo.create_project(
+        db, slug=slug, name=slug, workspace_path="/tmp/ws", status="active"
+    )
+    await db.execute(
+        "UPDATE projects SET default_branch='develop' WHERE id=?", (project_id,)
+    )
+    await db.commit()
+    return project_id
+
+
+async def _historical_submission(
+    db: aiosqlite.Connection,
+    project_id: int,
+    *,
+    human_verdict: str,
+    areas: list[str] | None = None,
+    raw_count: int = 4,
+    confirmed: str = "[]",
+    tokens: int = 1000,
+) -> int:
+    """Завершённая сдача: закреплённый sha, отчёт, зелёный CI, вердикт."""
+    areas = areas if areas is not None else ["hub/services/steward_shadow.py"]
+    task_id = await repo.create_task(
+        db,
+        title="историческая сдача",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="pda_claude",
+        rationale="",
+        status="done",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(
+        db,
+        task_id,
+        project_id=project_id,
+        submission_generation=1,
+        submission_sha=_SHA,
+        submission_model="claude-opus-5",
+        risk_class="R2",
+        affected_areas=json.dumps(areas),
+        # Ветка удалена после мержа — имя осталось, ref не резолвится.
+        branch=f"task-{task_id}/gone",
+    )
+    review_id = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="grok-4.6",
+        raw_count=raw_count,
+        findings_confirmed=confirmed,
+        tokens_spent=tokens,
+        profile="deep",
+    )
+    await db.execute(
+        "UPDATE machine_reviews SET provider_tokens=? WHERE id=?",
+        (tokens, review_id),
+    )
+    await repo.upsert_ci_run_report(
+        db,
+        task_id=task_id,
+        head_sha=_SHA,
+        ac_results="{}",
+        validation_status="pass",
+        validation_log="",
+        reason="",
+        reported_by="ci",
+    )
+    await repo.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="Denis",
+        payload={"submission_generation": 1, "verdict": human_verdict},
+    )
+    # Вердикт должен лежать ПОЗЖЕ всего остального: рубеж пакета — его метка.
+    await db.execute(
+        "UPDATE events SET created_at=datetime('now', '+1 hour') "
+        "WHERE task_id=? AND kind='review_verdict_recorded'",
+        (task_id,),
+    )
+    await db.commit()
+    return task_id
+
+
+async def test_offline_replay_makes_no_provider_calls(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167 AC-1: отчёт с таблицей 2x2 и НИ ОДНОГО обращения к провайдеру.
+
+    Проверяется по коду, а не по описанию: клиент провайдера подменён на
+    счётчик, и он обязан остаться нулевым.
+    """
+    from hub.integrations.registry import plugins
+
+    project_id = await _historical_project(db, "replay-free")
+    monkeypatch.setattr(
+        plugins, "git_ops", _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    )
+    await _historical_submission(db, project_id, human_verdict="approved")
+    await _historical_submission(
+        db, project_id, human_verdict="changes_requested", confirmed='[{"title": "x"}]'
+    )
+
+    calls = AsyncMock(return_value=({}, None))
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", calls)
+    usage = AsyncMock(return_value={})
+    monkeypatch.setattr(cursor_cloud, "get_usage", usage)
+
+    entries = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries)
+    report = sh.replay(cases, window_days=60, excluded=excluded)
+
+    assert calls.await_count == 0
+    assert usage.await_count == 0
+    assert report.provider_calls == 0
+    # Таблица 2x2 непуста и различает клетки, а не суммирует их.
+    assert report.table.judged == 2
+    assert report.table.both_approve == 1
+    assert report.table.both_changes == 1
+    assert report.table.false_approve == 0
+    text = sh.render_report(report)
+    assert "Таблица 2x2" in text
+    assert "Размер выборки" in text
+    assert "обращений к провайдеру за этот прогон: 0" in text
+
+
+async def test_historical_packet_rejects_post_submission_events(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167 AC-2: строка моложе рубежа роняет сборку, а не въезжает в пакет.
+
+    Утечка тут не абстрактная: пакет, собранный из сегодняшнего состояния,
+    несёт человеческий вердикт, и реплей над ним мерил бы списывание.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import PacketLeak, build_historical_packet
+
+    project_id = await _historical_project(db, "replay-leak")
+    monkeypatch.setattr(
+        plugins, "git_ops", _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    )
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+
+    rows = await fetchall(
+        db,
+        "SELECT created_at FROM events WHERE task_id=? AND "
+        "kind='review_verdict_recorded'",
+        (task_id,),
+    )
+    cutoff = dict(rows[0])["created_at"]
+
+    # До рубежа собирается.
+    packet = await build_historical_packet(db, task_id, 1, cutoff)
+    assert packet.fact("machine_review_report").is_present
+    # И не несёт человеческого вердикта ни одним полем.
+    assert packet.brief is None
+
+    # Отчёт, дописанный ПОСЛЕ вердикта, — это будущее. Сборка обязана упасть.
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=datetime('now', '+2 hours') "
+        "WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+    with pytest.raises(PacketLeak) as leak:
+        await build_historical_packet(db, task_id, 1, cutoff)
+    assert leak.value.source == "machine_review_report"
+
+
+async def test_historical_packet_rebuilt_from_sha_not_branch(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167 AC-3: ветки нет, а факты о коде present — потому что спросили sha.
+
+    Наивная сборка спросила бы имя ветки, получила бы absent на обоих фактах,
+    и вся историческая выборка выродилась бы в эскалации-артефакты.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import CorpusExclusion, build_historical_packet
+
+    project_id = await _historical_project(db, "replay-sha")
+    git = _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+    rows = await fetchall(
+        db,
+        "SELECT created_at FROM events WHERE task_id=? AND "
+        "kind='review_verdict_recorded'",
+        (task_id,),
+    )
+    cutoff = dict(rows[0])["created_at"]
+
+    packet = await build_historical_packet(db, task_id, 1, cutoff)
+    tip = packet.fact("branch_tip")
+    surface = packet.fact("diff_vs_areas")
+    assert tip.is_present and surface.is_present
+    assert tip.value["tip"] == _SHA
+    # Восстановление названо восстановлением: «вершина не двигалась» здесь
+    # не наблюдение, и пакет об этом говорит.
+    assert tip.value["reconstructed"] is True
+    assert tip.value["observed"] is False
+    # Дифф спрашивали по коммиту, а не по имени ветки.
+    assert git.asked == [_SHA]
+
+    # Коммита нет — сдача ВЫБЫВАЕТ с причиной, а не входит с пустыми фактами.
+    monkeypatch.setattr(
+        plugins,
+        "git_ops",
+        _HistoricalGitOps(["x"], commit_here=False),
+    )
+    with pytest.raises(CorpusExclusion) as gone:
+        await build_historical_packet(db, task_id, 1, cutoff)
+    assert gone.value.reason == "sha_unresolved"
+
+
+async def test_historical_rows_do_not_clear_act_refusals(db: aiosqlite.Connection):
+    """#1167 AC-4: сколько ни залей истории — sample_too_small остаётся.
+
+    Защитный отказ не снимается данными, под которые он не проектировался
+    (#585). Механизм — отдельный kind, а не фильтр: строку, которой
+    ``shadow_table`` не видит по своему же запросу, нельзя зачесть забыв
+    дописать условие.
+    """
+    project_id = await _historical_project(db, "replay-refusal")
+    before = await sh.act_refusals(db)
+    assert {code for code, _ in before} == {
+        sh.REASON_SAMPLE_TOO_SMALL,
+        sh.REASON_NO_SAMPLE,
+    }
+
+    for _ in range(40):
+        task_id = await _historical_submission(
+            db, project_id, human_verdict="changes_requested"
+        )
+        await sh.record_historical_judgement(db, task_id, 1, "changes_requested")
+
+    after = await sh.act_refusals(db)
+    assert {code for code, _ in after} == {
+        sh.REASON_SAMPLE_TOO_SMALL,
+        sh.REASON_NO_SAMPLE,
+    }, "исторические строки сняли отказ — ровно то, что запрещено #585"
+    # При этом они СЧИТАЮТСЯ и видны отдельно.
+    historical = await sh.historical_table(db)
+    assert historical.both_changes == 40
+    assert (await sh.shadow_table(db)).judged == 0
+
+
+async def test_replay_report_omits_share_on_small_sample(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167 AC-5: на недоборе доля не печатается вовсе, а называется причина."""
+    from hub.integrations.registry import plugins
+
+    project_id = await _historical_project(db, "replay-small")
+    monkeypatch.setattr(
+        plugins, "git_ops", _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    )
+    await _historical_submission(db, project_id, human_verdict="approved")
+
+    entries = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries)
+    small = sh.render_report(sh.replay(cases, excluded=excluded))
+    assert "НЕ ПЕЧАТАЕТСЯ" in small
+    assert f"меньше порога {sh.REPLAY_MIN_SAMPLE}" in small
+    assert "Доля эскалаций: 0%" not in small
+
+    empty = sh.render_report(sh.replay([], excluded=[]))
+    # Пустая выборка и малая выборка — РАЗНЫЕ ответы, а не один.
+    assert "не измерена" in empty
+    assert "НЕ ПЕЧАТАЕТСЯ" not in empty
+
+
+async def test_replay_is_deterministic(db: aiosqlite.Connection, monkeypatch):
+    """#1167 AC-6: один корпус и одна политика — побайтово один отчёт."""
+    from hub.integrations.registry import plugins
+
+    project_id = await _historical_project(db, "replay-determinism")
+    monkeypatch.setattr(
+        plugins, "git_ops", _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    )
+    for verdict in ("approved", "changes_requested", "approved"):
+        await _historical_submission(db, project_id, human_verdict=verdict)
+
+    first_entries = await sh.collect_corpus(db, days=60)
+    first_cases, first_excluded = await sh.build_cases(db, first_entries)
+    first = sh.render_report(sh.replay(first_cases, excluded=first_excluded))
+
+    second_entries = await sh.collect_corpus(db, days=60)
+    second_cases, second_excluded = await sh.build_cases(db, second_entries)
+    second = sh.render_report(sh.replay(second_cases, excluded=second_excluded))
+
+    assert first == second
+
+    # И бэкфилл без потолка не стартует, назвав цену вместо умолчания.
+    refused = sh.plan_backfill(first_cases, 0)
+    assert refused.refused
+    assert refused.runs == 0
+    planned = sh.plan_backfill(first_cases, 2)
+    assert planned.runs == 2
+    assert planned.tokens_estimate == 2 * sh.BACKFILL_TOKENS_PER_RUN
