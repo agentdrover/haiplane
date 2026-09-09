@@ -923,6 +923,29 @@ class ReviewReport(BaseModel):
     machine_review: "MachineReviewView | None" = None
 
 
+class ReviewCircleView(BaseModel):
+    """Заходы «закрыли находки — пришли новые», подряд (#1235).
+
+    Отдельно от ``review_cycle``, и это не дублирование. ``review_cycle``
+    считает ВОЗВРАТЫ работы автору и стоит под потолком, который задачу
+    останавливает; здесь считаются ПОКОЛЕНИЯ, в которых автор закрыл
+    находки и получил новый слой, и не останавливается ничего. На #1171
+    09.09.2026 review_cycle оставался нулём при третьем заходе — то есть
+    одно число другим не выводится.
+    """
+
+    laps: int = 0
+    threshold: int = 0
+    #: Пора ли звать человека. Считает хаб, а не читатель: сравнение
+    #: счётчика с порогом живёт в одном месте (ReviewCircle.named).
+    named: bool = False
+    #: По строке на заход: «закрыто / пришло новых».
+    breakdown: list[str] = Field(default_factory=list)
+    #: Категории, повторённые за предыдущим заходом. Отдельно от числа
+    #: заходов, потому что признак другой и важнее.
+    repeated_categories: list[str] = Field(default_factory=list)
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 
@@ -989,6 +1012,11 @@ class ReviewBrief(BaseModel):
     # #725: one verdict over all evidence blocks below.
     evidence_coverage: EvidenceCoverage = Field(default_factory=EvidenceCoverage)
     review_cycle: int = 0
+    # #1235: сколько заходов «закрыли находки — пришли новые» задача уже
+    # сделала. Ревьюер, читающий бриф, обязан видеть, что предыдущий слой
+    # был разобран и закрыт по-настоящему, — иначе очередной отчёт читается
+    # как первый.
+    review_circle: ReviewCircleView = Field(default_factory=ReviewCircleView)
     submission_generation: int = 0
     # #572: what code the submission pinned, where the branch stands now, and
     # whether they agree. sha_check is "match" | "diverged" | "unknown" —

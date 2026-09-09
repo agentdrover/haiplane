@@ -4208,3 +4208,718 @@ async def test_a_dispatched_project_gets_no_extra_notice(
     assert len(await _dispatch_notices(db, task_id)) == 1, (
         "и записей про диспетч по-прежнему одна"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1235 — круг ревью: заходы, где находки ЗАКРЫВАЛИСЬ
+# ---------------------------------------------------------------------------
+
+
+def _confirmed(title: str, category: str, line: int) -> dict:
+    """Подтверждённая находка в форме, в которой она лежит в отчёте."""
+    return {
+        "title": title,
+        "severity": "high",
+        "category": category,
+        "file": "hub/services/probe.py",
+        "line": line,
+        "start_line": line,
+        "end_line": line,
+        "locator": "lines",
+        "detail": "",
+    }
+
+
+def _unresolved(title: str) -> dict:
+    """Неразрешённая находка: категории у неё нет по модели (#1085)."""
+    return {"title": title, "why": "адъюдикаторы разошлись"}
+
+
+async def _generation_with_findings(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    *,
+    confirmed: list[dict] | None = None,
+    unresolved: list[dict] | None = None,
+) -> int:
+    """Поставить задачу на поколение N и положить на него отчёт."""
+    await db.execute(
+        "UPDATE tasks SET submission_generation=? WHERE id=?", (generation, task_id)
+    )
+    review_id = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        harness_skill="deep-review",
+        model="grok-4.6",
+        raw_count=len(confirmed or []) + len(unresolved or []),
+        findings_confirmed=json.dumps(confirmed or [], ensure_ascii=False),
+        unresolved=json.dumps(unresolved or [], ensure_ascii=False),
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+    return review_id
+
+
+async def _author_closed_them(
+    db: aiosqlite.Connection,
+    task_id: int,
+    review_id: int,
+    generation: int,
+    *,
+    confirmed: list[dict],
+    unresolved: list[dict],
+    outcome_confirmed: str = "fixed",
+    outcome_unresolved: str = "real_fixed",
+) -> None:
+    """Автор отчитался, что находки этого поколения закрыты правкой.
+
+    Ровно тот путь, которым исходы попадают в базу на живой задаче: они
+    пишутся на СДАЧЕ СЛЕДУЮЩЕГО поколения против отчёта, который вернул
+    работу (lifecycle._step_finding_outcomes), и потому лежат с номером
+    поколения ОТЧЁТА, а не новой сдачи.
+    """
+    from hub.services.finding_identity import finding_uids, unresolved_uids
+
+    for index, (uid, finding) in enumerate(zip(finding_uids(confirmed), confirmed)):
+        await repo.upsert_finding_outcome(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            submission_generation=generation,
+            finding_uid=uid,
+            finding_index=index,
+            finding_title=finding["title"],
+            outcome=outcome_confirmed,
+            note="разобрано опытом",
+            linked_task_id=None,
+            reported_by="dev-agent",
+            finding_kind="confirmed",
+        )
+    for index, (uid, finding) in enumerate(
+        zip(unresolved_uids(unresolved), unresolved)
+    ):
+        await repo.upsert_finding_outcome(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            submission_generation=generation,
+            finding_uid=uid,
+            finding_index=index,
+            finding_title=finding["title"],
+            outcome=outcome_unresolved,
+            note="воспроизведено зондом",
+            linked_task_id=None,
+            reported_by="dev-agent",
+            finding_kind="unresolved",
+        )
+    await db.commit()
+
+
+async def _circle_notices(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    """Всё, что карточка сказала о круге."""
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if "идёт по кругу" in dict(u)["content"]
+    ]
+
+
+async def _walk_the_circle(
+    db: aiosqlite.Connection,
+    task_id: int,
+    layers: list[tuple[list[dict], list[dict]]],
+) -> None:
+    """Пройти заданные слои находок: каждый закрыт, следующий принёс новые."""
+    previous: tuple[int, int, list[dict], list[dict]] | None = None
+    for generation, (confirmed, unresolved) in enumerate(layers, start=1):
+        review_id = await _generation_with_findings(
+            db, task_id, generation, confirmed=confirmed, unresolved=unresolved
+        )
+        if previous is not None:
+            prev_review, prev_generation, prev_conf, prev_unres = previous
+            await _author_closed_them(
+                db,
+                task_id,
+                prev_review,
+                prev_generation,
+                confirmed=prev_conf,
+                unresolved=prev_unres,
+            )
+        previous = (review_id, generation, confirmed, unresolved)
+
+
+async def test_a_task_going_in_circles_is_named_and_escalated(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1235): три захода — круг назван, и человека зовут решать.
+
+    Образец взят с прода 09.09.2026 без округления. #1171: отчёт #307 дал
+    три подтверждённые и пять неразрешённых, все восемь разобраны и
+    закрыты, пересдача — и отчёт #323 принёс ПЯТЬ НОВЫХ неразрешённых. То
+    же на #1208 и #1169. Ни один существующий потолок не сработал:
+    review_cycle на #1171 оставался нулём при третьем заходе, потому что
+    работу автору никто не возвращал — он пересдавал сам.
+
+    Последний отчёт приходит НАСТОЯЩИМ путём приёма, а не записью в
+    таблицу: круг обязан называться в тот момент, когда очередной отчёт
+    принесли, иначе он не позовёт никого.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1235"}, "run": {"id": "r-1235"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+
+    task_id = await _submitted(client, db, "spike-1235-circle")
+
+    # Три первых слоя: каждый закрыт, следующий принёс новые находки.
+    layer1 = ([_confirmed("гонка на записи", "concurrency", 10)], [_unresolved("A")])
+    layer2 = ([_confirmed("необработанный код возврата", "error-handling", 20)], [])
+    layer3 = ([_confirmed("тест не убивает мутацию", "test-adequacy", 30)], [])
+    await _walk_the_circle(db, task_id, [layer1, layer2, layer3])
+
+    from hub.services.review_dispatch import review_circle
+
+    assert (await review_circle(db, task_id)).count == 2, (
+        "предпосылка: до четвёртого отчёта заходов два, круг ещё не назван"
+    )
+    assert await _circle_notices(db, task_id) == [], "порог ещё не достигнут"
+
+    # Третий заход: закрываем слой 3 и принимаем ЧЕТВЁРТЫЙ отчёт как отчёт.
+    await _author_closed_them(
+        db,
+        task_id,
+        (await _last_review_id(db, task_id)),
+        3,
+        confirmed=layer3[0],
+        unresolved=layer3[1],
+    )
+    await db.execute("UPDATE tasks SET submission_generation=4 WHERE id=?", (task_id,))
+    await db.commit()
+    from hub.services.machine_review_intake import record_machine_review
+    from hub.models import MachineReviewSubmit
+
+    await record_machine_review(
+        db,
+        task_id,
+        MachineReviewSubmit(
+            harness_skill="deep-review",
+            model="grok-4.6",
+            raw_count=1,
+            incomplete=False,
+            findings_confirmed=[_confirmed("утечка дескриптора", "resource-leak", 40)],
+        ),
+        principal_id=None,
+        username="cursor-cloud-reviewer",
+    )
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 3, "три захода: 1→2, 2→3, 3→4"
+
+    notices = await _circle_notices(db, task_id)
+    assert len(notices) == 1, (
+        "круг обязан быть назван в карточке: пока он не назван, его не видит "
+        "ни автор, ни человек, ни метрики"
+    )
+    said = notices[0]
+    assert "3-й раз" in said, "число заходов названо"
+    for ordinal in (1, 2, 3):
+        assert f"заход {ordinal}" in said, "разбивка приводится по КАЖДОМУ заходу"
+    assert "закрыто 2, пришло новых 1" in said, (
+        "первый заход закрыл две находки (одну подтверждённую и одну "
+        "неразрешённую) и получил одну новую — оба числа стоят рядом"
+    )
+    for outcome in ("принять как есть", "отпустить", "продолжать"):
+        assert outcome in said, (
+            "три исхода названы явно: сигнал о круге легко прочесть как "
+            "разрешение перестать чинить настоящие дефекты"
+        )
+    assert "Ревью НЕ выключено и пересдача не запрещена" in said
+
+    events = [
+        dict(r)
+        for r in await repo.list_events(
+            db, since=0, kinds=["review_circle_named"], limit=10
+        )
+    ]
+    assert len(events) == 1, "событие в ленте, а не только строка в карточке"
+    assert json.loads(events[0]["payload"])["laps"] == 3
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "review", "сигнал не двигает задачу сам"
+    assert row["review_cycle"] == 0, (
+        "и это ровно тот случай, который существующий потолок не видит: "
+        "циклов ревью ноль при третьем заходе (наблюдено на #1171)"
+    )
+
+    from hub.services.review_brief import build_review_brief
+
+    brief = await build_review_brief(db, task_id)
+    assert brief.review_circle.laps == 3 and brief.review_circle.named, (
+        "число заходов видно и в брифе ревью, тем же счётом, что в карточке"
+    )
+    assert len(brief.review_circle.breakdown) == 3
+
+    from hub.mcp_server import _review_circle_line
+
+    rendered = _review_circle_line(brief.model_dump())
+    assert "Круг ревью: заходов 3" in rendered and "заход 1" in rendered, (
+        "ревьюер читает бриф ТЕКСТОМ: число, не дошедшее до строки, не прочитает никто"
+    )
+
+
+async def _last_review_id(db: aiosqlite.Connection, task_id: int) -> int:
+    rows = await db.execute_fetchall(
+        "SELECT id FROM machine_reviews WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    )
+    return int(dict(rows[0])["id"])
+
+
+async def test_a_plain_resubmission_is_not_a_circle(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1235): столько же пересдач, но находок между ними не было.
+
+    МУТАЦИЯ, которую этот тест обязан ловить: считать заходом любую
+    пересдачу. Счётчик, растущий на каждое поколение, назвал бы кругом
+    обычную работу — задачу, которую пересдавали четыре раза с чистыми
+    отчётами, — и позвал бы человека к тому, где решать нечего.
+
+    Проверяется НОЛЬ заходов, а не отсутствие алерта: алерта нет и при
+    пороге, которого не достигли, так что одно только молчание карточки
+    отличить эти два случая не может.
+    """
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-plain"}, "run": {"id": "r-plain"}}
+    )
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+
+    task_id = await _submitted(client, db, "spike-1235-plain")
+    for generation in (1, 2, 3, 4):
+        await _generation_with_findings(db, task_id, generation)
+
+    from hub.services.review_dispatch import name_the_circle, review_circle
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 0, (
+        "четыре поколения с чистыми отчётами — это не круг, а работа: "
+        "находок не было, закрывать было нечего"
+    )
+    assert not circle.named
+    assert await name_the_circle(db, task_id) is False
+    assert await _circle_notices(db, task_id) == []
+
+
+async def test_a_closed_layer_without_new_findings_ends_the_circle(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Контроль к AC-2: находки были и закрыты, но нового слоя не пришло.
+
+    Отдельный тест, потому что «находок не было вовсе» и «находки были,
+    круг кончился» — разные состояния, и правило, потерявшее второе,
+    прошло бы предыдущий тест целиком. Здесь же проверяется, что серия
+    считается ПОДРЯД: чистый отчёт обнуляет счёт, а не откладывается в
+    заслугу, по которой человека позовут к уже вышедшей задаче.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-end"}, "run": {"id": "r-end"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-ended")
+    layer1 = ([_confirmed("гонка", "concurrency", 10)], [])
+    layer2 = ([_confirmed("код возврата", "error-handling", 20)], [])
+    layer3 = ([_confirmed("мутация выжила", "test-adequacy", 30)], [])
+    await _walk_the_circle(db, task_id, [layer1, layer2, layer3])
+
+    from hub.services.review_dispatch import review_circle
+
+    assert (await review_circle(db, task_id)).count == 2, "предпосылка: два захода"
+
+    # Автор закрыл третий слой, и новый отчёт пришёл чистым.
+    await _author_closed_them(
+        db,
+        task_id,
+        await _last_review_id(db, task_id),
+        3,
+        confirmed=layer3[0],
+        unresolved=layer3[1],
+    )
+    await _generation_with_findings(db, task_id, 4)
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 0, (
+        "круг кончился на чистом отчёте — считается хвостовая серия подряд"
+    )
+    assert not circle.named
+
+
+async def test_a_repeating_category_is_named_apart_from_the_count(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1235): повтор категории отмечен ОТДЕЛЬНО от числа заходов.
+
+    Признак другой и важнее: три захода с находками разного рода — работа,
+    идущая вглубь, а повтор категории означает, что харнесс ходит по одному
+    и тому же месту. Поэтому проверяется не только наличие слов, но и то,
+    что при РАЗНЫХ категориях отметки нет — иначе «отмечено отдельно» было
+    бы совместимо с «отмечается всегда».
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-cat"}, "run": {"id": "r-cat"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-category")
+    same = "test-adequacy"
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("мутация выжила в А", same, 10)], []),
+            ([_confirmed("мутация выжила в Б", same, 20)], []),
+            ([_confirmed("мутация выжила в В", same, 30)], []),
+        ],
+    )
+
+    from hub.services.review_dispatch import name_the_circle, review_circle
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 2, "заходов два"
+    assert circle.repeated_categories == (same,), (
+        "категория повторяется — это отдельный факт, а не следствие счёта"
+    )
+    assert await name_the_circle(db, task_id) is True
+    said = (await _circle_notices(db, task_id))[0]
+    assert "ОТДЕЛЬНО" in said and same in said, "повтор назван своим абзацем"
+    assert "харнесс ходит по одному" in said, (
+        "названо, ЧТО этот признак означает, а не только что он есть"
+    )
+
+    # Контроль: те же два захода, но категории разные — отметки нет.
+    other = await _submitted(client, db, "spike-1235-varied")
+    await _walk_the_circle(
+        db,
+        other,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+    varied = await review_circle(db, other)
+    assert varied.count == 2, "заходов столько же"
+    assert varied.repeated_categories == (), (
+        "категории разные — повтора нет, и число заходов этого не подменяет"
+    )
+    assert await name_the_circle(db, other) is True
+    assert "ОТДЕЛЬНО" not in (await _circle_notices(db, other))[0]
+
+
+async def test_the_circle_threshold_comes_from_the_config(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Порог читается из конфига и проверен на трёх значениях.
+
+    Он выбран по трём наблюдениям одного дня — для числа это недобор, и
+    менять его придётся без правки кода. Значение, зашитое в коде, стоило
+    бы выката на каждое уточнение.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-thr"}, "run": {"id": "r-thr"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(client, db, "spike-1235-threshold")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+
+    from hub.services.review_dispatch import review_circle
+
+    for threshold, expected in ((2, True), (3, False), (5, False)):
+        monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", threshold)
+        circle = await review_circle(db, task_id)
+        assert circle.count == 2, "заходов два при любом пороге"
+        assert circle.threshold == threshold
+        assert circle.named is expected, (
+            f"порог {threshold}: круг называется только когда заходов не меньше"
+        )
+
+
+async def test_the_circle_is_named_once_per_generation(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Дедуп в пределах поколения: второй отчёт заходов не прибавляет.
+
+    Лестница добора (#879) кладёт на одно поколение два отчёта. Без дедупа
+    карточка получила бы вторую одинаковую запись про тот же круг.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-once"}, "run": {"id": "r-once"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-once")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+
+    from hub.services.review_dispatch import name_the_circle
+
+    assert await name_the_circle(db, task_id) is True
+    assert await name_the_circle(db, task_id) is False
+    assert len(await _circle_notices(db, task_id)) == 1
+
+
+async def test_findings_left_unclosed_are_not_a_lap(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Заход требует, чтобы находки БЫЛИ ЗАКРЫТЫ правкой.
+
+    Пересдача, на которой автор объявил находки ложными или отложил их, —
+    не круг: работы по коду на ней не было, а разговор про ложные находки
+    — это разговор про точность харнесса, и у него свои метрики. Без этого
+    теста мутация «считать заходом любую пересдачу, где отчёты были»
+    осталась бы живой: предыдущий контроль ловит только пересдачу вообще
+    без находок.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-open"}, "run": {"id": "r-open"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-unclosed")
+    layers = [
+        ([_confirmed("гонка", "concurrency", 10)], [_unresolved("A")]),
+        ([_confirmed("код возврата", "error-handling", 20)], [_unresolved("B")]),
+        ([_confirmed("утечка", "resource-leak", 30)], [_unresolved("C")]),
+    ]
+    previous: tuple[int, int, list[dict], list[dict]] | None = None
+    for generation, (confirmed, unresolved) in enumerate(layers, start=1):
+        review_id = await _generation_with_findings(
+            db, task_id, generation, confirmed=confirmed, unresolved=unresolved
+        )
+        if previous is not None:
+            prev_review, prev_generation, prev_conf, prev_unres = previous
+            await _author_closed_them(
+                db,
+                task_id,
+                prev_review,
+                prev_generation,
+                confirmed=prev_conf,
+                unresolved=prev_unres,
+                outcome_confirmed="false_positive",
+                outcome_unresolved="not_a_defect",
+            )
+        previous = (review_id, generation, confirmed, unresolved)
+
+    from hub.services.review_dispatch import name_the_circle, review_circle
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 0, (
+        "находки были и новые приходили, но чинить автор ничего не стал — "
+        "заходом это не считается"
+    )
+    assert await name_the_circle(db, task_id) is False
+    assert await _circle_notices(db, task_id) == []
+
+
+async def test_a_circle_of_uncategorised_findings_claims_no_repeat(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Круг из ОДНИХ неразрешённых находок не объявляет повтор категории.
+
+    Это форма круга, который оплачивался живьём: #1171 — ноль
+    подтверждённых и пять НОВЫХ неразрешённых, #1208 — четыре
+    неразрешённые. У неразрешённой записи категории нет по модели (#1085),
+    и здесь она остаётся пустой.
+
+    МУТАЦИЯ, которую тест обязан ловить: снять отсев пустой категории в
+    сравнении на повтор. Тогда «неизвестно» склеилось бы с «то же самое», и
+    САМЫЙ СИЛЬНЫЙ сигнал этой задачи — «харнесс ходит по одному месту, и
+    это важнее числа заходов» — срабатывал бы на каждом круге, собранном из
+    неразрешённых находок, то есть на самом частом. Человека звали бы
+    разбираться с повтором, которого никто не наблюдал, да ещё и с пустым
+    именем категории в тексте.
+    """
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-nocat"}, "run": {"id": "r-nocat"}}
+    )
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-uncategorised")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([], [_unresolved("адъюдикаторы разошлись про А")]),
+            ([], [_unresolved("адъюдикаторы разошлись про Б")]),
+            ([], [_unresolved("адъюдикаторы разошлись про В")]),
+        ],
+    )
+
+    from hub.services.review_dispatch import name_the_circle, review_circle
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 2, (
+        "заходы считаются и по неразрешённым: круг с прода состоял в "
+        "основном из них, и счёт по одним подтверждённым не увидел бы его"
+    )
+    assert circle.repeated_categories == (), (
+        "категории у неразрешённых находок нет — это «неизвестно», а не «та же самая»"
+    )
+    assert [lap.repeated_categories for lap in circle.laps] == [(), ()]
+
+    assert await name_the_circle(db, task_id) is True
+    said = (await _circle_notices(db, task_id))[0]
+    assert "ОТДЕЛЬНО" not in said and "Повтор категории" not in said, (
+        "круг назван, а повтор категории — нет: это разные признаки"
+    )
+
+
+async def test_the_repeat_reaches_the_reviewer_brief_text(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Повтор категории доходит до СТРОКИ брифа, а не только до поля.
+
+    Ревьюер читает бриф текстом (hub_get_review_brief склеивает его в
+    строки), и признак, оставшийся в структуре, до него не доходит. Тест
+    ловит мутацию, снимающую повтор из строки: число заходов в ней при
+    этом остаётся, и по нему одному подмену не заметить.
+    """
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-brief"}, "run": {"id": "r-brief"}}
+    )
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-brief")
+    same = "test-adequacy"
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("мутация выжила в А", same, 10)], []),
+            ([_confirmed("мутация выжила в Б", same, 20)], []),
+            ([_confirmed("мутация выжила в В", same, 30)], []),
+        ],
+    )
+
+    from hub.mcp_server import _review_circle_line
+    from hub.services.review_brief import build_review_brief
+
+    brief = await build_review_brief(db, task_id)
+    assert brief.review_circle.repeated_categories == [same]
+    rendered = _review_circle_line(brief.model_dump())
+    assert "Круг ревью: заходов 2" in rendered
+    assert f"Повтор категории: {same}" in rendered, (
+        "признак, не дошедший до строки брифа, ревьюер не прочитает"
+    )
+    assert "важнее числа заходов" in rendered
+
+
+async def test_a_zero_threshold_switches_the_signal_off(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Порог 0 выключает сигнал, а не зовёт человека на каждую задачу.
+
+    Ноль — это то, чем такую вещь выключают в конфиге, и без явной защиты
+    сравнение «заходов не меньше порога» стало бы истинным при НУЛЕ
+    заходов: карточка каждой задачи получила бы алерт о круге, которого
+    нет. Порог выбран по трём наблюдениям одного дня, так что выключатель
+    ему понадобится раньше, чем следующее уточнение.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-off"}, "run": {"id": "r-off"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 0)
+
+    from hub.services.review_dispatch import name_the_circle, review_circle
+
+    quiet = await _submitted(client, db, "spike-1235-off-quiet")
+    circle = await review_circle(db, quiet)
+    assert circle.count == 0 and circle.threshold == 0
+    assert not circle.named, "ноль заходов при пороге 0 — это не круг"
+    assert await name_the_circle(db, quiet) is False
+    assert await _circle_notices(db, quiet) == []
+
+    # И на задаче, которая по кругу действительно идёт, ноль тоже молчит.
+    spinning = await _submitted(client, db, "spike-1235-off-spinning")
+    await _walk_the_circle(
+        db,
+        spinning,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+    spun = await review_circle(db, spinning)
+    assert spun.count == 2, "заходы считаются по-прежнему"
+    assert not spun.named, "но при пороге 0 человека не зовут"
+    assert await name_the_circle(db, spinning) is False
+
+
+async def test_a_deeper_lap_is_named_again_on_the_next_generation(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Следующий заход называется СНОВА: дедуп живёт в пределах поколения.
+
+    МУТАЦИЯ, которую тест обязан ловить: убрать номер поколения из метки
+    дедупа. Одна запись за всю жизнь задачи прошла бы тест на дедуп в
+    пределах одной сдачи целиком, а на проде означала бы, что про третий,
+    четвёртый и пятый заходы человеку не скажут ничего — как раз тогда,
+    когда круг стал дороже всего.
+    """
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-again"}, "run": {"id": "r-again"}}
+    )
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-again")
+    layers = [
+        ([_confirmed("гонка", "concurrency", 10)], []),
+        ([_confirmed("код возврата", "error-handling", 20)], []),
+        ([_confirmed("утечка", "resource-leak", 30)], []),
+    ]
+    await _walk_the_circle(db, task_id, layers)
+
+    from hub.services.review_dispatch import name_the_circle, review_circle
+
+    assert await name_the_circle(db, task_id) is True
+    assert len(await _circle_notices(db, task_id)) == 1
+
+    # Автор закрыл третий слой, пересдал, и четвёртый отчёт принёс новое.
+    await _author_closed_them(
+        db,
+        task_id,
+        await _last_review_id(db, task_id),
+        3,
+        confirmed=layers[2][0],
+        unresolved=layers[2][1],
+    )
+    await _generation_with_findings(
+        db,
+        task_id,
+        4,
+        confirmed=[_confirmed("дескриптор не закрыт", "resource-leak", 40)],
+    )
+
+    assert (await review_circle(db, task_id)).count == 3, "заходов стало три"
+    assert await name_the_circle(db, task_id) is True, (
+        "новый заход — новая сдача — новая запись: молчание про углубившийся "
+        "круг было бы худшим из возможных исходов"
+    )
+    notices = await _circle_notices(db, task_id)
+    assert len(notices) == 2
+    assert "3-й раз" in notices[1], "и во второй раз названо новое число заходов"
