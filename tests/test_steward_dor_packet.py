@@ -25,6 +25,7 @@ from hub.services.steward_dor_packet import (
     LOCATOR_NO_LOCATOR,
     LOCATOR_NOT_TEST_BOUND,
     LOCATOR_RESOLVABLE,
+    LOCATOR_UNKNOWN,
     LOCATOR_UNRESOLVED,
     NO_ACCEPTANCE_CRITERIA,
     NO_DECLARED_AREAS,
@@ -100,6 +101,7 @@ async def _draft(
     reasons: list[str] | None = None,
     description: str = "постановка",
     branch: str | None = _BRANCH,
+    readiness: bool = True,
 ) -> int:
     project_id = await repo.create_project(
         db,
@@ -130,8 +132,10 @@ async def _draft(
         affected_areas=json.dumps(areas if areas is not None else ["hub/services"]),
         risk_class=risk_class,
         risk_class_reasons=json.dumps(reasons if reasons is not None else ["R2: хаб"]),
-        readiness_score=94,
-        dor_passed=1,
+        # Готовность пишется, только когда её ПОСЧИТАЛИ: свежая задача держит
+        # в обеих колонках NULL, и тест, который всегда проставляет 94/1, не
+        # умеет отличить непосчитанное от посчитанного и плохого.
+        **({"readiness_score": 94, "dor_passed": 1} if readiness else {}),
         statement_generation=3,
     )
     await db.commit()
@@ -182,6 +186,9 @@ async def test_locator_states_are_distinguishable(
     await _ac(db, task_id, "AC-2", test_ref="tests/test_x.py::test_missing")
     await _ac(db, task_id, "AC-3", test_ref=None)
     await _ac(db, task_id, "AC-4", verifiable_by="manual")
+    # Локатор чужого раннера: заглянуть внутрь хаб не умеет (#1203), и это
+    # не «теста нет», а «я не смотрел».
+    await _ac(db, task_id, "AC-5", test_ref="tests/x.test.ts::renders")
 
     packet = await build_draft_packet(db, task_id)
 
@@ -194,11 +201,19 @@ async def test_locator_states_are_distinguishable(
         "AC-2": LOCATOR_UNRESOLVED,
         "AC-3": LOCATOR_NO_LOCATOR,
         "AC-4": LOCATOR_NOT_TEST_BOUND,
+        "AC-5": LOCATOR_UNKNOWN,
     }
-    # Ни одно состояние не сведено к другому — четыре имени, четыре значения.
-    assert len(set(states.values())) == 4
+    # Ни одно состояние не сведено к другому — пять имён, пять значений.
+    assert len(set(states.values())) == 5
     assert fact.value["counts"][LOCATOR_UNRESOLVED] == 1
     assert fact.value["counts"][LOCATOR_NO_LOCATOR] == 1
+    assert fact.value["counts"][LOCATOR_UNKNOWN] == 1
+    # Каждый статус #506 разложен поимённо. Проверяется именно то, что
+    # состояние не выводится ОТРИЦАНИЕМ одного имени: подмена условия на
+    # «status != missing» увела бы AC-5 в resolvable, а «status != resolvable»
+    # — в unresolved, и обе подмены обрушивают именно это равенство.
+    by_state = {i["ac_id"]: i["status"] for i in fact.value["criteria"]}
+    assert by_state["AC-5"] == "unknown"
     # Причина исходного расчёта едет как есть: пакет раскладывает ответ #506,
     # а не заменяет его собой — иначе это был бы второй расчёт.
     by_id = {i["ac_id"]: i for i in fact.value["criteria"]}
@@ -339,8 +354,86 @@ async def test_statement_travels_as_data_not_instruction(
     assert draft_packet_payload(loud)["injection_suspected"] is True
     # Счёт готовности едет рядом с фактами, а не среди них: у него нет кода
     # в закрытом словаре, и сослаться на него как на основание нельзя.
-    assert quiet.readiness == {"score": 94, "dor_passed": True}
+    assert quiet.readiness == {"score": 94, "dor_passed": True, "computed": True}
     assert "readiness" not in quiet.facts
+
+
+async def test_real_draft_without_branch_does_not_accuse_the_locator(
+    db: aiosqlite.Connection, clone: Path
+):
+    """Драфт КАК ОН ЕСТЬ: ни ветки, ни коммита, ни подменённого сбора.
+
+    Остальные тесты дают задаче ветку и подменяют сбор, потому что их предмет
+    — как пакет РАСКЛАДЫВАЕТ уже посчитанный ответ #506. Но настоящий драфт
+    ветки не имеет по определению, и на нём расчёт отвечает ``unknown`` про
+    каждый названный локатор: коллекция не стартует, файла на «сданном
+    коммите» нет, читать нечего.
+
+    Сваленные в ``unresolved``, эти ответы говорили бы «хаб посмотрел и теста
+    нет» про локатор, указывающий на СУЩЕСТВУЮЩИЙ тест, — и это не угловой
+    случай, а нормальное состояние всякого драфта, то есть тот самый промах
+    #762 на пути, ради которого пакет и собирается.
+    """
+    task_id = await _draft(db, clone, title="real draft", branch=None)
+    await _ac(db, task_id, "AC-1", test_ref="tests/test_x.py::test_present")
+    await _ac(db, task_id, "AC-2", test_ref=None)
+    await _ac(db, task_id, "AC-3", verifiable_by="manual")
+
+    packet = await build_draft_packet(db, task_id)
+
+    assert packet is not None
+    fact = packet.fact("ac_locator")
+    assert fact.state == PRESENT
+    states = _states(fact)
+    # Локатор AC-1 назван и указывает на существующий тест. Хаб этого не
+    # видит — и говорит «не знаю», а не «не нашёл».
+    assert states["AC-1"] == LOCATOR_UNKNOWN
+    assert fact.value["counts"][LOCATOR_UNRESOLVED] == 0
+    # Различимость, ради которой пакет существует, переживает отсутствие
+    # ветки: обвинение, незнание и отсутствие локатора остаются тремя разными
+    # ответами, а не одним.
+    assert states["AC-2"] == LOCATOR_NO_LOCATOR
+    assert states["AC-3"] == LOCATOR_NOT_TEST_BOUND
+    assert len(set(states.values())) == 3
+    # Причина незнания едет как есть — стюарду видно, ПОЧЕМУ хаб не смотрел.
+    by_id = {i["ac_id"]: i for i in fact.value["criteria"]}
+    assert by_id["AC-1"]["status"] == "unknown"
+    assert by_id["AC-1"]["reason"]
+    # Остальные драфтовые факты на этом же пути собираются, а не падают.
+    assert packet.fact("risk_class").state == PRESENT
+    assert packet.fact("dependency_state").state == PRESENT
+    assert set(draft_packet_payload(packet)["facts"]) == set(DRAFT_GROUND_SOURCES)
+
+
+async def test_uncomputed_readiness_is_not_a_failed_dor(
+    db: aiosqlite.Connection, clone: Path, collection
+):
+    """«DoR не считали» и «DoR посчитан и не пройден» — разные ответы.
+
+    Свежесозданная задача держит в ``readiness_score`` и ``dor_passed`` NULL:
+    ``create_task`` их не пишет. ``bool(None)`` давал ``False``, и пакет
+    сообщал стюарду посчитанный провал там, где счёта не было вовсе. Первое
+    просит запустить расчёт, второе — вернуть постановку автору, и судья,
+    читающий их как одно, ошибётся в сторону отказа.
+
+    Два драфта собираются рядом, и различие видно по значению, а не по тому,
+    что поле пустое.
+    """
+    fresh = await _draft(db, clone, title="uncomputed", readiness=False)
+    scored = await _draft(db, clone, title="computed", readiness=True)
+
+    blank = await build_draft_packet(db, fresh)
+    known = await build_draft_packet(db, scored)
+
+    assert blank is not None and known is not None
+    assert blank.readiness == {"score": None, "dor_passed": None, "computed": False}
+    assert known.readiness == {"score": 94, "dor_passed": True, "computed": True}
+    # Непосчитанное не читается как провал: ``False`` здесь означал бы, что
+    # хаб считал и не досчитался.
+    assert blank.readiness["dor_passed"] is not False
+    # И то же различие уезжает за дверь, а не теряется в сериализации.
+    assert draft_packet_payload(blank)["readiness"]["computed"] is False
+    assert draft_packet_payload(known)["readiness"]["computed"] is True
 
 
 async def test_missing_task_is_none_not_empty_packet(db: aiosqlite.Connection):

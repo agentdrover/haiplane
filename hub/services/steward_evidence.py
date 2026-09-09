@@ -414,11 +414,18 @@ async def dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFac
     same edges: two builders of one source would drift, and a steward reading
     "blocked by nothing" from two different computations could not be told
     which one it read.
+
+    Delivery is read from the ``delivered`` key the repository already put on
+    the edge (#485). It used to be recomputed here from ``merges``, a column
+    ``_blocker_entry`` pops on its way out — so ``get`` always answered None,
+    every blocker came back undelivered, and a task whose blockers had all
+    landed still read "не доставлено N". The steward would have refused a
+    ready draft on a fact the hub itself contradicts.
     """
     source = "dependency_state"
     edges = await repo.list_task_dependencies(db, task_id)
     blocked_by = [dict(e) for e in edges.get("blocked_by", [])]
-    undelivered = [e for e in blocked_by if not (e.get("merges") or 0)]
+    undelivered = [e for e in blocked_by if not e.get("delivered")]
     return present(
         source,
         f"блокеров {len(blocked_by)}, не доставлено {len(undelivered)}",
@@ -426,7 +433,11 @@ async def dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFac
             {
                 "task_id": e.get("task_id"),
                 "status": e.get("status"),
-                "delivered": bool(e.get("merges") or 0),
+                "delivered": bool(e.get("delivered")),
+                # Почему не доставлено: «PR не заявлен» и «PR не смержен
+                # гейтом» — разные следующие шаги, и репозиторий их уже
+                # различил (#485).
+                "reason": e.get("reason") or "",
             }
             for e in blocked_by
         ],

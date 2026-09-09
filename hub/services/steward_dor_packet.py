@@ -28,9 +28,13 @@
 не смог посмотреть или смотреть было не на что). Пустое значение никогда не
 выдаётся за значение — на #762 непрочитанный клон прочитался как чистое
 дерево, а на харнессе ``raw_count=0`` — как «находок нет» вместо «данных
-нет». На драфте у этой ошибки есть своя форма: «локатор не разрешился» и
-«локатора нет» — разные факты, и судья, читающий их как один, ошибётся в
-пользу одобрения.
+нет». На драфте у этой ошибки есть своя форма, и не одна: «локатор не
+разрешился» и «локатора нет» — разные факты, и судья, читающий их как один,
+ошибётся в пользу одобрения. А «хаб посмотрел и теста нет» против «хаб не
+смотрел» — то же различие ещё на зарубку дальше, и вот оно на драфте не
+угловое: ветки у драфта нет, поэтому расчёт локаторов отвечает ``unknown``
+про КАЖДЫЙ названный локатор, включая тот, что указывает на существующий
+тест. Сведи их — и пакет обвинит годную постановку в несуществующем грехе.
 
 ТЕКСТ ПОСТАНОВКИ ИДЁТ КАК ДАННЫЕ. Он написан автором задачи и уезжает в
 модель, решающую судьбу этой же задачи, — то есть это последний канал, по
@@ -88,12 +92,13 @@ if _outside:  # pragma: no cover — падает при импорте, до л
 NO_ACCEPTANCE_CRITERIA = "no_acceptance_criteria"
 NO_DECLARED_AREAS = "no_declared_areas"
 
-# Состояния локатора. Их четыре, и ни одно не сводится к другому.
+# Состояния локатора. Их пять, и ни одно не сводится к другому.
 #
 # ``resolvable``   локатор назван и разрешается в существующий тест;
-# ``unresolved``   локатор назван, но в тест не разрешился — тест не найден,
-#                  файл не разобрался, посмотреть не удалось; какая именно из
-#                  причин, едет в ``status``/``reason`` расчёта;
+# ``unresolved``   локатор назван, хаб ПОСМОТРЕЛ и теста не нашёл;
+# ``unknown``      локатор назван, но посмотреть не удалось — ветки нет, файл
+#                  не прочитался, раннер незнакомый; хаб не знает ответа и
+#                  этого не скрывает;
 # ``no_locator``   критерий обещает проверку тестом и НЕ НАЗЫВАЕТ теста; это
 #                  не неудача разрешения, а отсутствие того, что разрешать;
 # ``not_test_bound`` критерий не обещает теста вовсе — локатора и не ждали.
@@ -102,14 +107,26 @@ NO_DECLARED_AREAS = "no_declared_areas"
 # сводит их в один статус ``missing`` (у пустого test_ref причина «no valid
 # test locator in test_ref», у ненайденного — «locator does not match any
 # collected test»), и на драфте это разные основания вернуть постановку.
+#
+# Разделение ``unresolved`` и ``unknown`` — тот же промах #762 на одну зарубку
+# дальше, и на драфте это НЕ угловой случай, а норма: у драфта нет ветки, сбор
+# не стартует, файл читать не из чего, и расчёт отвечает ``unknown`` про КАЖДЫЙ
+# названный локатор — в том числе про тот, что указывает на существующий тест.
+# Свалив ``unknown`` в ``unresolved``, пакет говорил бы «хаб посмотрел и теста
+# нет» ровно там, где хаб не смотрел вовсе, — и стюард вернул бы годную
+# постановку за несуществующий грех.
 LOCATOR_RESOLVABLE = "resolvable"
 LOCATOR_UNRESOLVED = "unresolved"
+LOCATOR_UNKNOWN = "unknown"
 LOCATOR_NO_LOCATOR = "no_locator"
 LOCATOR_NOT_TEST_BOUND = "not_test_bound"
 
-# Статус расчёта #506, означающий «названный тест существует». Остальные три
-# (missing, unparseable, unknown) говорят каждый своё и здесь не уравниваются.
+# Статусы расчёта #506. ``resolvable`` — «названный тест существует».
+# ``missing`` — «посмотрел, не нашёл». ``unknown`` и ``unparseable`` — «смотреть
+# не удалось»: первый про ветку и раннер, второй про нечитаемый файл, и оба
+# говорят о хабе, а не о тесте. Здесь они не уравниваются.
 _RESOLVABLE_STATUS = "resolvable"
+_COULD_NOT_LOOK_STATUSES = frozenset({"unknown", "unparseable"})
 
 
 @dataclass(frozen=True)
@@ -166,11 +183,19 @@ def _locator_state(resolution: dict[str, Any]) -> str:
     раскладывает. Единственное, что она смотрит сама, — назван ли локатор
     вообще; это чтение заявленного поля, а не проверка того, существует ли
     названный тест.
+
+    Каждый статус расчёта разложен ПОИМЁННО, а не «всё кроме resolvable».
+    Отрицанием одного имени неизвестность попадала бы в ту же корзину, что и
+    ненайденный тест, а любой новый статус #506 молча приезжал бы в
+    ``unresolved`` — то есть обвинением там, где ответа нет.
     """
-    if (resolution.get("status") or "") == _RESOLVABLE_STATUS:
+    status = (resolution.get("status") or "").strip()
+    if status == _RESOLVABLE_STATUS:
         return LOCATOR_RESOLVABLE
     if not (resolution.get("locator") or "").strip():
         return LOCATOR_NO_LOCATOR
+    if status in _COULD_NOT_LOOK_STATUSES:
+        return LOCATOR_UNKNOWN
     return LOCATOR_UNRESOLVED
 
 
@@ -226,6 +251,7 @@ def _ac_locator_fact(brief: Any) -> EvidenceFact:
         for state in (
             LOCATOR_RESOLVABLE,
             LOCATOR_UNRESOLVED,
+            LOCATOR_UNKNOWN,
             LOCATOR_NO_LOCATOR,
             LOCATOR_NOT_TEST_BOUND,
         )
@@ -234,6 +260,7 @@ def _ac_locator_fact(brief: Any) -> EvidenceFact:
         source,
         f"критериев {len(items)}: разрешается {counts[LOCATOR_RESOLVABLE]}, "
         f"не разрешилось {counts[LOCATOR_UNRESOLVED]}, "
+        f"посмотреть не удалось {counts[LOCATOR_UNKNOWN]}, "
         f"без локатора {counts[LOCATOR_NO_LOCATOR]}, "
         f"без обещания теста {counts[LOCATOR_NOT_TEST_BOUND]}",
         criteria=items,
@@ -312,11 +339,23 @@ def _statement_quotes(task: dict[str, Any]) -> tuple[QuotedText, ...]:
 
 
 def _readiness(task: dict[str, Any]) -> dict[str, Any]:
-    """Счёт готовности, как его посчитал хаб. Контекст, не основание."""
+    """Счёт готовности, как его посчитал хаб. Контекст, не основание.
+
+    Непосчитанное отличается от посчитанного и плохого — то же правило #762,
+    что и у фактов, и здесь оно нужно даже сильнее: свежесозданная задача
+    держит в обеих колонках NULL, ``bool(None)`` давал ``False``, и «DoR не
+    считали» уезжало стюарду как «DoR посчитан и не пройден». Первое просит
+    посчитать, второе — вернуть постановку автору.
+
+    ``computed`` отвечает на это одним полем, чтобы читателю не пришлось
+    выводить смысл из того, что оба значения оказались ``None``.
+    """
     score = task.get("readiness_score")
+    passed = task.get("dor_passed")
     return {
         "score": int(score) if score is not None else None,
-        "dor_passed": bool(task.get("dor_passed")),
+        "dor_passed": bool(passed) if passed is not None else None,
+        "computed": score is not None or passed is not None,
     }
 
 
@@ -397,6 +436,7 @@ __all__ = [
     "LOCATOR_NOT_TEST_BOUND",
     "LOCATOR_NO_LOCATOR",
     "LOCATOR_RESOLVABLE",
+    "LOCATOR_UNKNOWN",
     "LOCATOR_UNRESOLVED",
     "NO_ACCEPTANCE_CRITERIA",
     "NO_DECLARED_AREAS",

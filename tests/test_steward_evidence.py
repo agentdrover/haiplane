@@ -24,6 +24,7 @@ from hub.services.steward_evidence import (
     PRESENT,
     REPORT_OTHER_GENERATION,
     build_evidence_packet,
+    dependency_fact,
     present,
 )
 from tests.test_finding_evidence import (
@@ -402,3 +403,47 @@ async def test_payload_carries_quotes_with_their_authors(
         assert isinstance(quoted["signals"], list)
     # Старые поля на месте: правка только добавляет.
     assert {"task_id", "generation", "brief", "facts", "absent_sources"} <= set(payload)
+
+
+async def test_delivered_blocker_is_not_reported_undelivered(
+    db: aiosqlite.Connection, tmp_path: Path
+):
+    """#485 в факте: доставленный блокер не читается как недоставленный.
+
+    Ревью #319 по #1158 нашло разрыв: ``_blocker_entry`` СНИМАЕТ колонку
+    ``merges`` со строки и отдаёт вместо неё готовое ``delivered``, а факт
+    пересчитывал доставку из снятой колонки — ``get`` отвечал ``None``, и
+    каждый блокер приезжал недоставленным. Стюард получал «не доставлено N»
+    про задачу, у которой доставлено всё, и отказывал по факту, который хаб
+    сам же опровергает соседним полем.
+
+    Проверяются оба блокера сразу и по имени: пара «доставлен / не
+    доставлен» ловит и обратную поломку — «всё доставлено» — которую
+    односторонний тест пропустил бы.
+    """
+    clone = _init_repo(tmp_path / "packet-deps")
+    task_id = await _task_on_clone(db, clone, title="dependent")
+    delivered = await _task_on_clone(db, clone, title="delivered blocker")
+    pending = await _task_on_clone(db, clone, title="pending blocker")
+    await repo.update_task(db, delivered, pr_number=347)
+    await repo.update_task(db, pending, pr_number=348)
+    await repo.add_task_dependency(db, task_id, delivered)
+    await repo.add_task_dependency(db, task_id, pending)
+    # Доставка — это строка о мерже, который сделал сам гейт (#534).
+    await repo.record_pipeline_merge(
+        db, pr_number=347, task_id=delivered, merge_sha="b14eeec"
+    )
+    await db.commit()
+
+    fact = await dependency_fact(db, task_id)
+
+    assert fact.state == PRESENT
+    by_id = {e["task_id"]: e for e in fact.value["blocked_by"]}
+    assert by_id[delivered]["delivered"] is True
+    assert by_id[pending]["delivered"] is False
+    assert fact.value["undelivered"] == 1
+    assert "не доставлено 1" in fact.detail
+    # Причина отказа едет вместе с ним: «PR не смержен» и «PR не заявлен» —
+    # разные следующие шаги, и репозиторий их уже различил.
+    assert by_id[pending]["reason"]
+    assert not by_id[delivered]["reason"]
