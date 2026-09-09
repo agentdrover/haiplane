@@ -644,3 +644,314 @@ async def test_branch_ancestry_unresolvable_ref_is_unknown() -> None:
             "task-424/fix", "task-999/gone", repo="/tmp/repo"
         )
     assert relation == "unknown"
+
+
+# --- #1205: цена обхода. Одна ветка против СПИСКА, и память по SHA ---
+#
+# #1186 сделал этот обход условием мержа, и поллер стал звать его каждый цикл
+# для каждой задачи, ждущей доставки, — а удержание длится часами. Замер ДО
+# правки, снятый этим же способом (N=5, origin/<name> резолвится с первой
+# попытки): 25 git-вызовов, ровно 5N — по три rev-parse и два rev-list на
+# каждого кандидата, при том что ветка под судом и база между кандидатами не
+# меняются. Второй обход подряд стоил ровно столько же: памяти не было вовсе.
+
+
+def _walk_shas(n: int) -> dict[str, str]:
+    """Таблица ссылок обхода: ветка под судом, база и n кандидатов.
+
+    ``origin/<name>`` присутствует, потому что _resolve_ref_remote_first
+    спрашивает его ПЕРВЫМ. Без него ресолв стоит два подпроцесса вместо
+    одного, и цифра обхода вырастает с 5N до 8N — это отдельная цена, и
+    смешивать её с ценой формы вызова нельзя.
+    """
+    names = {"task-424/fix": "aaa111", "develop": "ccc333"}
+    for i in range(n):
+        names[f"task-{500 + i}/other"] = f"bbb{i:03d}"
+    table = {}
+    for name, sha in names.items():
+        table[f"origin/{name}^{{commit}}"] = sha
+        table[f"{name}^{{commit}}"] = sha
+    return table
+
+
+def _counting_git(
+    table: dict[str, str],
+    calls: list[tuple[str, ...]],
+    *,
+    excluded: str = "3",
+    total: str = "3",
+    rev_list_rc: int = 0,
+):
+    """_git, который считает каждый вызов и отвечает по таблице ссылок."""
+
+    async def fake_git(*args, repo=None, check=True, **kw):
+        calls.append(args)
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = table.get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "rev-list":
+            if rev_list_rc:
+                return (rev_list_rc, "", "fatal: bad revision")
+            return (0, total if len(args) == 4 else excluded, "")
+        return (0, "", "")
+
+    return fake_git
+
+
+async def _walk(
+    others: list[str],
+    fake_git,
+    branch: str = "task-424/fix",
+) -> list[tuple[str, object]]:
+    """Один обход: одна ветка против списка кандидатов."""
+    git_ops = GitOpsIntegration()
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        return [
+            (name, result)
+            async for name, result in git_ops.branch_stacking_probe_batch(
+                branch, others, base_branch="develop", repo="/tmp/repo"
+            )
+        ]
+
+
+def _kinds(calls: list[tuple[str, ...]]) -> tuple[int, int]:
+    return (
+        sum(1 for a in calls if a[0] == "rev-parse"),
+        sum(1 for a in calls if a[0] == "rev-list"),
+    )
+
+
+async def test_head_and_base_are_resolved_once_per_walk() -> None:
+    # AC-1. Замер ДО правки на этих же входах: 25 вызовов (5N при N=5) —
+    # по ТРИ rev-parse на кандидата, потому что ветка под судом и база
+    # разрешались заново на каждой итерации. Вопрос всегда был «одна ветка
+    # против списка», и в этой форме два ресолва выносятся из цикла по
+    # построению, а не потому, что вызывающий не забыл.
+    n = 5
+    others = [f"task-{500 + i}/other" for i in range(n)]
+    calls: list[tuple[str, ...]] = []
+    results = await _walk(others, _counting_git(_walk_shas(n), calls))
+
+    assert len(results) == n, "ответ приходит на каждого кандидата"
+    rev_parse, rev_list = _kinds(calls)
+    assert rev_list == 2 * n, "две rev-list на кандидата — эта работа не убрана"
+    assert rev_parse == n + 2, (
+        "ресолвов ровно n+2: по одному на кандидата плюс ветка и база на весь обход"
+    )
+    assert len(calls) == 3 * n + 2 == 17, "3N+2 вместо 5N=25, снятых до правки"
+
+    # Не «сколько всего», а «сколько раз спросили именно про эти две ссылки»:
+    # суммарная цифра сошлась бы и при перекосе между кандидатами.
+    resolved = [a[-1] for a in calls if a[0] == "rev-parse"]
+    assert resolved.count("origin/task-424/fix^{commit}") == 1
+    assert resolved.count("origin/develop^{commit}") == 1
+
+
+async def test_an_unchanged_walk_does_not_ask_git_twice() -> None:
+    # AC-2. Поллер повторяет обход каждый цикл, пока держит доставку, а ответ
+    # зависит только от того, что запушено. Пока все три SHA стоят на месте,
+    # rev-list не повторяется вовсе.
+    #
+    # ЧТО ЗДЕСЬ НЕ НОЛЬ И ПОЧЕМУ. Ресолвы на втором обходе платятся: SHA — это
+    # и есть проверка, что ответ ещё годен. Пропустить их можно было бы только
+    # инвалидацией по времени, а она запрещена ограничением задачи и стоит
+    # ровно того мержа поверх несмерженной ветки, ради запрета которого
+    # заведена #1186. Так что «git-работа не повторяется» — про пробу, и
+    # цифра ниже названа отдельно по каждому виду вызова, а не одной суммой.
+    n = 5
+    others = [f"task-{500 + i}/other" for i in range(n)]
+    table = _walk_shas(n)
+
+    first: list[tuple[str, ...]] = []
+    before = await _walk(others, _counting_git(table, first))
+    second: list[tuple[str, ...]] = []
+    after = await _walk(others, _counting_git(table, second))
+
+    assert [r for _, r in after] == [r for _, r in before], "ответ тот же"
+    assert _kinds(second)[1] == 0, "ни одной rev-list на повторном обходе"
+    assert len(second) == n + 2, "остаётся только проверка свежести — ресолвы"
+    assert len(second) < len(first)
+
+
+async def test_a_moved_branch_is_asked_about_again() -> None:
+    # AC-3. Устаревший clear перед необратимым мержем — это ровно инцидент
+    # 06.09.2026. Ключ памяти — тройка SHA, поэтому сдвиг ЛЮБОЙ из них делает
+    # прошлый ответ негодным. Проверяются оба конца: кандидат и база.
+    others = ["task-500/other"]
+    table = _walk_shas(1)
+
+    calls: list[tuple[str, ...]] = []
+    first = await _walk(others, _counting_git(table, calls, excluded="3"))
+    assert first[0][1].outcome is StackProbeOutcome.clear
+
+    moved_candidate = dict(table)
+    moved_candidate["origin/task-500/other^{commit}"] = "bbb999"
+    moved_candidate["task-500/other^{commit}"] = "bbb999"
+    calls = []
+    again = await _walk(others, _counting_git(moved_candidate, calls, excluded="1"))
+    assert _kinds(calls)[1] == 2, "кандидат сдвинулся — git спрошен заново"
+    assert again[0][1].outcome is StackProbeOutcome.stacked, (
+        "новый ответ, а не clear из памяти"
+    )
+
+    moved_base = dict(table)
+    moved_base["origin/develop^{commit}"] = "ccc999"
+    moved_base["develop^{commit}"] = "ccc999"
+    calls = []
+    again = await _walk(others, _counting_git(moved_base, calls, excluded="1"))
+    assert _kinds(calls)[1] == 2, "сдвинулась база — git спрошен заново"
+    assert again[0][1].outcome is StackProbeOutcome.stacked
+
+
+async def test_an_unresolvable_sha_is_never_cached() -> None:
+    # AC-4. Нечем проверить актуальность — значит спрашиваем git. Два способа
+    # не получить ответ, и ни один не оседает в памяти.
+    from hub.integrations import git_ops as git_ops_mod
+
+    # (1) ссылку кандидата не разрешить: ключа нет вовсе.
+    others = ["task-999/gone"]
+    calls: list[tuple[str, ...]] = []
+    first = await _walk(others, _counting_git(_walk_shas(1), calls))
+    assert first[0][1].outcome is StackProbeOutcome.unavailable
+    assert first[0][1].reason == "ref_unresolved"
+    assert git_ops_mod._STACK_PROBE_CACHE == {}, "в память не попало"
+
+    calls = []
+    await _walk(others, _counting_git(_walk_shas(1), calls))
+    assert _kinds(calls)[0] > 0, "и из памяти не взялось — ресолв повторён"
+
+    # (2) SHA разрешились, но rev-list отказал. Это retryable по построению
+    # (#1197), и запомнить отказ значило бы приклеить одну сорванную попытку
+    # к паре коммитов навсегда.
+    others = ["task-500/other"]
+    table = _walk_shas(1)
+    failed = await _walk(others, _counting_git(table, [], rev_list_rc=128))
+    assert failed[0][1].outcome is StackProbeOutcome.unavailable
+    assert failed[0][1].reason == "rev_list_failed"
+    assert git_ops_mod._STACK_PROBE_CACHE == {}
+
+    calls = []
+    healed = await _walk(others, _counting_git(table, calls, excluded="1"))
+    assert _kinds(calls)[1] == 2, "git спрошен заново, а не отказ из памяти"
+    assert healed[0][1].outcome is StackProbeOutcome.stacked
+
+
+async def test_probe_answers_unchanged_after_batching() -> None:
+    # AC-5. Форма вызова поменялась, ответы — нет. Все существующие исходы
+    # пробы прогоняются через ОДИНОЧНЫЙ вход (тот, которым пользуются оба
+    # advisory-потребителя) и дают ровно то же, что до правки.
+    from hub.integrations import git_ops as git_ops_mod
+
+    probe = GitOpsIntegration().branch_stacking_probe
+
+    async def ask(fake, other: str = "task-392/base"):
+        # Память забывается между сценариями, и только здесь. Все они стоят
+        # на ОДНИХ И ТЕХ ЖЕ трёх SHA и меняют лишь то, что отвечает rev-list,
+        # — в git так не бывает, и память вправе на это опираться. Чистка
+        # оставляет предметом проверки именно ответ пробы, а не то, что она
+        # ответила в прошлом сценарии.
+        git_ops_mod._stack_probe_cache_clear()
+        with patch("hub.integrations.git_ops._git", side_effect=fake):
+            return await probe(
+                "task-424/fix", other, base_branch="develop", repo="/tmp/repo"
+            )
+
+    stacked = await ask(_fake_git_factory("1"))
+    assert stacked.outcome is StackProbeOutcome.stacked
+    assert stacked.reason == "shares_unmerged_commits"
+    assert "2 of 3" in (stacked.details or "")
+
+    clear = await ask(_fake_git_factory("3"))
+    assert clear.outcome is StackProbeOutcome.clear
+    assert clear.reason == "no_shared_unmerged_commits"
+
+    merged_base = await ask(_fake_git_factory("0", total_count="0"))
+    assert merged_base.outcome is StackProbeOutcome.clear
+
+    gone = await ask(_fake_git_factory("0"), other="task-999/gone")
+    assert gone.outcome is StackProbeOutcome.unavailable
+    assert gone.reason == "ref_unresolved"
+    assert "task-999/gone" in (gone.details or "")
+
+    async def failing_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = _shas().get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "rev-list":
+            return (128, "", "fatal: bad revision")
+        return (0, "", "")
+
+    broken = await ask(failing_git)
+    assert broken.outcome is StackProbeOutcome.unavailable
+    assert broken.reason == "rev_list_failed"
+
+    unparseable = await ask(_fake_git_factory("не число", total_count="тоже не число"))
+    assert unparseable.outcome is StackProbeOutcome.unavailable
+    assert unparseable.reason == "rev_list_unparseable"
+
+    # И старый bool-предикат: плагин, у которого пробы нет вовсе, по-прежнему
+    # отвечает — и по-прежнему не выдаёт своё False за clear.
+    legacy = NoopGitOps()
+    legacy.branch_stacking_probe = None
+    walked = [
+        result
+        async for _, result in legacy.branch_stacking_probe_batch(
+            "task-424/fix", ["task-392/base"], base_branch="develop"
+        )
+    ]
+    assert walked[0].outcome is StackProbeOutcome.unsupported
+    assert walked[0].reason == "legacy_bool_predicate"
+
+
+class _RaisesOnOneCandidate(NoopGitOps):
+    """Плагин, который срывается на одном кандидате и отвечает на остальных."""
+
+    def __init__(self, raises: str, stacked_with: str):
+        self.raises = raises
+        self.stacked_with = stacked_with
+        self.asked: list[str] = []
+
+    async def branch_stacking_probe(
+        self,
+        branch: str,
+        other_branch: str,
+        base_branch: str | None = None,
+        repo: str | None = None,
+    ):
+        self.asked.append(other_branch)
+        if other_branch == self.raises:
+            raise RuntimeError("no repo access")
+        from hub.integrations.protocols import StackProbeResult
+
+        if other_branch == self.stacked_with:
+            return StackProbeResult(
+                outcome=StackProbeOutcome.stacked, reason="shares_unmerged_commits"
+            )
+        return StackProbeResult(
+            outcome=StackProbeOutcome.clear, reason="no_shared_unmerged_commits"
+        )
+
+
+async def test_a_raising_candidate_does_not_end_the_walk(
+    db: aiosqlite.Connection,
+) -> None:
+    # Пакетный обход — это ОДИН генератор, и срыв на одном кандидате закрыл бы
+    # его вместе с ещё не спрошенными строками. До #1205 цикл шёл по парам, и
+    # срыв стоил ровно одну строку. Неспрошенная строка — это ровно та, что
+    # может лежать под нами, поэтому обход обязан дойти до конца: здесь первый
+    # кандидат срывается, а стопка стоит на втором.
+    from hub.services import orchestration
+
+    task_id, branch = await _pair_running_task(db, "Task under judgement")
+    await _base_task_in_review(db, "task-900/raises")
+    await _base_task_in_review(db, "task-901/stacked")
+    fake = _RaisesOnOneCandidate("task-900/raises", "task-901/stacked")
+    plugins.git_ops = fake
+
+    assessment = await orchestration.assess_branch_stacking(db, task_id, branch)
+
+    assert fake.asked == ["task-900/raises", "task-901/stacked"], (
+        "спрошены оба кандидата, а не только первый"
+    )
+    assert assessment.outcome == orchestration.STACK_STACKED
+    assert assessment.base_task_branch == "task-901/stacked"

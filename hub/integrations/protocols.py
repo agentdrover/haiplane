@@ -6,7 +6,7 @@ Hub core depends only on these protocols, never on concrete implementations.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
 from dataclasses import dataclass
 from enum import Enum
@@ -153,6 +153,28 @@ async def stacking_probe_from_predicate(
     )
 
 
+async def stacking_probe_batch_from_probe(
+    probe: Callable[..., Awaitable[StackProbeResult]],
+    branch: str,
+    other_branches: Sequence[str],
+    base_branch: str | None = None,
+    repo: str | None = None,
+) -> AsyncIterator[tuple[str, StackProbeResult]]:
+    """Walk a list with a plugin that only knows the one-pair probe (#1205).
+
+    The degradation path, defined once here for the same reason
+    ``stacking_probe_from_predicate`` is: the delivery gate needs it for any
+    duck-typed plugin that predates the batch, and the answers must be the
+    ones that plugin gives — a walk over its own probe, not a substitute for
+    it. The saving is lost, the answers are not.
+    """
+    for other_branch in other_branches:
+        yield (
+            other_branch,
+            await probe(branch, other_branch, base_branch=base_branch, repo=repo),
+        )
+
+
 @runtime_checkable
 class DispatchPlugin(Protocol):
     def is_available(self) -> bool: ...
@@ -248,6 +270,13 @@ class GitOpsPlugin(Protocol):
         base_branch: str | None = None,
         repo: str | None = None,
     ) -> StackProbeResult: ...
+    def branch_stacking_probe_batch(
+        self,
+        branch: str,
+        other_branches: Sequence[str],
+        base_branch: str | None = None,
+        repo: str | None = None,
+    ) -> AsyncIterator[tuple[str, StackProbeResult]]: ...
     async def branch_ancestry(
         self,
         branch: str,
