@@ -234,6 +234,49 @@ def steward_section_state(payload: dict) -> str:
     return MEASURED if STEWARD_SECTION_KEY in payload else UNMEASURED
 
 
+def _report_outcome_of(mr) -> dict:
+    """Ступень лестницы исходов у отчёта, стоящего за автовердиктом (#1234).
+
+    Отсутствие отчёта названо словом, а не пустым словарём: автовердикт без
+    отчёта и автовердикт по чистому отчёту — разные вещи, и пустое место
+    рядом с задачей читается как «всё в порядке» ровно так же, как читались
+    «0 подтверждённых».
+    """
+    from hub.services.steward_corridor import names_clean, outcome_label, report_outcome
+
+    if mr is None:
+        return {"state": "absent", "label": "отчёта нет", "names_clean": False}
+    row = dict(mr)
+
+    def _list(key: str) -> list:
+        raw = row.get(key)
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw or "[]")
+            except ValueError:
+                return []
+            return parsed if isinstance(parsed, list) else []
+        return list(raw or [])
+
+    # ``incomplete`` хранится как 0/1/NULL, и NULL значит «полнота не
+    # заявлена», а не «прогон полный» (#549): ``is True`` здесь тот же приём,
+    # что в модели представления.
+    outcome = report_outcome(
+        confirmed=_list("findings_confirmed"),
+        unresolved=_list("unresolved"),
+        incomplete=bool(row.get("incomplete"))
+        if row.get("incomplete") is not None
+        else False,
+        raw_count=int(row.get("raw_count") or 0),
+    )
+    return {
+        "state": "present",
+        "outcome": outcome,
+        "label": outcome_label(outcome),
+        "names_clean": names_clean(outcome),
+    }
+
+
 async def _steward_entry(db: aiosqlite.Connection, entry: dict, payload: dict) -> dict:
     """One steward decision the way the digest must show it: WITH its grounds.
 
@@ -353,6 +396,13 @@ async def generate_due_digests(
                     ),
                     "reviewer": (dict(mr).get("model", "") if mr else ""),
                 }
+                # #1234: дайджест показывал автовердикт числом и молчал о том,
+                # ЧТО стояло в отчёте под ним. Отчёт с нулём подтверждённых и
+                # непустым unresolved попадал сюда неотличимо от чистого — а
+                # это ровно те отчёты, которые 09.09.2026 пришлось разбирать
+                # вручную. Ступень берётся из той же функции, что и на
+                # карточке: одно правило на трёх читателей.
+                entry["machine_review"] = _report_outcome_of(mr)
                 verdicts.append(entry)
             elif event["kind"] == "verdict_escalated":
                 escalations.append(entry)

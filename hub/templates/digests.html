@@ -34,6 +34,26 @@
     </ul>
     {% endif %}
 
+    {# #1234: счётчик автовердиктов не говорил, ЧТО стояло в отчёте под каждым
+       из них, и отчёт с непустым unresolved попадал в дайджест неотличимо от
+       чистого. Ступень печатается словами: «чисто» имеет право сказать ровно
+       одна из них. #}
+    {% if d.data.auto_verdicts %}
+    <h3>Автовердикты</h3>
+    <ul>
+        {% for v in d.data.auto_verdicts %}
+        <li><a href="/tasks/{{ v.task_id }}">#{{ v.task_id }}</a>
+            {% set mr = v.machine_review %}
+            {% if not mr %}
+            <span class="text-muted">исход отчёта не измерялся — дайджест старше раздела</span>
+            {% else %}
+            <span class="badge {{ 'badge-completed' if mr.names_clean else 'badge-failed' }}">{{ mr.label }}</span>
+            {% endif %}
+            <span class="text-muted">{{ v.at }}</span></li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
     {% if d.data.escalations %}
     <h3>Эскалации — ждут человека</h3>
     <ul>

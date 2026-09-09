@@ -82,11 +82,18 @@
     {% if mr.unresolved %}{% if mr_flags.append((mr.unresolved|length ~ ' не проверено')) %}{% endif %}{% endif %}
     {% if mr.lost_dimensions %}{% if mr_flags.append('потеряно измерений: ' ~ mr.lost_dimensions|join(', ')) %}{% endif %}{% endif %}
     {% if mr_undisposed %}{% if mr_flags.append(mr_undisposed ~ ' из ' ~ mr_confirmed ~ ' без диспозиции') %}{% endif %}{% endif %}
-    {% set mr_bad = mr.findings_confirmed or not mr.is_current or mr.self_reviewed or mr.incomplete or mr.unresolved %}
+    {# #1234: право назвать отчёт чистым принадлежит ступени лестницы исходов,
+       а не длине findings_confirmed. Плитка спрашивает outcome_names_clean и
+       ничего не выводит сама: пока каждая поверхность считала «чисто» по
+       своему выражению, все три считали одинаково и неверно — «0
+       подтверждённых» при непустом unresolved. Флаги и цвет — разные вопросы,
+       поэтому is_current и self_reviewed остаются рядом: ступень описывает
+       содержимое отчёта, а не его происхождение. #}
+    {% set mr_bad = not mr.outcome_names_clean or not mr.is_current or mr.self_reviewed %}
     <div class="task-review-tile {{ 'task-review-tile--bad' if mr_bad else ('task-review-tile--warn' if mr_flags else 'task-review-tile--ok') }}">
         <div class="task-review-tile-label">Машинное ревью</div>
         <div class="task-review-tile-value">{{ mr.findings_confirmed|length }} / {{ mr.raw_count }}</div>
-        <div class="task-review-tile-sub">подтверждено из сырых{% if mr.profile %} · {{ mr.profile }}{% endif %}{% if mr.model %} · {{ mr.model }}{% endif %}{% for flag in mr_flags %} · {{ flag }}{% endfor %}</div>
+        <div class="task-review-tile-sub">{{ mr.outcome_label }}{% if mr.profile %} · {{ mr.profile }}{% endif %}{% if mr.model %} · {{ mr.model }}{% endif %}{% for flag in mr_flags %} · {{ flag }}{% endfor %}</div>
     </div>
     {% else %}
     <div class="task-review-tile task-review-tile--warn">
@@ -401,6 +408,10 @@
         Machine review: {{ machine_review.raw_count }} raw &rarr;
         {{ machine_review.findings_confirmed|length }} confirmed /
         {{ machine_review.findings_rejected|length }} rejected
+        {# #1234: три числа рядом читаются как итог, и при нуле подтверждённых
+           этот итог читался как «находок нет». Ступень названа словами прямо
+           здесь, потому что именно эту строку человек цитирует в гейт. #}
+        <span class="badge {{ 'badge--xs' if machine_review.outcome_names_clean else 'badge-failed' }}">{{ machine_review.outcome_label }}</span>
         {% if not machine_review.is_current %}
         <span class="badge badge-failed">stale — работа пересдана</span>
         {% endif %}
