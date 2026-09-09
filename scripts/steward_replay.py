@@ -33,8 +33,7 @@ async def _run(days: int, cap: int, budget: int | None, require_raw: bool) -> in
     db = await connect()
     try:
         entries, dropped = await shadow.collect_corpus(db, days=days)
-        cases, excluded = await shadow.build_cases(db, entries)
-        excluded = dropped + excluded
+        cases, excluded = await shadow.build_cases(db, entries, dropped)
         # ``budget is None`` — «как на проде»: политика сама возьмёт
         # config.REVIEW_TOKEN_BUDGET. Ноль здесь означал бы выключенную
         # проверку, и стенд оказался бы мягче живого гейта.

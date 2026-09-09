@@ -1476,9 +1476,17 @@ async def collect_corpus(
 
 
 async def build_cases(
-    db: aiosqlite.Connection, entries: list[CorpusEntry]
+    db: aiosqlite.Connection,
+    entries: list[CorpusEntry],
+    dropped: list[Excluded] | None = None,
 ) -> tuple[list[ReplayCase], list[Excluded]]:
-    """Пакеты по корпусу. Каждая невошедшая сдача называет причину."""
+    """Пакеты по корпусу. Каждая невошедшая сдача называет причину.
+
+    ``dropped`` — то, что отсеял ``collect_corpus``; оно вливается в общий
+    список исключённых ЗДЕСЬ, а не у вызывающего. Склейка на стороне
+    вызывающего была ровно одна, в CLI, и ни один тест её не проходил:
+    её пропажа спрятала бы удалённые задачи из отчёта при зелёном прогоне.
+    """
     from hub.services.steward_evidence import (
         CorpusExclusion,
         PacketLeak,
@@ -1486,7 +1494,7 @@ async def build_cases(
     )
 
     cases: list[ReplayCase] = []
-    excluded: list[Excluded] = []
+    excluded: list[Excluded] = list(dropped or ())
     for entry in entries:
         try:
             packet = await build_historical_packet(
@@ -1506,6 +1514,20 @@ async def build_cases(
     return cases, excluded
 
 
+def _escalated_on_card_gap(packet: Any, decision: Any) -> bool:
+    """Эта эскалация — от дыры в карточке, а не по существу?
+
+    Смотрит на ПОСЛЕДНЕЕ прочитанное основание: лестница возвращает ответ
+    там, где споткнулась, и именно этот источник объясняет исход.
+    """
+    from hub.services.steward_evidence import CARD_NOT_RECORDED
+
+    if not decision.grounds:
+        return False
+    fact = packet.fact(decision.grounds[-1])
+    return fact.is_absent and fact.reason == CARD_NOT_RECORDED
+
+
 def replay(
     cases: list[ReplayCase],
     policy: Any = None,
@@ -1521,7 +1543,7 @@ def replay(
     нечем.
     """
     from hub.services import gate_grounds as grounds
-    from hub.services.steward_evidence import CARD_NOT_RECORDED, reconstructed_share
+    from hub.services.steward_evidence import reconstructed_share
 
     policy = policy or grounds.GatePolicy()
     cells = {
@@ -1534,9 +1556,6 @@ def replay(
     card_gaps = 0
     reasons: dict[str, int] = {}
     for case in cases:
-        surface = case.packet.fact("diff_vs_areas")
-        if surface.is_absent and surface.reason == CARD_NOT_RECORDED:
-            card_gaps += 1
         decision = grounds.decide(
             case.packet,
             grounds.PolicyInputs(
@@ -1550,6 +1569,13 @@ def replay(
             reasons[decision.reason] = reasons.get(decision.reason, 0) + 1
         if decision.verdict == grounds.VERDICT_ESCALATE:
             escalated += 1
+            # Считается ИСХОД, а не наличие дыры. Лестница до карточки могла
+            # и не дойти: отчёт с находками даёт changes_requested на первой
+            # же ступени, и пакет с дырой уезжает в клетку 2x2, а не в
+            # эскалации. Счётчик, прибавленный по наличию дыры, обещал бы
+            # вычесть из эскалаций больше, чем их есть.
+            if _escalated_on_card_gap(case.packet, decision):
+                card_gaps += 1
             continue
         human_approved = case.entry.human_verdict == "approved"
         if decision.is_approve:
@@ -1636,7 +1662,7 @@ def render_report(report: ReplayReport) -> str:
         lines.append(f"  {reason}: {count}")
     lines.append(
         _share_line(
-            "Доля восстановленных фактов о коде (вершина и дифф)",
+            "Доля сдач, где по коммиту восстановлены вершина и дифф",
             report.reconstructed,
             t.judged,
         )

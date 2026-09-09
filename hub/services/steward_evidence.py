@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import aiosqlite
@@ -1054,7 +1054,16 @@ async def _card_facts(
             _surface_fact(task, diff_paths, diff_reason),
             await _risk_fact(db, task, diff_paths, diff_reason),
         ]
+    if diff_paths is None:
+        # Дифф не прочитался — это отказ ГИТА, а не дыра карточки, и
+        # называть их одним кодом значило бы приписать реконструкции по sha
+        # провал, которого у неё не было (её долю по этому коду и считают).
+        return [
+            absent("diff_vs_areas", HISTORICAL_DIFF_UNREADABLE, diff_reason),
+            absent("risk_class", HISTORICAL_DIFF_UNREADABLE, diff_reason),
+        ]
     detail = (
+        f"дифф по коммиту восстановлен ({len(diff_paths)} путь(ей)), но "
         f"карточка описывает генерацию "
         f"{int(task.get('submission_generation') or 0)}, судится {generation}: "
         "объявленные области и класс риска этой сдачи не сохранены"
@@ -1115,13 +1124,25 @@ async def build_historical_packet(
     # База — та, против которой сдачу и судили. Леджер записал её вместе с
     # коммитом; сегодняшняя база проекта могла с тех пор смениться, и дифф
     # против неё описывал бы не ту работу.
+    base_branch = ledger_base or (ctx.get("base_branch") or "")
     diff_paths = await plugins.git_ops.branch_diff_paths(
-        pinned_sha,
-        base_branch=ledger_base or ctx.get("base_branch"),
-        repo=workspace,
+        pinned_sha, base_branch=base_branch, repo=workspace
     )
     diff_reason = (
         "" if diff_paths is not None else f"дифф по {pinned_sha[:12]} не прочитать"
+    )
+    # Леджер базы не пишет headless-путь сдачи, и тогда берётся СЕГОДНЯШНЯЯ
+    # база проекта. Это не ошибка — другого ответа нет, — но и не то же
+    # самое: смена default_branch с тех пор двигает точку сравнения. Молчать
+    # об этом нельзя, поэтому подмена едет в детали факта.
+    base_note = (
+        ""
+        if ledger_base
+        else (
+            f" База сравнения — сегодняшняя база проекта "
+            f"({base_branch or 'не названа'}): леджер сдач базу этой "
+            "генерации не записал."
+        )
     )
 
     provenance: list[tuple[str, str]] = []
@@ -1138,7 +1159,10 @@ async def build_historical_packet(
         # сторожа, который молчит всегда.
         provenance.append(("ci_pinned_sha", dict(ci_row).get("reported_at") or ""))
 
-    card_facts = await _card_facts(db, task, generation, diff_paths, diff_reason)
+    card_facts = [
+        replace(f, detail=f.detail + base_note) if base_note else f
+        for f in await _card_facts(db, task, generation, diff_paths, diff_reason)
+    ]
 
     facts = {
         f.source: f
@@ -1186,8 +1210,22 @@ async def build_historical_packet(
     )
 
 
+def diff_recovered(packet: EvidencePacket) -> bool:
+    """Прочитался ли дифф ПО КОММИТУ — независимо от того, с чем его сверяли.
+
+    Различение несущее. Пакет, где дифф восстановлен, а сравнить его не с
+    чем (карточка не сохранена), — это успех реконструкции и провал
+    записи; пакет, где гит не ответил, — провал реконструкции. Один код на
+    оба означал бы, что условие пересмотра задачи («доля восстановленных
+    ниже 70% — бэкфилл отменяется») срабатывает по причине, к git не
+    относящейся вовсе.
+    """
+    fact = packet.fact("diff_vs_areas")
+    return fact.is_present or fact.reason == CARD_NOT_RECORDED
+
+
 def reconstructed_share(packets: list[EvidencePacket]) -> float | None:
-    """Доля пакетов, где восстановились ОБА факта о коде: вершина и дифф.
+    """Доля пакетов, где по коммиту восстановились И вершина, И дифф.
 
     None на пустом входе, а не ноль: пустая выборка — это отсутствие
     измерения, и печатать её как «ничего не восстановилось» значит обвинять
@@ -1196,8 +1234,6 @@ def reconstructed_share(packets: list[EvidencePacket]) -> float | None:
     if not packets:
         return None
     good = sum(
-        1
-        for p in packets
-        if p.fact("branch_tip").is_present and p.fact("diff_vs_areas").is_present
+        1 for p in packets if p.fact("branch_tip").is_present and diff_recovered(p)
     )
     return good / len(packets)

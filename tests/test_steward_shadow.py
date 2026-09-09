@@ -1905,3 +1905,91 @@ async def test_corpus_names_every_submission_it_drops(
 
     assert [e.task_id for e in entries] == [kept]
     assert [(d.task_id, d.reason) for d in dropped] == [(orphan, "no_task")]
+
+    # И доезжает до отчёта: склейка живёт в библиотеке, а не у вызывающего.
+    _, excluded = await sh.build_cases(db, entries, dropped)
+    assert [(e.task_id, e.reason) for e in excluded] == [(orphan, "no_task")]
+    assert "no_task: 1" in sh.render_report(
+        sh.replay(await _cases_only(db, entries), excluded=excluded)
+    )
+
+
+async def _cases_only(db: aiosqlite.Connection, entries):
+    cases, _ = await sh.build_cases(db, entries)
+    return cases
+
+
+async def test_card_gap_counter_counts_outcomes_not_holes(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: счётчик «эскалаций не по существу» не смеет обгонять эскалации.
+
+    Лестница до карточки может и не дойти: отчёт с находками отвечает
+    changes_requested на первой ступени, и такая сдача уезжает в клетку
+    2x2, а не в эскалации. Счётчик, прибавленный по НАЛИЧИЮ дыры, обещал
+    бы читателю вычесть из эскалаций больше, чем их есть.
+    """
+    from hub.integrations.registry import plugins
+
+    project_id = await _historical_project(db, "replay-cardgap")
+    git = _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(
+        db,
+        project_id,
+        human_verdict="changes_requested",
+        confirmed='[{"title": "настоящая находка"}]',
+    )
+    await db.execute(
+        "INSERT INTO submissions (task_id, generation, sha, base_branch) "
+        "VALUES (?, 1, ?, 'develop')",
+        (task_id, _SHA),
+    )
+    await repo.update_task(
+        db, task_id, submission_generation=2, submission_sha="f" * 40
+    )
+    await db.commit()
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries, dropped)
+    report = sh.replay(cases, excluded=excluded)
+
+    # Дыра в карточке есть...
+    assert cases[0].packet.fact("diff_vs_areas").reason == "card_not_recorded"
+    # ...но исход определила НАХОДКА, и это клетка таблицы, а не эскалация.
+    assert report.table.both_changes == 1
+    assert report.table.escalated == 0
+    assert report.card_not_recorded == 0, "счётчик обогнал эскалации"
+    # И дифф по коммиту прочитан, поэтому доля восстановленных не страдает
+    # за то, к чему реконструкция отношения не имеет.
+    assert report.reconstructed == 1.0
+
+
+async def test_replay_without_policy_uses_the_live_token_budget(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: стенд без аргументов повторяет ПРОД, а не мягче его.
+
+    Ноль в token_budget означает «проверка выключена». Умолчание-ноль
+    показывало бы approve там, где живой гейт эскалирует перерасход, — и
+    отчёт, на который сошлются, врал бы в сторону автономии.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.gate_grounds import GatePolicy
+
+    monkeypatch.setattr(config, "REVIEW_TOKEN_BUDGET", 300000)
+    assert GatePolicy().token_budget == 300000
+
+    project_id = await _historical_project(db, "replay-budget")
+    monkeypatch.setattr(
+        plugins, "git_ops", _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    )
+    await _historical_submission(
+        db, project_id, human_verdict="approved", tokens=400000
+    )
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries, dropped)
+
+    report = sh.replay(cases, excluded=excluded)
+    assert dict(report.reasons).get("report_token_budget") == 1
+    assert report.table.both_approve == 0
