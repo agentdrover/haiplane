@@ -345,6 +345,9 @@ class GitOpsPlugin(Protocol):
     async def commit_diff_stat(
         self, repo: str, base: str, sha: str
     ) -> list[tuple[int, int, str]] | None: ...
+    async def commit_in_base_history(
+        self, repo: str, base: str, sha: str
+    ) -> bool | None: ...
     async def is_ancestor(
         self, repo: str, ancestor: str, descendant: str
     ) -> bool | None: ...

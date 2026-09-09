@@ -43,6 +43,7 @@ NO_SUBMISSION = "no_submission"  # nothing was pinned, so there is nothing to sh
 UNREACHABLE_SHA = "unreachable_sha"  # the workspace does not carry that commit
 NO_WORKSPACE = "no_workspace"  # nowhere to look
 UNREADABLE = "unreadable"  # git was there and still could not answer
+MERGED_INTO_BASE = "merged_into_base"  # the commit is already in the base (#1239)
 
 
 def _blank(state: str, reason: str, **extra: Any) -> dict[str, Any]:
@@ -255,6 +256,46 @@ async def _resolve_target(
     return None, sha, base, workspace, fallback
 
 
+async def _empty_reason(
+    workspace: str, base: str, sha: str, fallback: str
+) -> dict[str, Any] | None:
+    """Why is this diff empty? ``None`` when it honestly is "nothing changed".
+
+    A three-dot diff is computed from the merge base, so a commit that already
+    lies in the history of the base produces an EMPTY diff no matter what the
+    submission touched (#1239). Shown as-is that is the one lie the gate tells
+    the reader to their face — the card is what a human reads, the code is not
+    — and it reads as "изменений нет" on work that changed plenty.
+
+    So the emptiness is interrogated rather than printed. Three answers, the
+    same three git gives: already in the base (say so), not in the base (an
+    honest empty diff, ``None`` here and the caller renders it), or the
+    question could not be asked (``UNREADABLE``, never a silent empty screen).
+    """
+    merged = await plugins.git_ops.commit_in_base_history(workspace, base, sha)
+    if merged is None:
+        return _blank(
+            UNREADABLE,
+            f"дифф {base}...{sha[:12]} пуст, но предок ли коммит базы — git не "
+            "ответил: пустоту показать нельзя, она недоказуема как «изменений нет»",
+            sha=sha,
+            base=base,
+            fallback_command=fallback,
+        )
+    if merged:
+        return _blank(
+            MERGED_INTO_BASE,
+            f"коммит {sha[:12]} уже лежит в истории базы {base}: трёхточечный "
+            f"дифф {base}...{sha[:12]} схлопнулся в пустой и показывает не "
+            "«изменений нет», а то, что сдача уже доставлена. Смотреть её "
+            f"изменения надо по самому коммиту: git show {sha[:12]}",
+            sha=sha,
+            base=base,
+            fallback_command=fallback,
+        )
+    return None
+
+
 async def submission_files(db: Any, task_id: int) -> dict[str, Any]:
     """Paths and line counts of the pinned submission (#825).
 
@@ -274,6 +315,10 @@ async def submission_files(db: Any, task_id: int) -> dict[str, Any]:
             base=base,
             fallback_command=fallback,
         )
+    if not rows:
+        empty = await _empty_reason(workspace, base, sha, fallback)
+        if empty is not None:
+            return empty
     files: list[dict[str, Any]] = [
         {"path": path, "added": added, "removed": removed}
         for added, removed, path in rows
@@ -309,6 +354,10 @@ async def submission_diff(db: Any, task_id: int) -> dict[str, Any]:
         )
 
     files = split_files(raw)
+    if not files:
+        empty = await _empty_reason(workspace, base, sha, fallback)
+        if empty is not None:
+            return empty
     kept, truncated, shown, total = truncate(
         files, config.DIFF_MAX_LINES, config.DIFF_MAX_BYTES
     )
