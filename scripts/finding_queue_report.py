@@ -36,11 +36,11 @@ from pathlib import Path
 
 import aiosqlite
 
-from hub import repository as repo
 from hub.db import connect
 from hub.services.finding_report import (
     compare_recheck,
     disposition_report,
+    first_judgements,
     queue_snapshot,
     recheck_sample,
 )
@@ -85,33 +85,44 @@ def _print_report(report: dict) -> None:
     print(f"  покрытие отчётов: {flow['reports_judged']} из {flow['reports_counted']}")
     print("  сток и поток отвечают на разные вопросы и в одну дробь не сводятся")
     print()
-    print(f"РАЗБОР (порог ответа по срезу — {report['minimum_per_slice']} находок)")
-    _print_slice("всего", report["overall"])
-    for row in report["by_profile"]:
-        _print_slice(f"профиль {row['profile']}", row)
-    for row in report["by_model"]:
-        _print_slice(f"модель {row['model']}", row)
+    minimum = report["minimum_per_slice"]
+    _print_judged(
+        f"РАЗБОР ЗА ОКНО ({flow['since_days']} дней по дате ОТЧЁТА; "
+        f"порог ответа по срезу — {minimum} находок)",
+        report["judged_window"],
+    )
+    print()
+    _print_judged(
+        f"РАЗБОР ЗА ВСЁ ВРЕМЯ (окно не применяется; порог — {minimum} находок)",
+        report["judged_all_time"],
+    )
+    print(
+        "  суждение о находке из отчёта старше окна в оконный срез не входит: "
+        "разбор накопленного виден здесь, а не выше"
+    )
     unknown = report["unknown"]
-    if unknown is not None:
-        print()
-        print("СУДИТЬ НЕ ПО ЧЕМУ (остаются неразобранными, дефолт не назначается)")
-        print(
-            f"  {unknown['unknown']} из {unknown['queued']} "
-            f"(доля {unknown['share']}; выше 0.4 — условие пересмотра)"
-        )
-        for reason in unknown["reasons"]:
-            print(f"    {reason['reason']:<24} {reason['findings']}")
+    print()
+    if unknown is None:
+        # #762: пустота не чистота. Секция, исчезнувшая молча, читается как
+        # «unknown нет», а её здесь не считали — по явному ключу.
+        print("СУДИТЬ НЕ ПО ЧЕМУ: не считали (ключ --no-evidence, нужны клоны задач)")
+        return
+    print("СУДИТЬ НЕ ПО ЧЕМУ (остаются неразобранными, дефолт не назначается)")
+    print(
+        f"  {unknown['unknown']} из {unknown['queued']} "
+        f"(доля {unknown['share']}; выше 0.4 — условие пересмотра)"
+    )
+    for reason in unknown["reasons"]:
+        print(f"    {reason['reason']:<24} {reason['findings']}")
 
 
-async def _judged_dispositions(db: aiosqlite.Connection) -> dict[str, str]:
-    """Первое суждение по uid. Строки без uid — из времени до #1007 — вне
-    перепроверки: сравнивать их не с чем, и молча складывать их в знаменатель
-    значило бы разбавлять долю расхождений историей."""
-    return {
-        str(r["finding_uid"]): str(r["disposition"])
-        for r in await repo.list_judged_findings(db)
-        if str(r["finding_uid"] or "")
-    }
+def _print_judged(header: str, slices: dict) -> None:
+    print(header)
+    _print_slice("всего", slices["overall"])
+    for row in slices["by_profile"]:
+        _print_slice(f"профиль {row['profile']}", row)
+    for row in slices["by_model"]:
+        _print_slice(f"модель {row['model']}", row)
 
 
 def _read_answers(path: Path) -> dict[str, str]:
@@ -144,7 +155,7 @@ async def _run(args: argparse.Namespace) -> int:
             else:
                 _print_report(report)
             return 0
-        first = await _judged_dispositions(db)
+        first = await first_judgements(db)
         sample = recheck_sample(list(first), args.salt)
         if not args.answers:
             print(

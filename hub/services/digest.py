@@ -209,6 +209,11 @@ def _policy_delegates(gate_policy_raw: str | None) -> bool:
 # morning (#878).
 _DEBT_WINDOW = "-90 days"
 
+# Окно, за которое дайджест спрашивает про precision. То же, что у страницы
+# метрик по умолчанию (``hub_practice_metrics(since_days=90)``): если бы оно
+# отличалось, дайджест и страница называли бы разные precision одним словом.
+_PRECISION_WINDOW_DAYS = 90
+
 
 # The payload key the steward section lives under, and the question a reader
 # of an OLD digest must be able to answer: was the steward silent that day,
@@ -283,8 +288,23 @@ async def findings_queue_section(db: aiosqlite.Connection) -> dict:
     Надёжный канал тревоги — событие, которое пишет сторож в поллере; здесь
     сводка, а не будильник. Порог назван рядом с числом: «131 находка» без
     «порог 40» не говорит читателю, много это или норма.
+
+    Про precision секция говорит ровно то, что знает. Непустая очередь и
+    «precision не считается» — два РАЗНЫХ факта: precision это ``real/judged``
+    по РАЗОБРАННЫМ, и первая же записанная диспозиция делает его числом,
+    сколько бы находок ни осталось ждать рядом. Дайджест после частичного
+    разбора 105 находок — ровно то состояние, где безусловная строка
+    «precision не считается вовсе» становится полуправдой (#516/#549). Поэтому
+    ``judged`` и ``precision`` приезжают из ``practice_metrics`` — той же
+    функции, что считает precision для страницы метрик, а не из своего
+    запроса, который разошёлся бы с ней молча (#518).
     """
+    from hub.services.orchestration import practice_metrics
+
     counted = await repo.count_unjudged_findings(db)
+    disp = (await practice_metrics(db, since_days=_PRECISION_WINDOW_DAYS))[
+        "machine_reviews"
+    ]["dispositions"]
     return {
         "findings": int(counted["findings"]),
         "reports": int(counted["reports"]),
@@ -292,6 +312,12 @@ async def findings_queue_section(db: aiosqlite.Connection) -> dict:
         "over_threshold": (
             int(counted["findings"]) >= config.UNJUDGED_FINDINGS_ALERT_THRESHOLD > 0
         ),
+        # Размер выборки едет вместе со ставкой — правило #1153: голый
+        # precision 1.0 по двум находкам зовёт к решению, которого выборка не
+        # выдерживает.
+        "judged": int(disp["judged"]),
+        "precision": disp["precision"],
+        "precision_window_days": _PRECISION_WINDOW_DAYS,
     }
 
 

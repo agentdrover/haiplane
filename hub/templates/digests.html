@@ -76,7 +76,20 @@
         <a href="/findings">{{ d.data.findings_queue.findings }}</a> подтверждённых
         находок в {{ d.data.findings_queue.reports }} отчётах ждут ответа
         (порог {{ d.data.findings_queue.threshold }}). Это очередь за всё время,
-        не за сутки дайджеста. Пока ответа нет, precision не считается вовсе.</p>
+        не за сутки дайджеста.
+        {# #1171: непустая очередь и «precision нет» — РАЗНЫЕ факты. precision
+           это real/judged по разобранным, и первая же диспозиция делает его
+           числом, сколько бы находок ни ждало рядом. Безусловная строка «не
+           считается вовсе» после частичного разбора была полуправдой
+           (#516/#549). Ставка едет с размером выборки — правило #1153. #}
+        {% if d.data.findings_queue.judged %}
+        Разобрано {{ d.data.findings_queue.judged }} — precision
+        {{ d.data.findings_queue.precision }} по ним
+        (окно {{ d.data.findings_queue.precision_window_days }} дней,
+        <a href="/metrics">метрики</a>).</p>
+        {% else %}
+        Ни одной диспозиции ещё нет, поэтому precision не считается вовсе.</p>
+        {% endif %}
     {% endif %}
 
     <h3>Выборка на проверку (~10% решений; применённые approve — ~30%)</h3>

@@ -361,9 +361,16 @@ async def test_nothing_prechecked_and_author_account_is_not_a_disposition(
     assert "это отчёт автора, не диспозиция" in page, (
         "граница между отчётом автора и суждением человека держится подписью"
     )
+    # Скан по ВСЕМУ тегу, а не по хвосту после value=. Порядок атрибутов в
+    # HTML ничего не значит, и `<input checked value="fixed">` — законная
+    # разметка с ровно тем дефектом, который этот ассерт ловит; сканируя
+    # только хвост, он остался бы зелёным на предвыбранном переключателе.
     for value in ("fixed", "false_positive", "wont_fix"):
-        after = page.split(f'value="{value}"')[1][:80]
-        assert "checked" not in after, f"переключатель {value} предвыбран"
+        marker = f'value="{value}"'
+        assert marker in page, f"переключателя {value} нет на странице вовсе"
+        head, tail = page.split(marker, 1)
+        tag = head[head.rindex("<input") :] + marker + tail.split(">", 1)[0]
+        assert "checked" not in tag, f"переключатель {value} предвыбран: {tag}"
 
     assert await repo_module.list_finding_dispositions(db, review_id) == [], (
         "отчёт автора не создаёт диспозицию"

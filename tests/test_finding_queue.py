@@ -1038,3 +1038,192 @@ async def test_the_uid_survives_a_partial_queue(
         "слово автора о ВТОРОМ близнеце обязано найтись, хотя первый уже ушёл "
         "из очереди"
     )
+
+
+# --- Разбор накопленного: закрытие находок ревью #307 ----------------------
+
+
+async def _judge(
+    db: aiosqlite.Connection,
+    review_id: int,
+    task_id: int,
+    index: int,
+    uid: str,
+    disposition: str,
+) -> None:
+    await db.execute(
+        "INSERT INTO finding_dispositions (review_id, task_id, "
+        "submission_generation, finding_index, finding_uid, disposition, "
+        "decided_by) VALUES (?, ?, 1, ?, ?, ?, 'denis')",
+        (review_id, task_id, index, uid, disposition),
+    )
+
+
+async def test_the_recheck_compares_against_the_first_judgement(
+    db: aiosqlite.Connection,
+):
+    """AC-5: слепая перепроверка сверяется с ПЕРВЫМ суждением, а не с последним.
+
+    Один uid встречается больше одного раза законно: лестница #879 повторяет
+    находку на той же сдаче, а две задачи с одинаковыми категорией, заголовком
+    и местом дают один uid — он считается из содержания, без ``review_id``
+    (#1007). Словарное включение по строкам ``list_judged_findings`` оставляло
+    ПОСЛЕДНЕЕ значение: перепроверка сверяла бы второе суждение с третьим, а
+    штамп на первом проходе — то, ради чего она и заводится, — оставался бы
+    невидим. Заодно схлопывание занижало размер разобранного.
+    """
+    from hub.services.finding_report import first_judgements
+
+    await _task(db, 70, "completed", 1)
+    await _task(db, 71, "completed", 1)
+    await _report(db, 130, 70, 1, [_finding("близнец")])
+    await _report(db, 131, 71, 1, [_finding("близнец")])
+    await _judge(db, 130, 70, 0, "same-uid", "fixed")
+    await _judge(db, 131, 71, 0, "same-uid", "false_positive")
+    await _judge(db, 131, 71, 1, "", "wont_fix")
+    await db.commit()
+
+    assert await first_judgements(db) == {"same-uid": "fixed"}, (
+        "второе суждение по тому же uid затёрло первое"
+    )
+
+
+async def test_judging_the_old_stock_is_not_read_as_zero(db: aiosqlite.Connection):
+    """Разбор ЗАПАСА виден отчётом, а не тонет в окне потока.
+
+    ``practice_metrics`` берёт диспозиции по дате ОТЧЁТА: суждение, вынесенное
+    сегодня о находке из отчёта трёхмесячной давности, в оконный срез не
+    попадает вовсе. Очередь #1171 — это запас за год, и отчёт, знающий только
+    окно, назвал бы «разобрано 0» на следующее утро после того, как разобрали
+    весь сток. Оконный срез остаётся (его читает AC-4 и страница метрик), но
+    рядом стоит срез за всё время, и оба названы своими именами.
+    """
+    from hub.services.finding_report import disposition_report
+
+    await _task(db, 72, "completed", 1)
+    await _report(db, 132, 72, 1, [_finding("древняя")])
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=datetime('now','-100 days') WHERE id=132"
+    )
+    await _judge(db, 132, 72, 0, "old-uid", "fixed")
+    await db.commit()
+
+    report = await disposition_report(db, since_days=60, minimum=1, with_evidence=False)
+    assert report["overall"]["judged"] == 0, (
+        "оконный срез не меняется — по нему считает страница метрик"
+    )
+    assert report["judged_window"]["overall"]["judged"] == 0
+    assert report["judged_window"]["since_days"] == 60
+    assert report["judged_window"]["windowed"] is True
+    assert report["judged_all_time"]["overall"]["judged"] == 1, (
+        "разобранная находка старого стока обязана быть видна хоть одним числом"
+    )
+    assert report["judged_all_time"]["overall"]["precision"] == 1.0
+    assert report["judged_all_time"]["windowed"] is False
+    assert [r["profile"] for r in report["judged_all_time"]["by_profile"]] == [
+        "не заявлен"
+    ], "срез за всё время режется по профилям так же, как оконный"
+
+
+async def test_the_report_names_the_window_of_every_judged_number(
+    db: aiosqlite.Connection, capsys
+):
+    """Печатный отчёт не даёт прочитать оконное число как «за всё время»."""
+    import importlib.util
+    from pathlib import Path as _Path
+
+    from hub.services.finding_report import disposition_report
+
+    spec = importlib.util.spec_from_file_location(
+        "fqr",
+        _Path(__file__).resolve().parents[1] / "scripts" / "finding_queue_report.py",
+    )
+    assert spec is not None and spec.loader is not None
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    await _task(db, 73, "completed", 1)
+    await _report(db, 133, 73, 1, [_finding("ждёт")])
+    await db.commit()
+
+    script._print_report(
+        await disposition_report(db, since_days=60, with_evidence=False)
+    )
+    out = capsys.readouterr().out
+    assert "РАЗБОР ЗА ОКНО (60 дней по дате ОТЧЁТА" in out, (
+        "срез по окну обязан назвать окно и то, ЧЬЯ дата его задаёт"
+    )
+    assert "РАЗБОР ЗА ВСЁ ВРЕМЯ" in out
+    # #762: пустота не чистота. Секция, исчезнувшая молча, читается как
+    # «unknown нет», а её по ключу --no-evidence не считали.
+    assert "СУДИТЬ НЕ ПО ЧЕМУ: не считали (ключ --no-evidence" in out, (
+        "пропущенная секция обязана назвать причину пропуска, а не исчезнуть"
+    )
+
+
+async def test_the_unknown_breakdown_counts_findings_with_nothing_to_judge_by(
+    db: aiosqlite.Connection, tmp_path: Path
+):
+    """Доля «судить не по чему» считается по-настоящему, с причиной у каждой.
+
+    Условие пересмотра #1171 — доля unknown выше 40% — держится на этом
+    числе, а сам аггрегат не исполнялся ни одним тестом: три теста отчёта
+    зовут его с ``with_evidence=False``. Сломанный подсчёт оставался бы
+    зелёным ровно до дня, когда по нему принимают решение.
+    """
+    from hub.services.finding_report import unknown_breakdown
+
+    clone = _init_repo(tmp_path / "unknown-share")
+    baseline = _sha(clone)
+    # Задача с клоном и sha: факт по её находке ВЫЧИСЛИМ.
+    known = await _task_on_clone(db, clone, title="факт вычислим")
+    await _report_on(db, known, generation=1, sha=baseline)
+    await repo.update_task(db, known, submission_generation=1)
+    _write_numbered(clone / _FILE, tweak=5)
+    _repo_git(clone, "add", "-A")
+    _repo_git(clone, "commit", "-m", "тронул названные строки")
+    # Задача без клона: судить не по чему, и причина названа.
+    await _task(db, 74, "completed", 1)
+    await _report(db, 134, 74, 1, [_finding("клона нет")])
+    await db.commit()
+
+    breakdown = await unknown_breakdown(db)
+    assert breakdown["queued"] == 2, "знаменатель — вся очередь, а не только unknown"
+    assert breakdown["unknown"] == 1, "находка без клона обязана попасть в unknown"
+    assert breakdown["share"] == 0.5
+    assert [r["findings"] for r in breakdown["reasons"]] == [1]
+    assert breakdown["reasons"][0]["reason"], (
+        "unknown без причины — это молчание, а не ответ (#762)"
+    )
+    assert sum(r["findings"] for r in breakdown["reasons"]) == breakdown["unknown"]
+
+
+async def test_the_snapshot_addresses_twins_by_the_full_report(
+    db: aiosqlite.Connection,
+):
+    """Снимок берёт uid из ОТЧЁТА, а не из того, что очередь показывает.
+
+    Очередь показывает подмножество всегда: разобранное из неё уходит.
+    Близнецы — находки с одинаковыми категорией, файлом, заголовком и строкой —
+    различаются порядковым номером ВНУТРИ отчёта (#1007), и по обрезанному
+    списку второй близнец получил бы uid первого. Знаменатель приёмки AC-1
+    тогда адресовал бы находку, которую уже разобрали, а настоящую ждущую не
+    называл бы вовсе.
+    """
+    from hub.services.finding_report import queue_snapshot
+
+    twin = _finding("одинаковая находка")
+    await _task(db, 75, "completed", 1)
+    await _report(db, 135, 75, 1, [twin, dict(twin)])
+    uids = finding_uids([twin, dict(twin)])
+    assert uids[0] != uids[1], "близнецы обязаны различаться порядковым номером"
+    await _judge(db, 135, 75, 0, uids[0], "fixed")
+    await db.commit()
+
+    snapshot = await queue_snapshot(db)
+    assert snapshot["total"] == 1, "разобранный близнец из очереди ушёл"
+    assert [i["uid"] for i in snapshot["items"]] == [uids[1]], (
+        "снимок обязан назвать uid ВТОРОГО близнеца: по обрезанной очереди он "
+        "получил бы uid первого — уже разобранного"
+    )
+    assert snapshot["items"][0]["finding_index"] == 1

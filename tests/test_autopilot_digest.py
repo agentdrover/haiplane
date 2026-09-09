@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
 import aiosqlite
 from httpx import AsyncClient
@@ -437,4 +438,133 @@ async def test_a_quiet_steward_is_a_measured_zero(
     cell = _steward_counter_cell(page.text)
     assert cell == "0", (
         f"этот день измерен: ноль тут результат, а не пробел, получено {cell!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1171 — очередь находок в дайджесте: попутчик под тестом, и precision без лжи
+# ---------------------------------------------------------------------------
+
+
+async def _confirmed_report(
+    db: aiosqlite.Connection, review_id: int, task_id: int, findings: int
+) -> None:
+    """Отчёт с подтверждёнными находками на ТЕКУЩЕЙ сдаче задачи."""
+    await repo.update_task(db, task_id, submission_generation=1)
+    await db.execute(
+        "INSERT INTO machine_reviews (id, task_id, submission_generation, "
+        "profile, model, findings_confirmed) VALUES (?, ?, 1, 'deep', 'grok', ?)",
+        (
+            review_id,
+            task_id,
+            json.dumps(
+                [
+                    {"title": f"находка {n}", "category": "correctness"}
+                    for n in range(findings)
+                ],
+                ensure_ascii=False,
+            ),
+        ),
+    )
+    await db.commit()
+
+
+async def test_digest_carries_the_findings_queue(
+    db: aiosqlite.Connection, client: AsyncClient
+):
+    """#1171: сток находок доезжает до дайджеста — в payload и на страницу.
+
+    Попутчик, который никто не держит, тихо отваливается: убрать ключ из
+    payload, сломать порог или выкинуть блок из шаблона — и весь набор
+    дайджеста остаётся зелёным, потому что смотрит на соседние секции. Сторож
+    очереди #1171 задумывался «по образцу #751, в дайджест (#739)», и без
+    этого теста его сводка ничем не закреплена.
+    """
+    _pid, feature = await _autopilot_project(db, "spike-findings")
+    approved = await _policy_approved_task(db, feature, "auto one")
+    await _confirmed_report(db, 900, approved, findings=3)
+
+    with patch.object(config, "UNJUDGED_FINDINGS_ALERT_THRESHOLD", 2):
+        assert await generate_due_digests(db, now=_tomorrow()) == 1
+        payload = json.loads((await repo.list_digests(db))[0]["payload"])
+
+    section = payload["findings_queue"]
+    assert section["findings"] == 3, "число ждущих находок обязано доехать"
+    assert section["reports"] == 1
+    assert section["threshold"] == 2
+    assert section["over_threshold"] is True, "три находки при пороге два — выше порога"
+
+    page = (await client.get("/digests")).text
+    assert "Находки без диспозиции" in page, "блок обязан быть на странице дайджестов"
+    assert 'href="/findings"' in page, "число без пути к очереди не даёт её открыть"
+    assert "3</a> подтверждённых" in page
+
+
+async def test_a_queue_under_the_threshold_is_not_an_alarm(db: aiosqlite.Connection):
+    """Порог живёт в секции: ниже него сводка едет, но тревогой не притворяется."""
+    _pid, feature = await _autopilot_project(db, "spike-under")
+    approved = await _policy_approved_task(db, feature, "auto one")
+    await _confirmed_report(db, 901, approved, findings=1)
+
+    with patch.object(config, "UNJUDGED_FINDINGS_ALERT_THRESHOLD", 40):
+        assert await generate_due_digests(db, now=_tomorrow()) == 1
+        section = json.loads((await repo.list_digests(db))[0]["payload"])[
+            "findings_queue"
+        ]
+    assert section["findings"] == 1
+    assert section["over_threshold"] is False
+
+
+async def test_the_digest_stops_claiming_precision_is_uncomputable(
+    db: aiosqlite.Connection, client: AsyncClient
+):
+    """#1171: «precision не считается вовсе» — только пока не разобрано НИЧЕГО.
+
+    precision это ``real/judged`` по РАЗОБРАННЫМ, и первая же диспозиция
+    делает его числом; непустая очередь рядом его не обнуляет. После
+    частичного разбора — типичного состояния этой самой задачи — безусловная
+    строка отправляла читателя мимо числа, которое hub_practice_metrics уже
+    отдаёт: полуправда #516/#549. Ставка едет с размером выборки (#1153).
+    """
+    _pid, feature = await _autopilot_project(db, "spike-precision")
+    approved = await _policy_approved_task(db, feature, "auto one")
+    await _confirmed_report(db, 902, approved, findings=2)
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    section = json.loads((await repo.list_digests(db))[0]["payload"])["findings_queue"]
+    assert section["judged"] == 0
+    assert section["precision"] is None
+    page = (await client.get("/digests")).text
+    assert "Ни одной диспозиции ещё нет" in page
+    assert "precision не считается вовсе" in page, "нулевой разбор назван честно"
+
+    # Одна находка разобрана, вторая ждёт — очередь непуста, precision есть.
+    await db.execute(
+        "INSERT INTO finding_dispositions (review_id, task_id, "
+        "submission_generation, finding_index, finding_uid, disposition, "
+        "decided_by) VALUES (902, ?, 1, 0, 'uid-a', 'fixed', 'denis')",
+        (approved,),
+    )
+    await db.execute("DELETE FROM autopilot_digests")
+    await db.commit()
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    section = json.loads((await repo.list_digests(db))[0]["payload"])["findings_queue"]
+    assert section["judged"] == 1, "разобранное обязано доехать до дайджеста"
+    assert section["precision"] == 1.0
+    assert section["findings"] == 1, "вторая находка всё ещё ждёт — очередь непуста"
+
+    page = (await client.get("/digests")).text
+    assert "precision не считается вовсе" not in page, (
+        "очередь непуста, но precision посчитан — безусловная строка была ложью"
+    )
+    flat = re.sub(r"\s+", " ", page)
+    assert "Разобрано 1 — precision 1.0 по ним" in flat, (
+        "ставка без размера выборки рядом не печатается (#1153)"
+    )
+    assert "окно 90 дней" in flat, (
+        "precision без имени окна читается как «за всё время»"
+    )
+    assert section["precision_window_days"] == 90, (
+        "окно precision совпадает с окном страницы метрик"
     )

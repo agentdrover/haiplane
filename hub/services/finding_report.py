@@ -58,6 +58,12 @@ _RECHECK_TENTHS = 1
 #: суждением. Число из постановки #1171 (AC-5).
 RECHECK_DIVERGENCE_LIMIT = 0.2
 
+#: Окно, которое означает «без окна». ``practice_metrics`` считает ставки
+#: только за период, и другого способа спросить у НЕГО ЖЕ про всё время нет.
+#: Сто лет — не магия, а отказ от второго расчёта: свой запрос по
+#: ``finding_dispositions`` разошёлся бы с оконным в первый же месяц (#518).
+ALL_TIME_DAYS = 36500
+
 
 async def queue_snapshot(
     db: aiosqlite.Connection, *, project_id: int | None = None
@@ -163,9 +169,19 @@ async def disposition_report(
     Числа берутся из ``practice_metrics`` — того же расчёта, что читает
     страница метрик. Второй расчёт «специально для отчёта» разошёлся бы с
     первым в первый же месяц (#518), и разошёлся бы молча.
+
+    Разбор считается ДВАЖДЫ, и это не дублирование, а тот же разлад стока и
+    потока, что уже разведён выше. ``practice_metrics`` берёт диспозиции по
+    дате ОТЧЁТА: суждение, вынесенное сегодня о находке из отчёта
+    трёхмесячной давности, в оконный срез не попадает вовсе. Ровно такой и
+    была вся работа #1171 — очередь из 105 находок это запас, накопленный за
+    год, — и отчёт, знающий только окно, показал бы «разобрано 0» на
+    следующее утро после того, как разобрали весь сток. Поэтому оконный срез
+    остаётся (по нему считает страница метрик, и AC-4 читает именно его), а
+    рядом встаёт срез за всё время, названный своим именем.
     """
-    metrics = await practice_metrics(db, since_days=since_days)
-    disp = metrics["machine_reviews"]["dispositions"]
+    windowed, disp = await _judged_slices(db, since_days=since_days, minimum=minimum)
+    all_time, _ = await _judged_slices(db, since_days=ALL_TIME_DAYS, minimum=minimum)
     stock = await repo.count_unjudged_findings(db)
     return {
         "since_days": since_days,
@@ -185,6 +201,34 @@ async def disposition_report(
             "since_days": since_days,
             "windowed": True,
         },
+        # Разбор ЗА ОКНО. Ключи ``overall``/``by_profile``/``by_model`` лежат
+        # на верхнем уровне с самого начала и остаются оконными: их читает
+        # AC-4 и страница метрик.
+        "overall": windowed["overall"],
+        "by_profile": windowed["by_profile"],
+        "by_model": windowed["by_model"],
+        "judged_window": {**windowed, "since_days": since_days, "windowed": True},
+        # Разбор ЗА ВСЁ ВРЕМЯ. Здесь виден разбор старого стока, который в
+        # оконный срез не попадает и без этой строки читался бы как ноль.
+        "judged_all_time": {**all_time, "windowed": False},
+        "unknown": (await unknown_breakdown(db)) if with_evidence else None,
+    }
+
+
+async def _judged_slices(
+    db: aiosqlite.Connection, *, since_days: int, minimum: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Срезы разбора за один период — и сырые числа, из которых они собраны.
+
+    Сырые числа возвращаются ОТДЕЛЬНО, а не ключом внутри среза: вложенные,
+    они попали бы в JSON отчёта третьей копией тех же цифр рядом с двумя
+    посчитанными, и читателю пришлось бы догадываться, какая из трёх —
+    ответ. Вызывающему они нужны за одним — ``reports_counted`` потока, — и
+    брать их из уже сделанного расчёта дешевле, чем звать его второй раз.
+    """
+    metrics = await practice_metrics(db, since_days=since_days)
+    disp = metrics["machine_reviews"]["dispositions"]
+    slices = {
         "overall": _slice_answer(disp, minimum=minimum),
         "by_profile": [
             dict(_slice_answer(row, minimum=minimum), profile=row["profile"])
@@ -194,8 +238,32 @@ async def disposition_report(
             dict(_slice_answer(row, minimum=minimum), model=row["model"])
             for row in disp["by_model"]
         ],
-        "unknown": (await unknown_breakdown(db)) if with_evidence else None,
     }
+    return slices, disp
+
+
+async def first_judgements(db: aiosqlite.Connection) -> dict[str, str]:
+    """ПЕРВОЕ суждение по каждому uid — материал слепой перепроверки (AC-5).
+
+    Первое, а не любое. Один и тот же uid встречается больше одного раза
+    законно: лестница ревью #879 повторяет находку на той же сдаче, а две
+    задачи с одинаковыми категорией, заголовком и местом дают один uid — он
+    считается из содержания, без ``review_id`` (#1007). ``list_judged_findings``
+    отдаёт такие строки в порядке записи, и словарное включение по ним
+    оставило бы ПОСЛЕДНЮЮ: перепроверка сверяла бы второе суждение с третьим,
+    а штамп на первом проходе — то самое, ради чего она и заводится, —
+    остался бы невидим. Заодно схлопывание занижало бы размер разобранного.
+
+    Строки без uid — из времени до #1007 — вне перепроверки: сравнивать их не
+    с чем, и молча складывать их в знаменатель значило бы разбавлять долю
+    расхождений историей.
+    """
+    out: dict[str, str] = {}
+    for row in await repo.list_judged_findings(db):
+        uid = str(row["finding_uid"] or "")
+        if uid and uid not in out:
+            out[uid] = str(row["disposition"])
+    return out
 
 
 async def unknown_breakdown(db: aiosqlite.Connection) -> dict[str, Any]:
