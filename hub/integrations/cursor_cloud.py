@@ -223,13 +223,27 @@ async def find_agent_by_name(name: str, pages: int = 3) -> Reconciliation:
     то самое поле ``name``, которое хаб положил при создании. Если бы он
     его не возвращал, обход не нашёл бы НИЧЕГО и никогда — и сказал бы об
     этом словом «агента нет», то есть выдал бы разрешение купить второго.
-    Механизм против двойной покупки сам бы её и санкционировал. Поэтому
-    страница, где поля нет ни у одного элемента, считается непрочитанной,
-    а не пустой (#1206).
+    Механизм против двойной покупки сам бы её и санкционировал.
+
+    Живой round-trip метки НЕ ЗАМЕРЕН (#1206), поэтому «не нашли» само по
+    себе ничего не значит: оно одинаково выглядит и когда нашего агента
+    правда нет, и когда провайдер выбросил метку и вернул своё имя.
+    Различает эти миры один признак — встретилась ли в ответе хоть одна
+    метка нашей формы. Наблюдённая 06.09 форма именно такая: поле name
+    ЕСТЬ, а значения придуманы из промта (см. AGENT_MARKER_PREFIX), и
+    страж «ключа нет ни у кого» на ней не срабатывает.
+
+    Поэтому подтверждённой пустотой считается только ответ, в котором
+    метка нашей формы встретилась хотя бы раз (round-trip доказан этим же
+    ответом), либо пустой список — там нет ни агентов, ни вопроса.
+    Непустой ответ без единой нашей метки — «спросить не удалось».
     """
     if not name:
         return Reconciliation("", "", True)
     cursor = ""
+    listed = 0
+    named = 0
+    seen_marker = False
     for _ in range(max(1, pages)):
         page = await list_agents(cursor=cursor)
         if page is None:
@@ -242,16 +256,24 @@ async def find_agent_by_name(name: str, pages: int = 3) -> Reconciliation:
             # агента: отсутствие данных снова стало бы значением (#762).
             log.warning("cursor cloud /v1/agents: no items list in body")
             return Reconciliation("", "", False)
-        named = [item for item in items if isinstance(item, dict) and "name" in item]
-        if items and not named:
-            # Элементы есть, а поля, по которому только и можно узнать СВОЙ
-            # заказ, нет ни у одного. Спросить не удалось — ровно как на теле
-            # не той формы выше. Пустой обход здесь неотличим от «агента
-            # нет», а «нет» разрешает повторить POST и купить второго (#1206).
-            log.warning("cursor cloud /v1/agents: items carry no name field")
-            return Reconciliation("", "", False)
-        for item in named:
-            if item.get("name") == name:
+        listed += len(items)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("name")
+            if isinstance(value, str) and value:
+                named += 1
+            else:
+                # Ключа нет, значение пустое или не строка — сравнивать не
+                # с чем. Такой элемент не доказывает round-trip и не
+                # опровергает его: он просто молчит.
+                continue
+            if value.startswith(f"{AGENT_MARKER_PREFIX}:"):
+                # Метка НАШЕЙ формы (не просто слово «haiplane» внутри
+                # автоимени из промта): этим же ответом доказано, что имя
+                # переживает создание.
+                seen_marker = True
+            if value == name:
                 found = str(item.get("id") or "").strip()
                 if found:
                     return Reconciliation(
@@ -260,6 +282,25 @@ async def find_agent_by_name(name: str, pages: int = 3) -> Reconciliation:
         cursor = str(page.get("nextCursor") or "")
         if not cursor:
             break
+    if listed and not seen_marker:
+        # Агенты в ответе есть, а метки нашей формы нет ни одной. Отсюда
+        # неразличимы «нашего заказа тут нет» и «провайдер метку не
+        # хранит», а второе делает подбор невозможным НАВСЕГДА. Назвать
+        # это «агента нет» значило бы выдать разрешение купить второго —
+        # ровно то, против чего построен весь путь (#762, #1206).
+        # Счётчик ``named`` тут не для красоты: он единственный, кто
+        # разделит два мира в проде, пока живого замера нет (#1206 AC-1).
+        # named=0 — поля нет вовсе; named>0 — поле есть, но наша метка в
+        # нём не выжила. Это и будет запись замера, когда обрыв случится.
+        log.warning(
+            "cursor cloud /v1/agents: %s agents listed, %s carry a name, "
+            "none carries a %s: marker — round-trip of our name field is "
+            "unproven",
+            listed,
+            named,
+            AGENT_MARKER_PREFIX,
+        )
+        return Reconciliation("", "", False)
     return Reconciliation("", "", True)
 
 
