@@ -1647,3 +1647,51 @@ async def test_a_failed_recovery_does_not_hold_the_write_lock(
     assert dict(rows[0])["agent_id"].startswith(sh.PENDING_PREFIX), (
         "откат вернул метку: незаписанное восстановление не считается сделанным"
     )
+
+
+async def test_a_recovery_that_recovers_nothing_does_not_hold_the_write_lock(
+    db: aiosqlite.Connection,
+):
+    """#1195 (ревью #305): нулевая жатва тоже закрывает транзакцию.
+
+    Соседний путь того же класса, что и сбойный. UPDATE, не сменивший ни
+    одной строки, всё равно открывает write-транзакцию: isolation_level=
+    "IMMEDIATE" (#1065) начинает её на ЛЮБОМ DML, а не на удачном. Если
+    гонка забрала все выбранные строки, recovered остаётся нулём — и коммит
+    за условием `if recovered` не выполняется. Тогда успешный, ничего не
+    нашедший подъём держал бы write-лок всей базы до перезапуска.
+
+    Гонка здесь настоящая, а не воображаемая: заказ закрывают между SELECT и
+    UPDATE — ровно та ветка, ради которой в коде стоит `rowcount != 1`.
+    Сосед по файлу (start_run) свой нулевой UPDATE откатывает сразу же.
+    """
+    from hub.services.steward_dispatch import RUN_SUPERSEDED
+
+    project_id = await _project(db, "shadow-recover-zero")
+    task_id = await _task(db, project_id)
+    order = await order_run(db, task_id, 1)
+    assert order is not None
+    await _claimed(db, order["id"])
+
+    real_fetchall = sh.fetchall
+
+    async def _closed_underneath(conn, sql, parameters=()):
+        rows = await real_fetchall(conn, sql, parameters)
+        # Вердикт пришёл раньше: слот закрыт после выборки, но до записи.
+        await conn.execute(
+            "UPDATE steward_runs SET status=? WHERE id=?",
+            (RUN_SUPERSEDED, order["id"]),
+        )
+        await conn.commit()
+        return rows
+
+    with patch.object(sh, "fetchall", _closed_underneath):
+        assert await sh.recover_dead_process_claims(db) == 0
+
+    assert not db.in_transaction, (
+        "подъём без единого восстановления оставил открытую транзакцию"
+    )
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (order["id"],))
+    row = dict(rows[0])
+    assert row["status"] == RUN_SUPERSEDED, "закрытый заказ остался закрытым"
+    assert row["agent_id"].startswith(sh.PENDING_PREFIX), "метку никто не трогал"

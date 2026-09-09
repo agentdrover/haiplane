@@ -470,8 +470,13 @@ async def recover_dead_process_claims(db: aiosqlite.Connection) -> int:
                 },
             )
             recovered += 1
+        # Коммит БЕЗУСЛОВНЫЙ, а не за `if recovered`. UPDATE, не сменивший ни
+        # одной строки, открывает write-транзакцию ровно так же, как удачный:
+        # IMMEDIATE начинает её на любом DML. Гонка, забравшая все выбранные
+        # строки, дала бы recovered=0 — и коммит за условием оставил бы лок на
+        # успешном пути. Коммитить нечего, закрыть транзакцию нужно.
+        await db.commit()
         if recovered:
-            await db.commit()
             log.warning(
                 "steward: %s claim(s) left by a dead process recovered; "
                 "a paid agent may be orphaned at the provider",
