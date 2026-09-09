@@ -862,6 +862,13 @@ HISTORICAL_DIFF_UNREADABLE = "historical_diff_unreadable"
 # локаторы разрешаются против нынешнего дерева, база живёт сейчас, а зависимости
 # давно доставлены. Каждый — честная дыра, а не выдуманное значение.
 NOT_RECONSTRUCTIBLE = "not_reconstructible"
+#: Карточка задачи описывает ПОСЛЕДНЮЮ сдачу, а не судимую. Объявленные
+#: области, класс риска и декларация модели живут в одной строке на задачу и
+#: перезаписываются пересдачей (lifecycle: accept_areas дописывает пути,
+#: пересчёт поднимает класс, declared_model замещает прежнюю). Для генерации,
+#: которая уже не текущая, эти три поля — свидетельство о ЧУЖОЙ работе, и
+#: читать их значит судить сдачу по картам, нарисованным после неё.
+CARD_NOT_RECORDED = "card_not_recorded"
 
 #: Источники, которые читает детерминированная лестница (gate_grounds.decide).
 #: Перечень публичный, потому что по нему считается доля восстановленного:
@@ -1019,6 +1026,45 @@ async def _generation_commit(
     return "", ""
 
 
+async def _card_facts(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    generation: int,
+    diff_paths: list[str] | None,
+    diff_reason: str,
+) -> list[EvidenceFact]:
+    """Поверхность и класс — или честные дыры на их месте.
+
+    Оба факта сверяются с КАРТОЧКОЙ: ``_surface_fact`` сравнивает дифф с
+    ``affected_areas``, ``_risk_fact`` — пересчитанный класс с сохранённым.
+    Карточка одна на задачу, и пересдача её переписывает: ``accept_areas``
+    дописывает пути, пересчёт поднимает класс. Для генерации, которая уже не
+    текущая, это карты, нарисованные ПОСЛЕ судимой работы, и сверка по ним
+    отвечает мягче правды — путь, бывший вне области, попадает в
+    расширенный набор и читается как заявленный.
+
+    Записи «какими области были на той сдаче» в хабе нет: леджер (#880)
+    хранит коммит и базу, но не карточку. Значит ответа нет — и здесь стоит
+    ``absent`` с названной причиной, а не ответ из сегодняшней строки.
+    Лестница увидит дыру и выведет к человеку; отчёт покажет, какая доля
+    корпуса такая. Это дороже, чем красивое число, и честнее.
+    """
+    if int(task.get("submission_generation") or 0) == int(generation):
+        return [
+            _surface_fact(task, diff_paths, diff_reason),
+            await _risk_fact(db, task, diff_paths, diff_reason),
+        ]
+    detail = (
+        f"карточка описывает генерацию "
+        f"{int(task.get('submission_generation') or 0)}, судится {generation}: "
+        "объявленные области и класс риска этой сдачи не сохранены"
+    )
+    return [
+        absent("diff_vs_areas", CARD_NOT_RECORDED, detail),
+        absent("risk_class", CARD_NOT_RECORDED, detail),
+    ]
+
+
 async def build_historical_packet(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1092,14 +1138,15 @@ async def build_historical_packet(
         # сторожа, который молчит всегда.
         provenance.append(("ci_pinned_sha", dict(ci_row).get("reported_at") or ""))
 
+    card_facts = await _card_facts(db, task, generation, diff_paths, diff_reason)
+
     facts = {
         f.source: f
         for f in [
             report_fact,
             ci_fact,
             _historical_tip_fact(pinned_sha),
-            _surface_fact(task, diff_paths, diff_reason),
-            await _risk_fact(db, task, diff_paths, diff_reason),
+            *card_facts,
             # Три дыры ниже — не поломка сборки, а отказ выдумывать. Локаторы
             # разрешаются против СЕГОДНЯШНЕГО дерева, состояние базы — это
             # сегодняшняя база, а зависимости давно доставлены: любой ответ

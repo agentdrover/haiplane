@@ -1315,6 +1315,11 @@ class ReplayReport:
     excluded: tuple[Excluded, ...] = ()
     reconstructed: float | None = None
     corpus_tokens: int = 0
+    #: Сдачи, чья карточка на момент вердикта не сохранена, и потому
+    #: эскалированные не по существу. Отдельным числом, а не внутри
+    #: ``precondition_failed``: читатель обязан уметь отличить «политика
+    #: вывела к человеку» от «нам нечем было судить».
+    card_not_recorded: int = 0
     #: Обращений к провайдеру за прогон. Поле, а не обещание в докстроке:
     #: утверждение «реплей бесплатен» должно быть проверяемым числом.
     provider_calls: int = 0
@@ -1332,7 +1337,7 @@ class ReplayReport:
 
 async def _human_verdict_rows(
     db: aiosqlite.Connection, days: int
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[Excluded]]:
     """Человеческие вердикты окна с ОТМЕТКОЙ ВРЕМЕНИ.
 
     ``_human_verdicts`` выше возвращает только сам вердикт: таблице 2x2 время
@@ -1350,11 +1355,18 @@ async def _human_verdict_rows(
         (*actors, f"-{int(days)} days"),
     )
     out: dict[tuple[int, int], dict[str, Any]] = {}
+    unreadable: list[Excluded] = []
     for row in rows:
         item = dict(row)
         try:
             payload = json.loads(item.get("payload") or "{}")
         except ValueError:
+            # Живой писатель всегда кладёт словарь, поэтому сюда попасть
+            # нечем — и именно поэтому запись важна: если попадём, молчание
+            # спрячет порчу данных за красивым знаменателем.
+            unreadable.append(
+                Excluded(int(item["task_id"]), 0, "payload_unreadable", "")
+            )
             continue
         generation = int(payload.get("submission_generation") or 0)
         verdict = (payload.get("verdict") or "").strip()
@@ -1366,7 +1378,10 @@ async def _human_verdict_rows(
             "verdict": verdict,
             "created_at": item.get("created_at") or "",
         }
-    return sorted(out.values(), key=lambda r: (r["task_id"], r["generation"]))
+    return (
+        sorted(out.values(), key=lambda r: (r["task_id"], r["generation"])),
+        unreadable,
+    )
 
 
 async def _sibling_mismatch(
@@ -1389,17 +1404,36 @@ async def _sibling_mismatch(
     return any(json.loads(dict(s)["findings_confirmed"] or "[]") for s in siblings)
 
 
-async def collect_corpus(db: aiosqlite.Connection, days: int = 60) -> list[CorpusEntry]:
-    """Завершённые сдачи окна с человеческой меткой, отсортированные.
+async def collect_corpus(
+    db: aiosqlite.Connection, days: int = 60
+) -> tuple[list[CorpusEntry], list[Excluded]]:
+    """Завершённые сдачи окна с человеческой меткой — и те, что не вошли.
+
+    Пара, а не список. Вердикт, чья задача удалена, событие переживает
+    (``events.task_id`` без внешнего ключа — намеренно), и прежняя редакция
+    делала на нём ``continue``: сдача исчезала и из корпуса, и из списка
+    исключённых, а «доля от всех сдач окна» тихо занижалась. Знаменатель,
+    из которого молча вычли, — это не измерение (#516).
 
     Сортировка — часть контракта, а не вкус: отчёт обязан совпадать побайтово
     между прогонами (AC-6), а порядок, взятый из порядка выдачи базы, этого
     не гарантирует.
     """
     entries: list[CorpusEntry] = []
-    for row in await _human_verdict_rows(db, days):
+    dropped: list[Excluded] = []
+    rows, unreadable = await _human_verdict_rows(db, days)
+    dropped.extend(unreadable)
+    for row in rows:
         task_row = await repo.get_task(db, row["task_id"])
         if task_row is None:
+            dropped.append(
+                Excluded(
+                    row["task_id"],
+                    row["generation"],
+                    "no_task",
+                    "вердикт есть, задачи уже нет — событие пережило её",
+                )
+            )
             continue
         task = dict(task_row)
         # Отчёты ИМЕННО ЭТОЙ генерации, а не последний отчёт задачи: у
@@ -1421,14 +1455,24 @@ async def collect_corpus(db: aiosqlite.Connection, days: int = 60) -> list[Corpu
                 review_id=review_id,
                 profile=(review.get("profile") or "").strip(),
                 reviewer_model=(review.get("model") or "").strip(),
-                implementer_model=(task.get("submission_model") or "").strip(),
+                # Только для ТЕКУЩЕЙ генерации. ``submission_model`` — одна
+                # колонка на задачу, и пересдача записывает в неё свою
+                # декларацию; исторической модели не хранит и леджер. Для
+                # прошлой генерации ответа нет, и пустая строка — это
+                # «неизвестно», которое лестница выведет к человеку, а не
+                # чужая декларация, выданная за эту.
+                implementer_model=(
+                    (task.get("submission_model") or "").strip()
+                    if int(task.get("submission_generation") or 0) == row["generation"]
+                    else ""
+                ),
                 review_tokens=int(review.get("provider_tokens") or 0),
                 sibling_mismatch=await _sibling_mismatch(
                     db, row["task_id"], row["generation"], review_id
                 ),
             )
         )
-    return entries
+    return entries, dropped
 
 
 async def build_cases(
@@ -1477,7 +1521,7 @@ def replay(
     нечем.
     """
     from hub.services import gate_grounds as grounds
-    from hub.services.steward_evidence import reconstructed_share
+    from hub.services.steward_evidence import CARD_NOT_RECORDED, reconstructed_share
 
     policy = policy or grounds.GatePolicy()
     cells = {
@@ -1487,8 +1531,12 @@ def replay(
         "both_changes": 0,
     }
     escalated = 0
+    card_gaps = 0
     reasons: dict[str, int] = {}
     for case in cases:
+        surface = case.packet.fact("diff_vs_areas")
+        if surface.is_absent and surface.reason == CARD_NOT_RECORDED:
+            card_gaps += 1
         decision = grounds.decide(
             case.packet,
             grounds.PolicyInputs(
@@ -1516,6 +1564,7 @@ def replay(
         excluded=tuple(excluded or ()),
         reconstructed=reconstructed_share([c.packet for c in cases]),
         corpus_tokens=sum(c.entry.review_tokens for c in cases),
+        card_not_recorded=card_gaps,
         provider_calls=0,
         reasons=tuple(sorted(reasons.items())),
     )
@@ -1562,14 +1611,22 @@ def render_report(report: ReplayReport) -> str:
         f"Размер выборки: судимых {t.judged}, из них человеческих "
         f"changes_requested {t.human_changes}",
         _share_line("Доля эскалаций", t.escalation_share, t.judged),
+        # Отдельной строкой сразу под долей: «политика вывела к человеку» и
+        # «нам нечем было судить» — разные утверждения, и слитые в одно
+        # число они завышают осмысленность стенда.
+        f"Из эскалаций не по существу (карточка сдачи не сохранена): "
+        f"{report.card_not_recorded}",
     ]
-    excluded_share = report.excluded_share
+    lines.append(f"Исключено из корпуса: {len(report.excluded)}")
+    # Счётчик — всегда, ДОЛЯ — по тому же правилу, что доля эскалаций.
+    # Процент на выборке из одной сдачи читается как измерение, и приписка
+    # «выборка 1» рядом этого не отменяет (#1153).
     lines.append(
-        f"Исключено из корпуса: {len(report.excluded)}"
-        + (
-            f" ({excluded_share:.0%} от всех сдач окна)"
-            if excluded_share is not None
-            else ""
+        "  "
+        + _share_line(
+            "доля от всех сдач окна",
+            report.excluded_share,
+            report.sample + len(report.excluded),
         )
     )
     by_reason: dict[str, int] = {}

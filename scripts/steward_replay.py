@@ -29,19 +29,28 @@ from hub.services import gate_grounds as grounds
 from hub.services import steward_shadow as shadow
 
 
-async def _run(days: int, cap: int, budget: int, require_raw: bool) -> int:
+async def _run(days: int, cap: int, budget: int | None, require_raw: bool) -> int:
     db = await connect()
     try:
-        entries = await shadow.collect_corpus(db, days=days)
+        entries, dropped = await shadow.collect_corpus(db, days=days)
         cases, excluded = await shadow.build_cases(db, entries)
-        policy = grounds.GatePolicy(
-            name=f"budget={budget},raw={'on' if require_raw else 'off'}",
-            token_budget=budget,
-            require_raw_count=require_raw,
+        excluded = dropped + excluded
+        # ``budget is None`` — «как на проде»: политика сама возьмёт
+        # config.REVIEW_TOKEN_BUDGET. Ноль здесь означал бы выключенную
+        # проверку, и стенд оказался бы мягче живого гейта.
+        policy = (
+            grounds.GatePolicy(
+                name=f"raw={'on' if require_raw else 'off'}",
+                require_raw_count=require_raw,
+            )
+            if budget is None
+            else grounds.GatePolicy(
+                name=f"budget={budget},raw={'on' if require_raw else 'off'}",
+                token_budget=budget,
+                require_raw_count=require_raw,
+            )
         )
-        report = shadow.replay(
-            cases, policy, window_days=days, excluded=excluded
-        )
+        report = shadow.replay(cases, policy, window_days=days, excluded=excluded)
         sys.stdout.write(shadow.render_report(report))
         if cap:
             plan = shadow.plan_backfill(cases, cap)
@@ -74,8 +83,11 @@ def main() -> int:
     parser.add_argument(
         "--token-budget",
         type=int,
-        default=0,
-        help="порог токен-бюджета ревью в примеряемой политике (0 — проверка выключена)",
+        default=None,
+        help=(
+            "порог токен-бюджета ревью в примеряемой политике; "
+            "без флага берётся действующий порог прода, 0 выключает проверку"
+        ),
     )
     parser.add_argument(
         "--no-raw-count",

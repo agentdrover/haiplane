@@ -1595,7 +1595,7 @@ async def test_offline_replay_makes_no_provider_calls(
     usage = AsyncMock(return_value={})
     monkeypatch.setattr(cursor_cloud, "get_usage", usage)
 
-    entries = await sh.collect_corpus(db, days=60)
+    entries, dropped = await sh.collect_corpus(db, days=60)
     cases, excluded = await sh.build_cases(db, entries)
     report = sh.replay(cases, window_days=60, excluded=excluded)
 
@@ -1755,7 +1755,7 @@ async def test_resubmitted_task_keeps_its_own_generation_sha(
     )
     await db.commit()
 
-    entries = await sh.collect_corpus(db, days=60)
+    entries, dropped = await sh.collect_corpus(db, days=60)
     cases, excluded = await sh.build_cases(db, entries)
 
     assert excluded == [], f"сдача выброшена зря: {excluded}"
@@ -1768,10 +1768,24 @@ async def test_resubmitted_task_keeps_its_own_generation_sha(
     assert report.value["review_id"] != later
     assert report.value["generation"] == 1
     assert cases[0].packet.fact("branch_tip").value["tip"] == _SHA
-    # И решение по такой сдаче — настоящее, а не эскалация-артефакт.
-    report_only = sh.replay(cases, excluded=excluded)
-    assert report_only.table.escalated == 0
-    assert report_only.table.both_approve == 1
+
+    # А ВОТ КАРТОЧКА не восстановима, и пакет об этом говорит, вместо того
+    # чтобы сверить дифф первой генерации с областями, дописанными на
+    # третьей: расширенный набор ответил бы «в заявленном» мягче правды.
+    surface = cases[0].packet.fact("diff_vs_areas")
+    risk = cases[0].packet.fact("risk_class")
+    assert surface.is_absent and surface.reason == "card_not_recorded"
+    assert risk.is_absent and risk.reason == "card_not_recorded"
+    # Декларация модели — из того же одного поля, и для прошлой генерации
+    # она тоже чужая; корпус её не копирует.
+    assert cases[0].entry.implementer_model == ""
+
+    # Исход — эскалация, и она СЧИТАЕТСЯ ОТДЕЛЬНО: «политика вывела к
+    # человеку» и «нам нечем было судить» — разные утверждения.
+    replayed = sh.replay(cases, excluded=excluded)
+    assert replayed.table.escalated == 1
+    assert replayed.card_not_recorded == 1
+    assert "карточка сдачи не сохранена" in sh.render_report(replayed)
 
 
 async def test_historical_rows_do_not_clear_act_refusals(db: aiosqlite.Connection):
@@ -1818,12 +1832,17 @@ async def test_replay_report_omits_share_on_small_sample(
     )
     await _historical_submission(db, project_id, human_verdict="approved")
 
-    entries = await sh.collect_corpus(db, days=60)
+    entries, dropped = await sh.collect_corpus(db, days=60)
     cases, excluded = await sh.build_cases(db, entries)
     small = sh.render_report(sh.replay(cases, excluded=excluded))
     assert "НЕ ПЕЧАТАЕТСЯ" in small
     assert f"меньше порога {sh.REPLAY_MIN_SAMPLE}" in small
     assert "Доля эскалаций: 0%" not in small
+    # Правило одно на ВСЕ доли отчёта, а не на ту, о которой вспомнили.
+    # Доля исключённых печаталась процентом на выборке из одной сдачи —
+    # счётчик честен, процент рядом с ним читается как измерение.
+    assert "%" not in small, small
+    assert "Исключено из корпуса: 0" in small
 
     empty = sh.render_report(sh.replay([], excluded=[]))
     # Пустая выборка и малая выборка — РАЗНЫЕ ответы, а не один.
@@ -1842,11 +1861,11 @@ async def test_replay_is_deterministic(db: aiosqlite.Connection, monkeypatch):
     for verdict in ("approved", "changes_requested", "approved"):
         await _historical_submission(db, project_id, human_verdict=verdict)
 
-    first_entries = await sh.collect_corpus(db, days=60)
+    first_entries, dropped = await sh.collect_corpus(db, days=60)
     first_cases, first_excluded = await sh.build_cases(db, first_entries)
     first = sh.render_report(sh.replay(first_cases, excluded=first_excluded))
 
-    second_entries = await sh.collect_corpus(db, days=60)
+    second_entries, dropped = await sh.collect_corpus(db, days=60)
     second_cases, second_excluded = await sh.build_cases(db, second_entries)
     second = sh.render_report(sh.replay(second_cases, excluded=second_excluded))
 
@@ -1859,3 +1878,30 @@ async def test_replay_is_deterministic(db: aiosqlite.Connection, monkeypatch):
     planned = sh.plan_backfill(first_cases, 2)
     assert planned.runs == 2
     assert planned.tokens_estimate == 2 * sh.BACKFILL_TOKENS_PER_RUN
+
+
+async def test_corpus_names_every_submission_it_drops(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: знаменатель, из которого молча вычли, — не измерение (#516).
+
+    events.task_id намеренно без внешнего ключа: событие переживает задачу.
+    Прежняя редакция делала на таком вердикте continue, и сдача исчезала и
+    из корпуса, и из списка исключённых — «доля от всех сдач окна»
+    занижалась молча.
+    """
+    from hub.integrations.registry import plugins
+
+    project_id = await _historical_project(db, "replay-dropped")
+    monkeypatch.setattr(
+        plugins, "git_ops", _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    )
+    kept = await _historical_submission(db, project_id, human_verdict="approved")
+    orphan = await _historical_submission(db, project_id, human_verdict="approved")
+    await db.execute("DELETE FROM tasks WHERE id=?", (orphan,))
+    await db.commit()
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+
+    assert [e.task_id for e in entries] == [kept]
+    assert [(d.task_id, d.reason) for d in dropped] == [(orphan, "no_task")]

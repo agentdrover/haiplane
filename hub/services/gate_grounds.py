@@ -39,11 +39,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiosqlite
 
+from hub import config
 from hub.db import fetchall
 
 # Порядок здесь — тот же, в котором их проверял автовердикт, и он значим:
@@ -244,7 +245,16 @@ class GatePolicy:
     """
 
     name: str = "current"
-    token_budget: int = 0
+    #: Из конфигурации, а не ноль. Ноль у ``token_budget_ground`` означает
+    #: «проверка выключена», и умолчание-ноль сделало бы стенд мягче живого
+    #: гейта ровно там, где стенд обязан его повторять: живые
+    #: ``maybe_auto_verdict`` и ``steward_apply`` передают
+    #: ``config.REVIEW_TOKEN_BUDGET``. Отчёт, где сдача с перерасходом
+    #: проходит, а прод её эскалирует, хуже отсутствия отчёта — на него
+    #: сошлются.
+    #: Фабрика, а не константа: значение читается при СОЗДАНИИ политики,
+    #: поэтому правка настройки видна стенду без правки кода.
+    token_budget: int = field(default_factory=lambda: config.REVIEW_TOKEN_BUDGET)
     #: Отчёт без единого кандидата — это «нет данных», а не «нет находок»
     #: (harness v7, #745). Выключается только для сравнения политик.
     require_raw_count: bool = True
