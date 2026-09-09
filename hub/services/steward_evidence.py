@@ -42,6 +42,7 @@ from typing import Any
 
 import aiosqlite
 
+from hub import config
 from hub import repository as repo
 from hub.db import fetchall
 from hub.models import STEWARD_GROUND_SOURCES, ReviewBrief, RiskClass
@@ -138,6 +139,16 @@ class EvidencePacket:
     facts: dict[str, EvidenceFact]
     # Somebody else's words, kept apart from the hub's own facts (#1076).
     quotes: tuple["QuotedText", ...] = ()
+    #: Точка сравнения, по которой считался дифф, и ОТКУДА она взялась.
+    #: Поля только у исторического пакета: живой сборщик диффает ветку
+    #: против сегодняшней базы, и вопрос «та ли это база» там не стоит.
+    #:
+    #: Полем, а не припиской в ``detail``: подмену базы обязан УВИДЕТЬ
+    #: ОТЧЁТ, а не только читатель одного факта. Строка внутри чужого
+    #: текста не считается — по ней нельзя сложить число, и в поколении #5
+    #: она ровно так и потерялась.
+    diff_base: str = ""
+    diff_base_source: str = ""
 
     def fact(self, source: str) -> EvidenceFact:
         _check_source(source)
@@ -858,6 +869,34 @@ HISTORICAL_SHA_UNRESOLVED = "sha_unresolved"
 HISTORICAL_SHA_UNRECORDED = "sha_unrecorded"
 HISTORICAL_NO_WORKSPACE = "no_workspace"
 HISTORICAL_DIFF_UNREADABLE = "historical_diff_unreadable"
+#: Трёхточечный дифф СХЛОПНУЛСЯ. ``branch_diff_paths`` считает
+#: ``base_sha...commit_sha``, где ``base_sha`` — СЕГОДНЯШНИЙ резолв имени
+#: базы. Как только судимый коммит попал в историю этой базы (доставка
+#: настоящим мержем, а не squash), merge-base равен самому коммиту, и дифф
+#: пуст ВСЕГДА — независимо от того, что сдача меняла. Пустой список при
+#: этом не ``None``: пакет не исключается, ``_surface_fact`` говорит
+#: present и ``within_declared=True`` (незаявленных путей нет), класс риска
+#: не поднимается, а доля восстановленного засчитывает это как успех.
+#: Проверено на живой истории: у доставленной задачи #1185 закреплённая
+#: вершина 1695a41 — предок develop, ``git diff origin/develop...1695a41``
+#: даёт 0 файлов при настоящей поверхности в 2 файла.
+#:
+#: Восстановить настоящую поверхность нечем: леджер #880 хранит ИМЯ базы, а
+#: не её sha на момент сдачи, и историческая точка сравнения не сохранена
+#: нигде. Поэтому здесь стоит названная дыра, а не подставленный ноль:
+#: лестница выведет такую сдачу к человеку, доля восстановленного её не
+#: зачтёт, и условие пересмотра задачи («ниже 70% — бэкфилл отменяется»)
+#: сможет сработать по настоящей причине.
+HISTORICAL_DIFF_COLLAPSED = "historical_diff_collapsed"
+#: База, против которой считался дифф, взята из СЕГОДНЯШНЕЙ строки проекта
+#: (а если и там пусто — из ``PAIR_BASE_BRANCH``): леджер сдач базу этой
+#: генерации не записал, headless-путь сдачи её не пишет. Это не отказ —
+#: дифф посчитан, — но точка сравнения не та, по которой судили, и отчёт
+#: обязан назвать, скольких сдач это касается. Значение едет ПОЛЕМ пакета
+#: (``diff_base_source``), потому что число складывает отчёт, а не читатель.
+BASE_NOT_RECORDED = "base_not_recorded"
+#: База взята из леджера сдач — та самая, против которой судили.
+BASE_FROM_LEDGER = "ledger"
 # Факты, которые сегодняшнее состояние мира восстановить не может в принципе:
 # локаторы разрешаются против нынешнего дерева, база живёт сейчас, а зависимости
 # давно доставлены. Каждый — честная дыра, а не выдуманное значение.
@@ -1032,6 +1071,7 @@ async def _card_facts(
     generation: int,
     diff_paths: list[str] | None,
     diff_reason: str,
+    diff_hole: str = "",
 ) -> list[EvidenceFact]:
     """Поверхность и класс — или честные дыры на их месте.
 
@@ -1048,19 +1088,33 @@ async def _card_facts(
     ``absent`` с названной причиной, а не ответ из сегодняшней строки.
     Лестница увидит дыру и выведет к человеку; отчёт покажет, какая доля
     корпуса такая. Это дороже, чем красивое число, и честнее.
+
+    ``diff_hole`` идёт ПЕРВЫМ и бьёт обе ветки. Это отказ ГИТА (не прочитал
+    дифф) или схлопнувшийся трёхточечный дифф — в обоих случаях поверхности
+    нет ВООБЩЕ, и сверять с карточкой нечего, есть она или нет. Порядок
+    важен: у ТЕКУЩЕЙ генерации карточка на месте, и без этой проверки
+    сборка ушла бы в ``_surface_fact``, где пустой список читается как
+    «дифф пуст, незаявленного нет» — тихое «всё в порядке» на месте
+    отсутствующего измерения.
     """
-    if int(task.get("submission_generation") or 0) == int(generation):
-        return [
-            _surface_fact(task, diff_paths, diff_reason),
-            await _risk_fact(db, task, diff_paths, diff_reason),
-        ]
     if diff_paths is None:
         # Дифф не прочитался — это отказ ГИТА, а не дыра карточки, и
         # называть их одним кодом значило бы приписать реконструкции по sha
         # провал, которого у неё не было (её долю по этому коду и считают).
+        code = diff_hole or HISTORICAL_DIFF_UNREADABLE
         return [
-            absent("diff_vs_areas", HISTORICAL_DIFF_UNREADABLE, diff_reason),
-            absent("risk_class", HISTORICAL_DIFF_UNREADABLE, diff_reason),
+            absent("diff_vs_areas", code, diff_reason),
+            absent("risk_class", code, diff_reason),
+        ]
+    if diff_hole:
+        return [
+            absent("diff_vs_areas", diff_hole, diff_reason),
+            absent("risk_class", diff_hole, diff_reason),
+        ]
+    if int(task.get("submission_generation") or 0) == int(generation):
+        return [
+            _surface_fact(task, diff_paths, diff_reason),
+            await _risk_fact(db, task, diff_paths, diff_reason),
         ]
     detail = (
         f"дифф по коммиту восстановлен ({len(diff_paths)} путь(ей)), но "
@@ -1124,24 +1178,54 @@ async def build_historical_packet(
     # База — та, против которой сдачу и судили. Леджер записал её вместе с
     # коммитом; сегодняшняя база проекта могла с тех пор смениться, и дифф
     # против неё описывал бы не ту работу.
-    base_branch = ledger_base or (ctx.get("base_branch") or "")
+    #
+    # База называется ЗДЕСЬ и целиком. ``branch_diff_paths`` на пустое имя
+    # подставляет ``PAIR_BASE_BRANCH`` своим ``_resolve_base`` (#725), и
+    # приписка «база не названа» была бы прямой неправдой: база есть, просто
+    # её выбрал слой ниже. Пакет обязан говорить ту базу, против которой
+    # дифф посчитан на самом деле.
+    base_branch = (
+        ledger_base or (ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
+    )
+    # Леджер базы не пишет headless-путь сдачи, и тогда берётся СЕГОДНЯШНЯЯ
+    # база проекта. Это не ошибка — другого ответа нет, — но и не то же
+    # самое: смена default_branch с тех пор двигает точку сравнения.
+    base_source = BASE_FROM_LEDGER if ledger_base else BASE_NOT_RECORDED
     diff_paths = await plugins.git_ops.branch_diff_paths(
         pinned_sha, base_branch=base_branch, repo=workspace
     )
     diff_reason = (
         "" if diff_paths is not None else f"дифф по {pinned_sha[:12]} не прочитать"
     )
-    # Леджер базы не пишет headless-путь сдачи, и тогда берётся СЕГОДНЯШНЯЯ
-    # база проекта. Это не ошибка — другого ответа нет, — но и не то же
-    # самое: смена default_branch с тех пор двигает точку сравнения. Молчать
-    # об этом нельзя, поэтому подмена едет в детали факта.
+    diff_hole = ""
+    if diff_paths is not None and not diff_paths:
+        # ПУСТОЙ трёхточечный дифф — это два разных ответа в одном значении.
+        # ``base...sha`` считается от merge-base, и когда закреплённый
+        # коммит уже лежит в истории сегодняшней базы (доставка настоящим
+        # мержем, а не squash), merge-base равен самому коммиту и список
+        # пуст ВСЕГДА — независимо от того, что сдача меняла. Различает их
+        # только вопрос о предке, и он задаётся здесь, а не предполагается.
+        ancestor = await plugins.git_ops.is_ancestor(workspace, pinned_sha, base_branch)
+        if ancestor is None:
+            diff_hole = HISTORICAL_DIFF_UNREADABLE
+            diff_reason = (
+                f"дифф {base_branch}...{pinned_sha[:12]} пуст, а предок ли "
+                f"коммит базы — гит не ответил: пустота недоказуема как "
+                "измерение"
+            )
+        elif ancestor:
+            diff_hole = HISTORICAL_DIFF_COLLAPSED
+            diff_reason = (
+                f"коммит {pinned_sha[:12]} лежит в истории базы {base_branch}: "
+                f"трёхточечный дифф схлопнулся в пустой список, поверхность "
+                "сдачи по нему невосстановима"
+            )
     base_note = (
         ""
         if ledger_base
         else (
-            f" База сравнения — сегодняшняя база проекта "
-            f"({base_branch or 'не названа'}): леджер сдач базу этой "
-            "генерации не записал."
+            f" База сравнения — сегодняшняя база проекта ({base_branch}): "
+            "леджер сдач базу этой генерации не записал."
         )
     )
 
@@ -1161,7 +1245,9 @@ async def build_historical_packet(
 
     card_facts = [
         replace(f, detail=f.detail + base_note) if base_note else f
-        for f in await _card_facts(db, task, generation, diff_paths, diff_reason)
+        for f in await _card_facts(
+            db, task, generation, diff_paths, diff_reason, diff_hole
+        )
     ]
 
     facts = {
@@ -1207,6 +1293,8 @@ async def build_historical_packet(
         brief=None,
         facts=facts,
         quotes=_quotes(task, None, facts["machine_review_report"]),
+        diff_base=base_branch,
+        diff_base_source=base_source,
     )
 
 

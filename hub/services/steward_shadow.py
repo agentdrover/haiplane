@@ -1434,6 +1434,11 @@ class ReplayReport:
     #: ``precondition_failed``: читатель обязан уметь отличить «политика
     #: вывела к человеку» от «нам нечем было судить».
     card_not_recorded: int = 0
+    #: Сдачи, чей дифф сравнивали с СЕГОДНЯШНЕЙ базой проекта: леджер базу
+    #: той генерации не записал. Дифф посчитан, но точка сравнения не та, по
+    #: которой судили, — и число это обязано быть в отчёте, а не только в
+    #: детали одного факта: сложить приписку внутри чужого текста нельзя.
+    base_not_recorded: int = 0
     #: Обращений к провайдеру за прогон. Поле, а не обещание в докстроке:
     #: утверждение «реплей бесплатен» должно быть проверяемым числом.
     provider_calls: int = 0
@@ -1657,7 +1662,7 @@ def replay(
     нечем.
     """
     from hub.services import gate_grounds as grounds
-    from hub.services.steward_evidence import reconstructed_share
+    from hub.services.steward_evidence import BASE_NOT_RECORDED, reconstructed_share
 
     policy = policy or grounds.GatePolicy()
     cells = {
@@ -1668,8 +1673,14 @@ def replay(
     }
     escalated = 0
     card_gaps = 0
+    substituted_base = 0
     reasons: dict[str, int] = {}
     for case in cases:
+        # Прямым обращением, а не getattr с умолчанием: поле есть у каждого
+        # пакета, и молчаливое «нет атрибута — считаем ноль» спрятало бы
+        # ровно ту потерю числа, ради которой эта строка и добавлена.
+        if case.packet.diff_base_source == BASE_NOT_RECORDED:
+            substituted_base += 1
         decision = grounds.decide(
             case.packet,
             grounds.PolicyInputs(
@@ -1705,6 +1716,7 @@ def replay(
         reconstructed=reconstructed_share([c.packet for c in cases]),
         corpus_tokens=sum(c.entry.review_tokens for c in cases),
         card_not_recorded=card_gaps,
+        base_not_recorded=substituted_base,
         provider_calls=0,
         reasons=tuple(sorted(reasons.items())),
     )
@@ -1756,6 +1768,12 @@ def render_report(report: ReplayReport) -> str:
         # число они завышают осмысленность стенда.
         f"Из эскалаций не по существу (карточка сдачи не сохранена): "
         f"{report.card_not_recorded}",
+        # Та же болезнь, что строкой выше, и потому та же форма: число,
+        # которое читатель может вычесть. Дифф этих сдач считался не от той
+        # точки, от которой судил человек, — и без этой строки отчёт выдаёт
+        # реконструкцию за измерение.
+        f"Сравнено с сегодняшней базой проекта (база сдачи не записана): "
+        f"{report.base_not_recorded}",
     ]
     lines.append(f"Исключено из корпуса: {len(report.excluded)}")
     # Счётчик — всегда, ДОЛЯ — по тому же правилу, что доля эскалаций.
