@@ -661,10 +661,7 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
         run = dict(row)
         task_row = await repo.get_task(db, run["task_id"])
         task = dict(task_row) if task_row is not None else {}
-        # A human verdict on this very generation ends the run: the judgement
-        # it was ordered for is no longer anybody's to make (#1022 gives such
-        # a late judgement a 409, and this closes the slot behind it).
-        # #1120 review: a resubmission ends the run too. Its subject stopped
+        # #1120 review: a resubmission ends the run. Its subject stopped
         # being the thing under review, and a slot left open would hold the
         # daily cap and the evidence door for code nobody is judging any more.
         #
@@ -710,6 +707,22 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
             continue
         # Вердикт — про сдачу, и снимает он слот сдачи. Но только ЗАКАЗ,
         # который ещё не начинался (#1201).
+        #
+        # Здесь до #1213 стояли два неверных утверждения; называю оба,
+        # чтобы их не восстановили по памяти. Первое: вердикт бывает НЕ
+        # только человеческим — на делегированном проекте его выносит
+        # политика (#1151), и автора называет ``verdict_closing_reason``, а
+        # не догадка читающего. Второе, и оно хуже: приём суждения (#1022)
+        # позднему суждению НЕ отказывает. Статус задачи маршрут не смотрит
+        # вовсе, уже вынесенный вердикт — тем более, а ``pinned_generation``
+        # отказывает только на ПЕРЕСДАЧЕ, которой вердикт не делает.
+        # Конфликтный отказ на этом маршруте ровно один —
+        # ``steward_judgement_exists`` на ПОВТОР той же тройки (задача,
+        # поколение, вид). Проверено зондом по маршруту, а не чтением:
+        # суждение на поколении с вынесенным вердиктом принимается и
+        # записывается, конфликт приходит только на его повтор. Держит это
+        # ``test_a_late_judgement_is_recorded_but_changes_nothing`` в
+        # tests/test_steward_dispatch.py.
         #
         # Решение и наблюдение — разные вещи. В теневой фазе суждение на
         # вердикт не влияет вовсе; оно нужно надзору F7 как пара «суждение
