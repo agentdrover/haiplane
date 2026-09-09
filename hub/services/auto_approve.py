@@ -111,7 +111,10 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
 
     ``_persist_readiness_fields`` one floor below is deliberately NOT a
     caller: the lazy repair in ``get_readiness`` reaches it, and that is a
-    read — a card view must not open drafts.
+    read — a card view must not open drafts. Held by
+    ``test_reading_a_card_never_opens_a_draft``, not by this paragraph:
+    review #313 pointed out that moving the call one floor down left the
+    whole suite green, and the measurement agreed (3475 passed).
 
     Runs inside the caller's transaction; returns True when the draft was
     transitioned. Every refusal is silent by design: a draft that does not

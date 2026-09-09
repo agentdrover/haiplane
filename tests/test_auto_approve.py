@@ -11,10 +11,12 @@ from __future__ import annotations
 import json
 
 import aiosqlite
+import pytest
 from httpx import AsyncClient
 
 from hub import config
 from hub import repository as repo
+from hub.services import refinement
 
 _DOR_READY = {
     "work_type": "feature",
@@ -544,3 +546,156 @@ async def test_bulk_refine_without_policy_still_waits_for_the_human(
     assert await _approved_events(db) == [], (
         "ни одного автоодобрения там, где политика его не разрешала"
     )
+
+
+async def _bulk_refine_dying_in_phase_two(
+    client: AsyncClient,
+    monkeypatch,
+    items: list[tuple[int, list[str] | None]],
+    *,
+    die_on: int,
+) -> None:
+    """Пакет, у которого фаза 1 закоммитила патч, а фаза 2 умерла.
+
+    Состояние достижимое, а не выдуманное: ``refine_tasks_bulk`` пишет патч в
+    ``_atomic`` и коммитит его, а готовность (и автопилот следом) считает
+    ВТОРЫМ проходом, в отдельной транзакции. Всё, что убивает процесс или
+    запрос между этими двумя — рестарт службы на выкате, таймаут, ошибка
+    расчёта — оставляет патч на диске, а второй проход несделанным.
+    """
+    real = refinement.calculate_readiness_with_recommendations
+    calls = {"n": 0}
+
+    async def die_partway(db_, task_id, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == die_on:
+            raise RuntimeError("фаза 2 умерла посреди пакета")
+        return await real(db_, task_id, **kwargs)
+
+    monkeypatch.setattr(
+        refinement, "calculate_readiness_with_recommendations", die_partway
+    )
+    with pytest.raises(RuntimeError):
+        await client.post(
+            "/api/tasks/refine-bulk",
+            json={
+                "items": [dict(_dor_patch(areas), task_id=tid) for tid, areas in items]
+            },
+        )
+    monkeypatch.setattr(refinement, "calculate_readiness_with_recommendations", real)
+
+
+async def test_a_half_finished_batch_approves_nobody_and_stays_recoverable(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1164, находка ревью #313: падение второй фазы пакета.
+
+    Разбор находки «Bulk PATCH commits before autopilot; phase-2 fail then
+    get_readiness seals the skip». Утверждалось, что пропуск автопилота
+    ЗАКРЕПЛЯЕТСЯ: патч закоммичен, автопилот не спросили, а ленивая починка
+    в ``get_readiness`` пишет поля готовности и тем самым лишает систему
+    последнего повода вернуться к этой строке.
+
+    Проверено сценарием, а не рассуждением, и наблюдено три вещи.
+    1. Частично одобренного пакета не бывает: два элемента, до которых
+       вторая фаза дошла, не открыты — они откатились вместе с третьим.
+       Это утверждение стояло в рисках постановки как ВЫЧИТАННОЕ из
+       ``write_transaction``; здесь оно измерено.
+    2. Отказ смотрит в сторону человека: драфты остаются в draft, то есть
+       ровно там, где их оставлял хаб до этой задачи.
+    3. Ничего не «запечатывается»: чтение карточки между падением и
+       повтором не мешает повтору того же запроса открыть всё, что
+       политика разрешает. Тот же патч, тот же URL — и пакет доезжает.
+    """
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _project(db, "spike-half-batch", {"dor": "auto"})
+    first = await _draft_in_project(client, db, pid)
+    second = await _draft_in_project(client, db, pid)
+    third = await _draft_in_project(client, db, pid)
+    items: list[tuple[int, list[str] | None]] = [
+        (first, ["docs/notes.md"]),
+        (second, ["docs/notes.md"]),
+        (third, ["docs/notes.md"]),
+    ]
+
+    await _bulk_refine_dying_in_phase_two(client, monkeypatch, items, die_on=3)
+
+    for task_id in (first, second, third):
+        row = await repo.get_task(db, task_id)
+        assert row["status"] == "draft", (
+            "элемент, до которого вторая фаза успела дойти, не может остаться "
+            "одобренным после отката её транзакции"
+        )
+    assert await _approved_events(db) == [], "частично одобренного пакета не бывает"
+
+    # Ленивая починка чтением карточки: поля готовности она пишет, гейт — нет.
+    healed = await client.get(f"/api/tasks/{first}/readiness")
+    assert healed.status_code == 200, healed.text
+    assert (await repo.get_task(db, first))["dor_passed"], (
+        "иначе следующая проверка не про то: чтение обязано было починить поля"
+    )
+    assert (await repo.get_task(db, first))["status"] == "draft"
+
+    # И повтор того же запроса доезжает — пропуск не закреплён.
+    bodies = await _refine_bulk_to_dor(client, items)
+    assert [bodies[tid]["status"] for tid in (first, second, third)] == [
+        "open",
+        "open",
+        "open",
+    ], "повтор того же патча обязан открыть то, что политика разрешает"
+
+
+async def test_reading_a_card_never_opens_a_draft(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1164, находка ревью #313: этаж, ниже которого автопилот не опускают.
+
+    Разбор находки «Card-view persist_fields path can auto-approve with all
+    tests still green». Вызов автопилота стоит в
+    ``_persist_readiness_and_revision`` — в путях ЗАПИСИ. Этажом ниже, в
+    ``_persist_readiness_fields``, живёт ленивая починка из
+    ``get_readiness``, то есть обычное ЧТЕНИЕ карточки, и автопилот там
+    открывал бы драфты по факту просмотра.
+
+    До этого теста запрет держался одним абзацем докстринга: перенос вызова
+    на этаж ниже оставлял AC-1..3 и все соседние тесты зелёными, потому что
+    ни один из них не читает готовность на строке с УСТАРЕВШИМИ полями —
+    а без устаревших полей ленивая починка не срабатывает и разницы не
+    видно. Тест ниже ставит ровно эту строку.
+    """
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _project(db, "spike-card-read", {"dor": "auto"})
+    task_id = await _draft_in_project(client, db, pid)
+    filler = await _draft_in_project(client, db, pid)
+
+    # Состояние с несохранённой готовностью берём не подкруткой строки, а
+    # тем же достижимым путём, что и в тесте выше: пакет, у которого вторая
+    # фаза не доехала. Второй элемент нужен только затем, чтобы ей было на
+    # чём умереть после первого.
+    await _bulk_refine_dying_in_phase_two(
+        client,
+        monkeypatch,
+        [(task_id, ["docs/notes.md"]), (filler, ["docs/notes.md"])],
+        die_on=2,
+    )
+    row = await repo.get_task(db, task_id)
+    assert row["risk_class"] == "R0", "класс считается в первой фазе и уже на строке"
+    assert not row["dor_passed"], (
+        "поля готовности не записаны — иначе ленивая починка не сработает "
+        "и тест проверит не тот путь"
+    )
+
+    report = await client.get(f"/api/tasks/{task_id}/readiness")
+    assert report.status_code == 200, report.text
+    assert report.json()["dor_passed"] is True, (
+        "драфт ПОДХОДИТ под политику: R0, dor=auto, потолок r1 — то есть "
+        "чтение отделяет от open только отсутствие вызова автопилота"
+    )
+
+    healed = await repo.get_task(db, task_id)
+    assert healed["dor_passed"], "ленивая починка полей прошла"
+    assert healed["status"] == "draft", (
+        "просмотр карточки — не решение: гейт двигают пути записи, а чтение "
+        "не двигает даже подходящий драфт"
+    )
+    assert await _approved_events(db) == [], "чтение не порождает task_approved"
