@@ -1128,6 +1128,40 @@ async def _card_facts(
     ]
 
 
+def _diff_base_ref(base_branch: str) -> str:
+    """Ref, ПРОТИВ КОТОРОГО трёхточечный дифф посчитан на самом деле (#1167).
+
+    ``branch_diff_paths`` резолвит базу через ``_resolve_ref_remote_first``
+    (#762): сначала ``origin/<имя>`` и только потом голое имя. Вопрос о
+    предке обязан быть задан ТОЙ ЖЕ вершине, иначе ответ описывает другой
+    коммит: ``is_ancestor`` зовёт ``merge-base --is-ancestor`` по имени как
+    есть, а в общем клоне хаба локальный ``develop`` отстаёт от
+    ``origin/develop`` (#824, #1046) — ``branch_diff_paths`` двигает
+    фетчем именно remote-ветку, локальную не трогает никто.
+
+    Расхождение не рассуждение, а наблюдение: в клоне с отставшим локальным
+    ``develop`` те же три команды над одним коммитом отвечают
+
+        git diff --name-only origin/develop...<sha>        -> 0 файлов
+        git merge-base --is-ancestor <sha> develop         -> rc=1 (НЕ предок)
+        git merge-base --is-ancestor <sha> origin/develop  -> rc=0 (предок)
+
+    То есть на голом имени коллапс не опознаётся: дыры нет, ``_surface_fact``
+    получает пустой список, отвечает ``present`` и ``within_declared=True``,
+    класс риска не поднимается — и одобрение проходит по измерению, которого
+    не было.
+
+    Отката на голое имя здесь НЕТ, и это осознанно. ``is_ancestor`` отвечает
+    ``None`` и на «такого ref тут нет», и на «репозиторий не прочитать»; по
+    этому ответу нельзя решить, что откат безопасен, а откат на отставший
+    локальный ref вернул бы ровно ту ошибку, которую функция убирает. Клон
+    без ``origin`` получит ``historical_diff_unreadable`` — названную дыру,
+    которая выводит сдачу к человеку, а не тихий успех.
+    """
+    ref = (base_branch or "").strip()
+    return ref if ref.startswith("origin/") else f"origin/{ref}"
+
+
 async def build_historical_packet(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1205,18 +1239,22 @@ async def build_historical_packet(
         # мержем, а не squash), merge-base равен самому коммиту и список
         # пуст ВСЕГДА — независимо от того, что сдача меняла. Различает их
         # только вопрос о предке, и он задаётся здесь, а не предполагается.
-        ancestor = await plugins.git_ops.is_ancestor(workspace, pinned_sha, base_branch)
+        #
+        # Спрашивается ТА ЖЕ вершина, против которой дифф и посчитан:
+        # ``_diff_base_ref``. Голое имя базы — другой коммит (#1167).
+        base_ref = _diff_base_ref(base_branch)
+        ancestor = await plugins.git_ops.is_ancestor(workspace, pinned_sha, base_ref)
         if ancestor is None:
             diff_hole = HISTORICAL_DIFF_UNREADABLE
             diff_reason = (
-                f"дифф {base_branch}...{pinned_sha[:12]} пуст, а предок ли "
-                f"коммит базы — гит не ответил: пустота недоказуема как "
-                "измерение"
+                f"дифф {base_ref}...{pinned_sha[:12]} пуст, а предок ли "
+                f"коммит {base_ref} — гит не ответил: пустота недоказуема "
+                "как измерение"
             )
         elif ancestor:
             diff_hole = HISTORICAL_DIFF_COLLAPSED
             diff_reason = (
-                f"коммит {pinned_sha[:12]} лежит в истории базы {base_branch}: "
+                f"коммит {pinned_sha[:12]} лежит в истории базы {base_ref}: "
                 f"трёхточечный дифф схлопнулся в пустой список, поверхность "
                 "сдачи по нему невосстановима"
             )

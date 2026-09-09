@@ -1463,7 +1463,9 @@ class _HistoricalGitOps:
         commit_here: bool = True,
         base: str = "develop",
         diff_empty: bool = False,
+        diff_unreadable: bool = False,
         ancestor: bool | None = False,
+        local_ancestor: bool | None = False,
     ) -> None:
         self.paths = paths
         self.commit_here = commit_here
@@ -1475,11 +1477,23 @@ class _HistoricalGitOps:
         self.base = base
         #: Трёхточечный дифф вернул ПУСТОЙ список — топология, а не отказ.
         self.diff_empty = diff_empty
-        #: Лежит ли коммит в истории базы. Три ответа, как у живого git:
-        #: True, False и None («спросить не удалось»).
+        #: Гит не ответил вовсе: ``None``, а не пустой список. Отдельный
+        #: флаг, потому что отказ гита и пустой дифф — разные ответы, и
+        #: заглушка обязана уметь дать каждый.
+        self.diff_unreadable = diff_unreadable
+        #: Лежит ли коммит в истории ``origin/<база>`` — той вершины, против
+        #: которой ``branch_diff_paths`` и считает дифф. Три ответа, как у
+        #: живого git: True, False и None («спросить не удалось»).
         self.ancestor = ancestor
+        #: То же про ОТСТАВШИЙ локальный ref. По умолчанию False: в общем
+        #: клоне хаба локальный ``develop`` годами позади ``origin/develop``
+        #: (#824, #1046), и коммит, давно уехавший в origin, локальному
+        #: имени не предок. Вопрос, заданный сюда вместо origin, отвечает
+        #: «дифф не схлопнулся» на схлопнувшемся диффе.
+        self.local_ancestor = local_ancestor
         self.asked = []
         self.bases = []
+        self.ancestry_asked = []
 
     async def commit_exists(self, repo, sha):
         return self.commit_here
@@ -1492,10 +1506,21 @@ class _HistoricalGitOps:
             return None
         if base_branch != self.base:
             return None
+        if self.diff_unreadable:
+            return None
         return [] if self.diff_empty else list(self.paths)
 
     async def is_ancestor(self, repo, ancestor, descendant):
-        return self.ancestor
+        self.ancestry_asked.append(descendant)
+        # Каждому ref — свой ответ. Заглушка, отвечающая одно и то же на
+        # любое имя, не видит рассинхрона origin/local, а именно он и
+        # превращал схлопнувшийся дифф в «ничего не менялось».
+        if descendant == f"origin/{self.base}":
+            return self.ancestor
+        if descendant == self.base:
+            return self.local_ancestor
+        # Такого ref в клоне нет — живой git отвечает None (cat-file -e).
+        return None
 
     async def head_sha(self, repo, base):
         return ""
@@ -2082,6 +2107,125 @@ async def test_unanswered_ancestry_is_not_read_as_an_empty_diff(
     surface = packet.fact("diff_vs_areas")
     assert surface.is_absent and surface.reason == "historical_diff_unreadable"
     assert diff_recovered(packet) is False
+
+
+async def test_ancestry_is_asked_against_the_ref_the_diff_used(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: вопрос о предке задаётся ТОЙ вершине, против которой считан дифф.
+
+    ``branch_diff_paths`` резолвит базу remote-first (#762) и фетчем двигает
+    ``origin/<база>``; локальный ref не трогает никто, и в общем клоне хаба
+    он отстаёт (#824, #1046). Воспроизведено настоящим git на клоне с
+    отставшим локальным ``develop``:
+
+        git diff --name-only origin/develop...<sha>        -> 0 файлов
+        git merge-base --is-ancestor <sha> develop         -> rc=1
+        git merge-base --is-ancestor <sha> origin/develop  -> rc=0
+
+    Спросив голое имя, детектор коллапса получает «не предок», дыру не
+    ставит, и ``_surface_fact`` на пустом списке отвечает present +
+    ``within_declared=True``: одобрение по измерению, которого не было.
+    Заглушка отвечает на два ref РАЗНОЕ — иначе тест зелен при любом из них.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import build_historical_packet, diff_recovered
+
+    project_id = await _historical_project(db, "replay-ancestry-ref")
+    git = _HistoricalGitOps(
+        ["hub/services/steward_shadow.py"],
+        diff_empty=True,
+        ancestor=True,
+        local_ancestor=False,
+    )
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+    rows = await fetchall(
+        db,
+        "SELECT created_at FROM events WHERE task_id=? AND "
+        "kind='review_verdict_recorded'",
+        (task_id,),
+    )
+
+    packet = await build_historical_packet(db, task_id, 1, dict(rows[0])["created_at"])
+
+    # Сначала ПОСЛЕДСТВИЕ, потом уже способ: тест обязан краснеть от того,
+    # что схлопнувшийся дифф прошёл за измерение, а не от одного лишь имени
+    # ref в журнале заглушки.
+    surface = packet.fact("diff_vs_areas")
+    assert surface.is_absent, "пустой дифф выдан за измеренную поверхность"
+    assert surface.reason == "historical_diff_collapsed"
+    assert packet.fact("risk_class").is_absent
+    assert diff_recovered(packet) is False
+    assert git.ancestry_asked == ["origin/develop"], (
+        "предка спросили не у той вершины, против которой считан дифф: "
+        f"{git.ancestry_asked}"
+    )
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries, dropped)
+    report = sh.replay(cases, excluded=excluded)
+    assert report.table.escalated == 1
+    assert report.table.both_approve == 0, "approve на невосстановимой поверхности"
+
+
+async def test_git_refusing_the_diff_is_not_a_card_gap(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: ``diff_paths is None`` — отказ ГИТА, и он запинен здесь.
+
+    Ветка ``if diff_paths is None`` в ``_card_facts`` до сих пор не была
+    пройдена ни одним тестом задачи: у ``test_unanswered_ancestry`` дифф
+    пустой (``[]``), а не непрочитанный, card-gap тесты получают непустой
+    список, и заглушка отдавала ``None`` только на чужую базу — то есть на
+    сдачу, которую корпус и так выбрасывает.
+
+    Разница несущая: ``diff_recovered`` засчитывает ``card_not_recorded``
+    восстановлением, потому что дифф там ПРОЧИТАН, а сверять его не с чем.
+    Отказ гита восстановлением не является, и подмена кода тихо подняла бы
+    долю восстановленного — то самое число, по которому задача решает,
+    отменять ли бэкфилл («ниже 70%»).
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import (
+        build_historical_packet,
+        diff_recovered,
+        reconstructed_share,
+    )
+
+    project_id = await _historical_project(db, "replay-diff-unreadable")
+    git = _HistoricalGitOps(["hub/services/steward_shadow.py"], diff_unreadable=True)
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+    rows = await fetchall(
+        db,
+        "SELECT created_at FROM events WHERE task_id=? AND "
+        "kind='review_verdict_recorded'",
+        (task_id,),
+    )
+
+    packet = await build_historical_packet(db, task_id, 1, dict(rows[0])["created_at"])
+
+    # Сначала ПОСЛЕДСТВИЕ: отказ гита, зачтённый восстановлением, — это
+    # завышенная доля, по которой задача решает, отменять ли бэкфилл.
+    assert diff_recovered(packet) is False, "отказ гита зачтён восстановлением"
+    assert reconstructed_share([packet]) == 0.0
+    surface = packet.fact("diff_vs_areas")
+    risk = packet.fact("risk_class")
+    assert surface.is_absent and surface.reason == "historical_diff_unreadable"
+    assert risk.is_absent and risk.reason == "historical_diff_unreadable"
+    assert surface.reason != "card_not_recorded", "отказ гита выдан за дыру карточки"
+    assert "не прочитать" in surface.detail
+    # Пустоты не было — предка никто не спрашивал: ``None`` и ``[]`` идут
+    # разными ветками, и путать их значит спрашивать про несуществующий дифф.
+    assert git.ancestry_asked == []
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries, dropped)
+    report = sh.replay(cases, excluded=excluded)
+    assert report.card_not_recorded == 0, "отказ гита посчитан дырой карточки"
+    assert report.reconstructed == 0.0
+    assert report.table.both_approve == 0, "approve без прочитанной поверхности"
 
 
 async def test_historical_diff_is_asked_against_the_recorded_base(
