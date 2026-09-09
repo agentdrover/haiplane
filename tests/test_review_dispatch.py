@@ -4282,7 +4282,9 @@ def test_the_doc_recommends_only_sandboxes_the_hub_accepts(monkeypatch) -> None:
         )
 
 
-def test_the_doc_wrapper_carries_the_argv_the_hub_appends(monkeypatch, tmp_path) -> None:
+def test_the_doc_wrapper_carries_the_argv_the_hub_appends(
+    monkeypatch, tmp_path
+) -> None:
     """Скелет враппера ИЗ ДОКУМЕНТА доносит до движка argv, дописанный хабом.
 
     Хаб запускает ``shlex.split(SANDBOX) + shlex.split(CMD)``. Враппер без
@@ -4343,7 +4345,7 @@ def test_the_doc_wrapper_carries_the_argv_the_hub_appends(monkeypatch, tmp_path)
     assert seen[-1 - len(cmd) : -1] == cmd, (
         "скелет враппера из документа НЕ донёс до движка argv, который хаб к "
         f"нему дописал: движок получил {seen[:-1]}, а хвостом обязан был "
-        f"стоять {cmd}. Молча: код возврата 0. Добавьте \"$@\" последним "
+        f'стоять {cmd}. Молча: код возврата 0. Добавьте "$@" последним '
         "аргументом podman run"
     )
 
