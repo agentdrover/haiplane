@@ -4306,6 +4306,37 @@ async def completed_tasks_awaiting_delivery(
     no PR at all is work that never started delivery, which is #498's warning,
     not this list. Mixing them would make "the discrepancy list" mean two
     different things and stop being trustworthy as either.
+
+    THE LOOKBACK BOUNDS THE FIRST QUESTION, NOT EVERY LATER ONE (#1204, machine
+    review of submission #6). It used to bound both, and while every reader of
+    this table was advisory that was only a stale dashboard cell. Since #1204
+    a live ``pr_open`` row feeds an IRREVERSIBLE gate, and there the same
+    staleness is a different animal: past day thirty the sweep stopped asking,
+    so the row froze at whatever the provider last said. Deliver that base by
+    hand — merge the PR, delete the branch — and nothing ever corrects the row.
+    The branch is then a dead ref on a candidate the gate still trusts, which
+    ``_stranded_with_a_dead_ref`` turns into a NON-transient refusal that
+    ``list_pair_tasks_awaiting_delivery`` never retries. Not one delivery: the
+    walk asks about that row for every task in the project, so one fossil
+    bricks the whole project's deliveries and no event can unbrick it.
+
+    So a row that already says ``pr_open`` keeps being re-asked whatever its
+    age, and it is asked FIRST — ``ORDER BY`` puts it ahead of the window, so
+    the ``LIMIT`` cannot starve the very rows an irreversible gate stands on.
+    The cost is bounded by how many such rows exist, which is the set
+    ``hub_undelivered_completed`` prints, and is paid by the sweep rather than
+    in the delivery path.
+
+    ``unknown`` is deliberately NOT given the same reprieve. It is not a
+    candidate of that gate (see ``list_undelivered_completed_branch_tasks``),
+    so its staleness costs nothing, while re-asking every ancient unanswerable
+    row forever would spend a network call per sweep on exactly the rows the
+    provider has already refused to answer.
+
+    THE BLIND SPOT THAT REMAINS, named because half of it used to be named and
+    the dangerous half was not: absence of a row still means "never asked", not
+    "delivered" — a task completed before the window and never scanned has no
+    row to revive here.
     """
     return list(
         await fetchall(
@@ -4326,8 +4357,17 @@ async def completed_tasks_awaiting_delivery(
               AND (
                     COALESCE(NULLIF(t.completed_at, ''), t.updated_at)
                     >= datetime('now', ?)
+                    OR EXISTS (
+                        SELECT 1 FROM delivery_discrepancies d
+                        WHERE d.task_id = t.id AND d.state = 'pr_open'
+                    )
               )
-            ORDER BY COALESCE(NULLIF(t.completed_at, ''), t.updated_at) DESC
+            ORDER BY
+              EXISTS (
+                  SELECT 1 FROM delivery_discrepancies d
+                  WHERE d.task_id = t.id AND d.state = 'pr_open'
+              ) DESC,
+              COALESCE(NULLIF(t.completed_at, ''), t.updated_at) DESC
             LIMIT ?
             """,
             (f"-{max(int(lookback_days), 1)} days", max(int(limit), 1)),

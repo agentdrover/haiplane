@@ -22,6 +22,12 @@ from hub import repository as repo
 from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 from hub.integrations.registry import plugins
 from hub.services.delivery_gate import undelivered_warning
+from hub.services.delivery_state import (
+    DELIVERED,
+    PR_CLOSED,
+    PR_OPEN,
+    UNKNOWN,
+)
 from tests.test_pair_merge_gate import _approved_pair_task, _git, _report_done
 
 
@@ -707,7 +713,19 @@ async def test_every_status_in_the_delivery_list_is_actually_seen(
 
 
 async def _stranded_base(db: aiosqlite.Connection, branch: str) -> int:
-    """Задача, принятая человеком без доставки: свип нашёл её PR открытым."""
+    """Задача, принятая человеком без доставки: свип нашёл её PR открытым.
+
+    Состояние берётся КОНСТАНТОЙ из hub.services.delivery_state, а не строкой
+    в тесте. Найдено машинным ревью сдачи №6: AC-2 и AC-3 подставляли
+    state='merged' — токен, которого свип не пишет ВООБЩЕ (pr_state=merged он
+    мапит в 'delivered'). Запрос — allowlist на 'pr_open', поэтому любая
+    выдумка мимо него проходила, и тесты оставались зелёными на состоянии,
+    которого продакшен не порождает. Замерено мутацией: замена условия на
+    ``state IN ('pr_open','delivered')`` — то есть превращение КАЖДОГО
+    доставленного основания в застрявшее, остановка всех доставок разом —
+    не уронила ни одного из 112 тестов. Импорт делает переименование токена
+    ошибкой импорта, а не молча зелёным тестом.
+    """
     from hub.models import TaskCreate
     from hub.services import create_task
 
@@ -716,7 +734,7 @@ async def _stranded_base(db: aiosqlite.Connection, branch: str) -> int:
     await repo.record_delivery_discrepancy(
         db,
         task_id=tv.id,
-        state="pr_open",
+        state=PR_OPEN,
         reason="PR #3 открыт и не смержен — работа не в базовой ветке",
         pr_number=3,
         delivery_path="none",
@@ -764,10 +782,10 @@ async def test_a_delivered_base_does_not_hold_anything(
     await repo.record_delivery_discrepancy(
         db,
         task_id=base_id,
-        state="merged",
-        reason="PR #3 влит",
+        state=DELIVERED,
+        reason="PR #3 смержен",
         pr_number=3,
-        delivery_path="gate",
+        delivery_path="outside_gate",
     )
     await db.commit()
 
@@ -798,10 +816,23 @@ async def test_delivered_tasks_are_not_candidates(db: aiosqlite.Connection) -> N
     await repo.record_delivery_discrepancy(
         db,
         task_id=delivered,
-        state="merged",
-        reason="влит",
+        state=DELIVERED,
+        reason="PR #3 смержен",
         pr_number=3,
-        delivery_path="gate",
+        delivery_path="outside_gate",
+    )
+    # Второе состояние ТОГО ЖЕ словаря: PR закрыт без мержа. Работу свернули
+    # намеренно — это тоже не «ждём доставки», и в кандидаты оно не входит.
+    # Закрепляется здесь, потому что allowlist из одного токена читается как
+    # опечатка ровно до тех пор, пока рядом не названо, что ещё бывает.
+    closed = await _stranded_base(db, "task-901/closed-without-merge")
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=closed,
+        state=PR_CLOSED,
+        reason="PR #3 закрыт без мержа",
+        pr_number=3,
+        delivery_path="none",
     )
     await db.commit()
 
@@ -812,9 +843,11 @@ async def test_delivered_tasks_are_not_candidates(db: aiosqlite.Connection) -> N
         )
     ]
 
-    assert delivered not in [r["id"] for r in rows], (
+    ids = [r["id"] for r in rows]
+    assert delivered not in ids, (
         "доставленное основание не кандидат, и признак — состояние PR, не статус"
     )
+    assert closed not in ids, "закрытый без мержа PR — тоже не «ждём доставки»"
 
 
 async def test_an_unanswerable_pr_state_is_not_a_candidate(
@@ -830,7 +863,7 @@ async def test_an_unanswerable_pr_state_is_not_a_candidate(
     await repo.record_delivery_discrepancy(
         db,
         task_id=unanswered,
-        state="unknown",
+        state=UNKNOWN,
         reason="состояние PR узнать не удалось: провайдер не ответил",
         pr_number=443,
         delivery_path="unknown",
@@ -845,6 +878,110 @@ async def test_an_unanswerable_pr_state_is_not_a_candidate(
     ]
 
     assert unanswered not in [r["id"] for r in rows]
+
+
+async def test_a_live_pr_open_row_is_still_re_asked_past_the_lookback(
+    db: aiosqlite.Connection,
+) -> None:
+    """Строка, на которой стоит необратимый гейт, не имеет права замёрзнуть.
+
+    Найдено машинным ревью сдачи №6 и воспроизведено зондом до починки.
+    ``list_undelivered_completed_branch_tasks`` берёт ЛЮБУЮ живую строку
+    pr_open, а свип переспрашивал только задачи внутри
+    DELIVERY_SCAN_LOOKBACK_DAYS. За окном строка застывала на том, что
+    провайдер сказал в последний раз. Доставь основание руками — смержи PR,
+    удали ветку — и исправить строку уже нечему: свип о ней не спрашивает,
+    гейт ей верит.
+
+    Дальше это не одна задержанная доставка. Мёртвая ссылка на кандидате
+    уходит в ``_stranded_with_a_dead_ref``, тот исход НЕ транзитный, а
+    ``list_pair_tasks_awaiting_delivery`` берёт только running — значит
+    повторить некому. И обход спрашивает про эту строку у КАЖДОЙ задачи
+    проекта: один ископаемый ряд запирает доставки всего проекта, и события,
+    которое бы его отперло, не существует.
+
+    Зонд до починки: кандидат гейта — [id], список свипа — пусто.
+    """
+    from hub.models import TaskCreate
+    from hub.services import create_task
+
+    tv = await create_task(db, TaskCreate(title="Принята 40 дней назад"))
+    await repo.update_task(
+        db, tv.id, status="completed", branch="task-900/fossil", pr_number=7
+    )
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=tv.id,
+        state=PR_OPEN,
+        reason="PR #7 открыт и не смержен",
+        pr_number=7,
+        delivery_path="none",
+    )
+    await db.execute(
+        "UPDATE tasks SET completed_at = datetime('now','-40 days'), "
+        "updated_at = datetime('now','-40 days') WHERE id = ?",
+        (tv.id,),
+    )
+    await db.commit()
+
+    candidates = [
+        dict(r)["id"]
+        for r in await repo.list_undelivered_completed_branch_tasks(
+            db, exclude_task_id=999
+        )
+    ]
+    asked = [
+        dict(r)["id"]
+        for r in await repo.completed_tasks_awaiting_delivery(db, lookback_days=30)
+    ]
+
+    assert tv.id in candidates, "гейт этой строке верит"
+    assert tv.id in asked, (
+        "значит свип обязан её переспрашивать: строка, которую больше не "
+        "проверяют, но на которую опирается необратимый отказ, уже не "
+        "наблюдение, а память"
+    )
+
+
+async def test_an_unanswered_row_past_the_lookback_is_not_re_asked_forever(
+    db: aiosqlite.Connection,
+) -> None:
+    """Отсрочка дана ровно pr_open, и это выбор, а не побочный эффект.
+
+    unknown в кандидаты гейта не входит вовсе (см. соседний тест), поэтому его
+    несвежесть ничего не стоит. А переспрашивать вечно строки, на которые
+    провайдер уже отказался отвечать, — это сетевой вызов каждый свип за ответ,
+    которого не будет. Тест держит границу отсрочки: расширь её на unknown, и
+    он упадёт.
+    """
+    from hub.models import TaskCreate
+    from hub.services import create_task
+
+    tv = await create_task(db, TaskCreate(title="Провайдер молчал 40 дней назад"))
+    await repo.update_task(
+        db, tv.id, status="completed", branch="task-878/flywheel", pr_number=8
+    )
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=tv.id,
+        state=UNKNOWN,
+        reason="состояние PR узнать не удалось: провайдер не ответил",
+        pr_number=8,
+        delivery_path="unknown",
+    )
+    await db.execute(
+        "UPDATE tasks SET completed_at = datetime('now','-40 days'), "
+        "updated_at = datetime('now','-40 days') WHERE id = ?",
+        (tv.id,),
+    )
+    await db.commit()
+
+    asked = [
+        dict(r)["id"]
+        for r in await repo.completed_tasks_awaiting_delivery(db, lookback_days=30)
+    ]
+
+    assert tv.id not in asked
 
 
 async def test_the_undeliverable_base_is_not_worded_as_a_wait(
@@ -895,6 +1032,61 @@ async def test_a_stranded_task_built_on_top_of_us_does_not_block_us(
         "мы основание: ждать нечего и решать нечего, мержимся первыми"
     )
     assert g.merge_pr.await_count == 1
+
+
+async def test_a_benign_stranded_row_does_not_end_the_walk(
+    db: aiosqlite.Connection,
+) -> None:
+    """Застрявшая строка стоит в обходе ПЕРВОЙ — значит её «continue» несущий.
+
+    Найдено машинным ревью сдачи №6 и воспроизведено мутацией до починки:
+    ``if other_id in stranded: return found`` перед проверкой ancestry пережила
+    82 теста. Соседний тест — «застрявшая задача поверх нас не блокирует нас» —
+    её не ловит, потому что ``_stacking_gate_step`` САМ разбирает
+    head_is_ancestor раньше вопроса о застревании: исход у той пары одинаковый
+    хоть с ранним возвратом, хоть без.
+
+    Вред не у той пары, а у обхода. Застрявшие строки кладутся В НАЧАЛО списка
+    (это сделано намеренно: иначе ближнее обычное основание маскировало бы
+    застрявшее). Значит застрявшая задача, стоящая ПОВЕРХ нас, встречается
+    первой ВСЕГДА, и ранний возврат на ней означал бы, что настоящее основание
+    ПОД нами не спрашивают вообще — мы мержим и уносим его несмерженные
+    коммиты под своим номером. Это ровно тот инцидент 06.09, ради которого всё
+    условие написано, только через собственную оптимизацию.
+
+    Здесь: #B принята без доставки и отведена ОТ нашей ветки (мы её основание),
+    #A в review и наша ветка стоит НА ней. Обход обязан пройти мимо первой и
+    упереться во вторую.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+
+    async def _ancestry(branch: str, other_branch: str, repo: str | None = None) -> str:
+        # Мы — основание для застрявшей #B и потомок настоящего основания #A.
+        if other_branch == "task-B/stranded-on-top-of-us":
+            return "head_is_ancestor"
+        return "head_is_descendant"
+
+    g.branch_ancestry = AsyncMock(side_effect=_ancestry)
+    task_id = await _approved_pair_task(db)
+    await _stranded_base(db, "task-B/stranded-on-top-of-us")
+    real_base = await _base_task_in_review(db, "task-A/genuinely-under-us")
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "настоящее основание в review — это удержание: оно доставится само"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{real_base}" in body, (
+        "обход остановился на доброкачественной застрявшей строке и не дошёл "
+        "до основания, которое действительно под нами"
+    )
+    assert "task-A/genuinely-under-us" in body
 
 
 async def test_a_stranded_base_outranks_an_undetermined_order(
