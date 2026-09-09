@@ -1438,14 +1438,64 @@ class DoRCheckItem(BaseModel):
 RecommendationSeverity = Literal["blocking", "high", "medium", "low"]
 
 
+# Closed vocabulary of statement defects (#1172), same shape as
+# STEWARD_ESCALATE_REASONS below: a tuple of strings, checked by enumeration.
+#
+# WHY A DICTIONARY AT ALL. The hub already computes two of these defects, but
+# says them as a message string — you cannot count a string, cite it, or point
+# a steward's finding at it. Two producers name defects here: the hub's own
+# readiness read (deterministic and free) and the F6 steward (paid per run).
+# They must use ONE set of names, or the same defect arrives twice under two
+# spellings and the count is silently incomplete.
+#
+# `unknown` is absent on purpose, exactly as in the steward vocabularies: a
+# catch-all would reopen the dictionary. A string outside this tuple is not a
+# statement defect — Recommendation rejects it below.
+#
+# The list is closed, not frozen: it grows from RECORDED steward findings, not
+# from guesses, and a code that never fires is removed (task #1172 revisit
+# condition).
+STATEMENT_DEFECTS: tuple[str, ...] = (
+    # Already computed by the hub, previously nameless (recommendations.py).
+    "ac_clause_thin",
+    "expectation_source_unstated",
+    "expectation_source_is_implementation",
+    # Added by #1172, each against one reproducible authoring mistake.
+    "scope_item_without_criterion",
+    "affected_area_not_in_tree",
+    "outcome_metric_without_number",
+)
+
+
 class Recommendation(BaseModel):
-    """Actionable suggestion to improve task readiness."""
+    """Actionable suggestion to improve task readiness.
+
+    ``defect_code`` names a statement defect from the closed vocabulary
+    STATEMENT_DEFECTS (#1172). It is optional because most recommendations
+    are not defect reports: a failed DoR check says "this field is empty",
+    which is a missing field, not a flaw in what was written. A code outside
+    the vocabulary is refused rather than stored — that refusal is what keeps
+    a second, unlisted way of naming a defect from appearing.
+    """
 
     field: str
     severity: RecommendationSeverity
     message: str
     expected_score_delta: int = 0
     estimated_minutes: int = 0
+    defect_code: str | None = None
+
+    @field_validator("defect_code")
+    @classmethod
+    def _defect_code_is_in_the_vocabulary(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if v not in STATEMENT_DEFECTS:
+            raise ValueError(
+                f"unknown statement defect {v!r}; allowed: "
+                f"{', '.join(STATEMENT_DEFECTS)}"
+            )
+        return v
 
 
 class ReadinessTreeNode(BaseModel):

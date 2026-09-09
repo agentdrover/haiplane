@@ -19,8 +19,13 @@ Design choices:
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from hub.db import deserialize_str_list
 from hub.models import (
     DoRCheckItem,
     Recommendation,
@@ -214,15 +219,49 @@ def _ac_clause_is_thin(text: str | None) -> bool:
     return len(t) < AC_QUALITY_MIN_LEN
 
 
-def build_ac_quality_warnings(ac_rows: list[Any]) -> list[Recommendation]:
+def _row_value(row: Any, key: str) -> str:
+    """Read one column from an sqlite Row or a dict, missing key included."""
+    try:
+        keys = row.keys() if hasattr(row, "keys") else []
+        if key not in keys:
+            return ""
+        return str(row[key] or "")
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+@dataclass(frozen=True)
+class StatementInputs:
+    """Everything a statement-defect producer is allowed to look at (#1172).
+
+    One shape for every producer so the set of producers can be checked by
+    ENUMERATION rather than by example: a test iterates
+    ``STATEMENT_DEFECT_PRODUCERS`` and drives each one through the same call.
+    With per-producer signatures such a test could only sample, and a new
+    producer speaking outside the vocabulary would pass unnoticed — which is
+    the exact failure #1172 exists to prevent.
+
+    ``repo_path`` is the project's working copy (from ``project_git_context``),
+    or None when the project declares none. None means "no ground to judge on",
+    not "nothing found".
+    """
+
+    ac_rows: list[Any] = field(default_factory=list)
+    scope_in: list[str] = field(default_factory=list)
+    affected_areas: list[str] = field(default_factory=list)
+    outcome_metric: str = ""
+    repo_path: str | None = None
+
+
+def build_ac_quality_warnings(inputs: StatementInputs) -> list[Recommendation]:
     """Emit at most one low-severity warning when some ACs look hollow.
 
-    ``ac_rows`` are rows from ``repo.list_acceptance_criteria`` (columns
+    ``inputs.ac_rows`` are rows from ``repo.list_acceptance_criteria`` (columns
     ``ac_id``/``given``/``when_clause``/``then_clause``). Returns an empty
     list when every AC has substantive clauses.
     """
     weak: list[str] = []
-    for row in ac_rows:
+    for row in inputs.ac_rows:
         if (
             _ac_clause_is_thin(row["given"])
             or _ac_clause_is_thin(row["when_clause"])
@@ -243,11 +282,12 @@ def build_ac_quality_warnings(ac_rows: list[Any]) -> list[Recommendation]:
             ),
             expected_score_delta=0,
             estimated_minutes=5,
+            defect_code="ac_clause_thin",
         )
     ]
 
 
-def build_expectation_source_warnings(ac_rows: list[Any]) -> list[Recommendation]:
+def build_expectation_source_warnings(inputs: StatementInputs) -> list[Recommendation]:
     """Flag criteria whose expected behaviour has no stated source (#595).
 
     Strictly non-blocking: severity="low", expected_score_delta=0, no effect
@@ -262,7 +302,7 @@ def build_expectation_source_warnings(ac_rows: list[Any]) -> list[Recommendation
     """
     unstated: list[str] = []
     from_code: list[str] = []
-    for row in ac_rows:
+    for row in inputs.ac_rows:
         keys = row.keys() if hasattr(row, "keys") else []
         source = row["expectation_source"] if "expectation_source" in keys else None
         if source == "implementation":
@@ -286,6 +326,7 @@ def build_expectation_source_warnings(ac_rows: list[Any]) -> list[Recommendation
                 ),
                 expected_score_delta=0,
                 estimated_minutes=3,
+                defect_code="expectation_source_is_implementation",
             )
         )
     if unstated:
@@ -302,8 +343,238 @@ def build_expectation_source_warnings(ac_rows: list[Any]) -> list[Recommendation
                 ),
                 expected_score_delta=0,
                 estimated_minutes=2,
+                defect_code="expectation_source_unstated",
             )
         )
+    return out
+
+
+# Words too common to carry meaning when matching a scope_in item against the
+# acceptance criteria. Short tokens are dropped by length before this set is
+# consulted, so only longer filler needs listing.
+_SCOPE_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "this",
+        "that",
+        "with",
+        "from",
+        "into",
+        "when",
+        "then",
+        "given",
+        "which",
+        "should",
+        "must",
+        "code",
+        # Russian filler, listed as PREFIX STEMS (see _significant_stems), so
+        # one entry covers every inflection of the word.
+        "тольк",
+        "должн",
+        "котор",
+        "также",
+        "чтобы",
+        "этого",
+        "этому",
+    }
+)
+
+# A significant word is at least this long; a stem is its first N characters.
+# Stemming by prefix is what makes the match survive Russian inflection
+# ("словарь" / "словаря" / "словарю" all stem to "слова"), which a plain
+# substring test would not.
+_SCOPE_MIN_WORD_LEN = 4
+_SCOPE_STEM_LEN = 5
+
+
+def _significant_stems(text: str) -> set[str]:
+    """Prefix-stems of the words in ``text`` that carry meaning."""
+    words = re.split(r"[^0-9A-Za-zЀ-ӿ]+", (text or "").lower())
+    stems = set()
+    for w in words:
+        if len(w) < _SCOPE_MIN_WORD_LEN:
+            continue
+        stem = w[:_SCOPE_STEM_LEN]
+        if stem in _SCOPE_STOPWORDS or w in _SCOPE_STOPWORDS:
+            continue
+        stems.add(stem)
+    return stems
+
+
+def build_scope_coverage_warnings(inputs: StatementInputs) -> list[Recommendation]:
+    """Name scope_in items that no acceptance criterion looks at (#1172).
+
+    An area declared in scope with no criterion aimed at it goes to review
+    unchecked exactly where the author himself said the work was needed.
+
+    The match is deliberately SOFT: an item counts as covered when ANY of its
+    significant words stems to a word used in ANY Given/When/Then. A stricter
+    rule (every word, or per-criterion) would flag items that a criterion does
+    cover in other words, and the author would learn to skip the warning. It
+    is affordable to be soft here precisely because the charge is zero — this
+    names a fact, it does not gate anything.
+
+    An item with no significant words at all (e.g. "a") is left alone: there
+    is nothing to match on, and silence is honest where judgement is
+    impossible.
+    """
+    if not inputs.scope_in:
+        return []
+    covered_by: set[str] = set()
+    for row in inputs.ac_rows:
+        for clause in ("given", "when_clause", "then_clause"):
+            covered_by |= _significant_stems(_row_value(row, clause))
+
+    uncovered: list[str] = []
+    for item in inputs.scope_in:
+        stems = _significant_stems(item)
+        if not stems:
+            continue
+        if stems & covered_by:
+            continue
+        uncovered.append(item.strip())
+    if not uncovered:
+        return []
+    listed = "; ".join(f"«{item}»" for item in uncovered)
+    return [
+        Recommendation(
+            field="scope_in",
+            severity="low",
+            message=(
+                f"No acceptance criterion appears to look at these scope "
+                f"items: {listed}. You declared the work needed there, so "
+                "work will reach review unchecked in exactly the place you "
+                "named. Either add a criterion or drop the item from scope. "
+                "The match is by wording, so a criterion that covers the item "
+                "in different words will still show up here — say so and move "
+                "on; nothing is blocked."
+            ),
+            expected_score_delta=0,
+            estimated_minutes=5,
+            defect_code="scope_item_without_criterion",
+        )
+    ]
+
+
+def build_affected_area_warnings(inputs: StatementInputs) -> list[Recommendation]:
+    """Name declared affected_areas absent from the repository tree (#1172).
+
+    DoR counts areas and nothing else (dor.py: ``passed = count > 0``), so a
+    typo like "hub/services/steward_dor_apply.py" passes readiness and is only
+    caught at submission, when the same area is compared against the diff —
+    after the work is done.
+
+    NEVER blocks, and says why in the message: a new file is a legitimate
+    case, so this code names a fact instead of judging it. The cost of a false
+    positive is one line of text, not a stopped gate.
+
+    Silence when the project declares no working copy (``repo_path`` is None),
+    or when the path escapes it: there is no tree to check against, and a
+    warning would report the hub's own configuration as the author's mistake.
+    """
+    if not inputs.affected_areas:
+        return []
+    root_raw = (inputs.repo_path or "").strip()
+    if not root_raw:
+        return []
+    root = Path(root_raw)
+    if not root.is_dir():
+        return []
+    root = root.resolve()
+
+    missing: list[str] = []
+    for area in inputs.affected_areas:
+        rel = area.strip().lstrip("/")
+        if not rel:
+            continue
+        candidate = (root / rel).resolve()
+        if root not in candidate.parents and candidate != root:
+            # Escapes the working copy: not something this code can judge.
+            continue
+        if not candidate.exists():
+            missing.append(area.strip())
+    if not missing:
+        return []
+    listed = ", ".join(missing)
+    return [
+        Recommendation(
+            field="affected_areas",
+            severity="low",
+            message=(
+                f"These affected areas are not in the repository tree: "
+                f"{listed}. Readiness only counts areas, so a typo passes here "
+                "and is caught at submission, when the area is compared "
+                "against the diff — after the work is done. A file you are "
+                "about to create is a legitimate case and nothing is blocked: "
+                "fix the typo, or confirm the file does not exist yet."
+            ),
+            expected_score_delta=0,
+            estimated_minutes=2,
+            defect_code="affected_area_not_in_tree",
+        )
+    ]
+
+
+def build_outcome_metric_warnings(inputs: StatementInputs) -> list[Recommendation]:
+    """Name an outcome_metric that carries no number (#1172).
+
+    "Improve the quality of statements" is not a metric, but the field is
+    filled and DoR is satisfied by that alone. The test is the presence of a
+    digit, not a parse of a formula: "from 0 to a noticeable share" counts,
+    "improve quality" does not.
+
+    An EMPTY metric is not this code's business — that is a missing field, and
+    the DoR check ``has_outcome_hypothesis`` already says so. Reporting it
+    twice would put one defect under two names, which is the very thing this
+    vocabulary exists to prevent.
+    """
+    metric = (inputs.outcome_metric or "").strip()
+    if not metric:
+        return []
+    if any(ch.isdigit() for ch in metric):
+        return []
+    return [
+        Recommendation(
+            field="outcome_metric",
+            severity="low",
+            message=(
+                f"The outcome metric «{metric}» contains no number, so nobody "
+                "can tell later whether it was met. Readiness only checks that "
+                "the field is filled. Name a value and a direction, e.g. "
+                "'median lead time, 3d -> 1d' or 'statement warnings outside "
+                "the vocabulary: 0'."
+            ),
+            expected_score_delta=0,
+            estimated_minutes=5,
+            defect_code="outcome_metric_without_number",
+        )
+    ]
+
+
+# THE producer list. Every statement defect the hub computes is named here and
+# nowhere else — a warning built outside this tuple is a second way to name a
+# defect, and the count by code goes silently incomplete (#1172, AC-1).
+STATEMENT_DEFECT_PRODUCERS: tuple[
+    Callable[[StatementInputs], list[Recommendation]], ...
+] = (
+    build_ac_quality_warnings,
+    build_expectation_source_warnings,
+    build_scope_coverage_warnings,
+    build_affected_area_warnings,
+    build_outcome_metric_warnings,
+)
+
+
+def run_statement_defect_producers(inputs: StatementInputs) -> list[Recommendation]:
+    """Run every statement-defect producer over one set of inputs.
+
+    Deliberately NOT named ``build_..._warnings``: that name means "a producer"
+    everywhere in this module, and the AC-1 test enumerates the module by it.
+    An aggregator answering to the same name would be checked as if it were a
+    sixth producer.
+    """
+    out: list[Recommendation] = []
+    for producer in STATEMENT_DEFECT_PRODUCERS:
+        out.extend(producer(inputs))
     return out
 
 
@@ -365,6 +636,24 @@ def build_recommendations(
     return recs
 
 
+async def _project_repo_path(db, task_id: int) -> str | None:
+    """The project's working copy, or None when it declares none (#337).
+
+    Imported inside the function: orchestration reaches back into services,
+    and a module-level import here would close the cycle. Any failure to
+    resolve returns None, which every producer reads as "no ground to judge
+    on" — never as "nothing found".
+    """
+    try:
+        from hub.services.orchestration import project_git_context
+
+        ctx = await project_git_context(db, task_id)
+    except Exception:  # pragma: no cover - defensive: never break readiness
+        return None
+    value = ctx.get("repo")
+    return str(value) if value else None
+
+
 async def build_for_task(
     db,
     task_id: int,
@@ -398,10 +687,25 @@ async def calculate_readiness_with_recommendations(
 
     score, components = calculate_score_from_data(dor=dor, risks=risks, config=config)
     recs = build_recommendations(dor, config=config)
-    # Non-blocking AC-quality nudge (#6): does not affect score/dor_passed.
+    # Non-blocking statement-defect nudges (#6, #1172): every one of them is
+    # severity="low" with expected_score_delta=0, and NONE of them touches
+    # `score` or `dor.passed` above. Charging here would drop the whole
+    # backlog retroactively on the day this ships — the mistake declined in
+    # #6 and #331.
     ac_rows = await repo.list_acceptance_criteria(db, task_id)
-    recs.extend(build_ac_quality_warnings(ac_rows))
-    recs.extend(build_expectation_source_warnings(ac_rows))
+    recs.extend(
+        run_statement_defect_producers(
+            StatementInputs(
+                ac_rows=list(ac_rows),
+                scope_in=deserialize_str_list(row["scope_in"]) if row else [],
+                affected_areas=(
+                    deserialize_str_list(row["affected_areas"]) if row else []
+                ),
+                outcome_metric=(row["outcome_metric"] or "") if row else "",
+                repo_path=await _project_repo_path(db, task_id),
+            )
+        )
+    )
     recs.sort(key=lambda r: SEVERITY_ORDER[r.severity])
 
     return ReadinessReport(
@@ -418,9 +722,15 @@ async def calculate_readiness_with_recommendations(
 __all__ = [
     "CHECK_RECOMMENDATIONS",
     "SEVERITY_ORDER",
+    "STATEMENT_DEFECT_PRODUCERS",
+    "StatementInputs",
     "build_ac_quality_warnings",
+    "build_affected_area_warnings",
     "build_expectation_source_warnings",
     "build_for_task",
+    "build_outcome_metric_warnings",
     "build_recommendations",
+    "build_scope_coverage_warnings",
     "calculate_readiness_with_recommendations",
+    "run_statement_defect_producers",
 ]
