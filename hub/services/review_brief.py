@@ -387,7 +387,12 @@ async def build_review_brief(
     # answer the evidence itself defaults to, so brief and record agree.
     delivered_sha = await repo.merge_sha_for_task(db, task_id)
     live_check = await review_evidence.live_check_state(
-        db, task_id, delivered_sha=delivered_sha
+        db,
+        task_id,
+        delivered_sha=delivered_sha,
+        # #1236: что задача ОБЪЯВИЛА наблюдать. Без этого «зонд объявлен и ещё
+        # не снят» неотличимо от «наблюдать никто не собирался».
+        declared_probe=str(dict(task_row).get("live_probe") or ""),
     )
 
     # #725: one verdict over every evidence block, in the same place the green

@@ -737,3 +737,300 @@ async def test_headless_task_is_still_refused_from_review(
 
     assert resp.status_code == 400, resp.text
     assert "headless" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# #1236: живой зонд — хаб исполняет объявленную читающую пробу после доставки
+# ---------------------------------------------------------------------------
+#
+# Все четыре теста ниже целятся в ОДНУ границу: постановку пишет агент, а
+# исполнять объявленное будет служба с ключами. Поэтому объявление — имя из
+# закрытого реестра, а не строка вызова, и проверяется оно на обоих входах.
+
+
+async def _task_with_declared_probe(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    *,
+    probe: str,
+    dispatch_agent_id: str = "bc-agent-1",
+    title: str = "Живой зонд",
+) -> int:
+    """Задача с объявленным зондом, заказанным ревьюером и мержем в базу."""
+    resp = await client.post("/api/tasks", json={"title": title, "source": "agent"})
+    task_id = int(resp.json()["id"])
+    # Объявление пишется той же дорогой, что и вся постановка.
+    refine = await client.post(
+        f"/api/tasks/{task_id}/refine", json={"live_probe": probe}
+    )
+    assert refine.status_code == 200, refine.text
+
+    await db.execute(
+        "INSERT INTO review_dispatches (task_id, submission_generation, agent_id) "
+        "VALUES (?, ?, ?)",
+        (task_id, 0, dispatch_agent_id),
+    )
+    await repo.record_pipeline_merge(
+        db,
+        project_id=1,
+        pr_number=700 + task_id,
+        task_id=task_id,
+        merge_sha=f"merge-sha-{task_id}",
+    )
+    await db.commit()
+    return task_id
+
+
+async def _release_reaches_prod(db: aiosqlite.Connection, monkeypatch) -> str:
+    """Прогнать НАСТОЯЩИЙ шаг релиза, которым доставка доезжает до прода.
+
+    Не ``run_declared_probe`` напрямую: тест, зовущий исполнителя мимо провода,
+    не заметил бы, что провод сняли — а «зонд исполняет хаб после доставки» и
+    есть утверждение AC-1. Проверено мутацией: снятие вызова из
+    ``_stamp_released_merges`` роняет этот тест.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services import release as release_service
+
+    release_sha = "release-sha-1"
+
+    async def _release_commit(pr_number, repo=None, gh_repo=None, forge=""):
+        return release_sha
+
+    monkeypatch.setattr(
+        plugins.git_ops, "merge_commit_sha", _release_commit, raising=False
+    )
+    await release_service._stamp_released_merges(db, {"id": 1}, 900, {})
+    return release_sha
+
+
+def _page(items: list[dict]) -> dict:
+    return {"items": items, "nextCursor": ""}
+
+
+async def test_a_declared_probe_is_run_by_the_hub_after_delivery(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1236 AC-1: живая проверка становится ФАКТОМ хаба, а не заявлением автора.
+
+    Ведётся ровно тот первый живой случай, ради которого задача заведена
+    (#1206): имя заказанного ревьюера сверяется у провайдера с меткой хаба.
+    Провайдер подменён на уровне одного защищённого захода — так работают и
+    ``list_agents``, и ``find_agent_by_name``, то есть сверяет НАСТОЯЩИЙ код,
+    а не его пересказ в тесте.
+    """
+    from hub.integrations import cursor_cloud
+
+    task_id = await _task_with_declared_probe(
+        client, db, probe="review_agent_name_roundtrip"
+    )
+    marker = cursor_cloud.agent_marker("review", task_id, 0, 1)
+
+    asked: list[tuple[str, str]] = []
+
+    async def _fake_request(method, path, json_body=None):
+        asked.append((method, path))
+        return _page([{"id": "bc-agent-1", "name": marker, "latestRunId": "run-1"}])
+
+    monkeypatch.setattr(cursor_cloud, "is_configured", lambda: True)
+    monkeypatch.setattr(cursor_cloud, "_request", _fake_request)
+
+    # Исполняет ХАБ, своим шагом после доставки, а не вызывающий агент.
+    await _release_reaches_prod(db, monkeypatch)
+
+    checks = [dict(row) for row in await repo.list_live_checks(db, task_id)]
+    assert len(checks) == 1, "хаб снял ровно один зонд"
+    check = checks[0]
+    assert check["outcome"] == "done", check
+    assert check["recorded_agent"] == "hub", (
+        "наблюдение принадлежит хабу: автор его не записывал и записать не мог"
+    )
+    assert check["recorded_by"] is None, "ни один принципал-агент за этим не стоит"
+    assert marker in check["observation"], "метка названа посимвольно"
+    assert "совпало" in check["observation"]
+    assert check["sha"] == f"merge-sha-{task_id}", "наблюдение привязано к коммиту"
+    assert check["created_at"], "и ко времени"
+    assert asked and all(method == "GET" for method, _ in asked), (
+        f"зонд ходил только на чтение: {asked}"
+    )
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert brief["live_check"]["state"] == "done", (
+        "живая проверка ушла из unknown в наблюдение"
+    )
+    assert brief["live_check"]["declared_probe"] == "review_agent_name_roundtrip"
+
+
+async def test_a_mutating_probe_is_refused(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1236 AC-2: зонд, меняющий состояние, отклоняется на ОБОИХ входах.
+
+    ПРОВЕРЯЕТСЯ МУТАЦИЕЙ: снятие проверки на чтение (ветка ``spec.mutating`` в
+    ``probe_refusal``) обязано ронять именно этот тест — и объявление, и запуск
+    спрашивают её, поэтому упадут обе половины.
+    """
+    from hub.services import live_probe
+
+    ran: list[str] = []
+
+    async def _would_write(db_, task):  # pragma: no cover - до вызова не доходит
+        ran.append("вызван")
+        return live_probe.ProbeOutcome(True, observation="создал агента")
+
+    monkeypatch.setitem(
+        live_probe.PROBES,
+        "creates_a_review_agent",
+        live_probe.ProbeSpec(
+            name="creates_a_review_agent",
+            summary="создаёт агента у провайдера",
+            call="POST /v1/agents",
+            methods=frozenset({"POST"}),
+            runner=_would_write,
+        ),
+    )
+
+    resp = await client.post("/api/tasks", json={"title": "Мутирующий зонд"})
+    task_id = int(resp.json()["id"])
+
+    # Вход первый: объявление в постановке.
+    refused = await client.post(
+        f"/api/tasks/{task_id}/refine", json={"live_probe": "creates_a_review_agent"}
+    )
+    assert refused.status_code == 422, refused.text
+    assert live_probe.MUTATING_PROBE in refused.text, refused.text
+    row = dict(await repo.get_task(db, task_id))
+    assert row["live_probe"] == "", "отказ случился ДО записи в колонку"
+
+    # Строка вызова вместо имени — тем более не объявление.
+    as_command = await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={"live_probe": "curl -X DELETE https://api.cursor.com/v1/agents/bc-1"},
+    )
+    assert as_command.status_code == 422, as_command.text
+    assert live_probe.MALFORMED_PROBE in as_command.text, as_command.text
+
+    # Вход второй: запуск. Колонка заполнена мимо объявления — так бывает после
+    # сужения реестра или ручной правки, и запись в базе не сильнее правила.
+    await db.execute(
+        "UPDATE tasks SET live_probe = 'creates_a_review_agent' WHERE id = ?",
+        (task_id,),
+    )
+    await repo.record_pipeline_merge(
+        db, project_id=1, pr_number=777, task_id=task_id, merge_sha="merge-mutating"
+    )
+    await db.commit()
+
+    recorded = await live_probe.run_declared_probe(db, task_id)
+
+    assert ran == [], "меняющий состояние зонд до провода не дошёл"
+    assert recorded is not None and recorded["outcome"] == "failed", recorded
+    assert "POST" in recorded["reason"], recorded["reason"]
+
+
+async def test_a_failed_probe_is_named_and_changes_nothing(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1236 AC-3: отказ зонда назван, доставка цела, вердикт не тронут.
+
+    Самое дорогое место здесь — не текст отказа, а то, что он НЕ читается как
+    наблюдение. До третьего исхода всё, что не ``not_applicable``, схлопывалось
+    в ``done``: первый же упавший зонд закрыл бы блок зелёным.
+    """
+    from hub.integrations import cursor_cloud
+
+    task_id = await _task_with_declared_probe(
+        client, db, probe="review_agent_name_roundtrip", title="Отказавший зонд"
+    )
+    before = dict(await repo.get_task(db, task_id))
+
+    # Ключа у службы нет: это факт об окружении, а не о поведении задачи.
+    monkeypatch.setattr(cursor_cloud, "is_configured", lambda: False)
+
+    await _release_reaches_prod(db, monkeypatch)
+
+    check = dict((await repo.list_live_checks(db, task_id))[0])
+    assert check["outcome"] == "failed", check
+    assert "CURSOR_API_KEY" in check["reason"], "отказ назван причиной, а не молчанием"
+    assert check["probe"], "и тем, что именно пробовали"
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert brief["live_check"]["state"] == "failed", (
+        "провал зонда не смеет читаться как наблюдение"
+    )
+    coverage = brief["evidence_coverage"]
+    assert "live_check" not in coverage["checks_ran"], coverage
+    assert any(item["check"] == "live_check" for item in coverage["checks_missing"]), (
+        coverage
+    )
+
+    after = dict(await repo.get_task(db, task_id))
+    assert after["status"] == before["status"], "доставка не откачена"
+    assert after["review_verdict"] == before["review_verdict"], "вердикт не тронут"
+    assert await repo.merge_sha_for_task(db, task_id) == f"merge-sha-{task_id}", (
+        "запись о мерже на месте: зонд не отменяет доставку"
+    )
+
+
+async def test_a_probe_never_leaks_its_secret(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, caplog
+):
+    """#1236 AC-4: ни значения ключа, ни его длины — нигде.
+
+    Проверяются три поверхности, которые и составляют «нигде»: карточка
+    (наблюдение и лента обновлений), журнал и аргументы вызова, который зонд
+    делает наружу. Длина проверяется наравне со значением: она тоже сведение
+    о секрете, и «44 символа» сужает перебор.
+    """
+    import logging
+
+    from hub import config
+    from hub.integrations import cursor_cloud
+    from hub.services import live_probe
+
+    # Подложенное значение, а не ключ: длина 250 — цифра, которую легко искать
+    # в тексте. Переменная НЕ называется secret/token/key: сканер секретов
+    # (scripts/secret_scan.py) читает такое имя рядом со строкой как утечку.
+    planted = "z9" * 125
+    monkeypatch.setattr(config, "CURSOR_API_KEY", planted)
+
+    task_id = await _task_with_declared_probe(
+        client, db, probe="review_agent_name_roundtrip", title="Секрет зонда"
+    )
+    marker = cursor_cloud.agent_marker("review", task_id, 0, 1)
+
+    seen_calls: list[tuple[str, str, object]] = []
+
+    async def _fake_request(method, path, json_body=None):
+        seen_calls.append((method, path, json_body))
+        return _page([{"id": "bc-agent-1", "name": marker, "latestRunId": "run-1"}])
+
+    monkeypatch.setattr(cursor_cloud, "_request", _fake_request)
+
+    with caplog.at_level(logging.DEBUG):
+        await _release_reaches_prod(db, monkeypatch)
+
+    check = dict((await repo.list_live_checks(db, task_id))[0])
+    assert check["outcome"] == "done", check
+
+    updates = " ".join(
+        str(dict(row).get("content") or "")
+        for row in await repo.get_task_updates(db, task_id)
+    )
+    card = " ".join([check["probe"], check["observation"], check["reason"], updates])
+    arguments = " ".join(f"{m} {p} {b}" for m, p, b in seen_calls)
+    journal = " ".join(record.getMessage() for record in caplog.records)
+
+    for surface, text in (
+        ("карточка", card),
+        ("аргументы вызова", arguments),
+        ("журнал", journal),
+    ):
+        assert planted not in text, f"значение ключа утекло в {surface}"
+        assert str(len(planted)) not in text, f"длина ключа утекла в {surface}"
+
+    spec = live_probe.PROBES["review_agent_name_roundtrip"]
+    assert spec.setting_name == "CURSOR_API_KEY", (
+        "реестр носит ИМЯ настройки, а не её значение"
+    )
+    assert planted not in spec.call and planted not in spec.summary

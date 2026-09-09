@@ -214,7 +214,7 @@ def sha_check_statement(
 
 
 async def live_check_state(
-    db: Any, task_id: int, *, delivered_sha: str = ""
+    db: Any, task_id: int, *, delivered_sha: str = "", declared_probe: str = ""
 ) -> dict[str, Any]:
     """Did anyone watch this task behave after it shipped (#814, feature #811).
 
@@ -230,13 +230,22 @@ async def live_check_state(
     """
     from hub import repository as repo
 
+    declared = (declared_probe or "").strip()
     rows = await repo.list_live_checks(db, task_id, limit=1)
     if not rows:
         return {
             "state": "unknown",
             "reason": (
-                "живая проверка не записывалась: поведение в проде никто не наблюдал"
+                # #1236: объявленный, но ещё не снятый зонд — не то же самое,
+                # что незаданный вопрос. Первое читатель ждёт; второе значит,
+                # что наблюдать никто и не собирался.
+                f"зонд «{declared}» объявлен, но ещё не снимался — работа не "
+                "доехала до прода или релиз ещё не проходил"
+                if declared
+                else "живая проверка не записывалась: поведение в проде "
+                "никто не наблюдал"
             ),
+            "declared_probe": declared,
             "delivered_sha": delivered_sha or "",
         }
     row = dict(rows[0])
@@ -244,10 +253,28 @@ async def live_check_state(
     sha = row.get("sha") or ""
     mismatch = bool(delivered_sha and sha and sha != delivered_sha)
     reason = row.get("reason") or ""
+    if outcome == "failed":
+        # #1236: зонд отработал и ответа не принёс. Это НЕ наблюдение, и
+        # именно здесь оно могло бы стать им: до появления третьего исхода
+        # всё, что не ``not_applicable``, схлопывалось в ``done``, так что
+        # первый же провалившийся зонд закрыл бы блок зелёным. Ровно тот
+        # класс дефекта, ради которого этот файл существует (#725).
+        return {
+            "state": "failed",
+            "reason": reason or "зонд не назвал причину отказа",
+            "declared_probe": declared,
+            "probe": row.get("probe") or "",
+            "sha": sha,
+            "delivered_sha": delivered_sha or "",
+            "sha_mismatch": mismatch,
+            "recorded_agent": row.get("recorded_agent") or "",
+            "created_at": row.get("created_at") or "",
+        }
     if outcome == "not_applicable":
         return {
             "state": "not_applicable",
             "reason": reason or "наблюдаемой поверхности нет",
+            "declared_probe": declared,
             "sha": sha,
             "delivered_sha": delivered_sha or "",
             "sha_mismatch": mismatch,
@@ -262,6 +289,7 @@ async def live_check_state(
             if mismatch
             else ""
         ),
+        "declared_probe": declared,
         "probe": row.get("probe") or "",
         "observation": row.get("observation") or "",
         "sha": sha,
