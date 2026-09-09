@@ -301,6 +301,15 @@ async def test_the_pending_report_route_names_unanswered_findings(
     row = dict(await repo.get_task(db, task_id))
     assert row["status"] == "review", "потолок warn: назвать, но не отказать"
     assert row["submission_generation"] == 2
+    # Назвать находку — не значит ответить на неё и тем более не значит
+    # рассудить её. Заметка, которая по дороге завела бы исход или диспозицию,
+    # закрыла бы вопрос от имени того, кто на него не отвечал.
+    assert await repo.list_finding_outcomes(db, _review_id) == [], (
+        "заметка сама записала исход — молчание автора превратилось в ответ"
+    )
+    assert await repo.list_finding_dispositions(db, _review_id) == [], (
+        "заметка стала суждением о находке (#876)"
+    )
 
 
 async def test_the_pending_report_route_names_only_what_is_left_unanswered(
@@ -331,7 +340,9 @@ async def test_the_pending_report_route_names_only_what_is_left_unanswered(
     assert resp.status_code == 200, resp.text
     assert [
         dict(r)["outcome"] for r in await repo.list_finding_outcomes(db, review_id)
-    ] == ["fixed"], "присланный исход не записан — тогда «названо только второе» ни о чём"
+    ] == ["fixed"], (
+        "присланный исход не записан — тогда «названо только второе» ни о чём"
+    )
     feed = " ".join(
         dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
     )
@@ -376,65 +387,61 @@ async def test_the_pending_report_route_names_them_even_when_it_completes(
     )
 
 
-async def test_the_deprecated_alias_never_swallows_an_answer(
-    db: aiosqlite.Connection, client: AsyncClient, quiet_git_ops
+async def test_the_deprecated_alias_delivers_the_answer_through_its_published_door(
+    quiet_git_ops,
 ):
-    """Депрекированный алиас kind=done: потеря ответа не может быть ТИХОЙ.
+    """Депрекированный вход не имеет права ТИХО потерять ответ автора (#1155).
 
-    Ревью подозревало, что ответ автора пропадает у алиаса молча. Опровергнуто
-    опытом: поля у алиаса нет вовсе, поэтому попытка его передать — TypeError,
-    а не тишина, и каждый done через алиас помечен ``deprecated`` с прямым
-    указанием на инструмент, который поле принимает. Поле алиасу не заводится
-    намеренно: ADR-0002 его выводит, а вся документация проекта зовёт алиас
-    только для ``status``/``blocker``.
+    Ревью назвало это неразрешённой находкой. Предыдущая проверка объявила её
+    ложной, потому что смотрела на ФУНКЦИЮ: вызов ``.fn`` с лишним аргументом
+    падает TypeError, и это выглядело как запертая дверь. Опубликованный вход —
+    не функция, а транспорт: FastMCP валидирует аргументы по СХЕМЕ инструмента
+    и молча выбрасывает всё, чего в схеме нет. Воспроизведено зондом через
+    ``mcp.call_tool`` до починки: тело запроса уезжало как
+    ``{agent, kind, content}``, исходы исчезали, автор получал успех — и после
+    бампа поколения спросить о находке было уже негде (тот же механизм, что на
+    маршруте pending_report выше).
 
-    Пиньтся не отсутствие параметра, а сам инвариант: алиас либо ДОВОЗИТ
-    исходы до тела запроса, либо называет того, кто довозит. Чего он не имеет
-    права — принять их и выбросить. Тест верен при любом будущем решении.
+    Поэтому тест ходит ИМЕННО через ``mcp.call_tool``. Через ``.fn`` он был бы
+    зелёным и с выброшенным полем, то есть проверял бы не ту дверь. ADR-0002
+    держит алиас на этапе 1 — предупреждение и телеметрия, — а «депрекирован»
+    не значит «может терять данные».
     """
     from hub import mcp_server
 
-    fn = getattr(mcp_server.hub_task_update, "fn", mcp_server.hub_task_update)
-    outcomes = [{"finding_uid": "0" * 16, "outcome": "fixed"}]
+    tools = await mcp_server.mcp.list_tools()
+    schema = next(t for t in tools if t.name == "hub_task_update").inputSchema
+    assert "finding_outcomes" in schema["properties"], (
+        "поля нет в ОПУБЛИКОВАННОЙ схеме — транспорт выбросит аргумент молча, "
+        "и никакая проверка внутри функции этого не увидит"
+    )
 
+    outcomes = [{"finding_uid": "0" * 16, "outcome": "fixed"}]
     with (
         patch.object(mcp_server, "_api_post", new_callable=AsyncMock) as post,
         patch.object(mcp_server, "_api_get", new_callable=AsyncMock) as get,
     ):
         post.return_value = {"id": 1}
         get.return_value = {"status": "review"}
-        try:
-            out = await fn(
-                7, "готово", agent="dev", kind="done", finding_outcomes=outcomes
-            )
-        except TypeError:
-            # Дверь закрыта на замок: ответ невозможно даже начать терять.
-            out = None
-        else:
-            update_calls = [
-                c.args[1]
-                for c in post.await_args_list
-                if str(c.args[0]).endswith("/updates")
-            ]
-            assert update_calls and update_calls[0].get("finding_outcomes") == outcomes, (
-                "алиас принял исходы и не довёз их до запроса — ровно та тихая "
-                "потеря, которой быть не должно"
-            )
-
-    if out is None:
-        with (
-            patch.object(mcp_server, "_api_post", new_callable=AsyncMock) as post,
-            patch.object(mcp_server, "_api_get", new_callable=AsyncMock) as get,
-        ):
-            post.return_value = {"id": 1}
-            get.return_value = {"status": "review"}
-            out = await fn(7, "готово", agent="dev", kind="done")
-        payload = json.loads(out)
-        assert payload.get("deprecated") is True
-        assert "hub_report_done" in (payload.get("next_action") or ""), (
-            "алиас не умеет исходы и не называет того, кто умеет — вот это и "
-            "было бы тихой потерей"
+        await mcp_server.mcp.call_tool(
+            "hub_task_update",
+            {
+                "task_id": 7,
+                "content": "готово",
+                "agent": "dev",
+                "kind": "done",
+                "finding_outcomes": outcomes,
+            },
         )
+
+    bodies = [
+        c.args[1] for c in post.await_args_list if str(c.args[0]).endswith("/updates")
+    ]
+    assert bodies, "алиас не отправил отчёт вовсе"
+    assert bodies[0].get("finding_outcomes") == outcomes, (
+        "ответ автора не доехал до запроса — ровно та тихая потеря, которой "
+        f"быть не должно: тело {bodies[0]}"
+    )
 
 
 async def test_the_done_path_gate_is_active_and_explains_nothing_away():

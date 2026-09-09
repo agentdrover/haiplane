@@ -903,7 +903,11 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
 
 @mcp.tool()
 async def hub_task_update(
-    task_id: int, content: str, agent: str = "", kind: str = "status"
+    task_id: int,
+    content: str,
+    agent: str = "",
+    kind: str = "status",
+    finding_outcomes: list[dict[str, Any]] | None = None,
 ) -> str:
     """Add a status update or report to a task.
 
@@ -912,8 +916,8 @@ async def hub_task_update(
         content: Update text — status report, blocker description, or completion report
         agent: Name of the agent posting the update
         kind: Type of update: 'status', 'report', 'blocker', 'done', 'review', or 'arbitration'.
-            Prefer hub_report_done for completion (kind='done' is a deprecated alias with
-            the same validator and response envelope).
+            Prefer hub_report_done for completion (deprecated alias, same validator).
+        finding_outcomes: same as hub_report_done (#1155).
     """
     prior_status: str | None = None
     try:
@@ -922,14 +926,22 @@ async def hub_task_update(
     except HubApiError:
         prior_task = None
     try:
-        result = await _api_post(
-            f"/api/tasks/{task_id}/updates",
-            {
-                "agent": agent,
-                "kind": kind,
-                "content": content,
-            },
-        )
+        payload: dict[str, Any] = {
+            "agent": agent,
+            "kind": kind,
+            "content": content,
+        }
+        if finding_outcomes:
+            # #1155: депрекированный вход не имеет права терять ответ автора.
+            # Параметр объявлен ИМЕННО поэтому: транспорт MCP валидирует
+            # аргументы по схеме инструмента и молча выбрасывает всё, чего в
+            # схеме нет, — воспроизведено зондом через mcp.call_tool. Пока
+            # поля не было, исходы находок уезжали в никуда, а автор получал
+            # успех. Дальше поле проверяет тот же серверный валидатор, что и
+            # у канонического инструмента: при kind != 'done' будет 422, а не
+            # тишина.
+            payload["finding_outcomes"] = finding_outcomes
+        result = await _api_post(f"/api/tasks/{task_id}/updates", payload)
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
         return _format_hub_api_error(exc)
