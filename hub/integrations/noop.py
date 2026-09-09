@@ -6,7 +6,8 @@ even when no real integrations are configured.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+import functools
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
 from typing import Any
 
@@ -19,6 +20,7 @@ from hub.integrations.protocols import (
     CIRunRequestResult,
     MergeabilityOutcome,
     StackProbeResult,
+    stacking_probe_batch_from_probe,
     stacking_probe_from_predicate,
 )
 
@@ -364,6 +366,44 @@ class NoopGitOps:
             self.branch_contains_unmerged_commits_of,
             branch,
             other_branch,
+            base_branch=base_branch,
+            repo=repo,
+        )
+
+    def branch_stacking_probe_batch(
+        self,
+        branch: str,
+        other_branches: Sequence[str],
+        base_branch: str | None = None,
+        repo: str | None = None,
+    ) -> AsyncIterator[tuple[str, StackProbeResult]]:
+        """One branch against a list, for a plugin with no repository (#1205).
+
+        Routed through this class's OWN probe for the same reason the probe is
+        routed through its own predicate: subclasses exist that override one
+        method and nothing else, and answering over their heads would overrule
+        the only thing they implemented. There is no git work to save here —
+        what this gives them is the batch SHAPE, so the gate has one call path
+        and no plugin falls off it.
+
+        And down one more rung when the probe itself is not there. A plugin
+        that predates #1186 declares that by leaving ``branch_stacking_probe``
+        unset — ``None`` and "absent" are the same thing to ``getattr``, which
+        is how this repo already declares such a plugin. Inheriting a batch
+        built on a probe it does not have would turn that declaration into a
+        ``TypeError``, and a raise reads as "could not look", which holds
+        every delivery. So the batch falls back to the predicate exactly where
+        ``branch_stacking_probe`` would have.
+        """
+        probe = getattr(self, "branch_stacking_probe", None)
+        if probe is None:
+            probe = functools.partial(
+                stacking_probe_from_predicate, self.branch_contains_unmerged_commits_of
+            )
+        return stacking_probe_batch_from_probe(
+            probe,
+            branch,
+            other_branches,
             base_branch=base_branch,
             repo=repo,
         )

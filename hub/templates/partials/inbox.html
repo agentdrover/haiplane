@@ -2,7 +2,11 @@
 {# #1038: не список задач, а счёт находок — они переживают статус задачи и
    поэтому не собираются ни одним разделом выше. #}
 {% set unjudged_findings = unjudged_findings if unjudged_findings is defined else {"findings": 0, "reports": 0} %}
-{% set total_inbox = drafts|length + questions|length + decisions|length + pending_reports|length + ci_check_tasks|length + fix_requested_tasks|length + stale_tasks|length + undelivered|length + (1 if unjudged_findings.findings else 0) %}
+{# #1198: признанные расхождения не считаются НИ ОДНИМ счётчиком внимания.
+   Их три — этот, топбар на GET / и заголовок секции, — и правка, закрывшая
+   два из трёх, оставила «All clear» невозможным навсегда (#294). #}
+{% set undelivered_unacked = undelivered | rejectattr("acknowledged_now") | list %}
+{% set total_inbox = drafts|length + questions|length + decisions|length + pending_reports|length + ci_check_tasks|length + fix_requested_tasks|length + stale_tasks|length + undelivered_unacked|length + (1 if unjudged_findings.findings else 0) %}
 {% set filter_active = filter_mine or filter_human_owner or filter_claimed_by %}
 
 <div class="inbox-filter-bar">
@@ -31,9 +35,14 @@
     {% endif %}
 </div>
 
+{# Баннер и разделы независимы, и это не косметика (#294). Прежде «All clear»
+   стоял в {% else %}, то есть счёт «нечего разбирать» ПРЯТАЛ страницу целиком.
+   С появлением признанных строк это стало прямым нарушением доктрины задачи:
+   признанное расхождение обязано остаться видимым — заткнуть можно, стереть
+   нельзя, — а нулевой счёт означает лишь, что внимания оно не требует. #}
 {% if total_inbox == 0 %}
 <div class="inbox-clear">All clear — nothing needs your attention right now.{% if filter_active %} (with current filter){% endif %}</div>
-{% else %}
+{% endif %}
 
 {% if drafts %}
 <details class="inbox-group inbox-drafts inbox-drafts--collapsible" id="inbox-proposals" open>
@@ -274,21 +283,65 @@
 {% if undelivered %}
 <section class="inbox-group inbox-undelivered">
     <h3 class="inbox-group-title">
-        ⚠ Completed, PR still open <span class="inbox-count inbox-count-danger">{{ undelivered|length }}</span>
+        {# Одно определение «непризнанных» на файл — вверху. Второе, своё,
+           уже разошлось бы с общим счётом при первой же правке. #}
+        ⚠ Completed, PR still open <span class="inbox-count inbox-count-danger">{{ undelivered_unacked|length }}</span>
     </h3>
     {% for d in undelivered %}
     <article class="inbox-item" id="inbox-undelivered-{{ d.task_id }}">
         <div class="inbox-item-header">
             <a href="/tasks/{{ d.task_id }}" class="inbox-item-link">#{{ d.task_id }} {{ d.title[:60] }}{% if d.title|length > 60 %}…{% endif %}</a>
-            <span class="badge badge-failed">PR #{{ d.pr_number }} открыт</span>
+            <span class="badge {% if d.acknowledged_now %}badge-muted{% else %}badge-failed{% endif %}">PR #{{ d.pr_number }} открыт</span>
         </div>
         <div class="inbox-item-meta">
             расхождению {{ d.age_hours }} ч{% if d.accepted_via %} · принято через {{ d.accepted_via }}{% endif %}{% if d.disposition %} · владелец: {{ d.disposition }}{% else %} · судьба PR не выбрана{% endif %}
         </div>
         <div class="inbox-item-desc">{{ d.reason }}</div>
+        {% if d.acknowledged_now %}
+        {# Признанное расхождение не исчезает из списка: заткнуть можно,
+           стереть нельзя. Оно лишь перестаёт кричать — и видно, ЧЬЁ это
+           решение и почему, иначе тишина неотличима от забывчивости.
+           Спрашиваем acknowledged_now, а не сам факт признания: решение
+           относится к ФАКТУ, и если факт сменился, строке снова нужна кнопка,
+           иначе она кричит в ленту и молчит на доске одновременно (#294). #}
+        <div class="inbox-item-meta">
+            признано законным{% if d.acknowledged_by %} ({{ d.acknowledged_by }}){% endif %}: {{ d.ack_reason }}
+        </div>
+        <div class="inbox-item-actions">
+            <a href="/tasks/{{ d.task_id }}" class="btn btn-secondary btn-xs">Открыть</a>
+        </div>
+        {% else %}
+        {% if d.acknowledged_at %}
+        {# Прежнее решение не прячем, даже когда оно перестало применяться:
+           иначе человек видит, что строка снова кричит, и не понимает почему,
+           а причину для новой формы вводит вслепую. Тишина о своём же
+           суждении неотличима от того, что доска его потеряла (#294). #}
+        <div class="inbox-item-meta">
+            признавалось для другого факта{% if d.acknowledged_by %} ({{ d.acknowledged_by }}){% endif %}: {{ d.ack_reason }} — обстоятельства изменились, решение нужно принять заново
+        </div>
+        {% endif %}
         <div class="inbox-item-actions">
             <a href="/tasks/{{ d.task_id }}" class="btn btn-warning btn-xs">Разобрать</a>
         </div>
+        {# Признание стоит здесь, а не на отдельной странице: решать «так и
+           задумано» имеет смысл там, где видно возраст и номер PR. Причина —
+           обязательное поле, потому что признание без причины есть
+           выключатель, а не решение. #}
+        <form method="post" action="/tasks/{{ d.task_id }}/web-acknowledge-delivery"
+              class="inbox-item-actions inbox-ack-form">
+            {# Фильтр проекта переживает нажатие — так же, как его переживает
+               batch-approve выше и ссылка «Разобрать» ниже. Без этого поля
+               человек, разбирающий расхождения по одному проекту, после
+               каждого признания оказывается в общем списке и ищет следующую
+               строку заново (#1210). Слаг едет как ДАННЫЕ, а не как адрес:
+               обработчик подставляет его в один известный путь. #}
+            <input type="hidden" name="return_project" value="{{ filter_project or '' }}">
+            <input type="text" name="reason" required minlength="3" maxlength="1000"
+                   class="inbox-ack-reason"
+                   placeholder="Почему это законно — без причины не признать">
+            <button type="submit" class="btn btn-secondary btn-xs">Признать законным</button>
+        </form>
+        {% endif %}
     </article>
     {% endfor %}
 </section>
@@ -342,7 +395,6 @@
 </section>
 {% endif %}
 
-{% endif %}
 
 <script>
 (function () {
