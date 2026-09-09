@@ -51,6 +51,7 @@ import aiosqlite
 from hub import config
 from hub import repository as repo
 from hub.db import fetchall, write_transaction
+from hub.services.gate_events import NON_HUMAN_GATE_ACTORS
 from hub.services.project_policy import gate_policy_of
 
 log = logging.getLogger(__name__)
@@ -307,6 +308,78 @@ async def order_run(
     log.info("steward run ordered: task #%s gen %s kind %s", task_id, generation, kind)
     rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run_id,))
     return dict(rows[0]) if rows else None
+
+
+def run_has_started(run: dict[str, Any]) -> bool:
+    """Работает ли этот прогон уже — или заказ ещё только ждёт исполнителя.
+
+    Признак один и живёт здесь один раз (#1201). Различие между «заказан» и
+    «идёт» решает две разные вещи — как назвать закрытие по дедлайну (#1181)
+    и вправе ли вердикт снять слот, — и два похожих выражения в двух местах
+    разъехались бы ровно на метке захвата, которую легко забыть.
+
+    ``pending:`` к начатым не относится: это захват слота, сделанный ДО
+    обращения к провайдеру (#421), то есть обещание заплатить, а не агент.
+    """
+    agent_id = str(run.get("agent_id") or "").strip()
+    return bool(agent_id) and not agent_id.startswith(PENDING_PREFIX)
+
+
+async def verdict_author(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> str:
+    """Кто вынес вердикт на эту генерацию — по ленте, а не по догадке.
+
+    Строка задачи помнит только ПОСЛЕДНИЙ вердикт и не помнит его автора
+    вовсе. Лента помнит обоих: ``review_verdict_recorded`` пишется с actor и
+    несёт судимую генерацию в payload — тем же способом, каким читает пары
+    надзор F7 (``_human_verdicts``).
+
+    Пустая строка означает «автора назвать нечем», и это НЕ синоним человека:
+    выдуманный автор уводит читающего так же, как уводил «человеческий
+    вердикт» там, где решала политика.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT actor, payload FROM events "
+        "WHERE kind='review_verdict_recorded' AND task_id=? ORDER BY id DESC",
+        (task_id,),
+    )
+    for row in rows:
+        item = dict(row)
+        try:
+            payload = json.loads(item.get("payload") or "{}")
+        except ValueError:
+            continue
+        if int(payload.get("submission_generation") or 0) == int(generation):
+            return str(item.get("actor") or "").strip()
+    return ""
+
+
+async def verdict_closing_reason(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> str:
+    """Причина снятия слота, называющая автора вердикта верно (#1201).
+
+    Правило писалось под человека, который думает часами, и говорило
+    «человеческий вердикт» всегда. На делегированном проекте вердикт выносит
+    политика через минуты после сдачи (#1151) — и запись приписывала решение
+    тому, кого там не было. Сообщение, называющее чужого автора, уводит
+    читающего так же, как «отказ API» уводил в #1199.
+
+    Список «кто не человек» берётся у гейтовой ленты (#1009), а не заводится
+    здесь свой: два перечня разъехались бы, и разъехался бы тот, который
+    мягче.
+    """
+    actor = await verdict_author(db, task_id, generation)
+    if not actor:
+        return "вердикт на эту генерацию уже вынесен — судить больше нечего"
+    if actor in NON_HUMAN_GATE_ACTORS:
+        return (
+            f"вердикт на эту генерацию вынесла автоматика ({actor}) — "
+            "судить больше нечего"
+        )
+    return f"вердикт на эту генерацию вынес человек ({actor}) — судить больше нечего"
 
 
 async def close_run(
@@ -635,14 +708,38 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
             ):
                 closed += 1
             continue
-        # Человеческий вердикт — про сдачу, и закрывает он слот сдачи.
+        # Вердикт — про сдачу, и снимает он слот сдачи. Но только ЗАКАЗ,
+        # который ещё не начинался (#1201).
+        #
+        # Решение и наблюдение — разные вещи. В теневой фазе суждение на
+        # вердикт не влияет вовсе; оно нужно надзору F7 как пара «суждение
+        # против исхода». А на делегированном проекте вердикт выносит
+        # политика через минуты после сдачи (#1151), и снятие начатого
+        # прогона выбрасывало ровно то наблюдение, ради которого фаза
+        # заведена: измерено на #1183, где агент отработал 3 минуты 28
+        # секунд и его ответ не понадобился никому. Хуже цены агента то,
+        # что терялись ЧИСТЫЕ сдачи целиком — на грязной автовердикт не
+        # срабатывает, слот никто не трогает, — и выборка надзора оставалась
+        # смещённой в сторону спорных случаев по устройству.
+        #
+        # Обратное — заставить вердикт ЖДАТЬ суждения — отвергнуто сознательно:
+        # это задержало бы каждую чистую доставку на время судьи, который
+        # решения не меняет. Вердикт уходит сразу; ждёт только прогон.
+        #
+        # Потолок остаётся: начатый прогон падает НИЖЕ, в проверку дедлайна,
+        # и закрывается по ней. Вечно открытых не появляется.
         verdict_generation = task.get("review_verdict_generation")
-        if task and kind == KIND_VERDICT and verdict_generation == run["generation"]:
+        if (
+            task
+            and kind == KIND_VERDICT
+            and verdict_generation == run["generation"]
+            and not run_has_started(run)
+        ):
             if await close_run(
                 db,
                 run,
                 RUN_SUPERSEDED,
-                "человеческий вердикт на эту генерацию — судить больше нечего",
+                await verdict_closing_reason(db, run["task_id"], run["generation"]),
             ):
                 closed += 1
             continue
@@ -655,9 +752,7 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
             # Два исхода, а не один. Прогон, который работал и не ответил, и
             # заказ, который не начался вовсе, — разные события, и запись
             # обязана их различать: на этом различии стоит статистика надзора.
-            started = bool((run.get("agent_id") or "").strip()) and not str(
-                run.get("agent_id") or ""
-            ).startswith(PENDING_PREFIX)
+            started = run_has_started(run)
             if await close_run(
                 db,
                 run,

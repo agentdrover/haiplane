@@ -40,6 +40,7 @@ from hub import repository as repo
 from hub.db import fetchall
 from hub.integrations import cursor_cloud
 from hub.services import project_policy
+from hub.services.gate_events import NON_HUMAN_GATE_ACTORS, sql_in
 from hub.services.model_family import same_family
 from hub.services.steward_dispatch import (
     KIND_VERDICT,
@@ -787,13 +788,19 @@ async def _human_verdicts(db: aiosqlite.Connection) -> dict[tuple[int, int], str
     # would make the table measure agreement with AUTOMATION — the very
     # thing it exists to check. Same for a future steward-applied verdict:
     # the denominator is human decisions or it is nothing.
+    #
+    # Перечень «кто не человек» — общий с гейтовой лентой (#1009) и с
+    # причиной снятия слота (#1201). Своя копия здесь уже стояла: три места
+    # с одинаковым списком расходятся на первом же новом акторе, и разойдётся
+    # тот, который мягче — то есть тот, что зачтёт автомат за человека.
+    placeholders, actors = sql_in(NON_HUMAN_GATE_ACTORS)
     rows = await fetchall(
         db,
         "SELECT task_id, actor, payload FROM events "
         "WHERE kind='review_verdict_recorded' "
-        "AND actor NOT IN ('policy', 'steward', 'hub') "
-        "ORDER BY id ASC",
-        (),
+        f"AND actor NOT IN ({placeholders}) "
+        "ORDER BY id ASC",  # nosec B608 - placeholders from module constants
+        actors,
     )
     out: dict[tuple[int, int], str] = {}
     for row in rows:
