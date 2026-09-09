@@ -2622,6 +2622,38 @@ async def hub_undelivered_completed() -> CallToolResult:
         lines.append(f"{len(unknown)} task(s) the hub could not check:")
         for row in unknown:
             lines.append(f"#{row['task_id']} — {row.get('reason', '')}")
+    # Строка, у которой свип больше не спрашивает источники, застыла на
+    # последнем ответе. Сказать это вслух дешевле, чем ждать, пока читатель
+    # заметит неподвижный checked_at (#1215).
+    frozen = [row for row in (*rows, *unknown) if row.get("still_swept") is False]
+    if frozen:
+        lines.append("")
+        lines.append(
+            f"{len(frozen)} строк(и) старше окна свипа "
+            f"({data.get('sweep_lookback_days', '?')} дней): источники больше "
+            f"не перепрашиваются, ответ застыл. Выход — записать наблюдение: "
+            f"оно окна не спрашивает."
+        )
+        for row in frozen:
+            lines.append(f"    #{row['task_id']} — {row.get('age_hours', '?')}ч")
+    observed = data.get("closed_by_observation", [])
+    if observed:
+        lines.append("")
+        lines.append(
+            f"{len(observed)} строк(и) закрыты НАБЛЮДЕНИЕМ, а не хабом — "
+            f"доставку подтвердил человек или агент, прежний ответ реестра "
+            f"остаётся историей:"
+        )
+        for row in observed:
+            lines.append(
+                f"#{row['task_id']} {row.get('title', '')} — наблюдал "
+                f"{row.get('observed_by', '?')} в коммите "
+                f"{row.get('observed_sha', '?')}; закрыт факт "
+                f"«{row.get('state', '?')}»"
+            )
+            lines.append(f"    было: {row.get('reason', '')}")
+            lines.append(f"    проверял: {row.get('observed_probe', '')}")
+            lines.append(f"    увидел: {row.get('observed_evidence', '')}")
     return structured_echo_result("\n".join(lines), delivery_discrepancies=data)
 
 

@@ -1639,6 +1639,25 @@ class TaskDependencies(BaseModel):
     unblocks: list[TaskDependencyRef] = Field(default_factory=list)
 
 
+class DeliveryObservation(BaseModel):
+    """Наблюдённый факт доставки по завершённой задаче (#1215).
+
+    Форма повторяет живую проверку (#813) не из симметрии, а потому что это
+    одно и то же обязательство: запись, которую читатель может оспорить.
+    ``probe`` — что запускали, ``observation`` — что увидели, ``sha`` — коммит,
+    в котором видели работу.
+
+    Пороги min_length стоят В СХЕМЕ, а не только в сервисе, по тому же уроку,
+    что и у признания выше: форма и API обязаны отвергать одно и то же, иначе
+    два входа в один глагол ведут себя по-разному. Сервис проверяет ещё раз,
+    и это не дублирование — его зовут не только по HTTP.
+    """
+
+    probe: str = Field(..., min_length=1, max_length=2000)
+    observation: str = Field(..., min_length=1, max_length=4000)
+    sha: str = Field(..., min_length=1, max_length=64)
+
+
 class DeliveryAcknowledgement(BaseModel):
     """Признание расхождения доставки законным (#1198).
 

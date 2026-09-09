@@ -1818,6 +1818,124 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE delivery_discrepancies "
         "ADD COLUMN alerted_age_bucket INTEGER NOT NULL DEFAULT 0",
     ),
+    # --- Наблюдение доставки: четвёртый ВХОД, но не четвёртый ИСТОЧНИК (#1215).
+    #
+    # Три источника ответа о доставке — строка pipeline_merges, базовая ветка,
+    # провайдер — могут оказаться закрыты ОДНОВРЕМЕННО и навсегда. Живой
+    # случай 09.09.2026: #878 (PR #443), #875 (PR #461), #909 (PR #468) стояли
+    # в unknown 441-453 часа, потому что прежний репозиторий, где жили эти PR,
+    # удалён (в нынешнем нумерация началась заново), строк pipeline_merges
+    # нет, а базовая ветка не отвечает из-за squash. Спрашивать больше некого
+    # — ни сегодня, ни через месяц, и у строки не было НИ ОДНОГО выхода.
+    #
+    # Эти колонки — место, куда человек или агент кладёт то, что проверил
+    # своими глазами. Почему отдельные колонки, а не перезапись state/reason:
+    # наблюдение обязано ВИДИМО отличаться от того, что хаб установил сам.
+    # Перезапись сделала бы наблюдение неотличимым от вывода трёх источников,
+    # то есть ровно четвёртым источником правды, — и заодно стёрла бы прежнее
+    # unknown вместе с его причиной. Закрытие дописывает историю, а не
+    # заменяет её: state и reason остаются ровно теми, какими их оставил свип.
+    #
+    # observed_state — тот ФАКТ, который закрыли наблюдением, по образцу
+    # acknowledged_state. Наблюдение «код в 19ee3f6 есть» относится к
+    # состоянию unknown; если провайдер завтра оживёт и скажет pr_open, это
+    # уже другое утверждение, которого никто не наблюдал, и строка обязана
+    # вернуться в список. Обратной засыпки нет и быть не может: наблюдений до
+    # этой миграции не существует.
+    (
+        "add_delivery_observed_at",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_at TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_delivery_observed_by",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_by TEXT NOT NULL DEFAULT ''",
+    ),
+    # probe и evidence раздельно — та же схема доказательства, что у живых
+    # проверок (#813): «что запускал» и «что увидел». Одно поле принимало бы
+    # «проверено, всё хорошо» как полноценную запись, а это штамп.
+    (
+        "add_delivery_observed_probe",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_probe TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_delivery_observed_evidence",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_evidence TEXT NOT NULL DEFAULT ''",
+    ),
+    # Коммит обязателен: наблюдение доставки — это утверждение о том, что код
+    # ГДЕ-ТО есть, и без названного места оно нефальсифицируемо.
+    (
+        "add_delivery_observed_sha",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_sha TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_delivery_observed_state",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_state TEXT NOT NULL DEFAULT ''",
+    ),
+    # ЗАСЫПКА ПО УЖЕ ЗАПИСАННЫМ НАБЛЮДЕНИЯМ (#1215), и она здесь не ради
+    # удобства выката. Три строки — #878, #875, #909 — простояли в unknown
+    # 441-453 часа, и наблюдения по ним уже лежат: живые проверки от
+    # 09.09.2026, с командой, с ответом и с раскатанным коммитом. Без засыпки
+    # выкат оставил бы механизм, у которого нет ни одного закрытого случая, и
+    # закрывать три строки пришлось бы руками, повторяя запись, которая уже
+    # есть. Ровно этого требует постановка: «выкат проверяется на них».
+    #
+    # Берётся ПОСЛЕДНЯЯ живая проверка задачи, у которой есть и probe, и
+    # observation, и коммит, — то есть прошедшая тот же порог доказательства,
+    # что и прямая запись. Закрывается только unknown: строку, чей источник
+    # отвечает, наблюдением не закрывают ни здесь, ни в коде.
+    #
+    # Одноразовость даёт сам механизм миграций (имя выполняется один раз), а
+    # не WHERE: строка, которую человек закроет и передумает, не должна
+    # закрываться заново при следующем запуске.
+    (
+        "backfill_delivery_observed_from_live_checks",
+        """UPDATE delivery_discrepancies AS d
+              SET observed_at       = (
+                    SELECT c.created_at FROM live_checks c
+                     WHERE c.task_id = d.task_id AND c.outcome = 'done'
+                       AND TRIM(c.probe) != '' AND TRIM(c.observation) != ''
+                       AND TRIM(c.sha) != ''
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_by       = (
+                    SELECT COALESCE(NULLIF(c.recorded_agent, ''), 'hub')
+                      FROM live_checks c
+                     WHERE c.task_id = d.task_id AND c.outcome = 'done'
+                       AND TRIM(c.probe) != '' AND TRIM(c.observation) != ''
+                       AND TRIM(c.sha) != ''
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_probe    = (
+                    SELECT c.probe FROM live_checks c
+                     WHERE c.task_id = d.task_id AND c.outcome = 'done'
+                       AND TRIM(c.probe) != '' AND TRIM(c.observation) != ''
+                       AND TRIM(c.sha) != ''
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_evidence = (
+                    SELECT c.observation FROM live_checks c
+                     WHERE c.task_id = d.task_id AND c.outcome = 'done'
+                       AND TRIM(c.probe) != '' AND TRIM(c.observation) != ''
+                       AND TRIM(c.sha) != ''
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_sha      = (
+                    SELECT c.sha FROM live_checks c
+                     WHERE c.task_id = d.task_id AND c.outcome = 'done'
+                       AND TRIM(c.probe) != '' AND TRIM(c.observation) != ''
+                       AND TRIM(c.sha) != ''
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_state    = d.state
+            WHERE d.state = 'unknown'
+              AND d.observed_at = ''
+              AND EXISTS (
+                    SELECT 1 FROM live_checks c
+                     WHERE c.task_id = d.task_id AND c.outcome = 'done'
+                       AND TRIM(c.probe) != '' AND TRIM(c.observation) != ''
+                       AND TRIM(c.sha) != '')""",
+    ),
 ]
 
 

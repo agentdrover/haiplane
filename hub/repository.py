@@ -4411,6 +4411,62 @@ async def acknowledge_delivery_discrepancy(
     return (cur.rowcount or 0) > 0
 
 
+async def record_delivery_observation(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    by: str,
+    probe: str,
+    evidence: str,
+    sha: str,
+) -> dict[str, Any] | None:
+    """Положить в строку то, что человек или агент проверил своими глазами (#1215).
+
+    Возвращает строку ДО записи (прежнее состояние и его причина) или ``None``,
+    если строки нет. Возврат прежней строки — не удобство вызывающего: именно
+    из неё берётся ``observed_state``, и она же доказывает в тесте, что
+    закрытие ничего не стёрло.
+
+    ЧЕГО ЭТА ФУНКЦИЯ НЕ ДЕЛАЕТ, и каждое «не» — требование постановки:
+
+    * не трогает ``state``, ``reason`` и ``delivery_path``. Прежнее unknown и
+      причина, по которой оно возникло, остаются читаемыми навсегда: строка
+      не закрывается, а ДОПИСЫВАЕТСЯ. Свип, если он ещё берёт эту задачу в
+      кандидаты, продолжит обновлять факты поверх — и это правильно, потому
+      что наблюдение не отменяет вопроса, а отвечает на него от своего имени;
+    * не трогает задачу: ни статус, ни ``archived``. Реестр — зеркало, а не
+      гейт, и архивация не является и не становится способом убрать строку:
+      она унесла бы вместе со строкой outcome-долг, который читается тем же
+      фильтром ``archived = 0``;
+    * не проверяет доказательство на правдивость. Обязательность полей — это
+      всё, что схема может, и она честно ловит только форму штампа. Оценивает
+      запись читатель, которому она приписана поимённо.
+
+    ``observed_state`` пишется из ТЕКУЩЕГО состояния строки одним оператором,
+    как и у признания: наблюдение относится к факту, а не к задаче навсегда.
+    Заговорит провайдер — факт станет другим, наблюдения о нём не будет, и
+    строка вернётся в список сама.
+    """
+    prior = await get_delivery_discrepancy(db, task_id)
+    if prior is None:
+        return None
+    await db.execute(
+        """
+        UPDATE delivery_discrepancies
+           SET observed_at       = datetime('now'),
+               observed_by       = ?,
+               observed_probe    = ?,
+               observed_evidence = ?,
+               observed_sha      = ?,
+               observed_state    = state
+         WHERE task_id = ?
+        """,
+        ((by or "").strip(), probe.strip(), evidence.strip(), sha.strip(), task_id),
+    )
+    await db.commit()
+    return prior
+
+
 async def get_delivery_discrepancy(
     db: aiosqlite.Connection, task_id: int
 ) -> dict[str, Any] | None:
@@ -4431,6 +4487,7 @@ async def list_delivery_discrepancies(
     states: tuple[str, ...] = ("pr_open",),
     project_id: int | None = None,
     limit: int = 50,
+    closed_by_observation: bool = False,
 ) -> list[dict[str, Any]]:
     """The discrepancy list: reads stored answers, never asks a provider (#897).
 
@@ -4439,10 +4496,26 @@ async def list_delivery_discrepancies(
     asking for it and is reported apart: an answer the hub could not get is
     not evidence of a discrepancy, and folding it in would make the list cry
     wolf every time GitHub is unreachable.
+
+    ОДНО ОПРЕДЕЛЕНИЕ «закрыто наблюдением» на весь продукт (#1215), тем же
+    уроком, что и у «признано» выше. ``closed_by_observation=False`` (умолчание)
+    ВЫЧИТАЕТ такие строки, ``True`` возвращает только их. Оба режима считают
+    закрытие одним и тем же выражением, поэтому список, доска и счёт не могут
+    разъехаться в том, что считать расхождением. Вычитание по умолчанию — то,
+    ради чего задача заведена: список ценен, только пока пустой список значит
+    «расхождений нет», а строка, у которой закрыты все три источника, иначе не
+    может уйти из него никогда.
+
+    Закрытие привязано к ФАКТУ: ``observed_state = d.state``. Наблюдали
+    unknown — закрыт unknown; заговорит провайдер и скажет pr_open, и строка
+    вернётся в список, потому что ЭТОГО никто не наблюдал.
     """
     if not states:
         return []
     placeholders = ",".join("?" for _ in states)
+    # Литерал 1/0, а не параметр: он попадает в тот же f-string, что и рун
+    # знаков вопроса, и остаётся под контролем вызывающего кода, не данных.
+    observed_flag = "1" if closed_by_observation else "0"
     params: list[Any] = list(states)
     project_clause = ""
     if project_id is not None:
@@ -4457,6 +4530,8 @@ async def list_delivery_discrepancies(
             d.disposition, d.accepted_via, d.first_seen_at, d.checked_at,
             d.acknowledged_at, d.acknowledged_by, d.ack_reason,
             d.acknowledged_state,
+            d.observed_at, d.observed_by, d.observed_probe,
+            d.observed_evidence, d.observed_sha, d.observed_state,
             -- ОДНО определение «признано» на весь продукт (#294). Признание
             -- относится к ФАКТУ, и три места, решающие «видно ли это
             -- человеку» — топбар, счёт инбокса и сама строка, — обязаны
@@ -4475,6 +4550,7 @@ async def list_delivery_discrepancies(
         JOIN tasks t ON t.id = d.task_id
         WHERE d.state IN ({placeholders})
           AND t.archived = 0
+          AND (d.observed_at != '' AND d.observed_state = d.state) = {observed_flag}
           {project_clause}
         -- Непризнанные идут первыми, и это не вкусовщина: признанные живут
         -- вечно («стереть нельзя») и они же самые старые, поэтому при
