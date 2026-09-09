@@ -4210,7 +4210,6 @@ async def test_a_dispatched_project_gets_no_extra_notice(
     )
 
 
-
 # --- #1206: список без поля name -----------------------------------------
 
 
