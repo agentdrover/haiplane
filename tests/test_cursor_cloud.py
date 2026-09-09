@@ -329,3 +329,90 @@ async def test_the_marker_separates_a_top_up_from_the_first_order():
     top_up = cursor_cloud.agent_marker("review", 1199, 1, 2)
     assert first != top_up
     assert cursor_cloud.agent_marker("review", 1199, 1, 1) == first
+
+
+# --- #1206: подбор по имени держится на поле, которого может не быть ------
+
+
+class _Pages:
+    """Подставка страниц списка агентов.
+
+    Форма ответа — `items` и `nextCursor`, как у настоящего API (проверено
+    вызовом 06.09.2026 и записано в докстроке list_agents).
+    """
+
+    def __init__(self, pages: list[list[object]]):
+        self.pages = pages
+        self.calls = 0
+
+    async def __call__(self, limit: int = 50, cursor: str = ""):
+        self.calls += 1
+        index = int(cursor or 0)
+        if index >= len(self.pages):
+            return {"items": [], "nextCursor": ""}
+        nxt = str(index + 1) if index + 1 < len(self.pages) else ""
+        return {"items": self.pages[index], "nextCursor": nxt}
+
+
+async def test_a_listing_without_the_name_field_is_not_a_confirmed_absence(
+    monkeypatch, caplog
+):
+    """#1206 AC-2: элементы без поля name — «спросить не удалось».
+
+    Весь подбор сравнивает item['name'] с меткой. Если провайдер имя не
+    возвращает, обход не найдёт ничего НИКОГДА, а прежний код называл это
+    подтверждённой пустотой — тем самым разрешением купить второго
+    оплаченного агента. Отсутствие поля не есть отсутствие агента (#762).
+    """
+    pages = _Pages([[{"id": "bc-1", "createdAt": "2026-09-09T00:00:00Z"}]])
+    monkeypatch.setattr(cursor_cloud, "list_agents", pages)
+
+    with caplog.at_level("WARNING"):
+        seen = await cursor_cloud.find_agent_by_name("haiplane:review:t1206:g1:a1")
+
+    assert seen.asked is False, (
+        "ответ без поля name неотличим от «агента нет» — значит, спросить "
+        "не удалось, ровно как на теле не той формы"
+    )
+    assert seen.agent_id == "" and seen.run_id == ""
+    assert pages.calls == 1, (
+        "непрочитанная страница обрывает обход, а не листает дальше"
+    )
+    assert "no name field" in caplog.text, "молчащее поле обязано быть названо в логе"
+
+
+async def test_an_empty_listing_is_still_a_confirmed_absence(monkeypatch):
+    """#1206: пустой список остаётся «агента нет» — это не поломано.
+
+    Без этого граница повтор после подтверждённой пустоты (#1199 AC-2)
+    перестал бы существовать, и каждый обрыв уходил бы к человеку.
+    """
+    pages = _Pages([[]])
+    monkeypatch.setattr(cursor_cloud, "list_agents", pages)
+
+    seen = await cursor_cloud.find_agent_by_name("haiplane:review:t1206:g1:a1")
+
+    assert seen.asked is True, "спросили и получили ответ: агентов нет"
+    assert seen.agent_id == ""
+
+
+async def test_a_named_neighbour_still_answers_for_the_whole_page(monkeypatch):
+    """#1206: поле есть хотя бы у одного — страница прочитана.
+
+    Чужой агент без имени рядом с нашим не должен превращать удачный
+    подбор в «спросить не удалось»: иначе новое правило съело бы сам путь.
+    """
+    marker = "haiplane:review:t1206:g1:a1"
+    pages = _Pages(
+        [
+            [
+                {"id": "bc-anon"},
+                {"id": "bc-mine", "name": marker, "latestRunId": "run-9"},
+            ]
+        ]
+    )
+    monkeypatch.setattr(cursor_cloud, "list_agents", pages)
+
+    seen = await cursor_cloud.find_agent_by_name(marker)
+
+    assert seen == cursor_cloud.Reconciliation("bc-mine", "run-9", True)

@@ -218,6 +218,14 @@ async def find_agent_by_name(name: str, pages: int = 3) -> Reconciliation:
     агента, потому что второй хотя бы честно свой. Метка соседнего
     поколения отличается одним символом, и вхождение отдало бы сдаче
     чужого судью.
+
+    Весь подбор держится на одном допущении: провайдер возвращает в списке
+    то самое поле ``name``, которое хаб положил при создании. Если бы он
+    его не возвращал, обход не нашёл бы НИЧЕГО и никогда — и сказал бы об
+    этом словом «агента нет», то есть выдал бы разрешение купить второго.
+    Механизм против двойной покупки сам бы её и санкционировал. Поэтому
+    страница, где поля нет ни у одного элемента, считается непрочитанной,
+    а не пустой (#1206).
     """
     if not name:
         return Reconciliation("", "", True)
@@ -234,8 +242,16 @@ async def find_agent_by_name(name: str, pages: int = 3) -> Reconciliation:
             # агента: отсутствие данных снова стало бы значением (#762).
             log.warning("cursor cloud /v1/agents: no items list in body")
             return Reconciliation("", "", False)
-        for item in items:
-            if isinstance(item, dict) and item.get("name") == name:
+        named = [item for item in items if isinstance(item, dict) and "name" in item]
+        if items and not named:
+            # Элементы есть, а поля, по которому только и можно узнать СВОЙ
+            # заказ, нет ни у одного. Спросить не удалось — ровно как на теле
+            # не той формы выше. Пустой обход здесь неотличим от «агента
+            # нет», а «нет» разрешает повторить POST и купить второго (#1206).
+            log.warning("cursor cloud /v1/agents: items carry no name field")
+            return Reconciliation("", "", False)
+        for item in named:
+            if item.get("name") == name:
                 found = str(item.get("id") or "").strip()
                 if found:
                     return Reconciliation(

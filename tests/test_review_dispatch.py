@@ -4018,3 +4018,39 @@ async def test_a_body_of_the_wrong_shape_is_not_an_empty_answer(
     )
     alerts = " ".join(dict(r)["content"] for r in rows)
     assert "СПРОСИТЬ" in alerts, "состояние названо как есть, а не как пустота"
+
+
+# --- #1206: список без поля name -----------------------------------------
+
+
+async def test_a_listing_without_names_stops_instead_of_buying_a_second_agent(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1206: потребитель читает «поля нет» как blind, а не как пустоту.
+
+    Если провайдер перестанет возвращать метку, сверка не найдёт агента
+    никогда. Прежде это доезжало до _create_or_adopt как подтверждённая
+    пустота и разрешало повторный POST — то есть механизм против двойной
+    покупки сам покупал бы второго на каждом обрыве.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, recorder)
+    # Агент у провайдера ЕСТЬ и он наш — просто имени в ответе нет.
+    listing = _Listing([[{"id": "bc-paid", "latestRunId": "run-paid"}]])
+    monkeypatch.setattr(cursor_cloud, "list_agents", listing)
+
+    task_id = await _submitted(client, db, "spike-nameless")
+
+    assert listing.calls == 1, "спросить обязаны"
+    assert len(recorder.calls) == 1, (
+        "второй POST — это второй оплаченный агент поверх уже созданного"
+    )
+    assert not await repo.list_active_review_dispatches(db), (
+        "подобрать нечем: любой агент из такого ответа был бы угадан"
+    )
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    alerts = " ".join(dict(r)["content"] for r in rows)
+    assert "СПРОСИТЬ" in alerts, "состояние названо как есть, а не как пустота"
