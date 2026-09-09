@@ -25,12 +25,48 @@
 Условия в auto_verdict соединены через OR и срабатывают вместе. Приоритет
 задан ДО подсчёта и не меняется:
 
-    no_data (raw_count < 1)  >  incomplete  >  confirmed  >  unresolved
+    no_data  >  incomplete  >  confirmed  >  unresolved
 
 Первые две и последняя — про качество отчёта; ``confirmed`` — единственная
 корзина про качество кода. Число отчётов, где сработало больше одного
 условия, печатается отдельно: без него «ровно одна корзина» — это подгонка,
 а не факт.
+
+ВАЖНО: приоритет — соглашение о ПОДСЧЁТЕ, а не порядок проверок в коде.
+В ``auto_verdict.maybe_auto_verdict`` первым стоит ``unattended_blockers``
+(confirmed | unresolved | incomplete), и только потом ``raw_count < 1``.
+То есть отчёт, который и неполон, и пуст, в проде уходит по ``incomplete``,
+а здесь отнесён к ``no_data``. На головное число это не влияет: обе корзины
+— про качество отчёта, и доля quality/departures от перестановки внутри
+группы не меняется. На разбивку ПО корзинам влияет, и поэтому сказано вслух.
+
+Три разных определения «нет данных» — и почему здесь взято третье
+----------------------------------------------------------------
+Их действительно три, и они не совпадают. Разница не косметическая: она
+решает, попадёт отчёт в числитель или нет.
+
+1. ``auto_verdict``: ``raw_count < 1`` И неудача проверки proven-empty
+   (#769). Проверка ходит к провайдеру за usage и сверяет его с
+   ``tokens_spent`` (``_proven_empty_usage``, auto_verdict.py:153-182).
+   Воспроизвести её по архиву НЕЛЬЗЯ: нужен живой вызов.
+2. ``hub_practice_metrics.no_data_reports``: отрицание
+   ``REPORT_HAS_EVIDENCE_SQL`` (orchestration.py:212-218) — ни кандидатов,
+   ни находок, ни токенов, ни второго агента.
+3. Здесь: ``raw_count < 1`` И ``tokens_spent`` пуст или ноль.
+
+Третье выбрано потому, что оно ТОЧНО, а не приблизительно, отвечает на
+вопрос «ушёл ли отчёт». Из кода: proven-empty требует непустого
+``tokens_spent``, согласного с оплаченным usage в пределах 25%
+(``_USAGE_MISMATCH_SHARE``) при поле не ниже ``EMPTY_REVIEW_MIN_USAGE``.
+Если ``tokens_spent`` пуст или ноль, ни одно из условий выполниться не
+может — ``_proven_empty_usage`` вернёт ``None``, и уход происходит ВСЕГДА.
+Никакого живого вызова для этого вывода не нужно.
+
+Обратное неверно: ``raw_count < 1`` при НЕПУСТОМ ``tokens_spent`` может как
+уйти, так и остаться — ответ зависит от живого usage и от потолка класса
+(``_within_proven_empty_ceiling``, #835). Такие отчёты не отнесены никуда:
+они печатаются отдельной строкой «неразрешимо по архиву». Это отсутствие
+данных, а не ноль, и складывать их с уходами нельзя.
 
 Запуск (нужен доступ на чтение к файлу базы хаба):
 
@@ -59,14 +95,60 @@ REPORT_QUALITY_BUCKETS = ("no_data", "incomplete", "unresolved")
 BUCKET_ORDER = ("no_data", "incomplete", "confirmed", "unresolved")
 
 
+def _raw(report: dict) -> int:
+    return int(report.get("raw_count") or 0)
+
+
+def _tokens(report: dict) -> int:
+    return int(report.get("tokens_spent") or 0)
+
+
+def undecidable_no_data(report: dict) -> bool:
+    """``raw_count < 1`` при непустом ``tokens_spent`` — ответа в архиве нет.
+
+    Такой отчёт уходит или остаётся по итогу proven-empty (#769): нужен
+    живой usage провайдера и потолок класса задачи. Ни то, ни другое из
+    ``machine_reviews`` не читается, поэтому отчёт не относится ни к одной
+    корзине и считается отдельно.
+    """
+    return _raw(report) < 1 and _tokens(report) > 0
+
+
+def has_evidence(report: dict) -> bool:
+    """Python-двойник ``REPORT_HAS_EVIDENCE_SQL`` (orchestration.py:212-218).
+
+    Нужен только для сверки с ``hub_practice_metrics.no_data_reports``:
+    метрика считает по этому определению, корзины — по своему. Две цифры
+    рядом лучше одной, выданной за обе.
+
+    Двойник уже есть в проде — ``orchestration.report_has_evidence``; здесь
+    он переписан не по недосмотру, а потому, что скрипт разовый и хаб не
+    импортирует вовсе: он читает файл базы через ``sqlite3`` и обязан
+    работать там, где пакета ``hub`` на пути нет. Условия сверены со SQL
+    построчно (orchestration.py:212-218).
+    """
+    return bool(
+        _raw(report) > 0
+        or (report.get("confirmed_n") or 0) > 0
+        or (report.get("rejected_n") or 0) > 0
+        or _tokens(report) > 0
+        or int(report.get("provider_tokens") or 0) > 0
+        or int(report.get("agent_count") or 0) > 1
+    )
+
+
 def conditions(report: dict) -> dict[str, bool]:
     """Какие условия ухода сработали на этом отчёте — все, а не первое.
 
-    Читается ровно так же, как в auto_verdict: ``raw_count < 1`` — «ноль
-    кандидатов вообще», а не «ноль находок»; остальное — непустота секций.
+    ``no_data`` — НЕ просто ``raw_count < 1``: см. раздел про три
+    определения в докстроке модуля. Здесь взят тот случай, в котором уход
+    происходит наверняка и без живого вызова: кандидатов ноль И
+    ``tokens_spent`` пуст, а значит proven-empty не может состояться.
+    Пограничный случай (кандидатов ноль, но токены есть) сюда не попадает
+    и учитывается через :func:`undecidable_no_data`.
     """
     return {
-        "no_data": int(report.get("raw_count") or 0) < 1,
+        "no_data": _raw(report) < 1 and _tokens(report) <= 0,
         "incomplete": bool(report.get("incomplete")),
         "confirmed": bool(report.get("confirmed_n") or 0),
         "unresolved": bool(report.get("unresolved_n") or 0),
@@ -103,7 +185,8 @@ def load_reports(db_path: str, since_days: int) -> list[dict]:
         rows = con.execute(
             "SELECT id, task_id, submission_generation, harness_skill, "
             "       harness_version, profile, raw_count, incomplete, "
-            "       findings_confirmed, unresolved, provider_tokens, "
+            "       findings_confirmed, findings_rejected, unresolved, "
+            "       tokens_spent, provider_tokens, agent_count, "
             "       model, created_at "
             "FROM machine_reviews "
             "WHERE created_at >= datetime('now', ?) "
@@ -116,6 +199,7 @@ def load_reports(db_path: str, since_days: int) -> list[dict]:
     for row in rows:
         item = dict(row)
         item["confirmed_n"] = _len_json(item.pop("findings_confirmed"))
+        item["rejected_n"] = _len_json(item.pop("findings_rejected"))
         item["unresolved_n"] = _len_json(item.pop("unresolved"))
         reports.append(item)
     return reports
@@ -139,11 +223,19 @@ def report_lines(reports: list[dict]) -> list[str]:
     buckets: collections.Counter = collections.Counter()
     multi = 0
     clean = 0
+    undecidable = 0
     for r in current:
         fired = conditions(r)
         n_fired = sum(1 for v in fired.values() if v)
         if n_fired == 0:
-            clean += 1
+            # Пограничный случай proven-empty считается ОТДЕЛЬНО и только
+            # тогда, когда ни одно другое условие не сработало: если отчёт
+            # и так неполон, он уходит независимо от исхода proven-empty,
+            # и неразрешимость на него не влияет.
+            if undecidable_no_data(r):
+                undecidable += 1
+            else:
+                clean += 1
             continue
         if n_fired > 1:
             multi += 1
@@ -157,6 +249,18 @@ def report_lines(reports: list[dict]) -> list[str]:
     out.append(f"чистых отчётов (ни одно условие не сработало): {clean}")
     out.append(f"сумма корзин: {departures} — совпадает с числом уходов")
     out.append(f"из них сработало больше одного условия: {multi}")
+    out.append(
+        f"неразрешимо по архиву (кандидатов 0, но токены есть): {undecidable} "
+        "— в корзины НЕ отнесены: исход зависит от живого usage (#769)"
+    )
+    # Сверка с hub_practice_metrics: метрика считает no_data по другому
+    # определению. Числа должны расходиться, и видеть это расхождение
+    # лучше, чем считать одно из них «тем же самым».
+    by_metric = sum(1 for r in current if not has_evidence(r))
+    out.append(
+        f"для сверки: no_data по определению метрики (нет свидетельств вовсе): "
+        f"{by_metric}"
+    )
     out.append("")
     for name in BUCKET_ORDER:
         n = buckets[name]
@@ -258,6 +362,32 @@ def selftest() -> int:
         (
             {"raw_count": 0, "incomplete": 0, "confirmed_n": 0, "unresolved_n": 0},
             "no_data",
+        ),
+        # Пограничный случай proven-empty: кандидатов ноль, но прогон
+        # оплачен. Уход НЕ предрешён — корзины нет. Раньше здесь стояло
+        # безусловное no_data, и это была ошибка: отчёт мог остаться на
+        # детерминированном пути (#769).
+        (
+            {
+                "raw_count": 0,
+                "tokens_spent": 250000,
+                "incomplete": 0,
+                "confirmed_n": 0,
+                "unresolved_n": 0,
+            },
+            None,
+        ),
+        # Тот же оплаченный пустой прогон, но ещё и неполный: уходит по
+        # incomplete независимо от исхода proven-empty.
+        (
+            {
+                "raw_count": 0,
+                "tokens_spent": 250000,
+                "incomplete": 1,
+                "confirmed_n": 0,
+                "unresolved_n": 0,
+            },
+            "incomplete",
         ),
     ]
     failures = 0
