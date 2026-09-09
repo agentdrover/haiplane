@@ -1220,6 +1220,30 @@ class TaskUpdateCreate(BaseModel):
     agent: str = Field("", max_length=100)
     kind: str = Field("status", max_length=50)
     content: str = Field(..., min_length=1, max_length=10000)
+    # #1155: what became of the findings this work was sent back over. The
+    # SAME item type as ``TaskSubmitReview.finding_outcomes`` — the answer is
+    # the same answer, only the door differs — so the semantics, the four
+    # words per section and the note requirement stay in one place.
+    # Optional by construction: a done report without outcomes behaves exactly
+    # as it did before, and the done report is the most-called tool there is.
+    finding_outcomes: list[FindingOutcomeItem] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _only_a_done_report_answers_findings(self) -> "TaskUpdateCreate":
+        """Исходы приезжают ТОЛЬКО с отчётом о готовности.
+
+        На любом другом виде записи их некуда деть: сдачи нет, поколения,
+        которому они отвечают, тоже нет. Принять и промолчать значило бы
+        потерять ответ автора — ровно та тишина, ради которой #911 и заведён,
+        только теперь оплаченная его собственной попыткой ответить.
+        """
+        if self.finding_outcomes and self.kind != "done":
+            raise ValueError(
+                f"finding_outcomes принимается только при kind='done', а не "
+                f"'{self.kind}': исход находки — часть отчёта о сдаче, и на "
+                "обычной записи ему не к чему относиться"
+            )
+        return self
 
 
 class TaskReorder(BaseModel):

@@ -65,6 +65,7 @@ from hub.models import (
     BatchApproveSkipped,
     BulkChildTasksCreate,
     FINAL_STATUSES,
+    FindingOutcomeItem,
     FindingScope,
     LatestReview,
     PairGitMode,
@@ -1961,7 +1962,12 @@ async def _step_finding_outcomes(state: SubmitContext) -> None:
     # report for the submission being made does not exist yet. On a first
     # submission there are no reports and the gate is silent, which is the
     # point — it asks only where an answer is owed.
-    outcome_mode = (config.FINDING_OUTCOME or "warn").strip().lower()
+    # Режим берётся у конвейера, если тот его назвал: done-путь объявляет
+    # потолок warn, и шаг обязан его соблюдать, а не перечитывать политику
+    # мимо потолка (#1122, #1155) — та же правка, что уже сделана у поверхностей.
+    outcome_mode = (
+        (state.gate_mode or (config.FINDING_OUTCOME or "warn")).strip().lower()
+    )
     state.outcome_note = ""
     state.outcome_writes = []
     state.outcome_generation = int(state.task.get("submission_generation") or 0)
@@ -1979,6 +1985,84 @@ async def _step_finding_outcomes(state: SubmitContext) -> None:
             if outcome_mode == "require":
                 raise HTTPException(422, finding_outcome.refusal_text(still_open))
             state.outcome_note = finding_outcome.warn_note(still_open)
+
+
+async def record_finding_outcomes(state: SubmitContext, *, reported_by: str) -> None:
+    """Записать спланированные исходы и назвать заведённые драфты (#911, #1155).
+
+    ОДИН код записи на оба пути. Пара зовёт это из тела перехода, отчёт о
+    готовности — из ``add_update``; разъехаться им теперь негде, а именно так
+    разъехались гейты до #1122.
+
+    Зовётся только тогда, когда отказать уже нечему: запись идёт на общий
+    коннект, и отказ после неё оставил бы исходы за сдачей, которой не было —
+    исправленная вторая попытка автора получила бы «находка уже закрыта».
+    Поколение — то, которому исходы ОТВЕЧАЮТ, то есть до бампа.
+    """
+    if not state.outcome_writes:
+        return
+    drafts = await finding_outcome.apply_outcomes(
+        state.db,
+        state.task_id,
+        state.outcome_generation,
+        state.outcome_writes,
+        reported_by=reported_by,
+    )
+    if not drafts:
+        return
+    state.outcome_note = (
+        (state.outcome_note + " " if state.outcome_note else "")
+        + f"Исходы находок: заведено дефект-драфтов {len(drafts)} — "
+        + ", ".join(f"#{i}" for i in drafts)
+        + ". Находка, которую не чинят, остаётся работой, а не исчезает."
+    )
+
+
+#: Гейт исходов для отчёта о готовности (#1155). Тот же шаг и тот же потолок,
+#: что у ``HEADLESS_STEPS``: отчёт о готовности — это сдача, и отвечает он теми
+#: же словами. Отдельный однушаговый список нужен потому, что записать ответ
+#: надо в момент САМОГО отчёта — конвейер headless-гейтов доезжает позже (а на
+#: пути ``pending_report`` не доезжает вовсе), и к тому времени тела с ответом
+#: уже нет: поллер видит только строку в ленте.
+DONE_OUTCOME_STEPS: tuple[Step[SubmitContext], ...] = (
+    Step(
+        "finding_outcomes",
+        _step_finding_outcomes,
+        mode=capped_at_warn("FINDING_OUTCOME"),
+    ),
+)
+
+
+async def record_done_report_outcomes(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    items: list[FindingOutcomeItem],
+    *,
+    reported_by: str,
+) -> str:
+    """Исходы, приехавшие с отчётом о готовности: разбор и запись (#1155).
+
+    Возвращает заметку о заведённых драфтах — или пустую строку. Ничего не
+    печатает сам: писать в ленту решает вызывающий, внутри своей транзакции.
+
+    Разбор идёт ТЕМ ЖЕ шагом, что и на сдаче пары, а запись — той же
+    :func:`record_finding_outcomes`. Второго кода здесь нет; новое только одно
+    — момент, в который путь его зовёт.
+    """
+    state = SubmitContext(
+        db=db,
+        task_id=int(task["id"]),
+        task=task,
+        body=TaskSubmitReview(finding_outcomes=items),
+    )
+    await run_steps(state, DONE_OUTCOME_STEPS)
+    # Заметку режима warn о НЕотвеченных находках печатает конвейер гейтов —
+    # на pair-пути он доезжает следом, и оставить её здесь значило бы напечатать
+    # одно и то же дважды. Отсюда наружу идёт только то, чего больше не скажет
+    # никто: какие дефект-драфты завела эта запись.
+    state.outcome_note = ""
+    await record_finding_outcomes(state, reported_by=reported_by)
+    return state.outcome_note
 
 
 async def _step_submit_rules(state: SubmitContext) -> None:
@@ -2161,14 +2245,15 @@ HEADLESS_STEPS: tuple[Step[SubmitContext], ...] = (
     ),
     Step("resolve_diff", _step_resolve_diff, refuses=False),
     Step("surfaces", _step_surfaces, mode=capped_at_warn("SDD_SURFACES")),
+    # #1155: поле у done-отчёта появилось, отвечать теперь есть чем — шаг
+    # включён, и причина неактивности снята вместе с ней, а не оставлена
+    # ссылаться на закрытую задачу. Под потолком warn, как поверхности и
+    # правила: решение «warn против require» на этом пути остаётся за
+    # владельцем, и снятие потолка будет правкой одной строки в этом списке.
     Step(
         "finding_outcomes",
         _step_finding_outcomes,
-        inactive_reason=(
-            "у done-отчёта нет поля finding_outcomes — ответить негде, а гейт, "
-            "который спрашивает там, где ответить нечем, либо молчит всегда, "
-            "либо ругается всегда. Поле заводится задачей #1155"
-        ),
+        mode=capped_at_warn("FINDING_OUTCOME"),
     ),
     Step("submit_rules", _step_submit_rules, mode=capped_at_warn("SUBMIT_RULES")),
     Step("pin_submission_sha", _step_pin_submission_sha, refuses=False),
@@ -2440,8 +2525,6 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
     # Тело перехода при этом не изменилось ни на строку.
     risk_fields = state.risk_fields
     accepted_paths = state.accepted_paths
-    outcome_writes = state.outcome_writes
-    outcome_generation = state.outcome_generation
     submission_sha = state.submission_sha
     discovered_pr = state.discovered_pr
 
@@ -2463,24 +2546,12 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
         # happened — their corrected retry would then be told the finding is
         # already closed. Written BEFORE the bump so the rows belong to the
         # generation they answer, not to the one starting here.
-        outcome_drafts: list[int] = []
-        if outcome_writes:
-            outcome_drafts = await finding_outcome.apply_outcomes(
-                db,
-                task_id,
-                outcome_generation,
-                outcome_writes,
-                reported_by=(body.agent or task.get("assigned_agent") or ""),
-            )
-        if outcome_drafts:
-            # Пишем В КОНТЕКСТ: заметку ниже печатает
-            # _write_submission_notices, и она читает его, а не локальную.
-            state.outcome_note = (
-                (state.outcome_note + " " if state.outcome_note else "")
-                + f"Исходы находок: заведено дефект-драфтов {len(outcome_drafts)} — "
-                + ", ".join(f"#{i}" for i in outcome_drafts)
-                + ". Находка, которую не чинят, остаётся работой, а не исчезает."
-            )
+        # Пишем В КОНТЕКСТ: заметку ниже печатает _write_submission_notices,
+        # и она читает его, а не локальную.
+        await record_finding_outcomes(
+            state,
+            reported_by=(body.agent or task.get("assigned_agent") or ""),
+        )
         generation = await repo.bump_submission_generation(db, task_id)
         # #758: the declared implementing model rides the submission the
         # same way the branch does — a report, not an observation, kept
@@ -3822,6 +3893,33 @@ async def add_update(
                 # nature. Telling them apart is the point of the field.
                 author_kind="principal" if principal_id is not None else "anonymous",
             )
+
+            if body.finding_outcomes:
+                # #1155: ответ автора про находки предыдущей сдачи — ЗДЕСЬ, до
+                # любой развилки маршрутов и до бампа поколения. До развилки —
+                # потому что done-отчёт уходит тремя дорогами (pending_report →
+                # review, pair running → transition_after_agent_done, поллер), и
+                # поставить запись в одну значило бы потерять ответ на двух. До
+                # бампа — потому что исходы принадлежат поколению, на которое
+                # ОТВЕЧАЮТ, а не тому, что начинается этим отчётом (#911).
+                #
+                # Внутри савпоинта: отказ разбора (422) откатывает и строку
+                # отчёта, и исходы — принять отчёт, потеряв ответ, было бы той
+                # же тишиной, только оплаченной попыткой её нарушить.
+                #
+                # Условие на ПОЛЕ, а не на kind: отчёт уже завершённой задачи
+                # выше переписан в kind='status' (#971), и ответ автора не
+                # должен исчезать вместе с этой переменой.
+                outcome_note = await record_done_report_outcomes(
+                    db,
+                    task,
+                    body.finding_outcomes,
+                    reported_by=(body.agent or task.get("assigned_agent") or ""),
+                )
+                if outcome_note:
+                    await repo.add_task_update(
+                        db, task_id, "hub", "status", outcome_note
+                    )
 
             if body.kind == "done":
                 # Verifiable SDD (#510): under 'require', a done report that would
