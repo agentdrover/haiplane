@@ -782,3 +782,213 @@ async def test_the_fold_does_not_swallow_the_evidence(
     assert "Место не тронуто" not in heads["без места"], "пустота не чистота (#762)"
     for title, head in heads.items():
         assert detail.strip() not in head, f"деталь «{title}» осталась в первом экране"
+
+
+# --- Разбор накопленного: порядок захода и отчёт (#1171) -------------------
+
+
+async def test_the_queue_is_read_one_category_at_a_time(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1171: категории — самая частая сверху, и фильтр сужает выборку.
+
+    Сто находок одним потоком — это то, как суждение к концу очереди
+    становится штампом: вопрос меняется на каждой строке. Категория держит
+    вопрос одним на протяжении захода, а порядок категорий — это порядок из
+    постановки: под самую частую первой и имеет смысл писать детерминированную
+    проверку.
+    """
+    await _task(db, 61, "completed", 1)
+    await _report(
+        db,
+        120,
+        61,
+        1,
+        [
+            _finding("границу потеряли"),
+            _finding("гонка на повторе"),
+            _finding("тест ничего не проверяет", category="tests"),
+        ],
+    )
+    await db.commit()
+
+    counts = await repo.unjudged_findings_by_category(db)
+    assert counts == [
+        {"category": "correctness", "findings": 2},
+        {"category": "tests", "findings": 1},
+    ], "категории идут по убыванию числа находок"
+
+    page = (await client.get("/findings?category=tests")).text
+    assert "тест ничего не проверяет" in page
+    assert "границу потеряли" not in page, "фильтр обязан сужать выборку"
+    assert "показано 1 из 3" in page, (
+        "выборка и сток названы отдельно: общая цифра над фильтром читалась бы "
+        "как размер выборки"
+    )
+
+
+async def test_a_category_without_a_name_is_not_dropped(db: aiosqlite.Connection):
+    """Находка без категории остаётся в очереди под своим именем.
+
+    Половина исторических отчётов категорию не называет. Молча выкинуть их из
+    разбивки значило бы развести сумму по категориям с длиной очереди — и
+    потерять именно ту часть корпуса, которая копилась дольше всех.
+    """
+    await _task(db, 62, "completed", 1)
+    await _report(db, 121, 62, 1, [_finding("безымянная", category="")])
+    await db.commit()
+
+    counts = await repo.unjudged_findings_by_category(db)
+    assert counts == [{"category": "без категории", "findings": 1}]
+    assert sum(c["findings"] for c in counts) == len(await list_unjudged_findings(db))
+
+
+async def test_within_a_category_the_fresh_report_comes_first(
+    db: aiosqlite.Connection,
+):
+    """Свежий отчёт судится точнее старого: код ещё похож на тот, о котором писали."""
+    await _task(db, 63, "completed", 1)
+    await _task(db, 64, "completed", 1)
+    await _report(db, 122, 63, 1, [_finding("старая")])
+    await _report(db, 123, 64, 1, [_finding("свежая")])
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=datetime('now','-30 days') WHERE id=122"
+    )
+    await db.commit()
+
+    assert _titles(await list_unjudged_findings(db, newest_first=True)) == [
+        "свежая",
+        "старая",
+    ]
+    assert _titles(await list_unjudged_findings(db)) == ["старая", "свежая"], (
+        "порядок по умолчанию не тронут — его читают вызовы, написанные раньше"
+    )
+
+
+async def test_the_snapshot_fixes_the_denominator(db: aiosqlite.Connection):
+    """AC-1: приёмка меряет разбор, а не гонку разбора с конвейером.
+
+    Очередь пополняется каждым новым отчётом. Без снимка «разобрано 95%
+    очереди» означало бы «разбирали быстрее, чем ревью находило», то есть
+    измеряло бы совсем другое.
+    """
+    from hub.services.finding_report import queue_snapshot
+
+    await _task(db, 65, "completed", 1)
+    await _report(db, 124, 65, 1, [_finding("в снимке")])
+    await db.commit()
+    snapshot = await queue_snapshot(db)
+
+    await _task(db, 66, "completed", 1)
+    await _report(db, 125, 66, 1, [_finding("пришла после снимка")])
+    await db.commit()
+
+    assert snapshot["total"] == 1
+    assert [i["title"] for i in snapshot["items"]] == ["в снимке"]
+    assert snapshot["items"][0]["uid"], "снимок адресует находку uid, а не позицией"
+    assert (await queue_snapshot(db))["total"] == 2, (
+        "очередь растёт — и именно поэтому знаменатель берётся из снимка"
+    )
+
+
+async def test_the_report_keeps_stock_and_flow_apart(db: aiosqlite.Connection):
+    """AC-3: «в очереди за всё время N» и «покрытие отчётов X из Y» — разные числа.
+
+    Сток не оконный: находка, не отвеченная в апреле, не отвечена и сегодня.
+    Поток оконный. Сложить их в одну дробь значит поделить запас на поток и
+    получить число, не отвечающее ни на один из двух вопросов.
+    """
+    from hub.services.finding_report import disposition_report
+
+    await _task(db, 67, "completed", 1)
+    await _report(db, 126, 67, 1, [_finding("древняя")])
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=datetime('now','-100 days') WHERE id=126"
+    )
+    await db.commit()
+
+    report = await disposition_report(db, since_days=60, with_evidence=False)
+    assert report["stock"] == {"findings": 1, "reports": 1, "windowed": False}
+    assert report["flow"]["reports_counted"] == 0, (
+        "отчёт старше окна в поток не входит — а в сток входит"
+    )
+    assert report["flow"]["windowed"] is True
+    assert "findings" not in report["flow"], "сток и поток не живут в одной структуре"
+
+
+async def test_a_thin_slice_is_named_a_shortfall_not_a_number(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-4: precision без размера выборки не печатается, а мало — значит недобор.
+
+    Две разобранные находки дают precision 1.0, и голая единица зовёт к
+    решению «дешёвый профиль не хуже», которого выборка не выдерживает.
+    """
+    from hub.services.finding_report import disposition_report
+
+    await _task(db, 68, "completed", 1)
+    await _report(db, 127, 68, 1, [_finding("одна")])
+    await db.execute("UPDATE machine_reviews SET profile='lite' WHERE id=127")
+    await db.execute(
+        "INSERT INTO finding_dispositions (review_id, task_id, "
+        "submission_generation, finding_index, finding_uid, disposition, "
+        "decided_by) VALUES (127, 68, 1, 0, 'uid-one', 'fixed', 'denis')"
+    )
+    await db.commit()
+
+    report = await disposition_report(db, since_days=60, with_evidence=False)
+    assert report["overall"]["judged"] == 1
+    assert report["overall"]["precision"] is None, "одна находка не даёт precision"
+    assert "недобор" in report["overall"]["shortfall"]
+    assert report["by_profile"] == [
+        {
+            "profile": "lite",
+            "judged": 1,
+            "fixed": 1,
+            "false_positive": 0,
+            "wont_fix": 0,
+            "precision": None,
+            "resolution_rate": None,
+            "shortfall": "недобор: разобрано 1, нужно 20",
+        }
+    ], "ответ «deep против lite» на одной находке не даётся"
+
+    generous = await disposition_report(
+        db, since_days=60, minimum=1, with_evidence=False
+    )
+    assert generous["overall"]["precision"] == 1.0
+    assert generous["overall"]["judged"] == 1, "число всегда едет с размером выборки"
+
+
+def test_the_recheck_sample_is_deterministic_and_never_empty():
+    """AC-5: та же выборка при том же засоле, и минимум одна находка."""
+    from hub.services.finding_report import recheck_sample
+
+    uids = [f"uid-{n:03d}" for n in range(200)]
+    first = recheck_sample(uids, "2026-09-08")
+    assert first == recheck_sample(uids, "2026-09-08"), (
+        "выборка обязана повторяться — иначе о перепроверке нельзя рассуждать"
+    )
+    assert first != recheck_sample(uids, "2026-09-09")
+    assert 5 <= len(first) <= 40, f"доля вышла за окрестность 10%: {len(first)}"
+    assert recheck_sample(["одна"], "соль") == ["одна"], "выборка из нуля — не проверка"
+    assert recheck_sample([], "соль") == []
+
+
+def test_the_recheck_counts_divergence_and_names_the_unanswered():
+    """AC-5: расхождение выше 20% — разбор был штампом и не засчитывается."""
+    from hub.services.finding_report import compare_recheck
+
+    first = {"a": "fixed", "b": "false_positive", "c": "wont_fix", "d": "fixed"}
+    second = {"a": "fixed", "b": "fixed", "c": "wont_fix"}
+    result = compare_recheck(first, second, ["a", "b", "c", "d"])
+    assert result["compared"] == 3, "неотвеченный uid не считается совпадением"
+    assert result["diverged"] == 1
+    assert result["diverged_uids"] == ["b"]
+    assert result["unanswered"] == ["d"]
+    assert result["share"] == 0.333
+    assert result["stamped"] is True, "треть расхождений — выше границы 0.2"
+
+    agreed = compare_recheck(first, {"a": "fixed"}, ["a"])
+    assert agreed["share"] == 0.0
+    assert agreed["stamped"] is False

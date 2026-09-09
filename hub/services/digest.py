@@ -32,6 +32,7 @@ from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
+from hub import config
 from hub.db import fetchall
 from hub import repository as repo
 from hub.services.gate_events import STEWARD_JUDGEMENT
@@ -270,6 +271,30 @@ async def _steward_entry(db: aiosqlite.Connection, entry: dict, payload: dict) -
     }
 
 
+async def findings_queue_section(db: aiosqlite.Connection) -> dict:
+    """Сток неразобранных находок — попутчиком в дайджесте (#1171).
+
+    Едет ровно так же, как долг категорий (#878) и человеческая очередь
+    (#1020), и по той же причине: это свойство ПРАКТИКИ, а не активности
+    автопилота за сутки. Дайджеста собой не порождает — иначе строка
+    приезжала бы в одни дни и не приезжала в другие, и по её отсутствию
+    нельзя было бы сказать ничего.
+
+    Надёжный канал тревоги — событие, которое пишет сторож в поллере; здесь
+    сводка, а не будильник. Порог назван рядом с числом: «131 находка» без
+    «порог 40» не говорит читателю, много это или норма.
+    """
+    counted = await repo.count_unjudged_findings(db)
+    return {
+        "findings": int(counted["findings"]),
+        "reports": int(counted["reports"]),
+        "threshold": config.UNJUDGED_FINDINGS_ALERT_THRESHOLD,
+        "over_threshold": (
+            int(counted["findings"]) >= config.UNJUDGED_FINDINGS_ALERT_THRESHOLD > 0
+        ),
+    }
+
+
 async def generate_due_digests(
     db: aiosqlite.Connection, *, now: datetime | None = None
 ) -> int:
@@ -407,6 +432,7 @@ async def generate_due_digests(
             "project": project["slug"],
             "category_debt": debt,
             "human_queue": human_queue,
+            "findings_queue": await findings_queue_section(db),
             "auto_approvals": approvals,
             "auto_verdicts": verdicts,
             "escalations": escalations,
