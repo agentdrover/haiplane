@@ -6,11 +6,12 @@ import json
 import time
 import urllib.parse
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import Field
 
 from hub import brand, config
 from hub.actionable_errors import normalize_api_error_detail
@@ -610,10 +611,10 @@ async def hub_list_tasks(
     human_reviewer: str = "",
     claimed_by: str = "",
     mine: str = "",
-    limit: int = 20,
+    limit: Annotated[int, Field(le=200)] = 20,
     include_archived: bool = False,
-    after_id: int | None = None,
-    mode: str = "full",
+    after_id: Annotated[int | None, Field(ge=0)] = None,
+    mode: Literal["full", "summary"] = "full",
     project: str = "",
 ) -> CallToolResult:
     """List tasks with optional filters.
@@ -633,7 +634,7 @@ async def hub_list_tasks(
         human_reviewer: Exact match on human_reviewer.
         claimed_by: Exact match on the claim holder.
         mine: Shorthand for human_owner OR claimed_by (same person).
-        limit: Max number of tasks to return.
+        limit: Max tasks to return (≤200).
         include_archived: Include archived tasks, hidden from boards by default.
     """
     from urllib.parse import urlencode
@@ -678,6 +679,23 @@ async def hub_list_tasks(
         return structured_echo_result("No tasks found.", tasks=[])
     lines = [_format_task(t) for t in result]
     return structured_echo_result("\n".join(lines), tasks=result)
+
+
+def _drop_generated_titles(tool_name: str, fields: tuple[str, ...]) -> None:
+    """Pay for published bounds with titles the caller does not need (#1229)."""
+    tool = mcp._tool_manager.get_tool(tool_name)
+    if tool is None:
+        return
+    parameters = tool.parameters
+    parameters.pop("title", None)
+    properties = parameters.get("properties", {})
+    for name in fields:
+        schema = properties.get(name)
+        if isinstance(schema, dict):
+            schema.pop("title", None)
+
+
+_drop_generated_titles("hub_list_tasks", ("limit", "after_id", "mode"))
 
 
 def _dependency_lines(task: dict[str, Any]) -> list[str]:
