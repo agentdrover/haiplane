@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import os
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -27,6 +28,8 @@ from hub.integrations.protocols import (
     CIProbeResult,
     CIRunRequestOutcome,
     StackProbeOutcome,
+    StackProbeResult,
+    stacking_probe_batch_from_probe,
     stacking_probe_from_predicate,
 )
 from hub.integrations.registry import plugins
@@ -2033,6 +2036,82 @@ async def _project_id_for(db: aiosqlite.Connection, task_id: int) -> int | None:
     return dict(row)["id"] if row else None
 
 
+def _stacking_walker_for(git_ops: Any) -> Callable[..., Any] | None:
+    """The cheapest stacking call this plugin supports, or None (#1205).
+
+    Three rungs, tried in order, each a strictly weaker version of the one
+    above it — and the answers are the plugin's own on every rung.
+
+    ``branch_stacking_probe_batch`` asks the real question, one branch against
+    a list, so the branch under judgement and the base resolve once for the
+    whole walk instead of once per row (#1205).
+
+    ``branch_stacking_probe`` is #1186's one-pair form. A plugin that has only
+    it still answers correctly; it just pays the resolves this task is about.
+
+    ``branch_contains_unmerged_commits_of`` is the pre-#1186 bool. It still
+    answers the advisory question — the same graceful degradation
+    branch_ancestry already gets. What it cannot answer is the delivery one:
+    its ``False`` means "not stacked OR could not look", and
+    stacking_probe_from_predicate turns that honestly into ``unsupported``
+    rather than inventing a "clear" the bool never carried.
+    """
+    batch = getattr(git_ops, "branch_stacking_probe_batch", None)
+    if batch is not None:
+        return batch
+    probe = getattr(git_ops, "branch_stacking_probe", None)
+    if probe is None:
+        legacy = getattr(git_ops, "branch_contains_unmerged_commits_of", None)
+        if legacy is None:
+            return None
+        probe = functools.partial(stacking_probe_from_predicate, legacy)
+    return functools.partial(stacking_probe_batch_from_probe, probe)
+
+
+async def _walk_stacking_candidates(
+    walker: Callable[..., Any],
+    task_id: int,
+    branch: str,
+    candidates: list[tuple[dict[str, Any], str]],
+    base: str,
+    repo_path: str | None,
+) -> AsyncIterator[tuple[dict[str, Any], str, StackProbeResult | None]]:
+    """Yield ``(row, branch, result)`` for each candidate; ``None`` when it raised.
+
+    A batched walk is one generator, so a plugin that raises on ONE candidate
+    would otherwise end the walk and leave the remaining rows unasked — and an
+    unasked row is exactly the one that might be underneath us. The raise is
+    reported as "no answer for this row" and the walk restarts over what is
+    left, which is what the one-pair loop did before batching (#1186, #1205).
+    """
+    pending = list(candidates)
+    while pending:
+        stream = walker(
+            branch, [name for _, name in pending], base_branch=base, repo=repo_path
+        ).__aiter__()
+        consumed = 0
+        while True:
+            try:
+                _, result = await stream.__anext__()
+            except StopAsyncIteration:
+                return
+            except Exception:  # noqa: BLE001 — a raise is not an answer either
+                log.debug(
+                    "branch stacking probe raised for #%d (%s vs %s)",
+                    task_id,
+                    branch,
+                    pending[consumed][1],
+                    exc_info=True,
+                )
+                row, name = pending[consumed]
+                yield row, name, None
+                pending = pending[consumed + 1 :]
+                break
+            row, name = pending[consumed]
+            consumed += 1
+            yield row, name, result
+
+
 def _first_of(*answers: "StackAssessment | None") -> "StackAssessment | None":
     """The walk's precedence, written once and in order (#1186, #1204).
 
@@ -2152,23 +2231,13 @@ async def assess_branch_stacking(
             reason="no_branch_recorded",
             retryable=False,
         )
-    probe = getattr(plugins.git_ops, "branch_stacking_probe", None)
-    legacy = None
-    if probe is None:
-        # A plugin that predates the probe still answers the advisory
-        # question — the same graceful degradation branch_ancestry already
-        # gets. What it cannot answer is the delivery one: its ``False``
-        # means "not stacked OR could not look", and _as_probe turns that
-        # honestly into unknown rather than inventing a "clear" the bool
-        # never carried.
-        legacy = getattr(plugins.git_ops, "branch_contains_unmerged_commits_of", None)
-        if legacy is None:
-            return StackAssessment(
-                outcome=STACK_UNKNOWN,
-                reason="probe_unsupported",
-                retryable=False,
-            )
-        probe = functools.partial(stacking_probe_from_predicate, legacy)
+    walker = _stacking_walker_for(plugins.git_ops)
+    if walker is None:
+        return StackAssessment(
+            outcome=STACK_UNKNOWN,
+            reason="probe_unsupported",
+            retryable=False,
+        )
 
     ctx = await project_git_context(db, task_id)
     base = git_ops_mod._resolve_base(ctx.get("base_branch"))
@@ -2214,40 +2283,43 @@ async def assess_branch_stacking(
     # its own fix. So a benign match is REMEMBERED and the walk continues; it
     # stands only if nothing dangerous is found anywhere.
     benign: StackAssessment | None = None
+    # The rows worth asking git about, settled BEFORE any git call (#1205).
+    # Two filters, both free next to a subprocess: a row with no branch or
+    # our own, and a row belonging to another project.
+    #
+    # Another project is another REPOSITORY (each carries its own
+    # workspace_path and clone), so its branch names mean nothing here.
+    # Skipped before the probe rather than after: the probe would try to
+    # resolve a foreign name in this repo, fail, and answer "unavailable" —
+    # which #1186 rightly ranks above "clear" and which would then hold a
+    # perfectly clean delivery. Since one such row is enough and it can NEVER
+    # resolve, the hold would be permanent, and it would be permanent for
+    # every delivery in every project at once. Nine active projects on prod at
+    # the time of writing, most of them with work in flight: this was a
+    # hub-wide brick, not an edge case.
+    #
+    # Asked of repo.resolve_project_for_task rather than of a project_id
+    # column: projects live on epics and descendants inherit (#335), so the
+    # column is null for most tasks and a SQL filter would have been a second,
+    # weaker copy of that rule. The walk is a local SQLite lookup and it
+    # REPLACES a git subprocess for every foreign row, so scoping makes the
+    # walk cheaper, not dearer.
+    candidates: list[tuple[dict[str, Any], str]] = []
     for row in rows:
         other = dict(row)
         other_branch = (other.get("branch") or "").strip()
         if not other_branch or other_branch == branch:
             continue
-        # Another project is another REPOSITORY (each carries its own
-        # workspace_path and clone), so its branch names mean nothing here.
-        # Skipped before the probe rather than after: the probe would try to
-        # resolve a foreign name in this repo, fail, and answer "unavailable"
-        # — which #1186 rightly ranks above "clear" and which would then hold
-        # a perfectly clean delivery. Since one such row is enough and it can
-        # NEVER resolve, the hold would be permanent, and it would be
-        # permanent for every delivery in every project at once. Nine active
-        # projects on prod at the time of writing, most of them with work in
-        # flight: this was a hub-wide brick, not an edge case.
-        #
-        # Asked of repo.resolve_project_for_task rather than of a project_id
-        # column: projects live on epics and descendants inherit (#335), so
-        # the column is null for most tasks and a SQL filter would have been a
-        # second, weaker copy of that rule. The walk is a local SQLite lookup
-        # and it REPLACES a git subprocess for every foreign row, so scoping
-        # makes the walk cheaper, not dearer.
         if await _project_id_for(db, other["id"]) != own_project:
             continue
-        try:
-            result = await probe(branch, other_branch, base_branch=base, repo=repo_path)
-        except Exception:  # noqa: BLE001 — a raise is not an answer either
-            log.debug(
-                "branch stacking probe raised for #%d (%s vs %s)",
-                task_id,
-                branch,
-                other_branch,
-                exc_info=True,
-            )
+        candidates.append((other, other_branch))
+
+    async for other, other_branch, result in _walk_stacking_candidates(
+        walker, task_id, branch, candidates, base, repo_path
+    ):
+        if result is None:
+            # The probe raised. Not an answer either — and not a verdict about
+            # the rows it never reached, which is why the walk goes on.
             unknown = unknown or StackAssessment(
                 outcome=STACK_UNKNOWN,
                 reason=f"probe_raised: {other_branch}",

@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import socket
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -737,6 +737,64 @@ def _resolve_base(base_branch: str | None) -> str:
     return base_branch or PAIR_BASE_BRANCH
 
 
+# --- memory for the stacking probe (#1205) ---------------------------------
+#
+# #1186 turned the stacking walk from a twice-per-submission advisory into a
+# DELIVERY CONDITION, evaluated by the poller every POLL_INTERVAL for every
+# task waiting to be delivered — and a hold can last hours. Nothing between
+# cycles remembered the answer, so the whole walk was re-run from scratch
+# every minute for as long as the hold lasted.
+#
+# The key is the three SHAs, never the branch names and never a clock. The
+# probe's whole body is two rev-lists over three resolved commits, so a repeat
+# with the same three commits can only produce the same answer. A name-keyed
+# or time-keyed memory would do the opposite: hand a delivery a ``clear``
+# taken before the branch moved, which is exactly the merge #1186 exists to
+# prevent.
+#
+# Only definite answers are remembered. ``unavailable`` is retryable by
+# construction (#1197 keeps it apart from ``unsupported`` for that reason), so
+# caching it would make one failed git call stick to a pair of commits
+# forever.
+_STACK_PROBE_CACHE: dict[tuple[str, str, str, str], StackProbeResult] = {}
+
+#: The walk is bounded by the number of tasks with live branches, and the SHAs
+#: move as work lands, so entries go stale rather than growing without limit.
+#: A plain cap with a full clear is enough here and needs no eviction policy
+#: to reason about: the next walk re-fills exactly what it asks for.
+_STACK_PROBE_CACHE_MAX = 2048
+
+
+def _stack_probe_cache_clear() -> None:
+    """Forget every remembered probe answer (tests, and the size cap)."""
+    _STACK_PROBE_CACHE.clear()
+
+
+def _stack_probe_cache_get(
+    key: tuple[str, str, str, str],
+) -> StackProbeResult | None:
+    return _STACK_PROBE_CACHE.get(key)
+
+
+def _stack_probe_cache_put(
+    key: tuple[str, str, str, str], result: StackProbeResult
+) -> None:
+    """Remember a DEFINITE answer for this exact triple of commits.
+
+    Nothing else is remembered. An answer that is not ``stacked`` or ``clear``
+    is one we failed to get — ``unavailable`` is retryable by construction
+    (#1197) — and remembering a failed git call would glue one bad minute to a
+    pair of commits for as long as they stand. There is also no key to
+    remember it under when a SHA did not resolve: the key IS the freshness
+    check, so an answer without one can only be asked for again (#1205 AC-4).
+    """
+    if result.outcome not in (StackProbeOutcome.stacked, StackProbeOutcome.clear):
+        return
+    if len(_STACK_PROBE_CACHE) >= _STACK_PROBE_CACHE_MAX:
+        _STACK_PROBE_CACHE.clear()
+    _STACK_PROBE_CACHE[key] = result
+
+
 # ---------------------------------------------------------------------------
 # Plugin class
 # ---------------------------------------------------------------------------
@@ -868,15 +926,52 @@ class GitOpsIntegration:
     ) -> StackProbeResult:
         """Does ``branch`` carry commits unique to ``other_branch`` (#438, #1186)?
 
-        Merge-base analysis against ``base_branch``: ``other_branch`` owns the
+        The one-pair question, unchanged for its callers — it is now a walk of
+        one over ``branch_stacking_probe_batch``, so there is a single body
+        doing the git work and a single place where the memory lives.
+        """
+        async for _, result in self.branch_stacking_probe_batch(
+            branch, (other_branch,), base_branch=base_branch, repo=repo
+        ):
+            return result
+        # A one-element walk always yields exactly one answer; this line only
+        # exists so the function has no implicit ``None`` return.
+        return StackProbeResult(
+            outcome=StackProbeOutcome.unavailable,
+            reason="no_candidates",
+        )
+
+    async def branch_stacking_probe_batch(
+        self,
+        branch: str,
+        other_branches: Sequence[str],
+        base_branch: str | None = None,
+        repo: str | None = None,
+    ) -> AsyncIterator[tuple[str, StackProbeResult]]:
+        """One branch against a LIST of candidates, answered lazily (#1205).
+
+        Merge-base analysis against ``base_branch``: each candidate owns the
         commits reachable from it but not from base; if ``branch`` contains
-        any of them, the branches are stacked and ``branch`` cannot be
-        verified against base independently. Refs are resolved remote-first
-        (#1046 / #762): a stale local develop must not invent a stack.
+        any of them, the two are stacked and ``branch`` cannot be verified
+        against base independently. Refs are resolved remote-first (#1046 /
+        #762): a stale local develop must not invent a stack.
 
         Every way of NOT getting an answer is ``unavailable`` with the reason
         named, never ``clear``. The distinction is free for the advisory
         callers and load-bearing for the delivery gate, which merges on it.
+
+        WHY A LIST AND NOT A PAIR (#1205). The caller's real question has
+        always been "is this branch stacked on any of these", and asking it a
+        pair at a time made ``branch`` and the base resolve again for every
+        candidate — two extra subprocesses per row, paid every poll cycle for
+        as long as a delivery is held. Hoisting them out of the loop is a
+        property of the SHAPE here, not of the caller remembering to be
+        careful.
+
+        LAZY ON PURPOSE. The gate stops at the first dangerous stack (#1186),
+        so answering the whole list up front would spend rev-lists on rows
+        nobody reads. Yielding pairs lets the caller stop where it always
+        stopped.
 
         A ref that resolves nowhere is REFRESHED ONCE before the answer is
         formed (#1204, found by the machine review of submission #3). Without
@@ -899,61 +994,122 @@ class GitOpsIntegration:
         (``ls-remote --heads``: rc != 0 is "no answer", empty output is "no
         such head"), and no answer comes back as ``remote_unreachable`` —
         retryable, and never a ground for calling a human.
+
+        THE REFRESH IN A BATCHED WALK (#1204 × #1205). ``branch`` and the base
+        resolve ONCE for the whole walk, so their refresh is attempted once
+        too, and a remote that did not answer about either is not a fact about
+        any single candidate: every row of the walk gets the same
+        ``remote_unreachable``, the way ``workspace_unavailable`` already does.
+        A candidate's own ref is resolved per row, so its refresh is per row.
+        Neither shortcut may be replaced by "refresh the first row only": the
+        rows after it would then be told ``ref_unresolved`` — the one reason
+        the delivery gate is allowed to call a human with.
         """
         if repo is None:
             reason = await _default_workspace_error()
             if reason:
-                return StackProbeResult(
-                    outcome=StackProbeOutcome.unavailable,
-                    reason="workspace_unavailable",
-                    details=reason,
-                )
-        repo = repo or _repo_root()
+                for other_branch in other_branches:
+                    yield (
+                        other_branch,
+                        StackProbeResult(
+                            outcome=StackProbeOutcome.unavailable,
+                            reason="workspace_unavailable",
+                            details=reason,
+                        ),
+                    )
+                return
+        repo_path = repo or _repo_root()
         # #1046: judge the pushed refs. Local-first _resolve_ref made a stale
         # local develop turn independent branches into a false stack.
-        head = await _resolve_ref_remote_first(branch, repo)
-        other = await _resolve_ref_remote_first(other_branch, repo)
+        #
+        # Resolved ONCE for the whole walk: neither the branch under judgement
+        # nor the base changes between candidates.
+        head = await _resolve_ref_remote_first(branch, repo_path)
         base_name = _resolve_base(base_branch)
-        base = await _resolve_ref_remote_first(base_name, repo)
-        if not (head and other and base):
-            # One targeted refresh per name that did not resolve, then ask
-            # again. Only what survives an ANSWERED refresh is genuinely
-            # unknown to origin: a refresh that got no answer is a fact about
-            # this machine and the network, not about that branch, and is
-            # reported as such (#1204, machine review of submission #4).
-            for name, ref in (
-                (branch, head),
-                (other_branch, other),
-                (base_name, base),
-            ):
-                if ref:
-                    continue
-                state, detail = await _refresh_remote_ref(name, repo)
-                if state == "unreachable":
-                    return StackProbeResult(
+        base = await _resolve_ref_remote_first(base_name, repo_path)
+        # One targeted refresh per name that did not resolve, then ask again
+        # (#1204). Only what survives an ANSWERED refresh is genuinely unknown
+        # to origin: a refresh that got no answer is a fact about this machine
+        # and the network, not about that branch, and is reported as such.
+        # These two names are the walk's, not any candidate's, so an
+        # unanswered refresh of them is carried to EVERY row.
+        shared_unreachable = ""
+        if not head:
+            state, detail = await _refresh_remote_ref(branch, repo_path)
+            if state == "unreachable":
+                shared_unreachable = f"{branch}: {detail}"
+            else:
+                head = await _resolve_ref_remote_first(branch, repo_path)
+        if not shared_unreachable and not base:
+            state, detail = await _refresh_remote_ref(base_name, repo_path)
+            if state == "unreachable":
+                shared_unreachable = f"{base_name}: {detail}"
+            else:
+                base = await _resolve_ref_remote_first(base_name, repo_path)
+        for other_branch in other_branches:
+            if shared_unreachable:
+                yield (
+                    other_branch,
+                    StackProbeResult(
                         outcome=StackProbeOutcome.unavailable,
                         reason="remote_unreachable",
-                        details=f"{name}: {detail}",
-                    )
-            head = head or await _resolve_ref_remote_first(branch, repo)
-            other = other or await _resolve_ref_remote_first(other_branch, repo)
-            base = base or await _resolve_ref_remote_first(base_name, repo)
-        if not (head and other and base):
-            unresolved = [
-                name
-                for name, ref in (
-                    (branch, head),
-                    (other_branch, other),
-                    (base_name, base),
+                        details=shared_unreachable,
+                    ),
                 )
-                if not ref
-            ]
-            return StackProbeResult(
-                outcome=StackProbeOutcome.unavailable,
-                reason="ref_unresolved",
-                details=", ".join(unresolved),
-            )
+                continue
+            other = await _resolve_ref_remote_first(other_branch, repo_path)
+            if not other:
+                state, detail = await _refresh_remote_ref(other_branch, repo_path)
+                if state == "unreachable":
+                    yield (
+                        other_branch,
+                        StackProbeResult(
+                            outcome=StackProbeOutcome.unavailable,
+                            reason="remote_unreachable",
+                            details=f"{other_branch}: {detail}",
+                        ),
+                    )
+                    continue
+                other = await _resolve_ref_remote_first(other_branch, repo_path)
+            if not (head and other and base):
+                unresolved = [
+                    name
+                    for name, ref in (
+                        (branch, head),
+                        (other_branch, other),
+                        (base_name, base),
+                    )
+                    if not ref
+                ]
+                yield (
+                    other_branch,
+                    StackProbeResult(
+                        outcome=StackProbeOutcome.unavailable,
+                        reason="ref_unresolved",
+                        details=", ".join(unresolved),
+                    ),
+                )
+                continue
+            # The three SHAs ARE the question; the names are just how we found
+            # them. A remembered answer is reused only while all three still
+            # point where they pointed when it was computed (#1205).
+            key = (repo_path, head, other, base)
+            remembered = _stack_probe_cache_get(key)
+            if remembered is not None:
+                yield other_branch, remembered
+                continue
+            result = await self._stacking_rev_lists(head, other, base, repo_path)
+            _stack_probe_cache_put(key, result)
+            yield other_branch, result
 
+    async def _stacking_rev_lists(
+        self, head: str, other: str, base: str, repo: str
+    ) -> StackProbeResult:
+        """The two rev-lists behind every stacking answer (#438, #1186).
+
+        Split out of the walk so the memory above has exactly one thing to
+        remember: a function of three commits and nothing else.
+        """
         rc, total, _ = await _git(
             "rev-list", "--count", other, f"^{base}", repo=repo, check=False
         )

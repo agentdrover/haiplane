@@ -4346,6 +4346,7 @@ async def record_delivery_discrepancy(
     disposition: str | None = None,
     accepted_via: str | None = None,
     alerted_state: str | None = None,
+    alerted_age_bucket: int | None = None,
 ) -> None:
     """Store the latest answer about one task's delivery.
 
@@ -4362,8 +4363,8 @@ async def record_delivery_discrepancy(
         """
         INSERT INTO delivery_discrepancies
             (task_id, pr_number, state, reason, delivery_path,
-             disposition, accepted_via, alerted_state)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             disposition, accepted_via, alerted_state, alerted_age_bucket)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(task_id) DO UPDATE SET
             pr_number     = excluded.pr_number,
             state         = excluded.state,
@@ -4372,6 +4373,8 @@ async def record_delivery_discrepancy(
             disposition   = COALESCE(?, delivery_discrepancies.disposition),
             accepted_via  = COALESCE(?, delivery_discrepancies.accepted_via),
             alerted_state = COALESCE(?, delivery_discrepancies.alerted_state),
+            alerted_age_bucket =
+                COALESCE(?, delivery_discrepancies.alerted_age_bucket),
             checked_at    = datetime('now')
         """,
         (
@@ -4383,12 +4386,75 @@ async def record_delivery_discrepancy(
             disposition or "",
             accepted_via or "",
             alerted_state or "",
+            # Рубеж обязан ехать и в INSERT, а не только в ветку обновления:
+            # расхождение, найденное СРАЗУ старше суток, иначе записывалось бы
+            # с нулём, и следующий свип посчитал бы рубеж непройденным и
+            # заговорил во второй раз (#1198, находка ревью).
+            alerted_age_bucket or 0,
             disposition,
             accepted_via,
             alerted_state,
+            alerted_age_bucket,
         ),
     )
     await db.commit()
+
+
+async def acknowledge_delivery_discrepancy(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    by: str,
+    reason: str,
+) -> bool:
+    """Признать расхождение законным: замолкает, но остаётся видимым (#1198).
+
+    Возвращает False, если строки нет или причина пуста. Пустую причину
+    отвергает СХЕМА вызова, а не совесть вызывающего: признание без причины —
+    это выключатель, а он превращает механизм в способ глушить неудобное.
+    Ровно тот риск назван в постановке, и держать его комментарием мало.
+
+    Запись не удаляется и состояние не подменяется: реестр по-прежнему
+    показывает расхождение, к нему лишь приписано, кто и почему считает его
+    законным. Заткнуть можно, стереть нельзя.
+
+    Признание запоминает ФАКТ, а не только задачу: ``acknowledged_state``
+    берётся из той же строки одним оператором. Решение владельца 08.09.2026:
+    «PR держим открытым намеренно» — суждение о том, что PR открыт, и глушить
+    им следующий, никем не одобренный факт («доставку подтвердить не удалось»)
+    нельзя.
+
+    ЧЕГО ЭТО НЕ ДАЁТ, чтобы обещание не было шире кода: между отрисовкой
+    страницы и нажатием кнопки успевает пройти свип, и записан будет тот факт,
+    который в строке СЕЙЧАС, а не тот, что человек видел. Отдельной защиты нет
+    намеренно: промах самолечится — расхождение вернётся на доску уже как
+    непризнанное, с формой, и признать его можно заново.
+    """
+    if not (reason or "").strip():
+        return False
+    cur = await db.execute(
+        """
+        UPDATE delivery_discrepancies
+           SET acknowledged_at = datetime('now'),
+               acknowledged_by = ?,
+               ack_reason = ?,
+               acknowledged_state = state,
+               -- Признание ОБНУЛЯЕТ память о сказанном, и без этого обещание
+               -- «про новый факт услышите один раз» было ложью. Память —
+               -- множество ВСЕХ когда-либо озвученных состояний, а признание
+               -- навсегда снимает возрастные рубежи, которые её сбрасывали:
+               -- факт, звучавший ДО признания, при возврате оказывался «уже
+               -- сказанным» и молчал вечно, хотя одобряли не его. Решение
+               -- человека — точка отсчёта заново: что было сказано прежнему
+               -- вопросу, к новому отношения не имеет (#294, раунд 3).
+               alerted_state = '',
+               alerted_age_bucket = 0
+         WHERE task_id = ?
+        """,
+        ((by or "").strip(), reason.strip(), task_id),
+    )
+    await db.commit()
+    return (cur.rowcount or 0) > 0
 
 
 async def get_delivery_discrepancy(
@@ -4435,6 +4501,16 @@ async def list_delivery_discrepancies(
         SELECT
             d.task_id, d.pr_number, d.state, d.reason, d.delivery_path,
             d.disposition, d.accepted_via, d.first_seen_at, d.checked_at,
+            d.acknowledged_at, d.acknowledged_by, d.ack_reason,
+            d.acknowledged_state,
+            -- ОДНО определение «признано» на весь продукт (#294). Признание
+            -- относится к ФАКТУ, и три места, решающие «видно ли это
+            -- человеку» — топбар, счёт инбокса и сама строка, — обязаны
+            -- спрашивать то же самое, что спрашивает голос. Разъехавшись,
+            -- они дали худшее из возможного: карточка будила агентов, а
+            -- доска рисовала строку приглушённой и считала её нулём.
+            (d.acknowledged_at != '' AND d.acknowledged_state = d.state)
+                AS acknowledged_now,
             t.title, t.status, t.completed_at, t.human_owner, t.assigned_agent,
             CAST(
                 (julianday('now') - julianday(
@@ -4446,7 +4522,13 @@ async def list_delivery_discrepancies(
         WHERE d.state IN ({placeholders})
           AND t.archived = 0
           {project_clause}
-        ORDER BY age_hours DESC, d.task_id ASC
+        -- Непризнанные идут первыми, и это не вкусовщина: признанные живут
+        -- вечно («стереть нельзя») и они же самые старые, поэтому при
+        -- сортировке только по возрасту они выдавливали молодые непризнанные
+        -- за LIMIT. Счёт, взятый с усечённой страницы, тогда говорил «ноль»
+        -- при живом неразобранном расхождении — то есть доска утверждала
+        -- «всё чисто» вместо того, чтобы промолчать (#294).
+        ORDER BY acknowledged_now ASC, age_hours DESC, d.task_id ASC
         LIMIT ?
     """  # nosec B608 - placeholders only, values are params
     rows = await fetchall(db, query, tuple(params))
