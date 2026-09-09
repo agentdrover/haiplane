@@ -92,15 +92,39 @@ async def _draft_in_project(
     return body["id"]
 
 
-async def _refine_to_dor(
-    client: AsyncClient, task_id: int, areas: list[str] | None
-) -> dict:
+def _dor_patch(areas: list[str] | None) -> dict:
+    """Один DoR-патч, из которого собираются ОБА пути (#1164).
+
+    Оба помощника ниже строят тело запроса отсюда, а не из двух похожих
+    литералов: равенство путей — предмет AC-1, и если патчи разойдутся
+    хоть одним полем, тест начнёт сравнивать не то, о чём написан.
+    """
     payload = dict(_DOR_READY)
     if areas is not None:
         payload["affected_areas"] = areas
-    resp = await client.post(f"/api/tasks/{task_id}/refine", json=payload)
+    return payload
+
+
+async def _refine_to_dor(
+    client: AsyncClient, task_id: int, areas: list[str] | None
+) -> dict:
+    resp = await client.post(f"/api/tasks/{task_id}/refine", json=_dor_patch(areas))
     assert resp.status_code == 200, resp.text
     return (await client.get(f"/api/tasks/{task_id}")).json()
+
+
+async def _refine_bulk_to_dor(
+    client: AsyncClient, items: list[tuple[int, list[str] | None]]
+) -> dict[int, dict]:
+    """Тот же патч, что и выше, но через POST /api/tasks/refine-bulk."""
+    resp = await client.post(
+        "/api/tasks/refine-bulk",
+        json={"items": [dict(_dor_patch(areas), task_id=tid) for tid, areas in items]},
+    )
+    assert resp.status_code == 200, resp.text
+    return {
+        tid: (await client.get(f"/api/tasks/{tid}")).json() for tid, _areas in items
+    }
 
 
 async def _approved_events(db: aiosqlite.Connection) -> list[dict]:
@@ -421,3 +445,102 @@ async def test_unmapped_path_still_costs_r2(
 
     assert body["risk_class"] == "R2"
     assert body["status"] == "draft", "an undescribed path keeps the human gate"
+
+
+async def test_bulk_refine_reaches_the_same_gate_as_single(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1164 AC-1: политика смотрит на проект, а не на HTTP-вызов.
+
+    Статусы сравниваются ДРУГ С ДРУГОМ, а не с константой: предмет задачи —
+    равенство путей. Константа рядом нужна лишь затем, чтобы «равны» не
+    оказалось «оба остались в draft».
+    """
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _project(db, "spike-two-paths", {"dor": "auto"})
+    single = await _draft_in_project(client, db, pid)
+    bulk = await _draft_in_project(client, db, pid)
+
+    single_body = await _refine_to_dor(client, single, ["docs/notes.md"])
+    bulk_body = (await _refine_bulk_to_dor(client, [(bulk, ["docs/notes.md"])]))[bulk]
+
+    assert bulk_body["risk_class"] == single_body["risk_class"] == "R0"
+    assert bulk_body["dor_passed"] == single_body["dor_passed"] is True
+    assert bulk_body["status"] == single_body["status"], (
+        "один и тот же патч в одном проекте не может давать разный гейт"
+    )
+    assert single_body["status"] == "open", (
+        "иначе «равны» значило бы «оба ждут человека»"
+    )
+
+    events = {e["task_id"]: e for e in await _approved_events(db)}
+    assert set(events) == {single, bulk}, "автоодобрены оба, а не только один"
+    assert events[single]["actor"] == events[bulk]["actor"] == "policy"
+
+
+async def test_a_batch_does_not_launder_a_refusal(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1164 AC-2: пакет не проводит того, кому отказали бы поштучно.
+
+    Два вида отказа проверяются именно на пакетном пути, а не наследуются
+    из соседних одиночных тестов: ladder-поверхность (класс R0, то есть
+    отказ приходит НЕ от потолка) и класс выше потолка.
+    """
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _project(db, "spike-batch-refusal", {"dor": "auto"})
+    plain = await _draft_in_project(client, db, pid)
+    ladder = await _draft_in_project(client, db, pid)
+    too_high = await _draft_in_project(client, db, pid)
+
+    bodies = await _refine_bulk_to_dor(
+        client,
+        [
+            (plain, ["docs/notes.md"]),
+            (ladder, ["docs/agent-context/invariants.md"]),
+            (too_high, ["hub/db.py"]),
+        ],
+    )
+
+    assert bodies[plain]["status"] == "open"
+    assert bodies[ladder]["risk_class"] == "R0", (
+        "ladder-поверхность класса R0: отказ обязан прийти от стоп-листа, "
+        "а не от потолка класса"
+    )
+    assert bodies[ladder]["status"] == "draft"
+    assert bodies[too_high]["risk_class"] == "R3"
+    assert bodies[too_high]["status"] == "draft"
+    assert bodies[ladder]["dor_passed"] is True
+    assert bodies[too_high]["dor_passed"] is True, (
+        "отказал автопилот, а не DoR: иначе тест доказывал бы не то"
+    )
+
+
+async def test_bulk_refine_without_policy_still_waits_for_the_human(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1164 AC-3: расширяются пути действующей политики, а не сама политика."""
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    plain_pid = await _project(db, "spike-bulk-nopolicy", None)
+    plain_task = await _draft_in_project(client, db, plain_pid)
+    plain_body = (await _refine_bulk_to_dor(client, [(plain_task, ["docs/notes.md"])]))[
+        plain_task
+    ]
+    assert plain_body["risk_class"] == "R0"
+    assert plain_body["dor_passed"] is True
+    assert plain_body["status"] == "draft", "без dor=auto человеческий гейт стоит"
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "off")
+    killed_pid = await _project(db, "spike-bulk-killed", {"dor": "auto"})
+    killed_task = await _draft_in_project(client, db, killed_pid)
+    killed_body = (
+        await _refine_bulk_to_dor(client, [(killed_task, ["docs/notes.md"])])
+    )[killed_task]
+    assert killed_body["dor_passed"] is True
+    assert killed_body["status"] == "draft", (
+        "глобальный выключатель off выключает и пакетный путь"
+    )
+
+    assert await _approved_events(db) == [], (
+        "ни одного автоодобрения там, где политика его не разрешала"
+    )

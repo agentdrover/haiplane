@@ -94,13 +94,28 @@ def _touches_ladder(areas: list[str]) -> list[str]:
 async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
     """Approve a DoR-passed low-class draft when the switch allows (#584).
 
-    Called from the readiness-recalc funnel — the only place where
-    ``dor_passed`` flips to true, so every path a draft can take to
-    readiness (refine, bulk refine, AC/risk mutations) arrives here.
-    Runs inside the caller's transaction; returns True when the draft
-    was transitioned. Every refusal is silent by design: a draft that
-    does not qualify simply keeps waiting for the human, exactly as
-    today.
+    CALLERS, ENUMERATED RATHER THAN CLAIMED (#1164). Two, and the list is
+    the whole guarantee — the previous version of this docstring named
+    "every path (refine, bulk refine, AC/risk mutations)" while bulk refine
+    demonstrably did not arrive, so a coverage check made against this text
+    answered "covered" about an uncovered path:
+
+    1. ``refinement._persist_readiness_and_revision`` — THE readiness write
+       funnel. Both write paths go through it (the single refine and the
+       AC/risk mutations inside their ``_atomic`` block, the bulk refine as
+       one pass after the batch commits), which is why the call lives there
+       and not at each caller: a third write path would otherwise slip past
+       exactly the way bulk refine did.
+    2. ``steward_dispatch._order_one_dor_run`` — the poller, before it pays
+       for a steward run on a draft the policy would open for free.
+
+    ``_persist_readiness_fields`` one floor below is deliberately NOT a
+    caller: the lazy repair in ``get_readiness`` reaches it, and that is a
+    read — a card view must not open drafts.
+
+    Runs inside the caller's transaction; returns True when the draft was
+    transitioned. Every refusal is silent by design: a draft that does not
+    qualify simply keeps waiting for the human, exactly as today.
     """
     mode = (config.AUTO_APPROVE_MAX_CLASS or "off").strip().lower()
     global_ceiling = _AUTO_BAND.get(mode)
