@@ -2033,6 +2033,27 @@ DONE_OUTCOME_STEPS: tuple[Step[SubmitContext], ...] = (
 )
 
 
+async def _run_done_outcome_step(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    items: list[FindingOutcomeItem],
+) -> SubmitContext:
+    """Прогнать шаг исходов на пути отчёта о готовности (#1155).
+
+    Единственное место, где этот шаг заводится вне конвейера: и запись
+    ответа, и вопрос о том, на что не ответили, идут отсюда. Две точки
+    входа — но один шаг и один потолок; второго кода нет.
+    """
+    state = SubmitContext(
+        db=db,
+        task_id=int(task["id"]),
+        task=task,
+        body=TaskSubmitReview(finding_outcomes=items),
+    )
+    await run_steps(state, DONE_OUTCOME_STEPS)
+    return state
+
+
 async def record_done_report_outcomes(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -2049,19 +2070,37 @@ async def record_done_report_outcomes(
     :func:`record_finding_outcomes`. Второго кода здесь нет; новое только одно
     — момент, в который путь его зовёт.
     """
-    state = SubmitContext(
-        db=db,
-        task_id=int(task["id"]),
-        task=task,
-        body=TaskSubmitReview(finding_outcomes=items),
-    )
-    await run_steps(state, DONE_OUTCOME_STEPS)
+    state = await _run_done_outcome_step(db, task, items)
     # Заметку режима warn о НЕотвеченных находках печатает конвейер гейтов —
     # на pair-пути он доезжает следом, и оставить её здесь значило бы напечатать
     # одно и то же дважды. Отсюда наружу идёт только то, чего больше не скажет
     # никто: какие дефект-драфты завела эта запись.
+    # Маршрут, до которого конвейер НЕ доезжает, спрашивает отдельно —
+    # :func:`unanswered_findings_note`.
     state.outcome_note = ""
     await record_finding_outcomes(state, reported_by=reported_by)
+    return state.outcome_note
+
+
+async def unanswered_findings_note(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> str:
+    """Находки, на которые отчёт о готовности не ответил (#1155).
+
+    Нужна там, где конвейер гейтов НЕ доезжает: маршрут ``pending_report``
+    бампает поколение и уходит в ревью (или в completed) сам, не зовя
+    ``transition_after_agent_done``. Молчание здесь не нейтрально — после
+    бампа гейт спрашивает уже о НОВОМ поколении, у которого отчётов ревью
+    ещё нет, и находка предыдущего поколения выпадает из цикла навсегда:
+    вопрос исчезает вместе с ответом.
+
+    Тот же шаг и тот же потолок warn, что у конвейера: отказывать на этом
+    маршруте нельзя — за ним нет человека, который снимет отказ.
+
+    Зовётся ПОСЛЕ записи присланных исходов: ``open_findings`` вычитает уже
+    отвеченные, поэтому названо будет ровно то, на что ответа нет.
+    """
+    state = await _run_done_outcome_step(db, task, [])
     return state.outcome_note
 
 
@@ -3937,6 +3976,24 @@ async def add_update(
                     if vgap:
                         raise HTTPException(422, f"validation_failed: {vgap}")
                 if task["status"] == "pending_report":
+                    # #1155: на ЭТОМ маршруте конвейер гейтов не доезжает —
+                    # обе ветки ниже уходят из pending_report сами, не зовя
+                    # transition_after_agent_done. Значит сказать о находках,
+                    # на которые отчёт не ответил, больше некому: воспроизведено
+                    # зондом — задача в pending_report с открытой находкой
+                    # поколения 1 уезжала в review на поколении 2, и в ленте не
+                    # было ни слова. А после бампа гейт спрашивает уже о
+                    # поколении 2, где отчётов ревью нет вовсе, — вопрос
+                    # исчезает вместе с ответом, тихо.
+                    #
+                    # Тот же шаг и тот же потолок warn, что у конвейера. Перед
+                    # развилкой, а не в ветке review: маршрут «завершить без
+                    # ревью» уносит незакрытую находку ещё дальше.
+                    still_open_note = await unanswered_findings_note(db, task)
+                    if still_open_note:
+                        await repo.add_task_update(
+                            db, task_id, "hub", "alert", still_open_note
+                        )
                     if completion_requires_review(task):
                         # Universal Review Gate (#306): even the pending_report
                         # path may not complete unreviewed work — the done

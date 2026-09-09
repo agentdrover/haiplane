@@ -72,12 +72,16 @@ def quiet_git_ops(monkeypatch):
 
 
 async def _sent_back_with_a_finding(
-    client: AsyncClient, db: aiosqlite.Connection, title: str
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    title: str,
+    findings: tuple[str, ...] = ("утечка курсора",),
 ) -> tuple[int, int, str]:
-    """Задача, которую вернули с ПОДТВЕРЖДЁННОЙ находкой первой сдачи.
+    """Задача, которую вернули с ПОДТВЕРЖДЁННЫМИ находками первой сдачи.
 
-    Возвращает ``(task_id, review_id, finding_uid)``. Поколение сдачи, на
-    которую ответят исходы, — 1.
+    Возвращает ``(task_id, review_id, finding_uid)`` — uid ПЕРВОЙ находки.
+    Остальные читаются вызывающим через ``open_findings``. Поколение сдачи,
+    на которую ответят исходы, — 1.
     """
     resp = await client.post("/api/tasks", json={"title": title})
     task_id = resp.json()["id"]
@@ -94,8 +98,10 @@ async def _sent_back_with_a_finding(
         task_id=task_id,
         submission_generation=1,
         harness_skill="lite-diff-review",
-        raw_count=1,
-        findings_confirmed=json.dumps([_finding("утечка курсора")], ensure_ascii=False),
+        raw_count=len(findings),
+        findings_confirmed=json.dumps(
+            [_finding(t) for t in findings], ensure_ascii=False
+        ),
         unresolved=json.dumps([], ensure_ascii=False),
         incomplete=False,
     )
@@ -241,6 +247,194 @@ async def test_an_unanswered_finding_is_named_but_never_refused_on_done(
     assert "утечка курсора" in feed, (
         "гейт отработал и промолчал — читатель решит, что находок нет"
     )
+
+
+async def _pending_report_after_a_dispatch_run(
+    db: aiosqlite.Connection, task_id: int
+) -> None:
+    """Как задача попадает в ``pending_report``: прогон кончился без отчёта.
+
+    Поллер видит завершённый job и НЕ видит done-отчёта в ленте
+    (``poller.py`` #1018) — ``transition_after_agent_done(has_done=False)``
+    кладёт задачу в ``pending_report``. Отчёт присылается уже оттуда, и это
+    ЕДИНСТВЕННЫЙ статус, из которого диспетчерская задача (с ``job_id``)
+    вообще может его прислать: ``_validate_done_report`` пропускает
+    ``running``/``claimed`` только БЕЗ ``job_id``.
+    """
+    await repo.update_task(db, task_id, status="pending_report", job_id="job-1")
+    await db.commit()
+
+
+async def test_the_pending_report_route_names_unanswered_findings(
+    db: aiosqlite.Connection, client: AsyncClient, monkeypatch, quiet_git_ops
+):
+    """Маршрут pending_report обязан назвать находки, на которые не ответили.
+
+    Воспроизведено до починки: задача в ``pending_report`` с открытой находкой
+    поколения 1 уезжала в review на поколении 2, и в ленте не было ни слова.
+    Молчание здесь дороже, чем на других маршрутах: гейт после бампа
+    спрашивает уже о поколении 2, где отчётов ревью нет вовсе, — находка
+    поколения 1 выпадает из цикла НАВСЕГДА, вопрос исчезает вместе с ответом.
+
+    Конвейер headless-гейтов сюда не доезжает: обе ветки уходят из
+    ``pending_report`` сами, не зовя ``transition_after_agent_done``.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
+    task_id, _review_id, _uid = await _sent_back_with_a_finding(
+        client, db, "Молчаливый маршрут"
+    )
+    await _pending_report_after_a_dispatch_run(db, task_id)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "done", "content": "готово"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "утечка курсора" in feed, (
+        "маршрут pending_report промолчал о неотвеченной находке — а спросить "
+        "о ней после бампа поколения больше негде"
+    )
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "review", "потолок warn: назвать, но не отказать"
+    assert row["submission_generation"] == 2
+
+
+async def test_the_pending_report_route_names_only_what_is_left_unanswered(
+    db: aiosqlite.Connection, client: AsyncClient, monkeypatch, quiet_git_ops
+):
+    """Названо то, на что ответа НЕТ, — а не всё подряд.
+
+    Заметка, называющая уже закрытую находку, была бы тем же шумом, что и
+    молчание: читатель перестаёт её читать. Проверяется парой — один исход
+    прислан и записан, второй нет.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
+    task_id, review_id, first_uid = await _sent_back_with_a_finding(
+        client, db, "Половина ответа", findings=("утечка курсора", "вторая находка")
+    )
+    await _pending_report_after_a_dispatch_run(db, task_id)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={
+            "agent": "dev",
+            "kind": "done",
+            "content": "часть починил",
+            "finding_outcomes": [{"finding_uid": first_uid, "outcome": "fixed"}],
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert [
+        dict(r)["outcome"] for r in await repo.list_finding_outcomes(db, review_id)
+    ] == ["fixed"], "присланный исход не записан — тогда «названо только второе» ни о чём"
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "вторая находка" in feed, "остаток без ответа не назван"
+    assert "утечка курсора" not in feed, (
+        "названа находка, на которую автор ответил — заметка стала шумом"
+    )
+
+
+async def test_the_pending_report_route_names_them_even_when_it_completes(
+    db: aiosqlite.Connection, client: AsyncClient, monkeypatch, quiet_git_ops
+):
+    """Ветка «завершить без ревью» — та же обязанность, и она хуже.
+
+    При ``auto_review=false`` отчёт из ``pending_report`` закрывает задачу
+    сразу. Незакрытая находка уезжает не в следующую сдачу, а в completed:
+    сказать о ней здесь — последний момент, когда это ещё кому-то видно.
+    Поэтому заметка стоит ДО развилки, а не в ветке review.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
+    task_id, _review_id, _uid = await _sent_back_with_a_finding(
+        client, db, "Закрыть молча"
+    )
+    await repo.update_task(db, task_id, auto_review=0)
+    await _pending_report_after_a_dispatch_run(db, task_id)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "done", "content": "готово"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "completed", (
+        "тест обязан идти ИМЕННО веткой завершения, иначе он повторяет соседа"
+    )
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "утечка курсора" in feed, (
+        "задача закрыта, а незакрытая находка не названа ни разу"
+    )
+
+
+async def test_the_deprecated_alias_never_swallows_an_answer(
+    db: aiosqlite.Connection, client: AsyncClient, quiet_git_ops
+):
+    """Депрекированный алиас kind=done: потеря ответа не может быть ТИХОЙ.
+
+    Ревью подозревало, что ответ автора пропадает у алиаса молча. Опровергнуто
+    опытом: поля у алиаса нет вовсе, поэтому попытка его передать — TypeError,
+    а не тишина, и каждый done через алиас помечен ``deprecated`` с прямым
+    указанием на инструмент, который поле принимает. Поле алиасу не заводится
+    намеренно: ADR-0002 его выводит, а вся документация проекта зовёт алиас
+    только для ``status``/``blocker``.
+
+    Пиньтся не отсутствие параметра, а сам инвариант: алиас либо ДОВОЗИТ
+    исходы до тела запроса, либо называет того, кто довозит. Чего он не имеет
+    права — принять их и выбросить. Тест верен при любом будущем решении.
+    """
+    from hub import mcp_server
+
+    fn = getattr(mcp_server.hub_task_update, "fn", mcp_server.hub_task_update)
+    outcomes = [{"finding_uid": "0" * 16, "outcome": "fixed"}]
+
+    with (
+        patch.object(mcp_server, "_api_post", new_callable=AsyncMock) as post,
+        patch.object(mcp_server, "_api_get", new_callable=AsyncMock) as get,
+    ):
+        post.return_value = {"id": 1}
+        get.return_value = {"status": "review"}
+        try:
+            out = await fn(
+                7, "готово", agent="dev", kind="done", finding_outcomes=outcomes
+            )
+        except TypeError:
+            # Дверь закрыта на замок: ответ невозможно даже начать терять.
+            out = None
+        else:
+            update_calls = [
+                c.args[1]
+                for c in post.await_args_list
+                if str(c.args[0]).endswith("/updates")
+            ]
+            assert update_calls and update_calls[0].get("finding_outcomes") == outcomes, (
+                "алиас принял исходы и не довёз их до запроса — ровно та тихая "
+                "потеря, которой быть не должно"
+            )
+
+    if out is None:
+        with (
+            patch.object(mcp_server, "_api_post", new_callable=AsyncMock) as post,
+            patch.object(mcp_server, "_api_get", new_callable=AsyncMock) as get,
+        ):
+            post.return_value = {"id": 1}
+            get.return_value = {"status": "review"}
+            out = await fn(7, "готово", agent="dev", kind="done")
+        payload = json.loads(out)
+        assert payload.get("deprecated") is True
+        assert "hub_report_done" in (payload.get("next_action") or ""), (
+            "алиас не умеет исходы и не называет того, кто умеет — вот это и "
+            "было бы тихой потерей"
+        )
 
 
 async def test_the_done_path_gate_is_active_and_explains_nothing_away():
