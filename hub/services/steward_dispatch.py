@@ -661,10 +661,7 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
         run = dict(row)
         task_row = await repo.get_task(db, run["task_id"])
         task = dict(task_row) if task_row is not None else {}
-        # A human verdict on this very generation ends the run: the judgement
-        # it was ordered for is no longer anybody's to make (#1022 gives such
-        # a late judgement a 409, and this closes the slot behind it).
-        # #1120 review: a resubmission ends the run too. Its subject stopped
+        # #1120 review: a resubmission ends the run. Its subject stopped
         # being the thing under review, and a slot left open would hold the
         # daily cap and the evidence door for code nobody is judging any more.
         #
@@ -710,6 +707,14 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
             continue
         # Вердикт — про сдачу, и снимает он слот сдачи. Но только ЗАКАЗ,
         # который ещё не начинался (#1201).
+        #
+        # Здесь до #1201 стояло, что вердикт бывает только человеческим и что
+        # позднему суждению контракт #1022 отвечает 409. Оба утверждения
+        # неверны, и второе проверено чтением: приём суждения на уже
+        # решённое поколение не отказывает — 409 там только на ПОВТОР той же
+        # тройки (задача, поколение, вид). Комментарий, обещающий отказ,
+        # которого нет, уводит читающего ровно так же, как уводила причина
+        # закрытия, называвшая чужого автора.
         #
         # Решение и наблюдение — разные вещи. В теневой фазе суждение на
         # вердикт не влияет вовсе; оно нужно надзору F7 как пара «суждение
