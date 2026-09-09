@@ -32,6 +32,7 @@ from hub.integrations.registry import plugins
 from hub.models import (
     ACLocatorResolution,
     ACTestResultView,
+    BaseMergeState,
     CallSiteEntry,
     CallSiteSection,
     CIRunReportState,
@@ -176,6 +177,59 @@ async def build_call_sites_section(
             )
             for s in report.symbols
         ],
+    )
+
+
+async def base_merge_section(db, task_view) -> BaseMergeState:
+    """Будущий конфликт с базой, названный ДО вердикта (#1233, AC-1).
+
+    Четыре исхода, и ни один не подменяет другой. ``not_applicable`` — спрашивать
+    нечего (не гейт или нет PR). ``unknown`` — спросить не удалось; это НЕ
+    «чисто», и человек должен видеть разницу. ``conflicting`` — мерж не будет
+    чистым, и файлы названы, когда git смог их назвать.
+
+    09.09.2026 человек одобрил #1204 в 05:48 и через четырнадцать секунд узнал
+    из отказа доставки, что ветка конфликтует с базой в трёх файлах. Вердикт к
+    тому моменту уже был потрачен.
+    """
+    if task_view.status not in GATE_STATUSES or not task_view.pr_number:
+        return BaseMergeState(
+            state="not_applicable",
+            reason="расхождение с базой спрашивается на гейте и только при PR",
+        )
+    from hub import services
+
+    try:
+        ctx = await services.project_git_context(db, task_view.id)
+        outcome, detail = await plugins.git_ops.check_pr_mergeable(
+            task_view.pr_number,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
+        )
+    except Exception as exc:  # noqa: BLE001 - блок отвечает причиной, не молчанием
+        log.warning("base-merge probe failed for #%s: %s", task_view.id, exc)
+        return BaseMergeState(state="unknown", reason=f"спросить не удалось: {exc}")
+    value = getattr(outcome, "value", str(outcome))
+    if value == "mergeable":
+        return BaseMergeState(state="clean", reason=detail or "мерж будет чистым")
+    if value != "conflicting":
+        return BaseMergeState(state="unknown", reason=detail or value)
+    # Имена файлов приезжают в детали от того же расчёта, что читает доставка;
+    # разбираются здесь, чтобы читателю не пришлось разбирать строку глазами.
+    files = [
+        part.strip()
+        for part in detail.split(":", 1)[-1].split(",")
+        if ":" in detail and part.strip()
+    ]
+    return BaseMergeState(
+        state="conflicting",
+        reason=(
+            f"мерж в базу НЕ будет чистым: {detail}. Вердикт сейчас прибит к "
+            f"коммиту, поэтому мерж базы в ветку до доставки может стоить "
+            f"второго одобрения (#1233)"
+        ),
+        files=files,
     )
 
 
@@ -336,6 +390,13 @@ async def build_review_brief(
                 "in the branch"
             )
 
+    # #1233: разойдётся ли ветка с базой при доставке — ДО вердикта, а не
+    # после отказа доставки. Спрашивается только на гейте и только при наличии
+    # PR: у карточки драфта нет причины платить за пробный мерж. Ответ идёт
+    # тем же путём, которым его уже узнаёт доставка (#970/#1116), — второй
+    # расчёт расхождения здесь не заводится.
+    base_merge_state = await base_merge_section(db, task_view)
+
     # #601: where else is each changed symbol called, and does this diff touch
     # those places. Same shape as #506 above and for the same reason: the
     # analysis needs the checkout, so it runs against the project workspace and
@@ -455,6 +516,7 @@ async def build_review_brief(
         pr_number=task_view.pr_number,
         diff_command=diff_command,
         diff_base=DiffBaseState(**diff_base),
+        base_merge=base_merge_state,
         evidence_coverage=EvidenceCoverage(**coverage),
         submission_sha=submission_sha,
         current_branch_tip=current_tip,

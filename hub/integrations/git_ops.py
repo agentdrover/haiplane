@@ -2714,6 +2714,165 @@ class GitOpsIntegration:
         lines = [ln.strip() for ln in (out or "").splitlines()[1:] if ln.strip()]
         return lines[:10]
 
+    async def _prepare_base_merge_tree(
+        self, repo: str, base: str, branch: str, task_id: int
+    ) -> tuple[str, str]:
+        """Одноразовое дерево на вершине ветки со слитой в него базой (#1233).
+
+        Возвращает ``(путь, причина)``: путь непустой — мерж выполнен (чисто
+        или с конфликтами, это спрашивают отдельно), непустая причина — спросить
+        не удалось. Разметка diff3 включена НАРОЧНО: без секции общего предка
+        нельзя доказать, что ни одна сторона не переписала существующую строку,
+        а без этого доказательства автомерж не имеет права срабатывать.
+        """
+        rc, _, err = await _git(
+            "fetch",
+            "origin",
+            f"+{base}:refs/remotes/origin/{base}",
+            f"+{branch}:refs/remotes/origin/{branch}",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            return "", f"не удалось получить ветки из origin: {err[:150]}"
+        path = _scratch_worktree(repo, "basemerge", task_id)
+        await _git("worktree", "remove", "--force", path, repo=repo, check=False)
+        rc, _, err = await _git(
+            "worktree",
+            "add",
+            "--force",
+            "--detach",
+            path,
+            f"origin/{branch}",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            return "", f"не удалось подготовить дерево для мержа базы: {err[:150]}"
+        rc, _, err = await _git(
+            "-c",
+            "merge.conflictStyle=diff3",
+            "merge",
+            "--no-commit",
+            "--no-ff",
+            f"origin/{base}",
+            repo=path,
+            check=False,
+        )
+        if rc == _TIMEOUT_RC or rc >= 128:
+            # Таймаут и падение самого git — «спросить не удалось», а не
+            # конфликт: лечится повтором, а не человеком (#970, #1116).
+            await _git("worktree", "remove", "--force", path, repo=repo, check=False)
+            return "", f"мерж базы не состоялся (git rc={rc}): {err[:150]}"
+        return path, ""
+
+    async def base_merge_conflicts(
+        self, repo: str, base: str, branch: str, task_id: int
+    ) -> tuple[dict[str, str] | None, str]:
+        """Что помешает слить базу в ветку — пробой, которая ничего не меняет (#1233).
+
+        ``({}, "")`` — база сливается чисто. Непустой словарь — путь файла и его
+        содержимое С МАРКЕРАМИ diff3, чтобы класс конфликта судили по разметке
+        git, а не по догадке. ``None`` — спросить не удалось, и это НЕ «конфликта
+        нет»: одно чинится повтором, другое руками человека (#725).
+        """
+        path, why = await self._prepare_base_merge_tree(repo, base, branch, task_id)
+        if not path:
+            return None, why
+        try:
+            rc, out, _ = await _git(
+                "diff", "--name-only", "--diff-filter=U", repo=path, check=False
+            )
+            if rc != 0:
+                return None, "не удалось перечислить конфликтующие файлы"
+            paths = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+            files: dict[str, str] = {}
+            for rel in paths[:20]:
+                try:
+                    with open(os.path.join(path, rel), encoding="utf-8") as fh:
+                        files[rel] = fh.read()
+                except (OSError, UnicodeDecodeError) as exc:
+                    # Двоичный или нечитаемый файл — не наш класс, и молчать
+                    # об этом нельзя: пустой словарь читается как «чисто».
+                    return None, f"конфликтующий файл {rel} не прочитан: {exc}"
+            return files, ""
+        finally:
+            await _git("merge", "--abort", repo=path, check=False)
+            await _git("worktree", "remove", "--force", path, repo=repo, check=False)
+
+    async def push_resolved_base_merge(
+        self,
+        repo: str,
+        base: str,
+        branch: str,
+        task_id: int,
+        resolutions: dict[str, str],
+        validate: Any = None,
+    ) -> tuple[bool, str]:
+        """Слить базу в ветку с готовым разрешением и запушить (#1233, AC-3).
+
+        ``validate`` — асинхронный вызов ``(путь) -> (rc, лог) | None``, который
+        гонится в том же дереве ПОСЛЕ разрешения. Судим по коду возврата: 09.09
+        дважды наблюдали «All checks passed» при коде 2, и хвост вывода здесь
+        не доказательство. Валидации нет или она не запустилась — не пушим:
+        сложить два блока текста мало, они могут конфликтовать по именам.
+        """
+        path, why = await self._prepare_base_merge_tree(repo, base, branch, task_id)
+        if not path:
+            return False, why
+        try:
+            for rel, text in resolutions.items():
+                target = os.path.join(path, rel)
+                if not os.path.realpath(target).startswith(
+                    os.path.realpath(path) + os.sep
+                ):
+                    return False, f"путь {rel} ведёт наружу рабочего дерева"
+                with open(target, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                await _git("add", "--", rel, repo=path, check=False)
+            rc, out, _ = await _git(
+                "diff", "--name-only", "--diff-filter=U", repo=path, check=False
+            )
+            left = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+            if rc != 0 or left:
+                return False, (
+                    "после разрешения остались конфликтующие файлы: "
+                    + (", ".join(left) or "перечислить не удалось")
+                )
+            if validate is None:
+                return False, "валидацию после автомержа гонять нечем"
+            result = await validate(path)
+            if result is None:
+                return False, "валидация после автомержа не запустилась"
+            rc, _log = result
+            if rc != 0:
+                return False, f"валидация после автомержа упала (код возврата {rc})"
+            rc, _, err = await _git(
+                "commit",
+                "-m",
+                f"chore(task-{task_id}): merge {base} into {branch}",
+                "--no-verify",
+                repo=path,
+                check=False,
+            )
+            if rc != 0:
+                return False, f"коммит мержа не состоялся: {err[:150]}"
+            rc, _, err = await _git(
+                "push",
+                "origin",
+                f"HEAD:refs/heads/{branch}",
+                repo=path,
+                check=False,
+                timeout=60,
+            )
+            if rc != 0:
+                return False, f"пуш слитой ветки не прошёл: {err[:150]}"
+            _rc, sha, _ = await _git("rev-parse", "HEAD", repo=path, check=False)
+            return True, (sha or "").strip()
+        finally:
+            await _git("merge", "--abort", repo=path, check=False)
+            await _git("worktree", "remove", "--force", path, repo=repo, check=False)
+
     async def release_range(
         self,
         base: str,

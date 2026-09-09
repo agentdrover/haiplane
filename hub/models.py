@@ -865,6 +865,25 @@ class DiffBaseState(BaseModel):
     sha: str = ""
 
 
+class BaseMergeState(BaseModel):
+    """Разойдётся ли ветка с базой при доставке — ДО вердикта (#1233).
+
+    ``state``: ``clean`` | ``conflicting`` | ``unknown`` | ``not_applicable``.
+    Четыре, и они не схлопываются: «конфликта нет» и «спросить не удалось»
+    ведут к противоположным действиям, а «нечего спрашивать» (нет PR) — это не
+    зелёный свет. 09.09.2026 человек узнал о конфликте #1204 через четырнадцать
+    секунд ПОСЛЕ того, как потратил вердикт: гейт отказал в доставке, задача
+    ушла на второй круг ревью, и то же одобрение пришлось выдавать снова.
+
+    ``files`` — имена конфликтующих файлов, когда git смог их назвать. Пусто —
+    это «назвать не удалось», а не «их не было»: конфликт остаётся конфликтом.
+    """
+
+    state: str = "unknown"
+    reason: str = ""
+    files: list[str] = Field(default_factory=list)
+
+
 class EvidenceCoverage(BaseModel):
     """How much of this brief is evidence, and how much is absence (#725).
 
@@ -986,6 +1005,9 @@ class ReviewBrief(BaseModel):
     # whether it resolves. An unresolved base leaves diff_command empty — a
     # command that cannot run reads as an offer to verify.
     diff_base: DiffBaseState = Field(default_factory=DiffBaseState)
+    # #1233: расхождение с базой названо ДО вердикта, а не после отказа
+    # доставки. Читатель у поля тот же, что у diff_base, — человек на гейте.
+    base_merge: BaseMergeState = Field(default_factory=BaseMergeState)
     # #725: one verdict over all evidence blocks below.
     evidence_coverage: EvidenceCoverage = Field(default_factory=EvidenceCoverage)
     review_cycle: int = 0

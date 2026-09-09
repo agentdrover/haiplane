@@ -34,7 +34,7 @@ from hub.integrations.protocols import (
 )
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
-from hub.services import workflow_seed
+from hub.services import base_merge, workflow_seed
 from hub.services.gate_events import (
     HUMAN_GATE_EVENT_KINDS,
     NON_HUMAN_GATE_ACTORS,
@@ -2423,12 +2423,62 @@ async def _approved_code_check(
             f"Одобрен коммит {pinned[:12]}."
         )
     if current_tip != pinned:
+        # #1233: вершина сдвинулась — но ЧЕМ? Если в ветку приехала только база,
+        # авторская работа та же, и второй человеческий вердикт за неё — плата
+        # за механику, а не за содержание. Признак механический: дифф ветки к
+        # базе до и после мержа. Проверка стоит два чтения диффа и делается
+        # только здесь, на уже разошедшейся вершине.
+        kept, why = await base_merge_kept_the_verdict(db, task, pinned, current_tip)
+        if kept:
+            return "", (
+                f"Мерж базы в ветку: одобренный коммит {pinned[:12]} сменился "
+                f"на {current_tip[:12]}, но {why}. Вердикт остаётся текущим, "
+                f"второго одобрения не требуется (#1233). Зелёная валидация на "
+                f"новой вершине проверяется отдельно, ниже по этому же гейту."
+            )
         return (
             f"stale_approval: одобрен {pinned[:12]}, ветка на "
             f"{current_tip[:12]} — пересдайте, чтобы ревью увидело текущий код "
-            f"(PR #{pr_num})"
+            f"(PR #{pr_num}). {why}"
         ), ""
     return "", ""
+
+
+async def base_merge_kept_the_verdict(
+    db: aiosqlite.Connection, task: dict[str, Any], pinned: str, current_tip: str
+) -> tuple[bool, str]:
+    """Пережил ли вердикт сдвиг вершины: приехала база или правил автор (#1233).
+
+    Возвращает ``(сохранён, причина)``, и причина заполнена в обоих исходах —
+    сохранение вердикта без сказанного вслух основания ничем не отличается от
+    доверия.
+
+    Сравниваются два диффа ветки к базе: одобренной вершины и текущей. Совпали
+    байт в байт — привезена только база. Это НАБЛЮДЕНИЕ, а не разбор сообщения
+    коммита: «merge develop» в заголовке пишется рукой и ничего не доказывает.
+
+    Известная узость, и она в безопасную сторону: если база тронула тот же файл,
+    что и автор, дифф перестаёт совпадать (другой блоб базы — другая строка
+    ``index``, вставка базы — другие смещения ханков), и вердикт слетает, то
+    есть ровно сегодняшнее поведение. Наблюдено на настоящем git в
+    tests/test_delivery_gate.py. Обратной ошибки — сохранить вердикт там, где
+    автор правил, — такое сравнение не допускает, и это здесь важнее полноты.
+    """
+    branch = (task.get("branch") or "").strip()
+    if not branch:
+        return False, "у задачи нет ветки, сверять дифф не с чем"
+    try:
+        ctx = await project_git_context(db, task["id"])
+        workspace = ctx.get("repo")
+        base = git_ops_mod._resolve_base(ctx.get("base_branch"))
+        if not workspace:
+            return False, "у проекта нет клона, чтобы сверить дифф к базе"
+        before = await plugins.git_ops.branch_diff(workspace, base, pinned)
+        after = await plugins.git_ops.branch_diff(workspace, base, current_tip)
+    except Exception as exc:  # noqa: BLE001 - деградация, а не отказ гейта
+        log.warning("base-merge check failed for #%s: %s", task["id"], exc)
+        return False, f"сверка диффа к базе не состоялась: {exc}"
+    return base_merge.author_diff_unchanged(before, after)
 
 
 def _seconds_since_ci_start(iso_ts: str | None) -> float | None:
@@ -2706,6 +2756,8 @@ PR_DRAFT_PREFIX = "pr_draft"
 # retryable kind; see _stacking_gate_step for why the other kind does not
 # refuse at all.
 STACKED_BASE_PREFIX = "stacked_base"
+# #1233: гейт сам разрешил конфликт названного класса и обновил ветку.
+BASE_AUTOMERGE_PREFIX = "base_automerged"
 STACK_UNKNOWN_PREFIX = "stack_unknown"
 # Deliberately NOT in TRANSIENT_GATE_PREFIXES: a stack whose order does not
 # follow from ancestry has nothing to wait for, and a wait would be mutual and
@@ -2719,6 +2771,10 @@ TRANSIENT_GATE_PREFIXES = (
     PR_DRAFT_PREFIX,
     STACKED_BASE_PREFIX,
     STACK_UNKNOWN_PREFIX,
+    # #1233: база слита в ветку и запушена, конфликта больше нет — доставка
+    # состоится следующим циклом. Решать человеку нечего, а needs_decision
+    # здесь стоил бы ровно того вердикта, который задача и снимает.
+    BASE_AUTOMERGE_PREFIX,
     # #1116 (по ревью): мерж СОСТОЯЛСЯ, а подтвердить его не вышло. Раньше
     # это давало обычный merge_failed и уводило к человеку задачу, код
     # которой уже лежит в базовой ветке: PR открыт, реестр пуст, решать
@@ -2834,6 +2890,116 @@ def _merge_sha_or_detail(merge_sha: str, detail: str) -> str:
     return detail if re.fullmatch(r"[0-9a-f]{7,40}", detail or "") else ""
 
 
+async def base_automerge_step(
+    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
+) -> tuple[str, str]:
+    """Разрешить конфликт с базой самому — только названного класса (#1233).
+
+    Возвращает ``(отказ, причина)``. Непустой отказ — временный: база слита в
+    ветку и запушена, доставка повторится следующим циклом. Пустой отказ с
+    непустой причиной — класс не наш, и причина уезжает в merge_failed, чтобы
+    человек прочитал не «GitHub отказал», а ЧТО именно не сложилось (AC-4).
+    Пусто и там и там — конфликта не видно или спросить не удалось: обычный
+    отказ доставки, ничего не выдумываем.
+
+    Класс сужен нарочно: только хвостовые добавления с обеих сторон
+    (hub/services/base_merge.py). 09.09.2026 три ветки — #1206, #1208, #1216 —
+    дописывали тесты в конец одного файла, и каждая такая мелочь стоила круга
+    ревью. Смысловой конфликт (#1204) обязан остаться человеческим, и остаётся:
+    у него непустая секция общего предка.
+
+    Автомерж НИКОГДА не молчалив и НИКОГДА не верит хвосту вывода: что именно
+    сложено, пишется в карточку, а валидация после разрешения судится по коду
+    возврата — 09.09 дважды видели «All checks passed» при коде 2.
+    """
+    from hub.db import deserialize_str_list
+    from hub.services import validation_run
+
+    task_id = task["id"]
+    branch = (task.get("branch") or "").strip()
+    workspace = ctx.get("repo")
+    base = git_ops_mod._resolve_base(ctx.get("base_branch"))
+    if not branch or not workspace:
+        return "", ""
+    files, why = await plugins.git_ops.base_merge_conflicts(
+        workspace, base, branch, task_id
+    )
+    if files is None:
+        # «Посмотреть не удалось» — не «конфликта нет» и не «конфликт есть».
+        return "", f"проба мержа базы не удалась ({why})"
+    if not files:
+        # База сливается чисто: мерж отказал по другой причине, и приписывать
+        # ему конфликт значит поставить человеку неверный диагноз.
+        return "", ""
+    resolutions, note = base_merge.plan_resolution(files)
+    if not resolutions:
+        return "", f"конфликт вне класса автомержа — {note}"
+
+    commands = deserialize_str_list(task.get("validation_commands"))
+    if not commands:
+        # Нечем доказать, что сложенное вместе работает. Складывать вслепую и
+        # пушить в ветку под чужим одобрением гейт права не имеет.
+        return "", (
+            "конфликт хвостовой, но у задачи нет validation_commands — "
+            "проверить сложенное нечем, поэтому разрешает человек"
+        )
+
+    async def _validate(path: str) -> tuple[int, str] | None:
+        return await validation_run.default_validation_runner(commands, path)
+
+    ok, detail = await plugins.git_ops.push_resolved_base_merge(
+        workspace, base, branch, task_id, resolutions, _validate
+    )
+    if not ok:
+        return "", f"автомерж не состоялся: {detail}"
+    # Перезакрепление коммита сдачи — не поблажка, а точность. Этот мерж сделал
+    # САМ гейт: авторского кода в нём нет по построению, и ему не нужно
+    # доказывать это сравнением диффов. Сравнение здесь и не сработало бы —
+    # проверено делом (tests/test_delivery_gate.py): мерж базы меняет в
+    # `git diff base...tip` и строку index, и смещения ханков, даже когда
+    # авторская работа та же. Оставить старый коммит закреплённым значило бы
+    # уронить вердикт, который автомерж только что спас, — то есть отменить
+    # самого себя и всё равно взять с человека второе одобрение.
+    await repo.update_task(db, task_id, submission_sha=detail)
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Автомерж базы (#1233): конфликт с {base} разрешён «оставить оба» — "
+        f"{note}. Ничего не переписано, авторский блок остался первым. "
+        f"Валидация после разрешения прогнана и зелёная по коду возврата: "
+        f"{'; '.join(commands)}. Коммит мержа {detail[:12]}, и коммит сдачи "
+        f"перезакреплён на него: этот коммит сделал гейт, авторского кода в "
+        f"нём нет. Доставка повторится следующим циклом.",
+    )
+    return (
+        f"{BASE_AUTOMERGE_PREFIX}: конфликт с базой был из хвостовых добавлений "
+        f"и разрешён гейтом ({note}); валидация зелёная, ветка обновлена "
+        f"коммитом {detail[:12]} — доставка повторится следующим циклом"
+    ), ""
+
+
+async def refusal_after_automerge(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    merge_detail: str,
+) -> str:
+    """Отказ доставки после того, как автомерж сказал своё слово (#1233).
+
+    Временный отказ, если гейт разрешил конфликт сам, и обычный merge_failed
+    иначе — но с НАЗВАННОЙ причиной, почему автомерж не применён. Человек,
+    которого зовут, обязан читать «обе стороны правят одни и те же строки», а
+    не «GitHub отказал в мерже»: второе не ведёт никуда.
+    """
+    healed, cause = await base_automerge_step(db, task, ctx)
+    if healed:
+        return healed
+    detail = _merge_failure_detail(merge_detail)
+    return f"{detail}. Автомерж не применён: {cause}" if cause else detail
+
+
 async def merge_before_completion(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -2934,7 +3100,10 @@ async def merge_before_completion(
             forge=ctx.get("forge", ""),
         )
         if not merged:
-            return False, _merge_failure_detail(merge_detail)
+            # #1233: прежде чем звать человека — не тот ли это класс конфликта,
+            # который разрешается однозначно. Спрашивается ТОЛЬКО после отказа
+            # мержа: у зелёной доставки нет причины платить за пробу.
+            return False, await refusal_after_automerge(db, task, ctx, merge_detail)
 
         # The commit THIS pull request produced — never the branch tip,
         # which is whatever landed last (#534, review round 3).
