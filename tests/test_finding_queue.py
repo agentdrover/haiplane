@@ -1227,3 +1227,132 @@ async def test_the_snapshot_addresses_twins_by_the_full_report(
         "получил бы uid первого — уже разобранного"
     )
     assert snapshot["items"][0]["finding_index"] == 1
+
+
+async def test_the_report_names_the_two_different_default_windows(
+    db: aiosqlite.Connection, capsys
+):
+    """#1171: два дефолта окна названы, а не оставлены совпадать на глаз.
+
+    У команды разбора дефолт 60 дней (окно приёмки «0 из 29 отчётов»), у
+    страницы ``/metrics``, дайджеста и ``hub_practice_metrics`` — 90. Пока это
+    расхождение не было помечено нигде, оператор по доке запускал ``report``,
+    открывал голую страницу метрик и сверял под одним словом «precision»
+    числа за РАЗНЫЕ периоды. Разбор одной и той же находки при этом виден с
+    одной стороны и не виден с другой — что здесь и воспроизводится.
+    """
+    import importlib.util
+    from pathlib import Path as _Path
+
+    from hub.services.finding_report import disposition_report
+    from hub.services.orchestration import (
+        PRACTICE_METRICS_DEFAULT_DAYS,
+        practice_metrics,
+    )
+
+    await _task(db, 76, "completed", 1)
+    await _report(db, 136, 76, 1, [_finding("между окнами")])
+    # Отчёт лежит МЕЖДУ двумя дефолтами: старше 60 дней, моложе 90.
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=datetime('now','-70 days') WHERE id=136"
+    )
+    await _judge(db, 136, 76, 0, "uid-70", "fixed")
+    await db.commit()
+
+    report = await disposition_report(db, since_days=60, minimum=1, with_evidence=False)
+    page = (await practice_metrics(db, since_days=PRACTICE_METRICS_DEFAULT_DAYS))[
+        "machine_reviews"
+    ]["dispositions"]
+    assert report["judged_window"]["overall"]["judged"] == 0
+    assert page["judged"] == 1, (
+        "та же диспозиция: за 60 дней её не видно, за 90 видно — окна разные"
+    )
+    assert report["metrics_page_since_days"] == PRACTICE_METRICS_DEFAULT_DAYS
+    assert report["window_matches_metrics_page"] is False
+
+    spec = importlib.util.spec_from_file_location(
+        "fqr_windows",
+        _Path(__file__).resolve().parents[1] / "scripts" / "finding_queue_report.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module._print_report(report)
+    out = capsys.readouterr().out
+    assert "/metrics?since_days=60" in out, (
+        "расхождение окон без ссылки, по которой числа сходятся, — не ответ"
+    )
+    assert f"по умолчанию {PRACTICE_METRICS_DEFAULT_DAYS}" in out
+
+    # То же окно — сверять нечего, и строки нет: предупреждение на каждом
+    # прогоне становится фоном, который перестают читать.
+    same = await disposition_report(
+        db, since_days=PRACTICE_METRICS_DEFAULT_DAYS, minimum=1, with_evidence=False
+    )
+    assert same["window_matches_metrics_page"] is True
+    module._print_report(same)
+    assert "/metrics?since_days=" not in capsys.readouterr().out
+
+
+def test_the_doc_does_not_promise_the_same_number_across_different_windows():
+    """Дока — тоже поверхность, и она утверждала равенство без условия.
+
+    Строка «то же число, что на странице метрик» стояла прямо под командой с
+    ``--since-days 60``, а дефолт страницы — 90: читатель сверял разные
+    периоды по прямому указанию доки. Тест держит и оговорку, и оба дефолта
+    названными.
+    """
+    from pathlib import Path as _Path
+
+    from hub.services.orchestration import PRACTICE_METRICS_DEFAULT_DAYS
+
+    text = (
+        _Path(__file__).resolve().parents[1] / "docs" / "findings-disposition-pass.md"
+    ).read_text(encoding="utf-8")
+    assert "при том же N" in text, (
+        "«то же число» без условия равенства окон — обещание, которого код не даёт"
+    )
+    assert f"дефолт `{PRACTICE_METRICS_DEFAULT_DAYS}`" in text, (
+        "дефолт страницы обязан быть назван рядом с дефолтом команды"
+    )
+    assert "/metrics?since_days=60" in text
+
+
+async def test_the_default_report_carries_the_evidence_section(
+    db: aiosqlite.Connection, tmp_path: Path
+):
+    """#1171: ветка ``with_evidence=True`` — ДЕФОЛТНАЯ, и она не исполнялась.
+
+    Каждый тест отчёта звал ``disposition_report`` с ``with_evidence=False``,
+    поэтому подстановка ``unknown`` в отчёт не проверялась ничем: замена этой
+    ветки на ``None`` оставляла весь набор зелёным, а дефолтный прогон CLI
+    терял секцию «судить не по чему» — то самое число, на котором держится
+    условие пересмотра задачи (доля unknown выше 0.4). Агрегат считается своим
+    тестом; здесь проверяется, что он доезжает до отчёта тем путём, которым
+    его запускает оператор.
+    """
+    from hub.services.finding_report import disposition_report, unknown_breakdown
+
+    clone = _init_repo(tmp_path / "default-evidence")
+    baseline = _sha(clone)
+    known = await _task_on_clone(db, clone, title="факт вычислим")
+    await _report_on(db, known, generation=1, sha=baseline)
+    await repo.update_task(db, known, submission_generation=1)
+    _write_numbered(clone / _FILE, tweak=5)
+    _repo_git(clone, "add", "-A")
+    _repo_git(clone, "commit", "-m", "тронул названные строки")
+    await _task(db, 77, "completed", 1)
+    await _report(db, 137, 77, 1, [_finding("клона нет")])
+    await db.commit()
+
+    report = await disposition_report(db, since_days=60, minimum=1)
+    assert report["unknown"] == await unknown_breakdown(db), (
+        "дефолтный отчёт обязан нести тот же разбор unknown, что и агрегат"
+    )
+    assert report["unknown"]["unknown"] == 1
+    assert report["unknown"]["share"] == 0.5
+    assert report["unknown"]["reasons"][0]["reason"], (
+        "причина у unknown обязана доехать: без неё секция — молчание (#762)"
+    )
+
+    off = await disposition_report(db, since_days=60, minimum=1, with_evidence=False)
+    assert off["unknown"] is None, "ключ --no-evidence по-прежнему называет пропуск"

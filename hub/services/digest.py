@@ -36,6 +36,7 @@ from hub import config
 from hub.db import fetchall
 from hub import repository as repo
 from hub.services.gate_events import STEWARD_JUDGEMENT
+from hub.services.orchestration import PRACTICE_METRICS_DEFAULT_DAYS
 from hub.services.project_policy import DELEGATED_VERDICTS
 
 log = logging.getLogger(__name__)
@@ -210,9 +211,10 @@ def _policy_delegates(gate_policy_raw: str | None) -> bool:
 _DEBT_WINDOW = "-90 days"
 
 # Окно, за которое дайджест спрашивает про precision. То же, что у страницы
-# метрик по умолчанию (``hub_practice_metrics(since_days=90)``): если бы оно
-# отличалось, дайджест и страница называли бы разные precision одним словом.
-_PRECISION_WINDOW_DAYS = 90
+# метрик по умолчанию (``hub_practice_metrics``): если бы оно отличалось,
+# дайджест и страница называли бы разные precision одним словом. Берётся
+# КОНСТАНТОЙ, а не своей девяносткой: копия разошлась бы с оригиналом молча.
+_PRECISION_WINDOW_DAYS = PRACTICE_METRICS_DEFAULT_DAYS
 
 
 # The payload key the steward section lives under, and the question a reader
@@ -299,12 +301,14 @@ async def findings_queue_section(db: aiosqlite.Connection) -> dict:
     функции, что считает precision для страницы метрик, а не из своего
     запроса, который разошёлся бы с ней молча (#518).
     """
+    from hub.services.finding_report import judged_all_time
     from hub.services.orchestration import practice_metrics
 
     counted = await repo.count_unjudged_findings(db)
     disp = (await practice_metrics(db, since_days=_PRECISION_WINDOW_DAYS))[
         "machine_reviews"
     ]["dispositions"]
+    all_time = await judged_all_time(db)
     return {
         "findings": int(counted["findings"]),
         "reports": int(counted["reports"]),
@@ -318,6 +322,14 @@ async def findings_queue_section(db: aiosqlite.Connection) -> dict:
         "judged": int(disp["judged"]),
         "precision": disp["precision"],
         "precision_window_days": _PRECISION_WINDOW_DAYS,
+        # Разбор СТОКА виден только здесь. Оконное ``judged`` считает
+        # диспозиции по дате ОТЧЁТА, и разбор запаса — отчётов старше окна —
+        # в него не попадает вовсе: наутро после того, как разобрали все 105
+        # находок очереди, оконное число снова ноль. Строка «диспозиций нет
+        # вовсе», выведенная из него, была бы ложью о состоянии, которое хаб
+        # уже знает (#516/#549). Секция про сток — значит и про разбор стока.
+        "judged_all_time": all_time["judged"],
+        "precision_all_time": all_time["precision"],
     }
 
 

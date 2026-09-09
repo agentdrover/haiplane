@@ -535,7 +535,7 @@ async def test_the_digest_stops_claiming_precision_is_uncomputable(
     assert section["judged"] == 0
     assert section["precision"] is None
     page = (await client.get("/digests")).text
-    assert "Ни одной диспозиции ещё нет" in page
+    assert "Ни одной диспозиции нет" in page
     assert "precision не считается вовсе" in page, "нулевой разбор назван честно"
 
     # Одна находка разобрана, вторая ждёт — очередь непуста, precision есть.
@@ -568,3 +568,76 @@ async def test_the_digest_stops_claiming_precision_is_uncomputable(
     assert section["precision_window_days"] == 90, (
         "окно precision совпадает с окном страницы метрик"
     )
+
+
+async def test_the_digest_does_not_call_a_judged_stock_zero(
+    db: aiosqlite.Connection, client: AsyncClient
+):
+    """#1171: разбор СТОКА не читается как «диспозиций нет вовсе».
+
+    ``practice_metrics`` берёт диспозиции по дате ОТЧЁТА, поэтому суждение,
+    вынесенное сегодня о находке из отчёта трёхмесячной давности, в оконный
+    срез не попадает. Очередь #1171 — запас за год; наутро после того, как её
+    разобрали, оконное ``judged`` снова ноль, и безусловная ветка шаблона
+    утверждала, что числа нет вовсе, когда хаб его уже знает. Тот же класс
+    #516/#549, что закрыт для оконного случая, и тот же вход, что у CLI в
+    ``test_judging_the_old_stock_is_not_read_as_zero``.
+    """
+    _pid, feature = await _autopilot_project(db, "spike-old-stock")
+    approved = await _policy_approved_task(db, feature, "auto one")
+    await _confirmed_report(db, 903, approved, findings=2)
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=datetime('now','-100 days') WHERE id=903"
+    )
+    await db.execute(
+        "INSERT INTO finding_dispositions (review_id, task_id, "
+        "submission_generation, finding_index, finding_uid, disposition, "
+        "decided_by) VALUES (903, ?, 1, 0, 'uid-old', 'fixed', 'denis')",
+        (approved,),
+    )
+    await db.commit()
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    section = json.loads((await repo.list_digests(db))[0]["payload"])["findings_queue"]
+    assert section["judged"] == 0, "оконный срез не трогаем: по нему считает /metrics"
+    assert section["judged_all_time"] == 1, (
+        "разобранная находка старого стока обязана быть видна хоть одним числом"
+    )
+    assert section["precision_all_time"] == 1.0
+
+    flat = re.sub(r"\s+", " ", (await client.get("/digests")).text)
+    assert "precision не считается вовсе" not in flat, (
+        "диспозиция записана, а дайджест утверждает, что числа нет вовсе"
+    )
+    assert "за всё время разобрано 1 — precision 1.0 по ним" in flat, (
+        "ставка едет с размером выборки рядом (#1153)"
+    )
+    assert "За окно 90 дней диспозиций нет" in flat, (
+        "оконный ноль остаётся названным: он не отменяется разбором стока"
+    )
+
+
+async def test_a_wholly_unjudged_queue_still_says_precision_is_uncomputable(
+    db: aiosqlite.Connection, client: AsyncClient
+):
+    """Честность в обе стороны: когда не разобрано НИЧЕГО, так и сказано.
+
+    Без этого теста починку предыдущего можно было бы сделать, просто убрав
+    строку «precision не считается вовсе»: она правдива ровно тогда, когда ни
+    за окно, ни за всё время не разобрано ни одной находки.
+    """
+    _pid, feature = await _autopilot_project(db, "spike-nothing")
+    approved = await _policy_approved_task(db, feature, "auto one")
+    await _confirmed_report(db, 904, approved, findings=2)
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=datetime('now','-100 days') WHERE id=904"
+    )
+    await db.commit()
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    section = json.loads((await repo.list_digests(db))[0]["payload"])["findings_queue"]
+    assert section["judged_all_time"] == 0
+    assert section["precision_all_time"] is None
+    flat = re.sub(r"\s+", " ", (await client.get("/digests")).text)
+    assert "ни за окно 90 дней, ни за всё время" in flat
+    assert "precision не считается вовсе" in flat, "нулевой разбор назван честно"

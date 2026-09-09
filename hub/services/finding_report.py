@@ -42,7 +42,10 @@ import aiosqlite
 from hub import repository as repo
 from hub.services.finding_evidence import OUTCOME_UNKNOWN, evidence_for_report
 from hub.services.finding_identity import finding_uids
-from hub.services.orchestration import practice_metrics
+from hub.services.orchestration import (
+    PRACTICE_METRICS_DEFAULT_DAYS,
+    practice_metrics,
+)
 
 #: Сколько разобранных находок нужно, чтобы отвечать по профилю. Порог из
 #: постановки #1171: ниже него ответ «deep против lite» не даётся, а называется
@@ -186,6 +189,14 @@ async def disposition_report(
     return {
         "since_days": since_days,
         "minimum_per_slice": minimum,
+        # Окно СТРАНИЦЫ метрик, а не своё. У скрипта дефолт 60 (окно приёмки
+        # #1171 «0 из 29»), у страницы и MCP — 90, и до сих пор эти два
+        # дефолта не были помечены нигде: оператор запускал ``report`` и
+        # открывал ``/metrics``, получая под одним словом «precision» числа за
+        # разные периоды. Отчёт теперь называет оба и ссылку, по которой они
+        # совпадают.
+        "metrics_page_since_days": PRACTICE_METRICS_DEFAULT_DAYS,
+        "window_matches_metrics_page": since_days == PRACTICE_METRICS_DEFAULT_DAYS,
         # Сток. Не оконный — и подписан так, чтобы окно из заголовка не
         # прочиталось как его окно.
         "stock": {
@@ -368,3 +379,25 @@ def compare_recheck(
         "limit": RECHECK_DIVERGENCE_LIMIT,
         "stamped": bool(share is not None and share > RECHECK_DIVERGENCE_LIMIT),
     }
+
+
+async def judged_all_time(db: aiosqlite.Connection) -> dict[str, Any]:
+    """Разбор за ВСЁ ВРЕМЯ: сколько находок отвечено и какой у них precision.
+
+    Один вход для поверхностей, которые говорят про СТОК (#1171): дайджест и
+    сторож поллера. Обе называют очередь за всё время — запас не оконный, —
+    и обе до этого судили о том, есть ли вообще диспозиции, по ОКОННОМУ
+    числу. Это две разные величины: ``practice_metrics`` берёт диспозиции по
+    дате ОТЧЁТА, поэтому разбор старого стока в окно не попадает вовсе, и
+    наутро после того, как весь запас разобрали, оконное число снова ноль.
+    Утверждение «диспозиций нет вовсе», выведенное из него, — ложь о
+    состоянии, которое хаб уже знает: тот же класс #516/#549, что закрыт в
+    отчёте скрипта (``judged_all_time``) и в шаблоне дайджеста.
+
+    Считает не своим запросом, а тем же ``practice_metrics``, только с окном
+    ``ALL_TIME_DAYS``: второй расчёт разошёлся бы с первым молча (#518).
+    """
+    disp = (await practice_metrics(db, since_days=ALL_TIME_DAYS))["machine_reviews"][
+        "dispositions"
+    ]
+    return {"judged": int(disp["judged"]), "precision": disp["precision"]}

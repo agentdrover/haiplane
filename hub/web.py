@@ -1634,7 +1634,10 @@ async def web_findings_queue(
 
 
 @router.get("/metrics", response_class=HTMLResponse)
-async def web_metrics(request: Request, since_days: int = Query(default=90, ge=1)):
+async def web_metrics(
+    request: Request,
+    since_days: int = Query(default=services.PRACTICE_METRICS_DEFAULT_DAYS, ge=1),
+):
     """Practice metrics page (#384)."""
     data = await services.practice_metrics(_db(request), since_days=since_days)
     return TEMPLATES.TemplateResponse(request, "metrics.html", {"m": data})

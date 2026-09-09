@@ -445,3 +445,109 @@ async def test_unjudged_queue_watchdog_alerts(db):
         await db.commit()
         await _sweep_unjudged_findings(db)
         assert await _alerts() == [], "нулевой порог выключает сторожа, а не молчит зря"
+
+
+async def test_the_watchdog_does_not_claim_precision_is_uncomputable_when_it_is(db):
+    """#1171: сторож называет разбор, а не лозунг.
+
+    Дневная строка сторожа безусловно заканчивалась словами «Без ответа
+    precision не считается вовсе» — и продолжала это утверждать после того,
+    как часть очереди разобрали и precision стал числом. Непустая очередь и
+    «precision нет» — РАЗНЫЕ факты: precision это ``real/judged`` по
+    разобранным. Тот же класс #516/#549, что закрыли в шаблоне дайджеста;
+    сторож остался с ним, потому что живёт в другом файле. Считается разбор
+    за ВСЁ ВРЕМЯ: очередь сторожа не оконная.
+    """
+    import json as json_module
+
+    from hub import config
+    from hub.db import fetchall
+    from hub.poller import UNJUDGED_FINDINGS_ALERT, _sweep_unjudged_findings
+
+    findings = [_FINDINGS[0] | {"title": f"находка {n}"} for n in range(3)]
+    await db.execute(
+        "INSERT INTO tasks (id, title, status, submission_generation) "
+        "VALUES (778, 'очередь', 'completed', 1)"
+    )
+    await db.execute(
+        "INSERT INTO machine_reviews (id, task_id, submission_generation, "
+        "findings_confirmed) VALUES (6, 778, 1, ?)",
+        (json_module.dumps(findings, ensure_ascii=False),),
+    )
+    # Отчёт старше окна практики: разбор такого стока в оконное число не
+    # попадает вовсе, и сторож, спросивший про окно, снова сказал бы «нет».
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=datetime('now','-100 days') WHERE id=6"
+    )
+    await db.execute(
+        "INSERT INTO finding_dispositions (review_id, task_id, "
+        "submission_generation, finding_index, finding_uid, disposition, "
+        "decided_by) VALUES (6, 778, 1, 0, 'uid-judged', 'fixed', 'denis')"
+    )
+    await db.commit()
+
+    async def _line() -> str:
+        rows = await fetchall(
+            db,
+            "SELECT summary FROM activity_log WHERE kind=?",
+            (UNJUDGED_FINDINGS_ALERT,),
+        )
+        return dict(rows[-1])["summary"]
+
+    async def _payload() -> dict:
+        rows = await fetchall(
+            db, "SELECT payload FROM events WHERE kind=?", (UNJUDGED_FINDINGS_ALERT,)
+        )
+        return json_module.loads(dict(rows[-1])["payload"])
+
+    with patch.object(config, "UNJUDGED_FINDINGS_ALERT_THRESHOLD", 2):
+        await _sweep_unjudged_findings(db)
+
+    line = await _line()
+    assert "precision не считается вовсе" not in line, (
+        "диспозиция записана, а сторож утверждает, что числа нет вовсе"
+    )
+    assert "Разобрано за всё время 1 — precision 1.0 по ним." in line, (
+        "ставка едет с размером выборки рядом (#1153)"
+    )
+    assert "2 подтверждённых без диспозиции" in line, (
+        "тревога про очередь остаётся тревогой: число ждущих не потерялось"
+    )
+    payload = await _payload()
+    assert payload["judged_all_time"] == 1, "канал-будильник знает то же, что строка"
+    assert payload["precision_all_time"] == 1.0
+    assert payload["findings"] == 2, "порог и очередь не тронуты"
+
+
+async def test_the_watchdog_says_precision_is_uncomputable_when_nothing_is_judged(db):
+    """Честность в обе стороны: без единой диспозиции строка правдива.
+
+    Без этого теста предыдущий закрывался бы удалением фразы, а не разбором
+    условия, при котором она верна.
+    """
+    import json as json_module
+
+    from hub import config
+    from hub.db import fetchall
+    from hub.poller import UNJUDGED_FINDINGS_ALERT, _sweep_unjudged_findings
+
+    findings = [_FINDINGS[0] | {"title": f"находка {n}"} for n in range(3)]
+    await db.execute(
+        "INSERT INTO tasks (id, title, status, submission_generation) "
+        "VALUES (779, 'очередь', 'completed', 1)"
+    )
+    await db.execute(
+        "INSERT INTO machine_reviews (id, task_id, submission_generation, "
+        "findings_confirmed) VALUES (7, 779, 1, ?)",
+        (json_module.dumps(findings, ensure_ascii=False),),
+    )
+    await db.commit()
+
+    with patch.object(config, "UNJUDGED_FINDINGS_ALERT_THRESHOLD", 2):
+        await _sweep_unjudged_findings(db)
+
+    rows = await fetchall(
+        db, "SELECT summary FROM activity_log WHERE kind=?", (UNJUDGED_FINDINGS_ALERT,)
+    )
+    line = dict(rows[-1])["summary"]
+    assert "Ни одной диспозиции нет, поэтому precision не считается вовсе." in line

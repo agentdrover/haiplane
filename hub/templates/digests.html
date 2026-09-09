@@ -87,8 +87,20 @@
         {{ d.data.findings_queue.precision }} по ним
         (окно {{ d.data.findings_queue.precision_window_days }} дней,
         <a href="/metrics">метрики</a>).</p>
+        {% elif d.data.findings_queue.judged_all_time %}
+        {# #1171: разбор СТОКА в оконное число не попадает — практика считает
+           диспозиции по дате ОТЧЁТА, и наутро после разбора запаса окно снова
+           пусто. «Диспозиций нет вовсе» здесь было бы ложью о том, что хаб
+           уже знает: за окно их нет, за всё время есть. Названы оба. #}
+        За окно {{ d.data.findings_queue.precision_window_days }} дней диспозиций
+        нет, но разбор старого стока в это окно и не попадает: за всё время
+        разобрано {{ d.data.findings_queue.judged_all_time }} — precision
+        {{ d.data.findings_queue.precision_all_time }} по ним
+        (<a href="/metrics">метрики</a> считают за окно).</p>
         {% else %}
-        Ни одной диспозиции ещё нет, поэтому precision не считается вовсе.</p>
+        Ни одной диспозиции нет ни за окно
+        {{ d.data.findings_queue.precision_window_days }} дней, ни за всё время,
+        поэтому precision не считается вовсе.</p>
         {% endif %}
     {% endif %}
 

@@ -1231,7 +1231,18 @@ UNJUDGED_FINDINGS_ALERT = "unjudged_findings_alert"
 
 
 async def _sweep_unjudged_findings(db) -> None:
-    """Очередь выше порога говорит вслух — числом и ссылкой (#1171)."""
+    """Очередь выше порога говорит вслух — числом и ссылкой (#1171).
+
+    Про precision сторож говорит то, что ЕСТЬ, а не лозунг. Непустая очередь
+    и «precision не считается» — разные факты: precision это ``real/judged``
+    по РАЗОБРАННЫМ, и первая же диспозиция делает его числом, сколько бы
+    находок ни ждало рядом. Безусловная строка «Без ответа precision не
+    считается вовсе» после частичного разбора утверждала, что числа нет,
+    когда оно есть, — тот же класс #516/#549, что закрыт в шаблоне дайджеста;
+    сторож остался с ним просто потому, что живёт в другом файле. Считается
+    разбор ЗА ВСЁ ВРЕМЯ: очередь сторожа не оконная, и оконное ``judged``
+    ответило бы ноль наутро после разбора всего запаса.
+    """
     threshold = config.UNJUDGED_FINDINGS_ALERT_THRESHOLD
     if threshold <= 0:
         return  # порог снят настройкой — сторож выключен, а не «молчит»
@@ -1243,6 +1254,9 @@ async def _sweep_unjudged_findings(db) -> None:
         db, UNJUDGED_FINDINGS_ALERT, "-1 day"
     ):  # уже сказано в этих сутках
         return
+    from hub.services.finding_report import judged_all_time
+
+    judged = await judged_all_time(db)
     await repo.insert_event(
         db,
         kind=UNJUDGED_FINDINGS_ALERT,
@@ -1252,15 +1266,26 @@ async def _sweep_unjudged_findings(db) -> None:
             "reports": int(counted["reports"]),
             "threshold": threshold,
             "queue": "/findings",
+            "judged_all_time": judged["judged"],
+            "precision_all_time": judged["precision"],
         },
     )
     await db.commit()
+    # Ставка едет с размером выборки — правило #1153.
+    verdict = (
+        f"Разобрано за всё время {judged['judged']} — precision "
+        f"{judged['precision']} по ним."
+        if judged["judged"]
+        else "Ни одной диспозиции нет, поэтому precision не считается вовсе."
+    )
     await log_activity(
         db,
         UNJUDGED_FINDINGS_ALERT,
-        f"Очередь находок: {findings} подтверждённых без диспозиции "
-        f"в {counted['reports']} отчётах (порог {threshold}) — /findings. "
-        "Без ответа precision не считается вовсе."[:200],
+        (
+            f"Очередь находок: {findings} подтверждённых без диспозиции "
+            f"в {counted['reports']} отчётах (порог {threshold}) — /findings. "
+            f"{verdict}"
+        )[:200],
     )
     log.warning(
         "Poll: %d unjudged findings in %d reports (threshold %d) — /findings",

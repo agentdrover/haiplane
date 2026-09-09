@@ -91,6 +91,18 @@ def _print_report(report: dict) -> None:
         f"порог ответа по срезу — {minimum} находок)",
         report["judged_window"],
     )
+    if not report["window_matches_metrics_page"]:
+        # Два дефолта, ничем не помеченные, читаются как один: у скрипта 60,
+        # у страницы и MCP — 90. Оператор сверял бы «то же число» за разные
+        # периоды. Расхождение называется здесь, вместе со ссылкой, по
+        # которой числа сходятся.
+        page = report["metrics_page_since_days"]
+        print(
+            f"  окно этой команды — {flow['since_days']} дней, у страницы "
+            f"/metrics и hub_practice_metrics по умолчанию {page}: "
+            f"сверять с /metrics?since_days={flow['since_days']}, "
+            "иначе под одним словом precision сравниваются разные периоды"
+        )
     print()
     _print_judged(
         f"РАЗБОР ЗА ВСЁ ВРЕМЯ (окно не применяется; порог — {minimum} находок)",
