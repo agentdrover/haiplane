@@ -297,6 +297,7 @@ def test_the_steward_cannot_approve_its_own_boundaries():
 
     steward_modules = [
         "hub/services/steward_apply.py",
+        "hub/services/steward_applied.py",
         "hub/services/steward_dispatch.py",
         "hub/services/steward_evidence.py",
         "hub/services/steward_judgement.py",

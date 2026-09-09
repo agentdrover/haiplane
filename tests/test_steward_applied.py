@@ -15,12 +15,30 @@ from fastapi import HTTPException
 from hub import config
 from hub import repository as repo
 from hub.models import ReviewVerdict, TaskReviewVerdict
+from hub.models import (
+    ACTestResultView,
+    AcceptanceCriterion,
+    ACVerifiableBy,
+    CIRunReportState,
+    EvidenceCoverage,
+    LiveCheckState,
+    MachineReviewView,
+    PrepassState,
+    TaskStatus,
+)
 from hub.services.steward_applied import (
     APPLIED,
     ESCALATED_TO_HUMAN,
     RETURNED,
+    SELF_APPROVAL_FORBIDS,
+    SELF_APPROVAL_SIGNALS,
+    SelfApproval,
     apply_judgement,
+    approve_without_a_human,
+    self_approval,
+    self_approval_for,
 )
+from hub.services.steward_evidence import ReviewBrief
 from tests.test_steward_shadow import _project, _task
 
 
@@ -314,3 +332,444 @@ async def _budget_alerts(db: aiosqlite.Connection, task_id: int) -> int:
         (task_id,),
     )
     return sum(1 for r in rows if "Бюджет циклов ревью исчерпан" in dict(r)["content"])
+
+
+# ---------------------------------------------------------------------------
+# #1231 — самостоятельное одобрение по сошедшемуся набору свидетельств
+# ---------------------------------------------------------------------------
+
+_SHA_1231 = "b" * 40
+
+
+def _brief(**over) -> ReviewBrief:
+    """Сдача #1164/#1216 от 09.09.2026: набор, который сошёлся ЦЕЛИКОМ.
+
+    Заводится целиком и портится ровно в одном месте каждым тестом ниже —
+    тот же приём, которым проверяется привратник (#1147): тест, где чисто
+    всё, кроме проверяемого, отличает сработавшее правило от несобранного
+    брифа. Тест, начинающийся с пустого брифа, «поймал» бы любой признак
+    любой проверкой.
+    """
+    mr_over = over.pop("machine_review_fields", {})
+    fields: dict = dict(
+        task_id=1231,
+        title="сдача, у которой всё сошлось",
+        status=TaskStatus.review,
+        submission_generation=1,
+        submission_sha=_SHA_1231,
+        sha_check="match",
+        sha_check_reason="вершина ветки и закреплённый коммит совпадают",
+        machine_review=MachineReviewView(
+            **{
+                "id": 322,
+                "task_id": 1231,
+                "submission_generation": 1,
+                "is_current": True,
+                "incomplete": False,
+                "lost_dimensions": [],
+                "self_reviewed": False,
+                "submitted_by": "cursor-cloud-reviewer",
+                **mr_over,
+            }
+        ),
+        prepass=PrepassState(state="covered", head_sha=_SHA_1231, passed=["lint"]),
+        ci_run_report=CIRunReportState(state="current", head_sha=_SHA_1231),
+        acceptance_criteria=[
+            AcceptanceCriterion(
+                id="AC-1",
+                given="сошедшийся набор",
+                when="стюард выносит суждение",
+                then="APPROVED без человека",
+                verifiable_by=ACVerifiableBy.test,
+                test_ref="tests/test_steward_applied.py::x",
+            )
+        ],
+        ac_test_results=[
+            ACTestResultView(ac_id="AC-1", status="pass", is_current=True)
+        ],
+        evidence_coverage=EvidenceCoverage(
+            state="complete",
+            headline="every applicable evidence block produced a signal",
+        ),
+        live_check=LiveCheckState(state="done", observation="прод отвечает"),
+    )
+    fields.update(over)
+    return ReviewBrief(**fields)
+
+
+def _decide(**over) -> SelfApproval:
+    return self_approval(
+        _brief(**over), diff_paths=["hub/services/x.py"], reviewer_reachable=True
+    )
+
+
+async def test_a_fully_evidenced_submission_is_approved_without_a_human():
+    """AC-1: сошёлся весь набор — одобрение самостоятельное, и оно названо.
+
+    Проверяется не только «разрешено», но и ПЕРЕЧЕНЬ: одобрение, не
+    назвавшее оснований, человек на спот-чеке проверить не может, а
+    правило без перечня нельзя ни расширить, ни отозвать по причине.
+    """
+    decision = _decide()
+
+    assert decision.allowed, decision.reason
+    assert decision.missing == ()
+    assert decision.forbidden == ()
+    assert decision.converged == SELF_APPROVAL_SIGNALS, (
+        "решение обязано стоять на ВСЕХ восьми признаках поимённо: "
+        "одобрение без перечня оснований нечем проверить"
+    )
+    assert len(SELF_APPROVAL_SIGNALS) == 8
+
+
+async def test_each_missing_signal_names_itself_and_calls_a_human():
+    """AC-2: ровно один признак не сошёлся — к человеку, и назван ИМЕННО он.
+
+    Восемь прогонов, а не один общий: каждая порча трогает свой признак и
+    обязана уронить именно его. Тест, проверяющий «не одобрено», пережил бы
+    снятие любой из восьми проверок — правило требует «названо это», а не
+    «не зелёное».
+    """
+    spoilers: dict[str, dict] = {
+        "report_is_current": {"machine_review_fields": {"is_current": False}},
+        "no_confirmed_findings": {
+            "machine_review_fields": {
+                "findings_confirmed": [{"title": "гонка", "severity": "high"}]
+            }
+        },
+        "no_unresolved_findings": {
+            "machine_review_fields": {
+                "unresolved": [
+                    {"title": "не рассудили", "why": "адъюдикаторы разошлись"}
+                ]
+            }
+        },
+        "report_is_whole": {"machine_review_fields": {"incomplete": True}},
+        "reviewed_by_someone_else": {"machine_review_fields": {"self_reviewed": True}},
+        "checks_ran_on_the_submitted_commit": {"sha_check": "diverged"},
+        "acceptance_criteria_are_green": {
+            "ac_test_results": [
+                ACTestResultView(ac_id="AC-1", status="fail", is_current=True)
+            ]
+        },
+        "evidence_coverage_is_complete": {
+            "evidence_coverage": EvidenceCoverage(state="partial", headline="1 of 7")
+        },
+    }
+    assert set(spoilers) == set(SELF_APPROVAL_SIGNALS), (
+        "каждый признак обязан иметь СВОЮ порчу: признак, добавленный в "
+        "правило и забытый здесь, остался бы непроверенным"
+    )
+
+    for signal, spoiler in spoilers.items():
+        decision = _decide(**spoiler)
+        assert not decision.allowed, f"{signal}: набор не сошёлся, а одобрение выдано"
+        assert [code for code, _ in decision.missing] == [signal], (
+            f"{signal}: причина обязана назвать ИМЕННО этот признак, а названо "
+            f"{[code for code, _ in decision.missing]} — иначе человек ищет "
+            "причину заново"
+        )
+        assert decision.converged == tuple(
+            s for s in SELF_APPROVAL_SIGNALS if s != signal
+        ), f"{signal}: остальные семь обязаны остаться сошедшимися"
+        assert decision.missing[0][1], f"{signal}: имя без детали нечем чинить"
+
+
+async def test_absence_of_a_report_is_not_a_clean_report():
+    """Ноль находок без отчёта — это «смотреть было некому», а не чистота.
+
+    Самая дорогая подмена всего правила и причина, по которой каждый
+    читаемый из отчёта признак роняется ОТДЕЛЬНОЙ строкой: 09.09 два отчёта
+    из одиннадцати показывали ноль подтверждённых ровно потому, что один
+    был оборван, а второй сдан автором кода.
+    """
+    decision = self_approval(
+        _brief(machine_review=None), diff_paths=[], reviewer_reachable=True
+    )
+
+    assert not decision.allowed
+    named = [code for code, _ in decision.missing]
+    for signal in (
+        "report_is_current",
+        "no_confirmed_findings",
+        "no_unresolved_findings",
+        "report_is_whole",
+        "reviewed_by_someone_else",
+    ):
+        assert signal in named, (
+            f"{signal} читается из отчёта: без отчёта он обязан не сойтись, "
+            "а не промолчать"
+        )
+    assert all("отчёт" in detail for code, detail in decision.missing if code in named)
+
+
+async def test_a_report_silent_about_its_own_completeness_is_not_whole():
+    """incomplete=None — «никогда не заявляли», и это не «полон» (#549).
+
+    Отдельным тестом, потому что False и None различает одна ветка, и
+    проверка на истинность съела бы её молча: отчёт, написанный до
+    появления поля, объявил бы себя целым, ничего про это не сказав.
+    """
+    decision = _decide(machine_review_fields={"incomplete": None})
+
+    assert not decision.allowed
+    assert [code for code, _ in decision.missing] == ["report_is_whole"]
+    assert "не заявлен" in decision.missing[0][1]
+
+
+async def test_a_lost_dimension_is_not_a_whole_report():
+    """Потерянное измерение — тот же неполный отчёт другими словами (#1198)."""
+    decision = _decide(machine_review_fields={"lost_dimensions": ["security"]})
+
+    assert not decision.allowed
+    assert [code for code, _ in decision.missing] == ["report_is_whole"]
+    assert "security" in decision.missing[0][1]
+
+
+async def test_an_unrun_criterion_is_not_a_green_one():
+    """Критерий без записанного прогона — непроверенный, а не пройденный.
+
+    И результат прошлой сдачи — тоже не зелёный: он описывает код, которого
+    на ветке уже нет. Три случая одного признака перечислены, а не показаны
+    одним, потому что чинятся они по-разному.
+    """
+    no_result = _decide(ac_test_results=[])
+    assert [code for code, _ in no_result.missing] == ["acceptance_criteria_are_green"]
+    assert "не проверен" in no_result.missing[0][1]
+
+    stale = _decide(
+        ac_test_results=[
+            ACTestResultView(ac_id="AC-1", status="pass", is_current=False)
+        ]
+    )
+    assert [code for code, _ in stale.missing] == ["acceptance_criteria_are_green"]
+    assert "прошлой сдачи" in stale.missing[0][1]
+
+    untestable = _decide(acceptance_criteria=[], ac_test_results=[])
+    assert [code for code, _ in untestable.missing] == ["acceptance_criteria_are_green"]
+
+
+async def test_checks_must_have_run_on_the_commit_that_was_submitted():
+    """Признак 6 перечисляет, ЧТО разошлось: предпас, CI и вершина ветки.
+
+    Один признак и четыре разные причины: «зелёное было, но на другом
+    коммите» и «зелёного не было вовсе» чинятся по-разному, и общий текст
+    отказа заставил бы искать вслепую.
+    """
+    cases = {
+        "предпас 'unknown'": _decide(
+            prepass=PrepassState(state="unknown", reason="отчёта нет")
+        ),
+        "предпас снят на": _decide(
+            prepass=PrepassState(state="covered", head_sha="c" * 40, passed=["lint"])
+        ),
+        "отчёт CI": _decide(
+            ci_run_report=CIRunReportState(state="unknown", reason="прогона не было")
+        ),
+        "CI отчитался о": _decide(
+            ci_run_report=CIRunReportState(state="current", head_sha="d" * 40)
+        ),
+        "sha_check": _decide(sha_check="unknown"),
+        "не закрепила коммит": _decide(submission_sha=""),
+    }
+    for expected, decision in cases.items():
+        assert not decision.allowed
+        assert [code for code, _ in decision.missing] == [
+            "checks_ran_on_the_submitted_commit"
+        ], expected
+        assert expected in decision.missing[0][1], (
+            f"отказ обязан сказать, что именно разошлось: ждали {expected!r}, "
+            f"получили {decision.missing[0][1]!r}"
+        )
+
+
+async def test_the_gate_never_signs_a_change_to_its_own_rules():
+    """AC-3: запреты не снимаются никаким набором и названы ОТДЕЛЬНО.
+
+    Набор во всех трёх случаях сошёлся полностью — именно это и проверяется:
+    запрет обязан пережить полный комплект свидетельств. Настоящая такая
+    задача берётся не выдуманным путём, а перечнем ladder-поверхностей,
+    который читает и автовердикт (#1147): свой список рядом с общим означал
+    бы, что новая поверхность появится в одном месте и не появится в другом.
+    """
+    # Задача, меняющая сам путь решения гейта, — по ФАКТИЧЕСКОМУ диффу.
+    # Первой стоит НАСТОЯЩАЯ такая задача: файл, в котором живёт само это
+    # правило. Его собственная сдача обязана уехать к человеку — иначе
+    # правило умеет разрешать себе всё, что про себя перепишет.
+    for surface in (
+        "hub/services/steward_applied.py",
+        "hub/services/auto_verdict.py",
+        "hub/auth.py",
+        "hub/services/lifecycle.py",
+    ):
+        gate = self_approval(_brief(), diff_paths=[surface], reviewer_reachable=True)
+        assert not gate.allowed, surface
+        assert [code for code, _ in gate.forbidden] == ["gate_decision_path"]
+        assert gate.missing == (), (
+            "признаки сошлись все до одного: запрет обязан стоять сам по себе, "
+            "а не выглядеть как несобранное свидетельство"
+        )
+        assert gate.converged == SELF_APPROVAL_SIGNALS
+        assert surface in gate.forbidden[0][1]
+
+    # Нечитаемый дифф — не безопасный дифф.
+    blind = self_approval(_brief(), diff_paths=None, reviewer_reachable=True)
+    assert [code for code, _ in blind.forbidden] == ["gate_decision_path"]
+    assert "прочитать не удалось" in blind.forbidden[0][1]
+
+    # Постановка требует живой проверки, а её состояние unknown.
+    manual_ac = AcceptanceCriterion(
+        id="AC-9",
+        given="раскатано",
+        when="смотрят прод",
+        then="ручка отвечает",
+        verifiable_by=ACVerifiableBy.manual,
+    )
+    for live in (
+        LiveCheckState(state="unknown", reason="никто не наблюдал"),
+        LiveCheckState(state="done", sha_mismatch=True),
+    ):
+        watched = self_approval(
+            _brief(
+                acceptance_criteria=[
+                    _brief().acceptance_criteria[0],
+                    manual_ac,
+                ],
+                live_check=live,
+            ),
+            diff_paths=["hub/services/x.py"],
+            reviewer_reachable=True,
+        )
+        assert not watched.allowed
+        assert [code for code, _ in watched.forbidden] == ["live_check_unknown"]
+        assert watched.missing == ()
+
+    # Проект, где хаб не умеет позвать ревьюера.
+    unreachable = self_approval(
+        _brief(), diff_paths=["hub/services/x.py"], reviewer_reachable=False
+    )
+    assert not unreachable.allowed
+    assert [code for code, _ in unreachable.forbidden] == ["reviewer_unreachable"]
+    assert unreachable.missing == ()
+
+    assert {c for c, _ in blind.forbidden} | {
+        "live_check_unknown",
+        "reviewer_unreachable",
+    } == set(SELF_APPROVAL_FORBIDS)
+
+
+async def test_a_self_issued_approval_is_visible_and_sampled(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4: одобрение без человека видно в карточке, в дайджесте и в выборке.
+
+    Решение сюда приходит НЕ выдуманным: оно посчитано тем же правилом на
+    сошедшемся наборе. Проверяются три читателя сразу, потому что тихое
+    самостоятельное одобрение неотличимо от подлога.
+    """
+    monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
+    project_id = await _project(db, "self-approval-visible")
+    task_id = await _client_task(db, project_id)
+    await _judge(db, task_id, verdict="approve")
+    decision = _decide()
+    assert decision.allowed
+
+    outcome, _ = await approve_without_a_human(db, task_id, 1, decision)
+
+    assert outcome == APPLIED
+    # 1. Карточка: строка называет и то, что человека не было, и все восемь
+    #    признаков, на которых решение стоит.
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    line = [c for c in updates if "Одобрено стюардом без человека" in c]
+    assert line, "самостоятельное одобрение обязано назвать себя в карточке"
+    for signal in SELF_APPROVAL_SIGNALS:
+        assert signal in line[0], f"{signal} не назван в карточке"
+    # 2. Тот же вердикт в поле, где лежит и человеческий, — но с актором,
+    #    который называет, кто решил.
+    events = await repo.list_events(
+        db, since=0, kinds=["review_verdict_recorded"], limit=20
+    )
+    mine = [dict(e) for e in events if dict(e)["task_id"] == task_id]
+    assert mine and mine[-1]["actor"] == "steward"
+    # 3. Выборка на спот-чек: переиспользуется механика #1144, а не заводится
+    #    вторая. Самостоятельное одобрение обязано попасть в oversample.
+    from hub.services.digest import _audit_pool_and_oversample
+
+    pool, oversample = _audit_pool_and_oversample(
+        [], [], [], [{"task_id": task_id, "verdict": "approve"}]
+    )
+    assert task_id in pool and task_id in oversample, (
+        "решение, которого человек не видел, обязано проверяться чаще среднего"
+    )
+
+
+async def test_a_decision_that_did_not_converge_never_applies(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Несошедшийся набор к вердикту не приводит, и причина названа в карточке.
+
+    Проверяется по ИСХОДУ задачи, а не только по возвращённому слову:
+    применение, записавшее вердикт вопреки отказу, вернуло бы то же слово.
+    """
+    monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
+    project_id = await _project(db, "self-approval-refused")
+    task_id = await _client_task(db, project_id)
+    await _judge(db, task_id, verdict="approve")
+    decision = _decide(machine_review_fields={"self_reviewed": True})
+    assert not decision.allowed
+
+    outcome, detail = await approve_without_a_human(db, task_id, 1, decision)
+
+    assert outcome == ESCALATED_TO_HUMAN, detail
+    task = dict(await repo.get_task(db, task_id))
+    assert not (task.get("review_verdict") or ""), (
+        "вердикта не появилось: несошедшийся набор решает человек"
+    )
+    assert task["status"] == "review", "задача ждёт человека там же, где ждала"
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert any("reviewed_by_someone_else" in c for c in updates), (
+        "причина обязана назвать признак: возврат без имени заставляет искать её заново"
+    )
+
+
+async def test_the_composer_reads_the_hub_own_facts(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Сборщик входов берёт факты у хаба и на голой задаче не одобряет.
+
+    Прогон настоящий, а не подставной: бриф и пакет собираются в окружении
+    без клона репозитория, поэтому дифф честно не читается, а свидетельств
+    нет вовсе — и правило обязано это увидеть само, а не получить готовым.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "self-approval-composed")
+    task_id = await _client_task(db, project_id)
+
+    decision = await self_approval_for(db, task_id, 1)
+
+    assert not decision.allowed
+    named = [code for code, _ in decision.missing]
+    assert "report_is_current" in named and "evidence_coverage_is_complete" in named
+    assert "gate_decision_path" in [code for code, _ in decision.forbidden], (
+        "дифф прочитать не удалось — это запрет, а не разрешение"
+    )
+
+
+async def test_a_signal_the_rule_forgot_to_count_is_not_a_converged_one():
+    """Признак, который правило не посчитало вовсе, не попадает ни в один список.
+
+    Мутация «читать только пустоту missing» пережила восемь порч подряд:
+    каждая из них СЧИТАЛА свой признак и клала его в missing, поэтому
+    пустота missing и полнота converged были неотличимы. Разойтись они
+    могут ровно в одном случае — правило перестало считать признак совсем,
+    — и это самая тихая из возможных поломок: одобрение выдаётся по
+    неполному набору, не сказав об этом ни слова (#762).
+    """
+    forgotten = SelfApproval(converged=SELF_APPROVAL_SIGNALS[:-1])
+
+    assert forgotten.missing == () and forgotten.forbidden == ()
+    assert not forgotten.allowed, (
+        "непосчитанный признак — не сошедшийся: пустота missing не есть "
+        "полнота оснований"
+    )
+    assert SelfApproval(converged=SELF_APPROVAL_SIGNALS).allowed
