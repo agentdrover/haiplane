@@ -1024,6 +1024,7 @@ async def insert_machine_review(
     findings_rejected: str = "[]",
     submitted_by: str = "",
     incomplete: bool | None = None,
+    incomplete_reason: str = "",
     unresolved: str = "[]",
     lost_dimensions: str = "[]",
     profile: str = "",
@@ -1034,9 +1035,9 @@ async def insert_machine_review(
         "INSERT INTO machine_reviews (task_id, submission_generation, "
         "harness_skill, harness_version, agent_count, tokens_spent, "
         "duration_ms, orchestrator, model, raw_count, findings_confirmed, "
-        "findings_rejected, submitted_by, incomplete, unresolved, "
-        "lost_dimensions, profile, self_reviewed, principal_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "findings_rejected, submitted_by, incomplete, incomplete_reason, "
+        "unresolved, lost_dimensions, profile, self_reviewed, principal_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -1052,6 +1053,7 @@ async def insert_machine_review(
             findings_rejected,
             submitted_by,
             None if incomplete is None else int(incomplete),
+            incomplete_reason,
             unresolved,
             lost_dimensions,
             profile,

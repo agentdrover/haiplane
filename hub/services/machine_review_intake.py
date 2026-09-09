@@ -39,6 +39,98 @@ ORIGIN_RUN_TEXT = "cursor-cloud-result"
 ORIGIN_LOCAL_TEXT = "local-reviewer-result"
 
 
+async def _alert_no_candidates(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: MachineReviewSubmit,
+    raw_count: int,
+    generation: int,
+) -> None:
+    """Сказать на карточке, что кандидатов не было вовсе (#750).
+
+    Вынесено из record_machine_review без единого изменения поведения:
+    приём отчёта упёрся в бюджет сложности, а функция, которая не помещается
+    в потолок, ломает соседнюю задачу, а не свою (#1238).
+
+    #750: отчёт, не выдавший НИ ОДНОГО кандидата, с ОДНИМ агентом и БЕЗ
+    подсчитанных токенов — форма харнесса, который не запускался: 19.08.2026
+    таких приехало 60 штук за 36 минут (cursor_cloud), тихо выел метрики
+    фильтрации, а следом и автовердикт (#745 уже отказывает на raw_count=0).
+    Предупреждение одно на поколение и никогда не отказ: сам отчёт всё ещё
+    ценен как свидетельство.
+    """
+    if raw_count != 0:
+        return
+    prior_zero = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM machine_reviews "
+        "WHERE task_id=? AND submission_generation=? AND raw_count=0",
+        (task_id, generation),
+    )
+    if int(prior_zero[0]["n"]) != 1:
+        return
+    single_agent = (body.agent_count or 0) <= 1
+    no_tokens = body.tokens_spent is None
+    detail = (
+        "похоже, харнесс не запускался (agent_count≤1, токены не посчитаны)"
+        if single_agent and no_tokens
+        else "проверьте, что фазы измерений и адъюдикации исполнялись"
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        (
+            "Machine-review с raw_count=0: ноль кандидатов — это "
+            f"отсутствие данных, а не отсутствие находок; {detail}. "
+            "Отчёт принят, но автовердикт по нему невозможен, а "
+            "«чисто» не подтверждено (#750)."
+        ),
+    )
+
+
+async def _alert_environment_refusal(
+    db: aiosqlite.Connection, task_id: int, body: MachineReviewSubmit
+) -> None:
+    """Назвать отказ среды на карточке, если он заявлен (#1238).
+
+    Отдельной функцией не ради красоты: карточка — единственное место, где
+    человек встречает отчёт (код на гейте не смотрят), и текст этой строки
+    — весь результат задачи для читателя. Ему полагается своё имя, а не
+    десять строк внутри полукилометровой процедуры приёма.
+
+    Молчит на всём, кроме заявленного отказа среды: причина берётся из
+    слова, которое ревьюер назвал сам, и решается тем же предикатом, что
+    читает уже сохранённые строки, — двух ответов на вопрос «это отказ
+    среды?» быть не должно.
+    """
+    from hub.services.review_dispatch import is_environment_refusal
+
+    if not is_environment_refusal(
+        {"incomplete": body.incomplete, "incomplete_reason": body.incomplete_reason}
+    ):
+        return
+    lost = (
+        "; ".join(body.lost_dimensions[:5])
+        if body.lost_dimensions
+        else "перечень потерянных измерений не приложен"
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        (
+            f"Неполный отчёт по ОТКАЗУ СРЕДЫ: ревьюер заявил, что смотреть "
+            f"было НЕЧЕМ — {lost}. Это не исчерпание профиля: второй прогон "
+            "в той же среде даст тот же отказ, лечится настройкой окружения "
+            "ревьюера. Ноль находок здесь означает «смотреть было нечем», а "
+            "не «чисто» (#1238)."
+        ),
+    )
+
+
 async def record_machine_review(
     db: aiosqlite.Connection,
     task_id: int,
@@ -185,6 +277,11 @@ async def record_machine_review(
         ),
         submitted_by=(body.agent or username)[:100],
         incomplete=incomplete,
+        # #1238: the cause travels beside the flag, taken verbatim from the
+        # vocabulary the reviewer chose from. Stored even when `incomplete`
+        # is false — the row records what was declared, and the readers below
+        # ask for both before they call anything an environment refusal.
+        incomplete_reason=body.incomplete_reason,
         unresolved=_json.dumps(
             [f.model_dump(exclude_none=True) for f in body.unresolved],
             ensure_ascii=False,
@@ -207,39 +304,9 @@ async def record_machine_review(
             "generation": generation,
         },
     )
-    # #750: a report that surfaced NO candidates, ran ONE agent and counted
-    # NO tokens is the shape of a harness that never actually ran — 60 such
-    # reports landed in 36 minutes on 2026-08-19 (cursor_cloud), silently
-    # gutting the filtration metrics and, later, the auto-verdict (#745
-    # already refuses raw_count=0). Warned once per generation, never
-    # refused: the report itself is still worth keeping as evidence.
-    if raw_count == 0:
-        prior_zero = await fetchall(
-            db,
-            "SELECT COUNT(*) AS n FROM machine_reviews "
-            "WHERE task_id=? AND submission_generation=? AND raw_count=0",
-            (task_id, generation),
-        )
-        if int(prior_zero[0]["n"]) == 1:
-            single_agent = (body.agent_count or 0) <= 1
-            no_tokens = body.tokens_spent is None
-            detail = (
-                "похоже, харнесс не запускался (agent_count≤1, токены не посчитаны)"
-                if single_agent and no_tokens
-                else "проверьте, что фазы измерений и адъюдикации исполнялись"
-            )
-            await repo.add_task_update(
-                db,
-                task_id,
-                "hub",
-                "alert",
-                (
-                    "Machine-review с raw_count=0: ноль кандидатов — это "
-                    f"отсутствие данных, а не отсутствие находок; {detail}. "
-                    "Отчёт принят, но автовердикт по нему невозможен, а "
-                    "«чисто» не подтверждено (#750)."
-                ),
-            )
+    await _alert_no_candidates(db, task_id, body, raw_count, generation)
+    await _alert_environment_refusal(db, task_id, body)
+
     # #1012/#1025: the hub may already have called a reviewer for this very
     # submission. A second report is not refused — two profiles on one
     # generation is a real shape (#879) — but it must not arrive silently:

@@ -78,7 +78,7 @@
     {% set mr_flags = [] %}
     {% if not mr.is_current %}{% if mr_flags.append('устарело, работа пересдана') %}{% endif %}{% endif %}
     {% if mr.self_reviewed %}{% if mr_flags.append('саморевью') %}{% endif %}{% endif %}
-    {% if mr.incomplete %}{% if mr_flags.append('прогон неполный') %}{% endif %}{% elif mr.incomplete is none %}{% if mr_flags.append('полнота не заявлена') %}{% endif %}{% endif %}
+    {% if mr.incomplete %}{% if mr_flags.append('прогон неполный') %}{% endif %}{% if mr.incomplete_reason == 'environment' %}{% if mr_flags.append('отказ среды: смотреть было нечем, второй прогон не лечит') %}{% endif %}{% elif mr.incomplete_reason == 'profile' %}{% if mr_flags.append('исчерпан профиль') %}{% endif %}{% else %}{% if mr_flags.append('причина неполноты не заявлена') %}{% endif %}{% endif %}{% elif mr.incomplete is none %}{% if mr_flags.append('полнота не заявлена') %}{% endif %}{% endif %}
     {% if mr.unresolved %}{% if mr_flags.append((mr.unresolved|length ~ ' не проверено')) %}{% endif %}{% endif %}
     {% if mr.lost_dimensions %}{% if mr_flags.append('потеряно измерений: ' ~ mr.lost_dimensions|join(', ')) %}{% endif %}{% endif %}
     {% if mr_undisposed %}{% if mr_flags.append(mr_undisposed ~ ' из ' ~ mr_confirmed ~ ' без диспозиции') %}{% endif %}{% endif %}
@@ -421,6 +421,17 @@
            расхождение было видно глазом, а не выводилось из тишины. #}
         {% if machine_review.incomplete %}
         <span class="badge badge-failed">прогон неполный</span>
+        {# #1238: «неполный» само по себе не говорит, что делать дальше.
+           Отказ среды не лечится вторым прогоном — его лечит настройка
+           окружения ревьюера; исчерпание профиля лечит ровно добор. Пустая
+           причина остаётся пустой: угадывать её по тексту отчёта нельзя. #}
+        {% if machine_review.incomplete_reason == 'environment' %}
+        <span class="badge badge-failed">отказ среды — смотреть было нечем; второй прогон не лечит</span>
+        {% elif machine_review.incomplete_reason == 'profile' %}
+        <span class="badge badge-self-approved">исчерпан профиль — не хватило охвата</span>
+        {% else %}
+        <span class="badge badge-self-approved">причина неполноты не заявлена</span>
+        {% endif %}
         {% elif machine_review.incomplete is none %}
         <span class="badge badge-self-approved">полнота не заявлена</span>
         {% endif %}

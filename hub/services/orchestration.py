@@ -895,10 +895,18 @@ async def practice_metrics(
     human_touches = await _human_touch_metrics(db, since)
     review_outcomes = await _review_outcome_metrics(db, since)
     review_dispatches = await _review_dispatch_spend_metrics(db, since)
+    # #1238: повторяемость отказов среды. Считается тем же кодом, что решает,
+    # является ли отдельный отчёт отказом среды, — двух ответов на один
+    # вопрос здесь быть не должно. Окно берётся то же, что у остальных
+    # метрик, чтобы число сравнивалось с соседними по строке.
+    from hub.services.review_dispatch import count_environment_refusals
+
+    incomplete_reasons = await count_environment_refusals(db, since_days=since_days)
 
     return {
         "since_days": since_days,
         "machine_reviews": totals,
+        "incomplete_reasons": incomplete_reasons,
         "review_dispatches": review_dispatches,
         "by_harness": [dict(r) for r in harness_rows],
         "by_profile": profile_dicts,
