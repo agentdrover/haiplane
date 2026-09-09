@@ -415,59 +415,78 @@ async def recover_dead_process_claims(db: aiosqlite.Connection) -> int:
     Возвращает число восстановленных захватов. Рост этого числа — повод
     смотреть на ШИРИНУ окна между захватом и ответом провайдера, а не на само
     восстановление.
+
+    СВОЙ СБОЙ НЕ ИМЕЕТ ПРАВА СТОИТЬ ДОРОЖЕ СЕБЯ. Соединение подъёма живёт весь
+    процесс, а ``isolation_level="IMMEDIATE"`` (#1065) открывает
+    write-транзакцию на первом же UPDATE. Упасть между UPDATE и commit и никому
+    не откатить означало бы держать write-лок ВСЕЙ базы до перезапуска: поллер
+    и обработчики ходят своими соединениями и после ``busy_timeout`` получают
+    «database is locked». Вызов наверху best effort — он ловит исключение и
+    поднимается дальше, — поэтому откатывает тот, кто транзакцию и открыл.
+    Ловится BaseException: отмена корутины оставила бы тот же лок.
     """
-    rows = await fetchall(
-        db,
-        "SELECT * FROM steward_runs WHERE status=? AND agent_id LIKE ?",
-        (RUN_OPEN, f"{PENDING_PREFIX}%"),
-    )
-    recovered = 0
-    for row in rows:
-        order = dict(row)
-        cursor = await db.execute(
-            "UPDATE steward_runs SET agent_id='' "
-            "WHERE id=? AND status=? AND agent_id LIKE ?",
-            (order["id"], RUN_OPEN, f"{PENDING_PREFIX}%"),
-        )
-        if cursor.rowcount != 1:
-            # Кто-то закрыл или переписал строку между чтением и записью.
-            # Не ошибка: гонка разрешилась в другую сторону, и делать нечего.
-            continue
-        await repo.insert_event(
+    try:
+        rows = await fetchall(
             db,
-            kind=EVENT_CLAIM_RECOVERED,
-            task_id=order["task_id"],
-            actor="hub",
-            payload={
-                "run_id": order["id"],
-                "generation": order["generation"],
-                "kind": order.get("kind") or KIND_VERDICT,
-                "claim": order.get("agent_id") or "",
-                # Риск, а не только факт. Тихое восстановление прячет
-                # оплаченного агента ровно так же, как прятала метка: на
-                # #1190 агент был СОЗДАН (bc-953df24a, 08:49:06Z) и получил
-                # живой допуск на два часа, а хаб не знает ни его
-                # идентификатора, ни номера прогона — ни закрыть, ни
-                # сопоставить со сдачей.
-                "orphan_risk": True,
-                "detail": (
-                    "захват снят: он остался от процесса, которого больше нет. "
-                    "Агент у провайдера МОГ быть создан и оплачен — его "
-                    "идентификатор потерян вместе с процессом, хабу его не "
-                    "закрыть и не сопоставить с этой сдачей. Заказ возвращён "
-                    "в работу: ближайший тик стартует его заново"
-                ),
-            },
+            "SELECT * FROM steward_runs WHERE status=? AND agent_id LIKE ?",
+            (RUN_OPEN, f"{PENDING_PREFIX}%"),
         )
-        recovered += 1
-    if recovered:
-        await db.commit()
-        log.warning(
-            "steward: %s claim(s) left by a dead process recovered; "
-            "a paid agent may be orphaned at the provider",
-            recovered,
-        )
-    return recovered
+        recovered = 0
+        for row in rows:
+            order = dict(row)
+            cursor = await db.execute(
+                "UPDATE steward_runs SET agent_id='' "
+                "WHERE id=? AND status=? AND agent_id LIKE ?",
+                (order["id"], RUN_OPEN, f"{PENDING_PREFIX}%"),
+            )
+            if cursor.rowcount != 1:
+                # Кто-то закрыл или переписал строку между чтением и записью.
+                # Не ошибка: гонка разрешилась в другую сторону, и делать нечего.
+                continue
+            await repo.insert_event(
+                db,
+                kind=EVENT_CLAIM_RECOVERED,
+                task_id=order["task_id"],
+                actor="hub",
+                payload={
+                    "run_id": order["id"],
+                    "generation": order["generation"],
+                    "kind": order.get("kind") or KIND_VERDICT,
+                    "claim": order.get("agent_id") or "",
+                    # Риск, а не только факт. Тихое восстановление прячет
+                    # оплаченного агента ровно так же, как прятала метка: на
+                    # #1190 агент был СОЗДАН (bc-953df24a, 08:49:06Z) и получил
+                    # живой допуск на два часа, а хаб не знает ни его
+                    # идентификатора, ни номера прогона — ни закрыть, ни
+                    # сопоставить со сдачей.
+                    "orphan_risk": True,
+                    "detail": (
+                        "захват снят: он остался от процесса, которого больше нет. "
+                        "Агент у провайдера МОГ быть создан и оплачен — его "
+                        "идентификатор потерян вместе с процессом, хабу его не "
+                        "закрыть и не сопоставить с этой сдачей. Заказ возвращён "
+                        "в работу: ближайший тик стартует его заново"
+                    ),
+                },
+            )
+            recovered += 1
+        if recovered:
+            await db.commit()
+            log.warning(
+                "steward: %s claim(s) left by a dead process recovered; "
+                "a paid agent may be orphaned at the provider",
+                recovered,
+            )
+        return recovered
+    except BaseException:
+        # Откат громкий и безусловный: лок снят, а незаписанное восстановление
+        # не считается сделанным — метка остаётся на месте и будет снята
+        # следующим подъёмом. Полусделанная работа хуже несделанной: без отката
+        # заказ ушёл бы в работу, а событие о возможном оплаченном агенте так и
+        # не легло бы в ленту.
+        if db.in_transaction:
+            await db.rollback()
+        raise
 
 
 async def start_due_runs(db: aiosqlite.Connection) -> int:

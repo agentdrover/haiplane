@@ -1610,3 +1610,40 @@ async def test_startup_actually_runs_the_recovery():
     assert order == ["recovery", "poller"], (
         "восстановление зовётся при подъёме и ДО поллера"
     )
+
+
+async def test_a_failed_recovery_does_not_hold_the_write_lock(
+    db: aiosqlite.Connection,
+):
+    """#1195 (ревью #304): сбой на полпути не оставляет открытую транзакцию.
+
+    Соединение подъёма живёт весь процесс, а isolation_level="IMMEDIATE"
+    (#1065) открывает write-транзакцию на первом же UPDATE. Если запись
+    события упадёт между UPDATE и commit, а откатить некому, то соединение
+    держит write-лок ВСЕЙ базы до перезапуска: поллер и обработчики ходят
+    своими соединениями и после busy_timeout получают «database is locked».
+    Восстановление, задуманное как best-effort сигнал, тогда останавливает
+    запись в хаб — цена сбоя больше, чем сам сбой. Поллер откатывает свой
+    хвост тика ровно от этого (hub/poller.py), здесь коммит один на пачку и
+    окно шире.
+
+    Проверяется наблюдаемое состояние соединения, а не текст лога.
+    """
+    project_id = await _project(db, "shadow-recover-rollback")
+    task_id = await _task(db, project_id)
+    order = await order_run(db, task_id, 1)
+    assert order is not None
+    await _claimed(db, order["id"])
+
+    boom = AsyncMock(side_effect=RuntimeError("лента событий недоступна"))
+    with patch.object(repo, "insert_event", boom):
+        with pytest.raises(RuntimeError):
+            await sh.recover_dead_process_claims(db)
+
+    assert not db.in_transaction, (
+        "сбой восстановления оставил открытую транзакцию: write-лок всей базы"
+    )
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (order["id"],))
+    assert dict(rows[0])["agent_id"].startswith(sh.PENDING_PREFIX), (
+        "откат вернул метку: незаписанное восстановление не считается сделанным"
+    )
