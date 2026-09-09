@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 from hub import config
@@ -677,6 +678,9 @@ async def note_completion_without_delivery(
             accepted_via=via,
             # The alert below IS this state's alert, so the sweep must not
             # repeat it. Delivered rows carry no alert to suppress.
+            # ``alerted_state`` хранит МНОЖЕСТВО озвученных состояний через
+            # запятую (#294); одно имя — законное множество из одного, и
+            # свип дополнит его сам, когда заговорит о другом состоянии.
             alerted_state=(answer["state"] if answer["state"] != DELIVERED else ""),
         )
         if answer["state"] != DELIVERED:
@@ -702,6 +706,126 @@ async def note_completion_without_delivery(
         return None
 
 
+#: Событие, которым реестр говорит сам, не дожидаясь вопроса (#1198).
+DISCREPANCY_EVENT = "delivery_discrepancy"
+
+#: Возрастные рубежи расхождения в часах. Их немного и они редеют намеренно:
+#: рубеж — это повод сказать «это длится дольше, чем вы думали», а не
+#: расписание напоминаний. Замер, из которого выросла задача, жил 73 часа.
+AGE_BUCKETS_HOURS = (24, 72, 168)
+
+
+def _age_hours(task: dict[str, Any], prior: dict[str, Any]) -> int:
+    """Сколько часов длится расхождение — тем же счётом, что и в реестре."""
+    started = (task.get("completed_at") or "").strip() or (
+        prior.get("first_seen_at") or ""
+    ).strip()
+    if not started:
+        return 0
+    try:
+        began = datetime.strptime(started[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    except ValueError:
+        return 0
+    return max(int((datetime.now(UTC) - began).total_seconds() // 3600), 0)
+
+
+def _crossed_bucket(age_hours: int) -> int:
+    """Наибольший пройденный рубеж, или 0 — ни одного."""
+    passed = [b for b in AGE_BUCKETS_HOURS if age_hours >= b]
+    return max(passed) if passed else 0
+
+
+def _discrepancy_voice(
+    task: dict[str, Any], answer: dict[str, Any], prior: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Говорить ли сейчас — и что именно (#1198).
+
+    ``None`` означает молчание, и молчание здесь имеет три разные причины,
+    которые нельзя путать:
+
+    * ЭТОТ ФАКТ признан человеком законным — заткнули по решению, а не по
+      усталости; строка остаётся в реестре с причиной;
+    * об этом состоянии уже сказали, и возрастной рубеж с тех пор не пройден —
+      повтор на каждом тике превращает карточку в ленту одинаковых строк, и
+      это ровно тот способ убить сигнал, от которого задача защищает;
+    * состояние вообще не повод говорить.
+
+    UNKNOWN звучит СВОИМИ словами. Сегодняшний код объявлял его текстом
+    «работа не доставлена» — то есть выдавал незнание за факт, ровно то, что
+    реестр в своей выдаче делать отказывается.
+    """
+    state = answer["state"]
+    if state not in (PR_OPEN, UNKNOWN):
+        return None
+
+    # Признание относится к ФАКТУ, а не к задаче навсегда (решение владельца
+    # 08.09.2026 по неразрешённой находке ревью #294). «PR держим открытым
+    # намеренно» — суждение о том, что PR открыт; когда факт сменился на
+    # «доставку подтвердить не удалось», это уже другое утверждение, которого
+    # никто не одобрял, и молчать о нём значит выдавать старое решение за
+    # оценку новой обстановки.
+    settled_fact = (prior.get("acknowledged_state") or "").strip()
+    if (prior.get("acknowledged_at") or "").strip() and settled_fact == state:
+        return None
+
+    age_hours = _age_hours(task, prior)
+    bucket = _crossed_bucket(age_hours)
+    # Память о сказанном — МНОЖЕСТВО состояний, а не одна ячейка, и это не
+    # украшение. Рубеж принадлежит расхождению (его возрасту), а состояние —
+    # провайдеру, который моргает: при чередовании PR_OPEN и UNKNOWN одна
+    # ячейка затиралась, память о том, что про PR_OPEN уже сказали, пропадала,
+    # и голос звучал на каждом проходе свипа — ровно тот метроном, от которого
+    # задача защищает (#294, находка ревью). Рубеж по-прежнему обнуляет набор:
+    # перейти рубеж значит получить право сказать «это длится дольше, чем вы
+    # думали» — про каждое состояние заново.
+    said_bucket = int(prior.get("alerted_age_bucket") or 0)
+    said_states = {
+        part for part in (prior.get("alerted_state") or "").split(",") if part.strip()
+    }
+    # Рубеж принадлежит ФАКТУ, а не строке. Соблазн «признавшего рубежами не
+    # беспокоить» я уже реализовал и он оказался неверен ровно наоборот:
+    # проверка выше уже вернула None для признанного факта, значит сюда
+    # доходит только тот, которого никто не одобрял, — и глушить ЕГО
+    # эскалацию значит второй раз построить «одно суждение отнимает голос у
+    # другого». До этой правки все три рубежа по такому факту молчали
+    # навсегда (#294, раунд 3).
+    fresh_round = bucket > said_bucket
+    if state in said_states and not fresh_round:
+        return None
+    voiced = {state} if fresh_round else said_states | {state}
+
+    pr = answer["pr_number"]
+    where = f"PR #{pr}" if pr else "PR не закреплён"
+    aged = (
+        f"Расхождению {age_hours} ч."
+        if age_hours
+        else "Расхождение только что найдено."
+    )
+    if state == UNKNOWN:
+        text = (
+            f"Доставку подтвердить НЕ УДАЛОСЬ, и это не то же самое, что "
+            f"«не доставлено»: {answer['reason']}. Задача #{task['id']}, "
+            f"{where}. {aged} Хаб не знает ответа и не выдаёт незнание за факт "
+            f"— проверьте вручную (#1198)."
+        )
+    else:
+        text = (
+            f"Задача числится completed, но работа НЕ доставлена: "
+            f"{answer['reason']}. Задача #{task['id']}, {where}. {aged} "
+            f"Расхождение видно в списке недоставленных завершённых задач "
+            f"(#897). Если так и задумано — признайте его законным с "
+            f"причиной, и оно замолчит, оставшись в реестре (#1198)."
+        )
+    return {
+        "text": text,
+        "bucket": bucket,
+        "age_hours": age_hours,
+        # Отсортировано, чтобы одно и то же множество всегда писалось одной
+        # строкой: иначе «уже сказали» зависело бы от порядка обхода set.
+        "states": ",".join(sorted(voiced)),
+    }
+
+
 async def scan_completed_deliveries(
     db: Any, *, lookback_days: int = 30, limit: int = 100
 ) -> list[dict[str, Any]]:
@@ -710,7 +834,8 @@ async def scan_completed_deliveries(
     Modelled on the stale-alert loop in ``hub/poller.py``: run on a timer, look
     only at rows that can still be news, and alert at most once per state so
     the owner is told something new rather than reminded every half minute.
-    Repeats are damped by ``alerted_state`` on the stored row rather than by
+    Repeats are damped by ``alerted_state`` (a comma-separated SET of states
+    already voiced at the current age bucket) on the stored row rather than by
     matching alert text — durable, and it survives an unrelated update landing
     on the task, which the text heuristic does not.
 
@@ -727,11 +852,34 @@ async def scan_completed_deliveries(
         task_id = int(task["id"])
         try:
             answer = await task_delivery(db, task)
-            prior = await repo.get_delivery_discrepancy(db, task_id)
-            already = (prior or {}).get("alerted_state") or ""
-            should_alert = answer["state"] in (PR_OPEN, UNKNOWN) and (
-                already != answer["state"]
-            )
+            prior = await repo.get_delivery_discrepancy(db, task_id) or {}
+            voice = _discrepancy_voice(task, answer, prior)
+            if voice:
+                # Сказать РАНЬШЕ, чем пометить сказанным. record_... коммитит,
+                # и в прежнем порядке упавшая запись голоса оставляла строку
+                # уже помеченной: сигнал терялся навсегда, потому что второй
+                # попытки правило не даёт (#1198, находка ревью). Теперь обе
+                # записи голоса и отметка о нём укладываются в один коммит —
+                # либо сказано и помечено, либо не случилось ничего.
+                await repo.add_task_update(db, task_id, "hub", "alert", voice["text"])
+                # Алерт ложится на карточку УЖЕ ЗАКРЫТОЙ задачи — страницу, на
+                # которую не возвращаются, и именно так #1138 осталась
+                # непрочитанной. Лента событий — канал, который БУДИТ
+                # (hub_wait_events, Stop-хук); соседний путь ручного принятия
+                # событие писал всегда, а свип — половина, которая находит
+                # расхождения сама, — не писал ни одного.
+                await repo.insert_event(
+                    db,
+                    kind=DISCREPANCY_EVENT,
+                    task_id=task_id,
+                    actor="hub",
+                    payload={
+                        "state": answer["state"],
+                        "pr": answer["pr_number"],
+                        "age_hours": voice["age_hours"],
+                        "reason": answer["reason"],
+                    },
+                )
             await repo.record_delivery_discrepancy(
                 db,
                 task_id=task_id,
@@ -739,22 +887,25 @@ async def scan_completed_deliveries(
                 reason=answer["reason"],
                 pr_number=answer["pr_number"],
                 delivery_path=answer["delivery_path"],
-                alerted_state=(answer["state"] if should_alert else None),
+                alerted_state=(voice["states"] if voice else None),
+                alerted_age_bucket=(voice["bucket"] if voice else None),
             )
-            if should_alert:
-                await repo.add_task_update(
-                    db,
-                    task_id,
-                    "hub",
-                    "alert",
-                    f"Задача числится completed, но работа не доставлена: "
-                    f"{answer['reason']}. Расхождение видно в списке "
-                    "недоставленных завершённых задач (#897).",
-                )
-                await db.commit()
             if answer["state"] == PR_OPEN:
                 found.append({"task_id": task_id, **answer})
         except Exception:  # noqa: BLE001 - one bad row must not stop the sweep
+            # Откат ОБЯЗАТЕЛЕН, и без него обещание строкой выше было
+            # комментарием. add_task_update и insert_event не коммитят —
+            # коммитит record_delivery_discrepancy; значит исключение между
+            # голосом и отметкой оставляло алерт незакоммиченным, но ЖИВЫМ в
+            # открытой транзакции, и первый же коммит следующего кандидата
+            # записывал его без отметки. Расхождение звучало бы снова, а
+            # «либо сказано и помечено, либо не случилось ничего» оказалось
+            # бы неправдой (находка ревью №281, раскол адъюдикации).
+            #
+            # Оговорка рефутера верна лишь наполовину: ошибка SQLite и правда
+            # обрывает транзакцию сама, но исключение уровня Python — нет,
+            # и именно оно оставляет транзакцию здоровой и грязной.
+            await db.rollback()
             log.exception("delivery sweep failed for #%s", task_id)
     return found
 

@@ -1382,6 +1382,8 @@ _MIGRATIONS: list[tuple[str, str]] = [
             delivery_path TEXT    NOT NULL DEFAULT '',
             disposition   TEXT    NOT NULL DEFAULT '',
             accepted_via  TEXT    NOT NULL DEFAULT '',
+            -- множество уже озвученных состояний через запятую (#294):
+            -- одна ячейка затиралась при дребезге провайдера
             alerted_state TEXT    NOT NULL DEFAULT '',
             first_seen_at TEXT    NOT NULL DEFAULT (datetime('now')),
             checked_at    TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -1766,6 +1768,56 @@ _MIGRATIONS: list[tuple[str, str]] = [
         # а на нём стоит потолок против хождения драфта по кругу (#1161).
         "add_tasks_statement_fingerprint",
         "ALTER TABLE tasks ADD COLUMN statement_fingerprint TEXT NOT NULL DEFAULT ''",
+    ),
+    # ---- Голос реестра расхождений (#1198). Обнаружение было построено и
+    # верно; не хватало того, чтобы найденное перестало ждать вопроса — и при
+    # этом не превратилось в шум, который перестают читать.
+    #
+    # acknowledged_* — признание расхождения ЗАКОННЫМ. Строка замолкает, но
+    # остаётся в реестре с названной причиной: заткнуть можно, стереть нельзя.
+    # Причина обязательна в коде, а не в комментарии: без неё это выключатель,
+    # а не решение.
+    #
+    # alerted_age_bucket — сколько часов возраста уже отзвучало. Повтор
+    # случается при переходе рубежа и ровно один раз. Условие вида «возраст
+    # больше N» без этой памяти звучало бы на КАЖДОМ тике, а лента одинаковых
+    # строк — это ровно тот способ убить сигнал, от которого задача защищает.
+    (
+        "add_delivery_acknowledged_at",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN acknowledged_at TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_delivery_acknowledged_by",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN acknowledged_by TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_delivery_ack_reason",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN ack_reason TEXT NOT NULL DEFAULT ''",
+    ),
+    # acknowledged_state — ФАКТ, который признали законным, а не задача целиком.
+    # Решение владельца 08.09.2026 по неразрешённой находке ревью: признание
+    # относится к факту. Без этой колонки «PR держим открытым намеренно»
+    # глушило и следующее, никем не одобренное состояние — например «доставку
+    # подтвердить не удалось», — то есть одно суждение отнимало голос у
+    # другого. ОБРАТНОЙ ЗАСЫПКИ НЕТ НАМЕРЕННО: признанных строк не существует
+    # — колонки acknowledged_* родились в этой же задаче и на прод не
+    # выкатывались, — а засыпать пришлось бы ТЕКУЩИМ состоянием, которое свип
+    # перезаписывает каждые 15 минут. Это не то, что признавал человек, и
+    # правило было бы неверным ровно в ту сторону, ради которой задача
+    # заведена. Пустое значение тут не совпадёт ни с одним состоянием, то есть
+    # читается как «не признано» — и это верная сторона осторожности (#762).
+    (
+        "add_delivery_acknowledged_state",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN acknowledged_state TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_delivery_alerted_age_bucket",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN alerted_age_bucket INTEGER NOT NULL DEFAULT 0",
     ),
 ]
 

@@ -47,6 +47,7 @@ from hub.services.finding_identity import finding_uids
 from hub.services.review_evidence import inflight_view
 from hub.version import get_app_version
 from hub.models import (
+    DeliveryAcknowledgement,
     DEFAULT_FORGE,
     FORGES,
     FindingDisposition,
@@ -906,7 +907,17 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
         # #897: a completed task with an open PR belongs in the count the owner
         # glances at. Left out of it, the section would be a thing you only see
         # if you already scrolled to where you were not looking.
-        + len(inbox["undelivered"])
+        #
+        # #1198: acknowledged rows are excluded. They stay in the section — the
+        # record is never erased — but a discrepancy the owner has already
+        # judged legitimate must not keep pushing the badge up: a counter that
+        # never returns to zero is a counter nobody reads, which is the exact
+        # death this task exists to prevent.
+        # #294: «признано» спрашивается ОДНИМ определением из репозитория
+        # (acknowledged_now), а не своим здесь. Своё уже разъехалось с голосом:
+        # строка, признанная для другого факта, будила агентов и одновременно
+        # считалась нулём.
+        + len([d for d in inbox["undelivered"] if not d.get("acknowledged_now")])
     )
     # Coordination panels (#775): who is around, and what the sessions are
     # saying to each other. Deliberately unfiltered by project — a session
@@ -1310,6 +1321,63 @@ async def web_request_machine_review(task_id: int, request: Request):
     )
     await db.commit()
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+@router.post("/tasks/{task_id}/web-acknowledge-delivery")
+async def web_acknowledge_delivery(task_id: int, request: Request):
+    """Владелец говорит: расхождение доставки законно (#1198).
+
+    Кнопка живёт РЯДОМ СО СТРОКОЙ реестра, а не в отдельном месте: признание
+    имеет смысл там, где расхождение читают, и требует того же взгляда на
+    возраст и номер PR, который в строке уже есть.
+
+    Причина обязательна и здесь, а не только в схеме API: пустая форма — это
+    выключатель, а выключатель превращает механизм в способ глушить
+    неудобное. Строка после признания не исчезает: она остаётся в реестре с
+    причиной и именем, потому что заткнуть можно, а стереть нельзя.
+    """
+    identity = require_human_or_admin(request)
+    db = _db(request)
+    form = await request.form()
+    # Порог причины живёт ОДНИМ определением — в схеме. Свой strip и своя
+    # проверка здесь уже разошлись с API: форма пропускала «  a», то есть
+    # причину в один символ, а API её отвергал. Два входа в один глагол,
+    # ведущие себя по-разному, — худший вид расхождения, потому что оба
+    # выглядят рабочими (#1198, находка ревью).
+    try:
+        checked = DeliveryAcknowledgement(reason=str(form.get("reason") or ""))
+    except ValidationError as exc:
+        raise HTTPException(
+            422, "причина признания — предложение, а не пробелы"
+        ) from exc
+    reason = checked.reason
+    if not await repo.acknowledge_delivery_discrepancy(
+        db, task_id, by=identity.username, reason=reason
+    ):
+        raise HTTPException(404, "по этой задаче расхождение не записано")
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Расхождение доставки признано законным: {reason} "
+        f"(признал: {identity.username}). Сигнал замолчал, запись осталась "
+        "в реестре — заткнуть можно, стереть нельзя (#1198).",
+    )
+    await db.commit()
+    # Возврат В ТОТ ЖЕ вид, из которого нажали. Разбор расхождений — работа
+    # списком, и фильтр проекта в нём несущий: голый "/" после каждого
+    # признания отправлял человека в общий список, где следующую строку надо
+    # искать заново (#1210). Слаг не берётся как URL — он подставляется в один
+    # известный путь и экранируется, поэтому полем нельзя увести на чужой хост.
+    # Тот же приём и та же причина, что у возврата в очередь находок ниже.
+    back_project = str(form.get("return_project") or "").strip()
+    # safe="" намеренно: слаг — ЗНАЧЕНИЕ параметра, а не кусок пути, поэтому
+    # экранируется целиком, включая косые. Умолчание quote() их пропускает, и
+    # тогда доказательство «увести нельзя» держится на том, что значение стоит
+    # в query, а не в пути, — рассуждение, которое переживёт не всякую правку.
+    back = f"/?project={quote(back_project, safe='')}" if back_project else "/"
+    return RedirectResponse(back, status_code=303)
 
 
 @router.post("/tasks/{task_id}/web-finding-dispositions")

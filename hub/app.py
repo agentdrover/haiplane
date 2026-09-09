@@ -33,6 +33,7 @@ from hub.version import get_app_version
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
+    DeliveryAcknowledgement,
     DeployCallback,
     DeployView,
     ProdStateView,
@@ -269,6 +270,25 @@ async def lifespan(app: FastAPI):
             )
         except Exception:
             log.exception("stale env activity write failed")
+
+    # Захваты, оставленные мёртвым процессом (#1195). Место — ДО поллера, и
+    # это не вкусовщина: первый же тик читает открытые заказы, и метка,
+    # снятая после него, стоила бы поколению ещё одного круга ожидания.
+    #
+    # Признак точный, а не «наверное»: процесс, который только что поднялся,
+    # не может иметь своих незавершённых вызовов к провайдеру, значит любая
+    # метка захвата в базе оставлена тем, кого больше нет.
+    #
+    # Best effort, как и соседний сигнал о мёртвых env: сигнал не имеет права
+    # уронить подъём. Но молчать нельзя — за меткой стоит, возможно,
+    # оплаченный агент, и лог здесь последняя инстанция, если событие лечь не
+    # смогло.
+    try:
+        from hub.services.steward_shadow import recover_dead_process_claims
+
+        await recover_dead_process_claims(app.state.db)
+    except Exception:
+        log.exception("steward claim recovery failed at startup")
 
     poll_task = start_poller(app)
 
@@ -2005,6 +2025,48 @@ async def api_delivery_discrepancies(
     return await services.undelivered_completed_tasks(
         db, project_id=project_id, limit=max(1, min(limit, 200))
     )
+
+
+@app.post("/api/delivery/discrepancies/{task_id}/acknowledge")
+async def api_acknowledge_delivery_discrepancy(
+    task_id: int,
+    body: DeliveryAcknowledgement,
+    request: Request,
+    identity=Depends(require_human_or_admin),
+):
+    """Признать расхождение доставки законным — оно замолчит (#1198).
+
+    Человеческий маршрут намеренно: «так и задумано» — это суждение о работе,
+    и агент, чья задача попала в реестр, — последний, кому его выносить.
+
+    Причина обязательна. Признание без причины было бы выключателем, а не
+    решением, и первый же неудобный сигнал был бы им заглушён. Запись при
+    этом не стирается и состояние не подменяется: реестр продолжает показывать
+    расхождение, к нему лишь приписано, кто и почему считает его законным.
+    """
+    db = _db(request)
+    ok = await repo.acknowledge_delivery_discrepancy(
+        db,
+        task_id,
+        by=str(getattr(identity, "username", "") or "human"),
+        reason=body.reason,
+    )
+    if not ok:
+        raise HTTPException(
+            404, "no delivery discrepancy recorded for this task, or reason is empty"
+        )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Расхождение доставки признано законным: {body.reason.strip()} "
+        f"(признал: {getattr(identity, 'username', '') or 'human'}). "
+        "Сигнал замолчал, запись осталась в реестре — заткнуть можно, "
+        "стереть нельзя (#1198).",
+    )
+    await db.commit()
+    return {"task_id": task_id, "acknowledged": True, "reason": body.reason.strip()}
 
 
 @app.post("/api/deploys", response_model=DeployView)

@@ -16,6 +16,7 @@ from hub.db import (
     seed_chat_pair_agent,
     _table_exists,
 )
+from hub.integrations import git_ops as git_ops_mod
 from hub.integrations.noop import (
     NoopDispatch,
     NoopGitHub,
@@ -72,6 +73,22 @@ class MockGitOps(NoopGitOps):
 
     async def checkout(self, branch, repo=None):
         return True
+
+
+@pytest.fixture(autouse=True)
+def _forget_stacking_probe_answers():
+    """Empty the stacking probe's memory around every test (#1205).
+
+    The memory is keyed on the three commit SHAs, which in production is the
+    whole question — the same three commits cannot produce two answers. Test
+    fakes are not bound by that: they hand out fixed SHAs and vary what
+    ``rev-list`` says, so one test's answer would otherwise be handed to the
+    next one. Cleared on both sides so an order-dependent pass is impossible
+    in either direction.
+    """
+    git_ops_mod._stack_probe_cache_clear()
+    yield
+    git_ops_mod._stack_probe_cache_clear()
 
 
 @pytest.fixture(autouse=True)
