@@ -22,6 +22,7 @@ from hub import config
 from hub import db as db_module
 from hub import repository as repo
 from hub import services
+from hub import skill_publish
 from hub.actionable_errors import (
     agent_create_forbidden_detail,
     human_only_gate_detail,
@@ -1530,6 +1531,81 @@ async def web_skills(request: Request, skill_error: str = Query("")):
     )
 
 
+async def _skill_publish_views(
+    request: Request, name: str, versions: list[Any], active: Any | None
+) -> dict[int, dict[str, Any]]:
+    """Что показать рядом с каждой версией на /skills/{name} (#1169).
+
+    Момент показа у путей разный, и это не деталь оформления:
+
+    * Драфт, предложенный агентом (путь 2) — человек НЕ автор текста, и диф
+      нужен ему ДО нажатия кнопки. Он считается здесь, на лету: сравнивать
+      есть с чем ровно сейчас, а активной эта версия ещё не стала.
+    * Активная версия (пути 1 и 3) — предпоказывать нечего, публикация уже
+      случилась. Показывается ЗАПИСЬ о ней, прочитанная из события
+      ``skill_activated``, а не пересчёт: человек должен видеть то, что было
+      записано в момент публикации.
+
+    ``active`` — активная версия либо ``None``, когда активной нет вовсе
+    (весь реестр этого скилла — драфты). Отсутствие основания сравнения не
+    отменяет показ: драфт всё равно можно активировать, и человеку тогда
+    нужно видеть словами, что сравнивать не с чем, а не пустое место, из
+    которого одинаково читаются «ничего не изменилось» и «блок не построился».
+    """
+    baseline_content = None if active is None else active.content
+    baseline_version = None if active is None else active.version
+    views: dict[int, dict[str, Any]] = {}
+    for version in versions:
+        if version.status != "active":
+            views[version.version] = {
+                "when": "before",
+                "diff": skill_publish.summarize_change(
+                    previous_content=baseline_content,
+                    previous_version=baseline_version,
+                    content=version.content,
+                ).as_dict(),
+                "unified": skill_publish.unified_diff(
+                    previous_content=baseline_content,
+                    previous_version=baseline_version,
+                    content=version.content,
+                    version=version.version,
+                ),
+                "scan": skill_publish.scan_report(version.content),
+            }
+            continue
+        recorded = await repo.latest_skill_activation(
+            _db(request), name, version.version
+        )
+        if recorded is None:
+            continue
+        diff = recorded.get("diff") or {}
+        baseline_version = diff.get("baseline_version")
+        baseline = next(
+            (v for v in versions if v.version == baseline_version),
+            None,
+        )
+        views[version.version] = {
+            "when": "after",
+            "diff": diff,
+            # Unified diff в событие не кладётся — обе версии лежат в реестре,
+            # и копия текста на 100k символов в фиде не нужна. Здесь он
+            # восстанавливается по названному в записи основанию; если той
+            # версии в реестре уже нет, остаются сводка и вердикт.
+            "unified": (
+                ""
+                if baseline is None
+                else skill_publish.unified_diff(
+                    previous_content=baseline.content,
+                    previous_version=baseline.version,
+                    content=version.content,
+                    version=version.version,
+                )
+            ),
+            "scan": recorded.get("content_scan") or {},
+        }
+    return views
+
+
 @router.get("/skills/{name}", response_class=HTMLResponse)
 async def web_skill_detail(name: str, request: Request, skill_error: str = Query("")):
     from hub.models import SkillView
@@ -1538,14 +1614,22 @@ async def web_skill_detail(name: str, request: Request, skill_error: str = Query
     if not rows:
         raise HTTPException(404, "skill not found")
     versions = [SkillView(**dict(r)) for r in rows]
-    active = next((v for v in versions if v.status == "active"), versions[0])
+    # Активная версия — то, ЧТО раздаётся агентам; когда её нет, основания для
+    # сравнения нет тоже, и подставлять вместо него самый свежий драфт нельзя:
+    # диф к неопубликованному тексту выдал бы за прежнюю активную версию то,
+    # что ею никогда не было (#1169).
+    published = next((v for v in versions if v.status == "active"), None)
     return TEMPLATES.TemplateResponse(
         request,
         "skill_detail.html",
         {
             "name": name,
             "versions": versions,
-            "active_content": active.content,
+            "active_content": (published or versions[0]).content,
+            "publish_views": await _skill_publish_views(
+                request, name, versions, published
+            ),
+            "baseline_absent": skill_publish.BASELINE_ABSENT,
             "skill_error": skill_error,
         },
     )

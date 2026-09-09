@@ -25,7 +25,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from hub import brand, config, models, services
+from hub import brand, config, models, services, skill_publish
 from hub import db as db_module
 from hub import repository as repo
 from hub.db import get_db, log_activity, write_transaction
@@ -1124,6 +1124,13 @@ async def api_create_skill(
 
     db = _db(request)
     status_value = "active" if identity.is_human else "draft"
+    # Прежняя активная версия читается ДО вставки: новая версия становится
+    # активной сразу же и сама стала бы своим же основанием для сравнения
+    # (#1169). Путь 1 — человек и есть автор текста, поэтому предпоказа тут
+    # нет; нужна запись о том, что именно опубликовано.
+    baseline = (
+        await repo.get_active_skill(db, body.name) if status_value == "active" else None
+    )
     skill_id, version = await repo.create_skill_version(
         db,
         name=body.name,
@@ -1139,7 +1146,13 @@ async def api_create_skill(
             db,
             kind="skill_activated",
             actor=identity.username,
-            payload={"name": body.name, "version": version},
+            payload=skill_publish.publication_payload(
+                name=body.name,
+                version=version,
+                content=body.content,
+                previous_content=None if baseline is None else str(baseline["content"]),
+                previous_version=None if baseline is None else int(baseline["version"]),
+            ),
         )
     await db.commit()
     await db_module.log_activity(
@@ -1167,6 +1180,11 @@ async def api_activate_skill(
     if row is None:
         raise HTTPException(404, "skill version not found")
     if row["status"] != "active":
+        # Тот же порядок, что и на пути 1: основание сравнения читается до
+        # того, как активной станет эта версия (#1169). Ветка идемпотентности
+        # не трогается — повторная активация уже активной версии по-прежнему
+        # не порождает второго события.
+        baseline = await repo.get_active_skill(db, name)
         await repo.activate_skill_version(
             db, name, version, activated_by=_identity.username
         )
@@ -1174,7 +1192,13 @@ async def api_activate_skill(
             db,
             kind="skill_activated",
             actor=_identity.username,
-            payload={"name": name, "version": version},
+            payload=skill_publish.publication_payload(
+                name=name,
+                version=version,
+                content=str(row["content"]),
+                previous_content=None if baseline is None else str(baseline["content"]),
+                previous_version=None if baseline is None else int(baseline["version"]),
+            ),
         )
         await db.commit()
         await db_module.log_activity(

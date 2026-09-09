@@ -4051,3 +4051,53 @@ body.htmx-request .htmx-progress {
     .task-ac-evidence { display: block; overflow-x: auto; }
     .task-verdict-buttons { grid-template-columns: 1fr; }
 }
+
+/* Что изменилось в публикуемой версии скилла (#1169).
+   Диф — основание решения, поэтому он читается как текст, а не как код-блок
+   в рамке: моноширинный, с сохранёнными переносами и собственной прокруткой,
+   чтобы длинная строка не растягивала страницу. Сработавшие правила скана
+   намеренно НЕ красные — это указатель места внутри дифа, а не сигнал
+   тревоги, и цвет опасности прочитался бы как вердикт, которого у них нет. */
+.skill-publish {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+    padding: var(--sp-3);
+    margin-bottom: var(--sp-3);
+}
+
+.skill-publish-when { margin: 0 0 var(--sp-2); }
+.skill-publish-summary { margin: 0 0 var(--sp-2); }
+.skill-diff-added { color: var(--green); }
+.skill-diff-removed { color: var(--red); }
+
+.skill-scan-hits {
+    list-style: none;
+    margin: 0 0 var(--sp-2);
+    padding: 0;
+    display: grid;
+    gap: var(--sp-2);
+}
+
+.skill-scan-hit { font-size: 13px; line-height: 1.5; }
+
+.skill-scan-fragment {
+    display: block;
+    margin-top: var(--sp-1);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow-x: auto;
+}
+
+.skill-scan-empty, .skill-scan-note { margin: 0 0 var(--sp-2); }
+.skill-publish-diff > summary { margin-bottom: var(--sp-2); }
+
+.skill-diff {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    max-height: 420px;
+    overflow: auto;
+    margin: 0;
+}

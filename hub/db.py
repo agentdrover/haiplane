@@ -8,6 +8,7 @@ from typing import Any
 
 import aiosqlite
 
+from hub import skill_publish
 from hub.config import CHAT_PAIR_AGENT, HUB_DB_PATH
 
 log = logging.getLogger("hub.db")
@@ -2840,7 +2841,8 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
             (name,),
         )
         if not rows:
-            await _insert_seed_skill(db, name, kind, content, tags, 1, "active")
+            if await _insert_seed_skill(db, name, kind, content, tags, 1, "active"):
+                await _record_seed_activation(db, name, 1, content, None, None)
             continue
         # Highest active version — the same row ``get_active_skill`` serves.
         active = next((r for r in rows if str(r["status"]) == "active"), None)
@@ -2856,25 +2858,45 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
             continue
         # Case 3. The shipped text has to become the one agents read.
         shipped = next((r for r in rows if str(r["content"]) == content), None)
+        published: int | None = None
         if shipped is not None:
             if _is_seed_word(shipped):
-                await db.execute(
-                    "UPDATE skills SET status='active', activated_by='seed' WHERE id=?",
+                # ``AND status<>'active'`` is what makes the event honest, not
+                # what makes the UPDATE correct: this row is not the active one
+                # (case 1 returned above), so the clause changes nothing about
+                # the library. It changes who gets to SAY so — ``get_db`` seeds
+                # on every connection, and without it two workers racing here
+                # would each report having published, writing the change to the
+                # feed twice (#1169).
+                cur = await db.execute(
+                    "UPDATE skills SET status='active', activated_by='seed' "
+                    "WHERE id=? AND status<>'active'",
                     (int(shipped["id"]),),
                 )
+                published = int(shipped["version"]) if cur.rowcount else None
             else:
                 # A person published this exact text. Activating it is AGREEING
                 # with them, not replacing them, so their signature outlives the
                 # act — stamping 'seed' here would erase the only record that a
                 # human ever spoke, and the next upgrade would then read the row
                 # as ours and overrule a decision that was never ours to make.
-                await db.execute(
-                    "UPDATE skills SET status='active' WHERE id=?",
+                cur = await db.execute(
+                    "UPDATE skills SET status='active' WHERE id=? AND status<>'active'",
                     (int(shipped["id"]),),
                 )
-        else:
-            await _insert_seed_skill(
-                db, name, kind, content, tags, next_version, "active"
+                published = int(shipped["version"]) if cur.rowcount else None
+        elif await _insert_seed_skill(
+            db, name, kind, content, tags, next_version, "active"
+        ):
+            published = next_version
+        if published is not None:
+            await _record_seed_activation(
+                db,
+                name,
+                published,
+                content,
+                None if active is None else str(active["content"]),
+                None if active is None else int(active["version"]),
             )
         # And the hub's own PREVIOUS word steps back to a draft. Without this
         # every upgrade leaves another live version behind, and since
@@ -2936,7 +2958,7 @@ async def _insert_seed_skill(
     tags: str,
     version: int,
     status: str,
-) -> None:
+) -> bool:
     """Insert one seeded version, tolerating a parallel seeder.
 
     The race is real and benign: ``get_db`` seeds on every connection, so two
@@ -2946,8 +2968,12 @@ async def _insert_seed_skill(
     statement of this loop (the second seeded skill) would fail on nothing it
     did wrong, taking the connection down over a row that already says what we
     wanted to say.
+
+    Returns whether THIS connection wrote the row. Losing the race is still
+    fine for the library — the winner wrote the same text — but it is not fine
+    for the feed: the loser wrote nothing and has nothing to report (#1169).
     """
-    await db.execute(
+    cur = await db.execute(
         "INSERT INTO skills (name, kind, version, content, tags, status, "
         "created_by, activated_by) VALUES (?, ?, ?, ?, ?, ?, 'seed', ?) "
         "ON CONFLICT(name, version) DO NOTHING",
@@ -2959,6 +2985,46 @@ async def _insert_seed_skill(
             tags,
             status,
             "seed" if status == "active" else "",
+        ),
+    )
+    return bool(cur.rowcount)
+
+
+async def _record_seed_activation(
+    db: aiosqlite.Connection,
+    name: str,
+    version: int,
+    content: str,
+    previous_content: str | None,
+    previous_version: int | None,
+) -> None:
+    """The seed path leaves the same trace the other two do (#1169).
+
+    Before this, changing the text every agent READS happened on deploy and
+    was recorded nowhere: no human pressed anything, and ``seed_default_skills``
+    wrote no event at all. The payload is the one ``hub/app.py`` writes, built
+    by the same function, so a reader of the feed does not have to know which
+    of the three paths published a version.
+
+    Raw SQL rather than ``repository.insert_event``: ``hub.repository`` imports
+    ``hub.db``, so the call cannot go the other way. No commit here either —
+    the caller commits the loop, and a rollback must take the event with the
+    activation it describes.
+    """
+    await db.execute(
+        "INSERT INTO events (kind, task_id, project_id, actor, payload) "
+        "VALUES ('skill_activated', NULL, NULL, 'seed', ?)",
+        (
+            json.dumps(
+                skill_publish.publication_payload(
+                    name=name,
+                    version=version,
+                    content=content,
+                    previous_content=previous_content,
+                    previous_version=previous_version,
+                ),
+                ensure_ascii=False,
+            ),
         ),
     )
 
