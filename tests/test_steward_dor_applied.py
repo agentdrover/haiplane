@@ -349,3 +349,144 @@ async def test_a_task_that_left_the_draft_is_not_returned(db: aiosqlite.Connecti
 
     assert refusal.value.status_code == 409
     assert await _alerts(db, task_id) == []
+
+
+# --- Находки машинного ревью #330 ------------------------------------------
+
+
+async def test_the_return_is_decided_under_a_write_lock(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 8fcfcf7912b84697: проверил — записал, без лока на запись."""
+    from hub.services import steward_dor_applied as mod
+
+    task_id = await _draft(db)
+    generation = await baseline_if_absent(db, task_id)
+    await _judge(db, task_id, generation)
+    await db.commit()
+    assert not db.in_transaction, "предусловие: соединение чистое"
+
+    at_read: list[bool] = []
+    at_write: list[bool] = []
+    real_seen = mod._seen
+    real_event = repo.insert_event
+
+    async def _watch_read(conn, tid, gen, kind):
+        at_read.append(bool(conn.in_transaction))
+        return await real_seen(conn, tid, gen, kind)
+
+    async def _watch_write(conn, **kw):
+        at_write.append(bool(conn.in_transaction))
+        return await real_event(conn, **kw)
+
+    monkeypatch.setattr(mod, "_seen", _watch_read, raising=True)
+    monkeypatch.setattr(mod.repo, "insert_event", _watch_write, raising=True)
+
+    await apply_dor_judgement(db, task_id, generation)
+
+    assert at_read and all(at_read), "проверка «уже возвращали?» читается вне лока"
+    assert at_write and all(at_write)
+
+
+async def test_a_finding_explains_itself_from_detail(db: aiosqlite.Connection):
+    """Находка e2db58901a8aaa20: объяснение читается только из why."""
+    task_id = await _draft(db)
+    generation = await baseline_if_absent(db, task_id)
+    await _judge(
+        db,
+        task_id,
+        generation,
+        findings=[
+            {
+                "category": "ac_not_verifiable",
+                "file": "",
+                "locator": "none",
+                "title": "AC-2 проверяется словом «корректно»",
+                "detail": "«корректно» нельзя ни выполнить, ни опровергнуть",
+            }
+        ],
+    )
+
+    await apply_dor_judgement(db, task_id, generation)
+
+    alert = (await _alerts(db, task_id))[0]
+    assert "«корректно» нельзя ни выполнить, ни опровергнуть" in alert
+
+
+async def test_a_finding_with_only_detail_is_not_empty(db: aiosqlite.Connection):
+    """Та же находка с другой стороны: находка только с detail — не пустая."""
+    task_id = await _draft(db, title="только detail")
+    generation = await baseline_if_absent(db, task_id)
+    await _judge(
+        db,
+        task_id,
+        generation,
+        findings=[
+            {
+                "category": "ac_not_verifiable",
+                "file": "",
+                "locator": "none",
+                "detail": "AC-1 не проверяется ничем",
+            }
+        ],
+    )
+
+    outcome, _ = await apply_dor_judgement(db, task_id, generation)
+
+    assert outcome == RETURNED
+    assert "AC-1 не проверяется ничем" in (await _alerts(db, task_id))[0]
+
+
+async def test_unreadable_findings_are_not_called_an_empty_list(
+    db: aiosqlite.Connection,
+):
+    """Находка 552e3b7085c66dc9: битый JSON выдаётся за «замечаний не было»."""
+    task_id = await _draft(db)
+    generation = await baseline_if_absent(db, task_id)
+    await _judge(db, task_id, generation)
+    await db.execute(
+        "UPDATE steward_judgements SET findings=? WHERE task_id=?",
+        ("{не json", task_id),
+    )
+    await db.commit()
+
+    with pytest.raises(HTTPException) as refusal:
+        await apply_dor_judgement(db, task_id, generation)
+
+    assert refusal.value.status_code == 409
+    detail = str(refusal.value.detail)
+    assert "без единого замечания" not in detail, (
+        "нечитаемые находки — не «замечаний не было»"
+    )
+    assert "JSON" in detail or "прочитать" in detail
+    assert await _alerts(db, task_id) == []
+
+
+async def test_a_half_written_return_leaves_no_alert(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Возврат ложится целиком или не ложится вовсе.
+
+    Обратная сторона того же лока: алерт пишется раньше события, и без
+    общей транзакции упавшая запись события оставила бы автору замечания,
+    о которых хаб не помнит. Следующее применение сочло бы такой возврат
+    первым — потолок сдвинулся бы на заход вперёд.
+    """
+    from hub.services import steward_dor_applied as mod
+
+    task_id = await _draft(db)
+    generation = await baseline_if_absent(db, task_id)
+    await _judge(db, task_id, generation)
+    await db.commit()
+
+    async def _falls(conn, **kw):
+        raise RuntimeError("запись события не прошла")
+
+    monkeypatch.setattr(mod.repo, "insert_event", _falls, raising=True)
+
+    with pytest.raises(RuntimeError):
+        await apply_dor_judgement(db, task_id, generation)
+
+    assert await _alerts(db, task_id) == [], (
+        "замечания без события — возврат, которого хаб не помнит"
+    )

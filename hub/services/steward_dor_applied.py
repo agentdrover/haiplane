@@ -38,6 +38,14 @@
 статусу (``_HUMAN_QUEUE_ACTIONS['draft']``) — ему сообщается, ПОЧЕМУ
 стюард больше не пытается.
 
+ОДНО ПРИМЕНЕНИЕ ЗА РАЗ. Проверка «уже возвращали?» и запись возврата
+стоят в одной транзакции, взятой сразу на запись: без неё два применения
+с разных соединений оба читают «ещё не возвращали» и оба пишут автору
+полный перечень — потолок, ради которого задача и заводилась, не
+срабатывает. Нечитаемые находки при этом отказ, а не пустой список:
+«замечаний не было» про суждение, которое их содержит, — неправда о
+собственных данных (#516).
+
 ЧЕГО ЗДЕСЬ НЕТ. Одобрения драфта: снятие гейта DoR — предмет соседних
 задач (привратник #1159, композиция с автопилотом #1157), и scope этой
 задачи выводит их наружу. ``approve`` сюда доходит и отклоняется, а не
@@ -55,7 +63,7 @@ import aiosqlite
 from fastapi import HTTPException
 
 from hub import repository as repo
-from hub.db import fetchall, log_activity
+from hub.db import fetchall, log_activity, write_transaction
 from hub.services.finding_identity import finding_uids
 from hub.services.steward_dispatch import KIND_DOR
 
@@ -95,6 +103,48 @@ async def apply_dor_judgement(
     Прав применять не проверяет: это вопрос привратника (#1159), и второй
     ответ на него здесь означал бы два места, где его можно решить
     по-разному.
+
+    Решение целиком идёт под ``BEGIN IMMEDIATE`` (находка ревью 8fcfcf79).
+    До этой правки статус, ревизия и события возврата читались вне всякой
+    транзакции, а писалось всё несколькими ``await`` позже: два применения
+    с разных соединений оба не видели ``steward_dor_returned`` и оба
+    отправляли автору полный перечень — потолок не срабатывал, и автор
+    получал два «первых» возврата. Под write-локом соперник либо успел до
+    нас и виден в прочитанном, либо ждёт очереди и увидит уже записанное
+    событие. Тот же приём, каким #1160 закрыл окно «человек одобрил, пока
+    мы думали» (#238), и та же схема «проверил — вставил» (#1065).
+    """
+    async with write_transaction(db):
+        outcome, detail, remarks_count = await _decide(db, task_id, generation)
+
+    # Журнал активности коммитит сам, поэтому пишется ПОСЛЕ блока: внутри
+    # он зафиксировал бы чужую незавершённую транзакцию — ровно та дыра,
+    # ради которой блок и заведён.
+    if outcome == RETURNED:
+        await log_activity(
+            db,
+            "steward_dor_returned",
+            f"Task #{task_id} draft returned to author "
+            f"(revision {generation}, remarks {remarks_count})",
+        )
+    else:
+        await log_activity(
+            db,
+            "steward_dor_ceiling",
+            f"Task #{task_id} draft loop ceiling at revision {generation}",
+        )
+    return outcome, detail
+
+
+async def _decide(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> tuple[str, str, int]:
+    """Прочитать, решить и записать — одним блоком под write-локом.
+
+    Отдельной функцией, а не телом ``async with``: отказы здесь выходят
+    исключением, и блок обязан их откатить, а не дописать половину
+    возврата — алерт без события автор прочитал бы как возврат, которого
+    хаб не помнит.
     """
     row = await repo.get_task(db, task_id)
     if row is None:
@@ -160,13 +210,17 @@ async def apply_dor_judgement(
 
     if await _seen(db, task_id, generation, EVENT_RETURNED):
         await _hand_to_the_human(db, task_id, generation, remarks)
-        return ESCALATED_TO_HUMAN, (
-            f"постановка на ревизии {generation} не менялась с прошлого "
-            "возврата — решает человек"
+        return (
+            ESCALATED_TO_HUMAN,
+            (
+                f"постановка на ревизии {generation} не менялась с прошлого "
+                "возврата — решает человек"
+            ),
+            len(remarks),
         )
 
     await _return_to_author(db, task_id, generation, remarks)
-    return RETURNED, f"автору отправлено замечаний: {len(remarks)}"
+    return RETURNED, f"автору отправлено замечаний: {len(remarks)}", len(remarks)
 
 
 def _refuse_if_the_draft_is_gone(task: dict[str, Any], task_id: int) -> None:
@@ -236,6 +290,27 @@ def _remarks(judgement: dict[str, Any]) -> list[str]:
     return [_one_remark(entry, uid) for entry, uid in zip(entries, uids, strict=True)]
 
 
+#: Поля, в которых у находки лежит «почему», в порядке предпочтения.
+#: Контракт суждения (#1022) — ``list[dict]`` без схемы полей, и судьи
+#: пишут объяснение по-разному: опубликованная в репозитории схема находок
+#: (``MachineFinding``) зовёт его ``detail``, словарь стюарда — ``why``,
+#: отклонённая находка — ``reason``. Разбор находок в ``steward_evidence``
+#: читает title/detail/why/reason; читать здесь только ``why`` значило бы,
+#: что находка ``{title, detail}`` доедет до автора без причины — ровно то,
+#: что AC-1 запрещает, — а находка с одним ``detail`` будет сочтена пустой
+#: и возврат отклонится «без единого замечания» (находка ревью e2db5890).
+_WHY_FIELDS = ("why", "detail", "reason")
+
+
+def _why(entry: Mapping[str, Any]) -> str:
+    """Объяснение находки — из того поля, в которое его положил судья."""
+    for field in _WHY_FIELDS:
+        text = str(entry.get(field) or "").strip()
+        if text:
+            return text
+    return ""
+
+
 def _has_text(entry: Mapping[str, Any]) -> bool:
     """Есть ли в находке хоть одно слово для автора.
 
@@ -243,9 +318,7 @@ def _has_text(entry: Mapping[str, Any]) -> bool:
     uid с местом, и «в ней что-то написано» перестало бы отличать
     замечание от его адреса.
     """
-    return bool(
-        str(entry.get("title") or "").strip() or str(entry.get("why") or "").strip()
-    )
+    return bool(str(entry.get("title") or "").strip() or _why(entry))
 
 
 def _findings(raw: Any) -> list[Mapping[str, Any]]:
@@ -255,13 +328,27 @@ def _findings(raw: Any) -> list[Mapping[str, Any]]:
     Функция, понимающая только одну из форм, — ровно тот случай, когда
     ``getattr`` над словарём возвращает None про каждое поле, о котором
     его спрашивают (#1007).
+
+    Текст, который не разбирается, — отказ, а не пустой список: см. ниже.
     """
     if isinstance(raw, str):
         try:
             parsed = json.loads(raw or "[]")
-        except ValueError:
+        except ValueError as broken:
+            # Пустой список сюда не годится: выше он неотличим от суждения
+            # без находок, и автор получил бы отказ «возврат без единого
+            # замечания» про суждение, замечания в котором есть — их просто
+            # не прочитали (правило честности #516, находка ревью 552e3b70).
             log.warning("steward dor judgement: findings are not JSON")
-            return []
+            raise HTTPException(
+                409,
+                detail=(
+                    "находки суждения не прочитать: колонка findings — не "
+                    f"JSON ({broken}). Это не «замечаний не было»: "
+                    "применить такое суждение нечем, и формат чинится там, "
+                    "где оно записано"
+                ),
+            ) from broken
     else:
         parsed = raw
     if not isinstance(parsed, list):
@@ -277,7 +364,7 @@ def _one_remark(entry: Mapping[str, Any], uid: str) -> str:
     строка «поле: —» сообщила бы автору, что где-то потерялось значение.
     """
     title = str(entry.get("title") or "").strip()
-    why = str(entry.get("why") or "").strip()
+    why = _why(entry)
     where = str(entry.get("file") or "").strip()
     line = entry.get("start_line")
     if where and line is not None:
@@ -322,7 +409,12 @@ async def _seen(
 async def _return_to_author(
     db: aiosqlite.Connection, task_id: int, generation: int, remarks: list[str]
 ) -> None:
-    """Замечания автору — той же записью, какой пишет watchdog драфтов (#751)."""
+    """Замечания автору — той же записью, какой пишет watchdog драфтов (#751).
+
+    Не коммитит: алерт и событие ложатся в транзакцию вызывающего, и
+    откат уносит оба. Возврат, о котором есть запись автору и нет события,
+    сломал бы потолок — следующее применение сочло бы этот возврат первым.
+    """
     listed = "\n".join(remarks)
     await repo.add_task_update(
         db,
@@ -346,13 +438,6 @@ async def _return_to_author(
         actor=_STEWARD_ACTOR,
         payload={"generation": generation, "remarks": len(remarks)},
     )
-    await db.commit()
-    await log_activity(
-        db,
-        "steward_dor_returned",
-        f"Task #{task_id} draft returned to author "
-        f"(revision {generation}, remarks {len(remarks)})",
-    )
 
 
 async def _hand_to_the_human(
@@ -364,6 +449,8 @@ async def _hand_to_the_human(
     некуда: драфт стоит в его очереди по одному только статусу. Меняется
     адресат сообщения — оно объясняет, почему стюард больше не пытается, и
     называет решения, которые есть у человека.
+
+    Как и возврат, не коммитит: транзакцию держит вызывающий.
     """
     listed = "\n".join(remarks)
     await repo.add_task_update(
@@ -387,12 +474,6 @@ async def _hand_to_the_human(
         task_id=task_id,
         actor=_STEWARD_ACTOR,
         payload={"generation": generation, "reason": "statement_unchanged"},
-    )
-    await db.commit()
-    await log_activity(
-        db,
-        "steward_dor_ceiling",
-        f"Task #{task_id} draft loop ceiling at revision {generation}",
     )
 
 
