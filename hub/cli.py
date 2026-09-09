@@ -1016,6 +1016,26 @@ def cmd_prod_state(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delivery_ack(args: argparse.Namespace) -> int:
+    """Признать расхождение доставки законным — оно замолчит (#1198).
+
+    Живёт в CLI, а не в каталоге MCP, намеренно: каталог стоит у своего
+    рабочего замера, и весь перерасход дал бы один этот инструмент. Платить
+    контекстом КАЖДОГО агента на КАЖДОМ вызове за глагол, который агенту
+    запрещён, — плохая мена. Подробности выбора — в отчёте по задаче.
+    """
+    _api(
+        "POST",
+        f"/api/delivery/discrepancies/{int(args.task_id)}/acknowledge",
+        {"reason": args.reason},
+    )
+    print(
+        f"#{args.task_id}: расхождение признано законным — {args.reason}\n"
+        "Сигнал замолчал; запись осталась в реестре с причиной."
+    )
+    return 0
+
+
 def cmd_undelivered(args: argparse.Namespace) -> int:
     """Completed tasks whose PR is neither merged nor closed (#897)."""
     result = _api("GET", f"/api/delivery/discrepancies?limit={int(args.limit)}")
@@ -2130,6 +2150,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_undelivered.add_argument("--json", action="store_true", help="Print raw JSON")
     p_undelivered.set_defaults(func=cmd_undelivered)
+
+    p_delivery_ack = sub.add_parser(
+        "delivery-ack",
+        help="Признать расхождение доставки законным: оно замолчит, но останется",
+    )
+    p_delivery_ack.add_argument("task_id", type=int)
+    p_delivery_ack.add_argument(
+        "--reason",
+        required=True,
+        help="Почему это законно. Без причины признание было бы выключателем",
+    )
+    p_delivery_ack.set_defaults(func=cmd_delivery_ack)
 
     p_health = sub.add_parser(
         "health", help="Show Hub bind/auth/vast configuration (no secrets)"
