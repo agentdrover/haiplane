@@ -1151,14 +1151,21 @@ def test_an_ordinary_edit_in_a_big_skill_is_still_counted():
     """
     rows = [f"строка номер {i} текста скилла" for i in range(20000)]
     previous = "\n".join(rows) + "\n"
-    content = "\n".join(rows[:10000] + ["ВСТАВЛЕННАЯ СТРОКА"] + rows[10000:]) + "\n"
     assert len(previous) > 85 * 1024, "предпосылка: файл крупнее обычного скилла"
+
+    # Правка не в одну строку, а блоком: остаток после отсечения краёв должен
+    # быть НЕПУСТЫМ, иначе тест зелен и при потолке в ноль — то есть при
+    # сплошном отказе считать что-либо вообще.
+    edited = list(rows)
+    for i in range(9000, 9050):
+        edited[i] = f"переписанная строка {i}"
+    content = "\n".join(edited[:9500] + ["ВСТАВЛЕННАЯ СТРОКА"] + edited[9500:]) + "\n"
 
     summary = skill_publish.summarize_change(
         previous_content=previous, previous_version=1, content=content
     )
     assert summary.baseline == skill_publish.BASELINE_VERSION
-    assert (summary.added_lines, summary.removed_lines) == (1, 0)
+    assert (summary.added_lines, summary.removed_lines) == (51, 50)
     assert "ВСТАВЛЕННАЯ СТРОКА" in skill_publish.unified_diff(
         previous_content=previous, previous_version=1, content=content, version=2
     )
