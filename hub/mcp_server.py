@@ -1765,6 +1765,31 @@ async def hub_submit_for_review(
     )
 
 
+def _review_circle_line(brief: dict[str, Any]) -> str:
+    """Строка про круг ревью, или пустая, когда заходов не было (#1235).
+
+    Ревьюер, читающий бриф, обязан знать, что предыдущий слой находок был
+    разобран и закрыт по-настоящему: без этого очередной отчёт читается
+    как первый, а именно так круг и остаётся невидимым.
+
+    Ноль заходов молчит намеренно — он стоял бы в брифе каждой первой
+    сдачи и стал бы фоном, который не читают.
+    """
+    circle = brief.get("review_circle") or {}
+    laps = int(circle.get("laps") or 0)
+    if not laps:
+        return ""
+    line = f"Круг ревью: заходов {laps} — " + "; ".join(circle.get("breakdown") or [])
+    repeated = circle.get("repeated_categories") or []
+    if repeated:
+        line += (
+            ". Повтор категории: "
+            + ", ".join(repeated)
+            + " — харнесс ходит по одному месту, и это важнее числа заходов"
+        )
+    return line
+
+
 @mcp.tool()
 async def hub_get_review_brief(task_id: int) -> CallToolResult:
     """REVIEWER step: everything needed to review someone else's work (#308).
@@ -1801,6 +1826,9 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
             f"| review cycle {brief.get('review_cycle', 0)}",
         ]
     )
+    circle_line = _review_circle_line(brief)
+    if circle_line:
+        parts.append(circle_line)
     if brief.get("description"):
         parts.append(f"\nDescription:\n{brief['description']}")
     acs = brief.get("acceptance_criteria") or []

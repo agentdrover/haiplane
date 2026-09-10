@@ -299,6 +299,19 @@ async def record_machine_review(
     view = MachineReviewView(**dict(saved))
     view.is_current = view.submission_generation == generation
 
+    # #1235: круг ревью — сколько поколений подряд автор закрывал находки и
+    # получал новые. Считается ЗДЕСЬ, потому что заход виден ровно в момент,
+    # когда приходит очередной отчёт с новыми находками: раньше его нет, а
+    # позже он уже никого не позовёт. Ничего не останавливает — ни этот
+    # приём, ни ревью, ни пересдачу, — и, как всё вокруг, best-effort:
+    # отчёт не должен падать из-за счётчика.
+    try:
+        from hub.services.review_dispatch import name_the_circle
+
+        await name_the_circle(db, task_id)
+    except Exception:  # noqa: BLE001 - degradation is the contract
+        log.exception("circle check failed for task #%s", task_id)
+
     # Auto-verdict (#745): a clean report in a project whose policy allows
     # it gets its APPROVED right here. Best-effort by contract — the report
     # intake must never fail because the autopilot stumbled.
