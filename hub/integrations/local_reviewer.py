@@ -363,17 +363,40 @@ def _container_run_flags(
 _FLAG_ABSENT = object()
 
 
+def _effective(occurrences: list[Any]) -> Any:
+    """ДЕЙСТВУЮЩЕЕ вхождение повторённого флага — ПОСЛЕДНЕЕ. Нет — _FLAG_ABSENT.
+
+    Правило одно на весь модуль, потому что одна и та же ошибка дала здесь
+    уже три разных дефекта: страж судил ПЕРВОЕ вхождение, а инструменты
+    берут ПОСЛЕДНЕЕ, и всё, что дописано правее, страж не видел вовсе.
+
+    ЗАМЕРЕНО 10.09.2026 на машине разработки — оба семейства разборщиков:
+    — spf13/pflag (podman, docker): ``docker context ls --format '{{.Name}}'
+      --format 'LAST_WINS'`` печатает LAST_WINS, а обратный порядок печатает
+      имена контекстов, то есть повторный Set перезаписывает значение;
+    — getopt_long (sudo(8) parse_args.c, systemd-run): программа на C с
+      ``case 'u': user = optarg`` даёт на ``-n -u alice -u bob`` — bob, на
+      ``--user alice --user bob`` — bob, на ``-u bob -nu alice`` — alice.
+
+    Живого podman и systemd-run на машине нет, и повтор флага у них САМИХ не
+    замерялся: замерены их РАЗБОРЩИКИ, названные поимённо.
+    """
+    return occurrences[-1] if occurrences else _FLAG_ABSENT
+
+
 def _flag_value(flags: list[tuple[str, str | None]], flag: str) -> Any:
     """Значение флага среди флагов run; ``_FLAG_ABSENT``, если флага нет.
 
     «Флага нет» и «флаг есть, а времени в нём нет» — разные отказы, и путать
     их нельзя: первый чинится дописыванием флага, второй — исправлением его
     значения, и подсказка обязана называть именно то, что делать.
+
+    Повторённый флаг судится по ПОСЛЕДНЕМУ вхождению (_effective): на
+    ``--timeout 1800 --timeout 0`` действует ноль, то есть срока жизни нет,
+    а страж по первому вхождению пропускал такой запуск молча (найдено
+    машинным ревью 09.09.2026, находка 04d3d4b0f7febee0).
     """
-    for name, value in flags:
-        if name == flag:
-            return value
-    return _FLAG_ABSENT
+    return _effective([value for name, value in flags if name == flag])
 
 
 def _names_a_deadline(value: str | None) -> bool:
@@ -461,9 +484,17 @@ def sandbox_uid() -> str:
     Разбор идёт слева направо, и флаги ищутся те, что принадлежат ПОСЛЕДНЕМУ
     названному инструменту: в ``sudo -u X podman run --user 1000`` хостовый
     пользователь — X, а ``--user`` за podman относится к контейнеру.
+
+    При ПОВТОРЕ флага действует ПОСЛЕДНЕЕ вхождение — то же правило и тот же
+    _effective, что судит срок жизни контейнера. По первому вхождению страж
+    на ``sudo -u alice -u bob`` называл alice, тогда как запуск идёт под bob,
+    и членство в группе каталога прогонов проверялось НЕ У ТОГО пользователя
+    — то есть проверка, заведённая ради 45971e09, отвечала не про ту
+    конфигурацию (найдено при работе над #1208, ревьюер этого не называл).
     """
     parts = shlex.split(config.LOCAL_REVIEW_SANDBOX or "")
     flags: tuple[str, ...] = ()
+    named: list[str] = []
     for i, part in enumerate(parts):
         tool = part.rsplit("/", 1)[-1]
         if tool in _USER_FLAGS:
@@ -471,14 +502,18 @@ def sandbox_uid() -> str:
             continue
         for flag in flags:
             if part.startswith(flag + "="):
-                return part.split("=", 1)[1]
+                named.append(part.split("=", 1)[1])
+                break
             if part == flag and i + 1 < len(parts):
-                return parts[i + 1]
+                named.append(parts[i + 1])
+                break
             if len(flag) == 2 and not flag.startswith("--"):
                 bundled = _bundled_short_value(part, flag[1], parts, i)
                 if bundled:
-                    return bundled
-    return ""
+                    named.append(bundled)
+                    break
+    user = _effective(named)
+    return "" if user is _FLAG_ABSENT else str(user)
 
 
 def scratch_problem() -> list[str]:

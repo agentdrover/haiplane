@@ -4325,6 +4325,20 @@ def test_the_guard_reads_the_sudo_form_of_the_sandbox_user(monkeypatch) -> None:
         # Принять его значило бы проверить членство в группе не того.
         "/usr/bin/sudo -pu haiplane-reviewer /usr/local/bin/wrap": "",
         "/usr/bin/sudo -n -g haiplane /usr/local/bin/wrap": "",
+        # ПОВТОР ФЛАГА: запуск идёт под ПОСЛЕДНИМ названным пользователем, и
+        # членство в группе каталога прогонов надо проверять у него. Замерено
+        # 10.09.2026 на getopt_long — разборщике sudo(8) (parse_args.c) и
+        # systemd-run: «case 'u': user = optarg» на «-n -u alice -u bob» даёт
+        # bob. Страж по ПЕРВОМУ вхождению называл alice, то есть отвечал про
+        # не того пользователя, а проверка 45971e09 на такой строке говорила
+        # не о той конфигурации (найдено при работе над #1208).
+        "/usr/bin/sudo -n -u alice -u bob /usr/local/bin/wrap": "bob",
+        "/usr/bin/sudo -n -u bob -u alice /usr/local/bin/wrap": "alice",
+        "/usr/bin/sudo -n --user alice --user bob /usr/local/bin/wrap": "bob",
+        "/usr/bin/sudo -n --user=alice -u bob /usr/local/bin/wrap": "bob",
+        "/usr/bin/sudo -n -u alice -nu bob /usr/local/bin/wrap": "bob",
+        "/usr/bin/systemd-run --scope --uid=alice --uid=bob --": "bob",
+        "/usr/bin/systemd-run --scope --uid alice --uid=bob --": "bob",
         # Старая форма НЕ сломана — иначе починено одно ценой другого.
         "/usr/bin/systemd-run --scope --uid=haiplane-reviewer --": "haiplane-reviewer",
         "/usr/bin/systemd-run --scope --uid haiplane-reviewer --": "haiplane-reviewer",
@@ -4464,6 +4478,41 @@ def test_a_container_launch_without_its_own_deadline_is_refused(monkeypatch) -> 
         assert local_reviewer.detaching_sandbox() == [], (
             f"«{ok_deadline}» называет срок жизни целым числом секунд больше "
             "нуля — это рабочая форма, а не отказ"
+        )
+
+    # ПОВТОР ФЛАГА: действует ПОСЛЕДНЕЕ вхождение, потому что так делают сами
+    # разборщики — замерено 10.09.2026 на spf13/pflag, которым разбирают
+    # командную строку и podman, и docker: «docker context ls --format
+    # '{{.Name}}' --format 'LAST_WINS'» печатает LAST_WINS, а обратный
+    # порядок печатает имена контекстов. Судя по ПЕРВОМУ вхождению, страж
+    # принимал «--timeout 1800 --timeout 0» за запуск со сроком жизни, тогда
+    # как действует ноль (найдено машинным ревью 09.09.2026, находка
+    # 04d3d4b0f7febee0).
+    for shadowed in (
+        "/usr/bin/podman run --rm -i --timeout 1800 --timeout 0 img",
+        "/usr/bin/podman run --rm -i --timeout=1800 --timeout=0 img",
+        "/usr/bin/podman run --rm -i --timeout 1800 --timeout abc img",
+        "/usr/bin/podman run --rm -i --timeout 1800 --timeout 5 --timeout 0 img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", shadowed)
+        reasons = local_reviewer.detaching_sandbox()
+        assert reasons and all("--timeout" in r for r in reasons), (
+            f"в «{shadowed}» действует ПОСЛЕДНИЙ --timeout, и срока жизни он "
+            f"не задаёт — первое вхождение здесь не значит ничего: {reasons}"
+        )
+
+    # То же правило в обратную сторону: последний --timeout срок задаёт,
+    # значит запуск законен, сколько бы нулей ни стояло левее. Иначе страж
+    # отвергал бы рабочую строку, и починка одного была бы оплачена поломкой
+    # другого.
+    for shadowed_ok in (
+        "/usr/bin/podman run --rm -i --timeout 0 --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout abc --timeout=1800 img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", shadowed_ok)
+        assert local_reviewer.detaching_sandbox() == [], (
+            f"в «{shadowed_ok}» действует последний --timeout, и он называет "
+            f"срок жизни: {local_reviewer.detaching_sandbox()}"
         )
 
     # ``podman ps`` — не запуск контейнера, и судить о нём нечего.
