@@ -4741,6 +4741,110 @@ def test_the_run_guard_refuses_the_string_it_cannot_parse(monkeypatch) -> None:
     )
 
 
+def test_a_consumed_value_does_not_pass_for_the_scope_flag(monkeypatch) -> None:
+    """``--scope``, съеденный как ЗНАЧЕНИЕ соседа, флагом ``--scope`` не является.
+
+    Неразрешённая 5a59af8d620685d0 машинного ревью #371. Воспроизведено на
+    ff617db и на HEAD 149cd825::
+
+        systemd-run --description --scope --uid=haiplane-reviewer /wrap
+        окно -> ['--description', '--scope', '--uid=haiplane-reviewer']
+        detaching_sandbox() -> []            # пропуск
+
+    Окно было ПЛОСКИМ списком токенов, и проверка ``'--scope' not in own``
+    находила своё слово там, где стоит значение ``--description``. Настоящий
+    systemd-run возьмёт ``--scope`` описанием и поднимет transient SERVICE —
+    то есть ровно тот отсоединённый запуск, ради которого отказ и написан.
+    Ошибка шла В СТОРОНУ ПРОПУСКА.
+
+    Возражение опровергателя («рекомендованный рецепт — sudo-враппер, а не
+    systemd-run») отклонено: страж существует не для рекомендованной строки,
+    а для той, которую напишет оператор, — рекомендованную проверять было бы
+    незачем. И systemd-run остаётся названной, поддержанной формой (#1180).
+    """
+    # Значение, СЛУЧАЙНО совпавшее со словом «--scope», отказа не снимает.
+    for sandbox in (
+        "/usr/bin/systemd-run --description --scope --uid=r /wrap",
+        "/usr/bin/systemd-run --unit --scope --uid=r /wrap",
+        "/usr/bin/systemd-run --slice --scope -- /wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.detaching_sandbox(), (
+            f"в «{sandbox}» слово «--scope» стоит ЗНАЧЕНИЕМ соседнего флага, "
+            "а не флагом. systemd-run поднимет transient service, который "
+            "переживёт снятие прогона, — и хаб пропустил его молча"
+        )
+
+    # А рабочие формы, где --scope настоящий, приниматься не перестали:
+    # починка не оплачена ложным отказом (возражение опровергателя учтено).
+    for fine in (
+        "/usr/bin/systemd-run --description=review --scope --uid=r /wrap",
+        "/usr/bin/systemd-run --scope --description review --uid=r /wrap",
+        "/usr/bin/systemd-run --scope --uid=r -- /wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", fine)
+        assert local_reviewer.detaching_sandbox() == [], (
+            f"«{fine}» называет --scope собственным флагом systemd-run: "
+            f"{local_reviewer.detaching_sandbox()}"
+        )
+
+    # Та же поправка на пользователе: имя берётся у флага, а не у соседа.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/sudo --prompt -u alice /wrap"
+    )
+    assert local_reviewer.sandbox_uid() == "", (
+        "«-u» здесь съедено значением --prompt, и пользователя строка не "
+        f"называет вовсе; страж назвал «{local_reviewer.sandbox_uid()}»"
+    )
+
+
+def test_the_run_options_end_at_the_double_dash(monkeypatch) -> None:
+    """``--`` кончает опции самого ``run``: за ним ОБРАЗ, а не флаги.
+
+    Неразрешённая a58d77e268b2d709 машинного ревью #371. Воспроизведено на
+    ff617db и на HEAD 149cd825::
+
+        podman run -- --timeout 1800 img
+        окно флагов -> [('--', None), ('--timeout', '1800')]
+        detaching_sandbox() -> []            # пропуск
+
+    Для podman образ здесь — ``--timeout``, а ``1800`` и ``img`` уже команда
+    внутри контейнера: собственного срока жизни у запуска НЕТ. Страж же
+    находил ``--timeout 1800`` и засчитывал срок, то есть ошибался В СТОРОНУ
+    ПРОПУСКА — ровно тот класс, что AC-3 обязан ловить.
+
+    Хуже того, прошлый круг числил ``--`` СРЕДИ БЕЗЗНАЧНЫХ ФЛАГОВ, то есть
+    отказ по неизвестному флагу на этой строке заведомо не срабатывал:
+    починка одного дефекта прикрывала другой.
+    """
+    for sandbox in (
+        "/usr/bin/podman run -- --timeout 1800 img",
+        "/usr/bin/podman run --rm -i -- --timeout 1800 img",
+        "/usr/bin/podman run -- --rm -i img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.detaching_sandbox(), (
+            f"в «{sandbox}» всё, что стоит за «--», — это образ и команда "
+            "внутри контейнера. Своего срока жизни у запуска нет, и "
+            "контейнер переживёт снятие прогона"
+        )
+        flags = local_reviewer._container_run_flags(shlex.split(sandbox), "podman")
+        assert flags is not None and not any(
+            name == "--timeout" for name, _ in flags.flags
+        ), f"окно флагов run обязано кончиться на «--»: {flags}"
+
+    # ``--`` ДО образа, но со сроком слева — по-прежнему годная строка.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/podman run --rm -i --timeout 1800 -- img",
+    )
+    assert local_reviewer.detaching_sandbox() == [], (
+        "срок назван ДО «--», и разбор обязан его увидеть: "
+        f"{local_reviewer.detaching_sandbox()}"
+    )
+
+
 def test_sudo_names_a_numeric_uid_with_a_hash(monkeypatch) -> None:
     """``sudo -u '#1000'`` — числовой uid, а не имя, которого нет в системе.
 

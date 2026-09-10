@@ -341,7 +341,6 @@ _RUN_VALUE_FLAGS: frozenset[str] = frozenset(
 # только форму ``--flag=value``; значит принять их за беззначные безопасно.
 _RUN_VALUELESS_FLAGS: frozenset[str] = frozenset(
     {
-        "--",
         "--detach",
         "-d",
         "--help",
@@ -428,6 +427,16 @@ def _container_run_flags(parts: list[str], engine: str) -> _RunFlags | None:
         unknown = ""
         k = j + 1
         while k < len(parts) and parts[k].startswith("-"):
+            if parts[k] == "--":
+                # ``--`` кончает опции САМОГО run: следующий за ним токен —
+                # образ, чего бы он ни напоминал. Прежде ``--`` числился
+                # среди беззначных флагов, и разбор шёл дальше: на
+                # ``podman run -- --timeout 1800 img`` страж видел срок
+                # жизни, тогда как для podman образ здесь — ``--timeout``, а
+                # срока нет вовсе. Ошибка шла В СТОРОНУ ПРОПУСКА (найдено
+                # машинным ревью 10.09.2026, неразрешённая a58d77e268b2d709;
+                # воспроизведено на ff617db и на HEAD 149cd825).
+                break
             if parts[k] in _RUN_VALUE_FLAGS:
                 own.append((parts[k], parts[k + 1] if k + 1 < len(parts) else None))
                 k += 2
@@ -510,8 +519,12 @@ def detaching_sandbox() -> list[str]:
     # /wrap --scope`` проходил молча (найдено машинным ревью 10.09.2026,
     # находка 3d5938a9a645c39d; воспроизведено на HEAD 21629cde).
     if any(
-        tool == "systemd-run" and "--scope" not in own
-        for tool, own in _wrapper_windows(parts)
+        window.tool == "systemd-run"
+        # Именно среди ФЛАГОВ окна, а не среди его токенов: ``--scope``,
+        # съеденный как значение соседа, флагом не является (неразрешённая
+        # 5a59af8d620685d0).
+        and not any(name == "--scope" for name, _ in window.flags)
+        for window in _wrapper_windows(parts)
     ):
         reasons.append(_SCOPE_HINT)
     podman_flags = _container_run_flags(parts, "podman")
@@ -566,10 +579,15 @@ _USER_FLAGS: dict[str, tuple[str, ...]] = {
 _SUDO_VALUELESS_SHORT = frozenset("AbEeHiKklnPSsVv")
 
 
-def _bundled_short_value(
-    token: str, letter: str, parts: list[str], i: int
-) -> str | None:
-    """Значение слипшегося короткого флага: ``-nu X``, ``-uX``, ``-nuX``."""
+def _bundled_short_value(token: str, letter: str, following: str | None) -> str | None:
+    """Значение слипшегося короткого флага: ``-nu X``, ``-uX``, ``-nuX``.
+
+    ``following`` — значение, которое окно уже отдало ЭТОМУ флагу отдельным
+    токеном (``None``, если флаг значения не берёт). Раньше сюда передавался
+    весь список окна и индекс, и «следующим» считался соседний токен, кем бы
+    он ни был; теперь сосед приходит только тогда, когда он и вправду
+    значение этого флага.
+    """
     if not token.startswith("-") or token.startswith("--"):
         return None
     body = token[1:]
@@ -579,7 +597,7 @@ def _bundled_short_value(
     rest = body[pos + 1 :]
     if rest:
         return rest
-    return parts[i + 1] if i + 1 < len(parts) else None
+    return following
 
 
 # Флаги СОБСТВЕННЫХ аргументов обёртки, чьё значение стоит ОТДЕЛЬНЫМ
@@ -685,7 +703,27 @@ def _consumes_next(tool: str, arg: str) -> bool:
     )
 
 
-def _wrapper_windows(parts: list[str]) -> list[tuple[str, list[str]]]:
+class _ToolWindow(NamedTuple):
+    """Окно собственных аргументов инструмента, разобранное НА ФЛАГИ.
+
+    Окно отдаётся парами ``(флаг, значение отдельным токеном или None)``, а
+    не плоским списком токенов, потому что плоский список не отличал ФЛАГ от
+    ЗНАЧЕНИЯ ЧУЖОГО ФЛАГА — и на этом страж выносил ПОЛОЖИТЕЛЬНОЕ суждение о
+    строке, которой в ней нет. Измерено на ff617db и на HEAD 149cd825:
+    ``systemd-run --description --scope --uid=haiplane-reviewer /wrap`` давало
+    окно ``['--description', '--scope', '--uid=…']``, проверка ``'--scope' in
+    own`` находила своё слово — и отказ снимался. Но ``--scope`` здесь съеден
+    как ЗНАЧЕНИЕ ``--description``: настоящий systemd-run поднимет transient
+    service, то есть ровно то, ради чего отказ и написан. Ошибка шла В
+    СТОРОНУ ПРОПУСКА (найдено машинным ревью 10.09.2026, неразрешённая
+    5a59af8d620685d0).
+    """
+
+    tool: str
+    flags: list[tuple[str, str | None]]
+
+
+def _wrapper_windows(parts: list[str]) -> list[_ToolWindow]:
     """Окна СОБСТВЕННЫХ аргументов названных инструментов, слева направо.
 
     Окно инструмента кончается там же, где кончает его читать он сам: на
@@ -706,14 +744,14 @@ def _wrapper_windows(parts: list[str]) -> list[tuple[str, list[str]]]:
     (``sudo -u X podman run …``) остаётся видимой, и последнее названное имя
     по-прежнему действующее.
     """
-    windows: list[tuple[str, list[str]]] = []
+    windows: list[_ToolWindow] = []
     i = 0
     while i < len(parts):
         tool = parts[i].rsplit("/", 1)[-1]
         if tool not in _USER_FLAGS:
             i += 1
             continue
-        own: list[str] = []
+        own: list[tuple[str, str | None]] = []
         j = i + 1
         while j < len(parts):
             arg = parts[j]
@@ -722,13 +760,13 @@ def _wrapper_windows(parts: list[str]) -> list[tuple[str, list[str]]]:
                 break
             if not arg.startswith("-") or arg == "-":
                 break
-            own.append(arg)
             if _consumes_next(tool, arg) and j + 1 < len(parts):
-                own.append(parts[j + 1])
+                own.append((arg, parts[j + 1]))
                 j += 2
             else:
+                own.append((arg, None))
                 j += 1
-        windows.append((tool, own))
+        windows.append(_ToolWindow(tool, own))
         i = max(j, i + 1)
     return windows
 
@@ -744,20 +782,20 @@ def _named_sandbox_user() -> tuple[str, str]:
     """
     parts = shlex.split(config.LOCAL_REVIEW_SANDBOX or "")
     named: list[tuple[str, str]] = []
-    for tool, own in _wrapper_windows(parts):
-        flags = _USER_FLAGS[tool]
-        for i, part in enumerate(own):
+    for window in _wrapper_windows(parts):
+        flags = _USER_FLAGS[window.tool]
+        for part, value in window.flags:
             for flag in flags:
                 if part.startswith(flag + "="):
-                    named.append((tool, part.split("=", 1)[1]))
+                    named.append((window.tool, part.split("=", 1)[1]))
                     break
-                if part == flag and i + 1 < len(own):
-                    named.append((tool, own[i + 1]))
+                if part == flag and value is not None:
+                    named.append((window.tool, value))
                     break
                 if len(flag) == 2 and not flag.startswith("--"):
-                    bundled = _bundled_short_value(part, flag[1], own, i)
+                    bundled = _bundled_short_value(part, flag[1], value)
                     if bundled:
-                        named.append((tool, bundled))
+                        named.append((window.tool, bundled))
                         break
     entry = _effective(named)
     return ("", "") if entry is _FLAG_ABSENT else entry
