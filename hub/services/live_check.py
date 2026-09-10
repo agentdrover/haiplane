@@ -9,10 +9,14 @@ that nobody ever touched looked exactly alike on the board.
 
 This module stores that evidence. Three decisions shape it:
 
-1. **The hub does not run the check.** It keeps what someone else observed.
-   Executing task-supplied commands on the production box was ruled out on
-   31.07.2026, and building a second place where that happens would trade a
-   reporting gap for a much worse one.
+1. **The hub runs no command the card supplies.** It keeps what someone else
+   observed. Executing task-supplied commands on the production box was ruled
+   out on 31.07.2026, and building a second place where that happens would
+   trade a reporting gap for a much worse one. #1236 narrows that line without
+   moving it: the hub does run a probe of its own after delivery, but the card
+   only ever names ONE of a closed registry of read-only calls
+   (``hub/services/live_probe.py``) — text from a statement is still data, and
+   never a command.
 
 2. **"Done" costs two facts, not one.** A record claiming a check must say what
    was run and what was seen. "Checked, all good" is the shape a formal stamp
@@ -35,7 +39,12 @@ from hub.models import LiveCheckRecord, LiveCheckView
 
 DONE = "done"
 NOT_APPLICABLE = "not_applicable"
-OUTCOMES = frozenset({DONE, NOT_APPLICABLE})
+# #1236: зонд отработал и ответа не принёс. Третий исход, а не оттенок первых
+# двух: "нечего наблюдать" — утверждение о задаче, "не смог посмотреть" —
+# о попытке. Схлопнутые в одно, они дают карточку, где отказ провайдера читается
+# как отсутствие поверхности, и критерий закрывается тем, чего не было.
+FAILED = "failed"
+OUTCOMES = frozenset({DONE, NOT_APPLICABLE, FAILED})
 
 
 def _refuse(reason: str, message: str, hint: str) -> HTTPException:
@@ -117,6 +126,13 @@ async def record_live_check(
             "'Nothing to observe' is a claim about the task — say why, so a "
             "reader can disagree with it.",
         )
+    if outcome == FAILED and not (probe and reason):
+        raise _refuse(
+            "incomplete_failure",
+            "провал живой проверки называется двумя фактами: что пробовали и почему не вышло",
+            "Голое 'не получилось' неотличимо от того, что никто и не пробовал — "
+            "а это разные состояния, и второе не должно прятаться за первым.",
+        )
 
     # What shipped is what should be observed. The caller may name the sha
     # explicitly (a check can happen long after the deploy); otherwise the
@@ -189,7 +205,7 @@ async def record_live_check(
         "status",
         (
             f"Живая проверка ({outcome}): {probe or reason} → "
-            f"{observation or 'наблюдать нечего'}"
+            + (reason if outcome == FAILED else (observation or "наблюдать нечего"))
             + (f" [sha {sha[:12]}]" if sha else " [sha неизвестен]")
             + (" [не сверено с выкатом]" if deploy_state == UNVERIFIED else "")
         ),

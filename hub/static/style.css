@@ -3839,6 +3839,22 @@ body.htmx-request .htmx-progress {
 
 .finding-evidence { font-size: 11px; margin-top: var(--sp-1); }
 
+/* #1171: слово автора стоит рядом с фактом и подписано как отчёт автора.
+   Тот же кегль, что у факта, — и то и другое ВХОД; отдельная подпись —
+   потому что вопросы разные, и именно здесь границу проще всего потерять. */
+.finding-author { font-size: 11px; margin-top: var(--sp-1); }
+.finding-author-note { font-style: italic; }
+
+/* Категории очереди: самая частая первой, заход идёт одной из них. */
+.finding-categories {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    font-size: 11px;
+    margin-bottom: var(--sp-2);
+}
+.finding-categories a.active { font-weight: 600; color: var(--text); }
+
 .finding-detail { margin-top: var(--sp-1); }
 .finding-detail > summary {
     list-style: none;

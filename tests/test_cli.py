@@ -83,6 +83,12 @@ def test_cmd_list() -> None:
     assert "Alpha" in out.getvalue()
 
 
+def test_cli_list_limit_default_stays_twenty() -> None:
+    """#1229: CLI default matches MCP (20). Bounds live on REST/MCP, not here."""
+    args = cli.build_parser().parse_args(["list"])
+    assert args.limit == 20
+
+
 def test_cmd_create() -> None:
     created = {"id": 99, "title": "New task", "status": "open"}
     mock_api = MagicMock(return_value=created)
@@ -2131,3 +2137,70 @@ def test_cmd_template_list_when_none_installed(monkeypatch, capsys) -> None:
     rc = cli.cmd_template(args)
     assert rc == 1
     assert "No templates installed." in capsys.readouterr().err
+
+
+# --- исходы находок в отчёте о готовности (#1155) ----------------------------
+
+
+def test_done_refuses_broken_finding_outcomes_json(capsys) -> None:
+    """AC-4: неразбираемый JSON — отказ с ненулевым кодом и без запроса.
+
+    Отправить отчёт без исходов и вернуть 0 значило бы записать готовность,
+    потеряв ответ автора: молча потерянный ответ неотличим от неответа, а
+    узнал бы автор об этом только от гейта на следующей сдаче.
+    """
+    rc, api = _run_main(
+        [
+            "update",
+            "42",
+            "--kind",
+            "done",
+            "--message",
+            "готово",
+            "--finding-outcomes",
+            '[{"finding_uid": "abc", ',
+        ]
+    )
+
+    assert rc == 2
+    # Именно not_called: сдача без исходов не должна уезжать вовсе.
+    api.assert_not_called()
+    _, err = _assert_no_traceback(capsys)
+    assert "--finding-outcomes is not valid JSON" in err
+
+
+def test_done_sends_valid_finding_outcomes(capsys) -> None:
+    """И разобранные исходы доезжают до тела запроса, а не только не падают.
+
+    Без этой половины отказ выше зелен и тогда, когда поле не отправляется
+    никогда.
+    """
+    rc, api = _run_main(
+        [
+            "update",
+            "42",
+            "--kind",
+            "done",
+            "--message",
+            "готово",
+            "--finding-outcomes",
+            '[{"finding_uid": "abc", "outcome": "fixed"}]',
+        ]
+    )
+
+    assert rc == 0
+    body = api.call_args.args[2]
+    assert body["kind"] == "done"
+    assert body["finding_outcomes"] == [{"finding_uid": "abc", "outcome": "fixed"}]
+
+
+def test_submit_review_still_refuses_broken_finding_outcomes_json(capsys) -> None:
+    """Общий разбор не сменил поведение сдачи: тот же код и тот же текст."""
+    rc, api = _run_main(
+        ["submit-review", "42", "--finding-outcomes", "{не json"],
+    )
+
+    assert rc == 2
+    api.assert_not_called()
+    _, err = _assert_no_traceback(capsys)
+    assert "--finding-outcomes is not valid JSON" in err
