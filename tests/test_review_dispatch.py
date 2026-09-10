@@ -5038,3 +5038,174 @@ async def test_a_switched_off_threshold_still_counts_on_the_card(
     circle = card.get("review_circle") or {}
     assert circle.get("laps") == 2 and circle.get("named") is False
     assert await _circle_notices(db, task_id) == []
+
+
+async def test_an_incomplete_empty_report_does_not_wipe_the_laps(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Неполный отчёт без находок — «неизвестно», а не «чисто».
+
+    Пустой ПОЛНЫЙ отчёт круг кончает: харнесс дочитал и не нашёл ничего.
+    Неполный отчёт говорит о себе сам, что дочитал не всё, и лестница
+    добора (#879) существует ровно затем, чтобы добрать непрочитанное. Тот
+    же файл уже исключает incomplete из «код прочитан» по этой самой
+    причине, а докстринг review_circle обещает, что поколение без сведений
+    цепь не рвёт: «неизвестно» не равно «чисто».
+
+    Пока цепь рвалась, пустая строка оставалась в machine_reviews
+    навсегда, и КАЖДАЯ следующая сдача снова упиралась в ту же пару и
+    снова сбрасывала хвост: круг переставал быть видимым насовсем.
+
+    Наблюдено на этой же задаче 10.09.2026: отчёт #366 по поколению 2
+    пришёл с incomplete=true и нулём находок, после чего хаб сам вызвал
+    глубокий добор.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-inc"}, "run": {"id": "r-inc"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+
+    task_id = await _submitted(client, db, "spike-1235-incomplete")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+
+    from hub.services.review_dispatch import review_circle
+
+    assert (await review_circle(db, task_id)).count == 2, "предпосылка: два захода"
+
+    # Поколение 4: НЕПОЛНЫЙ отчёт, находок ноль.
+    await db.execute("UPDATE tasks SET submission_generation=4 WHERE id=?", (task_id,))
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=4,
+        harness_skill="lite-diff-review",
+        model="grok-4.6",
+        raw_count=0,
+        incomplete=True,
+        findings_confirmed="[]",
+        unresolved="[]",
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+
+    assert (await review_circle(db, task_id)).count == 2, (
+        "неполный отчёт не рвёт цепь: он сам говорит, что дочитал не всё, "
+        "и обнулять по нему счёт значит объявить «чисто» там, где сказано "
+        "«неизвестно»"
+    )
+
+    # КОНТРОЛЬ: полный пустой отчёт круг по-прежнему кончает.
+    await db.execute("UPDATE tasks SET submission_generation=5 WHERE id=?", (task_id,))
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=5,
+        harness_skill="deep-review",
+        model="grok-4.6",
+        raw_count=0,
+        incomplete=False,
+        findings_confirmed="[]",
+        unresolved="[]",
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+
+    assert (await review_circle(db, task_id)).count == 0, (
+        "а вот ПОЛНЫЙ пустой отчёт круг кончает: харнесс дочитал и не нашёл "
+        "ничего, и звать человека к вышедшей задаче незачем"
+    )
+
+
+async def test_the_brief_text_carries_the_count_before_the_circle_is_named(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Строка брифа несёт число и ДО того, как круг назван.
+
+    Все прочие проверки _review_circle_line идут при named=true, поэтому
+    мутация «молчать, пока не названо» осталась бы зелёной: ревьюер
+    очередной сдачи читал бы отчёт как первый ровно в том случае, ради
+    которого строка и заведена.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-txt"}, "run": {"id": "r-txt"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+
+    task_id = await _submitted(client, db, "spike-1235-brieftext")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+
+    from hub.mcp_server import _review_circle_line
+    from hub.services.review_brief import build_review_brief
+
+    brief = await build_review_brief(db, task_id)
+    assert brief.review_circle.laps == 2 and not brief.review_circle.named
+    rendered = _review_circle_line(brief.model_dump())
+    assert "Круг ревью: заходов 2" in rendered, (
+        "число обязано стоять в ТЕКСТЕ брифа и до порога: ревьюер, не "
+        "знающий, что предыдущий слой был разобран, читает отчёт как первый"
+    )
+    assert "заход 1" in rendered and "заход 2" in rendered
+
+
+async def test_an_incomplete_report_that_found_things_still_counts(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Неполнота отменяет ЧИСТОТУ отчёта, а не его находки.
+
+    Пропускается только отчёт, не принёсший НИЧЕГО: там сведений ноль.
+    Неполный отчёт, который что-то нашёл, — обычный слой находок, и
+    выбросить его значило бы спрятать заход, который человек оплатил.
+
+    Наблюдено на этой же задаче 10.09.2026: глубокий отчёт #369 пришёл с
+    incomplete=true И с находками — то есть это не редкий угол, а обычный
+    исход лестницы добора (#879).
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-inc2"}, "run": {"id": "r-inc2"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+
+    task_id = await _submitted(client, db, "spike-1235-incomplete-found")
+    first = [_confirmed("гонка на записи", "concurrency", 10)]
+    review_id = await _generation_with_findings(db, task_id, 1, confirmed=first)
+
+    await db.execute("UPDATE tasks SET submission_generation=2 WHERE id=?", (task_id,))
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=2,
+        harness_skill="deep-review",
+        model="grok-4.6",
+        raw_count=1,
+        incomplete=True,
+        findings_confirmed=json.dumps(
+            [_confirmed("утечка дескриптора", "resource-leak", 40)],
+            ensure_ascii=False,
+        ),
+        unresolved="[]",
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+    await _author_closed_them(db, task_id, review_id, 1, confirmed=first, unresolved=[])
+
+    from hub.services.review_dispatch import review_circle
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 1, (
+        "заход есть: отчёт неполон, но находку он принёс, и заход этой "
+        "находкой и состоялся"
+    )
+    assert circle.laps[0].arrived == 1

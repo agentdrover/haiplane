@@ -2798,11 +2798,16 @@ async def review_circle(db: aiosqlite.Connection, task_id: int) -> ReviewCircle:
 
     Поколения без отчёта в счёт не входят и цепь не рвут: отчёта нет —
     значит, о находках этого поколения не известно ничего, а «неизвестно»
-    не равно «чисто».
+    не равно «чисто». НЕПОЛНЫЙ отчёт, не принёсший находок, — тот же
+    случай, и потому он тоже пропускается: он САМ говорит, что дочитал не
+    всё, а лестница добора (#879) существует ровно затем, чтобы добрать
+    непрочитанное. Этот же файл уже исключает ``incomplete`` из «код
+    прочитан» по той же причине. Пустой ПОЛНЫЙ отчёт круг по-прежнему
+    кончает: харнесс дочитал и не нашёл ничего.
     """
     rows = await fetchall(
         db,
-        "SELECT submission_generation, findings_confirmed, unresolved "
+        "SELECT submission_generation, findings_confirmed, unresolved, incomplete "
         "FROM machine_reviews WHERE task_id=? "
         "ORDER BY submission_generation, id",
         (task_id,),
@@ -2810,8 +2815,16 @@ async def review_circle(db: aiosqlite.Connection, task_id: int) -> ReviewCircle:
     per_generation: dict[int, list[tuple[str, str]]] = {}
     for raw in rows:
         row = dict(raw)
+        found = _findings_of(row)
+        if not found and bool(row.get("incomplete")):
+            # Сведений ноль: отчёт не дочитал и ничего не принёс. Строка
+            # остаётся в machine_reviews навсегда, поэтому, обнуляй мы по
+            # ней хвост, КАЖДАЯ следующая сдача снова упиралась бы в ту же
+            # пару и снова сбрасывала счёт — круг переставал бы быть
+            # видимым насовсем.
+            continue
         generation = int(row.get("submission_generation") or 0)
-        per_generation.setdefault(generation, []).extend(_findings_of(row))
+        per_generation.setdefault(generation, []).extend(found)
 
     closed_rows = await fetchall(
         db,
