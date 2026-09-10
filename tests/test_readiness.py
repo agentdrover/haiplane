@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import json
+import subprocess
+from pathlib import Path
 
 import aiosqlite
+from httpx import AsyncClient
+
+from hub.integrations.git_ops import GitOpsIntegration
+from hub.integrations.registry import plugins
 
 from hub import repository as repo
 from hub.models import (
@@ -441,3 +447,364 @@ def test_risk_penalties_do_not_touch_the_dor_gate():
     )
     assert score < 100
     assert dor.passed is True, "declared risks never decide the DoR gate"
+
+
+# --- #1232: the subject of a statement must be in the base branch ---
+
+
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(  # noqa: S603
+        ["git", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+            "HOME": str(root),
+        },
+    ).stdout.strip()
+
+
+SUBJECT_PATH = "hub/services/thing.py"
+OTHER_BRANCH = "task-9001/delivers-the-subject"
+
+# What the base branch holds in the case the executors met on 09.09: the name
+# is nowhere near the module.
+BASE_WITHOUT_SUBJECT = '''"""A module that knows nothing about the subject yet."""
+
+
+def existing_helper() -> int:
+    return 1
+'''
+
+# The same module in the shape a GREP would be fooled by: the name appears in
+# the docstring, in a comment, in a string literal and in a dead call — four
+# textual hits, zero definitions.
+BASE_MENTIONING_SUBJECT_IN_PROSE = '''"""A module that only talks about stranded_base."""
+
+# stranded_base will live here one day, once #1204 lands.
+QUERY = "select stranded_base from tasks"
+
+
+def existing_helper() -> int:
+    # A dead reference: nobody ever defined this here.
+    return len("stranded_base")
+'''
+
+# What the unfinished branch of the other task actually delivers.
+BRANCH_WITH_SUBJECT = '''"""The module as the other task's branch leaves it."""
+
+
+def existing_helper() -> int:
+    return 1
+
+
+def stranded_base() -> str:
+    return "here"
+
+
+def base_can_deliver_itself() -> bool:
+    return True
+'''
+
+
+def _clone_with(tmp_path: Path, base_source: str, branch_source: str) -> str:
+    """A clone whose base branch and one task branch differ in ONE module."""
+    root = tmp_path / "clone"
+    (root / "hub" / "services").mkdir(parents=True)
+    _git(root, "init", "-b", "develop")
+    (root / SUBJECT_PATH).write_text(base_source)
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "base")
+    _git(root, "checkout", "-q", "-b", OTHER_BRANCH)
+    (root / SUBJECT_PATH).write_text(branch_source)
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "the other task's work")
+    _git(root, "checkout", "-q", "develop")
+    return str(root)
+
+
+def _use_real_git_reads(monkeypatch) -> None:
+    """Read files from a real repository; leave every other git op mocked."""
+    real = GitOpsIntegration()
+    monkeypatch.setattr(plugins.git_ops, "file_at_ref", real.file_at_ref, raising=False)
+    monkeypatch.setattr(
+        plugins.git_ops, "files_at_ref", real.files_at_ref, raising=False
+    )
+
+
+async def _point_project_at(db: aiosqlite.Connection, workspace: str) -> int:
+    """A project whose declared clone is the fixture repository."""
+    return await repo.create_project(
+        db,
+        slug="subject",
+        name="Subject",
+        workspace_path=workspace,
+        default_branch="develop",
+    )
+
+
+async def _other_task_holding_the_subject(
+    client: AsyncClient, db: aiosqlite.Connection, status: str = "review"
+) -> int:
+    """A task whose branch carries the subject and which has not delivered."""
+    other_id = (
+        await client.post("/api/tasks", json={"title": "Гейт доставки"})
+    ).json()["id"]
+    await db.execute(
+        "UPDATE tasks SET status=?, branch=?, submission_sha='c0ffee' WHERE id=?",
+        (status, OTHER_BRANCH, other_id),
+    )
+    await db.commit()
+    return other_id
+
+
+async def _task_named(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    project_id: int,
+    hints: str,
+    areas: list[str] | None = None,
+) -> int:
+    task_id = (
+        await client.post("/api/tasks", json={"title": "Задача с предметом"})
+    ).json()["id"]
+    await repo.update_task(db, task_id, project_id=project_id)
+    await db.commit()
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "technical_hints": hints,
+            "affected_areas": areas if areas is not None else [SUBJECT_PATH],
+        },
+    )
+    await client.post(f"/api/tasks/{task_id}/approve", json={"force": True})
+    await client.post(f"/api/tasks/{task_id}/claim", json={"agent": "dev"})
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: implement"},
+    )
+    return task_id
+
+
+async def _pair_start(client: AsyncClient, task_id: int):
+    return await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+
+
+async def test_a_task_whose_subject_is_still_in_someone_elses_branch_does_not_open(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path: Path
+):
+    """AC-1 (#1232): the #1209 case — the symbols live only on another branch.
+
+    The refusal has to name things, not decline politely: the NAMES that are
+    missing and the NUMBER of the task whose delivery has to be waited for.
+    Every executor on 09.09 had to find both by hand.
+    """
+    workspace = _clone_with(tmp_path, BASE_WITHOUT_SUBJECT, BRANCH_WITH_SUBJECT)
+    _use_real_git_reads(monkeypatch)
+    project_id = await _point_project_at(db, workspace)
+    other_id = await _other_task_holding_the_subject(client, db)
+    task_id = await _task_named(
+        client,
+        db,
+        project_id,
+        "Опереться на stranded_base и base_can_deliver_itself из гейта доставки.",
+    )
+
+    resp = await _pair_start(client, task_id)
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "subject_not_in_base_branch"
+    assert set(detail["missing"]) == {"stranded_base", "base_can_deliver_itself"}
+    assert detail["found_in_task_id"] == other_id
+    assert detail["found_in_branch"] == OTHER_BRANCH
+    # The task did NOT open.
+    assert (await client.get(f"/api/tasks/{task_id}")).json()["status"] == "claimed"
+    # And the card says so out loud, with the same names and number.
+    feed = " ".join(
+        u["content"] for u in (await client.get(f"/api/tasks/{task_id}/updates")).json()
+    )
+    assert "stranded_base" in feed
+    assert "base_can_deliver_itself" in feed
+    assert f"#{other_id}" in feed
+    assert OTHER_BRANCH in feed
+
+
+async def test_new_work_is_not_mistaken_for_a_missing_subject(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path: Path
+):
+    """AC-2 (#1232): absent from the base branch is the NORMAL case.
+
+    #1172 passed exactly this way on the same day and turned out to be
+    perfectly implementable. The refusal rests on TWO facts, and this test is
+    what dies when the second one is dropped: simplify the rule to "the symbol
+    is not in the base branch" and a task that merely creates something new
+    stops opening — which would be worse than no check at all.
+    """
+    workspace = _clone_with(tmp_path, BASE_WITHOUT_SUBJECT, BRANCH_WITH_SUBJECT)
+    _use_real_git_reads(monkeypatch)
+    project_id = await _point_project_at(db, workspace)
+    # The branch of the other task exists and is unfinished — it simply does
+    # not carry THIS subject.
+    await _other_task_holding_the_subject(client, db)
+    task_id = await _task_named(
+        client, db, project_id, "Завести completely_new_symbol и never_written_before."
+    )
+
+    resp = await _pair_start(client, task_id)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "running"
+
+    from hub.services.readiness import SUBJECT_NEW_WORK, subject_presence
+
+    row = await repo.get_task(db, task_id)
+    presence = await subject_presence(db, dict(row))
+    assert presence.verdict == SUBJECT_NEW_WORK
+    # Named as missing — the verdict is not "found", it is "missing and nobody
+    # else is carrying it".
+    assert set(presence.missing) == {"completely_new_symbol", "never_written_before"}
+
+
+async def test_a_name_in_a_comment_is_not_a_subject(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path: Path
+):
+    """AC-3 (#1232): the check is runtime-shaped, not textual.
+
+    The base branch here mentions ``stranded_base`` four times — docstring,
+    comment, string literal, dead reference — and defines it zero times. A
+    grep would call the subject present and open an empty task; asking what
+    the module BINDS gives the answer ``hasattr`` would give after an import.
+    """
+    from hub.services.readiness import defined_names
+
+    # The direct statement of the property, without any hub around it.
+    bound = defined_names(BASE_MENTIONING_SUBJECT_IN_PROSE)
+    assert bound is not None
+    assert "stranded_base" not in bound
+    assert "existing_helper" in bound
+    assert "stranded_base" in BASE_MENTIONING_SUBJECT_IN_PROSE  # a grep WOULD find it
+
+    # And the same property where it costs something: the task still refuses.
+    workspace = _clone_with(
+        tmp_path, BASE_MENTIONING_SUBJECT_IN_PROSE, BRANCH_WITH_SUBJECT
+    )
+    _use_real_git_reads(monkeypatch)
+    project_id = await _point_project_at(db, workspace)
+    other_id = await _other_task_holding_the_subject(client, db)
+    task_id = await _task_named(client, db, project_id, "Починить stranded_base.")
+
+    resp = await _pair_start(client, task_id)
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["missing"] == ["stranded_base"]
+    assert detail["found_in_task_id"] == other_id
+
+
+async def test_a_branch_with_no_submission_is_not_something_to_wait_for(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path: Path
+):
+    """An unfinished branch is one that has work ON it (#1232).
+
+    A task that owns a branch name and never submitted has nothing to deliver,
+    so treating it as the thing to wait for would refuse openings on the
+    strength of an empty branch.
+    """
+    workspace = _clone_with(tmp_path, BASE_WITHOUT_SUBJECT, BRANCH_WITH_SUBJECT)
+    _use_real_git_reads(monkeypatch)
+    project_id = await _point_project_at(db, workspace)
+    other_id = await _other_task_holding_the_subject(client, db)
+    await db.execute("UPDATE tasks SET submission_sha='' WHERE id=?", (other_id,))
+    await db.commit()
+    task_id = await _task_named(client, db, project_id, "Опереться на stranded_base.")
+
+    resp = await _pair_start(client, task_id)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "running"
+
+
+async def test_a_statement_with_no_names_opens_as_before(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path: Path
+):
+    """No names in the hints means the check has nothing to say (#1232).
+
+    The stated mitigation of the one risk this task carries: hints are free
+    text, and a silent refusal on an empty list of names would cost more than
+    the empty task it is meant to prevent.
+    """
+    workspace = _clone_with(tmp_path, BASE_WITHOUT_SUBJECT, BRANCH_WITH_SUBJECT)
+    _use_real_git_reads(monkeypatch)
+    project_id = await _point_project_at(db, workspace)
+    await _other_task_holding_the_subject(client, db)
+    task_id = await _task_named(
+        client, db, project_id, "Сделать хорошо, а плохо не делать.", areas=[]
+    )
+
+    resp = await _pair_start(client, task_id)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "running"
+
+
+def test_subject_names_ignores_prose_and_paths():
+    """Only identifier-shaped tokens, and paths donate no symbols (#1232)."""
+    from hub.services.readiness import subject_names
+
+    names = subject_names(
+        "Правка в hub/services/delivery_state.py: символы stranded_base и "
+        "base_can_deliver_itself, класс ReadinessConfig. Ветка task-1204/foo."
+    )
+    assert names == [
+        "stranded_base",
+        "base_can_deliver_itself",
+        "ReadinessConfig",
+    ]
+
+
+async def test_the_dispatch_start_refuses_the_same_way(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path: Path
+):
+    """Both doors into work, not one (#1232).
+
+    A rule applied at one of two call sites is a rule with a hole: pair-start
+    and the headless dispatch start are the two ways a task reaches
+    ``running``, and an empty task opened through the second one costs exactly
+    what it costs through the first.
+    """
+    workspace = _clone_with(tmp_path, BASE_WITHOUT_SUBJECT, BRANCH_WITH_SUBJECT)
+    _use_real_git_reads(monkeypatch)
+    project_id = await _point_project_at(db, workspace)
+    other_id = await _other_task_holding_the_subject(client, db)
+    task_id = (
+        await client.post("/api/tasks", json={"title": "Через диспетчер"})
+    ).json()["id"]
+    await repo.update_task(db, task_id, project_id=project_id)
+    await db.commit()
+    await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "technical_hints": "Опереться на stranded_base.",
+            "affected_areas": [SUBJECT_PATH],
+        },
+    )
+    await client.post(f"/api/tasks/{task_id}/approve", json={"force": True})
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: implement"},
+    )
+
+    resp = await client.post(f"/api/tasks/{task_id}/start", json={})
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["found_in_task_id"] == other_id
+    assert (await client.get(f"/api/tasks/{task_id}")).json()["status"] == "open"
