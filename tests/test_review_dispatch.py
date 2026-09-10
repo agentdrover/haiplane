@@ -4751,7 +4751,15 @@ def test_the_scope_flag_is_read_only_from_systemd_runs_own_arguments(
     ):
         monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", hidden)
         reasons = local_reviewer.sandbox_problem()
-        assert reasons and all("--scope" in r for r in reasons), (
+        # Подстроки «--scope» мало: она стоит и в ИМЕНИ формы, поэтому её
+        # находит любой другой отказ этой же формы. Найдено мутацией
+        # 10.09.2026: «if missing:» -> «if False:» оставляла тест зелёным,
+        # потому что отказ по терминатору называет форму «systemd-run
+        # --scope». Отказ обязан называть ПРИЧИНУ, а она одна — transient
+        # service, переживающий снятие прогона.
+        assert reasons and all(
+            "--scope" in r and "transient service" in r for r in reasons
+        ), (
             f"«{hidden}» — systemd-run БЕЗ --scope: ``--scope`` здесь стоит "
             "среди аргументов полезной нагрузки и transient service в scope "
             f"не превращает, а страж пропустил запуск молча: {reasons}"
@@ -4874,9 +4882,9 @@ def test_a_container_launch_without_its_own_deadline_is_refused(monkeypatch) -> 
         config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/systemd-run --quiet --pipe --uid=x --"
     )
     reasons = local_reviewer.sandbox_problem()
-    assert reasons and all("--scope" in r for r in reasons), (
-        f"systemd-run без --scope остаётся отказом: {reasons}"
-    )
+    assert reasons and all(
+        "--scope" in r and "transient service" in r for r in reasons
+    ), f"systemd-run без --scope остаётся отказом: {reasons}"
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_SANDBOX",
@@ -5114,7 +5122,9 @@ def test_a_consumed_value_does_not_pass_for_the_scope_flag(monkeypatch) -> None:
     ):
         monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
         reasons = local_reviewer.sandbox_problem()
-        assert reasons and all("--scope" in r for r in reasons), (
+        assert reasons and all(
+            "--scope" in r and "transient service" in r for r in reasons
+        ), (
             f"в «{sandbox}» слово «--scope» стоит ЗНАЧЕНИЕМ соседнего флага, "
             "а не флагом. systemd-run поднимет transient service, который "
             f"переживёт снятие прогона: {reasons}"
