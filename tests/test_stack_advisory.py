@@ -8,6 +8,7 @@ stacked on the unmerged task-392 branch and nothing warned about it).
 
 from __future__ import annotations
 
+import pytest
 from unittest.mock import patch
 
 import aiosqlite
@@ -646,6 +647,154 @@ async def test_branch_ancestry_unresolvable_ref_is_unknown() -> None:
     assert relation == "unknown"
 
 
+async def test_probe_refreshes_a_missing_ref_before_calling_it_missing() -> None:
+    # #1204, найдено машинным ревью сдачи №3. Резолвер читает ТОЛЬКО локальные
+    # ссылки, поэтому «ветки нет в клоне» и «ветку сюда не тянули» давали один
+    # и тот же ref_unresolved. Пока ответ был advisory, разницы не было; гейт
+    # доставки начал на ней действовать и говорил человеку «эту ветку никто не
+    # вернёт» про ветку, которая всё это время лежала на origin.
+    fetched: list[str] = []
+    present = dict(_shas())
+    present.pop("task-392/base^{commit}")
+
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = present.get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "ls-remote":
+            # origin answers: that head exists.
+            return (0, f"bbb222\t{args[-1]}\n", "")
+        if args[0] == "fetch":
+            fetched.append(args[-1])
+            present["task-392/base^{commit}"] = "bbb222"
+            return (0, "", "")
+        if args[0] == "rev-list":
+            return (0, "3" if len(args) == 4 else "1", "")
+        return (0, "", "")
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        probe = await GitOpsIntegration().branch_stacking_probe(
+            "task-424/fix", "task-392/base", base_branch="develop", repo="/tmp/repo"
+        )
+
+    assert fetched == ["+refs/heads/task-392/base:refs/remotes/origin/task-392/base"], (
+        "обновляется ровно та ссылка, которой не хватило, и явным рефспеком"
+    )
+    assert probe.outcome is StackProbeOutcome.stacked, (
+        "после обновления ответ настоящий, а не «посмотреть не удалось»"
+    )
+
+
+async def test_probe_still_says_unresolved_when_the_refresh_does_not_help() -> None:
+    # Обратная сторона того же: ветки нет и на origin. Тогда ref_unresolved
+    # остаётся, но теперь он значит «сервер её тоже не знает», а не «мы не
+    # смотрели» — и только на таком ответе гейту можно что-то утверждать.
+    # «Не знает» здесь — ОТВЕТ origin (ls-remote отработал, вывод пустой), а
+    # не отсутствие ответа: сдача №4 моделировала fetch с rc=0 и тем закрепляла
+    # ложную посылку, что сбой fetch неотличим от пустого origin.
+    asked: list[str] = []
+    fetched: list[str] = []
+
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = _shas().get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "ls-remote":
+            asked.append(args[-1])
+            return (0, "", "")
+        if args[0] == "fetch":
+            fetched.append(args[-1])
+            return (0, "", "")
+        return (0, "", "")
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        probe = await GitOpsIntegration().branch_stacking_probe(
+            "task-424/fix", "task-999/gone", base_branch="develop", repo="/tmp/repo"
+        )
+
+    assert asked == ["refs/heads/task-999/gone"], (
+        "origin обязан быть спрошен именно про эту ветку до вывода"
+    )
+    assert fetched == [], "нечего тянуть: origin ответил, что такой ветки нет"
+    assert probe.outcome is StackProbeOutcome.unavailable
+    assert probe.reason == "ref_unresolved"
+    assert (probe.details or "").strip() == "task-999/gone", (
+        "в details только то, что не разрешилось ПОСЛЕ обновления"
+    )
+
+
+@pytest.mark.parametrize(
+    ("rc", "err"),
+    [
+        (124, ""),
+        (
+            128,
+            "fatal: unable to access 'https://github.com/x/y/': Could not resolve host",
+        ),
+        (128, "fatal: Authentication failed"),
+    ],
+    ids=["timeout", "host_unreachable", "auth"],
+)
+async def test_probe_does_not_call_a_branch_gone_when_origin_did_not_answer(
+    rc: int, err: str
+) -> None:
+    # #1204, найдено машинным ревью сдачи №4. Сбой самого обновления —
+    # таймаут в 60 с, auth, моргание origin — выбрасывался: check=False и
+    # возврат _git не читался, после чего утверждалось «на origin её нет, ждать
+    # бесполезно». Рядом в этом же файле ls-remote --heads различает «не
+    # ответил» (rc != 0) и «ветки нет» (пустой вывод), а пробный merge на
+    # rc 124/128 отвечает «спросить не удалось». Теперь и проба так: сбой —
+    # отдельный исход, не ref_unresolved, и гейт по нему человека не зовёт.
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = _shas().get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "ls-remote":
+            return (rc, "", err)
+        if args[0] == "fetch":
+            raise AssertionError("после неотвеченного ls-remote тянуть нечего")
+        return (0, "", "")
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        probe = await GitOpsIntegration().branch_stacking_probe(
+            "task-424/fix", "task-999/gone", base_branch="develop", repo="/tmp/repo"
+        )
+
+    assert probe.outcome is StackProbeOutcome.unavailable
+    assert probe.reason == "remote_unreachable", (
+        "сбой обновления — не «ветки нет на origin»"
+    )
+    assert "task-999/gone" in (probe.details or "")
+    assert f"rc={rc}" in (probe.details or "")
+
+
+async def test_probe_treats_a_failed_fetch_as_no_answer_too() -> None:
+    # origin ответил, что ветка есть, а сам fetch упал — lock параллельного
+    # fetch, обрыв на середине. Это тоже «спросить не удалось», не «ветки нет».
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = _shas().get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "ls-remote":
+            return (0, f"eee555\t{args[-1]}\n", "")
+        if args[0] == "fetch":
+            return (
+                128,
+                "",
+                "fatal: Unable to create '.git/FETCH_HEAD.lock': File exists",
+            )
+        return (0, "", "")
+
+    with patch("hub.integrations.git_ops._git", side_effect=fake_git):
+        probe = await GitOpsIntegration().branch_stacking_probe(
+            "task-424/fix", "task-999/gone", base_branch="develop", repo="/tmp/repo"
+        )
+
+    assert probe.outcome is StackProbeOutcome.unavailable
+    assert probe.reason == "remote_unreachable"
+    assert "FETCH_HEAD.lock" in (probe.details or "")
+
+
 # --- #1205: цена обхода. Одна ветка против СПИСКА, и память по SHA ---
 #
 # #1186 сделал этот обход условием мержа, и поллер стал звать его каждый цикл
@@ -955,3 +1104,160 @@ async def test_a_raising_candidate_does_not_end_the_walk(
     )
     assert assessment.outcome == orchestration.STACK_STACKED
     assert assessment.base_task_branch == "task-901/stacked"
+
+
+# --- #1204 × #1205: исход «origin не ответил» на ПАКЕТНОМ пути -------------
+#
+# #1204 завёл третий исход пробы — remote_unreachable — на одиночной форме,
+# где обновление ссылки делается для трёх имён подряд. #1205 превратил ту же
+# пробу в пакетный обход: ветка под судом и база разрешаются ОДИН раз на весь
+# обход, кандидат — на каждой строке, а одиночная форма стала обходом из
+# одного элемента поверх пакетного. Значит у исхода теперь два места
+# применения, и одиночные тесты выше держат только одно из них.
+#
+# Замерено мутацией на этой самой ветке до появления тестов ниже: подмена
+# remote_unreachable на ref_unresolved в общей (ветка/база) части обхода —
+# 77 passed, ноль падений; обновление только первого кандидата вместо каждого
+# — тоже 77 passed. Оба перекладывают на человека отказ, который проходит сам.
+
+
+@pytest.mark.parametrize(
+    "missing", ["task-424/fix", "develop"], ids=["branch_under_judgement", "base"]
+)
+async def test_an_unanswered_shared_ref_is_unreachable_for_every_row(
+    missing: str,
+) -> None:
+    # Ветка под судом и база — общие для всего обхода, поэтому неответ origin
+    # про них не факт про какого-то одного кандидата: его обязана получить
+    # КАЖДАЯ строка. Одиночная проба этого не показывает — в ней строка одна,
+    # и «первому ответили правильно» неотличимо от «всем ответили правильно».
+    table = _walk_shas(3)
+    table.pop(f"{missing}^{{commit}}")
+    table.pop(f"origin/{missing}^{{commit}}")
+    asked: list[str] = []
+
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = table.get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "ls-remote":
+            asked.append(args[-1])
+            return (128, "", "fatal: Could not resolve host: github.com")
+        if args[0] == "fetch":
+            raise AssertionError("после неотвеченного ls-remote тянуть нечего")
+        if args[0] == "rev-list":
+            raise AssertionError("сравнивать нечего: ссылка не разрешена")
+        return (0, "", "")
+
+    others = [f"task-{500 + i}/other" for i in range(3)]
+    results = await _walk(others, fake_git)
+
+    assert [name for name, _ in results] == others, "ответ приходит каждой строке"
+    assert asked == [f"refs/heads/{missing}"], (
+        "общая ссылка обновляется один раз на весь обход, а не на каждой строке"
+    )
+    for name, result in results:
+        assert result.outcome is StackProbeOutcome.unavailable, name
+        assert result.reason == "remote_unreachable", (
+            f"{name}: неответ origin про общую ссылку — не «ветки нет на origin»"
+        )
+        assert missing in (result.details or ""), name
+
+
+async def test_every_candidate_is_refreshed_not_only_the_first() -> None:
+    # Обновление кандидатской ссылки живёт ВНУТРИ цикла обхода. Если оно
+    # достанется только первой строке, остальные вернут ref_unresolved — а это
+    # единственная причина, по которой гейту доставки разрешено звать человека
+    # (_stranded_with_a_dead_ref). Тогда сбой сети на второй строке становится
+    # утверждением «origin ответил, что такой ветки у него нет».
+    table = _walk_shas(3)
+    for i in range(3):
+        table.pop(f"task-{500 + i}/other^{{commit}}")
+        table.pop(f"origin/task-{500 + i}/other^{{commit}}")
+    asked: list[str] = []
+
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = table.get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "ls-remote":
+            asked.append(args[-1])
+            return (124, "", "")
+        if args[0] == "fetch":
+            raise AssertionError("после неотвеченного ls-remote тянуть нечего")
+        return (0, "", "")
+
+    others = [f"task-{500 + i}/other" for i in range(3)]
+    results = await _walk(others, fake_git)
+
+    assert asked == [f"refs/heads/{name}" for name in others], (
+        "origin спрашивают про КАЖДОГО кандидата, а не только про первого"
+    )
+    assert [r.reason for _, r in results] == ["remote_unreachable"] * 3, (
+        "ни одна строка не выдаёт неответ за «origin такой ветки не знает»"
+    )
+
+
+async def test_a_later_candidate_still_gets_its_answer_after_a_refresh() -> None:
+    # Обратная сторона: обновление на не-первой строке ОТВЕЧАЕТ, и обход
+    # обязан продолжиться настоящим ответом, а не «посмотреть не удалось».
+    # Без этой пары предыдущий тест закрывался бы и полным отказом от
+    # обновления кандидатов.
+    table = _walk_shas(2)
+    table.pop("task-501/other^{commit}")
+    table.pop("origin/task-501/other^{commit}")
+
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = table.get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "ls-remote":
+            return (0, f"bbb001\t{args[-1]}\n", "")
+        if args[0] == "fetch":
+            table["origin/task-501/other^{commit}"] = "bbb001"
+            return (0, "", "")
+        if args[0] == "rev-list":
+            return (0, "3" if len(args) == 4 else "1", "")
+        return (0, "", "")
+
+    results = await _walk(["task-500/other", "task-501/other"], fake_git)
+
+    assert [r.outcome for _, r in results] == [
+        StackProbeOutcome.stacked,
+        StackProbeOutcome.stacked,
+    ], "вторая строка получает настоящий ответ после обновления её ссылки"
+
+
+async def test_an_unreachable_remote_is_never_remembered() -> None:
+    # Память #1205 хранит только stacked и clear. remote_unreachable —
+    # повторяемый по построению (#1197), и запомнить его значило бы приклеить
+    # одну плохую минуту к паре коммитов до конца их жизни. Проверяется
+    # вторым обходом: origin, который «починился», обязан быть спрошен снова.
+    table = _walk_shas(1)
+    table.pop("task-500/other^{commit}")
+    table.pop("origin/task-500/other^{commit}")
+    healed = {"yes": False}
+
+    async def fake_git(*args, repo=None, check=True, **kw):
+        if args[0] == "rev-parse" and "--verify" in args:
+            sha = table.get(args[-1])
+            return (0, sha, "") if sha else (1, "", "")
+        if args[0] == "ls-remote":
+            if not healed["yes"]:
+                return (124, "", "")
+            return (0, f"bbb000\t{args[-1]}\n", "")
+        if args[0] == "fetch":
+            table["origin/task-500/other^{commit}"] = "bbb000"
+            return (0, "", "")
+        if args[0] == "rev-list":
+            return (0, "3" if len(args) == 4 else "1", "")
+        return (0, "", "")
+
+    first = await _walk(["task-500/other"], fake_git)
+    assert first[0][1].reason == "remote_unreachable"
+
+    healed["yes"] = True
+    second = await _walk(["task-500/other"], fake_git)
+    assert second[0][1].outcome is StackProbeOutcome.stacked, (
+        "неответ не запоминается: тот же вопрос задаётся заново"
+    )
