@@ -479,7 +479,12 @@ _SCOPE_VOWELS = "аеиоуыэюя"
 # NORMALISATION, applied to every stem alike, so it can only bring two words
 # together, never take them apart. Measured over the 11865 distinct Russian
 # words of this repository it brings together 30 groups, and all 30 are one
-# word: ветка/веток, список/списка, порядок/порядке, находка/находок.
+# word: ветка/веток, список/списка, порядок/порядке, находка/находок. With
+# the й restored it is 32, and the two it adds — настройка/настроек and
+# канарейка/канареек — are one word as well.
+#
+# The floor is what keeps it off short roots: without it «сток» collapses to
+# «стк» and takes «стек» with it, and those are two words.
 _SCOPE_FLEETING_VOWEL_STEM = 4
 
 # Two-letter present-tense endings that are also the tail of ordinary nouns.
@@ -526,12 +531,12 @@ def _drop_fleeting_vowel(stem: str) -> str:
     every stem alike, which is what makes it safe: a normalisation both sides
     go through cannot pull two forms of one word apart.
     """
-    if (
-        len(stem) > _SCOPE_FLEETING_VOWEL_STEM
-        and stem[-1] == "к"
-        and stem[-2] in "ое"
-        and stem[-3] not in _SCOPE_VOWELS
-    ):
+    if len(stem) > _SCOPE_FLEETING_VOWEL_STEM and stem[-1] == "к" and stem[-2] in "ое":
+        # After a vowel the stem is holding a й that the plural swallowed:
+        # «настройка» keeps «настройк», «настроек» has to get the й back or it
+        # lands on «настро-к» and meets nothing. «канарейка»/«канареек» too.
+        if stem[-3] in _SCOPE_VOWELS:
+            return stem[:-2] + "йк"
         return stem[:-2] + "к"
     return stem
 

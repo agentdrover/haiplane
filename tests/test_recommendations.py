@@ -617,6 +617,10 @@ def _scope_and_criterion(scope_form: str, ac_form: str):
 #       runs on.
 #   коммит / коммита   — a noun whose tail «ит» is also a verb ending; the
 #       matcher stemmed it to «комм» and stopped meeting its own oblique form.
+#   настройка / настроек — the same fleeting vowel, but after a vowel, where
+#       the plural also swallows the й of the stem. It is here because the
+#       mutation series found it: neutering the vowel branch of the rule left
+#       every other pair passing.
 # The last three come from the machine review of this task, which reproduced
 # the miss on each of them against the producer, not against the stemmer.
 _LIVE_WORD_FORMS = [
@@ -629,6 +633,7 @@ _LIVE_WORD_FORMS = [
     ("постановка", "постановок"),
     ("находок", "находкой"),
     ("коммит", "коммита"),
+    ("настройка", "настроек"),
 ]
 
 
@@ -716,6 +721,21 @@ def test_a_different_word_with_the_same_opening_does_not_cover_the_item(
     )
     assert item in named[0].message
     assert named[0].expected_score_delta == 0
+
+
+def test_a_short_root_is_not_collapsed_onto_another_word():
+    """«сток» and «стек» are two words, and the floor is what keeps them so.
+
+    The fleeting vowel is dropped only from a stem long enough to survive it.
+    Without that floor «сток» becomes «стк» and «стек» becomes «стк» with it —
+    a check that names uncovered scope items would fall silent on a real one.
+    """
+    item, row = _scope_and_criterion("сток", "стек")
+    named = build_scope_coverage_warnings(
+        StatementInputs(scope_in=[item], ac_rows=[row])
+    )
+    assert len(named) == 1, "«сток» и «стек» — разные слова, пункт никем не покрыт"
+    assert item in named[0].message
 
 
 # The residual, written down instead of implied. The doubled н of the long
