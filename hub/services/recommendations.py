@@ -470,6 +470,30 @@ _SCOPE_SOFT_ENDINGS: tuple[str, ...] = (
 
 _CYRILLIC = re.compile(r"[а-я]")
 
+_SCOPE_VOWELS = "аеиоуыэюя"
+
+# The genitive plural of a noun in -ка pushes a vowel back into the stem:
+# «постановка» keeps «постановк», «постановок» does not. The same о (or е)
+# sits between the two of them in «находок», «ошибок», «правок», «карточек» —
+# and -ка nouns are what this backlog is written in. Dropping that vowel is a
+# NORMALISATION, applied to every stem alike, so it can only bring two words
+# together, never take them apart. Measured over the 11865 distinct Russian
+# words of this repository it brings together 30 groups, and all 30 are one
+# word: ветка/веток, список/списка, порядок/порядке, находка/находок.
+_SCOPE_FLEETING_VOWEL_STEM = 4
+
+# Two-letter present-tense endings that are also the tail of ordinary nouns.
+# «коммит», «формат», «результат», «приоритет», «захват» are not verbs, but
+# «ит»/«ат»/«ет» come off them all the same — and the noun's own oblique
+# forms («коммита» -> «коммит») then stem to the word the matcher has just
+# thrown away. Refusing to strip them off short words is not the answer:
+# measured on the same corpus, demanding five characters back splits 73
+# groups that are one word (делает/делал, входит/входа, ставит/ставится).
+# So a word ending this way keeps BOTH readings — the verb stem and itself —
+# and a shared reading decides. That adds 21 links, of which 20 are one word
+# (коммит/коммита, результат/результата, секрет/секрета).
+_SCOPE_AMBIGUOUS_ENDINGS: tuple[str, ...] = ("ат", "ят", "ет", "ит", "ут", "ют")
+
 # Latin words are left exactly as the first cut of this matcher left them —
 # their first five characters. Russian endings say nothing about them, and
 # this change deliberately does not touch behaviour it has no measurement for.
@@ -495,21 +519,58 @@ def _strip_ending(word: str, endings: tuple[str, ...], floor: int) -> str | None
     return None
 
 
-def _stem(word: str) -> str:
-    """The word with one inflectional ending removed."""
+def _drop_fleeting_vowel(stem: str) -> str:
+    """The о or е that the genitive plural pushes back into a -ка stem, gone.
+
+    «постановок» -> «постановк», so that it meets «постановка». Applied to
+    every stem alike, which is what makes it safe: a normalisation both sides
+    go through cannot pull two forms of one word apart.
+    """
+    if (
+        len(stem) > _SCOPE_FLEETING_VOWEL_STEM
+        and stem[-1] == "к"
+        and stem[-2] in "ое"
+        and stem[-3] not in _SCOPE_VOWELS
+    ):
+        return stem[:-2] + "к"
+    return stem
+
+
+def _stem_and_ending(word: str) -> tuple[str, str]:
+    """The word with one inflectional ending removed, and that ending."""
     if not _CYRILLIC.search(word):
-        return word[:_SCOPE_LATIN_STEM_LEN]
-    stem = _strip_ending(word, _SCOPE_REFLEXIVE_ENDINGS, _SCOPE_MIN_HARD_STEM) or word
-    cut = _strip_ending(stem, _SCOPE_HARD_ENDINGS, _SCOPE_MIN_HARD_STEM)
+        return word[:_SCOPE_LATIN_STEM_LEN], ""
+    body = _strip_ending(word, _SCOPE_REFLEXIVE_ENDINGS, _SCOPE_MIN_HARD_STEM) or word
+    cut = _strip_ending(body, _SCOPE_HARD_ENDINGS, _SCOPE_MIN_HARD_STEM)
     if cut is None:
-        cut = _strip_ending(stem, _SCOPE_SOFT_ENDINGS, _SCOPE_MIN_SOFT_STEM)
-    if cut is not None:
-        stem = cut
-    # «доставленная» and «доставлена» are one word; the doubled н of the long
-    # participle is the only thing left between their stems.
+        cut = _strip_ending(body, _SCOPE_SOFT_ENDINGS, _SCOPE_MIN_SOFT_STEM)
+    stem = body if cut is None else cut
+    ending = word[len(stem) :]
+    # «изменение» and «изменённая» are one word; the doubled н of the long
+    # participle is the only thing left between their stems. The SHORT
+    # participle «изменена» is not reached by this — it loses «на» and stops
+    # at «измене» — and that residual is named in the tests, not papered over.
     if stem.endswith("нн") and len(stem) > _SCOPE_MIN_SOFT_STEM:
         stem = stem[:-1]
-    return stem
+    return _drop_fleeting_vowel(stem), ending
+
+
+def _stem(word: str) -> str:
+    """The word with one inflectional ending removed."""
+    return _stem_and_ending(word)[0]
+
+
+def _stems(word: str) -> set[str]:
+    """Every reading of ``word`` this matcher is prepared to accept.
+
+    One, normally. Two when the ending removed is a present-tense verb ending
+    that is also the tail of an ordinary noun: there the matcher cannot tell
+    «коммит» the noun from a verb, so it declines to choose and keeps both.
+    """
+    stem, ending = _stem_and_ending(word)
+    if ending in _SCOPE_AMBIGUOUS_ENDINGS:
+        return {stem, word}
+    return {stem}
 
 
 # Words too common to carry meaning when matching a scope_in item against the
@@ -559,10 +620,10 @@ def _significant_stems(text: str) -> set[str]:
     for w in words:
         if len(w) < _SCOPE_MIN_WORD_LEN:
             continue
-        stem = _stem(w)
-        if stem in _SCOPE_STOPWORDS or w in _SCOPE_STOPWORDS:
+        readings = _stems(w)
+        if w in _SCOPE_STOPWORDS or readings & _SCOPE_STOPWORDS:
             continue
-        stems.add(stem)
+        stems |= readings
     return stems
 
 

@@ -588,7 +588,7 @@ def _scope_and_criterion(scope_form: str, ac_form: str):
     item = f"Учёт {scope_form} без исключений"
     row = _row(
         "AC-1",
-        "постановка проекта",
+        "дано условие",
         "читается готовность",
         f"назван {ac_form} и ничего кроме",
         source="requirement",
@@ -610,6 +610,15 @@ def _scope_and_criterion(scope_form: str, ac_form: str):
 #       guess — «поименно» and «объявленный» are written both ways in it. The
 #       pair belongs here because its ё falls early enough to change the stem,
 #       which the поимённо pair does not.
+#   постановка / постановок — the word this backlog is named after; the
+#       genitive plural pushes an о back into the stem, and «-ка» nouns are
+#       what statements here are written in.
+#   находок / находкой — the same fleeting о, on the word the review process
+#       runs on.
+#   коммит / коммита   — a noun whose tail «ит» is also a verb ending; the
+#       matcher stemmed it to «комм» and stopped meeting its own oblique form.
+# The last three come from the machine review of this task, which reproduced
+# the miss on each of them against the producer, not against the stemmer.
 _LIVE_WORD_FORMS = [
     ("сдаче", "сдачи"),
     ("гейтов", "гейтам"),
@@ -617,6 +626,9 @@ _LIVE_WORD_FORMS = [
     ("пустого", "пустым"),
     ("поимённо", "поименно"),
     ("отчёта", "отчета"),
+    ("постановка", "постановок"),
+    ("находок", "находкой"),
+    ("коммит", "коммита"),
 ]
 
 
@@ -624,10 +636,13 @@ _LIVE_WORD_FORMS = [
 def test_a_scope_item_covered_in_another_word_form_is_not_named(scope_form, ac_form):
     """A criterion that uses the SAME word in another form covers the item.
 
-    The matcher stems by prefix precisely so it survives Russian inflection.
-    Where it does not, a covered item gets named — and naming a covered item
-    is the one failure this code exists to avoid, because an author who sees
-    the warning fire on work he did cover learns to skip it.
+    The matcher removes the ending AS AN ENDING — it does not keep a prefix of
+    a guessed length; that algorithm was measured and discarded, and a reader
+    who restored it from this docstring would reopen the window it closed.
+    Where the ending tables do not reach, a covered item gets named — and
+    naming a covered item is the one failure this code exists to avoid,
+    because an author who sees the warning fire on work he did cover learns to
+    skip it.
 
     The fixtures are deliberately narrow: apart from the pair under test, no
     word of the scope item appears in the criterion, so the pair alone decides
@@ -660,8 +675,13 @@ def test_a_scope_item_covered_in_another_word_form_is_not_named(scope_form, ac_f
 # Provenance, honestly: the first five pairs are a scope word and a criterion
 # word of one and the same live task (#803 разбор/разбирает, #803 and #819
 # ответа/отвечает, #801 видимость/видит, #811 запрос/запрашивали, #812
-# факт/фактическое). The last two — задание/задача and словарь/слово — come
-# from the review of this task, which reproduced the miss on them.
+# факт/фактическое). Then задание/задача and словарь/слово, from the review
+# of this task, which reproduced the miss on them. Last, принят/принтер and
+# список/списание: those two guard the rules added for the SECOND review —
+# «принят» loses the verb ending «ят» and so keeps itself as a second reading,
+# and «список» loses its fleeting о. Neither loosening may reach a word that
+# is merely spelled alike — and both pairs share a root, which is the harder
+# case, not the easier one.
 _DIFFERENT_WORDS = [
     ("разбор", "разбирает"),
     ("ответа", "отвечает"),
@@ -670,6 +690,8 @@ _DIFFERENT_WORDS = [
     ("факт", "фактическое"),
     ("задание", "задача"),
     ("словарь", "слово"),
+    ("принят", "принтер"),
+    ("список", "списание"),
 ]
 
 
@@ -693,6 +715,31 @@ def test_a_different_word_with_the_same_opening_does_not_cover_the_item(
         f"«{scope_form}» и «{ac_form}» — разные слова, пункт никем не покрыт"
     )
     assert item in named[0].message
+    assert named[0].expected_score_delta == 0
+
+
+# The residual, written down instead of implied. The doubled н of the long
+# participle is collapsed, so «изменение» and «изменённая» are one word — but
+# the SHORT participle «изменена» loses «на» and stops one letter earlier.
+# Closing that needs the participle suffix н dropped from every stem, and
+# measured over this repository's own Russian text that also brings «выше»
+# together with «вышла». The charge is zero, so the cheaper miss is kept and
+# NAMED here: a residual nobody wrote down is a residual somebody will later
+# report as new.
+_UNREACHED_WORD_FORMS = [("изменённая", "изменена"), ("доставленная", "доставлена")]
+
+
+@pytest.mark.parametrize(("scope_form", "ac_form"), _UNREACHED_WORD_FORMS)
+def test_the_short_participle_is_a_known_miss_not_a_silent_one(scope_form, ac_form):
+    """These two ARE one word, and the matcher still names the item."""
+    item, covering = _scope_and_criterion(scope_form, ac_form)
+    named = build_scope_coverage_warnings(
+        StatementInputs(scope_in=[item], ac_rows=[covering])
+    )
+    assert len(named) == 1, (
+        f"«{scope_form}»/«{ac_form}» стали покрывать друг друга — "
+        "остаток закрыт, и этот тест пора заменить на обратный"
+    )
     assert named[0].expected_score_delta == 0
 
 
