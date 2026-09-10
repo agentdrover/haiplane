@@ -1760,6 +1760,7 @@ async def web_skill_detail(name: str, request: Request, skill_error: str = Query
             "baseline_absent": skill_publish.BASELINE_ABSENT,
             "baseline_unrecorded": skill_publish.BASELINE_UNRECORDED,
             "baseline_no_record": skill_publish.BASELINE_NO_RECORD,
+            "baseline_too_large": skill_publish.BASELINE_TOO_LARGE,
             "skill_error": skill_error,
         },
     )

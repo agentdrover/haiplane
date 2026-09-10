@@ -61,6 +61,15 @@
         <span class="badge badge-review">дифа в записи нет</span>
         {{ view.diff.note }}
     </p>
+    {# Диф не посчитан из-за размера. Своя ветка нужна ровно затем, зачем и
+       предыдущие: без неё счётчики None рисовались бы как «+ строк, − строк»,
+       то есть как посчитанный диф, в котором ничего не изменилось. Отказ
+       считать обязан читаться как отказ, а не как «изменений нет». #}
+    {% elif view.diff.baseline == baseline_too_large %}
+    <p class="skill-publish-summary">
+        <span class="badge badge-review">диф не посчитан</span>
+        {{ view.diff.note }}
+    </p>
     {% else %}
     <p class="skill-publish-summary">
         К активной версии v{{ view.diff.baseline_version }}:

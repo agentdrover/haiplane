@@ -20,12 +20,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import aiosqlite
 from httpx import AsyncClient
 
-from hub import skill_publish
+from hub import repository, skill_publish
 from hub.db import (
     MACHINE_REVIEW_CYCLE_SKILL,
     MULTI_AGENT_REVIEW_SKILL,
@@ -1079,3 +1080,356 @@ async def test_racing_seeders_publish_the_change_once_update_branch(
     events = await _events(db, RACED)
     assert len(events) == 1, f"смена одна — и запись о ней одна; получено {len(events)}"
     assert events[0]["version"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Стоимость построения дифа (находка ревью, сдача 5)
+# ---------------------------------------------------------------------------
+
+
+# Патологический вход — не выдумка: это текст, в котором строки переставлены
+# через одну. Замер ДО починки на нём: 1000 строк — 0.04 с, 6000 — 1.26 с,
+# 16000 (83 КБ) — 9.39 с, и вызов синхронный внутри асинхронного обработчика.
+# На СЛУЧАЙНО перемешанном входе тормозов нет вовсе: при уникальных строках
+# срабатывает эвристика autojunk из difflib, поэтому вход тут именно такой.
+def _interleaved(lines: int) -> tuple[str, str]:
+    rows = [f"строка номер {i}" for i in range(lines)]
+    return "\n".join(rows) + "\n", "\n".join(rows[::2] + rows[1::2]) + "\n"
+
+
+class _Exploded(AssertionError):
+    """Признак того, что дорогая работа всё-таки была начата."""
+
+
+def test_a_diff_too_big_to_compute_says_so_instead_of_lying_with_zeros(monkeypatch):
+    """Отказ считать — своё состояние, а не «+0/−0» и не пустое место.
+
+    Проверяется ДВА разных утверждения, и оба нужны:
+
+    1. работа не делается — ``SequenceMatcher`` не зовётся вовсе. Это
+       доказывается взрывом, а не секундомером: часы на загруженной машине
+       меряют машину, а не код;
+    2. отказ назван словами. «Изменений нет» и «изменения не посчитаны» —
+       разные ответы, и подменять первым второй значит воспроизвести ровно тот
+       дефект, ради которого заведена задача.
+    """
+
+    def explode(*_args, **_kwargs):
+        raise _Exploded("дорогой SequenceMatcher позван на входе за потолком")
+
+    monkeypatch.setattr(skill_publish.difflib, "SequenceMatcher", explode)
+
+    previous, content = _interleaved(16000)
+    summary = skill_publish.summarize_change(
+        previous_content=previous, previous_version=7, content=content
+    ).as_dict()
+
+    assert summary["baseline"] == skill_publish.BASELINE_TOO_LARGE
+    assert summary["added_lines"] is None and summary["removed_lines"] is None, (
+        "числа, которых не считали, показывать нельзя — ни нулями, ни как-либо"
+    )
+    assert summary["note"] == skill_publish.BASELINE_TOO_LARGE_NOTE
+    assert "НЕ «изменений нет»" in summary["note"], (
+        "отказ считать обязан прямо отличать себя от «изменений нет»"
+    )
+    assert (
+        skill_publish.unified_diff(
+            previous_content=previous, previous_version=7, content=content, version=8
+        )
+        == ""
+    ), "тот же потолок обязан держать и unified diff — иначе он потратит те же секунды"
+
+
+def test_an_ordinary_edit_in_a_big_skill_is_still_counted():
+    """Потолок отсекает патологию, а не большие скиллы.
+
+    Скилл в 85 КБ — обычный размер, и правка нескольких строк внутри него
+    обязана считаться как считалась. Общие начало и хвост отсекаются за O(n),
+    поэтому от файла в 20000 строк остаётся почти пустая задача (замер: 0
+    клеток, 0.01 с). Без этого теста потолок можно было бы опустить до нуля и
+    объявить «починено» — при том, что диф исчез бы вообще везде.
+    """
+    rows = [f"строка номер {i} текста скилла" for i in range(20000)]
+    previous = "\n".join(rows) + "\n"
+    content = "\n".join(rows[:10000] + ["ВСТАВЛЕННАЯ СТРОКА"] + rows[10000:]) + "\n"
+    assert len(previous) > 85 * 1024, "предпосылка: файл крупнее обычного скилла"
+
+    summary = skill_publish.summarize_change(
+        previous_content=previous, previous_version=1, content=content
+    )
+    assert summary.baseline == skill_publish.BASELINE_VERSION
+    assert (summary.added_lines, summary.removed_lines) == (1, 0)
+    assert "ВСТАВЛЕННАЯ СТРОКА" in skill_publish.unified_diff(
+        previous_content=previous, previous_version=1, content=content, version=2
+    )
+
+
+async def test_the_page_names_the_refusal_instead_of_drawing_empty_counters(
+    client: AsyncClient, db
+):
+    """Записанный отказ считать человек читает словами, а не как «+ строк».
+
+    Без своей ветки в шаблоне счётчики ``None`` рисуются как «К активной
+    версии v1: + строк, − строк» — то есть как посчитанный диф, в котором
+    ничего не изменилось.
+    """
+    name = "too-big-skill"
+    await _install(
+        db, name, [(1, OLD, "draft", "seed", ""), (2, NEW, "active", "denis", "denis")]
+    )
+    await db.execute(
+        "INSERT INTO events (kind, task_id, project_id, actor, payload) "
+        "VALUES ('skill_activated', NULL, NULL, 'denis', ?)",
+        (
+            json.dumps(
+                {
+                    "name": name,
+                    "version": 2,
+                    "diff": {
+                        "baseline": skill_publish.BASELINE_TOO_LARGE,
+                        "baseline_version": 1,
+                        "added_lines": None,
+                        "removed_lines": None,
+                        "note": skill_publish.BASELINE_TOO_LARGE_NOTE,
+                    },
+                    "content_scan": {
+                        "rules_triggered": [],
+                        "note": skill_publish.SCAN_NOTE,
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        ),
+    )
+    await db.commit()
+
+    page = (await client.get(f"/skills/{name}")).text
+    block = page[page.index("Что было опубликовано") :]
+    assert skill_publish.BASELINE_TOO_LARGE_NOTE in block
+    assert "диф не посчитан" in block
+    assert "К активной версии v1:" not in block, (
+        "отказ считать нельзя рисовать строкой со счётчиками — она читается "
+        "как посчитанный диф"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Правка одного перевода строки (находка ревью, сдача 5)
+# ---------------------------------------------------------------------------
+
+
+def test_splitting_lines_is_reversible():
+    """Разбиение на строки не теряет ничего — на этом держится вся сводка.
+
+    ``str.splitlines()`` лоссовый: ``"instruction"`` и ``"instruction\\n"``
+    дают один список. Пока разбиение обратимо, «списки совпали» равносильно
+    «тексты совпали», и сводка физически не может сказать «изменений нет» о
+    тексте, который изменился.
+    """
+    for text in (
+        "",
+        "\n",
+        "instruction",
+        "instruction\n",
+        "a\nb",
+        "a\nb\n",
+        "a\r\nb\r\n",
+        "hello\n---\nworld\n",
+        OLD,
+        NEW,
+    ):
+        assert "\n".join(skill_publish.split_lines(text)) == text, (
+            f"разбиение потеряло содержимое: {text!r}"
+        )
+
+
+def test_a_change_of_only_the_final_newline_is_visible():
+    """Правка, состоящая ровно в переводе строки, видна и в сводке, и в дифе.
+
+    Замер ДО починки: ``"instruction"`` → ``"instruction\\n"`` давало
+    ``+0/−0`` при ПУСТОМ unified diff — то есть текст, раздаваемый агентам,
+    менялся, а человеку показывали «ничего не изменилось».
+    """
+    previous, content = "instruction", "instruction\n"
+    summary = skill_publish.summarize_change(
+        previous_content=previous, previous_version=1, content=content
+    )
+    assert summary.baseline == skill_publish.BASELINE_VERSION
+    assert (summary.added_lines, summary.removed_lines) != (0, 0), (
+        "содержимое изменилось — сводка не имеет права показать «+0/−0»"
+    )
+    assert skill_publish.unified_diff(
+        previous_content=previous, previous_version=1, content=content, version=2
+    ), "диф не имеет права быть пустым там, где содержимое разное"
+
+    # И обратная сторона: там, где содержимое действительно совпало, сводка
+    # обязана сказать «+0/−0», а не выдумать разницу из воздуха.
+    same = skill_publish.summarize_change(
+        previous_content=content, previous_version=1, content=content
+    )
+    assert (same.added_lines, same.removed_lines) == (0, 0)
+    assert (
+        skill_publish.unified_diff(
+            previous_content=content, previous_version=1, content=content, version=2
+        )
+        == ""
+    )
+
+
+# ---------------------------------------------------------------------------
+# Гонка на снимке базы: пути 1 и 2 (находка ревью, сдача 5)
+# ---------------------------------------------------------------------------
+
+
+class _Gate:
+    """Встретить N участников — либо пойти дальше по таймауту.
+
+    Таймаут не послабление, а условие исполнимости: под write-локом второй
+    писатель до точки встречи не доходит вовсе, пока первый не закоммитил, и
+    жёсткий барьер повесил бы тест вместо того, чтобы его пройти. Победа
+    выглядит так: первый пришёл, подождал впустую, дописал; второй пришёл уже
+    после и увидел работу первого.
+    """
+
+    def __init__(self, parties: int, timeout: float) -> None:
+        self.parties = parties
+        self.timeout = timeout
+        self.seen = 0
+        self.event = asyncio.Event()
+
+    async def arrive(self) -> None:
+        self.seen += 1
+        if self.seen >= self.parties:
+            self.event.set()
+            return
+        try:
+            await asyncio.wait_for(self.event.wait(), self.timeout)
+        except (TimeoutError, asyncio.TimeoutError):
+            pass
+
+
+def _gate_the_baseline_read(monkeypatch, name: str, gate: _Gate) -> None:
+    """Задержать каждого читателя основания сравнения по этому скиллу.
+
+    Точка выбрана там, где она и есть в коде: сразу ПОСЛЕ чтения прежней
+    активной версии и до записи. Именно этот промежуток гонка и использует.
+    """
+    original = repository.get_active_skill
+
+    async def gated(conn, skill_name):
+        row = await original(conn, skill_name)
+        if skill_name == name:
+            await gate.arrive()
+        return row
+
+    monkeypatch.setattr(repository, "get_active_skill", gated)
+
+
+async def test_two_concurrent_creates_record_a_consistent_chain(
+    client: AsyncClient, db, monkeypatch
+):
+    """Путь 1: две одновременные публикации одного скилла.
+
+    Замер ДО починки на этом же тесте:
+
+        STATUSES: [200, IntegrityError('UNIQUE constraint failed:
+                   skills.name, skills.version')]
+        CHAIN: {1: None, 2: 1}
+
+    То есть вторая публикация не просто записала неверное основание — она
+    потерялась целиком, отдав 500. Оба чтения перед записью (MAX(version) и
+    прежняя активная версия) шли по снимку, устаревавшему до вставки.
+    """
+    name = "race-create"
+    first = await client.post("/api/skills", json={"name": name, "content": "v1\n"})
+    assert first.status_code == 200
+
+    _gate_the_baseline_read(monkeypatch, name, _Gate(2, 0.5))
+
+    results = await asyncio.gather(
+        client.post("/api/skills", json={"name": name, "content": "a\nb\n"}),
+        client.post("/api/skills", json={"name": name, "content": "c\nd\ne\n"}),
+        return_exceptions=True,
+    )
+    assert [getattr(r, "status_code", r) for r in results] == [200, 200], (
+        f"обе публикации обязаны состояться; получено {results}"
+    )
+
+    events = await _events(db, name)
+    chain = {e["version"]: e["diff"].get("baseline_version") for e in events}
+    assert chain == {1: None, 2: 1, 3: 2}, (
+        "основанием каждой публикации обязана быть та версия, что была "
+        f"активной непосредственно перед ней; получено {chain}"
+    )
+
+
+async def test_two_concurrent_activations_record_a_consistent_chain(
+    client: AsyncClient, db, monkeypatch
+):
+    """Путь 2: два человека активируют разные драфты одного скилла разом.
+
+    Замер ДО починки на этом же тесте: ``CHAIN: {2: 1, 3: 1}`` — обе записи
+    называют основанием v1, хотя вторая активация шла уже поверх первой.
+    Постоянное событие и показанный по нему диф говорили о паре версий,
+    которая никогда не следовала одна за другой.
+    """
+    name = "race-activate"
+    await _install(
+        db,
+        name,
+        [
+            (1, "v1\n", "active", "seed", "denis"),
+            (2, "v2\n", "draft", "seed", ""),
+            (3, "v3\n", "draft", "seed", ""),
+        ],
+    )
+
+    _gate_the_baseline_read(monkeypatch, name, _Gate(2, 0.5))
+
+    results = await asyncio.gather(
+        client.patch(f"/api/skills/{name}/versions/2/activate"),
+        client.patch(f"/api/skills/{name}/versions/3/activate"),
+        return_exceptions=True,
+    )
+    assert [getattr(r, "status_code", r) for r in results] == [200, 200], (
+        f"обе активации обязаны состояться; получено {results}"
+    )
+
+    events = await _events(db, name)
+    chain = {e["version"]: e["diff"].get("baseline_version") for e in events}
+    assert chain in ({2: 1, 3: 2}, {3: 1, 2: 3}), (
+        "основание каждой активации — версия, реально предшествовавшая ей; "
+        f"получено {chain}"
+    )
+
+
+async def test_activating_the_same_version_twice_at_once_records_one_publication(
+    client: AsyncClient, db, monkeypatch
+):
+    """Проверка «эта версия ещё не активна» — тоже чтение перед записью.
+
+    Без общего write-лока две одновременные активации ОДНОЙ версии проходят
+    её обе и пишут два события об одной публикации, причём второе — с дифом к
+    самой себе.
+    """
+    name = "race-same-version"
+    await _install(
+        db,
+        name,
+        [(1, "v1\n", "active", "seed", "denis"), (2, "v2\n", "draft", "seed", "")],
+    )
+
+    _gate_the_baseline_read(monkeypatch, name, _Gate(2, 0.5))
+
+    results = await asyncio.gather(
+        client.patch(f"/api/skills/{name}/versions/2/activate"),
+        client.patch(f"/api/skills/{name}/versions/2/activate"),
+        return_exceptions=True,
+    )
+    assert [getattr(r, "status_code", r) for r in results] == [200, 200]
+
+    events = await _events(db, name)
+    assert len(events) == 1, (
+        f"публикация одна — и запись о ней одна; получено {len(events)}"
+    )
+    assert events[0]["diff"]["baseline_version"] == 1
