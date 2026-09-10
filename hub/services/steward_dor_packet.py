@@ -50,6 +50,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -63,6 +65,9 @@ from hub.services.steward_evidence import (
     ABSENT,
     NO_STORED_CLASS,
     PRESENT,
+    QUOTE_AC_TEST_REF,
+    QUOTE_DECLARED_AREA,
+    QUOTE_RISK_CLASS_REASON,
     QUOTE_TASK_STATEMENT,
     EvidenceFact,
     QuotedText,
@@ -184,6 +189,18 @@ class DraftEvidencePacket:
     readiness: dict[str, Any] = field(default_factory=dict)
     # Чужие слова, отдельно от собственных фактов хаба (#1076).
     quotes: tuple[QuotedText, ...] = ()
+    # Отпечаток СОСТОЯНИЯ, о котором говорит пакет (``_revision_stamp``).
+    revision: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def stable(self) -> bool:
+        """Описывает ли пакет ОДНО состояние.
+
+        ``False`` означает, что состояние двигалось всё время сборки и пакет
+        собран из кусков разных ревизий. Это не факт об постановке, а факт о
+        самой сборке, поэтому лежит рядом с фактами, а не среди них.
+        """
+        return bool(self.revision.get("stable", True))
 
     def fact(self, source: str) -> EvidenceFact:
         if source not in DRAFT_GROUND_SOURCES:
@@ -405,20 +422,71 @@ def _draft_risk_fact(task: dict[str, Any]) -> EvidenceFact:
     )
 
 
-def _statement_quotes(task: dict[str, Any]) -> tuple[QuotedText, ...]:
-    """Текст постановки — как текст, с автором.
+def _authored_texts(
+    task: dict[str, Any], ac_fact: EvidenceFact
+) -> list[tuple[str, str]]:
+    """Каждая строка пакета, которую набрал АВТОР, а не вычислил хаб.
 
-    Список исчерпывающий по построению, а не по добросовестности: свободного
-    текста пакет больше не несёт. Текст критериев сюда не входит намеренно —
-    пакет сообщает состояние критериев, а не их формулировки.
+    Список исчерпывающий по построению, и построение здесь — не «свободный
+    текст постановки», а ПРОИСХОЖДЕНИЕ. Прошлая редакция считала цитатами
+    только три поля постановки, и этого хватало ровно до тех пор, пока факты
+    не начали ПЕРЕНОСИТЬ авторские строки: ``test_ref`` уезжал в
+    ``ac_locator.criteria[].locator`` дословно, ``affected_areas`` — в
+    ``diff_vs_areas.declared``, а признаки класса риска составляет хаб, но
+    заявленные области вставляет в них как есть. Перенос делает строку
+    похожей на вычисление хаба, и мимо ``injection_signals`` она проходила
+    молча: пакет писал ``injection_suspected=False``, то есть УТВЕРЖДАЛ, что
+    подозрений нет, про текст, который никто не смотрел. Это хуже молчания —
+    судья читает утверждение хаба и получает чужой приказ под видом факта.
+
+    Строки не вырезаются из фактов: стюарду нужно видеть, что именно написал
+    автор. Они едут ДВАЖДЫ — значением факта и цитатой, — и второе снимает
+    ложное утверждение о безопасности первого.
+
+    Что сюда НЕ входит и почему: ``ac_id`` проверен схемой (AC-<число>),
+    ``verifiable_by`` и ``risk_class`` — перечисления, ``status``/``reason``
+    локатора — константы расчёта #506, ``reason`` зависимости складывает
+    репозиторий из номера PR (#485), счёты и признаки — числа и флаги хаба.
+    Ни в одной из них автор не может оставить текст. Полнота этого списка
+    проверяется тестом, а не добросовестностью того, кто заведёт следующее
+    поле.
+    """
+    out: list[tuple[str, str]] = []
+    for column in ("description", "user_story", "problem_statement"):
+        text = (task.get(column) or "").strip()
+        if text:
+            out.append((QUOTE_TASK_STATEMENT, text))
+    # Ниже цитируется РОВНО то значение, которое лежит в факте, — не
+    # обрезанное и не нормализованное. Цитата, отличающаяся от факта хотя бы
+    # пробелом, перестаёт быть цитатой ИМЕННО этой строки, и «текст проверен»
+    # снова становится утверждением про что-то другое.
+    if ac_fact.is_present:
+        for item in ac_fact.value.get("criteria") or []:
+            locator = item.get("locator") or ""
+            if locator.strip():
+                out.append((QUOTE_AC_TEST_REF, locator))
+    for area in deserialize_str_list(task.get("affected_areas")):
+        if area.strip():
+            out.append((QUOTE_DECLARED_AREA, area))
+    for reason in deserialize_str_list(task.get("risk_class_reasons")):
+        if reason.strip():
+            out.append((QUOTE_RISK_CLASS_REASON, reason))
+    return out
+
+
+def _statement_quotes(
+    task: dict[str, Any], ac_fact: EvidenceFact
+) -> tuple[QuotedText, ...]:
+    """Чужие слова — как слова, с автором и с признаками (#1076).
+
+    Текст критериев (given/when/then) сюда не входит намеренно: пакет
+    сообщает СОСТОЯНИЕ критериев, а не их формулировки, и в фактах их нет —
+    значит и цитировать нечего.
     """
     author = (task.get("assigned_agent") or task.get("source") or "").strip()
-    texts = [
-        (task.get("description") or "").strip(),
-        (task.get("user_story") or "").strip(),
-        (task.get("problem_statement") or "").strip(),
-    ]
-    return tuple(quote(QUOTE_TASK_STATEMENT, author, t) for t in texts if t)
+    return tuple(
+        quote(source, author, text) for source, text in _authored_texts(task, ac_fact)
+    )
 
 
 def _readiness(task: dict[str, Any]) -> dict[str, Any]:
@@ -442,6 +510,52 @@ def _readiness(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _revision_stamp(db: aiosqlite.Connection, task_id: int) -> dict[str, Any]:
+    """Отпечаток состояния, о котором пакет собирается говорить.
+
+    ЗАЧЕМ ОТПЕЧАТОК, А НЕ ОДНО ПОКОЛЕНИЕ. ``statement_generation`` считает
+    ревизии ПОСТАНОВКИ, и считает их по отпечатку из ``STATEMENT_FIELDS``
+    плюс критерии (#1156). Рёбер зависимостей в этом отпечатке нет, и это
+    правильно: добавление блокера постановку не переписывает. Но пакет
+    сообщает о зависимостях ФАКТ, и факт этот меняется ровно тогда, когда
+    поколение стоит на месте. Один такт: стюард читает «блокирующих нет»,
+    ему добавляют недоставленный блокер, стюард записывает одобрение под тем
+    же поколением — и одобрение выглядит выданным по состоянию, которого уже
+    нет. Поэтому отпечаток берётся по ВСЕМУ, о чём пакет говорит, а не по
+    одной его половине.
+
+    ЗАЧЕМ СЧИТАТЬ ОТПЕЧАТОК ПОСТАНОВКИ ЗАНОВО, А НЕ ЧИТАТЬ КОЛОНКУ. Колонку
+    ``statement_fingerprint`` обновляет только путь записи готовности
+    (#1156); правка, прошедшая мимо него, оставит колонку прежней. Отпечаток,
+    который не двигается при изменившемся содержимом, хуже отсутствующего:
+    он утверждает неизменность.
+    """
+    from hub.services.statement_generation import statement_fingerprint
+
+    row = await repo.get_task(db, task_id)
+    task = dict(row) if row is not None else {}
+    edges = await repo.list_task_dependencies(db, task_id)
+    blocked_by = sorted(
+        (int(e.get("task_id") or 0), bool(e.get("delivered")))
+        for e in edges.get("blocked_by", [])
+    )
+    return {
+        "statement_generation": int(task.get("statement_generation") or 0),
+        "statement": await statement_fingerprint(db, task_id),
+        "dependencies": hashlib.sha256(
+            json.dumps(blocked_by, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+# Сколько раз собирать пакет, пока состояние не устоится. Первая попытка —
+# обычный путь; две пересборки покрывают одиночную правку, попавшую в окно
+# сборки. Правка на КАЖДОЙ попытке — это уже не гонка, а автор, который прямо
+# сейчас переписывает постановку, и врать про неё «собрано по одной ревизии»
+# нельзя ни при какой глубине повтора.
+_ASSEMBLY_ATTEMPTS = 3
+
+
 async def build_draft_packet(
     db: aiosqlite.Connection, task_id: int
 ) -> DraftEvidencePacket | None:
@@ -456,16 +570,61 @@ async def build_draft_packet(
     расчёта, а не второго такого же: два расчёта разойдутся, и разойдутся
     молча. Но берётся так, чтобы неудача ЕГО сборки стоила одного факта, а не
     всего пакета: см. ``_ac_locator_from_brief``.
+
+    ПАКЕТ ОПИСЫВАЕТ ОДНО СОСТОЯНИЕ, И ЭТО ПРОВЕРЯЕТСЯ, А НЕ ПРЕДПОЛАГАЕТСЯ.
+    Сборка не мгновенна: бриф ревью ходит в базу и на диск, и правка автора,
+    закоммиченная в эту секунду, доставала ранний снимок задачи с одной
+    стороны и свежие критерии с другой. Пакет тогда ЗАЯВЛЯЛ старое поколение,
+    не описывая целиком ни одну ревизию, — а заявленное поколение и есть ключ,
+    под которым ляжет суждение. Поэтому состояние снимается ДО и ПОСЛЕ сборки
+    (``_revision_stamp``), при расхождении пакет пересобирается, и если оно
+    не сошлось и тогда — пакет говорит об этом полем ``stable``, а не молчит.
     """
+    stamp = await _revision_stamp(db, task_id)
+    packet: DraftEvidencePacket | None = None
+    for _ in range(_ASSEMBLY_ATTEMPTS):
+        packet = await _assemble(db, task_id, stamp)
+        if packet is None:
+            return None
+        after = await _revision_stamp(db, task_id)
+        if after == stamp:
+            return packet
+        log.info(
+            "draft packet %s: state moved during assembly (%s -> %s), rebuilding",
+            task_id,
+            stamp["statement_generation"],
+            after["statement_generation"],
+        )
+        stamp = after
+    # Врать про одну ревизию нельзя, а отдать судье ПУСТОТУ — тоже: решает
+    # привратник (#1159), и решать ему есть по чему только когда
+    # нестабильность НАЗВАНА. Рядом едет то, во что состояние ушло, — иначе
+    # разбирающему случай остаётся один флаг без диагноза.
+    if packet is None:  # pragma: no cover — цикл выполняется хотя бы раз
+        return None
+    packet.revision["stable"] = False
+    packet.revision["observed_after"] = stamp
+    log.warning(
+        "draft packet %s: state kept moving; packet is not one revision",
+        task_id,
+    )
+    return packet
+
+
+async def _assemble(
+    db: aiosqlite.Connection, task_id: int, stamp: dict[str, Any]
+) -> DraftEvidencePacket | None:
+    """Одна попытка сборки под УЖЕ снятый отпечаток состояния."""
     row = await repo.get_task(db, task_id)
     if row is None:
         return None
     task = dict(row)
 
+    ac_fact = await _ac_locator_from_brief(db, task_id)
     facts = {
         f.source: f
         for f in [
-            await _ac_locator_from_brief(db, task_id),
+            ac_fact,
             _declared_areas_fact(task),
             _draft_risk_fact(task),
             await dependency_fact(db, task_id),
@@ -476,7 +635,8 @@ async def build_draft_packet(
         statement_generation=int(task.get("statement_generation") or 0),
         facts=facts,
         readiness=_readiness(task),
-        quotes=_statement_quotes(task),
+        quotes=_statement_quotes(task, ac_fact),
+        revision={**stamp, "stable": True},
     )
 
 
@@ -497,6 +657,8 @@ def draft_packet_payload(packet: DraftEvidencePacket) -> dict[str, Any]:
         },
         "absent_sources": packet.absent_sources(),
         "readiness": dict(packet.readiness),
+        "revision": dict(packet.revision),
+        "stable": packet.stable,
         "quotes": [
             {
                 "source": q.source,

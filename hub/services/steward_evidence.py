@@ -565,6 +565,18 @@ def _quotes(
 QUOTE_TASK_STATEMENT = "task_statement"
 QUOTE_SUBMISSION_SUMMARY = "submission_summary"
 QUOTE_REVIEW_FINDING = "review_finding"
+# Драфтовые входы (#1158). Их объединяет не место в схеме, а происхождение:
+# строку набрал автор постановки, а хаб её только ПЕРЕНОСИТ в факт. Перенос
+# делает такую строку похожей на вычисление хаба, и ровно поэтому она обязана
+# ехать ещё и цитатой: иначе пакет утверждает "подозрений нет" про текст,
+# который никто не смотрел.
+QUOTE_AC_TEST_REF = "ac_test_ref"
+QUOTE_DECLARED_AREA = "declared_area"
+# Предложение про класс риска составляет хаб, но в скобки он вставляет
+# заявленные области ДОСЛОВНО. Авторская здесь половина, и цитируется
+# предложение целиком: резать хабовскую рамку от авторской вставки значило бы
+# завести второй разбор той же строки.
+QUOTE_RISK_CLASS_REASON = "risk_class_reason"
 
 # Each signal is (code, matcher). Two shapes only, both about ADDRESSING the
 # judge — not about tone, not about imperatives in general. A statement telling
