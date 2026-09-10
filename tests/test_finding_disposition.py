@@ -9,6 +9,8 @@ way must keep reading — they were filed under the only scheme that existed.
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from httpx import AsyncClient
@@ -16,6 +18,15 @@ from httpx import AsyncClient
 from hub.models import FindingDisposition, FindingDispositionItem
 from hub.services.finding_disposition import record_finding_dispositions
 from hub.services.finding_identity import finding_uids
+from tests.test_finding_evidence import (
+    _FILE,
+    _git as _repo_git,
+    _init_repo,
+    _report_on,
+    _sha,
+    _task_on_clone,
+    _write_numbered,
+)
 
 _FINDINGS = [
     {
@@ -293,3 +304,250 @@ async def test_disposition_emits_event(client: AsyncClient, db):
     assert rows[0]["actor"] == "denis"
     payload = json.loads(rows[0]["payload"])
     assert payload["judged"] == 1
+
+
+# --- Разбор накопленного: два входа, ни одного предвыбора (#1171) ----------
+
+
+async def test_nothing_prechecked_and_author_account_is_not_a_disposition(
+    client: AsyncClient, db, tmp_path: Path
+):
+    """AC-2: у находки есть ФАКТ и слово АВТОРА — и ни то, ни другое не судит.
+
+    Регрессия на несущее разделение #1039/#911. Факт касания говорит, что
+    последующий коммит тронул названное место, — это про код, а не про дефект;
+    слово автора говорит, что автор с находкой сделал, — это отчёт, а не
+    суждение о том, была ли находка настоящей. Показывать их рядом дешевле и
+    честнее, чем искать по одному; но стоит хотя бы одному из них
+    предустановить переключатель или попасть в ``dispositions.judged`` — и
+    precision начинает мерить согласие харнесса с самим собой, ровно то, от
+    чего разбор и заводился.
+    """
+    from hub import repository as repo_module
+    from hub.services.orchestration import practice_metrics
+
+    clone = _init_repo(tmp_path / "two-inputs")
+    baseline = _sha(clone)
+    task_id = await _task_on_clone(db, clone, title="факт и слово автора рядом")
+    await _report_on(db, task_id, generation=1, sha=baseline)
+    await repo_module.update_task(db, task_id, submission_generation=1)
+    # Место находки тронуто последующим коммитом — тот самый ФАКТ, ради
+    # которого в очередь и приходят.
+    _write_numbered(clone / _FILE, tweak=5)
+    _repo_git(clone, "add", "-A")
+    _repo_git(clone, "commit", "-m", "тронул названные строки")
+    review = dict(await repo_module.get_latest_machine_review(db, task_id))
+    review_id = int(review["id"])
+    confirmed = json.loads(review["findings_confirmed"])
+    uid = finding_uids(confirmed)[0]
+    await repo_module.upsert_finding_outcome(
+        db,
+        review_id=review_id,
+        task_id=task_id,
+        submission_generation=1,
+        finding_uid=uid,
+        finding_index=0,
+        finding_title=str(confirmed[0].get("title") or ""),
+        outcome="fixed",
+        note="поправил границу",
+        linked_task_id=None,
+        reported_by="pda_claude",
+    )
+    await db.commit()
+
+    page = (await client.get("/findings")).text
+    assert "Место тронуто после отчёта" in page, "факт касания обязан быть на экране"
+    assert "автор: исправил" in page, "слово автора обязано быть видно рядом с фактом"
+    assert "это отчёт автора, не диспозиция" in page, (
+        "граница между отчётом автора и суждением человека держится подписью"
+    )
+    # Скан по ВСЕМУ тегу, а не по хвосту после value=. Порядок атрибутов в
+    # HTML ничего не значит, и `<input checked value="fixed">` — законная
+    # разметка с ровно тем дефектом, который этот ассерт ловит; сканируя
+    # только хвост, он остался бы зелёным на предвыбранном переключателе.
+    for value in ("fixed", "false_positive", "wont_fix"):
+        marker = f'value="{value}"'
+        assert marker in page, f"переключателя {value} нет на странице вовсе"
+        head, tail = page.split(marker, 1)
+        tag = head[head.rindex("<input") :] + marker + tail.split(">", 1)[0]
+        assert "checked" not in tag, f"переключатель {value} предвыбран: {tag}"
+
+    assert await repo_module.list_finding_dispositions(db, review_id) == [], (
+        "отчёт автора не создаёт диспозицию"
+    )
+    disp = (await practice_metrics(db, since_days=60))["machine_reviews"][
+        "dispositions"
+    ]
+    assert disp["judged"] == 0, "отчёт автора просочился в число диспозиций"
+    assert disp["precision"] is None, "precision посчитан по отчёту автора"
+    assert disp["confirmed_unjudged"] >= 1, (
+        "находка с отчётом автора обязана остаться в очереди неразобранной"
+    )
+
+
+async def test_unjudged_queue_watchdog_alerts(db):
+    """AC-6: очередь выше порога говорит вслух — числом и ссылкой, один раз в сутки.
+
+    Молчание сторожа и пустая очередь до сих пор выглядели одинаково: 131
+    находка копилась год, и ни одна страница об этом не окликала. Алерт не
+    решает ничего за человека — он называет размер стока и путь к нему.
+    """
+    import json as json_module
+
+    from hub import config
+    from hub.db import fetchall
+    from hub.poller import UNJUDGED_FINDINGS_ALERT, _sweep_unjudged_findings
+
+    findings = [_FINDINGS[0] | {"title": f"находка {n}"} for n in range(3)]
+    await db.execute(
+        "INSERT INTO tasks (id, title, status, submission_generation) "
+        "VALUES (777, 'очередь', 'completed', 1)"
+    )
+    await db.execute(
+        "INSERT INTO machine_reviews (id, task_id, submission_generation, "
+        "findings_confirmed) VALUES (5, 777, 1, ?)",
+        (json_module.dumps(findings, ensure_ascii=False),),
+    )
+    await db.commit()
+
+    async def _alerts() -> list[dict]:
+        return [
+            dict(r)
+            for r in await fetchall(
+                db,
+                "SELECT payload FROM events WHERE kind=?",
+                (UNJUDGED_FINDINGS_ALERT,),
+            )
+        ]
+
+    with patch.object(config, "UNJUDGED_FINDINGS_ALERT_THRESHOLD", 4):
+        await _sweep_unjudged_findings(db)
+        assert await _alerts() == [], "три находки при пороге четыре — сторож молчит"
+
+    with patch.object(config, "UNJUDGED_FINDINGS_ALERT_THRESHOLD", 3):
+        await _sweep_unjudged_findings(db)
+        raised = await _alerts()
+        assert len(raised) == 1, "очередь на пороге обязана поднять алерт"
+        payload = json_module.loads(raised[0]["payload"])
+        assert payload["findings"] == 3, "алерт без числа не говорит ничего"
+        assert payload["reports"] == 1
+        assert payload["threshold"] == 3
+        assert payload["queue"] == "/findings", "алерт обязан назвать путь к очереди"
+
+        await _sweep_unjudged_findings(db)
+        assert len(await _alerts()) == 1, (
+            "второй проход в тех же сутках молчит: напоминание на каждом тике "
+            "становится фоном, который перестают читать"
+        )
+
+    with patch.object(config, "UNJUDGED_FINDINGS_ALERT_THRESHOLD", 0):
+        await db.execute("DELETE FROM events WHERE kind=?", (UNJUDGED_FINDINGS_ALERT,))
+        await db.commit()
+        await _sweep_unjudged_findings(db)
+        assert await _alerts() == [], "нулевой порог выключает сторожа, а не молчит зря"
+
+
+async def test_the_watchdog_does_not_claim_precision_is_uncomputable_when_it_is(db):
+    """#1171: сторож называет разбор, а не лозунг.
+
+    Дневная строка сторожа безусловно заканчивалась словами «Без ответа
+    precision не считается вовсе» — и продолжала это утверждать после того,
+    как часть очереди разобрали и precision стал числом. Непустая очередь и
+    «precision нет» — РАЗНЫЕ факты: precision это ``real/judged`` по
+    разобранным. Тот же класс #516/#549, что закрыли в шаблоне дайджеста;
+    сторож остался с ним, потому что живёт в другом файле. Считается разбор
+    за ВСЁ ВРЕМЯ: очередь сторожа не оконная.
+    """
+    import json as json_module
+
+    from hub import config
+    from hub.db import fetchall
+    from hub.poller import UNJUDGED_FINDINGS_ALERT, _sweep_unjudged_findings
+
+    findings = [_FINDINGS[0] | {"title": f"находка {n}"} for n in range(3)]
+    await db.execute(
+        "INSERT INTO tasks (id, title, status, submission_generation) "
+        "VALUES (778, 'очередь', 'completed', 1)"
+    )
+    await db.execute(
+        "INSERT INTO machine_reviews (id, task_id, submission_generation, "
+        "findings_confirmed) VALUES (6, 778, 1, ?)",
+        (json_module.dumps(findings, ensure_ascii=False),),
+    )
+    # Отчёт старше окна практики: разбор такого стока в оконное число не
+    # попадает вовсе, и сторож, спросивший про окно, снова сказал бы «нет».
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=datetime('now','-100 days') WHERE id=6"
+    )
+    await db.execute(
+        "INSERT INTO finding_dispositions (review_id, task_id, "
+        "submission_generation, finding_index, finding_uid, disposition, "
+        "decided_by) VALUES (6, 778, 1, 0, 'uid-judged', 'fixed', 'denis')"
+    )
+    await db.commit()
+
+    async def _line() -> str:
+        rows = await fetchall(
+            db,
+            "SELECT summary FROM activity_log WHERE kind=?",
+            (UNJUDGED_FINDINGS_ALERT,),
+        )
+        return dict(rows[-1])["summary"]
+
+    async def _payload() -> dict:
+        rows = await fetchall(
+            db, "SELECT payload FROM events WHERE kind=?", (UNJUDGED_FINDINGS_ALERT,)
+        )
+        return json_module.loads(dict(rows[-1])["payload"])
+
+    with patch.object(config, "UNJUDGED_FINDINGS_ALERT_THRESHOLD", 2):
+        await _sweep_unjudged_findings(db)
+
+    line = await _line()
+    assert "precision не считается вовсе" not in line, (
+        "диспозиция записана, а сторож утверждает, что числа нет вовсе"
+    )
+    assert "Разобрано за всё время 1 — precision 1.0 по ним." in line, (
+        "ставка едет с размером выборки рядом (#1153)"
+    )
+    assert "2 подтверждённых без диспозиции" in line, (
+        "тревога про очередь остаётся тревогой: число ждущих не потерялось"
+    )
+    payload = await _payload()
+    assert payload["judged_all_time"] == 1, "канал-будильник знает то же, что строка"
+    assert payload["precision_all_time"] == 1.0
+    assert payload["findings"] == 2, "порог и очередь не тронуты"
+
+
+async def test_the_watchdog_says_precision_is_uncomputable_when_nothing_is_judged(db):
+    """Честность в обе стороны: без единой диспозиции строка правдива.
+
+    Без этого теста предыдущий закрывался бы удалением фразы, а не разбором
+    условия, при котором она верна.
+    """
+    import json as json_module
+
+    from hub import config
+    from hub.db import fetchall
+    from hub.poller import UNJUDGED_FINDINGS_ALERT, _sweep_unjudged_findings
+
+    findings = [_FINDINGS[0] | {"title": f"находка {n}"} for n in range(3)]
+    await db.execute(
+        "INSERT INTO tasks (id, title, status, submission_generation) "
+        "VALUES (779, 'очередь', 'completed', 1)"
+    )
+    await db.execute(
+        "INSERT INTO machine_reviews (id, task_id, submission_generation, "
+        "findings_confirmed) VALUES (7, 779, 1, ?)",
+        (json_module.dumps(findings, ensure_ascii=False),),
+    )
+    await db.commit()
+
+    with patch.object(config, "UNJUDGED_FINDINGS_ALERT_THRESHOLD", 2):
+        await _sweep_unjudged_findings(db)
+
+    rows = await fetchall(
+        db, "SELECT summary FROM activity_log WHERE kind=?", (UNJUDGED_FINDINGS_ALERT,)
+    )
+    line = dict(rows[-1])["summary"]
+    assert "Ни одной диспозиции нет, поэтому precision не считается вовсе." in line

@@ -921,7 +921,11 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
 
 @mcp.tool()
 async def hub_task_update(
-    task_id: int, content: str, agent: str = "", kind: str = "status"
+    task_id: int,
+    content: str,
+    agent: str = "",
+    kind: str = "status",
+    finding_outcomes: list[dict[str, Any]] | None = None,
 ) -> str:
     """Add a status update or report to a task.
 
@@ -930,8 +934,8 @@ async def hub_task_update(
         content: Update text — status report, blocker description, or completion report
         agent: Name of the agent posting the update
         kind: Type of update: 'status', 'report', 'blocker', 'done', 'review', or 'arbitration'.
-            Prefer hub_report_done for completion (kind='done' is a deprecated alias with
-            the same validator and response envelope).
+            Prefer hub_report_done for completion (deprecated alias, same validator).
+        finding_outcomes: same as hub_report_done (#1155).
     """
     prior_status: str | None = None
     try:
@@ -940,14 +944,22 @@ async def hub_task_update(
     except HubApiError:
         prior_task = None
     try:
-        result = await _api_post(
-            f"/api/tasks/{task_id}/updates",
-            {
-                "agent": agent,
-                "kind": kind,
-                "content": content,
-            },
-        )
+        payload: dict[str, Any] = {
+            "agent": agent,
+            "kind": kind,
+            "content": content,
+        }
+        if finding_outcomes:
+            # #1155: депрекированный вход не имеет права терять ответ автора.
+            # Параметр объявлен ИМЕННО поэтому: транспорт MCP валидирует
+            # аргументы по схеме инструмента и молча выбрасывает всё, чего в
+            # схеме нет, — воспроизведено зондом через mcp.call_tool. Пока
+            # поля не было, исходы находок уезжали в никуда, а автор получал
+            # успех. Дальше поле проверяет тот же серверный валидатор, что и
+            # у канонического инструмента: при kind != 'done' будет 422, а не
+            # тишина.
+            payload["finding_outcomes"] = finding_outcomes
+        result = await _api_post(f"/api/tasks/{task_id}/updates", payload)
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
         return _format_hub_api_error(exc)
@@ -1070,20 +1082,25 @@ async def _task_mutation_response(
 
 
 @mcp.tool()
-async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
+async def hub_report_done(
+    task_id: int,
+    summary: str,
+    agent: str = "",
+    finding_outcomes: list[dict[str, Any]] | None = None,
+) -> str:
     """Submit a done report and return the task's actual status after lifecycle handling.
 
     AUTHOR step. Universal Review Gate (#306): this completes the task only
     when the current submission already carries an APPROVED review by another
     actor (or auto_review=false opted out). Otherwise it IS a submission — the
     task routes to ``review`` or ``ci_check`` and the response names the next
-    action. The response always states the real status and never implies
-    ``completed`` unless the task is.
+    action.
 
     Args:
         task_id: The task ID to report on
         summary: What was changed and how it was validated
         agent: Name of the agent submitting the report
+        finding_outcomes: same as hub_submit_for_review (#1155).
     """
     prior_status: str | None = None
     try:
@@ -1092,14 +1109,14 @@ async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
     except HubApiError:
         prior_status = None
     try:
-        result = await _api_post(
-            f"/api/tasks/{task_id}/updates",
-            {
-                "agent": agent,
-                "kind": "done",
-                "content": summary,
-            },
-        )
+        payload: dict[str, Any] = {
+            "agent": agent,
+            "kind": "done",
+            "content": summary,
+        }
+        if finding_outcomes:
+            payload["finding_outcomes"] = finding_outcomes
+        result = await _api_post(f"/api/tasks/{task_id}/updates", payload)
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
         return _format_hub_api_error(exc)
