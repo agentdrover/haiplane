@@ -386,7 +386,7 @@ def _scan(shape: Shape, parts: list[str]) -> _Scan:
     bad = ""
     i = 1
     while i < len(parts):
-        token = parts[i]
+        arg = parts[i]
         i += 1
         # Всё, что стоит ПОСЛЕ первого позиционного токена, — аргументы
         # ЧУЖОЙ программы, и флагами обёртки они не являются, как бы ни
@@ -395,20 +395,20 @@ def _scan(shape: Shape, parts: list[str]) -> _Scan:
         # флаг обёртки и проходил молча — то есть отказ уходил В СТОРОНУ
         # ПРОПУСКА (находка машинного ревью 3d5938a9a645c39d, воспроизведена
         # на первой редакции закрытого набора).
-        if terminator or positionals or not token.startswith("-") or token == "-":
-            positionals.append(token)
+        if terminator or positionals or not arg.startswith("-") or arg == "-":
+            positionals.append(arg)
             continue
-        if token == "--":
+        if arg == "--":
             terminator = True
             bad = bad or _TERMINATOR_HINT.format(shape=shape.name)
             continue
-        long = token.startswith("--")
-        name, sep, value = token.partition("=")
+        long = arg.startswith("--")
+        name, sep, value = arg.partition("=")
         if sep and not long:
             # ``-u=alice``: sudo возьмёт пользователем «=alice». Записать
             # флаг именем ``-u`` со значением ``alice`` значило бы прочитать
             # строку не так, как её прочитает сам инструмент.
-            bad = bad or _SHORT_EQ_HINT.format(flag=token, value=value)
+            bad = bad or _SHORT_EQ_HINT.format(flag=arg, value=value)
             continue
         if sep:
             flags.append((name, value))
@@ -419,11 +419,11 @@ def _scan(shape: Shape, parts: list[str]) -> _Scan:
                     shape=shape.name, flag=name, value=value
                 )
             continue
-        if not long and len(token) > 2:
+        if not long and len(arg) > 2:
             # Пучок разбирается только ради ИМЁН: назвать оператору
             # недостающий ``--scope`` важнее, чем сообщить про пучок, а сам
             # пучок набором не принимается в любом случае.
-            letters = [f"-{ch}" for ch in token[1:]]
+            letters = [f"-{ch}" for ch in arg[1:]]
             if all(letter in known for letter in letters):
                 for letter in letters[:-1]:
                     flags.append((letter, None))
@@ -433,19 +433,19 @@ def _scan(shape: Shape, parts: list[str]) -> _Scan:
                     i += 1
                 else:
                     flags.append((last, None))
-            bad = bad or _BUNDLE_HINT.format(flag=token)
+            bad = bad or _BUNDLE_HINT.format(flag=arg)
             continue
-        if token in shape.valued:
+        if arg in shape.valued:
             if i < len(parts):
-                flags.append((token, parts[i]))
+                flags.append((arg, parts[i]))
                 i += 1
             else:
-                flags.append((token, None))
-                bad = bad or _VALUE_MISSING_HINT.format(shape=shape.name, flag=token)
+                flags.append((arg, None))
+                bad = bad or _VALUE_MISSING_HINT.format(shape=shape.name, flag=arg)
             continue
-        flags.append((token, None))
-        if token not in shape.valueless:
-            bad = bad or _UNKNOWN_FLAG_HINT.format(shape=shape.name, flag=token)
+        flags.append((arg, None))
+        if arg not in shape.valueless:
+            bad = bad or _UNKNOWN_FLAG_HINT.format(shape=shape.name, flag=arg)
     return _Scan(flags, positionals, bad)
 
 
