@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import textwrap
 from pathlib import Path
@@ -4852,15 +4853,48 @@ def test_sudo_names_a_numeric_uid_with_a_hash(monkeypatch) -> None:
             f"«{junk}» числовым uid не является, и разрешаться не должен"
         )
 
-    # И проверка группы каталога прогонов на форме с решёткой ДОХОДИТ до
-    # существа: пользователь разрешён, поэтому «не смогли проверить» больше
-    # не звучит. Прямой вызов _resolve_user выше этого не показал бы —
-    # scratch_problem зовёт его сам.
+
+def test_the_scratch_check_reaches_the_group_through_a_hash_uid(
+    monkeypatch, tmp_path
+) -> None:
+    """Проверка группы каталога прогонов ДОХОДИТ до существа на форме ``#UID``.
+
+    Отдельный тест, а не хвост предыдущего, по двум причинам. Первая — так
+    видно, ЧТО именно ломается: прямые вызовы ``_resolve_user`` рядом падают
+    первыми и накрывают собой эту проверку. Вторая важнее: прошлая редакция
+    ставила здесь ``LOCAL_REVIEW_SCRATCH_DIR = ""`` и ждала ``[]`` — а
+    ``scratch_problem()`` на пустой настройке возвращает ``[]`` ПЕРВОЙ ЖЕ
+    СТРОКОЙ, не дойдя ни до ``_uid_outside_group``, ни до ``_resolve_user``.
+    Утверждение было верным при любом состоянии кода, то есть не держало
+    ничего; комментарий при нём обещал ровно обратное («scratch_problem зовёт
+    его сам»). Поэтому каталог здесь настоящий.
+
+    Существо: пользователь РАЗРЕШЁН, значит «не смогли проверить» звучать не
+    должно. Про саму группу тест не судит — она зависит от машины; он судит
+    ровно то, что чинила находка.
+    """
+    import pwd
+
+    uid = pwd.getpwuid(os.getuid()).pw_uid
+    scratch = tmp_path / "runs"
+    scratch.mkdir()
+    scratch.chmod(0o2770)
+    st = os.stat(scratch)
+    assert st.st_mode & stat.S_ISGID, (
+        "каталог без setgid уводит scratch_problem() в ДРУГУЮ ветку, и тест "
+        "снова ничего не проверит — как это уже было с пустой настройкой"
+    )
+
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(scratch))
     monkeypatch.setattr(
         config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -n -u #{uid} /wrap"
     )
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", "")
-    assert local_reviewer.scratch_problem() == []
+    problems = local_reviewer.scratch_problem()
+    assert not any("не разрешается в системе" in p for p in problems), (
+        f"«sudo -u #{uid}» называет существующего пользователя синтаксисом "
+        "самого sudo, а хаб отвечает оператору, что такого пользователя в "
+        f"системе нет, и проверить доступ нельзя: {problems}"
+    )
 
 
 def test_the_doc_recommends_only_sandboxes_the_hub_accepts(monkeypatch) -> None:
