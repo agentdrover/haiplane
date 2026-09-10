@@ -483,8 +483,38 @@ async def _stamp_released_merges(
                 stamped,
                 release_sha[:12],
             )
+            await _run_declared_live_probes(db, release_sha)
     except Exception:  # noqa: BLE001 - bookkeeping must not fail the release
         log.exception("release #%s: could not stamp released merges", pr_number)
+
+
+async def _run_declared_live_probes(db: aiosqlite.Connection, release_sha: str) -> None:
+    """Снять объявленные зонды по работам, которые этот релиз вынес в прод (#1236).
+
+    ЗДЕСЬ, а не на мерже задачи в базовую ветку, и это не деталь размещения.
+    Живая проверка отказывается принимать свидетельство о коде, которого в
+    проде нет (#837): зонд, снятый на мерже в develop, получил бы
+    ``not_deployed_yet`` у каждой задачи и записал бы отказ вместо наблюдения.
+    Момент, когда наблюдение может быть ПРАВДОЙ, ровно один — тот, в который
+    работа доехала до прода, и вот он.
+
+    Полностью best-effort, как и вся бухгалтерия вокруг: релиз состоялся,
+    доставка необратима, и зонд не имеет права ни отменить её, ни уронить
+    выкат. Ошибка одной задачи не отменяет зонды остальных — иначе первая же
+    сетевая неудача съела бы весь набор.
+    """
+    from hub.services.live_probe import run_declared_probe
+
+    try:
+        task_ids = await repo.tasks_released_with(db, release_sha)
+    except Exception:  # noqa: BLE001 - см. контракт функции
+        log.exception("release: список выпущенных задач не прочитан")
+        return
+    for task_id in task_ids:
+        try:
+            await run_declared_probe(db, task_id)
+        except Exception:  # noqa: BLE001 - см. контракт функции
+            log.exception("release: живой зонд задачи #%s не отработал", task_id)
 
 
 async def _return_the_release(

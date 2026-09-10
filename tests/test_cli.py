@@ -83,6 +83,12 @@ def test_cmd_list() -> None:
     assert "Alpha" in out.getvalue()
 
 
+def test_cli_list_limit_default_stays_twenty() -> None:
+    """#1229: CLI default matches MCP (20). Bounds live on REST/MCP, not here."""
+    args = cli.build_parser().parse_args(["list"])
+    assert args.limit == 20
+
+
 def test_cmd_create() -> None:
     created = {"id": 99, "title": "New task", "status": "open"}
     mock_api = MagicMock(return_value=created)

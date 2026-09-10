@@ -786,10 +786,11 @@ class LiveCheckState(BaseModel):
     """Did anyone watch this behave in production, and on which build (#814).
 
     ``state`` is ``done`` (someone ran it and said what they saw),
-    ``not_applicable`` (there is nothing to observe, with a reason) or
-    ``unknown`` — nobody looked. Unknown is the default and always carries a
-    cause: an absent block would read as "the question was not asked", and it
-    is asked of every task.
+    ``not_applicable`` (there is nothing to observe, with a reason),
+    ``failed`` (#1236: a declared probe ran and brought back no answer — a fact
+    about the attempt, not about the behaviour) or ``unknown`` — nobody looked.
+    Unknown is the default and always carries a cause: an absent block would
+    read as "the question was not asked", and it is asked of every task.
 
     ``sha_mismatch`` names the case the card must not hide: the observation
     exists but was taken against another build than the one delivered.
@@ -797,6 +798,8 @@ class LiveCheckState(BaseModel):
 
     state: str = "unknown"
     reason: str = "живая проверка не записывалась"
+    # #1236: имя зонда, объявленного постановкой. Пусто — не объявлен.
+    declared_probe: str = ""
     probe: str = ""
     observation: str = ""
     sha: str = ""
@@ -1366,6 +1369,12 @@ class TaskRefine(BaseModel):
     validation_commands: list[str] | None = Field(default=None, max_length=10)
     out_of_scope_for_review: list[str] | None = Field(default=None, max_length=10)
     review_checklist: list[str] | None = Field(default=None, max_length=10)
+    # #1236: ИМЯ читающей пробы из закрытого реестра (hub/services/live_probe.py),
+    # которую хаб исполнит сам после доставки. Не команда и не строка вызова:
+    # проверяется на принадлежность реестру ДО записи, потому что поле, куда
+    # ложится текст из карточки, а исполняет его служба с ключами, — это не
+    # поле, а канал исполнения. "" очищает объявление.
+    live_probe: str | None = Field(default=None, max_length=64)
     risks: list[TaskRisk] | None = None
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     prepared_by: str | None = Field(default=None, max_length=100)
@@ -1830,6 +1839,8 @@ class TaskView(BaseModel):
     validation_commands: list[str] = Field(default_factory=list)
     out_of_scope_for_review: list[str] = Field(default_factory=list)
     review_checklist: list[str] = Field(default_factory=list)
+    # #1236: имя объявленного живого зонда; "" — не объявлен.
+    live_probe: str = ""
     risks: list[TaskRisk] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     lifecycle_hint: str | None = None

@@ -1337,6 +1337,62 @@ async def warn_about_undelivered_blockers(
     return blockers
 
 
+async def refuse_opening_without_subject(
+    db: aiosqlite.Connection, task_id: int, task: dict[str, Any]
+) -> None:
+    """Refuse to open a task whose subject is still in somebody else's branch (#1232).
+
+    A gate, not a warning — and the only one in this file that refuses on a
+    fact about the CODE rather than about the task record. #484 stays advisory
+    because working deliberately on top of an open PR is legitimate; this one
+    refuses because the case it names is not a stack, it is an empty task. On
+    09.09.2026 three of them were opened in a day (#1210, #1209, #1159) and
+    each cost a full round of work to discover it had nothing to do.
+
+    Never silent, in both directions: the refusal writes the NAMES of what is
+    missing and the number of the task to wait for into the card, and every
+    verdict other than ``stranded`` — including "could not look" — opens the
+    task exactly as before this check existed.
+    """
+    from hub.services.readiness import subject_presence
+
+    try:
+        presence = await subject_presence(db, task)
+    except Exception as exc:  # noqa: BLE001 - a gate that raises blocks everything
+        log.warning("subject presence check for #%s failed: %s", task_id, exc)
+        return
+    if not presence.blocks_opening:
+        return
+    updates = await repo.get_task_updates(db, task_id)
+    already = any(
+        (u["content"] if not isinstance(u, dict) else u.get("content", ""))
+        == presence.reason
+        for u in updates
+    )
+    if not already:
+        await repo.add_task_update(db, task_id, "hub", "alert", presence.reason)
+        await db.commit()
+    raise HTTPException(
+        422,
+        detail=enrich_error_payload(
+            {
+                "reason": "subject_not_in_base_branch",
+                "actor_hint": "human",
+                "current_status": task.get("status", ""),
+                "message": (
+                    f"Task #{task_id} is not opened: its subject is not in the "
+                    f"base branch yet"
+                ),
+                "hint": presence.reason,
+                "missing": list(presence.missing),
+                "found_in_branch": presence.found_in_branch,
+                "found_in_task_id": presence.found_in_task_id,
+                "task_id": task_id,
+            }
+        ),
+    )
+
+
 async def start_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1352,6 +1408,9 @@ async def start_task(
             400,
             f"can only start open tasks, current status: {task['status']}",
         )
+    # #1232: before anything is written — the plan update below is a write, and
+    # a task refused after it would carry a plan for work it never began.
+    await refuse_opening_without_subject(db, task_id, task)
 
     body = body or TaskStart()
 
@@ -1474,6 +1533,11 @@ async def pair_start_task(
             400,
             f"can only pair-start open or own-claimed tasks, current status: {task['status']}",
         )
+
+    # #1232: here, for the same reason the session check above is here — what
+    # follows writes the plan and prepares a branch, and a task refused after
+    # that would leave both behind.
+    await refuse_opening_without_subject(db, task_id, task)
 
     body = body or TaskPairStart()
 
