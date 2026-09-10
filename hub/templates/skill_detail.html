@@ -23,6 +23,89 @@
     </form>
 </details>
 
+{# Что изменилось относительно прежней активной версии (#1169).
+
+   Порядок внутри блока — не оформление, а смысл. Сводка стоит первой: на
+   версии, переписанной целиком, диф равен всему содержимому и не добавляет
+   ничего, а два числа отличают правку от переписывания сразу. Вердикт скана
+   идёт вторым и назван перечнем сработавших правил, а не оценкой
+   безопасности: он лишь указывает место внутри дифа. Сам диф — последним,
+   потому что он длинный, а не потому что второстепенный. #}
+{% macro publish_block(view) %}
+<div class="skill-publish">
+    {# Записи о публикации нет вовсе — не «дифа в записи нет», а «записи нет».
+       Ветка стоит первой и уходит из макроса сразу: показывать по ней «что
+       было опубликовано», сводку и вердикт нечего, а рисовать вокруг пустоты
+       разметку значит намекать на сведения, которых нет. #}
+    {% if view.diff.baseline == baseline_no_record %}
+    <p class="skill-publish-summary">
+        <span class="badge badge-review">записи о публикации нет</span>
+        {{ view.diff.note }}
+    </p>
+    {% else %}
+    <p class="skill-publish-when small muted">
+        {% if view.when == 'before' %}Что изменится, если активировать эту версию — до нажатия
+        {% else %}Что было опубликовано — по записи события в момент публикации{% endif %}
+    </p>
+    {% if view.diff.baseline == baseline_absent %}
+    <p class="skill-publish-summary">
+        <span class="badge badge-review">сравнивать не с чем</span>
+        {{ view.diff.note }}
+    </p>
+    {# Запись, сделанная до #1169, дифа не несёт. Без своей ветки она попадала в
+       else и рисовалась как «К активной версии v: +  строк, −  строк» — диф,
+       в котором ничего не изменилось, к версии без номера. Полуправда читается
+       как факт, а молчание — нет. #}
+    {% elif view.diff.baseline == baseline_unrecorded %}
+    <p class="skill-publish-summary">
+        <span class="badge badge-review">дифа в записи нет</span>
+        {{ view.diff.note }}
+    </p>
+    {# Диф не посчитан из-за размера. Своя ветка нужна ровно затем, зачем и
+       предыдущие: без неё счётчики None рисовались бы как «+ строк, − строк»,
+       то есть как посчитанный диф, в котором ничего не изменилось. Отказ
+       считать обязан читаться как отказ, а не как «изменений нет». #}
+    {% elif view.diff.baseline == baseline_too_large %}
+    <p class="skill-publish-summary">
+        <span class="badge badge-review">диф не посчитан</span>
+        {{ view.diff.note }}
+    </p>
+    {% else %}
+    <p class="skill-publish-summary">
+        К активной версии v{{ view.diff.baseline_version }}:
+        <strong class="skill-diff-added">+{{ view.diff.added_lines }}</strong> строк,
+        <strong class="skill-diff-removed">−{{ view.diff.removed_lines }}</strong> строк
+    </p>
+    {% endif %}
+    {% if view.scan.rules_triggered %}
+    <ul class="skill-scan-hits">
+        {% for hit in view.scan.rules_triggered %}
+        <li class="skill-scan-hit">
+            <span class="badge badge-review">{{ hit.rule }}</span>
+            {{ hit.title }} — строка {{ hit.line }}, смещение {{ hit.offset }}
+            <code class="skill-scan-fragment">{{ hit.fragment }}</code>
+        </li>
+        {% endfor %}
+    </ul>
+    {# ``rules_triggered is none`` — то же различение, что у счётчиков сводки:
+       пустой список означает «ни одно правило не совпало», а отсутствие
+       вердикта — что его тогда не считали вовсе. #}
+    {% elif view.scan.rules_triggered is none %}
+    <p class="skill-scan-empty small muted">Вердикта в записи нет.</p>
+    {% else %}
+    <p class="skill-scan-empty small muted">Сработавших правил нет.</p>
+    {% endif %}
+    <p class="skill-scan-note small muted">{{ view.scan.note }}</p>
+    {% if view.unified %}
+    <details class="skill-publish-diff">
+        <summary class="project-edit-summary">Показать unified diff</summary>
+        <pre class="u-pre-wrap skill-diff">{{ view.unified }}</pre>
+    </details>
+    {% endif %}
+    {% endif %}
+</div>
+{% endmacro %}
+
 {% for v in versions %}
 <details {% if loop.first %}open{% endif %} class="task-action-stack project-create">
     <summary class="project-edit-summary">
@@ -31,6 +114,10 @@
         {% else %}<span class="badge badge-review">draft</span>{% endif %}
         by {{ v.created_by }} at {{ v.created_at }}
     </summary>
+    {# Блок стоит ПЕРЕД кнопкой намеренно: на пути 2 человек не автор текста, и
+       основание для решения должно быть прочитано до нажатия, а не найдено под
+       ним. #}
+    {% if publish_views.get(v.version) %}{{ publish_block(publish_views[v.version]) }}{% endif %}
     {% if v.status != 'active' %}
     <form method="post" action="/skills/{{ name }}/versions/{{ v.version }}/web-activate" class="project-inline-form">
         <button class="btn btn-success" type="submit"
