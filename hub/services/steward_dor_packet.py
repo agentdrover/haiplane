@@ -50,6 +50,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -70,6 +71,15 @@ from hub.services.steward_evidence import (
     present,
     quote,
 )
+from hub.services.test_existence import (
+    MISSING,
+    NO_VALID_LOCATOR,
+    RESOLVABLE,
+    UNKNOWN,
+    UNPARSEABLE,
+)
+
+log = logging.getLogger("hub")
 
 # Источники, которые на драфте вообще имеют смысл. Подмножество #1022, и это
 # проверяется при импорте, а не на ревью: источник, которого закрытый словарь
@@ -91,6 +101,12 @@ if _outside:  # pragma: no cover — падает при импорте, до л
 # прозу; человеческая формулировка едет рядом в ``detail``.
 NO_ACCEPTANCE_CRITERIA = "no_acceptance_criteria"
 NO_DECLARED_AREAS = "no_declared_areas"
+# Бриф ревью не собрался — значит разрешимость локаторов НЕ ВЫЧИСЛЕНА. Это
+# отдельный код, а не ``no_acceptance_criteria``: у второго есть утвердительный
+# смысл («хаб посмотрел, критериев нет»), и подставить его вместо незнания
+# значило бы обвинить постановку с критериями в их отсутствии — тот же промах
+# #762, от которого пакет и защищает.
+BRIEF_UNAVAILABLE = "brief_unavailable"
 
 # Состояния локатора. Их пять, и ни одно не сводится к другому.
 #
@@ -99,14 +115,20 @@ NO_DECLARED_AREAS = "no_declared_areas"
 # ``unknown``      локатор назван, но посмотреть не удалось — ветки нет, файл
 #                  не прочитался, раннер незнакомый; хаб не знает ответа и
 #                  этого не скрывает;
-# ``no_locator``   критерий обещает проверку тестом и НЕ НАЗЫВАЕТ теста; это
-#                  не неудача разрешения, а отсутствие того, что разрешать;
+# ``no_locator``   критерий обещает проверку тестом и НЕ НАЗЫВАЕТ теста,
+#                  который можно разрешить: поле пусто ЛИБО в поле не локатор,
+#                  а проза («см. юнит-тесты»). Это не неудача разрешения, а
+#                  отсутствие того, что разрешать;
 # ``not_test_bound`` критерий не обещает теста вовсе — локатора и не ждали.
 #
 # Разделение ``unresolved`` и ``no_locator`` и есть смысл AC-1: расчёт #506
-# сводит их в один статус ``missing`` (у пустого test_ref причина «no valid
-# test locator in test_ref», у ненайденного — «locator does not match any
-# collected test»), и на драфте это разные основания вернуть постановку.
+# сводит их в один статус ``missing``, и различает их ТОЛЬКО причина —
+# ``NO_VALID_LOCATOR`` против ``NOT_COLLECTED``. На драфте это разные
+# основания вернуть постановку, и разбирать их по пустоте поля нельзя:
+# непустой мусор в ``test_ref`` даёт ту же самую причину, что и пустое поле,
+# потому что разбор не состоялся в обоих случаях. Пакет, глядевший на пустоту,
+# писал такому критерию ``unresolved`` — то есть «хаб посмотрел и теста нет»
+# про тест, которого автор и не называл.
 #
 # Разделение ``unresolved`` и ``unknown`` — тот же промах #762 на одну зарубку
 # дальше, и на драфте это НЕ угловой случай, а норма: у драфта нет ветки, сбор
@@ -121,12 +143,24 @@ LOCATOR_UNKNOWN = "unknown"
 LOCATOR_NO_LOCATOR = "no_locator"
 LOCATOR_NOT_TEST_BOUND = "not_test_bound"
 
-# Статусы расчёта #506. ``resolvable`` — «названный тест существует».
-# ``missing`` — «посмотрел, не нашёл». ``unknown`` и ``unparseable`` — «смотреть
-# не удалось»: первый про ветку и раннер, второй про нечитаемый файл, и оба
-# говорят о хабе, а не о тесте. Здесь они не уравниваются.
-_RESOLVABLE_STATUS = "resolvable"
-_COULD_NOT_LOOK_STATUSES = frozenset({"unknown", "unparseable"})
+# Разбор ответа #506 — ТАБЛИЦЕЙ, покрывающей весь словарь статусов расчёта.
+# ``resolvable`` — «названный тест существует». ``missing`` — «посмотрел, не
+# нашёл» (уточняется причиной, см. ``_locator_state``). ``unknown`` и
+# ``unparseable`` — «смотреть не удалось»: первый про ветку и раннер, второй
+# про нечитаемый файл; оба говорят о ХАБЕ, а не о тесте, и здесь не
+# уравниваются с обвинением.
+#
+# Таблица, а не цепочка ``if`` с хвостовым ``return``: у цепочки хвост ловил
+# ВСЁ неназванное, и любой статус, который #506 заведёт завтра, молча приезжал
+# бы в ``unresolved`` — то есть в обвинение. Полнота таблицы по словарю #506
+# проверяется тестом (``test_every_506_status_is_decomposed_by_name``), а не
+# добросовестностью того, кто заведёт следующий статус.
+_STATUS_STATES: dict[str, str] = {
+    RESOLVABLE: LOCATOR_RESOLVABLE,
+    MISSING: LOCATOR_UNRESOLVED,
+    UNKNOWN: LOCATOR_UNKNOWN,
+    UNPARSEABLE: LOCATOR_UNKNOWN,
+}
 
 
 @dataclass(frozen=True)
@@ -187,22 +221,71 @@ def _locator_state(resolution: dict[str, Any]) -> str:
     Каждый статус расчёта разложен ПОИМЁННО, а не «всё кроме resolvable».
     Отрицанием одного имени неизвестность попадала бы в ту же корзину, что и
     ненайденный тест, а любой новый статус #506 молча приезжал бы в
-    ``unresolved`` — то есть обвинением там, где ответа нет.
+    ``unresolved`` — то есть обвинением там, где ответа нет. Поэтому
+    неизвестный статус уходит в ``unknown``: незнание хаба про свой же
+    словарь — это незнание, а не улика против автора.
+
+    ``missing`` уточняется ПРИЧИНОЙ, а не пустотой поля. Расчёт отвечает
+    ``missing`` и на «названного теста нет среди собранных», и на «в
+    ``test_ref`` нет локатора, который вообще можно разобрать», а второе
+    приходит одинаково и от пустого поля, и от прозы вроде «см. юнит-тесты».
+    Разбирая по пустоте, пакет писал прозе ``unresolved`` — обвинение в
+    несуществующем тесте вместо просьбы назвать тест. Причина #506 читается
+    здесь как есть; второго разбора ``test_ref`` не заводится.
     """
     status = (resolution.get("status") or "").strip()
-    if status == _RESOLVABLE_STATUS:
-        return LOCATOR_RESOLVABLE
-    if not (resolution.get("locator") or "").strip():
+    reason = (resolution.get("reason") or "").strip()
+    if status == MISSING and reason == NO_VALID_LOCATOR:
         return LOCATOR_NO_LOCATOR
-    if status in _COULD_NOT_LOOK_STATUSES:
-        return LOCATOR_UNKNOWN
-    return LOCATOR_UNRESOLVED
+    return _STATUS_STATES.get(status, LOCATOR_UNKNOWN)
+
+
+async def _ac_locator_from_brief(
+    db: aiosqlite.Connection, task_id: int
+) -> EvidenceFact:
+    """Разрешимость локаторов — из брифа ревью, и ни разу не вместо него.
+
+    Сборка брифа поднимает вид задачи из того, что лежит в колонках, и на
+    нечитаемом содержимом колонки падает проверкой типов. Пакету падать
+    нельзя: он собирается ровно для того, чтобы судья не остался без входа, и
+    исключение отсюда ослепило бы его целиком — включая факты, которые
+    собрались бы прекрасно и без брифа (области, класс риска, зависимости).
+
+    Поэтому неудача сборки вырождается в ``absent`` с собственным кодом, а не
+    в отсутствие критериев и не в пустое значение: «хаб не смог вычислить» и
+    «критериев нет» — разные ответы, и второй судья читает как повод вернуть
+    постановку.
+    """
+    from hub.services.review_brief import build_review_brief
+
+    try:
+        brief = await build_review_brief(db, task_id)
+    except Exception as exc:  # noqa: BLE001 — вход судьи важнее причины отказа
+        log.warning(
+            "draft packet %s: review brief did not assemble (%s: %s)",
+            task_id,
+            type(exc).__name__,
+            exc,
+        )
+        return absent(
+            "ac_locator",
+            BRIEF_UNAVAILABLE,
+            f"бриф ревью не собрался ({type(exc).__name__}) — разрешимость "
+            "локаторов не вычислена; это незнание хаба, а не отсутствие критериев",
+        )
+    if brief is None:
+        return absent(
+            "ac_locator",
+            BRIEF_UNAVAILABLE,
+            "бриф ревью не собран — разрешимость локаторов не вычислена",
+        )
+    return _ac_locator_fact(brief)
 
 
 def _ac_locator_fact(brief: Any) -> EvidenceFact:
     """Существуют ли критерии и во что разрешаются их локаторы (#505/#506)."""
     source = "ac_locator"
-    criteria = list(getattr(brief, "acceptance_criteria", []) or []) if brief else []
+    criteria = list(getattr(brief, "acceptance_criteria", []) or [])
     if not criteria:
         return absent(
             source,
@@ -371,20 +454,18 @@ async def build_draft_packet(
 
     Разрешимость локаторов берётся из брифа ревью (#308/#506) — того самого
     расчёта, а не второго такого же: два расчёта разойдутся, и разойдутся
-    молча.
+    молча. Но берётся так, чтобы неудача ЕГО сборки стоила одного факта, а не
+    всего пакета: см. ``_ac_locator_from_brief``.
     """
-    from hub.services.review_brief import build_review_brief
-
     row = await repo.get_task(db, task_id)
     if row is None:
         return None
     task = dict(row)
-    brief = await build_review_brief(db, task_id)
 
     facts = {
         f.source: f
         for f in [
-            _ac_locator_fact(brief),
+            await _ac_locator_from_brief(db, task_id),
             _declared_areas_fact(task),
             _draft_risk_fact(task),
             await dependency_fact(db, task_id),
@@ -432,6 +513,7 @@ def draft_packet_payload(packet: DraftEvidencePacket) -> dict[str, Any]:
 
 __all__ = [
     "ABSENT",
+    "BRIEF_UNAVAILABLE",
     "DRAFT_GROUND_SOURCES",
     "LOCATOR_NOT_TEST_BOUND",
     "LOCATOR_NO_LOCATOR",

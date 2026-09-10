@@ -21,6 +21,7 @@ from hub.integrations.registry import plugins
 from hub.models import STEWARD_GROUND_SOURCES, ACVerifiableBy, AcceptanceCriterion
 from hub.services.steward_dor_packet import (
     ABSENT,
+    BRIEF_UNAVAILABLE,
     DRAFT_GROUND_SOURCES,
     LOCATOR_NO_LOCATOR,
     LOCATOR_NOT_TEST_BOUND,
@@ -31,8 +32,20 @@ from hub.services.steward_dor_packet import (
     NO_DECLARED_AREAS,
     NO_STORED_CLASS,
     PRESENT,
+    _locator_state,
+    _STATUS_STATES,
     build_draft_packet,
     draft_packet_payload,
+)
+from hub.services.test_existence import (
+    LOCATOR_STATUSES,
+    MISSING,
+    NO_VALID_LOCATOR,
+    NOT_COLLECTED,
+    RESOLVABLE,
+    UNKNOWN,
+    UNPARSEABLE,
+    resolve_ac_locators,
 )
 
 _COLLECTED = {"tests/test_x.py::test_present"}
@@ -439,3 +452,142 @@ async def test_uncomputed_readiness_is_not_a_failed_dor(
 async def test_missing_task_is_none_not_empty_packet(db: aiosqlite.Connection):
     """Задачи нет — пакета нет; пустой пакет читался бы как драфт без фактов."""
     assert await build_draft_packet(db, 987654) is None
+
+
+async def test_unparseable_test_ref_is_not_an_accusation(
+    db: aiosqlite.Connection, clone: Path, collection
+):
+    """Мусор в ``test_ref`` — не «теста нет», а «теста не назвали».
+
+    Расчёт #506 отвечает ``missing`` на две разные вещи, и разделяет их
+    только причина. ``NO_VALID_LOCATOR`` значит, что разбирать было нечего:
+    так отвечает и пустое поле, и проза «см. юнит-тесты» — во втором случае
+    хаб не начинал искать. ``NOT_COLLECTED`` значит, что локатор разобран,
+    хаб посмотрел и теста не нашёл.
+
+    Пакет разбирал их по ПУСТОТЕ поля, и непустая проза уезжала стюарду как
+    ``unresolved`` — «хаб посмотрел и теста нет» про тест, которого автор не
+    называл. Судья тогда возвращает постановку с обвинением в поломанной
+    привязке AC↔тест вместо просьбы назвать тест, а автор ищет тест, который
+    никогда не существовал.
+    """
+    task_id = await _draft(db, clone, title="unparseable ref")
+    await _ac(db, task_id, "AC-1", test_ref="см. юнит-тесты")
+    await _ac(db, task_id, "AC-2", test_ref=None)
+    await _ac(db, task_id, "AC-3", test_ref="tests/test_x.py::test_missing")
+
+    packet = await build_draft_packet(db, task_id)
+
+    assert packet is not None
+    fact = packet.fact("ac_locator")
+    states = _states(fact)
+    # Названная проза и пустое поле — одно и то же состояние, потому что это
+    # одна и та же причина: локатора, который можно разрешить, никто не дал.
+    assert states["AC-1"] == LOCATOR_NO_LOCATOR
+    assert states["AC-2"] == LOCATOR_NO_LOCATOR
+    # А вот РАЗОБРАННЫЙ локатор, которого нет среди собранных, — обвинение по
+    # праву, и оно не должно раствориться вместе с исправлением.
+    assert states["AC-3"] == LOCATOR_UNRESOLVED
+    assert fact.value["counts"][LOCATOR_NO_LOCATOR] == 2
+    assert fact.value["counts"][LOCATOR_UNRESOLVED] == 1
+    by_id = {i["ac_id"]: i for i in fact.value["criteria"]}
+    # Обе причины #506 едут как есть — и они РАЗНЫЕ, иначе разбирать было бы
+    # нечем; а сырой текст сохранён, чтобы автору было видно, что он написал.
+    assert by_id["AC-1"]["reason"] == NO_VALID_LOCATOR
+    assert by_id["AC-2"]["reason"] == NO_VALID_LOCATOR
+    assert by_id["AC-3"]["reason"] == NOT_COLLECTED
+    assert by_id["AC-1"]["locator"] == "см. юнит-тесты"
+    assert by_id["AC-2"]["locator"] == ""
+
+
+def test_every_506_status_is_decomposed_by_name():
+    """Разбор ответа #506 покрывает ВЕСЬ его словарь статусов, поимённо.
+
+    Таблица разбора держала ``unparseable``, но ни один тест этим статусом
+    её не кормил: убрать его из таблицы — и весь набор оставался зелёным.
+    Такая проверка хуже отсутствующей, она изображает защиту. Здесь словарь
+    берётся у самого расчёта (#506), так что новый статус, заведённый там и
+    не разобранный здесь, роняет этот тест, а не приезжает молча.
+
+    Хвостовой ``return`` тоже проверяется: неизвестный статус — это незнание
+    ХАБА про свой же словарь, и читаться он обязан как ``unknown``. Прежний
+    хвост писал ``unresolved``, то есть выдавал бы новый вид «не смог
+    посмотреть» за установленное отсутствие теста.
+    """
+    assert set(_STATUS_STATES) == set(LOCATOR_STATUSES)
+    assert _STATUS_STATES[RESOLVABLE] == LOCATOR_RESOLVABLE
+    assert _STATUS_STATES[MISSING] == LOCATOR_UNRESOLVED
+    assert _STATUS_STATES[UNKNOWN] == LOCATOR_UNKNOWN
+    assert _STATUS_STATES[UNPARSEABLE] == LOCATOR_UNKNOWN
+
+    # Не выдуманный статус: ``unparseable`` отдаёт настоящий расчёт #506 на
+    # настоящем нечитаемом файле, и его собственный ответ разбирается пакетом.
+    real = resolve_ac_locators(
+        [
+            AcceptanceCriterion(
+                id="AC-1",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by=ACVerifiableBy("test"),
+                test_ref="tests/test_x.py::test_present",
+            )
+        ],
+        None,
+        sources={"tests/test_x.py": "def test_present(:\n"},
+    )
+    assert real[0]["status"] == UNPARSEABLE
+    assert _locator_state(real[0]) == LOCATOR_UNKNOWN
+
+    # Статус, которого словарь #506 сегодня не знает: незнание, а не улика.
+    assert (
+        _locator_state({"status": "some-status-506-may-add", "locator": "t.py::x"})
+        == LOCATOR_UNKNOWN
+    )
+
+
+async def test_packet_degrades_when_the_brief_does_not_assemble(
+    db: aiosqlite.Connection, clone: Path, collection, caplog
+):
+    """Сборка доказательств не имеет права падать — иначе судья слепнет.
+
+    Бриф ревью поднимает вид задачи из колонок и на нечитаемом содержимом
+    падает проверкой типов (тот же вход, что у
+    ``test_calculate_readiness_drops_malformed_risks``). Пакет звал его без
+    защиты, и исключение уносило ВЕСЬ пакет — вместе с областями, классом
+    риска и зависимостями, которые собрались бы прекрасно и без брифа.
+
+    Так контракт «всё, кроме несуществующей задачи, вырождается в absent»
+    ломался ровно на нестандартных задачах, то есть там, где судье вход
+    нужнее всего. И вырождается он в СВОЙ код: «хаб не смог вычислить» — не
+    «критериев нет», иначе стюард вернул бы постановку с критериями за их
+    отсутствие.
+    """
+    task_id = await _draft(db, clone, title="brief will not assemble")
+    await _ac(db, task_id, "AC-1", test_ref="tests/test_x.py::test_present")
+    await repo.update_task(
+        db,
+        task_id,
+        risks='[{"kind": "security", "severity": "high", "description": "d", '
+        '"mitigation": "m"}, {"kind": "not-a-real-kind"}, "string", 42]',
+    )
+    await db.commit()
+
+    packet = await build_draft_packet(db, task_id)
+
+    assert packet is not None
+    locators = packet.fact("ac_locator")
+    assert locators.state == ABSENT
+    assert locators.reason == BRIEF_UNAVAILABLE
+    # Не «критериев нет»: критерий у задачи есть, невычисленной осталась
+    # разрешимость, и стюард должен прочитать именно это.
+    assert locators.reason != NO_ACCEPTANCE_CRITERIA
+    assert not locators.value
+    # Остальные факты собрались: одна неудача стоит одного факта, а не пакета.
+    assert packet.fact("risk_class").state == PRESENT
+    assert packet.fact("diff_vs_areas").state == PRESENT
+    assert packet.fact("dependency_state").state == PRESENT
+    assert set(packet.facts) == set(DRAFT_GROUND_SOURCES)
+    assert draft_packet_payload(packet)["absent_sources"] == ["ac_locator"]
+    # Причина не проглочена молча: у неудачи есть след в журнале.
+    assert any("review brief did not assemble" in r.message for r in caplog.records)
