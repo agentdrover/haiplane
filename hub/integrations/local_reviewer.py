@@ -55,7 +55,7 @@ import stat
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from hub import config
 from hub.process_kill import kill_process_group
@@ -135,46 +135,687 @@ def not_ready() -> list[str]:
     )
 
 
-# Песочница, которая ОТСОЕДИНЯЕТ полезную нагрузку от хаба (найдено ревью,
-# находка a6aaffbc). ``systemd-run`` без ``--scope`` поднимает transient
-# service: родителем CLI становится PID 1, наш процесс — всего лишь клиент,
-# и SIGKILL по его группе юнит не останавливает. Хаб при этом честно
-# напишет в ленту «процесс и вся его группа убиты» — то есть скажет
-# неправду, а ревьюер продолжит жечь CPU и сможет прислать отчёт по уже
-# закрытому прогону. Ровно класс #509/#544, только на чужом менеджере
-# процессов.
+# Песочница, из-под которой хаб не может СНЯТЬ полезную нагрузку (найдено
+# ревью, находка a6aaffbc; расширено выкатом 08.09.2026, #1208).
 #
-# Проверка узкая и по имени: она знает ОДИН инструмент и ОДИН его флаг,
-# потому что это факт про systemd-run, а не догадка про песочницы вообще.
-# Всё, чего она не знает, она пропускает — и об этом сказано в документе
-# выката прямым требованием к обёртке.
-_DETACHING_HINT = (
+# Правило, которое здесь проверяется, звучит так: обёртка обязана ЛИБО
+# оставлять CLI прямым потомком хаба, ЛИБО иметь СОБСТВЕННЫЙ срок жизни.
+# Первая редакция требовала только потомка — и это требование недостижимо
+# для контейнеров: ``podman run`` переживает убийство группы процессов
+# (измерено на проде 08.09.2026: kill -KILL по группе, через 7 с контейнер
+# «Up»), потому что conmon намеренно отсоединён от клиента podman. Ровно то
+# же делает ``systemd-run`` без ``--scope``: родителем становится PID 1.
+#
+# Опасен здесь не сам факт отсоединения, а то, что хаб при этом напишет в
+# ленту «процесс и вся его группа убиты» — то есть скажет неправду, а
+# ревьюер продолжит жечь CPU и сможет прислать отчёт по уже закрытому
+# прогону. Свой срок жизни закрывает дыру с другой стороны: podman с
+# ``--timeout`` убивает контейнер сам (измерено: ``--timeout 5`` — через
+# 12 с живых контейнеров нет, хотя убийство группы до него не дошло).
+#
+# Проверка узкая и ПО ИМЕНИ: она знает названные инструменты и названные
+# флаги, потому что это факты про systemd-run, podman и docker, а не
+# догадка про песочницы вообще. Всё, чего она не знает, она пропускает — и
+# об этом сказано в документе выката прямым требованием к обёртке. В
+# частности, обёртка-скрипт, внутри которой лежит podman, для этой проверки
+# невидима, и срок жизни в ней — на совести того, кто её написал.
+_SCOPE_HINT = (
     "LOCAL_REVIEW_SANDBOX: systemd-run без --scope запускает transient "
     "service — полезная нагрузка становится потомком PID 1, и снять её по "
     "таймауту хаб не сможет, хотя напишет в ленту, что снял. Добавьте "
     "--scope (тогда CLI остаётся прямым потомком хаба и наследует cwd, "
     "окружение и stdin) — см. deploy/LOCAL-REVIEW.md"
 )
+_PODMAN_HINT = (
+    "LOCAL_REVIEW_SANDBOX: podman run без --timeout отсоединяет контейнер "
+    "от хаба — conmon переживает убийство группы процессов (измерено "
+    "08.09.2026: через 7 с контейнер «Up»), и снять прогон по таймауту хаб "
+    "не сможет, хотя напишет в ленту, что снял. Добавьте --timeout "
+    "<секунды> — с ним контейнер умирает сам — см. deploy/LOCAL-REVIEW.md"
+)
+_PODMAN_DEADLINE_HINT = (
+    "LOCAL_REVIEW_SANDBOX: podman run --timeout «{value}» срока жизни "
+    "контейнеру НЕ задаёт. Срок — целое число секунд больше нуля; ноль это "
+    "подман-умолчание, а умолчание задокументировано словами «By default "
+    "containers run until they exit or are stopped by podman stop» "
+    "(podman-run(1)). Токен в строке есть, а снять прогон по таймауту хаб "
+    "по-прежнему не сможет — тот же случай, что --timeout после образа. "
+    "Поставьте --timeout <секунды> — см. deploy/LOCAL-REVIEW.md"
+)
+_PODMAN_UNKNOWN_FLAG_HINT = (
+    "LOCAL_REVIEW_SANDBOX: в строке podman run стоит флаг «{flag}», про "
+    "который страж не знает, берёт ли тот значение отдельным токеном. "
+    "Разобрать строку до образа поэтому нельзя, а значит нельзя и сказать, "
+    "есть ли у контейнера свой срок жизни: за проглоченным значением может "
+    "стоять ещё один --timeout, и действующим будет он. Это НЕ разрешение "
+    "работать — стражу «не знаю» и «всё в порядке» не одно и то же. "
+    "Напишите флаг в форме {flag}=<значение> — она однозначна и от списков "
+    "не зависит — либо уберите его из строки песочницы, спрятав podman "
+    "внутрь враппера-скрипта, как советует deploy/LOCAL-REVIEW.md"
+)
+_DOCKER_HINT = (
+    "LOCAL_REVIEW_SANDBOX: docker run отсоединяет контейнер от хаба так же, "
+    "как podman, но флага собственного срока жизни (аналога podman "
+    "--timeout) у него нет вовсе — недостающий флаг здесь дописать некуда. "
+    "Возьмите podman run --timeout <секунды> либо обёртку, оставляющую CLI "
+    "прямым потомком хаба — см. deploy/LOCAL-REVIEW.md"
+)
+
+
+# Глобальные флаги движка, которые берут значение ОТДЕЛЬНЫМ токеном. Без них
+# ``podman --log-level debug run --rm -i img`` читается как подкоманда
+# «debug», запуск контейнера стражу невидим и проходит без своего срока жизни
+# (найдено машинным ревью 09.09.2026, находка 2e24a6068bbc3fa1). Список ПО
+# ИМЕНИ, как и всё в этом модуле: глобальный флаг, которого здесь нет, съест
+# подкоманду по-прежнему — это названный пропуск, он записан в
+# deploy/LOCAL-REVIEW.md. Форма ``--flag=value`` от списка не зависит вовсе.
+_ENGINE_GLOBAL_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "podman": frozenset(
+        {
+            "--cgroup-manager",
+            "--conmon",
+            "--connection",
+            "-c",
+            "--db-backend",
+            "--events-backend",
+            "--hooks-dir",
+            "--identity",
+            "--imagestore",
+            "--log-level",
+            "--module",
+            "--namespace",
+            "--network-cmd-path",
+            "--root",
+            "--runroot",
+            "--runtime",
+            "--runtime-flag",
+            "--ssh",
+            "--storage-driver",
+            "--storage-opt",
+            "--tmpdir",
+            "--url",
+            "--volumepath",
+        }
+    ),
+    "docker": frozenset(
+        {
+            "--config",
+            "--context",
+            "-c",
+            "--host",
+            "-H",
+            "--log-level",
+            "-l",
+            "--tlscacert",
+            "--tlscert",
+            "--tlskey",
+        }
+    ),
+}
+
+# Флаги самого ``<engine> run``, которые берут значение ОТДЕЛЬНЫМ токеном.
+# Нужны, чтобы найти ОБРАЗ: всё, что стоит после образа, — команда полезной
+# нагрузки, и её ``--timeout`` сроком жизни контейнера не является (найдено
+# машинным ревью 09.09.2026, находка 2e24a6068bbc3fa1: ``podman run --rm -i
+# img cursor-agent --timeout 60`` проходил как запуск со своим сроком).
+#
+# Прежняя редакция этого комментария утверждала, что неизвестный флаг можно
+# считать булевым, потому что «ошибка тогда идёт в сторону отказа». Это
+# НЕВЕРНО, и измерено 10.09.2026 на ``podman run --timeout 60 --blkio-weight
+# 500 --timeout 0 img``: ``--blkio-weight`` в списке не назван, ``500``
+# принято за образ, разбор кончился — и ВТОРОЙ ``--timeout 0`` не увиден, а
+# у podman действует последний. Страж пропустил контейнер без срока жизни,
+# то есть ошибся ровно В СТОРОНУ ПРОПУСКА. Поэтому неизвестный флаг больше
+# не угадывается: см. _RUN_VALUELESS_FLAGS и поле ``unknown`` у _RunFlags.
+_RUN_VALUE_FLAGS: frozenset[str] = frozenset(
+    {
+        "--add-host",
+        "--annotation",
+        "--arch",
+        "--cap-add",
+        "--cap-drop",
+        "--cgroup-parent",
+        "--cgroups",
+        "--cidfile",
+        "--cpu-shares",
+        "--cpus",
+        "--cpuset-cpus",
+        "--cpuset-mems",
+        "--device",
+        "--dns",
+        "--entrypoint",
+        "--env",
+        "-e",
+        "--env-file",
+        "--gidmap",
+        "--health-cmd",
+        "--hostname",
+        "-h",
+        "--ipc",
+        "--label",
+        "-l",
+        "--log-driver",
+        "--log-opt",
+        "--memory",
+        "-m",
+        "--memory-swap",
+        "--name",
+        "--network",
+        "--os",
+        "--pid",
+        "--pids-limit",
+        "--platform",
+        "--publish",
+        "-p",
+        "--pull",
+        "--restart",
+        "--secret",
+        "--security-opt",
+        "--shm-size",
+        "--stop-signal",
+        "--stop-timeout",
+        "--sysctl",
+        "--timeout",
+        "--tmpfs",
+        "--tz",
+        "--uidmap",
+        "--ulimit",
+        "--umask",
+        "--user",
+        "-u",
+        "--userns",
+        "--variant",
+        "--volume",
+        "-v",
+        "--workdir",
+        "-w",
+    }
+)
+
+
+# Флаги ``<engine> run``, которые значения НЕ берут. Список нужен не ради
+# полноты, а ради РАЗЛИЧЕНИЯ: «флаг известен и он булев» против «флаг мне не
+# известен». Без него разбор угадывал, и угадывал в сторону пропуска (см.
+# комментарий к _RUN_VALUE_FLAGS). Булевы флаги обоих движков разбираются
+# spf13/pflag, а он значение отдельным токеном у булевого флага НЕ берёт —
+# только форму ``--flag=value``; значит принять их за беззначные безопасно.
+_RUN_VALUELESS_FLAGS: frozenset[str] = frozenset(
+    {
+        "--detach",
+        "-d",
+        "--help",
+        "--http-proxy",
+        "--init",
+        "--interactive",
+        "-i",
+        "--no-healthcheck",
+        "--no-hosts",
+        "--oom-kill-disable",
+        "--passwd",
+        "--privileged",
+        "--publish-all",
+        "-P",
+        "--quiet",
+        "-q",
+        "--read-only",
+        "--replace",
+        "--rm",
+        "--rmi",
+        "--sig-proxy",
+        "--tls-verify",
+        "--tty",
+        "-t",
+        "--unsetenv-all",
+    }
+)
+# Буквы слипшегося короткого пучка (``-it``, ``-ti``, ``-itd``), значения не
+# берущие. Пучок с чужой буквой известным не считается.
+_RUN_VALUELESS_SHORTS = frozenset("Pdiqt")
+
+
+def _is_valueless_run_flag(token: str) -> bool:
+    """Флаг ``run``, о котором ТОЧНО известно, что значения он не берёт."""
+    if token in _RUN_VALUELESS_FLAGS:
+        return True
+    if token.startswith("--") or not token.startswith("-"):
+        return False
+    body = token[1:]
+    return bool(body) and all(ch in _RUN_VALUELESS_SHORTS for ch in body)
+
+
+class _RunFlags(NamedTuple):
+    """Окно флагов ``<engine> run`` и признак того, что разбор не достоверен.
+
+    ``unknown`` — имя первого флага, про который неизвестно, берёт ли он
+    значение отдельным токеном. Пока он пуст, окну можно верить; как только
+    он назван, судить по этому окну о сроке жизни контейнера НЕЛЬЗЯ: за
+    проглоченным значением может стоять ещё один ``--timeout``, и именно он
+    будет действующим.
+    """
+
+    flags: list[tuple[str, str | None]]
+    unknown: str
+
+
+def _container_run_flags(parts: list[str], engine: str) -> _RunFlags | None:
+    """Флаги самого ``<engine> run`` — до образа. ``None``, если это не run.
+
+    Возвращается именно окно флагов запуска, а не вся строка: судить о сроке
+    жизни контейнера по токенам ПОСЛЕ образа нельзя, там уже команда внутри
+    контейнера.
+
+    Каждый флаг отдаётся ВМЕСТЕ СО ЗНАЧЕНИЕМ (``None``, если значения нет):
+    у ``--timeout`` вопрос не «есть ли флаг», а «названо ли им время», и без
+    значения на него не ответить (найдено машинным ревью 09.09.2026, находка
+    fee582c0e918a6a6).
+    """
+    global_value_flags = _ENGINE_GLOBAL_VALUE_FLAGS.get(engine, frozenset())
+    for i, part in enumerate(parts):
+        if part.rsplit("/", 1)[-1] != engine:
+            continue
+        j = i + 1
+        while j < len(parts) and parts[j].startswith("-"):
+            j += 2 if parts[j] in global_value_flags else 1
+        if j >= len(parts) or parts[j] != "run":
+            # Не «движка в строке нет», а «ЭТОТ вызов — не run»: подкоманд у
+            # движка много, и первая же не-run (``podman ps``) обрывала поиск
+            # вовсе, оставляя настоящий ``podman run`` правее невидимым — то
+            # есть отказ уходил В СТОРОНУ ПРОПУСКА (найдено машинным ревью
+            # 10.09.2026, находка 96144e6317c1d7ac).
+            continue
+        own: list[tuple[str, str | None]] = []
+        unknown = ""
+        k = j + 1
+        while k < len(parts) and parts[k].startswith("-"):
+            if parts[k] == "--":
+                # ``--`` кончает опции САМОГО run: следующий за ним токен —
+                # образ, чего бы он ни напоминал. Прежде ``--`` числился
+                # среди беззначных флагов, и разбор шёл дальше: на
+                # ``podman run -- --timeout 1800 img`` страж видел срок
+                # жизни, тогда как для podman образ здесь — ``--timeout``, а
+                # срока нет вовсе. Ошибка шла В СТОРОНУ ПРОПУСКА (найдено
+                # машинным ревью 10.09.2026, неразрешённая a58d77e268b2d709;
+                # воспроизведено на ff617db и на HEAD 149cd825).
+                break
+            if parts[k] in _RUN_VALUE_FLAGS:
+                own.append((parts[k], parts[k + 1] if k + 1 < len(parts) else None))
+                k += 2
+            else:
+                name, sep, value = parts[k].partition("=")
+                own.append((name, value if sep else None))
+                # Форма ``--flag=value`` однозначна и от списков не зависит.
+                # А вот голый флаг, которого нет НИ в одном из двух списков,
+                # разбору не по зубам: следующий токен может быть и его
+                # значением, и образом, и от выбора зависит, увидим ли мы
+                # флаги правее. Запоминаем ПЕРВЫЙ такой — он и называется в
+                # отказе.
+                if not sep and not _is_valueless_run_flag(parts[k]):
+                    unknown = unknown or parts[k]
+                k += 1
+        return _RunFlags(own, unknown)
+    return None
+
+
+_FLAG_ABSENT = object()
+
+
+def _effective(occurrences: list[Any]) -> Any:
+    """ДЕЙСТВУЮЩЕЕ вхождение повторённого флага — ПОСЛЕДНЕЕ. Нет — _FLAG_ABSENT.
+
+    Правило одно на весь модуль, потому что одна и та же ошибка дала здесь
+    уже три разных дефекта: страж судил ПЕРВОЕ вхождение, а инструменты
+    берут ПОСЛЕДНЕЕ, и всё, что дописано правее, страж не видел вовсе.
+
+    ЗАМЕРЕНО 10.09.2026 на машине разработки — оба семейства разборщиков:
+    — spf13/pflag (podman, docker): ``docker context ls --format '{{.Name}}'
+      --format 'LAST_WINS'`` печатает LAST_WINS, а обратный порядок печатает
+      имена контекстов, то есть повторный Set перезаписывает значение;
+    — getopt_long (sudo(8) parse_args.c, systemd-run): программа на C с
+      ``case 'u': user = optarg`` даёт на ``-n -u alice -u bob`` — bob, на
+      ``--user alice --user bob`` — bob, на ``-u bob -nu alice`` — alice.
+
+    Живого podman и systemd-run на машине нет, и повтор флага у них САМИХ не
+    замерялся: замерены их РАЗБОРЩИКИ, названные поимённо.
+    """
+    return occurrences[-1] if occurrences else _FLAG_ABSENT
+
+
+def _flag_value(flags: list[tuple[str, str | None]], flag: str) -> Any:
+    """Значение флага среди флагов run; ``_FLAG_ABSENT``, если флага нет.
+
+    «Флага нет» и «флаг есть, а времени в нём нет» — разные отказы, и путать
+    их нельзя: первый чинится дописыванием флага, второй — исправлением его
+    значения, и подсказка обязана называть именно то, что делать.
+
+    Повторённый флаг судится по ПОСЛЕДНЕМУ вхождению (_effective): на
+    ``--timeout 1800 --timeout 0`` действует ноль, то есть срока жизни нет,
+    а страж по первому вхождению пропускал такой запуск молча (найдено
+    машинным ревью 09.09.2026, находка 04d3d4b0f7febee0).
+    """
+    return _effective([value for name, value in flags if name == flag])
+
+
+def _names_a_deadline(value: str | None) -> bool:
+    """Значение ``--timeout`` действительно задаёт срок жизни контейнера.
+
+    Срок — целое число секунд БОЛЬШЕ НУЛЯ. Ноль сроком не является: это
+    подман-умолчание, а умолчание задокументировано словами «By default
+    containers run until they exit or are stopped by ``podman stop``»
+    (podman-run(1)). То есть ``--timeout 0`` — тот же класс «токен в строке
+    есть, срока жизни нет», что и ``--timeout`` после образа, и пропускать
+    его значит вернуть ровно ту дыру, ради которой страж написан.
+    """
+    return value is not None and value.isdigit() and int(value) > 0
 
 
 def detaching_sandbox() -> list[str]:
-    """Названная причина, если обёртка запуска отсоединяет процесс."""
+    """Названные причины, если обёртка запуска ни потомок, ни со своим сроком."""
     parts = shlex.split(config.LOCAL_REVIEW_SANDBOX or "")
-    runs_unit = any(part.rsplit("/", 1)[-1] == "systemd-run" for part in parts)
-    if runs_unit and "--scope" not in parts:
-        return [_DETACHING_HINT]
-    return []
+    reasons: list[str] = []
+    # ``--scope`` засчитывается только среди СОБСТВЕННЫХ аргументов
+    # systemd-run: за ``--`` стоит полезная нагрузка, и её ``--scope``
+    # transient service в scope не превращает. Взгляд на всю строку давал
+    # отказ В СТОРОНУ ПРОПУСКА — ``systemd-run --quiet --pipe --uid=x --
+    # /wrap --scope`` проходил молча (найдено машинным ревью 10.09.2026,
+    # находка 3d5938a9a645c39d; воспроизведено на HEAD 21629cde).
+    if any(
+        window.tool == "systemd-run"
+        # Именно среди ФЛАГОВ окна, а не среди его токенов: ``--scope``,
+        # съеденный как значение соседа, флагом не является (неразрешённая
+        # 5a59af8d620685d0).
+        and not any(name == "--scope" for name, _ in window.flags)
+        for window in _wrapper_windows(parts)
+    ):
+        reasons.append(_SCOPE_HINT)
+    podman_flags = _container_run_flags(parts, "podman")
+    if podman_flags is not None and podman_flags.unknown:
+        # Неизвестный флаг со значением отменяет ЛЮБОЕ суждение о сроке, а не
+        # только положительное: он мог проглотить и сам --timeout, и тогда
+        # «допишите --timeout» — совет починить то, что уже написано. Честный
+        # отказ называет флаг, который сорвал разбор (измерено 10.09.2026 на
+        # ``podman run --timeout 60 --blkio-weight 500 --timeout 0 img``:
+        # страж пропускал строку, где действующий срок — ноль).
+        reasons.append(_PODMAN_UNKNOWN_FLAG_HINT.format(flag=podman_flags.unknown))
+    elif podman_flags is not None:
+        deadline = _flag_value(podman_flags.flags, "--timeout")
+        if deadline is _FLAG_ABSENT:
+            reasons.append(_PODMAN_HINT)
+        elif not _names_a_deadline(deadline):
+            # Значения нет вовсе (флаг последним токеном) — так и сказать, а
+            # не показать оператору «None», которого он в строке не писал.
+            shown = "<значения нет>" if deadline is None else deadline
+            reasons.append(_PODMAN_DEADLINE_HINT.format(value=shown))
+    if _container_run_flags(parts, "docker") is not None:
+        reasons.append(_DOCKER_HINT)
+    return reasons
+
+
+# Пользователь песочницы записывается РАЗНЫМИ инструментами по-разному, и
+# знание одной формы означает, что на другой конфигурации проверка группы
+# каталога прогонов молча не срабатывает вовсе (найдено выкатом 08.09.2026,
+# #1208: рабочий рецепт использует ``sudo -n -u``, а страж знал только
+# ``--uid=`` от systemd-run).
+#
+# Карта по имени инструмента, а не список флагов вообще: ``--user`` у podman
+# и docker означает пользователя ВНУТРИ контейнера, а не на хосте, и принять
+# его за хостового значило бы проверить членство в группе не того. Поэтому
+# контейнерные движки названы здесь ЯВНО и с пустым списком флагов: они
+# гасят чужой ``--user``, а не остаются неизвестными.
+_USER_FLAGS: dict[str, tuple[str, ...]] = {
+    "systemd-run": ("--uid",),
+    "sudo": ("-u", "--user"),
+    "podman": (),
+    "docker": (),
+}
+
+
+# Короткие флаги sudo, НЕ берущие значения: только из таких букв может
+# состоять слипшийся пучок перед ``-u``. ``sudo -nu X`` — обычная запись тех
+# же ``-n`` и ``-u``, и на ней страж возвращал пустую строку, то есть молча
+# снимал проверку членства в группе (найдено машинным ревью 09.09.2026,
+# находка f4286f03c34368d3). А вот в ``sudo -pu X`` буква ``u`` — уже
+# значение ``-p``, а не флаг, и такой пучок здесь НЕ признаётся: угадать тут
+# значит проверить группу не того пользователя.
+_SUDO_VALUELESS_SHORT = frozenset("AbEeHiKklnPSsVv")
+
+
+def _bundled_short_value(token: str, letter: str, following: str | None) -> str | None:
+    """Значение слипшегося короткого флага: ``-nu X``, ``-uX``, ``-nuX``.
+
+    ``following`` — значение, которое окно уже отдало ЭТОМУ флагу отдельным
+    токеном (``None``, если флаг значения не берёт). Раньше сюда передавался
+    весь список окна и индекс, и «следующим» считался соседний токен, кем бы
+    он ни был; теперь сосед приходит только тогда, когда он и вправду
+    значение этого флага.
+    """
+    if not token.startswith("-") or token.startswith("--"):
+        return None
+    body = token[1:]
+    pos = body.find(letter)
+    if pos < 0 or any(ch not in _SUDO_VALUELESS_SHORT for ch in body[:pos]):
+        return None
+    rest = body[pos + 1 :]
+    if rest:
+        return rest
+    return following
+
+
+# Флаги СОБСТВЕННЫХ аргументов обёртки, чьё значение стоит ОТДЕЛЬНЫМ
+# токеном. Нужны, чтобы отличить значение флага от первого позиционного
+# аргумента: в ``sudo -n -u haiplane-reviewer /wrap`` имя пользователя — это
+# значение ``-u``, а ``/wrap`` уже полезная нагрузка, и всё правее неё —
+# аргументы ЧУЖОЙ программы. Списки ПО ИМЕНИ, как и всё в этом модуле;
+# незнакомый флаг со значением отдельным токеном закончит окно раньше
+# времени, и пользователь останется НЕ НАЗВАН — это пропуск, а не подмена.
+_TOOL_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    # sudo(8): опции, берущие аргумент.
+    "sudo": frozenset(
+        {
+            "-C",
+            "--close-from",
+            "-D",
+            "--chdir",
+            "-g",
+            "--group",
+            "-h",
+            "--host",
+            "-p",
+            "--prompt",
+            "-R",
+            "--chroot",
+            "-r",
+            "--role",
+            "-t",
+            "--type",
+            "-T",
+            "--command-timeout",
+            "-U",
+            "--other-user",
+            "-u",
+            "--user",
+        }
+    ),
+    # systemd-run(1): опции, берущие аргумент. ``--user`` здесь значения НЕ
+    # берёт — это выбор менеджера, а не имя пользователя, и путать их нельзя.
+    "systemd-run": frozenset(
+        {
+            "-u",
+            "--unit",
+            "-p",
+            "--property",
+            "--description",
+            "--slice",
+            "--uid",
+            "--gid",
+            "--nice",
+            "-E",
+            "--setenv",
+            "--service-type",
+            "--working-directory",
+            "--on-active",
+            "--on-boot",
+            "--on-startup",
+            "--on-unit-active",
+            "--on-unit-inactive",
+            "--on-calendar",
+            "--timer-property",
+            "--path-property",
+            "--socket-property",
+            "-M",
+            "--machine",
+            "-H",
+            "--host",
+        }
+    ),
+    # У движков собственные аргументы — это глобальные флаги ДО подкоманды,
+    # и они уже названы поимённо выше.
+    "podman": _ENGINE_GLOBAL_VALUE_FLAGS["podman"],
+    "docker": _ENGINE_GLOBAL_VALUE_FLAGS["docker"],
+}
+
+
+# Короткие флаги, берущие значение, и короткие флаги без значения — по
+# инструменту. Слипшийся пучок ``-nu`` берёт следующий токен, а ``-n`` — нет,
+# и без этого различия окно собственных аргументов обрывалось бы на имени
+# пользователя (``sudo -n -u alice -nu bob``).
+_TOOL_VALUE_SHORTS: dict[str, str] = {
+    "sudo": "CDghpRrtTUu",
+    "systemd-run": "upEMH",
+}
+_TOOL_VALUELESS_SHORTS: dict[str, str] = {
+    "sudo": "".join(sorted(_SUDO_VALUELESS_SHORT)),
+    "systemd-run": "dGPqrSt",
+}
+
+
+def _consumes_next(tool: str, arg: str) -> bool:
+    """Флаг инструмента, чьё значение стоит СЛЕДУЮЩИМ отдельным токеном."""
+    if arg in _TOOL_VALUE_FLAGS.get(tool, frozenset()):
+        return True
+    if arg.startswith("--") or not arg.startswith("-"):
+        return False
+    body = arg[1:]
+    if not body:
+        return False
+    valueless = _TOOL_VALUELESS_SHORTS.get(tool, "")
+    return body[-1] in _TOOL_VALUE_SHORTS.get(tool, "") and all(
+        ch in valueless for ch in body[:-1]
+    )
+
+
+class _ToolWindow(NamedTuple):
+    """Окно собственных аргументов инструмента, разобранное НА ФЛАГИ.
+
+    Окно отдаётся парами ``(флаг, значение отдельным токеном или None)``, а
+    не плоским списком токенов, потому что плоский список не отличал ФЛАГ от
+    ЗНАЧЕНИЯ ЧУЖОГО ФЛАГА — и на этом страж выносил ПОЛОЖИТЕЛЬНОЕ суждение о
+    строке, которой в ней нет. Измерено на ff617db и на HEAD 149cd825:
+    ``systemd-run --description --scope --uid=haiplane-reviewer /wrap`` давало
+    окно ``['--description', '--scope', '--uid=…']``, проверка ``'--scope' in
+    own`` находила своё слово — и отказ снимался. Но ``--scope`` здесь съеден
+    как ЗНАЧЕНИЕ ``--description``: настоящий systemd-run поднимет transient
+    service, то есть ровно то, ради чего отказ и написан. Ошибка шла В
+    СТОРОНУ ПРОПУСКА (найдено машинным ревью 10.09.2026, неразрешённая
+    5a59af8d620685d0).
+    """
+
+    tool: str
+    flags: list[tuple[str, str | None]]
+
+
+def _wrapper_windows(parts: list[str]) -> list[_ToolWindow]:
+    """Окна СОБСТВЕННЫХ аргументов названных инструментов, слева направо.
+
+    Окно инструмента кончается там же, где кончает его читать он сам: на
+    ``--`` либо на первом позиционном токене (имени полезной нагрузки).
+    Дальше идут аргументы ЧУЖОЙ программы, и принимать их за флаги обёртки
+    нельзя: страж возвращал тогда постороннее имя.
+
+    ЗАМЕРЕНО на HEAD 21629cde до починки — обе формы давали чужой ответ:
+    ``sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap`` давало
+    ``HOME`` (находка 64e89a8683b01db1), а
+    ``systemd-run --scope --uid=alice -- /bin/true --uid=bob`` — ``bob``
+    (находка d228b0eb3310a9cc). Это не «пропустили незнакомое», о чём
+    говорит объявленное ограничение задачи, а РАЗОБРАЛИ ЗНАКОМОЕ НЕВЕРНО:
+    имя постороннее, и членство в группе каталога прогонов проверялось у
+    того, кого в строке нет.
+
+    Поиск инструментов продолжается и ЗА окном: вложенная обёртка
+    (``sudo -u X podman run …``) остаётся видимой, и последнее названное имя
+    по-прежнему действующее.
+    """
+    windows: list[_ToolWindow] = []
+    i = 0
+    while i < len(parts):
+        tool = parts[i].rsplit("/", 1)[-1]
+        if tool not in _USER_FLAGS:
+            i += 1
+            continue
+        own: list[tuple[str, str | None]] = []
+        j = i + 1
+        while j < len(parts):
+            arg = parts[j]
+            if arg == "--":
+                j += 1
+                break
+            if not arg.startswith("-") or arg == "-":
+                break
+            if _consumes_next(tool, arg) and j + 1 < len(parts):
+                own.append((arg, parts[j + 1]))
+                j += 2
+            else:
+                own.append((arg, None))
+                j += 1
+        windows.append(_ToolWindow(tool, own))
+        i = max(j, i + 1)
+    return windows
+
+
+def _named_sandbox_user() -> tuple[str, str]:
+    """ИНСТРУМЕНТ и пользователь ХОСТА, названные в песочнице, или ("", "").
+
+    Инструмент возвращается вместе с именем, потому что форма записи
+    пользователя — свойство ИНСТРУМЕНТА, а не строки: ``#1000`` у sudo это
+    числовой uid, а у systemd-run такой формы нет вовсе. Разрешать имя,
+    забыв, кто его написал, значит либо отвергать годную настройку, либо
+    принимать негодную (найдено ревьюером Codex 10.09.2026 на ff617db).
+    """
+    parts = shlex.split(config.LOCAL_REVIEW_SANDBOX or "")
+    named: list[tuple[str, str]] = []
+    for window in _wrapper_windows(parts):
+        flags = _USER_FLAGS[window.tool]
+        for part, value in window.flags:
+            for flag in flags:
+                if part.startswith(flag + "="):
+                    named.append((window.tool, part.split("=", 1)[1]))
+                    break
+                if part == flag and value is not None:
+                    named.append((window.tool, value))
+                    break
+                if len(flag) == 2 and not flag.startswith("--"):
+                    bundled = _bundled_short_value(part, flag[1], value)
+                    if bundled:
+                        named.append((window.tool, bundled))
+                        break
+    entry = _effective(named)
+    return ("", "") if entry is _FLAG_ABSENT else entry
 
 
 def sandbox_uid() -> str:
-    """Пользователь, названный в песочнице (``--uid=X`` или ``--uid X``), или ""."""
-    parts = shlex.split(config.LOCAL_REVIEW_SANDBOX or "")
-    for i, part in enumerate(parts):
-        if part.startswith("--uid="):
-            return part.split("=", 1)[1]
-        if part == "--uid" and i + 1 < len(parts):
-            return parts[i + 1]
-    return ""
+    """Пользователь ХОСТА, названный в песочнице, или "".
+
+    Разбор идёт слева направо, и флаги ищутся те, что принадлежат ПОСЛЕДНЕМУ
+    названному инструменту: в ``sudo -u X podman run --user 1000`` хостовый
+    пользователь — X, а ``--user`` за podman относится к контейнеру.
+
+    При ПОВТОРЕ флага действует ПОСЛЕДНЕЕ вхождение — то же правило и тот же
+    _effective, что судит срок жизни контейнера. По первому вхождению страж
+    на ``sudo -u alice -u bob`` называл alice, тогда как запуск идёт под bob,
+    и членство в группе каталога прогонов проверялось НЕ У ТОГО пользователя
+    — то есть проверка, заведённая ради 45971e09, отвечала не про ту
+    конфигурацию (найдено при работе над #1208, ревьюер этого не называл).
+    """
+    return _named_sandbox_user()[1]
 
 
 def scratch_problem() -> list[str]:
@@ -215,15 +856,51 @@ def scratch_problem() -> list[str]:
     return _uid_outside_group(base, st.st_gid)
 
 
-def _resolve_user(user: str) -> Any | None:
+def _resolve_user(user: str, tool: str = "") -> Any | None:
     """Пользователь песочницы: ИМЯ или ЧИСЛО. Не разрешился — None.
 
     Числовая форма — не экзотика: ``--uid`` у systemd-run принимает и её, а
     ``getpwnam("65534")`` бросает KeyError, то есть проверка группы на таком
     значении молча ничего не проверяла (найдено ревью, неразрешённая
     534e16e4).
+
+    Форма ``#1000`` — тоже не экзотика, а НАСТОЯЩИЙ синтаксис sudo(8): «The
+    user may be either a user name or a numeric user ID (UID) prefixed with
+    the '#' character». Решётка у sudo как раз и снимает неоднозначность
+    между ИМЕНЕМ ``1000`` и uid ``1000`` — обе записи законны и означают
+    разное. Без неё ``'#1000'.isdigit()`` ложно, разбор уходил в
+    ``getpwnam('#1000')`` и падал ВСЕГДА: годная настройка отвергалась, а
+    оператору называлась неверная причина — «пользователь не разрешается в
+    системе» вместо «страж не знает этой записи» (найдено ревьюером Codex
+    10.09.2026, воспроизведено на ff617db).
+
+    ``tool`` обязателен именно потому, что форма принадлежит инструменту, и
+    правило это двустороннее:
+
+    * у systemd-run записи ``--uid=#1000`` не существует, и принять её там
+      значило бы разрешить строку, которую сам systemd-run отвергнет;
+    * у sudo, наоборот, ГОЛОЕ ЧИСЛО — это ИМЯ, а не uid, и разрешать его
+      через ``getpwuid`` значит проверить членство в группе НЕ У ТОГО, а
+      заодно одобрить строку, на которой sudo и не запустится.
+
+    Второе не выведено из мана, а ЗАМЕРЕНО 10.09.2026 на машине разработки,
+    где uid 501 существует и принадлежит вызывающему::
+
+        sudo -n -u 501 true    -> «sudo: unknown user 501», rc 1
+        sudo -n -u '#501' true -> rc 0
+
+    То есть ``getpwuid(501)`` для строки ``sudo -u 501`` отвечает про
+    пользователя, которого sudo в ней НЕ ВИДИТ. Ошибка шла в сторону
+    ПРОПУСКА: страж говорил «настроено» про песочницу, которая падает на
+    первом же запуске (доделано преемником на #1208; ревьюер называл только
+    форму с решёткой).
     """
     try:
+        if tool == "sudo":
+            if user.startswith("#"):
+                return pwd.getpwuid(int(user[1:]))
+            # Голое число у sudo — имя. Никакого getpwuid здесь быть не может.
+            return pwd.getpwnam(user)
         return pwd.getpwuid(int(user)) if user.isdigit() else pwd.getpwnam(user)
     except (KeyError, ValueError, OverflowError):
         return None
@@ -239,10 +916,10 @@ def _uid_outside_group(base: str, gid: int) -> list[str]:
     а в карточке будет «завершилось без отчёта» вместо названной причины,
     которую документ обещает.
     """
-    user = sandbox_uid()
+    tool, user = _named_sandbox_user()
     if not user:
         return []  # песочница не называет пользователя — судить не о чем
-    entry = _resolve_user(user)
+    entry = _resolve_user(user, tool)
     try:
         group = grp.getgrgid(gid)
     except (KeyError, OSError):
