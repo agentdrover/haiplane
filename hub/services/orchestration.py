@@ -603,8 +603,18 @@ async def _steward_shadow_metrics(db: aiosqlite.Connection) -> dict[str, Any]:
     }
 
 
+#: Окно практики по умолчанию — одно на все поверхности, которые его не
+#: называют явно: страница ``/metrics``, дайджест и MCP-вызов
+#: ``hub_practice_metrics``. Стоит именованной константой, а не тремя
+#: девяностыми в трёх файлах, потому что у скрипта разбора #1171 дефолт
+#: ДРУГОЙ (60 дней — окно приёмки «0 из 29»), и два дефолта, нигде не
+#: помеченные, читаются как один: оператор запускает ``report`` и открывает
+#: страницу, а числа под одним словом «precision» разные (#1153, #518).
+PRACTICE_METRICS_DEFAULT_DAYS = 90
+
+
 async def practice_metrics(
-    db: aiosqlite.Connection, *, since_days: int = 90
+    db: aiosqlite.Connection, *, since_days: int = PRACTICE_METRICS_DEFAULT_DAYS
 ) -> dict[str, Any]:
     """Practice economics (#384): machine-review costs, filtration rate,
     harness-version comparison, recurring finding categories, cycle times,

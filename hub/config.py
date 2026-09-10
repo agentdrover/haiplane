@@ -303,6 +303,15 @@ STALE_REVIEW_MINUTES = int(env_get("STALE_REVIEW_MINUTES", "120"))
 # mechanically fails (422 dor_failed), and until this watchdog the author
 # learned that only when the owner hit the button.
 UNREFINED_DRAFT_MINUTES = int(env_get("UNREFINED_DRAFT_MINUTES", "240"))
+# Сторож очереди неразобранных находок (#1171). Механика разбора построена
+# целиком — факт касания (#1039), очередь (#1038), кнопки (#876) — и за всё
+# время ею не воспользовались ни разу: 131 подтверждённая находка без ответа,
+# precision=null. Молчание тут неотличимо от пустой очереди, поэтому очередь
+# выше порога говорит вслух. Порог — суждение: 40 находок это больше, чем
+# один заход за раз, и всё ещё меньше, чем накопленный к #1171 запас.
+UNJUDGED_FINDINGS_ALERT_THRESHOLD = int(
+    env_get("UNJUDGED_FINDINGS_ALERT_THRESHOLD", "40")
+)
 # Delivery reconciliation (#897): how often the poller compares "completed"
 # against "the PR is still open", and how far back it looks. On a timer because
 # every candidate costs a call to GitHub; bounded in time because history from
