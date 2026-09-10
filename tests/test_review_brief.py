@@ -825,3 +825,53 @@ async def test_an_unasked_base_merge_does_not_pass_for_full_coverage():
     assert "base_merge" in [c["check"] for c in absent["checks_not_applicable"]], (
         "блока в брифе нет вовсе — требовать с него сигнала не с чего"
     )
+
+
+async def test_the_brief_feeds_its_base_merge_block_into_the_coverage_verdict(
+    client: AsyncClient, monkeypatch
+):
+    """Блок, показанный в брифе, обязан быть в его же счёте (#1233).
+
+    Вторая половина находки 84b9b04c160f8350: мало научить счётчик принимать
+    блок — бриф обязан его туда ПЕРЕДАТЬ. Без передачи счёт видит «блока нет»,
+    объявляет полное покрытие, а рядом в том же брифе стоит названный конфликт
+    с базой. Один документ, два несогласных утверждения — ровно та подмена,
+    против которой #725 и заводил единый вердикт над блоками.
+    """
+    from unittest.mock import AsyncMock
+
+    from hub.services import review_brief
+
+    task_id = (await client.post("/api/tasks", json={"title": "Base merge"})).json()[
+        "id"
+    ]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: go"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    monkeypatch.setattr(
+        review_brief,
+        "base_merge_section",
+        AsyncMock(
+            return_value=review_brief.BaseMergeState(
+                state="conflicting",
+                reason="мерж в базу НЕ будет чистым",
+                files=["tests/test_review_dispatch.py"],
+            )
+        ),
+    )
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    coverage = brief["evidence_coverage"]
+
+    assert brief["base_merge"]["state"] == "conflicting", "блок в брифе есть"
+    assert "base_merge" in coverage["checks_ran"], (
+        "и он посчитан: блок, который виден в брифе, но не участвует в счёте, "
+        "оставляет заголовок покрытия несогласным с самим брифом"
+    )
+    assert "base_merge" not in [
+        c["check"] for c in coverage["checks_not_applicable"]
+    ], "«спрашивать нечего» — это не про блок, который прямо сейчас показан"

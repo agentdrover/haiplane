@@ -1438,3 +1438,118 @@ async def test_a_push_in_the_await_window_never_rides_the_verdict_in(
         capture_output=True,
     )
     assert carries.returncode != 0, "неодобренного кода нет в закреплённом коммите"
+
+
+async def test_an_unreadable_merge_commit_is_a_refusal_not_an_empty_pin(
+    tmp_path, monkeypatch
+) -> None:
+    """(True, "") не бывает: пустое закрепление хуже несостоявшегося автомержа.
+
+    Находка 66436b8dfb8ce18b. ``rev-parse HEAD`` читался без кода возврата, и
+    его молчание превращалось в успех с пустым sha. Пустота уезжала в
+    submission_sha, а пустое закрепление гейт читает как «сверка с одобрением
+    не проводилась» и доставляет БЕЗ неё (#572) — то есть неудача чтения
+    снимала бы проверку, ради которой закрепление и заведено.
+    """
+    from hub.integrations import git_ops as git_ops_mod
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import base_merge
+
+    repo = _repo_with_a_tail_conflict(tmp_path)
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1233/probe")
+    files, why = await ops.base_merge_conflicts(
+        str(repo), "develop", "task-1233/probe", 1233, pinned
+    )
+    assert files, why
+    resolutions, _ = base_merge.plan_resolution(files)
+
+    real_git = git_ops_mod._git
+
+    async def _blind_rev_parse(*args, **kw):
+        if args[:2] == ("rev-parse", "HEAD"):
+            return 128, "", "fatal: ambiguous argument 'HEAD'"
+        return await real_git(*args, **kw)
+
+    monkeypatch.setattr(git_ops_mod, "_git", _blind_rev_parse)
+
+    async def _green(_path):
+        return 0, "ok"
+
+    ok, detail = await ops.push_resolved_base_merge(
+        str(repo), "develop", "task-1233/probe", 1233, resolutions, _green, pinned
+    )
+
+    assert not ok, "неудача чтения коммита — это отказ, а не успех"
+    assert detail.strip(), "у отказа всегда есть названная причина"
+    assert "закрепление не трогаем" in detail
+    assert _tip(repo, "task-1233/probe") == pinned, (
+        "ветка не сдвинулась: пушить то, чего не смогли назвать, автомерж не станет"
+    )
+
+
+async def test_a_branch_rewound_under_the_automerge_is_not_clobbered(
+    tmp_path,
+) -> None:
+    """Аренда пуша: ветку, уехавшую ПОСЛЕ пробы, автомерж не затирает (#1233).
+
+    Дерево строится на закреплённом коммите, поэтому обычный пуш и так отказал
+    бы любому коммиту ПОВЕРХ него — не fast-forward. Аренда закрывает другой
+    случай, который простой пуш пропустил бы молча: ветку откатили НАЗАД (чужой
+    force-push в окно ожидания). Слитый коммит тогда оказывается потомком новой
+    вершины, обычный пуш прошёл бы как fast-forward и стёр бы этот откат.
+    Момент отката подстроен точно: ``validate`` вызывается между подготовкой
+    дерева и пушем, то есть ровно в то окно, которое аренда и стережёт.
+    """
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import base_merge
+
+    repo = _repo_with_a_tail_conflict(tmp_path)
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1233/probe")
+    rewound_to = _run_git_out("git", "rev-parse", f"{pinned}^", cwd=repo)
+
+    files, why = await ops.base_merge_conflicts(
+        str(repo), "develop", "task-1233/probe", 1233, pinned
+    )
+    assert files, why
+    resolutions, _ = base_merge.plan_resolution(files)
+
+    async def _green_but_someone_rewinds(_path):
+        # Окно между подготовкой дерева и пушем — здесь и живёт гонка.
+        _run_git(
+            "git",
+            "push",
+            "-q",
+            "--force",
+            "origin",
+            f"{rewound_to}:refs/heads/task-1233/probe",
+            cwd=repo,
+        )
+        return 0, "ok"
+
+    ok, detail = await ops.push_resolved_base_merge(
+        str(repo),
+        "develop",
+        "task-1233/probe",
+        1233,
+        resolutions,
+        _green_but_someone_rewinds,
+        pinned,
+    )
+
+    assert not ok, (
+        "ветку откатили под нами — пуш обязан отказать, а не пройти "
+        "fast-forward'ом поверх чужого отката"
+    )
+    assert _tip(repo, "task-1233/probe") == rewound_to, (
+        "чужой откат остался на месте: автомерж ничего не затёр"
+    )
+
+
+def _run_git_out(*args: str, cwd) -> str:
+    import subprocess
+
+    return subprocess.run(
+        args, cwd=cwd, capture_output=True, text=True, check=True
+    ).stdout.strip()
