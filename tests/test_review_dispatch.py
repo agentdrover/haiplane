@@ -16,6 +16,7 @@ import shlex
 import stat
 import subprocess
 import textwrap
+import uuid
 from pathlib import Path
 
 import aiosqlite
@@ -3194,6 +3195,106 @@ async def test_the_timed_out_reviewer_is_actually_dead(monkeypatch, tmp_path):
     )
 
 
+async def test_the_run_guard_judges_the_deadline_the_run_will_get(
+    monkeypatch, tmp_path
+):
+    """Страж сверяет срок контейнера с тем числом, по которому прогон СНИМУТ.
+
+    Находка 10.09.2026 (ревьюер Codex, воспроизведено на ef2198fc): проверка
+    сравнивала срок контейнера с ``LOCAL_REVIEW_TIMEOUT_SEC`` даже там, где
+    прогону отмерили меньше. ``podman run --timeout 1800`` проходил готовность
+    при умолчании 1800, а ``run_review(timeout=1)`` убивал только клиента
+    podman — контейнер жил оставшиеся почти полчаса, жёг CPU и мог прислать
+    отчёт по закрытому прогону. Формально страж срабатывал; инвариант при этом
+    был нарушен.
+    """
+    sandbox = "/usr/bin/podman run --rm -i --timeout 1800 img"
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", 1800)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "cursor-agent --print")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+
+    assert local_reviewer.detaching_sandbox() == [], (
+        "по настройке эта строка законна — иначе проверка ниже беспредметна"
+    )
+    short = local_reviewer.detaching_sandbox(60)
+    assert short, (
+        "прогону отмерили 60 с, контейнеру — 1800: он переживёт снятие "
+        "прогона ровно так же, как без --timeout вовсе"
+    )
+    assert any("60" in reason for reason in short), (
+        f"отказ обязан назвать срок ЭТОГО прогона, а не настройку: {short}"
+    )
+    assert local_reviewer.detaching_sandbox(1800) == [], (
+        f"на своём же сроке строка отвергаться не должна: "
+        f"{local_reviewer.detaching_sandbox(1800)}"
+    )
+
+    # И это не только суждение: прогон с таким сроком НЕ ЗАПУСКАЕТСЯ. Иначе
+    # страж остался бы мнением, которое некому применить, — весь класс
+    # дефектов #1208 именно об этом.
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        local_reviewer,
+        "_spawn",
+        lambda *a, **k: spawned.append("да"),  # noqa: ARG005
+    )
+    assert await local_reviewer.run_review("промт", timeout=1) is None, (
+        "прогон, чей контейнер переживёт его снятие, запускать нельзя"
+    )
+    assert not spawned, (
+        "страж высказался, а хаб всё равно породил процесс: контейнер "
+        f"пережил бы прогон на 1799 с, {spawned}"
+    )
+
+
+async def test_two_local_runs_never_overlap_on_the_host(monkeypatch, tmp_path):
+    """Хост держит один прогон разом, и это держит ХАБ, а не скрипт враппера.
+
+    Находка 10.09.2026 (ревьюер Codex, подтверждена на хосте хаба). Рабочий
+    враппер снимал «хвосты» строкой ``podman rm -af``, называя основанием
+    «два ревьюера разом хосту не по карману». Хаб такого ограничения не знал:
+    ``_LOCAL_RUNS`` — обычный ``dict`` по идентификатору заказа, ни очереди,
+    ни сериализации. Два ревью, начавшихся близко по времени, сносили друг
+    друга, и в карточке это ложилось отказом прогона с ЛОЖНОЙ причиной.
+
+    Доказательство внешнее: полезная нагрузка отмечает вход и выход в общем
+    файле. Пересечение читается из ПОРЯДКА отметок, а не из времени — по
+    времени тест был бы флаким на загруженной машине.
+    """
+    import shlex
+    import shutil
+
+    marks = tmp_path / "marks"
+    payload = (
+        f"printf 'in\n' >> {shlex.quote(str(marks))}; "
+        "sleep 0.3; "
+        f"printf 'out\n' >> {shlex.quote(str(marks))}"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_CMD", shlex.join(["/bin/sh", "-c", payload])
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+
+    runs = await asyncio.gather(
+        *[local_reviewer.run_review("промт", timeout=30) for _ in range(3)]
+    )
+    assert all(run is not None and not run.timed_out for run in runs), (
+        f"прогоны не состоялись — тогда о пересечении судить не по чему: {runs}"
+    )
+    seen = marks.read_text().split()
+    assert seen == ["in", "out"] * 3, (
+        f"прогоны шли внахлёст: {seen}. На хосте это значит второй контейнер "
+        "при отмеренных первому 1500 МБ и 1.5 CPU — и уборку враппера, "
+        "которая сносит живой контейнер соседа"
+    )
+
+
 async def test_stopping_the_hub_kills_the_local_reviewer(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
 ):
@@ -5598,7 +5699,14 @@ def test_the_doc_wrapper_carries_the_argv_the_hub_appends(
 
     cmd = ["cursor-agent", "--print", "--model", "grok-4.6"]
     done = subprocess.run(
-        [str(wrapper), *cmd], capture_output=True, text=True, timeout=30
+        [str(wrapper), *cmd],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            **os.environ,
+            "HAIPLANE_REVIEW_CONF": str(_wrapper_conf(tmp_path, deadline=None)),
+        },
     )
     assert done.returncode == 0, f"скелет враппера не запустился: {done.stderr}"
     seen = done.stdout.split("\n")
@@ -5643,17 +5751,49 @@ def test_the_doc_probe_runs_the_same_command_the_hub_will_run(monkeypatch) -> No
         )
 
 
-def _doc_wrapper_launch(tmp_path) -> str:
-    """Строка запуска движка, какой её видит движок ПОСЛЕ подстановки.
+def _wrapper_conf(tmp_path, *, deadline: int | None) -> Path:
+    """Каталог ``$CONF`` враппера: то, что оператор кладёт в /etc по шагу 3a.
 
-    Скелет из документа не читается глазами и не разбирается регулярками: он
-    ИСПОЛНЯЕТСЯ с подменённым на заглушку движком, и наружу отдаётся тот
-    argv, который заглушка получила. Разница не косметическая — в скелете
-    стоят переменные (``--timeout="$TIMEOUT"``, ``"$IMAGE"``), и текст
-    «--timeout "$TIMEOUT"» выглядит убедительно ровно так же при пустом
-    TIMEOUT, при опечатке в имени переменной и при её потере под ``set -u``.
-    Проверять текст значило бы проверять намерение, а не команду.
+    Скелет читает оттуда образ и срок — сам он их не зашивает, иначе срок ни
+    за какой настройкой не следовал бы (находка 10.09.2026). Файл ``timeout``
+    при ``deadline is None`` НЕ создаётся: это вход «оператор файла не писал»,
+    на котором действует умолчание скелета.
     """
+    conf = tmp_path / "conf"
+    conf.mkdir(exist_ok=True)
+    (conf / "image").write_text("localhost/haiplane-reviewer:1\n")
+    (conf / "model.env").write_text("KEY=x\n")
+    if deadline is None:
+        (conf / "timeout").unlink(missing_ok=True)
+    else:
+        (conf / "timeout").write_text(f"{deadline}\n")
+    return conf
+
+
+def _doc_wrapper_argv(tmp_path, *, deadline: int | None) -> list[str]:
+    """ВСЕ вызовы движка, которые сделал скелет враппера из документа.
+
+    Скелет не читается глазами и не разбирается регулярками: он ИСПОЛНЯЕТСЯ с
+    подменённым на заглушку движком, и наружу отдаётся то, что заглушка
+    получила — каждый вызов отдельной строкой, в порядке вызова. Разница не
+    косметическая — в скелете стоят переменные (``--timeout="$TIMEOUT"``,
+    ``"$IMAGE"``), и текст «--timeout "$TIMEOUT"» выглядит убедительно ровно
+    так же при пустом TIMEOUT, при опечатке в имени переменной и при её потере
+    под ``set -u``. Проверять текст значило бы проверять намерение, а не
+    команду.
+
+    ``deadline`` — что лежит в ``$CONF/timeout``; ``None`` значит файла нет, и
+    тогда действует умолчание самого скелета. Каталог настроек подставляется
+    через ``HAIPLANE_REVIEW_CONF``: без него скелет читал бы боевой
+    ``/etc/haiplane-review``, которого на машине проверки нет, а с зашитым в
+    скелет литералом срок вообще не следовал бы ни за чем (находка 10.09.2026,
+    находки 2 и 3 одного и того же числа).
+
+    Возвращаются ВСЕ вызовы, а не только ``run``: то, что скелет делает ДО
+    запуска, — часть рецепта, и именно там жил ``podman rm -af``, сносивший
+    чужие контейнеры.
+    """
+    conf = _wrapper_conf(tmp_path, deadline=deadline)
     blocks = [
         b
         for b in re.findall(r"```sh\n(.*?)```", _DEPLOY_DOC.read_text(), re.S)
@@ -5669,7 +5809,9 @@ def _doc_wrapper_launch(tmp_path) -> str:
         for tok in shlex.split(script.replace("\\\n", " "))
         if tok.rsplit("/", 1)[-1] == "podman"
     )
-    log = tmp_path / "argv.log"
+    # Свой файл на КАЖДЫЙ прогон: заглушка дописывает, и общий файл склеил бы
+    # вызовы соседнего запуска скелета в том же tmp_path.
+    log = tmp_path / f"argv-{uuid.uuid4().hex}.log"
     stub = tmp_path / "podman"
     stub.write_text(
         "#!/usr/bin/env python3\n"
@@ -5686,15 +5828,26 @@ def _doc_wrapper_launch(tmp_path) -> str:
         capture_output=True,
         text=True,
         timeout=30,
-        env={**os.environ, "ARGV_LOG": str(log)},
+        env={
+            **os.environ,
+            "ARGV_LOG": str(log),
+            "HAIPLANE_REVIEW_CONF": str(conf),
+        },
     )
     assert done.returncode == 0, f"скелет враппера не запустился: {done.stderr}"
     seen = [line for line in log.read_text().splitlines() if line]
-    runs = [line for line in seen if shlex.split(line)[:1] == ["run"]]
+    log.unlink()
+    return [shlex.join([engine, *shlex.split(line)]) for line in seen]
+
+
+def _doc_wrapper_launch(tmp_path, *, deadline: int | None = None) -> str:
+    """Единственная строка ``<engine> run`` скелета — то, что судит страж."""
+    calls = _doc_wrapper_argv(tmp_path, deadline=deadline)
+    runs = [c for c in calls if shlex.split(c)[1:2] == ["run"]]
     assert len(runs) == 1, (
-        f"скелет враппера обязан один раз позвать «podman run»; движок получил {seen}"
+        f"скелет враппера обязан один раз позвать «podman run»; движок получил {calls}"
     )
-    return shlex.join([engine, *shlex.split(runs[0])])
+    return runs[0]
 
 
 def test_the_doc_wrapper_skeleton_names_its_own_deadline(monkeypatch, tmp_path) -> None:
@@ -5728,6 +5881,123 @@ def test_the_doc_wrapper_skeleton_names_its_own_deadline(monkeypatch, tmp_path) 
         f"эту строку: {local_reviewer.detaching_sandbox()}. Внутри обёртки "
         "страж её не увидит — а значит прогон нельзя будет снять, и хаб "
         "напишет в ленту, что снял"
+    )
+
+
+def test_the_doc_wrapper_deadline_follows_the_conf_file(monkeypatch, tmp_path) -> None:
+    """Срок контейнера СЛЕДУЕТ за настройкой, а не зашит в скелет числом.
+
+    Находка 10.09.2026 (ревьюер Codex, воспроизведено на ef2198fc): оператор
+    ставит ``HAIPLANE_LOCAL_REVIEW_TIMEOUT_SEC=600`` и копирует скелет как
+    есть — а в скелете стояло ``TIMEOUT=1800`` литералом, ни с чем не
+    связанным. Контейнер переживал прогон втрое, и страж этого не видел вовсе:
+    на рекомендованном рецепте ему виден только ``sudo …
+    /haiplane-review-run``, podman лежит внутри скрипта.
+
+    Проверяется исполнением: скелет запускается с подставленным каталогом
+    настроек, и наружу берётся то число, которое ПОЛУЧИЛ движок. Замер на
+    прежней редакции: файл ``timeout`` с любым содержимым не менял ничего —
+    движку уходило 1800.
+    """
+    hub_deadline = _documented_hub_deadline()
+
+    # 1. Умолчание скелета (файла нет) — это ХАБСКОЕ умолчание, а не «просто
+    #    число»: разойдись они, рецепт по умолчанию был бы уже сломан.
+    launch = _doc_wrapper_launch(tmp_path, deadline=None)
+    flags = local_reviewer._container_run_flags(shlex.split(launch), "podman")
+    assert flags is not None and not flags.unknown, (
+        f"строка запуска скелета не разобралась: {launch}"
+    )
+    assert local_reviewer._flag_value(flags.flags, "--timeout") == str(hub_deadline), (
+        f"без файла настроек скелет ставит контейнеру срок из «{launch}», а "
+        f"хабское умолчание — {hub_deadline}. Умолчания обязаны совпадать: "
+        "иначе рецепт ломается ещё до того, как оператор что-либо тронул"
+    )
+
+    # 2. Файл настроек ДЕЙСТВУЕТ: оператор укоротил хабский срок, вписал то же
+    #    число в файл — и контейнер получил именно его. Это и есть то, чего в
+    #    прежней редакции не было: связь между двумя местами.
+    shortened = 600
+    assert shortened != hub_deadline, "проверка беспредметна на равных числах"
+    launch = _doc_wrapper_launch(tmp_path, deadline=shortened)
+    flags = local_reviewer._container_run_flags(shlex.split(launch), "podman")
+    assert local_reviewer._flag_value(flags.flags, "--timeout") == str(shortened), (
+        f"скелет не взял срок из $CONF/timeout: движку ушло «{launch}». "
+        "Значит число в скелете зашито, и согласовать его с настройкой хаба "
+        "оператору нечем"
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", launch)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", shortened)
+    assert local_reviewer.detaching_sandbox() == [], (
+        f"согласованная пара (хаб {shortened}, контейнер {shortened}) обязана "
+        f"проходить: {local_reviewer.detaching_sandbox()}"
+    )
+
+    # 3. И РАСХОЖДЕНИЕ — это дыра, а не мелочь: тот же укороченный хаб против
+    #    прежнего зашитого 1800. Страж назвал бы её, если бы видел строку, —
+    #    но на рекомендованном рецепте не видит, поэтому файл из шага 3a и
+    #    есть единственное место, где она закрывается.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", _doc_wrapper_launch(tmp_path, deadline=None)
+    )
+    assert local_reviewer.detaching_sandbox(), (
+        f"контейнерные {hub_deadline} при хабских {shortened} переживают "
+        "прогон — если страж молчит и здесь, то расхождение не ловится нигде"
+    )
+
+
+def test_the_doc_wrapper_cleans_up_only_its_own_container(tmp_path) -> None:
+    """Уборка хвоста адресована ОДНОМУ контейнеру, а не всем подряд.
+
+    Находка 10.09.2026 (ревьюер Codex, подтверждена на хосте хаба:
+    /usr/local/bin/haiplane-review-run, строка 22). Скелет содержал
+    ``podman rm -af`` — снос ВСЕХ контейнеров пользователя-ревьюера.
+    Основание было названо тут же в комментарии («два ревьюера разом хосту не
+    по карману»), но ``rm -af`` такого ограничения не устанавливает: он не
+    сдерживает второй прогон, а УБИВАЕТ первый — и заодно всё постороннее,
+    что этот пользователь запустил. Одновременность держит хаб
+    (``local_reviewer._HOST_BUDGET``, тест
+    ``test_two_local_runs_never_overlap_on_the_host``), а здесь держится то,
+    что уборка никого чужого не задевает.
+
+    Судится не текст, а argv, которые движок ФАКТИЧЕСКИ получил.
+    """
+    calls = _doc_wrapper_argv(tmp_path, deadline=None)
+    # ``--all``/``-a`` у любой снимающей подкоманды — это «все контейнеры
+    # пользователя», то есть ровно та находка. Перечислены по имени: список
+    # узкий и о подкомандах podman, а не догадка про CLI вообще.
+    for call in calls:
+        argv = shlex.split(call)[1:]
+        if not argv or argv[0] not in ("rm", "stop", "kill", "pod"):
+            continue
+        wholesale = [
+            tok
+            for tok in argv[1:]
+            if tok in ("-a", "--all")
+            or (tok.startswith("-") and not tok.startswith("--") and "a" in tok[1:])
+        ]
+        assert not wholesale, (
+            f"скелет враппера зовёт «{call}»: {wholesale} значит ВСЕ "
+            "контейнеры пользователя-ревьюера, а не хвост своего прошлого "
+            "прогона. Так уборка сносит живое чужое ревью, и в карточке это "
+            "ляжет отказом прогона с ложной причиной"
+        )
+    # А адресат уборки обязан БЫТЬ: снести хвост всё-таки надо, и адресуется
+    # он именем. Без имени ``--replace`` бессмыслен, а без ``--replace``
+    # хвост пережил бы запуск и занял бы имя.
+    launch = _doc_wrapper_launch(tmp_path, deadline=None)
+    flags = local_reviewer._container_run_flags(shlex.split(launch), "podman")
+    assert flags is not None and not flags.unknown, (
+        f"строка запуска скелета не разобралась: {launch}"
+    )
+    name = local_reviewer._flag_value(flags.flags, "--name")
+    assert isinstance(name, str) and name, (
+        f"скелет не даёт контейнеру имени: {launch}. Тогда адресной уборки "
+        "нет вовсе, и вернуться к «rm -af» — вопрос одного коммита"
+    )
+    assert any(flag == "--replace" for flag, _ in flags.flags), (
+        f"имя «{name}» есть, а --replace нет: {launch}. Хвост прошлого "
+        "прогона займёт имя, и запуск упадёт «name already in use»"
     )
 
 

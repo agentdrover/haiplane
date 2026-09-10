@@ -209,8 +209,9 @@ _PODMAN_DETACH_HINT = (
 )
 _PODMAN_OVERLONG_HINT = (
     "LOCAL_REVIEW_SANDBOX: podman run --timeout «{value}» переживает сам "
-    "прогон: хаб снимает локальное ревью через {limit} с "
-    "(LOCAL_REVIEW_TIMEOUT_SEC), а убийство группы до conmon не доходит — "
+    "прогон: хаб снимает этот прогон через {limit} с "
+    "(LOCAL_REVIEW_TIMEOUT_SEC, если прогону не отмерили меньше), а убийство "
+    "группы до conmon не доходит — "
     "контейнер доживёт свои {value} с, продолжит жечь CPU и сможет прислать "
     "отчёт по уже закрытому прогону. Срок контейнера не может быть БОЛЬШЕ "
     "хабского; поставьте --timeout {limit} — см. deploy/LOCAL-REVIEW.md"
@@ -616,8 +617,23 @@ def _detaching_flag(flags: list[tuple[str, str | None]]) -> str:
     return name
 
 
-def detaching_sandbox() -> list[str]:
-    """Названные причины, если обёртка запуска ни потомок, ни со своим сроком."""
+def detaching_sandbox(limit: int | None = None) -> list[str]:
+    """Названные причины, если обёртка запуска ни потомок, ни со своим сроком.
+
+    ``limit`` — срок, который ХАБ отмерит прогону, в секундах. Он аргумент, а
+    не только настройка, потому что ``run_review(timeout=N)`` эту настройку
+    перекрывает, а инвариант стража привязан не к имени настройки, а к числу,
+    по которому прогон РЕАЛЬНО снимут. Со сроком по умолчанию проверка
+    сравнивала ``LOCAL_REVIEW_TIMEOUT_SEC`` даже там, где хаб отмерил секунду:
+    ``podman run --timeout 1800`` проходил готовность при умолчании 1800, а
+    ``run_review(timeout=1)`` убивал только клиента podman — контейнер жил
+    оставшиеся полчаса (найдено ревьюером Codex 10.09.2026, воспроизведено на
+    ef2198fc). Формально страж срабатывал; инвариант при этом был нарушен.
+
+    ``None`` означает «сроком распоряжается настройка» — так спрашивает
+    готовность (``not_ready``), которой конкретного прогона ещё не показали.
+    """
+    deadline = config.LOCAL_REVIEW_TIMEOUT_SEC if limit is None else limit
     parts = shlex.split(config.LOCAL_REVIEW_SANDBOX or "")
     reasons: list[str] = []
     # ``--scope`` засчитывается только среди СОБСТВЕННЫХ аргументов
@@ -659,25 +675,21 @@ def detaching_sandbox() -> list[str]:
             )
         )
     elif podman_flags is not None:
-        deadline = _flag_value(podman_flags.flags, "--timeout")
-        if deadline is _FLAG_ABSENT:
+        lifetime = _flag_value(podman_flags.flags, "--timeout")
+        if lifetime is _FLAG_ABSENT:
             reasons.append(_PODMAN_HINT)
-        elif not _names_a_deadline(deadline):
+        elif not _names_a_deadline(lifetime):
             # Значения нет вовсе (флаг последним токеном) — так и сказать, а
             # не показать оператору «None», которого он в строке не писал.
-            shown = "<значения нет>" if deadline is None else deadline
+            shown = "<значения нет>" if lifetime is None else lifetime
             reasons.append(_PODMAN_DEADLINE_HINT.format(value=shown))
-        elif int(deadline) > config.LOCAL_REVIEW_TIMEOUT_SEC:
+        elif int(lifetime) > deadline:
             # Срок ДЛИННЕЕ хабского собственным сроком жизни не является: он
             # истечёт уже после того, как хаб снял прогон и написал в ленту,
             # что снял. Требование — «не больше»; равенство документ
             # рекомендует, а более короткий срок дырой не является и
             # отвергаться не должен.
-            reasons.append(
-                _PODMAN_OVERLONG_HINT.format(
-                    value=deadline, limit=config.LOCAL_REVIEW_TIMEOUT_SEC
-                )
-            )
+            reasons.append(_PODMAN_OVERLONG_HINT.format(value=lifetime, limit=deadline))
     if _container_run_flags(parts, "docker") is not None:
         reasons.append(_DOCKER_HINT)
     return reasons
@@ -1094,47 +1106,96 @@ def _clean_env(workdir: str) -> dict[str, str]:
     return env
 
 
+# Хост держит ОДИН прогон разом, и знать об этом может только хаб.
+#
+# Основание не выдумано: контейнеру ревьюера отмерено 1500 МБ и 1.5 CPU
+# (deploy/LOCAL-REVIEW.md), и рабочий враппер на хосте хаба сам пишет об этом
+# в комментарии — «два ревьюера разом хосту не по карману». Но САМ ВРАППЕР
+# соблюсти это не может: он живёт одну команду и соседей не видит, и то, чем
+# он это «соблюдал», — ``podman rm -af`` — соседа не сдерживает, а УБИВАЕТ,
+# заодно снося все прочие контейнеры пользователя (найдено ревьюером Codex
+# 10.09.2026 на ef2198fc и подтверждено на хосте: /usr/local/bin/
+# haiplane-review-run, строка 22). Второй прогон, начавшийся близко по
+# времени, сносил контейнер первого, и в карточке это легло бы отказом
+# прогона с ЛОЖНОЙ причиной.
+#
+# Очередь, а не отказ: «хост занят» — это ожидание, а «ревью не состоялось» —
+# исход, который карточка обязана нести человеку. Превращать первое во второе
+# значило бы завести ровно тот класс молчаливой лжи, против которого написан
+# весь этот модуль. Ждущий прогон остаётся в ``_LOCAL_RUNS``, поэтому свип
+# потерянных строк его не трогает.
+#
+# Один процесс — та же зернистость, что у ``_LOCAL_RUNS``: прогоны
+# досматривает только тот процесс хаба, который их завёл, и на большее этот
+# замок не претендует.
+_HOST_BUDGET = asyncio.Lock()
+
+
 async def run_review(prompt: str, *, timeout: int | None = None) -> LocalRun | None:
     """Прогнать ревьюера над готовым промтом. ``None`` — запуска не было.
 
-    ``None`` возвращается ровно тогда, когда процесс не удалось породить: нет
-    настроек, нет каталога, нет бинаря. Это не «ревью ничего не нашло» и не
-    «ревью упало» — вызывающий обязан назвать это в ленте отдельной причиной,
-    иначе «не запускалось» прочитается как «прочитано и чисто», а это и есть
-    класс дефектов, ради которого всё здесь написано.
+    ``None`` возвращается ровно тогда, когда прогона не было: нет настроек,
+    нет каталога, нет бинаря — или песочница не переживает снятие ИМЕННО
+    ЭТОГО прогона, которому могли отмерить меньше, чем настройке. Это не
+    «ревью ничего не нашло» и не «ревью упало» — вызывающий обязан назвать
+    это в ленте отдельной причиной, иначе «не запускалось» прочитается как
+    «прочитано и чисто», а это и есть класс дефектов, ради которого всё
+    здесь написано.
+
+    Прогон идёт ПО ОДНОМУ на хост: см. ``_HOST_BUDGET``. Ожидание очереди в
+    отмеренный прогону срок не входит — срок начинают отсчитывать после того,
+    как замок взят.
     """
     if not is_configured():
         return None
     limit = timeout if timeout is not None else config.LOCAL_REVIEW_TIMEOUT_SEC
-    base = config.LOCAL_REVIEW_SCRATCH_DIR.strip()
-    try:
-        workdir = tempfile.mkdtemp(prefix="haiplane-review-", dir=base)
-        # Каталог создаёт ХАБ, а работать в нём чужому пользователю (найдено
-        # ревью, находка 92eba4f8 — и это регрессия, которую открыл фикс
-        # предыдущей). Пока песочница отсоединяла процесс, домом ревьюера был
-        # его passwd-home и права этого каталога никого не задевали. С --scope
-        # cwd, HOME и TMPDIR доезжают по-настоящему — а mkdtemp всегда даёт
-        # 0700 владельца-создателя, то есть ревьюер получил бы EACCES на
-        # собственный рабочий каталог и упал бы, не начав.
-        #
-        # 0770, а не 0777: доступ даётся ГРУППЕ, общей у хаба и ревьюера, —
-        # setgid на родителе (2770) проставляет её сам. Права «всем» открыли
-        # бы промт с одноразовым кодом любому пользователю хоста.
-        os.chmod(workdir, 0o770)  # nosec B103 - права даны ГРУППЕ, не миру
-    except OSError as exc:
-        log.warning("local reviewer: no scratch dir under %s: %s", base, exc)
+    # Стража спрашивают ЗДЕСЬ и по ЭТОМУ числу, а не только на готовности и не
+    # только по настройке: готовность видела ``LOCAL_REVIEW_TIMEOUT_SEC``, а
+    # прогону могли отмерить меньше — и тогда одобренный там контейнер
+    # переживёт снятие вот этого прогона. Отказ, а не запуск: контейнер,
+    # которого не снять, — ровно тот исход, ради которого стражи написаны.
+    outliving = detaching_sandbox(limit)
+    if outliving:
+        log.warning(
+            "local reviewer: sandbox outlives a %s s run: %s",
+            limit,
+            "; ".join(outliving),
+        )
         return None
-    started = time.monotonic()
-    try:
-        return await _spawn(prompt, workdir, limit, started)
-    except (OSError, ValueError) as exc:
-        # Нет бинаря, нет прав, пустая команда. Возврат None, а не исключение:
-        # сорвавшийся ревьюер не имеет права ронять сдачу — это тот же
-        # контракт деградации, которым живёт облачный клиент.
-        log.warning("local reviewer could not start: %s", exc)
-        return None
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+    # Каталог прогона заводится ПОД ЗАМКОМ, а не до него: ждущий своей
+    # очереди прогон иначе держал бы чужой каталог в scratch всё время
+    # ожидания, а хаб обещает заводить его на прогон и сносить после.
+    async with _HOST_BUDGET:
+        base = config.LOCAL_REVIEW_SCRATCH_DIR.strip()
+        try:
+            workdir = tempfile.mkdtemp(prefix="haiplane-review-", dir=base)
+            # Каталог создаёт ХАБ, а работать в нём чужому пользователю
+            # (найдено ревью, находка 92eba4f8 — и это регрессия, которую
+            # открыл фикс предыдущей). Пока песочница отсоединяла процесс,
+            # домом ревьюера был его passwd-home и права этого каталога
+            # никого не задевали. С --scope cwd, HOME и TMPDIR доезжают
+            # по-настоящему — а mkdtemp всегда даёт 0700 владельца-создателя,
+            # то есть ревьюер получил бы EACCES на собственный рабочий
+            # каталог и упал бы, не начав.
+            #
+            # 0770, а не 0777: доступ даётся ГРУППЕ, общей у хаба и ревьюера,
+            # — setgid на родителе (2770) проставляет её сам. Права «всем»
+            # открыли бы промт с одноразовым кодом любому пользователю хоста.
+            os.chmod(workdir, 0o770)  # nosec B103 - права даны ГРУППЕ, не миру
+        except OSError as exc:
+            log.warning("local reviewer: no scratch dir under %s: %s", base, exc)
+            return None
+        started = time.monotonic()
+        try:
+            return await _spawn(prompt, workdir, limit, started)
+        except (OSError, ValueError) as exc:
+            # Нет бинаря, нет прав, пустая команда. Возврат None, а не исключение:
+            # сорвавшийся ревьюер не имеет права ронять сдачу — это тот же
+            # контракт деградации, которым живёт облачный клиент.
+            log.warning("local reviewer could not start: %s", exc)
+            return None
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 async def _spawn(prompt: str, workdir: str, limit: int, started: float) -> LocalRun:
