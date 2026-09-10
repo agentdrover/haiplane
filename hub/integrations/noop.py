@@ -275,6 +275,30 @@ class NoopGitOps:
         """
         return None
 
+    async def base_merge_conflicts(
+        self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
+    ) -> tuple[dict[str, str] | None, str]:
+        """Нет git — «посмотреть не удалось», и никогда «конфликта нет» (#1233).
+
+        Пустой словарь здесь означал бы «база сливается чисто», то есть
+        разрешение доставлять. Это утверждение о репозитории, которого эта
+        интеграция не видит.
+        """
+        return None, "git integration is not configured"
+
+    async def push_resolved_base_merge(
+        self,
+        repo: str,
+        base: str,
+        branch: str,
+        task_id: int,
+        resolutions: dict[str, str],
+        validate: Any = None,
+        tip: str = "",
+    ) -> tuple[bool, str]:
+        """Нет git — автомерж не состоялся, с названной причиной (#1233)."""
+        return False, "git integration is not configured"
+
     async def check_pr_mergeable(
         self,
         pr_number: int,

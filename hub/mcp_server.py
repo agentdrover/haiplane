@@ -1846,6 +1846,15 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
                 parts.append(f"  base NOT verified: {base['reason']}")
         elif base.get("reason"):
             parts.append(f"Diff: NOT AVAILABLE — {base['reason']}")
+    # #1233: расхождение с базой — ДО вердикта. Раньше человек узнавал о нём
+    # из отказа доставки, то есть после того, как одобрение уже потрачено.
+    merge_state = brief.get("base_merge") or {}
+    if merge_state.get("state") in ("conflicting", "unknown"):
+        parts.append(
+            f"\nМерж в базу [{merge_state['state']}]: {merge_state.get('reason', '')}"
+        )
+        for path in merge_state.get("files") or []:
+            parts.append(f"  - {path}")
     coverage = brief.get("evidence_coverage") or {}
     if coverage.get("headline"):
         parts.append(

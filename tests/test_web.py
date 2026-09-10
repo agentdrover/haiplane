@@ -6237,3 +6237,49 @@ async def test_the_refusal_names_the_project_and_the_field(client: AsyncClient):
         "цена отказа — вся отправка, и молчать об этом значит оставить человека "
         "с мыслью, что сохранилось хоть что-то"
     )
+
+
+async def test_the_base_merge_block_is_painted_where_approve_is_clicked(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-1 доходит до КАРТОЧКИ, а не только до API брифа (#1233).
+
+    Находка b3d276963b8303bf, и она настоящая. 09.09.2026 человек одобрил #1204
+    именно на этой карточке и через четырнадцать секунд узнал из отказа
+    доставки, что ветка конфликтует с базой в трёх файлах. Блок, посчитанный в
+    брифе, но не нарисованный там, где нажимают Approve, не успевает ни к
+    какому решению — а «до вердикта» и есть весь предмет AC-1.
+    """
+    from unittest.mock import AsyncMock
+
+    from hub.services import review_brief
+
+    task_id = await _web_task_in_review_with_test_ac(client, db)
+    monkeypatch.setattr(
+        review_brief,
+        "base_merge_section",
+        AsyncMock(
+            return_value=review_brief.BaseMergeState(
+                state="conflicting",
+                reason="мерж в базу НЕ будет чистым",
+                files=[
+                    "tests/test_review_dispatch.py",
+                    "hub/services/orchestration.py",
+                ],
+            )
+        ),
+    )
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert resp.status_code == 200
+    assert "Мерж в базу:" in resp.text, (
+        "расхождение с базой обязано быть видно на карточке до вердикта"
+    )
+    assert "conflicting" in resp.text
+    assert "tests/test_review_dispatch.py" in resp.text, (
+        "имена конфликтующих файлов названы человеку, а не только агенту"
+    )
+    assert resp.text.index("Мерж в базу:") < resp.text.rindex('value="approved"'), (
+        "блок стоит ДО кнопки Approve: после неё вердикт уже потрачен"
+    )
