@@ -359,11 +359,83 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
     )
 
 
+#: Один текст на обоих потребителей — строку зависимости и реестр (#1214).
+#:
+#: До задачи их было два: «проверить базовую ветку не удалось» у строки
+#: зависимости и «базовую ветку проверить не удалось» у реестра. Разные слова
+#: об одном факте заставляют читателя гадать, разные ли это факты, — а вся
+#: ценность обеих строк в том, что им верят с одного взгляда.
+BASE_UNCHECKED_NOTE = "проверить базовую ветку не удалось"
+
+#: Отдельный текст для случая, который и завёл #1214: посмотреть МОЖНО, но
+#: смотреть бесполезно — метод неприменим по построению.
+#:
+#: Не сводится к предыдущему намеренно. «Не удалось» зовёт попробовать ещё раз
+#: (сеть, клон, права — всё это чинится и проходит). Здесь чинить нечего:
+#: сколько ни спрашивай родословную о squash-мерже, ответ будет один и тот же
+#: и одинаково бессодержательный. Читателю нужно знать, какой из двух случаев
+#: перед ним, иначе он будет ждать, что строка когда-нибудь дозреет.
+BASE_UNANSWERABLE_NOTE = (
+    "родословная о доставке здесь не судит: конвейер мержит squash-ом, "
+    "и сдаточный коммит не станет предком базовой ветки даже после доставки"
+)
+
+
+async def merged_into_base_detail(
+    db: Any, task_row: dict[str, Any]
+) -> tuple[bool | None, str]:
+    """То же, что ``merged_into_base``, но с ПРИЧИНОЙ молчания (#1214).
+
+    Возвращает ``(ответ, примечание)``. Примечание непусто только у ``None`` и
+    называет, ПОЧЕМУ ответа нет: посмотреть не удалось или смотреть этим
+    способом нельзя. Пустое примечание при ``None`` — третий случай: искать
+    было нечего, сдаточный коммит не закреплён, и говорить тут не о чем.
+
+    Почему причина возвращается вместе с ответом, а не выясняется потребителем
+    заново: потребителей два, вопрос один, и разъехавшиеся формулировки — уже
+    случившийся дефект, а не гипотеза (см. константы выше).
+    """
+    sha = (task_row.get("submission_sha") or "").strip()
+    if not sha:
+        return (None, "")
+    try:
+        from hub import services
+
+        ctx = await services.project_git_context(db, task_row["id"])
+        workspace = (ctx.get("repo") or "").strip()
+        base = (ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
+        forge = (ctx.get("forge") or "").strip()
+    except Exception as exc:  # noqa: BLE001 - advisory path, never fatal
+        log.warning("delivery check for #%s: no git context: %s", task_row["id"], exc)
+        return (None, BASE_UNCHECKED_NOTE)
+    if not workspace:
+        return (None, BASE_UNCHECKED_NOTE)
+    # ПРИМЕНИМОСТЬ МЕТОДА — ДО ВЫЗОВА GIT, и это не оптимизация.
+    #
+    # Спросить сначала git, а потом решать, что значил его ответ, значит один
+    # раз обязательно забыть про второй шаг. Здесь вопрос вообще не задаётся:
+    # если конвейер мержит squash, сдаточный коммит не предок базы по
+    # построению, и «нет» от git было бы утверждением, которого никто не
+    # проверял. Стоимость при этом падает, а не растёт — git не зовут вовсе.
+    if not plugins.git_ops.merge_preserves_ancestry(forge):
+        return (None, BASE_UNANSWERABLE_NOTE)
+    # origin/<base> rather than <base>: the shared clone sits on the base
+    # branch but may be behind, and the question is about what has landed
+    # upstream, not about this checkout.
+    reached = await plugins.git_ops.is_ancestor(workspace, sha, f"origin/{base}")
+    return (reached, "" if reached is not None else BASE_UNCHECKED_NOTE)
+
+
 async def merged_into_base(db: Any, task_row: dict[str, Any]) -> bool | None:
     """Is this task's submitted commit already in its project's base branch (#885)?
 
     True — yes, wherever the merge came from. False — looked and it is not.
     None — could not look, which is NOT the same as "not delivered" (#725).
+
+    #1214: с 09.09.2026 ``None`` покрывает и второй случай незнания — вопрос
+    задан методом, который к стратегии мержа этого проекта неприменим. Для
+    вызывающего разницы нет (незнание есть незнание), поэтому подпись прежняя;
+    кому нужна ПРИЧИНА молчания — тот зовёт ``merged_into_base_detail``.
 
     Exists because delivery was read from ``pipeline_merges`` alone — merges
     the hub performed itself (#534). A merge made outside the gate leaves no
@@ -376,24 +448,8 @@ async def merged_into_base(db: Any, task_row: dict[str, Any]) -> bool | None:
     Cheap by construction: callers ask ONLY for blockers with no pipeline
     merge, so in the normal path this runs zero git commands.
     """
-    sha = (task_row.get("submission_sha") or "").strip()
-    if not sha:
-        return None
-    try:
-        from hub import services
-
-        ctx = await services.project_git_context(db, task_row["id"])
-        workspace = (ctx.get("repo") or "").strip()
-        base = (ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
-    except Exception as exc:  # noqa: BLE001 - advisory path, never fatal
-        log.warning("delivery check for #%s: no git context: %s", task_row["id"], exc)
-        return None
-    if not workspace:
-        return None
-    # origin/<base> rather than <base>: the shared clone sits on the base
-    # branch but may be behind, and the question is about what has landed
-    # upstream, not about this checkout.
-    return await plugins.git_ops.is_ancestor(workspace, sha, f"origin/{base}")
+    reached, _note = await merged_into_base_detail(db, task_row)
+    return reached
 
 
 async def blocker_delivery(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
@@ -410,11 +466,12 @@ async def blocker_delivery(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
         return {**blocker, "delivery_path": "gate"}
     row = await repo.get_task(db, blocker["task_id"])
     task = dict(row) if row is not None else {}
-    reached = await merged_into_base(db, task) if task else None
+    reached, note = await merged_into_base_detail(db, task) if task else (None, "")
     # A blocker that never pinned a commit has nothing to look for, so the
     # second source staying silent is not news — saying "could not check"
-    # there would add noise to a reason that is already complete.
-    had_something_to_check = bool((task.get("submission_sha") or "").strip())
+    # there would add noise to a reason that is already complete. Именно этот
+    # случай и отдаёт пустое примечание (#1214), поэтому отдельная проверка
+    # submission_sha здесь больше не нужна: правило живёт в одном месте.
     if reached is True:
         return {
             **blocker,
@@ -422,13 +479,13 @@ async def blocker_delivery(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
             "delivery_path": "outside_gate",
             "reason": "код в базовой ветке, но мерж прошёл мимо гейта",
         }
-    if reached is None and had_something_to_check and blocker.get("reason"):
+    if reached is None and note and blocker.get("reason"):
         # Keep the original reason and say the second source stayed silent —
         # "could not look" must not read as "looked and it is not there".
         return {
             **blocker,
             "delivery_path": "unknown",
-            "reason": f"{blocker['reason']}; проверить базовую ветку не удалось",
+            "reason": f"{blocker['reason']}; {note}",
         }
     return {**blocker, "delivery_path": "none"}
 
@@ -525,7 +582,7 @@ async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
             delivery_path="gate",
         )
 
-    reached = await merged_into_base(db, task)
+    reached, base_note_text = await merged_into_base_detail(db, task)
     if reached is True:
         return _task_answer(
             DELIVERED,
@@ -547,7 +604,18 @@ async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
             delivery_path="none",
         )
 
-    base_note = "" if reached is False else "; базовую ветку проверить не удалось"
+    # Ровно тот же текст, что уходит в строку зависимости (#1214). Реестр и
+    # строка описывают один факт, и до задачи описывали его двумя разными
+    # фразами — «базовую ветку проверить не удалось» здесь против «проверить
+    # базовую ветку не удалось» там. Читателю приходилось решать, один это
+    # случай или два; теперь текст берётся из одной константы через один
+    # вопрос, и разъехаться им негде.
+    #
+    # Пустое примечание при reached is None означает «искать было нечего»
+    # (сдаточный коммит не закреплён) — там молчать правильнее, чем говорить
+    # о неудаче, которой не было. Раньше эта ветка тоже дописывала «не
+    # удалось», и это была маленькая версия того же дефекта.
+    base_note = f"; {base_note_text}" if base_note_text else ""
     workspace, gh_repo = "", ""
     try:
         from hub import services

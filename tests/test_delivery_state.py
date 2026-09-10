@@ -10,6 +10,7 @@ check" must never print as "not deployed".
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from unittest.mock import AsyncMock
 
@@ -650,3 +651,278 @@ async def test_deployed_commit_is_the_merge_itself(
     assert answer["merge_sha"] == sha
     assert answer["deployed_sha"] == sha
     assert answer["reason"]
+
+
+# ---- #1214: молчание второго источника подавалось как отрицание ----
+#
+# ``merged_into_base`` спрашивает is_ancestor(submission_sha, origin/base) и по
+# контракту различает три ответа, из которых третий — «посмотреть не смогли» —
+# заведён ровно для случая, когда метод не работает. Метод не работал ВСЕГДА:
+# конвейер мержит squash, и сдаточный коммит не остаётся предком базовой ветки
+# никогда. False приходил на каждой доставке и читался как «посмотрели, кода в
+# базовой ветке нет».
+#
+# ЗАМЕР 09.09.2026 на живом клоне, 4 из 4. Сдачи 48fad6129241 (#1186),
+# bc3328def634 (#878), 3d2fd5814cf0 (#875), 3fedf1979908 (#909) — ни одна не
+# предок origin/develop и origin/main, при том что AC-тест каждой лежит в
+# origin/develop по имени. Цифра записана в ленте задачи; здесь она держится
+# формой репозитория, а не переписанными хешами: тест воспроизводит НАСТОЯЩИЙ
+# squash-мерж настоящим git и убеждается, что git отвечает «не предок» — то
+# есть проверяет тот самый вход, на котором дефект и жил.
+#
+# Различение бесплатно: стратегию мержа задаёт сам гейт, она объявлена на
+# форже (GitHub сливает `gh pr merge --squash`, GitVerse — локальным
+# `merge --no-ff`), и спросить её можно ДО обращения к git.
+
+
+def _hermetic_git(root: Path, *args: str) -> str:
+    """git в ``root`` без пользовательской конфигурации, stdout строкой."""
+    import subprocess
+
+    return subprocess.run(
+        ["git", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "HOME": str(root),
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+        },
+    ).stdout.strip()
+
+
+@pytest.fixture
+def squash_delivery(tmp_path: Path) -> dict[str, Any]:
+    """Клон с настоящими origin/-ссылками: четыре доставки и одна нет.
+
+    Собирается через bare-remote и clone, а не одним репозиторием с локальными
+    ветками: вопрос задаётся про ``origin/<base>``, и подделать эту ссылку
+    значило бы проверить не то, что работает в проде.
+
+    Мержи делаются командой ``git merge --squash`` — тем же, что стоит за
+    ``gh pr merge --squash``. Ни один хеш здесь не выдуман: «не предок» ниже
+    утверждает git, а не фикстура.
+    """
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _hermetic_git(remote, "init", "--bare", "-b", "develop")
+
+    work = tmp_path / "clone"
+    _hermetic_git(tmp_path, "clone", str(remote), str(work))
+
+    (work / "base.py").write_text("base = 1\n")
+    _hermetic_git(work, "add", ".")
+    _hermetic_git(work, "commit", "-m", "base")
+    _hermetic_git(work, "push", "origin", "develop")
+
+    # Четыре доставки — по одной на каждую сдачу из замера.
+    delivered: dict[int, str] = {}
+    for task_id in (1186, 878, 875, 909):
+        _hermetic_git(work, "checkout", "-q", "-b", f"task-{task_id}/w", "develop")
+        (work / f"feature_{task_id}.py").write_text(f"answer = {task_id}\n")
+        _hermetic_git(work, "add", ".")
+        _hermetic_git(work, "commit", "-m", f"work for #{task_id}")
+        delivered[task_id] = _hermetic_git(work, "rev-parse", "HEAD")
+        _hermetic_git(work, "checkout", "-q", "develop")
+        _hermetic_git(work, "merge", "--squash", f"task-{task_id}/w")
+        _hermetic_git(work, "commit", "-m", f"feat(task): work (#{task_id})")
+
+    # И одна работа, которая в базовую ветку не попадала вовсе.
+    _hermetic_git(work, "checkout", "-q", "-b", "task-999/never", "develop")
+    (work / "never.py").write_text("never = True\n")
+    _hermetic_git(work, "add", ".")
+    _hermetic_git(work, "commit", "-m", "work nobody merged")
+    undelivered = _hermetic_git(work, "rev-parse", "HEAD")
+
+    _hermetic_git(work, "checkout", "-q", "develop")
+    _hermetic_git(work, "push", "origin", "develop")
+    _hermetic_git(work, "fetch", "origin")
+
+    return {
+        "repo": str(work),
+        "base": "develop",
+        "delivered": delivered,
+        "undelivered": undelivered,
+    }
+
+
+def _real_git_for(monkeypatch, squash_delivery: dict[str, Any], forge: str) -> None:
+    """Настоящий git и настоящий адаптер форжа — обе половины вопроса.
+
+    Подменяется весь ``plugins.git_ops`` целиком, а не отдельные методы:
+    применимость метода и сам метод обязаны прийти из ОДНОГО объекта, иначе
+    тест разрешит ровно то расхождение, которое чинит задача.
+    """
+    from hub import app as hub_app
+
+    context = AsyncMock(
+        return_value={
+            "repo": squash_delivery["repo"],
+            "base_branch": squash_delivery["base"],
+            "gh_repo": "owner/repo",
+            "forge": forge,
+        }
+    )
+    monkeypatch.setattr(hub_app.services, "project_git_context", context)
+    monkeypatch.setattr(
+        "hub.services.orchestration.project_git_context", context, raising=False
+    )
+    monkeypatch.setattr(plugins, "git_ops", GitOpsIntegration(), raising=False)
+
+
+async def _completed_blocker(
+    client: AsyncClient, db: aiosqlite.Connection, sha: str, pr: int = 323
+) -> dict[str, Any]:
+    """Строка зависимости о завершённой задаче с закреплённой сдачей."""
+    task_id = (await client.post("/api/tasks", json={"title": "upstream"})).json()["id"]
+    await repo.update_task(
+        db, task_id, status="completed", pr_number=pr, submission_sha=sha
+    )
+    await db.commit()
+    return {
+        "task_id": task_id,
+        "title": "upstream",
+        "status": "completed",
+        "delivered": False,
+        "reason": f"PR #{pr} не смержен гейтом",
+    }
+
+
+async def test_a_squash_merge_is_not_reported_as_missing_work(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    squash_delivery: dict[str, Any],
+    monkeypatch,
+):
+    """AC-1: «этим способом нельзя» вместо «кода в базовой ветке нет».
+
+    Фикстура намеренно начинается со squash-стратегии: на merge-commit зелена
+    и доредакционная реализация, и такой тест не поймал бы ничего.
+    """
+    from hub.services.delivery_state import (
+        BASE_UNANSWERABLE_NOTE,
+        blocker_delivery,
+        task_delivery,
+        UNKNOWN,
+    )
+
+    sha = squash_delivery["delivered"][1186]
+
+    # Вход теста — не предположение: спрашиваем настоящий git обеими половинами.
+    real = GitOpsIntegration()
+    assert (
+        await real.is_ancestor(squash_delivery["repo"], sha, "origin/develop") is False
+    ), "фикстура обязана воспроизводить именно тот вход, на котором жил дефект"
+    assert "feature_1186.py" in _hermetic_git(
+        Path(squash_delivery["repo"]), "ls-tree", "-r", "--name-only", "origin/develop"
+    ), "а работа при этом доставлена — иначе проверялось бы не то"
+
+    _real_git_for(monkeypatch, squash_delivery, "github")
+    blocker = await _completed_blocker(client, db, sha)
+
+    entry = await blocker_delivery(db, blocker)
+
+    # Сила утверждения: не «не none», а именно unknown и именно этими словами.
+    assert entry["delivery_path"] == "unknown", entry
+    assert entry["delivered"] is False, "молчание — не подтверждение доставки"
+    assert BASE_UNANSWERABLE_NOTE in entry["reason"], entry["reason"]
+    assert "PR #323 не смержен гейтом" in entry["reason"], "исходная причина цела"
+
+    # Второй потребитель — реестр расхождений — говорит ТЕМИ ЖЕ словами.
+    row = await repo.get_task(db, blocker["task_id"])
+    task = dict(row)
+    task["pr_number"] = None  # у реестра без провайдера остаётся только база
+    answer = await task_delivery(db, task)
+    assert answer["state"] == UNKNOWN, answer
+
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_state", AsyncMock(return_value=""), raising=False
+    )
+    task["pr_number"] = 323
+    answer = await task_delivery(db, task)
+    assert answer["state"] == UNKNOWN, answer
+    assert BASE_UNANSWERABLE_NOTE in answer["reason"], answer["reason"]
+    assert answer["delivery_path"] == "unknown", answer
+
+
+async def test_the_measured_four_stop_reading_as_undelivered(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    squash_delivery: dict[str, Any],
+    monkeypatch,
+):
+    """AC-2: 4 из 4 — цифра до правки; после неё не остаётся ни одной.
+
+    Четыре сдачи замера воспроизведены по форме: каждая доставлена настоящим
+    squash-мержем. Настоящие хеши (48fad6129241, bc3328def634, 3d2fd5814cf0,
+    3fedf1979908) названы в ленте задачи — здесь важна не их запись, а то, что
+    ни один из четырёх входов больше не читается как «не доставлено».
+    """
+    from hub.services.delivery_state import blocker_delivery
+
+    _real_git_for(monkeypatch, squash_delivery, "github")
+    real = GitOpsIntegration()
+
+    said_undelivered: list[int] = []
+    for task_id, sha in squash_delivery["delivered"].items():
+        assert (
+            await real.is_ancestor(squash_delivery["repo"], sha, "origin/develop")
+            is False
+        ), f"#{task_id}: замер держится на том, что git отвечает «не предок»"
+        entry = await blocker_delivery(db, await _completed_blocker(client, db, sha))
+        if entry["delivery_path"] == "none":
+            said_undelivered.append(task_id)
+
+    assert said_undelivered == [], (
+        f"до правки этот список был всеми четырьмя: осталось {said_undelivered}"
+    )
+    assert len(squash_delivery["delivered"]) == 4, "замер был на четырёх, не меньше"
+
+
+async def test_a_truly_undelivered_blocker_still_says_so(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    squash_delivery: dict[str, Any],
+    monkeypatch,
+):
+    """AC-3: там, где родословная судить может, «не доставлено» осталось.
+
+    Тот же файл и та же фикстура, что у AC-1 — иначе починка ложного
+    срабатывания могла бы погасить настоящее, и никто бы не заметил. Форж
+    здесь мержит локальным ``merge --no-ff`` (GitVerse), то есть сдаточный
+    коммит остаётся предком базы, и «не предок» — настоящее отрицание.
+    """
+    from hub.services.delivery_state import (
+        BASE_UNANSWERABLE_NOTE,
+        BASE_UNCHECKED_NOTE,
+        blocker_delivery,
+    )
+
+    _real_git_for(monkeypatch, squash_delivery, "gitverse")
+    blocker = await _completed_blocker(client, db, squash_delivery["undelivered"])
+
+    entry = await blocker_delivery(db, blocker)
+
+    assert entry["delivery_path"] == "none", entry
+    assert entry["delivered"] is False, entry
+    assert BASE_UNANSWERABLE_NOTE not in entry["reason"], (
+        "работа действительно не в базовой ветке — звать это молчанием нельзя"
+    )
+    assert BASE_UNCHECKED_NOTE not in entry["reason"], entry["reason"]
+
+    # И тот же форж подтверждает доставку, когда она есть, — то есть источник
+    # остался работающим, а не замолчал в обе стороны.
+    _hermetic_git(Path(squash_delivery["repo"]), "checkout", "-q", "develop")
+    tip = _hermetic_git(Path(squash_delivery["repo"]), "rev-parse", "origin/develop")
+    delivered_entry = await blocker_delivery(
+        db, await _completed_blocker(client, db, tip)
+    )
+    assert delivered_entry["delivered"] is True, delivered_entry
+    assert delivered_entry["delivery_path"] == "outside_gate", delivered_entry
