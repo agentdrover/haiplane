@@ -4232,6 +4232,39 @@ _CONFIG_SOURCE = _HUB_ROOT / "hub/config.py"
 _DEPLOY_DOC = _HUB_ROOT / "deploy/LOCAL-REVIEW.md"
 _ENV_EXAMPLE = _HUB_ROOT / "deploy/local-hub.env.example"
 
+
+def _documented_hub_deadline() -> int:
+    """Хабский срок прогона, КАК ЕГО НАЗЫВАЕТ документ выката.
+
+    Нужен там, где суждение стража зависит от ``LOCAL_REVIEW_TIMEOUT_SEC``:
+    с 10.09.2026 контейнерный ``--timeout`` больше хабского отвергается, и
+    тест, оставивший этот срок на волю окружения, был бы зелёным или красным
+    по чужой переменной, а не по содержанию документа. Значение берётся ИЗ
+    ФАЙЛА — переписанное сюда числом, оно проверяло бы тест, а не документ.
+    """
+    # Число берётся регулярным выражением, а не хвостом строки: то же имя со
+    # значением стоит и внутри таблицы отказов, где за ним идёт разметка.
+    named = re.compile(
+        re.escape(config.brand.ENV_PREFIX + "LOCAL_REVIEW_TIMEOUT_SEC") + r"=(\d+)"
+    )
+    values = [
+        found.group(1)
+        for path in (_ENV_EXAMPLE, _DEPLOY_DOC)
+        for line in path.read_text().splitlines()
+        if (found := named.search(line))
+    ]
+    assert values, (
+        f"в примере окружения и документе не назван {named.pattern} — "
+        "проверка срока была бы привязана к переменной окружения, а не к "
+        "документу"
+    )
+    assert len(set(values)) == 1, (
+        f"документ называет хабский срок по-разному: {values}. Оператор "
+        "скопирует одно из двух, и какое — неизвестно"
+    )
+    return int(values[0])
+
+
 # Строка вида ``Environment=ИМЯ=…``, ``# ИМЯ=…`` или просто ``ИМЯ=…`` — то, что
 # оператор КОПИРУЕТ к себе. Именно она и разошлась с кодом.
 _ASSIGNED = re.compile(r"^\s*(?:#\s*)?(?:Environment=)?([A-Z][A-Z0-9_]*)=")
@@ -4658,6 +4691,151 @@ def test_a_container_launch_without_its_own_deadline_is_refused(monkeypatch) -> 
     assert local_reviewer.detaching_sandbox() == []
 
 
+def test_a_detached_container_launch_is_refused_by_flag(monkeypatch) -> None:
+    """Отсоединённый запуск — ОТКАЗ, и никакой ``--timeout`` его не снимает.
+
+    Найдено ревьюером Codex 10.09.2026, воспроизведено на 5b7b813::
+
+        podman run -d --timeout 1800 img        -> []       # пропуск
+        podman run --detach --timeout=1800 img  -> []       # пропуск
+        podman run --rm -i img                  -> ОТКАЗ    # правильно
+
+    ``-d`` и ``--detach`` разбирались как обычные беззначные флаги и попадали
+    в список известных, то есть строка выглядела разобранной и одобренной.
+    Между тем отсоединённый podman возвращает управление НЕМЕДЛЕННО: хаб
+    видит завершившийся процесс, закрывает прогон как законченный и может
+    снести его каталог, а ревьюер в контейнере продолжает работать и способен
+    прислать отчёт по уже закрытому прогону. Правило «потомок ИЛИ свой срок»
+    здесь не выполняется НИ ОДНОЙ половиной: срок есть, а снимать уже нечего.
+    Плюс протокол хаба построен на переднем плане — промт в stdin, ответ из
+    stdout, — и с ``-d`` не работает вовсе.
+    """
+    # Отказ обязан назвать ИМЕННО ТОТ ТОКЕН, который стоит в строке: «уберите
+    # --detach» на строке с ``-itd`` — совет убрать то, чего оператор не
+    # писал, а починку этот страж обещает называть.
+    for detached, token in (
+        ("/usr/bin/podman run -d --timeout 1800 img", "-d"),
+        ("/usr/bin/podman run --detach --timeout=1800 img", "--detach"),
+        # Срок здесь заведомо живой и хабскому не противоречит: отказ обязан
+        # идти именно по отсоединению, а не по сроку.
+        ("/usr/bin/podman run --rm -i -d --timeout 1800 img", "-d"),
+        # Буква ``d`` внутри слипшегося пучка — тот же самый флаг. Знать одну
+        # запись из трёх значит пропускать две.
+        ("/usr/bin/podman run -itd --timeout 1800 img", "-itd"),
+        ("/usr/bin/podman run -dt --read-only --timeout 1800 img", "-dt"),
+        # ``=true`` — та же истина, записанная явно.
+        ("/usr/bin/podman run --rm -i --detach=true --timeout 1800 img", "--detach"),
+        # Повтор судится по ПОСЛЕДНЕМУ вхождению, как всё в этом модуле.
+        ("/usr/bin/podman run --rm -i --detach=false -d --timeout 1800 img", "-d"),
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", detached)
+        reasons = local_reviewer.detaching_sandbox()
+        assert reasons, (
+            f"«{detached}» запускает контейнер отсоединённым: хаб закроет "
+            "прогон, увидев мгновенно завершившегося клиента podman, а "
+            "ревьюер внутри продолжит работать и пришлёт отчёт по закрытому "
+            "прогону"
+        )
+        assert any(f"«{token}»" in r for r in reasons), (
+            f"отказ обязан НАЗВАТЬ флаг отсоединения «{token}» так, как он "
+            f"написан в строке, а не срок: {reasons}"
+        )
+
+    # Обратная сторона: явно выключенное отсоединение — рабочая строка, и
+    # ложного отказа на ней быть не должно, иначе починка одного оплачена
+    # поломкой другого.
+    for foreground in (
+        "/usr/bin/podman run --rm -i --timeout 1800 img",
+        "/usr/bin/podman run --rm -it --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --detach=false --timeout 1800 img",
+        "/usr/bin/podman run --rm -i -d=false --timeout 1800 img",
+        "/usr/bin/podman run --rm -i -d --detach=false --timeout 1800 img",
+        # ``-d`` ПОСЛЕ образа — флаг программы внутри контейнера, а не podman.
+        "/usr/bin/podman run --rm -i --timeout 1800 img agent -d",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", foreground)
+        assert local_reviewer.detaching_sandbox() == [], (
+            f"«{foreground}» идёт на переднем плане и отвергаться не должна: "
+            f"{local_reviewer.detaching_sandbox()}"
+        )
+
+
+def test_a_container_deadline_may_not_outlive_the_hubs(monkeypatch) -> None:
+    """Срок контейнера БОЛЬШЕ хабского сроком жизни не является.
+
+    Найдено ревьюером Codex 10.09.2026, воспроизведено на 5b7b813::
+
+        podman run --rm -i --timeout 3600 img   -> []   # при хабских 1800
+
+    Смысл собственного срока один — чтобы контейнер умер, когда хаб счёл
+    прогон зависшим и убил клиента. Срок вдвое длиннее хабского этого не
+    даёт: контейнер переживёт снятие прогона так же, как без ``--timeout``
+    вовсе, только тише — и пришлёт отчёт по закрытому прогону.
+
+    Это была не только дыра в страже, но и РАСХОЖДЕНИЕ С ДОКУМЕНТОМ:
+    deploy/LOCAL-REVIEW.md советовал держать ``--timeout`` «не меньше»
+    хабского, то есть учил ровно тому, что страж обязан отвергать. Согласие
+    текста с кодом держат тесты документа
+    (test_the_doc_table_of_refusals_is_what_the_guard_actually_refuses и
+    test_the_doc_wrapper_skeleton_names_its_own_deadline), а этот тест держит
+    само правило.
+    """
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", 1800)
+    for overlong in (
+        "/usr/bin/podman run --rm -i --timeout 3600 img",
+        "/usr/bin/podman run --rm -i --timeout=1801 img",
+        # Действует ПОСЛЕДНЕЕ вхождение: годный срок левее ничего не спасает.
+        "/usr/bin/podman run --rm -i --timeout 1800 --timeout 7200 img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", overlong)
+        reasons = local_reviewer.detaching_sandbox()
+        assert reasons, (
+            f"«{overlong}» даёт контейнеру пережить снятие прогона: хаб "
+            "убьёт клиента через 1800 с, до conmon это не дойдёт, и "
+            "контейнер доживёт свой срок уже после закрытия прогона"
+        )
+        assert any("1800" in r for r in reasons), (
+            "отказ обязан назвать хабский срок — иначе оператору не видно, "
+            f"чему равнять: {reasons}"
+        )
+
+    # Не больше — значит РОВНО столько же тоже можно: именно равенство
+    # документ и рекомендует, и именно оно стоит в рабочем враппере на хосте
+    # хаба. Отвергнуть его значило бы сломать выкат ради починки.
+    for ok in (
+        "/usr/bin/podman run --rm -i --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout=1800 img",
+        # Более короткий срок дырой не является: контейнер умрёт сам, клиент
+        # podman вернётся, хаб закроет прогон по коду возврата.
+        "/usr/bin/podman run --rm -i --timeout 60 img",
+        "/usr/bin/podman run --rm -i --timeout 7200 --timeout 900 img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", ok)
+        assert local_reviewer.detaching_sandbox() == [], (
+            f"«{ok}» не переживает прогон и отвергаться не должна: "
+            f"{local_reviewer.detaching_sandbox()}"
+        )
+
+    # Потолок берётся у НАСТРОЙКИ, а не зашит числом: на другом хабском сроке
+    # граница обязана поехать вместе с ним. Иначе страж держал бы 1800 даже
+    # там, где хаб отмеряет прогону час.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", 7200)
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/podman run --rm -i --timeout 3600 img"
+    )
+    assert local_reviewer.detaching_sandbox() == [], (
+        "при хабском сроке 7200 контейнерные 3600 прогона не переживают: "
+        f"{local_reviewer.detaching_sandbox()}"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/podman run --rm -i --timeout 7201 img"
+    )
+    assert local_reviewer.detaching_sandbox(), (
+        "граница обязана двигаться вместе с LOCAL_REVIEW_TIMEOUT_SEC, а не "
+        "стоять на умолчании"
+    )
+
+
 def test_the_run_guard_refuses_the_string_it_cannot_parse(monkeypatch) -> None:
     """Неизвестный флаг СО ЗНАЧЕНИЕМ — отказ, а не молчаливое «срок есть».
 
@@ -4716,11 +4894,14 @@ def test_the_run_guard_refuses_the_string_it_cannot_parse(monkeypatch) -> None:
     )
 
     # Известные беззначные флаги — в том числе слипшийся пучок ``-it`` —
-    # ложного отказа не дают.
+    # ложного отказа не дают. Пучок ``-itd`` стоял здесь до 10.09.2026 и
+    # переехал в ОТКАЗЫ: буква ``d`` в нём — это ``--detach``, и разбору она
+    # по зубам, а прогону не по зубам (см.
+    # test_a_detached_container_launch_is_refused_by_flag).
     for fine in (
         "/usr/bin/podman run --rm -i --timeout 1800 img",
         "/usr/bin/podman run --rm -it --privileged --timeout 1800 img",
-        "/usr/bin/podman run -itd --read-only --timeout 1800 img",
+        "/usr/bin/podman run -itq --read-only --timeout 1800 img",
     ):
         monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", fine)
         assert local_reviewer.detaching_sandbox() == [], (
@@ -5298,6 +5479,20 @@ def test_the_doc_table_of_refusals_is_what_the_guard_actually_refuses(
         "строка с неизвестным флагом при ЖИВОМ сроке в таблице не названа, а "
         "именно на ней текст документа расходился с кодом"
     )
+    # Два класса, добавленные 10.09.2026: отсоединённый запуск и срок жизни
+    # ДЛИННЕЕ хабского. Оба страж пропускал молча, и оба обязаны стоять в
+    # таблице — иначе оператор прочитает про них только в коде.
+    assert any("-d" in s or "--detach" in s for s in refused), (
+        "отсоединённый запуск в таблице отказов не назван, а он проходил "
+        "стража молча (воспроизведено на 5b7b813)"
+    )
+    assert any("3600" in s for s in refused), (
+        "срок контейнера ДЛИННЕЕ хабского в таблице отказов не назван, а "
+        "документ до 10.09.2026 такой срок прямо СОВЕТОВАЛ («не меньше»)"
+    )
+    # Суждение о сроке зависит от хабского, и брать его из окружения значило
+    # бы судить документ по чужой переменной.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", _documented_hub_deadline())
 
     for sandbox in refused:
         monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
@@ -5524,6 +5719,10 @@ def test_the_doc_wrapper_skeleton_names_its_own_deadline(monkeypatch, tmp_path) 
     # безразлична, и убирать её незачем: окно флагов запуска кончается на
     # образе.
     monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", launch)
+    # Хабский срок берётся из документа, а не из окружения: с 10.09.2026
+    # страж отвергает контейнерный срок ДЛИННЕЕ хабского, и оставить хабский
+    # на волю чужой переменной значило бы судить скелет не по документу.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", _documented_hub_deadline())
     assert local_reviewer.detaching_sandbox() == [], (
         f"скелет враппера из документа запускает «{launch}», и хаб отверг бы "
         f"эту строку: {local_reviewer.detaching_sandbox()}. Внутри обёртки "
