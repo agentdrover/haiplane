@@ -621,6 +621,9 @@ def _scope_and_criterion(scope_form: str, ac_form: str):
 #       the plural also swallows the й of the stem. It is here because the
 #       mutation series found it: neutering the vowel branch of the rule left
 #       every other pair passing.
+#   изменённая / изменение — the long participle and the verbal noun; the
+#       doubled н is the whole difference between their stems. Also from the
+#       mutation series: deleting the collapse left all 51 other cases green.
 # The last three come from the machine review of this task, which reproduced
 # the miss on each of them against the producer, not against the stemmer.
 _LIVE_WORD_FORMS = [
@@ -634,6 +637,7 @@ _LIVE_WORD_FORMS = [
     ("находок", "находкой"),
     ("коммит", "коммита"),
     ("настройка", "настроек"),
+    ("изменённая", "изменение"),
 ]
 
 
@@ -686,7 +690,9 @@ def test_a_scope_item_covered_in_another_word_form_is_not_named(scope_form, ac_f
 # «принят» loses the verb ending «ят» and so keeps itself as a second reading,
 # and «список» loses its fleeting о. Neither loosening may reach a word that
 # is merely spelled alike — and both pairs share a root, which is the harder
-# case, not the easier one.
+# case, not the easier one. Last, выше/вышел, which the mutation series
+# produced: handing EVERY word a second reading of itself makes «вышел» stem
+# to «выше» and swallow it, and those are two words.
 _DIFFERENT_WORDS = [
     ("разбор", "разбирает"),
     ("ответа", "отвечает"),
@@ -697,6 +703,7 @@ _DIFFERENT_WORDS = [
     ("словарь", "слово"),
     ("принят", "принтер"),
     ("список", "списание"),
+    ("выше", "вышел"),
 ]
 
 
