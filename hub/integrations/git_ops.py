@@ -2715,15 +2715,24 @@ class GitOpsIntegration:
         return lines[:10]
 
     async def _prepare_base_merge_tree(
-        self, repo: str, base: str, branch: str, task_id: int
+        self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
     ) -> tuple[str, str]:
-        """Одноразовое дерево на вершине ветки со слитой в него базой (#1233).
+        """Одноразовое дерево на ЗАКРЕПЛЁННОМ коммите со слитой в него базой (#1233).
 
         Возвращает ``(путь, причина)``: путь непустой — мерж выполнен (чисто
         или с конфликтами, это спрашивают отдельно), непустая причина — спросить
         не удалось. Разметка diff3 включена НАРОЧНО: без секции общего предка
         нельзя доказать, что ни одна сторона не переписала существующую строку,
         а без этого доказательства автомерж не имеет права срабатывать.
+
+        ``tip`` — коммит, НА КОТОРОМ строится дерево, и он обязан быть тем самым
+        закреплённым коммитом сдачи. Пока здесь стоял ``origin/<branch>``,
+        автомерж брал вершину ветки КАКОЙ ОНА СТАЛА: пуш, приехавший в окно
+        ожидания, попадал в дерево, в слитый коммит и в перезакрепление, и
+        человеческий вердикт переезжал на код, которого человек не видел.
+        Наблюдено на настоящем git: неодобренный коммит оказывался предком
+        перезакреплённого (tests/test_delivery_gate.py). Это ровно обратное
+        предмету #1233, поэтому якорь здесь — закрепление, а не вершина.
         """
         rc, _, err = await _git(
             "fetch",
@@ -2735,6 +2744,28 @@ class GitOpsIntegration:
         )
         if rc != 0:
             return "", f"не удалось получить ветки из origin: {err[:150]}"
+        if not (tip or "").strip():
+            # Без закрепления опереться не на что: строить на вершине ветки
+            # значило бы согласиться слить что угодно, что туда приехало.
+            return "", (
+                "автомерж не на чем закрепить: коммит сдачи не закреплён, "
+                "а вершину ветки автомерж не берёт (#1233)"
+            )
+        tip = tip.strip()
+        rc, moved, _ = await _git(
+            "rev-parse", f"origin/{branch}", repo=repo, check=False
+        )
+        if rc != 0:
+            return "", f"не удалось прочитать вершину ветки {branch}"
+        moved = (moved or "").strip()
+        if moved != tip:
+            # Ветка уехала с закреплённого коммита. Слить базу в закрепление и
+            # запушить значило бы затереть чужой пуш, а слить в вершину —
+            # перенести вердикт на неодобренное. Оба выхода хуже человека.
+            return "", (
+                f"ветка {branch} ушла с закреплённого коммита {tip[:12]} на "
+                f"{moved[:12]} — автомерж не трогает то, чего не одобряли"
+            )
         path = _scratch_worktree(repo, "basemerge", task_id)
         await _git("worktree", "remove", "--force", path, repo=repo, check=False)
         rc, _, err = await _git(
@@ -2743,7 +2774,7 @@ class GitOpsIntegration:
             "--force",
             "--detach",
             path,
-            f"origin/{branch}",
+            tip,
             repo=repo,
             check=False,
         )
@@ -2767,7 +2798,7 @@ class GitOpsIntegration:
         return path, ""
 
     async def base_merge_conflicts(
-        self, repo: str, base: str, branch: str, task_id: int
+        self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
     ) -> tuple[dict[str, str] | None, str]:
         """Что помешает слить базу в ветку — пробой, которая ничего не меняет (#1233).
 
@@ -2775,8 +2806,13 @@ class GitOpsIntegration:
         содержимое С МАРКЕРАМИ diff3, чтобы класс конфликта судили по разметке
         git, а не по догадке. ``None`` — спросить не удалось, и это НЕ «конфликта
         нет»: одно чинится повтором, другое руками человека (#725).
+
+        ``tip`` — закреплённый коммит сдачи: пробу задают о ТОМ коде, который
+        одобряли, а не о вершине ветки.
         """
-        path, why = await self._prepare_base_merge_tree(repo, base, branch, task_id)
+        path, why = await self._prepare_base_merge_tree(
+            repo, base, branch, task_id, tip
+        )
         if not path:
             return None, why
         try:
@@ -2808,6 +2844,7 @@ class GitOpsIntegration:
         task_id: int,
         resolutions: dict[str, str],
         validate: Any = None,
+        tip: str = "",
     ) -> tuple[bool, str]:
         """Слить базу в ветку с готовым разрешением и запушить (#1233, AC-3).
 
@@ -2816,8 +2853,14 @@ class GitOpsIntegration:
         дважды наблюдали «All checks passed» при коде 2, и хвост вывода здесь
         не доказательство. Валидации нет или она не запустилась — не пушим:
         сложить два блока текста мало, они могут конфликтовать по именам.
+
+        ``tip`` — закреплённый коммит сдачи. Дерево строится на нём, и пуш идёт
+        с арендой (``--force-with-lease``) на то же значение: если ветка уехала
+        между пробой и пушем, пуш обязан отказать, а не затереть чужой коммит.
         """
-        path, why = await self._prepare_base_merge_tree(repo, base, branch, task_id)
+        path, why = await self._prepare_base_merge_tree(
+            repo, base, branch, task_id, tip
+        )
         if not path:
             return False, why
         try:
@@ -2857,8 +2900,25 @@ class GitOpsIntegration:
             )
             if rc != 0:
                 return False, f"коммит мержа не состоялся: {err[:150]}"
+            # Коммит слитой ветки читается ДО пуша: закрепление сдачи будет
+            # переставлено именно на него, и переставлять его вслепую нельзя.
+            rc, sha, _ = await _git("rev-parse", "HEAD", repo=path, check=False)
+            sha = (sha or "").strip()
+            if rc != 0 or not sha:
+                # Раньше код возврата здесь не смотрели и возвращали
+                # ``True, ""``. Пустая строка уезжала в submission_sha и СТИРАЛА
+                # закрепление, а пустое закрепление гейт читает как «сверка не
+                # проводилась» и доставляет без неё (#572). Молчаливая потеря
+                # закрепления хуже несостоявшегося автомержа.
+                return False, "коммит слитой ветки не прочитан — закрепление не трогаем"
+            # Аренда — это сравнение-и-запись: пуш пройдёт, только если ветка
+            # ВСЁ ЕЩЁ стоит на закреплённом коммите. Дерево тоже построено на
+            # нём, так что это обычный fast-forward; аренда закрывает окно между
+            # пробой и пушем, где чужой коммит успел бы лечь под наш вердикт.
+            # Пустой ``tip`` сюда не доходит: дерево на нём и строится.
             rc, _, err = await _git(
                 "push",
+                f"--force-with-lease=refs/heads/{branch}:{tip.strip()}",
                 "origin",
                 f"HEAD:refs/heads/{branch}",
                 repo=path,
@@ -2867,8 +2927,7 @@ class GitOpsIntegration:
             )
             if rc != 0:
                 return False, f"пуш слитой ветки не прошёл: {err[:150]}"
-            _rc, sha, _ = await _git("rev-parse", "HEAD", repo=path, check=False)
-            return True, (sha or "").strip()
+            return True, sha
         finally:
             await _git("merge", "--abort", repo=path, check=False)
             await _git("worktree", "remove", "--force", path, repo=repo, check=False)

@@ -471,6 +471,7 @@ async def build_review_brief(
         freshness=freshness,
         sha_check=sha_check,
         live_check=live_check,
+        base_merge=base_merge_state.model_dump(),
     )
 
     # #808: the block the human reads at the gate, built by the same function

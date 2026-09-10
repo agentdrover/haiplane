@@ -276,7 +276,7 @@ class NoopGitOps:
         return None
 
     async def base_merge_conflicts(
-        self, repo: str, base: str, branch: str, task_id: int
+        self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
     ) -> tuple[dict[str, str] | None, str]:
         """Нет git — «посмотреть не удалось», и никогда «конфликта нет» (#1233).
 
@@ -294,6 +294,7 @@ class NoopGitOps:
         task_id: int,
         resolutions: dict[str, str],
         validate: Any = None,
+        tip: str = "",
     ) -> tuple[bool, str]:
         """Нет git — автомерж не состоялся, с названной причиной (#1233)."""
         return False, "git integration is not configured"

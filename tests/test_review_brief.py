@@ -233,6 +233,9 @@ async def test_a_task_without_test_acs_is_not_reported_as_lost_evidence():
         # #814 joins the same list here, and for the same reason: nothing has
         # shipped yet, so a live check is not a check that failed to run.
         "live_check",
+        # #1233 joins it too: this call names no base-merge block at all, and a
+        # block the brief does not carry is not a block that stayed silent.
+        "base_merge",
     ]
 
 
@@ -777,3 +780,48 @@ async def test_foreign_locator_is_read_even_when_collection_succeeded(
     resolution = brief["locator_resolution"][0]
     assert resolution["status"] == "resolvable", resolution
     assert "could not read" not in resolution["reason"], resolution
+
+
+async def test_an_unasked_base_merge_does_not_pass_for_full_coverage():
+    """Блок мержа базы посчитан, а не показан рядом со счётчиком (#1233).
+
+    Находка 84b9b04c160f8350. Правило записала сама эта функция для #814: блок,
+    который в брифе есть, но в счёте не участвует, оставляет заголовок врущим в
+    успокаивающую сторону. Здесь цена особенно высока — «спросить не удалось» и
+    «мерж будет чистым» ведут человека к разным решениям ровно перед тем
+    вердиктом, который #1233 бережёт.
+    """
+    common = {
+        "diff_base": {"state": review_evidence.BASE_RESOLVED, "base": "main"},
+        "branch": "task-1233/x",
+        "call_sites_status": "analysed",
+        "has_test_acs": False,
+        "locator_resolution": [],
+        "ac_test_results": [],
+        "ci_state": "current",
+        "freshness": {"state": "no_overlap"},
+        "sha_check": "unknown",
+    }
+
+    blind = review_evidence.evidence_coverage(
+        **common, base_merge={"state": "unknown", "reason": "спросить не удалось"}
+    )
+    assert blind["state"] != review_evidence.COVERAGE_COMPLETE, (
+        "«все блоки дали сигнал» при неспрошенном расхождении с базой — это "
+        "тот самый успокаивающий заголовок, который #725/#814 запретили"
+    )
+    assert "base_merge" in [c["check"] for c in blind["checks_missing"]]
+
+    seen = review_evidence.evidence_coverage(
+        **common, base_merge={"state": "conflicting", "reason": "не будет чистым"}
+    )
+    assert seen["state"] == review_evidence.COVERAGE_COMPLETE, (
+        "названный конфликт — это СИГНАЛ, а не отсутствие его: человек узнал "
+        "о расхождении до вердикта, чего AC-1 и требует"
+    )
+    assert "base_merge" in seen["checks_ran"]
+
+    absent = review_evidence.evidence_coverage(**common)
+    assert "base_merge" in [c["check"] for c in absent["checks_not_applicable"]], (
+        "блока в брифе нет вовсе — требовать с него сигнала не с чего"
+    )

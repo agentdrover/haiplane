@@ -373,7 +373,7 @@ class GitOpsPlugin(Protocol):
         forge: str = "",
     ) -> tuple[MergeabilityOutcome, str]: ...
     async def base_merge_conflicts(
-        self, repo: str, base: str, branch: str, task_id: int
+        self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
     ) -> tuple[dict[str, str] | None, str]: ...
     async def push_resolved_base_merge(
         self,
@@ -383,6 +383,7 @@ class GitOpsPlugin(Protocol):
         task_id: int,
         resolutions: dict[str, str],
         validate: Any = None,
+        tip: str = "",
     ) -> tuple[bool, str]: ...
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str

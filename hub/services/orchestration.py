@@ -2931,8 +2931,20 @@ async def base_automerge_step(
     base = git_ops_mod._resolve_base(ctx.get("base_branch"))
     if not branch or not workspace:
         return "", ""
+    # ЯКОРЬ АВТОМЕРЖА — закреплённый коммит сдачи, а не вершина ветки. Вершина
+    # к этому моменту могла уехать: между сверкой с одобрением и этим шагом
+    # стоят проба CI, условие стопки и сам отказ мержа, и в это окно в ветку
+    # может лечь чужой пуш. Дерево на вершине означало бы, что автомерж слил и
+    # запушил неодобренный код, а потом перезакрепил на него вердикт человека —
+    # ровно то, против чего #1233 и заведена.
+    pinned = (task.get("submission_sha") or "").strip()
+    if not pinned:
+        return "", (
+            "коммит сдачи не закреплён — автомержу не на чем закрепиться, "
+            "и вершину ветки он не берёт"
+        )
     files, why = await plugins.git_ops.base_merge_conflicts(
-        workspace, base, branch, task_id
+        workspace, base, branch, task_id, pinned
     )
     if files is None:
         # «Посмотреть не удалось» — не «конфликта нет» и не «конфликт есть».
@@ -2958,10 +2970,20 @@ async def base_automerge_step(
         return await validation_run.default_validation_runner(commands, path)
 
     ok, detail = await plugins.git_ops.push_resolved_base_merge(
-        workspace, base, branch, task_id, resolutions, _validate
+        workspace, base, branch, task_id, resolutions, _validate, pinned
     )
     if not ok:
         return "", f"автомерж не состоялся: {detail}"
+    detail = (detail or "").strip()
+    if not detail:
+        # Успех без коммита — не успех. Записать пустоту в submission_sha значит
+        # СТЕРЕТЬ закрепление, а гейт читает пустое закрепление как «сверка не
+        # проводилась» и доставляет без неё (#572). Молчаливая потеря
+        # закрепления опаснее несостоявшегося автомержа, поэтому зовём человека.
+        return "", (
+            "автомерж прошёл, но коммит слитой ветки не назван — закрепление "
+            "сдачи не трогаем, разбирается человек"
+        )
     # Перезакрепление коммита сдачи — не поблажка, а точность. Этот мерж сделал
     # САМ гейт: авторского кода в нём нет по построению, и ему не нужно
     # доказывать это сравнением диффов. Сравнение здесь и не сработало бы —
