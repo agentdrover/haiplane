@@ -382,13 +382,32 @@ _SCOPE_STOPWORDS: frozenset[str] = frozenset(
 # Stemming by prefix is what makes the match survive Russian inflection
 # ("словарь" / "словаря" / "словарю" all stem to "слова"), which a plain
 # substring test would not.
+#
+# Five characters are not enough on their own: in short words the ending falls
+# INSIDE the window, and real statements in this backlog are full of such
+# pairs — «сдаче»/«сдачи», «гейтов»/«гейтам», «зонда»/«зондом»,
+# «пустого»/«пустым». So every word also yields a shorter LOOSE stem, and a
+# match on either counts. The stop-word list stays keyed on the long stem, so
+# widening the match does not widen what counts as filler.
 _SCOPE_MIN_WORD_LEN = 4
 _SCOPE_STEM_LEN = 5
+_SCOPE_LOOSE_STEM_LEN = 4
+
+
+def _fold(text: str) -> str:
+    """Lower-case, and read ё as е.
+
+    The two letters are written interchangeably in this backlog — the same
+    word appears as «поимённо» (#1170, #1161) and as «поименно» (#1144) — so
+    treating them as different letters would call a covered item uncovered
+    over a diacritic.
+    """
+    return (text or "").lower().replace("ё", "е")
 
 
 def _significant_stems(text: str) -> set[str]:
     """Prefix-stems of the words in ``text`` that carry meaning."""
-    words = re.split(r"[^0-9A-Za-zЀ-ӿ]+", (text or "").lower())
+    words = re.split(r"[^0-9A-Za-zЀ-ӿ]+", _fold(text))
     stems = set()
     for w in words:
         if len(w) < _SCOPE_MIN_WORD_LEN:
@@ -397,6 +416,7 @@ def _significant_stems(text: str) -> set[str]:
         if stem in _SCOPE_STOPWORDS or w in _SCOPE_STOPWORDS:
             continue
         stems.add(stem)
+        stems.add(w[:_SCOPE_LOOSE_STEM_LEN])
     return stems
 
 

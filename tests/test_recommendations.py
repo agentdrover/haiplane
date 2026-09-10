@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import aiosqlite
+import pytest
 
 from hub import repository as repo
 from hub.models import (
@@ -574,6 +575,74 @@ def test_a_scope_item_without_a_criterion_is_named():
     assert covered not in warnings[0].message
     assert warnings[0].severity == "low"
     assert warnings[0].expected_score_delta == 0
+
+
+# Word forms taken from LIVE Hub statements, not invented. Each pair is one
+# and the same word as authors actually wrote it in this backlog:
+#   сдаче / сдачи      — #1122, scope item and criterion of the same task
+#   гейтов / гейтам    — #1122, scope item and criterion of the same task
+#   зонда / зондом     — #1236, scope item and criterion of the same task
+#   пустого / пустым   — #1143, scope item and criterion of the same task
+#   поимённо / поименно — #1170 and #1161 write it with ё, #1144 without; the
+#       pair е/ё is the entire difference between the two spellings.
+#   отчёта / отчета    — «отчёта» is live (it is the wording of the AC-2
+#       fixture above and runs through the whole backlog); «отчета» is the
+#       same word without the ё. That this backlog does drop the ё is not a
+#       guess — «поименно» and «объявленный» are written both ways in it. The
+#       pair belongs here because its ё falls early enough to change the stem,
+#       which the поимённо pair does not.
+_LIVE_WORD_FORMS = [
+    ("сдаче", "сдачи"),
+    ("гейтов", "гейтам"),
+    ("зонда", "зондом"),
+    ("пустого", "пустым"),
+    ("поимённо", "поименно"),
+    ("отчёта", "отчета"),
+]
+
+
+@pytest.mark.parametrize(("scope_form", "ac_form"), _LIVE_WORD_FORMS)
+def test_a_scope_item_covered_in_another_word_form_is_not_named(scope_form, ac_form):
+    """A criterion that uses the SAME word in another form covers the item.
+
+    The matcher stems by prefix precisely so it survives Russian inflection.
+    Where it does not, a covered item gets named — and naming a covered item
+    is the one failure this code exists to avoid, because an author who sees
+    the warning fire on work he did cover learns to skip it.
+
+    The fixtures are deliberately narrow: apart from the pair under test, no
+    word of the scope item appears in the criterion, so the pair alone decides
+    the verdict.
+    """
+    item = f"Учёт {scope_form} без исключений"
+    covering = _row(
+        "AC-1",
+        "постановка проекта",
+        "читается готовность",
+        f"в ответе назван {ac_form}",
+        source="requirement",
+    )
+    assert (
+        build_scope_coverage_warnings(
+            StatementInputs(scope_in=[item], ac_rows=[covering])
+        )
+        == []
+    )
+
+    # Control: with a genuinely unrelated word the item IS still named. A
+    # producer that had simply fallen silent would not pass this half.
+    unrelated = _row(
+        "AC-1",
+        "постановка проекта",
+        "читается готовность",
+        "в ответе назван реестр",
+        source="requirement",
+    )
+    named = build_scope_coverage_warnings(
+        StatementInputs(scope_in=[item], ac_rows=[unrelated])
+    )
+    assert len(named) == 1
+    assert item in named[0].message
 
 
 def test_a_scope_item_with_nothing_to_match_on_is_left_alone():
