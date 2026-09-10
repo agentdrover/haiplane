@@ -5209,3 +5209,227 @@ async def test_an_incomplete_report_that_found_things_still_counts(
         "находкой и состоялся"
     )
     assert circle.laps[0].arrived == 1
+
+
+# --- #1252: вторая дверь ревью после НАБЛЮДЁННОГО отказа облака -------------
+#
+# Замерено 10.09.2026 на проде: HTTP 400, код usage_limit_exceeded, тело
+# называет причину («Background Agent requires at least $2 remaining until
+# your hard limit»). Наблюдалось на задачах #1250 в 09:46 UTC и #1172 в 10:03.
+_LIMIT_REFUSAL = cursor_cloud.Refusal(
+    status=400,
+    code="usage_limit_exceeded",
+    detail="Background Agent requires at least $2 remaining until your hard limit",
+)
+
+
+def _no_local_path(monkeypatch) -> None:
+    """Локальный путь ВЫКЛЮЧЕН явно, а не по счастливому умолчанию."""
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "")
+
+
+async def test_a_refused_cloud_call_still_gets_a_report_from_the_local_path(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-1 (#1252): облако отказало НА СОЗДАНИИ — отчёт всё равно есть.
+
+    Форж github, то есть облако сюда дотягивается и пробуется ПЕРВЫМ; это и
+    есть случай, у которого второй двери не было вовсе. Проверяется
+    НАБЛЮДАЕМЫМ СОСТОЯНИЕМ карточки — строка в machine_reviews текущего
+    поколения под принципалом ревьюера, — а не тем, что функцию позвали.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder(None, refusal=_LIMIT_REFUSAL)
+    _wire(monkeypatch, recorder)
+    reviewer_pid = await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-second-door", policy={"review": "dispatch"}
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert len(recorder.calls) == 1, (
+        "порядок не меняется: облако пробуется ПЕРВЫМ и ровно один раз "
+        "(повтор на 400 покупает тот же отказ)"
+    )
+    reports = [
+        dict(r) for r in await repo.machine_reviews_of_generation(db, task_id, 1)
+    ]
+    assert len(reports) == 1, (
+        "ровно это и не получалось 10.09.2026: сдача оставалась без отчёта "
+        "навсегда, потому что второго способа не было"
+    )
+    assert reports[0]["principal_id"] == reviewer_pid, (
+        "отчёт ложится под принципалом РЕВЬЮЕРА, иначе гейт его не засчитает"
+    )
+    assert not reports[0]["self_reviewed"], (
+        "self_reviewed=1 означал бы оплаченный впустую прогон (#1128)"
+    )
+    dispatches = [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=? ORDER BY id", (task_id,)
+        )
+    ]
+    assert [d["channel"] for d in dispatches] == ["local"], (
+        "облачной строки нет — агент не создался; локальная одна"
+    )
+    assert dispatches[0]["status"] == "done"
+
+
+async def test_a_run_that_ended_without_a_report_opens_the_second_door(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-2 (#1252): ВТОРОЕ место применения — прогон кончился без отчёта.
+
+    Отказ здесь асинхронный и лежит в другом пути кода: агент создался,
+    деньги потрачены, прогон дошёл до ERROR, а machine_review так и не
+    пришёл (замерено 10.09.2026 на агентах bc-6e7cc3e1 и bc-9b077f68).
+    Закрыть только синхронный случай значит оставить эту половину сдач без
+    отчёта ровно так же, как сегодня.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-6e7cc3e1"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    reviewer_pid = await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-dead-run", policy={"review": "dispatch"}
+    )
+    assert len(recorder.calls) == 1, "облако пробуется первым и агент СОЗДАЁТСЯ"
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert any("отчёт НЕ сдан" in u for u in updates), (
+        "отказ облака остаётся наблюдённым фактом в карточке"
+    )
+    reports = [
+        dict(r) for r in await repo.machine_reviews_of_generation(db, task_id, 1)
+    ]
+    assert len(reports) == 1, (
+        "второй дверью открывается и этот путь: одного потребителя правила недостаточно"
+    )
+    assert reports[0]["principal_id"] == reviewer_pid
+    assert not reports[0]["self_reviewed"]
+    channels = [
+        dict(r)["channel"]
+        for r in await db.execute_fetchall(
+            "SELECT channel FROM review_dispatches WHERE task_id=? ORDER BY id",
+            (task_id,),
+        )
+    ]
+    assert channels == ["cloud", "local"], (
+        "облачный прогон был оплачен и остаётся в истории; локальный — второй"
+    )
+
+
+async def test_an_unconfigured_local_path_changes_nothing_on_github(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1252): настройки нет — поведение байт в байт прежнее.
+
+    Тот же форж и тот же отказ облака, но локальный путь не настроен. Тогда
+    в карточке ровно тот же единственный алерт об отказе облака, ни одной
+    новой записи и ни одной попытки запуска. Настройка, которой нет, не
+    имеет права менять сегодняшний путь — и это проверяется ПОПЫТКОЙ, а не
+    чтением кода: подставка на месте запуска процесса обязана остаться
+    нетронутой.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LIMIT_REFUSAL)
+    _wire(monkeypatch, recorder)
+    _no_local_path(monkeypatch)
+    launched: list[str] = []
+
+    async def _never(prompt):
+        launched.append(prompt)
+        raise AssertionError("локального прогона тут быть не должно")
+
+    monkeypatch.setattr(local_reviewer, "run_review", _never)
+
+    task_id = await _submitted(
+        client, db, "spike-no-local", policy={"review": "dispatch"}
+    )
+    await db.commit()
+
+    assert launched == [], "ненастроенный путь не запускает НИЧЕГО"
+    alerts = [
+        dict(r)["content"]
+        for r in await db.execute_fetchall(
+            "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+            (task_id,),
+        )
+    ]
+    about_review = [a for a in alerts if "ревью НЕ вызвано" in a]
+    assert len(about_review) == 1, (
+        "алерт об отказе облака остаётся ОДИН — второго объяснения одному "
+        "состоянию не заводим (#1188)"
+    )
+    assert "провайдер отказал" in about_review[0], about_review[0]
+    assert "HTTP 400, usage_limit_exceeded" in about_review[0], about_review[0]
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM review_dispatches WHERE task_id=?", (task_id,)
+    ), "ни одной новой строки диспетчера"
+    assert not await repo.machine_reviews_of_generation(db, task_id, 1)
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert not any("ЛОКАЛЬНО" in u for u in updates), (
+        "карточка не обещает того, чего не было"
+    )
+
+
+async def test_the_card_names_which_provider_gave_the_report_and_why(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-4 (#1252): карточка называет, КТО дал отчёт и ПОЧЕМУ не первый.
+
+    Названной причиной отказа облака, а не общими словами. Отчёт без
+    указания автора читается как облачный и вводит человека в заблуждение
+    ровно так же, как сегодня вводит молчание. И «форж облаку недоступен»
+    здесь было бы ЛОЖЬЮ: форж github, облако до него дотягивается.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder(None, refusal=_LIMIT_REFUSAL)
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-named-author", policy={"review": "dispatch"}
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    started = [u for u in updates if "запущено ЛОКАЛЬНО" in u]
+    assert len(started) == 1, "запуск второй двери называется в карточке"
+    note = started[0]
+    assert "ВТОРЫМ поставщиком" in note and "локальным" in note, (
+        "кто дал отчёт — сказано поимённо"
+    )
+    assert "usage_limit_exceeded" in note and "HTTP 400" in note, (
+        "почему не первый — НАЗВАННОЙ причиной отказа облака, с кодом "
+        "провайдера, а не «облако недоступно»"
+    )
+    assert "недоступен" not in note, (
+        "форж github облаку доступен; старый текст на этом месте был бы ложью"
+    )

@@ -1684,16 +1684,23 @@ async def maybe_dispatch_review(
     )
     agent_id, run_id = started.agent_id, started.run_id
     if not agent_id:
+        # МЕСТО ПРИМЕНЕНИЯ №1 второй двери (#1252): отказ СИНХРОННЫЙ — агент
+        # не создался, денег не потрачено. Алерт остаётся на месте: отказ
+        # облака — наблюдённый факт, и он стоит в карточке независимо от
+        # того, добыл ли отчёт кто-то второй.
+        detail = _lost_call_detail(started)
         await repo.add_task_update(
             db,
             task_id,
             "hub",
             "alert",
-            f"Кросс-модельное ревью НЕ вызвано: {_lost_call_detail(started)}. "
+            f"Кросс-модельное ревью НЕ вызвано: {detail}. "
             "Вердикт остаётся человеку; детали в логе хаба (#757).",
         )
         await db.commit()
-        return False
+        return await open_second_door(
+            db, task, forge, branch, generation, force_profile, cloud_refusal=detail
+        )
 
     # #1025: pin whose report this dispatch waits for, resolved from the
     # reviewer token at dispatch time (above, where the code was minted under
@@ -1810,20 +1817,75 @@ async def review_reach(db: aiosqlite.Connection, forge: str) -> ReviewReach:
     БЫТЬ и не разрешаться (отозван, открытый режим), а отчёт под принципалом
     автора гейт не засчитает при REVIEW_SELF_APPROVE=forbid, то есть прогон
     был бы оплачен впустую (#1128).
+
+    #1252: способы считаются ОБА, и на форже с облаком тоже. Раньше здесь
+    стоял ранний выход — «облако дотягивается» отвечало за весь вопрос, и
+    локальная готовность на github не проверялась вовсе. Из-за этого у
+    сдачи, чей облачный прогон отказал, второй двери не было даже там, где
+    локальный ревьюер настроен и работает.
+
+    Порядок в ``ways`` — порядок попыток: облако первое, локальный путь
+    второй. Он читается как предпочтение, а не как множество.
+
+    Ответ для трёх прежних читателей не меняется: на форже с облаком
+    ``ways`` по-прежнему непуст, а ``reason`` по-прежнему пуст — то есть ни
+    форма проекта, ни инвариант записи нового состояния не видят.
     """
+    ways: list[str] = []
     if forge in CLOUD_REVIEW_FORGES:
-        return ReviewReach((CLOUD_CHANNEL,), "")
+        ways.append(CLOUD_CHANNEL)
     missing = local_reviewer.not_ready()
     if await local_reviewer_principal_id(db) is None:
         missing = missing or ["LOCAL_REVIEWER_HUB_TOKEN не разрешается в принципала"]
     if not missing:
-        return ReviewReach((LOCAL_CHANNEL,), "")
+        ways.append(LOCAL_CHANNEL)
+    if ways:
+        return ReviewReach(tuple(ways), "")
     return ReviewReach(
         (),
         f"облачный ревьюер не работает с форжем «{forge}» (проверено "
         "31.08.2026, #1119), а локальный не настроен: "
         + "; ".join(missing)
         + ". Порядок включения — deploy/LOCAL-REVIEW.md",
+    )
+
+
+async def open_second_door(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    forge: str,
+    branch: str,
+    generation: int,
+    force_profile: str = "",
+    *,
+    cloud_refusal: str,
+) -> bool:
+    """Вторая дверь: локальный путь ПОСЛЕ наблюдённого отказа облака (#1252).
+
+    Зовётся из ДВУХ мест, и это не украшение: отказ у облака бывает двух
+    видов, и лежат они в разных путях кода. Синхронный — агент не создался
+    (``maybe_dispatch_review``). Асинхронный — агент создался, прогон дошёл
+    до терминального статуса, а отчёта нет (``sweep_review_dispatches``); там
+    прогон УЖЕ оплачен. Закрыть один и забыть второй значит оставить
+    половину сдач без отчёта ровно так же, как сегодня.
+
+    ``cloud_refusal`` — НАБЛЮДЁННАЯ причина, а не догадка о недоступности:
+    текст отказа провайдера или терминальный статус прогона. Он доезжает до
+    карточки, потому что отчёт без имени автора читается как облачный и
+    вводит человека в заблуждение (#1252, AC-4).
+
+    Ненастроенный локальный путь не пишет НИЧЕГО: алерт об отказе облака уже
+    стоит и остаётся единственным следом. Настройка, которой нет, не имеет
+    права менять сегодняшнее поведение — поэтому здесь спрашивается
+    ``review_reach`` (единственный автор этого знания, #1188), а не
+    ``dispatch_local_review``, который на форже с облаком счёл бы
+    достижимость облака своей и запустил прогон.
+    """
+    reach = await review_reach(db, forge)
+    if LOCAL_CHANNEL not in reach.ways:
+        return False
+    return await dispatch_local_review(
+        db, task, forge, branch, generation, force_profile, cloud_refusal=cloud_refusal
     )
 
 
@@ -1834,6 +1896,8 @@ async def dispatch_local_review(
     branch: str,
     generation: int,
     force_profile: str = "",
+    *,
+    cloud_refusal: str = "",
 ) -> bool:
     """Добыть ревью там, куда облако не дотягивается. True — прогон запущен.
 
@@ -1885,13 +1949,24 @@ async def dispatch_local_review(
         reviewer_principal_id=principal_id,
         channel=LOCAL_CHANNEL,
     )
+    # #1252: причина, по которой отчёт добывается ЗДЕСЬ, а не в облаке, —
+    # разная в двух случаях, и обе называются. «Облако сюда не дотягивается»
+    # — свойство форжа (#1180). «Облако отказало» — наблюдённый факт про
+    # конкретную сдачу, и человеку нужен именно он: без него отчёт второго
+    # поставщика читается как облачный.
+    why = (
+        f"облако отчёта НЕ дало — {cloud_refusal}; отчёт добывается ВТОРЫМ "
+        "поставщиком, локальным (#1252)"
+        if cloud_refusal
+        else f"форж «{forge}» облачному ревьюеру недоступен"
+    )
     await repo.add_task_update(
         db,
         task_id,
         "hub",
         "status",
-        f"Машинное ревью запущено ЛОКАЛЬНО: форж «{forge}» облачному ревьюеру "
-        f"недоступен, прогон идёт на хосте хаба под песочницей (#1180). "
+        f"Машинное ревью запущено ЛОКАЛЬНО: {why}, "
+        f"прогон идёт на хосте хаба под песочницей (#1180). "
         f"Профиль {order.profile}, прогон {run_id}. Правила репозитория: "
         f"{order.rules_note} (#873). Предмет ревью: {order.diff_note} (#874). "
         "Отчёт придёт по контракту от принципала локального ревьюера — "
@@ -2623,6 +2698,52 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
             )
         await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
         await db.commit()
+        # МЕСТО ПРИМЕНЕНИЯ №2 второй двери (#1252): отказ АСИНХРОННЫЙ — агент
+        # создался, прогон дошёл до терминального статуса, отчёта нет. Прогон
+        # тут УЖЕ оплачен, и это единственное, чем этот случай отличается от
+        # синхронного: без отчёта сдача стоит одинаково мёртво.
+        await _second_door_after_run(db, dispatch, task_row, run.get("status"))
+
+
+async def _second_door_after_run(
+    db: aiosqlite.Connection,
+    dispatch: dict[str, Any],
+    task_row: Any,
+    run_status: Any,
+) -> None:
+    """Позвать второго поставщика по прогону, кончившемуся без отчёта (#1252).
+
+    Гейты здесь — про то, что сдача ВСЁ ЕЩЁ ждёт отчёта, а не про сам отказ:
+    задача в review, поколение то же, что у провалившегося заказа, политика
+    по-прежнему просит ревьюера. Свип бежит по расписанию, и между заказом и
+    его разбором задачу могли вернуть в работу, пересдать или снять политику.
+    """
+    if task_row is None:
+        return
+    task = dict(task_row)
+    generation = int(dispatch["submission_generation"])
+    if task.get("status") != "review":
+        return
+    if int(task.get("submission_generation") or 0) != generation:
+        return
+    branch = (task.get("branch") or "").strip()
+    if not branch:
+        return
+    project = await repo.resolve_project_for_task(db, int(task["id"]))
+    if project is None or not review_dispatch_enabled(gate_policy_of(project)):
+        return
+    await open_second_door(
+        db,
+        task,
+        project_policy.forge_of(project),
+        branch,
+        generation,
+        cloud_refusal=(
+            f"прогон облачного агента {dispatch['agent_id']} "
+            f"({dispatch.get('model') or 'модель не названа'}) кончился "
+            f"статусом {run_status} и отчёта не оставил"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
