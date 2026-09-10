@@ -4018,3 +4018,193 @@ async def test_a_body_of_the_wrong_shape_is_not_an_empty_answer(
     )
     alerts = " ".join(dict(r)["content"] for r in rows)
     assert "СПРОСИТЬ" in alerts, "состояние названо как есть, а не как пустота"
+
+
+# ---------------------------------------------------------------------------
+# #1216 — тихий отказ по политике называет себя в карточке
+#
+# Измерено на #1202 (snip-portal, форж gitverse, gate_policy без ключа review):
+# две сдачи подряд встали в review, и в карточке НЕТ НИ ОДНОЙ записи про
+# диспетч ревью. Порядок проверок в maybe_dispatch_review отказывает по
+# политике раньше, чем управление доходит до развилки по форжу, где стоит
+# именованный отказ #1180. Второго читателя не будет ни при каких условиях, а
+# карточка об этом молчит — и молчание читается как «ревью не потребовалось».
+# ---------------------------------------------------------------------------
+
+
+#: Собственный словарь диспетчера: чем он открывает вызов и чем — отказ.
+#: Фильтровать по одному слову «ревью» нельзя: сдача пишет в карточку и своё
+#: («ревью валидно и без PR»), и тогда счётчик считал бы чужие строки.
+_DISPATCH_SAYS = (
+    "ревью вызвано хабом",
+    "ревью НЕ вызвано",
+    "ревью запущено ЛОКАЛЬНО",
+)
+
+
+async def _dispatch_notices(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    """Всё, что карточка говорит о диспетче ревью: и вызовы, и отказы."""
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if any(phrase in dict(u)["content"] for phrase in _DISPATCH_SAYS)
+    ]
+
+
+async def test_a_submission_without_a_reviewer_says_so_on_the_card(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1216): политика не просит диспетча — карточка называет это.
+
+    Политика snip-portal снята с прода 09.09.2026 как есть: dor и verdict
+    человеку, ключа review нет вовсе. До правки этот путь не писал ничего, и
+    задача стояла в review без второго читателя молча.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1216"}, "run": {"id": "r-1216"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(
+        client,
+        db,
+        "spike-1216-silent",
+        policy={"dor": "human", "verdict": "human"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+
+    assert recorder.calls == [], "политика не просила диспетча — звать некого"
+    notices = await _dispatch_notices(db, task_id)
+    assert notices, (
+        "карточка обязана сказать, что второго читателя не будет: тишина на "
+        "этом месте читается как «ревью не потребовалось» (#1202)"
+    )
+    said = " ".join(notices)
+    assert "политика проекта не просит" in said, (
+        "причина называется по существу, а не общими словами: отказала именно "
+        "политика проекта"
+    )
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "review", "запись не должна ломать сдачу"
+
+
+async def test_the_refusal_names_the_missing_settings(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1216): имена недостающих настроек берутся у review_reach.
+
+    Второго источника правды не заводим: тот же текст человек видит в форме
+    проекта и в отказе на записи политики (#1188). Сверяем ПОДСТРОКОЙ, а не
+    похожестью — расхождение в одном слове означало бы вторую копию знания.
+    """
+    from hub.services.review_dispatch import review_reach
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-r"}, "run": {"id": "r-r"}})
+    _wire(monkeypatch, recorder)
+    # Локальный путь не настроен — ровно состояние прода на 09.09.2026.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "")
+
+    task_id = await _submitted(
+        client,
+        db,
+        "spike-1216-names",
+        policy={"dor": "human", "verdict": "human"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+
+    said = " ".join(await _dispatch_notices(db, task_id))
+    reach = await review_reach(db, "gitverse")
+    assert not reach.runnable, "предпосылка теста: добыть ревью нечем"
+    assert reach.reason in said, (
+        "текст про форж и настройки обязан быть ТЕМ ЖЕ, что отдаёт "
+        "review_reach: иначе три места объясняют одно состояние тремя словами"
+    )
+    assert "LOCAL_REVIEW_CMD" in said and "LOCAL_REVIEWER_HUB_TOKEN" in said, (
+        "настройки названы по именам (#1083)"
+    )
+    assert "deploy/LOCAL-REVIEW.md" in said, "назван порядок включения"
+
+
+async def test_the_notice_is_written_once_per_generation(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1216): свип проходит по сдаче снова — записи не прибавляется.
+
+    Отказ по политике не меняет ни статуса, ни review_job_id, поэтому каждый
+    следующий проход входит в ту же ветку. Без дедупа карточка засорялась бы
+    одинаковыми алертами до самого вердикта.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-d"}, "run": {"id": "r-d"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(
+        client,
+        db,
+        "spike-1216-dedup",
+        policy={"dor": "human", "verdict": "human"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    first = len(await _dispatch_notices(db, task_id))
+    assert first == 1, "первая сдача оставляет ровно одну запись"
+
+    assert await maybe_dispatch_review(db, task_id) is False
+    assert await maybe_dispatch_review(db, task_id) is False
+
+    assert len(await _dispatch_notices(db, task_id)) == 1, (
+        "повторные проходы по той же сдаче второй записи не создают"
+    )
+
+
+async def test_a_dispatched_project_gets_no_extra_notice(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4 (#1216): на проекте с review=dispatch не изменилось ничего.
+
+    Контроль к трём предыдущим: они доказывают появление записи, и без этого
+    теста «запись появилась» было бы совместимо с «запись появляется всегда»,
+    то есть с засорением карточек работающих проектов.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ok"}, "run": {"id": "r-ok"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(
+        client, db, "spike-1216-working", policy={"review": "dispatch"}
+    )
+
+    assert len(recorder.calls) == 1, "ревью вызывается как раньше"
+    notices = await _dispatch_notices(db, task_id)
+    assert len(notices) == 1 and "вызвано хабом" in notices[0], (
+        "единственная запись про ревью — та самая, что была до правки: "
+        "новой записи на рабочем пути не появилось"
+    )
+
+    # Второй тихий отказ той же функции — проверка новизны (#1152). Он
+    # случается на проекте с ВКЛЮЧЁННЫМ диспетчем, то есть проходит ровно
+    # через новый помощник, и накрыть его записью «политика не просит
+    # диспетча» значило бы сказать неправду: политика как раз просила.
+    # Первая редакция этого теста мутацию «снять условие, отделяющее тихий
+    # путь от рабочего» ПЕРЕЖИЛА — до сюда она не доставала.
+    review_id = await _report_on_current(db, task_id)
+    await db.commit()
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+
+    assert len(recorder.calls) == 1, "второй прогон на том же коде не покупается"
+    said = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "политика проекта не просит" not in said, (
+        "отказала проверка новизны, а не политика: чужая причина в карточке "
+        "хуже отсутствующей — по ней пойдут править gate_policy"
+    )
+    assert f"отчёт #{review_id}" in said, (
+        "своя причина у этого отказа осталась на месте (#1152)"
+    )
+    assert len(await _dispatch_notices(db, task_id)) == 1, (
+        "и записей про диспетч по-прежнему одна"
+    )

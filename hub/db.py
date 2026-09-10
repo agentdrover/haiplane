@@ -1818,6 +1818,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE delivery_discrepancies "
         "ADD COLUMN alerted_age_bucket INTEGER NOT NULL DEFAULT 0",
     ),
+    (
+        # #1236: ИМЯ читающей пробы из закрытого реестра, которую хаб исполнит
+        # сам после доставки. Одно имя, а не строка вызова: колонка, куда
+        # ложится текст из карточки, стала бы каналом исполнения произвольного
+        # кода на проде. Пусто — зонд не объявлен, и это законное состояние:
+        # обязательной живая проверка не делается, обязательной её делает
+        # постановка, когда объявляет зонд.
+        "add_tasks_live_probe",
+        "ALTER TABLE tasks ADD COLUMN live_probe TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 
@@ -1914,6 +1924,9 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     "validation_commands",
     "out_of_scope_for_review",
     "review_checklist",
+    # #1236: имя объявленного живого зонда. Часть постановки: она говорит, что
+    # именно наблюдать после доставки.
+    "live_probe",
     "risks",
     "prepared_by",
     "prepared_at",

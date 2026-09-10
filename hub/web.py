@@ -1419,9 +1419,19 @@ async def web_finding_dispositions(task_id: int, request: Request):
         # отчёта человек оказывается в общем списке. Слаг не берётся как URL:
         # он подставляется в один известный путь и экранируется.
         back_project = str(form.get("return_project") or "").strip()
-        back = (
-            f"/findings?project={quote(back_project)}" if back_project else "/findings"
-        )
+        # #1171: и в ту же КАТЕГОРИЮ. Заход идёт одной категорией; выброс в
+        # общий список после каждого отчёта возвращает ровно ту навигацию,
+        # которую страница снимает. Оба значения подставляются в один
+        # известный путь и экранируются — открытым редиректом это не станет.
+        params = [
+            f"{name}={quote(value)}"
+            for name, value in (
+                ("project", back_project),
+                ("category", str(form.get("return_category") or "").strip()),
+            )
+            if value
+        ]
+        back = "/findings" + ("?" + "&".join(params) if params else "")
     else:
         back = f"/tasks/{task_id}"
     # Какой ИМЕННО отчёт судят. Карточка задачи рисует только новейший и потому
@@ -1452,26 +1462,30 @@ async def web_finding_dispositions(task_id: int, request: Request):
     return RedirectResponse(back, status_code=303)
 
 
-@router.get("/findings", response_class=HTMLResponse)
-async def web_findings_queue(request: Request, project: str = Query(default="")):
-    """Every confirmed finding nobody has answered yet (#1038).
+#: Слово автора про находку, по-русски и рядом с фактом (#911, #1085). Это
+#: ВХОД, а не диспозиция: автор отчитывается о том, что сделал, суждение о том,
+#: была ли находка настоящей, вводит человек (#876). Подпись у строки говорит
+#: это вслух — соседство двух ответов на экране и есть то место, где границу
+#: проще всего потерять.
+_AUTHOR_OUTCOME_LABELS: dict[str, str] = {
+    "fixed": "исправил",
+    "false_positive": "считает ложняком",
+    "wont_fix": "чинить не стал",
+    "deferred": "отложил",
+    "real_fixed": "признал и исправил",
+    "real_deferred": "признал и отложил",
+    "not_a_defect": "смотрел, дефекта не нашёл",
+    "not_judged": "не судил",
+}
 
-    The page exists because the JUDGEMENT was never the expensive part — the
-    form has been in the task card since #876. What was missing is a way to
-    reach it: reports are written while a task is in review, and every inbox
-    section is built from ``list_tasks_by_status``, so once the task completes
-    its findings appear nowhere. Judging them meant remembering which of
-    twenty-eight tasks had reports.
 
-    Grouped by task so a person answers a whole report in one pass, and posting
-    through the same route the task card uses — a second way to record a
-    judgement would be a second thing to keep honest.
+def _findings_queue_groups(rows: list[Any]) -> list[dict[str, Any]]:
+    """Строки очереди НАХОДОК, сгруппированные по отчёту: один ответ — одна форма.
+
+    Имя названо полностью не из педантизма: ``_queue_groups`` выше в этом же
+    файле — группы человеческой очереди задач, и совпадение имён молча
+    подменило бы одну другой.
     """
-    db = _db(request)
-    # The project narrows the query, not its result (#627). Arriving here from a
-    # board filtered to one project must not silently widen to every project.
-    project_id = await services.project_id_for(db, project or None)
-    rows = await repo.list_unjudged_findings(db, project_id=project_id)
     groups: list[dict[str, Any]] = []
     by_review: dict[int, dict[str, Any]] = {}
     for row in rows:
@@ -1499,27 +1513,131 @@ async def web_findings_queue(request: Request, project: str = Query(default=""))
             # the metrics page and make the two disagree.
             finding = {}
         group["findings"].append({"index": int(r["finding_index"]), "f": finding})
+    return groups
+
+
+def _confirmed_findings(review: dict[str, Any]) -> list[dict[str, Any]]:
+    """Полный список подтверждённых находок отчёта — материал для uid."""
+    try:
+        parsed = json.loads(review.get("findings_confirmed") or "[]")
+    except ValueError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [f if isinstance(f, dict) else {} for f in parsed]
+
+
+def _author_said(row: dict[str, Any] | None) -> dict[str, str] | None:
+    if row is None:
+        return None
+    return {
+        "label": _AUTHOR_OUTCOME_LABELS.get(str(row["outcome"]), str(row["outcome"])),
+        "note": str(row.get("note") or ""),
+        "by": str(row.get("reported_by") or ""),
+    }
+
+
+async def _attach_queue_inputs(db, groups: list[dict[str, Any]]) -> None:
+    """Оба ВХОДА рядом с находкой: факт касания и слово автора (#1171).
+
+    Ни один из них ничего не предвыбирает. Факт (#1039) отвечает, тронул ли
+    последующий коммит названное место, — это про код, а не про дефект. Слово
+    автора (#911) хранится в своей таблице и диспозицией не становится ни
+    одним путём. Показаны вместе потому, что по одному их и так приходилось
+    искать руками; подписаны порознь потому, что это разные вопросы.
+
+    uid считается по ПОЛНОМУ списку подтверждённых находок отчёта, а не по
+    тем строкам, которые очередь показывает сейчас. Очередь показывает
+    подмножество всегда — разобранное из неё уходит, а фильтр по категории
+    сужает её дальше, — и личность близнецов (одинаковые категория, файл,
+    заголовок и строка) различается порядковым номером ВНУТРИ отчёта (#1007).
+    Считать uid по обрезанному списку значило бы искать слово автора по
+    ключу, которого он никогда не носил.
+    """
     for group in groups:
-        payload = [item["f"] for item in group["findings"]]
+        row = await repo.get_machine_review(db, int(group["review_id"]))
+        confirmed = _confirmed_findings(dict(row)) if row is not None else []
+        uids = finding_uids(confirmed)
         by_uid = await evidence_for_report(
             db,
             int(group["task_id"]),
-            payload,
+            confirmed,
             generation=int(group["generation"]),
         )
-        for item, uid in zip(group["findings"], finding_uids(payload), strict=True):
-            item["evidence"] = by_uid.get(uid)
+        author = {
+            str(dict(r)["finding_uid"]): dict(r)
+            for r in await repo.list_finding_outcomes(db, int(group["review_id"]))
+        }
+        for item in group["findings"]:
+            index = int(item["index"])
+            uid = uids[index] if index < len(uids) else ""
             item["uid"] = uid
-    total = sum(len(g["findings"]) for g in groups)
+            item["evidence"] = by_uid.get(uid)
+            item["author"] = _author_said(author.get(uid))
+
+
+@router.get("/findings", response_class=HTMLResponse)
+async def web_findings_queue(
+    request: Request,
+    project: str = Query(default=""),
+    category: str = Query(default=""),
+):
+    """Every confirmed finding nobody has answered yet (#1038).
+
+    The page exists because the JUDGEMENT was never the expensive part — the
+    form has been in the task card since #876. What was missing is a way to
+    reach it: reports are written while a task is in review, and every inbox
+    section is built from ``list_tasks_by_status``, so once the task completes
+    its findings appear nowhere. Judging them meant remembering which of
+    twenty-eight tasks had reports.
+
+    Grouped by task so a person answers a whole report in one pass, and posting
+    through the same route the task card uses — a second way to record a
+    judgement would be a second thing to keep honest.
+
+    #1171: очередь читается КАТЕГОРИЯМИ, самая частая сверху, и внутри выборки
+    свежие отчёты идут первыми. Сто находок подряд одним потоком — это то, как
+    суждение вырождается в штамп к концу списка; категория держит вопрос одним
+    и тем же на протяжении захода, а фильтр позволяет закончить заход, а не
+    очередь.
+    """
+    db = _db(request)
+    # The project narrows the query, not its result (#627). Arriving here from a
+    # board filtered to one project must not silently widen to every project.
+    project_id = await services.project_id_for(db, project or None)
+    categories = await repo.unjudged_findings_by_category(db, project_id=project_id)
+    rows = await repo.list_unjudged_findings(
+        db,
+        project_id=project_id,
+        category=category or None,
+        newest_first=True,
+    )
+    groups = _findings_queue_groups(rows)
+    await _attach_queue_inputs(db, groups)
+    shown = sum(len(g["findings"]) for g in groups)
     return TEMPLATES.TemplateResponse(
         request,
         "findings_queue.html",
-        {"groups": groups, "total": total, "project": project or ""},
+        {
+            "groups": groups,
+            # Сток — вся очередь; выборка — то, что на экране. Одним числом их
+            # не сводить: «в очереди 131» и «в этой категории 12» отвечают на
+            # разные вопросы, и общая цифра в заголовке над фильтром читалась
+            # бы как размер выборки.
+            "total": sum(c["findings"] for c in categories),
+            "shown": shown,
+            "categories": categories,
+            "category": category or "",
+            "project": project or "",
+        },
     )
 
 
 @router.get("/metrics", response_class=HTMLResponse)
-async def web_metrics(request: Request, since_days: int = Query(default=90, ge=1)):
+async def web_metrics(
+    request: Request,
+    since_days: int = Query(default=services.PRACTICE_METRICS_DEFAULT_DAYS, ge=1),
+):
     """Practice metrics page (#384)."""
     data = await services.practice_metrics(_db(request), since_days=since_days)
     return TEMPLATES.TemplateResponse(request, "metrics.html", {"m": data})
