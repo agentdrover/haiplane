@@ -6047,6 +6047,7 @@ async def _local_reviewer_ready(db, monkeypatch, tmp_path) -> None:
     решает, — tests/test_forge_links.py на пути записи.
     """
     import os
+    import pwd
 
     from hub import config
     from hub.services import review_dispatch
@@ -6055,7 +6056,15 @@ async def _local_reviewer_ready(db, monkeypatch, tmp_path) -> None:
     scratch.mkdir(exist_ok=True)
     os.chmod(scratch, 0o2770)
     monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "/bin/true")
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/env")
+    # Песочница обязана быть формой из ЗАКРЫТОГО НАБОРА (#1208): «/usr/bin/env»
+    # хаб больше не принимает, и готовность на такой строке была бы «не
+    # настроено» — то есть тест судил бы не то, что называет. Пользователь —
+    # сам вызывающий: он владеет каталогом прогонов и проходит по группе.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/sudo -n -u {pwd.getpwuid(os.getuid()).pw_name} /usr/local/bin/wrap",
+    )
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(scratch))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "reviewer-key")
 

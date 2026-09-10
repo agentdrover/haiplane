@@ -2703,26 +2703,52 @@ def _scratch(tmp_path) -> str:
     return str(path)
 
 
-def _stub_reviewer(monkeypatch, tmp_path, script: str) -> None:
-    """Локальный ревьюер = python-заглушка под настоящим префиксом.
+def _fake_sudo(tmp_path) -> str:
+    """Исполняемый скрипт по имени ``sudo`` — ради ФОРМЫ, а не ради изоляции.
 
-    Префикс здесь — системный ``env``: он ничего не изолирует, и в этом весь
-    смысл. Тест не может завести на машине разработчика второго unix-
-    пользователя, но может доказать, что префикс ДЕЙСТВИТЕЛЬНО применяется к
-    командной строке: заглушка видит себя запущенной через него. Настоящая
-    изоляция — свойство выката (deploy/LOCAL-REVIEW.md), и её проверка
-    попыткой названа в AC-2 ручной честно, а не подменена этим тестом.
+    С 10.09.2026 хаб принимает закрытый набор форм строки песочницы (#1208), и
+    системный ``env``, которым эти тесты пользовались раньше, в набор не
+    входит: строка вне набора не запускается вовсе, и прогон, который тест
+    хочет измерить, просто не состоялся бы. Второго unix-пользователя на
+    машине разработчика не завести, поэтому здесь стоит скрипт, который
+    ничего не изолирует, а лишь съедает свои три токена и запускает остальное.
+
+    Смысл тот же, что был у ``env``: доказать, что префикс ДЕЙСТВИТЕЛЬНО
+    применяется к командной строке — заглушка видит себя запущенной через
+    него. Настоящая изоляция остаётся свойством выката
+    (deploy/LOCAL-REVIEW.md), и её проверка попыткой названа в AC-2 ручной
+    честно, а не подменена этим тестом.
     """
+    path = tmp_path / "sudo"
+    if not path.exists():
+        path.write_text(
+            '#!/bin/sh\n# sudo -n -u <пользователь> <команда...>\nshift 3\nexec "$@"\n'
+        )
+        path.chmod(0o755)
+    return str(path)
+
+
+def _sudo_sandbox(tmp_path, wrapper: str) -> str:
+    """Строка песочницы формы ``sudo`` — той самой, что стоит на проде.
+
+    Пользователь — сам вызывающий: чужого на машине разработчика нет, а страж
+    проверяет его членство в группе каталога прогонов по-настоящему.
+    """
+    import os
+    import pwd
+
+    return f"{_fake_sudo(tmp_path)} -n -u {pwd.getpwuid(os.getuid()).pw_name} {wrapper}"
+
+
+def _stub_reviewer(monkeypatch, tmp_path, script: str) -> None:
+    """Локальный ревьюер = python-заглушка под настоящим префиксом."""
     import shlex
-    import shutil
     import sys
 
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_CMD", shlex.join([sys.executable, "-c", script])
-    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", shlex.join(["-c", script]))
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
 
 
@@ -3164,7 +3190,6 @@ async def test_the_timed_out_reviewer_is_actually_dead(monkeypatch, tmp_path):
     убийство группы.
     """
     import shlex
-    import shutil
     import sys
 
     marker = tmp_path / "still_alive"
@@ -3177,11 +3202,9 @@ async def test_the_timed_out_reviewer_is_actually_dead(monkeypatch, tmp_path):
         + "; :"
     )
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, "/bin/sh")
     )
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_CMD", shlex.join(["/bin/sh", "-c", payload])
-    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", shlex.join(["-c", payload]))
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
 
@@ -3198,15 +3221,23 @@ async def test_the_timed_out_reviewer_is_actually_dead(monkeypatch, tmp_path):
 async def test_the_run_guard_judges_the_deadline_the_run_will_get(
     monkeypatch, tmp_path
 ):
-    """Страж сверяет срок контейнера с тем числом, по которому прогон СНИМУТ.
+    """Стража спрашивают НА КАЖДОМ ПРОГОНЕ, а не только на готовности.
 
     Находка 10.09.2026 (ревьюер Codex, воспроизведено на ef2198fc): проверка
     сравнивала срок контейнера с ``LOCAL_REVIEW_TIMEOUT_SEC`` даже там, где
     прогону отмерили меньше. ``podman run --timeout 1800`` проходил готовность
     при умолчании 1800, а ``run_review(timeout=1)`` убивал только клиента
     podman — контейнер жил оставшиеся почти полчаса, жёг CPU и мог прислать
-    отчёт по закрытому прогону. Формально страж срабатывал; инвариант при этом
-    был нарушен.
+    отчёт по закрытому прогону.
+
+    ПОВОРОТ 10.09.2026. Половина про СРОК потеряла предмет: контейнерных
+    запусков в песочнице больше не бывает (закрытый набор форм, #1208), а обе
+    формы набора оставляют полезную нагрузку потомком хаба — убийство группы
+    доходит до неё при любом сроке, и суждения, зависящего от ``timeout``, у
+    стража не осталось. Вход не выброшен: та же строка стоит здесь же и
+    проверяется на отказ. Вторая половина осталась целиком и она несущая:
+    отказ — это не мнение, а незапуск, иначе страж был бы суждением, которое
+    некому применить.
     """
     sandbox = "/usr/bin/podman run --rm -i --timeout 1800 img"
     monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
@@ -3215,25 +3246,13 @@ async def test_the_run_guard_judges_the_deadline_the_run_will_get(
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
 
-    assert local_reviewer.detaching_sandbox() == [], (
-        "по настройке эта строка законна — иначе проверка ниже беспредметна"
-    )
-    short = local_reviewer.detaching_sandbox(60)
-    assert short, (
-        "прогону отмерили 60 с, контейнеру — 1800: он переживёт снятие "
-        "прогона ровно так же, как без --timeout вовсе"
-    )
-    assert any("60" in reason for reason in short), (
-        f"отказ обязан назвать срок ЭТОГО прогона, а не настройку: {short}"
-    )
-    assert local_reviewer.detaching_sandbox(1800) == [], (
-        f"на своём же сроке строка отвергаться не должна: "
-        f"{local_reviewer.detaching_sandbox(1800)}"
+    assert local_reviewer.sandbox_problem(), (
+        "контейнерный запуск в набор форм не входит — иначе проверка ниже беспредметна"
     )
 
-    # И это не только суждение: прогон с таким сроком НЕ ЗАПУСКАЕТСЯ. Иначе
-    # страж остался бы мнением, которое некому применить, — весь класс
-    # дефектов #1208 именно об этом.
+    # И это не только суждение: прогон НЕ ЗАПУСКАЕТСЯ. Иначе страж остался бы
+    # мнением, которое некому применить, — весь класс дефектов #1208 именно
+    # об этом.
     spawned: list[str] = []
     monkeypatch.setattr(
         local_reviewer,
@@ -3241,7 +3260,7 @@ async def test_the_run_guard_judges_the_deadline_the_run_will_get(
         lambda *a, **k: spawned.append("да"),  # noqa: ARG005
     )
     assert await local_reviewer.run_review("промт", timeout=1) is None, (
-        "прогон, чей контейнер переживёт его снятие, запускать нельзя"
+        "прогон с песочницей вне закрытого набора форм запускать нельзя"
     )
     assert not spawned, (
         "страж высказался, а хаб всё равно породил процесс: контейнер "
@@ -3264,7 +3283,6 @@ async def test_two_local_runs_never_overlap_on_the_host(monkeypatch, tmp_path):
     времени тест был бы флаким на загруженной машине.
     """
     import shlex
-    import shutil
 
     marks = tmp_path / "marks"
     payload = (
@@ -3273,11 +3291,9 @@ async def test_two_local_runs_never_overlap_on_the_host(monkeypatch, tmp_path):
         f"printf 'out\n' >> {shlex.quote(str(marks))}"
     )
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, "/bin/sh")
     )
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_CMD", shlex.join(["/bin/sh", "-c", payload])
-    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", shlex.join(["-c", payload]))
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
 
@@ -3307,7 +3323,6 @@ async def test_stopping_the_hub_kills_the_local_reviewer(
     from hub.services.review_dispatch import cancel_local_runs
 
     import shlex
-    import shutil
     import sys
 
     marker = tmp_path / "outlived_the_hub"
@@ -3323,11 +3338,9 @@ async def test_stopping_the_hub_kills_the_local_reviewer(
     _wire(monkeypatch, recorder)
     await _local_principal(db, monkeypatch)
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, "/bin/sh")
     )
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_CMD", shlex.join(["/bin/sh", "-c", payload])
-    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", shlex.join(["-c", payload]))
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
 
     await _submitted(
@@ -3357,19 +3370,16 @@ async def test_a_chatty_reviewer_does_not_grow_the_hub(monkeypatch, tmp_path):
     слайсе ревьюера, а росла память ХАБА.
     """
     import shlex
-    import shutil
     import sys
 
     monkeypatch.setattr(local_reviewer, "OUTPUT_CAP", 1000)
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_CMD",
-        shlex.join(
-            [sys.executable, "-c", "import sys; sys.stdin.read(); print('x' * 500000)"]
-        ),
+        shlex.join(["-c", "import sys; sys.stdin.read(); print('x' * 500000)"]),
     )
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
@@ -3459,19 +3469,17 @@ async def test_the_scratch_dir_is_writable_by_the_reviewer(monkeypatch, tmp_path
     но режим каталога — это ровно то, что решает исход.
     """
     import shlex
-    import shutil
     import sys
 
     probe = tmp_path / "mode.txt"
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_CMD",
         shlex.join(
             [
-                sys.executable,
                 "-c",
                 "import os, sys; sys.stdin.read(); "
                 f"open({str(probe)!r}, 'w').write(oct(os.stat(os.getcwd()).st_mode & 0o777))",
@@ -3504,21 +3512,18 @@ async def test_stopping_the_hub_closes_the_dispatch_row(
     from hub.services.review_dispatch import cancel_local_runs
 
     import shlex
-    import shutil
     import sys
 
     recorder = _DispatchRecorder({"agent": {"id": "bc-sd"}, "run": {"id": "r-sd"}})
     _wire(monkeypatch, recorder)
     await _local_principal(db, monkeypatch)
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_CMD",
-        shlex.join(
-            [sys.executable, "-c", "import time, sys; sys.stdin.read(); time.sleep(30)"]
-        ),
+        shlex.join(["-c", "import time, sys; sys.stdin.read(); time.sleep(30)"]),
     )
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
 
@@ -3648,8 +3653,17 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     """
     import os
 
+    import pwd
+
     monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "/bin/true")
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/env")
+    # Песочница обязана быть ФОРМОЙ ИЗ НАБОРА, иначе not_ready() назовёт её, а
+    # не каталог, и тест судил бы другое (#1208, поворот 10.09.2026: прежде
+    # здесь стоял «/usr/bin/env», который набор не принимает). Пользователь —
+    # сам вызывающий: он владеет каталогом, и по группе проходит.
+    me = pwd.getpwuid(os.getuid()).pw_name
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -n -u {me} /usr/local/bin/wrap"
+    )
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
 
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "missing"))
@@ -3676,7 +3690,7 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_SANDBOX",
-        "/usr/bin/systemd-run --scope --uid=nobody --",
+        "/usr/bin/systemd-run --scope --uid=nobody /usr/local/bin/wrap",
     )
     assert any("не состоит в группе" in r for r in local_reviewer.not_ready()), (
         "пользователь песочницы вне группы каталога — тот же EACCES, только "
@@ -3688,7 +3702,9 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     # (найдено ревью, неразрешённая 534e16e4). uid 1 есть на обеих системах,
     # где это гоняется, и в группе каталога он не состоит.
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/systemd-run --scope --uid=1 --"
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=1 /usr/local/bin/wrap",
     )
     assert any("не состоит в группе" in r for r in local_reviewer.not_ready()), (
         "числовая форма --uid обязана проверяться так же, как именная: "
@@ -3700,7 +3716,7 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_SANDBOX",
-        f"/usr/bin/systemd-run --scope --uid={os.getuid()} --",
+        f"/usr/bin/systemd-run --scope --uid={os.getuid()} /usr/local/bin/wrap",
     )
     assert local_reviewer.not_ready() == [], "владелец каталога проходит по группе"
 
@@ -3711,7 +3727,7 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_SANDBOX",
-        "/usr/bin/systemd-run --scope --uid=no-such-user-1180 --",
+        "/usr/bin/systemd-run --scope --uid=no-such-user-1180 /usr/local/bin/wrap",
     )
     assert any("не разрешается в системе" in r for r in local_reviewer.not_ready()), (
         "неудача проверки не имеет права читаться как «настроено»"
@@ -3730,20 +3746,18 @@ async def test_the_chatty_reviewer_output_never_lands_in_memory(monkeypatch, tmp
     кусками держит в памяти только лимит.
     """
     import shlex
-    import shutil
     import sys
     import tracemalloc
 
     monkeypatch.setattr(local_reviewer, "OUTPUT_CAP", 1000)
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_CMD",
         shlex.join(
             [
-                sys.executable,
                 "-c",
                 "import sys; sys.stdin.read(); sys.stdout.write('x' * 8_000_000)",
             ]
@@ -4435,6 +4449,182 @@ def test_the_deploy_doc_names_the_settings_the_code_reads() -> None:
         )
 
 
+# ПЕРЕСМОТР 10.09.2026: закрытый набор форм вместо перечисления флагов.
+#
+# Тесты ниже НЕ выброшены и не ослаблены. Каждый из них кодирует настоящий
+# вход, на котором страж когда-то ошибался, и все девять кругов ошибка шла в
+# одну сторону — ложного ПРОПУСКА. Новое правило отвергает эти входы тем
+# более, поэтому у большинства тестов входы остались прежними, а изменился
+# ПРИГОВОР: там, где прежде проверялось «отвергнут по такому-то флагу»,
+# теперь проверяется «отвергнут, и причина названа». Каждый такой поворот
+# назван в докстроке своего теста поимённо — молча не перевёрнут ни один.
+
+
+def test_every_blessed_sandbox_shape_still_passes(monkeypatch) -> None:
+    """AC-6: рабочая строка прода и обе формы набора проходят стража.
+
+    Строгое правило, отвергающее рабочий выкат, хуже прежнего мягкого,
+    поэтому эта половина проверяется ТЕМ ЖЕ набором тестов, что и AC-5: иначе
+    строгость чинилась бы ценой поломки, и поломка вскрылась бы на проде.
+
+    Строки берутся из ``SANDBOX_SHAPES``, а не переписываются сюда: список,
+    переписанный в тест, — третье описание тех же форм, и оно разойдётся
+    следующим ровно так же, как пять раз расходился документ.
+    """
+    prod = "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run"
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", prod)
+    assert local_reviewer.sandbox_problem() == [], (
+        f"рабочая строка прода отвергнута: {local_reviewer.sandbox_problem()}"
+    )
+    assert local_reviewer.sandbox_uid() == "haiplane-reviewer"
+    assert local_reviewer.sandbox_shape() == "sudo"
+
+    for shape in local_reviewer.SANDBOX_SHAPES:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", shape.example)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"форма «{shape.name}» отвергает собственный пример "
+            f"«{shape.example}»: {local_reviewer.sandbox_problem()}"
+        )
+        assert local_reviewer.sandbox_shape() == shape.name
+        assert local_reviewer.sandbox_uid() == "haiplane-reviewer", (
+            f"в примере формы «{shape.name}» страж не видит пользователя — "
+            "значит проверка его членства в группе каталога прогонов на этой "
+            "конфигурации молча не сработает вовсе, ровно как было до #1208"
+        )
+
+    # Необязательные флаги формы — тоже часть обещания: названный в документе
+    # флаг обязан проходить, иначе документ рекомендует то, что хаб отвергнет.
+    for sandbox in (
+        "/usr/bin/systemd-run --scope --quiet --uid=haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --uid=haiplane-reviewer --slice=review.slice "
+        "--property=MemoryMax=1500M --property=CPUQuota=150% /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --uid haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -n --user haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -n --user=haiplane-reviewer /usr/local/bin/wrap",
+        # Имя инструмента без пути: PATH прогону собирает сам хаб.
+        "sudo -n -u haiplane-reviewer /usr/local/bin/wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"«{sandbox}» состоит из флагов, названных в наборе, и отвергаться "
+            f"не должна: {local_reviewer.sandbox_problem()}"
+        )
+        assert local_reviewer.sandbox_uid() == "haiplane-reviewer"
+
+    # Повтор НАКАПЛИВАЮЩЕГОСЯ флага — не тот повтор, что перекрывает: две
+    # --property у systemd-run складываются, и запрещать их значило бы
+    # отвергать строку с двумя лимитами, то есть рабочий рецепт.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=r --setenv=A=1 --setenv=B=2 /usr/local/bin/wrap",
+    )
+    assert local_reviewer.sandbox_problem() == [], (
+        f"--setenv накапливается, а не перекрывает: {local_reviewer.sandbox_problem()}"
+    )
+
+
+def test_a_sandbox_outside_the_closed_set_is_refused(monkeypatch) -> None:
+    """AC-5: строка вне закрытого набора отвергается с названной причиной.
+
+    Здесь собраны входы, каждый из которых КОГДА-ТО ПРОХОДИЛ стража, а
+    обязан был быть отвергнут, — и входы, которые страж отвергал по частному
+    флагу, а теперь отвергает по правилу. Ни один не выброшен: это
+    накопленное за девять кругов доказательство, и оно переживает смену
+    правила.
+
+    Проверяется ДВА следствия разом. Первое: отказ есть и он назван. Второе:
+    ``sandbox_uid()`` на такой строке пуст — раньше страж отвечал «кто» и про
+    строку, которой не понял, и именно в этих ответах ошибался (имя из
+    аргументов полезной нагрузки, из значения соседнего флага, из первого
+    вхождения повторённого флага).
+    """
+    outside = [
+        # Инструмент, о котором набор не знает вовсе. Прежнее ограничение
+        # «чего не знаем — пропускаем» отменено решением владельца 10.09.2026.
+        "/usr/bin/env",
+        "/usr/bin/env -u HOME /usr/local/bin/wrap",
+        "/bin/sh -c /usr/local/bin/wrap",
+        # Относительное имя со слэшем: «какая-то программа», а не названная.
+        "./sudo -n -u haiplane-reviewer /usr/local/bin/wrap",
+        # Контейнерные движки — целиком, любой подкомандой и с любым сроком.
+        "/usr/bin/podman run --rm -i img",
+        "/usr/bin/podman run --rm -i --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout=1800 img",
+        "/usr/bin/podman ps",
+        "/usr/bin/docker run --rm -i img",
+        "sudo -n -u haiplane-reviewer podman run --timeout 60 img",
+        # Слипшийся короткий токен во всех записях, что находили читатели.
+        "/usr/bin/sudo -nu haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -nuhaiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -uhaiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -niu haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -pu haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u=haiplane-reviewer /usr/local/bin/wrap",
+        # Повтор перекрывающего флага: инструмент возьмёт последнее вхождение,
+        # читатель глазами — первое, и на этой разнице страж уже ошибался.
+        "/usr/bin/sudo -n -u alice -u bob /usr/local/bin/wrap",
+        "/usr/bin/sudo -n --user alice --user bob /usr/local/bin/wrap",
+        "/usr/bin/sudo -n --user=alice -u bob /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --uid=alice --uid=bob /usr/local/bin/wrap",
+        # Флаг, которого в форме нет.
+        "/usr/bin/sudo -n -u haiplane-reviewer -g haiplane /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --pipe --uid=r /usr/local/bin/wrap",
+        # Терминатор и аргументы полезной нагрузки в самой песочнице.
+        "/usr/bin/systemd-run --scope --uid=alice -- /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u alice -- -u bob",
+        "/usr/bin/systemd-run --scope --uid=alice /wrap --uid=bob",
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap",
+        # Пути к обёртке нет вовсе либо он относительный.
+        "/usr/bin/sudo -n -u haiplane-reviewer",
+        "/usr/bin/sudo -n -u haiplane-reviewer wrap",
+        # Обязательного флага нет: без -n sudo может спросить пароль, а stdin
+        # занят промтом с одноразовым кодом доступа к хабу.
+        "/usr/bin/sudo -u 1234 /usr/local/bin/wrap",
+        "/usr/bin/sudo /usr/local/bin/wrap",
+        # Пользователь не назван вовсе — запуск шёл бы от самого хаба.
+        "/usr/bin/sudo -n /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u  /usr/local/bin/wrap",
+        # Флаг есть, значения нет: «флага нет» и «флаг пуст» — разные отказы,
+        # и чинятся они по-разному.
+        "/usr/bin/systemd-run --scope --uid= /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u",
+        # И наоборот: значение написано флагу, который его не берёт.
+        "/usr/bin/systemd-run --scope=1 --uid=r /usr/local/bin/wrap",
+        # Одинокий дефис позиционным путём не является.
+        "/usr/bin/sudo -n -u r -",
+    ]
+    for sandbox in outside:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons, (
+            f"«{sandbox}» не совпадает ни с одной формой закрытого набора, а "
+            "хаб пропустил её молча. Пустой список здесь означает «посмотрел "
+            "и одобрил» — то есть ровно ту ошибку в сторону пропуска, из-за "
+            "которой правило и переписано"
+        )
+        assert all(r.startswith("LOCAL_REVIEW_SANDBOX:") for r in reasons), (
+            f"отказ обязан называть НАСТРОЙКУ, которую чинить: {reasons}"
+        )
+        assert all("deploy/LOCAL-REVIEW.md" in r for r in reasons), (
+            f"отказ обязан указывать на документ, где набор форм назван: {reasons}"
+        )
+        assert local_reviewer.sandbox_uid() == "", (
+            f"на отвергнутой строке «{sandbox}» страж назвал пользователя "
+            f"«{local_reviewer.sandbox_uid()}». Прогона не будет, и судить о "
+            "членстве в группе каталога прогонов не о чем — а имя, названное "
+            "по непрочитанной строке, и есть источник всех девяти кругов"
+        )
+        assert local_reviewer.sandbox_shape() == ""
+
+    # Пустая настройка второй причиной не шумит: её называет not_ready()
+    # отдельной строкой, и повторять то же самое другими словами — это
+    # два разных имени одной поломки в одной карточке.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "")
+    assert local_reviewer.sandbox_problem() == []
+
+
 def test_the_guard_reads_the_sudo_form_of_the_sandbox_user(monkeypatch) -> None:
     """AC-2: форма sudo видна стражу так же, как --uid= от systemd-run.
 
@@ -4443,62 +4633,42 @@ def test_the_guard_reads_the_sudo_form_of_the_sandbox_user(monkeypatch) -> None:
     членства в группе каталога прогонов (заведённая ради находки ревью
     45971e09) на этой конфигурации не срабатывала ВОВСЕ — то есть создавала
     впечатление проверки там, где её нет.
+
+    ПОВОРОТ 10.09.2026. Прежняя редакция этого теста держала таблицу «строка
+    → имя пользователя» и на строках ВНЕ набора: ``sudo -nu X`` давало X,
+    ``sudo -u alice -u bob`` — bob. Теперь такие строки не запускаются вовсе,
+    и страж на них молчит; сами строки переехали в
+    test_a_sandbox_outside_the_closed_set_is_refused, где проверяется их
+    отказ. Здесь остались формы, которые набор ПРИНИМАЕТ, — и на них ответ
+    обязан быть точным, потому что по нему судится доступ к каталогу.
     """
     cases = {
-        # Новые формы sudo — то, чем песочницу настраивают на самом деле.
-        "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run": "haiplane-reviewer",
-        "/usr/bin/sudo -n --user haiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
-        "/usr/bin/sudo -n --user=haiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
-        "sudo -u 1234 /usr/local/bin/wrap": "1234",
-        # Слипшаяся запись тех же -n и -u — обычная форма, на которой страж
-        # возвращал пустую строку и молча снимал проверку группы (найдено
-        # машинным ревью 09.09.2026, находка f4286f03c34368d3).
-        "/usr/bin/sudo -nu haiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
-        "/usr/bin/sudo -nuhaiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
-        "/usr/bin/sudo -uhaiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
-        "/usr/bin/sudo -niu haiplane-reviewer /usr/local/bin/wrap": "haiplane-reviewer",
-        # А здесь угадывать нельзя: -p берёт значение, то есть «u» — уже текст
-        # приглашения, а не флаг, и пользователя строка не называет вовсе.
-        # Принять его значило бы проверить членство в группе не того.
-        "/usr/bin/sudo -pu haiplane-reviewer /usr/local/bin/wrap": "",
-        "/usr/bin/sudo -n -g haiplane /usr/local/bin/wrap": "",
-        # ПОВТОР ФЛАГА: запуск идёт под ПОСЛЕДНИМ названным пользователем, и
-        # членство в группе каталога прогонов надо проверять у него. Замерено
-        # 10.09.2026 на getopt_long — разборщике sudo(8) (parse_args.c) и
-        # systemd-run: «case 'u': user = optarg» на «-n -u alice -u bob» даёт
-        # bob. Страж по ПЕРВОМУ вхождению называл alice, то есть отвечал про
-        # не того пользователя, а проверка 45971e09 на такой строке говорила
-        # не о той конфигурации (найдено при работе над #1208).
-        "/usr/bin/sudo -n -u alice -u bob /usr/local/bin/wrap": "bob",
-        "/usr/bin/sudo -n -u bob -u alice /usr/local/bin/wrap": "alice",
-        "/usr/bin/sudo -n --user alice --user bob /usr/local/bin/wrap": "bob",
-        "/usr/bin/sudo -n --user=alice -u bob /usr/local/bin/wrap": "bob",
-        "/usr/bin/sudo -n -u alice -nu bob /usr/local/bin/wrap": "bob",
-        "/usr/bin/systemd-run --scope --uid=alice --uid=bob --": "bob",
-        "/usr/bin/systemd-run --scope --uid alice --uid=bob --": "bob",
+        # Три формы записи пользователя у sudo, названные в AC-2.
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/sudo -n --user haiplane-reviewer /usr/local/bin/wrap": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/sudo -n --user=haiplane-reviewer /usr/local/bin/wrap": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/sudo -n -u 1234 /usr/local/bin/wrap": "1234",
         # Старая форма НЕ сломана — иначе починено одно ценой другого.
-        "/usr/bin/systemd-run --scope --uid=haiplane-reviewer --": "haiplane-reviewer",
-        "/usr/bin/systemd-run --scope --uid haiplane-reviewer --": "haiplane-reviewer",
-        "/usr/bin/systemd-run --scope --uid=65534 --": "65534",
-        # --user за podman/docker — пользователь ВНУТРИ контейнера, а не на
-        # хосте: принять его за хостового значило бы проверить членство в
-        # группе каталога совсем не того пользователя.
-        "/usr/bin/podman run --rm -i --timeout 60 --user 1000 img": "",
-        "/usr/bin/docker run --user haiplane-reviewer img": "",
-        # Хостовый пользователь назван до контейнера — его и берём.
-        "sudo -u haiplane-reviewer podman run --timeout 60 --user 1000 img": "haiplane-reviewer",
-        # А вот здесь sudo хостового пользователя НЕ называет, и --user за
-        # podman — единственный на строке. Принять его значило бы проверить
-        # членство в группе каталога у пользователя другой машины.
-        "sudo -n /usr/local/bin/wrap podman run --timeout 60 --user 1000 img": "",
-        "sudo -n /usr/local/bin/wrap docker run --user haiplane-reviewer img": "",
-        # Обёртка, о которой страж ничего не знает, пропускается молча — это
-        # сказано в документе прямым требованием к обёртке.
-        "/usr/bin/env": "",
-        "": "",
+        "/usr/bin/systemd-run --scope --uid=haiplane-reviewer /usr/local/bin/wrap": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/systemd-run --scope --uid haiplane-reviewer /usr/local/bin/wrap": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/systemd-run --scope --uid=65534 /usr/local/bin/wrap": "65534",
     }
     for sandbox, expected in cases.items():
         monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"«{sandbox}» — форма из набора, и отвергаться она не должна: "
+            f"{local_reviewer.sandbox_problem()}"
+        )
         assert local_reviewer.sandbox_uid() == expected, (
             f"песочница «{sandbox}» называет пользователя «{expected}», а "
             f"страж вернул «{local_reviewer.sandbox_uid()}»: пустая строка "
@@ -4508,112 +4678,100 @@ def test_the_guard_reads_the_sudo_form_of_the_sandbox_user(monkeypatch) -> None:
 
 
 def test_the_user_guard_reads_only_the_wrappers_own_arguments(monkeypatch) -> None:
-    """Флаг пользователя берётся из СОБСТВЕННЫХ аргументов обёртки.
+    """Имя пользователя не берётся из аргументов полезной нагрузки.
 
-    Объявленное ограничение задачи разрешает ПРОПУСКАТЬ незнакомое: «стражи
-    знают названные инструменты и флаги, чего не знают — пропускают». Оно НЕ
-    разрешает разобрать знакомое неверно и вернуть постороннее имя, а именно
-    это здесь и происходило: страж читал всю строку целиком и брал последнее
-    ``-u``/``--uid`` где угодно, включая аргументы полезной нагрузки.
+    Воспроизведено на HEAD 21629cde до починки — обе формы давали чужой
+    ответ: ``sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap`` давало
+    ``HOME`` (находка 64e89a8683b01db1), а ``systemd-run --scope --uid=alice
+    -- /bin/true --uid=bob`` — ``bob`` (находка d228b0eb3310a9cc). Следствие
+    названо: ``scratch_problem`` судил членство в группе каталога прогонов у
+    пользователя, которого в строке нет вовсе.
 
-    Воспроизведено на HEAD 21629cde до починки:
-    ``sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap`` → ``HOME``
-    (находка 64e89a8683b01db1), ``systemd-run --scope --uid=alice --
-    /bin/true --uid=bob`` → ``bob`` (находка d228b0eb3310a9cc). Следствие
-    названо: ``scratch_problem`` судит членство в группе каталога прогонов у
-    пользователя, которого в строке нет вовсе, то есть проверка, заведённая
-    ради 45971e09, отвечает про чужую конфигурацию.
+    ПОВОРОТ 10.09.2026. Прежде тест требовал, чтобы на таких строках страж
+    называл ПРАВИЛЬНОЕ имя. Теперь у песочницы аргументов полезной нагрузки
+    не бывает вовсе: их дописывает сам хаб из LOCAL_REVIEW_CMD, а форма
+    кончается путём к обёртке. Поэтому те же входы обязаны быть ОТВЕРГНУТЫ, а
+    имя — не называться вообще: ответ по строке, которую хаб не запустит,
+    никому не нужен, а именно такие ответы девять кругов и были неверны.
     """
-    cases = {
-        # Полезная нагрузка со СВОИМ ``-u``: обёртка — sudo, пользователь
-        # хоста назван ею, а ``-u HOME`` принадлежит /usr/bin/env.
-        "/usr/bin/sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap": (
-            "haiplane-reviewer"
-        ),
-        "/usr/bin/sudo -n -u haiplane-reviewer /usr/bin/env -u HOME -u PATH /wrap": (
-            "haiplane-reviewer"
-        ),
-        # ``--`` кончает собственные аргументы systemd-run: всё правее —
-        # чужая программа, и её ``--uid`` к хосту отношения не имеет.
-        "/usr/bin/systemd-run --scope --uid=alice -- /bin/true --uid=bob": "alice",
-        "/usr/bin/systemd-run --scope --uid alice -- /wrap --uid bob": "alice",
-        # Тот же разрыв без ``--``: имя полезной нагрузки — уже позиционный
-        # аргумент, и собственные флаги обёртки на нём кончились.
-        "/usr/bin/systemd-run --scope --uid=alice /wrap --uid=bob": "alice",
-        # ``--`` кончает разбор САМ ПО СЕБЕ, а не потому, что за ним обычно
-        # стоит позиционный токен: ради аргументов полезной нагрузки,
-        # начинающихся с дефиса, его и пишут. Без этого правила первый же
-        # такой аргумент снова читался бы как флаг обёртки.
-        "/usr/bin/sudo -n -u alice -- -u bob": "alice",
-        "/usr/bin/systemd-run --scope --uid=alice -- --uid=bob": "alice",
-        # Обёртка пользователя НЕ называет вовсе — и выдумывать его из
-        # аргументов полезной нагрузки нельзя: пустая строка честнее чужого
-        # имени.
-        "/usr/bin/sudo -n /wrap --uid=bob": "",
-        "/usr/bin/sudo -n /usr/bin/env -u HOME /wrap": "",
-        # Повтор флага ВНУТРИ собственных аргументов судится по-прежнему по
-        # последнему вхождению — починка одного не отменяет другого.
-        "/usr/bin/sudo -n -u alice -u bob /wrap --user carol": "bob",
-        # Вложенная обёртка за окном остаётся видимой: podman назван после
-        # позиционного аргумента sudo, и его ``--user`` по-прежнему гасится
-        # как пользователь ВНУТРИ контейнера.
-        "/usr/bin/sudo -n /wrap podman run --timeout 60 --user 1000 img": "",
-        # Слипшийся пучок берёт значение отдельным токеном, и окно на нём не
-        # кончается: иначе починка одного оплачена поломкой другого.
-        "/usr/bin/sudo -nu haiplane-reviewer /usr/bin/env -u HOME /wrap": (
-            "haiplane-reviewer"
-        ),
-    }
-    for sandbox, expected in cases.items():
+    for sandbox in (
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap",
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/bin/env -u HOME -u PATH /wrap",
+        "/usr/bin/systemd-run --scope --uid=alice -- /bin/true --uid=bob",
+        "/usr/bin/systemd-run --scope --uid alice -- /wrap --uid bob",
+        "/usr/bin/systemd-run --scope --uid=alice /wrap --uid=bob",
+        "/usr/bin/sudo -n -u alice -- -u bob",
+        "/usr/bin/systemd-run --scope --uid=alice -- --uid=bob",
+        "/usr/bin/sudo -n /wrap --uid=bob",
+        "/usr/bin/sudo -n /usr/bin/env -u HOME /wrap",
+        "/usr/bin/sudo -n -u alice -u bob /wrap --user carol",
+        "/usr/bin/sudo -n /wrap podman run --timeout 60 --user 1000 img",
+        "/usr/bin/sudo -nu haiplane-reviewer /usr/bin/env -u HOME /wrap",
+        # --user за podman/docker — пользователь ВНУТРИ контейнера, а не на
+        # хосте: принять его за хостового значило бы проверить членство в
+        # группе каталога совсем не того пользователя.
+        "/usr/bin/podman run --rm -i --timeout 60 --user 1000 img",
+        "/usr/bin/docker run --user haiplane-reviewer img",
+    ):
         monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
-        assert local_reviewer.sandbox_uid() == expected, (
-            f"в песочнице «{sandbox}» хостовый пользователь — «{expected}», а "
-            f"страж назвал «{local_reviewer.sandbox_uid()}»: имя из аргументов "
-            "полезной нагрузки означает, что членство в группе каталога "
-            "прогонов проверяется НЕ У ТОГО пользователя"
+        assert local_reviewer.sandbox_problem(), (
+            f"«{sandbox}» несёт аргументы полезной нагрузки прямо в песочнице "
+            "— форма набора кончается путём к обёртке, и разбирать чужие "
+            "флаги хаб не обязан и не берётся"
+        )
+        assert local_reviewer.sandbox_uid() == "", (
+            f"в отвергнутой строке «{sandbox}» страж назвал "
+            f"«{local_reviewer.sandbox_uid()}»: имя из аргументов полезной "
+            "нагрузки означает, что членство в группе каталога прогонов "
+            "проверяется НЕ У ТОГО пользователя"
         )
 
 
 def test_the_scope_flag_is_read_only_from_systemd_runs_own_arguments(
     monkeypatch,
 ) -> None:
-    """``--scope`` засчитывается только среди собственных аргументов обёртки.
+    """``--scope`` засчитывается только как СОБСТВЕННЫЙ флаг обёртки.
 
     Отказ уходил В СТОРОНУ ПРОПУСКА: страж искал ``--scope`` во всей строке,
     и ``--scope`` полезной нагрузки снимал отказ, хотя transient service от
     этого в scope не превращается. Воспроизведено на HEAD 21629cde: строка
     ``systemd-run --quiet --pipe --uid=x -- /wrap --scope`` возвращала ``[]``
     (находка 3d5938a9a645c39d).
+
+    Отказ по НЕДОСТАЮЩЕМУ ОБЯЗАТЕЛЬНОМУ флагу идёт первым — раньше любого
+    другого: оператору важнее узнать, что он забыл ``--scope``, чем что хаб
+    не принимает ``--pipe``. Иначе он чинил бы по одному незнакомому флагу за
+    круг, так и не увидев главного.
     """
     for hidden in (
         "/usr/bin/systemd-run --quiet --pipe --uid=x -- /wrap --scope",
         "/usr/bin/systemd-run --quiet --uid=x /wrap --scope",
         "/usr/bin/systemd-run --uid=x -- /usr/bin/env SCOPE=1 /wrap --scope",
+        "/usr/bin/systemd-run --quiet --pipe --uid=haiplane-reviewer --",
     ):
         monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", hidden)
-        reasons = local_reviewer.detaching_sandbox()
+        reasons = local_reviewer.sandbox_problem()
         assert reasons and all("--scope" in r for r in reasons), (
             f"«{hidden}» — systemd-run БЕЗ --scope: ``--scope`` здесь стоит "
             "среди аргументов полезной нагрузки и transient service в scope "
             f"не превращает, а страж пропустил запуск молча: {reasons}"
         )
 
-    # Собственный ``--scope`` обёртки по-прежнему снимает отказ — иначе
+    # Собственный ``--scope`` обёртки по-прежнему снимает этот отказ — иначе
     # рабочая форма из #1180 оказалась бы сломана.
-    for ok in (
-        "/usr/bin/systemd-run --scope --uid=x -- /wrap",
-        "/usr/bin/systemd-run --scope --uid=x /wrap --uid=y",
-    ):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", ok)
-        assert local_reviewer.detaching_sandbox() == [], (
-            f"«{ok}» называет --scope среди собственных аргументов "
-            f"systemd-run и отвергаться не должна: "
-            f"{local_reviewer.detaching_sandbox()}"
-        )
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=x /usr/local/bin/wrap",
+    )
+    assert local_reviewer.sandbox_problem() == [], (
+        "«systemd-run --scope --uid=x /usr/local/bin/wrap» называет --scope "
+        f"собственным флагом: {local_reviewer.sandbox_problem()}"
+    )
 
 
 def test_a_non_run_engine_call_does_not_hide_a_later_run(monkeypatch) -> None:
-    """Первая не-``run`` подкоманда движка не обрывает поиск запуска.
+    """Движок отвергается любой подкомандой, а не только на ``run``.
 
     Отказ уходил В СТОРОНУ ПРОПУСКА: страж возвращал «движка нет» на первом
     же ``podman``, за которым не стоит ``run``, и настоящий запуск правее
@@ -4621,179 +4779,114 @@ def test_a_non_run_engine_call_does_not_hide_a_later_run(monkeypatch) -> None:
     ``podman ps /usr/bin/podman run --timeout 0 img`` давало ``[]``, тогда
     как одиночный ``podman run --timeout 0`` отвергался (находка
     96144e6317c1d7ac).
+
+    ПОВОРОТ 10.09.2026: искать подкоманду больше не нужно вовсе. Движок в
+    закрытый набор форм не входит, и ``podman ps`` отвергается ровно так же,
+    как ``podman run``, — вопрос «а не спрятан ли запуск правее» просто
+    перестал существовать. Прежняя редакция теста ждала на ``podman ps``
+    пустого списка, то есть ОДОБРЕНИЯ; это и есть поворот, и он назван.
     """
-    for hidden in (
+    for sandbox in (
         "/usr/bin/podman ps /usr/bin/podman run --timeout 0 img",
         "/usr/bin/podman version /usr/bin/podman run --rm -i img",
         "/usr/bin/docker ps /usr/bin/docker run --rm -i img",
+        "/usr/bin/podman ps",
+        "/usr/bin/podman ps /usr/bin/podman version",
     ):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", hidden)
-        assert local_reviewer.detaching_sandbox(), (
-            f"в «{hidden}» настоящий запуск контейнера стоит ПРАВЕЕ первой "
-            "не-run подкоманды, и пропустить его значит разрешить прогон, "
-            "который снять нельзя"
-        )
-
-    # А там, где запуска нет вовсе, судить по-прежнему нечего.
-    for nothing in ("/usr/bin/podman ps", "/usr/bin/podman ps /usr/bin/podman version"):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", nothing)
-        assert local_reviewer.detaching_sandbox() == [], (
-            f"«{nothing}» контейнер не запускает: {local_reviewer.detaching_sandbox()}"
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem(), (
+            f"«{sandbox}» начинается с контейнерного движка, а он в набор "
+            "форм не входит ни одной подкомандой: пропустить его значит "
+            "разрешить прогон, который снять нельзя"
         )
 
 
 def test_a_container_launch_without_its_own_deadline_is_refused(monkeypatch) -> None:
-    """AC-3: контейнер без собственного срока жизни отвергнут ПО ИМЕНИ ФЛАГА.
+    """AC-3: контейнерный запуск отвергнут, и отказ называет НЕДОСТАЮЩИЙ ФЛАГ.
 
     Требование «прямой потомок хаба» для контейнеров недостижимо: измерено
     08.09.2026 — podman run переживает kill -KILL по группе, через 7 с
     контейнер «Up», потому что conmon отсоединён от клиента намеренно. Зато
-    с --timeout 5 контейнер умирает сам (через 12 с живых нет). Поэтому
-    правило звучит «потомок ИЛИ свой срок жизни», а отказ обязан называть
-    НЕДОСТАЮЩИЙ ФЛАГ, а не «песочница неверна».
-    """
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/podman run --rm -i img"
-    )
-    reasons = local_reviewer.detaching_sandbox()
-    assert reasons and all("--timeout" in r for r in reasons), (
-        f"podman run без своего срока жизни обязан назвать --timeout: {reasons}"
-    )
+    с --timeout 5 контейнер умирает сам (через 12 с живых нет).
 
-    for ok in (
+    ПОВОРОТ 10.09.2026. Прежде отсюда следовало «потомок ИЛИ свой срок», и
+    хаб разбирал строку podman до образа, чтобы этот срок найти. Разбор и дал
+    шесть находок из пятнадцати, все — в сторону пропуска. Теперь
+    контейнерный запуск отвергается ЦЕЛИКОМ, а срок жизни переехал внутрь
+    root-ового враппера, где флаги зафиксированы и sudoers не допускает
+    подстановок. Отказ по-прежнему обязан называть НЕДОСТАЮЩИЙ ФЛАГ, а не
+    «песочница неверна»: оператору нужно знать, что во враппере обязан стоять
+    ``--timeout``, и что у docker такого флага нет вовсе.
+
+    Строки со сроком жизни (``--timeout 1800``), которые прежняя редакция
+    теста требовала ПРИНИМАТЬ, теперь отвергаются вместе с остальными — и
+    это тот самый поворот. Ни одна из них не выброшена: они стоят здесь же,
+    ниже, и проверяются на отказ.
+    """
+    containers = [
+        "/usr/bin/podman run --rm -i img",
         "/usr/bin/podman run --rm -i --timeout 1800 img",
         "/usr/bin/podman run --rm -i --timeout=1800 img",
-        # Флаг стоит среди флагов run, а между ним и образом — флаги со
-        # значениями: их значения за образ приниматься не должны.
         "/usr/bin/podman run --rm -i -m 1500m --cpus 1.5 --pids-limit 512 "
         "--env-file /etc/haiplane-review/env --network none --timeout 1800 img",
-        # Глобальный флаг движка со значением отдельным токеном: подкоманда
-        # «run» стоит за ним, и хаб обязан её увидеть.
         "/usr/bin/podman --log-level debug run --rm -i --timeout 1800 img",
         "/usr/bin/podman --url unix:///run/x run --rm -i --timeout 1800 img",
-    ):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", ok)
-        assert local_reviewer.detaching_sandbox() == [], (
-            f"«{ok}» имеет собственный срок жизни и отвергаться не должен"
-        )
-
-    # --timeout ПОСЛЕ образа принадлежит команде внутри контейнера, а не
-    # podman run: conmon переживает убийство группы ровно так же, и принять
-    # чужой флаг за срок жизни значит разрешить прогон, который снять нельзя
-    # (найдено машинным ревью 09.09.2026, находка 2e24a6068bbc3fa1).
-    for detaching in (
         "/usr/bin/podman run --rm -i img cursor-agent --timeout 60",
         "/usr/bin/podman run --rm -i img agent --timeout=60",
-        # Тот же промах с другой стороны: глобальный флаг движка съедал
-        # подкоманду, и «run» страж не находил вовсе.
         "/usr/bin/podman --log-level debug run --rm -i img",
         "/usr/bin/podman -c remote run --rm -i img",
-    ):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", detaching)
-        reasons = local_reviewer.detaching_sandbox()
-        assert reasons and all("--timeout" in r for r in reasons), (
-            f"«{detaching}» — контейнер БЕЗ собственного срока жизни, и отказ "
-            f"обязан назвать недостающий --timeout: {reasons}"
-        )
-
-    # У docker штатного аналога --timeout нет вовсе, поэтому честнее назвать
-    # неподходящим весь запуск — и сказать, чем его заменить.
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/docker run --rm -i --timeout 60 img"
-    )
-    reasons = local_reviewer.detaching_sandbox()
-    assert reasons and any("docker" in r and "podman" in r for r in reasons), (
-        f"docker run обязан быть отвергнут с названной заменой: {reasons}"
-    )
-
-    # Старое требование не ослаблено: systemd-run без --scope — прежний отказ.
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/systemd-run --quiet --pipe --uid=x --"
-    )
-    reasons = local_reviewer.detaching_sandbox()
-    assert reasons and all("--scope" in r for r in reasons), (
-        f"systemd-run без --scope остаётся отказом: {reasons}"
-    )
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/systemd-run --scope --uid=x --"
-    )
-    assert local_reviewer.detaching_sandbox() == []
-
-    # ``--timeout 0`` — токен в строке есть, срока жизни нет: ноль это
-    # подман-умолчание, а умолчание задокументировано словами «By default
-    # containers run until they exit or are stopped by podman stop»
-    # (podman-run(1)). Тот же класс, что --timeout после образа, и пропускать
-    # его значит вернуть дыру, ради которой страж написан (найдено машинным
-    # ревью 09.09.2026, находка fee582c0e918a6a6).
-    for no_deadline in (
         "/usr/bin/podman run --rm -i --timeout 0 img",
         "/usr/bin/podman run --rm -i --timeout=0 img",
         "/usr/bin/podman run --rm -i --timeout 00 img",
-        # Нечисловое значение сроком тоже не является — и молча пройти не должно.
         "/usr/bin/podman run --rm -i --timeout abc img",
-        # Флаг последним токеном: значения нет вовсе.
         "/usr/bin/podman run --rm -i --timeout",
-    ):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", no_deadline)
-        reasons = local_reviewer.detaching_sandbox()
-        assert reasons and all("--timeout" in r for r in reasons), (
-            f"«{no_deadline}» задаёт контейнеру НЕ срок жизни, а подман-"
-            f"умолчание «работать до выхода»: {reasons}"
-        )
-
-    # А положительное число — задаёт, и отвергаться не должно.
-    for ok_deadline in (
         "/usr/bin/podman run --rm -i --timeout 1 img",
-        "/usr/bin/podman run --rm -i --timeout=1800 img",
-    ):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", ok_deadline)
-        assert local_reviewer.detaching_sandbox() == [], (
-            f"«{ok_deadline}» называет срок жизни целым числом секунд больше "
-            "нуля — это рабочая форма, а не отказ"
-        )
-
-    # ПОВТОР ФЛАГА: действует ПОСЛЕДНЕЕ вхождение, потому что так делают сами
-    # разборщики — замерено 10.09.2026 на spf13/pflag, которым разбирают
-    # командную строку и podman, и docker: «docker context ls --format
-    # '{{.Name}}' --format 'LAST_WINS'» печатает LAST_WINS, а обратный
-    # порядок печатает имена контекстов. Судя по ПЕРВОМУ вхождению, страж
-    # принимал «--timeout 1800 --timeout 0» за запуск со сроком жизни, тогда
-    # как действует ноль (найдено машинным ревью 09.09.2026, находка
-    # 04d3d4b0f7febee0).
-    for shadowed in (
         "/usr/bin/podman run --rm -i --timeout 1800 --timeout 0 img",
         "/usr/bin/podman run --rm -i --timeout=1800 --timeout=0 img",
         "/usr/bin/podman run --rm -i --timeout 1800 --timeout abc img",
         "/usr/bin/podman run --rm -i --timeout 1800 --timeout 5 --timeout 0 img",
-    ):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", shadowed)
-        reasons = local_reviewer.detaching_sandbox()
-        assert reasons and all("--timeout" in r for r in reasons), (
-            f"в «{shadowed}» действует ПОСЛЕДНИЙ --timeout, и срока жизни он "
-            f"не задаёт — первое вхождение здесь не значит ничего: {reasons}"
-        )
-
-    # То же правило в обратную сторону: последний --timeout срок задаёт,
-    # значит запуск законен, сколько бы нулей ни стояло левее. Иначе страж
-    # отвергал бы рабочую строку, и починка одного была бы оплачена поломкой
-    # другого.
-    for shadowed_ok in (
         "/usr/bin/podman run --rm -i --timeout 0 --timeout 1800 img",
         "/usr/bin/podman run --rm -i --timeout abc --timeout=1800 img",
-    ):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", shadowed_ok)
-        assert local_reviewer.detaching_sandbox() == [], (
-            f"в «{shadowed_ok}» действует последний --timeout, и он называет "
-            f"срок жизни: {local_reviewer.detaching_sandbox()}"
+    ]
+    for sandbox in containers:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons and all("--timeout" in r for r in reasons), (
+            f"«{sandbox}» — контейнерный запуск: отказ обязан назвать флаг, "
+            f"без которого контейнер переживёт снятие прогона: {reasons}"
         )
 
-    # ``podman ps`` — не запуск контейнера, и судить о нём нечего.
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/podman ps")
-    assert local_reviewer.detaching_sandbox() == []
+    # У docker штатного аналога --timeout нет вовсе, и отказ обязан сказать,
+    # ЧЕМ его заменить, а не просто «нельзя».
+    for sandbox in (
+        "/usr/bin/docker run --rm -i --timeout 60 img",
+        "/usr/bin/docker run --rm -i img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons and any("docker" in r and "podman" in r for r in reasons), (
+            f"docker run обязан быть отвергнут с названной заменой: {reasons}"
+        )
+
+    # Старое требование не ослаблено: systemd-run без --scope — прежний отказ,
+    # и назван по-прежнему недостающий флаг.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/systemd-run --quiet --pipe --uid=x --"
+    )
+    reasons = local_reviewer.sandbox_problem()
+    assert reasons and all("--scope" in r for r in reasons), (
+        f"systemd-run без --scope остаётся отказом: {reasons}"
+    )
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=x /usr/local/bin/wrap",
+    )
+    assert local_reviewer.sandbox_problem() == []
 
 
 def test_a_detached_container_launch_is_refused_by_flag(monkeypatch) -> None:
-    """Отсоединённый запуск — ОТКАЗ, и никакой ``--timeout`` его не снимает.
+    """Отсоединённый запуск — отказ, и ``--timeout`` его не снимал никогда.
 
     Найдено ревьюером Codex 10.09.2026, воспроизведено на 5b7b813::
 
@@ -4801,275 +4894,197 @@ def test_a_detached_container_launch_is_refused_by_flag(monkeypatch) -> None:
         podman run --detach --timeout=1800 img  -> []       # пропуск
         podman run --rm -i img                  -> ОТКАЗ    # правильно
 
-    ``-d`` и ``--detach`` разбирались как обычные беззначные флаги и попадали
-    в список известных, то есть строка выглядела разобранной и одобренной.
-    Между тем отсоединённый podman возвращает управление НЕМЕДЛЕННО: хаб
+    ``-d`` заставляет клиента podman вернуть управление НЕМЕДЛЕННО: хаб
     видит завершившийся процесс, закрывает прогон как законченный и может
-    снести его каталог, а ревьюер в контейнере продолжает работать и способен
-    прислать отчёт по уже закрытому прогону. Правило «потомок ИЛИ свой срок»
-    здесь не выполняется НИ ОДНОЙ половиной: срок есть, а снимать уже нечего.
-    Плюс протокол хаба построен на переднем плане — промт в stdin, ответ из
-    stdout, — и с ``-d`` не работает вовсе.
-    """
-    # Отказ обязан назвать ИМЕННО ТОТ ТОКЕН, который стоит в строке: «уберите
-    # --detach» на строке с ``-itd`` — совет убрать то, чего оператор не
-    # писал, а починку этот страж обещает называть.
-    for detached, token in (
-        ("/usr/bin/podman run -d --timeout 1800 img", "-d"),
-        ("/usr/bin/podman run --detach --timeout=1800 img", "--detach"),
-        # Срок здесь заведомо живой и хабскому не противоречит: отказ обязан
-        # идти именно по отсоединению, а не по сроку.
-        ("/usr/bin/podman run --rm -i -d --timeout 1800 img", "-d"),
-        # Буква ``d`` внутри слипшегося пучка — тот же самый флаг. Знать одну
-        # запись из трёх значит пропускать две.
-        ("/usr/bin/podman run -itd --timeout 1800 img", "-itd"),
-        ("/usr/bin/podman run -dt --read-only --timeout 1800 img", "-dt"),
-        # ``=true`` — та же истина, записанная явно.
-        ("/usr/bin/podman run --rm -i --detach=true --timeout 1800 img", "--detach"),
-        # Повтор судится по ПОСЛЕДНЕМУ вхождению, как всё в этом модуле.
-        ("/usr/bin/podman run --rm -i --detach=false -d --timeout 1800 img", "-d"),
-    ):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", detached)
-        reasons = local_reviewer.detaching_sandbox()
-        assert reasons, (
-            f"«{detached}» запускает контейнер отсоединённым: хаб закроет "
-            "прогон, увидев мгновенно завершившегося клиента podman, а "
-            "ревьюер внутри продолжит работать и пришлёт отчёт по закрытому "
-            "прогону"
-        )
-        assert any(f"«{token}»" in r for r in reasons), (
-            f"отказ обязан НАЗВАТЬ флаг отсоединения «{token}» так, как он "
-            f"написан в строке, а не срок: {reasons}"
-        )
+    снести его каталог, а ревьюер внутри контейнера продолжает работать и
+    способен прислать отчёт по уже закрытому прогону.
 
-    # Обратная сторона: явно выключенное отсоединение — рабочая строка, и
-    # ложного отказа на ней быть не должно, иначе починка одного оплачена
-    # поломкой другого.
-    for foreground in (
+    ПОВОРОТ 10.09.2026. Прежде тест держал две половины: отсоединённые строки
+    отвергнуть, «передний план» (``--detach=false``, ``-d=false``, ``-it``)
+    принять — иначе починка была бы оплачена ложным отказом. Теперь
+    отвергаются ОБЕ половины, потому что отвергается движок целиком, и
+    ложного отказа тут нет: строка не «плоха», она вне набора, и починка
+    названа — тот же podman внутри враппера. Важное осталось: отказ НЕ
+    ВЫДУМЫВАЕТ отсоединения там, где его нет. ``--detach=false`` — это
+    передний план, и обвинять строку в ``-d`` было бы ложью о ней.
+    """
+    detached = [
+        "/usr/bin/podman run -d --timeout 1800 img",
+        "/usr/bin/podman run --detach --timeout=1800 img",
+        "/usr/bin/podman run --rm -i -d --timeout 1800 img",
+        "/usr/bin/podman run -itd --timeout 1800 img",
+        "/usr/bin/podman run -dt --read-only --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --detach=true --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --detach=false -d --timeout 1800 img",
+    ]
+    foreground = [
         "/usr/bin/podman run --rm -i --timeout 1800 img",
         "/usr/bin/podman run --rm -it --timeout 1800 img",
         "/usr/bin/podman run --rm -i --detach=false --timeout 1800 img",
         "/usr/bin/podman run --rm -i -d=false --timeout 1800 img",
         "/usr/bin/podman run --rm -i -d --detach=false --timeout 1800 img",
-        # ``-d`` ПОСЛЕ образа — флаг программы внутри контейнера, а не podman.
         "/usr/bin/podman run --rm -i --timeout 1800 img agent -d",
-    ):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", foreground)
-        assert local_reviewer.detaching_sandbox() == [], (
-            f"«{foreground}» идёт на переднем плане и отвергаться не должна: "
-            f"{local_reviewer.detaching_sandbox()}"
+    ]
+    for sandbox in detached + foreground:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem(), (
+            f"«{sandbox}» — контейнерный запуск, и в набор форм он не входит"
+        )
+
+    for sandbox in foreground:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert not any("отсоедин" in r and "«-d»" in r for r in reasons), (
+            f"«{sandbox}» идёт на переднем плане, и обвинять её в -d значит "
+            f"назвать оператору причину, которой в строке нет: {reasons}"
         )
 
 
 def test_a_container_deadline_may_not_outlive_the_hubs(monkeypatch) -> None:
-    """Срок контейнера БОЛЬШЕ хабского сроком жизни не является.
+    """Срок контейнера в песочнице не судится вовсе — контейнера там нет.
 
-    Найдено ревьюером Codex 10.09.2026, воспроизведено на 5b7b813::
+    Найдено ревьюером Codex 10.09.2026, воспроизведено на 5b7b813:
+    ``podman run --rm -i --timeout 3600 img`` при хабских 1800 проходило
+    молча, хотя контейнер переживает снятие прогона ровно так же, как без
+    ``--timeout`` вовсе, — только тише.
 
-        podman run --rm -i --timeout 3600 img   -> []   # при хабских 1800
-
-    Смысл собственного срока один — чтобы контейнер умер, когда хаб счёл
-    прогон зависшим и убил клиента. Срок вдвое длиннее хабского этого не
-    даёт: контейнер переживёт снятие прогона так же, как без ``--timeout``
-    вовсе, только тише — и пришлёт отчёт по закрытому прогону.
-
-    Это была не только дыра в страже, но и РАСХОЖДЕНИЕ С ДОКУМЕНТОМ:
-    deploy/LOCAL-REVIEW.md советовал держать ``--timeout`` «не меньше»
-    хабского, то есть учил ровно тому, что страж обязан отвергать. Согласие
-    текста с кодом держат тесты документа
-    (test_the_doc_table_of_refusals_is_what_the_guard_actually_refuses и
-    test_the_doc_wrapper_skeleton_names_its_own_deadline), а этот тест держит
-    само правило.
+    ПОВОРОТ 10.09.2026. Правило «не больше хабского» держалось на разборе
+    чужой командной строки и на сравнении с числом, по которому прогон
+    снимут. Обе опоры ушли вместе с контейнерами: приговор этому классу
+    строк теперь ОДИН и от ``LOCAL_REVIEW_TIMEOUT_SEC`` не зависит вовсе.
+    Это и проверяется — иначе поворот был бы заявлен, а не измерен. Сам срок
+    жизни контейнера никуда не делся: он стоит во враппере, равен хабскому и
+    держится тестами документа (test_the_doc_wrapper_deadline_follows_the_conf_file).
     """
-    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", 1800)
-    for overlong in (
-        "/usr/bin/podman run --rm -i --timeout 3600 img",
-        "/usr/bin/podman run --rm -i --timeout=1801 img",
-        # Действует ПОСЛЕДНЕЕ вхождение: годный срок левее ничего не спасает.
-        "/usr/bin/podman run --rm -i --timeout 1800 --timeout 7200 img",
-    ):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", overlong)
-        reasons = local_reviewer.detaching_sandbox()
-        assert reasons, (
-            f"«{overlong}» даёт контейнеру пережить снятие прогона: хаб "
-            "убьёт клиента через 1800 с, до conmon это не дойдёт, и "
-            "контейнер доживёт свой срок уже после закрытия прогона"
-        )
-        assert any("1800" in r for r in reasons), (
-            "отказ обязан назвать хабский срок — иначе оператору не видно, "
-            f"чему равнять: {reasons}"
-        )
+    verdicts = set()
+    for deadline in (1800, 7200):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", deadline)
+        for sandbox in (
+            "/usr/bin/podman run --rm -i --timeout 3600 img",
+            "/usr/bin/podman run --rm -i --timeout=1801 img",
+            "/usr/bin/podman run --rm -i --timeout 1800 --timeout 7200 img",
+            "/usr/bin/podman run --rm -i --timeout 1800 img",
+            "/usr/bin/podman run --rm -i --timeout 60 img",
+            "/usr/bin/podman run --rm -i --timeout 7200 --timeout 900 img",
+            "/usr/bin/podman run --rm -i --timeout 7201 img",
+        ):
+            monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+            reasons = local_reviewer.sandbox_problem()
+            assert reasons, f"«{sandbox}» — контейнерный запуск, и он отвергнут"
+            verdicts.add((sandbox, tuple(reasons)))
 
-    # Не больше — значит РОВНО столько же тоже можно: именно равенство
-    # документ и рекомендует, и именно оно стоит в рабочем враппере на хосте
-    # хаба. Отвергнуть его значило бы сломать выкат ради починки.
-    for ok in (
-        "/usr/bin/podman run --rm -i --timeout 1800 img",
-        "/usr/bin/podman run --rm -i --timeout=1800 img",
-        # Более короткий срок дырой не является: контейнер умрёт сам, клиент
-        # podman вернётся, хаб закроет прогон по коду возврата.
-        "/usr/bin/podman run --rm -i --timeout 60 img",
-        "/usr/bin/podman run --rm -i --timeout 7200 --timeout 900 img",
-    ):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", ok)
-        assert local_reviewer.detaching_sandbox() == [], (
-            f"«{ok}» не переживает прогон и отвергаться не должна: "
-            f"{local_reviewer.detaching_sandbox()}"
-        )
-
-    # Потолок берётся у НАСТРОЙКИ, а не зашит числом: на другом хабском сроке
-    # граница обязана поехать вместе с ним. Иначе страж держал бы 1800 даже
-    # там, где хаб отмеряет прогону час.
-    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", 7200)
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/podman run --rm -i --timeout 3600 img"
-    )
-    assert local_reviewer.detaching_sandbox() == [], (
-        "при хабском сроке 7200 контейнерные 3600 прогона не переживают: "
-        f"{local_reviewer.detaching_sandbox()}"
-    )
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/podman run --rm -i --timeout 7201 img"
-    )
-    assert local_reviewer.detaching_sandbox(), (
-        "граница обязана двигаться вместе с LOCAL_REVIEW_TIMEOUT_SEC, а не "
-        "стоять на умолчании"
+    assert len({sandbox for sandbox, _ in verdicts}) == len(verdicts), (
+        "приговор одной и той же строке разошёлся на разном хабском сроке — "
+        "значит суждение всё ещё зависит от LOCAL_REVIEW_TIMEOUT_SEC, а "
+        "зависеть ему больше не от чего"
     )
 
 
 def test_the_run_guard_refuses_the_string_it_cannot_parse(monkeypatch) -> None:
-    """Неизвестный флаг СО ЗНАЧЕНИЕМ — отказ, а не молчаливое «срок есть».
+    """Строка, которую страж не может прочитать целиком, — отказ, а не «ок».
 
-    Объявленное ограничение задачи — «стражи узкие и по имени, чего не знают,
-    пропускают» — здесь НЕ оправдание: страж уже решил, что строку понял, и
-    вынес по ней суждение «свой срок жизни у контейнера есть». Разница между
-    «не смотрел» и «посмотрел и одобрил» — вся разница, ради которой страж
-    написан.
-
-    Воспроизведено на ff617db (найдено ревьюером Codex 10.09.2026):
+    Воспроизведено на ff617db (найдено ревьюером Codex 10.09.2026)::
 
         podman run --timeout 60 --blkio-weight 500 --timeout 0 img
         detaching_sandbox() -> []            # пропуск
-        podman run --timeout 0 img
-        detaching_sandbox() -> ОТКАЗ         # правильно
 
-    ``--blkio-weight`` не назван в _RUN_VALUE_FLAGS, поэтому ``500`` принято
-    за имя образа, разбор кончился, и ВТОРОЙ ``--timeout 0`` остался невиден.
-    У podman действующим будет последний, то есть ноль, то есть срока жизни
-    нет — а именно его отсутствие этот страж и обязан не пропустить.
+    ``--blkio-weight`` не был назван в списке флагов со значением, поэтому
+    ``500`` принято за имя образа, разбор кончился, и ВТОРОЙ ``--timeout 0``
+    остался невиден. У podman действующим будет последний, то есть ноль, то
+    есть срока жизни нет.
+
+    ПОВОРОТ 10.09.2026: списка флагов podman у хаба больше нет, и угадывать
+    нечего — движок не входит в набор форм. Правило, ради которого тест
+    написан, стало ШИРЕ: страж отвергает всё, что не прочитал целиком, а не
+    только то, о чём успел вынести суждение. Поэтому здесь же проверяются
+    строки, которые прежняя редакция ПРИНИМАЛА как «однозначные»
+    (``--blkio-weight=500``, ``-itq``): они тоже вне набора.
     """
-    ambiguous = [
-        # Ровно строка находки: первый --timeout годен, второй спрятан.
+    for sandbox in (
         "/usr/bin/podman run --timeout 60 --blkio-weight 500 --timeout 0 img",
-        # Тот же класс, где спрятан САМ срок: «допишите --timeout» было бы
-        # советом починить уже написанное, поэтому отказ говорит о разборе.
         "/usr/bin/podman run --blkio-weight 500 --timeout 1800 img",
-        # Неизвестный флаг вообще без --timeout — по-прежнему отказ, но
-        # причина честная: строку не разобрать.
         "/usr/bin/podman run --rm -i --blkio-weight 500 img",
-    ]
-    for sandbox in ambiguous:
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
-        reasons = local_reviewer.detaching_sandbox()
-        assert reasons, (
-            f"«{sandbox}» содержит флаг, о котором страж не знает, берёт ли "
-            "тот значение. Пустой список здесь означает «посмотрел и "
-            "одобрил» — то есть контейнер без срока жизни пройдёт молча"
-        )
-        assert any("--blkio-weight" in r for r in reasons), (
-            "отказ обязан НАЗВАТЬ флаг, сорвавший разбор, иначе оператор не "
-            f"поймёт, что чинить: {reasons}"
-        )
-
-    # Однозначная форма ``--flag=value`` от списков не зависит вовсе, и
-    # отказа на ней быть не должно — иначе починка оплачена ложным отказом
-    # на годной строке.
-    monkeypatch.setattr(
-        config,
-        "LOCAL_REVIEW_SANDBOX",
         "/usr/bin/podman run --rm -i --blkio-weight=500 --timeout=1800 img",
-    )
-    assert local_reviewer.detaching_sandbox() == [], (
-        "в форме --flag=value значение не может быть принято за образ, "
-        f"разбирать нечего: {local_reviewer.detaching_sandbox()}"
-    )
-
-    # Известные беззначные флаги — в том числе слипшийся пучок ``-it`` —
-    # ложного отказа не дают. Пучок ``-itd`` стоял здесь до 10.09.2026 и
-    # переехал в ОТКАЗЫ: буква ``d`` в нём — это ``--detach``, и разбору она
-    # по зубам, а прогону не по зубам (см.
-    # test_a_detached_container_launch_is_refused_by_flag).
-    for fine in (
-        "/usr/bin/podman run --rm -i --timeout 1800 img",
         "/usr/bin/podman run --rm -it --privileged --timeout 1800 img",
         "/usr/bin/podman run -itq --read-only --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout 1800 img cursor-agent --blkio-weight 5",
+        # Тот же класс в форме, которую набор ЗНАЕТ по инструменту: флаг, о
+        # котором форма не договаривалась, отвергается по имени.
+        "/usr/bin/systemd-run --scope --uid=r --blkio-weight=500 /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u r --blkio-weight=500 /usr/local/bin/wrap",
     ):
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", fine)
-        assert local_reviewer.detaching_sandbox() == [], (
-            f"«{fine}» состоит из названных флагов и своего срока жизни не "
-            f"теряет: {local_reviewer.detaching_sandbox()}"
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons, (
+            f"«{sandbox}» страж прочитать целиком не может. Пустой список "
+            "здесь означает «посмотрел и одобрил» — то есть контейнер без "
+            "срока жизни пройдёт молча"
         )
 
-    # И то, что стоит ПОСЛЕ образа, окном флагов запуска не является: команда
-    # полезной нагрузки со своим неизвестным флагом отказа не порождает.
+    # Флаг, которого форма не знает, назван в отказе ПО ИМЕНИ: иначе
+    # оператору не видно, что убирать.
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_SANDBOX",
-        "/usr/bin/podman run --rm -i --timeout 1800 img cursor-agent --blkio-weight 5",
+        "/usr/bin/systemd-run --scope --uid=r --blkio-weight=500 /usr/local/bin/wrap",
     )
-    assert local_reviewer.detaching_sandbox() == [], (
-        "флаги за образом принадлежат программе внутри контейнера: "
-        f"{local_reviewer.detaching_sandbox()}"
+    assert any("--blkio-weight" in r for r in local_reviewer.sandbox_problem()), (
+        "отказ обязан НАЗВАТЬ флаг, которого форма не знает: "
+        f"{local_reviewer.sandbox_problem()}"
     )
 
 
 def test_the_unknown_flag_refusal_advises_a_form_podman_has(monkeypatch) -> None:
-    """Отказ по неизвестному флагу советует форму, КОТОРАЯ СУЩЕСТВУЕТ.
+    """Отказ советует починку, КОТОРАЯ РАБОТАЕТ, — и это проверяется запуском.
 
-    Один шаблон на обе формы флага советовал невозможное. На длинном имени
-    ``--blkio-weight`` совет «напишите --blkio-weight=<значение>» верен, и
-    страж такую строку и вправду принимает. А на коротком токене тот же
-    шаблон давал ``-p80:80=<значение>`` — записи, которой у podman нет вовсе:
-    pflag разберёт ``-p80:80=x`` как значение ``80:80=x`` у ``-p``, и
-    оператор, сделавший ровно то, что сказано, получит тот же отказ.
+    Один шаблон на обе формы флага советовал невозможное: на коротком токене
+    он предлагал ``-p80:80=<значение>`` — записи, которой у podman нет вовсе
+    (pflag разберёт ``-p80:80=x`` как значение ``80:80=x`` у ``-p``), и
+    оператор, сделавший ровно то, что сказано, получал тот же отказ.
 
-    Замечено при работе над #1208 на строке из таблицы документа; отчёт
-    ревьюера #373 помечен НЕПОЛНЫМ и этого не называл.
+    ПОВОРОТ 10.09.2026: советовать форму записи флага podman хаб больше не
+    берётся — он не разбирает podman вовсе. Обещание осталось прежним и стало
+    проверяемым строже: КАЖДЫЙ отказ называет починку, и починка приводит к
+    строке, которую хаб принимает. Здесь это проверяется исполнением, а не
+    чтением: сделали, как сказано, — прогнали через стража.
     """
-    monkeypatch.setattr(
-        config,
-        "LOCAL_REVIEW_SANDBOX",
-        "/usr/bin/podman run --rm --blkio-weight 500 --timeout 1800 img",
-    )
-    long_reasons = local_reviewer.detaching_sandbox()
-    assert any("--blkio-weight=<значение>" in r for r in long_reasons), (
-        f"у длинного имени форма «--флаг=значение» и есть починка: {long_reasons}"
-    )
-    # И она РАБОТАЕТ: совет проверяется исполнением, а не чтением.
-    monkeypatch.setattr(
-        config,
-        "LOCAL_REVIEW_SANDBOX",
-        "/usr/bin/podman run --rm --blkio-weight=500 --timeout 1800 img",
-    )
-    assert local_reviewer.detaching_sandbox() == [], (
-        "страж советует форму, которую сам же отвергает: "
-        f"{local_reviewer.detaching_sandbox()}"
-    )
-
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_SANDBOX",
         "/usr/bin/podman run --rm -p80:80 --timeout 1800 img",
     )
-    short_reasons = local_reviewer.detaching_sandbox()
-    assert short_reasons, "неизвестный короткий флаг обязан давать отказ"
-    assert not any("-p80:80=<значение>" in r for r in short_reasons), (
+    reasons = local_reviewer.sandbox_problem()
+    assert reasons, "неизвестный короткий флаг обязан давать отказ"
+    assert not any("-p80:80=<значение>" in r for r in reasons), (
         "отказ советует дописать «=<значение>» к целому короткому токену — "
-        f"записи, которой у podman нет: {short_reasons}"
+        f"записи, которой у podman нет: {reasons}"
     )
-    assert any("--флаг=значение" in r for r in short_reasons), (
-        "короткому флагу починка — его ДЛИННОЕ имя; отказ обязан её назвать, "
-        f"иначе оператору нечего делать: {short_reasons}"
+    assert all("sudo -n -u" in r for r in reasons), (
+        f"отказ обязан назвать форму, к которой оператору идти: {reasons}"
+    )
+
+    # Починка, названная в отказе, ИСПОЛНЯЕТСЯ и приводит к принятой строке.
+    fixed = "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run"
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", fixed)
+    assert local_reviewer.sandbox_problem() == [], (
+        f"страж советует форму, которую сам же отвергает: "
+        f"{local_reviewer.sandbox_problem()}"
+    )
+
+    # То же обещание на слипшемся токене: сказано «напишите отдельными
+    # токенами» — делаем так и получаем принятую строку.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/sudo -nu r /usr/local/bin/wrap"
+    )
+    bundled = local_reviewer.sandbox_problem()
+    assert bundled and all("отдельным токеном" in r for r in bundled), (
+        f"отказ на слипшемся токене обязан назвать починку: {bundled}"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/sudo -n -u r /usr/local/bin/wrap"
+    )
+    assert local_reviewer.sandbox_problem() == [], (
+        f"починка, названная в отказе, не работает: {local_reviewer.sandbox_problem()}"
     )
 
 
@@ -5083,41 +5098,38 @@ def test_a_consumed_value_does_not_pass_for_the_scope_flag(monkeypatch) -> None:
         окно -> ['--description', '--scope', '--uid=haiplane-reviewer']
         detaching_sandbox() -> []            # пропуск
 
-    Окно было ПЛОСКИМ списком токенов, и проверка ``'--scope' not in own``
-    находила своё слово там, где стоит значение ``--description``. Настоящий
-    systemd-run возьмёт ``--scope`` описанием и поднимет transient SERVICE —
-    то есть ровно тот отсоединённый запуск, ради которого отказ и написан.
-    Ошибка шла В СТОРОНУ ПРОПУСКА.
+    Настоящий systemd-run возьмёт ``--scope`` описанием и поднимет transient
+    SERVICE, то есть ровно то, ради чего отказ и написан. Ошибка шла В
+    СТОРОНУ ПРОПУСКА.
 
     Возражение опровергателя («рекомендованный рецепт — sudo-враппер, а не
-    systemd-run») отклонено: страж существует не для рекомендованной строки,
-    а для той, которую напишет оператор, — рекомендованную проверять было бы
-    незачем. И systemd-run остаётся названной, поддержанной формой (#1180).
+    systemd-run») отклонено и здесь: страж существует не для рекомендованной
+    строки, а для той, которую напишет оператор, — рекомендованную проверять
+    было бы незачем. И systemd-run --scope остаётся формой набора.
     """
-    # Значение, СЛУЧАЙНО совпавшее со словом «--scope», отказа не снимает.
     for sandbox in (
         "/usr/bin/systemd-run --description --scope --uid=r /wrap",
         "/usr/bin/systemd-run --unit --scope --uid=r /wrap",
         "/usr/bin/systemd-run --slice --scope -- /wrap",
     ):
         monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
-        assert local_reviewer.detaching_sandbox(), (
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons and all("--scope" in r for r in reasons), (
             f"в «{sandbox}» слово «--scope» стоит ЗНАЧЕНИЕМ соседнего флага, "
             "а не флагом. systemd-run поднимет transient service, который "
-            "переживёт снятие прогона, — и хаб пропустил его молча"
+            f"переживёт снятие прогона: {reasons}"
         )
 
     # А рабочие формы, где --scope настоящий, приниматься не перестали:
     # починка не оплачена ложным отказом (возражение опровергателя учтено).
     for fine in (
-        "/usr/bin/systemd-run --description=review --scope --uid=r /wrap",
-        "/usr/bin/systemd-run --scope --description review --uid=r /wrap",
-        "/usr/bin/systemd-run --scope --uid=r -- /wrap",
+        "/usr/bin/systemd-run --description=review --scope --uid=r /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --description review --uid=r /usr/local/bin/wrap",
     ):
         monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", fine)
-        assert local_reviewer.detaching_sandbox() == [], (
+        assert local_reviewer.sandbox_problem() == [], (
             f"«{fine}» называет --scope собственным флагом systemd-run: "
-            f"{local_reviewer.detaching_sandbox()}"
+            f"{local_reviewer.sandbox_problem()}"
         )
 
     # Та же поправка на пользователе: имя берётся у флага, а не у соседа.
@@ -5131,7 +5143,7 @@ def test_a_consumed_value_does_not_pass_for_the_scope_flag(monkeypatch) -> None:
 
 
 def test_the_run_options_end_at_the_double_dash(monkeypatch) -> None:
-    """``--`` кончает опции самого ``run``: за ним ОБРАЗ, а не флаги.
+    """``--`` в песочнице не принимается — ни у движка, ни у формы набора.
 
     Неразрешённая a58d77e268b2d709 машинного ревью #371. Воспроизведено на
     ff617db и на HEAD 149cd825::
@@ -5142,39 +5154,38 @@ def test_the_run_options_end_at_the_double_dash(monkeypatch) -> None:
 
     Для podman образ здесь — ``--timeout``, а ``1800`` и ``img`` уже команда
     внутри контейнера: собственного срока жизни у запуска НЕТ. Страж же
-    находил ``--timeout 1800`` и засчитывал срок, то есть ошибался В СТОРОНУ
-    ПРОПУСКА — ровно тот класс, что AC-3 обязан ловить.
+    находил ``--timeout 1800`` и засчитывал срок, ошибаясь В СТОРОНУ
+    ПРОПУСКА. Хуже того, прошлый круг числил ``--`` среди беззначных флагов,
+    то есть отказ по неизвестному флагу на этой строке заведомо не срабатывал.
 
-    Хуже того, прошлый круг числил ``--`` СРЕДИ БЕЗЗНАЧНЫХ ФЛАГОВ, то есть
-    отказ по неизвестному флагу на этой строке заведомо не срабатывал:
-    починка одного дефекта прикрывала другой.
+    ПОВОРОТ 10.09.2026: терминатор не принимается ни в одной форме набора —
+    за флагами стоит ровно один аргумент, путь к обёртке, и отделять от него
+    нечего. Класс дефектов «что считается за ``--``» закрыт целиком, а не
+    разобран правильнее.
     """
     for sandbox in (
         "/usr/bin/podman run -- --timeout 1800 img",
         "/usr/bin/podman run --rm -i -- --timeout 1800 img",
         "/usr/bin/podman run -- --rm -i img",
+        "/usr/bin/podman run --rm -i --timeout 1800 -- img",
     ):
         monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
-        assert local_reviewer.detaching_sandbox(), (
+        assert local_reviewer.sandbox_problem(), (
             f"в «{sandbox}» всё, что стоит за «--», — это образ и команда "
             "внутри контейнера. Своего срока жизни у запуска нет, и "
             "контейнер переживёт снятие прогона"
         )
-        flags = local_reviewer._container_run_flags(shlex.split(sandbox), "podman")
-        assert flags is not None and not any(
-            name == "--timeout" for name, _ in flags.flags
-        ), f"окно флагов run обязано кончиться на «--»: {flags}"
 
-    # ``--`` ДО образа, но со сроком слева — по-прежнему годная строка.
-    monkeypatch.setattr(
-        config,
-        "LOCAL_REVIEW_SANDBOX",
-        "/usr/bin/podman run --rm -i --timeout 1800 -- img",
-    )
-    assert local_reviewer.detaching_sandbox() == [], (
-        "срок назван ДО «--», и разбор обязан его увидеть: "
-        f"{local_reviewer.detaching_sandbox()}"
-    )
+    for sandbox in (
+        "/usr/bin/sudo -n -u haiplane-reviewer -- /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --uid=r -- /usr/local/bin/wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons and all("--»" in r for r in reasons), (
+            f"«{sandbox}» пишет терминатор там, где отделять нечего, и отказ "
+            f"обязан назвать именно его: {reasons}"
+        )
 
 
 def test_sudo_names_a_numeric_uid_with_a_hash(monkeypatch, tmp_path) -> None:
@@ -5202,11 +5213,20 @@ def test_sudo_names_a_numeric_uid_with_a_hash(monkeypatch, tmp_path) -> None:
     me = pwd.getpwuid(os.getuid())
     uid = me.pw_uid
 
+    # Слипшаяся запись той же решётки в набор форм не входит с 10.09.2026 —
+    # но вход не выброшен: он проверяется на ОТКАЗ, а не на разбор.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -nu#{uid} /usr/local/bin/wrap"
+    )
+    assert local_reviewer.sandbox_problem(), (
+        "слипшийся токен «-nu#N» набор форм не принимает: из одного токена не "
+        "видно, где кончается флаг и начинается значение"
+    )
+
     # Форма sudo с решёткой разрешается в НАСТОЯЩЕГО пользователя.
     for sandbox in (
         f"/usr/bin/sudo -n -u #{uid} /usr/local/bin/wrap",
         f"/usr/bin/sudo -n --user=#{uid} /usr/local/bin/wrap",
-        f"/usr/bin/sudo -nu#{uid} /usr/local/bin/wrap",
     ):
         monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
         tool, user = local_reviewer._named_sandbox_user()
@@ -5220,7 +5240,9 @@ def test_sudo_names_a_numeric_uid_with_a_hash(monkeypatch, tmp_path) -> None:
     # Различение сохранено: у systemd-run решётки нет, и придумывать её там
     # нельзя — а голое число он принимает как uid по-прежнему.
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/systemd-run --scope --uid=#{uid} --"
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/systemd-run --scope --uid=#{uid} /usr/local/bin/wrap",
     )
     tool, user = local_reviewer._named_sandbox_user()
     assert local_reviewer._resolve_user(user, tool) is None, (
@@ -5228,7 +5250,9 @@ def test_sudo_names_a_numeric_uid_with_a_hash(monkeypatch, tmp_path) -> None:
         "разрешить строку, на которой запуск упадёт уже внутри systemd-run"
     )
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/systemd-run --scope --uid={uid} --"
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/systemd-run --scope --uid={uid} /usr/local/bin/wrap",
     )
     tool, user = local_reviewer._named_sandbox_user()
     entry = local_reviewer._resolve_user(user, tool)
@@ -5305,7 +5329,9 @@ def test_sudo_names_a_numeric_uid_with_a_hash(monkeypatch, tmp_path) -> None:
     # А у systemd-run голое число uid-ом БЫТЬ ОБЯЗАНО — иначе доделка выше
     # сломала бы неразрешённую 534e16e4, ради которой числовая форма и заведена.
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/systemd-run --scope --uid={uid} --"
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/systemd-run --scope --uid={uid} /usr/local/bin/wrap",
     )
     tool, user = local_reviewer._named_sandbox_user()
     entry = local_reviewer._resolve_user(user, tool)
@@ -5549,6 +5575,100 @@ def test_the_doc_limits_probe_tells_failure_from_success(tmp_path) -> None:
     )
 
 
+def _doc_table(heading: str) -> list[list[str]]:
+    """Строки таблицы под НАЗВАННЫМ заголовком документа, ячейками.
+
+    Заголовок обязателен: таблиц в документе несколько, и брать «все строки,
+    начинающиеся с | `» значило бы судить таблицу принятых форм правилами
+    таблицы отказов. Пустая выборка — провал теста, а не зелёный прогон: она
+    была бы зелёной при любом содержании документа.
+    """
+    lines = _DEPLOY_DOC.read_text().splitlines()
+    start = next(
+        (i for i, line in enumerate(lines) if line.strip() == heading.strip()), -1
+    )
+    assert start >= 0, f"в {_DEPLOY_DOC.name} нет заголовка «{heading}»"
+    rows: list[list[str]] = []
+    for line in lines[start:]:
+        if line.startswith("## ") or line.startswith("### "):
+            if rows:
+                break
+            continue
+        if line.startswith("| `"):
+            rows.append([cell.strip() for cell in line.strip("|").split("|")])
+    assert rows, f"под «{heading}» не нашлось таблицы — проверка была бы пустой"
+    return rows
+
+
+def _backticked(cell: str) -> str:
+    assert cell.count("`") >= 2, f"в ячейке «{cell}» нет строки в обратных кавычках"
+    return cell.split("`")[1]
+
+
+def test_the_doc_names_the_closed_set_the_guard_accepts(monkeypatch) -> None:
+    """AC-5/AC-6: набор форм в документе — это набор форм В КОДЕ, сверено машиной.
+
+    Расхождение документа с кодом на этой задаче случалось ПЯТЬ раз и глазами
+    не поймалось ни разу: документ рекомендовал `systemd-run --uid=`, который
+    на проде не стартует; советовал `--timeout` «не меньше» хабского, тогда
+    как страж отвергает «больше»; обещал, что незнакомое пропускается, тогда
+    как незнакомый флаг давал отказ. Поэтому сверяется не глазами: имена форм,
+    строки целиком и ОБА списка флагов берутся из таблицы документа и
+    сравниваются с ``SANDBOX_SHAPES``, а каждая строка прогоняется через
+    самого стража.
+    """
+    rows = _doc_table("### Что хаб принимает")
+    shapes = {shape.name: shape for shape in local_reviewer.SANDBOX_SHAPES}
+    documented = {_backticked(row[0]) for row in rows}
+    assert documented == set(shapes), (
+        f"документ называет формы {sorted(documented)}, а код принимает "
+        f"{sorted(shapes)}. Форма, которой нет в одном из двух мест, — это "
+        "либо обещание без кода, либо код без обещания"
+    )
+
+    for row in rows:
+        shape = shapes[_backticked(row[0])]
+        example = _backticked(row[1])
+        assert example == shape.example, (
+            f"документ печатает для формы «{shape.name}» строку «{example}», а "
+            f"код держит «{shape.example}». Оператор скопирует первую"
+        )
+        required = {
+            flag.strip()
+            for cell in row[2].split(",")
+            for flag in cell.replace("`", " ").split("/")
+            if flag.strip().startswith("-")
+        }
+        assert required == {flag for group in shape.required for flag in group}, (
+            f"обязательные флаги формы «{shape.name}»: документ называет "
+            f"{sorted(required)}, код требует "
+            f"{sorted(flag for group in shape.required for flag in group)}"
+        )
+        optional = {
+            flag.strip()
+            for flag in row[3].replace("`", " ").split(",")
+            if flag.strip().startswith("-")
+        }
+        in_code = (shape.valueless | shape.valued) - {
+            flag for group in shape.required for flag in group
+        }
+        assert optional == in_code, (
+            f"необязательные флаги формы «{shape.name}»: документ называет "
+            f"{sorted(optional)}, код принимает {sorted(in_code)}. Флаг, "
+            "названный в документе и не принятый кодом, — это отказ на строке, "
+            "которую документ рекомендует"
+        )
+
+        # И то же самое ИСПОЛНЕНИЕМ: строка из документа прогоняется через
+        # стража и обязана подойти именно той форме, которой её назвали.
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", example)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"документ печатает «{example}» как форму «{shape.name}», а хаб её "
+            f"отвергает: {local_reviewer.sandbox_problem()}"
+        )
+        assert local_reviewer.sandbox_shape() == shape.name
+
+
 def test_the_doc_table_of_refusals_is_what_the_guard_actually_refuses(
     monkeypatch,
 ) -> None:
@@ -5559,30 +5679,43 @@ def test_the_doc_table_of_refusals_is_what_the_guard_actually_refuses(
     которого выросла задача. Строки берутся из таблицы, а не переписываются
     сюда.
 
-    Тот же тест держит и согласие ТЕКСТА с кодом по неразрешённой находке
-    ревьюера #373: прежняя редакция абзаца ниже таблицы обещала, что «всё
-    неизвестное проверка ПРОПУСКАЕТ», тогда как неизвестный флаг уже
-    опознанного ``podman run`` даёт ОТКАЗ — в том числе на строке с живым
-    сроком (``-p80:80 --timeout 1800``). Неверен был текст, и строка с этим
-    флагом стоит теперь в таблице отказов, где её судит код.
+    В таблице стоят НАСТОЯЩИЕ входы, на которых страж когда-то ошибался, —
+    включая те, что прежняя редакция документа обещала ПРИНИМАТЬ (`podman run
+    --timeout 1800`). Смена правила не выбросила ни одного из них: они
+    отвергаются тем более, и документ обязан говорить об этом ровно то же,
+    что делает код.
     """
-    rows = [
-        line
-        for line in _DEPLOY_DOC.read_text().splitlines()
-        if line.startswith("| `") and line.count("|") >= 3
-    ]
-    assert len(rows) >= 5, (
-        f"в {_DEPLOY_DOC.name} не нашлось таблицы отказов — проверка была бы "
-        f"пустой и зелёной при любом её содержании (найдено {len(rows)})"
+    refused = [_backticked(row[0]) for row in _doc_table("### Что хаб отвергает")]
+    assert len(refused) >= 10, (
+        f"таблица отказов слишком коротка ({len(refused)}): накопленные за "
+        "девять кругов входы обязаны стоять в документе, а не только в тестах"
     )
-    refused = [row.split("|")[1].strip().split("`")[1] for row in rows]
-    assert any("-p80:80" in s for s in refused), (
-        "строка с неизвестным флагом при ЖИВОМ сроке в таблице не названа, а "
-        "именно на ней текст документа расходился с кодом"
+    # Суждение о сроке зависело от хабского, и брать его из окружения значило
+    # бы судить документ по чужой переменной. Приговор от него больше не
+    # зависит, но число в документе и в примере окружения обязано быть одно —
+    # это и проверяет _documented_hub_deadline.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", _documented_hub_deadline())
+
+    for sandbox in refused:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons, (
+            f"документ обещает отказ на «{sandbox}», а хаб пропускает её "
+            "молча: обещание в тексте, которого нет в коде, — это тот же "
+            "выкат, ради которого писан весь документ"
+        )
+        assert local_reviewer.sandbox_uid() == "", (
+            f"на отвергнутой «{sandbox}» страж назвал пользователя "
+            f"«{local_reviewer.sandbox_uid()}»"
+        )
+
+    # Классы, за которыми документ обязан следить поимённо: контейнерный
+    # запуск (отказ называет недостающий --timeout), отсоединённый запуск и
+    # срок ДЛИННЕЕ хабского — все три страж когда-то пропускал молча.
+    assert any("podman" in s and "--timeout" in s for s in refused), (
+        "контейнерный запуск со сроком жизни в таблице не назван, а прежняя "
+        "редакция документа его РЕКОМЕНДОВАЛА"
     )
-    # Два класса, добавленные 10.09.2026: отсоединённый запуск и срок жизни
-    # ДЛИННЕЕ хабского. Оба страж пропускал молча, и оба обязаны стоять в
-    # таблице — иначе оператор прочитает про них только в коде.
     assert any("-d" in s or "--detach" in s for s in refused), (
         "отсоединённый запуск в таблице отказов не назван, а он проходил "
         "стража молча (воспроизведено на 5b7b813)"
@@ -5591,22 +5724,10 @@ def test_the_doc_table_of_refusals_is_what_the_guard_actually_refuses(
         "срок контейнера ДЛИННЕЕ хабского в таблице отказов не назван, а "
         "документ до 10.09.2026 такой срок прямо СОВЕТОВАЛ («не меньше»)"
     )
-    # Суждение о сроке зависит от хабского, и брать его из окружения значило
-    # бы судить документ по чужой переменной.
-    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", _documented_hub_deadline())
-
-    for sandbox in refused:
-        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
-        reasons = local_reviewer.detaching_sandbox()
-        assert reasons, (
-            f"документ обещает отказ на «{sandbox}», а хаб пропускает её "
-            "молча: обещание в тексте, которого нет в коде, — это тот же "
-            "выкат, ради которого писан весь документ"
-        )
-        if "-p80:80" in sandbox:
-            assert any("-p80:80" in r for r in reasons), (
-                f"отказ обязан назвать флаг, сорвавший разбор: {reasons}"
-            )
+    assert any("-p80:80" in s for s in refused), (
+        "строка с неизвестным флагом при ЖИВОМ сроке в таблице не названа, а "
+        "именно на ней текст документа расходился с кодом"
+    )
 
 
 def test_the_doc_recommends_only_sandboxes_the_hub_accepts(monkeypatch) -> None:
@@ -5631,9 +5752,9 @@ def test_the_doc_recommends_only_sandboxes_the_hub_accepts(monkeypatch) -> None:
 
     for sandbox in recommended:
         monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
-        assert local_reviewer.detaching_sandbox() == [], (
+        assert local_reviewer.sandbox_problem() == [], (
             f"документ рекомендует «{sandbox}», а хаб её отвергает: "
-            f"{local_reviewer.detaching_sandbox()}"
+            f"{local_reviewer.sandbox_problem()}"
         )
         assert local_reviewer.sandbox_uid(), (
             f"в рекомендованной строке «{sandbox}» страж не видит "
@@ -5751,6 +5872,72 @@ def test_the_doc_probe_runs_the_same_command_the_hub_will_run(monkeypatch) -> No
         )
 
 
+# Флаги ``podman run``, которые встречаются в СКЕЛЕТЕ ВРАППЕРА из документа.
+# Список живёт здесь, а не в хабе: с 10.09.2026 хаб строку podman не разбирает
+# вовсе — контейнерного запуска нет в закрытом наборе форм песочницы (#1208),
+# а внутрь враппера он не заглядывает по определению. Тесты документа читают
+# скелет сами, и незнакомый флаг для них — ПРОВАЛ разбора, о котором тест
+# кричит, а не угадывает: иначе проверка «--timeout доехал» была бы зелёной на
+# строке, которую тест не понял.
+_WRAPPER_VALUE_FLAGS = frozenset(
+    {
+        "--cpus",
+        "--env-file",
+        "-m",
+        "--memory",
+        "--name",
+        "--net",
+        "--network",
+        "--pids-limit",
+        "--timeout",
+        "--userns",
+        "-v",
+        "--volume",
+    }
+)
+_WRAPPER_VALUELESS_FLAGS = frozenset(
+    {"--init", "-i", "-it", "--read-only", "--replace", "--rm", "-t"}
+)
+
+
+def _wrapper_run_flags(parts: list[str]) -> list[tuple[str, str | None]]:
+    """Флаги самого ``podman run`` из скелета враппера — ДО образа.
+
+    Всё, что стоит после образа, — команда внутри контейнера, и её флаги к
+    запуску отношения не имеют.
+    """
+    assert "run" in parts, f"в строке запуска нет подкоманды run: {parts}"
+    i = parts.index("run")
+    assert parts[i - 1].rsplit("/", 1)[-1] in ("podman", "docker"), (
+        f"«run» стоит не за движком: {parts}"
+    )
+    flags: list[tuple[str, str | None]] = []
+    k = i + 1
+    while k < len(parts) and parts[k].startswith("-"):
+        name, sep, value = parts[k].partition("=")
+        if sep:
+            flags.append((name, value))
+            k += 1
+        elif name in _WRAPPER_VALUE_FLAGS:
+            flags.append((name, parts[k + 1] if k + 1 < len(parts) else None))
+            k += 2
+        else:
+            assert name in _WRAPPER_VALUELESS_FLAGS, (
+                f"скелет враппера содержит флаг «{name}», о котором этот тест "
+                f"не знает, берёт ли тот значение отдельным токеном: {parts}. "
+                "Разбор недостоверен, и судить по нему нельзя"
+            )
+            flags.append((name, None))
+            k += 1
+    return flags
+
+
+def _wrapper_flag(flags: list[tuple[str, str | None]], flag: str) -> str | None:
+    """ДЕЙСТВУЮЩЕЕ значение флага — последнее вхождение, как берёт его pflag."""
+    values = [value for name, value in flags if name == flag]
+    return values[-1] if values else None
+
+
 def _wrapper_conf(tmp_path, *, deadline: int | None) -> Path:
     """Каталог ``$CONF`` враппера: то, что оператор кладёт в /etc по шагу 3a.
 
@@ -5862,25 +6049,36 @@ def test_the_doc_wrapper_skeleton_names_its_own_deadline(monkeypatch, tmp_path) 
     b3a35600e66e971d). То есть флаг, ради которого писан страж, на
     рекомендованном пути не держался ничем.
 
-    Проверяется не глазами и не подстрокой: строка запуска берётся ИЗ ФАЙЛА,
-    ИСПОЛНЯЕТСЯ (переменные скелета подставляются оболочкой, а не читателем) и
-    прогоняется через САМОГО стража хаба — то же правило, что AC-4 применяет
-    к песочнице, применённое там, где на этом рецепте живёт срок жизни.
+    Проверяется не глазами и не подстрокой: строка запуска берётся ИЗ ФАЙЛА и
+    ИСПОЛНЯЕТСЯ (переменные скелета подставляются оболочкой, а не читателем).
+
+    ПОВОРОТ 10.09.2026. Прежде эту строку прогоняли через самого стража хаба.
+    Теперь так нельзя, и не потому, что стало хуже: контейнерный запуск в
+    закрытый набор форм песочницы не входит, и страж отверг бы ЛЮБУЮ строку
+    podman — в том числе верную. Судить скелет ему больше нечем и незачем: он
+    и на рекомендованном рецепте его не видел. Поэтому срок берётся из
+    исполненного скелета и сравнивается с ХАБСКИМ СРОКОМ ИЗ ДОКУМЕНТА — с тем
+    самым числом, которое оператор скопирует к себе.
     """
     launch = _doc_wrapper_launch(tmp_path)
-    # Хвост ``cursor-agent --print`` — команда ВНУТРИ контейнера; стражу она
-    # безразлична, и убирать её незачем: окно флагов запуска кончается на
-    # образе.
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", launch)
-    # Хабский срок берётся из документа, а не из окружения: с 10.09.2026
-    # страж отвергает контейнерный срок ДЛИННЕЕ хабского, и оставить хабский
-    # на волю чужой переменной значило бы судить скелет не по документу.
-    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", _documented_hub_deadline())
-    assert local_reviewer.detaching_sandbox() == [], (
-        f"скелет враппера из документа запускает «{launch}», и хаб отверг бы "
-        f"эту строку: {local_reviewer.detaching_sandbox()}. Внутри обёртки "
-        "страж её не увидит — а значит прогон нельзя будет снять, и хаб "
+    # Хвост ``cursor-agent --print`` — команда ВНУТРИ контейнера; флаги
+    # запуска кончаются на образе, и до хвоста разбор не доходит.
+    flags = _wrapper_run_flags(shlex.split(launch))
+    lifetime = _wrapper_flag(flags, "--timeout")
+    assert lifetime and lifetime.isdigit() and int(lifetime) > 0, (
+        f"скелет враппера из документа запускает «{launch}» без собственного "
+        "срока жизни. Контейнер переживёт снятие прогона — измерено "
+        "08.09.2026: kill -KILL по группе, через 7 с контейнер «Up», — а хаб "
         "напишет в ленту, что снял"
+    )
+    # Срок контейнера не может быть БОЛЬШЕ хабского: он истёк бы уже после
+    # того, как хаб закрыл прогон. Хабский берётся из документа, а не из
+    # окружения, иначе скелет судился бы чужой переменной.
+    hub_deadline = _documented_hub_deadline()
+    assert int(lifetime) <= hub_deadline, (
+        f"скелет даёт контейнеру {lifetime} с при хабских {hub_deadline}: "
+        "контейнер переживёт снятие прогона ровно так же, как без --timeout "
+        "вовсе, только тише"
     )
 
 
@@ -5904,11 +6102,8 @@ def test_the_doc_wrapper_deadline_follows_the_conf_file(monkeypatch, tmp_path) -
     # 1. Умолчание скелета (файла нет) — это ХАБСКОЕ умолчание, а не «просто
     #    число»: разойдись они, рецепт по умолчанию был бы уже сломан.
     launch = _doc_wrapper_launch(tmp_path, deadline=None)
-    flags = local_reviewer._container_run_flags(shlex.split(launch), "podman")
-    assert flags is not None and not flags.unknown, (
-        f"строка запуска скелета не разобралась: {launch}"
-    )
-    assert local_reviewer._flag_value(flags.flags, "--timeout") == str(hub_deadline), (
+    flags = _wrapper_run_flags(shlex.split(launch))
+    assert _wrapper_flag(flags, "--timeout") == str(hub_deadline), (
         f"без файла настроек скелет ставит контейнеру срок из «{launch}», а "
         f"хабское умолчание — {hub_deadline}. Умолчания обязаны совпадать: "
         "иначе рецепт ломается ещё до того, как оператор что-либо тронул"
@@ -5920,29 +6115,42 @@ def test_the_doc_wrapper_deadline_follows_the_conf_file(monkeypatch, tmp_path) -
     shortened = 600
     assert shortened != hub_deadline, "проверка беспредметна на равных числах"
     launch = _doc_wrapper_launch(tmp_path, deadline=shortened)
-    flags = local_reviewer._container_run_flags(shlex.split(launch), "podman")
-    assert local_reviewer._flag_value(flags.flags, "--timeout") == str(shortened), (
+    flags = _wrapper_run_flags(shlex.split(launch))
+    assert _wrapper_flag(flags, "--timeout") == str(shortened), (
         f"скелет не взял срок из $CONF/timeout: движку ушло «{launch}». "
         "Значит число в скелете зашито, и согласовать его с настройкой хаба "
         "оператору нечем"
     )
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", launch)
+    # ПОВОРОТ 10.09.2026: прежде здесь стояла третья проверка — что строку
+    # запуска враппера принимает сам страж хаба. Она потеряла предмет:
+    # контейнерный запуск в закрытый набор форм песочницы не входит, и хаб
+    # эту строку не увидит вовсе — ему видна только форма sudo, а podman
+    # лежит внутри скрипта. Согласие двух чисел от этого не ослабло: оно и
+    # есть то, что проверено выше, — и проверено ИСПОЛНЕНИЕМ скелета.
     monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", shortened)
-    assert local_reviewer.detaching_sandbox() == [], (
-        f"согласованная пара (хаб {shortened}, контейнер {shortened}) обязана "
-        f"проходить: {local_reviewer.detaching_sandbox()}"
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run",
+    )
+    assert local_reviewer.sandbox_problem() == [], (
+        "хаб видит не строку podman, а форму sudo, и она обязана проходить "
+        f"при любом сроке: {local_reviewer.sandbox_problem()}"
     )
 
-    # 3. И РАСХОЖДЕНИЕ — это дыра, а не мелочь: тот же укороченный хаб против
-    #    прежнего зашитого 1800. Страж назвал бы её, если бы видел строку, —
-    #    но на рекомендованном рецепте не видит, поэтому файл из шага 3a и
-    #    есть единственное место, где она закрывается.
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", _doc_wrapper_launch(tmp_path, deadline=None)
+    # 3. И РАСХОЖДЕНИЕ — это дыра, а не мелочь: не тронув файл, оператор
+    #    получит на укороченном хабе контейнер с прежним умолчанием. Страж
+    #    этого не увидит НИКОГДА — ни прежде, ни теперь: на рекомендованном
+    #    рецепте podman лежит внутри скрипта. Поэтому файл из шага 3a и есть
+    #    единственное место, где расхождение закрывается, и здесь измеряется
+    #    именно оно.
+    stale = _wrapper_flag(
+        _wrapper_run_flags(shlex.split(_doc_wrapper_launch(tmp_path))), "--timeout"
     )
-    assert local_reviewer.detaching_sandbox(), (
-        f"контейнерные {hub_deadline} при хабских {shortened} переживают "
-        "прогон — если страж молчит и здесь, то расхождение не ловится нигде"
+    assert stale == str(hub_deadline) and int(stale) > shortened, (
+        f"без файла скелет даёт контейнеру {stale} с — и на хабских "
+        f"{shortened} это переживший прогон контейнер. Если бы умолчание "
+        "скелета следовало за настройкой само, шаг 3a был бы не нужен вовсе"
     )
 
 
@@ -5986,16 +6194,13 @@ def test_the_doc_wrapper_cleans_up_only_its_own_container(tmp_path) -> None:
     # он именем. Без имени ``--replace`` бессмыслен, а без ``--replace``
     # хвост пережил бы запуск и занял бы имя.
     launch = _doc_wrapper_launch(tmp_path, deadline=None)
-    flags = local_reviewer._container_run_flags(shlex.split(launch), "podman")
-    assert flags is not None and not flags.unknown, (
-        f"строка запуска скелета не разобралась: {launch}"
-    )
-    name = local_reviewer._flag_value(flags.flags, "--name")
+    flags = _wrapper_run_flags(shlex.split(launch))
+    name = _wrapper_flag(flags, "--name")
     assert isinstance(name, str) and name, (
         f"скелет не даёт контейнеру имени: {launch}. Тогда адресной уборки "
         "нет вовсе, и вернуться к «rm -af» — вопрос одного коммита"
     )
-    assert any(flag == "--replace" for flag, _ in flags.flags), (
+    assert any(flag == "--replace" for flag, _ in flags), (
         f"имя «{name}» есть, а --replace нет: {launch}. Хвост прошлого "
         "прогона займёт имя, и запуск упадёт «name already in use»"
     )
@@ -6028,13 +6233,8 @@ def test_the_doc_wrapper_leaves_the_network_the_hub_hands_the_run(tmp_path) -> N
 
     launch = shlex.split(_doc_wrapper_launch(tmp_path))
     # Всё, что стоит ДО образа, — флаги запуска; сеть настраивается только там.
-    flags = local_reviewer._container_run_flags(launch, "podman")
-    assert flags is not None, f"строка запуска не разобралась как podman run: {launch}"
-    assert not flags.unknown, (
-        f"скелет враппера содержит флаг «{flags.unknown}», который страж хаба "
-        "разобрать не может — а значит и о сети по нему судить нельзя"
-    )
-    for name, value in flags.flags:
+    flags = _wrapper_run_flags(launch)
+    for name, value in flags:
         assert name not in ("--network", "--net"), (
             f"скелет враппера из документа задаёт «{name} {value}». Сеть "
             "контейнеру нужна В ДВЕ стороны: к поставщику (agentский CLI "
