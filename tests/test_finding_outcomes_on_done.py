@@ -387,6 +387,160 @@ async def test_the_pending_report_route_names_them_even_when_it_completes(
     )
 
 
+async def _a_subtask_sent_back_with_a_finding(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    findings: tuple[str, ...] = ("утечка курсора",),
+) -> tuple[int, int, str]:
+    """Сабтаск, вернувшийся с подтверждённой находкой, — без opt-out руками.
+
+    Ревью назвало достижимость этого пути НЕсогласованной: путь в коде есть,
+    но «а как туда попасть без искусственного ``auto_review=False``?».
+    Отсюда и сабтаск, а не ``update_task(auto_review=0)``: ноль ставит сам
+    продукт — ``create_subtasks_bulk`` в ``hub/services/lifecycle.py``
+    принудительно гасит ``auto_review`` для ``task_type=subtask``. Запрета на
+    ``pair-start``/``submit-review`` у сабтаска нет, и весь путь пройден
+    настоящим транспортом (REST), а не вызовами функций.
+    """
+    parent = (await client.post("/api/tasks", json={"title": "Родитель"})).json()["id"]
+    resp = await client.post(
+        f"/api/tasks/{parent}/subtasks",
+        json={
+            "task_type": "subtask",
+            "source": "human",
+            "items": [{"title": "Сабтаск с находкой"}],
+        },
+    )
+    assert resp.status_code in (200, 201), resp.text
+    task_id = int(resp.json()[0]["id"])
+    assert dict(await repo.get_task(db, task_id))["auto_review"] == 0, (
+        "продукт больше НЕ гасит auto_review у сабтаска — тогда этот тест "
+        "проверяет выдуманную конфигурацию, а не достижимый путь"
+    )
+
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: работать"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        harness_skill="lite-diff-review",
+        raw_count=len(findings),
+        findings_confirmed=json.dumps(
+            [_finding(t) for t in findings], ensure_ascii=False
+        ),
+        unresolved=json.dumps([], ensure_ascii=False),
+        incomplete=False,
+    )
+    await db.commit()
+    review_id = int(dict(await repo.get_latest_machine_review(db, task_id))["id"])
+    await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "reviewer",
+            "comments": "чините",
+            "findings": [{"id": 1, "severity": "high", "message": "см отчёт"}],
+        },
+    )
+    uid = (await finding_outcome.open_findings(db, task_id, 1))[0]["finding_uid"]
+    return task_id, review_id, uid
+
+
+async def test_the_pair_done_route_names_unanswered_findings_when_it_completes(
+    db: aiosqlite.Connection, client: AsyncClient, monkeypatch, quiet_git_ops
+):
+    """Последний маршрут, до которого конвейер гейтов не доезжает (#1155).
+
+    ``transition_after_agent_done`` при ``auto_review=false`` уходит в
+    ``_complete_without_review`` ВЫШЕ вызова гейтов сдачи: шаг исходов на
+    этой ветке не работал никогда. Воспроизведено зондом до починки — путь
+    open → pair-start → submit-review → CHANGES_REQUESTED с подтверждённой
+    находкой → done уносил задачу в ``completed``, и в ленте не было ни
+    слова про находку.
+
+    Хуже, чем на ``pending_report``: там задача остаётся жива и вопрос ещё
+    можно задать, здесь он закрывается вместе с задачей. Потолок тот же —
+    warn: назвать, но не отказать.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
+    task_id, review_id, _uid = await _a_subtask_sent_back_with_a_finding(client, db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "running", (
+        "путь обязан идти веткой pair-running, иначе тест повторяет соседа"
+    )
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "done", "content": "готово"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "completed", (
+        "тест обязан идти ИМЕННО веткой завершения без ревью"
+    )
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "утечка курсора" in feed, (
+        "задача закрыта, а незакрытая находка не названа ни разу — спросить "
+        "о ней после completed уже негде"
+    )
+    # Назвать находку — не значит ответить на неё и тем более не значит
+    # рассудить её: авторский отчёт об исходе НЕ диспозиция.
+    assert await repo.list_finding_outcomes(db, review_id) == [], (
+        "заметка сама записала исход — молчание автора стало ответом"
+    )
+    assert await repo.list_finding_dispositions(db, review_id) == [], (
+        "заметка стала суждением о находке (#876)"
+    )
+
+
+async def test_the_pair_done_route_names_only_what_is_left_unanswered(
+    db: aiosqlite.Connection, client: AsyncClient, monkeypatch, quiet_git_ops
+):
+    """И на этом маршруте названо то, на что ответа НЕТ, — а не всё подряд.
+
+    Исходы, приехавшие с отчётом, пишутся ДО развилки маршрутов, поэтому
+    заметка обязана вычесть уже отвеченное. Заметка, называющая закрытую
+    находку, была бы тем же шумом, что и молчание.
+    """
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "require")
+    task_id, review_id, first_uid = await _a_subtask_sent_back_with_a_finding(
+        client, db, findings=("утечка курсора", "вторая находка")
+    )
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={
+            "agent": "dev",
+            "kind": "done",
+            "content": "часть починил",
+            "finding_outcomes": [{"finding_uid": first_uid, "outcome": "fixed"}],
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert [
+        dict(r)["outcome"] for r in await repo.list_finding_outcomes(db, review_id)
+    ] == ["fixed"], (
+        "присланный исход не записан — тогда «названо только второе» ни о чём"
+    )
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "вторая находка" in feed, "остаток без ответа не назван"
+    assert "утечка курсора" not in feed, (
+        "названа находка, на которую автор ответил — заметка стала шумом"
+    )
+
+
 async def test_the_deprecated_alias_delivers_the_answer_through_its_published_door(
     quiet_git_ops,
 ):
