@@ -4328,6 +4328,27 @@ async def merge_sha_for_task(db: aiosqlite.Connection, task_id: int) -> str:
     return str(dict(rows[0])["merge_sha"]) if rows else ""
 
 
+async def tasks_released_with(db: aiosqlite.Connection, release_sha: str) -> list[int]:
+    """Задачи, чьи мержи этот релиз унёс в прод (#1236).
+
+    Спрашивается сразу после ``mark_merges_released``: это единственный момент,
+    когда ответ точен без гадания по истории — релиз несёт базовую ветку целиком
+    (#812), так что помеченные им строки и есть тот набор, чьё поведение теперь
+    можно наблюдать. Восстанавливать его позже по предкам нельзя: сквош режет
+    родословную, ровно ради чего штамп и заведён (#950).
+    """
+    sha = (release_sha or "").strip()
+    if not sha:
+        return []
+    rows = await fetchall(
+        db,
+        "SELECT DISTINCT task_id FROM pipeline_merges "
+        "WHERE released_sha = ? AND task_id IS NOT NULL ORDER BY task_id",
+        (sha,),
+    )
+    return [int(dict(row)["task_id"]) for row in rows]
+
+
 # --- Completed, but is the work actually delivered? (#897) ------------------
 
 

@@ -61,6 +61,12 @@ REFUSED_UNDECLARED_MODEL = "undeclared_model"
 REFUSED_RUN_FAILED = "run_failed"
 REFUSED_NOT_CONFIGURED = "not_configured"
 REFUSED_NO_IDENTITY_CHANNEL = "no_identity_channel"
+#: Ни одного судьи запустить не удалось: перебор дошёл до конца, и каждая
+#: попытка вернула «эта модель здесь недоступна» (#1237). Своё слово, а не
+#: run_failed: run_failed означает «провайдер моргнул, попробуем то же самое»,
+#: а здесь пробовать нечего — список кончился, и следующий тик потратит
+#: окно старта ровно так же. Разница видна только если её назвать.
+REFUSED_NO_LAUNCHABLE_JUDGE = "no_launchable_judge"
 
 EVENT_RUN_STARTED = "steward_run_started"
 EVENT_RUN_REFUSED = "steward_run_refused"
@@ -589,6 +595,102 @@ async def _refuse_transiently(
     log.info("steward run not started (retryable): %s — %s", code, detail)
 
 
+#: Метка в карточке, по которой запись «судьи нет» узнаётся повторно (#1237).
+#: Заказ по этому отказу остаётся ОТКРЫТЫМ, а тик приходит раз в полминуты:
+#: без метки карточка собрала бы полсотни одинаковых записей за окно старта,
+#: и названная причина утонула бы в собственном повторе.
+_NO_JUDGE_MARK = "[стюард: заказ #{run_id}]"
+
+
+def _provider_answer(denial: object) -> str:
+    """Что ответил провайдер, одной строкой — то, чего в отказе не хватало.
+
+    Ключей и токенов здесь нет по устройству: ``Refusal`` несёт статус, код
+    ошибки и обрезанный фрагмент ТЕЛА ОТВЕТА — то есть что провайдер сказал
+    про наш запрос, а не то, чем запрос был подписан.
+    """
+    if denial is None:
+        return "ответа не было"
+    status = int(getattr(denial, "status", 0) or 0)
+    code = str(getattr(denial, "code", "") or "").strip() or "без кода"
+    detail = str(getattr(denial, "detail", "") or "").strip()[:200]
+    answer = f"HTTP {status} {code}" if status else code
+    return f"{answer} ({detail})" if detail else answer
+
+
+def _no_judge_reason(
+    tried: list[str], denial: object, implementer: str, reviewer: str
+) -> tuple[str, str]:
+    """Почему прогон не начался: код и текст, называющие ИМЕНА и ОТВЕТ (#1237).
+
+    До сих пор оба исхода — «провайдер моргнул» и «ни одну модель списка эта
+    подписка не запускает» — уходили одной строкой «Cloud Agents API не принял
+    запрос». Ответ провайдера при этом уже был на руках: ``create_agent_attempt``
+    возвращает его вторым значением, и он просто не доходил до записи. Из-за
+    этого история хаба не могла ответить на вопрос, ради которого заведена
+    #1237, — какие имена подписка сегодня разрешает запускать.
+    """
+    answer = _provider_answer(denial)
+    names = ", ".join(tried) or "ни одной"
+    if is_capacity_refusal(denial):
+        return (
+            REFUSED_NO_LAUNCHABLE_JUDGE,
+            f"судью запустить не удалось ни одной моделью: пробовали {names}; "
+            f"последний ответ провайдера — {answer}; годной замены в списке "
+            "не осталось (настройка STEWARD_MODEL_FALLBACKS; исполнитель "
+            f"{implementer or 'не объявлен'}, ревьюер "
+            f"{reviewer or 'не объявлен'} — гейт разнообразия закрывает "
+            "однофамильцев). Заказ остаётся открытым, но сам собой этот "
+            "отказ не пройдёт: список исчерпан",
+        )
+    return (
+        REFUSED_RUN_FAILED,
+        f"Cloud Agents API не принял запрос (пробовали {names}; ответ — "
+        f"{answer}) — заказ остаётся открытым, следующий тик попробует снова",
+    )
+
+
+async def _name_the_missing_judge(
+    db: aiosqlite.Connection, task_id: int, run_id: int, detail: str
+) -> None:
+    """Сказать в КАРТОЧКЕ, что судьи не нашлось, — ровно один раз за заказ.
+
+    Событие видит надзор, карточку видит человек, которому эту сдачу
+    доводить; молчаливый слот выглядит для него как «стюард ещё думает».
+    """
+    mark = _NO_JUDGE_MARK.format(run_id=run_id)
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM task_updates WHERE task_id=? AND content LIKE ? LIMIT 1",
+        (task_id, f"%{mark}%"),
+    )
+    if rows:
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        f"Судья стюарда не выбран: {detail} {mark}",
+        author_kind="hub",
+    )
+
+
+async def _refuse_without_a_judge(
+    db: aiosqlite.Connection,
+    order: dict,
+    tried: list[str],
+    denial: object,
+    implementer: str,
+    reviewer: str,
+) -> None:
+    """Отказ, у которого есть имя, ответ провайдера и адресат (#1237)."""
+    code, detail = _no_judge_reason(tried, denial, implementer, reviewer)
+    if code == REFUSED_NO_LAUNCHABLE_JUDGE:
+        await _name_the_missing_judge(db, order["task_id"], order["id"], detail)
+    await _refuse_transiently(db, order, code, detail)
+
+
 async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     """Start one run for this order, or refuse it with a named reason.
 
@@ -744,13 +846,14 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
         # The provider did not take it. Release the claim rather than close
         # the order: a beta API blinking must not cost this submission its
         # only judgement.
-        await _refuse_transiently(
-            db,
-            order,
-            REFUSED_RUN_FAILED,
-            "Cloud Agents API не принял запрос — заказ остаётся открытым, "
-            "следующий тик попробует снова",
-        )
+        #
+        # Но НАЗВАТЬ причину обязательно (#1237): «список кончился, эта
+        # подписка не запускает ни одного судью» и «бета моргнула» ведут себя
+        # одинаково — заказ открыт, тик придёт снова, — и потому двенадцать
+        # недель выглядели одинаково: ни одного суждения и ни одной записи о
+        # том, почему. Ответ провайдера у нас на руках; молчал не он, молчали
+        # мы.
+        await _refuse_without_a_judge(db, order, tried, denial, implementer, reviewer)
         return False
     run_id = ((created or {}).get("run") or {}).get("id") or ""
     judge = tried[-1]
