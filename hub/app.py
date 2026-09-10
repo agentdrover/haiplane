@@ -25,7 +25,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from hub import brand, config, models, services
+from hub import brand, config, models, services, skill_publish
 from hub import db as db_module
 from hub import repository as repo
 from hub.db import get_db, log_activity, write_transaction
@@ -1144,24 +1144,56 @@ async def api_create_skill(
 
     db = _db(request)
     status_value = "active" if identity.is_human else "draft"
-    skill_id, version = await repo.create_skill_version(
-        db,
-        name=body.name,
-        kind=body.kind,
-        content=body.content,
-        tags=_json.dumps(body.tags, ensure_ascii=False),
-        project_id=body.project_id,
-        status=status_value,
-        created_by=identity.username,
-    )
-    if status_value == "active":
-        await repo.insert_event(
-            db,
-            kind="skill_activated",
-            actor=identity.username,
-            payload={"name": body.name, "version": version},
+    # Прочитать и записать — ОДНОЙ транзакцией, взятой сразу на запись (#1169,
+    # находка ревью, сдача 5). Здесь два чтения-перед-записью подряд: номер
+    # следующей версии (MAX(version) внутри create_skill_version) и прежняя
+    # активная версия, которая станет основанием сравнения. Без write-лока с
+    # начала блока оба читают снимок, устаревающий до вставки, и обе поломки
+    # наблюдались на двух одновременных публикациях одного скилла:
+    #
+    #   * второй INSERT прилетал UNIQUE constraint failed: skills.name,
+    #     skills.version — то есть 500, а публикация терялась целиком;
+    #   * записанное основание сравнения указывало на версию, которая к
+    #     моменту вставки уже не была активной, — и постоянное событие, и
+    #     показанный по нему диф говорили о чужой паре версий.
+    #
+    # Прежняя активная версия читается ДО вставки: новая версия становится
+    # активной сразу же и сама стала бы своим же основанием для сравнения.
+    # Путь 1 — человек и есть автор текста, поэтому предпоказа тут нет; нужна
+    # запись о том, что именно опубликовано.
+    async with write_transaction(db):
+        baseline = (
+            await repo.get_active_skill(db, body.name)
+            if status_value == "active"
+            else None
         )
-    await db.commit()
+        skill_id, version = await repo.create_skill_version(
+            db,
+            name=body.name,
+            kind=body.kind,
+            content=body.content,
+            tags=_json.dumps(body.tags, ensure_ascii=False),
+            project_id=body.project_id,
+            status=status_value,
+            created_by=identity.username,
+        )
+        if status_value == "active":
+            await repo.insert_event(
+                db,
+                kind="skill_activated",
+                actor=identity.username,
+                payload=skill_publish.publication_payload(
+                    name=body.name,
+                    version=version,
+                    content=body.content,
+                    previous_content=(
+                        None if baseline is None else str(baseline["content"])
+                    ),
+                    previous_version=(
+                        None if baseline is None else int(baseline["version"])
+                    ),
+                ),
+            )
     await db_module.log_activity(
         db,
         "skill_version_created",
@@ -1183,20 +1215,48 @@ async def api_activate_skill(
 ):
     """Activate a proposed skill version (human gate, #380)."""
     db = _db(request)
-    row = await repo.get_skill_version(db, name, version)
-    if row is None:
-        raise HTTPException(404, "skill version not found")
-    if row["status"] != "active":
-        await repo.activate_skill_version(
-            db, name, version, activated_by=_identity.username
-        )
-        await repo.insert_event(
-            db,
-            kind="skill_activated",
-            actor=_identity.username,
-            payload={"name": name, "version": version},
-        )
-        await db.commit()
+    activated = False
+    # Проверка «эта версия ещё не активна» — тоже чтение перед записью, и без
+    # общего write-лока две одновременные активации ОДНОЙ версии проходили бы
+    # её обе и писали два события об одной публикации. Поэтому под локом весь
+    # блок, а не только чтение основания.
+    async with write_transaction(db):
+        row = await repo.get_skill_version(db, name, version)
+        if row is None:
+            raise HTTPException(404, "skill version not found")
+        if row["status"] != "active":
+            activated = True
+            # Та же защита, что и на пути 1, и по той же причине: основание
+            # сравнения читается перед записью, а значит читать его надо уже
+            # под write-локом. Наблюдено на двух одновременных активациях
+            # разных драфтов одного скилла: обе записи называли основанием
+            # v1, хотя вторая активация шла уже поверх первой (#1169,
+            # находка ревью, сдача 5).
+            #
+            # Основание читается до того, как активной станет эта версия.
+            # Ветка идемпотентности не трогается — повторная активация уже
+            # активной версии по-прежнему не порождает второго события.
+            baseline = await repo.get_active_skill(db, name)
+            await repo.activate_skill_version(
+                db, name, version, activated_by=_identity.username
+            )
+            await repo.insert_event(
+                db,
+                kind="skill_activated",
+                actor=_identity.username,
+                payload=skill_publish.publication_payload(
+                    name=name,
+                    version=version,
+                    content=str(row["content"]),
+                    previous_content=(
+                        None if baseline is None else str(baseline["content"])
+                    ),
+                    previous_version=(
+                        None if baseline is None else int(baseline["version"])
+                    ),
+                ),
+            )
+    if activated:
         await db_module.log_activity(
             db,
             "skill_activated",

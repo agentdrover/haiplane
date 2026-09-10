@@ -981,6 +981,35 @@ async def get_skill_version(
     return rows[0] if rows else None
 
 
+async def latest_skill_activation(
+    db: aiosqlite.Connection, name: str, version: int
+) -> dict[str, Any] | None:
+    """Payload of the last ``skill_activated`` event for this exact version.
+
+    This is what makes paths 1 and 3 visible AFTER the fact (#1169). On path 1
+    the person is the author of the text, so a preview adds nothing — what was
+    missing is the record of what got published; on path 3 there is no person
+    at all. The page reads that record back rather than recomputing it, so what
+    a human sees is the thing that was actually written down, not a second
+    opinion computed later from rows that may since have moved.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind='skill_activated' "
+        "AND json_extract(payload, '$.name')=? "
+        "AND json_extract(payload, '$.version')=? "
+        "ORDER BY id DESC LIMIT 1",
+        (name, version),
+    )
+    if not rows:
+        return None
+    try:
+        payload = json.loads(str(rows[0]["payload"] or "{}"))
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 async def activate_skill_version(
     db: aiosqlite.Connection, name: str, version: int, *, activated_by: str
 ) -> None:
