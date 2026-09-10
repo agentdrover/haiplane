@@ -577,6 +577,25 @@ def test_a_scope_item_without_a_criterion_is_named():
     assert warnings[0].expected_score_delta == 0
 
 
+def _scope_and_criterion(scope_form: str, ac_form: str):
+    """One scope item and one criterion whose ONLY shared ground is the pair.
+
+    Both word-form tests below use it, so the pair itself is the only thing
+    that can decide the verdict: no other word of the item appears in the
+    criterion, and none of the frame words share an opening with the forms
+    under test.
+    """
+    item = f"Учёт {scope_form} без исключений"
+    row = _row(
+        "AC-1",
+        "постановка проекта",
+        "читается готовность",
+        f"назван {ac_form} и ничего кроме",
+        source="requirement",
+    )
+    return item, row
+
+
 # Word forms taken from LIVE Hub statements, not invented. Each pair is one
 # and the same word as authors actually wrote it in this backlog:
 #   сдаче / сдачи      — #1122, scope item and criterion of the same task
@@ -614,14 +633,7 @@ def test_a_scope_item_covered_in_another_word_form_is_not_named(scope_form, ac_f
     word of the scope item appears in the criterion, so the pair alone decides
     the verdict.
     """
-    item = f"Учёт {scope_form} без исключений"
-    covering = _row(
-        "AC-1",
-        "постановка проекта",
-        "читается готовность",
-        f"в ответе назван {ac_form}",
-        source="requirement",
-    )
+    item, covering = _scope_and_criterion(scope_form, ac_form)
     assert (
         build_scope_coverage_warnings(
             StatementInputs(scope_in=[item], ac_rows=[covering])
@@ -631,18 +643,57 @@ def test_a_scope_item_covered_in_another_word_form_is_not_named(scope_form, ac_f
 
     # Control: with a genuinely unrelated word the item IS still named. A
     # producer that had simply fallen silent would not pass this half.
-    unrelated = _row(
-        "AC-1",
-        "постановка проекта",
-        "читается готовность",
-        "в ответе назван реестр",
-        source="requirement",
-    )
+    _, unrelated = _scope_and_criterion(scope_form, "реестр")
     named = build_scope_coverage_warnings(
         StatementInputs(scope_in=[item], ac_rows=[unrelated])
     )
     assert len(named) == 1
     assert item in named[0].message
+
+
+# Pairs of DIFFERENT words that share their first four characters. The
+# opposite hazard to the list above: a matcher loose enough to survive
+# inflection must not be so loose that any two words with the same opening
+# count as one, or the check falls silent on a scope item nothing looks at —
+# which is the whole thing it exists to name.
+#
+# Provenance, honestly: the first five pairs are a scope word and a criterion
+# word of one and the same live task (#803 разбор/разбирает, #803 and #819
+# ответа/отвечает, #801 видимость/видит, #811 запрос/запрашивали, #812
+# факт/фактическое). The last two — задание/задача and словарь/слово — come
+# from the review of this task, which reproduced the miss on them.
+_DIFFERENT_WORDS = [
+    ("разбор", "разбирает"),
+    ("ответа", "отвечает"),
+    ("видимость", "видит"),
+    ("запрос", "запрашивали"),
+    ("факт", "фактическое"),
+    ("задание", "задача"),
+    ("словарь", "слово"),
+]
+
+
+@pytest.mark.parametrize(("scope_form", "ac_form"), _DIFFERENT_WORDS)
+def test_a_different_word_with_the_same_opening_does_not_cover_the_item(
+    scope_form, ac_form
+):
+    """Sharing four characters is not being the same word.
+
+    Both halves of the fixture are the same as in the inflection test above,
+    so the only thing that changes the verdict is the pair itself: there the
+    words are one word in two forms and the item is covered, here they are two
+    words and it is not.
+    """
+    item, row = _scope_and_criterion(scope_form, ac_form)
+    assert scope_form[:4] == ac_form[:4], "фикстура бессмысленна без общего начала"
+    named = build_scope_coverage_warnings(
+        StatementInputs(scope_in=[item], ac_rows=[row])
+    )
+    assert len(named) == 1, (
+        f"«{scope_form}» и «{ac_form}» — разные слова, пункт никем не покрыт"
+    )
+    assert item in named[0].message
+    assert named[0].expected_score_delta == 0
 
 
 def test_a_scope_item_with_nothing_to_match_on_is_left_alone():

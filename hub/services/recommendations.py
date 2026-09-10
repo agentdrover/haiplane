@@ -349,49 +349,131 @@ def build_expectation_source_warnings(inputs: StatementInputs) -> list[Recommend
     return out
 
 
-# Words too common to carry meaning when matching a scope_in item against the
-# acceptance criteria. Short tokens are dropped by length before this set is
-# consulted, so only longer filler needs listing.
-_SCOPE_STOPWORDS: frozenset[str] = frozenset(
-    {
-        "this",
-        "that",
-        "with",
-        "from",
-        "into",
-        "when",
-        "then",
-        "given",
-        "which",
-        "should",
-        "must",
-        "code",
-        # Russian filler, listed as PREFIX STEMS (see _significant_stems), so
-        # one entry covers every inflection of the word.
-        "тольк",
-        "должн",
-        "котор",
-        "также",
-        "чтобы",
-        "этого",
-        "этому",
-    }
+# A significant word is at least this long.
+_SCOPE_MIN_WORD_LEN = 4
+
+# Russian inflection has to be stripped, not guessed at by prefix length.
+#
+# The first cut of this matcher kept the first five characters of a word. In
+# short words the ending falls INSIDE that window, so «сдаче»/«сдачи» and
+# «зонда»/«зондом» — one word each, both pairs taken from live statements —
+# looked like different words and a covered scope item got named. The second
+# cut answered that by ALSO keeping the first four characters. Measured over
+# 435 live statements that window rescued 337 pairs of one word and glued
+# together 408 pairs of different words («задание»/«задача», «словарь»/«слово»,
+# «разбор»/«разбирает»): it bought silence in the wrong places.
+#
+# So the ending is removed as an ending. Endings that end in a consonant, or
+# run to two or more letters, must leave four characters behind; a lone vowel
+# or soft sign — the whole ending of most short nouns — may leave three. The
+# tables are deliberately small: this is a nudge worth zero points, not a
+# morphological analyser.
+_SCOPE_MIN_HARD_STEM = 4
+_SCOPE_MIN_SOFT_STEM = 3
+
+_SCOPE_REFLEXIVE_ENDINGS: tuple[str, ...] = ("ся", "сь")
+
+_SCOPE_HARD_ENDINGS: tuple[str, ...] = (
+    # adjective and participle
+    "ыми",
+    "ими",
+    "ого",
+    "его",
+    "ому",
+    "ему",
+    "ых",
+    "их",
+    "ый",
+    "ий",
+    "ой",
+    "ым",
+    "им",
+    "ом",
+    "ем",
+    "ей",
+    "ою",
+    "ею",
+    "ая",
+    "яя",
+    "ое",
+    "ее",
+    "ые",
+    "ие",
+    "ую",
+    "юю",
+    # verb
+    "ешься",
+    "ишься",
+    "аться",
+    "иться",
+    "ать",
+    "ять",
+    "еть",
+    "ить",
+    "ыть",
+    "уть",
+    "ешь",
+    "ишь",
+    "ете",
+    "ите",
+    "ают",
+    "яют",
+    "уют",
+    "ует",
+    "ют",
+    "ат",
+    "ят",
+    "ит",
+    "ет",
+    "ла",
+    "ло",
+    "ли",
+    "на",
+    "ны",
+    "но",
+    "л",
+    "н",
+    # noun
+    "иями",
+    "ями",
+    "ами",
+    "иях",
+    "ях",
+    "ах",
+    "ией",
+    "иям",
+    "ием",
+    "ов",
+    "ев",
+    "ья",
+    "ью",
+    "ию",
+    "ям",
+    "ам",
+    "ии",
+    "ье",
+    "ия",
 )
 
-# A significant word is at least this long; a stem is its first N characters.
-# Stemming by prefix is what makes the match survive Russian inflection
-# ("словарь" / "словаря" / "словарю" all stem to "слова"), which a plain
-# substring test would not.
-#
-# Five characters are not enough on their own: in short words the ending falls
-# INSIDE the window, and real statements in this backlog are full of such
-# pairs — «сдаче»/«сдачи», «гейтов»/«гейтам», «зонда»/«зондом»,
-# «пустого»/«пустым». So every word also yields a shorter LOOSE stem, and a
-# match on either counts. The stop-word list stays keyed on the long stem, so
-# widening the match does not widen what counts as filler.
-_SCOPE_MIN_WORD_LEN = 4
-_SCOPE_STEM_LEN = 5
-_SCOPE_LOOSE_STEM_LEN = 4
+_SCOPE_SOFT_ENDINGS: tuple[str, ...] = (
+    "а",
+    "е",
+    "и",
+    "о",
+    "у",
+    "ы",
+    "ь",
+    "ю",
+    "я",
+    "й",
+)
+
+_CYRILLIC = re.compile(r"[а-я]")
+
+# Latin words are left exactly as the first cut of this matcher left them —
+# their first five characters. Russian endings say nothing about them, and
+# this change deliberately does not touch behaviour it has no measurement for.
+_SCOPE_LATIN_STEM_LEN = 5
 
 
 def _fold(text: str) -> str:
@@ -405,18 +487,82 @@ def _fold(text: str) -> str:
     return (text or "").lower().replace("ё", "е")
 
 
+def _strip_ending(word: str, endings: tuple[str, ...], floor: int) -> str | None:
+    """Longest ending from ``endings`` removed, if ``floor`` characters remain."""
+    for ending in sorted(endings, key=len, reverse=True):
+        if word.endswith(ending) and len(word) - len(ending) >= floor:
+            return word[: -len(ending)]
+    return None
+
+
+def _stem(word: str) -> str:
+    """The word with one inflectional ending removed."""
+    if not _CYRILLIC.search(word):
+        return word[:_SCOPE_LATIN_STEM_LEN]
+    stem = _strip_ending(word, _SCOPE_REFLEXIVE_ENDINGS, _SCOPE_MIN_HARD_STEM) or word
+    cut = _strip_ending(stem, _SCOPE_HARD_ENDINGS, _SCOPE_MIN_HARD_STEM)
+    if cut is None:
+        cut = _strip_ending(stem, _SCOPE_SOFT_ENDINGS, _SCOPE_MIN_SOFT_STEM)
+    if cut is not None:
+        stem = cut
+    # «доставленная» and «доставлена» are one word; the doubled н of the long
+    # participle is the only thing left between their stems.
+    if stem.endswith("нн") and len(stem) > _SCOPE_MIN_SOFT_STEM:
+        stem = stem[:-1]
+    return stem
+
+
+# Words too common to carry meaning when matching a scope_in item against the
+# acceptance criteria. Short tokens are dropped by length before this set is
+# consulted, so only longer filler needs listing. They are written as WORDS
+# and stemmed here, so the list stays readable and cannot drift away from the
+# stemmer: a hand-written stem would silently stop matching the moment the
+# endings table changes.
+_SCOPE_STOPWORD_FORMS: frozenset[str] = frozenset(
+    {
+        "this",
+        "that",
+        "with",
+        "from",
+        "into",
+        "when",
+        "then",
+        "given",
+        "which",
+        "should",
+        "must",
+        "code",
+        "только",
+        "должно",
+        "должны",
+        "который",
+        "которая",
+        "которые",
+        "также",
+        "чтобы",
+        "этого",
+        "этому",
+        "этом",
+        "этот",
+    }
+)
+
+_SCOPE_STOPWORDS: frozenset[str] = frozenset(
+    _stem(_fold(w)) for w in _SCOPE_STOPWORD_FORMS
+)
+
+
 def _significant_stems(text: str) -> set[str]:
-    """Prefix-stems of the words in ``text`` that carry meaning."""
+    """Stems of the words in ``text`` that carry meaning."""
     words = re.split(r"[^0-9A-Za-zЀ-ӿ]+", _fold(text))
     stems = set()
     for w in words:
         if len(w) < _SCOPE_MIN_WORD_LEN:
             continue
-        stem = w[:_SCOPE_STEM_LEN]
+        stem = _stem(w)
         if stem in _SCOPE_STOPWORDS or w in _SCOPE_STOPWORDS:
             continue
         stems.add(stem)
-        stems.add(w[:_SCOPE_LOOSE_STEM_LEN])
     return stems
 
 
