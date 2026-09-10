@@ -4954,9 +4954,7 @@ async def test_two_reports_on_one_generation_do_not_double_count_a_finding(
     starve = _confirmed("тест не убивает мутацию", "test-adequacy", 60)
     await _generation_with_findings(db, task_id, 2, confirmed=[leak, hang])
     await _generation_with_findings(db, task_id, 2, confirmed=[leak, starve])
-    await _author_closed_them(
-        db, task_id, review_id, 1, confirmed=first, unresolved=[]
-    )
+    await _author_closed_them(db, task_id, review_id, 1, confirmed=first, unresolved=[])
 
     from hub.services.review_dispatch import review_circle
 
