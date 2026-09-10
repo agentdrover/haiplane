@@ -4527,6 +4527,7 @@ async def record_delivery_observation(
     probe: str,
     evidence: str,
     sha: str,
+    expect_state: str,
 ) -> dict[str, Any] | None:
     """Положить в строку то, что человек или агент проверил своими глазами (#1215).
 
@@ -4550,15 +4551,25 @@ async def record_delivery_observation(
       всё, что схема может, и она честно ловит только форму штампа. Оценивает
       запись читатель, которому она приписана поимённо.
 
-    ``observed_state`` пишется из ТЕКУЩЕГО состояния строки одним оператором,
-    как и у признания: наблюдение относится к факту, а не к задаче навсегда.
-    Заговорит провайдер — факт станет другим, наблюдения о нём не будет, и
-    строка вернётся в список сама.
+    ``observed_state`` пишется ИЗ ``expect_state`` — из того факта, который
+    вызывающий читал и о котором наблюдение сделано, — и тем же значением
+    сторожится строка: ``WHERE ... AND state = ?``. Не ``observed_state =
+    state``, и разница здесь не косметическая (находка 493a0ee9). SELECT
+    транзакции не открывает, а #1065 даёт запросу и опросчику РАЗНЫЕ
+    соединения: между чтением состояния и этой записью свип успевает
+    зафиксировать ``pr_open``. Без предиката запись села бы поверх нового
+    факта, ``observed_state`` совпал бы с ним — и строка, источник которой
+    ОТВЕЧАЕТ, молча вычлась бы из списка как «закрытая наблюдением», хотя
+    pr_open не наблюдал никто. Предикат превращает это в честный промах:
+    ``None`` вместо тихой лжи, и вызывающий говорит словами, что случилось.
+
+    Возврат ``None`` значит РОВНО «запись не легла»: строки нет или факт под
+    ней успел смениться. Различает эти два случая вызывающий — ему есть чем.
     """
     prior = await get_delivery_discrepancy(db, task_id)
     if prior is None:
         return None
-    await db.execute(
+    cur = await db.execute(
         """
         UPDATE delivery_discrepancies
            SET observed_at       = datetime('now'),
@@ -4566,11 +4577,22 @@ async def record_delivery_observation(
                observed_probe    = ?,
                observed_evidence = ?,
                observed_sha      = ?,
-               observed_state    = state
+               observed_state    = ?
          WHERE task_id = ?
+           AND state   = ?
         """,
-        ((by or "").strip(), probe.strip(), evidence.strip(), sha.strip(), task_id),
+        (
+            (by or "").strip(),
+            probe.strip(),
+            evidence.strip(),
+            sha.strip(),
+            expect_state,
+            task_id,
+            expect_state,
+        ),
     )
+    if (cur.rowcount or 0) == 0:
+        return None
     await db.commit()
     return prior
 

@@ -1219,3 +1219,139 @@ async def test_the_backfill_closes_rows_from_observations_already_written(
     assert closed["observed_sha"] == _SHA
     assert closed["observed_by"] == "pda_claude"
     assert closed["state"] == UNKNOWN
+
+
+# --- Находки ревью #352 -----------------------------------------------------
+
+
+async def test_a_sweep_that_speaks_mid_write_does_not_get_closed_by_it(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Находка 493a0ee9: наблюдение unknown не имеет права закрыть pr_open.
+
+    Служба читает состояние строки одним запросом, а пишет наблюдение другим,
+    и SELECT транзакции не открывает. Между ними законно вклинивается свип:
+    #1065 даёт запросу и опросчику РАЗНЫЕ соединения, поэтому провайдер может
+    заговорить и свип успевает зафиксировать ``pr_open`` до записи. Запись
+    ставила ``observed_state = state`` уже поверх нового факта — и строка,
+    источник которой отвечает, вычиталась из списка как «закрытая
+    наблюдением», хотя pr_open не наблюдал никто. Хуже, чем шумная строка:
+    список сам себя чистит от настоящего расхождения и не выздоравливает,
+    пока pr_open стабилен.
+
+    Окно воспроизводится в самой его точке — свип исполняется между чтением и
+    записью, — а не одновременным запуском: параллельный прогон дал бы
+    взаимную блокировку, а не наблюдаемый исход. Проверяется ИНВАРИАНТ:
+    закрытым может оказаться только тот факт, который наблюдали.
+    """
+    from hub import services
+
+    task_id = await _unanswerable_row(
+        client, db, title="Гонка со свипом", pr=443, monkeypatch=monkeypatch
+    )
+    real = repo.record_delivery_observation
+
+    async def _sweep_speaks_meanwhile(conn, tid, **kwargs):
+        # Ровно то, что делает опросчик: провайдер ожил и назвал PR открытым.
+        _pr_states(monkeypatch, {443: "open"})
+        await scan_completed_deliveries(conn)
+        return await real(conn, tid, **kwargs)
+
+    monkeypatch.setattr(
+        repo, "record_delivery_observation", _sweep_speaks_meanwhile, raising=True
+    )
+
+    with pytest.raises(services.ObservationRefused) as refused:
+        await services.record_delivery_observation(
+            db, task_id, by="pda_claude", probe=_PROBE, evidence=_SAW, sha=_SHA
+        )
+    assert "архив" not in str(refused.value).lower()
+
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert row["state"] == PR_OPEN, "свип должен был успеть сказать своё"
+    assert row["observed_state"] != row["state"], (
+        "наблюдали unknown — закрытым может быть только unknown; "
+        "иначе строка, у которой источник ОТВЕЧАЕТ, молча уходит из списка"
+    )
+
+    listed = await undelivered_completed_tasks(db)
+    assert [r["task_id"] for r in listed["undelivered"]] == [task_id], (
+        "строка с отвечающим источником обязана остаться расхождением"
+    )
+    assert listed["closed_by_observation"] == []
+
+
+async def test_the_backfill_holds_the_same_evidence_bar_as_the_live_door(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Находка 80fcb9c9: засыпка обещает «тот же порог» и не держит его.
+
+    Комментарий миграции говорит: берётся проверка, «прошедшая тот же порог
+    доказательства, что и прямая запись». SQL проверял только ``TRIM != ''``,
+    а ``_check_evidence`` требует двенадцати знаков в каждом поле и семи
+    шестнадцатеричных в коммите. Живая проверка вида «ок / норм / zzz» живой
+    дверью отвергается как штамп — и той же записью закрывала строку через
+    засыпку. Одноразовость миграции этого не лечит: закрытые ею строки живут
+    дальше, а расхождение между двумя порогами и есть та самая подмена
+    доказательства штампом, против которой написан AC-2.
+
+    Мутация по местам применения: ослабление ЛЮБОГО из трёх условий SQL
+    роняет ровно этот тест.
+    """
+    from hub import services
+    from hub.db import _MIGRATIONS
+
+    good = await _unanswerable_row(
+        client, db, title="Настоящее наблюдение", pr=443, monkeypatch=monkeypatch
+    )
+    # По строке на КАЖДОЕ условие порога, и каждая проваливает ровно одно:
+    # ослабление любого из трёх мест применения роняет этот тест поимённо.
+    thin_probe = await _unanswerable_row(
+        client, db, title="Короткий probe", pr=461, monkeypatch=monkeypatch
+    )
+    thin_seen = await _unanswerable_row(
+        client, db, title="Короткий observation", pr=468, monkeypatch=monkeypatch
+    )
+    bad_sha = await _unanswerable_row(
+        client, db, title="Коммит не коммит", pr=469, monkeypatch=monkeypatch
+    )
+    short_sha = await _unanswerable_row(
+        client, db, title="Коммит в три знака", pr=470, monkeypatch=monkeypatch
+    )
+    rows = (
+        (good, _PROBE, _SAW, _SHA),
+        (thin_probe, "ок", _SAW, _SHA),
+        (thin_seen, _PROBE, "норм", _SHA),
+        (bad_sha, _PROBE, _SAW, "не помню"),
+        # Шестнадцатеричный, но неоднозначный: длину проверяет ОТДЕЛЬНОЕ
+        # условие, и без этой строки его можно было бы снять незамеченным.
+        (short_sha, _PROBE, _SAW, "19e"),
+    )
+    for task_id, probe, seen, sha in rows:
+        await db.execute(
+            "INSERT INTO live_checks (task_id, sha, outcome, probe, observation, "
+            "recorded_agent) VALUES (?, ?, 'done', ?, ?, 'pda_claude')",
+            (task_id, sha, probe, seen),
+        )
+    await db.commit()
+
+    # Те же три записи, поданные в живую дверь, отвергаются — это и есть порог,
+    # который засыпка обязана держать, раз обещает его в своём комментарии.
+    for task_id, probe, seen, sha in rows[1:]:
+        with pytest.raises(services.ObservationRefused):
+            await services.record_delivery_observation(
+                db, task_id, by="pda_claude", probe=probe, evidence=seen, sha=sha
+            )
+
+    sql = dict(_MIGRATIONS)["backfill_delivery_observed_from_live_checks"]
+    await db.execute(sql)
+    await db.commit()
+
+    listed = await undelivered_completed_tasks(db)
+    assert [r["task_id"] for r in listed["closed_by_observation"]] == [good]
+    assert sorted(r["task_id"] for r in listed["unknown"]) == sorted(
+        [thin_probe, thin_seen, bad_sha, short_sha]
+    ), (
+        "штамп не закрывает строку ни прямой записью, ни засыпкой: "
+        "два порога у одного глагола — это два разных ответа"
+    )

@@ -82,6 +82,41 @@ CREATE TABLE IF NOT EXISTS activity_log (
 );
 """
 
+#: Минимальная длина каждого поля доказательства доставки (#1215). Порог, а не
+#: детектор лжи, и называть его иначе значит обещать больше, чем код делает. Он
+#: ловит форму штампа: «проверено» (9) и «всё хорошо» (10) не проходят ни
+#: порознь, ни россыпью по двум полям. Развёрнутое доказательство — «git show
+#: 19ee3f6 --stat» и «файл присутствует, AC-тест зелёный» — проходит без усилий.
+#:
+#: ЖИВЁТ ЗДЕСЬ, а не в службе, потому что порог применяют ДВА места: живая
+#: дверь (``delivery_state._check_evidence``) и SQL засыпки ниже в этом файле.
+#: Пока их было два и определений было два, они разошлись: засыпка проверяла
+#: лишь ``TRIM != ''`` и закрывала строку записью, которую живая дверь
+#: отвергала как штамп (находка 80fcb9c9). Одно определение — один ответ на
+#: вопрос «что считается доказательством».
+MIN_EVIDENCE_CHARS = 12
+
+#: Наблюдение обязано назвать коммит: утверждение «работа доставлена» — это
+#: утверждение о том, что код ГДЕ-ТО есть, и без места оно нефальсифицируемо.
+#: Семь знаков — короткий git-хеш, ниже этого хеш перестаёт быть однозначным.
+MIN_SHA_CHARS = 7
+
+#: Условие «это похоже на хеш» для SQL: длина плюс отсутствие НЕ-шестнадцати-
+#: ричного знака. GLOB здесь единственная форма, которой SQLite умеет сказать
+#: «во всей строке нет символа вне набора» — LIKE такого не умеет.
+_SQL_SHA_LOOKS_LIKE_A_COMMIT = (
+    f"LENGTH(TRIM(c.sha)) >= {MIN_SHA_CHARS} AND TRIM(c.sha) NOT GLOB '*[^0-9a-fA-F]*'"
+)
+
+#: Та же тройка требований, что у ``_check_evidence``, на языке засыпки.
+_SQL_EVIDENCE_BAR = (
+    f"c.outcome = 'done' "
+    f"AND LENGTH(TRIM(c.probe)) >= {MIN_EVIDENCE_CHARS} "
+    f"AND LENGTH(TRIM(c.observation)) >= {MIN_EVIDENCE_CHARS} "
+    f"AND {_SQL_SHA_LOOKS_LIKE_A_COMMIT}"
+)
+
+
 _MIGRATIONS: list[tuple[str, str]] = [
     (
         "add_source_column",
@@ -1895,9 +1930,14 @@ _MIGRATIONS: list[tuple[str, str]] = [
     # закрывать три строки пришлось бы руками, повторяя запись, которая уже
     # есть. Ровно этого требует постановка: «выкат проверяется на них».
     #
-    # Берётся ПОСЛЕДНЯЯ живая проверка задачи, у которой есть и probe, и
-    # observation, и коммит, — то есть прошедшая тот же порог доказательства,
-    # что и прямая запись. Закрывается только unknown: строку, чей источник
+    # Берётся ПОСЛЕДНЯЯ живая проверка задачи, прошедшая ТОТ ЖЕ порог
+    # доказательства, что и прямая запись, — и «тот же» здесь буквально: и
+    # эта SQL, и живая дверь считают его по _SQL_EVIDENCE_BAR / константам
+    # выше, одним определением. Пока определений было два, они разошлись:
+    # засыпка спрашивала лишь TRIM != '' и закрывала строку записью вида
+    # «ок / норм / zzz», которую живая дверь отвергает как штамп (находка
+    # 80fcb9c9). Обещание в комментарии, не проверяемое кодом, — та же
+    # подмена доказательства штампом, только этажом выше. Закрывается только unknown: строку, чей источник
     # отвечает, наблюдением не закрывают ни здесь, ни в коде.
     #
     # Одноразовость даёт сам механизм миграций (имя выполняется один раз), а
@@ -1905,46 +1945,34 @@ _MIGRATIONS: list[tuple[str, str]] = [
     # закрываться заново при следующем запуске.
     (
         "backfill_delivery_observed_from_live_checks",
-        """UPDATE delivery_discrepancies AS d
+        f"""UPDATE delivery_discrepancies AS d
               SET observed_at       = (
                     SELECT c.created_at FROM live_checks c
-                     WHERE c.task_id = d.task_id AND c.outcome = 'done'
-                       AND TRIM(c.probe) != '' AND TRIM(c.observation) != ''
-                       AND TRIM(c.sha) != ''
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
                      ORDER BY c.id DESC LIMIT 1),
                   observed_by       = (
                     SELECT COALESCE(NULLIF(c.recorded_agent, ''), 'hub')
                       FROM live_checks c
-                     WHERE c.task_id = d.task_id AND c.outcome = 'done'
-                       AND TRIM(c.probe) != '' AND TRIM(c.observation) != ''
-                       AND TRIM(c.sha) != ''
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
                      ORDER BY c.id DESC LIMIT 1),
                   observed_probe    = (
                     SELECT c.probe FROM live_checks c
-                     WHERE c.task_id = d.task_id AND c.outcome = 'done'
-                       AND TRIM(c.probe) != '' AND TRIM(c.observation) != ''
-                       AND TRIM(c.sha) != ''
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
                      ORDER BY c.id DESC LIMIT 1),
                   observed_evidence = (
                     SELECT c.observation FROM live_checks c
-                     WHERE c.task_id = d.task_id AND c.outcome = 'done'
-                       AND TRIM(c.probe) != '' AND TRIM(c.observation) != ''
-                       AND TRIM(c.sha) != ''
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
                      ORDER BY c.id DESC LIMIT 1),
                   observed_sha      = (
                     SELECT c.sha FROM live_checks c
-                     WHERE c.task_id = d.task_id AND c.outcome = 'done'
-                       AND TRIM(c.probe) != '' AND TRIM(c.observation) != ''
-                       AND TRIM(c.sha) != ''
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
                      ORDER BY c.id DESC LIMIT 1),
                   observed_state    = d.state
             WHERE d.state = 'unknown'
               AND d.observed_at = ''
               AND EXISTS (
                     SELECT 1 FROM live_checks c
-                     WHERE c.task_id = d.task_id AND c.outcome = 'done'
-                       AND TRIM(c.probe) != '' AND TRIM(c.observation) != ''
-                       AND TRIM(c.sha) != '')""",
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR})""",  # nosec B608 - константы модуля, не данные
     ),
 ]
 

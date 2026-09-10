@@ -1074,13 +1074,25 @@ def cmd_delivery_ack(args: argparse.Namespace) -> int:
 
 
 def cmd_undelivered(args: argparse.Namespace) -> int:
-    """Completed tasks whose PR is neither merged nor closed (#897)."""
+    """Completed tasks whose PR is neither merged nor closed (#897).
+
+    ЧЕТЫРЕ ВЕДРА, НЕ ДВА (#1215, находка d7b46ff7). Тот же ответ API читает
+    MCP, и он печатает все четыре; человеческий путь обходил только открытые
+    PR и unknown. После того как наблюдение закрывало строку, оператор видел
+    одну фразу — «No completed task is waiting on an open PR» — то есть
+    «проверено, чисто» там, где на самом деле «закрыто чужим наблюдением, вот
+    кем и по какому коммиту». Пустой текст, читающийся как штамп, — ровно та
+    подмена, против которой написан весь этот механизм; молчать о ней в CLI и
+    говорить в MCP значит иметь два разных ответа на один вопрос.
+    """
     result = _api("GET", f"/api/delivery/discrepancies?limit={int(args.limit)}")
     if args.json:
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     rows = result.get("undelivered") or []
-    if not rows:
+    unknown = result.get("unknown") or []
+    observed = result.get("closed_by_observation") or []
+    if not rows and not unknown and not observed:
         print("No completed task is waiting on an open PR.")
     for row in rows:
         print(
@@ -1095,8 +1107,37 @@ def cmd_undelivered(args: argparse.Namespace) -> int:
             )
     # Printed apart, and printed even when the list above is empty: an answer
     # the hub could not get is not a discrepancy, but it is also not nothing.
-    for row in result.get("unknown") or []:
+    for row in unknown:
         print(f"#{row['task_id']} — не проверено: {row.get('reason', '')}")
+    # Строка за краем окна свипа застыла на последнем ответе источников, и
+    # узнавать об этом по неподвижному checked_at читатель не обязан (#1215).
+    frozen = [r for r in (*rows, *unknown) if r.get("still_swept") is False]
+    if frozen:
+        print(
+            f"\n{len(frozen)} строк(и) старше окна свипа "
+            f"({result.get('sweep_lookback_days', '?')} дней): источники больше "
+            f"не перепрашиваются, ответ застыл. Выход — записать наблюдение: "
+            f"оно окна не спрашивает."
+        )
+        for row in frozen:
+            print(f"    #{row['task_id']} — {row.get('age_hours', '?')}ч")
+    # Закрытая наблюдением строка ушла из списка расхождений, но не из виду:
+    # видно, что доставку подтвердил человек или агент, а не установил хаб.
+    if observed:
+        print(
+            f"\n{len(observed)} строк(и) закрыты НАБЛЮДЕНИЕМ, а не хабом — "
+            f"прежний ответ реестра остаётся историей:"
+        )
+        for row in observed:
+            print(
+                f"#{row['task_id']} {row.get('title', '')} — наблюдал "
+                f"{row.get('observed_by', '?')} в коммите "
+                f"{row.get('observed_sha', '?')}; закрыт факт "
+                f"«{row.get('state', '?')}»"
+            )
+            print(f"    было: {row.get('reason', '')}")
+            print(f"    проверял: {row.get('observed_probe', '')}")
+            print(f"    увидел: {row.get('observed_evidence', '')}")
     return 0
 
 

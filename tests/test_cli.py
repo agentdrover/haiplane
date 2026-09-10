@@ -2204,3 +2204,95 @@ def test_submit_review_still_refuses_broken_finding_outcomes_json(capsys) -> Non
     api.assert_not_called()
     _, err = _assert_no_traceback(capsys)
     assert "--finding-outcomes is not valid JSON" in err
+
+
+def test_cmd_undelivered_names_observation_and_the_frozen_window() -> None:
+    """Находка d7b46ff7: пустой человеческий вывод читается как «чисто».
+
+    ``cmd_undelivered`` берёт тот же ответ API, что и MCP, но обходил только
+    два ведра из четырёх. Строка, закрытая наблюдением, и строка, вышедшая за
+    окно свипа, до человека не доезжали: после закрытия оператор видел одну
+    фразу «No completed task is waiting on an open PR» — то есть «проверено,
+    чисто» вместо «закрыто чужим наблюдением, вот кем и по какому коммиту».
+    Ровно то правило честности, ради которого MCP печатает третье ведро.
+
+    Мутация по местам применения: снять печать наблюдения ИЛИ печать
+    застывших строк — тест падает на своём assert поимённо.
+    """
+    payload = {
+        "undelivered": [],
+        "unknown": [
+            {
+                "task_id": 878,
+                "title": "Маховик",
+                "reason": "провайдер не ответил",
+                "age_hours": 467,
+                "still_swept": False,
+            }
+        ],
+        "closed_by_observation": [
+            {
+                "task_id": 909,
+                "title": "Паспорт дефекта",
+                "state": "unknown",
+                # Своя причина, не совпадающая с причиной строки #878 выше:
+                # иначе assert про историю проходил бы за счёт чужого ведра.
+                "reason": "репозиторий PR #468 удалён, спросить некого",
+                "observed_by": "pda_claude",
+                "observed_sha": "19ee3f6faf9f",
+                "observed_probe": "git show 19ee3f6faf9f --stat",
+                "observed_evidence": "файл на месте, AC-тест зелёный",
+            }
+        ],
+        "sweep_lookback_days": 30,
+    }
+    mock_api = MagicMock(return_value=payload)
+    args = argparse.Namespace(limit=50, json=False)
+    out = StringIO()
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=out):
+        rc = cli.cmd_undelivered(args)
+    assert rc == 0
+    text = out.getvalue()
+
+    assert "#909" in text and "pda_claude" in text and "19ee3f6faf9f" in text, (
+        "закрытая наблюдением строка обязана быть видна человеку с именем "
+        "наблюдавшего и коммитом, иначе закрытие читается как «расхождений нет»"
+    )
+    assert "19ee3f6faf9f --stat" in text and "AC-тест зелёный" in text
+    assert "unknown" in text and "репозиторий PR #468 удалён" in text, (
+        "прежний ответ реестра — история, а не стёртое состояние"
+    )
+    assert "30" in text and "#878" in text, (
+        "про строку за краем окна свипа сказано вслух: источники больше не "
+        "перепрашиваются"
+    )
+    assert "архив" not in text.lower()
+    # Сердце находки: пустой список открытых PR — это НЕ «проверено, чисто»,
+    # пока рядом стоит строка, закрытая чужим наблюдением.
+    assert "No completed task is waiting on an open PR." not in text, (
+        "фраза «расхождений нет» при закрытой наблюдением строке — штамп: "
+        "читатель принимает чужое наблюдение за собственную проверку хаба"
+    )
+
+
+def test_cmd_undelivered_still_says_all_clear_when_it_really_is() -> None:
+    """Обратная сторона той же находки: молчать, когда сказать нечего.
+
+    Убрать ложное «чисто» легко ценой того, что честное «чисто» исчезнет
+    вместе с ним, — и тогда пустой вывод снова придётся толковать. Все четыре
+    ведра пусты ровно тогда, когда фраза правдива.
+    """
+    mock_api = MagicMock(
+        return_value={
+            "undelivered": [],
+            "unknown": [],
+            "closed_by_observation": [],
+            "sweep_lookback_days": 30,
+        }
+    )
+    args = argparse.Namespace(limit=50, json=False)
+    out = StringIO()
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=out):
+        rc = cli.cmd_undelivered(args)
+    assert rc == 0
+    assert "No completed task is waiting on an open PR." in out.getvalue()
