@@ -4657,7 +4657,6 @@ def test_a_container_launch_without_its_own_deadline_is_refused(monkeypatch) -> 
     assert local_reviewer.detaching_sandbox() == []
 
 
-
 def test_the_run_guard_refuses_the_string_it_cannot_parse(monkeypatch) -> None:
     """Неизвестный флаг СО ЗНАЧЕНИЕМ — отказ, а не молчаливое «срок есть».
 
@@ -5048,8 +5047,7 @@ def _doc_wrapper_launch(tmp_path) -> str:
     seen = [line for line in log.read_text().splitlines() if line]
     runs = [line for line in seen if shlex.split(line)[:1] == ["run"]]
     assert len(runs) == 1, (
-        f"скелет враппера обязан один раз позвать «podman run»; движок "
-        f"получил {seen}"
+        f"скелет враппера обязан один раз позвать «podman run»; движок получил {seen}"
     )
     return shlex.join([engine, *shlex.split(runs[0])])
 
