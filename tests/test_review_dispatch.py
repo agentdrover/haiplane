@@ -5433,3 +5433,89 @@ async def test_the_card_names_which_provider_gave_the_report_and_why(
     assert "недоступен" not in note, (
         "форж github облаку доступен; старый текст на этом месте был бы ложью"
     )
+
+
+async def _cloud_dispatch_that_died(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path, slug: str
+) -> int:
+    """Задача с облачным заказом, чей прогон кончился ERROR без отчёта."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-stale"}, "run": {"id": "r-s"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    task_id = await _submitted(client, db, slug, policy={"review": "dispatch"})
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    return task_id
+
+
+async def _local_dispatches(db: aiosqlite.Connection, task_id: int) -> list[dict]:
+    return [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=? AND channel='local'",
+            (task_id,),
+        )
+    ]
+
+
+async def test_the_second_door_does_not_buy_a_run_for_a_superseded_submission(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1252: свип разбирает заказ ПОЗЖЕ, и сдача могла успеть смениться.
+
+    Заказ был на поколение 1, автор с тех пор пересдал. Купить второго
+    ревьюера по мёртвому поколению — это оплатить чтение кода, которого на
+    ветке уже нет, и положить в карточку отчёт не про ту сдачу.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    task_id = await _cloud_dispatch_that_died(
+        client, db, monkeypatch, tmp_path, "spike-superseded"
+    )
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 2 WHERE id = ?", (task_id,)
+    )
+    await db.commit()
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert await _local_dispatches(db, task_id) == [], (
+        "вторая дверь открывается по ЖИВОЙ сдаче, а не по той, которую заказ "
+        "успел пережить"
+    )
+
+
+async def test_the_second_door_stays_shut_on_a_task_that_left_review(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1252: задача ушла из review — отчёт больше некому засчитывать.
+
+    Свип бежит по расписанию, и между заказом и его разбором задачу могли
+    вернуть в работу. Прогон по ней был бы куплен впустую: гейта, который
+    ждёт этот отчёт, больше нет.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    task_id = await _cloud_dispatch_that_died(
+        client, db, monkeypatch, tmp_path, "spike-left-review"
+    )
+    await db.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,))
+    await db.commit()
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert await _local_dispatches(db, task_id) == [], (
+        "ревьюер не покупается для задачи, которая ревью больше не ждёт"
+    )
