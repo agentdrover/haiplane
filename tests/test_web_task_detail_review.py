@@ -278,3 +278,96 @@ async def test_strip_names_incomplete_and_unresolved_review(client: AsyncClient,
     assert "task-review-tile--ok" not in strip[tile_open:tile_at], (
         "an incomplete run with unjudged findings is not a green tile"
     )
+
+
+async def test_the_card_page_prints_the_circle_before_the_threshold(client, db):
+    """#1235: заходы стоят на СТРАНИЦЕ карточки, а не только в модели.
+
+    Находка ревью #347 назвала обе поверхности сразу — TaskView и шаблон.
+    Поле, доехавшее до модели и не доехавшее до разметки, человек не
+    прочитает, а молчание страницы читается как «круга нет» (#516, #549).
+    Порог здесь НЕ достигнут намеренно: до порога карточка и молчала.
+    """
+    import json
+
+    from hub import config
+    from hub import repository as repo_module
+    from tests.test_web import _web_task_in_review
+
+    task_id = await _web_task_in_review(client)
+
+    async def _report(generation: int, title: str, category: str, line: int) -> int:
+        await db.execute(
+            "UPDATE tasks SET submission_generation=? WHERE id=?",
+            (generation, task_id),
+        )
+        review_id = await repo_module.insert_machine_review(
+            db,
+            task_id=task_id,
+            submission_generation=generation,
+            harness_skill="deep-review",
+            model="grok-4.6",
+            raw_count=1,
+            findings_confirmed=json.dumps(
+                [
+                    {
+                        "title": title,
+                        "severity": "high",
+                        "category": category,
+                        "file": "hub/services/probe.py",
+                        "line": line,
+                        "start_line": line,
+                        "end_line": line,
+                        "locator": "lines",
+                        "detail": "",
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+            unresolved="[]",
+            submitted_by="cursor-cloud-reviewer",
+        )
+        await db.commit()
+        return review_id
+
+    from hub.services.finding_identity import finding_uids
+
+    first_finding = {
+        "title": "гонка на записи",
+        "severity": "high",
+        "category": "concurrency",
+        "file": "hub/services/probe.py",
+        "line": 10,
+        "start_line": 10,
+        "end_line": 10,
+        "locator": "lines",
+        "detail": "",
+    }
+    review_id = await _report(1, "гонка на записи", "concurrency", 10)
+    await _report(2, "утечка дескриптора", "resource-leak", 40)
+    await repo_module.upsert_finding_outcome(
+        db,
+        review_id=review_id,
+        task_id=task_id,
+        submission_generation=1,
+        finding_uid=finding_uids([first_finding])[0],
+        finding_index=0,
+        finding_title=first_finding["title"],
+        outcome="fixed",
+        note="разобрано опытом",
+        linked_task_id=None,
+        reported_by="dev",
+        finding_kind="confirmed",
+    )
+    await db.commit()
+
+    original = config.REVIEW_CIRCLE_THRESHOLD
+    config.REVIEW_CIRCLE_THRESHOLD = 3
+    try:
+        page = (await client.get(f"/tasks/{task_id}")).text
+    finally:
+        config.REVIEW_CIRCLE_THRESHOLD = original
+
+    assert "заходов 1/3" in page, "число заходов напечатано на странице до порога"
+    assert "закрыто 1, пришло новых 1" in page, "разбивка едет вместе с числом"
+    assert "круг назван" not in page, "видно — не значит позвали: порог не достигнут"

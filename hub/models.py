@@ -1742,6 +1742,14 @@ class TaskView(BaseModel):
     log_tail: list[str] | None = None
     updates: list[TaskUpdateView] | None = None
     review_cycle: int = 0
+    # #1235: заходы «закрыли находки — пришли новые» стоят в карточке
+    # ВСЕГДА, а не одним алертом на пороге. До порога карточка иначе
+    # выглядит так, будто круга нет вовсе, — а молчание читается как
+    # «чисто» (#516, #549), и человек узнаёт о круге ровно тогда, когда
+    # круг уже стал дорогим. Порог 0 гасит ЗОВ, а не счёт: выключатель,
+    # прячущий заодно и число, отнял бы единственный способ увидеть, что
+    # выключили не то.
+    review_circle: ReviewCircleView = Field(default_factory=ReviewCircleView)
     ci_fix_cycle: int = 0
     auto_review: bool = True
     review_job_id: str | None = None

@@ -4923,3 +4923,120 @@ async def test_a_deeper_lap_is_named_again_on_the_next_generation(
     notices = await _circle_notices(db, task_id)
     assert len(notices) == 2
     assert "3-й раз" in notices[1], "и во второй раз названо новое число заходов"
+
+
+async def test_two_reports_on_one_generation_do_not_double_count_a_finding(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Разбивка «пришло новых N» считает НАХОДКИ, а не строки отчётов.
+
+    Лестница добора (#879) кладёт на одно поколение два отчёта, и второй
+    часто повторяет находки первого. Находки поколения сливаются в один
+    список, поэтому длина списка — не число находок: тот же дефект,
+    названный дважды, дал бы двойку там, где находка одна.
+
+    Число дорогое: человек по нему решает, стоит ли продолжать круг. «Слой
+    из двух находок» вместо одной — ровно то завышение, из-за которого он
+    решит иначе.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-dbl"}, "run": {"id": "r-dbl"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-double")
+    first = [_confirmed("гонка на записи", "concurrency", 10)]
+    review_id = await _generation_with_findings(db, task_id, 1, confirmed=first)
+
+    # Поколение 2: ДВА отчёта. Второй повторяет находку первого и приносит
+    # свою. Строк в слитом списке четыре, РАЗНЫХ находок — три.
+    leak = _confirmed("утечка дескриптора", "resource-leak", 40)
+    hang = _confirmed("необработанный код возврата", "error-handling", 50)
+    starve = _confirmed("тест не убивает мутацию", "test-adequacy", 60)
+    await _generation_with_findings(db, task_id, 2, confirmed=[leak, hang])
+    await _generation_with_findings(db, task_id, 2, confirmed=[leak, starve])
+    await _author_closed_them(
+        db, task_id, review_id, 1, confirmed=first, unresolved=[]
+    )
+
+    from hub.services.review_dispatch import review_circle
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 1, (
+        "заход один: два отчёта на поколении — всё ещё одно поколение"
+    )
+    assert circle.laps[0].arrived == 3, (
+        "находок три, а строк в слитом списке четыре: считать надо "
+        "уникальные finding_uid. Число не константа — оно обязано ЗАВИСЕТЬ "
+        "от размера слоя, иначе человеку показывают не то, по чему он решает"
+    )
+    assert "пришло новых 3" in circle.breakdown()[0]
+
+
+async def test_the_lap_count_stands_on_the_card_before_the_threshold(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Счёт заходов виден в КАРТОЧКЕ, а не только в алерте после порога.
+
+    Постановка требует, чтобы число было видно в карточке и в брифе, и
+    комментарий к REVIEW_CIRCLE_THRESHOLD обещает то же при пороге 0:
+    «заходы считаются по-прежнему и видны в карточке и в брифе, но
+    человека не зовут». Пока число доходит до карточки одним алертом на
+    пороге, до порога карточка выглядит так, будто круга нет вовсе, —
+    а молчание читается как «чисто» (#516, #549).
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-card"}, "run": {"id": "r-card"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+
+    task_id = await _submitted(client, db, "spike-1235-card")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+
+    assert await _circle_notices(db, task_id) == [], "порог не достигнут: не зовём"
+
+    card = (await client.get(f"/api/tasks/{task_id}")).json()
+    circle = card.get("review_circle") or {}
+    assert circle.get("laps") == 2, (
+        "два захода из трёх обязаны стоять в карточке ДО порога: иначе "
+        "человек видит круг только тогда, когда круг уже стал дорогим"
+    )
+    assert circle.get("named") is False, "видно — не значит позвали"
+    assert len(circle.get("breakdown") or []) == 2, (
+        "разбивка «закрыто / пришло новых» едет вместе с числом"
+    )
+
+
+async def test_a_switched_off_threshold_still_counts_on_the_card(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Порог 0 гасит ЗОВ, а не счёт: ровно то, что обещает конфиг.
+
+    Выключатель, прячущий заодно и число, отнял бы у человека
+    единственный способ увидеть, что выключил он не то.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-off"}, "run": {"id": "r-off"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 0)
+
+    task_id = await _submitted(client, db, "spike-1235-off")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+
+    card = (await client.get(f"/api/tasks/{task_id}")).json()
+    circle = card.get("review_circle") or {}
+    assert circle.get("laps") == 2 and circle.get("named") is False
+    assert await _circle_notices(db, task_id) == []

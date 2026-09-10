@@ -2848,7 +2848,14 @@ async def review_circle(db: aiosqlite.Connection, task_id: int) -> ReviewCircle:
             CircleLap(
                 generation=current,
                 closed=len(shut),
-                arrived=len(fresh),
+                # Уникальные uid, а не длина списка: находки ВСЕХ отчётов
+                # поколения слиты в один список, а лестница добора (#879)
+                # кладёт на поколение два отчёта, и второй часто повторяет
+                # находки первого. Длина списка назвала бы человеку слой
+                # вдвое толще настоящего — ровно то число, по которому он
+                # решает, продолжать круг или нет. Категории считать
+                # заново не нужно: ``repeated`` уже множество.
+                arrived=len({uid for uid, _ in fresh}),
                 repeated_categories=tuple(repeated),
             )
         )
