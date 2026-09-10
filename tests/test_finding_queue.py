@@ -1356,3 +1356,53 @@ async def test_the_default_report_carries_the_evidence_section(
 
     off = await disposition_report(db, since_days=60, minimum=1, with_evidence=False)
     assert off["unknown"] is None, "ключ --no-evidence по-прежнему называет пропуск"
+
+
+async def test_a_fully_judged_queue_does_not_print_a_share_of_none(
+    db: aiosqlite.Connection, capsys
+):
+    """#1171: цель задачи — пустая очередь, и ровно там отчёт печатал «доля None».
+
+    ``unknown_breakdown`` честно отвечает ``share=None`` на нулевом знаменателе:
+    доли у нуля находок нет, и подставлять 0.0 было бы выдумкой числа (#516).
+    Ложь была не в данных, а в печати: f-строка вставляла ``None`` в текст,
+    рядом с порогом «выше 0.4 — условие пересмотра», и оператор читал сбой
+    формата там, где на деле судить нечего — очередь разобрана до конца.
+    Разбор очереди #1171 приводит систему ровно в это состояние, поэтому
+    строка ломается не на краю, а в точке успеха.
+    """
+    import importlib.util
+    from pathlib import Path as _Path
+
+    from hub.services.finding_report import disposition_report, unknown_breakdown
+
+    await _task(db, 91, "completed", 1)
+    await _report(db, 191, 91, 1, [_finding("единственная, и та разобрана")])
+    await _judge(db, 191, 91, 0, "uid-разобрана", "fixed")
+    await db.commit()
+
+    breakdown = await unknown_breakdown(db)
+    assert breakdown["queued"] == 0, "очередь обязана быть пуста: находка разобрана"
+    assert breakdown["share"] is None, (
+        "доли у нулевого знаменателя нет — данные остаются честными, чинится печать"
+    )
+
+    report = await disposition_report(db, since_days=60, minimum=1)
+    spec = importlib.util.spec_from_file_location(
+        "fqr_empty_queue",
+        _Path(__file__).resolve().parents[1] / "scripts" / "finding_queue_report.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module._print_report(report)
+    out = capsys.readouterr().out
+
+    assert "доля None" not in out, (
+        "буквальное None в тексте отчёта — не ответ оператору, а сбой формата"
+    )
+    assert "0 из 0" in out and "очередь разобрана" in out, (
+        "пустую очередь надо назвать словами, а не молчанием и не долей"
+    )
+    assert "выше 0.4" not in out.split("СУДИТЬ НЕ ПО ЧЕМУ")[-1].split("\n")[1], (
+        "порог пересмотра относится к доле; без доли его печатать не о чем"
+    )

@@ -120,10 +120,21 @@ def _print_report(report: dict) -> None:
         print("СУДИТЬ НЕ ПО ЧЕМУ: не считали (ключ --no-evidence, нужны клоны задач)")
         return
     print("СУДИТЬ НЕ ПО ЧЕМУ (остаются неразобранными, дефолт не назначается)")
-    print(
-        f"  {unknown['unknown']} из {unknown['queued']} "
-        f"(доля {unknown['share']}; выше 0.4 — условие пересмотра)"
-    )
+    if unknown["share"] is None:
+        # Знаменатель нулевой: очередь разобрана до конца — та самая цель
+        # #1171. Доли у нуля нет, и подставлять 0.0 значило бы выдумать
+        # число (#516); печатать в тексте «доля None» — показать оператору
+        # сбой формата вместо ответа. Порог 0.4 относится к доле, поэтому
+        # без доли он здесь и не называется.
+        print(
+            f"  {unknown['unknown']} из {unknown['queued']} — "
+            "очередь разобрана, доли считать не от чего"
+        )
+    else:
+        print(
+            f"  {unknown['unknown']} из {unknown['queued']} "
+            f"(доля {unknown['share']}; выше 0.4 — условие пересмотра)"
+        )
     for reason in unknown["reasons"]:
         print(f"    {reason['reason']:<24} {reason['findings']}")
 
