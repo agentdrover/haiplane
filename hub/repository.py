@@ -1290,6 +1290,23 @@ async def list_finding_dispositions(
     )
 
 
+async def list_judged_findings(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    """Каждое ЗАПИСАННОЕ суждение о находке — материал перепроверки (#1171).
+
+    Ключ здесь uid, а не позиция: слепая перепроверка сравнивает суждение о
+    ТОМ ЖЕ дефекте, а позиция принадлежит списку отчёта, не находке (#1007).
+    Строки без uid — из времени до его появления — отдаются как есть; отбор
+    делает вызывающий, а тихо ронять их здесь значило бы уменьшать
+    знаменатель перепроверки на историю.
+    """
+    return await fetchall(
+        db,
+        "SELECT review_id, task_id, finding_index, finding_uid, finding_title, "
+        "disposition, decided_by, decided_at FROM finding_dispositions "
+        "ORDER BY id ASC",
+    )
+
+
 # --- The queue of unjudged findings (#1038) --------------------------------
 
 #: Where an unjudged finding LIVES, written once and shared by the list and the
@@ -1321,7 +1338,18 @@ _UNJUDGED_FINDINGS_FROM = (
 _UNJUDGED_PROJECT_CONDITION = " AND t." + PROJECT_SUBTREE_CONDITION
 
 
-def _unjudged_where(since: str | None, project_id: int | None) -> tuple[str, list[Any]]:
+#: Категория находки как ЗНАЧЕНИЕ, а не как поле: она лежит внутри JSON
+#: отчёта, и половина исторических находок её не называет. Написано один раз —
+#: по этому же выражению и группируют, и фильтруют, иначе счётчик над списком
+#: и сам список разойдутся первым же отчётом без категории (#518).
+UNJUDGED_CATEGORY_SQL = (
+    "COALESCE(NULLIF(json_extract(f.value, '$.category'), ''), 'без категории')"
+)
+
+
+def _unjudged_where(
+    since: str | None, project_id: int | None, category: str | None = None
+) -> tuple[str, list[Any]]:
     """The one place the queue's WHERE is assembled, for list and count alike."""
     where = _UNJUDGED_FINDINGS_FROM
     params: list[Any] = []
@@ -1331,6 +1359,9 @@ def _unjudged_where(since: str | None, project_id: int | None) -> tuple[str, lis
     if project_id is not None:
         where += _UNJUDGED_PROJECT_CONDITION
         params.append(project_id)
+    if category is not None:
+        where += f" AND {UNJUDGED_CATEGORY_SQL} = ?"
+        params.append(category)
     return where, params
 
 
@@ -1339,6 +1370,8 @@ async def list_unjudged_findings(
     *,
     since: str | None = None,
     project_id: int | None = None,
+    category: str | None = None,
+    newest_first: bool = False,
     limit: int | None = None,
 ) -> list[aiosqlite.Row]:
     """Confirmed findings of CURRENT reports that nobody has answered yet.
@@ -1353,19 +1386,55 @@ async def list_unjudged_findings(
     ``since`` takes the same relative form as the metrics window
     ('-90 days'); omitted, the whole history answers.
     """
-    where, params = _unjudged_where(since, project_id)
+    where, params = _unjudged_where(since, project_id, category)
+    # Свежие сверху, когда об этом просят (#1171). Разбор идёт категориями, а
+    # внутри категории свежая находка судится точнее старой: код ещё похож на
+    # тот, о котором писал ревьюер. Порядок по умолчанию не тронут — его читает
+    # страница, написанная до этого параметра.
+    order = "DESC" if newest_first else "ASC"
     sql = (
         "SELECT t.id AS task_id, t.title AS task_title, "  # nosec B608
         "t.status AS task_status, mr.id AS review_id, "
         "mr.submission_generation AS submission_generation, "
         "mr.created_at AS reported_at, mr.model AS model, "
+        f"{UNJUDGED_CATEGORY_SQL} AS category, "
         "f.key AS finding_index, f.value AS finding "
-        f"{where} ORDER BY mr.created_at ASC, mr.id ASC, f.key ASC"
+        f"{where} ORDER BY mr.created_at {order}, mr.id {order}, f.key ASC"
     )
     if limit is not None:
         sql += " LIMIT ?"
         params.append(limit)
     return await fetchall(db, sql, tuple(params))
+
+
+async def unjudged_findings_by_category(
+    db: aiosqlite.Connection,
+    *,
+    since: str | None = None,
+    project_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """Сколько находок ждёт в каждой категории, самые частые первыми (#1171).
+
+    Порядок разбора — предмет постановки, а не украшение: correctness даёт
+    больше находок, чем все прочие категории вместе, и его precision — первое
+    число, под которое имеет смысл писать детерминированную проверку. Один
+    длинный список вперемешку такого ответа не даёт.
+
+    Тот же ``FROM``, что у списка и счётчика, — по построению, а не по
+    аккуратности копирования.
+    """
+    where, params = _unjudged_where(since, project_id)
+    rows = await fetchall(
+        db,
+        f"SELECT {UNJUDGED_CATEGORY_SQL} AS category, "  # nosec B608
+        f"COUNT(*) AS findings {where} "
+        "GROUP BY category ORDER BY findings DESC, category ASC",
+        tuple(params),
+    )
+    return [
+        {"category": str(dict(r)["category"]), "findings": int(dict(r)["findings"])}
+        for r in rows
+    ]
 
 
 async def count_unjudged_findings(
@@ -1647,6 +1716,24 @@ async def insert_event(
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
+
+
+async def event_raised_since(db: aiosqlite.Connection, kind: str, window: str) -> bool:
+    """Есть ли уже событие такого рода за окно — дедуп для сторожей без задачи.
+
+    ``has_stale_alert`` (#319, #751) дедуплицирует по ЗАПИСИ В ЗАДАЧЕ, и это
+    работает, пока у предупреждения есть задача. У очереди находок (#1171) её
+    нет: сток — свойство практики, а не одной строки. Ключом становится само
+    событие, которое сторож и пишет, а окно берётся относительным — тем же
+    языком, что у метрик ('-1 day').
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM events WHERE kind=? "
+        "AND created_at >= datetime('now', ?) LIMIT 1",
+        (kind, window),
+    )
+    return bool(rows)
 
 
 async def list_events(
@@ -4239,6 +4326,27 @@ async def merge_sha_for_task(db: aiosqlite.Connection, task_id: int) -> str:
         )
     )
     return str(dict(rows[0])["merge_sha"]) if rows else ""
+
+
+async def tasks_released_with(db: aiosqlite.Connection, release_sha: str) -> list[int]:
+    """Задачи, чьи мержи этот релиз унёс в прод (#1236).
+
+    Спрашивается сразу после ``mark_merges_released``: это единственный момент,
+    когда ответ точен без гадания по истории — релиз несёт базовую ветку целиком
+    (#812), так что помеченные им строки и есть тот набор, чьё поведение теперь
+    можно наблюдать. Восстанавливать его позже по предкам нельзя: сквош режет
+    родословную, ровно ради чего штамп и заведён (#950).
+    """
+    sha = (release_sha or "").strip()
+    if not sha:
+        return []
+    rows = await fetchall(
+        db,
+        "SELECT DISTINCT task_id FROM pipeline_merges "
+        "WHERE released_sha = ? AND task_id IS NOT NULL ORDER BY task_id",
+        (sha,),
+    )
+    return [int(dict(row)["task_id"]) for row in rows]
 
 
 # --- Completed, but is the work actually delivered? (#897) ------------------

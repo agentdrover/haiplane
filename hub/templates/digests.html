@@ -67,6 +67,43 @@
     </ul>
     {% endif %}
 
+    {% if d.data.findings_queue %}
+    {# #1171: сток находок едет попутчиком — он про практику, а не про сутки
+       автопилота. Тревога живёт в ленте событий (сторож поллера), здесь
+       сводка. Порог назван рядом с числом: без него «131» ничего не говорит. #}
+    <h3>Находки без диспозиции</h3>
+    <p{% if d.data.findings_queue.over_threshold %} class="badge badge-failed"{% else %} class="text-muted"{% endif %}>
+        <a href="/findings">{{ d.data.findings_queue.findings }}</a> подтверждённых
+        находок в {{ d.data.findings_queue.reports }} отчётах ждут ответа
+        (порог {{ d.data.findings_queue.threshold }}). Это очередь за всё время,
+        не за сутки дайджеста.
+        {# #1171: непустая очередь и «precision нет» — РАЗНЫЕ факты. precision
+           это real/judged по разобранным, и первая же диспозиция делает его
+           числом, сколько бы находок ни ждало рядом. Безусловная строка «не
+           считается вовсе» после частичного разбора была полуправдой
+           (#516/#549). Ставка едет с размером выборки — правило #1153. #}
+        {% if d.data.findings_queue.judged %}
+        Разобрано {{ d.data.findings_queue.judged }} — precision
+        {{ d.data.findings_queue.precision }} по ним
+        (окно {{ d.data.findings_queue.precision_window_days }} дней,
+        <a href="/metrics">метрики</a>).</p>
+        {% elif d.data.findings_queue.judged_all_time %}
+        {# #1171: разбор СТОКА в оконное число не попадает — практика считает
+           диспозиции по дате ОТЧЁТА, и наутро после разбора запаса окно снова
+           пусто. «Диспозиций нет вовсе» здесь было бы ложью о том, что хаб
+           уже знает: за окно их нет, за всё время есть. Названы оба. #}
+        За окно {{ d.data.findings_queue.precision_window_days }} дней диспозиций
+        нет, но разбор старого стока в это окно и не попадает: за всё время
+        разобрано {{ d.data.findings_queue.judged_all_time }} — precision
+        {{ d.data.findings_queue.precision_all_time }} по ним
+        (<a href="/metrics">метрики</a> считают за окно).</p>
+        {% else %}
+        Ни одной диспозиции нет ни за окно
+        {{ d.data.findings_queue.precision_window_days }} дней, ни за всё время,
+        поэтому precision не считается вовсе.</p>
+        {% endif %}
+    {% endif %}
+
     <h3>Выборка на проверку (~10% решений; применённые approve — ~30%)</h3>
     <ul>
         {% for tid in d.data.audit_sample %}
