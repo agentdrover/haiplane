@@ -38,6 +38,11 @@ from hub.services.live_check import (
     live_check_view,
     record_live_check,
 )
+from hub.services.live_probe import (
+    PROBES,
+    run_declared_probe,
+    validate_declared_probe,
+)
 from hub.services.messaging import (
     MESSAGE_EVENT_KIND,
     addressable_refs,
@@ -225,6 +230,9 @@ __all__ = [
     "pair_executor_online",
     "readiness_tree",
     "record_live_check",
+    "PROBES",
+    "run_declared_probe",
+    "validate_declared_probe",
     "refine_task",
     "refine_tasks_bulk",
     "register_session",

@@ -3741,6 +3741,13 @@ PREPARE_HIDDEN: tuple[Hidden, ...] = (
     Hidden("caused_by_task_id", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("detected_at", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("clear_caused_by", "флаг очистки паспорта дефекта, а не поле"),
+    Hidden("live_probe", "объявление живого зонда (#1236) правят через refine"),
+    # #1236 заплатил этими двумя за новый параметр постановки: схема каталога
+    # стояла в пяти символах от потолка, а потолок двигается только вниз.
+    # Оба — БУХГАЛТЕРИЯ, а не постановка (refinement.BOOKKEEPING_FIELDS): они
+    # не меняют того, что задача утверждает, и ставятся через refine.
+    Hidden("human_owner", "бухгалтерия, а не постановка: ставится через refine"),
+    Hidden("human_reviewer", "бухгалтерия, а не постановка: ставится через refine"),
 )
 
 
@@ -4030,12 +4037,10 @@ async def hub_refine_task(
         class_of_service: standard | expedite | fixed_date | intangible
         size: XS | S | M | L | XL
         wip_tag: feature_work | bugfix | tech_debt | support
-        due_date: ISO date (YYYY-MM-DD), for fixed_date COS.
+        due_date: ISO date, for fixed_date COS.
         user_story: "As a <role>, I want <X> so that <Y>".
         problem_statement: What's broken and why.
-        business_value: Why it matters.
-        outcome_metric: Which number moves, from what to what (lead time
-            3d -> 1d). Makes business_value checkable.
+        outcome_metric: Which number moves, from what to what (3d -> 1d).
         outcome_indicator: Leading signal, before the metric moves.
         outcome_deadline: When the outcome is checked.
         outcome_revisit_condition: What reopens this decision.
@@ -4044,14 +4049,13 @@ async def hub_refine_task(
         agent_fit: deterministic | assistant | sdd_native | agentic.
         found_in: Defect stage: unknown | review | ci | test | staging | prod.
         caused_by_task_id: Task that introduced the defect.
-        detected_at: When it was noticed.
         technical_hints: Hints, references, approach.
         scope_in: In scope.
         scope_out: Out of scope.
         constraints: Hard limits.
-        assumptions: Assumed to hold.
         affected_areas: Modules/paths impacted.
         validation_commands: Commands proving it works.
+        live_probe: Read-only probe the hub runs after delivery; a registry name.
         out_of_scope_for_review: What the reviewer ignores.
         review_checklist: What the reviewer verifies.
         human_owner: Who is accountable.
