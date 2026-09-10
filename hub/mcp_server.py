@@ -6,11 +6,12 @@ import json
 import time
 import urllib.parse
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import Field
 
 from hub import brand, config
 from hub.actionable_errors import normalize_api_error_detail
@@ -610,10 +611,10 @@ async def hub_list_tasks(
     human_reviewer: str = "",
     claimed_by: str = "",
     mine: str = "",
-    limit: int = 20,
+    limit: Annotated[int, Field(le=200)] = 20,
     include_archived: bool = False,
-    after_id: int | None = None,
-    mode: str = "full",
+    after_id: Annotated[int | None, Field(ge=0)] = None,
+    mode: Literal["full", "summary"] = "full",
     project: str = "",
 ) -> CallToolResult:
     """List tasks with optional filters.
@@ -633,7 +634,7 @@ async def hub_list_tasks(
         human_reviewer: Exact match on human_reviewer.
         claimed_by: Exact match on the claim holder.
         mine: Shorthand for human_owner OR claimed_by (same person).
-        limit: Max number of tasks to return.
+        limit: Max tasks to return (≤200).
         include_archived: Include archived tasks, hidden from boards by default.
     """
     from urllib.parse import urlencode
@@ -678,6 +679,23 @@ async def hub_list_tasks(
         return structured_echo_result("No tasks found.", tasks=[])
     lines = [_format_task(t) for t in result]
     return structured_echo_result("\n".join(lines), tasks=result)
+
+
+def _drop_generated_titles(tool_name: str, fields: tuple[str, ...]) -> None:
+    """Pay for published bounds with titles the caller does not need (#1229)."""
+    tool = mcp._tool_manager.get_tool(tool_name)
+    if tool is None:
+        return
+    parameters = tool.parameters
+    parameters.pop("title", None)
+    properties = parameters.get("properties", {})
+    for name in fields:
+        schema = properties.get(name)
+        if isinstance(schema, dict):
+            schema.pop("title", None)
+
+
+_drop_generated_titles("hub_list_tasks", ("limit", "after_id", "mode"))
 
 
 def _dependency_lines(task: dict[str, Any]) -> list[str]:
@@ -3723,6 +3741,13 @@ PREPARE_HIDDEN: tuple[Hidden, ...] = (
     Hidden("caused_by_task_id", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("detected_at", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("clear_caused_by", "флаг очистки паспорта дефекта, а не поле"),
+    Hidden("live_probe", "объявление живого зонда (#1236) правят через refine"),
+    # #1236 заплатил этими двумя за новый параметр постановки: схема каталога
+    # стояла в пяти символах от потолка, а потолок двигается только вниз.
+    # Оба — БУХГАЛТЕРИЯ, а не постановка (refinement.BOOKKEEPING_FIELDS): они
+    # не меняют того, что задача утверждает, и ставятся через refine.
+    Hidden("human_owner", "бухгалтерия, а не постановка: ставится через refine"),
+    Hidden("human_reviewer", "бухгалтерия, а не постановка: ставится через refine"),
 )
 
 
@@ -4012,12 +4037,10 @@ async def hub_refine_task(
         class_of_service: standard | expedite | fixed_date | intangible
         size: XS | S | M | L | XL
         wip_tag: feature_work | bugfix | tech_debt | support
-        due_date: ISO date (YYYY-MM-DD), for fixed_date COS.
+        due_date: ISO date, for fixed_date COS.
         user_story: "As a <role>, I want <X> so that <Y>".
         problem_statement: What's broken and why.
-        business_value: Why it matters.
-        outcome_metric: Which number moves, from what to what (lead time
-            3d -> 1d). Makes business_value checkable.
+        outcome_metric: Which number moves, from what to what (3d -> 1d).
         outcome_indicator: Leading signal, before the metric moves.
         outcome_deadline: When the outcome is checked.
         outcome_revisit_condition: What reopens this decision.
@@ -4026,14 +4049,13 @@ async def hub_refine_task(
         agent_fit: deterministic | assistant | sdd_native | agentic.
         found_in: Defect stage: unknown | review | ci | test | staging | prod.
         caused_by_task_id: Task that introduced the defect.
-        detected_at: When it was noticed.
         technical_hints: Hints, references, approach.
         scope_in: In scope.
         scope_out: Out of scope.
         constraints: Hard limits.
-        assumptions: Assumed to hold.
         affected_areas: Modules/paths impacted.
         validation_commands: Commands proving it works.
+        live_probe: Read-only probe the hub runs after delivery; a registry name.
         out_of_scope_for_review: What the reviewer ignores.
         review_checklist: What the reviewer verifies.
         human_owner: Who is accountable.
