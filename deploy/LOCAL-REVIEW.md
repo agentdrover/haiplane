@@ -353,7 +353,8 @@ Interactive authentication required`. Выкат по прежнему доку�
 
    **Остальные расхождения скелета с рабочим враппером, закрытые здесь же.**
    `--cgroup-manager=systemd` (без него делегирование из пункта 4 не к чему
-   применять); `--env-file=/etc/haiplane-review/model.env`, а не
+   применять); `--env-file="$CONF/model.env"`, то есть
+   `/etc/haiplane-review/model.env`, а не
    `/etc/haiplane-review/env` — путь в прежней редакции был выдуман и не
    существует (на хосте хаба лежит `model.env`, и в нём ровно один ключ);
    образ и срок берутся из файлов `$CONF/image` и `$CONF/timeout`, а не зашиты
