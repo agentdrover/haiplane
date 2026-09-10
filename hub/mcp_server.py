@@ -240,18 +240,94 @@ def _parse_api_error(resp: Any, status_code: int) -> dict[str, Any]:
     return payload
 
 
-async def _api_get(path: str, *, timeout: float = 15) -> Any:
+# Транспортные сроки. #1250 их НЕ меняет — величина срока вынесена в scope_out,
+# и подвинуть стену значит оставить за ней ту же пустоту. Имя нужно затем, что
+# отказ обязан назвать срок, который он только что просрочил: значение должно
+# быть под рукой у помощника, а не рассыпано магическими числами по восьми
+# местам.
+_TIMEOUT_DEFAULT = 15.0
+_TIMEOUT_SLOW = 30.0
+
+_TRANSPORT_READ_RETRY = "Повтор безопасен: чтение ничего не меняло."
+_TRANSPORT_WRITE_RETRY = (
+    "Повтор НЕ безопасен: запись могла пройти на сервере, а потеряться мог "
+    "ответ. Сначала прочитай состояние, убедись, прошла ли она, и только "
+    "потом решай про повтор."
+)
+
+
+def _parse_transport_error(
+    exc: Exception,
+    *,
+    timeout: float,
+    write: bool,
+    method: str,
+    path: str,
+) -> dict[str, Any]:
+    """Транспортный отказ → тот же payload, что и HTTP-статус (#1250).
+
+    У httpx на молчащий сервер приходит ReadTimeout, и str() у него ПУСТОЙ —
+    замерено 10.09.2026. FastMCP печатает ровно str(exc), поэтому вызывающий
+    видел «Error executing tool X:» и больше ничего: ни причины, ни срока, ни
+    даже слова «таймаут». Ловится не TimeoutException, а RequestError целиком:
+    отвергнутое соединение, оборванный ответ и неудачное разрешение имени —
+    для вызывающего тот же класс отказа.
+
+    Чтение и запись расходятся текстом намеренно. Правило хаба гласит, что
+    ошибка транспорта не означает «запись не прошла»; выполнить его можно,
+    только зная, что случился транспорт и что повтор записи небезопасен.
+
+    Сообщение идёт через _strip_internal_urls, как и ошибки статуса: у
+    ReadTimeout внутренний адрес лежит в exc.request.url, и часть транспортных
+    исключений вписывает его прямо в текст.
+    """
     import httpx
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.get(f"{_hub_url()}{path}", headers=_auth_headers())
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json()
+    kind = type(exc).__name__
+    timed_out = isinstance(exc, httpx.TimeoutException)
+    reason = "transport_timeout" if timed_out else "transport_error"
+    what = "не дождался ответа хаба" if timed_out else "не смог поговорить с хабом"
+    detail = _strip_internal_urls(str(exc))
+    tail = f" Транспорт сказал: {detail}." if detail else ""
+    retry = _TRANSPORT_WRITE_RETRY if write else _TRANSPORT_READ_RETRY
+    message = _strip_internal_urls(
+        f"{method} {path} {what}: {kind}, срок ожидания {timeout:g} с.{tail} {retry}"
+    )
+    return enrich_error_payload(
+        {
+            "reason": reason,
+            "message": message,
+            "hint": retry,
+            "actor_hint": "agent",
+            "suggested_tool": "hub_task_status" if write else None,
+            "transport": kind,
+            "timeout_seconds": timeout,
+            "retry_safe": not write,
+            "write": write,
+        }
+    )
+
+
+async def _api_get(path: str, *, timeout: float | None = None) -> Any:
+    import httpx
+
+    deadline = _TIMEOUT_DEFAULT if timeout is None else timeout
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.get(f"{_hub_url()}{path}", headers=_auth_headers())
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json()
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=False, method="GET", path=path
+            )
+        ) from exc
 
 
 async def _api_post(
@@ -265,64 +341,96 @@ async def _api_post(
     headers = _auth_headers()
     if extra_headers:
         headers.update(extra_headers)
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{_hub_url()}{path}", json=body or {}, headers=headers
-        )
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json()
+    deadline = _TIMEOUT_SLOW
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.post(
+                f"{_hub_url()}{path}", json=body or {}, headers=headers
+            )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json()
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=True, method="POST", path=path
+            )
+        ) from exc
 
 
 async def _api_patch(path: str, body: dict[str, Any] | None = None) -> Any:
     import httpx
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.patch(
-            f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
-        )
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json()
+    deadline = _TIMEOUT_DEFAULT
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.patch(
+                f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
+            )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json()
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=True, method="PATCH", path=path
+            )
+        ) from exc
 
 
 async def _api_put(path: str, body: Any) -> Any:
     """PUT for collection-level replace (e.g. acceptance criteria)."""
     import httpx
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.put(
-            f"{_hub_url()}{path}", json=body, headers=_auth_headers()
-        )
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json()
+    deadline = _TIMEOUT_DEFAULT
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.put(
+                f"{_hub_url()}{path}", json=body, headers=_auth_headers()
+            )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json()
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=True, method="PUT", path=path
+            )
+        ) from exc
 
 
 async def _api_delete(path: str) -> None:
     """DELETE returning 204 / no body."""
     import httpx
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.delete(f"{_hub_url()}{path}", headers=_auth_headers())
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
+    deadline = _TIMEOUT_DEFAULT
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.delete(f"{_hub_url()}{path}", headers=_auth_headers())
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=True, method="DELETE", path=path
+            )
+        ) from exc
 
 
 async def _api_delete_json(path: str) -> Any:
@@ -331,15 +439,23 @@ async def _api_delete_json(path: str) -> Any:
     difference between "removed" and "was not there"."""
     import httpx
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.delete(f"{_hub_url()}{path}", headers=_auth_headers())
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json()
+    deadline = _TIMEOUT_DEFAULT
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.delete(f"{_hub_url()}{path}", headers=_auth_headers())
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json()
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=True, method="DELETE", path=path
+            )
+        ) from exc
 
 
 async def _api_post_with_status(
@@ -348,34 +464,55 @@ async def _api_post_with_status(
     """POST that also returns the HTTP status (e.g. 201 created vs 200 existing)."""
     import httpx
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
-        )
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json(), resp.status_code
+    deadline = _TIMEOUT_SLOW
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.post(
+                f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
+            )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json(), resp.status_code
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=True, method="POST", path=path
+            )
+        ) from exc
 
 
 async def _api_put_with_status(path: str, body: Any) -> tuple[Any, int]:
-    """PUT that also returns the HTTP status (201 created vs 200 updated)."""
+    """PUT that also returns the HTTP status (201 created vs 200 updated).
+
+    Восьмой помощник: постановка #1250 перечисляла семь, но в develop их уже
+    восемь, и этот тоже пишет. Ветка добавлена и ему — иначе правило «каждое
+    место применения» закрыто на бумаге, а не в коде.
+    """
     import httpx
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.put(
-            f"{_hub_url()}{path}", json=body, headers=_auth_headers()
-        )
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json(), resp.status_code
+    deadline = _TIMEOUT_DEFAULT
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.put(
+                f"{_hub_url()}{path}", json=body, headers=_auth_headers()
+            )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json(), resp.status_code
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=True, method="PUT", path=path
+            )
+        ) from exc
 
 
 def _finding_line(finding: dict[str, Any]) -> str:

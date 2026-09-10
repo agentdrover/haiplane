@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+
 from unittest.mock import ANY, AsyncMock, patch
 
 from typing import Any
@@ -3830,3 +3832,219 @@ async def test_no_rest_tool_lets_hub_api_error_escape() -> None:
 
     assert not unreached, f"probe never reached REST for: {unreached}"
     assert not bare, f"refusal reached the agent without its envelope: {bare}"
+
+
+# --- #1250: транспортный отказ обязан себя назвать -------------------------
+#
+# 10.09.2026 hub_get_review_brief и hub_list_projects отвечали на проде
+# «Error executing tool hub_get_review_brief:» и больше ничем. Причина
+# замерена, а не выведена: у настоящего httpx.ReadTimeout ПУСТОЙ str(), а
+# FastMCP печатает ровно str(exc). Поэтому тесты ниже поднимают НАСТОЯЩИЙ
+# молчащий сервер и ловят НАСТОЯЩИЙ таймаут: подменённое заглушкой исключение
+# с текстом не проверило бы ничего — весь предмет задачи в пустоте текста.
+
+
+_API_HELPER_CALLS: dict[str, tuple[tuple[Any, ...], bool]] = {
+    # имя помощника -> (позиционные аргументы, это запись?)
+    "_api_get": (("/api/tasks",), False),
+    "_api_post": (("/api/tasks", {}), True),
+    "_api_patch": (("/api/tasks/1", {}), True),
+    "_api_put": (("/api/tasks/1/acceptance-criteria", []), True),
+    "_api_delete": (("/api/tasks/1/dependencies/2",), True),
+    "_api_delete_json": (("/api/tasks/1/dependencies/2",), True),
+    "_api_post_with_status": (("/api/projects", {}), True),
+    "_api_put_with_status": (("/api/tasks/1/live-check", {}), True),
+}
+
+
+@contextlib.asynccontextmanager
+async def _silent_hub(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Сервер, который принимает соединение и молчит, — как на проде.
+
+    Сроки укорочены до долей секунды монкипатчем ТЕХ ЖЕ констант, которые
+    читает боевой код: тест и ждёт столько же, сколько потом называет в
+    сообщении. Величина срока при этом не меняется нигде, кроме теста.
+    """
+    import asyncio
+
+    from hub import mcp_server as srv
+
+    handlers: list[Any] = []
+
+    async def handler(reader: Any, writer: Any) -> None:
+        handlers.append(asyncio.current_task())
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    monkeypatch.setattr(srv, "_hub_url", lambda: f"http://127.0.0.1:{port}")
+    monkeypatch.setattr(srv, "_auth_headers", lambda: {})
+    monkeypatch.setattr(srv, "_TIMEOUT_DEFAULT", 0.4)
+    monkeypatch.setattr(srv, "_TIMEOUT_SLOW", 0.4)
+    try:
+        yield port
+    finally:
+        for task in handlers:
+            task.cancel()
+        if handlers:
+            await asyncio.gather(*handlers, return_exceptions=True)
+        server.close()
+        await server.wait_closed()
+
+
+async def test_a_transport_timeout_names_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-1: настоящий ReadTimeout уходит наружу структурированной ошибкой."""
+    import httpx
+
+    from hub import mcp_server as srv
+
+    async with _silent_hub(monkeypatch) as port:
+        # Сначала — механизм, ради которого задача и заведена: у настоящего
+        # таймаута текст ПУСТОЙ, и это не HTTPStatusError.
+        with pytest.raises(httpx.RequestError) as raw:
+            async with httpx.AsyncClient(timeout=0.4) as client:
+                await client.get(f"http://127.0.0.1:{port}/api/tasks")
+        assert str(raw.value) == ""
+        assert not isinstance(raw.value, httpx.HTTPStatusError)
+        assert isinstance(raw.value, httpx.ReadTimeout)
+
+        with pytest.raises(HubApiError) as caught:
+            await srv._api_get("/api/tasks")
+
+    payload = caught.value.payload
+    message = payload["message"]
+    # Пустой строки не бывает — именно её видел вызывающий 10.09.2026.
+    assert message.strip()
+    assert str(caught.value).strip()
+    assert payload["reason"] == "transport_timeout"
+    # Класс отказа назван…
+    assert "ReadTimeout" in message
+    assert payload["transport"] == "ReadTimeout"
+    # …и срок ожидания тоже, тот самый, который только что просрочили.
+    assert "0.4" in message
+    assert payload["timeout_seconds"] == 0.4
+    # Конверт на месте: отказ доезжает до агента тем же путём, что и статус.
+    assert "hint" in payload and "actor_hint" in payload
+    assert json.loads(srv._format_hub_api_error(caught.value))["message"] == message
+
+
+@pytest.mark.parametrize("helper_name", sorted(_API_HELPER_CALLS))
+async def test_every_api_helper_names_a_transport_failure(
+    helper_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-2: каждый помощник поимённо, а не один за всех.
+
+    Один потребитель правила не доказывает остальных: ветку надо было
+    дописать в каждый helper отдельно, поэтому и проверяется каждый.
+    """
+    from hub import mcp_server as srv
+
+    args, is_write = _API_HELPER_CALLS[helper_name]
+    async with _silent_hub(monkeypatch):
+        helper = getattr(srv, helper_name)
+        with pytest.raises(HubApiError) as caught:
+            await helper(*args)
+
+    payload = caught.value.payload
+    assert payload["message"].strip(), f"{helper_name} отдал пустой текст"
+    assert payload["transport"] == "ReadTimeout", helper_name
+    assert payload["reason"] == "transport_timeout", helper_name
+    assert "0.4" in payload["message"], helper_name
+    assert payload["write"] is is_write, helper_name
+
+
+def test_no_api_helper_escapes_the_transport_branch() -> None:
+    """Девятый помощник, добавленный потом, обязан уронить этот тест.
+
+    Перечисление, которое не сверяется с модулем, стареет молча — а именно
+    так задача #1250 и застала восьмой helper при семи в постановке.
+    """
+    import inspect
+
+    from hub import mcp_server as srv
+
+    found = {
+        name
+        for name, obj in vars(srv).items()
+        if name.startswith("_api_") and inspect.iscoroutinefunction(obj)
+    }
+    assert found == set(_API_HELPER_CALLS), found ^ set(_API_HELPER_CALLS)
+
+    source = inspect.getsource(srv)
+    assert source.count("except httpx.RequestError") == len(_API_HELPER_CALLS)
+
+
+async def test_a_write_timeout_does_not_invite_a_blind_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-3: тексты чтения и записи расходятся указанием про повтор."""
+    from hub import mcp_server as srv
+
+    async with _silent_hub(monkeypatch):
+        with pytest.raises(HubApiError) as read:
+            await srv._api_get("/api/tasks")
+        with pytest.raises(HubApiError) as write:
+            await srv._api_post("/api/tasks", {})
+
+    read_payload = read.value.payload
+    write_payload = write.value.payload
+
+    assert read_payload["message"] != write_payload["message"]
+    assert read_payload["retry_safe"] is True
+    assert write_payload["retry_safe"] is False
+    assert "Повтор безопасен" in read_payload["message"]
+    assert "Повтор НЕ безопасен" in write_payload["message"]
+    # Правило хаба выполнимо только если сказано, что делать вместо повтора.
+    assert "состояние" in write_payload["message"]
+    assert write_payload["suggested_tool"] == "hub_task_status"
+    assert read_payload["suggested_tool"] is None
+
+
+async def test_a_transport_failure_leaks_no_internal_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC-4: внутренний адрес не просачивается — ветка идёт через тот же
+    _strip_internal_urls, что и ошибки HTTP-статуса."""
+    import httpx
+
+    from hub import mcp_server as srv
+
+    async with _silent_hub(monkeypatch) as port:
+        with pytest.raises(HubApiError) as read:
+            await srv._api_get("/api/tasks")
+        with pytest.raises(HubApiError) as write:
+            await srv._api_post("/api/tasks", {})
+
+        # У настоящего ReadTimeout адрес лежит в exc.request.url, то есть
+        # соблазн его напечатать реален. Проверяются ТЕКСТОВЫЕ поля отказа:
+        # base_url в конверте — объявленный эхо-адрес инстанса, он приходит
+        # ровно так же и на ошибках HTTP-статуса, и предметом не является.
+        for caught in (read, write):
+            texts = json.dumps(
+                [caught.value.payload.get(f) for f in ("message", "hint")],
+                ensure_ascii=False,
+            )
+            assert "127.0.0.1" not in texts
+            assert str(port) not in texts
+
+        # Проверка не вхолостую: транспортный отказ, который сам вписал адрес
+        # в свой текст, тоже приходит очищенным.
+        url = f"http://127.0.0.1:{port}/api/tasks"
+        noisy = httpx.ConnectError(
+            f"connection failed for url '{url}' — {url}",
+            request=httpx.Request("GET", url),
+        )
+        payload = srv._parse_transport_error(
+            noisy, timeout=0.4, write=False, method="GET", path="/api/tasks"
+        )
+        assert "127.0.0.1" not in payload["message"]
+        assert "127.0.0.1" not in payload["hint"]
+        assert payload["reason"] == "transport_error"
+        assert payload["message"].strip()
