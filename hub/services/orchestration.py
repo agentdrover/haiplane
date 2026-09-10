@@ -3876,6 +3876,28 @@ async def transition_after_agent_done(
         # the hub never learned its number" — and the second one completed
         # tasks over unmerged branches. The lookup runs here, at done time,
         # instead of only at submission.
+        #
+        # #1155: последний маршрут, до которого конвейер гейтов НЕ доезжает.
+        # Ветка уходит в completed ЗДЕСЬ, выше вызова
+        # _run_headless_submit_gates, поэтому шаг исходов на ней не работал
+        # никогда — и находка, из-за которой работу вернули, уносилась в
+        # завершённую задачу молча. Достижимо без искусственного opt-out:
+        # сабтаску auto_review=False ставит сам продукт
+        # (create_subtasks_bulk), а pair-start и submit-review ей не
+        # запрещены — зонд прошёл open → pair-start → submit-review →
+        # CHANGES_REQUESTED с подтверждённой находкой → done → completed, и
+        # в ленте не было ни слова. Хуже, чем на pending_report: там задача
+        # ещё жива, здесь вопрос закрывается вместе с задачей.
+        #
+        # Та же заметка, тот же шаг и тот же потолок warn, что у конвейера и
+        # у маршрута pending_report. Двойной печати нет: конвейер живёт в
+        # ветке НИЖЕ этого return, а pending_report сюда не заходит вовсе.
+        # Отказывать нельзя — потолок этого пути warn по решению #1122.
+        from hub.services.lifecycle import unanswered_findings_note
+
+        still_open_note = await unanswered_findings_note(db, task)
+        if still_open_note:
+            await repo.add_task_update(db, task_id, "hub", "alert", still_open_note)
         return await _complete_without_review(
             db,
             task,
