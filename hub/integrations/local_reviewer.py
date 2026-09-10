@@ -55,7 +55,7 @@ import stat
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from hub import config
 from hub.process_kill import kill_process_group
@@ -182,6 +182,17 @@ _PODMAN_DEADLINE_HINT = (
     "по-прежнему не сможет — тот же случай, что --timeout после образа. "
     "Поставьте --timeout <секунды> — см. deploy/LOCAL-REVIEW.md"
 )
+_PODMAN_UNKNOWN_FLAG_HINT = (
+    "LOCAL_REVIEW_SANDBOX: в строке podman run стоит флаг «{flag}», про "
+    "который страж не знает, берёт ли тот значение отдельным токеном. "
+    "Разобрать строку до образа поэтому нельзя, а значит нельзя и сказать, "
+    "есть ли у контейнера свой срок жизни: за проглоченным значением может "
+    "стоять ещё один --timeout, и действующим будет он. Это НЕ разрешение "
+    "работать — стражу «не знаю» и «всё в порядке» не одно и то же. "
+    "Напишите флаг в форме {flag}=<значение> — она однозначна и от списков "
+    "не зависит — либо уберите его из строки песочницы, спрятав podman "
+    "внутрь враппера-скрипта, как советует deploy/LOCAL-REVIEW.md"
+)
 _DOCKER_HINT = (
     "LOCAL_REVIEW_SANDBOX: docker run отсоединяет контейнер от хаба так же, "
     "как podman, но флага собственного срока жизни (аналога podman "
@@ -248,10 +259,14 @@ _ENGINE_GLOBAL_VALUE_FLAGS: dict[str, frozenset[str]] = {
 # машинным ревью 09.09.2026, находка 2e24a6068bbc3fa1: ``podman run --rm -i
 # img cursor-agent --timeout 60`` проходил как запуск со своим сроком).
 #
-# Неизвестный флаг здесь считается булевым, и если он на самом деле берёт
-# значение, его значение будет принято за образ. Ошибка тогда идёт в сторону
-# ОТКАЗА с названным флагом, а не в сторону молчаливого разрешения: отказ
-# оператор увидит в карточке и поправит, а разрешение не увидит никто.
+# Прежняя редакция этого комментария утверждала, что неизвестный флаг можно
+# считать булевым, потому что «ошибка тогда идёт в сторону отказа». Это
+# НЕВЕРНО, и измерено 10.09.2026 на ``podman run --timeout 60 --blkio-weight
+# 500 --timeout 0 img``: ``--blkio-weight`` в списке не назван, ``500``
+# принято за образ, разбор кончился — и ВТОРОЙ ``--timeout 0`` не увиден, а
+# у podman действует последний. Страж пропустил контейнер без срока жизни,
+# то есть ошибся ровно В СТОРОНУ ПРОПУСКА. Поэтому неизвестный флаг больше
+# не угадывается: см. _RUN_VALUELESS_FLAGS и поле ``unknown`` у _RunFlags.
 _RUN_VALUE_FLAGS: frozenset[str] = frozenset(
     {
         "--add-host",
@@ -318,9 +333,72 @@ _RUN_VALUE_FLAGS: frozenset[str] = frozenset(
 )
 
 
-def _container_run_flags(
-    parts: list[str], engine: str
-) -> list[tuple[str, str | None]] | None:
+# Флаги ``<engine> run``, которые значения НЕ берут. Список нужен не ради
+# полноты, а ради РАЗЛИЧЕНИЯ: «флаг известен и он булев» против «флаг мне не
+# известен». Без него разбор угадывал, и угадывал в сторону пропуска (см.
+# комментарий к _RUN_VALUE_FLAGS). Булевы флаги обоих движков разбираются
+# spf13/pflag, а он значение отдельным токеном у булевого флага НЕ берёт —
+# только форму ``--flag=value``; значит принять их за беззначные безопасно.
+_RUN_VALUELESS_FLAGS: frozenset[str] = frozenset(
+    {
+        "--",
+        "--detach",
+        "-d",
+        "--help",
+        "--http-proxy",
+        "--init",
+        "--interactive",
+        "-i",
+        "--no-healthcheck",
+        "--no-hosts",
+        "--oom-kill-disable",
+        "--passwd",
+        "--privileged",
+        "--publish-all",
+        "-P",
+        "--quiet",
+        "-q",
+        "--read-only",
+        "--replace",
+        "--rm",
+        "--rmi",
+        "--sig-proxy",
+        "--tls-verify",
+        "--tty",
+        "-t",
+        "--unsetenv-all",
+    }
+)
+# Буквы слипшегося короткого пучка (``-it``, ``-ti``, ``-itd``), значения не
+# берущие. Пучок с чужой буквой известным не считается.
+_RUN_VALUELESS_SHORTS = frozenset("Pdiqt")
+
+
+def _is_valueless_run_flag(token: str) -> bool:
+    """Флаг ``run``, о котором ТОЧНО известно, что значения он не берёт."""
+    if token in _RUN_VALUELESS_FLAGS:
+        return True
+    if token.startswith("--") or not token.startswith("-"):
+        return False
+    body = token[1:]
+    return bool(body) and all(ch in _RUN_VALUELESS_SHORTS for ch in body)
+
+
+class _RunFlags(NamedTuple):
+    """Окно флагов ``<engine> run`` и признак того, что разбор не достоверен.
+
+    ``unknown`` — имя первого флага, про который неизвестно, берёт ли он
+    значение отдельным токеном. Пока он пуст, окну можно верить; как только
+    он назван, судить по этому окну о сроке жизни контейнера НЕЛЬЗЯ: за
+    проглоченным значением может стоять ещё один ``--timeout``, и именно он
+    будет действующим.
+    """
+
+    flags: list[tuple[str, str | None]]
+    unknown: str
+
+
+def _container_run_flags(parts: list[str], engine: str) -> _RunFlags | None:
     """Флаги самого ``<engine> run`` — до образа. ``None``, если это не run.
 
     Возвращается именно окно флагов запуска, а не вся строка: судить о сроке
@@ -347,6 +425,7 @@ def _container_run_flags(
             # 10.09.2026, находка 96144e6317c1d7ac).
             continue
         own: list[tuple[str, str | None]] = []
+        unknown = ""
         k = j + 1
         while k < len(parts) and parts[k].startswith("-"):
             if parts[k] in _RUN_VALUE_FLAGS:
@@ -355,8 +434,16 @@ def _container_run_flags(
             else:
                 name, sep, value = parts[k].partition("=")
                 own.append((name, value if sep else None))
+                # Форма ``--flag=value`` однозначна и от списков не зависит.
+                # А вот голый флаг, которого нет НИ в одном из двух списков,
+                # разбору не по зубам: следующий токен может быть и его
+                # значением, и образом, и от выбора зависит, увидим ли мы
+                # флаги правее. Запоминаем ПЕРВЫЙ такой — он и называется в
+                # отказе.
+                if not sep and not _is_valueless_run_flag(parts[k]):
+                    unknown = unknown or parts[k]
                 k += 1
-        return own
+        return _RunFlags(own, unknown)
     return None
 
 
@@ -428,8 +515,16 @@ def detaching_sandbox() -> list[str]:
     ):
         reasons.append(_SCOPE_HINT)
     podman_flags = _container_run_flags(parts, "podman")
-    if podman_flags is not None:
-        deadline = _flag_value(podman_flags, "--timeout")
+    if podman_flags is not None and podman_flags.unknown:
+        # Неизвестный флаг со значением отменяет ЛЮБОЕ суждение о сроке, а не
+        # только положительное: он мог проглотить и сам --timeout, и тогда
+        # «допишите --timeout» — совет починить то, что уже написано. Честный
+        # отказ называет флаг, который сорвал разбор (измерено 10.09.2026 на
+        # ``podman run --timeout 60 --blkio-weight 500 --timeout 0 img``:
+        # страж пропускал строку, где действующий срок — ноль).
+        reasons.append(_PODMAN_UNKNOWN_FLAG_HINT.format(flag=podman_flags.unknown))
+    elif podman_flags is not None:
+        deadline = _flag_value(podman_flags.flags, "--timeout")
         if deadline is _FLAG_ABSENT:
             reasons.append(_PODMAN_HINT)
         elif not _names_a_deadline(deadline):
@@ -638,6 +733,36 @@ def _wrapper_windows(parts: list[str]) -> list[tuple[str, list[str]]]:
     return windows
 
 
+def _named_sandbox_user() -> tuple[str, str]:
+    """ИНСТРУМЕНТ и пользователь ХОСТА, названные в песочнице, или ("", "").
+
+    Инструмент возвращается вместе с именем, потому что форма записи
+    пользователя — свойство ИНСТРУМЕНТА, а не строки: ``#1000`` у sudo это
+    числовой uid, а у systemd-run такой формы нет вовсе. Разрешать имя,
+    забыв, кто его написал, значит либо отвергать годную настройку, либо
+    принимать негодную (найдено ревьюером Codex 10.09.2026 на ff617db).
+    """
+    parts = shlex.split(config.LOCAL_REVIEW_SANDBOX or "")
+    named: list[tuple[str, str]] = []
+    for tool, own in _wrapper_windows(parts):
+        flags = _USER_FLAGS[tool]
+        for i, part in enumerate(own):
+            for flag in flags:
+                if part.startswith(flag + "="):
+                    named.append((tool, part.split("=", 1)[1]))
+                    break
+                if part == flag and i + 1 < len(own):
+                    named.append((tool, own[i + 1]))
+                    break
+                if len(flag) == 2 and not flag.startswith("--"):
+                    bundled = _bundled_short_value(part, flag[1], own, i)
+                    if bundled:
+                        named.append((tool, bundled))
+                        break
+    entry = _effective(named)
+    return ("", "") if entry is _FLAG_ABSENT else entry
+
+
 def sandbox_uid() -> str:
     """Пользователь ХОСТА, названный в песочнице, или "".
 
@@ -652,25 +777,7 @@ def sandbox_uid() -> str:
     — то есть проверка, заведённая ради 45971e09, отвечала не про ту
     конфигурацию (найдено при работе над #1208, ревьюер этого не называл).
     """
-    parts = shlex.split(config.LOCAL_REVIEW_SANDBOX or "")
-    named: list[str] = []
-    for tool, own in _wrapper_windows(parts):
-        flags = _USER_FLAGS[tool]
-        for i, part in enumerate(own):
-            for flag in flags:
-                if part.startswith(flag + "="):
-                    named.append(part.split("=", 1)[1])
-                    break
-                if part == flag and i + 1 < len(own):
-                    named.append(own[i + 1])
-                    break
-                if len(flag) == 2 and not flag.startswith("--"):
-                    bundled = _bundled_short_value(part, flag[1], own, i)
-                    if bundled:
-                        named.append(bundled)
-                        break
-    user = _effective(named)
-    return "" if user is _FLAG_ABSENT else str(user)
+    return _named_sandbox_user()[1]
 
 
 def scratch_problem() -> list[str]:
@@ -711,15 +818,51 @@ def scratch_problem() -> list[str]:
     return _uid_outside_group(base, st.st_gid)
 
 
-def _resolve_user(user: str) -> Any | None:
+def _resolve_user(user: str, tool: str = "") -> Any | None:
     """Пользователь песочницы: ИМЯ или ЧИСЛО. Не разрешился — None.
 
     Числовая форма — не экзотика: ``--uid`` у systemd-run принимает и её, а
     ``getpwnam("65534")`` бросает KeyError, то есть проверка группы на таком
     значении молча ничего не проверяла (найдено ревью, неразрешённая
     534e16e4).
+
+    Форма ``#1000`` — тоже не экзотика, а НАСТОЯЩИЙ синтаксис sudo(8): «The
+    user may be either a user name or a numeric user ID (UID) prefixed with
+    the '#' character». Решётка у sudo как раз и снимает неоднозначность
+    между ИМЕНЕМ ``1000`` и uid ``1000`` — обе записи законны и означают
+    разное. Без неё ``'#1000'.isdigit()`` ложно, разбор уходил в
+    ``getpwnam('#1000')`` и падал ВСЕГДА: годная настройка отвергалась, а
+    оператору называлась неверная причина — «пользователь не разрешается в
+    системе» вместо «страж не знает этой записи» (найдено ревьюером Codex
+    10.09.2026, воспроизведено на ff617db).
+
+    ``tool`` обязателен именно потому, что форма принадлежит инструменту, и
+    правило это двустороннее:
+
+    * у systemd-run записи ``--uid=#1000`` не существует, и принять её там
+      значило бы разрешить строку, которую сам systemd-run отвергнет;
+    * у sudo, наоборот, ГОЛОЕ ЧИСЛО — это ИМЯ, а не uid, и разрешать его
+      через ``getpwuid`` значит проверить членство в группе НЕ У ТОГО, а
+      заодно одобрить строку, на которой sudo и не запустится.
+
+    Второе не выведено из мана, а ЗАМЕРЕНО 10.09.2026 на машине разработки,
+    где uid 501 существует и принадлежит вызывающему::
+
+        sudo -n -u 501 true    -> «sudo: unknown user 501», rc 1
+        sudo -n -u '#501' true -> rc 0
+
+    То есть ``getpwuid(501)`` для строки ``sudo -u 501`` отвечает про
+    пользователя, которого sudo в ней НЕ ВИДИТ. Ошибка шла в сторону
+    ПРОПУСКА: страж говорил «настроено» про песочницу, которая падает на
+    первом же запуске (доделано преемником на #1208; ревьюер называл только
+    форму с решёткой).
     """
     try:
+        if tool == "sudo":
+            if user.startswith("#"):
+                return pwd.getpwuid(int(user[1:]))
+            # Голое число у sudo — имя. Никакого getpwuid здесь быть не может.
+            return pwd.getpwnam(user)
         return pwd.getpwuid(int(user)) if user.isdigit() else pwd.getpwnam(user)
     except (KeyError, ValueError, OverflowError):
         return None
@@ -735,10 +878,10 @@ def _uid_outside_group(base: str, gid: int) -> list[str]:
     а в карточке будет «завершилось без отчёта» вместо названной причины,
     которую документ обещает.
     """
-    user = sandbox_uid()
+    tool, user = _named_sandbox_user()
     if not user:
         return []  # песочница не называет пользователя — судить не о чем
-    entry = _resolve_user(user)
+    entry = _resolve_user(user, tool)
     try:
         group = grp.getgrgid(gid)
     except (KeyError, OSError):

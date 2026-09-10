@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -33,6 +34,7 @@ from hub.services.model_family import family
 from hub.services.review_dispatch import (
     DEEP,
     _REVIEW_MODEL_PREFERENCES,
+    _delivery_block,
     REVIEW_FILE_LINE_CAP,
     changed_paths,
     diff_plan,
@@ -4655,6 +4657,213 @@ def test_a_container_launch_without_its_own_deadline_is_refused(monkeypatch) -> 
     assert local_reviewer.detaching_sandbox() == []
 
 
+
+def test_the_run_guard_refuses_the_string_it_cannot_parse(monkeypatch) -> None:
+    """Неизвестный флаг СО ЗНАЧЕНИЕМ — отказ, а не молчаливое «срок есть».
+
+    Объявленное ограничение задачи — «стражи узкие и по имени, чего не знают,
+    пропускают» — здесь НЕ оправдание: страж уже решил, что строку понял, и
+    вынес по ней суждение «свой срок жизни у контейнера есть». Разница между
+    «не смотрел» и «посмотрел и одобрил» — вся разница, ради которой страж
+    написан.
+
+    Воспроизведено на ff617db (найдено ревьюером Codex 10.09.2026):
+
+        podman run --timeout 60 --blkio-weight 500 --timeout 0 img
+        detaching_sandbox() -> []            # пропуск
+        podman run --timeout 0 img
+        detaching_sandbox() -> ОТКАЗ         # правильно
+
+    ``--blkio-weight`` не назван в _RUN_VALUE_FLAGS, поэтому ``500`` принято
+    за имя образа, разбор кончился, и ВТОРОЙ ``--timeout 0`` остался невиден.
+    У podman действующим будет последний, то есть ноль, то есть срока жизни
+    нет — а именно его отсутствие этот страж и обязан не пропустить.
+    """
+    ambiguous = [
+        # Ровно строка находки: первый --timeout годен, второй спрятан.
+        "/usr/bin/podman run --timeout 60 --blkio-weight 500 --timeout 0 img",
+        # Тот же класс, где спрятан САМ срок: «допишите --timeout» было бы
+        # советом починить уже написанное, поэтому отказ говорит о разборе.
+        "/usr/bin/podman run --blkio-weight 500 --timeout 1800 img",
+        # Неизвестный флаг вообще без --timeout — по-прежнему отказ, но
+        # причина честная: строку не разобрать.
+        "/usr/bin/podman run --rm -i --blkio-weight 500 img",
+    ]
+    for sandbox in ambiguous:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.detaching_sandbox()
+        assert reasons, (
+            f"«{sandbox}» содержит флаг, о котором страж не знает, берёт ли "
+            "тот значение. Пустой список здесь означает «посмотрел и "
+            "одобрил» — то есть контейнер без срока жизни пройдёт молча"
+        )
+        assert any("--blkio-weight" in r for r in reasons), (
+            "отказ обязан НАЗВАТЬ флаг, сорвавший разбор, иначе оператор не "
+            f"поймёт, что чинить: {reasons}"
+        )
+
+    # Однозначная форма ``--flag=value`` от списков не зависит вовсе, и
+    # отказа на ней быть не должно — иначе починка оплачена ложным отказом
+    # на годной строке.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/podman run --rm -i --blkio-weight=500 --timeout=1800 img",
+    )
+    assert local_reviewer.detaching_sandbox() == [], (
+        "в форме --flag=value значение не может быть принято за образ, "
+        f"разбирать нечего: {local_reviewer.detaching_sandbox()}"
+    )
+
+    # Известные беззначные флаги — в том числе слипшийся пучок ``-it`` —
+    # ложного отказа не дают.
+    for fine in (
+        "/usr/bin/podman run --rm -i --timeout 1800 img",
+        "/usr/bin/podman run --rm -it --privileged --timeout 1800 img",
+        "/usr/bin/podman run -itd --read-only --timeout 1800 img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", fine)
+        assert local_reviewer.detaching_sandbox() == [], (
+            f"«{fine}» состоит из названных флагов и своего срока жизни не "
+            f"теряет: {local_reviewer.detaching_sandbox()}"
+        )
+
+    # И то, что стоит ПОСЛЕ образа, окном флагов запуска не является: команда
+    # полезной нагрузки со своим неизвестным флагом отказа не порождает.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/podman run --rm -i --timeout 1800 img cursor-agent --blkio-weight 5",
+    )
+    assert local_reviewer.detaching_sandbox() == [], (
+        "флаги за образом принадлежат программе внутри контейнера: "
+        f"{local_reviewer.detaching_sandbox()}"
+    )
+
+
+def test_sudo_names_a_numeric_uid_with_a_hash(monkeypatch) -> None:
+    """``sudo -u '#1000'`` — числовой uid, а не имя, которого нет в системе.
+
+    sudo(8): «The user may be either a user name or a numeric user ID (UID)
+    prefixed with the '#' character». Воспроизведено на ff617db (найдено
+    ревьюером Codex 10.09.2026)::
+
+        sudo -n -u #1000 /usr/local/bin/wrap
+        sandbox_uid() -> '#1000'   _resolve_user('#1000') -> None
+
+    ``'#1000'.isdigit()`` ложно, разбор уходил в ``getpwnam('#1000')`` и падал
+    ВСЕГДА. Отказ шёл в безопасную сторону, но причину называл неверную:
+    оператор читал «пользователь не разрешается в системе» про пользователя,
+    который в системе есть.
+
+    Решётка снимает неоднозначность именно У SUDO: там ``1000`` — это ИМЯ, а
+    ``#1000`` — uid, и обе записи законны. У systemd-run такой формы нет, и
+    принимать её там значит разрешить строку, которую сам systemd-run
+    отвергнет, — поэтому тест держит и это.
+    """
+    import pwd
+
+    me = pwd.getpwuid(os.getuid())
+    uid = me.pw_uid
+
+    # Форма sudo с решёткой разрешается в НАСТОЯЩЕГО пользователя.
+    for sandbox in (
+        f"/usr/bin/sudo -n -u #{uid} /usr/local/bin/wrap",
+        f"/usr/bin/sudo -n --user=#{uid} /usr/local/bin/wrap",
+        f"/usr/bin/sudo -nu#{uid} /usr/local/bin/wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        tool, user = local_reviewer._named_sandbox_user()
+        entry = local_reviewer._resolve_user(user, tool)
+        assert entry is not None and entry.pw_uid == uid, (
+            f"«{sandbox}» называет uid {uid} синтаксисом самого sudo, а страж "
+            f"его не разрешил ({tool!r}, {user!r} -> {entry}): годная "
+            "настройка отвергается, и человеку называется ложная причина"
+        )
+
+    # Различение сохранено: у systemd-run решётки нет, и придумывать её там
+    # нельзя — а голое число он принимает как uid по-прежнему.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/systemd-run --scope --uid=#{uid} --"
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    assert local_reviewer._resolve_user(user, tool) is None, (
+        "у systemd-run записи --uid=#N не существует; принять её значило бы "
+        "разрешить строку, на которой запуск упадёт уже внутри systemd-run"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/systemd-run --scope --uid={uid} --"
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    entry = local_reviewer._resolve_user(user, tool)
+    assert entry is not None and entry.pw_uid == uid, (
+        "числовая форма systemd-run (неразрешённая 534e16e4) не сломана"
+    )
+
+    # И обратная сторона того же правила: у sudo ГОЛОЕ число — это ИМЯ.
+    # Замерено 10.09.2026 на машине разработки, где uid 501 существует и
+    # принадлежит вызывающему::
+    #
+    #     sudo -n -u 501 true    -> «sudo: unknown user 501», rc 1
+    #     sudo -n -u '#501' true -> rc 0
+    #
+    # Значит ``getpwuid`` на такой записи отвечает про пользователя, которого
+    # sudo в строке НЕ ВИДИТ, — и страж одобрял бы песочницу, падающую на
+    # первом запуске. Ревьюер называл только форму с решёткой; эта половина
+    # доделана преемником.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -n -u {uid} /usr/local/bin/wrap"
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    bare = local_reviewer._resolve_user(user, tool)
+    assert bare is None or bare.pw_name == str(uid), (
+        f"«sudo -u {uid}» — это ИМЯ «{uid}», а страж разрешил его как uid и "
+        f"назвал «{bare.pw_name if bare else None}»: членство в группе "
+        "проверяется у постороннего, и песочница, на которой sudo скажет "
+        "«unknown user», объявляется настроенной"
+        # Оговорка «или пользователь с таким именем правда есть» — не
+        # смягчение: если он есть, getpwnam его и вернёт, и ответ верен.
+    )
+    # А у systemd-run голое число uid-ом БЫТЬ ОБЯЗАНО — иначе доделка выше
+    # сломала бы неразрешённую 534e16e4, ради которой числовая форма и заведена.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/systemd-run --scope --uid={uid} --"
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    entry = local_reviewer._resolve_user(user, tool)
+    assert entry is not None and entry.pw_uid == uid
+
+    # Имя пользователя по-прежнему разрешается по имени, а мусор с решёткой —
+    # по-прежнему нет: отказ остаётся отказом.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/sudo -n -u {me.pw_name} /usr/local/bin/wrap",
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    assert local_reviewer._resolve_user(user, tool) is not None
+    for junk in ("#", "#abc", "#-1"):
+        monkeypatch.setattr(
+            config,
+            "LOCAL_REVIEW_SANDBOX",
+            f"/usr/bin/sudo -n -u '{junk}' /usr/local/bin/wrap",
+        )
+        tool, user = local_reviewer._named_sandbox_user()
+        assert local_reviewer._resolve_user(user, tool) is None, (
+            f"«{junk}» числовым uid не является, и разрешаться не должен"
+        )
+
+    # И проверка группы каталога прогонов на форме с решёткой ДОХОДИТ до
+    # существа: пользователь разрешён, поэтому «не смогли проверить» больше
+    # не звучит. Прямой вызов _resolve_user выше этого не показал бы —
+    # scratch_problem зовёт его сам.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -n -u #{uid} /wrap"
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", "")
+    assert local_reviewer.scratch_problem() == []
+
+
 def test_the_doc_recommends_only_sandboxes_the_hub_accepts(monkeypatch) -> None:
     """AC-4: строки песочницы ИЗ ДОКУМЕНТА прогоняются через самих стражей.
 
@@ -4790,7 +4999,62 @@ def test_the_doc_probe_runs_the_same_command_the_hub_will_run(monkeypatch) -> No
         )
 
 
-def test_the_doc_wrapper_skeleton_names_its_own_deadline(monkeypatch) -> None:
+def _doc_wrapper_launch(tmp_path) -> str:
+    """Строка запуска движка, какой её видит движок ПОСЛЕ подстановки.
+
+    Скелет из документа не читается глазами и не разбирается регулярками: он
+    ИСПОЛНЯЕТСЯ с подменённым на заглушку движком, и наружу отдаётся тот
+    argv, который заглушка получила. Разница не косметическая — в скелете
+    стоят переменные (``--timeout="$TIMEOUT"``, ``"$IMAGE"``), и текст
+    «--timeout "$TIMEOUT"» выглядит убедительно ровно так же при пустом
+    TIMEOUT, при опечатке в имени переменной и при её потере под ``set -u``.
+    Проверять текст значило бы проверять намерение, а не команду.
+    """
+    blocks = [
+        b
+        for b in re.findall(r"```sh\n(.*?)```", _DEPLOY_DOC.read_text(), re.S)
+        if "podman run" in b
+    ]
+    assert len(blocks) == 1, (
+        f"в {_DEPLOY_DOC.name} ожидался ровно один sh-скелет враппера с "
+        f"podman run, найдено {len(blocks)}"
+    )
+    script = textwrap.dedent(blocks[0])
+    engine = next(
+        tok
+        for tok in shlex.split(script.replace("\\\n", " "))
+        if tok.rsplit("/", 1)[-1] == "podman"
+    )
+    log = tmp_path / "argv.log"
+    stub = tmp_path / "podman"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, shlex, sys\n"
+        "open(os.environ['ARGV_LOG'], 'a').write(shlex.join(sys.argv[1:]) + '\\n')\n"
+    )
+    stub.chmod(0o755)
+    wrapper = tmp_path / "haiplane-review-run"
+    wrapper.write_text(script.replace(engine, str(stub)))
+    wrapper.chmod(0o755)
+
+    done = subprocess.run(
+        [str(wrapper), "cursor-agent", "--print"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "ARGV_LOG": str(log)},
+    )
+    assert done.returncode == 0, f"скелет враппера не запустился: {done.stderr}"
+    seen = [line for line in log.read_text().splitlines() if line]
+    runs = [line for line in seen if shlex.split(line)[:1] == ["run"]]
+    assert len(runs) == 1, (
+        f"скелет враппера обязан один раз позвать «podman run»; движок "
+        f"получил {seen}"
+    )
+    return shlex.join([engine, *shlex.split(runs[0])])
+
+
+def test_the_doc_wrapper_skeleton_names_its_own_deadline(monkeypatch, tmp_path) -> None:
     """Срок жизни контейнера в скелете враппера держится тестом, а не текстом.
 
     Рекомендованная песочница — ``sudo … /usr/local/bin/haiplane-review-run``,
@@ -4802,28 +5066,15 @@ def test_the_doc_wrapper_skeleton_names_its_own_deadline(monkeypatch) -> None:
     b3a35600e66e971d). То есть флаг, ради которого писан страж, на
     рекомендованном пути не держался ничем.
 
-    Проверяется не глазами и не подстрокой: строка запуска берётся ИЗ ФАЙЛА и
+    Проверяется не глазами и не подстрокой: строка запуска берётся ИЗ ФАЙЛА,
+    ИСПОЛНЯЕТСЯ (переменные скелета подставляются оболочкой, а не читателем) и
     прогоняется через САМОГО стража хаба — то же правило, что AC-4 применяет
     к песочнице, применённое там, где на этом рецепте живёт срок жизни.
     """
-    blocks = [
-        b
-        for b in re.findall(r"```sh\n(.*?)```", _DEPLOY_DOC.read_text(), re.S)
-        if "podman run" in b
-    ]
-    assert len(blocks) == 1, (
-        f"в {_DEPLOY_DOC.name} ожидался ровно один sh-скелет враппера с "
-        f"podman run, найдено {len(blocks)}"
-    )
-    joined = textwrap.dedent(blocks[0]).replace("\\\n", " ")
-    launches = [line for line in joined.splitlines() if "podman run" in line]
-    assert len(launches) == 1, (
-        f"в скелете враппера ожидалась ровно одна строка запуска podman, "
-        f"найдено {len(launches)}: {launches}"
-    )
-    # ``exec`` и хвостовой ``"$@"`` — оболочка запуска, а не флаги podman.
-    launch = launches[0].strip().removeprefix("exec ").removesuffix(' "$@"')
-
+    launch = _doc_wrapper_launch(tmp_path)
+    # Хвост ``cursor-agent --print`` — команда ВНУТРИ контейнера; стражу она
+    # безразлична, и убирать её незачем: окно флагов запуска кончается на
+    # образе.
     monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", launch)
     assert local_reviewer.detaching_sandbox() == [], (
         f"скелет враппера из документа запускает «{launch}», и хаб отверг бы "
@@ -4831,6 +5082,51 @@ def test_the_doc_wrapper_skeleton_names_its_own_deadline(monkeypatch) -> None:
         "страж её не увидит — а значит прогон нельзя будет снять, и хаб "
         "напишет в ленту, что снял"
     )
+
+
+def test_the_doc_wrapper_leaves_the_network_the_hub_hands_the_run(tmp_path) -> None:
+    """Скелет враппера НЕ отрезает контейнеру сеть, которой хаб его снабжает.
+
+    Прежняя редакция документа рекомендовала ``--network none`` — четвёртый
+    экземпляр того же дефекта, ради которого заведена #1208: документ учил
+    настройке, на которой выкат останавливается. Настоящий враппер на хосте
+    хаба флага ``--network`` не имеет вовсе (снят 10.09.2026).
+
+    Требование не выдумано и не переписано в тест словами: оно берётся у
+    САМОГО ХАБА. ``review_dispatch._delivery_block`` — та функция, что
+    собирает промт, — кладёт в него ``curl`` на публичный адрес установки:
+    обменять одноразовый код, прочитать постановку, СДАТЬ ОТЧЁТ. Контейнер
+    без сети до этого адреса не дойдёт, и остаётся только запасной путь —
+    блок в тексте (#1036), который хаб помечает как более слабый. Измерено на
+    хосте хаба 10.09.2026 тем же образом: с сетью по умолчанию ``getent
+    hosts`` внутри контейнера отвечает про agenthai.ru и api.cursor.com
+    (rc 0), с ``--network none`` — rc 2 и ни одной строки.
+    """
+    hub_base = "https://hub.example"
+    delivery = _delivery_block(1208, "CODE-1", hub_base)
+    assert hub_base in delivery and "curl" in delivery, (
+        "хаб перестал давать прогону сетевой адрес — тогда и требование "
+        f"ниже беспредметно, и этот тест надо переписать: {delivery!r}"
+    )
+
+    launch = shlex.split(_doc_wrapper_launch(tmp_path))
+    # Всё, что стоит ДО образа, — флаги запуска; сеть настраивается только там.
+    flags = local_reviewer._container_run_flags(launch, "podman")
+    assert flags is not None, f"строка запуска не разобралась как podman run: {launch}"
+    assert not flags.unknown, (
+        f"скелет враппера содержит флаг «{flags.unknown}», который страж хаба "
+        "разобрать не может — а значит и о сети по нему судить нельзя"
+    )
+    for name, value in flags.flags:
+        assert name not in ("--network", "--net"), (
+            f"скелет враппера из документа задаёт «{name} {value}». Сеть "
+            "контейнеру нужна В ДВЕ стороны: к поставщику (agentский CLI "
+            "авторизуется ключом из --env-file и ходит в api.cursor.com) и К "
+            "САМОМУ ХАБУ — отчёт по контракту сдаётся обычным HTTP на адрес "
+            f"из промта ({hub_base} в примере выше). Отрезав её, выкат "
+            "остановится молча: прогон кончится без отчёта. Если сеть надо "
+            "сузить, сужайте до СПИСКА АДРЕСОВ, а не до нуля"
+        )
 
 
 def test_the_doc_probe_passes_the_cli_argv_as_arguments(monkeypatch) -> None:
