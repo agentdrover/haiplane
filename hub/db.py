@@ -83,6 +83,21 @@ CREATE TABLE IF NOT EXISTS activity_log (
 );
 """
 
+# Перенос записей о публикации из ленты событий на строку версии (#1253).
+# Отдельной константой, потому что это единственная миграция здесь, которая
+# двигает данные, а не схему: её надо было бы уметь прочитать и проверить
+# отдельно от списка.
+BACKFILL_PUBLICATION_RECORD_SQL = """
+UPDATE skills SET publication_record = COALESCE((
+    SELECT e.payload FROM events e
+    WHERE e.kind = 'skill_activated'
+      AND json_extract(e.payload, '$.name') = skills.name
+      AND json_extract(e.payload, '$.version') = skills.version
+    ORDER BY e.id DESC LIMIT 1
+), '')
+WHERE publication_record = ''
+"""
+
 _MIGRATIONS: list[tuple[str, str]] = [
     (
         "add_source_column",
@@ -494,6 +509,28 @@ _MIGRATIONS: list[tuple[str, str]] = [
     (
         "add_skills_activated_by_column",
         "ALTER TABLE skills ADD COLUMN activated_by TEXT NOT NULL DEFAULT ''",
+    ),
+    # Доказательства публикации ЖИВУТ ЗДЕСЬ, а не в ленте событий (#1253).
+    # Лента — канал уведомлений с двухнедельной чисткой (#349), и сама она об
+    # этом говорит прямым текстом над своим DELETE. Запись о том, что именно
+    # опубликовано, лежит на строке версии, которую описывает: у таблицы
+    # ``skills`` нет и не может быть срока годности — удалить строку значит
+    # удалить саму версию скилла, а не сведения о ней.
+    (
+        "add_skills_publication_record_column",
+        "ALTER TABLE skills ADD COLUMN publication_record TEXT NOT NULL DEFAULT ''",
+    ),
+    # Разовый перенос того, что ещё лежит в ленте (#1253). Без него починка
+    # работала бы только на будущих публикациях, а КАЖДАЯ уже опубликованная
+    # версия всё равно потеряла бы свою запись через две недели — то есть
+    # ровно тот дефект, ради которого заведена задача. Переносится последняя
+    # запись по паре (name, version) — тем же «последняя побеждает», каким
+    # читал ленту прежний ``latest_skill_activation``. Запись до #1169 несёт
+    # только имя и версию, и она тоже переезжает: «запись есть, дифа в ней
+    # нет» — отдельное состояние, и превратить его в «записи нет» нельзя.
+    (
+        "backfill_skills_publication_record",
+        BACKFILL_PUBLICATION_RECORD_SQL,
     ),
     # ---- Machine review policy (#382): project default + task override.
     (
@@ -3075,22 +3112,32 @@ async def _record_seed_activation(
     ``hub.db``, so the call cannot go the other way. No commit here either —
     the caller commits the loop, and a rollback must take the event with the
     activation it describes.
+
+    Пишутся ОБА места, и полезная нагрузка для них считается ОДИН раз (#1253).
+    Событие остаётся уведомлением — человек видит факт публикации сразу; а
+    ``skills.publication_record`` остаётся доказательством, потому что ленту
+    поллер чистит раз в две недели. Разойтись им нельзя: расхождение путей и
+    есть исходный дефект #1169, поэтому payload здесь — одна переменная, а не
+    два вызова.
     """
+    payload = json.dumps(
+        skill_publish.publication_payload(
+            name=name,
+            version=version,
+            content=content,
+            previous_content=previous_content,
+            previous_version=previous_version,
+        ),
+        ensure_ascii=False,
+    )
     await db.execute(
         "INSERT INTO events (kind, task_id, project_id, actor, payload) "
         "VALUES ('skill_activated', NULL, NULL, 'seed', ?)",
-        (
-            json.dumps(
-                skill_publish.publication_payload(
-                    name=name,
-                    version=version,
-                    content=content,
-                    previous_content=previous_content,
-                    previous_version=previous_version,
-                ),
-                ensure_ascii=False,
-            ),
-        ),
+        (payload,),
+    )
+    await db.execute(
+        "UPDATE skills SET publication_record=? WHERE name=? AND version=?",
+        (payload, name, version),
     )
 
 

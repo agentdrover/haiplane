@@ -1178,22 +1178,28 @@ async def api_create_skill(
             created_by=identity.username,
         )
         if status_value == "active":
+            # Одна полезная нагрузка на два места (#1253): событие — чтобы
+            # человек увидел публикацию в ленте сразу, колонка версии — чтобы
+            # доказательства пережили двухнедельную чистку ленты. Считается
+            # она ОДИН раз: два вызова разошлись бы молча.
+            payload = skill_publish.publication_payload(
+                name=body.name,
+                version=version,
+                content=body.content,
+                previous_content=(
+                    None if baseline is None else str(baseline["content"])
+                ),
+                previous_version=(
+                    None if baseline is None else int(baseline["version"])
+                ),
+            )
             await repo.insert_event(
                 db,
                 kind="skill_activated",
                 actor=identity.username,
-                payload=skill_publish.publication_payload(
-                    name=body.name,
-                    version=version,
-                    content=body.content,
-                    previous_content=(
-                        None if baseline is None else str(baseline["content"])
-                    ),
-                    previous_version=(
-                        None if baseline is None else int(baseline["version"])
-                    ),
-                ),
+                payload=payload,
             )
+            await repo.record_skill_publication(db, body.name, version, payload)
     await db_module.log_activity(
         db,
         "skill_version_created",
@@ -1240,22 +1246,28 @@ async def api_activate_skill(
             await repo.activate_skill_version(
                 db, name, version, activated_by=_identity.username
             )
+            # Та же пара записей, что и на пути 1, и по той же причине
+            # (#1253): лента уведомляет, колонка версии хранит. Ветка
+            # идемпотентности не трогается — повторная активация уже активной
+            # версии по-прежнему не пишет ни события, ни записи.
+            payload = skill_publish.publication_payload(
+                name=name,
+                version=version,
+                content=str(row["content"]),
+                previous_content=(
+                    None if baseline is None else str(baseline["content"])
+                ),
+                previous_version=(
+                    None if baseline is None else int(baseline["version"])
+                ),
+            )
             await repo.insert_event(
                 db,
                 kind="skill_activated",
                 actor=_identity.username,
-                payload=skill_publish.publication_payload(
-                    name=name,
-                    version=version,
-                    content=str(row["content"]),
-                    previous_content=(
-                        None if baseline is None else str(baseline["content"])
-                    ),
-                    previous_version=(
-                        None if baseline is None else int(baseline["version"])
-                    ),
-                ),
+                payload=payload,
             )
+            await repo.record_skill_publication(db, name, version, payload)
     if activated:
         await db_module.log_activity(
             db,

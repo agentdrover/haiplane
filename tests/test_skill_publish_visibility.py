@@ -26,8 +26,9 @@ import json
 import aiosqlite
 from httpx import AsyncClient
 
-from hub import repository, skill_publish
+from hub import poller, repository, skill_publish
 from hub.db import (
+    BACKFILL_PUBLICATION_RECORD_SQL,
     MACHINE_REVIEW_CYCLE_SKILL,
     MULTI_AGENT_REVIEW_SKILL,
     fetchall,
@@ -81,11 +82,16 @@ async def _record_publication(
     baseline_version: int | None = None,
     legacy: bool = False,
 ) -> None:
-    """Записать событие публикации так, как его пишет хаб.
+    """Записать публикацию так, как её пишет хаб: событие И запись версии.
 
     ``legacy=True`` даёт payload ДО #1169 — только имя и версия. Это не
     выдумка ради теста: ровно такие записи лежат в проде у всех версий,
     активированных до этой задачи.
+
+    Оба места пишутся ОДНОЙ строкой, как в хабе (#1253): событие — канал
+    уведомлений, ``skills.publication_record`` — то, что переживёт чистку
+    ленты. Помощник, пишущий только в одно из них, проверял бы не тот хаб,
+    который выкатывается.
     """
     payload: dict = {"name": name, "version": version}
     if not legacy:
@@ -99,10 +105,15 @@ async def _record_publication(
             "rules_triggered": [],
             "note": skill_publish.SCAN_NOTE,
         }
+    raw = json.dumps(payload, ensure_ascii=False)
     await db.execute(
         "INSERT INTO events (kind, task_id, project_id, actor, payload) "
         "VALUES ('skill_activated', NULL, NULL, 'denis', ?)",
-        (json.dumps(payload, ensure_ascii=False),),
+        (raw,),
+    )
+    await db.execute(
+        "UPDATE skills SET publication_record=? WHERE name=? AND version=?",
+        (raw, name, version),
     )
     await db.commit()
 
@@ -1186,29 +1197,32 @@ async def test_the_page_names_the_refusal_instead_of_drawing_empty_counters(
     await _install(
         db, name, [(1, OLD, "draft", "seed", ""), (2, NEW, "active", "denis", "denis")]
     )
+    raw = json.dumps(
+        {
+            "name": name,
+            "version": 2,
+            "diff": {
+                "baseline": skill_publish.BASELINE_TOO_LARGE,
+                "baseline_version": 1,
+                "added_lines": None,
+                "removed_lines": None,
+                "note": skill_publish.BASELINE_TOO_LARGE_NOTE,
+            },
+            "content_scan": {
+                "rules_triggered": [],
+                "note": skill_publish.SCAN_NOTE,
+            },
+        },
+        ensure_ascii=False,
+    )
     await db.execute(
         "INSERT INTO events (kind, task_id, project_id, actor, payload) "
         "VALUES ('skill_activated', NULL, NULL, 'denis', ?)",
-        (
-            json.dumps(
-                {
-                    "name": name,
-                    "version": 2,
-                    "diff": {
-                        "baseline": skill_publish.BASELINE_TOO_LARGE,
-                        "baseline_version": 1,
-                        "added_lines": None,
-                        "removed_lines": None,
-                        "note": skill_publish.BASELINE_TOO_LARGE_NOTE,
-                    },
-                    "content_scan": {
-                        "rules_triggered": [],
-                        "note": skill_publish.SCAN_NOTE,
-                    },
-                },
-                ensure_ascii=False,
-            ),
-        ),
+        (raw,),
+    )
+    await db.execute(
+        "UPDATE skills SET publication_record=? WHERE name=? AND version=2",
+        (raw, name),
     )
     await db.commit()
 
@@ -1442,3 +1456,244 @@ async def test_activating_the_same_version_twice_at_once_records_one_publication
         f"публикация одна — и запись о ней одна; получено {len(events)}"
     )
     assert events[0]["diff"]["baseline_version"] == 1
+
+
+# ---------------------------------------------------------------------------
+# #1253 — где доказательствам публикации место: они переживают чистку ленты
+# ---------------------------------------------------------------------------
+
+
+async def _records(db: aiosqlite.Connection, name: str) -> dict[int, dict]:
+    """Записи о публикации ЭТОГО скилла, прочитанные из хранилища версий."""
+    rows = await fetchall(
+        db,
+        "SELECT version, publication_record FROM skills WHERE name=? "
+        "ORDER BY version ASC",
+        (name,),
+    )
+    return {
+        int(r["version"]): json.loads(str(r["publication_record"]))
+        for r in rows
+        if str(r["publication_record"] or "")
+    }
+
+
+async def _age_the_feed(db: aiosqlite.Connection, days: int = 30) -> None:
+    """Состарить ленту событий — не подменяя ни чистку, ни её условие.
+
+    Чистка отбирает строки по ``created_at``, поэтому единственный честный
+    способ показать её на старых данных — сделать данные старыми. Подменять
+    ``prune_events`` нельзя: предмет задачи в том, что удаляет ИМЕННО ОН.
+    """
+    await db.execute(
+        "UPDATE events SET created_at = datetime('now', ?)", (f"-{days} days",)
+    )
+    await db.commit()
+
+
+async def test_a_publication_record_outlives_the_events_sweep(client: AsyncClient, db):
+    """AC-1. Проходит НАСТОЯЩАЯ чистка ленты — запись о публикации остаётся.
+
+    До #1253 диф, сводка и вердикт лежали в payload события ``skill_activated``
+    и читались ровно оттуда. Поллер чистит ленту раз в две недели
+    (``_sweep_events_retention`` → ``prune_events``), поэтому через 14 дней
+    страница скилла молча возвращалась к «записи о публикации нет» — тому
+    самому состоянию, ради выхода из которого сделана #1169.
+
+    Чистка здесь настоящая: зовётся ``poller._sweep_events_retention`` с её
+    собственными четырнадцатью днями, а состарены ДАННЫЕ. Подмена вызова
+    доказала бы что угодно, кроме того, что удаляет именно она, — а удаляет
+    именно она.
+    """
+    await client.post(
+        "/api/skills", json={"name": "kept", "content": OLD, "kind": "prompt"}
+    )
+    await client.post(
+        "/api/skills", json={"name": "kept", "content": NEW, "kind": "prompt"}
+    )
+    assert len(await _events(db, "kept")) == 2, "предпосылка: публикации записаны"
+
+    await _age_the_feed(db)
+    await poller._sweep_events_retention(db)
+
+    assert await _events(db, "kept") == [], (
+        "предпосылка теста: чистка действительно унесла события — иначе "
+        "страница могла бы читать их, и переезд ничего не доказывает"
+    )
+
+    page = (await client.get("/skills/kept")).text
+    after = page[page.index("Что было опубликовано") :]
+    assert "К активной версии v1" in after, "основание сравнения пережило чистку"
+    assert "+2" in after and "−1" in after, "сводка правок пережила чистку"
+    assert "Сработавших правил нет." in after, "вердикт скана пережил чистку"
+    assert "записи о публикации нет" not in page, (
+        "именно этой строкой дефект и проявлялся: через 14 дней страница "
+        "молча говорила, что публикации не было"
+    )
+
+
+async def test_the_three_publication_states_survive_the_move(client: AsyncClient, db):
+    """AC-2. Три состояния различаются после переезда — и после чистки тоже.
+
+    Починить «запись исчезает» ценой слияния «записи нет» с «запись есть, но
+    дифа в ней нет» значит сломать ровно то, что #1169 сделала честно. Второе
+    состояние не гипотетическое: КАЖДАЯ запись, сделанная до #1169, несёт
+    только имя и версию.
+
+    Чистка прогоняется настоящая и здесь: пока такие записи жили в ленте,
+    после неё второе состояние вырождалось в третье само собой — без единой
+    правки кода и молча.
+    """
+    await _install(db, "with-diff", [(1, OLD, "active", "denis", "denis")])
+    await _record_publication(db, "with-diff", version=1, baseline_version=None)
+    await _install(db, "legacy-record", [(1, OLD, "active", "seed", "seed")])
+    await _record_publication(db, "legacy-record", version=1, legacy=True)
+    await _install(db, "no-record", [(1, OLD, "active", "seed", "seed")])
+
+    await _age_the_feed(db)
+    await poller._sweep_events_retention(db)
+
+    with_diff = (await client.get("/skills/with-diff")).text
+    legacy = (await client.get("/skills/legacy-record")).text
+    absent = (await client.get("/skills/no-record")).text
+
+    # 1. Запись есть, и в ней диф.
+    assert "Сработавших правил нет." in with_diff
+    assert "дифа в записи нет" not in with_diff
+    assert "записи о публикации нет" not in with_diff
+
+    # 2. Запись есть, дифа в ней нет — и это сказано именно так.
+    assert "дифа в записи нет" in legacy
+    assert "Вердикта в записи нет" in legacy
+    assert "записи о публикации нет" not in legacy, (
+        "старая запись без дифа — не отсутствие записи; слить их значит "
+        "починить одно ценой другого"
+    )
+
+    # 3. Записи нет вовсе.
+    assert "записи о публикации нет" in absent
+    assert skill_publish.BASELINE_NO_RECORD_NOTE in absent
+    assert "дифа в записи нет" not in absent, (
+        "«записи нет» и «в записи нет дифа» — разные состояния"
+    )
+
+    # И три состояния действительно ТРИ, а не одно с тремя подписями: каждая
+    # страница называет своё и молчит о двух чужих. Слияние любых двух из них
+    # прошло бы мимо проверки «нужная строка есть», если бы слитое состояние
+    # печатало обе строки сразу.
+    marks = ("Сработавших правил нет.", "дифа в записи нет", "записи о публикации нет")
+    assert [
+        [mark in page for mark in marks] for page in (with_diff, legacy, absent)
+    ] == [
+        [True, False, False],
+        [False, True, False],
+        [False, False, True],
+    ]
+
+
+async def test_every_publication_path_writes_the_durable_record(
+    client: AsyncClient, db
+):
+    """AC-3. Все ТРИ пути кладут запись в хранилище версий, а не два из трёх.
+
+    Расхождение путей и есть исходный дефект #1169: закрыть тот, который
+    проще всего проверить, и оставить остальные два — значит вернуть его в
+    новом хранилище. Поэтому пути перечислены поимённо, и у каждого
+    проверяется, что записанное СОВПАДАЕТ с уехавшим в событие: два места,
+    собранные разными вызовами, разошлись бы молча.
+    """
+    # Путь 1 — человек создаёт версию сразу активной (``api_create_skill``).
+    # Версий две: у первой основания сравнения нет по существу, а проверять
+    # надо запись С ДИФОМ — ту, что и терялась вместе с событием.
+    resp = await client.post(
+        "/api/skills", json={"name": "path-one", "content": OLD, "kind": "prompt"}
+    )
+    assert resp.status_code == 200 and resp.json()["status"] == "active"
+    resp = await client.post(
+        "/api/skills", json={"name": "path-one", "content": NEW, "kind": "prompt"}
+    )
+    assert resp.status_code == 200 and resp.json()["version"] == 2
+
+    # Путь 2 — человек активирует чужой драфт (``api_activate_skill``).
+    await _install(db, "path-two", [(1, OLD, "active", "seed", "seed")])
+    await create_skill_version(
+        db, name="path-two", content=NEW, status="draft", created_by="bot"
+    )
+    await db.commit()
+    resp = await client.patch("/api/skills/path-two/versions/2/activate")
+    assert resp.status_code == 200, resp.text
+
+    # Путь 3 — сид (``seed_default_skills``), человека нет вовсе.
+    await _install(db, "machine-review-cycle", [(1, OLD, "active", "seed", "")])
+    await seed_default_skills(db)
+    await db.commit()
+
+    for name, version in (
+        ("path-one", 2),
+        ("path-two", 2),
+        ("machine-review-cycle", 2),
+    ):
+        records = await _records(db, name)
+        assert version in records, (
+            f"путь публикации {name} v{version} не оставил записи в "
+            "skills.publication_record — ровно так возвращается #1169"
+        )
+        record = records[version]
+        assert record["name"] == name and record["version"] == version
+        assert record["diff"]["baseline"] == skill_publish.BASELINE_VERSION
+        assert record["diff"]["baseline_version"] == version - 1
+        assert isinstance(record["content_scan"]["rules_triggered"], list)
+
+        # Событие и запись несут ОДНО И ТО ЖЕ — не «оба непусты».
+        event = [e for e in await _events(db, name) if e["version"] == version]
+        assert len(event) == 1, f"{name} v{version}: одно событие на публикацию"
+        del event[0]["_actor"]
+        assert event[0] == record, (
+            f"{name} v{version}: лента и хранилище разошлись — значит "
+            "полезная нагрузка собрана дважды, а не один раз"
+        )
+
+        # И то же самое читается штатным путём показа.
+        assert await repository.latest_skill_activation(db, name, version) == record
+
+
+async def test_the_backfill_moves_records_the_feed_still_holds(
+    db: aiosqlite.Connection,
+):
+    """Уже опубликованное переезжает, а не ждёт следующей публикации.
+
+    #1169 доставлена за день до этой задачи, поэтому в момент выката ВСЕ
+    записи о публикации лежат только в ленте и умрут через две недели. Без
+    переноса починка работала бы лишь на будущих публикациях — то есть на
+    проде не работала бы ни на одной существующей версии.
+
+    Переносится и запись без дифа: «запись есть, дифа в ней нет» — состояние,
+    которое обязано пережить переезд, а не выродиться в «записи нет».
+    """
+    await _install(
+        db,
+        "to-migrate",
+        [(1, OLD, "draft", "seed", ""), (2, NEW, "active", "denis", "denis")],
+    )
+    await _record_publication(db, "to-migrate", version=2, baseline_version=1)
+    await _install(db, "legacy-to-migrate", [(1, OLD, "active", "seed", "seed")])
+    await _record_publication(db, "legacy-to-migrate", version=1, legacy=True)
+    # Состояние ДО переезда: записи есть только в ленте.
+    await db.execute("UPDATE skills SET publication_record=''")
+    await db.commit()
+
+    await db.execute(BACKFILL_PUBLICATION_RECORD_SQL)
+    await db.commit()
+
+    moved = await repository.latest_skill_activation(db, "to-migrate", 2)
+    assert moved is not None and moved["diff"]["baseline_version"] == 1, (
+        "запись с дифом переехала целиком"
+    )
+    legacy = await repository.latest_skill_activation(db, "legacy-to-migrate", 1)
+    assert legacy == {"name": "legacy-to-migrate", "version": 1}, (
+        "запись без дифа переезжает КАК ЕСТЬ: превратить её в «записи нет» "
+        "значит починить одно ценой другого"
+    )
+    assert await repository.latest_skill_activation(db, "to-migrate", 1) is None, (
+        "у версии, которую никогда не публиковали, записи не появляется"
+    )
