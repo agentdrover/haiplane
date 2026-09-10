@@ -1466,6 +1466,7 @@ class _HistoricalGitOps:
         diff_unreadable: bool = False,
         ancestor: bool | None = False,
         local_ancestor: bool | None = False,
+        other_refs: tuple[str, ...] = (),
     ) -> None:
         self.paths = paths
         self.commit_here = commit_here
@@ -1491,6 +1492,13 @@ class _HistoricalGitOps:
         #: имени не предок. Вопрос, заданный сюда вместо origin, отвечает
         #: «дифф не схлопнулся» на схлопнувшемся диффе.
         self.local_ancestor = local_ancestor
+        #: Ref-ы, которые в этом клоне ЕСТЬ, но коммита в себе не несут.
+        #: Нужны, чтобы отличить «спросили не тот ref, и его тут нет»
+        #: (живой git отвечает ``None``, и сдача уходит к человеку) от
+        #: «спросили не тот ref, а он есть»: там ответ ``False``, дыра не
+        #: ставится, и схлопнувшийся дифф проходит за измеренную
+        #: поверхность. Опасно именно второе, и запинить надо его.
+        self.other_refs = other_refs
         self.asked = []
         self.bases = []
         self.ancestry_asked = []
@@ -1519,6 +1527,11 @@ class _HistoricalGitOps:
             return self.ancestor
         if descendant == self.base:
             return self.local_ancestor
+        if descendant in self.other_refs:
+            # Ref в клоне есть, коммита в себе не несёт: живой git отвечает
+            # rc=1, то есть False. Именно этот ответ и опасен — он читается
+            # как «дифф не схлопнулся».
+            return False
         # Такого ref в клоне нет — живой git отвечает None (cat-file -e).
         return None
 
@@ -2167,6 +2180,80 @@ async def test_ancestry_is_asked_against_the_ref_the_diff_used(
     report = sh.replay(cases, excluded=excluded)
     assert report.table.escalated == 1
     assert report.table.both_approve == 0, "approve на невосстановимой поверхности"
+
+
+async def test_collapse_is_detected_on_a_base_that_is_not_develop(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: детектор коллапса держится на БАЗЕ СДАЧИ, а не на слове develop.
+
+    Дыра, найденная машинным ревью и воспроизведённая мутацией: зашей в
+    ``_diff_base_ref`` строку ``"origin/develop"`` — и все три теста про
+    пустой дифф остаются зелёными, потому что база у них у всех develop.
+    То есть проверялся механизм ``origin/``, но не то, что спрошена ИМЕННО
+    та база, против которой дифф посчитан.
+
+    Здесь база другая и клон РЕАЛЬНЫЙ: в нём есть и ``origin/release-2026-08``
+    (туда работу и влили), и ``origin/develop`` (сегодняшняя база проекта),
+    причём коммита в develop нет. Три ответа git расходятся:
+
+        merge-base --is-ancestor <sha> origin/release-2026-08  -> rc=0
+        merge-base --is-ancestor <sha> origin/develop          -> rc=1
+
+    Спросив develop, детектор получает честное «не предок», дыру не ставит,
+    и ``_surface_fact`` на пустом списке отвечает present +
+    ``within_declared=True``. Это не косметика имени дыры: сдача с
+    невосстановимой поверхностью уходит в both_approve. Поэтому тест сперва
+    проверяет ПОСЛЕДСТВИЕ и только потом журнал заглушки.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import build_historical_packet, diff_recovered
+
+    project_id = await _historical_project(db, "replay-collapse-other-base")
+    git = _HistoricalGitOps(
+        ["hub/services/steward_shadow.py"],
+        base="release-2026-08",
+        diff_empty=True,
+        ancestor=True,
+        other_refs=("origin/develop", "develop"),
+    )
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+    # Судили против релизной ветки; сегодняшняя база проекта — develop.
+    await db.execute(
+        "INSERT INTO submissions (task_id, generation, sha, base_branch) "
+        "VALUES (?, 1, ?, 'release-2026-08')",
+        (task_id, _SHA),
+    )
+    await db.commit()
+    rows = await fetchall(
+        db,
+        "SELECT created_at FROM events WHERE task_id=? AND "
+        "kind='review_verdict_recorded'",
+        (task_id,),
+    )
+
+    packet = await build_historical_packet(db, task_id, 1, dict(rows[0])["created_at"])
+
+    surface = packet.fact("diff_vs_areas")
+    assert surface.is_absent, (
+        "схлопнувшийся дифф выдан за измеренную поверхность: предка спросили "
+        f"не у базы сдачи, а у {git.ancestry_asked}"
+    )
+    assert surface.reason == "historical_diff_collapsed"
+    assert packet.fact("risk_class").is_absent
+    assert diff_recovered(packet) is False
+    assert git.ancestry_asked == ["origin/release-2026-08"], (
+        "предка спросили не у той базы, против которой считан дифф: "
+        f"{git.ancestry_asked}"
+    )
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries, dropped)
+    report = sh.replay(cases, excluded=excluded)
+    assert report.table.escalated == 1
+    assert report.table.both_approve == 0, "approve на невосстановимой поверхности"
+    assert report.reconstructed == 0.0
 
 
 async def test_git_refusing_the_diff_is_not_a_card_gap(
