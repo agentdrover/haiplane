@@ -4741,6 +4741,56 @@ def test_the_run_guard_refuses_the_string_it_cannot_parse(monkeypatch) -> None:
     )
 
 
+def test_the_unknown_flag_refusal_advises_a_form_podman_has(monkeypatch) -> None:
+    """Отказ по неизвестному флагу советует форму, КОТОРАЯ СУЩЕСТВУЕТ.
+
+    Один шаблон на обе формы флага советовал невозможное. На длинном имени
+    ``--blkio-weight`` совет «напишите --blkio-weight=<значение>» верен, и
+    страж такую строку и вправду принимает. А на коротком токене тот же
+    шаблон давал ``-p80:80=<значение>`` — записи, которой у podman нет вовсе:
+    pflag разберёт ``-p80:80=x`` как значение ``80:80=x`` у ``-p``, и
+    оператор, сделавший ровно то, что сказано, получит тот же отказ.
+
+    Замечено при работе над #1208 на строке из таблицы документа; отчёт
+    ревьюера #373 помечен НЕПОЛНЫМ и этого не называл.
+    """
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/podman run --rm --blkio-weight 500 --timeout 1800 img",
+    )
+    long_reasons = local_reviewer.detaching_sandbox()
+    assert any("--blkio-weight=<значение>" in r for r in long_reasons), (
+        f"у длинного имени форма «--флаг=значение» и есть починка: {long_reasons}"
+    )
+    # И она РАБОТАЕТ: совет проверяется исполнением, а не чтением.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/podman run --rm --blkio-weight=500 --timeout 1800 img",
+    )
+    assert local_reviewer.detaching_sandbox() == [], (
+        "страж советует форму, которую сам же отвергает: "
+        f"{local_reviewer.detaching_sandbox()}"
+    )
+
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/podman run --rm -p80:80 --timeout 1800 img",
+    )
+    short_reasons = local_reviewer.detaching_sandbox()
+    assert short_reasons, "неизвестный короткий флаг обязан давать отказ"
+    assert not any("-p80:80=<значение>" in r for r in short_reasons), (
+        "отказ советует дописать «=<значение>» к целому короткому токену — "
+        f"записи, которой у podman нет: {short_reasons}"
+    )
+    assert any("--флаг=значение" in r for r in short_reasons), (
+        "короткому флагу починка — его ДЛИННОЕ имя; отказ обязан её назвать, "
+        f"иначе оператору нечего делать: {short_reasons}"
+    )
+
+
 def test_a_consumed_value_does_not_pass_for_the_scope_flag(monkeypatch) -> None:
     """``--scope``, съеденный как ЗНАЧЕНИЕ соседа, флагом ``--scope`` не является.
 
@@ -4845,7 +4895,7 @@ def test_the_run_options_end_at_the_double_dash(monkeypatch) -> None:
     )
 
 
-def test_sudo_names_a_numeric_uid_with_a_hash(monkeypatch) -> None:
+def test_sudo_names_a_numeric_uid_with_a_hash(monkeypatch, tmp_path) -> None:
     """``sudo -u '#1000'`` — числовой uid, а не имя, которого нет в системе.
 
     sudo(8): «The user may be either a user name or a numeric user ID (UID)
@@ -4919,15 +4969,57 @@ def test_sudo_names_a_numeric_uid_with_a_hash(monkeypatch) -> None:
         config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -n -u {uid} /usr/local/bin/wrap"
     )
     tool, user = local_reviewer._named_sandbox_user()
-    bare = local_reviewer._resolve_user(user, tool)
-    assert bare is None or bare.pw_name == str(uid), (
-        f"«sudo -u {uid}» — это ИМЯ «{uid}», а страж разрешил его как uid и "
-        f"назвал «{bare.pw_name if bare else None}»: членство в группе "
-        "проверяется у постороннего, и песочница, на которой sudo скажет "
-        "«unknown user», объявляется настроенной"
-        # Оговорка «или пользователь с таким именем правда есть» — не
-        # смягчение: если он есть, getpwnam его и вернёт, и ответ верен.
+    assert (tool, user) == ("sudo", str(uid)), (
+        f"пользователь из «sudo -u {uid}» не извлёкся ({tool!r}, {user!r}) — "
+        "всё, что ниже, судило бы не тот вход"
     )
+    bare = local_reviewer._resolve_user(user, tool)
+    try:
+        by_name = pwd.getpwnam(str(uid))
+    except KeyError:
+        by_name = None
+    # РАВЕНСТВО, а не «None или имя из цифр». Прежнее утверждение
+    # «bare is None or bare.pw_name == str(uid)» getpwnam от getpwuid не
+    # отличало: на машине, где учётка названа цифрами собственного uid
+    # (обычная запись в образах и в LDAP), обе ветки дают одну и ту же
+    # запись, pw_name == str(uid), и регресс в getpwuid проходил бы
+    # зелёным (неразрешённая ревью #373; проверено на struct_passwd
+    # ('1000', uid 1000) — утверждение True на обеих ветках).
+    assert bare == by_name, (
+        f"«sudo -u {uid}» — это ИМЯ «{uid}», и страж обязан ответить ровно "
+        f"то же, что getpwnam('{uid}') ({by_name}); он ответил {bare}. "
+        "Разрешать голое число через getpwuid значит проверить членство в "
+        "группе у постороннего и объявить настроенной песочницу, на которой "
+        "sudo скажет «unknown user»"
+    )
+
+    # Та же строка, доведённая до САМОГО стража каталога прогонов: прежде эта
+    # половина не проверялась вовсе, и «страж одобрял бы песочницу, падающую
+    # на первом запуске» держалось одним лишь _resolve_user.
+    scratch = tmp_path / "runs"
+    scratch.mkdir()
+    # chown ДО chmod: непривилегированный chown снимает setgid, и каталог
+    # увёл бы scratch_problem() в ветку «нет setgid», где про пользователя не
+    # спрашивают вовсе.
+    os.chown(scratch, -1, me.pw_gid)
+    scratch.chmod(0o2770)
+    assert os.stat(scratch).st_mode & stat.S_ISGID, "каталог без setgid судит другое"
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(scratch))
+    problems = local_reviewer.scratch_problem()
+    if by_name is None:
+        assert problems and all("не разрешается в системе" in p for p in problems), (
+            f"«sudo -u {uid}» называет ИМЯ «{uid}», которого в системе нет. "
+            "Страж обязан назвать это причиной, а не промолчать: молчание "
+            f"здесь — обещание работы, которой не будет ({problems})"
+        )
+        assert any(f"«{uid}»" in p for p in problems), (
+            f"отказ обязан назвать неразрешённого пользователя: {problems}"
+        )
+    else:  # pragma: no cover — учётка, названная цифрами uid, на CI не заводится
+        assert not any("не разрешается в системе" in p for p in problems), (
+            f"пользователь «{uid}» в системе ЕСТЬ, и отказ по разрешению "
+            f"имени был бы ложным: {problems}"
+        )
     # А у systemd-run голое число uid-ом БЫТЬ ОБЯЗАНО — иначе доделка выше
     # сломала бы неразрешённую 534e16e4, ради которой числовая форма и заведена.
     monkeypatch.setattr(
@@ -4974,31 +5066,251 @@ def test_the_scratch_check_reaches_the_group_through_a_hash_uid(
     его сам»). Поэтому каталог здесь настоящий.
 
     Существо: пользователь РАЗРЕШЁН, значит «не смогли проверить» звучать не
-    должно. Про саму группу тест не судит — она зависит от машины; он судит
-    ровно то, что чинила находка.
+    должно.
+
+    Утверждениями ПОЛОЖИТЕЛЬНЫМИ, а не запретом фразы. Прошлая редакция
+    запрещала здесь только слова «не разрешается в системе» — и оставалась
+    зелёной, когда извлечение пользователя ломалось совсем: при пустом
+    ``user`` ``_uid_outside_group`` возвращает ``[]`` первой же строкой, до
+    ``_resolve_user`` дело не доходит, и запрещать в пустом списке нечего.
+    Замерено на HEAD 684bab0b: подменить ``_named_sandbox_user`` на
+    ``("", "")`` — ``scratch_problem()`` даёт ``[]``, утверждение True
+    (неразрешённая ревью #373). Поэтому тест теперь называет и извлечение, и
+    ОБА исхода сравнения с группой.
     """
+    import grp
     import pwd
 
-    uid = pwd.getpwuid(os.getuid()).pw_uid
+    me = pwd.getpwuid(os.getuid())
+    uid = me.pw_uid
     scratch = tmp_path / "runs"
     scratch.mkdir()
+    # chown ДО chmod: непривилегированный chown снимает setgid.
+    os.chown(scratch, -1, me.pw_gid)
     scratch.chmod(0o2770)
     st = os.stat(scratch)
     assert st.st_mode & stat.S_ISGID, (
         "каталог без setgid уводит scratch_problem() в ДРУГУЮ ветку, и тест "
         "снова ничего не проверит — как это уже было с пустой настройкой"
     )
+    assert st.st_gid == me.pw_gid, "группа каталога не та, о которой судит тест"
 
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(scratch))
     monkeypatch.setattr(
         config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -n -u #{uid} /wrap"
     )
-    problems = local_reviewer.scratch_problem()
-    assert not any("не разрешается в системе" in p for p in problems), (
-        f"«sudo -u #{uid}» называет существующего пользователя синтаксисом "
-        "самого sudo, а хаб отвечает оператору, что такого пользователя в "
-        f"системе нет, и проверить доступ нельзя: {problems}"
+
+    # 1. Пользователь ИЗВЛЁКСЯ. Без этого всё ниже вырождается в проверку
+    #    пустого списка, а вырожденный тест хуже отсутствующего: он показывает
+    #    покрытие там, где его нет.
+    assert local_reviewer._named_sandbox_user() == ("sudo", f"#{uid}"), (
+        "форма «-u #UID» не извлеклась из песочницы: "
+        f"{local_reviewer._named_sandbox_user()}"
     )
+
+    # 2. Группа СВОЯ — путь доходит до сравнения и разрешает. Пустой список
+    #    здесь означает «проверил и допустил», и держит его пункт 1.
+    problems = local_reviewer.scratch_problem()
+    assert problems == [], (
+        f"«sudo -u #{uid}» называет существующего пользователя синтаксисом "
+        "самого sudo, каталог принадлежит его же основной группе — а хаб "
+        f"всё равно нашёл причину: {problems}"
+    )
+
+    # 3. Группа ЧУЖАЯ — тот же путь доходит до сравнения и НАЗЫВАЕТ имена.
+    #    Это и есть утверждение, которого не хватало: если ``#UID`` перестанет
+    #    разрешаться, здесь встанет «не разрешается в системе», а если
+    #    извлечение сломается — пустой список. Оба падают.
+    mine = set(os.getgroups()) | {me.pw_gid}
+    foreign = next(
+        (
+            g
+            for g in grp.getgrall()
+            if g.gr_gid not in mine and me.pw_name not in g.gr_mem
+        ),
+        None,
+    )
+    assert foreign is not None, "на машине не нашлось группы, в которой мы не состоим"
+    outside = local_reviewer._uid_outside_group(str(scratch), foreign.gr_gid)
+    assert len(outside) == 1, (
+        f"членство в чужой группе «{foreign.gr_name}» обязано быть названо "
+        f"причиной, а страж вернул {outside}"
+    )
+    assert "не разрешается в системе" not in outside[0], (
+        f"форма «#{uid}» снова не разрешилась, и оператору называется ложная "
+        f"причина: {outside[0]}"
+    )
+    assert me.pw_name in outside[0] and foreign.gr_name in outside[0], (
+        "отказ обязан назвать И пользователя, И группу — иначе чинить нечего: "
+        f"{outside[0]}"
+    )
+
+
+def _doc_limits_probe() -> str:
+    """Фрагмент пробы лимитов ИЗ ДОКУМЕНТА — от шага 3 до конца блока.
+
+    Берётся текстом из файла, а не переписывается сюда: переписанная проба
+    проверяла бы тест, а не документ.
+    """
+    blocks = [
+        b
+        for b in re.findall(r"```bash\n(.*?)```", _DEPLOY_DOC.read_text(), re.S)
+        if "memory.max" in b
+    ]
+    assert len(blocks) == 1, (
+        f"в {_DEPLOY_DOC.name} ожидался ровно один bash-блок с пробой "
+        f"memory.max, найдено {len(blocks)}"
+    )
+    lines = blocks[0].splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("# 3."))
+    return "\n".join(lines[start:])
+
+
+def test_the_doc_limits_probe_tells_failure_from_success(tmp_path) -> None:
+    """Проба лимитов ОТЛИЧАЕТ отказ движка от успеха, а не читает молчание.
+
+    Прежняя редакция запускала `haiplane-review:latest` — литерал, который
+    абзац «Остальные расхождения» того же документа называет разошедшимся с
+    настоящим именем образа (`localhost/haiplane-reviewer:1`). Образа с таким
+    именем на хосте нет, podman отказывает и НИЧЕГО не печатает, а критерий
+    был написан отрицанием: «не должно быть 'max'». Замерено::
+
+        rc=125, stdout=[] -> слова 'max' нет -> оператор читает УСПЕХ
+
+    То есть проба доказывала лимиты собственным отказом. Здесь она
+    ИСПОЛНЯЕТСЯ с подставным движком, и проверяется ровно то, что чинит
+    находка: три исхода — «лимиты есть», «лимитов нет», «проба не
+    запустилась» — обязаны звучать ПО-РАЗНОМУ.
+    """
+    probe = _doc_limits_probe()
+    # Судятся ИСПОЛНЯЕМЫЕ строки: комментарий рядом называет старый литерал
+    # именно затем, чтобы его сюда не вернули, и запретом на слово это не
+    # проверить.
+    runnable = "\n".join(
+        line for line in probe.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "haiplane-review:latest" not in runnable, (
+        "проба запускает образ, который этот же документ называет выдуманным "
+        "литералом прежней редакции"
+    )
+    assert "/etc/haiplane-review/image" in runnable, (
+        "образ обязан читаться из того же файла, что читает враппер: литерал "
+        "в пробе уже расходился с настоящим именем образа"
+    )
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "sudo").write_text('#!/bin/sh\n[ "$1" = "-u" ] && shift 2\nexec "$@"\n')
+    imagefile = tmp_path / "image"
+    imagefile.write_text("localhost/haiplane-reviewer:1\n")
+    argv_log = tmp_path / "argv.log"
+
+    engines = {
+        # Образа нет — ровно исход прежней редакции: rc 125, stdout пуст.
+        "отказ движка": '#!/bin/sh\necho "Error: no such image" >&2\nexit 125\n',
+        # Движок отработал, но лимитов нет.
+        "лимитов нет": "#!/bin/sh\necho max\n",
+        # Движок отработал и не напечатал ничего — то же молчание, что у
+        # отказа, но с нулевым кодом.
+        "пустой вывод": "#!/bin/sh\nexit 0\n",
+        # Лимиты применены.
+        "лимиты есть": "#!/bin/sh\necho 1572864000\n",
+    }
+    verdicts: dict[str, str] = {}
+    for label, body in engines.items():
+        podman = bindir / "podman"
+        podman.write_text(
+            body.replace(
+                "#!/bin/sh\n",
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$ARGV_LOG"\n',
+                1,
+            )
+        )
+        for path in (bindir / "sudo", podman):
+            path.chmod(0o755)
+        done = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                probe.replace("/etc/haiplane-review/image", str(imagefile)),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={
+                **os.environ,
+                "PATH": f"{bindir}:{os.environ['PATH']}",
+                "ARGV_LOG": str(argv_log),
+            },
+        )
+        verdicts[label] = done.stdout.strip()
+        assert verdicts[label], (
+            f"на исходе «{label}» проба не сказала НИЧЕГО: оператору нечего "
+            f"прочитать (stderr: {done.stderr!r})"
+        )
+
+    assert verdicts["отказ движка"] != verdicts["лимиты есть"], (
+        "отказ движка читается так же, как применённые лимиты — это ровно та "
+        f"находка: {verdicts}"
+    )
+    assert verdicts["пустой вывод"] != verdicts["лимиты есть"], (
+        f"молчание движка принимается за доказательство лимитов: {verdicts}"
+    )
+    assert verdicts["лимитов нет"] != verdicts["лимиты есть"], (
+        f"'max' обязан читаться как отсутствие лимитов: {verdicts}"
+    )
+
+    # И образ — тот, что лежит в файле, а не зашитый в пробу литерал.
+    seen = argv_log.read_text()
+    assert "localhost/haiplane-reviewer:1" in seen, (
+        f"проба запустила не тот образ, что назван в файле: {seen!r}"
+    )
+
+
+def test_the_doc_table_of_refusals_is_what_the_guard_actually_refuses(
+    monkeypatch,
+) -> None:
+    """AC-4, обратная сторона: строки из таблицы ОТКАЗОВ хаб и вправду отвергает.
+
+    Пара к test_the_doc_recommends_only_sandboxes_the_hub_accepts. Документ,
+    обещающий отказ там, где хаб молча пропускает, готовит ровно тот выкат, из
+    которого выросла задача. Строки берутся из таблицы, а не переписываются
+    сюда.
+
+    Тот же тест держит и согласие ТЕКСТА с кодом по неразрешённой находке
+    ревьюера #373: прежняя редакция абзаца ниже таблицы обещала, что «всё
+    неизвестное проверка ПРОПУСКАЕТ», тогда как неизвестный флаг уже
+    опознанного ``podman run`` даёт ОТКАЗ — в том числе на строке с живым
+    сроком (``-p80:80 --timeout 1800``). Неверен был текст, и строка с этим
+    флагом стоит теперь в таблице отказов, где её судит код.
+    """
+    rows = [
+        line
+        for line in _DEPLOY_DOC.read_text().splitlines()
+        if line.startswith("| `") and line.count("|") >= 3
+    ]
+    assert len(rows) >= 5, (
+        f"в {_DEPLOY_DOC.name} не нашлось таблицы отказов — проверка была бы "
+        f"пустой и зелёной при любом её содержании (найдено {len(rows)})"
+    )
+    refused = [row.split("|")[1].strip().split("`")[1] for row in rows]
+    assert any("-p80:80" in s for s in refused), (
+        "строка с неизвестным флагом при ЖИВОМ сроке в таблице не названа, а "
+        "именно на ней текст документа расходился с кодом"
+    )
+
+    for sandbox in refused:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.detaching_sandbox()
+        assert reasons, (
+            f"документ обещает отказ на «{sandbox}», а хаб пропускает её "
+            "молча: обещание в тексте, которого нет в коде, — это тот же "
+            "выкат, ради которого писан весь документ"
+        )
+        if "-p80:80" in sandbox:
+            assert any("-p80:80" in r for r in reasons), (
+                f"отказ обязан назвать флаг, сорвавший разбор: {reasons}"
+            )
 
 
 def test_the_doc_recommends_only_sandboxes_the_hub_accepts(monkeypatch) -> None:
