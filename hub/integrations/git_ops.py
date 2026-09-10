@@ -1624,6 +1624,66 @@ class GitOpsIntegration:
         )
         return out if rc == 0 else None
 
+    async def delta_without_base(
+        self, repo: str, base: str, prev: str, current: str
+    ) -> str | None:
+        """The author's OWN patch series inside ``prev..current`` (#1249).
+
+        ``None`` when the question could not be asked — an unknown base ref, a
+        commit this checkout does not carry, a git that refused. The caller
+        turns that into "origin unknown, read everything", never into "nothing
+        came from the base": a silent narrowing of the subject is the one
+        failure this must not have.
+
+        Why it exists. The previous submission is an ANCESTOR of the current
+        tip, so ``git diff prev current`` also carries everything the author
+        pulled in by merging the base branch. Measured on #1172 generation 2
+        (10.09.2026): 25 files in that diff, of which the author had written
+        two — the other 23 arrived with 9 commits of develop that had already
+        passed the gate as somebody else's work.
+
+        Origin is decided by REACHABILITY, which is the only fact git will
+        state: ``--not origin/<base>`` drops every commit the base branch
+        already contains. Commit messages and author names are not consulted —
+        a merge commit says "Merge ..." whoever wrote the code inside it.
+
+        ``--cc`` rather than ``--no-merges``: on a merge commit the combined
+        diff shows exactly the hunks that match NEITHER parent, which is the
+        conflict resolution the author typed by hand. Dropping merges outright
+        would lose it, and a resolution is the author's work by definition.
+        """
+        base_sha = await _resolve_ref_remote_first(base, repo)
+        if base_sha is None:
+            # One best-effort fetch, exactly as ``branch_diff`` does: a stale
+            # clone must not turn a readable answer into an unreadable one.
+            await _git("fetch", "origin", base, repo=repo, check=False)
+            base_sha = await _resolve_ref_remote_first(base, repo)
+        if base_sha is None:
+            log.warning("delta_without_base: base %r not found in %s", base, repo)
+            return None
+        for sha in (prev, current):
+            rc, _, _ = await _git(
+                "cat-file", "-e", f"{sha}^{{commit}}", repo=repo, check=False
+            )
+            if rc != 0:
+                log.warning("delta_without_base: %r not found in %s", sha, repo)
+                return None
+        rc, out, _ = await _git(
+            "log",
+            "-p",
+            "-U0",
+            "--cc",
+            "--format=",
+            current,
+            "--not",
+            prev,
+            base_sha,
+            "--",
+            repo=repo,
+            check=False,
+        )
+        return out if rc == 0 else None
+
     async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None:
         """``git show <ref>:<path>``, or None when it is not there (#873).
 

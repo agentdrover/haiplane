@@ -269,14 +269,30 @@ async def previous_findings(
     return titles
 
 
+@dataclass(frozen=True)
+class DeltaSubject:
+    """What a resubmission puts in front of the reviewer, split by AUTHORSHIP.
+
+    ``paths`` is what the review command narrows to and what the profile is
+    judged on; ``base_paths`` arrived with the base branch and is NAMED to the
+    reviewer rather than removed from sight. ``author_diff`` is the author's
+    own patch series — empty when origin could not be established, and then
+    the caller falls back to the whole submitted diff, loudly.
+    """
+
+    paths: list[str]
+    base_paths: list[str]
+    author_diff: str
+    note: str
+
+
 async def generation_delta(
     db: aiosqlite.Connection, task: dict, base: str
-) -> tuple[list[str], str]:
-    """Files touched since the previous submission, and why, or (empty, reason).
+) -> DeltaSubject:
+    """What changed since the previous submission, and WHOSE change it is.
 
-    Returns ``(paths, note)``. A non-empty ``paths`` narrows the review to the
-    files this round of fixes touched; an empty one means the whole diff is the
-    subject, and ``note`` always says which of those it is and on what grounds.
+    ``paths`` empty means the whole diff is the subject, and ``note`` always
+    says which of those it is and on what grounds.
 
     Three facts have to hold, and each is checked rather than assumed:
 
@@ -290,29 +306,49 @@ async def generation_delta(
     Anything unproven means the full diff. Reviewing a delta we cannot justify
     would be the one failure this feature must not have — silently reading less
     than the report claims.
+
+    #1249 adds a fourth fact, and it is about AUTHORSHIP rather than about
+    trust. The previous submission is an ancestor of the current tip, so a
+    plain ``prev..current`` diff also carries whatever the author pulled in by
+    merging the base branch — on #1172 generation 2 that was 23 of 25 files,
+    written by other tasks that had already passed the gate. The subject is
+    therefore split: the author's own commits (those the base branch does not
+    already contain) decide what the command narrows to and what the profile
+    is bought for, and the files that came with the base are named beside
+    them. Named, not dropped: #1238 found a defect that exists only where two
+    branches meet, and a reviewer blind to a moved base could not have seen
+    it. Origin that cannot be established is not origin "base" — it reads
+    everything, and says so.
     """
     task_id = int(task.get("id") or 0)
     generation = int(task.get("submission_generation") or 0)
     current = (task.get("submission_sha") or "").strip()
     if generation <= 1 or not current:
-        return [], "первая сдача — предмет ревью весь дифф"
+        return DeltaSubject([], [], "", "первая сдача — предмет ревью весь дифф")
 
     previous = await repo.previous_submission(db, task_id, generation)
     if previous is None:
-        return [], "предыдущая сдача не записана — читается весь дифф"
+        return DeltaSubject(
+            [], [], "", "предыдущая сдача не записана — читается весь дифф"
+        )
     prev = dict(previous)
     prev_sha = (prev.get("sha") or "").strip()
     if not prev_sha:
-        return [], "у предыдущей сдачи не закреплён коммит — читается весь дифф"
+        return DeltaSubject(
+            [], [], "", "у предыдущей сдачи не закреплён коммит — читается весь дифф"
+        )
     if (prev.get("base_branch") or "") != base:
-        return [], (
+        return DeltaSubject(
+            [],
+            [],
+            "",
             f"базовая ветка сменилась ({prev.get('base_branch') or '—'} → {base}) "
-            "— дельта невалидна, читается весь дифф"
+            "— дельта невалидна, читается весь дифф",
         )
 
     ctx = await _git_context(db, task_id)
     if ctx is None:
-        return [], "воркспейс недоступен — читается весь дифф"
+        return DeltaSubject([], [], "", "воркспейс недоступен — читается весь дифф")
     workspace, _ = ctx
     try:
         ancestor = await plugins.git_ops.is_ancestor(workspace, prev_sha, current)
@@ -320,11 +356,16 @@ async def generation_delta(
         log.warning("ancestry check failed for task #%s: %s", task_id, exc)
         ancestor = None
     if ancestor is None:
-        return [], "историю проверить не удалось — читается весь дифф"
+        return DeltaSubject(
+            [], [], "", "историю проверить не удалось — читается весь дифф"
+        )
     if not ancestor:
-        return [], (
+        return DeltaSubject(
+            [],
+            [],
+            "",
             f"коммит {prev_sha[:12]} не предок текущего — ветку перебазировали "
-            "или переписали, читается весь дифф"
+            "или переписали, читается весь дифф",
         )
 
     try:
@@ -333,15 +374,77 @@ async def generation_delta(
         log.warning("delta diff failed for task #%s: %s", task_id, exc)
         delta = None
     if delta is None:
-        return [], "дельту прочитать не удалось — читается весь дифф"
+        return DeltaSubject(
+            [], [], "", "дельту прочитать не удалось — читается весь дифф"
+        )
     paths = [p for p in changed_paths(delta) if not is_generated(p)]
     if not paths:
-        return [], (
-            f"с поколения #{prev.get('generation')} код не менялся — читается весь дифф"
+        return DeltaSubject(
+            [],
+            [],
+            "",
+            f"с поколения #{prev.get('generation')} код не менялся — читается весь дифф",
         )
-    return paths, (
-        f"дельта к поколению #{prev.get('generation')} ({prev_sha[:12]}): "
-        f"{len(paths)} файл(ов)"
+    head = f"дельта к поколению #{prev.get('generation')} ({prev_sha[:12]})"
+    return await _split_by_origin(
+        task_id, workspace, base, prev_sha, current, paths, head
+    )
+
+
+async def _split_by_origin(
+    task_id: int,
+    workspace: str,
+    base: str,
+    prev_sha: str,
+    current: str,
+    paths: list[str],
+    head: str,
+) -> DeltaSubject:
+    """Whose change is which, inside a delta already proven trustworthy (#1249).
+
+    Asked of git by REACHABILITY from the base branch — never guessed from a
+    commit message or an author name, because a merge commit says "Merge ..."
+    whoever wrote the code inside it. Every answer git cannot give leaves the
+    WHOLE delta as the subject with the cause named; none of them narrows it.
+    """
+    try:
+        own = await plugins.git_ops.delta_without_base(
+            workspace, base, prev_sha, current
+        )
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.warning("origin split failed for task #%s: %s", task_id, exc)
+        own = None
+    if own is None:
+        return DeltaSubject(
+            paths,
+            [],
+            "",
+            f"{head}: {len(paths)} файл(ов), происхождение коммитов установить "
+            "не удалось — привезённое базой не отделено, читается вся дельта",
+        )
+    author_set = {p for p in changed_paths(own) if not is_generated(p)}
+    author = [p for p in paths if p in author_set]
+    brought = [p for p in paths if p not in author_set]
+    if not author:
+        # The round added nothing of the author's own — a bare merge of the
+        # base. Narrowing to zero files would hand the reviewer an empty
+        # command, so the whole delta stays the subject and says why.
+        return DeltaSubject(
+            paths,
+            [],
+            "",
+            f"{head}: {len(paths)} файл(ов), все привезены базой — своей правки "
+            "в этом круге нет, читается вся дельта",
+        )
+    if not brought:
+        return DeltaSubject(
+            author, [], own, f"{head}: {len(author)} файл(ов) автора, база не двигалась"
+        )
+    return DeltaSubject(
+        author,
+        brought,
+        own,
+        f"{head}: {len(author)} файл(ов) автора и {len(brought)} привезено базой",
     )
 
 
@@ -352,6 +455,7 @@ def diff_plan(
     delta_paths: list[str] | None = None,
     delta_note: str = "",
     prior_findings: list[str] | None = None,
+    base_paths: list[str] | None = None,
 ) -> tuple[str, str]:
     """What the reviewer should read, and the note for the task update (#874).
 
@@ -366,6 +470,11 @@ def diff_plan(
     stays visible, which bare changed lines would have hidden. The coverage is
     stated in the block, because "read the delta" and "read the whole diff"
     are different claims about the same report (#549).
+
+    ``base_paths`` are the files that arrived with the base branch rather than
+    from the author (#1249). They are NAMED, not removed: a defect can exist
+    only where two branches meet — #1238 was exactly that — and a reviewer who
+    never learns the base moved cannot look for one.
     """
     if diff is None:
         return (
@@ -389,6 +498,17 @@ def diff_plan(
             "на прошлом поколении и сейчас НЕ пересматриваются — если "
             "найдёшь причину усомниться в этом, скажи об этом в отчёте."
         )
+        if base_paths:
+            named = ", ".join(base_paths[:30])
+            more = "" if len(base_paths) <= 30 else f" и ещё {len(base_paths) - 30}"
+            lines.append(
+                f"ПРИВЕЗЕНО БАЗОЙ, НЕ АВТОРОМ: {len(base_paths)} файл(ов) — "
+                f"{named}{more}. Это чужая работа: она уже прошла свой гейт, "
+                "и находки по ней адресованы не этому автору. Но база "
+                "СДВИНУЛАСЬ под правкой, а дефект бывает только на стыке двух "
+                "веток — если увидишь, что привезённое ломается о правку "
+                "автора, это находка, и назови её именно так."
+            )
     elif delta_note:
         lines.append(f"ОХВАТ: прочитан ВЕСЬ дифф ветки — {delta_note}.")
     if prior_findings:
@@ -1340,11 +1460,6 @@ async def prepare_review_order(
     # areas the author declared — self-assessment cannot exempt work from
     # oversight (#582). An unreadable diff buys deep, it does not excuse it.
     diff = await _submission_diff(db, task_id, branch)
-    if force_profile:
-        profile, profile_reasons = force_profile, ["добор после неполного прогона"]
-    else:
-        profile, profile_reasons = pick_review_profile(task, diff)
-    rules_block, rules_note = await collect_review_rules(db, task_id, diff)
     # #874: which base the reviewer diffs against. Unknown base falls back to
     # the configured one rather than to nothing — a command the reviewer cannot
     # run would send it back to inventing its own, which is what we are fixing.
@@ -1353,10 +1468,28 @@ async def prepare_review_order(
     # #880: a resubmission reads what changed since the previous generation,
     # not the whole branch again. Every reason the delta cannot be trusted
     # falls back to the full diff and says so.
-    delta_paths, delta_note = await generation_delta(db, task, base)
+    subject = await generation_delta(db, task, base)
+    # #1249: the profile is bought for the AUTHOR's change. On a resubmission
+    # that merged the base branch, the plain delta also carries other people's
+    # work — code that already passed its own gate — and a process surface
+    # found only there used to buy the deep harness on somebody else's behalf.
+    # An origin that could not be established leaves ``author_diff`` empty and
+    # the whole submitted diff decides, exactly as before.
+    profile_diff = subject.author_diff or diff
+    if force_profile:
+        profile, profile_reasons = force_profile, ["добор после неполного прогона"]
+    else:
+        profile, profile_reasons = pick_review_profile(task, profile_diff)
+    rules_block, rules_note = await collect_review_rules(db, task_id, diff)
     prior = await previous_findings(db, task_id, generation)
     diff_block, diff_note = diff_plan(
-        diff, base, branch, delta_paths, delta_note, prior
+        diff,
+        base,
+        branch,
+        subject.paths,
+        subject.note,
+        prior,
+        subject.base_paths,
     )
     # #875: what the toolchain already proved on THIS commit. Built from the
     # task row the caller already read, so no extra query for the common case.
