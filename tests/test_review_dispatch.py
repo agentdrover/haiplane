@@ -27,6 +27,7 @@ from hub.services.project_policy import review_dispatch_enabled
 from hub.services.model_family import family
 from hub.services.review_dispatch import (
     DEEP,
+    LITE,
     _REVIEW_MODEL_PREFERENCES,
     REVIEW_FILE_LINE_CAP,
     changed_paths,
@@ -5518,4 +5519,139 @@ async def test_the_second_door_stays_shut_on_a_task_that_left_review(
 
     assert await _local_dispatches(db, task_id) == [], (
         "ревьюер не покупается для задачи, которая ревью больше не ждёт"
+    )
+
+
+# --- #1252, второй заход ревью: находки 1–3 --------------------------------
+
+
+async def test_a_blind_creation_does_not_open_the_second_door(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1252, находка 1: СЛЕПОЙ исход — не отказ, и дверь на нём не открывается.
+
+    Ответ на создание не дошёл, и спросить провайдера, создался ли агент,
+    тоже не вышло. Это состояние ``_Started.blind``: агент, возможно, УЖЕ
+    создан и оплачен. Локальный путь на нём купил бы ВТОРОГО ревьюера на ту
+    же сдачу и принёс бы два соперничающих отчёта — ровно то, ради чего
+    запрет на слепой повтор и стоит двумя строками выше по коду.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder(
+        None, refusal=cursor_cloud.Refusal(status=0, detail="таймаут ответа")
+    )
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    async def _cannot_ask(name, pages=3):
+        return cursor_cloud.Reconciliation("", "", False)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _cannot_ask)
+
+    task_id = await _submitted(
+        client, db, "spike-blind-door", policy={"review": "dispatch"}
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert await _local_dispatches(db, task_id) == [], (
+        "агент, возможно, УЖЕ создан — локальный путь купил бы второго судью"
+    )
+
+
+async def test_the_replacement_keeps_the_profile_the_top_up_ordered(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1252, находка 2: замена упавшего добора обязана остаться deep.
+
+    Принудительный добор лестницы (#879) заказал deep, прогон кончился без
+    отчёта, и локальная замена считала профиль ЗАНОВО — на сдаче низкого
+    риска это lite. Хуже понижения его последствие: упавший заказ и его
+    замена вместе выводят счёт заходов за REVIEW_LADDER_MAX_STEPS, и
+    неполный отчёт lite нового deep уже не позовёт. Лестница ломается молча
+    и в сторону более дешёвого прогона. Тот же класс, что находка 7ed386a8.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-deep"}, "run": {"id": "r-deep"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-deep-replacement", policy={"review": "dispatch"}
+    )
+    first = await _any_dispatch_row(db, task_id)
+    assert first["profile"] == LITE, "исходный прогон дешёвый — иначе добора нет"
+    await repo.set_review_dispatch_status(db, first["id"], "done")
+    await db.commit()
+
+    assert await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+    top_up = await _any_dispatch_row(db, task_id)
+    assert top_up["profile"] == DEEP and top_up["id"] != first["id"]
+
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    local = await _local_dispatches(db, task_id)
+    assert len(local) == 1, "замена должна быть"
+    assert local[0]["profile"] == DEEP, (
+        "добор заказывали ТЕМ ЖЕ профилем: понижение до lite ломает лестницу молча"
+    )
+
+
+async def test_the_sync_second_door_rechecks_the_submission_is_still_live(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1252, находка 3: свежесть перечитывает и СИНХРОННЫЙ путь.
+
+    Сторожа свежести стояли только в свипе, а мест применения два: пока
+    летел запрос на создание облачного агента, автор успел пересдать.
+    Синхронный путь передавал локальному диспетчеру устаревшие задачу,
+    ветку и поколение — и покупал ревью по замещённой сдаче. Один
+    потребитель правила ≠ все.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "test-key")
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "reviewer-token")
+
+    async def _no_usage(agent_id, run_id=None):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _no_usage)
+
+    async def _refuse_and_resubmit(**kwargs):
+        # Пока летел запрос, автор пересдал: поколение уже другое.
+        await db.execute(
+            "UPDATE tasks SET submission_generation = 2 "
+            "WHERE submission_generation = 1 AND status = 'review'"
+        )
+        return None, _LIMIT_REFUSAL
+
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _refuse_and_resubmit)
+
+    task_id = await _submitted(
+        client, db, "spike-sync-stale", policy={"review": "dispatch"}
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert await _local_dispatches(db, task_id) == [], (
+        "сдача сменилась, пока летел запрос: локальный прогон купил бы чтение "
+        "кода, которого на этой сдаче уже нет"
     )

@@ -1341,7 +1341,10 @@ async def prepare_review_order(
     # oversight (#582). An unreadable diff buys deep, it does not excuse it.
     diff = await _submission_diff(db, task_id, branch)
     if force_profile:
-        profile, profile_reasons = force_profile, ["добор после неполного прогона"]
+        profile, profile_reasons = (
+            force_profile,
+            ["профиль задан заказом: добор лестницы или его замена"],
+        )
     else:
         profile, profile_reasons = pick_review_profile(task, diff)
     rules_block, rules_note = await collect_review_rules(db, task_id, diff)
@@ -1698,6 +1701,17 @@ async def maybe_dispatch_review(
             "Вердикт остаётся человеку; детали в логе хаба (#757).",
         )
         await db.commit()
+        if started.blind:
+            # Пустой agent_id тут значит НЕ «создать не вышло», а «спросить,
+            # создался ли, не вышло» — то самое состояние, которое _Started
+            # отличает признаком blind и ради которого повтор запрещён двумя
+            # строками выше. Открыть на нём вторую дверь значит купить второго
+            # ревьюера поверх, возможно, уже оплаченного первого и получить
+            # два соперничающих отчёта на одну сдачу. Отказом считается
+            # только НАБЛЮДЁННЫЙ факт (deploy/LOCAL-REVIEW.md): либо
+            # провайдер отверг создание, либо сверка подтвердила, что агента
+            # нет. Слепота — ни то, ни другое, и остаётся человеку.
+            return False
         return await open_second_door(
             db, task, forge, branch, generation, force_profile, cloud_refusal=detail
         )
@@ -1880,12 +1894,44 @@ async def open_second_door(
     ``review_reach`` (единственный автор этого знания, #1188), а не
     ``dispatch_local_review``, который на форже с облаком счёл бы
     достижимость облака своей и запустил прогон.
+
+    Свежесть сдачи перечитывается ЗДЕСЬ, а не у каждого зовущего: между
+    заказом облака и этой развилкой лежит сеть — синхронный путь ждал ответа
+    на создание агента, асинхронный ждал расписания свипа. За это время
+    задачу могли вернуть в работу, пересдать или переставить на другую
+    ветку, и локальный прогон купил бы чтение кода, которого на живой сдаче
+    уже нет. Правило одно, мест применения два, и второе место — ровно тот
+    класс, что уже ловили: один потребитель правила ≠ все.
     """
+    if not await _submission_still_live(db, task, branch, generation):
+        return False
     reach = await review_reach(db, forge)
     if LOCAL_CHANNEL not in reach.ways:
         return False
     return await dispatch_local_review(
         db, task, forge, branch, generation, force_profile, cloud_refusal=cloud_refusal
+    )
+
+
+async def _submission_still_live(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    branch: str,
+    generation: int,
+) -> bool:
+    """Та ли ещё сдача ждёт отчёта, по СВЕЖЕЙ строке задачи (#1252).
+
+    Читается из базы, а не из ``task``: словарь на руках — снимок, сделанный
+    до сетевого ожидания, и именно поэтому он ничего не доказывает.
+    """
+    row = await repo.get_task(db, int(task["id"]))
+    if row is None:
+        return False
+    fresh = dict(row)
+    return (
+        fresh.get("status") == "review"
+        and int(fresh.get("submission_generation") or 0) == generation
+        and (fresh.get("branch") or "").strip() == branch
     )
 
 
@@ -2738,6 +2784,18 @@ async def _second_door_after_run(
         project_policy.forge_of(project),
         branch,
         generation,
+        # Замена обязана доехать ТЕМ ЖЕ профилем, каким заказывали упавший
+        # прогон (#1252, тот же класс, что находка 7ed386a8 на #1180). Без
+        # проброса dispatch_local_review считает профиль заново и на сдаче
+        # низкого риска понижает добор до lite — а вместе с упавшим заказом
+        # эта замена выводит счёт заходов за REVIEW_LADDER_MAX_STEPS, то есть
+        # неполный отчёт lite уже НЕ сможет позвать новый deep. Лестница
+        # ломается молча и в сторону более дешёвого прогона.
+        #
+        # Форсируется только deep: понижать замену запрещено, а навязывать
+        # lite там, где сегодняшний выбор сказал бы deep, — тот же дефект
+        # зеркально.
+        DEEP if (dispatch.get("profile") or "").strip() == DEEP else "",
         cloud_refusal=(
             f"прогон облачного агента {dispatch['agent_id']} "
             f"({dispatch.get('model') or 'модель не названа'}) кончился "
