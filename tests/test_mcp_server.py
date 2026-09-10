@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 
 from unittest.mock import ANY, AsyncMock, patch
 
@@ -4003,7 +4004,10 @@ async def test_a_write_timeout_does_not_invite_a_blind_retry(
     assert "Повтор НЕ безопасен" in write_payload["message"]
     # Правило хаба выполнимо только если сказано, что делать вместо повтора.
     assert "состояние" in write_payload["message"]
-    assert write_payload["suggested_tool"] == "hub_task_status"
+    # POST /api/tasks создаёт задачу: её id ещё не существует, и hub_task_status
+    # по ней ответить не может — подсказка обязана вести в hub_list_tasks
+    # (находка ревью P2, ниже она проверена по всем маршрутам записи).
+    assert write_payload["suggested_tool"] == "hub_list_tasks"
     assert read_payload["suggested_tool"] is None
 
 
@@ -4048,3 +4052,183 @@ async def test_a_transport_failure_leaks_no_internal_url(
         assert "127.0.0.1" not in payload["hint"]
         assert payload["reason"] == "transport_error"
         assert payload["message"].strip()
+
+
+# --- #1250, находка ревью P2: подсказка обязана вести туда, где можно
+# --- проверить ИМЕННО эту запись ------------------------------------------
+#
+# Первая сдача поставила на все записи один указатель — hub_task_status. Ему
+# нужен task_id (обязательный целый в опубликованной схеме), которого у
+# создания проекта, отправки сообщения и регистрации сессии нет и быть не
+# может. Пустоту в тексте починили, а на этих маршрутах поставили вместо неё
+# указатель в никуда: ради безопасного повтора задача и заводилась.
+
+
+async def test_a_task_free_write_does_not_point_at_hub_task_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Находка воспроизводится на НАСТОЯЩЕМ таймауте, не на выдуманном.
+
+    Проверяются три записи, у которых задачи нет ни в каком виде: создание
+    проекта, отправка сообщения, регистрация сессии.
+    """
+    from hub import mcp_server as srv
+
+    async with _silent_hub(monkeypatch):
+        caught: dict[str, Any] = {}
+        for path in ("/api/projects", "/api/messages", "/api/sessions"):
+            with pytest.raises(HubApiError) as exc:
+                await srv._api_post(path, {})
+            caught[path] = srv.enrich_error_payload(exc.value.payload)
+
+    for path, payload in caught.items():
+        assert payload["write"] is True, path
+        # Не сломано то, что верно всегда: запись могла пройти.
+        assert payload["retry_safe"] is False, path
+        # Сломана была подсказка — и только она.
+        assert payload["suggested_tool"] != "hub_task_status", path
+        assert "hub_task_status" not in payload["message"], path
+
+    # Проект и сессию читать ЕСТЬ чем — подсказка их и называет.
+    assert caught["/api/projects"]["suggested_tool"] == "hub_list_projects"
+    assert "hub_list_projects" in caught["/api/projects"]["message"]
+    assert caught["/api/sessions"]["suggested_tool"] == "hub_sessions"
+    assert "hub_sessions" in caught["/api/sessions"]["message"]
+
+    # Отправленное сообщение прочитать нечем: hub_inbox показывает адресованное
+    # ТЕБЕ. Пустой указатель, и это сказано словами, а не молчанием поля.
+    assert caught["/api/messages"]["suggested_tool"] is None
+    assert "нет" in caught["/api/messages"]["message"]
+    assert srv._TRANSPORT_NO_CHECK in caught["/api/messages"]["message"]
+    assert srv._TRANSPORT_NO_CHECK in caught["/api/messages"]["hint"]
+
+
+async def test_a_task_write_names_the_task_id_it_already_knows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Где hub_task_status уместен — совет назван вместе с аргументом.
+
+    Имя инструмента, которому нужен id, без самого id — половина совета:
+    вызывающий знает, ЧЕМ читать, но не ЧТО. Маршрут id уже несёт.
+    """
+    from hub import mcp_server as srv
+
+    async with _silent_hub(monkeypatch):
+        with pytest.raises(HubApiError) as exc:
+            await srv._api_post("/api/tasks/1250/updates", {})
+
+    payload = srv.enrich_error_payload(exc.value.payload)
+    assert payload["suggested_tool"] == "hub_task_status"
+    assert "hub_task_status(task_id=1250)" in payload["message"]
+
+
+def _write_routes_in_module() -> dict[str, str]:
+    """Каждый маршрут записи, который модуль реально вызывает.
+
+    Перечисление берётся из исходника, а не из головы: «один потребитель
+    правила ≠ все», и список, который не сверяется с кодом, стареет молча.
+    """
+    import inspect
+
+    from hub import mcp_server as srv
+
+    source = inspect.getsource(srv)
+    pattern = re.compile(
+        r"_api_(?:post|patch|put|delete)[a-z_]*\(\s*f?\"(/api/[^\"]*)\"",
+    )
+    routes: dict[str, str] = {}
+    for raw in pattern.findall(source):
+        # f-строки несут подстановки: id — любое целое, всё прочее — слово.
+        concrete = re.sub(r"\{task_id\}", "1250", raw)
+        concrete = re.sub(r"\{[a-z_]+\}", "7", concrete)
+        routes[concrete] = raw
+    assert routes, "ни одного маршрута записи не найдено — сломался разбор"
+    return routes
+
+
+async def test_every_write_route_points_where_its_write_can_be_checked() -> None:
+    """Каждый маршрут записи поимённо, а не пять для примера.
+
+    Требование к строке таблицы одно: названный инструмент существует в
+    опубликованном каталоге И вызывающий может его позвать — то есть каждый
+    обязательный аргумент либо есть в маршруте, либо не нужен вовсе. Иначе
+    подсказка снова указатель в никуда.
+    """
+    from hub import mcp_server as srv
+
+    catalog = {tool.name: tool for tool in await srv.mcp.list_tools()}
+    assert "hub_task_status" in catalog, "каталог не прочитался"
+
+    unusable: list[str] = []
+    silent: list[str] = []
+    for path in sorted(_write_routes_in_module()):
+        tool_name, advice = srv._write_state_check(path)
+        if tool_name is None:
+            # Пустой указатель обязан объясниться словами.
+            if srv._TRANSPORT_NO_CHECK != advice:
+                silent.append(path)
+            continue
+        tool = catalog.get(tool_name)
+        if tool is None:
+            unusable.append(f"{path} -> {tool_name}: такого инструмента нет")
+            continue
+        schema = tool.inputSchema or {}
+        for required in schema.get("required", []):
+            # Аргумент считается доступным, только если он назван в совете
+            # конкретным значением: имя параметра само по себе вызывающему
+            # ничего не даёт.
+            if f"{required}=" not in advice:
+                unusable.append(
+                    f"{path} -> {tool_name}: нужен {required}, "
+                    f"а совет его не называет: {advice!r}"
+                )
+
+    assert not unusable, "подсказка ведёт туда, где ответить нельзя: " + "; ".join(
+        unusable
+    )
+    assert not silent, "пустой указатель промолчал о том, что он пустой: " + "; ".join(
+        silent
+    )
+
+
+async def test_a_route_without_a_reading_tool_says_so_instead_of_guessing() -> None:
+    """Незнакомый маршрут стареет в честную сторону, а не под чужой указатель.
+
+    Девятый helper и новый маршрут появятся когда-нибудь без этой таблицы.
+    Правильный исход для них — «общей проверки нет», а не hub_task_status,
+    который к ним не относится.
+    """
+    from hub import mcp_server as srv
+
+    tool_name, advice = srv._write_state_check("/api/something-nobody-wrote-yet")
+    assert tool_name is None
+    assert advice == srv._TRANSPORT_NO_CHECK
+    assert "hub_task_status" not in advice
+
+    payload = srv._parse_transport_error(
+        RuntimeError("boom"),
+        timeout=0.4,
+        write=True,
+        method="POST",
+        path="/api/something-nobody-wrote-yet",
+    )
+    assert payload["suggested_tool"] is None
+    # Верное осталось верным: запись могла пройти.
+    assert payload["retry_safe"] is False
+    assert srv._TRANSPORT_NO_CHECK in payload["message"]
+
+
+async def test_a_read_timeout_suggests_nothing_because_nothing_needs_checking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Чтение ничего не меняло — проверять после него нечего."""
+    from hub import mcp_server as srv
+
+    async with _silent_hub(monkeypatch):
+        with pytest.raises(HubApiError) as exc:
+            await srv._api_get("/api/projects")
+
+    payload = srv.enrich_error_payload(exc.value.payload)
+    assert payload["suggested_tool"] is None
+    assert payload["retry_safe"] is True
+    assert srv._TRANSPORT_NO_CHECK not in payload["message"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.parse
 from datetime import UTC, datetime
@@ -256,6 +257,73 @@ _TRANSPORT_WRITE_RETRY = (
 )
 
 
+# Чем читать состояние после проглоченной транспортом записи (#1250, находка
+# ревью P2).
+#
+# «Сначала прочитай состояние» выполнимо, только если названо, ЧЕМ читать.
+# Первая редакция советовала hub_task_status на ЛЮБОЙ записи — включая
+# создание проекта, отправку сообщения и регистрацию сессии. Этому инструменту
+# нужен task_id (обязательный целый параметр в его схеме), которого у таких
+# вызовов нет и быть не может: совет оказывался указателем в никуда ровно там,
+# где он был нужнее всего. Пустоту в тексте починили, а на части маршрутов
+# поставили вместо неё ложный указатель.
+#
+# Маршрут, у которого читающего инструмента НЕ существует, не получает его
+# вовсе и говорит об этом словами: пустой указатель честнее ложного. Так же
+# честно таблица и стареет — новый маршрут без своей строки попадает в ветку
+# «общей проверки нет», а не под чужой указатель.
+#
+# Инструмент в строке обязан уметь ответить на вопрос «прошла ли ИМЕННО эта
+# запись». Поэтому hub_inbox для /api/messages сюда не попал: он читает
+# сообщения, адресованные ТЕБЕ, а отправленное другому в нём не видно.
+_TRANSPORT_WRITE_CHECKS: tuple[tuple[re.Pattern[str], str, str], ...] = (
+    (
+        re.compile(r"^/api/tasks/(?P<task_id>\d+)(?:/|$)"),
+        "hub_task_status",
+        "Читать состояние здесь: hub_task_status(task_id={task_id}).",
+    ),
+    (
+        re.compile(r"^/api/tasks(?:/|$)"),
+        "hub_list_tasks",
+        "Читать состояние здесь: hub_list_tasks — задача либо появилась, либо нет.",
+    ),
+    (
+        re.compile(r"^/api/projects(?:/|$)"),
+        "hub_list_projects",
+        "Читать состояние здесь: hub_list_projects.",
+    ),
+    (
+        re.compile(r"^/api/sessions(?:/|$)"),
+        "hub_sessions",
+        "Читать состояние здесь: hub_sessions.",
+    ),
+    (
+        re.compile(r"^/api/skills(?:/|$)"),
+        "hub_list_skills",
+        "Читать состояние здесь: hub_list_skills.",
+    ),
+)
+
+_TRANSPORT_NO_CHECK = (
+    "Общего инструмента, который скажет, прошла ли ИМЕННО эта запись, здесь "
+    "нет: прочитай то место, куда писал, прежде чем решать про повтор."
+)
+
+
+def _write_state_check(path: str) -> tuple[str | None, str]:
+    """Маршрут записи → (читающий инструмент | None, что делать словами).
+
+    None здесь — не пропуск и не заглушка, а утверждение: общей проверки для
+    этого маршрута не существует. Вызывающему это сказано текстом, а не
+    отсутствием поля.
+    """
+    for pattern, tool, advice in _TRANSPORT_WRITE_CHECKS:
+        match = pattern.match(path)
+        if match:
+            return tool, advice.format(**match.groupdict())
+    return None, _TRANSPORT_NO_CHECK
+
+
 def _parse_transport_error(
     exc: Exception,
     *,
@@ -277,6 +345,13 @@ def _parse_transport_error(
     ошибка транспорта не означает «запись не прошла»; выполнить его можно,
     только зная, что случился транспорт и что повтор записи небезопасен.
 
+    Куда идти проверять — берётся из маршрута (_write_state_check), а не
+    ставится одно и то же на все записи. retry_safe=false на записи верен
+    всегда: запись могла пройти. Сломать можно было именно подсказку — и
+    первая редакция её сломала, отправляя с /api/projects и /api/messages в
+    hub_task_status, которому нужен id задачи. Там, где читающего инструмента
+    нет, поле остаётся пустым, а текст это проговаривает.
+
     Сообщение идёт через _strip_internal_urls, как и ошибки статуса: у
     ReadTimeout внутренний адрес лежит в exc.request.url, и часть транспортных
     исключений вписывает его прямо в текст.
@@ -289,7 +364,11 @@ def _parse_transport_error(
     what = "не дождался ответа хаба" if timed_out else "не смог поговорить с хабом"
     detail = _strip_internal_urls(str(exc))
     tail = f" Транспорт сказал: {detail}." if detail else ""
-    retry = _TRANSPORT_WRITE_RETRY if write else _TRANSPORT_READ_RETRY
+    if write:
+        suggested_tool, advice = _write_state_check(path)
+        retry = f"{_TRANSPORT_WRITE_RETRY} {advice}"
+    else:
+        suggested_tool, retry = None, _TRANSPORT_READ_RETRY
     message = _strip_internal_urls(
         f"{method} {path} {what}: {kind}, срок ожидания {timeout:g} с.{tail} {retry}"
     )
@@ -299,7 +378,7 @@ def _parse_transport_error(
             "message": message,
             "hint": retry,
             "actor_hint": "agent",
-            "suggested_tool": "hub_task_status" if write else None,
+            "suggested_tool": suggested_tool,
             "transport": kind,
             "timeout_seconds": timeout,
             "retry_safe": not write,
