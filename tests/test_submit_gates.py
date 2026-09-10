@@ -188,7 +188,10 @@ def test_the_two_pipelines_are_compared_by_their_lists():
 
     active_here = {n for n, s in headless.items() if s.active}
     inactive_here = {n for n, s in headless.items() if not s.active}
-    assert inactive_here == {"branch_matches", "finding_outcomes"}, (
+    # #1155: finding_outcomes ушёл отсюда в активные — у отчёта о готовности
+    # появилось поле исходов, и причина «ответить негде» перестала быть верной.
+    # Матрица решений #1122 обновлена этой задачей, и сдача называет перемену.
+    assert inactive_here == {"branch_matches"}, (
         "набор неактивных на headless изменился — обновите матрицу решений в "
         "#1122 и скажите об этом в сдаче, а не молча"
     )

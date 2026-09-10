@@ -6,11 +6,12 @@ import json
 import time
 import urllib.parse
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import Field
 
 from hub import brand, config
 from hub.actionable_errors import normalize_api_error_detail
@@ -610,10 +611,10 @@ async def hub_list_tasks(
     human_reviewer: str = "",
     claimed_by: str = "",
     mine: str = "",
-    limit: int = 20,
+    limit: Annotated[int, Field(le=200)] = 20,
     include_archived: bool = False,
-    after_id: int | None = None,
-    mode: str = "full",
+    after_id: Annotated[int | None, Field(ge=0)] = None,
+    mode: Literal["full", "summary"] = "full",
     project: str = "",
 ) -> CallToolResult:
     """List tasks with optional filters.
@@ -633,7 +634,7 @@ async def hub_list_tasks(
         human_reviewer: Exact match on human_reviewer.
         claimed_by: Exact match on the claim holder.
         mine: Shorthand for human_owner OR claimed_by (same person).
-        limit: Max number of tasks to return.
+        limit: Max tasks to return (≤200).
         include_archived: Include archived tasks, hidden from boards by default.
     """
     from urllib.parse import urlencode
@@ -678,6 +679,23 @@ async def hub_list_tasks(
         return structured_echo_result("No tasks found.", tasks=[])
     lines = [_format_task(t) for t in result]
     return structured_echo_result("\n".join(lines), tasks=result)
+
+
+def _drop_generated_titles(tool_name: str, fields: tuple[str, ...]) -> None:
+    """Pay for published bounds with titles the caller does not need (#1229)."""
+    tool = mcp._tool_manager.get_tool(tool_name)
+    if tool is None:
+        return
+    parameters = tool.parameters
+    parameters.pop("title", None)
+    properties = parameters.get("properties", {})
+    for name in fields:
+        schema = properties.get(name)
+        if isinstance(schema, dict):
+            schema.pop("title", None)
+
+
+_drop_generated_titles("hub_list_tasks", ("limit", "after_id", "mode"))
 
 
 def _dependency_lines(task: dict[str, Any]) -> list[str]:
@@ -903,7 +921,11 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
 
 @mcp.tool()
 async def hub_task_update(
-    task_id: int, content: str, agent: str = "", kind: str = "status"
+    task_id: int,
+    content: str,
+    agent: str = "",
+    kind: str = "status",
+    finding_outcomes: list[dict[str, Any]] | None = None,
 ) -> str:
     """Add a status update or report to a task.
 
@@ -912,8 +934,8 @@ async def hub_task_update(
         content: Update text — status report, blocker description, or completion report
         agent: Name of the agent posting the update
         kind: Type of update: 'status', 'report', 'blocker', 'done', 'review', or 'arbitration'.
-            Prefer hub_report_done for completion (kind='done' is a deprecated alias with
-            the same validator and response envelope).
+            Prefer hub_report_done for completion (deprecated alias, same validator).
+        finding_outcomes: same as hub_report_done (#1155).
     """
     prior_status: str | None = None
     try:
@@ -922,14 +944,22 @@ async def hub_task_update(
     except HubApiError:
         prior_task = None
     try:
-        result = await _api_post(
-            f"/api/tasks/{task_id}/updates",
-            {
-                "agent": agent,
-                "kind": kind,
-                "content": content,
-            },
-        )
+        payload: dict[str, Any] = {
+            "agent": agent,
+            "kind": kind,
+            "content": content,
+        }
+        if finding_outcomes:
+            # #1155: депрекированный вход не имеет права терять ответ автора.
+            # Параметр объявлен ИМЕННО поэтому: транспорт MCP валидирует
+            # аргументы по схеме инструмента и молча выбрасывает всё, чего в
+            # схеме нет, — воспроизведено зондом через mcp.call_tool. Пока
+            # поля не было, исходы находок уезжали в никуда, а автор получал
+            # успех. Дальше поле проверяет тот же серверный валидатор, что и
+            # у канонического инструмента: при kind != 'done' будет 422, а не
+            # тишина.
+            payload["finding_outcomes"] = finding_outcomes
+        result = await _api_post(f"/api/tasks/{task_id}/updates", payload)
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
         return _format_hub_api_error(exc)
@@ -1052,20 +1082,25 @@ async def _task_mutation_response(
 
 
 @mcp.tool()
-async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
+async def hub_report_done(
+    task_id: int,
+    summary: str,
+    agent: str = "",
+    finding_outcomes: list[dict[str, Any]] | None = None,
+) -> str:
     """Submit a done report and return the task's actual status after lifecycle handling.
 
     AUTHOR step. Universal Review Gate (#306): this completes the task only
     when the current submission already carries an APPROVED review by another
     actor (or auto_review=false opted out). Otherwise it IS a submission — the
     task routes to ``review`` or ``ci_check`` and the response names the next
-    action. The response always states the real status and never implies
-    ``completed`` unless the task is.
+    action.
 
     Args:
         task_id: The task ID to report on
         summary: What was changed and how it was validated
         agent: Name of the agent submitting the report
+        finding_outcomes: same as hub_submit_for_review (#1155).
     """
     prior_status: str | None = None
     try:
@@ -1074,14 +1109,14 @@ async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
     except HubApiError:
         prior_status = None
     try:
-        result = await _api_post(
-            f"/api/tasks/{task_id}/updates",
-            {
-                "agent": agent,
-                "kind": "done",
-                "content": summary,
-            },
-        )
+        payload: dict[str, Any] = {
+            "agent": agent,
+            "kind": "done",
+            "content": summary,
+        }
+        if finding_outcomes:
+            payload["finding_outcomes"] = finding_outcomes
+        result = await _api_post(f"/api/tasks/{task_id}/updates", payload)
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
         return _format_hub_api_error(exc)
@@ -3732,6 +3767,13 @@ PREPARE_HIDDEN: tuple[Hidden, ...] = (
     Hidden("caused_by_task_id", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("detected_at", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("clear_caused_by", "флаг очистки паспорта дефекта, а не поле"),
+    Hidden("live_probe", "объявление живого зонда (#1236) правят через refine"),
+    # #1236 заплатил этими двумя за новый параметр постановки: схема каталога
+    # стояла в пяти символах от потолка, а потолок двигается только вниз.
+    # Оба — БУХГАЛТЕРИЯ, а не постановка (refinement.BOOKKEEPING_FIELDS): они
+    # не меняют того, что задача утверждает, и ставятся через refine.
+    Hidden("human_owner", "бухгалтерия, а не постановка: ставится через refine"),
+    Hidden("human_reviewer", "бухгалтерия, а не постановка: ставится через refine"),
 )
 
 
@@ -4021,12 +4063,10 @@ async def hub_refine_task(
         class_of_service: standard | expedite | fixed_date | intangible
         size: XS | S | M | L | XL
         wip_tag: feature_work | bugfix | tech_debt | support
-        due_date: ISO date (YYYY-MM-DD), for fixed_date COS.
+        due_date: ISO date, for fixed_date COS.
         user_story: "As a <role>, I want <X> so that <Y>".
         problem_statement: What's broken and why.
-        business_value: Why it matters.
-        outcome_metric: Which number moves, from what to what (lead time
-            3d -> 1d). Makes business_value checkable.
+        outcome_metric: Which number moves, from what to what (3d -> 1d).
         outcome_indicator: Leading signal, before the metric moves.
         outcome_deadline: When the outcome is checked.
         outcome_revisit_condition: What reopens this decision.
@@ -4035,14 +4075,13 @@ async def hub_refine_task(
         agent_fit: deterministic | assistant | sdd_native | agentic.
         found_in: Defect stage: unknown | review | ci | test | staging | prod.
         caused_by_task_id: Task that introduced the defect.
-        detected_at: When it was noticed.
         technical_hints: Hints, references, approach.
         scope_in: In scope.
         scope_out: Out of scope.
         constraints: Hard limits.
-        assumptions: Assumed to hold.
         affected_areas: Modules/paths impacted.
         validation_commands: Commands proving it works.
+        live_probe: Read-only probe the hub runs after delivery; a registry name.
         out_of_scope_for_review: What the reviewer ignores.
         review_checklist: What the reviewer verifies.
         human_owner: Who is accountable.

@@ -162,19 +162,50 @@ STEWARD_RUN_DEADLINE_MIN = int(env_get("STEWARD_RUN_DEADLINE_MIN", "30"))
 #: стюарда семнадцать минут ушли на повторные попытки, и судье досталось
 #: двенадцать минут из тридцати.
 STEWARD_START_DEADLINE_MIN = int(env_get("STEWARD_START_DEADLINE_MIN", "30"))
+#: Имена, ЗАПУСК которых наблюдён у провайдера попыткой создания (#1237).
+#: Список сегодня не сужает ничего — в нём все проверенные имена, — и стоит
+#: он не ради сужения, а ради связи выбора судьи со СПОСОБОМ проверки: имя
+#: попадает сюда только после наблюдённой попытки создания. Без этой связи
+#: список судьи один раз уже пополнился по каталогу (#1182) и разошёлся с
+#: соседним списком на двенадцать недель, никого не уронив.
+#:
+#: СПОСОБ: попытка создания агента, POST /v1/agents клиентом самого хаба
+#: (cursor_cloud.create_agent_attempt) в окружении службы на прод-хосте. Не
+#: list_models: наличие имени в каталоге проверяет существование имени, а не
+#: право его запускать, и ровно эта подмена развела два списка.
+#: ДАТА: 09.09.2026.
+#: РЕЗУЛЬТАТ: созданы ВСЕ ШЕСТЬ проверенных имён, ни одного отказа
+#: usage_limit_exceeded; каждый созданный агент удалён сразу (DELETE,
+#: HTTP 200). Тем самым запись review_dispatch.py о «гарантированном отказе»
+#: gpt-5.3-codex, gemini-3.1-pro и claude-sonnet-5 (28.08.2026, #1036) на
+#: 09.09.2026 ОПРОВЕРГНУТА опытом. Сужение списка ревьюера при этом не
+#: трогается: оно решение владельца, а не следствие этого замера.
+SUBSCRIPTION_LAUNCHABLE_MODELS: tuple[str, ...] = (
+    "grok-4.6",
+    "grok-4.5",
+    "composer-2.5",
+    "gpt-5.3-codex",
+    "gemini-3.1-pro",
+    "claude-sonnet-5",
+)
 # The model the steward runs on (#994 §4): a third family, distinct from the
 # implementer's and from the reviewer's. Declared on the order so the
 # diversity rule has something to check before the run starts.
+#
+# gpt-5.3-codex ЗАПУСКАЕТСЯ: проверено попыткой создания 09.09.2026 (#1237),
+# см. SUBSCRIPTION_LAUNCHABLE_MODELS. Имя оставлено прежним не по инерции:
+# посылка, по которой его считали гарантированным отказом, опровергнута
+# замером, и менять судью было не из-за чего.
 STEWARD_MODEL = env_get("STEWARD_MODEL", "gpt-5.3-codex")
 # Запасные судьи на случай, когда провайдер не может запустить основного
 # (#1182). Порядок — предпочтение; берётся первая, проходящая гейт
 # монокультуры ДЛЯ КОНКРЕТНОЙ сдачи, поэтому список не обязан быть
 # согласован с ревьюером заранее.
 #
-# Имена проверены у провайдера через list_models 06.09.2026: composer-2
-# не существует, существует composer-2.5. Непроверенное имя здесь — это
-# молчаливый пропуск замены, поэтому список пополняется только тем, что
-# наблюдалось в выдаче провайдера.
+# Имена берутся из SUBSCRIPTION_LAUNCHABLE_MODELS — там записано, чем и когда
+# их запуск наблюдался; связь держит тест, а не договорённость. composer-2.5,
+# а не composer-2: последнего не существует (06.09.2026, #1182). Непроверенное
+# имя здесь — молчаливый пропуск замены.
 STEWARD_MODEL_FALLBACKS = tuple(
     m.strip()
     for m in env_get("STEWARD_MODEL_FALLBACKS", "composer-2.5,gemini-3.1-pro").split(
@@ -272,6 +303,15 @@ STALE_REVIEW_MINUTES = int(env_get("STALE_REVIEW_MINUTES", "120"))
 # mechanically fails (422 dor_failed), and until this watchdog the author
 # learned that only when the owner hit the button.
 UNREFINED_DRAFT_MINUTES = int(env_get("UNREFINED_DRAFT_MINUTES", "240"))
+# Сторож очереди неразобранных находок (#1171). Механика разбора построена
+# целиком — факт касания (#1039), очередь (#1038), кнопки (#876) — и за всё
+# время ею не воспользовались ни разу: 131 подтверждённая находка без ответа,
+# precision=null. Молчание тут неотличимо от пустой очереди, поэтому очередь
+# выше порога говорит вслух. Порог — суждение: 40 находок это больше, чем
+# один заход за раз, и всё ещё меньше, чем накопленный к #1171 запас.
+UNJUDGED_FINDINGS_ALERT_THRESHOLD = int(
+    env_get("UNJUDGED_FINDINGS_ALERT_THRESHOLD", "40")
+)
 # Delivery reconciliation (#897): how often the poller compares "completed"
 # against "the PR is still open", and how far back it looks. On a timer because
 # every candidate costs a call to GitHub; bounded in time because history from
