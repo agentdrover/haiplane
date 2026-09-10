@@ -4429,11 +4429,43 @@ async def completed_tasks_awaiting_delivery(
     bricks the whole project's deliveries and no event can unbrick it.
 
     So a row that already says ``pr_open`` keeps being re-asked whatever its
-    age, and it is asked FIRST — ``ORDER BY`` puts it ahead of the window, so
-    the ``LIMIT`` cannot starve the very rows an irreversible gate stands on.
+    age, and it is asked FIRST — ``ORDER BY`` puts it ahead of the window.
     The cost is bounded by how many such rows exist, which is the set
     ``hub_undelivered_completed`` prints, and is paid by the sweep rather than
     in the delivery path.
+
+    AHEAD OF THE WINDOW IS NOT YET "CANNOT STARVE" (#1204, machine review of
+    submission #7). Submission #6 claimed this ``ORDER BY`` put the ``LIMIT``
+    beyond starving these rows. That was false whenever live ``pr_open`` rows
+    outnumber the limit (default 100; the sweep passes none of its own), and
+    false in the worst possible direction: ordering them ``completed_at DESC``
+    is a FIXED priority, so the rows past the cut are always the SAME rows —
+    the oldest. Those are exactly the fossils most likely to have been merged
+    and had their branch deleted by hand, which is the dead ref
+    ``_stranded_with_a_dead_ref`` bricks the whole project on. A fixed order
+    does not delay such a row, it excludes it permanently — the same "a frozen
+    row locks the project" class this function was changed to close, with a
+    counter for a threshold instead of thirty days.
+
+    Live ``pr_open`` rows are therefore ordered by ``checked_at`` ASC: the
+    least recently asked goes first, and asking it writes ``checked_at`` and
+    moves it to the back. That is rotation rather than priority — with R live
+    rows and limit L every one of them is reached within ``ceil(R / L)``
+    sweeps, whatever L is, so the gate's trust in any single row expires after
+    a bounded wait instead of never. This ordering is load-bearing precisely
+    because ``list_undelivered_completed_branch_tasks`` reads ALL live rows
+    with no ceiling of its own: the gate stands on rows only this sweep
+    refreshes, so a row it can never reach is a row the gate believes forever.
+
+    ``checked_at`` alone would not be enough, and the reason is a property of
+    the column rather than of the design: it is written ``datetime('now')``,
+    which is whole seconds. Rows refreshed inside the same second tie, and a
+    tie falls to the next key — under the old ``completed_at DESC`` that handed
+    the cut straight back to the oldest rows. So live rows break their tie
+    ``completed_at`` ASC: oldest first, the same direction the rotation runs,
+    never against it. The window's own rows keep their ``DESC`` ordering — the
+    tiebreak is scoped to live rows by the ``CASE``, because for a row nobody
+    has ever asked about there is no rotation to preserve.
 
     ``unknown`` is deliberately NOT given the same reprieve. It is not a
     candidate of that gate (see ``list_undelivered_completed_branch_tasks``),
@@ -4475,6 +4507,14 @@ async def completed_tasks_awaiting_delivery(
                   SELECT 1 FROM delivery_discrepancies d
                   WHERE d.task_id = t.id AND d.state = 'pr_open'
               ) DESC,
+              COALESCE(
+                  (SELECT d.checked_at FROM delivery_discrepancies d
+                   WHERE d.task_id = t.id AND d.state = 'pr_open'), ''
+              ) ASC,
+              CASE WHEN EXISTS (
+                  SELECT 1 FROM delivery_discrepancies d
+                  WHERE d.task_id = t.id AND d.state = 'pr_open'
+              ) THEN COALESCE(NULLIF(t.completed_at, ''), t.updated_at) END ASC,
               COALESCE(NULLIF(t.completed_at, ''), t.updated_at) DESC
             LIMIT ?
             """,

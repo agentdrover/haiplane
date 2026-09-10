@@ -943,6 +943,122 @@ async def test_a_live_pr_open_row_is_still_re_asked_past_the_lookback(
     )
 
 
+async def _live_row(
+    db: aiosqlite.Connection, *, title: str, pr: int, age_hours: int
+) -> int:
+    """Задача completed с живой строкой pr_open заданного возраста."""
+    from hub.models import TaskCreate
+    from hub.services import create_task
+
+    tv = await create_task(db, TaskCreate(title=title))
+    await repo.update_task(
+        db, tv.id, status="completed", branch=f"task-{tv.id}/x", pr_number=pr
+    )
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=tv.id,
+        state=PR_OPEN,
+        reason=f"PR #{pr} открыт и не смержен",
+        pr_number=pr,
+        delivery_path="none",
+    )
+    await db.execute(
+        "UPDATE tasks SET completed_at = datetime('now', ?), "
+        "updated_at = datetime('now', ?) WHERE id = ?",
+        (f"-{age_hours} hours", f"-{age_hours} hours", tv.id),
+    )
+    await db.commit()
+    return tv.id
+
+
+async def test_the_limit_does_not_cut_off_the_oldest_live_row(
+    db: aiosqlite.Connection,
+) -> None:
+    """Потолок выборки не имеет права всегда отрезать одни и те же строки.
+
+    Найдено машинным ревью сдачи №7. Сдача №6 сняла с живых pr_open временное
+    окно и поставила их первыми — но ВНУТРИ них порядок остался
+    ``completed_at DESC``, то есть фиксированным. Живых строк больше потолка
+    (по умолчанию 100, свип своего не передаёт) — и за срез уходят всегда одни
+    и те же: самые старые. Это ровно те ископаемые, которые после ручного
+    merge + delete ветки дают мёртвую ссылку и нетранзитный отказ на весь
+    проект. Фиксированный порядок такую строку не задерживает, а исключает
+    навсегда.
+
+    Числа взяты с прода (hub_undelivered_completed, 10.09.2026): живая строка
+    задачи #1138 возрастом 165 ч и строка #878 возрастом 467 ч, которая
+    становится живой ровно тем переходом, ради которого живут #1214/#1215, —
+    провайдер заговорил и сказал pr_open.
+
+    Мутация: верни ``completed_at DESC`` внутри живых строк — упадёт здесь.
+    """
+    fresh = await _live_row(db, title="#1138 eslint", pr=3, age_hours=165)
+    fossil = await _live_row(db, title="#878 маховик", pr=443, age_hours=467)
+
+    gate = [
+        dict(r)["id"]
+        for r in await repo.list_undelivered_completed_branch_tasks(
+            db, exclude_task_id=999
+        )
+    ]
+    assert {fresh, fossil} <= set(gate), "гейт стоит на обеих живых строках"
+
+    asked = [
+        dict(r)["id"] for r in await repo.completed_tasks_awaiting_delivery(db, limit=1)
+    ]
+    assert asked == [fossil], (
+        "при потолке меньше числа живых строк свип обязан начинать со САМОЙ "
+        f"СТАРОЙ (467 ч), а не с самой молодой: {asked}"
+    )
+
+
+async def test_live_rows_rotate_so_none_is_starved(
+    db: aiosqlite.Connection,
+) -> None:
+    """Порядок живых строк — ротация, а не приоритет.
+
+    Спросили строку — она уходит в конец очереди, и следующий свип берёт
+    другую. Значит при R живых строках и потолке L каждая опрашивается не
+    позже чем через ceil(R/L) свипов: доверие гейта к строке протухает за
+    ограниченное время, а не никогда.
+
+    Мутация: убери ключ ``checked_at`` — свип будет вечно спрашивать одну и ту
+    же строку, и тест упадёт на втором шаге.
+    """
+    first = await _live_row(db, title="строка A", pr=11, age_hours=400)
+    second = await _live_row(db, title="строка B", pr=12, age_hours=300)
+    # checked_at пишется с точностью до секунды, поэтому в тесте развожу его
+    # явно — иначе обе строки попадут в одну секунду и сравнивать будет нечего.
+    await db.execute(
+        "UPDATE delivery_discrepancies SET checked_at = datetime('now','-2 hours') "
+        "WHERE task_id = ?",
+        (first,),
+    )
+    await db.execute(
+        "UPDATE delivery_discrepancies SET checked_at = datetime('now','-1 hours') "
+        "WHERE task_id = ?",
+        (second,),
+    )
+    await db.commit()
+
+    asked = [
+        dict(r)["id"] for r in await repo.completed_tasks_awaiting_delivery(db, limit=1)
+    ]
+    assert asked == [first], f"первой идёт та, которую спрашивали давнее: {asked}"
+
+    # свип переспросил её и записал ответ — checked_at подвинулся
+    await repo.record_delivery_discrepancy(
+        db, task_id=first, state=PR_OPEN, reason="переспросили", pr_number=11
+    )
+    asked_next = [
+        dict(r)["id"] for r in await repo.completed_tasks_awaiting_delivery(db, limit=1)
+    ]
+    assert asked_next == [second], (
+        "после ответа строка обязана уйти в конец очереди, иначе это не "
+        f"ротация, а тот же вечный приоритет: {asked_next}"
+    )
+
+
 async def test_an_unanswered_row_past_the_lookback_is_not_re_asked_forever(
     db: aiosqlite.Connection,
 ) -> None:
