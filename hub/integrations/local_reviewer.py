@@ -191,11 +191,6 @@ _DOCKER_HINT = (
 )
 
 
-def _runs_tool(parts: list[str], name: str) -> bool:
-    """Обёртка ЗАПУСКАЕТ названный инструмент (сравнение по basename)."""
-    return any(part.rsplit("/", 1)[-1] == name for part in parts)
-
-
 # Глобальные флаги движка, которые берут значение ОТДЕЛЬНЫМ токеном. Без них
 # ``podman --log-level debug run --rm -i img`` читается как подкоманда
 # «debug», запуск контейнера стражу невидим и проходит без своего срока жизни
@@ -345,7 +340,12 @@ def _container_run_flags(
         while j < len(parts) and parts[j].startswith("-"):
             j += 2 if parts[j] in global_value_flags else 1
         if j >= len(parts) or parts[j] != "run":
-            return None
+            # Не «движка в строке нет», а «ЭТОТ вызов — не run»: подкоманд у
+            # движка много, и первая же не-run (``podman ps``) обрывала поиск
+            # вовсе, оставляя настоящий ``podman run`` правее невидимым — то
+            # есть отказ уходил В СТОРОНУ ПРОПУСКА (найдено машинным ревью
+            # 10.09.2026, находка 96144e6317c1d7ac).
+            continue
         own: list[tuple[str, str | None]] = []
         k = j + 1
         while k < len(parts) and parts[k].startswith("-"):
@@ -416,7 +416,16 @@ def detaching_sandbox() -> list[str]:
     """Названные причины, если обёртка запуска ни потомок, ни со своим сроком."""
     parts = shlex.split(config.LOCAL_REVIEW_SANDBOX or "")
     reasons: list[str] = []
-    if _runs_tool(parts, "systemd-run") and "--scope" not in parts:
+    # ``--scope`` засчитывается только среди СОБСТВЕННЫХ аргументов
+    # systemd-run: за ``--`` стоит полезная нагрузка, и её ``--scope``
+    # transient service в scope не превращает. Взгляд на всю строку давал
+    # отказ В СТОРОНУ ПРОПУСКА — ``systemd-run --quiet --pipe --uid=x --
+    # /wrap --scope`` проходил молча (найдено машинным ревью 10.09.2026,
+    # находка 3d5938a9a645c39d; воспроизведено на HEAD 21629cde).
+    if any(
+        tool == "systemd-run" and "--scope" not in own
+        for tool, own in _wrapper_windows(parts)
+    ):
         reasons.append(_SCOPE_HINT)
     podman_flags = _container_run_flags(parts, "podman")
     if podman_flags is not None:
@@ -478,6 +487,157 @@ def _bundled_short_value(
     return parts[i + 1] if i + 1 < len(parts) else None
 
 
+# Флаги СОБСТВЕННЫХ аргументов обёртки, чьё значение стоит ОТДЕЛЬНЫМ
+# токеном. Нужны, чтобы отличить значение флага от первого позиционного
+# аргумента: в ``sudo -n -u haiplane-reviewer /wrap`` имя пользователя — это
+# значение ``-u``, а ``/wrap`` уже полезная нагрузка, и всё правее неё —
+# аргументы ЧУЖОЙ программы. Списки ПО ИМЕНИ, как и всё в этом модуле;
+# незнакомый флаг со значением отдельным токеном закончит окно раньше
+# времени, и пользователь останется НЕ НАЗВАН — это пропуск, а не подмена.
+_TOOL_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    # sudo(8): опции, берущие аргумент.
+    "sudo": frozenset(
+        {
+            "-C",
+            "--close-from",
+            "-D",
+            "--chdir",
+            "-g",
+            "--group",
+            "-h",
+            "--host",
+            "-p",
+            "--prompt",
+            "-R",
+            "--chroot",
+            "-r",
+            "--role",
+            "-t",
+            "--type",
+            "-T",
+            "--command-timeout",
+            "-U",
+            "--other-user",
+            "-u",
+            "--user",
+        }
+    ),
+    # systemd-run(1): опции, берущие аргумент. ``--user`` здесь значения НЕ
+    # берёт — это выбор менеджера, а не имя пользователя, и путать их нельзя.
+    "systemd-run": frozenset(
+        {
+            "-u",
+            "--unit",
+            "-p",
+            "--property",
+            "--description",
+            "--slice",
+            "--uid",
+            "--gid",
+            "--nice",
+            "-E",
+            "--setenv",
+            "--service-type",
+            "--working-directory",
+            "--on-active",
+            "--on-boot",
+            "--on-startup",
+            "--on-unit-active",
+            "--on-unit-inactive",
+            "--on-calendar",
+            "--timer-property",
+            "--path-property",
+            "--socket-property",
+            "-M",
+            "--machine",
+            "-H",
+            "--host",
+        }
+    ),
+    # У движков собственные аргументы — это глобальные флаги ДО подкоманды,
+    # и они уже названы поимённо выше.
+    "podman": _ENGINE_GLOBAL_VALUE_FLAGS["podman"],
+    "docker": _ENGINE_GLOBAL_VALUE_FLAGS["docker"],
+}
+
+
+# Короткие флаги, берущие значение, и короткие флаги без значения — по
+# инструменту. Слипшийся пучок ``-nu`` берёт следующий токен, а ``-n`` — нет,
+# и без этого различия окно собственных аргументов обрывалось бы на имени
+# пользователя (``sudo -n -u alice -nu bob``).
+_TOOL_VALUE_SHORTS: dict[str, str] = {
+    "sudo": "CDghpRrtTUu",
+    "systemd-run": "upEMH",
+}
+_TOOL_VALUELESS_SHORTS: dict[str, str] = {
+    "sudo": "".join(sorted(_SUDO_VALUELESS_SHORT)),
+    "systemd-run": "dGPqrSt",
+}
+
+
+def _consumes_next(tool: str, arg: str) -> bool:
+    """Флаг инструмента, чьё значение стоит СЛЕДУЮЩИМ отдельным токеном."""
+    if arg in _TOOL_VALUE_FLAGS.get(tool, frozenset()):
+        return True
+    if arg.startswith("--") or not arg.startswith("-"):
+        return False
+    body = arg[1:]
+    if not body:
+        return False
+    valueless = _TOOL_VALUELESS_SHORTS.get(tool, "")
+    return body[-1] in _TOOL_VALUE_SHORTS.get(tool, "") and all(
+        ch in valueless for ch in body[:-1]
+    )
+
+
+def _wrapper_windows(parts: list[str]) -> list[tuple[str, list[str]]]:
+    """Окна СОБСТВЕННЫХ аргументов названных инструментов, слева направо.
+
+    Окно инструмента кончается там же, где кончает его читать он сам: на
+    ``--`` либо на первом позиционном токене (имени полезной нагрузки).
+    Дальше идут аргументы ЧУЖОЙ программы, и принимать их за флаги обёртки
+    нельзя: страж возвращал тогда постороннее имя.
+
+    ЗАМЕРЕНО на HEAD 21629cde до починки — обе формы давали чужой ответ:
+    ``sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap`` давало
+    ``HOME`` (находка 64e89a8683b01db1), а
+    ``systemd-run --scope --uid=alice -- /bin/true --uid=bob`` — ``bob``
+    (находка d228b0eb3310a9cc). Это не «пропустили незнакомое», о чём
+    говорит объявленное ограничение задачи, а РАЗОБРАЛИ ЗНАКОМОЕ НЕВЕРНО:
+    имя постороннее, и членство в группе каталога прогонов проверялось у
+    того, кого в строке нет.
+
+    Поиск инструментов продолжается и ЗА окном: вложенная обёртка
+    (``sudo -u X podman run …``) остаётся видимой, и последнее названное имя
+    по-прежнему действующее.
+    """
+    windows: list[tuple[str, list[str]]] = []
+    i = 0
+    while i < len(parts):
+        tool = parts[i].rsplit("/", 1)[-1]
+        if tool not in _USER_FLAGS:
+            i += 1
+            continue
+        own: list[str] = []
+        j = i + 1
+        while j < len(parts):
+            arg = parts[j]
+            if arg == "--":
+                j += 1
+                break
+            if not arg.startswith("-") or arg == "-":
+                break
+            own.append(arg)
+            if _consumes_next(tool, arg) and j + 1 < len(parts):
+                own.append(parts[j + 1])
+                j += 2
+            else:
+                j += 1
+        windows.append((tool, own))
+        i = max(j, i + 1)
+    return windows
+
+
 def sandbox_uid() -> str:
     """Пользователь ХОСТА, названный в песочнице, или "".
 
@@ -493,25 +653,22 @@ def sandbox_uid() -> str:
     конфигурацию (найдено при работе над #1208, ревьюер этого не называл).
     """
     parts = shlex.split(config.LOCAL_REVIEW_SANDBOX or "")
-    flags: tuple[str, ...] = ()
     named: list[str] = []
-    for i, part in enumerate(parts):
-        tool = part.rsplit("/", 1)[-1]
-        if tool in _USER_FLAGS:
-            flags = _USER_FLAGS[tool]
-            continue
-        for flag in flags:
-            if part.startswith(flag + "="):
-                named.append(part.split("=", 1)[1])
-                break
-            if part == flag and i + 1 < len(parts):
-                named.append(parts[i + 1])
-                break
-            if len(flag) == 2 and not flag.startswith("--"):
-                bundled = _bundled_short_value(part, flag[1], parts, i)
-                if bundled:
-                    named.append(bundled)
+    for tool, own in _wrapper_windows(parts):
+        flags = _USER_FLAGS[tool]
+        for i, part in enumerate(own):
+            for flag in flags:
+                if part.startswith(flag + "="):
+                    named.append(part.split("=", 1)[1])
                     break
+                if part == flag and i + 1 < len(own):
+                    named.append(own[i + 1])
+                    break
+                if len(flag) == 2 and not flag.startswith("--"):
+                    bundled = _bundled_short_value(part, flag[1], own, i)
+                    if bundled:
+                        named.append(bundled)
+                        break
     user = _effective(named)
     return "" if user is _FLAG_ABSENT else str(user)
 

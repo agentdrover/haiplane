@@ -4370,6 +4370,135 @@ def test_the_guard_reads_the_sudo_form_of_the_sandbox_user(monkeypatch) -> None:
         )
 
 
+def test_the_user_guard_reads_only_the_wrappers_own_arguments(monkeypatch) -> None:
+    """Флаг пользователя берётся из СОБСТВЕННЫХ аргументов обёртки.
+
+    Объявленное ограничение задачи разрешает ПРОПУСКАТЬ незнакомое: «стражи
+    знают названные инструменты и флаги, чего не знают — пропускают». Оно НЕ
+    разрешает разобрать знакомое неверно и вернуть постороннее имя, а именно
+    это здесь и происходило: страж читал всю строку целиком и брал последнее
+    ``-u``/``--uid`` где угодно, включая аргументы полезной нагрузки.
+
+    Воспроизведено на HEAD 21629cde до починки:
+    ``sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap`` → ``HOME``
+    (находка 64e89a8683b01db1), ``systemd-run --scope --uid=alice --
+    /bin/true --uid=bob`` → ``bob`` (находка d228b0eb3310a9cc). Следствие
+    названо: ``scratch_problem`` судит членство в группе каталога прогонов у
+    пользователя, которого в строке нет вовсе, то есть проверка, заведённая
+    ради 45971e09, отвечает про чужую конфигурацию.
+    """
+    cases = {
+        # Полезная нагрузка со СВОИМ ``-u``: обёртка — sudo, пользователь
+        # хоста назван ею, а ``-u HOME`` принадлежит /usr/bin/env.
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/bin/env -u HOME -u PATH /wrap": (
+            "haiplane-reviewer"
+        ),
+        # ``--`` кончает собственные аргументы systemd-run: всё правее —
+        # чужая программа, и её ``--uid`` к хосту отношения не имеет.
+        "/usr/bin/systemd-run --scope --uid=alice -- /bin/true --uid=bob": "alice",
+        "/usr/bin/systemd-run --scope --uid alice -- /wrap --uid bob": "alice",
+        # Тот же разрыв без ``--``: имя полезной нагрузки — уже позиционный
+        # аргумент, и собственные флаги обёртки на нём кончились.
+        "/usr/bin/systemd-run --scope --uid=alice /wrap --uid=bob": "alice",
+        # Обёртка пользователя НЕ называет вовсе — и выдумывать его из
+        # аргументов полезной нагрузки нельзя: пустая строка честнее чужого
+        # имени.
+        "/usr/bin/sudo -n /wrap --uid=bob": "",
+        "/usr/bin/sudo -n /usr/bin/env -u HOME /wrap": "",
+        # Повтор флага ВНУТРИ собственных аргументов судится по-прежнему по
+        # последнему вхождению — починка одного не отменяет другого.
+        "/usr/bin/sudo -n -u alice -u bob /wrap --user carol": "bob",
+        # Вложенная обёртка за окном остаётся видимой: podman назван после
+        # позиционного аргумента sudo, и его ``--user`` по-прежнему гасится
+        # как пользователь ВНУТРИ контейнера.
+        "/usr/bin/sudo -n /wrap podman run --timeout 60 --user 1000 img": "",
+        # Слипшийся пучок берёт значение отдельным токеном, и окно на нём не
+        # кончается: иначе починка одного оплачена поломкой другого.
+        "/usr/bin/sudo -nu haiplane-reviewer /usr/bin/env -u HOME /wrap": (
+            "haiplane-reviewer"
+        ),
+    }
+    for sandbox, expected in cases.items():
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_uid() == expected, (
+            f"в песочнице «{sandbox}» хостовый пользователь — «{expected}», а "
+            f"страж назвал «{local_reviewer.sandbox_uid()}»: имя из аргументов "
+            "полезной нагрузки означает, что членство в группе каталога "
+            "прогонов проверяется НЕ У ТОГО пользователя"
+        )
+
+
+def test_the_scope_flag_is_read_only_from_systemd_runs_own_arguments(
+    monkeypatch,
+) -> None:
+    """``--scope`` засчитывается только среди собственных аргументов обёртки.
+
+    Отказ уходил В СТОРОНУ ПРОПУСКА: страж искал ``--scope`` во всей строке,
+    и ``--scope`` полезной нагрузки снимал отказ, хотя transient service от
+    этого в scope не превращается. Воспроизведено на HEAD 21629cde: строка
+    ``systemd-run --quiet --pipe --uid=x -- /wrap --scope`` возвращала ``[]``
+    (находка 3d5938a9a645c39d).
+    """
+    for hidden in (
+        "/usr/bin/systemd-run --quiet --pipe --uid=x -- /wrap --scope",
+        "/usr/bin/systemd-run --quiet --uid=x /wrap --scope",
+        "/usr/bin/systemd-run --uid=x -- /usr/bin/env SCOPE=1 /wrap --scope",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", hidden)
+        reasons = local_reviewer.detaching_sandbox()
+        assert reasons and all("--scope" in r for r in reasons), (
+            f"«{hidden}» — systemd-run БЕЗ --scope: ``--scope`` здесь стоит "
+            "среди аргументов полезной нагрузки и transient service в scope "
+            f"не превращает, а страж пропустил запуск молча: {reasons}"
+        )
+
+    # Собственный ``--scope`` обёртки по-прежнему снимает отказ — иначе
+    # рабочая форма из #1180 оказалась бы сломана.
+    for ok in (
+        "/usr/bin/systemd-run --scope --uid=x -- /wrap",
+        "/usr/bin/systemd-run --scope --uid=x /wrap --uid=y",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", ok)
+        assert local_reviewer.detaching_sandbox() == [], (
+            f"«{ok}» называет --scope среди собственных аргументов "
+            f"systemd-run и отвергаться не должна: "
+            f"{local_reviewer.detaching_sandbox()}"
+        )
+
+
+def test_a_non_run_engine_call_does_not_hide_a_later_run(monkeypatch) -> None:
+    """Первая не-``run`` подкоманда движка не обрывает поиск запуска.
+
+    Отказ уходил В СТОРОНУ ПРОПУСКА: страж возвращал «движка нет» на первом
+    же ``podman``, за которым не стоит ``run``, и настоящий запуск правее
+    оставался невидимым. Воспроизведено на HEAD 21629cde:
+    ``podman ps /usr/bin/podman run --timeout 0 img`` давало ``[]``, тогда
+    как одиночный ``podman run --timeout 0`` отвергался (находка
+    96144e6317c1d7ac).
+    """
+    for hidden in (
+        "/usr/bin/podman ps /usr/bin/podman run --timeout 0 img",
+        "/usr/bin/podman version /usr/bin/podman run --rm -i img",
+        "/usr/bin/docker ps /usr/bin/docker run --rm -i img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", hidden)
+        assert local_reviewer.detaching_sandbox(), (
+            f"в «{hidden}» настоящий запуск контейнера стоит ПРАВЕЕ первой "
+            "не-run подкоманды, и пропустить его значит разрешить прогон, "
+            "который снять нельзя"
+        )
+
+    # А там, где запуска нет вовсе, судить по-прежнему нечего.
+    for nothing in ("/usr/bin/podman ps", "/usr/bin/podman ps /usr/bin/podman version"):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", nothing)
+        assert local_reviewer.detaching_sandbox() == [], (
+            f"«{nothing}» контейнер не запускает: {local_reviewer.detaching_sandbox()}"
+        )
+
+
 def test_a_container_launch_without_its_own_deadline_is_refused(monkeypatch) -> None:
     """AC-3: контейнер без собственного срока жизни отвергнут ПО ИМЕНИ ФЛАГА.
 
