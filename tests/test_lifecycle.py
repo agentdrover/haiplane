@@ -18,6 +18,12 @@ from hub import repository as repo
 from hub.services.finding_identity import finding_uids
 from hub.services.lifecycle import maybe_rollup_parent, repair_stale_parent_completions
 
+# Корень дерева логгеров хаба: hub/* берут либо literal "hub", либо __name__,
+# а __name__ модуля пакета всегда начинается с "hub.". Всё, что не под этим
+# корнем, — чужие записи (aiosqlite, sqlite3, httpx), и в проверках на утечку
+# они образуют случайный стог (#1251).
+_HUB_LOGGER = "hub"
+
 
 async def _walk_pair_lifecycle(client: AsyncClient, task_id: int) -> list[str]:
     """Run the canonical pair cycle and return the observed status trace."""
@@ -1007,7 +1013,14 @@ async def test_a_probe_never_leaks_its_secret(
 
     monkeypatch.setattr(cursor_cloud, "_request", _fake_request)
 
-    with caplog.at_level(logging.DEBUG):
+    # Уровень поднимается ТОЛЬКО логгеру хаба (#1251). caplog.at_level() без
+    # аргумента logger поднимает корневой, и тогда в caplog.records сыплются
+    # чужие записи: aiosqlite и sqlite3 пишут туда repr соединений с адресами
+    # вида 0x10ab5d910 и параметры запросов — десятками за прогон. Иголка
+    # («250», длина подложенного значения) фиксированная, а стог был
+    # случайным: три цифры подряд попадались в шестнадцатеричном адресе, и
+    # тест краснел на задачах, к которым не относится. Проверять надо НАШ код.
+    with caplog.at_level(logging.DEBUG, logger=_HUB_LOGGER):
         await _release_reaches_prod(db, monkeypatch)
 
     check = dict((await repo.list_live_checks(db, task_id))[0])
@@ -1019,7 +1032,20 @@ async def test_a_probe_never_leaks_its_secret(
     )
     card = " ".join([check["probe"], check["observation"], check["reason"], updates])
     arguments = " ".join(f"{m} {p} {b}" for m, p, b in seen_calls)
-    journal = " ".join(record.getMessage() for record in caplog.records)
+    # Второй рубеж к сужению уровня: даже если корневой логгер поднимет кто-то
+    # ещё (плагин, ini-настройка log_level, соседний тест), в поверхность
+    # попадут только записи хаба. Утверждение перестаёт зависеть от глобальной
+    # настройки логирования — а значит, и от того, какие адреса выдал
+    # аллокатор в этом прогоне.
+    hub_records = [
+        record
+        for record in caplog.records
+        if record.name == _HUB_LOGGER or record.name.startswith(f"{_HUB_LOGGER}.")
+    ]
+    journal = " ".join(record.getMessage() for record in hub_records)
+    # Сузить журнал до пустоты — тоже способ снять проверку: поверхность
+    # осталась бы в списке, но не могла бы поймать ничего.
+    assert hub_records, "журнал хаба пуст: поверхность нечего проверять"
 
     for surface, text in (
         ("карточка", card),
