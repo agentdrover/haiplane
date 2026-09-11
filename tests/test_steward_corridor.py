@@ -1247,7 +1247,10 @@ async def test_a_finding_cannot_write_outside_the_sandbox(tmp_path, monkeypatch)
         },
     )
     outside = tmp_path / "outside.py"
-    outside.write_text("SECRET = 'live'\nCHECK = True\n", encoding="utf-8")
+    # Содержимое нарочно безобидное: файл важен тем, что он ЧУЖОЙ, а не тем,
+    # что в нём лежит. (Слово «secret» здесь роняло бы сканер секретов, и
+    # тест ловил бы его, а не мутацию.)
+    outside.write_text("OUTSIDE_MARKER = 'untouched'\nCHECK = True\n", encoding="utf-8")
     before = outside.read_text(encoding="utf-8")
 
     # Место мутации приходит из ТЕКСТА находки — не из головы теста.
@@ -1505,3 +1508,45 @@ async def test_the_digest_ignores_a_report_that_landed_after_the_verdict(db):
         "вердикт стоял на ПЕРВОМ отчёте — его ступень и показывают"
     )
     assert entry["models"]["reviewer"] == "grok-4.6"
+
+
+async def test_a_probe_without_a_baseline_says_nothing(tmp_path, monkeypatch):
+    """База не снялась — зонд не отвечает и мутацию не гоняет.
+
+    Без базы «упал тест» ничего не доказывает: неизвестно, падал ли он и
+    раньше. Гонять мутацию в такой обстановке — платить минутами за ответ,
+    которому нельзя верить.
+    """
+    from hub import config as config_module
+    from hub.services import mechanical_pass as mp
+    from hub.services.steward_corridor import Mutation
+
+    project = tmp_path / "nobase"
+    sha = _tiny_repo(project, {"calc.py": "x = 1\ny = 2\n"})
+    # Команда, которая ничего не говорит: ненулевой код и ни одного имени.
+    monkeypatch.setattr(config_module, "MUTATION_PROBE_CMD", "/usr/bin/false")
+    monkeypatch.setattr(config_module, "MUTATION_PROBE_SCRATCH_DIR", str(tmp_path))
+
+    runs: list[Mutation | None] = []
+    original = mp.run_suite_in_sandbox
+
+    async def _counted(*, repo_path, sha, mutation=None):
+        runs.append(mutation)
+        return await original(repo_path=repo_path, sha=sha, mutation=mutation)
+
+    monkeypatch.setattr(mp, "run_suite_in_sandbox", _counted)
+
+    probe = mp.SandboxProbe(str(project), sha)
+    answer = await probe(
+        Mutation(
+            file="calc.py",
+            start_line=2,
+            end_line=2,
+            source_field="title",
+            quote="calc.py:2",
+        )
+    )
+
+    assert answer is None, "без базы зонд не отвечает"
+    assert probe.baseline is None
+    assert runs == [None], "мутированный прогон не заказывают вовсе"
