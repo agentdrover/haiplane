@@ -904,17 +904,19 @@ async def test_blocker_status_change_moves_the_packets_revision(
     assert before.revision["dependencies"] != after.revision["dependencies"]
 
 
-async def test_risk_and_readiness_changes_move_the_packets_revision(
+async def test_risk_class_change_moves_the_packets_revision(
     db: aiosqlite.Connection, clone: Path, collection
 ):
-    """Класс риска и счёт готовности пакет отдаёт — значит и они в отпечатке.
+    """Класс риска пакет отдаёт — значит и он в отпечатке.
 
-    ``statement_fingerprint`` собран из ``STATEMENT_FIELDS`` (#1156), и ни
-    ``risk_class``, ни ``readiness_score`` туда не входят: их пишет хаб, а не
-    правка постановки. До правки это означало ровно то, чего отпечаток и
-    должен не допускать: ``R2`` → ``R3`` и «готовность 94, DoR пройден» →
-    «40, не пройден» оставляли отпечаток посимвольно прежним, и суждение,
+    ``statement_fingerprint`` собран из ``STATEMENT_FIELDS`` (#1156), и
+    ``risk_class`` туда не входит: колонку пишет хаб, а не правка постановки.
+    До правки это означало ровно то, чего отпечаток и должен не допускать:
+    ``R2`` → ``R3`` оставляло отпечаток посимвольно прежним, и суждение,
     записанное под ним, выглядело бы выданным по классу, которого уже нет.
+
+    Меняется ТОЛЬКО класс: изменив заодно готовность, тест зеленел бы и на
+    отпечатке, который про класс не знает.
     """
     task_id = await _draft(db, clone, title="risk moves")
     await _ac(db, task_id, "AC-1", test_ref="tests/test_x.py::test_present")
@@ -922,24 +924,50 @@ async def test_risk_and_readiness_changes_move_the_packets_revision(
     before = await build_draft_packet(db, task_id)
     assert before is not None
     assert before.fact("risk_class").value["stored"] == "R2"
-    assert before.readiness == {"score": 94, "dor_passed": True, "computed": True}
 
     await repo.update_task(
         db,
         task_id,
         risk_class="R3",
         risk_class_reasons=json.dumps(["R3: миграция"]),
-        readiness_score=40,
-        dor_passed=0,
     )
     await db.commit()
 
     after = await build_draft_packet(db, task_id)
     assert after is not None
     assert after.fact("risk_class").value["stored"] == "R3"
-    assert after.readiness == {"score": 40, "dor_passed": False, "computed": True}
     # Постановку не трогали: её поколение и её отпечаток стоят на месте —
     # и правы. Двинуться обязана та половина отпечатка, что про задачу.
+    assert before.statement_generation == after.statement_generation
+    assert before.revision["statement"] == after.revision["statement"]
+    assert before.revision["task"] != after.revision["task"]
+
+
+async def test_readiness_change_moves_the_packets_revision(
+    db: aiosqlite.Connection, clone: Path, collection
+):
+    """Счёт готовности пакет отдаёт рядом с фактами — значит и он в отпечатке.
+
+    Готовность объявлена контекстом, а не основанием, и это не выводит её
+    из-под правила: стюард её ЧИТАЕТ, и «94, DoR пройден» против «40, не
+    пройден» — разные картины одной задачи. Отпечаток, называвший оба
+    состояния одним, продавал бы вторую под номером первой.
+
+    Меняется ТОЛЬКО готовность — по той же причине, что и в соседнем тесте.
+    """
+    task_id = await _draft(db, clone, title="readiness moves")
+    await _ac(db, task_id, "AC-1", test_ref="tests/test_x.py::test_present")
+
+    before = await build_draft_packet(db, task_id)
+    assert before is not None
+    assert before.readiness == {"score": 94, "dor_passed": True, "computed": True}
+
+    await repo.update_task(db, task_id, readiness_score=40, dor_passed=0)
+    await db.commit()
+
+    after = await build_draft_packet(db, task_id)
+    assert after is not None
+    assert after.readiness == {"score": 40, "dor_passed": False, "computed": True}
     assert before.statement_generation == after.statement_generation
     assert before.revision["statement"] == after.revision["statement"]
     assert before.revision["task"] != after.revision["task"]
