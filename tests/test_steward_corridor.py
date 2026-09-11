@@ -1021,7 +1021,7 @@ async def test_the_live_probe_kills_a_mutation_in_a_sandbox_and_leaves_no_trace(
     import sys
 
     from hub import config as config_module
-    from hub.services.mechanical_pass import live_probe
+    from hub.services.mechanical_pass import run_suite_in_sandbox
     from hub.services.steward_corridor import Mutation
 
     project = tmp_path / "project"
@@ -1056,16 +1056,16 @@ async def test_the_live_probe_kills_a_mutation_in_a_sandbox_and_leaves_no_trace(
     )
     monkeypatch.setattr(config_module, "MUTATION_PROBE_SCRATCH_DIR", str(tmp_path))
 
-    suite = await live_probe(
-        Mutation(
+    suite = await run_suite_in_sandbox(
+        repo_path=str(project),
+        sha=sha,
+        mutation=Mutation(
             file="calc.py",
             start_line=2,
             end_line=2,
             source_field="title",
             quote="calc.py:2",
         ),
-        repo_path=str(project),
-        sha=sha,
     )
 
     assert suite is not None, "прогон обязан состояться — команда набора задана"
@@ -1095,7 +1095,7 @@ async def test_the_live_probe_refuses_a_mutation_that_breaks_the_parse(
     import sys
 
     from hub import config as config_module
-    from hub.services.mechanical_pass import live_probe
+    from hub.services.mechanical_pass import run_suite_in_sandbox
     from hub.services.steward_corridor import Mutation
 
     project = tmp_path / "broken"
@@ -1130,16 +1130,16 @@ async def test_the_live_probe_refuses_a_mutation_that_breaks_the_parse(
     monkeypatch.setattr(config_module, "MUTATION_PROBE_SCRATCH_DIR", str(tmp_path))
 
     assert (
-        await live_probe(
-            Mutation(
+        await run_suite_in_sandbox(
+            repo_path=str(project),
+            sha=sha,
+            mutation=Mutation(
                 file="calc.py",
                 start_line=2,
                 end_line=2,
                 source_field="title",
                 quote="calc.py:2",
             ),
-            repo_path=str(project),
-            sha=sha,
         )
         is None
     )
@@ -1187,3 +1187,321 @@ async def test_no_configured_suite_command_means_no_probe_at_all(
     await repo_module.update_task(db, task_id, submission_sha="")
     await db.commit()
     assert await mp.configured_probe(db, task_id) is None
+
+
+# ---------------------------------------------------------------------------
+# ВТОРОЕ РЕВЬЮ #1234: живой зонд — это путь, который ПРАВИТ ФАЙЛЫ и ЗАПУСКАЕТ
+# ПРОЦЕССЫ по тексту, который пишет ревьюер. Тексты находок — данные, а не
+# команды, и тесты ниже держат именно эту границу.
+# ---------------------------------------------------------------------------
+
+
+def _tiny_repo(root, files: dict[str, str]) -> str:
+    """Крошечный git-репозиторий с коммитом. Возвращает sha."""
+    import subprocess
+
+    root.mkdir(parents=True, exist_ok=True)
+
+    def git(*args: str) -> str:
+        return subprocess.run(  # noqa: S603
+            ["git", "-C", str(root), *args], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    git("init", "-b", "main")
+    git("config", "user.email", "probe@example.com")
+    git("config", "user.name", "probe")
+    for name, body in files.items():
+        (root / name).write_text(body, encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-m", "base")
+    return git("rev-parse", "HEAD")
+
+
+async def test_a_finding_cannot_write_outside_the_sandbox(tmp_path, monkeypatch):
+    """Путь из текста находки не выводит запись за пределы песочницы.
+
+    ВОСПРОИЗВЕДЕНО ДО ПОЧИНКИ: находка с текстом «гейт читает ../outside.py:1»
+    давала Mutation(file='../outside.py'), os.path.join уводил наружу, и файл
+    ВНЕ песочницы получал закомментированную первую строку — уборка рабочего
+    дерева его не восстанавливала, потому что дереву он не принадлежал. Это
+    произвольная запись в файлы по недоверенному входу.
+
+    Мутация «склеивать путь, не запирая его в песочнице» роняет именно этот
+    тест.
+    """
+    import sys
+
+    from hub import config as config_module
+    from hub.services.mechanical_pass import resolve_in_sandbox, run_suite_in_sandbox
+    from hub.services.steward_corridor import derive_mutation
+
+    project = tmp_path / "project"
+    sha = _tiny_repo(
+        project,
+        {
+            "calc.py": "def double(n):\n    result = n * 2\n    return result\n",
+            "test_calc.py": (
+                "from calc import double\n\n\ndef test_double():\n"
+                "    assert double(2) == 4\n"
+            ),
+        },
+    )
+    outside = tmp_path / "outside.py"
+    outside.write_text("SECRET = 'live'\nCHECK = True\n", encoding="utf-8")
+    before = outside.read_text(encoding="utf-8")
+
+    # Место мутации приходит из ТЕКСТА находки — не из головы теста.
+    mutation = derive_mutation(
+        {"title": "гейт читает ../outside.py:1 и решает по нему", "why": "не сошлись"}
+    )
+    assert mutation is not None and mutation.file == "../outside.py"
+
+    monkeypatch.setattr(
+        config_module, "MUTATION_PROBE_CMD", f"{sys.executable} -m pytest -q -rf"
+    )
+    monkeypatch.setattr(config_module, "MUTATION_PROBE_SCRATCH_DIR", str(tmp_path))
+
+    assert (
+        await run_suite_in_sandbox(repo_path=str(project), sha=sha, mutation=mutation)
+        is None
+    ), "цель вне песочницы — отказ прогона, а не наблюдение"
+    assert outside.read_text(encoding="utf-8") == before, (
+        "файл ВНЕ песочницы не имеет права измениться"
+    )
+
+    # И то же правило поимённо, на самой функции: она — то место, где текст
+    # находки перестаёт быть путём.
+    sandbox = tmp_path / "sand"
+    (sandbox / "sub").mkdir(parents=True)
+    (sandbox / "sub" / "ok.py").write_text("x = 1\n", encoding="utf-8")
+    (sandbox / "link.py").symlink_to(outside)
+    assert resolve_in_sandbox(str(sandbox), "sub/ok.py") is not None
+    assert resolve_in_sandbox(str(sandbox), "../outside.py") is None
+    assert resolve_in_sandbox(str(sandbox), "sub/../../outside.py") is None
+    assert resolve_in_sandbox(str(sandbox), str(outside)) is None, "абсолютный — нет"
+    assert resolve_in_sandbox(str(sandbox), "link.py") is None, "симлинк наружу — нет"
+    assert resolve_in_sandbox(str(sandbox), "sub") is None, "каталог — не файл"
+
+
+async def test_a_run_that_hit_the_ceiling_is_killed_with_its_children(tmp_path):
+    """Прогон, снятый по потолку времени, не переживает потолок.
+
+    ВОСПРОИЗВЕДЕНО ДО ПОЧИНКИ: команда, снятая по потолку в 1 секунду,
+    дописала свой файл через 4 — то есть продолжала жить с окружением и
+    правами пользователя хаба уже после того, как зовущий вернул «прогнать не
+    смог» и снёс песочницу.
+
+    Мутация «снять kill_process_group по таймауту» роняет именно этот тест.
+    """
+    import asyncio
+
+    from hub.services.mechanical_pass import _run
+
+    marker = tmp_path / "alive.txt"
+    argv = ["/bin/sh", "-c", f"sleep 5; echo alive > {marker}"]
+
+    try:
+        await _run(argv, None, 1)
+        raise AssertionError("потолок обязан сработать")
+    except (TimeoutError, asyncio.TimeoutError):
+        pass
+
+    await asyncio.sleep(3)
+    assert not marker.exists(), (
+        "процесс пережил потолок и продолжил работать от имени хаба"
+    )
+
+
+async def test_a_red_suite_does_not_confirm_every_finding(tmp_path, monkeypatch):
+    """Падавший ДО мутации тест не выдаётся за доказательство находки.
+
+    ВОСПРОИЗВЕДЕНО ДО ПОЧИНКИ: на наборе с одним уже красным тестом мутация
+    строки, которую не зовёт НИ ОДИН тест, вернулась с
+    failed=('test_broken.py::test_already_red',) — то есть подтвердилась бы
+    КАЖДАЯ неразрешённая находка подряд.
+
+    Правило, оплаченное раньше: на красном наборе мутация «убита» ни о чём.
+    Мутация «не снимать базовый прогон» роняет именно этот тест.
+    """
+    import sys
+
+    from hub import config as config_module
+    from hub.services.mechanical_pass import SandboxProbe
+    from hub.services.steward_corridor import Mutation
+
+    project = tmp_path / "red"
+    sha = _tiny_repo(
+        project,
+        {
+            "helper.py": "def unused():\n    value = 1\n    return value\n",
+            "test_ok.py": "def test_ok():\n    assert True\n",
+            "test_broken.py": (
+                "def test_already_red():\n    assert False, 'red before any mutation'\n"
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        config_module,
+        "MUTATION_PROBE_CMD",
+        f"{sys.executable} -m pytest -q -rf -p no:randomly",
+    )
+    monkeypatch.setattr(config_module, "MUTATION_PROBE_SCRATCH_DIR", str(tmp_path))
+
+    probe = SandboxProbe(str(project), sha)
+    # helper.unused не зовёт ни один тест: убить эту мутацию нечем.
+    suite = await probe(
+        Mutation(
+            file="helper.py",
+            start_line=2,
+            end_line=2,
+            source_field="title",
+            quote="helper.py:2",
+        )
+    )
+
+    assert probe.baseline is not None
+    assert probe.baseline.failed == ("test_broken.py::test_already_red",), (
+        "база снята и она красная — это и есть то, что нельзя засчитывать"
+    )
+    assert suite is not None
+    assert suite.failed == (), (
+        "падение, бывшее и ДО мутации, не доказывает о ней ничего"
+    )
+    assert suite.green is True
+
+
+async def test_a_collection_error_is_a_refusal_not_a_fallen_test():
+    """ERROR — отказ прогона, а не упавший тест.
+
+    Модуль объявлял это правило абзацем и нарушал строкой ниже: ``ERROR ...``
+    складывались в упавшие тесты вместе с ``FAILED ...``. ERROR печатается на
+    ошибке сбора и на упавшем фикстуре — тест не исполнялся, и сказать,
+    изменила ли мутация поведение, нечем.
+    """
+    from hub.services.mechanical_pass import parse_suite_output
+
+    assert parse_suite_output(2, "ERROR tests/test_x.py - ImportError") is None
+    assert (
+        parse_suite_output(
+            1, "FAILED tests/a.py::test_a - x\nERROR tests/b.py - ImportError"
+        )
+        is None
+    ), "сбор сломался — весь прогон под сомнением, и FAILED рядом ничего не спасает"
+
+
+async def test_a_second_report_of_one_submission_gets_its_own_findings_answered(
+    client, db
+):
+    """Новая находка второго отчёта поколения тоже получает исход.
+
+    Лестница добора (#879) кладёт в ОДНО поколение два отчёта, и у второго
+    неразрешённые находки СВОИ. Пока пропуск ключился поколением, событие
+    первого отчёта заставляло пропустить второй целиком: новые находки не
+    получали ни исхода, ни имени мутации — то есть снова становились тишиной,
+    против которой заведена задача.
+
+    Мутация «пропускать по поколению, а не по находке» роняет именно этот тест.
+    """
+    from tests.test_web import _web_task_in_review_with_test_ac
+
+    task_id = await _web_task_in_review_with_test_ac(client, db)
+    await _report_with_unresolved(client, task_id)
+    assert len(await _step_events(db, task_id)) == 1
+
+    # Второй отчёт ТОГО ЖЕ поколения — добор с другой находкой.
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "multi-agent-review",
+            "raw_count": 5,
+            "findings_confirmed": [],
+            "findings_rejected": [],
+            "incomplete": False,
+            "unresolved": [
+                {
+                    "title": "другая находка глубокого прогона — hub/models.py:2599",
+                    "why": "адъюдикаторы не сошлись",
+                }
+            ],
+            "agent": "cursor-cloud-reviewer",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    recorded = await _step_events(db, task_id)
+    assert len(recorded) == 2, "у находки второго отчёта тоже есть исход"
+    assert {r["mutation"] for r in recorded} == {
+        "hub/web.py:1871",
+        "hub/models.py:2599",
+    }
+
+
+async def test_the_digest_ignores_a_report_that_landed_after_the_verdict(db):
+    """Второй отчёт ТОГО ЖЕ поколения, легший после вердикта, — не его отчёт.
+
+    Поколения мало: добор кладёт в одно поколение два отчёта, и «последний из
+    поколения» снова оказывается не тем. Вердикт мог опираться только на то,
+    что к его моменту уже существовало.
+    """
+    import json as _json
+
+    from hub import repository as repo_module
+    from hub.services.digest import generate_due_digests
+    from tests.test_autopilot_digest import _autopilot_project, _node, _tomorrow
+
+    _pid, feature = await _autopilot_project(db, "spike-1234-two-reports")
+    task_id = await _node(db, title="добор", task_type="task", parent_id=feature)
+    first = await repo_module.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="grok-4.6",
+        raw_count=4,
+        findings_confirmed="[]",
+        unresolved=_json.dumps([{"title": "никто не рассудил"}], ensure_ascii=False),
+    )
+    second = await repo_module.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="sonnet-4.5",
+        raw_count=3,
+        findings_confirmed="[]",
+        unresolved="[]",
+    )
+    await repo_module.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="policy",
+        payload={"verdict": "approved", "submission_generation": 1},
+    )
+    # Время расставляется явно: два отчёта и событие иначе делят одну секунду,
+    # и тест мерил бы разрешение секунды, а не правило. День берётся
+    # сегодняшний — окно дайджеста именно его, и дата в тесте, написанная
+    # руками, протухла бы вместе с календарём.
+    from datetime import UTC, datetime
+
+    day = datetime.now(UTC).strftime("%Y-%m-%d")
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=? WHERE id=?",
+        (f"{day} 10:00:00", first),
+    )
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=? WHERE id=?",
+        (f"{day} 12:00:00", second),
+    )
+    await db.execute(
+        "UPDATE events SET created_at=? "
+        "WHERE kind='review_verdict_recorded' AND task_id=?",
+        (f"{day} 11:00:00", task_id),
+    )
+    await db.commit()
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    payload = _json.loads((await repo_module.list_digests(db))[0]["payload"])
+    entry = payload["auto_verdicts"][0]
+    assert entry["machine_review"]["outcome"] == OUTCOME_UNRESOLVED, (
+        "вердикт стоял на ПЕРВОМ отчёте — его ступень и показывают"
+    )
+    assert entry["models"]["reviewer"] == "grok-4.6"

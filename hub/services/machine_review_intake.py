@@ -299,6 +299,29 @@ async def record_machine_review(
     view = MachineReviewView(**dict(saved))
     view.is_current = view.submission_generation == generation
 
+    # Механический шаг (#1234): прежде чем оставить задачу ждать человека,
+    # хаб разбирает неразрешённые находки тем, что умеет сам.
+    #
+    # ДО автовердикта, а не после. Сначала стояло после — и это было
+    # бессмысленно: вердикт отказывается при ЛЮБОМ непустом unresolved
+    # (gate_grounds.unattended_blockers) и повторно не прогоняется, так что
+    # задача всё равно уходила ждать человека, сколько бы находок шаг ни
+    # разобрал. Исход, записанный после решения, на решение не влияет.
+    #
+    # Здесь, а не в роутере: отчёт приезжает двумя дверями — по контракту MCP
+    # и переписанным из текста прогона (#1036, #1180), — и шаг, повешенный на
+    # одну из них, не выполнялся бы для второй. Ровно так же, как автовердикт.
+    #
+    # Best-effort по тому же контракту, что и вызовы ниже: приём отчёта не
+    # имеет права упасть из-за шага. Молчаливой деградации при этом нет — исход
+    # каждой находки пишется событием, и его отсутствие видно счётом.
+    try:
+        from hub.services.mechanical_pass import mechanical_pass_after_report
+
+        await mechanical_pass_after_report(db, task_id)
+    except Exception:  # noqa: BLE001 - degradation is the contract
+        log.exception("mechanical step failed for task #%s", task_id)
+
     # Auto-verdict (#745): a clean report in a project whose policy allows
     # it gets its APPROVED right here. Best-effort by contract — the report
     # intake must never fail because the autopilot stumbled.
@@ -321,25 +344,5 @@ async def record_machine_review(
         await maybe_top_up_incomplete(db, task_id)
     except Exception:  # noqa: BLE001 - degradation is the contract
         log.exception("review top-up failed for task #%s", task_id)
-
-    # Механический шаг (#1234): прежде чем оставить задачу ждать человека,
-    # хаб разбирает неразрешённые находки тем, что умеет сам. ПОСЛЕ вердикта
-    # и добора и по той же причине, по которой добор стоит после вердикта:
-    # это последнее, что происходит перед ожиданием человека, и по отчёту без
-    # неразрешённых находок проход не делает ничего.
-    #
-    # Здесь, а не в роутере: отчёт приезжает двумя дверями — по контракту MCP
-    # и переписанным из текста прогона (#1036, #1180), — и шаг, повешенный на
-    # одну из них, не выполнялся бы для второй. Ровно так же, как автовердикт.
-    #
-    # Best-effort по тому же контракту, что и два вызова выше: приём отчёта не
-    # имеет права упасть из-за шага. Молчаливой деградации при этом нет — исход
-    # каждой находки пишется событием, и его отсутствие видно счётом.
-    try:
-        from hub.services.mechanical_pass import mechanical_pass_after_report
-
-        await mechanical_pass_after_report(db, task_id)
-    except Exception:  # noqa: BLE001 - degradation is the contract
-        log.exception("mechanical step failed for task #%s", task_id)
 
     return view

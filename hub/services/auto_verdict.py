@@ -190,6 +190,47 @@ def _finding_dicts(raw: str | None) -> list[dict]:
     return [f for f in value if isinstance(f, dict)]
 
 
+async def _fold_mechanical_outcomes(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    confirmed: list[dict],
+    unresolved: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Разнести неразрешённые находки по их механическому исходу (#1234).
+
+    Три судьбы, и каждая — своя сторона гейта:
+
+    * упал тест (``STEP_CONFIRMED``) — находка настоящая и переезжает в
+      ПОДТВЕРЖДЁННЫЕ: вердикт обязан отказать, но уже как настоящему дефекту,
+      а не как незаданному вопросу;
+    * набор пережил мутацию (``STEP_UNCOVERED``) — это ответ, а не вопрос;
+      находка выбывает из ``unresolved`` и остаётся записанной наблюдением
+      (непокрытый случай), человека не требует;
+    * исхода нет или он — отказ шага — находка остаётся неразрешённой, и
+      гейт держит её ровно как держал.
+
+    Ни один список не переписывается в базе: перекладка живёт здесь, на время
+    одного решения. Отчёт ревьюера остаётся тем, что ревьюер написал.
+    """
+    from hub.services.finding_identity import unresolved_uids
+    from hub.services.mechanical_pass import mechanical_outcomes
+    from hub.services.steward_corridor import STEP_CONFIRMED, STEP_UNCOVERED
+
+    answered = await mechanical_outcomes(db, task_id, generation)
+    if not answered:
+        return confirmed, unresolved
+    still: list[dict] = []
+    promoted: list[dict] = []
+    for uid, finding in zip(unresolved_uids(unresolved), unresolved):
+        outcome = answered.get(uid, "")
+        if outcome == STEP_CONFIRMED:
+            promoted.append(finding)
+        elif outcome != STEP_UNCOVERED:
+            still.append(finding)
+    return confirmed + promoted, still
+
+
 async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     """Issue APPROVED for the current submission when policy and facts allow.
 
@@ -266,6 +307,21 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     # same reason the loud five do: the steward has to refuse where this
     # refuses, and it did not — ``unresolved`` was invisible to it entirely.
     # Silent here and named there is fine; two different lists would not be.
+    #
+    # #1234: неразрешённая находка, у которой ПОЯВИЛСЯ механический исход,
+    # перестаёт быть незаданным вопросом — в этом вся задача. Разобранная
+    # находка выбывает из ``unresolved``, но не исчезает: под упавшим тестом
+    # она становится ПОДТВЕРЖДЁННОЙ и блокирует автовердикт с той стороны,
+    # где блокирует настоящий дефект. Пережившая мутацию — это «непокрытый
+    # случай», ответ, а не вопрос, и человека он не требует (постановка
+    # #1234: «Ни один из этих двух исходов не требует человека»).
+    #
+    # Без этого места шаг был украшением: вердикт отказывал при любом
+    # непустом unresolved, и задача уходила к человеку с записанным
+    # needs_human=False.
+    confirmed, unresolved = await _fold_mechanical_outcomes(
+        db, task_id, generation, confirmed, unresolved
+    )
     if grounds.unattended_blockers(
         confirmed, unresolved, bool(review.get("incomplete"))
     ):

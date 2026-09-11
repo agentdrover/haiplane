@@ -651,3 +651,100 @@ async def test_an_unresolved_finding_leaves_the_verdict_to_the_human(
     assert not await _events(db, "verdict_escalated", unresolved), (
         "unresolved is a silent refusal, not an escalation trigger"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1234: механический исход неразрешённой находки ВЛИЯЕТ на маршрут.
+#
+# Шаг записывал исход ПОСЛЕ автовердикта, а вердикт отказывал при любом
+# непустом unresolved и повторно не прогонялся. Значит задача всё равно
+# уходила ждать человека — с записанным needs_human=False. Исход, записанный
+# после решения, на решение не влияет.
+# ---------------------------------------------------------------------------
+
+_UNRESOLVED = [
+    {
+        "title": "порядок записи полей, hub/app.py:10",
+        "why": "адъюдикаторы не сошлись",
+    }
+]
+
+
+def _probe_returning(monkeypatch, suite):
+    """Подменить настроенный зонд на тот, что вернёт ``suite``."""
+    from hub.services import mechanical_pass as mp
+
+    async def _configured(db_, task_id_):
+        async def _probe(mutation):
+            return suite
+
+        return _probe
+
+    monkeypatch.setattr(mp, "configured_probe", _configured)
+
+
+async def test_a_surviving_mutation_unblocks_the_verdict(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Набор пережил мутацию — это ОТВЕТ, и человека он не требует.
+
+    Постановка #1234 дословно: «Ни один из этих двух исходов не требует
+    человека». Пока исход не доезжал до вердикта, это оставалось словами.
+    """
+    from hub.services.steward_corridor import SuiteResult
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    _probe_returning(monkeypatch, SuiteResult(failed=(), passed=3475))
+    task_id = await _submitted_task(client, db, "spike-uncovered", {"verdict": "auto"})
+
+    await _post_review(client, task_id, raw_count=3, unresolved=_UNRESOLVED)
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["review_verdict"] == "approved", (
+        "разобранная механически находка больше не незаданный вопрос"
+    )
+    assert body["status"] == "running"
+
+
+async def test_a_killed_mutation_keeps_the_verdict_but_as_a_defect(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Упал тест — находка настоящая, и вердикт отказывает как ДЕФЕКТУ.
+
+    Граница задачи: голосование в подтверждение не превращается, а упавший
+    тест превращает. И такой исход обязан держать гейт, а не открывать его.
+    """
+    from hub.services.steward_corridor import SuiteResult
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    _probe_returning(
+        monkeypatch, SuiteResult(failed=("tests/test_x.py::test_y",), passed=3474)
+    )
+    task_id = await _submitted_task(client, db, "spike-killed", {"verdict": "auto"})
+
+    await _post_review(client, task_id, raw_count=3, unresolved=_UNRESOLVED)
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["status"] == "review"
+    assert body["review_verdict"] != "approved"
+    assert not await _events(db, "verdict_escalated", task_id), (
+        "подтверждённая находка — штатный исход ревью, а не происшествие"
+    )
+
+
+async def test_an_unanswered_finding_still_holds_the_gate(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Без прогона исхода нет, и гейт держит находку ровно как держал.
+
+    Мутация «считать неразрешённую находку разобранной, раз проход состоялся»
+    роняет именно этот тест: непрогнанный набор открыл бы вердикт.
+    """
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(client, db, "spike-noanswer", {"verdict": "auto"})
+
+    await _post_review(client, task_id, raw_count=3, unresolved=_UNRESOLVED)
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["status"] == "review"
+    assert body["review_verdict"] != "approved"

@@ -46,6 +46,7 @@ from typing import Any, Awaitable, Callable
 from hub import config
 from hub import repository as repo
 from hub.db import fetchall
+from hub.process_kill import kill_process_group
 from hub.services.finding_identity import unresolved_uids
 from hub.services.steward_corridor import (
     MAX_RUNS_PER_FINDING,
@@ -104,26 +105,37 @@ def _json_list(raw: Any) -> list[dict]:
     return [item for item in parsed if isinstance(item, dict)]
 
 
-async def _already_passed(db, task_id: int, generation: int) -> bool:
-    """Был ли уже проход по этому поколению.
+async def mechanical_outcomes(db, task_id: int, generation: int) -> dict[str, str]:
+    """Исход механического шага по КАЖДОЙ разобранной находке: uid -> исход.
 
-    Идемпотентность по ПОКОЛЕНИЮ, а не по отчёту: лестница добора (#879)
-    кладёт в одно поколение два отчёта, и второй приход не должен гонять
-    набор заново по тем же находкам.
+    Ключ — uid находки, а не поколение. Сначала здесь стояло «был ли проход по
+    этому поколению», и это был дефект в ту же сторону, что и весь #1234:
+    лестница добора (#879) кладёт в ОДНО поколение два отчёта, и у второго
+    неразрешённые находки СВОИ. Событие первого отчёта заставляло пропустить
+    второй целиком — новые находки не получали ни исхода, ни имени мутации,
+    то есть снова становились тишиной.
+
+    Дважды одну и ту же находку не разбирают (прогон набора — минуты), а
+    новую разбирают всегда, в каком бы по счёту отчёте поколения она ни
+    приехала.
     """
     rows = await fetchall(
         db,
         "SELECT payload FROM events WHERE kind=? AND task_id=?",
         (MECHANICAL_STEP_RECORDED, task_id),
     )
+    answered: dict[str, str] = {}
     for row in rows:
         try:
             payload = json.loads(row["payload"] or "{}")
         except ValueError:
             continue
-        if int(payload.get("generation") or 0) == int(generation):
-            return True
-    return False
+        if int(payload.get("generation") or 0) != int(generation):
+            continue
+        uid = str(payload.get("finding_uid") or "")
+        if uid:
+            answered[uid] = str(payload.get("outcome") or "")
+    return answered
 
 
 async def run_mechanical_pass(
@@ -162,14 +174,18 @@ async def run_mechanical_pass(
         # без них ему не предмет.
         return PassResult(False, "неразрешённых находок нет")
 
-    if await _already_passed(db, task_id, generation):
-        return PassResult(False, "проход по этому поколению уже был")
-
+    # Пропускается не ОТЧЁТ, а разобранная НАХОДКА: второй отчёт поколения
+    # приносит свои неразрешённые записи, и им исход положен так же.
+    answered_before = await mechanical_outcomes(db, task_id, generation)
     uids = unresolved_uids(findings)
+    pending = [(uid, f) for uid, f in zip(uids, findings) if uid not in answered_before]
+    if not pending:
+        return PassResult(False, "все находки этого поколения уже разобраны")
+
     runs_left = MAX_RUNS_PER_REPORT
     outcomes: list[dict[str, Any]] = []
 
-    for uid, finding in zip(uids, findings):
+    for uid, finding in pending:
         # Мутация выводится здесь ВТОРОЙ раз (шаг выведет её сам) — ровно
         # затем, чтобы знать, положен ли этой находке прогон, и не занимать
         # бюджет находкой, которой мутировать нечего. Решает исход по-прежнему
@@ -252,14 +268,72 @@ def _summary(result: PassResult) -> str:
 
 
 async def _run(argv: list[str], cwd: str | None, timeout: int) -> tuple[int, str]:
+    """Запустить и дождаться, а по потолку времени — СНЯТЬ ГРУППУ ПРОЦЕССОВ.
+
+    Отмена ``communicate()`` не завершает ни подпроцесс, ни его потомков:
+    ``wait_for`` снимает ожидание, а прогон продолжает жить с окружением и
+    правами пользователя хаба — уже после того, как зовущий вернул «прогнать
+    не смог» и снёс песочницу. Наблюдено опытом: команда, снятая по потолку в
+    1 секунду, дописала свой файл через 4 секунды.
+
+    ``start_new_session=True`` + ``kill_process_group`` — тот же приём, что у
+    прогона валидации (#544): ``proc.kill()`` сигналит только тому pid,
+    который породил хаб, а работу делает не он.
+    """
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,
     )
-    out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (TimeoutError, asyncio.TimeoutError):
+        await kill_process_group(proc)
+        raise
     return proc.returncode or 0, out.decode(errors="replace")
+
+
+def resolve_in_sandbox(sandbox: str, relative: str) -> str | None:
+    """Настоящий путь внутри песочницы — или ``None``.
+
+    ЗАЧЕМ. ``mutation.file`` приходит из ТЕКСТА НАХОДКИ, который пишет
+    ревьюер, то есть это недоверенный вход. Пока путь только склеивали через
+    ``os.path.join``, находка с текстом «гейт читает ../../opt/haiplane-hub/
+    src/hub/config.py:1» уводила запись наружу: наблюдено опытом — файл вне
+    песочницы получил закомментированную первую строку и НЕ был восстановлен
+    уборкой рабочего дерева, потому что к дереву он не принадлежал. Это
+    произвольная запись в файлы по недоверенному входу, а не мутация.
+
+    ЧТО ИМЕННО ЗАКРЫВАЕТ. Путь разрешается целиком (``realpath`` проходит и
+    по симлинкам, поэтому ссылка ВНУТРИ песочницы, указывающая наружу, тоже
+    не проходит), и результат обязан лежать строго под корнем песочницы,
+    быть обычным файлом и не быть симлинком. Абсолютный путь отвергается до
+    склейки: ``os.path.join`` с абсолютным вторым аргументом молча выбрасывает
+    первый.
+
+    Отказ здесь — не авария, а штатный исход: находка едет человеку.
+    """
+    if not relative or os.path.isabs(relative) or "\x00" in relative:
+        return None
+    root = os.path.realpath(sandbox)
+    target = os.path.realpath(os.path.join(root, relative))
+    if target == root:
+        return None
+    try:
+        if os.path.commonpath([root, target]) != root:
+            return None
+    except ValueError:
+        # Разные тома — общего корня нет вовсе.
+        return None
+    # ``islink`` по УЖЕ разрешённому пути ловит только битую ссылку, но
+    # проверяется и он: ``isfile`` на битой ссылке даёт False, и порядок
+    # утверждений тут читается как одно правило — обычный файл, и ничего
+    # кроме.
+    if not os.path.isfile(target) or os.path.islink(target):
+        return None
+    return target
 
 
 def _apply(path: str, start: int, end: int) -> bool:
@@ -304,12 +378,22 @@ def parse_suite_output(rc: int, out: str) -> SuiteResult | None:
     упавший тест дают один и тот же ненулевой код, а подтверждать находку
     ошибкой сбора значит подтверждать её тем, что мутация синтаксически
     задела файл.
+
+    ``ERROR`` СЧИТАЕТСЯ ОТКАЗОМ, А НЕ ПАДЕНИЕМ. Сначала строки ``ERROR ...``
+    складывались в упавшие тесты вместе с ``FAILED ...`` — то есть ровно то,
+    что абзац выше запрещает, делалось на строку ниже. ``ERROR`` печатается
+    на ошибке сбора и на упавшем фикстуре: тест при этом не исполнялся, и
+    сказать, изменила ли мутация поведение, нечем.
     """
     failed: list[str] = []
     passed = 0
+    errored = False
     for raw in out.splitlines():
         line = raw.strip()
-        if line.startswith("FAILED ") or line.startswith("ERROR "):
+        if line.startswith("ERROR "):
+            errored = True
+            continue
+        if line.startswith("FAILED "):
             nodeid = line.split(None, 1)[1].split(" - ", 1)[0].strip()
             if nodeid and nodeid not in failed:
                 failed.append(nodeid)
@@ -317,6 +401,8 @@ def parse_suite_output(rc: int, out: str) -> SuiteResult | None:
         found = _PASSED.search(line)
         if found is not None:
             passed = max(passed, int(found.group(1)))
+    if errored:
+        return None
     if failed:
         return SuiteResult(failed=tuple(failed), passed=passed)
     if rc != 0:
@@ -324,18 +410,22 @@ def parse_suite_output(rc: int, out: str) -> SuiteResult | None:
     return SuiteResult(failed=(), passed=passed)
 
 
-async def live_probe(
-    mutation: Mutation,
+async def run_suite_in_sandbox(
     *,
     repo_path: str,
     sha: str,
+    mutation: Mutation | None = None,
 ) -> SuiteResult | None:
-    """Применить мутацию в ОДНОРАЗОВОЙ песочнице и прогнать набор.
+    """Прогнать набор в ОДНОРАЗОВОЙ песочнице, при мутации — под ней.
 
     Песочница — отдельное рабочее дерево на коммите сдачи, а не рабочая копия
     проекта. Так требование «дерево после шага чистое» выполняется не
     аккуратностью отката, а тем, что мутировать общую копию некуда: её здесь
     не открывают вовсе.
+
+    ``mutation=None`` — БАЗОВЫЙ прогон: тот же коммит, тот же набор, ничего не
+    мутировано. Без него «упал тест» ничего не доказывает (см.
+    :class:`SandboxProbe`).
     """
     argv = shlex.split(config.MUTATION_PROBE_CMD or "")
     if not argv or not repo_path or not sha:
@@ -352,11 +442,19 @@ async def live_probe(
         )
         if rc != 0:
             return None
-        target = os.path.join(sandbox, mutation.file)
-        if not os.path.isfile(target):
-            return None
-        if not _apply(target, mutation.start_line, mutation.end_line):
-            return None
+        if mutation is not None:
+            # Путь из ТЕКСТА НАХОДКИ разрешается и запирается в песочнице —
+            # см. resolve_in_sandbox. Отказ здесь штатный: находка едет
+            # человеку, а не переписывает файл, до которого дотянулась.
+            target = resolve_in_sandbox(sandbox, mutation.file)
+            if target is None:
+                log.warning(
+                    "mutation probe refused a path outside the sandbox: %r",
+                    mutation.file,
+                )
+                return None
+            if not _apply(target, mutation.start_line, mutation.end_line):
+                return None
         rc, out = await _run(argv, sandbox, config.MUTATION_PROBE_TIMEOUT_SEC)
         return parse_suite_output(rc, out)
     except (OSError, TimeoutError, asyncio.TimeoutError):
@@ -377,6 +475,59 @@ async def live_probe(
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
+class SandboxProbe:
+    """Зонд с БАЗОВЫМ прогоном: убийством считается только НОВОЕ падение.
+
+    ПОЧЕМУ БЕЗ БАЗОВОГО ПРОГОНА ШАГ ЛЖЁТ. Если на коммите сдачи уже есть
+    падающий (или плавающий) тест, то полный прогон под ЛЮБОЙ мутацией
+    покажет это падение, и его имя уедет в наблюдение как доказательство:
+    подтвердится КАЖДАЯ неразрешённая находка подряд. Воспроизведено опытом —
+    мутация строки, которую не зовёт ни один тест, вернулась с
+    ``failed=('test_broken.py::test_already_red',)`` при красном наборе.
+
+    Правило, оплаченное раньше и записанное отдельно: на красном наборе
+    мутация «убита» ни о чём. Поэтому база снимается ОДИН РАЗ на отчёт (не на
+    находку — прогон стоит минуты), а из падений мутированного прогона
+    вычитаются те, что падали и без неё.
+
+    База не снялась — зонд не отвечает вовсе: судить не о чем.
+    """
+
+    def __init__(self, repo_path: str, sha: str) -> None:
+        self.repo_path = repo_path
+        self.sha = sha
+        self.baseline: SuiteResult | None = None
+        self.baseline_taken = False
+
+    async def _ensure_baseline(self) -> None:
+        if self.baseline_taken:
+            return
+        self.baseline_taken = True
+        self.baseline = await run_suite_in_sandbox(
+            repo_path=self.repo_path, sha=self.sha
+        )
+        if self.baseline is None:
+            log.warning("mutation probe: baseline run did not say anything")
+        elif self.baseline.failed:
+            log.warning(
+                "mutation probe: baseline is red (%d failing) — those names "
+                "cannot prove anything about a mutation",
+                len(self.baseline.failed),
+            )
+
+    async def __call__(self, mutation: Mutation) -> SuiteResult | None:
+        await self._ensure_baseline()
+        if self.baseline is None:
+            return None
+        mutated = await run_suite_in_sandbox(
+            repo_path=self.repo_path, sha=self.sha, mutation=mutation
+        )
+        if mutated is None:
+            return None
+        fresh = tuple(t for t in mutated.failed if t not in self.baseline.failed)
+        return SuiteResult(failed=fresh, passed=mutated.passed)
+
+
 async def configured_probe(db, task_id: int) -> Probe | None:
     """Зонд для этой задачи, или ``None``, если гонять негде.
 
@@ -395,11 +546,7 @@ async def configured_probe(db, task_id: int) -> Probe | None:
     sha = str(dict(row).get("submission_sha") or "") if row is not None else ""
     if not repo_path or not sha:
         return None
-
-    async def _probe(mutation: Mutation) -> SuiteResult | None:
-        return await live_probe(mutation, repo_path=repo_path, sha=sha)
-
-    return _probe
+    return SandboxProbe(repo_path, sha)
 
 
 async def mechanical_pass_after_report(db, task_id: int) -> PassResult:
@@ -417,9 +564,12 @@ __all__ = [
     "MAX_RUNS_PER_REPORT",
     "MECHANICAL_STEP_RECORDED",
     "PassResult",
+    "SandboxProbe",
     "configured_probe",
-    "live_probe",
+    "mechanical_outcomes",
     "mechanical_pass_after_report",
     "parse_suite_output",
+    "resolve_in_sandbox",
     "run_mechanical_pass",
+    "run_suite_in_sandbox",
 ]

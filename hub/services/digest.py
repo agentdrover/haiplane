@@ -278,7 +278,10 @@ def _report_outcome_of(mr) -> dict:
 
 
 async def _report_of_generation(
-    db: aiosqlite.Connection, task_id: int, generation: int | None
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int | None,
+    verdict_at: str | None = None,
 ):
     """Отчёт ТОГО поколения, о котором вынесен вердикт (#1234).
 
@@ -302,8 +305,18 @@ async def _report_of_generation(
     if not generation:
         return None
     rows = await repo.machine_reviews_of_generation(db, task_id, int(generation))
-    # Последний ИЗ СВОЕГО поколения: лестница добора (#879) кладёт в одно
-    # поколение два отчёта, и вердикт выносится после второго.
+    # Одного поколения МАЛО. Лестница добора (#879) кладёт в одно поколение
+    # ДВА отчёта, и «последний из поколения» снова оказывается не тем: второй
+    # отчёт, легший ПОСЛЕ вердикта, приписывал более раннему вердикту свою
+    # ступень и своего ревьюера — тот же дефект, что и выбор по свежести,
+    # только на один шаг уже.
+    #
+    # Отсекается временем СОБЫТИЯ: вердикт мог опираться только на отчёт,
+    # который к тому моменту уже существовал. Отчёты и события пишутся одной
+    # базой в одном формате времени (``datetime('now')``), поэтому сравнение
+    # строк здесь — сравнение моментов, а не догадка о формате.
+    if verdict_at:
+        rows = [r for r in rows if str(dict(r).get("created_at") or "") <= verdict_at]
     return rows[-1] if rows else None
 
 
@@ -423,7 +436,10 @@ async def generate_due_digests(
                 # отчёт, легший после вердикта, подменяет собой тот, под
                 # которым вердикт вынесен.
                 mr = await _report_of_generation(
-                    db, event["task_id"], payload.get("submission_generation")
+                    db,
+                    event["task_id"],
+                    payload.get("submission_generation"),
+                    event["created_at"],
                 )
                 entry["models"] = {
                     "implementer": (
