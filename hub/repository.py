@@ -2395,9 +2395,20 @@ async def create_review_dispatch(
 async def list_active_review_dispatches(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
+    """Заказы, по которым свипу ещё есть что доделать (#757, #1252).
+
+    ``second_door`` здесь не украшение: это ДОЛГ, а не состояние прогона.
+    Прогон уже кончился без отчёта, но обещанная сдаче вторая дверь ещё не
+    открыта, и строка обязана оставаться видимой свипу — иначе сбой между
+    закрытием облачного заказа и созданием локального уносил бы второй
+    способ добыть отчёт безвозвратно (поллер глотает исключение и идёт
+    дальше).
+    """
     return list(
         await fetchall(
-            db, "SELECT * FROM review_dispatches WHERE status='active' ORDER BY id ASC"
+            db,
+            "SELECT * FROM review_dispatches "
+            "WHERE status IN ('active', 'second_door') ORDER BY id ASC",
         )
     )
 
@@ -2514,6 +2525,22 @@ async def set_review_dispatch_status(
 ) -> None:
     await db.execute(
         "UPDATE review_dispatches SET status=? WHERE id=?", (status, dispatch_id)
+    )
+
+
+async def owe_second_door(
+    db: aiosqlite.Connection, dispatch_id: int, run_status: str
+) -> None:
+    """Записать ДОЛГ второй двери, переживающий перезапуск (#1252).
+
+    Строка остаётся видимой свипу, а терминальный статус прогона ложится
+    рядом: на возобновлении причину отказа облака больше неоткуда взять, а
+    ходить за ней к провайдеру значило бы поставить текст в карточке в
+    зависимость от его доступности.
+    """
+    await db.execute(
+        "UPDATE review_dispatches SET status='second_door', run_status=? WHERE id=?",
+        (run_status, dispatch_id),
     )
 
 

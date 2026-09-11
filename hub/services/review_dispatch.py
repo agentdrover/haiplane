@@ -25,6 +25,7 @@ import logging
 import math
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, NamedTuple
@@ -1024,6 +1025,13 @@ CLOUD_REVIEW_FORGES: tuple[str, ...] = ("github",)
 CLOUD_CHANNEL = "cloud"
 LOCAL_CHANNEL = "local"
 
+# Состояние строки заказа между «облако отчёта не дало» и «вторая дверь
+# открыта» (#1252). Не украшение и не третий исход: это ДОЛГ, записанный в
+# базу, потому что между двумя этими событиями лежит подготовка заказа с
+# сетью внутри, а поллер глотает исключение и идёт дальше. Закрытая строка
+# свипу невидима — значит закрывать её раньше, чем долг отдан, нельзя.
+SECOND_DOOR_OWED = "second_door"
+
 
 async def _policy_and_novelty_allow(
     db: aiosqlite.Connection,
@@ -1812,6 +1820,13 @@ class ReviewReach:
 
     ways: tuple[str, ...]
     reason: str
+    local_missing: tuple[str, ...] = ()
+    """Чего не хватает ЛОКАЛЬНОМУ пути, пустой кортеж — хватает всего.
+
+    Отдельно от ``reason``, потому что ``reason`` заполнен только когда ways
+    пуст, а на форже с облаком ways непуст всегда. Отказать локальному
+    заказу там надо всё равно, и назвать причину — тоже (#1252).
+    """
 
     @property
     def runnable(self) -> bool:
@@ -1854,13 +1869,26 @@ async def review_reach(db: aiosqlite.Connection, forge: str) -> ReviewReach:
     if not missing:
         ways.append(LOCAL_CHANNEL)
     if ways:
-        return ReviewReach(tuple(ways), "")
+        return ReviewReach(tuple(ways), "", tuple(missing))
     return ReviewReach(
         (),
         f"облачный ревьюер не работает с форжем «{forge}» (проверено "
-        "31.08.2026, #1119), а локальный не настроен: "
+        "31.08.2026, #1119), а " + local_path_refusal(missing),
+        tuple(missing),
+    )
+
+
+def local_path_refusal(missing: Sequence[str]) -> str:
+    """Почему локального пути нет — одними и теми же словами (#1188).
+
+    Автор текста один на два места: отказ, когда способов НЕТ вовсе, и отказ
+    локальному заказу на форже, где облако есть, но отчёта не дало. Две копии
+    объясняли бы одно состояние двумя разными словами на первой же правке.
+    """
+    return (
+        "локальный путь не настроен: "
         + "; ".join(missing)
-        + ". Порядок включения — deploy/LOCAL-REVIEW.md",
+        + ". Порядок включения — deploy/LOCAL-REVIEW.md"
     )
 
 
@@ -1954,12 +1982,26 @@ async def dispatch_local_review(
     """
     task_id = int(task["id"])
     reach = await review_reach(db, forge)
-    if not reach.runnable:
+    principal_id = await local_reviewer_principal_id(db)
+    if LOCAL_CHANNEL not in reach.ways or principal_id is None:
+        # Спрашивается ЛОКАЛЬНЫЙ канал, а не ``runnable``: на форже из
+        # CLOUD_REVIEW_FORGES ways непуст из-за облака даже тогда, когда
+        # локального пути нет вовсе, и старая проверка пропускала заказ
+        # дальше. Принципал перечитывается ЗДЕСЬ и здесь же судится: между
+        # готовностью и заказом лежит await, а токен ревьюера могут отозвать
+        # — и заказ уехал бы под NULL, то есть отчёт перестал бы быть чужим
+        # автору, ради чего прогон и покупается (#1128, #1252).
+        #
         # Причина та же, что увидит человек в форме проекта и в отказе на
         # записи: у неё один автор (#1188), иначе три места объясняли бы
         # одно состояние тремя разными словами.
-        return await _refuse_local_review(db, task_id, reach.reason)
-    principal_id = await local_reviewer_principal_id(db)
+        missing = reach.local_missing or (
+            "LOCAL_REVIEWER_HUB_TOKEN (токен принципала ревьюера) "
+            "не разрешается в принципала",
+        )
+        return await _refuse_local_review(
+            db, task_id, reach.reason or local_path_refusal(missing)
+        )
     spent = await _tokens_already_spent(db, task_id)
     if spent >= config.LOCAL_REVIEW_TOKEN_CEILING:
         return await _refuse_local_review(
@@ -2056,13 +2098,25 @@ async def _refuse_local_review(
 
 
 async def _tokens_already_spent(db: aiosqlite.Connection, task_id: int) -> int:
-    """Сколько токенов задача уже стоила по отчётам ревью.
+    """Сколько токенов задача уже стоила — по всему, где сумма СКАЗАНА.
 
-    Считается по ОТЧЁТАМ, а не по числу прогонов: прогон, о котором ревьюер
+    Считается по отчётам, а не по числу прогонов: прогон, о котором ревьюер
     не отчитался, деньги всё равно стоил, но назвать сумму мы можем только
     там, где она сказана. Незнание здесь склоняется в сторону прогона —
     пропущенное ревью дороже лишнего, — и это тот же выбор направления
     ошибки, что в #762.
+
+    #1252: посылка «у прогона без отчёта суммы нет» на пути второй двери
+    неверна. Свип строкой выше спрашивает счёт у провайдера и кладёт его в
+    ``review_dispatches.provider_tokens`` (#1026) — то есть в тот момент,
+    когда открывается вторая дверь, оплаченный прогон УЖЕ назван, а потолок
+    считал его нулём и обходился. Слагаемое второе: заказы, не доставившие
+    отчёт. Они не пересекаются с первым — счёт доставленного отчёта лежит и
+    на строке ``machine_reviews`` (``set_machine_review_provider_tokens``), и
+    такой заказ закрыт как ``done``; двойного счёта тут нет.
+
+    NULL остаётся незнанием и по-прежнему склоняется в сторону прогона: ноль
+    в сумме, а не запрет.
     """
     rows = await fetchall(
         db,
@@ -2070,7 +2124,14 @@ async def _tokens_already_spent(db: aiosqlite.Connection, task_id: int) -> int:
         "FROM machine_reviews WHERE task_id = ?",
         (task_id,),
     )
-    return int(dict(rows[0])["total"]) if rows else 0
+    reported = int(dict(rows[0])["total"]) if rows else 0
+    unreported = await fetchall(
+        db,
+        "SELECT COALESCE(SUM(provider_tokens), 0) AS total FROM review_dispatches "
+        "WHERE task_id = ? AND status <> 'done' AND provider_tokens IS NOT NULL",
+        (task_id,),
+    )
+    return reported + (int(dict(unreported[0])["total"]) if unreported else 0)
 
 
 @dataclass(frozen=True)
@@ -2657,6 +2718,11 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     for row in await repo.list_active_review_dispatches(db):
         dispatch = dict(row)
         task_id = dispatch["task_id"]
+        if dispatch.get("status") == SECOND_DOOR_OWED:
+            # Долг, записанный прошлым проходом (или прошлой жизнью процесса):
+            # облако уже отказало вслух, вторая дверь ещё не открыта.
+            await _settle_second_door(db, dispatch)
+            continue
         if dispatch.get("channel") == LOCAL_CHANNEL:
             # Локальный прогон досматривает своя корутина (#1180). Свипу тут
             # остаётся один случай — процесс хаба, перезапущенный посреди
@@ -2742,13 +2808,44 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
                     "task_status": task_status,
                 },
             )
-        await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
-        await db.commit()
         # МЕСТО ПРИМЕНЕНИЯ №2 второй двери (#1252): отказ АСИНХРОННЫЙ — агент
         # создался, прогон дошёл до терминального статуса, отчёта нет. Прогон
         # тут УЖЕ оплачен, и это единственное, чем этот случай отличается от
         # синхронного: без отчёта сдача стоит одинаково мёртво.
-        await _second_door_after_run(db, dispatch, task_row, run.get("status"))
+        #
+        # Строка НЕ закрывается раньше, чем долг отдан. Закрытая строка
+        # невидима свипу, и сбой между двумя записями — упавший процесс или
+        # исключение в подготовке заказа, где git ходит в сеть, — уносил бы
+        # обещанную вторую дверь навсегда: поллер глотает исключение и идёт
+        # дальше. Долг durable, отдача идемпотентна по сдаче.
+        run_status = str(run.get("status") or "")
+        await repo.owe_second_door(db, dispatch["id"], run_status)
+        await db.commit()
+        dispatch["run_status"] = run_status
+        await _settle_second_door(db, dispatch, task_row=task_row)
+
+
+async def _settle_second_door(
+    db: aiosqlite.Connection,
+    dispatch: dict[str, Any],
+    *,
+    task_row: Any | None = None,
+) -> None:
+    """Отдать долг второй двери и только потом закрыть строку (#1252).
+
+    Зовётся из двух моментов одного и того же пути: сразу после записи долга
+    и на возобновлении, когда предыдущая попытка не дошла до конца. Алерт об
+    отказе облака здесь НЕ повторяется — он записан вместе с долгом, и
+    повторять его на каждом проходе значило бы превратить один наблюдённый
+    факт в поток.
+    """
+    if task_row is None:
+        task_row = await repo.get_task(db, int(dispatch["task_id"]))
+    await _second_door_after_run(
+        db, dispatch, task_row, dispatch.get("run_status") or "терминальным"
+    )
+    await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
+    await db.commit()
 
 
 async def _second_door_after_run(

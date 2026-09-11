@@ -12,6 +12,7 @@ import json
 import re
 
 import aiosqlite
+import pytest
 from httpx import AsyncClient
 
 from hub import auth as hub_auth
@@ -5654,4 +5655,265 @@ async def test_the_sync_second_door_rechecks_the_submission_is_still_live(
     assert await _local_dispatches(db, task_id) == [], (
         "сдача сменилась, пока летел запрос: локальный прогон купил бы чтение "
         "кода, которого на этой сдаче уже нет"
+    )
+
+
+# --- #1252, сдача №3: находки внешнего ревьюера по коммиту c939276 ----------
+
+
+async def test_the_ceiling_counts_what_the_failed_run_already_cost(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находка 1 (P1): потолок расходов не видел денег УПАВШЕГО прогона.
+
+    На асинхронном пути свип строкой выше спрашивает у провайдера счёт за
+    прогон и кладёт его в ``review_dispatches.provider_tokens`` — сумма уже
+    НАЗВАНА. А потолок считал ``_tokens_already_spent``, и та суммировала
+    только ``machine_reviews``, где строки нет: отчёта-то не было. Оплаченный
+    прогон учитывался как ноль ровно в тот момент, когда открывается вторая
+    дверь, и ``LOCAL_REVIEW_TOKEN_CEILING`` (deploy/LOCAL-REVIEW.md)
+    обходился.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-costly"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TOKEN_CEILING", 1_000)
+
+    task_id = await _submitted(
+        client, db, "spike-ceiling-blind", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    async def _billed(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": 5_000}}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    monkeypatch.setattr(cursor_cloud, "get_usage", _billed)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    cloud = [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+            (task_id,),
+        )
+    ]
+    assert cloud and cloud[0]["provider_tokens"] == 5_000, (
+        "счёт за упавший прогон СКАЗАН провайдером и записан — это не незнание"
+    )
+    assert await _local_dispatches(db, task_id) == [], (
+        "потолок в 1000 токенов уже пробит оплаченным прогоном: вторая дверь "
+        "не имеет права покупать ещё один"
+    )
+    alerts = [
+        dict(r)["content"]
+        for r in await repo.get_task_updates(db, task_id)
+        if dict(r)["kind"] == "alert"
+    ]
+    assert any("потолок стоимости исчерпан" in a for a in alerts), (
+        "отказ по потолку называет причину, а не молчит (#1152)"
+    )
+
+
+async def test_a_crash_before_the_second_door_does_not_lose_it(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находка 2 (P2): вторая попытка терялась НАВСЕГДА.
+
+    Строка облачного заказа переводилась в ``failed`` и коммитилась ДО вызова
+    второй двери. Любой сбой после этого коммита — упавший процесс хаба или
+    исключение в подготовке заказа (git-операции ходят в сеть) — оставлял
+    сдачу без локального заказа, а свипы грузят только активные строки.
+    Обещанной второй двери больше не существовало: поллер глотает исключение
+    (hub/poller.py: «the sweep must not kill the loop») и идёт дальше.
+    """
+    from hub.services import review_dispatch as rd
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-crash"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-crash-second-door", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_order = rd.prepare_review_order
+    attempts = {"n": 0}
+
+    async def _flaky_order(*args, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("подготовка заказа сорвалась: git-операция не прошла")
+        return await real_order(*args, **kwargs)
+
+    monkeypatch.setattr(rd, "prepare_review_order", _flaky_order)
+
+    try:
+        await sweep_review_dispatches(db)
+    except RuntimeError:
+        pass  # ровно то, что поллер глотает и забывает
+    await db.commit()
+
+    # Перезапуск: следующий проход свипа обязан ЗАСТАТЬ долг второй двери.
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert len(await _local_dispatches(db, task_id)) == 1, (
+        "долг второй двери переживает сбой: иначе сдача теряет обещанный "
+        "второй способ добыть отчёт безвозвратно"
+    )
+    reports = [
+        dict(r) for r in await repo.machine_reviews_of_generation(db, task_id, 1)
+    ]
+    assert len(reports) == 1
+    alerts = [
+        dict(r)["content"]
+        for r in await repo.get_task_updates(db, task_id)
+        if dict(r)["kind"] == "alert" and "отчёт НЕ сдан" in dict(r)["content"]
+    ]
+    assert len(alerts) == 1, (
+        "повтор долга не превращается в поток алертов: отказ облака назван один раз"
+    )
+
+
+@pytest.mark.parametrize(
+    "reads_before_revocation",
+    # Чтений принципала на пути второй двери ТРИ, и отзыв токена между любыми
+    # двумя из них даёт разное состояние. 1 — отозван после проверки
+    # готовности у зовущего: ways вызываемого уже без локального канала.
+    # 2 — отозван после ЕГО собственного review_reach: ways ещё с локальным
+    # каналом, а принципала уже нет. Второй случай ловится только
+    # перечитыванием принципала, и без него первый сторож пропускает.
+    (1, 2),
+    ids=("revoked-before-the-callee-looks", "revoked-between-reach-and-order"),
+)
+async def test_the_local_order_refuses_without_the_reviewers_principal(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    monkeypatch,
+    tmp_path,
+    reads_before_revocation: int,
+):
+    """Находка 3 (P2): заказ мог уехать БЕЗ принципала ревьюера.
+
+    ``open_second_door`` требует LOCAL_CHANNEL в ways, а вызываемый
+    ``dispatch_local_review`` делал СВОЙ ``review_reach`` и смотрел только на
+    ``runnable``. На github ``runnable`` истинно из-за облака даже тогда,
+    когда локального канала уже нет, — и ``principal_id`` мог оказаться
+    None. Между двумя чтениями лежит await, и токен ревьюера успевает быть
+    отозванным: заказ создавался под NULL, то есть отчёт переставал быть
+    чужим автору — ровно то, что обесценивает прогон (#1128).
+    """
+    from hub.services import review_dispatch as rd
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder(None, refusal=_LIMIT_REFUSAL)
+    _wire(monkeypatch, recorder)
+    pid = await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    real_principal = rd.local_reviewer_principal_id
+    reads = {"n": 0}
+
+    async def _revoked_after_the_first_read(conn):
+        reads["n"] += 1
+        got = await real_principal(conn)
+        if reads["n"] == reads_before_revocation:
+            # Токен ревьюера отозвали ПОСЛЕ того, как готовность уже сказали.
+            await conn.execute(
+                "UPDATE api_keys SET revoked_at = datetime('now') "
+                "WHERE principal_id = ?",
+                (pid,),
+            )
+            await conn.commit()
+        return got
+
+    monkeypatch.setattr(
+        rd, "local_reviewer_principal_id", _revoked_after_the_first_read
+    )
+
+    task_id = await _submitted(
+        client, db, "spike-no-principal", policy={"review": "dispatch"}
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    _rows = await _local_dispatches(db, task_id)
+    assert [(r["id"], r["reviewer_principal_id"]) for r in _rows] == [], (
+        "заказ без принципала независимого ревьюера не создаётся вовсе: "
+        "отчёт под NULL читается как свой собственному вызову"
+    )
+    alerts = [
+        dict(r)["content"]
+        for r in await repo.get_task_updates(db, task_id)
+        if dict(r)["kind"] == "alert"
+    ]
+    assert any("LOCAL_REVIEWER_HUB_TOKEN" in a for a in alerts), (
+        "отказ называет, ЧЕГО не хватает, именем настройки (#1083)"
+    )
+
+
+async def test_the_local_order_refuses_a_forge_where_only_the_cloud_is_ready(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 3, вторая половина: правило живёт в ВЫЗЫВАЕМОЙ функции.
+
+    Проверяется собственный вход ``dispatch_local_review``, а не путь через
+    ``open_second_door``: сегодня сторож стоит у зовущего, и достаточность
+    этого — свойство сегодняшнего списка зовущих, а не функции. На форже из
+    CLOUD_REVIEW_FORGES ``reach.runnable`` истинно ИЗ-ЗА ОБЛАКА даже тогда,
+    когда локального канала нет вовсе, и старая проверка пропускала заказ
+    дальше: строка диспетчера создавалась под путь, которым исполнить её
+    нечем.
+    """
+    from hub.services.review_dispatch import dispatch_local_review
+
+    await _local_principal(db, monkeypatch)
+    # Токен ревьюера есть и разрешается, а CLI и песочницы нет: локального
+    # канала нет, но ways на github непуст — там стоит облако.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", "")
+
+    task_id = await _submitted(client, db, "spike-cloud-only-reach")
+    task = dict(await repo.get_task(db, task_id))
+
+    assert not await dispatch_local_review(db, task, "github", task["branch"], 1), (
+        "локального канала нет — заказывать нечем"
+    )
+    assert await _local_dispatches(db, task_id) == [], (
+        "строка диспетчера под путь, которым исполнить нечем, — оплаченный "
+        "заказ в никуда"
+    )
+    alerts = [
+        dict(r)["content"]
+        for r in await repo.get_task_updates(db, task_id)
+        if dict(r)["kind"] == "alert"
+    ]
+    assert any("LOCAL_REVIEW_CMD" in a for a in alerts), (
+        "отказ называет отсутствующие настройки по именам (#1083)"
     )
