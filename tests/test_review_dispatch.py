@@ -6449,3 +6449,42 @@ async def test_the_queued_local_run_starts_with_a_live_access_code(
         "не выкупит основной канал отчёта и свалится в слабый путь через "
         "stdout — или потеряет отчёт вовсе"
     )
+
+
+async def test_renewal_speaks_only_when_a_code_was_really_lost(
+    db: aiosqlite.Connection, db_dsn: str, caplog
+):
+    """Продление кода пишет в журнал РОВНО один случай — потерянный код.
+
+    Журнал здесь единственный след того, что отчёт поедет слабым путём
+    (блоком в тексте прогона, #1036), и цена ложной строки высока в обе
+    стороны. «Кода не выдавали вовсе» — это открытый режим или отозванный
+    токен, и говорить там «код пропал» значит звать оператора искать то,
+    чего не было. Молчать же о настоящей пропаже значит оставить слабый путь
+    незамеченным.
+
+    Заодно проверяется, что продление доходит до базы обоими способами, как
+    и на проде: своим соединением по пути и на переданном живом соединении.
+    """
+    import logging
+
+    from hub.services.review_dispatch import _renew_access_code
+
+    with caplog.at_level(logging.WARNING, logger="hub.services.review_dispatch"):
+        await _renew_access_code(db_dsn, None, "")
+        await _renew_access_code("", None, "AH-11111111")
+        assert caplog.records == [], (
+            "продление сказало что-то о коде, которого не выдавали: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+        await _renew_access_code(db_dsn, None, "AH-22222222")
+        await _renew_access_code("", db, "AH-33333333")
+
+    said = [r.getMessage() for r in caplog.records]
+    assert len(said) == 2, (
+        f"о пропавшем коде обязаны были сказать оба пути продления: {said}"
+    )
+    assert all("stdout" in message for message in said), (
+        f"в журнале не названо следствие — отчёт поедет слабым путём: {said}"
+    )
