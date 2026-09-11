@@ -838,6 +838,15 @@ async def test_a_report_without_unresolved_findings_is_not_touched(client, db):
     assert resp.status_code == 200, resp.text
     assert await _step_events(db, task_id) == []
 
+    # И ни слова в ленте: «механический шаг сделан» на отчёте, которому он не
+    # предмет, — это строка, после которой «шаг сделан» перестаёт что-либо
+    # значить. Проверяется отдельно от событий: проход без находок пишет ноль
+    # событий и в мутированном виде тоже, а сводку — уже нет.
+    from hub import repository as repo_module
+
+    updates = [dict(u) for u in await repo_module.get_task_updates(db, task_id)]
+    assert not [u for u in updates if "Механический шаг" in (u["content"] or "")]
+
 
 async def test_a_failing_suite_confirms_the_finding_on_the_production_path(
     client, db, monkeypatch
