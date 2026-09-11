@@ -83,6 +83,41 @@ CREATE TABLE IF NOT EXISTS activity_log (
 );
 """
 
+#: Минимальная длина каждого поля доказательства доставки (#1215). Порог, а не
+#: детектор лжи, и называть его иначе значит обещать больше, чем код делает. Он
+#: ловит форму штампа: «проверено» (9) и «всё хорошо» (10) не проходят ни
+#: порознь, ни россыпью по двум полям. Развёрнутое доказательство — «git show
+#: 19ee3f6 --stat» и «файл присутствует, AC-тест зелёный» — проходит без усилий.
+#:
+#: ЖИВЁТ ЗДЕСЬ, а не в службе, потому что порог применяют ДВА места: живая
+#: дверь (``delivery_state._check_evidence``) и SQL засыпки ниже в этом файле.
+#: Пока их было два и определений было два, они разошлись: засыпка проверяла
+#: лишь ``TRIM != ''`` и закрывала строку записью, которую живая дверь
+#: отвергала как штамп (находка 80fcb9c9). Одно определение — один ответ на
+#: вопрос «что считается доказательством».
+MIN_EVIDENCE_CHARS = 12
+
+#: Наблюдение обязано назвать коммит: утверждение «работа доставлена» — это
+#: утверждение о том, что код ГДЕ-ТО есть, и без места оно нефальсифицируемо.
+#: Семь знаков — короткий git-хеш, ниже этого хеш перестаёт быть однозначным.
+MIN_SHA_CHARS = 7
+
+#: Условие «это похоже на хеш» для SQL: длина плюс отсутствие НЕ-шестнадцати-
+#: ричного знака. GLOB здесь единственная форма, которой SQLite умеет сказать
+#: «во всей строке нет символа вне набора» — LIKE такого не умеет.
+_SQL_SHA_LOOKS_LIKE_A_COMMIT = (
+    f"LENGTH(TRIM(c.sha)) >= {MIN_SHA_CHARS} AND TRIM(c.sha) NOT GLOB '*[^0-9a-fA-F]*'"
+)
+
+#: Та же тройка требований, что у ``_check_evidence``, на языке засыпки.
+_SQL_EVIDENCE_BAR = (
+    f"c.outcome = 'done' "
+    f"AND LENGTH(TRIM(c.probe)) >= {MIN_EVIDENCE_CHARS} "
+    f"AND LENGTH(TRIM(c.observation)) >= {MIN_EVIDENCE_CHARS} "
+    f"AND {_SQL_SHA_LOOKS_LIKE_A_COMMIT}"
+)
+
+
 _MIGRATIONS: list[tuple[str, str]] = [
     (
         "add_source_column",
@@ -1828,6 +1863,117 @@ _MIGRATIONS: list[tuple[str, str]] = [
         # постановка, когда объявляет зонд.
         "add_tasks_live_probe",
         "ALTER TABLE tasks ADD COLUMN live_probe TEXT NOT NULL DEFAULT ''",
+    ),
+    # --- Наблюдение доставки: четвёртый ВХОД, но не четвёртый ИСТОЧНИК (#1215).
+    #
+    # Три источника ответа о доставке — строка pipeline_merges, базовая ветка,
+    # провайдер — могут оказаться закрыты ОДНОВРЕМЕННО и навсегда. Живой
+    # случай 09.09.2026: #878 (PR #443), #875 (PR #461), #909 (PR #468) стояли
+    # в unknown 441-453 часа, потому что прежний репозиторий, где жили эти PR,
+    # удалён (в нынешнем нумерация началась заново), строк pipeline_merges
+    # нет, а базовая ветка не отвечает из-за squash. Спрашивать больше некого
+    # — ни сегодня, ни через месяц, и у строки не было НИ ОДНОГО выхода.
+    #
+    # Эти колонки — место, куда человек или агент кладёт то, что проверил
+    # своими глазами. Почему отдельные колонки, а не перезапись state/reason:
+    # наблюдение обязано ВИДИМО отличаться от того, что хаб установил сам.
+    # Перезапись сделала бы наблюдение неотличимым от вывода трёх источников,
+    # то есть ровно четвёртым источником правды, — и заодно стёрла бы прежнее
+    # unknown вместе с его причиной. Закрытие дописывает историю, а не
+    # заменяет её: state и reason остаются ровно теми, какими их оставил свип.
+    #
+    # observed_state — тот ФАКТ, который закрыли наблюдением, по образцу
+    # acknowledged_state. Наблюдение «код в 19ee3f6 есть» относится к
+    # состоянию unknown; если провайдер завтра оживёт и скажет pr_open, это
+    # уже другое утверждение, которого никто не наблюдал, и строка обязана
+    # вернуться в список. Обратной засыпки нет и быть не может: наблюдений до
+    # этой миграции не существует.
+    (
+        "add_delivery_observed_at",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_at TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_delivery_observed_by",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_by TEXT NOT NULL DEFAULT ''",
+    ),
+    # probe и evidence раздельно — та же схема доказательства, что у живых
+    # проверок (#813): «что запускал» и «что увидел». Одно поле принимало бы
+    # «проверено, всё хорошо» как полноценную запись, а это штамп.
+    (
+        "add_delivery_observed_probe",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_probe TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_delivery_observed_evidence",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_evidence TEXT NOT NULL DEFAULT ''",
+    ),
+    # Коммит обязателен: наблюдение доставки — это утверждение о том, что код
+    # ГДЕ-ТО есть, и без названного места оно нефальсифицируемо.
+    (
+        "add_delivery_observed_sha",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_sha TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_delivery_observed_state",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_state TEXT NOT NULL DEFAULT ''",
+    ),
+    # ЗАСЫПКА ПО УЖЕ ЗАПИСАННЫМ НАБЛЮДЕНИЯМ (#1215), и она здесь не ради
+    # удобства выката. Три строки — #878, #875, #909 — простояли в unknown
+    # 441-453 часа, и наблюдения по ним уже лежат: живые проверки от
+    # 09.09.2026, с командой, с ответом и с раскатанным коммитом. Без засыпки
+    # выкат оставил бы механизм, у которого нет ни одного закрытого случая, и
+    # закрывать три строки пришлось бы руками, повторяя запись, которая уже
+    # есть. Ровно этого требует постановка: «выкат проверяется на них».
+    #
+    # Берётся ПОСЛЕДНЯЯ живая проверка задачи, прошедшая ТОТ ЖЕ порог
+    # доказательства, что и прямая запись, — и «тот же» здесь буквально: и
+    # эта SQL, и живая дверь считают его по _SQL_EVIDENCE_BAR / константам
+    # выше, одним определением. Пока определений было два, они разошлись:
+    # засыпка спрашивала лишь TRIM != '' и закрывала строку записью вида
+    # «ок / норм / zzz», которую живая дверь отвергает как штамп (находка
+    # 80fcb9c9). Обещание в комментарии, не проверяемое кодом, — та же
+    # подмена доказательства штампом, только этажом выше. Закрывается только unknown: строку, чей источник
+    # отвечает, наблюдением не закрывают ни здесь, ни в коде.
+    #
+    # Одноразовость даёт сам механизм миграций (имя выполняется один раз), а
+    # не WHERE: строка, которую человек закроет и передумает, не должна
+    # закрываться заново при следующем запуске.
+    (
+        "backfill_delivery_observed_from_live_checks",
+        f"""UPDATE delivery_discrepancies AS d
+              SET observed_at       = (
+                    SELECT c.created_at FROM live_checks c
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_by       = (
+                    SELECT COALESCE(NULLIF(c.recorded_agent, ''), 'hub')
+                      FROM live_checks c
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_probe    = (
+                    SELECT c.probe FROM live_checks c
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_evidence = (
+                    SELECT c.observation FROM live_checks c
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_sha      = (
+                    SELECT c.sha FROM live_checks c
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_state    = d.state
+            WHERE d.state = 'unknown'
+              AND d.observed_at = ''
+              AND EXISTS (
+                    SELECT 1 FROM live_checks c
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR})""",  # nosec B608 - константы модуля, не данные
     ),
 ]
 

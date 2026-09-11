@@ -13,6 +13,8 @@ from hub.services.dashboard import (
     list_tasks,
 )
 from hub.services.delivery_state import (
+    ObservationRefused,
+    record_delivery_observation,
     scan_completed_deliveries,
     task_delivery,
     undelivered_completed_tasks,
@@ -302,6 +304,8 @@ __all__ = [
     "scan_completed_deliveries",
     "task_delivery",
     "undelivered_completed_tasks",
+    "record_delivery_observation",
+    "ObservationRefused",
     "project_git_context",
     "provision_project",
     "record_review_verdict",

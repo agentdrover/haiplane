@@ -767,3 +767,591 @@ async def test_force_complete_deliver_behaves_like_decide(
     )
     assert resp.status_code == 200
     assert 909 not in spy.merged, "force-complete is not a way past the gate"
+
+
+# --- #1215: a row nobody is left to ask -------------------------------------
+#
+# 09.09.2026. #878 (PR #443), #875 (PR #461) and #909 (PR #468) had stood in
+# ``unknown`` for 441-453 hours. Not because the provider blinked: the former
+# repository, where those PRs lived, is deleted, and in the current one the
+# numbering started over. No pipeline_merges row, no answer from the base
+# branch (squash), no provider.
+# Every source closed at once, and ``unknown`` was the correct answer to a
+# question that will never be answered again.
+#
+# Their delivery was nevertheless verified, and by something stronger than a
+# PR state: the code of all three is present in the deployed commit
+# 19ee3f6faf9f, checked by their own AC tests by name. The registry knew
+# nothing about it, because it had nowhere to put an observation.
+#
+# The one exit that existed — archiving — is worse than the illness: the same
+# ``archived = 0`` filter reads the outcome debt, so archiving would have
+# removed the visible row at the price of a silently dropped outcome review.
+# These tests hold the exit that does not make that trade.
+
+
+async def _unanswerable_row(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    *,
+    title: str,
+    pr: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> int:
+    """A completed task whose three sources are all closed, as of 09.09.2026.
+
+    No ``pipeline_merges`` row, a base branch that cannot answer, and a
+    provider that answers "" — the shape #878/#875/#909 are actually in.
+    """
+    task_id = await _completed_task(db, client, title=title, pr=pr)
+    _pr_states(monkeypatch, {})  # unlisted number => "could not look"
+    await scan_completed_deliveries(db)
+    return task_id
+
+
+_PROBE = "git show 19ee3f6faf9f --stat | grep hub/services/delivery_state.py"
+_SAW = "файл присутствует в раскатанном коммите, AC-тест задачи зелёный"
+_SHA = "19ee3f6faf9f"
+
+
+async def test_a_named_observation_closes_an_unanswerable_row(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-1. The row leaves the list, and the reader can see WHO closed it.
+
+    Both halves matter and they pull against each other. Leaving is the point:
+    a list that cannot return to zero stops meaning "nothing is undelivered",
+    and then the first real loss leaves with the noise. Staying visible is the
+    guard: if closing a row made it vanish, the record would be a button
+    labelled "remove this line" rather than an attributed act.
+    """
+    task_id = await _unanswerable_row(
+        client, db, title="Маховик", pr=443, monkeypatch=monkeypatch
+    )
+    assert [
+        r["task_id"] for r in (await undelivered_completed_tasks(db))["unknown"]
+    ] == [task_id]
+
+    result = (
+        await client.post(
+            f"/api/delivery/discrepancies/{task_id}/observation",
+            json={"probe": _PROBE, "observation": _SAW, "sha": _SHA},
+        )
+    ).json()
+    assert result["closed_state"] == UNKNOWN
+
+    listed = await undelivered_completed_tasks(db)
+    assert [r["task_id"] for r in listed["unknown"]] == []
+    assert [r["task_id"] for r in listed["undelivered"]] == []
+
+    # Gone from the list, not gone. And what the reader sees is that a PERSON
+    # answered, naming a commit — not that the hub finally established it.
+    closed = listed["closed_by_observation"]
+    assert [r["task_id"] for r in closed] == [task_id]
+    assert closed[0]["observed_by"]
+    assert closed[0]["observed_sha"] == _SHA
+    assert closed[0]["observed_probe"] == _PROBE
+    assert closed[0]["observed_evidence"] == _SAW
+    # The distinction is in the reader's payload, not only in a column: the
+    # closed row still carries the hub's own answer, which is what makes
+    # "confirmed by observation" different from "established by the hub".
+    assert closed[0]["state"] == UNKNOWN
+
+    # A mirror, not a gate: the row moved, the task did not.
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed"
+    assert not task["archived"], "archiving takes the outcome debt with it"
+
+
+async def test_a_stamp_without_evidence_closes_nothing(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-2. "Проверено, всё хорошо" is a stamp, and a stamp closes nothing.
+
+    Four refusals, because the stamp has four shapes and only the first one is
+    obvious: empty; a stamp split across both fields so that neither is empty;
+    a real observation with no commit named; and a "commit" that is not one.
+    """
+    task_id = await _unanswerable_row(
+        client, db, title="Предпас", pr=461, monkeypatch=monkeypatch
+    )
+    url = f"/api/delivery/discrepancies/{task_id}/observation"
+
+    refusals = [
+        {"probe": "", "observation": "", "sha": _SHA},
+        {"probe": "   ", "observation": _SAW, "sha": _SHA},
+        # The stamp, split in two so that neither field is empty.
+        {"probe": "проверено", "observation": "всё хорошо", "sha": _SHA},
+        # A real observation that names no place to check it.
+        {"probe": _PROBE, "observation": _SAW, "sha": ""},
+        {"probe": _PROBE, "observation": _SAW, "sha": "не помню"},
+    ]
+    for payload in refusals:
+        resp = await client.post(url, json=payload)
+        assert resp.status_code == 422, payload
+        # A refusal that does not say why is its own kind of stamp.
+        assert resp.json()["detail"], payload
+        # And it must never offer the exit that loses the outcome review.
+        assert "архив" not in str(resp.json()).lower(), payload
+
+    # The row is exactly where it was: refused is refused, not "half recorded".
+    listed = await undelivered_completed_tasks(db)
+    assert [r["task_id"] for r in listed["unknown"]] == [task_id]
+    assert listed["closed_by_observation"] == []
+
+
+async def test_closing_a_row_keeps_what_it_used_to_say(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-3. Closing appends to the history; it does not overwrite it.
+
+    The temptation is to write ``delivered`` over the row and be done. That
+    would erase the fact that the hub could not answer, and with it the reason
+    — turning an attributed human observation into an indistinguishable fourth
+    source of truth, which is exactly what the task forbids.
+    """
+    task_id = await _unanswerable_row(
+        client, db, title="Паспорт дефекта", pr=468, monkeypatch=monkeypatch
+    )
+    before = await repo.get_delivery_discrepancy(db, task_id)
+    assert before["state"] == UNKNOWN
+    was_reason = before["reason"]
+    assert "468" in was_reason
+
+    await client.post(
+        f"/api/delivery/discrepancies/{task_id}/observation",
+        json={"probe": _PROBE, "observation": _SAW, "sha": _SHA},
+    )
+
+    after = await repo.get_delivery_discrepancy(db, task_id)
+    assert after["state"] == UNKNOWN, "the hub's own answer was overwritten"
+    assert after["reason"] == was_reason, "the cause of the unknown was erased"
+    assert after["observed_state"] == UNKNOWN
+
+    # Readable as history, in the feed the owner actually reads.
+    note = " ".join(await _alerts(db, task_id))
+    assert was_reason in note
+    assert _SHA in note
+
+    # The closure is tied to the FACT, not to the task forever. If the
+    # provider ever comes back and says something nobody observed, the row
+    # returns: an observation of "could not tell" says nothing about
+    # "the PR is open".
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=task_id,
+        state=PR_OPEN,
+        reason="PR #468 открыт",
+        pr_number=468,
+        delivery_path="none",
+    )
+    listed = await undelivered_completed_tasks(db)
+    assert [r["task_id"] for r in listed["undelivered"]] == [task_id]
+    assert listed["closed_by_observation"] == []
+
+
+async def test_a_row_past_the_sweep_window_still_has_the_exit(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What happens to a row older than the sweep window — said, not implied.
+
+    The sweep takes candidates completed within DELIVERY_SCAN_LOOKBACK_DAYS.
+    Past that edge the sources are never re-asked and the row freezes on
+    whatever they last said. For #878/#875/#909 that edge falls around
+    20-21.09.2026, and the statement's whole deadline is that after it nobody
+    could rewrite the row at all.
+
+    Two things are asserted, and the second is the one with the deadline on
+    it: the reader is TOLD the row is frozen rather than being left to notice
+    a motionless ``checked_at``, and the observation path does not consult the
+    window, so the exit outlives the boundary.
+    """
+    task_id = await _unanswerable_row(
+        client, db, title="Старая строка", pr=470, monkeypatch=monkeypatch
+    )
+    # Push it past the edge: completed long before the lookback window.
+    await db.execute(
+        "UPDATE tasks SET completed_at = datetime('now', '-400 days') WHERE id = ?",
+        (task_id,),
+    )
+    await db.commit()
+
+    # The sweep no longer even considers it — this is the freeze, reproduced.
+    candidates = await repo.completed_tasks_awaiting_delivery(db)
+    assert task_id not in [dict(r)["id"] for r in candidates]
+
+    listed = await undelivered_completed_tasks(db)
+    frozen = [r for r in listed["unknown"] if r["task_id"] == task_id]
+    assert frozen, "a frozen row must stay visible, not fall off the list"
+    assert frozen[0]["still_swept"] is False, (
+        "the reader must be told the sources are no longer being re-asked"
+    )
+    assert listed["sweep_lookback_days"] >= 1
+
+    # And the exit still opens, which is the entire point of the deadline.
+    assert (
+        await client.post(
+            f"/api/delivery/discrepancies/{task_id}/observation",
+            json={"probe": _PROBE, "observation": _SAW, "sha": _SHA},
+        )
+    ).status_code == 200
+    listed = await undelivered_completed_tasks(db)
+    assert [r["task_id"] for r in listed["closed_by_observation"]] == [task_id]
+
+
+async def test_an_observation_needs_a_row_to_close(
+    client: AsyncClient, db: aiosqlite.Connection
+) -> None:
+    """No stored discrepancy means there is nothing to close, and saying so
+    beats inventing a row: the registry must not learn to hold observations
+    about tasks it never had an opinion on."""
+    task_id = (await client.post("/api/tasks", json={"title": "Never swept"})).json()[
+        "id"
+    ]
+    resp = await client.post(
+        f"/api/delivery/discrepancies/{task_id}/observation",
+        json={"probe": _PROBE, "observation": _SAW, "sha": _SHA},
+    )
+    assert resp.status_code == 422
+    assert await repo.get_delivery_discrepancy(db, task_id) is None
+
+
+async def test_a_refusal_names_the_right_cause(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each refusal names ITS cause, not merely some cause.
+
+    Found by mutation: with the emptiness check removed, every test still
+    passed, because the length floor refuses an empty field too. Same verdict,
+    different sentence — and the sentence is the whole product here. "Слишком
+    коротко" sends someone to pad a stamp out to twelve characters; "нужно и
+    то, что запускали, и то, что увидели" sends them to run something. This
+    codebase has already paid for a refusal naming the wrong cause once, in
+    the acknowledgement path, where three spaces got "строки нет".
+    """
+    from hub.services.delivery_state import ObservationRefused
+    from hub.services.delivery_state import (
+        record_delivery_observation as record_observation,
+    )
+
+    task_id = await _unanswerable_row(
+        client, db, title="Причины отказов", pr=471, monkeypatch=monkeypatch
+    )
+
+    cases = {
+        "incomplete_evidence": ("", _SAW, _SHA),
+        "evidence_too_thin": ("коротко", "тоже", _SHA),
+        "missing_commit": (_PROBE, _SAW, ""),
+    }
+    for expected, (probe, seen, sha) in cases.items():
+        with pytest.raises(ObservationRefused) as caught:
+            await record_observation(
+                db, task_id, by="tester", probe=probe, evidence=seen, sha=sha
+            )
+        assert caught.value.reason == expected, (probe, seen, sha)
+        assert caught.value.hint, "a refusal with no way forward is a dead end"
+        assert "архив" not in caught.value.hint.lower()
+
+
+async def test_a_live_check_closes_the_row_it_already_answered(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second door, and the reason it exists.
+
+    A live check (#813) is already a named, attributed observation: what was
+    run, what came back, in which commit, recorded by whom. For #878/#875/#909
+    such records were written on 09.09.2026, and they are stronger evidence of
+    delivery than a PR state — the code of all three is in the deployed commit,
+    checked by their own AC tests by name. Making someone write the same thing
+    again under a different verb would be charging for the form.
+
+    Both doors write the same columns through the same function, so there is
+    no second answer to "is this row closed".
+    """
+    task_id = await _unanswerable_row(
+        client, db, title="Живая проверка", pr=472, monkeypatch=monkeypatch
+    )
+    monkeypatch.setattr(
+        "hub.services.delivery_state.delivery_state",
+        _in_prod,
+        raising=False,
+    )
+
+    assert (
+        await client.post(
+            f"/api/tasks/{task_id}/live-check",
+            json={"probe": _PROBE, "observation": _SAW, "sha": _SHA},
+        )
+    ).status_code == 200
+
+    listed = await undelivered_completed_tasks(db)
+    closed = listed["closed_by_observation"]
+    assert [r["task_id"] for r in closed] == [task_id]
+    assert closed[0]["observed_sha"] == _SHA
+    assert closed[0]["observed_evidence"] == _SAW
+    assert closed[0]["state"] == UNKNOWN, "the hub's own answer is still there"
+
+
+async def _in_prod(db: Any, task_id: int) -> dict[str, Any]:
+    """The task's code is deployed — the case the three live rows are in."""
+    return {"state": "in_prod", "reason": "в раскатанном коммите"}
+
+
+async def test_a_source_that_still_answers_is_not_silenced(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An observation is the exit for a row with NOBODY left to ask.
+
+    Where a source does answer — "PR #473 is open" — closing the row by
+    observation would be a way to argue with a fact instead of fixing it. That
+    row has its own exits already: deliver the work, or acknowledge the
+    discrepancy with a reason (#1198). Both doors refuse here, and the refusal
+    says which exit to use.
+    """
+    task_id = await _completed_task(db, client, title="PR всё ещё открыт", pr=473)
+    _pr_states(monkeypatch, {473: "open"})
+    await scan_completed_deliveries(db)
+    assert [
+        r["task_id"] for r in (await undelivered_completed_tasks(db))["undelivered"]
+    ] == [task_id]
+
+    resp = await client.post(
+        f"/api/delivery/discrepancies/{task_id}/observation",
+        json={"probe": _PROBE, "observation": _SAW, "sha": _SHA},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["reason"] == "source_still_answers"
+
+    # The live-check door obeys the same rule, and the check itself survives.
+    monkeypatch.setattr(
+        "hub.services.delivery_state.delivery_state", _in_prod, raising=False
+    )
+    assert (
+        await client.post(
+            f"/api/tasks/{task_id}/live-check",
+            json={"probe": _PROBE, "observation": _SAW, "sha": _SHA},
+        )
+    ).status_code == 200
+
+    listed = await undelivered_completed_tasks(db)
+    assert [r["task_id"] for r in listed["undelivered"]] == [task_id]
+    assert listed["closed_by_observation"] == []
+
+
+async def test_the_registry_cannot_break_a_live_check(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live check is a finished record in its own right.
+
+    It must not fail because the registry had no row for it, or because the
+    closure blew up. Those are reasons not to close a row, never reasons to
+    lose the observation — and the same discipline the sweep keeps.
+    """
+    task_id = (
+        await client.post("/api/tasks", json={"title": "Никакой строки"})
+    ).json()["id"]
+    monkeypatch.setattr(
+        "hub.services.delivery_state.delivery_state", _in_prod, raising=False
+    )
+
+    async def explodes(*a: Any, **k: Any) -> None:
+        raise RuntimeError("реестр упал")
+
+    monkeypatch.setattr(
+        "hub.services.delivery_state.record_delivery_observation",
+        explodes,
+        raising=False,
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/live-check",
+        json={"probe": _PROBE, "observation": _SAW, "sha": _SHA},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["observation"] == _SAW
+
+
+async def test_the_backfill_closes_rows_from_observations_already_written(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rollout is checked on the three live rows, so it must close them.
+
+    Without this, shipping would leave a mechanism with not one closed case
+    and three rows to close by hand, repeating records that already exist.
+    Only ``unknown`` rows, and only from a live check that passes the same
+    evidence bar as a direct write — a stamp backfills nothing.
+    """
+    from hub.db import _MIGRATIONS
+
+    unanswerable = await _unanswerable_row(
+        client, db, title="Есть наблюдение", pr=474, monkeypatch=monkeypatch
+    )
+    stamped = await _unanswerable_row(
+        client, db, title="Только штамп", pr=475, monkeypatch=monkeypatch
+    )
+    # A row whose source still answers, with evidence as good as the first
+    # one's. The backfill must leave it alone for the same reason the code
+    # does: nobody is arguing with a fact by hand here either.
+    still_open = await _completed_task(db, client, title="PR открыт", pr=476)
+    _pr_states(monkeypatch, {476: "open"})
+    await scan_completed_deliveries(db)
+
+    for task_id, probe, seen, sha in (
+        (unanswerable, _PROBE, _SAW, _SHA),
+        (stamped, "", "", ""),  # a live check with nothing to check
+        (still_open, _PROBE, _SAW, _SHA),
+    ):
+        await db.execute(
+            "INSERT INTO live_checks (task_id, sha, outcome, probe, observation, "
+            "recorded_agent) VALUES (?, ?, 'done', ?, ?, 'pda_claude')",
+            (task_id, sha, probe, seen),
+        )
+    await db.commit()
+
+    sql = dict(_MIGRATIONS)["backfill_delivery_observed_from_live_checks"]
+    await db.execute(sql)
+    await db.commit()
+
+    listed = await undelivered_completed_tasks(db)
+    assert [r["task_id"] for r in listed["closed_by_observation"]] == [unanswerable]
+    assert [r["task_id"] for r in listed["unknown"]] == [stamped]
+    assert [r["task_id"] for r in listed["undelivered"]] == [still_open]
+    closed = listed["closed_by_observation"][0]
+    assert closed["observed_sha"] == _SHA
+    assert closed["observed_by"] == "pda_claude"
+    assert closed["state"] == UNKNOWN
+
+
+# --- Находки ревью #352 -----------------------------------------------------
+
+
+async def test_a_sweep_that_speaks_mid_write_does_not_get_closed_by_it(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Находка 493a0ee9: наблюдение unknown не имеет права закрыть pr_open.
+
+    Служба читает состояние строки одним запросом, а пишет наблюдение другим,
+    и SELECT транзакции не открывает. Между ними законно вклинивается свип:
+    #1065 даёт запросу и опросчику РАЗНЫЕ соединения, поэтому провайдер может
+    заговорить и свип успевает зафиксировать ``pr_open`` до записи. Запись
+    ставила ``observed_state = state`` уже поверх нового факта — и строка,
+    источник которой отвечает, вычиталась из списка как «закрытая
+    наблюдением», хотя pr_open не наблюдал никто. Хуже, чем шумная строка:
+    список сам себя чистит от настоящего расхождения и не выздоравливает,
+    пока pr_open стабилен.
+
+    Окно воспроизводится в самой его точке — свип исполняется между чтением и
+    записью, — а не одновременным запуском: параллельный прогон дал бы
+    взаимную блокировку, а не наблюдаемый исход. Проверяется ИНВАРИАНТ:
+    закрытым может оказаться только тот факт, который наблюдали.
+    """
+    from hub import services
+
+    task_id = await _unanswerable_row(
+        client, db, title="Гонка со свипом", pr=443, monkeypatch=monkeypatch
+    )
+    real = repo.record_delivery_observation
+
+    async def _sweep_speaks_meanwhile(conn, tid, **kwargs):
+        # Ровно то, что делает опросчик: провайдер ожил и назвал PR открытым.
+        _pr_states(monkeypatch, {443: "open"})
+        await scan_completed_deliveries(conn)
+        return await real(conn, tid, **kwargs)
+
+    monkeypatch.setattr(
+        repo, "record_delivery_observation", _sweep_speaks_meanwhile, raising=True
+    )
+
+    with pytest.raises(services.ObservationRefused) as refused:
+        await services.record_delivery_observation(
+            db, task_id, by="pda_claude", probe=_PROBE, evidence=_SAW, sha=_SHA
+        )
+    assert "архив" not in str(refused.value).lower()
+
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert row["state"] == PR_OPEN, "свип должен был успеть сказать своё"
+    assert row["observed_state"] != row["state"], (
+        "наблюдали unknown — закрытым может быть только unknown; "
+        "иначе строка, у которой источник ОТВЕЧАЕТ, молча уходит из списка"
+    )
+
+    listed = await undelivered_completed_tasks(db)
+    assert [r["task_id"] for r in listed["undelivered"]] == [task_id], (
+        "строка с отвечающим источником обязана остаться расхождением"
+    )
+    assert listed["closed_by_observation"] == []
+
+
+async def test_the_backfill_holds_the_same_evidence_bar_as_the_live_door(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Находка 80fcb9c9: засыпка обещает «тот же порог» и не держит его.
+
+    Комментарий миграции говорит: берётся проверка, «прошедшая тот же порог
+    доказательства, что и прямая запись». SQL проверял только ``TRIM != ''``,
+    а ``_check_evidence`` требует двенадцати знаков в каждом поле и семи
+    шестнадцатеричных в коммите. Живая проверка вида «ок / норм / zzz» живой
+    дверью отвергается как штамп — и той же записью закрывала строку через
+    засыпку. Одноразовость миграции этого не лечит: закрытые ею строки живут
+    дальше, а расхождение между двумя порогами и есть та самая подмена
+    доказательства штампом, против которой написан AC-2.
+
+    Мутация по местам применения: ослабление ЛЮБОГО из трёх условий SQL
+    роняет ровно этот тест.
+    """
+    from hub import services
+    from hub.db import _MIGRATIONS
+
+    good = await _unanswerable_row(
+        client, db, title="Настоящее наблюдение", pr=443, monkeypatch=monkeypatch
+    )
+    # По строке на КАЖДОЕ условие порога, и каждая проваливает ровно одно:
+    # ослабление любого из трёх мест применения роняет этот тест поимённо.
+    thin_probe = await _unanswerable_row(
+        client, db, title="Короткий probe", pr=461, monkeypatch=monkeypatch
+    )
+    thin_seen = await _unanswerable_row(
+        client, db, title="Короткий observation", pr=468, monkeypatch=monkeypatch
+    )
+    bad_sha = await _unanswerable_row(
+        client, db, title="Коммит не коммит", pr=469, monkeypatch=monkeypatch
+    )
+    short_sha = await _unanswerable_row(
+        client, db, title="Коммит в три знака", pr=470, monkeypatch=monkeypatch
+    )
+    rows = (
+        (good, _PROBE, _SAW, _SHA),
+        (thin_probe, "ок", _SAW, _SHA),
+        (thin_seen, _PROBE, "норм", _SHA),
+        (bad_sha, _PROBE, _SAW, "не помню"),
+        # Шестнадцатеричный, но неоднозначный: длину проверяет ОТДЕЛЬНОЕ
+        # условие, и без этой строки его можно было бы снять незамеченным.
+        (short_sha, _PROBE, _SAW, "19e"),
+    )
+    for task_id, probe, seen, sha in rows:
+        await db.execute(
+            "INSERT INTO live_checks (task_id, sha, outcome, probe, observation, "
+            "recorded_agent) VALUES (?, ?, 'done', ?, ?, 'pda_claude')",
+            (task_id, sha, probe, seen),
+        )
+    await db.commit()
+
+    # Те же три записи, поданные в живую дверь, отвергаются — это и есть порог,
+    # который засыпка обязана держать, раз обещает его в своём комментарии.
+    for task_id, probe, seen, sha in rows[1:]:
+        with pytest.raises(services.ObservationRefused):
+            await services.record_delivery_observation(
+                db, task_id, by="pda_claude", probe=probe, evidence=seen, sha=sha
+            )
+
+    sql = dict(_MIGRATIONS)["backfill_delivery_observed_from_live_checks"]
+    await db.execute(sql)
+    await db.commit()
+
+    listed = await undelivered_completed_tasks(db)
+    assert [r["task_id"] for r in listed["closed_by_observation"]] == [good]
+    assert sorted(r["task_id"] for r in listed["unknown"]) == sorted(
+        [thin_probe, thin_seen, bad_sha, short_sha]
+    ), (
+        "штамп не закрывает строку ни прямой записью, ни засыпкой: "
+        "два порога у одного глагола — это два разных ответа"
+    )

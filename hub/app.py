@@ -34,6 +34,7 @@ from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
     DeliveryAcknowledgement,
+    DeliveryObservation,
     DeployCallback,
     DeployView,
     ProdStateView,
@@ -133,6 +134,7 @@ from hub.auth import (
     verify_csrf,
 )
 from hub.host_security import HostAllowlistMiddleware
+from hub.mcp_envelope import enrich_error_payload
 from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
 from hub.mcp_catalog import (
     catalog_snapshot,
@@ -2061,6 +2063,54 @@ async def api_delivery_discrepancies(
     return await services.undelivered_completed_tasks(
         db, project_id=project_id, limit=max(1, min(limit, 200))
     )
+
+
+@app.post("/api/delivery/discrepancies/{task_id}/observation")
+async def api_record_delivery_observation(
+    task_id: int,
+    body: DeliveryObservation,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Закрыть строку реестра наблюдённым фактом доставки (#1215).
+
+    Четвёртый ВХОД в реестр, но не четвёртый источник правды: строка уходит из
+    списка и приезжает отдельным ведром ``closed_by_observation``, где видно,
+    что доставку подтвердило наблюдение, а не установил хаб. Прежний ответ и
+    его причина остаются читаемыми — закрытие дописывает историю.
+
+    ``current_identity``, а не ``require_human_or_admin``, и это НЕ ослабление
+    соседнего маршрута: признание («так и задумано») — суждение о работе, и
+    выносить его агенту, чья задача попала в реестр, действительно нельзя.
+    Наблюдение — другое: это отчёт о том, что запускали и что увидели, той же
+    природы, что живая проверка (#813), и права здесь ровно те же. Второй
+    модели прав для одного и того же поступка быть не должно.
+
+    Статус задачи не меняется и задача не архивируется. Архивация убрала бы
+    строку вместе с outcome-долгом, который читается тем же фильтром
+    ``archived = 0``, — она не выход и здесь не предлагается.
+    """
+    try:
+        return await services.record_delivery_observation(
+            _db(request),
+            task_id,
+            by=str(getattr(identity, "username", "") or "agent"),
+            probe=body.probe,
+            evidence=body.observation,
+            sha=body.sha,
+        )
+    except services.ObservationRefused as exc:
+        raise HTTPException(
+            422,
+            detail=enrich_error_payload(
+                {
+                    "reason": exc.reason,
+                    "actor_hint": "agent",
+                    "message": exc.message,
+                    "hint": exc.hint,
+                }
+            ),
+        ) from exc
 
 
 @app.post("/api/delivery/discrepancies/{task_id}/acknowledge")
