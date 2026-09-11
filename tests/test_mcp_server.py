@@ -4577,3 +4577,29 @@ def test_an_empty_pointer_always_says_that_it_is_empty() -> None:
     for advice in [*empties, srv._TRANSPORT_NO_CHECK]:
         assert srv._TRANSPORT_NO_CHECK_CORE in advice, advice
         assert "hub_task_status" not in advice, advice
+
+
+def test_the_empty_pointer_says_it_in_words_and_not_in_a_placeholder() -> None:
+    """Дыра, найденная мутацией: константу проверяли ею же самой.
+
+    Все прочие проверки пустого указателя сверялись с ``_TRANSPORT_NO_CHECK_CORE``
+    — то есть с той самой строкой, которую и проверяли. Подмена её текста на
+    заглушку проходила мимо всей серии: тесты оставались зелёными, а агент
+    читал бы бессмыслицу. Константа здесь и есть продукт, поэтому её
+    содержание проверяется буквой, а не ссылкой на себя.
+    """
+    from hub import mcp_server as srv
+
+    core = srv._TRANSPORT_NO_CHECK_CORE
+    # Сказано, ЧЕГО нет: инструмента, отвечающего про ЭТУ запись.
+    assert "инструмента" in core
+    assert "прошла ли ИМЕННО эта запись" in core
+    assert core.rstrip().endswith("нет")
+    # Это фраза, а не метка: заглушка из одного слова сюда не пролезет.
+    assert len(core.split()) >= 8, core
+
+    # И каждый текст, который на ней строится, остаётся читаемой фразой.
+    for advice in (srv._TRANSPORT_NO_CHECK, srv._TRANSPORT_NO_CHECK_SKILL):
+        assert advice.startswith(core), advice
+        assert len(advice) > len(core) + 20, advice
+        assert advice.rstrip().endswith("."), advice
