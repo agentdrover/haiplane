@@ -19,6 +19,7 @@ from hub import repository as repo
 from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
 from hub.models import STEWARD_GROUND_SOURCES, ACVerifiableBy, AcceptanceCriterion
+from hub.services import steward_dor_packet
 from hub.services.steward_dor_packet import (
     ABSENT,
     BRIEF_UNAVAILABLE,
@@ -31,6 +32,7 @@ from hub.services.steward_dor_packet import (
     NO_ACCEPTANCE_CRITERIA,
     NO_DECLARED_AREAS,
     NO_STORED_CLASS,
+    PACKET_TASK_COLUMNS,
     PRESENT,
     _locator_state,
     _STATUS_STATES,
@@ -864,3 +866,216 @@ async def test_blocker_becoming_delivered_moves_the_packets_revision(
     # Рёбра те же и постановку не трогали — двинуться обязана доставленность.
     assert before.statement_generation == after.statement_generation
     assert before.revision["dependencies"] != after.revision["dependencies"]
+
+
+async def test_blocker_status_change_moves_the_packets_revision(
+    db: aiosqlite.Connection, clone: Path, collection
+):
+    """Статус блокера пакет ОТДАЁТ — значит и в отпечаток он входит.
+
+    Отпечаток, хешировавший у блокера только номер задачи и доставленность,
+    объявлял одним состоянием два, между которыми блокер сдвинулся с
+    ``open`` на ``in_progress``: ребро то же, доставки по-прежнему нет, а
+    факт, который читает стюард, другой. Замерено до правки — отпечатки
+    совпадали посимвольно при разных фактах. «Ждём незанятую задачу» и «ждём
+    задачу в работе» — разные основания подождать или вернуть постановку, и
+    одобрение, выданное по первому, не должно выглядеть выданным по второму.
+    """
+    task_id = await _draft(db, clone, title="blocker status")
+    await _ac(db, task_id, "AC-1", test_ref="tests/test_x.py::test_present")
+    blocker = await _draft(db, clone, title="blocker status blocker")
+    await repo.add_task_dependency(db, task_id, blocker)
+    await db.commit()
+
+    before = await build_draft_packet(db, task_id)
+    assert before is not None
+    assert before.fact("dependency_state").value["blocked_by"][0]["status"] == "open"
+
+    await repo.update_task(db, blocker, status="in_progress")
+    await db.commit()
+
+    after = await build_draft_packet(db, task_id)
+    assert after is not None
+    got = after.fact("dependency_state").value["blocked_by"][0]
+    assert got["status"] == "in_progress"
+    # Ребро не добавляли и не снимали, доставки как не было, так и нет.
+    assert got["delivered"] is False
+    assert before.statement_generation == after.statement_generation
+    assert before.revision["dependencies"] != after.revision["dependencies"]
+
+
+async def test_risk_and_readiness_changes_move_the_packets_revision(
+    db: aiosqlite.Connection, clone: Path, collection
+):
+    """Класс риска и счёт готовности пакет отдаёт — значит и они в отпечатке.
+
+    ``statement_fingerprint`` собран из ``STATEMENT_FIELDS`` (#1156), и ни
+    ``risk_class``, ни ``readiness_score`` туда не входят: их пишет хаб, а не
+    правка постановки. До правки это означало ровно то, чего отпечаток и
+    должен не допускать: ``R2`` → ``R3`` и «готовность 94, DoR пройден» →
+    «40, не пройден» оставляли отпечаток посимвольно прежним, и суждение,
+    записанное под ним, выглядело бы выданным по классу, которого уже нет.
+    """
+    task_id = await _draft(db, clone, title="risk moves")
+    await _ac(db, task_id, "AC-1", test_ref="tests/test_x.py::test_present")
+
+    before = await build_draft_packet(db, task_id)
+    assert before is not None
+    assert before.fact("risk_class").value["stored"] == "R2"
+    assert before.readiness == {"score": 94, "dor_passed": True, "computed": True}
+
+    await repo.update_task(
+        db,
+        task_id,
+        risk_class="R3",
+        risk_class_reasons=json.dumps(["R3: миграция"]),
+        readiness_score=40,
+        dor_passed=0,
+    )
+    await db.commit()
+
+    after = await build_draft_packet(db, task_id)
+    assert after is not None
+    assert after.fact("risk_class").value["stored"] == "R3"
+    assert after.readiness == {"score": 40, "dor_passed": False, "computed": True}
+    # Постановку не трогали: её поколение и её отпечаток стоят на месте —
+    # и правы. Двинуться обязана та половина отпечатка, что про задачу.
+    assert before.statement_generation == after.statement_generation
+    assert before.revision["statement"] == after.revision["statement"]
+    assert before.revision["task"] != after.revision["task"]
+
+
+async def test_state_moving_outside_the_statement_is_not_sold_as_one_revision(
+    db: aiosqlite.Connection, clone: Path, collection, monkeypatch
+):
+    """Смесь двух состояний в одном пакете — и ``stable=True`` поверх неё.
+
+    Сборка читает задачу ДО брифа, а зависимости — ПОСЛЕ. Правка, попавшая
+    в это окно и не тронувшая постановку, давала пакет, в котором класс
+    риска был из состояния ДО, а статус блокера — из состояния ПОСЛЕ.
+    Отпечаток обеих правок не видел, пересборка не запускалась, и пакет
+    заявлял ``stable=True``: смесь продавалась стюарду как одна ревизия.
+    Замерено до правки — ``risk_class=R2`` в пакете при ``R3`` в базе рядом
+    с блокером ``in_progress``.
+    """
+    task_id = await _draft(db, clone, title="mixed state")
+    await _ac(db, task_id, "AC-1", test_ref="tests/test_x.py::test_present")
+    blocker = await _draft(db, clone, title="mixed state blocker")
+    await repo.add_task_dependency(db, task_id, blocker)
+    await db.commit()
+
+    import hub.services.review_brief as rb
+
+    real = rb.build_review_brief
+    fired: list[int] = []
+
+    async def racing(db_, tid, *args, **kwargs):
+        if not fired:
+            fired.append(1)
+            await repo.update_task(db_, tid, risk_class="R3")
+            await repo.update_task(db_, blocker, status="in_progress")
+            await db_.commit()
+        return await real(db_, tid, *args, **kwargs)
+
+    monkeypatch.setattr(rb, "build_review_brief", racing)
+
+    packet = await build_draft_packet(db, task_id)
+
+    assert packet is not None
+    row = dict(await repo.get_task(db, task_id))
+    # Не смесь: обе половины из ОДНОГО состояния — того, что в базе.
+    assert packet.fact("risk_class").value["stored"] == row["risk_class"] == "R3"
+    assert (
+        packet.fact("dependency_state").value["blocked_by"][0]["status"]
+        == "in_progress"
+    )
+    assert packet.stable is True
+    assert draft_packet_payload(packet)["stable"] is True
+
+
+def test_every_task_column_the_packet_reads_is_in_the_stamp():
+    """Полнота отпечатка — перечислением по КОДУ, а не по памяти автора.
+
+    Прошлая редакция перечисляла покрытое руками, и ровно поэтому класс
+    риска, готовность и статус блокера из отпечатка выпали. Список, который
+    надо помнить, забывается; поэтому колонки вычитываются из самого модуля
+    разбором его дерева, и поле, дописанное завтра и забытое в
+    ``PACKET_TASK_COLUMNS``, роняет этот тест, а не суждение стюарда.
+
+    Покрытым считается либо вход в ``STATEMENT_FIELDS`` (эти колонки держит
+    отпечаток постановки #1156), либо вход в ``PACKET_TASK_COLUMNS``.
+    """
+    import ast
+
+    from hub.services.statement_generation import STATEMENT_FIELDS
+
+    source = Path(steward_dor_packet.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    def _strings(node: ast.AST) -> tuple[str, ...] | None:
+        if isinstance(node, ast.Tuple | ast.List) and all(
+            isinstance(e, ast.Constant) and isinstance(e.value, str) for e in node.elts
+        ):
+            return tuple(e.value for e in node.elts)  # type: ignore[attr-defined]
+        return None
+
+    # Модульные кортежи строк — из них разворачиваются имена.
+    consts: dict[str, tuple[str, ...]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign | ast.Assign):
+            targets = (
+                [node.target] if isinstance(node, ast.AnnAssign) else list(node.targets)
+            )
+            values = _strings(node.value) if node.value is not None else None
+            if values is None:
+                continue
+            for t in targets:
+                if isinstance(t, ast.Name):
+                    consts[t.id] = values
+
+    # Имена, связанные обходом модульного кортежа: `for c in CONST` и то же
+    # самое внутри включения. Без этого `task.get(c)` осталось бы дырой.
+    bound: dict[str, tuple[str, ...]] = {}
+    for node in ast.walk(tree):
+        target, it = None, None
+        if isinstance(node, ast.For):
+            target, it = node.target, node.iter
+        elif isinstance(node, ast.comprehension):
+            target, it = node.target, node.iter
+        if (
+            isinstance(target, ast.Name)
+            and isinstance(it, ast.Name)
+            and it.id in consts
+        ):
+            bound[target.id] = consts[it.id]
+
+    read: set[str] = set()
+    unresolved: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if not (
+            isinstance(fn, ast.Attribute)
+            and fn.attr == "get"
+            and isinstance(fn.value, ast.Name)
+            and fn.value.id == "task"
+        ):
+            continue
+        arg = node.args[0] if node.args else None
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            read.add(arg.value)
+        elif isinstance(arg, ast.Name) and arg.id in bound:
+            read.update(bound[arg.id])
+        else:
+            unresolved.append(ast.dump(arg) if arg is not None else "<нет аргумента>")
+
+    # Нераспознанное обращение — это дыра, а не повод промолчать: колонка,
+    # которую тест не сумел назвать, не покрыта и отпечатком.
+    assert not unresolved, unresolved
+    # Защита от вырождения: переименовали переменную — тест обязан заметить,
+    # что читать стало нечего, а не позеленеть на пустом множестве.
+    assert {"risk_class", "dor_passed", "affected_areas"} <= read, read
+
+    covered = set(STATEMENT_FIELDS) | set(PACKET_TASK_COLUMNS)
+    assert read <= covered, read - covered

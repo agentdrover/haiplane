@@ -102,6 +102,31 @@ if _outside:  # pragma: no cover — падает при импорте, до л
         f"allowed: {', '.join(STEWARD_GROUND_SOURCES)}"
     )
 
+# Поля постановки, которые едут стюарду ЦИТАТОЙ (#1076). Названы константой, а
+# не литералом в цикле, чтобы отпечаток ревизии и проверка его полноты читали
+# тот же список, что и сборщик цитат, а не похожий на него.
+QUOTED_STATEMENT_COLUMNS: tuple[str, ...] = (
+    "description",
+    "user_story",
+    "problem_statement",
+)
+
+# Колонки задачи, которые пакет ОТДАЁТ стюарду и которых нет в отпечатке
+# постановки #1156. ``statement_fingerprint`` считает ревизии ПОСТАНОВКИ и
+# собран из ``STATEMENT_FIELDS``; класс риска, его признаки, счёт готовности и
+# автор в этот набор не входят — их пишет хаб или путь готовности, а не правка
+# постановки. Пакет их тем не менее НЕСЁТ, и отпечаток, который их не покрывает,
+# объявляет два разных состояния одним.
+PACKET_TASK_COLUMNS: tuple[str, ...] = (
+    "assigned_agent",
+    "dor_passed",
+    "readiness_score",
+    "risk_class",
+    "risk_class_reasons",
+    "source",
+    "statement_generation",
+)
+
 # Причины отсутствия — кодами, чтобы привратник ветвился на них, а не разбирал
 # прозу; человеческая формулировка едет рядом в ``detail``.
 NO_ACCEPTANCE_CRITERIA = "no_acceptance_criteria"
@@ -452,7 +477,7 @@ def _authored_texts(
     поле.
     """
     out: list[tuple[str, str]] = []
-    for column in ("description", "user_story", "problem_statement"):
+    for column in QUOTED_STATEMENT_COLUMNS:
         text = (task.get(column) or "").strip()
         if text:
             out.append((QUOTE_TASK_STATEMENT, text))
@@ -510,6 +535,21 @@ def _readiness(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _digest(payload: Any) -> str:
+    """Устойчивый отпечаток куска состояния.
+
+    ``default=str`` — чтобы значение неожиданного типа НЕ роняло сборку
+    доказательств: пакет не имеет права падать оттого, что в колонке лежит
+    что-то непривычное. sha256 здесь не про безопасность, а про длину и
+    отсутствие коллизий на человеческих объёмах.
+    """
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
 async def _revision_stamp(db: aiosqlite.Connection, task_id: int) -> dict[str, Any]:
     """Отпечаток состояния, о котором пакет собирается говорить.
 
@@ -529,22 +569,48 @@ async def _revision_stamp(db: aiosqlite.Connection, task_id: int) -> dict[str, A
     (#1156); правка, прошедшая мимо него, оставит колонку прежней. Отпечаток,
     который не двигается при изменившемся содержимом, хуже отсутствующего:
     он утверждает неизменность.
+
+    ЗАЧЕМ ЦЕЛИКОМ, А НЕ ПО ДВУМ ПОЛЯМ. Прошлая редакция хешировала у блокера
+    ровно номер задачи и признак доставленности, а у задачи — ничего, кроме
+    постановки. Пакет при этом отдаёт стюарду СТАТУС блокера и причину
+    недоставки, класс риска с признаками и счёт готовности: ни одно из этих
+    полей в отпечаток не входило, и два состояния, различающиеся любым из них,
+    давали ОДИН отпечаток. Замерено на этом коде: блокер ``open`` →
+    ``in_progress`` при неизменном ребре, ``R2`` → ``R3`` и готовность 94/пройдена
+    → 40/не пройдена — факты разные, отпечатки посимвольно равные. И потому же
+    гонка внутри сборки не ловилась вовсе: пакет уносил класс ДО правки рядом со
+    статусом блокера ПОСЛЕ неё и объявлял себя ``stable=True``, то есть выдавал
+    смесь двух состояний за одну ревизию.
+
+    Поэтому отпечаток берётся по ВСЕМУ, о чём пакет говорит: рёбра целиком, как
+    их отдаёт репозиторий (#485), и каждая колонка, которую пакет читает мимо
+    ``STATEMENT_FIELDS`` (``PACKET_TASK_COLUMNS``). Полнота этого списка
+    проверяется тестом, который вычитывает обращения к колонкам из самого
+    модуля, — а не добросовестностью того, кто заведёт следующее поле.
+
+    Лишняя чувствительность здесь дешевле недостаточной: отпечаток, дрогнувший
+    зря, стоит одной пересборки, а в пределе — честного ``stable=False``.
+    Отпечаток, не дрогнувший вовремя, стоит одобрения, выданного по состоянию,
+    которого уже нет.
     """
     from hub.services.statement_generation import statement_fingerprint
 
     row = await repo.get_task(db, task_id)
     task = dict(row) if row is not None else {}
     edges = await repo.list_task_dependencies(db, task_id)
-    blocked_by = sorted(
-        (int(e.get("task_id") or 0), bool(e.get("delivered")))
-        for e in edges.get("blocked_by", [])
-    )
     return {
         "statement_generation": int(task.get("statement_generation") or 0),
         "statement": await statement_fingerprint(db, task_id),
-        "dependencies": hashlib.sha256(
-            json.dumps(blocked_by, sort_keys=True).encode("utf-8")
-        ).hexdigest(),
+        "task": _digest({c: task.get(c) for c in PACKET_TASK_COLUMNS}),
+        # Рёбра целиком: статус и причина едут стюарду внутри факта, значит и в
+        # отпечаток входят. Порядок задаёт запрос (ORDER BY t.id), но сортировка
+        # повторена здесь: порядок строк — свойство запроса, а не отпечатка.
+        "dependencies": _digest(
+            sorted(
+                (dict(e) for e in edges.get("blocked_by", [])),
+                key=lambda e: int(e.get("task_id") or 0),
+            )
+        ),
     }
 
 
@@ -685,7 +751,9 @@ __all__ = [
     "NO_ACCEPTANCE_CRITERIA",
     "NO_DECLARED_AREAS",
     "NO_STORED_CLASS",
+    "PACKET_TASK_COLUMNS",
     "PRESENT",
+    "QUOTED_STATEMENT_COLUMNS",
     "DraftEvidencePacket",
     "build_draft_packet",
     "draft_packet_payload",
