@@ -277,6 +277,36 @@ def _report_outcome_of(mr) -> dict:
     }
 
 
+async def _report_of_generation(
+    db: aiosqlite.Connection, task_id: int, generation: int | None
+):
+    """Отчёт ТОГО поколения, о котором вынесен вердикт (#1234).
+
+    Здесь стоял ``get_latest_machine_review`` — «самый свежий отчёт задачи».
+    Свежесть и поколение события совпадают ровно до первого расхождения: если
+    после вердикта, но до полуночного дайджеста, ляжет ещё один отчёт (добор
+    лестницы #879 кладёт второй прямо в то же поколение, пересдача — в
+    следующее), дайджест припишет более раннему вердикту чужую ступень и
+    чужого ревьюера. Это ровно та подмена, против которой написан весь
+    раздел: под автовердиктом по неразрешённым находкам показался бы «clean»
+    от следующего, чистого отчёта.
+
+    Поколение у события своё — ``submission_generation`` пишется вместе с
+    вердиктом, — и берётся отсюда, а не из сегодняшнего состояния задачи.
+
+    Поколения не оказалось (событие старше поля) — отчёт НЕ подбирается по
+    свежести: «не знаю, о каком диффе вердикт» отвечается отсутствием отчёта,
+    и дайджест печатает «отчёта нет». Догадка здесь дороже пустоты — пустота
+    видна, а подставленный чужой отчёт читается как свой.
+    """
+    if not generation:
+        return None
+    rows = await repo.machine_reviews_of_generation(db, task_id, int(generation))
+    # Последний ИЗ СВОЕГО поколения: лестница добора (#879) кладёт в одно
+    # поколение два отчёта, и вердикт выносится после второго.
+    return rows[-1] if rows else None
+
+
 async def _steward_entry(db: aiosqlite.Connection, entry: dict, payload: dict) -> dict:
     """One steward decision the way the digest must show it: WITH its grounds.
 
@@ -389,7 +419,12 @@ async def generate_due_digests(
                 # Model diversity (#758): the digest shows WHO wrote and WHO
                 # reviewed — the pair the monoculture rule compares.
                 task_row = await repo.get_task(db, event["task_id"])
-                mr = await repo.get_latest_machine_review(db, event["task_id"])
+                # Отчёт СВОЕГО поколения, а не самый свежий (#1234): иначе
+                # отчёт, легший после вердикта, подменяет собой тот, под
+                # которым вердикт вынесен.
+                mr = await _report_of_generation(
+                    db, event["task_id"], payload.get("submission_generation")
+                )
                 entry["models"] = {
                     "implementer": (
                         dict(task_row).get("submission_model", "") if task_row else ""
