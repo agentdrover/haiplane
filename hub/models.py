@@ -793,6 +793,15 @@ class LiveCheckState(BaseModel):
 
     ``sha_mismatch`` names the case the card must not hide: the observation
     exists but was taken against another build than the one delivered.
+
+    ``deploy_state`` is the OTHER half of that question, and it is not the
+    same one (#837, #1231 review). The sha says which commit the observer
+    named; this says whether the hub could confirm that commit is what
+    production runs — ``in_prod``, ``unknown`` when the hub has no delivery
+    facts to check against, or empty for rows written before the check
+    existed. Recording an unverified observation is deliberate: an
+    installation that knows nothing about production must not have its
+    ignorance turned into a gate. Reading it as confirmation is not.
     """
 
     state: str = "unknown"
@@ -802,6 +811,7 @@ class LiveCheckState(BaseModel):
     sha: str = ""
     delivered_sha: str = ""
     sha_mismatch: bool = False
+    deploy_state: str = ""
     recorded_agent: str = ""
     created_at: str = ""
 

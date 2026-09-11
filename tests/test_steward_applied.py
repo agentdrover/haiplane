@@ -1098,3 +1098,72 @@ async def test_a_converged_submission_applies_without_a_human_on_the_live_path(
     )
     lines = await _steward_lines(db, task_id)
     assert lines and "Одобрено стюардом без человека" in lines[0]
+
+
+async def test_an_unverified_deployment_is_not_a_live_check(db: aiosqlite.Connection):
+    """Совпавший sha не отвечает на вопрос «а доехал ли этот коммит до прода».
+
+    ``record_live_check`` СОЗНАТЕЛЬНО принимает наблюдение с
+    ``deploy_state='unknown'`` (#837): установка без фактов о доставке ничего
+    не знает про прод, и отказ там превратил бы незнание в гейт. Но принятая
+    запись — не подтверждённая: хаб прямо сказал, что не смог убедиться, что
+    наблюдали именно выкаченный код.
+
+    Sha здесь не спасает, и это главное в находке: его присылает ТОТ ЖЕ
+    вызывающий, что и наблюдение, а вопрос не «тот ли коммит назвали», а
+    «доехал ли он». Проверяются оба ответа сразу — неподтверждённая доставка
+    запрещает, подтверждённая пропускает, — иначе сторож, отказывающий
+    всегда, выглядел бы работающим.
+    """
+    from hub.services.review_evidence import live_check_state
+
+    project_id = await _project(db, "live-check-deploy")
+    manual_ac = AcceptanceCriterion(
+        id="AC-9",
+        given="раскатано",
+        when="смотрят прод",
+        then="ручка отвечает",
+        verifiable_by=ACVerifiableBy.manual,
+    )
+
+    async def _decide_with(deploy_state: str) -> SelfApproval:
+        task_id = await _client_task(db, project_id)
+        await repo.insert_live_check(
+            db,
+            task_id=task_id,
+            sha=_SHA_1231,
+            outcome="done",
+            probe="curl /healthz",
+            observation="200 OK",
+            deploy_state=deploy_state,
+        )
+        raw = await live_check_state(
+            db, task_id, delivered_sha=await repo.merge_sha_for_task(db, task_id)
+        )
+        assert raw["state"] == "done" and raw["sha"] == _SHA_1231, (
+            "запись про ТОТ САМЫЙ коммит: расхождение sha здесь ни при чём"
+        )
+        return self_approval(
+            _brief(
+                acceptance_criteria=[_brief().acceptance_criteria[0], manual_ac],
+                live_check=LiveCheckState(**raw),
+            ),
+            diff_paths=["hub/services/x.py"],
+            reviewer_reachable=True,
+        )
+
+    unverified = await _decide_with("unknown")
+    assert not unverified.allowed, (
+        "хаб не подтвердил выкат — наблюдение не говорит о раскатанном коде"
+    )
+    assert [code for code, _ in unverified.forbidden] == ["live_check_unknown"]
+    assert "выкат" in unverified.forbidden[0][1], (
+        "отказ обязан назвать ИМЕННО доставку, а не коммит: ветки про sha и "
+        "ветка про выкат чинятся по-разному"
+    )
+    assert unverified.missing == (), "признаки сошлись все — это запрет, а не пробел"
+
+    # Запись, которую хаб сверил с выкатом, проходит. Без этой половины
+    # сторож, отказывающий всегда, был бы неотличим от работающего.
+    verified = await _decide_with("in_prod")
+    assert verified.allowed, verified.reason
