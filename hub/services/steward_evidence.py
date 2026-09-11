@@ -407,12 +407,25 @@ async def _base_fact(db: aiosqlite.Connection, project_row: Any | None) -> Evide
     )
 
 
-async def _dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFact:
-    """What this task waits for, judged by DELIVERY rather than status (#484/#485)."""
+async def dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFact:
+    """What this task waits for, judged by DELIVERY rather than status (#484/#485).
+
+    Public because the draft packet (#1158) assembles the same fact from the
+    same edges: two builders of one source would drift, and a steward reading
+    "blocked by nothing" from two different computations could not be told
+    which one it read.
+
+    Delivery is read from the ``delivered`` key the repository already put on
+    the edge (#485). It used to be recomputed here from ``merges``, a column
+    ``_blocker_entry`` pops on its way out — so ``get`` always answered None,
+    every blocker came back undelivered, and a task whose blockers had all
+    landed still read "не доставлено N". The steward would have refused a
+    ready draft on a fact the hub itself contradicts.
+    """
     source = "dependency_state"
     edges = await repo.list_task_dependencies(db, task_id)
     blocked_by = [dict(e) for e in edges.get("blocked_by", [])]
-    undelivered = [e for e in blocked_by if not (e.get("merges") or 0)]
+    undelivered = [e for e in blocked_by if not e.get("delivered")]
     return present(
         source,
         f"блокеров {len(blocked_by)}, не доставлено {len(undelivered)}",
@@ -420,7 +433,11 @@ async def _dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFa
             {
                 "task_id": e.get("task_id"),
                 "status": e.get("status"),
-                "delivered": bool(e.get("merges") or 0),
+                "delivered": bool(e.get("delivered")),
+                # Почему не доставлено: «PR не заявлен» и «PR не смержен
+                # гейтом» — разные следующие шаги, и репозиторий их уже
+                # различил (#485).
+                "reason": e.get("reason") or "",
             }
             for e in blocked_by
         ],
@@ -468,7 +485,7 @@ async def build_evidence_packet(
             await _risk_fact(db, task, diff_paths, diff_reason),
             _locator_fact(brief),
             await _base_fact(db, project_row),
-            await _dependency_fact(db, task_id),
+            await dependency_fact(db, task_id),
         ]
     }
     return EvidencePacket(
@@ -548,6 +565,18 @@ def _quotes(
 QUOTE_TASK_STATEMENT = "task_statement"
 QUOTE_SUBMISSION_SUMMARY = "submission_summary"
 QUOTE_REVIEW_FINDING = "review_finding"
+# Драфтовые входы (#1158). Их объединяет не место в схеме, а происхождение:
+# строку набрал автор постановки, а хаб её только ПЕРЕНОСИТ в факт. Перенос
+# делает такую строку похожей на вычисление хаба, и ровно поэтому она обязана
+# ехать ещё и цитатой: иначе пакет утверждает "подозрений нет" про текст,
+# который никто не смотрел.
+QUOTE_AC_TEST_REF = "ac_test_ref"
+QUOTE_DECLARED_AREA = "declared_area"
+# Предложение про класс риска составляет хаб, но в скобки он вставляет
+# заявленные области ДОСЛОВНО. Авторская здесь половина, и цитируется
+# предложение целиком: резать хабовскую рамку от авторской вставки значило бы
+# завести второй разбор той же строки.
+QUOTE_RISK_CLASS_REASON = "risk_class_reason"
 
 # Each signal is (code, matcher). Two shapes only, both about ADDRESSING the
 # judge — not about tone, not about imperatives in general. A statement telling
