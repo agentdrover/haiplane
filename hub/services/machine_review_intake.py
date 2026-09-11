@@ -335,4 +335,24 @@ async def record_machine_review(
     except Exception:  # noqa: BLE001 - degradation is the contract
         log.exception("review top-up failed for task #%s", task_id)
 
+    # Механический шаг (#1234): прежде чем оставить задачу ждать человека,
+    # хаб разбирает неразрешённые находки тем, что умеет сам. ПОСЛЕ вердикта
+    # и добора и по той же причине, по которой добор стоит после вердикта:
+    # это последнее, что происходит перед ожиданием человека, и по отчёту без
+    # неразрешённых находок проход не делает ничего.
+    #
+    # Здесь, а не в роутере: отчёт приезжает двумя дверями — по контракту MCP
+    # и переписанным из текста прогона (#1036, #1180), — и шаг, повешенный на
+    # одну из них, не выполнялся бы для второй. Ровно так же, как автовердикт.
+    #
+    # Best-effort по тому же контракту, что и два вызова выше: приём отчёта не
+    # имеет права упасть из-за шага. Молчаливой деградации при этом нет — исход
+    # каждой находки пишется событием, и его отсутствие видно счётом.
+    try:
+        from hub.services.mechanical_pass import mechanical_pass_after_report
+
+        await mechanical_pass_after_report(db, task_id)
+    except Exception:  # noqa: BLE001 - degradation is the contract
+        log.exception("mechanical step failed for task #%s", task_id)
+
     return view

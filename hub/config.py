@@ -288,6 +288,23 @@ LOCAL_REVIEW_TIMEOUT_SEC = int(env_get("LOCAL_REVIEW_TIMEOUT_SEC", "1800"))
 # сумме уже потраченного на ЭТУ задачу: без него автозапуск обошёл бы механизм
 # экономии #1152 с другой стороны.
 LOCAL_REVIEW_TOKEN_CEILING = int(env_get("LOCAL_REVIEW_TOKEN_CEILING", "2000000"))
+
+# Живой прогон механического шага (#1234): применить мутацию, названную
+# находкой, и прогнать набор. ТА ЖЕ дисциплина, что у локального ревьюера
+# выше, и по той же причине: набор проекта — чужой код, и запускать его на
+# хосте хаба по умолчанию нельзя.
+#
+# MUTATION_PROBE_CMD — argv команды набора (shlex), например
+# "uv run pytest -q -rf". Пустая означает «живого прогона нет», и шаг тогда
+# возвращает STEP_NO_RUN: находка едет человеку с НАЗВАННОЙ мутацией, а не с
+# выдуманным «набор зелёный». Молчаливого «сойдёт» здесь нет ни в одну
+# сторону.
+MUTATION_PROBE_CMD = env_get("MUTATION_PROBE_CMD", "")
+# База для одноразовых песочниц шага. Пустая — системный временный каталог.
+MUTATION_PROBE_SCRATCH_DIR = env_get("MUTATION_PROBE_SCRATCH_DIR", "")
+# Потолок по времени на ОДИН прогон. Шаг дешёвый или его нет: находка,
+# упёршаяся в потолок, едет человеку как есть.
+MUTATION_PROBE_TIMEOUT_SEC = int(env_get("MUTATION_PROBE_TIMEOUT_SEC", "1800"))
 # Review profiles (#807). The lite profile reviews the branch diff in one
 # pass; deep is the multi-agent harness.
 #

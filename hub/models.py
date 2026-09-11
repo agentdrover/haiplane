@@ -2630,6 +2630,18 @@ class MachineReviewView(BaseModel):
     # What the gate said each confirmed finding turned out to be (#876). An
     # empty list means nobody judged them — never that they were all fine.
     dispositions: list[FindingDispositionView] = Field(default_factory=list)
+    # На какой ступени лестницы исходов стоит отчёт (#1234), и что об этой
+    # ступени печатают. Поля, а не свойства: читатели — карточка, дайджест и
+    # квитанция MCP, и последняя видит модель уже сериализованной в JSON, где
+    # свойства не доезжают. Штампуются на выходе тем же приёмом, что и
+    # finding_uid: ступень — функция содержимого отчёта, и хранимая копия
+    # могла бы разъехаться с содержимым, которое описывает.
+    outcome: str = ""
+    outcome_label: str = ""
+    #: Имеет ли эта ступень право называться чистотой. Отдельным полем, чтобы
+    #: шаблон не сравнивал строки сам: сравнение, повторённое в трёх
+    #: поверхностях, — это ровно то, как «0 подтверждённых» стало «чисто».
+    outcome_names_clean: bool = False
 
     @field_validator("created_at", mode="before")
     @classmethod
@@ -2656,6 +2668,37 @@ class MachineReviewView(BaseModel):
         # found, and none of them could be addressed at all.
         for record, uid in zip(self.unresolved, unresolved_uids(self.unresolved)):
             record.finding_uid = uid
+        return self
+
+    @model_validator(mode="after")
+    def _stamp_report_outcome(self) -> "MachineReviewView":
+        """Поставить отчёту его ступень лестницы исходов (#1234).
+
+        Здесь, а не в каждой поверхности: карточка, дайджест и квитанция
+        ревью читали «0 подтверждённых» и печатали чистоту, пока
+        ``unresolved`` был непустым. Один расчёт на трёх читателей — то же
+        решение и по той же причине, что свело пять громких оснований в
+        ``gate_grounds`` (#1147): второй список рядом с первым разъезжается,
+        и разъезжается тот, который мягче.
+        """
+        from hub.services.steward_corridor import (
+            names_clean,
+            outcome_label,
+            report_outcome,
+        )
+
+        # ``incomplete is None`` значит «полнота не заявлена», а не «прогон
+        # полный»: обратное back-fill'ило бы утверждение в отчёты, которые
+        # его не делали (#549). Ступени «не заявлено» здесь не заводится —
+        # это отдельный флаг, который карточка показывает своим бейджем.
+        self.outcome = report_outcome(
+            confirmed=self.findings_confirmed,
+            unresolved=self.unresolved,
+            incomplete=self.incomplete is True,
+            raw_count=self.raw_count,
+        )
+        self.outcome_label = outcome_label(self.outcome)
+        self.outcome_names_clean = names_clean(self.outcome)
         return self
 
     @field_validator(

@@ -2934,10 +2934,20 @@ async def hub_submit_machine_review(
         if result.get("self_reviewed")
         else ""
     )
+    # #1234: «0 confirmed / N rejected» — это счёт, а не исход, и при непустом
+    # unresolved агент читал его как чистоту и цитировал в задачу. Ступень
+    # берётся из СОХРАНЁННОЙ строки — по тому же правилу, что и числа выше:
+    # квитанция описывает запись, а не то, что в неё отправляли. Поле, а не
+    # свойство модели, именно ради этого места: сюда отчёт доезжает уже
+    # сериализованным в JSON.
+    outcome_note = ""
+    outcome_label = str(result.get("outcome_label") or "")
+    if outcome_label:
+        outcome_note = f" Исход отчёта: {outcome_label}."
     return structured_echo_result(
         f"Machine review for task #{task_id} recorded (submission "
         f"#{result.get('submission_generation')}): {stored_raw} raw → "
-        f"{confirmed} confirmed / {rejected} rejected.{self_note}",
+        f"{confirmed} confirmed / {rejected} rejected.{outcome_note}{self_note}",
         machine_review=result,
     )
 
