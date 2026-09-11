@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import aiosqlite
+import pytest
 
 from hub import repository as repo
 from hub.models import (
+    STATEMENT_DEFECTS,
     AgentFit,
     RedesignDecision,
     ACVerifiableBy,
@@ -23,10 +25,16 @@ from hub.services.readiness import DEFAULT_CONFIG, ReadinessConfig
 from hub.services.recommendations import (
     CHECK_RECOMMENDATIONS,
     SEVERITY_ORDER,
+    STATEMENT_DEFECT_PRODUCERS,
+    StatementInputs,
     build_ac_quality_warnings,
+    build_affected_area_warnings,
     build_for_task,
+    build_outcome_metric_warnings,
     build_recommendations,
+    build_scope_coverage_warnings,
     calculate_readiness_with_recommendations,
+    run_statement_defect_producers,
 )
 
 
@@ -382,9 +390,9 @@ def test_build_ac_quality_warnings_unit():
             "then_clause": "a CSV download starts within 2 seconds",
         }
     ]
-    assert len(build_ac_quality_warnings(thin_rows)) == 1
-    assert build_ac_quality_warnings(good_rows) == []
-    assert build_ac_quality_warnings([]) == []
+    assert len(build_ac_quality_warnings(StatementInputs(ac_rows=thin_rows))) == 1
+    assert build_ac_quality_warnings(StatementInputs(ac_rows=good_rows)) == []
+    assert build_ac_quality_warnings(StatementInputs()) == []
 
 
 def test_build_ac_quality_warnings_detects_long_placeholder():
@@ -399,7 +407,7 @@ def test_build_ac_quality_warnings_detects_long_placeholder():
             "then_clause": "a substantive outcome clause here too",
         }
     ]
-    warnings = build_ac_quality_warnings(placeholder_rows)
+    warnings = build_ac_quality_warnings(StatementInputs(ac_rows=placeholder_rows))
     assert len(warnings) == 1
     assert "AC-9" in warnings[0].message
 
@@ -413,3 +421,609 @@ async def test_score_after_applying_all_recommendations_returns_to_max(
     report = await calculate_readiness_with_recommendations(db, task_id)
     total_recoverable = sum(r.expected_score_delta for r in report.recommendations)
     assert report.score + total_recoverable == 100
+
+
+# --- #1172: closed vocabulary of statement defects ---
+
+
+async def _project_with_workspace(db: aiosqlite.Connection, workspace) -> int:
+    """Point the fallback 'default' project at a real working copy.
+
+    resolve_project_for_task falls back to the 'default' slug for tasks
+    outside any epic, so this is the project the readiness read will resolve.
+    """
+    existing = await repo.get_project_by_slug(db, "default")
+    if existing is not None:
+        await repo.update_project(db, existing["id"], workspace_path=str(workspace))
+        await db.commit()
+        return int(existing["id"])
+    project_id = await repo.create_project(
+        db, slug="default", name="default", workspace_path=str(workspace)
+    )
+    await db.commit()
+    return project_id
+
+
+def _row(ac_id: str, given: str, when: str, then: str, source=None) -> dict:
+    row = {
+        "ac_id": ac_id,
+        "given": given,
+        "when_clause": when,
+        "then_clause": then,
+    }
+    if source is not None:
+        row["expectation_source"] = source
+    return row
+
+
+def _inputs_firing_every_producer(repo_path: str) -> StatementInputs:
+    """Inputs chosen so that EVERY producer emits at least one warning."""
+    return StatementInputs(
+        ac_rows=[
+            # thin clauses -> ac_clause_thin; no source key -> unstated
+            _row("AC-1", "g", "w", "t"),
+            # expectation taken from the code -> is_implementation
+            _row(
+                "AC-2",
+                "a substantive precondition clause",
+                "a substantive action clause",
+                "a substantive outcome clause",
+                source="implementation",
+            ),
+        ],
+        scope_in=["Закрытый словарь дефектов постановки"],
+        affected_areas=["hub/services/nothing_like_this.py"],
+        outcome_metric="улучшить качество постановок",
+        repo_path=repo_path,
+    )
+
+
+def test_every_producer_speaks_the_closed_vocabulary(tmp_path):
+    """AC-1: enumerate the producers, do not sample one.
+
+    A producer that emits a bare string instead of a code is a second way to
+    name a statement defect, and the count by code goes silently incomplete.
+    Only enumeration catches that; an example would pass while the new
+    producer stayed mute.
+    """
+    inputs = _inputs_firing_every_producer(str(tmp_path))
+
+    seen: set[str] = set()
+    for producer in STATEMENT_DEFECT_PRODUCERS:
+        produced = producer(inputs)
+        assert produced, (
+            f"{producer.__name__} produced nothing on inputs built to fire it"
+        )
+        for rec in produced:
+            assert rec.defect_code is not None, (
+                f"{producer.__name__} emitted a warning with no code: {rec.message!r}"
+            )
+            assert rec.defect_code in STATEMENT_DEFECTS
+            seen.add(rec.defect_code)
+
+    # Every code has a producer, and no producer speaks outside the tuple.
+    assert seen == set(STATEMENT_DEFECTS)
+
+    # And the registry is the ONLY door: a warning builder added to the module
+    # but left out of STATEMENT_DEFECT_PRODUCERS would never be enumerated
+    # above, so check the module itself rather than trusting the tuple.
+    import hub.services.recommendations as module
+
+    registered = {p.__name__ for p in STATEMENT_DEFECT_PRODUCERS}
+    declared = {
+        name
+        for name in dir(module)
+        if name.startswith("build_") and name.endswith("_warnings")
+    }
+    assert declared == registered, (
+        f"warning producers outside the registry: {declared - registered}"
+    )
+
+    # The aggregator is exactly the producers and nothing else: it must not
+    # become a place where a warning is built directly.
+    assert run_statement_defect_producers(inputs) == [
+        rec for producer in STATEMENT_DEFECT_PRODUCERS for rec in producer(inputs)
+    ]
+
+
+def test_a_code_outside_the_vocabulary_is_not_a_defect_name():
+    """A string outside STATEMENT_DEFECTS is refused, not stored.
+
+    This is what keeps the dictionary closed: without the refusal, a producer
+    could invent a name, the value would round-trip through the API, and the
+    count by code would be quietly incomplete.
+    """
+    import pytest
+
+    with pytest.raises(ValueError):
+        Recommendation(
+            field="scope_in",
+            severity="low",
+            message="m",
+            defect_code="statement_is_bad",
+        )
+    # None stays legal: most recommendations report a missing field, which is
+    # not a defect in what was written.
+    assert (
+        Recommendation(field="scope_in", severity="low", message="m").defect_code
+        is None
+    )
+
+
+def test_a_scope_item_without_a_criterion_is_named():
+    """AC-2: a declared scope item no criterion looks at is named by name."""
+    covered = "Экспорт отчёта в CSV"
+    uncovered = "Закрытый словарь дефектов постановки"
+    inputs = StatementInputs(
+        scope_in=[uncovered, covered],
+        ac_rows=[
+            _row(
+                "AC-1",
+                "пользователь на странице задачи",
+                "он нажимает кнопку выгрузки",
+                "начинается выгрузка отчёта в формате CSV",
+                source="requirement",
+            )
+        ],
+    )
+    warnings = build_scope_coverage_warnings(inputs)
+    assert len(warnings) == 1
+    assert warnings[0].defect_code == "scope_item_without_criterion"
+    assert uncovered in warnings[0].message
+    # The covered item must stay out of the message: naming it would teach the
+    # author that the warning fires regardless of what he wrote.
+    assert covered not in warnings[0].message
+    assert warnings[0].severity == "low"
+    assert warnings[0].expected_score_delta == 0
+
+
+def _scope_and_criterion(scope_form: str, ac_form: str):
+    """One scope item and one criterion whose ONLY shared ground is the pair.
+
+    Both word-form tests below use it, so the pair itself is the only thing
+    that can decide the verdict: no other word of the item appears in the
+    criterion, and none of the frame words share an opening with the forms
+    under test.
+    """
+    item = f"Учёт {scope_form} без исключений"
+    row = _row(
+        "AC-1",
+        "дано условие",
+        "читается готовность",
+        f"назван {ac_form} и ничего кроме",
+        source="requirement",
+    )
+    return item, row
+
+
+# Word forms taken from LIVE Hub statements, not invented. Each pair is one
+# and the same word as authors actually wrote it in this backlog:
+#   сдаче / сдачи      — #1122, scope item and criterion of the same task
+#   гейтов / гейтам    — #1122, scope item and criterion of the same task
+#   зонда / зондом     — #1236, scope item and criterion of the same task
+#   пустого / пустым   — #1143, scope item and criterion of the same task
+#   поимённо / поименно — #1170 and #1161 write it with ё, #1144 without; the
+#       pair е/ё is the entire difference between the two spellings.
+#   отчёта / отчета    — «отчёта» is live (it is the wording of the AC-2
+#       fixture above and runs through the whole backlog); «отчета» is the
+#       same word without the ё. That this backlog does drop the ё is not a
+#       guess — «поименно» and «объявленный» are written both ways in it. The
+#       pair belongs here because its ё falls early enough to change the stem,
+#       which the поимённо pair does not.
+#   постановка / постановок — the word this backlog is named after; the
+#       genitive plural pushes an о back into the stem, and «-ка» nouns are
+#       what statements here are written in.
+#   находок / находкой — the same fleeting о, on the word the review process
+#       runs on.
+#   коммит / коммита   — a noun whose tail «ит» is also a verb ending; the
+#       matcher stemmed it to «комм» and stopped meeting its own oblique form.
+#   настройка / настроек — the same fleeting vowel, but after a vowel, where
+#       the plural also swallows the й of the stem. It is here because the
+#       mutation series found it: neutering the vowel branch of the rule left
+#       every other pair passing.
+#   изменённая / изменение — the long participle and the verbal noun; the
+#       doubled н is the whole difference between their stems. Also from the
+#       mutation series: deleting the collapse left all 51 other cases green.
+# The last three come from the machine review of this task, which reproduced
+# the miss on each of them against the producer, not against the stemmer.
+_LIVE_WORD_FORMS = [
+    ("сдаче", "сдачи"),
+    ("гейтов", "гейтам"),
+    ("зонда", "зондом"),
+    ("пустого", "пустым"),
+    ("поимённо", "поименно"),
+    ("отчёта", "отчета"),
+    ("постановка", "постановок"),
+    ("находок", "находкой"),
+    ("коммит", "коммита"),
+    ("настройка", "настроек"),
+    ("изменённая", "изменение"),
+]
+
+
+@pytest.mark.parametrize(("scope_form", "ac_form"), _LIVE_WORD_FORMS)
+def test_a_scope_item_covered_in_another_word_form_is_not_named(scope_form, ac_form):
+    """A criterion that uses the SAME word in another form covers the item.
+
+    The matcher removes the ending AS AN ENDING — it does not keep a prefix of
+    a guessed length; that algorithm was measured and discarded, and a reader
+    who restored it from this docstring would reopen the window it closed.
+    Where the ending tables do not reach, a covered item gets named — and
+    naming a covered item is the one failure this code exists to avoid,
+    because an author who sees the warning fire on work he did cover learns to
+    skip it.
+
+    The fixtures are deliberately narrow: apart from the pair under test, no
+    word of the scope item appears in the criterion, so the pair alone decides
+    the verdict.
+    """
+    item, covering = _scope_and_criterion(scope_form, ac_form)
+    assert (
+        build_scope_coverage_warnings(
+            StatementInputs(scope_in=[item], ac_rows=[covering])
+        )
+        == []
+    )
+
+    # Control: with a genuinely unrelated word the item IS still named. A
+    # producer that had simply fallen silent would not pass this half.
+    _, unrelated = _scope_and_criterion(scope_form, "реестр")
+    named = build_scope_coverage_warnings(
+        StatementInputs(scope_in=[item], ac_rows=[unrelated])
+    )
+    assert len(named) == 1
+    assert item in named[0].message
+
+
+# Pairs of DIFFERENT words that share their first four characters. The
+# opposite hazard to the list above: a matcher loose enough to survive
+# inflection must not be so loose that any two words with the same opening
+# count as one, or the check falls silent on a scope item nothing looks at —
+# which is the whole thing it exists to name.
+#
+# Provenance, honestly: the first five pairs are a scope word and a criterion
+# word of one and the same live task (#803 разбор/разбирает, #803 and #819
+# ответа/отвечает, #801 видимость/видит, #811 запрос/запрашивали, #812
+# факт/фактическое). Then задание/задача and словарь/слово, from the review
+# of this task, which reproduced the miss on them. Last, принят/принтер and
+# список/списание: those two guard the rules added for the SECOND review —
+# «принят» loses the verb ending «ят» and so keeps itself as a second reading,
+# and «список» loses its fleeting о. Neither loosening may reach a word that
+# is merely spelled alike — and both pairs share a root, which is the harder
+# case, not the easier one. Last, выше/вышел, which the mutation series
+# produced: handing EVERY word a second reading of itself makes «вышел» stem
+# to «выше» and swallow it, and those are two words.
+_DIFFERENT_WORDS = [
+    ("разбор", "разбирает"),
+    ("ответа", "отвечает"),
+    ("видимость", "видит"),
+    ("запрос", "запрашивали"),
+    ("факт", "фактическое"),
+    ("задание", "задача"),
+    ("словарь", "слово"),
+    ("принят", "принтер"),
+    ("список", "списание"),
+    ("выше", "вышел"),
+]
+
+
+@pytest.mark.parametrize(("scope_form", "ac_form"), _DIFFERENT_WORDS)
+def test_a_different_word_with_the_same_opening_does_not_cover_the_item(
+    scope_form, ac_form
+):
+    """Sharing four characters is not being the same word.
+
+    Both halves of the fixture are the same as in the inflection test above,
+    so the only thing that changes the verdict is the pair itself: there the
+    words are one word in two forms and the item is covered, here they are two
+    words and it is not.
+    """
+    item, row = _scope_and_criterion(scope_form, ac_form)
+    assert scope_form[:4] == ac_form[:4], "фикстура бессмысленна без общего начала"
+    named = build_scope_coverage_warnings(
+        StatementInputs(scope_in=[item], ac_rows=[row])
+    )
+    assert len(named) == 1, (
+        f"«{scope_form}» и «{ac_form}» — разные слова, пункт никем не покрыт"
+    )
+    assert item in named[0].message
+    assert named[0].expected_score_delta == 0
+
+
+def test_a_short_root_is_not_collapsed_onto_another_word():
+    """«сток» and «стек» are two words, and the floor is what keeps them so.
+
+    The fleeting vowel is dropped only from a stem long enough to survive it.
+    Without that floor «сток» becomes «стк» and «стек» becomes «стк» with it —
+    a check that names uncovered scope items would fall silent on a real one.
+    """
+    item, row = _scope_and_criterion("сток", "стек")
+    named = build_scope_coverage_warnings(
+        StatementInputs(scope_in=[item], ac_rows=[row])
+    )
+    assert len(named) == 1, "«сток» и «стек» — разные слова, пункт никем не покрыт"
+    assert item in named[0].message
+
+
+# The residual, written down instead of implied. The doubled н of the long
+# participle is collapsed, so «изменение» and «изменённая» are one word — but
+# the SHORT participle «изменена» loses «на» and stops one letter earlier.
+# Closing that needs the participle suffix н dropped from every stem, and
+# measured over this repository's own Russian text that also brings «выше»
+# together with «вышла». The charge is zero, so the cheaper miss is kept and
+# NAMED here: a residual nobody wrote down is a residual somebody will later
+# report as new.
+_UNREACHED_WORD_FORMS = [("изменённая", "изменена"), ("доставленная", "доставлена")]
+
+
+@pytest.mark.parametrize(("scope_form", "ac_form"), _UNREACHED_WORD_FORMS)
+def test_the_short_participle_is_a_known_miss_not_a_silent_one(scope_form, ac_form):
+    """These two ARE one word, and the matcher still names the item."""
+    item, covering = _scope_and_criterion(scope_form, ac_form)
+    named = build_scope_coverage_warnings(
+        StatementInputs(scope_in=[item], ac_rows=[covering])
+    )
+    assert len(named) == 1, (
+        f"«{scope_form}»/«{ac_form}» стали покрывать друг друга — "
+        "остаток закрыт, и этот тест пора заменить на обратный"
+    )
+    assert named[0].expected_score_delta == 0
+
+
+def test_a_scope_item_with_nothing_to_match_on_is_left_alone():
+    """No significant words -> no ground to judge; silence, not a warning."""
+    assert build_scope_coverage_warnings(StatementInputs(scope_in=["a"])) == []
+
+
+async def test_a_missing_area_is_named_and_never_blocks(
+    db: aiosqlite.Connection, tmp_path
+):
+    """AC-3: existing path, a typo of it, and a new file — end to end."""
+    existing = "hub/services/dor.py"
+    (tmp_path / "hub" / "services").mkdir(parents=True)
+    (tmp_path / "hub" / "services" / "dor.py").write_text("# real file\n")
+    typo = "hub/services/dor_apply.py"
+    new_file = "hub/services/statement_defects.py"
+
+    await _project_with_workspace(db, tmp_path)
+
+    payload = TaskCreate(
+        title="t",
+        user_story="us",
+        problem_statement="ps",
+        business_value="bv",
+        scope_in=["a"],
+        validation_commands=["pytest"],
+        size=TaskSize.S,
+        wip_tag=WipTag.feature_work,
+        affected_areas=[existing, typo, new_file],
+        outcome_metric="median lead time, 3d -> 1d",
+        redesign_decision=RedesignDecision.adapt,
+        agent_fit=AgentFit.sdd_native,
+    )
+    task_id = await repo.create_task_full(db, payload, status="draft")
+    await repo.add_acceptance_criterion(db, task_id, _ac(1))
+    await db.commit()
+
+    report = await calculate_readiness_with_recommendations(db, task_id)
+    area = [r for r in report.recommendations if r.field == "affected_areas"]
+    assert len(area) == 1
+    assert area[0].defect_code == "affected_area_not_in_tree"
+    assert typo in area[0].message
+    assert new_file in area[0].message
+    assert existing not in area[0].message
+    # Never blocks: a file about to be created is a legitimate case.
+    assert area[0].severity == "low"
+    assert area[0].expected_score_delta == 0
+    assert report.dor_passed is True
+    assert report.score == 100
+
+
+def test_an_area_check_without_a_working_copy_stays_silent(tmp_path):
+    """No repo path is 'no ground to judge on', not 'nothing found'."""
+    inputs = StatementInputs(affected_areas=["hub/services/nope.py"])
+    assert build_affected_area_warnings(inputs) == []
+    missing_dir = StatementInputs(
+        affected_areas=["hub/services/nope.py"],
+        repo_path=str(tmp_path / "not-a-directory"),
+    )
+    assert build_affected_area_warnings(missing_dir) == []
+
+
+def test_a_metric_without_a_number_is_named():
+    """AC-4: a filled outcome_metric with no digit is not a metric."""
+    wordy = build_outcome_metric_warnings(
+        StatementInputs(outcome_metric="улучшить качество постановок")
+    )
+    assert len(wordy) == 1
+    assert wordy[0].defect_code == "outcome_metric_without_number"
+    assert wordy[0].severity == "low"
+    assert wordy[0].expected_score_delta == 0
+
+    numbered = build_outcome_metric_warnings(
+        StatementInputs(outcome_metric="замечаний мимо словаря: 0")
+    )
+    assert numbered == []
+
+    # An EMPTY metric is a missing field, and the DoR check already says so.
+    # Naming it here too would put one defect under two names.
+    assert build_outcome_metric_warnings(StatementInputs(outcome_metric="")) == []
+
+
+async def test_no_new_code_charges_the_score(db: aiosqlite.Connection, tmp_path):
+    """AC-5: a task firing all three new codes keeps its score and dor_passed.
+
+    The baseline is not a remembered constant: it is recomputed from the
+    readiness/DoR engine, which #1172 does not touch. Charging here would drop
+    the whole backlog retroactively — the mistake declined in #6 and #331.
+    """
+    await _project_with_workspace(db, tmp_path)
+
+    payload = TaskCreate(
+        title="t",
+        user_story="us",
+        problem_statement="ps",
+        business_value="bv",
+        scope_in=["Закрытый словарь дефектов постановки"],
+        validation_commands=["pytest"],
+        size=TaskSize.S,
+        wip_tag=WipTag.feature_work,
+        affected_areas=["hub/services/nothing_like_this.py"],
+        outcome_metric="улучшить качество постановок",
+        redesign_decision=RedesignDecision.adapt,
+        agent_fit=AgentFit.sdd_native,
+    )
+    task_id = await repo.create_task_full(db, payload, status="draft")
+    await repo.add_acceptance_criterion(db, task_id, _ac(1))
+    await db.commit()
+
+    from hub.services.dor import evaluate_dor
+    from hub.services.readiness import calculate_score_from_data
+
+    dor = await evaluate_dor(db, task_id)
+    baseline_score, _ = calculate_score_from_data(dor=dor, risks=[])
+
+    report = await calculate_readiness_with_recommendations(db, task_id)
+
+    fired = {r.defect_code for r in report.recommendations if r.defect_code}
+    assert fired >= {
+        "scope_item_without_criterion",
+        "affected_area_not_in_tree",
+        "outcome_metric_without_number",
+    }
+    assert report.score == baseline_score
+    assert report.dor_passed is dor.passed
+    assert report.dor_passed is True
+    for rec in report.recommendations:
+        if rec.defect_code is None:
+            continue
+        assert rec.expected_score_delta == 0, rec.defect_code
+        assert rec.severity == "low", rec.defect_code
+
+
+# --- the refusal a caller actually receives (#1172) ---
+#
+# The vocabulary exists so a statement defect can be counted and referred to.
+# That only holds where the code LEAVES the process. Readiness ships whole
+# Recommendation objects, so it carried the code for free; the DoR gate hand-
+# built a four-key dict and dropped it, and the 422 is the one place most
+# callers ever see a statement defect. Both tests below check the whole set of
+# outputs, not one of them: the first compares every code across both replies,
+# the second sweeps the package for a third place that could re-open the hole.
+
+
+async def _draft_with_statement_defects(client) -> int:
+    """A draft that fails DoR and carries statement defects at once.
+
+    Failing DoR is what makes approve answer 422 at all; the defects are what
+    the 422 has to name. validation_commands is left out on purpose — that is
+    the missing required field.
+    """
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": "t", "source": "agent", "agent": "test"},
+    )
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["id"]
+    resp = await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "work_type": "feature",
+            "user_story": "as a user, I want X so that Y",
+            "problem_statement": "ps",
+            "business_value": "bv",
+            # No criterion looks at this item -> scope_item_without_criterion.
+            "scope_in": ["телепортация котиков в подвал"],
+            # Filled, but no digit -> outcome_metric_without_number.
+            "outcome_metric": "улучшить качество постановок",
+            "size": "S",
+            "wip_tag": "feature_work",
+            "affected_areas": ["hub/services/dor.py"],
+            # Placeholder Given/When/Then -> ac_clause_thin, and no
+            # expectation_source -> expectation_source_unstated.
+            "acceptance_criteria": [
+                {
+                    "id": "AC-1",
+                    "given": "g",
+                    "when": "w",
+                    "then": "t",
+                    "verifiable_by": "test",
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    return task_id
+
+
+async def test_the_dor_gate_refusal_names_every_defect_code(client):
+    task_id = await _draft_with_statement_defects(client)
+
+    readiness = await client.get(f"/api/tasks/{task_id}/readiness")
+    assert readiness.status_code == 200, readiness.text
+    from_readiness = {
+        rec["defect_code"]
+        for rec in readiness.json()["recommendations"]
+        if rec.get("defect_code")
+    }
+    # Guard the fixture itself: a task that produced no code would let the
+    # comparison below pass on two empty sets.
+    assert len(from_readiness) >= 3, from_readiness
+
+    refusal = await client.post(f"/api/tasks/{task_id}/approve", json={})
+    assert refusal.status_code == 422, refusal.text
+    detail = refusal.json()["detail"]
+    assert detail["error"] == "dor_failed"
+    shipped = detail["recommendations"]
+
+    # Enumeration, not an example: every code the hub computed has to be in
+    # the reply, and the reply must not invent one of its own.
+    from_refusal = {rec["defect_code"] for rec in shipped if rec.get("defect_code")}
+    assert from_refusal == from_readiness
+
+    # And every recommendation in the reply carries the whole form, so a field
+    # added to Recommendation later cannot be lost here in silence.
+    expected_keys = set(Recommendation.model_fields)
+    for rec in shipped:
+        assert set(rec) == expected_keys, rec
+
+
+def test_no_output_rebuilds_a_recommendation_by_hand():
+    """Sweep the package: nobody re-types a recommendation payload short.
+
+    The defect was not «this one dict forgot a key» but «a caller-facing
+    payload was assembled by listing fields», which loses whatever field the
+    author did not think of. A hand-built dict is still allowed — it just has
+    to carry every field of Recommendation.
+    """
+    import ast
+    import pathlib
+
+    expected_keys = set(Recommendation.model_fields)
+    signature = {"field", "severity", "message"}
+    offenders: list[str] = []
+    scanned = 0
+    package = pathlib.Path(__file__).resolve().parent.parent / "hub"
+    for path in sorted(package.rglob("*.py")):
+        scanned += 1
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            keys = {
+                key.value
+                for key in node.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+            if not signature <= keys:
+                continue
+            missing = expected_keys - keys
+            if missing:
+                offenders.append(
+                    f"{path.relative_to(package.parent)}:{node.lineno} "
+                    f"drops {', '.join(sorted(missing))}"
+                )
+    # The sweep has to have looked at something; an empty package would make
+    # the assertion below vacuous.
+    assert scanned > 10, scanned
+    assert not offenders, offenders

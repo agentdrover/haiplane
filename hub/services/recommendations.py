@@ -19,8 +19,13 @@ Design choices:
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from hub.db import deserialize_str_list
 from hub.models import (
     DoRCheckItem,
     Recommendation,
@@ -214,15 +219,49 @@ def _ac_clause_is_thin(text: str | None) -> bool:
     return len(t) < AC_QUALITY_MIN_LEN
 
 
-def build_ac_quality_warnings(ac_rows: list[Any]) -> list[Recommendation]:
+def _row_value(row: Any, key: str) -> str:
+    """Read one column from an sqlite Row or a dict, missing key included."""
+    try:
+        keys = row.keys() if hasattr(row, "keys") else []
+        if key not in keys:
+            return ""
+        return str(row[key] or "")
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+@dataclass(frozen=True)
+class StatementInputs:
+    """Everything a statement-defect producer is allowed to look at (#1172).
+
+    One shape for every producer so the set of producers can be checked by
+    ENUMERATION rather than by example: a test iterates
+    ``STATEMENT_DEFECT_PRODUCERS`` and drives each one through the same call.
+    With per-producer signatures such a test could only sample, and a new
+    producer speaking outside the vocabulary would pass unnoticed — which is
+    the exact failure #1172 exists to prevent.
+
+    ``repo_path`` is the project's working copy (from ``project_git_context``),
+    or None when the project declares none. None means "no ground to judge on",
+    not "nothing found".
+    """
+
+    ac_rows: list[Any] = field(default_factory=list)
+    scope_in: list[str] = field(default_factory=list)
+    affected_areas: list[str] = field(default_factory=list)
+    outcome_metric: str = ""
+    repo_path: str | None = None
+
+
+def build_ac_quality_warnings(inputs: StatementInputs) -> list[Recommendation]:
     """Emit at most one low-severity warning when some ACs look hollow.
 
-    ``ac_rows`` are rows from ``repo.list_acceptance_criteria`` (columns
+    ``inputs.ac_rows`` are rows from ``repo.list_acceptance_criteria`` (columns
     ``ac_id``/``given``/``when_clause``/``then_clause``). Returns an empty
     list when every AC has substantive clauses.
     """
     weak: list[str] = []
-    for row in ac_rows:
+    for row in inputs.ac_rows:
         if (
             _ac_clause_is_thin(row["given"])
             or _ac_clause_is_thin(row["when_clause"])
@@ -243,11 +282,12 @@ def build_ac_quality_warnings(ac_rows: list[Any]) -> list[Recommendation]:
             ),
             expected_score_delta=0,
             estimated_minutes=5,
+            defect_code="ac_clause_thin",
         )
     ]
 
 
-def build_expectation_source_warnings(ac_rows: list[Any]) -> list[Recommendation]:
+def build_expectation_source_warnings(inputs: StatementInputs) -> list[Recommendation]:
     """Flag criteria whose expected behaviour has no stated source (#595).
 
     Strictly non-blocking: severity="low", expected_score_delta=0, no effect
@@ -262,7 +302,7 @@ def build_expectation_source_warnings(ac_rows: list[Any]) -> list[Recommendation
     """
     unstated: list[str] = []
     from_code: list[str] = []
-    for row in ac_rows:
+    for row in inputs.ac_rows:
         keys = row.keys() if hasattr(row, "keys") else []
         source = row["expectation_source"] if "expectation_source" in keys else None
         if source == "implementation":
@@ -286,6 +326,7 @@ def build_expectation_source_warnings(ac_rows: list[Any]) -> list[Recommendation
                 ),
                 expected_score_delta=0,
                 estimated_minutes=3,
+                defect_code="expectation_source_is_implementation",
             )
         )
     if unstated:
@@ -302,8 +343,470 @@ def build_expectation_source_warnings(ac_rows: list[Any]) -> list[Recommendation
                 ),
                 expected_score_delta=0,
                 estimated_minutes=2,
+                defect_code="expectation_source_unstated",
             )
         )
+    return out
+
+
+# A significant word is at least this long.
+_SCOPE_MIN_WORD_LEN = 4
+
+# Russian inflection has to be stripped, not guessed at by prefix length.
+#
+# The first cut of this matcher kept the first five characters of a word. In
+# short words the ending falls INSIDE that window, so «сдаче»/«сдачи» and
+# «зонда»/«зондом» — one word each, both pairs taken from live statements —
+# looked like different words and a covered scope item got named. The second
+# cut answered that by ALSO keeping the first four characters. Measured over
+# 435 live statements that window rescued 337 pairs of one word and glued
+# together 408 pairs of different words («задание»/«задача», «словарь»/«слово»,
+# «разбор»/«разбирает»): it bought silence in the wrong places.
+#
+# So the ending is removed as an ending. Endings that end in a consonant, or
+# run to two or more letters, must leave four characters behind; a lone vowel
+# or soft sign — the whole ending of most short nouns — may leave three. The
+# tables are deliberately small: this is a nudge worth zero points, not a
+# morphological analyser.
+_SCOPE_MIN_HARD_STEM = 4
+_SCOPE_MIN_SOFT_STEM = 3
+
+_SCOPE_REFLEXIVE_ENDINGS: tuple[str, ...] = ("ся", "сь")
+
+_SCOPE_HARD_ENDINGS: tuple[str, ...] = (
+    # adjective and participle
+    "ыми",
+    "ими",
+    "ого",
+    "его",
+    "ому",
+    "ему",
+    "ых",
+    "их",
+    "ый",
+    "ий",
+    "ой",
+    "ым",
+    "им",
+    "ом",
+    "ем",
+    "ей",
+    "ою",
+    "ею",
+    "ая",
+    "яя",
+    "ое",
+    "ее",
+    "ые",
+    "ие",
+    "ую",
+    "юю",
+    # verb
+    "ешься",
+    "ишься",
+    "аться",
+    "иться",
+    "ать",
+    "ять",
+    "еть",
+    "ить",
+    "ыть",
+    "уть",
+    "ешь",
+    "ишь",
+    "ете",
+    "ите",
+    "ают",
+    "яют",
+    "уют",
+    "ует",
+    "ют",
+    "ат",
+    "ят",
+    "ит",
+    "ет",
+    "ла",
+    "ло",
+    "ли",
+    "на",
+    "ны",
+    "но",
+    "л",
+    "н",
+    # noun
+    "иями",
+    "ями",
+    "ами",
+    "иях",
+    "ях",
+    "ах",
+    "ией",
+    "иям",
+    "ием",
+    "ов",
+    "ев",
+    "ья",
+    "ью",
+    "ию",
+    "ям",
+    "ам",
+    "ии",
+    "ье",
+    "ия",
+)
+
+_SCOPE_SOFT_ENDINGS: tuple[str, ...] = (
+    "а",
+    "е",
+    "и",
+    "о",
+    "у",
+    "ы",
+    "ь",
+    "ю",
+    "я",
+    "й",
+)
+
+_CYRILLIC = re.compile(r"[а-я]")
+
+_SCOPE_VOWELS = "аеиоуыэюя"
+
+# The genitive plural of a noun in -ка pushes a vowel back into the stem:
+# «постановка» keeps «постановк», «постановок» does not. The same о (or е)
+# sits between the two of them in «находок», «ошибок», «правок», «карточек» —
+# and -ка nouns are what this backlog is written in. Dropping that vowel is a
+# NORMALISATION, applied to every stem alike, so it can only bring two words
+# together, never take them apart. Measured over the 11865 distinct Russian
+# words of this repository it brings together 30 groups, and all 30 are one
+# word: ветка/веток, список/списка, порядок/порядке, находка/находок. With
+# the й restored it is 32, and the two it adds — настройка/настроек and
+# канарейка/канареек — are one word as well.
+#
+# The floor is what keeps it off short roots: without it «сток» collapses to
+# «стк» and takes «стек» with it, and those are two words.
+_SCOPE_FLEETING_VOWEL_STEM = 4
+
+# Two-letter present-tense endings that are also the tail of ordinary nouns.
+# «коммит», «формат», «результат», «приоритет», «захват» are not verbs, but
+# «ит»/«ат»/«ет» come off them all the same — and the noun's own oblique
+# forms («коммита» -> «коммит») then stem to the word the matcher has just
+# thrown away. Refusing to strip them off short words is not the answer:
+# measured on the same corpus, demanding five characters back splits 73
+# groups that are one word (делает/делал, входит/входа, ставит/ставится).
+# So a word ending this way keeps BOTH readings — the verb stem and itself —
+# and a shared reading decides. That adds 21 links, of which 20 are one word
+# (коммит/коммита, результат/результата, секрет/секрета).
+_SCOPE_AMBIGUOUS_ENDINGS: tuple[str, ...] = ("ат", "ят", "ет", "ит", "ут", "ют")
+
+# Latin words are left exactly as the first cut of this matcher left them —
+# their first five characters. Russian endings say nothing about them, and
+# this change deliberately does not touch behaviour it has no measurement for.
+_SCOPE_LATIN_STEM_LEN = 5
+
+
+def _fold(text: str) -> str:
+    """Lower-case, and read ё as е.
+
+    The two letters are written interchangeably in this backlog — the same
+    word appears as «поимённо» (#1170, #1161) and as «поименно» (#1144) — so
+    treating them as different letters would call a covered item uncovered
+    over a diacritic.
+    """
+    return (text or "").lower().replace("ё", "е")
+
+
+def _strip_ending(word: str, endings: tuple[str, ...], floor: int) -> str | None:
+    """Longest ending from ``endings`` removed, if ``floor`` characters remain."""
+    for ending in sorted(endings, key=len, reverse=True):
+        if word.endswith(ending) and len(word) - len(ending) >= floor:
+            return word[: -len(ending)]
+    return None
+
+
+def _drop_fleeting_vowel(stem: str) -> str:
+    """The о or е that the genitive plural pushes back into a -ка stem, gone.
+
+    «постановок» -> «постановк», so that it meets «постановка». Applied to
+    every stem alike, which is what makes it safe: a normalisation both sides
+    go through cannot pull two forms of one word apart.
+    """
+    if len(stem) > _SCOPE_FLEETING_VOWEL_STEM and stem[-1] == "к" and stem[-2] in "ое":
+        # After a vowel the stem is holding a й that the plural swallowed:
+        # «настройка» keeps «настройк», «настроек» has to get the й back or it
+        # lands on «настро-к» and meets nothing. «канарейка»/«канареек» too.
+        if stem[-3] in _SCOPE_VOWELS:
+            return stem[:-2] + "йк"
+        return stem[:-2] + "к"
+    return stem
+
+
+def _stem_and_ending(word: str) -> tuple[str, str]:
+    """The word with one inflectional ending removed, and that ending."""
+    if not _CYRILLIC.search(word):
+        return word[:_SCOPE_LATIN_STEM_LEN], ""
+    body = _strip_ending(word, _SCOPE_REFLEXIVE_ENDINGS, _SCOPE_MIN_HARD_STEM) or word
+    cut = _strip_ending(body, _SCOPE_HARD_ENDINGS, _SCOPE_MIN_HARD_STEM)
+    if cut is None:
+        cut = _strip_ending(body, _SCOPE_SOFT_ENDINGS, _SCOPE_MIN_SOFT_STEM)
+    stem = body if cut is None else cut
+    ending = word[len(stem) :]
+    # «изменение» and «изменённая» are one word; the doubled н of the long
+    # participle is the only thing left between their stems. The SHORT
+    # participle «изменена» is not reached by this — it loses «на» and stops
+    # at «измене» — and that residual is named in the tests, not papered over.
+    if stem.endswith("нн") and len(stem) > _SCOPE_MIN_SOFT_STEM:
+        stem = stem[:-1]
+    return _drop_fleeting_vowel(stem), ending
+
+
+def _stem(word: str) -> str:
+    """The word with one inflectional ending removed."""
+    return _stem_and_ending(word)[0]
+
+
+def _stems(word: str) -> set[str]:
+    """Every reading of ``word`` this matcher is prepared to accept.
+
+    One, normally. Two when the ending removed is a present-tense verb ending
+    that is also the tail of an ordinary noun: there the matcher cannot tell
+    «коммит» the noun from a verb, so it declines to choose and keeps both.
+    """
+    stem, ending = _stem_and_ending(word)
+    if ending in _SCOPE_AMBIGUOUS_ENDINGS:
+        return {stem, word}
+    return {stem}
+
+
+# Words too common to carry meaning when matching a scope_in item against the
+# acceptance criteria. Short tokens are dropped by length before this set is
+# consulted, so only longer filler needs listing. They are written as WORDS
+# and stemmed here, so the list stays readable and cannot drift away from the
+# stemmer: a hand-written stem would silently stop matching the moment the
+# endings table changes.
+_SCOPE_STOPWORD_FORMS: frozenset[str] = frozenset(
+    {
+        "this",
+        "that",
+        "with",
+        "from",
+        "into",
+        "when",
+        "then",
+        "given",
+        "which",
+        "should",
+        "must",
+        "code",
+        "только",
+        "должно",
+        "должны",
+        "который",
+        "которая",
+        "которые",
+        "также",
+        "чтобы",
+        "этого",
+        "этому",
+        "этом",
+        "этот",
+    }
+)
+
+_SCOPE_STOPWORDS: frozenset[str] = frozenset(
+    _stem(_fold(w)) for w in _SCOPE_STOPWORD_FORMS
+)
+
+
+def _significant_stems(text: str) -> set[str]:
+    """Stems of the words in ``text`` that carry meaning."""
+    words = re.split(r"[^0-9A-Za-zЀ-ӿ]+", _fold(text))
+    stems = set()
+    for w in words:
+        if len(w) < _SCOPE_MIN_WORD_LEN:
+            continue
+        readings = _stems(w)
+        if w in _SCOPE_STOPWORDS or readings & _SCOPE_STOPWORDS:
+            continue
+        stems |= readings
+    return stems
+
+
+def build_scope_coverage_warnings(inputs: StatementInputs) -> list[Recommendation]:
+    """Name scope_in items that no acceptance criterion looks at (#1172).
+
+    An area declared in scope with no criterion aimed at it goes to review
+    unchecked exactly where the author himself said the work was needed.
+
+    The match is deliberately SOFT: an item counts as covered when ANY of its
+    significant words stems to a word used in ANY Given/When/Then. A stricter
+    rule (every word, or per-criterion) would flag items that a criterion does
+    cover in other words, and the author would learn to skip the warning. It
+    is affordable to be soft here precisely because the charge is zero — this
+    names a fact, it does not gate anything.
+
+    An item with no significant words at all (e.g. "a") is left alone: there
+    is nothing to match on, and silence is honest where judgement is
+    impossible.
+    """
+    if not inputs.scope_in:
+        return []
+    covered_by: set[str] = set()
+    for row in inputs.ac_rows:
+        for clause in ("given", "when_clause", "then_clause"):
+            covered_by |= _significant_stems(_row_value(row, clause))
+
+    uncovered: list[str] = []
+    for item in inputs.scope_in:
+        stems = _significant_stems(item)
+        if not stems:
+            continue
+        if stems & covered_by:
+            continue
+        uncovered.append(item.strip())
+    if not uncovered:
+        return []
+    listed = "; ".join(f"«{item}»" for item in uncovered)
+    return [
+        Recommendation(
+            field="scope_in",
+            severity="low",
+            message=(
+                f"No acceptance criterion appears to look at these scope "
+                f"items: {listed}. You declared the work needed there, so "
+                "work will reach review unchecked in exactly the place you "
+                "named. Either add a criterion or drop the item from scope. "
+                "The match is by wording, so a criterion that covers the item "
+                "in different words will still show up here — say so and move "
+                "on; nothing is blocked."
+            ),
+            expected_score_delta=0,
+            estimated_minutes=5,
+            defect_code="scope_item_without_criterion",
+        )
+    ]
+
+
+def build_affected_area_warnings(inputs: StatementInputs) -> list[Recommendation]:
+    """Name declared affected_areas absent from the repository tree (#1172).
+
+    DoR counts areas and nothing else (dor.py: ``passed = count > 0``), so a
+    typo like "hub/services/steward_dor_apply.py" passes readiness and is only
+    caught at submission, when the same area is compared against the diff —
+    after the work is done.
+
+    NEVER blocks, and says why in the message: a new file is a legitimate
+    case, so this code names a fact instead of judging it. The cost of a false
+    positive is one line of text, not a stopped gate.
+
+    Silence when the project declares no working copy (``repo_path`` is None),
+    or when the path escapes it: there is no tree to check against, and a
+    warning would report the hub's own configuration as the author's mistake.
+    """
+    if not inputs.affected_areas:
+        return []
+    root_raw = (inputs.repo_path or "").strip()
+    if not root_raw:
+        return []
+    root = Path(root_raw)
+    if not root.is_dir():
+        return []
+    root = root.resolve()
+
+    missing: list[str] = []
+    for area in inputs.affected_areas:
+        rel = area.strip().lstrip("/")
+        if not rel:
+            continue
+        candidate = (root / rel).resolve()
+        if root not in candidate.parents and candidate != root:
+            # Escapes the working copy: not something this code can judge.
+            continue
+        if not candidate.exists():
+            missing.append(area.strip())
+    if not missing:
+        return []
+    listed = ", ".join(missing)
+    return [
+        Recommendation(
+            field="affected_areas",
+            severity="low",
+            message=(
+                f"These affected areas are not in the repository tree: "
+                f"{listed}. Readiness only counts areas, so a typo passes here "
+                "and is caught at submission, when the area is compared "
+                "against the diff — after the work is done. A file you are "
+                "about to create is a legitimate case and nothing is blocked: "
+                "fix the typo, or confirm the file does not exist yet."
+            ),
+            expected_score_delta=0,
+            estimated_minutes=2,
+            defect_code="affected_area_not_in_tree",
+        )
+    ]
+
+
+def build_outcome_metric_warnings(inputs: StatementInputs) -> list[Recommendation]:
+    """Name an outcome_metric that carries no number (#1172).
+
+    "Improve the quality of statements" is not a metric, but the field is
+    filled and DoR is satisfied by that alone. The test is the presence of a
+    digit, not a parse of a formula: "from 0 to a noticeable share" counts,
+    "improve quality" does not.
+
+    An EMPTY metric is not this code's business — that is a missing field, and
+    the DoR check ``has_outcome_hypothesis`` already says so. Reporting it
+    twice would put one defect under two names, which is the very thing this
+    vocabulary exists to prevent.
+    """
+    metric = (inputs.outcome_metric or "").strip()
+    if not metric:
+        return []
+    if any(ch.isdigit() for ch in metric):
+        return []
+    return [
+        Recommendation(
+            field="outcome_metric",
+            severity="low",
+            message=(
+                f"The outcome metric «{metric}» contains no number, so nobody "
+                "can tell later whether it was met. Readiness only checks that "
+                "the field is filled. Name a value and a direction, e.g. "
+                "'median lead time, 3d -> 1d' or 'statement warnings outside "
+                "the vocabulary: 0'."
+            ),
+            expected_score_delta=0,
+            estimated_minutes=5,
+            defect_code="outcome_metric_without_number",
+        )
+    ]
+
+
+# THE producer list. Every statement defect the hub computes is named here and
+# nowhere else — a warning built outside this tuple is a second way to name a
+# defect, and the count by code goes silently incomplete (#1172, AC-1).
+STATEMENT_DEFECT_PRODUCERS: tuple[
+    Callable[[StatementInputs], list[Recommendation]], ...
+] = (
+    build_ac_quality_warnings,
+    build_expectation_source_warnings,
+    build_scope_coverage_warnings,
+    build_affected_area_warnings,
+    build_outcome_metric_warnings,
+)
+
+
+def run_statement_defect_producers(inputs: StatementInputs) -> list[Recommendation]:
+    """Run every statement-defect producer over one set of inputs.
+
+    Deliberately NOT named ``build_..._warnings``: that name means "a producer"
+    everywhere in this module, and the AC-1 test enumerates the module by it.
+    An aggregator answering to the same name would be checked as if it were a
+    sixth producer.
+    """
+    out: list[Recommendation] = []
+    for producer in STATEMENT_DEFECT_PRODUCERS:
+        out.extend(producer(inputs))
     return out
 
 
@@ -365,6 +868,24 @@ def build_recommendations(
     return recs
 
 
+async def _project_repo_path(db, task_id: int) -> str | None:
+    """The project's working copy, or None when it declares none (#337).
+
+    Imported inside the function: orchestration reaches back into services,
+    and a module-level import here would close the cycle. Any failure to
+    resolve returns None, which every producer reads as "no ground to judge
+    on" — never as "nothing found".
+    """
+    try:
+        from hub.services.orchestration import project_git_context
+
+        ctx = await project_git_context(db, task_id)
+    except Exception:  # pragma: no cover - defensive: never break readiness
+        return None
+    value = ctx.get("repo")
+    return str(value) if value else None
+
+
 async def build_for_task(
     db,
     task_id: int,
@@ -398,10 +919,25 @@ async def calculate_readiness_with_recommendations(
 
     score, components = calculate_score_from_data(dor=dor, risks=risks, config=config)
     recs = build_recommendations(dor, config=config)
-    # Non-blocking AC-quality nudge (#6): does not affect score/dor_passed.
+    # Non-blocking statement-defect nudges (#6, #1172): every one of them is
+    # severity="low" with expected_score_delta=0, and NONE of them touches
+    # `score` or `dor.passed` above. Charging here would drop the whole
+    # backlog retroactively on the day this ships — the mistake declined in
+    # #6 and #331.
     ac_rows = await repo.list_acceptance_criteria(db, task_id)
-    recs.extend(build_ac_quality_warnings(ac_rows))
-    recs.extend(build_expectation_source_warnings(ac_rows))
+    recs.extend(
+        run_statement_defect_producers(
+            StatementInputs(
+                ac_rows=list(ac_rows),
+                scope_in=deserialize_str_list(row["scope_in"]) if row else [],
+                affected_areas=(
+                    deserialize_str_list(row["affected_areas"]) if row else []
+                ),
+                outcome_metric=(row["outcome_metric"] or "") if row else "",
+                repo_path=await _project_repo_path(db, task_id),
+            )
+        )
+    )
     recs.sort(key=lambda r: SEVERITY_ORDER[r.severity])
 
     return ReadinessReport(
@@ -418,9 +954,15 @@ async def calculate_readiness_with_recommendations(
 __all__ = [
     "CHECK_RECOMMENDATIONS",
     "SEVERITY_ORDER",
+    "STATEMENT_DEFECT_PRODUCERS",
+    "StatementInputs",
     "build_ac_quality_warnings",
+    "build_affected_area_warnings",
     "build_expectation_source_warnings",
     "build_for_task",
+    "build_outcome_metric_warnings",
     "build_recommendations",
+    "build_scope_coverage_warnings",
     "calculate_readiness_with_recommendations",
+    "run_statement_defect_producers",
 ]
