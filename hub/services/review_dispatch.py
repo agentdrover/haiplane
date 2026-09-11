@@ -32,7 +32,7 @@ from typing import Any, NamedTuple
 
 import aiosqlite
 
-from hub.db import fetchall, write_transaction
+from hub.db import fetchall
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
@@ -2802,14 +2802,18 @@ async def _close_a_run_without_a_report(
     """Прогон дошёл до конца и отчёта не оставил: назвать это и открыть дверь.
 
     #1252: отчёт перечитывается НЕПОСРЕДСТВЕННО перед тем, как назвать его
-    отсутствующим, и перечитывается ПОД ВЗЯТЫМ НА ЗАПИСЬ ЛОКОМ. Между первой
-    проверкой в свипе и этим местом лежат два сетевых ожидания — терминальное
-    состояние прогона и расход, — и контрактный отчёт, доехавший в это окно,
-    заставал решение «отчёта нет» уже принятым: алерт «отчёт НЕ сдан», вторая
-    дверь, лишние деньги и два соперничающих отчёта на одну сдачу.
-    ``write_transaction`` — это BEGIN IMMEDIATE (#1065): лок берётся ДО
-    чтения и держится до записи долга, то есть окно закрывается базой, а не
-    расторопностью.
+    отсутствующим. Между первой проверкой в свипе и этим местом лежат два
+    сетевых ожидания — терминальное состояние прогона и расход, — и
+    контрактный отчёт, доехавший в это окно, заставал решение «отчёта нет»
+    уже принятым: алерт «отчёт НЕ сдан», вторая дверь, лишние деньги и два
+    соперничающих отчёта на одну сдачу.
+
+    Эта проверка — первая из ДВУХ, и вторая важнее. Здесь закрывается ложь в
+    карточке; деньги тратятся ниже по пути, и последнее слово перед заказом
+    говорит ``_second_door_after_run``. Окно между двумя проверками — запись
+    долга, чтение задачи и проекта, а на возобновлении ещё и весь перерыв
+    между проходами свипа — как раз то, где отчёт успевает доехать. Один
+    потребитель правила ≠ все.
 
     Доехавший отчёт здесь НЕ закрывается на месте: строка остаётся активной,
     и следующий проход разбирает её обычным путём — со сверкой расхода по
@@ -2818,51 +2822,46 @@ async def _close_a_run_without_a_report(
     """
     task_id = int(dispatch["task_id"])
     run_status = str(run.get("status") or "")
-    task_row = None
-    async with write_transaction(db):
-        if (
-            await _dispatch_report(
-                db, task_id, dispatch["submission_generation"], dispatch
-            )
-            is not None
-        ):
-            return
-        await repo.add_task_update(
+    if (
+        await _dispatch_report(db, task_id, dispatch["submission_generation"], dispatch)
+        is not None
+    ):
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Кросс-модельное ревью вызвано, но отчёт НЕ сдан: агент "
+        f"{dispatch['agent_id']} ({dispatch['model']}) завершил ран со "
+        f"статусом {run.get('status')}, machine-review актуальной "
+        "генерации отсутствует. Вердикт остаётся человеку (#757).",
+    )
+    task_row = await repo.get_task(db, task_id)
+    task_status = dict(task_row)["status"] if task_row else ""
+    if task_status != "review":
+        await repo.insert_event(
             db,
-            task_id,
-            "hub",
-            "alert",
-            f"Кросс-модельное ревью вызвано, но отчёт НЕ сдан: агент "
-            f"{dispatch['agent_id']} ({dispatch['model']}) завершил ран со "
-            f"статусом {run.get('status')}, machine-review актуальной "
-            "генерации отсутствует. Вердикт остаётся человеку (#757).",
+            kind="review_dispatch_failed",
+            task_id=task_id,
+            actor="hub",
+            payload={
+                "dispatch_id": dispatch["id"],
+                "model": dispatch.get("model") or "",
+                "run_status": run.get("status"),
+                "task_status": task_status,
+            },
         )
-        task_row = await repo.get_task(db, task_id)
-        task_status = dict(task_row)["status"] if task_row else ""
-        if task_status != "review":
-            await repo.insert_event(
-                db,
-                kind="review_dispatch_failed",
-                task_id=task_id,
-                actor="hub",
-                payload={
-                    "dispatch_id": dispatch["id"],
-                    "model": dispatch.get("model") or "",
-                    "run_status": run.get("status"),
-                    "task_status": task_status,
-                },
-            )
-        # МЕСТО ПРИМЕНЕНИЯ №2 второй двери (#1252): отказ АСИНХРОННЫЙ — агент
-        # создался, прогон дошёл до терминального статуса, отчёта нет. Прогон
-        # тут УЖЕ оплачен, и это единственное, чем этот случай отличается от
-        # синхронного: без отчёта сдача стоит одинаково мёртво.
-        #
-        # Строка НЕ закрывается раньше, чем долг отдан. Закрытая строка
-        # невидима свипу, и сбой между двумя записями — упавший процесс или
-        # исключение в подготовке заказа, где git ходит в сеть, — уносил бы
-        # обещанную вторую дверь навсегда: поллер глотает исключение и идёт
-        # дальше.
-        await repo.owe_second_door(db, dispatch["id"], run_status)
+    # МЕСТО ПРИМЕНЕНИЯ №2 второй двери (#1252): отказ АСИНХРОННЫЙ — агент
+    # создался, прогон дошёл до терминального статуса, отчёта нет. Прогон тут
+    # УЖЕ оплачен, и это единственное, чем этот случай отличается от
+    # синхронного: без отчёта сдача стоит одинаково мёртво.
+    #
+    # Строка НЕ закрывается раньше, чем долг отдан. Закрытая строка невидима
+    # свипу, и сбой между двумя записями — упавший процесс или исключение в
+    # подготовке заказа, где git ходит в сеть, — уносил бы обещанную вторую
+    # дверь навсегда: поллер глотает исключение и идёт дальше.
+    await repo.owe_second_door(db, dispatch["id"], run_status)
     await db.commit()
     dispatch["run_status"] = run_status
     await _settle_second_door(db, dispatch, task_row=task_row)
@@ -2953,6 +2952,17 @@ async def _second_door_after_run(
         return
     project = await repo.resolve_project_for_task(db, int(task["id"]))
     if project is None or not review_dispatch_enabled(gate_policy_of(project)):
+        return
+    # ПОСЛЕДНЕЕ слово перед заказом (#1252). Первую проверку отчёта делает
+    # _close_a_run_without_a_report, и между ней и этим местом лежат запись
+    # долга, чтение задачи и чтение проекта, а на возобновлении — ещё и весь
+    # перерыв между проходами свипа. Отчёт, доехавший в это окно, покупал бы
+    # второго ревьюера поверх уже сданного: деньги тратятся ЗДЕСЬ, и здесь же
+    # надо смотреть. Проверка именно рунг-совпадением (#1025), а не «есть ли
+    # хоть какой-то отчёт этого поколения»: у добора лестницы (#879) отчёт
+    # предыдущей ступени законно есть, и запрет по нему закрыл бы дверь перед
+    # заказом, который как раз и заказывали вторым.
+    if await _dispatch_report(db, int(task["id"]), generation, dispatch) is not None:
         return
     await open_second_door(
         db,

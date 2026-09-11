@@ -6174,3 +6174,183 @@ async def test_the_debt_is_paid_once_even_after_a_death_mid_settlement(
         )["status"]
         == "failed"
     ), "отданный долг закрывается"
+
+
+async def _a_report_from(db, task_id: int, principal_id: int, username: str) -> int:
+    """Отчёт этого принципала по текущему поколению. Возвращает его id."""
+    from hub.models import MachineReviewSubmit
+    from hub.services.machine_review_intake import record_machine_review
+
+    payload = {**_LOCAL_REPORT}
+    payload.pop("orchestrator", None)
+    await record_machine_review(
+        db,
+        task_id,
+        MachineReviewSubmit(**payload),
+        principal_id=principal_id,
+        username=username,
+    )
+    await db.commit()
+    rows = await repo.machine_reviews_of_generation(db, task_id, 1)
+    return int(dict(rows[-1])["id"])
+
+
+async def test_the_rung_is_counted_inside_its_own_channel(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1252: канал в мерке ступени нужен САМ ПО СЕБЕ.
+
+    Отдельный токен у локального ревьюера — требование выката, а не свойство
+    кода: ничто не мешает поставить на обоих каналах ОДИН токен. Тогда
+    принципал у двух заказов поколения общий, и мерки «свои заказы того же
+    принципала» не хватает — локальный заказ снова оказывается ступенью 1
+    при единственном отчёте.
+    """
+    from hub.services.review_dispatch import _dispatch_report
+
+    monkeypatch.setattr(hub_auth, "_is_open_mode", lambda: False)
+    shared_pid, _ = await _agent_key(db, "one-token-for-both")
+    task_id = await _submitted(client, db, "spike-shared-token")
+
+    await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-shared",
+        run_id="r-1",
+        model="grok-4.6",
+        reviewer_principal_id=shared_pid,
+        channel="cloud",
+    )
+    local_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="local:shared",
+        run_id="r-2",
+        model="grok-4.6",
+        reviewer_principal_id=shared_pid,
+        channel="local",
+    )
+    await db.commit()
+    report_id = await _a_report_from(db, task_id, shared_pid, "one-token-for-both")
+
+    local = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE id=?", (local_id,)
+            )
+        )[0]
+    )
+    matched = await _dispatch_report(db, task_id, 1, local)
+    assert matched is not None and int(matched["id"]) == report_id, (
+        "единственный отчёт принадлежит локальному заказу: ступень считается "
+        "внутри своего канала, иначе общий токен ломает сопоставление"
+    )
+
+
+async def test_the_rung_is_counted_inside_its_own_principal(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1252: принципал в мерке ступени нужен САМ ПО СЕБЕ.
+
+    Два заказа одного канала в одном поколении бывают и без второй двери:
+    добор лестницы (#879). Если между ними токен ревьюера сменили, отчёт
+    нового принципала — первый ЕГО отчёт, а заказ стоит вторым в канале.
+    Мерки «свои заказы того же канала» тут не хватает.
+    """
+    from hub.services.review_dispatch import _dispatch_report
+
+    monkeypatch.setattr(hub_auth, "_is_open_mode", lambda: False)
+    old_pid, _ = await _agent_key(db, "reviewer-before-rotation")
+    new_pid, _ = await _agent_key(db, "reviewer-after-rotation")
+    task_id = await _submitted(client, db, "spike-rotated-token")
+
+    await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-old",
+        run_id="r-1",
+        model="grok-4.6",
+        reviewer_principal_id=old_pid,
+        channel="cloud",
+    )
+    top_up_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-new",
+        run_id="r-2",
+        model="grok-4.6",
+        reviewer_principal_id=new_pid,
+        channel="cloud",
+    )
+    await db.commit()
+    report_id = await _a_report_from(db, task_id, new_pid, "reviewer-after-rotation")
+
+    top_up = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE id=?", (top_up_id,)
+            )
+        )[0]
+    )
+    matched = await _dispatch_report(db, task_id, 1, top_up)
+    assert matched is not None and int(matched["id"]) == report_id, (
+        "отчёт нового принципала — ПЕРВЫЙ его отчёт: ступень считается "
+        "внутри заказов того же принципала"
+    )
+
+
+async def test_a_report_arriving_while_the_debt_settles_still_stops_the_order(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1252: последнее слово перед заказом говорится ПЕРЕД заказом.
+
+    Одной проверки мало. Отчёт может доехать уже после того, как свип назвал
+    его отсутствующим, — пока пишется долг, читается задача и читается
+    проект, а на возобновлении ещё и между проходами. Деньги тратятся в
+    момент заказа, и смотреть надо там.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-mid"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-report-mid-settle", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_resolve = repo.resolve_project_for_task
+    landed: list[int] = []
+
+    async def _report_lands_mid_settlement(conn, tid):
+        # Отчёт доехал ПОСЛЕ первой проверки: долг уже записан, заказ ещё нет.
+        if not landed:
+            landed.append(-1)
+            landed[0] = await _a_report_from(db, task_id, cloud_pid, "cloud-reviewer")
+        return await real_resolve(conn, tid)
+
+    monkeypatch.setattr(repo, "resolve_project_for_task", _report_lands_mid_settlement)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert landed and landed[0] > 0, "предпосылка: отчёт доехал именно в это окно"
+    assert await _local_dispatches(db, task_id) == [], (
+        "отчёт уже сдан: заказ второго ревьюера — оплаченный отчёт-соперник"
+    )
