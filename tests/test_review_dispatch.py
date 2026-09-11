@@ -6480,6 +6480,13 @@ async def test_the_slot_prompt_mints_a_code_or_says_why_not(
     # Запись зафиксирована: второй путь до базы открывает СВОЁ соединение, и
     # незакрытая транзакция фикстуры отдала бы ему «database is locked» —
     # то есть тест мерил бы блокировку, а не подмену.
+    # Задача СТОИТ НА РЕВЬЮ своего поколения: код вида reviewer годен только
+    # против той сдачи, на которую выписан, и без этого «код выписан» нельзя
+    # было бы отличить от «кодом можно воспользоваться».
+    await db.execute(
+        "UPDATE tasks SET status='review', submission_generation=1 WHERE id=?",
+        (task_id,),
+    )
     await db.commit()
     base = instance_base_url().rstrip("/")
     stale = "AH-11111111"
@@ -6527,11 +6534,15 @@ async def test_the_slot_prompt_mints_a_code_or_says_why_not(
         )
         found = re.search(r'"code":"([^"]+)"', produced)
         assert found and found.group(1) != stale, f"код не сменился: {produced[:200]}"
-        assert await db.execute_fetchall(
-            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? "
-            "AND redeemed_at IS NULL AND expires_at > datetime('now')",
-            (chat_pair.hash_pair_code(chat_pair.normalize_pair_code(found.group(1))),),
-        ), "выписанный код не лёг в базу живым"
+        # Проверяется ВЫКУП, а не строка в таблице. Живая строка не значит
+        # годный код: reviewer-код приколот к задаче И К ПОКОЛЕНИЮ сдачи, и
+        # код, выписанный не на то поколение, лежит в базе живым, а на двери
+        # получает отказ — мутация «generation + 1» на проверке строки
+        # выживала, на выкупе гибнет.
+        assert await chat_pair.redeem_code(db, found.group(1)) is not None, (
+            "выписанный код не выкупается: ревьюер не войдёт в основной канал "
+            f"отчёта (путь к базе {db_path!r})"
+        )
         assert prompt.replace(
             _delivery_block(task_id, stale, base), ""
         ) == produced.replace(_delivery_block(task_id, found.group(1), base), ""), (
