@@ -667,9 +667,7 @@ async def test_the_digest_reads_the_report_of_the_verdicts_own_generation(db):
         model="grok-4.6",
         raw_count=4,
         findings_confirmed="[]",
-        unresolved=_json.dumps(
-            [{"title": "никто не рассудил"}], ensure_ascii=False
-        ),
+        unresolved=_json.dumps([{"title": "никто не рассудил"}], ensure_ascii=False),
     )
     await repo_module.insert_event(
         db,
@@ -1039,7 +1037,9 @@ async def test_the_live_probe_kills_a_mutation_in_a_sandbox_and_leaves_no_trace(
     sha = git("rev-parse", "HEAD")
 
     monkeypatch.setattr(
-        config_module, "MUTATION_PROBE_CMD", f"{sys.executable} -m pytest -q -rf -p no:randomly"
+        config_module,
+        "MUTATION_PROBE_CMD",
+        f"{sys.executable} -m pytest -q -rf -p no:randomly",
     )
     monkeypatch.setattr(config_module, "MUTATION_PROBE_SCRATCH_DIR", str(tmp_path))
 
@@ -1126,7 +1126,9 @@ async def test_the_live_probe_refuses_a_mutation_that_breaks_the_parse(
     assert git("status", "--porcelain") == ""
 
 
-async def test_no_configured_suite_command_means_no_probe_at_all(client, db, monkeypatch):
+async def test_no_configured_suite_command_means_no_probe_at_all(
+    client, db, monkeypatch
+):
     """Пустая команда набора — «живого прогона нет», а не «запускай как есть».
 
     То же правило, которым выключен локальный ревьюер (#1180): набор проекта

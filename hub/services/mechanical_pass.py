@@ -184,9 +184,16 @@ async def run_mechanical_pass(
                 log.exception("mutation probe failed for task #%s", task_id)
                 suite = None
 
+        # Прогон уже состоялся (или не состоялся) ВЫШЕ, а шагу отдаётся
+        # готовый ответ: ``mechanical_step`` синхронный, и делать его
+        # асинхронным ради одного вызывающего значило бы переписать решающую
+        # функцию под инфраструктуру, а не наоборот.
+        def _answer(_m: Mutation, _suite: SuiteResult | None = suite):
+            return _suite
+
         step = mechanical_step(
             finding,
-            lambda _m, _suite=suite: _suite,
+            _answer,
             already_checked=(
                 f"отчёт машинного ревью #{report.get('id')} по сдаче "
                 f"#{generation} прочитан",
@@ -402,7 +409,8 @@ async def mechanical_pass_after_report(db, task_id: int) -> PassResult:
     ждать человека, — то есть ровно там, где задача его и объявила: «прежде
     чем звать человека, стюард делает то, что умеет сам».
     """
-    return await run_mechanical_pass(db, task_id, probe=await configured_probe(db, task_id))
+    probe = await configured_probe(db, task_id)
+    return await run_mechanical_pass(db, task_id, probe=probe)
 
 
 __all__ = [
