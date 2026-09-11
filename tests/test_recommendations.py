@@ -899,3 +899,131 @@ async def test_no_new_code_charges_the_score(db: aiosqlite.Connection, tmp_path)
             continue
         assert rec.expected_score_delta == 0, rec.defect_code
         assert rec.severity == "low", rec.defect_code
+
+
+# --- the refusal a caller actually receives (#1172) ---
+#
+# The vocabulary exists so a statement defect can be counted and referred to.
+# That only holds where the code LEAVES the process. Readiness ships whole
+# Recommendation objects, so it carried the code for free; the DoR gate hand-
+# built a four-key dict and dropped it, and the 422 is the one place most
+# callers ever see a statement defect. Both tests below check the whole set of
+# outputs, not one of them: the first compares every code across both replies,
+# the second sweeps the package for a third place that could re-open the hole.
+
+
+async def _draft_with_statement_defects(client) -> int:
+    """A draft that fails DoR and carries statement defects at once.
+
+    Failing DoR is what makes approve answer 422 at all; the defects are what
+    the 422 has to name. validation_commands is left out on purpose — that is
+    the missing required field.
+    """
+    resp = await client.post(
+        "/api/tasks",
+        json={"title": "t", "source": "agent", "agent": "test"},
+    )
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["id"]
+    resp = await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "work_type": "feature",
+            "user_story": "as a user, I want X so that Y",
+            "problem_statement": "ps",
+            "business_value": "bv",
+            # No criterion looks at this item -> scope_item_without_criterion.
+            "scope_in": ["телепортация котиков в подвал"],
+            # Filled, but no digit -> outcome_metric_without_number.
+            "outcome_metric": "улучшить качество постановок",
+            "size": "S",
+            "wip_tag": "feature_work",
+            "affected_areas": ["hub/services/dor.py"],
+            # Placeholder Given/When/Then -> ac_clause_thin, and no
+            # expectation_source -> expectation_source_unstated.
+            "acceptance_criteria": [
+                {
+                    "id": "AC-1",
+                    "given": "g",
+                    "when": "w",
+                    "then": "t",
+                    "verifiable_by": "test",
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    return task_id
+
+
+async def test_the_dor_gate_refusal_names_every_defect_code(client):
+    task_id = await _draft_with_statement_defects(client)
+
+    readiness = await client.get(f"/api/tasks/{task_id}/readiness")
+    assert readiness.status_code == 200, readiness.text
+    from_readiness = {
+        rec["defect_code"]
+        for rec in readiness.json()["recommendations"]
+        if rec.get("defect_code")
+    }
+    # Guard the fixture itself: a task that produced no code would let the
+    # comparison below pass on two empty sets.
+    assert len(from_readiness) >= 3, from_readiness
+
+    refusal = await client.post(f"/api/tasks/{task_id}/approve", json={})
+    assert refusal.status_code == 422, refusal.text
+    detail = refusal.json()["detail"]
+    assert detail["error"] == "dor_failed"
+    shipped = detail["recommendations"]
+
+    # Enumeration, not an example: every code the hub computed has to be in
+    # the reply, and the reply must not invent one of its own.
+    from_refusal = {rec["defect_code"] for rec in shipped if rec.get("defect_code")}
+    assert from_refusal == from_readiness
+
+    # And every recommendation in the reply carries the whole form, so a field
+    # added to Recommendation later cannot be lost here in silence.
+    expected_keys = set(Recommendation.model_fields)
+    for rec in shipped:
+        assert set(rec) == expected_keys, rec
+
+
+def test_no_output_rebuilds_a_recommendation_by_hand():
+    """Sweep the package: nobody re-types a recommendation payload short.
+
+    The defect was not «this one dict forgot a key» but «a caller-facing
+    payload was assembled by listing fields», which loses whatever field the
+    author did not think of. A hand-built dict is still allowed — it just has
+    to carry every field of Recommendation.
+    """
+    import ast
+    import pathlib
+
+    expected_keys = set(Recommendation.model_fields)
+    signature = {"field", "severity", "message"}
+    offenders: list[str] = []
+    scanned = 0
+    package = pathlib.Path(__file__).resolve().parent.parent / "hub"
+    for path in sorted(package.rglob("*.py")):
+        scanned += 1
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            keys = {
+                key.value
+                for key in node.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+            if not signature <= keys:
+                continue
+            missing = expected_keys - keys
+            if missing:
+                offenders.append(
+                    f"{path.relative_to(package.parent)}:{node.lineno} "
+                    f"drops {', '.join(sorted(missing))}"
+                )
+    # The sweep has to have looked at something; an empty package would make
+    # the assertion below vacuous.
+    assert scanned > 10, scanned
+    assert not offenders, offenders

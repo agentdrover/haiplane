@@ -1037,14 +1037,16 @@ async def approve_task(
                     "task_id": task_id,
                     "score": readiness.score,
                     "missing_required": missing,
+                    # Dump the whole Recommendation instead of re-typing a
+                    # subset of its fields (#1172). The hand-built dict here
+                    # silently dropped ``defect_code``, so the one refusal a
+                    # caller actually receives carried human prose and no
+                    # vocabulary code — exactly the thing the closed
+                    # vocabulary exists to prevent. model_dump also means the
+                    # next field added to Recommendation reaches this payload
+                    # without anyone remembering to widen it.
                     "recommendations": [
-                        {
-                            "field": r.field,
-                            "severity": r.severity,
-                            "message": r.message,
-                            "expected_score_delta": r.expected_score_delta,
-                        }
-                        for r in readiness.recommendations
+                        r.model_dump() for r in readiness.recommendations
                     ],
                     "hint": "pass force=true to override the DoR gate",
                 },
