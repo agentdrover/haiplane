@@ -173,12 +173,54 @@ async def record_steward_judgement(
     )
     await _close_the_order(db, task_id, body.generation, body.kind)
     await db.commit()
+    await _self_approve_if_everything_converged(
+        db, task_id, body.generation, body.kind, effective_verdict
+    )
     saved = await repo.get_steward_judgement_by_id(db, inserted)
     if saved is None:
         raise RuntimeError(
             f"steward judgement {inserted} missing after insert for task #{task_id}"
         )
     return StewardJudgementView(**dict(saved))
+
+
+async def _self_approve_if_everything_converged(
+    db, task_id: int, generation: int, kind: str, verdict: str
+) -> None:
+    """Записанный approve может уехать без человека — если всё сошлось (#1231).
+
+    ТОЛЬКО ``kind=verdict`` и ТОЛЬКО ``approve``. Про драфт здесь решать
+    нечего — у DoR свой привратник (#1159), он в scope_out #1231. А
+    ``changes_requested`` и ``escalate`` самостоятельного одобрения не
+    порождают по определению, и звать правило на них значило бы спрашивать
+    «сошлись ли свидетельства» там, где судья уже сказал «нет».
+
+    Вызов стоит здесь, а не в проходе поллера, ради at-most-once: запись
+    суждения случается ровно один раз на тройку (задача, поколение, kind) —
+    повтор отбивает 409 контракта #1022. Поллер писал бы строку в карточку
+    каждые тридцать секунд, пока задача стоит в review.
+
+    Best effort ТЕМ ЖЕ договором, что и закрытие заказа выше: суждение уже
+    записано и стоит независимо от того, чем кончилось применение. Но
+    молчать про отказ нельзя — проглоченное исключение здесь неотличимо от
+    «правило посмотрело и не одобрило», а это разные вещи: во втором случае
+    задача ждёт человека осознанно, в первом — по недосмотру.
+    """
+    from hub.services.steward_dispatch import KIND_VERDICT
+
+    if kind != KIND_VERDICT or verdict != "approve":
+        return
+    try:
+        from hub.services.steward_applied import apply_self_approval
+
+        await apply_self_approval(db, task_id, generation)
+    except Exception as exc:  # noqa: BLE001 — суждение стоит в любом случае
+        log.warning(
+            "self-approval not applied for task #%s gen %s: %s",
+            task_id,
+            generation,
+            exc,
+        )
 
 
 async def _refuse_unknown_closure_uids(

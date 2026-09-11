@@ -773,3 +773,314 @@ async def test_a_signal_the_rule_forgot_to_count_is_not_a_converged_one():
         "полнота оснований"
     )
     assert SelfApproval(converged=SELF_APPROVAL_SIGNALS).allowed
+
+
+# ---------------------------------------------------------------------------
+# #1231, вторая сдача — находки внешнего ревью
+# ---------------------------------------------------------------------------
+
+
+async def test_a_live_check_on_another_commit_is_not_evidence_about_this_one(
+    db: aiosqlite.Connection,
+):
+    """Живая проверка принимается ТОЛЬКО против сдаваемого коммита.
+
+    Состояние живой проверки собирается настоящим ``live_check_state``, а не
+    выдумывается: именно его на ревью вызывает ``build_review_brief``, и
+    именно его ``sha_mismatch`` до доставки всегда ложен — сравнивать не с
+    чем, merge-коммита ещё нет. Поэтому запрет, полагающийся на чужой флаг,
+    пропускал наблюдение неопознанного кода.
+    """
+    from hub.services.review_evidence import live_check_state
+
+    project_id = await _project(db, "live-check-foreign")
+    task_id = await _client_task(db, project_id)
+    manual_ac = AcceptanceCriterion(
+        id="AC-9",
+        given="раскатано",
+        when="смотрят прод",
+        then="ручка отвечает",
+        verifiable_by=ACVerifiableBy.manual,
+    )
+
+    for recorded_sha, why in (
+        ("", "живая проверка не назвала коммит вовсе"),
+        ("f" * 40, "живая проверка снята на другом коммите"),
+    ):
+        await repo.insert_live_check(
+            db,
+            task_id=task_id,
+            sha=recorded_sha,
+            outcome="done",
+            observation="ручка ответила",
+        )
+        raw = await live_check_state(
+            db, task_id, delivered_sha=await repo.merge_sha_for_task(db, task_id)
+        )
+        assert raw["state"] == "done"
+        assert not raw.get("sha_mismatch"), (
+            "до доставки хабу не с чем сверять — на этот флаг опираться нельзя"
+        )
+
+        decision = self_approval(
+            _brief(
+                acceptance_criteria=[_brief().acceptance_criteria[0], manual_ac],
+                live_check=LiveCheckState(**raw),
+            ),
+            diff_paths=["hub/services/x.py"],
+            reviewer_reachable=True,
+        )
+
+        assert not decision.allowed, why
+        assert [code for code, _ in decision.forbidden] == ["live_check_unknown"], why
+        assert _SHA_1231[:12] in decision.forbidden[0][1], (
+            "отказ обязан назвать коммит, о котором свидетельство обязано было "
+            "говорить"
+        )
+
+
+async def test_the_card_never_records_an_approval_the_judgement_did_not_give(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Запись «одобрено без человека» появляется только при настоящем approve.
+
+    Решение по свидетельствам и суждение стюарда — разные вопросы, и они
+    расходятся: набор может сойтись, а стюард просить правок. Тогда
+    ``apply_judgement`` возвращает работу автору, и строка про одобрение в
+    карточке описывала бы исход, которого не было, — ложная запись в
+    аудите, то есть ровно то, ради чего вся видимость и заводилась.
+    """
+    monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
+    project_id = await _project(db, "self-approval-vs-judgement")
+    task_id = await _client_task(db, project_id)
+    await _judge(db, task_id, verdict="changes_requested")
+    decision = _decide()
+    assert decision.allowed, "свидетельства сошлись — расходится именно суждение"
+
+    outcome, detail = await approve_without_a_human(db, task_id, 1, decision)
+
+    assert outcome == RETURNED, detail
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert not [c for c in updates if "Одобрено стюардом без человека" in c], (
+        "суждение просило правок — записи об одобрении в карточке быть не может"
+    )
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", "работа вернулась автору, как и решил стюард"
+
+
+# ---------------------------------------------------------------------------
+# Боевой вход: правило вызывается не только из тестов (#1231, вторая сдача)
+# ---------------------------------------------------------------------------
+
+
+def _grant_act(monkeypatch) -> None:
+    """Выдать режим act ТЕМ ЖЕ читателем, который его выдаёт в бою.
+
+    ``effective_mode`` — единственное место, где слово ``act`` вообще может
+    быть возвращено (#1107). Подменяется именно оно, потому что тест про
+    вызов правила, а не про условия выдачи автономии: их проверяет #1107.
+    """
+    from hub.services import steward_shadow
+
+    async def _act(_db):
+        return "act"
+
+    monkeypatch.setattr(steward_shadow, "effective_mode", _act)
+
+
+async def _steward_lines(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if "самостоятельн" in dict(u)["content"].lower()
+        or "Одобрено стюардом без человека" in dict(u)["content"]
+    ]
+
+
+async def test_with_the_contour_off_a_recorded_judgement_changes_nothing(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Режим не act — хаб ведёт себя ровно как до этой задачи.
+
+    Замок читается настоящим ``effective_mode``, без подмен: ``STEWARD_MODE``
+    по умолчанию ``off``, и это то состояние, в котором прод живёт сегодня.
+    Проверяется не «не одобрено», а ОТСУТСТВИЕ следа вообще — ни вердикта, ни
+    смены статуса, ни строки в карточке: выключенный контур обязан быть
+    неотличим от несуществующего.
+    """
+    monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
+    monkeypatch.setattr(config, "STEWARD_MODE", "off")
+    project_id = await _project(db, "live-path-off")
+    task_id = await _client_task(db, project_id)
+    before = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+
+    await _judge(db, task_id, verdict="approve")
+
+    task = dict(await repo.get_task(db, task_id))
+    assert not (task.get("review_verdict") or ""), "вердикта при off не появляется"
+    assert task["status"] == "review", "задача ждёт человека там же, где ждала"
+    assert await _steward_lines(db, task_id) == [], (
+        "выключенный контур не пишет в карточку ничего — ни одобрения, ни отказа"
+    )
+    after = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert after == before + ["Steward judgement recorded: verdict approve."], (
+        "единственная новая строка — сама запись суждения, как и до #1231"
+    )
+
+
+async def test_a_project_that_did_not_delegate_the_verdict_gets_no_autonomy(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Режим act есть, делегирования нет — правило не применяется.
+
+    Автономия включается глобально, а делегируется ПОПРОЕКТНО (#743, #1151).
+    Проект, не отдавший гейт стюарду, не получает самостоятельных одобрений
+    оттого, что их получил соседний.
+    """
+    from hub.services.steward_applied import apply_self_approval
+
+    monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
+    _grant_act(monkeypatch)
+    project_id = await _project(db, "live-path-not-delegated")
+    await db.execute(
+        "UPDATE projects SET gate_policy=? WHERE id=?",
+        ('{"verdict": "human"}', project_id),
+    )
+    await db.commit()
+    task_id = await _client_task(db, project_id)
+    await _judge(db, task_id, verdict="approve")
+
+    assert await apply_self_approval(db, task_id, 1) is None, (
+        "гейт не делегирован — правило здесь не решает ничего"
+    )
+    assert await _steward_lines(db, task_id) == []
+
+
+async def test_the_gatekeeper_is_asked_before_the_eight_signals(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Право применять спрашивается раньше свидетельств и своим отказом.
+
+    Восемь признаков не заменяют привратника (#1147, #1148): они ничего не
+    говорят ни про класс риска, ни про громкие основания автовердикта. Отказ
+    привратника обязан назвать СВОЙ код, а не выглядеть как несобранное
+    свидетельство.
+    """
+    from hub.services.steward_applied import apply_self_approval
+
+    monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    _grant_act(monkeypatch)
+    project_id = await _project(db, "live-path-gatekeeper")
+    task_id = await _client_task(db, project_id)
+    await _judge(db, task_id, verdict="approve")
+
+    outcome, detail = await apply_self_approval(db, task_id, 1)
+
+    assert outcome == ESCALATED_TO_HUMAN, detail
+    assert "precondition_failed" in detail
+    lines = await _steward_lines(db, task_id)
+    assert lines and "Привратник применения возражает" in lines[0], (
+        "отказ права применять читается иначе, чем несошедшееся свидетельство"
+    )
+    task = dict(await repo.get_task(db, task_id))
+    assert not (task.get("review_verdict") or "")
+
+
+async def test_a_recorded_approve_reaches_the_live_rule(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Запись approve-суждения ДОХОДИТ до правила — не только из теста.
+
+    Первая сдача #1231 оставила правило без вызывающих в ``hub/``, и
+    собственный анализатор хаба (#601) сказал про оба входа ``only_tests``.
+    Этот тест и есть тот вызывающий: проверяется не возвращённое значение
+    правила, а СЛЕД его работы в карточке после настоящей записи суждения
+    контрактом #1022.
+    """
+    monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    _grant_act(monkeypatch)
+    project_id = await _project(db, "live-path-reached")
+    task_id = await _client_task(db, project_id)
+
+    await _judge(db, task_id, verdict="approve")
+
+    assert await _steward_lines(db, task_id), (
+        "правило обязано быть вызвано записью суждения: механизм без "
+        "вызывающего не меняет ни одного исхода"
+    )
+
+
+async def test_only_a_verdict_approve_reaches_the_rule(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Правило спрашивают только про approve на вердикте, и ни про что ещё.
+
+    ``changes_requested`` и ``escalate`` самостоятельного одобрения не
+    порождают по определению, а драфт решает свой привратник (#1159, scope_out
+    #1231). Спрашивать «сошлись ли свидетельства» там, где судья уже сказал
+    «нет», значило бы завести второй ответ на решённый вопрос.
+    """
+    from hub.services import steward_applied
+
+    monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    _grant_act(monkeypatch)
+    asked: list[tuple[int, int]] = []
+
+    async def _spy(_db, task_id: int, generation: int):
+        asked.append((task_id, generation))
+        return None
+
+    monkeypatch.setattr(steward_applied, "apply_self_approval", _spy)
+    project_id = await _project(db, "live-path-only-approve")
+
+    refused = await _client_task(db, project_id)
+    await _judge(db, refused, verdict="changes_requested")
+    assert asked == [], "правку судья уже запросил — правило здесь не спрашивают"
+
+    escalated = await _client_task(db, project_id)
+    await _judge(db, escalated, verdict="escalate")
+    assert asked == [], "эскалация и есть отказ судить — применять нечего"
+
+    approved = await _client_task(db, project_id)
+    await _judge(db, approved, verdict="approve")
+    assert asked == [(approved, 1)], "approve обязан дойти до правила"
+
+
+async def test_a_converged_submission_applies_without_a_human_on_the_live_path(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Все три замка открыты и свидетельства сошлись — вердикт уезжает сам.
+
+    Свидетельства подставляются готовым решением, а НЕ выдуманным вердиктом:
+    что именно считается сошедшимся набором, проверяют тесты AC-1..AC-3 выше,
+    а здесь проверяется, что открытый контур доводит их ответ до настоящей
+    записи вердикта — того же поля, в которое пишет человек.
+    """
+    from hub.services import steward_apply, steward_applied
+
+    monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    _grant_act(monkeypatch)
+
+    async def _no_refusals(_db, _task_id, _generation=None):
+        return []
+
+    async def _converged(_db, _task_id, _generation):
+        return _decide()
+
+    monkeypatch.setattr(steward_apply, "apply_refusals", _no_refusals)
+    monkeypatch.setattr(steward_applied, "self_approval_for", _converged)
+    project_id = await _project(db, "live-path-applies")
+    task_id = await _client_task(db, project_id)
+
+    await _judge(db, task_id, verdict="approve")
+
+    task = dict(await repo.get_task(db, task_id))
+    assert (task.get("review_verdict") or "") == ReviewVerdict.approved.value, (
+        "сошедшаяся сдача уезжает без человеческого вердикта — в этом вся задача"
+    )
+    lines = await _steward_lines(db, task_id)
+    assert lines and "Одобрено стюардом без человека" in lines[0]
