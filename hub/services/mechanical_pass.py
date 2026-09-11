@@ -168,19 +168,19 @@ async def run_mechanical_pass(
         return PassResult(False, "отчёта об этом поколении нет")
     report = dict(reports[-1])
     findings = _json_list(report.get("unresolved"))
-    if not findings:
-        # Ровно та ветка, по которой идёт подавляющее большинство отчётов.
-        # Дёшево и молча: шаг существует для неразрешённых находок, и отчёт
-        # без них ему не предмет.
-        return PassResult(False, "неразрешённых находок нет")
-
     # Пропускается не ОТЧЁТ, а разобранная НАХОДКА: второй отчёт поколения
     # приносит свои неразрешённые записи, и им исход положен так же.
     answered_before = await mechanical_outcomes(db, task_id, generation)
     uids = unresolved_uids(findings)
     pending = [(uid, f) for uid, f in zip(uids, findings) if uid not in answered_before]
     if not pending:
-        return PassResult(False, "все находки этого поколения уже разобраны")
+        # ОДНА дверь на два случая: неразрешённых находок в отчёте нет вовсе
+        # (так идёт подавляющее большинство отчётов) или все они уже разобраны.
+        # Раньше первый случай отсекался отдельной проверкой выше — и та
+        # проверка стала неубиваемой мутацией: снятие ничего не меняло,
+        # потому что пустой список находок и так даёт пустой ``pending``.
+        # Правило, которое нельзя нарушить, правилом не является.
+        return PassResult(False, "разбирать нечего: новых неразрешённых находок нет")
 
     runs_left = MAX_RUNS_PER_REPORT
     outcomes: list[dict[str, Any]] = []

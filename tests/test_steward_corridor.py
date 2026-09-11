@@ -1129,6 +1129,22 @@ async def test_the_live_probe_refuses_a_mutation_that_breaks_the_parse(
     )
     monkeypatch.setattr(config_module, "MUTATION_PROBE_SCRATCH_DIR", str(tmp_path))
 
+    # Отказ обязан случиться ДО прогона. Проверять только «ответ None» мало:
+    # неразбираемый файл роняет и сбор набора, а сбор с ERROR тоже даёт None
+    # (#1234, второе ревью) — то есть утверждение проходило бы и без правила.
+    # Считаем заказы команды набора: их должно быть НОЛЬ.
+    from hub.services import mechanical_pass as mp
+
+    suite_runs: list[list[str]] = []
+    original_run = mp._run
+
+    async def _counted(argv, cwd, timeout):
+        if argv[0] != "git":
+            suite_runs.append(argv)
+        return await original_run(argv, cwd, timeout)
+
+    monkeypatch.setattr(mp, "_run", _counted)
+
     assert (
         await run_suite_in_sandbox(
             repo_path=str(project),
@@ -1143,6 +1159,7 @@ async def test_the_live_probe_refuses_a_mutation_that_breaks_the_parse(
         )
         is None
     )
+    assert suite_runs == [], "набор не гоняют под мутацией, которая не вышла"
     assert git("status", "--porcelain") == ""
 
 
