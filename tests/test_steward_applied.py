@@ -627,7 +627,10 @@ async def test_the_gate_never_signs_a_change_to_its_own_rules():
     )
     for live in (
         LiveCheckState(state="unknown", reason="никто не наблюдал"),
-        LiveCheckState(state="done", sha_mismatch=True),
+        # Коммит назван, и он ЧУЖОЙ. Флаг ``sha_mismatch`` здесь ни при чём:
+        # бриф считает его против доставленного merge-коммита, которого на
+        # ревью ещё нет, и до доставки он ложен всегда.
+        LiveCheckState(state="done", sha="9" * 40, sha_mismatch=False),
     ):
         watched = self_approval(
             _brief(
@@ -834,8 +837,7 @@ async def test_a_live_check_on_another_commit_is_not_evidence_about_this_one(
         assert not decision.allowed, why
         assert [code for code, _ in decision.forbidden] == ["live_check_unknown"], why
         assert _SHA_1231[:12] in decision.forbidden[0][1], (
-            "отказ обязан назвать коммит, о котором свидетельство обязано было "
-            "говорить"
+            "отказ обязан назвать коммит, о котором свидетельство обязано было говорить"
         )
 
 
