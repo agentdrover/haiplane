@@ -3830,3 +3830,107 @@ async def test_no_rest_tool_lets_hub_api_error_escape() -> None:
 
     assert not unreached, f"probe never reached REST for: {unreached}"
     assert not bare, f"refusal reached the agent without its envelope: {bare}"
+
+
+# --- #1238: what the report contract holds, the published tool must accept ---
+
+
+async def test_every_machine_review_contract_field_is_a_published_argument() -> None:
+    """Parity by ENUMERATION, not by example (#1238 review, P2).
+
+    ``incomplete_reason`` reached the API and the run-text path and never the
+    MCP one, because nobody compared the two lists: the model grew a field and
+    the tool did not, and a report submitted through MCP then always sent the
+    default. An environment refusal arriving that way is recorded as "cause not
+    stated" — dropped from the very alert and count the field exists for.
+
+    Checking one field by name would only prevent that field from regressing.
+    The set comparison is what makes the NEXT contract field fail here instead
+    of failing silently in production.
+    """
+    from hub.mcp_server import mcp
+    from hub.models import MachineReviewSubmit
+
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    published = set(tools["hub_submit_machine_review"].inputSchema["properties"])
+    contract = set(MachineReviewSubmit.model_fields)
+
+    missing = sorted(contract - published)
+    assert not missing, (
+        "MachineReviewSubmit fields the MCP tool does not accept: "
+        f"{missing}. A report submitted through MCP would send the default "
+        "for each of them and nobody would see it. Repository rule: MCP stays "
+        "behaviourally consistent with the REST API."
+    )
+    # The enumeration has to enumerate something, or it passes on an empty set.
+    assert "incomplete_reason" in contract and len(contract) > 10
+
+
+async def test_hub_submit_machine_review_sends_the_incomplete_reason(
+    mock_api_post: AsyncMock,
+) -> None:
+    """#1238: the wrapper carries the cause, it does not merely accept it.
+
+    Accepting the argument and dropping it on the floor looks identical to the
+    caller — the call succeeds either way — and produces exactly the bug this
+    fixes.
+    """
+    from hub.mcp_server import hub_submit_machine_review
+
+    mock_api_post.return_value = {
+        "id": 1,
+        "task_id": 7,
+        "submission_generation": 1,
+        "is_current": True,
+        "raw_count": 0,
+        "findings_confirmed": [],
+        "findings_rejected": [],
+    }
+    await hub_submit_machine_review(
+        7,
+        raw_count=0,
+        incomplete=True,
+        incomplete_reason="environment",
+        lost_dimensions=["прогон тестов: в среде нет uv/pytest"],
+    )
+    _, body = mock_api_post.await_args.args
+    assert body["incomplete_reason"] == "environment"
+
+
+async def test_machine_review_list_arguments_still_accept_null(
+    mock_api_post: AsyncMock,
+) -> None:
+    """The schema trim that paid for the new field kept the accepted input.
+
+    The four list arguments dropped their ``null`` arm from the published
+    schema — the wrapper never distinguished ``null`` from omitted — but a
+    client already sending ``null`` must keep working. Called through
+    ``mcp.call_tool``, the published entrance, because the Python function
+    would accept ``None`` regardless of what the schema says.
+    """
+    from hub.mcp_server import mcp
+
+    mock_api_post.return_value = {
+        "id": 1,
+        "task_id": 7,
+        "submission_generation": 1,
+        "is_current": True,
+        "raw_count": 0,
+        "findings_confirmed": [],
+        "findings_rejected": [],
+    }
+    await mcp.call_tool(
+        "hub_submit_machine_review",
+        {
+            "task_id": 7,
+            "raw_count": 0,
+            "incomplete": False,
+            "findings_confirmed": None,
+            "findings_rejected": None,
+            "unresolved": None,
+            "lost_dimensions": None,
+        },
+    )
+    _, body = mock_api_post.await_args.args
+    assert body["findings_confirmed"] == []
+    assert body["lost_dimensions"] == []

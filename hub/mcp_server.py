@@ -6,7 +6,9 @@ import json
 import time
 import urllib.parse
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
+
+from pydantic import BeforeValidator
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
@@ -2414,15 +2416,33 @@ async def hub_list_projects(include_archived: bool = False) -> CallToolResult:
     return structured_echo_result("\n".join(lines), projects=projects)
 
 
+def _null_is_empty(value: Any) -> Any:
+    """``null`` and "omitted" are the same answer for a list argument.
+
+    Published as a plain array rather than "array or null" (#1238). The
+    wrapper has always folded both into ``[]``, so the null arm advertised a
+    distinction the tool does not make — and the catalog paid ~32 characters
+    of schema per argument for it, on a budget with 5 characters left. The
+    coercion stays here so a client that already sends ``null`` keeps working:
+    the surface shrinks, the accepted input does not.
+    """
+    return [] if value is None else value
+
+
+ListOfDicts = Annotated[list[dict[str, Any]], BeforeValidator(_null_is_empty)]
+ListOfStrings = Annotated[list[str], BeforeValidator(_null_is_empty)]
+
+
 @mcp.tool()
 async def hub_submit_machine_review(
     task_id: int,
     raw_count: int,
     incomplete: bool,
-    findings_confirmed: list[dict[str, Any]] | None = None,
-    findings_rejected: list[dict[str, Any]] | None = None,
-    unresolved: list[dict[str, Any]] | None = None,
-    lost_dimensions: list[str] | None = None,
+    incomplete_reason: str = "",
+    findings_confirmed: ListOfDicts = [],
+    findings_rejected: ListOfDicts = [],
+    unresolved: ListOfDicts = [],
+    lost_dimensions: ListOfStrings = [],
     harness_skill: str = "multi-agent-review",
     harness_version: int | None = None,
     agent_count: int | None = None,
@@ -2435,18 +2455,19 @@ async def hub_submit_machine_review(
     """Submit a structured multi-agent review report (#381).
 
     Bound to the current submission generation: resubmitting work makes the
-    report stale. Metrics are optional but feed practice economics (#384).
+    report stale. Metrics are optional (#384).
 
     ``incomplete`` is REQUIRED, no default (#549): "0 confirmed" means nothing
-    without it. A finding nobody could judge goes to ``unresolved``, never to
-    ``findings_rejected`` — "nobody voted" and "refuted" are opposite.
+    without it.
 
     Args:
         task_id: Reviewed task.
         raw_count: Findings before adversarial verification.
         incomplete: True when an agent died, a dimension was lost, context was
-            truncated, or a budget ran out. No default: a silent False is how
-            a run with dead agents reads clean.
+            truncated, or a budget ran out.
+        incomplete_reason: WHY (#1238): 'environment' — nothing to run tests
+            with, no diff to compare; a second run repeats it. 'profile' —
+            budget ran out; a top-up can help. Empty means not stated.
         findings_confirmed: [{title, severity, locator, category?, file?,
             start_line?, end_line?, detail?}]. locator is REQUIRED (#1007):
             'lines' (file + start_line), 'file' (module known, line not),
@@ -2466,11 +2487,12 @@ async def hub_submit_machine_review(
     """
     body: dict[str, Any] = {
         "raw_count": raw_count,
-        "findings_confirmed": findings_confirmed or [],
-        "findings_rejected": findings_rejected or [],
+        "findings_confirmed": findings_confirmed,
+        "findings_rejected": findings_rejected,
         "incomplete": incomplete,
-        "unresolved": unresolved or [],
-        "lost_dimensions": lost_dimensions or [],
+        "incomplete_reason": incomplete_reason,
+        "unresolved": unresolved,
+        "lost_dimensions": lost_dimensions,
         "harness_skill": harness_skill,
         "orchestrator": orchestrator,
         "model": model,

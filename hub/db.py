@@ -2788,9 +2788,9 @@ HAIPLANE_MACHINE_REVIEW=require
 3. Исправить confirmed-находки, прогнать тесты заново (exit code проверять
    отдельным echo, не через пайп).
 4. `hub_submit_machine_review(task_id, raw_count, incomplete,
-   findings_confirmed, findings_rejected, unresolved, lost_dimensions,
-   harness_skill, harness_version, agent_count, tokens_spent, duration_ms,
-   orchestrator, model)` — метрики опциональны, но токены/время питают
+   incomplete_reason, findings_confirmed, findings_rejected, unresolved,
+   lost_dimensions, harness_skill, harness_version, agent_count, tokens_spent,
+   duration_ms, orchestrator, model)` — метрики опциональны, но токены/время питают
    экономику практики (#384). Отчёт привязывается к текущему
    submission_generation: пересдача работы делает его stale.
 
@@ -2808,9 +2808,9 @@ HAIPLANE_MACHINE_REVIEW=require
    хватило на объём диффа. Пропуск поля означает «причина не заявлена» и НЕ
    читается ни как одно, ни как другое. Прозу по-прежнему пиши в
    `lost_dimensions`: причина берётся из этого слова, а не угадывается по
-   тексту. Поле едет в ТЕЛЕ отчёта — HTTP `POST /api/tasks/<id>/machine-review`
-   и текстовый блок прогона; в MCP-инструменте его пока нет, каталог упёрся в
-   свой потолок (#780), и подъём потолка — отдельное решение.
+   тексту. Поле едет ВСЕМИ тремя путями, которыми приезжают отчёты: аргумент
+   MCP-инструмента, HTTP `POST /api/tasks/<id>/machine-review` и текстовый
+   блок прогона.
 5. `hub_submit_for_review` — человеческий вердикт остаётся финальным гейтом;
    отчёт его информирует, не заменяет.
 

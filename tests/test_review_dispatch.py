@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from unittest.mock import patch
 
 import aiosqlite
 from httpx import AsyncClient
@@ -4403,3 +4404,50 @@ async def test_reports_without_the_field_are_not_counted_as_refusals(
     view = MachineReviewView(**row)
     assert view.incomplete_reason == ""
     assert view.incomplete is True
+
+
+async def test_the_mcp_path_carries_the_environment_refusal_to_storage(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1238 (ревью, P2): отчёт, сданный через MCP, доносит причину.
+
+    До этой правки аргумента не было вовсе: вызов проходил успешно, лишний
+    аргумент молча отбрасывался, и в строке оставалось умолчание — «причина
+    не заявлена». Отказ среды, приехавший этим путём, выпадал и из алерта, и
+    из счётчика, ради которых поле заведено.
+
+    Проверяется ОПУБЛИКОВАННЫМ входом — ``mcp.call_tool`` поверх настоящего
+    приёма, — потому что питонова функция приняла бы аргумент и тогда, когда
+    в схеме его нет: вызов .fn ничего не доказывает.
+    """
+    from hub.mcp_server import mcp
+
+    task_id = await _submitted(client, db, "spike-mcp-refusal")
+
+    async def _post(path: str, body: dict | None = None, **_kw):
+        resp = await client.post(path, json=body or {})
+        resp.raise_for_status()
+        return resp.json()
+
+    with patch("hub.mcp_server._api_post", side_effect=_post):
+        await mcp.call_tool(
+            "hub_submit_machine_review",
+            {
+                "task_id": task_id,
+                "raw_count": 0,
+                "incomplete": True,
+                "incomplete_reason": "environment",
+                "lost_dimensions": ["прогон тестов: в среде нет uv/pytest"],
+                "agent": "cursor-cloud-reviewer",
+                "model": "grok-4.6",
+            },
+        )
+
+    stored = dict(await repo.get_latest_machine_review(db, task_id))
+    assert stored["incomplete_reason"] == "environment"
+    assert is_environment_refusal(stored) is True
+
+    # И карточка получает тот же алерт, что и на HTTP-пути: паритет — это про
+    # поведение, а не про то, что аргумент принят.
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert [u for u in updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
