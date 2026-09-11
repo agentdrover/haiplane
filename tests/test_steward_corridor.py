@@ -1301,7 +1301,11 @@ async def test_a_run_that_hit_the_ceiling_is_killed_with_its_children(tmp_path):
     from hub.services.mechanical_pass import _run
 
     marker = tmp_path / "alive.txt"
-    argv = ["/bin/sh", "-c", f"sleep 5; echo alive > {marker}"]
+    # Сроки: потолок 1с, работа 2с, ожидание 5с. Ожидание ОБЯЗАНО быть длиннее
+    # работы — иначе тест проверяет собственное нетерпение, а не снятие
+    # процесса: первая его редакция ждала 3с при работе в 5с и выживала под
+    # мутацией «не снимать группу».
+    argv = ["/bin/sh", "-c", f"sleep 2; echo alive > {marker}"]
 
     try:
         await _run(argv, None, 1)
@@ -1309,7 +1313,7 @@ async def test_a_run_that_hit_the_ceiling_is_killed_with_its_children(tmp_path):
     except (TimeoutError, asyncio.TimeoutError):
         pass
 
-    await asyncio.sleep(3)
+    await asyncio.sleep(5)
     assert not marker.exists(), (
         "процесс пережил потолок и продолжил работать от имени хаба"
     )
