@@ -187,36 +187,6 @@ async def issue_code(
 # ---------------------------------------------------------------------------
 
 
-async def renew_code(db: aiosqlite.Connection, raw_code: str) -> bool:
-    """Отмерить коду его срок ЗАНОВО, от этой секунды. ``False`` — некому.
-
-    Нужна ровно там, где между чеканкой кода и его первым употреблением стоит
-    ОЖИДАНИЕ, которого чеканящий не видит: локальный прогон ревью чеканит код
-    внутри HTTP-запроса автора, а слот хоста берёт уже в фоне и ждёт его
-    столько, сколько идёт ревью соседа — десятки минут против
-    ``CHAT_PAIR_CODE_SECONDS`` (#1208, находка ревьюера Codex 11.09.2026).
-    Короткий срок жизни кода при этом НЕ удлиняется: он просто начинает
-    считаться с фактического старта, как и задумано текстом промта («код
-    живёт минуты — обменяй его сразу»).
-
-    Сожжённый код воскресить нельзя, и это свойство не отдельной проверки, а
-    того, КАК его жгут: ``issue_code`` строку УДАЛЯЕТ, поэтому пересдача,
-    сжёгшая код прошлого поколения, не оставляет здесь ничего, что можно было
-    бы продлить. Потраченный код не продлевается по ``redeemed_at``:
-    продлённый, он дал бы вторую сессию по одному предъявлению.
-    """
-    cursor = await db.execute(
-        "UPDATE chat_pair_codes SET expires_at = datetime('now', ?) "
-        "WHERE code_hash = ? AND redeemed_at IS NULL",
-        (
-            f"+{int(config.CHAT_PAIR_CODE_SECONDS)} seconds",
-            hash_pair_code(normalize_pair_code(raw_code)),
-        ),
-    )
-    await db.commit()
-    return bool(cursor.rowcount)
-
-
 async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any] | None:
     """Exchange a code for a session. ``None`` for every way that can fail.
 

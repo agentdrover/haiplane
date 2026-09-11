@@ -2975,9 +2975,9 @@ async def test_local_review_obeys_policy_and_cost_ceiling(
     runs: list[str] = []
     real_run = local_reviewer.run_review
 
-    async def _counting(prompt, *, timeout=None, on_slot=None):
+    async def _counting(prompt, *, timeout=None, prompt_at_slot=None):
         runs.append(prompt)
-        return await real_run(prompt, timeout=timeout, on_slot=on_slot)
+        return await real_run(prompt, timeout=timeout, prompt_at_slot=prompt_at_slot)
 
     monkeypatch.setattr(local_reviewer, "run_review", _counting)
     _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
@@ -3039,7 +3039,7 @@ async def test_github_still_goes_to_the_cloud_reviewer(
 
     runs: list[str] = []
 
-    async def _never(prompt, *, timeout=None, on_slot=None):
+    async def _never(prompt, *, timeout=None, prompt_at_slot=None):
         runs.append(prompt)
         return None
 
@@ -3430,7 +3430,7 @@ async def test_a_detaching_sandbox_is_refused_by_name(
     _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
     runs: list[str] = []
 
-    async def _never(prompt, *, timeout=None, on_slot=None):
+    async def _never(prompt, *, timeout=None, prompt_at_slot=None):
         runs.append(prompt)
         return None
 
@@ -6451,40 +6451,171 @@ async def test_the_queued_local_run_starts_with_a_live_access_code(
     )
 
 
-async def test_renewal_speaks_only_when_a_code_was_really_lost(
-    db: aiosqlite.Connection, db_dsn: str, caplog
+async def test_the_slot_prompt_mints_a_code_or_says_why_not(
+    db: aiosqlite.Connection, db_dsn: str, monkeypatch, caplog
 ):
-    """Продление кода пишет в журнал РОВНО один случай — потерянный код.
+    """Промт на слоте: либо свежий код, либо названная в журнале причина.
 
     Журнал здесь единственный след того, что отчёт поедет слабым путём
     (блоком в тексте прогона, #1036), и цена ложной строки высока в обе
     стороны. «Кода не выдавали вовсе» — это открытый режим или отозванный
-    токен, и говорить там «код пропал» значит звать оператора искать то,
-    чего не было. Молчать же о настоящей пропаже значит оставить слабый путь
+    токен, и говорить там «код не выписать» значит звать оператора искать то,
+    чего не было. Молчать же о настоящей неудаче значит оставить слабый путь
     незамеченным.
 
-    Заодно проверяется, что продление доходит до базы обоими способами, как
-    и на проде: своим соединением по пути и на переданном живом соединении.
+    Заодно проверяется, что подмена доходит до базы обоими способами, как и
+    на проде: своим соединением по пути базы и на переданном живом
+    соединении.
     """
     import logging
+    import re
 
-    from hub.services.review_dispatch import _renew_access_code
+    from hub.services import chat_pair
+    from hub.services.review_dispatch import _prompt_at_slot, instance_base_url
+
+    principal = await _local_principal(db, monkeypatch)
+    # Задача настоящая: код привязывается к ней внешним ключом, и выдуманный
+    # номер проверял бы отказ базы, а не поведение подмены.
+    task_id = await _node(db, title="слот", task_type="task", parent_id=None)
+    # Запись зафиксирована: второй путь до базы открывает СВОЁ соединение, и
+    # незакрытая транзакция фикстуры отдала бы ему «database is locked» —
+    # то есть тест мерил бы блокировку, а не подмену.
+    await db.commit()
+    base = instance_base_url().rstrip("/")
+    stale = "AH-11111111"
+    prompt = "шапка\n" + _delivery_block(task_id, stale, base) + "хвост\n"
+
+    async def _at_slot(db_path, live_db, **kw):
+        return await _prompt_at_slot(
+            db_path,
+            live_db,
+            prompt=kw.pop("prompt", prompt),
+            code=kw.pop("code", stale),
+            task_id=task_id,
+            generation=1,
+            principal_id=kw.pop("principal_id", principal),
+        )
 
     with caplog.at_level(logging.WARNING, logger="hub.services.review_dispatch"):
-        await _renew_access_code(db_dsn, None, "")
-        await _renew_access_code("", None, "AH-11111111")
+        assert await _at_slot(db_dsn, None, code="") == prompt, (
+            "промт без блока доставки трогать нечем"
+        )
+        assert await _at_slot("", None) == prompt, "базы нет — менять нечем"
         assert caplog.records == [], (
-            "продление сказало что-то о коде, которого не выдавали: "
+            "сказано о коде, которого не выдавали: "
             f"{[r.getMessage() for r in caplog.records]}"
         )
 
-        await _renew_access_code(db_dsn, None, "AH-22222222")
-        await _renew_access_code("", db, "AH-33333333")
+        assert await _at_slot(db_dsn, None, principal_id=None) == prompt, (
+            "без принципала код не выписать — промт обязан остаться прежним"
+        )
+        assert await _at_slot(db_dsn, None, prompt="без блока") == "без блока", (
+            "блока доставки в промте нет — подменять нечего"
+        )
 
     said = [r.getMessage() for r in caplog.records]
-    assert len(said) == 2, (
-        f"о пропавшем коде обязаны были сказать оба пути продления: {said}"
-    )
+    assert len(said) == 2, f"о каждой неудаче обязаны были сказать один раз: {said}"
     assert all("stdout" in message for message in said), (
         f"в журнале не названо следствие — отчёт поедет слабым путём: {said}"
+    )
+
+    for db_path, live in ((db_dsn, None), ("", db)):
+        produced = await _at_slot(db_path, live)
+        assert produced != prompt, (
+            f"промт не переписан (путь к базе {db_path!r}) — прогон унёс бы "
+            "код, который к этому времени может быть уже удалён сборщиком"
+        )
+        found = re.search(r'"code":"([^"]+)"', produced)
+        assert found and found.group(1) != stale, f"код не сменился: {produced[:200]}"
+        assert await db.execute_fetchall(
+            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? "
+            "AND redeemed_at IS NULL AND expires_at > datetime('now')",
+            (chat_pair.hash_pair_code(chat_pair.normalize_pair_code(found.group(1))),),
+        ), "выписанный код не лёг в базу живым"
+        assert prompt.replace(
+            _delivery_block(task_id, stale, base), ""
+        ) == produced.replace(_delivery_block(task_id, found.group(1), base), ""), (
+            "переписан не только блок доставки — промт обязан отличаться ровно кодом"
+        )
+
+
+async def test_a_purged_access_code_is_replaced_before_the_run_starts(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Код, который сборщик уже УДАЛИЛ, обязан быть заменён к старту прогона.
+
+    Находка ревьюера Codex 11.09.2026 на c6af952: продления мало. Пока прогон
+    стоит в очереди, по часовому кругу поллера отрабатывает ``purge_expired``,
+    и протухшую строку она не щадит — ``DELETE FROM chat_pair_codes WHERE
+    expires_at < datetime('now')``. Продлять тогда нечего, и второй в очереди
+    всё равно стартует с мёртвым кодом: основной канал отчёта не выкуплен,
+    прогон куплен впустую.
+
+    Гонка здесь ВОСПРОИЗВОДИТСЯ БЕЗ ЧАСОВ, а не подгадывается спячками.
+    Первый прогон, уже взявший слот, останавливается перед порождением
+    процесса и ждёт, пока вторая сдача встанет в очередь; тогда он состаривает
+    коды и гоняет сборщик — ровно тот порядок, что описан в находке, — и
+    только после этого отпускает себя. Время в этом тесте не участвует
+    вовсе, поэтому и флака в нём нет.
+    """
+    import re
+
+    from hub.services import chat_pair
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-nope"}, "run": {"id": "r-nope"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _own_host_budget(monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, "import sys; sys.stdin.read()")
+
+    queued = asyncio.Event()
+    purged: list[int] = []
+    alive: list[bool] = []
+    spawn = local_reviewer._spawn
+
+    async def _watching(prompt: str, workdir: str, limit: int, started: float):
+        found = re.search(r'"code":"([^"]+)"', prompt)
+        assert found, "в промте нет кода доступа — тогда судить не о чем"
+        rows = await db.execute_fetchall(
+            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? "
+            "AND redeemed_at IS NULL AND expires_at > datetime('now')",
+            (chat_pair.hash_pair_code(chat_pair.normalize_pair_code(found.group(1))),),
+        )
+        alive.append(bool(rows))
+        if not purged:
+            # Слот держит этот прогон, поэтому вторая сдача сейчас стоит в
+            # очереди — и её код доживает здесь свой срок ровно так, как
+            # дожил бы на проде.
+            await queued.wait()
+            await db.execute(
+                "UPDATE chat_pair_codes SET expires_at = datetime('now', '-1 hour')"
+            )
+            await db.commit()
+            purged.append(await chat_pair.purge_expired(db))
+        return await spawn(prompt, workdir, limit, started)
+
+    monkeypatch.setattr(local_reviewer, "_spawn", _watching)
+
+    for slug in ("purged-first", "purged-second"):
+        await _submitted(
+            client,
+            db,
+            slug,
+            policy={"review": "dispatch"},
+            repo_name="mrpda/snip-portal",
+            forge="gitverse",
+        )
+    queued.set()
+    await wait_for_local_runs()
+
+    assert purged and purged[0] >= 1, (
+        f"сборщик ничего не удалил ({purged}) — тогда тест не воспроизвёл "
+        "находку и зелен не за то"
+    )
+    assert len(alive) == 2, f"оба прогона обязаны были стартовать: {alive}"
+    assert alive == [True, True], (
+        f"прогон стартовал с кодом, которого в базе уже нет: {alive}. "
+        "Продления мало: сборщик протухшего УДАЛЯЕТ строку, и продлять "
+        "становится нечего — код к старту обязан быть выписан заново"
     )

@@ -1921,7 +1921,13 @@ async def dispatch_local_review(
     )
     await db.commit()
     await _start_local_run(
-        db, dispatch_id, task_id, generation, order.prompt, order.access_code
+        db,
+        dispatch_id,
+        task_id,
+        generation,
+        order.prompt,
+        order.access_code,
+        principal_id,
     )
     return True
 
@@ -1990,6 +1996,7 @@ async def _start_local_run(
     generation: int,
     prompt: str,
     access_code: str = "",
+    principal_id: int | None = None,
 ) -> None:
     """Запустить прогон фоном и вернуть управление сдаче.
 
@@ -2009,6 +2016,7 @@ async def _start_local_run(
             generation=generation,
             prompt=prompt,
             access_code=access_code,
+            principal_id=principal_id,
         )
     )
     _LOCAL_RUNS[dispatch_id] = _LocalRunHandle(
@@ -2115,30 +2123,55 @@ async def _main_db_path(db: aiosqlite.Connection) -> str:
     return ""
 
 
-async def _renew_access_code(
-    db_path: str, live_db: aiosqlite.Connection | None, code: str
-) -> None:
-    """Отмерить коду доступа его срок ЗАНОВО — в момент, когда слот уже взят.
+async def _prompt_at_slot(
+    db_path: str,
+    live_db: aiosqlite.Connection | None,
+    *,
+    prompt: str,
+    code: str,
+    task_id: int,
+    generation: int,
+    principal_id: int | None,
+) -> str:
+    """Промт с ЗАНОВО выписанным кодом доступа — в момент, когда слот взят.
 
-    Код чеканится в ``prepare_review_order``, то есть внутри HTTP-запроса
-    автора, и живёт ``CHAT_PAIR_CODE_SECONDS`` (на проде 300 с). Слот хоста
-    берётся уже в фоне, а ждать его можно всё чужое ревью — десятки минут.
-    Без этого второй в очереди стартовал бы с МЁРТВЫМ кодом: основной канал
-    отчёта ему не выкупить, и прогон сваливается в слабый путь через stdout
-    либо теряет отчёт вовсе (найдено ревьюером Codex 11.09.2026 на ff5b518).
+    Почему заново, а не продлением срока (так было на c6af952, #1208).
+    Продление двигало ``expires_at`` у СУЩЕСТВУЮЩЕЙ строки, а строки к этому
+    моменту может уже не быть: по часовому кругу поллера отрабатывает
+    ``chat_pair.purge_expired``, и протухший код она не щадит — ``DELETE FROM
+    chat_pair_codes WHERE expires_at < datetime('now')``. Длинная очередь —
+    ровно тот случай, ради которого всё это писалось, — переживает и срок, и
+    сборщика; продлять там нечего (найдено ревьюером Codex 11.09.2026 на
+    c6af952).
 
-    Своё соединение — по той же причине, что и у всего прочего в этом фоне:
-    соединение запроса к этому моменту давно закрыто. Держать его открытым
-    ВСЁ ожидание было бы хуже: ждут здесь десятками минут.
+    Второй путь, названный ревьюером, — исключить коды стоящих в очереди
+    заказов из сборки протухшего — отвергнут по существу: он оставляет
+    протухший код ЖИТЬ в таблице неограниченно долго и всё равно требует
+    продления, чтобы им можно было воспользоваться, то есть заводит два
+    механизма там, где хватает одного. Свежий код короткого срока, выписанный
+    тогда, когда он нужен, снимает и срок, и сборщика разом.
 
-    Неудача продления прогон не отменяет и ничего не роняет: у отчёта есть
-    слабый путь через stdout, и подменять «отчёт пришёл хуже» на «ревью не
-    состоялось» — тот самый обмен, против которого написан весь этот модуль.
-    Но молчать о ней нельзя: это единственный след того, что отчёт поедет
-    слабым путём.
+    Почему подменяется БЛОК, а не токен кода. Блок доставки собирается
+    ``_delivery_block`` детерминированно, поэтому его можно собрать заново со
+    старым кодом и убедиться, что в промте он ровно один. Подменять голый
+    токен значило бы верить, что восьмизначная строка не встретилась в
+    диффе, — а проверять это нечем.
+
+    Заказ при этом не расходится с облачным: ``prepare_review_order`` для
+    обоих транспортов остаётся ОДИН, и код в нём выписывается одинаково.
+    Локальный путь лишь переписывает свой блок доставки перед самым запуском.
+
+    Любая неудача возвращает ИСХОДНЫЙ промт и говорит об этом в журнал.
+    Прогон она не отменяет: у отчёта есть слабый путь через stdout, и
+    подменять «отчёт пришёл хуже» на «ревью не состоялось» — тот самый обмен,
+    против которого написан весь этот модуль. Но молчать нельзя — журнал
+    здесь единственный след того, что отчёт поедет слабым путём.
     """
     if not code:
-        return
+        # Кода не выдавали вовсе: открытый режим или отозванный токен. Блока
+        # доставки в промте тогда нет, и подменять нечего — говорить об этом
+        # значило бы звать оператора искать то, чего не было.
+        return prompt
     conn = None
     try:
         if db_path:
@@ -2147,16 +2180,28 @@ async def _renew_access_code(
             conn = await db_module.connect(db_path)
         target = conn if conn is not None else live_db
         if target is None:
-            return
-        from hub.services import chat_pair
-
-        if not await chat_pair.renew_code(target, code):
+            return prompt
+        hub_base = instance_base_url().rstrip("/")
+        stale = _delivery_block(task_id, code, hub_base)
+        if prompt.count(stale) != 1:
             log.warning(
-                "local review: the access code is gone before the run started; "
-                "the report will have to come back through stdout"
+                "local review: the delivery block of task #%s is not where it "
+                "was put; the report will have to come back through stdout",
+                task_id,
             )
+            return prompt
+        fresh = await _access_code(target, task_id, generation, principal_id)
+        if not fresh:
+            log.warning(
+                "local review: no access code could be minted for task #%s at "
+                "start; the report will have to come back through stdout",
+                task_id,
+            )
+            return prompt
+        return prompt.replace(stale, _delivery_block(task_id, fresh, hub_base), 1)
     except Exception:  # noqa: BLE001 - фон не имеет права уронить прогон
-        log.exception("could not renew the access code of the local review")
+        log.exception("could not mint the access code of the local review")
+        return prompt
     finally:
         if conn is not None:
             await conn.close()
@@ -2171,9 +2216,19 @@ async def _supervise_local_run(
     generation: int,
     prompt: str,
     access_code: str = "",
+    principal_id: int | None = None,
 ) -> None:
     run = await local_reviewer.run_review(
-        prompt, on_slot=lambda: _renew_access_code(db_path, live_db, access_code)
+        prompt,
+        prompt_at_slot=lambda ready: _prompt_at_slot(
+            db_path,
+            live_db,
+            prompt=ready,
+            code=access_code,
+            task_id=task_id,
+            generation=generation,
+            principal_id=principal_id,
+        ),
     )
     conn = None
     try:
