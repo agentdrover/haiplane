@@ -2975,9 +2975,9 @@ async def test_local_review_obeys_policy_and_cost_ceiling(
     runs: list[str] = []
     real_run = local_reviewer.run_review
 
-    async def _counting(prompt, *, timeout=None):
+    async def _counting(prompt, *, timeout=None, on_slot=None):
         runs.append(prompt)
-        return await real_run(prompt, timeout=timeout)
+        return await real_run(prompt, timeout=timeout, on_slot=on_slot)
 
     monkeypatch.setattr(local_reviewer, "run_review", _counting)
     _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
@@ -3039,7 +3039,7 @@ async def test_github_still_goes_to_the_cloud_reviewer(
 
     runs: list[str] = []
 
-    async def _never(prompt, *, timeout=None):
+    async def _never(prompt, *, timeout=None, on_slot=None):
         runs.append(prompt)
         return None
 
@@ -3268,6 +3268,23 @@ async def test_the_run_guard_judges_the_deadline_the_run_will_get(
     )
 
 
+def _own_host_budget(monkeypatch) -> None:
+    """Свой замок слота на этот тест — ради ЦИКЛА СОБЫТИЙ, а не ради смысла.
+
+    ``asyncio.Lock`` привязывается к циклу при ПЕРВОЙ же конкуренции за него
+    (``_LoopBoundMixin._get_loop``), а ``_HOST_BUDGET`` живёт в модуле, то
+    есть переживает тест. Второй тест, который дождётся очереди, получил бы
+    «bound to a different event loop» вместо своего измерения — и падал бы
+    только В КОМПАНИИ первого, что читается как флак, а не как правило. У
+    хаба цикл один, поэтому на проде вопроса нет вовсе.
+
+    Замок остаётся настоящим и остаётся глобалью модуля: ``run_review``
+    читает его по имени на каждом вызове, так что очередь тест измеряет ту
+    же самую.
+    """
+    monkeypatch.setattr(local_reviewer, "_HOST_BUDGET", asyncio.Lock())
+
+
 async def test_two_local_runs_never_overlap_on_the_host(monkeypatch, tmp_path):
     """Хост держит один прогон разом, и это держит ХАБ, а не скрипт враппера.
 
@@ -3284,6 +3301,7 @@ async def test_two_local_runs_never_overlap_on_the_host(monkeypatch, tmp_path):
     """
     import shlex
 
+    _own_host_budget(monkeypatch)
     marks = tmp_path / "marks"
     payload = (
         f"printf 'in\n' >> {shlex.quote(str(marks))}; "
@@ -3412,7 +3430,7 @@ async def test_a_detaching_sandbox_is_refused_by_name(
     _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
     runs: list[str] = []
 
-    async def _never(prompt, *, timeout=None):
+    async def _never(prompt, *, timeout=None, on_slot=None):
         runs.append(prompt)
         return None
 
@@ -6354,3 +6372,80 @@ def test_the_recommended_sudo_recipe_still_checks_the_scratch_group(
             "ради 45971e09, на рецепте из документа молча не срабатывает — "
             f"ровно как было до #1208. Вернулось: {local_reviewer.not_ready()}"
         )
+
+
+async def test_the_queued_local_run_starts_with_a_live_access_code(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Код доступа обязан быть жив В МОМЕНТ СТАРТА прогона, а не сдачи.
+
+    Находка ревьюера Codex 11.09.2026 на ff5b518. Код чеканится в
+    ``prepare_review_order`` — то есть внутри HTTP-запроса автора, — а слот
+    хоста (``local_reviewer._HOST_BUDGET``) берётся уже в фоне, и ждать его
+    можно дольше, чем живёт код (``CHAT_PAIR_CODE_SECONDS``, на проде 300 с
+    против ревью в десятки минут). Второй в очереди стартовал бы с мёртвым
+    кодом: основной HTTP-канал отчёта ему не выкупить, и прогон сваливается
+    в слабый путь через stdout либо теряет отчёт вовсе.
+
+    Проверяется ТЕМ ЖЕ предикатом, которым живость кода судит сам
+    ``redeem_code`` (не redeem'ом: он потратил бы код), и ровно в тот момент,
+    когда хаб порождает процесс. Первый прогон проверяется вместе со вторым —
+    иначе починка очереди могла бы сломать нормальный путь.
+    """
+    import re
+    import time as _time
+
+    from hub.services import chat_pair
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-nope"}, "run": {"id": "r-nope"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _own_host_budget(monkeypatch)
+    # Прогон держит слот ДОЛЬШЕ, чем живёт код: на проде это 300 с против
+    # ревью в десятки минут, здесь — те же отношения в секундах.
+    monkeypatch.setattr(config, "CHAT_PAIR_CODE_SECONDS", 1)
+    _stub_reviewer(
+        monkeypatch,
+        tmp_path,
+        "import sys, time; sys.stdin.read(); time.sleep(2.5)",
+    )
+
+    alive: list[bool] = []
+    spawn = local_reviewer._spawn
+
+    async def _watching(prompt: str, workdir: str, limit: int, started: float):
+        found = re.search(r'"code":"([^"]+)"', prompt)
+        assert found, "в промте нет кода доступа — тогда судить не о чем"
+        rows = await db.execute_fetchall(
+            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? "
+            "AND redeemed_at IS NULL AND expires_at > datetime('now')",
+            (chat_pair.hash_pair_code(chat_pair.normalize_pair_code(found.group(1))),),
+        )
+        alive.append(bool(rows))
+        return await spawn(prompt, workdir, limit, started)
+
+    monkeypatch.setattr(local_reviewer, "_spawn", _watching)
+
+    began = _time.monotonic()
+    for slug in ("queued-first", "queued-second"):
+        await _submitted(
+            client,
+            db,
+            slug,
+            policy={"review": "dispatch"},
+            repo_name="mrpda/snip-portal",
+            forge="gitverse",
+        )
+    await wait_for_local_runs()
+
+    assert len(alive) == 2, f"оба прогона обязаны были стартовать: {alive}"
+    assert _time.monotonic() - began > config.CHAT_PAIR_CODE_SECONDS, (
+        "очередь оказалась короче срока жизни кода — тогда тест ничего не "
+        "измерил; удлините полезную нагрузку заглушки"
+    )
+    assert alive == [True, True], (
+        f"код доступа был мёртв на старте прогона: {alive}. Второй в очереди "
+        "не выкупит основной канал отчёта и свалится в слабый путь через "
+        "stdout — или потеряет отчёт вовсе"
+    )

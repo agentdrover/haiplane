@@ -1316,6 +1316,12 @@ class ReviewOrder:
     rules_note: str
     diff_note: str
     prepass: Any
+    #: Одноразовый код, уже вписанный в ``prompt``. Хранится отдельно не ради
+    #: удобства: срок его жизни отсчитывается от ЧЕКАНКИ, а локальный прогон
+    #: может простоять в очереди дольше этого срока — тогда исполнителю нужно
+    #: отмерить срок заново, а для этого нужен сам код (#1208). Пусто там, где
+    #: кода не выдавали: открытый режим, отозванный токен.
+    access_code: str = ""
 
 
 async def prepare_review_order(
@@ -1385,6 +1391,7 @@ async def prepare_review_order(
         rules_note=rules_note,
         diff_note=diff_note,
         prepass=prepass,
+        access_code=code,
     )
 
 
@@ -1913,7 +1920,9 @@ async def dispatch_local_review(
         },
     )
     await db.commit()
-    await _start_local_run(db, dispatch_id, task_id, generation, order.prompt)
+    await _start_local_run(
+        db, dispatch_id, task_id, generation, order.prompt, order.access_code
+    )
     return True
 
 
@@ -1980,6 +1989,7 @@ async def _start_local_run(
     task_id: int,
     generation: int,
     prompt: str,
+    access_code: str = "",
 ) -> None:
     """Запустить прогон фоном и вернуть управление сдаче.
 
@@ -1998,6 +2008,7 @@ async def _start_local_run(
             task_id=task_id,
             generation=generation,
             prompt=prompt,
+            access_code=access_code,
         )
     )
     _LOCAL_RUNS[dispatch_id] = _LocalRunHandle(
@@ -2104,6 +2115,53 @@ async def _main_db_path(db: aiosqlite.Connection) -> str:
     return ""
 
 
+async def _renew_access_code(
+    db_path: str, live_db: aiosqlite.Connection | None, code: str
+) -> None:
+    """Отмерить коду доступа его срок ЗАНОВО — в момент, когда слот уже взят.
+
+    Код чеканится в ``prepare_review_order``, то есть внутри HTTP-запроса
+    автора, и живёт ``CHAT_PAIR_CODE_SECONDS`` (на проде 300 с). Слот хоста
+    берётся уже в фоне, а ждать его можно всё чужое ревью — десятки минут.
+    Без этого второй в очереди стартовал бы с МЁРТВЫМ кодом: основной канал
+    отчёта ему не выкупить, и прогон сваливается в слабый путь через stdout
+    либо теряет отчёт вовсе (найдено ревьюером Codex 11.09.2026 на ff5b518).
+
+    Своё соединение — по той же причине, что и у всего прочего в этом фоне:
+    соединение запроса к этому моменту давно закрыто. Держать его открытым
+    ВСЁ ожидание было бы хуже: ждут здесь десятками минут.
+
+    Неудача продления прогон не отменяет и ничего не роняет: у отчёта есть
+    слабый путь через stdout, и подменять «отчёт пришёл хуже» на «ревью не
+    состоялось» — тот самый обмен, против которого написан весь этот модуль.
+    Но молчать о ней нельзя: это единственный след того, что отчёт поедет
+    слабым путём.
+    """
+    if not code:
+        return
+    conn = None
+    try:
+        if db_path:
+            from hub import db as db_module
+
+            conn = await db_module.connect(db_path)
+        target = conn if conn is not None else live_db
+        if target is None:
+            return
+        from hub.services import chat_pair
+
+        if not await chat_pair.renew_code(target, code):
+            log.warning(
+                "local review: the access code is gone before the run started; "
+                "the report will have to come back through stdout"
+            )
+    except Exception:  # noqa: BLE001 - фон не имеет права уронить прогон
+        log.exception("could not renew the access code of the local review")
+    finally:
+        if conn is not None:
+            await conn.close()
+
+
 async def _supervise_local_run(
     *,
     db_path: str,
@@ -2112,8 +2170,11 @@ async def _supervise_local_run(
     task_id: int,
     generation: int,
     prompt: str,
+    access_code: str = "",
 ) -> None:
-    run = await local_reviewer.run_review(prompt)
+    run = await local_reviewer.run_review(
+        prompt, on_slot=lambda: _renew_access_code(db_path, live_db, access_code)
+    )
     conn = None
     try:
         if db_path:

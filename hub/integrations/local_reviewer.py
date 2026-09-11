@@ -55,6 +55,7 @@ import stat
 import tempfile
 import time
 from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 from typing import Any, NamedTuple
 
 from hub import config
@@ -734,7 +735,12 @@ def _clean_env(workdir: str) -> dict[str, str]:
 _HOST_BUDGET = asyncio.Lock()
 
 
-async def run_review(prompt: str, *, timeout: int | None = None) -> LocalRun | None:
+async def run_review(
+    prompt: str,
+    *,
+    timeout: int | None = None,
+    on_slot: Callable[[], Awaitable[None]] | None = None,
+) -> LocalRun | None:
     """Прогнать ревьюера над готовым промтом. ``None`` — запуска не было.
 
     ``None`` возвращается ровно тогда, когда прогона не было: нет настроек,
@@ -756,6 +762,14 @@ async def run_review(prompt: str, *, timeout: int | None = None) -> LocalRun | N
     Прогон идёт ПО ОДНОМУ на хост: см. ``_HOST_BUDGET``. Ожидание очереди в
     отмеренный прогону срок не входит — срок начинают отсчитывать после того,
     как замок взят.
+
+    ``on_slot`` зовут ОДИН раз — когда слот уже взят, а процесса ещё нет. Это
+    единственный момент, в который вызывающий может привести в порядок то,
+    что протухает в ОЧЕРЕДИ: код доступа ревьюера к хабу чеканится внутри
+    HTTP-запроса автора, живёт ``CHAT_PAIR_CODE_SECONDS``, а ждать здесь
+    можно всё чужое ревью — десятки минут (#1208, находка ревьюера Codex
+    11.09.2026). Подготовить это ЗАРАНЕЕ нельзя ровно потому, что «заранее» и
+    есть источник дефекта.
     """
     if not is_configured():
         return None
@@ -764,6 +778,8 @@ async def run_review(prompt: str, *, timeout: int | None = None) -> LocalRun | N
     # очереди прогон иначе держал бы чужой каталог в scratch всё время
     # ожидания, а хаб обещает заводить его на прогон и сносить после.
     async with _HOST_BUDGET:
+        if on_slot is not None:
+            await on_slot()
         base = config.LOCAL_REVIEW_SCRATCH_DIR.strip()
         try:
             workdir = tempfile.mkdtemp(prefix="haiplane-review-", dir=base)
