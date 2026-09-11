@@ -4164,8 +4164,11 @@ async def test_every_write_route_points_where_its_write_can_be_checked() -> None
     for path in sorted(_write_routes_in_module()):
         tool_name, advice = srv._write_state_check(path)
         if tool_name is None:
-            # Пустой указатель обязан объясниться словами.
-            if srv._TRANSPORT_NO_CHECK != advice:
+            # Пустой указатель обязан объясниться словами. Сверка по ЯДРУ
+            # фразы, а не по полному совпадению: у /api/skills причина своя
+            # («черновик за активной версией не виден»), и требование
+            # буквального текста запрещало бы её называть (#1250, находка 2).
+            if srv._TRANSPORT_NO_CHECK_CORE not in advice:
                 silent.append(path)
             continue
         tool = catalog.get(tool_name)
@@ -4232,3 +4235,345 @@ async def test_a_read_timeout_suggests_nothing_because_nothing_needs_checking(
     assert payload["suggested_tool"] is None
     assert payload["retry_safe"] is True
     assert srv._TRANSPORT_NO_CHECK not in payload["message"]
+
+
+# --- #1250, сдача №3. Две находки ревью, обе воспроизведены ДО починки через
+# --- опубликованный вход на настоящем таймауте, а не вычитаны из кода.
+#
+# НАХОДКА 1. retry_safe выводился из одного HTTP-метода: любая запись → false
+# и совет «не повторяй». Замерено на сдаче №2 через mcp.call_tool против
+# молчащего сервера:
+#   hub_session_register            → retry_safe=false, «Повтор НЕ безопасен»
+#   hub_upsert_acceptance_criterion → retry_safe=false, «Повтор НЕ безопасен»
+#   hub_create_task(client_request_id=…) → retry_safe=false
+# при опубликованных docstring'ах «Idempotent», «Idempotent upsert» и
+# «Optional idempotency key; safe to retry on timeout». Одна поверхность
+# утверждала обе вещи сразу, и совет вёл ровно мимо.
+#
+# НАХОДКА 2. POST /api/skills указывал на hub_list_skills. Замерено на
+# настоящей базе: при активной v1 и свежем черновике v2 в таблице лежит
+# [(2, draft), (1, active)], а hub_list_skills показывает только (1, active).
+# Указатель формально был, а отвечал «записи нет» ровно там, где запись есть.
+
+
+# Каждая строка таблицы идемпотентности — своё место применения правила.
+# Один потребитель не доказывает остальных, поэтому прогоняются все поимённо.
+_IDEMPOTENT_CALLS: dict[str, tuple[str, tuple[Any, ...], dict[str, Any]]] = {
+    # имя строки -> (helper, позиционные аргументы, kwargs)
+    "POST /api/tasks + client_request_id": (
+        "_api_post",
+        ("/api/tasks", {"title": "t", "client_request_id": "key-42"}),
+        {},
+    ),
+    "POST /api/tasks + X-Client-Request-Id": (
+        "_api_post",
+        ("/api/tasks", {"title": "t"}),
+        {"extra_headers": {"X-Client-Request-Id": "key-42"}},
+    ),
+    "POST /api/sessions/register": (
+        "_api_post",
+        ("/api/sessions/register", {"session_id": "s-1"}),
+        {},
+    ),
+    "POST /api/tasks/{id}/acceptance_criteria": (
+        "_api_post_with_status",
+        ("/api/tasks/1250/acceptance_criteria", {"id": "AC-1"}),
+        {},
+    ),
+    "PUT /api/tasks/{id}/acceptance_criteria/{ac_id}": (
+        "_api_put_with_status",
+        ("/api/tasks/1250/acceptance_criteria/AC-1", {"id": "AC-1"}),
+        {},
+    ),
+}
+
+
+@pytest.mark.parametrize("row", sorted(_IDEMPOTENT_CALLS))
+async def test_an_idempotent_write_is_not_told_to_avoid_a_retry(
+    row: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Находка 1, каждое место применения поимённо.
+
+    Совет «не повторяй, сначала прочитай состояние» стоит одного лишнего
+    чтения там, где он лишний, — и целой потерянной записи там, где агент ему
+    поверил и бросил работу. На идемпотентных маршрутах он просто неверен.
+    """
+    from hub import mcp_server as srv
+
+    helper_name, args, kwargs = _IDEMPOTENT_CALLS[row]
+    async with _silent_hub(monkeypatch):
+        with pytest.raises(HubApiError) as caught:
+            await getattr(srv, helper_name)(*args, **kwargs)
+
+    payload = srv.enrich_error_payload(caught.value.payload)
+    assert payload["write"] is True, row
+    assert payload["idempotent"] is True, row
+    assert payload["retry_safe"] is True, row
+    assert srv._TRANSPORT_IDEMPOTENT_RETRY in payload["message"], row
+    # Не голое «можно»: сказано, ЧЕМ идемпотентность держится.
+    assert "Повтор безопасен" in payload["message"], row
+    assert srv._TRANSPORT_WRITE_RETRY not in payload["message"], row
+    assert payload["hint"] == payload["hint"].strip() and payload["hint"], row
+
+
+async def test_a_create_without_its_key_stays_unrepeatable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Идемпотентность POST /api/tasks — свойство ВЫЗОВА, а не маршрута.
+
+    Без client_request_id повтор заводит вторую задачу, и строка таблицы
+    обязана требовать ключ, а не маршрут: иначе правка чинила бы один совет
+    ложью в другом.
+    """
+    from hub import mcp_server as srv
+
+    async with _silent_hub(monkeypatch):
+        with pytest.raises(HubApiError) as caught:
+            await srv._api_post("/api/tasks", {"title": "без ключа"})
+
+    payload = srv.enrich_error_payload(caught.value.payload)
+    assert payload["idempotent"] is False
+    assert payload["retry_safe"] is False
+    assert "Повтор НЕ безопасен" in payload["message"]
+    assert srv._TRANSPORT_IDEMPOTENT_RETRY not in payload["message"]
+
+
+def test_an_unknown_write_route_defaults_to_the_unrepeatable_side() -> None:
+    """Умолчание обязано падать в БЕЗОПАСНУЮ сторону, а не в опасную.
+
+    Ошибка «сказали не повторять, а было можно» стоит одного чтения. Ошибка
+    «сказали повторять, а было нельзя» стоит второй записи. Поэтому таблица
+    перечисляет идемпотентное, а маршрут без строки объявляется неповторяемым
+    — и когда-нибудь появившийся маршрут попадёт именно сюда.
+    """
+    from hub import mcp_server as srv
+
+    for method in ("POST", "PUT", "PATCH", "DELETE"):
+        ok, why = srv._write_is_idempotent(method, "/api/nobody-wrote-this-yet")
+        assert ok is False, method
+        assert why == "", method
+
+    # И тот же маршрут другим методом: строка держится на паре метод+путь.
+    assert srv._write_is_idempotent("PATCH", "/api/sessions/register")[0] is False
+    assert srv._write_is_idempotent("POST", "/api/sessions/register")[0] is True
+
+    payload = srv._parse_transport_error(
+        RuntimeError("boom"),
+        timeout=0.4,
+        write=True,
+        method="POST",
+        path="/api/nobody-wrote-this-yet",
+    )
+    assert payload["retry_safe"] is False
+    assert payload["idempotent"] is False
+
+
+async def test_a_read_stays_repeatable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Сторож сделанного: чтение не задето правкой про запись."""
+    from hub import mcp_server as srv
+
+    async with _silent_hub(monkeypatch):
+        with pytest.raises(HubApiError) as caught:
+            await srv._api_get("/api/tasks")
+
+    payload = srv.enrich_error_payload(caught.value.payload)
+    assert payload["write"] is False
+    assert payload["retry_safe"] is True
+    assert payload["idempotent"] is True
+    assert srv._TRANSPORT_READ_RETRY in payload["message"]
+
+
+async def test_every_idempotency_claim_holds_on_the_real_server(
+    client: Any, monkeypatch: pytest.MonkeyPatch, db: Any
+) -> None:
+    """Таблица утверждает про СЕРВЕР — и проверяется об него, а не об docstring.
+
+    Совет «повторяй смело» опаснее молчания: если маршрут перестанет быть
+    идемпотентным, агент по этому совету запишет дважды. Поэтому каждая строка
+    прогоняется дважды по настоящему приложению, и предметом является
+    состояние базы, а не код ответа.
+    """
+    from hub import config
+    from hub.config import TokenIdentity
+    from hub import mcp_server as srv
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-token": TokenIdentity("bot", "agent", principal_id=7),
+            "human-token": TokenIdentity("denis", "human"),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    auth = {"Authorization": "Bearer agent-token"}
+    # Создание задачи с source=human — человеческий гейт (#360), и именно его
+    # зовёт hub_create_task, у которого ключ идемпотентности и объявлен.
+    human = {"Authorization": "Bearer human-token"}
+
+    # 1. POST /api/tasks с ключом идемпотентности.
+    body = {"title": "идемпотентная", "client_request_id": "key-1250"}
+    first = await client.post("/api/tasks", json=body, headers=human)
+    assert first.status_code == 201, first.text
+    task_id = first.json()["id"]
+    again = await client.post("/api/tasks", json=body, headers=human)
+    assert again.status_code == 200, again.text
+    assert again.json()["id"] == task_id
+    rows = await db.execute_fetchall(
+        "SELECT id FROM tasks WHERE title=?", ("идемпотентная",)
+    )
+    assert len(rows) == 1, "повтор с ключом завёл вторую задачу"
+
+    # 2. POST /api/sessions/register.
+    for _ in range(2):
+        resp = await client.post(
+            "/api/sessions/register", json={"session_id": "s-1250"}, headers=auth
+        )
+        assert resp.status_code in (200, 201), resp.text
+    rows = await db.execute_fetchall(
+        "SELECT session_id FROM agent_sessions WHERE session_id=?", ("s-1250",)
+    )
+    assert len(rows) == 1, "повтор регистрации завёл вторую сессию"
+
+    # 3. POST /api/tasks/{id}/acceptance_criteria — no-op по ac_id.
+    ac = {
+        "id": "AC-9",
+        "given": "г",
+        "when": "к",
+        "then": "т",
+        "verifiable_by": "test",
+    }
+    created = await client.post(
+        f"/api/tasks/{task_id}/acceptance_criteria", json=ac, headers=auth
+    )
+    assert created.status_code == 201, created.text
+    repeat = await client.post(
+        f"/api/tasks/{task_id}/acceptance_criteria", json=ac, headers=auth
+    )
+    assert repeat.status_code == 200, repeat.text
+
+    # 4. PUT /api/tasks/{id}/acceptance_criteria/{ac_id} — upsert.
+    for _ in range(2):
+        put = await client.put(
+            f"/api/tasks/{task_id}/acceptance_criteria/AC-9",
+            json={**ac, "then": "переписанное"},
+            headers=auth,
+        )
+        assert put.status_code in (200, 201), put.text
+
+    listed = await client.get(f"/api/tasks/{task_id}/acceptance_criteria", headers=auth)
+    assert listed.status_code == 200, listed.text
+    ids = [row["id"] for row in listed.json()]
+    assert ids.count("AC-9") == 1, f"критерий размножился: {ids}"
+
+    # И ровно эти четыре пары метод+путь таблица и объявляет идемпотентными.
+    claimed = {
+        (verb, pattern.pattern) for verb, pattern, _, _ in srv._IDEMPOTENT_WRITES
+    }
+    assert len(claimed) == 4, claimed
+    for method, path in (
+        ("POST", "/api/tasks"),
+        ("POST", "/api/sessions/register"),
+        (
+            "POST",
+            f"/api/tasks/{task_id}/acceptance_criteria",
+        ),
+        ("PUT", f"/api/tasks/{task_id}/acceptance_criteria/AC-9"),
+    ):
+        assert srv._write_is_idempotent(method, path, idempotency_key="key-1250")[0], (
+            f"{method} {path} проверен об сервер, а таблица его не знает"
+        )
+
+
+async def test_a_new_skill_version_is_not_pointed_at_a_list_that_hides_it(
+    monkeypatch: pytest.MonkeyPatch, db: Any
+) -> None:
+    """Находка 2: указатель был, но вёл не туда.
+
+    Проверяется не текст ради текста, а ПРИЧИНА, по которой указатель врал:
+    на настоящей базе черновик записан, а инструмент, который советовали,
+    его не показывает. Если list_skills когда-нибудь начнёт показывать
+    черновики, первая половина теста упадёт — и строку таблицы можно будет
+    вернуть осознанно, а не по памяти.
+    """
+    from hub import mcp_server as srv
+    from hub import repository as repo
+
+    await repo.create_skill_version(
+        db, name="multi-agent-review", content="v1", status="active"
+    )
+    _id, version = await repo.create_skill_version(
+        db, name="multi-agent-review", content="v2", status="draft"
+    )
+    assert version == 2, "вторая версия должна быть именно второй"
+
+    stored = {
+        (r["version"], r["status"])
+        for r in await repo.list_skill_versions(db, "multi-agent-review")
+    }
+    assert (2, "draft") in stored, "черновик записан"
+
+    shown = {(r["name"], r["version"]) for r in await repo.list_skills(db)}
+    assert ("multi-agent-review", 2) not in shown, (
+        "hub_list_skills показал черновик — тогда указатель на него честен"
+    )
+    assert ("multi-agent-review", 1) in shown
+
+    # Значит на таймауте POST /api/skills он отвечал бы «записи нет» ровно
+    # там, где запись есть, и звал предложить версию ЗАНОВО.
+    async with _silent_hub(monkeypatch):
+        with pytest.raises(HubApiError) as caught:
+            await srv._api_post("/api/skills", {"name": "multi-agent-review"})
+
+    payload = srv.enrich_error_payload(caught.value.payload)
+    assert payload["suggested_tool"] is None
+    assert "hub_list_skills" != payload["suggested_tool"]
+    # Пустой указатель обязан объясниться, а не промолчать полем.
+    assert srv._TRANSPORT_NO_CHECK_CORE in payload["message"]
+    assert srv._TRANSPORT_NO_CHECK_SKILL in payload["message"]
+    assert srv._TRANSPORT_NO_CHECK_SKILL in payload["hint"]
+    # Названа и цена слепого повтора: он заводит ЕЩЁ одну версию.
+    assert "ЕЩЁ одну" in payload["message"]
+    # Повтор здесь по-прежнему небезопасен — предложение версии не идемпотентно.
+    assert payload["retry_safe"] is False
+    assert payload["idempotent"] is False
+
+
+async def test_a_repeat_of_a_skill_proposal_really_adds_another_version(
+    db: Any,
+) -> None:
+    """Проверка не вхолостую: слепой повтор действительно стоит версии.
+
+    Совет «спроси человека» держится на этом факте. Если бы повтор был
+    no-op'ом, честнее было бы советовать повтор.
+    """
+    from hub import repository as repo
+
+    await repo.create_skill_version(db, name="s", content="v1", status="active")
+    _id, first = await repo.create_skill_version(
+        db, name="s", content="draft", status="draft"
+    )
+    _id2, second = await repo.create_skill_version(
+        db, name="s", content="draft", status="draft"
+    )
+    assert (first, second) == (2, 3), (
+        "повтор перезаписал бы версию — тогда совет другой"
+    )
+
+
+def test_an_empty_pointer_always_says_that_it_is_empty() -> None:
+    """Пустых указателей теперь два вида, и оба обязаны говорить словами.
+
+    Сверка идёт по ЯДРУ фразы, а не по полному совпадению: иначе маршрутную
+    причину («черновик за активной версией не виден») некуда написать, и
+    выбор был бы между молчащим полем и отсутствием причины.
+    """
+    from hub import mcp_server as srv
+
+    empties = [
+        advice for _pattern, tool, advice in srv._TRANSPORT_WRITE_CHECKS if tool is None
+    ]
+    assert empties, "ни одной строки с пустым указателем — тест перестал проверять"
+    for advice in [*empties, srv._TRANSPORT_NO_CHECK]:
+        assert srv._TRANSPORT_NO_CHECK_CORE in advice, advice
+        assert "hub_task_status" not in advice, advice
