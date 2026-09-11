@@ -1600,6 +1600,13 @@ async def _sweep_stale_arbiter(db) -> None:
 async def _sweep_events_retention(db) -> None:
     # Events feed retention (#349): the feed is a notification
     # channel, not an archive — activity_log keeps the history.
+    #
+    # Это правило действует и на то, что кладут в ленту потом (#1253):
+    # доказательства публикации скилла две недели пролежали в payload
+    # ``skill_activated``, и страница скилла молча теряла бы их на первом же
+    # прогоне этой чистки. Теперь они лежат в ``skills.publication_record``, а
+    # событие осталось тем, чем лента и объявлена, — уведомлением. Кладёшь
+    # сюда что-то, что нужно будет прочитать через месяц, — не клади.
     pruned = await repo.prune_events(db, keep_days=14)
     # Коммит БЕЗУСЛОВНЫЙ. isolation_level="IMMEDIATE" (#1065) открывает
     # транзакцию перед любым DML — и перед DELETE, которому нечего удалять.
