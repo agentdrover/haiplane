@@ -32,7 +32,7 @@ from typing import Any, NamedTuple
 
 import aiosqlite
 
-from hub.db import fetchall
+from hub.db import fetchall, write_transaction
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
@@ -2497,11 +2497,21 @@ async def _dispatch_report(
     # Exact for every current path, because a second dispatch exists only
     # after the first report bought it (top-up is the sole same-generation
     # re-dispatch).
+    #
+    # #1252: ступень считается СРЕДИ ЗАКАЗОВ ТОГО ЖЕ ПРИНЦИПАЛА И КАНАЛА, а
+    # не среди всех. Вторая дверь сделала «все заказы поколения» неверной
+    # меркой: облачный и локальный заказы живут в одном поколении, а
+    # принципалы у них разные — иначе отчёт не был бы независимым (#1128).
+    # Локальный заказ оказывался ступенью 1, а у локального принципала отчёт
+    # был первым (индекс 0), и годный контрактный отчёт не опознавался своим
+    # же заказом: прогон объявлялся упавшим, а закрытого заказа не
+    # оставалось вовсе — то есть пустое ревью не могло дать автовердикт.
     dispatch_ids = await fetchall(
         db,
         "SELECT id FROM review_dispatches WHERE task_id = ? "
-        "AND submission_generation = ? ORDER BY id",
-        (task_id, generation),
+        "AND submission_generation = ? AND reviewer_principal_id = ? "
+        "AND channel = ? ORDER BY id",
+        (task_id, generation, expected, dispatch.get("channel") or CLOUD_CHANNEL),
     )
     order = [int(dict(r)["id"]) for r in dispatch_ids]
     try:
@@ -2783,6 +2793,40 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
             await repo.set_review_dispatch_status(db, dispatch["id"], "done")
             await db.commit()
             continue
+        await _close_a_run_without_a_report(db, dispatch, run)
+
+
+async def _close_a_run_without_a_report(
+    db: aiosqlite.Connection, dispatch: dict[str, Any], run: dict[str, Any]
+) -> None:
+    """Прогон дошёл до конца и отчёта не оставил: назвать это и открыть дверь.
+
+    #1252: отчёт перечитывается НЕПОСРЕДСТВЕННО перед тем, как назвать его
+    отсутствующим, и перечитывается ПОД ВЗЯТЫМ НА ЗАПИСЬ ЛОКОМ. Между первой
+    проверкой в свипе и этим местом лежат два сетевых ожидания — терминальное
+    состояние прогона и расход, — и контрактный отчёт, доехавший в это окно,
+    заставал решение «отчёта нет» уже принятым: алерт «отчёт НЕ сдан», вторая
+    дверь, лишние деньги и два соперничающих отчёта на одну сдачу.
+    ``write_transaction`` — это BEGIN IMMEDIATE (#1065): лок берётся ДО
+    чтения и держится до записи долга, то есть окно закрывается базой, а не
+    расторопностью.
+
+    Доехавший отчёт здесь НЕ закрывается на месте: строка остаётся активной,
+    и следующий проход разбирает её обычным путём — со сверкой расхода по
+    данным провайдера (#1026). Второй автор этого закрытия разошёлся бы с
+    первым на первой же правке.
+    """
+    task_id = int(dispatch["task_id"])
+    run_status = str(run.get("status") or "")
+    task_row = None
+    async with write_transaction(db):
+        if (
+            await _dispatch_report(
+                db, task_id, dispatch["submission_generation"], dispatch
+            )
+            is not None
+        ):
+            return
         await repo.add_task_update(
             db,
             task_id,
@@ -2817,12 +2861,11 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
         # невидима свипу, и сбой между двумя записями — упавший процесс или
         # исключение в подготовке заказа, где git ходит в сеть, — уносил бы
         # обещанную вторую дверь навсегда: поллер глотает исключение и идёт
-        # дальше. Долг durable, отдача идемпотентна по сдаче.
-        run_status = str(run.get("status") or "")
+        # дальше.
         await repo.owe_second_door(db, dispatch["id"], run_status)
-        await db.commit()
-        dispatch["run_status"] = run_status
-        await _settle_second_door(db, dispatch, task_row=task_row)
+    await db.commit()
+    dispatch["run_status"] = run_status
+    await _settle_second_door(db, dispatch, task_row=task_row)
 
 
 async def _settle_second_door(
@@ -2838,7 +2881,18 @@ async def _settle_second_door(
     отказе облака здесь НЕ повторяется — он записан вместе с долгом, и
     повторять его на каждом проходе значило бы превратить один наблюдённый
     факт в поток.
+
+    #1252: долг отдаётся ОДИН раз, и это проверяется НАБЛЮДЕНИЕМ, а не
+    порядком записей. Возобновление существует именно потому, что хаб может
+    умереть посередине, — а умереть он может и после того, как локальный
+    заказ закоммичен, но до того, как долг помечен закрытым. Тогда при
+    рестарте видны обе строки, облачная разбирается первой (ORDER BY id), и
+    без этой проверки она покупала бы ВТОРОЙ прогон на то же поколение.
     """
+    if await _second_door_already_opened(db, dispatch):
+        await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
+        await db.commit()
+        return
     if task_row is None:
         task_row = await repo.get_task(db, int(dispatch["task_id"]))
     await _second_door_after_run(
@@ -2846,6 +2900,31 @@ async def _settle_second_door(
     )
     await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
     await db.commit()
+
+
+async def _second_door_already_opened(
+    db: aiosqlite.Connection, dispatch: dict[str, Any]
+) -> bool:
+    """Есть ли по этой сдаче живой или удавшийся локальный заказ (#1252).
+
+    Упавший локальный заказ сюда НЕ считается: он говорит «вторую дверь
+    попробовали и она не сработала», и запретить по нему новую попытку
+    значило бы закрыть дверь именно там, где она нужнее всего. Считается
+    только заказ, который ещё идёт или уже принёс отчёт, — то есть долг,
+    который в самом деле отдан.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM review_dispatches WHERE task_id = ? "
+        "AND submission_generation = ? AND channel = ? "
+        "AND status IN ('active', 'done') LIMIT 1",
+        (
+            int(dispatch["task_id"]),
+            int(dispatch["submission_generation"]),
+            LOCAL_CHANNEL,
+        ),
+    )
+    return bool(rows)
 
 
 async def _second_door_after_run(

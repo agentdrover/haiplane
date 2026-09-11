@@ -5917,3 +5917,260 @@ async def test_the_local_order_refuses_a_forge_where_only_the_cloud_is_ready(
     assert any("LOCAL_REVIEW_CMD" in a for a in alerts), (
         "отказ называет отсутствующие настройки по именам (#1083)"
     )
+
+
+# --- #1252, сдача №4: находки внешнего ревьюера по коммиту 6bdc607 ----------
+
+
+def _contract_reporting_stub(db, principal_id: int, report: dict | None = None):
+    """Ревьюер, сдающий отчёт ПО КОНТРАКТУ и не оставляющий блока в тексте.
+
+    Основной путь локального ревьюера — ``hub_submit_machine_review`` под
+    своим токеном (#1180); блок в выводе — запасной (#1036). Заглушки этого
+    файла до сих пор изображали только запасной, и контрактный путь второй
+    двери ни одним тестом не проходился.
+    """
+
+    async def _run(prompt: str, *, timeout: int | None = None):
+        from hub.models import MachineReviewSubmit
+        from hub.services.machine_review_intake import record_machine_review
+
+        payload = {**(report or _LOCAL_REPORT)}
+        payload.pop("orchestrator", None)
+        await record_machine_review(
+            db,
+            _run.task_id,
+            MachineReviewSubmit(**payload),
+            principal_id=principal_id,
+            username="local-reviewer",
+        )
+        await db.commit()
+        return local_reviewer.LocalRun(
+            rc=0, output="", dropped=0, timed_out=False, duration_ms=1_000
+        )
+
+    return _run
+
+
+async def test_a_contract_report_from_the_local_reviewer_closes_its_dispatch(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """P1-1: отчёт локального ревьюера не опознавался СВОИМ заказом.
+
+    Ступень заказа считалась по ВСЕМ заказам поколения, а отчёты отбирались
+    по принципалу заказа. На пути второй двери заказов два и принципалы
+    разные: облачный — ступень 0, локальный — ступень 1, а у локального
+    принципала отчёт всего один, с индексом 0. Годный отчёт не опознавался,
+    локальный заказ помечался упавшим, и пустое ревью не могло дать
+    автовердикт: ни один заказ не закрылся.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-contract"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    reviewer_pid = await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-contract-report", policy={"review": "dispatch"}
+    )
+    stub = _contract_reporting_stub(db, reviewer_pid)
+    stub.task_id = task_id
+    monkeypatch.setattr(local_reviewer, "run_review", stub)
+
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    local = await _local_dispatches(db, task_id)
+    assert len(local) == 1
+    assert local[0]["status"] == "done", (
+        "отчёт сдан по контракту под принципалом ревьюера — заказ обязан "
+        "закрыться им, а не быть объявленным упавшим"
+    )
+    alerts = [
+        dict(r)["content"]
+        for r in await repo.get_task_updates(db, task_id)
+        if dict(r)["kind"] == "alert"
+    ]
+    assert not any("Локальное машинное ревью" in a for a in alerts), (
+        "«ревью не состоялось» по годному отчёту — ложь в карточке"
+    )
+
+
+async def test_a_late_cloud_report_closes_the_dispatch_instead_of_the_second_door(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """P1-2: гонка с поздним отчётом облака покупала второго ревьюера.
+
+    Между первой проверкой отчёта и открытием второй двери свип успевает
+    сходить в сеть дважды — за терминальным состоянием прогона и за расходом.
+    Контрактный отчёт, пришедший в это окно, блок не останавливал: писался
+    алерт «отчёт НЕ сдан», открывалась вторая дверь, и на одну сдачу
+    приезжали два соперничающих отчёта за лишние деньги.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-late"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-late-cloud", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    submitted: list[int] = []
+
+    async def _usage_and_a_late_report(agent_id, run_id=None):
+        # Пока свип ходит за расходом, облачный ревьюер сдаёт отчёт по
+        # контракту: сеть и MCP работают параллельно. Сдаёт ОДИН раз —
+        # ревьюер не отчитывается дважды.
+        from hub.models import MachineReviewSubmit
+        from hub.services.machine_review_intake import record_machine_review
+
+        if submitted:
+            return None
+        submitted.append(1)
+        payload = {**_LOCAL_REPORT}
+        payload.pop("orchestrator", None)
+        await record_machine_review(
+            db,
+            task_id,
+            MachineReviewSubmit(**payload),
+            principal_id=cloud_pid,
+            username="cloud-reviewer",
+        )
+        await db.commit()
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage_and_a_late_report)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+    # Доехавший отчёт закрывает заказ СЛЕДУЮЩИМ проходом, обычным путём — со
+    # сверкой расхода по данным провайдера (#1026), а не вторым автором
+    # закрытия здесь.
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert await _local_dispatches(db, task_id) == [], (
+        "отчёт УЖЕ есть: второй ревьюер здесь — лишние деньги и второй "
+        "отчёт-соперник на ту же сдачу"
+    )
+    reports = [
+        dict(r) for r in await repo.machine_reviews_of_generation(db, task_id, 1)
+    ]
+    assert len(reports) == 1
+    cloud = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert cloud["status"] == "done", "заказ закрывается СВОИМ доехавшим отчётом"
+    alerts = [
+        dict(r)["content"]
+        for r in await repo.get_task_updates(db, task_id)
+        if dict(r)["kind"] == "alert"
+    ]
+    assert not any("отчёт НЕ сдан" in a for a in alerts), (
+        "алерт об отсутствии отчёта при доехавшем отчёте — ложь в карточке"
+    )
+
+
+async def test_the_debt_is_paid_once_even_after_a_death_mid_settlement(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """P2: отдача долга второй двери была неидемпотентна.
+
+    Хаб остановился после того, как локальный заказ закоммичен, но до того,
+    как облачный долг помечен failed. При рестарте видны обе строки, а
+    отдача долга существующего локального заказа не замечала: облачная
+    разбиралась первой и покупала ВТОРОЙ прогон на то же поколение.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-twice"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-debt-twice", policy={"review": "dispatch"}
+    )
+    cloud_id = (await _any_dispatch_row(db, task_id))["id"]
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_set = repo.set_review_dispatch_status
+    died = {"n": 0}
+
+    async def _dies_closing_the_debt(conn, dispatch_id, status):
+        if int(dispatch_id) == int(cloud_id) and status == "failed":
+            died["n"] += 1
+            raise RuntimeError("хаб остановлен между двумя записями")
+        return await real_set(conn, dispatch_id, status)
+
+    monkeypatch.setattr(repo, "set_review_dispatch_status", _dies_closing_the_debt)
+
+    try:
+        await sweep_review_dispatches(db)
+    except RuntimeError:
+        pass
+    await wait_for_local_runs()
+    await db.commit()
+    assert died["n"] == 1, "предпосылка: смерть случилась именно на закрытии долга"
+    assert len(await _local_dispatches(db, task_id)) == 1, (
+        "предпосылка: локальный заказ уже создан и закоммичен"
+    )
+
+    monkeypatch.setattr(repo, "set_review_dispatch_status", real_set)
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert len(await _local_dispatches(db, task_id)) == 1, (
+        "долг отдаётся ОДИН раз: второй прогон на то же поколение — "
+        "оплаченный дважды отчёт"
+    )
+    assert (
+        dict(
+            (
+                await db.execute_fetchall(
+                    "SELECT * FROM review_dispatches WHERE id=?", (cloud_id,)
+                )
+            )[0]
+        )["status"]
+        == "failed"
+    ), "отданный долг закрывается"
