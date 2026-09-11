@@ -37,11 +37,12 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import aiosqlite
 
+from hub import config
 from hub import repository as repo
 from hub.db import fetchall
 from hub.models import STEWARD_GROUND_SOURCES, ReviewBrief, RiskClass
@@ -138,6 +139,16 @@ class EvidencePacket:
     facts: dict[str, EvidenceFact]
     # Somebody else's words, kept apart from the hub's own facts (#1076).
     quotes: tuple["QuotedText", ...] = ()
+    #: Точка сравнения, по которой считался дифф, и ОТКУДА она взялась.
+    #: Поля только у исторического пакета: живой сборщик диффает ветку
+    #: против сегодняшней базы, и вопрос «та ли это база» там не стоит.
+    #:
+    #: Полем, а не припиской в ``detail``: подмену базы обязан УВИДЕТЬ
+    #: ОТЧЁТ, а не только читатель одного факта. Строка внутри чужого
+    #: текста не считается — по ней нельзя сложить число, и в поколении #5
+    #: она ровно так и потерялась.
+    diff_base: str = ""
+    diff_base_source: str = ""
 
     def fact(self, source: str) -> EvidenceFact:
         _check_source(source)
@@ -195,6 +206,16 @@ async def _report_fact(
             f"последний отчёт покрывает генерацию {reported_generation}, "
             f"судится {generation}",
         )
+    return _report_present(review, generation)
+
+
+def _report_present(review: dict[str, Any], generation: int) -> EvidenceFact:
+    """Один отчёт, разложенный в факт. Общий для живого и исторического пути.
+
+    Вынесено ради одного: два места, раскладывающие один и тот же отчёт,
+    разъезжаются полем — и разъедется то, которого не хватит именно судье.
+    """
+    source = "machine_review_report"
     confirmed = _finding_dicts(review.get("findings_confirmed"))
     unresolved = _finding_dicts(review.get("unresolved"))
     rejected = _finding_dicts(review.get("findings_rejected"))
@@ -808,3 +829,547 @@ def pinned_generation(identity: Any, task: dict[str, Any], asked: int | None) ->
             detail=steward_stale_pin_detail(task_id, pin, current),
         )
     return pin
+
+
+# ---------------------------------------------------------------------------
+# Тот же пакет, собранный по истории (#1167)
+# ---------------------------------------------------------------------------
+#
+# Всё выше собирает пакет о ЖИВОЙ сдаче: ветка на месте, отчёт последний,
+# база отвечает по сети. По завершённой сдаче ни одно из этих условий не
+# держится, и главное — ветки нет. ``_tip_fact`` идёт в ``resolve_branch_tip``
+# по ИМЕНИ ветки, ``_surface_fact`` — по диффу той же ветки; после мержа и
+# уборки обе вернут ``absent``, а absent по здешней конвенции означает
+# эскалацию. Историческая выборка, собранная наивно, состояла бы из
+# эскалаций-артефактов и мерила бы уборку веток, а не политику.
+#
+# Поэтому здесь всё восстанавливается по ``submission_sha``: коммит переживает
+# удаление ветки, и `git diff base...<sha>` отвечает ровно про ту сдачу,
+# которую судили. Сдача, чей sha больше не резолвится, из корпуса ВЫБЫВАЕТ с
+# названной причиной — не входит в него с пустыми фактами.
+#
+# И второе, дороже первого: ПАКЕТ НЕ СМЕЕТ СОДЕРЖАТЬ БУДУЩЕЕ. Живой сборщик
+# кладёт в пакет брифинг, а брифинг несёт ``latest_review`` — человеческий
+# вердикт. Реплей над таким пакетом мерил бы способность списать ответ, и
+# мерил бы её на отлично. Поэтому у исторического пакета есть РУБЕЖ, каждый
+# прочитанный источник едет с отметкой времени, и строка не старше рубежа
+# роняет сборку — а не молча в неё попадает.
+#
+# Рубеж — момент ЧЕЛОВЕЧЕСКОГО ВЕРДИКТА, а не самой сдачи, и это осознанно:
+# между сдачей и вердиктом ложатся отчёт харнесса и прогон CI, то есть ровно
+# то, на что смотрит гейт. Пакет по состоянию «на сдачу» не содержал бы
+# отчёта и мерил бы политику без её главного входа. Рубеж на вердикте
+# означает: судье показывают то же, что лежало на столе у человека, и ни
+# строкой больше.
+
+HISTORICAL_SHA_UNRESOLVED = "sha_unresolved"
+#: Коммит этой генерации не нашёлся НИГДЕ: ни строкой в леджере сдач, ни в
+#: поле задачи. Не «задача помнит другую генерацию» — леджер #880 помнит
+#: каждую, и вердикт по пересданной работе восстанавливается из него.
+HISTORICAL_SHA_UNRECORDED = "sha_unrecorded"
+HISTORICAL_NO_WORKSPACE = "no_workspace"
+HISTORICAL_DIFF_UNREADABLE = "historical_diff_unreadable"
+#: Трёхточечный дифф СХЛОПНУЛСЯ. ``branch_diff_paths`` считает
+#: ``base_sha...commit_sha``, где ``base_sha`` — СЕГОДНЯШНИЙ резолв имени
+#: базы. Как только судимый коммит попал в историю этой базы (доставка
+#: настоящим мержем, а не squash), merge-base равен самому коммиту, и дифф
+#: пуст ВСЕГДА — независимо от того, что сдача меняла. Пустой список при
+#: этом не ``None``: пакет не исключается, ``_surface_fact`` говорит
+#: present и ``within_declared=True`` (незаявленных путей нет), класс риска
+#: не поднимается, а доля восстановленного засчитывает это как успех.
+#: Проверено на живой истории: у доставленной задачи #1185 закреплённая
+#: вершина 1695a41 — предок develop, ``git diff origin/develop...1695a41``
+#: даёт 0 файлов при настоящей поверхности в 2 файла.
+#:
+#: Восстановить настоящую поверхность нечем: леджер #880 хранит ИМЯ базы, а
+#: не её sha на момент сдачи, и историческая точка сравнения не сохранена
+#: нигде. Поэтому здесь стоит названная дыра, а не подставленный ноль:
+#: лестница выведет такую сдачу к человеку, доля восстановленного её не
+#: зачтёт, и условие пересмотра задачи («ниже 70% — бэкфилл отменяется»)
+#: сможет сработать по настоящей причине.
+HISTORICAL_DIFF_COLLAPSED = "historical_diff_collapsed"
+#: База, против которой считался дифф, взята из СЕГОДНЯШНЕЙ строки проекта
+#: (а если и там пусто — из ``PAIR_BASE_BRANCH``): леджер сдач базу этой
+#: генерации не записал, headless-путь сдачи её не пишет. Это не отказ —
+#: дифф посчитан, — но точка сравнения не та, по которой судили, и отчёт
+#: обязан назвать, скольких сдач это касается. Значение едет ПОЛЕМ пакета
+#: (``diff_base_source``), потому что число складывает отчёт, а не читатель.
+BASE_NOT_RECORDED = "base_not_recorded"
+#: База взята из леджера сдач — та самая, против которой судили.
+BASE_FROM_LEDGER = "ledger"
+# Факты, которые сегодняшнее состояние мира восстановить не может в принципе:
+# локаторы разрешаются против нынешнего дерева, база живёт сейчас, а зависимости
+# давно доставлены. Каждый — честная дыра, а не выдуманное значение.
+NOT_RECONSTRUCTIBLE = "not_reconstructible"
+#: Карточка задачи описывает ПОСЛЕДНЮЮ сдачу, а не судимую. Объявленные
+#: области, класс риска и декларация модели живут в одной строке на задачу и
+#: перезаписываются пересдачей (lifecycle: accept_areas дописывает пути,
+#: пересчёт поднимает класс, declared_model замещает прежнюю). Для генерации,
+#: которая уже не текущая, эти три поля — свидетельство о ЧУЖОЙ работе, и
+#: читать их значит судить сдачу по картам, нарисованным после неё.
+CARD_NOT_RECORDED = "card_not_recorded"
+
+#: Источники, которые читает детерминированная лестница (gate_grounds.decide).
+#: Перечень публичный, потому что по нему считается доля восстановленного:
+#: «пакет собрался» и «в пакете есть то, по чему решают» — разные утверждения.
+DECIDABLE_SOURCES: tuple[str, ...] = (
+    "machine_review_report",
+    "ci_pinned_sha",
+    "branch_tip",
+    "diff_vs_areas",
+    "risk_class",
+)
+
+
+class CorpusExclusion(Exception):
+    """Эта сдача в корпус не входит, и вот почему.
+
+    Исключение, а не ``None``: причина обязана доехать до отчёта поимённо.
+    Доля исключённых — условие пересмотра всей задачи, и посчитать её можно
+    только если каждый отказ назвал себя.
+    """
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+        self.detail = detail
+
+
+class PacketLeak(Exception):
+    """В пакет попало то, чего на рубеже ещё не было.
+
+    Громко и без права на продолжение. Тихая склейка здесь означала бы
+    реплей, который списывает ответ у человека, и отчёт с прекрасными
+    числами, не значащими ничего.
+    """
+
+    def __init__(self, source: str, stamp: str, cutoff: str) -> None:
+        super().__init__(
+            f"утечка будущего: источник {source!r} записан {stamp!r}, "
+            f"рубеж пакета {cutoff!r}"
+        )
+        self.source = source
+        self.stamp = stamp
+        self.cutoff = cutoff
+
+
+def _stamp(value: Any) -> str:
+    """Отметку времени — к одному написанию, чтобы сравнение было сравнением.
+
+    SQLite пишет ``datetime('now')`` как ``YYYY-MM-DD HH:MM:SS``, а часть
+    полей приезжает в ISO с ``T`` и хвостом зоны. Строки сравниваются
+    лексикографически, поэтому одна и та же секунда в двух написаниях
+    сравнилась бы неверно — и сторож утечки промолчал бы там, где должен
+    кричать.
+    """
+    text = str(value or "").strip().replace("T", " ")
+    for suffix in ("Z", "+00:00"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+    return text.strip()
+
+
+def assert_within(cutoff: str, provenance: list[tuple[str, str]]) -> None:
+    """Ни одна прочитанная строка не моложе рубежа. Иначе — PacketLeak.
+
+    Рубеж исключающий: строка, записанная В ТУ ЖЕ секунду, что и вердикт,
+    могла быть его следствием, и различить это по метке в секундах нельзя.
+    Спорную секунду отдаём в сторону отказа — это дешевле, чем пакет, про
+    который потом нельзя сказать, знал он ответ или нет.
+    """
+    edge = _stamp(cutoff)
+    if not edge:
+        raise PacketLeak("cutoff", "", "")
+    for source, raw in provenance:
+        stamp = _stamp(raw)
+        if stamp and stamp >= edge:
+            raise PacketLeak(source, stamp, edge)
+
+
+async def _historical_report_fact(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> tuple[EvidenceFact, list[tuple[str, str]]]:
+    """Отчёт ИМЕННО ЭТОЙ генерации плюс отметка времени для сторожа.
+
+    Живой путь спрашивает последний отчёт задачи и объявляет отсутствие,
+    когда тот покрывает другую генерацию: у живой сдачи последний отчёт и
+    есть отчёт о ней. В истории это не так. Задача, которую человек вернул,
+    почти всегда пересдана, у неё есть более поздние отчёты — и «последний»
+    вернул бы absent на каждой такой сдаче. Тогда корпус наполнился бы
+    эскалациями ровно там, где лежит вся его ценность.
+    """
+    rows = await repo.machine_reviews_of_generation(db, task_id, generation)
+    if not rows:
+        return (
+            absent(
+                "machine_review_report",
+                NO_REPORT,
+                f"отчёта о генерации {generation} нет",
+            ),
+            [],
+        )
+    # Последний из отчётов ЭТОЙ генерации: лестница (#879) может дать два, и
+    # судили по тому, который лежал на столе последним.
+    review = dict(rows[-1])
+    return (
+        _report_present(review, generation),
+        [("machine_review_report", review.get("created_at") or "")],
+    )
+
+
+def _historical_tip_fact(pinned_sha: str) -> EvidenceFact:
+    """Вершина, восстановленная из коммита, — и честно названная таковой.
+
+    Ветки нет, поэтому вопрос «уехала ли вершина после сдачи» исторически
+    НЕНАБЛЮДАЕМ. Здесь он не подменяется нулём и не выдаётся за наблюдение:
+    ``moved`` равно False потому, что предметом суждения был именно этот
+    коммит, а ``observed`` равно False потому, что посмотреть было некуда.
+    Реплей, который захочет считать иначе, увидит оба поля.
+    """
+    return present(
+        "branch_tip",
+        f"вершина восстановлена из закреплённого коммита {pinned_sha[:12]}: "
+        "ветка удалена после мержа, движение вершины исторически ненаблюдаемо",
+        tip=pinned_sha,
+        pinned_sha=pinned_sha,
+        moved=False,
+        reconstructed=True,
+        observed=False,
+    )
+
+
+async def _generation_commit(
+    db: aiosqlite.Connection, task: dict[str, Any], generation: int
+) -> tuple[str, str]:
+    """Коммит и база ИМЕННО этой генерации: сначала леджер, потом поле задачи.
+
+    ``tasks.submission_sha`` — одно поле на задачу, и пересдача его
+    перезаписывает. Читать только его значило бы выбрасывать из корпуса
+    ровно те сдачи, ради которых он строится: человеческий возврат почти
+    всегда сопровождается пересдачей, и после неё поле описывает уже
+    следующий код.
+
+    Леджер сдач (#880) помнит каждую генерацию отдельно и пишется в той же
+    транзакции, что пинит поле, — тем же путём восстанавливает коммит
+    ``finding_evidence``. Поле задачи остаётся запасным ответом и годится
+    только когда генерация СОВПАДАЕТ: иначе это чужой код.
+    """
+    ledger = await repo.get_submission(db, int(task["id"]), int(generation))
+    if ledger is not None:
+        row = dict(ledger)
+        sha = (row.get("sha") or "").strip()
+        if sha:
+            return sha, (row.get("base_branch") or "").strip()
+    if int(task.get("submission_generation") or 0) == int(generation):
+        return (task.get("submission_sha") or "").strip(), ""
+    return "", ""
+
+
+async def _card_facts(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    generation: int,
+    diff_paths: list[str] | None,
+    diff_reason: str,
+    diff_hole: str = "",
+) -> list[EvidenceFact]:
+    """Поверхность и класс — или честные дыры на их месте.
+
+    Оба факта сверяются с КАРТОЧКОЙ: ``_surface_fact`` сравнивает дифф с
+    ``affected_areas``, ``_risk_fact`` — пересчитанный класс с сохранённым.
+    Карточка одна на задачу, и пересдача её переписывает: ``accept_areas``
+    дописывает пути, пересчёт поднимает класс. Для генерации, которая уже не
+    текущая, это карты, нарисованные ПОСЛЕ судимой работы, и сверка по ним
+    отвечает мягче правды — путь, бывший вне области, попадает в
+    расширенный набор и читается как заявленный.
+
+    Записи «какими области были на той сдаче» в хабе нет: леджер (#880)
+    хранит коммит и базу, но не карточку. Значит ответа нет — и здесь стоит
+    ``absent`` с названной причиной, а не ответ из сегодняшней строки.
+    Лестница увидит дыру и выведет к человеку; отчёт покажет, какая доля
+    корпуса такая. Это дороже, чем красивое число, и честнее.
+
+    ``diff_hole`` идёт ПЕРВЫМ и бьёт обе ветки. Это отказ ГИТА (не прочитал
+    дифф) или схлопнувшийся трёхточечный дифф — в обоих случаях поверхности
+    нет ВООБЩЕ, и сверять с карточкой нечего, есть она или нет. Порядок
+    важен: у ТЕКУЩЕЙ генерации карточка на месте, и без этой проверки
+    сборка ушла бы в ``_surface_fact``, где пустой список читается как
+    «дифф пуст, незаявленного нет» — тихое «всё в порядке» на месте
+    отсутствующего измерения.
+    """
+    if diff_paths is None:
+        # Дифф не прочитался — это отказ ГИТА, а не дыра карточки, и
+        # называть их одним кодом значило бы приписать реконструкции по sha
+        # провал, которого у неё не было (её долю по этому коду и считают).
+        code = diff_hole or HISTORICAL_DIFF_UNREADABLE
+        return [
+            absent("diff_vs_areas", code, diff_reason),
+            absent("risk_class", code, diff_reason),
+        ]
+    if diff_hole:
+        return [
+            absent("diff_vs_areas", diff_hole, diff_reason),
+            absent("risk_class", diff_hole, diff_reason),
+        ]
+    if int(task.get("submission_generation") or 0) == int(generation):
+        return [
+            _surface_fact(task, diff_paths, diff_reason),
+            await _risk_fact(db, task, diff_paths, diff_reason),
+        ]
+    detail = (
+        f"дифф по коммиту восстановлен ({len(diff_paths)} путь(ей)), но "
+        f"карточка описывает генерацию "
+        f"{int(task.get('submission_generation') or 0)}, судится {generation}: "
+        "объявленные области и класс риска этой сдачи не сохранены"
+    )
+    return [
+        absent("diff_vs_areas", CARD_NOT_RECORDED, detail),
+        absent("risk_class", CARD_NOT_RECORDED, detail),
+    ]
+
+
+def _diff_base_ref(base_branch: str) -> str:
+    """Ref, ПРОТИВ КОТОРОГО трёхточечный дифф посчитан на самом деле (#1167).
+
+    ``branch_diff_paths`` резолвит базу через ``_resolve_ref_remote_first``
+    (#762): сначала ``origin/<имя>`` и только потом голое имя. Вопрос о
+    предке обязан быть задан ТОЙ ЖЕ вершине, иначе ответ описывает другой
+    коммит: ``is_ancestor`` зовёт ``merge-base --is-ancestor`` по имени как
+    есть, а в общем клоне хаба локальный ``develop`` отстаёт от
+    ``origin/develop`` (#824, #1046) — ``branch_diff_paths`` двигает
+    фетчем именно remote-ветку, локальную не трогает никто.
+
+    Расхождение не рассуждение, а наблюдение: в клоне с отставшим локальным
+    ``develop`` те же три команды над одним коммитом отвечают
+
+        git diff --name-only origin/develop...<sha>        -> 0 файлов
+        git merge-base --is-ancestor <sha> develop         -> rc=1 (НЕ предок)
+        git merge-base --is-ancestor <sha> origin/develop  -> rc=0 (предок)
+
+    То есть на голом имени коллапс не опознаётся: дыры нет, ``_surface_fact``
+    получает пустой список, отвечает ``present`` и ``within_declared=True``,
+    класс риска не поднимается — и одобрение проходит по измерению, которого
+    не было.
+
+    Отката на голое имя здесь НЕТ, и это осознанно. ``is_ancestor`` отвечает
+    ``None`` и на «такого ref тут нет», и на «репозиторий не прочитать»; по
+    этому ответу нельзя решить, что откат безопасен, а откат на отставший
+    локальный ref вернул бы ровно ту ошибку, которую функция убирает. Клон
+    без ``origin`` получит ``historical_diff_unreadable`` — названную дыру,
+    которая выводит сдачу к человеку, а не тихий успех.
+
+    ЭТА ФУНКЦИЯ — ВРЕМЕННЫЙ ВХОД, И ВХОД ДОЛЖЕН ОСТАТЬСЯ ОДИН. #1239 (в
+    ревью, в develop ещё не доставлена) заводит общий детектор
+    ``git_ops.commit_in_base_history``: он резолвит ОБА конца тем же
+    ``_resolve_ref_remote_first``, которым считается сам дифф, и его уже
+    зовут карточка и живой пакет. Как только #1239 доставлена, здесь
+    остаётся делегирование в него, а ``_diff_base_ref`` уходит: третьего
+    способа задавать вопрос о предке заводить нельзя. До тех пор ветку
+    #1239 сюда не втаскиваем — это была бы стопка на недоставленной работе
+    и второй экземпляр той же функции в двух PR.
+    """
+    ref = (base_branch or "").strip()
+    return ref if ref.startswith("origin/") else f"origin/{ref}"
+
+
+async def build_historical_packet(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    cutoff: str,
+) -> EvidencePacket:
+    """Пакет завершённой сдачи, восстановленный по sha и обрезанный рубежом.
+
+    Поднимает :class:`CorpusExclusion`, когда сдачу восстановить нечем, и
+    :class:`PacketLeak`, когда в неё попало будущее. Ни одного ``None``: обе
+    ситуации обязаны доехать до отчёта с причиной, а не раствориться в
+    пустом ответе.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.orchestration import project_git_context
+
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        raise CorpusExclusion("no_task", f"задачи #{task_id} нет")
+    task = dict(row)
+    pinned_sha, ledger_base = await _generation_commit(db, task, generation)
+    if not pinned_sha:
+        raise CorpusExclusion(
+            HISTORICAL_SHA_UNRECORDED,
+            f"коммит генерации {generation} не записан ни в леджере сдач, "
+            f"ни в поле задачи (она помнит генерацию "
+            f"{int(task.get('submission_generation') or 0)})",
+        )
+
+    ctx = await project_git_context(db, task_id)
+    workspace = (ctx.get("repo") or "").strip()
+    if not workspace:
+        raise CorpusExclusion(
+            HISTORICAL_NO_WORKSPACE, "у проекта нет клона, из которого смотреть"
+        )
+    exists = await plugins.git_ops.commit_exists(workspace, pinned_sha)
+    if exists is None:
+        raise CorpusExclusion(HISTORICAL_NO_WORKSPACE, f"клон {workspace} не прочитать")
+    if not exists:
+        raise CorpusExclusion(
+            HISTORICAL_SHA_UNRESOLVED,
+            f"коммит {pinned_sha[:12]} в репозитории не найден",
+        )
+
+    # Дифф — ПО SHA, а не по имени ветки. ``branch_diff_paths`` резолвит и то
+    # и другое одним резолвером (#1055), поэтому нового git-слоя здесь нет:
+    # меняется аргумент, а не механизм.
+    # База — та, против которой сдачу и судили. Леджер записал её вместе с
+    # коммитом; сегодняшняя база проекта могла с тех пор смениться, и дифф
+    # против неё описывал бы не ту работу.
+    #
+    # База называется ЗДЕСЬ и целиком. ``branch_diff_paths`` на пустое имя
+    # подставляет ``PAIR_BASE_BRANCH`` своим ``_resolve_base`` (#725), и
+    # приписка «база не названа» была бы прямой неправдой: база есть, просто
+    # её выбрал слой ниже. Пакет обязан говорить ту базу, против которой
+    # дифф посчитан на самом деле.
+    base_branch = (
+        ledger_base or (ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
+    )
+    # Леджер базы не пишет headless-путь сдачи, и тогда берётся СЕГОДНЯШНЯЯ
+    # база проекта. Это не ошибка — другого ответа нет, — но и не то же
+    # самое: смена default_branch с тех пор двигает точку сравнения.
+    base_source = BASE_FROM_LEDGER if ledger_base else BASE_NOT_RECORDED
+    diff_paths = await plugins.git_ops.branch_diff_paths(
+        pinned_sha, base_branch=base_branch, repo=workspace
+    )
+    diff_reason = (
+        "" if diff_paths is not None else f"дифф по {pinned_sha[:12]} не прочитать"
+    )
+    diff_hole = ""
+    if diff_paths is not None and not diff_paths:
+        # ПУСТОЙ трёхточечный дифф — это два разных ответа в одном значении.
+        # ``base...sha`` считается от merge-base, и когда закреплённый
+        # коммит уже лежит в истории сегодняшней базы (доставка настоящим
+        # мержем, а не squash), merge-base равен самому коммиту и список
+        # пуст ВСЕГДА — независимо от того, что сдача меняла. Различает их
+        # только вопрос о предке, и он задаётся здесь, а не предполагается.
+        #
+        # Спрашивается ТА ЖЕ вершина, против которой дифф и посчитан:
+        # ``_diff_base_ref``. Голое имя базы — другой коммит (#1167).
+        base_ref = _diff_base_ref(base_branch)
+        ancestor = await plugins.git_ops.is_ancestor(workspace, pinned_sha, base_ref)
+        if ancestor is None:
+            diff_hole = HISTORICAL_DIFF_UNREADABLE
+            diff_reason = (
+                f"дифф {base_ref}...{pinned_sha[:12]} пуст, а предок ли "
+                f"коммит {base_ref} — гит не ответил: пустота недоказуема "
+                "как измерение"
+            )
+        elif ancestor:
+            diff_hole = HISTORICAL_DIFF_COLLAPSED
+            diff_reason = (
+                f"коммит {pinned_sha[:12]} лежит в истории базы {base_ref}: "
+                f"трёхточечный дифф схлопнулся в пустой список, поверхность "
+                "сдачи по нему невосстановима"
+            )
+    base_note = (
+        ""
+        if ledger_base
+        else (
+            f" База сравнения — сегодняшняя база проекта ({base_branch}): "
+            "леджер сдач базу этой генерации не записал."
+        )
+    )
+
+    provenance: list[tuple[str, str]] = []
+    report_fact, report_provenance = await _historical_report_fact(
+        db, task_id, generation
+    )
+    provenance.extend(report_provenance)
+
+    ci_fact = await _ci_fact(db, task_id, pinned_sha)
+    ci_row = await repo.get_ci_run_report(db, task_id, pinned_sha)
+    if ci_row is not None:
+        # ``reported_at``, а не ``created_at``: у этой таблицы своё имя
+        # колонки, и промах в нём означал бы пустую отметку — то есть
+        # сторожа, который молчит всегда.
+        provenance.append(("ci_pinned_sha", dict(ci_row).get("reported_at") or ""))
+
+    card_facts = [
+        replace(f, detail=f.detail + base_note) if base_note else f
+        for f in await _card_facts(
+            db, task, generation, diff_paths, diff_reason, diff_hole
+        )
+    ]
+
+    facts = {
+        f.source: f
+        for f in [
+            report_fact,
+            ci_fact,
+            _historical_tip_fact(pinned_sha),
+            *card_facts,
+            # Три дыры ниже — не поломка сборки, а отказ выдумывать. Локаторы
+            # разрешаются против СЕГОДНЯШНЕГО дерева, состояние базы — это
+            # сегодняшняя база, а зависимости давно доставлены: любой ответ
+            # на них был бы ответом про сегодня, выданным за апрель.
+            absent(
+                "ac_locator",
+                NOT_RECONSTRUCTIBLE,
+                "локаторы разрешаются против нынешнего дерева — это будущее "
+                "относительно судимой сдачи",
+            ),
+            absent(
+                "red_base",
+                NOT_RECONSTRUCTIBLE,
+                "состояние базовой ветки на тот момент не сохранено",
+            ),
+            absent(
+                "dependency_state",
+                NOT_RECONSTRUCTIBLE,
+                "доставка блокеров читается на сегодня, а не на рубеж",
+            ),
+        ]
+    }
+
+    # Сторож последним: сначала собрали, потом доказали, что не списали.
+    assert_within(cutoff, provenance)
+
+    return EvidencePacket(
+        task_id=task_id,
+        generation=generation,
+        # brief=None намеренно и это несущее решение, а не экономия. Брифинг
+        # несёт ``latest_review`` — человеческий вердикт, то есть ровно ту
+        # метку, против которой считается таблица 2x2. Пакет с ней внутри
+        # мерил бы списывание.
+        brief=None,
+        facts=facts,
+        quotes=_quotes(task, None, facts["machine_review_report"]),
+        diff_base=base_branch,
+        diff_base_source=base_source,
+    )
+
+
+def diff_recovered(packet: EvidencePacket) -> bool:
+    """Прочитался ли дифф ПО КОММИТУ — независимо от того, с чем его сверяли.
+
+    Различение несущее. Пакет, где дифф восстановлен, а сравнить его не с
+    чем (карточка не сохранена), — это успех реконструкции и провал
+    записи; пакет, где гит не ответил, — провал реконструкции. Один код на
+    оба означал бы, что условие пересмотра задачи («доля восстановленных
+    ниже 70% — бэкфилл отменяется») срабатывает по причине, к git не
+    относящейся вовсе.
+    """
+    fact = packet.fact("diff_vs_areas")
+    return fact.is_present or fact.reason == CARD_NOT_RECORDED
+
+
+def reconstructed_share(packets: list[EvidencePacket]) -> float | None:
+    """Доля пакетов, где по коммиту восстановились И вершина, И дифф.
+
+    None на пустом входе, а не ноль: пустая выборка — это отсутствие
+    измерения, и печатать её как «ничего не восстановилось» значит обвинять
+    механизм там, где его не запускали (#762).
+    """
+    if not packets:
+        return None
+    good = sum(
+        1 for p in packets if p.fact("branch_tip").is_present and diff_recovered(p)
+    )
+    return good / len(packets)
