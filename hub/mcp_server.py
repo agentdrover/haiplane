@@ -2637,9 +2637,16 @@ async def hub_undelivered_completed() -> CallToolResult:
         return _error_result(exc)
     rows = data.get("undelivered", [])
     unknown = data.get("unknown", [])
-    if not rows:
+    observed = data.get("closed_by_observation", [])
+    # НЕ только ``rows`` (находка ревью #1215, d7b46ff7 — тот же класс,
+    # который CLI уже чинил): заголовок «всё чисто» штампуется, только пока
+    # ВСЕ ТРИ ведра пусты. Строка с закрытыми источниками, стоящая в
+    # ``unknown``, — расхождение, которое хаб честно не смог проверить, а не
+    # его отсутствие; печатать «No completed task is waiting on an open PR.»
+    # поверх такой строки — тот самый штамп, против которого написан #1215.
+    if not rows and not unknown and not observed:
         lines = ["No completed task is waiting on an open PR."]
-    else:
+    elif rows:
         lines = [f"{len(rows)} completed task(s) with an open PR:", ""]
         for row in rows:
             lines.append(
@@ -2652,6 +2659,11 @@ async def hub_undelivered_completed() -> CallToolResult:
                     f"    completed via: {row['accepted_via']}"
                     f" · owner said: {row.get('disposition') or 'nothing about the PR'}"
                 )
+    else:
+        # rows пуст, но unknown и/или observed — нет: заголовок про открытый
+        # PR здесь неприменим, и ложное «всё чисто» тоже — печатать нечего,
+        # unknown/observed допишут свои строки ниже.
+        lines = []
     if unknown:
         lines.append("")
         lines.append(f"{len(unknown)} task(s) the hub could not check:")
@@ -2660,18 +2672,35 @@ async def hub_undelivered_completed() -> CallToolResult:
     # Строка, у которой свип больше не спрашивает источники, застыла на
     # последнем ответе. Сказать это вслух дешевле, чем ждать, пока читатель
     # заметит неподвижный checked_at (#1215).
-    frozen = [row for row in (*rows, *unknown) if row.get("still_swept") is False]
-    if frozen:
+    #
+    # РАЗДЕЛЕНО ПО СОСТОЯНИЮ (находка ревью #1215, 7be892476f84f99c): запись
+    # наблюдения принимает ТОЛЬКО unknown — источник pr_open отвечает, и
+    # эндпоинт честно отказывает 422 source_still_answers. Пока баннер не
+    # различал состояния, замёрзшей строке pr_open предлагали выход, которого
+    # для неё не существует.
+    frozen_unknown = [row for row in unknown if row.get("still_swept") is False]
+    frozen_pr_open = [row for row in rows if row.get("still_swept") is False]
+    if frozen_unknown:
         lines.append("")
         lines.append(
-            f"{len(frozen)} строк(и) старше окна свипа "
+            f"{len(frozen_unknown)} строк(и) старше окна свипа "
             f"({data.get('sweep_lookback_days', '?')} дней): источники больше "
             f"не перепрашиваются, ответ застыл. Выход — записать наблюдение: "
             f"оно окна не спрашивает."
         )
-        for row in frozen:
+        for row in frozen_unknown:
             lines.append(f"    #{row['task_id']} — {row.get('age_hours', '?')}ч")
-    observed = data.get("closed_by_observation", [])
+    if frozen_pr_open:
+        lines.append("")
+        lines.append(
+            f"{len(frozen_pr_open)} строк(и) старше окна свипа "
+            f"({data.get('sweep_lookback_days', '?')} дней) с открытым PR: "
+            f"источники больше не перепрашиваются, ответ застыл. Наблюдением "
+            f"эту строку не закрыть — источник ещё отвечает. Выход — довезти "
+            f"работу или признать расхождение законным с причиной."
+        )
+        for row in frozen_pr_open:
+            lines.append(f"    #{row['task_id']} — {row.get('age_hours', '?')}ч")
     if observed:
         lines.append("")
         lines.append(

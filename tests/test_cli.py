@@ -2275,6 +2275,121 @@ def test_cmd_undelivered_names_observation_and_the_frozen_window() -> None:
     )
 
 
+def test_delivery_observe_posts_to_the_observation_endpoint() -> None:
+    """Находка ревью Codex, сдача 2, ``hub/app.py:2008-2013``.
+
+    ``undelivered`` советует замёрзшей unknown-строке «записать наблюдение»,
+    но CLI не давал команды, которая отправила бы probe/observation/sha на
+    ``POST .../observation`` — оператор с одним только CLI не мог
+    воспользоваться названным выходом. ``delivery-observe`` — этот вход.
+    """
+    rc, api = _run_main(
+        [
+            "delivery-observe",
+            "909",
+            "--probe",
+            "git show 19ee3f6faf9f --stat",
+            "--observation",
+            "файл на месте, AC-тест зелёный",
+            "--sha",
+            "19ee3f6faf9f",
+        ],
+        api_result={"task_id": 909, "closed_state": "unknown"},
+    )
+    assert rc == 0
+    api.assert_called_once_with(
+        "POST",
+        "/api/delivery/discrepancies/909/observation",
+        {
+            "probe": "git show 19ee3f6faf9f --stat",
+            "observation": "файл на месте, AC-тест зелёный",
+            "sha": "19ee3f6faf9f",
+        },
+    )
+
+
+def test_cmd_undelivered_frozen_pr_open_is_not_told_to_observe() -> None:
+    """Находка ревью #1215, 7be892476f84f99c — та же проверка, что MCP.
+
+    ``cmd_undelivered`` строил единый баннер ``frozen`` из ``(*rows,
+    *unknown)`` без разбора состояния: замёрзшей строке с открытым PR
+    предлагали «записать наблюдение», хотя эндпоинт отвечает 422
+    ``source_still_answers`` — наблюдением закрывают только unknown.
+    """
+    payload = {
+        "undelivered": [
+            {
+                "task_id": 461,
+                "title": "Предпас",
+                "pr_number": 461,
+                "reason": "PR #461 открыт и не смержен",
+                "age_hours": 800,
+                "still_swept": False,
+            }
+        ],
+        "unknown": [],
+        "closed_by_observation": [],
+        "sweep_lookback_days": 30,
+    }
+    mock_api = MagicMock(return_value=payload)
+    args = argparse.Namespace(limit=50, json=False)
+    out = StringIO()
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=out):
+        rc = cli.cmd_undelivered(args)
+    assert rc == 0
+    text = out.getvalue()
+    assert "#461" in text
+    assert "Выход — записать наблюдение" not in text
+    assert "источник ещё отвечает" in text
+
+
+def test_cmd_undelivered_all_clear_stays_locked_when_only_observed_remains() -> None:
+    """Находка ревью #1215, d9a42edd0c92224f: вырожденный тест не запирает
+    конъюнкт ``not observed``.
+
+    ``test_cmd_undelivered_names_observation_and_the_frozen_window`` выше
+    держит ``unknown`` непустым РЯДОМ с ``closed_by_observation`` — то есть
+    снятие именно ``and not observed`` из ``if not rows and not unknown and
+    not observed:`` (строка вернулась бы к прежнему ``if not rows and not
+    unknown:``) остаётся зелёным: ``unknown`` и без того запрещает печатать
+    «всё чисто». Настоящая боевая форма после закрытия строки — та, что видна
+    у #878/#875/#909: ``undelivered`` и ``unknown`` ОБА пусты, стоит только
+    ``closed_by_observation``. Этот тест строит именно её.
+    """
+    payload = {
+        "undelivered": [],
+        "unknown": [],
+        "closed_by_observation": [
+            {
+                "task_id": 909,
+                "title": "Паспорт дефекта",
+                "state": "unknown",
+                "reason": "репозиторий PR #468 удалён, спросить некого",
+                "observed_by": "pda_claude",
+                "observed_sha": "19ee3f6faf9f",
+                "observed_probe": "git show 19ee3f6faf9f --stat",
+                "observed_evidence": "файл на месте, AC-тест зелёный",
+            }
+        ],
+        "sweep_lookback_days": 30,
+    }
+    mock_api = MagicMock(return_value=payload)
+    args = argparse.Namespace(limit=50, json=False)
+    out = StringIO()
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=out):
+        rc = cli.cmd_undelivered(args)
+    assert rc == 0
+    text = out.getvalue()
+
+    assert "#909" in text and "pda_claude" in text
+    # Сердце находки: undelivered и unknown оба пусты, но строка закрыта
+    # чужим наблюдением, а не хабом — «всё чисто» здесь было бы штампом.
+    assert "No completed task is waiting on an open PR." not in text, (
+        "unknown пуст, но closed_by_observation — нет: печатать «расхождений "
+        "нет» здесь значит выдавать чужое наблюдение за собственный вывод хаба"
+    )
+
+
 def test_cmd_undelivered_still_says_all_clear_when_it_really_is() -> None:
     """Обратная сторона той же находки: молчать, когда сказать нечего.
 

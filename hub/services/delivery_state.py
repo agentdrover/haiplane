@@ -773,6 +773,19 @@ def _discrepancy_voice(
     if (prior.get("acknowledged_at") or "").strip() and settled_fact == state:
         return None
 
+    # Наблюдение — тоже законный выход, не только признание (#1215, находка
+    # ревью fa215699bb39343a). Строка, закрытая наблюдением, ушла из списка
+    # расхождений, но свип продолжает её проверять (наблюдение не отменяет
+    # вопроса), и без этой проверки следующий пройденный возрастной рубеж
+    # заново писал «Доставку подтвердить НЕ УДАЛОСЬ ... проверьте вручную» —
+    # ровно то, что уже проверили и подтвердили. observed_state сравнивается
+    # с ТЕКУЩИМ answer["state"], а не с прежним d.state: если источник ожил и
+    # заговорил другое, наблюдение относилось не к этому факту, и строка
+    # обязана снова заговорить (#1215, комментарий record_delivery_observation).
+    observed_state = (prior.get("observed_state") or "").strip()
+    if (prior.get("observed_at") or "").strip() and observed_state == state:
+        return None
+
     age_hours = _age_hours(task, prior)
     bucket = _crossed_bucket(age_hours)
     # Память о сказанном — МНОЖЕСТВО состояний, а не одна ячейка, и это не

@@ -1281,6 +1281,108 @@ async def test_a_sweep_that_speaks_mid_write_does_not_get_closed_by_it(
     assert listed["closed_by_observation"] == []
 
 
+async def test_the_sweep_stays_quiet_after_observation_closes_the_row(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Находка ревью #1215, fa215699bb39343a.
+
+    Наблюдение закрыло строку. Свип продолжает её проверять (наблюдение не
+    отменяет вопроса), и без предохранителя следующий пройденный возрастной
+    рубеж заново писал «Доставку подтвердить НЕ УДАЛОСЬ ... проверьте
+    вручную» — тем же голосом, каким свип говорит про НЕзакрытые строки,
+    хотя ровно это уже проверили и приписали поимённо.
+    """
+    task_id = await _unanswerable_row(
+        client, db, title="Свип после закрытия", pr=1215, monkeypatch=monkeypatch
+    )
+    # Уже старше первого рубежа (24ч), чтобы первый прогон свипа заговорил.
+    await db.execute(
+        "UPDATE tasks SET completed_at = datetime('now', '-25 hours') WHERE id = ?",
+        (task_id,),
+    )
+    await db.commit()
+    await scan_completed_deliveries(db)
+    before = await _alerts(db, task_id)
+    assert any("НЕ УДАЛОСЬ" in a for a in before)
+
+    await client.post(
+        f"/api/delivery/discrepancies/{task_id}/observation",
+        json={"probe": _PROBE, "observation": _SAW, "sha": _SHA},
+    )
+    listed = await undelivered_completed_tasks(db)
+    assert [r["task_id"] for r in listed["closed_by_observation"]] == [task_id]
+
+    # Пересечь следующий рубеж (72ч) ПОСЛЕ закрытия наблюдением.
+    await db.execute(
+        "UPDATE tasks SET completed_at = datetime('now', '-73 hours') WHERE id = ?",
+        (task_id,),
+    )
+    await db.commit()
+    await scan_completed_deliveries(db)
+    after = await _alerts(db, task_id)
+    new_alerts = after[len(before) :]
+    voiced_again = [a for a in new_alerts if "НЕ УДАЛОСЬ" in a]
+    assert voiced_again == [], (
+        "свип заново озвучил unknown уже ПОСЛЕ того, как строку закрыло "
+        f"наблюдение: {voiced_again}"
+    )
+
+    # Если источник ОЖИВЁТ и заговорит другое, наблюдение относилось не к
+    # этому факту — строка обязана заговорить снова, а не молчать вечно.
+    _pr_states(monkeypatch, {1215: "open"})
+    await scan_completed_deliveries(db)
+    after_source_speaks = await _alerts(db, task_id)
+    assert any(
+        "PR" in a and "НЕ доставлена" in a for a in after_source_speaks[len(after) :]
+    ), "источник заговорил pr_open — про НОВЫЙ факт молчать нельзя"
+
+
+async def test_a_failed_journal_write_does_not_leave_a_silently_closed_row(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Находка ревью Codex, сдача 2: наблюдение коммитится одним актом.
+
+    ``repo.record_delivery_observation`` раньше коммитило само сразу после
+    UPDATE, отдельно от журнала и события, которые пишет вызывающий сервис.
+    Если ``insert_event`` падал ПОСЛЕ этого коммита, HTTP-вызов возвращал бы
+    500, но строка в БД уже читалась бы как закрытая наблюдением — без
+    записи в ленту и без события, и повторный вызов переписал бы наблюдение
+    заново, не будучи идемпотентным. Один коммит на весь акт делает падение
+    честным: либо всё, либо ничего.
+    """
+    from hub import services
+
+    task_id = await _unanswerable_row(
+        client, db, title="Атомарность записи", pr=1216, monkeypatch=monkeypatch
+    )
+
+    async def boom(*_a, **_kw):
+        raise RuntimeError("simulated failure after the repo-layer UPDATE")
+
+    monkeypatch.setattr(repo, "insert_event", boom)
+    with pytest.raises(RuntimeError):
+        await services.record_delivery_observation(
+            db, task_id, by="tester", probe=_PROBE, evidence=_SAW, sha=_SHA
+        )
+
+    # В проде на этом месте REST-обработчик отдаёт исключение выше, и
+    # RequestConnectionMiddleware закрывает соединение запроса в finally —
+    # SQLite откатывает незакоммиченную транзакцию сама (hub/app.py:381-394,
+    # #1065: своё соединение на запрос). Тестовое соединение переживает всю
+    # функцию, поэтому откат здесь делается явно — тем же эффектом.
+    await db.rollback()
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert not row["observed_at"], (
+        "запись легла в базу, хотя вызывающий получил исключение — "
+        "строка закрылась молча, без истории и без события"
+    )
+    listed = await undelivered_completed_tasks(db)
+    assert [r["task_id"] for r in listed["unknown"]] == [task_id], (
+        "строка обязана остаться расхождением: акт наблюдения не завершился"
+    )
+    assert listed["closed_by_observation"] == []
+
+
 async def test_the_backfill_holds_the_same_evidence_bar_as_the_live_door(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:

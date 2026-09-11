@@ -54,6 +54,7 @@ from hub.mcp_server import (
     hub_submit_review,
     hub_task_status,
     hub_task_update,
+    hub_undelivered_completed,
     hub_whoami,
 )
 
@@ -3625,6 +3626,124 @@ async def test_my_context_digest_does_not_name_removed_review_worktree(
     assert "#910" in text
     assert "task-910" not in text
     assert "worktrees" not in text
+
+
+# ---------------------------------------------------------------------------
+# #1215: the MCP undelivered-completed text must not stamp "all clear" while
+# an unknown or observed row still stands (находка ревью 36a0199e4bb6e3b9).
+# No MCP-level test existed for this human text before — the REST payload
+# was covered, the rendered sentence was not.
+# ---------------------------------------------------------------------------
+
+
+async def test_undelivered_completed_does_not_say_all_clear_beside_unknown(
+    mock_api_get: AsyncMock,
+) -> None:
+    """rows(pr_open) empty, but an unknown row stands: no "all clear" stamp.
+
+    Before the fix, ``hub_undelivered_completed`` gated its opening line on
+    ``if not rows:`` alone, so "No completed task is waiting on an open PR."
+    printed even though a row the hub could not check was sitting right
+    below it in the same text — the exact honesty bug the CLI's ``cmd_
+    undelivered`` was already fixed for (d7b46ff7), left standing in MCP.
+    """
+    mock_api_get.return_value = {
+        "undelivered": [],
+        "unknown": [
+            {
+                "task_id": 878,
+                "title": "Маховик",
+                "reason": "провайдер не ответил",
+                "age_hours": 467,
+            }
+        ],
+        "closed_by_observation": [],
+        "sweep_lookback_days": 30,
+    }
+    text = _mcp_text(await hub_undelivered_completed())
+    assert "No completed task is waiting on an open PR." not in text, (
+        "unknown стоит рядом — печатать «всё чисто» значит прятать строку, "
+        "которую хаб честно не смог проверить"
+    )
+    assert "#878" in text and "провайдер не ответил" in text
+
+
+async def test_undelivered_completed_does_not_say_all_clear_beside_observed(
+    mock_api_get: AsyncMock,
+) -> None:
+    """rows and unknown both empty, but a row stands closed_by_observation.
+
+    The production shape #878/#875/#909 settle into once #1215 ships: nothing
+    left in ``undelivered`` or ``unknown``, only ``closed_by_observation``.
+    """
+    mock_api_get.return_value = {
+        "undelivered": [],
+        "unknown": [],
+        "closed_by_observation": [
+            {
+                "task_id": 909,
+                "title": "Паспорт дефекта",
+                "state": "unknown",
+                "reason": "репозиторий PR #468 удалён, спросить некого",
+                "observed_by": "pda_claude",
+                "observed_sha": "19ee3f6faf9f",
+                "observed_probe": "git show 19ee3f6faf9f --stat",
+                "observed_evidence": "файл на месте, AC-тест зелёный",
+            }
+        ],
+        "sweep_lookback_days": 30,
+    }
+    text = _mcp_text(await hub_undelivered_completed())
+    assert "No completed task is waiting on an open PR." not in text
+    assert "#909" in text and "pda_claude" in text
+
+
+async def test_undelivered_completed_still_says_all_clear_when_it_really_is(
+    mock_api_get: AsyncMock,
+) -> None:
+    """All three buckets empty is the only case the stamp may print."""
+    mock_api_get.return_value = {
+        "undelivered": [],
+        "unknown": [],
+        "closed_by_observation": [],
+        "sweep_lookback_days": 30,
+    }
+    text = _mcp_text(await hub_undelivered_completed())
+    assert "No completed task is waiting on an open PR." in text
+
+
+async def test_undelivered_completed_frozen_pr_open_is_not_told_to_observe(
+    mock_api_get: AsyncMock,
+) -> None:
+    """Находка ревью #1215, 7be892476f84f99c.
+
+    A frozen ``pr_open`` row must not be told "record an observation" — the
+    write path (`record_delivery_observation`) refuses any state but
+    ``unknown`` with 422 ``source_still_answers``. Before the fix, the frozen
+    banner was built from ``(*rows, *unknown)`` without a state split, so a
+    31-day-old open PR was handed a promised exit that the endpoint rejects.
+    """
+    mock_api_get.return_value = {
+        "undelivered": [
+            {
+                "task_id": 461,
+                "title": "Предпас",
+                "pr_number": 461,
+                "reason": "PR #461 открыт и не смержен",
+                "age_hours": 800,
+                "still_swept": False,
+            }
+        ],
+        "unknown": [],
+        "closed_by_observation": [],
+        "sweep_lookback_days": 30,
+    }
+    text = _mcp_text(await hub_undelivered_completed())
+    assert "#461" in text
+    # The banner for a frozen OPEN-PR row must not promise the observation
+    # door — that door is unknown-only.
+    assert "Выход — записать наблюдение" not in text
+    assert "источник ещё отвечает" in text
 
 
 # ---------------------------------------------------------------------------

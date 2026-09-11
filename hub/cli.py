@@ -1073,6 +1073,27 @@ def cmd_delivery_ack(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delivery_observe(args: argparse.Namespace) -> int:
+    """Закрыть строку реестра наблюдённым фактом доставки (#1215).
+
+    Единственный CLI-вход к ``POST .../observation`` (находка ревью Codex,
+    сдача 2): ``undelivered`` советует замёрзшей unknown-строке «записать
+    наблюдение», а команды, которая отправила бы probe/observation/sha,
+    раньше не существовало — оператору с одним только CLI предложенный выход
+    был недоступен.
+    """
+    _api(
+        "POST",
+        f"/api/delivery/discrepancies/{int(args.task_id)}/observation",
+        {"probe": args.probe, "observation": args.observation, "sha": args.sha},
+    )
+    print(
+        f"#{args.task_id}: строка закрыта наблюдением — коммит {args.sha}.\n"
+        "Прежний ответ реестра остался историей; задача не тронута."
+    )
+    return 0
+
+
 def cmd_undelivered(args: argparse.Namespace) -> int:
     """Completed tasks whose PR is neither merged nor closed (#897).
 
@@ -1111,15 +1132,31 @@ def cmd_undelivered(args: argparse.Namespace) -> int:
         print(f"#{row['task_id']} — не проверено: {row.get('reason', '')}")
     # Строка за краем окна свипа застыла на последнем ответе источников, и
     # узнавать об этом по неподвижному checked_at читатель не обязан (#1215).
-    frozen = [r for r in (*rows, *unknown) if r.get("still_swept") is False]
-    if frozen:
+    #
+    # РАЗДЕЛЕНО ПО СОСТОЯНИЮ (находка ревью #1215, 7be892476f84f99c): запись
+    # наблюдения принимает ТОЛЬКО unknown, источник pr_open отвечает и
+    # эндпоинт честно отказывает 422 source_still_answers. Общий баннер
+    # предлагал этот выход и замёрзшим pr_open-строкам, для которых его нет.
+    frozen_unknown = [r for r in unknown if r.get("still_swept") is False]
+    frozen_pr_open = [r for r in rows if r.get("still_swept") is False]
+    if frozen_unknown:
         print(
-            f"\n{len(frozen)} строк(и) старше окна свипа "
+            f"\n{len(frozen_unknown)} строк(и) старше окна свипа "
             f"({result.get('sweep_lookback_days', '?')} дней): источники больше "
             f"не перепрашиваются, ответ застыл. Выход — записать наблюдение: "
             f"оно окна не спрашивает."
         )
-        for row in frozen:
+        for row in frozen_unknown:
+            print(f"    #{row['task_id']} — {row.get('age_hours', '?')}ч")
+    if frozen_pr_open:
+        print(
+            f"\n{len(frozen_pr_open)} строк(и) старше окна свипа "
+            f"({result.get('sweep_lookback_days', '?')} дней) с открытым PR: "
+            f"источники больше не перепрашиваются, ответ застыл. Наблюдением "
+            f"эту строку не закрыть — источник ещё отвечает. Выход — довезти "
+            f"работу или признать расхождение законным с причиной."
+        )
+        for row in frozen_pr_open:
             print(f"    #{row['task_id']} — {row.get('age_hours', '?')}ч")
     # Закрытая наблюдением строка ушла из списка расхождений, но не из виду:
     # видно, что доставку подтвердил человек или агент, а не установил хаб.
@@ -2231,6 +2268,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Почему это законно. Без причины признание было бы выключателем",
     )
     p_delivery_ack.set_defaults(func=cmd_delivery_ack)
+
+    p_delivery_observe = sub.add_parser(
+        "delivery-observe",
+        help="Закрыть строку реестра доставки наблюдённым фактом (#1215)",
+    )
+    p_delivery_observe.add_argument("task_id", type=int)
+    p_delivery_observe.add_argument(
+        "--probe", required=True, help="Что запускали или запрашивали"
+    )
+    p_delivery_observe.add_argument(
+        "--observation", required=True, help="Что увидели в результате"
+    )
+    p_delivery_observe.add_argument(
+        "--sha", required=True, help="Коммит, в котором видели работу"
+    )
+    p_delivery_observe.set_defaults(func=cmd_delivery_observe)
 
     p_health = sub.add_parser(
         "health", help="Show Hub bind/auth/vast configuration (no secrets)"
