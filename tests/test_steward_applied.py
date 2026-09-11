@@ -806,9 +806,16 @@ async def test_a_live_check_on_another_commit_is_not_evidence_about_this_one(
         verifiable_by=ACVerifiableBy.manual,
     )
 
-    for recorded_sha, why in (
-        ("", "живая проверка не назвала коммит вовсе"),
-        ("f" * 40, "живая проверка снята на другом коммите"),
+    # Два случая, и ОТКАЗ У НИХ РАЗНЫЙ. Проверять только «не одобрено» здесь
+    # мало: ветка про безымянный коммит и ветка про чужой перекрывают друг
+    # друга по исходу — пустая строка не равна закреплённому sha, и вторая
+    # поймала бы первую. Мутация «снять проверку на безымянный коммит»
+    # пережила серию ровно поэтому. Чинится тем, чем и должно: отказ обязан
+    # сказать, что именно не так, — «коммита не назвали» и «назвали чужой»
+    # автор чинит по-разному.
+    for recorded_sha, why, expected in (
+        ("", "живая проверка не назвала коммит вовсе", "не назвала коммита"),
+        ("f" * 40, "живая проверка снята на другом коммите", "снята на ffffffffffff"),
     ):
         await repo.insert_live_check(
             db,
@@ -836,8 +843,13 @@ async def test_a_live_check_on_another_commit_is_not_evidence_about_this_one(
 
         assert not decision.allowed, why
         assert [code for code, _ in decision.forbidden] == ["live_check_unknown"], why
-        assert _SHA_1231[:12] in decision.forbidden[0][1], (
+        detail = decision.forbidden[0][1]
+        assert _SHA_1231[:12] in detail, (
             "отказ обязан назвать коммит, о котором свидетельство обязано было говорить"
+        )
+        assert expected in detail, (
+            f"{why}: отказ обязан назвать ИМЕННО этот случай, ждали {expected!r}, "
+            f"получили {detail!r}"
         )
 
 
