@@ -6116,6 +6116,11 @@ async def test_the_debt_is_paid_once_even_after_a_death_mid_settlement(
 
     recorder = _DispatchRecorder({"agent": {"id": "bc-twice"}, "run": {"id": "r-1"}})
     _wire(monkeypatch, recorder)
+    # Принципал облачного ревьюера настоящий, как на проде. Без него заказ
+    # пишется с NULL, сопоставление отчёта падает на старое правило «любой
+    # отчёт этого поколения», и отчёт ЛОКАЛЬНОГО прогона закрывал бы дверь
+    # вместо сторожа идемпотентности — то есть проверялся бы не тот сторож.
+    await _pinned_setup(db, monkeypatch)
     await _local_principal(db, monkeypatch)
     _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
 
