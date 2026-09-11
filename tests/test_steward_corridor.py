@@ -734,11 +734,24 @@ async def test_a_verdict_without_a_report_of_its_generation_says_so(db):
     )
     await db.commit()
 
+    # И вердикт, у которого поколения в событии нет вовсе (запись старше
+    # поля): подстановка «самого свежего» здесь была бы тем же дефектом, что
+    # и в тесте выше, только тише — чужой отчёт на месте своего.
+    await repo_module.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="policy",
+        payload={"verdict": "approved"},
+    )
+    await db.commit()
+
     assert await generate_due_digests(db, now=_tomorrow()) == 1
     payload = _json.loads((await repo_module.list_digests(db))[0]["payload"])
-    entry = payload["auto_verdicts"][0]
-    assert entry["machine_review"]["state"] == "absent"
-    assert entry["models"]["reviewer"] == ""
+    assert len(payload["auto_verdicts"]) == 2
+    for entry in payload["auto_verdicts"]:
+        assert entry["machine_review"]["state"] == "absent"
+        assert entry["models"]["reviewer"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1100,6 +1113,13 @@ async def test_the_live_probe_refuses_a_mutation_that_breaks_the_parse(
     git("config", "user.email", "probe@example.com")
     git("config", "user.name", "probe")
     (project / "calc.py").write_text("def double(n):\n    return n * 2\n", "utf-8")
+    # Тест в песочнице обязателен: без него прогон «ничего не собрал» и был бы
+    # отказом в любом случае — включая тот, где проверку разбора сняли. Тест,
+    # проходящий и без правила, ничего о правиле не говорит.
+    (project / "test_calc.py").write_text(
+        "from calc import double\n\n\ndef test_double():\n    assert double(2) == 4\n",
+        "utf-8",
+    )
     git("add", "-A")
     git("commit", "-m", "base")
     sha = git("rev-parse", "HEAD")
@@ -1127,7 +1147,7 @@ async def test_the_live_probe_refuses_a_mutation_that_breaks_the_parse(
 
 
 async def test_no_configured_suite_command_means_no_probe_at_all(
-    client, db, monkeypatch
+    client, db, monkeypatch, tmp_path
 ):
     """Пустая команда набора — «живого прогона нет», а не «запускай как есть».
 
@@ -1140,12 +1160,30 @@ async def test_no_configured_suite_command_means_no_probe_at_all(
     from hub.services import mechanical_pass as mp
     from tests.test_web import _web_task_in_review_with_test_ac
 
+    from hub import repository as repo_module
+    from hub.services import orchestration
+
     task_id = await _web_task_in_review_with_test_ac(client, db)
 
-    monkeypatch.setattr(config_module, "MUTATION_PROBE_CMD", "")
-    assert await mp.configured_probe(db, task_id) is None
+    # Копия проекта и коммит сдачи ЕСТЬ: иначе зонда не было бы и без правила,
+    # и тест мерил бы отсутствие рабочей копии вместо отсутствия команды.
+    async def _ctx(db_, task_id_):
+        return {"repo": str(tmp_path)}
 
-    # Команда есть, но копии проекта и коммита сдачи нет — тоже «нет», а не
-    # «попробуем»: гонять набор негде и не на чём.
+    monkeypatch.setattr(orchestration, "project_git_context", _ctx)
+    await repo_module.update_task(db, task_id, submission_sha="0" * 40)
+    await db.commit()
+
+    monkeypatch.setattr(config_module, "MUTATION_PROBE_CMD", "")
+    assert await mp.configured_probe(db, task_id) is None, (
+        "пустая команда набора — «живого прогона нет», а не «запускай как есть»"
+    )
+
+    # С командой зонд появляется — значит отказ выше дал именно её отсутствие.
     monkeypatch.setattr(config_module, "MUTATION_PROBE_CMD", "pytest -q")
+    assert await mp.configured_probe(db, task_id) is not None
+
+    # А без коммита сдачи — снова «нет»: гонять не на чём.
+    await repo_module.update_task(db, task_id, submission_sha="")
+    await db.commit()
     assert await mp.configured_probe(db, task_id) is None
