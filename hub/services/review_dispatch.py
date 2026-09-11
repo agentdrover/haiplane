@@ -25,6 +25,7 @@ import logging
 import math
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, NamedTuple
@@ -1024,6 +1025,13 @@ CLOUD_REVIEW_FORGES: tuple[str, ...] = ("github",)
 CLOUD_CHANNEL = "cloud"
 LOCAL_CHANNEL = "local"
 
+# Состояние строки заказа между «облако отчёта не дало» и «вторая дверь
+# открыта» (#1252). Не украшение и не третий исход: это ДОЛГ, записанный в
+# базу, потому что между двумя этими событиями лежит подготовка заказа с
+# сетью внутри, а поллер глотает исключение и идёт дальше. Закрытая строка
+# свипу невидима — значит закрывать её раньше, чем долг отдан, нельзя.
+SECOND_DOOR_OWED = "second_door"
+
 
 async def _policy_and_novelty_allow(
     db: aiosqlite.Connection,
@@ -1341,7 +1349,10 @@ async def prepare_review_order(
     # oversight (#582). An unreadable diff buys deep, it does not excuse it.
     diff = await _submission_diff(db, task_id, branch)
     if force_profile:
-        profile, profile_reasons = force_profile, ["добор после неполного прогона"]
+        profile, profile_reasons = (
+            force_profile,
+            ["профиль задан заказом: добор лестницы или его замена"],
+        )
     else:
         profile, profile_reasons = pick_review_profile(task, diff)
     rules_block, rules_note = await collect_review_rules(db, task_id, diff)
@@ -1684,16 +1695,34 @@ async def maybe_dispatch_review(
     )
     agent_id, run_id = started.agent_id, started.run_id
     if not agent_id:
+        # МЕСТО ПРИМЕНЕНИЯ №1 второй двери (#1252): отказ СИНХРОННЫЙ — агент
+        # не создался, денег не потрачено. Алерт остаётся на месте: отказ
+        # облака — наблюдённый факт, и он стоит в карточке независимо от
+        # того, добыл ли отчёт кто-то второй.
+        detail = _lost_call_detail(started)
         await repo.add_task_update(
             db,
             task_id,
             "hub",
             "alert",
-            f"Кросс-модельное ревью НЕ вызвано: {_lost_call_detail(started)}. "
+            f"Кросс-модельное ревью НЕ вызвано: {detail}. "
             "Вердикт остаётся человеку; детали в логе хаба (#757).",
         )
         await db.commit()
-        return False
+        if started.blind:
+            # Пустой agent_id тут значит НЕ «создать не вышло», а «спросить,
+            # создался ли, не вышло» — то самое состояние, которое _Started
+            # отличает признаком blind и ради которого повтор запрещён двумя
+            # строками выше. Открыть на нём вторую дверь значит купить второго
+            # ревьюера поверх, возможно, уже оплаченного первого и получить
+            # два соперничающих отчёта на одну сдачу. Отказом считается
+            # только НАБЛЮДЁННЫЙ факт (deploy/LOCAL-REVIEW.md): либо
+            # провайдер отверг создание, либо сверка подтвердила, что агента
+            # нет. Слепота — ни то, ни другое, и остаётся человеку.
+            return False
+        return await open_second_door(
+            db, task, forge, branch, generation, force_profile, cloud_refusal=detail
+        )
 
     # #1025: pin whose report this dispatch waits for, resolved from the
     # reviewer token at dispatch time (above, where the code was minted under
@@ -1791,6 +1820,13 @@ class ReviewReach:
 
     ways: tuple[str, ...]
     reason: str
+    local_missing: tuple[str, ...] = ()
+    """Чего не хватает ЛОКАЛЬНОМУ пути, пустой кортеж — хватает всего.
+
+    Отдельно от ``reason``, потому что ``reason`` заполнен только когда ways
+    пуст, а на форже с облаком ways непуст всегда. Отказать локальному
+    заказу там надо всё равно, и назвать причину — тоже (#1252).
+    """
 
     @property
     def runnable(self) -> bool:
@@ -1810,20 +1846,120 @@ async def review_reach(db: aiosqlite.Connection, forge: str) -> ReviewReach:
     БЫТЬ и не разрешаться (отозван, открытый режим), а отчёт под принципалом
     автора гейт не засчитает при REVIEW_SELF_APPROVE=forbid, то есть прогон
     был бы оплачен впустую (#1128).
+
+    #1252: способы считаются ОБА, и на форже с облаком тоже. Раньше здесь
+    стоял ранний выход — «облако дотягивается» отвечало за весь вопрос, и
+    локальная готовность на github не проверялась вовсе. Из-за этого у
+    сдачи, чей облачный прогон отказал, второй двери не было даже там, где
+    локальный ревьюер настроен и работает.
+
+    Порядок в ``ways`` — порядок попыток: облако первое, локальный путь
+    второй. Он читается как предпочтение, а не как множество.
+
+    Ответ для трёх прежних читателей не меняется: на форже с облаком
+    ``ways`` по-прежнему непуст, а ``reason`` по-прежнему пуст — то есть ни
+    форма проекта, ни инвариант записи нового состояния не видят.
     """
+    ways: list[str] = []
     if forge in CLOUD_REVIEW_FORGES:
-        return ReviewReach((CLOUD_CHANNEL,), "")
+        ways.append(CLOUD_CHANNEL)
     missing = local_reviewer.not_ready()
     if await local_reviewer_principal_id(db) is None:
         missing = missing or ["LOCAL_REVIEWER_HUB_TOKEN не разрешается в принципала"]
     if not missing:
-        return ReviewReach((LOCAL_CHANNEL,), "")
+        ways.append(LOCAL_CHANNEL)
+    if ways:
+        return ReviewReach(tuple(ways), "", tuple(missing))
     return ReviewReach(
         (),
         f"облачный ревьюер не работает с форжем «{forge}» (проверено "
-        "31.08.2026, #1119), а локальный не настроен: "
+        "31.08.2026, #1119), а " + local_path_refusal(missing),
+        tuple(missing),
+    )
+
+
+def local_path_refusal(missing: Sequence[str]) -> str:
+    """Почему локального пути нет — одними и теми же словами (#1188).
+
+    Автор текста один на два места: отказ, когда способов НЕТ вовсе, и отказ
+    локальному заказу на форже, где облако есть, но отчёта не дало. Две копии
+    объясняли бы одно состояние двумя разными словами на первой же правке.
+    """
+    return (
+        "локальный путь не настроен: "
         + "; ".join(missing)
-        + ". Порядок включения — deploy/LOCAL-REVIEW.md",
+        + ". Порядок включения — deploy/LOCAL-REVIEW.md"
+    )
+
+
+async def open_second_door(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    forge: str,
+    branch: str,
+    generation: int,
+    force_profile: str = "",
+    *,
+    cloud_refusal: str,
+) -> bool:
+    """Вторая дверь: локальный путь ПОСЛЕ наблюдённого отказа облака (#1252).
+
+    Зовётся из ДВУХ мест, и это не украшение: отказ у облака бывает двух
+    видов, и лежат они в разных путях кода. Синхронный — агент не создался
+    (``maybe_dispatch_review``). Асинхронный — агент создался, прогон дошёл
+    до терминального статуса, а отчёта нет (``sweep_review_dispatches``); там
+    прогон УЖЕ оплачен. Закрыть один и забыть второй значит оставить
+    половину сдач без отчёта ровно так же, как сегодня.
+
+    ``cloud_refusal`` — НАБЛЮДЁННАЯ причина, а не догадка о недоступности:
+    текст отказа провайдера или терминальный статус прогона. Он доезжает до
+    карточки, потому что отчёт без имени автора читается как облачный и
+    вводит человека в заблуждение (#1252, AC-4).
+
+    Ненастроенный локальный путь не пишет НИЧЕГО: алерт об отказе облака уже
+    стоит и остаётся единственным следом. Настройка, которой нет, не имеет
+    права менять сегодняшнее поведение — поэтому здесь спрашивается
+    ``review_reach`` (единственный автор этого знания, #1188), а не
+    ``dispatch_local_review``, который на форже с облаком счёл бы
+    достижимость облака своей и запустил прогон.
+
+    Свежесть сдачи перечитывается ЗДЕСЬ, а не у каждого зовущего: между
+    заказом облака и этой развилкой лежит сеть — синхронный путь ждал ответа
+    на создание агента, асинхронный ждал расписания свипа. За это время
+    задачу могли вернуть в работу, пересдать или переставить на другую
+    ветку, и локальный прогон купил бы чтение кода, которого на живой сдаче
+    уже нет. Правило одно, мест применения два, и второе место — ровно тот
+    класс, что уже ловили: один потребитель правила ≠ все.
+    """
+    if not await _submission_still_live(db, task, branch, generation):
+        return False
+    reach = await review_reach(db, forge)
+    if LOCAL_CHANNEL not in reach.ways:
+        return False
+    return await dispatch_local_review(
+        db, task, forge, branch, generation, force_profile, cloud_refusal=cloud_refusal
+    )
+
+
+async def _submission_still_live(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    branch: str,
+    generation: int,
+) -> bool:
+    """Та ли ещё сдача ждёт отчёта, по СВЕЖЕЙ строке задачи (#1252).
+
+    Читается из базы, а не из ``task``: словарь на руках — снимок, сделанный
+    до сетевого ожидания, и именно поэтому он ничего не доказывает.
+    """
+    row = await repo.get_task(db, int(task["id"]))
+    if row is None:
+        return False
+    fresh = dict(row)
+    return (
+        fresh.get("status") == "review"
+        and int(fresh.get("submission_generation") or 0) == generation
+        and (fresh.get("branch") or "").strip() == branch
     )
 
 
@@ -1834,6 +1970,8 @@ async def dispatch_local_review(
     branch: str,
     generation: int,
     force_profile: str = "",
+    *,
+    cloud_refusal: str = "",
 ) -> bool:
     """Добыть ревью там, куда облако не дотягивается. True — прогон запущен.
 
@@ -1844,12 +1982,26 @@ async def dispatch_local_review(
     """
     task_id = int(task["id"])
     reach = await review_reach(db, forge)
-    if not reach.runnable:
+    principal_id = await local_reviewer_principal_id(db)
+    if LOCAL_CHANNEL not in reach.ways or principal_id is None:
+        # Спрашивается ЛОКАЛЬНЫЙ канал, а не ``runnable``: на форже из
+        # CLOUD_REVIEW_FORGES ways непуст из-за облака даже тогда, когда
+        # локального пути нет вовсе, и старая проверка пропускала заказ
+        # дальше. Принципал перечитывается ЗДЕСЬ и здесь же судится: между
+        # готовностью и заказом лежит await, а токен ревьюера могут отозвать
+        # — и заказ уехал бы под NULL, то есть отчёт перестал бы быть чужим
+        # автору, ради чего прогон и покупается (#1128, #1252).
+        #
         # Причина та же, что увидит человек в форме проекта и в отказе на
         # записи: у неё один автор (#1188), иначе три места объясняли бы
         # одно состояние тремя разными словами.
-        return await _refuse_local_review(db, task_id, reach.reason)
-    principal_id = await local_reviewer_principal_id(db)
+        missing = reach.local_missing or (
+            "LOCAL_REVIEWER_HUB_TOKEN (токен принципала ревьюера) "
+            "не разрешается в принципала",
+        )
+        return await _refuse_local_review(
+            db, task_id, reach.reason or local_path_refusal(missing)
+        )
     spent = await _tokens_already_spent(db, task_id)
     if spent >= config.LOCAL_REVIEW_TOKEN_CEILING:
         return await _refuse_local_review(
@@ -1885,13 +2037,24 @@ async def dispatch_local_review(
         reviewer_principal_id=principal_id,
         channel=LOCAL_CHANNEL,
     )
+    # #1252: причина, по которой отчёт добывается ЗДЕСЬ, а не в облаке, —
+    # разная в двух случаях, и обе называются. «Облако сюда не дотягивается»
+    # — свойство форжа (#1180). «Облако отказало» — наблюдённый факт про
+    # конкретную сдачу, и человеку нужен именно он: без него отчёт второго
+    # поставщика читается как облачный.
+    why = (
+        f"облако отчёта НЕ дало — {cloud_refusal}; отчёт добывается ВТОРЫМ "
+        "поставщиком, локальным (#1252)"
+        if cloud_refusal
+        else f"форж «{forge}» облачному ревьюеру недоступен"
+    )
     await repo.add_task_update(
         db,
         task_id,
         "hub",
         "status",
-        f"Машинное ревью запущено ЛОКАЛЬНО: форж «{forge}» облачному ревьюеру "
-        f"недоступен, прогон идёт на хосте хаба под песочницей (#1180). "
+        f"Машинное ревью запущено ЛОКАЛЬНО: {why}, "
+        f"прогон идёт на хосте хаба под песочницей (#1180). "
         f"Профиль {order.profile}, прогон {run_id}. Правила репозитория: "
         f"{order.rules_note} (#873). Предмет ревью: {order.diff_note} (#874). "
         "Отчёт придёт по контракту от принципала локального ревьюера — "
@@ -1935,13 +2098,25 @@ async def _refuse_local_review(
 
 
 async def _tokens_already_spent(db: aiosqlite.Connection, task_id: int) -> int:
-    """Сколько токенов задача уже стоила по отчётам ревью.
+    """Сколько токенов задача уже стоила — по всему, где сумма СКАЗАНА.
 
-    Считается по ОТЧЁТАМ, а не по числу прогонов: прогон, о котором ревьюер
+    Считается по отчётам, а не по числу прогонов: прогон, о котором ревьюер
     не отчитался, деньги всё равно стоил, но назвать сумму мы можем только
     там, где она сказана. Незнание здесь склоняется в сторону прогона —
     пропущенное ревью дороже лишнего, — и это тот же выбор направления
     ошибки, что в #762.
+
+    #1252: посылка «у прогона без отчёта суммы нет» на пути второй двери
+    неверна. Свип строкой выше спрашивает счёт у провайдера и кладёт его в
+    ``review_dispatches.provider_tokens`` (#1026) — то есть в тот момент,
+    когда открывается вторая дверь, оплаченный прогон УЖЕ назван, а потолок
+    считал его нулём и обходился. Слагаемое второе: заказы, не доставившие
+    отчёт. Они не пересекаются с первым — счёт доставленного отчёта лежит и
+    на строке ``machine_reviews`` (``set_machine_review_provider_tokens``), и
+    такой заказ закрыт как ``done``; двойного счёта тут нет.
+
+    NULL остаётся незнанием и по-прежнему склоняется в сторону прогона: ноль
+    в сумме, а не запрет.
     """
     rows = await fetchall(
         db,
@@ -1949,7 +2124,14 @@ async def _tokens_already_spent(db: aiosqlite.Connection, task_id: int) -> int:
         "FROM machine_reviews WHERE task_id = ?",
         (task_id,),
     )
-    return int(dict(rows[0])["total"]) if rows else 0
+    reported = int(dict(rows[0])["total"]) if rows else 0
+    unreported = await fetchall(
+        db,
+        "SELECT COALESCE(SUM(provider_tokens), 0) AS total FROM review_dispatches "
+        "WHERE task_id = ? AND status <> 'done' AND provider_tokens IS NOT NULL",
+        (task_id,),
+    )
+    return reported + (int(dict(unreported[0])["total"]) if unreported else 0)
 
 
 @dataclass(frozen=True)
@@ -2315,11 +2497,21 @@ async def _dispatch_report(
     # Exact for every current path, because a second dispatch exists only
     # after the first report bought it (top-up is the sole same-generation
     # re-dispatch).
+    #
+    # #1252: ступень считается СРЕДИ ЗАКАЗОВ ТОГО ЖЕ ПРИНЦИПАЛА И КАНАЛА, а
+    # не среди всех. Вторая дверь сделала «все заказы поколения» неверной
+    # меркой: облачный и локальный заказы живут в одном поколении, а
+    # принципалы у них разные — иначе отчёт не был бы независимым (#1128).
+    # Локальный заказ оказывался ступенью 1, а у локального принципала отчёт
+    # был первым (индекс 0), и годный контрактный отчёт не опознавался своим
+    # же заказом: прогон объявлялся упавшим, а закрытого заказа не
+    # оставалось вовсе — то есть пустое ревью не могло дать автовердикт.
     dispatch_ids = await fetchall(
         db,
         "SELECT id FROM review_dispatches WHERE task_id = ? "
-        "AND submission_generation = ? ORDER BY id",
-        (task_id, generation),
+        "AND submission_generation = ? AND reviewer_principal_id = ? "
+        "AND channel = ? ORDER BY id",
+        (task_id, generation, expected, dispatch.get("channel") or CLOUD_CHANNEL),
     )
     order = [int(dict(r)["id"]) for r in dispatch_ids]
     try:
@@ -2536,6 +2728,11 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     for row in await repo.list_active_review_dispatches(db):
         dispatch = dict(row)
         task_id = dispatch["task_id"]
+        if dispatch.get("status") == SECOND_DOOR_OWED:
+            # Долг, записанный прошлым проходом (или прошлой жизнью процесса):
+            # облако уже отказало вслух, вторая дверь ещё не открыта.
+            await _settle_second_door(db, dispatch)
+            continue
         if dispatch.get("channel") == LOCAL_CHANNEL:
             # Локальный прогон досматривает своя корутина (#1180). Свипу тут
             # остаётся один случай — процесс хаба, перезапущенный посреди
@@ -2596,33 +2793,201 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
             await repo.set_review_dispatch_status(db, dispatch["id"], "done")
             await db.commit()
             continue
-        await repo.add_task_update(
+        await _close_a_run_without_a_report(db, dispatch, run)
+
+
+async def _close_a_run_without_a_report(
+    db: aiosqlite.Connection, dispatch: dict[str, Any], run: dict[str, Any]
+) -> None:
+    """Прогон дошёл до конца и отчёта не оставил: назвать это и открыть дверь.
+
+    #1252: отчёт перечитывается НЕПОСРЕДСТВЕННО перед тем, как назвать его
+    отсутствующим. Между первой проверкой в свипе и этим местом лежат два
+    сетевых ожидания — терминальное состояние прогона и расход, — и
+    контрактный отчёт, доехавший в это окно, заставал решение «отчёта нет»
+    уже принятым: алерт «отчёт НЕ сдан», вторая дверь, лишние деньги и два
+    соперничающих отчёта на одну сдачу.
+
+    Эта проверка — первая из ДВУХ, и вторая важнее. Здесь закрывается ложь в
+    карточке; деньги тратятся ниже по пути, и последнее слово перед заказом
+    говорит ``_second_door_after_run``. Окно между двумя проверками — запись
+    долга, чтение задачи и проекта, а на возобновлении ещё и весь перерыв
+    между проходами свипа — как раз то, где отчёт успевает доехать. Один
+    потребитель правила ≠ все.
+
+    Доехавший отчёт здесь НЕ закрывается на месте: строка остаётся активной,
+    и следующий проход разбирает её обычным путём — со сверкой расхода по
+    данным провайдера (#1026). Второй автор этого закрытия разошёлся бы с
+    первым на первой же правке.
+    """
+    task_id = int(dispatch["task_id"])
+    run_status = str(run.get("status") or "")
+    if (
+        await _dispatch_report(db, task_id, dispatch["submission_generation"], dispatch)
+        is not None
+    ):
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Кросс-модельное ревью вызвано, но отчёт НЕ сдан: агент "
+        f"{dispatch['agent_id']} ({dispatch['model']}) завершил ран со "
+        f"статусом {run.get('status')}, machine-review актуальной "
+        "генерации отсутствует. Вердикт остаётся человеку (#757).",
+    )
+    task_row = await repo.get_task(db, task_id)
+    task_status = dict(task_row)["status"] if task_row else ""
+    if task_status != "review":
+        await repo.insert_event(
             db,
-            task_id,
-            "hub",
-            "alert",
-            f"Кросс-модельное ревью вызвано, но отчёт НЕ сдан: агент "
-            f"{dispatch['agent_id']} ({dispatch['model']}) завершил ран со "
-            f"статусом {run.get('status')}, machine-review актуальной "
-            "генерации отсутствует. Вердикт остаётся человеку (#757).",
+            kind="review_dispatch_failed",
+            task_id=task_id,
+            actor="hub",
+            payload={
+                "dispatch_id": dispatch["id"],
+                "model": dispatch.get("model") or "",
+                "run_status": run.get("status"),
+                "task_status": task_status,
+            },
         )
-        task_row = await repo.get_task(db, task_id)
-        task_status = dict(task_row)["status"] if task_row else ""
-        if task_status != "review":
-            await repo.insert_event(
-                db,
-                kind="review_dispatch_failed",
-                task_id=task_id,
-                actor="hub",
-                payload={
-                    "dispatch_id": dispatch["id"],
-                    "model": dispatch.get("model") or "",
-                    "run_status": run.get("status"),
-                    "task_status": task_status,
-                },
-            )
+    # МЕСТО ПРИМЕНЕНИЯ №2 второй двери (#1252): отказ АСИНХРОННЫЙ — агент
+    # создался, прогон дошёл до терминального статуса, отчёта нет. Прогон тут
+    # УЖЕ оплачен, и это единственное, чем этот случай отличается от
+    # синхронного: без отчёта сдача стоит одинаково мёртво.
+    #
+    # Строка НЕ закрывается раньше, чем долг отдан. Закрытая строка невидима
+    # свипу, и сбой между двумя записями — упавший процесс или исключение в
+    # подготовке заказа, где git ходит в сеть, — уносил бы обещанную вторую
+    # дверь навсегда: поллер глотает исключение и идёт дальше.
+    await repo.owe_second_door(db, dispatch["id"], run_status)
+    await db.commit()
+    dispatch["run_status"] = run_status
+    await _settle_second_door(db, dispatch, task_row=task_row)
+
+
+async def _settle_second_door(
+    db: aiosqlite.Connection,
+    dispatch: dict[str, Any],
+    *,
+    task_row: Any | None = None,
+) -> None:
+    """Отдать долг второй двери и только потом закрыть строку (#1252).
+
+    Зовётся из двух моментов одного и того же пути: сразу после записи долга
+    и на возобновлении, когда предыдущая попытка не дошла до конца. Алерт об
+    отказе облака здесь НЕ повторяется — он записан вместе с долгом, и
+    повторять его на каждом проходе значило бы превратить один наблюдённый
+    факт в поток.
+
+    #1252: долг отдаётся ОДИН раз, и это проверяется НАБЛЮДЕНИЕМ, а не
+    порядком записей. Возобновление существует именно потому, что хаб может
+    умереть посередине, — а умереть он может и после того, как локальный
+    заказ закоммичен, но до того, как долг помечен закрытым. Тогда при
+    рестарте видны обе строки, облачная разбирается первой (ORDER BY id), и
+    без этой проверки она покупала бы ВТОРОЙ прогон на то же поколение.
+    """
+    if await _second_door_already_opened(db, dispatch):
         await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
         await db.commit()
+        return
+    if task_row is None:
+        task_row = await repo.get_task(db, int(dispatch["task_id"]))
+    await _second_door_after_run(
+        db, dispatch, task_row, dispatch.get("run_status") or "терминальным"
+    )
+    await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
+    await db.commit()
+
+
+async def _second_door_already_opened(
+    db: aiosqlite.Connection, dispatch: dict[str, Any]
+) -> bool:
+    """Есть ли по этой сдаче живой или удавшийся локальный заказ (#1252).
+
+    Упавший локальный заказ сюда НЕ считается: он говорит «вторую дверь
+    попробовали и она не сработала», и запретить по нему новую попытку
+    значило бы закрыть дверь именно там, где она нужнее всего. Считается
+    только заказ, который ещё идёт или уже принёс отчёт, — то есть долг,
+    который в самом деле отдан.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM review_dispatches WHERE task_id = ? "
+        "AND submission_generation = ? AND channel = ? "
+        "AND status IN ('active', 'done') LIMIT 1",
+        (
+            int(dispatch["task_id"]),
+            int(dispatch["submission_generation"]),
+            LOCAL_CHANNEL,
+        ),
+    )
+    return bool(rows)
+
+
+async def _second_door_after_run(
+    db: aiosqlite.Connection,
+    dispatch: dict[str, Any],
+    task_row: Any,
+    run_status: Any,
+) -> None:
+    """Позвать второго поставщика по прогону, кончившемуся без отчёта (#1252).
+
+    Гейты здесь — про то, что сдача ВСЁ ЕЩЁ ждёт отчёта, а не про сам отказ:
+    задача в review, поколение то же, что у провалившегося заказа, политика
+    по-прежнему просит ревьюера. Свип бежит по расписанию, и между заказом и
+    его разбором задачу могли вернуть в работу, пересдать или снять политику.
+    """
+    if task_row is None:
+        return
+    task = dict(task_row)
+    generation = int(dispatch["submission_generation"])
+    if task.get("status") != "review":
+        return
+    if int(task.get("submission_generation") or 0) != generation:
+        return
+    branch = (task.get("branch") or "").strip()
+    if not branch:
+        return
+    project = await repo.resolve_project_for_task(db, int(task["id"]))
+    if project is None or not review_dispatch_enabled(gate_policy_of(project)):
+        return
+    # ПОСЛЕДНЕЕ слово перед заказом (#1252). Первую проверку отчёта делает
+    # _close_a_run_without_a_report, и между ней и этим местом лежат запись
+    # долга, чтение задачи и чтение проекта, а на возобновлении — ещё и весь
+    # перерыв между проходами свипа. Отчёт, доехавший в это окно, покупал бы
+    # второго ревьюера поверх уже сданного: деньги тратятся ЗДЕСЬ, и здесь же
+    # надо смотреть. Проверка именно рунг-совпадением (#1025), а не «есть ли
+    # хоть какой-то отчёт этого поколения»: у добора лестницы (#879) отчёт
+    # предыдущей ступени законно есть, и запрет по нему закрыл бы дверь перед
+    # заказом, который как раз и заказывали вторым.
+    if await _dispatch_report(db, int(task["id"]), generation, dispatch) is not None:
+        return
+    await open_second_door(
+        db,
+        task,
+        project_policy.forge_of(project),
+        branch,
+        generation,
+        # Замена обязана доехать ТЕМ ЖЕ профилем, каким заказывали упавший
+        # прогон (#1252, тот же класс, что находка 7ed386a8 на #1180). Без
+        # проброса dispatch_local_review считает профиль заново и на сдаче
+        # низкого риска понижает добор до lite — а вместе с упавшим заказом
+        # эта замена выводит счёт заходов за REVIEW_LADDER_MAX_STEPS, то есть
+        # неполный отчёт lite уже НЕ сможет позвать новый deep. Лестница
+        # ломается молча и в сторону более дешёвого прогона.
+        #
+        # Форсируется только deep: понижать замену запрещено, а навязывать
+        # lite там, где сегодняшний выбор сказал бы deep, — тот же дефект
+        # зеркально.
+        DEEP if (dispatch.get("profile") or "").strip() == DEEP else "",
+        cloud_refusal=(
+            f"прогон облачного агента {dispatch['agent_id']} "
+            f"({dispatch.get('model') or 'модель не названа'}) кончился "
+            f"статусом {run_status} и отчёта не оставил"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

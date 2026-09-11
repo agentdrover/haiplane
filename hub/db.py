@@ -1866,6 +1866,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_tasks_live_probe",
         "ALTER TABLE tasks ADD COLUMN live_probe TEXT NOT NULL DEFAULT ''",
     ),
+    (
+        # #1252: терминальный статус прогона, кончившегося БЕЗ отчёта. Он
+        # нужен уже после того, как строку закрыли: долг второй двери
+        # переживает перезапуск хаба, и на возобновлении назвать причину
+        # отказа облака больше неоткуда — спрашивать провайдера заново значит
+        # зависеть от его доступности ради текста в карточке. Пусто — прогон
+        # до терминального статуса не доходил.
+        "add_review_dispatches_run_status",
+        "ALTER TABLE review_dispatches ADD COLUMN run_status TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 
