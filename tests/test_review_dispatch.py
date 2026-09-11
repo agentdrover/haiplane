@@ -4451,3 +4451,43 @@ async def test_the_mcp_path_carries_the_environment_refusal_to_storage(
     # поведение, а не про то, что аргумент принят.
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     assert [u for u in updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
+
+
+async def test_a_report_sent_through_mcp_without_a_reason_is_not_a_refusal(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-3 на MCP-пути (#1238): умолчание аргумента — «не заявлена».
+
+    У опубликованного аргумента есть ДЕФОЛТ, и это отдельное место, где
+    можно ошибиться: дефолт `environment` записал бы отказом среды каждый
+    неполный отчёт, никем этого не заявивший, — ровно ту подмену, против
+    которой поле и заведено. Сидящие в базе отчёты старого образца такую
+    мутацию не ловят: они приходят мимо инструмента.
+    """
+    from hub.mcp_server import mcp
+
+    task_id = await _submitted(client, db, "spike-mcp-no-reason")
+
+    async def _post(path: str, body: dict | None = None, **_kw):
+        resp = await client.post(path, json=body or {})
+        resp.raise_for_status()
+        return resp.json()
+
+    with patch("hub.mcp_server._api_post", side_effect=_post):
+        await mcp.call_tool(
+            "hub_submit_machine_review",
+            {
+                "task_id": task_id,
+                "raw_count": 0,
+                "incomplete": True,
+                "lost_dimensions": ["20 файлов не дочитаны"],
+                "agent": "cursor-cloud-reviewer",
+                "model": "grok-4.6",
+            },
+        )
+
+    stored = dict(await repo.get_latest_machine_review(db, task_id))
+    assert stored["incomplete_reason"] == ""
+    assert is_environment_refusal(stored) is False
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert not [u for u in updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
