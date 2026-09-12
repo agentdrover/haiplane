@@ -1436,10 +1436,20 @@ async def test_top_up_never_fires_on_an_unknown_profile(
 class _AncestryGitOps(_PinnedGitOps):
     """Git that answers the three questions the delta stands on."""
 
-    def __init__(self, *args, ancestor: bool | None = True, delta: str = "", **kw):
+    def __init__(
+        self,
+        *args,
+        ancestor: bool | None = True,
+        delta: str = "",
+        own: str | None = "",
+        **kw,
+    ):
         super().__init__(*args, **kw)
         self._ancestor = ancestor
         self._delta = delta
+        # #1249: the author's OWN commits inside the delta. None is the answer
+        # a clone gives when reachability cannot be established at all.
+        self._own = own
 
     async def is_ancestor(self, repo, ancestor, descendant):
         return self._ancestor
@@ -1451,9 +1461,37 @@ class _AncestryGitOps(_PinnedGitOps):
             return self._delta
         return self._diff
 
+    async def delta_without_base(self, repo, base, prev, current):
+        return self._own
+
 
 _PREV_SHA = "b" * 40
 _DELTA = "+++ b/hub/services/fixed.py\n+исправление\n"
+
+# --- Whose change is this? (#1249) ------------------------------------------
+#
+# The previous submission is an ancestor of the current tip, so the plain
+# prev..current diff also carries everything a merge of the base branch
+# brought in. Measured on the live resubmission of #1172 (generation 2,
+# 10.09.2026): 25 files in that diff, 2 written by the author, 9 of the 11
+# commits in the range already reachable from origin/develop. The marker that
+# bought the deep harness — workspace_path — appeared 0 times in the author's
+# own commit and twice in the delta as a whole.
+#
+# The doubles below are that shape in miniature: one file the author wrote,
+# one file that arrived with the base and carries the process-surface marker.
+_AUTHOR_FILE = "hub/services/fixed.py"
+_BASE_FILE = "hub/services/readiness.py"
+_MERGED_DELTA = (
+    f"+++ b/{_AUTHOR_FILE}\n"
+    "+исправление\n"
+    f"+++ b/{_BASE_FILE}\n"
+    "+        workspace_path = project.workspace_path\n"
+)
+_OWN_PLAIN = f"+++ b/{_AUTHOR_FILE}\n+исправление\n"
+_OWN_WITH_SURFACE = (
+    f"+++ b/{_AUTHOR_FILE}\n+        workspace_path = project.workspace_path\n"
+)
 
 
 async def _second_generation(
@@ -1604,6 +1642,133 @@ async def test_unreadable_ancestry_reads_everything(
     prompt = recorder.calls[-1]["prompt_text"]
     assert "историю проверить не удалось" in prompt
     assert "прочитана ДЕЛЬТА" not in prompt
+
+
+# --- The delta is split by AUTHORSHIP, not trimmed (#1249) -------------------
+
+
+async def test_a_surface_that_came_with_the_base_does_not_raise_the_profile(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1249): the deep harness is bought for the AUTHOR's change. A
+    # process surface that arrived with the base branch is somebody else's
+    # work — it has already passed its own gate — and buying ~0.6M extra
+    # provider tokens on its account is paying twice for one review.
+    #
+    # MUTATION that must kill this test: return the whole delta as the
+    # author's work from generation_delta. Then the workspace_path line in
+    # the file the base brought decides, and the profile goes deep.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o1"}, "run": {"id": "r-o1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-base")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=_OWN_PLAIN
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    assert (await _dispatch_row(db, task_id))["profile"] == "lite", (
+        "a marker only the base brought must not buy the expensive profile"
+    )
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    notes = [u["content"] for u in data["updates"] or [] if "профиль" in u["content"]]
+    assert "workspace_path" not in notes[-1], (
+        "the reason must not quote a marker the author never wrote"
+    )
+
+
+async def test_a_surface_written_by_the_author_still_raises_the_profile(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1249): the distinction sharpens the rule's INPUT, it does not
+    # weaken the rule. The same marker, written by the author this round,
+    # still buys the deep harness and still says which surface bought it.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o2"}, "run": {"id": "r-o2"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-author")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=_OWN_WITH_SURFACE
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    assert (await _dispatch_row(db, task_id))["profile"] == "deep"
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    notes = [
+        u["content"] for u in data["updates"] or [] if "профиль deep" in u["content"]
+    ]
+    assert notes and "workspace_path" in notes[-1], (
+        "the surface the author wrote still names itself in the card"
+    )
+
+
+async def test_the_subject_names_both_halves(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#1249): what came with the base does not disappear from sight.
+    # #1238 found a defect that exists ONLY where two branches meet; a
+    # reviewer who never learns the base moved cannot look for one. So the
+    # card carries BOTH numbers and the prompt names the foreign files.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o3"}, "run": {"id": "r-o3"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-both")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=_OWN_PLAIN
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    cards = [
+        u["content"] for u in data["updates"] or [] if "Предмет ревью" in u["content"]
+    ]
+    assert cards, "the dispatch card must state the subject"
+    assert "1 файл(ов) автора и 1 привезено базой" in cards[-1], (
+        "both halves are counted where a person reads the card"
+    )
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert "ПРИВЕЗЕНО БАЗОЙ" in prompt and _BASE_FILE in prompt, (
+        "the foreign half is named to the reviewer, not removed"
+    )
+    assert f"'{_AUTHOR_FILE}'" in prompt, "the command narrows to the author's file"
+    assert f"'{_BASE_FILE}'" not in prompt, (
+        "the command itself is the author's work; the base half is named beside it"
+    )
+
+
+async def test_unknown_origin_reads_everything_and_says_so(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#1249): a clone that cannot answer "whose commit is this" gets no
+    # split at all. Everything in the delta is read, exactly as before, and
+    # the reason is named — a silently narrowed subject is worse than a wide
+    # one, because the report would claim a coverage nobody had.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o4"}, "run": {"id": "r-o4"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-unknown")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=None
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert f"'{_AUTHOR_FILE}'" in prompt and f"'{_BASE_FILE}'" in prompt, (
+        "nothing is dropped when origin could not be established"
+    )
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    cards = [
+        u["content"] for u in data["updates"] or [] if "Предмет ревью" in u["content"]
+    ]
+    assert "происхождение коммитов установить не удалось" in cards[-1], (
+        "the wider subject states its cause instead of being inferred"
+    )
+    # "as before" is asserted against the rule itself, not against a literal:
+    # with no split the profile is whatever the whole submitted diff buys.
+    row = dict(await repo.get_task(db, task_id))
+    assert (await _dispatch_row(db, task_id))["profile"] == (
+        pick_review_profile(row, _HARMLESS_DIFF)[0]
+    ), "an unanswerable origin changes the subject's width, not the rule"
 
 
 async def test_previous_findings_travel_with_the_delta(
