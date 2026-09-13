@@ -718,7 +718,12 @@ def build_affected_area_warnings(inputs: StatementInputs) -> list[Recommendation
         rel = area.strip().lstrip("/")
         if not rel:
             continue
-        candidate = (root / rel).resolve()
+        try:
+            candidate = (root / rel).resolve()
+        except (ValueError, OSError, RuntimeError):
+            # Unresolvable (e.g. an embedded NUL byte, or a symlink loop):
+            # indeterminate, not "not in the tree" — no ground to judge on.
+            continue
         if root not in candidate.parents and candidate != root:
             # Escapes the working copy: not something this code can judge.
             continue

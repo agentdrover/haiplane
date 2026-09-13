@@ -830,6 +830,68 @@ def test_an_area_check_without_a_working_copy_stays_silent(tmp_path):
     assert build_affected_area_warnings(missing_dir) == []
 
 
+def test_an_unresolvable_area_with_an_embedded_nul_stays_silent(tmp_path):
+    """A NUL byte is legal in TaskCreate/TaskRefine but not in a real path.
+
+    On 3.12.13, Path.resolve() raises ValueError("embedded null character in
+    path") for such a name. That candidate is unresolvable, not "not in the
+    tree" — the docstring's contract is silence when the check cannot judge,
+    same as the no-repo-path and escapes-the-root cases just above.
+    """
+    inputs = StatementInputs(
+        affected_areas=["hub/a\x00b.py"], repo_path=str(tmp_path)
+    )
+    assert build_affected_area_warnings(inputs) == []
+
+
+def test_a_symlink_loop_in_an_area_stays_silent(tmp_path):
+    """A self-referential symlink makes resolve() raise RuntimeError.
+
+    Same contract as the NUL-byte case: unresolvable is indeterminate, so the
+    check skips the area instead of crashing the caller.
+    """
+    link = tmp_path / "looplink"
+    link.symlink_to(link)
+    inputs = StatementInputs(
+        affected_areas=["looplink/x.py"], repo_path=str(tmp_path)
+    )
+    assert build_affected_area_warnings(inputs) == []
+
+
+async def test_an_unresolvable_area_does_not_500_the_readiness_read(
+    db: aiosqlite.Connection, tmp_path
+):
+    """End to end: a NUL byte in affected_areas must not crash readiness.
+
+    TaskCreate/TaskRefine accept the NUL byte (verified separately); this
+    proves the consequence never reaches the caller as a 500 when the check
+    runs through the real readiness/recommendations path.
+    """
+    await _project_with_workspace(db, tmp_path)
+
+    payload = TaskCreate(
+        title="t",
+        user_story="us",
+        problem_statement="ps",
+        business_value="bv",
+        scope_in=["a"],
+        validation_commands=["pytest"],
+        size=TaskSize.S,
+        wip_tag=WipTag.feature_work,
+        affected_areas=["hub/a\x00b.py"],
+        outcome_metric="median lead time, 3d -> 1d",
+        redesign_decision=RedesignDecision.adapt,
+        agent_fit=AgentFit.sdd_native,
+    )
+    task_id = await repo.create_task_full(db, payload, status="draft")
+    await repo.add_acceptance_criterion(db, task_id, _ac(1))
+    await db.commit()
+
+    report = await calculate_readiness_with_recommendations(db, task_id)
+    area = [r for r in report.recommendations if r.field == "affected_areas"]
+    assert area == []
+
+
 def test_a_metric_without_a_number_is_named():
     """AC-4: a filled outcome_metric with no digit is not a metric."""
     wordy = build_outcome_metric_warnings(
