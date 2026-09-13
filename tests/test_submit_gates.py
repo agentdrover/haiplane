@@ -640,7 +640,9 @@ async def test_resubmitting_the_same_sha_from_review_is_not_a_new_generation(
     )
     hint = second.lifecycle_hint or ""
     assert "поколение 1" in hint, "ответ называет поколение, на котором уже стоит сдача"
-    assert "bot" in hint, "ответ называет, кто сдал это поколение (assigned_agent задачи)"
+    assert "bot" in hint, (
+        "ответ называет, кто сдал это поколение (assigned_agent задачи)"
+    )
 
 
 async def test_resubmitting_a_new_sha_from_review_still_bumps_the_generation(

@@ -23,7 +23,7 @@ from hub.integrations import cursor_cloud
 from hub.integrations import local_reviewer
 from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
-from hub.models import MachineReviewView, TaskRefine, TaskSubmitReview
+from hub.models import MachineReviewView, TaskCreate, TaskRefine, TaskSubmitReview
 from hub.services.project_policy import review_dispatch_enabled
 from hub.services.model_family import family
 from hub.services.review_dispatch import (
@@ -2393,24 +2393,30 @@ async def _report_on_current(
 async def test_same_sha_buys_no_second_review(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
-    """AC-2 (#1152): код уже прочитан — второй прогон не заказывается.
+    """AC-2 (#1152), сужено #1265: код уже прочитан — второй прогон не заказывается.
 
     Измерено на живой базе прода: 8 дублей из 87 прогонов, порядка 15M
-    токенов провайдера. Пересдача на неизменившемся sha — ровно тот путь,
-    которым они возникали: генерация новая, дифф прежний.
+    токенов провайдера. Пересдача на неизменившемся sha была ровно тем
+    путём, которым они возникали — но ДО #1265: «генерация новая, дифф
+    прежний», и только диспетч отказывал отдельной сверкой (#1150/#1152).
 
-    Проверяется ОТСУТСТВИЕ строки в review_dispatches, а не отсутствие
-    отчёта: заказ и есть оплата.
+    #1265 закрывает это на шаг раньше: пересдача того же sha из review
+    вообще не создаёт нового поколения, и конвейер до диспетча не доходит
+    — отказывать там больше нечему. Деньги по-прежнему не тратятся дважды
+    (это и проверяется ниже), но карточка теперь называет причину словами
+    ответа сдачи, а не алертом диспетчера: тот алерт был сформулирован как
+    «пересдача подняла поколение», а поколение больше не поднимается,
+    говорить это было бы неправдой.
     """
     recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
     _wire(monkeypatch, recorder)
     task_id = await _submitted(client, db, "spike-same-sha")
     assert len(recorder.calls) == 1, "первая сдача ревью получает"
-    review_id = await _report_on_current(db, task_id)
+    await _report_on_current(db, task_id)
     await db.commit()
 
-    # Пересдача НА ТОМ ЖЕ коммите: поколение растёт, вершина та же.
-    await services.submit_for_review(
+    # Пересдача НА ТОМ ЖЕ коммите: #1265 — поколение остаётся тем же.
+    second = await services.submit_for_review(
         db, task_id, TaskSubmitReview(model="claude-fable-5")
     )
 
@@ -2422,46 +2428,60 @@ async def test_same_sha_buys_no_second_review(
         "SELECT id FROM review_dispatches WHERE task_id=?", (task_id,)
     )
     assert len(rows) == 1, "заказа не появляется: заказ и есть оплата"
-    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
-    assert any(f"отчёт #{review_id}" in c for c in updates), (
-        "отказ обязан назвать отчёт, который уже покрывает этот код: "
-        "молчаливый отказ неотличим от сломавшегося диспетчера"
+    assert second.submission_generation == 1, (
+        "#1265: поколение не растёт вовсе — раньше росло, и только диспетч "
+        "отказывал по совпадению кода отдельной проверкой"
+    )
+    assert "уже на ревью" in (second.lifecycle_hint or ""), (
+        "ответ сдачи обязан назвать, что это тот же код, а не молчать (#1265)"
     )
 
 
 async def test_a_real_resubmission_still_gets_reviewed(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
-    """AC-3 (#1152): новый код ревью ПОЛУЧАЕТ, и тот же код без отчёта тоже.
+    """AC-3 (#1152), первая половина заменена #1265: новый код ревью ПОЛУЧАЕТ.
 
-    Ложный отказ здесь дороже лишнего прогона: сдача, оставшаяся без
-    отчёта, уйдёт к человеку вслепую или встанет вовсе. Поэтому зеркало
-    двустороннее — сдвинулась вершина, и отдельно случай «тот же sha, но
-    отчёта по нему нет».
+    До #1265 «тот же sha, отчёта нет — прогон нужен» было верно: пересдача
+    поднимала поколение независимо от кода, и только диспетч решал, читать
+    ли заново. #1265 переносит это решение ВЫШЕ: сдача того же sha из review
+    вообще не открывает нового поколения — конвейер узнаёт «это тот же код»
+    раньше, чем диспетчер успел бы спросить «есть ли уже отчёт». Отсутствие
+    отчёта для НЕИЗМЕНИВШЕГОСЯ кода больше не повод заказывать прогон: код
+    один и тот же, и добор непрочитанного (#879, лестница `force_profile`)
+    остаётся отдельным, прямым входом — `test_the_top_up_is_not_stopped_by_
+    the_same_sha_guard` показывает, что он не задет этим правилом.
+
+    Вторая половина — «отчёт есть, но вершина сдвинулась — это новая
+    работа» — осталась НЕТРОНУТОЙ: это ровно AC-2 задачи #1265 (новый sha
+    работает как раньше), и она же его и проверяет.
     """
     recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
     _wire(monkeypatch, recorder)
 
-    # Тот же sha, но отчёта нет вовсе — сравнивать не с чем, прогон нужен.
+    # Тот же sha, отчёта нет — #1265: код не менялся, новое поколение не
+    # открывается, и заказывать прогон не за чем.
     fresh = await _submitted(client, db, "spike-no-report")
     assert len(recorder.calls) == 1
-    await services.submit_for_review(
+    resubmitted = await services.submit_for_review(
         db, fresh, TaskSubmitReview(model="claude-fable-5")
     )
-    assert len(recorder.calls) == 2, (
-        "без отчёта по этому sha отказывать не за что: незнание не есть совпадение"
+    assert len(recorder.calls) == 1, (
+        "#1265: тот же sha из review не заказывает прогон — отсутствие "
+        "отчёта не делает НЕИЗМЕНИВШИЙСЯ код новой работой"
     )
+    assert resubmitted.submission_generation == 1, "поколение не выросло — код тот же"
 
-    # Отчёт есть, но вершина сдвинулась — это новая работа.
+    # Отчёт есть, но вершина сдвинулась — это новая работа (AC-2, #1265).
     moved = await _submitted(client, db, "spike-moved")
-    assert len(recorder.calls) == 3
+    assert len(recorder.calls) == 2
     await _report_on_current(db, moved)
     await db.commit()
     plugins.git_ops = _PinnedGitOps("b" * 40, ["docs/notes.md"])
     await services.submit_for_review(
         db, moved, TaskSubmitReview(model="claude-fable-5")
     )
-    assert len(recorder.calls) == 4, "новый sha — новая работа, ревью заказывается"
+    assert len(recorder.calls) == 3, "новый sha — новая работа, ревью заказывается"
 
 
 async def test_a_submission_without_a_pinned_sha_is_not_a_match(
@@ -2493,16 +2513,16 @@ async def test_a_submission_without_a_pinned_sha_is_not_a_match(
 async def test_an_incomplete_report_does_not_lock_the_sha(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
-    """Неполный отчёт не есть прочитанный код (#879).
+    """Неполный отчёт не есть прочитанный код (#879) — добор, а не пересдача.
 
-    Найдено кросс-модельным ревью первой сдачи, и находка бьёт в саму
-    задачу: правило, написанное ради экономии прогонов, запирало добор
-    непрочитанного. Отчёт с incomplete=true САМ говорит, что дочитал не
-    всё, — назвать его чтением значит поверить утверждению, которое он о
-    себе опровергает.
-
-    Направление ошибки то же, что и во всём правиле: лишний прогон стоит
-    денег, пропущенный — сдачи без ревью.
+    До #1265 пересдача того же sha после неполного отчёта поднимала
+    поколение и давала диспетчу второй шанс заказать прогон. #1265 убирает
+    саму пересдачу из этой роли: тот же код больше не открывает новое
+    поколение независимо от того, что сказал предыдущий отчёт о себе.
+    Добор непрочитанного остаётся, но через свой прямой вход — лестницу
+    `force_profile=DEEP` (#879), которую `test_the_top_up_is_not_stopped_
+    by_the_same_sha_guard` проверяет отдельно и которую это правило не
+    задевает.
     """
     recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
     _wire(monkeypatch, recorder)
@@ -2511,26 +2531,32 @@ async def test_an_incomplete_report_does_not_lock_the_sha(
     await _report_on_current(db, task_id, incomplete=True)
     await db.commit()
 
-    await services.submit_for_review(
+    resubmitted = await services.submit_for_review(
         db, task_id, TaskSubmitReview(model="claude-fable-5")
     )
 
-    assert len(recorder.calls) == 2, (
-        "отчёт, объявивший себя неполным, покрытием не является — иначе "
-        "правило запирает лестницу добора #879"
+    assert len(recorder.calls) == 1, (
+        "#1265: тот же sha из review не заказывает прогон САМ — неполнота "
+        "предыдущего отчёта не делает неизменившийся код новой работой; "
+        "добор непрочитанного идёт через лестницу #879, не через пересдачу"
     )
+    assert resubmitted.submission_generation == 1
 
 
 async def test_a_self_report_does_not_cancel_the_independent_reviewer(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
-    """Отчёт исполнителя о себе не отменяет ревьюера со стороны.
+    """Отчёт исполнителя о себе не отменяет ревьюера со стороны — не через пересдачу.
 
-    Найдено кросс-модельным ревью. Тот же автор уже однажды закрыл чужой
-    диспетчер как выполненный своим параллельным отчётом (#1011, #1025) —
-    здесь он закрывал бы его ещё до старта, и «код прочитан» означало бы
-    «автор прочитал свой код». Независимость — весь смысл кросс-модельного
-    контура, и правило экономии не должно её покупать.
+    До #1265 пересдача того же sha после самоотчёта поднимала поколение и
+    давала диспетчу шанс заказать независимое чтение заново. #1265 убирает
+    пересдачу неизменившегося кода из этой роли вовсе — код тот же, новое
+    поколение не открывается, и до диспетча дело не доходит. Независимость
+    кросс-модельного контура (#1011, #1025) как ценность здесь не пострадала
+    — самоотчёт по-прежнему не покрывает код сам по себе (`_report_already_
+    covers_this_sha` продолжает его исключать в путях, где это правило ещё
+    действует, например при смене sha); просто дорога к повторному чтению
+    через ПРОСТУЮ ПЕРЕСДАЧУ ТОГО ЖЕ КОДА больше не открыта.
     """
     recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
     _wire(monkeypatch, recorder)
@@ -2539,18 +2565,20 @@ async def test_a_self_report_does_not_cancel_the_independent_reviewer(
     await _report_on_current(db, task_id, self_reviewed=True)
     await db.commit()
 
-    await services.submit_for_review(
+    resubmitted = await services.submit_for_review(
         db, task_id, TaskSubmitReview(model="claude-fable-5")
     )
 
-    assert len(recorder.calls) == 2, (
-        "самоотчёт не есть независимое чтение — он не может отменить "
-        "кросс-модельного ревьюера"
+    assert len(recorder.calls) == 1, (
+        "#1265: тот же sha из review не заказывает прогон сам по себе — "
+        "самоотчёт по прежнему поколению не делает неизменившийся код "
+        "новой работой, которую стоило бы пересдавать"
     )
+    assert resubmitted.submission_generation == 1
 
 
 async def test_the_refusal_is_as_loud_as_the_other_dispatcher_refusals(
-    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+    db: aiosqlite.Connection,
 ):
     """Отказ пишется алертом, как остальные отказы диспетчера.
 
@@ -2558,21 +2586,27 @@ async def test_the_refusal_is_as_loud_as_the_other_dispatcher_refusals(
     соседей. Отказ, который тише остальных, читается как «ничего не
     произошло» ровно там, где ревьюера не позвали, — а не позвать
     ревьюера это событие, а не отсутствие события.
+
+    #1265 больше не достаёт до этого отказа с pair-пути «тот же sha из
+    review»: конвейер узнаёт «код не менялся» раньше, чем дело доходит до
+    диспетча, — see ``test_same_sha_buys_no_second_review``. Сам помощник
+    (``_refuse_second_read``) остаётся живым (доборные и headless-пути его
+    всё ещё зовут), и его громкость проверяется напрямую, а не через путь,
+    который до него больше не доходит.
     """
-    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
-    _wire(monkeypatch, recorder)
-    task_id = await _submitted(client, db, "spike-refusal-loud")
-    review_id = await _report_on_current(db, task_id)
+    from hub.services.review_dispatch import _refuse_second_read
+
+    task = await services.create_task(
+        db, TaskCreate(title="Громкость отказа", source="agent", agent="bot")
+    )
     await db.commit()
 
-    await services.submit_for_review(
-        db, task_id, TaskSubmitReview(model="claude-fable-5")
-    )
+    await _refuse_second_read(db, task.id, 42)
 
     kinds = {
         dict(u)["kind"]
-        for u in await repo.get_task_updates(db, task_id)
-        if f"отчёт #{review_id}" in dict(u)["content"]
+        for u in await repo.get_task_updates(db, task.id)
+        if "отчёт #42" in dict(u)["content"]
     }
     assert kinds == {"alert"}, f"отказ обязан быть слышен как алерт: {kinds}"
 
@@ -4187,31 +4221,30 @@ async def test_a_dispatched_project_gets_no_extra_notice(
         "новой записи на рабочем пути не появилось"
     )
 
-    # Второй тихий отказ той же функции — проверка новизны (#1152). Он
-    # случается на проекте с ВКЛЮЧЁННЫМ диспетчем, то есть проходит ровно
-    # через новый помощник, и накрыть его записью «политика не просит
-    # диспетча» значило бы сказать неправду: политика как раз просила.
-    # Первая редакция этого теста мутацию «снять условие, отделяющее тихий
-    # путь от рабочего» ПЕРЕЖИЛА — до сюда она не доставала.
-    review_id = await _report_on_current(db, task_id)
+    # Второй тихий отказ той же функции — проверка новизны (#1152) — до
+    # #1265 случался на проекте с ВКЛЮЧЁННЫМ диспетчем при пересдаче того же
+    # sha. #1265 переносит решение ВЫШЕ диспетчера: конвейер сдачи узнаёт
+    # «код не менялся» раньше, чем дело доходит до этого помощника, — как и
+    # в ``test_same_sha_buys_no_second_review``. Деньги по-прежнему не
+    # тратятся дважды; изменилось лишь то, КАКОЙ слой это говорит.
+    await _report_on_current(db, task_id)
     await db.commit()
-    await services.submit_for_review(
+    second = await services.submit_for_review(
         db, task_id, TaskSubmitReview(model="claude-fable-5")
     )
 
     assert len(recorder.calls) == 1, "второй прогон на том же коде не покупается"
+    assert second.submission_generation == 1, "#1265: код не менялся — поколение то же"
     said = " ".join(
         dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
     )
     assert "политика проекта не просит" not in said, (
-        "отказала проверка новизны, а не политика: чужая причина в карточке "
-        "хуже отсутствующей — по ней пойдут править gate_policy"
-    )
-    assert f"отчёт #{review_id}" in said, (
-        "своя причина у этого отказа осталась на месте (#1152)"
+        "отказала проверка новизны на конвейере сдачи, а не политика: чужая "
+        "причина в карточке хуже отсутствующей — по ней пойдут править "
+        "gate_policy"
     )
     assert len(await _dispatch_notices(db, task_id)) == 1, (
-        "и записей про диспетч по-прежнему одна"
+        "и записей про диспетч по-прежнему одна — до диспетча дело не дошло"
     )
 
 
