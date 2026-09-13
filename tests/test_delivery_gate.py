@@ -897,8 +897,9 @@ async def test_a_merged_open_or_unknown_recorded_pr_is_never_replaced(
     task = dict(await repo.get_task(db, task_id))
     assert task["pr_number"] == 360, f"{state!r}: номер остаётся на месте"
     if state == "merged":
-        g.pr_for_branch.assert_not_awaited(), (
-            "мерж-состояние не ищет замену — искать нечего"
+        (
+            g.pr_for_branch.assert_not_awaited(),
+            ("мерж-состояние не ищет замену — искать нечего"),
         )
     if state:
         assert g.merge_pr.await_args.args[0] == 360, (
