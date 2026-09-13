@@ -506,7 +506,7 @@ async def list_undelivered_completed_branch_tasks(
     *,
     exclude_task_id: int,
 ) -> list[aiosqlite.Row]:
-    """Completed tasks the sweep found still holding an OPEN pull request (#1204).
+    """Completed tasks the sweep found still holding an UNMERGED pull request (#1204).
 
     The sixth way a branch can be unmerged, and the only one no amount of
     waiting will resolve: a human accepted the task without delivering it, so
@@ -524,8 +524,30 @@ async def list_undelivered_completed_branch_tasks(
     * asking the provider here would put a network call in the delivery path,
       per candidate, on every poll. The sweep already pays it once per fifteen
       minutes and stores the answer.
-    * ``state = 'pr_open'`` only. ``unknown`` is an answer the hub could not
-      get, and the existing reader keeps it apart for the same reason (#725).
+    * ``state IN ('pr_open', 'pr_closed')``. ``unknown`` is an answer the hub
+      could not get, and the existing reader keeps it apart for the same
+      reason (#725).
+
+    ``pr_closed`` reads the same as ``pr_open`` here, and that is deliberate
+    (found by machine review of submission #8, verified against the code
+    rather than taken on the reviewer's word): ``delivery_state.task_delivery``
+    calls a PR closed without merging "work dropped on purpose", but "on
+    purpose" describes the OWNER's decision, not the git history. The base
+    task's commits stay ancestors of any branch drawn from it whether its PR
+    is still open or was closed, and a squash merge of that branch still
+    carries them into the base branch under the dependent's number — the
+    #1183-over-#1175 shape this whole condition exists to prevent. A prior
+    revision of this query and its test asserted the opposite (``pr_closed``
+    excluded, reasoning only about whether it is worth ASKING a human "when
+    will this arrive" — a question that genuinely has no answer for abandoned
+    work). That reasoning answers a different question than the one this
+    function feeds: the stacking gate is not asking when the base will
+    deliver, it is asking whether merging now would carry undelivered commits
+    forward. Reproduced before this fix: a completed base with a
+    ``delivery_discrepancies`` row of ``pr_closed`` let a stacked dependent
+    merge straight through, with ``merge_pr`` awaited and no human ever
+    named the base
+    (``tests/test_delivery_gate.py::test_a_closed_unmerged_base_also_calls_a_human``).
 
     TWO NAMED BLIND SPOTS, because a partial answer read as a complete one is
     how this class of bug returns:
@@ -541,7 +563,8 @@ async def list_undelivered_completed_branch_tasks(
         db,
         "SELECT t.id, t.title, t.status, t.branch "
         "FROM delivery_discrepancies d JOIN tasks t ON t.id = d.task_id "
-        "WHERE d.state = 'pr_open' AND t.archived = 0 AND t.id != ? "
+        "WHERE d.state IN ('pr_open', 'pr_closed') AND t.archived = 0 "
+        "AND t.id != ? "
         "AND t.branch IS NOT NULL AND TRIM(t.branch) != '' ORDER BY t.id",
         (exclude_task_id,),
     )

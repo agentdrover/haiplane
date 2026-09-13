@@ -769,6 +769,48 @@ async def test_an_accepted_but_undelivered_base_calls_a_human(
     assert "task-1138/eslint-debt" in body
 
 
+async def test_a_closed_unmerged_base_also_calls_a_human(
+    db: aiosqlite.Connection,
+) -> None:
+    # REPRO for the P1 finding on fe32ee25 (hub/repository.py:544): a base
+    # task accepted as completed whose PR was closed WITHOUT merging is, per
+    # delivery_state.task_delivery's own docstring, "work dropped on purpose"
+    # — delivery_path="none", exactly like pr_open. Its commits are still
+    # ancestors of any branch drawn from it before the close, and a squash
+    # merge of the dependent branch would carry them into the base branch
+    # under the dependent's number — the same #1183-over-#1175 shape AC-1
+    # exists to prevent. list_undelivered_completed_branch_tasks only reads
+    # state='pr_open', so this base never enters ``stranded`` and the gate
+    # currently reads the stack as clear.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+    task_id = await _approved_pair_task(db)
+    base_id = await _stranded_base(db, "task-901/closed-without-merge")
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=base_id,
+        state=PR_CLOSED,
+        reason="PR #3 закрыт без мержа — работу свернули намеренно",
+        pr_number=3,
+        delivery_path="none",
+    )
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "закрытый без мержа PR тоже никогда не доедет до базовой ветки сам: "
+        "мерж сейчас унёс бы отвергнутую работу основания под нашим номером"
+    )
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{base_id}" in body
+
+
 async def test_a_delivered_base_does_not_hold_anything(
     db: aiosqlite.Connection,
 ) -> None:
@@ -821,10 +863,15 @@ async def test_delivered_tasks_are_not_candidates(db: aiosqlite.Connection) -> N
         pr_number=3,
         delivery_path="outside_gate",
     )
-    # Второе состояние ТОГО ЖЕ словаря: PR закрыт без мержа. Работу свернули
-    # намеренно — это тоже не «ждём доставки», и в кандидаты оно не входит.
-    # Закрепляется здесь, потому что allowlist из одного токена читается как
-    # опечатка ровно до тех пор, пока рядом не названо, что ещё бывает.
+    # PR_CLOSED is NOT a second exclusion here (fix for the P1 finding on
+    # fe32ee25, see repo.list_undelivered_completed_branch_tasks docstring):
+    # a PR closed without merging still leaves the base's commits as
+    # ancestors of any branch drawn from it, and the stacking gate is asking
+    # a safety question ("would merging now carry undelivered commits
+    # forward"), not a timing question ("when will this arrive"). A prior
+    # revision of this test asserted the opposite and was wrong to.
+    # tests/test_delivery_gate.py::test_a_closed_unmerged_base_also_calls_a_human
+    # covers the closed case end to end through the gate.
     closed = await _stranded_base(db, "task-901/closed-without-merge")
     await repo.record_delivery_discrepancy(
         db,
@@ -847,7 +894,10 @@ async def test_delivered_tasks_are_not_candidates(db: aiosqlite.Connection) -> N
     assert delivered not in ids, (
         "доставленное основание не кандидат, и признак — состояние PR, не статус"
     )
-    assert closed not in ids, "закрытый без мержа PR — тоже не «ждём доставки»"
+    assert closed in ids, (
+        "закрытый без мержа PR — коммиты всё равно не в базовой ветке, "
+        "и они всё равно предки любой ветки, отведённой от основания"
+    )
 
 
 async def test_an_unanswerable_pr_state_is_not_a_candidate(
