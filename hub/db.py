@@ -8,6 +8,7 @@ from typing import Any
 
 import aiosqlite
 
+from hub import skill_publish
 from hub.config import CHAT_PAIR_AGENT, HUB_DB_PATH
 
 log = logging.getLogger("hub.db")
@@ -116,6 +117,20 @@ _SQL_EVIDENCE_BAR = (
     f"AND {_SQL_SHA_LOOKS_LIKE_A_COMMIT}"
 )
 
+# Перенос записей о публикации из ленты событий на строку версии (#1253).
+# Отдельной константой, потому что это единственная миграция здесь, которая
+# двигает данные, а не схему: её надо было бы уметь прочитать и проверить
+# отдельно от списка.
+BACKFILL_PUBLICATION_RECORD_SQL = """
+UPDATE skills SET publication_record = COALESCE((
+    SELECT e.payload FROM events e
+    WHERE e.kind = 'skill_activated'
+      AND json_extract(e.payload, '$.name') = skills.name
+      AND json_extract(e.payload, '$.version') = skills.version
+    ORDER BY e.id DESC LIMIT 1
+), '')
+WHERE publication_record = ''
+"""
 
 _MIGRATIONS: list[tuple[str, str]] = [
     (
@@ -529,6 +544,28 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_skills_activated_by_column",
         "ALTER TABLE skills ADD COLUMN activated_by TEXT NOT NULL DEFAULT ''",
     ),
+    # Доказательства публикации ЖИВУТ ЗДЕСЬ, а не в ленте событий (#1253).
+    # Лента — канал уведомлений с двухнедельной чисткой (#349), и сама она об
+    # этом говорит прямым текстом над своим DELETE. Запись о том, что именно
+    # опубликовано, лежит на строке версии, которую описывает: у таблицы
+    # ``skills`` нет и не может быть срока годности — удалить строку значит
+    # удалить саму версию скилла, а не сведения о ней.
+    (
+        "add_skills_publication_record_column",
+        "ALTER TABLE skills ADD COLUMN publication_record TEXT NOT NULL DEFAULT ''",
+    ),
+    # Разовый перенос того, что ещё лежит в ленте (#1253). Без него починка
+    # работала бы только на будущих публикациях, а КАЖДАЯ уже опубликованная
+    # версия всё равно потеряла бы свою запись через две недели — то есть
+    # ровно тот дефект, ради которого заведена задача. Переносится последняя
+    # запись по паре (name, version) — тем же «последняя побеждает», каким
+    # читал ленту прежний ``latest_skill_activation``. Запись до #1169 несёт
+    # только имя и версию, и она тоже переезжает: «запись есть, дифа в ней
+    # нет» — отдельное состояние, и превратить его в «записи нет» нельзя.
+    (
+        "backfill_skills_publication_record",
+        BACKFILL_PUBLICATION_RECORD_SQL,
+    ),
     # ---- Machine review policy (#382): project default + task override.
     (
         "add_projects_machine_review_column",
@@ -696,6 +733,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_machine_reviews_lost_dimensions_column",
         "ALTER TABLE machine_reviews ADD COLUMN lost_dimensions TEXT "
         "NOT NULL DEFAULT '[]'",
+    ),
+    # #1238. WHY the run called itself incomplete, from a fixed vocabulary.
+    # The empty default is the honest value for history: every row written
+    # before this column made no claim about the cause, and back-filling
+    # either word would put one in its mouth — the same reasoning that left
+    # `incomplete` nullable above. Nothing reads the cause out of prose.
+    (
+        "add_machine_reviews_incomplete_reason_column",
+        "ALTER TABLE machine_reviews ADD COLUMN incomplete_reason TEXT "
+        "NOT NULL DEFAULT ''",
     ),
     (
         "add_task_updates_principal_id",
@@ -2937,9 +2984,9 @@ HAIPLANE_MACHINE_REVIEW=require
 3. Исправить confirmed-находки, прогнать тесты заново (exit code проверять
    отдельным echo, не через пайп).
 4. `hub_submit_machine_review(task_id, raw_count, incomplete,
-   findings_confirmed, findings_rejected, unresolved, lost_dimensions,
-   harness_skill, harness_version, agent_count, tokens_spent, duration_ms,
-   orchestrator, model)` — метрики опциональны, но токены/время питают
+   incomplete_reason, findings_confirmed, findings_rejected, unresolved,
+   lost_dimensions, harness_skill, harness_version, agent_count, tokens_spent,
+   duration_ms, orchestrator, model)` — метрики опциональны, но токены/время питают
    экономику практики (#384). Отчёт привязывается к текущему
    submission_generation: пересдача работы делает его stale.
 
@@ -2949,6 +2996,17 @@ HAIPLANE_MACHINE_REVIEW=require
    НЕ идут в `findings_rejected`, потому что «никто не голосовал» и «кто-то
    опроверг» — противоположные исходы. `lost_dimensions` — измерения, не
    вернувшие результат.
+
+   `incomplete_reason` (#1238) — ПОЧЕМУ прогон неполон, одним словом из
+   двух: `environment` — смотреть было нечем (нечем запустить тесты, ссылка
+   на базовую ветку не разрешается, сравнить не с чем), лечится настройкой
+   окружения, а не вторым прогоном; `profile` — инструменты были, охвата не
+   хватило на объём диффа. Пропуск поля означает «причина не заявлена» и НЕ
+   читается ни как одно, ни как другое. Прозу по-прежнему пиши в
+   `lost_dimensions`: причина берётся из этого слова, а не угадывается по
+   тексту. Поле едет ВСЕМИ тремя путями, которыми приезжают отчёты: аргумент
+   MCP-инструмента, HTTP `POST /api/tasks/<id>/machine-review` и текстовый
+   блок прогона.
 5. `hub_submit_for_review` — человеческий вердикт остаётся финальным гейтом;
    отчёт его информирует, не заменяет.
 
@@ -3051,7 +3109,8 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
             (name,),
         )
         if not rows:
-            await _insert_seed_skill(db, name, kind, content, tags, 1, "active")
+            if await _insert_seed_skill(db, name, kind, content, tags, 1, "active"):
+                await _record_seed_activation(db, name, 1, content, None, None)
             continue
         # Highest active version — the same row ``get_active_skill`` serves.
         active = next((r for r in rows if str(r["status"]) == "active"), None)
@@ -3067,25 +3126,45 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
             continue
         # Case 3. The shipped text has to become the one agents read.
         shipped = next((r for r in rows if str(r["content"]) == content), None)
+        published: int | None = None
         if shipped is not None:
             if _is_seed_word(shipped):
-                await db.execute(
-                    "UPDATE skills SET status='active', activated_by='seed' WHERE id=?",
+                # ``AND status<>'active'`` is what makes the event honest, not
+                # what makes the UPDATE correct: this row is not the active one
+                # (case 1 returned above), so the clause changes nothing about
+                # the library. It changes who gets to SAY so — ``get_db`` seeds
+                # on every connection, and without it two workers racing here
+                # would each report having published, writing the change to the
+                # feed twice (#1169).
+                cur = await db.execute(
+                    "UPDATE skills SET status='active', activated_by='seed' "
+                    "WHERE id=? AND status<>'active'",
                     (int(shipped["id"]),),
                 )
+                published = int(shipped["version"]) if cur.rowcount else None
             else:
                 # A person published this exact text. Activating it is AGREEING
                 # with them, not replacing them, so their signature outlives the
                 # act — stamping 'seed' here would erase the only record that a
                 # human ever spoke, and the next upgrade would then read the row
                 # as ours and overrule a decision that was never ours to make.
-                await db.execute(
-                    "UPDATE skills SET status='active' WHERE id=?",
+                cur = await db.execute(
+                    "UPDATE skills SET status='active' WHERE id=? AND status<>'active'",
                     (int(shipped["id"]),),
                 )
-        else:
-            await _insert_seed_skill(
-                db, name, kind, content, tags, next_version, "active"
+                published = int(shipped["version"]) if cur.rowcount else None
+        elif await _insert_seed_skill(
+            db, name, kind, content, tags, next_version, "active"
+        ):
+            published = next_version
+        if published is not None:
+            await _record_seed_activation(
+                db,
+                name,
+                published,
+                content,
+                None if active is None else str(active["content"]),
+                None if active is None else int(active["version"]),
             )
         # And the hub's own PREVIOUS word steps back to a draft. Without this
         # every upgrade leaves another live version behind, and since
@@ -3147,7 +3226,7 @@ async def _insert_seed_skill(
     tags: str,
     version: int,
     status: str,
-) -> None:
+) -> bool:
     """Insert one seeded version, tolerating a parallel seeder.
 
     The race is real and benign: ``get_db`` seeds on every connection, so two
@@ -3157,8 +3236,12 @@ async def _insert_seed_skill(
     statement of this loop (the second seeded skill) would fail on nothing it
     did wrong, taking the connection down over a row that already says what we
     wanted to say.
+
+    Returns whether THIS connection wrote the row. Losing the race is still
+    fine for the library — the winner wrote the same text — but it is not fine
+    for the feed: the loser wrote nothing and has nothing to report (#1169).
     """
-    await db.execute(
+    cur = await db.execute(
         "INSERT INTO skills (name, kind, version, content, tags, status, "
         "created_by, activated_by) VALUES (?, ?, ?, ?, ?, ?, 'seed', ?) "
         "ON CONFLICT(name, version) DO NOTHING",
@@ -3171,6 +3254,56 @@ async def _insert_seed_skill(
             status,
             "seed" if status == "active" else "",
         ),
+    )
+    return bool(cur.rowcount)
+
+
+async def _record_seed_activation(
+    db: aiosqlite.Connection,
+    name: str,
+    version: int,
+    content: str,
+    previous_content: str | None,
+    previous_version: int | None,
+) -> None:
+    """The seed path leaves the same trace the other two do (#1169).
+
+    Before this, changing the text every agent READS happened on deploy and
+    was recorded nowhere: no human pressed anything, and ``seed_default_skills``
+    wrote no event at all. The payload is the one ``hub/app.py`` writes, built
+    by the same function, so a reader of the feed does not have to know which
+    of the three paths published a version.
+
+    Raw SQL rather than ``repository.insert_event``: ``hub.repository`` imports
+    ``hub.db``, so the call cannot go the other way. No commit here either —
+    the caller commits the loop, and a rollback must take the event with the
+    activation it describes.
+
+    Пишутся ОБА места, и полезная нагрузка для них считается ОДИН раз (#1253).
+    Событие остаётся уведомлением — человек видит факт публикации сразу; а
+    ``skills.publication_record`` остаётся доказательством, потому что ленту
+    поллер чистит раз в две недели. Разойтись им нельзя: расхождение путей и
+    есть исходный дефект #1169, поэтому payload здесь — одна переменная, а не
+    два вызова.
+    """
+    payload = json.dumps(
+        skill_publish.publication_payload(
+            name=name,
+            version=version,
+            content=content,
+            previous_content=previous_content,
+            previous_version=previous_version,
+        ),
+        ensure_ascii=False,
+    )
+    await db.execute(
+        "INSERT INTO events (kind, task_id, project_id, actor, payload) "
+        "VALUES ('skill_activated', NULL, NULL, 'seed', ?)",
+        (payload,),
+    )
+    await db.execute(
+        "UPDATE skills SET publication_record=? WHERE name=? AND version=?",
+        (payload, name, version),
     )
 
 

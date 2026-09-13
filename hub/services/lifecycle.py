@@ -728,6 +728,23 @@ async def enrich_task_view(
         task_view.lifecycle_hint = compute_lifecycle_hint(task_dict)
         task_view.outcome_status = await outcome_status_for_task(db, task_dict)
 
+    # #1235: круг ревью читается ТОЙ ЖЕ функцией, которой его считают бриф и
+    # сигнал. Второе выражение того же счёта здесь означало бы, что карточка
+    # и бриф расходятся в числе. Стоит в обогащении, а не в row_to_task:
+    # счёт идёт по отчётам и исходам, а списки задач за него платить не
+    # должны (#485).
+    from hub.models import ReviewCircleView
+    from hub.services.review_dispatch import review_circle
+
+    circle = await review_circle(db, task_view.id)
+    task_view.review_circle = ReviewCircleView(
+        laps=circle.count,
+        threshold=circle.threshold,
+        named=circle.named,
+        breakdown=circle.breakdown(),
+        repeated_categories=list(circle.repeated_categories),
+    )
+
     project_row = await repo.resolve_project_for_task(db, task_view.id)
     if project_row is not None:
         task_view.project = TaskProjectRef(
@@ -1037,14 +1054,16 @@ async def approve_task(
                     "task_id": task_id,
                     "score": readiness.score,
                     "missing_required": missing,
+                    # Dump the whole Recommendation instead of re-typing a
+                    # subset of its fields (#1172). The hand-built dict here
+                    # silently dropped ``defect_code``, so the one refusal a
+                    # caller actually receives carried human prose and no
+                    # vocabulary code — exactly the thing the closed
+                    # vocabulary exists to prevent. model_dump also means the
+                    # next field added to Recommendation reaches this payload
+                    # without anyone remembering to widen it.
                     "recommendations": [
-                        {
-                            "field": r.field,
-                            "severity": r.severity,
-                            "message": r.message,
-                            "expected_score_delta": r.expected_score_delta,
-                        }
-                        for r in readiness.recommendations
+                        r.model_dump() for r in readiness.recommendations
                     ],
                     "hint": "pass force=true to override the DoR gate",
                 },

@@ -981,6 +981,74 @@ async def get_skill_version(
     return rows[0] if rows else None
 
 
+async def record_skill_publication(
+    db: aiosqlite.Connection,
+    name: str,
+    version: int,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Записать доказательства публикации ТУДА, ГДЕ У НИХ НЕТ СРОКА (#1253).
+
+    Парная к ``insert_event`` запись: событие уведомляет, эта — хранит.
+    Вызывающий обязан передать сюда ТОТ ЖЕ словарь, что ушёл в событие, — не
+    второй такой же, собранный рядом. Разойтись двум сборкам полезной
+    нагрузки ничто не мешает, а расхождение путей публикации и есть исходный
+    дефект #1169; сериализация здесь та же, что у ``insert_event``, поэтому
+    из одного словаря выходит и одна строка.
+
+    Коммита здесь нет намеренно, как и у ``insert_event``: вызывающий пишет
+    запись в той же транзакции, что и саму активацию, и откат обязан унести
+    обе. Записи о публикации версии, которой нет в реестре, не бывает —
+    ``UPDATE`` по несуществующей паре просто не тронет ни одной строки.
+    """
+    await db.execute(
+        "UPDATE skills SET publication_record=? WHERE name=? AND version=?",
+        (json.dumps(payload or {}, ensure_ascii=False), name, version),
+    )
+
+
+async def latest_skill_activation(
+    db: aiosqlite.Connection, name: str, version: int
+) -> dict[str, Any] | None:
+    """Записанные доказательства публикации ИМЕННО ЭТОЙ версии.
+
+    This is what makes paths 1 and 3 visible AFTER the fact (#1169). On path 1
+    the person is the author of the text, so a preview adds nothing — what was
+    missing is the record of what got published; on path 3 there is no person
+    at all. The page reads that record back rather than recomputing it, so what
+    a human sees is the thing that was actually written down, not a second
+    opinion computed later from rows that may since have moved.
+
+    Читается колонка строки версии, а НЕ лента событий (#1253). Лента —
+    канал уведомлений: поллер чистит её раз в две недели
+    (``_sweep_events_retention`` → ``prune_events``), и пока доказательства
+    лежали там, страница скилла через 14 дней молча возвращалась к «записи о
+    публикации нет» — тому самому состоянию, ради выхода из которого сделана
+    #1169. Событие по-прежнему пишется рядом, чтобы человек видел факт сразу.
+
+    Пустая колонка — это «записи нет вовсе», третье из трёх состояний, и оно
+    отличается от «запись есть, дифа в ней нет»: во втором колонка непуста, а
+    вот ключа ``diff`` в ней нет (так выглядит всё, что записано до #1169).
+    Различает их ``hub/web.py``, и различать он может только потому, что
+    здесь эти два случая не слиты в один ``None``.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT publication_record FROM skills WHERE name=? AND version=?",
+        (name, version),
+    )
+    if not rows:
+        return None
+    raw = str(rows[0]["publication_record"] or "")
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 async def activate_skill_version(
     db: aiosqlite.Connection, name: str, version: int, *, activated_by: str
 ) -> None:
@@ -1024,6 +1092,7 @@ async def insert_machine_review(
     findings_rejected: str = "[]",
     submitted_by: str = "",
     incomplete: bool | None = None,
+    incomplete_reason: str = "",
     unresolved: str = "[]",
     lost_dimensions: str = "[]",
     profile: str = "",
@@ -1034,9 +1103,9 @@ async def insert_machine_review(
         "INSERT INTO machine_reviews (task_id, submission_generation, "
         "harness_skill, harness_version, agent_count, tokens_spent, "
         "duration_ms, orchestrator, model, raw_count, findings_confirmed, "
-        "findings_rejected, submitted_by, incomplete, unresolved, "
-        "lost_dimensions, profile, self_reviewed, principal_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "findings_rejected, submitted_by, incomplete, incomplete_reason, "
+        "unresolved, lost_dimensions, profile, self_reviewed, principal_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -1052,6 +1121,7 @@ async def insert_machine_review(
             findings_rejected,
             submitted_by,
             None if incomplete is None else int(incomplete),
+            incomplete_reason,
             unresolved,
             lost_dimensions,
             profile,

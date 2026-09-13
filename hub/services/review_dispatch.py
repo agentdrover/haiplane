@@ -25,6 +25,7 @@ import logging
 import math
 import re
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, NamedTuple
@@ -38,7 +39,11 @@ from hub.integrations import cursor_cloud
 from hub.integrations import local_reviewer
 from hub.integrations import forge as forge_urls
 from hub.integrations.registry import plugins
-from hub.models import RiskClass
+from hub.models import (
+    INCOMPLETE_REASON_ENVIRONMENT,
+    INCOMPLETE_REASON_PROFILE,
+    RiskClass,
+)
 from hub.services import project_policy
 from hub.services.model_family import family
 from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
@@ -744,14 +749,47 @@ REPORT_BLOCK_INSTRUCTION = (
     '"start_line": 1, "detail": "..."}], '
     '"findings_rejected": [{"title": "...", "category": "...", "reason": "..."}], '
     '"unresolved": [{"title": "...", "why": "..."}], '
-    '"lost_dimensions": ["..."], "harness_skill": "...", '
+    '"lost_dimensions": ["..."], "incomplete_reason": "environment|profile|", '
+    '"harness_skill": "...", '
     '"tokens_spent": <число или null>, "model": "<твоя модель>"}\n'
     "```\n"
     "Правила блока: он ОДИН и он последний; incomplete обязателен и без "
     "дефолта — «0 подтверждённых» без него не значит ничего; находка, которую "
     "никто не смог рассудить, идёт в unresolved, а НЕ в findings_rejected. "
+    "При incomplete=true назови ПРИЧИНУ одним словом в incomplete_reason: "
+    "«environment» — смотреть было нечем (нет чем запустить проверки, не "
+    "разрешается база для сравнения), «profile» — инструменты были, а охвата "
+    "на объём диффа не хватило. Это РАЗНЫЕ ответы человека: первое лечится "
+    "настройкой окружения, второе — ещё одним прогоном. Не заявишь — причина "
+    "останется неизвестной, и угадывать её по твоему тексту никто не будет. "
     "Если инструменты хаба недоступны — этот блок единственный способ "
     "доставить работу, и без него прогон пропадёт целиком."
+)
+
+
+# #1238. Что делать ДО того, как объявить, что среда не дала измерить.
+#
+# Заведено по отчёту #334 (задача #1169, профиль deep, 12 агентов): прогон
+# честно записал «в среде нет uv/pytest — сюит не исполнялся, только чтение»
+# и «локальный ref develop не резолвится». Ни того, ни другого никто не
+# просил попробовать обойти, и оба измерения пропали при полной оплате.
+#
+# Обещаний про среду провайдера здесь нет — только порядок попыток и
+# требование назвать отказ отказом, если ни одна не сработала. Сработает ли
+# он, покажет счётчик отказов среды, а не этот комментарий.
+ENVIRONMENT_ATTEMPT_BLOCK = (
+    "ЧЕМ СМОТРЕТЬ — СНАЧАЛА ПОПРОБУЙ, ПОТОМ ЗАЯВЛЯЙ ОТКАЗ.\n"
+    "Тесты: `uv run pytest -q`; нет uv — `python -m pytest -q`; нет pytest — "
+    "`python -m pip install -q pytest` и повтори. Код возврата смотри "
+    "отдельным `echo $?`, а не по хвосту вывода.\n"
+    "База для сравнения: если ссылка на базовую ветку не разрешается, "
+    "`git fetch origin <база>` и сравнивай с `origin/<база>`. Взять ДРУГОЙ "
+    "диапазон — значит судить о другом наборе изменений; если пришлось, "
+    "скажи об этом прямо.\n"
+    "Если после попыток измерение так и не сделано — incomplete=true и "
+    'incomplete_reason="environment", а в lost_dimensions перечисли, чего '
+    "именно не хватило. Чтение кода вместо прогона тестов прогоном не "
+    "называется.\n\n"
 )
 
 
@@ -810,12 +848,16 @@ def _review_prompt(
         # And the prepass (#875): both profiles pay model prices for what a
         # linter already proved, and the expensive one pays them per pass.
         f"{prepass_block}\n\n"
+        # #1238: and the order of attempts before "the environment refused".
+        # Both profiles get it: the deep harness lost the test dimension on
+        # exactly the same missing tool as a cheap one would.
+        + ENVIRONMENT_ATTEMPT_BLOCK
         # #1036: the report has to survive a run with no MCP. Since 22.08 the
         # hub's MCP stopped reaching cloud runs at all — the reviewer works,
         # finishes, and its findings die in the final text nobody parses. So
         # the text becomes a second, weaker delivery: same fields, stated
         # once, at the very end, where a machine can find them.
-        f"{delivery_block}"
+        + f"{delivery_block}"
         # .replace, не .format: сам шаблон несёт JSON отчёта в фигурных
         # скобках, и форматирование прочитало бы "raw_count" как поле.
         + REPORT_BLOCK_INSTRUCTION.replace(
@@ -911,6 +953,108 @@ async def _submission_diff(
 REVIEW_LADDER_MAX_STEPS = 2
 
 
+#: Окно, за которое считается повторяемость отказов среды (#1238).
+ENVIRONMENT_REFUSAL_WINDOW_DAYS = 30
+
+
+def is_environment_refusal(report: Mapping[str, Any] | None) -> bool:
+    """Отчёт неполон ПОТОМУ ЧТО среда отказала — по заявлению ревьюера (#1238).
+
+    ЕДИНСТВЕННОЕ место, где это решается. Два условия, и оба обязательны:
+    прогон объявил себя неполным И назвал причиной ``environment``. Пустая
+    причина — «не заявлена»; так выглядят все отчёты, написанные до
+    появления поля, и засчитать их отказом среды задним числом значило бы
+    сочинить за них показание.
+
+    Ничего не выводится из ``lost_dimensions``: разбор прозы по подстрокам
+    и есть то угадывание, ради замены которого поле заведено.
+    """
+    if report is None:
+        return False
+    if not report.get("incomplete"):
+        return False
+    return (report.get("incomplete_reason") or "") == INCOMPLETE_REASON_ENVIRONMENT
+
+
+#: Хвост алерта лестницы, когда неполнота — отказ среды (#1238).
+#:
+#: Лестница (#879) от этого не меняется: она и до, и после решает по профилю
+#: и по потолку — перечень её исходов вне области этой задачи. Меняется
+#: только то, ЧТО человек прочитает в карточке, когда за отказ примутся.
+ENVIRONMENT_REFUSAL_NOTE = (
+    " ПРИЧИНА — ОТКАЗ СРЕДЫ по заявлению ревьюера: смотреть было нечем "
+    "(нечем запустить проверки или не с чем сравнить дифф). Повтор прогона "
+    "в той же среде даст тот же отказ — лечится настройкой окружения "
+    "ревьюера, а не ещё одним ревью (#1238)."
+)
+
+
+def _ladder_cause_note(report: Mapping[str, Any] | None) -> str:
+    """Что дописать в алерт лестницы про ПРИЧИНУ неполноты (#1238)."""
+    if is_environment_refusal(report):
+        return ENVIRONMENT_REFUSAL_NOTE
+    return ""
+
+
+async def count_environment_refusals(
+    db: aiosqlite.Connection,
+    since_days: int = ENVIRONMENT_REFUSAL_WINDOW_DAYS,
+) -> dict[str, Any]:
+    """Сколько отчётов за окно неполны по отказу среды — с размером выборки.
+
+    Повторяемость до этой задачи не считал никто: два случая за 09.09.2026
+    заметил человек, читавший карточки подряд, а не механизм. Считается
+    здесь, рядом с определением отказа, чтобы счёт и признак не разъехались.
+
+    Доля печатается ТОЛЬКО когда есть от чего её брать. Знаменатель — не
+    все неполные отчёты, а те из них, что назвали причину: пока причину не
+    назвал никто, «0 отказов среды из 48 неполных» читалось бы как «со
+    средой всё хорошо», хотя измерено ровно ничего. Такой случай называется
+    словом «недобор» (#1153), а не нулём.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT incomplete, incomplete_reason FROM machine_reviews "
+        "WHERE created_at >= datetime('now', ?)",
+        (f"-{int(since_days)} days",),
+    )
+    reports_total = len(rows)
+    incomplete_rows = [dict(row) for row in rows if row["incomplete"]]
+    environment = sum(1 for row in incomplete_rows if is_environment_refusal(row))
+    profile_exhausted = sum(
+        1
+        for row in incomplete_rows
+        if (row.get("incomplete_reason") or "") == INCOMPLETE_REASON_PROFILE
+    )
+    declared = environment + profile_exhausted
+    incomplete_total = len(incomplete_rows)
+    if declared:
+        share_note = (
+            f"отказ среды: {environment} из {declared} неполных отчётов, "
+            f"назвавших причину (неполных всего {incomplete_total} из "
+            f"{reports_total} отчётов за {since_days} дн.)"
+        )
+    else:
+        share_note = (
+            f"недобор: причину неполноты не назвал ни один отчёт (неполных "
+            f"{incomplete_total} из {reports_total} за {since_days} дн.), "
+            "поэтому доля отказов среды не измерена — это не ноль"
+        )
+    return {
+        "since_days": int(since_days),
+        "reports_total": reports_total,
+        "incomplete_total": incomplete_total,
+        "reason_declared": declared,
+        "reason_unstated": incomplete_total - declared,
+        "environment_refusals": environment,
+        "profile_exhausted": profile_exhausted,
+        # Доля есть только при непустом знаменателе; иначе её нет, и вместо
+        # числа стоит None рядом со словом «недобор» в share_note.
+        "environment_share": (round(environment / declared, 3) if declared else None),
+        "share_note": share_note,
+    }
+
+
 async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> bool:
     """Buy the heavy profile when the cheap run said it did not finish (#879).
 
@@ -960,7 +1104,7 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             f"Неполный отчёт после {steps} прогон(ов): потолок лестницы "
             f"{REVIEW_LADDER_MAX_STEPS} достигнут, добор НЕ ставится. "
             "Ревью этой сдачи так и не состоялось полностью — решение за "
-            "человеком (#879).",
+            "человеком (#879)." + _ladder_cause_note(report),
         )
         await db.commit()
         return False
@@ -978,7 +1122,8 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             "alert",
             "Неполный отчёт, добор не положен: профиль "
             + (f"«{profile}»" if profile else "не заявлен")
-            + " — выше дешёвого подниматься некуда. Решение за человеком (#879).",
+            + " — выше дешёвого подниматься некуда. Решение за человеком "
+            "(#879)." + _ladder_cause_note(report),
         )
         await db.commit()
         return False
@@ -2623,3 +2768,353 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
             )
         await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
         await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Круг ревью: заходы, где находки ЗАКРЫВАЛИСЬ (#1235)
+# ---------------------------------------------------------------------------
+#
+# Два потолка уже стоят, и оба ловят ПОВТОР БЕЗ ИЗМЕНЕНИЯ: бюджет циклов
+# считает возвраты работы автору (review_cycle), потолок драфта (#1161)
+# стоит на неизменившейся ревизии постановки. Круг, наблюдённый 09.09.2026
+# на #1171, #1208 и #1169, не ловится ни тем, ни другим по построению: код
+# менялся по-настоящему, каждая пересдача несла реальную работу и честно
+# покупала новый глубокий прогон, который находил следующий слой. На #1171
+# review_cycle оставался нулём при третьем заходе.
+#
+# Поэтому здесь СЧИТАЮТСЯ ПОКОЛЕНИЯ, а не возвраты, и ничего не
+# останавливается. Ревью не глушится, пересдача не запрещается, статус не
+# меняется: находки в таком круге настоящие (из 25 неразрешённых за день
+# настоящими оказались 24), и механизм, который упёрся бы в потолок на
+# задаче, где каждый заход закрывает настоящие дефекты, вытолкнул бы к
+# человеку именно ту работу, которая шла верно. Хаб называет круг и зовёт
+# человека решать — этим его полномочия и кончаются.
+
+#: Исходы, которыми автор говорит, что дефекта в коде больше нет — он его
+#: ПОПРАВИЛ. ``fixed`` из словаря подтверждённых находок, ``real_fixed`` —
+#: из словаря неразрешённых (#1085).
+#:
+#: Свой набор, а не ``models._SELF_EVIDENT_OUTCOMES``, хотя состав сегодня
+#: совпадает буква в букву. Тот отвечает на вопрос «обязан ли этот исход
+#: нести строку объяснения», этот — на вопрос «была ли на этом заходе
+#: сделана работа». Два разных вопроса, совпавших в ответе, разойдутся на
+#: первом же новом слове в любом из словарей, и заход тогда считался бы по
+#: признаку из чужой задачи.
+#:
+#: ``false_positive``, ``not_a_defect``, ``wont_fix``, ``deferred``,
+#: ``real_deferred`` и ``not_judged`` сюда не входят намеренно: круг, ради
+#: которого всё это заведено, — про поколения, где автор ЧИНИЛ и получал
+#: новый слой. Пересдача, на которой все находки объявлены ложными, — это
+#: не круг, а разговор о точности харнесса, и у него свои метрики.
+CIRCLE_CLOSING_OUTCOMES: frozenset[str] = frozenset({"fixed", "real_fixed"})
+
+#: Метка записи о круге, по которой она находится снова. Внутри — номер
+#: поколения: дедуп обязан быть в его пределах, иначе одна запись за всю
+#: жизнь задачи молчала бы про каждый следующий заход. Образец —
+#: ``NO_REVIEWER_MARK`` выше, и по той же причине ключ разбирается из
+#: текста, а не хранится второй колонкой.
+CIRCLE_MARK = "[круг ревью: сдача {generation}]"
+
+
+@dataclass(frozen=True)
+class CircleLap:
+    """Один заход: находки прошлого поколения закрыты, пришли новые.
+
+    ``generation`` — поколение, В КОТОРОМ пришли новые находки, то есть то,
+    по которому заход и виден. ``closed`` — сколько находок ПРЕДЫДУЩЕГО
+    поколения автор закрыл правкой, ``arrived`` — сколько новых принёс
+    отчёт этого. Оба числа рядом намеренно: одно без другого не отличает
+    круг от обычной работы.
+    """
+
+    generation: int
+    closed: int
+    arrived: int
+    repeated_categories: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReviewCircle:
+    """Сколько заходов подряд задача уже сделала и назван ли круг."""
+
+    laps: tuple[CircleLap, ...]
+    threshold: int
+
+    @property
+    def count(self) -> int:
+        return len(self.laps)
+
+    @property
+    def named(self) -> bool:
+        """Пора ли звать человека. Порог из конфига, сравнение — здесь одно."""
+        return self.threshold > 0 and self.count >= self.threshold
+
+    @property
+    def repeated_categories(self) -> tuple[str, ...]:
+        """Категории, которые новый заход повторил за предыдущим.
+
+        Отдельно от числа заходов, потому что это ДРУГОЙ признак и он
+        важнее: три захода с находками разного рода — работа, идущая
+        вглубь, а повтор категории означает, что харнесс ходит по одному и
+        тому же месту.
+        """
+        seen: list[str] = []
+        for lap in self.laps:
+            for category in lap.repeated_categories:
+                if category not in seen:
+                    seen.append(category)
+        return tuple(seen)
+
+    def breakdown(self) -> list[str]:
+        """По строке на заход: «закрыто / пришло новых», в порядке заходов."""
+        lines: list[str] = []
+        for ordinal, lap in enumerate(self.laps, start=1):
+            line = (
+                f"заход {ordinal} (сдача {lap.generation}): "
+                f"закрыто {lap.closed}, пришло новых {lap.arrived}"
+            )
+            if lap.repeated_categories:
+                line += f"; повтор категории: {', '.join(lap.repeated_categories)}"
+            lines.append(line)
+        return lines
+
+
+def _findings_of(row: dict[str, Any]) -> list[tuple[str, str]]:
+    """Находки одного отчёта как ``(uid, категория)``.
+
+    Обе секции сразу — и подтверждённые, и неразрешённые. Круг, который
+    оплачивался живьём, состоял в основном из НЕРАЗРЕШЁННЫХ находок (#1171:
+    ноль подтверждённых и пять новых неразрешённых), так что счёт по одним
+    подтверждённым не увидел бы его вовсе.
+
+    У неразрешённой записи категории нет — модель её не несёт (#1085), — и
+    здесь она остаётся пустой, а не выдумывается. Пустая категория в
+    сравнение на повтор не входит: «неизвестно» и «то же самое» — разные
+    ответы, и склеить их значило бы объявить повтор там, где о категории
+    ничего не сказано.
+    """
+    from hub.services.finding_identity import finding_uids, unresolved_uids
+
+    out: list[tuple[str, str]] = []
+    try:
+        confirmed = json.loads(row.get("findings_confirmed") or "[]")
+    except ValueError:
+        confirmed = []
+    if isinstance(confirmed, list):
+        entries = [f for f in confirmed if isinstance(f, dict)]
+        for uid, finding in zip(finding_uids(entries), entries):
+            out.append((uid, str(finding.get("category") or "").strip()))
+    try:
+        unresolved = json.loads(row.get("unresolved") or "[]")
+    except ValueError:
+        unresolved = []
+    if isinstance(unresolved, list):
+        entries = [f for f in unresolved if isinstance(f, dict)]
+        for uid in unresolved_uids(entries):
+            out.append((uid, ""))
+    return out
+
+
+async def review_circle(db: aiosqlite.Connection, task_id: int) -> ReviewCircle:
+    """Заходы этой задачи: «находки закрыли — пришли новые», подряд.
+
+    ЗАХОД — это пара поколений: в поколении N отчёт нашёл находки, автор их
+    ЗАКРЫЛ правкой (``CIRCLE_CLOSING_OUTCOMES``), а отчёт поколения N+1
+    принёс находки, которых в N не было. Условий ДВА, и каждое стоит
+    против своей ошибки:
+
+    * ЗАКРЫТИЕ находок поколения N правкой. Оно же закрывает и требование
+      «находки в N были»: закрыть можно только то, что нашли, поэтому
+      пересдача с чистым отчётом заходом не станет (AC-2). Отдельной
+      третьей проверки «находки были» здесь нет намеренно — она
+      недостижима, а условие, которое не может сработать, врёт читателю
+      про свою работу: мутация, снимающая его, не роняет ни одного теста.
+      Проверяется именно закрытие, а не наличие: пересдача, на которой
+      автор объявил все находки ложными или отложил их, работой по коду не
+      была — это разговор о точности харнесса, и у него свои метрики.
+    * НОВЫЕ находки в N+1 — по ``finding_uid``, который выводится из
+      содержания находки (#1007), поэтому тот же дефект, найденный снова,
+      имеет тот же id и новым не считается.
+
+    ПОДРЯД — буквально: считается ХВОСТОВАЯ серия, оканчивающаяся на самом
+    свежем поколении с отчётом. Заход, прервавшийся чистым отчётом,
+    обнуляет счёт, потому что круг на этом и кончился; хранить его как
+    заслугу значило бы позвать человека к задаче, которая уже вышла.
+
+    Поколения без отчёта в счёт не входят и цепь не рвут: отчёта нет —
+    значит, о находках этого поколения не известно ничего, а «неизвестно»
+    не равно «чисто». НЕПОЛНЫЙ отчёт, не принёсший находок, — тот же
+    случай, и потому он тоже пропускается: он САМ говорит, что дочитал не
+    всё, а лестница добора (#879) существует ровно затем, чтобы добрать
+    непрочитанное. Этот же файл уже исключает ``incomplete`` из «код
+    прочитан» по той же причине. Пустой ПОЛНЫЙ отчёт круг по-прежнему
+    кончает: харнесс дочитал и не нашёл ничего.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT submission_generation, findings_confirmed, unresolved, incomplete "
+        "FROM machine_reviews WHERE task_id=? "
+        "ORDER BY submission_generation, id",
+        (task_id,),
+    )
+    per_generation: dict[int, list[tuple[str, str]]] = {}
+    for raw in rows:
+        row = dict(raw)
+        found = _findings_of(row)
+        if not found and bool(row.get("incomplete")):
+            # Сведений ноль: отчёт не дочитал и ничего не принёс. Строка
+            # остаётся в machine_reviews навсегда, поэтому, обнуляй мы по
+            # ней хвост, КАЖДАЯ следующая сдача снова упиралась бы в ту же
+            # пару и снова сбрасывала счёт — круг переставал бы быть
+            # видимым насовсем.
+            continue
+        generation = int(row.get("submission_generation") or 0)
+        per_generation.setdefault(generation, []).extend(found)
+
+    closed_rows = await fetchall(
+        db,
+        "SELECT submission_generation, finding_uid, outcome "
+        "FROM finding_outcomes WHERE task_id=?",
+        (task_id,),
+    )
+    closed: dict[int, set[str]] = {}
+    for raw in closed_rows:
+        row = dict(raw)
+        if str(row.get("outcome") or "") not in CIRCLE_CLOSING_OUTCOMES:
+            continue
+        generation = int(row.get("submission_generation") or 0)
+        closed.setdefault(generation, set()).add(str(row.get("finding_uid") or ""))
+
+    generations = sorted(per_generation)
+    laps: list[CircleLap] = []
+    for previous, current in zip(generations, generations[1:]):
+        before = per_generation[previous]
+        seen = {uid for uid, _ in before}
+        shut = seen & closed.get(previous, set())
+        fresh = [(uid, cat) for uid, cat in per_generation[current] if uid not in seen]
+        if not shut or not fresh:
+            # Цепь оборвалась: дальше считается заново, а не поверх.
+            laps = []
+            continue
+        # Пустая категория отсеивается ОДИН раз, на стороне предыдущего
+        # поколения: непустого имени, равного пустому, не бывает, поэтому
+        # второй такой же отсев на стороне новых находок не мог бы ничего
+        # изменить — и мутация, снимающая его, не роняла ни одного теста.
+        earlier = {cat for _, cat in before if cat}
+        repeated = sorted({cat for _, cat in fresh if cat in earlier})
+        laps.append(
+            CircleLap(
+                generation=current,
+                closed=len(shut),
+                # Уникальные uid, а не длина списка: находки ВСЕХ отчётов
+                # поколения слиты в один список, а лестница добора (#879)
+                # кладёт на поколение два отчёта, и второй часто повторяет
+                # находки первого. Длина списка назвала бы человеку слой
+                # вдвое толще настоящего — ровно то число, по которому он
+                # решает, продолжать круг или нет. Категории считать
+                # заново не нужно: ``repeated`` уже множество.
+                arrived=len({uid for uid, _ in fresh}),
+                repeated_categories=tuple(repeated),
+            )
+        )
+    return ReviewCircle(laps=tuple(laps), threshold=config.REVIEW_CIRCLE_THRESHOLD)
+
+
+async def name_the_circle(db: aiosqlite.Connection, task_id: int) -> bool:
+    """Назвать круг в карточке и позвать человека. True — записали сейчас.
+
+    Ничего не останавливает и остановить не может: статуса не трогает,
+    диспетч не отменяет, пересдачу не запрещает. Всё, что здесь
+    происходит, — запись в карточке и событие в ленте, потому что решение,
+    где остановиться, принимает человек, а узнать о круге он обязан от
+    хаба, а не из чьего-то пересказа.
+
+    Три исхода названы явно и по именам. Сигнал о круге легко прочесть как
+    разрешение перестать чинить настоящие дефекты, а это самый дорогой из
+    возможных выводов: находки настоящие.
+    """
+    circle = await review_circle(db, task_id)
+    if not circle.named:
+        return False
+    row = await repo.get_task(db, task_id)
+    if row is None:  # pragma: no cover - зовут сразу после записи отчёта
+        return False
+    generation = int(dict(row).get("submission_generation") or 0)
+    mark = CIRCLE_MARK.format(generation=generation)
+    if await _already_named_the_circle(db, task_id, mark):
+        return False
+    repeated = circle.repeated_categories
+    category_line = (
+        (
+            f" ОТДЕЛЬНО: новые находки повторяют категорию предыдущих "
+            f"({', '.join(repeated)}) — это признак, что харнесс ходит по "
+            f"одному и тому же месту, и он важнее числа заходов."
+        )
+        if repeated
+        else ""
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        (
+            f"Задача идёт по кругу {circle.count}-й раз: каждый заход "
+            f"закрывал находки и получал новые. "
+            + "; ".join(circle.breakdown())
+            + f".{category_line} Ревью НЕ выключено и пересдача не запрещена — "
+            "находки настоящие, и молча перестать их искать было бы хуже "
+            "круга. Решает человек, и исходов три: принять как есть, "
+            "отпустить оставшееся в отдельную задачу или продолжать этот "
+            f"круг сознательно (порог REVIEW_CIRCLE_THRESHOLD={circle.threshold}, "
+            f"#1235). {mark}"
+        ),
+    )
+    await repo.insert_event(
+        db,
+        kind="review_circle_named",
+        task_id=task_id,
+        actor="hub",
+        payload={
+            "generation": generation,
+            "laps": circle.count,
+            "threshold": circle.threshold,
+            "breakdown": [
+                {
+                    "generation": lap.generation,
+                    "closed": lap.closed,
+                    "arrived": lap.arrived,
+                    "repeated_categories": list(lap.repeated_categories),
+                }
+                for lap in circle.laps
+            ],
+            "repeated_categories": list(repeated),
+        },
+    )
+    await db.commit()
+    log.info(
+        "task #%s goes in circles: %s laps, generation %s, repeated categories %s",
+        task_id,
+        circle.count,
+        generation,
+        ", ".join(repeated) or "—",
+    )
+    return True
+
+
+async def _already_named_the_circle(
+    db: aiosqlite.Connection, task_id: int, mark: str
+) -> bool:
+    """Называли ли круг на ЭТОЙ сдаче.
+
+    Лестница добора (#879) кладёт на одно поколение два отчёта, и второй
+    заходов не прибавляет — а без дедупа добавил бы вторую одинаковую
+    запись в карточку.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM task_updates WHERE task_id=? AND kind='alert' "
+        "AND content LIKE ? LIMIT 1",
+        (task_id, f"%{mark}%"),
+    )
+    return bool(rows)
