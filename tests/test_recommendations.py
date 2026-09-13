@@ -838,9 +838,7 @@ def test_an_unresolvable_area_with_an_embedded_nul_stays_silent(tmp_path):
     tree" — the docstring's contract is silence when the check cannot judge,
     same as the no-repo-path and escapes-the-root cases just above.
     """
-    inputs = StatementInputs(
-        affected_areas=["hub/a\x00b.py"], repo_path=str(tmp_path)
-    )
+    inputs = StatementInputs(affected_areas=["hub/a\x00b.py"], repo_path=str(tmp_path))
     assert build_affected_area_warnings(inputs) == []
 
 
@@ -852,9 +850,7 @@ def test_a_symlink_loop_in_an_area_stays_silent(tmp_path):
     """
     link = tmp_path / "looplink"
     link.symlink_to(link)
-    inputs = StatementInputs(
-        affected_areas=["looplink/x.py"], repo_path=str(tmp_path)
-    )
+    inputs = StatementInputs(affected_areas=["looplink/x.py"], repo_path=str(tmp_path))
     assert build_affected_area_warnings(inputs) == []
 
 
