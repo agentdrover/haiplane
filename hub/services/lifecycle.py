@@ -4507,6 +4507,7 @@ async def deliver_on_disposition(
 
     from hub.services.orchestration import (
         merge_before_completion,
+        resolve_delivery_pr,
         review_approved_for_current_submission,
     )
 
@@ -4523,7 +4524,26 @@ async def deliver_on_disposition(
         await db.commit()
         return False, "no_approved_review"
 
-    ok, reason = await merge_before_completion(db, task)
+    # #1261: the recorded pr_number is a cached observation (#959), same as
+    # on the sweep and the done-report path — a stacked PR can close when
+    # its base merges and its branch is deleted, with no action from this
+    # task at all (#774, #880, #1204). Resolving here reuses the one rule
+    # in pr_for_delivery rather than handing merge_before_completion a
+    # number that may no longer name anything mergeable.
+    task, delivery_pr = await resolve_delivery_pr(db, task)
+    if delivery_pr.reason:
+        # Said once, regardless of outcome — the same rule the sweep and
+        # the done-report path already follow (#767, #959): the reader
+        # must see both the closed number and its replacement, or the
+        # closed number and the absence of one.
+        await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
+    if delivery_pr.unusable:
+        # #959: closed, no live replacement — nothing to merge. Asking
+        # GitHub would read as "merge_failed" over a PR that is not there
+        # to refuse anything (AC-3); the true cause is named instead.
+        ok, reason = False, delivery_pr.reason
+    else:
+        ok, reason = await merge_before_completion(db, task)
     if ok:
         await repo.add_task_update(
             db,

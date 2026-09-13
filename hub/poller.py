@@ -1727,8 +1727,29 @@ async def _sweep_pair_delivery(db) -> None:
 async def _deliver_pair_task(db, task: dict) -> None:
     """One approved pair task through the delivery gate (#971)."""
     task_id = task["id"]
+    # #1261: this sweep is today's primary delivery path — #1172 and #1238
+    # arrived by it, not by an agent's done report — and it used to hand
+    # task["pr_number"] to the gate on faith. A PR closes without its
+    # author (a stacked base merged and its branch deleted, same as #774
+    # and #880), and the gate then refused a live, green PR of the same
+    # branch as merge_failed on a corpse: #1204, twice. resolve_delivery_pr
+    # wraps the one rule (#959) the done-report path already applies.
+    task, delivery_pr = await services.resolve_delivery_pr(db, task)
     pr_num = task.get("pr_number")
-    ok, detail = await services.merge_before_completion(db, task)
+    if delivery_pr.reason:
+        # Said once, regardless of outcome: the reader must see which PR
+        # this delivery is actually about — the closed number and its
+        # replacement, or the closed number and the absence of one — the
+        # same rule the done-report path already follows (#767, #959).
+        await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
+    if delivery_pr.unusable:
+        # #959: closed, no live replacement — nothing to merge. Asking
+        # GitHub to merge a corpse is what produced "merge_failed: GitHub
+        # refused the merge" on #1204; the true cause is named instead
+        # (AC-3), and it is a decision for a human, not a wait.
+        ok, detail = False, delivery_pr.reason
+    else:
+        ok, detail = await services.merge_before_completion(db, task)
     if not ok:
         # #951: a temporary state is not a decision, and the poller is the
         # place that has always known it — it simply comes back next pass.

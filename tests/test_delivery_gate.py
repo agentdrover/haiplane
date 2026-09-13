@@ -12,16 +12,32 @@ nothing. An accusation made out of ignorance is worse than saying nothing.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import aiosqlite
+import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
 from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 from hub.integrations.registry import plugins
 from hub.services.delivery_gate import undelivered_warning
-from tests.test_pair_merge_gate import _approved_pair_task, _git, _report_done
+from tests.test_accept_without_delivery import (
+    _alerts,
+    _approved_task,
+    _decide_deliver,
+    _install,
+    _MergeSpy,
+)
+from tests.test_pair_merge_gate import (
+    _approved_pair_task,
+    _drain_pair_delivery,
+    _git,
+    _git_with_state,
+    _report_done,
+)
 
 
 async def _running_task(client: AsyncClient, title: str = "Undelivered?") -> int:
@@ -698,3 +714,319 @@ async def test_every_status_in_the_delivery_list_is_actually_seen(
         await repo.update_task(db, base_id, status="completed", branch="")
         await repo.update_task(db, task_id, status="completed", branch="")
         await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# #1261: закрытый записанный PR доставляется только отчётом агента.
+#
+# pr_for_delivery (#767, #959) умеет менять закрытый/отсутствующий записанный
+# номер на живой открытый PR той же ветки. Но у merge_before_completion три
+# вызывающих, и правило применено перед одним — отчётом агента
+# (orchestration._deliver_completed_pair_task, через _complete_without_review).
+# Свип одобренных задач (poller._deliver_pair_task, #971 — СЕГОДНЯ основной
+# путь доставки: #1172 и #1238 пришли им) и решение человека
+# accept+pr_disposition=deliver (lifecycle.deliver_on_disposition, #1037) брали
+# task["pr_number"] как есть. На #1204 (прод aa33d18, 13.09.2026, второй раз —
+# тот же алерт был 09.09) записан закрытый #325, живой той же ветки — #332:
+# свип получил "merge_failed: GitHub refused the merge" и увёл задачу в
+# needs_decision, откуда отчёт агента запрещён (human_decision_required), а
+# решение человека упёрлось бы в тот же #325 — тупик, не считая запрещённого
+# ручного мержа.
+#
+# ВЫБОР ИСПОЛНИТЕЛЯ: разрешение PR — перед КАЖДЫМ вызовом
+# merge_before_completion (resolve_delivery_pr, тонкая обёртка над
+# pr_for_delivery), а не внутри самого гейта. Причина: путь отчёта агента уже
+# зовёт pr_for_delivery САМ, на шаг выше (_complete_without_review, ради
+# ensure_delivery_pr, #967) — протолкнуть разрешение внутрь гейта означало бы
+# спросить провайдера о том же PR дважды за один отчёт. pr_for_delivery
+# остаётся единственной копией правила #959; resolve_delivery_pr — второй
+# вход в неё же, а не вторая логика.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_delivery_sweep_replaces_a_closed_recorded_pr(
+    db: aiosqlite.Connection,
+) -> None:
+    """AC-1. Живой случай #1204: записан #325 (CLOSED), у ветки открыт #332.
+
+    На неисправленном коде (poller._deliver_pair_task зовёт
+    merge_before_completion с task["pr_number"] как есть) этот тест красный:
+    свип пытается мержить закрытый #325, GitHub отказывает, задача уходит в
+    needs_decision с алертом "merge_failed: GitHub refused the merge" вместо
+    доставки через #332.
+    """
+    g = _git_with_state("closed", found=332)
+    task_id = await _approved_pair_task(db, pr_number=325)
+    await repo.update_task(
+        db, task_id, branch="task-1204/undelivered-base-calls-a-human"
+    )
+    await db.commit()
+
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 332, "живой PR ветки записан на задачу"
+    assert g.merge_pr.await_args.args[0] == 332, "и доставляется именно он"
+    assert task["status"] == "completed"
+    g.pr_for_branch.assert_awaited()
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "#325" in feed and "#332" in feed, "оба номера названы в ленте"
+    assert "merge_failed" not in feed
+
+
+async def test_a_human_deliver_decision_replaces_a_closed_recorded_pr(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """AC-2. Тот же случай #1204, но задача уже в needs_decision и человек
+    принимает её с pr_disposition=deliver.
+
+    На неисправленном коде (lifecycle.deliver_on_disposition зовёт
+    merge_before_completion с task["pr_number"] как есть) тест красный: гейт
+    пытается мержить закрытый #325 и отказывает, а не доставляет через #332.
+    """
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_state", AsyncMock(return_value="closed"), raising=False
+    )
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_for_branch", AsyncMock(return_value=332), raising=False
+    )
+    task_id = await _approved_task(
+        client, db, title="undelivered base calls a human", pr=325
+    )
+    await repo.update_task(
+        db, task_id, branch="task-1204/undelivered-base-calls-a-human"
+    )
+    await db.commit()
+
+    resp = await _decide_deliver(client, task_id)
+
+    assert resp.status_code == 200, resp.text
+    assert spy.merged == [332], "доставлен живой PR, а не закрытый записанный"
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 332, "живой PR ветки записан на задачу"
+    alerts = " ".join(await _alerts(db, task_id))
+    assert "#325" in alerts and "#332" in alerts, "оба номера названы в ленте"
+    assert "merge_failed" not in alerts
+
+
+@pytest.mark.parametrize("via", ["poller", "human"])
+async def test_a_closed_pr_without_a_replacement_is_named_not_merged(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, via: str
+) -> None:
+    """AC-3. Записанный PR закрыт, у ветки нет открытого PR ни по одному пути.
+
+    К провайдеру за мержем не обращаются (нет попытки мержа закрытого
+    номера), причина названа словами, а не merge_failed, и задача не
+    остаётся в молчаливом ожидании — она уходит к человеку.
+    """
+    branch = "task-1204/undelivered-base-calls-a-human"
+    if via == "poller":
+        g = _git_with_state("closed", found=None)
+        task_id = await _approved_pair_task(db, pr_number=325)
+        await repo.update_task(db, task_id, branch=branch)
+        await db.commit()
+
+        await _drain_pair_delivery(db)
+
+        g.merge_pr.assert_not_awaited()
+    else:
+        spy = _MergeSpy()
+        _install(monkeypatch, spy)
+        monkeypatch.setattr(
+            plugins.git_ops,
+            "pr_state",
+            AsyncMock(return_value="closed"),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            plugins.git_ops,
+            "pr_for_branch",
+            AsyncMock(return_value=None),
+            raising=False,
+        )
+        task_id = await _approved_task(client, db, title="no replacement", pr=325)
+        await repo.update_task(db, task_id, branch=branch)
+        await db.commit()
+
+        await _decide_deliver(client, task_id)
+
+        assert spy.merged == [], "закрытый PR мержить не пытаются"
+
+    task = dict(await repo.get_task(db, task_id))
+    if via == "poller":
+        # Свип не может решать за человека: менять номер не на что, и
+        # задача уходит в needs_decision, а не остаётся тихо ждать.
+        assert task["status"] == "needs_decision", (
+            "менять номер не на что — решение человека, а не тихое ожидание"
+        )
+    else:
+        # Человек уже принял решение (accept) — оно не отменяется отказом
+        # доставки (#1037): задача остаётся completed, а несостоявшаяся
+        # доставка названа в ленте, а не спрятана за успешным статусом.
+        assert task["status"] == "completed"
+    if via == "poller":
+        feed = " ".join(
+            dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+        )
+    else:
+        feed = " ".join(await _alerts(db, task_id))
+    assert "325" in feed and "закрыт" in feed
+    assert "merge_failed" not in feed, (
+        "причина названа явно, а не отказом GitHub по несуществующему PR"
+    )
+
+
+@pytest.mark.parametrize("state", ["merged", "open", ""])
+async def test_a_merged_open_or_unknown_recorded_pr_is_never_replaced(
+    db: aiosqlite.Connection, state: str
+) -> None:
+    """AC-4, путь свипа. Смерженный — никогда не заменяется (#605): второй
+    мерж не страховка. Открытый и unknown тоже стоят на месте — они и так
+    живы, либо про них нечего сказать наверняка (#959)."""
+    g = _git_with_state(state, found=999)
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 360, f"{state!r}: номер остаётся на месте"
+    if state == "merged":
+        g.pr_for_branch.assert_not_awaited(), (
+            "мерж-состояние не ищет замену — искать нечего"
+        )
+    if state:
+        assert g.merge_pr.await_args.args[0] == 360, (
+            "мержится записанный, второй мерж не заводится"
+        )
+
+
+async def test_a_human_deliver_decision_never_replaces_a_merged_pr(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """AC-4, путь человека: то же самое правило по третьему пути к гейту."""
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_state", AsyncMock(return_value="merged"), raising=False
+    )
+    pr_for_branch = AsyncMock(return_value=999)
+    monkeypatch.setattr(plugins.git_ops, "pr_for_branch", pr_for_branch, raising=False)
+    task_id = await _approved_task(client, db, title="merged stays merged", pr=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    await _decide_deliver(client, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 360, "смерженный записанный номер не заменяется"
+    pr_for_branch.assert_not_awaited(), "мерж-состояние не ищет замену"
+
+
+# ---------------------------------------------------------------------------
+# AC-5. Сторож полноты: КАЖДЫЙ вызывающий merge_before_completion в hub/
+# обязан разрешить PR через #959 (pr_for_delivery / resolve_delivery_pr)
+# раньше, чем позвать гейт — сам, либо через кого-то выше по цепочке
+# вызовов, кто уже это сделал (так устроен путь отчёта агента:
+# _deliver_completed_pair_task получает уже разрешённый delivery_pr от
+# _complete_without_review, а не зовёт pr_for_delivery второй раз).
+#
+# Разбор — по исходнику hub/, а не по примеру: считает вызовы merge_before_
+# completion и pr_for_delivery/resolve_delivery_pr как AST Call-узлы (имя
+# функции — Name или Attribute.attr, что покрывает и обычный вызов, и
+# services.merge_before_completion(...), и локальный import внутри функции),
+# строит граф "кто кого зовёт" по именам функций в hub/ и идёт вверх от
+# каждого вызывающего гейта, пока не найдёт разрешающий вызов. Новый
+# вызывающий мимо правила — без разрешающего вызова нигде в цепочке — роняет
+# тест по имени функции, а не стареет молча.
+# ---------------------------------------------------------------------------
+
+_MERGE_GATE_FUNC = "merge_before_completion"
+_RESOLVER_FUNCS = {"pr_for_delivery", "resolve_delivery_pr"}
+
+
+def _call_name(node: ast.Call) -> str | None:
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _called_names(fn: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            name = _call_name(node)
+            if name:
+                names.add(name)
+    return names
+
+
+def _collect_hub_functions(
+    hub_dir: Path,
+) -> dict[tuple[str, str, int], set[str]]:
+    """(файл, имя функции, строка) -> имена всего, что она вызывает."""
+    functions: dict[tuple[str, str, int], set[str]] = {}
+    for path in sorted(hub_dir.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                key = (str(path), node.name, node.lineno)
+                functions[key] = _called_names(node)
+    return functions
+
+
+def test_every_merge_gate_caller_resolves_the_pr_first() -> None:
+    hub_dir = Path(__file__).resolve().parents[1] / "hub"
+    functions = _collect_hub_functions(hub_dir)
+
+    mergers = {key for key, calls in functions.items() if _MERGE_GATE_FUNC in calls}
+    assert mergers, (
+        "merge_before_completion не вызывается нигде в hub/ — разбор сломан, "
+        "а не то, что вызывающих нет"
+    )
+    # Живой список сегодняшних вызывающих (#1261) — падение здесь значит
+    # появился четвёртый путь к гейту, и его тоже нужно обвести правилом.
+    caller_names = {key[1] for key in mergers}
+    assert caller_names == {
+        "_deliver_completed_pair_task",
+        "_deliver_pair_task",
+        "deliver_on_disposition",
+    }, f"список вызывающих merge_before_completion изменился: {caller_names}"
+
+    resolvers = {key for key, calls in functions.items() if calls & _RESOLVER_FUNCS}
+
+    callers_by_name: dict[str, list[tuple[str, str, int]]] = {}
+    for key, calls in functions.items():
+        for called in calls:
+            callers_by_name.setdefault(called, []).append(key)
+
+    unresolved = []
+    for merger in mergers:
+        seen: set[tuple[str, str, int]] = set()
+        queue = [merger]
+        covered = False
+        while queue:
+            current = queue.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if current in resolvers:
+                covered = True
+                break
+            queue.extend(callers_by_name.get(current[1], []))
+        if not covered:
+            unresolved.append(merger[1])
+
+    assert not unresolved, (
+        "вызывающие merge_before_completion, для которых ни сам вызывающий, "
+        "ни кто-либо выше по цепочке вызовов не зовёт pr_for_delivery/"
+        f"resolve_delivery_pr: {sorted(unresolved)}"
+    )

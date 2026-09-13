@@ -3241,6 +3241,46 @@ async def pr_for_delivery(db: aiosqlite.Connection, task: dict[str, Any]) -> Del
     return DeliveryPR(int(found))
 
 
+async def resolve_delivery_pr(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[dict[str, Any], DeliveryPR]:
+    """Resolve the PR a ``merge_before_completion`` call should use (#1261).
+
+    Wraps :func:`pr_for_delivery` for the two callers that used to hand the
+    gate ``task["pr_number"]`` on faith: the delivery sweep
+    (``poller._deliver_pair_task``) and the human decision path
+    (``lifecycle.deliver_on_disposition``). Both need exactly what
+    ``pr_for_delivery`` already does — the recorded number if it still
+    stands, the branch's live PR if it does not, a named refusal when
+    neither exists — and #959's rule lives in that one function, not a
+    second copy of it (constraint: "второй копии логики замены не
+    заводится").
+
+    The third caller, the agent done-report path
+    (``orchestration._deliver_completed_pair_task``), does NOT go through
+    this wrapper. It already calls ``pr_for_delivery`` itself, one step up
+    in ``_complete_without_review``, because that path has an extra step
+    (``ensure_delivery_pr``, #967) sharing the same lookup that this
+    wrapper does not carry, and the note ``pr_for_delivery`` returns has to
+    reach the feed exactly once either way. Routing it through here too
+    would ask the provider about the same PR twice in one done report —
+    the very doubling the design note for this task warns against. So the
+    report path keeps calling the one rule through its older door; this
+    wrapper is the SAME rule through the door the sweep and the human
+    decision needed and did not have.
+
+    Returns the task dict with ``pr_number`` updated when a replacement was
+    found (``pr_for_delivery`` already persisted it; this keeps the
+    caller's in-memory copy — the one ``merge_before_completion`` reads —
+    in agreement) and the :class:`DeliveryPR` the caller reads for
+    ``unusable`` and ``reason``.
+    """
+    delivery_pr = await pr_for_delivery(db, task)
+    if delivery_pr.number:
+        task = {**task, "pr_number": delivery_pr.number}
+    return task, delivery_pr
+
+
 async def _deliver_completed_pair_task(
     db: aiosqlite.Connection, task: dict[str, Any], delivery_pr: DeliveryPR
 ) -> str | None:
