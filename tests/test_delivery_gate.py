@@ -1161,6 +1161,109 @@ async def test_a_deduplicated_wait_pass_leaves_no_open_transaction(
         await second.close()
 
 
+# ---------------------------------------------------------------------------
+# #1261, стюард — ревью незакоммиченного WIP выше (два теста над этой
+# секцией). Тот же F1/F2, но на ВТОРОЙ ветке ожидания: RECOVERABLE_GATE_
+# PREFIXES (красный CI) с бюджетом, ещё не потраченным, и исполнителем на
+# связи (pair_executor_online -> True) — она тоже зовёт _note_pair_delivery_
+# wait и тоже возвращается, до этого WIP-фикса — БЕЗ resolver_note. Ранняя
+# версия правки писала delivery_pr.reason безусловно ПЕРЕД проверкой этой
+# ветки, думая, что всё после транзиентной ветки терминально; это неверно —
+# recoverable-ветка тоже возвращается раньше итогового commit. Те же два
+# симптома вернулись здесь: алерт на каждый проход (F2) и открытая
+# транзакция после дедуплицированного прохода (F1).
+# ---------------------------------------------------------------------------
+
+
+async def test_the_resolver_note_is_said_once_across_repeated_recoverable_waits(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """AC F2 (recoverable-ветка). Три прохода подряд: unknown PR-состояние +
+    красный CI + исполнитель на связи + бюджет ещё не потрачен —
+    RECOVERABLE_GATE_PREFIXES-ветка (#1030), не транзиентная. Причина
+    резолвера обязана прозвучать РОВНО один раз здесь тоже.
+
+    На WIP ДО этого фикса (после первого фикса F1/F2, но до переноса
+    resolver_note в recoverable-ветку) тест красный: 3 совпадения вместо 1.
+    """
+    from hub import poller
+    from tests.test_pair_merge_gate import _live_session
+
+    g = _git_with_state("", found=None)
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.failed, "checks_failed")
+    )
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+    await _live_session(db, task_id)
+
+    for _ in range(3):
+        task = dict(await repo.get_task(db, task_id))
+        await poller._deliver_pair_task(db, task)
+
+    updates = [
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, task_id)
+    ]
+    resolver_mentions = [c for c in updates if "PR #360 неизвестно" in c]
+    assert len(resolver_mentions) == 1, (
+        f"причина резолвера обязана прозвучать один раз и на recoverable-"
+        f"ветке (#534): {updates}"
+    )
+    waits = [c for c in updates if "Доставка отложена" in c]
+    assert len(waits) == 1, f"и нота ожидания — тоже один раз: {updates}"
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "исполнитель на связи — это ожидание, не решение"
+    )
+
+
+async def test_a_deduplicated_recoverable_wait_pass_leaves_no_open_transaction(
+    db: aiosqlite.Connection, db_dsn: str, monkeypatch
+) -> None:
+    """AC F1 (recoverable-ветка). Дедуплицированный проход по RECOVERABLE_
+    GATE_PREFIXES не должен оставлять соединение поллера в открытой
+    транзакции — тот же F1, другая ветка ожидания.
+
+    На WIP ДО этого фикса тест красный: после прохода №2
+    ``db.in_transaction`` истинно, и INSERT со второй коннекции падает с
+    ``OperationalError: database is locked``.
+    """
+    from hub import poller
+    from tests.test_pair_merge_gate import _live_session
+
+    g = _git_with_state("", found=None)
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.failed, "checks_failed")
+    )
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+    await _live_session(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    await poller._deliver_pair_task(db, task)  # проход №1: не дедуплицирован
+    task = dict(await repo.get_task(db, task_id))
+    await poller._deliver_pair_task(db, task)  # проход №2: дедуплицирован
+
+    assert db.in_transaction is False, (
+        "дедуплицированный проход (recoverable-ветка) не должен оставлять "
+        "соединение поллера в открытой транзакции"
+    )
+
+    second = await aiosqlite.connect(db_dsn, uri=True)
+    try:
+        await second.execute("PRAGMA busy_timeout = 200")
+        await second.execute(
+            "INSERT INTO task_updates (task_id, agent, kind, content) "
+            "VALUES (?, 'probe', 'status', 'second connection probe')",
+            (task_id,),
+        )
+        await second.commit()
+    finally:
+        await second.close()
+
+
 async def test_a_human_deliver_decision_commits_the_resolver_note_when_unusable(
     db: aiosqlite.Connection, monkeypatch
 ) -> None:
