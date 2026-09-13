@@ -700,6 +700,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE machine_reviews ADD COLUMN lost_dimensions TEXT "
         "NOT NULL DEFAULT '[]'",
     ),
+    # #1238. WHY the run called itself incomplete, from a fixed vocabulary.
+    # The empty default is the honest value for history: every row written
+    # before this column made no claim about the cause, and back-filling
+    # either word would put one in its mouth — the same reasoning that left
+    # `incomplete` nullable above. Nothing reads the cause out of prose.
+    (
+        "add_machine_reviews_incomplete_reason_column",
+        "ALTER TABLE machine_reviews ADD COLUMN incomplete_reason TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
     (
         "add_task_updates_principal_id",
         "ALTER TABLE task_updates ADD COLUMN principal_id INTEGER",
@@ -2829,9 +2839,9 @@ HAIPLANE_MACHINE_REVIEW=require
 3. Исправить confirmed-находки, прогнать тесты заново (exit code проверять
    отдельным echo, не через пайп).
 4. `hub_submit_machine_review(task_id, raw_count, incomplete,
-   findings_confirmed, findings_rejected, unresolved, lost_dimensions,
-   harness_skill, harness_version, agent_count, tokens_spent, duration_ms,
-   orchestrator, model)` — метрики опциональны, но токены/время питают
+   incomplete_reason, findings_confirmed, findings_rejected, unresolved,
+   lost_dimensions, harness_skill, harness_version, agent_count, tokens_spent,
+   duration_ms, orchestrator, model)` — метрики опциональны, но токены/время питают
    экономику практики (#384). Отчёт привязывается к текущему
    submission_generation: пересдача работы делает его stale.
 
@@ -2841,6 +2851,17 @@ HAIPLANE_MACHINE_REVIEW=require
    НЕ идут в `findings_rejected`, потому что «никто не голосовал» и «кто-то
    опроверг» — противоположные исходы. `lost_dimensions` — измерения, не
    вернувшие результат.
+
+   `incomplete_reason` (#1238) — ПОЧЕМУ прогон неполон, одним словом из
+   двух: `environment` — смотреть было нечем (нечем запустить тесты, ссылка
+   на базовую ветку не разрешается, сравнить не с чем), лечится настройкой
+   окружения, а не вторым прогоном; `profile` — инструменты были, охвата не
+   хватило на объём диффа. Пропуск поля означает «причина не заявлена» и НЕ
+   читается ни как одно, ни как другое. Прозу по-прежнему пиши в
+   `lost_dimensions`: причина берётся из этого слова, а не угадывается по
+   тексту. Поле едет ВСЕМИ тремя путями, которыми приезжают отчёты: аргумент
+   MCP-инструмента, HTTP `POST /api/tasks/<id>/machine-review` и текстовый
+   блок прогона.
 5. `hub_submit_for_review` — человеческий вердикт остаётся финальным гейтом;
    отчёт его информирует, не заменяет.
 
