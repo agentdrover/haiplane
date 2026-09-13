@@ -1216,6 +1216,85 @@ async def _sweep_unrefined_drafts(db) -> None:
             )
 
 
+# Очередь неразобранных находок (#1171). Механика разбора построена целиком —
+# факт касания (#1039), очередь (#1038), кнопки с границей ложняк/неважно
+# (#876) — и не была использована ни разу: 131 подтверждённая находка без
+# ответа, precision=null, by_profile пустой список. Разрыв тут не в
+# инструменте, а в том, что молчание неотличимо от пустой очереди. Сторож
+# говорит вслух ровно то, чего не хватало, и ничего не решает за человека.
+#
+# Один алерт в сутки, не на каждый проход: очередь — это СТОК, он не меняется
+# за пятнадцать минут, и напоминание на каждом тике становится фоном, который
+# перестают читать (тот же урок, что у лестницы #1020). Дедупликация — по
+# собственному событию, а не по флагу в задаче: у очереди задачи нет.
+UNJUDGED_FINDINGS_ALERT = "unjudged_findings_alert"
+
+
+async def _sweep_unjudged_findings(db) -> None:
+    """Очередь выше порога говорит вслух — числом и ссылкой (#1171).
+
+    Про precision сторож говорит то, что ЕСТЬ, а не лозунг. Непустая очередь
+    и «precision не считается» — разные факты: precision это ``real/judged``
+    по РАЗОБРАННЫМ, и первая же диспозиция делает его числом, сколько бы
+    находок ни ждало рядом. Безусловная строка «Без ответа precision не
+    считается вовсе» после частичного разбора утверждала, что числа нет,
+    когда оно есть, — тот же класс #516/#549, что закрыт в шаблоне дайджеста;
+    сторож остался с ним просто потому, что живёт в другом файле. Считается
+    разбор ЗА ВСЁ ВРЕМЯ: очередь сторожа не оконная, и оконное ``judged``
+    ответило бы ноль наутро после разбора всего запаса.
+    """
+    threshold = config.UNJUDGED_FINDINGS_ALERT_THRESHOLD
+    if threshold <= 0:
+        return  # порог снят настройкой — сторож выключен, а не «молчит»
+    counted = await repo.count_unjudged_findings(db)
+    findings = int(counted["findings"])
+    if findings < threshold:
+        return
+    if await repo.event_raised_since(
+        db, UNJUDGED_FINDINGS_ALERT, "-1 day"
+    ):  # уже сказано в этих сутках
+        return
+    from hub.services.finding_report import judged_all_time
+
+    judged = await judged_all_time(db)
+    await repo.insert_event(
+        db,
+        kind=UNJUDGED_FINDINGS_ALERT,
+        actor="hub",
+        payload={
+            "findings": findings,
+            "reports": int(counted["reports"]),
+            "threshold": threshold,
+            "queue": "/findings",
+            "judged_all_time": judged["judged"],
+            "precision_all_time": judged["precision"],
+        },
+    )
+    await db.commit()
+    # Ставка едет с размером выборки — правило #1153.
+    verdict = (
+        f"Разобрано за всё время {judged['judged']} — precision "
+        f"{judged['precision']} по ним."
+        if judged["judged"]
+        else "Ни одной диспозиции нет, поэтому precision не считается вовсе."
+    )
+    await log_activity(
+        db,
+        UNJUDGED_FINDINGS_ALERT,
+        (
+            f"Очередь находок: {findings} подтверждённых без диспозиции "
+            f"в {counted['reports']} отчётах (порог {threshold}) — /findings. "
+            f"{verdict}"
+        )[:200],
+    )
+    log.warning(
+        "Poll: %d unjudged findings in %d reports (threshold %d) — /findings",
+        findings,
+        int(counted["reports"]),
+        threshold,
+    )
+
+
 # What each human-owned instance is actually waiting for. The age alone does
 # not tell a person what to do with the task — and "someone should look at
 # this" is what the single lifetime alert already said, to no effect.
@@ -1521,6 +1600,13 @@ async def _sweep_stale_arbiter(db) -> None:
 async def _sweep_events_retention(db) -> None:
     # Events feed retention (#349): the feed is a notification
     # channel, not an archive — activity_log keeps the history.
+    #
+    # Это правило действует и на то, что кладут в ленту потом (#1253):
+    # доказательства публикации скилла две недели пролежали в payload
+    # ``skill_activated``, и страница скилла молча теряла бы их на первом же
+    # прогоне этой чистки. Теперь они лежат в ``skills.publication_record``, а
+    # событие осталось тем, чем лента и объявлена, — уведомлением. Кладёшь
+    # сюда что-то, что нужно будет прочитать через месяц, — не клади.
     pruned = await repo.prune_events(db, keep_days=14)
     # Коммит БЕЗУСЛОВНЫЙ. isolation_level="IMMEDIATE" (#1065) открывает
     # транзакцию перед любым DML — и перед DELETE, которому нечего удалять.
@@ -1894,6 +1980,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("stale_statuses", _sweep_stale_statuses),
     Sweep("unrefined_drafts", _sweep_unrefined_drafts),
     Sweep("human_queue", _sweep_human_queue),
+    Sweep("unjudged_findings", _sweep_unjudged_findings),
     Sweep("autopilot_digests", _sweep_autopilot_digests),
     Sweep("delivery_discrepancies", _sweep_delivery_discrepancies),
     Sweep("review_dispatches", _sweep_review_dispatches),

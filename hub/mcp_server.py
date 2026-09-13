@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.parse
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ from pydantic import BeforeValidator
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import Field
 
 from hub import brand, config
 from hub.actionable_errors import normalize_api_error_detail
@@ -241,18 +243,305 @@ def _parse_api_error(resp: Any, status_code: int) -> dict[str, Any]:
     return payload
 
 
-async def _api_get(path: str, *, timeout: float = 15) -> Any:
+# Транспортные сроки. #1250 их НЕ меняет — величина срока вынесена в scope_out,
+# и подвинуть стену значит оставить за ней ту же пустоту. Имя нужно затем, что
+# отказ обязан назвать срок, который он только что просрочил: значение должно
+# быть под рукой у помощника, а не рассыпано магическими числами по восьми
+# местам.
+_TIMEOUT_DEFAULT = 15.0
+_TIMEOUT_SLOW = 30.0
+
+_TRANSPORT_READ_RETRY = "Повтор безопасен: чтение ничего не меняло."
+_TRANSPORT_WRITE_RETRY = (
+    "Повтор НЕ безопасен: запись могла пройти на сервере, а потеряться мог "
+    "ответ. Сначала прочитай состояние, убедись, прошла ли она, и только "
+    "потом решай про повтор."
+)
+
+
+# Ядро фразы «указателя нет» вынесено отдельно затем, что пустых указателей
+# теперь два вида: общий и маршрутный. Оба обязаны СКАЗАТЬ, что они пустые, —
+# молчащее поле без слов вызывающему не помогает. Сверяется тестом по ядру, а
+# не по полному совпадению текста, иначе маршрутная причина не помещается.
+_TRANSPORT_NO_CHECK_CORE = (
+    "Общего инструмента, который скажет, прошла ли ИМЕННО эта запись, здесь нет"
+)
+
+_TRANSPORT_NO_CHECK = (
+    _TRANSPORT_NO_CHECK_CORE
+    + ": прочитай то место, куда писал, прежде чем решать про повтор."
+)
+
+_TRANSPORT_NO_CHECK_SKILL = (
+    _TRANSPORT_NO_CHECK_CORE
+    + ": hub_propose_skill заводит ЧЕРНОВИК, а hub_list_skills предпочитает "
+    "активную версию и черновик за ней не показывает. Повтор заведёт ЕЩЁ одну "
+    "версию, а не перезапишет эту: спроси человека, который активирует скиллы."
+)
+
+
+# Чем читать состояние после проглоченной транспортом записи (#1250, находка
+# ревью P2).
+#
+# «Сначала прочитай состояние» выполнимо, только если названо, ЧЕМ читать.
+# Первая редакция советовала hub_task_status на ЛЮБОЙ записи — включая
+# создание проекта, отправку сообщения и регистрацию сессии. Этому инструменту
+# нужен task_id (обязательный целый параметр в его схеме), которого у таких
+# вызовов нет и быть не может: совет оказывался указателем в никуда ровно там,
+# где он был нужнее всего. Пустоту в тексте починили, а на части маршрутов
+# поставили вместо неё ложный указатель.
+#
+# Маршрут, у которого читающего инструмента НЕ существует, не получает его
+# вовсе и говорит об этом словами: пустой указатель честнее ложного. Так же
+# честно таблица и стареет — новый маршрут без своей строки попадает в ветку
+# «общей проверки нет», а не под чужой указатель.
+#
+# Инструмент в строке обязан уметь ответить на вопрос «прошла ли ИМЕННО эта
+# запись». Поэтому hub_inbox для /api/messages сюда не попал: он читает
+# сообщения, адресованные ТЕБЕ, а отправленное другому в нём не видно.
+_TRANSPORT_WRITE_CHECKS: tuple[tuple[re.Pattern[str], str | None, str], ...] = (
+    (
+        re.compile(r"^/api/tasks/(?P<task_id>\d+)(?:/|$)"),
+        "hub_task_status",
+        "Читать состояние здесь: hub_task_status(task_id={task_id}).",
+    ),
+    (
+        re.compile(r"^/api/tasks(?:/|$)"),
+        "hub_list_tasks",
+        "Читать состояние здесь: hub_list_tasks — задача либо появилась, либо нет.",
+    ),
+    (
+        re.compile(r"^/api/projects(?:/|$)"),
+        "hub_list_projects",
+        "Читать состояние здесь: hub_list_projects.",
+    ),
+    (
+        re.compile(r"^/api/sessions(?:/|$)"),
+        "hub_sessions",
+        "Читать состояние здесь: hub_sessions.",
+    ),
+    (
+        # Указатель, который формально есть, а ведёт не туда (#1250, вторая
+        # находка ревью). Строка раньше называла hub_list_skills — он
+        # существует, не требует аргументов и на первый взгляд отвечает на
+        # вопрос «прошла ли запись». На деле НЕ отвечает: hub_propose_skill
+        # заводит ЧЕРНОВИК, а list_skills отдаёт последнюю версию на имя,
+        # ПРЕДПОЧИТАЯ активную (repository.list_skills: COALESCE(MAX(version
+        # WHERE status='active'), MAX(version))). У скилла с активной версией
+        # свежий черновик за ней не виден вовсе — замерено на настоящей базе:
+        # в skills лежит [(2, draft), (1, active)], а hub_list_skills
+        # показывает только (1, active).
+        #
+        # То есть указатель отвечал «записи нет» ровно там, где запись есть, —
+        # и звал предложить версию заново, а повтор заводит ЕЩЁ одну.
+        re.compile(r"^/api/skills(?:/|$)"),
+        None,
+        _TRANSPORT_NO_CHECK_SKILL,
+    ),
+)
+
+
+# Идемпотентность записи по контракту хаба (#1250, первая находка ревью).
+#
+# retry_safe выводился ТОЛЬКО из HTTP-метода: любая запись получала false и
+# совет «не повторяй, сначала прочитай состояние». На записях, идемпотентных
+# ПО КОНТРАКТУ, этот совет ведёт ровно мимо — и противоречит их же
+# опубликованным docstring'ам. Замерено через опубликованный вход на
+# настоящем таймауте, ДО этой правки:
+#
+#   hub_session_register      → retry_safe=false, «Повтор НЕ безопасен»
+#   hub_upsert_acceptance_criterion → retry_safe=false, «Повтор НЕ безопасен»
+#   hub_create_task(client_request_id=...) → retry_safe=false
+#
+# при том что их docstring'и говорят «Idempotent», «Idempotent upsert» и
+# «Optional idempotency key; safe to retry on timeout». Вызывающий получал
+# два взаимно противоречащих утверждения от одной и той же поверхности.
+#
+# ЗНАЧЕНИЕ ПО УМОЛЧАНИЮ — НЕ ИДЕМПОТЕНТНО. Маршрут без своей строки попадает
+# в БЕЗОПАСНУЮ сторону (не повторять): лишняя проверка состояния стоит одного
+# чтения, а лишний повтор неидемпотентной записи стоит второй записи. Поэтому
+# таблица перечисляет то, что идемпотентно, а не то, что нет.
+#
+# Каждая строка — утверждение о СЕРВЕРЕ, а не о вежливости клиента, и каждая
+# закрыта своим тестом против настоящего приложения: если маршрут перестанет
+# быть идемпотентным, упадёт тест, а не выкатится ложный совет.
+_TRANSPORT_IDEMPOTENT_RETRY = (
+    "Повтор безопасен: эта запись идемпотентна по контракту, повторный тот же "
+    "вызов с теми же аргументами не создаст второй записи."
+)
+
+# (метод, маршрут, нужен ли ключ идемпотентности, чем именно она держится)
+_IDEMPOTENT_WRITES: tuple[tuple[str, re.Pattern[str], bool, str], ...] = (
+    (
+        # Единственная строка с ключом: идемпотентность здесь — свойство
+        # ВЫЗОВА, а не маршрута. Без client_request_id повтор POST /api/tasks
+        # заводит вторую задачу, поэтому строка требует ключ, а не маршрут.
+        "POST",
+        re.compile(r"^/api/tasks$"),
+        True,
+        "Ключ client_request_id уже отправлен: повтор с тем же ключом вернёт "
+        "ту же задачу (HTTP 200), а не заведёт вторую.",
+    ),
+    (
+        "POST",
+        re.compile(r"^/api/sessions/register$"),
+        False,
+        "Регистрация сессии идемпотентна по session_id: повтор обновляет "
+        "объявленное и признак жизни, а не заводит вторую сессию.",
+    ),
+    (
+        "POST",
+        re.compile(r"^/api/tasks/\d+/acceptance_criteria$"),
+        False,
+        "Добавление критерия идемпотентно по ac_id: повтор с тем же id — "
+        "безопасный no-op (HTTP 200), а не второй критерий.",
+    ),
+    (
+        "PUT",
+        re.compile(r"^/api/tasks/\d+/acceptance_criteria/[^/]+$"),
+        False,
+        "Upsert критерия идемпотентен по ac_id: повтор перезапишет тот же "
+        "критерий, а не добавит второй.",
+    ),
+    # СОЗНАТЕЛЬНО НЕ ВКЛЮЧЁН: PUT /api/tasks/{id}/acceptance_criteria —
+    # замена всего набора. По смыслу PUT повтор тем же телом даёт то же
+    # состояние, но об сервер это здесь не замерено, а строка таблицы — это
+    # совет «повторяй смело». Непроверенное утверждение такого рода стоит
+    # второй записи, поэтому маршрут остаётся в безопасном умолчании
+    # (retry_safe=false): лишняя проверка состояния дешевле.
+)
+
+
+def _write_is_idempotent(
+    method: str, path: str, *, idempotency_key: str = ""
+) -> tuple[bool, str]:
+    """Идемпотентна ли ЭТА запись по контракту → (да/нет, чем держится).
+
+    Незнакомый маршрут возвращает False: умолчание обязано падать в сторону
+    «повторять нельзя». Ошибиться в эту сторону стоит одного лишнего чтения,
+    в противоположную — второй записи.
+    """
+    for verb, pattern, needs_key, why in _IDEMPOTENT_WRITES:
+        if verb == method and pattern.match(path):
+            if needs_key and not idempotency_key:
+                return False, ""
+            return True, why
+    return False, ""
+
+
+def _write_state_check(path: str) -> tuple[str | None, str]:
+    """Маршрут записи → (читающий инструмент | None, что делать словами).
+
+    None здесь — не пропуск и не заглушка, а утверждение: общей проверки для
+    этого маршрута не существует. Вызывающему это сказано текстом, а не
+    отсутствием поля.
+    """
+    for pattern, tool, advice in _TRANSPORT_WRITE_CHECKS:
+        match = pattern.match(path)
+        if match:
+            return tool, advice.format(**match.groupdict())
+    return None, _TRANSPORT_NO_CHECK
+
+
+def _parse_transport_error(
+    exc: Exception,
+    *,
+    timeout: float,
+    write: bool,
+    method: str,
+    path: str,
+    idempotency_key: str = "",
+) -> dict[str, Any]:
+    """Транспортный отказ → тот же payload, что и HTTP-статус (#1250).
+
+    У httpx на молчащий сервер приходит ReadTimeout, и str() у него ПУСТОЙ —
+    замерено 10.09.2026. FastMCP печатает ровно str(exc), поэтому вызывающий
+    видел «Error executing tool X:» и больше ничего: ни причины, ни срока, ни
+    даже слова «таймаут». Ловится не TimeoutException, а RequestError целиком:
+    отвергнутое соединение, оборванный ответ и неудачное разрешение имени —
+    для вызывающего тот же класс отказа.
+
+    Чтение и запись расходятся текстом намеренно. Правило хаба гласит, что
+    ошибка транспорта не означает «запись не прошла»; выполнить его можно,
+    только зная, что случился транспорт и что повтор записи небезопасен.
+
+    Куда идти проверять — берётся из маршрута (_write_state_check), а не
+    ставится одно и то же на все записи: первая редакция отправляла с
+    /api/projects и /api/messages в hub_task_status, которому нужен id задачи.
+    Там, где читающего инструмента нет, поле остаётся пустым, а текст это
+    проговаривает.
+
+    retry_safe тоже НЕ выводится из одного HTTP-метода (#1250, первая находка
+    ревью): часть записей идемпотентна по контракту, и на них «не повторяй»
+    ведёт мимо — см. _write_is_idempotent. Умолчание при этом остаётся
+    безопасным: маршрут, о котором таблица ничего не знает, объявляется
+    неповторяемым.
+
+    Сообщение идёт через _strip_internal_urls, как и ошибки статуса: у
+    ReadTimeout внутренний адрес лежит в exc.request.url, и часть транспортных
+    исключений вписывает его прямо в текст.
+    """
     import httpx
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.get(f"{_hub_url()}{path}", headers=_auth_headers())
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json()
+    kind = type(exc).__name__
+    timed_out = isinstance(exc, httpx.TimeoutException)
+    reason = "transport_timeout" if timed_out else "transport_error"
+    what = "не дождался ответа хаба" if timed_out else "не смог поговорить с хабом"
+    detail = _strip_internal_urls(str(exc))
+    tail = f" Транспорт сказал: {detail}." if detail else ""
+    idempotent = not write
+    if write:
+        suggested_tool, advice = _write_state_check(path)
+        idempotent, why = _write_is_idempotent(
+            method, path, idempotency_key=idempotency_key
+        )
+        if idempotent:
+            # Повтор здесь и есть правильное действие: указатель на чтение
+            # состояния остаётся полезным, но перестаёт быть обязательным.
+            retry = f"{_TRANSPORT_IDEMPOTENT_RETRY} {why}"
+        else:
+            retry = f"{_TRANSPORT_WRITE_RETRY} {advice}"
+    else:
+        suggested_tool, retry = None, _TRANSPORT_READ_RETRY
+    message = _strip_internal_urls(
+        f"{method} {path} {what}: {kind}, срок ожидания {timeout:g} с.{tail} {retry}"
+    )
+    return enrich_error_payload(
+        {
+            "reason": reason,
+            "message": message,
+            "hint": retry,
+            "actor_hint": "agent",
+            "suggested_tool": suggested_tool,
+            "transport": kind,
+            "timeout_seconds": timeout,
+            "retry_safe": idempotent,
+            "idempotent": idempotent,
+            "write": write,
+        }
+    )
+
+
+async def _api_get(path: str, *, timeout: float | None = None) -> Any:
+    import httpx
+
+    deadline = _TIMEOUT_DEFAULT if timeout is None else timeout
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.get(f"{_hub_url()}{path}", headers=_auth_headers())
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json()
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=False, method="GET", path=path
+            )
+        ) from exc
 
 
 async def _api_post(
@@ -266,64 +555,110 @@ async def _api_post(
     headers = _auth_headers()
     if extra_headers:
         headers.update(extra_headers)
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{_hub_url()}{path}", json=body or {}, headers=headers
-        )
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json()
+    # Ключ идемпотентности — свойство ВЫЗОВА, не маршрута: без него повтор
+    # POST /api/tasks заводит вторую задачу. Берётся из обоих мест, куда его
+    # кладёт hub_create_task, чтобы совет о повторе не зависел от того, каким
+    # из двух способов вызывающий его передал (#1250).
+    idem_key = str(
+        (body or {}).get("client_request_id")
+        or headers.get("X-Client-Request-Id")
+        or ""
+    ).strip()
+    deadline = _TIMEOUT_SLOW
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.post(
+                f"{_hub_url()}{path}", json=body or {}, headers=headers
+            )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json()
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc,
+                timeout=deadline,
+                write=True,
+                method="POST",
+                path=path,
+                idempotency_key=idem_key,
+            )
+        ) from exc
 
 
 async def _api_patch(path: str, body: dict[str, Any] | None = None) -> Any:
     import httpx
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.patch(
-            f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
-        )
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json()
+    deadline = _TIMEOUT_DEFAULT
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.patch(
+                f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
+            )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json()
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=True, method="PATCH", path=path
+            )
+        ) from exc
 
 
 async def _api_put(path: str, body: Any) -> Any:
     """PUT for collection-level replace (e.g. acceptance criteria)."""
     import httpx
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.put(
-            f"{_hub_url()}{path}", json=body, headers=_auth_headers()
-        )
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json()
+    deadline = _TIMEOUT_DEFAULT
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.put(
+                f"{_hub_url()}{path}", json=body, headers=_auth_headers()
+            )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json()
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=True, method="PUT", path=path
+            )
+        ) from exc
 
 
 async def _api_delete(path: str) -> None:
     """DELETE returning 204 / no body."""
     import httpx
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.delete(f"{_hub_url()}{path}", headers=_auth_headers())
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
+    deadline = _TIMEOUT_DEFAULT
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.delete(f"{_hub_url()}{path}", headers=_auth_headers())
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=True, method="DELETE", path=path
+            )
+        ) from exc
 
 
 async def _api_delete_json(path: str) -> Any:
@@ -332,15 +667,23 @@ async def _api_delete_json(path: str) -> Any:
     difference between "removed" and "was not there"."""
     import httpx
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.delete(f"{_hub_url()}{path}", headers=_auth_headers())
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json()
+    deadline = _TIMEOUT_DEFAULT
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.delete(f"{_hub_url()}{path}", headers=_auth_headers())
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json()
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=True, method="DELETE", path=path
+            )
+        ) from exc
 
 
 async def _api_post_with_status(
@@ -349,34 +692,55 @@ async def _api_post_with_status(
     """POST that also returns the HTTP status (e.g. 201 created vs 200 existing)."""
     import httpx
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
-        )
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json(), resp.status_code
+    deadline = _TIMEOUT_SLOW
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.post(
+                f"{_hub_url()}{path}", json=body or {}, headers=_auth_headers()
+            )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json(), resp.status_code
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=True, method="POST", path=path
+            )
+        ) from exc
 
 
 async def _api_put_with_status(path: str, body: Any) -> tuple[Any, int]:
-    """PUT that also returns the HTTP status (201 created vs 200 updated)."""
+    """PUT that also returns the HTTP status (201 created vs 200 updated).
+
+    Восьмой помощник: постановка #1250 перечисляла семь, но в develop их уже
+    восемь, и этот тоже пишет. Ветка добавлена и ему — иначе правило «каждое
+    место применения» закрыто на бумаге, а не в коде.
+    """
     import httpx
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.put(
-            f"{_hub_url()}{path}", json=body, headers=_auth_headers()
-        )
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HubApiError(
-                _parse_api_error(exc.response, exc.response.status_code)
-            ) from exc
-        return resp.json(), resp.status_code
+    deadline = _TIMEOUT_DEFAULT
+    try:
+        async with httpx.AsyncClient(timeout=deadline) as client:
+            resp = await client.put(
+                f"{_hub_url()}{path}", json=body, headers=_auth_headers()
+            )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise HubApiError(
+                    _parse_api_error(exc.response, exc.response.status_code)
+                ) from exc
+            return resp.json(), resp.status_code
+    except httpx.RequestError as exc:
+        raise HubApiError(
+            _parse_transport_error(
+                exc, timeout=deadline, write=True, method="PUT", path=path
+            )
+        ) from exc
 
 
 def _finding_line(finding: dict[str, Any]) -> str:
@@ -612,10 +976,10 @@ async def hub_list_tasks(
     human_reviewer: str = "",
     claimed_by: str = "",
     mine: str = "",
-    limit: int = 20,
+    limit: Annotated[int, Field(le=200)] = 20,
     include_archived: bool = False,
-    after_id: int | None = None,
-    mode: str = "full",
+    after_id: Annotated[int | None, Field(ge=0)] = None,
+    mode: Literal["full", "summary"] = "full",
     project: str = "",
 ) -> CallToolResult:
     """List tasks with optional filters.
@@ -635,7 +999,7 @@ async def hub_list_tasks(
         human_reviewer: Exact match on human_reviewer.
         claimed_by: Exact match on the claim holder.
         mine: Shorthand for human_owner OR claimed_by (same person).
-        limit: Max number of tasks to return.
+        limit: Max tasks to return (≤200).
         include_archived: Include archived tasks, hidden from boards by default.
     """
     from urllib.parse import urlencode
@@ -680,6 +1044,23 @@ async def hub_list_tasks(
         return structured_echo_result("No tasks found.", tasks=[])
     lines = [_format_task(t) for t in result]
     return structured_echo_result("\n".join(lines), tasks=result)
+
+
+def _drop_generated_titles(tool_name: str, fields: tuple[str, ...]) -> None:
+    """Pay for published bounds with titles the caller does not need (#1229)."""
+    tool = mcp._tool_manager.get_tool(tool_name)
+    if tool is None:
+        return
+    parameters = tool.parameters
+    parameters.pop("title", None)
+    properties = parameters.get("properties", {})
+    for name in fields:
+        schema = properties.get(name)
+        if isinstance(schema, dict):
+            schema.pop("title", None)
+
+
+_drop_generated_titles("hub_list_tasks", ("limit", "after_id", "mode"))
 
 
 def _dependency_lines(task: dict[str, Any]) -> list[str]:
@@ -905,7 +1286,11 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
 
 @mcp.tool()
 async def hub_task_update(
-    task_id: int, content: str, agent: str = "", kind: str = "status"
+    task_id: int,
+    content: str,
+    agent: str = "",
+    kind: str = "status",
+    finding_outcomes: list[dict[str, Any]] | None = None,
 ) -> str:
     """Add a status update or report to a task.
 
@@ -914,8 +1299,8 @@ async def hub_task_update(
         content: Update text — status report, blocker description, or completion report
         agent: Name of the agent posting the update
         kind: Type of update: 'status', 'report', 'blocker', 'done', 'review', or 'arbitration'.
-            Prefer hub_report_done for completion (kind='done' is a deprecated alias with
-            the same validator and response envelope).
+            Prefer hub_report_done for completion (deprecated alias, same validator).
+        finding_outcomes: same as hub_report_done (#1155).
     """
     prior_status: str | None = None
     try:
@@ -924,14 +1309,22 @@ async def hub_task_update(
     except HubApiError:
         prior_task = None
     try:
-        result = await _api_post(
-            f"/api/tasks/{task_id}/updates",
-            {
-                "agent": agent,
-                "kind": kind,
-                "content": content,
-            },
-        )
+        payload: dict[str, Any] = {
+            "agent": agent,
+            "kind": kind,
+            "content": content,
+        }
+        if finding_outcomes:
+            # #1155: депрекированный вход не имеет права терять ответ автора.
+            # Параметр объявлен ИМЕННО поэтому: транспорт MCP валидирует
+            # аргументы по схеме инструмента и молча выбрасывает всё, чего в
+            # схеме нет, — воспроизведено зондом через mcp.call_tool. Пока
+            # поля не было, исходы находок уезжали в никуда, а автор получал
+            # успех. Дальше поле проверяет тот же серверный валидатор, что и
+            # у канонического инструмента: при kind != 'done' будет 422, а не
+            # тишина.
+            payload["finding_outcomes"] = finding_outcomes
+        result = await _api_post(f"/api/tasks/{task_id}/updates", payload)
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
         return _format_hub_api_error(exc)
@@ -1054,20 +1447,25 @@ async def _task_mutation_response(
 
 
 @mcp.tool()
-async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
+async def hub_report_done(
+    task_id: int,
+    summary: str,
+    agent: str = "",
+    finding_outcomes: list[dict[str, Any]] | None = None,
+) -> str:
     """Submit a done report and return the task's actual status after lifecycle handling.
 
     AUTHOR step. Universal Review Gate (#306): this completes the task only
     when the current submission already carries an APPROVED review by another
     actor (or auto_review=false opted out). Otherwise it IS a submission — the
     task routes to ``review`` or ``ci_check`` and the response names the next
-    action. The response always states the real status and never implies
-    ``completed`` unless the task is.
+    action.
 
     Args:
         task_id: The task ID to report on
         summary: What was changed and how it was validated
         agent: Name of the agent submitting the report
+        finding_outcomes: same as hub_submit_for_review (#1155).
     """
     prior_status: str | None = None
     try:
@@ -1076,14 +1474,14 @@ async def hub_report_done(task_id: int, summary: str, agent: str = "") -> str:
     except HubApiError:
         prior_status = None
     try:
-        result = await _api_post(
-            f"/api/tasks/{task_id}/updates",
-            {
-                "agent": agent,
-                "kind": "done",
-                "content": summary,
-            },
-        )
+        payload: dict[str, Any] = {
+            "agent": agent,
+            "kind": "done",
+            "content": summary,
+        }
+        if finding_outcomes:
+            payload["finding_outcomes"] = finding_outcomes
+        result = await _api_post(f"/api/tasks/{task_id}/updates", payload)
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
         return _format_hub_api_error(exc)
@@ -1732,6 +2130,31 @@ async def hub_submit_for_review(
     )
 
 
+def _review_circle_line(brief: dict[str, Any]) -> str:
+    """Строка про круг ревью, или пустая, когда заходов не было (#1235).
+
+    Ревьюер, читающий бриф, обязан знать, что предыдущий слой находок был
+    разобран и закрыт по-настоящему: без этого очередной отчёт читается
+    как первый, а именно так круг и остаётся невидимым.
+
+    Ноль заходов молчит намеренно — он стоял бы в брифе каждой первой
+    сдачи и стал бы фоном, который не читают.
+    """
+    circle = brief.get("review_circle") or {}
+    laps = int(circle.get("laps") or 0)
+    if not laps:
+        return ""
+    line = f"Круг ревью: заходов {laps} — " + "; ".join(circle.get("breakdown") or [])
+    repeated = circle.get("repeated_categories") or []
+    if repeated:
+        line += (
+            ". Повтор категории: "
+            + ", ".join(repeated)
+            + " — харнесс ходит по одному месту, и это важнее числа заходов"
+        )
+    return line
+
+
 @mcp.tool()
 async def hub_get_review_brief(task_id: int) -> CallToolResult:
     """REVIEWER step: everything needed to review someone else's work (#308).
@@ -1768,6 +2191,9 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
             f"| review cycle {brief.get('review_cycle', 0)}",
         ]
     )
+    circle_line = _review_circle_line(brief)
+    if circle_line:
+        parts.append(circle_line)
     if brief.get("description"):
         parts.append(f"\nDescription:\n{brief['description']}")
     acs = brief.get("acceptance_criteria") or []
@@ -3745,6 +4171,13 @@ PREPARE_HIDDEN: tuple[Hidden, ...] = (
     Hidden("caused_by_task_id", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("detected_at", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("clear_caused_by", "флаг очистки паспорта дефекта, а не поле"),
+    Hidden("live_probe", "объявление живого зонда (#1236) правят через refine"),
+    # #1236 заплатил этими двумя за новый параметр постановки: схема каталога
+    # стояла в пяти символах от потолка, а потолок двигается только вниз.
+    # Оба — БУХГАЛТЕРИЯ, а не постановка (refinement.BOOKKEEPING_FIELDS): они
+    # не меняют того, что задача утверждает, и ставятся через refine.
+    Hidden("human_owner", "бухгалтерия, а не постановка: ставится через refine"),
+    Hidden("human_reviewer", "бухгалтерия, а не постановка: ставится через refine"),
 )
 
 
@@ -4034,12 +4467,10 @@ async def hub_refine_task(
         class_of_service: standard | expedite | fixed_date | intangible
         size: XS | S | M | L | XL
         wip_tag: feature_work | bugfix | tech_debt | support
-        due_date: ISO date (YYYY-MM-DD), for fixed_date COS.
+        due_date: ISO date, for fixed_date COS.
         user_story: "As a <role>, I want <X> so that <Y>".
         problem_statement: What's broken and why.
-        business_value: Why it matters.
-        outcome_metric: Which number moves, from what to what (lead time
-            3d -> 1d). Makes business_value checkable.
+        outcome_metric: Which number moves, from what to what (3d -> 1d).
         outcome_indicator: Leading signal, before the metric moves.
         outcome_deadline: When the outcome is checked.
         outcome_revisit_condition: What reopens this decision.
@@ -4048,14 +4479,13 @@ async def hub_refine_task(
         agent_fit: deterministic | assistant | sdd_native | agentic.
         found_in: Defect stage: unknown | review | ci | test | staging | prod.
         caused_by_task_id: Task that introduced the defect.
-        detected_at: When it was noticed.
         technical_hints: Hints, references, approach.
         scope_in: In scope.
         scope_out: Out of scope.
         constraints: Hard limits.
-        assumptions: Assumed to hold.
         affected_areas: Modules/paths impacted.
         validation_commands: Commands proving it works.
+        live_probe: Read-only probe the hub runs after delivery; a registry name.
         out_of_scope_for_review: What the reviewer ignores.
         review_checklist: What the reviewer verifies.
         human_owner: Who is accountable.

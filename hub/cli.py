@@ -419,21 +419,56 @@ def cmd_approve_batch(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Текст отказа на неразбираемых исходах — один на все команды, которые их
+#: принимают (#1155). Формулировка тоже одна: автор, увидевший разные слова на
+#: сдаче и на отчёте, ищет разницу в поведении, которой нет.
+FINDING_OUTCOMES_JSON_ERROR = "--finding-outcomes is not valid JSON"
+
+
+def _put_finding_outcomes(body: dict[str, Any], args: argparse.Namespace) -> bool:
+    """Положить исходы находок в тело запроса; False — отказ уже напечатан.
+
+    Отказ, а не тихая отправка без них: сдача, молча потерявшая исходы,
+    выглядит как автор, который не ответил, — та самая тишина, ради которой
+    поле и заведено (#911).
+
+    Общая на submit-review и update, потому что это ОДНО поле одного контракта:
+    два разбора разошлись бы ровно так, как расходятся поверхности (#819).
+    """
+    raw = getattr(args, "finding_outcomes", "") or ""
+    if not raw.strip():
+        return True
+    try:
+        body["finding_outcomes"] = json.loads(raw)
+    except ValueError as exc:
+        print(f"{FINDING_OUTCOMES_JSON_ERROR}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def _finding_outcomes_option(parser: argparse.ArgumentParser) -> None:
+    """Один и тот же ключ у сдачи и у отчёта о готовности (#911, #1155)."""
+    parser.add_argument(
+        "--finding-outcomes",
+        default="",
+        help=(
+            "JSON list of what became of the previous submission's findings "
+            '(#911): [{"finding_uid": "...", "outcome": "...", "note": "..."}]'
+            ". Confirmed findings take fixed|false_positive|wont_fix|deferred;"
+            " ones no adjudicator resolved take real_fixed|real_deferred|"
+            "not_a_defect|not_judged (#1085). Everything but a fix owes a note."
+        ),
+    )
+
+
 def cmd_submit_review(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {}
     if args.agent:
         body["agent"] = args.agent
     if args.summary:
         body["summary"] = args.summary
-    raw_outcomes = getattr(args, "finding_outcomes", "") or ""
-    if raw_outcomes.strip():
-        try:
-            body["finding_outcomes"] = json.loads(raw_outcomes)
-        except ValueError as exc:
-            # Refusing here beats sending nothing: a submission that silently
-            # dropped the outcomes would look like an author who never answered.
-            print(f"--finding-outcomes is not valid JSON: {exc}", file=sys.stderr)
-            return 2
+    if not _put_finding_outcomes(body, args):
+        return 2
     result = _api("POST", f"/api/tasks/{args.task_id}/submit-review", body)
     _print_json(result)
     return 0
@@ -559,15 +594,17 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_update(args: argparse.Namespace) -> int:
-    result = _api(
-        "POST",
-        f"/api/tasks/{args.task_id}/updates",
-        {
-            "agent": args.agent or "",
-            "kind": args.kind,
-            "content": args.message,
-        },
-    )
+    body: dict[str, Any] = {
+        "agent": args.agent or "",
+        "kind": args.kind,
+        "content": args.message,
+    }
+    # #1155: отказ ДО запроса. Отправить отчёт без исходов и вернуть 0 значило
+    # бы записать в ленту готовность, потеряв ответ про находки, — и автор
+    # узнал бы об этом только от гейта на следующей сдаче.
+    if not _put_finding_outcomes(body, args):
+        return 2
+    result = _api("POST", f"/api/tasks/{args.task_id}/updates", body)
     _print_json(result)
     return 0
 
@@ -1558,17 +1595,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_submit_review.add_argument(
         "--summary", default="", help="Short note on what is being submitted"
     )
-    p_submit_review.add_argument(
-        "--finding-outcomes",
-        default="",
-        help=(
-            "JSON list of what became of the previous submission's findings "
-            '(#911): [{"finding_uid": "...", "outcome": "...", "note": "..."}]'
-            ". Confirmed findings take fixed|false_positive|wont_fix|deferred;"
-            " ones no adjudicator resolved take real_fixed|real_deferred|"
-            "not_a_defect|not_judged (#1085). Everything but a fix owes a note."
-        ),
-    )
+    _finding_outcomes_option(p_submit_review)
     p_submit_review.set_defaults(func=cmd_submit_review)
 
     p_review_brief = sub.add_parser(
@@ -1735,6 +1762,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["status", "report", "blocker", "done", "review", "arbitration"],
         help="Update type",
     )
+    _finding_outcomes_option(p_update)
     p_update.set_defaults(func=cmd_update)
 
     # updates — list updates

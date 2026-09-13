@@ -40,6 +40,7 @@ from hub.models import (
     LiveCheckState,
     MachineReviewView,
     ReviewBrief,
+    ReviewCircleView,
     SelfReviewWarning,
     TaskProjectRef,
 )
@@ -387,7 +388,12 @@ async def build_review_brief(
     # answer the evidence itself defaults to, so brief and record agree.
     delivered_sha = await repo.merge_sha_for_task(db, task_id)
     live_check = await review_evidence.live_check_state(
-        db, task_id, delivered_sha=delivered_sha
+        db,
+        task_id,
+        delivered_sha=delivered_sha,
+        # #1236: что задача ОБЪЯВИЛА наблюдать. Без этого «зонд объявлен и ещё
+        # не снят» неотличимо от «наблюдать никто не собирался».
+        declared_probe=str(dict(task_row).get("live_probe") or ""),
     )
 
     # #725: one verdict over every evidence block, in the same place the green
@@ -421,7 +427,21 @@ async def build_review_brief(
         if str(u["content"]).startswith(commit_scope.SCOPE_GROWTH_MARKER)
     ]
 
+    # #1235: круг ревью читается тем же способом, каким его считает сигнал в
+    # карточке, — одной функцией. Второе выражение того же счёта здесь и
+    # означало бы, что бриф и карточка расходятся в числе.
+    from hub.services.review_dispatch import review_circle
+
+    circle = await review_circle(db, int(task_row["id"]))
+
     return ReviewBrief(
+        review_circle=ReviewCircleView(
+            laps=circle.count,
+            threshold=circle.threshold,
+            named=circle.named,
+            breakdown=circle.breakdown(),
+            repeated_categories=list(circle.repeated_categories),
+        ),
         review_report=brief_review_report,
         task_id=task_view.id,
         title=task_view.title,

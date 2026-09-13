@@ -38,6 +38,11 @@ from hub.services.live_check import (
     live_check_view,
     record_live_check,
 )
+from hub.services.live_probe import (
+    PROBES,
+    run_declared_probe,
+    validate_declared_probe,
+)
 from hub.services.messaging import (
     MESSAGE_EVENT_KIND,
     addressable_refs,
@@ -156,6 +161,7 @@ from hub.services.orchestration import (
     merge_before_completion,
     stacking_gate_step,
     request_missing_ci_run,
+    PRACTICE_METRICS_DEFAULT_DAYS,
     practice_metrics,
     prepare_pair_branch,
     project_git_context,
@@ -225,6 +231,9 @@ __all__ = [
     "pair_executor_online",
     "readiness_tree",
     "record_live_check",
+    "PROBES",
+    "run_declared_probe",
+    "validate_declared_probe",
     "refine_task",
     "refine_tasks_bulk",
     "register_session",
@@ -288,6 +297,7 @@ __all__ = [
     "restore_pair_workspace_base",
     "answer_outcome",
     "outcome_debt",
+    "PRACTICE_METRICS_DEFAULT_DAYS",
     "practice_metrics",
     "scan_completed_deliveries",
     "task_delivery",

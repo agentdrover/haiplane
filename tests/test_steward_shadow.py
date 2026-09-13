@@ -1695,3 +1695,138 @@ async def test_a_recovery_that_recovers_nothing_does_not_hold_the_write_lock(
     row = dict(rows[0])
     assert row["status"] == RUN_SUPERSEDED, "закрытый заказ остался закрытым"
     assert row["agent_id"].startswith(sh.PENDING_PREFIX), "метку никто не трогал"
+
+
+# --------------------------------------------------------------------------
+# Судья выбирается из имён, чей ЗАПУСК наблюдали (#1237)
+# --------------------------------------------------------------------------
+#
+# Значения hub/config.py, снятые ПРИ ИМПОРТЕ модуля — до того, как autouse-
+# фикстура shadow_mode подменит STEWARD_MODEL своим. Тест про конфигурацию
+# обязан читать конфигурацию, а не то, что подставили себе тесты: иначе
+# подмену имени судьи он проспит, потому что смотрит на свою же подмену.
+_JUDGE_LIST_AS_SHIPPED: tuple[str, ...] = (config.STEWARD_MODEL,) + tuple(
+    config.STEWARD_MODEL_FALLBACKS
+)
+
+
+def test_the_judge_list_holds_only_launchable_models():
+    """AC-2: у судьи стоят только имена, чей ЗАПУСК наблюдали попыткой создания.
+
+    Проверка конфигурации, а не поведения: подбор замен построен в #1182 и
+    покрыт выше, а разошлось содержимое списка — и разошлось потому, что
+    имя туда пускали по каталогу list_models. Каталог отвечает на вопрос
+    «имя существует», а нужен ответ на «имя запускается»; двенадцать недель
+    разницы между этими вопросами никого не уронили.
+
+    ЧТО ЗДЕСЬ НЕ ПРОВЕРЯЕТСЯ И ПОЧЕМУ. Раньше на этом месте стоял чёрный
+    список из gpt-5.3-codex, gemini-3.1-pro и claude-sonnet-5 — со ссылкой
+    на #1036, где их назвали гарантированным отказом. Живая попытка
+    создания 09.09.2026 (#1237) создала все три; список снят как
+    опровергнутый замером, а не как неудобный. Остаётся то, что замер
+    подтверждает: имя у судьи — только из наблюдённых.
+    """
+    from hub.services.review_dispatch import _REVIEW_MODEL_PREFERENCES
+
+    launchable = set(config.SUBSCRIPTION_LAUNCHABLE_MODELS)
+    assert launchable, "список наблюдённых имён пуст — судьи не будет вовсе"
+
+    outside = [m for m in _JUDGE_LIST_AS_SHIPPED if m not in launchable]
+    assert not outside, (
+        "судья и его запасные берутся только из имён, чей запуск наблюдали "
+        f"попыткой создания: {outside} вне SUBSCRIPTION_LAUNCHABLE_MODELS "
+        f"({sorted(launchable)})"
+    )
+
+    # Тот же признак для второго потребителя. НЕ равенство: список ревьюера
+    # сужен решением владельца (#1036), и сужение остаётся — замер показал
+    # лишь, что оно не вынуждено провайдером. Требуется другое: чтобы имя,
+    # которое ревьюеру назначают, тоже было наблюдено запуском, а не взято
+    # из каталога. Ровно на этой подмене разошлись два списка.
+    unverified = sorted(set(_REVIEW_MODEL_PREFERENCES) - launchable)
+    assert not unverified, (
+        f"{unverified} у ревьюера не наблюдалось попыткой создания: имя "
+        "попадает в любой из двух списков только после наблюдённого запуска"
+    )
+
+
+async def test_no_launchable_judge_is_named_not_silent(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """AC-3: «запустить некого» названо событием и карточкой, а не молчит.
+
+    Берётся ровно сегодняшняя конфигурация, не выдуманная: основной судья и
+    его запасные из hub/config.py, обычная сдача (исполнитель claude,
+    ревьюер grok-4.6). Провайдер отказывает по недоступности, замены из
+    семейства ревьюера гейт не пускает — и прогон не начинается.
+
+    До #1237 оба исхода — «бета моргнула» и «эта подписка не запускает ни
+    одного судью» — уходили одной строкой run_failed «Cloud Agents API не
+    принял запрос», без единого имени и без ответа провайдера. Ответ при
+    этом был на руках: create_agent_attempt возвращает его вторым значением.
+    Поэтому девяносто дней нулевых суждений не оставили в хабе ни одной
+    записи о причине.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODEL", _JUDGE_LIST_AS_SHIPPED[0])
+    monkeypatch.setattr(
+        config, "STEWARD_MODEL_FALLBACKS", tuple(_JUDGE_LIST_AS_SHIPPED[1:])
+    )
+    project_id = await _project(db, "shadow-no-judge")
+    task_id = await _task(db, project_id)
+    await order_run(db, task_id, 1)
+
+    attempts: list[str] = []
+
+    async def _attempt(**kwargs):
+        attempts.append(kwargs["model_id"])
+        assert len(attempts) <= 8, f"перебор не кончается: {attempts}"
+        return None, _CAPACITY
+
+    with patch("hub.integrations.cursor_cloud.create_agent_attempt", new=_attempt):
+        assert await start_due_runs(db) == 0
+        first_tick = len(attempts)
+        # Второй тик: заказ остался открытым, и он придёт снова — раз в
+        # полминуты всё окно старта.
+        await start_due_runs(db)
+
+    assert len(attempts) > first_tick, (
+        "второй тик обязан состояться, иначе проверка «запись одна» ничего не "
+        f"проверяет: {attempts}"
+    )
+    assert first_tick and attempts[0] == config.STEWARD_MODEL, (
+        f"основной судья пробуется первым: {attempts}"
+    )
+
+    refused = await _events(db, "steward_run_refused")
+    assert refused, "отказ без события — это и есть тишина"
+    payload = json.loads(refused[-1]["payload"])
+    assert payload["reason"] == sh.REFUSED_NO_LAUNCHABLE_JUDGE, (
+        "«список кончился» и «провайдер моргнул» — разные исходы: первый сам "
+        f"собой не пройдёт. Получено: {payload}"
+    )
+    detail = payload["detail"]
+    assert attempts[0] in detail, f"в причине названы имена, а не «модель»: {detail}"
+    assert "usage_limit_exceeded" in detail and "400" in detail, (
+        f"ответ провайдера — то единственное, что отвечает на вопрос «какие "
+        f"имена подписка разрешает сегодня»: {detail}"
+    )
+
+    run = (await _runs(db, task_id))[0]
+    assert run["status"] == RUN_OPEN and run["agent_id"] == "", (
+        "лимит провайдера — состояние временное: слот не закрывается"
+    )
+
+    said = [
+        dict(u)["content"]
+        for u in await fetchall(
+            db, "SELECT content FROM task_updates WHERE task_id=?", (task_id,)
+        )
+    ]
+    named = [c for c in said if "Судья стюарда не выбран" in c]
+    assert len(named) == 1, (
+        "человек, которому доводить эту сдачу, видит причину в карточке — и "
+        f"ровно один раз за заказ, а не по записи на тик: {said}"
+    )
+    assert "usage_limit_exceeded" in named[0], (
+        f"карточка называет ответ провайдера, а не «что-то пошло не так»: {named}"
+    )

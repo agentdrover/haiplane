@@ -789,10 +789,11 @@ class LiveCheckState(BaseModel):
     """Did anyone watch this behave in production, and on which build (#814).
 
     ``state`` is ``done`` (someone ran it and said what they saw),
-    ``not_applicable`` (there is nothing to observe, with a reason) or
-    ``unknown`` — nobody looked. Unknown is the default and always carries a
-    cause: an absent block would read as "the question was not asked", and it
-    is asked of every task.
+    ``not_applicable`` (there is nothing to observe, with a reason),
+    ``failed`` (#1236: a declared probe ran and brought back no answer — a fact
+    about the attempt, not about the behaviour) or ``unknown`` — nobody looked.
+    Unknown is the default and always carries a cause: an absent block would
+    read as "the question was not asked", and it is asked of every task.
 
     ``sha_mismatch`` names the case the card must not hide: the observation
     exists but was taken against another build than the one delivered.
@@ -800,6 +801,8 @@ class LiveCheckState(BaseModel):
 
     state: str = "unknown"
     reason: str = "живая проверка не записывалась"
+    # #1236: имя зонда, объявленного постановкой. Пусто — не объявлен.
+    declared_probe: str = ""
     probe: str = ""
     observation: str = ""
     sha: str = ""
@@ -926,6 +929,29 @@ class ReviewReport(BaseModel):
     machine_review: "MachineReviewView | None" = None
 
 
+class ReviewCircleView(BaseModel):
+    """Заходы «закрыли находки — пришли новые», подряд (#1235).
+
+    Отдельно от ``review_cycle``, и это не дублирование. ``review_cycle``
+    считает ВОЗВРАТЫ работы автору и стоит под потолком, который задачу
+    останавливает; здесь считаются ПОКОЛЕНИЯ, в которых автор закрыл
+    находки и получил новый слой, и не останавливается ничего. На #1171
+    09.09.2026 review_cycle оставался нулём при третьем заходе — то есть
+    одно число другим не выводится.
+    """
+
+    laps: int = 0
+    threshold: int = 0
+    #: Пора ли звать человека. Считает хаб, а не читатель: сравнение
+    #: счётчика с порогом живёт в одном месте (ReviewCircle.named).
+    named: bool = False
+    #: По строке на заход: «закрыто / пришло новых».
+    breakdown: list[str] = Field(default_factory=list)
+    #: Категории, повторённые за предыдущим заходом. Отдельно от числа
+    #: заходов, потому что признак другой и важнее.
+    repeated_categories: list[str] = Field(default_factory=list)
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 
@@ -992,6 +1018,11 @@ class ReviewBrief(BaseModel):
     # #725: one verdict over all evidence blocks below.
     evidence_coverage: EvidenceCoverage = Field(default_factory=EvidenceCoverage)
     review_cycle: int = 0
+    # #1235: сколько заходов «закрыли находки — пришли новые» задача уже
+    # сделала. Ревьюер, читающий бриф, обязан видеть, что предыдущий слой
+    # был разобран и закрыт по-настоящему, — иначе очередной отчёт читается
+    # как первый.
+    review_circle: ReviewCircleView = Field(default_factory=ReviewCircleView)
     submission_generation: int = 0
     # #572: what code the submission pinned, where the branch stands now, and
     # whether they agree. sha_check is "match" | "diverged" | "unknown" —
@@ -1223,6 +1254,30 @@ class TaskUpdateCreate(BaseModel):
     agent: str = Field("", max_length=100)
     kind: str = Field("status", max_length=50)
     content: str = Field(..., min_length=1, max_length=10000)
+    # #1155: what became of the findings this work was sent back over. The
+    # SAME item type as ``TaskSubmitReview.finding_outcomes`` — the answer is
+    # the same answer, only the door differs — so the semantics, the four
+    # words per section and the note requirement stay in one place.
+    # Optional by construction: a done report without outcomes behaves exactly
+    # as it did before, and the done report is the most-called tool there is.
+    finding_outcomes: list[FindingOutcomeItem] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _only_a_done_report_answers_findings(self) -> "TaskUpdateCreate":
+        """Исходы приезжают ТОЛЬКО с отчётом о готовности.
+
+        На любом другом виде записи их некуда деть: сдачи нет, поколения,
+        которому они отвечают, тоже нет. Принять и промолчать значило бы
+        потерять ответ автора — ровно та тишина, ради которой #911 и заведён,
+        только теперь оплаченная его собственной попыткой ответить.
+        """
+        if self.finding_outcomes and self.kind != "done":
+            raise ValueError(
+                f"finding_outcomes принимается только при kind='done', а не "
+                f"'{self.kind}': исход находки — часть отчёта о сдаче, и на "
+                "обычной записи ему не к чему относиться"
+            )
+        return self
 
 
 class TaskReorder(BaseModel):
@@ -1345,6 +1400,12 @@ class TaskRefine(BaseModel):
     validation_commands: list[str] | None = Field(default=None, max_length=10)
     out_of_scope_for_review: list[str] | None = Field(default=None, max_length=10)
     review_checklist: list[str] | None = Field(default=None, max_length=10)
+    # #1236: ИМЯ читающей пробы из закрытого реестра (hub/services/live_probe.py),
+    # которую хаб исполнит сам после доставки. Не команда и не строка вызова:
+    # проверяется на принадлежность реестру ДО записи, потому что поле, куда
+    # ложится текст из карточки, а исполняет его служба с ключами, — это не
+    # поле, а канал исполнения. "" очищает объявление.
+    live_probe: str | None = Field(default=None, max_length=64)
     risks: list[TaskRisk] | None = None
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     prepared_by: str | None = Field(default=None, max_length=100)
@@ -1717,6 +1778,14 @@ class TaskView(BaseModel):
     log_tail: list[str] | None = None
     updates: list[TaskUpdateView] | None = None
     review_cycle: int = 0
+    # #1235: заходы «закрыли находки — пришли новые» стоят в карточке
+    # ВСЕГДА, а не одним алертом на пороге. До порога карточка иначе
+    # выглядит так, будто круга нет вовсе, — а молчание читается как
+    # «чисто» (#516, #549), и человек узнаёт о круге ровно тогда, когда
+    # круг уже стал дорогим. Порог 0 гасит ЗОВ, а не счёт: выключатель,
+    # прячущий заодно и число, отнял бы единственный способ увидеть, что
+    # выключили не то.
+    review_circle: ReviewCircleView = Field(default_factory=ReviewCircleView)
     ci_fix_cycle: int = 0
     auto_review: bool = True
     review_job_id: str | None = None
@@ -1809,6 +1878,8 @@ class TaskView(BaseModel):
     validation_commands: list[str] = Field(default_factory=list)
     out_of_scope_for_review: list[str] = Field(default_factory=list)
     review_checklist: list[str] = Field(default_factory=list)
+    # #1236: имя объявленного живого зонда; "" — не объявлен.
+    live_probe: str = ""
     risks: list[TaskRisk] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     lifecycle_hint: str | None = None

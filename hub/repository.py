@@ -981,6 +981,74 @@ async def get_skill_version(
     return rows[0] if rows else None
 
 
+async def record_skill_publication(
+    db: aiosqlite.Connection,
+    name: str,
+    version: int,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Записать доказательства публикации ТУДА, ГДЕ У НИХ НЕТ СРОКА (#1253).
+
+    Парная к ``insert_event`` запись: событие уведомляет, эта — хранит.
+    Вызывающий обязан передать сюда ТОТ ЖЕ словарь, что ушёл в событие, — не
+    второй такой же, собранный рядом. Разойтись двум сборкам полезной
+    нагрузки ничто не мешает, а расхождение путей публикации и есть исходный
+    дефект #1169; сериализация здесь та же, что у ``insert_event``, поэтому
+    из одного словаря выходит и одна строка.
+
+    Коммита здесь нет намеренно, как и у ``insert_event``: вызывающий пишет
+    запись в той же транзакции, что и саму активацию, и откат обязан унести
+    обе. Записи о публикации версии, которой нет в реестре, не бывает —
+    ``UPDATE`` по несуществующей паре просто не тронет ни одной строки.
+    """
+    await db.execute(
+        "UPDATE skills SET publication_record=? WHERE name=? AND version=?",
+        (json.dumps(payload or {}, ensure_ascii=False), name, version),
+    )
+
+
+async def latest_skill_activation(
+    db: aiosqlite.Connection, name: str, version: int
+) -> dict[str, Any] | None:
+    """Записанные доказательства публикации ИМЕННО ЭТОЙ версии.
+
+    This is what makes paths 1 and 3 visible AFTER the fact (#1169). On path 1
+    the person is the author of the text, so a preview adds nothing — what was
+    missing is the record of what got published; on path 3 there is no person
+    at all. The page reads that record back rather than recomputing it, so what
+    a human sees is the thing that was actually written down, not a second
+    opinion computed later from rows that may since have moved.
+
+    Читается колонка строки версии, а НЕ лента событий (#1253). Лента —
+    канал уведомлений: поллер чистит её раз в две недели
+    (``_sweep_events_retention`` → ``prune_events``), и пока доказательства
+    лежали там, страница скилла через 14 дней молча возвращалась к «записи о
+    публикации нет» — тому самому состоянию, ради выхода из которого сделана
+    #1169. Событие по-прежнему пишется рядом, чтобы человек видел факт сразу.
+
+    Пустая колонка — это «записи нет вовсе», третье из трёх состояний, и оно
+    отличается от «запись есть, дифа в ней нет»: во втором колонка непуста, а
+    вот ключа ``diff`` в ней нет (так выглядит всё, что записано до #1169).
+    Различает их ``hub/web.py``, и различать он может только потому, что
+    здесь эти два случая не слиты в один ``None``.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT publication_record FROM skills WHERE name=? AND version=?",
+        (name, version),
+    )
+    if not rows:
+        return None
+    raw = str(rows[0]["publication_record"] or "")
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 async def activate_skill_version(
     db: aiosqlite.Connection, name: str, version: int, *, activated_by: str
 ) -> None:
@@ -1292,6 +1360,23 @@ async def list_finding_dispositions(
     )
 
 
+async def list_judged_findings(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    """Каждое ЗАПИСАННОЕ суждение о находке — материал перепроверки (#1171).
+
+    Ключ здесь uid, а не позиция: слепая перепроверка сравнивает суждение о
+    ТОМ ЖЕ дефекте, а позиция принадлежит списку отчёта, не находке (#1007).
+    Строки без uid — из времени до его появления — отдаются как есть; отбор
+    делает вызывающий, а тихо ронять их здесь значило бы уменьшать
+    знаменатель перепроверки на историю.
+    """
+    return await fetchall(
+        db,
+        "SELECT review_id, task_id, finding_index, finding_uid, finding_title, "
+        "disposition, decided_by, decided_at FROM finding_dispositions "
+        "ORDER BY id ASC",
+    )
+
+
 # --- The queue of unjudged findings (#1038) --------------------------------
 
 #: Where an unjudged finding LIVES, written once and shared by the list and the
@@ -1323,7 +1408,18 @@ _UNJUDGED_FINDINGS_FROM = (
 _UNJUDGED_PROJECT_CONDITION = " AND t." + PROJECT_SUBTREE_CONDITION
 
 
-def _unjudged_where(since: str | None, project_id: int | None) -> tuple[str, list[Any]]:
+#: Категория находки как ЗНАЧЕНИЕ, а не как поле: она лежит внутри JSON
+#: отчёта, и половина исторических находок её не называет. Написано один раз —
+#: по этому же выражению и группируют, и фильтруют, иначе счётчик над списком
+#: и сам список разойдутся первым же отчётом без категории (#518).
+UNJUDGED_CATEGORY_SQL = (
+    "COALESCE(NULLIF(json_extract(f.value, '$.category'), ''), 'без категории')"
+)
+
+
+def _unjudged_where(
+    since: str | None, project_id: int | None, category: str | None = None
+) -> tuple[str, list[Any]]:
     """The one place the queue's WHERE is assembled, for list and count alike."""
     where = _UNJUDGED_FINDINGS_FROM
     params: list[Any] = []
@@ -1333,6 +1429,9 @@ def _unjudged_where(since: str | None, project_id: int | None) -> tuple[str, lis
     if project_id is not None:
         where += _UNJUDGED_PROJECT_CONDITION
         params.append(project_id)
+    if category is not None:
+        where += f" AND {UNJUDGED_CATEGORY_SQL} = ?"
+        params.append(category)
     return where, params
 
 
@@ -1341,6 +1440,8 @@ async def list_unjudged_findings(
     *,
     since: str | None = None,
     project_id: int | None = None,
+    category: str | None = None,
+    newest_first: bool = False,
     limit: int | None = None,
 ) -> list[aiosqlite.Row]:
     """Confirmed findings of CURRENT reports that nobody has answered yet.
@@ -1355,19 +1456,55 @@ async def list_unjudged_findings(
     ``since`` takes the same relative form as the metrics window
     ('-90 days'); omitted, the whole history answers.
     """
-    where, params = _unjudged_where(since, project_id)
+    where, params = _unjudged_where(since, project_id, category)
+    # Свежие сверху, когда об этом просят (#1171). Разбор идёт категориями, а
+    # внутри категории свежая находка судится точнее старой: код ещё похож на
+    # тот, о котором писал ревьюер. Порядок по умолчанию не тронут — его читает
+    # страница, написанная до этого параметра.
+    order = "DESC" if newest_first else "ASC"
     sql = (
         "SELECT t.id AS task_id, t.title AS task_title, "  # nosec B608
         "t.status AS task_status, mr.id AS review_id, "
         "mr.submission_generation AS submission_generation, "
         "mr.created_at AS reported_at, mr.model AS model, "
+        f"{UNJUDGED_CATEGORY_SQL} AS category, "
         "f.key AS finding_index, f.value AS finding "
-        f"{where} ORDER BY mr.created_at ASC, mr.id ASC, f.key ASC"
+        f"{where} ORDER BY mr.created_at {order}, mr.id {order}, f.key ASC"
     )
     if limit is not None:
         sql += " LIMIT ?"
         params.append(limit)
     return await fetchall(db, sql, tuple(params))
+
+
+async def unjudged_findings_by_category(
+    db: aiosqlite.Connection,
+    *,
+    since: str | None = None,
+    project_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """Сколько находок ждёт в каждой категории, самые частые первыми (#1171).
+
+    Порядок разбора — предмет постановки, а не украшение: correctness даёт
+    больше находок, чем все прочие категории вместе, и его precision — первое
+    число, под которое имеет смысл писать детерминированную проверку. Один
+    длинный список вперемешку такого ответа не даёт.
+
+    Тот же ``FROM``, что у списка и счётчика, — по построению, а не по
+    аккуратности копирования.
+    """
+    where, params = _unjudged_where(since, project_id)
+    rows = await fetchall(
+        db,
+        f"SELECT {UNJUDGED_CATEGORY_SQL} AS category, "  # nosec B608
+        f"COUNT(*) AS findings {where} "
+        "GROUP BY category ORDER BY findings DESC, category ASC",
+        tuple(params),
+    )
+    return [
+        {"category": str(dict(r)["category"]), "findings": int(dict(r)["findings"])}
+        for r in rows
+    ]
 
 
 async def count_unjudged_findings(
@@ -1649,6 +1786,24 @@ async def insert_event(
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
+
+
+async def event_raised_since(db: aiosqlite.Connection, kind: str, window: str) -> bool:
+    """Есть ли уже событие такого рода за окно — дедуп для сторожей без задачи.
+
+    ``has_stale_alert`` (#319, #751) дедуплицирует по ЗАПИСИ В ЗАДАЧЕ, и это
+    работает, пока у предупреждения есть задача. У очереди находок (#1171) её
+    нет: сток — свойство практики, а не одной строки. Ключом становится само
+    событие, которое сторож и пишет, а окно берётся относительным — тем же
+    языком, что у метрик ('-1 day').
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM events WHERE kind=? "
+        "AND created_at >= datetime('now', ?) LIMIT 1",
+        (kind, window),
+    )
+    return bool(rows)
 
 
 async def list_events(
@@ -4241,6 +4396,27 @@ async def merge_sha_for_task(db: aiosqlite.Connection, task_id: int) -> str:
         )
     )
     return str(dict(rows[0])["merge_sha"]) if rows else ""
+
+
+async def tasks_released_with(db: aiosqlite.Connection, release_sha: str) -> list[int]:
+    """Задачи, чьи мержи этот релиз унёс в прод (#1236).
+
+    Спрашивается сразу после ``mark_merges_released``: это единственный момент,
+    когда ответ точен без гадания по истории — релиз несёт базовую ветку целиком
+    (#812), так что помеченные им строки и есть тот набор, чьё поведение теперь
+    можно наблюдать. Восстанавливать его позже по предкам нельзя: сквош режет
+    родословную, ровно ради чего штамп и заведён (#950).
+    """
+    sha = (release_sha or "").strip()
+    if not sha:
+        return []
+    rows = await fetchall(
+        db,
+        "SELECT DISTINCT task_id FROM pipeline_merges "
+        "WHERE released_sha = ? AND task_id IS NOT NULL ORDER BY task_id",
+        (sha,),
+    )
+    return [int(dict(row)["task_id"]) for row in rows]
 
 
 # --- Completed, but is the work actually delivered? (#897) ------------------

@@ -1474,6 +1474,11 @@ code { font-size: 0.9em; background: var(--bg); padding: 2px 6px; border-radius:
 .badge-agent { background: var(--orange-dim); color: var(--orange); }
 .badge-review { background: var(--accent-dim); color: var(--accent-light); }
 .badge-fix_requested { background: var(--orange-dim); color: var(--orange); }
+/* #1235: круг ревью назван. Оранжевый, а не красный: это не отказ и не
+   остановка — задача идёт дальше, человека лишь зовут решить. */
+.badge-circle { background: var(--orange-dim); color: var(--orange); }
+.circle-laps { margin: 4px 0 0; padding-left: 18px; font-size: 12px; opacity: .85; }
+.circle-repeat { margin-top: 4px; font-size: 12px; color: var(--orange); }
 .badge-ci_check { background: var(--blue-dim); color: var(--blue); }
 .badge-needs_decision { background: var(--red-dim); color: var(--red); }
 .badge-pending_report { background: var(--orange-dim); color: var(--orange); }
@@ -3839,6 +3844,22 @@ body.htmx-request .htmx-progress {
 
 .finding-evidence { font-size: 11px; margin-top: var(--sp-1); }
 
+/* #1171: слово автора стоит рядом с фактом и подписано как отчёт автора.
+   Тот же кегль, что у факта, — и то и другое ВХОД; отдельная подпись —
+   потому что вопросы разные, и именно здесь границу проще всего потерять. */
+.finding-author { font-size: 11px; margin-top: var(--sp-1); }
+.finding-author-note { font-style: italic; }
+
+/* Категории очереди: самая частая первой, заход идёт одной из них. */
+.finding-categories {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    font-size: 11px;
+    margin-bottom: var(--sp-2);
+}
+.finding-categories a.active { font-weight: 600; color: var(--text); }
+
 .finding-detail { margin-top: var(--sp-1); }
 .finding-detail > summary {
     list-style: none;
@@ -4080,4 +4101,54 @@ body.htmx-request .htmx-progress {
     .task-review-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .task-ac-evidence { display: block; overflow-x: auto; }
     .task-verdict-buttons { grid-template-columns: 1fr; }
+}
+
+/* Что изменилось в публикуемой версии скилла (#1169).
+   Диф — основание решения, поэтому он читается как текст, а не как код-блок
+   в рамке: моноширинный, с сохранёнными переносами и собственной прокруткой,
+   чтобы длинная строка не растягивала страницу. Сработавшие правила скана
+   намеренно НЕ красные — это указатель места внутри дифа, а не сигнал
+   тревоги, и цвет опасности прочитался бы как вердикт, которого у них нет. */
+.skill-publish {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+    padding: var(--sp-3);
+    margin-bottom: var(--sp-3);
+}
+
+.skill-publish-when { margin: 0 0 var(--sp-2); }
+.skill-publish-summary { margin: 0 0 var(--sp-2); }
+.skill-diff-added { color: var(--green); }
+.skill-diff-removed { color: var(--red); }
+
+.skill-scan-hits {
+    list-style: none;
+    margin: 0 0 var(--sp-2);
+    padding: 0;
+    display: grid;
+    gap: var(--sp-2);
+}
+
+.skill-scan-hit { font-size: 13px; line-height: 1.5; }
+
+.skill-scan-fragment {
+    display: block;
+    margin-top: var(--sp-1);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow-x: auto;
+}
+
+.skill-scan-empty, .skill-scan-note { margin: 0 0 var(--sp-2); }
+.skill-publish-diff > summary { margin-bottom: var(--sp-2); }
+
+.skill-diff {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    max-height: 420px;
+    overflow: auto;
+    margin: 0;
 }
