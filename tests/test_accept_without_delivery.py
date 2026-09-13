@@ -1457,3 +1457,115 @@ async def test_the_backfill_holds_the_same_evidence_bar_as_the_live_door(
         "штамп не закрывает строку ни прямой записью, ни засыпкой: "
         "два порога у одного глагола — это два разных ответа"
     )
+
+
+# --- Находки Codex по коммиту 86150e7 ---------------------------------------
+
+
+async def test_a_failed_close_during_a_live_check_leaves_no_partial_trace(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P1: ``close_row_from_live_check`` глотает провал, чтобы не уронить
+    саму живую проверку, — но UPDATE, который он успел сделать через
+    репозиторный слой ``record_delivery_observation``, при этом раньше не
+    откатывался. ``record_live_check`` продолжает работать на ТОМ ЖЕ
+    соединении и коммитит в конце свой собственный акт — и этот коммит уносил
+    бы с собой и чужой недооткаченный UPDATE: строка уезжала бы в
+    closed_by_observation без журнала и без события, хотя вызов честно
+    сообщил об отказе. Акт обязан остаться «либо всё, либо ничего», как и у
+    прямой двери (см. ``test_a_failed_journal_write_does_not_leave_a_silently_closed_row``):
+    сама живая проверка не роняется, а закрытие строки, которое не
+    состоялось, не оставляет по себе ни строки, ни события.
+    """
+    task_id = await _unanswerable_row(
+        client,
+        db,
+        title="Провал закрытия внутри живой проверки",
+        pr=1217,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setattr(
+        "hub.services.delivery_state.delivery_state", _in_prod, raising=False
+    )
+
+    async def boom(*_a, **_kw):
+        raise RuntimeError("simulated failure after the repo-layer UPDATE")
+
+    monkeypatch.setattr(repo, "insert_event", boom)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/live-check",
+        json={"probe": _PROBE, "observation": _SAW, "sha": _SHA},
+    )
+    assert resp.status_code == 200, "живая проверка не обязана падать из-за реестра"
+    assert resp.json()["observation"] == _SAW, "сама живая проверка не потеряна"
+
+    listed = await undelivered_completed_tasks(db)
+    closed_ids = [r["task_id"] for r in listed["closed_by_observation"]]
+    assert task_id not in closed_ids, (
+        "провалившееся закрытие не имеет права наполовину зафиксироваться: "
+        "строка ушла в closed_by_observation, хотя helper вернул отказ"
+    )
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert not (row["observed_at"] or "").strip(), (
+        "UPDATE репозиторного слоя пережил провал журнала/события и "
+        "закоммитился более поздним commit'ом вызывающего"
+    )
+
+    events = await repo.list_events(db, kinds=["delivery_observed"])
+    event_task_ids = {dict(e)["task_id"] for e in events}
+    assert task_id not in event_task_ids, (
+        "событие delivery_observed записано для акта, который сам себя "
+        "признал провалившимся"
+    )
+
+
+async def test_a_second_observation_does_not_overwrite_the_first(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P2: UPDATE сторожится только ``state = ?``, а ``state`` наблюдение
+    никогда не меняет (оно и есть весь смысл: прежний ответ реестра остаётся
+    читаемым). Значит retry после потерянного ответа — или второй наблюдатель
+    той же ещё-``unknown`` строки — проходит тот же предикат заново и молча
+    переписывает ``observed_by``/``observed_evidence``/``observed_sha``/
+    ``observed_at`` поверх первой записи, плюс дописывает второй алерт и
+    второе событие ``delivery_observed`` на один и тот же акт закрытия.
+    """
+    task_id = await _unanswerable_row(
+        client, db, title="Двойное наблюдение", pr=1218, monkeypatch=monkeypatch
+    )
+    url = f"/api/delivery/discrepancies/{task_id}/observation"
+
+    first = await client.post(
+        url, json={"probe": _PROBE, "observation": _SAW, "sha": _SHA}
+    )
+    assert first.status_code == 200
+    first_row = await repo.get_delivery_discrepancy(db, task_id)
+    assert first_row["observed_sha"] == _SHA
+
+    other_probe = "git show 19ee3f6faf9f --stat | grep hub/repository.py"
+    other_seen = "тот же коммит, другой наблюдатель, другое доказательство"
+    other_sha = "a1b2c3d4e5f6"
+    second = await client.post(
+        url,
+        json={"probe": other_probe, "observation": other_seen, "sha": other_sha},
+    )
+
+    assert second.status_code != 200, (
+        "повторная запись наблюдения над уже закрытой строкой не должна "
+        "молча проходить — иначе retry или второй наблюдатель переписывают "
+        "чужой факт"
+    )
+
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert row["observed_sha"] == first_row["observed_sha"], (
+        "второе наблюдение переписало доказательство первого"
+    )
+    assert row["observed_evidence"] == first_row["observed_evidence"]
+    assert row["observed_by"] == first_row["observed_by"]
+
+    events = await repo.list_events(db, kinds=["delivery_observed"])
+    matching = [e for e in events if dict(e)["task_id"] == task_id]
+    assert len(matching) == 1, (
+        f"повтор записал дублирующее событие delivery_observed: {len(matching)}"
+    )
