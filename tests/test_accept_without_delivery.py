@@ -1545,7 +1545,7 @@ async def test_a_second_observation_does_not_overwrite_the_first(
 
     other_probe = "git show 19ee3f6faf9f --stat | grep hub/repository.py"
     other_seen = "тот же коммит, другой наблюдатель, другое доказательство"
-    other_sha = "a1b2c3d4e5f6"
+    other_sha = "000000001218"  # низкоэнтропийный, чтобы не бить detect-secrets
     second = await client.post(
         url,
         json={"probe": other_probe, "observation": other_seen, "sha": other_sha},
