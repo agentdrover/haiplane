@@ -1272,7 +1272,14 @@ async def test_a_human_deliver_decision_commits_the_resolver_note_when_unusable(
     исходе, включая unusable, обязан покрывать и resolver-note. Уже верно
     сегодня (единственный commit в самом конце функции покрывает обе ветки);
     тест закрепляет это, чтобы будущая правка с ранним return не открыла
-    ту же дыру, что и в поллере."""
+    ту же дыру, что и в поллере.
+
+    #1261 P2 (Codex, подтверждено стюардом на сдаче №2, 8ea2eeac): отказ на
+    unusable-исходе писал общий текст "PR остался открытым" — ложь именно
+    здесь: записанный PR закрыт/отсутствует, замены нет, мержить нечего, и
+    закрытый PR не переоткрывается (docs/agent-context/invariants.md ~57-68).
+    Человек пошёл бы искать открытый PR, которого не существует. На сдаче
+    №2 (8ea2eeac) тест красный: "остался открытым" есть в ленте задачи."""
     from hub.services import lifecycle as lifecycle_mod
 
     monkeypatch.setattr(
@@ -1292,4 +1299,14 @@ async def test_a_human_deliver_decision_commits_the_resolver_note_when_unusable(
     assert ok is False, "закрытый без замены не доставляется"
     assert db.in_transaction is False, (
         "решение человека не должно оставлять соединение в открытой транзакции"
+    )
+    updates = [
+        (dict(u)["content"] or "") for u in await repo.get_task_updates(db, task_id)
+    ]
+    feed = " ".join(updates)
+    assert "остался открытым" not in feed and "open" not in feed.lower(), (
+        f"записанный PR закрыт/отсутствует — открытого PR искать негде: {updates}"
+    )
+    assert "закрыт" in feed, (
+        f"отказ обязан назвать закрытое/отсутствующее состояние: {updates}"
     )

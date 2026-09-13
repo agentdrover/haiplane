@@ -4555,6 +4555,21 @@ async def deliver_on_disposition(
             "гейт — одобренное ревью, неизменившийся с апрува код, зелёный CI "
             "(#1037).",
         )
+    elif delivery_pr.unusable:
+        # #1261 (Codex, P2): the generic "PR остался открытым" text below is
+        # false here — unusable means the recorded PR is closed or absent and
+        # nothing replaced it (#959), so there is no open PR for a human to
+        # find. Closed is terminal (no reopening), so this must not read as a
+        # transient state either — mergeable is not "not yet merged".
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Доставка по решению человека НЕ выполнена: {reason}. Мержить "
+            "нечего: у ветки нет открытого PR — задача остаётся принятой "
+            "(#1037).",
+        )
     else:
         await repo.add_task_update(
             db,
