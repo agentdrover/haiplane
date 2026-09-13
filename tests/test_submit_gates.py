@@ -111,6 +111,7 @@ EXPECTED_SUBMIT_ORDER = (
     "finding_outcomes",
     "submit_rules",
     "pin_submission_sha",
+    "same_sha_from_review_is_current",
     "delivery_pr",
 )
 
@@ -181,9 +182,15 @@ def test_the_two_pipelines_are_compared_by_their_lists():
     submit = {s.name: s for s in lifecycle.SUBMIT_STEPS}
     headless = {s.name: s for s in lifecycle.HEADLESS_STEPS}
 
-    # task_is_submittable — единственный шаг, которого у headless нет вовсе:
-    # он проверяет, что задача pair и в статусе, из которого сдают.
-    assert set(submit) - set(headless) == {"task_is_submittable"}
+    # task_is_submittable — шаг, которого у headless нет вовсе: он проверяет,
+    # что задача pair и в статусе, из которого сдают. same_sha_from_review_is_
+    # current — тоже только pair (#1265): headless сдаёт done-отчётом, у него
+    # нет ни статуса review, ни повторной сдачи того же коммита через этот
+    # путь — решение не трогать headless названо в постановке прямо.
+    assert set(submit) - set(headless) == {
+        "task_is_submittable",
+        "same_sha_from_review_is_current",
+    }
     assert set(headless) - set(submit) == set()
 
     active_here = {n for n, s in headless.items() if s.active}
@@ -532,3 +539,190 @@ async def test_the_rules_step_obeys_the_cap_instead_of_rereading_the_policy(
     with pytest.raises(HTTPException) as refused:
         await _step_submit_rules(state)
     assert refused.value.status_code == 422
+
+
+# --------------------------------------------------------------------------
+# #1265: пересдача того же коммита из review не рождает новое поколение
+# --------------------------------------------------------------------------
+#
+# Образец — #1172, 13.09.2026: сдачи №6 и №7, один и тот же sha
+# b530268a24c6, исполнитель и стюард сдали независимо. Хаб принял вторую как
+# новую работу: поколение выросло с 6 до 7, диспетч ревью вызван повторно
+# (отказан лимитом), а вердикт по «заменённой» сдаче перестал быть текущим,
+# хотя код не менялся ни на байт.
+
+
+async def _pair_task_ready_to_submit(
+    db: aiosqlite.Connection, title: str, *, agent: str = "dev"
+):
+    task = await lifecycle.create_task(
+        db, models.TaskCreate(title=title, source="agent", agent="bot")
+    )
+    await lifecycle.approve_task(db, task.id, models.TaskApprove(force=True))
+    await lifecycle.pair_start_task(
+        db,
+        task.id,
+        models.TaskPairStart(agent=agent, branch_slug="mine", plan="Plan: сдать"),
+    )
+    return task
+
+
+def _install_fixed_tip_git(monkeypatch, tip: str):
+    """Git-двойник, чья вершина не меняется между сдачами, пока тест не велит."""
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    class _Git(NoopGitOps):
+        def __init__(self, tip: str) -> None:
+            self.tip = tip
+
+        async def fetch_base(self, repo: str, base: str):
+            return (True, "")
+
+        async def head_sha(self, repo: str, base: str) -> str:
+            return self.tip
+
+    git = _Git(tip)
+    monkeypatch.setattr(plugins, "git_ops", git)
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(return_value={"repo": "/srv/ws", "base_branch": "develop"}),
+    )
+    return git
+
+
+async def test_resubmitting_the_same_sha_from_review_is_not_a_new_generation(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1: тот же коммит из review не открывает новое поколение (#1265, #1172)."""
+    from hub.services import review_dispatch
+
+    _install_fixed_tip_git(monkeypatch, "same-tip")
+
+    task = await _pair_task_ready_to_submit(db, "Дубль сдачи")
+    first = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    assert first.submission_generation == 1
+    assert first.submission_sha == "same-tip"
+
+    # Вердикт закреплён за поколением 1 напрямую через repo, а не через
+    # record_review_verdict сервиса: клиентское ревью на APPROVED само уводит
+    # задачу review->running (#3433 lifecycle.py — «report done on APPROVED»),
+    # а #1172 воспроизводит именно гонку ДВУХ СДАЧ, пока задача ещё в review
+    # и вердикт по ней уже есть (машинное ревью его и оставляет там).
+    await repo.record_review_verdict(db, task.id, "approved")
+    await db.commit()
+
+    dispatch_calls: list[int] = []
+
+    async def _spy(db_, task_id_, **kwargs):
+        dispatch_calls.append(task_id_)
+        return False
+
+    monkeypatch.setattr(review_dispatch, "maybe_dispatch_review", _spy)
+
+    second = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+
+    assert second.submission_generation == 1, "поколение не растёт — код не менялся"
+    assert second.submission_sha == "same-tip"
+    assert second.review_approved_current is True, (
+        "вердикт по прежней сдаче остаётся текущим — это ТА ЖЕ сдача"
+    )
+    assert dispatch_calls == [], (
+        "диспетч ревью не вызван на дубле — проверено вызовом-шпионом, а не выведено"
+    )
+    hint = second.lifecycle_hint or ""
+    assert "поколение 1" in hint, "ответ называет поколение, на котором уже стоит сдача"
+    assert "bot" in hint, "ответ называет, кто сдал это поколение (assigned_agent задачи)"
+
+
+async def test_resubmitting_a_new_sha_from_review_still_bumps_the_generation(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2: ветка сдвинулась — пересдача открывает новое поколение, как сегодня."""
+    git = _install_fixed_tip_git(monkeypatch, "first-tip")
+
+    task = await _pair_task_ready_to_submit(db, "Новый коммит")
+    first = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev")
+    )
+    assert first.submission_generation == 1
+
+    git.tip = "second-tip"
+    second = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev")
+    )
+
+    assert second.submission_generation == 2, "новый коммит — новое поколение"
+    assert second.submission_sha == "second-tip"
+
+
+async def test_same_sha_resubmission_answer_is_idempotent(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3: одна и та же сдача X дважды подряд — один ответ, и не ошибка."""
+    _install_fixed_tip_git(monkeypatch, "idem-tip")
+
+    task = await _pair_task_ready_to_submit(db, "Идемпотентный повтор")
+    await lifecycle.submit_for_review(db, task.id, models.TaskSubmitReview(agent="dev"))
+
+    first_retry = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev")
+    )
+    second_retry = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev")
+    )
+
+    assert first_retry.submission_generation == second_retry.submission_generation == 1
+    assert first_retry.submission_sha == second_retry.submission_sha == "idem-tip"
+    assert first_retry.status == "review"
+    assert second_retry.status == "review"
+    assert first_retry.lifecycle_hint == second_retry.lifecycle_hint, (
+        "повтор по таймауту обязан получить ТОТ ЖЕ ответ, а не новый текст"
+    )
+
+
+async def test_same_sha_from_fix_requested_is_untouched(db: aiosqlite.Connection):
+    """AC-4: правило не срабатывает вне review — сдача из fix_requested не тронута.
+
+    fix_requested — headless-статус; ``_step_task_is_submittable`` отказывает
+    headless-задаче (``job_id`` установлен) раньше, чем конвейер дойдёт до
+    пин-шага, так что сегодняшняя сдача из fix_requested этим шагом вообще не
+    задета. Опасная мутация из review-чеклиста — «сравнивать sha из любого
+    статуса» — это про ЯДРО условия: без привязки к
+    ``resubmitted_from_review`` (=``status == "review"``, #1054) шаг пометил
+    бы дублем и пересдачу того же sha из fix_requested, если бы конвейер до
+    него когда-нибудь дошёл. Проверяется поэтому на самом шаге напрямую, а
+    не только через отказ headless-задачи выше по списку.
+    """
+    from hub.services.lifecycle import (
+        SubmitContext,
+        _step_same_sha_from_review_is_current,
+    )
+
+    state = SubmitContext(
+        db=db,
+        task_id=1,
+        task={"status": "fix_requested", "submission_sha": "same-sha"},
+        body=models.TaskSubmitReview(),
+    )
+    # fix_requested, не review: #1054 связывает resubmitted_from_review
+    # ИМЕННО со статусом review, и здесь он выставлен вручную ровно так же,
+    # как это делает _step_task_is_submittable для fix_requested — False.
+    state.resubmitted_from_review = False
+    state.replaced_sha = "same-sha"
+    state.submission_sha = "same-sha"
+
+    await _step_same_sha_from_review_is_current(state)
+
+    assert state.same_sha_noop is False, (
+        "пересдача того же sha из fix_requested не должна помечаться дублем "
+        "ревью — правило действует только из статуса review, #1265 scope_out"
+    )

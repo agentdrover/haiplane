@@ -1892,6 +1892,9 @@ class SubmitContext:
     discovered_pr: int | None = None
     pr_opened_by_hub: bool = False
     pr_ensure_note: str = ""
+    #: #1265 — та же вершина ветки пришла повторно из review: сдача не
+    #: открывает новое поколение, и вызывающий получает ответ без перехода.
+    same_sha_noop: bool = False
 
 
 async def _step_task_is_submittable(state: SubmitContext) -> None:
@@ -2261,6 +2264,42 @@ async def _step_pin_submission_sha(state: SubmitContext) -> None:
     )
 
 
+async def _step_same_sha_from_review_is_current(state: SubmitContext) -> None:
+    """Пересдача того же коммита из review не открывает новое поколение (#1265).
+
+    #1172, 13.09.2026: сдачи №6 и №7 — один и тот же sha b530268a24c6,
+    исполнитель и стюард сдали независимо, не зная друг о друге. Хаб принял
+    вторую как новую работу: поколение выросло с 6 до 7, диспетч ревью
+    вызван повторно (отказан лимитом usage_limit_exceeded), а вердикт по
+    «заменённой» сдаче перестал быть текущим — хотя код не менялся ни на
+    байт.
+
+    Сверка — по вершине, которую уже закрепил шаг ``pin_submission_sha``
+    выше: нового сетевого вызова здесь нет, только сравнение двух строк,
+    обе уже лежат в контексте (``state.submission_sha`` и
+    ``state.replaced_sha``, прочитанный в ``_step_task_is_submittable`` до
+    любых записей).
+
+    Пустой sha не считается совпадением: сеть могла быть недоступна на ОБЕИХ
+    сдачах, и тогда "" == "" ничего не доказывает о коде — только то, что
+    пиннинг сорвался дважды. Такая сдача идёт обычным путём, как и раньше.
+
+    ``resubmitted_from_review`` — это уже ``status == "review"`` (#1054), и
+    проверка ничего не добавляет к нему: пересдача того же sha из
+    ``fix_requested`` (headless) сюда не попадает вовсе, потому что
+    ``_step_task_is_submittable`` отказывает headless-задачам раньше, чем
+    конвейер дойдёт до этого шага. Сравнивать sha из ЛЮБОГО статуса, минуя
+    ``resubmitted_from_review``, было бы другим, более широким правилом —
+    его здесь нет.
+    """
+    if (
+        state.resubmitted_from_review
+        and state.submission_sha
+        and state.submission_sha == state.replaced_sha
+    ):
+        state.same_sha_noop = True
+
+
 async def _step_delivery_pr(state: SubmitContext) -> None:
     """PR, который повезёт работу (#605, #967, #975)."""
     # #605: record which PR carries this work. The pair flow never sets
@@ -2337,6 +2376,11 @@ SUBMIT_STEPS: tuple[Step[SubmitContext], ...] = (
     Step("finding_outcomes", _step_finding_outcomes, mode=policy("FINDING_OUTCOME")),
     Step("submit_rules", _step_submit_rules, mode=policy("SUBMIT_RULES")),
     Step("pin_submission_sha", _step_pin_submission_sha, refuses=False),
+    Step(
+        "same_sha_from_review_is_current",
+        _step_same_sha_from_review_is_current,
+        refuses=False,
+    ),
     Step("delivery_pr", _step_delivery_pr, refuses=False),
 )
 
@@ -2437,7 +2481,46 @@ async def submit_for_review(
     state = SubmitContext(db=db, task_id=task_id, task=task, body=body)
     await run_steps(state, SUBMIT_STEPS)
 
+    if state.same_sha_noop:
+        # #1265: the pipeline named this a duplicate of the current
+        # generation — no transition, no write, no dispatch. Everything the
+        # caller sees below is read straight from the row _apply_submission
+        # would otherwise have mutated.
+        return await _same_sha_noop_response(state)
+
     return await _apply_submission(state)
+
+
+async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
+    """Ответ на пересдачу того же sha из review — без перехода (#1265).
+
+    Нет ни одной записи в базу: поколение, submission_sha, статус,
+    текущесть ревью и вердикта остаются ровно теми, что были ДО вызова.
+    Идемпотентность (AC-3) — прямое следствие отсутствия записи: повторный
+    вызов читает те же строки и строит тот же текст, а не пересчитывает
+    переход заново.
+    """
+    db = state.db
+    task_id = state.task_id
+    generation = int(state.task.get("submission_generation") or 0)
+    submission = await repo.get_submission(db, task_id, generation)
+    submitted_at = (submission["submitted_at"] or "") if submission is not None else ""
+    agent = (state.task.get("assigned_agent") or "").strip() or "—"
+    declared_model = (state.task.get("submission_model") or "").strip()
+    who = agent + (f" ({declared_model})" if declared_model else "")
+    when = f" в {submitted_at}" if submitted_at else ""
+    sha_display = state.submission_sha[:12] if state.submission_sha else "—"
+
+    row = _existing_task(await repo.get_task(db, task_id), task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    view = row_to_task(row, updates=updates)
+    view.lifecycle_hint = (
+        f"Сдача {sha_display} уже на ревью как поколение {generation} "
+        f"(сдал {who}{when}). Код не изменился — новое поколение не "
+        "открыто, ревью и вердикт остаются текущими как были (#1265)."
+    )
+    view.wait_baseline = wait_baseline_for(dict(row))
+    return view
 
 
 def _submission_update_text(
