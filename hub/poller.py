@@ -1734,14 +1734,22 @@ async def _deliver_pair_task(db, task: dict) -> None:
     # and #880), and the gate then refused a live, green PR of the same
     # branch as merge_failed on a corpse: #1204, twice. resolve_delivery_pr
     # wraps the one rule (#959) the done-report path already applies.
+    #
+    # delivery_pr.reason is NOT written here, unconditionally, on its own.
+    # This sweep revisits a running task every pass, and a raw write here
+    # would either repeat every 30s when the gate keeps waiting on the same
+    # transient cause (#534), or — worse — leave the connection sitting in
+    # an open transaction: on a deduped pass _note_pair_delivery_wait below
+    # returns without a commit, and a write made before it is then the only
+    # uncommitted thing on the connection (found by machine review, #1261
+    # submission #1, F1/F2). So the terminal branches below (needs_decision,
+    # delivered) write it themselves, right before the commit each already
+    # makes — each runs at most once per task, since the task leaves this
+    # sweep's candidate list the moment either one fires — and the transient
+    # branch folds it into _note_pair_delivery_wait's own dedupe-and-commit
+    # cycle instead of a second one.
     task, delivery_pr = await services.resolve_delivery_pr(db, task)
     pr_num = task.get("pr_number")
-    if delivery_pr.reason:
-        # Said once, regardless of outcome: the reader must see which PR
-        # this delivery is actually about — the closed number and its
-        # replacement, or the closed number and the absence of one — the
-        # same rule the done-report path already follows (#767, #959).
-        await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
     if delivery_pr.unusable:
         # #959: closed, no live replacement — nothing to merge. Asking
         # GitHub to merge a corpse is what produced "merge_failed: GitHub
@@ -1766,8 +1774,13 @@ async def _deliver_pair_task(db, task: dict) -> None:
                     if detail.startswith(services.PR_DRAFT_PREFIX)
                     else ""
                 ),
+                resolver_note=delivery_pr.reason,
             )
             return
+        if delivery_pr.reason:
+            # Terminal from here — needs_decision below fires at most once,
+            # and the commit a few lines down covers this write too.
+            await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
         reason = "merge_gate"
         if detail.startswith(services.RECOVERABLE_GATE_PREFIXES):
             # #1030: this is the path #1015 actually took — the sweep, not the
@@ -1822,6 +1835,10 @@ async def _deliver_pair_task(db, task: dict) -> None:
         )
         return
 
+    if delivery_pr.reason:
+        # Terminal from here too — the task leaves the sweep once delivered,
+        # so this write happens at most once, and the commit below covers it.
+        await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
     _pair_delivery_waits.pop(task_id, None)
     # #812: delivery grew the release range. Best effort, exactly as on the
     # done path — a release that could not be prepared is a reason in the log,
@@ -1860,29 +1877,40 @@ async def _deliver_pair_task(db, task: dict) -> None:
 
 
 async def _note_pair_delivery_wait(
-    db, task_id: int, pr_num, detail: str, *, hint: str = ""
+    db, task_id: int, pr_num, detail: str, *, hint: str = "", resolver_note: str = ""
 ) -> None:
     """Say once that delivery is waiting, and then be quiet (#534).
 
     ``hint`` names what happens next when it is not "the hub comes back on its
     own": a refusal the executor has to cure is also a wait, but waiting for a
     different actor, and the default sentence would promise the wrong one.
+
+    ``resolver_note`` (#1261) is ``pr_for_delivery``'s own reason — a closed
+    recorded PR replaced, or one that could not be resolved. It rides IN this
+    function's dedupe key and commit rather than getting a write of its own:
+    a separate write here repeated every 30s while the gate kept waiting on
+    the same transient cause (#534), and on a pass this function dedupes and
+    returns from early, that separate write was the only uncommitted thing
+    left on the connection — the poller's connection then sat in an open
+    transaction until the next write elsewhere happened to commit it, and a
+    second, unrelated connection to the same database file got
+    ``OperationalError: database is locked`` (found by machine review,
+    submission #1, F1/F2). Folding it in means one commit covers both notes
+    always, and a changed resolver reason — unknown becoming a replacement,
+    say — is said again exactly like a changed gate detail is.
     """
-    if _pair_delivery_waits.get(task_id) == detail:
+    key = f"{resolver_note}\x1f{detail}"
+    if _pair_delivery_waits.get(task_id) == key:
         return
-    _pair_delivery_waits[task_id] = detail
-    await repo.add_task_update(
-        db,
-        task_id,
-        "hub",
-        "status",
-        f"Доставка отложена: PR #{pr_num} — {detail}. "
-        + (
-            hint
-            or "Это временное состояние, решение человека не требуется — хаб "
-            "вернётся к нему следующим циклом."
-        ),
+    _pair_delivery_waits[task_id] = key
+    message = f"Доставка отложена: PR #{pr_num} — {detail}. " + (
+        hint
+        or "Это временное состояние, решение человека не требуется — хаб "
+        "вернётся к нему следующим циклом."
     )
+    if resolver_note:
+        message = f"{resolver_note} {message}"
+    await repo.add_task_update(db, task_id, "hub", "status", message)
     await db.commit()
     log.info("Poll: task #%d waiting to deliver (%s)", task_id, detail)
 

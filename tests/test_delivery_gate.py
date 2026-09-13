@@ -1031,3 +1031,162 @@ def test_every_merge_gate_caller_resolves_the_pr_first() -> None:
         "ни кто-либо выше по цепочке вызовов не зовёт pr_for_delivery/"
         f"resolve_delivery_pr: {sorted(unresolved)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1261, ревью сдачи №1 (d464d356): два подтверждённых находки об одной строке
+# — безусловной `if delivery_pr.reason: add_task_update(..., "alert", ...)`
+# в poller._deliver_pair_task.
+#
+# [F1, Codex, подтверждено стюардом пробами] Незакоммиченная запись держит
+# блокировку SQLite. Когда pr_state — "" (unknown) и merge_before_completion
+# на каждый проход отвечает одним и тем же транзиентным отказом (например,
+# CI ещё идёт), проход №1 пишет resolver-алерт и _note_pair_delivery_wait
+# коммитит. Проход №2 пишет resolver-алерт ЕЩЁ РАЗ, а _note_pair_delivery_wait
+# дедуплицирует и возвращается БЕЗ commit — соединение поллера остаётся в
+# открытой транзакции. Проба: после прохода №1 db.in_transaction=False, после
+# прохода №2 db.in_transaction=True, а вторая коннекция к тому же файлу
+# получает OperationalError: database is locked.
+#
+# [F2, стюард, подтверждено] Алерт повторяется на каждый 30-секундный проход.
+# Тот же сетап, 3 прохода дают 3 одинаковых алерта "состояние PR #360
+# неизвестно — доставка идёт по нему как раньше" и только 1 запись "Доставка
+# отложена". Это ломает #534 ("сказано один раз, а не на каждый цикл"),
+# которую сама функция и цитирует.
+#
+# ЧИНИТСЯ ОДНИМ ходом: resolver-note больше не пишется отдельной, безусловной
+# строкой. На транзиентной ветке (единственной, где _deliver_pair_task
+# перевызывается на ОДНОЙ и той же задаче раз за разом, пока статус остаётся
+# running) она сворачивается в СУЩЕСТВУЮЩИЙ дедуп-и-commit цикл
+# _note_pair_delivery_wait/_pair_delivery_waits — второго дедупа не заводится.
+# На терминальных ветках (needs_decision из другого отказа, успешная
+# доставка) resolver-note пишется как и раньше, безусловно: та задача покидает
+# список кандидатов свипа в тот же проход, так что запись не повторяется, а
+# существующий commit чуть ниже её уже покрывает.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_resolver_note_is_said_once_across_repeated_transient_waits(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """AC F2. Три прохода подряд с unknown-состоянием и транзиентным отказом
+    гейта — причина резолвера обязана прозвучать РОВНО один раз.
+
+    Проба — как у стюарда: _git_with_state("", found=None),
+    _approved_pair_task(pr_number=360), merge_before_completion
+    замокан на постоянный transient-отказ, poller._deliver_pair_task зовётся
+    3 раза НАПРЯМУЮ (не через свип) с одной и той же задачей.
+
+    На неисправленной сдаче №1 (d464d356) тест красный: resolver-алерт
+    пишется безусловно на каждый проход — 3 совпадения вместо 1.
+    """
+    from hub import poller
+    from hub import services as hub_services
+
+    _git_with_state("", found=None)
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    transient_detail = hub_services.TRANSIENT_GATE_PREFIXES[0] + " CI ещё идёт"
+
+    async def _stuck_ci(db_, task_):
+        return False, transient_detail
+
+    monkeypatch.setattr(hub_services, "merge_before_completion", _stuck_ci)
+
+    for _ in range(3):
+        task = dict(await repo.get_task(db, task_id))
+        await poller._deliver_pair_task(db, task)
+
+    updates = [
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, task_id)
+    ]
+    resolver_mentions = [c for c in updates if "PR #360 неизвестно" in c]
+    assert len(resolver_mentions) == 1, (
+        f"причина резолвера обязана прозвучать один раз, а не на каждый "
+        f"проход (#534): {updates}"
+    )
+    waits = [c for c in updates if "Доставка отложена" in c]
+    assert len(waits) == 1, f"и нота ожидания — тоже один раз: {updates}"
+
+
+async def test_a_deduplicated_wait_pass_leaves_no_open_transaction(
+    db: aiosqlite.Connection, db_dsn: str, monkeypatch
+) -> None:
+    """AC F1. Тот же сетап: дедуплицированный проход (второй с тем же
+    транзиентным отказом) не должен оставлять соединение поллера в открытой
+    транзакции — ни ``db.in_transaction``, ни блокировкой для второй
+    коннекции к тому же файлу.
+
+    На неисправленной сдаче №1 (d464d356) тест красный: после прохода №2
+    ``db.in_transaction`` истинно, и INSERT со второй коннекции падает с
+    ``OperationalError: database is locked``.
+    """
+    from hub import poller
+    from hub import services as hub_services
+
+    _git_with_state("", found=None)
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    transient_detail = hub_services.TRANSIENT_GATE_PREFIXES[0] + " CI ещё идёт"
+
+    async def _stuck_ci(db_, task_):
+        return False, transient_detail
+
+    monkeypatch.setattr(hub_services, "merge_before_completion", _stuck_ci)
+
+    task = dict(await repo.get_task(db, task_id))
+    await poller._deliver_pair_task(db, task)  # проход №1: не дедуплицирован
+    task = dict(await repo.get_task(db, task_id))
+    await poller._deliver_pair_task(db, task)  # проход №2: дедуплицирован
+
+    assert db.in_transaction is False, (
+        "дедуплицированный проход не должен оставлять соединение поллера "
+        "в открытой транзакции"
+    )
+
+    second = await aiosqlite.connect(db_dsn, uri=True)
+    try:
+        await second.execute("PRAGMA busy_timeout = 200")
+        await second.execute(
+            "INSERT INTO task_updates (task_id, agent, kind, content) "
+            "VALUES (?, 'probe', 'status', 'second connection probe')",
+            (task_id,),
+        )
+        await second.commit()
+    finally:
+        await second.close()
+
+
+async def test_a_human_deliver_decision_commits_the_resolver_note_when_unusable(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1261: deliver_on_disposition — одноразовый вызов на одно решение
+    человека, так что повтор (#534) тут не вопрос, но commit на КАЖДОМ
+    исходе, включая unusable, обязан покрывать и resolver-note. Уже верно
+    сегодня (единственный commit в самом конце функции покрывает обе ветки);
+    тест закрепляет это, чтобы будущая правка с ранним return не открыла
+    ту же дыру, что и в поллере."""
+    from hub.services import lifecycle as lifecycle_mod
+
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_state", AsyncMock(return_value="closed"), raising=False
+    )
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_for_branch", AsyncMock(return_value=None), raising=False
+    )
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    ok, reason = await lifecycle_mod.deliver_on_disposition(
+        db, task_id, "deliver", via="test"
+    )
+
+    assert ok is False, "закрытый без замены не доставляется"
+    assert db.in_transaction is False, (
+        "решение человека не должно оставлять соединение в открытой транзакции"
+    )
