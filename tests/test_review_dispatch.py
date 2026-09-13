@@ -6359,3 +6359,263 @@ async def test_a_report_arriving_while_the_debt_settles_still_stops_the_order(
     assert await _local_dispatches(db, task_id) == [], (
         "отчёт уже сдан: заказ второго ревьюера — оплаченный отчёт-соперник"
     )
+
+
+# --- #1252: находки внешнего ревьюера по коммиту e69a3d5 --------------------
+
+
+_INCOMPLETE_LOCAL_REPORT = {
+    **_LOCAL_REPORT,
+    "incomplete": True,
+    "lost_dimensions": ["hub/services/big.py"],
+}
+
+
+async def test_a_deep_top_up_is_not_silenced_by_an_earlier_lite_debt(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находка 1 (P1): ключ идемпотентности не различает РАЗНЫЕ долги.
+
+    Первый облачный вызов отказывает на создании -> открывается первая
+    вторая дверь -> локальный LITE-прогон сдаёт отчёт incomplete=true ->
+    лестница (#879) заказывает тяжёлый добор -> второй облачный вызов
+    СОЗДАЁТСЯ, но кончается без отчёта -> открывается ВТОРАЯ вторая дверь.
+
+    ``_second_door_already_opened`` спрашивал только task_id+generation+
+    channel='local'+status, не различая, какой ИМЕННО долг локальный заказ
+    оплатил. Он находил первый (LITE, уже done) заказ и считал ВТОРОЙ
+    (DEEP) долг уже оплаченным — тяжёлый добор так и не заказывался, а
+    сдача оставалась с одним неполным отчётом.
+    """
+    from hub.services.review_dispatch import DEEP, wait_for_local_runs
+
+    calls: list[dict] = []
+
+    async def _create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            # Первый вызов (первичная сдача): облако отказывает НА СОЗДАНИИ.
+            return None, _LIMIT_REFUSAL
+        # Второй вызов (добор лестницы): облако СОЗДАЁТ агента на этот раз.
+        return {"agent": {"id": "bc-deep"}, "run": {"id": "r-deep"}}, None
+
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "test-key")
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _create)
+
+    async def _no_usage(agent_id, run_id=None):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _no_usage)
+    # Принципал облачного ревьюера настоящий, как на проде (без него отчёт
+    # сопоставляется по старому правилу «любой отчёт этого поколения», и
+    # LITE-отчёт замаскировал бы находку 1 под находку рунг-сопоставления).
+    await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub(_INCOMPLETE_LOCAL_REPORT))
+
+    task_id = await _submitted(
+        client, db, "spike-topup-after-lite-debt", policy={"review": "dispatch"}
+    )
+    # Первый (синхронный) отказ уже случился внутри _submitted; локальный
+    # LITE-прогон запущен асинхронно.
+    await wait_for_local_runs()
+    await db.commit()
+
+    local_after_first_door = await _local_dispatches(db, task_id)
+    assert len(local_after_first_door) == 1
+    assert local_after_first_door[0]["status"] == "done"
+    assert local_after_first_door[0]["profile"] == "lite"
+    # Предпосылка: неполный LITE-отчёт купил тяжёлый добор ВТОРЫМ облачным
+    # вызовом (лестница #879 срабатывает автоматически при приёме отчёта).
+    assert len(calls) == 2, "неполный отчёт обязан купить добор лестницы"
+
+    deep_cloud = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert deep_cloud["profile"] == DEEP
+
+    # Тяжёлый добор дошёл до терминального статуса без отчёта.
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes') "
+        "WHERE id = ?",
+        (deep_cloud["id"],),
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    local_after_second_door = await _local_dispatches(db, task_id)
+    assert len(local_after_second_door) == 2, (
+        "тяжёлый добор кончился без отчёта — ему причитается СВОЯ вторая "
+        "дверь, а не долг, уже оплаченный чужим (LITE) заказом"
+    )
+    newest = max(local_after_second_door, key=lambda d: d["id"])
+    assert newest["profile"] == DEEP, (
+        "замена обязана доехать тем же (тяжёлым) профилем, каким заказывали "
+        "упавший добор"
+    )
+
+
+async def test_a_late_report_during_debt_settlement_settles_its_own_dispatch(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находка 2 (P1): доехавший отчёт обязан закрыть СВОЙ заказ как done.
+
+    Сценарий тот же, что и в ``test_a_report_arriving_while_the_debt_settles_
+    still_stops_the_order`` — отчёт доезжает, пока отдаётся долг второй
+    двери, и локальный соперник верно не покупается. Но ``_settle_second_
+    door`` безусловно закрывал СТРОКУ ОБЛАЧНОГО заказа в ``failed`` — даже
+    когда его же отчёт только что нашёлся. ``failed``-строки свип больше не
+    разбирает, а ``get_settled_review_dispatch`` берёт только ``done``, то
+    есть годный отчёт никогда не сверяется как успешный заказ.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-late2"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-late-settles-done", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_resolve = repo.resolve_project_for_task
+    landed: list[int] = []
+
+    async def _report_lands_mid_settlement(conn, tid):
+        if not landed:
+            landed.append(-1)
+            landed[0] = await _a_report_from(db, task_id, cloud_pid, "cloud-reviewer")
+        return await real_resolve(conn, tid)
+
+    monkeypatch.setattr(repo, "resolve_project_for_task", _report_lands_mid_settlement)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert landed and landed[0] > 0, "предпосылка: отчёт доехал именно в это окно"
+    assert await _local_dispatches(db, task_id) == [], (
+        "отчёт уже сдан: заказ второго ревьюера — оплаченный отчёт-соперник"
+    )
+    cloud = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert cloud["status"] == "done", (
+        "доехавший отчёт принадлежит ЭТОМУ заказу — он обязан закрыться им, "
+        "а не быть объявленным упавшим одновременно с годным отчётом"
+    )
+    settled = await repo.get_settled_review_dispatch(db, task_id, 1)
+    assert settled is not None and int(settled["id"]) == int(cloud["id"]), (
+        "get_settled_review_dispatch обязана видеть этот заказ доставленным, "
+        "иначе доказательство пустого ревью (#769) никогда не соберётся"
+    )
+
+
+async def test_a_report_arriving_while_the_local_order_is_being_prepared_stops_it(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находка 3 (P1): последнее слово должно звучать НЕПОСРЕДСТВЕННО перед заказом.
+
+    Рунг-проверка в ``_second_door_after_run`` — только ПЕРВАЯ из двух:
+    после неё ``open_second_door`` перечитывает свежесть сдачи и достижимость
+    (несколько await в базу), а ``dispatch_local_review`` считает потолок
+    стоимости и готовит заказ через ``prepare_review_order`` (диф/правила) —
+    и только потом вставляет строку и запускает прогон. Отчёт, доехавший в
+    ЭТО окно, эту проверку не видит вовсе и покупает оплаченного соперника.
+    """
+    from hub.services import review_dispatch as review_dispatch_module
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-prep"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-report-during-prep", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_prepare = review_dispatch_module.prepare_review_order
+    landed: list[int] = []
+
+    async def _report_lands_during_prep(
+        db_conn, task, *, branch, generation, force_profile, principal_id
+    ):
+        # Отчёт доезжает ПОСЛЕ рунг-проверки в _second_door_after_run (она
+        # уже прошла — отчёта тогда не было), но ДО вставки строки локального
+        # заказа: подготовка заказа (git/дифф) идёт прямо сейчас.
+        if not landed:
+            landed.append(-1)
+            landed[0] = await _a_report_from(db, task_id, cloud_pid, "cloud-reviewer")
+        return await real_prepare(
+            db_conn,
+            task,
+            branch=branch,
+            generation=generation,
+            force_profile=force_profile,
+            principal_id=principal_id,
+        )
+
+    monkeypatch.setattr(
+        review_dispatch_module, "prepare_review_order", _report_lands_during_prep
+    )
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert landed and landed[0] > 0, "предпосылка: отчёт доехал именно в это окно"
+    assert await _local_dispatches(db, task_id) == [], (
+        "отчёт доехал во время подготовки заказа: локальный заказ здесь — "
+        "оплаченный отчёт-соперник"
+    )
+    cloud = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert cloud["status"] == "done", (
+        "доехавший отчёт принадлежит этому заказу — закрывается им"
+    )

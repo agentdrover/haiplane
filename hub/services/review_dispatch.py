@@ -1901,6 +1901,7 @@ async def open_second_door(
     force_profile: str = "",
     *,
     cloud_refusal: str,
+    late_report_recheck: dict[str, Any] | None = None,
 ) -> bool:
     """Вторая дверь: локальный путь ПОСЛЕ наблюдённого отказа облака (#1252).
 
@@ -1930,6 +1931,11 @@ async def open_second_door(
     ветку, и локальный прогон купил бы чтение кода, которого на живой сдаче
     уже нет. Правило одно, мест применения два, и второе место — ровно тот
     класс, что уже ловили: один потребитель правила ≠ все.
+
+    ``late_report_recheck`` — заказ, чей провал мы разбираем (когда он
+    известен), пробрасывается дальше в ``dispatch_local_review`` для ПОСЛЕДНЕЙ
+    проверки отчёта непосредственно перед вставкой строки (находка по
+    e69a3d5): здесь, тремя await раньше, отчёт ещё не увидеть.
     """
     if not await _submission_still_live(db, task, branch, generation):
         return False
@@ -1937,7 +1943,14 @@ async def open_second_door(
     if LOCAL_CHANNEL not in reach.ways:
         return False
     return await dispatch_local_review(
-        db, task, forge, branch, generation, force_profile, cloud_refusal=cloud_refusal
+        db,
+        task,
+        forge,
+        branch,
+        generation,
+        force_profile,
+        cloud_refusal=cloud_refusal,
+        late_report_recheck=late_report_recheck,
     )
 
 
@@ -1972,6 +1985,7 @@ async def dispatch_local_review(
     force_profile: str = "",
     *,
     cloud_refusal: str = "",
+    late_report_recheck: dict[str, Any] | None = None,
 ) -> bool:
     """Добыть ревью там, куда облако не дотягивается. True — прогон запущен.
 
@@ -1979,6 +1993,15 @@ async def dispatch_local_review(
     месте — это ровно то, что задача #1180 закрывает: на GitVerse вердикт
     выносился вообще без второго читателя, и по карточке это выглядело как
     «ревью не потребовалось».
+
+    ``late_report_recheck`` — заказ второй двери, чей провал мы разбираем
+    (находка по e69a3d5). Между рунг-проверкой в ``_second_door_after_run`` и
+    вставкой строки ниже лежат перечитывание свежести сдачи и достижимости
+    (``open_second_door``), счёт потраченного и подготовка заказа —
+    ``prepare_review_order`` только что сходила за диффом и правилами
+    репозитория. Отчёт, доехавший за это время, ту раннюю проверку не видит
+    вовсе. Здесь — ПОСЛЕДНЕЕ слово, ближе к вставке уже некуда: деньги тратит
+    именно она.
     """
     task_id = int(task["id"])
     reach = await review_reach(db, forge)
@@ -2025,6 +2048,17 @@ async def dispatch_local_review(
         force_profile=force_profile,
         principal_id=principal_id,
     )
+    # ПОСЛЕДНЕЕ слово перед заказом (находка по e69a3d5). Рунг-проверка в
+    # _second_door_after_run — только первая; prepare_review_order выше сама
+    # по себе не быстрая (дифф, правила репозитория), и отчёт, доехавший,
+    # пока она шла, эта функция должна увидеть здесь, а не молча купить
+    # оплаченного соперника. Тихий отказ (без своего алерта): карточка уже
+    # называет причину провалившегося заказа, вторую на то же состояние не
+    # заводим (#1188).
+    if late_report_recheck is not None and (
+        await _dispatch_report(db, task_id, generation, late_report_recheck) is not None
+    ):
+        return False
     run_id = uuid.uuid4().hex[:12]
     dispatch_id = await repo.create_review_dispatch(
         db,
@@ -2887,6 +2921,14 @@ async def _settle_second_door(
     заказ закоммичен, но до того, как долг помечен закрытым. Тогда при
     рестарте видны обе строки, облачная разбирается первой (ORDER BY id), и
     без этой проверки она покупала бы ВТОРОЙ прогон на то же поколение.
+
+    Находка внешнего ревьюера по коммиту e69a3d5 (P1): строка ЭТОГО заказа
+    закрывалась в ``failed`` БЕЗУСЛОВНО, даже когда ``_second_door_after_run``
+    находил отчёт, принадлежащий ИМЕННО ЕМУ (поздний отчёт застаёт вторую
+    дверь уже приоткрытой) — ``failed``-строки свип больше не разбирает, а
+    ``get_settled_review_dispatch`` берёт только ``done``, то есть годный
+    отчёт был бы никогда не сверен как успешный заказ. Статус берётся из
+    того, что в самом деле нашлось для ЭТОГО заказа, а не назначается заранее.
     """
     if await _second_door_already_opened(db, dispatch):
         await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
@@ -2894,33 +2936,51 @@ async def _settle_second_door(
         return
     if task_row is None:
         task_row = await repo.get_task(db, int(dispatch["task_id"]))
-    await _second_door_after_run(
+    settled_by_its_own_report = await _second_door_after_run(
         db, dispatch, task_row, dispatch.get("run_status") or "терминальным"
     )
-    await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
+    await repo.set_review_dispatch_status(
+        db, dispatch["id"], "done" if settled_by_its_own_report else "failed"
+    )
     await db.commit()
 
 
 async def _second_door_already_opened(
     db: aiosqlite.Connection, dispatch: dict[str, Any]
 ) -> bool:
-    """Есть ли по этой сдаче живой или удавшийся локальный заказ (#1252).
+    """Есть ли по ЭТОМУ долгу живой или удавшийся локальный заказ (#1252).
 
     Упавший локальный заказ сюда НЕ считается: он говорит «вторую дверь
     попробовали и она не сработала», и запретить по нему новую попытку
     значило бы закрыть дверь именно там, где она нужнее всего. Считается
     только заказ, который ещё идёт или уже принёс отчёт, — то есть долг,
     который в самом деле отдан.
+
+    Находка внешнего ревьюера по коммиту e69a3d5 (P1): task_id+generation+
+    channel одних отличает «долг отдан» от «долг ещё не отдан», но НЕ
+    отличает РАЗНЫЕ долги внутри одного поколения. Лестница (#879) может
+    внутри одной сдачи открыть вторую дверь дважды — дешёвый прогон
+    провалился, локальный LITE ответил, а его неполный отчёт купил тяжёлый
+    облачный добор, который тоже провалился. Без ``id > dispatch['id']``
+    этот запрос находил ПЕРВЫЙ (LITE) локальный заказ и считал долг ВТОРОГО
+    (DEEP) провала уже оплаченным — тяжёлый добор так и не заказывался.
+
+    ``id`` растёт монотонно в порядке вставки (как и везде в этом модуле —
+    рунг-сопоставление, ``get_settled_review_dispatch``), и локальный заказ,
+    отвечающий на провал ИМЕННО этого облачного заказа, обязан появиться
+    ПОСЛЕ него: раньше него в базе может быть только заказ, оплативший
+    какой-то более ранний долг.
     """
     rows = await fetchall(
         db,
         "SELECT 1 FROM review_dispatches WHERE task_id = ? "
         "AND submission_generation = ? AND channel = ? "
-        "AND status IN ('active', 'done') LIMIT 1",
+        "AND status IN ('active', 'done') AND id > ? LIMIT 1",
         (
             int(dispatch["task_id"]),
             int(dispatch["submission_generation"]),
             LOCAL_CHANNEL,
+            int(dispatch["id"]),
         ),
     )
     return bool(rows)
@@ -2931,39 +2991,46 @@ async def _second_door_after_run(
     dispatch: dict[str, Any],
     task_row: Any,
     run_status: Any,
-) -> None:
+) -> bool:
     """Позвать второго поставщика по прогону, кончившемуся без отчёта (#1252).
 
     Гейты здесь — про то, что сдача ВСЁ ЕЩЁ ждёт отчёта, а не про сам отказ:
     задача в review, поколение то же, что у провалившегося заказа, политика
     по-прежнему просит ревьюера. Свип бежит по расписанию, и между заказом и
     его разбором задачу могли вернуть в работу, пересдать или снять политику.
+
+    Возвращает True, когда у ЭТОГО заказа в итоге нашёлся СВОЙ отчёт (гонка с
+    поздним отчётом облака — заказ обязан закрыться им как ``done``, а не
+    ``failed``), и False во всех остальных случаях (дверь открыта, отказана
+    или не понадобилась). Решение принимает вызывающий (``_settle_second_
+    door``), потому что статус ЭТОГО заказа — его забота, а не этой функции.
     """
     if task_row is None:
-        return
+        return False
     task = dict(task_row)
     generation = int(dispatch["submission_generation"])
     if task.get("status") != "review":
-        return
+        return False
     if int(task.get("submission_generation") or 0) != generation:
-        return
+        return False
     branch = (task.get("branch") or "").strip()
     if not branch:
-        return
+        return False
     project = await repo.resolve_project_for_task(db, int(task["id"]))
     if project is None or not review_dispatch_enabled(gate_policy_of(project)):
-        return
-    # ПОСЛЕДНЕЕ слово перед заказом (#1252). Первую проверку отчёта делает
-    # _close_a_run_without_a_report, и между ней и этим местом лежат запись
-    # долга, чтение задачи и чтение проекта, а на возобновлении — ещё и весь
-    # перерыв между проходами свипа. Отчёт, доехавший в это окно, покупал бы
-    # второго ревьюера поверх уже сданного: деньги тратятся ЗДЕСЬ, и здесь же
-    # надо смотреть. Проверка именно рунг-совпадением (#1025), а не «есть ли
-    # хоть какой-то отчёт этого поколения»: у добора лестницы (#879) отчёт
-    # предыдущей ступени законно есть, и запрет по нему закрыл бы дверь перед
-    # заказом, который как раз и заказывали вторым.
+        return False
+    # Первая из ДВУХ проверок отчёта (#1252). Ещё одну, ПОСЛЕДНЮЮ, делает
+    # dispatch_local_review непосредственно перед вставкой строки заказа —
+    # между ЭТИМ местом и той вставкой ``open_second_door`` перечитывает
+    # свежесть сдачи и достижимость, а сам заказ считает потолок стоимости и
+    # готовит дифф/правила (``prepare_review_order``), и отчёт, доехавший в
+    # это куда более длинное окно, эта проверка одна не увидит. Проверка
+    # именно рунг-совпадением (#1025), а не «есть ли хоть какой-то отчёт
+    # этого поколения»: у добора лестницы (#879) отчёт предыдущей ступени
+    # законно есть, и запрет по нему закрыл бы дверь перед заказом, который
+    # как раз и заказывали вторым.
     if await _dispatch_report(db, int(task["id"]), generation, dispatch) is not None:
-        return
+        return True
     await open_second_door(
         db,
         task,
@@ -2987,7 +3054,15 @@ async def _second_door_after_run(
             f"({dispatch.get('model') or 'модель не названа'}) кончился "
             f"статусом {run_status} и отчёта не оставил"
         ),
+        late_report_recheck=dispatch,
     )
+    # Последнее слово — уже ПОСЛЕ попытки открыть дверь, а не только до неё
+    # (находка по e69a3d5). Что бы ни случилось внутри — дверь открылась,
+    # отказала по конфигурации/потолку, или её остановила ПОСЛЕДНЯЯ проверка
+    # внутри dispatch_local_review, — единственная правда сейчас в базе:
+    # если СВОЙ отчёт этого заказа тем временем нашёлся, статус решает он, а
+    # не путь, которым мы сюда пришли.
+    return await _dispatch_report(db, int(task["id"]), generation, dispatch) is not None
 
 
 # ---------------------------------------------------------------------------
