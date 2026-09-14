@@ -2646,6 +2646,23 @@ async def owe_second_door(
     )
 
 
+async def delete_review_dispatch(db: aiosqlite.Connection, dispatch_id: int) -> None:
+    """Remove a debt-tracking stub once it settled without a crash (#1266).
+
+    The sync cloud-create-refusal path writes a placeholder row (empty
+    ``agent_id``) purely as crash insurance BEFORE the risky call that might
+    open the second door — the row is how a resumed sweep finds the debt if
+    the process dies in between. When nothing crashed, the caller already
+    knows the outcome from the direct call and no longer needs the row: an
+    unconfigured local path must stay byte-identical to before the second
+    door existed (#1252 AC-3), and a successful local order must be the ONLY
+    row a clean run leaves. Called only on the row this same call just wrote
+    and immediately settled — never on a row a crash may have left for a
+    later sweep to find.
+    """
+    await db.execute("DELETE FROM review_dispatches WHERE id=?", (dispatch_id,))
+
+
 async def set_review_dispatch_provider_tokens(
     db: aiosqlite.Connection, dispatch_id: int, tokens: int
 ) -> None:

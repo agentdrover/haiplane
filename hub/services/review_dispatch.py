@@ -1901,7 +1901,21 @@ async def maybe_dispatch_review(
         # локальный заказ по ЭТОМУ долгу, а не догадкой по пути, которым
         # сюда пришли.
         await _settle_second_door(db, stub, task_row=task)
-        return await _second_door_already_opened(db, stub)
+        opened = await _second_door_already_opened(db, stub)
+        # Заглушка была ТОЛЬКО страховкой от падения внутри вызова выше —
+        # раз мы досюда дошли без исключения, падения не было, и сама она
+        # больше не нужна ни свипу, ни счёту шагов. Не убрать её значило бы
+        # оставить облачную строку там, где по AC-3 #1252 её не бывает
+        # вовсе (ненастроенный путь — байт в байт как раньше) и там, где
+        # AC-1 #1252 требует ровно одну строку, локальную. Падение МЕЖДУ
+        # _settle_second_door и этим удалением не теряет долг: строка к
+        # тому моменту уже закрыта (done/failed) самой _settle_second_door,
+        # а следующий свип такую строку не трогает — то есть худшее, что
+        # оставляет несостоявшееся удаление, это лишняя закрытая строка в
+        # истории, не потерянная вторая дверь.
+        await repo.delete_review_dispatch(db, stub["id"])
+        await db.commit()
+        return opened
 
     # #1025: pin whose report this dispatch waits for, resolved from the
     # reviewer token at dispatch time (above, where the code was minted under
