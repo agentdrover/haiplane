@@ -777,3 +777,61 @@ async def test_foreign_locator_is_read_even_when_collection_succeeded(
     resolution = brief["locator_resolution"][0]
     assert resolution["status"] == "resolvable", resolution
     assert "could not read" not in resolution["reason"], resolution
+
+
+async def test_the_brief_names_the_second_provider_and_why(
+    client: AsyncClient, db
+):
+    """AC-3 (#1266): бриф называет канал отчёта и причину, когда это не облако.
+
+    Текст «ВТОРЫМ поставщиком... причина» сегодня живёт только в ленте
+    задачи (review_dispatch.py, находка при create). MachineReviewView не
+    несёт channel и причину отказа облака, и бриф показывает локальный
+    отчёт неотличимым от облачного.
+    """
+    from hub.services.review_dispatch import LOCAL_CHANNEL
+
+    task_id = await _submitted_task(client, db, "Second door brief task")
+    row = dict(await repo.get_task(db, task_id))
+    generation = row["submission_generation"]
+
+    dispatch_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        agent_id="local:abc123",
+        run_id="abc123",
+        model="local-reviewer",
+        profile="lite",
+        channel=LOCAL_CHANNEL,
+        second_door_reason=(
+            "облако отчёта НЕ дало — usage_limit_exceeded; отчёт добывается "
+            "ВТОРЫМ поставщиком, локальным (#1252)"
+        ),
+    )
+    await repo.set_review_dispatch_status(db, dispatch_id, "done")
+    await db.commit()
+
+    await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "model": "local-reviewer",
+            "raw_count": 1,
+            "findings_confirmed": [],
+            "findings_rejected": [],
+            "incomplete": False,
+            "unresolved": [],
+            "lost_dimensions": [],
+            "agent": "local-reviewer",
+        },
+    )
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    machine_review = brief["review_report"]["machine_review"]
+    assert machine_review["second_door_channel"] == "local", (
+        "бриф обязан назвать канал отчёта — иначе локальный читается как облачный"
+    )
+    assert "usage_limit_exceeded" in machine_review["second_door_reason"], (
+        "бриф обязан назвать причину, по которой отчёт не облачный"
+    )
