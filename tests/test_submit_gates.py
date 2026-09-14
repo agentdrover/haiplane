@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi import HTTPException
 
@@ -23,6 +25,7 @@ import aiosqlite
 from hub import config, models
 from hub import repository as repo
 from hub import services
+from hub.db import deserialize_str_list
 from hub.models import TaskCreate, TaskSubmitReview
 from hub.services import lifecycle
 from hub.services.gate_pipeline import ALWAYS, OFF, Step, run_steps
@@ -590,8 +593,14 @@ async def _pair_task_ready_to_submit(
     return task
 
 
-def _install_fixed_tip_git(monkeypatch, tip: str):
-    """Git-двойник, чья вершина не меняется между сдачами, пока тест не велит."""
+def _install_fixed_tip_git(monkeypatch, tip: str, *, diff_paths: list[str] | None = None):
+    """Git-двойник, чья вершина не меняется между сдачами, пока тест не велит.
+
+    ``diff_paths`` — для AC-5 (accept_areas): по умолчанию NoopGitOps отдаёт
+    None («дифф не прочитан»), и мержить в affected_areas нечего. Явный
+    список делает дифф наблюдаемым, не трогая остальные тесты, которым он
+    не нужен.
+    """
     from unittest.mock import AsyncMock
 
     from hub.integrations.noop import NoopGitOps
@@ -608,6 +617,11 @@ def _install_fixed_tip_git(monkeypatch, tip: str):
         async def head_sha(self, repo: str, base: str) -> str:
             return self.tip
 
+        async def branch_diff_paths(
+            self, branch: str, base_branch: str | None = None, repo: str | None = None
+        ) -> list[str] | None:
+            return diff_paths
+
     git = _Git(tip)
     monkeypatch.setattr(plugins, "git_ops", git)
     monkeypatch.setattr(
@@ -621,7 +635,16 @@ def _install_fixed_tip_git(monkeypatch, tip: str):
 async def test_resubmitting_the_same_sha_from_review_is_not_a_new_generation(
     db: aiosqlite.Connection, monkeypatch
 ):
-    """AC-1: тот же коммит из review не открывает новое поколение (#1265, #1172)."""
+    """AC-1: тот же коммит из review не открывает новое поколение (#1265, #1172).
+
+    Круг 2 (владелец, вариант A): решение о заказе ревью на этом поколении
+    НЕ отключается — оно принимается ровно так, как #1150/#1152 всегда его
+    принимали, только на неизменившемся поколении, а не на новом. Здесь
+    проверяется, что решение ДОХОДИТ до диспетча (шпион на самой функции
+    принятия решения) — а КАКОЕ это решение при разном покрытии отчётом,
+    без единой правки, доказывают шесть тестов tests/test_review_dispatch.py
+    (#1150/#1152), которые эта задача не трогает.
+    """
     from hub.services import review_dispatch
 
     _install_fixed_tip_git(monkeypatch, "same-tip")
@@ -658,8 +681,9 @@ async def test_resubmitting_the_same_sha_from_review_is_not_a_new_generation(
     assert second.review_approved_current is True, (
         "вердикт по прежней сдаче остаётся текущим — это ТА ЖЕ сдача"
     )
-    assert dispatch_calls == [], (
-        "диспетч ревью не вызван на дубле — проверено вызовом-шпионом, а не выведено"
+    assert dispatch_calls == [task.id], (
+        "решение о заказе ревью принимается на дубле — по #1150/#1152, на "
+        "том же поколении, а не пропущено (находка Codex #1 на 41159735)"
     )
     hint = second.lifecycle_hint or ""
     assert "поколение 1" in hint, "ответ называет поколение, на котором уже стоит сдача"
@@ -692,7 +716,16 @@ async def test_resubmitting_a_new_sha_from_review_still_bumps_the_generation(
 async def test_same_sha_resubmission_answer_is_idempotent(
     db: aiosqlite.Connection, monkeypatch
 ):
-    """AC-3: одна и та же сдача X дважды подряд — один ответ, и не ошибка."""
+    """AC-3: одна и та же сдача X дважды подряд — один ответ, и не ошибка.
+
+    Круг 2 (Codex #1, #3 на 41159735): и после того, как на поколение легла
+    находка при FINDING_OUTCOME=require — гейт finding_outcomes отказал бы
+    ОБЫЧНОЙ сдаче без ответа на неё (422), а повтор того же sha не должен
+    встретить отказ, которого не получил оригинал; и без пуша/открытия PR.
+    """
+    from hub import config
+    from hub.services import orchestration
+
     _install_fixed_tip_git(monkeypatch, "idem-tip")
 
     task = await _pair_task_ready_to_submit(db, "Идемпотентный повтор")
@@ -711,6 +744,98 @@ async def test_same_sha_resubmission_answer_is_idempotent(
     assert second_retry.status == "review"
     assert first_retry.lifecycle_hint == second_retry.lifecycle_hint, (
         "повтор по таймауту обязан получить ТОТ ЖЕ ответ, а не новый текст"
+    )
+
+    # Находка легла на поколение 1, режим — require.
+    await repo.insert_machine_review(
+        db,
+        task_id=task.id,
+        submission_generation=1,
+        harness_skill="lite-diff-review",
+        model="grok-4.6",
+        raw_count=1,
+        findings_confirmed=json.dumps(
+            [{"title": "утечка", "severity": "high", "file": "hub/x.py"}]
+        ),
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+    monkeypatch.setattr(config, "FINDING_OUTCOME", "require")
+
+    ensure_pr_calls: list[int] = []
+
+    async def _ensure_spy(db_, task_, canonical, diff_paths):
+        ensure_pr_calls.append(task_["id"])
+        return None, ""
+
+    monkeypatch.setattr(orchestration, "ensure_delivery_pr", _ensure_spy)
+
+    third_retry = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev")
+    )
+
+    assert third_retry.submission_generation == 1, (
+        "находка + require не роняют повтор в новую генерацию"
+    )
+    assert third_retry.status == "review"
+    assert ensure_pr_calls == [], (
+        "повтор не пушит ветку и не открывает PR (находка Codex #3 на 41159735)"
+    )
+
+
+async def test_same_sha_resubmission_still_applies_its_payload(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-5: accept_areas и finding_outcomes на том же sha не теряются молча.
+
+    Находка Codex #2 на 41159735: ``_same_sha_noop_response`` раньше
+    возвращала ответ, минуя ``_apply_submission`` целиком, — accept_areas и
+    finding_outcomes из тела повторной сдачи тихо выбрасывались, а ответ
+    всё равно выглядел успехом.
+    """
+    from hub.services.finding_identity import finding_uid
+
+    _install_fixed_tip_git(monkeypatch, "payload-tip", diff_paths=["hub/new_area.py"])
+
+    task = await _pair_task_ready_to_submit(db, "Применение данных")
+    await lifecycle.submit_for_review(db, task.id, models.TaskSubmitReview(agent="dev"))
+
+    finding = {"title": "утечка", "severity": "high", "file": "hub/x.py"}
+    review_id = await repo.insert_machine_review(
+        db,
+        task_id=task.id,
+        submission_generation=1,
+        harness_skill="lite-diff-review",
+        model="grok-4.6",
+        raw_count=1,
+        findings_confirmed=json.dumps([finding]),
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+    uid = finding_uid(finding)
+
+    retry = await lifecycle.submit_for_review(
+        db,
+        task.id,
+        models.TaskSubmitReview(
+            agent="dev",
+            accept_areas=True,
+            finding_outcomes=[{"finding_uid": uid, "outcome": "fixed"}],
+        ),
+    )
+
+    assert retry.submission_generation == 1, "данные применились без нового поколения"
+
+    outcomes = await repo.list_finding_outcomes(db, review_id)
+    recorded = [dict(o) for o in outcomes]
+    assert any(o["finding_uid"] == uid and o["outcome"] == "fixed" for o in recorded), (
+        "исход находки записан на текущее поколение, а не выброшен"
+    )
+
+    fresh = dict(await repo.get_task(db, task.id))
+    areas = deserialize_str_list(fresh.get("affected_areas"))
+    assert "hub/new_area.py" in areas, (
+        "accept_areas дописал affected_areas тем же диффом, что и обычная сдача"
     )
 
 
