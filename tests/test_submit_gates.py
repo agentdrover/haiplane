@@ -164,7 +164,9 @@ def test_the_network_walking_steps_come_last():
         names.index(n) for n in cheap_and_stable if n in names
     ), "пиннинг вершины ветки ходит в сеть и обязан идти после дешёвых отказов"
     mutable_gates = ("surfaces", "finding_outcomes", "submit_rules")
-    assert names.index("pin_submission_sha") < min(names.index(n) for n in mutable_gates), (
+    assert names.index("pin_submission_sha") < min(
+        names.index(n) for n in mutable_gates
+    ), (
         "пиннинг и распознавание повтора обязаны идти ДО гейтов, чей ответ "
         "меняется со временем — иначе повтор рискует их отказом"
     )
@@ -593,7 +595,9 @@ async def _pair_task_ready_to_submit(
     return task
 
 
-def _install_fixed_tip_git(monkeypatch, tip: str, *, diff_paths: list[str] | None = None):
+def _install_fixed_tip_git(
+    monkeypatch, tip: str, *, diff_paths: list[str] | None = None
+):
     """Git-двойник, чья вершина не меняется между сдачами, пока тест не велит.
 
     ``diff_paths`` — для AC-5 (accept_areas): по умолчанию NoopGitOps отдаёт
