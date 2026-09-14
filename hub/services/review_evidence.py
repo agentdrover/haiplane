@@ -697,6 +697,7 @@ async def review_report(
     diff volume that could not be measured is None with a reason (not zero,
     which would claim the branch changed nothing — #518).
     """
+    from hub import repository as repo
     from hub.models import MachineReviewView, ReviewReport
 
     generation = task_row.get("submission_generation") or 0
@@ -705,6 +706,26 @@ async def review_report(
     if mr_row is not None:
         machine_review = MachineReviewView(**dict(mr_row))
         machine_review.is_current = machine_review.submission_generation == generation
+        # #1266: channel and reason live on the SETTLED review_dispatches row
+        # — the report table itself carries nothing about how it was
+        # obtained. get_settled_review_dispatch is the same "which dispatch
+        # actually delivered this generation" fact #769 already established;
+        # reusing it here (rather than re-deriving from the task feed, #1252)
+        # keeps this from becoming a second source of the same knowledge.
+        # Cloud, or nothing settled yet, leaves both fields empty — never
+        # guessed, never shown as if it were local.
+        from hub.services.review_dispatch import LOCAL_CHANNEL
+
+        settled_dispatch = await repo.get_settled_review_dispatch(
+            db, int(task_row["id"]), machine_review.submission_generation
+        )
+        if settled_dispatch is not None:
+            settled = dict(settled_dispatch)
+            if settled.get("channel") == LOCAL_CHANNEL:
+                machine_review.second_door_channel = LOCAL_CHANNEL
+                machine_review.second_door_reason = (
+                    settled.get("second_door_reason") or ""
+                )
         await attach_dispositions(db, machine_review)
         state = "current" if machine_review.is_current else "stale"
 
