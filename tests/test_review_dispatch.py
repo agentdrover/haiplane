@@ -7037,3 +7037,76 @@ async def test_a_sync_refusal_keeps_the_second_door_debt_through_a_crash(
         "как и в асинхронном случае (test_a_crash_before_the_second_door_"
         "does_not_lose_it)"
     )
+
+
+async def test_a_submission_moved_during_preparation_buys_no_local_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-4: сдачу пересдали, пока готовился локальный заказ — прогон не покупается.
+
+    ``_submission_still_live`` сегодня перечитывается только в начале
+    ``open_second_door`` — ДО ``review_reach``, счёта потраченного и
+    медленной ``prepare_review_order``. Пересдача, случившаяся ВНУТРИ
+    подготовки заказа, этой ранней проверке не видна вовсе, а
+    ``late_report_recheck`` перед вставкой строки смотрит только на поздний
+    отчёт, не на актуальность сдачи.
+    """
+    from hub.services import review_dispatch as review_dispatch_module
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-move"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-resubmit-during-prep", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_prepare = review_dispatch_module.prepare_review_order
+    moved: list[bool] = []
+
+    async def _resubmit_during_prep(
+        db_conn, task, *, branch, generation, force_profile, principal_id
+    ):
+        if not moved:
+            moved.append(True)
+            # Пересдача поднимает submission_generation — ровно то, что
+            # увидел бы _submission_still_live, если бы его спросили ЗДЕСЬ,
+            # а не только в самом начале open_second_door.
+            await repo.update_task(
+                db_conn, task_id, submission_generation=generation + 1
+            )
+            await db_conn.commit()
+        return await real_prepare(
+            db_conn,
+            task,
+            branch=branch,
+            generation=generation,
+            force_profile=force_profile,
+            principal_id=principal_id,
+        )
+
+    monkeypatch.setattr(
+        review_dispatch_module, "prepare_review_order", _resubmit_during_prep
+    )
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert moved, "предпосылка: пересдача произошла именно во время подготовки заказа"
+    assert await _local_dispatches(db, task_id) == [], (
+        "сдачу пересдали, пока готовился локальный заказ — прогон по уехавшей "
+        "сдаче не покупается"
+    )
