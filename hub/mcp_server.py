@@ -2065,11 +2065,8 @@ async def hub_submit_for_review(
 
     This does NOT complete the task, and the verdict is not yours: the
     reviewer is a different actor (hub_get_review_brief, hub_submit_review).
-    Bumps the generation, invalidating any earlier APPROVED — UNLESS this
-    call names the same commit already on review from ``status=review``
-    (#1265): that resubmission opens no new generation, the earlier verdict
-    stays current, and the response names the unchanged generation instead
-    of reading like a fresh submission.
+    Bumps the generation, invalidating any earlier APPROVED; resubmitting
+    the same commit from review keeps it (#1265).
 
     Args:
         task_id: The running pair task ID
