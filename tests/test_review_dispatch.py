@@ -6972,3 +6972,68 @@ async def test_a_replacement_does_not_spend_the_ladder_step(
         "замена упавшего облачного LITE не должна тратить шаг лестницы: "
         "DEEP-добор обязан быть заказан по неполному отчёту локальной замены"
     )
+
+
+async def test_a_sync_refusal_keeps_the_second_door_debt_through_a_crash(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-2: синхронный отказ облака обязан оставить долг ДО риска сломаться.
+
+    Облако отказывает НА СОЗДАНИИ (синхронно, строки не бывает вовсе).
+    Подготовка локального заказа (``prepare_review_order`` для локального
+    принципала) падает — ровно то, что может случиться из-за сети внутри
+    неё. Сегодня ``open_second_door`` зовётся БЕЗ строки долга, и падение
+    внутри нею не оставляет НИЧЕГО, что свип мог бы повторить: вторая дверь
+    потеряна навсегда.
+    """
+    from hub.services import review_dispatch as rd
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    async def _refused(**kwargs):
+        return None, _LIMIT_REFUSAL
+
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "test-key")
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _refused)
+
+    local_pid = await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    real_order = rd.prepare_review_order
+    local_attempts = {"n": 0}
+
+    async def _flaky_for_local(*args, **kwargs):
+        if kwargs.get("principal_id") == local_pid:
+            local_attempts["n"] += 1
+            if local_attempts["n"] == 1:
+                raise RuntimeError(
+                    "подготовка локального заказа сорвалась: git-операция не прошла"
+                )
+        return await real_order(*args, **kwargs)
+
+    monkeypatch.setattr(rd, "prepare_review_order", _flaky_for_local)
+
+    task_id = await _submitted(
+        client, db, "spike-sync-debt-crash", policy={"review": "dispatch"}
+    )
+
+    rows_after_crash = list(
+        await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=?", (task_id,)
+        )
+    )
+    assert rows_after_crash, (
+        "долг второй двери обязан быть записан ДО рискованного вызова: иначе "
+        "падение внутри подготовки локального заказа теряет обещанную вторую "
+        "дверь безвозвратно"
+    )
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    locals_ = await _local_dispatches(db, task_id)
+    assert len(locals_) == 1 and locals_[0]["status"] == "done", (
+        "долг второй двери обязан быть отдан на следующем проходе свипа, "
+        "как и в асинхронном случае (test_a_crash_before_the_second_door_"
+        "does_not_lose_it)"
+    )
