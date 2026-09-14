@@ -1310,3 +1310,101 @@ async def test_a_human_deliver_decision_commits_the_resolver_note_when_unusable(
     assert "закрыт" in feed, (
         f"отказ обязан назвать закрытое/отсутствующее состояние: {updates}"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1261, Cursor/grok-4.6 (отчёт #376, находка 40adcc8f02f26c98), подтверждено
+# стюардом чтением pr_for_delivery. unusable сам по себе не различает ДВЕ
+# разные причины "заменить нечем": поиск живого PR по ветке ОТВЕТИЛ "нет
+# такого" (факт, случай AC-3) или поиск УПАЛ с исключением (молчание —
+# #725/#802/#959 запрещают читать его как отрицательный факт). Текст
+# P2-чинки выше ("у ветки нет открытого PR") был написан только для первого
+# случая; для второго это превращает "спросить не удалось" в "замены нет".
+# Та же путаница била и по свипу: unusable считался терминальным всегда,
+# так что сетевой сбой поиска уводил задачу к человеку вместо повтора на
+# следующем проходе.
+#
+# DeliveryPR получил search_unanswered: True только когда сам поиск упал
+# (find_note непусто — единственный путь, которым _live_pr_for_branch его
+# заполняет). pr_for_delivery остаётся единственным местом, которое решает.
+# ---------------------------------------------------------------------------
+
+
+def _git_with_failed_replacement_search(state: str = "closed"):
+    """Записанный PR в состоянии ``state``, а поиск замены по ветке падает —
+    случай (b): "спросить не удалось", а не "открытого PR нет" (случай a)."""
+    g = _git_with_state(state, found=None)
+    g.pr_for_branch = AsyncMock(side_effect=RuntimeError("gh: rate limited"))
+    return g
+
+
+async def test_a_human_deliver_decision_does_not_claim_no_open_pr_when_the_search_failed(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Тест 1. Записанный PR закрыт, поиск живой замены по ветке УПАЛ.
+
+    Ни одна запись в ленте не должна утверждать «нет открытого PR» — это
+    неизвестно, а не установлено. Текст обязан называть, что поиск не
+    ответил. На сдаче №3 (dceeec82) тест красный: P2-чинка отвечает "Мержить
+    нечего: у ветки нет открытого PR" и для этого случая тоже.
+    """
+    from hub.services import lifecycle as lifecycle_mod
+
+    _git_with_failed_replacement_search("closed")
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    ok, reason = await lifecycle_mod.deliver_on_disposition(
+        db, task_id, "deliver", via="test"
+    )
+
+    assert ok is False, "закрытый без установленной замены не доставляется"
+    updates = [
+        (dict(u)["content"] or "") for u in await repo.get_task_updates(db, task_id)
+    ]
+    feed = " ".join(updates)
+    assert "нет открытого PR" not in feed, (
+        f"поиск не ответил — это не факт об отсутствии открытого PR: {updates}"
+    )
+    assert "не ответил" in feed, (
+        f"отказ обязан назвать, что поиск замены не ответил: {updates}"
+    )
+
+
+async def test_a_failed_replacement_search_waits_instead_of_calling_a_human(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Тест 2. Тот же сетап через свип: сетевой сбой поиска — не решение
+    человека, а повод попробовать на следующем проходе. Три прохода дают
+    ровно одну ноту ожидания, задача остаётся running, транзакция закрыта.
+
+    На сдаче №3 (dceeec82) тест красный: свип считает unusable терминальным
+    всегда и уводит задачу в needs_decision на первом же проходе.
+    """
+    from hub import poller
+
+    g = _git_with_failed_replacement_search("closed")
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    for _ in range(3):
+        task = dict(await repo.get_task(db, task_id))
+        await poller._deliver_pair_task(db, task)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "сбой поиска замены — временное состояние, не решение человека"
+    )
+    g.merge_pr.assert_not_awaited()
+    updates = [
+        (dict(u)["content"] or "") for u in await repo.get_task_updates(db, task_id)
+    ]
+    waits = [c for c in updates if "Доставка отложена" in c]
+    assert len(waits) == 1, (
+        f"нота ожидания — один раз на три прохода, не на каждый: {updates}"
+    )
+    assert db.in_transaction is False, (
+        "проход по этой ветке не должен оставлять соединение в открытой транзакции"
+    )

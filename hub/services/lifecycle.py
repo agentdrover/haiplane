@@ -4555,12 +4555,33 @@ async def deliver_on_disposition(
             "гейт — одобренное ревью, неизменившийся с апрува код, зелёный CI "
             "(#1037).",
         )
+    elif delivery_pr.unusable and delivery_pr.search_unanswered:
+        # #1261 (Cursor/grok-4.6, report #376, finding 40adcc8f02f26c98): the
+        # "нет открытого PR" text just below is a FACT — the search for a
+        # replacement answered "none". Here it did not answer at all (it
+        # raised); reading that silence as "no open PR" is exactly what
+        # #725/#802/#959 forbid. The recorded PR is still named closed — that
+        # part IS known — but whether a replacement exists is not, and the
+        # decision can simply be repeated once the search can be asked again.
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Доставка по решению человека НЕ выполнена: {reason}. Записанный "
+            "PR закрыт и не смержен, но узнать, есть ли у ветки открытая "
+            "замена, не удалось — поиск не ответил, а не «замены нет». "
+            "Задача остаётся принятой; решение можно принять снова, когда "
+            "поиск ответит (#1037).",
+        )
     elif delivery_pr.unusable:
         # #1261 (Codex, P2): the generic "PR остался открытым" text below is
         # false here — unusable means the recorded PR is closed or absent and
-        # nothing replaced it (#959), so there is no open PR for a human to
-        # find. Closed is terminal (no reopening), so this must not read as a
-        # transient state either — mergeable is not "not yet merged".
+        # the search for a replacement ANSWERED "none" (search_unanswered is
+        # False here — see the branch above for when it did not), so there is
+        # no open PR for a human to find. Closed is terminal (no reopening),
+        # so this must not read as a transient state either — mergeable is
+        # not "not yet merged".
         await repo.add_task_update(
             db,
             task_id,

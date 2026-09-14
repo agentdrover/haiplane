@@ -3017,6 +3017,15 @@ class DeliveryPR:
     # branch reads it: telling somebody to wait for a green CI is a promise
     # about a PR, and it must not be made when the PR itself is unknown.
     established: bool = True
+    # #1261 (Cursor/grok-4.6, report #376, finding 40adcc8f02f26c98): ``unusable``
+    # alone conflates two different facts. The recorded PR is closed either way,
+    # but the search for a live replacement can ANSWER "no open PR" (a fact) or
+    # RAISE (silence — #725/#802/#959's rule that silence is never read as a
+    # negative). Both set ``unusable`` today because both mean "cannot deliver
+    # THIS pass", but only the first is a decision for a human: the second is a
+    # network blip the next pass may answer on its own. True only in that second
+    # case — the search itself failed, not merely came back empty.
+    search_unanswered: bool = False
 
 
 async def _recorded_pr_state(
@@ -3211,6 +3220,10 @@ async def pr_for_delivery(db: aiosqlite.Connection, task: dict[str, Any]) -> Del
                     f"{branch or '(ветки нет)'} не нашлось"
                 ),
                 unusable=True,
+                # #1261: find_note is non-empty ONLY on the exception path in
+                # _live_pr_for_branch (found is None there returns ""), so this
+                # is precisely "the search raised" versus "the search answered".
+                search_unanswered=bool(find_note),
             )
         # merged, open, or unknown: the number stands. "Merged" must never be
         # replaced — a second merge is not extra safety, and #605 already had

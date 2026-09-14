@@ -1750,11 +1750,23 @@ async def _deliver_pair_task(db, task: dict) -> None:
     # cycle instead of a second one.
     task, delivery_pr = await services.resolve_delivery_pr(db, task)
     pr_num = task.get("pr_number")
+    if delivery_pr.unusable and delivery_pr.search_unanswered:
+        # #1261 (Cursor/grok-4.6, report #376, finding 40adcc8f02f26c98):
+        # ``unusable`` alone does not say WHY a replacement could not be
+        # found — the search can answer "no open PR" (a fact, AC-3's case)
+        # or it can raise (silence, #725/#802/#959's forbidden read). Sending
+        # this to needs_decision would turn a network blip into a human
+        # chore the very next pass might make unnecessary — the same
+        # reasoning as an unreadable recorded-PR state, so it gets the same
+        # treatment: a transient wait, not a terminal refusal.
+        await _note_pair_delivery_wait(db, task_id, pr_num, delivery_pr.reason)
+        return
     if delivery_pr.unusable:
-        # #959: closed, no live replacement — nothing to merge. Asking
-        # GitHub to merge a corpse is what produced "merge_failed: GitHub
-        # refused the merge" on #1204; the true cause is named instead
-        # (AC-3), and it is a decision for a human, not a wait.
+        # #959: closed, the search for a replacement ANSWERED "none" —
+        # nothing to merge. Asking GitHub to merge a corpse is what produced
+        # "merge_failed: GitHub refused the merge" on #1204; the true cause
+        # is named instead (AC-3), and it is a decision for a human, not a
+        # wait. (The search-raised case above never reaches here.)
         ok, detail = False, delivery_pr.reason
     else:
         ok, detail = await services.merge_before_completion(db, task)
