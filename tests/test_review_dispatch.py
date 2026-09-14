@@ -7231,3 +7231,47 @@ async def test_two_real_cloud_runs_still_hit_the_ladder_ceiling(
         "два настоящих облачных прогона обязаны считаться двумя шагами — "
         "починка счёта логического шага не должна расширить потолок"
     )
+
+
+async def test_a_sync_refusal_names_the_refusal_not_a_finished_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """F3 (раунд 2, 7a78080de93938ae): синхронный отказ — не «прогон кончился».
+
+    _second_door_after_run строит текст шаблоном «прогон облачного агента
+    ... кончился статусом ... и отчёта не оставил», и после унификации
+    синхронного и асинхронного путей (#1266) этот же шаблон достаётся и
+    заглушке долга синхронного отказа — с пустым agent_id, где не было ни
+    агента, ни рана. Карточка и second_door_reason обязаны назвать
+    НАБЛЮДЁННЫЙ отказ провайдера НА СОЗДАНИИ, а не сочинённое «кончился
+    статусом» про событие, которого не было.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    _wire(monkeypatch, _DispatchRecorder(None, _LIMIT_REFUSAL))
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-sync-refusal-wording", policy={"review": "dispatch"}
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    started = [u for u in updates if "запущено ЛОКАЛЬНО" in u]
+    assert len(started) == 1, "запуск второй двери называется в карточке"
+    note = started[0]
+    assert "кончился статусом" not in note, (
+        "создание агента отказало СИНХРОННО — рана, который бы «кончился», не было"
+    )
+    assert "usage_limit_exceeded" in note and "HTTP 400" in note, (
+        "причина — наблюдённый отказ провайдера НА СОЗДАНИИ, с кодом"
+    )
+
+    local = (await _local_dispatches(db, task_id))[0]
+    assert "кончился статусом" not in local["second_door_reason"], (
+        "second_door_reason — тот же текст, что и в карточке; третьей копии "
+        "не заводится"
+    )
+    assert "usage_limit_exceeded" in local["second_door_reason"]
