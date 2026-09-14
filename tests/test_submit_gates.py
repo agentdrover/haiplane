@@ -843,6 +843,86 @@ async def test_same_sha_resubmission_still_applies_its_payload(
     )
 
 
+async def test_a_replayed_payload_is_not_an_error_but_a_typo_is(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 и AC-5 на одном теле (Cursor #380: db8880bcc6c939e2, 97ee0d78bda22c1c).
+
+    Повтор ТОГО ЖЕ тела с finding_outcomes, которые первый вызов уже записал,
+    — не ошибка: эти uid отвечены на поколении. А uid, которого у поколения
+    нет вовсе, — опечатка, и на неё ответ тот же 422, что у обычной сдачи,
+    а не молчаливый успех над выброшенными данными.
+    """
+    from fastapi import HTTPException
+
+    from hub.services.finding_identity import finding_uid
+
+    _install_fixed_tip_git(monkeypatch, "replay-tip")
+
+    task = await _pair_task_ready_to_submit(db, "Повтор тела и опечатка")
+    await lifecycle.submit_for_review(db, task.id, models.TaskSubmitReview(agent="dev"))
+
+    finding = {"title": "утечка", "severity": "high", "file": "hub/x.py"}
+    await repo.insert_machine_review(
+        db,
+        task_id=task.id,
+        submission_generation=1,
+        harness_skill="lite-diff-review",
+        model="grok-4.6",
+        raw_count=1,
+        findings_confirmed=json.dumps([finding]),
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+    body = models.TaskSubmitReview(
+        agent="dev",
+        finding_outcomes=[{"finding_uid": finding_uid(finding), "outcome": "fixed"}],
+    )
+
+    first = await lifecycle.submit_for_review(db, task.id, body)
+    replay = await lifecycle.submit_for_review(db, task.id, body)
+
+    assert first.submission_generation == replay.submission_generation == 1
+    assert first.lifecycle_hint == replay.lifecycle_hint, (
+        "повтор тела с уже записанными исходами — тот же ответ, а не ошибка"
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.submit_for_review(
+            db,
+            task.id,
+            models.TaskSubmitReview(
+                agent="dev",
+                finding_outcomes=[
+                    {"finding_uid": "0000deadbeef0000", "outcome": "fixed"}
+                ],
+            ),
+        )
+    assert refused.value.status_code == 422, (
+        "uid, которого у поколения нет, — не повтор, а опечатка: 422, как у обычной сдачи"
+    )
+
+
+async def test_the_second_read_refusal_does_not_claim_a_bumped_generation(
+    db: aiosqlite.Connection,
+):
+    """Cursor #380 (e1e65dee8cdf6635): отказ #1152 теперь пишется и на пути
+    #1265, где поколение НЕ поднималось. Текст обязан быть правдой на обоих
+    путях — «код не изменился», а не «пересдача подняла поколение»."""
+    from hub.services.review_dispatch import _refuse_second_read
+
+    task = await _pair_task_ready_to_submit(db, "Текст отказа")
+    await _refuse_second_read(db, task.id, 42)
+
+    said = " ".join(
+        (dict(u)["content"] or "") for u in await repo.get_task_updates(db, task.id)
+    )
+    assert "отчёт #42" in said
+    assert "подняла" not in said, (
+        f"на пути #1265 поколение не поднималось — текст не вправе это утверждать: {said}"
+    )
+
+
 async def test_same_sha_from_fix_requested_is_untouched(db: aiosqlite.Connection):
     """AC-4: правило не срабатывает вне review — сдача из fix_requested не тронута.
 

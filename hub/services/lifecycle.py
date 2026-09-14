@@ -2547,31 +2547,51 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
     generation = int(state.task.get("submission_generation") or 0)
     agent = (body.agent or state.task.get("assigned_agent") or "").strip()
 
+    if body.accept_areas:
+        # Код не менялся — дифф тот же, что видела бы обычная сдача, но он
+        # нигде не закэширован: читаем заново. ДО блокировки записи, как у
+        # обычной сдачи (resolve_diff стоит в конвейере до перехода): это
+        # сетевой git, и держать под ним BEGIN IMMEDIATE значит останавливать
+        # все записи хаба (#1265, Cursor #380, 8a892feff574a2a6).
+        await _step_resolve_diff(state)
+
     async with write_transaction(db):
         # AC-5: то же место в транзакции, что и в _apply_submission — до
         # того, как решение о ревью уходит за пределы транзакции ниже.
         # Поколение, которому отвечают исходы, — ТЕКУЩЕЕ: здесь оно не растёт.
         open_items = await finding_outcome.open_findings(db, task_id, generation)
+        # AC-3: повтор тела, чьи исходы уже записал предыдущий такой же вызов,
+        # не становится ошибкой — такие uid отвечены на ЭТОМ поколении и
+        # просто пропускаются. Но uid, которого у поколения нет вовсе
+        # (опечатка), — не повтор: обычная сдача ответила бы на него 422, и
+        # здесь ответ тот же, а не молчаливый успех над выброшенными данными
+        # (AC-5; Cursor #380, 97ee0d78bda22c1c).
+        already_answered: set[str] = set()
+        for report in await repo.machine_reviews_of_generation(db, task_id, generation):
+            already_answered.update(
+                str(dict(row)["finding_uid"])
+                for row in await repo.list_finding_outcomes(db, int(dict(report)["id"]))
+            )
+        open_uids = {str(found["finding_uid"]) for found in open_items}
+        pending = [
+            item
+            for item in body.finding_outcomes
+            if not (
+                item.finding_uid in already_answered
+                and item.finding_uid not in open_uids
+            )
+        ]
         try:
             outcome_writes, _still_open = finding_outcome.plan_outcomes(
-                open_items, body.finding_outcomes
+                open_items, pending
             )
-        except ValueError:
-            # #1265 AC-3: повтор, чьи находки уже закрыл предыдущий такой же
-            # повтор, не становится ошибкой — closed uid просто не входит в
-            # open_items второй раз, а нераспознанный uid из старого тела
-            # запроса — не новая проблема этого вызова.
-            outcome_writes = []
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         if outcome_writes:
             await finding_outcome.apply_outcomes(
                 db, task_id, generation, outcome_writes, reported_by=agent
             )
         if body.accept_areas:
-            # Код не менялся — дифф тот же, что видела бы обычная сдача, но
-            # он нигде не закэширован: читаем заново. Сама проверка «тот же
-            # ли sha» выше нового git-вызова не делала — это про НЕЁ, а не
-            # про применение данных, которое обязано смотреть на диф.
-            await _step_resolve_diff(state)
             if state.diff_paths:
                 declared = deserialize_str_list(state.task.get("affected_areas"))
                 merged = list(declared) + [
