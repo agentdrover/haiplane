@@ -6921,7 +6921,9 @@ async def test_a_replacement_does_not_spend_the_ladder_step(
     """
     from hub.services.review_dispatch import DEEP, wait_for_local_runs
 
-    recorder = _DispatchRecorder({"agent": {"id": "bc-ladder"}, "run": {"id": "r-ladder"}})
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-ladder"}, "run": {"id": "r-ladder"}}
+    )
     _wire(monkeypatch, recorder)
     await _pinned_setup(db, monkeypatch)
     await _local_principal(db, monkeypatch)

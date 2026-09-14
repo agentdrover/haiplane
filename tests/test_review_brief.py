@@ -779,9 +779,7 @@ async def test_foreign_locator_is_read_even_when_collection_succeeded(
     assert "could not read" not in resolution["reason"], resolution
 
 
-async def test_the_brief_names_the_second_provider_and_why(
-    client: AsyncClient, db
-):
+async def test_the_brief_names_the_second_provider_and_why(client: AsyncClient, db):
     """AC-3 (#1266): бриф называет канал отчёта и причину, когда это не облако.
 
     Текст «ВТОРЫМ поставщиком... причина» сегодня живёт только в ленте
