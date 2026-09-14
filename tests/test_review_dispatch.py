@@ -6902,3 +6902,73 @@ async def test_a_report_arriving_while_the_local_order_is_being_prepared_stops_i
     assert cloud["status"] == "done", (
         "доехавший отчёт принадлежит этому заказу — закрывается им"
     )
+
+
+# --- #1266: пять остаточных находок доставки #1252 --------------------------
+
+
+async def test_a_replacement_does_not_spend_the_ladder_step(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-1: локальная замена упавшего облачного LITE не тратит шаг лестницы.
+
+    Облачный LITE СОЗДАЁТСЯ (в отличие от test_a_deep_top_up_is_not_
+    silenced_by_an_earlier_lite_debt, где он отказывает на создании и строки
+    не пишет) и кончается без отчёта. Вторая дверь заказывает локальную
+    замену, её отчёт неполный. count_review_dispatches сегодня считает ОБЕ
+    строки (облачную и локальную замену) как два шага, REVIEW_LADDER_MAX_
+    STEPS=2 достигнут — DEEP-добор молча не заказывается.
+    """
+    from hub.services.review_dispatch import DEEP, wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ladder"}, "run": {"id": "r-ladder"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub(_INCOMPLETE_LOCAL_REPORT))
+
+    task_id = await _submitted(
+        client, db, "spike-ladder-replacement", policy={"review": "dispatch"}
+    )
+    cloud_before = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert cloud_before["profile"] == "lite"
+
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes') "
+        "WHERE id = ?",
+        (cloud_before["id"],),
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    locals_ = await _local_dispatches(db, task_id)
+    assert len(locals_) == 1 and locals_[0]["status"] == "done"
+    assert locals_[0]["profile"] == "lite"
+
+    deep_rows = [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud' "
+            "AND profile=?",
+            (task_id, DEEP),
+        )
+    ]
+    assert deep_rows, (
+        "замена упавшего облачного LITE не должна тратить шаг лестницы: "
+        "DEEP-добор обязан быть заказан по неполному отчёту локальной замены"
+    )
