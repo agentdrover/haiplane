@@ -4561,8 +4561,12 @@ async def deliver_on_disposition(
         # replacement answered "none". Here it did not answer at all (it
         # raised); reading that silence as "no open PR" is exactly what
         # #725/#802/#959 forbid. The recorded PR is still named closed — that
-        # part IS known — but whether a replacement exists is not, and the
-        # decision can simply be repeated once the search can be asked again.
+        # part IS known — but whether a replacement exists is not. No retry is
+        # promised: decide/force-complete have already committed the task as
+        # completed before this runs, so a second decision is refused and the
+        # delivery sweep no longer picks the task up (Cursor #378, finding
+        # 5a41a733cbb3e7be). What remains is the undelivered-work registry
+        # (#1198), which lists a completed task whose PR is not merged.
         await repo.add_task_update(
             db,
             task_id,
@@ -4571,8 +4575,9 @@ async def deliver_on_disposition(
             f"Доставка по решению человека НЕ выполнена: {reason}. Записанный "
             "PR закрыт и не смержен, но узнать, есть ли у ветки открытая "
             "замена, не удалось — поиск не ответил, а не «замены нет». "
-            "Задача остаётся принятой; решение можно принять снова, когда "
-            "поиск ответит (#1037).",
+            "Задача принята и остаётся завершённой без доставки: повторное "
+            "решение по ней хаб уже не примет, а работа ветки видна в реестре "
+            "недоставленного (#1198, #1037).",
         )
     elif delivery_pr.unusable:
         # #1261 (Codex, P2): the generic "PR остался открытым" text below is

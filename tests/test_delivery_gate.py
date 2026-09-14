@@ -1370,6 +1370,15 @@ async def test_a_human_deliver_decision_does_not_claim_no_open_pr_when_the_searc
     assert "не ответил" in feed, (
         f"отказ обязан назвать, что поиск замены не ответил: {updates}"
     )
+    # Cursor #378 (5a41a733cbb3e7be): decide уже записал completed до этой
+    # доставки, повторное решение хаб отвергнет — обещать его значит назвать
+    # выход, которого нет. Выход, который есть, — реестр недоставленного.
+    assert "принять снова" not in feed, (
+        f"повторного решения по завершённой задаче не будет: {updates}"
+    )
+    assert "реестр" in feed, (
+        f"отказ обязан назвать, где работа остаётся видимой: {updates}"
+    )
 
 
 async def test_a_failed_replacement_search_waits_instead_of_calling_a_human(
