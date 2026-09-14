@@ -6989,11 +6989,7 @@ async def test_a_sync_refusal_keeps_the_second_door_debt_through_a_crash(
     from hub.services import review_dispatch as rd
     from hub.services.review_dispatch import wait_for_local_runs
 
-    async def _refused(**kwargs):
-        return None, _LIMIT_REFUSAL
-
-    monkeypatch.setattr(config, "CURSOR_API_KEY", "test-key")
-    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _refused)
+    _wire(monkeypatch, _DispatchRecorder(None, _LIMIT_REFUSAL))
 
     local_pid = await _local_principal(db, monkeypatch)
     _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())

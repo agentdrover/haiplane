@@ -1865,9 +1865,43 @@ async def maybe_dispatch_review(
             # провайдер отверг создание, либо сверка подтвердила, что агента
             # нет. Слепота — ни то, ни другое, и остаётся человеку.
             return False
-        return await open_second_door(
-            db, task, forge, branch, generation, force_profile, cloud_refusal=detail
+        # Долг второй двери записывается ДО попытки её открыть (#1266), тем
+        # же способом, каким это уже делает асинхронный путь (owe_second_
+        # door, _close_a_run_without_a_report): строка-заглушка коммитится
+        # первой, и только потом идёт рискованный вызов (review_reach,
+        # счёт токенов, сетевая prepare_review_order). Без этого порядка
+        # падение ВНУТРИ open_second_door не оставляло свипу ничего, что
+        # повторить, — вторая дверь терялась навсегда, потому что строки не
+        # было вовсе. agent_id пуст здесь НЕ временно: ничего не создано и
+        # не оплачено, и count_review_dispatches (#1266) такую строку в шаг
+        # лестницы не считает.
+        stub_id = await repo.create_review_dispatch(
+            db,
+            task_id=task_id,
+            submission_generation=generation,
+            agent_id="",
+            run_id="",
+            model=model_id,
+            profile=profile,
+            reviewer_principal_id=expected_principal,
+            channel=CLOUD_CHANNEL,
         )
+        await repo.owe_second_door(db, stub_id, detail)
+        await db.commit()
+        stub_row = await repo.get_review_dispatch_for_generation(
+            db, task_id, generation
+        )
+        stub = dict(stub_row) if stub_row is not None else None
+        if stub is None:  # pragma: no cover - defensive, row was just committed
+            return False
+        # Дальше долг разбирает ТОТ ЖЕ путь, что и асинхронный отказ:
+        # _settle_second_door сама решает, открывать ли дверь, и сама же
+        # закрывает строку. Успех отсюда виден тем же наблюдением, каким
+        # _second_door_already_opened судит повтор — живой или удавшийся
+        # локальный заказ по ЭТОМУ долгу, а не догадкой по пути, которым
+        # сюда пришли.
+        await _settle_second_door(db, stub, task_row=task)
+        return await _second_door_already_opened(db, stub)
 
     # #1025: pin whose report this dispatch waits for, resolved from the
     # reviewer token at dispatch time (above, where the code was minted under
