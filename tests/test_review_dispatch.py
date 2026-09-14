@@ -7196,3 +7196,36 @@ async def test_a_late_cloud_report_wins_over_an_existing_fallback(
         "СВОЙ поздний отчёт обязан закрыть заказ как done, а не failed — иначе "
         "get_settled_review_dispatch никогда не сверит этот отчёт как заказ (#769)"
     )
+
+
+async def test_two_real_cloud_runs_still_hit_the_ladder_ceiling(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """Мутационный щит: правка count_review_dispatches не расширяет потолок.
+
+    Два НАСТОЯЩИХ облачных прогона (agent_id непуст, replaces_dispatch_id
+    пуст у обоих — ни один не замена) обязаны по-прежнему считаться ДВУМЯ
+    шагами лестницы, а не одним: #1266 чинит замену, а не потолок.
+    """
+    from hub.services.review_dispatch import REVIEW_LADDER_MAX_STEPS
+
+    task_id = await _submitted(client, db, "spike-ceiling-two-real-cloud")
+    generation = 1
+    for i in range(REVIEW_LADDER_MAX_STEPS):
+        await repo.create_review_dispatch(
+            db,
+            task_id=task_id,
+            submission_generation=generation,
+            agent_id=f"bc-real-{i}",
+            run_id=f"r-{i}",
+            model="grok-4.6",
+            profile="lite" if i == 0 else "deep",
+            channel="cloud",
+        )
+    await db.commit()
+
+    steps = await repo.count_review_dispatches(db, task_id, generation)
+    assert steps == REVIEW_LADDER_MAX_STEPS, (
+        "два настоящих облачных прогона обязаны считаться двумя шагами — "
+        "починка счёта логического шага не должна расширить потолок"
+    )
