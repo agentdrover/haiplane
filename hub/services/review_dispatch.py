@@ -2759,6 +2759,42 @@ async def _dispatch_report(
     return own[rung] if rung < len(own) else None
 
 
+async def dispatch_for_report(
+    db: aiosqlite.Connection, task_id: int, generation: int, report: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The dispatch THIS report belongs to — the inverse of ``_dispatch_report``.
+
+    #1266 round 2 (715481fedbf41130): the report shown in the brief is the
+    LATEST report (``get_latest_machine_review``, ordered by report id), but
+    ``get_settled_review_dispatch`` names the LATEST DONE dispatch (ordered
+    by dispatch id). Those are different rows in the AC-5 shape: a local
+    replacement can settle with its own report before an earlier cloud order
+    settles with ITS late report — the local dispatch then has the higher id
+    even though its report is the older one. Naming the channel from "latest
+    done dispatch" then paints a cloud report as local.
+
+    Rather than inventing a second matching rule, this walks every dispatch
+    of the generation and asks the SAME question ``_dispatch_report`` already
+    answers authoritatively (principal+channel+rung) — "is THIS dispatch's
+    own report exactly the one being shown" — and returns the first match.
+    """
+    report_id = report.get("id")
+    if report_id is None:
+        return None
+    rows = await fetchall(
+        db,
+        "SELECT * FROM review_dispatches WHERE task_id=? "
+        "AND submission_generation=? ORDER BY id",
+        (task_id, generation),
+    )
+    for row in rows:
+        dispatch = dict(row)
+        matched = await _dispatch_report(db, task_id, generation, dispatch)
+        if matched is not None and matched.get("id") == report_id:
+            return dispatch
+    return None
+
+
 def _provider_token_total(usage: dict[str, Any] | None) -> int | None:
     """The billed total, or None when the provider did not answer (#1026)."""
     total = ((usage or {}).get("totalUsage") or {}).get("totalTokens")
