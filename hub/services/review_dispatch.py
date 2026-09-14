@@ -3078,20 +3078,29 @@ async def _settle_second_door(
     рестарте видны обе строки, облачная разбирается первой (ORDER BY id), и
     без этой проверки она покупала бы ВТОРОЙ прогон на то же поколение.
 
-    Находка внешнего ревьюера по коммиту e69a3d5 (P1): строка ЭТОГО заказа
-    закрывалась в ``failed`` БЕЗУСЛОВНО, даже когда ``_second_door_after_run``
-    находил отчёт, принадлежащий ИМЕННО ЕМУ (поздний отчёт застаёт вторую
-    дверь уже приоткрытой) — ``failed``-строки свип больше не разбирает, а
-    ``get_settled_review_dispatch`` берёт только ``done``, то есть годный
-    отчёт был бы никогда не сверен как успешный заказ. Статус берётся из
-    того, что в самом деле нашлось для ЭТОГО заказа, а не назначается заранее.
+    Находка внешнего ревьюера по коммиту e69a3d5 (P1) и её остаток по #1266:
+    строка ЭТОГО заказа закрывалась в ``failed`` БЕЗУСЛОВНО, даже когда у неё
+    самой уже нашёлся СВОЙ отчёт — потому что ``_second_door_already_opened``
+    спрашивалась РАНЬШЕ. На возобновлении после падения это не гипотетика:
+    локальная замена уже закоммичена (долг «отдан» с точки зрения этой
+    проверки), а поздний облачный отчёт ЭТОГО же заказа мог доехать в то же
+    самое окно. Статус берётся из того, что в самом деле нашлось для ЭТОГО
+    заказа, а не из того, приоткрыта ли дверь: СВОЙ отчёт красноречивее
+    замены, потому что замена — это и есть ответ на его отсутствие, а не
+    независимое свидетельство.
     """
+    task_id = int(dispatch["task_id"])
+    generation = int(dispatch["submission_generation"])
+    if await _dispatch_report(db, task_id, generation, dispatch) is not None:
+        await repo.set_review_dispatch_status(db, dispatch["id"], "done")
+        await db.commit()
+        return
     if await _second_door_already_opened(db, dispatch):
         await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
         await db.commit()
         return
     if task_row is None:
-        task_row = await repo.get_task(db, int(dispatch["task_id"]))
+        task_row = await repo.get_task(db, task_id)
     settled_by_its_own_report = await _second_door_after_run(
         db, dispatch, task_row, dispatch.get("run_status") or "терминальным"
     )
