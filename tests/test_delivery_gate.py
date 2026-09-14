@@ -12,6 +12,8 @@ nothing. An accusation made out of ignorance is worse than saying nothing.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import aiosqlite
@@ -28,7 +30,20 @@ from hub.services.delivery_state import (
     PR_OPEN,
     UNKNOWN,
 )
-from tests.test_pair_merge_gate import _approved_pair_task, _git, _report_done
+from tests.test_accept_without_delivery import (
+    _alerts,
+    _approved_task,
+    _decide_deliver,
+    _install,
+    _MergeSpy,
+)
+from tests.test_pair_merge_gate import (
+    _approved_pair_task,
+    _drain_pair_delivery,
+    _git,
+    _git_with_state,
+    _report_done,
+)
 
 
 async def _running_task(client: AsyncClient, title: str = "Undelivered?") -> int:
@@ -1634,4 +1649,712 @@ async def test_an_unanswered_origin_is_not_blamed_on_the_stranded_task(
     assert "ждать бесполезно" not in body
     assert "на origin её нет" not in body, (
         "«на origin её нет» утверждается только после ответа origin"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1261: закрытый записанный PR доставляется только отчётом агента.
+#
+# pr_for_delivery (#767, #959) умеет менять закрытый/отсутствующий записанный
+# номер на живой открытый PR той же ветки. Но у merge_before_completion три
+# вызывающих, и правило применено перед одним — отчётом агента
+# (orchestration._deliver_completed_pair_task, через _complete_without_review).
+# Свип одобренных задач (poller._deliver_pair_task, #971 — СЕГОДНЯ основной
+# путь доставки: #1172 и #1238 пришли им) и решение человека
+# accept+pr_disposition=deliver (lifecycle.deliver_on_disposition, #1037) брали
+# task["pr_number"] как есть. На #1204 (прод aa33d18, 13.09.2026, второй раз —
+# тот же алерт был 09.09) записан закрытый #325, живой той же ветки — #332:
+# свип получил "merge_failed: GitHub refused the merge" и увёл задачу в
+# needs_decision, откуда отчёт агента запрещён (human_decision_required), а
+# решение человека упёрлось бы в тот же #325 — тупик, не считая запрещённого
+# ручного мержа.
+#
+# ВЫБОР ИСПОЛНИТЕЛЯ: разрешение PR — перед КАЖДЫМ вызовом
+# merge_before_completion (resolve_delivery_pr, тонкая обёртка над
+# pr_for_delivery), а не внутри самого гейта. Причина: путь отчёта агента уже
+# зовёт pr_for_delivery САМ, на шаг выше (_complete_without_review, ради
+# ensure_delivery_pr, #967) — протолкнуть разрешение внутрь гейта означало бы
+# спросить провайдера о том же PR дважды за один отчёт. pr_for_delivery
+# остаётся единственной копией правила #959; resolve_delivery_pr — второй
+# вход в неё же, а не вторая логика.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_delivery_sweep_replaces_a_closed_recorded_pr(
+    db: aiosqlite.Connection,
+) -> None:
+    """AC-1. Живой случай #1204: записан #325 (CLOSED), у ветки открыт #332.
+
+    На неисправленном коде (poller._deliver_pair_task зовёт
+    merge_before_completion с task["pr_number"] как есть) этот тест красный:
+    свип пытается мержить закрытый #325, GitHub отказывает, задача уходит в
+    needs_decision с алертом "merge_failed: GitHub refused the merge" вместо
+    доставки через #332.
+    """
+    g = _git_with_state("closed", found=332)
+    task_id = await _approved_pair_task(db, pr_number=325)
+    await repo.update_task(
+        db, task_id, branch="task-1204/undelivered-base-calls-a-human"
+    )
+    await db.commit()
+
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 332, "живой PR ветки записан на задачу"
+    assert g.merge_pr.await_args.args[0] == 332, "и доставляется именно он"
+    assert task["status"] == "completed"
+    g.pr_for_branch.assert_awaited()
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "#325" in feed and "#332" in feed, "оба номера названы в ленте"
+    assert "merge_failed" not in feed
+
+
+async def test_a_human_deliver_decision_replaces_a_closed_recorded_pr(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """AC-2. Тот же случай #1204, но задача уже в needs_decision и человек
+    принимает её с pr_disposition=deliver.
+
+    На неисправленном коде (lifecycle.deliver_on_disposition зовёт
+    merge_before_completion с task["pr_number"] как есть) тест красный: гейт
+    пытается мержить закрытый #325 и отказывает, а не доставляет через #332.
+    """
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_state", AsyncMock(return_value="closed"), raising=False
+    )
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_for_branch", AsyncMock(return_value=332), raising=False
+    )
+    task_id = await _approved_task(
+        client, db, title="undelivered base calls a human", pr=325
+    )
+    await repo.update_task(
+        db, task_id, branch="task-1204/undelivered-base-calls-a-human"
+    )
+    await db.commit()
+
+    resp = await _decide_deliver(client, task_id)
+
+    assert resp.status_code == 200, resp.text
+    assert spy.merged == [332], "доставлен живой PR, а не закрытый записанный"
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 332, "живой PR ветки записан на задачу"
+    alerts = " ".join(await _alerts(db, task_id))
+    assert "#325" in alerts and "#332" in alerts, "оба номера названы в ленте"
+    assert "merge_failed" not in alerts
+
+
+@pytest.mark.parametrize("via", ["poller", "human"])
+async def test_a_closed_pr_without_a_replacement_is_named_not_merged(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, via: str
+) -> None:
+    """AC-3. Записанный PR закрыт, у ветки нет открытого PR ни по одному пути.
+
+    К провайдеру за мержем не обращаются (нет попытки мержа закрытого
+    номера), причина названа словами, а не merge_failed, и задача не
+    остаётся в молчаливом ожидании — она уходит к человеку.
+    """
+    branch = "task-1204/undelivered-base-calls-a-human"
+    if via == "poller":
+        g = _git_with_state("closed", found=None)
+        task_id = await _approved_pair_task(db, pr_number=325)
+        await repo.update_task(db, task_id, branch=branch)
+        await db.commit()
+
+        await _drain_pair_delivery(db)
+
+        g.merge_pr.assert_not_awaited()
+    else:
+        spy = _MergeSpy()
+        _install(monkeypatch, spy)
+        monkeypatch.setattr(
+            plugins.git_ops,
+            "pr_state",
+            AsyncMock(return_value="closed"),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            plugins.git_ops,
+            "pr_for_branch",
+            AsyncMock(return_value=None),
+            raising=False,
+        )
+        task_id = await _approved_task(client, db, title="no replacement", pr=325)
+        await repo.update_task(db, task_id, branch=branch)
+        await db.commit()
+
+        await _decide_deliver(client, task_id)
+
+        assert spy.merged == [], "закрытый PR мержить не пытаются"
+
+    task = dict(await repo.get_task(db, task_id))
+    if via == "poller":
+        # Свип не может решать за человека: менять номер не на что, и
+        # задача уходит в needs_decision, а не остаётся тихо ждать.
+        assert task["status"] == "needs_decision", (
+            "менять номер не на что — решение человека, а не тихое ожидание"
+        )
+    else:
+        # Человек уже принял решение (accept) — оно не отменяется отказом
+        # доставки (#1037): задача остаётся completed, а несостоявшаяся
+        # доставка названа в ленте, а не спрятана за успешным статусом.
+        assert task["status"] == "completed"
+    if via == "poller":
+        feed = " ".join(
+            dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+        )
+    else:
+        feed = " ".join(await _alerts(db, task_id))
+    assert "325" in feed and "закрыт" in feed
+    assert "merge_failed" not in feed, (
+        "причина названа явно, а не отказом GitHub по несуществующему PR"
+    )
+
+
+@pytest.mark.parametrize("state", ["merged", "open", ""])
+async def test_a_merged_open_or_unknown_recorded_pr_is_never_replaced(
+    db: aiosqlite.Connection, state: str
+) -> None:
+    """AC-4, путь свипа. Смерженный — никогда не заменяется (#605): второй
+    мерж не страховка. Открытый и unknown тоже стоят на месте — они и так
+    живы, либо про них нечего сказать наверняка (#959)."""
+    g = _git_with_state(state, found=999)
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 360, f"{state!r}: номер остаётся на месте"
+    if state == "merged":
+        (
+            g.pr_for_branch.assert_not_awaited(),
+            ("мерж-состояние не ищет замену — искать нечего"),
+        )
+    if state:
+        assert g.merge_pr.await_args.args[0] == 360, (
+            "мержится записанный, второй мерж не заводится"
+        )
+
+
+async def test_a_human_deliver_decision_never_replaces_a_merged_pr(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """AC-4, путь человека: то же самое правило по третьему пути к гейту."""
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_state", AsyncMock(return_value="merged"), raising=False
+    )
+    pr_for_branch = AsyncMock(return_value=999)
+    monkeypatch.setattr(plugins.git_ops, "pr_for_branch", pr_for_branch, raising=False)
+    task_id = await _approved_task(client, db, title="merged stays merged", pr=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    await _decide_deliver(client, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["pr_number"] == 360, "смерженный записанный номер не заменяется"
+    pr_for_branch.assert_not_awaited(), "мерж-состояние не ищет замену"
+
+
+# ---------------------------------------------------------------------------
+# AC-5. Сторож полноты: КАЖДЫЙ вызывающий merge_before_completion в hub/
+# обязан разрешить PR через #959 (pr_for_delivery / resolve_delivery_pr)
+# раньше, чем позвать гейт — сам, либо через кого-то выше по цепочке
+# вызовов, кто уже это сделал (так устроен путь отчёта агента:
+# _deliver_completed_pair_task получает уже разрешённый delivery_pr от
+# _complete_without_review, а не зовёт pr_for_delivery второй раз).
+#
+# Разбор — по исходнику hub/, а не по примеру: считает вызовы merge_before_
+# completion и pr_for_delivery/resolve_delivery_pr как AST Call-узлы (имя
+# функции — Name или Attribute.attr, что покрывает и обычный вызов, и
+# services.merge_before_completion(...), и локальный import внутри функции),
+# строит граф "кто кого зовёт" по именам функций в hub/ и идёт вверх от
+# каждого вызывающего гейта, пока не найдёт разрешающий вызов. Новый
+# вызывающий мимо правила — без разрешающего вызова нигде в цепочке — роняет
+# тест по имени функции, а не стареет молча.
+# ---------------------------------------------------------------------------
+
+_MERGE_GATE_FUNC = "merge_before_completion"
+_RESOLVER_FUNCS = {"pr_for_delivery", "resolve_delivery_pr"}
+
+
+def _call_name(node: ast.Call) -> str | None:
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _called_names(fn: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            name = _call_name(node)
+            if name:
+                names.add(name)
+    return names
+
+
+def _collect_hub_functions(
+    hub_dir: Path,
+) -> dict[tuple[str, str, int], set[str]]:
+    """(файл, имя функции, строка) -> имена всего, что она вызывает."""
+    functions: dict[tuple[str, str, int], set[str]] = {}
+    for path in sorted(hub_dir.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                key = (str(path), node.name, node.lineno)
+                functions[key] = _called_names(node)
+    return functions
+
+
+def test_every_merge_gate_caller_resolves_the_pr_first() -> None:
+    hub_dir = Path(__file__).resolve().parents[1] / "hub"
+    functions = _collect_hub_functions(hub_dir)
+
+    mergers = {key for key, calls in functions.items() if _MERGE_GATE_FUNC in calls}
+    assert mergers, (
+        "merge_before_completion не вызывается нигде в hub/ — разбор сломан, "
+        "а не то, что вызывающих нет"
+    )
+    # Живой список сегодняшних вызывающих (#1261) — падение здесь значит
+    # появился четвёртый путь к гейту, и его тоже нужно обвести правилом.
+    caller_names = {key[1] for key in mergers}
+    assert caller_names == {
+        "_deliver_completed_pair_task",
+        "_deliver_pair_task",
+        "deliver_on_disposition",
+    }, f"список вызывающих merge_before_completion изменился: {caller_names}"
+
+    resolvers = {key for key, calls in functions.items() if calls & _RESOLVER_FUNCS}
+
+    callers_by_name: dict[str, list[tuple[str, str, int]]] = {}
+    for key, calls in functions.items():
+        for called in calls:
+            callers_by_name.setdefault(called, []).append(key)
+
+    unresolved = []
+    for merger in mergers:
+        seen: set[tuple[str, str, int]] = set()
+        queue = [merger]
+        covered = False
+        while queue:
+            current = queue.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if current in resolvers:
+                covered = True
+                break
+            queue.extend(callers_by_name.get(current[1], []))
+        if not covered:
+            unresolved.append(merger[1])
+
+    assert not unresolved, (
+        "вызывающие merge_before_completion, для которых ни сам вызывающий, "
+        "ни кто-либо выше по цепочке вызовов не зовёт pr_for_delivery/"
+        f"resolve_delivery_pr: {sorted(unresolved)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1261, ревью сдачи №1 (d464d356): два подтверждённых находки об одной строке
+# — безусловной `if delivery_pr.reason: add_task_update(..., "alert", ...)`
+# в poller._deliver_pair_task.
+#
+# [F1, Codex, подтверждено стюардом пробами] Незакоммиченная запись держит
+# блокировку SQLite. Когда pr_state — "" (unknown) и merge_before_completion
+# на каждый проход отвечает одним и тем же транзиентным отказом (например,
+# CI ещё идёт), проход №1 пишет resolver-алерт и _note_pair_delivery_wait
+# коммитит. Проход №2 пишет resolver-алерт ЕЩЁ РАЗ, а _note_pair_delivery_wait
+# дедуплицирует и возвращается БЕЗ commit — соединение поллера остаётся в
+# открытой транзакции. Проба: после прохода №1 db.in_transaction=False, после
+# прохода №2 db.in_transaction=True, а вторая коннекция к тому же файлу
+# получает OperationalError: database is locked.
+#
+# [F2, стюард, подтверждено] Алерт повторяется на каждый 30-секундный проход.
+# Тот же сетап, 3 прохода дают 3 одинаковых алерта "состояние PR #360
+# неизвестно — доставка идёт по нему как раньше" и только 1 запись "Доставка
+# отложена". Это ломает #534 ("сказано один раз, а не на каждый цикл"),
+# которую сама функция и цитирует.
+#
+# ЧИНИТСЯ ОДНИМ ходом: resolver-note больше не пишется отдельной, безусловной
+# строкой. На транзиентной ветке (единственной, где _deliver_pair_task
+# перевызывается на ОДНОЙ и той же задаче раз за разом, пока статус остаётся
+# running) она сворачивается в СУЩЕСТВУЮЩИЙ дедуп-и-commit цикл
+# _note_pair_delivery_wait/_pair_delivery_waits — второго дедупа не заводится.
+# На терминальных ветках (needs_decision из другого отказа, успешная
+# доставка) resolver-note пишется как и раньше, безусловно: та задача покидает
+# список кандидатов свипа в тот же проход, так что запись не повторяется, а
+# существующий commit чуть ниже её уже покрывает.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_resolver_note_is_said_once_across_repeated_transient_waits(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """AC F2. Три прохода подряд с unknown-состоянием и транзиентным отказом
+    гейта — причина резолвера обязана прозвучать РОВНО один раз.
+
+    Проба — как у стюарда: _git_with_state("", found=None),
+    _approved_pair_task(pr_number=360), merge_before_completion
+    замокан на постоянный transient-отказ, poller._deliver_pair_task зовётся
+    3 раза НАПРЯМУЮ (не через свип) с одной и той же задачей.
+
+    На неисправленной сдаче №1 (d464d356) тест красный: resolver-алерт
+    пишется безусловно на каждый проход — 3 совпадения вместо 1.
+    """
+    from hub import poller
+    from hub import services as hub_services
+
+    _git_with_state("", found=None)
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    transient_detail = hub_services.TRANSIENT_GATE_PREFIXES[0] + " CI ещё идёт"
+
+    async def _stuck_ci(db_, task_):
+        return False, transient_detail
+
+    monkeypatch.setattr(hub_services, "merge_before_completion", _stuck_ci)
+
+    for _ in range(3):
+        task = dict(await repo.get_task(db, task_id))
+        await poller._deliver_pair_task(db, task)
+
+    updates = [
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, task_id)
+    ]
+    resolver_mentions = [c for c in updates if "PR #360 неизвестно" in c]
+    assert len(resolver_mentions) == 1, (
+        f"причина резолвера обязана прозвучать один раз, а не на каждый "
+        f"проход (#534): {updates}"
+    )
+    waits = [c for c in updates if "Доставка отложена" in c]
+    assert len(waits) == 1, f"и нота ожидания — тоже один раз: {updates}"
+
+
+async def test_a_deduplicated_wait_pass_leaves_no_open_transaction(
+    db: aiosqlite.Connection, db_dsn: str, monkeypatch
+) -> None:
+    """AC F1. Тот же сетап: дедуплицированный проход (второй с тем же
+    транзиентным отказом) не должен оставлять соединение поллера в открытой
+    транзакции — ни ``db.in_transaction``, ни блокировкой для второй
+    коннекции к тому же файлу.
+
+    На неисправленной сдаче №1 (d464d356) тест красный: после прохода №2
+    ``db.in_transaction`` истинно, и INSERT со второй коннекции падает с
+    ``OperationalError: database is locked``.
+    """
+    from hub import poller
+    from hub import services as hub_services
+
+    _git_with_state("", found=None)
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    transient_detail = hub_services.TRANSIENT_GATE_PREFIXES[0] + " CI ещё идёт"
+
+    async def _stuck_ci(db_, task_):
+        return False, transient_detail
+
+    monkeypatch.setattr(hub_services, "merge_before_completion", _stuck_ci)
+
+    task = dict(await repo.get_task(db, task_id))
+    await poller._deliver_pair_task(db, task)  # проход №1: не дедуплицирован
+    task = dict(await repo.get_task(db, task_id))
+    await poller._deliver_pair_task(db, task)  # проход №2: дедуплицирован
+
+    assert db.in_transaction is False, (
+        "дедуплицированный проход не должен оставлять соединение поллера "
+        "в открытой транзакции"
+    )
+
+    second = await aiosqlite.connect(db_dsn, uri=True)
+    try:
+        await second.execute("PRAGMA busy_timeout = 200")
+        await second.execute(
+            "INSERT INTO task_updates (task_id, agent, kind, content) "
+            "VALUES (?, 'probe', 'status', 'second connection probe')",
+            (task_id,),
+        )
+        await second.commit()
+    finally:
+        await second.close()
+
+
+# ---------------------------------------------------------------------------
+# #1261, стюард — ревью незакоммиченного WIP выше (два теста над этой
+# секцией). Тот же F1/F2, но на ВТОРОЙ ветке ожидания: RECOVERABLE_GATE_
+# PREFIXES (красный CI) с бюджетом, ещё не потраченным, и исполнителем на
+# связи (pair_executor_online -> True) — она тоже зовёт _note_pair_delivery_
+# wait и тоже возвращается, до этого WIP-фикса — БЕЗ resolver_note. Ранняя
+# версия правки писала delivery_pr.reason безусловно ПЕРЕД проверкой этой
+# ветки, думая, что всё после транзиентной ветки терминально; это неверно —
+# recoverable-ветка тоже возвращается раньше итогового commit. Те же два
+# симптома вернулись здесь: алерт на каждый проход (F2) и открытая
+# транзакция после дедуплицированного прохода (F1).
+# ---------------------------------------------------------------------------
+
+
+async def test_the_resolver_note_is_said_once_across_repeated_recoverable_waits(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """AC F2 (recoverable-ветка). Три прохода подряд: unknown PR-состояние +
+    красный CI + исполнитель на связи + бюджет ещё не потрачен —
+    RECOVERABLE_GATE_PREFIXES-ветка (#1030), не транзиентная. Причина
+    резолвера обязана прозвучать РОВНО один раз здесь тоже.
+
+    На WIP ДО этого фикса (после первого фикса F1/F2, но до переноса
+    resolver_note в recoverable-ветку) тест красный: 3 совпадения вместо 1.
+    """
+    from hub import poller
+    from tests.test_pair_merge_gate import _live_session
+
+    g = _git_with_state("", found=None)
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.failed, "checks_failed")
+    )
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+    await _live_session(db, task_id)
+
+    for _ in range(3):
+        task = dict(await repo.get_task(db, task_id))
+        await poller._deliver_pair_task(db, task)
+
+    updates = [
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, task_id)
+    ]
+    resolver_mentions = [c for c in updates if "PR #360 неизвестно" in c]
+    assert len(resolver_mentions) == 1, (
+        f"причина резолвера обязана прозвучать один раз и на recoverable-"
+        f"ветке (#534): {updates}"
+    )
+    waits = [c for c in updates if "Доставка отложена" in c]
+    assert len(waits) == 1, f"и нота ожидания — тоже один раз: {updates}"
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "исполнитель на связи — это ожидание, не решение"
+    )
+
+
+async def test_a_deduplicated_recoverable_wait_pass_leaves_no_open_transaction(
+    db: aiosqlite.Connection, db_dsn: str, monkeypatch
+) -> None:
+    """AC F1 (recoverable-ветка). Дедуплицированный проход по RECOVERABLE_
+    GATE_PREFIXES не должен оставлять соединение поллера в открытой
+    транзакции — тот же F1, другая ветка ожидания.
+
+    На WIP ДО этого фикса тест красный: после прохода №2
+    ``db.in_transaction`` истинно, и INSERT со второй коннекции падает с
+    ``OperationalError: database is locked``.
+    """
+    from hub import poller
+    from tests.test_pair_merge_gate import _live_session
+
+    g = _git_with_state("", found=None)
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.failed, "checks_failed")
+    )
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+    await _live_session(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    await poller._deliver_pair_task(db, task)  # проход №1: не дедуплицирован
+    task = dict(await repo.get_task(db, task_id))
+    await poller._deliver_pair_task(db, task)  # проход №2: дедуплицирован
+
+    assert db.in_transaction is False, (
+        "дедуплицированный проход (recoverable-ветка) не должен оставлять "
+        "соединение поллера в открытой транзакции"
+    )
+
+    second = await aiosqlite.connect(db_dsn, uri=True)
+    try:
+        await second.execute("PRAGMA busy_timeout = 200")
+        await second.execute(
+            "INSERT INTO task_updates (task_id, agent, kind, content) "
+            "VALUES (?, 'probe', 'status', 'second connection probe')",
+            (task_id,),
+        )
+        await second.commit()
+    finally:
+        await second.close()
+
+
+async def test_a_human_deliver_decision_commits_the_resolver_note_when_unusable(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1261: deliver_on_disposition — одноразовый вызов на одно решение
+    человека, так что повтор (#534) тут не вопрос, но commit на КАЖДОМ
+    исходе, включая unusable, обязан покрывать и resolver-note. Уже верно
+    сегодня (единственный commit в самом конце функции покрывает обе ветки);
+    тест закрепляет это, чтобы будущая правка с ранним return не открыла
+    ту же дыру, что и в поллере.
+
+    #1261 P2 (Codex, подтверждено стюардом на сдаче №2, 8ea2eeac): отказ на
+    unusable-исходе писал общий текст "PR остался открытым" — ложь именно
+    здесь: записанный PR закрыт/отсутствует, замены нет, мержить нечего, и
+    закрытый PR не переоткрывается (docs/agent-context/invariants.md ~57-68).
+    Человек пошёл бы искать открытый PR, которого не существует. На сдаче
+    №2 (8ea2eeac) тест красный: "остался открытым" есть в ленте задачи."""
+    from hub.services import lifecycle as lifecycle_mod
+
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_state", AsyncMock(return_value="closed"), raising=False
+    )
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_for_branch", AsyncMock(return_value=None), raising=False
+    )
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    ok, reason = await lifecycle_mod.deliver_on_disposition(
+        db, task_id, "deliver", via="test"
+    )
+
+    assert ok is False, "закрытый без замены не доставляется"
+    assert db.in_transaction is False, (
+        "решение человека не должно оставлять соединение в открытой транзакции"
+    )
+    updates = [
+        (dict(u)["content"] or "") for u in await repo.get_task_updates(db, task_id)
+    ]
+    feed = " ".join(updates)
+    assert "остался открытым" not in feed and "open" not in feed.lower(), (
+        f"записанный PR закрыт/отсутствует — открытого PR искать негде: {updates}"
+    )
+    assert "закрыт" in feed, (
+        f"отказ обязан назвать закрытое/отсутствующее состояние: {updates}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1261, Cursor/grok-4.6 (отчёт #376, находка 40adcc8f02f26c98), подтверждено
+# стюардом чтением pr_for_delivery. unusable сам по себе не различает ДВЕ
+# разные причины "заменить нечем": поиск живого PR по ветке ОТВЕТИЛ "нет
+# такого" (факт, случай AC-3) или поиск УПАЛ с исключением (молчание —
+# #725/#802/#959 запрещают читать его как отрицательный факт). Текст
+# P2-чинки выше ("у ветки нет открытого PR") был написан только для первого
+# случая; для второго это превращает "спросить не удалось" в "замены нет".
+# Та же путаница била и по свипу: unusable считался терминальным всегда,
+# так что сетевой сбой поиска уводил задачу к человеку вместо повтора на
+# следующем проходе.
+#
+# DeliveryPR получил search_unanswered: True только когда сам поиск упал
+# (find_note непусто — единственный путь, которым _live_pr_for_branch его
+# заполняет). pr_for_delivery остаётся единственным местом, которое решает.
+# ---------------------------------------------------------------------------
+
+
+def _git_with_failed_replacement_search(state: str = "closed"):
+    """Записанный PR в состоянии ``state``, а поиск замены по ветке падает —
+    случай (b): "спросить не удалось", а не "открытого PR нет" (случай a)."""
+    g = _git_with_state(state, found=None)
+    g.pr_for_branch = AsyncMock(side_effect=RuntimeError("gh: rate limited"))
+    return g
+
+
+async def test_a_human_deliver_decision_does_not_claim_no_open_pr_when_the_search_failed(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Тест 1. Записанный PR закрыт, поиск живой замены по ветке УПАЛ.
+
+    Ни одна запись в ленте не должна утверждать «нет открытого PR» — это
+    неизвестно, а не установлено. Текст обязан называть, что поиск не
+    ответил. На сдаче №3 (dceeec82) тест красный: P2-чинка отвечает "Мержить
+    нечего: у ветки нет открытого PR" и для этого случая тоже.
+    """
+    from hub.services import lifecycle as lifecycle_mod
+
+    _git_with_failed_replacement_search("closed")
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    ok, reason = await lifecycle_mod.deliver_on_disposition(
+        db, task_id, "deliver", via="test"
+    )
+
+    assert ok is False, "закрытый без установленной замены не доставляется"
+    updates = [
+        (dict(u)["content"] or "") for u in await repo.get_task_updates(db, task_id)
+    ]
+    feed = " ".join(updates)
+    assert "нет открытого PR" not in feed, (
+        f"поиск не ответил — это не факт об отсутствии открытого PR: {updates}"
+    )
+    assert "не ответил" in feed, (
+        f"отказ обязан назвать, что поиск замены не ответил: {updates}"
+    )
+    # Cursor #378 (5a41a733cbb3e7be) и #379 (f43a94d860cfc4e1): decide уже
+    # записал completed до этой доставки, повторное решение хаб отвергнет, а
+    # реестр недоставленного закрытый PR не показывает. Ни один из этих
+    # выходов не существует — текст не вправе их называть, но обязан сказать,
+    # что работа не доставлена и сама не доставится.
+    assert "принять снова" not in feed, (
+        f"повторного решения по завершённой задаче не будет: {updates}"
+    )
+    assert "реестр" not in feed, (
+        f"закрытый PR в реестр недоставленного не попадает: {updates}"
+    )
+    assert "БЕЗ доставки" in feed, (
+        f"отказ обязан сказать, что задача завершена без доставки: {updates}"
+    )
+
+
+async def test_a_failed_replacement_search_waits_instead_of_calling_a_human(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Тест 2. Тот же сетап через свип: сетевой сбой поиска — не решение
+    человека, а повод попробовать на следующем проходе. Три прохода дают
+    ровно одну ноту ожидания, задача остаётся running, транзакция закрыта.
+
+    На сдаче №3 (dceeec82) тест красный: свип считает unusable терминальным
+    всегда и уводит задачу в needs_decision на первом же проходе.
+    """
+    from hub import poller
+
+    g = _git_with_failed_replacement_search("closed")
+    task_id = await _approved_pair_task(db, pr_number=360)
+    await repo.update_task(db, task_id, branch="task-774/message-wakeup")
+    await db.commit()
+
+    for _ in range(3):
+        task = dict(await repo.get_task(db, task_id))
+        await poller._deliver_pair_task(db, task)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "сбой поиска замены — временное состояние, не решение человека"
+    )
+    g.merge_pr.assert_not_awaited()
+    updates = [
+        (dict(u)["content"] or "") for u in await repo.get_task_updates(db, task_id)
+    ]
+    waits = [c for c in updates if "Доставка отложена" in c]
+    assert len(waits) == 1, (
+        f"нота ожидания — один раз на три прохода, не на каждый: {updates}"
+    )
+    assert db.in_transaction is False, (
+        "проход по этой ветке не должен оставлять соединение в открытой транзакции"
     )

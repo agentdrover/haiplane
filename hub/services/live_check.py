@@ -181,6 +181,23 @@ async def record_live_check(
         recorded_agent=agent,
         deploy_state=deploy_state,
     )
+    # Та же запись отвечает и на вопрос реестра доставки, если он остался без
+    # ответа навсегда (#1215). Наблюдение уже названо и приписано — вот что
+    # запускали, вот что увидели, вот коммит; требовать записать то же самое
+    # ещё раз другим глаголом значит брать плату за форму. Закроется только
+    # строка, у которой замолчали ВСЕ источники, и только доказательством,
+    # прошедшим ту же проверку. Живую проверку это не может уронить.
+    if outcome == DONE:
+        from hub.services.delivery_state import close_row_from_live_check
+
+        await close_row_from_live_check(
+            db,
+            task_id,
+            by=agent or "agent",
+            probe=probe,
+            observation=observation,
+            sha=sha,
+        )
     await repo.add_task_update(
         db,
         task_id,

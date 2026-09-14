@@ -728,6 +728,23 @@ async def enrich_task_view(
         task_view.lifecycle_hint = compute_lifecycle_hint(task_dict)
         task_view.outcome_status = await outcome_status_for_task(db, task_dict)
 
+    # #1235: круг ревью читается ТОЙ ЖЕ функцией, которой его считают бриф и
+    # сигнал. Второе выражение того же счёта здесь означало бы, что карточка
+    # и бриф расходятся в числе. Стоит в обогащении, а не в row_to_task:
+    # счёт идёт по отчётам и исходам, а списки задач за него платить не
+    # должны (#485).
+    from hub.models import ReviewCircleView
+    from hub.services.review_dispatch import review_circle
+
+    circle = await review_circle(db, task_view.id)
+    task_view.review_circle = ReviewCircleView(
+        laps=circle.count,
+        threshold=circle.threshold,
+        named=circle.named,
+        breakdown=circle.breakdown(),
+        repeated_categories=list(circle.repeated_categories),
+    )
+
     project_row = await repo.resolve_project_for_task(db, task_view.id)
     if project_row is not None:
         task_view.project = TaskProjectRef(
@@ -1037,14 +1054,16 @@ async def approve_task(
                     "task_id": task_id,
                     "score": readiness.score,
                     "missing_required": missing,
+                    # Dump the whole Recommendation instead of re-typing a
+                    # subset of its fields (#1172). The hand-built dict here
+                    # silently dropped ``defect_code``, so the one refusal a
+                    # caller actually receives carried human prose and no
+                    # vocabulary code — exactly the thing the closed
+                    # vocabulary exists to prevent. model_dump also means the
+                    # next field added to Recommendation reaches this payload
+                    # without anyone remembering to widen it.
                     "recommendations": [
-                        {
-                            "field": r.field,
-                            "severity": r.severity,
-                            "message": r.message,
-                            "expected_score_delta": r.expected_score_delta,
-                        }
-                        for r in readiness.recommendations
+                        r.model_dump() for r in readiness.recommendations
                     ],
                     "hint": "pass force=true to override the DoR gate",
                 },
@@ -4488,6 +4507,7 @@ async def deliver_on_disposition(
 
     from hub.services.orchestration import (
         merge_before_completion,
+        resolve_delivery_pr,
         review_approved_for_current_submission,
     )
 
@@ -4504,7 +4524,26 @@ async def deliver_on_disposition(
         await db.commit()
         return False, "no_approved_review"
 
-    ok, reason = await merge_before_completion(db, task)
+    # #1261: the recorded pr_number is a cached observation (#959), same as
+    # on the sweep and the done-report path — a stacked PR can close when
+    # its base merges and its branch is deleted, with no action from this
+    # task at all (#774, #880, #1204). Resolving here reuses the one rule
+    # in pr_for_delivery rather than handing merge_before_completion a
+    # number that may no longer name anything mergeable.
+    task, delivery_pr = await resolve_delivery_pr(db, task)
+    if delivery_pr.reason:
+        # Said once, regardless of outcome — the same rule the sweep and
+        # the done-report path already follow (#767, #959): the reader
+        # must see both the closed number and its replacement, or the
+        # closed number and the absence of one.
+        await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
+    if delivery_pr.unusable:
+        # #959: closed, no live replacement — nothing to merge. Asking
+        # GitHub would read as "merge_failed" over a PR that is not there
+        # to refuse anything (AC-3); the true cause is named instead.
+        ok, reason = False, delivery_pr.reason
+    else:
+        ok, reason = await merge_before_completion(db, task)
     if ok:
         await repo.add_task_update(
             db,
@@ -4514,6 +4553,49 @@ async def deliver_on_disposition(
             f"Доставлено по решению человека ({via}, pr_disposition=deliver): "
             f"PR #{task['pr_number']} влит теми же условиями, что применяет "
             "гейт — одобренное ревью, неизменившийся с апрува код, зелёный CI "
+            "(#1037).",
+        )
+    elif delivery_pr.unusable and delivery_pr.search_unanswered:
+        # #1261 (Cursor/grok-4.6, report #376, finding 40adcc8f02f26c98): the
+        # "нет открытого PR" text just below is a FACT — the search for a
+        # replacement answered "none". Here it did not answer at all (it
+        # raised); reading that silence as "no open PR" is exactly what
+        # #725/#802/#959 forbid. The recorded PR is still named closed — that
+        # part IS known — but whether a replacement exists is not. No exit is
+        # named, because none exists on this path: decide/force-complete have
+        # already committed the task as completed before this runs, so a second
+        # decision is refused and the delivery sweep no longer picks it up
+        # (Cursor #378, 5a41a733cbb3e7be); and the undelivered-work registry
+        # (#1198) lists pr_open/unknown rows only, while this closed recorded
+        # PR is written as pr_closed right after (Cursor #379, f43a94d860cfc4e1).
+        # The honest text states what happened and that nothing will deliver
+        # the branch by itself.
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Доставка по решению человека НЕ выполнена: {reason}. Записанный "
+            "PR закрыт и не смержен, но узнать, есть ли у ветки открытая "
+            "замена, не удалось — поиск не ответил, а не «замены нет». "
+            "Задача принята и завершена БЕЗ доставки: повторного решения по "
+            "ней хаб не примет, и сам хаб работу этой ветки не доставит (#1037).",
+        )
+    elif delivery_pr.unusable:
+        # #1261 (Codex, P2): the generic "PR остался открытым" text below is
+        # false here — unusable means the recorded PR is closed or absent and
+        # the search for a replacement ANSWERED "none" (search_unanswered is
+        # False here — see the branch above for when it did not), so there is
+        # no open PR for a human to find. Closed is terminal (no reopening),
+        # so this must not read as a transient state either — mergeable is
+        # not "not yet merged".
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            f"Доставка по решению человека НЕ выполнена: {reason}. Мержить "
+            "нечего: у ветки нет открытого PR — задача остаётся принятой "
             "(#1037).",
         )
     else:

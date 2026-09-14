@@ -22,6 +22,7 @@ from hub import config
 from hub import db as db_module
 from hub import repository as repo
 from hub import services
+from hub import skill_publish
 from hub.actionable_errors import (
     agent_create_forbidden_detail,
     human_only_gate_detail,
@@ -1716,6 +1717,141 @@ async def web_skills(request: Request, skill_error: str = Query("")):
     )
 
 
+async def _skill_publish_views(
+    request: Request, name: str, versions: list[Any], active: Any | None
+) -> dict[int, dict[str, Any]]:
+    """Что показать рядом с каждой версией на /skills/{name} (#1169).
+
+    Момент показа у путей разный, и это не деталь оформления:
+
+    * Драфт, предложенный агентом (путь 2) — человек НЕ автор текста, и диф
+      нужен ему ДО нажатия кнопки. Он считается здесь, на лету: сравнивать
+      есть с чем ровно сейчас, а активной эта версия ещё не стала.
+    * Активная версия (пути 1 и 3) — предпоказывать нечего, публикация уже
+      случилась. Показывается ЗАПИСЬ о ней, прочитанная из события
+      ``skill_activated``, а не пересчёт: человек должен видеть то, что было
+      записано в момент публикации.
+
+    ``active`` — активная версия либо ``None``, когда активной нет вовсе
+    (весь реестр этого скилла — драфты). Отсутствие основания сравнения не
+    отменяет показ: драфт всё равно можно активировать, и человеку тогда
+    нужно видеть словами, что сравнивать не с чем, а не пустое место, из
+    которого одинаково читаются «ничего не изменилось» и «блок не построился».
+    """
+    # Основание сравнения для драфтов — активная версия, и оно ОДНО на весь
+    # цикл. Держать его в переменных, которые ветка активной версии потом
+    # переиспользует, нельзя: `list_skill_versions` отдаёт версии по убыванию,
+    # активная встречается раньше драфтов с меньшим номером, и после отката
+    # (сид демоутит свою прежнюю версию в draft) превью подписывалось номером
+    # из ЧУЖОЙ записи — «К активной версии v1» при дифе к v2, а unified diff
+    # выходил с заголовком `--- v1 / +++ v1` (#1169, находка ревью #317).
+    active_content = None if active is None else active.content
+    active_version = None if active is None else active.version
+    views: dict[int, dict[str, Any]] = {}
+    for version in versions:
+        if version.status != "active":
+            views[version.version] = {
+                "when": "before",
+                "diff": skill_publish.summarize_change(
+                    previous_content=active_content,
+                    previous_version=active_version,
+                    content=version.content,
+                ).as_dict(),
+                "unified": skill_publish.unified_diff(
+                    previous_content=active_content,
+                    previous_version=active_version,
+                    content=version.content,
+                    version=version.version,
+                ),
+                "scan": skill_publish.scan_report(version.content),
+            }
+            continue
+        recorded = await repo.latest_skill_activation(
+            _db(request), name, version.version
+        )
+        if recorded is None:
+            # Записи нет вовсе — и это не повод показать пустое место. Ровно
+            # так выглядят обе версии реестра хаба в день выката: сид до #1169
+            # не писал ``skill_activated``, а сид case 1 (активный текст уже
+            # совпадает с константой) события задним числом не допишет. Пустой
+            # блок читается и как «ничего не менялось», и как «блок не
+            # построился»; отсутствие записи надо назвать словами — тем же
+            # приёмом, каким уже названы «дифа в записи нет» и «вердикта в
+            # записи нет» (#1169, находка ревью #327).
+            views[version.version] = {
+                "when": "after",
+                "diff": {
+                    "baseline": skill_publish.BASELINE_NO_RECORD,
+                    "note": skill_publish.BASELINE_NO_RECORD_NOTE,
+                },
+                "unified": "",
+                "scan": {"rules_triggered": None, "note": ""},
+            }
+            continue
+        diff = _recorded_diff(recorded)
+        recorded_baseline = diff.get("baseline_version")
+        baseline = next(
+            (v for v in versions if v.version == recorded_baseline),
+            None,
+        )
+        views[version.version] = {
+            "when": "after",
+            "diff": diff,
+            # Unified diff в событие не кладётся — обе версии лежат в реестре,
+            # и копия текста на 100k символов в фиде не нужна. Здесь он
+            # восстанавливается по названному в записи основанию; если той
+            # версии в реестре уже нет, остаются сводка и вердикт.
+            "unified": (
+                ""
+                if baseline is None
+                else skill_publish.unified_diff(
+                    previous_content=baseline.content,
+                    previous_version=baseline.version,
+                    content=version.content,
+                    version=version.version,
+                )
+            ),
+            "scan": _recorded_scan(recorded),
+        }
+    return views
+
+
+def _recorded_diff(recorded: dict[str, Any]) -> dict[str, Any]:
+    """Сводка из записи — или прямое «дифа в записи нет» (#1169).
+
+    События ``skill_activated``, написанные ДО этой задачи, несут только имя и
+    номер версии. Пустой словарь на их месте рисовался шаблоном как «К
+    активной версии v: + строк, − строк» — то есть как диф, в котором ничего
+    не изменилось, к версии без номера. Это хуже молчания: полуправда читается
+    как факт. В день выката такую запись имеет КАЖДАЯ активная версия в
+    реестре, так что ветка не гипотетическая.
+    """
+    diff = recorded.get("diff")
+    if isinstance(diff, dict) and diff.get("baseline"):
+        return diff
+    return {
+        "baseline": skill_publish.BASELINE_UNRECORDED,
+        "note": skill_publish.BASELINE_UNRECORDED_NOTE,
+    }
+
+
+def _recorded_scan(recorded: dict[str, Any]) -> dict[str, Any]:
+    """Вердикт из записи — или прямое «вердикта в записи нет» (#1169).
+
+    ``rules_triggered is None`` — то же различение, что у счётчиков
+    ``DiffSummary``: пустой список означает «ни одно правило не совпало», а
+    отсутствие вердикта — что его тогда не считали вовсе. Рисовать второе как
+    первое значит утверждать проверку, которой не было.
+    """
+    scan = recorded.get("content_scan")
+    if isinstance(scan, dict) and isinstance(scan.get("rules_triggered"), list):
+        return scan
+    return {
+        "rules_triggered": None,
+        "note": skill_publish.SCAN_UNRECORDED_NOTE,
+    }
+
+
 @router.get("/skills/{name}", response_class=HTMLResponse)
 async def web_skill_detail(name: str, request: Request, skill_error: str = Query("")):
     from hub.models import SkillView
@@ -1724,14 +1860,25 @@ async def web_skill_detail(name: str, request: Request, skill_error: str = Query
     if not rows:
         raise HTTPException(404, "skill not found")
     versions = [SkillView(**dict(r)) for r in rows]
-    active = next((v for v in versions if v.status == "active"), versions[0])
+    # Активная версия — то, ЧТО раздаётся агентам; когда её нет, основания для
+    # сравнения нет тоже, и подставлять вместо него самый свежий драфт нельзя:
+    # диф к неопубликованному тексту выдал бы за прежнюю активную версию то,
+    # что ею никогда не было (#1169).
+    published = next((v for v in versions if v.status == "active"), None)
     return TEMPLATES.TemplateResponse(
         request,
         "skill_detail.html",
         {
             "name": name,
             "versions": versions,
-            "active_content": active.content,
+            "active_content": (published or versions[0]).content,
+            "publish_views": await _skill_publish_views(
+                request, name, versions, published
+            ),
+            "baseline_absent": skill_publish.BASELINE_ABSENT,
+            "baseline_unrecorded": skill_publish.BASELINE_UNRECORDED,
+            "baseline_no_record": skill_publish.BASELINE_NO_RECORD,
+            "baseline_too_large": skill_publish.BASELINE_TOO_LARGE,
             "skill_error": skill_error,
         },
     )

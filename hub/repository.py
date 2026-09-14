@@ -1050,6 +1050,74 @@ async def get_skill_version(
     return rows[0] if rows else None
 
 
+async def record_skill_publication(
+    db: aiosqlite.Connection,
+    name: str,
+    version: int,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Записать доказательства публикации ТУДА, ГДЕ У НИХ НЕТ СРОКА (#1253).
+
+    Парная к ``insert_event`` запись: событие уведомляет, эта — хранит.
+    Вызывающий обязан передать сюда ТОТ ЖЕ словарь, что ушёл в событие, — не
+    второй такой же, собранный рядом. Разойтись двум сборкам полезной
+    нагрузки ничто не мешает, а расхождение путей публикации и есть исходный
+    дефект #1169; сериализация здесь та же, что у ``insert_event``, поэтому
+    из одного словаря выходит и одна строка.
+
+    Коммита здесь нет намеренно, как и у ``insert_event``: вызывающий пишет
+    запись в той же транзакции, что и саму активацию, и откат обязан унести
+    обе. Записи о публикации версии, которой нет в реестре, не бывает —
+    ``UPDATE`` по несуществующей паре просто не тронет ни одной строки.
+    """
+    await db.execute(
+        "UPDATE skills SET publication_record=? WHERE name=? AND version=?",
+        (json.dumps(payload or {}, ensure_ascii=False), name, version),
+    )
+
+
+async def latest_skill_activation(
+    db: aiosqlite.Connection, name: str, version: int
+) -> dict[str, Any] | None:
+    """Записанные доказательства публикации ИМЕННО ЭТОЙ версии.
+
+    This is what makes paths 1 and 3 visible AFTER the fact (#1169). On path 1
+    the person is the author of the text, so a preview adds nothing — what was
+    missing is the record of what got published; on path 3 there is no person
+    at all. The page reads that record back rather than recomputing it, so what
+    a human sees is the thing that was actually written down, not a second
+    opinion computed later from rows that may since have moved.
+
+    Читается колонка строки версии, а НЕ лента событий (#1253). Лента —
+    канал уведомлений: поллер чистит её раз в две недели
+    (``_sweep_events_retention`` → ``prune_events``), и пока доказательства
+    лежали там, страница скилла через 14 дней молча возвращалась к «записи о
+    публикации нет» — тому самому состоянию, ради выхода из которого сделана
+    #1169. Событие по-прежнему пишется рядом, чтобы человек видел факт сразу.
+
+    Пустая колонка — это «записи нет вовсе», третье из трёх состояний, и оно
+    отличается от «запись есть, дифа в ней нет»: во втором колонка непуста, а
+    вот ключа ``diff`` в ней нет (так выглядит всё, что записано до #1169).
+    Различает их ``hub/web.py``, и различать он может только потому, что
+    здесь эти два случая не слиты в один ``None``.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT publication_record FROM skills WHERE name=? AND version=?",
+        (name, version),
+    )
+    if not rows:
+        return None
+    raw = str(rows[0]["publication_record"] or "")
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 async def activate_skill_version(
     db: aiosqlite.Connection, name: str, version: int, *, activated_by: str
 ) -> None:
@@ -1093,6 +1161,7 @@ async def insert_machine_review(
     findings_rejected: str = "[]",
     submitted_by: str = "",
     incomplete: bool | None = None,
+    incomplete_reason: str = "",
     unresolved: str = "[]",
     lost_dimensions: str = "[]",
     profile: str = "",
@@ -1103,9 +1172,9 @@ async def insert_machine_review(
         "INSERT INTO machine_reviews (task_id, submission_generation, "
         "harness_skill, harness_version, agent_count, tokens_spent, "
         "duration_ms, orchestrator, model, raw_count, findings_confirmed, "
-        "findings_rejected, submitted_by, incomplete, unresolved, "
-        "lost_dimensions, profile, self_reviewed, principal_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "findings_rejected, submitted_by, incomplete, incomplete_reason, "
+        "unresolved, lost_dimensions, profile, self_reviewed, principal_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -1121,6 +1190,7 @@ async def insert_machine_review(
             findings_rejected,
             submitted_by,
             None if incomplete is None else int(incomplete),
+            incomplete_reason,
             unresolved,
             lost_dimensions,
             profile,
@@ -2464,9 +2534,20 @@ async def create_review_dispatch(
 async def list_active_review_dispatches(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
+    """Заказы, по которым свипу ещё есть что доделать (#757, #1252).
+
+    ``second_door`` здесь не украшение: это ДОЛГ, а не состояние прогона.
+    Прогон уже кончился без отчёта, но обещанная сдаче вторая дверь ещё не
+    открыта, и строка обязана оставаться видимой свипу — иначе сбой между
+    закрытием облачного заказа и созданием локального уносил бы второй
+    способ добыть отчёт безвозвратно (поллер глотает исключение и идёт
+    дальше).
+    """
     return list(
         await fetchall(
-            db, "SELECT * FROM review_dispatches WHERE status='active' ORDER BY id ASC"
+            db,
+            "SELECT * FROM review_dispatches "
+            "WHERE status IN ('active', 'second_door') ORDER BY id ASC",
         )
     )
 
@@ -2583,6 +2664,22 @@ async def set_review_dispatch_status(
 ) -> None:
     await db.execute(
         "UPDATE review_dispatches SET status=? WHERE id=?", (status, dispatch_id)
+    )
+
+
+async def owe_second_door(
+    db: aiosqlite.Connection, dispatch_id: int, run_status: str
+) -> None:
+    """Записать ДОЛГ второй двери, переживающий перезапуск (#1252).
+
+    Строка остаётся видимой свипу, а терминальный статус прогона ложится
+    рядом: на возобновлении причину отказа облака больше неоткуда взять, а
+    ходить за ней к провайдеру значило бы поставить текст в карточке в
+    зависимость от его доступности.
+    """
+    await db.execute(
+        "UPDATE review_dispatches SET status='second_door', run_status=? WHERE id=?",
+        (run_status, dispatch_id),
     )
 
 
@@ -4668,6 +4765,109 @@ async def acknowledge_delivery_discrepancy(
     return (cur.rowcount or 0) > 0
 
 
+async def record_delivery_observation(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    by: str,
+    probe: str,
+    evidence: str,
+    sha: str,
+    expect_state: str,
+) -> dict[str, Any] | None:
+    """Положить в строку то, что человек или агент проверил своими глазами (#1215).
+
+    Возвращает строку ДО записи (прежнее состояние и его причина) или ``None``,
+    если строки нет. Возврат прежней строки — не удобство вызывающего: именно
+    из неё берётся ``observed_state``, и она же доказывает в тесте, что
+    закрытие ничего не стёрло.
+
+    ЧЕГО ЭТА ФУНКЦИЯ НЕ ДЕЛАЕТ, и каждое «не» — требование постановки:
+
+    * не трогает ``state``, ``reason`` и ``delivery_path``. Прежнее unknown и
+      причина, по которой оно возникло, остаются читаемыми навсегда: строка
+      не закрывается, а ДОПИСЫВАЕТСЯ. Свип, если он ещё берёт эту задачу в
+      кандидаты, продолжит обновлять факты поверх — и это правильно, потому
+      что наблюдение не отменяет вопроса, а отвечает на него от своего имени;
+    * не трогает задачу: ни статус, ни ``archived``. Реестр — зеркало, а не
+      гейт, и архивация не является и не становится способом убрать строку:
+      она унесла бы вместе со строкой outcome-долг, который читается тем же
+      фильтром ``archived = 0``;
+    * не проверяет доказательство на правдивость. Обязательность полей — это
+      всё, что схема может, и она честно ловит только форму штампа. Оценивает
+      запись читатель, которому она приписана поимённо.
+
+    ``observed_state`` пишется ИЗ ``expect_state`` — из того факта, который
+    вызывающий читал и о котором наблюдение сделано, — и тем же значением
+    сторожится строка: ``WHERE ... AND state = ?``. Не ``observed_state =
+    state``, и разница здесь не косметическая (находка 493a0ee9). SELECT
+    транзакции не открывает, а #1065 даёт запросу и опросчику РАЗНЫЕ
+    соединения: между чтением состояния и этой записью свип успевает
+    зафиксировать ``pr_open``. Без предиката запись села бы поверх нового
+    факта, ``observed_state`` совпал бы с ним — и строка, источник которой
+    ОТВЕЧАЕТ, молча вычлась бы из списка как «закрытая наблюдением», хотя
+    pr_open не наблюдал никто. Предикат превращает это в честный промах:
+    ``None`` вместо тихой лжи, и вызывающий говорит словами, что случилось.
+
+    ``AND observed_at = ''`` сторожит второй, независимый промах (находка
+    ревью Codex, коммит 86150e7): наблюдение никогда не меняет ``state``, а
+    значит строка остаётся ``unknown`` и ПОСЛЕ того, как её уже закрыли.
+    (Столбец объявлен ``NOT NULL DEFAULT ''`` — как и засыпка в миграции
+    ``backfill_delivery_observed_from_live_checks`` проверяет, пусто ли поле,
+    сравнением со строкой, а не ``IS NULL``.) Без этого предиката retry после
+    потерянного ответа — или второй наблюдатель той же строки — проходил бы
+    тот же WHERE заново и молча переписывал бы чужие
+    ``observed_by``/``observed_evidence``/``observed_sha`` поверх первой, уже
+    приписанной записи. Акт закрытия происходит один раз; второй заход — не
+    обновление, а отдельное событие, которого предикат не пускает.
+
+    Возврат ``None`` значит РОВНО «запись не легла»: строки нет, факт под ней
+    успел смениться, или строка уже закрыта чьим-то наблюдением. Различает
+    эти случаи вызывающий — ему есть чем.
+    """
+    prior = await get_delivery_discrepancy(db, task_id)
+    if prior is None:
+        return None
+    cur = await db.execute(
+        """
+        UPDATE delivery_discrepancies
+           SET observed_at       = datetime('now'),
+               observed_by       = ?,
+               observed_probe    = ?,
+               observed_evidence = ?,
+               observed_sha      = ?,
+               observed_state    = ?
+         WHERE task_id      = ?
+           AND state        = ?
+           AND observed_at  = ''
+        """,
+        (
+            (by or "").strip(),
+            probe.strip(),
+            evidence.strip(),
+            sha.strip(),
+            expect_state,
+            task_id,
+            expect_state,
+        ),
+    )
+    if (cur.rowcount or 0) == 0:
+        return None
+    # Намеренно БЕЗ коммита здесь (находка ревью #1215, задача Codex): эта
+    # запись — только первая часть акта закрытия строки. Вызывающий
+    # (``services.delivery_state.record_delivery_observation``) дописывает
+    # тем же соединением журнал и событие и коммитит ОДИН раз для всех трёх.
+    # Прежде запись коммитилась сама: падение insert_event ПОСЛЕ этой строки
+    # оставляло ``observed_at``/``observed_state`` уже зафиксированными —
+    # список расхождений уже не видел строку как «неотвеченную», хотя вызов
+    # вернул ошибку и ни истории, ни события не осталось. Повтор того же
+    # запроса при этом переписывал бы наблюдение заново, не будучи
+    # идемпотентным. Один коммит на весь акт устраняет оба исхода: либо
+    # строка закрыта, история дописана и событие есть, либо не произошло
+    # ничего.
+    return prior
+
+
 async def get_delivery_discrepancy(
     db: aiosqlite.Connection, task_id: int
 ) -> dict[str, Any] | None:
@@ -4688,6 +4888,7 @@ async def list_delivery_discrepancies(
     states: tuple[str, ...] = ("pr_open",),
     project_id: int | None = None,
     limit: int = 50,
+    closed_by_observation: bool = False,
 ) -> list[dict[str, Any]]:
     """The discrepancy list: reads stored answers, never asks a provider (#897).
 
@@ -4696,10 +4897,26 @@ async def list_delivery_discrepancies(
     asking for it and is reported apart: an answer the hub could not get is
     not evidence of a discrepancy, and folding it in would make the list cry
     wolf every time GitHub is unreachable.
+
+    ОДНО ОПРЕДЕЛЕНИЕ «закрыто наблюдением» на весь продукт (#1215), тем же
+    уроком, что и у «признано» выше. ``closed_by_observation=False`` (умолчание)
+    ВЫЧИТАЕТ такие строки, ``True`` возвращает только их. Оба режима считают
+    закрытие одним и тем же выражением, поэтому список, доска и счёт не могут
+    разъехаться в том, что считать расхождением. Вычитание по умолчанию — то,
+    ради чего задача заведена: список ценен, только пока пустой список значит
+    «расхождений нет», а строка, у которой закрыты все три источника, иначе не
+    может уйти из него никогда.
+
+    Закрытие привязано к ФАКТУ: ``observed_state = d.state``. Наблюдали
+    unknown — закрыт unknown; заговорит провайдер и скажет pr_open, и строка
+    вернётся в список, потому что ЭТОГО никто не наблюдал.
     """
     if not states:
         return []
     placeholders = ",".join("?" for _ in states)
+    # Литерал 1/0, а не параметр: он попадает в тот же f-string, что и рун
+    # знаков вопроса, и остаётся под контролем вызывающего кода, не данных.
+    observed_flag = "1" if closed_by_observation else "0"
     params: list[Any] = list(states)
     project_clause = ""
     if project_id is not None:
@@ -4714,6 +4931,8 @@ async def list_delivery_discrepancies(
             d.disposition, d.accepted_via, d.first_seen_at, d.checked_at,
             d.acknowledged_at, d.acknowledged_by, d.ack_reason,
             d.acknowledged_state,
+            d.observed_at, d.observed_by, d.observed_probe,
+            d.observed_evidence, d.observed_sha, d.observed_state,
             -- ОДНО определение «признано» на весь продукт (#294). Признание
             -- относится к ФАКТУ, и три места, решающие «видно ли это
             -- человеку» — топбар, счёт инбокса и сама строка, — обязаны
@@ -4732,6 +4951,7 @@ async def list_delivery_discrepancies(
         JOIN tasks t ON t.id = d.task_id
         WHERE d.state IN ({placeholders})
           AND t.archived = 0
+          AND (d.observed_at != '' AND d.observed_state = d.state) = {observed_flag}
           {project_clause}
         -- Непризнанные идут первыми, и это не вкусовщина: признанные живут
         -- вечно («стереть нельзя») и они же самые старые, поэтому при
