@@ -2367,21 +2367,44 @@ async def _step_delivery_pr(state: SubmitContext) -> None:
 # Порядок сдачи. Он и был несущим — сетевые резолвы до транзакции, отказ до
 # записи, — но держался тем, что никто не переставил блоки. Теперь его можно
 # сверить тестом и сравнить с набором headless-пути.
-SUBMIT_STEPS: tuple[Step[SubmitContext], ...] = (
+#
+# #1265, круг 2 (находка Codex #1 на 41159735): список расколот на ДВЕ
+# половины. surfaces/finding_outcomes/submit_rules — гейты, чей ответ
+# меняется НЕ от кода, а от времени: находка может лечь на поколение между
+# оригинальной сдачей и её точным повтором, и режим require может включиться
+# между ними же. Повтор запроса, который сдача уже приняла однажды, не
+# должен получить отказ, которого не получил оригинал — поэтому «тот же ли
+# это sha» распознаётся ДО них, сразу после дешёвых, неизменных во времени
+# отказов и пиннинга вершины (сам pin переехал раньше по той же причине —
+# без него сравнивать не с чем). submit_for_review прогоняет первую половину,
+# проверяет флаг и либо уходит в _same_sha_noop_response, либо продолжает
+# второй половиной — gate_pipeline.run_steps не трогается, деление снаружи
+# него.
+SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
     Step("task_is_submittable", _step_task_is_submittable),
     Step("canonical_branch", _step_canonical_branch, refuses=False),
     Step("branch_matches", _step_branch_matches),
-    Step("resolve_diff", _step_resolve_diff, refuses=False),
-    Step("surfaces", _step_surfaces, mode=policy("SDD_SURFACES")),
-    Step("finding_outcomes", _step_finding_outcomes, mode=policy("FINDING_OUTCOME")),
-    Step("submit_rules", _step_submit_rules, mode=policy("SUBMIT_RULES")),
     Step("pin_submission_sha", _step_pin_submission_sha, refuses=False),
     Step(
         "same_sha_from_review_is_current",
         _step_same_sha_from_review_is_current,
         refuses=False,
     ),
+)
+
+SUBMIT_STEPS_AFTER_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
+    Step("resolve_diff", _step_resolve_diff, refuses=False),
+    Step("surfaces", _step_surfaces, mode=policy("SDD_SURFACES")),
+    Step("finding_outcomes", _step_finding_outcomes, mode=policy("FINDING_OUTCOME")),
+    Step("submit_rules", _step_submit_rules, mode=policy("SUBMIT_RULES")),
     Step("delivery_pr", _step_delivery_pr, refuses=False),
+)
+
+#: Полный объявленный список — для сверки порядка и сравнения с headless-путём.
+#: submit_for_review прогоняет его НЕ одним вызовом run_steps — см. докстринг
+#: выше и тело функции — но список остаётся единым источником для тестов.
+SUBMIT_STEPS: tuple[Step[SubmitContext], ...] = (
+    SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK + SUBMIT_STEPS_AFTER_SAME_SHA_CHECK
 )
 
 
@@ -2479,35 +2502,97 @@ async def submit_for_review(
     body = body or TaskSubmitReview()
 
     state = SubmitContext(db=db, task_id=task_id, task=task, body=body)
-    await run_steps(state, SUBMIT_STEPS)
+    await run_steps(state, SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK)
 
     if state.same_sha_noop:
         # #1265: the pipeline named this a duplicate of the current
-        # generation — no transition, no write, no dispatch. Everything the
-        # caller sees below is read straight from the row _apply_submission
-        # would otherwise have mutated.
+        # generation BEFORE the gates whose answer can drift between the
+        # original submission and this identical retry (finding_outcomes,
+        # submit_rules) — a repeat must not meet a refusal the original
+        # never faced (Codex finding #1 on 41159735). No transition, no
+        # push/PR (finding #3); the caller's payload still lands (finding
+        # #2, AC-5); the review-dispatch DECISION still runs on generation N
+        # exactly as #1150/#1152 always ran it (AC-1).
         return await _same_sha_noop_response(state)
 
+    await run_steps(state, SUBMIT_STEPS_AFTER_SAME_SHA_CHECK)
     return await _apply_submission(state)
 
 
 async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
-    """Ответ на пересдачу того же sha из review — без перехода (#1265).
+    """Ответ на пересдачу того же sha из review — без НОВОГО поколения (#1265).
 
-    Нет ни одной записи в базу: поколение, submission_sha, статус,
-    текущесть ревью и вердикта остаются ровно теми, что были ДО вызова.
-    Идемпотентность (AC-3) — прямое следствие отсутствия записи: повторный
-    вызов читает те же строки и строит тот же текст, а не пересчитывает
-    переход заново.
+    НЕ полный no-op: поколение, submission_sha, статус, текущесть ревью и
+    вердикта остаются ровно теми, что были ДО вызова — перехода нет, и
+    ``delivery_pr`` в этот путь не входит вовсе, так что повтор не пушит
+    ветку и не открывает PR (находка Codex #3, AC-3). Но три вещи ниже
+    происходят по-настоящему:
+
+    * данные сдачи — исходы находок и ``accept_areas`` — применяются к
+      ТЕКУЩЕМУ (не новому) поколению, а не тонут молча за отчётом об успехе
+      (находка Codex #2, AC-5);
+    * решение о заказе ревью принимается СЕЙЧАС, тем же правилом
+      #1150/#1152, что и всегда — полный текущий отчёт покрывает sha,
+      второй прогон не заказывается; отчёта нет или он неполный — код мог
+      остаться непрочитанным, и прогон заказывается на этом же поколении
+      (находка Codex #1, AC-1);
+    * повтор идемпотентен (AC-3): применение уже применённых исходов на
+      втором одинаковом вызове не становится отказом — находка, закрытая
+      первым повтором, просто не открыта для второго, и ``plan_outcomes``
+      получает пустой список кандидатов вместо ValueError.
     """
     db = state.db
     task_id = state.task_id
+    body = state.body
     generation = int(state.task.get("submission_generation") or 0)
+    agent = (body.agent or state.task.get("assigned_agent") or "").strip()
+
+    async with write_transaction(db):
+        # AC-5: то же место в транзакции, что и в _apply_submission — до
+        # того, как решение о ревью уходит за пределы транзакции ниже.
+        # Поколение, которому отвечают исходы, — ТЕКУЩЕЕ: здесь оно не растёт.
+        open_items = await finding_outcome.open_findings(db, task_id, generation)
+        try:
+            outcome_writes, _still_open = finding_outcome.plan_outcomes(
+                open_items, body.finding_outcomes
+            )
+        except ValueError:
+            # #1265 AC-3: повтор, чьи находки уже закрыл предыдущий такой же
+            # повтор, не становится ошибкой — closed uid просто не входит в
+            # open_items второй раз, а нераспознанный uid из старого тела
+            # запроса — не новая проблема этого вызова.
+            outcome_writes = []
+        if outcome_writes:
+            await finding_outcome.apply_outcomes(
+                db, task_id, generation, outcome_writes, reported_by=agent
+            )
+        if body.accept_areas:
+            # Код не менялся — дифф тот же, что видела бы обычная сдача, но
+            # он нигде не закэширован: читаем заново. Сама проверка «тот же
+            # ли sha» выше нового git-вызова не делала — это про НЕЁ, а не
+            # про применение данных, которое обязано смотреть на диф.
+            await _step_resolve_diff(state)
+            if state.diff_paths:
+                declared = deserialize_str_list(state.task.get("affected_areas"))
+                merged = list(declared) + [
+                    p for p in state.diff_paths if p not in declared
+                ]
+                if merged != list(declared):
+                    await repo.update_task_structured(
+                        db, task_id, TaskRefine(affected_areas=merged)
+                    )
+        await db.commit()
+
+    # AC-1 / #1150/#1152: решение о заказе ревью не тронуто этой задачей —
+    # тот же вызов, что делает обычная сдача, только на НЕИЗМЕНИВШЕМСЯ
+    # поколении. best-effort по контракту: неудача не рвёт этот ответ.
+    await _dispatch_cross_model_review(db, task_id)
+
     submission = await repo.get_submission(db, task_id, generation)
     submitted_at = (submission["submitted_at"] or "") if submission is not None else ""
-    agent = (state.task.get("assigned_agent") or "").strip() or "—"
+    who_agent = (state.task.get("assigned_agent") or "").strip() or "—"
     declared_model = (state.task.get("submission_model") or "").strip()
-    who = agent + (f" ({declared_model})" if declared_model else "")
+    who = who_agent + (f" ({declared_model})" if declared_model else "")
     when = f" в {submitted_at}" if submitted_at else ""
     sha_display = state.submission_sha[:12] if state.submission_sha else "—"
 
