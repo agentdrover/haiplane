@@ -7110,3 +7110,93 @@ async def test_a_submission_moved_during_preparation_buys_no_local_run(
         "сдачу пересдали, пока готовился локальный заказ — прогон по уехавшей "
         "сдаче не покупается"
     )
+
+
+async def test_a_late_cloud_report_wins_over_an_existing_fallback(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-5: поздний СВОЙ отчёт закрывает заказ как done, а не failed.
+
+    Локальная замена уже закоммичена (долг «отдан»), но финальную запись
+    статуса ОБЛАЧНОГО заказа обрывает «падение процесса» — строка остаётся
+    ``second_door``. Поздний отчёт ЭТОГО облачного заказа доезжает до
+    следующего прохода свипа. Сегодня ``_settle_second_door`` спрашивает
+    ``_second_door_already_opened`` РАНЬШЕ своего отчёта — находит локальную
+    замену и БЕЗУСЛОВНО закрывает облачный заказ ``failed``, хотя его
+    собственный отчёт уже лежит в базе.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-late5"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-late-cloud-wins", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_set_status = repo.set_review_dispatch_status
+    crashed = {"done": False}
+
+    async def _crash_on_first_status_write(db_conn, dispatch_id, status):
+        if not crashed["done"]:
+            crashed["done"] = True
+            raise RuntimeError("падение процесса перед закрытием долга")
+        return await real_set_status(db_conn, dispatch_id, status)
+
+    monkeypatch.setattr(
+        repo, "set_review_dispatch_status", _crash_on_first_status_write
+    )
+
+    try:
+        await sweep_review_dispatches(db)
+    except RuntimeError:
+        pass
+    await db.commit()
+
+    monkeypatch.setattr(repo, "set_review_dispatch_status", real_set_status)
+    await wait_for_local_runs()
+    await db.commit()
+
+    cloud = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert cloud["status"] == "second_door", (
+        "предпосылка: долг остался неотданным — процесс упал перед записью статуса"
+    )
+    assert await _local_dispatches(db, task_id) != [], (
+        "предпосылка: локальная замена уже закоммичена к моменту падения"
+    )
+
+    await _a_report_from(db, task_id, cloud_pid, "cloud-reviewer")
+
+    await sweep_review_dispatches(db)
+    await db.commit()
+
+    cloud_after = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE id=?", (cloud["id"],)
+            )
+        )[0]
+    )
+    assert cloud_after["status"] == "done", (
+        "СВОЙ поздний отчёт обязан закрыть заказ как done, а не failed — иначе "
+        "get_settled_review_dispatch никогда не сверит этот отчёт как заказ (#769)"
+    )
