@@ -106,12 +106,12 @@ EXPECTED_SUBMIT_ORDER = (
     "task_is_submittable",
     "canonical_branch",
     "branch_matches",
+    "pin_submission_sha",
+    "same_sha_from_review_is_current",
     "resolve_diff",
     "surfaces",
     "finding_outcomes",
     "submit_rules",
-    "pin_submission_sha",
-    "same_sha_from_review_is_current",
     "delivery_pr",
 )
 
@@ -143,13 +143,36 @@ def test_the_verdict_order_is_pinned():
 
 
 def test_the_network_walking_steps_come_last():
-    """Сетевые шаги — после дешёвых отказов, иначе отказ оплачен сетью."""
+    """Сетевые шаги — после дешёвых, НЕИЗМЕННЫХ во времени отказов.
+
+    До #1265 круга 2 это звучало «после ВСЕХ отказов»: единственным
+    сетевым шагом был ``pin_submission_sha``, и цена отказа до него всегда
+    была дешевле сети. #1265 добавила сюда второй смысл: пиннинг обязан
+    идти ДО surfaces/finding_outcomes/submit_rules — эти гейты отказывают
+    не только по коду, но и по ВРЕМЕНИ (новая находка, смена политики), и
+    повтор того же запроса не должен встретить отказ, которого не получил
+    оригинал (находка Codex #1 на 41159735). Отказы task_is_submittable и
+    branch_matches — дешёвые и неизменные во времени для одного и того же
+    запроса, поэтому пиннинг остаётся ПОСЛЕ них и только их.
+    """
     names = [s.name for s in lifecycle.SUBMIT_STEPS]
-    refusing = [s.name for s in lifecycle.SUBMIT_STEPS if s.refuses]
-    assert names.index("pin_submission_sha") > max(names.index(n) for n in refusing), (
-        "пиннинг вершины ветки ходит в сеть и обязан идти после всех отказов"
+    cheap_and_stable = ("task_is_submittable", "canonical_branch", "branch_matches")
+    assert names.index("pin_submission_sha") > max(
+        names.index(n) for n in cheap_and_stable if n in names
+    ), "пиннинг вершины ветки ходит в сеть и обязан идти после дешёвых отказов"
+    mutable_gates = ("surfaces", "finding_outcomes", "submit_rules")
+    assert names.index("pin_submission_sha") < min(names.index(n) for n in mutable_gates), (
+        "пиннинг и распознавание повтора обязаны идти ДО гейтов, чей ответ "
+        "меняется со временем — иначе повтор рискует их отказом"
     )
+    assert names.index("same_sha_from_review_is_current") < min(
+        names.index(n) for n in mutable_gates
+    ), "распознавание повтора — ДО изменчивых гейтов, а не после них"
     assert names.index("delivery_pr") > names.index("pin_submission_sha")
+    assert names.index("delivery_pr") == len(names) - 1, (
+        "доставка — последний шаг: повтор, ушедший в no-op раньше, не "
+        "должен дойти до пуша/PR"
+    )
 
 
 # --------------------------------------------------------------------------
