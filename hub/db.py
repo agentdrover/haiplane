@@ -2031,6 +2031,29 @@ _MIGRATIONS: list[tuple[str, str]] = [
                     SELECT 1 FROM live_checks c
                      WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR})""",  # nosec B608 - константы модуля, не данные
     ),
+    (
+        # #1266: id заказа, который ЭТА строка заменяет — ставится только на
+        # локальную строку второй двери, заказанную вместо упавшего заказа
+        # (create_review_dispatch внутри dispatch_local_review, когда
+        # late_report_recheck передан). Пусто — строка сама начинает шаг, а
+        # не продолжает чужой. Логический шаг лестницы (#879) считается по
+        # этой колонке: замена не тратит свой собственный, она донашивает
+        # шаг заменяемой строки (count_review_dispatches).
+        "add_review_dispatches_replaces_dispatch_id",
+        "ALTER TABLE review_dispatches ADD COLUMN replaces_dispatch_id INTEGER",
+    ),
+    (
+        # #1266: почему отчёт добыт НЕ облаком — тем же текстом, что сегодня
+        # уходит только в ленту задачи (review_dispatch.py, "why" при
+        # create_review_dispatch с cloud_refusal). Живёт на строке заказа,
+        # а не только в ленте, потому что бриф (review_brief.py) читает
+        # именно строку через get_settled_review_dispatch — вторым автором
+        # того же текста заводить не стоит. Пусто — заказ облачный или
+        # локальный без наблюдённого отказа облака (форж недоступен облаку).
+        "add_review_dispatches_second_door_reason",
+        "ALTER TABLE review_dispatches ADD COLUMN second_door_reason TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
 ]
 
 

@@ -2442,12 +2442,25 @@ async def create_review_dispatch(
     profile: str = "",
     reviewer_principal_id: int | None = None,
     channel: str = "cloud",
+    replaces_dispatch_id: int | None = None,
+    second_door_reason: str = "",
 ) -> int:
+    """Insert a review-dispatch row (#757, #1180, #1252, #1266).
+
+    ``replaces_dispatch_id`` is set ONLY when this row is the second door's
+    local replacement of an earlier failed order of the SAME rung — it marks
+    the row as continuing that order's ladder step rather than spending a new
+    one (#1266, ``count_review_dispatches``). ``second_door_reason`` is the
+    observed cause the local channel was used instead of cloud — the same
+    text the task feed already gets, kept here too because the review brief
+    reads the ROW (``get_settled_review_dispatch``), not the feed.
+    """
     cur = await db.execute(
         "INSERT INTO review_dispatches "
         "(task_id, submission_generation, agent_id, run_id, model, profile, "
-        "reviewer_principal_id, channel) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "reviewer_principal_id, channel, replaces_dispatch_id, "
+        "second_door_reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -2457,6 +2470,8 @@ async def create_review_dispatch(
             profile,
             reviewer_principal_id,
             channel,
+            replaces_dispatch_id,
+            second_door_reason,
         ),
     )
     return inserted_id(cur)
@@ -2576,15 +2591,32 @@ async def previous_submission(
 async def count_review_dispatches(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> int:
-    """How many cloud runs this submission has already bought (#879).
+    """How many LOGICAL ladder steps this submission has already bought (#879, #1266).
 
     Counted from the rows, not from a flag: the ladder's ceiling has to be the
-    same fact the bill is, and a flag would drift from it.
+    same fact the bill is, and a flag would drift from it. But a row is not a
+    step: the second door (#1252) can leave TWO rows for one rung — a real
+    cloud run that was created and failed, and the local order that replaced
+    it. Counting both silenced the DEEP top-up after a single failed rung.
+
+    A row counts iff BOTH hold:
+    - ``agent_id != ''`` — an actual run was started (paid for, one way or
+      another). A sync cloud-create refusal writes a debt-tracking stub with
+      an empty ``agent_id`` (#1266, ``owe_second_door`` on the sync path) —
+      that costs nothing and never did, before or after this fix.
+    - ``replaces_dispatch_id IS NULL`` — the row is not a replacement. A
+      replacement continues the rung it replaces rather than opening a new
+      one; the row it replaces already counted (it had a real ``agent_id``).
+
+    Two genuine cloud runs (LITE then a DEEP top-up) both have empty
+    ``replaces_dispatch_id`` and non-empty ``agent_id`` — they still count as
+    two and still hit ``REVIEW_LADDER_MAX_STEPS``.
     """
     rows = await fetchall(
         db,
         "SELECT COUNT(*) AS n FROM review_dispatches "
-        "WHERE task_id=? AND submission_generation=?",
+        "WHERE task_id=? AND submission_generation=? "
+        "AND agent_id != '' AND replaces_dispatch_id IS NULL",
         (task_id, generation),
     )
     return int(dict(rows[0])["n"]) if rows else 0
