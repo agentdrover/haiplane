@@ -501,6 +501,77 @@ async def list_unmerged_branch_tasks(
     )
 
 
+async def list_undelivered_completed_branch_tasks(
+    db: aiosqlite.Connection,
+    *,
+    exclude_task_id: int,
+) -> list[aiosqlite.Row]:
+    """Completed tasks the sweep found still holding an UNMERGED pull request (#1204).
+
+    The sixth way a branch can be unmerged, and the only one no amount of
+    waiting will resolve: a human accepted the task without delivering it, so
+    the conveyor will never come back for it. Same shape as
+    ``list_unmerged_branch_tasks`` so the stacking walk can consume both.
+
+    Read from ``delivery_discrepancies``, which the timed sweep writes, rather
+    than derived here, for three reasons the alternatives get wrong:
+
+    * ``pipeline_merges`` says whether the HUB merged it. A merge made by hand
+      leaves no row, which ``undelivered_blockers`` documents as acceptable
+      precisely because the gate it feeds is advisory. This one is not: on a
+      project where manual merges happen, that reading would hold a delivery
+      whose base is long since in the base branch.
+    * asking the provider here would put a network call in the delivery path,
+      per candidate, on every poll. The sweep already pays it once per fifteen
+      minutes and stores the answer.
+    * ``state IN ('pr_open', 'pr_closed')``. ``unknown`` is an answer the hub
+      could not get, and the existing reader keeps it apart for the same
+      reason (#725).
+
+    ``pr_closed`` reads the same as ``pr_open`` here, and that is deliberate
+    (found by machine review of submission #8, verified against the code
+    rather than taken on the reviewer's word): ``delivery_state.task_delivery``
+    calls a PR closed without merging "work dropped on purpose", but "on
+    purpose" describes the OWNER's decision, not the git history. The base
+    task's commits stay ancestors of any branch drawn from it whether its PR
+    is still open or was closed, and a squash merge of that branch still
+    carries them into the base branch under the dependent's number — the
+    #1183-over-#1175 shape this whole condition exists to prevent. A prior
+    revision of this query and its test asserted the opposite (``pr_closed``
+    excluded, reasoning only about whether it is worth ASKING a human "when
+    will this arrive" — a question that genuinely has no answer for abandoned
+    work). That reasoning answers a different question than the one this
+    function feeds: the stacking gate is not asking when the base will
+    deliver, it is asking whether merging now would carry undelivered commits
+    forward. Reproduced before this fix: a completed base with a
+    ``delivery_discrepancies`` row of ``pr_closed`` let a stacked dependent
+    merge straight through, with ``merge_pr`` awaited and no human ever
+    named the base
+    (``tests/test_delivery_gate.py::test_a_closed_unmerged_base_also_calls_a_human``).
+
+    TWO NAMED BLIND SPOTS, because a partial answer read as a complete one is
+    how this class of bug returns:
+    1. ``unknown`` rows are NOT candidates. They cannot be: such a task's
+       branch is usually long deleted, the probe would answer ``unavailable``,
+       and under #1186's rule that outranks ``clear`` — every delivery would
+       hold forever on a handful of ancient rows.
+    2. The sweep looks back DELIVERY_SCAN_LOOKBACK_DAYS. A task completed
+       before that window and never scanned has no row at all, and its absence
+       means "never asked", not "delivered".
+    """
+    return await fetchall(
+        db,
+        # d.state travels with the row: a closed base whose branch is gone must
+        # not hold a stack the way an open one does (#1204, Cursor #385).
+        "SELECT t.id, t.title, t.status, t.branch, d.state AS delivery_state "
+        "FROM delivery_discrepancies d JOIN tasks t ON t.id = d.task_id "
+        "WHERE d.state IN ('pr_open', 'pr_closed') AND t.archived = 0 "
+        "AND t.id != ? "
+        "AND t.branch IS NOT NULL AND TRIM(t.branch) != '' ORDER BY t.id",
+        (exclude_task_id,),
+    )
+
+
 async def list_running_dispatchable(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
@@ -4465,6 +4536,69 @@ async def completed_tasks_awaiting_delivery(
     no PR at all is work that never started delivery, which is #498's warning,
     not this list. Mixing them would make "the discrepancy list" mean two
     different things and stop being trustworthy as either.
+
+    THE LOOKBACK BOUNDS THE FIRST QUESTION, NOT EVERY LATER ONE (#1204, machine
+    review of submission #6). It used to bound both, and while every reader of
+    this table was advisory that was only a stale dashboard cell. Since #1204
+    a live ``pr_open`` row feeds an IRREVERSIBLE gate, and there the same
+    staleness is a different animal: past day thirty the sweep stopped asking,
+    so the row froze at whatever the provider last said. Deliver that base by
+    hand — merge the PR, delete the branch — and nothing ever corrects the row.
+    The branch is then a dead ref on a candidate the gate still trusts, which
+    ``_stranded_with_a_dead_ref`` turns into a NON-transient refusal that
+    ``list_pair_tasks_awaiting_delivery`` never retries. Not one delivery: the
+    walk asks about that row for every task in the project, so one fossil
+    bricks the whole project's deliveries and no event can unbrick it.
+
+    So a row that already says ``pr_open`` keeps being re-asked whatever its
+    age, and it is asked FIRST — ``ORDER BY`` puts it ahead of the window.
+    The cost is bounded by how many such rows exist, which is the set
+    ``hub_undelivered_completed`` prints, and is paid by the sweep rather than
+    in the delivery path.
+
+    AHEAD OF THE WINDOW IS NOT YET "CANNOT STARVE" (#1204, machine review of
+    submission #7). Submission #6 claimed this ``ORDER BY`` put the ``LIMIT``
+    beyond starving these rows. That was false whenever live ``pr_open`` rows
+    outnumber the limit (default 100; the sweep passes none of its own), and
+    false in the worst possible direction: ordering them ``completed_at DESC``
+    is a FIXED priority, so the rows past the cut are always the SAME rows —
+    the oldest. Those are exactly the fossils most likely to have been merged
+    and had their branch deleted by hand, which is the dead ref
+    ``_stranded_with_a_dead_ref`` bricks the whole project on. A fixed order
+    does not delay such a row, it excludes it permanently — the same "a frozen
+    row locks the project" class this function was changed to close, with a
+    counter for a threshold instead of thirty days.
+
+    Live ``pr_open`` rows are therefore ordered by ``checked_at`` ASC: the
+    least recently asked goes first, and asking it writes ``checked_at`` and
+    moves it to the back. That is rotation rather than priority — with R live
+    rows and limit L every one of them is reached within ``ceil(R / L)``
+    sweeps, whatever L is, so the gate's trust in any single row expires after
+    a bounded wait instead of never. This ordering is load-bearing precisely
+    because ``list_undelivered_completed_branch_tasks`` reads ALL live rows
+    with no ceiling of its own: the gate stands on rows only this sweep
+    refreshes, so a row it can never reach is a row the gate believes forever.
+
+    ``checked_at`` alone would not be enough, and the reason is a property of
+    the column rather than of the design: it is written ``datetime('now')``,
+    which is whole seconds. Rows refreshed inside the same second tie, and a
+    tie falls to the next key — under the old ``completed_at DESC`` that handed
+    the cut straight back to the oldest rows. So live rows break their tie
+    ``completed_at`` ASC: oldest first, the same direction the rotation runs,
+    never against it. The window's own rows keep their ``DESC`` ordering — the
+    tiebreak is scoped to live rows by the ``CASE``, because for a row nobody
+    has ever asked about there is no rotation to preserve.
+
+    ``unknown`` is deliberately NOT given the same reprieve. It is not a
+    candidate of that gate (see ``list_undelivered_completed_branch_tasks``),
+    so its staleness costs nothing, while re-asking every ancient unanswerable
+    row forever would spend a network call per sweep on exactly the rows the
+    provider has already refused to answer.
+
+    THE BLIND SPOT THAT REMAINS, named because half of it used to be named and
+    the dangerous half was not: absence of a row still means "never asked", not
+    "delivered" — a task completed before the window and never scanned has no
+    row to revive here.
     """
     return list(
         await fetchall(
@@ -4485,8 +4619,25 @@ async def completed_tasks_awaiting_delivery(
               AND (
                     COALESCE(NULLIF(t.completed_at, ''), t.updated_at)
                     >= datetime('now', ?)
+                    OR EXISTS (
+                        SELECT 1 FROM delivery_discrepancies d
+                        WHERE d.task_id = t.id AND d.state = 'pr_open'
+                    )
               )
-            ORDER BY COALESCE(NULLIF(t.completed_at, ''), t.updated_at) DESC
+            ORDER BY
+              EXISTS (
+                  SELECT 1 FROM delivery_discrepancies d
+                  WHERE d.task_id = t.id AND d.state = 'pr_open'
+              ) DESC,
+              COALESCE(
+                  (SELECT d.checked_at FROM delivery_discrepancies d
+                   WHERE d.task_id = t.id AND d.state = 'pr_open'), ''
+              ) ASC,
+              CASE WHEN EXISTS (
+                  SELECT 1 FROM delivery_discrepancies d
+                  WHERE d.task_id = t.id AND d.state = 'pr_open'
+              ) THEN COALESCE(NULLIF(t.completed_at, ''), t.updated_at) END ASC,
+              COALESCE(NULLIF(t.completed_at, ''), t.updated_at) DESC
             LIMIT ?
             """,
             (f"-{max(int(lookback_days), 1)} days", max(int(limit), 1)),
