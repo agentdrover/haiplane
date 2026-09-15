@@ -2564,6 +2564,12 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         # область и называет «сверка НЕ выполнялась», когда дифф не прочитан,
         # вместо молчаливого успеха (Cursor #383, 40af8ae7af0f7943). С
         # accept_areas он не отказывает — признанный объём не расхождение.
+        # Шаг вызывается МИМО конвейера, а run_steps оставил в gate_mode режим
+        # последнего своего шага (always) — с ним SDD_SURFACES=off не
+        # действовал бы, и повтор расширял бы область, которую оригинал не
+        # трогал. Пустой режим — «вне конвейера, читай политику» (Cursor #386,
+        # f4ec12806d4c263e).
+        state.gate_mode = ""
         await _step_surfaces(state)
 
     async with write_transaction(db):
@@ -2604,7 +2610,22 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
             )
         if body.accept_areas:
             await _record_accepted_scope(db, task_id, state.task, state.accepted_paths)
-            await _write_submission_notices(state)
+            # Дифф прочитан заново — и пересчитанный по нему класс риска
+            # записывается так же, как у обычной сдачи, иначе лента назвала бы
+            # повышение, которого в задаче нет (Cursor #386, cd22025d472a0300).
+            if state.risk_fields:
+                await repo.update_task(db, task_id, **state.risk_fields)
+            # Правила сдачи на повторе не перезапускались — заголовок полного
+            # «Отчёта проверок на сдаче» над одной строкой сверки читался бы
+            # как чистый отчёт (Cursor #386, 4c832c08b8bb5dcc).
+            await _write_submission_notices(
+                state,
+                header=(
+                    f"Повтор сдачи того же коммита (поколение {generation}): "
+                    "сверена только область для accept_areas. Правила сдачи не "
+                    "перезапускались — их отчёт записан сдачей этого поколения."
+                ),
+            )
         await db.commit()
 
     # AC-1 / #1150/#1152: решение о заказе ревью не тронуто этой задачей —
@@ -2772,8 +2793,13 @@ async def _record_accepted_scope(
     )
 
 
-async def _write_submission_notices(state: SubmitContext) -> None:
+async def _write_submission_notices(
+    state: SubmitContext, *, header: str | None = None
+) -> None:
     """Заметки о сдаче в ленту: что проверено, чего не хватает (#1067).
+
+    ``header`` — для повтора того же sha (#1265), где правила сдачи не
+    выполнялись и заголовок полного отчёта был бы неправдой.
 
     Вынесено вместе с записями, а не только со сборкой текста: блок целиком
     про уведомление читателя и ничего не решает о переходе. Все входы —
@@ -2791,7 +2817,8 @@ async def _write_submission_notices(state: SubmitContext) -> None:
         # Only now is "what ran and found nothing" worth printing: inside
         # a report the reader is already looking at.
         report_lines += state.clean_lines
-        header = f"Отчёт проверок на сдаче (режим правил: {state.rules_mode})."
+        if header is None:
+            header = f"Отчёт проверок на сдаче (режим правил: {state.rules_mode})."
         await repo.add_task_update(
             state.db,
             state.task_id,

@@ -893,6 +893,79 @@ async def test_accept_areas_on_a_retry_names_an_unreadable_diff(
     )
     fresh = dict(await repo.get_task(db, task.id))
     assert deserialize_str_list(fresh.get("affected_areas")) == ["hub/x.py"]
+    assert not any("Отчёт проверок на сдаче" in c for c in new), (
+        "правила на повторе не выполнялись — заголовок полного отчёта был бы "
+        f"неправдой (Cursor #386, 4c832c08b8bb5dcc): {new}"
+    )
+    assert any("Правила сдачи не перезапускались" in c for c in new), new
+
+
+async def test_accept_areas_on_a_retry_obeys_surfaces_off(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Cursor #386 (f4ec12806d4c263e): при SDD_SURFACES=off обычная сдача
+    область не сверяет — и повтор того же sha с accept_areas её не
+    расширяет, хотя run_steps оставил в gate_mode режим своего шага."""
+    monkeypatch.setattr(config, "SDD_SURFACES", "off")
+    _install_fixed_tip_git(
+        monkeypatch, "off-tip", diff_paths=["hub/x.py", "hub/new_area.py"]
+    )
+    task = await _pair_task_ready_to_submit(db, "Сверка выключена")
+    await repo.update_task_structured(
+        db, task.id, models.TaskRefine(affected_areas=["hub/x.py"])
+    )
+    await db.commit()
+    await lifecycle.submit_for_review(db, task.id, models.TaskSubmitReview(agent="dev"))
+
+    retry = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", accept_areas=True)
+    )
+
+    assert retry.submission_generation == 1
+    fresh = dict(await repo.get_task(db, task.id))
+    assert deserialize_str_list(fresh.get("affected_areas")) == ["hub/x.py"], (
+        "SDD_SURFACES=off: повтор не расширяет область, которую оригинал не трогал"
+    )
+
+
+async def test_accept_areas_on_a_retry_records_the_risk_class_it_alerts(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Cursor #386 (cd22025d472a0300): первая сдача не прочитала дифф, повтор
+    прочитал — и в нём миграция. Лента называет повышение класса, значит
+    класс в задаче тоже повышен, а не остался прежним."""
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+    _install_fixed_tip_git(monkeypatch, "risk-tip")  # дифф: None
+    task = await _pair_task_ready_to_submit(db, "Класс риска на повторе")
+    await repo.update_task_structured(
+        db, task.id, models.TaskRefine(affected_areas=["hub/web.py"])
+    )
+    # Класс «было» должен существовать: без него пересчёт пишет класс молча,
+    # а повышения, о котором говорит алерт, нет (#583).
+    await repo.update_task(db, task.id, risk_class="R2")
+    await db.commit()
+    await lifecycle.submit_for_review(db, task.id, models.TaskSubmitReview(agent="dev"))
+    before_class = dict(await repo.get_task(db, task.id))["risk_class"]
+    before = len(await repo.get_task_updates(db, task.id))
+
+    _install_fixed_tip_git(
+        monkeypatch, "risk-tip", diff_paths=["hub/web.py", "hub/db.py"]
+    )
+    retry = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", accept_areas=True)
+    )
+
+    assert retry.submission_generation == 1
+    new = [
+        (dict(u)["content"] or "")
+        for u in (await repo.get_task_updates(db, task.id))[before:]
+    ]
+    alerts = [c for c in new if "Класс риска" in c]
+    assert alerts, f"миграция в диффе повтора должна поднять класс: {new}"
+    after_class = dict(await repo.get_task(db, task.id))["risk_class"]
+    assert after_class == "R3" and after_class != before_class, (
+        f"лента назвала повышение, а в задаче {before_class}->{after_class}"
+    )
 
 
 async def test_the_second_read_refusal_is_said_once_per_report(
