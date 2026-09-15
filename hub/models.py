@@ -2772,6 +2772,16 @@ class MachineReviewView(BaseModel):
     # What the gate said each confirmed finding turned out to be (#876). An
     # empty list means nobody judged them — never that they were all fine.
     dispositions: list[FindingDispositionView] = Field(default_factory=list)
+    # Which channel actually produced this report, and why it is not cloud
+    # (#1266). Set by the brief builder from the settled review_dispatches
+    # row, never from this table — a report row carries no channel of its
+    # own. Empty ``second_door_channel`` means "cloud, or unknown" (rows
+    # written before the second door existed, or no settled dispatch found);
+    # it is never guessed from ``model`` or ``orchestrator``. A reader that
+    # skips this field and reads ``model`` alone sees a local report as an
+    # indistinguishable cloud one.
+    second_door_channel: str = ""
+    second_door_reason: str = ""
 
     @field_validator("created_at", mode="before")
     @classmethod

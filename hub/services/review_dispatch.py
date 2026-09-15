@@ -1865,9 +1865,57 @@ async def maybe_dispatch_review(
             # провайдер отверг создание, либо сверка подтвердила, что агента
             # нет. Слепота — ни то, ни другое, и остаётся человеку.
             return False
-        return await open_second_door(
-            db, task, forge, branch, generation, force_profile, cloud_refusal=detail
+        # Долг второй двери записывается ДО попытки её открыть (#1266), тем
+        # же способом, каким это уже делает асинхронный путь (owe_second_
+        # door, _close_a_run_without_a_report): строка-заглушка коммитится
+        # первой, и только потом идёт рискованный вызов (review_reach,
+        # счёт токенов, сетевая prepare_review_order). Без этого порядка
+        # падение ВНУТРИ open_second_door не оставляло свипу ничего, что
+        # повторить, — вторая дверь терялась навсегда, потому что строки не
+        # было вовсе. agent_id пуст здесь НЕ временно: ничего не создано и
+        # не оплачено, и count_review_dispatches (#1266) такую строку в шаг
+        # лестницы не считает.
+        stub_id = await repo.create_review_dispatch(
+            db,
+            task_id=task_id,
+            submission_generation=generation,
+            agent_id="",
+            run_id="",
+            model=model_id,
+            profile=profile,
+            reviewer_principal_id=expected_principal,
+            channel=CLOUD_CHANNEL,
         )
+        await repo.owe_second_door(db, stub_id, detail)
+        await db.commit()
+        stub_row = await repo.get_review_dispatch_for_generation(
+            db, task_id, generation
+        )
+        stub = dict(stub_row) if stub_row is not None else None
+        if stub is None:  # pragma: no cover - defensive, row was just committed
+            return False
+        # Дальше долг разбирает ТОТ ЖЕ путь, что и асинхронный отказ:
+        # _settle_second_door сама решает, открывать ли дверь, и сама же
+        # закрывает строку. Успех отсюда виден тем же наблюдением, каким
+        # _second_door_already_opened судит повтор — живой или удавшийся
+        # локальный заказ по ЭТОМУ долгу, а не догадкой по пути, которым
+        # сюда пришли.
+        await _settle_second_door(db, stub, task_row=task)
+        opened = await _second_door_already_opened(db, stub)
+        # Заглушка была ТОЛЬКО страховкой от падения внутри вызова выше —
+        # раз мы досюда дошли без исключения, падения не было, и сама она
+        # больше не нужна ни свипу, ни счёту шагов. Не убрать её значило бы
+        # оставить облачную строку там, где по AC-3 #1252 её не бывает
+        # вовсе (ненастроенный путь — байт в байт как раньше) и там, где
+        # AC-1 #1252 требует ровно одну строку, локальную. Падение МЕЖДУ
+        # _settle_second_door и этим удалением не теряет долг: строка к
+        # тому моменту уже закрыта (done/failed) самой _settle_second_door,
+        # а следующий свип такую строку не трогает — то есть худшее, что
+        # оставляет несостоявшееся удаление, это лишняя закрытая строка в
+        # истории, не потерянная вторая дверь.
+        await repo.delete_review_dispatch(db, stub["id"])
+        await db.commit()
+        return opened
 
     # #1025: pin whose report this dispatch waits for, resolved from the
     # reviewer token at dispatch time (above, where the code was minted under
@@ -2193,13 +2241,31 @@ async def dispatch_local_review(
         force_profile=force_profile,
         principal_id=principal_id,
     )
-    # ПОСЛЕДНЕЕ слово перед заказом (находка по e69a3d5). Рунг-проверка в
-    # _second_door_after_run — только первая; prepare_review_order выше сама
-    # по себе не быстрая (дифф, правила репозитория), и отчёт, доехавший,
-    # пока она шла, эта функция должна увидеть здесь, а не молча купить
-    # оплаченного соперника. Тихий отказ (без своего алерта): карточка уже
-    # называет причину провалившегося заказа, вторую на то же состояние не
-    # заводим (#1188).
+    # #1252: причина, по которой отчёт добывается ЗДЕСЬ, а не в облаке, —
+    # разная в двух случаях, и обе называются. «Облако сюда не дотягивается»
+    # — свойство форжа (#1180). «Облако отказало» — наблюдённый факт про
+    # конкретную сдачу, и человеку нужен именно он: без него отчёт второго
+    # поставщика читается как облачный. Считается ДО последнего слова — не
+    # зависит от базы, и нужна и вставке (second_door_reason), и карточке.
+    why = (
+        f"облако отчёта НЕ дало — {cloud_refusal}; отчёт добывается ВТОРЫМ "
+        "поставщиком, локальным (#1252)"
+        if cloud_refusal
+        else f"форж «{forge}» облачному ревьюеру недоступен"
+    )
+    # ЕДИНСТВЕННОЕ последнее слово перед тратой денег (#1266). Рунг-проверка
+    # в _second_door_after_run — только первая; prepare_review_order выше
+    # сама по себе не быстрая (дифф, правила репозитория), а свежесть сдачи
+    # могла смениться в том же окне (пересдача, снятие с ревью) — не только
+    # отчёт заказа, который мы заменяем. Обе проверки здесь — уже
+    # существующие функции (_submission_still_live — тот же дешёвый фильтр,
+    # что стоит и в начале open_second_door, но авторитетен только он;
+    # _dispatch_report — тот же, что и рунг-проверка выше), третьей копии ни
+    # одной из них не заводится. Тихий отказ (без своего алерта): карточка
+    # уже называет причину провалившегося заказа, вторую на то же состояние
+    # не заводим (#1188).
+    if not await _submission_still_live(db, task, branch, generation):
+        return False
     if late_report_recheck is not None and (
         await _dispatch_report(db, task_id, generation, late_report_recheck) is not None
     ):
@@ -2215,17 +2281,10 @@ async def dispatch_local_review(
         profile=order.profile,
         reviewer_principal_id=principal_id,
         channel=LOCAL_CHANNEL,
-    )
-    # #1252: причина, по которой отчёт добывается ЗДЕСЬ, а не в облаке, —
-    # разная в двух случаях, и обе называются. «Облако сюда не дотягивается»
-    # — свойство форжа (#1180). «Облако отказало» — наблюдённый факт про
-    # конкретную сдачу, и человеку нужен именно он: без него отчёт второго
-    # поставщика читается как облачный.
-    why = (
-        f"облако отчёта НЕ дало — {cloud_refusal}; отчёт добывается ВТОРЫМ "
-        "поставщиком, локальным (#1252)"
-        if cloud_refusal
-        else f"форж «{forge}» облачному ревьюеру недоступен"
+        replaces_dispatch_id=(
+            int(late_report_recheck["id"]) if late_report_recheck is not None else None
+        ),
+        second_door_reason=why,
     )
     await repo.add_task_update(
         db,
@@ -2700,6 +2759,42 @@ async def _dispatch_report(
     return own[rung] if rung < len(own) else None
 
 
+async def dispatch_for_report(
+    db: aiosqlite.Connection, task_id: int, generation: int, report: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The dispatch THIS report belongs to — the inverse of ``_dispatch_report``.
+
+    #1266 round 2 (715481fedbf41130): the report shown in the brief is the
+    LATEST report (``get_latest_machine_review``, ordered by report id), but
+    ``get_settled_review_dispatch`` names the LATEST DONE dispatch (ordered
+    by dispatch id). Those are different rows in the AC-5 shape: a local
+    replacement can settle with its own report before an earlier cloud order
+    settles with ITS late report — the local dispatch then has the higher id
+    even though its report is the older one. Naming the channel from "latest
+    done dispatch" then paints a cloud report as local.
+
+    Rather than inventing a second matching rule, this walks every dispatch
+    of the generation and asks the SAME question ``_dispatch_report`` already
+    answers authoritatively (principal+channel+rung) — "is THIS dispatch's
+    own report exactly the one being shown" — and returns the first match.
+    """
+    report_id = report.get("id")
+    if report_id is None:
+        return None
+    rows = await fetchall(
+        db,
+        "SELECT * FROM review_dispatches WHERE task_id=? "
+        "AND submission_generation=? ORDER BY id",
+        (task_id, generation),
+    )
+    for row in rows:
+        dispatch = dict(row)
+        matched = await _dispatch_report(db, task_id, generation, dispatch)
+        if matched is not None and matched.get("id") == report_id:
+            return dispatch
+    return None
+
+
 def _provider_token_total(usage: dict[str, Any] | None) -> int | None:
     """The billed total, or None when the provider did not answer (#1026)."""
     total = ((usage or {}).get("totalUsage") or {}).get("totalTokens")
@@ -3067,20 +3162,29 @@ async def _settle_second_door(
     рестарте видны обе строки, облачная разбирается первой (ORDER BY id), и
     без этой проверки она покупала бы ВТОРОЙ прогон на то же поколение.
 
-    Находка внешнего ревьюера по коммиту e69a3d5 (P1): строка ЭТОГО заказа
-    закрывалась в ``failed`` БЕЗУСЛОВНО, даже когда ``_second_door_after_run``
-    находил отчёт, принадлежащий ИМЕННО ЕМУ (поздний отчёт застаёт вторую
-    дверь уже приоткрытой) — ``failed``-строки свип больше не разбирает, а
-    ``get_settled_review_dispatch`` берёт только ``done``, то есть годный
-    отчёт был бы никогда не сверен как успешный заказ. Статус берётся из
-    того, что в самом деле нашлось для ЭТОГО заказа, а не назначается заранее.
+    Находка внешнего ревьюера по коммиту e69a3d5 (P1) и её остаток по #1266:
+    строка ЭТОГО заказа закрывалась в ``failed`` БЕЗУСЛОВНО, даже когда у неё
+    самой уже нашёлся СВОЙ отчёт — потому что ``_second_door_already_opened``
+    спрашивалась РАНЬШЕ. На возобновлении после падения это не гипотетика:
+    локальная замена уже закоммичена (долг «отдан» с точки зрения этой
+    проверки), а поздний облачный отчёт ЭТОГО же заказа мог доехать в то же
+    самое окно. Статус берётся из того, что в самом деле нашлось для ЭТОГО
+    заказа, а не из того, приоткрыта ли дверь: СВОЙ отчёт красноречивее
+    замены, потому что замена — это и есть ответ на его отсутствие, а не
+    независимое свидетельство.
     """
+    task_id = int(dispatch["task_id"])
+    generation = int(dispatch["submission_generation"])
+    if await _dispatch_report(db, task_id, generation, dispatch) is not None:
+        await repo.set_review_dispatch_status(db, dispatch["id"], "done")
+        await db.commit()
+        return
     if await _second_door_already_opened(db, dispatch):
         await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
         await db.commit()
         return
     if task_row is None:
-        task_row = await repo.get_task(db, int(dispatch["task_id"]))
+        task_row = await repo.get_task(db, task_id)
     settled_by_its_own_report = await _second_door_after_run(
         db, dispatch, task_row, dispatch.get("run_status") or "терминальным"
     )
@@ -3194,10 +3298,21 @@ async def _second_door_after_run(
         # lite там, где сегодняшний выбор сказал бы deep, — тот же дефект
         # зеркально.
         DEEP if (dispatch.get("profile") or "").strip() == DEEP else "",
+        # #1266 раунд 2 (7a78080de93938ae): пустой agent_id здесь значит
+        # СИНХРОННЫЙ отказ на СОЗДАНИИ (заглушка долга из maybe_dispatch_
+        # review, а не прогон, дошедший до терминального статуса) — агента и
+        # рана не было вовсе, и текст «прогон... кончился статусом» был бы
+        # ложью про событие, которого не случилось. run_status для заглушки
+        # несёт НАБЛЮДЁННУЮ причину отказа (_lost_call_detail), а не код
+        # статуса рана, и печатается как есть, без обёртки «кончился».
         cloud_refusal=(
-            f"прогон облачного агента {dispatch['agent_id']} "
-            f"({dispatch.get('model') or 'модель не названа'}) кончился "
-            f"статусом {run_status} и отчёта не оставил"
+            f"провайдер отказал в создании агента: {run_status}"
+            if not (dispatch.get("agent_id") or "").strip()
+            else (
+                f"прогон облачного агента {dispatch['agent_id']} "
+                f"({dispatch.get('model') or 'модель не названа'}) кончился "
+                f"статусом {run_status} и отчёта не оставил"
+            )
         ),
         late_report_recheck=dispatch,
     )
