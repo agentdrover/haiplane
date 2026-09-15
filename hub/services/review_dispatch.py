@@ -1352,7 +1352,14 @@ async def _this_code_was_already_read(
     already = await _report_already_covers_this_sha(db, task)
     if not already:
         return False
-    await _refuse_second_read(db, int(task["id"]), already)
+    # #1265: пересдача того же sha из review теперь штатный повтор (таймаут,
+    # две сессии) и приходит сюда на ТОМ ЖЕ поколении снова и снова. Отказ
+    # говорится один раз на отчёт — тем же приёмом, каким свип не повторяет
+    # алерт о недоступном ревьюере (Cursor #383, 78312fbb487b30ca).
+    if not await _already_told_about_the_missing_reviewer(
+        db, int(task["id"]), f"отчёт #{already} покрывает ту же вершину"
+    ):
+        await _refuse_second_read(db, int(task["id"]), already)
     return True
 
 

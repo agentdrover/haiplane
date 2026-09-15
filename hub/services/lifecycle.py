@@ -2480,7 +2480,9 @@ async def submit_for_review(
     report and reviewed by the poller conveyor). Bumps the submission
     generation — which invalidates any verdict recorded for earlier work —
     and leaves the task in ``status=review`` with no ``review_job_id``,
-    marking the review as client-driven.
+    marking the review as client-driven. The one exception (#1265): the same
+    commit resubmitted from ``review`` opens no new generation — see
+    :func:`_same_sha_noop_response`.
 
     #1054: resubmitting from ``review`` used to be refused, and the refusal
     had no third move behind it. An author who found a defect in his own
@@ -2536,10 +2538,13 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
       второй прогон не заказывается; отчёта нет или он неполный — код мог
       остаться непрочитанным, и прогон заказывается на этом же поколении
       (находка Codex #1, AC-1);
-    * повтор идемпотентен (AC-3): применение уже применённых исходов на
-      втором одинаковом вызове не становится отказом — находка, закрытая
-      первым повтором, просто не открыта для второго, и ``plan_outcomes``
-      получает пустой список кандидатов вместо ValueError.
+    * повтор идемпотентен (AC-3): uid, уже отвеченный на этом поколении,
+      пропускается, и второй одинаковый вызов не становится отказом. Но uid,
+      которого у поколения нет вовсе (опечатка), получает тот же 422, что и
+      обычная сдача, — это не повтор;
+    * ``accept_areas`` проходит тот же шаг сверки области, что и обычная
+      сдача (``_step_surfaces``), и ту же запись о росте объёма: служебные
+      пути не дописываются, а непрочитанный дифф называется в ленте.
     """
     db = state.db
     task_id = state.task_id
@@ -2554,6 +2559,12 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         # сетевой git, и держать под ним BEGIN IMMEDIATE значит останавливать
         # все записи хаба (#1265, Cursor #380, 8a892feff574a2a6).
         await _step_resolve_diff(state)
+        # Тот же шаг сверки области, что у обычной сдачи: он сам отбрасывает
+        # ROUTINE_PATHS, признаёт только настоящий выход за объявленную
+        # область и называет «сверка НЕ выполнялась», когда дифф не прочитан,
+        # вместо молчаливого успеха (Cursor #383, 40af8ae7af0f7943). С
+        # accept_areas он не отказывает — признанный объём не расхождение.
+        await _step_surfaces(state)
 
     async with write_transaction(db):
         # AC-5: то же место в транзакции, что и в _apply_submission — до
@@ -2592,15 +2603,8 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
                 db, task_id, generation, outcome_writes, reported_by=agent
             )
         if body.accept_areas:
-            if state.diff_paths:
-                declared = deserialize_str_list(state.task.get("affected_areas"))
-                merged = list(declared) + [
-                    p for p in state.diff_paths if p not in declared
-                ]
-                if merged != list(declared):
-                    await repo.update_task_structured(
-                        db, task_id, TaskRefine(affected_areas=merged)
-                    )
+            await _record_accepted_scope(db, task_id, state.task, state.accepted_paths)
+            await _write_submission_notices(state)
         await db.commit()
 
     # AC-1 / #1150/#1152: решение о заказе ревью не тронуто этой задачей —
@@ -2729,6 +2733,43 @@ async def write_submission_notices(state: SubmitContext) -> None:
             + ". Вердикт будет относиться к номеру сдачи, а не к коду.",
         )
     await _write_submission_notices(state)
+
+
+async def _record_accepted_scope(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    accepted_paths: list[str],
+) -> None:
+    """Дописать признанный на сдаче объём и сказать об этом отдельно (#890).
+
+    Один код на обычную сдачу и на повтор того же sha (#1265): иначе повтор
+    дописывал бы affected_areas своим способом — сырым диффом, мимо
+    ROUTINE_PATHS и без записи о росте объёма (Cursor #383, 56fc0a823ab5e1a2,
+    5c3ba1c53664357f). Зовётся ВНУТРИ транзакции вызывающего.
+    """
+    if not accepted_paths:
+        return
+    declared = deserialize_str_list(task.get("affected_areas"))
+    merged = list(declared) + [p for p in accepted_paths if p not in declared]
+    await repo.update_task_structured(db, task_id, TaskRefine(affected_areas=merged))
+    shown = ", ".join(accepted_paths[:10])
+    more = f" и ещё {len(accepted_paths) - 10}" if len(accepted_paths) > 10 else ""
+    # A separate, visible event on purpose. Without it affected_areas would
+    # simply always equal the diff, and there would be nothing left to compare:
+    # the reviewer must be able to see that half the declared scope appeared at
+    # submission, not at DoR.
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"{commit_scope.SCOPE_GROWTH_MARKER} "
+        f"+{len(accepted_paths)} путь(ей) "
+        f"признан(ы) на сдаче — {shown}{more}. Было заявлено "
+        f"{len(declared)}, стало {len(merged)}. Это признание факта "
+        "сдающим, а не предсказание из постановки.",
+    )
 
 
 async def _write_submission_notices(state: SubmitContext) -> None:
@@ -2913,31 +2954,7 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
         # #890: the accepted scope is written INSIDE the same transaction as
         # the transition, so a task can never end up in review with the field
         # widened but the growth unrecorded — or the other way round.
-        if accepted_paths:
-            declared = deserialize_str_list(task.get("affected_areas"))
-            merged = list(declared) + [p for p in accepted_paths if p not in declared]
-            await repo.update_task_structured(
-                db, task_id, TaskRefine(affected_areas=merged)
-            )
-            shown = ", ".join(accepted_paths[:10])
-            more = (
-                f" и ещё {len(accepted_paths) - 10}" if len(accepted_paths) > 10 else ""
-            )
-            # A separate, visible event on purpose. Without it affected_areas
-            # would simply always equal the diff, and there would be nothing
-            # left to compare: the reviewer must be able to see that half the
-            # declared scope appeared at submission, not at DoR.
-            await repo.add_task_update(
-                db,
-                task_id,
-                "hub",
-                "alert",
-                f"{commit_scope.SCOPE_GROWTH_MARKER} "
-                f"+{len(accepted_paths)} путь(ей) "
-                f"признан(ы) на сдаче — {shown}{more}. Было заявлено "
-                f"{len(declared)}, стало {len(merged)}. Это признание факта "
-                "сдающим, а не предсказание из постановки.",
-            )
+        await _record_accepted_scope(db, task_id, task, accepted_paths)
         # #855: ONE report instead of scattered alerts. The area verdict is a
         # line in it, not a second independent message — a submission should
         # leave the reader with a single list of what was checked. The wording

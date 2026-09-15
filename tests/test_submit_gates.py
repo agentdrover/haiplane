@@ -799,9 +799,18 @@ async def test_same_sha_resubmission_still_applies_its_payload(
     """
     from hub.services.finding_identity import finding_uid
 
-    _install_fixed_tip_git(monkeypatch, "payload-tip", diff_paths=["hub/new_area.py"])
+    routine = sorted(lifecycle.commit_scope.ROUTINE_PATHS)[0]
+    _install_fixed_tip_git(
+        monkeypatch, "payload-tip", diff_paths=["hub/x.py", "hub/new_area.py", routine]
+    )
 
     task = await _pair_task_ready_to_submit(db, "Применение данных")
+    # Признать объём можно только против ОБЪЯВЛЕННОЙ области — как и у
+    # обычной сдачи: без неё сверка «unknown», и дописывать нечего (#890).
+    await repo.update_task_structured(
+        db, task.id, models.TaskRefine(affected_areas=["hub/x.py"])
+    )
+    await db.commit()
     await lifecycle.submit_for_review(db, task.id, models.TaskSubmitReview(agent="dev"))
 
     finding = {"title": "утечка", "severity": "high", "file": "hub/x.py"}
@@ -840,6 +849,76 @@ async def test_same_sha_resubmission_still_applies_its_payload(
     areas = deserialize_str_list(fresh.get("affected_areas"))
     assert "hub/new_area.py" in areas, (
         "accept_areas дописал affected_areas тем же диффом, что и обычная сдача"
+    )
+    assert routine not in areas, (
+        "служебный путь не дописывается — тот же фильтр ROUTINE_PATHS, что у "
+        "обычной сдачи (Cursor #383, 56fc0a823ab5e1a2)"
+    )
+    feed = " ".join(
+        (dict(u)["content"] or "") for u in await repo.get_task_updates(db, task.id)
+    )
+    assert lifecycle.commit_scope.SCOPE_GROWTH_MARKER in feed, (
+        "рост объёма на повторе записан так же, как на обычной сдаче "
+        "(Cursor #383, 5c3ba1c53664357f)"
+    )
+
+
+async def test_accept_areas_on_a_retry_names_an_unreadable_diff(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Cursor #383 (40af8ae7af0f7943): accept_areas на повторе при
+    непрочитанном диффе не молчит об успехе — лента называет, что сверка
+    области НЕ выполнялась, как и у обычной сдачи, и область не расширена."""
+    _install_fixed_tip_git(monkeypatch, "unreadable-tip")  # дифф: None
+
+    task = await _pair_task_ready_to_submit(db, "Непрочитанный дифф")
+    await repo.update_task_structured(
+        db, task.id, models.TaskRefine(affected_areas=["hub/x.py"])
+    )
+    await db.commit()
+    await lifecycle.submit_for_review(db, task.id, models.TaskSubmitReview(agent="dev"))
+    before = len(await repo.get_task_updates(db, task.id))
+
+    retry = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", accept_areas=True)
+    )
+
+    assert retry.submission_generation == 1
+    new = [
+        (dict(u)["content"] or "")
+        for u in (await repo.get_task_updates(db, task.id))[before:]
+    ]
+    assert any("НЕ выполнялась" in c for c in new), (
+        f"повтор с accept_areas обязан назвать, что сверка не выполнялась: {new}"
+    )
+    fresh = dict(await repo.get_task(db, task.id))
+    assert deserialize_str_list(fresh.get("affected_areas")) == ["hub/x.py"]
+
+
+async def test_the_second_read_refusal_is_said_once_per_report(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Cursor #383 (78312fbb487b30ca): повтор того же sha — штатный путь, и
+    отказ #1152 на нём не копится в ленте: один раз на отчёт."""
+    from hub.services import review_dispatch
+
+    async def _covers(db_, task_):
+        return 42
+
+    monkeypatch.setattr(review_dispatch, "_report_already_covers_this_sha", _covers)
+    task = await _pair_task_ready_to_submit(db, "Отказ один раз")
+    row = dict(await repo.get_task(db, task.id))
+
+    assert await review_dispatch._this_code_was_already_read(db, row) is True
+    assert await review_dispatch._this_code_was_already_read(db, row) is True
+
+    said = [
+        (dict(u)["content"] or "")
+        for u in await repo.get_task_updates(db, task.id)
+        if "отчёт #42 покрывает ту же вершину" in (dict(u)["content"] or "")
+    ]
+    assert len(said) == 1, (
+        f"отказ сказан ровно один раз, а не на каждом повторе: {said}"
     )
 
 
