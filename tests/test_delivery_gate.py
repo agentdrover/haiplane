@@ -824,6 +824,102 @@ async def test_a_closed_unmerged_base_also_calls_a_human(
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     body = " ".join(u.get("content") or "" for u in updates)
     assert f"#{base_id}" in body
+    # Cursor #385 (fc420e738b347d00): закрытый PR не называется открытым.
+    assert "её PR закрыт без мержа" in body, body
+    assert "её PR открыт" not in body, body
+
+
+async def test_a_closed_base_whose_branch_is_gone_does_not_hold_the_project(
+    db: aiosqlite.Connection,
+) -> None:
+    # Cursor #385 (4a97669554fc9e13), high; решение стюарда 15.09, вариант 1.
+    # pr_closed свип не переспрашивает, а ветку свёрнутой работы никто не
+    # вернёт. Звать человека на такой строке значило бы ставить в
+    # needs_decision КАЖДУЮ доставку проекта без своей явной стопки, без
+    # отпирающего события. Исход — мерж с алертом, называющим задачу.
+    from hub.integrations.protocols import StackProbeOutcome
+
+    dead = "task-901/closed-and-deleted"
+    g = _probes(
+        _git(CIProbeOutcome.passed, merged=True),
+        StackProbeOutcome.unavailable,
+        reason="ref_unresolved",
+        details=dead,
+    )
+    task_id = await _approved_pair_task(db)
+    base_id = await _stranded_base(db, dead)
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=base_id,
+        state=PR_CLOSED,
+        reason="PR #3 закрыт без мержа — работу свернули намеренно",
+        pr_number=3,
+        delivery_path="none",
+    )
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] != "needs_decision", (
+        "одна свёрнутая задача с удалённой веткой не должна звать человека "
+        "на каждой доставке проекта"
+    )
+    assert g.merge_pr.await_count == 1
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{base_id}" in body and dead in body, (
+        "мерж не молчаливый: алерт называет, что проверить было нечем"
+    )
+
+
+async def test_a_closed_gone_base_does_not_mask_a_plain_unknown(
+    db: aiosqlite.Connection,
+) -> None:
+    # Обратная сторона: свёрнутая база ниже обычного unknown. Моргнувший git
+    # на соседней строке по-прежнему ждёт, а не мержит с алертом только
+    # потому, что рядом лежит закрытая база. Мутация «closed_gone выше
+    # unknown в _first_of» роняет этот тест.
+    from hub.integrations.protocols import StackProbeOutcome, StackProbeResult
+
+    g = _git(CIProbeOutcome.passed, merged=True)
+    dead = "task-901/closed-and-deleted"
+    live = "task-1175/image-capture"
+
+    async def _probe(_branch, other_branch, **_kw):
+        if other_branch == dead:
+            return StackProbeResult(
+                outcome=StackProbeOutcome.unavailable,
+                reason="ref_unresolved",
+                details=dead,
+            )
+        return StackProbeResult(
+            outcome=StackProbeOutcome.unavailable,
+            reason="rev_list_failed",
+            details=f"rc=1/0 for {other_branch}",
+        )
+
+    g.branch_stacking_probe = _probe
+    task_id = await _approved_pair_task(db)
+    base_id = await _stranded_base(db, dead)
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=base_id,
+        state=PR_CLOSED,
+        reason="PR #3 закрыт без мержа — работу свернули намеренно",
+        pr_number=3,
+        delivery_path="none",
+    )
+    await _base_task_in_review(db, live)
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "непроверенная живая строка — повторяемое ожидание, как и было"
+    )
 
 
 async def test_a_delivered_base_does_not_hold_anything(

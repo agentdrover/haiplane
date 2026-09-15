@@ -561,7 +561,9 @@ async def list_undelivered_completed_branch_tasks(
     """
     return await fetchall(
         db,
-        "SELECT t.id, t.title, t.status, t.branch "
+        # d.state travels with the row: a closed base whose branch is gone must
+        # not hold a stack the way an open one does (#1204, Cursor #385).
+        "SELECT t.id, t.title, t.status, t.branch, d.state AS delivery_state "
         "FROM delivery_discrepancies d JOIN tasks t ON t.id = d.task_id "
         "WHERE d.state IN ('pr_open', 'pr_closed') AND t.archived = 0 "
         "AND t.id != ? "

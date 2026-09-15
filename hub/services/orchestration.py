@@ -2034,6 +2034,9 @@ class StackAssessment:
     # a plain unknown is retryable and waits, while a terminal task's deleted
     # branch will never come back — waiting on it is silent and permanent.
     unprobed_stranded_task_id: int | None = None
+    # #1204 (Cursor #385): the registry state of a stranded base — pr_open or
+    # pr_closed. Empty for a base still on the conveyor.
+    base_delivery_state: str = ""
 
     def as_advisory(self) -> dict[str, Any] | None:
         """The pre-#1186 shape: a dict for a stack, None for anything else."""
@@ -2130,6 +2133,19 @@ async def _walk_stacking_candidates(
             yield row, name, result
 
 
+def _base_pr_phrase(delivery_state: str) -> str:
+    """What the stranded base's PR is, as the registry recorded it (#1204).
+
+    Cursor #385 (fc420e738b347d00): both refusals said «её PR открыт и не
+    влит» unconditionally, while pr_closed rows reach them too.
+    """
+    from hub.services.delivery_state import PR_CLOSED
+
+    if delivery_state == PR_CLOSED:
+        return "её PR закрыт без мержа"
+    return "её PR открыт и не влит"
+
+
 def _first_of(*answers: "StackAssessment | None") -> "StackAssessment | None":
     """The walk's precedence, written once and in order (#1186, #1204).
 
@@ -2199,6 +2215,31 @@ def _stranded_with_a_dead_ref(
     unresolved = {n.strip() for n in (result.details or "").split(",") if n.strip()}
     if unresolved != {other_branch}:
         return None
+    from hub.services.delivery_state import PR_CLOSED
+
+    if other.get("delivery_state") == PR_CLOSED:
+        # #1204, Cursor #385 (4a97669554fc9e13), решение стюарда 15.09 за
+        # молчащего владельца, вариант 1. PR закрыт без мержа И ветки нет на
+        # origin: работу свернули окончательно — pr_closed свип не
+        # переспрашивает, ветку никто не вернёт. Звать человека значило бы, что
+        # ОДНА такая строка ставит в needs_decision каждую доставку проекта без
+        # своей явной стопки, и отпирающего события нет. Поэтому это не
+        # «застрявший непроверенный», а неповторяемый unknown — мерж с алертом,
+        # называющим задачу; в обходе он ниже обычного unknown (моргнувший git
+        # по-прежнему ждёт). Остаточный риск назван: ветка, отведённая от
+        # свёрнутой работы, унесёт её коммиты — их видит ревью этой ветки.
+        return StackAssessment(
+            outcome=STACK_UNKNOWN,
+            reason=(
+                f"ветка '{other_branch}' задачи #{other['id']} удалена с origin, "
+                "её PR закрыт без мержа — стоит ли эта ветка на ней, проверить "
+                "нечем"
+            ),
+            retryable=False,
+            base_task_id=int(other["id"]),
+            base_task_branch=other_branch,
+            base_delivery_state=PR_CLOSED,
+        )
     return StackAssessment(
         outcome=STACK_UNKNOWN,
         reason=f"stranded_ref_unresolved: {other_branch}",
@@ -2208,7 +2249,23 @@ def _stranded_with_a_dead_ref(
         base_task_status=other.get("status") or "",
         base_can_deliver_itself=False,
         unprobed_stranded_task_id=int(other["id"]),
+        base_delivery_state=other.get("delivery_state") or "",
     )
+
+
+def _file_dead_ref(
+    dead: "StackAssessment",
+    stranded_unprobed: "StackAssessment | None",
+    closed_gone: "StackAssessment | None",
+) -> tuple["StackAssessment | None", "StackAssessment | None"]:
+    """Which slot of the walk a dead-ref answer belongs to (#1204, Cursor #385).
+
+    An open base calls a human; a closed one whose branch is gone does not.
+    The first answer of each kind is kept, as everywhere in the walk.
+    """
+    if dead.unprobed_stranded_task_id:
+        return stranded_unprobed or dead, closed_gone
+    return stranded_unprobed, closed_gone or dead
 
 
 async def assess_branch_stacking(
@@ -2289,6 +2346,8 @@ async def assess_branch_stacking(
     unknown: StackAssessment | None = None
     # Held apart from ``unknown``: see StackAssessment.unprobed_stranded_task_id.
     stranded_unprobed: StackAssessment | None = None
+    # #1204 (Cursor #385): a closed base whose branch is gone. Not a hold.
+    closed_gone: StackAssessment | None = None
     # #1186 round 2: a match that says "the OTHER branch stands on ME" is
     # benign — but only for that pair. The walk answers with the first match
     # it finds, and while every match meant a refusal that was safe: order
@@ -2356,6 +2415,7 @@ async def assess_branch_stacking(
                 base_task_status=other_status,
                 relation=relation,
                 base_can_deliver_itself=other_id not in stranded,
+                base_delivery_state=other.get("delivery_state") or "",
                 message=_stacking_message(
                     relation, branch, other_branch, other_id, other_status, base
                 ),
@@ -2367,7 +2427,9 @@ async def assess_branch_stacking(
         if result.outcome is not StackProbeOutcome.clear:
             dead = _stranded_with_a_dead_ref(other, other_branch, result, stranded)
             if dead is not None:
-                stranded_unprobed = stranded_unprobed or dead
+                stranded_unprobed, closed_gone = _file_dead_ref(
+                    dead, stranded_unprobed, closed_gone
+                )
                 continue
             # Remembered, not returned: a later row may still be a definite
             # stack, and a definite stack is the more useful answer. Only
@@ -2380,7 +2442,7 @@ async def assess_branch_stacking(
     # Unknown outranks benign for the same reason it outranks clear: a row we
     # could not look at may be the dangerous one, and "the pair I DID look at
     # is safe" says nothing about it.
-    answer = _first_of(stranded_unprobed, unknown, benign)
+    answer = _first_of(stranded_unprobed, unknown, closed_gone, benign)
     if answer is not None:
         return answer
     return StackAssessment(outcome=STACK_CLEAR, reason="no_unmerged_branch_shares")
@@ -2814,7 +2876,8 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
                 )
             return (
                 f"{STRANDED_BASE_PREFIX}: {how}, и эту задачу человек принял, "
-                f"НЕ доставив — её PR открыт и не влит. Ждать нечего: "
+                f"НЕ доставив — "
+                f"{_base_pr_phrase(assessment.base_delivery_state)}. Ждать нечего: "
                 f"конвейер к принятой задаче не вернётся, а мерж сейчас унёс "
                 f"бы её работу в базовую ветку под номером этой задачи. "
                 f"Решение за человеком: доставить "
@@ -2860,7 +2923,7 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
         return (
             f"{UNPROBED_STRANDED_BASE_PREFIX}: задачу "
             f"#{assessment.unprobed_stranded_task_id} человек принял, НЕ "
-            f"доставив (её PR открыт и не влит), а её ветку "
+            f"доставив ({_base_pr_phrase(assessment.base_delivery_state)}), а её ветку "
             f"'{assessment.base_task_branch}' не разрешается, а origin на "
             f"прямой вопрос ответил, что такой ветки у него нет — обычно так "
             f"выглядит удаление ветки после ручного мержа. Поэтому хаб НЕ "
