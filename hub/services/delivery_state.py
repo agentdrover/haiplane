@@ -619,6 +619,62 @@ async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+#: #1267: the named cause of a row whose closed recorded PR could not be
+#: checked for a live replacement — the branch search RAISED. Kept as a
+#: constant because the accept path and the sweep must say the same words.
+SEARCH_UNANSWERED_CAUSE = "поиск PR не ответил"
+
+
+def _search_unanswered(answer: dict[str, Any]) -> dict[str, Any]:
+    """A closed recorded PR whose replacement search failed: silence, not a fact.
+
+    ``task_delivery`` is right that the recorded number is closed. What it
+    cannot know is whether the branch carries a live PR elsewhere (#959) —
+    and when the search for one raised, "работу свернули намеренно" would be
+    silence written down as a decision (#802). The row stays ``unknown``: the
+    registry lists it and the sweep asks again (#1267). No new state, no second
+    computation — only the verdict on an answer already computed is withheld.
+    """
+    pr = answer["pr_number"]
+    return _task_answer(
+        UNKNOWN,
+        f"{SEARCH_UNANSWERED_CAUSE}: записанный PR #{pr} закрыт без мержа, но "
+        "есть ли у ветки открытая замена, узнать не удалось. Это незнание, а "
+        "не решение свернуть работу и не «доставлено» (#1267)",
+        pr_number=pr,
+        delivery_path="unknown",
+    )
+
+
+async def _answer_past_closed_number(
+    db: Any, task: dict[str, Any], answer: dict[str, Any]
+) -> dict[str, Any]:
+    """Re-ask a closed recorded PR the way #959 asks it: through the branch.
+
+    The sweep keys on ``pr_number``, which is a cached observation. Reading
+    "closed" off it as the final answer turned an ``unknown`` row — written
+    when the replacement search failed at accept — into ``pr_closed`` on the
+    very next pass, and ``pr_closed`` is never asked again (#1267, AC-3). The
+    replacement is found by ``resolve_delivery_pr``, the one rule the gate and
+    the human decision already use; the live PR's state is then asked through
+    ``task_delivery`` like any other — no second copy of either.
+    """
+    if answer["state"] != PR_CLOSED:
+        return answer
+    from hub import services
+
+    live_task, delivery_pr = await services.resolve_delivery_pr(db, task)
+    if delivery_pr.unusable and delivery_pr.search_unanswered:
+        return _search_unanswered(answer)
+    if (
+        not delivery_pr.unusable
+        and delivery_pr.number
+        and delivery_pr.number != answer["pr_number"]
+    ):
+        return await task_delivery(db, live_task)
+    return answer
+
+
 def _acceptance_note(answer: dict[str, Any], disposition: str) -> str:
     """The sentence a manual acceptance leaves behind instead of silence."""
     intent = _DISPOSITION_TEXT.get(disposition, _DISPOSITION_TEXT[""])
@@ -647,6 +703,7 @@ async def note_completion_without_delivery(
     via: str,
     actor: str = "human",
     disposition: str = "",
+    search_unanswered: bool = False,
 ) -> dict[str, Any] | None:
     """Say out loud what a completion outside the delivery gate left behind.
 
@@ -659,6 +716,11 @@ async def note_completion_without_delivery(
     be undone because GitHub was slow, and manual acceptance stays available in
     every form. Returns the answer it recorded, or ``None`` if it could not
     look at the task at all.
+
+    ``search_unanswered`` (#1267) is what ``deliver_on_disposition`` already
+    learned: the recorded PR is closed and the branch search for its live
+    replacement raised. A ``pr_closed`` answer is then written as ``unknown``
+    with that cause — never as "свернули намеренно".
     """
     try:
         row = await repo.get_task(db, task_id)
@@ -671,6 +733,8 @@ async def note_completion_without_delivery(
             # different findings under one name.
             return None
         answer = await task_delivery(db, task)
+        if search_unanswered and answer["state"] == PR_CLOSED:
+            answer = _search_unanswered(answer)
         disposition = disposition if disposition in DISPOSITIONS else ""
         await repo.record_delivery_discrepancy(
             db,
@@ -869,7 +933,9 @@ async def scan_completed_deliveries(
         task = dict(row)
         task_id = int(task["id"])
         try:
-            answer = await task_delivery(db, task)
+            answer = await _answer_past_closed_number(
+                db, task, await task_delivery(db, task)
+            )
             prior = await repo.get_delivery_discrepancy(db, task_id) or {}
             voice = _discrepancy_voice(task, answer, prior)
             if voice:
