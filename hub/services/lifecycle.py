@@ -4467,7 +4467,7 @@ DELIVER_DISPOSITION = "deliver"
 
 async def deliver_on_disposition(
     db: aiosqlite.Connection, task_id: int, disposition: str, *, via: str
-) -> tuple[bool, str]:
+) -> tuple[bool, str, bool]:
     """Act on ``pr_disposition=deliver``: merge, or refuse and say why (#1037).
 
     Until now the field was recorded and never acted on, so a human who

@@ -789,22 +789,32 @@ def _pr_search_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """The live-branch PR search fails — silence, never "no open PR" (#959)."""
 
     async def fake_pr_for_branch(
-        branch: str, repo: str | None = None, gh_repo: str | None = None, forge: str = ""
+        branch: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> int | None:
         raise RuntimeError("gh: rate limited")
 
-    monkeypatch.setattr(plugins.git_ops, "pr_for_branch", fake_pr_for_branch, raising=False)
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_for_branch", fake_pr_for_branch, raising=False
+    )
 
 
 def _pr_search_answers_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """The live-branch PR search ANSWERS "no open PR" — a fact, not silence."""
 
     async def fake_pr_for_branch(
-        branch: str, repo: str | None = None, gh_repo: str | None = None, forge: str = ""
+        branch: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> int | None:
         return None
 
-    monkeypatch.setattr(plugins.git_ops, "pr_for_branch", fake_pr_for_branch, raising=False)
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_for_branch", fake_pr_for_branch, raising=False
+    )
 
 
 async def test_a_failed_pr_search_at_accept_stays_visible_as_unknown(
@@ -834,6 +844,29 @@ async def test_a_failed_pr_search_at_accept_stays_visible_as_unknown(
         f"строка обязана быть видна в реестре недоставленных: {listed}"
     )
     assert task_id not in [r["task_id"] for r in listed["undelivered"]]
+
+
+async def test_a_failed_pr_search_at_force_complete_stays_visible_as_unknown(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1267: force-complete is the second door with the same order
+    # (completed first, delivery after) — it must record the same unknown.
+    _pr_states(monkeypatch, {916: "closed"})
+    _pr_search_raises(monkeypatch)
+    task_id = await _approved_task(client, db, title="forced, search raised", pr=916)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/force-complete",
+        json={"comment": "closing by hand", "pr_disposition": "deliver"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert row is not None and row["state"] == UNKNOWN, dict(row or {})
+    assert "поиск PR не ответил" in (row["reason"] or ""), dict(row)
+    assert row["accepted_via"] == "force_complete", dict(row)
+    listed = await undelivered_completed_tasks(db)
+    assert task_id in [r["task_id"] for r in listed["unknown"]], listed
 
 
 async def test_an_answered_empty_search_at_accept_still_records_closed(
@@ -873,11 +906,16 @@ async def test_a_reswept_unknown_row_is_not_buried_by_the_closed_recorded_number
 
     # The provider is no longer blinking, and the branch now has a live PR.
     async def fake_pr_for_branch(
-        branch: str, repo: str | None = None, gh_repo: str | None = None, forge: str = ""
+        branch: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
     ) -> int | None:
         return 950
 
-    monkeypatch.setattr(plugins.git_ops, "pr_for_branch", fake_pr_for_branch, raising=False)
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_for_branch", fake_pr_for_branch, raising=False
+    )
 
     await scan_completed_deliveries(db)
 
@@ -891,6 +929,75 @@ async def test_a_reswept_unknown_row_is_not_buried_by_the_closed_recorded_number
         assert after["pr_number"] == 950, (
             f"если строка называет живой PR, это обязан быть PR ветки: {dict(after)}"
         )
+
+
+async def test_a_reswept_unknown_row_stays_unknown_while_the_search_still_fails(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1267, risk "два прохода свипа": the search keeps raising on every pass.
+    # Each pass must keep the row unknown with the named cause — silence on
+    # the second pass is no more an answer than on the first (#802, #959).
+    _pr_states(monkeypatch, {913: "closed"})
+    _pr_search_raises(monkeypatch)
+    task_id = await _approved_task(client, db, title="search still down", pr=913)
+    await _decide_deliver(client, task_id)
+
+    for _ in range(2):
+        await scan_completed_deliveries(db)
+        row = await repo.get_delivery_discrepancy(db, task_id)
+        assert row is not None and row["state"] == UNKNOWN, dict(row or {})
+        assert "поиск PR не ответил" in (row["reason"] or ""), dict(row)
+
+    listed = await undelivered_completed_tasks(db)
+    assert task_id in [r["task_id"] for r in listed["unknown"]], listed
+
+
+async def test_a_reswept_row_whose_search_answers_none_is_closed(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1267, the other half of AC-2 on the sweep: once the search ANSWERS
+    # "no open PR", the closed recorded number is a fact and pr_closed is
+    # right — the fix withholds a verdict only from silence.
+    _pr_states(monkeypatch, {914: "closed"})
+    _pr_search_raises(monkeypatch)
+    task_id = await _approved_task(client, db, title="search answers later", pr=914)
+    await _decide_deliver(client, task_id)
+
+    _pr_search_answers_none(monkeypatch)
+    await scan_completed_deliveries(db)
+
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert row is not None and row["state"] == PR_CLOSED, dict(row or {})
+
+
+async def test_a_reswept_row_names_the_live_pr_of_the_branch(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1267 AC-3, the strong form: when the branch's live PR is open, the row
+    # names THAT PR as pr_open — the work is visible under its real number.
+    _pr_states(monkeypatch, {915: "closed", 951: "open"})
+    _pr_search_raises(monkeypatch)
+    task_id = await _approved_task(client, db, title="live pr named", pr=915)
+    await _decide_deliver(client, task_id)
+
+    async def fake_pr_for_branch(
+        branch: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> int | None:
+        return 951
+
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_for_branch", fake_pr_for_branch, raising=False
+    )
+    await scan_completed_deliveries(db)
+
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert row is not None and row["state"] == PR_OPEN, dict(row or {})
+    assert row["pr_number"] == 951, dict(row)
+    listed = await undelivered_completed_tasks(db)
+    assert task_id in [r["task_id"] for r in listed["undelivered"]], listed
 
 
 # --- #1215: a row nobody is left to ask -------------------------------------
