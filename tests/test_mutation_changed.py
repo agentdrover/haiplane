@@ -138,13 +138,47 @@ def test_a_red_baseline_is_not_reported_as_no_survivors(tmp_path):
     assert (repo / "calc.py").read_text() == _HEAD_CALC
 
 
-def test_type_annotations_are_not_mutated(tmp_path, monkeypatch):
-    """`int | None` → `int - None` survives any test and says nothing about it."""
+def _script_module():
     sys.path.insert(0, str(REPO_ROOT / "scripts"))
     try:
         import mutation_changed
     finally:
         sys.path.remove(str(REPO_ROOT / "scripts"))
+    return mutation_changed
+
+
+def test_tests_are_chosen_per_function_and_too_broad_is_named(tmp_path):
+    """A function is judged by the tests that name it; a core module is not a full run."""
+    mc = _script_module()
+    fn = mc.Function("hub/calc.py", "Calc.add", 1, 3)
+    texts = {
+        tmp_path / "test_add.py": "from hub.calc import Calc\nCalc().add(1, 2)",
+        tmp_path / "test_other.py": "import hub.calc\nhub.calc.sub(1, 2)",
+        tmp_path / "test_far.py": "import json",
+    }
+
+    chosen, why = mc.tests_for(fn, texts)
+    assert chosen == [tmp_path / "test_add.py"]
+    assert why == ""
+
+    nobody_names = mc.Function("hub/calc.py", "mul", 5, 6)
+    chosen, _ = mc.tests_for(nobody_names, texts)
+    assert sorted(chosen) == sorted(
+        [tmp_path / "test_add.py", tmp_path / "test_other.py"]
+    )
+
+    chosen, why = mc.tests_for(nobody_names, texts, limit=1)
+    assert chosen == []
+    assert "шире предела 1" in why
+
+    chosen, why = mc.tests_for(mc.Function("hub/none.py", "f", 1, 2), texts)
+    assert chosen == []
+    assert why
+
+
+def test_type_annotations_are_not_mutated(tmp_path, monkeypatch):
+    """`int | None` → `int - None` survives any test and says nothing about it."""
+    mutation_changed = _script_module()
 
     source = (
         "from __future__ import annotations\n\n\n"
