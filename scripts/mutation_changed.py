@@ -179,6 +179,40 @@ def functions_in(path: str, source: str) -> list[Function]:
     return found
 
 
+Span = tuple[tuple[int, int], tuple[int, int]]
+
+
+def annotation_spans(source: str) -> list[Span]:
+    """(start, end) of every type annotation, as (line, column) pairs.
+
+    Under ``from __future__ import annotations`` an annotation is never
+    evaluated, so ``int | None`` → ``int - None`` survives every test and says
+    nothing about them — pure noise for the reader of the survivor list.
+    """
+    spans: list[Span] = []
+    for node in ast.walk(ast.parse(source)):
+        annotations: list[ast.expr | None] = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            annotations.append(node.returns)
+        elif isinstance(node, ast.arg):
+            annotations.append(node.annotation)
+        elif isinstance(node, ast.AnnAssign):
+            annotations.append(node.annotation)
+        for ann in annotations:
+            if ann is not None and ann.end_lineno is not None:
+                spans.append(
+                    (
+                        (ann.lineno, ann.col_offset),
+                        (ann.end_lineno, ann.end_col_offset or 0),
+                    )
+                )
+    return spans
+
+
+def in_annotation(spans: Iterable[Span], position: tuple[int, int]) -> bool:
+    return any(start <= tuple(position) < end for start, end in spans)
+
+
 def innermost(functions: Iterable[Function], line: int) -> Function | None:
     """The narrowest function whose span contains ``line``."""
     containing = [f for f in functions if f.first <= line <= f.last]
@@ -273,11 +307,12 @@ def _no_bytecode_env() -> dict[str, str]:
     return env
 
 
-def _mutations_for(path: str, db_path: Path) -> list:
-    """Every cosmic-ray mutation of one file, minus the excluded operators."""
+def mutations_for(path: str, db_path: Path) -> list:
+    """Every cosmic-ray mutation of one file, minus excluded operators and annotations."""
     from cosmic_ray.commands import init
     from cosmic_ray.work_db import WorkDB, use_db
 
+    spans = annotation_spans(Path(path).read_text(encoding="utf-8"))
     with use_db(str(db_path), WorkDB.Mode.create) as work_db:
         init([Path(path)], work_db, {})
         return [
@@ -285,6 +320,7 @@ def _mutations_for(path: str, db_path: Path) -> list:
             for item in work_db.pending_work_items
             for mutation in item.mutations
             if not EXCLUDED_OPERATORS.match(mutation.operator_name)
+            and not in_annotation(spans, mutation.start_pos)
         ]
 
 
@@ -322,7 +358,7 @@ def _collect_targets(
                 report.untested.append(f"{function.key}: {why_not}")
                 continue
             if mutations is None:
-                mutations = _mutations_for(path, scratch / f"session-{index}.sqlite")
+                mutations = mutations_for(path, scratch / f"session-{index}.sqlite")
             mine = [
                 m for m in mutations if innermost(functions, m.start_pos[0]) == function
             ]

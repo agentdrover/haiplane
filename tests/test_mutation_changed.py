@@ -136,3 +136,25 @@ def test_a_red_baseline_is_not_reported_as_no_survivors(tmp_path):
     assert "серия мутаций не выполнялась" in proc.stdout
     assert "выживших нет" not in proc.stdout
     assert (repo / "calc.py").read_text() == _HEAD_CALC
+
+
+def test_type_annotations_are_not_mutated(tmp_path, monkeypatch):
+    """`int | None` → `int - None` survives any test and says nothing about it."""
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        import mutation_changed
+    finally:
+        sys.path.remove(str(REPO_ROOT / "scripts"))
+
+    source = (
+        "from __future__ import annotations\n\n\n"
+        "def pick(a: int | None, b: int) -> int | None:\n"
+        "    return a | b\n"
+    )
+    (tmp_path / "mod.py").write_text(source)
+    monkeypatch.chdir(tmp_path)
+
+    mutations = mutation_changed.mutations_for("mod.py", tmp_path / "s.sqlite")
+
+    assert mutations, "the body must still be mutated"
+    assert {m.start_pos[0] for m in mutations} == {5}
