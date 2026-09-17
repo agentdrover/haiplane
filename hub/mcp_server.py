@@ -2065,7 +2065,8 @@ async def hub_submit_for_review(
 
     This does NOT complete the task, and the verdict is not yours: the
     reviewer is a different actor (hub_get_review_brief, hub_submit_review).
-    Bumps the generation, invalidating any earlier APPROVED.
+    Bumps the generation, invalidating any earlier APPROVED; resubmitting
+    the same commit from review keeps it (#1265).
 
     Args:
         task_id: The running pair task ID
@@ -2087,6 +2088,7 @@ async def hub_submit_for_review(
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
+    prior_generation = prior_task.get("submission_generation") if prior_task else None
     body: dict[str, Any] = {}
     if agent:
         body["agent"] = agent
@@ -2105,11 +2107,29 @@ async def hub_submit_for_review(
     except HubApiError as exc:
         return _format_hub_api_error(exc)
     generation = task.get("submission_generation", 0)
-    message = (
-        f"Task #{task_id} submitted for review (submission #{generation}, "
-        f"status: {task.get('status', '?')}). Awaiting reviewer verdict via "
-        "hub_submit_review."
+    # #1265 AC-6: a same-sha retry from review opens no new generation — the
+    # prior read (BEFORE this call) and the fresh one (AFTER) share the same
+    # number only in that case, since every real submission (first one, new
+    # sha, or leaving review) changes it. No new field needed: the client
+    # already fetched both reads for prior_status.
+    was_unchanged_retry = (
+        prior_status == "review"
+        and prior_generation is not None
+        and generation == prior_generation
     )
+    if was_unchanged_retry:
+        message = (
+            f"Task #{task_id}: submission #{generation} is already on "
+            "review — the code did not change, so no new generation opened "
+            "and the earlier verdict stays current. Awaiting reviewer "
+            "verdict via hub_submit_review."
+        )
+    else:
+        message = (
+            f"Task #{task_id} submitted for review (submission #{generation}, "
+            f"status: {task.get('status', '?')}). Awaiting reviewer verdict via "
+            "hub_submit_review."
+        )
     # #836: name the baseline here, in the response the waiting agent reads.
     # Watching `verdict` instead fires on the PREVIOUS generation's approval,
     # which reads as "my resubmission was approved" — that happened.

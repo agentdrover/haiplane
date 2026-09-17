@@ -6902,3 +6902,376 @@ async def test_a_report_arriving_while_the_local_order_is_being_prepared_stops_i
     assert cloud["status"] == "done", (
         "доехавший отчёт принадлежит этому заказу — закрывается им"
     )
+
+
+# --- #1266: пять остаточных находок доставки #1252 --------------------------
+
+
+async def test_a_replacement_does_not_spend_the_ladder_step(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-1: локальная замена упавшего облачного LITE не тратит шаг лестницы.
+
+    Облачный LITE СОЗДАЁТСЯ (в отличие от test_a_deep_top_up_is_not_
+    silenced_by_an_earlier_lite_debt, где он отказывает на создании и строки
+    не пишет) и кончается без отчёта. Вторая дверь заказывает локальную
+    замену, её отчёт неполный. count_review_dispatches сегодня считает ОБЕ
+    строки (облачную и локальную замену) как два шага, REVIEW_LADDER_MAX_
+    STEPS=2 достигнут — DEEP-добор молча не заказывается.
+    """
+    from hub.services.review_dispatch import DEEP, wait_for_local_runs
+
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-ladder"}, "run": {"id": "r-ladder"}}
+    )
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub(_INCOMPLETE_LOCAL_REPORT))
+
+    task_id = await _submitted(
+        client, db, "spike-ladder-replacement", policy={"review": "dispatch"}
+    )
+    cloud_before = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert cloud_before["profile"] == "lite"
+
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes') "
+        "WHERE id = ?",
+        (cloud_before["id"],),
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    locals_ = await _local_dispatches(db, task_id)
+    assert len(locals_) == 1 and locals_[0]["status"] == "done"
+    assert locals_[0]["profile"] == "lite"
+
+    deep_rows = [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud' "
+            "AND profile=?",
+            (task_id, DEEP),
+        )
+    ]
+    assert deep_rows, (
+        "замена упавшего облачного LITE не должна тратить шаг лестницы: "
+        "DEEP-добор обязан быть заказан по неполному отчёту локальной замены"
+    )
+
+
+async def test_a_sync_refusal_keeps_the_second_door_debt_through_a_crash(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-2: синхронный отказ облака обязан оставить долг ДО риска сломаться.
+
+    Облако отказывает НА СОЗДАНИИ (синхронно, строки не бывает вовсе).
+    Подготовка локального заказа (``prepare_review_order`` для локального
+    принципала) падает — ровно то, что может случиться из-за сети внутри
+    неё. Сегодня ``open_second_door`` зовётся БЕЗ строки долга, и падение
+    внутри нею не оставляет НИЧЕГО, что свип мог бы повторить: вторая дверь
+    потеряна навсегда.
+    """
+    from hub.services import review_dispatch as rd
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    _wire(monkeypatch, _DispatchRecorder(None, _LIMIT_REFUSAL))
+
+    local_pid = await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    real_order = rd.prepare_review_order
+    local_attempts = {"n": 0}
+
+    async def _flaky_for_local(*args, **kwargs):
+        if kwargs.get("principal_id") == local_pid:
+            local_attempts["n"] += 1
+            if local_attempts["n"] == 1:
+                raise RuntimeError(
+                    "подготовка локального заказа сорвалась: git-операция не прошла"
+                )
+        return await real_order(*args, **kwargs)
+
+    monkeypatch.setattr(rd, "prepare_review_order", _flaky_for_local)
+
+    task_id = await _submitted(
+        client, db, "spike-sync-debt-crash", policy={"review": "dispatch"}
+    )
+
+    rows_after_crash = list(
+        await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=?", (task_id,)
+        )
+    )
+    assert rows_after_crash, (
+        "долг второй двери обязан быть записан ДО рискованного вызова: иначе "
+        "падение внутри подготовки локального заказа теряет обещанную вторую "
+        "дверь безвозвратно"
+    )
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    locals_ = await _local_dispatches(db, task_id)
+    assert len(locals_) == 1 and locals_[0]["status"] == "done", (
+        "долг второй двери обязан быть отдан на следующем проходе свипа, "
+        "как и в асинхронном случае (test_a_crash_before_the_second_door_"
+        "does_not_lose_it)"
+    )
+
+
+async def test_a_submission_moved_during_preparation_buys_no_local_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-4: сдачу пересдали, пока готовился локальный заказ — прогон не покупается.
+
+    ``_submission_still_live`` сегодня перечитывается только в начале
+    ``open_second_door`` — ДО ``review_reach``, счёта потраченного и
+    медленной ``prepare_review_order``. Пересдача, случившаяся ВНУТРИ
+    подготовки заказа, этой ранней проверке не видна вовсе, а
+    ``late_report_recheck`` перед вставкой строки смотрит только на поздний
+    отчёт, не на актуальность сдачи.
+    """
+    from hub.services import review_dispatch as review_dispatch_module
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-move"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-resubmit-during-prep", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_prepare = review_dispatch_module.prepare_review_order
+    moved: list[bool] = []
+
+    async def _resubmit_during_prep(
+        db_conn, task, *, branch, generation, force_profile, principal_id
+    ):
+        if not moved:
+            moved.append(True)
+            # Пересдача поднимает submission_generation — ровно то, что
+            # увидел бы _submission_still_live, если бы его спросили ЗДЕСЬ,
+            # а не только в самом начале open_second_door.
+            await repo.update_task(
+                db_conn, task_id, submission_generation=generation + 1
+            )
+            await db_conn.commit()
+        return await real_prepare(
+            db_conn,
+            task,
+            branch=branch,
+            generation=generation,
+            force_profile=force_profile,
+            principal_id=principal_id,
+        )
+
+    monkeypatch.setattr(
+        review_dispatch_module, "prepare_review_order", _resubmit_during_prep
+    )
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert moved, "предпосылка: пересдача произошла именно во время подготовки заказа"
+    assert await _local_dispatches(db, task_id) == [], (
+        "сдачу пересдали, пока готовился локальный заказ — прогон по уехавшей "
+        "сдаче не покупается"
+    )
+
+
+async def test_a_late_cloud_report_wins_over_an_existing_fallback(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-5: поздний СВОЙ отчёт закрывает заказ как done, а не failed.
+
+    Локальная замена уже закоммичена (долг «отдан»), но финальную запись
+    статуса ОБЛАЧНОГО заказа обрывает «падение процесса» — строка остаётся
+    ``second_door``. Поздний отчёт ЭТОГО облачного заказа доезжает до
+    следующего прохода свипа. Сегодня ``_settle_second_door`` спрашивает
+    ``_second_door_already_opened`` РАНЬШЕ своего отчёта — находит локальную
+    замену и БЕЗУСЛОВНО закрывает облачный заказ ``failed``, хотя его
+    собственный отчёт уже лежит в базе.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-late5"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-late-cloud-wins", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_set_status = repo.set_review_dispatch_status
+    crashed = {"done": False}
+
+    async def _crash_on_first_status_write(db_conn, dispatch_id, status):
+        if not crashed["done"]:
+            crashed["done"] = True
+            raise RuntimeError("падение процесса перед закрытием долга")
+        return await real_set_status(db_conn, dispatch_id, status)
+
+    monkeypatch.setattr(
+        repo, "set_review_dispatch_status", _crash_on_first_status_write
+    )
+
+    try:
+        await sweep_review_dispatches(db)
+    except RuntimeError:
+        pass
+    await db.commit()
+
+    monkeypatch.setattr(repo, "set_review_dispatch_status", real_set_status)
+    await wait_for_local_runs()
+    await db.commit()
+
+    cloud = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert cloud["status"] == "second_door", (
+        "предпосылка: долг остался неотданным — процесс упал перед записью статуса"
+    )
+    assert await _local_dispatches(db, task_id) != [], (
+        "предпосылка: локальная замена уже закоммичена к моменту падения"
+    )
+
+    await _a_report_from(db, task_id, cloud_pid, "cloud-reviewer")
+
+    await sweep_review_dispatches(db)
+    await db.commit()
+
+    cloud_after = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE id=?", (cloud["id"],)
+            )
+        )[0]
+    )
+    assert cloud_after["status"] == "done", (
+        "СВОЙ поздний отчёт обязан закрыть заказ как done, а не failed — иначе "
+        "get_settled_review_dispatch никогда не сверит этот отчёт как заказ (#769)"
+    )
+
+
+async def test_two_real_cloud_runs_still_hit_the_ladder_ceiling(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """Мутационный щит: правка count_review_dispatches не расширяет потолок.
+
+    Два НАСТОЯЩИХ облачных прогона (agent_id непуст, replaces_dispatch_id
+    пуст у обоих — ни один не замена) обязаны по-прежнему считаться ДВУМЯ
+    шагами лестницы, а не одним: #1266 чинит замену, а не потолок.
+    """
+    from hub.services.review_dispatch import REVIEW_LADDER_MAX_STEPS
+
+    task_id = await _submitted(client, db, "spike-ceiling-two-real-cloud")
+    generation = 1
+    for i in range(REVIEW_LADDER_MAX_STEPS):
+        await repo.create_review_dispatch(
+            db,
+            task_id=task_id,
+            submission_generation=generation,
+            agent_id=f"bc-real-{i}",
+            run_id=f"r-{i}",
+            model="grok-4.6",
+            profile="lite" if i == 0 else "deep",
+            channel="cloud",
+        )
+    await db.commit()
+
+    steps = await repo.count_review_dispatches(db, task_id, generation)
+    assert steps == REVIEW_LADDER_MAX_STEPS, (
+        "два настоящих облачных прогона обязаны считаться двумя шагами — "
+        "починка счёта логического шага не должна расширить потолок"
+    )
+
+
+async def test_a_sync_refusal_names_the_refusal_not_a_finished_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """F3 (раунд 2, 7a78080de93938ae): синхронный отказ — не «прогон кончился».
+
+    _second_door_after_run строит текст шаблоном «прогон облачного агента
+    ... кончился статусом ... и отчёта не оставил», и после унификации
+    синхронного и асинхронного путей (#1266) этот же шаблон достаётся и
+    заглушке долга синхронного отказа — с пустым agent_id, где не было ни
+    агента, ни рана. Карточка и second_door_reason обязаны назвать
+    НАБЛЮДЁННЫЙ отказ провайдера НА СОЗДАНИИ, а не сочинённое «кончился
+    статусом» про событие, которого не было.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    _wire(monkeypatch, _DispatchRecorder(None, _LIMIT_REFUSAL))
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-sync-refusal-wording", policy={"review": "dispatch"}
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    started = [u for u in updates if "запущено ЛОКАЛЬНО" in u]
+    assert len(started) == 1, "запуск второй двери называется в карточке"
+    note = started[0]
+    assert "кончился статусом" not in note, (
+        "создание агента отказало СИНХРОННО — рана, который бы «кончился», не было"
+    )
+    assert "usage_limit_exceeded" in note and "HTTP 400" in note, (
+        "причина — наблюдённый отказ провайдера НА СОЗДАНИИ, с кодом"
+    )
+
+    local = (await _local_dispatches(db, task_id))[0]
+    assert "кончился статусом" not in local["second_door_reason"], (
+        "second_door_reason — тот же текст, что и в карточке; третьей копии "
+        "не заводится"
+    )
+    assert "usage_limit_exceeded" in local["second_door_reason"]
