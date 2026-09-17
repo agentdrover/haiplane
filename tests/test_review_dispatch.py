@@ -7457,14 +7457,20 @@ async def test_both_report_paths_carry_the_submission_pin(
         assert len(_moved_refusals(updates)) == 1, (
             f"{name} путь не назвал отказ в карточке: {updates}"
         )
+        assert not [
+            u
+            for u in updates
+            if "отчёт НЕ сдан" in u["content"]
+            or "завершилось без отчёта" in u["content"]
+        ], f"{name} путь выдал отказ по поколению за отсутствие отчёта"
         rows = await db.execute_fetchall(
             "SELECT status FROM review_dispatches WHERE task_id = ?", (task_id,)
         )
         assert [dict(r)["status"] for r in rows] == ["failed"], name
     local_updates = [dict(u) for u in await repo.get_task_updates(db, local)]
-    assert not [
-        u for u in local_updates if "восстановлен из вывода" in u["content"]
-    ], "локальный путь не выдаёт отказ за восстановление"
+    assert not [u for u in local_updates if "восстановлен из вывода" in u["content"]], (
+        "локальный путь не выдаёт отказ за восстановление"
+    )
 
 
 async def test_a_matching_generation_is_recorded_on_both_channels(
@@ -7479,7 +7485,9 @@ async def test_a_matching_generation_is_recorded_on_both_channels(
     cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
     local_pid = await _local_principal(db, monkeypatch)
 
-    cloud = await _submitted(client, db, "spike-same-cloud", policy={"review": "dispatch"})
+    cloud = await _submitted(
+        client, db, "spike-same-cloud", policy={"review": "dispatch"}
+    )
     await _expire_grace(db)
     await _finished_run_with(monkeypatch, _report_block())
     await sweep_review_dispatches(db)
@@ -7541,9 +7549,7 @@ def _intake_callers() -> list[tuple[str, str, bool]]:
                     else ""
                 )
                 if name == "record_machine_review":
-                    pinned = any(
-                        k.arg == "expected_generation" for k in child.keywords
-                    )
+                    pinned = any(k.arg == "expected_generation" for k in child.keywords)
                     found.append((rel, owner, pinned))
             _walk(child, owner, rel)
 

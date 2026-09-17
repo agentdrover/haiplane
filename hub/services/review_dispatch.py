@@ -2598,9 +2598,18 @@ async def _settle_local_run(
     from hub.services.machine_review_intake import ORIGIN_LOCAL_TEXT
 
     report = parse_report_block(run.output if run else None)
-    if report is not None and await _store_report(
-        db, dispatch, report, ORIGIN_LOCAL_TEXT
-    ):
+    stored = (
+        _REPORT_NOT_STORED
+        if report is None
+        else await _store_report(db, dispatch, report, ORIGIN_LOCAL_TEXT)
+    )
+    if stored == _REPORT_STALE:
+        # #1260: отказ уже назван в карточке. «Прогон не состоялся» поверх
+        # него было бы ложью: отчёт был, но о прежней сдаче.
+        await repo.set_review_dispatch_status(db, dispatch_id, "failed")
+        await db.commit()
+        return
+    if stored == _REPORT_STORED:
         await repo.add_task_update(
             db,
             task_id,
@@ -2869,8 +2878,8 @@ def parse_report_block(text: str | None) -> Any | None:
 
 async def _recover_report_from_run(
     db: aiosqlite.Connection, dispatch: dict[str, Any], run: dict[str, Any]
-) -> bool:
-    """Record the report a finished run left in its text. True when stored.
+) -> str:
+    """Record the report a finished run left in its text; see _store_report.
 
     The path exists because the contract path stopped working: Cursor no
     longer delivers the hub's MCP into a cloud run, so since 22.08 reviewers
@@ -2902,11 +2911,12 @@ async def _recover_report_from_run(
                 "по прозе. Текст сохранён как есть, находки из него никем не "
                 f"подтверждены (#1036):\n\n{tail[:4000]}",
             )
-        return False
+        return _REPORT_NOT_STORED
     from hub.services.machine_review_intake import ORIGIN_RUN_TEXT
 
-    if not await _store_report(db, dispatch, report, ORIGIN_RUN_TEXT):
-        return False
+    stored = await _store_report(db, dispatch, report, ORIGIN_RUN_TEXT)
+    if stored != _REPORT_STORED:
+        return stored
     await repo.add_task_update(
         db,
         task_id,
@@ -2917,7 +2927,7 @@ async def _recover_report_from_run(
         "блоком в ответе. Он записан с пометкой происхождения — это слабее "
         "отчёта, сданного по контракту: прогон писал его о себе сам (#1036).",
     )
-    return True
+    return _REPORT_STORED
 
 
 async def _sweep_orphan_local(
@@ -2972,13 +2982,22 @@ async def _sweep_orphan_local(
     await db.commit()
 
 
+# Исходы записи отчёта из текста прогона (#1260). Три, а не True/False:
+# «отчёт о прежней сдаче» — не «отчёт не разобрался», и путь, закрывающий
+# прогон, обязан их различать, иначе причина отказа тонет в общей ветке.
+_REPORT_STORED = "stored"
+_REPORT_STALE = "stale"
+_REPORT_NOT_STORED = "not_stored"
+_GENERATION_MOVED = "chat_pair_generation_moved"
+
+
 async def _store_report(
     db: aiosqlite.Connection,
     dispatch: dict[str, Any],
     report: Any,
     origin: str,
-) -> bool:
-    """Записать отчёт, оставленный прогоном в СВОЁМ тексте. True — записан.
+) -> str:
+    """Записать отчёт, оставленный прогоном в СВОЁМ тексте; вернуть исход.
 
     Владелец отчёта берётся из строки диспетчера, а не из того, как отчёт
     называет себя сам: иначе он прочитался бы как чужой собственному вызову —
@@ -2989,8 +3008,16 @@ async def _store_report(
     Одна реализация на оба канала намеренно: облачный и локальный прогон
     оставляют текст по одной и той же причине и с одинаковой доказательной
     силой, и две копии этого правила разошлись бы на первой же правке.
+
+    Закрепление сдачи — тоже из строки диспетчера (#1260), по тому же
+    принципу, что и владелец: прогон судил дифф поколения, на которое его
+    заказали, и отчёт, доехавший после пересдачи, не засчитывается новой.
+    Отказ пишется в карточку названной причиной ДО общего except: иначе он
+    был бы неотличим от испорченного отчёта и пропал бы в журнале.
     """
     task_id = int(dispatch["task_id"])
+    from fastapi import HTTPException
+
     from hub.services.machine_review_intake import record_machine_review
 
     try:
@@ -3001,11 +3028,28 @@ async def _store_report(
             principal_id=dispatch.get("reviewer_principal_id"),
             username=(dispatch.get("model") or "cursor-cloud-reviewer"),
             origin=origin,
+            expected_generation=int(dispatch["submission_generation"]),
         )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        if detail.get("reason") != _GENERATION_MOVED:
+            log.exception("could not record the report recovered for task #%s", task_id)
+            return _REPORT_NOT_STORED
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            "Отчёт ревью, оставленный прогоном в тексте, НЕ записан: "
+            f"{detail.get('message')} Прогон судил прежний дифф, и засчитать "
+            "его текущей сдаче значило бы считать прочитанным код, которого "
+            "ревью не видело. Строка прогона закрыта (#1260).",
+        )
+        return _REPORT_STALE
     except Exception:  # noqa: BLE001 - the sweep must survive a bad report
         log.exception("could not record the report recovered for task #%s", task_id)
-        return False
-    return True
+        return _REPORT_NOT_STORED
+    return _REPORT_STORED
 
 
 async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
@@ -3080,8 +3124,13 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
         if not grace_rows:
             continue
         await _stamp_dispatch_usage(db, dispatch)
-        if await _recover_report_from_run(db, dispatch, run):
-            await repo.set_review_dispatch_status(db, dispatch["id"], "done")
+        recovered = await _recover_report_from_run(db, dispatch, run)
+        if recovered != _REPORT_NOT_STORED:
+            # #1260: отчёт о прежней сдаче уже назван в карточке; вторая
+            # дверь за него не покупается — он был, но судил другой дифф.
+            await repo.set_review_dispatch_status(
+                db, dispatch["id"], "done" if recovered == _REPORT_STORED else "failed"
+            )
             await db.commit()
             continue
         await _close_a_run_without_a_report(db, dispatch, run)
