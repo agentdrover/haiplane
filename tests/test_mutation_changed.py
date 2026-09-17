@@ -177,13 +177,13 @@ def test_tests_are_chosen_per_function_and_too_broad_is_named(tmp_path):
 
 
 def test_type_annotations_are_not_mutated(tmp_path, monkeypatch):
-    """`int | None` → `int - None` survives any test and says nothing about it."""
+    """`int | None` → `int - None` and `*,` → `/,` survive any test and say nothing."""
     mutation_changed = _script_module()
 
     source = (
         "from __future__ import annotations\n\n\n"
-        "def pick(a: int | None, b: int) -> int | None:\n"
-        "    return a | b\n"
+        "def pick(a: int | None, *, b: int) -> int | None:\n"
+        "    return a | b * 2\n"
     )
     (tmp_path / "mod.py").write_text(source)
     monkeypatch.chdir(tmp_path)
@@ -192,3 +192,10 @@ def test_type_annotations_are_not_mutated(tmp_path, monkeypatch):
 
     assert mutations, "the body must still be mutated"
     assert {m.start_pos[0] for m in mutations} == {5}
+    # The keyword-only `*` is not multiplication; the one in the body is.
+    stars = [
+        m
+        for m in mutations
+        if m.operator_name.startswith("core/ReplaceBinaryOperator_Mul_")
+    ]
+    assert stars and all(m.start_pos[0] == 5 for m in stars)

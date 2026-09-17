@@ -213,6 +213,23 @@ def in_annotation(spans: Iterable[Span], position: tuple[int, int]) -> bool:
     return any(start <= tuple(position) < end for start, end in spans)
 
 
+_BARE_STAR = re.compile(r"\*\s*(,|\)|$)")
+
+
+def is_signature_star(lines: list[str], position: tuple[int, int]) -> bool:
+    """Is this the bare ``*`` of a keyword-only signature?
+
+    cosmic-ray reads it as multiplication and swaps it for ``/`` — which turns
+    ``def f(db, *, x)`` into the equally valid ``def f(db, /, x)``. Every
+    keyword call still works, so the mutant survives any test: noise, and the
+    hub's services are full of such signatures.
+    """
+    line_no, col = position
+    if not 0 < line_no <= len(lines):
+        return False
+    return bool(_BARE_STAR.match(lines[line_no - 1], col))
+
+
 def innermost(functions: Iterable[Function], line: int) -> Function | None:
     """The narrowest function whose span contains ``line``."""
     containing = [f for f in functions if f.first <= line <= f.last]
@@ -312,7 +329,9 @@ def mutations_for(path: str, db_path: Path) -> list:
     from cosmic_ray.commands import init
     from cosmic_ray.work_db import WorkDB, use_db
 
-    spans = annotation_spans(Path(path).read_text(encoding="utf-8"))
+    source = Path(path).read_text(encoding="utf-8")
+    spans = annotation_spans(source)
+    lines = source.splitlines()
     with use_db(str(db_path), WorkDB.Mode.create) as work_db:
         init([Path(path)], work_db, {})
         return [
@@ -321,6 +340,7 @@ def mutations_for(path: str, db_path: Path) -> list:
             for mutation in item.mutations
             if not EXCLUDED_OPERATORS.match(mutation.operator_name)
             and not in_annotation(spans, mutation.start_pos)
+            and not is_signature_star(lines, mutation.start_pos)
         ]
 
 
