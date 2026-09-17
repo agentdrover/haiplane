@@ -1292,11 +1292,14 @@ async def test_a_human_deliver_decision_commits_the_resolver_note_when_unusable(
     await repo.update_task(db, task_id, branch="task-774/message-wakeup")
     await db.commit()
 
-    ok, reason = await lifecycle_mod.deliver_on_disposition(
+    ok, reason, search_unanswered = await lifecycle_mod.deliver_on_disposition(
         db, task_id, "deliver", via="test"
     )
 
     assert ok is False, "закрытый без замены не доставляется"
+    assert search_unanswered is False, (
+        "поиск здесь ОТВЕТИЛ «нет открытого PR» — это не молчание (#1267)"
+    )
     assert db.in_transaction is False, (
         "решение человека не должно оставлять соединение в открытой транзакции"
     )
@@ -1347,6 +1350,13 @@ async def test_a_human_deliver_decision_does_not_claim_no_open_pr_when_the_searc
     неизвестно, а не установлено. Текст обязан называть, что поиск не
     ответил. На сдаче №3 (dceeec82) тест красный: P2-чинка отвечает "Мержить
     нечего: у ветки нет открытого PR" и для этого случая тоже.
+
+    #1267: после этой задачи выход из молчания появился — реестр
+    недоставленного теперь ВИДИТ эту строку (unknown, а не pr_closed), и
+    текст обязан назвать это место, а не только повторить, что доставки не
+    будет. ``deliver_on_disposition`` возвращает третьим значением
+    ``search_unanswered``, которым и передаётся этот факт дальше в
+    ``note_completion_without_delivery`` — без второго вычисления состояния.
     """
     from hub.services import lifecycle as lifecycle_mod
 
@@ -1355,11 +1365,14 @@ async def test_a_human_deliver_decision_does_not_claim_no_open_pr_when_the_searc
     await repo.update_task(db, task_id, branch="task-774/message-wakeup")
     await db.commit()
 
-    ok, reason = await lifecycle_mod.deliver_on_disposition(
+    ok, reason, search_unanswered = await lifecycle_mod.deliver_on_disposition(
         db, task_id, "deliver", via="test"
     )
 
     assert ok is False, "закрытый без установленной замены не доставляется"
+    assert search_unanswered is True, (
+        "поиск замены упал — вызывающий обязан узнать об этом факте (#1267)"
+    )
     updates = [
         (dict(u)["content"] or "") for u in await repo.get_task_updates(db, task_id)
     ]
@@ -1371,15 +1384,20 @@ async def test_a_human_deliver_decision_does_not_claim_no_open_pr_when_the_searc
         f"отказ обязан назвать, что поиск замены не ответил: {updates}"
     )
     # Cursor #378 (5a41a733cbb3e7be) и #379 (f43a94d860cfc4e1): decide уже
-    # записал completed до этой доставки, повторное решение хаб отвергнет, а
-    # реестр недоставленного закрытый PR не показывает. Ни один из этих
-    # выходов не существует — текст не вправе их называть, но обязан сказать,
-    # что работа не доставлена и сама не доставится.
+    # записал completed до этой доставки, повторное решение хаб отвергнет.
+    # Ни один из этих выходов не существует — текст не вправе их называть.
     assert "принять снова" not in feed, (
         f"повторного решения по завершённой задаче не будет: {updates}"
     )
-    assert "реестр" not in feed, (
-        f"закрытый PR в реестр недоставленного не попадает: {updates}"
+    # #1267 (было #1261's assertion — "реестр" not in feed): до #1267 реестр
+    # недоставленного закрытый-но-неотвеченный PR действительно не показывал,
+    # и текст был прав, ничего не называя. После #1267 note_completion_
+    # without_delivery пишет эту строку как unknown, реестр её видит и
+    # переспросит сам — и текст обязан назвать реестр как место, где работа
+    # осталась видимой, потому что это стало правдой (см. AC-4, #1267).
+    assert "реестр" in feed, (
+        f"после #1267 строка видна в реестре недоставленного — отказ обязан "
+        f"назвать его: {updates}"
     )
     assert "БЕЗ доставки" in feed, (
         f"отказ обязан сказать, что задача завершена без доставки: {updates}"
