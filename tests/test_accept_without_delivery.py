@@ -952,6 +952,38 @@ async def test_a_reswept_unknown_row_stays_unknown_while_the_search_still_fails(
     assert task_id in [r["task_id"] for r in listed["unknown"]], listed
 
 
+async def test_a_reswept_row_is_not_closed_when_the_second_state_read_is_silent(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # Cursor #390 (7bc5ff2093e7b0bb), high. Свип спрашивает pr_state дважды:
+    # task_delivery («closed») и resolve_delivery_pr. Если второй вызов
+    # промолчал, pr_for_delivery возвращает записанный номер с
+    # established=False — «не удалось спросить», а не ответ. Строка обязана
+    # остаться unknown, а не лечь pr_closed, который больше не переспросят.
+    _pr_states(monkeypatch, {916: "closed"})
+    _pr_search_raises(monkeypatch)
+    task_id = await _approved_task(client, db, title="second read silent", pr=916)
+    await _decide_deliver(client, task_id)
+
+    calls = {"n": 0}
+
+    async def closed_then_silent(
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> str:
+        calls["n"] += 1
+        return "closed" if calls["n"] == 1 else ""
+
+    monkeypatch.setattr(plugins.git_ops, "pr_state", closed_then_silent, raising=False)
+    await scan_completed_deliveries(db)
+
+    assert calls["n"] >= 2, "сценарий требует второго чтения состояния"
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert row is not None and row["state"] == UNKNOWN, dict(row or {})
+
+
 async def test_a_reswept_row_whose_search_answers_none_is_closed(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):

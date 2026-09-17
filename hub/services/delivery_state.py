@@ -672,6 +672,12 @@ async def _answer_past_closed_number(
         and delivery_pr.number != answer["pr_number"]
     ):
         return await task_delivery(db, live_task)
+    if not delivery_pr.unusable and not delivery_pr.established:
+        # Cursor #390 (7bc5ff2093e7b0bb): the second pr_state read went silent,
+        # and pr_for_delivery hands back the recorded number unestablished —
+        # «could not ask», not an answer. Keeping the first «closed» here would
+        # write pr_closed, which is never asked again (#802, #959).
+        return _search_unanswered(answer)
     return answer
 
 
