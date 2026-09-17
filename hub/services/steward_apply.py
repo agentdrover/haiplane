@@ -39,6 +39,7 @@ from typing import Any
 import aiosqlite
 
 from hub import config
+from hub.db import fetchall
 from hub.services import gate_grounds as grounds
 from hub.services.auto_approve import ladder_hits
 from hub.services.steward_evidence import EvidencePacket, build_evidence_packet
@@ -48,6 +49,10 @@ log = logging.getLogger(__name__)
 REFUSED_PRECONDITION = "precondition_failed"
 REFUSED_LADDER = "ladder_surface"
 REFUSED_UNCLOSED = "unclosed_finding"
+# Один актор на обоих гейтах: тот, кто одобрил AC, судит их выполнение
+# (#1162). Код из того же закрытого словаря #1022, где он и заводился;
+# им же названо саморевью в громких основаниях — написание одно.
+REFUSED_SELF_AUTHORED = "self_authored"
 
 # Типы закрытия из закрытого словаря #1022, и рядом — ЧЕМ каждый
 # подтверждается. Соответствие публичное, потому что его полноту проверяет
@@ -203,7 +208,7 @@ async def loud_refusals(
             ),
         ),
         (
-            "self_authored",
+            REFUSED_SELF_AUTHORED,
             grounds.self_review_ground(
                 bool(value.get("self_reviewed")),
                 config.REVIEW_SELF_APPROVE == "allow",
@@ -588,6 +593,46 @@ def mode_refusal() -> tuple[str, str] | None:
     )
 
 
+async def self_authored_refusal(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[str, str] | None:
+    """Постановку одобрил стюард — вердикт по ней остаётся человеку (#1162).
+
+    Гейт ревью держится на том, что сдающий и выносящий вердикт — разные
+    акторы (#306, #433). Стюард на двух гейтах разом нарушает это по сути:
+    он одобрил AC, а потом судит, выполнены ли ОНИ, — и слабый критерий,
+    пропущенный на первом гейте, на втором прикроет сам себя.
+
+    Признак — ЗАПИСЬ суждения kind='dor' с вердиктом approve, а не факт
+    прогона: драфт, который стюард прочитал и ВЕРНУЛ, а человек потом
+    одобрил руками, самоавторством не является — решение на том гейте
+    принял человек. По той же причине читается ``verdict``, а не
+    ``submitted_verdict``: одобрение, понижённое политикой до escalate
+    (низкая уверенность, #1022), драфт с гейта не сняло.
+
+    Поколение в запросе не участвует намеренно: суждение о постановке
+    живёт в поколении ПОСТАНОВКИ, а вердикт — в поколении сдачи, и
+    совпадать они не обязаны. Ограничение одностороннее: человеческое
+    одобрение постановки вердикту стюарда не мешает, и записи, по которой
+    его можно было бы принять за стюарда, здесь нет.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT id FROM steward_judgements "
+        "WHERE task_id=? AND kind='dor' AND verdict='approve' "
+        "ORDER BY id LIMIT 1",
+        (task_id,),
+    )
+    if not rows:
+        return None
+    return (
+        REFUSED_SELF_AUTHORED,
+        "постановку этой задачи снял с гейта DoR сам стюард (суждение "
+        "kind=dor, approve) — судить выполнение им же одобренных AC "
+        "остаётся человеку",
+    )
+
+
 async def apply_refusals(
     db: aiosqlite.Connection, task_id: int, generation: int | None = None
 ) -> list[tuple[str, str]]:
@@ -611,6 +656,9 @@ async def apply_refusals(
     task = dict(row) if row is not None else {"id": task_id}
 
     out = precondition_refusals(packet)
+    self_authored = await self_authored_refusal(db, task_id)
+    if self_authored:
+        out.append(self_authored)
     out.extend(await loud_refusals(db, task, packet))
     out.extend(await closure_refusals(db, task_id, packet))
     ladder = ladder_refusal(packet)

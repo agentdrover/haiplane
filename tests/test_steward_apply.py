@@ -23,6 +23,7 @@ from hub.services.steward_apply import (
     PRECONDITION_FACTS,
     REFUSED_LADDER,
     REFUSED_PRECONDITION,
+    REFUSED_SELF_AUTHORED,
     REFUSED_UNCLOSED,
     apply_refusals,
 )
@@ -1308,4 +1309,137 @@ def test_accountable_sections_are_a_subset_of_the_blockers():
     assert "incomplete" not in grounds.ACCOUNTABLE_SECTIONS, (
         "incomplete — свойство прогона, а не список находок: разбирать по "
         "одной там нечего, и у стюарда он закрыт предусловием"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1162 — саморевью на вердикте: одобривший постановку её не судит
+# ---------------------------------------------------------------------------
+
+
+async def _dor_judged(
+    db: aiosqlite.Connection,
+    task_id: int,
+    verdict: str,
+    *,
+    confidence: str = "high",
+    escalate_reason: str = "",
+) -> None:
+    """Суждение стюарда о ПОСТАНОВКЕ — настоящим записывающим путём.
+
+    Поколение здесь 0, а не 1: суждение о постановке живёт в поколении
+    постановки, вердикт — в поколении сдачи. Совпадение поколений было бы
+    случайностью теста, и проверка, опершаяся на него, прошла бы мимо
+    настоящего входа.
+    """
+    from hub.config import TokenIdentity
+    from hub.models import StewardJudgementSubmit
+    from hub.services.steward_judgement import record_steward_judgement
+
+    await record_steward_judgement(
+        db,
+        task_id,
+        StewardJudgementSubmit(
+            generation=0,
+            kind="dor",
+            verdict=verdict,
+            confidence=confidence,
+            escalate_reason=escalate_reason,
+            model="gpt-5.3-codex",
+        ),
+        TokenIdentity("steward-bot", "steward", principal_id=42),
+    )
+
+
+async def test_self_authored_task_escalates_at_verdict(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1: постановку снял с гейта стюард — вердикт по ней остаётся человеку.
+
+    Проверяется через НАСТОЯЩИЙ вход привратника, а не предикатом рядом:
+    правило, живущее в функции, которую apply_refusals не зовёт, — это
+    правило, которого нет. Зеркало в том же прогоне: без записи о суждении
+    стюарда на постановке отказа быть не должно, иначе проверка неотличима
+    от выключателя вердикта вообще.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-self-authored")
+
+    untouched = await _task(db, project_id)
+    await _green(db, untouched)
+    assert REFUSED_SELF_AUTHORED not in _codes(await apply_refusals(db, untouched)), (
+        "постановки стюард не касался — самоавторства нет"
+    )
+
+    task_id = await _task(db, project_id)
+    await _green(db, task_id)
+    await _dor_judged(db, task_id, "approve")
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_SELF_AUTHORED in _codes(refusals)
+    assert REFUSED_SELF_AUTHORED in STEWARD_ESCALATE_REASONS, "код вне словаря #1022"
+    detail = " ".join(d for c, d in refusals if c == REFUSED_SELF_AUTHORED)
+    assert "DoR" in detail and "kind=dor" in detail, (
+        f"отказ обязан назвать, ЧТО именно стюард одобрил: {detail!r}"
+    )
+
+
+async def test_a_human_approval_leaves_the_verdict_alone(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2: стюард драфт вернул, одобрил человек — на вердикте отказа нет.
+
+    Разница существенная и не формальная: решение на гейте DoR принял
+    человек, и роли не совпали. Правило, срабатывающее на самом ФАКТЕ
+    прогона стюарда по драфту, здесь отказало бы — и стало бы неотличимо
+    от выключения стюарда на вердикте для всякой задачи, которую он вообще
+    читал.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-human-approved")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id)
+
+    # Стюард ПРОЧИТАЛ и ВЕРНУЛ: запись суждения есть, одобрения нет.
+    await _dor_judged(db, task_id, "changes_requested")
+    # Готовность потом проставил человек — своей рукой, не стюардом.
+    await repo.update_task(db, task_id, dor_passed=1, prepared_by="Denis")
+    await db.commit()
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_SELF_AUTHORED not in _codes(refusals), (
+        "возврат стюарда самоавторством не является: постановку одобрил "
+        f"человек — {[d for c, d in refusals if c == REFUSED_SELF_AUTHORED]}"
+    )
+
+
+async def test_an_approval_downgraded_to_escalate_is_not_self_authorship(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Одобрение, понижённое политикой, драфт с гейта не снимало.
+
+    Стюард отправил approve, но с низкой уверенностью — и #1022 записал
+    вердикт escalate: постановку с гейта снял человек, которому она
+    досталась. Ветка «читать verdict, а не submitted_verdict» иначе не
+    исполняется ни одним тестом, а обе колонки лежат в одной строке.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-downgraded")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id)
+    await _dor_judged(db, task_id, "approve", confidence="low")
+
+    saved = await repo.get_steward_judgement(db, task_id, 0, "dor")
+    assert saved is not None
+    assert dict(saved)["submitted_verdict"] == "approve"
+    assert dict(saved)["verdict"] == "escalate", (
+        "предпосылка теста: понижение сработало"
+    )
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_SELF_AUTHORED not in _codes(refusals), (
+        "escalate на постановке означает, что решал человек"
     )
