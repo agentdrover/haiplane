@@ -92,6 +92,28 @@ def _forget_stacking_probe_answers():
 
 
 @pytest.fixture(autouse=True)
+def _forget_pair_delivery_waits():
+    """Empty the poller's delivery-wait dedupe memory around every test (#1261).
+
+    ``poller._pair_delivery_waits`` is keyed by task id, and task ids restart
+    at 1 in every test's fresh SQLite file (#1065's file-per-test db) — so two
+    tests that each build a "Deliver me" task with the same pr_number and the
+    same transient CI detail land on the SAME dedupe key for the SAME task id
+    1, and whichever runs second inherits the first one's "already said"
+    state. Discovered writing the #1261 F1/F2 tests: a mutation that broke the
+    dedupe's commit still passed when run alongside its sibling test, because
+    the sibling's leftover entry made the second test's own first pass read as
+    a repeat. Same shape as ``_forget_stacking_probe_answers`` above, for the
+    same reason.
+    """
+    from hub import poller as poller_mod
+
+    poller_mod._pair_delivery_waits.clear()
+    yield
+    poller_mod._pair_delivery_waits.clear()
+
+
+@pytest.fixture(autouse=True)
 def _setup_mock_plugins():
     """Install mock plugins for all tests, restore originals after."""
     orig_dispatch = plugins.dispatch

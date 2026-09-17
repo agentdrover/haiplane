@@ -38,8 +38,8 @@ from hub.models import (
     DiffBaseState,
     EvidenceCoverage,
     LiveCheckState,
-    MachineReviewView,
     ReviewBrief,
+    ReviewCircleView,
     SelfReviewWarning,
     TaskProjectRef,
 )
@@ -227,17 +227,16 @@ async def build_review_brief(
     )
     diff_command = review_evidence.diff_command_for(diff_base, task_view.branch or "")
 
-    machine_review = None
+    # #1266 (round 2 fix, c0babbdf6d557c91): the report is built ONCE, by
+    # review_evidence.review_report() below — it already fills is_current,
+    # dispositions (#876) and, since the second door, second_door_channel/
+    # reason (#1266). A second MachineReviewView built here straight from
+    # mr_row used to skip all three: the top-level ``machine_review`` field
+    # (what MCP hub_get_review_brief and the CLI read) never got the second-
+    # door fields, only review_report.machine_review did. mr_row itself is
+    # still fetched here because review_report() needs it passed in — #808's
+    # invariant is ONE builder, not one caller.
     mr_row = await repo.get_latest_machine_review(db, task_id)
-    if mr_row is not None:
-        machine_review = MachineReviewView(**dict(mr_row))
-        machine_review.is_current = machine_review.submission_generation == (
-            task_view.submission_generation or 0
-        )
-        # #876: what the gate said these findings turned out to be. The same
-        # filler the card uses — the brief shows a later reviewer what was
-        # already judged, and the two readers cannot disagree.
-        await review_evidence.attach_dispositions(db, machine_review)
 
     # Advisory branch-stacking check (#438): the reviewer should know when
     # the diff includes another task's unmerged work. Best-effort — no repo
@@ -387,7 +386,12 @@ async def build_review_brief(
     # answer the evidence itself defaults to, so brief and record agree.
     delivered_sha = await repo.merge_sha_for_task(db, task_id)
     live_check = await review_evidence.live_check_state(
-        db, task_id, delivered_sha=delivered_sha
+        db,
+        task_id,
+        delivered_sha=delivered_sha,
+        # #1236: что задача ОБЪЯВИЛА наблюдать. Без этого «зонд объявлен и ещё
+        # не снят» неотличимо от «наблюдать никто не собирался».
+        declared_probe=str(dict(task_row).get("live_probe") or ""),
     )
 
     # #725: one verdict over every evidence block, in the same place the green
@@ -410,6 +414,9 @@ async def build_review_brief(
     # #808: the block the human reads at the gate, built by the same function
     # that feeds the task card. Two readers, one report.
     brief_review_report = await review_evidence.review_report(db, task_row, mr_row)
+    # #1266 (round 2, c0babbdf6d557c91): the top-level field is the SAME
+    # object review_report just built — not a second construction of it.
+    machine_review = brief_review_report.machine_review
 
     # #890: scope accepted at submission, newest first. Read from the feed
     # rather than a column: the growth IS an event, and an event that only
@@ -421,7 +428,21 @@ async def build_review_brief(
         if str(u["content"]).startswith(commit_scope.SCOPE_GROWTH_MARKER)
     ]
 
+    # #1235: круг ревью читается тем же способом, каким его считает сигнал в
+    # карточке, — одной функцией. Второе выражение того же счёта здесь и
+    # означало бы, что бриф и карточка расходятся в числе.
+    from hub.services.review_dispatch import review_circle
+
+    circle = await review_circle(db, int(task_row["id"]))
+
     return ReviewBrief(
+        review_circle=ReviewCircleView(
+            laps=circle.count,
+            threshold=circle.threshold,
+            named=circle.named,
+            breakdown=circle.breakdown(),
+            repeated_categories=list(circle.repeated_categories),
+        ),
         review_report=brief_review_report,
         task_id=task_view.id,
         title=task_view.title,

@@ -636,6 +636,49 @@ async def _resolve_ref(name: str, repo: str) -> str | None:
     return None
 
 
+async def _refresh_remote_ref(name: str, repo: str) -> tuple[str, str]:
+    """One targeted refresh of ``origin/<name>``, failure kept apart from fact.
+
+    ``(state, detail)``: ``refreshed`` — origin has the head and it is now a
+    local tracking ref; ``absent`` — origin answered and has no such head;
+    ``unreachable`` — origin did not answer (timeout, lock of a parallel
+    fetch, auth, a blink), with the git error in ``detail``.
+
+    Two commands rather than one fetch, because a fetch's non-zero rc does not
+    separate "couldn't find remote ref" from "could not connect" without
+    parsing localized stderr. ``ls-remote --heads`` does: rc != 0 is no
+    answer, empty output is no such head — the same reading
+    ``ensure_default_branch`` relies on (#1204).
+    """
+    rc, out, err = await _git(
+        "ls-remote",
+        "--heads",
+        "origin",
+        f"refs/heads/{name}",
+        repo=repo,
+        check=False,
+        timeout=60,
+    )
+    if rc != 0:
+        return (
+            "unreachable",
+            f"ls-remote rc={rc}: {err.strip()[:150] or 'git молчит'}",
+        )
+    if not out.strip():
+        return ("absent", "")
+    rc, _, err = await _git(
+        "fetch",
+        "origin",
+        f"+refs/heads/{name}:refs/remotes/origin/{name}",
+        repo=repo,
+        check=False,
+        timeout=60,
+    )
+    if rc != 0:
+        return ("unreachable", f"fetch rc={rc}: {err.strip()[:150] or 'git молчит'}")
+    return ("refreshed", "")
+
+
 async def _resolve_ref_remote_first(name: str, repo: str) -> str | None:
     """Resolve a branch to a sha, preferring ``origin/<name>`` (#762).
 
@@ -929,6 +972,38 @@ class GitOpsIntegration:
         so answering the whole list up front would spend rev-lists on rows
         nobody reads. Yielding pairs lets the caller stop where it always
         stopped.
+
+        A ref that resolves nowhere is REFRESHED ONCE before the answer is
+        formed (#1204, found by the machine review of submission #3). Without
+        that, ``ref_unresolved`` conflated two opposite facts: a branch deleted
+        on the server, and a branch this clone simply never fetched — the
+        resolver reads local refs only. Consumers cannot tell them apart, and
+        the delivery gate had started to act on the difference, telling a human
+        "nobody will bring that branch back" about a branch that was on origin
+        all along. Same line #954 drew for push status, and the targeted
+        refspec is copied from there for the same reason: plain
+        ``git fetch origin <branch>`` is not guaranteed to write
+        ``refs/remotes/origin/<branch>``.
+
+        The refresh itself can fail to get an answer — a 60 s timeout, a
+        parallel fetch holding the lock, auth, origin blinking — and that is
+        NOT ``ref_unresolved`` (#1204, machine review of submission #4). The
+        first version threw the fetch's return code away and then asserted
+        "origin does not have it" about a branch nobody had managed to ask
+        about. Now the refresh is asked the way ``ensure_default_branch`` asks
+        (``ls-remote --heads``: rc != 0 is "no answer", empty output is "no
+        such head"), and no answer comes back as ``remote_unreachable`` —
+        retryable, and never a ground for calling a human.
+
+        THE REFRESH IN A BATCHED WALK (#1204 × #1205). ``branch`` and the base
+        resolve ONCE for the whole walk, so their refresh is attempted once
+        too, and a remote that did not answer about either is not a fact about
+        any single candidate: every row of the walk gets the same
+        ``remote_unreachable``, the way ``workspace_unavailable`` already does.
+        A candidate's own ref is resolved per row, so its refresh is per row.
+        Neither shortcut may be replaced by "refresh the first row only": the
+        rows after it would then be told ``ref_unresolved`` — the one reason
+        the delivery gate is allowed to call a human with.
         """
         if repo is None:
             reason = await _default_workspace_error()
@@ -952,8 +1027,50 @@ class GitOpsIntegration:
         head = await _resolve_ref_remote_first(branch, repo_path)
         base_name = _resolve_base(base_branch)
         base = await _resolve_ref_remote_first(base_name, repo_path)
+        # One targeted refresh per name that did not resolve, then ask again
+        # (#1204). Only what survives an ANSWERED refresh is genuinely unknown
+        # to origin: a refresh that got no answer is a fact about this machine
+        # and the network, not about that branch, and is reported as such.
+        # These two names are the walk's, not any candidate's, so an
+        # unanswered refresh of them is carried to EVERY row.
+        shared_unreachable = ""
+        if not head:
+            state, detail = await _refresh_remote_ref(branch, repo_path)
+            if state == "unreachable":
+                shared_unreachable = f"{branch}: {detail}"
+            else:
+                head = await _resolve_ref_remote_first(branch, repo_path)
+        if not shared_unreachable and not base:
+            state, detail = await _refresh_remote_ref(base_name, repo_path)
+            if state == "unreachable":
+                shared_unreachable = f"{base_name}: {detail}"
+            else:
+                base = await _resolve_ref_remote_first(base_name, repo_path)
         for other_branch in other_branches:
+            if shared_unreachable:
+                yield (
+                    other_branch,
+                    StackProbeResult(
+                        outcome=StackProbeOutcome.unavailable,
+                        reason="remote_unreachable",
+                        details=shared_unreachable,
+                    ),
+                )
+                continue
             other = await _resolve_ref_remote_first(other_branch, repo_path)
+            if not other:
+                state, detail = await _refresh_remote_ref(other_branch, repo_path)
+                if state == "unreachable":
+                    yield (
+                        other_branch,
+                        StackProbeResult(
+                            outcome=StackProbeOutcome.unavailable,
+                            reason="remote_unreachable",
+                            details=f"{other_branch}: {detail}",
+                        ),
+                    )
+                    continue
+                other = await _resolve_ref_remote_first(other_branch, repo_path)
             if not (head and other and base):
                 unresolved = [
                     name
