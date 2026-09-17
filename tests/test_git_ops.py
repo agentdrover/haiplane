@@ -2733,3 +2733,75 @@ async def test_unknown_mergeability_still_is_not_a_conflict() -> None:
     assert outcome is MergeabilityOutcome.unknown
     assert "не посчитал" in detail
     forge.pr_refs.assert_not_awaited()
+
+
+# ---- #1271 AC-3: докстринг branch_ancestry называет каждый исход ----
+#
+# #1193: докстринг перечислял 4 исхода из 5 — same_tip добавили в константы,
+# а в текст, по которому вызывающий решает, как формулировать ответ, нет.
+# Исходы берутся из модуля по префиксу имени, а не выписываются здесь: новый
+# STACK_ANCESTRY_* без упоминания в докстринге роняет тест сам.
+#
+# «Назван» значит буквально: имя константы или её значение словом. Пересказ
+# («the head is the descendant») не считается — по нему нельзя сверить.
+#
+# Исходы, которые докстринг на develop не называет, — находка (#1271), код в
+# этой задаче не правится. Ключ — имя константы, значение — ссылка на драфт.
+BRANCH_ANCESTRY_UNNAMED_FINDINGS: dict[str, str] = {
+    "STACK_ANCESTRY_HEAD_IS_DESCENDANT": "драфт #1277: только пересказом",
+    "STACK_ANCESTRY_HEAD_IS_ANCESTOR": "драфт #1277: только пересказом",
+    "STACK_ANCESTRY_SAME_TIP": "драфт #1277: не назван вовсе (#1193)",
+}
+
+
+def _ancestry_outcomes() -> dict[str, str]:
+    from hub.integrations import git_ops
+
+    return {
+        name: getattr(git_ops, name)
+        for name in dir(git_ops)
+        if name.startswith("STACK_ANCESTRY_")
+    }
+
+
+def _unnamed_ancestry_outcomes() -> list[str]:
+    import re
+
+    doc = GitOpsIntegration.branch_ancestry.__doc__ or ""
+    return sorted(
+        name
+        for name, value in _ancestry_outcomes().items()
+        if name not in doc
+        and not re.search(rf"(?<![\w]){re.escape(value)}(?![\w])", doc)
+    )
+
+
+def test_branch_ancestry_docstring_names_every_outcome() -> None:
+    """#1271 AC-3: исход STACK_ANCESTRY_*, не названный в докстринге, роняет тест."""
+    outcomes = _ancestry_outcomes()
+    assert outcomes, "в git_ops нет ни одной STACK_ANCESTRY_* — проверять нечего"
+    stale = sorted(set(BRANCH_ANCESTRY_UNNAMED_FINDINGS) - set(outcomes))
+    assert not stale, f"находки называют исходы, которых нет в git_ops: {stale}"
+
+    unnamed = [
+        name
+        for name in _unnamed_ancestry_outcomes()
+        if name not in BRANCH_ANCESTRY_UNNAMED_FINDINGS
+    ]
+    assert not unnamed, (
+        f"докстринг GitOpsIntegration.branch_ancestry не называет исходы "
+        f"{unnamed} — вызывающий решает по этому тексту, как формулировать ответ"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#1271 находка на develop, драфт #1277: докстринг branch_ancestry "
+    "не называет head_is_descendant, head_is_ancestor, same_tip",
+)
+def test_branch_ancestry_unnamed_findings_are_resolved() -> None:
+    still = sorted(
+        set(_unnamed_ancestry_outcomes()) & set(BRANCH_ANCESTRY_UNNAMED_FINDINGS)
+    )
+    assert not still, f"всё ещё не названы: {still}"

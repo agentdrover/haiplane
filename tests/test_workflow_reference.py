@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from httpx import AsyncClient
 
@@ -234,3 +236,90 @@ def test_machine_review_gate_in_reference():
     assert "machine-review-cycle" in gates["machine_review"]["rule"]
     # base MCP instructions stay within the documented size budget
     assert len(build_mcp_instructions()) < 4096
+
+
+# ---- #1271 AC-4: аргументы, названные в тексте, существуют в схеме ----
+#
+# #988: текст workflow_reference называл аргументы, которых у инструмента не
+# было, — агент шёл по карте в отказ, а транспорт MCP молча выбрасывает лишний
+# аргумент. Сверяется ОПУБЛИКОВАННАЯ схема (mcp.list_tools), а не сигнатура
+# функции: именно она решает, дойдёт ли аргумент.
+#
+# Три формы, которыми текст называет аргумент:
+#   hub_x(arg=value, other)           — вызов;
+#   hub_x (…; takes a, b, and c …)    — перечень после «takes»;
+#   hub_x arg=value                   — присваивание сразу за именем.
+
+_TOOL = r"(hub_[a-z_]+)"
+_IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def _reference_texts() -> list[str]:
+    def leaves(node: object) -> list[str]:
+        if isinstance(node, str):
+            return [node]
+        if isinstance(node, dict):
+            return [s for v in node.values() for s in leaves(v)]
+        if isinstance(node, (list, tuple)):
+            return [s for v in node for s in leaves(v)]
+        return []
+
+    return [
+        *lifecycle_map_lines(),
+        build_mcp_instructions(),
+        *leaves(workflow_reference_dict()),
+    ]
+
+
+def _named_arguments(text: str) -> dict[str, set[tuple[str, str]]]:
+    """{форма: {(инструмент, аргумент)}} — по каждой форме отдельно."""
+    found: dict[str, set[tuple[str, str]]] = {
+        "call": set(),
+        "takes": set(),
+        "assign": set(),
+    }
+    for tool, inner in re.findall(_TOOL + r"\(([^)]*)\)", text):
+        for part in inner.split(","):
+            name = part.split("=", 1)[0].strip()
+            if _IDENT.match(name):
+                found["call"].add((tool, name))
+    for tool, inner in re.findall(_TOOL + r"\s+\(([^)]*)\)", text):
+        if "takes " not in inner:
+            continue
+        for part in inner.split("takes ", 1)[1].split(","):
+            name = re.sub(r"^and\s+", "", part.strip())
+            if _IDENT.match(name):
+                found["takes"].add((tool, name))
+    for tool, name in re.findall(_TOOL + r" ([a-z_]+)=", text):
+        found["assign"].add((tool, name))
+    return found
+
+
+async def test_arguments_named_in_the_reference_exist_in_the_tool_schema() -> None:
+    """#1271 AC-4: аргумент, названный текстом и отсутствующий в схеме, роняет тест."""
+    from hub import mcp_server
+
+    schemas = {t.name: t.inputSchema for t in await mcp_server.mcp.list_tools()}
+    named: dict[str, set[tuple[str, str]]] = {
+        "call": set(),
+        "takes": set(),
+        "assign": set(),
+    }
+    for text in _reference_texts():
+        for form, pairs in _named_arguments(text).items():
+            named[form] |= pairs
+
+    # Разбор не должен тихо ослепнуть: если текст перестал пользоваться формой,
+    # её правило здесь стоит убрать осознанно, а не проверять пустоту.
+    empty = sorted(form for form, pairs in named.items() if not pairs)
+    assert not empty, f"формы, не найденные в тексте ни разу: {empty}"
+
+    problems = []
+    for tool, arg in sorted(set().union(*named.values())):
+        if tool not in schemas:
+            problems.append(f"{tool}: инструмента нет в опубликованном каталоге")
+        elif arg not in schemas[tool].get("properties", {}):
+            problems.append(f"{tool}: аргумента {arg!r} нет в схеме")
+    assert not problems, (
+        "текст workflow_reference расходится со схемой MCP: " + "; ".join(problems)
+    )
