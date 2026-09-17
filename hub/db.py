@@ -8,6 +8,7 @@ from typing import Any
 
 import aiosqlite
 
+from hub import skill_publish
 from hub.config import CHAT_PAIR_AGENT, HUB_DB_PATH
 
 log = logging.getLogger("hub.db")
@@ -80,6 +81,55 @@ CREATE TABLE IF NOT EXISTS activity_log (
     detail    TEXT,
     timestamp TEXT NOT NULL DEFAULT (datetime('now'))
 );
+"""
+
+#: Минимальная длина каждого поля доказательства доставки (#1215). Порог, а не
+#: детектор лжи, и называть его иначе значит обещать больше, чем код делает. Он
+#: ловит форму штампа: «проверено» (9) и «всё хорошо» (10) не проходят ни
+#: порознь, ни россыпью по двум полям. Развёрнутое доказательство — «git show
+#: 19ee3f6 --stat» и «файл присутствует, AC-тест зелёный» — проходит без усилий.
+#:
+#: ЖИВЁТ ЗДЕСЬ, а не в службе, потому что порог применяют ДВА места: живая
+#: дверь (``delivery_state._check_evidence``) и SQL засыпки ниже в этом файле.
+#: Пока их было два и определений было два, они разошлись: засыпка проверяла
+#: лишь ``TRIM != ''`` и закрывала строку записью, которую живая дверь
+#: отвергала как штамп (находка 80fcb9c9). Одно определение — один ответ на
+#: вопрос «что считается доказательством».
+MIN_EVIDENCE_CHARS = 12
+
+#: Наблюдение обязано назвать коммит: утверждение «работа доставлена» — это
+#: утверждение о том, что код ГДЕ-ТО есть, и без места оно нефальсифицируемо.
+#: Семь знаков — короткий git-хеш, ниже этого хеш перестаёт быть однозначным.
+MIN_SHA_CHARS = 7
+
+#: Условие «это похоже на хеш» для SQL: длина плюс отсутствие НЕ-шестнадцати-
+#: ричного знака. GLOB здесь единственная форма, которой SQLite умеет сказать
+#: «во всей строке нет символа вне набора» — LIKE такого не умеет.
+_SQL_SHA_LOOKS_LIKE_A_COMMIT = (
+    f"LENGTH(TRIM(c.sha)) >= {MIN_SHA_CHARS} AND TRIM(c.sha) NOT GLOB '*[^0-9a-fA-F]*'"
+)
+
+#: Та же тройка требований, что у ``_check_evidence``, на языке засыпки.
+_SQL_EVIDENCE_BAR = (
+    f"c.outcome = 'done' "
+    f"AND LENGTH(TRIM(c.probe)) >= {MIN_EVIDENCE_CHARS} "
+    f"AND LENGTH(TRIM(c.observation)) >= {MIN_EVIDENCE_CHARS} "
+    f"AND {_SQL_SHA_LOOKS_LIKE_A_COMMIT}"
+)
+
+# Перенос записей о публикации из ленты событий на строку версии (#1253).
+# Отдельной константой, потому что это единственная миграция здесь, которая
+# двигает данные, а не схему: её надо было бы уметь прочитать и проверить
+# отдельно от списка.
+BACKFILL_PUBLICATION_RECORD_SQL = """
+UPDATE skills SET publication_record = COALESCE((
+    SELECT e.payload FROM events e
+    WHERE e.kind = 'skill_activated'
+      AND json_extract(e.payload, '$.name') = skills.name
+      AND json_extract(e.payload, '$.version') = skills.version
+    ORDER BY e.id DESC LIMIT 1
+), '')
+WHERE publication_record = ''
 """
 
 _MIGRATIONS: list[tuple[str, str]] = [
@@ -494,6 +544,28 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_skills_activated_by_column",
         "ALTER TABLE skills ADD COLUMN activated_by TEXT NOT NULL DEFAULT ''",
     ),
+    # Доказательства публикации ЖИВУТ ЗДЕСЬ, а не в ленте событий (#1253).
+    # Лента — канал уведомлений с двухнедельной чисткой (#349), и сама она об
+    # этом говорит прямым текстом над своим DELETE. Запись о том, что именно
+    # опубликовано, лежит на строке версии, которую описывает: у таблицы
+    # ``skills`` нет и не может быть срока годности — удалить строку значит
+    # удалить саму версию скилла, а не сведения о ней.
+    (
+        "add_skills_publication_record_column",
+        "ALTER TABLE skills ADD COLUMN publication_record TEXT NOT NULL DEFAULT ''",
+    ),
+    # Разовый перенос того, что ещё лежит в ленте (#1253). Без него починка
+    # работала бы только на будущих публикациях, а КАЖДАЯ уже опубликованная
+    # версия всё равно потеряла бы свою запись через две недели — то есть
+    # ровно тот дефект, ради которого заведена задача. Переносится последняя
+    # запись по паре (name, version) — тем же «последняя побеждает», каким
+    # читал ленту прежний ``latest_skill_activation``. Запись до #1169 несёт
+    # только имя и версию, и она тоже переезжает: «запись есть, дифа в ней
+    # нет» — отдельное состояние, и превратить его в «записи нет» нельзя.
+    (
+        "backfill_skills_publication_record",
+        BACKFILL_PUBLICATION_RECORD_SQL,
+    ),
     # ---- Machine review policy (#382): project default + task override.
     (
         "add_projects_machine_review_column",
@@ -661,6 +733,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_machine_reviews_lost_dimensions_column",
         "ALTER TABLE machine_reviews ADD COLUMN lost_dimensions TEXT "
         "NOT NULL DEFAULT '[]'",
+    ),
+    # #1238. WHY the run called itself incomplete, from a fixed vocabulary.
+    # The empty default is the honest value for history: every row written
+    # before this column made no claim about the cause, and back-filling
+    # either word would put one in its mouth — the same reasoning that left
+    # `incomplete` nullable above. Nothing reads the cause out of prose.
+    (
+        "add_machine_reviews_incomplete_reason_column",
+        "ALTER TABLE machine_reviews ADD COLUMN incomplete_reason TEXT "
+        "NOT NULL DEFAULT ''",
     ),
     (
         "add_task_updates_principal_id",
@@ -1818,6 +1900,160 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE delivery_discrepancies "
         "ADD COLUMN alerted_age_bucket INTEGER NOT NULL DEFAULT 0",
     ),
+    (
+        # #1236: ИМЯ читающей пробы из закрытого реестра, которую хаб исполнит
+        # сам после доставки. Одно имя, а не строка вызова: колонка, куда
+        # ложится текст из карточки, стала бы каналом исполнения произвольного
+        # кода на проде. Пусто — зонд не объявлен, и это законное состояние:
+        # обязательной живая проверка не делается, обязательной её делает
+        # постановка, когда объявляет зонд.
+        "add_tasks_live_probe",
+        "ALTER TABLE tasks ADD COLUMN live_probe TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1252: терминальный статус прогона, кончившегося БЕЗ отчёта. Он
+        # нужен уже после того, как строку закрыли: долг второй двери
+        # переживает перезапуск хаба, и на возобновлении назвать причину
+        # отказа облака больше неоткуда — спрашивать провайдера заново значит
+        # зависеть от его доступности ради текста в карточке. Пусто — прогон
+        # до терминального статуса не доходил.
+        "add_review_dispatches_run_status",
+        "ALTER TABLE review_dispatches ADD COLUMN run_status TEXT NOT NULL DEFAULT ''",
+    ),
+    # --- Наблюдение доставки: четвёртый ВХОД, но не четвёртый ИСТОЧНИК (#1215).
+    #
+    # Три источника ответа о доставке — строка pipeline_merges, базовая ветка,
+    # провайдер — могут оказаться закрыты ОДНОВРЕМЕННО и навсегда. Живой
+    # случай 09.09.2026: #878 (PR #443), #875 (PR #461), #909 (PR #468) стояли
+    # в unknown 441-453 часа, потому что прежний репозиторий, где жили эти PR,
+    # удалён (в нынешнем нумерация началась заново), строк pipeline_merges
+    # нет, а базовая ветка не отвечает из-за squash. Спрашивать больше некого
+    # — ни сегодня, ни через месяц, и у строки не было НИ ОДНОГО выхода.
+    #
+    # Эти колонки — место, куда человек или агент кладёт то, что проверил
+    # своими глазами. Почему отдельные колонки, а не перезапись state/reason:
+    # наблюдение обязано ВИДИМО отличаться от того, что хаб установил сам.
+    # Перезапись сделала бы наблюдение неотличимым от вывода трёх источников,
+    # то есть ровно четвёртым источником правды, — и заодно стёрла бы прежнее
+    # unknown вместе с его причиной. Закрытие дописывает историю, а не
+    # заменяет её: state и reason остаются ровно теми, какими их оставил свип.
+    #
+    # observed_state — тот ФАКТ, который закрыли наблюдением, по образцу
+    # acknowledged_state. Наблюдение «код в 19ee3f6 есть» относится к
+    # состоянию unknown; если провайдер завтра оживёт и скажет pr_open, это
+    # уже другое утверждение, которого никто не наблюдал, и строка обязана
+    # вернуться в список. Обратной засыпки нет и быть не может: наблюдений до
+    # этой миграции не существует.
+    (
+        "add_delivery_observed_at",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_at TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_delivery_observed_by",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_by TEXT NOT NULL DEFAULT ''",
+    ),
+    # probe и evidence раздельно — та же схема доказательства, что у живых
+    # проверок (#813): «что запускал» и «что увидел». Одно поле принимало бы
+    # «проверено, всё хорошо» как полноценную запись, а это штамп.
+    (
+        "add_delivery_observed_probe",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_probe TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_delivery_observed_evidence",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_evidence TEXT NOT NULL DEFAULT ''",
+    ),
+    # Коммит обязателен: наблюдение доставки — это утверждение о том, что код
+    # ГДЕ-ТО есть, и без названного места оно нефальсифицируемо.
+    (
+        "add_delivery_observed_sha",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_sha TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_delivery_observed_state",
+        "ALTER TABLE delivery_discrepancies "
+        "ADD COLUMN observed_state TEXT NOT NULL DEFAULT ''",
+    ),
+    # ЗАСЫПКА ПО УЖЕ ЗАПИСАННЫМ НАБЛЮДЕНИЯМ (#1215), и она здесь не ради
+    # удобства выката. Три строки — #878, #875, #909 — простояли в unknown
+    # 441-453 часа, и наблюдения по ним уже лежат: живые проверки от
+    # 09.09.2026, с командой, с ответом и с раскатанным коммитом. Без засыпки
+    # выкат оставил бы механизм, у которого нет ни одного закрытого случая, и
+    # закрывать три строки пришлось бы руками, повторяя запись, которая уже
+    # есть. Ровно этого требует постановка: «выкат проверяется на них».
+    #
+    # Берётся ПОСЛЕДНЯЯ живая проверка задачи, прошедшая ТОТ ЖЕ порог
+    # доказательства, что и прямая запись, — и «тот же» здесь буквально: и
+    # эта SQL, и живая дверь считают его по _SQL_EVIDENCE_BAR / константам
+    # выше, одним определением. Пока определений было два, они разошлись:
+    # засыпка спрашивала лишь TRIM != '' и закрывала строку записью вида
+    # «ок / норм / zzz», которую живая дверь отвергает как штамп (находка
+    # 80fcb9c9). Обещание в комментарии, не проверяемое кодом, — та же
+    # подмена доказательства штампом, только этажом выше. Закрывается только unknown: строку, чей источник
+    # отвечает, наблюдением не закрывают ни здесь, ни в коде.
+    #
+    # Одноразовость даёт сам механизм миграций (имя выполняется один раз), а
+    # не WHERE: строка, которую человек закроет и передумает, не должна
+    # закрываться заново при следующем запуске.
+    (
+        "backfill_delivery_observed_from_live_checks",
+        f"""UPDATE delivery_discrepancies AS d
+              SET observed_at       = (
+                    SELECT c.created_at FROM live_checks c
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_by       = (
+                    SELECT COALESCE(NULLIF(c.recorded_agent, ''), 'hub')
+                      FROM live_checks c
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_probe    = (
+                    SELECT c.probe FROM live_checks c
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_evidence = (
+                    SELECT c.observation FROM live_checks c
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_sha      = (
+                    SELECT c.sha FROM live_checks c
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR}
+                     ORDER BY c.id DESC LIMIT 1),
+                  observed_state    = d.state
+            WHERE d.state = 'unknown'
+              AND d.observed_at = ''
+              AND EXISTS (
+                    SELECT 1 FROM live_checks c
+                     WHERE c.task_id = d.task_id AND {_SQL_EVIDENCE_BAR})""",  # nosec B608 - константы модуля, не данные
+    ),
+    (
+        # #1266: id заказа, который ЭТА строка заменяет — ставится только на
+        # локальную строку второй двери, заказанную вместо упавшего заказа
+        # (create_review_dispatch внутри dispatch_local_review, когда
+        # late_report_recheck передан). Пусто — строка сама начинает шаг, а
+        # не продолжает чужой. Логический шаг лестницы (#879) считается по
+        # этой колонке: замена не тратит свой собственный, она донашивает
+        # шаг заменяемой строки (count_review_dispatches).
+        "add_review_dispatches_replaces_dispatch_id",
+        "ALTER TABLE review_dispatches ADD COLUMN replaces_dispatch_id INTEGER",
+    ),
+    (
+        # #1266: почему отчёт добыт НЕ облаком — тем же текстом, что сегодня
+        # уходит только в ленту задачи (review_dispatch.py, "why" при
+        # create_review_dispatch с cloud_refusal). Живёт на строке заказа,
+        # а не только в ленте, потому что бриф (review_brief.py) читает
+        # именно строку через get_settled_review_dispatch — вторым автором
+        # того же текста заводить не стоит. Пусто — заказ облачный или
+        # локальный без наблюдённого отказа облака (форж недоступен облаку).
+        "add_review_dispatches_second_door_reason",
+        "ALTER TABLE review_dispatches ADD COLUMN second_door_reason TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
 ]
 
 
@@ -1914,6 +2150,9 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     "validation_commands",
     "out_of_scope_for_review",
     "review_checklist",
+    # #1236: имя объявленного живого зонда. Часть постановки: она говорит, что
+    # именно наблюдать после доставки.
+    "live_probe",
     "risks",
     "prepared_by",
     "prepared_at",
@@ -2778,9 +3017,9 @@ HAIPLANE_MACHINE_REVIEW=require
 3. Исправить confirmed-находки, прогнать тесты заново (exit code проверять
    отдельным echo, не через пайп).
 4. `hub_submit_machine_review(task_id, raw_count, incomplete,
-   findings_confirmed, findings_rejected, unresolved, lost_dimensions,
-   harness_skill, harness_version, agent_count, tokens_spent, duration_ms,
-   orchestrator, model)` — метрики опциональны, но токены/время питают
+   incomplete_reason, findings_confirmed, findings_rejected, unresolved,
+   lost_dimensions, harness_skill, harness_version, agent_count, tokens_spent,
+   duration_ms, orchestrator, model)` — метрики опциональны, но токены/время питают
    экономику практики (#384). Отчёт привязывается к текущему
    submission_generation: пересдача работы делает его stale.
 
@@ -2790,6 +3029,17 @@ HAIPLANE_MACHINE_REVIEW=require
    НЕ идут в `findings_rejected`, потому что «никто не голосовал» и «кто-то
    опроверг» — противоположные исходы. `lost_dimensions` — измерения, не
    вернувшие результат.
+
+   `incomplete_reason` (#1238) — ПОЧЕМУ прогон неполон, одним словом из
+   двух: `environment` — смотреть было нечем (нечем запустить тесты, ссылка
+   на базовую ветку не разрешается, сравнить не с чем), лечится настройкой
+   окружения, а не вторым прогоном; `profile` — инструменты были, охвата не
+   хватило на объём диффа. Пропуск поля означает «причина не заявлена» и НЕ
+   читается ни как одно, ни как другое. Прозу по-прежнему пиши в
+   `lost_dimensions`: причина берётся из этого слова, а не угадывается по
+   тексту. Поле едет ВСЕМИ тремя путями, которыми приезжают отчёты: аргумент
+   MCP-инструмента, HTTP `POST /api/tasks/<id>/machine-review` и текстовый
+   блок прогона.
 5. `hub_submit_for_review` — человеческий вердикт остаётся финальным гейтом;
    отчёт его информирует, не заменяет.
 
@@ -2892,7 +3142,8 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
             (name,),
         )
         if not rows:
-            await _insert_seed_skill(db, name, kind, content, tags, 1, "active")
+            if await _insert_seed_skill(db, name, kind, content, tags, 1, "active"):
+                await _record_seed_activation(db, name, 1, content, None, None)
             continue
         # Highest active version — the same row ``get_active_skill`` serves.
         active = next((r for r in rows if str(r["status"]) == "active"), None)
@@ -2908,25 +3159,45 @@ async def seed_default_skills(db: aiosqlite.Connection) -> None:
             continue
         # Case 3. The shipped text has to become the one agents read.
         shipped = next((r for r in rows if str(r["content"]) == content), None)
+        published: int | None = None
         if shipped is not None:
             if _is_seed_word(shipped):
-                await db.execute(
-                    "UPDATE skills SET status='active', activated_by='seed' WHERE id=?",
+                # ``AND status<>'active'`` is what makes the event honest, not
+                # what makes the UPDATE correct: this row is not the active one
+                # (case 1 returned above), so the clause changes nothing about
+                # the library. It changes who gets to SAY so — ``get_db`` seeds
+                # on every connection, and without it two workers racing here
+                # would each report having published, writing the change to the
+                # feed twice (#1169).
+                cur = await db.execute(
+                    "UPDATE skills SET status='active', activated_by='seed' "
+                    "WHERE id=? AND status<>'active'",
                     (int(shipped["id"]),),
                 )
+                published = int(shipped["version"]) if cur.rowcount else None
             else:
                 # A person published this exact text. Activating it is AGREEING
                 # with them, not replacing them, so their signature outlives the
                 # act — stamping 'seed' here would erase the only record that a
                 # human ever spoke, and the next upgrade would then read the row
                 # as ours and overrule a decision that was never ours to make.
-                await db.execute(
-                    "UPDATE skills SET status='active' WHERE id=?",
+                cur = await db.execute(
+                    "UPDATE skills SET status='active' WHERE id=? AND status<>'active'",
                     (int(shipped["id"]),),
                 )
-        else:
-            await _insert_seed_skill(
-                db, name, kind, content, tags, next_version, "active"
+                published = int(shipped["version"]) if cur.rowcount else None
+        elif await _insert_seed_skill(
+            db, name, kind, content, tags, next_version, "active"
+        ):
+            published = next_version
+        if published is not None:
+            await _record_seed_activation(
+                db,
+                name,
+                published,
+                content,
+                None if active is None else str(active["content"]),
+                None if active is None else int(active["version"]),
             )
         # And the hub's own PREVIOUS word steps back to a draft. Without this
         # every upgrade leaves another live version behind, and since
@@ -2988,7 +3259,7 @@ async def _insert_seed_skill(
     tags: str,
     version: int,
     status: str,
-) -> None:
+) -> bool:
     """Insert one seeded version, tolerating a parallel seeder.
 
     The race is real and benign: ``get_db`` seeds on every connection, so two
@@ -2998,8 +3269,12 @@ async def _insert_seed_skill(
     statement of this loop (the second seeded skill) would fail on nothing it
     did wrong, taking the connection down over a row that already says what we
     wanted to say.
+
+    Returns whether THIS connection wrote the row. Losing the race is still
+    fine for the library — the winner wrote the same text — but it is not fine
+    for the feed: the loser wrote nothing and has nothing to report (#1169).
     """
-    await db.execute(
+    cur = await db.execute(
         "INSERT INTO skills (name, kind, version, content, tags, status, "
         "created_by, activated_by) VALUES (?, ?, ?, ?, ?, ?, 'seed', ?) "
         "ON CONFLICT(name, version) DO NOTHING",
@@ -3012,6 +3287,56 @@ async def _insert_seed_skill(
             status,
             "seed" if status == "active" else "",
         ),
+    )
+    return bool(cur.rowcount)
+
+
+async def _record_seed_activation(
+    db: aiosqlite.Connection,
+    name: str,
+    version: int,
+    content: str,
+    previous_content: str | None,
+    previous_version: int | None,
+) -> None:
+    """The seed path leaves the same trace the other two do (#1169).
+
+    Before this, changing the text every agent READS happened on deploy and
+    was recorded nowhere: no human pressed anything, and ``seed_default_skills``
+    wrote no event at all. The payload is the one ``hub/app.py`` writes, built
+    by the same function, so a reader of the feed does not have to know which
+    of the three paths published a version.
+
+    Raw SQL rather than ``repository.insert_event``: ``hub.repository`` imports
+    ``hub.db``, so the call cannot go the other way. No commit here either —
+    the caller commits the loop, and a rollback must take the event with the
+    activation it describes.
+
+    Пишутся ОБА места, и полезная нагрузка для них считается ОДИН раз (#1253).
+    Событие остаётся уведомлением — человек видит факт публикации сразу; а
+    ``skills.publication_record`` остаётся доказательством, потому что ленту
+    поллер чистит раз в две недели. Разойтись им нельзя: расхождение путей и
+    есть исходный дефект #1169, поэтому payload здесь — одна переменная, а не
+    два вызова.
+    """
+    payload = json.dumps(
+        skill_publish.publication_payload(
+            name=name,
+            version=version,
+            content=content,
+            previous_content=previous_content,
+            previous_version=previous_version,
+        ),
+        ensure_ascii=False,
+    )
+    await db.execute(
+        "INSERT INTO events (kind, task_id, project_id, actor, payload) "
+        "VALUES ('skill_activated', NULL, NULL, 'seed', ?)",
+        (payload,),
+    )
+    await db.execute(
+        "UPDATE skills SET publication_record=? WHERE name=? AND version=?",
+        (payload, name, version),
     )
 
 

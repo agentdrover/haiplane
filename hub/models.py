@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from enum import Enum
 from typing import Any, Literal
 
@@ -9,6 +10,8 @@ import re
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hub import config
+
+_models_log = logging.getLogger("hub")
 
 _SQLITE_DT_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 
@@ -786,10 +789,11 @@ class LiveCheckState(BaseModel):
     """Did anyone watch this behave in production, and on which build (#814).
 
     ``state`` is ``done`` (someone ran it and said what they saw),
-    ``not_applicable`` (there is nothing to observe, with a reason) or
-    ``unknown`` — nobody looked. Unknown is the default and always carries a
-    cause: an absent block would read as "the question was not asked", and it
-    is asked of every task.
+    ``not_applicable`` (there is nothing to observe, with a reason),
+    ``failed`` (#1236: a declared probe ran and brought back no answer — a fact
+    about the attempt, not about the behaviour) or ``unknown`` — nobody looked.
+    Unknown is the default and always carries a cause: an absent block would
+    read as "the question was not asked", and it is asked of every task.
 
     ``sha_mismatch`` names the case the card must not hide: the observation
     exists but was taken against another build than the one delivered.
@@ -797,6 +801,8 @@ class LiveCheckState(BaseModel):
 
     state: str = "unknown"
     reason: str = "живая проверка не записывалась"
+    # #1236: имя зонда, объявленного постановкой. Пусто — не объявлен.
+    declared_probe: str = ""
     probe: str = ""
     observation: str = ""
     sha: str = ""
@@ -923,6 +929,29 @@ class ReviewReport(BaseModel):
     machine_review: "MachineReviewView | None" = None
 
 
+class ReviewCircleView(BaseModel):
+    """Заходы «закрыли находки — пришли новые», подряд (#1235).
+
+    Отдельно от ``review_cycle``, и это не дублирование. ``review_cycle``
+    считает ВОЗВРАТЫ работы автору и стоит под потолком, который задачу
+    останавливает; здесь считаются ПОКОЛЕНИЯ, в которых автор закрыл
+    находки и получил новый слой, и не останавливается ничего. На #1171
+    09.09.2026 review_cycle оставался нулём при третьем заходе — то есть
+    одно число другим не выводится.
+    """
+
+    laps: int = 0
+    threshold: int = 0
+    #: Пора ли звать человека. Считает хаб, а не читатель: сравнение
+    #: счётчика с порогом живёт в одном месте (ReviewCircle.named).
+    named: bool = False
+    #: По строке на заход: «закрыто / пришло новых».
+    breakdown: list[str] = Field(default_factory=list)
+    #: Категории, повторённые за предыдущим заходом. Отдельно от числа
+    #: заходов, потому что признак другой и важнее.
+    repeated_categories: list[str] = Field(default_factory=list)
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 
@@ -989,6 +1018,11 @@ class ReviewBrief(BaseModel):
     # #725: one verdict over all evidence blocks below.
     evidence_coverage: EvidenceCoverage = Field(default_factory=EvidenceCoverage)
     review_cycle: int = 0
+    # #1235: сколько заходов «закрыли находки — пришли новые» задача уже
+    # сделала. Ревьюер, читающий бриф, обязан видеть, что предыдущий слой
+    # был разобран и закрыт по-настоящему, — иначе очередной отчёт читается
+    # как первый.
+    review_circle: ReviewCircleView = Field(default_factory=ReviewCircleView)
     submission_generation: int = 0
     # #572: what code the submission pinned, where the branch stands now, and
     # whether they agree. sha_check is "match" | "diverged" | "unknown" —
@@ -1220,6 +1254,30 @@ class TaskUpdateCreate(BaseModel):
     agent: str = Field("", max_length=100)
     kind: str = Field("status", max_length=50)
     content: str = Field(..., min_length=1, max_length=10000)
+    # #1155: what became of the findings this work was sent back over. The
+    # SAME item type as ``TaskSubmitReview.finding_outcomes`` — the answer is
+    # the same answer, only the door differs — so the semantics, the four
+    # words per section and the note requirement stay in one place.
+    # Optional by construction: a done report without outcomes behaves exactly
+    # as it did before, and the done report is the most-called tool there is.
+    finding_outcomes: list[FindingOutcomeItem] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _only_a_done_report_answers_findings(self) -> "TaskUpdateCreate":
+        """Исходы приезжают ТОЛЬКО с отчётом о готовности.
+
+        На любом другом виде записи их некуда деть: сдачи нет, поколения,
+        которому они отвечают, тоже нет. Принять и промолчать значило бы
+        потерять ответ автора — ровно та тишина, ради которой #911 и заведён,
+        только теперь оплаченная его собственной попыткой ответить.
+        """
+        if self.finding_outcomes and self.kind != "done":
+            raise ValueError(
+                f"finding_outcomes принимается только при kind='done', а не "
+                f"'{self.kind}': исход находки — часть отчёта о сдаче, и на "
+                "обычной записи ему не к чему относиться"
+            )
+        return self
 
 
 class TaskReorder(BaseModel):
@@ -1342,6 +1400,12 @@ class TaskRefine(BaseModel):
     validation_commands: list[str] | None = Field(default=None, max_length=10)
     out_of_scope_for_review: list[str] | None = Field(default=None, max_length=10)
     review_checklist: list[str] | None = Field(default=None, max_length=10)
+    # #1236: ИМЯ читающей пробы из закрытого реестра (hub/services/live_probe.py),
+    # которую хаб исполнит сам после доставки. Не команда и не строка вызова:
+    # проверяется на принадлежность реестру ДО записи, потому что поле, куда
+    # ложится текст из карточки, а исполняет его служба с ключами, — это не
+    # поле, а канал исполнения. "" очищает объявление.
+    live_probe: str | None = Field(default=None, max_length=64)
     risks: list[TaskRisk] | None = None
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     prepared_by: str | None = Field(default=None, max_length=100)
@@ -1438,14 +1502,64 @@ class DoRCheckItem(BaseModel):
 RecommendationSeverity = Literal["blocking", "high", "medium", "low"]
 
 
+# Closed vocabulary of statement defects (#1172), same shape as
+# STEWARD_ESCALATE_REASONS below: a tuple of strings, checked by enumeration.
+#
+# WHY A DICTIONARY AT ALL. The hub already computes two of these defects, but
+# says them as a message string — you cannot count a string, cite it, or point
+# a steward's finding at it. Two producers name defects here: the hub's own
+# readiness read (deterministic and free) and the F6 steward (paid per run).
+# They must use ONE set of names, or the same defect arrives twice under two
+# spellings and the count is silently incomplete.
+#
+# `unknown` is absent on purpose, exactly as in the steward vocabularies: a
+# catch-all would reopen the dictionary. A string outside this tuple is not a
+# statement defect — Recommendation rejects it below.
+#
+# The list is closed, not frozen: it grows from RECORDED steward findings, not
+# from guesses, and a code that never fires is removed (task #1172 revisit
+# condition).
+STATEMENT_DEFECTS: tuple[str, ...] = (
+    # Already computed by the hub, previously nameless (recommendations.py).
+    "ac_clause_thin",
+    "expectation_source_unstated",
+    "expectation_source_is_implementation",
+    # Added by #1172, each against one reproducible authoring mistake.
+    "scope_item_without_criterion",
+    "affected_area_not_in_tree",
+    "outcome_metric_without_number",
+)
+
+
 class Recommendation(BaseModel):
-    """Actionable suggestion to improve task readiness."""
+    """Actionable suggestion to improve task readiness.
+
+    ``defect_code`` names a statement defect from the closed vocabulary
+    STATEMENT_DEFECTS (#1172). It is optional because most recommendations
+    are not defect reports: a failed DoR check says "this field is empty",
+    which is a missing field, not a flaw in what was written. A code outside
+    the vocabulary is refused rather than stored — that refusal is what keeps
+    a second, unlisted way of naming a defect from appearing.
+    """
 
     field: str
     severity: RecommendationSeverity
     message: str
     expected_score_delta: int = 0
     estimated_minutes: int = 0
+    defect_code: str | None = None
+
+    @field_validator("defect_code")
+    @classmethod
+    def _defect_code_is_in_the_vocabulary(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if v not in STATEMENT_DEFECTS:
+            raise ValueError(
+                f"unknown statement defect {v!r}; allowed: "
+                f"{', '.join(STATEMENT_DEFECTS)}"
+            )
+        return v
 
 
 class ReadinessTreeNode(BaseModel):
@@ -1639,6 +1753,25 @@ class TaskDependencies(BaseModel):
     unblocks: list[TaskDependencyRef] = Field(default_factory=list)
 
 
+class DeliveryObservation(BaseModel):
+    """Наблюдённый факт доставки по завершённой задаче (#1215).
+
+    Форма повторяет живую проверку (#813) не из симметрии, а потому что это
+    одно и то же обязательство: запись, которую читатель может оспорить.
+    ``probe`` — что запускали, ``observation`` — что увидели, ``sha`` — коммит,
+    в котором видели работу.
+
+    Пороги min_length стоят В СХЕМЕ, а не только в сервисе, по тому же уроку,
+    что и у признания выше: форма и API обязаны отвергать одно и то же, иначе
+    два входа в один глагол ведут себя по-разному. Сервис проверяет ещё раз,
+    и это не дублирование — его зовут не только по HTTP.
+    """
+
+    probe: str = Field(..., min_length=1, max_length=2000)
+    observation: str = Field(..., min_length=1, max_length=4000)
+    sha: str = Field(..., min_length=1, max_length=64)
+
+
 class DeliveryAcknowledgement(BaseModel):
     """Признание расхождения доставки законным (#1198).
 
@@ -1714,6 +1847,14 @@ class TaskView(BaseModel):
     log_tail: list[str] | None = None
     updates: list[TaskUpdateView] | None = None
     review_cycle: int = 0
+    # #1235: заходы «закрыли находки — пришли новые» стоят в карточке
+    # ВСЕГДА, а не одним алертом на пороге. До порога карточка иначе
+    # выглядит так, будто круга нет вовсе, — а молчание читается как
+    # «чисто» (#516, #549), и человек узнаёт о круге ровно тогда, когда
+    # круг уже стал дорогим. Порог 0 гасит ЗОВ, а не счёт: выключатель,
+    # прячущий заодно и число, отнял бы единственный способ увидеть, что
+    # выключили не то.
+    review_circle: ReviewCircleView = Field(default_factory=ReviewCircleView)
     ci_fix_cycle: int = 0
     auto_review: bool = True
     review_job_id: str | None = None
@@ -1806,6 +1947,8 @@ class TaskView(BaseModel):
     validation_commands: list[str] = Field(default_factory=list)
     out_of_scope_for_review: list[str] = Field(default_factory=list)
     review_checklist: list[str] = Field(default_factory=list)
+    # #1236: имя объявленного живого зонда; "" — не объявлен.
+    live_probe: str = ""
     risks: list[TaskRisk] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] | None = None
     lifecycle_hint: str | None = None
@@ -2291,6 +2434,53 @@ class OutcomeAnswerView(BaseModel):
     hypothesis_snapshot: str | None = None
 
 
+#: Почему машинное ревью объявило себя неполным — СО СЛОВ ревьюера (#1238).
+#:
+#: Два случая, неразличимые в карточке до этой задачи, требуют разных ответов
+#: человека и разных денег:
+#:
+#: * ``environment`` — ОТКАЗ СРЕДЫ. Ревьюеру было нечем смотреть: в среде нет
+#:   инструмента, которым запускают тесты, или ссылка на базовую ветку не
+#:   разрешается и дифф не с чем сравнить. Второй прогон в той же среде даст
+#:   тот же отказ: это лечится настройкой, а не повтором.
+#: * ``profile`` — ИСЧЕРПАНИЕ ПРОФИЛЯ. Инструменты были, охвата не хватило:
+#:   дифф больше, чем один проход. Ровно это и покупает добор (#879).
+#:
+#: Пустая строка — «не заявлена». Это НЕ третья причина и не «со средой всё
+#: хорошо»: так выглядят все отчёты, написанные до появления поля.
+INCOMPLETE_REASON_ENVIRONMENT = "environment"
+INCOMPLETE_REASON_PROFILE = "profile"
+INCOMPLETE_REASON_UNSTATED = ""
+INCOMPLETE_REASONS: tuple[str, ...] = (
+    INCOMPLETE_REASON_ENVIRONMENT,
+    INCOMPLETE_REASON_PROFILE,
+)
+
+
+def normalise_incomplete_reason(value: Any) -> str:
+    """The declared cause, or ``""`` when nothing recognisable was declared.
+
+    Guessing is what this field exists to replace, so nothing here reads the
+    reviewer's prose: a word outside the vocabulary is dropped to "not
+    stated" and logged, never mapped to the nearest-looking cause. The prose
+    itself is not lost — it stays in ``lost_dimensions``, where the reviewer
+    wrote it.
+    """
+    if value is None:
+        return INCOMPLETE_REASON_UNSTATED
+    text = str(value).strip().lower()
+    if not text:
+        return INCOMPLETE_REASON_UNSTATED
+    if text in INCOMPLETE_REASONS:
+        return text
+    _models_log.warning(
+        "machine review declared an unknown incomplete_reason %r; recorded as "
+        "not stated",
+        text[:40],
+    )
+    return INCOMPLETE_REASON_UNSTATED
+
+
 class MachineReviewSubmit(BaseModel):
     """Structured multi-agent review report (#381).
 
@@ -2317,11 +2507,29 @@ class MachineReviewSubmit(BaseModel):
     # the substitution this field exists to prevent: a run that lost agents
     # reading as a clean one. Forgetting must fail loudly at the schema.
     incomplete: bool
+    # WHY it is incomplete, in the reviewer's own words from a fixed
+    # vocabulary (#1238). Two causes that look identical in the card today
+    # need opposite answers: an environment refusal is not cured by a second
+    # run in the same environment, an exhausted profile is exactly what the
+    # ladder (#879) buys another run for.
+    #
+    # Optional, and empty means "not stated" — never "environment was fine".
+    # Required would have been louder, but the only path the cloud reviewer
+    # actually has is the text block, and parse_report_block drops a report
+    # whose fields the contract refuses: a missing cause would then cost the
+    # findings too. A cause the hub does not know is normalised to "not
+    # stated" for the same reason, and logged — see the validator.
+    incomplete_reason: str = Field("", max_length=40)
     unresolved: list[MachineUnresolvedFinding] = Field(
         default_factory=list, max_length=200
     )
     lost_dimensions: list[str] = Field(default_factory=list, max_length=50)
     agent: str = Field("", max_length=100)
+
+    @field_validator("incomplete_reason", mode="before")
+    @classmethod
+    def _known_incomplete_reason(cls, v: Any) -> str:
+        return normalise_incomplete_reason(v)
 
 
 class CategoryCheckSubmit(BaseModel):
@@ -2540,6 +2748,11 @@ class MachineReviewView(BaseModel):
     # field existed made no such claim, and back-filling false would put words
     # in their mouth (#549).
     incomplete: bool | None = None
+    # #1238. Empty means the reviewer never said why — which is where every
+    # report written before this field existed sits, and which must never be
+    # read as either cause. Only ``INCOMPLETE_REASON_ENVIRONMENT`` says the
+    # environment refused; nothing is inferred from prose.
+    incomplete_reason: str = ""
     unresolved: list[MachineUnresolvedFinding] = Field(default_factory=list)
     lost_dimensions: list[str] = Field(default_factory=list)
     # Which profile produced this report (#807). Set by the hub from the
@@ -2559,6 +2772,16 @@ class MachineReviewView(BaseModel):
     # What the gate said each confirmed finding turned out to be (#876). An
     # empty list means nobody judged them — never that they were all fine.
     dispositions: list[FindingDispositionView] = Field(default_factory=list)
+    # Which channel actually produced this report, and why it is not cloud
+    # (#1266). Set by the brief builder from the settled review_dispatches
+    # row, never from this table — a report row carries no channel of its
+    # own. Empty ``second_door_channel`` means "cloud, or unknown" (rows
+    # written before the second door existed, or no settled dispatch found);
+    # it is never guessed from ``model`` or ``orchestrator``. A reader that
+    # skips this field and reads ``model`` alone sees a local report as an
+    # indistinguishable cloud one.
+    second_door_channel: str = ""
+    second_door_reason: str = ""
 
     @field_validator("created_at", mode="before")
     @classmethod
