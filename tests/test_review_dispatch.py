@@ -7275,3 +7275,303 @@ async def test_a_sync_refusal_names_the_refusal_not_a_finished_run(
         "не заводится"
     )
     assert "usage_limit_exceeded" in local["second_door_reason"]
+
+
+# --- Закрепление сдачи на отчёте, восстановленном из текста (#1260) ----------
+#
+# record_machine_review умеет отвергать отчёт, выписанный на другое поколение
+# (#1084), но путь восстановления из текста прогона закрепления не передавал:
+# прогон судил сдачу №1, работу пересдали, и отчёт ложился на №2 — отчёт о
+# прежнем диффе читался как отчёт о новом. _store_report одна на облачный и
+# локальный каналы, поэтому оба проверяются поимённо.
+
+
+async def _cloud_report_on_moved_submission(
+    client: AsyncClient, db: aiosqlite.Connection, slug: str
+) -> int:
+    """Облачный заказ на поколении 1; пока прогон шёл, работу пересдали."""
+    task_id = await _submitted(client, db, slug, policy={"review": "dispatch"})
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 2 WHERE id = ?", (task_id,)
+    )
+    await db.commit()
+    return task_id
+
+
+def _gated_reporting_stub(marker) -> str:
+    """Локальная заглушка, которая сдаёт отчёт только после сигнала теста.
+
+    Сигнал — файл: тест пересдаёт работу ПОКА прогон идёт, и лишь потом
+    отпускает его. Без шлюза исход зависел бы от того, кто успеет первым.
+    """
+    payload = json.dumps(_LOCAL_REPORT, ensure_ascii=False)
+    return (
+        "import os, sys, time\n"
+        "sys.stdin.read()\n"
+        "for _ in range(400):\n"
+        f"    if os.path.exists({str(marker)!r}):\n"
+        "        break\n"
+        "    time.sleep(0.05)\n"
+        "print('```haiplane-review')\n"
+        f"print({payload!r})\n"
+        "print('```')\n"
+    )
+
+
+async def _local_report_on_moved_submission(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    monkeypatch,
+    tmp_path,
+    slug: str,
+    *,
+    move: bool = True,
+) -> int:
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    marker = tmp_path / f"{slug}.go"
+    _stub_reviewer(monkeypatch, tmp_path, _gated_reporting_stub(marker))
+    task_id = await _submitted(
+        client,
+        db,
+        slug,
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    if move:
+        await db.execute(
+            "UPDATE tasks SET submission_generation = 2 WHERE id = ?", (task_id,)
+        )
+        await db.commit()
+    marker.write_text("go")
+    await wait_for_local_runs()
+    await db.commit()
+    return task_id
+
+
+async def _reports_by_generation(db: aiosqlite.Connection, task_id: int) -> list[int]:
+    return [
+        len(await repo.machine_reviews_of_generation(db, task_id, generation))
+        for generation in (1, 2)
+    ]
+
+
+def _moved_refusals(updates: list[dict]) -> list[str]:
+    return [
+        u["content"]
+        for u in updates
+        if u["kind"] == "alert"
+        and "выписан на сдачу #1" in u["content"]
+        and "текущая — #2" in u["content"]
+    ]
+
+
+async def test_a_report_from_a_superseded_run_is_not_stamped_on_the_new_submission(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1260): проверяется СОСТОЯНИЕМ — строк отчётов на обоих
+    # поколениях столько же, сколько было до свипа. И свип после отказа
+    # продолжает работу: соседний заказ того же прохода записывается.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-mv"}, "run": {"id": "run-mv"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    moved = await _cloud_report_on_moved_submission(client, db, "spike-moved")
+    steady = await _submitted(client, db, "spike-steady", policy={"review": "dispatch"})
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+    before = await _reports_by_generation(db, moved)
+    dispatches_before = len(
+        await db.execute_fetchall("SELECT id FROM review_dispatches")
+    )
+
+    await sweep_review_dispatches(db)
+
+    assert await _reports_by_generation(db, moved) == before == [0, 0], (
+        "отчёт о прежнем диффе не ложится ни на прежнюю, ни на новую сдачу"
+    )
+    assert len(await repo.machine_reviews_of_generation(db, steady, 1)) == 1, (
+        "свип обязан пережить отказ и записать соседний отчёт"
+    )
+    rows = await db.execute_fetchall(
+        "SELECT status FROM review_dispatches WHERE task_id = ?", (moved,)
+    )
+    assert [dict(r)["status"] for r in rows] == ["failed"], (
+        "строка прогона закрыта, а не висит активной"
+    )
+    assert (
+        len(await db.execute_fetchall("SELECT id FROM review_dispatches"))
+        == dispatches_before
+    ), "за прогон по уехавшей сдаче вторая дверь не покупается"
+
+
+async def test_the_card_names_why_the_recovered_report_was_refused(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1260): отказ виден в карточке названной причиной. Молчание — и
+    # ложное «отчёт НЕ сдан» — критерий не закрывают: отчёт был, но о другом.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-nm"}, "run": {"id": "run-nm"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    task_id = await _cloud_report_on_moved_submission(client, db, "spike-named")
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+
+    await sweep_review_dispatches(db)
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert len(_moved_refusals(updates)) == 1, (
+        f"причина отказа обязана быть в карточке ровно раз: {updates}"
+    )
+    assert not [u for u in updates if "отчёт НЕ сдан" in u["content"]], (
+        "отчёт был сдан — о прежней сдаче; «не сдан» подменило бы причину"
+    )
+    assert not [u for u in updates if "восстановлен из текста" in u["content"]]
+
+
+async def test_both_report_paths_carry_the_submission_pin(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    # AC-3 (#1260): два зовущих _store_report поимённо — облачное
+    # восстановление из текста рана и локальный отчёт из вывода прогона.
+    # Один потребитель правила не доказывает второго.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-bt"}, "run": {"id": "run-bt"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+
+    cloud = await _cloud_report_on_moved_submission(client, db, "spike-pin-cloud")
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+    await sweep_review_dispatches(db)
+
+    local = await _local_report_on_moved_submission(
+        client, db, monkeypatch, tmp_path, "spike-pin-local"
+    )
+
+    for name, task_id in (("облачный", cloud), ("локальный", local)):
+        assert await _reports_by_generation(db, task_id) == [0, 0], (
+            f"{name} путь записал отчёт о прежней сдаче"
+        )
+        updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+        assert len(_moved_refusals(updates)) == 1, (
+            f"{name} путь не назвал отказ в карточке: {updates}"
+        )
+        rows = await db.execute_fetchall(
+            "SELECT status FROM review_dispatches WHERE task_id = ?", (task_id,)
+        )
+        assert [dict(r)["status"] for r in rows] == ["failed"], name
+    local_updates = [dict(u) for u in await repo.get_task_updates(db, local)]
+    assert not [
+        u for u in local_updates if "восстановлен из вывода" in u["content"]
+    ], "локальный путь не выдаёт отказ за восстановление"
+
+
+async def test_a_matching_generation_is_recorded_on_both_channels(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    # AC-4 (#1260): совпавшее поколение ложится как раньше — с владельцем и
+    # происхождением. Сторож, отказывающий всегда, неотличим от работающего.
+    from hub.services.machine_review_intake import ORIGIN_LOCAL_TEXT, ORIGIN_RUN_TEXT
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ok"}, "run": {"id": "run-ok"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    local_pid = await _local_principal(db, monkeypatch)
+
+    cloud = await _submitted(client, db, "spike-same-cloud", policy={"review": "dispatch"})
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+    await sweep_review_dispatches(db)
+
+    local = await _local_report_on_moved_submission(
+        client, db, monkeypatch, tmp_path, "spike-same-local", move=False
+    )
+
+    for task_id, owner, origin in (
+        (cloud, cloud_pid, ORIGIN_RUN_TEXT),
+        (local, local_pid, ORIGIN_LOCAL_TEXT),
+    ):
+        rows = [
+            dict(r) for r in await repo.machine_reviews_of_generation(db, task_id, 1)
+        ]
+        assert len(rows) == 1, f"{origin}: отчёт совпавшего поколения не записан"
+        assert rows[0]["principal_id"] == owner, origin
+        assert rows[0]["orchestrator"].startswith(origin), rows[0]["orchestrator"]
+        updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+        assert not _moved_refusals(updates), origin
+        status = await db.execute_fetchall(
+            "SELECT status FROM review_dispatches WHERE task_id = ?", (task_id,)
+        )
+        assert [dict(r)["status"] for r in status] == ["done"], origin
+
+
+# Названные исключения из правила «вызывающий record_machine_review передаёт
+# закрепление». Ключ — (файл относительно корня, функция-владелец вызова),
+# значение — причина. Пусто сознательно: сегодня исключений нет, и новое
+# обязано прийти сюда с объяснением, а не проскочить молча.
+_INTAKE_PIN_EXCEPTIONS: dict[tuple[str, str], str] = {}
+
+
+def _intake_callers() -> list[tuple[str, str, bool]]:
+    """Все вызовы record_machine_review в hub/, собранные разбором AST.
+
+    Функция-владелец — ближайшая объемлющая def: оба сегодняшних вызова
+    импортируют функцию ЛОКАЛЬНО, из тела, и сторож по импортам верхнего
+    уровня их бы не увидел. Поэтому ищутся сами вызовы, а не импорты.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    found: list[tuple[str, str, bool]] = []
+
+    def _walk(node: ast.AST, owner: str, rel: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                _walk(child, child.name, rel)
+                continue
+            if isinstance(child, ast.Call):
+                func = child.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr
+                    if isinstance(func, ast.Attribute)
+                    else ""
+                )
+                if name == "record_machine_review":
+                    pinned = any(
+                        k.arg == "expected_generation" for k in child.keywords
+                    )
+                    found.append((rel, owner, pinned))
+            _walk(child, owner, rel)
+
+    for path in sorted((root / "hub").rglob("*.py")):
+        rel = path.relative_to(root).as_posix()
+        _walk(ast.parse(path.read_text(encoding="utf-8")), "<module>", rel)
+    return found
+
+
+def test_every_intake_caller_pins_the_submission_or_is_a_named_exception():
+    # AC-5 (#1260): вызывающие перечисляются разбором исходника, а не списком
+    # из головы. Новый вызывающий роняет тест, а не стареет молча.
+    callers = _intake_callers()
+    owners = {(rel, owner) for rel, owner, _ in callers}
+    assert ("hub/services/review_dispatch.py", "_store_report") in owners, (
+        f"сторож не видит вызова из _store_report — он слеп: {callers}"
+    )
+    assert any(rel == "hub/app.py" for rel, _ in owners), (
+        f"сторож не видит приёма по контракту в hub/app.py: {callers}"
+    )
+    unpinned = [
+        (rel, owner)
+        for rel, owner, pinned in callers
+        if not pinned and (rel, owner) not in _INTAKE_PIN_EXCEPTIONS
+    ]
+    assert not unpinned, (
+        "вызывающий record_machine_review без expected_generation и без "
+        f"названной причины: {unpinned}"
+    )
+    stale = set(_INTAKE_PIN_EXCEPTIONS) - owners
+    assert not stale, f"исключение названо для вызова, которого больше нет: {stale}"
