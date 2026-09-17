@@ -45,6 +45,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess  # nosec B404 - runs git and the repository's own tests
 import sys
 import tempfile
@@ -56,6 +57,7 @@ from pathlib import Path
 DEFAULT_BASE = "origin/develop"
 DEFAULT_BUDGET_SECONDS = 600
 MIN_MUTANT_TIMEOUT = 30.0
+MAX_TEST_FILES = 8
 
 # Binary-operator swaps produce eleven mutants per operator, most of which
 # (shifts, bitwise, power) no reviewer would ever call a missed case — they
@@ -189,18 +191,39 @@ def changed_functions(functions: list[Function], lines: set[int]) -> list[Functi
     return sorted((f for f in owners if f is not None), key=lambda f: f.first)
 
 
-def tests_for(path: str, tests_dir: Path) -> list[Path]:
-    """Test files that reference the module by dotted name, else by file stem."""
+def _module_references(path: str, texts: dict[Path, str]) -> list[Path]:
+    """Test files that reference a module by dotted name, else by file stem."""
     module = ".".join(Path(path).with_suffix("").parts)
-    stem = Path(path).stem
-    files = sorted(tests_dir.rglob("test_*.py")) if tests_dir.is_dir() else []
-    texts = {f: f.read_text(encoding="utf-8", errors="replace") for f in files}
     dotted = re.compile(rf"\b{re.escape(module)}\b")
     by_module = [f for f, text in texts.items() if dotted.search(text)]
     if by_module:
         return by_module
-    by_stem = re.compile(rf"\b{re.escape(stem)}\b")
+    by_stem = re.compile(rf"\b{re.escape(Path(path).stem)}\b")
     return [f for f, text in texts.items() if by_stem.search(text)]
+
+
+def tests_for(
+    function: Function, texts: dict[Path, str], limit: int = MAX_TEST_FILES
+) -> tuple[list[Path], str]:
+    """The tests that judge one function's mutants, or why there are none.
+
+    Narrowest first: files referencing the module AND naming the function. A
+    function nobody names falls back to the files referencing its module — but
+    only while there are at most ``limit`` of them. A core module referenced by
+    half the suite would turn every mutant into a full run, so that case is
+    reported as not mutated, with the reason, instead of eating the budget.
+    """
+    module_files = _module_references(function.path, texts)
+    if not module_files:
+        return [], "ни один тест не ссылается на файл"
+    short = function.name.rsplit(".", 1)[-1]
+    named = re.compile(rf"\b{re.escape(short)}\b")
+    by_name = [f for f in module_files if named.search(texts[f])]
+    chosen = by_name or module_files
+    if len(chosen) > limit:
+        how = "называют функцию" if by_name else "ссылаются на файл"
+        return [], f"{len(chosen)} тестовых файлов {how} — шире предела {limit}"
+    return chosen, ""
 
 
 def _test_command(test_files: Iterable[Path], repo: Path) -> str:
@@ -219,16 +242,24 @@ def _test_command(test_files: Iterable[Path], repo: Path) -> str:
     )
 
 
-def run_baseline(command: str, repo: Path) -> tuple[int, float, str]:
-    """Run the selected tests unmutated. Returns (rc, seconds, output tail)."""
+def run_baseline(command: str, repo: Path, timeout: float) -> tuple[int, float, str]:
+    """Run the selected tests unmutated. Returns (rc, seconds, output tail).
+
+    A baseline that outlives ``timeout`` is reported as rc -1: it did not end
+    green, so nothing may be concluded from mutants.
+    """
     started = time.monotonic()
-    proc = subprocess.run(  # nosec B603 - the repository's own test command
-        shlex.split(command),
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        env=_no_bytecode_env(),
-    )
+    try:
+        proc = subprocess.run(  # nosec B603 - the repository's own test command
+            shlex.split(command),
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            env=_no_bytecode_env(),
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return -1, time.monotonic() - started, f"таймаут {timeout:.0f} с"
     return (
         proc.returncode,
         time.monotonic() - started,
@@ -268,6 +299,11 @@ def _collect_targets(
     repo: Path, base: str, tests_dir: Path, report: Report, scratch: Path
 ) -> list[_Target]:
     merge_base = _git(repo, "merge-base", base, "HEAD").strip()
+    test_root = repo / tests_dir
+    texts = {
+        f: f.read_text(encoding="utf-8", errors="replace")
+        for f in (sorted(test_root.rglob("test_*.py")) if test_root.is_dir() else [])
+    }
     diff = _git(repo, "diff", "-U0", "--no-color", merge_base, "HEAD", "--", "*.py")
     targets: list[_Target] = []
     for index, (path, lines) in enumerate(sorted(touched_lines(diff).items())):
@@ -279,12 +315,14 @@ def _collect_targets(
         if not changed:
             continue
         report.functions.extend(f.key for f in changed)
-        test_files = tests_for(path, repo / tests_dir)
-        if not test_files:
-            report.untested.extend(f.key for f in changed)
-            continue
-        mutations = _mutations_for(path, scratch / f"session-{index}.sqlite")
+        mutations: list | None = None
         for function in changed:
+            test_files, why_not = tests_for(function, texts)
+            if not test_files:
+                report.untested.append(f"{function.key}: {why_not}")
+                continue
+            if mutations is None:
+                mutations = _mutations_for(path, scratch / f"session-{index}.sqlite")
             mine = [
                 m for m in mutations if innermost(functions, m.start_pos[0]) == function
             ]
@@ -371,13 +409,11 @@ def _analyse_targets(
         return
     if not targets:
         report.state = STATE_NO_TESTS
-        report.reason = (
-            "ни на один файл с изменёнными функциями не ссылается ни один тест"
-        )
+        report.reason = "ни у одной изменённой функции нет тестов, которыми её судить"
         return
     test_files = sorted({f for t in targets for f in t.test_files})
     command = _test_command(test_files, repo)
-    rc, seconds, tail = run_baseline(command, repo)
+    rc, seconds, tail = run_baseline(command, repo, budget)
     if rc != 0:
         report.state = STATE_BASELINE_RED
         report.reason = (
@@ -387,7 +423,7 @@ def _analyse_targets(
         return
     timeout = max(MIN_MUTANT_TIMEOUT, 3 * seconds)
     report.state = STATE_RAN
-    _run_series(repo, targets, timeout, budget, report)
+    _run_series(repo, targets, timeout, max(0.0, budget - seconds), report)
 
 
 def format_report(report: Report) -> str:
@@ -401,10 +437,8 @@ def format_report(report: Report) -> str:
             f"Изменённые функции ({len(report.functions)}): {', '.join(report.functions)}"
         )
     if report.untested:
-        lines.append(
-            f"Без тестов, ссылающихся на файл — не мутировались ({len(report.untested)}): "
-            f"{', '.join(report.untested)}"
-        )
+        lines.append(f"Не мутировались ({len(report.untested)}):")
+        lines.extend(f"  {entry}" for entry in report.untested)
     if report.state != STATE_RAN:
         lines.append(f"Состояние: {report.state} — {report.reason}")
         return "\n".join(lines)
@@ -447,6 +481,9 @@ def main(argv: list[str] | None = None) -> int:
         "--json-out", metavar="FILE", help="also write the report as JSON"
     )
     args = parser.parse_args(argv)
+    # A CI step timeout sends SIGTERM. Turning it into SystemExit lets the
+    # snapshot restore in analyse() run, so no mutant is left on disk.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
     report = analyse(
         Path(args.repo),
