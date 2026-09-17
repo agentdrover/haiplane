@@ -3031,7 +3031,7 @@ async def _store_report(
             expected_generation=int(dispatch["submission_generation"]),
         )
     except HTTPException as exc:
-        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        detail: dict[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}
         if detail.get("reason") != _GENERATION_MOVED:
             log.exception("could not record the report recovered for task #%s", task_id)
             return _REPORT_NOT_STORED
