@@ -22,6 +22,7 @@ from hub.models import STEWARD_GROUND_SOURCES, ACVerifiableBy, AcceptanceCriteri
 from hub.services import steward_dor_packet
 from hub.services.steward_dor_packet import (
     ABSENT,
+    AUTHOR_TEXT,
     BRIEF_UNAVAILABLE,
     DRAFT_GROUND_SOURCES,
     LOCATOR_NO_LOCATOR,
@@ -41,8 +42,12 @@ from hub.services.steward_dor_packet import (
 )
 from hub.services.steward_evidence import (
     QUOTE_AC_TEST_REF,
+    QUOTE_AC_TEXT,
     QUOTE_DECLARED_AREA,
     QUOTE_RISK_CLASS_REASON,
+    QUOTE_SCOPE_IN,
+    QUOTE_SCOPE_OUT,
+    QUOTE_SIZE,
     QUOTE_TASK_STATEMENT,
 )
 from hub.services.test_existence import (
@@ -1107,3 +1112,204 @@ def test_every_task_column_the_packet_reads_is_in_the_stamp():
 
     covered = set(STATEMENT_FIELDS) | set(PACKET_TASK_COLUMNS)
     assert read <= covered, read - covered
+
+
+# ---------------------------------------------------------------------------
+# Текст постановки, который стюард читает как техлид (решение владельца 17.09)
+# ---------------------------------------------------------------------------
+#
+# Спека §6.2 велит стюарду на драфте судить о проверяемости критериев,
+# заявленном охвате и честности размера. Фактом ни одно из трёх не выражается:
+# это слова автора. Поэтому они едут ЦИТАТАМИ тем же ``quote()``, что и
+# описание (#1076), с пометкой «текст автора», и в закрытый набор фактов не
+# проникают (§3: факты пакета перепроверяемы, цитаты — нет).
+
+_TEXT_QUOTE_SOURCES = (QUOTE_AC_TEXT, QUOTE_SCOPE_IN, QUOTE_SCOPE_OUT, QUOTE_SIZE)
+
+
+async def _authored_statement(
+    db: aiosqlite.Connection,
+    clone: Path,
+    *,
+    title: str,
+    scope_in: list[str],
+    scope_out: list[str],
+    size: str,
+    given: str = "драфт с критерием",
+    when: str = "собирается пакет",
+    then: str = "критерий виден стюарду",
+) -> int:
+    task_id = await _draft(db, clone, title=title, description="обычная постановка")
+    await repo.update_task(
+        db,
+        task_id,
+        scope_in=json.dumps(scope_in, ensure_ascii=False),
+        scope_out=json.dumps(scope_out, ensure_ascii=False),
+        size=size,
+    )
+    await db.commit()
+    await repo.add_acceptance_criterion(
+        db,
+        task_id,
+        AcceptanceCriterion(
+            id="AC-1",
+            given=given,
+            when=when,
+            then=then,
+            verifiable_by=ACVerifiableBy("test"),
+            test_ref="tests/test_x.py::test_present",
+        ),
+    )
+    await db.commit()
+    return task_id
+
+
+def _by_source(packet, source: str) -> list[str]:
+    return [q.text for q in packet.quotes if q.source == source]
+
+
+async def test_criteria_scope_and_size_travel_as_author_quotes(
+    db: aiosqlite.Connection, clone: Path, collection
+):
+    """Текст AC, scope_in, scope_out и size доезжают до стюарда — цитатами.
+
+    Без них три пункта §6.2 из семи стюарду не доезжали ничем, а пакет —
+    единственный вход (#1075). Но доезжают они как слова автора, а не как
+    наблюдения хаба: каждая цитата несёт свой источник и пометку
+    ``author_text``, по которой судья отличает её от факта.
+    """
+    task_id = await _authored_statement(
+        db,
+        clone,
+        title="authored statement text",
+        scope_in=["охват-внутри-1", "охват-внутри-2"],
+        scope_out=["охват-вне-1"],
+        size="M",
+        given="дано-метка",
+        when="когда-метка",
+        then="тогда-метка",
+    )
+
+    packet = await build_draft_packet(db, task_id)
+
+    assert packet is not None
+    ac_text = _by_source(packet, QUOTE_AC_TEXT)
+    assert len(ac_text) == 1, ac_text
+    for part in ("AC-1", "дано-метка", "когда-метка", "тогда-метка"):
+        assert part in ac_text[0], (part, ac_text)
+    assert _by_source(packet, QUOTE_SCOPE_IN) == ["охват-внутри-1", "охват-внутри-2"]
+    assert _by_source(packet, QUOTE_SCOPE_OUT) == ["охват-вне-1"]
+    assert _by_source(packet, QUOTE_SIZE) == ["M"]
+    # Автор у цитаты тот же, что у описания, — а не «хаб».
+    for q in packet.quotes:
+        if q.source in _TEXT_QUOTE_SOURCES:
+            assert q.author == "pda_claude"
+
+    payload = draft_packet_payload(packet)
+    text_quotes = [q for q in payload["quotes"] if q["source"] in _TEXT_QUOTE_SOURCES]
+    assert {q["source"] for q in text_quotes} == set(_TEXT_QUOTE_SOURCES)
+    # Пометка на КАЖДОЙ цитате, а не на примере: судья отличает текст автора
+    # от перепроверенного факта по полю, а не по месту в JSON.
+    assert AUTHOR_TEXT == "author_text"
+    for q in payload["quotes"]:
+        assert q["kind"] == AUTHOR_TEXT, q
+    for fact in payload["facts"].values():
+        assert fact.get("kind") != AUTHOR_TEXT
+
+
+async def test_empty_scope_and_size_are_not_quoted_as_empty_text(
+    db: aiosqlite.Connection, clone: Path, collection
+):
+    """Пустое поле не становится цитатой пустой строки (#762)."""
+    task_id = await _draft(db, clone, title="no scope no size")
+
+    packet = await build_draft_packet(db, task_id)
+
+    assert packet is not None
+    for source in (QUOTE_SCOPE_IN, QUOTE_SCOPE_OUT, QUOTE_SIZE, QUOTE_AC_TEXT):
+        assert _by_source(packet, source) == [], source
+
+
+@pytest.mark.parametrize(
+    "field,quote_source",
+    [
+        ("given", QUOTE_AC_TEXT),
+        ("then", QUOTE_AC_TEXT),
+        ("scope_in", QUOTE_SCOPE_IN),
+        ("scope_out", QUOTE_SCOPE_OUT),
+        ("size", QUOTE_SIZE),
+    ],
+)
+async def test_statement_text_quotes_meet_the_injection_check(
+    db: aiosqlite.Connection, clone: Path, collection, field: str, quote_source: str
+):
+    """#1076 и для новых цитат: приказ судье в AC, охвате или размере виден.
+
+    Признак ``injection_suspected`` — утверждение хаба «я посмотрел на чужие
+    слова». Цитата, прошедшая мимо ``quote()``, сделала бы его ложным.
+    """
+    task_id = await _authored_statement(
+        db,
+        clone,
+        title=f"ordered {field}",
+        scope_in=[_ORDER] if field == "scope_in" else ["охват"],
+        scope_out=[_ORDER] if field == "scope_out" else ["вне"],
+        size=_ORDER if field == "size" else "M",
+        given=_ORDER if field == "given" else "дано",
+        then=_ORDER if field == "then" else "тогда",
+    )
+
+    packet = await build_draft_packet(db, task_id)
+
+    assert packet is not None
+    assert packet.injection_suspected is True
+    assert "frame_impersonation" in packet.injection_signals
+    suspected = [q for q in packet.quotes if q.suspected]
+    assert [q.source for q in suspected] == [quote_source]
+    payload = draft_packet_payload(packet)
+    assert payload["injection_suspected"] is True
+    flagged = [q for q in payload["quotes"] if q["signals"]]
+    assert [q["kind"] for q in flagged] == [AUTHOR_TEXT]
+
+
+async def test_statement_text_quotes_do_not_enter_the_closed_fact_set(
+    db: aiosqlite.Connection, clone: Path, collection
+):
+    """Цитаты не проникают в факты — перечислением закрытого набора.
+
+    Набор фактов драфта перечислен здесь поимённо. Текст критериев, охвата и
+    размера не заводит в нём ни нового источника, ни строки внутри старого:
+    §3 спеки — факт перепроверяем, цитата нет, и смешать их значит выдать
+    слова автора за вычисление хаба.
+    """
+    mark = "ТЕКСТ-АВТОРА"
+    task_id = await _authored_statement(
+        db,
+        clone,
+        title="quotes stay quotes",
+        scope_in=[f"{mark}-внутри"],
+        scope_out=[f"{mark}-вне"],
+        size=f"{mark}-размер",
+        given=f"{mark}-дано",
+        when=f"{mark}-когда",
+        then=f"{mark}-тогда",
+    )
+
+    packet = await build_draft_packet(db, task_id)
+
+    assert packet is not None
+    closed = {"ac_locator", "diff_vs_areas", "risk_class", "dependency_state"}
+    assert set(packet.facts) == closed
+    payload = draft_packet_payload(packet)
+    assert set(payload["facts"]) == closed
+    assert set(payload["absent_sources"]) <= closed
+    for source in _TEXT_QUOTE_SOURCES:
+        assert source not in STEWARD_GROUND_SOURCES, source
+        assert source not in payload["facts"], source
+    leaked = [s for s in _strings(payload["facts"]) if mark in s]
+    assert leaked == [], leaked
+    leaked_readiness = [s for s in _strings(payload["readiness"]) if mark in s]
+    assert leaked_readiness == [], leaked_readiness
+    # А в цитатах метка есть — иначе тест зеленел бы на пакете без текста.
+    quoted = [q["text"] for q in payload["quotes"] if mark in q["text"]]
+    assert len(quoted) == 4, quoted

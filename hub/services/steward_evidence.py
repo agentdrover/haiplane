@@ -598,6 +598,15 @@ QUOTE_DECLARED_AREA = "declared_area"
 # предложение целиком: резать хабовскую рамку от авторской вставки значило бы
 # завести второй разбор той же строки.
 QUOTE_RISK_CLASS_REASON = "risk_class_reason"
+# Текст постановки, который стюард на драфте читает как техлид (§6.2 спеки,
+# решение владельца по #1158 от 17.09): формулировки критериев, заявленный
+# охват и размер. Фактом ни одно из них не является — хаб не может их
+# перепроверить (§3), — поэтому они едут цитатами, как описание, и проходят ту
+# же проверку на приказ судье.
+QUOTE_AC_TEXT = "ac_text"
+QUOTE_SCOPE_IN = "scope_in"
+QUOTE_SCOPE_OUT = "scope_out"
+QUOTE_SIZE = "size"
 
 # Each signal is (code, matcher). Two shapes only, both about ADDRESSING the
 # judge — not about tone, not about imperatives in general. A statement telling

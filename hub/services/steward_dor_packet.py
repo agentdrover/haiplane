@@ -42,10 +42,17 @@
 (#1076), с автором и признаком ``injection_suspected``, и никогда не
 смешивается с полями, которые читаются как факты хаба.
 
-Чего здесь НЕТ намеренно: текста самих критериев. Пакет сообщает СОСТОЯНИЕ
-критериев — существуют, локатор такой-то, — а оценка формулировок это
-суждение стюарда, а не факт пакета. И решений по фактам здесь тоже нет:
-чего не одобрять ни при каком классе — привратник #1159.
+Текст критериев, заявленный охват (``scope_in``/``scope_out``) и размер едут
+тоже — но ЦИТАТАМИ, а не фактами (решение владельца от 17.09 по находке P1
+сдачи 4). Спека §6.2 велит стюарду судить о проверяемости AC, охвате и
+честности размера, а пакет — единственный его вход; без этих слов три пункта
+из семи не доезжали ничем. Фактами они при этом не становятся: хаб не может
+их перепроверить (§3), и оценка формулировок остаётся суждением стюарда. В
+payload каждая цитата помечена ``kind=author_text``, и ``injection_suspected``
+считается по ним так же, как по описанию.
+
+Решений по фактам здесь нет: чего не одобрять ни при каком классе —
+привратник #1159.
 """
 
 from __future__ import annotations
@@ -66,8 +73,12 @@ from hub.services.steward_evidence import (
     NO_STORED_CLASS,
     PRESENT,
     QUOTE_AC_TEST_REF,
+    QUOTE_AC_TEXT,
     QUOTE_DECLARED_AREA,
     QUOTE_RISK_CLASS_REASON,
+    QUOTE_SCOPE_IN,
+    QUOTE_SCOPE_OUT,
+    QUOTE_SIZE,
     QUOTE_TASK_STATEMENT,
     EvidenceFact,
     QuotedText,
@@ -110,6 +121,11 @@ QUOTED_STATEMENT_COLUMNS: tuple[str, ...] = (
     "user_story",
     "problem_statement",
 )
+
+# Пометка каждой цитаты в payload: это текст АВТОРА, а не наблюдение хаба.
+# Факт пакета хаб может пересчитать, цитату — нет (§3 спеки), и судья должен
+# различать их по полю, а не по тому, в каком разделе JSON строка лежит.
+AUTHOR_TEXT = "author_text"
 
 # Колонки задачи, которые пакет ОТДАЁТ стюарду и которых нет в отпечатке
 # постановки #1156. ``statement_fingerprint`` считает ревизии ПОСТАНОВКИ и
@@ -447,8 +463,18 @@ def _draft_risk_fact(task: dict[str, Any]) -> EvidenceFact:
     )
 
 
+def _ac_text(row: dict[str, Any]) -> str:
+    """Формулировка одного критерия одной строкой — как её набрал автор."""
+    return (
+        f"{row.get('ac_id') or '?'} — given: {row.get('given') or ''}; "
+        f"when: {row.get('when_clause') or ''}; then: {row.get('then_clause') or ''}"
+    )
+
+
 def _authored_texts(
-    task: dict[str, Any], ac_fact: EvidenceFact
+    task: dict[str, Any],
+    ac_fact: EvidenceFact,
+    criteria: list[dict[str, Any]] | None = None,
 ) -> list[tuple[str, str]]:
     """Каждая строка пакета, которую набрал АВТОР, а не вычислил хаб.
 
@@ -481,6 +507,22 @@ def _authored_texts(
         text = (task.get(column) or "").strip()
         if text:
             out.append((QUOTE_TASK_STATEMENT, text))
+    # Текст постановки, который стюард читает как техлид (§6.2): формулировки
+    # критериев, охват и размер. Цитаты, не факты — хаб их не перепроверит.
+    for row in criteria or []:
+        if any(
+            (row.get(k) or "").strip() for k in ("given", "when_clause", "then_clause")
+        ):
+            out.append((QUOTE_AC_TEXT, _ac_text(row)))
+    for item in deserialize_str_list(task.get("scope_in")):
+        if item.strip():
+            out.append((QUOTE_SCOPE_IN, item))
+    for item in deserialize_str_list(task.get("scope_out")):
+        if item.strip():
+            out.append((QUOTE_SCOPE_OUT, item))
+    size = str(task.get("size") or "").strip()
+    if size:
+        out.append((QUOTE_SIZE, size))
     # Ниже цитируется РОВНО то значение, которое лежит в факте, — не
     # обрезанное и не нормализованное. Цитата, отличающаяся от факта хотя бы
     # пробелом, перестаёт быть цитатой ИМЕННО этой строки, и «текст проверен»
@@ -500,17 +542,21 @@ def _authored_texts(
 
 
 def _statement_quotes(
-    task: dict[str, Any], ac_fact: EvidenceFact
+    task: dict[str, Any],
+    ac_fact: EvidenceFact,
+    criteria: list[dict[str, Any]] | None = None,
 ) -> tuple[QuotedText, ...]:
     """Чужие слова — как слова, с автором и с признаками (#1076).
 
-    Текст критериев (given/when/then) сюда не входит намеренно: пакет
-    сообщает СОСТОЯНИЕ критериев, а не их формулировки, и в фактах их нет —
-    значит и цитировать нечего.
+    Формулировки критериев входят сюда с 17.09 (решение владельца): факт
+    ``ac_locator`` сообщает их СОСТОЯНИЕ, цитата ``ac_text`` — что автор
+    написал. Критерии читаются строками таблицы, а не из брифа: бриф может не
+    собраться (``BRIEF_UNAVAILABLE``), а слова автора от этого не исчезают.
     """
     author = (task.get("assigned_agent") or task.get("source") or "").strip()
     return tuple(
-        quote(source, author, text) for source, text in _authored_texts(task, ac_fact)
+        quote(source, author, text)
+        for source, text in _authored_texts(task, ac_fact, criteria)
     )
 
 
@@ -687,6 +733,7 @@ async def _assemble(
     task = dict(row)
 
     ac_fact = await _ac_locator_from_brief(db, task_id)
+    criteria = [dict(r) for r in await repo.list_acceptance_criteria(db, task_id)]
     facts = {
         f.source: f
         for f in [
@@ -701,7 +748,7 @@ async def _assemble(
         statement_generation=int(task.get("statement_generation") or 0),
         facts=facts,
         readiness=_readiness(task),
-        quotes=_statement_quotes(task, ac_fact),
+        quotes=_statement_quotes(task, ac_fact, criteria),
         revision={**stamp, "stable": True},
     )
 
@@ -727,6 +774,8 @@ def draft_packet_payload(packet: DraftEvidencePacket) -> dict[str, Any]:
         "stable": packet.stable,
         "quotes": [
             {
+                # Текст автора, а не наблюдение хаба (§3): перепроверить нельзя.
+                "kind": AUTHOR_TEXT,
                 "source": q.source,
                 "author": q.author,
                 "text": q.text,
@@ -741,6 +790,7 @@ def draft_packet_payload(packet: DraftEvidencePacket) -> dict[str, Any]:
 
 __all__ = [
     "ABSENT",
+    "AUTHOR_TEXT",
     "BRIEF_UNAVAILABLE",
     "DRAFT_GROUND_SOURCES",
     "LOCATOR_NOT_TEST_BOUND",
