@@ -160,6 +160,38 @@ async def test_typo_in_a_budget_key_is_a_failure_not_a_silent_no_op():
     assert "never applied" in format_report(result)
 
 
+def test_the_budget_names_the_headroom_it_leaves():
+    """AC-1 (#1241): the printed report must say the remaining room as a
+    NUMBER of characters, for every ceiling, in a catalog that PASSES —
+    not only a percentage, and not only when something is already over.
+
+    A percentage alone does not answer the question an author actually has
+    before starting work — "does a ~90-character parameter fit under THIS
+    ceiling" — and #1155/#1236/#1215 each hit that gap the same day (2026-09-
+    09), one of them by raising a ceiling that had 5 characters of room left
+    with nothing in the report saying so in absolute terms. Existing coverage
+    (test_report_names_remaining_headroom) only checks the DATA has a
+    ``remaining`` field and that the phrase "of headroom spent" appears — it
+    does not check that the absolute count is actually printed, and a report
+    that dropped the number while keeping the percentage passed every test in
+    this file before this one was added.
+    """
+    snapshot = _fake_catalog({"hub_a": 100, "hub_b": 100})
+    measured = {key: snapshot[key] for key in BUDGET_KEYS}
+    ceilings = {key: int(value * 1.5) for key, value in measured.items()}
+
+    result = check_budget(snapshot, ceilings, {}, measured)
+    assert result["ok"], "given: a catalog state that passes the check"
+    report = format_report(result)
+
+    for row in result["headroom"]:
+        assert f"{row['metric']}" in report and f"{row['remaining']} left" in report, (
+            f"{row['metric']}: the report must print how many characters are "
+            "left under this ceiling as a number, not only as a percentage — "
+            "a reader deciding whether a new parameter fits needs the count"
+        )
+
+
 def test_report_names_remaining_headroom():
     """AC-3 (#829): slack nobody watches is how a check stops checking.
 
