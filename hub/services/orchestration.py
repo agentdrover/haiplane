@@ -2944,20 +2944,42 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
         # Merged, but never silently: the alert is the whole difference
         # between "we looked" and "we could not look".
         await repo.add_task_update(
-            db,
-            task["id"],
-            "hub",
-            "alert",
-            f"Стопку веток подтвердить не удалось ({assessment.reason}) — "
-            f"доставка идёт без этой проверки. Это НЕ значит, что стопки нет: "
-            f"значит, что ответа, на который можно опереться, хаб не получил. "
-            f"Плагин мог и проверить — старое «да/нет» просто не различает "
-            f"«проверил, независимы» и «проверить не смог», и опираться на "
-            f"такое «нет» перед необратимым мержем нельзя. Если ветка "
-            f"отведена от чужой несмерженной ветки, её работа уедет в базовую "
-            f"ветку под номером этой задачи (#1186).",
+            db, task["id"], "hub", "alert", _unchecked_stack_alert(assessment)
         )
     return ""
+
+
+def _unchecked_stack_alert(assessment: "StackAssessment") -> str:
+    """The alert a merge without a stack answer leaves behind (#1186, #1204).
+
+    Two different facts reach it. A plugin that cannot probe gave no answer
+    at all. A closed base whose branch is gone DID answer — origin said the
+    branch is not there — so the generic «хаб не получил ответа… плагин мог и
+    проверить» would be the same kind of false statement Cursor #385 found in
+    the stranded texts (#1204, Cursor #391, d560bd210dee88dc).
+    """
+    from hub.services.delivery_state import PR_CLOSED
+
+    if assessment.base_delivery_state == PR_CLOSED:
+        return (
+            f"Стопку веток проверить нечем ({assessment.reason}) — доставка "
+            f"идёт без этой проверки. Проба ответила: ветки задачи "
+            f"#{assessment.base_task_id} на origin нет, а её PR закрыт без "
+            f"мержа, то есть работу свернули и сравнивать эту ветку не с чем. "
+            f"Если эта ветка всё же была отведена от неё, свёрнутые коммиты "
+            f"уедут в базовую ветку под номером этой задачи — их видно в "
+            f"диффе этой задачи (#1204)."
+        )
+    return (
+        f"Стопку веток подтвердить не удалось ({assessment.reason}) — "
+        f"доставка идёт без этой проверки. Это НЕ значит, что стопки нет: "
+        f"значит, что ответа, на который можно опереться, хаб не получил. "
+        f"Плагин мог и проверить — старое «да/нет» просто не различает "
+        f"«проверил, независимы» и «проверить не смог», и опираться на "
+        f"такое «нет» перед необратимым мержем нельзя. Если ветка "
+        f"отведена от чужой несмерженной ветки, её работа уедет в базовую "
+        f"ветку под номером этой задачи (#1186)."
+    )
 
 
 # #951: the two gate refusals that mean "ask again in a minute", not "ask a

@@ -871,6 +871,11 @@ async def test_a_closed_base_whose_branch_is_gone_does_not_hold_the_project(
     assert f"#{base_id}" in body and dead in body, (
         "мерж не молчаливый: алерт называет, что проверить было нечем"
     )
+    # Cursor #391 (d560bd210dee88dc): проба ОТВЕТИЛА (ветки нет), и алерт не
+    # говорит «хаб не получил ответа» / «плагин мог и проверить».
+    assert "Плагин мог и проверить" not in body, body
+    assert "ответа, на который можно опереться, хаб не получил" not in body, body
+    assert "PR закрыт без мержа" in body, body
 
 
 async def test_a_closed_gone_base_does_not_mask_a_plain_unknown(
