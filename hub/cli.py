@@ -419,21 +419,56 @@ def cmd_approve_batch(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Текст отказа на неразбираемых исходах — один на все команды, которые их
+#: принимают (#1155). Формулировка тоже одна: автор, увидевший разные слова на
+#: сдаче и на отчёте, ищет разницу в поведении, которой нет.
+FINDING_OUTCOMES_JSON_ERROR = "--finding-outcomes is not valid JSON"
+
+
+def _put_finding_outcomes(body: dict[str, Any], args: argparse.Namespace) -> bool:
+    """Положить исходы находок в тело запроса; False — отказ уже напечатан.
+
+    Отказ, а не тихая отправка без них: сдача, молча потерявшая исходы,
+    выглядит как автор, который не ответил, — та самая тишина, ради которой
+    поле и заведено (#911).
+
+    Общая на submit-review и update, потому что это ОДНО поле одного контракта:
+    два разбора разошлись бы ровно так, как расходятся поверхности (#819).
+    """
+    raw = getattr(args, "finding_outcomes", "") or ""
+    if not raw.strip():
+        return True
+    try:
+        body["finding_outcomes"] = json.loads(raw)
+    except ValueError as exc:
+        print(f"{FINDING_OUTCOMES_JSON_ERROR}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def _finding_outcomes_option(parser: argparse.ArgumentParser) -> None:
+    """Один и тот же ключ у сдачи и у отчёта о готовности (#911, #1155)."""
+    parser.add_argument(
+        "--finding-outcomes",
+        default="",
+        help=(
+            "JSON list of what became of the previous submission's findings "
+            '(#911): [{"finding_uid": "...", "outcome": "...", "note": "..."}]'
+            ". Confirmed findings take fixed|false_positive|wont_fix|deferred;"
+            " ones no adjudicator resolved take real_fixed|real_deferred|"
+            "not_a_defect|not_judged (#1085). Everything but a fix owes a note."
+        ),
+    )
+
+
 def cmd_submit_review(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {}
     if args.agent:
         body["agent"] = args.agent
     if args.summary:
         body["summary"] = args.summary
-    raw_outcomes = getattr(args, "finding_outcomes", "") or ""
-    if raw_outcomes.strip():
-        try:
-            body["finding_outcomes"] = json.loads(raw_outcomes)
-        except ValueError as exc:
-            # Refusing here beats sending nothing: a submission that silently
-            # dropped the outcomes would look like an author who never answered.
-            print(f"--finding-outcomes is not valid JSON: {exc}", file=sys.stderr)
-            return 2
+    if not _put_finding_outcomes(body, args):
+        return 2
     result = _api("POST", f"/api/tasks/{args.task_id}/submit-review", body)
     _print_json(result)
     return 0
@@ -559,15 +594,17 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_update(args: argparse.Namespace) -> int:
-    result = _api(
-        "POST",
-        f"/api/tasks/{args.task_id}/updates",
-        {
-            "agent": args.agent or "",
-            "kind": args.kind,
-            "content": args.message,
-        },
-    )
+    body: dict[str, Any] = {
+        "agent": args.agent or "",
+        "kind": args.kind,
+        "content": args.message,
+    }
+    # #1155: отказ ДО запроса. Отправить отчёт без исходов и вернуть 0 значило
+    # бы записать в ленту готовность, потеряв ответ про находки, — и автор
+    # узнал бы об этом только от гейта на следующей сдаче.
+    if not _put_finding_outcomes(body, args):
+        return 2
+    result = _api("POST", f"/api/tasks/{args.task_id}/updates", body)
     _print_json(result)
     return 0
 
@@ -1036,14 +1073,47 @@ def cmd_delivery_ack(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delivery_observe(args: argparse.Namespace) -> int:
+    """Закрыть строку реестра наблюдённым фактом доставки (#1215).
+
+    Единственный CLI-вход к ``POST .../observation`` (находка ревью Codex,
+    сдача 2): ``undelivered`` советует замёрзшей unknown-строке «записать
+    наблюдение», а команды, которая отправила бы probe/observation/sha,
+    раньше не существовало — оператору с одним только CLI предложенный выход
+    был недоступен.
+    """
+    _api(
+        "POST",
+        f"/api/delivery/discrepancies/{int(args.task_id)}/observation",
+        {"probe": args.probe, "observation": args.observation, "sha": args.sha},
+    )
+    print(
+        f"#{args.task_id}: строка закрыта наблюдением — коммит {args.sha}.\n"
+        "Прежний ответ реестра остался историей; задача не тронута."
+    )
+    return 0
+
+
 def cmd_undelivered(args: argparse.Namespace) -> int:
-    """Completed tasks whose PR is neither merged nor closed (#897)."""
+    """Completed tasks whose PR is neither merged nor closed (#897).
+
+    ЧЕТЫРЕ ВЕДРА, НЕ ДВА (#1215, находка d7b46ff7). Тот же ответ API читает
+    MCP, и он печатает все четыре; человеческий путь обходил только открытые
+    PR и unknown. После того как наблюдение закрывало строку, оператор видел
+    одну фразу — «No completed task is waiting on an open PR» — то есть
+    «проверено, чисто» там, где на самом деле «закрыто чужим наблюдением, вот
+    кем и по какому коммиту». Пустой текст, читающийся как штамп, — ровно та
+    подмена, против которой написан весь этот механизм; молчать о ней в CLI и
+    говорить в MCP значит иметь два разных ответа на один вопрос.
+    """
     result = _api("GET", f"/api/delivery/discrepancies?limit={int(args.limit)}")
     if args.json:
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     rows = result.get("undelivered") or []
-    if not rows:
+    unknown = result.get("unknown") or []
+    observed = result.get("closed_by_observation") or []
+    if not rows and not unknown and not observed:
         print("No completed task is waiting on an open PR.")
     for row in rows:
         print(
@@ -1058,8 +1128,53 @@ def cmd_undelivered(args: argparse.Namespace) -> int:
             )
     # Printed apart, and printed even when the list above is empty: an answer
     # the hub could not get is not a discrepancy, but it is also not nothing.
-    for row in result.get("unknown") or []:
+    for row in unknown:
         print(f"#{row['task_id']} — не проверено: {row.get('reason', '')}")
+    # Строка за краем окна свипа застыла на последнем ответе источников, и
+    # узнавать об этом по неподвижному checked_at читатель не обязан (#1215).
+    #
+    # РАЗДЕЛЕНО ПО СОСТОЯНИЮ (находка ревью #1215, 7be892476f84f99c): запись
+    # наблюдения принимает ТОЛЬКО unknown, источник pr_open отвечает и
+    # эндпоинт честно отказывает 422 source_still_answers. Общий баннер
+    # предлагал этот выход и замёрзшим pr_open-строкам, для которых его нет.
+    frozen_unknown = [r for r in unknown if r.get("still_swept") is False]
+    frozen_pr_open = [r for r in rows if r.get("still_swept") is False]
+    if frozen_unknown:
+        print(
+            f"\n{len(frozen_unknown)} строк(и) старше окна свипа "
+            f"({result.get('sweep_lookback_days', '?')} дней): источники больше "
+            f"не перепрашиваются, ответ застыл. Выход — записать наблюдение: "
+            f"оно окна не спрашивает."
+        )
+        for row in frozen_unknown:
+            print(f"    #{row['task_id']} — {row.get('age_hours', '?')}ч")
+    if frozen_pr_open:
+        print(
+            f"\n{len(frozen_pr_open)} строк(и) старше окна свипа "
+            f"({result.get('sweep_lookback_days', '?')} дней) с открытым PR: "
+            f"источники больше не перепрашиваются, ответ застыл. Наблюдением "
+            f"эту строку не закрыть — источник ещё отвечает. Выход — довезти "
+            f"работу или признать расхождение законным с причиной."
+        )
+        for row in frozen_pr_open:
+            print(f"    #{row['task_id']} — {row.get('age_hours', '?')}ч")
+    # Закрытая наблюдением строка ушла из списка расхождений, но не из виду:
+    # видно, что доставку подтвердил человек или агент, а не установил хаб.
+    if observed:
+        print(
+            f"\n{len(observed)} строк(и) закрыты НАБЛЮДЕНИЕМ, а не хабом — "
+            f"прежний ответ реестра остаётся историей:"
+        )
+        for row in observed:
+            print(
+                f"#{row['task_id']} {row.get('title', '')} — наблюдал "
+                f"{row.get('observed_by', '?')} в коммите "
+                f"{row.get('observed_sha', '?')}; закрыт факт "
+                f"«{row.get('state', '?')}»"
+            )
+            print(f"    было: {row.get('reason', '')}")
+            print(f"    проверял: {row.get('observed_probe', '')}")
+            print(f"    увидел: {row.get('observed_evidence', '')}")
     return 0
 
 
@@ -1558,17 +1673,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_submit_review.add_argument(
         "--summary", default="", help="Short note on what is being submitted"
     )
-    p_submit_review.add_argument(
-        "--finding-outcomes",
-        default="",
-        help=(
-            "JSON list of what became of the previous submission's findings "
-            '(#911): [{"finding_uid": "...", "outcome": "...", "note": "..."}]'
-            ". Confirmed findings take fixed|false_positive|wont_fix|deferred;"
-            " ones no adjudicator resolved take real_fixed|real_deferred|"
-            "not_a_defect|not_judged (#1085). Everything but a fix owes a note."
-        ),
-    )
+    _finding_outcomes_option(p_submit_review)
     p_submit_review.set_defaults(func=cmd_submit_review)
 
     p_review_brief = sub.add_parser(
@@ -1735,6 +1840,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["status", "report", "blocker", "done", "review", "arbitration"],
         help="Update type",
     )
+    _finding_outcomes_option(p_update)
     p_update.set_defaults(func=cmd_update)
 
     # updates — list updates
@@ -2162,6 +2268,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Почему это законно. Без причины признание было бы выключателем",
     )
     p_delivery_ack.set_defaults(func=cmd_delivery_ack)
+
+    p_delivery_observe = sub.add_parser(
+        "delivery-observe",
+        help="Закрыть строку реестра доставки наблюдённым фактом (#1215)",
+    )
+    p_delivery_observe.add_argument("task_id", type=int)
+    p_delivery_observe.add_argument(
+        "--probe", required=True, help="Что запускали или запрашивали"
+    )
+    p_delivery_observe.add_argument(
+        "--observation", required=True, help="Что увидели в результате"
+    )
+    p_delivery_observe.add_argument(
+        "--sha", required=True, help="Коммит, в котором видели работу"
+    )
+    p_delivery_observe.set_defaults(func=cmd_delivery_observe)
 
     p_health = sub.add_parser(
         "health", help="Show Hub bind/auth/vast configuration (no secrets)"

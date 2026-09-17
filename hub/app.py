@@ -25,7 +25,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from hub import brand, config, models, services
+from hub import brand, config, models, services, skill_publish
 from hub import db as db_module
 from hub import repository as repo
 from hub.db import get_db, log_activity, write_transaction
@@ -34,6 +34,7 @@ from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
     DeliveryAcknowledgement,
+    DeliveryObservation,
     DeployCallback,
     DeployView,
     ProdStateView,
@@ -133,6 +134,7 @@ from hub.auth import (
     verify_csrf,
 )
 from hub.host_security import HostAllowlistMiddleware
+from hub.mcp_envelope import enrich_error_payload
 from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
 from hub.mcp_catalog import (
     catalog_snapshot,
@@ -1144,24 +1146,62 @@ async def api_create_skill(
 
     db = _db(request)
     status_value = "active" if identity.is_human else "draft"
-    skill_id, version = await repo.create_skill_version(
-        db,
-        name=body.name,
-        kind=body.kind,
-        content=body.content,
-        tags=_json.dumps(body.tags, ensure_ascii=False),
-        project_id=body.project_id,
-        status=status_value,
-        created_by=identity.username,
-    )
-    if status_value == "active":
-        await repo.insert_event(
-            db,
-            kind="skill_activated",
-            actor=identity.username,
-            payload={"name": body.name, "version": version},
+    # Прочитать и записать — ОДНОЙ транзакцией, взятой сразу на запись (#1169,
+    # находка ревью, сдача 5). Здесь два чтения-перед-записью подряд: номер
+    # следующей версии (MAX(version) внутри create_skill_version) и прежняя
+    # активная версия, которая станет основанием сравнения. Без write-лока с
+    # начала блока оба читают снимок, устаревающий до вставки, и обе поломки
+    # наблюдались на двух одновременных публикациях одного скилла:
+    #
+    #   * второй INSERT прилетал UNIQUE constraint failed: skills.name,
+    #     skills.version — то есть 500, а публикация терялась целиком;
+    #   * записанное основание сравнения указывало на версию, которая к
+    #     моменту вставки уже не была активной, — и постоянное событие, и
+    #     показанный по нему диф говорили о чужой паре версий.
+    #
+    # Прежняя активная версия читается ДО вставки: новая версия становится
+    # активной сразу же и сама стала бы своим же основанием для сравнения.
+    # Путь 1 — человек и есть автор текста, поэтому предпоказа тут нет; нужна
+    # запись о том, что именно опубликовано.
+    async with write_transaction(db):
+        baseline = (
+            await repo.get_active_skill(db, body.name)
+            if status_value == "active"
+            else None
         )
-    await db.commit()
+        skill_id, version = await repo.create_skill_version(
+            db,
+            name=body.name,
+            kind=body.kind,
+            content=body.content,
+            tags=_json.dumps(body.tags, ensure_ascii=False),
+            project_id=body.project_id,
+            status=status_value,
+            created_by=identity.username,
+        )
+        if status_value == "active":
+            # Одна полезная нагрузка на два места (#1253): событие — чтобы
+            # человек увидел публикацию в ленте сразу, колонка версии — чтобы
+            # доказательства пережили двухнедельную чистку ленты. Считается
+            # она ОДИН раз: два вызова разошлись бы молча.
+            payload = skill_publish.publication_payload(
+                name=body.name,
+                version=version,
+                content=body.content,
+                previous_content=(
+                    None if baseline is None else str(baseline["content"])
+                ),
+                previous_version=(
+                    None if baseline is None else int(baseline["version"])
+                ),
+            )
+            await repo.insert_event(
+                db,
+                kind="skill_activated",
+                actor=identity.username,
+                payload=payload,
+            )
+            await repo.record_skill_publication(db, body.name, version, payload)
     await db_module.log_activity(
         db,
         "skill_version_created",
@@ -1183,20 +1223,54 @@ async def api_activate_skill(
 ):
     """Activate a proposed skill version (human gate, #380)."""
     db = _db(request)
-    row = await repo.get_skill_version(db, name, version)
-    if row is None:
-        raise HTTPException(404, "skill version not found")
-    if row["status"] != "active":
-        await repo.activate_skill_version(
-            db, name, version, activated_by=_identity.username
-        )
-        await repo.insert_event(
-            db,
-            kind="skill_activated",
-            actor=_identity.username,
-            payload={"name": name, "version": version},
-        )
-        await db.commit()
+    activated = False
+    # Проверка «эта версия ещё не активна» — тоже чтение перед записью, и без
+    # общего write-лока две одновременные активации ОДНОЙ версии проходили бы
+    # её обе и писали два события об одной публикации. Поэтому под локом весь
+    # блок, а не только чтение основания.
+    async with write_transaction(db):
+        row = await repo.get_skill_version(db, name, version)
+        if row is None:
+            raise HTTPException(404, "skill version not found")
+        if row["status"] != "active":
+            activated = True
+            # Та же защита, что и на пути 1, и по той же причине: основание
+            # сравнения читается перед записью, а значит читать его надо уже
+            # под write-локом. Наблюдено на двух одновременных активациях
+            # разных драфтов одного скилла: обе записи называли основанием
+            # v1, хотя вторая активация шла уже поверх первой (#1169,
+            # находка ревью, сдача 5).
+            #
+            # Основание читается до того, как активной станет эта версия.
+            # Ветка идемпотентности не трогается — повторная активация уже
+            # активной версии по-прежнему не порождает второго события.
+            baseline = await repo.get_active_skill(db, name)
+            await repo.activate_skill_version(
+                db, name, version, activated_by=_identity.username
+            )
+            # Та же пара записей, что и на пути 1, и по той же причине
+            # (#1253): лента уведомляет, колонка версии хранит. Ветка
+            # идемпотентности не трогается — повторная активация уже активной
+            # версии по-прежнему не пишет ни события, ни записи.
+            payload = skill_publish.publication_payload(
+                name=name,
+                version=version,
+                content=str(row["content"]),
+                previous_content=(
+                    None if baseline is None else str(baseline["content"])
+                ),
+                previous_version=(
+                    None if baseline is None else int(baseline["version"])
+                ),
+            )
+            await repo.insert_event(
+                db,
+                kind="skill_activated",
+                actor=_identity.username,
+                payload=payload,
+            )
+            await repo.record_skill_publication(db, name, version, payload)
+    if activated:
         await db_module.log_activity(
             db,
             "skill_activated",
@@ -2001,6 +2075,60 @@ async def api_delivery_discrepancies(
     return await services.undelivered_completed_tasks(
         db, project_id=project_id, limit=max(1, min(limit, 200))
     )
+
+
+@app.post("/api/delivery/discrepancies/{task_id}/observation")
+async def api_record_delivery_observation(
+    task_id: int,
+    body: DeliveryObservation,
+    request: Request,
+    identity=Depends(current_identity),
+):
+    """Закрыть строку реестра наблюдённым фактом доставки (#1215).
+
+    Четвёртый ВХОД в реестр, но не четвёртый источник правды: строка уходит из
+    списка и приезжает отдельным ведром ``closed_by_observation``, где видно,
+    что доставку подтвердило наблюдение, а не установил хаб. Прежний ответ и
+    его причина остаются читаемыми — закрытие дописывает историю.
+
+    ``current_identity``, а не ``require_human_or_admin``, и это НЕ ослабление
+    соседнего маршрута: признание («так и задумано») — суждение о работе, и
+    выносить его агенту, чья задача попала в реестр, действительно нельзя.
+    Наблюдение — другое: это отчёт о том, что запускали и что увидели, той же
+    природы, что живая проверка (#813), и права здесь ровно те же. Второй
+    модели прав для одного и того же поступка быть не должно.
+
+    Статус задачи не меняется и задача не архивируется. Архивация убрала бы
+    строку вместе с outcome-долгом, который читается тем же фильтром
+    ``archived = 0``, — она не выход и здесь не предлагается.
+
+    Закрытие — акт, который происходит один раз: строка, уже закрытая чужим
+    наблюдением, отказывает повторной записи (``already_observed``), а не
+    молча переписывает её доказательство — иначе retry после потерянного
+    ответа или второй наблюдатель стирали бы первую, уже приписанную запись
+    (находка ревью Codex, коммит 86150e7).
+    """
+    try:
+        return await services.record_delivery_observation(
+            _db(request),
+            task_id,
+            by=str(getattr(identity, "username", "") or "agent"),
+            probe=body.probe,
+            evidence=body.observation,
+            sha=body.sha,
+        )
+    except services.ObservationRefused as exc:
+        raise HTTPException(
+            422,
+            detail=enrich_error_payload(
+                {
+                    "reason": exc.reason,
+                    "actor_hint": "agent",
+                    "message": exc.message,
+                    "hint": exc.hint,
+                }
+            ),
+        ) from exc
 
 
 @app.post("/api/delivery/discrepancies/{task_id}/acknowledge")

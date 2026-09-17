@@ -603,8 +603,18 @@ async def _steward_shadow_metrics(db: aiosqlite.Connection) -> dict[str, Any]:
     }
 
 
+#: Окно практики по умолчанию — одно на все поверхности, которые его не
+#: называют явно: страница ``/metrics``, дайджест и MCP-вызов
+#: ``hub_practice_metrics``. Стоит именованной константой, а не тремя
+#: девяностыми в трёх файлах, потому что у скрипта разбора #1171 дефолт
+#: ДРУГОЙ (60 дней — окно приёмки «0 из 29»), и два дефолта, нигде не
+#: помеченные, читаются как один: оператор запускает ``report`` и открывает
+#: страницу, а числа под одним словом «precision» разные (#1153, #518).
+PRACTICE_METRICS_DEFAULT_DAYS = 90
+
+
 async def practice_metrics(
-    db: aiosqlite.Connection, *, since_days: int = 90
+    db: aiosqlite.Connection, *, since_days: int = PRACTICE_METRICS_DEFAULT_DAYS
 ) -> dict[str, Any]:
     """Practice economics (#384): machine-review costs, filtration rate,
     harness-version comparison, recurring finding categories, cycle times,
@@ -895,10 +905,18 @@ async def practice_metrics(
     human_touches = await _human_touch_metrics(db, since)
     review_outcomes = await _review_outcome_metrics(db, since)
     review_dispatches = await _review_dispatch_spend_metrics(db, since)
+    # #1238: повторяемость отказов среды. Считается тем же кодом, что решает,
+    # является ли отдельный отчёт отказом среды, — двух ответов на один
+    # вопрос здесь быть не должно. Окно берётся то же, что у остальных
+    # метрик, чтобы число сравнивалось с соседними по строке.
+    from hub.services.review_dispatch import count_environment_refusals
+
+    incomplete_reasons = await count_environment_refusals(db, since_days=since_days)
 
     return {
         "since_days": since_days,
         "machine_reviews": totals,
+        "incomplete_reasons": incomplete_reasons,
         "review_dispatches": review_dispatches,
         "by_harness": [dict(r) for r in harness_rows],
         "by_profile": profile_dicts,
@@ -2002,6 +2020,23 @@ class StackAssessment:
     base_task_status: str = ""
     relation: str = ""
     message: str = ""
+    # #1204: can the base still reach the base branch on its own? Every base
+    # #1186 knew about could — that is why holding was the right answer there.
+    # A task a human accepted WITHOUT delivering never will, and the gate has
+    # to tell the two apart before it decides between waiting and asking.
+    # Carried explicitly rather than inferred from the status: a reader who
+    # has to derive "completed means undelivered here" from which query the
+    # row came out of will eventually derive it wrong.
+    base_can_deliver_itself: bool = True
+    # #1204 (found by the machine review of submission #2): the id of a
+    # STRANDED candidate whose own branch ref could not be resolved. Kept
+    # apart from a plain ``unknown`` because the two need opposite handling:
+    # a plain unknown is retryable and waits, while a terminal task's deleted
+    # branch will never come back — waiting on it is silent and permanent.
+    unprobed_stranded_task_id: int | None = None
+    # #1204 (Cursor #385): the registry state of a stranded base — pr_open or
+    # pr_closed. Empty for a base still on the conveyor.
+    base_delivery_state: str = ""
 
     def as_advisory(self) -> dict[str, Any] | None:
         """The pre-#1186 shape: a dict for a stack, None for anything else."""
@@ -2098,6 +2133,141 @@ async def _walk_stacking_candidates(
             yield row, name, result
 
 
+def _base_pr_phrase(delivery_state: str) -> str:
+    """What the stranded base's PR is, as the registry recorded it (#1204).
+
+    Cursor #385 (fc420e738b347d00): both refusals said «её PR открыт и не
+    влит» unconditionally, while pr_closed rows reach them too.
+    """
+    from hub.services.delivery_state import PR_CLOSED
+
+    if delivery_state == PR_CLOSED:
+        return "её PR закрыт без мержа"
+    return "её PR открыт и не влит"
+
+
+def _first_of(*answers: "StackAssessment | None") -> "StackAssessment | None":
+    """The walk's precedence, written once and in order (#1186, #1204).
+
+    A stranded row we could not probe outranks a plain unknown: both mean "we
+    could not look", but only that one names a task and says who has to act,
+    so returning the silent retryable one instead would hide it forever. And
+    unknown outranks a benign match for the reason #1186 gave: a row we could
+    not look at may be the dangerous one, and "the pair I DID look at is safe"
+    says nothing about it.
+    """
+    for answer in answers:
+        if answer is not None:
+            return answer
+    return None
+
+
+def _stranded_with_a_dead_ref(
+    other: dict[str, Any],
+    other_branch: str,
+    result: Any,
+    stranded: set[int],
+) -> "StackAssessment | None":
+    """A stranded candidate whose OWN branch ref no longer resolves (#1204).
+
+    Found by the machine review of submission #2, severity high. Such a row
+    cannot be handled the way a plain ``unknown`` is. The plain kind is
+    retryable on purpose: git blinked, the clone will catch up, the next cycle
+    answers. This kind never will — the task is terminal, so nobody is going
+    to push that branch back, and deleting the branch is what GitHub does by
+    default after a manual merge. Left as a retryable unknown it became a
+    SILENT, PERMANENT hold on every delivery in the project that had no
+    definite stack of its own: exactly the brick the foreign-project skip
+    prevents, re-entered through the candidate list this change introduced.
+
+    Merging is not the alternative — that is the other existing branch of
+    ``unknown``, and the whole point of the stranded question is that merging
+    on top of such a base carries its work into the base branch under our
+    number. So this becomes a refusal that CALLS A HUMAN, the same answer
+    ``stranded_base`` already gives and for the same reason.
+
+    Narrow on purpose: only when the candidate's OWN ref is the ONLY one that
+    did not resolve. A missing workspace or a failed rev-list is about this
+    machine rather than about that branch, would hit every candidate alike,
+    and really can pass by itself — so it stays retryable. Reading which name
+    failed means reading ``details``, which the probe fills with every name it
+    could not resolve; an empty ``details`` falls through to the old behaviour
+    rather than guessing.
+
+    Equality, not membership (#1204, machine review of submission #3). The
+    first version asked whether the candidate was AMONG the unresolved names,
+    and a broken clone puts our own branch in that list beside it — so a
+    machine-level failure was being reported to a human as "that task's branch
+    is gone". The probe itself now refreshes a missing ref once before saying
+    it is missing, so surviving this check really does mean origin does not
+    have it either. And only ``ref_unresolved`` qualifies: a refresh that got
+    NO ANSWER comes back as ``remote_unreachable`` (#1204, machine review of
+    submission #4) and falls through to the retryable unknown below — a
+    timeout or a fetch lock is about this machine, hits every candidate alike,
+    and must not be told to a human as "origin does not have that branch".
+    """
+    if int(other["id"]) not in stranded:
+        return None
+    if result.outcome is not StackProbeOutcome.unavailable:
+        return None
+    if result.reason != "ref_unresolved":
+        return None
+    unresolved = {n.strip() for n in (result.details or "").split(",") if n.strip()}
+    if unresolved != {other_branch}:
+        return None
+    from hub.services.delivery_state import PR_CLOSED
+
+    if other.get("delivery_state") == PR_CLOSED:
+        # #1204, Cursor #385 (4a97669554fc9e13), решение стюарда 15.09 за
+        # молчащего владельца, вариант 1. PR закрыт без мержа И ветки нет на
+        # origin: работу свернули окончательно — pr_closed свип не
+        # переспрашивает, ветку никто не вернёт. Звать человека значило бы, что
+        # ОДНА такая строка ставит в needs_decision каждую доставку проекта без
+        # своей явной стопки, и отпирающего события нет. Поэтому это не
+        # «застрявший непроверенный», а неповторяемый unknown — мерж с алертом,
+        # называющим задачу; в обходе он ниже обычного unknown (моргнувший git
+        # по-прежнему ждёт). Остаточный риск назван: ветка, отведённая от
+        # свёрнутой работы, унесёт её коммиты — их видит ревью этой ветки.
+        return StackAssessment(
+            outcome=STACK_UNKNOWN,
+            reason=(
+                f"ветка '{other_branch}' задачи #{other['id']} удалена с origin, "
+                "её PR закрыт без мержа — стоит ли эта ветка на ней, проверить "
+                "нечем"
+            ),
+            retryable=False,
+            base_task_id=int(other["id"]),
+            base_task_branch=other_branch,
+            base_delivery_state=PR_CLOSED,
+        )
+    return StackAssessment(
+        outcome=STACK_UNKNOWN,
+        reason=f"stranded_ref_unresolved: {other_branch}",
+        retryable=False,
+        base_task_id=int(other["id"]),
+        base_task_branch=other_branch,
+        base_task_status=other.get("status") or "",
+        base_can_deliver_itself=False,
+        unprobed_stranded_task_id=int(other["id"]),
+        base_delivery_state=other.get("delivery_state") or "",
+    )
+
+
+def _file_dead_ref(
+    dead: "StackAssessment",
+    stranded_unprobed: "StackAssessment | None",
+    closed_gone: "StackAssessment | None",
+) -> tuple["StackAssessment | None", "StackAssessment | None"]:
+    """Which slot of the walk a dead-ref answer belongs to (#1204, Cursor #385).
+
+    An open base calls a human; a closed one whose branch is gone does not.
+    The first answer of each kind is kept, as everywhere in the walk.
+    """
+    if dead.unprobed_stranded_task_id:
+        return stranded_unprobed or dead, closed_gone
+    return stranded_unprobed, closed_gone or dead
+
+
 async def assess_branch_stacking(
     db: aiosqlite.Connection,
     task_id: int,
@@ -2148,10 +2318,36 @@ async def assess_branch_stacking(
     base = git_ops_mod._resolve_base(ctx.get("base_branch"))
     repo_path = ctx.get("repo")
     own_project = await _project_id_for(db, task_id)
-    rows = await repo.list_unmerged_branch_tasks(
-        db, exclude_task_id=task_id, statuses=statuses or STACK_ADVISORY_STATUSES
+    rows: list[Any] = []
+    stranded: set[int] = set()
+    if statuses is not None:
+        # #1204: the delivery question only. The advisory callers keep asking
+        # "is someone working on top of me", and a task nobody is working on
+        # any more is not part of that question — but it is very much part of
+        # "is there work under mine that will never reach the base branch".
+        #
+        # FIRST in the walk, not appended after. The loop answers with the
+        # first stacked row it finds, so walk order IS priority — and putting
+        # these last meant a nearer ordinary base masked a stranded one deeper
+        # in the same stack: the reader got "waiting for #A", a silent retry,
+        # while under them sat a base no wait would ever deliver. Found by the
+        # machine review of this very change; the comment below already
+        # claimed this precedence, and only the order made it true.
+        for row in await repo.list_undelivered_completed_branch_tasks(
+            db, exclude_task_id=task_id
+        ):
+            rows.append(row)
+            stranded.add(int(dict(row)["id"]))
+    rows.extend(
+        await repo.list_unmerged_branch_tasks(
+            db, exclude_task_id=task_id, statuses=statuses or STACK_ADVISORY_STATUSES
+        )
     )
     unknown: StackAssessment | None = None
+    # Held apart from ``unknown``: see StackAssessment.unprobed_stranded_task_id.
+    stranded_unprobed: StackAssessment | None = None
+    # #1204 (Cursor #385): a closed base whose branch is gone. Not a hold.
+    closed_gone: StackAssessment | None = None
     # #1186 round 2: a match that says "the OTHER branch stands on ME" is
     # benign — but only for that pair. The walk answers with the first match
     # it finds, and while every match meant a refusal that was safe: order
@@ -2218,6 +2414,8 @@ async def assess_branch_stacking(
                 base_task_branch=other_branch,
                 base_task_status=other_status,
                 relation=relation,
+                base_can_deliver_itself=other_id not in stranded,
+                base_delivery_state=other.get("delivery_state") or "",
                 message=_stacking_message(
                     relation, branch, other_branch, other_id, other_status, base
                 ),
@@ -2227,6 +2425,12 @@ async def assess_branch_stacking(
                 continue
             return found
         if result.outcome is not StackProbeOutcome.clear:
+            dead = _stranded_with_a_dead_ref(other, other_branch, result, stranded)
+            if dead is not None:
+                stranded_unprobed, closed_gone = _file_dead_ref(
+                    dead, stranded_unprobed, closed_gone
+                )
+                continue
             # Remembered, not returned: a later row may still be a definite
             # stack, and a definite stack is the more useful answer. Only
             # after the whole walk finds none does the unknown stand.
@@ -2238,10 +2442,9 @@ async def assess_branch_stacking(
     # Unknown outranks benign for the same reason it outranks clear: a row we
     # could not look at may be the dangerous one, and "the pair I DID look at
     # is safe" says nothing about it.
-    if unknown is not None:
-        return unknown
-    if benign is not None:
-        return benign
+    answer = _first_of(stranded_unprobed, unknown, closed_gone, benign)
+    if answer is not None:
+        return answer
     return StackAssessment(outcome=STACK_CLEAR, reason="no_unmerged_branch_shares")
 
 
@@ -2637,6 +2840,49 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             # this one, so delivering this task would have escalated instead
             # of merging.
             return ""
+        if not assessment.base_can_deliver_itself:
+            # #1204. Checked after the case above and before the one below,
+            # and both halves of that are load-bearing.
+            #
+            # AFTER "we are the base": a task accepted without delivery can
+            # perfectly well be the one built ON TOP of us. Then we are not
+            # standing on anything — merging carries only our own commits —
+            # and refusing here would strand the deliverable half of the pair
+            # over the undeliverable one. Found by the machine review of #1204,
+            # which named exactly this pair.
+            #
+            # BEFORE the order question: once we ARE standing on it, whichever
+            # way the rest of the ancestry reads, a base that will never be
+            # delivered cannot be waited for, and naming a merge order would
+            # only suggest that waiting is what is wanted.
+            # Направление называется ТОЛЬКО когда его подтвердил git.
+            # Найдено машинным ревью: проверка застревания стоит выше вопроса
+            # о порядке, значит она ловит и формы, где ancestry ничего не
+            # сказала, — а текст утверждал «ветка стоит на» безусловно. Это
+            # ровно тот же перебор, что уже чинили в алерте о непроверенной
+            # стопке: не утверждать больше, чем хаб знает (#725).
+            if assessment.relation == git_ops_mod.STACK_ANCESTRY_HEAD_IS_DESCENDANT:
+                how = (
+                    f"ветка стоит на ветке задачи "
+                    f"#{assessment.base_task_id} "
+                    f"'{assessment.base_task_branch}'"
+                )
+            else:
+                how = (
+                    f"ветка делит несмерженные коммиты с веткой задачи "
+                    f"#{assessment.base_task_id} "
+                    f"'{assessment.base_task_branch}' (направление git не "
+                    f"подтвердил, сторону хаб не называет)"
+                )
+            return (
+                f"{STRANDED_BASE_PREFIX}: {how}, и эту задачу человек принял, "
+                f"НЕ доставив — "
+                f"{_base_pr_phrase(assessment.base_delivery_state)}. Ждать нечего: "
+                f"конвейер к принятой задаче не вернётся, а мерж сейчас унёс "
+                f"бы её работу в базовую ветку под номером этой задачи. "
+                f"Решение за человеком: доставить "
+                f"#{assessment.base_task_id} или отвязать от неё эту ветку"
+            )
         if assessment.relation != git_ops_mod.STACK_ANCESTRY_HEAD_IS_DESCENDANT:
             # #1186, found by the machine review of this very change. Waiting
             # is only an answer when there is a side to wait FOR. When the two
@@ -2665,6 +2911,29 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             f"работу #{assessment.base_task_id} в базовую ветку под этим "
             f"номером. Ждём доставки #{assessment.base_task_id}"
         )
+    if assessment.outcome == STACK_UNKNOWN and assessment.unprobed_stranded_task_id:
+        # #1204, по машинному ревью сдачи №2. Ни один из двух существующих
+        # исходов unknown здесь не годится, и это надо было увидеть до того,
+        # как класть застрявших в обход. Повторяемый unknown ЖДЁТ, а ждать
+        # тут нечего и вечно: задача терминальная, её ветку никто не вернёт.
+        # Неповторяемый unknown МЕРЖИТ с алертом, а мерж поверх застрявшего
+        # основания — ровно тот инцидент, ради которого условие написано.
+        # Значит третий исход: не ждать и не мержить, а позвать человека,
+        # назвав задачу и то, чего именно хаб не смог проверить.
+        return (
+            f"{UNPROBED_STRANDED_BASE_PREFIX}: задачу "
+            f"#{assessment.unprobed_stranded_task_id} человек принял, НЕ "
+            f"доставив ({_base_pr_phrase(assessment.base_delivery_state)}), а её ветку "
+            f"'{assessment.base_task_branch}' не разрешается, а origin на "
+            f"прямой вопрос ответил, что такой ветки у него нет — обычно так "
+            f"выглядит удаление ветки после ручного мержа. Поэтому хаб НЕ "
+            f"знает, не стоит ли эта ветка на ней, и «не смог проверить» тут "
+            f"не то же самое, что «стопки нет». Ждать бесполезно: принятая "
+            f"задача терминальна, её ветку никто не вернёт. Решение за "
+            f"человеком: доставить или закрыть PR задачи "
+            f"#{assessment.unprobed_stranded_task_id}, либо подтвердить, что "
+            f"эта ветка от неё не отведена"
+        )
     if assessment.outcome == STACK_UNKNOWN and assessment.retryable:
         return (
             f"{STACK_UNKNOWN_PREFIX}: проверить, не стоит ли ветка на чужой "
@@ -2675,20 +2944,42 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
         # Merged, but never silently: the alert is the whole difference
         # between "we looked" and "we could not look".
         await repo.add_task_update(
-            db,
-            task["id"],
-            "hub",
-            "alert",
-            f"Стопку веток подтвердить не удалось ({assessment.reason}) — "
-            f"доставка идёт без этой проверки. Это НЕ значит, что стопки нет: "
-            f"значит, что ответа, на который можно опереться, хаб не получил. "
-            f"Плагин мог и проверить — старое «да/нет» просто не различает "
-            f"«проверил, независимы» и «проверить не смог», и опираться на "
-            f"такое «нет» перед необратимым мержем нельзя. Если ветка "
-            f"отведена от чужой несмерженной ветки, её работа уедет в базовую "
-            f"ветку под номером этой задачи (#1186).",
+            db, task["id"], "hub", "alert", _unchecked_stack_alert(assessment)
         )
     return ""
+
+
+def _unchecked_stack_alert(assessment: "StackAssessment") -> str:
+    """The alert a merge without a stack answer leaves behind (#1186, #1204).
+
+    Two different facts reach it. A plugin that cannot probe gave no answer
+    at all. A closed base whose branch is gone DID answer — origin said the
+    branch is not there — so the generic «хаб не получил ответа… плагин мог и
+    проверить» would be the same kind of false statement Cursor #385 found in
+    the stranded texts (#1204, Cursor #391, d560bd210dee88dc).
+    """
+    from hub.services.delivery_state import PR_CLOSED
+
+    if assessment.base_delivery_state == PR_CLOSED:
+        return (
+            f"Стопку веток проверить нечем ({assessment.reason}) — доставка "
+            f"идёт без этой проверки. Проба ответила: ветки задачи "
+            f"#{assessment.base_task_id} на origin нет, а её PR закрыт без "
+            f"мержа, то есть работу свернули и сравнивать эту ветку не с чем. "
+            f"Если эта ветка всё же была отведена от неё, свёрнутые коммиты "
+            f"уедут в базовую ветку под номером этой задачи — их видно в "
+            f"диффе этой задачи (#1204)."
+        )
+    return (
+        f"Стопку веток подтвердить не удалось ({assessment.reason}) — "
+        f"доставка идёт без этой проверки. Это НЕ значит, что стопки нет: "
+        f"значит, что ответа, на который можно опереться, хаб не получил. "
+        f"Плагин мог и проверить — старое «да/нет» просто не различает "
+        f"«проверил, независимы» и «проверить не смог», и опираться на "
+        f"такое «нет» перед необратимым мержем нельзя. Если ветка "
+        f"отведена от чужой несмерженной ветки, её работа уедет в базовую "
+        f"ветку под номером этой задачи (#1186)."
+    )
 
 
 # #951: the two gate refusals that mean "ask again in a minute", not "ask a
@@ -2712,6 +3003,23 @@ STACK_UNKNOWN_PREFIX = "stack_unknown"
 # silent. This one calls a human, like every other refusal nobody can resolve
 # by waiting.
 STACKED_UNDETERMINED_PREFIX = "stacked_undetermined"
+# #1204: also deliberately NOT transient, and for a sharper reason than the
+# one above. There the order is unknown; here the order is known and the base
+# is simply never going to move — a human accepted it without delivering it,
+# so the conveyor will not come back for it. A wait would be a promise the
+# hub cannot keep, and transient refusals are silent, so nobody would ever
+# learn the promise had failed.
+STRANDED_BASE_PREFIX = "stranded_base"
+# #1204 (машинное ревью сдачи №2): тоже НЕ транзитный, и по обеим причинам
+# сразу. Ветка застрявшей задачи, которую не удалось разрешить, не вернётся
+# (ждать нечего — как у соседа выше), а мержить с алертом, как делает второй
+# существующий исход unknown, здесь нельзя: непроверенная стопка на
+# недоставляемом основании — это исходный инцидент #1186. Единственный
+# честный ответ — человек.
+# Значение НЕ начинается со "stranded_base" сознательно: соседние проверки
+# в этом файле сравнивают детали через startswith, и префикс, являющийся
+# приставкой другого, рано или поздно молча попадёт в чужую ветку разбора.
+UNPROBED_STRANDED_BASE_PREFIX = "unprobed_stranded_base"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",
@@ -2999,6 +3307,15 @@ class DeliveryPR:
     # branch reads it: telling somebody to wait for a green CI is a promise
     # about a PR, and it must not be made when the PR itself is unknown.
     established: bool = True
+    # #1261 (Cursor/grok-4.6, report #376, finding 40adcc8f02f26c98): ``unusable``
+    # alone conflates two different facts. The recorded PR is closed either way,
+    # but the search for a live replacement can ANSWER "no open PR" (a fact) or
+    # RAISE (silence — #725/#802/#959's rule that silence is never read as a
+    # negative). Both set ``unusable`` today because both mean "cannot deliver
+    # THIS pass", but only the first is a decision for a human: the second is a
+    # network blip the next pass may answer on its own. True only in that second
+    # case — the search itself failed, not merely came back empty.
+    search_unanswered: bool = False
 
 
 async def _recorded_pr_state(
@@ -3193,6 +3510,10 @@ async def pr_for_delivery(db: aiosqlite.Connection, task: dict[str, Any]) -> Del
                     f"{branch or '(ветки нет)'} не нашлось"
                 ),
                 unusable=True,
+                # #1261: find_note is non-empty ONLY on the exception path in
+                # _live_pr_for_branch (found is None there returns ""), so this
+                # is precisely "the search raised" versus "the search answered".
+                search_unanswered=bool(find_note),
             )
         # merged, open, or unknown: the number stands. "Merged" must never be
         # replaced — a second merge is not extra safety, and #605 already had
@@ -3221,6 +3542,46 @@ async def pr_for_delivery(db: aiosqlite.Connection, task: dict[str, Any]) -> Del
         )
     await repo.update_task(db, task["id"], pr_number=found)
     return DeliveryPR(int(found))
+
+
+async def resolve_delivery_pr(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[dict[str, Any], DeliveryPR]:
+    """Resolve the PR a ``merge_before_completion`` call should use (#1261).
+
+    Wraps :func:`pr_for_delivery` for the two callers that used to hand the
+    gate ``task["pr_number"]`` on faith: the delivery sweep
+    (``poller._deliver_pair_task``) and the human decision path
+    (``lifecycle.deliver_on_disposition``). Both need exactly what
+    ``pr_for_delivery`` already does — the recorded number if it still
+    stands, the branch's live PR if it does not, a named refusal when
+    neither exists — and #959's rule lives in that one function, not a
+    second copy of it (constraint: "второй копии логики замены не
+    заводится").
+
+    The third caller, the agent done-report path
+    (``orchestration._deliver_completed_pair_task``), does NOT go through
+    this wrapper. It already calls ``pr_for_delivery`` itself, one step up
+    in ``_complete_without_review``, because that path has an extra step
+    (``ensure_delivery_pr``, #967) sharing the same lookup that this
+    wrapper does not carry, and the note ``pr_for_delivery`` returns has to
+    reach the feed exactly once either way. Routing it through here too
+    would ask the provider about the same PR twice in one done report —
+    the very doubling the design note for this task warns against. So the
+    report path keeps calling the one rule through its older door; this
+    wrapper is the SAME rule through the door the sweep and the human
+    decision needed and did not have.
+
+    Returns the task dict with ``pr_number`` updated when a replacement was
+    found (``pr_for_delivery`` already persisted it; this keeps the
+    caller's in-memory copy — the one ``merge_before_completion`` reads —
+    in agreement) and the :class:`DeliveryPR` the caller reads for
+    ``unusable`` and ``reason``.
+    """
+    delivery_pr = await pr_for_delivery(db, task)
+    if delivery_pr.number:
+        task = {**task, "pr_number": delivery_pr.number}
+    return task, delivery_pr
 
 
 async def _deliver_completed_pair_task(
@@ -3866,6 +4227,28 @@ async def transition_after_agent_done(
         # the hub never learned its number" — and the second one completed
         # tasks over unmerged branches. The lookup runs here, at done time,
         # instead of only at submission.
+        #
+        # #1155: последний маршрут, до которого конвейер гейтов НЕ доезжает.
+        # Ветка уходит в completed ЗДЕСЬ, выше вызова
+        # _run_headless_submit_gates, поэтому шаг исходов на ней не работал
+        # никогда — и находка, из-за которой работу вернули, уносилась в
+        # завершённую задачу молча. Достижимо без искусственного opt-out:
+        # сабтаску auto_review=False ставит сам продукт
+        # (create_subtasks_bulk), а pair-start и submit-review ей не
+        # запрещены — зонд прошёл open → pair-start → submit-review →
+        # CHANGES_REQUESTED с подтверждённой находкой → done → completed, и
+        # в ленте не было ни слова. Хуже, чем на pending_report: там задача
+        # ещё жива, здесь вопрос закрывается вместе с задачей.
+        #
+        # Та же заметка, тот же шаг и тот же потолок warn, что у конвейера и
+        # у маршрута pending_report. Двойной печати нет: конвейер живёт в
+        # ветке НИЖЕ этого return, а pending_report сюда не заходит вовсе.
+        # Отказывать нельзя — потолок этого пути warn по решению #1122.
+        from hub.services.lifecycle import unanswered_findings_note
+
+        still_open_note = await unanswered_findings_note(db, task)
+        if still_open_note:
+            await repo.add_task_update(db, task_id, "hub", "alert", still_open_note)
         return await _complete_without_review(
             db,
             task,
