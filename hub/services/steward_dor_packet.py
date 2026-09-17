@@ -471,6 +471,33 @@ def _ac_text(row: dict[str, Any]) -> str:
     )
 
 
+def _statement_text(
+    task: dict[str, Any], criteria: list[dict[str, Any]] | None
+) -> list[tuple[str, str]]:
+    """Текст постановки, который стюард читает как техлид (§6.2 спеки).
+
+    Формулировки критериев, заявленный охват и размер. Цитаты, а не факты:
+    хаб их не перепроверит (§3), и оценка формулировок — суждение стюарда.
+    Пустое поле цитатой пустой строки не становится (#762).
+    """
+    out: list[tuple[str, str]] = []
+    for row in criteria or []:
+        if any(
+            (row.get(k) or "").strip() for k in ("given", "when_clause", "then_clause")
+        ):
+            out.append((QUOTE_AC_TEXT, _ac_text(row)))
+    for item in deserialize_str_list(task.get("scope_in")):
+        if item.strip():
+            out.append((QUOTE_SCOPE_IN, item))
+    for item in deserialize_str_list(task.get("scope_out")):
+        if item.strip():
+            out.append((QUOTE_SCOPE_OUT, item))
+    size = str(task.get("size") or "").strip()
+    if size:
+        out.append((QUOTE_SIZE, size))
+    return out
+
+
 def _authored_texts(
     task: dict[str, Any],
     ac_fact: EvidenceFact,
@@ -507,22 +534,7 @@ def _authored_texts(
         text = (task.get(column) or "").strip()
         if text:
             out.append((QUOTE_TASK_STATEMENT, text))
-    # Текст постановки, который стюард читает как техлид (§6.2): формулировки
-    # критериев, охват и размер. Цитаты, не факты — хаб их не перепроверит.
-    for row in criteria or []:
-        if any(
-            (row.get(k) or "").strip() for k in ("given", "when_clause", "then_clause")
-        ):
-            out.append((QUOTE_AC_TEXT, _ac_text(row)))
-    for item in deserialize_str_list(task.get("scope_in")):
-        if item.strip():
-            out.append((QUOTE_SCOPE_IN, item))
-    for item in deserialize_str_list(task.get("scope_out")):
-        if item.strip():
-            out.append((QUOTE_SCOPE_OUT, item))
-    size = str(task.get("size") or "").strip()
-    if size:
-        out.append((QUOTE_SIZE, size))
+    out.extend(_statement_text(task, criteria))
     # Ниже цитируется РОВНО то значение, которое лежит в факте, — не
     # обрезанное и не нормализованное. Цитата, отличающаяся от факта хотя бы
     # пробелом, перестаёт быть цитатой ИМЕННО этой строки, и «текст проверен»
