@@ -4066,7 +4066,7 @@ async def decide_task(
         # #897: the acceptance is done and stays done — this only refuses to
         # let it be silent. On 21.08.2026 exactly this transition left #878 and
         # #885 completed with their PRs open, and nothing in the task said so.
-        await deliver_on_disposition(
+        _, _, search_unanswered = await deliver_on_disposition(
             db, task_id, getattr(body, "pr_disposition", "") or "", via="decide_accept"
         )
         await note_completion_without_delivery(
@@ -4074,6 +4074,7 @@ async def decide_task(
             task_id,
             via="decide_accept",
             disposition=getattr(body, "pr_disposition", "") or "",
+            search_unanswered=search_unanswered,
         )
         await maybe_rollup_parent(db, task_id)
         await log_activity(
@@ -4675,7 +4676,7 @@ async def force_complete_task(
     # gets the same delivery. Left out, it would stay the second door with the
     # same silence behind it — and the one people reach for when the first
     # refuses.
-    await deliver_on_disposition(
+    _, _, search_unanswered = await deliver_on_disposition(
         db,
         task_id,
         ((body.pr_disposition if body else "") or ""),
@@ -4686,6 +4687,7 @@ async def force_complete_task(
         task_id,
         via="force_complete",
         disposition=((body.pr_disposition if body else "") or ""),
+        search_unanswered=search_unanswered,
     )
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -4697,7 +4699,7 @@ DELIVER_DISPOSITION = "deliver"
 
 async def deliver_on_disposition(
     db: aiosqlite.Connection, task_id: int, disposition: str, *, via: str
-) -> tuple[bool, str]:
+) -> tuple[bool, str, bool]:
     """Act on ``pr_disposition=deliver``: merge, or refuse and say why (#1037).
 
     Until now the field was recorded and never acted on, so a human who
@@ -4725,17 +4727,22 @@ async def deliver_on_disposition(
       its conditions. A second set would drift, and the weaker one would
       become the real one (#519, #546).
 
-    Returns ``(delivered, reason)``. A refusal never undoes the acceptance:
-    those are two decisions, and the human made only one of them here.
+    Returns ``(delivered, reason, search_unanswered)``. A refusal never
+    undoes the acceptance: those are two decisions, and the human made only
+    one of them here. ``search_unanswered`` (#1267) is True only when the
+    recorded PR was closed and the search for a live replacement on the
+    branch RAISED rather than answering "no open PR" — the caller needs this
+    fact to record the completion honestly, and must not recompute it: this
+    is the one place that resolves the PR (#1261's ``resolve_delivery_pr``).
     """
     if (disposition or "").strip() != DELIVER_DISPOSITION:
-        return False, ""
+        return False, "", False
     row = await repo.get_task(db, task_id)
     if row is None:
-        return False, "task not found"
+        return False, "task not found", False
     task = dict(row)
     if not task.get("pr_number"):
-        return False, "no_pr"
+        return False, "no_pr", False
 
     from hub.services.orchestration import (
         merge_before_completion,
@@ -4754,7 +4761,7 @@ async def deliver_on_disposition(
             "заменяет вердикт ревьюера — PR остался открытым (#1037).",
         )
         await db.commit()
-        return False, "no_approved_review"
+        return False, "no_approved_review", False
 
     # #1261: the recorded pr_number is a cached observation (#959), same as
     # on the sweep and the done-report path — a stacked PR can close when
@@ -4800,8 +4807,13 @@ async def deliver_on_disposition(
         # (Cursor #378, 5a41a733cbb3e7be); and the undelivered-work registry
         # (#1198) lists pr_open/unknown rows only, while this closed recorded
         # PR is written as pr_closed right after (Cursor #379, f43a94d860cfc4e1).
-        # The honest text states what happened and that nothing will deliver
-        # the branch by itself.
+        #
+        # #1267 fixed the second half: note_completion_without_delivery now
+        # reads search_unanswered (returned by this function, below) and
+        # writes the row as unknown with a named cause instead of pr_closed
+        # "свернули намеренно". That row IS in the registry a reader can see
+        # (hub_undelivered_completed / hub_task_status), so the text below
+        # names it — it is no longer a place with nothing to find.
         await repo.add_task_update(
             db,
             task_id,
@@ -4811,7 +4823,10 @@ async def deliver_on_disposition(
             "PR закрыт и не смержен, но узнать, есть ли у ветки открытая "
             "замена, не удалось — поиск не ответил, а не «замены нет». "
             "Задача принята и завершена БЕЗ доставки: повторного решения по "
-            "ней хаб не примет, и сам хаб работу этой ветки не доставит (#1037).",
+            "ней хаб не примет, и сам хаб работу этой ветки не доставит — но "
+            "строка остаётся видна в реестре недоставленного "
+            "(hub_undelivered_completed) как unknown, и свип расхождений "
+            "переспросит её сам, когда поиск ответит (#1267).",
         )
     elif delivery_pr.unusable:
         # #1261 (Codex, P2): the generic "PR остался открытым" text below is
@@ -4841,7 +4856,7 @@ async def deliver_on_disposition(
             "открытым, задача остаётся принятой (#1037).",
         )
     await db.commit()
-    return ok, reason
+    return ok, reason, bool(delivery_pr.unusable and delivery_pr.search_unanswered)
 
 
 async def withdraw_own_draft(
