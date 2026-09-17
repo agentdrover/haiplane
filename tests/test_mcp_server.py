@@ -2211,6 +2211,66 @@ async def test_hub_submit_for_review_forwards_lifecycle_hint(
     assert "открыть не удалось" in payload["message"]
 
 
+async def test_submit_answer_names_the_unchanged_generation(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """AC-6 (#1265): a same-sha retry from review reads as unchanged, not new.
+
+    Codex finding #4 on 41159735: the response always said "submitted ...
+    Awaiting reviewer verdict" and the docstring promised an unconditional
+    bump — both misleading when a resubmission of identical code from
+    review opens no new generation. Detected here purely from the two reads
+    the wrapper already makes (before and after the call): equal generation
+    with a prior status of "review" only happens for this no-op case, since
+    a first submission, a new-sha resubmission, or leaving review all change
+    the number.
+    """
+    mock_api_get.return_value = {
+        "id": 42,
+        "status": "review",
+        "submission_generation": 3,
+    }
+    mock_api_post.return_value = {
+        "id": 42,
+        "status": "review",
+        "submission_generation": 3,
+    }
+    out = await hub_submit_for_review(42)
+    payload = json.loads(out)
+    assert "already on review" in payload["message"]
+    assert "submission #3" in payload["message"]
+    assert "did not change" in payload["message"]
+    assert "Awaiting reviewer verdict" in payload["message"]
+    assert "submitted for review" not in payload["message"], (
+        "a same-sha retry must not read like a brand-new submission"
+    )
+
+
+async def test_submit_answer_reads_as_new_when_the_generation_moves(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """Control for AC-6: a REAL resubmission (new sha) still reads as new.
+
+    Same shape as the unchanged-generation test above — prior status
+    "review" — but the generation moved, so the ordinary "submitted for
+    review" wording must survive; only equality is special-cased.
+    """
+    mock_api_get.return_value = {
+        "id": 42,
+        "status": "review",
+        "submission_generation": 3,
+    }
+    mock_api_post.return_value = {
+        "id": 42,
+        "status": "review",
+        "submission_generation": 4,
+    }
+    out = await hub_submit_for_review(42)
+    payload = json.loads(out)
+    assert "submitted for review (submission #4" in payload["message"]
+    assert "already on review" not in payload["message"]
+
+
 async def test_hub_get_review_brief(mock_api_get: AsyncMock) -> None:
     mock_api_get.return_value = {
         "task_id": 42,

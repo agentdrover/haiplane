@@ -1892,6 +1892,9 @@ class SubmitContext:
     discovered_pr: int | None = None
     pr_opened_by_hub: bool = False
     pr_ensure_note: str = ""
+    #: #1265 — та же вершина ветки пришла повторно из review: сдача не
+    #: открывает новое поколение, и вызывающий получает ответ без перехода.
+    same_sha_noop: bool = False
 
 
 async def _step_task_is_submittable(state: SubmitContext) -> None:
@@ -2261,6 +2264,42 @@ async def _step_pin_submission_sha(state: SubmitContext) -> None:
     )
 
 
+async def _step_same_sha_from_review_is_current(state: SubmitContext) -> None:
+    """Пересдача того же коммита из review не открывает новое поколение (#1265).
+
+    #1172, 13.09.2026: сдачи №6 и №7 — один и тот же sha b530268a24c6,
+    исполнитель и стюард сдали независимо, не зная друг о друге. Хаб принял
+    вторую как новую работу: поколение выросло с 6 до 7, диспетч ревью
+    вызван повторно (отказан лимитом usage_limit_exceeded), а вердикт по
+    «заменённой» сдаче перестал быть текущим — хотя код не менялся ни на
+    байт.
+
+    Сверка — по вершине, которую уже закрепил шаг ``pin_submission_sha``
+    выше: нового сетевого вызова здесь нет, только сравнение двух строк,
+    обе уже лежат в контексте (``state.submission_sha`` и
+    ``state.replaced_sha``, прочитанный в ``_step_task_is_submittable`` до
+    любых записей).
+
+    Пустой sha не считается совпадением: сеть могла быть недоступна на ОБЕИХ
+    сдачах, и тогда "" == "" ничего не доказывает о коде — только то, что
+    пиннинг сорвался дважды. Такая сдача идёт обычным путём, как и раньше.
+
+    ``resubmitted_from_review`` — это уже ``status == "review"`` (#1054), и
+    проверка ничего не добавляет к нему: пересдача того же sha из
+    ``fix_requested`` (headless) сюда не попадает вовсе, потому что
+    ``_step_task_is_submittable`` отказывает headless-задачам раньше, чем
+    конвейер дойдёт до этого шага. Сравнивать sha из ЛЮБОГО статуса, минуя
+    ``resubmitted_from_review``, было бы другим, более широким правилом —
+    его здесь нет.
+    """
+    if (
+        state.resubmitted_from_review
+        and state.submission_sha
+        and state.submission_sha == state.replaced_sha
+    ):
+        state.same_sha_noop = True
+
+
 async def _step_delivery_pr(state: SubmitContext) -> None:
     """PR, который повезёт работу (#605, #967, #975)."""
     # #605: record which PR carries this work. The pair flow never sets
@@ -2328,16 +2367,44 @@ async def _step_delivery_pr(state: SubmitContext) -> None:
 # Порядок сдачи. Он и был несущим — сетевые резолвы до транзакции, отказ до
 # записи, — но держался тем, что никто не переставил блоки. Теперь его можно
 # сверить тестом и сравнить с набором headless-пути.
-SUBMIT_STEPS: tuple[Step[SubmitContext], ...] = (
+#
+# #1265, круг 2 (находка Codex #1 на 41159735): список расколот на ДВЕ
+# половины. surfaces/finding_outcomes/submit_rules — гейты, чей ответ
+# меняется НЕ от кода, а от времени: находка может лечь на поколение между
+# оригинальной сдачей и её точным повтором, и режим require может включиться
+# между ними же. Повтор запроса, который сдача уже приняла однажды, не
+# должен получить отказ, которого не получил оригинал — поэтому «тот же ли
+# это sha» распознаётся ДО них, сразу после дешёвых, неизменных во времени
+# отказов и пиннинга вершины (сам pin переехал раньше по той же причине —
+# без него сравнивать не с чем). submit_for_review прогоняет первую половину,
+# проверяет флаг и либо уходит в _same_sha_noop_response, либо продолжает
+# второй половиной — gate_pipeline.run_steps не трогается, деление снаружи
+# него.
+SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
     Step("task_is_submittable", _step_task_is_submittable),
     Step("canonical_branch", _step_canonical_branch, refuses=False),
     Step("branch_matches", _step_branch_matches),
+    Step("pin_submission_sha", _step_pin_submission_sha, refuses=False),
+    Step(
+        "same_sha_from_review_is_current",
+        _step_same_sha_from_review_is_current,
+        refuses=False,
+    ),
+)
+
+SUBMIT_STEPS_AFTER_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
     Step("resolve_diff", _step_resolve_diff, refuses=False),
     Step("surfaces", _step_surfaces, mode=policy("SDD_SURFACES")),
     Step("finding_outcomes", _step_finding_outcomes, mode=policy("FINDING_OUTCOME")),
     Step("submit_rules", _step_submit_rules, mode=policy("SUBMIT_RULES")),
-    Step("pin_submission_sha", _step_pin_submission_sha, refuses=False),
     Step("delivery_pr", _step_delivery_pr, refuses=False),
+)
+
+#: Полный объявленный список — для сверки порядка и сравнения с headless-путём.
+#: submit_for_review прогоняет его НЕ одним вызовом run_steps — см. докстринг
+#: выше и тело функции — но список остаётся единым источником для тестов.
+SUBMIT_STEPS: tuple[Step[SubmitContext], ...] = (
+    SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK + SUBMIT_STEPS_AFTER_SAME_SHA_CHECK
 )
 
 
@@ -2413,7 +2480,9 @@ async def submit_for_review(
     report and reviewed by the poller conveyor). Bumps the submission
     generation — which invalidates any verdict recorded for earlier work —
     and leaves the task in ``status=review`` with no ``review_job_id``,
-    marking the review as client-driven.
+    marking the review as client-driven. The one exception (#1265): the same
+    commit resubmitted from ``review`` opens no new generation — see
+    :func:`_same_sha_noop_response`.
 
     #1054: resubmitting from ``review`` used to be refused, and the refusal
     had no third move behind it. An author who found a defect in his own
@@ -2435,9 +2504,153 @@ async def submit_for_review(
     body = body or TaskSubmitReview()
 
     state = SubmitContext(db=db, task_id=task_id, task=task, body=body)
-    await run_steps(state, SUBMIT_STEPS)
+    await run_steps(state, SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK)
 
+    if state.same_sha_noop:
+        # #1265: the pipeline named this a duplicate of the current
+        # generation BEFORE the gates whose answer can drift between the
+        # original submission and this identical retry (finding_outcomes,
+        # submit_rules) — a repeat must not meet a refusal the original
+        # never faced (Codex finding #1 on 41159735). No transition, no
+        # push/PR (finding #3); the caller's payload still lands (finding
+        # #2, AC-5); the review-dispatch DECISION still runs on generation N
+        # exactly as #1150/#1152 always ran it (AC-1).
+        return await _same_sha_noop_response(state)
+
+    await run_steps(state, SUBMIT_STEPS_AFTER_SAME_SHA_CHECK)
     return await _apply_submission(state)
+
+
+async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
+    """Ответ на пересдачу того же sha из review — без НОВОГО поколения (#1265).
+
+    НЕ полный no-op: поколение, submission_sha, статус, текущесть ревью и
+    вердикта остаются ровно теми, что были ДО вызова — перехода нет, и
+    ``delivery_pr`` в этот путь не входит вовсе, так что повтор не пушит
+    ветку и не открывает PR (находка Codex #3, AC-3). Но три вещи ниже
+    происходят по-настоящему:
+
+    * данные сдачи — исходы находок и ``accept_areas`` — применяются к
+      ТЕКУЩЕМУ (не новому) поколению, а не тонут молча за отчётом об успехе
+      (находка Codex #2, AC-5);
+    * решение о заказе ревью принимается СЕЙЧАС, тем же правилом
+      #1150/#1152, что и всегда — полный текущий отчёт покрывает sha,
+      второй прогон не заказывается; отчёта нет или он неполный — код мог
+      остаться непрочитанным, и прогон заказывается на этом же поколении
+      (находка Codex #1, AC-1);
+    * повтор идемпотентен (AC-3): uid, уже отвеченный на этом поколении,
+      пропускается, и второй одинаковый вызов не становится отказом. Но uid,
+      которого у поколения нет вовсе (опечатка), получает тот же 422, что и
+      обычная сдача, — это не повтор;
+    * ``accept_areas`` проходит тот же шаг сверки области, что и обычная
+      сдача (``_step_surfaces``), и ту же запись о росте объёма: служебные
+      пути не дописываются, а непрочитанный дифф называется в ленте.
+    """
+    db = state.db
+    task_id = state.task_id
+    body = state.body
+    generation = int(state.task.get("submission_generation") or 0)
+    agent = (body.agent or state.task.get("assigned_agent") or "").strip()
+
+    if body.accept_areas:
+        # Код не менялся — дифф тот же, что видела бы обычная сдача, но он
+        # нигде не закэширован: читаем заново. ДО блокировки записи, как у
+        # обычной сдачи (resolve_diff стоит в конвейере до перехода): это
+        # сетевой git, и держать под ним BEGIN IMMEDIATE значит останавливать
+        # все записи хаба (#1265, Cursor #380, 8a892feff574a2a6).
+        await _step_resolve_diff(state)
+        # Тот же шаг сверки области, что у обычной сдачи: он сам отбрасывает
+        # ROUTINE_PATHS, признаёт только настоящий выход за объявленную
+        # область и называет «сверка НЕ выполнялась», когда дифф не прочитан,
+        # вместо молчаливого успеха (Cursor #383, 40af8ae7af0f7943). С
+        # accept_areas он не отказывает — признанный объём не расхождение.
+        # Шаг вызывается МИМО конвейера, а run_steps оставил в gate_mode режим
+        # последнего своего шага (always) — с ним SDD_SURFACES=off не
+        # действовал бы, и повтор расширял бы область, которую оригинал не
+        # трогал. Пустой режим — «вне конвейера, читай политику» (Cursor #386,
+        # f4ec12806d4c263e).
+        state.gate_mode = ""
+        await _step_surfaces(state)
+
+    async with write_transaction(db):
+        # AC-5: то же место в транзакции, что и в _apply_submission — до
+        # того, как решение о ревью уходит за пределы транзакции ниже.
+        # Поколение, которому отвечают исходы, — ТЕКУЩЕЕ: здесь оно не растёт.
+        open_items = await finding_outcome.open_findings(db, task_id, generation)
+        # AC-3: повтор тела, чьи исходы уже записал предыдущий такой же вызов,
+        # не становится ошибкой — такие uid отвечены на ЭТОМ поколении и
+        # просто пропускаются. Но uid, которого у поколения нет вовсе
+        # (опечатка), — не повтор: обычная сдача ответила бы на него 422, и
+        # здесь ответ тот же, а не молчаливый успех над выброшенными данными
+        # (AC-5; Cursor #380, 97ee0d78bda22c1c).
+        already_answered: set[str] = set()
+        for report in await repo.machine_reviews_of_generation(db, task_id, generation):
+            already_answered.update(
+                str(dict(row)["finding_uid"])
+                for row in await repo.list_finding_outcomes(db, int(dict(report)["id"]))
+            )
+        open_uids = {str(found["finding_uid"]) for found in open_items}
+        pending = [
+            item
+            for item in body.finding_outcomes
+            if not (
+                item.finding_uid in already_answered
+                and item.finding_uid not in open_uids
+            )
+        ]
+        try:
+            outcome_writes, _still_open = finding_outcome.plan_outcomes(
+                open_items, pending
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if outcome_writes:
+            await finding_outcome.apply_outcomes(
+                db, task_id, generation, outcome_writes, reported_by=agent
+            )
+        if body.accept_areas:
+            await _record_accepted_scope(db, task_id, state.task, state.accepted_paths)
+            # Дифф прочитан заново — и пересчитанный по нему класс риска
+            # записывается так же, как у обычной сдачи, иначе лента назвала бы
+            # повышение, которого в задаче нет (Cursor #386, cd22025d472a0300).
+            if state.risk_fields:
+                await repo.update_task(db, task_id, **state.risk_fields)
+            # Правила сдачи на повторе не перезапускались — заголовок полного
+            # «Отчёта проверок на сдаче» над одной строкой сверки читался бы
+            # как чистый отчёт (Cursor #386, 4c832c08b8bb5dcc).
+            await _write_submission_notices(
+                state,
+                header=(
+                    f"Повтор сдачи того же коммита (поколение {generation}): "
+                    "сверена только область для accept_areas. Правила сдачи не "
+                    "перезапускались — их отчёт записан сдачей этого поколения."
+                ),
+            )
+        await db.commit()
+
+    # AC-1 / #1150/#1152: решение о заказе ревью не тронуто этой задачей —
+    # тот же вызов, что делает обычная сдача, только на НЕИЗМЕНИВШЕМСЯ
+    # поколении. best-effort по контракту: неудача не рвёт этот ответ.
+    await _dispatch_cross_model_review(db, task_id)
+
+    submission = await repo.get_submission(db, task_id, generation)
+    submitted_at = (submission["submitted_at"] or "") if submission is not None else ""
+    who_agent = (state.task.get("assigned_agent") or "").strip() or "—"
+    declared_model = (state.task.get("submission_model") or "").strip()
+    who = who_agent + (f" ({declared_model})" if declared_model else "")
+    when = f" в {submitted_at}" if submitted_at else ""
+    sha_display = state.submission_sha[:12] if state.submission_sha else "—"
+
+    row = _existing_task(await repo.get_task(db, task_id), task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    view = row_to_task(row, updates=updates)
+    view.lifecycle_hint = (
+        f"Сдача {sha_display} уже на ревью как поколение {generation} "
+        f"(сдал {who}{when}). Код не изменился — новое поколение не "
+        "открыто, ревью и вердикт остаются текущими как были (#1265)."
+    )
+    view.wait_baseline = wait_baseline_for(dict(row))
+    return view
 
 
 def _submission_update_text(
@@ -2543,8 +2756,50 @@ async def write_submission_notices(state: SubmitContext) -> None:
     await _write_submission_notices(state)
 
 
-async def _write_submission_notices(state: SubmitContext) -> None:
+async def _record_accepted_scope(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    accepted_paths: list[str],
+) -> None:
+    """Дописать признанный на сдаче объём и сказать об этом отдельно (#890).
+
+    Один код на обычную сдачу и на повтор того же sha (#1265): иначе повтор
+    дописывал бы affected_areas своим способом — сырым диффом, мимо
+    ROUTINE_PATHS и без записи о росте объёма (Cursor #383, 56fc0a823ab5e1a2,
+    5c3ba1c53664357f). Зовётся ВНУТРИ транзакции вызывающего.
+    """
+    if not accepted_paths:
+        return
+    declared = deserialize_str_list(task.get("affected_areas"))
+    merged = list(declared) + [p for p in accepted_paths if p not in declared]
+    await repo.update_task_structured(db, task_id, TaskRefine(affected_areas=merged))
+    shown = ", ".join(accepted_paths[:10])
+    more = f" и ещё {len(accepted_paths) - 10}" if len(accepted_paths) > 10 else ""
+    # A separate, visible event on purpose. Without it affected_areas would
+    # simply always equal the diff, and there would be nothing left to compare:
+    # the reviewer must be able to see that half the declared scope appeared at
+    # submission, not at DoR.
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"{commit_scope.SCOPE_GROWTH_MARKER} "
+        f"+{len(accepted_paths)} путь(ей) "
+        f"признан(ы) на сдаче — {shown}{more}. Было заявлено "
+        f"{len(declared)}, стало {len(merged)}. Это признание факта "
+        "сдающим, а не предсказание из постановки.",
+    )
+
+
+async def _write_submission_notices(
+    state: SubmitContext, *, header: str | None = None
+) -> None:
     """Заметки о сдаче в ленту: что проверено, чего не хватает (#1067).
+
+    ``header`` — для повтора того же sha (#1265), где правила сдачи не
+    выполнялись и заголовок полного отчёта был бы неправдой.
 
     Вынесено вместе с записями, а не только со сборкой текста: блок целиком
     про уведомление читателя и ничего не решает о переходе. Все входы —
@@ -2562,7 +2817,8 @@ async def _write_submission_notices(state: SubmitContext) -> None:
         # Only now is "what ran and found nothing" worth printing: inside
         # a report the reader is already looking at.
         report_lines += state.clean_lines
-        header = f"Отчёт проверок на сдаче (режим правил: {state.rules_mode})."
+        if header is None:
+            header = f"Отчёт проверок на сдаче (режим правил: {state.rules_mode})."
         await repo.add_task_update(
             state.db,
             state.task_id,
@@ -2725,31 +2981,7 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
         # #890: the accepted scope is written INSIDE the same transaction as
         # the transition, so a task can never end up in review with the field
         # widened but the growth unrecorded — or the other way round.
-        if accepted_paths:
-            declared = deserialize_str_list(task.get("affected_areas"))
-            merged = list(declared) + [p for p in accepted_paths if p not in declared]
-            await repo.update_task_structured(
-                db, task_id, TaskRefine(affected_areas=merged)
-            )
-            shown = ", ".join(accepted_paths[:10])
-            more = (
-                f" и ещё {len(accepted_paths) - 10}" if len(accepted_paths) > 10 else ""
-            )
-            # A separate, visible event on purpose. Without it affected_areas
-            # would simply always equal the diff, and there would be nothing
-            # left to compare: the reviewer must be able to see that half the
-            # declared scope appeared at submission, not at DoR.
-            await repo.add_task_update(
-                db,
-                task_id,
-                "hub",
-                "alert",
-                f"{commit_scope.SCOPE_GROWTH_MARKER} "
-                f"+{len(accepted_paths)} путь(ей) "
-                f"признан(ы) на сдаче — {shown}{more}. Было заявлено "
-                f"{len(declared)}, стало {len(merged)}. Это признание факта "
-                "сдающим, а не предсказание из постановки.",
-            )
+        await _record_accepted_scope(db, task_id, task, accepted_paths)
         # #855: ONE report instead of scattered alerts. The area verdict is a
         # line in it, not a second independent message — a submission should
         # leave the reader with a single list of what was checked. The wording
