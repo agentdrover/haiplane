@@ -2345,6 +2345,11 @@ class CIRunReportSubmit(BaseModel):
     # pass | fail | skipped. Optional, and an omitted map means "this report
     # names no checks" — never "everything passed".
     checks: dict[str, str] = Field(default_factory=dict)
+    # The mutation run over changed functions (#1270), kept under its own key:
+    # a warning with named survivors, not a check outcome — putting it into
+    # ``checks`` would tell the reviewer the code is "known-broken" whenever a
+    # weak test exists. Omitted ⇒ stored as {} and reported as not_reported.
+    mutations: dict[str, Any] = Field(default_factory=dict)
     validation_status: str = Field("", max_length=20)
     validation_log: str = Field("", max_length=4000)
     reason: str = Field("", max_length=500)
@@ -2361,6 +2366,7 @@ class CIRunReportResult(BaseModel):
     ac_recorded: list[dict[str, Any]] = Field(default_factory=list)
     ac_ignored: list[str] = Field(default_factory=list)
     validation_status: str = ""
+    mutations_state: str = "not_reported"
 
 
 class OutcomeVerdict(str, Enum):
