@@ -23,7 +23,10 @@ pytest`` — this repository's own way, and exactly what a satellite repository
 with different tooling has to be able to change),
 HAIPLANE_HUB_CI_RAN (#1081: the commands this job already executed, one
 ``<outcome> <command>`` per line — what they prove is not executed a second
-time; absent ⇒ nothing is reused and every command runs as before).
+time; absent ⇒ nothing is reused and every command runs as before),
+HAIPLANE_HUB_CI_MUTATIONS (#1270: path to the JSON written by
+scripts/mutation_changed.py — sent under its own ``mutations`` key; absent or
+unreadable ⇒ the key is not sent, and the log says why).
 """
 
 from __future__ import annotations
@@ -442,6 +445,46 @@ def run_validation(
     return "pass", "\n".join(logs)[-_LOG_TAIL:], ""
 
 
+# The hub refuses a mutation report above 32 000 chars (#1270). Survivors are
+# trimmed well below that here, and the trimmed count is sent alongside: a list
+# cut silently would read as "these are all of them".
+_MUTATION_SURVIVORS_MAX = 40
+_MUTATION_DIFF_MAX = 300
+
+
+def trim_mutations(report: dict) -> dict:
+    """Bound the survivor list; counts are never trimmed."""
+    survivors = report.get("survivors")
+    if not isinstance(survivors, list):
+        return report
+    kept = [
+        {**s, "diff": str(s["diff"])[-_MUTATION_DIFF_MAX:]}
+        if isinstance(s, dict) and "diff" in s
+        else s
+        for s in survivors[:_MUTATION_SURVIVORS_MAX]
+    ]
+    trimmed = dict(report, survivors=kept)
+    if len(survivors) > len(kept):
+        trimmed["survivors_trimmed"] = len(survivors) - len(kept)
+    return trimmed
+
+
+def read_mutations(path: str) -> dict | None:
+    """The mutation step's JSON, or None with the reason logged."""
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            report = json.load(handle)
+    except (OSError, ValueError) as exc:
+        log(f"mutation report {path} not sent: {exc}")
+        return None
+    if not isinstance(report, dict):
+        log(f"mutation report {path} not sent: expected an object")
+        return None
+    return trim_mutations(report)
+
+
 def main() -> int:
     base = env_get("HUB_URL").rstrip("/")
     token = env_get("HUB_CI_TOKEN")
@@ -502,13 +545,18 @@ def main() -> int:
         "reported_by": "github-actions",
         "checks": checks,
     }
+    mutations = read_mutations(env_get("HUB_CI_MUTATIONS"))
+    if mutations is not None:
+        payload["mutations"] = mutations
+        log(f"mutation run reported: state={mutations.get('state')!r}")
     result = hub_request(f"{base}/api/tasks/{task_id}/ci-run-report", token, payload)
     if result is None:
         log("report not delivered — the hub will read this as unknown")
         return 0
     log(
         f"reported {len(ac_results)} AC result(s), validation={v_status}; "
-        f"applied={result.get('applied')} ({result.get('reason')})"
+        f"applied={result.get('applied')} ({result.get('reason')}); "
+        f"mutations={result.get('mutations_state', 'not accepted by this hub')}"
     )
     return 0
 

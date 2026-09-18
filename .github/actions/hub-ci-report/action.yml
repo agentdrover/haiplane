@@ -55,6 +55,13 @@ inputs:
       "uv run ruff check hub tests". Absent ⇒ nothing is reused.
     required: false
     default: ""
+  mutations-file:
+    description: >-
+      Path to the JSON written by scripts/mutation_changed.py (#1270). Sent to
+      the hub under its own key, as a warning — never as a check outcome.
+      Absent or unreadable ⇒ the key is not sent and the log says why.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -68,6 +75,7 @@ runs:
         HAIPLANE_HUB_CI_PYTEST: ${{ inputs.ac-runner }}
         HAIPLANE_HUB_CI_CHECKS: ${{ inputs.checks }}
         HAIPLANE_HUB_CI_RAN: ${{ inputs.ran-commands }}
+        HAIPLANE_HUB_CI_MUTATIONS: ${{ inputs.mutations-file }}
       run: |
         set -u
         # A repo-hosted action ships with its whole repository, so the reporter

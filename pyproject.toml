@@ -44,6 +44,7 @@ testpaths = ["tests"]
 [dependency-groups]
 dev = [
     "bandit>=1.9.4",
+    "cosmic-ray>=8.7,<9",
     "detect-secrets>=1.5.0",
     "mypy>=1.19.1",
     "pip-audit>=2.10.0",
