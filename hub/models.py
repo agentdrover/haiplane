@@ -314,6 +314,10 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # now refuses to let happen again (#886).
     "release",
     "ci_runner",
+    # #1268: стюард судит в тени, вердикт остаётся за человеком. Ключ не
+    # гейт и ничего не делегирует — поэтому замок #743 (default) его не
+    # трогает. Читатель: steward_dispatch._policy_wants_steward.
+    "steward_shadow",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -2143,6 +2147,13 @@ class ProjectPatch(BaseModel):
             raise ValueError(
                 f"gate_policy values must be one of {sorted(GATE_VALUES)}, got: {bad}"
             )
+        if "steward_shadow" in v and not isinstance(v["steward_shadow"], bool):
+            # Читатель понимает только true (#835); запись отказывает громко,
+            # чтобы «"true"» строкой не выглядело включённым, ничего не включая.
+            raise ValueError(
+                "gate_policy steward_shadow must be true or false, "
+                f"got: {v['steward_shadow']!r}"
+            )
         if "review" in v and v["review"] not in REVIEW_POLICY_VALUES:
             raise ValueError(
                 "gate_policy review must be one of "
@@ -2345,6 +2356,11 @@ class CIRunReportSubmit(BaseModel):
     # pass | fail | skipped. Optional, and an omitted map means "this report
     # names no checks" — never "everything passed".
     checks: dict[str, str] = Field(default_factory=dict)
+    # The mutation run over changed functions (#1270), kept under its own key:
+    # a warning with named survivors, not a check outcome — putting it into
+    # ``checks`` would tell the reviewer the code is "known-broken" whenever a
+    # weak test exists. Omitted ⇒ stored as {} and reported as not_reported.
+    mutations: dict[str, Any] = Field(default_factory=dict)
     validation_status: str = Field("", max_length=20)
     validation_log: str = Field("", max_length=4000)
     reason: str = Field("", max_length=500)
@@ -2361,6 +2377,7 @@ class CIRunReportResult(BaseModel):
     ac_recorded: list[dict[str, Any]] = Field(default_factory=list)
     ac_ignored: list[str] = Field(default_factory=list)
     validation_status: str = ""
+    mutations_state: str = "not_reported"
 
 
 class OutcomeVerdict(str, Enum):
@@ -3293,6 +3310,9 @@ STEWARD_ESCALATE_REASONS: tuple[str, ...] = (
     "run_failed",
     "run_timeout",
     "injection_suspected",
+    # #1268: привратник применения на проекте, где вердикт стюарду не отдан
+    # (теневое участие): суждение записано, применять его нельзя.
+    "policy_not_delegated",
 )
 STEWARD_CLOSURE_TYPES: tuple[str, ...] = (
     "fixed",
