@@ -35,6 +35,9 @@ EXCEPTIONS: dict[str, str] = {
         "оптимизация прогона, не проверка — #1077"
     ),
     "Surface parity (warning only)": ("только PR и warning-only: exit 0 всегда"),
+    "Mutations of changed functions (warning only)": (
+        "только PR и warning-only: exit 0 всегда, серия дольше make check — #1270"
+    ),
     "Report AC tests and validation to Hub": "отчётность, не проверка",
     "Dependency vulnerability audit": (
         "advisory: continue-on-error, находки уезжают драфтами в хаб, красным не бывает"
