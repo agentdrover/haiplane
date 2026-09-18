@@ -596,19 +596,6 @@ async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
             delivery_path="outside_gate",
         )
 
-    if pr_number is None:
-        # Assumption stated on the task: a completed task with no pinned PR is
-        # indistinguishable here from work that never needed one. Saying so is
-        # the honest answer; guessing would put research and spikes on a list
-        # about undelivered pull requests.
-        return _task_answer(
-            UNKNOWN,
-            "у задачи не закреплён PR — по нему сверять нечего. "
-            "Это не «не доставлено»: работы без ветки здесь не отличить",
-            pr_number=None,
-            delivery_path="none",
-        )
-
     # Ровно тот же текст, что уходит в строку зависимости (#1214). Реестр и
     # строка описывают один факт, и до задачи описывали его двумя разными
     # фразами — «базовую ветку проверить не удалось» здесь против «проверить
@@ -621,6 +608,27 @@ async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
     # о неудаче, которой не было. Раньше эта ветка тоже дописывала «не
     # удалось», и это была маленькая версия того же дефекта.
     base_note = f"; {base_note_text}" if base_note_text else ""
+
+    if pr_number is None:
+        # Assumption stated on the task: a completed task with no pinned PR is
+        # indistinguishable here from work that never needed one. Saying so is
+        # the honest answer; guessing would put research and spikes on a list
+        # about undelivered pull requests.
+        #
+        # Причин молчания тут может быть две, и вторая уже посчитана. Говорить
+        # только про незакреплённый PR значит отправить читателя проверять
+        # базовую ветку руками — тем самым способом, о котором эта задача и
+        # говорит, что он о squash-мерже не судит. Слова берутся из той же
+        # константы, что у строки зависимости, поэтому разъехаться им негде.
+        return _task_answer(
+            UNKNOWN,
+            "у задачи не закреплён PR — по нему сверять нечего. "
+            "Это не «не доставлено»: работы без ветки здесь не отличить"
+            f"{base_note}",
+            pr_number=None,
+            delivery_path="none",
+        )
+
     workspace, gh_repo = "", ""
     try:
         from hub import services

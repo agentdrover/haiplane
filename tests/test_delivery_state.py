@@ -926,3 +926,109 @@ async def test_a_truly_undelivered_blocker_still_says_so(
     )
     assert delivered_entry["delivered"] is True, delivered_entry
     assert delivered_entry["delivery_path"] == "outside_gate", delivered_entry
+
+
+async def test_an_open_pr_outranks_ancestry_that_cannot_judge(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    squash_delivery: dict[str, Any],
+    monkeypatch,
+):
+    """Находка 6f85fb04: провайдер сказал «открыт» — это факт, а не молчание.
+
+    Вход тот же, на котором живёт #1214: форж мержит squash, поэтому
+    родословная судить не может и отдаёт ``None`` с общим примечанием. Дальше
+    реестр спрашивает провайдера — и тот отвечает определённо. Каскад #897
+    затем и построен: незнание одного источника не отменяет знания другого.
+
+    Здесь записано решение, а не случайность реализации. Реестр обязан
+    сохранить «не доставлено», иначе починка ложного срабатывания превратится
+    в ложное успокоение (зарегистрированный риск постановки): строка «PR
+    открыт» — единственное, что успевает предупредить о старте поверх
+    несмёрженной работы. Примечания о родословной здесь быть не должно: оно
+    звало бы сомневаться в факте, который наблюдал провайдер.
+
+    Строка зависимости в том же входе остаётся ``unknown`` — и это не
+    расхождение слов, а разный объём знания: ``blocker_delivery`` провайдера
+    не спрашивает вовсе.
+    """
+    from hub.services.delivery_state import (
+        BASE_UNANSWERABLE_NOTE,
+        PR_OPEN,
+        blocker_delivery,
+        merged_into_base_detail,
+        task_delivery,
+    )
+
+    _real_git_for(monkeypatch, squash_delivery, "github")
+    blocker = await _completed_blocker(client, db, squash_delivery["undelivered"])
+    task = dict(await repo.get_task(db, blocker["task_id"]))
+
+    # Вход теста — не предположение: родословная действительно не судит.
+    reached, note = await merged_into_base_detail(db, task)
+    assert reached is None and note == BASE_UNANSWERABLE_NOTE, (reached, note)
+
+    monkeypatch.setattr(
+        plugins.git_ops, "pr_state", AsyncMock(return_value="open"), raising=False
+    )
+    answer = await task_delivery(db, task)
+
+    assert answer["state"] == PR_OPEN, answer
+    assert answer["delivery_path"] == "none", answer
+    assert "открыт" in answer["reason"], answer["reason"]
+    assert BASE_UNANSWERABLE_NOTE not in answer["reason"], (
+        "провайдер наблюдал открытый PR — звать это неответом нельзя"
+    )
+
+    # Второй потребитель провайдера не спрашивает, поэтому честно молчит.
+    entry = await blocker_delivery(db, blocker)
+    assert entry["delivery_path"] == "unknown", entry
+    assert BASE_UNANSWERABLE_NOTE in entry["reason"], entry["reason"]
+
+
+async def test_a_task_without_a_pinned_pr_still_names_the_silent_ancestry(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    squash_delivery: dict[str, Any],
+    monkeypatch,
+):
+    """Находка afa88e80: ветка «PR не закреплён» роняла уже посчитанное примечание.
+
+    Сдаточный коммит есть, PR у задачи нет. Реестр отвечал только про PR — и
+    читатель уходил проверять базовую ветку руками, то есть ровно тем
+    способом, о котором #1214 и говорит, что он здесь не работает. Ответ был
+    неполным: причин молчания две, названа была одна.
+
+    Состояние и ``delivery_path`` теста не меняют: строка и так называется
+    ``unknown``, «не доставлено» отсюда не следует. Меняется только полнота
+    причины — и слова берутся из той же константы, что у строки зависимости.
+    """
+    from hub.services.delivery_state import (
+        BASE_UNANSWERABLE_NOTE,
+        UNKNOWN,
+        blocker_delivery,
+        task_delivery,
+    )
+
+    _real_git_for(monkeypatch, squash_delivery, "github")
+    sha = squash_delivery["delivered"][878]
+    blocker = await _completed_blocker(client, db, sha)
+    task = dict(await repo.get_task(db, blocker["task_id"]))
+    task["pr_number"] = None
+
+    # Провайдер не должен участвовать: по незакреплённому PR его не спрашивают.
+    never = AsyncMock(side_effect=AssertionError("провайдера тут спрашивать нечего"))
+    monkeypatch.setattr(plugins.git_ops, "pr_state", never, raising=False)
+
+    answer = await task_delivery(db, task)
+
+    assert answer["state"] == UNKNOWN, answer
+    assert "не закреплён PR" in answer["reason"], answer["reason"]
+    assert BASE_UNANSWERABLE_NOTE in answer["reason"], (
+        "вторая причина молчания посчитана — терять её значит звать читателя "
+        "проверять базовую ветку способом, который здесь не отвечает"
+    )
+
+    # Те же слова, что у строки зависимости про тот же факт.
+    entry = await blocker_delivery(db, blocker)
+    assert BASE_UNANSWERABLE_NOTE in entry["reason"], entry["reason"]
