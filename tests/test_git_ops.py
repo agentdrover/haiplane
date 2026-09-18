@@ -2733,3 +2733,142 @@ async def test_unknown_mergeability_still_is_not_a_conflict() -> None:
     assert outcome is MergeabilityOutcome.unknown
     assert "не посчитал" in detail
     forge.pr_refs.assert_not_awaited()
+
+
+# ---- #1271 AC-3: докстринг branch_ancestry называет каждый исход ----
+#
+# #1193: докстринг перечислял 4 исхода из 5 — same_tip добавили в константы,
+# а в текст, по которому вызывающий решает, как формулировать ответ, нет.
+# Исходы берутся из модуля по префиксу имени, а не выписываются здесь: новый
+# STACK_ANCESTRY_* без упоминания в докстринге роняет тест сам.
+#
+# «Назван» значит буквально: имя константы, значение литералом (``unknown``)
+# или значение словом В ПЕРЕЧНЕ исходов. Пересказ («the head is the
+# descendant») не считается — по нему нельзя сверить; и слово из объяснения
+# вокруг перечня (order, first, symmetric, stacked, head, side) именем исхода
+# тоже не становится.
+#
+# Исходы, которые докстринг на develop не называет, — находка (#1271), код в
+# этой задаче не правится. Ключ — имя константы, значение — ссылка на драфт.
+BRANCH_ANCESTRY_UNNAMED_FINDINGS: dict[str, str] = {
+    "STACK_ANCESTRY_HEAD_IS_DESCENDANT": "драфт #1277: только пересказом",
+    "STACK_ANCESTRY_HEAD_IS_ANCESTOR": "драфт #1277: только пересказом",
+    "STACK_ANCESTRY_SAME_TIP": "драфт #1277: не назван вовсе (#1193)",
+}
+
+
+def _ancestry_outcomes() -> dict[str, str]:
+    from hub.integrations import git_ops
+
+    return {
+        name: getattr(git_ops, name)
+        for name in dir(git_ops)
+        if name.startswith("STACK_ANCESTRY_")
+    }
+
+
+def _outcome_listing(doc: str) -> str:
+    """Перечень исходов — предложение, которое их перечисляет, без пересказа.
+
+    Всё остальное в докстринге — объяснение, почему исходы такие, и слова
+    оттуда (order, first, symmetric, stacked, side) именем исхода не являются.
+    Из самого перечня выброшены скобочные пояснения и подлежащие вида «the
+    head»: по ним тоже нельзя сверить значение константы.
+    """
+    import re
+
+    start = doc.find("Returns one of")
+    if start < 0:
+        return ""
+    sentence = re.split(r"\.\s", doc[start:], maxsplit=1)[0]
+    without_asides = re.sub(r"\([^)]*\)", " ", sentence)
+    return re.sub(r"\bthe\s+[a-z_]+", " ", without_asides)
+
+
+def _outcomes_not_named_in(doc: str, outcomes: dict[str, str]) -> list[str]:
+    """Исходы, которых перечень не называет ни константой, ни значением."""
+    import re
+
+    listing = _outcome_listing(doc)
+    return sorted(
+        name
+        for name, value in outcomes.items()
+        if name not in doc
+        and not re.search(rf"``{re.escape(value)}``|\"{re.escape(value)}\"", doc)
+        and not re.search(rf"(?<![\w]){re.escape(value)}(?![\w])", listing)
+    )
+
+
+def _unnamed_ancestry_outcomes() -> list[str]:
+    return _outcomes_not_named_in(
+        GitOpsIntegration.branch_ancestry.__doc__ or "", _ancestry_outcomes()
+    )
+
+
+def test_prose_around_the_listing_does_not_name_an_outcome() -> None:
+    """#1271: значение, попавшее в пересказ, считалось названным.
+
+    Докстринг branch_ancestry — абзац английской прозы про симметрию и merge
+    order, и слова order, first, symmetric, stacked, head, side стоят в нём по
+    другому поводу. Проверка по всему тексту засчитывала их как имя исхода:
+    новый STACK_ANCESTRY_* с таким значением проходил незамеченным.
+    """
+    doc = (
+        "Which of two branches stands on the other.\n\n"
+        "The answer is symmetric, and the advisory named the merge order from "
+        "whichever task submitted first, so it flipped to the other side; a "
+        "stacked pair reads true in either direction.\n\n"
+        "Returns one of ``STACK_ANCESTRY_*``: the head is the descendant (the "
+        "other branch merges first), the two are unrelated by ancestry (no "
+        "order to name), or the question could not be answered; an "
+        "unresolvable ref is ``unknown``.\n"
+    )
+    outcomes = {
+        "STACK_ANCESTRY_UNKNOWN": "unknown",  # литерал в перечне
+        "STACK_ANCESTRY_UNRELATED": "unrelated",  # назван в перечне
+        "STACK_ANCESTRY_ORDER": "order",  # дальше — только пересказ
+        "STACK_ANCESTRY_FIRST": "first",
+        "STACK_ANCESTRY_SYMMETRIC": "symmetric",
+        "STACK_ANCESTRY_STACKED": "stacked",
+        "STACK_ANCESTRY_SIDE": "side",
+        "STACK_ANCESTRY_HEAD": "head",
+    }
+    assert _outcomes_not_named_in(doc, outcomes) == [
+        "STACK_ANCESTRY_FIRST",
+        "STACK_ANCESTRY_HEAD",
+        "STACK_ANCESTRY_ORDER",
+        "STACK_ANCESTRY_SIDE",
+        "STACK_ANCESTRY_STACKED",
+        "STACK_ANCESTRY_SYMMETRIC",
+    ]
+
+
+def test_branch_ancestry_docstring_names_every_outcome() -> None:
+    """#1271 AC-3: исход STACK_ANCESTRY_*, не названный в докстринге, роняет тест."""
+    outcomes = _ancestry_outcomes()
+    assert outcomes, "в git_ops нет ни одной STACK_ANCESTRY_* — проверять нечего"
+    stale = sorted(set(BRANCH_ANCESTRY_UNNAMED_FINDINGS) - set(outcomes))
+    assert not stale, f"находки называют исходы, которых нет в git_ops: {stale}"
+
+    unnamed = [
+        name
+        for name in _unnamed_ancestry_outcomes()
+        if name not in BRANCH_ANCESTRY_UNNAMED_FINDINGS
+    ]
+    assert not unnamed, (
+        f"докстринг GitOpsIntegration.branch_ancestry не называет исходы "
+        f"{unnamed} — вызывающий решает по этому тексту, как формулировать ответ"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#1271 находка на develop, драфт #1277: докстринг branch_ancestry "
+    "не называет head_is_descendant, head_is_ancestor, same_tip",
+)
+def test_branch_ancestry_unnamed_findings_are_resolved() -> None:
+    still = sorted(
+        set(_unnamed_ancestry_outcomes()) & set(BRANCH_ANCESTRY_UNNAMED_FINDINGS)
+    )
+    assert not still, f"всё ещё не названы: {still}"
