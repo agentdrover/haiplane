@@ -87,6 +87,9 @@ STATEMENT_FIELDS: tuple[str, ...] = (
     "validation_commands",
     "out_of_scope_for_review",
     "review_checklist",
+    # #1236: какое поведение наблюдать после доставки — часть того, что задача
+    # утверждает, поэтому смена объявления двигает отпечаток постановки.
+    "live_probe",
     "risks",
     "prepared_by",
 )
