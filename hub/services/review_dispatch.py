@@ -25,6 +25,8 @@ import logging
 import math
 import re
 import uuid
+from collections.abc import Mapping
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, NamedTuple
@@ -38,7 +40,11 @@ from hub.integrations import cursor_cloud
 from hub.integrations import local_reviewer
 from hub.integrations import forge as forge_urls
 from hub.integrations.registry import plugins
-from hub.models import RiskClass
+from hub.models import (
+    INCOMPLETE_REASON_ENVIRONMENT,
+    INCOMPLETE_REASON_PROFILE,
+    RiskClass,
+)
 from hub.services import project_policy
 from hub.services.model_family import family
 from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
@@ -744,14 +750,47 @@ REPORT_BLOCK_INSTRUCTION = (
     '"start_line": 1, "detail": "..."}], '
     '"findings_rejected": [{"title": "...", "category": "...", "reason": "..."}], '
     '"unresolved": [{"title": "...", "why": "..."}], '
-    '"lost_dimensions": ["..."], "harness_skill": "...", '
+    '"lost_dimensions": ["..."], "incomplete_reason": "environment|profile|", '
+    '"harness_skill": "...", '
     '"tokens_spent": <число или null>, "model": "<твоя модель>"}\n'
     "```\n"
     "Правила блока: он ОДИН и он последний; incomplete обязателен и без "
     "дефолта — «0 подтверждённых» без него не значит ничего; находка, которую "
     "никто не смог рассудить, идёт в unresolved, а НЕ в findings_rejected. "
+    "При incomplete=true назови ПРИЧИНУ одним словом в incomplete_reason: "
+    "«environment» — смотреть было нечем (нет чем запустить проверки, не "
+    "разрешается база для сравнения), «profile» — инструменты были, а охвата "
+    "на объём диффа не хватило. Это РАЗНЫЕ ответы человека: первое лечится "
+    "настройкой окружения, второе — ещё одним прогоном. Не заявишь — причина "
+    "останется неизвестной, и угадывать её по твоему тексту никто не будет. "
     "Если инструменты хаба недоступны — этот блок единственный способ "
     "доставить работу, и без него прогон пропадёт целиком."
+)
+
+
+# #1238. Что делать ДО того, как объявить, что среда не дала измерить.
+#
+# Заведено по отчёту #334 (задача #1169, профиль deep, 12 агентов): прогон
+# честно записал «в среде нет uv/pytest — сюит не исполнялся, только чтение»
+# и «локальный ref develop не резолвится». Ни того, ни другого никто не
+# просил попробовать обойти, и оба измерения пропали при полной оплате.
+#
+# Обещаний про среду провайдера здесь нет — только порядок попыток и
+# требование назвать отказ отказом, если ни одна не сработала. Сработает ли
+# он, покажет счётчик отказов среды, а не этот комментарий.
+ENVIRONMENT_ATTEMPT_BLOCK = (
+    "ЧЕМ СМОТРЕТЬ — СНАЧАЛА ПОПРОБУЙ, ПОТОМ ЗАЯВЛЯЙ ОТКАЗ.\n"
+    "Тесты: `uv run pytest -q`; нет uv — `python -m pytest -q`; нет pytest — "
+    "`python -m pip install -q pytest` и повтори. Код возврата смотри "
+    "отдельным `echo $?`, а не по хвосту вывода.\n"
+    "База для сравнения: если ссылка на базовую ветку не разрешается, "
+    "`git fetch origin <база>` и сравнивай с `origin/<база>`. Взять ДРУГОЙ "
+    "диапазон — значит судить о другом наборе изменений; если пришлось, "
+    "скажи об этом прямо.\n"
+    "Если после попыток измерение так и не сделано — incomplete=true и "
+    'incomplete_reason="environment", а в lost_dimensions перечисли, чего '
+    "именно не хватило. Чтение кода вместо прогона тестов прогоном не "
+    "называется.\n\n"
 )
 
 
@@ -810,12 +849,16 @@ def _review_prompt(
         # And the prepass (#875): both profiles pay model prices for what a
         # linter already proved, and the expensive one pays them per pass.
         f"{prepass_block}\n\n"
+        # #1238: and the order of attempts before "the environment refused".
+        # Both profiles get it: the deep harness lost the test dimension on
+        # exactly the same missing tool as a cheap one would.
+        + ENVIRONMENT_ATTEMPT_BLOCK
         # #1036: the report has to survive a run with no MCP. Since 22.08 the
         # hub's MCP stopped reaching cloud runs at all — the reviewer works,
         # finishes, and its findings die in the final text nobody parses. So
         # the text becomes a second, weaker delivery: same fields, stated
         # once, at the very end, where a machine can find them.
-        f"{delivery_block}"
+        + f"{delivery_block}"
         # .replace, не .format: сам шаблон несёт JSON отчёта в фигурных
         # скобках, и форматирование прочитало бы "raw_count" как поле.
         + REPORT_BLOCK_INSTRUCTION.replace(
@@ -911,6 +954,108 @@ async def _submission_diff(
 REVIEW_LADDER_MAX_STEPS = 2
 
 
+#: Окно, за которое считается повторяемость отказов среды (#1238).
+ENVIRONMENT_REFUSAL_WINDOW_DAYS = 30
+
+
+def is_environment_refusal(report: Mapping[str, Any] | None) -> bool:
+    """Отчёт неполон ПОТОМУ ЧТО среда отказала — по заявлению ревьюера (#1238).
+
+    ЕДИНСТВЕННОЕ место, где это решается. Два условия, и оба обязательны:
+    прогон объявил себя неполным И назвал причиной ``environment``. Пустая
+    причина — «не заявлена»; так выглядят все отчёты, написанные до
+    появления поля, и засчитать их отказом среды задним числом значило бы
+    сочинить за них показание.
+
+    Ничего не выводится из ``lost_dimensions``: разбор прозы по подстрокам
+    и есть то угадывание, ради замены которого поле заведено.
+    """
+    if report is None:
+        return False
+    if not report.get("incomplete"):
+        return False
+    return (report.get("incomplete_reason") or "") == INCOMPLETE_REASON_ENVIRONMENT
+
+
+#: Хвост алерта лестницы, когда неполнота — отказ среды (#1238).
+#:
+#: Лестница (#879) от этого не меняется: она и до, и после решает по профилю
+#: и по потолку — перечень её исходов вне области этой задачи. Меняется
+#: только то, ЧТО человек прочитает в карточке, когда за отказ примутся.
+ENVIRONMENT_REFUSAL_NOTE = (
+    " ПРИЧИНА — ОТКАЗ СРЕДЫ по заявлению ревьюера: смотреть было нечем "
+    "(нечем запустить проверки или не с чем сравнить дифф). Повтор прогона "
+    "в той же среде даст тот же отказ — лечится настройкой окружения "
+    "ревьюера, а не ещё одним ревью (#1238)."
+)
+
+
+def _ladder_cause_note(report: Mapping[str, Any] | None) -> str:
+    """Что дописать в алерт лестницы про ПРИЧИНУ неполноты (#1238)."""
+    if is_environment_refusal(report):
+        return ENVIRONMENT_REFUSAL_NOTE
+    return ""
+
+
+async def count_environment_refusals(
+    db: aiosqlite.Connection,
+    since_days: int = ENVIRONMENT_REFUSAL_WINDOW_DAYS,
+) -> dict[str, Any]:
+    """Сколько отчётов за окно неполны по отказу среды — с размером выборки.
+
+    Повторяемость до этой задачи не считал никто: два случая за 09.09.2026
+    заметил человек, читавший карточки подряд, а не механизм. Считается
+    здесь, рядом с определением отказа, чтобы счёт и признак не разъехались.
+
+    Доля печатается ТОЛЬКО когда есть от чего её брать. Знаменатель — не
+    все неполные отчёты, а те из них, что назвали причину: пока причину не
+    назвал никто, «0 отказов среды из 48 неполных» читалось бы как «со
+    средой всё хорошо», хотя измерено ровно ничего. Такой случай называется
+    словом «недобор» (#1153), а не нулём.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT incomplete, incomplete_reason FROM machine_reviews "
+        "WHERE created_at >= datetime('now', ?)",
+        (f"-{int(since_days)} days",),
+    )
+    reports_total = len(rows)
+    incomplete_rows = [dict(row) for row in rows if row["incomplete"]]
+    environment = sum(1 for row in incomplete_rows if is_environment_refusal(row))
+    profile_exhausted = sum(
+        1
+        for row in incomplete_rows
+        if (row.get("incomplete_reason") or "") == INCOMPLETE_REASON_PROFILE
+    )
+    declared = environment + profile_exhausted
+    incomplete_total = len(incomplete_rows)
+    if declared:
+        share_note = (
+            f"отказ среды: {environment} из {declared} неполных отчётов, "
+            f"назвавших причину (неполных всего {incomplete_total} из "
+            f"{reports_total} отчётов за {since_days} дн.)"
+        )
+    else:
+        share_note = (
+            f"недобор: причину неполноты не назвал ни один отчёт (неполных "
+            f"{incomplete_total} из {reports_total} за {since_days} дн.), "
+            "поэтому доля отказов среды не измерена — это не ноль"
+        )
+    return {
+        "since_days": int(since_days),
+        "reports_total": reports_total,
+        "incomplete_total": incomplete_total,
+        "reason_declared": declared,
+        "reason_unstated": incomplete_total - declared,
+        "environment_refusals": environment,
+        "profile_exhausted": profile_exhausted,
+        # Доля есть только при непустом знаменателе; иначе её нет, и вместо
+        # числа стоит None рядом со словом «недобор» в share_note.
+        "environment_share": (round(environment / declared, 3) if declared else None),
+        "share_note": share_note,
+    }
+
+
 async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> bool:
     """Buy the heavy profile when the cheap run said it did not finish (#879).
 
@@ -960,7 +1105,7 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             f"Неполный отчёт после {steps} прогон(ов): потолок лестницы "
             f"{REVIEW_LADDER_MAX_STEPS} достигнут, добор НЕ ставится. "
             "Ревью этой сдачи так и не состоялось полностью — решение за "
-            "человеком (#879).",
+            "человеком (#879)." + _ladder_cause_note(report),
         )
         await db.commit()
         return False
@@ -978,7 +1123,8 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
             "alert",
             "Неполный отчёт, добор не положен: профиль "
             + (f"«{profile}»" if profile else "не заявлен")
-            + " — выше дешёвого подниматься некуда. Решение за человеком (#879).",
+            + " — выше дешёвого подниматься некуда. Решение за человеком "
+            "(#879)." + _ladder_cause_note(report),
         )
         await db.commit()
         return False
@@ -1023,6 +1169,13 @@ CLOUD_REVIEW_FORGES: tuple[str, ...] = ("github",)
 # причину вместо своей.
 CLOUD_CHANNEL = "cloud"
 LOCAL_CHANNEL = "local"
+
+# Состояние строки заказа между «облако отчёта не дало» и «вторая дверь
+# открыта» (#1252). Не украшение и не третий исход: это ДОЛГ, записанный в
+# базу, потому что между двумя этими событиями лежит подготовка заказа с
+# сетью внутри, а поллер глотает исключение и идёт дальше. Закрытая строка
+# свипу невидима — значит закрывать её раньше, чем долг отдан, нельзя.
+SECOND_DOOR_OWED = "second_door"
 
 
 async def _policy_and_novelty_allow(
@@ -1199,7 +1352,14 @@ async def _this_code_was_already_read(
     already = await _report_already_covers_this_sha(db, task)
     if not already:
         return False
-    await _refuse_second_read(db, int(task["id"]), already)
+    # #1265: пересдача того же sha из review теперь штатный повтор (таймаут,
+    # две сессии) и приходит сюда на ТОМ ЖЕ поколении снова и снова. Отказ
+    # говорится один раз на отчёт — тем же приёмом, каким свип не повторяет
+    # алерт о недоступном ревьюере (Cursor #383, 78312fbb487b30ca).
+    if not await _already_told_about_the_missing_reviewer(
+        db, int(task["id"]), f"отчёт #{already} покрывает ту же вершину"
+    ):
+        await _refuse_second_read(db, int(task["id"]), already)
     return True
 
 
@@ -1229,6 +1389,16 @@ async def _report_already_covers_this_sha(
         отчёт исполнителя о собственной работе не отменяет независимого
         ревьюера. Тот же автор уже однажды закрыл чужой диспетчер как
         выполненный (#1011, #1025); здесь он закрывал бы его до старта.
+
+    Фильтр по поколению — ``<=``, не ``!=`` (#1265, круг 2). До #1265
+    пересдача ВСЕГДА поднимала поколение, так что к моменту этой проверки
+    отчёт нужного sha неизбежно лежал на генерации МЕНЬШЕ текущей — «не
+    равно» и «меньше» были одним и тем же условием, потому что «равно»
+    никогда не случалось. Теперь пересдача того же sha из review поколение
+    не поднимает: решение о заказе идёт на ТОЙ ЖЕ генерации, на которой
+    лежит и отчёт. Условие переписано на явную границу, а не снято вовсе,
+    потому что отчёт СТРОГО БУДУЩЕЙ генерации в принципе невозможен —
+    задача не пишет отчёт для сдачи, которой ещё не было.
     """
     task_id = int(task["id"])
     generation = int(task.get("submission_generation") or 0)
@@ -1241,7 +1411,7 @@ async def _report_already_covers_this_sha(
         "FROM machine_reviews mr "
         "JOIN submissions s ON s.task_id = mr.task_id "
         "AND s.generation = mr.submission_generation "
-        "WHERE mr.task_id = ? AND mr.submission_generation != ? "
+        "WHERE mr.task_id = ? AND mr.submission_generation <= ? "
         # Неполный отчёт не покрывает код: он САМ говорит, что дочитал не
         # всё, и лестница #879 существует ровно затем, чтобы добрать
         # непрочитанное. Назвать его чтением значило бы запереть добор
@@ -1282,9 +1452,9 @@ async def _refuse_second_read(
         "alert",
         (
             f"Кросс-модельное ревью не заказано: этот код уже прочитан, "
-            f"отчёт #{review_id} покрывает ту же вершину. Пересдача подняла "
-            "поколение, но дифф не изменился, и второй прогон вернул бы то "
-            "же чтение за те же деньги (#1152). Отчёт по этому коду читается "
+            f"отчёт #{review_id} покрывает ту же вершину. Код этой сдачи не "
+            "изменился, и второй прогон вернул бы то же чтение за те же "
+            "деньги (#1152). Отчёт по этому коду читается "
             f"как есть — он #{review_id}; неполный отчёт этим правилом не "
             "закрывается и добор ставится обычным порядком (#879)."
         ),
@@ -1347,7 +1517,10 @@ async def prepare_review_order(
     # oversight (#582). An unreadable diff buys deep, it does not excuse it.
     diff = await _submission_diff(db, task_id, branch)
     if force_profile:
-        profile, profile_reasons = force_profile, ["добор после неполного прогона"]
+        profile, profile_reasons = (
+            force_profile,
+            ["профиль задан заказом: добор лестницы или его замена"],
+        )
     else:
         profile, profile_reasons = pick_review_profile(task, diff)
     rules_block, rules_note = await collect_review_rules(db, task_id, diff)
@@ -1691,16 +1864,82 @@ async def maybe_dispatch_review(
     )
     agent_id, run_id = started.agent_id, started.run_id
     if not agent_id:
+        # МЕСТО ПРИМЕНЕНИЯ №1 второй двери (#1252): отказ СИНХРОННЫЙ — агент
+        # не создался, денег не потрачено. Алерт остаётся на месте: отказ
+        # облака — наблюдённый факт, и он стоит в карточке независимо от
+        # того, добыл ли отчёт кто-то второй.
+        detail = _lost_call_detail(started)
         await repo.add_task_update(
             db,
             task_id,
             "hub",
             "alert",
-            f"Кросс-модельное ревью НЕ вызвано: {_lost_call_detail(started)}. "
+            f"Кросс-модельное ревью НЕ вызвано: {detail}. "
             "Вердикт остаётся человеку; детали в логе хаба (#757).",
         )
         await db.commit()
-        return False
+        if started.blind:
+            # Пустой agent_id тут значит НЕ «создать не вышло», а «спросить,
+            # создался ли, не вышло» — то самое состояние, которое _Started
+            # отличает признаком blind и ради которого повтор запрещён двумя
+            # строками выше. Открыть на нём вторую дверь значит купить второго
+            # ревьюера поверх, возможно, уже оплаченного первого и получить
+            # два соперничающих отчёта на одну сдачу. Отказом считается
+            # только НАБЛЮДЁННЫЙ факт (deploy/LOCAL-REVIEW.md): либо
+            # провайдер отверг создание, либо сверка подтвердила, что агента
+            # нет. Слепота — ни то, ни другое, и остаётся человеку.
+            return False
+        # Долг второй двери записывается ДО попытки её открыть (#1266), тем
+        # же способом, каким это уже делает асинхронный путь (owe_second_
+        # door, _close_a_run_without_a_report): строка-заглушка коммитится
+        # первой, и только потом идёт рискованный вызов (review_reach,
+        # счёт токенов, сетевая prepare_review_order). Без этого порядка
+        # падение ВНУТРИ open_second_door не оставляло свипу ничего, что
+        # повторить, — вторая дверь терялась навсегда, потому что строки не
+        # было вовсе. agent_id пуст здесь НЕ временно: ничего не создано и
+        # не оплачено, и count_review_dispatches (#1266) такую строку в шаг
+        # лестницы не считает.
+        stub_id = await repo.create_review_dispatch(
+            db,
+            task_id=task_id,
+            submission_generation=generation,
+            agent_id="",
+            run_id="",
+            model=model_id,
+            profile=profile,
+            reviewer_principal_id=expected_principal,
+            channel=CLOUD_CHANNEL,
+        )
+        await repo.owe_second_door(db, stub_id, detail)
+        await db.commit()
+        stub_row = await repo.get_review_dispatch_for_generation(
+            db, task_id, generation
+        )
+        stub = dict(stub_row) if stub_row is not None else None
+        if stub is None:  # pragma: no cover - defensive, row was just committed
+            return False
+        # Дальше долг разбирает ТОТ ЖЕ путь, что и асинхронный отказ:
+        # _settle_second_door сама решает, открывать ли дверь, и сама же
+        # закрывает строку. Успех отсюда виден тем же наблюдением, каким
+        # _second_door_already_opened судит повтор — живой или удавшийся
+        # локальный заказ по ЭТОМУ долгу, а не догадкой по пути, которым
+        # сюда пришли.
+        await _settle_second_door(db, stub, task_row=task)
+        opened = await _second_door_already_opened(db, stub)
+        # Заглушка была ТОЛЬКО страховкой от падения внутри вызова выше —
+        # раз мы досюда дошли без исключения, падения не было, и сама она
+        # больше не нужна ни свипу, ни счёту шагов. Не убрать её значило бы
+        # оставить облачную строку там, где по AC-3 #1252 её не бывает
+        # вовсе (ненастроенный путь — байт в байт как раньше) и там, где
+        # AC-1 #1252 требует ровно одну строку, локальную. Падение МЕЖДУ
+        # _settle_second_door и этим удалением не теряет долг: строка к
+        # тому моменту уже закрыта (done/failed) самой _settle_second_door,
+        # а следующий свип такую строку не трогает — то есть худшее, что
+        # оставляет несостоявшееся удаление, это лишняя закрытая строка в
+        # истории, не потерянная вторая дверь.
+        await repo.delete_review_dispatch(db, stub["id"])
+        await db.commit()
+        return opened
 
     # #1025: pin whose report this dispatch waits for, resolved from the
     # reviewer token at dispatch time (above, where the code was minted under
@@ -1798,6 +2037,13 @@ class ReviewReach:
 
     ways: tuple[str, ...]
     reason: str
+    local_missing: tuple[str, ...] = ()
+    """Чего не хватает ЛОКАЛЬНОМУ пути, пустой кортеж — хватает всего.
+
+    Отдельно от ``reason``, потому что ``reason`` заполнен только когда ways
+    пуст, а на форже с облаком ways непуст всегда. Отказать локальному
+    заказу там надо всё равно, и назвать причину — тоже (#1252).
+    """
 
     @property
     def runnable(self) -> bool:
@@ -1817,20 +2063,133 @@ async def review_reach(db: aiosqlite.Connection, forge: str) -> ReviewReach:
     БЫТЬ и не разрешаться (отозван, открытый режим), а отчёт под принципалом
     автора гейт не засчитает при REVIEW_SELF_APPROVE=forbid, то есть прогон
     был бы оплачен впустую (#1128).
+
+    #1252: способы считаются ОБА, и на форже с облаком тоже. Раньше здесь
+    стоял ранний выход — «облако дотягивается» отвечало за весь вопрос, и
+    локальная готовность на github не проверялась вовсе. Из-за этого у
+    сдачи, чей облачный прогон отказал, второй двери не было даже там, где
+    локальный ревьюер настроен и работает.
+
+    Порядок в ``ways`` — порядок попыток: облако первое, локальный путь
+    второй. Он читается как предпочтение, а не как множество.
+
+    Ответ для трёх прежних читателей не меняется: на форже с облаком
+    ``ways`` по-прежнему непуст, а ``reason`` по-прежнему пуст — то есть ни
+    форма проекта, ни инвариант записи нового состояния не видят.
     """
+    ways: list[str] = []
     if forge in CLOUD_REVIEW_FORGES:
-        return ReviewReach((CLOUD_CHANNEL,), "")
+        ways.append(CLOUD_CHANNEL)
     missing = local_reviewer.not_ready()
     if await local_reviewer_principal_id(db) is None:
         missing = missing or ["LOCAL_REVIEWER_HUB_TOKEN не разрешается в принципала"]
     if not missing:
-        return ReviewReach((LOCAL_CHANNEL,), "")
+        ways.append(LOCAL_CHANNEL)
+    if ways:
+        return ReviewReach(tuple(ways), "", tuple(missing))
     return ReviewReach(
         (),
         f"облачный ревьюер не работает с форжем «{forge}» (проверено "
-        "31.08.2026, #1119), а локальный не настроен: "
+        "31.08.2026, #1119), а " + local_path_refusal(missing),
+        tuple(missing),
+    )
+
+
+def local_path_refusal(missing: Sequence[str]) -> str:
+    """Почему локального пути нет — одними и теми же словами (#1188).
+
+    Автор текста один на два места: отказ, когда способов НЕТ вовсе, и отказ
+    локальному заказу на форже, где облако есть, но отчёта не дало. Две копии
+    объясняли бы одно состояние двумя разными словами на первой же правке.
+    """
+    return (
+        "локальный путь не настроен: "
         + "; ".join(missing)
-        + ". Порядок включения — deploy/LOCAL-REVIEW.md",
+        + ". Порядок включения — deploy/LOCAL-REVIEW.md"
+    )
+
+
+async def open_second_door(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    forge: str,
+    branch: str,
+    generation: int,
+    force_profile: str = "",
+    *,
+    cloud_refusal: str,
+    late_report_recheck: dict[str, Any] | None = None,
+) -> bool:
+    """Вторая дверь: локальный путь ПОСЛЕ наблюдённого отказа облака (#1252).
+
+    Зовётся из ДВУХ мест, и это не украшение: отказ у облака бывает двух
+    видов, и лежат они в разных путях кода. Синхронный — агент не создался
+    (``maybe_dispatch_review``). Асинхронный — агент создался, прогон дошёл
+    до терминального статуса, а отчёта нет (``sweep_review_dispatches``); там
+    прогон УЖЕ оплачен. Закрыть один и забыть второй значит оставить
+    половину сдач без отчёта ровно так же, как сегодня.
+
+    ``cloud_refusal`` — НАБЛЮДЁННАЯ причина, а не догадка о недоступности:
+    текст отказа провайдера или терминальный статус прогона. Он доезжает до
+    карточки, потому что отчёт без имени автора читается как облачный и
+    вводит человека в заблуждение (#1252, AC-4).
+
+    Ненастроенный локальный путь не пишет НИЧЕГО: алерт об отказе облака уже
+    стоит и остаётся единственным следом. Настройка, которой нет, не имеет
+    права менять сегодняшнее поведение — поэтому здесь спрашивается
+    ``review_reach`` (единственный автор этого знания, #1188), а не
+    ``dispatch_local_review``, который на форже с облаком счёл бы
+    достижимость облака своей и запустил прогон.
+
+    Свежесть сдачи перечитывается ЗДЕСЬ, а не у каждого зовущего: между
+    заказом облака и этой развилкой лежит сеть — синхронный путь ждал ответа
+    на создание агента, асинхронный ждал расписания свипа. За это время
+    задачу могли вернуть в работу, пересдать или переставить на другую
+    ветку, и локальный прогон купил бы чтение кода, которого на живой сдаче
+    уже нет. Правило одно, мест применения два, и второе место — ровно тот
+    класс, что уже ловили: один потребитель правила ≠ все.
+
+    ``late_report_recheck`` — заказ, чей провал мы разбираем (когда он
+    известен), пробрасывается дальше в ``dispatch_local_review`` для ПОСЛЕДНЕЙ
+    проверки отчёта непосредственно перед вставкой строки (находка по
+    e69a3d5): здесь, тремя await раньше, отчёт ещё не увидеть.
+    """
+    if not await _submission_still_live(db, task, branch, generation):
+        return False
+    reach = await review_reach(db, forge)
+    if LOCAL_CHANNEL not in reach.ways:
+        return False
+    return await dispatch_local_review(
+        db,
+        task,
+        forge,
+        branch,
+        generation,
+        force_profile,
+        cloud_refusal=cloud_refusal,
+        late_report_recheck=late_report_recheck,
+    )
+
+
+async def _submission_still_live(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    branch: str,
+    generation: int,
+) -> bool:
+    """Та ли ещё сдача ждёт отчёта, по СВЕЖЕЙ строке задачи (#1252).
+
+    Читается из базы, а не из ``task``: словарь на руках — снимок, сделанный
+    до сетевого ожидания, и именно поэтому он ничего не доказывает.
+    """
+    row = await repo.get_task(db, int(task["id"]))
+    if row is None:
+        return False
+    fresh = dict(row)
+    return (
+        fresh.get("status") == "review"
+        and int(fresh.get("submission_generation") or 0) == generation
+        and (fresh.get("branch") or "").strip() == branch
     )
 
 
@@ -1841,6 +2200,9 @@ async def dispatch_local_review(
     branch: str,
     generation: int,
     force_profile: str = "",
+    *,
+    cloud_refusal: str = "",
+    late_report_recheck: dict[str, Any] | None = None,
 ) -> bool:
     """Добыть ревью там, куда облако не дотягивается. True — прогон запущен.
 
@@ -1848,15 +2210,38 @@ async def dispatch_local_review(
     месте — это ровно то, что задача #1180 закрывает: на GitVerse вердикт
     выносился вообще без второго читателя, и по карточке это выглядело как
     «ревью не потребовалось».
+
+    ``late_report_recheck`` — заказ второй двери, чей провал мы разбираем
+    (находка по e69a3d5). Между рунг-проверкой в ``_second_door_after_run`` и
+    вставкой строки ниже лежат перечитывание свежести сдачи и достижимости
+    (``open_second_door``), счёт потраченного и подготовка заказа —
+    ``prepare_review_order`` только что сходила за диффом и правилами
+    репозитория. Отчёт, доехавший за это время, ту раннюю проверку не видит
+    вовсе. Здесь — ПОСЛЕДНЕЕ слово, ближе к вставке уже некуда: деньги тратит
+    именно она.
     """
     task_id = int(task["id"])
     reach = await review_reach(db, forge)
-    if not reach.runnable:
+    principal_id = await local_reviewer_principal_id(db)
+    if LOCAL_CHANNEL not in reach.ways or principal_id is None:
+        # Спрашивается ЛОКАЛЬНЫЙ канал, а не ``runnable``: на форже из
+        # CLOUD_REVIEW_FORGES ways непуст из-за облака даже тогда, когда
+        # локального пути нет вовсе, и старая проверка пропускала заказ
+        # дальше. Принципал перечитывается ЗДЕСЬ и здесь же судится: между
+        # готовностью и заказом лежит await, а токен ревьюера могут отозвать
+        # — и заказ уехал бы под NULL, то есть отчёт перестал бы быть чужим
+        # автору, ради чего прогон и покупается (#1128, #1252).
+        #
         # Причина та же, что увидит человек в форме проекта и в отказе на
         # записи: у неё один автор (#1188), иначе три места объясняли бы
         # одно состояние тремя разными словами.
-        return await _refuse_local_review(db, task_id, reach.reason)
-    principal_id = await local_reviewer_principal_id(db)
+        missing = reach.local_missing or (
+            "LOCAL_REVIEWER_HUB_TOKEN (токен принципала ревьюера) "
+            "не разрешается в принципала",
+        )
+        return await _refuse_local_review(
+            db, task_id, reach.reason or local_path_refusal(missing)
+        )
     spent = await _tokens_already_spent(db, task_id)
     if spent >= config.LOCAL_REVIEW_TOKEN_CEILING:
         return await _refuse_local_review(
@@ -1880,6 +2265,35 @@ async def dispatch_local_review(
         force_profile=force_profile,
         principal_id=principal_id,
     )
+    # #1252: причина, по которой отчёт добывается ЗДЕСЬ, а не в облаке, —
+    # разная в двух случаях, и обе называются. «Облако сюда не дотягивается»
+    # — свойство форжа (#1180). «Облако отказало» — наблюдённый факт про
+    # конкретную сдачу, и человеку нужен именно он: без него отчёт второго
+    # поставщика читается как облачный. Считается ДО последнего слова — не
+    # зависит от базы, и нужна и вставке (second_door_reason), и карточке.
+    why = (
+        f"облако отчёта НЕ дало — {cloud_refusal}; отчёт добывается ВТОРЫМ "
+        "поставщиком, локальным (#1252)"
+        if cloud_refusal
+        else f"форж «{forge}» облачному ревьюеру недоступен"
+    )
+    # ЕДИНСТВЕННОЕ последнее слово перед тратой денег (#1266). Рунг-проверка
+    # в _second_door_after_run — только первая; prepare_review_order выше
+    # сама по себе не быстрая (дифф, правила репозитория), а свежесть сдачи
+    # могла смениться в том же окне (пересдача, снятие с ревью) — не только
+    # отчёт заказа, который мы заменяем. Обе проверки здесь — уже
+    # существующие функции (_submission_still_live — тот же дешёвый фильтр,
+    # что стоит и в начале open_second_door, но авторитетен только он;
+    # _dispatch_report — тот же, что и рунг-проверка выше), третьей копии ни
+    # одной из них не заводится. Тихий отказ (без своего алерта): карточка
+    # уже называет причину провалившегося заказа, вторую на то же состояние
+    # не заводим (#1188).
+    if not await _submission_still_live(db, task, branch, generation):
+        return False
+    if late_report_recheck is not None and (
+        await _dispatch_report(db, task_id, generation, late_report_recheck) is not None
+    ):
+        return False
     run_id = uuid.uuid4().hex[:12]
     dispatch_id = await repo.create_review_dispatch(
         db,
@@ -1891,14 +2305,18 @@ async def dispatch_local_review(
         profile=order.profile,
         reviewer_principal_id=principal_id,
         channel=LOCAL_CHANNEL,
+        replaces_dispatch_id=(
+            int(late_report_recheck["id"]) if late_report_recheck is not None else None
+        ),
+        second_door_reason=why,
     )
     await repo.add_task_update(
         db,
         task_id,
         "hub",
         "status",
-        f"Машинное ревью запущено ЛОКАЛЬНО: форж «{forge}» облачному ревьюеру "
-        f"недоступен, прогон идёт на хосте хаба под песочницей (#1180). "
+        f"Машинное ревью запущено ЛОКАЛЬНО: {why}, "
+        f"прогон идёт на хосте хаба под песочницей (#1180). "
         f"Профиль {order.profile}, прогон {run_id}. Правила репозитория: "
         f"{order.rules_note} (#873). Предмет ревью: {order.diff_note} (#874). "
         "Отчёт придёт по контракту от принципала локального ревьюера — "
@@ -1950,13 +2368,25 @@ async def _refuse_local_review(
 
 
 async def _tokens_already_spent(db: aiosqlite.Connection, task_id: int) -> int:
-    """Сколько токенов задача уже стоила по отчётам ревью.
+    """Сколько токенов задача уже стоила — по всему, где сумма СКАЗАНА.
 
-    Считается по ОТЧЁТАМ, а не по числу прогонов: прогон, о котором ревьюер
+    Считается по отчётам, а не по числу прогонов: прогон, о котором ревьюер
     не отчитался, деньги всё равно стоил, но назвать сумму мы можем только
     там, где она сказана. Незнание здесь склоняется в сторону прогона —
     пропущенное ревью дороже лишнего, — и это тот же выбор направления
     ошибки, что в #762.
+
+    #1252: посылка «у прогона без отчёта суммы нет» на пути второй двери
+    неверна. Свип строкой выше спрашивает счёт у провайдера и кладёт его в
+    ``review_dispatches.provider_tokens`` (#1026) — то есть в тот момент,
+    когда открывается вторая дверь, оплаченный прогон УЖЕ назван, а потолок
+    считал его нулём и обходился. Слагаемое второе: заказы, не доставившие
+    отчёт. Они не пересекаются с первым — счёт доставленного отчёта лежит и
+    на строке ``machine_reviews`` (``set_machine_review_provider_tokens``), и
+    такой заказ закрыт как ``done``; двойного счёта тут нет.
+
+    NULL остаётся незнанием и по-прежнему склоняется в сторону прогона: ноль
+    в сумме, а не запрет.
     """
     rows = await fetchall(
         db,
@@ -1964,7 +2394,14 @@ async def _tokens_already_spent(db: aiosqlite.Connection, task_id: int) -> int:
         "FROM machine_reviews WHERE task_id = ?",
         (task_id,),
     )
-    return int(dict(rows[0])["total"]) if rows else 0
+    reported = int(dict(rows[0])["total"]) if rows else 0
+    unreported = await fetchall(
+        db,
+        "SELECT COALESCE(SUM(provider_tokens), 0) AS total FROM review_dispatches "
+        "WHERE task_id = ? AND status <> 'done' AND provider_tokens IS NOT NULL",
+        (task_id,),
+    )
+    return reported + (int(dict(unreported[0])["total"]) if unreported else 0)
 
 
 @dataclass(frozen=True)
@@ -2277,9 +2714,18 @@ async def _settle_local_run(
     from hub.services.machine_review_intake import ORIGIN_LOCAL_TEXT
 
     report = parse_report_block(run.output if run else None)
-    if report is not None and await _store_report(
-        db, dispatch, report, ORIGIN_LOCAL_TEXT
-    ):
+    stored = (
+        _REPORT_NOT_STORED
+        if report is None
+        else await _store_report(db, dispatch, report, ORIGIN_LOCAL_TEXT)
+    )
+    if stored == _REPORT_STALE:
+        # #1260: отказ уже назван в карточке. «Прогон не состоялся» поверх
+        # него было бы ложью: отчёт был, но о прежней сдаче.
+        await repo.set_review_dispatch_status(db, dispatch_id, "failed")
+        await db.commit()
+        return
+    if stored == _REPORT_STORED:
         await repo.add_task_update(
             db,
             task_id,
@@ -2432,11 +2878,21 @@ async def _dispatch_report(
     # Exact for every current path, because a second dispatch exists only
     # after the first report bought it (top-up is the sole same-generation
     # re-dispatch).
+    #
+    # #1252: ступень считается СРЕДИ ЗАКАЗОВ ТОГО ЖЕ ПРИНЦИПАЛА И КАНАЛА, а
+    # не среди всех. Вторая дверь сделала «все заказы поколения» неверной
+    # меркой: облачный и локальный заказы живут в одном поколении, а
+    # принципалы у них разные — иначе отчёт не был бы независимым (#1128).
+    # Локальный заказ оказывался ступенью 1, а у локального принципала отчёт
+    # был первым (индекс 0), и годный контрактный отчёт не опознавался своим
+    # же заказом: прогон объявлялся упавшим, а закрытого заказа не
+    # оставалось вовсе — то есть пустое ревью не могло дать автовердикт.
     dispatch_ids = await fetchall(
         db,
         "SELECT id FROM review_dispatches WHERE task_id = ? "
-        "AND submission_generation = ? ORDER BY id",
-        (task_id, generation),
+        "AND submission_generation = ? AND reviewer_principal_id = ? "
+        "AND channel = ? ORDER BY id",
+        (task_id, generation, expected, dispatch.get("channel") or CLOUD_CHANNEL),
     )
     order = [int(dict(r)["id"]) for r in dispatch_ids]
     try:
@@ -2444,6 +2900,42 @@ async def _dispatch_report(
     except (ValueError, KeyError, TypeError):
         return None  # the dispatch row is gone or unreadable — nothing to match
     return own[rung] if rung < len(own) else None
+
+
+async def dispatch_for_report(
+    db: aiosqlite.Connection, task_id: int, generation: int, report: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The dispatch THIS report belongs to — the inverse of ``_dispatch_report``.
+
+    #1266 round 2 (715481fedbf41130): the report shown in the brief is the
+    LATEST report (``get_latest_machine_review``, ordered by report id), but
+    ``get_settled_review_dispatch`` names the LATEST DONE dispatch (ordered
+    by dispatch id). Those are different rows in the AC-5 shape: a local
+    replacement can settle with its own report before an earlier cloud order
+    settles with ITS late report — the local dispatch then has the higher id
+    even though its report is the older one. Naming the channel from "latest
+    done dispatch" then paints a cloud report as local.
+
+    Rather than inventing a second matching rule, this walks every dispatch
+    of the generation and asks the SAME question ``_dispatch_report`` already
+    answers authoritatively (principal+channel+rung) — "is THIS dispatch's
+    own report exactly the one being shown" — and returns the first match.
+    """
+    report_id = report.get("id")
+    if report_id is None:
+        return None
+    rows = await fetchall(
+        db,
+        "SELECT * FROM review_dispatches WHERE task_id=? "
+        "AND submission_generation=? ORDER BY id",
+        (task_id, generation),
+    )
+    for row in rows:
+        dispatch = dict(row)
+        matched = await _dispatch_report(db, task_id, generation, dispatch)
+        if matched is not None and matched.get("id") == report_id:
+            return dispatch
+    return None
 
 
 def _provider_token_total(usage: dict[str, Any] | None) -> int | None:
@@ -2503,8 +2995,8 @@ def parse_report_block(text: str | None) -> Any | None:
 
 async def _recover_report_from_run(
     db: aiosqlite.Connection, dispatch: dict[str, Any], run: dict[str, Any]
-) -> bool:
-    """Record the report a finished run left in its text. True when stored.
+) -> str:
+    """Record the report a finished run left in its text; see _store_report.
 
     The path exists because the contract path stopped working: Cursor no
     longer delivers the hub's MCP into a cloud run, so since 22.08 reviewers
@@ -2536,11 +3028,12 @@ async def _recover_report_from_run(
                 "по прозе. Текст сохранён как есть, находки из него никем не "
                 f"подтверждены (#1036):\n\n{tail[:4000]}",
             )
-        return False
+        return _REPORT_NOT_STORED
     from hub.services.machine_review_intake import ORIGIN_RUN_TEXT
 
-    if not await _store_report(db, dispatch, report, ORIGIN_RUN_TEXT):
-        return False
+    stored = await _store_report(db, dispatch, report, ORIGIN_RUN_TEXT)
+    if stored != _REPORT_STORED:
+        return stored
     await repo.add_task_update(
         db,
         task_id,
@@ -2551,7 +3044,7 @@ async def _recover_report_from_run(
         "блоком в ответе. Он записан с пометкой происхождения — это слабее "
         "отчёта, сданного по контракту: прогон писал его о себе сам (#1036).",
     )
-    return True
+    return _REPORT_STORED
 
 
 async def _sweep_orphan_local(
@@ -2606,13 +3099,22 @@ async def _sweep_orphan_local(
     await db.commit()
 
 
+# Исходы записи отчёта из текста прогона (#1260). Три, а не True/False:
+# «отчёт о прежней сдаче» — не «отчёт не разобрался», и путь, закрывающий
+# прогон, обязан их различать, иначе причина отказа тонет в общей ветке.
+_REPORT_STORED = "stored"
+_REPORT_STALE = "stale"
+_REPORT_NOT_STORED = "not_stored"
+_GENERATION_MOVED = "chat_pair_generation_moved"
+
+
 async def _store_report(
     db: aiosqlite.Connection,
     dispatch: dict[str, Any],
     report: Any,
     origin: str,
-) -> bool:
-    """Записать отчёт, оставленный прогоном в СВОЁМ тексте. True — записан.
+) -> str:
+    """Записать отчёт, оставленный прогоном в СВОЁМ тексте; вернуть исход.
 
     Владелец отчёта берётся из строки диспетчера, а не из того, как отчёт
     называет себя сам: иначе он прочитался бы как чужой собственному вызову —
@@ -2623,8 +3125,16 @@ async def _store_report(
     Одна реализация на оба канала намеренно: облачный и локальный прогон
     оставляют текст по одной и той же причине и с одинаковой доказательной
     силой, и две копии этого правила разошлись бы на первой же правке.
+
+    Закрепление сдачи — тоже из строки диспетчера (#1260), по тому же
+    принципу, что и владелец: прогон судил дифф поколения, на которое его
+    заказали, и отчёт, доехавший после пересдачи, не засчитывается новой.
+    Отказ пишется в карточку названной причиной ДО общего except: иначе он
+    был бы неотличим от испорченного отчёта и пропал бы в журнале.
     """
     task_id = int(dispatch["task_id"])
+    from fastapi import HTTPException
+
     from hub.services.machine_review_intake import record_machine_review
 
     try:
@@ -2635,11 +3145,28 @@ async def _store_report(
             principal_id=dispatch.get("reviewer_principal_id"),
             username=(dispatch.get("model") or "cursor-cloud-reviewer"),
             origin=origin,
+            expected_generation=int(dispatch["submission_generation"]),
         )
+    except HTTPException as exc:
+        detail: dict[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}
+        if detail.get("reason") != _GENERATION_MOVED:
+            log.exception("could not record the report recovered for task #%s", task_id)
+            return _REPORT_NOT_STORED
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            "Отчёт ревью, оставленный прогоном в тексте, НЕ записан: "
+            f"{detail.get('message')} Прогон судил прежний дифф, и засчитать "
+            "его текущей сдаче значило бы считать прочитанным код, которого "
+            "ревью не видело. Строка прогона закрыта (#1260).",
+        )
+        return _REPORT_STALE
     except Exception:  # noqa: BLE001 - the sweep must survive a bad report
         log.exception("could not record the report recovered for task #%s", task_id)
-        return False
-    return True
+        return _REPORT_NOT_STORED
+    return _REPORT_STORED
 
 
 async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
@@ -2653,6 +3180,11 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     for row in await repo.list_active_review_dispatches(db):
         dispatch = dict(row)
         task_id = dispatch["task_id"]
+        if dispatch.get("status") == SECOND_DOOR_OWED:
+            # Долг, записанный прошлым проходом (или прошлой жизнью процесса):
+            # облако уже отказало вслух, вторая дверь ещё не открыта.
+            await _settle_second_door(db, dispatch)
+            continue
         if dispatch.get("channel") == LOCAL_CHANNEL:
             # Локальный прогон досматривает своя корутина (#1180). Свипу тут
             # остаётся один случай — процесс хаба, перезапущенный посреди
@@ -2709,34 +3241,618 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
         if not grace_rows:
             continue
         await _stamp_dispatch_usage(db, dispatch)
-        if await _recover_report_from_run(db, dispatch, run):
-            await repo.set_review_dispatch_status(db, dispatch["id"], "done")
+        recovered = await _recover_report_from_run(db, dispatch, run)
+        if recovered != _REPORT_NOT_STORED:
+            # #1260: отчёт о прежней сдаче уже назван в карточке; вторая
+            # дверь за него не покупается — он был, но судил другой дифф.
+            await repo.set_review_dispatch_status(
+                db, dispatch["id"], "done" if recovered == _REPORT_STORED else "failed"
+            )
             await db.commit()
             continue
-        await repo.add_task_update(
+        await _close_a_run_without_a_report(db, dispatch, run)
+
+
+async def _close_a_run_without_a_report(
+    db: aiosqlite.Connection, dispatch: dict[str, Any], run: dict[str, Any]
+) -> None:
+    """Прогон дошёл до конца и отчёта не оставил: назвать это и открыть дверь.
+
+    #1252: отчёт перечитывается НЕПОСРЕДСТВЕННО перед тем, как назвать его
+    отсутствующим. Между первой проверкой в свипе и этим местом лежат два
+    сетевых ожидания — терминальное состояние прогона и расход, — и
+    контрактный отчёт, доехавший в это окно, заставал решение «отчёта нет»
+    уже принятым: алерт «отчёт НЕ сдан», вторая дверь, лишние деньги и два
+    соперничающих отчёта на одну сдачу.
+
+    Эта проверка — первая из ДВУХ, и вторая важнее. Здесь закрывается ложь в
+    карточке; деньги тратятся ниже по пути, и последнее слово перед заказом
+    говорит ``_second_door_after_run``. Окно между двумя проверками — запись
+    долга, чтение задачи и проекта, а на возобновлении ещё и весь перерыв
+    между проходами свипа — как раз то, где отчёт успевает доехать. Один
+    потребитель правила ≠ все.
+
+    Доехавший отчёт здесь НЕ закрывается на месте: строка остаётся активной,
+    и следующий проход разбирает её обычным путём — со сверкой расхода по
+    данным провайдера (#1026). Второй автор этого закрытия разошёлся бы с
+    первым на первой же правке.
+    """
+    task_id = int(dispatch["task_id"])
+    run_status = str(run.get("status") or "")
+    if (
+        await _dispatch_report(db, task_id, dispatch["submission_generation"], dispatch)
+        is not None
+    ):
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Кросс-модельное ревью вызвано, но отчёт НЕ сдан: агент "
+        f"{dispatch['agent_id']} ({dispatch['model']}) завершил ран со "
+        f"статусом {run.get('status')}, machine-review актуальной "
+        "генерации отсутствует. Вердикт остаётся человеку (#757).",
+    )
+    task_row = await repo.get_task(db, task_id)
+    task_status = dict(task_row)["status"] if task_row else ""
+    if task_status != "review":
+        await repo.insert_event(
             db,
-            task_id,
-            "hub",
-            "alert",
-            f"Кросс-модельное ревью вызвано, но отчёт НЕ сдан: агент "
-            f"{dispatch['agent_id']} ({dispatch['model']}) завершил ран со "
-            f"статусом {run.get('status')}, machine-review актуальной "
-            "генерации отсутствует. Вердикт остаётся человеку (#757).",
+            kind="review_dispatch_failed",
+            task_id=task_id,
+            actor="hub",
+            payload={
+                "dispatch_id": dispatch["id"],
+                "model": dispatch.get("model") or "",
+                "run_status": run.get("status"),
+                "task_status": task_status,
+            },
         )
-        task_row = await repo.get_task(db, task_id)
-        task_status = dict(task_row)["status"] if task_row else ""
-        if task_status != "review":
-            await repo.insert_event(
-                db,
-                kind="review_dispatch_failed",
-                task_id=task_id,
-                actor="hub",
-                payload={
-                    "dispatch_id": dispatch["id"],
-                    "model": dispatch.get("model") or "",
-                    "run_status": run.get("status"),
-                    "task_status": task_status,
-                },
-            )
+    # МЕСТО ПРИМЕНЕНИЯ №2 второй двери (#1252): отказ АСИНХРОННЫЙ — агент
+    # создался, прогон дошёл до терминального статуса, отчёта нет. Прогон тут
+    # УЖЕ оплачен, и это единственное, чем этот случай отличается от
+    # синхронного: без отчёта сдача стоит одинаково мёртво.
+    #
+    # Строка НЕ закрывается раньше, чем долг отдан. Закрытая строка невидима
+    # свипу, и сбой между двумя записями — упавший процесс или исключение в
+    # подготовке заказа, где git ходит в сеть, — уносил бы обещанную вторую
+    # дверь навсегда: поллер глотает исключение и идёт дальше.
+    await repo.owe_second_door(db, dispatch["id"], run_status)
+    await db.commit()
+    dispatch["run_status"] = run_status
+    await _settle_second_door(db, dispatch, task_row=task_row)
+
+
+async def _settle_second_door(
+    db: aiosqlite.Connection,
+    dispatch: dict[str, Any],
+    *,
+    task_row: Any | None = None,
+) -> None:
+    """Отдать долг второй двери и только потом закрыть строку (#1252).
+
+    Зовётся из двух моментов одного и того же пути: сразу после записи долга
+    и на возобновлении, когда предыдущая попытка не дошла до конца. Алерт об
+    отказе облака здесь НЕ повторяется — он записан вместе с долгом, и
+    повторять его на каждом проходе значило бы превратить один наблюдённый
+    факт в поток.
+
+    #1252: долг отдаётся ОДИН раз, и это проверяется НАБЛЮДЕНИЕМ, а не
+    порядком записей. Возобновление существует именно потому, что хаб может
+    умереть посередине, — а умереть он может и после того, как локальный
+    заказ закоммичен, но до того, как долг помечен закрытым. Тогда при
+    рестарте видны обе строки, облачная разбирается первой (ORDER BY id), и
+    без этой проверки она покупала бы ВТОРОЙ прогон на то же поколение.
+
+    Находка внешнего ревьюера по коммиту e69a3d5 (P1) и её остаток по #1266:
+    строка ЭТОГО заказа закрывалась в ``failed`` БЕЗУСЛОВНО, даже когда у неё
+    самой уже нашёлся СВОЙ отчёт — потому что ``_second_door_already_opened``
+    спрашивалась РАНЬШЕ. На возобновлении после падения это не гипотетика:
+    локальная замена уже закоммичена (долг «отдан» с точки зрения этой
+    проверки), а поздний облачный отчёт ЭТОГО же заказа мог доехать в то же
+    самое окно. Статус берётся из того, что в самом деле нашлось для ЭТОГО
+    заказа, а не из того, приоткрыта ли дверь: СВОЙ отчёт красноречивее
+    замены, потому что замена — это и есть ответ на его отсутствие, а не
+    независимое свидетельство.
+    """
+    task_id = int(dispatch["task_id"])
+    generation = int(dispatch["submission_generation"])
+    if await _dispatch_report(db, task_id, generation, dispatch) is not None:
+        await repo.set_review_dispatch_status(db, dispatch["id"], "done")
+        await db.commit()
+        return
+    if await _second_door_already_opened(db, dispatch):
         await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
         await db.commit()
+        return
+    if task_row is None:
+        task_row = await repo.get_task(db, task_id)
+    settled_by_its_own_report = await _second_door_after_run(
+        db, dispatch, task_row, dispatch.get("run_status") or "терминальным"
+    )
+    await repo.set_review_dispatch_status(
+        db, dispatch["id"], "done" if settled_by_its_own_report else "failed"
+    )
+    await db.commit()
+
+
+async def _second_door_already_opened(
+    db: aiosqlite.Connection, dispatch: dict[str, Any]
+) -> bool:
+    """Есть ли по ЭТОМУ долгу живой или удавшийся локальный заказ (#1252).
+
+    Упавший локальный заказ сюда НЕ считается: он говорит «вторую дверь
+    попробовали и она не сработала», и запретить по нему новую попытку
+    значило бы закрыть дверь именно там, где она нужнее всего. Считается
+    только заказ, который ещё идёт или уже принёс отчёт, — то есть долг,
+    который в самом деле отдан.
+
+    Находка внешнего ревьюера по коммиту e69a3d5 (P1): task_id+generation+
+    channel одних отличает «долг отдан» от «долг ещё не отдан», но НЕ
+    отличает РАЗНЫЕ долги внутри одного поколения. Лестница (#879) может
+    внутри одной сдачи открыть вторую дверь дважды — дешёвый прогон
+    провалился, локальный LITE ответил, а его неполный отчёт купил тяжёлый
+    облачный добор, который тоже провалился. Без ``id > dispatch['id']``
+    этот запрос находил ПЕРВЫЙ (LITE) локальный заказ и считал долг ВТОРОГО
+    (DEEP) провала уже оплаченным — тяжёлый добор так и не заказывался.
+
+    ``id`` растёт монотонно в порядке вставки (как и везде в этом модуле —
+    рунг-сопоставление, ``get_settled_review_dispatch``), и локальный заказ,
+    отвечающий на провал ИМЕННО этого облачного заказа, обязан появиться
+    ПОСЛЕ него: раньше него в базе может быть только заказ, оплативший
+    какой-то более ранний долг.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM review_dispatches WHERE task_id = ? "
+        "AND submission_generation = ? AND channel = ? "
+        "AND status IN ('active', 'done') AND id > ? LIMIT 1",
+        (
+            int(dispatch["task_id"]),
+            int(dispatch["submission_generation"]),
+            LOCAL_CHANNEL,
+            int(dispatch["id"]),
+        ),
+    )
+    return bool(rows)
+
+
+async def _second_door_after_run(
+    db: aiosqlite.Connection,
+    dispatch: dict[str, Any],
+    task_row: Any,
+    run_status: Any,
+) -> bool:
+    """Позвать второго поставщика по прогону, кончившемуся без отчёта (#1252).
+
+    Гейты здесь — про то, что сдача ВСЁ ЕЩЁ ждёт отчёта, а не про сам отказ:
+    задача в review, поколение то же, что у провалившегося заказа, политика
+    по-прежнему просит ревьюера. Свип бежит по расписанию, и между заказом и
+    его разбором задачу могли вернуть в работу, пересдать или снять политику.
+
+    Возвращает True, когда у ЭТОГО заказа в итоге нашёлся СВОЙ отчёт (гонка с
+    поздним отчётом облака — заказ обязан закрыться им как ``done``, а не
+    ``failed``), и False во всех остальных случаях (дверь открыта, отказана
+    или не понадобилась). Решение принимает вызывающий (``_settle_second_
+    door``), потому что статус ЭТОГО заказа — его забота, а не этой функции.
+    """
+    if task_row is None:
+        return False
+    task = dict(task_row)
+    generation = int(dispatch["submission_generation"])
+    if task.get("status") != "review":
+        return False
+    if int(task.get("submission_generation") or 0) != generation:
+        return False
+    branch = (task.get("branch") or "").strip()
+    if not branch:
+        return False
+    project = await repo.resolve_project_for_task(db, int(task["id"]))
+    if project is None or not review_dispatch_enabled(gate_policy_of(project)):
+        return False
+    # Первая из ДВУХ проверок отчёта (#1252). Ещё одну, ПОСЛЕДНЮЮ, делает
+    # dispatch_local_review непосредственно перед вставкой строки заказа —
+    # между ЭТИМ местом и той вставкой ``open_second_door`` перечитывает
+    # свежесть сдачи и достижимость, а сам заказ считает потолок стоимости и
+    # готовит дифф/правила (``prepare_review_order``), и отчёт, доехавший в
+    # это куда более длинное окно, эта проверка одна не увидит. Проверка
+    # именно рунг-совпадением (#1025), а не «есть ли хоть какой-то отчёт
+    # этого поколения»: у добора лестницы (#879) отчёт предыдущей ступени
+    # законно есть, и запрет по нему закрыл бы дверь перед заказом, который
+    # как раз и заказывали вторым.
+    if await _dispatch_report(db, int(task["id"]), generation, dispatch) is not None:
+        return True
+    await open_second_door(
+        db,
+        task,
+        project_policy.forge_of(project),
+        branch,
+        generation,
+        # Замена обязана доехать ТЕМ ЖЕ профилем, каким заказывали упавший
+        # прогон (#1252, тот же класс, что находка 7ed386a8 на #1180). Без
+        # проброса dispatch_local_review считает профиль заново и на сдаче
+        # низкого риска понижает добор до lite — а вместе с упавшим заказом
+        # эта замена выводит счёт заходов за REVIEW_LADDER_MAX_STEPS, то есть
+        # неполный отчёт lite уже НЕ сможет позвать новый deep. Лестница
+        # ломается молча и в сторону более дешёвого прогона.
+        #
+        # Форсируется только deep: понижать замену запрещено, а навязывать
+        # lite там, где сегодняшний выбор сказал бы deep, — тот же дефект
+        # зеркально.
+        DEEP if (dispatch.get("profile") or "").strip() == DEEP else "",
+        # #1266 раунд 2 (7a78080de93938ae): пустой agent_id здесь значит
+        # СИНХРОННЫЙ отказ на СОЗДАНИИ (заглушка долга из maybe_dispatch_
+        # review, а не прогон, дошедший до терминального статуса) — агента и
+        # рана не было вовсе, и текст «прогон... кончился статусом» был бы
+        # ложью про событие, которого не случилось. run_status для заглушки
+        # несёт НАБЛЮДЁННУЮ причину отказа (_lost_call_detail), а не код
+        # статуса рана, и печатается как есть, без обёртки «кончился».
+        cloud_refusal=(
+            f"провайдер отказал в создании агента: {run_status}"
+            if not (dispatch.get("agent_id") or "").strip()
+            else (
+                f"прогон облачного агента {dispatch['agent_id']} "
+                f"({dispatch.get('model') or 'модель не названа'}) кончился "
+                f"статусом {run_status} и отчёта не оставил"
+            )
+        ),
+        late_report_recheck=dispatch,
+    )
+    # Последнее слово — уже ПОСЛЕ попытки открыть дверь, а не только до неё
+    # (находка по e69a3d5). Что бы ни случилось внутри — дверь открылась,
+    # отказала по конфигурации/потолку, или её остановила ПОСЛЕДНЯЯ проверка
+    # внутри dispatch_local_review, — единственная правда сейчас в базе:
+    # если СВОЙ отчёт этого заказа тем временем нашёлся, статус решает он, а
+    # не путь, которым мы сюда пришли.
+    return await _dispatch_report(db, int(task["id"]), generation, dispatch) is not None
+
+
+# ---------------------------------------------------------------------------
+# Круг ревью: заходы, где находки ЗАКРЫВАЛИСЬ (#1235)
+# ---------------------------------------------------------------------------
+#
+# Два потолка уже стоят, и оба ловят ПОВТОР БЕЗ ИЗМЕНЕНИЯ: бюджет циклов
+# считает возвраты работы автору (review_cycle), потолок драфта (#1161)
+# стоит на неизменившейся ревизии постановки. Круг, наблюдённый 09.09.2026
+# на #1171, #1208 и #1169, не ловится ни тем, ни другим по построению: код
+# менялся по-настоящему, каждая пересдача несла реальную работу и честно
+# покупала новый глубокий прогон, который находил следующий слой. На #1171
+# review_cycle оставался нулём при третьем заходе.
+#
+# Поэтому здесь СЧИТАЮТСЯ ПОКОЛЕНИЯ, а не возвраты, и ничего не
+# останавливается. Ревью не глушится, пересдача не запрещается, статус не
+# меняется: находки в таком круге настоящие (из 25 неразрешённых за день
+# настоящими оказались 24), и механизм, который упёрся бы в потолок на
+# задаче, где каждый заход закрывает настоящие дефекты, вытолкнул бы к
+# человеку именно ту работу, которая шла верно. Хаб называет круг и зовёт
+# человека решать — этим его полномочия и кончаются.
+
+#: Исходы, которыми автор говорит, что дефекта в коде больше нет — он его
+#: ПОПРАВИЛ. ``fixed`` из словаря подтверждённых находок, ``real_fixed`` —
+#: из словаря неразрешённых (#1085).
+#:
+#: Свой набор, а не ``models._SELF_EVIDENT_OUTCOMES``, хотя состав сегодня
+#: совпадает буква в букву. Тот отвечает на вопрос «обязан ли этот исход
+#: нести строку объяснения», этот — на вопрос «была ли на этом заходе
+#: сделана работа». Два разных вопроса, совпавших в ответе, разойдутся на
+#: первом же новом слове в любом из словарей, и заход тогда считался бы по
+#: признаку из чужой задачи.
+#:
+#: ``false_positive``, ``not_a_defect``, ``wont_fix``, ``deferred``,
+#: ``real_deferred`` и ``not_judged`` сюда не входят намеренно: круг, ради
+#: которого всё это заведено, — про поколения, где автор ЧИНИЛ и получал
+#: новый слой. Пересдача, на которой все находки объявлены ложными, — это
+#: не круг, а разговор о точности харнесса, и у него свои метрики.
+CIRCLE_CLOSING_OUTCOMES: frozenset[str] = frozenset({"fixed", "real_fixed"})
+
+#: Метка записи о круге, по которой она находится снова. Внутри — номер
+#: поколения: дедуп обязан быть в его пределах, иначе одна запись за всю
+#: жизнь задачи молчала бы про каждый следующий заход. Образец —
+#: ``NO_REVIEWER_MARK`` выше, и по той же причине ключ разбирается из
+#: текста, а не хранится второй колонкой.
+CIRCLE_MARK = "[круг ревью: сдача {generation}]"
+
+
+@dataclass(frozen=True)
+class CircleLap:
+    """Один заход: находки прошлого поколения закрыты, пришли новые.
+
+    ``generation`` — поколение, В КОТОРОМ пришли новые находки, то есть то,
+    по которому заход и виден. ``closed`` — сколько находок ПРЕДЫДУЩЕГО
+    поколения автор закрыл правкой, ``arrived`` — сколько новых принёс
+    отчёт этого. Оба числа рядом намеренно: одно без другого не отличает
+    круг от обычной работы.
+    """
+
+    generation: int
+    closed: int
+    arrived: int
+    repeated_categories: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReviewCircle:
+    """Сколько заходов подряд задача уже сделала и назван ли круг."""
+
+    laps: tuple[CircleLap, ...]
+    threshold: int
+
+    @property
+    def count(self) -> int:
+        return len(self.laps)
+
+    @property
+    def named(self) -> bool:
+        """Пора ли звать человека. Порог из конфига, сравнение — здесь одно."""
+        return self.threshold > 0 and self.count >= self.threshold
+
+    @property
+    def repeated_categories(self) -> tuple[str, ...]:
+        """Категории, которые новый заход повторил за предыдущим.
+
+        Отдельно от числа заходов, потому что это ДРУГОЙ признак и он
+        важнее: три захода с находками разного рода — работа, идущая
+        вглубь, а повтор категории означает, что харнесс ходит по одному и
+        тому же месту.
+        """
+        seen: list[str] = []
+        for lap in self.laps:
+            for category in lap.repeated_categories:
+                if category not in seen:
+                    seen.append(category)
+        return tuple(seen)
+
+    def breakdown(self) -> list[str]:
+        """По строке на заход: «закрыто / пришло новых», в порядке заходов."""
+        lines: list[str] = []
+        for ordinal, lap in enumerate(self.laps, start=1):
+            line = (
+                f"заход {ordinal} (сдача {lap.generation}): "
+                f"закрыто {lap.closed}, пришло новых {lap.arrived}"
+            )
+            if lap.repeated_categories:
+                line += f"; повтор категории: {', '.join(lap.repeated_categories)}"
+            lines.append(line)
+        return lines
+
+
+def _findings_of(row: dict[str, Any]) -> list[tuple[str, str]]:
+    """Находки одного отчёта как ``(uid, категория)``.
+
+    Обе секции сразу — и подтверждённые, и неразрешённые. Круг, который
+    оплачивался живьём, состоял в основном из НЕРАЗРЕШЁННЫХ находок (#1171:
+    ноль подтверждённых и пять новых неразрешённых), так что счёт по одним
+    подтверждённым не увидел бы его вовсе.
+
+    У неразрешённой записи категории нет — модель её не несёт (#1085), — и
+    здесь она остаётся пустой, а не выдумывается. Пустая категория в
+    сравнение на повтор не входит: «неизвестно» и «то же самое» — разные
+    ответы, и склеить их значило бы объявить повтор там, где о категории
+    ничего не сказано.
+    """
+    from hub.services.finding_identity import finding_uids, unresolved_uids
+
+    out: list[tuple[str, str]] = []
+    try:
+        confirmed = json.loads(row.get("findings_confirmed") or "[]")
+    except ValueError:
+        confirmed = []
+    if isinstance(confirmed, list):
+        entries = [f for f in confirmed if isinstance(f, dict)]
+        for uid, finding in zip(finding_uids(entries), entries):
+            out.append((uid, str(finding.get("category") or "").strip()))
+    try:
+        unresolved = json.loads(row.get("unresolved") or "[]")
+    except ValueError:
+        unresolved = []
+    if isinstance(unresolved, list):
+        entries = [f for f in unresolved if isinstance(f, dict)]
+        for uid in unresolved_uids(entries):
+            out.append((uid, ""))
+    return out
+
+
+async def review_circle(db: aiosqlite.Connection, task_id: int) -> ReviewCircle:
+    """Заходы этой задачи: «находки закрыли — пришли новые», подряд.
+
+    ЗАХОД — это пара поколений: в поколении N отчёт нашёл находки, автор их
+    ЗАКРЫЛ правкой (``CIRCLE_CLOSING_OUTCOMES``), а отчёт поколения N+1
+    принёс находки, которых в N не было. Условий ДВА, и каждое стоит
+    против своей ошибки:
+
+    * ЗАКРЫТИЕ находок поколения N правкой. Оно же закрывает и требование
+      «находки в N были»: закрыть можно только то, что нашли, поэтому
+      пересдача с чистым отчётом заходом не станет (AC-2). Отдельной
+      третьей проверки «находки были» здесь нет намеренно — она
+      недостижима, а условие, которое не может сработать, врёт читателю
+      про свою работу: мутация, снимающая его, не роняет ни одного теста.
+      Проверяется именно закрытие, а не наличие: пересдача, на которой
+      автор объявил все находки ложными или отложил их, работой по коду не
+      была — это разговор о точности харнесса, и у него свои метрики.
+    * НОВЫЕ находки в N+1 — по ``finding_uid``, который выводится из
+      содержания находки (#1007), поэтому тот же дефект, найденный снова,
+      имеет тот же id и новым не считается.
+
+    ПОДРЯД — буквально: считается ХВОСТОВАЯ серия, оканчивающаяся на самом
+    свежем поколении с отчётом. Заход, прервавшийся чистым отчётом,
+    обнуляет счёт, потому что круг на этом и кончился; хранить его как
+    заслугу значило бы позвать человека к задаче, которая уже вышла.
+
+    Поколения без отчёта в счёт не входят и цепь не рвут: отчёта нет —
+    значит, о находках этого поколения не известно ничего, а «неизвестно»
+    не равно «чисто». НЕПОЛНЫЙ отчёт, не принёсший находок, — тот же
+    случай, и потому он тоже пропускается: он САМ говорит, что дочитал не
+    всё, а лестница добора (#879) существует ровно затем, чтобы добрать
+    непрочитанное. Этот же файл уже исключает ``incomplete`` из «код
+    прочитан» по той же причине. Пустой ПОЛНЫЙ отчёт круг по-прежнему
+    кончает: харнесс дочитал и не нашёл ничего.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT submission_generation, findings_confirmed, unresolved, incomplete "
+        "FROM machine_reviews WHERE task_id=? "
+        "ORDER BY submission_generation, id",
+        (task_id,),
+    )
+    per_generation: dict[int, list[tuple[str, str]]] = {}
+    for raw in rows:
+        row = dict(raw)
+        found = _findings_of(row)
+        if not found and bool(row.get("incomplete")):
+            # Сведений ноль: отчёт не дочитал и ничего не принёс. Строка
+            # остаётся в machine_reviews навсегда, поэтому, обнуляй мы по
+            # ней хвост, КАЖДАЯ следующая сдача снова упиралась бы в ту же
+            # пару и снова сбрасывала счёт — круг переставал бы быть
+            # видимым насовсем.
+            continue
+        generation = int(row.get("submission_generation") or 0)
+        per_generation.setdefault(generation, []).extend(found)
+
+    closed_rows = await fetchall(
+        db,
+        "SELECT submission_generation, finding_uid, outcome "
+        "FROM finding_outcomes WHERE task_id=?",
+        (task_id,),
+    )
+    closed: dict[int, set[str]] = {}
+    for raw in closed_rows:
+        row = dict(raw)
+        if str(row.get("outcome") or "") not in CIRCLE_CLOSING_OUTCOMES:
+            continue
+        generation = int(row.get("submission_generation") or 0)
+        closed.setdefault(generation, set()).add(str(row.get("finding_uid") or ""))
+
+    generations = sorted(per_generation)
+    laps: list[CircleLap] = []
+    for previous, current in zip(generations, generations[1:]):
+        before = per_generation[previous]
+        seen = {uid for uid, _ in before}
+        shut = seen & closed.get(previous, set())
+        fresh = [(uid, cat) for uid, cat in per_generation[current] if uid not in seen]
+        if not shut or not fresh:
+            # Цепь оборвалась: дальше считается заново, а не поверх.
+            laps = []
+            continue
+        # Пустая категория отсеивается ОДИН раз, на стороне предыдущего
+        # поколения: непустого имени, равного пустому, не бывает, поэтому
+        # второй такой же отсев на стороне новых находок не мог бы ничего
+        # изменить — и мутация, снимающая его, не роняла ни одного теста.
+        earlier = {cat for _, cat in before if cat}
+        repeated = sorted({cat for _, cat in fresh if cat in earlier})
+        laps.append(
+            CircleLap(
+                generation=current,
+                closed=len(shut),
+                # Уникальные uid, а не длина списка: находки ВСЕХ отчётов
+                # поколения слиты в один список, а лестница добора (#879)
+                # кладёт на поколение два отчёта, и второй часто повторяет
+                # находки первого. Длина списка назвала бы человеку слой
+                # вдвое толще настоящего — ровно то число, по которому он
+                # решает, продолжать круг или нет. Категории считать
+                # заново не нужно: ``repeated`` уже множество.
+                arrived=len({uid for uid, _ in fresh}),
+                repeated_categories=tuple(repeated),
+            )
+        )
+    return ReviewCircle(laps=tuple(laps), threshold=config.REVIEW_CIRCLE_THRESHOLD)
+
+
+async def name_the_circle(db: aiosqlite.Connection, task_id: int) -> bool:
+    """Назвать круг в карточке и позвать человека. True — записали сейчас.
+
+    Ничего не останавливает и остановить не может: статуса не трогает,
+    диспетч не отменяет, пересдачу не запрещает. Всё, что здесь
+    происходит, — запись в карточке и событие в ленте, потому что решение,
+    где остановиться, принимает человек, а узнать о круге он обязан от
+    хаба, а не из чьего-то пересказа.
+
+    Три исхода названы явно и по именам. Сигнал о круге легко прочесть как
+    разрешение перестать чинить настоящие дефекты, а это самый дорогой из
+    возможных выводов: находки настоящие.
+    """
+    circle = await review_circle(db, task_id)
+    if not circle.named:
+        return False
+    row = await repo.get_task(db, task_id)
+    if row is None:  # pragma: no cover - зовут сразу после записи отчёта
+        return False
+    generation = int(dict(row).get("submission_generation") or 0)
+    mark = CIRCLE_MARK.format(generation=generation)
+    if await _already_named_the_circle(db, task_id, mark):
+        return False
+    repeated = circle.repeated_categories
+    category_line = (
+        (
+            f" ОТДЕЛЬНО: новые находки повторяют категорию предыдущих "
+            f"({', '.join(repeated)}) — это признак, что харнесс ходит по "
+            f"одному и тому же месту, и он важнее числа заходов."
+        )
+        if repeated
+        else ""
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        (
+            f"Задача идёт по кругу {circle.count}-й раз: каждый заход "
+            f"закрывал находки и получал новые. "
+            + "; ".join(circle.breakdown())
+            + f".{category_line} Ревью НЕ выключено и пересдача не запрещена — "
+            "находки настоящие, и молча перестать их искать было бы хуже "
+            "круга. Решает человек, и исходов три: принять как есть, "
+            "отпустить оставшееся в отдельную задачу или продолжать этот "
+            f"круг сознательно (порог REVIEW_CIRCLE_THRESHOLD={circle.threshold}, "
+            f"#1235). {mark}"
+        ),
+    )
+    await repo.insert_event(
+        db,
+        kind="review_circle_named",
+        task_id=task_id,
+        actor="hub",
+        payload={
+            "generation": generation,
+            "laps": circle.count,
+            "threshold": circle.threshold,
+            "breakdown": [
+                {
+                    "generation": lap.generation,
+                    "closed": lap.closed,
+                    "arrived": lap.arrived,
+                    "repeated_categories": list(lap.repeated_categories),
+                }
+                for lap in circle.laps
+            ],
+            "repeated_categories": list(repeated),
+        },
+    )
+    await db.commit()
+    log.info(
+        "task #%s goes in circles: %s laps, generation %s, repeated categories %s",
+        task_id,
+        circle.count,
+        generation,
+        ", ".join(repeated) or "—",
+    )
+    return True
+
+
+async def _already_named_the_circle(
+    db: aiosqlite.Connection, task_id: int, mark: str
+) -> bool:
+    """Называли ли круг на ЭТОЙ сдаче.
+
+    Лестница добора (#879) кладёт на одно поколение два отчёта, и второй
+    заходов не прибавляет — а без дедупа добавил бы вторую одинаковую
+    запись в карточку.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM task_updates WHERE task_id=? AND kind='alert' "
+        "AND content LIKE ? LIMIT 1",
+        (task_id, f"%{mark}%"),
+    )
+    return bool(rows)

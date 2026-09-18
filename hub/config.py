@@ -63,6 +63,26 @@ HUB_HOST = env_get("HUB_HOST", "127.0.0.1")
 HUB_PORT = int(env_get("HUB_PORT", "8080"))
 
 MAX_REVIEW_CYCLES = int(env_get("MAX_REVIEW_CYCLES", "3"))
+# Круг ревью (#1235): сколько ЗАХОДОВ — «находки закрыли, пришли новые» —
+# хаб принимает молча, прежде чем НАЗВАТЬ круг и позвать человека.
+#
+# Это не второй бюджет циклов и не потолок. MAX_REVIEW_CYCLES считает
+# возвраты работы автору и ОСТАНАВЛИВАЕТ задачу; здесь не останавливается
+# ничего — ни ревью, ни пересдача, — потому что находки в таком круге
+# настоящие (09.09.2026: из 25 неразрешённых настоящими оказались 24), и
+# молча перестать их искать было бы хуже круга.
+#
+# Порог живёт в конфиге, а не в коде, ровно потому, что выбран по трём
+# наблюдениям одного дня (#1171, #1208, #1169) — этого мало для числа, и
+# менять его придётся без правки кода. Условие пересмотра записано в
+# постановке: если сигнал срабатывает там, где каждый заход приносил
+# находки ДРУГОГО рода, считать надо повтор категории, а не заходы.
+#
+# 0 ВЫКЛЮЧАЕТ сигнал целиком: заходы считаются по-прежнему и видны в
+# карточке и в брифе, но человека не зовут. Выключатель стоит здесь же,
+# потому что порог назначен по трём наблюдениям одного дня, и первым
+# вопросом к нему будет «как это выключить», а не «на сколько подвинуть».
+REVIEW_CIRCLE_THRESHOLD = int(env_get("REVIEW_CIRCLE_THRESHOLD", "3"))
 # Universal Review Gate (#318): 'forbid' (default) rejects review verdicts
 # from the agent principal that implemented the task (assigned_agent or
 # claimed_by); 'allow' is the explicit solo-mode opt-out.
@@ -303,6 +323,15 @@ STALE_REVIEW_MINUTES = int(env_get("STALE_REVIEW_MINUTES", "120"))
 # mechanically fails (422 dor_failed), and until this watchdog the author
 # learned that only when the owner hit the button.
 UNREFINED_DRAFT_MINUTES = int(env_get("UNREFINED_DRAFT_MINUTES", "240"))
+# Сторож очереди неразобранных находок (#1171). Механика разбора построена
+# целиком — факт касания (#1039), очередь (#1038), кнопки (#876) — и за всё
+# время ею не воспользовались ни разу: 131 подтверждённая находка без ответа,
+# precision=null. Молчание тут неотличимо от пустой очереди, поэтому очередь
+# выше порога говорит вслух. Порог — суждение: 40 находок это больше, чем
+# один заход за раз, и всё ещё меньше, чем накопленный к #1171 запас.
+UNJUDGED_FINDINGS_ALERT_THRESHOLD = int(
+    env_get("UNJUDGED_FINDINGS_ALERT_THRESHOLD", "40")
+)
 # Delivery reconciliation (#897): how often the poller compares "completed"
 # against "the PR is still open", and how far back it looks. On a timer because
 # every candidate costs a call to GitHub; bounded in time because history from

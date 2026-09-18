@@ -166,6 +166,49 @@ async def test_re_reporting_the_same_commit_updates_instead_of_duplicating(db):
     assert results[0]["status"] == "pass"
 
 
+async def test_a_mutation_report_is_stored_and_grants_nothing(db):
+    # #1270: warning only. The mutation result is kept as evidence about the
+    # commit, but it neither applies nor blocks anything by itself.
+    import json
+
+    task_id = await _task(db, generation=1, sha="sha-pinned")
+    out = await accept_ci_run_report(
+        db,
+        task_id,
+        head_sha="sha-pinned",
+        ac_results={},
+        mutations={"state": "baseline_red", "survivors": None},
+    )
+    assert out["applied"] is True
+    assert out["mutations_state"] == "baseline_red"
+    stored = dict(await repo.get_ci_run_report(db, task_id, "sha-pinned"))
+    assert json.loads(stored["mutations"]) == {
+        "state": "baseline_red",
+        "survivors": None,
+    }
+    assert json.loads(stored["checks"]) == {}
+
+
+async def test_a_report_without_mutations_says_none_were_reported(db):
+    task_id = await _task(db, generation=1, sha="sha-pinned")
+    out = await accept_ci_run_report(db, task_id, head_sha="sha-pinned", ac_results={})
+    assert out["mutations_state"] == "not_reported"
+    stored = dict(await repo.get_ci_run_report(db, task_id, "sha-pinned"))
+    assert stored["mutations"] == "{}"
+
+
+async def test_an_oversized_mutation_report_is_refused(db):
+    task_id = await _task(db, generation=1, sha="sha-pinned")
+    with pytest.raises(ValueError, match="mutations"):
+        await accept_ci_run_report(
+            db,
+            task_id,
+            head_sha="sha-pinned",
+            ac_results={},
+            mutations={"state": "ran", "blob": "x" * 40_000},
+        )
+
+
 # ---- the order that actually happens in production ----
 
 
