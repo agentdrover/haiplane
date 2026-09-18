@@ -6355,7 +6355,7 @@ def _contract_reporting_stub(db, principal_id: int, report: dict | None = None):
     двери ни одним тестом не проходился.
     """
 
-    async def _run(prompt: str, *, timeout: int | None = None):
+    async def _run(prompt: str, *, timeout: int | None = None, prompt_at_slot=None):
         from hub.models import MachineReviewSubmit
         from hub.services.machine_review_intake import record_machine_review
 
