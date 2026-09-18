@@ -1309,3 +1309,79 @@ def test_accountable_sections_are_a_subset_of_the_blockers():
         "incomplete — свойство прогона, а не список находок: разбирать по "
         "одной там нечего, и у стюарда он закрыт предусловием"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1268 — суждение не применяется там, где вердикт не отдан стюарду
+# ---------------------------------------------------------------------------
+
+
+async def test_a_judgement_is_never_applied_where_the_verdict_is_not_delegated(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1268 AC-3: теневое участие судит, но не применяет — даже при выданном act.
+
+    Самый опасный случай: STEWARD_MODE=act, измерение автономию выдало (она
+    глобальна, а не по проекту), сдача зелёная, суждение approve. На проекте
+    с verdict=human и признаком тени привратник обязан отказать кодом,
+    называющим политику проекта, и ничего в задаче не сдвинуть.
+
+    Зеркало стоит рядом: та же сдача на проекте с verdict=steward этим кодом
+    не отказывается — иначе проверка была бы выключателем, а не правилом.
+    """
+    from hub.services.steward_apply import REFUSED_NOT_DELEGATED
+    from tests.test_steward_shadow import _pair
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    measured = await _project(db, "apply-measured")
+    for _ in range(10):
+        await _pair(
+            db, measured, steward="changes_requested", human="changes_requested"
+        )
+    for _ in range(2):
+        await _pair(db, measured, steward="escalate", human="approved")
+    from hub.services.steward_shadow import effective_mode
+
+    assert await effective_mode(db) == "act", "предусловие: автономия выдана"
+
+    shadow = await _project(db, "apply-shadow-default")
+    await db.execute(
+        "UPDATE projects SET gate_policy=? WHERE id=?",
+        (
+            json.dumps(
+                {
+                    "dor": "human",
+                    "verdict": "human",
+                    "review": "dispatch",
+                    "steward_shadow": True,
+                }
+            ),
+            shadow,
+        ),
+    )
+    await db.commit()
+    task_id = await _task(db, shadow)
+    await _green(db, task_id)
+    await _judged_with(db, task_id, [])
+    before = dict(await repo.get_task(db, task_id))
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert REFUSED_NOT_DELEGATED in _codes(refusals), (
+        f"вердикт проекта не отдан стюарду — применение обязано быть отказано: "
+        f"{refusals}"
+    )
+    detail = next(d for c, d in refusals if c == REFUSED_NOT_DELEGATED)
+    assert "verdict" in detail and "human" in detail, (
+        "отказ обязан назвать политику проекта, иначе человек не поймёт причину"
+    )
+    after = dict(await repo.get_task(db, task_id))
+    assert after["status"] == before["status"] == "review"
+    assert after["review_verdict"] == before["review_verdict"]
+    assert after["review_verdict_generation"] == before["review_verdict_generation"]
+
+    delegated_task = await _task(db, measured)
+    await _green(db, delegated_task)
+    assert REFUSED_NOT_DELEGATED not in _codes(
+        await apply_refusals(db, delegated_task)
+    ), "verdict=steward отказом политики не задерживается"
