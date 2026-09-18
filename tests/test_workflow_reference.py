@@ -252,6 +252,14 @@ def test_machine_review_gate_in_reference():
 
 _TOOL = r"(hub_[a-z_]+)"
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
+# Имя в перечне «takes» почти никогда не стоит в части одно: за последним
+# элементом идёт многоточие, тире или пояснение. Требование «вся часть —
+# идентификатор» роняло как раз последний элемент, то есть слепло на форме из
+# комментария выше. Имя читается из головы части, а хвост допускается, только
+# если он явно НЕ продолжает имя (конец части, многоточие, тире, двоеточие).
+# Слово, за которым идут другие слова, — проза («and hands back a
+# wait_baseline»), и аргументом не считается.
+_TAKES_NAME = re.compile(r"^(?:and\s+)?([a-z_][a-z0-9_]*)\s*(?:$|\.\.\.|[…—–;:])")
 
 
 def _reference_texts() -> list[str]:
@@ -287,12 +295,42 @@ def _named_arguments(text: str) -> dict[str, set[tuple[str, str]]]:
         if "takes " not in inner:
             continue
         for part in inner.split("takes ", 1)[1].split(","):
-            name = re.sub(r"^and\s+", "", part.strip())
-            if _IDENT.match(name):
-                found["takes"].add((tool, name))
+            named = _TAKES_NAME.match(part.strip())
+            if named:
+                found["takes"].add((tool, named.group(1)))
     for tool, name in re.findall(_TOOL + r" ([a-z_]+)=", text):
         found["assign"].add((tool, name))
     return found
+
+
+def test_takes_form_reads_the_name_that_carries_a_tail() -> None:
+    """#1271: имя терялось, если за ним хвост — многоточие, тире или проза.
+
+    Форма из комментария выше (``hub_x (…; takes a, b, and c …)``) отдавала
+    только a и b: последний элемент принимался, лишь когда ВСЯ часть между
+    запятыми была идентификатором. Аргумент, названный текстом последним,
+    оставался невидимым для инварианта — тот же класс, что #988.
+    """
+
+    def takes(text: str) -> set[str]:
+        return {arg for _, arg in _named_arguments(text)["takes"]}
+
+    # многоточие, тире и проза после имени — имя всё равно читается
+    assert takes("hub_x (…; takes a, b, and c …)") == {"a", "b", "c"}
+    assert takes("hub_x (pair; takes a, b, and c — see the poller)") == {
+        "a",
+        "b",
+        "c",
+    }
+    assert takes("hub_x (pair; takes a, b, and c, which the poller reads)") == {
+        "a",
+        "b",
+        "c",
+    }
+    # а проза без имени в голове части аргументом не становится
+    assert takes(
+        "hub_x (pair; takes branch, model, and hands back a wait_baseline)"
+    ) == {"branch", "model"}
 
 
 async def test_arguments_named_in_the_reference_exist_in_the_tool_schema() -> None:
