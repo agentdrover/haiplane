@@ -32,9 +32,11 @@ from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
+from hub import config
 from hub.db import fetchall
 from hub import repository as repo
 from hub.services.gate_events import STEWARD_JUDGEMENT
+from hub.services.orchestration import PRACTICE_METRICS_DEFAULT_DAYS
 from hub.services.project_policy import DELEGATED_VERDICTS
 
 log = logging.getLogger(__name__)
@@ -208,6 +210,12 @@ def _policy_delegates(gate_policy_raw: str | None) -> bool:
 # morning (#878).
 _DEBT_WINDOW = "-90 days"
 
+# Окно, за которое дайджест спрашивает про precision. То же, что у страницы
+# метрик по умолчанию (``hub_practice_metrics``): если бы оно отличалось,
+# дайджест и страница называли бы разные precision одним словом. Берётся
+# КОНСТАНТОЙ, а не своей девяносткой: копия разошлась бы с оригиналом молча.
+_PRECISION_WINDOW_DAYS = PRACTICE_METRICS_DEFAULT_DAYS
+
 
 # The payload key the steward section lives under, and the question a reader
 # of an OLD digest must be able to answer: was the steward silent that day,
@@ -267,6 +275,61 @@ async def _steward_entry(db: aiosqlite.Connection, entry: dict, payload: dict) -
         "generation": int(payload.get("generation") or 0),
         "grounds": grounds,
         "grounds_state": "present" if grounds else "absent",
+    }
+
+
+async def findings_queue_section(db: aiosqlite.Connection) -> dict:
+    """Сток неразобранных находок — попутчиком в дайджесте (#1171).
+
+    Едет ровно так же, как долг категорий (#878) и человеческая очередь
+    (#1020), и по той же причине: это свойство ПРАКТИКИ, а не активности
+    автопилота за сутки. Дайджеста собой не порождает — иначе строка
+    приезжала бы в одни дни и не приезжала в другие, и по её отсутствию
+    нельзя было бы сказать ничего.
+
+    Надёжный канал тревоги — событие, которое пишет сторож в поллере; здесь
+    сводка, а не будильник. Порог назван рядом с числом: «131 находка» без
+    «порог 40» не говорит читателю, много это или норма.
+
+    Про precision секция говорит ровно то, что знает. Непустая очередь и
+    «precision не считается» — два РАЗНЫХ факта: precision это ``real/judged``
+    по РАЗОБРАННЫМ, и первая же записанная диспозиция делает его числом,
+    сколько бы находок ни осталось ждать рядом. Дайджест после частичного
+    разбора 105 находок — ровно то состояние, где безусловная строка
+    «precision не считается вовсе» становится полуправдой (#516/#549). Поэтому
+    ``judged`` и ``precision`` приезжают из ``practice_metrics`` — той же
+    функции, что считает precision для страницы метрик, а не из своего
+    запроса, который разошёлся бы с ней молча (#518).
+    """
+    from hub.services.finding_report import judged_all_time
+    from hub.services.orchestration import practice_metrics
+
+    counted = await repo.count_unjudged_findings(db)
+    disp = (await practice_metrics(db, since_days=_PRECISION_WINDOW_DAYS))[
+        "machine_reviews"
+    ]["dispositions"]
+    all_time = await judged_all_time(db)
+    return {
+        "findings": int(counted["findings"]),
+        "reports": int(counted["reports"]),
+        "threshold": config.UNJUDGED_FINDINGS_ALERT_THRESHOLD,
+        "over_threshold": (
+            int(counted["findings"]) >= config.UNJUDGED_FINDINGS_ALERT_THRESHOLD > 0
+        ),
+        # Размер выборки едет вместе со ставкой — правило #1153: голый
+        # precision 1.0 по двум находкам зовёт к решению, которого выборка не
+        # выдерживает.
+        "judged": int(disp["judged"]),
+        "precision": disp["precision"],
+        "precision_window_days": _PRECISION_WINDOW_DAYS,
+        # Разбор СТОКА виден только здесь. Оконное ``judged`` считает
+        # диспозиции по дате ОТЧЁТА, и разбор запаса — отчётов старше окна —
+        # в него не попадает вовсе: наутро после того, как разобрали все 105
+        # находок очереди, оконное число снова ноль. Строка «диспозиций нет
+        # вовсе», выведенная из него, была бы ложью о состоянии, которое хаб
+        # уже знает (#516/#549). Секция про сток — значит и про разбор стока.
+        "judged_all_time": all_time["judged"],
+        "precision_all_time": all_time["precision"],
     }
 
 
@@ -407,6 +470,7 @@ async def generate_due_digests(
             "project": project["slug"],
             "category_debt": debt,
             "human_queue": human_queue,
+            "findings_queue": await findings_queue_section(db),
             "auto_approvals": approvals,
             "auto_verdicts": verdicts,
             "escalations": escalations,

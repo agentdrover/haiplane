@@ -7,6 +7,21 @@
         <span class="badge badge-review">{{ total }}</span></h1>
 </header>
 
+{# #1171: заход идёт ОДНОЙ категорией, самая частая сверху. Сто находок
+   вперемешку — это то, как суждение к концу списка становится штампом:
+   вопрос меняется на каждой строке, и внимание уходит на переключение, а не
+   на находку. Число у ссылки — сток этой категории за всё время, не выборка
+   окна. #}
+<nav class="finding-categories muted">
+    <a href="/findings{% if project %}?project={{ project | urlencode }}{% endif %}"{% if not category %} class="active"{% endif %}>все ({{ total }})</a>
+    {% for c in categories %}
+    <a href="/findings?category={{ c.category | urlencode }}{% if project %}&amp;project={{ project | urlencode }}{% endif %}"{% if category == c.category %} class="active"{% endif %}>{{ c.category }} ({{ c.findings }})</a>
+    {% endfor %}
+</nav>
+{% if category %}
+<p class="muted">Категория «{{ category }}»: показано {{ shown }} из {{ total }} в очереди за всё время.</p>
+{% endif %}
+
 {# #1038: судьбу находке называет ЧЕЛОВЕК (#876, правило 1). Значения по
    умолчанию здесь нет и быть не должно: находка, оставленная неотмеченной,
    остаётся неразмеченной, а не считается разобранной. #}
@@ -17,9 +32,14 @@
 </p>
 
 {% if not groups %}
+{% if category %}
+<p>В категории «{{ category }}» неразмеченных находок нет. В очереди целиком
+   ещё {{ total }} — выберите другую категорию.</p>
+{% else %}
 <p>Неразмеченных находок нет. Это значит, что каждая подтверждённая находка
    текущих сдач получила ответ — precision и resolution rate есть из чего
    считать.</p>
+{% endif %}
 {% endif %}
 
 {% for g in groups %}
@@ -37,6 +57,10 @@
            страница снимает. #}
         <input type="hidden" name="return_to" value="queue">
         {% if project %}<input type="hidden" name="return_project" value="{{ project }}">{% endif %}
+        {# Возврат в ТУ ЖЕ категорию: заход идёт одной категорией, и выброс в
+           общую очередь после каждого отчёта — это ровно та навигация, ради
+           снятия которой страница и заведена (#1038, #1171). #}
+        {% if category %}<input type="hidden" name="return_category" value="{{ category }}">{% endif %}
         {# Какой отчёт судят. Лестница #879 может оставить два текущих отчёта на
            одной сдаче, и очередь показывает оба; без этого поля ответ лёг бы на
            новейший, то есть на находку, которую никто не читал. #}
@@ -70,6 +94,18 @@
                     {% else %}
                     Ответа нет: {{ ev.reason_label }}
                     {% endif %}
+                </div>
+                {% endif %}
+                {% if item.author %}
+                {# Слово АВТОРА (#911) — второй вход, и он же самая тонкая
+                   граница этой страницы. Автор отвечает «что я с этим сделал»,
+                   человек отвечает «была ли находка настоящей». Подпись
+                   «автор:» стоит здесь именно затем, чтобы соседство двух
+                   строк не прочиталось как готовый ответ: диспозицией это не
+                   становится ни одним путём (#876, правило 1). #}
+                <div class="finding-author muted">
+                    автор: {{ item.author.label }}{% if item.author.by %} ({{ item.author.by }}){% endif %}{% if item.author.note %} — {{ item.author.note }}{% endif %}
+                    <span class="finding-author-note">— это отчёт автора, не диспозиция</span>
                 </div>
                 {% endif %}
                 {% if item.f.detail %}

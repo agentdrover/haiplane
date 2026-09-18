@@ -214,7 +214,7 @@ def sha_check_statement(
 
 
 async def live_check_state(
-    db: Any, task_id: int, *, delivered_sha: str = ""
+    db: Any, task_id: int, *, delivered_sha: str = "", declared_probe: str = ""
 ) -> dict[str, Any]:
     """Did anyone watch this task behave after it shipped (#814, feature #811).
 
@@ -230,13 +230,22 @@ async def live_check_state(
     """
     from hub import repository as repo
 
+    declared = (declared_probe or "").strip()
     rows = await repo.list_live_checks(db, task_id, limit=1)
     if not rows:
         return {
             "state": "unknown",
             "reason": (
-                "живая проверка не записывалась: поведение в проде никто не наблюдал"
+                # #1236: объявленный, но ещё не снятый зонд — не то же самое,
+                # что незаданный вопрос. Первое читатель ждёт; второе значит,
+                # что наблюдать никто и не собирался.
+                f"зонд «{declared}» объявлен, но ещё не снимался — работа не "
+                "доехала до прода или релиз ещё не проходил"
+                if declared
+                else "живая проверка не записывалась: поведение в проде "
+                "никто не наблюдал"
             ),
+            "declared_probe": declared,
             "delivered_sha": delivered_sha or "",
         }
     row = dict(rows[0])
@@ -244,10 +253,28 @@ async def live_check_state(
     sha = row.get("sha") or ""
     mismatch = bool(delivered_sha and sha and sha != delivered_sha)
     reason = row.get("reason") or ""
+    if outcome == "failed":
+        # #1236: зонд отработал и ответа не принёс. Это НЕ наблюдение, и
+        # именно здесь оно могло бы стать им: до появления третьего исхода
+        # всё, что не ``not_applicable``, схлопывалось в ``done``, так что
+        # первый же провалившийся зонд закрыл бы блок зелёным. Ровно тот
+        # класс дефекта, ради которого этот файл существует (#725).
+        return {
+            "state": "failed",
+            "reason": reason or "зонд не назвал причину отказа",
+            "declared_probe": declared,
+            "probe": row.get("probe") or "",
+            "sha": sha,
+            "delivered_sha": delivered_sha or "",
+            "sha_mismatch": mismatch,
+            "recorded_agent": row.get("recorded_agent") or "",
+            "created_at": row.get("created_at") or "",
+        }
     if outcome == "not_applicable":
         return {
             "state": "not_applicable",
             "reason": reason or "наблюдаемой поверхности нет",
+            "declared_probe": declared,
             "sha": sha,
             "delivered_sha": delivered_sha or "",
             "sha_mismatch": mismatch,
@@ -262,6 +289,7 @@ async def live_check_state(
             if mismatch
             else ""
         ),
+        "declared_probe": declared,
         "probe": row.get("probe") or "",
         "observation": row.get("observation") or "",
         "sha": sha,
@@ -677,6 +705,31 @@ async def review_report(
     if mr_row is not None:
         machine_review = MachineReviewView(**dict(mr_row))
         machine_review.is_current = machine_review.submission_generation == generation
+        # #1266 (round 2, 715481fedbf41130): channel and reason belong to
+        # THIS report's OWN dispatch, not "the latest DONE dispatch"
+        # (get_settled_review_dispatch orders by DISPATCH id, while the
+        # report shown here is the latest by REPORT id — get_latest_machine_
+        # review). In the AC-5 shape those diverge: a local replacement can
+        # settle with its own report before an earlier cloud order settles
+        # with its late report, so the local dispatch carries the higher id
+        # even though the CLOUD report is the one actually displayed here.
+        # dispatch_for_report answers "which dispatch produced THIS report"
+        # with the same principal+channel+rung rule _dispatch_report already
+        # uses — not a second rule. Cloud, or no matching dispatch, leaves
+        # both fields empty — never guessed, never shown as if it were local.
+        from hub.services.review_dispatch import LOCAL_CHANNEL, dispatch_for_report
+
+        own_dispatch = await dispatch_for_report(
+            db,
+            int(task_row["id"]),
+            machine_review.submission_generation,
+            dict(mr_row),
+        )
+        if own_dispatch is not None and own_dispatch.get("channel") == LOCAL_CHANNEL:
+            machine_review.second_door_channel = LOCAL_CHANNEL
+            machine_review.second_door_reason = (
+                own_dispatch.get("second_door_reason") or ""
+            )
         await attach_dispositions(db, machine_review)
         state = "current" if machine_review.is_current else "stale"
 
