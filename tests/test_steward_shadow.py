@@ -2735,11 +2735,12 @@ def _task_branch_clone(tmp_path, *, delivered: bool):
 
 
 async def _packet_task(db: aiosqlite.Connection, clone, branch: str) -> int:
+    """``clone=None`` — проект БЕЗ рабочей копии: та самая дыра из #1239."""
     project_id = await repo.create_project(
         db,
         slug="collapse-probe",
         name="collapse probe",
-        workspace_path=str(clone),
+        workspace_path="" if clone is None else str(clone),
         default_branch="develop",
         status="active",
     )
@@ -2830,6 +2831,91 @@ async def test_a_live_packet_still_measures_a_branch_before_delivery(
     assert surface.is_present
     assert surface.value["paths"] == ["hub/secrets.py"]
     assert surface.value["within_declared"] is False
+
+
+async def test_a_live_packet_without_a_workspace_does_not_measure_a_foreign_clone(
+    db: aiosqlite.Connection, tmp_path, monkeypatch
+) -> None:
+    """У проекта нет клона — поверхность НЕ измерена, а не «в границах».
+
+    Находка 95907d9c52c474b8. Сторож обещает три ответа, но выходил четвёртым:
+    без ``workspace`` он возвращал исходный ПУСТОЙ СПИСОК без дыры. А дальше
+    цепочка уже сработала: ``_resolve_branch_diff`` зовёт ``branch_diff_paths``
+    с ``repo=None``, та молча падает на ``_repo_root()`` — клон ХАБА, а не
+    проекта. В нём ветка задачи вполне может быть уже влита, и пустой дифф
+    ЧУЖОГО клона приезжал как ``[]``. ``_surface_fact`` писал ``present`` и
+    ``within_declared=True``: судья видел зелёную поверхность, которой никто
+    не мерил. Вход в ту же ложь другой — «нет рабочей копии» вместо «не
+    спросили предка», а цена та же.
+
+    Здесь это воспроизведено настоящим git: проект без ``workspace_path``,
+    а подменённый ``_repo_root`` указывает на клон, где ветка уже доставлена.
+    Сдача трогает ``hub/secrets.py`` при заявленном ``hub/base.py`` — будь
+    поверхность измерена, сверка сказала бы «вне заявленного».
+    """
+    from hub.integrations import git_ops as git_ops_mod
+    from hub.services.steward_evidence import DIFF_UNREADABLE, build_evidence_packet
+
+    _real_git(monkeypatch)
+    clone, branch = _task_branch_clone(tmp_path, delivered=True)
+    monkeypatch.setattr(git_ops_mod, "_repo_root", lambda: str(clone))
+    task_id = await _packet_task(db, None, branch)
+
+    packet = await build_evidence_packet(db, task_id)
+
+    surface = packet.fact("diff_vs_areas")
+    assert surface.is_absent, (
+        "без клона проекта поверхность не измерена — сказать «в границах» "
+        f"по чужому клону нельзя: {surface.value}"
+    )
+    assert surface.reason == DIFF_UNREADABLE
+    risk = packet.fact("risk_class")
+    assert risk.is_absent
+    assert risk.reason == DIFF_UNREADABLE
+
+
+async def test_a_live_packet_names_an_unanswered_ancestry_as_unreadable(
+    db: aiosqlite.Connection, tmp_path, monkeypatch
+) -> None:
+    """Третий ответ сторожа закрыт своим тестом (5d67b34d6bb2f77f).
+
+    ``commit_in_base_history`` отвечает тремя значениями, и ветка ``None`` —
+    «git не ответил» — до сих пор не была прогнана НИ ОДНИМ тестом живого
+    пакета: мутация ``None`` -> ``[]`` в этой ветке оставляла набор зелёным.
+    Дыра покрытия, а не продуктовый дефект, — но именно она и разрешает
+    будущей правке свернуть три ответа в два, ровно против ограничения
+    задачи.
+
+    Ответ ``None`` здесь подставлен точечно: сам вопрос задаётся настоящему
+    git, а «не ответил» на живом репозитории не ставится честно — оба конца
+    диффа только что зарезолвились, иначе дифф не был бы пустым списком.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import DIFF_UNREADABLE, build_evidence_packet
+
+    _real_git(monkeypatch)
+    clone, branch = _task_branch_clone(tmp_path, delivered=True)
+    task_id = await _packet_task(db, clone, branch)
+
+    async def _no_answer(repo: str, base: str, sha: str) -> bool | None:
+        return None
+
+    monkeypatch.setattr(plugins.git_ops, "commit_in_base_history", _no_answer)
+
+    packet = await build_evidence_packet(db, task_id)
+
+    surface = packet.fact("diff_vs_areas")
+    assert surface.is_absent
+    assert surface.reason == DIFF_UNREADABLE, (
+        "«git не ответил» — не «дифф схлопнулся» и не «изменений нет»: "
+        f"{surface.reason}"
+    )
+    assert "не ответил" in surface.detail
+    risk = packet.fact("risk_class")
+    assert risk.is_absent
+    assert risk.reason == DIFF_UNREADABLE
+
+
 # --------------------------------------------------------------------------
 # Судья выбирается из имён, чей ЗАПУСК наблюдали (#1237)
 # --------------------------------------------------------------------------

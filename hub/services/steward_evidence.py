@@ -495,6 +495,12 @@ async def _guard_collapsed_diff(
     честно пуст и остаётся пустым; не ответили — дыра ``diff_unreadable``.
     Свести их в два значило бы вернуть ровно то умолчание, ради снятия
     которого функция написана.
+
+    И вопрос должно быть КОМУ задать. У проекта без рабочей копии такого
+    конца нет: пустой список тогда приезжает не из сдачи, а из клона хаба,
+    на который ``branch_diff_paths`` молча падает по ``repo=None``. Это
+    та же ложь «в границах заявленного», только вход в неё другой, поэтому
+    здесь тоже ``diff_unreadable``, а не исходная пустота.
     """
     from hub import config
     from hub.integrations.registry import plugins
@@ -509,7 +515,21 @@ async def _guard_collapsed_diff(
     workspace = (ctx.get("repo") or "").strip()
     base = (ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
     if not workspace:
-        return diff_paths, diff_reason, ""
+        # Четвёртого ответа у сторожа нет. Отдать здесь исходный пустой список
+        # значило бы сказать «поверхность измерена и пуста» — а мерить было
+        # негде: ``_resolve_branch_diff`` звал ``branch_diff_paths`` с
+        # ``repo=None``, и та молча упала на ``_repo_root()``, клон ХАБА. В
+        # чужом клоне ветка задачи вполне может быть уже влита, и пустота
+        # приезжает оттуда, а не из сдачи. Спросить о предке не у кого:
+        # вопрос задаётся тому концу, против которого дифф посчитан, а такого
+        # конца у проекта без рабочей копии нет вовсе.
+        return (
+            None,
+            f"дифф {base}...{branch} пуст, а рабочей копии у проекта нет: "
+            "спросить о предке не у кого, и пустота недоказуема как "
+            "измеренная поверхность",
+            DIFF_UNREADABLE,
+        )
     merged = await plugins.git_ops.commit_in_base_history(workspace, base, branch)
     if merged is None:
         return (
