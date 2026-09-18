@@ -421,7 +421,14 @@ async def close_run(
     return True
 
 
-def _policy_wants_steward(project_row: Any | None, gate: str = "verdict") -> bool:
+#: Признак политики «стюард судит в тени» (#1268). Не значение гейта, а
+#: отдельный ключ: он ничего не делегирует, поэтому замок #743 его пропускает.
+STEWARD_SHADOW_KEY = "steward_shadow"
+
+
+def _policy_wants_steward(
+    project_row: Any | None, gate: str = "verdict", *, shadow: bool = True
+) -> bool:
     """Does the project's own gate policy hand THIS gate to the steward (#743)?
 
     Один вопрос на два гейта, а не два похожих читателя: вердикт и DoR
@@ -435,10 +442,25 @@ def _policy_wants_steward(project_row: Any | None, gate: str = "verdict") -> boo
     Сравнение со строкой ``steward`` живёт ровно здесь и нигде больше — #1157
     заводит перечень делегирующих значений ключа ``dor`` и один читатель для
     него, и заменить придётся одно место, а не каждое употребление.
+
+    Теневое участие (#1268) — второй вход в тот же вопрос, и только для
+    вердикта: проект просит суждения, не отдавая решения. Вход открывает
+    ровно ``true`` JSON; строка «true», единица и прочее читаются как «не
+    участвует» (#835). ``shadow=False`` спрашивает про делегирование в
+    чистом виде — это вопрос привратника применения: суждение применяется
+    только там, где вердикт стюарду ОТДАН, а не где его лишь слушают.
     """
     if project_row is None:
         return False
-    return gate_policy_of(project_row).get(gate) == "steward"
+    policy = gate_policy_of(project_row)
+    if policy.get(gate) == "steward":
+        return True
+    return shadow and gate == "verdict" and policy.get(STEWARD_SHADOW_KEY) is True
+
+
+def verdict_delegated_to_steward(project_row: Any | None) -> bool:
+    """Отдан ли вердикт проекта стюарду — без теневого входа (#1268)."""
+    return _policy_wants_steward(project_row, shadow=False)
 
 
 async def _nothing_new_since(
