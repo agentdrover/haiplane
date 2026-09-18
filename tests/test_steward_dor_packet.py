@@ -1313,3 +1313,80 @@ async def test_statement_text_quotes_do_not_enter_the_closed_fact_set(
     # А в цитатах метка есть — иначе тест зеленел бы на пакете без текста.
     quoted = [q["text"] for q in payload["quotes"] if mark in q["text"]]
     assert len(quoted) == 4, quoted
+
+
+async def test_author_quotes_survive_a_brief_that_does_not_assemble(
+    db: aiosqlite.Connection, clone: Path, collection
+):
+    """Находка a3f5cbbe: вырождение пакета проверялось без цитат.
+
+    ``test_packet_degrades_when_the_brief_does_not_assemble`` смотрит только
+    на факты, а цитаты критериев, охвата и размера с 17.09 берутся из таблицы
+    ИМЕННО ради этого входа: бриф не собрался, а слова автора никуда не
+    делись. Верни кто-нибудь их под ``if ac_fact.is_present`` — и оба теста
+    остались бы зелёными, а стюард на нестандартной задаче читал бы пакет без
+    единой авторской строки и с ``injection_suspected=False``, то есть с
+    утверждением хаба «чужих слов я не нашёл» про текст, который он не смотрел.
+
+    ЗАПИСАННОЕ РЕШЕНИЕ по находке 88137148 (охват цитат ``ac_test_ref``):
+    авторский ``test_ref`` при несобравшемся брифе в цитаты НЕ идёт, и это
+    выбор, а не упущение. Цитата ``ac_test_ref`` существует не сама по себе:
+    она снимает ложное «подозрений нет» с той строки, которую факт
+    ``ac_locator`` ПЕРЕНОСИТ в пакет дословно. Здесь факт absent — строка в
+    пакет не едет вовсе, утверждать про неё нечего, и цитировать её из второго
+    источника (таблицы критериев) значило бы развести цитату с фактом: при
+    ``present`` она обязана совпадать со значением факта до пробела. Ценность
+    локатора для стюарда — его РАЗРЕШИМОСТЬ, а это факт, и его отсутствие уже
+    названо отсутствием с причиной. Формулировки критериев — другой случай:
+    их стюард читает как техлид (§6.2), хаб их не перепроверяет, и от неудачи
+    брифа они не зависят.
+    """
+    task_id = await _draft(
+        db, clone, title="quotes when the brief fails", areas=["hub/services/x.py"]
+    )
+    await repo.update_task(
+        db,
+        task_id,
+        scope_in=json.dumps(["охват внутри"], ensure_ascii=False),
+        scope_out=json.dumps(["охват вне"], ensure_ascii=False),
+        size="M",
+        risks='[{"kind": "security", "severity": "high", "description": "d", '
+        '"mitigation": "m"}, {"kind": "not-a-real-kind"}, "string", 42]',
+    )
+    await db.commit()
+    await repo.add_acceptance_criterion(
+        db,
+        task_id,
+        AcceptanceCriterion(
+            id="AC-1",
+            given=_ORDER,
+            when="собирается пакет",
+            then="критерий виден стюарду",
+            verifiable_by=ACVerifiableBy("test"),
+            test_ref="tests/test_x.py::test_present",
+        ),
+    )
+    await db.commit()
+
+    packet = await build_draft_packet(db, task_id)
+
+    # Вход теста — тот самый: бриф действительно не собрался.
+    assert packet is not None
+    locators = packet.fact("ac_locator")
+    assert locators.state == ABSENT and locators.reason == BRIEF_UNAVAILABLE, locators
+
+    # Слова автора на месте — каждый источник текста, а не один пример.
+    for source in _TEXT_QUOTE_SOURCES:
+        assert _by_source(packet, source), source
+    assert any(_ORDER in text for text in _by_source(packet, QUOTE_AC_TEXT))
+
+    # И утверждение хаба о чужих словах осталось верным: приказ в критерии
+    # виден, хотя факта о критериях в пакете нет.
+    assert packet.injection_suspected is True
+    assert [q.source for q in packet.quotes if q.suspected] == [QUOTE_AC_TEXT]
+    payload = draft_packet_payload(packet)
+    assert payload["injection_suspected"] is True
+    assert [q["source"] for q in payload["quotes"] if q["signals"]] == [QUOTE_AC_TEXT]
+
+    # Записанное решение: локатор при absent не цитируется.
+    assert _by_source(packet, QUOTE_AC_TEST_REF) == []
