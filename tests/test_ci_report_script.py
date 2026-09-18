@@ -11,6 +11,7 @@ prose to a shell produces an exit code that looks like the work is broken.
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 from pathlib import Path
 
@@ -34,7 +35,13 @@ def script():
 @pytest.fixture(autouse=True)
 def _clean_prefixed_env(monkeypatch):
     """Neither prefix may leak in from the developer's shell (Task 4)."""
-    for suffix in ("HUB_URL", "HUB_CI_TOKEN", "HUB_CI_PYTEST", "HUB_CI_CHECKS"):
+    for suffix in (
+        "HUB_URL",
+        "HUB_CI_TOKEN",
+        "HUB_CI_PYTEST",
+        "HUB_CI_CHECKS",
+        "HUB_CI_MUTATIONS",
+    ):
         monkeypatch.delenv(f"HAIPLANE_{suffix}", raising=False)
 
 
@@ -604,3 +611,90 @@ def test_a_reused_outcome_counts_as_executed(script):
     )
     assert status == "unknown"
     assert "исполнено и прошло 1 из 2" in reason
+
+
+# ---- #1270: the mutation run travels under its own key -----------------------
+
+
+def _capture_payload(script, monkeypatch) -> dict:
+    monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_TOKEN", "irrelevant")  # noqa: S105
+    monkeypatch.setenv("GITHUB_HEAD_REF", "task-1270/x")
+    monkeypatch.setenv("HEAD_SHA", "sha-head")
+    seen: dict = {}
+
+    def fake_request(url, token, payload=None):
+        if payload is None:
+            return {"acceptance_criteria": [], "validation_commands": []}
+        seen.update(payload)
+        return {"applied": True, "reason": "ok", "mutations_state": "ran"}
+
+    monkeypatch.setattr(script, "hub_request", fake_request)
+    assert script.main() == 0
+    return seen
+
+
+def test_the_mutation_report_is_sent_under_its_own_key(script, monkeypatch, tmp_path):
+    report = {
+        "state": "ran",
+        "survivors": [{"file": "a.py", "function": "f", "line": 2}],
+    }
+    path = tmp_path / "mutations.json"
+    path.write_text(json.dumps(report))
+    monkeypatch.setenv("HAIPLANE_HUB_CI_MUTATIONS", str(path))
+
+    payload = _capture_payload(script, monkeypatch)
+
+    assert payload["mutations"] == report
+    assert "mutation" not in payload["checks"], "a warning is not a check outcome"
+
+
+def test_a_missing_or_unreadable_mutation_report_is_not_sent(
+    script, monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("HAIPLANE_HUB_CI_MUTATIONS", str(tmp_path / "absent.json"))
+    assert "mutations" not in _capture_payload(script, monkeypatch)
+    assert "absent.json" in capsys.readouterr().out
+
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_MUTATIONS", str(broken))
+    assert "mutations" not in _capture_payload(script, monkeypatch)
+
+
+def test_a_long_survivor_list_is_trimmed_and_says_so(script):
+    report = {
+        "state": "ran",
+        "survived": 80,
+        "survivors": [
+            {"file": "a.py", "function": "f", "line": i, "diff": "d" * 600}
+            for i in range(80)
+        ],
+    }
+    trimmed = script.trim_mutations(report)
+    assert len(json.dumps(trimmed)) < 30_000
+    assert trimmed["survived"] == 80, "the count is never trimmed"
+    assert trimmed["survivors_trimmed"] == 80 - len(trimmed["survivors"])
+    assert all(s["line"] is not None for s in trimmed["survivors"])
+
+
+def test_ci_workflow_runs_mutations_after_tests_and_cannot_fail_the_job():
+    """#1270 AC-3 (static half): warning step, PR only, its JSON reaches the reporter."""
+    import yaml
+
+    workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+    doc = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    steps = [s for job in doc["jobs"].values() for s in job.get("steps") or []]
+    names = [s.get("id") or s.get("name") for s in steps]
+    mutation = next(s for s in steps if s.get("id") == "mutations")
+
+    assert mutation["continue-on-error"] is True
+    assert "pull_request" in mutation["if"]
+    assert "timeout-minutes" in mutation
+    assert "scripts/mutation_changed.py" in mutation["run"]
+    assert names.index("mutations") > names.index("tests")
+
+    reporter = next(s for s in steps if "hub-ci-report" in str(s.get("uses", "")))
+    assert names.index("mutations") < steps.index(reporter)
+    json_out = re.search(r"--json-out\s+(\S+)", mutation["run"]).group(1)
+    assert reporter["with"]["mutations-file"] == json_out.strip("\"'")
