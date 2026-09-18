@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi import HTTPException
 
@@ -23,6 +25,7 @@ import aiosqlite
 from hub import config, models
 from hub import repository as repo
 from hub import services
+from hub.db import deserialize_str_list
 from hub.models import TaskCreate, TaskSubmitReview
 from hub.services import lifecycle
 from hub.services.gate_pipeline import ALWAYS, OFF, Step, run_steps
@@ -106,11 +109,12 @@ EXPECTED_SUBMIT_ORDER = (
     "task_is_submittable",
     "canonical_branch",
     "branch_matches",
+    "pin_submission_sha",
+    "same_sha_from_review_is_current",
     "resolve_diff",
     "surfaces",
     "finding_outcomes",
     "submit_rules",
-    "pin_submission_sha",
     "delivery_pr",
 )
 
@@ -142,13 +146,38 @@ def test_the_verdict_order_is_pinned():
 
 
 def test_the_network_walking_steps_come_last():
-    """Сетевые шаги — после дешёвых отказов, иначе отказ оплачен сетью."""
+    """Сетевые шаги — после дешёвых, НЕИЗМЕННЫХ во времени отказов.
+
+    До #1265 круга 2 это звучало «после ВСЕХ отказов»: единственным
+    сетевым шагом был ``pin_submission_sha``, и цена отказа до него всегда
+    была дешевле сети. #1265 добавила сюда второй смысл: пиннинг обязан
+    идти ДО surfaces/finding_outcomes/submit_rules — эти гейты отказывают
+    не только по коду, но и по ВРЕМЕНИ (новая находка, смена политики), и
+    повтор того же запроса не должен встретить отказ, которого не получил
+    оригинал (находка Codex #1 на 41159735). Отказы task_is_submittable и
+    branch_matches — дешёвые и неизменные во времени для одного и того же
+    запроса, поэтому пиннинг остаётся ПОСЛЕ них и только их.
+    """
     names = [s.name for s in lifecycle.SUBMIT_STEPS]
-    refusing = [s.name for s in lifecycle.SUBMIT_STEPS if s.refuses]
-    assert names.index("pin_submission_sha") > max(names.index(n) for n in refusing), (
-        "пиннинг вершины ветки ходит в сеть и обязан идти после всех отказов"
+    cheap_and_stable = ("task_is_submittable", "canonical_branch", "branch_matches")
+    assert names.index("pin_submission_sha") > max(
+        names.index(n) for n in cheap_and_stable if n in names
+    ), "пиннинг вершины ветки ходит в сеть и обязан идти после дешёвых отказов"
+    mutable_gates = ("surfaces", "finding_outcomes", "submit_rules")
+    assert names.index("pin_submission_sha") < min(
+        names.index(n) for n in mutable_gates
+    ), (
+        "пиннинг и распознавание повтора обязаны идти ДО гейтов, чей ответ "
+        "меняется со временем — иначе повтор рискует их отказом"
     )
+    assert names.index("same_sha_from_review_is_current") < min(
+        names.index(n) for n in mutable_gates
+    ), "распознавание повтора — ДО изменчивых гейтов, а не после них"
     assert names.index("delivery_pr") > names.index("pin_submission_sha")
+    assert names.index("delivery_pr") == len(names) - 1, (
+        "доставка — последний шаг: повтор, ушедший в no-op раньше, не "
+        "должен дойти до пуша/PR"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -181,14 +210,23 @@ def test_the_two_pipelines_are_compared_by_their_lists():
     submit = {s.name: s for s in lifecycle.SUBMIT_STEPS}
     headless = {s.name: s for s in lifecycle.HEADLESS_STEPS}
 
-    # task_is_submittable — единственный шаг, которого у headless нет вовсе:
-    # он проверяет, что задача pair и в статусе, из которого сдают.
-    assert set(submit) - set(headless) == {"task_is_submittable"}
+    # task_is_submittable — шаг, которого у headless нет вовсе: он проверяет,
+    # что задача pair и в статусе, из которого сдают. same_sha_from_review_is_
+    # current — тоже только pair (#1265): headless сдаёт done-отчётом, у него
+    # нет ни статуса review, ни повторной сдачи того же коммита через этот
+    # путь — решение не трогать headless названо в постановке прямо.
+    assert set(submit) - set(headless) == {
+        "task_is_submittable",
+        "same_sha_from_review_is_current",
+    }
     assert set(headless) - set(submit) == set()
 
     active_here = {n for n, s in headless.items() if s.active}
     inactive_here = {n for n, s in headless.items() if not s.active}
-    assert inactive_here == {"branch_matches", "finding_outcomes"}, (
+    # #1155: finding_outcomes ушёл отсюда в активные — у отчёта о готовности
+    # появилось поле исходов, и причина «ответить негде» перестала быть верной.
+    # Матрица решений #1122 обновлена этой задачей, и сдача называет перемену.
+    assert inactive_here == {"branch_matches"}, (
         "набор неактивных на headless изменился — обновите матрицу решений в "
         "#1122 и скажите об этом в сдаче, а не молча"
     )
@@ -529,3 +567,548 @@ async def test_the_rules_step_obeys_the_cap_instead_of_rereading_the_policy(
     with pytest.raises(HTTPException) as refused:
         await _step_submit_rules(state)
     assert refused.value.status_code == 422
+
+
+# --------------------------------------------------------------------------
+# #1265: пересдача того же коммита из review не рождает новое поколение
+# --------------------------------------------------------------------------
+#
+# Образец — #1172, 13.09.2026: сдачи №6 и №7, один и тот же sha
+# b530268a24c6, исполнитель и стюард сдали независимо. Хаб принял вторую как
+# новую работу: поколение выросло с 6 до 7, диспетч ревью вызван повторно
+# (отказан лимитом), а вердикт по «заменённой» сдаче перестал быть текущим,
+# хотя код не менялся ни на байт.
+
+
+async def _pair_task_ready_to_submit(
+    db: aiosqlite.Connection, title: str, *, agent: str = "dev"
+):
+    task = await lifecycle.create_task(
+        db, models.TaskCreate(title=title, source="agent", agent="bot")
+    )
+    await lifecycle.approve_task(db, task.id, models.TaskApprove(force=True))
+    await lifecycle.pair_start_task(
+        db,
+        task.id,
+        models.TaskPairStart(agent=agent, branch_slug="mine", plan="Plan: сдать"),
+    )
+    return task
+
+
+def _install_fixed_tip_git(
+    monkeypatch, tip: str, *, diff_paths: list[str] | None = None
+):
+    """Git-двойник, чья вершина не меняется между сдачами, пока тест не велит.
+
+    ``diff_paths`` — для AC-5 (accept_areas): по умолчанию NoopGitOps отдаёт
+    None («дифф не прочитан»), и мержить в affected_areas нечего. Явный
+    список делает дифф наблюдаемым, не трогая остальные тесты, которым он
+    не нужен.
+    """
+    from unittest.mock import AsyncMock
+
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    class _Git(NoopGitOps):
+        def __init__(self, tip: str) -> None:
+            self.tip = tip
+
+        async def fetch_base(self, repo: str, base: str):
+            return (True, "")
+
+        async def head_sha(self, repo: str, base: str) -> str:
+            return self.tip
+
+        async def branch_diff_paths(
+            self, branch: str, base_branch: str | None = None, repo: str | None = None
+        ) -> list[str] | None:
+            return diff_paths
+
+    git = _Git(tip)
+    monkeypatch.setattr(plugins, "git_ops", git)
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(return_value={"repo": "/srv/ws", "base_branch": "develop"}),
+    )
+    return git
+
+
+async def test_resubmitting_the_same_sha_from_review_is_not_a_new_generation(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1: тот же коммит из review не открывает новое поколение (#1265, #1172).
+
+    Круг 2 (владелец, вариант A): решение о заказе ревью на этом поколении
+    НЕ отключается — оно принимается ровно так, как #1150/#1152 всегда его
+    принимали, только на неизменившемся поколении, а не на новом. Здесь
+    проверяется, что решение ДОХОДИТ до диспетча (шпион на самой функции
+    принятия решения) — а КАКОЕ это решение при разном покрытии отчётом,
+    без единой правки, доказывают шесть тестов tests/test_review_dispatch.py
+    (#1150/#1152), которые эта задача не трогает.
+    """
+    from hub.services import review_dispatch
+
+    _install_fixed_tip_git(monkeypatch, "same-tip")
+
+    task = await _pair_task_ready_to_submit(db, "Дубль сдачи")
+    first = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+    assert first.submission_generation == 1
+    assert first.submission_sha == "same-tip"
+
+    # Вердикт закреплён за поколением 1 напрямую через repo, а не через
+    # record_review_verdict сервиса: клиентское ревью на APPROVED само уводит
+    # задачу review->running (#3433 lifecycle.py — «report done on APPROVED»),
+    # а #1172 воспроизводит именно гонку ДВУХ СДАЧ, пока задача ещё в review
+    # и вердикт по ней уже есть (машинное ревью его и оставляет там).
+    await repo.record_review_verdict(db, task.id, "approved")
+    await db.commit()
+
+    dispatch_calls: list[int] = []
+
+    async def _spy(db_, task_id_, **kwargs):
+        dispatch_calls.append(task_id_)
+        return False
+
+    monkeypatch.setattr(review_dispatch, "maybe_dispatch_review", _spy)
+
+    second = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", model="claude-opus-5")
+    )
+
+    assert second.submission_generation == 1, "поколение не растёт — код не менялся"
+    assert second.submission_sha == "same-tip"
+    assert second.review_approved_current is True, (
+        "вердикт по прежней сдаче остаётся текущим — это ТА ЖЕ сдача"
+    )
+    assert dispatch_calls == [task.id], (
+        "решение о заказе ревью принимается на дубле — по #1150/#1152, на "
+        "том же поколении, а не пропущено (находка Codex #1 на 41159735)"
+    )
+    hint = second.lifecycle_hint or ""
+    assert "поколение 1" in hint, "ответ называет поколение, на котором уже стоит сдача"
+    assert "bot" in hint, (
+        "ответ называет, кто сдал это поколение (assigned_agent задачи)"
+    )
+
+
+async def test_resubmitting_a_new_sha_from_review_still_bumps_the_generation(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2: ветка сдвинулась — пересдача открывает новое поколение, как сегодня."""
+    git = _install_fixed_tip_git(monkeypatch, "first-tip")
+
+    task = await _pair_task_ready_to_submit(db, "Новый коммит")
+    first = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev")
+    )
+    assert first.submission_generation == 1
+
+    git.tip = "second-tip"
+    second = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev")
+    )
+
+    assert second.submission_generation == 2, "новый коммит — новое поколение"
+    assert second.submission_sha == "second-tip"
+
+
+async def test_same_sha_resubmission_answer_is_idempotent(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3: одна и та же сдача X дважды подряд — один ответ, и не ошибка.
+
+    Круг 2 (Codex #1, #3 на 41159735): и после того, как на поколение легла
+    находка при FINDING_OUTCOME=require — гейт finding_outcomes отказал бы
+    ОБЫЧНОЙ сдаче без ответа на неё (422), а повтор того же sha не должен
+    встретить отказ, которого не получил оригинал; и без пуша/открытия PR.
+    """
+    from hub import config
+    from hub.services import orchestration
+
+    _install_fixed_tip_git(monkeypatch, "idem-tip")
+
+    task = await _pair_task_ready_to_submit(db, "Идемпотентный повтор")
+    await lifecycle.submit_for_review(db, task.id, models.TaskSubmitReview(agent="dev"))
+
+    first_retry = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev")
+    )
+    second_retry = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev")
+    )
+
+    assert first_retry.submission_generation == second_retry.submission_generation == 1
+    assert first_retry.submission_sha == second_retry.submission_sha == "idem-tip"
+    assert first_retry.status == "review"
+    assert second_retry.status == "review"
+    assert first_retry.lifecycle_hint == second_retry.lifecycle_hint, (
+        "повтор по таймауту обязан получить ТОТ ЖЕ ответ, а не новый текст"
+    )
+
+    # Находка легла на поколение 1, режим — require.
+    await repo.insert_machine_review(
+        db,
+        task_id=task.id,
+        submission_generation=1,
+        harness_skill="lite-diff-review",
+        model="grok-4.6",
+        raw_count=1,
+        findings_confirmed=json.dumps(
+            [{"title": "утечка", "severity": "high", "file": "hub/x.py"}]
+        ),
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+    monkeypatch.setattr(config, "FINDING_OUTCOME", "require")
+
+    ensure_pr_calls: list[int] = []
+
+    async def _ensure_spy(db_, task_, canonical, diff_paths):
+        ensure_pr_calls.append(task_["id"])
+        return None, ""
+
+    monkeypatch.setattr(orchestration, "ensure_delivery_pr", _ensure_spy)
+
+    third_retry = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev")
+    )
+
+    assert third_retry.submission_generation == 1, (
+        "находка + require не роняют повтор в новую генерацию"
+    )
+    assert third_retry.status == "review"
+    assert ensure_pr_calls == [], (
+        "повтор не пушит ветку и не открывает PR (находка Codex #3 на 41159735)"
+    )
+
+
+async def test_same_sha_resubmission_still_applies_its_payload(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-5: accept_areas и finding_outcomes на том же sha не теряются молча.
+
+    Находка Codex #2 на 41159735: ``_same_sha_noop_response`` раньше
+    возвращала ответ, минуя ``_apply_submission`` целиком, — accept_areas и
+    finding_outcomes из тела повторной сдачи тихо выбрасывались, а ответ
+    всё равно выглядел успехом.
+    """
+    from hub.services.finding_identity import finding_uid
+
+    routine = sorted(lifecycle.commit_scope.ROUTINE_PATHS)[0]
+    _install_fixed_tip_git(
+        monkeypatch, "payload-tip", diff_paths=["hub/x.py", "hub/new_area.py", routine]
+    )
+
+    task = await _pair_task_ready_to_submit(db, "Применение данных")
+    # Признать объём можно только против ОБЪЯВЛЕННОЙ области — как и у
+    # обычной сдачи: без неё сверка «unknown», и дописывать нечего (#890).
+    await repo.update_task_structured(
+        db, task.id, models.TaskRefine(affected_areas=["hub/x.py"])
+    )
+    await db.commit()
+    await lifecycle.submit_for_review(db, task.id, models.TaskSubmitReview(agent="dev"))
+
+    finding = {"title": "утечка", "severity": "high", "file": "hub/x.py"}
+    review_id = await repo.insert_machine_review(
+        db,
+        task_id=task.id,
+        submission_generation=1,
+        harness_skill="lite-diff-review",
+        model="grok-4.6",
+        raw_count=1,
+        findings_confirmed=json.dumps([finding]),
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+    uid = finding_uid(finding)
+
+    retry = await lifecycle.submit_for_review(
+        db,
+        task.id,
+        models.TaskSubmitReview(
+            agent="dev",
+            accept_areas=True,
+            finding_outcomes=[{"finding_uid": uid, "outcome": "fixed"}],
+        ),
+    )
+
+    assert retry.submission_generation == 1, "данные применились без нового поколения"
+
+    outcomes = await repo.list_finding_outcomes(db, review_id)
+    recorded = [dict(o) for o in outcomes]
+    assert any(o["finding_uid"] == uid and o["outcome"] == "fixed" for o in recorded), (
+        "исход находки записан на текущее поколение, а не выброшен"
+    )
+
+    fresh = dict(await repo.get_task(db, task.id))
+    areas = deserialize_str_list(fresh.get("affected_areas"))
+    assert "hub/new_area.py" in areas, (
+        "accept_areas дописал affected_areas тем же диффом, что и обычная сдача"
+    )
+    assert routine not in areas, (
+        "служебный путь не дописывается — тот же фильтр ROUTINE_PATHS, что у "
+        "обычной сдачи (Cursor #383, 56fc0a823ab5e1a2)"
+    )
+    feed = " ".join(
+        (dict(u)["content"] or "") for u in await repo.get_task_updates(db, task.id)
+    )
+    assert lifecycle.commit_scope.SCOPE_GROWTH_MARKER in feed, (
+        "рост объёма на повторе записан так же, как на обычной сдаче "
+        "(Cursor #383, 5c3ba1c53664357f)"
+    )
+
+
+async def test_accept_areas_on_a_retry_names_an_unreadable_diff(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Cursor #383 (40af8ae7af0f7943): accept_areas на повторе при
+    непрочитанном диффе не молчит об успехе — лента называет, что сверка
+    области НЕ выполнялась, как и у обычной сдачи, и область не расширена."""
+    _install_fixed_tip_git(monkeypatch, "unreadable-tip")  # дифф: None
+
+    task = await _pair_task_ready_to_submit(db, "Непрочитанный дифф")
+    await repo.update_task_structured(
+        db, task.id, models.TaskRefine(affected_areas=["hub/x.py"])
+    )
+    await db.commit()
+    await lifecycle.submit_for_review(db, task.id, models.TaskSubmitReview(agent="dev"))
+    before = len(await repo.get_task_updates(db, task.id))
+
+    retry = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", accept_areas=True)
+    )
+
+    assert retry.submission_generation == 1
+    new = [
+        (dict(u)["content"] or "")
+        for u in (await repo.get_task_updates(db, task.id))[before:]
+    ]
+    assert any("НЕ выполнялась" in c for c in new), (
+        f"повтор с accept_areas обязан назвать, что сверка не выполнялась: {new}"
+    )
+    fresh = dict(await repo.get_task(db, task.id))
+    assert deserialize_str_list(fresh.get("affected_areas")) == ["hub/x.py"]
+    assert not any("Отчёт проверок на сдаче" in c for c in new), (
+        "правила на повторе не выполнялись — заголовок полного отчёта был бы "
+        f"неправдой (Cursor #386, 4c832c08b8bb5dcc): {new}"
+    )
+    assert any("Правила сдачи не перезапускались" in c for c in new), new
+
+
+async def test_accept_areas_on_a_retry_obeys_surfaces_off(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Cursor #386 (f4ec12806d4c263e): при SDD_SURFACES=off обычная сдача
+    область не сверяет — и повтор того же sha с accept_areas её не
+    расширяет, хотя run_steps оставил в gate_mode режим своего шага."""
+    monkeypatch.setattr(config, "SDD_SURFACES", "off")
+    _install_fixed_tip_git(
+        monkeypatch, "off-tip", diff_paths=["hub/x.py", "hub/new_area.py"]
+    )
+    task = await _pair_task_ready_to_submit(db, "Сверка выключена")
+    await repo.update_task_structured(
+        db, task.id, models.TaskRefine(affected_areas=["hub/x.py"])
+    )
+    await db.commit()
+    await lifecycle.submit_for_review(db, task.id, models.TaskSubmitReview(agent="dev"))
+
+    retry = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", accept_areas=True)
+    )
+
+    assert retry.submission_generation == 1
+    fresh = dict(await repo.get_task(db, task.id))
+    assert deserialize_str_list(fresh.get("affected_areas")) == ["hub/x.py"], (
+        "SDD_SURFACES=off: повтор не расширяет область, которую оригинал не трогал"
+    )
+
+
+async def test_accept_areas_on_a_retry_records_the_risk_class_it_alerts(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Cursor #386 (cd22025d472a0300): первая сдача не прочитала дифф, повтор
+    прочитал — и в нём миграция. Лента называет повышение класса, значит
+    класс в задаче тоже повышен, а не остался прежним."""
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+    _install_fixed_tip_git(monkeypatch, "risk-tip")  # дифф: None
+    task = await _pair_task_ready_to_submit(db, "Класс риска на повторе")
+    await repo.update_task_structured(
+        db, task.id, models.TaskRefine(affected_areas=["hub/web.py"])
+    )
+    # Класс «было» должен существовать: без него пересчёт пишет класс молча,
+    # а повышения, о котором говорит алерт, нет (#583).
+    await repo.update_task(db, task.id, risk_class="R2")
+    await db.commit()
+    await lifecycle.submit_for_review(db, task.id, models.TaskSubmitReview(agent="dev"))
+    before_class = dict(await repo.get_task(db, task.id))["risk_class"]
+    before = len(await repo.get_task_updates(db, task.id))
+
+    _install_fixed_tip_git(
+        monkeypatch, "risk-tip", diff_paths=["hub/web.py", "hub/db.py"]
+    )
+    retry = await lifecycle.submit_for_review(
+        db, task.id, models.TaskSubmitReview(agent="dev", accept_areas=True)
+    )
+
+    assert retry.submission_generation == 1
+    new = [
+        (dict(u)["content"] or "")
+        for u in (await repo.get_task_updates(db, task.id))[before:]
+    ]
+    alerts = [c for c in new if "Класс риска" in c]
+    assert alerts, f"миграция в диффе повтора должна поднять класс: {new}"
+    after_class = dict(await repo.get_task(db, task.id))["risk_class"]
+    assert after_class == "R3" and after_class != before_class, (
+        f"лента назвала повышение, а в задаче {before_class}->{after_class}"
+    )
+
+
+async def test_the_second_read_refusal_is_said_once_per_report(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Cursor #383 (78312fbb487b30ca): повтор того же sha — штатный путь, и
+    отказ #1152 на нём не копится в ленте: один раз на отчёт."""
+    from hub.services import review_dispatch
+
+    async def _covers(db_, task_):
+        return 42
+
+    monkeypatch.setattr(review_dispatch, "_report_already_covers_this_sha", _covers)
+    task = await _pair_task_ready_to_submit(db, "Отказ один раз")
+    row = dict(await repo.get_task(db, task.id))
+
+    assert await review_dispatch._this_code_was_already_read(db, row) is True
+    assert await review_dispatch._this_code_was_already_read(db, row) is True
+
+    said = [
+        (dict(u)["content"] or "")
+        for u in await repo.get_task_updates(db, task.id)
+        if "отчёт #42 покрывает ту же вершину" in (dict(u)["content"] or "")
+    ]
+    assert len(said) == 1, (
+        f"отказ сказан ровно один раз, а не на каждом повторе: {said}"
+    )
+
+
+async def test_a_replayed_payload_is_not_an_error_but_a_typo_is(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 и AC-5 на одном теле (Cursor #380: db8880bcc6c939e2, 97ee0d78bda22c1c).
+
+    Повтор ТОГО ЖЕ тела с finding_outcomes, которые первый вызов уже записал,
+    — не ошибка: эти uid отвечены на поколении. А uid, которого у поколения
+    нет вовсе, — опечатка, и на неё ответ тот же 422, что у обычной сдачи,
+    а не молчаливый успех над выброшенными данными.
+    """
+    from fastapi import HTTPException
+
+    from hub.services.finding_identity import finding_uid
+
+    _install_fixed_tip_git(monkeypatch, "replay-tip")
+
+    task = await _pair_task_ready_to_submit(db, "Повтор тела и опечатка")
+    await lifecycle.submit_for_review(db, task.id, models.TaskSubmitReview(agent="dev"))
+
+    finding = {"title": "утечка", "severity": "high", "file": "hub/x.py"}
+    await repo.insert_machine_review(
+        db,
+        task_id=task.id,
+        submission_generation=1,
+        harness_skill="lite-diff-review",
+        model="grok-4.6",
+        raw_count=1,
+        findings_confirmed=json.dumps([finding]),
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+    body = models.TaskSubmitReview(
+        agent="dev",
+        finding_outcomes=[{"finding_uid": finding_uid(finding), "outcome": "fixed"}],
+    )
+
+    first = await lifecycle.submit_for_review(db, task.id, body)
+    replay = await lifecycle.submit_for_review(db, task.id, body)
+
+    assert first.submission_generation == replay.submission_generation == 1
+    assert first.lifecycle_hint == replay.lifecycle_hint, (
+        "повтор тела с уже записанными исходами — тот же ответ, а не ошибка"
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.submit_for_review(
+            db,
+            task.id,
+            models.TaskSubmitReview(
+                agent="dev",
+                finding_outcomes=[
+                    {"finding_uid": "0000deadbeef0000", "outcome": "fixed"}
+                ],
+            ),
+        )
+    assert refused.value.status_code == 422, (
+        "uid, которого у поколения нет, — не повтор, а опечатка: 422, как у обычной сдачи"
+    )
+
+
+async def test_the_second_read_refusal_does_not_claim_a_bumped_generation(
+    db: aiosqlite.Connection,
+):
+    """Cursor #380 (e1e65dee8cdf6635): отказ #1152 теперь пишется и на пути
+    #1265, где поколение НЕ поднималось. Текст обязан быть правдой на обоих
+    путях — «код не изменился», а не «пересдача подняла поколение»."""
+    from hub.services.review_dispatch import _refuse_second_read
+
+    task = await _pair_task_ready_to_submit(db, "Текст отказа")
+    await _refuse_second_read(db, task.id, 42)
+
+    said = " ".join(
+        (dict(u)["content"] or "") for u in await repo.get_task_updates(db, task.id)
+    )
+    assert "отчёт #42" in said
+    assert "подняла" not in said, (
+        f"на пути #1265 поколение не поднималось — текст не вправе это утверждать: {said}"
+    )
+
+
+async def test_same_sha_from_fix_requested_is_untouched(db: aiosqlite.Connection):
+    """AC-4: правило не срабатывает вне review — сдача из fix_requested не тронута.
+
+    fix_requested — headless-статус; ``_step_task_is_submittable`` отказывает
+    headless-задаче (``job_id`` установлен) раньше, чем конвейер дойдёт до
+    пин-шага, так что сегодняшняя сдача из fix_requested этим шагом вообще не
+    задета. Опасная мутация из review-чеклиста — «сравнивать sha из любого
+    статуса» — это про ЯДРО условия: без привязки к
+    ``resubmitted_from_review`` (=``status == "review"``, #1054) шаг пометил
+    бы дублем и пересдачу того же sha из fix_requested, если бы конвейер до
+    него когда-нибудь дошёл. Проверяется поэтому на самом шаге напрямую, а
+    не только через отказ headless-задачи выше по списку.
+    """
+    from hub.services.lifecycle import (
+        SubmitContext,
+        _step_same_sha_from_review_is_current,
+    )
+
+    state = SubmitContext(
+        db=db,
+        task_id=1,
+        task={"status": "fix_requested", "submission_sha": "same-sha"},
+        body=models.TaskSubmitReview(),
+    )
+    # fix_requested, не review: #1054 связывает resubmitted_from_review
+    # ИМЕННО со статусом review, и здесь он выставлен вручную ровно так же,
+    # как это делает _step_task_is_submittable для fix_requested — False.
+    state.resubmitted_from_review = False
+    state.replaced_sha = "same-sha"
+    state.submission_sha = "same-sha"
+
+    await _step_same_sha_from_review_is_current(state)
+
+    assert state.same_sha_noop is False, (
+        "пересдача того же sha из fix_requested не должна помечаться дублем "
+        "ревью — правило действует только из статуса review, #1265 scope_out"
+    )

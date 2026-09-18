@@ -22,6 +22,7 @@ from hub import config
 from hub import db as db_module
 from hub import repository as repo
 from hub import services
+from hub import skill_publish
 from hub.actionable_errors import (
     agent_create_forbidden_detail,
     human_only_gate_detail,
@@ -1419,9 +1420,19 @@ async def web_finding_dispositions(task_id: int, request: Request):
         # отчёта человек оказывается в общем списке. Слаг не берётся как URL:
         # он подставляется в один известный путь и экранируется.
         back_project = str(form.get("return_project") or "").strip()
-        back = (
-            f"/findings?project={quote(back_project)}" if back_project else "/findings"
-        )
+        # #1171: и в ту же КАТЕГОРИЮ. Заход идёт одной категорией; выброс в
+        # общий список после каждого отчёта возвращает ровно ту навигацию,
+        # которую страница снимает. Оба значения подставляются в один
+        # известный путь и экранируются — открытым редиректом это не станет.
+        params = [
+            f"{name}={quote(value)}"
+            for name, value in (
+                ("project", back_project),
+                ("category", str(form.get("return_category") or "").strip()),
+            )
+            if value
+        ]
+        back = "/findings" + ("?" + "&".join(params) if params else "")
     else:
         back = f"/tasks/{task_id}"
     # Какой ИМЕННО отчёт судят. Карточка задачи рисует только новейший и потому
@@ -1452,26 +1463,30 @@ async def web_finding_dispositions(task_id: int, request: Request):
     return RedirectResponse(back, status_code=303)
 
 
-@router.get("/findings", response_class=HTMLResponse)
-async def web_findings_queue(request: Request, project: str = Query(default="")):
-    """Every confirmed finding nobody has answered yet (#1038).
+#: Слово автора про находку, по-русски и рядом с фактом (#911, #1085). Это
+#: ВХОД, а не диспозиция: автор отчитывается о том, что сделал, суждение о том,
+#: была ли находка настоящей, вводит человек (#876). Подпись у строки говорит
+#: это вслух — соседство двух ответов на экране и есть то место, где границу
+#: проще всего потерять.
+_AUTHOR_OUTCOME_LABELS: dict[str, str] = {
+    "fixed": "исправил",
+    "false_positive": "считает ложняком",
+    "wont_fix": "чинить не стал",
+    "deferred": "отложил",
+    "real_fixed": "признал и исправил",
+    "real_deferred": "признал и отложил",
+    "not_a_defect": "смотрел, дефекта не нашёл",
+    "not_judged": "не судил",
+}
 
-    The page exists because the JUDGEMENT was never the expensive part — the
-    form has been in the task card since #876. What was missing is a way to
-    reach it: reports are written while a task is in review, and every inbox
-    section is built from ``list_tasks_by_status``, so once the task completes
-    its findings appear nowhere. Judging them meant remembering which of
-    twenty-eight tasks had reports.
 
-    Grouped by task so a person answers a whole report in one pass, and posting
-    through the same route the task card uses — a second way to record a
-    judgement would be a second thing to keep honest.
+def _findings_queue_groups(rows: list[Any]) -> list[dict[str, Any]]:
+    """Строки очереди НАХОДОК, сгруппированные по отчёту: один ответ — одна форма.
+
+    Имя названо полностью не из педантизма: ``_queue_groups`` выше в этом же
+    файле — группы человеческой очереди задач, и совпадение имён молча
+    подменило бы одну другой.
     """
-    db = _db(request)
-    # The project narrows the query, not its result (#627). Arriving here from a
-    # board filtered to one project must not silently widen to every project.
-    project_id = await services.project_id_for(db, project or None)
-    rows = await repo.list_unjudged_findings(db, project_id=project_id)
     groups: list[dict[str, Any]] = []
     by_review: dict[int, dict[str, Any]] = {}
     for row in rows:
@@ -1499,27 +1514,131 @@ async def web_findings_queue(request: Request, project: str = Query(default=""))
             # the metrics page and make the two disagree.
             finding = {}
         group["findings"].append({"index": int(r["finding_index"]), "f": finding})
+    return groups
+
+
+def _confirmed_findings(review: dict[str, Any]) -> list[dict[str, Any]]:
+    """Полный список подтверждённых находок отчёта — материал для uid."""
+    try:
+        parsed = json.loads(review.get("findings_confirmed") or "[]")
+    except ValueError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [f if isinstance(f, dict) else {} for f in parsed]
+
+
+def _author_said(row: dict[str, Any] | None) -> dict[str, str] | None:
+    if row is None:
+        return None
+    return {
+        "label": _AUTHOR_OUTCOME_LABELS.get(str(row["outcome"]), str(row["outcome"])),
+        "note": str(row.get("note") or ""),
+        "by": str(row.get("reported_by") or ""),
+    }
+
+
+async def _attach_queue_inputs(db, groups: list[dict[str, Any]]) -> None:
+    """Оба ВХОДА рядом с находкой: факт касания и слово автора (#1171).
+
+    Ни один из них ничего не предвыбирает. Факт (#1039) отвечает, тронул ли
+    последующий коммит названное место, — это про код, а не про дефект. Слово
+    автора (#911) хранится в своей таблице и диспозицией не становится ни
+    одним путём. Показаны вместе потому, что по одному их и так приходилось
+    искать руками; подписаны порознь потому, что это разные вопросы.
+
+    uid считается по ПОЛНОМУ списку подтверждённых находок отчёта, а не по
+    тем строкам, которые очередь показывает сейчас. Очередь показывает
+    подмножество всегда — разобранное из неё уходит, а фильтр по категории
+    сужает её дальше, — и личность близнецов (одинаковые категория, файл,
+    заголовок и строка) различается порядковым номером ВНУТРИ отчёта (#1007).
+    Считать uid по обрезанному списку значило бы искать слово автора по
+    ключу, которого он никогда не носил.
+    """
     for group in groups:
-        payload = [item["f"] for item in group["findings"]]
+        row = await repo.get_machine_review(db, int(group["review_id"]))
+        confirmed = _confirmed_findings(dict(row)) if row is not None else []
+        uids = finding_uids(confirmed)
         by_uid = await evidence_for_report(
             db,
             int(group["task_id"]),
-            payload,
+            confirmed,
             generation=int(group["generation"]),
         )
-        for item, uid in zip(group["findings"], finding_uids(payload), strict=True):
-            item["evidence"] = by_uid.get(uid)
+        author = {
+            str(dict(r)["finding_uid"]): dict(r)
+            for r in await repo.list_finding_outcomes(db, int(group["review_id"]))
+        }
+        for item in group["findings"]:
+            index = int(item["index"])
+            uid = uids[index] if index < len(uids) else ""
             item["uid"] = uid
-    total = sum(len(g["findings"]) for g in groups)
+            item["evidence"] = by_uid.get(uid)
+            item["author"] = _author_said(author.get(uid))
+
+
+@router.get("/findings", response_class=HTMLResponse)
+async def web_findings_queue(
+    request: Request,
+    project: str = Query(default=""),
+    category: str = Query(default=""),
+):
+    """Every confirmed finding nobody has answered yet (#1038).
+
+    The page exists because the JUDGEMENT was never the expensive part — the
+    form has been in the task card since #876. What was missing is a way to
+    reach it: reports are written while a task is in review, and every inbox
+    section is built from ``list_tasks_by_status``, so once the task completes
+    its findings appear nowhere. Judging them meant remembering which of
+    twenty-eight tasks had reports.
+
+    Grouped by task so a person answers a whole report in one pass, and posting
+    through the same route the task card uses — a second way to record a
+    judgement would be a second thing to keep honest.
+
+    #1171: очередь читается КАТЕГОРИЯМИ, самая частая сверху, и внутри выборки
+    свежие отчёты идут первыми. Сто находок подряд одним потоком — это то, как
+    суждение вырождается в штамп к концу списка; категория держит вопрос одним
+    и тем же на протяжении захода, а фильтр позволяет закончить заход, а не
+    очередь.
+    """
+    db = _db(request)
+    # The project narrows the query, not its result (#627). Arriving here from a
+    # board filtered to one project must not silently widen to every project.
+    project_id = await services.project_id_for(db, project or None)
+    categories = await repo.unjudged_findings_by_category(db, project_id=project_id)
+    rows = await repo.list_unjudged_findings(
+        db,
+        project_id=project_id,
+        category=category or None,
+        newest_first=True,
+    )
+    groups = _findings_queue_groups(rows)
+    await _attach_queue_inputs(db, groups)
+    shown = sum(len(g["findings"]) for g in groups)
     return TEMPLATES.TemplateResponse(
         request,
         "findings_queue.html",
-        {"groups": groups, "total": total, "project": project or ""},
+        {
+            "groups": groups,
+            # Сток — вся очередь; выборка — то, что на экране. Одним числом их
+            # не сводить: «в очереди 131» и «в этой категории 12» отвечают на
+            # разные вопросы, и общая цифра в заголовке над фильтром читалась
+            # бы как размер выборки.
+            "total": sum(c["findings"] for c in categories),
+            "shown": shown,
+            "categories": categories,
+            "category": category or "",
+            "project": project or "",
+        },
     )
 
 
 @router.get("/metrics", response_class=HTMLResponse)
-async def web_metrics(request: Request, since_days: int = Query(default=90, ge=1)):
+async def web_metrics(
+    request: Request,
+    since_days: int = Query(default=services.PRACTICE_METRICS_DEFAULT_DAYS, ge=1),
+):
     """Practice metrics page (#384)."""
     data = await services.practice_metrics(_db(request), since_days=since_days)
     return TEMPLATES.TemplateResponse(request, "metrics.html", {"m": data})
@@ -1598,6 +1717,141 @@ async def web_skills(request: Request, skill_error: str = Query("")):
     )
 
 
+async def _skill_publish_views(
+    request: Request, name: str, versions: list[Any], active: Any | None
+) -> dict[int, dict[str, Any]]:
+    """Что показать рядом с каждой версией на /skills/{name} (#1169).
+
+    Момент показа у путей разный, и это не деталь оформления:
+
+    * Драфт, предложенный агентом (путь 2) — человек НЕ автор текста, и диф
+      нужен ему ДО нажатия кнопки. Он считается здесь, на лету: сравнивать
+      есть с чем ровно сейчас, а активной эта версия ещё не стала.
+    * Активная версия (пути 1 и 3) — предпоказывать нечего, публикация уже
+      случилась. Показывается ЗАПИСЬ о ней, прочитанная из события
+      ``skill_activated``, а не пересчёт: человек должен видеть то, что было
+      записано в момент публикации.
+
+    ``active`` — активная версия либо ``None``, когда активной нет вовсе
+    (весь реестр этого скилла — драфты). Отсутствие основания сравнения не
+    отменяет показ: драфт всё равно можно активировать, и человеку тогда
+    нужно видеть словами, что сравнивать не с чем, а не пустое место, из
+    которого одинаково читаются «ничего не изменилось» и «блок не построился».
+    """
+    # Основание сравнения для драфтов — активная версия, и оно ОДНО на весь
+    # цикл. Держать его в переменных, которые ветка активной версии потом
+    # переиспользует, нельзя: `list_skill_versions` отдаёт версии по убыванию,
+    # активная встречается раньше драфтов с меньшим номером, и после отката
+    # (сид демоутит свою прежнюю версию в draft) превью подписывалось номером
+    # из ЧУЖОЙ записи — «К активной версии v1» при дифе к v2, а unified diff
+    # выходил с заголовком `--- v1 / +++ v1` (#1169, находка ревью #317).
+    active_content = None if active is None else active.content
+    active_version = None if active is None else active.version
+    views: dict[int, dict[str, Any]] = {}
+    for version in versions:
+        if version.status != "active":
+            views[version.version] = {
+                "when": "before",
+                "diff": skill_publish.summarize_change(
+                    previous_content=active_content,
+                    previous_version=active_version,
+                    content=version.content,
+                ).as_dict(),
+                "unified": skill_publish.unified_diff(
+                    previous_content=active_content,
+                    previous_version=active_version,
+                    content=version.content,
+                    version=version.version,
+                ),
+                "scan": skill_publish.scan_report(version.content),
+            }
+            continue
+        recorded = await repo.latest_skill_activation(
+            _db(request), name, version.version
+        )
+        if recorded is None:
+            # Записи нет вовсе — и это не повод показать пустое место. Ровно
+            # так выглядят обе версии реестра хаба в день выката: сид до #1169
+            # не писал ``skill_activated``, а сид case 1 (активный текст уже
+            # совпадает с константой) события задним числом не допишет. Пустой
+            # блок читается и как «ничего не менялось», и как «блок не
+            # построился»; отсутствие записи надо назвать словами — тем же
+            # приёмом, каким уже названы «дифа в записи нет» и «вердикта в
+            # записи нет» (#1169, находка ревью #327).
+            views[version.version] = {
+                "when": "after",
+                "diff": {
+                    "baseline": skill_publish.BASELINE_NO_RECORD,
+                    "note": skill_publish.BASELINE_NO_RECORD_NOTE,
+                },
+                "unified": "",
+                "scan": {"rules_triggered": None, "note": ""},
+            }
+            continue
+        diff = _recorded_diff(recorded)
+        recorded_baseline = diff.get("baseline_version")
+        baseline = next(
+            (v for v in versions if v.version == recorded_baseline),
+            None,
+        )
+        views[version.version] = {
+            "when": "after",
+            "diff": diff,
+            # Unified diff в событие не кладётся — обе версии лежат в реестре,
+            # и копия текста на 100k символов в фиде не нужна. Здесь он
+            # восстанавливается по названному в записи основанию; если той
+            # версии в реестре уже нет, остаются сводка и вердикт.
+            "unified": (
+                ""
+                if baseline is None
+                else skill_publish.unified_diff(
+                    previous_content=baseline.content,
+                    previous_version=baseline.version,
+                    content=version.content,
+                    version=version.version,
+                )
+            ),
+            "scan": _recorded_scan(recorded),
+        }
+    return views
+
+
+def _recorded_diff(recorded: dict[str, Any]) -> dict[str, Any]:
+    """Сводка из записи — или прямое «дифа в записи нет» (#1169).
+
+    События ``skill_activated``, написанные ДО этой задачи, несут только имя и
+    номер версии. Пустой словарь на их месте рисовался шаблоном как «К
+    активной версии v: + строк, − строк» — то есть как диф, в котором ничего
+    не изменилось, к версии без номера. Это хуже молчания: полуправда читается
+    как факт. В день выката такую запись имеет КАЖДАЯ активная версия в
+    реестре, так что ветка не гипотетическая.
+    """
+    diff = recorded.get("diff")
+    if isinstance(diff, dict) and diff.get("baseline"):
+        return diff
+    return {
+        "baseline": skill_publish.BASELINE_UNRECORDED,
+        "note": skill_publish.BASELINE_UNRECORDED_NOTE,
+    }
+
+
+def _recorded_scan(recorded: dict[str, Any]) -> dict[str, Any]:
+    """Вердикт из записи — или прямое «вердикта в записи нет» (#1169).
+
+    ``rules_triggered is None`` — то же различение, что у счётчиков
+    ``DiffSummary``: пустой список означает «ни одно правило не совпало», а
+    отсутствие вердикта — что его тогда не считали вовсе. Рисовать второе как
+    первое значит утверждать проверку, которой не было.
+    """
+    scan = recorded.get("content_scan")
+    if isinstance(scan, dict) and isinstance(scan.get("rules_triggered"), list):
+        return scan
+    return {
+        "rules_triggered": None,
+        "note": skill_publish.SCAN_UNRECORDED_NOTE,
+    }
+
+
 @router.get("/skills/{name}", response_class=HTMLResponse)
 async def web_skill_detail(name: str, request: Request, skill_error: str = Query("")):
     from hub.models import SkillView
@@ -1606,14 +1860,25 @@ async def web_skill_detail(name: str, request: Request, skill_error: str = Query
     if not rows:
         raise HTTPException(404, "skill not found")
     versions = [SkillView(**dict(r)) for r in rows]
-    active = next((v for v in versions if v.status == "active"), versions[0])
+    # Активная версия — то, ЧТО раздаётся агентам; когда её нет, основания для
+    # сравнения нет тоже, и подставлять вместо него самый свежий драфт нельзя:
+    # диф к неопубликованному тексту выдал бы за прежнюю активную версию то,
+    # что ею никогда не было (#1169).
+    published = next((v for v in versions if v.status == "active"), None)
     return TEMPLATES.TemplateResponse(
         request,
         "skill_detail.html",
         {
             "name": name,
             "versions": versions,
-            "active_content": active.content,
+            "active_content": (published or versions[0]).content,
+            "publish_views": await _skill_publish_views(
+                request, name, versions, published
+            ),
+            "baseline_absent": skill_publish.BASELINE_ABSENT,
+            "baseline_unrecorded": skill_publish.BASELINE_UNRECORDED,
+            "baseline_no_record": skill_publish.BASELINE_NO_RECORD,
+            "baseline_too_large": skill_publish.BASELINE_TOO_LARGE,
             "skill_error": skill_error,
         },
     )

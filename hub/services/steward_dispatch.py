@@ -421,7 +421,14 @@ async def close_run(
     return True
 
 
-def _policy_wants_steward(project_row: Any | None, gate: str = "verdict") -> bool:
+#: Признак политики «стюард судит в тени» (#1268). Не значение гейта, а
+#: отдельный ключ: он ничего не делегирует, поэтому замок #743 его пропускает.
+STEWARD_SHADOW_KEY = "steward_shadow"
+
+
+def _policy_wants_steward(
+    project_row: Any | None, gate: str = "verdict", *, shadow: bool = True
+) -> bool:
     """Does the project's own gate policy hand THIS gate to the steward (#743)?
 
     Один вопрос на два гейта, а не два похожих читателя: вердикт и DoR
@@ -435,10 +442,25 @@ def _policy_wants_steward(project_row: Any | None, gate: str = "verdict") -> boo
     Сравнение со строкой ``steward`` живёт ровно здесь и нигде больше — #1157
     заводит перечень делегирующих значений ключа ``dor`` и один читатель для
     него, и заменить придётся одно место, а не каждое употребление.
+
+    Теневое участие (#1268) — второй вход в тот же вопрос, и только для
+    вердикта: проект просит суждения, не отдавая решения. Вход открывает
+    ровно ``true`` JSON; строка «true», единица и прочее читаются как «не
+    участвует» (#835). ``shadow=False`` спрашивает про делегирование в
+    чистом виде — это вопрос привратника применения: суждение применяется
+    только там, где вердикт стюарду ОТДАН, а не где его лишь слушают.
     """
     if project_row is None:
         return False
-    return gate_policy_of(project_row).get(gate) == "steward"
+    policy = gate_policy_of(project_row)
+    if policy.get(gate) == "steward":
+        return True
+    return shadow and gate == "verdict" and policy.get(STEWARD_SHADOW_KEY) is True
+
+
+def verdict_delegated_to_steward(project_row: Any | None) -> bool:
+    """Отдан ли вердикт проекта стюарду — без теневого входа (#1268)."""
+    return _policy_wants_steward(project_row, shadow=False)
 
 
 async def _nothing_new_since(
@@ -661,10 +683,7 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
         run = dict(row)
         task_row = await repo.get_task(db, run["task_id"])
         task = dict(task_row) if task_row is not None else {}
-        # A human verdict on this very generation ends the run: the judgement
-        # it was ordered for is no longer anybody's to make (#1022 gives such
-        # a late judgement a 409, and this closes the slot behind it).
-        # #1120 review: a resubmission ends the run too. Its subject stopped
+        # #1120 review: a resubmission ends the run. Its subject stopped
         # being the thing under review, and a slot left open would hold the
         # daily cap and the evidence door for code nobody is judging any more.
         #
@@ -710,6 +729,43 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
             continue
         # Вердикт — про сдачу, и снимает он слот сдачи. Но только ЗАКАЗ,
         # который ещё не начинался (#1201).
+        #
+        # Здесь до #1213 стояли два неверных утверждения; называю оба,
+        # чтобы их не восстановили по памяти, и при каждом — чем оно
+        # опровергается, чтобы следующий читатель шёл в названное место, а
+        # не проверял заново.
+        #
+        # Первое: вердикт бывает НЕ только человеческим — на делегированном
+        # проекте его выносит политика (#1151), и автора называет
+        # ``verdict_closing_reason``, а не догадка читающего. Это держит
+        # ``test_the_closing_reason_names_who_decided`` в
+        # tests/test_steward_dispatch.py: на вердикте политики причина
+        # снятия обязана не выдавать её за человека.
+        #
+        # Второе, и оно хуже: приём суждения (#1022) позднему суждению НЕ
+        # отказывает. Это утверждение о чужом модуле, и проверяется оно
+        # ЧТЕНИЕМ двух мест, а не прогоном: ни маршрут
+        # ``api_steward_judgement`` (hub/app.py), ни
+        # ``record_steward_judgement`` (hub/services/steward_judgement.py)
+        # не смотрят ни статус задачи, ни уже вынесенный вердикт — строка
+        # задачи читается там только ради ответа на несуществующую и ради
+        # поколения. ``pinned_generation`` (hub/services/steward_evidence.py)
+        # срабатывает лишь у вызывающего с пином и отказывает на
+        # РАСХОЖДЕНИИ поколений, то есть на пересдаче, которой вердикт не
+        # делает; отказ тот запретный (403), а не конфликтный.
+        #
+        # Чем это держат тесты — поимённо, чтобы им не приписали лишнего.
+        # ``test_a_late_judgement_is_recorded_but_changes_nothing`` (там же)
+        # зовёт ``record_steward_judgement`` НАПРЯМУЮ, мимо HTTP, и
+        # держит ровно одно: суждение после вердикта записывается и не
+        # трогает ни статус, ни вердикт. Единственный конфликт этого пути —
+        # ПОВТОР той же тройки (задача, поколение, вид) — держит
+        # ``test_at_most_once_per_generation`` в
+        # tests/test_steward_contract.py, и вот он идёт по маршруту. А
+        # слепоту маршрута к статусу не пинит НИ ОДИН тест, и это измерено,
+        # а не предположено: заставь маршрут отказывать при уже вынесенном
+        # вердикте — прогон останется зелёным целиком. Значит держать это
+        # утверждение может только чтение, названное выше.
         #
         # Решение и наблюдение — разные вещи. В теневой фазе суждение на
         # вердикт не влияет вовсе; оно нужно надзору F7 как пара «суждение
