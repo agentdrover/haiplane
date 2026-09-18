@@ -1458,3 +1458,94 @@ async def test_a_pending_claim_is_not_a_started_run(
         (await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],)))[0]
     )
     assert row["status"] == RUN_NEVER_STARTED
+
+
+# ---------------------------------------------------------------------------
+# #1268 — теневое участие: стюард судит, вердикт остаётся за человеком
+# ---------------------------------------------------------------------------
+
+#: Политика default, какой она стоит на проде, плюс признак тени.
+_SHADOW_POLICY: dict[str, object] = {
+    "dor": "human",
+    "verdict": "human",
+    "review": "dispatch",
+    "release": "auto",
+    "steward_shadow": True,
+}
+
+
+async def test_a_shadow_participant_with_a_human_verdict_gets_a_run(
+    db: aiosqlite.Connection,
+):
+    """#1268 AC-1: verdict=human и признак тени — прогон заказан, как для steward.
+
+    Сдача несёт отчёт ревью: на default review=dispatch, и именно такая сдача
+    идёт по потоку. Заказ тот же, что у делегированного проекта, — модель,
+    событие, генерация; различие только в том, кто потом выносит вердикт.
+    """
+    project_id = await _project_with_policy(db, "shadow-default", _SHADOW_POLICY)
+    task_id = await _submitted_task(db, project_id)
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        harness_skill="multi-agent-review",
+        harness_version=1,
+        agent_count=11,
+        tokens_spent=None,
+        duration_ms=1000,
+        orchestrator="cursor",
+        model="grok-4.6",
+        raw_count=0,
+        findings_confirmed="[]",
+        findings_rejected="[]",
+        unresolved="[]",
+        lost_dimensions="[]",
+        incomplete=False,
+        submitted_by="cursor-cloud-reviewer",
+        self_reviewed=False,
+    )
+    await db.commit()
+
+    assert await order_due_runs(db) == 1
+    run = await open_run(db, task_id, 1)
+    assert run is not None, "теневой участник обязан получить прогон вердикта"
+    assert run["status"] == RUN_OPEN
+    assert run["model"] == config.STEWARD_MODEL
+    payload = json.loads((await _events(db, EVENT_ORDERED))[0]["payload"])
+    assert payload["kind"] == "verdict"
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "review", "заказ прогона не трогает статус сдачи"
+    assert row["review_verdict"] is None, "и не выносит вердикта"
+
+
+async def test_shadow_participation_does_not_open_the_dor_gate(
+    db: aiosqlite.Connection,
+):
+    """#1268, граница scope_out: тень — только вердикт, DoR-стюарда она не заказывает."""
+    project_id = await _project_with_policy(db, "shadow-no-dor", _SHADOW_POLICY)
+    task_id = await _ready_draft(db, project_id)
+
+    assert await order_due_dor_runs(db) == 0
+    assert await _runs(db, task_id) == []
+
+
+async def test_a_malformed_shadow_flag_reads_as_not_participating(
+    db: aiosqlite.Connection,
+):
+    """#1268 AC-4: признак неверного типа или незнакомый — проект не участвует (#835).
+
+    Перебором: строка «true», единица, «yes», пустой объект, null. Ровно
+    ``true`` JSON — и только оно — есть участие; всё прочее читается как
+    отсутствие признака, потому что нераспознанная политика не есть просьба.
+    """
+    for number, value in enumerate(("true", "True", 1, "yes", {}, None, [True])):
+        policy = {"verdict": "human", "steward_shadow": value}
+        project_id = await _project_with_policy(db, f"shadow-bad-{number}", policy)
+        task_id = await _submitted_task(db, project_id)
+
+        assert await order_due_runs(db) == 0, (
+            f"steward_shadow={value!r} не участие, а прогон заказан"
+        )
+        assert await open_run(db, task_id, 1) is None
