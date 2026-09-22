@@ -18,6 +18,7 @@ from hub import config
 from hub import repository as repo
 from hub.db import fetchall
 from hub.services.steward_dispatch import (
+    EVENT_DEFERRED,
     EVENT_ORDERED,
     EVENT_REFUSED,
     KIND_DOR,
@@ -26,6 +27,7 @@ from hub.services.steward_dispatch import (
     REFUSED_MODE_OFF,
     REFUSED_NO_GENERATION,
     REFUSED_NO_NEW_INFORMATION,
+    REFUSED_REVIEW_IN_FLIGHT,
     RUN_JUDGED,
     RUN_OPEN,
     RUN_REFUSED,
@@ -38,6 +40,7 @@ from hub.services.steward_dispatch import (
     order_due_dor_runs,
     order_due_runs,
     order_run,
+    runs_today,
 )
 
 
@@ -1549,3 +1552,121 @@ async def test_a_malformed_shadow_flag_reads_as_not_participating(
             f"steward_shadow={value!r} не участие, а прогон заказан"
         )
         assert await open_run(db, task_id, 1) is None
+
+
+async def _dispatch(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    generation: int = 1,
+    status: str = "active",
+) -> int:
+    """Строка заказа кросс-модельного ревью — тот же факт, что бриф зовёт
+    review_in_flight."""
+    cur = await db.execute(
+        "INSERT INTO review_dispatches "
+        "(task_id, submission_generation, agent_id, run_id, model, status) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (task_id, generation, "rev-agent", "run-7", "gpt-5.2", status),
+    )
+    await db.commit()
+    return int(cur.lastrowid or 0)
+
+
+async def _report(
+    db: aiosqlite.Connection, task_id: int, *, generation: int = 1
+) -> None:
+    """Отчёт ревью этой генерации лёг."""
+    await db.execute(
+        "INSERT INTO machine_reviews "
+        "(task_id, submission_generation, model, submitted_by) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, generation, "gpt-5.2", "rev-agent"),
+    )
+    await db.commit()
+
+
+async def test_a_review_in_flight_defers_the_steward_run(db: aiosqlite.Connection):
+    """#1289 AC-1: пока ревью этой сдачи идёт, прогон не покупается.
+
+    Наблюдено 22.09.2026 на #1283 и #1286: заказ размещался через минуту
+    после сдачи, отчёта ещё не было, и gate_grounds эскалировал по
+    no_current_report — исход был предрешён до начала прогона. Отказ здесь
+    стоит ноль, прогон стоил бы денег и суточной квоты.
+    """
+    project_id = await _project(db, "steward-inflight", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    await _dispatch(db, task_id)
+
+    # Два тика подряд — обычный случай: поллер тикает каждые тридцать
+    # секунд, а ревью идёт минутами. Отсрочка повторяется, слово о ней — нет.
+    assert await order_due_runs(db) == 0
+    assert await order_due_runs(db) == 0
+
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE task_id=?", (task_id,))
+    assert list(rows) == [], "отложенный заказ не смеет оставлять строку прогона"
+    assert await runs_today(db, project_id) == 0, "квота на отложенный заказ потрачена"
+    deferrals = await _events(db, EVENT_DEFERRED)
+    assert len(deferrals) == 1
+    payload = json.loads(deferrals[0]["payload"])
+    assert payload["reason"] == REFUSED_REVIEW_IN_FLIGHT
+    assert payload["generation"] == 1
+    assert "ревью" in payload["detail"]
+
+
+async def test_a_deferred_order_comes_back_when_the_report_lands(
+    db: aiosqlite.Connection,
+):
+    """#1289 AC-2: отложенный заказ не теряется — следующий проход вернётся.
+
+    Откладывание держится на отсутствии строки в steward_runs: генерация
+    остаётся нерешённой, и поллер обязан прийти к ней снова. Строка
+    (хоть refused) заперла бы её навсегда.
+    """
+    project_id = await _project(db, "steward-comes-back", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    await _dispatch(db, task_id)
+
+    assert await order_due_runs(db) == 0
+    assert await open_run(db, task_id, 1) is None
+
+    await _report(db, task_id)
+
+    assert await order_due_runs(db) == 1
+    run = await open_run(db, task_id, 1)
+    assert run is not None
+    assert run["status"] == RUN_OPEN
+
+
+async def test_no_review_at_all_still_buys_a_run(db: aiosqlite.Connection):
+    """#1289 AC-3: ревью нет вовсе — прогон заказан, эскалация законна.
+
+    Случай #1241: ревьюер падал, отчёта нет по-настоящему. Такое суждение и
+    есть то, ради чего стюард заведён, и откладывать его нечем — ждать
+    нечего. Мутация «откладывать всегда» роняет именно этот тест.
+    """
+    project_id = await _project(db, "steward-no-review", steward=True)
+    task_id = await _submitted_task(db, project_id)
+
+    assert await order_due_runs(db) == 1
+
+    run = await open_run(db, task_id, 1)
+    assert run is not None
+    assert run["status"] == RUN_OPEN
+    assert await _events(db, EVENT_DEFERRED) == []
+
+
+async def test_a_finished_dispatch_without_a_report_does_not_defer(
+    db: aiosqlite.Connection,
+):
+    """#1289 AC-3, тот же случай с закрытым заказом ревью.
+
+    Свип закрывает зависший заказ как failed. После этого ждать снова нечего:
+    ревью было вызвано и не сдало отчёта — ровно #1241.
+    """
+    project_id = await _project(db, "steward-dispatch-failed", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    await _dispatch(db, task_id, status="failed")
+
+    assert await order_due_runs(db) == 1
+    assert await open_run(db, task_id, 1) is not None

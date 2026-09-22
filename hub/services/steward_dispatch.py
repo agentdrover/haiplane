@@ -101,10 +101,20 @@ REFUSED_DAILY_CAP = "daily_cap"
 REFUSED_ALREADY_ORDERED = "already_ordered"
 REFUSED_NO_GENERATION = "no_generation"
 REFUSED_NO_NEW_INFORMATION = "no_new_information"
+# Не отказ, а ОТСРОЧКА (#1289): ревью этой сдачи ещё идёт, и судить пока
+# нечего. Слово то же, что бриф даёт этому факту, — чтобы отсрочка здесь и
+# плашка там назывались одинаково, а не походили друг на друга.
+REFUSED_REVIEW_IN_FLIGHT = "review_in_flight"
 
 EVENT_ORDERED = "steward_run_ordered"
 EVENT_REFUSED = "steward_run_refused"
 EVENT_CLOSED = "steward_run_closed"
+# Своё слово, а не steward_run_refused (#1289). Отказ РЕШАЕТ генерацию:
+# рядом с ним стоит строка steward_runs, и второго заказа не будет никогда.
+# Отсрочка не решает ничего — она говорит «ещё рано», строки не пишет, и
+# следующий проход поллера обязан вернуться к этой задаче. Назвать их одним
+# словом значило бы потерять ровно ту разницу, ради которой это заведено.
+EVENT_DEFERRED = "steward_run_deferred"
 
 _MODES = {"off", "shadow", "act"}
 
@@ -548,6 +558,87 @@ async def _nothing_new_since(
     )
 
 
+async def _review_still_running(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
+    """Почему заказывать рано, или "" если пора.
+
+    Наблюдено 22.09.2026, первый день тени на default: из восьми суждений
+    три — эскалации no_current_report, и две из них (#1283, #1286)
+    искусственные. Прогон заказывали через минуту после сдачи, пока
+    кросс-модельное ревью ЭТОЙ сдачи ещё работало; gate_grounds читает
+    отчёт первым и при его отсутствии эскалирует сразу. Исход такого
+    прогона предрешён до его начала — а стоит он денег и суточной квоты, и
+    портит измерение: доля эскалаций и есть порог выхода стюарда из тени.
+
+    Приём тот же, что steward_shadow применяет к неназванной модели
+    ревьюера: «пока неизвестно» не то же самое, что «неизвестно никогда».
+    Разница с тамошним ожиданием одна и она в цене: там ждёт УЖЕ
+    РАЗМЕЩЁННЫЙ заказ, здесь заказ ещё не размещён — и не размещается,
+    поэтому ожидание не стоит ни прогона, ни квоты.
+
+    Про ход ревью спрашивается ОДИН читатель — ``inflight_view``, тот
+    самый, чей ответ бриф показывает как ``review_in_flight``. Второй
+    читатель того же факта разошёлся бы с первым, и разошёлся бы в сторону
+    «заказывать»: экономия всегда тише осторожности.
+
+    Отчёт спрашивается вторым и решает в пользу прогона: ревью может
+    сдать отчёт раньше, чем свип переведёт свою строку в done, и ждать
+    того, что уже пришло, значило бы задерживать суждение ради
+    аккуратности учёта. Полное отсутствие ревью (#1241) сюда не попадает
+    вовсе: ждать нечего, прогон покупается, и эскалация по нему законна.
+    """
+    from hub.services.review_evidence import inflight_view
+
+    view = await inflight_view(db, task)
+    if view is None:
+        return ""
+    task_id = int(task["id"])
+    generation = int(task.get("submission_generation") or 0)
+    if await repo.machine_reviews_of_generation(db, task_id, generation):
+        return ""
+    return (
+        f"ревью этой сдачи ещё идёт ({view.headline}) — прогон прочитал бы "
+        "отсутствие отчёта и эскалировал по no_current_report, не начав "
+        "судить; заказ ждёт отчёта"
+    )
+
+
+async def _defer(
+    db: aiosqlite.Connection, task_id: int, generation: int, detail: str
+) -> None:
+    """Сказать в ленте, что заказ отложен, — один раз на поколение.
+
+    Поллер тикает каждые тридцать секунд, а ревью идёт минутами: сказать
+    на каждом тике значило бы утопить ленту задачи в повторе одной мысли.
+    Молчать нельзя — отложенный заказ, о котором не сказано, неотличим от
+    диспетчера, который эту задачу не увидел.
+
+    Запирать генерацию строкой, как это делает отказ, здесь НЕЛЬЗЯ по
+    построению: строка в steward_runs закрывает её навсегда (``_settled``),
+    а отсрочка обязана кончиться заказом. Поэтому дедупликация — по ленте.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM events WHERE task_id=? AND kind=? "
+        "AND json_extract(payload, '$.generation')=? LIMIT 1",
+        (task_id, EVENT_DEFERRED, generation),
+    )
+    if rows:
+        return
+    await repo.insert_event(
+        db,
+        kind=EVENT_DEFERRED,
+        task_id=task_id,
+        actor="hub",
+        payload={
+            "reason": REFUSED_REVIEW_IN_FLIGHT,
+            "detail": detail,
+            "generation": generation,
+            "kind": KIND_VERDICT,
+        },
+    )
+    await db.commit()
+
+
 async def order_due_runs(db: aiosqlite.Connection) -> int:
     """Order a run for every submission that is waiting for one."""
     if not dispatcher_enabled():
@@ -568,6 +659,13 @@ async def order_due_runs(db: aiosqlite.Connection) -> int:
         if await open_run(db, task_id, generation) is not None:
             continue
         if await _settled(db, task_id, generation):
+            continue
+        # Шестой страж (#1289), и единственный, который НЕ решает генерацию:
+        # пока ревью этой сдачи идёт, судить нечего, и прогон кончился бы
+        # эскалацией «нет отчёта», предрешённой до его начала.
+        waiting = await _review_still_running(db, task)
+        if waiting:
+            await _defer(db, task_id, generation, waiting)
             continue
         # Пятый страж, и единственный, который экономит деньги: отказ ДО
         # заказа стоит ноль, отказ после — полный прогон (#1150).
