@@ -2742,11 +2742,13 @@ async def test_unknown_mergeability_still_is_not_a_conflict() -> None:
 # Исходы берутся из модуля по префиксу имени, а не выписываются здесь: новый
 # STACK_ANCESTRY_* без упоминания в докстринге роняет тест сам.
 #
-# «Назван» значит буквально: имя константы, значение литералом (``unknown``)
-# или значение словом В ПЕРЕЧНЕ исходов. Пересказ («the head is the
-# descendant») не считается — по нему нельзя сверить; и слово из объяснения
-# вокруг перечня (order, first, symmetric, stacked, head, side) именем исхода
-# тоже не становится.
+# «Назван» значит буквально: имя константы или значение литералом — в
+# бэктиках (``unknown``) или в кавычках ("unknown"). Слово английской фразы
+# именем исхода не становится, даже если стоит в самом предложении-перечне:
+# «Returns one of …: the two are unrelated by ancestry …, or the question
+# could not be answered» — это проза, и значения `ancestry`, `answered`,
+# `unrelated` по ней не сверить (#1271, находка ba85e024). Пересказ («the head
+# is the descendant») не считается по той же причине.
 #
 # Исходы, которые докстринг на develop не называет, — находка (#1271), код в
 # этой задаче не правится. Ключ — имя константы, значение — ссылка на драфт.
@@ -2754,6 +2756,7 @@ BRANCH_ANCESTRY_UNNAMED_FINDINGS: dict[str, str] = {
     "STACK_ANCESTRY_HEAD_IS_DESCENDANT": "драфт #1277: только пересказом",
     "STACK_ANCESTRY_HEAD_IS_ANCESTOR": "драфт #1277: только пересказом",
     "STACK_ANCESTRY_SAME_TIP": "драфт #1277: не назван вовсе (#1193)",
+    "STACK_ANCESTRY_UNRELATED": "драфт #1277: только словом фразы, не литералом",
 }
 
 
@@ -2767,35 +2770,24 @@ def _ancestry_outcomes() -> dict[str, str]:
     }
 
 
-def _outcome_listing(doc: str) -> str:
-    """Перечень исходов — предложение, которое их перечисляет, без пересказа.
+def _outcomes_not_named_in(doc: str, outcomes: dict[str, str]) -> list[str]:
+    """Исходы, которых докстринг не называет ни константой, ни литералом.
 
-    Всё остальное в докстринге — объяснение, почему исходы такие, и слова
-    оттуда (order, first, symmetric, stacked, side) именем исхода не являются.
-    Из самого перечня выброшены скобочные пояснения и подлежащие вида «the
-    head»: по ним тоже нельзя сверить значение константы.
+    Токен перечня — имя константы или значение в бэктиках либо кавычках.
+    Слово английской фразы токеном не является: значение, совпавшее со словом
+    предложения «Returns one of …», названным не считается.
     """
     import re
 
-    start = doc.find("Returns one of")
-    if start < 0:
-        return ""
-    sentence = re.split(r"\.\s", doc[start:], maxsplit=1)[0]
-    without_asides = re.sub(r"\([^)]*\)", " ", sentence)
-    return re.sub(r"\bthe\s+[a-z_]+", " ", without_asides)
-
-
-def _outcomes_not_named_in(doc: str, outcomes: dict[str, str]) -> list[str]:
-    """Исходы, которых перечень не называет ни константой, ни значением."""
-    import re
-
-    listing = _outcome_listing(doc)
     return sorted(
         name
         for name, value in outcomes.items()
         if name not in doc
-        and not re.search(rf"``{re.escape(value)}``|\"{re.escape(value)}\"", doc)
-        and not re.search(rf"(?<![\w]){re.escape(value)}(?![\w])", listing)
+        and not re.search(
+            rf"``{re.escape(value)}``|`{re.escape(value)}`"
+            rf"|\"{re.escape(value)}\"|'{re.escape(value)}'",
+            doc,
+        )
     )
 
 
@@ -2805,13 +2797,15 @@ def _unnamed_ancestry_outcomes() -> list[str]:
     )
 
 
-def test_prose_around_the_listing_does_not_name_an_outcome() -> None:
-    """#1271: значение, попавшее в пересказ, считалось названным.
+def test_only_a_constant_or_a_literal_names_an_outcome() -> None:
+    """#1271: значение, совпавшее со словом английской фразы, считалось названным.
 
-    Докстринг branch_ancestry — абзац английской прозы про симметрию и merge
-    order, и слова order, first, symmetric, stacked, head, side стоят в нём по
-    другому поводу. Проверка по всему тексту засчитывала их как имя исхода:
-    новый STACK_ANCESTRY_* с таким значением проходил незамеченным.
+    Сначала (находка прошлого круга) засчитывались слова пересказа вокруг
+    перечня — order, first, symmetric, stacked, head, side. Потом (находка
+    ba85e024) — слова самого предложения-перечня: `ancestry` и `answered`
+    стоят в нём как пересказ чужого исхода, и новый STACK_ANCESTRY_* с таким
+    значением проходил незамеченным. Названным считается только токен: имя
+    константы или значение литералом.
     """
     doc = (
         "Which of two branches stands on the other.\n\n"
@@ -2824,9 +2818,11 @@ def test_prose_around_the_listing_does_not_name_an_outcome() -> None:
         "unresolvable ref is ``unknown``.\n"
     )
     outcomes = {
-        "STACK_ANCESTRY_UNKNOWN": "unknown",  # литерал в перечне
-        "STACK_ANCESTRY_UNRELATED": "unrelated",  # назван в перечне
-        "STACK_ANCESTRY_ORDER": "order",  # дальше — только пересказ
+        "STACK_ANCESTRY_UNKNOWN": "unknown",  # литерал — назван
+        "STACK_ANCESTRY_UNRELATED": "unrelated",  # слово перечня — нет
+        "STACK_ANCESTRY_ANCESTRY": "ancestry",  # слово перечня — нет
+        "STACK_ANCESTRY_ANSWERED": "answered",  # слово перечня — нет
+        "STACK_ANCESTRY_ORDER": "order",  # пересказ вокруг перечня — нет
         "STACK_ANCESTRY_FIRST": "first",
         "STACK_ANCESTRY_SYMMETRIC": "symmetric",
         "STACK_ANCESTRY_STACKED": "stacked",
@@ -2834,12 +2830,15 @@ def test_prose_around_the_listing_does_not_name_an_outcome() -> None:
         "STACK_ANCESTRY_HEAD": "head",
     }
     assert _outcomes_not_named_in(doc, outcomes) == [
+        "STACK_ANCESTRY_ANCESTRY",
+        "STACK_ANCESTRY_ANSWERED",
         "STACK_ANCESTRY_FIRST",
         "STACK_ANCESTRY_HEAD",
         "STACK_ANCESTRY_ORDER",
         "STACK_ANCESTRY_SIDE",
         "STACK_ANCESTRY_STACKED",
         "STACK_ANCESTRY_SYMMETRIC",
+        "STACK_ANCESTRY_UNRELATED",
     ]
 
 
@@ -2865,7 +2864,9 @@ def test_branch_ancestry_docstring_names_every_outcome() -> None:
     strict=True,
     raises=AssertionError,
     reason="#1271 находка на develop, драфт #1277: докстринг branch_ancestry "
-    "не называет head_is_descendant, head_is_ancestor, same_tip",
+    "не называет head_is_descendant, head_is_ancestor, same_tip; после "
+    "сужения правила до токенов перечня (ba85e024) — и unrelated, которое "
+    "стоит в докстринге словом фразы, а не литералом",
 )
 def test_branch_ancestry_unnamed_findings_are_resolved() -> None:
     still = sorted(
