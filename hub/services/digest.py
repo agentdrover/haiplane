@@ -38,6 +38,7 @@ from hub import repository as repo
 from hub.services.gate_events import STEWARD_JUDGEMENT
 from hub.services.orchestration import PRACTICE_METRICS_DEFAULT_DAYS
 from hub.services.project_policy import DELEGATED_VERDICTS
+from hub.services.steward_corridor import names_clean, outcome_label, report_outcome
 
 log = logging.getLogger(__name__)
 
@@ -250,8 +251,6 @@ def _report_outcome_of(mr) -> dict:
     рядом с задачей читается как «всё в порядке» ровно так же, как читались
     «0 подтверждённых».
     """
-    from hub.services.steward_corridor import names_clean, outcome_label, report_outcome
-
     if mr is None:
         return {"state": "absent", "label": "отчёта нет", "names_clean": False}
     row = dict(mr)

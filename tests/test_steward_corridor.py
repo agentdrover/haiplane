@@ -769,3 +769,49 @@ async def test_the_report_feed_carries_unresolved_and_the_outcome(client, db):
     assert "1 unresolved" in summary
     assert outcome_label(OUTCOME_UNRESOLVED) in summary
     assert CLEAN_WORDS not in summary
+
+
+async def test_the_digest_page_prints_the_outcome_under_an_auto_verdict(client, db):
+    """Страница /digests — та поверхность, которую читает человек.
+
+    Тесты выше проверяют полезную нагрузку дайджеста, а шаблон печатает её
+    сам: блок «Автовердикты», сломанный в digests.html, оставлял их
+    зелёными. Здесь под автовердиктом стоит отчёт с неразрешёнными
+    находками, и страница обязана назвать его ступень словами и красным
+    бейджем — не «находок нет» и не зелёным.
+    """
+    import json as _json
+
+    from hub import repository as repo_module
+    from hub.services.digest import generate_due_digests
+    from tests.test_autopilot_digest import _autopilot_project, _node, _tomorrow
+
+    _pid, feature = await _autopilot_project(db, "spike-1234-page")
+    task_id = await _node(db, title="страница", task_type="task", parent_id=feature)
+    await repo_module.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="grok-4.6",
+        raw_count=4,
+        findings_confirmed="[]",
+        unresolved=_json.dumps([{"title": "никто не рассудил"}], ensure_ascii=False),
+    )
+    await repo_module.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="policy",
+        payload={"verdict": "approved", "submission_generation": 1},
+    )
+    await db.commit()
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+
+    page = (await client.get("/digests")).text
+    section = page[page.index("<h3>Автовердикты</h3>") :]
+    section = section[: section.index("</ul>")]
+    assert f"/tasks/{task_id}" in section
+    assert outcome_label(OUTCOME_UNRESOLVED) in section
+    assert "badge-failed" in section
+    assert "badge-completed" not in section
+    assert CLEAN_WORDS not in section
