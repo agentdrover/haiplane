@@ -2345,15 +2345,58 @@ async def record_review_verdict(
     ``self_approved`` marks verdicts accepted only via the
     ``HAIPLANE_REVIEW_SELF_APPROVE=allow`` solo opt-out (#434); it belongs
     to the verdict, so every new verdict overwrites the flag.
+    ``review_verdict_closed_generation`` is cleared for the same reason
+    (#1286): a window closed by a human decision belonged to the PREVIOUS
+    verdict, and a new verdict opens its own.
     """
     await db.execute(
         "UPDATE tasks SET review_verdict=?, "
         "review_verdict_generation=submission_generation, "
         "review_findings=?, "
         "review_self_approved=?, "
+        "review_verdict_closed_generation=NULL, "
         "updated_at=datetime('now') WHERE id=?",
         (verdict, findings_json, 1 if self_approved else 0, task_id),
     )
+
+
+async def close_review_verdict_window(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> int | None:
+    """Mark the CURRENT submission's verdict as closed by a decision (#1286).
+
+    Returns the generation whose window was closed, or ``None`` when there was
+    nothing to close — no verdict, or one that already belongs to an earlier
+    submission. The caller uses that answer to decide whether the feed has
+    anything to say, so "nothing was closed" is an answer and not a silence.
+
+    Written in SQL against ``submission_generation`` for the same reason
+    ``record_review_verdict`` binds the verdict there: nothing read before the
+    statement can be stale by the time it runs. The verdict itself, its
+    generation, its findings and its self-approved flag are left ALONE — the
+    window closes, the history stays (#1286 constraint).
+    """
+    rows = await fetchall(
+        db,
+        "SELECT submission_generation, review_verdict, review_verdict_generation "
+        "FROM tasks WHERE id=?",
+        (task_id,),
+    )
+    if not rows:
+        return None
+    row = dict(rows[0])
+    generation = int(row.get("submission_generation") or 0)
+    if not (row.get("review_verdict") or "").strip():
+        return None
+    if generation <= 0 or row.get("review_verdict_generation") != generation:
+        return None
+    await db.execute(
+        "UPDATE tasks SET review_verdict_closed_generation=submission_generation, "
+        "updated_at=datetime('now') WHERE id=?",
+        (task_id,),
+    )
+    return generation
 
 
 async def transition_status_if(

@@ -38,6 +38,7 @@ from hub.models import (
     DEFAULT_FORGE,
     FINAL_STATUSES,
     TaskRefine,
+    latest_review_freshness,
 )
 from hub.mcp_signature import Hidden, with_model_signature
 from hub.workflow_reference import build_mcp_instructions, lifecycle_map_lines
@@ -1245,8 +1246,9 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
         parts.append(f"\nLifecycle: {task['lifecycle_hint']}")
     latest_review = task.get("latest_review")
     if latest_review:
-        freshness = (
-            "current" if latest_review.get("is_current") else "stale — work resubmitted"
+        freshness = latest_review_freshness(
+            bool(latest_review.get("is_current")),
+            bool(latest_review.get("closed_by_decision")),
         )
         solo = (
             " [SELF-APPROVED: solo mode, not independent]"
@@ -2273,8 +2275,9 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
         parts.append(f"\nLatest submission:\n{brief['latest_submission_summary']}")
     latest_review = brief.get("latest_review")
     if latest_review:
-        freshness = (
-            "current" if latest_review.get("is_current") else "stale — work resubmitted"
+        freshness = latest_review_freshness(
+            bool(latest_review.get("is_current")),
+            bool(latest_review.get("closed_by_decision")),
         )
         solo = (
             " [SELF-APPROVED: solo mode, not independent]"

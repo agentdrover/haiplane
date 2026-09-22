@@ -41,6 +41,7 @@ from tests.test_pair_merge_gate import (
     _approved_pair_task,
     _drain_pair_delivery,
     _git,
+    _git_seeing,
     _git_with_state,
     _report_done,
 )
@@ -2476,4 +2477,88 @@ async def test_a_failed_replacement_search_waits_instead_of_calling_a_human(
     )
     assert db.in_transaction is False, (
         "проход по этой ветке не должен оставлять соединение в открытой транзакции"
+    )
+
+
+# ---- #1286: решение «на доработку» закрывает окно одобрения ----------------
+#
+# Наблюдено на проде 22.09.2026 дважды, на #1162 и #1206. Возврат на доработку
+# сбрасывал цикл ревью и метку арбитра, но вердикт оставлял: одобрение
+# продолжало относиться к текущей сдаче до самой пересдачи. Отсюда два неверных
+# исхода, и это ровно два теста ниже: свип доставлял работу, которую человек
+# только что вернул, а как только исполнитель пушил правки — отказ по
+# stale_approval уводил задачу в needs_decision к тому же человеку.
+
+
+async def _returned_for_rework(db: aiosqlite.Connection, task_id: int) -> None:
+    """Человек вернул одобренную работу на доработку, и исполнитель вернулся.
+
+    Задача проходит тот же путь, что на проде: needs_decision → решение rework
+    (диспетчера в тестах нет, поэтому задача уходит в ``open``) → исполнитель
+    снова берёт её в pair-режиме и оказывается в ``running`` — состоянии, в
+    котором её и видит свип доставки.
+    """
+    from hub import services
+    from hub.models import TaskDecide
+
+    await repo.update_task(db, task_id, status="needs_decision")
+    await db.commit()
+    await services.decide_task(
+        db, task_id, TaskDecide(action="rework", instructions="Доделать AC-2.")
+    )
+    await services.pair_start_task(db, task_id, caller="dev")
+
+
+async def test_rework_stops_delivery_of_the_returned_submission(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-1: между возвратом и первой правкой ветка стоит там же, где её
+    # одобрили, а CI зелёный — то есть выполнено ВСЁ, чего свип ждёт. Решение
+    # человека «ещё не берём» и есть единственное, что должно его остановить.
+    g = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    await _returned_for_rework(db, task_id)
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] != "completed", (
+        "возвращённую работу доставил свип — машина отменила решение человека"
+    )
+    g.merge_pr.assert_not_awaited()
+    from hub.services.orchestration import review_approved_for_current_submission
+
+    assert not review_approved_for_current_submission(task), (
+        "одобрение обязано перестать быть текущим сразу, а не к пересдаче"
+    )
+
+
+async def test_a_reworked_task_waits_for_resubmission_not_a_human(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-2: исполнитель сделал ровно то, о чём его попросили, — запушил правки
+    # на ту же ветку. Вершина разошлась с закреплённым коммитом, и на прежнем
+    # коде это давало stale_approval и возврат к человеку, который только что
+    # принял решение. Одобрения больше нет — значит и сверять нечего: задача
+    # просто ждёт пересдачи.
+    g = _git_seeing(monkeypatch, "approved0commit")
+    task_id = await _approved_pair_task(db)
+    await _returned_for_rework(db, task_id)
+
+    g.head_sha = AsyncMock(return_value="rework0pushed")
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "правка по решению человека не должна возвращаться к нему же вопросом"
+    )
+    g.merge_pr.assert_not_awaited()
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert not any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    ), "возврат на доработку не должен рождать второе решение"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    feed = " ".join(u.get("content") or "" for u in updates)
+    assert "stale_approval" not in feed, (
+        f"гейт расхождения не должен даже спрашиваться: одобрения нет — {feed}"
     )

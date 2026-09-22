@@ -33,6 +33,7 @@ from hub.version import get_app_version
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
+    latest_review_freshness,
     DeliveryAcknowledgement,
     DeliveryObservation,
     DeployCallback,
@@ -1866,7 +1867,7 @@ async def api_task_context(
         lines.append(f"Risks ({len(task_view.risks)}): {risk_brief}")
     if task_view.latest_review:
         lr = task_view.latest_review
-        freshness = "current" if lr.is_current else "stale — work resubmitted"
+        freshness = latest_review_freshness(lr.is_current, lr.closed_by_decision)
         solo = " [SELF-APPROVED: solo mode]" if lr.self_approved else ""
         lines.append(
             f"Latest review: {lr.verdict.value.upper()} "
