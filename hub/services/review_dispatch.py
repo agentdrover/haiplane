@@ -1486,6 +1486,12 @@ class ReviewOrder:
     rules_note: str
     diff_note: str
     prepass: Any
+    #: Одноразовый код, уже вписанный в ``prompt``. Хранится отдельно не ради
+    #: удобства: срок его жизни отсчитывается от ЧЕКАНКИ, а локальный прогон
+    #: может простоять в очереди дольше этого срока — тогда исполнителю нужно
+    #: отмерить срок заново, а для этого нужен сам код (#1208). Пусто там, где
+    #: кода не выдавали: открытый режим, отозванный токен.
+    access_code: str = ""
 
 
 async def prepare_review_order(
@@ -1558,6 +1564,7 @@ async def prepare_review_order(
         rules_note=rules_note,
         diff_note=diff_note,
         prepass=prepass,
+        access_code=code,
     )
 
 
@@ -2331,7 +2338,15 @@ async def dispatch_local_review(
         },
     )
     await db.commit()
-    await _start_local_run(db, dispatch_id, task_id, generation, order.prompt)
+    await _start_local_run(
+        db,
+        dispatch_id,
+        task_id,
+        generation,
+        order.prompt,
+        order.access_code,
+        principal_id,
+    )
     return True
 
 
@@ -2417,6 +2432,8 @@ async def _start_local_run(
     task_id: int,
     generation: int,
     prompt: str,
+    access_code: str = "",
+    principal_id: int | None = None,
 ) -> None:
     """Запустить прогон фоном и вернуть управление сдаче.
 
@@ -2435,6 +2452,8 @@ async def _start_local_run(
             task_id=task_id,
             generation=generation,
             prompt=prompt,
+            access_code=access_code,
+            principal_id=principal_id,
         )
     )
     _LOCAL_RUNS[dispatch_id] = _LocalRunHandle(
@@ -2541,6 +2560,90 @@ async def _main_db_path(db: aiosqlite.Connection) -> str:
     return ""
 
 
+async def _prompt_at_slot(
+    db_path: str,
+    live_db: aiosqlite.Connection | None,
+    *,
+    prompt: str,
+    code: str,
+    task_id: int,
+    generation: int,
+    principal_id: int | None,
+) -> str:
+    """Промт с ЗАНОВО выписанным кодом доступа — в момент, когда слот взят.
+
+    Почему заново, а не продлением срока (так было на c6af952, #1208).
+    Продление двигало ``expires_at`` у СУЩЕСТВУЮЩЕЙ строки, а строки к этому
+    моменту может уже не быть: по часовому кругу поллера отрабатывает
+    ``chat_pair.purge_expired``, и протухший код она не щадит — ``DELETE FROM
+    chat_pair_codes WHERE expires_at < datetime('now')``. Длинная очередь —
+    ровно тот случай, ради которого всё это писалось, — переживает и срок, и
+    сборщика; продлять там нечего (найдено ревьюером Codex 11.09.2026 на
+    c6af952).
+
+    Второй путь, названный ревьюером, — исключить коды стоящих в очереди
+    заказов из сборки протухшего — отвергнут по существу: он оставляет
+    протухший код ЖИТЬ в таблице неограниченно долго и всё равно требует
+    продления, чтобы им можно было воспользоваться, то есть заводит два
+    механизма там, где хватает одного. Свежий код короткого срока, выписанный
+    тогда, когда он нужен, снимает и срок, и сборщика разом.
+
+    Почему подменяется БЛОК, а не токен кода. Блок доставки собирается
+    ``_delivery_block`` детерминированно, поэтому его можно собрать заново со
+    старым кодом и убедиться, что в промте он ровно один. Подменять голый
+    токен значило бы верить, что восьмизначная строка не встретилась в
+    диффе, — а проверять это нечем.
+
+    Заказ при этом не расходится с облачным: ``prepare_review_order`` для
+    обоих транспортов остаётся ОДИН, и код в нём выписывается одинаково.
+    Локальный путь лишь переписывает свой блок доставки перед самым запуском.
+
+    Любая неудача возвращает ИСХОДНЫЙ промт и говорит об этом в журнал.
+    Прогон она не отменяет: у отчёта есть слабый путь через stdout, и
+    подменять «отчёт пришёл хуже» на «ревью не состоялось» — тот самый обмен,
+    против которого написан весь этот модуль. Но молчать нельзя — журнал
+    здесь единственный след того, что отчёт поедет слабым путём.
+    """
+    if not code:
+        # Кода не выдавали вовсе: открытый режим или отозванный токен. Блока
+        # доставки в промте тогда нет, и подменять нечего — говорить об этом
+        # значило бы звать оператора искать то, чего не было.
+        return prompt
+    conn = None
+    try:
+        if db_path:
+            from hub import db as db_module
+
+            conn = await db_module.connect(db_path)
+        target = conn if conn is not None else live_db
+        if target is None:
+            return prompt
+        hub_base = instance_base_url().rstrip("/")
+        stale = _delivery_block(task_id, code, hub_base)
+        if prompt.count(stale) != 1:
+            log.warning(
+                "local review: the delivery block of task #%s is not where it "
+                "was put; the report will have to come back through stdout",
+                task_id,
+            )
+            return prompt
+        fresh = await _access_code(target, task_id, generation, principal_id)
+        if not fresh:
+            log.warning(
+                "local review: no access code could be minted for task #%s at "
+                "start; the report will have to come back through stdout",
+                task_id,
+            )
+            return prompt
+        return prompt.replace(stale, _delivery_block(task_id, fresh, hub_base), 1)
+    except Exception:  # noqa: BLE001 - фон не имеет права уронить прогон
+        log.exception("could not mint the access code of the local review")
+        return prompt
+    finally:
+        if conn is not None:
+            await conn.close()
+
+
 async def _supervise_local_run(
     *,
     db_path: str,
@@ -2549,8 +2652,21 @@ async def _supervise_local_run(
     task_id: int,
     generation: int,
     prompt: str,
+    access_code: str = "",
+    principal_id: int | None = None,
 ) -> None:
-    run = await local_reviewer.run_review(prompt)
+    run = await local_reviewer.run_review(
+        prompt,
+        prompt_at_slot=lambda ready: _prompt_at_slot(
+            db_path,
+            live_db,
+            prompt=ready,
+            code=access_code,
+            task_id=task_id,
+            generation=generation,
+            principal_id=principal_id,
+        ),
+    )
     conn = None
     try:
         if db_path:
@@ -2632,9 +2748,10 @@ def _local_failure_reason(run: local_reviewer.LocalRun | None) -> str:
     """Почему прогона нет — по имени, а не «что-то пошло не так»."""
     if run is None:
         return (
-            "Локальное машинное ревью НЕ состоялось: прогон не удалось "
-            "запустить — нет каталога, бинаря или прав (детали в логе хаба). "
-            "Это не «прочитано и чисто»: вердикт остаётся человеку (#1180)."
+            "Локальное машинное ревью НЕ состоялось: прогона не было — нет "
+            "каталога, бинаря, прав либо песочница не переживает снятие "
+            "этого прогона (детали в логе хаба). Это не «прочитано и чисто»: "
+            "вердикт остаётся человеку (#1180)."
         )
     if run.timed_out:
         return (
