@@ -2873,3 +2873,149 @@ def test_branch_ancestry_unnamed_findings_are_resolved() -> None:
         set(_unnamed_ancestry_outcomes()) & set(BRANCH_ANCESTRY_UNNAMED_FINDINGS)
     )
     assert not still, f"всё ещё не названы: {still}"
+
+
+# ---------------------------------------------------------------------------
+# Происхождение коммитов дельты — настоящим git (#1249)
+# ---------------------------------------------------------------------------
+#
+# Находка aa7696aed8f4324e: все четыре AC #1249 подменяют git двойником, а сам
+# ``delta_without_base`` не исполнялся НИ РАЗУ. Сломанный argv — забытый
+# ``base_sha`` после ``--not``, ``--no-merges`` вместо ``--cc`` — прошёл бы
+# мимо всех, и случай #1172 вернулся бы целиком. Предмет проверки здесь
+# именно то, ЧТО ОТВЕЧАЕТ GIT, а мок ответил бы вложенное.
+
+
+def _delta_clone(tmp_path):
+    """Форма пересдачи #1172 в миниатюре, собранная настоящим git.
+
+    ``origin/develop`` уходит вперёд на чужой коммит, автор сливает базу к
+    себе и дописывает свой. Возвращает (клон, sha прошлой сдачи, sha вершины).
+    """
+    import subprocess
+
+    def sha(cwd) -> str:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=cwd, capture_output=True, text=True
+        ).stdout.strip()
+
+    origin = tmp_path / "origin.git"
+    _run_git("git", "init", "-q", "--bare", "-b", "develop", str(origin), cwd=tmp_path)
+    upstream = tmp_path / "upstream"
+    _run_git("git", "clone", "-q", str(origin), str(upstream), cwd=tmp_path)
+    _run_git("git", "config", "user.email", "t@example.com", cwd=upstream)
+    _run_git("git", "config", "user.name", "t", cwd=upstream)
+    (upstream / "app.py").write_text("v1\n")
+    _run_git("git", "add", "-A", cwd=upstream)
+    _run_git("git", "commit", "-qm", "init", cwd=upstream)
+    _run_git("git", "push", "-q", "origin", "develop", cwd=upstream)
+
+    clone = tmp_path / "work"
+    _run_git("git", "clone", "-q", str(origin), str(clone), cwd=tmp_path)
+    _run_git("git", "config", "user.email", "t@example.com", cwd=clone)
+    _run_git("git", "config", "user.name", "t", cwd=clone)
+    _run_git("git", "checkout", "-qb", "task-1249/work", cwd=clone)
+    (clone / "mine.py").write_text("первая сдача\n")
+    _run_git("git", "add", "-A", cwd=clone)
+    _run_git("git", "commit", "-qm", "submission 1", cwd=clone)
+    prev = sha(clone)
+
+    # Чужая работа уезжает в базу и приезжает к автору мержем.
+    (upstream / "theirs.py").write_text("        workspace_path = p.workspace_path\n")
+    _run_git("git", "add", "-A", cwd=upstream)
+    _run_git(
+        "git", "commit", "-qm", "somebody else, already through the gate", cwd=upstream
+    )
+    _run_git("git", "push", "-q", "origin", "develop", cwd=upstream)
+    _run_git("git", "fetch", "-q", "origin", "develop", cwd=clone)
+    _run_git("git", "merge", "-q", "--no-edit", "origin/develop", cwd=clone)
+
+    (clone / "mine.py").write_text("первая сдача\nпочинка второго круга\n")
+    _run_git("git", "commit", "-aqm", "submission 2", cwd=clone)
+    return clone, prev, sha(clone)
+
+
+async def test_delta_without_base_leaves_out_what_the_base_brought(
+    tmp_path, git_ops: GitOpsIntegration
+) -> None:
+    """AC-1 #1249, но спрошено у настоящего git, а не у двойника.
+
+    Мерж базы внутри диапазона приносит чужой файл с маркером процессной
+    поверхности. Обычный ``git diff prev current`` его показал бы — и именно
+    так и покупался дорогой профиль на #1172. Достижимость из базы обязана
+    его снять, не тронув правку автора.
+    """
+    clone, prev, current = _delta_clone(tmp_path)
+
+    plain = await git_ops.commit_diff(str(clone), prev, current)
+    own = await git_ops.delta_without_base(str(clone), "develop", prev, current)
+
+    assert plain is not None and "theirs.py" in plain, (
+        "предпосылка находки: обычная дельта втаскивает привезённое базой"
+    )
+    assert own is not None, "база и оба конца на месте — вопрос задан"
+    assert "починка второго круга" in own, "правка автора остаётся"
+    assert "theirs.py" not in own and "workspace_path" not in own, (
+        "чужой коммит достижим из origin/develop и в работу автора не входит"
+    )
+
+
+async def test_delta_without_base_keeps_a_conflict_resolution_as_the_authors(
+    tmp_path, git_ops: GitOpsIntegration
+) -> None:
+    """``--cc``, а не ``--no-merges``: разрешение конфликта набрал автор.
+
+    Комбинированный дифф мержа показывает ровно то, что не совпало ни с одним
+    родителем. Выбросив мержи целиком, мы потеряли бы строки, которых нет ни
+    в базе, ни в прошлой сдаче, — то есть настоящую работу этого круга.
+    """
+    import subprocess
+
+    clone, prev, _ = _delta_clone(tmp_path)
+    upstream = tmp_path / "upstream"
+    (upstream / "shared.py").write_text("их строка\n")
+    _run_git("git", "add", "-A", cwd=upstream)
+    _run_git("git", "commit", "-qm", "base edits shared", cwd=upstream)
+    _run_git("git", "push", "-q", "origin", "develop", cwd=upstream)
+
+    (clone / "shared.py").write_text("моя строка\n")
+    _run_git("git", "add", "-A", cwd=clone)
+    _run_git("git", "commit", "-qm", "author edits shared", cwd=clone)
+    _run_git("git", "fetch", "-q", "origin", "develop", cwd=clone)
+    rc = subprocess.run(
+        ["git", "merge", "--no-edit", "origin/develop"], cwd=clone, capture_output=True
+    ).returncode
+    assert rc != 0, "предпосылка теста: мерж обязан конфликтовать"
+    (clone / "shared.py").write_text("строка, набранная руками при разрешении\n")
+    _run_git("git", "add", "shared.py", cwd=clone)
+    _run_git("git", "commit", "-qm", "resolve", cwd=clone)
+    current = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=clone, capture_output=True, text=True
+    ).stdout.strip()
+
+    own = await git_ops.delta_without_base(str(clone), "develop", prev, current)
+
+    assert own is not None
+    assert "строка, набранная руками при разрешении" in own, (
+        "разрешение конфликта не совпадает ни с одним родителем — это работа "
+        "автора, и ``--no-merges`` её бы потерял"
+    )
+
+
+async def test_delta_without_base_says_it_could_not_ask(
+    tmp_path, git_ops: GitOpsIntegration
+) -> None:
+    """Третий ответ. Нерезолвимая база — ``None``, не пустая строка.
+
+    Пустая строка означала бы «автор не написал ничего», и вызывающий сузил
+    бы предмет молча — единственный отказ, которого у этого места быть не
+    должно.
+    """
+    clone, prev, current = _delta_clone(tmp_path)
+
+    assert (
+        await git_ops.delta_without_base(str(clone), "no-such-base", prev, current)
+    ) is None
+    assert (
+        await git_ops.delta_without_base(str(clone), "develop", "f" * 40, current)
+    ) is None

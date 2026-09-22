@@ -1787,6 +1787,80 @@ async def test_unknown_origin_reads_everything_and_says_so(
     ), "an unanswerable origin changes the subject's width, not the rule"
 
 
+async def test_an_empty_brought_half_claims_only_what_was_measured(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Карточка называет измеренное, а не вывод из него (6ea44f6f, 21ad18b5).
+
+    Пустая привезённая половина НЕ значит «база не двигалась». Спрошена
+    достижимость, и тот же пустой набор даёт ещё два случая: база влита
+    сжатием — её коммиты не предки по хешу (#1240) — и полное перекрытие
+    путей, когда автор тронул ровно те же файлы, что приехали, а разбор идёт
+    по путям. Оба раза база двигалась, а прежняя формулировка это отрицала.
+
+    Здесь воспроизведено полное перекрытие: автор сам написал ОБА файла
+    дельты, привезённого сверх них нет.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o6"}, "run": {"id": "r-o6"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-overlap")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=_MERGED_DELTA
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    cards = [
+        u["content"] for u in data["updates"] or [] if "Предмет ревью" in u["content"]
+    ]
+    assert "файлов только из базы нет" in cards[-1], (
+        "измерено отсутствие ФАЙЛОВ чужого происхождения, не покой базы"
+    )
+    assert "база не двигалась" not in cards[-1], (
+        "про саму базу разбор по достижимости путей ничего не знает"
+    )
+
+
+async def test_unknown_origin_still_lets_the_submitted_diff_buy_deep(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Вторая половина AC-4, которой не было (находка b4bf6acce462a2a6).
+
+    Сосед выше сверяет профиль с ``pick_review_profile(row, _HARMLESS_DIFF)``,
+    а безобидный дифф даёт ``lite`` — ровно столько же, сколько ПУСТАЯ
+    авторская дельта. Поэтому мутация, снимающая запасной вариант
+    (``profile_diff = subject.author_diff`` без ``or diff``), оставляла тот
+    assert зелёным: обе стороны равенства сходились на ``lite``.
+
+    Здесь дифф сдачи сам по себе стоит ``deep`` — в нём процессная поверхность
+    автора, — а происхождение коммитов не установлено. Если запасной вариант
+    сломать, профиль посчитается по пустой строке и упадёт до ``lite``:
+    неустановленное происхождение расширяет предмет, но правило не смягчает.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o5"}, "run": {"id": "r-o5"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-fallback")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP,
+        ["docs/notes.md"],
+        diff=_OWN_WITH_SURFACE,
+        delta=_MERGED_DELTA,
+        own=None,
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    row = dict(await repo.get_task(db, task_id))
+    assert pick_review_profile(row, _OWN_WITH_SURFACE)[0] == "deep", (
+        "предпосылка теста: дифф сдачи сам по себе покупает дорогой профиль"
+    )
+    assert (await _dispatch_row(db, task_id))["profile"] == "deep", (
+        "происхождение неизвестно — решает весь дифф сдачи, как и раньше, "
+        "а не пустая авторская дельта"
+    )
+
+
 async def test_previous_findings_travel_with_the_delta(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
