@@ -26,6 +26,13 @@ MISSING = "missing"
 UNKNOWN = "unknown"
 UNPARSEABLE = "unparseable"
 
+# The whole status vocabulary of this calculation, named once so a reader of
+# the answer can check it decomposed ALL of it and not just the statuses it
+# happened to think of. Anyone adding a status here has to look at who
+# consumes it (#1158): a consumer that folds unnamed statuses into its own
+# default silently turns a new "could not look" into an accusation.
+LOCATOR_STATUSES: tuple[str, ...] = (RESOLVABLE, MISSING, UNKNOWN, UNPARSEABLE)
+
 # How a locator was resolved. The two are not equally strong and the brief says
 # which one answered: collection proves pytest can actually run the test;
 # reading the file proves only that a function by that name is written there.
@@ -36,6 +43,14 @@ BY_SOURCE = "test found in the file, read without running it"
 # reader who cannot tell it from "the test is not there" is being accused
 # on the hub's behalf (#1203).
 NO_RESOLVER = "no way to look inside a {runner} test file"
+# ``missing`` answers two different questions and the reason is the only thing
+# that tells them apart, so both wordings are named rather than spelled inline.
+# NO_VALID_LOCATOR means nothing resolvable was NAMED — the hub never got as
+# far as looking. NOT_COLLECTED means a locator was named, the hub looked, and
+# the test is not there. Reading the first as the second accuses an author of a
+# missing test they never claimed to have written (#1158).
+NO_VALID_LOCATOR = "no valid test locator in test_ref"
+NOT_COLLECTED = "locator does not match any collected test"
 
 _COLLECT_TIMEOUT = 90
 
@@ -317,7 +332,7 @@ def resolve_ac_locators(
         # no-collection route whether or not pytest ran (#1203).
         usable = collected if runner_of(locator) == PYTEST else None
         if parsed is None:
-            status, reason = MISSING, "no valid test locator in test_ref"
+            status, reason = MISSING, NO_VALID_LOCATOR
         elif usable is None and parsed[0] in (absent_files or set()):
             status, reason = resolve_locator_absent_file(parsed[1])
         elif usable is None:
@@ -327,7 +342,7 @@ def resolve_ac_locators(
         elif parsed[1] in usable or parsed[1] in bases:
             status, reason = RESOLVABLE, BY_COLLECTION
         else:
-            status, reason = MISSING, "locator does not match any collected test"
+            status, reason = MISSING, NOT_COLLECTED
         resolutions.append(
             {
                 "ac_id": getattr(ac, "id", "?"),

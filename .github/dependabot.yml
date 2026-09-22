@@ -1,0 +1,22 @@
+# Dependabot aims at develop, never at main.
+#
+# main is the release branch: a merge into it runs the "Deploy to server" job,
+# so accepting a bot PR there would be a production deploy that skipped
+# develop, the hub task and review (see docs/repository-rules.md).
+#
+# Branch names the bot creates ("dependabot/uv/...") are allowed by
+# .githooks/pre-push; the prefix is not configurable here, only the separator.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Moscow"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore"
+      include: "scope"

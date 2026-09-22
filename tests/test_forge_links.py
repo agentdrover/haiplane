@@ -210,6 +210,7 @@ async def test_dispatch_policy_allowed_when_the_local_reviewer_is_ready(
     получить и не сохранив ничего.
     """
     import os
+    import pwd
 
     from hub import auth as hub_auth
     from hub import config
@@ -231,7 +232,15 @@ async def test_dispatch_policy_allowed_when_the_local_reviewer_is_ready(
     scratch.mkdir()
     os.chmod(scratch, 0o2770)
     monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "/bin/true")
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/env")
+    # Песочница обязана быть формой из ЗАКРЫТОГО НАБОРА (#1208): «/usr/bin/env»
+    # хаб больше не принимает, и готовность на такой строке была бы «не
+    # настроено» — то есть тест судил бы не то, что называет. Пользователь —
+    # сам вызывающий: он владеет каталогом прогонов и проходит по группе.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/sudo -n -u {pwd.getpwuid(os.getuid()).pw_name} /usr/local/bin/wrap",
+    )
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(scratch))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", key["plaintext_key"])
 

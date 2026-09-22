@@ -636,6 +636,49 @@ async def _resolve_ref(name: str, repo: str) -> str | None:
     return None
 
 
+async def _refresh_remote_ref(name: str, repo: str) -> tuple[str, str]:
+    """One targeted refresh of ``origin/<name>``, failure kept apart from fact.
+
+    ``(state, detail)``: ``refreshed`` — origin has the head and it is now a
+    local tracking ref; ``absent`` — origin answered and has no such head;
+    ``unreachable`` — origin did not answer (timeout, lock of a parallel
+    fetch, auth, a blink), with the git error in ``detail``.
+
+    Two commands rather than one fetch, because a fetch's non-zero rc does not
+    separate "couldn't find remote ref" from "could not connect" without
+    parsing localized stderr. ``ls-remote --heads`` does: rc != 0 is no
+    answer, empty output is no such head — the same reading
+    ``ensure_default_branch`` relies on (#1204).
+    """
+    rc, out, err = await _git(
+        "ls-remote",
+        "--heads",
+        "origin",
+        f"refs/heads/{name}",
+        repo=repo,
+        check=False,
+        timeout=60,
+    )
+    if rc != 0:
+        return (
+            "unreachable",
+            f"ls-remote rc={rc}: {err.strip()[:150] or 'git молчит'}",
+        )
+    if not out.strip():
+        return ("absent", "")
+    rc, _, err = await _git(
+        "fetch",
+        "origin",
+        f"+refs/heads/{name}:refs/remotes/origin/{name}",
+        repo=repo,
+        check=False,
+        timeout=60,
+    )
+    if rc != 0:
+        return ("unreachable", f"fetch rc={rc}: {err.strip()[:150] or 'git молчит'}")
+    return ("refreshed", "")
+
+
 async def _resolve_ref_remote_first(name: str, repo: str) -> str | None:
     """Resolve a branch to a sha, preferring ``origin/<name>`` (#762).
 
@@ -663,6 +706,33 @@ async def _resolve_ref_remote_first(name: str, repo: str) -> str | None:
         if rc == 0 and out:
             return out.strip()
     return None
+
+
+async def _diff_ends(base: str, sha: str, repo: str) -> tuple[str, str] | None:
+    """Both ends of a ``base...sha`` comparison, as SHAs, origin-first (#1239).
+
+    ``None`` when either end resolves nowhere — the caller then says "could not
+    read", never "nothing changed". No fallback to the bare names is attempted
+    on that path on purpose: a comparison the hub shows a human must not
+    silently degrade into a comparison against whatever an old checkout left
+    behind, which is precisely the answer this helper exists to stop.
+
+    ``_resolve_ref_remote_first`` is reused rather than reimplemented: it is
+    the resolver ``branch_diff`` and ``branch_diff_paths`` have used since
+    #762/#1055, and its own local fallback (used only when ``origin/<name>``
+    does not exist at all) keeps a local-only clone working. A pinned sha
+    resolves through it too — ``origin/<sha>`` misses, the bare sha hits.
+    """
+    base_sha = await _resolve_ref_remote_first(base, repo)
+    head_sha = await _resolve_ref_remote_first(sha, repo)
+    if base_sha is None or head_sha is None:
+        log.warning(
+            "_diff_ends: %r not found in %s",
+            base if base_sha is None else sha,
+            repo,
+        )
+        return None
+    return base_sha, head_sha
 
 
 # Ancestry between two task branches (#1184). The names say which side of the
@@ -929,6 +999,38 @@ class GitOpsIntegration:
         so answering the whole list up front would spend rev-lists on rows
         nobody reads. Yielding pairs lets the caller stop where it always
         stopped.
+
+        A ref that resolves nowhere is REFRESHED ONCE before the answer is
+        formed (#1204, found by the machine review of submission #3). Without
+        that, ``ref_unresolved`` conflated two opposite facts: a branch deleted
+        on the server, and a branch this clone simply never fetched — the
+        resolver reads local refs only. Consumers cannot tell them apart, and
+        the delivery gate had started to act on the difference, telling a human
+        "nobody will bring that branch back" about a branch that was on origin
+        all along. Same line #954 drew for push status, and the targeted
+        refspec is copied from there for the same reason: plain
+        ``git fetch origin <branch>`` is not guaranteed to write
+        ``refs/remotes/origin/<branch>``.
+
+        The refresh itself can fail to get an answer — a 60 s timeout, a
+        parallel fetch holding the lock, auth, origin blinking — and that is
+        NOT ``ref_unresolved`` (#1204, machine review of submission #4). The
+        first version threw the fetch's return code away and then asserted
+        "origin does not have it" about a branch nobody had managed to ask
+        about. Now the refresh is asked the way ``ensure_default_branch`` asks
+        (``ls-remote --heads``: rc != 0 is "no answer", empty output is "no
+        such head"), and no answer comes back as ``remote_unreachable`` —
+        retryable, and never a ground for calling a human.
+
+        THE REFRESH IN A BATCHED WALK (#1204 × #1205). ``branch`` and the base
+        resolve ONCE for the whole walk, so their refresh is attempted once
+        too, and a remote that did not answer about either is not a fact about
+        any single candidate: every row of the walk gets the same
+        ``remote_unreachable``, the way ``workspace_unavailable`` already does.
+        A candidate's own ref is resolved per row, so its refresh is per row.
+        Neither shortcut may be replaced by "refresh the first row only": the
+        rows after it would then be told ``ref_unresolved`` — the one reason
+        the delivery gate is allowed to call a human with.
         """
         if repo is None:
             reason = await _default_workspace_error()
@@ -952,8 +1054,50 @@ class GitOpsIntegration:
         head = await _resolve_ref_remote_first(branch, repo_path)
         base_name = _resolve_base(base_branch)
         base = await _resolve_ref_remote_first(base_name, repo_path)
+        # One targeted refresh per name that did not resolve, then ask again
+        # (#1204). Only what survives an ANSWERED refresh is genuinely unknown
+        # to origin: a refresh that got no answer is a fact about this machine
+        # and the network, not about that branch, and is reported as such.
+        # These two names are the walk's, not any candidate's, so an
+        # unanswered refresh of them is carried to EVERY row.
+        shared_unreachable = ""
+        if not head:
+            state, detail = await _refresh_remote_ref(branch, repo_path)
+            if state == "unreachable":
+                shared_unreachable = f"{branch}: {detail}"
+            else:
+                head = await _resolve_ref_remote_first(branch, repo_path)
+        if not shared_unreachable and not base:
+            state, detail = await _refresh_remote_ref(base_name, repo_path)
+            if state == "unreachable":
+                shared_unreachable = f"{base_name}: {detail}"
+            else:
+                base = await _resolve_ref_remote_first(base_name, repo_path)
         for other_branch in other_branches:
+            if shared_unreachable:
+                yield (
+                    other_branch,
+                    StackProbeResult(
+                        outcome=StackProbeOutcome.unavailable,
+                        reason="remote_unreachable",
+                        details=shared_unreachable,
+                    ),
+                )
+                continue
             other = await _resolve_ref_remote_first(other_branch, repo_path)
+            if not other:
+                state, detail = await _refresh_remote_ref(other_branch, repo_path)
+                if state == "unreachable":
+                    yield (
+                        other_branch,
+                        StackProbeResult(
+                            outcome=StackProbeOutcome.unavailable,
+                            reason="remote_unreachable",
+                            details=f"{other_branch}: {detail}",
+                        ),
+                    )
+                    continue
+                other = await _resolve_ref_remote_first(other_branch, repo_path)
             if not (head and other and base):
                 unresolved = [
                     name
@@ -1676,15 +1820,62 @@ class GitOpsIntegration:
         one submission, and a branch that moved after it would show the human
         code they are not approving. Carries real context lines — this diff is
         read by a person, unlike the ``-U0`` one call-site analysis parses.
+
+        Both ends go through ``_diff_ends`` since #1239. Until then the names
+        were interpolated verbatim, and the bare base name is not the base the
+        hub judges against: in the shared clone the local ``develop`` trails
+        ``origin/develop`` — nothing ever moves the local ref — so the card
+        showed the submission against a point in the past. Observed on a
+        purpose-built clone: the same commit gives 2 files against the stale
+        local ``develop`` and 0 against ``origin/develop``. Whichever of the
+        two the reader got, nobody told them which one they were looking at.
         """
+        ends = await _diff_ends(base, sha, repo)
+        if ends is None:
+            return None
+        base_sha, head_sha = ends
         rc, out, _ = await _git(
             "diff",
             f"-U{int(context)}",
-            f"{base}...{sha}",
+            f"{base_sha}...{head_sha}",
             repo=repo,
             check=False,
         )
         return out if rc == 0 else None
+
+    async def commit_in_base_history(
+        self, repo: str, base: str, sha: str
+    ) -> bool | None:
+        """Is ``sha`` already inside the history of the base? (#1239)
+
+        THE question a caller must ask before reading an empty three-dot diff
+        as "this changed nothing". ``base...sha`` is computed from the merge
+        base, so once the commit lands in the base's history the merge base IS
+        the commit and the diff is empty ALWAYS — whatever the submission
+        actually touched. Verified on a purpose-built clone: after the branch
+        was merged, ``git diff --name-only origin/develop...<sha>`` returns 0
+        files for a commit that adds two.
+
+        Three answers, never two, exactly as ``is_ancestor``: ``None`` means
+        the question could not be asked, and it must not collapse into "no" —
+        "we did not check" printed as "not merged" would send the reader back
+        to trusting an empty screen.
+
+        The ancestry is asked of the SAME tip the diff was computed against —
+        both go through ``_diff_ends`` — because on a bare name they disagree:
+        in the clone above ``merge-base --is-ancestor <sha> develop`` answers
+        rc=1 (not an ancestor) while ``origin/develop`` answers rc=0. Asking
+        the bare name would leave the collapse unrecognised.
+
+        One detector, shared: the card (``task_diff``) and the live evidence
+        packet (``steward_evidence``) both call this, rather than each
+        rebuilding the ref juggling that the disagreement above punishes.
+        """
+        ends = await _diff_ends(base, sha, repo)
+        if ends is None:
+            return None
+        base_sha, head_sha = ends
+        return await self.is_ancestor(repo, head_sha, base_sha)
 
     async def is_ancestor(
         self, repo: str, ancestor: str, descendant: str
@@ -1756,9 +1947,18 @@ class GitOpsIntegration:
         touched to lay criteria against them; reading every hunk for that would
         put the cost of the full diff on every gate render, and the full diff
         is already loaded on demand (#824).
+
+        Both ends resolved origin-first through ``_diff_ends`` (#1239), for the
+        same reason ``commit_diff`` does it: the change map and the diff below
+        it must describe one and the same comparison, and until #1239 they
+        agreed only by accident — both were wrong in the same way.
         """
+        ends = await _diff_ends(base, sha, repo)
+        if ends is None:
+            return None
+        base_sha, head_sha = ends
         rc, out, _ = await _git(
-            "diff", "--numstat", f"{base}...{sha}", repo=repo, check=False
+            "diff", "--numstat", f"{base_sha}...{head_sha}", repo=repo, check=False
         )
         if rc != 0:
             return None
@@ -2870,6 +3070,21 @@ class GitOpsIntegration:
         return await self._forge_for(forge).merge_commit_sha(
             pr_number, repo=repo, gh_repo=gh_repo
         )
+
+    def merge_preserves_ancestry(self, forge: str = "") -> bool:
+        """Останется ли сдаточный коммит предком базовой ветки после доставки.
+
+        Спрашивается у ТОГО ЖЕ адаптера, который будет мержить: ``_forge_for``
+        с тем же именем форжа, что получит ``merge_pr``. Не у настройки рядом
+        и не у имени в строке — иначе ответ про стратегию и сама стратегия
+        разъехались бы ровно так, как разъезжаются два источника правды.
+
+        Синхронный и без единого обращения наружу: это объявленное свойство
+        конвейера, а не наблюдение. Именно поэтому потребитель может спросить
+        ПЕРЕД git-вызовом и не платить за вопрос, на который всё равно нельзя
+        ответить (#1214).
+        """
+        return bool(self._forge_for(forge).merge_preserves_ancestry)
 
     async def merge_pr(
         self,
