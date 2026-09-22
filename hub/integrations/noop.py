@@ -239,6 +239,12 @@ class NoopGitOps:
         """No git here — "could not look", never "the submission lacks it" (#764)."""
         return None
 
+    async def files_naming_at_ref(
+        self, repo: str, ref: str, word: str, pathspec: str = "*.py"
+    ) -> set[str] | None:
+        """No git here — "could not look", never "the name is nowhere" (#1287)."""
+        return None
+
     async def commit_exists(self, repo: str, sha: str) -> bool | None:
         """No git here — "could not look", never "the commit is gone" (#824)."""
         return None

@@ -286,6 +286,11 @@ SUBJECT_UNFINISHED_STATUSES = (
 # trees are read once — so the cap is about branches, which cost a git call each.
 MAX_SUBJECT_BRANCHES = 25
 MAX_SUBJECT_NAMES = 40
+# Сколько файлов разбирать на одно имя, когда поиск выходит за объявленные
+# области (#1287). Файлы берутся в отсортированном порядке, так что выбор
+# воспроизводим; определение обычно лежит в первом же модуле, а хвост из
+# десятков совпадений — это имя таблицы, которое определения не имеет вовсе.
+MAX_WIDE_FILES = 5
 
 # Paths are named by affected_areas; identifiers are named in prose. Strip the
 # paths first so that ``hub/services/delivery_state.py`` does not also donate
@@ -301,6 +306,15 @@ class SubjectPresence:
 
     verdict: str
     missing: tuple[str, ...] = ()
+    # Подмножество ``missing``, про которое отказ обязан говорить иначе
+    # (#1287): имя ЕСТЬ в базовой ветке, но не как определение — имя таблицы
+    # или колонки, ключ словаря, упоминание. Решение от этого не меняется
+    # (определения нет — предмета нет), а утверждение меняется: «не найдено в
+    # базе» про такое имя — неправда, и человек, читающий отказ, идёт чинить
+    # не то. Отдельное поле, а не вычитание из ``missing``: читатели этого
+    # отказа считают missing множеством того, чего база не даёт, и сузить его
+    # значило бы поменять смысл поля ради текста.
+    text_only: tuple[str, ...] = ()
     found_in_branch: str = ""
     found_in_task_id: int = 0
     found_in_title: str = ""
@@ -470,6 +484,121 @@ async def _supplied_by(
     return supplied, readable
 
 
+@dataclass(frozen=True)
+class _WideSearch:
+    """Что ДЕРЕВО базовой ветки знает об именах, которых нет в объявленных областях.
+
+    Три исхода вместо одного, и каждый читается вслух по-своему (#1287).
+    Четвёртого поля — «нет вовсе» — здесь намеренно нет: оно выводится как
+    остаток и не может разойтись с ним.
+
+    22.09.2026 отказ по #1282 назвал отсутствующими пять имён, а отсутствовало
+    одно: у трёх определения лежали в файлах, которых проверка не открывала
+    (она разбирает только .py из affected_areas), а четвёртое —
+    ``steward_judgements`` — имя таблицы, у которого определения нет нигде и
+    не будет. Разница между «нет вовсе», «есть, но не определением» и
+    «посмотреть не удалось» — и есть разница между честным отказом и ложным.
+    """
+
+    defined: set[str]
+    text_only: dict[str, list[str]]
+    unsearched: set[str]
+
+
+async def _widen_the_search(repo_path: str, ref: str, names: list[str]) -> _WideSearch:
+    """Спросить всё дерево ``ref`` про имена, которых объявленные области не дали.
+
+    Поиск идёт СЛОВОМ ЦЕЛИКОМ и только сужает список файлов; присутствием
+    по-прежнему считается ОПРЕДЕЛЕНИЕ, найденное разбором исходника. Считать
+    присутствием само совпадение нельзя — это свойство #1232, проверенное
+    тестом про имя в комментарии: строка SQL и комментарий называют предмет,
+    не создавая его, и задача открылась бы пустой. Подстрока не считается
+    присутствием тем более: за это отвечает ``-w`` у git grep, а не правило,
+    написанное здесь заново.
+    """
+    from hub.integrations.registry import plugins
+
+    found = _WideSearch(defined=set(), text_only={}, unsearched=set())
+    for name in names:
+        where = await plugins.git_ops.files_naming_at_ref(repo_path, ref, name)
+        if where is None:
+            found.unsearched.add(name)
+            continue
+        paths = sorted(p for p in where if p.endswith(".py"))[:MAX_WIDE_FILES]
+        if not paths:
+            # Слова нет в дереве вовсе — остаток, который назовёт отказ.
+            continue
+        read_any = False
+        defined_here = False
+        for path in paths:
+            source = await plugins.git_ops.file_at_ref(repo_path, ref, path)
+            if source is None:
+                continue
+            bound = defined_names(source)
+            if bound is None:
+                continue
+            read_any = True
+            if name in bound or name.split(".")[-1] in bound:
+                defined_here = True
+                break
+        if defined_here:
+            found.defined.add(name)
+        elif read_any:
+            found.text_only[name] = paths
+        else:
+            # Файлы нашлись, но ни один не прочитался: «посмотреть не
+            # удалось» — не «есть только как текст» (#725).
+            found.unsearched.add(name)
+    return found
+
+
+def _how_we_looked() -> str:
+    """Каким способом искали. Отказ, который этого не говорит, нечем проверить."""
+    return (
+        "Искали так: определением — разбором исходника (def/class/присваивание/"
+        "импорт), сначала в объявленных областях, затем в файлах базовой ветки, "
+        "где имя встречается СЛОВОМ ЦЕЛИКОМ. Совпадение внутри другого слова "
+        "присутствием не считается."
+    )
+
+
+def _what_is_missing(
+    missing: list[str],
+    base: str,
+    *,
+    text_only: dict[str, list[str]],
+    unsearched: set[str],
+) -> str:
+    """Чего именно нет — тремя разными утверждениями вместо одного общего.
+
+    Раньше здесь была одна строка «Не найдено в базе: ...», и она утверждала
+    отсутствие про всё, чего не дали объявленные области. На #1282 это было
+    неправдой про четыре имени из пяти (#1287).
+    """
+    parts: list[str] = []
+    absent = [m for m in missing if m not in text_only and m not in unsearched]
+    if absent:
+        parts.append(f"Не найдено в {base} вовсе: {', '.join(absent)}.")
+    if text_only:
+        named = "; ".join(
+            f"{name} ({', '.join(paths)})" for name, paths in sorted(text_only.items())
+        )
+        parts.append(
+            f"Есть в {base}, но не определением — имя таблицы или колонки, ключ "
+            f"словаря, упоминание: {named}. Предметом это не считается: назвать "
+            "имя не значит создать его."
+        )
+    still = sorted(m for m in missing if m in unsearched)
+    if still:
+        parts.append(
+            f"Шире объявленных областей посмотреть не удалось, поэтому про "
+            f"{', '.join(still)} сказано только то, что их нет в объявленных "
+            "файлах."
+        )
+    parts.append(_how_we_looked())
+    return " ".join(parts)
+
+
 def _stranded_reason(
     missing: list[str],
     base: str,
@@ -479,10 +608,12 @@ def _stranded_reason(
     title: str,
     status: str,
     supplied: set[str],
+    text_only: dict[str, list[str]] | None = None,
+    unsearched: set[str] | None = None,
 ) -> str:
     return (
         f"Задача не открыта: её предмета нет в базовой ветке {base}. "
-        f"Не найдено в базе: {', '.join(missing)}. "
+        f"{_what_is_missing(missing, base, text_only=text_only or {}, unsearched=unsearched or set())} "
         f"Найдено в ветке {branch} задачи #{other_id} "
         f"«{title}» ({status}): {', '.join(sorted(supplied))} — "
         f"надо дождаться её доставки. "
@@ -544,6 +675,16 @@ async def subject_presence(db: Any, task: dict[str, Any]) -> SubjectPresence:
         )
     wanted = [*paths, *names]
     missing = [w for w in wanted if w not in supplied]
+    # Объявленные области — не весь код (#1287). Имя, которого там нет, вполне
+    # может быть определено в файле, который постановка не назвала: на #1282
+    # так было у трёх имён из пяти. Спрашиваем дерево, прежде чем говорить
+    # «нет» — и спрашиваем только про то, чего не хватает, чтобы обычное
+    # открытие не платило ни одного лишнего вызова git.
+    wide = await _widen_the_search(
+        repo_path, base_ref, [m for m in missing if m in names]
+    )
+    missing = [m for m in missing if m not in wide.defined]
+    text_only = {n: p for n, p in wide.text_only.items() if n in missing}
     if not missing:
         return SubjectPresence(
             verdict=SUBJECT_PRESENT,
@@ -590,6 +731,7 @@ async def subject_presence(db: Any, task: dict[str, Any]) -> SubjectPresence:
         return SubjectPresence(
             verdict=SUBJECT_STRANDED,
             missing=tuple(missing),
+            text_only=tuple(sorted(text_only)),
             found_in_branch=branch,
             found_in_task_id=other_id,
             found_in_title=other_title,
@@ -602,15 +744,18 @@ async def subject_presence(db: Any, task: dict[str, Any]) -> SubjectPresence:
                 title=other_title,
                 status=other_status,
                 supplied=there,
+                text_only=text_only,
+                unsearched=wide.unsearched,
             ),
         )
 
     return SubjectPresence(
         verdict=SUBJECT_NEW_WORK,
         missing=tuple(missing),
+        text_only=tuple(sorted(text_only)),
         reason=(
-            f"в {base_ref} нет: {', '.join(missing)}; "
-            "ни в одной незавершённой ветке этого тоже нет — обычная новая работа"
+            f"{_what_is_missing(missing, base_ref, text_only=text_only, unsearched=wide.unsearched)} "
+            "Ни в одной незавершённой ветке этого тоже нет — обычная новая работа"
         ),
     )
 

@@ -1404,6 +1404,11 @@ async def refuse_opening_without_subject(
                 ),
                 "hint": presence.reason,
                 "missing": list(presence.missing),
+                # Подмножество missing, про которое «не найдено» было бы
+                # неправдой: имя в базовой ветке есть, но не определением
+                # (#1287). Отдельным полем, потому что читатель отказа —
+                # человек или агент — решает по нему, что чинить.
+                "text_only": list(presence.text_only),
                 "found_in_branch": presence.found_in_branch,
                 "found_in_task_id": presence.found_in_task_id,
                 "task_id": task_id,
