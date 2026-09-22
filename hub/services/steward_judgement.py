@@ -45,6 +45,25 @@ def _require_member(field: str, got: str, allowed: tuple[str, ...]) -> None:
         )
 
 
+def _downgrade_reason(verdict: str, confidence: str, grounds: list) -> str:
+    """Why a verdict is stored as an escalation, or "" when it stands.
+
+    ``low`` confidence beats any verdict (#1022). An approve or a return that
+    names no ground, or states no confidence, cannot be checked by a human or
+    by the hub — it is stored as an escalation too (#1327). An escalation
+    needs neither: it already says "I cannot judge this".
+    """
+    if confidence == "low":
+        return "low_confidence"
+    if verdict == "escalate":
+        return ""
+    if not grounds:
+        return "no_grounds"
+    if not confidence:
+        return "no_confidence"
+    return ""
+
+
 async def record_steward_judgement(
     db,
     task_id: int,
@@ -88,9 +107,10 @@ async def record_steward_judgement(
         _require_member("closure.type", closure.type, STEWARD_CLOSURE_TYPES)
 
     escalate_reason = (body.escalate_reason or "").strip()
-    if confidence == "low":
+    downgrade = _downgrade_reason(submitted_verdict, confidence, body.grounds)
+    if downgrade:
         effective_verdict = "escalate"
-        effective_reason = "low_confidence"
+        effective_reason = downgrade
     else:
         effective_verdict = submitted_verdict
         if effective_verdict == "escalate":

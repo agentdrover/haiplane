@@ -532,6 +532,7 @@ async def _judged_with(
             kind="verdict",
             verdict="approve",
             confidence="high",
+            grounds=[{"source": "ci_pinned_sha"}],
             closures=closures,
             model="gpt-5.3-codex",
         ),
