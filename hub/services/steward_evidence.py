@@ -429,22 +429,33 @@ async def _base_fact(db: aiosqlite.Connection, project_row: Any | None) -> Evide
     )
 
 
-async def _dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFact:
+async def dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFact:
     """What this task waits for, judged by DELIVERY rather than status (#484/#485).
 
+    Public because the draft packet (#1158) assembles the same fact from the
+    same edges: two builders of one source would drift, and a steward reading
+    "blocked by nothing" from two different computations could not be told
+    which one it read.
+
     Доставку здесь НЕ считают заново. Читатель тот же, что у реестра
-    недоставленной работы (#897) — ``with_cached_delivery`` поверх #885, —
-    и по той же причине: пока источников два, суждение стюарда не сойдётся
-    с тем, что хаб считает истиной в другом окне. Собственный счёт по
-    ``pipeline_merges`` видел только мержи, сделанные гейтом, поэтому
-    squash-доставка и мерж мимо записи гейта читались как «не доставлено»
-    (#1214, находка 42b59be386311b35). Вдобавок считал он поле ``merges``,
-    которого в строке уже нет: ``_blocker_entry`` снимает его, разбирая в
-    ``delivered``, — так что НЕДОСТАВЛЕННЫМ выходил каждый блокер.
+    недоставленной работы (#897) — ``with_cached_delivery`` поверх #885, — и
+    по той же причине: пока источников два, суждение стюарда не сойдётся с
+    тем, что хаб считает истиной в другом окне.
+
+    Что было до этого, двумя слоями. Сперва факт считался по ``merges``, а
+    этой колонки в строке уже нет — ``_blocker_entry`` снимает её, разбирая
+    в ``delivered``, — так что недоставленным выходил КАЖДЫЙ блокер (#1158
+    это и починило). Но и сам ``delivered`` с ребра — это счёт по
+    ``pipeline_merges``, то есть по мержам, которые сделал гейт: доставка
+    squash-ом и мерж мимо записи гейта по-прежнему читались как «не
+    доставлено» (#1214, находка 42b59be386311b35). Второй слой снимается
+    здесь.
 
     Ответ трёхзначный, как и у реестра: ``delivered`` True, False и None =
     «узнать не удалось». Третье состояние существует, чтобы молчание
-    провайдера не работало основанием эскалации и отказа.
+    провайдера не работало основанием эскалации и отказа, — и чтобы случай,
+    в котором родословная не судит по построению (squash-конвейер,
+    ``BASE_UNANSWERABLE_NOTE``), не выдавался за наблюдённое «нет».
 
     Провайдера пакет не спрашивает: за этот вопрос платит свип, а пакет
     читает записанное. Сборка пакета не должна стоить сетевого вызова на
@@ -465,9 +476,15 @@ async def _dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFa
             {
                 "task_id": e.get("task_id"),
                 "status": e.get("status"),
+                # Трёхзначно: True, False и None = «узнать не удалось».
+                # bool() здесь схлопнул бы незнание в отказ — ровно то, что
+                # реестр перестал делать дважды (#897, #1198).
                 "delivered": e.get("delivered"),
                 "delivery_path": e.get("delivery_path", ""),
-                "reason": e.get("reason", ""),
+                # Почему не доставлено: «PR не заявлен» и «PR не смержен
+                # гейтом» — разные следующие шаги, и репозиторий их уже
+                # различил (#485).
+                "reason": e.get("reason") or "",
             }
             for e in blocked_by
         ],
@@ -516,7 +533,7 @@ async def build_evidence_packet(
             await _risk_fact(db, task, diff_paths, diff_reason),
             _locator_fact(brief),
             await _base_fact(db, project_row),
-            await _dependency_fact(db, task_id),
+            await dependency_fact(db, task_id),
         ]
     }
     return EvidencePacket(
@@ -596,6 +613,27 @@ def _quotes(
 QUOTE_TASK_STATEMENT = "task_statement"
 QUOTE_SUBMISSION_SUMMARY = "submission_summary"
 QUOTE_REVIEW_FINDING = "review_finding"
+# Драфтовые входы (#1158). Их объединяет не место в схеме, а происхождение:
+# строку набрал автор постановки, а хаб её только ПЕРЕНОСИТ в факт. Перенос
+# делает такую строку похожей на вычисление хаба, и ровно поэтому она обязана
+# ехать ещё и цитатой: иначе пакет утверждает "подозрений нет" про текст,
+# который никто не смотрел.
+QUOTE_AC_TEST_REF = "ac_test_ref"
+QUOTE_DECLARED_AREA = "declared_area"
+# Предложение про класс риска составляет хаб, но в скобки он вставляет
+# заявленные области ДОСЛОВНО. Авторская здесь половина, и цитируется
+# предложение целиком: резать хабовскую рамку от авторской вставки значило бы
+# завести второй разбор той же строки.
+QUOTE_RISK_CLASS_REASON = "risk_class_reason"
+# Текст постановки, который стюард на драфте читает как техлид (§6.2 спеки,
+# решение владельца по #1158 от 17.09): формулировки критериев, заявленный
+# охват и размер. Фактом ни одно из них не является — хаб не может их
+# перепроверить (§3), — поэтому они едут цитатами, как описание, и проходят ту
+# же проверку на приказ судье.
+QUOTE_AC_TEXT = "ac_text"
+QUOTE_SCOPE_IN = "scope_in"
+QUOTE_SCOPE_OUT = "scope_out"
+QUOTE_SIZE = "size"
 
 # Each signal is (code, matcher). Two shapes only, both about ADDRESSING the
 # judge — not about tone, not about imperatives in general. A statement telling
