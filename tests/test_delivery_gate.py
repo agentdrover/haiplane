@@ -2674,6 +2674,7 @@ TRANSIENT_SHARED_HINTS: dict[str, tuple[str, str]] = {
     ),
 }
 
+
 async def _transient_hint(db: aiosqlite.Connection, monkeypatch, prefix: str) -> str:
     """Подсказка, которую лесенка done-flow даёт отказу с этим префиксом."""
     from hub.services import orchestration
