@@ -716,6 +716,11 @@ async def test_a_self_issued_approval_is_visible_and_sampled(
         by_human,
         TaskReviewVerdict(agent="denis", verdict=ReviewVerdict.approved),
     )
+    # Вердикт, который стюард ПРИМЕНИЛ, но это возврат, а не одобрение: актор
+    # тот же, и отличает его только слово вердикта.
+    returned = await _client_task(db, project_id)
+    await _judge(db, returned, verdict="changes_requested")
+    assert (await apply_judgement(db, returned, 1))[0] == RETURNED
 
     from datetime import UTC, datetime, timedelta
 
@@ -1247,6 +1252,46 @@ async def test_a_self_approval_is_named_apart_on_the_digest_page(
     assert "Решение остаётся человеческим" not in page.text, (
         "в дайджесте, где стюард одобрил сам, строка «решение человеческое» ложна"
     )
+    assert "не измерялось" not in page.text, (
+        "дайджест со своим разделом самоодобрений обязан назвать число, а не "
+        "«не измерялось»"
+    )
+
+
+async def test_a_day_with_only_a_self_approval_still_gets_a_digest(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Суждение вчера, применение сегодня — день применения не пустой.
+
+    Суждение и применение — два события, и граница суток может лечь между
+    ними. День, где было только применённое одобрение, обязан дать дайджест:
+    иначе ровно то решение, которого человек не видел, выпало бы из надзора
+    молча — пустой день и непосчитанный неотличимы.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from hub.services.digest import SELF_APPROVALS_KEY, generate_due_digests
+    from hub.services.gate_events import STEWARD_JUDGEMENT
+
+    monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
+    project_id = await _project(db, "self-approval-alone")
+    task_id = await _client_task(db, project_id)
+    await _judge(db, task_id, verdict="approve")
+    await db.execute(
+        "UPDATE events SET created_at = datetime('now', '-3 days') "
+        "WHERE kind = ? AND task_id = ?",
+        (STEWARD_JUDGEMENT, task_id),
+    )
+    await db.commit()
+    outcome, _ = await approve_without_a_human(db, task_id, 1, _decide())
+    assert outcome == APPLIED
+
+    assert (
+        await generate_due_digests(db, now=datetime.now(UTC) + timedelta(days=1)) == 1
+    )
+    payload = json.loads(dict((await repo.list_digests(db))[0])["payload"])
+    assert payload["steward_judgements"] == []
+    assert [a["task_id"] for a in payload[SELF_APPROVALS_KEY]] == [task_id]
 
 
 async def test_independence_nobody_established_is_not_a_second_look(
