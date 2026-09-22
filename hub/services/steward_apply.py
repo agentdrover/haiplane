@@ -53,6 +53,7 @@ REFUSED_UNCLOSED = "unclosed_finding"
 # (#1162). Код из того же закрытого словаря #1022, где он и заводился;
 # им же названо саморевью в громких основаниях — написание одно.
 REFUSED_SELF_AUTHORED = "self_authored"
+REFUSED_NOT_DELEGATED = "policy_not_delegated"
 
 # Типы закрытия из закрытого словаря #1022, и рядом — ЧЕМ каждый
 # подтверждается. Соответствие публичное, потому что его полноту проверяет
@@ -633,6 +634,37 @@ async def self_authored_refusal(
     )
 
 
+async def policy_refusal(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[str, str] | None:
+    """Вердикт проекта не отдан стюарду — применять нечего и некому (#1268).
+
+    Теневое участие открывает заказ и суждение, но не решение: вердикт там
+    выносит человек. Проверка стоит здесь, а не на заказе, потому что
+    автономия (``steward_shadow.effective_mode``) глобальна — выданная по
+    измерению одного проекта, она иначе дотянулась бы до любого, где стюарда
+    только слушают, включая репозиторий самого хаба. Режим и автономия этот
+    отказ не снимают: он о том, ЧЬЁ решение, а не о том, насколько судье
+    доверяют.
+
+    Вопрос «отдан ли» задаётся единственному читателю политики стюарда;
+    непрочитанный проект — не отданный.
+    """
+    from hub import repository as repo
+    from hub.services.project_policy import gate_policy_of
+    from hub.services.steward_dispatch import verdict_delegated_to_steward
+
+    project = await repo.resolve_project_for_task(db, task_id)
+    if verdict_delegated_to_steward(project):
+        return None
+    stored = gate_policy_of(project).get("verdict") if project is not None else None
+    return (
+        REFUSED_NOT_DELEGATED,
+        f"политика проекта: verdict={stored or 'human'} — вердикт не отдан "
+        "стюарду, суждение записано в тени и не применяется",
+    )
+
+
 async def apply_refusals(
     db: aiosqlite.Connection, task_id: int, generation: int | None = None
 ) -> list[tuple[str, str]]:
@@ -647,6 +679,7 @@ async def apply_refusals(
     mode = mode_refusal()
     if mode:
         return [mode]
+    not_delegated = await policy_refusal(db, task_id)
     packet = await build_evidence_packet(db, task_id, generation)
     if packet is None:
         return [(REFUSED_PRECONDITION, f"задачи #{task_id} нет")]
@@ -655,7 +688,8 @@ async def apply_refusals(
     row = await repo.get_task(db, task_id)
     task = dict(row) if row is not None else {"id": task_id}
 
-    out = precondition_refusals(packet)
+    out = [not_delegated] if not_delegated else []
+    out.extend(precondition_refusals(packet))
     self_authored = await self_authored_refusal(db, task_id)
     if self_authored:
         out.append(self_authored)

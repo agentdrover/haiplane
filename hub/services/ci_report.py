@@ -69,6 +69,10 @@ CHECK_FAIL = "fail"
 CHECK_SKIPPED = "skipped"
 CHECK_OUTCOMES = frozenset({CHECK_PASS, CHECK_FAIL, CHECK_SKIPPED})
 
+# The mutation report (#1270) is stored verbatim; the reporter trims the survivor
+# list well below this, so hitting it means a reporter that forgot to.
+MUTATIONS_MAX_CHARS = 32_000
+
 
 def _pinned_sha(task: dict) -> str:
     return (task.get("submission_sha") or "").strip()
@@ -85,6 +89,7 @@ async def accept_ci_run_report(
     reason: str = "",
     reported_by: str = "",
     checks: dict[str, str] | None = None,
+    mutations: dict[str, Any] | None = None,
 ) -> dict:
     """Store a CI run report and stamp it if it covers the pinned commit.
 
@@ -118,6 +123,15 @@ async def accept_ci_run_report(
                 f"unknown check outcome {outcome!r} for {name!r}; "
                 f"expected one of {sorted(CHECK_OUTCOMES)}"
             )
+
+    # #1270: stored as evidence under its own key, never interpreted into a
+    # gate. Bounded, because it is free text from CI landing in a table row.
+    mutations_json = json.dumps(mutations or {}, ensure_ascii=False, sort_keys=True)
+    if len(mutations_json) > MUTATIONS_MAX_CHARS:
+        raise ValueError(
+            f"mutations report is {len(mutations_json)} chars, the limit is "
+            f"{MUTATIONS_MAX_CHARS}: trim the survivor list before sending"
+        )
 
     known = await test_ac_nodeids(db, task_id)
     accepted: dict[str, str] = {}
@@ -170,6 +184,7 @@ async def accept_ci_run_report(
             ensure_ascii=False,
             sort_keys=True,
         ),
+        mutations=mutations_json,
     )
 
     recorded: list[dict] = []
@@ -192,6 +207,7 @@ async def accept_ci_run_report(
         "ac_recorded": recorded,
         "ac_ignored": ignored,
         "validation_status": validation_status,
+        "mutations_state": str((mutations or {}).get("state") or "not_reported"),
     }
 
 

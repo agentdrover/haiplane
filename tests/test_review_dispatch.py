@@ -7,9 +7,17 @@ report whose tokens disagree with the provider's usage is flagged.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
+import os
 import re
+import shlex
+import stat
+import subprocess
+import textwrap
+import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 import aiosqlite
@@ -33,6 +41,7 @@ from hub.services.review_dispatch import (
     LITE,
     _ladder_cause_note,
     _REVIEW_MODEL_PREFERENCES,
+    _delivery_block,
     REVIEW_FILE_LINE_CAP,
     changed_paths,
     count_environment_refusals,
@@ -2701,26 +2710,52 @@ def _scratch(tmp_path) -> str:
     return str(path)
 
 
-def _stub_reviewer(monkeypatch, tmp_path, script: str) -> None:
-    """Локальный ревьюер = python-заглушка под настоящим префиксом.
+def _fake_sudo(tmp_path) -> str:
+    """Исполняемый скрипт по имени ``sudo`` — ради ФОРМЫ, а не ради изоляции.
 
-    Префикс здесь — системный ``env``: он ничего не изолирует, и в этом весь
-    смысл. Тест не может завести на машине разработчика второго unix-
-    пользователя, но может доказать, что префикс ДЕЙСТВИТЕЛЬНО применяется к
-    командной строке: заглушка видит себя запущенной через него. Настоящая
-    изоляция — свойство выката (deploy/LOCAL-REVIEW.md), и её проверка
-    попыткой названа в AC-2 ручной честно, а не подменена этим тестом.
+    С 10.09.2026 хаб принимает закрытый набор форм строки песочницы (#1208), и
+    системный ``env``, которым эти тесты пользовались раньше, в набор не
+    входит: строка вне набора не запускается вовсе, и прогон, который тест
+    хочет измерить, просто не состоялся бы. Второго unix-пользователя на
+    машине разработчика не завести, поэтому здесь стоит скрипт, который
+    ничего не изолирует, а лишь съедает свои три токена и запускает остальное.
+
+    Смысл тот же, что был у ``env``: доказать, что префикс ДЕЙСТВИТЕЛЬНО
+    применяется к командной строке — заглушка видит себя запущенной через
+    него. Настоящая изоляция остаётся свойством выката
+    (deploy/LOCAL-REVIEW.md), и её проверка попыткой названа в AC-2 ручной
+    честно, а не подменена этим тестом.
     """
+    path = tmp_path / "sudo"
+    if not path.exists():
+        path.write_text(
+            '#!/bin/sh\n# sudo -n -u <пользователь> <команда...>\nshift 3\nexec "$@"\n'
+        )
+        path.chmod(0o755)
+    return str(path)
+
+
+def _sudo_sandbox(tmp_path, wrapper: str) -> str:
+    """Строка песочницы формы ``sudo`` — той самой, что стоит на проде.
+
+    Пользователь — сам вызывающий: чужого на машине разработчика нет, а страж
+    проверяет его членство в группе каталога прогонов по-настоящему.
+    """
+    import os
+    import pwd
+
+    return f"{_fake_sudo(tmp_path)} -n -u {pwd.getpwuid(os.getuid()).pw_name} {wrapper}"
+
+
+def _stub_reviewer(monkeypatch, tmp_path, script: str) -> None:
+    """Локальный ревьюер = python-заглушка под настоящим префиксом."""
     import shlex
-    import shutil
     import sys
 
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_CMD", shlex.join([sys.executable, "-c", script])
-    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", shlex.join(["-c", script]))
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
 
 
@@ -2947,9 +2982,9 @@ async def test_local_review_obeys_policy_and_cost_ceiling(
     runs: list[str] = []
     real_run = local_reviewer.run_review
 
-    async def _counting(prompt, *, timeout=None):
+    async def _counting(prompt, *, timeout=None, prompt_at_slot=None):
         runs.append(prompt)
-        return await real_run(prompt, timeout=timeout)
+        return await real_run(prompt, timeout=timeout, prompt_at_slot=prompt_at_slot)
 
     monkeypatch.setattr(local_reviewer, "run_review", _counting)
     _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
@@ -3011,7 +3046,7 @@ async def test_github_still_goes_to_the_cloud_reviewer(
 
     runs: list[str] = []
 
-    async def _never(prompt, *, timeout=None):
+    async def _never(prompt, *, timeout=None, prompt_at_slot=None):
         runs.append(prompt)
         return None
 
@@ -3162,7 +3197,6 @@ async def test_the_timed_out_reviewer_is_actually_dead(monkeypatch, tmp_path):
     убийство группы.
     """
     import shlex
-    import shutil
     import sys
 
     marker = tmp_path / "still_alive"
@@ -3175,11 +3209,9 @@ async def test_the_timed_out_reviewer_is_actually_dead(monkeypatch, tmp_path):
         + "; :"
     )
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, "/bin/sh")
     )
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_CMD", shlex.join(["/bin/sh", "-c", payload])
-    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", shlex.join(["-c", payload]))
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
 
@@ -3190,6 +3222,117 @@ async def test_the_timed_out_reviewer_is_actually_dead(monkeypatch, tmp_path):
     assert not marker.exists(), (
         "ревьюер пережил собственный таймаут: хаб написал в ленту, что снял "
         "процесс, и это было бы неправдой"
+    )
+
+
+async def test_the_run_guard_judges_the_deadline_the_run_will_get(
+    monkeypatch, tmp_path
+):
+    """Стража спрашивают НА КАЖДОМ ПРОГОНЕ, а не только на готовности.
+
+    Находка 10.09.2026 (ревьюер Codex, воспроизведено на ef2198fc): проверка
+    сравнивала срок контейнера с ``LOCAL_REVIEW_TIMEOUT_SEC`` даже там, где
+    прогону отмерили меньше. ``podman run --timeout 1800`` проходил готовность
+    при умолчании 1800, а ``run_review(timeout=1)`` убивал только клиента
+    podman — контейнер жил оставшиеся почти полчаса, жёг CPU и мог прислать
+    отчёт по закрытому прогону.
+
+    ПОВОРОТ 10.09.2026. Половина про СРОК потеряла предмет: контейнерных
+    запусков в песочнице больше не бывает (закрытый набор форм, #1208), а обе
+    формы набора оставляют полезную нагрузку потомком хаба — убийство группы
+    доходит до неё при любом сроке, и суждения, зависящего от ``timeout``, у
+    стража не осталось. Вход не выброшен: та же строка стоит здесь же и
+    проверяется на отказ. Вторая половина осталась целиком и она несущая:
+    отказ — это не мнение, а незапуск, иначе страж был бы суждением, которое
+    некому применить.
+    """
+    sandbox = "/usr/bin/podman run --rm -i --timeout 1800 img"
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", 1800)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "cursor-agent --print")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+
+    assert local_reviewer.sandbox_problem(), (
+        "контейнерный запуск в набор форм не входит — иначе проверка ниже беспредметна"
+    )
+
+    # И это не только суждение: прогон НЕ ЗАПУСКАЕТСЯ. Иначе страж остался бы
+    # мнением, которое некому применить, — весь класс дефектов #1208 именно
+    # об этом.
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        local_reviewer,
+        "_spawn",
+        lambda *a, **k: spawned.append("да"),  # noqa: ARG005
+    )
+    assert await local_reviewer.run_review("промт", timeout=1) is None, (
+        "прогон с песочницей вне закрытого набора форм запускать нельзя"
+    )
+    assert not spawned, (
+        "страж высказался, а хаб всё равно породил процесс: контейнер "
+        f"пережил бы прогон на 1799 с, {spawned}"
+    )
+
+
+def _own_host_budget(monkeypatch) -> None:
+    """Свой замок слота на этот тест — ради ЦИКЛА СОБЫТИЙ, а не ради смысла.
+
+    ``asyncio.Lock`` привязывается к циклу при ПЕРВОЙ же конкуренции за него
+    (``_LoopBoundMixin._get_loop``), а ``_HOST_BUDGET`` живёт в модуле, то
+    есть переживает тест. Второй тест, который дождётся очереди, получил бы
+    «bound to a different event loop» вместо своего измерения — и падал бы
+    только В КОМПАНИИ первого, что читается как флак, а не как правило. У
+    хаба цикл один, поэтому на проде вопроса нет вовсе.
+
+    Замок остаётся настоящим и остаётся глобалью модуля: ``run_review``
+    читает его по имени на каждом вызове, так что очередь тест измеряет ту
+    же самую.
+    """
+    monkeypatch.setattr(local_reviewer, "_HOST_BUDGET", asyncio.Lock())
+
+
+async def test_two_local_runs_never_overlap_on_the_host(monkeypatch, tmp_path):
+    """Хост держит один прогон разом, и это держит ХАБ, а не скрипт враппера.
+
+    Находка 10.09.2026 (ревьюер Codex, подтверждена на хосте хаба). Рабочий
+    враппер снимал «хвосты» строкой ``podman rm -af``, называя основанием
+    «два ревьюера разом хосту не по карману». Хаб такого ограничения не знал:
+    ``_LOCAL_RUNS`` — обычный ``dict`` по идентификатору заказа, ни очереди,
+    ни сериализации. Два ревью, начавшихся близко по времени, сносили друг
+    друга, и в карточке это ложилось отказом прогона с ЛОЖНОЙ причиной.
+
+    Доказательство внешнее: полезная нагрузка отмечает вход и выход в общем
+    файле. Пересечение читается из ПОРЯДКА отметок, а не из времени — по
+    времени тест был бы флаким на загруженной машине.
+    """
+    import shlex
+
+    _own_host_budget(monkeypatch)
+    marks = tmp_path / "marks"
+    payload = (
+        f"printf 'in\n' >> {shlex.quote(str(marks))}; "
+        "sleep 0.3; "
+        f"printf 'out\n' >> {shlex.quote(str(marks))}"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, "/bin/sh")
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", shlex.join(["-c", payload]))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+
+    runs = await asyncio.gather(
+        *[local_reviewer.run_review("промт", timeout=30) for _ in range(3)]
+    )
+    assert all(run is not None and not run.timed_out for run in runs), (
+        f"прогоны не состоялись — тогда о пересечении судить не по чему: {runs}"
+    )
+    seen = marks.read_text().split()
+    assert seen == ["in", "out"] * 3, (
+        f"прогоны шли внахлёст: {seen}. На хосте это значит второй контейнер "
+        "при отмеренных первому 1500 МБ и 1.5 CPU — и уборку враппера, "
+        "которая сносит живой контейнер соседа"
     )
 
 
@@ -3205,7 +3348,6 @@ async def test_stopping_the_hub_kills_the_local_reviewer(
     from hub.services.review_dispatch import cancel_local_runs
 
     import shlex
-    import shutil
     import sys
 
     marker = tmp_path / "outlived_the_hub"
@@ -3221,11 +3363,9 @@ async def test_stopping_the_hub_kills_the_local_reviewer(
     _wire(monkeypatch, recorder)
     await _local_principal(db, monkeypatch)
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, "/bin/sh")
     )
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_CMD", shlex.join(["/bin/sh", "-c", payload])
-    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", shlex.join(["-c", payload]))
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
 
     await _submitted(
@@ -3255,19 +3395,16 @@ async def test_a_chatty_reviewer_does_not_grow_the_hub(monkeypatch, tmp_path):
     слайсе ревьюера, а росла память ХАБА.
     """
     import shlex
-    import shutil
     import sys
 
     monkeypatch.setattr(local_reviewer, "OUTPUT_CAP", 1000)
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_CMD",
-        shlex.join(
-            [sys.executable, "-c", "import sys; sys.stdin.read(); print('x' * 500000)"]
-        ),
+        shlex.join(["-c", "import sys; sys.stdin.read(); print('x' * 500000)"]),
     )
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
@@ -3300,7 +3437,7 @@ async def test_a_detaching_sandbox_is_refused_by_name(
     _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
     runs: list[str] = []
 
-    async def _never(prompt, *, timeout=None):
+    async def _never(prompt, *, timeout=None, prompt_at_slot=None):
         runs.append(prompt)
         return None
 
@@ -3357,19 +3494,17 @@ async def test_the_scratch_dir_is_writable_by_the_reviewer(monkeypatch, tmp_path
     но режим каталога — это ровно то, что решает исход.
     """
     import shlex
-    import shutil
     import sys
 
     probe = tmp_path / "mode.txt"
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_CMD",
         shlex.join(
             [
-                sys.executable,
                 "-c",
                 "import os, sys; sys.stdin.read(); "
                 f"open({str(probe)!r}, 'w').write(oct(os.stat(os.getcwd()).st_mode & 0o777))",
@@ -3402,21 +3537,18 @@ async def test_stopping_the_hub_closes_the_dispatch_row(
     from hub.services.review_dispatch import cancel_local_runs
 
     import shlex
-    import shutil
     import sys
 
     recorder = _DispatchRecorder({"agent": {"id": "bc-sd"}, "run": {"id": "r-sd"}})
     _wire(monkeypatch, recorder)
     await _local_principal(db, monkeypatch)
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_CMD",
-        shlex.join(
-            [sys.executable, "-c", "import time, sys; sys.stdin.read(); time.sleep(30)"]
-        ),
+        shlex.join(["-c", "import time, sys; sys.stdin.read(); time.sleep(30)"]),
     )
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
 
@@ -3546,8 +3678,17 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     """
     import os
 
+    import pwd
+
     monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "/bin/true")
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/env")
+    # Песочница обязана быть ФОРМОЙ ИЗ НАБОРА, иначе not_ready() назовёт её, а
+    # не каталог, и тест судил бы другое (#1208, поворот 10.09.2026: прежде
+    # здесь стоял «/usr/bin/env», который набор не принимает). Пользователь —
+    # сам вызывающий: он владеет каталогом, и по группе проходит.
+    me = pwd.getpwuid(os.getuid()).pw_name
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -n -u {me} /usr/local/bin/wrap"
+    )
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
 
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "missing"))
@@ -3574,7 +3715,7 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_SANDBOX",
-        "/usr/bin/systemd-run --scope --uid=nobody --",
+        "/usr/bin/systemd-run --scope --uid=nobody /usr/local/bin/wrap",
     )
     assert any("не состоит в группе" in r for r in local_reviewer.not_ready()), (
         "пользователь песочницы вне группы каталога — тот же EACCES, только "
@@ -3586,7 +3727,9 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     # (найдено ревью, неразрешённая 534e16e4). uid 1 есть на обеих системах,
     # где это гоняется, и в группе каталога он не состоит.
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/systemd-run --scope --uid=1 --"
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=1 /usr/local/bin/wrap",
     )
     assert any("не состоит в группе" in r for r in local_reviewer.not_ready()), (
         "числовая форма --uid обязана проверяться так же, как именная: "
@@ -3598,7 +3741,7 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_SANDBOX",
-        f"/usr/bin/systemd-run --scope --uid={os.getuid()} --",
+        f"/usr/bin/systemd-run --scope --uid={os.getuid()} /usr/local/bin/wrap",
     )
     assert local_reviewer.not_ready() == [], "владелец каталога проходит по группе"
 
@@ -3609,7 +3752,7 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_SANDBOX",
-        "/usr/bin/systemd-run --scope --uid=no-such-user-1180 --",
+        "/usr/bin/systemd-run --scope --uid=no-such-user-1180 /usr/local/bin/wrap",
     )
     assert any("не разрешается в системе" in r for r in local_reviewer.not_ready()), (
         "неудача проверки не имеет права читаться как «настроено»"
@@ -3628,20 +3771,18 @@ async def test_the_chatty_reviewer_output_never_lands_in_memory(monkeypatch, tmp
     кусками держит в памяти только лимит.
     """
     import shlex
-    import shutil
     import sys
     import tracemalloc
 
     monkeypatch.setattr(local_reviewer, "OUTPUT_CAP", 1000)
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_CMD",
         shlex.join(
             [
-                sys.executable,
                 "-c",
                 "import sys; sys.stdin.read(); sys.stdout.write('x' * 8_000_000)",
             ]
@@ -6214,7 +6355,7 @@ def _contract_reporting_stub(db, principal_id: int, report: dict | None = None):
     двери ни одним тестом не проходился.
     """
 
-    async def _run(prompt: str, *, timeout: int | None = None):
+    async def _run(prompt: str, *, timeout: int | None = None, prompt_at_slot=None):
         from hub.models import MachineReviewSubmit
         from hub.services.machine_review_intake import record_machine_review
 
@@ -7275,3 +7416,2590 @@ async def test_a_sync_refusal_names_the_refusal_not_a_finished_run(
         "не заводится"
     )
     assert "usage_limit_exceeded" in local["second_door_reason"]
+
+
+# --- Закрепление сдачи на отчёте, восстановленном из текста (#1260) ----------
+#
+# record_machine_review умеет отвергать отчёт, выписанный на другое поколение
+# (#1084), но путь восстановления из текста прогона закрепления не передавал:
+# прогон судил сдачу №1, работу пересдали, и отчёт ложился на №2 — отчёт о
+# прежнем диффе читался как отчёт о новом. _store_report одна на облачный и
+# локальный каналы, поэтому оба проверяются поимённо.
+
+
+async def _cloud_report_on_moved_submission(
+    client: AsyncClient, db: aiosqlite.Connection, slug: str
+) -> int:
+    """Облачный заказ на поколении 1; пока прогон шёл, работу пересдали."""
+    task_id = await _submitted(client, db, slug, policy={"review": "dispatch"})
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 2 WHERE id = ?", (task_id,)
+    )
+    await db.commit()
+    return task_id
+
+
+def _gated_reporting_stub(marker) -> str:
+    """Локальная заглушка, которая сдаёт отчёт только после сигнала теста.
+
+    Сигнал — файл: тест пересдаёт работу ПОКА прогон идёт, и лишь потом
+    отпускает его. Без шлюза исход зависел бы от того, кто успеет первым.
+    """
+    payload = json.dumps(_LOCAL_REPORT, ensure_ascii=False)
+    return (
+        "import os, sys, time\n"
+        "sys.stdin.read()\n"
+        "for _ in range(400):\n"
+        f"    if os.path.exists({str(marker)!r}):\n"
+        "        break\n"
+        "    time.sleep(0.05)\n"
+        "print('```haiplane-review')\n"
+        f"print({payload!r})\n"
+        "print('```')\n"
+    )
+
+
+async def _local_report_on_moved_submission(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    monkeypatch,
+    tmp_path,
+    slug: str,
+    *,
+    move: bool = True,
+) -> int:
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    marker = tmp_path / f"{slug}.go"
+    _stub_reviewer(monkeypatch, tmp_path, _gated_reporting_stub(marker))
+    task_id = await _submitted(
+        client,
+        db,
+        slug,
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    if move:
+        await db.execute(
+            "UPDATE tasks SET submission_generation = 2 WHERE id = ?", (task_id,)
+        )
+        await db.commit()
+    marker.write_text("go")
+    await wait_for_local_runs()
+    await db.commit()
+    return task_id
+
+
+async def _reports_by_generation(db: aiosqlite.Connection, task_id: int) -> list[int]:
+    return [
+        len(await repo.machine_reviews_of_generation(db, task_id, generation))
+        for generation in (1, 2)
+    ]
+
+
+def _moved_refusals(updates: list[dict]) -> list[str]:
+    return [
+        u["content"]
+        for u in updates
+        if u["kind"] == "alert"
+        and "выписан на сдачу #1" in u["content"]
+        and "текущая — #2" in u["content"]
+    ]
+
+
+async def test_a_report_from_a_superseded_run_is_not_stamped_on_the_new_submission(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1260): проверяется СОСТОЯНИЕМ — строк отчётов на обоих
+    # поколениях столько же, сколько было до свипа. И свип после отказа
+    # продолжает работу: соседний заказ того же прохода записывается.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-mv"}, "run": {"id": "run-mv"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    moved = await _cloud_report_on_moved_submission(client, db, "spike-moved")
+    steady = await _submitted(client, db, "spike-steady", policy={"review": "dispatch"})
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+    before = await _reports_by_generation(db, moved)
+    dispatches_before = len(
+        await db.execute_fetchall("SELECT id FROM review_dispatches")
+    )
+
+    await sweep_review_dispatches(db)
+
+    assert await _reports_by_generation(db, moved) == before == [0, 0], (
+        "отчёт о прежнем диффе не ложится ни на прежнюю, ни на новую сдачу"
+    )
+    assert len(await repo.machine_reviews_of_generation(db, steady, 1)) == 1, (
+        "свип обязан пережить отказ и записать соседний отчёт"
+    )
+    rows = await db.execute_fetchall(
+        "SELECT status FROM review_dispatches WHERE task_id = ?", (moved,)
+    )
+    assert [dict(r)["status"] for r in rows] == ["failed"], (
+        "строка прогона закрыта, а не висит активной"
+    )
+    assert (
+        len(await db.execute_fetchall("SELECT id FROM review_dispatches"))
+        == dispatches_before
+    ), "за прогон по уехавшей сдаче вторая дверь не покупается"
+
+
+async def test_the_card_names_why_the_recovered_report_was_refused(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1260): отказ виден в карточке названной причиной. Молчание — и
+    # ложное «отчёт НЕ сдан» — критерий не закрывают: отчёт был, но о другом.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-nm"}, "run": {"id": "run-nm"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    task_id = await _cloud_report_on_moved_submission(client, db, "spike-named")
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+
+    await sweep_review_dispatches(db)
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert len(_moved_refusals(updates)) == 1, (
+        f"причина отказа обязана быть в карточке ровно раз: {updates}"
+    )
+    assert not [u for u in updates if "отчёт НЕ сдан" in u["content"]], (
+        "отчёт был сдан — о прежней сдаче; «не сдан» подменило бы причину"
+    )
+    assert not [u for u in updates if "восстановлен из текста" in u["content"]]
+
+
+async def test_both_report_paths_carry_the_submission_pin(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    # AC-3 (#1260): два зовущих _store_report поимённо — облачное
+    # восстановление из текста рана и локальный отчёт из вывода прогона.
+    # Один потребитель правила не доказывает второго.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-bt"}, "run": {"id": "run-bt"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+
+    cloud = await _cloud_report_on_moved_submission(client, db, "spike-pin-cloud")
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+    await sweep_review_dispatches(db)
+
+    local = await _local_report_on_moved_submission(
+        client, db, monkeypatch, tmp_path, "spike-pin-local"
+    )
+
+    for name, task_id in (("облачный", cloud), ("локальный", local)):
+        assert await _reports_by_generation(db, task_id) == [0, 0], (
+            f"{name} путь записал отчёт о прежней сдаче"
+        )
+        updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+        assert len(_moved_refusals(updates)) == 1, (
+            f"{name} путь не назвал отказ в карточке: {updates}"
+        )
+        assert not [
+            u
+            for u in updates
+            if "отчёт НЕ сдан" in u["content"]
+            or "завершилось без отчёта" in u["content"]
+        ], f"{name} путь выдал отказ по поколению за отсутствие отчёта"
+        rows = await db.execute_fetchall(
+            "SELECT status FROM review_dispatches WHERE task_id = ?", (task_id,)
+        )
+        assert [dict(r)["status"] for r in rows] == ["failed"], name
+    local_updates = [dict(u) for u in await repo.get_task_updates(db, local)]
+    assert not [u for u in local_updates if "восстановлен из вывода" in u["content"]], (
+        "локальный путь не выдаёт отказ за восстановление"
+    )
+
+
+async def test_a_matching_generation_is_recorded_on_both_channels(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    # AC-4 (#1260): совпавшее поколение ложится как раньше — с владельцем и
+    # происхождением. Сторож, отказывающий всегда, неотличим от работающего.
+    from hub.services.machine_review_intake import ORIGIN_LOCAL_TEXT, ORIGIN_RUN_TEXT
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ok"}, "run": {"id": "run-ok"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    local_pid = await _local_principal(db, monkeypatch)
+
+    cloud = await _submitted(
+        client, db, "spike-same-cloud", policy={"review": "dispatch"}
+    )
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+    await sweep_review_dispatches(db)
+
+    local = await _local_report_on_moved_submission(
+        client, db, monkeypatch, tmp_path, "spike-same-local", move=False
+    )
+
+    for task_id, owner, origin in (
+        (cloud, cloud_pid, ORIGIN_RUN_TEXT),
+        (local, local_pid, ORIGIN_LOCAL_TEXT),
+    ):
+        rows = [
+            dict(r) for r in await repo.machine_reviews_of_generation(db, task_id, 1)
+        ]
+        assert len(rows) == 1, f"{origin}: отчёт совпавшего поколения не записан"
+        assert rows[0]["principal_id"] == owner, origin
+        assert rows[0]["orchestrator"].startswith(origin), rows[0]["orchestrator"]
+        updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+        assert not _moved_refusals(updates), origin
+        status = await db.execute_fetchall(
+            "SELECT status FROM review_dispatches WHERE task_id = ?", (task_id,)
+        )
+        assert [dict(r)["status"] for r in status] == ["done"], origin
+
+
+# Названные исключения из правила «вызывающий record_machine_review передаёт
+# закрепление». Ключ — (файл относительно корня, функция-владелец вызова),
+# значение — причина. Пусто сознательно: сегодня исключений нет, и новое
+# обязано прийти сюда с объяснением, а не проскочить молча.
+_INTAKE_PIN_EXCEPTIONS: dict[tuple[str, str], str] = {}
+
+
+def _intake_callers() -> list[tuple[str, str, bool]]:
+    """Все вызовы record_machine_review в hub/, собранные разбором AST.
+
+    Функция-владелец — ближайшая объемлющая def: оба сегодняшних вызова
+    импортируют функцию ЛОКАЛЬНО, из тела, и сторож по импортам верхнего
+    уровня их бы не увидел. Поэтому ищутся сами вызовы, а не импорты.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    found: list[tuple[str, str, bool]] = []
+
+    def _walk(node: ast.AST, owner: str, rel: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                _walk(child, child.name, rel)
+                continue
+            if isinstance(child, ast.Call):
+                func = child.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr
+                    if isinstance(func, ast.Attribute)
+                    else ""
+                )
+                if name == "record_machine_review":
+                    pinned = any(k.arg == "expected_generation" for k in child.keywords)
+                    found.append((rel, owner, pinned))
+            _walk(child, owner, rel)
+
+    for path in sorted((root / "hub").rglob("*.py")):
+        rel = path.relative_to(root).as_posix()
+        _walk(ast.parse(path.read_text(encoding="utf-8")), "<module>", rel)
+    return found
+
+
+def test_every_intake_caller_pins_the_submission_or_is_a_named_exception():
+    # AC-5 (#1260): вызывающие перечисляются разбором исходника, а не списком
+    # из головы. Новый вызывающий роняет тест, а не стареет молча.
+    callers = _intake_callers()
+    owners = {(rel, owner) for rel, owner, _ in callers}
+    assert ("hub/services/review_dispatch.py", "_store_report") in owners, (
+        f"сторож не видит вызова из _store_report — он слеп: {callers}"
+    )
+    assert any(rel == "hub/app.py" for rel, _ in owners), (
+        f"сторож не видит приёма по контракту в hub/app.py: {callers}"
+    )
+    unpinned = [
+        (rel, owner)
+        for rel, owner, pinned in callers
+        if not pinned and (rel, owner) not in _INTAKE_PIN_EXCEPTIONS
+    ]
+    assert not unpinned, (
+        "вызывающий record_machine_review без expected_generation и без "
+        f"названной причины: {unpinned}"
+    )
+    stale = set(_INTAKE_PIN_EXCEPTIONS) - owners
+    assert not stale, f"исключение названо для вызова, которого больше нет: {stale}"
+
+
+# --- #1208: документ выката и охват стражей песочницы -------------------------
+#
+# Найдено ВЫКАТОМ 08.09.2026, а не чтением: развёртывание локального ревьюера
+# по собственному документу #1180 остановилось четырежды. Имена настроек в
+# документе стояли без префикса HAIPLANE_, который подставляет config.env_get,
+# — и это не ломало запуск, а МОЛЧА выключало локальный путь. Рекомендованная
+# строка systemd-run --uid= от непривилегированного хаба не запускалась вовсе.
+# А стражи знали ровно ту форму записи, которой на рабочей конфигурации нет.
+
+_HUB_ROOT = Path(__file__).resolve().parents[1]
+_CONFIG_SOURCE = _HUB_ROOT / "hub/config.py"
+_DEPLOY_DOC = _HUB_ROOT / "deploy/LOCAL-REVIEW.md"
+_ENV_EXAMPLE = _HUB_ROOT / "deploy/local-hub.env.example"
+
+
+def _documented_hub_deadline() -> int:
+    """Хабский срок прогона, КАК ЕГО НАЗЫВАЕТ документ выката.
+
+    Нужен там, где суждение стража зависит от ``LOCAL_REVIEW_TIMEOUT_SEC``:
+    с 10.09.2026 контейнерный ``--timeout`` больше хабского отвергается, и
+    тест, оставивший этот срок на волю окружения, был бы зелёным или красным
+    по чужой переменной, а не по содержанию документа. Значение берётся ИЗ
+    ФАЙЛА — переписанное сюда числом, оно проверяло бы тест, а не документ.
+    """
+    # Число берётся регулярным выражением, а не хвостом строки: то же имя со
+    # значением стоит и внутри таблицы отказов, где за ним идёт разметка.
+    named = re.compile(
+        re.escape(config.brand.ENV_PREFIX + "LOCAL_REVIEW_TIMEOUT_SEC") + r"=(\d+)"
+    )
+    values = [
+        found.group(1)
+        for path in (_ENV_EXAMPLE, _DEPLOY_DOC)
+        for line in path.read_text().splitlines()
+        if (found := named.search(line))
+    ]
+    assert values, (
+        f"в примере окружения и документе не назван {named.pattern} — "
+        "проверка срока была бы привязана к переменной окружения, а не к "
+        "документу"
+    )
+    assert len(set(values)) == 1, (
+        f"документ называет хабский срок по-разному: {values}. Оператор "
+        "скопирует одно из двух, и какое — неизвестно"
+    )
+    return int(values[0])
+
+
+# Строка вида ``Environment=ИМЯ=…``, ``# ИМЯ=…`` или просто ``ИМЯ=…`` — то, что
+# оператор КОПИРУЕТ к себе. Именно она и разошлась с кодом.
+_ASSIGNED = re.compile(r"^\s*(?:#\s*)?(?:Environment=)?([A-Z][A-Z0-9_]*)=")
+# Имя настройки локального ревьюера БЕЗ префикса: \b не срабатывает внутри
+# HAIPLANE_LOCAL_REVIEW…, поэтому лишний lookbehind не нужен.
+_BARE_NAME = re.compile(r"\bLOCAL_REVIEW[A-Z0-9_]*")
+
+
+def _suffixes_read_by_config() -> set[str]:
+    """Суффиксы env_get(...) из ИСХОДНИКА hub/config.py, а не из списка в тесте.
+
+    Список имён, переписанный в тест, — третье описание тех же имён, и оно
+    разойдётся следующим ровно так же, как разошёлся документ.
+    """
+    tree = ast.parse(_CONFIG_SOURCE.read_text())
+    found = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id != "env_get" or not node.args:
+            continue
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            found.add(arg.value)
+    return {name for name in found if name.startswith("LOCAL_REVIEW")}
+
+
+def _names_assigned_in(path: Path) -> set[str]:
+    return {
+        m.group(1)
+        for line in path.read_text().splitlines()
+        if (m := _ASSIGNED.match(line)) and "LOCAL_REVIEW" in m.group(1)
+    }
+
+
+def test_the_deploy_doc_names_the_settings_the_code_reads() -> None:
+    """AC-1: имена в документе сверяются С ИСХОДНИКОМ машиной, а не глазами.
+
+    Расхождение уже случилось один раз и было незаметным ровно потому, что
+    глазами оно не ловится: HAIPLANE_HUB_HOST двумя строками выше в том же
+    файле выглядит так же убедительно, как LOCAL_REVIEW_CMD без префикса.
+    """
+    read_by_code = _suffixes_read_by_config()
+    assert read_by_code, (
+        "разбор hub/config.py не нашёл ни одного env_get с именем "
+        "LOCAL_REVIEW* — сверка была бы пустой и зелёной на любом документе"
+    )
+    expected = {config.brand.ENV_PREFIX + suffix for suffix in read_by_code}
+
+    for path in (_DEPLOY_DOC, _ENV_EXAMPLE):
+        named = _names_assigned_in(path)
+        assert named == expected, (
+            f"{path.name} называет настройки локального ревьюера как "
+            f"{sorted(named)}, а код читает {sorted(expected)}. Разница в "
+            "префиксе не ломает запуск, а МОЛЧА выключает локальный путь: в "
+            "карточке встанет «локальный не настроен» при верной во всём "
+            "остальном конфигурации (найдено выкатом 08.09.2026, #1208)"
+        )
+
+    # Ни одного упоминания без префикса — включая прозу: оператор, который
+    # грепает по имени из текста, обязан найти то же самое имя.
+    for path in (_DEPLOY_DOC, _ENV_EXAMPLE):
+        bare = _BARE_NAME.findall(path.read_text())
+        assert not bare, (
+            f"{path.name} упоминает {sorted(set(bare))} без префикса "
+            f"{config.brand.ENV_PREFIX} — а config.env_get читает только с ним"
+        )
+
+
+# ПЕРЕСМОТР 10.09.2026: закрытый набор форм вместо перечисления флагов.
+#
+# Тесты ниже НЕ выброшены и не ослаблены. Каждый из них кодирует настоящий
+# вход, на котором страж когда-то ошибался, и все девять кругов ошибка шла в
+# одну сторону — ложного ПРОПУСКА. Новое правило отвергает эти входы тем
+# более, поэтому у большинства тестов входы остались прежними, а изменился
+# ПРИГОВОР: там, где прежде проверялось «отвергнут по такому-то флагу»,
+# теперь проверяется «отвергнут, и причина названа». Каждый такой поворот
+# назван в докстроке своего теста поимённо — молча не перевёрнут ни один.
+
+
+def test_every_blessed_sandbox_shape_still_passes(monkeypatch) -> None:
+    """AC-6: рабочая строка прода и обе формы набора проходят стража.
+
+    Строгое правило, отвергающее рабочий выкат, хуже прежнего мягкого,
+    поэтому эта половина проверяется ТЕМ ЖЕ набором тестов, что и AC-5: иначе
+    строгость чинилась бы ценой поломки, и поломка вскрылась бы на проде.
+
+    Строки берутся из ``SANDBOX_SHAPES``, а не переписываются сюда: список,
+    переписанный в тест, — третье описание тех же форм, и оно разойдётся
+    следующим ровно так же, как пять раз расходился документ.
+    """
+    prod = "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run"
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", prod)
+    assert local_reviewer.sandbox_problem() == [], (
+        f"рабочая строка прода отвергнута: {local_reviewer.sandbox_problem()}"
+    )
+    assert local_reviewer.sandbox_uid() == "haiplane-reviewer"
+    assert local_reviewer.sandbox_shape() == "sudo"
+
+    for shape in local_reviewer.SANDBOX_SHAPES:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", shape.example)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"форма «{shape.name}» отвергает собственный пример "
+            f"«{shape.example}»: {local_reviewer.sandbox_problem()}"
+        )
+        assert local_reviewer.sandbox_shape() == shape.name
+        assert local_reviewer.sandbox_uid() == "haiplane-reviewer", (
+            f"в примере формы «{shape.name}» страж не видит пользователя — "
+            "значит проверка его членства в группе каталога прогонов на этой "
+            "конфигурации молча не сработает вовсе, ровно как было до #1208"
+        )
+
+    # Необязательные флаги формы — тоже часть обещания: названный в документе
+    # флаг обязан проходить, иначе документ рекомендует то, что хаб отвергнет.
+    for sandbox in (
+        "/usr/bin/systemd-run --scope --quiet --uid=haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --uid=haiplane-reviewer --slice=review.slice "
+        "--property=MemoryMax=1500M --property=CPUQuota=150% /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --uid haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -n --user haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -n --user=haiplane-reviewer /usr/local/bin/wrap",
+        # Имя инструмента без пути: PATH прогону собирает сам хаб.
+        "sudo -n -u haiplane-reviewer /usr/local/bin/wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"«{sandbox}» состоит из флагов, названных в наборе, и отвергаться "
+            f"не должна: {local_reviewer.sandbox_problem()}"
+        )
+        assert local_reviewer.sandbox_uid() == "haiplane-reviewer"
+
+    # Повтор НАКАПЛИВАЮЩЕГОСЯ флага — не тот повтор, что перекрывает: две
+    # --property у systemd-run складываются, и запрещать их значило бы
+    # отвергать строку с двумя лимитами, то есть рабочий рецепт.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=r --setenv=A=1 --setenv=B=2 /usr/local/bin/wrap",
+    )
+    assert local_reviewer.sandbox_problem() == [], (
+        f"--setenv накапливается, а не перекрывает: {local_reviewer.sandbox_problem()}"
+    )
+
+
+def test_a_sandbox_outside_the_closed_set_is_refused(monkeypatch) -> None:
+    """AC-5: строка вне закрытого набора отвергается с названной причиной.
+
+    Здесь собраны входы, каждый из которых КОГДА-ТО ПРОХОДИЛ стража, а
+    обязан был быть отвергнут, — и входы, которые страж отвергал по частному
+    флагу, а теперь отвергает по правилу. Ни один не выброшен: это
+    накопленное за девять кругов доказательство, и оно переживает смену
+    правила.
+
+    Проверяется ДВА следствия разом. Первое: отказ есть и он назван. Второе:
+    ``sandbox_uid()`` на такой строке пуст — раньше страж отвечал «кто» и про
+    строку, которой не понял, и именно в этих ответах ошибался (имя из
+    аргументов полезной нагрузки, из значения соседнего флага, из первого
+    вхождения повторённого флага).
+    """
+    outside = [
+        # Инструмент, о котором набор не знает вовсе. Прежнее ограничение
+        # «чего не знаем — пропускаем» отменено решением владельца 10.09.2026.
+        "/usr/bin/env",
+        "/usr/bin/env -u HOME /usr/local/bin/wrap",
+        "/bin/sh -c /usr/local/bin/wrap",
+        # Относительное имя со слэшем: «какая-то программа», а не названная.
+        "./sudo -n -u haiplane-reviewer /usr/local/bin/wrap",
+        # Контейнерные движки — целиком, любой подкомандой и с любым сроком.
+        "/usr/bin/podman run --rm -i img",
+        "/usr/bin/podman run --rm -i --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout=1800 img",
+        "/usr/bin/podman ps",
+        "/usr/bin/docker run --rm -i img",
+        "sudo -n -u haiplane-reviewer podman run --timeout 60 img",
+        # Слипшийся короткий токен во всех записях, что находили читатели.
+        "/usr/bin/sudo -nu haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -nuhaiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -uhaiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -niu haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -pu haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u=haiplane-reviewer /usr/local/bin/wrap",
+        # Повтор перекрывающего флага: инструмент возьмёт последнее вхождение,
+        # читатель глазами — первое, и на этой разнице страж уже ошибался.
+        "/usr/bin/sudo -n -u alice -u bob /usr/local/bin/wrap",
+        "/usr/bin/sudo -n --user alice --user bob /usr/local/bin/wrap",
+        "/usr/bin/sudo -n --user=alice -u bob /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --uid=alice --uid=bob /usr/local/bin/wrap",
+        # Флаг, которого в форме нет.
+        "/usr/bin/sudo -n -u haiplane-reviewer -g haiplane /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --pipe --uid=r /usr/local/bin/wrap",
+        # Терминатор и аргументы полезной нагрузки в самой песочнице.
+        "/usr/bin/systemd-run --scope --uid=alice -- /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u alice -- -u bob",
+        "/usr/bin/systemd-run --scope --uid=alice /wrap --uid=bob",
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap",
+        # Пути к обёртке нет вовсе либо он относительный.
+        "/usr/bin/sudo -n -u haiplane-reviewer",
+        "/usr/bin/sudo -n -u haiplane-reviewer wrap",
+        # Обязательного флага нет: без -n sudo может спросить пароль, а stdin
+        # занят промтом с одноразовым кодом доступа к хабу.
+        "/usr/bin/sudo -u 1234 /usr/local/bin/wrap",
+        "/usr/bin/sudo /usr/local/bin/wrap",
+        # Пользователь не назван вовсе — запуск шёл бы от самого хаба.
+        "/usr/bin/sudo -n /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u  /usr/local/bin/wrap",
+        # Флаг есть, значения нет: «флага нет» и «флаг пуст» — разные отказы,
+        # и чинятся они по-разному.
+        "/usr/bin/systemd-run --scope --uid= /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u",
+        # И наоборот: значение написано флагу, который его не берёт.
+        "/usr/bin/systemd-run --scope=1 --uid=r /usr/local/bin/wrap",
+        # Одинокий дефис позиционным путём не является.
+        "/usr/bin/sudo -n -u r -",
+    ]
+    for sandbox in outside:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons, (
+            f"«{sandbox}» не совпадает ни с одной формой закрытого набора, а "
+            "хаб пропустил её молча. Пустой список здесь означает «посмотрел "
+            "и одобрил» — то есть ровно ту ошибку в сторону пропуска, из-за "
+            "которой правило и переписано"
+        )
+        assert all(r.startswith("LOCAL_REVIEW_SANDBOX:") for r in reasons), (
+            f"отказ обязан называть НАСТРОЙКУ, которую чинить: {reasons}"
+        )
+        assert all("deploy/LOCAL-REVIEW.md" in r for r in reasons), (
+            f"отказ обязан указывать на документ, где набор форм назван: {reasons}"
+        )
+        assert local_reviewer.sandbox_uid() == "", (
+            f"на отвергнутой строке «{sandbox}» страж назвал пользователя "
+            f"«{local_reviewer.sandbox_uid()}». Прогона не будет, и судить о "
+            "членстве в группе каталога прогонов не о чем — а имя, названное "
+            "по непрочитанной строке, и есть источник всех девяти кругов"
+        )
+        assert local_reviewer.sandbox_shape() == ""
+
+    # Пустая настройка второй причиной не шумит: её называет not_ready()
+    # отдельной строкой, и повторять то же самое другими словами — это
+    # два разных имени одной поломки в одной карточке.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "")
+    assert local_reviewer.sandbox_problem() == []
+
+
+def test_the_guard_reads_the_sudo_form_of_the_sandbox_user(monkeypatch) -> None:
+    """AC-2: форма sudo видна стражу так же, как --uid= от systemd-run.
+
+    Рабочий рецепт выката использует ``sudo -n -u haiplane-reviewer``, а
+    страж знал только ``--uid``. Он возвращал пустую строку, и проверка
+    членства в группе каталога прогонов (заведённая ради находки ревью
+    45971e09) на этой конфигурации не срабатывала ВОВСЕ — то есть создавала
+    впечатление проверки там, где её нет.
+
+    ПОВОРОТ 10.09.2026. Прежняя редакция этого теста держала таблицу «строка
+    → имя пользователя» и на строках ВНЕ набора: ``sudo -nu X`` давало X,
+    ``sudo -u alice -u bob`` — bob. Теперь такие строки не запускаются вовсе,
+    и страж на них молчит; сами строки переехали в
+    test_a_sandbox_outside_the_closed_set_is_refused, где проверяется их
+    отказ. Здесь остались формы, которые набор ПРИНИМАЕТ, — и на них ответ
+    обязан быть точным, потому что по нему судится доступ к каталогу.
+    """
+    cases = {
+        # Три формы записи пользователя у sudo, названные в AC-2.
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/sudo -n --user haiplane-reviewer /usr/local/bin/wrap": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/sudo -n --user=haiplane-reviewer /usr/local/bin/wrap": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/sudo -n -u 1234 /usr/local/bin/wrap": "1234",
+        # Старая форма НЕ сломана — иначе починено одно ценой другого.
+        "/usr/bin/systemd-run --scope --uid=haiplane-reviewer /usr/local/bin/wrap": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/systemd-run --scope --uid haiplane-reviewer /usr/local/bin/wrap": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/systemd-run --scope --uid=65534 /usr/local/bin/wrap": "65534",
+    }
+    for sandbox, expected in cases.items():
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"«{sandbox}» — форма из набора, и отвергаться она не должна: "
+            f"{local_reviewer.sandbox_problem()}"
+        )
+        assert local_reviewer.sandbox_uid() == expected, (
+            f"песочница «{sandbox}» называет пользователя «{expected}», а "
+            f"страж вернул «{local_reviewer.sandbox_uid()}»: пустая строка "
+            "здесь означает, что проверка группы каталога прогонов молча не "
+            "сработает вовсе"
+        )
+
+
+def test_the_user_guard_reads_only_the_wrappers_own_arguments(monkeypatch) -> None:
+    """Имя пользователя не берётся из аргументов полезной нагрузки.
+
+    Воспроизведено на HEAD 21629cde до починки — обе формы давали чужой
+    ответ: ``sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap`` давало
+    ``HOME`` (находка 64e89a8683b01db1), а ``systemd-run --scope --uid=alice
+    -- /bin/true --uid=bob`` — ``bob`` (находка d228b0eb3310a9cc). Следствие
+    названо: ``scratch_problem`` судил членство в группе каталога прогонов у
+    пользователя, которого в строке нет вовсе.
+
+    ПОВОРОТ 10.09.2026. Прежде тест требовал, чтобы на таких строках страж
+    называл ПРАВИЛЬНОЕ имя. Теперь у песочницы аргументов полезной нагрузки
+    не бывает вовсе: их дописывает сам хаб из LOCAL_REVIEW_CMD, а форма
+    кончается путём к обёртке. Поэтому те же входы обязаны быть ОТВЕРГНУТЫ, а
+    имя — не называться вообще: ответ по строке, которую хаб не запустит,
+    никому не нужен, а именно такие ответы девять кругов и были неверны.
+    """
+    for sandbox in (
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap",
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/bin/env -u HOME -u PATH /wrap",
+        "/usr/bin/systemd-run --scope --uid=alice -- /bin/true --uid=bob",
+        "/usr/bin/systemd-run --scope --uid alice -- /wrap --uid bob",
+        "/usr/bin/systemd-run --scope --uid=alice /wrap --uid=bob",
+        "/usr/bin/sudo -n -u alice -- -u bob",
+        "/usr/bin/systemd-run --scope --uid=alice -- --uid=bob",
+        "/usr/bin/sudo -n /wrap --uid=bob",
+        "/usr/bin/sudo -n /usr/bin/env -u HOME /wrap",
+        "/usr/bin/sudo -n -u alice -u bob /wrap --user carol",
+        "/usr/bin/sudo -n /wrap podman run --timeout 60 --user 1000 img",
+        "/usr/bin/sudo -nu haiplane-reviewer /usr/bin/env -u HOME /wrap",
+        # --user за podman/docker — пользователь ВНУТРИ контейнера, а не на
+        # хосте: принять его за хостового значило бы проверить членство в
+        # группе каталога совсем не того пользователя.
+        "/usr/bin/podman run --rm -i --timeout 60 --user 1000 img",
+        "/usr/bin/docker run --user haiplane-reviewer img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem(), (
+            f"«{sandbox}» несёт аргументы полезной нагрузки прямо в песочнице "
+            "— форма набора кончается путём к обёртке, и разбирать чужие "
+            "флаги хаб не обязан и не берётся"
+        )
+        assert local_reviewer.sandbox_uid() == "", (
+            f"в отвергнутой строке «{sandbox}» страж назвал "
+            f"«{local_reviewer.sandbox_uid()}»: имя из аргументов полезной "
+            "нагрузки означает, что членство в группе каталога прогонов "
+            "проверяется НЕ У ТОГО пользователя"
+        )
+
+
+def test_the_scope_flag_is_read_only_from_systemd_runs_own_arguments(
+    monkeypatch,
+) -> None:
+    """``--scope`` засчитывается только как СОБСТВЕННЫЙ флаг обёртки.
+
+    Отказ уходил В СТОРОНУ ПРОПУСКА: страж искал ``--scope`` во всей строке,
+    и ``--scope`` полезной нагрузки снимал отказ, хотя transient service от
+    этого в scope не превращается. Воспроизведено на HEAD 21629cde: строка
+    ``systemd-run --quiet --pipe --uid=x -- /wrap --scope`` возвращала ``[]``
+    (находка 3d5938a9a645c39d).
+
+    Отказ по НЕДОСТАЮЩЕМУ ОБЯЗАТЕЛЬНОМУ флагу идёт первым — раньше любого
+    другого: оператору важнее узнать, что он забыл ``--scope``, чем что хаб
+    не принимает ``--pipe``. Иначе он чинил бы по одному незнакомому флагу за
+    круг, так и не увидев главного.
+    """
+    for hidden in (
+        "/usr/bin/systemd-run --quiet --pipe --uid=x -- /wrap --scope",
+        "/usr/bin/systemd-run --quiet --uid=x /wrap --scope",
+        "/usr/bin/systemd-run --uid=x -- /usr/bin/env SCOPE=1 /wrap --scope",
+        "/usr/bin/systemd-run --quiet --pipe --uid=haiplane-reviewer --",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", hidden)
+        reasons = local_reviewer.sandbox_problem()
+        # Подстроки «--scope» мало: она стоит и в ИМЕНИ формы, поэтому её
+        # находит любой другой отказ этой же формы. Найдено мутацией
+        # 10.09.2026: «if missing:» -> «if False:» оставляла тест зелёным,
+        # потому что отказ по терминатору называет форму «systemd-run
+        # --scope». Отказ обязан называть ПРИЧИНУ, а она одна — transient
+        # service, переживающий снятие прогона.
+        assert reasons and all(
+            "--scope" in r and "transient service" in r for r in reasons
+        ), (
+            f"«{hidden}» — systemd-run БЕЗ --scope: ``--scope`` здесь стоит "
+            "среди аргументов полезной нагрузки и transient service в scope "
+            f"не превращает, а страж пропустил запуск молча: {reasons}"
+        )
+
+    # Собственный ``--scope`` обёртки по-прежнему снимает этот отказ — иначе
+    # рабочая форма из #1180 оказалась бы сломана.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=x /usr/local/bin/wrap",
+    )
+    assert local_reviewer.sandbox_problem() == [], (
+        "«systemd-run --scope --uid=x /usr/local/bin/wrap» называет --scope "
+        f"собственным флагом: {local_reviewer.sandbox_problem()}"
+    )
+
+
+def test_a_non_run_engine_call_does_not_hide_a_later_run(monkeypatch) -> None:
+    """Движок отвергается любой подкомандой, а не только на ``run``.
+
+    Отказ уходил В СТОРОНУ ПРОПУСКА: страж возвращал «движка нет» на первом
+    же ``podman``, за которым не стоит ``run``, и настоящий запуск правее
+    оставался невидимым. Воспроизведено на HEAD 21629cde:
+    ``podman ps /usr/bin/podman run --timeout 0 img`` давало ``[]``, тогда
+    как одиночный ``podman run --timeout 0`` отвергался (находка
+    96144e6317c1d7ac).
+
+    ПОВОРОТ 10.09.2026: искать подкоманду больше не нужно вовсе. Движок в
+    закрытый набор форм не входит, и ``podman ps`` отвергается ровно так же,
+    как ``podman run``, — вопрос «а не спрятан ли запуск правее» просто
+    перестал существовать. Прежняя редакция теста ждала на ``podman ps``
+    пустого списка, то есть ОДОБРЕНИЯ; это и есть поворот, и он назван.
+    """
+    for sandbox in (
+        "/usr/bin/podman ps /usr/bin/podman run --timeout 0 img",
+        "/usr/bin/podman version /usr/bin/podman run --rm -i img",
+        "/usr/bin/docker ps /usr/bin/docker run --rm -i img",
+        "/usr/bin/podman ps",
+        "/usr/bin/podman ps /usr/bin/podman version",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem(), (
+            f"«{sandbox}» начинается с контейнерного движка, а он в набор "
+            "форм не входит ни одной подкомандой: пропустить его значит "
+            "разрешить прогон, который снять нельзя"
+        )
+
+
+def test_a_container_launch_without_its_own_deadline_is_refused(monkeypatch) -> None:
+    """AC-3: контейнерный запуск отвергнут, и отказ называет НЕДОСТАЮЩИЙ ФЛАГ.
+
+    Требование «прямой потомок хаба» для контейнеров недостижимо: измерено
+    08.09.2026 — podman run переживает kill -KILL по группе, через 7 с
+    контейнер «Up», потому что conmon отсоединён от клиента намеренно. Зато
+    с --timeout 5 контейнер умирает сам (через 12 с живых нет).
+
+    ПОВОРОТ 10.09.2026. Прежде отсюда следовало «потомок ИЛИ свой срок», и
+    хаб разбирал строку podman до образа, чтобы этот срок найти. Разбор и дал
+    шесть находок из пятнадцати, все — в сторону пропуска. Теперь
+    контейнерный запуск отвергается ЦЕЛИКОМ, а срок жизни переехал внутрь
+    root-ового враппера, где флаги зафиксированы и sudoers не допускает
+    подстановок. Отказ по-прежнему обязан называть НЕДОСТАЮЩИЙ ФЛАГ, а не
+    «песочница неверна»: оператору нужно знать, что во враппере обязан стоять
+    ``--timeout``, и что у docker такого флага нет вовсе.
+
+    Строки со сроком жизни (``--timeout 1800``), которые прежняя редакция
+    теста требовала ПРИНИМАТЬ, теперь отвергаются вместе с остальными — и
+    это тот самый поворот. Ни одна из них не выброшена: они стоят здесь же,
+    ниже, и проверяются на отказ.
+    """
+    containers = [
+        "/usr/bin/podman run --rm -i img",
+        "/usr/bin/podman run --rm -i --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout=1800 img",
+        "/usr/bin/podman run --rm -i -m 1500m --cpus 1.5 --pids-limit 512 "
+        "--env-file /etc/haiplane-review/env --network none --timeout 1800 img",
+        "/usr/bin/podman --log-level debug run --rm -i --timeout 1800 img",
+        "/usr/bin/podman --url unix:///run/x run --rm -i --timeout 1800 img",
+        "/usr/bin/podman run --rm -i img cursor-agent --timeout 60",
+        "/usr/bin/podman run --rm -i img agent --timeout=60",
+        "/usr/bin/podman --log-level debug run --rm -i img",
+        "/usr/bin/podman -c remote run --rm -i img",
+        "/usr/bin/podman run --rm -i --timeout 0 img",
+        "/usr/bin/podman run --rm -i --timeout=0 img",
+        "/usr/bin/podman run --rm -i --timeout 00 img",
+        "/usr/bin/podman run --rm -i --timeout abc img",
+        "/usr/bin/podman run --rm -i --timeout",
+        "/usr/bin/podman run --rm -i --timeout 1 img",
+        "/usr/bin/podman run --rm -i --timeout 1800 --timeout 0 img",
+        "/usr/bin/podman run --rm -i --timeout=1800 --timeout=0 img",
+        "/usr/bin/podman run --rm -i --timeout 1800 --timeout abc img",
+        "/usr/bin/podman run --rm -i --timeout 1800 --timeout 5 --timeout 0 img",
+        "/usr/bin/podman run --rm -i --timeout 0 --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout abc --timeout=1800 img",
+    ]
+    for sandbox in containers:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons and all("--timeout" in r for r in reasons), (
+            f"«{sandbox}» — контейнерный запуск: отказ обязан назвать флаг, "
+            f"без которого контейнер переживёт снятие прогона: {reasons}"
+        )
+
+    # У docker штатного аналога --timeout нет вовсе, и отказ обязан сказать,
+    # ЧЕМ его заменить, а не просто «нельзя».
+    for sandbox in (
+        "/usr/bin/docker run --rm -i --timeout 60 img",
+        "/usr/bin/docker run --rm -i img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons and any("docker" in r and "podman" in r for r in reasons), (
+            f"docker run обязан быть отвергнут с названной заменой: {reasons}"
+        )
+
+    # Старое требование не ослаблено: systemd-run без --scope — прежний отказ,
+    # и назван по-прежнему недостающий флаг.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/systemd-run --quiet --pipe --uid=x --"
+    )
+    reasons = local_reviewer.sandbox_problem()
+    assert reasons and all(
+        "--scope" in r and "transient service" in r for r in reasons
+    ), f"systemd-run без --scope остаётся отказом: {reasons}"
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=x /usr/local/bin/wrap",
+    )
+    assert local_reviewer.sandbox_problem() == []
+
+
+def test_a_detached_container_launch_is_refused_by_flag(monkeypatch) -> None:
+    """Отсоединённый запуск — отказ, и ``--timeout`` его не снимал никогда.
+
+    Найдено ревьюером Codex 10.09.2026, воспроизведено на 5b7b813::
+
+        podman run -d --timeout 1800 img        -> []       # пропуск
+        podman run --detach --timeout=1800 img  -> []       # пропуск
+        podman run --rm -i img                  -> ОТКАЗ    # правильно
+
+    ``-d`` заставляет клиента podman вернуть управление НЕМЕДЛЕННО: хаб
+    видит завершившийся процесс, закрывает прогон как законченный и может
+    снести его каталог, а ревьюер внутри контейнера продолжает работать и
+    способен прислать отчёт по уже закрытому прогону.
+
+    ПОВОРОТ 10.09.2026. Прежде тест держал две половины: отсоединённые строки
+    отвергнуть, «передний план» (``--detach=false``, ``-d=false``, ``-it``)
+    принять — иначе починка была бы оплачена ложным отказом. Теперь
+    отвергаются ОБЕ половины, потому что отвергается движок целиком, и
+    ложного отказа тут нет: строка не «плоха», она вне набора, и починка
+    названа — тот же podman внутри враппера. Важное осталось: отказ НЕ
+    ВЫДУМЫВАЕТ отсоединения там, где его нет. ``--detach=false`` — это
+    передний план, и обвинять строку в ``-d`` было бы ложью о ней.
+    """
+    detached = [
+        "/usr/bin/podman run -d --timeout 1800 img",
+        "/usr/bin/podman run --detach --timeout=1800 img",
+        "/usr/bin/podman run --rm -i -d --timeout 1800 img",
+        "/usr/bin/podman run -itd --timeout 1800 img",
+        "/usr/bin/podman run -dt --read-only --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --detach=true --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --detach=false -d --timeout 1800 img",
+    ]
+    foreground = [
+        "/usr/bin/podman run --rm -i --timeout 1800 img",
+        "/usr/bin/podman run --rm -it --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --detach=false --timeout 1800 img",
+        "/usr/bin/podman run --rm -i -d=false --timeout 1800 img",
+        "/usr/bin/podman run --rm -i -d --detach=false --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout 1800 img agent -d",
+    ]
+    for sandbox in detached + foreground:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem(), (
+            f"«{sandbox}» — контейнерный запуск, и в набор форм он не входит"
+        )
+
+    for sandbox in foreground:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert not any("отсоедин" in r and "«-d»" in r for r in reasons), (
+            f"«{sandbox}» идёт на переднем плане, и обвинять её в -d значит "
+            f"назвать оператору причину, которой в строке нет: {reasons}"
+        )
+
+
+def test_a_container_deadline_may_not_outlive_the_hubs(monkeypatch) -> None:
+    """Срок контейнера в песочнице не судится вовсе — контейнера там нет.
+
+    Найдено ревьюером Codex 10.09.2026, воспроизведено на 5b7b813:
+    ``podman run --rm -i --timeout 3600 img`` при хабских 1800 проходило
+    молча, хотя контейнер переживает снятие прогона ровно так же, как без
+    ``--timeout`` вовсе, — только тише.
+
+    ПОВОРОТ 10.09.2026. Правило «не больше хабского» держалось на разборе
+    чужой командной строки и на сравнении с числом, по которому прогон
+    снимут. Обе опоры ушли вместе с контейнерами: приговор этому классу
+    строк теперь ОДИН и от ``LOCAL_REVIEW_TIMEOUT_SEC`` не зависит вовсе.
+    Это и проверяется — иначе поворот был бы заявлен, а не измерен. Сам срок
+    жизни контейнера никуда не делся: он стоит во враппере, равен хабскому и
+    держится тестами документа (test_the_doc_wrapper_deadline_follows_the_conf_file).
+    """
+    verdicts = set()
+    for deadline in (1800, 7200):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", deadline)
+        for sandbox in (
+            "/usr/bin/podman run --rm -i --timeout 3600 img",
+            "/usr/bin/podman run --rm -i --timeout=1801 img",
+            "/usr/bin/podman run --rm -i --timeout 1800 --timeout 7200 img",
+            "/usr/bin/podman run --rm -i --timeout 1800 img",
+            "/usr/bin/podman run --rm -i --timeout 60 img",
+            "/usr/bin/podman run --rm -i --timeout 7200 --timeout 900 img",
+            "/usr/bin/podman run --rm -i --timeout 7201 img",
+        ):
+            monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+            reasons = local_reviewer.sandbox_problem()
+            assert reasons, f"«{sandbox}» — контейнерный запуск, и он отвергнут"
+            verdicts.add((sandbox, tuple(reasons)))
+
+    assert len({sandbox for sandbox, _ in verdicts}) == len(verdicts), (
+        "приговор одной и той же строке разошёлся на разном хабском сроке — "
+        "значит суждение всё ещё зависит от LOCAL_REVIEW_TIMEOUT_SEC, а "
+        "зависеть ему больше не от чего"
+    )
+
+
+def test_the_run_guard_refuses_the_string_it_cannot_parse(monkeypatch) -> None:
+    """Строка, которую страж не может прочитать целиком, — отказ, а не «ок».
+
+    Воспроизведено на ff617db (найдено ревьюером Codex 10.09.2026)::
+
+        podman run --timeout 60 --blkio-weight 500 --timeout 0 img
+        detaching_sandbox() -> []            # пропуск
+
+    ``--blkio-weight`` не был назван в списке флагов со значением, поэтому
+    ``500`` принято за имя образа, разбор кончился, и ВТОРОЙ ``--timeout 0``
+    остался невиден. У podman действующим будет последний, то есть ноль, то
+    есть срока жизни нет.
+
+    ПОВОРОТ 10.09.2026: списка флагов podman у хаба больше нет, и угадывать
+    нечего — движок не входит в набор форм. Правило, ради которого тест
+    написан, стало ШИРЕ: страж отвергает всё, что не прочитал целиком, а не
+    только то, о чём успел вынести суждение. Поэтому здесь же проверяются
+    строки, которые прежняя редакция ПРИНИМАЛА как «однозначные»
+    (``--blkio-weight=500``, ``-itq``): они тоже вне набора.
+    """
+    for sandbox in (
+        "/usr/bin/podman run --timeout 60 --blkio-weight 500 --timeout 0 img",
+        "/usr/bin/podman run --blkio-weight 500 --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --blkio-weight 500 img",
+        "/usr/bin/podman run --rm -i --blkio-weight=500 --timeout=1800 img",
+        "/usr/bin/podman run --rm -it --privileged --timeout 1800 img",
+        "/usr/bin/podman run -itq --read-only --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout 1800 img cursor-agent --blkio-weight 5",
+        # Тот же класс в форме, которую набор ЗНАЕТ по инструменту: флаг, о
+        # котором форма не договаривалась, отвергается по имени.
+        "/usr/bin/systemd-run --scope --uid=r --blkio-weight=500 /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u r --blkio-weight=500 /usr/local/bin/wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons, (
+            f"«{sandbox}» страж прочитать целиком не может. Пустой список "
+            "здесь означает «посмотрел и одобрил» — то есть контейнер без "
+            "срока жизни пройдёт молча"
+        )
+
+    # Флаг, которого форма не знает, назван в отказе ПО ИМЕНИ: иначе
+    # оператору не видно, что убирать.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=r --blkio-weight=500 /usr/local/bin/wrap",
+    )
+    assert any("--blkio-weight" in r for r in local_reviewer.sandbox_problem()), (
+        "отказ обязан НАЗВАТЬ флаг, которого форма не знает: "
+        f"{local_reviewer.sandbox_problem()}"
+    )
+
+
+def test_the_unknown_flag_refusal_advises_a_form_podman_has(monkeypatch) -> None:
+    """Отказ советует починку, КОТОРАЯ РАБОТАЕТ, — и это проверяется запуском.
+
+    Один шаблон на обе формы флага советовал невозможное: на коротком токене
+    он предлагал ``-p80:80=<значение>`` — записи, которой у podman нет вовсе
+    (pflag разберёт ``-p80:80=x`` как значение ``80:80=x`` у ``-p``), и
+    оператор, сделавший ровно то, что сказано, получал тот же отказ.
+
+    ПОВОРОТ 10.09.2026: советовать форму записи флага podman хаб больше не
+    берётся — он не разбирает podman вовсе. Обещание осталось прежним и стало
+    проверяемым строже: КАЖДЫЙ отказ называет починку, и починка приводит к
+    строке, которую хаб принимает. Здесь это проверяется исполнением, а не
+    чтением: сделали, как сказано, — прогнали через стража.
+    """
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/podman run --rm -p80:80 --timeout 1800 img",
+    )
+    reasons = local_reviewer.sandbox_problem()
+    assert reasons, "неизвестный короткий флаг обязан давать отказ"
+    assert not any("-p80:80=<значение>" in r for r in reasons), (
+        "отказ советует дописать «=<значение>» к целому короткому токену — "
+        f"записи, которой у podman нет: {reasons}"
+    )
+    assert all("sudo -n -u" in r for r in reasons), (
+        f"отказ обязан назвать форму, к которой оператору идти: {reasons}"
+    )
+
+    # Починка, названная в отказе, ИСПОЛНЯЕТСЯ и приводит к принятой строке.
+    fixed = "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run"
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", fixed)
+    assert local_reviewer.sandbox_problem() == [], (
+        f"страж советует форму, которую сам же отвергает: "
+        f"{local_reviewer.sandbox_problem()}"
+    )
+
+    # То же обещание на слипшемся токене: сказано «напишите отдельными
+    # токенами» — делаем так и получаем принятую строку.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/sudo -nu r /usr/local/bin/wrap"
+    )
+    bundled = local_reviewer.sandbox_problem()
+    assert bundled and all("отдельным токеном" in r for r in bundled), (
+        f"отказ на слипшемся токене обязан назвать починку: {bundled}"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/sudo -n -u r /usr/local/bin/wrap"
+    )
+    assert local_reviewer.sandbox_problem() == [], (
+        f"починка, названная в отказе, не работает: {local_reviewer.sandbox_problem()}"
+    )
+
+
+def test_a_consumed_value_does_not_pass_for_the_scope_flag(monkeypatch) -> None:
+    """``--scope``, съеденный как ЗНАЧЕНИЕ соседа, флагом ``--scope`` не является.
+
+    Неразрешённая 5a59af8d620685d0 машинного ревью #371. Воспроизведено на
+    ff617db и на HEAD 149cd825::
+
+        systemd-run --description --scope --uid=haiplane-reviewer /wrap
+        окно -> ['--description', '--scope', '--uid=haiplane-reviewer']
+        detaching_sandbox() -> []            # пропуск
+
+    Настоящий systemd-run возьмёт ``--scope`` описанием и поднимет transient
+    SERVICE, то есть ровно то, ради чего отказ и написан. Ошибка шла В
+    СТОРОНУ ПРОПУСКА.
+
+    Возражение опровергателя («рекомендованный рецепт — sudo-враппер, а не
+    systemd-run») отклонено и здесь: страж существует не для рекомендованной
+    строки, а для той, которую напишет оператор, — рекомендованную проверять
+    было бы незачем. И systemd-run --scope остаётся формой набора.
+    """
+    for sandbox in (
+        "/usr/bin/systemd-run --description --scope --uid=r /wrap",
+        "/usr/bin/systemd-run --unit --scope --uid=r /wrap",
+        "/usr/bin/systemd-run --slice --scope -- /wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons and all(
+            "--scope" in r and "transient service" in r for r in reasons
+        ), (
+            f"в «{sandbox}» слово «--scope» стоит ЗНАЧЕНИЕМ соседнего флага, "
+            "а не флагом. systemd-run поднимет transient service, который "
+            f"переживёт снятие прогона: {reasons}"
+        )
+
+    # А рабочие формы, где --scope настоящий, приниматься не перестали:
+    # починка не оплачена ложным отказом (возражение опровергателя учтено).
+    for fine in (
+        "/usr/bin/systemd-run --description=review --scope --uid=r /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --description review --uid=r /usr/local/bin/wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", fine)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"«{fine}» называет --scope собственным флагом systemd-run: "
+            f"{local_reviewer.sandbox_problem()}"
+        )
+
+    # Та же поправка на пользователе: имя берётся у флага, а не у соседа.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/sudo --prompt -u alice /wrap"
+    )
+    assert local_reviewer.sandbox_uid() == "", (
+        "«-u» здесь съедено значением --prompt, и пользователя строка не "
+        f"называет вовсе; страж назвал «{local_reviewer.sandbox_uid()}»"
+    )
+
+
+def test_the_run_options_end_at_the_double_dash(monkeypatch) -> None:
+    """``--`` в песочнице не принимается — ни у движка, ни у формы набора.
+
+    Неразрешённая a58d77e268b2d709 машинного ревью #371. Воспроизведено на
+    ff617db и на HEAD 149cd825::
+
+        podman run -- --timeout 1800 img
+        окно флагов -> [('--', None), ('--timeout', '1800')]
+        detaching_sandbox() -> []            # пропуск
+
+    Для podman образ здесь — ``--timeout``, а ``1800`` и ``img`` уже команда
+    внутри контейнера: собственного срока жизни у запуска НЕТ. Страж же
+    находил ``--timeout 1800`` и засчитывал срок, ошибаясь В СТОРОНУ
+    ПРОПУСКА. Хуже того, прошлый круг числил ``--`` среди беззначных флагов,
+    то есть отказ по неизвестному флагу на этой строке заведомо не срабатывал.
+
+    ПОВОРОТ 10.09.2026: терминатор не принимается ни в одной форме набора —
+    за флагами стоит ровно один аргумент, путь к обёртке, и отделять от него
+    нечего. Класс дефектов «что считается за ``--``» закрыт целиком, а не
+    разобран правильнее.
+    """
+    for sandbox in (
+        "/usr/bin/podman run -- --timeout 1800 img",
+        "/usr/bin/podman run --rm -i -- --timeout 1800 img",
+        "/usr/bin/podman run -- --rm -i img",
+        "/usr/bin/podman run --rm -i --timeout 1800 -- img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem(), (
+            f"в «{sandbox}» всё, что стоит за «--», — это образ и команда "
+            "внутри контейнера. Своего срока жизни у запуска нет, и "
+            "контейнер переживёт снятие прогона"
+        )
+
+    for sandbox in (
+        "/usr/bin/sudo -n -u haiplane-reviewer -- /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --uid=r -- /usr/local/bin/wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons and all("--»" in r for r in reasons), (
+            f"«{sandbox}» пишет терминатор там, где отделять нечего, и отказ "
+            f"обязан назвать именно его: {reasons}"
+        )
+
+
+def test_sudo_names_a_numeric_uid_with_a_hash(monkeypatch, tmp_path) -> None:
+    """``sudo -u '#1000'`` — числовой uid, а не имя, которого нет в системе.
+
+    sudo(8): «The user may be either a user name or a numeric user ID (UID)
+    prefixed with the '#' character». Воспроизведено на ff617db (найдено
+    ревьюером Codex 10.09.2026)::
+
+        sudo -n -u #1000 /usr/local/bin/wrap
+        sandbox_uid() -> '#1000'   _resolve_user('#1000') -> None
+
+    ``'#1000'.isdigit()`` ложно, разбор уходил в ``getpwnam('#1000')`` и падал
+    ВСЕГДА. Отказ шёл в безопасную сторону, но причину называл неверную:
+    оператор читал «пользователь не разрешается в системе» про пользователя,
+    который в системе есть.
+
+    Решётка снимает неоднозначность именно У SUDO: там ``1000`` — это ИМЯ, а
+    ``#1000`` — uid, и обе записи законны. У systemd-run такой формы нет, и
+    принимать её там значит разрешить строку, которую сам systemd-run
+    отвергнет, — поэтому тест держит и это.
+    """
+    import pwd
+
+    me = pwd.getpwuid(os.getuid())
+    uid = me.pw_uid
+
+    # Слипшаяся запись той же решётки в набор форм не входит с 10.09.2026 —
+    # но вход не выброшен: он проверяется на ОТКАЗ, а не на разбор.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -nu#{uid} /usr/local/bin/wrap"
+    )
+    assert local_reviewer.sandbox_problem(), (
+        "слипшийся токен «-nu#N» набор форм не принимает: из одного токена не "
+        "видно, где кончается флаг и начинается значение"
+    )
+
+    # Форма sudo с решёткой разрешается в НАСТОЯЩЕГО пользователя.
+    for sandbox in (
+        f"/usr/bin/sudo -n -u #{uid} /usr/local/bin/wrap",
+        f"/usr/bin/sudo -n --user=#{uid} /usr/local/bin/wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        tool, user = local_reviewer._named_sandbox_user()
+        entry = local_reviewer._resolve_user(user, tool)
+        assert entry is not None and entry.pw_uid == uid, (
+            f"«{sandbox}» называет uid {uid} синтаксисом самого sudo, а страж "
+            f"его не разрешил ({tool!r}, {user!r} -> {entry}): годная "
+            "настройка отвергается, и человеку называется ложная причина"
+        )
+
+    # Различение сохранено: у systemd-run решётки нет, и придумывать её там
+    # нельзя — а голое число он принимает как uid по-прежнему.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/systemd-run --scope --uid=#{uid} /usr/local/bin/wrap",
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    assert local_reviewer._resolve_user(user, tool) is None, (
+        "у systemd-run записи --uid=#N не существует; принять её значило бы "
+        "разрешить строку, на которой запуск упадёт уже внутри systemd-run"
+    )
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/systemd-run --scope --uid={uid} /usr/local/bin/wrap",
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    entry = local_reviewer._resolve_user(user, tool)
+    assert entry is not None and entry.pw_uid == uid, (
+        "числовая форма systemd-run (неразрешённая 534e16e4) не сломана"
+    )
+
+    # И обратная сторона того же правила: у sudo ГОЛОЕ число — это ИМЯ.
+    # Замерено 10.09.2026 на машине разработки, где uid 501 существует и
+    # принадлежит вызывающему::
+    #
+    #     sudo -n -u 501 true    -> «sudo: unknown user 501», rc 1
+    #     sudo -n -u '#501' true -> rc 0
+    #
+    # Значит ``getpwuid`` на такой записи отвечает про пользователя, которого
+    # sudo в строке НЕ ВИДИТ, — и страж одобрял бы песочницу, падающую на
+    # первом запуске. Ревьюер называл только форму с решёткой; эта половина
+    # доделана преемником.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -n -u {uid} /usr/local/bin/wrap"
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    assert (tool, user) == ("sudo", str(uid)), (
+        f"пользователь из «sudo -u {uid}» не извлёкся ({tool!r}, {user!r}) — "
+        "всё, что ниже, судило бы не тот вход"
+    )
+    bare = local_reviewer._resolve_user(user, tool)
+    try:
+        by_name = pwd.getpwnam(str(uid))
+    except KeyError:
+        by_name = None
+    # РАВЕНСТВО, а не «None или имя из цифр». Прежнее утверждение
+    # «bare is None or bare.pw_name == str(uid)» getpwnam от getpwuid не
+    # отличало: на машине, где учётка названа цифрами собственного uid
+    # (обычная запись в образах и в LDAP), обе ветки дают одну и ту же
+    # запись, pw_name == str(uid), и регресс в getpwuid проходил бы
+    # зелёным (неразрешённая ревью #373; проверено на struct_passwd
+    # ('1000', uid 1000) — утверждение True на обеих ветках).
+    assert bare == by_name, (
+        f"«sudo -u {uid}» — это ИМЯ «{uid}», и страж обязан ответить ровно "
+        f"то же, что getpwnam('{uid}') ({by_name}); он ответил {bare}. "
+        "Разрешать голое число через getpwuid значит проверить членство в "
+        "группе у постороннего и объявить настроенной песочницу, на которой "
+        "sudo скажет «unknown user»"
+    )
+
+    # Та же строка, доведённая до САМОГО стража каталога прогонов: прежде эта
+    # половина не проверялась вовсе, и «страж одобрял бы песочницу, падающую
+    # на первом запуске» держалось одним лишь _resolve_user.
+    scratch = tmp_path / "runs"
+    scratch.mkdir()
+    # chown ДО chmod: непривилегированный chown снимает setgid, и каталог
+    # увёл бы scratch_problem() в ветку «нет setgid», где про пользователя не
+    # спрашивают вовсе.
+    os.chown(scratch, -1, me.pw_gid)
+    scratch.chmod(0o2770)
+    assert os.stat(scratch).st_mode & stat.S_ISGID, "каталог без setgid судит другое"
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(scratch))
+    problems = local_reviewer.scratch_problem()
+    if by_name is None:
+        assert problems and all("не разрешается в системе" in p for p in problems), (
+            f"«sudo -u {uid}» называет ИМЯ «{uid}», которого в системе нет. "
+            "Страж обязан назвать это причиной, а не промолчать: молчание "
+            f"здесь — обещание работы, которой не будет ({problems})"
+        )
+        assert any(f"«{uid}»" in p for p in problems), (
+            f"отказ обязан назвать неразрешённого пользователя: {problems}"
+        )
+    else:  # pragma: no cover — учётка, названная цифрами uid, на CI не заводится
+        assert not any("не разрешается в системе" in p for p in problems), (
+            f"пользователь «{uid}» в системе ЕСТЬ, и отказ по разрешению "
+            f"имени был бы ложным: {problems}"
+        )
+    # А у systemd-run голое число uid-ом БЫТЬ ОБЯЗАНО — иначе доделка выше
+    # сломала бы неразрешённую 534e16e4, ради которой числовая форма и заведена.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/systemd-run --scope --uid={uid} /usr/local/bin/wrap",
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    entry = local_reviewer._resolve_user(user, tool)
+    assert entry is not None and entry.pw_uid == uid
+
+    # Имя пользователя по-прежнему разрешается по имени, а мусор с решёткой —
+    # по-прежнему нет: отказ остаётся отказом.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/sudo -n -u {me.pw_name} /usr/local/bin/wrap",
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    assert local_reviewer._resolve_user(user, tool) is not None
+    for junk in ("#", "#abc", "#-1"):
+        monkeypatch.setattr(
+            config,
+            "LOCAL_REVIEW_SANDBOX",
+            f"/usr/bin/sudo -n -u '{junk}' /usr/local/bin/wrap",
+        )
+        tool, user = local_reviewer._named_sandbox_user()
+        assert local_reviewer._resolve_user(user, tool) is None, (
+            f"«{junk}» числовым uid не является, и разрешаться не должен"
+        )
+
+
+def test_the_scratch_check_reaches_the_group_through_a_hash_uid(
+    monkeypatch, tmp_path
+) -> None:
+    """Проверка группы каталога прогонов ДОХОДИТ до существа на форме ``#UID``.
+
+    Отдельный тест, а не хвост предыдущего, по двум причинам. Первая — так
+    видно, ЧТО именно ломается: прямые вызовы ``_resolve_user`` рядом падают
+    первыми и накрывают собой эту проверку. Вторая важнее: прошлая редакция
+    ставила здесь ``LOCAL_REVIEW_SCRATCH_DIR = ""`` и ждала ``[]`` — а
+    ``scratch_problem()`` на пустой настройке возвращает ``[]`` ПЕРВОЙ ЖЕ
+    СТРОКОЙ, не дойдя ни до ``_uid_outside_group``, ни до ``_resolve_user``.
+    Утверждение было верным при любом состоянии кода, то есть не держало
+    ничего; комментарий при нём обещал ровно обратное («scratch_problem зовёт
+    его сам»). Поэтому каталог здесь настоящий.
+
+    Существо: пользователь РАЗРЕШЁН, значит «не смогли проверить» звучать не
+    должно.
+
+    Утверждениями ПОЛОЖИТЕЛЬНЫМИ, а не запретом фразы. Прошлая редакция
+    запрещала здесь только слова «не разрешается в системе» — и оставалась
+    зелёной, когда извлечение пользователя ломалось совсем: при пустом
+    ``user`` ``_uid_outside_group`` возвращает ``[]`` первой же строкой, до
+    ``_resolve_user`` дело не доходит, и запрещать в пустом списке нечего.
+    Замерено на HEAD 684bab0b: подменить ``_named_sandbox_user`` на
+    ``("", "")`` — ``scratch_problem()`` даёт ``[]``, утверждение True
+    (неразрешённая ревью #373). Поэтому тест теперь называет и извлечение, и
+    ОБА исхода сравнения с группой.
+    """
+    import grp
+    import pwd
+
+    me = pwd.getpwuid(os.getuid())
+    uid = me.pw_uid
+    scratch = tmp_path / "runs"
+    scratch.mkdir()
+    # chown ДО chmod: непривилегированный chown снимает setgid.
+    os.chown(scratch, -1, me.pw_gid)
+    scratch.chmod(0o2770)
+    st = os.stat(scratch)
+    assert st.st_mode & stat.S_ISGID, (
+        "каталог без setgid уводит scratch_problem() в ДРУГУЮ ветку, и тест "
+        "снова ничего не проверит — как это уже было с пустой настройкой"
+    )
+    assert st.st_gid == me.pw_gid, "группа каталога не та, о которой судит тест"
+
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(scratch))
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -n -u #{uid} /wrap"
+    )
+
+    # 1. Пользователь ИЗВЛЁКСЯ. Без этого всё ниже вырождается в проверку
+    #    пустого списка, а вырожденный тест хуже отсутствующего: он показывает
+    #    покрытие там, где его нет.
+    assert local_reviewer._named_sandbox_user() == ("sudo", f"#{uid}"), (
+        "форма «-u #UID» не извлеклась из песочницы: "
+        f"{local_reviewer._named_sandbox_user()}"
+    )
+
+    # 2. Группа СВОЯ — путь доходит до сравнения и разрешает. Пустой список
+    #    здесь означает «проверил и допустил», и держит его пункт 1.
+    problems = local_reviewer.scratch_problem()
+    assert problems == [], (
+        f"«sudo -u #{uid}» называет существующего пользователя синтаксисом "
+        "самого sudo, каталог принадлежит его же основной группе — а хаб "
+        f"всё равно нашёл причину: {problems}"
+    )
+
+    # 3. Группа ЧУЖАЯ — тот же путь доходит до сравнения и НАЗЫВАЕТ имена.
+    #    Это и есть утверждение, которого не хватало: если ``#UID`` перестанет
+    #    разрешаться, здесь встанет «не разрешается в системе», а если
+    #    извлечение сломается — пустой список. Оба падают.
+    mine = set(os.getgroups()) | {me.pw_gid}
+    foreign = next(
+        (
+            g
+            for g in grp.getgrall()
+            if g.gr_gid not in mine and me.pw_name not in g.gr_mem
+        ),
+        None,
+    )
+    assert foreign is not None, "на машине не нашлось группы, в которой мы не состоим"
+    outside = local_reviewer._uid_outside_group(str(scratch), foreign.gr_gid)
+    assert len(outside) == 1, (
+        f"членство в чужой группе «{foreign.gr_name}» обязано быть названо "
+        f"причиной, а страж вернул {outside}"
+    )
+    assert "не разрешается в системе" not in outside[0], (
+        f"форма «#{uid}» снова не разрешилась, и оператору называется ложная "
+        f"причина: {outside[0]}"
+    )
+    assert me.pw_name in outside[0] and foreign.gr_name in outside[0], (
+        "отказ обязан назвать И пользователя, И группу — иначе чинить нечего: "
+        f"{outside[0]}"
+    )
+
+
+def _doc_limits_probe() -> str:
+    """Фрагмент пробы лимитов ИЗ ДОКУМЕНТА — от шага 3 до конца блока.
+
+    Берётся текстом из файла, а не переписывается сюда: переписанная проба
+    проверяла бы тест, а не документ.
+    """
+    blocks = [
+        b
+        for b in re.findall(r"```bash\n(.*?)```", _DEPLOY_DOC.read_text(), re.S)
+        if "memory.max" in b
+    ]
+    assert len(blocks) == 1, (
+        f"в {_DEPLOY_DOC.name} ожидался ровно один bash-блок с пробой "
+        f"memory.max, найдено {len(blocks)}"
+    )
+    lines = blocks[0].splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("# 3."))
+    return "\n".join(lines[start:])
+
+
+def test_the_doc_limits_probe_tells_failure_from_success(tmp_path) -> None:
+    """Проба лимитов ОТЛИЧАЕТ отказ движка от успеха, а не читает молчание.
+
+    Прежняя редакция запускала `haiplane-review:latest` — литерал, который
+    абзац «Остальные расхождения» того же документа называет разошедшимся с
+    настоящим именем образа (`localhost/haiplane-reviewer:1`). Образа с таким
+    именем на хосте нет, podman отказывает и НИЧЕГО не печатает, а критерий
+    был написан отрицанием: «не должно быть 'max'». Замерено::
+
+        rc=125, stdout=[] -> слова 'max' нет -> оператор читает УСПЕХ
+
+    То есть проба доказывала лимиты собственным отказом. Здесь она
+    ИСПОЛНЯЕТСЯ с подставным движком, и проверяется ровно то, что чинит
+    находка: четыре исхода — лимиты есть, лимитов нет, ответа нет, проба не
+    запустилась — обязаны звучать ПО-РАЗНОМУ.
+    """
+    probe = _doc_limits_probe()
+    # Судятся ИСПОЛНЯЕМЫЕ строки: комментарий рядом называет старый литерал
+    # именно затем, чтобы его сюда не вернули, и запретом на слово это не
+    # проверить.
+    runnable = "\n".join(
+        line for line in probe.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "haiplane-review:latest" not in runnable, (
+        "проба запускает образ, который этот же документ называет выдуманным "
+        "литералом прежней редакции"
+    )
+    assert "/etc/haiplane-review/image" in runnable, (
+        "образ обязан читаться из того же файла, что читает враппер: литерал "
+        "в пробе уже расходился с настоящим именем образа"
+    )
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "sudo").write_text('#!/bin/sh\n[ "$1" = "-u" ] && shift 2\nexec "$@"\n')
+    imagefile = tmp_path / "image"
+    imagefile.write_text("localhost/haiplane-reviewer:1\n")
+    argv_log = tmp_path / "argv.log"
+
+    engines = {
+        # Образа нет — ровно исход прежней редакции: rc 125, stdout пуст.
+        "отказ движка": '#!/bin/sh\necho "Error: no such image" >&2\nexit 125\n',
+        # Движок отработал, но лимитов нет.
+        "лимитов нет": "#!/bin/sh\necho max\n",
+        # Движок отработал и не напечатал ничего — то же молчание, что у
+        # отказа, но с нулевым кодом.
+        "пустой вывод": "#!/bin/sh\nexit 0\n",
+        # Лимиты применены.
+        "лимиты есть": "#!/bin/sh\necho 1572864000\n",
+    }
+    verdicts: dict[str, str] = {}
+    for label, body in engines.items():
+        podman = bindir / "podman"
+        podman.write_text(
+            body.replace(
+                "#!/bin/sh\n",
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$ARGV_LOG"\n',
+                1,
+            )
+        )
+        for path in (bindir / "sudo", podman):
+            path.chmod(0o755)
+        done = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                probe.replace("/etc/haiplane-review/image", str(imagefile)),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={
+                **os.environ,
+                "PATH": f"{bindir}:{os.environ['PATH']}",
+                "ARGV_LOG": str(argv_log),
+            },
+        )
+        printed = done.stdout.strip()
+        assert printed, (
+            f"на исходе «{label}» проба не сказала НИЧЕГО: оператору нечего "
+            f"прочитать (stderr: {done.stderr!r})"
+        )
+        # Приговор — то, что стоит ДО двоеточия. Сравнивать целые строки
+        # значило бы различать исходы по подставленному числу: мутация,
+        # печатающая на отказе движка «лимиты применены: memory.max=» с
+        # пустым значением, отличалась бы от успеха одним лишь числом и
+        # ВЫЖИЛА (замерено в мутационной серии, M2).
+        verdicts[label] = printed.split(":", 1)[0].strip()
+
+    assert len(set(verdicts.values())) == len(verdicts), (
+        "исходы пробы неразличимы по приговору: оператор не сможет отличить "
+        f"отказ движка от применённых лимитов, читая одно и то же — {verdicts}"
+    )
+
+    # И образ — тот, что лежит в файле, а не зашитый в пробу литерал.
+    seen = argv_log.read_text()
+    assert "localhost/haiplane-reviewer:1" in seen, (
+        f"проба запустила не тот образ, что назван в файле: {seen!r}"
+    )
+
+
+def _doc_table(heading: str) -> list[list[str]]:
+    """Строки таблицы под НАЗВАННЫМ заголовком документа, ячейками.
+
+    Заголовок обязателен: таблиц в документе несколько, и брать «все строки,
+    начинающиеся с | `» значило бы судить таблицу принятых форм правилами
+    таблицы отказов. Пустая выборка — провал теста, а не зелёный прогон: она
+    была бы зелёной при любом содержании документа.
+    """
+    lines = _DEPLOY_DOC.read_text().splitlines()
+    start = next(
+        (i for i, line in enumerate(lines) if line.strip() == heading.strip()), -1
+    )
+    assert start >= 0, f"в {_DEPLOY_DOC.name} нет заголовка «{heading}»"
+    rows: list[list[str]] = []
+    for line in lines[start:]:
+        if line.startswith("## ") or line.startswith("### "):
+            if rows:
+                break
+            continue
+        if line.startswith("| `"):
+            rows.append([cell.strip() for cell in line.strip("|").split("|")])
+    assert rows, f"под «{heading}» не нашлось таблицы — проверка была бы пустой"
+    return rows
+
+
+def _backticked(cell: str) -> str:
+    assert cell.count("`") >= 2, f"в ячейке «{cell}» нет строки в обратных кавычках"
+    return cell.split("`")[1]
+
+
+def test_the_doc_names_the_closed_set_the_guard_accepts(monkeypatch) -> None:
+    """AC-5/AC-6: набор форм в документе — это набор форм В КОДЕ, сверено машиной.
+
+    Расхождение документа с кодом на этой задаче случалось ПЯТЬ раз и глазами
+    не поймалось ни разу: документ рекомендовал `systemd-run --uid=`, который
+    на проде не стартует; советовал `--timeout` «не меньше» хабского, тогда
+    как страж отвергает «больше»; обещал, что незнакомое пропускается, тогда
+    как незнакомый флаг давал отказ. Поэтому сверяется не глазами: имена форм,
+    строки целиком и ОБА списка флагов берутся из таблицы документа и
+    сравниваются с ``SANDBOX_SHAPES``, а каждая строка прогоняется через
+    самого стража.
+    """
+    rows = _doc_table("### Что хаб принимает")
+    shapes = {shape.name: shape for shape in local_reviewer.SANDBOX_SHAPES}
+    documented = {_backticked(row[0]) for row in rows}
+    assert documented == set(shapes), (
+        f"документ называет формы {sorted(documented)}, а код принимает "
+        f"{sorted(shapes)}. Форма, которой нет в одном из двух мест, — это "
+        "либо обещание без кода, либо код без обещания"
+    )
+
+    for row in rows:
+        shape = shapes[_backticked(row[0])]
+        example = _backticked(row[1])
+        assert example == shape.example, (
+            f"документ печатает для формы «{shape.name}» строку «{example}», а "
+            f"код держит «{shape.example}». Оператор скопирует первую"
+        )
+        required = {
+            flag.strip()
+            for cell in row[2].split(",")
+            for flag in cell.replace("`", " ").split("/")
+            if flag.strip().startswith("-")
+        }
+        assert required == {flag for group in shape.required for flag in group}, (
+            f"обязательные флаги формы «{shape.name}»: документ называет "
+            f"{sorted(required)}, код требует "
+            f"{sorted(flag for group in shape.required for flag in group)}"
+        )
+        optional = {
+            flag.strip()
+            for flag in row[3].replace("`", " ").split(",")
+            if flag.strip().startswith("-")
+        }
+        in_code = (shape.valueless | shape.valued) - {
+            flag for group in shape.required for flag in group
+        }
+        assert optional == in_code, (
+            f"необязательные флаги формы «{shape.name}»: документ называет "
+            f"{sorted(optional)}, код принимает {sorted(in_code)}. Флаг, "
+            "названный в документе и не принятый кодом, — это отказ на строке, "
+            "которую документ рекомендует"
+        )
+
+        # И то же самое ИСПОЛНЕНИЕМ: строка из документа прогоняется через
+        # стража и обязана подойти именно той форме, которой её назвали.
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", example)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"документ печатает «{example}» как форму «{shape.name}», а хаб её "
+            f"отвергает: {local_reviewer.sandbox_problem()}"
+        )
+        assert local_reviewer.sandbox_shape() == shape.name
+
+
+def test_the_doc_table_of_refusals_is_what_the_guard_actually_refuses(
+    monkeypatch,
+) -> None:
+    """AC-4, обратная сторона: строки из таблицы ОТКАЗОВ хаб и вправду отвергает.
+
+    Пара к test_the_doc_recommends_only_sandboxes_the_hub_accepts. Документ,
+    обещающий отказ там, где хаб молча пропускает, готовит ровно тот выкат, из
+    которого выросла задача. Строки берутся из таблицы, а не переписываются
+    сюда.
+
+    В таблице стоят НАСТОЯЩИЕ входы, на которых страж когда-то ошибался, —
+    включая те, что прежняя редакция документа обещала ПРИНИМАТЬ (`podman run
+    --timeout 1800`). Смена правила не выбросила ни одного из них: они
+    отвергаются тем более, и документ обязан говорить об этом ровно то же,
+    что делает код.
+    """
+    refused = [_backticked(row[0]) for row in _doc_table("### Что хаб отвергает")]
+    assert len(refused) >= 10, (
+        f"таблица отказов слишком коротка ({len(refused)}): накопленные за "
+        "девять кругов входы обязаны стоять в документе, а не только в тестах"
+    )
+    # Суждение о сроке зависело от хабского, и брать его из окружения значило
+    # бы судить документ по чужой переменной. Приговор от него больше не
+    # зависит, но число в документе и в примере окружения обязано быть одно —
+    # это и проверяет _documented_hub_deadline.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", _documented_hub_deadline())
+
+    for sandbox in refused:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons, (
+            f"документ обещает отказ на «{sandbox}», а хаб пропускает её "
+            "молча: обещание в тексте, которого нет в коде, — это тот же "
+            "выкат, ради которого писан весь документ"
+        )
+        assert local_reviewer.sandbox_uid() == "", (
+            f"на отвергнутой «{sandbox}» страж назвал пользователя "
+            f"«{local_reviewer.sandbox_uid()}»"
+        )
+
+    # Классы, за которыми документ обязан следить поимённо: контейнерный
+    # запуск (отказ называет недостающий --timeout), отсоединённый запуск и
+    # срок ДЛИННЕЕ хабского — все три страж когда-то пропускал молча.
+    assert any("podman" in s and "--timeout" in s for s in refused), (
+        "контейнерный запуск со сроком жизни в таблице не назван, а прежняя "
+        "редакция документа его РЕКОМЕНДОВАЛА"
+    )
+    assert any("-d" in s or "--detach" in s for s in refused), (
+        "отсоединённый запуск в таблице отказов не назван, а он проходил "
+        "стража молча (воспроизведено на 5b7b813)"
+    )
+    assert any("3600" in s for s in refused), (
+        "срок контейнера ДЛИННЕЕ хабского в таблице отказов не назван, а "
+        "документ до 10.09.2026 такой срок прямо СОВЕТОВАЛ («не меньше»)"
+    )
+    assert any("-p80:80" in s for s in refused), (
+        "строка с неизвестным флагом при ЖИВОМ сроке в таблице не названа, а "
+        "именно на ней текст документа расходился с кодом"
+    )
+
+
+def test_the_doc_recommends_only_sandboxes_the_hub_accepts(monkeypatch) -> None:
+    """AC-4: строки песочницы ИЗ ДОКУМЕНТА прогоняются через самих стражей.
+
+    Документ, рекомендующий то, что хаб сам же отклонит, хуже отсутствующего.
+    Строки берутся из файлов, а не переписываются сюда: переписанная строка
+    проверяла бы тест, а не документ.
+    """
+    key = config.brand.ENV_PREFIX + "LOCAL_REVIEW_SANDBOX"
+    # Значение — всё после первого '<ИМЯ>=' в строке.
+    recommended = [
+        line.split(key + "=", 1)[1]
+        for path in (_DEPLOY_DOC, _ENV_EXAMPLE)
+        for line in path.read_text().splitlines()
+        if key + "=" in line
+    ]
+    assert len(recommended) >= 2, (
+        "в документе и примере окружения не нашлось рекомендованных строк "
+        f"{key}= — проверка была бы пустой и зелёной при любом их содержании"
+    )
+
+    for sandbox in recommended:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"документ рекомендует «{sandbox}», а хаб её отвергает: "
+            f"{local_reviewer.sandbox_problem()}"
+        )
+        assert local_reviewer.sandbox_uid(), (
+            f"в рекомендованной строке «{sandbox}» страж не видит "
+            "пользователя — значит проверка его членства в группе каталога "
+            "прогонов на этой конфигурации молча не сработает вовсе, ровно "
+            "как было до #1208"
+        )
+
+
+def test_the_doc_wrapper_carries_the_argv_the_hub_appends(
+    monkeypatch, tmp_path
+) -> None:
+    """Скелет враппера ИЗ ДОКУМЕНТА доносит до движка argv, дописанный хабом.
+
+    Хаб запускает ``shlex.split(SANDBOX) + shlex.split(CMD)``. Враппер без
+    ``"$@"`` этот хвост молча выбрасывает: измерено на прежней редакции
+    скелета — ``haiplane-review-run cursor-agent --print`` доходило до podman
+    строкой БЕЗ ``cursor-agent``, код возврата 0, ни ошибки, ни следа.
+    Запускалось бы то, что зашито в образ, а не то, что стоит в настройке —
+    тот же класс отказа, который чинила задача: не ломает, а тихо подменяет
+    (найдено машинным ревью 09.09.2026, находка 8d363dc407782056).
+
+    Скелет берётся ИЗ ФАЙЛА и ИСПОЛНЯЕТСЯ, а не читается глазами: переписанный
+    в тест, он проверял бы тест, а прочитанный — ничего.
+    """
+    # 1. Хаб действительно дописывает CMD к SANDBOX — это наблюдение, а не
+    #    посылка: на ней держится всё остальное в этом тесте.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/sudo -n -u r /wrap")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "cursor-agent --print")
+    assert local_reviewer.argv() == [
+        "/usr/bin/sudo",
+        "-n",
+        "-u",
+        "r",
+        "/wrap",
+        "cursor-agent",
+        "--print",
+    ], "хаб склеивает песочницу и CMD — если это не так, весь тест ниже мимо"
+
+    # 2. Скелет враппера из документа, с подменённым движком на заглушку,
+    #    печатающую свой argv.
+    blocks = [
+        b
+        for b in re.findall(r"```sh\n(.*?)```", _DEPLOY_DOC.read_text(), re.S)
+        if "podman run" in b
+    ]
+    assert len(blocks) == 1, (
+        f"в {_DEPLOY_DOC.name} ожидался ровно один sh-скелет враппера с "
+        f"podman run, найдено {len(blocks)}"
+    )
+    script = textwrap.dedent(blocks[0])
+    engine = next(
+        tok
+        for tok in shlex.split(script.replace("\\\n", " "))
+        if tok.rsplit("/", 1)[-1] == "podman"
+    )
+    stub = tmp_path / "podman"
+    stub.write_text('#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n')
+    stub.chmod(0o755)
+    wrapper = tmp_path / "haiplane-review-run"
+    wrapper.write_text(script.replace(engine, str(stub)))
+    wrapper.chmod(0o755)
+
+    cmd = ["cursor-agent", "--print", "--model", "grok-4.6"]
+    done = subprocess.run(
+        [str(wrapper), *cmd],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            **os.environ,
+            "HAIPLANE_REVIEW_CONF": str(_wrapper_conf(tmp_path, deadline=None)),
+        },
+    )
+    assert done.returncode == 0, f"скелет враппера не запустился: {done.stderr}"
+    seen = done.stdout.split("\n")
+    assert seen[-1 - len(cmd) : -1] == cmd, (
+        "скелет враппера из документа НЕ донёс до движка argv, который хаб к "
+        f"нему дописал: движок получил {seen[:-1]}, а хвостом обязан был "
+        f'стоять {cmd}. Молча: код возврата 0. Добавьте "$@" последним '
+        "аргументом podman run"
+    )
+
+
+def test_the_doc_probe_runs_the_same_command_the_hub_will_run(monkeypatch) -> None:
+    """Проба песочницы в документе гоняет тот же argv, что и живой запуск.
+
+    Проба, которая запускает враппер голым, проходит и на скелете, молча
+    выбрасывающем argv, — то есть доказывает не то, что проверяет.
+    """
+    key = config.brand.ENV_PREFIX + "LOCAL_REVIEW_SANDBOX"
+    text = _DEPLOY_DOC.read_text()
+    recommended = [
+        line.split(key + "=", 1)[1] for line in text.splitlines() if key + "=" in line
+    ]
+    assert recommended, f"в {_DEPLOY_DOC.name} нет рекомендованной строки {key}="
+    wrapper = shlex.split(recommended[0])[-1]
+
+    probes = [
+        line
+        for block in re.findall(r"```bash\n(.*?)```", text, re.S)
+        for line in block.splitlines()
+        if wrapper in line
+    ]
+    assert probes, (
+        f"в {_DEPLOY_DOC.name} нет пробы, запускающей враппер {wrapper} — "
+        "проверка была бы пустой и зелёной при любом её содержании"
+    )
+    for line in probes:
+        assert "$CMD" in line, (
+            f"проба «{line.strip()}» запускает враппер БЕЗ дописанного argv "
+            "CLI, а хаб запускает песочницу вместе с ним "
+            f"({key[:-7]}CMD). Такая проба пройдёт там, где живой запуск "
+            "пойдёт другой командой"
+        )
+
+
+# Флаги ``podman run``, которые встречаются в СКЕЛЕТЕ ВРАППЕРА из документа.
+# Список живёт здесь, а не в хабе: с 10.09.2026 хаб строку podman не разбирает
+# вовсе — контейнерного запуска нет в закрытом наборе форм песочницы (#1208),
+# а внутрь враппера он не заглядывает по определению. Тесты документа читают
+# скелет сами, и незнакомый флаг для них — ПРОВАЛ разбора, о котором тест
+# кричит, а не угадывает: иначе проверка «--timeout доехал» была бы зелёной на
+# строке, которую тест не понял.
+_WRAPPER_VALUE_FLAGS = frozenset(
+    {
+        "--cpus",
+        "--env-file",
+        "-m",
+        "--memory",
+        "--name",
+        "--net",
+        "--network",
+        "--pids-limit",
+        "--timeout",
+        "--userns",
+        "-v",
+        "--volume",
+    }
+)
+_WRAPPER_VALUELESS_FLAGS = frozenset(
+    {"--init", "-i", "-it", "--read-only", "--replace", "--rm", "-t"}
+)
+
+
+def _wrapper_run_flags(parts: list[str]) -> list[tuple[str, str | None]]:
+    """Флаги самого ``podman run`` из скелета враппера — ДО образа.
+
+    Всё, что стоит после образа, — команда внутри контейнера, и её флаги к
+    запуску отношения не имеют.
+    """
+    assert "run" in parts, f"в строке запуска нет подкоманды run: {parts}"
+    i = parts.index("run")
+    assert parts[i - 1].rsplit("/", 1)[-1] in ("podman", "docker"), (
+        f"«run» стоит не за движком: {parts}"
+    )
+    flags: list[tuple[str, str | None]] = []
+    k = i + 1
+    while k < len(parts) and parts[k].startswith("-"):
+        name, sep, value = parts[k].partition("=")
+        if sep:
+            flags.append((name, value))
+            k += 1
+        elif name in _WRAPPER_VALUE_FLAGS:
+            flags.append((name, parts[k + 1] if k + 1 < len(parts) else None))
+            k += 2
+        else:
+            assert name in _WRAPPER_VALUELESS_FLAGS, (
+                f"скелет враппера содержит флаг «{name}», о котором этот тест "
+                f"не знает, берёт ли тот значение отдельным токеном: {parts}. "
+                "Разбор недостоверен, и судить по нему нельзя"
+            )
+            flags.append((name, None))
+            k += 1
+    return flags
+
+
+def _wrapper_flag(flags: list[tuple[str, str | None]], flag: str) -> str | None:
+    """ДЕЙСТВУЮЩЕЕ значение флага — последнее вхождение, как берёт его pflag."""
+    values = [value for name, value in flags if name == flag]
+    return values[-1] if values else None
+
+
+def _wrapper_conf(tmp_path, *, deadline: int | None) -> Path:
+    """Каталог ``$CONF`` враппера: то, что оператор кладёт в /etc по шагу 3a.
+
+    Скелет читает оттуда образ и срок — сам он их не зашивает, иначе срок ни
+    за какой настройкой не следовал бы (находка 10.09.2026). Файл ``timeout``
+    при ``deadline is None`` НЕ создаётся: это вход «оператор файла не писал»,
+    на котором действует умолчание скелета.
+    """
+    conf = tmp_path / "conf"
+    conf.mkdir(exist_ok=True)
+    (conf / "image").write_text("localhost/haiplane-reviewer:1\n")
+    (conf / "model.env").write_text("KEY=x\n")
+    if deadline is None:
+        (conf / "timeout").unlink(missing_ok=True)
+    else:
+        (conf / "timeout").write_text(f"{deadline}\n")
+    return conf
+
+
+def _doc_wrapper_argv(tmp_path, *, deadline: int | None) -> list[str]:
+    """ВСЕ вызовы движка, которые сделал скелет враппера из документа.
+
+    Скелет не читается глазами и не разбирается регулярками: он ИСПОЛНЯЕТСЯ с
+    подменённым на заглушку движком, и наружу отдаётся то, что заглушка
+    получила — каждый вызов отдельной строкой, в порядке вызова. Разница не
+    косметическая — в скелете стоят переменные (``--timeout="$TIMEOUT"``,
+    ``"$IMAGE"``), и текст «--timeout "$TIMEOUT"» выглядит убедительно ровно
+    так же при пустом TIMEOUT, при опечатке в имени переменной и при её потере
+    под ``set -u``. Проверять текст значило бы проверять намерение, а не
+    команду.
+
+    ``deadline`` — что лежит в ``$CONF/timeout``; ``None`` значит файла нет, и
+    тогда действует умолчание самого скелета. Каталог настроек подставляется
+    через ``HAIPLANE_REVIEW_CONF``: без него скелет читал бы боевой
+    ``/etc/haiplane-review``, которого на машине проверки нет, а с зашитым в
+    скелет литералом срок вообще не следовал бы ни за чем (находка 10.09.2026,
+    находки 2 и 3 одного и того же числа).
+
+    Возвращаются ВСЕ вызовы, а не только ``run``: то, что скелет делает ДО
+    запуска, — часть рецепта, и именно там жил ``podman rm -af``, сносивший
+    чужие контейнеры.
+    """
+    conf = _wrapper_conf(tmp_path, deadline=deadline)
+    blocks = [
+        b
+        for b in re.findall(r"```sh\n(.*?)```", _DEPLOY_DOC.read_text(), re.S)
+        if "podman run" in b
+    ]
+    assert len(blocks) == 1, (
+        f"в {_DEPLOY_DOC.name} ожидался ровно один sh-скелет враппера с "
+        f"podman run, найдено {len(blocks)}"
+    )
+    script = textwrap.dedent(blocks[0])
+    engine = next(
+        tok
+        for tok in shlex.split(script.replace("\\\n", " "))
+        if tok.rsplit("/", 1)[-1] == "podman"
+    )
+    # Свой файл на КАЖДЫЙ прогон: заглушка дописывает, и общий файл склеил бы
+    # вызовы соседнего запуска скелета в том же tmp_path.
+    log = tmp_path / f"argv-{uuid.uuid4().hex}.log"
+    stub = tmp_path / "podman"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, shlex, sys\n"
+        "open(os.environ['ARGV_LOG'], 'a').write(shlex.join(sys.argv[1:]) + '\\n')\n"
+    )
+    stub.chmod(0o755)
+    wrapper = tmp_path / "haiplane-review-run"
+    wrapper.write_text(script.replace(engine, str(stub)))
+    wrapper.chmod(0o755)
+
+    done = subprocess.run(
+        [str(wrapper), "cursor-agent", "--print"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            **os.environ,
+            "ARGV_LOG": str(log),
+            "HAIPLANE_REVIEW_CONF": str(conf),
+        },
+    )
+    assert done.returncode == 0, f"скелет враппера не запустился: {done.stderr}"
+    seen = [line for line in log.read_text().splitlines() if line]
+    log.unlink()
+    return [shlex.join([engine, *shlex.split(line)]) for line in seen]
+
+
+def _doc_wrapper_launch(tmp_path, *, deadline: int | None = None) -> str:
+    """Единственная строка ``<engine> run`` скелета — то, что судит страж."""
+    calls = _doc_wrapper_argv(tmp_path, deadline=deadline)
+    runs = [c for c in calls if shlex.split(c)[1:2] == ["run"]]
+    assert len(runs) == 1, (
+        f"скелет враппера обязан один раз позвать «podman run»; движок получил {calls}"
+    )
+    return runs[0]
+
+
+def test_the_doc_wrapper_skeleton_names_its_own_deadline(monkeypatch, tmp_path) -> None:
+    """Срок жизни контейнера в скелете враппера держится тестом, а не текстом.
+
+    Рекомендованная песочница — ``sudo … /usr/local/bin/haiplane-review-run``,
+    и стражам хаба она непрозрачна: podman лежит ВНУТРИ скрипта. Значит на
+    рекомендованном рецепте единственное место, где срок жизни вообще
+    существует, — это скелет враппера в документе. Замер: вычеркнуть из него
+    ``--timeout 1800`` — и весь набор оставался зелёным, включая AC-1..AC-4,
+    тест argv и тест пробы (09.09.2026, находка машинного ревью
+    b3a35600e66e971d). То есть флаг, ради которого писан страж, на
+    рекомендованном пути не держался ничем.
+
+    Проверяется не глазами и не подстрокой: строка запуска берётся ИЗ ФАЙЛА и
+    ИСПОЛНЯЕТСЯ (переменные скелета подставляются оболочкой, а не читателем).
+
+    ПОВОРОТ 10.09.2026. Прежде эту строку прогоняли через самого стража хаба.
+    Теперь так нельзя, и не потому, что стало хуже: контейнерный запуск в
+    закрытый набор форм песочницы не входит, и страж отверг бы ЛЮБУЮ строку
+    podman — в том числе верную. Судить скелет ему больше нечем и незачем: он
+    и на рекомендованном рецепте его не видел. Поэтому срок берётся из
+    исполненного скелета и сравнивается с ХАБСКИМ СРОКОМ ИЗ ДОКУМЕНТА — с тем
+    самым числом, которое оператор скопирует к себе.
+    """
+    launch = _doc_wrapper_launch(tmp_path)
+    # Хвост ``cursor-agent --print`` — команда ВНУТРИ контейнера; флаги
+    # запуска кончаются на образе, и до хвоста разбор не доходит.
+    flags = _wrapper_run_flags(shlex.split(launch))
+    lifetime = _wrapper_flag(flags, "--timeout")
+    assert lifetime and lifetime.isdigit() and int(lifetime) > 0, (
+        f"скелет враппера из документа запускает «{launch}» без собственного "
+        "срока жизни. Контейнер переживёт снятие прогона — измерено "
+        "08.09.2026: kill -KILL по группе, через 7 с контейнер «Up», — а хаб "
+        "напишет в ленту, что снял"
+    )
+    # Срок контейнера не может быть БОЛЬШЕ хабского: он истёк бы уже после
+    # того, как хаб закрыл прогон. Хабский берётся из документа, а не из
+    # окружения, иначе скелет судился бы чужой переменной.
+    hub_deadline = _documented_hub_deadline()
+    assert int(lifetime) <= hub_deadline, (
+        f"скелет даёт контейнеру {lifetime} с при хабских {hub_deadline}: "
+        "контейнер переживёт снятие прогона ровно так же, как без --timeout "
+        "вовсе, только тише"
+    )
+
+
+def test_the_doc_wrapper_deadline_follows_the_conf_file(monkeypatch, tmp_path) -> None:
+    """Срок контейнера СЛЕДУЕТ за настройкой, а не зашит в скелет числом.
+
+    Находка 10.09.2026 (ревьюер Codex, воспроизведено на ef2198fc): оператор
+    ставит ``HAIPLANE_LOCAL_REVIEW_TIMEOUT_SEC=600`` и копирует скелет как
+    есть — а в скелете стояло ``TIMEOUT=1800`` литералом, ни с чем не
+    связанным. Контейнер переживал прогон втрое, и страж этого не видел вовсе:
+    на рекомендованном рецепте ему виден только ``sudo …
+    /haiplane-review-run``, podman лежит внутри скрипта.
+
+    Проверяется исполнением: скелет запускается с подставленным каталогом
+    настроек, и наружу берётся то число, которое ПОЛУЧИЛ движок. Замер на
+    прежней редакции: файл ``timeout`` с любым содержимым не менял ничего —
+    движку уходило 1800.
+    """
+    hub_deadline = _documented_hub_deadline()
+
+    # 1. Умолчание скелета (файла нет) — это ХАБСКОЕ умолчание, а не «просто
+    #    число»: разойдись они, рецепт по умолчанию был бы уже сломан.
+    launch = _doc_wrapper_launch(tmp_path, deadline=None)
+    flags = _wrapper_run_flags(shlex.split(launch))
+    assert _wrapper_flag(flags, "--timeout") == str(hub_deadline), (
+        f"без файла настроек скелет ставит контейнеру срок из «{launch}», а "
+        f"хабское умолчание — {hub_deadline}. Умолчания обязаны совпадать: "
+        "иначе рецепт ломается ещё до того, как оператор что-либо тронул"
+    )
+
+    # 2. Файл настроек ДЕЙСТВУЕТ: оператор укоротил хабский срок, вписал то же
+    #    число в файл — и контейнер получил именно его. Это и есть то, чего в
+    #    прежней редакции не было: связь между двумя местами.
+    shortened = 600
+    assert shortened != hub_deadline, "проверка беспредметна на равных числах"
+    launch = _doc_wrapper_launch(tmp_path, deadline=shortened)
+    flags = _wrapper_run_flags(shlex.split(launch))
+    assert _wrapper_flag(flags, "--timeout") == str(shortened), (
+        f"скелет не взял срок из $CONF/timeout: движку ушло «{launch}». "
+        "Значит число в скелете зашито, и согласовать его с настройкой хаба "
+        "оператору нечем"
+    )
+    # ПОВОРОТ 10.09.2026: прежде здесь стояла третья проверка — что строку
+    # запуска враппера принимает сам страж хаба. Она потеряла предмет:
+    # контейнерный запуск в закрытый набор форм песочницы не входит, и хаб
+    # эту строку не увидит вовсе — ему видна только форма sudo, а podman
+    # лежит внутри скрипта. Согласие двух чисел от этого не ослабло: оно и
+    # есть то, что проверено выше, — и проверено ИСПОЛНЕНИЕМ скелета.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", shortened)
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run",
+    )
+    assert local_reviewer.sandbox_problem() == [], (
+        "хаб видит не строку podman, а форму sudo, и она обязана проходить "
+        f"при любом сроке: {local_reviewer.sandbox_problem()}"
+    )
+
+    # 3. И РАСХОЖДЕНИЕ — это дыра, а не мелочь: не тронув файл, оператор
+    #    получит на укороченном хабе контейнер с прежним умолчанием. Страж
+    #    этого не увидит НИКОГДА — ни прежде, ни теперь: на рекомендованном
+    #    рецепте podman лежит внутри скрипта. Поэтому файл из шага 3a и есть
+    #    единственное место, где расхождение закрывается, и здесь измеряется
+    #    именно оно.
+    stale = _wrapper_flag(
+        _wrapper_run_flags(shlex.split(_doc_wrapper_launch(tmp_path))), "--timeout"
+    )
+    assert stale == str(hub_deadline) and int(stale) > shortened, (
+        f"без файла скелет даёт контейнеру {stale} с — и на хабских "
+        f"{shortened} это переживший прогон контейнер. Если бы умолчание "
+        "скелета следовало за настройкой само, шаг 3a был бы не нужен вовсе"
+    )
+
+
+def test_the_doc_wrapper_cleans_up_only_its_own_container(tmp_path) -> None:
+    """Уборка хвоста адресована ОДНОМУ контейнеру, а не всем подряд.
+
+    Находка 10.09.2026 (ревьюер Codex, подтверждена на хосте хаба:
+    /usr/local/bin/haiplane-review-run, строка 22). Скелет содержал
+    ``podman rm -af`` — снос ВСЕХ контейнеров пользователя-ревьюера.
+    Основание было названо тут же в комментарии («два ревьюера разом хосту не
+    по карману»), но ``rm -af`` такого ограничения не устанавливает: он не
+    сдерживает второй прогон, а УБИВАЕТ первый — и заодно всё постороннее,
+    что этот пользователь запустил. Одновременность держит хаб
+    (``local_reviewer._HOST_BUDGET``, тест
+    ``test_two_local_runs_never_overlap_on_the_host``), а здесь держится то,
+    что уборка никого чужого не задевает.
+
+    Судится не текст, а argv, которые движок ФАКТИЧЕСКИ получил.
+    """
+    calls = _doc_wrapper_argv(tmp_path, deadline=None)
+    # ``--all``/``-a`` у любой снимающей подкоманды — это «все контейнеры
+    # пользователя», то есть ровно та находка. Перечислены по имени: список
+    # узкий и о подкомандах podman, а не догадка про CLI вообще.
+    for call in calls:
+        argv = shlex.split(call)[1:]
+        if not argv or argv[0] not in ("rm", "stop", "kill", "pod"):
+            continue
+        wholesale = [
+            tok
+            for tok in argv[1:]
+            if tok in ("-a", "--all")
+            or (tok.startswith("-") and not tok.startswith("--") and "a" in tok[1:])
+        ]
+        assert not wholesale, (
+            f"скелет враппера зовёт «{call}»: {wholesale} значит ВСЕ "
+            "контейнеры пользователя-ревьюера, а не хвост своего прошлого "
+            "прогона. Так уборка сносит живое чужое ревью, и в карточке это "
+            "ляжет отказом прогона с ложной причиной"
+        )
+    # А адресат уборки обязан БЫТЬ: снести хвост всё-таки надо, и адресуется
+    # он именем. Без имени ``--replace`` бессмыслен, а без ``--replace``
+    # хвост пережил бы запуск и занял бы имя.
+    launch = _doc_wrapper_launch(tmp_path, deadline=None)
+    flags = _wrapper_run_flags(shlex.split(launch))
+    name = _wrapper_flag(flags, "--name")
+    assert isinstance(name, str) and name, (
+        f"скелет не даёт контейнеру имени: {launch}. Тогда адресной уборки "
+        "нет вовсе, и вернуться к «rm -af» — вопрос одного коммита"
+    )
+    assert any(flag == "--replace" for flag, _ in flags), (
+        f"имя «{name}» есть, а --replace нет: {launch}. Хвост прошлого "
+        "прогона займёт имя, и запуск упадёт «name already in use»"
+    )
+
+
+def test_the_doc_wrapper_leaves_the_network_the_hub_hands_the_run(tmp_path) -> None:
+    """Скелет враппера НЕ отрезает контейнеру сеть, которой хаб его снабжает.
+
+    Прежняя редакция документа рекомендовала ``--network none`` — четвёртый
+    экземпляр того же дефекта, ради которого заведена #1208: документ учил
+    настройке, на которой выкат останавливается. Настоящий враппер на хосте
+    хаба флага ``--network`` не имеет вовсе (снят 10.09.2026).
+
+    Требование не выдумано и не переписано в тест словами: оно берётся у
+    САМОГО ХАБА. ``review_dispatch._delivery_block`` — та функция, что
+    собирает промт, — кладёт в него ``curl`` на публичный адрес установки:
+    обменять одноразовый код, прочитать постановку, СДАТЬ ОТЧЁТ. Контейнер
+    без сети до этого адреса не дойдёт, и остаётся только запасной путь —
+    блок в тексте (#1036), который хаб помечает как более слабый. Измерено на
+    хосте хаба 10.09.2026 тем же образом: с сетью по умолчанию ``getent
+    hosts`` внутри контейнера отвечает про agenthai.ru и api.cursor.com
+    (rc 0), с ``--network none`` — rc 2 и ни одной строки.
+    """
+    hub_base = "https://hub.example"
+    delivery = _delivery_block(1208, "CODE-1", hub_base)
+    assert hub_base in delivery and "curl" in delivery, (
+        "хаб перестал давать прогону сетевой адрес — тогда и требование "
+        f"ниже беспредметно, и этот тест надо переписать: {delivery!r}"
+    )
+
+    launch = shlex.split(_doc_wrapper_launch(tmp_path))
+    # Всё, что стоит ДО образа, — флаги запуска; сеть настраивается только там.
+    flags = _wrapper_run_flags(launch)
+    for name, value in flags:
+        assert name not in ("--network", "--net"), (
+            f"скелет враппера из документа задаёт «{name} {value}». Сеть "
+            "контейнеру нужна В ДВЕ стороны: к поставщику (agentский CLI "
+            "авторизуется ключом из --env-file и ходит в api.cursor.com) и К "
+            "САМОМУ ХАБУ — отчёт по контракту сдаётся обычным HTTP на адрес "
+            f"из промта ({hub_base} в примере выше). Отрезав её, выкат "
+            "остановится молча: прогон кончится без отчёта. Если сеть надо "
+            "сузить, сужайте до СПИСКА АДРЕСОВ, а не до нуля"
+        )
+
+
+def test_the_doc_probe_passes_the_cli_argv_as_arguments(monkeypatch) -> None:
+    """В пробе ``$CMD`` — ПОЗИЦИОННЫЙ аргумент враппера, а не что попало.
+
+    Прежняя проверка требовала лишь подстроки ``$CMD`` в строке. Замер: строка
+    ``CMD=$CMD /usr/local/bin/haiplane-review-run`` — то есть враппер запущен
+    ГОЛЫМ, ровно та регрессия, ради которой тест писан, — оставляла весь набор
+    зелёным (09.09.2026, находка машинного ревью dc051e23e80f3cdd). Подстрока
+    не отличает аргумент от присваивания перед командой и от ``<<<"$CMD"``.
+    """
+    key = config.brand.ENV_PREFIX + "LOCAL_REVIEW_SANDBOX"
+    text = _DEPLOY_DOC.read_text()
+    recommended = [
+        line.split(key + "=", 1)[1] for line in text.splitlines() if key + "=" in line
+    ]
+    assert recommended, f"в {_DEPLOY_DOC.name} нет рекомендованной строки {key}="
+    wrapper = shlex.split(recommended[0])[-1]
+
+    probes = [
+        line
+        for block in re.findall(r"```bash\n(.*?)```", text, re.S)
+        # Продолжения строк склеиваются: проба разнесена по строкам обратным
+        # слешем, и разорванную строку токенами не разобрать.
+        for line in block.replace("\\\n", " ").splitlines()
+        if wrapper in line
+    ]
+    assert probes, (
+        f"в {_DEPLOY_DOC.name} нет пробы, запускающей враппер {wrapper} — "
+        "проверка была бы пустой и зелёной при любом её содержании"
+    )
+    for line in probes:
+        tokens = shlex.split(line, comments=True)
+        assert wrapper in tokens, (
+            f"в пробе «{line.strip()}» {wrapper} — не отдельное слово команды: "
+            "разобрать такую пробу нельзя, и что она запускает, неизвестно"
+        )
+        tail = tokens[tokens.index(wrapper) + 1 :]
+        assert "$CMD" in tail, (
+            f"проба «{line.strip()}» запускает враппер БЕЗ дописанного argv "
+            f"CLI ПОЗИЦИОННЫМ аргументом, а хаб запускает песочницу именно "
+            f"так ({key[:-7]}CMD дописывается хвостом argv). Присваивание "
+            "перед командой или подача через heredoc сюда не годятся: "
+            "враппер получит пустой argv, и проба пройдёт там, где живой "
+            "запуск пойдёт другой командой"
+        )
+
+
+def test_the_recommended_sudo_recipe_still_checks_the_scratch_group(
+    monkeypatch, tmp_path
+) -> None:
+    """Рецепт ИЗ ДОКУМЕНТА прогоняется через not_ready(), а не через страж.
+
+    AC-2 проверяет sandbox_uid() прямым вызовом — и этого мало: решение о
+    запуске принимает not_ready(), а его единственная интеграционная проверка
+    кормили формой ``systemd-run --uid=``. Замер: вернуть в _uid_outside_group
+    разбор ТОЛЬКО ``--uid`` — sandbox_uid() на sudo остаётся верным, AC-2 и
+    AC-4 зелёные, весь набор зелёный (rc=0), а not_ready() на рецепте из
+    документа возвращает [] и прогон упирается в EACCES внутри чужого
+    процесса, где причину уже никто не назовёт (09.09.2026, находка машинного
+    ревью 2bdf3c910e8d581c). Ровно то же расхождение, что и на #1155: дверь
+    заперта по прямому вызову и открыта по дороге, которой ходят.
+
+    Форма берётся ИЗ ДОКУМЕНТА; подменяется только имя пользователя — оно на
+    машине проверки не заведено, а проверяется здесь не оно, а то, что
+    проверка вообще СРАБАТЫВАЕТ на рекомендованной форме записи.
+    """
+    key = config.brand.ENV_PREFIX + "LOCAL_REVIEW_SANDBOX"
+    recommended = [
+        line.split(key + "=", 1)[1]
+        for line in _DEPLOY_DOC.read_text().splitlines()
+        if key + "=" in line
+    ]
+    assert recommended, f"в {_DEPLOY_DOC.name} нет рекомендованной строки {key}="
+
+    import os
+
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "/bin/true")
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o2770)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(shared))
+
+    for sandbox in recommended:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        named = local_reviewer.sandbox_uid()
+        assert named, (
+            f"в рекомендованной строке «{sandbox}» страж не видит пользователя"
+        )
+        # «nobody» есть на обеих системах, где это гоняется, и в группе
+        # каталога не состоит — как и в соседней проверке 45971e09.
+        probe = sandbox.replace(named, "nobody")
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", probe)
+        assert any("не состоит в группе" in r for r in local_reviewer.not_ready()), (
+            f"на рекомендованной форме «{probe}» not_ready() НЕ назвал "
+            "проблему с группой каталога прогонов: значит проверка, заведённая "
+            "ради 45971e09, на рецепте из документа молча не срабатывает — "
+            f"ровно как было до #1208. Вернулось: {local_reviewer.not_ready()}"
+        )
+
+
+async def test_the_queued_local_run_starts_with_a_live_access_code(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Код доступа обязан быть жив В МОМЕНТ СТАРТА прогона, а не сдачи.
+
+    Находка ревьюера Codex 11.09.2026 на ff5b518. Код чеканится в
+    ``prepare_review_order`` — то есть внутри HTTP-запроса автора, — а слот
+    хоста (``local_reviewer._HOST_BUDGET``) берётся уже в фоне, и ждать его
+    можно дольше, чем живёт код (``CHAT_PAIR_CODE_SECONDS``, на проде 300 с
+    против ревью в десятки минут). Второй в очереди стартовал бы с мёртвым
+    кодом: основной HTTP-канал отчёта ему не выкупить, и прогон сваливается
+    в слабый путь через stdout либо теряет отчёт вовсе.
+
+    Проверяется ТЕМ ЖЕ предикатом, которым живость кода судит сам
+    ``redeem_code`` (не redeem'ом: он потратил бы код), и ровно в тот момент,
+    когда хаб порождает процесс. Первый прогон проверяется вместе со вторым —
+    иначе починка очереди могла бы сломать нормальный путь.
+    """
+    import re
+    import time as _time
+
+    from hub.services import chat_pair
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-nope"}, "run": {"id": "r-nope"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _own_host_budget(monkeypatch)
+    # Прогон держит слот ДОЛЬШЕ, чем живёт код: на проде это 300 с против
+    # ревью в десятки минут, здесь — те же отношения в секундах.
+    monkeypatch.setattr(config, "CHAT_PAIR_CODE_SECONDS", 1)
+    _stub_reviewer(
+        monkeypatch,
+        tmp_path,
+        "import sys, time; sys.stdin.read(); time.sleep(2.5)",
+    )
+
+    alive: list[bool] = []
+    spawn = local_reviewer._spawn
+
+    async def _watching(prompt: str, workdir: str, limit: int, started: float):
+        found = re.search(r'"code":"([^"]+)"', prompt)
+        assert found, "в промте нет кода доступа — тогда судить не о чем"
+        rows = await db.execute_fetchall(
+            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? "
+            "AND redeemed_at IS NULL AND expires_at > datetime('now')",
+            (chat_pair.hash_pair_code(chat_pair.normalize_pair_code(found.group(1))),),
+        )
+        alive.append(bool(rows))
+        return await spawn(prompt, workdir, limit, started)
+
+    monkeypatch.setattr(local_reviewer, "_spawn", _watching)
+
+    began = _time.monotonic()
+    for slug in ("queued-first", "queued-second"):
+        await _submitted(
+            client,
+            db,
+            slug,
+            policy={"review": "dispatch"},
+            repo_name="mrpda/snip-portal",
+            forge="gitverse",
+        )
+    await wait_for_local_runs()
+
+    assert len(alive) == 2, f"оба прогона обязаны были стартовать: {alive}"
+    assert _time.monotonic() - began > config.CHAT_PAIR_CODE_SECONDS, (
+        "очередь оказалась короче срока жизни кода — тогда тест ничего не "
+        "измерил; удлините полезную нагрузку заглушки"
+    )
+    assert alive == [True, True], (
+        f"код доступа был мёртв на старте прогона: {alive}. Второй в очереди "
+        "не выкупит основной канал отчёта и свалится в слабый путь через "
+        "stdout — или потеряет отчёт вовсе"
+    )
+
+
+async def test_the_slot_prompt_mints_a_code_or_says_why_not(
+    db: aiosqlite.Connection, db_dsn: str, monkeypatch, caplog
+):
+    """Промт на слоте: либо свежий код, либо названная в журнале причина.
+
+    Журнал здесь единственный след того, что отчёт поедет слабым путём
+    (блоком в тексте прогона, #1036), и цена ложной строки высока в обе
+    стороны. «Кода не выдавали вовсе» — это открытый режим или отозванный
+    токен, и говорить там «код не выписать» значит звать оператора искать то,
+    чего не было. Молчать же о настоящей неудаче значит оставить слабый путь
+    незамеченным.
+
+    Заодно проверяется, что подмена доходит до базы обоими способами, как и
+    на проде: своим соединением по пути базы и на переданном живом
+    соединении.
+    """
+    import logging
+    import re
+
+    from hub.services import chat_pair
+    from hub.services.review_dispatch import _prompt_at_slot, instance_base_url
+
+    principal = await _local_principal(db, monkeypatch)
+    # Задача настоящая: код привязывается к ней внешним ключом, и выдуманный
+    # номер проверял бы отказ базы, а не поведение подмены.
+    task_id = await _node(db, title="слот", task_type="task", parent_id=None)
+    # Запись зафиксирована: второй путь до базы открывает СВОЁ соединение, и
+    # незакрытая транзакция фикстуры отдала бы ему «database is locked» —
+    # то есть тест мерил бы блокировку, а не подмену.
+    # Задача СТОИТ НА РЕВЬЮ своего поколения: код вида reviewer годен только
+    # против той сдачи, на которую выписан, и без этого «код выписан» нельзя
+    # было бы отличить от «кодом можно воспользоваться».
+    await db.execute(
+        "UPDATE tasks SET status='review', submission_generation=1 WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    base = instance_base_url().rstrip("/")
+    stale = "AH-11111111"
+    prompt = "шапка\n" + _delivery_block(task_id, stale, base) + "хвост\n"
+
+    async def _at_slot(db_path, live_db, **kw):
+        return await _prompt_at_slot(
+            db_path,
+            live_db,
+            prompt=kw.pop("prompt", prompt),
+            code=kw.pop("code", stale),
+            task_id=task_id,
+            generation=1,
+            principal_id=kw.pop("principal_id", principal),
+        )
+
+    with caplog.at_level(logging.WARNING, logger="hub.services.review_dispatch"):
+        assert await _at_slot(db_dsn, None, code="") == prompt, (
+            "промт без блока доставки трогать нечем"
+        )
+        assert await _at_slot("", None) == prompt, "базы нет — менять нечем"
+        assert caplog.records == [], (
+            "сказано о коде, которого не выдавали: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+        assert await _at_slot(db_dsn, None, principal_id=None) == prompt, (
+            "без принципала код не выписать — промт обязан остаться прежним"
+        )
+        assert await _at_slot(db_dsn, None, prompt="без блока") == "без блока", (
+            "блока доставки в промте нет — подменять нечего"
+        )
+
+    said = [r.getMessage() for r in caplog.records]
+    assert len(said) == 2, f"о каждой неудаче обязаны были сказать один раз: {said}"
+    assert all("stdout" in message for message in said), (
+        f"в журнале не названо следствие — отчёт поедет слабым путём: {said}"
+    )
+
+    for db_path, live in ((db_dsn, None), ("", db)):
+        produced = await _at_slot(db_path, live)
+        assert produced != prompt, (
+            f"промт не переписан (путь к базе {db_path!r}) — прогон унёс бы "
+            "код, который к этому времени может быть уже удалён сборщиком"
+        )
+        found = re.search(r'"code":"([^"]+)"', produced)
+        assert found and found.group(1) != stale, f"код не сменился: {produced[:200]}"
+        # Проверяется ВЫКУП, а не строка в таблице. Живая строка не значит
+        # годный код: reviewer-код приколот к задаче И К ПОКОЛЕНИЮ сдачи, и
+        # код, выписанный не на то поколение, лежит в базе живым, а на двери
+        # получает отказ — мутация «generation + 1» на проверке строки
+        # выживала, на выкупе гибнет.
+        assert await chat_pair.redeem_code(db, found.group(1)) is not None, (
+            "выписанный код не выкупается: ревьюер не войдёт в основной канал "
+            f"отчёта (путь к базе {db_path!r})"
+        )
+        assert prompt.replace(
+            _delivery_block(task_id, stale, base), ""
+        ) == produced.replace(_delivery_block(task_id, found.group(1), base), ""), (
+            "переписан не только блок доставки — промт обязан отличаться ровно кодом"
+        )
+
+
+async def test_a_purged_access_code_is_replaced_before_the_run_starts(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Код, который сборщик уже УДАЛИЛ, обязан быть заменён к старту прогона.
+
+    Находка ревьюера Codex 11.09.2026 на c6af952: продления мало. Пока прогон
+    стоит в очереди, по часовому кругу поллера отрабатывает ``purge_expired``,
+    и протухшую строку она не щадит — ``DELETE FROM chat_pair_codes WHERE
+    expires_at < datetime('now')``. Продлять тогда нечего, и второй в очереди
+    всё равно стартует с мёртвым кодом: основной канал отчёта не выкуплен,
+    прогон куплен впустую.
+
+    Гонка здесь ВОСПРОИЗВОДИТСЯ БЕЗ ЧАСОВ, а не подгадывается спячками.
+    Первый прогон, уже взявший слот, останавливается перед порождением
+    процесса и ждёт, пока вторая сдача встанет в очередь; тогда он состаривает
+    коды и гоняет сборщик — ровно тот порядок, что описан в находке, — и
+    только после этого отпускает себя. Время в этом тесте не участвует
+    вовсе, поэтому и флака в нём нет.
+    """
+    import re
+
+    from hub.services import chat_pair
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-nope"}, "run": {"id": "r-nope"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _own_host_budget(monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, "import sys; sys.stdin.read()")
+
+    queued = asyncio.Event()
+    purged: list[int] = []
+    alive: list[bool] = []
+    spawn = local_reviewer._spawn
+
+    async def _watching(prompt: str, workdir: str, limit: int, started: float):
+        found = re.search(r'"code":"([^"]+)"', prompt)
+        assert found, "в промте нет кода доступа — тогда судить не о чем"
+        rows = await db.execute_fetchall(
+            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? "
+            "AND redeemed_at IS NULL AND expires_at > datetime('now')",
+            (chat_pair.hash_pair_code(chat_pair.normalize_pair_code(found.group(1))),),
+        )
+        alive.append(bool(rows))
+        if not purged:
+            # Слот держит этот прогон, поэтому вторая сдача сейчас стоит в
+            # очереди — и её код доживает здесь свой срок ровно так, как
+            # дожил бы на проде.
+            await queued.wait()
+            await db.execute(
+                "UPDATE chat_pair_codes SET expires_at = datetime('now', '-1 hour')"
+            )
+            await db.commit()
+            purged.append(await chat_pair.purge_expired(db))
+        return await spawn(prompt, workdir, limit, started)
+
+    monkeypatch.setattr(local_reviewer, "_spawn", _watching)
+
+    for slug in ("purged-first", "purged-second"):
+        await _submitted(
+            client,
+            db,
+            slug,
+            policy={"review": "dispatch"},
+            repo_name="mrpda/snip-portal",
+            forge="gitverse",
+        )
+    queued.set()
+    await wait_for_local_runs()
+
+    assert purged and purged[0] >= 1, (
+        f"сборщик ничего не удалил ({purged}) — тогда тест не воспроизвёл "
+        "находку и зелен не за то"
+    )
+    assert len(alive) == 2, f"оба прогона обязаны были стартовать: {alive}"
+    assert alive == [True, True], (
+        f"прогон стартовал с кодом, которого в базе уже нет: {alive}. "
+        "Продления мало: сборщик протухшего УДАЛЯЕТ строку, и продлять "
+        "становится нечего — код к старту обязан быть выписан заново"
+    )

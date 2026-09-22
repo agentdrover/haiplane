@@ -1486,6 +1486,12 @@ class ReviewOrder:
     rules_note: str
     diff_note: str
     prepass: Any
+    #: Одноразовый код, уже вписанный в ``prompt``. Хранится отдельно не ради
+    #: удобства: срок его жизни отсчитывается от ЧЕКАНКИ, а локальный прогон
+    #: может простоять в очереди дольше этого срока — тогда исполнителю нужно
+    #: отмерить срок заново, а для этого нужен сам код (#1208). Пусто там, где
+    #: кода не выдавали: открытый режим, отозванный токен.
+    access_code: str = ""
 
 
 async def prepare_review_order(
@@ -1558,6 +1564,7 @@ async def prepare_review_order(
         rules_note=rules_note,
         diff_note=diff_note,
         prepass=prepass,
+        access_code=code,
     )
 
 
@@ -2331,7 +2338,15 @@ async def dispatch_local_review(
         },
     )
     await db.commit()
-    await _start_local_run(db, dispatch_id, task_id, generation, order.prompt)
+    await _start_local_run(
+        db,
+        dispatch_id,
+        task_id,
+        generation,
+        order.prompt,
+        order.access_code,
+        principal_id,
+    )
     return True
 
 
@@ -2417,6 +2432,8 @@ async def _start_local_run(
     task_id: int,
     generation: int,
     prompt: str,
+    access_code: str = "",
+    principal_id: int | None = None,
 ) -> None:
     """Запустить прогон фоном и вернуть управление сдаче.
 
@@ -2435,6 +2452,8 @@ async def _start_local_run(
             task_id=task_id,
             generation=generation,
             prompt=prompt,
+            access_code=access_code,
+            principal_id=principal_id,
         )
     )
     _LOCAL_RUNS[dispatch_id] = _LocalRunHandle(
@@ -2541,6 +2560,90 @@ async def _main_db_path(db: aiosqlite.Connection) -> str:
     return ""
 
 
+async def _prompt_at_slot(
+    db_path: str,
+    live_db: aiosqlite.Connection | None,
+    *,
+    prompt: str,
+    code: str,
+    task_id: int,
+    generation: int,
+    principal_id: int | None,
+) -> str:
+    """Промт с ЗАНОВО выписанным кодом доступа — в момент, когда слот взят.
+
+    Почему заново, а не продлением срока (так было на c6af952, #1208).
+    Продление двигало ``expires_at`` у СУЩЕСТВУЮЩЕЙ строки, а строки к этому
+    моменту может уже не быть: по часовому кругу поллера отрабатывает
+    ``chat_pair.purge_expired``, и протухший код она не щадит — ``DELETE FROM
+    chat_pair_codes WHERE expires_at < datetime('now')``. Длинная очередь —
+    ровно тот случай, ради которого всё это писалось, — переживает и срок, и
+    сборщика; продлять там нечего (найдено ревьюером Codex 11.09.2026 на
+    c6af952).
+
+    Второй путь, названный ревьюером, — исключить коды стоящих в очереди
+    заказов из сборки протухшего — отвергнут по существу: он оставляет
+    протухший код ЖИТЬ в таблице неограниченно долго и всё равно требует
+    продления, чтобы им можно было воспользоваться, то есть заводит два
+    механизма там, где хватает одного. Свежий код короткого срока, выписанный
+    тогда, когда он нужен, снимает и срок, и сборщика разом.
+
+    Почему подменяется БЛОК, а не токен кода. Блок доставки собирается
+    ``_delivery_block`` детерминированно, поэтому его можно собрать заново со
+    старым кодом и убедиться, что в промте он ровно один. Подменять голый
+    токен значило бы верить, что восьмизначная строка не встретилась в
+    диффе, — а проверять это нечем.
+
+    Заказ при этом не расходится с облачным: ``prepare_review_order`` для
+    обоих транспортов остаётся ОДИН, и код в нём выписывается одинаково.
+    Локальный путь лишь переписывает свой блок доставки перед самым запуском.
+
+    Любая неудача возвращает ИСХОДНЫЙ промт и говорит об этом в журнал.
+    Прогон она не отменяет: у отчёта есть слабый путь через stdout, и
+    подменять «отчёт пришёл хуже» на «ревью не состоялось» — тот самый обмен,
+    против которого написан весь этот модуль. Но молчать нельзя — журнал
+    здесь единственный след того, что отчёт поедет слабым путём.
+    """
+    if not code:
+        # Кода не выдавали вовсе: открытый режим или отозванный токен. Блока
+        # доставки в промте тогда нет, и подменять нечего — говорить об этом
+        # значило бы звать оператора искать то, чего не было.
+        return prompt
+    conn = None
+    try:
+        if db_path:
+            from hub import db as db_module
+
+            conn = await db_module.connect(db_path)
+        target = conn if conn is not None else live_db
+        if target is None:
+            return prompt
+        hub_base = instance_base_url().rstrip("/")
+        stale = _delivery_block(task_id, code, hub_base)
+        if prompt.count(stale) != 1:
+            log.warning(
+                "local review: the delivery block of task #%s is not where it "
+                "was put; the report will have to come back through stdout",
+                task_id,
+            )
+            return prompt
+        fresh = await _access_code(target, task_id, generation, principal_id)
+        if not fresh:
+            log.warning(
+                "local review: no access code could be minted for task #%s at "
+                "start; the report will have to come back through stdout",
+                task_id,
+            )
+            return prompt
+        return prompt.replace(stale, _delivery_block(task_id, fresh, hub_base), 1)
+    except Exception:  # noqa: BLE001 - фон не имеет права уронить прогон
+        log.exception("could not mint the access code of the local review")
+        return prompt
+    finally:
+        if conn is not None:
+            await conn.close()
+
+
 async def _supervise_local_run(
     *,
     db_path: str,
@@ -2549,8 +2652,21 @@ async def _supervise_local_run(
     task_id: int,
     generation: int,
     prompt: str,
+    access_code: str = "",
+    principal_id: int | None = None,
 ) -> None:
-    run = await local_reviewer.run_review(prompt)
+    run = await local_reviewer.run_review(
+        prompt,
+        prompt_at_slot=lambda ready: _prompt_at_slot(
+            db_path,
+            live_db,
+            prompt=ready,
+            code=access_code,
+            task_id=task_id,
+            generation=generation,
+            principal_id=principal_id,
+        ),
+    )
     conn = None
     try:
         if db_path:
@@ -2598,9 +2714,18 @@ async def _settle_local_run(
     from hub.services.machine_review_intake import ORIGIN_LOCAL_TEXT
 
     report = parse_report_block(run.output if run else None)
-    if report is not None and await _store_report(
-        db, dispatch, report, ORIGIN_LOCAL_TEXT
-    ):
+    stored = (
+        _REPORT_NOT_STORED
+        if report is None
+        else await _store_report(db, dispatch, report, ORIGIN_LOCAL_TEXT)
+    )
+    if stored == _REPORT_STALE:
+        # #1260: отказ уже назван в карточке. «Прогон не состоялся» поверх
+        # него было бы ложью: отчёт был, но о прежней сдаче.
+        await repo.set_review_dispatch_status(db, dispatch_id, "failed")
+        await db.commit()
+        return
+    if stored == _REPORT_STORED:
         await repo.add_task_update(
             db,
             task_id,
@@ -2623,9 +2748,10 @@ def _local_failure_reason(run: local_reviewer.LocalRun | None) -> str:
     """Почему прогона нет — по имени, а не «что-то пошло не так»."""
     if run is None:
         return (
-            "Локальное машинное ревью НЕ состоялось: прогон не удалось "
-            "запустить — нет каталога, бинаря или прав (детали в логе хаба). "
-            "Это не «прочитано и чисто»: вердикт остаётся человеку (#1180)."
+            "Локальное машинное ревью НЕ состоялось: прогона не было — нет "
+            "каталога, бинаря, прав либо песочница не переживает снятие "
+            "этого прогона (детали в логе хаба). Это не «прочитано и чисто»: "
+            "вердикт остаётся человеку (#1180)."
         )
     if run.timed_out:
         return (
@@ -2869,8 +2995,8 @@ def parse_report_block(text: str | None) -> Any | None:
 
 async def _recover_report_from_run(
     db: aiosqlite.Connection, dispatch: dict[str, Any], run: dict[str, Any]
-) -> bool:
-    """Record the report a finished run left in its text. True when stored.
+) -> str:
+    """Record the report a finished run left in its text; see _store_report.
 
     The path exists because the contract path stopped working: Cursor no
     longer delivers the hub's MCP into a cloud run, so since 22.08 reviewers
@@ -2902,11 +3028,12 @@ async def _recover_report_from_run(
                 "по прозе. Текст сохранён как есть, находки из него никем не "
                 f"подтверждены (#1036):\n\n{tail[:4000]}",
             )
-        return False
+        return _REPORT_NOT_STORED
     from hub.services.machine_review_intake import ORIGIN_RUN_TEXT
 
-    if not await _store_report(db, dispatch, report, ORIGIN_RUN_TEXT):
-        return False
+    stored = await _store_report(db, dispatch, report, ORIGIN_RUN_TEXT)
+    if stored != _REPORT_STORED:
+        return stored
     await repo.add_task_update(
         db,
         task_id,
@@ -2917,7 +3044,7 @@ async def _recover_report_from_run(
         "блоком в ответе. Он записан с пометкой происхождения — это слабее "
         "отчёта, сданного по контракту: прогон писал его о себе сам (#1036).",
     )
-    return True
+    return _REPORT_STORED
 
 
 async def _sweep_orphan_local(
@@ -2972,13 +3099,22 @@ async def _sweep_orphan_local(
     await db.commit()
 
 
+# Исходы записи отчёта из текста прогона (#1260). Три, а не True/False:
+# «отчёт о прежней сдаче» — не «отчёт не разобрался», и путь, закрывающий
+# прогон, обязан их различать, иначе причина отказа тонет в общей ветке.
+_REPORT_STORED = "stored"
+_REPORT_STALE = "stale"
+_REPORT_NOT_STORED = "not_stored"
+_GENERATION_MOVED = "chat_pair_generation_moved"
+
+
 async def _store_report(
     db: aiosqlite.Connection,
     dispatch: dict[str, Any],
     report: Any,
     origin: str,
-) -> bool:
-    """Записать отчёт, оставленный прогоном в СВОЁМ тексте. True — записан.
+) -> str:
+    """Записать отчёт, оставленный прогоном в СВОЁМ тексте; вернуть исход.
 
     Владелец отчёта берётся из строки диспетчера, а не из того, как отчёт
     называет себя сам: иначе он прочитался бы как чужой собственному вызову —
@@ -2989,8 +3125,16 @@ async def _store_report(
     Одна реализация на оба канала намеренно: облачный и локальный прогон
     оставляют текст по одной и той же причине и с одинаковой доказательной
     силой, и две копии этого правила разошлись бы на первой же правке.
+
+    Закрепление сдачи — тоже из строки диспетчера (#1260), по тому же
+    принципу, что и владелец: прогон судил дифф поколения, на которое его
+    заказали, и отчёт, доехавший после пересдачи, не засчитывается новой.
+    Отказ пишется в карточку названной причиной ДО общего except: иначе он
+    был бы неотличим от испорченного отчёта и пропал бы в журнале.
     """
     task_id = int(dispatch["task_id"])
+    from fastapi import HTTPException
+
     from hub.services.machine_review_intake import record_machine_review
 
     try:
@@ -3001,11 +3145,28 @@ async def _store_report(
             principal_id=dispatch.get("reviewer_principal_id"),
             username=(dispatch.get("model") or "cursor-cloud-reviewer"),
             origin=origin,
+            expected_generation=int(dispatch["submission_generation"]),
         )
+    except HTTPException as exc:
+        detail: dict[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}
+        if detail.get("reason") != _GENERATION_MOVED:
+            log.exception("could not record the report recovered for task #%s", task_id)
+            return _REPORT_NOT_STORED
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            "Отчёт ревью, оставленный прогоном в тексте, НЕ записан: "
+            f"{detail.get('message')} Прогон судил прежний дифф, и засчитать "
+            "его текущей сдаче значило бы считать прочитанным код, которого "
+            "ревью не видело. Строка прогона закрыта (#1260).",
+        )
+        return _REPORT_STALE
     except Exception:  # noqa: BLE001 - the sweep must survive a bad report
         log.exception("could not record the report recovered for task #%s", task_id)
-        return False
-    return True
+        return _REPORT_NOT_STORED
+    return _REPORT_STORED
 
 
 async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
@@ -3080,8 +3241,13 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
         if not grace_rows:
             continue
         await _stamp_dispatch_usage(db, dispatch)
-        if await _recover_report_from_run(db, dispatch, run):
-            await repo.set_review_dispatch_status(db, dispatch["id"], "done")
+        recovered = await _recover_report_from_run(db, dispatch, run)
+        if recovered != _REPORT_NOT_STORED:
+            # #1260: отчёт о прежней сдаче уже назван в карточке; вторая
+            # дверь за него не покупается — он был, но судил другой дифф.
+            await repo.set_review_dispatch_status(
+                db, dispatch["id"], "done" if recovered == _REPORT_STORED else "failed"
+            )
             await db.commit()
             continue
         await _close_a_run_without_a_report(db, dispatch, run)
