@@ -2723,18 +2723,43 @@ def _stacking_message(
     )
 
 
+def review_verdict_covers_current_submission(task: dict[str, Any]) -> bool:
+    """Does the stored verdict still speak about the work as it stands?
+
+    Two ways it stops doing so, and both live HERE so the hub has one answer
+    to the question rather than one per reader:
+
+    * a new submission bumped the generation — the verdict judged other code;
+    * a human sent the work back for rework and closed the window (#1286).
+      The verdict itself stays recorded, findings and all; what the decision
+      revokes is its power to authorise a delivery. Before #1286 the rework
+      branch only said it did this, in a comment (#422), and the approval went
+      on counting until the resubmission — which on 22.09.2026 delivered #1162
+      and #1206 after their owner had called them back.
+
+    Said about the verdict, not about approval, because ``latest_review``
+    asks the same question about CHANGES_REQUESTED too.
+    """
+    generation = task.get("submission_generation") or 0
+    if task.get("review_verdict_generation") != generation:
+        return False
+    return task.get("review_verdict_closed_generation") != generation
+
+
 def review_approved_for_current_submission(task: dict[str, Any]) -> bool:
     """True only when an APPROVED verdict applies to the latest submission.
 
     A verdict recorded against an earlier submission generation is stale:
     the work changed since it was approved. A task with no submissions yet
-    (generation 0) can never count as approved.
+    (generation 0) can never count as approved. A verdict whose window a
+    human decision closed does not count either (#1286) — the single
+    predicate above owns both ways of ceasing to apply.
     """
     generation = task.get("submission_generation") or 0
     return (
         generation > 0
         and task.get("review_verdict") == "approved"
-        and task.get("review_verdict_generation") == generation
+        and review_verdict_covers_current_submission(task)
     )
 
 

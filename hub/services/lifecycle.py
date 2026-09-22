@@ -106,6 +106,7 @@ from hub.services.orchestration import (
     prepare_pair_branch,
     restore_pair_workspace_base,
     review_approved_for_current_submission,
+    review_verdict_covers_current_submission,
     switch_pair_workspace_to_task,
     transition_after_agent_done,
 )
@@ -595,15 +596,35 @@ def parse_review_findings(raw: Any) -> list[ReviewFinding]:
 
 
 def latest_review_projection(task: dict[str, Any]) -> LatestReview | None:
-    """Build the latest-review projection for status/context (#308)."""
+    """Build the latest-review projection for status/context (#308).
+
+    ``is_current`` is asked of the one predicate that owns the question
+    (#1286) instead of being recomputed here: a second copy of the rule would
+    have this card saying the verdict is current while
+    ``review_approved_current`` next to it said the work is not approved.
+
+    ``closed_by_decision`` answers WHY it stopped being current, so it holds
+    only while the closed generation is still the one being worked on.
+    """
     verdict = task.get("review_verdict")
     if not verdict:
         return None
     verdict_generation = task.get("review_verdict_generation") or 0
+    generation = task.get("submission_generation") or 0
+    closed_generation = task.get("review_verdict_closed_generation")
     return LatestReview(
         verdict=verdict,
         submission_generation=verdict_generation,
-        is_current=verdict_generation == (task.get("submission_generation") or 0),
+        is_current=review_verdict_covers_current_submission(task),
+        # The closure speaks about the submission it closed, and only while
+        # that submission is still the current one (#1286). Once the executor
+        # resubmits, the generation moves on: the verdict stops being current
+        # because the work changed, not because a human called it back, and a
+        # card still flying the rework flag would ask for a resubmission that
+        # has already happened.
+        closed_by_decision=(
+            closed_generation == verdict_generation and closed_generation == generation
+        ),
         self_approved=bool(task.get("review_self_approved") or 0),
         findings=parse_review_findings(task.get("review_findings")),
     )
@@ -4089,11 +4110,46 @@ async def decide_task(
         if summary_text:
             update_content += f"\nDecision: {summary_text}"
         await repo.add_task_update(db, task_id, "human", "decision", update_content)
-        # Rework is the boundary that closes the old arbiter/verdict window
-        # (#422): reset the cycle and clear the arbiter marker so the reworked
-        # submission starts clean and the stale verdict cannot count as current.
+        # Rework is the boundary that closes the old arbiter/approval window
+        # (#422): reset the cycle, clear the arbiter marker, and close the
+        # approval the decision has just revoked, so the reworked submission
+        # starts clean and the stale approval cannot count as current.
+        # An approval and nothing else: a CHANGES_REQUESTED verdict on this
+        # same submission authorised no delivery, so this branch revokes
+        # nothing from it and says nothing about it (#1286 review).
+        #
+        # That last clause used to be a promise this branch did not keep
+        # (#1286). The verdict stayed bound to the current submission
+        # generation, and generations move only on a resubmission — so between
+        # the decision and the next submit the work went on counting as
+        # approved. Both halves of that were observed on 22.09.2026: the
+        # delivery sweep merged #1162 and #1206 after their owner had called
+        # them back, and once the executor pushed the fix the branch outran the
+        # pinned commit and the task returned to the same human as a
+        # stale_approval. The window closes here; the verdict itself, its
+        # findings and its generation stay on the card as history.
         await repo.update_task(db, task_id, review_cycle=0)
         await repo.reset_arbiter_state(db, task_id)
+        closed_generation = await repo.close_review_verdict_window(db, task_id)
+        if closed_generation is not None:
+            # Said out loud, because the card now shows an APPROVED verdict
+            # that authorises nothing, and silence there reads as a bug.
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "status",
+                f"Одобрение ревью (сдача #{closed_generation}"
+                + (
+                    f", коммит {(task.get('submission_sha') or '')[:12]}"
+                    if (task.get("submission_sha") or "").strip()
+                    else ""
+                )
+                + ") закрыто этим решением: работа по нему больше не "
+                "доставляется. Вердикт остаётся в истории задачи; чтобы "
+                "работа поехала, нужна новая сдача через "
+                "hub_submit_for_review и новый вердикт.",
+            )
         # #737: same trace as the accept branch — rework is the "override"
         # outcome of the decision gate.
         await repo.insert_event(
@@ -4104,6 +4160,10 @@ async def decide_task(
             payload={
                 "action": "rework",
                 "entered_at": task.get("status_entered_at") or "",
+                # #1286: how many approvals a rework revokes is a number
+                # somebody will want; reading it out of feed prose is not a
+                # way to count. Null when there was nothing to close.
+                "closed_verdict_generation": closed_generation,
             },
         )
         await db.commit()
