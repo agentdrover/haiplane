@@ -2820,6 +2820,12 @@ class MachineReviewView(BaseModel):
     # about itself. False on rows written before the column existed — there
     # the question was never asked, which is not the same as "independent".
     self_reviewed: bool = False
+    # Who owns the report, from the TOKEN (#1025). The column arrived AFTER
+    # ``self_reviewed``, so a report with an owner is one about which the
+    # "did the author review it" question was actually asked. None means
+    # nobody established independence — which a reader of ``self_reviewed``
+    # alone would mistake for "someone else looked" (#1231, f9ac6478eaeb2ac2).
+    principal_id: int | None = None
     created_at: str = ""
     # What the gate said each confirmed finding turned out to be (#876). An
     # empty list means nobody judged them — never that they were all fine.

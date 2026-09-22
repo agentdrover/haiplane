@@ -464,6 +464,20 @@ def _signals_that_did_not_converge(brief: ReviewBrief) -> list[tuple[str, str]]:
                 "отчёт сдан автором кода (self_reviewed) — это не второй взгляд",
             )
         )
+    elif mr.principal_id is None:
+        # self_reviewed двузначен: колонка пришла с DEFAULT 0 (#728), и на
+        # строке без владельца по токену ноль значит «вопрос не задавали»,
+        # а не «смотрел другой». Владелец (#1025) появился позже колонки,
+        # поэтому только отчёт с ним — отчёт, про который вопрос задан и
+        # отвечен. Незнание вторым взглядом не читается.
+        out.append(
+            (
+                "reviewed_by_someone_else",
+                "независимость отчёта не установлена: у него нет владельца "
+                "по токену, и self_reviewed=false здесь значит «вопрос не "
+                "задавали», а не «смотрел другой»",
+            )
+        )
 
     out.extend(_commit_signal(brief))
     out.extend(_acceptance_signal(brief))
