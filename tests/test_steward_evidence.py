@@ -15,8 +15,10 @@ import aiosqlite
 import pytest
 
 from hub import repository as repo
+from hub.integrations.registry import plugins
 from hub.models import STEWARD_GROUND_SOURCES
 from hub.services.ci_report import VALIDATION_PASS
+from hub.services.delivery_state import DELIVERED, PR_OPEN, UNKNOWN
 from hub.services.steward_evidence import (
     ABSENT,
     packet_payload,
@@ -402,3 +404,143 @@ async def test_payload_carries_quotes_with_their_authors(
         assert isinstance(quoted["signals"], list)
     # Старые поля на месте: правка только добавляет.
     assert {"task_id", "generation", "brief", "facts", "absent_sources"} <= set(payload)
+
+
+# ---------------------------------------------------------------------------
+# Доставка зависимости — одним читателем на весь хаб (#1281)
+# ---------------------------------------------------------------------------
+
+
+async def _blocker_of(
+    db: aiosqlite.Connection,
+    clone: Path,
+    subject: int,
+    *,
+    title: str,
+    sha: str = "",
+    pr_number: int | None = None,
+) -> int:
+    """Блокер задачи ``subject``: своя задача, сдача и ребро зависимости."""
+    blocker = await _task_on_clone(db, clone, title=title)
+    if sha:
+        await _submit(db, blocker, generation=1, sha=sha)
+    if pr_number is not None:
+        await repo.update_task(db, blocker, pr_number=pr_number)
+    await repo.add_task_dependency(db, subject, blocker)
+    await db.commit()
+    return blocker
+
+
+def _entry(fact, blocker_id: int) -> dict:
+    """Строка одного блокера в пакете."""
+    rows = [b for b in fact.value["blocked_by"] if b["task_id"] == blocker_id]
+    assert rows, f"блокера #{blocker_id} нет в пакете вовсе"
+    return rows[0]
+
+
+async def test_a_squashed_dependency_is_not_called_undelivered(
+    db: aiosqlite.Connection, tmp_path: Path
+):
+    """#1281 AC-1: squash-доставка без строки гейта — это «доставлено».
+
+    Тот же класс дефекта, что чинили #897 и #1214 для реестра: счётчик
+    pipeline_merges видит только мержи, которые хаб сделал сам, и работа,
+    уехавшая в базовую ветку squash-мержем, читалась как «не доставлено».
+    Ответ реестра про эту же задачу уже лежит записанным — пакет обязан
+    читать его, а не считать заново своим счётчиком.
+    """
+    clone = _init_repo(tmp_path / "dep-squash")
+    sha = _sha(clone)
+    subject = await _task_on_clone(db, clone, title="dep squash subject")
+    blocker = await _blocker_of(
+        db, clone, subject, title="dep squash blocker", sha=sha, pr_number=7
+    )
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=blocker,
+        state=DELIVERED,
+        reason="PR #7 смержен, но записи о мерже у хаба нет — доставка мимо гейта",
+        pr_number=7,
+        delivery_path="outside_gate",
+    )
+
+    deps = (await build_evidence_packet(db, subject)).fact("dependency_state")
+
+    assert deps.state == PRESENT
+    row = _entry(deps, blocker)
+    assert row["delivered"] is True
+    assert row["delivery_path"] == "outside_gate"
+    assert deps.value["undelivered"] == 0
+
+
+async def test_an_unanswered_dependency_is_not_a_denial(
+    db: aiosqlite.Connection, tmp_path: Path
+):
+    """#1281 AC-2: «узнать не удалось» — третий ответ, а не «не доставлено».
+
+    И пакет не спрашивает провайдера сам: сеть на каждую зависимость при
+    каждой сборке — это то, чего задача не разрешает, а ответ свипа уже
+    лежит записанным (#897).
+    """
+    clone = _init_repo(tmp_path / "dep-unknown")
+    sha = _sha(clone)
+    subject = await _task_on_clone(db, clone, title="dep unknown subject")
+    blocker = await _blocker_of(
+        db, clone, subject, title="dep unknown blocker", sha=sha, pr_number=11
+    )
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=blocker,
+        state=UNKNOWN,
+        reason="состояние PR #11 узнать не удалось: провайдер не ответил",
+        pr_number=11,
+        delivery_path="unknown",
+    )
+
+    async def _refuse(*args, **kwargs):
+        raise AssertionError("пакет спросил провайдера о состоянии PR")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(plugins.git_ops, "pr_state", _refuse, raising=False)
+    try:
+        deps = (await build_evidence_packet(db, subject)).fact("dependency_state")
+    finally:
+        monkeypatch.undo()
+
+    row = _entry(deps, blocker)
+    assert row["delivered"] is None, "незнание выдано за факт"
+    assert row["reason"], "молчание провайдера обязано назвать причину"
+    assert deps.value["undelivered"] == 0
+    assert deps.value["unanswerable"] == 1
+
+
+async def test_a_truly_undelivered_dependency_still_says_no(
+    db: aiosqlite.Connection, tmp_path: Path
+):
+    """#1281 AC-3: настоящий недоставленный блокер по-прежнему «не доставлено».
+
+    Мутация «всегда доставлено» обязана ронять этот тест: починка снимает
+    ложные «нет», а не сам ответ «нет».
+    """
+    clone = _init_repo(tmp_path / "dep-open")
+    sha = _sha(clone)
+    subject = await _task_on_clone(db, clone, title="dep open subject")
+    blocker = await _blocker_of(
+        db, clone, subject, title="dep open blocker", sha=sha, pr_number=13
+    )
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=blocker,
+        state=PR_OPEN,
+        reason="PR #13 открыт и не смержен — работа не в базовой ветке",
+        pr_number=13,
+        delivery_path="none",
+    )
+
+    deps = (await build_evidence_packet(db, subject)).fact("dependency_state")
+
+    row = _entry(deps, blocker)
+    assert row["delivered"] is False
+    assert "#13" in row["reason"]
+    assert deps.value["undelivered"] == 1
+    assert deps.value["unanswerable"] == 0

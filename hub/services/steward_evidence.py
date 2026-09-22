@@ -50,6 +50,7 @@ from hub.services.ci_report import (
     VALIDATION_FAIL,
     VALIDATION_PASS,
 )
+from hub.services.delivery_state import with_cached_delivery
 
 PRESENT = "present"
 ABSENT = "absent"
@@ -429,23 +430,49 @@ async def _base_fact(db: aiosqlite.Connection, project_row: Any | None) -> Evide
 
 
 async def _dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFact:
-    """What this task waits for, judged by DELIVERY rather than status (#484/#485)."""
+    """What this task waits for, judged by DELIVERY rather than status (#484/#485).
+
+    Доставку здесь НЕ считают заново. Читатель тот же, что у реестра
+    недоставленной работы (#897) — ``with_cached_delivery`` поверх #885, —
+    и по той же причине: пока источников два, суждение стюарда не сойдётся
+    с тем, что хаб считает истиной в другом окне. Собственный счёт по
+    ``pipeline_merges`` видел только мержи, сделанные гейтом, поэтому
+    squash-доставка и мерж мимо записи гейта читались как «не доставлено»
+    (#1214, находка 42b59be386311b35). Вдобавок считал он поле ``merges``,
+    которого в строке уже нет: ``_blocker_entry`` снимает его, разбирая в
+    ``delivered``, — так что НЕДОСТАВЛЕННЫМ выходил каждый блокер.
+
+    Ответ трёхзначный, как и у реестра: ``delivered`` True, False и None =
+    «узнать не удалось». Третье состояние существует, чтобы молчание
+    провайдера не работало основанием эскалации и отказа.
+
+    Провайдера пакет не спрашивает: за этот вопрос платит свип, а пакет
+    читает записанное. Сборка пакета не должна стоить сетевого вызова на
+    каждую зависимость.
+    """
     source = "dependency_state"
     edges = await repo.list_task_dependencies(db, task_id)
-    blocked_by = [dict(e) for e in edges.get("blocked_by", [])]
-    undelivered = [e for e in blocked_by if not (e.get("merges") or 0)]
+    blocked_by = await with_cached_delivery(
+        db, [dict(e) for e in edges.get("blocked_by", [])]
+    )
+    undelivered = [e for e in blocked_by if e.get("delivered") is False]
+    unanswerable = [e for e in blocked_by if e.get("delivered") is None]
     return present(
         source,
-        f"блокеров {len(blocked_by)}, не доставлено {len(undelivered)}",
+        f"блокеров {len(blocked_by)}, не доставлено {len(undelivered)}, "
+        f"узнать не удалось {len(unanswerable)}",
         blocked_by=[
             {
                 "task_id": e.get("task_id"),
                 "status": e.get("status"),
-                "delivered": bool(e.get("merges") or 0),
+                "delivered": e.get("delivered"),
+                "delivery_path": e.get("delivery_path", ""),
+                "reason": e.get("reason", ""),
             }
             for e in blocked_by
         ],
         undelivered=len(undelivered),
+        unanswerable=len(unanswerable),
     )
 
 
