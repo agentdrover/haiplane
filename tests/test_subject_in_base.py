@@ -404,3 +404,41 @@ async def test_hitting_the_file_ceiling_says_the_look_was_partial(
     assert "far_defined_subject (просмотрено 2 из 6)" in presence.reason
     assert "Ответ неполный" in presence.reason
     assert "вовсе" not in presence.reason
+
+
+async def test_an_unreadable_candidate_among_readable_ones_says_the_look_was_partial(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path: Path
+):
+    """Часть файлов прочиталась, часть нет — просмотр неполон, а не «не определением».
+
+    Неразрешённая находка cf396b00fbf2ec25: при смеси читаемых и неразбираемых
+    попаданий имя уходило в text_only, хотя определение могло лежать как раз в
+    непрочитанном файле. Для «не прочиталось ни одного» это уже закрыто (#725);
+    здесь то же правило для «прочиталось не всё».
+    """
+    from hub.services.readiness import subject_presence
+
+    workspace = _clone_with_a_far_definition(tmp_path)
+    _use_real_git_reads(monkeypatch)
+    real_read = plugins.git_ops.file_at_ref
+
+    async def definer_unreadable(repo_path, ref, path):
+        if path == DEFINER:
+            return None
+        return await real_read(repo_path, ref, path)
+
+    monkeypatch.setattr(
+        plugins.git_ops, "file_at_ref", definer_unreadable, raising=False
+    )
+    project_id = await _project_at(db, workspace)
+    task_id = await _task_named(
+        client, db, project_id, "Опереться на far_defined_subject."
+    )
+    row = await repo.get_task(db, task_id)
+    presence = await subject_presence(db, dict(row))
+
+    assert "far_defined_subject" in presence.missing
+    assert "far_defined_subject" not in presence.text_only
+    assert "не определением" not in presence.reason
+    assert "far_defined_subject (просмотрено 5 из 6)" in presence.reason
+    assert "Ответ неполный" in presence.reason

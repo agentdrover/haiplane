@@ -545,10 +545,11 @@ async def _widen_the_search(repo_path: str, ref: str, names: list[str]) -> _Wide
             # Файлы нашлись, но ни один не прочитался: «посмотреть не
             # удалось» — не «есть только как текст» (#725).
             found.unsearched.add(name)
-        elif len(candidates) > len(paths):
-            # Определение может лежать в неразобранном хвосте: сказать «не
-            # определением» значило бы выдать частичный просмотр за полный.
-            found.partial[name] = (len(paths), len(candidates))
+        elif read_count < len(candidates):
+            # Определение может лежать в неразобранном хвосте или в файле,
+            # который не прочитался: сказать «не определением» значило бы
+            # выдать частичный просмотр за полный (находка cf396b00fbf2ec25).
+            found.partial[name] = (read_count, len(candidates))
         else:
             found.text_only[name] = paths
     return found
