@@ -2269,6 +2269,7 @@ async def api_ci_run_report(
             reason=body.reason,
             reported_by=body.reported_by or identity.username,
             checks=body.checks,
+            mutations=body.mutations,
         )
     except LookupError:
         raise HTTPException(404, "task not found") from None

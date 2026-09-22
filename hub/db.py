@@ -1383,6 +1383,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE ci_run_reports ADD COLUMN checks TEXT NOT NULL DEFAULT '{}'",
     ),
     (
+        # Mutation run over the functions a PR changed (#1270): warning only.
+        # Its own column rather than an entry in ``checks``: a check outcome
+        # feeds the reviewer's prepass, and a surviving mutant is a named
+        # suspicion about a test, not proof the code is broken. '{}' for every
+        # older report means "no mutation run was reported" — never "none
+        # survived".
+        "add_ci_run_reports_mutations",
+        "ALTER TABLE ci_run_reports ADD COLUMN mutations TEXT NOT NULL DEFAULT '{}'",
+    ),
+    (
         # Defect passport (#909, epic #900): the stage a defect was caught at.
         #
         # Until now the answer was reconstructed — ``escaped_defects`` infers a
