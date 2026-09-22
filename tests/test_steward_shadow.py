@@ -1441,6 +1441,984 @@ async def test_the_working_deadline_starts_when_work_does(
 
 
 # ---------------------------------------------------------------------------
+# Реплей истории сдач (#1167)
+# ---------------------------------------------------------------------------
+
+_SHA = "c" * 40
+
+
+class _HistoricalGitOps:
+    """Клон, в котором ветки уже нет, а коммит есть.
+
+    Ровно то состояние, из-за которого наивная сборка выродилась бы в
+    эскалации: ``head_sha`` и ``fetch_base`` по ИМЕНИ ветки не отвечают,
+    ``commit_exists`` по sha — отвечает, и ``branch_diff_paths`` принимает
+    sha там, где живой сборщик передавал бы имя.
+    """
+
+    def __init__(
+        self,
+        paths: list[str],
+        *,
+        commit_here: bool = True,
+        base: str = "develop",
+        diff_empty: bool = False,
+        diff_unreadable: bool = False,
+        ancestor: bool | None = False,
+        local_ancestor: bool | None = False,
+        other_refs: tuple[str, ...] = (),
+    ) -> None:
+        self.paths = paths
+        self.commit_here = commit_here
+        #: База, которая в этом клоне вообще есть. Спросили другую — клон не
+        #: отвечает, как не ответил бы живой git на неизвестное имя. Без
+        #: этого стенд не отличал бы «спросили ту базу, против которой
+        #: судили» от «спросили сегодняшнюю»: заглушка отдавала пути на
+        #: ЛЮБУЮ базу, и подмена точки сравнения проходила зелёной.
+        self.base = base
+        #: Трёхточечный дифф вернул ПУСТОЙ список — топология, а не отказ.
+        self.diff_empty = diff_empty
+        #: Гит не ответил вовсе: ``None``, а не пустой список. Отдельный
+        #: флаг, потому что отказ гита и пустой дифф — разные ответы, и
+        #: заглушка обязана уметь дать каждый.
+        self.diff_unreadable = diff_unreadable
+        #: Лежит ли коммит в истории ``origin/<база>`` — той вершины, против
+        #: которой ``branch_diff_paths`` и считает дифф. Три ответа, как у
+        #: живого git: True, False и None («спросить не удалось»).
+        self.ancestor = ancestor
+        #: То же про ОТСТАВШИЙ локальный ref. По умолчанию False: в общем
+        #: клоне хаба локальный ``develop`` годами позади ``origin/develop``
+        #: (#824, #1046), и коммит, давно уехавший в origin, локальному
+        #: имени не предок. Вопрос, заданный сюда вместо origin, отвечает
+        #: «дифф не схлопнулся» на схлопнувшемся диффе.
+        self.local_ancestor = local_ancestor
+        #: Ref-ы, которые в этом клоне ЕСТЬ, но коммита в себе не несут.
+        #: Нужны, чтобы отличить «спросили не тот ref, и его тут нет»
+        #: (живой git отвечает ``None``, и сдача уходит к человеку) от
+        #: «спросили не тот ref, а он есть»: там ответ ``False``, дыра не
+        #: ставится, и схлопнувшийся дифф проходит за измеренную
+        #: поверхность. Опасно именно второе, и запинить надо его.
+        self.other_refs = other_refs
+        self.asked = []
+        self.bases = []
+        self.ancestry_asked = []
+
+    async def commit_exists(self, repo, sha):
+        return self.commit_here
+
+    async def branch_diff_paths(self, branch, base_branch=None, repo=None):
+        self.asked.append(branch)
+        self.bases.append(base_branch)
+        # Ветки нет: спросили по имени — ответа нет. Спросили по коммиту — есть.
+        if branch != _SHA:
+            return None
+        if base_branch != self.base:
+            return None
+        if self.diff_unreadable:
+            return None
+        return [] if self.diff_empty else list(self.paths)
+
+    async def is_ancestor(self, repo, ancestor, descendant):
+        self.ancestry_asked.append(descendant)
+        # Каждому ref — свой ответ. Заглушка, отвечающая одно и то же на
+        # любое имя, не видит рассинхрона origin/local, а именно он и
+        # превращал схлопнувшийся дифф в «ничего не менялось».
+        if descendant == f"origin/{self.base}":
+            return self.ancestor
+        if descendant == self.base:
+            return self.local_ancestor
+        if descendant in self.other_refs:
+            # Ref в клоне есть, коммита в себе не несёт: живой git отвечает
+            # rc=1, то есть False. Именно этот ответ и опасен — он читается
+            # как «дифф не схлопнулся».
+            return False
+        # Такого ref в клоне нет — живой git отвечает None (cat-file -e).
+        return None
+
+    async def head_sha(self, repo, base):
+        return ""
+
+    async def fetch_base(self, repo, base):
+        return (False, "ветка удалена после мержа")
+
+    async def branch_ci_runs(self, branch, repo=None, gh_repo=None, forge=""):
+        return None
+
+
+async def _historical_project(db: aiosqlite.Connection, slug: str) -> int:
+    project_id = await repo.create_project(
+        db, slug=slug, name=slug, workspace_path="/tmp/ws", status="active"
+    )
+    await db.execute(
+        "UPDATE projects SET default_branch='develop' WHERE id=?", (project_id,)
+    )
+    await db.commit()
+    return project_id
+
+
+async def _historical_submission(
+    db: aiosqlite.Connection,
+    project_id: int,
+    *,
+    human_verdict: str,
+    areas: list[str] | None = None,
+    raw_count: int = 4,
+    confirmed: str = "[]",
+    tokens: int = 1000,
+) -> int:
+    """Завершённая сдача: закреплённый sha, отчёт, зелёный CI, вердикт."""
+    areas = areas if areas is not None else ["hub/services/steward_shadow.py"]
+    task_id = await repo.create_task(
+        db,
+        title="историческая сдача",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="pda_claude",
+        rationale="",
+        status="done",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(
+        db,
+        task_id,
+        project_id=project_id,
+        submission_generation=1,
+        submission_sha=_SHA,
+        submission_model="claude-opus-5",
+        risk_class="R2",
+        affected_areas=json.dumps(areas),
+        # Ветка удалена после мержа — имя осталось, ref не резолвится.
+        branch=f"task-{task_id}/gone",
+    )
+    review_id = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="grok-4.6",
+        raw_count=raw_count,
+        findings_confirmed=confirmed,
+        tokens_spent=tokens,
+        profile="deep",
+    )
+    await db.execute(
+        "UPDATE machine_reviews SET provider_tokens=? WHERE id=?",
+        (tokens, review_id),
+    )
+    await repo.upsert_ci_run_report(
+        db,
+        task_id=task_id,
+        head_sha=_SHA,
+        ac_results="{}",
+        validation_status="pass",
+        validation_log="",
+        reason="",
+        reported_by="ci",
+    )
+    await repo.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="Denis",
+        payload={"submission_generation": 1, "verdict": human_verdict},
+    )
+    # Вердикт должен лежать ПОЗЖЕ всего остального: рубеж пакета — его метка.
+    await db.execute(
+        "UPDATE events SET created_at=datetime('now', '+1 hour') "
+        "WHERE task_id=? AND kind='review_verdict_recorded'",
+        (task_id,),
+    )
+    await db.commit()
+    return task_id
+
+
+async def test_offline_replay_makes_no_provider_calls(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167 AC-1: отчёт с таблицей 2x2 и НИ ОДНОГО обращения к провайдеру.
+
+    Проверяется по коду, а не по описанию: клиент провайдера подменён на
+    счётчик, и он обязан остаться нулевым.
+    """
+    from hub.integrations.registry import plugins
+
+    project_id = await _historical_project(db, "replay-free")
+    monkeypatch.setattr(
+        plugins, "git_ops", _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    )
+    await _historical_submission(db, project_id, human_verdict="approved")
+    await _historical_submission(
+        db, project_id, human_verdict="changes_requested", confirmed='[{"title": "x"}]'
+    )
+
+    calls = AsyncMock(return_value=({}, None))
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", calls)
+    usage = AsyncMock(return_value={})
+    monkeypatch.setattr(cursor_cloud, "get_usage", usage)
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries)
+    report = sh.replay(cases, window_days=60, excluded=excluded)
+
+    assert calls.await_count == 0
+    assert usage.await_count == 0
+    assert report.provider_calls == 0
+    # Таблица 2x2 непуста и различает клетки, а не суммирует их.
+    assert report.table.judged == 2
+    assert report.table.both_approve == 1
+    assert report.table.both_changes == 1
+    assert report.table.false_approve == 0
+    text = sh.render_report(report)
+    assert "Таблица 2x2" in text
+    assert "Размер выборки" in text
+    assert "обращений к провайдеру за этот прогон: 0" in text
+
+
+async def test_historical_packet_rejects_post_submission_events(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167 AC-2: строка моложе рубежа роняет сборку, а не въезжает в пакет.
+
+    Утечка тут не абстрактная: пакет, собранный из сегодняшнего состояния,
+    несёт человеческий вердикт, и реплей над ним мерил бы списывание.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import PacketLeak, build_historical_packet
+
+    project_id = await _historical_project(db, "replay-leak")
+    monkeypatch.setattr(
+        plugins, "git_ops", _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    )
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+
+    rows = await fetchall(
+        db,
+        "SELECT created_at FROM events WHERE task_id=? AND "
+        "kind='review_verdict_recorded'",
+        (task_id,),
+    )
+    cutoff = dict(rows[0])["created_at"]
+
+    # До рубежа собирается.
+    packet = await build_historical_packet(db, task_id, 1, cutoff)
+    assert packet.fact("machine_review_report").is_present
+    # И не несёт человеческого вердикта ни одним полем.
+    assert packet.brief is None
+
+    # Отчёт, дописанный ПОСЛЕ вердикта, — это будущее. Сборка обязана упасть.
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=datetime('now', '+2 hours') "
+        "WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+    with pytest.raises(PacketLeak) as leak:
+        await build_historical_packet(db, task_id, 1, cutoff)
+    assert leak.value.source == "machine_review_report"
+
+
+async def test_historical_packet_rebuilt_from_sha_not_branch(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167 AC-3: ветки нет, а факты о коде present — потому что спросили sha.
+
+    Наивная сборка спросила бы имя ветки, получила бы absent на обоих фактах,
+    и вся историческая выборка выродилась бы в эскалации-артефакты.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import CorpusExclusion, build_historical_packet
+
+    project_id = await _historical_project(db, "replay-sha")
+    git = _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+    rows = await fetchall(
+        db,
+        "SELECT created_at FROM events WHERE task_id=? AND "
+        "kind='review_verdict_recorded'",
+        (task_id,),
+    )
+    cutoff = dict(rows[0])["created_at"]
+
+    packet = await build_historical_packet(db, task_id, 1, cutoff)
+    tip = packet.fact("branch_tip")
+    surface = packet.fact("diff_vs_areas")
+    assert tip.is_present and surface.is_present
+    assert tip.value["tip"] == _SHA
+    # Восстановление названо восстановлением: «вершина не двигалась» здесь
+    # не наблюдение, и пакет об этом говорит.
+    assert tip.value["reconstructed"] is True
+    assert tip.value["observed"] is False
+    # Дифф спрашивали по коммиту, а не по имени ветки.
+    assert git.asked == [_SHA]
+
+    # Коммита нет — сдача ВЫБЫВАЕТ с причиной, а не входит с пустыми фактами.
+    monkeypatch.setattr(
+        plugins,
+        "git_ops",
+        _HistoricalGitOps(["x"], commit_here=False),
+    )
+    with pytest.raises(CorpusExclusion) as gone:
+        await build_historical_packet(db, task_id, 1, cutoff)
+    assert gone.value.reason == "sha_unresolved"
+
+    # Третий выход: коммит генерации не записан НИГДЕ. Не «задача помнит
+    # другую генерацию» — леджер сдач помнит каждую, и следующий тест это
+    # проверяет; сюда попадают только сдачи без единой записи о коммите.
+    monkeypatch.setattr(plugins, "git_ops", git)
+    await repo.update_task(
+        db, task_id, submission_generation=2, submission_sha="d" * 40
+    )
+    with pytest.raises(CorpusExclusion) as stale:
+        await build_historical_packet(db, task_id, 1, cutoff)
+    assert stale.value.reason == "sha_unrecorded"
+
+
+async def test_resubmitted_task_keeps_its_own_generation_sha(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: возврат человеком почти всегда влечёт пересдачу — и корпус
+    обязан пережить её, иначе он теряет ровно ту половину, ради которой
+    существует.
+
+    tasks.submission_sha — одно поле, пересдача его перезаписывает. Леджер
+    сдач (#880) помнит каждую генерацию, и коммит берётся оттуда: тем же
+    путём восстанавливает sha finding_evidence. Тест ведёт сдачу через
+    collect_corpus → build_cases, а не только через сборщик: подмена
+    аргумента в проводке вернула бы утечку при зелёном юните.
+    """
+    from hub.integrations.registry import plugins
+
+    project_id = await _historical_project(db, "replay-resubmit")
+    git = _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+
+    # Леджер помнит коммит первой генерации; задача уже пересдана и помнит
+    # третий, а второй сдачи не было вовсе.
+    await db.execute(
+        "INSERT INTO submissions (task_id, generation, sha, base_branch) "
+        "VALUES (?, 1, ?, 'develop')",
+        (task_id, _SHA),
+    )
+    await repo.update_task(
+        db, task_id, submission_generation=3, submission_sha="e" * 40
+    )
+    # И у пересдачи есть свой, более поздний отчёт. «Последний отчёт задачи»
+    # описывал бы именно его — то есть другой код.
+    later = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=3,
+        model="grok-4.6",
+        raw_count=9,
+        findings_confirmed='[{"title": "находка о другом коде"}]',
+    )
+    await db.commit()
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries)
+
+    assert excluded == [], f"сдача выброшена зря: {excluded}"
+    assert len(cases) == 1
+    # Механизм зафиксирован ЧИСЛАМИ, а не отсутствием исключения: дифф
+    # спрошен по коммиту ПЕРВОЙ генерации, и отчёт взят её же, а не поздний.
+    assert git.asked == [_SHA]
+    report = cases[0].packet.fact("machine_review_report")
+    assert report.is_present, "отчёт своей генерации потерян — корпус выродится"
+    assert report.value["review_id"] != later
+    assert report.value["generation"] == 1
+    assert cases[0].packet.fact("branch_tip").value["tip"] == _SHA
+
+    # А ВОТ КАРТОЧКА не восстановима, и пакет об этом говорит, вместо того
+    # чтобы сверить дифф первой генерации с областями, дописанными на
+    # третьей: расширенный набор ответил бы «в заявленном» мягче правды.
+    surface = cases[0].packet.fact("diff_vs_areas")
+    risk = cases[0].packet.fact("risk_class")
+    assert surface.is_absent and surface.reason == "card_not_recorded"
+    assert risk.is_absent and risk.reason == "card_not_recorded"
+    # Декларация модели — из того же одного поля, и для прошлой генерации
+    # она тоже чужая; корпус её не копирует.
+    assert cases[0].entry.implementer_model == ""
+
+    # Исход — эскалация, и она СЧИТАЕТСЯ ОТДЕЛЬНО: «политика вывела к
+    # человеку» и «нам нечем было судить» — разные утверждения.
+    replayed = sh.replay(cases, excluded=excluded)
+    assert replayed.table.escalated == 1
+    assert replayed.card_not_recorded == 1
+    assert "карточка сдачи не сохранена" in sh.render_report(replayed)
+
+
+async def test_historical_rows_do_not_clear_act_refusals(db: aiosqlite.Connection):
+    """#1167 AC-4: сколько ни залей истории — sample_too_small остаётся.
+
+    Защитный отказ не снимается данными, под которые он не проектировался
+    (#585). Механизм — отдельный kind, а не фильтр: строку, которой
+    ``shadow_table`` не видит по своему же запросу, нельзя зачесть забыв
+    дописать условие.
+    """
+    project_id = await _historical_project(db, "replay-refusal")
+    before = await sh.act_refusals(db)
+    assert {code for code, _ in before} == {
+        sh.REASON_SAMPLE_TOO_SMALL,
+        sh.REASON_NO_SAMPLE,
+    }
+
+    for _ in range(40):
+        task_id = await _historical_submission(
+            db, project_id, human_verdict="changes_requested"
+        )
+        await sh.record_historical_judgement(db, task_id, 1, "changes_requested")
+
+    after = await sh.act_refusals(db)
+    assert {code for code, _ in after} == {
+        sh.REASON_SAMPLE_TOO_SMALL,
+        sh.REASON_NO_SAMPLE,
+    }, "исторические строки сняли отказ — ровно то, что запрещено #585"
+    # При этом они СЧИТАЮТСЯ и видны отдельно.
+    historical = await sh.historical_table(db)
+    assert historical.both_changes == 40
+    assert (await sh.shadow_table(db)).judged == 0
+
+
+async def test_replay_report_omits_share_on_small_sample(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167 AC-5: на недоборе доля не печатается вовсе, а называется причина."""
+    from hub.integrations.registry import plugins
+
+    project_id = await _historical_project(db, "replay-small")
+    monkeypatch.setattr(
+        plugins, "git_ops", _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    )
+    await _historical_submission(db, project_id, human_verdict="approved")
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries)
+    small = sh.render_report(sh.replay(cases, excluded=excluded))
+    assert "НЕ ПЕЧАТАЕТСЯ" in small
+    assert f"меньше порога {sh.REPLAY_MIN_SAMPLE}" in small
+    assert "Доля эскалаций: 0%" not in small
+    # Правило одно на ВСЕ доли отчёта, а не на ту, о которой вспомнили.
+    # Доля исключённых печаталась процентом на выборке из одной сдачи —
+    # счётчик честен, процент рядом с ним читается как измерение.
+    assert "%" not in small, small
+    assert "Исключено из корпуса: 0" in small
+
+    empty = sh.render_report(sh.replay([], excluded=[]))
+    # Пустая выборка и малая выборка — РАЗНЫЕ ответы, а не один.
+    assert "не измерена" in empty
+    assert "НЕ ПЕЧАТАЕТСЯ" not in empty
+
+
+async def test_replay_is_deterministic(db: aiosqlite.Connection, monkeypatch):
+    """#1167 AC-6: один корпус и одна политика — побайтово один отчёт."""
+    from hub.integrations.registry import plugins
+
+    project_id = await _historical_project(db, "replay-determinism")
+    monkeypatch.setattr(
+        plugins, "git_ops", _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    )
+    for verdict in ("approved", "changes_requested", "approved"):
+        await _historical_submission(db, project_id, human_verdict=verdict)
+
+    first_entries, dropped = await sh.collect_corpus(db, days=60)
+    first_cases, first_excluded = await sh.build_cases(db, first_entries)
+    first = sh.render_report(sh.replay(first_cases, excluded=first_excluded))
+
+    second_entries, dropped = await sh.collect_corpus(db, days=60)
+    second_cases, second_excluded = await sh.build_cases(db, second_entries)
+    second = sh.render_report(sh.replay(second_cases, excluded=second_excluded))
+
+    assert first == second
+
+    # И бэкфилл без потолка не стартует, назвав цену вместо умолчания.
+    refused = sh.plan_backfill(first_cases, 0)
+    assert refused.refused
+    assert refused.runs == 0
+    planned = sh.plan_backfill(first_cases, 2)
+    assert planned.runs == 2
+    assert planned.tokens_estimate == 2 * sh.BACKFILL_TOKENS_PER_RUN
+
+
+async def test_corpus_names_every_submission_it_drops(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: знаменатель, из которого молча вычли, — не измерение (#516).
+
+    events.task_id намеренно без внешнего ключа: событие переживает задачу.
+    Прежняя редакция делала на таком вердикте continue, и сдача исчезала и
+    из корпуса, и из списка исключённых — «доля от всех сдач окна»
+    занижалась молча.
+    """
+    from hub.integrations.registry import plugins
+
+    project_id = await _historical_project(db, "replay-dropped")
+    monkeypatch.setattr(
+        plugins, "git_ops", _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    )
+    kept = await _historical_submission(db, project_id, human_verdict="approved")
+    orphan = await _historical_submission(db, project_id, human_verdict="approved")
+    await db.execute("DELETE FROM tasks WHERE id=?", (orphan,))
+    await db.commit()
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+
+    assert [e.task_id for e in entries] == [kept]
+    assert [(d.task_id, d.reason) for d in dropped] == [(orphan, "no_task")]
+
+    # И доезжает до отчёта: склейка живёт в библиотеке, а не у вызывающего.
+    _, excluded = await sh.build_cases(db, entries, dropped)
+    assert [(e.task_id, e.reason) for e in excluded] == [(orphan, "no_task")]
+    assert "no_task: 1" in sh.render_report(
+        sh.replay(await _cases_only(db, entries), excluded=excluded)
+    )
+
+
+async def _cases_only(db: aiosqlite.Connection, entries):
+    cases, _ = await sh.build_cases(db, entries)
+    return cases
+
+
+async def test_card_gap_counter_counts_outcomes_not_holes(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: счётчик «эскалаций не по существу» не смеет обгонять эскалации.
+
+    Лестница до карточки может и не дойти: отчёт с находками отвечает
+    changes_requested на первой ступени, и такая сдача уезжает в клетку
+    2x2, а не в эскалации. Счётчик, прибавленный по НАЛИЧИЮ дыры, обещал
+    бы читателю вычесть из эскалаций больше, чем их есть.
+    """
+    from hub.integrations.registry import plugins
+
+    project_id = await _historical_project(db, "replay-cardgap")
+    git = _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(
+        db,
+        project_id,
+        human_verdict="changes_requested",
+        confirmed='[{"title": "настоящая находка"}]',
+    )
+    await db.execute(
+        "INSERT INTO submissions (task_id, generation, sha, base_branch) "
+        "VALUES (?, 1, ?, 'develop')",
+        (task_id, _SHA),
+    )
+    await repo.update_task(
+        db, task_id, submission_generation=2, submission_sha="f" * 40
+    )
+    await db.commit()
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries, dropped)
+    report = sh.replay(cases, excluded=excluded)
+
+    # Дыра в карточке есть...
+    assert cases[0].packet.fact("diff_vs_areas").reason == "card_not_recorded"
+    # ...но исход определила НАХОДКА, и это клетка таблицы, а не эскалация.
+    assert report.table.both_changes == 1
+    assert report.table.escalated == 0
+    assert report.card_not_recorded == 0, "счётчик обогнал эскалации"
+    # И дифф по коммиту прочитан, поэтому доля восстановленных не страдает
+    # за то, к чему реконструкция отношения не имеет.
+    assert report.reconstructed == 1.0
+
+
+async def test_collapsed_three_dot_diff_is_a_named_hole(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: пустой трёхточечный дифф — не «сдача ничего не меняла».
+
+    ``branch_diff_paths`` считает ``base...sha`` от merge-base. Как только
+    закреплённый коммит попал в историю сегодняшней базы (доставка
+    настоящим мержем, а не squash), merge-base равен самому коммиту, и
+    список пуст ВСЕГДА — что бы сдача ни меняла. Проверено на живой
+    истории: у доставленной задачи #1185 вершина 1695a41 — предок develop,
+    ``git diff --name-only origin/develop...1695a41`` даёт 0 файлов, а сам
+    коммит трогает 2.
+
+    Опаснее всего, что пустой список — не ``None``: без этой проверки пакет
+    не исключается, поверхность читается как «в заявленном», класс не
+    поднимается, а доля восстановленного засчитывает провал успехом.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import (
+        build_historical_packet,
+        diff_recovered,
+        reconstructed_share,
+    )
+
+    project_id = await _historical_project(db, "replay-collapsed")
+    git = _HistoricalGitOps(
+        ["hub/services/steward_shadow.py"], diff_empty=True, ancestor=True
+    )
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+    rows = await fetchall(
+        db,
+        "SELECT created_at FROM events WHERE task_id=? AND "
+        "kind='review_verdict_recorded'",
+        (task_id,),
+    )
+    cutoff = dict(rows[0])["created_at"]
+
+    packet = await build_historical_packet(db, task_id, 1, cutoff)
+    surface = packet.fact("diff_vs_areas")
+    risk = packet.fact("risk_class")
+    assert surface.is_absent, "пустой дифф выдан за измеренную поверхность"
+    assert surface.reason == "historical_diff_collapsed"
+    assert risk.is_absent and risk.reason == "historical_diff_collapsed"
+    assert "истории базы" in surface.detail
+    # Отказ ГИТА и схлопнувшаяся топология — РАЗНЫЕ коды: доля
+    # восстановленного считает первое, и путать их значит отменять бэкфилл
+    # по причине, к реконструкции по sha отношения не имеющей.
+    assert surface.reason != "historical_diff_unreadable"
+    assert diff_recovered(packet) is False
+    assert reconstructed_share([packet]) == 0.0
+
+    # И это доезжает до исхода: судить не по чему — значит к человеку.
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries, dropped)
+    report = sh.replay(cases, excluded=excluded)
+    assert report.table.escalated == 1
+    assert report.table.both_approve == 0, "approve на невосстановимой поверхности"
+    assert report.card_not_recorded == 0, "дыра карточки тут ни при чём"
+    assert report.reconstructed == 0.0
+
+
+async def test_unanswered_ancestry_is_not_read_as_an_empty_diff(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: «не смогли спросить» — не «сдача ничего не меняла».
+
+    Пустой дифф значит одно из двух, и различает их только вопрос о предке.
+    Когда git на него не ответил, пустота недоказуема как измерение — и
+    падает туда же, куда любой другой отказ гита.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import build_historical_packet, diff_recovered
+
+    project_id = await _historical_project(db, "replay-ancestry-unknown")
+    monkeypatch.setattr(
+        plugins,
+        "git_ops",
+        _HistoricalGitOps(["x"], diff_empty=True, ancestor=None),
+    )
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+    rows = await fetchall(
+        db,
+        "SELECT created_at FROM events WHERE task_id=? AND "
+        "kind='review_verdict_recorded'",
+        (task_id,),
+    )
+    packet = await build_historical_packet(db, task_id, 1, dict(rows[0])["created_at"])
+    surface = packet.fact("diff_vs_areas")
+    assert surface.is_absent and surface.reason == "historical_diff_unreadable"
+    assert diff_recovered(packet) is False
+
+
+async def test_ancestry_is_asked_against_the_ref_the_diff_used(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: вопрос о предке задаётся ТОЙ вершине, против которой считан дифф.
+
+    ``branch_diff_paths`` резолвит базу remote-first (#762) и фетчем двигает
+    ``origin/<база>``; локальный ref не трогает никто, и в общем клоне хаба
+    он отстаёт (#824, #1046). Воспроизведено настоящим git на клоне с
+    отставшим локальным ``develop``:
+
+        git diff --name-only origin/develop...<sha>        -> 0 файлов
+        git merge-base --is-ancestor <sha> develop         -> rc=1
+        git merge-base --is-ancestor <sha> origin/develop  -> rc=0
+
+    Спросив голое имя, детектор коллапса получает «не предок», дыру не
+    ставит, и ``_surface_fact`` на пустом списке отвечает present +
+    ``within_declared=True``: одобрение по измерению, которого не было.
+    Заглушка отвечает на два ref РАЗНОЕ — иначе тест зелен при любом из них.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import build_historical_packet, diff_recovered
+
+    project_id = await _historical_project(db, "replay-ancestry-ref")
+    git = _HistoricalGitOps(
+        ["hub/services/steward_shadow.py"],
+        diff_empty=True,
+        ancestor=True,
+        local_ancestor=False,
+    )
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+    rows = await fetchall(
+        db,
+        "SELECT created_at FROM events WHERE task_id=? AND "
+        "kind='review_verdict_recorded'",
+        (task_id,),
+    )
+
+    packet = await build_historical_packet(db, task_id, 1, dict(rows[0])["created_at"])
+
+    # Сначала ПОСЛЕДСТВИЕ, потом уже способ: тест обязан краснеть от того,
+    # что схлопнувшийся дифф прошёл за измерение, а не от одного лишь имени
+    # ref в журнале заглушки.
+    surface = packet.fact("diff_vs_areas")
+    assert surface.is_absent, "пустой дифф выдан за измеренную поверхность"
+    assert surface.reason == "historical_diff_collapsed"
+    assert packet.fact("risk_class").is_absent
+    assert diff_recovered(packet) is False
+    assert git.ancestry_asked == ["origin/develop"], (
+        "предка спросили не у той вершины, против которой считан дифф: "
+        f"{git.ancestry_asked}"
+    )
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries, dropped)
+    report = sh.replay(cases, excluded=excluded)
+    assert report.table.escalated == 1
+    assert report.table.both_approve == 0, "approve на невосстановимой поверхности"
+
+
+async def test_collapse_is_detected_on_a_base_that_is_not_develop(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: детектор коллапса держится на БАЗЕ СДАЧИ, а не на слове develop.
+
+    Дыра, найденная машинным ревью и воспроизведённая мутацией: зашей в
+    ``_diff_base_ref`` строку ``"origin/develop"`` — и все три теста про
+    пустой дифф остаются зелёными, потому что база у них у всех develop.
+    То есть проверялся механизм ``origin/``, но не то, что спрошена ИМЕННО
+    та база, против которой дифф посчитан.
+
+    Здесь база другая и клон РЕАЛЬНЫЙ: в нём есть и ``origin/release-2026-08``
+    (туда работу и влили), и ``origin/develop`` (сегодняшняя база проекта),
+    причём коммита в develop нет. Три ответа git расходятся:
+
+        merge-base --is-ancestor <sha> origin/release-2026-08  -> rc=0
+        merge-base --is-ancestor <sha> origin/develop          -> rc=1
+
+    Спросив develop, детектор получает честное «не предок», дыру не ставит,
+    и ``_surface_fact`` на пустом списке отвечает present +
+    ``within_declared=True``. Это не косметика имени дыры: сдача с
+    невосстановимой поверхностью уходит в both_approve. Поэтому тест сперва
+    проверяет ПОСЛЕДСТВИЕ и только потом журнал заглушки.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import build_historical_packet, diff_recovered
+
+    project_id = await _historical_project(db, "replay-collapse-other-base")
+    git = _HistoricalGitOps(
+        ["hub/services/steward_shadow.py"],
+        base="release-2026-08",
+        diff_empty=True,
+        ancestor=True,
+        other_refs=("origin/develop", "develop"),
+    )
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+    # Судили против релизной ветки; сегодняшняя база проекта — develop.
+    await db.execute(
+        "INSERT INTO submissions (task_id, generation, sha, base_branch) "
+        "VALUES (?, 1, ?, 'release-2026-08')",
+        (task_id, _SHA),
+    )
+    await db.commit()
+    rows = await fetchall(
+        db,
+        "SELECT created_at FROM events WHERE task_id=? AND "
+        "kind='review_verdict_recorded'",
+        (task_id,),
+    )
+
+    packet = await build_historical_packet(db, task_id, 1, dict(rows[0])["created_at"])
+
+    surface = packet.fact("diff_vs_areas")
+    assert surface.is_absent, (
+        "схлопнувшийся дифф выдан за измеренную поверхность: предка спросили "
+        f"не у базы сдачи, а у {git.ancestry_asked}"
+    )
+    assert surface.reason == "historical_diff_collapsed"
+    assert packet.fact("risk_class").is_absent
+    assert diff_recovered(packet) is False
+    assert git.ancestry_asked == ["origin/release-2026-08"], (
+        "предка спросили не у той базы, против которой считан дифф: "
+        f"{git.ancestry_asked}"
+    )
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries, dropped)
+    report = sh.replay(cases, excluded=excluded)
+    assert report.table.escalated == 1
+    assert report.table.both_approve == 0, "approve на невосстановимой поверхности"
+    assert report.reconstructed == 0.0
+
+
+async def test_git_refusing_the_diff_is_not_a_card_gap(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: ``diff_paths is None`` — отказ ГИТА, и он запинен здесь.
+
+    Ветка ``if diff_paths is None`` в ``_card_facts`` до сих пор не была
+    пройдена ни одним тестом задачи: у ``test_unanswered_ancestry`` дифф
+    пустой (``[]``), а не непрочитанный, card-gap тесты получают непустой
+    список, и заглушка отдавала ``None`` только на чужую базу — то есть на
+    сдачу, которую корпус и так выбрасывает.
+
+    Разница несущая: ``diff_recovered`` засчитывает ``card_not_recorded``
+    восстановлением, потому что дифф там ПРОЧИТАН, а сверять его не с чем.
+    Отказ гита восстановлением не является, и подмена кода тихо подняла бы
+    долю восстановленного — то самое число, по которому задача решает,
+    отменять ли бэкфилл («ниже 70%»).
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import (
+        build_historical_packet,
+        diff_recovered,
+        reconstructed_share,
+    )
+
+    project_id = await _historical_project(db, "replay-diff-unreadable")
+    git = _HistoricalGitOps(["hub/services/steward_shadow.py"], diff_unreadable=True)
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+    rows = await fetchall(
+        db,
+        "SELECT created_at FROM events WHERE task_id=? AND "
+        "kind='review_verdict_recorded'",
+        (task_id,),
+    )
+
+    packet = await build_historical_packet(db, task_id, 1, dict(rows[0])["created_at"])
+
+    # Сначала ПОСЛЕДСТВИЕ: отказ гита, зачтённый восстановлением, — это
+    # завышенная доля, по которой задача решает, отменять ли бэкфилл.
+    assert diff_recovered(packet) is False, "отказ гита зачтён восстановлением"
+    assert reconstructed_share([packet]) == 0.0
+    surface = packet.fact("diff_vs_areas")
+    risk = packet.fact("risk_class")
+    assert surface.is_absent and surface.reason == "historical_diff_unreadable"
+    assert risk.is_absent and risk.reason == "historical_diff_unreadable"
+    assert surface.reason != "card_not_recorded", "отказ гита выдан за дыру карточки"
+    assert "не прочитать" in surface.detail
+    # Пустоты не было — предка никто не спрашивал: ``None`` и ``[]`` идут
+    # разными ветками, и путать их значит спрашивать про несуществующий дифф.
+    assert git.ancestry_asked == []
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries, dropped)
+    report = sh.replay(cases, excluded=excluded)
+    assert report.card_not_recorded == 0, "отказ гита посчитан дырой карточки"
+    assert report.reconstructed == 0.0
+    assert report.table.both_approve == 0, "approve без прочитанной поверхности"
+
+
+async def test_historical_diff_is_asked_against_the_recorded_base(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: точка сравнения — та, против которой судили, и это проверяется.
+
+    Заглушка отвечает ТОЛЬКО на свою базу: спросили другую — ответа нет.
+    Без этого условия стенд не отличал бы базу из леджера от сегодняшней
+    базы проекта, и подмена точки сравнения проходила бы зелёной.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import BASE_FROM_LEDGER
+
+    project_id = await _historical_project(db, "replay-recorded-base")
+    git = _HistoricalGitOps(["hub/services/steward_shadow.py"], base="release-2026-08")
+    monkeypatch.setattr(plugins, "git_ops", git)
+    task_id = await _historical_submission(db, project_id, human_verdict="approved")
+    # Сдачу судили против релизной ветки; сегодняшняя база проекта — develop.
+    await db.execute(
+        "INSERT INTO submissions (task_id, generation, sha, base_branch) "
+        "VALUES (?, 1, ?, 'release-2026-08')",
+        (task_id, _SHA),
+    )
+    await db.commit()
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries, dropped)
+
+    assert excluded == [], f"сдача выброшена зря: {excluded}"
+    assert git.bases == ["release-2026-08"], "дифф спрошен не от той базы"
+    packet = cases[0].packet
+    assert packet.fact("diff_vs_areas").is_present
+    assert packet.diff_base == "release-2026-08"
+    assert packet.diff_base_source == BASE_FROM_LEDGER
+    report = sh.replay(cases, excluded=excluded)
+    assert report.base_not_recorded == 0
+    assert "база сдачи не записана): 0" in sh.render_report(report)
+
+
+async def test_substituted_base_is_counted_in_the_report(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: подмена базы обязана доехать до ОТЧЁТА, а не осесть в детали.
+
+    Леджер базу headless-сдачи не пишет, и тогда дифф считается от
+    сегодняшней базы проекта. Это не отказ — дифф посчитан, — но сравнивали
+    не с тем, с чем судил человек. Приписка внутри ``detail`` этого не
+    закрывает: по ней нельзя сложить число, и читатель отчёта не узнает,
+    скольких сдач это касается.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import BASE_NOT_RECORDED
+
+    project_id = await _historical_project(db, "replay-substituted-base")
+    monkeypatch.setattr(
+        plugins, "git_ops", _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    )
+    await _historical_submission(db, project_id, human_verdict="approved")
+
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries, dropped)
+
+    packet = cases[0].packet
+    assert packet.diff_base == "develop"
+    assert packet.diff_base_source == BASE_NOT_RECORDED
+    # И названа в самом факте — тем именем, против которого дифф посчитан на
+    # самом деле. «База не названа» было бы неправдой: пустое имя ниже
+    # подменяет PAIR_BASE_BRANCH, и пакет обязан говорить эту базу.
+    assert "сегодняшняя база проекта (develop)" in packet.fact("diff_vs_areas").detail
+    report = sh.replay(cases, excluded=excluded)
+    assert report.base_not_recorded == 1
+    text = sh.render_report(report)
+    assert "Сравнено с сегодняшней базой проекта (база сдачи не записана): 1" in text
+
+
+async def test_replay_without_policy_uses_the_live_token_budget(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1167: стенд без аргументов повторяет ПРОД, а не мягче его.
+
+    Ноль в token_budget означает «проверка выключена». Умолчание-ноль
+    показывало бы approve там, где живой гейт эскалирует перерасход, — и
+    отчёт, на который сошлются, врал бы в сторону автономии.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.gate_grounds import GatePolicy
+
+    monkeypatch.setattr(config, "REVIEW_TOKEN_BUDGET", 300000)
+    assert GatePolicy().token_budget == 300000
+
+    project_id = await _historical_project(db, "replay-budget")
+    monkeypatch.setattr(
+        plugins, "git_ops", _HistoricalGitOps(["hub/services/steward_shadow.py"])
+    )
+    await _historical_submission(
+        db, project_id, human_verdict="approved", tokens=400000
+    )
+    entries, dropped = await sh.collect_corpus(db, days=60)
+    cases, excluded = await sh.build_cases(db, entries, dropped)
+
+    report = sh.replay(cases, excluded=excluded)
+    assert dict(report.reasons).get("report_token_budget") == 1
+    assert report.table.both_approve == 0
+
+
 # Восстановление захвата, оставленного мёртвым процессом (#1195)
 # ---------------------------------------------------------------------------
 #

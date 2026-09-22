@@ -1600,6 +1600,13 @@ async def _sweep_stale_arbiter(db) -> None:
 async def _sweep_events_retention(db) -> None:
     # Events feed retention (#349): the feed is a notification
     # channel, not an archive — activity_log keeps the history.
+    #
+    # Это правило действует и на то, что кладут в ленту потом (#1253):
+    # доказательства публикации скилла две недели пролежали в payload
+    # ``skill_activated``, и страница скилла молча теряла бы их на первом же
+    # прогоне этой чистки. Теперь они лежат в ``skills.publication_record``, а
+    # событие осталось тем, чем лента и объявлена, — уведомлением. Кладёшь
+    # сюда что-то, что нужно будет прочитать через месяц, — не клади.
     pruned = await repo.prune_events(db, keep_days=14)
     # Коммит БЕЗУСЛОВНЫЙ. isolation_level="IMMEDIATE" (#1065) открывает
     # транзакцию перед любым DML — и перед DELETE, которому нечего удалять.
@@ -1720,8 +1727,49 @@ async def _sweep_pair_delivery(db) -> None:
 async def _deliver_pair_task(db, task: dict) -> None:
     """One approved pair task through the delivery gate (#971)."""
     task_id = task["id"]
+    # #1261: this sweep is today's primary delivery path — #1172 and #1238
+    # arrived by it, not by an agent's done report — and it used to hand
+    # task["pr_number"] to the gate on faith. A PR closes without its
+    # author (a stacked base merged and its branch deleted, same as #774
+    # and #880), and the gate then refused a live, green PR of the same
+    # branch as merge_failed on a corpse: #1204, twice. resolve_delivery_pr
+    # wraps the one rule (#959) the done-report path already applies.
+    #
+    # delivery_pr.reason is NOT written here, unconditionally, on its own.
+    # This sweep revisits a running task every pass, and a raw write here
+    # would either repeat every 30s when the gate keeps waiting on the same
+    # transient cause (#534), or — worse — leave the connection sitting in
+    # an open transaction: on a deduped pass _note_pair_delivery_wait below
+    # returns without a commit, and a write made before it is then the only
+    # uncommitted thing on the connection (found by machine review, #1261
+    # submission #1, F1/F2). So the terminal branches below (needs_decision,
+    # delivered) write it themselves, right before the commit each already
+    # makes — each runs at most once per task, since the task leaves this
+    # sweep's candidate list the moment either one fires — and the transient
+    # branch folds it into _note_pair_delivery_wait's own dedupe-and-commit
+    # cycle instead of a second one.
+    task, delivery_pr = await services.resolve_delivery_pr(db, task)
     pr_num = task.get("pr_number")
-    ok, detail = await services.merge_before_completion(db, task)
+    if delivery_pr.unusable and delivery_pr.search_unanswered:
+        # #1261 (Cursor/grok-4.6, report #376, finding 40adcc8f02f26c98):
+        # ``unusable`` alone does not say WHY a replacement could not be
+        # found — the search can answer "no open PR" (a fact, AC-3's case)
+        # or it can raise (silence, #725/#802/#959's forbidden read). Sending
+        # this to needs_decision would turn a network blip into a human
+        # chore the very next pass might make unnecessary — the same
+        # reasoning as an unreadable recorded-PR state, so it gets the same
+        # treatment: a transient wait, not a terminal refusal.
+        await _note_pair_delivery_wait(db, task_id, pr_num, delivery_pr.reason)
+        return
+    if delivery_pr.unusable:
+        # #959: closed, the search for a replacement ANSWERED "none" —
+        # nothing to merge. Asking GitHub to merge a corpse is what produced
+        # "merge_failed: GitHub refused the merge" on #1204; the true cause
+        # is named instead (AC-3), and it is a decision for a human, not a
+        # wait. (The search-raised case above never reaches here.)
+        ok, detail = False, delivery_pr.reason
+    else:
+        ok, detail = await services.merge_before_completion(db, task)
     if not ok:
         # #951: a temporary state is not a decision, and the poller is the
         # place that has always known it — it simply comes back next pass.
@@ -1738,6 +1786,7 @@ async def _deliver_pair_task(db, task: dict) -> None:
                     if detail.startswith(services.PR_DRAFT_PREFIX)
                     else ""
                 ),
+                resolver_note=delivery_pr.reason,
             )
             return
         reason = "merge_gate"
@@ -1753,12 +1802,23 @@ async def _deliver_pair_task(db, task: dict) -> None:
                 _cycle, budget_spent = await services.charge_ci_fix_budget(db, task)
             if not budget_spent:
                 if await services.pair_executor_online(db, task):
+                    # #1261 F1/F2 (steward review of submission #1's WIP): this
+                    # branch returns too, exactly like the transient one above
+                    # — a red CI with the executor present is a wait, not a
+                    # decision. The earlier version of this fix wrote
+                    # delivery_pr.reason unconditionally BEFORE this check,
+                    # believing everything past the transient branch was
+                    # terminal; it was not, and the same two bugs (repeated
+                    # alert, open transaction on a deduped pass) came back
+                    # here. Folded into the same dedupe-and-commit cycle
+                    # instead, exactly like the transient branch.
                     await _note_pair_delivery_wait(
                         db,
                         task_id,
                         pr_num,
                         detail,
                         hint=services.RESUBMIT_AFTER_FIX_HINT,
+                        resolver_note=delivery_pr.reason,
                     )
                     return
                 # Nobody is around to push the fix. Said out loud: without it
@@ -1771,6 +1831,12 @@ async def _deliver_pair_task(db, task: dict) -> None:
                     f"{detail} (бюджет починки исчерпан: "
                     f"{task.get('ci_fix_cycle')}/{config.MAX_CI_FIX_CYCLES})"
                 )
+        # Terminal from here: every wait branch above (transient, and the
+        # recoverable-with-executor-online one just above) returns before
+        # reaching this line, so this write happens at most once per task,
+        # and the commit a few lines down covers it.
+        if delivery_pr.reason:
+            await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
         await repo.update_task(db, task_id, status="needs_decision")
         await repo.add_task_update(
             db,
@@ -1794,6 +1860,10 @@ async def _deliver_pair_task(db, task: dict) -> None:
         )
         return
 
+    if delivery_pr.reason:
+        # Terminal from here too — the task leaves the sweep once delivered,
+        # so this write happens at most once, and the commit below covers it.
+        await repo.add_task_update(db, task_id, "hub", "alert", delivery_pr.reason)
     _pair_delivery_waits.pop(task_id, None)
     # #812: delivery grew the release range. Best effort, exactly as on the
     # done path — a release that could not be prepared is a reason in the log,
@@ -1832,31 +1902,48 @@ async def _deliver_pair_task(db, task: dict) -> None:
 
 
 async def _note_pair_delivery_wait(
-    db, task_id: int, pr_num, detail: str, *, hint: str = ""
+    db, task_id: int, pr_num, detail: str, *, hint: str = "", resolver_note: str = ""
 ) -> None:
     """Say once that delivery is waiting, and then be quiet (#534).
 
     ``hint`` names what happens next when it is not "the hub comes back on its
     own": a refusal the executor has to cure is also a wait, but waiting for a
     different actor, and the default sentence would promise the wrong one.
+
+    ``resolver_note`` (#1261) is ``pr_for_delivery``'s own reason — a closed
+    recorded PR replaced, or one that could not be resolved. It rides IN this
+    function's dedupe key rather than getting a write of its own: a separate
+    write for it repeated every 30s while the gate kept waiting on the same
+    cause (#534).
+
+    The commit at the end is UNCONDITIONAL — made whether this call writes a
+    new note or dedupes and skips it. ``_deliver_pair_task`` calls this
+    function as the last thing it does on every wait path, but it is not the
+    only writer in that call: ``merge_before_completion`` itself can write
+    (the #612 "not pinned" note, for one) with no commit of its own, on the
+    understanding that the caller commits. When this function dedupes and
+    returns early WITHOUT committing, that earlier write — not this note —
+    is what is left open: the poller's connection then sits in a transaction
+    until some later, unrelated write happens to commit it, and a second
+    connection to the same database file gets ``OperationalError: database
+    is locked`` (found by machine review, submission #1, F1/F2 and its
+    recoverable-branch recurrence). A commit with nothing pending is a cheap
+    no-op, so making it unconditional costs nothing on the common path and
+    closes every path that skipped it.
     """
-    if _pair_delivery_waits.get(task_id) == detail:
-        return
-    _pair_delivery_waits[task_id] = detail
-    await repo.add_task_update(
-        db,
-        task_id,
-        "hub",
-        "status",
-        f"Доставка отложена: PR #{pr_num} — {detail}. "
-        + (
+    key = f"{resolver_note}\x1f{detail}"
+    if _pair_delivery_waits.get(task_id) != key:
+        _pair_delivery_waits[task_id] = key
+        message = f"Доставка отложена: PR #{pr_num} — {detail}. " + (
             hint
             or "Это временное состояние, решение человека не требуется — хаб "
             "вернётся к нему следующим циклом."
-        ),
-    )
+        )
+        if resolver_note:
+            message = f"{resolver_note} {message}"
+        await repo.add_task_update(db, task_id, "hub", "status", message)
+        log.info("Poll: task #%d waiting to deliver (%s)", task_id, detail)
     await db.commit()
-    log.info("Poll: task #%d waiting to deliver (%s)", task_id, detail)
 
 
 async def _sweep_release_policy(db) -> None:

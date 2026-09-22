@@ -7,11 +7,21 @@ report whose tokens disagree with the provider's usage is flagged.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
+import os
 import re
+import shlex
+import stat
+import subprocess
+import textwrap
+import uuid
+from pathlib import Path
+from unittest.mock import patch
 
 import aiosqlite
+import pytest
 from httpx import AsyncClient
 
 from hub import auth as hub_auth
@@ -22,16 +32,22 @@ from hub.integrations import cursor_cloud
 from hub.integrations import local_reviewer
 from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
-from hub.models import TaskRefine, TaskSubmitReview
+from hub.models import MachineReviewView, TaskRefine, TaskSubmitReview
 from hub.services.project_policy import review_dispatch_enabled
 from hub.services.model_family import family
 from hub.services.review_dispatch import (
     DEEP,
+    ENVIRONMENT_REFUSAL_NOTE,
+    LITE,
+    _ladder_cause_note,
     _REVIEW_MODEL_PREFERENCES,
+    _delivery_block,
     REVIEW_FILE_LINE_CAP,
     changed_paths,
+    count_environment_refusals,
     diff_plan,
     file_line_counts,
+    is_environment_refusal,
     is_generated,
     maybe_dispatch_review,
     pick_review_model,
@@ -2859,26 +2875,52 @@ def _scratch(tmp_path) -> str:
     return str(path)
 
 
-def _stub_reviewer(monkeypatch, tmp_path, script: str) -> None:
-    """Локальный ревьюер = python-заглушка под настоящим префиксом.
+def _fake_sudo(tmp_path) -> str:
+    """Исполняемый скрипт по имени ``sudo`` — ради ФОРМЫ, а не ради изоляции.
 
-    Префикс здесь — системный ``env``: он ничего не изолирует, и в этом весь
-    смысл. Тест не может завести на машине разработчика второго unix-
-    пользователя, но может доказать, что префикс ДЕЙСТВИТЕЛЬНО применяется к
-    командной строке: заглушка видит себя запущенной через него. Настоящая
-    изоляция — свойство выката (deploy/LOCAL-REVIEW.md), и её проверка
-    попыткой названа в AC-2 ручной честно, а не подменена этим тестом.
+    С 10.09.2026 хаб принимает закрытый набор форм строки песочницы (#1208), и
+    системный ``env``, которым эти тесты пользовались раньше, в набор не
+    входит: строка вне набора не запускается вовсе, и прогон, который тест
+    хочет измерить, просто не состоялся бы. Второго unix-пользователя на
+    машине разработчика не завести, поэтому здесь стоит скрипт, который
+    ничего не изолирует, а лишь съедает свои три токена и запускает остальное.
+
+    Смысл тот же, что был у ``env``: доказать, что префикс ДЕЙСТВИТЕЛЬНО
+    применяется к командной строке — заглушка видит себя запущенной через
+    него. Настоящая изоляция остаётся свойством выката
+    (deploy/LOCAL-REVIEW.md), и её проверка попыткой названа в AC-2 ручной
+    честно, а не подменена этим тестом.
     """
+    path = tmp_path / "sudo"
+    if not path.exists():
+        path.write_text(
+            '#!/bin/sh\n# sudo -n -u <пользователь> <команда...>\nshift 3\nexec "$@"\n'
+        )
+        path.chmod(0o755)
+    return str(path)
+
+
+def _sudo_sandbox(tmp_path, wrapper: str) -> str:
+    """Строка песочницы формы ``sudo`` — той самой, что стоит на проде.
+
+    Пользователь — сам вызывающий: чужого на машине разработчика нет, а страж
+    проверяет его членство в группе каталога прогонов по-настоящему.
+    """
+    import os
+    import pwd
+
+    return f"{_fake_sudo(tmp_path)} -n -u {pwd.getpwuid(os.getuid()).pw_name} {wrapper}"
+
+
+def _stub_reviewer(monkeypatch, tmp_path, script: str) -> None:
+    """Локальный ревьюер = python-заглушка под настоящим префиксом."""
     import shlex
-    import shutil
     import sys
 
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_CMD", shlex.join([sys.executable, "-c", script])
-    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", shlex.join(["-c", script]))
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
 
 
@@ -3105,9 +3147,9 @@ async def test_local_review_obeys_policy_and_cost_ceiling(
     runs: list[str] = []
     real_run = local_reviewer.run_review
 
-    async def _counting(prompt, *, timeout=None):
+    async def _counting(prompt, *, timeout=None, prompt_at_slot=None):
         runs.append(prompt)
-        return await real_run(prompt, timeout=timeout)
+        return await real_run(prompt, timeout=timeout, prompt_at_slot=prompt_at_slot)
 
     monkeypatch.setattr(local_reviewer, "run_review", _counting)
     _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
@@ -3169,7 +3211,7 @@ async def test_github_still_goes_to_the_cloud_reviewer(
 
     runs: list[str] = []
 
-    async def _never(prompt, *, timeout=None):
+    async def _never(prompt, *, timeout=None, prompt_at_slot=None):
         runs.append(prompt)
         return None
 
@@ -3320,7 +3362,6 @@ async def test_the_timed_out_reviewer_is_actually_dead(monkeypatch, tmp_path):
     убийство группы.
     """
     import shlex
-    import shutil
     import sys
 
     marker = tmp_path / "still_alive"
@@ -3333,11 +3374,9 @@ async def test_the_timed_out_reviewer_is_actually_dead(monkeypatch, tmp_path):
         + "; :"
     )
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, "/bin/sh")
     )
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_CMD", shlex.join(["/bin/sh", "-c", payload])
-    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", shlex.join(["-c", payload]))
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
 
@@ -3348,6 +3387,117 @@ async def test_the_timed_out_reviewer_is_actually_dead(monkeypatch, tmp_path):
     assert not marker.exists(), (
         "ревьюер пережил собственный таймаут: хаб написал в ленту, что снял "
         "процесс, и это было бы неправдой"
+    )
+
+
+async def test_the_run_guard_judges_the_deadline_the_run_will_get(
+    monkeypatch, tmp_path
+):
+    """Стража спрашивают НА КАЖДОМ ПРОГОНЕ, а не только на готовности.
+
+    Находка 10.09.2026 (ревьюер Codex, воспроизведено на ef2198fc): проверка
+    сравнивала срок контейнера с ``LOCAL_REVIEW_TIMEOUT_SEC`` даже там, где
+    прогону отмерили меньше. ``podman run --timeout 1800`` проходил готовность
+    при умолчании 1800, а ``run_review(timeout=1)`` убивал только клиента
+    podman — контейнер жил оставшиеся почти полчаса, жёг CPU и мог прислать
+    отчёт по закрытому прогону.
+
+    ПОВОРОТ 10.09.2026. Половина про СРОК потеряла предмет: контейнерных
+    запусков в песочнице больше не бывает (закрытый набор форм, #1208), а обе
+    формы набора оставляют полезную нагрузку потомком хаба — убийство группы
+    доходит до неё при любом сроке, и суждения, зависящего от ``timeout``, у
+    стража не осталось. Вход не выброшен: та же строка стоит здесь же и
+    проверяется на отказ. Вторая половина осталась целиком и она несущая:
+    отказ — это не мнение, а незапуск, иначе страж был бы суждением, которое
+    некому применить.
+    """
+    sandbox = "/usr/bin/podman run --rm -i --timeout 1800 img"
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", 1800)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "cursor-agent --print")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+
+    assert local_reviewer.sandbox_problem(), (
+        "контейнерный запуск в набор форм не входит — иначе проверка ниже беспредметна"
+    )
+
+    # И это не только суждение: прогон НЕ ЗАПУСКАЕТСЯ. Иначе страж остался бы
+    # мнением, которое некому применить, — весь класс дефектов #1208 именно
+    # об этом.
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        local_reviewer,
+        "_spawn",
+        lambda *a, **k: spawned.append("да"),  # noqa: ARG005
+    )
+    assert await local_reviewer.run_review("промт", timeout=1) is None, (
+        "прогон с песочницей вне закрытого набора форм запускать нельзя"
+    )
+    assert not spawned, (
+        "страж высказался, а хаб всё равно породил процесс: контейнер "
+        f"пережил бы прогон на 1799 с, {spawned}"
+    )
+
+
+def _own_host_budget(monkeypatch) -> None:
+    """Свой замок слота на этот тест — ради ЦИКЛА СОБЫТИЙ, а не ради смысла.
+
+    ``asyncio.Lock`` привязывается к циклу при ПЕРВОЙ же конкуренции за него
+    (``_LoopBoundMixin._get_loop``), а ``_HOST_BUDGET`` живёт в модуле, то
+    есть переживает тест. Второй тест, который дождётся очереди, получил бы
+    «bound to a different event loop» вместо своего измерения — и падал бы
+    только В КОМПАНИИ первого, что читается как флак, а не как правило. У
+    хаба цикл один, поэтому на проде вопроса нет вовсе.
+
+    Замок остаётся настоящим и остаётся глобалью модуля: ``run_review``
+    читает его по имени на каждом вызове, так что очередь тест измеряет ту
+    же самую.
+    """
+    monkeypatch.setattr(local_reviewer, "_HOST_BUDGET", asyncio.Lock())
+
+
+async def test_two_local_runs_never_overlap_on_the_host(monkeypatch, tmp_path):
+    """Хост держит один прогон разом, и это держит ХАБ, а не скрипт враппера.
+
+    Находка 10.09.2026 (ревьюер Codex, подтверждена на хосте хаба). Рабочий
+    враппер снимал «хвосты» строкой ``podman rm -af``, называя основанием
+    «два ревьюера разом хосту не по карману». Хаб такого ограничения не знал:
+    ``_LOCAL_RUNS`` — обычный ``dict`` по идентификатору заказа, ни очереди,
+    ни сериализации. Два ревью, начавшихся близко по времени, сносили друг
+    друга, и в карточке это ложилось отказом прогона с ЛОЖНОЙ причиной.
+
+    Доказательство внешнее: полезная нагрузка отмечает вход и выход в общем
+    файле. Пересечение читается из ПОРЯДКА отметок, а не из времени — по
+    времени тест был бы флаким на загруженной машине.
+    """
+    import shlex
+
+    _own_host_budget(monkeypatch)
+    marks = tmp_path / "marks"
+    payload = (
+        f"printf 'in\n' >> {shlex.quote(str(marks))}; "
+        "sleep 0.3; "
+        f"printf 'out\n' >> {shlex.quote(str(marks))}"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, "/bin/sh")
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", shlex.join(["-c", payload]))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+
+    runs = await asyncio.gather(
+        *[local_reviewer.run_review("промт", timeout=30) for _ in range(3)]
+    )
+    assert all(run is not None and not run.timed_out for run in runs), (
+        f"прогоны не состоялись — тогда о пересечении судить не по чему: {runs}"
+    )
+    seen = marks.read_text().split()
+    assert seen == ["in", "out"] * 3, (
+        f"прогоны шли внахлёст: {seen}. На хосте это значит второй контейнер "
+        "при отмеренных первому 1500 МБ и 1.5 CPU — и уборку враппера, "
+        "которая сносит живой контейнер соседа"
     )
 
 
@@ -3363,7 +3513,6 @@ async def test_stopping_the_hub_kills_the_local_reviewer(
     from hub.services.review_dispatch import cancel_local_runs
 
     import shlex
-    import shutil
     import sys
 
     marker = tmp_path / "outlived_the_hub"
@@ -3379,11 +3528,9 @@ async def test_stopping_the_hub_kills_the_local_reviewer(
     _wire(monkeypatch, recorder)
     await _local_principal(db, monkeypatch)
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, "/bin/sh")
     )
-    monkeypatch.setattr(
-        config, "LOCAL_REVIEW_CMD", shlex.join(["/bin/sh", "-c", payload])
-    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", shlex.join(["-c", payload]))
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
 
     await _submitted(
@@ -3413,19 +3560,16 @@ async def test_a_chatty_reviewer_does_not_grow_the_hub(monkeypatch, tmp_path):
     слайсе ревьюера, а росла память ХАБА.
     """
     import shlex
-    import shutil
     import sys
 
     monkeypatch.setattr(local_reviewer, "OUTPUT_CAP", 1000)
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_CMD",
-        shlex.join(
-            [sys.executable, "-c", "import sys; sys.stdin.read(); print('x' * 500000)"]
-        ),
+        shlex.join(["-c", "import sys; sys.stdin.read(); print('x' * 500000)"]),
     )
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
@@ -3458,7 +3602,7 @@ async def test_a_detaching_sandbox_is_refused_by_name(
     _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
     runs: list[str] = []
 
-    async def _never(prompt, *, timeout=None):
+    async def _never(prompt, *, timeout=None, prompt_at_slot=None):
         runs.append(prompt)
         return None
 
@@ -3515,19 +3659,17 @@ async def test_the_scratch_dir_is_writable_by_the_reviewer(monkeypatch, tmp_path
     но режим каталога — это ровно то, что решает исход.
     """
     import shlex
-    import shutil
     import sys
 
     probe = tmp_path / "mode.txt"
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_CMD",
         shlex.join(
             [
-                sys.executable,
                 "-c",
                 "import os, sys; sys.stdin.read(); "
                 f"open({str(probe)!r}, 'w').write(oct(os.stat(os.getcwd()).st_mode & 0o777))",
@@ -3560,21 +3702,18 @@ async def test_stopping_the_hub_closes_the_dispatch_row(
     from hub.services.review_dispatch import cancel_local_runs
 
     import shlex
-    import shutil
     import sys
 
     recorder = _DispatchRecorder({"agent": {"id": "bc-sd"}, "run": {"id": "r-sd"}})
     _wire(monkeypatch, recorder)
     await _local_principal(db, monkeypatch)
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_CMD",
-        shlex.join(
-            [sys.executable, "-c", "import time, sys; sys.stdin.read(); time.sleep(30)"]
-        ),
+        shlex.join(["-c", "import time, sys; sys.stdin.read(); time.sleep(30)"]),
     )
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
 
@@ -3704,8 +3843,17 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     """
     import os
 
+    import pwd
+
     monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "/bin/true")
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/env")
+    # Песочница обязана быть ФОРМОЙ ИЗ НАБОРА, иначе not_ready() назовёт её, а
+    # не каталог, и тест судил бы другое (#1208, поворот 10.09.2026: прежде
+    # здесь стоял «/usr/bin/env», который набор не принимает). Пользователь —
+    # сам вызывающий: он владеет каталогом, и по группе проходит.
+    me = pwd.getpwuid(os.getuid()).pw_name
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -n -u {me} /usr/local/bin/wrap"
+    )
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
 
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(tmp_path / "missing"))
@@ -3732,7 +3880,7 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_SANDBOX",
-        "/usr/bin/systemd-run --scope --uid=nobody --",
+        "/usr/bin/systemd-run --scope --uid=nobody /usr/local/bin/wrap",
     )
     assert any("не состоит в группе" in r for r in local_reviewer.not_ready()), (
         "пользователь песочницы вне группы каталога — тот же EACCES, только "
@@ -3744,7 +3892,9 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     # (найдено ревью, неразрешённая 534e16e4). uid 1 есть на обеих системах,
     # где это гоняется, и в группе каталога он не состоит.
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/systemd-run --scope --uid=1 --"
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=1 /usr/local/bin/wrap",
     )
     assert any("не состоит в группе" in r for r in local_reviewer.not_ready()), (
         "числовая форма --uid обязана проверяться так же, как именная: "
@@ -3756,7 +3906,7 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_SANDBOX",
-        f"/usr/bin/systemd-run --scope --uid={os.getuid()} --",
+        f"/usr/bin/systemd-run --scope --uid={os.getuid()} /usr/local/bin/wrap",
     )
     assert local_reviewer.not_ready() == [], "владелец каталога проходит по группе"
 
@@ -3767,7 +3917,7 @@ def test_a_scratch_dir_that_cannot_be_shared_is_refused_by_name(monkeypatch, tmp
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_SANDBOX",
-        "/usr/bin/systemd-run --scope --uid=no-such-user-1180 --",
+        "/usr/bin/systemd-run --scope --uid=no-such-user-1180 /usr/local/bin/wrap",
     )
     assert any("не разрешается в системе" in r for r in local_reviewer.not_ready()), (
         "неудача проверки не имеет права читаться как «настроено»"
@@ -3786,20 +3936,18 @@ async def test_the_chatty_reviewer_output_never_lands_in_memory(monkeypatch, tmp
     кусками держит в памяти только лимит.
     """
     import shlex
-    import shutil
     import sys
     import tracemalloc
 
     monkeypatch.setattr(local_reviewer, "OUTPUT_CAP", 1000)
     monkeypatch.setattr(
-        config, "LOCAL_REVIEW_SANDBOX", shutil.which("env") or "/usr/bin/env"
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
     )
     monkeypatch.setattr(
         config,
         "LOCAL_REVIEW_CMD",
         shlex.join(
             [
-                sys.executable,
                 "-c",
                 "import sys; sys.stdin.read(); sys.stdout.write('x' * 8_000_000)",
             ]
@@ -4372,4 +4520,5731 @@ async def test_a_dispatched_project_gets_no_extra_notice(
     )
     assert len(await _dispatch_notices(db, task_id)) == 1, (
         "и записей про диспетч по-прежнему одна"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1238 — почему отчёт неполон: отказ среды против исчерпания профиля
+# ---------------------------------------------------------------------------
+#
+# Повод — отчёт #334 (задача #1169, профиль deep, 12 агентов, счёт провайдера
+# 1 238 071 токен). Он честно записал в lost_dimensions «в среде нет
+# uv/pytest — сюит не исполнялся, только чтение» и «локальный ref develop не
+# резолвится», то есть потерял два измерения из-за среды, а не из-за кода. В
+# карточке это выглядело так же, как любая другая неполнота, и ноль
+# подтверждённых находок читался как «чисто».
+
+
+async def _seed_report(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    incomplete: bool,
+    reason: str | None,
+) -> int:
+    """Отчёт прямо в таблицу. ``reason=None`` — отчёт СТАРОГО образца.
+
+    None здесь не «пустая причина», а «поля не было вовсе»: аргумент не
+    передаётся, и колонка берёт свой DEFAULT. Именно эти строки не должны
+    задним числом становиться отказом среды.
+    """
+    task = dict(await repo.get_task(db, task_id))
+    kwargs = {} if reason is None else {"incomplete_reason": reason}
+    return await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=int(task["submission_generation"] or 0),
+        harness_skill="lite-diff-review",
+        model="grok-4.6",
+        raw_count=1,
+        findings_confirmed=json.dumps([]),
+        incomplete=incomplete,
+        submitted_by="cursor-cloud-reviewer",
+        **kwargs,
+    )
+
+
+async def test_an_environment_refusal_is_not_an_exhausted_profile(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1238): причина названа, и она отличается от исчерпания профиля.
+
+    Проверяется не хранение ради хранения, а то, что человек прочитает в
+    карточке: отказ среды говорит про настройку окружения, исчерпание
+    профиля — нет. Мутация «считать любую неполноту отказом среды» роняет
+    вторую половину теста, мутация «не различать причину вовсе» — первую.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-e1"}, "run": {"id": "run-e1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-env-refusal")
+
+    report = {
+        "harness_skill": "multi-agent-review",
+        "raw_count": 0,
+        "findings_confirmed": [],
+        "findings_rejected": [],
+        "incomplete": True,
+        "incomplete_reason": "environment",
+        "unresolved": [],
+        "lost_dimensions": ["прогон тестов: в среде нет uv/pytest"],
+        "agent": "cursor-cloud-reviewer",
+        "model": "grok-4.6",
+    }
+    resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=report)
+    assert resp.status_code == 200, resp.text
+
+    stored = dict(await repo.get_latest_machine_review(db, task_id))
+    assert stored["incomplete_reason"] == "environment"
+    assert is_environment_refusal(stored) is True
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    refusal = [u for u in updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
+    assert len(refusal) == 1, [u["content"] for u in updates]
+    text = refusal[0]["content"]
+    # Карточка обязана сказать не только ЧТО, но и что с этим делать: второй
+    # прогон в той же среде даст тот же отказ.
+    assert "второй прогон" in text and "настройкой" in text
+    assert "в среде нет uv/pytest" in text
+    # Тот же вывод — в алерте лестницы (#879): её перечень исходов не
+    # меняется, меняется только то, что человек в нём прочитает.
+    assert ENVIRONMENT_REFUSAL_NOTE in _ladder_cause_note(stored)
+
+    # Тот же отчёт, но с исчерпанием профиля, такой строки не порождает:
+    # это ровно тот случай, который лечит добор.
+    other_id = await _submitted(client, db, "spike-profile-exhausted")
+    report["incomplete_reason"] = "profile"
+    report["lost_dimensions"] = ["20 файлов не дочитаны"]
+    resp = await client.post(f"/api/tasks/{other_id}/machine-review", json=report)
+    assert resp.status_code == 200, resp.text
+    other_stored = dict(await repo.get_latest_machine_review(db, other_id))
+    assert other_stored["incomplete_reason"] == "profile"
+    assert is_environment_refusal(other_stored) is False
+    other_updates = [dict(u) for u in await repo.get_task_updates(db, other_id)]
+    assert not [u for u in other_updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
+    assert _ladder_cause_note(other_stored) == ""
+
+    # И причина, которую хаб не знает, не становится отказом среды по
+    # похожести слов: «нет pytest» — это проза, а поле заведено ровно затем,
+    # чтобы прозу не разбирать. Отчёт при этом не теряется — только причина
+    # остаётся незаявленной.
+    third_id = await _submitted(client, db, "spike-unknown-reason")
+    report["incomplete_reason"] = "в среде нет pytest"
+    resp = await client.post(f"/api/tasks/{third_id}/machine-review", json=report)
+    assert resp.status_code == 200, resp.text
+    third_stored = dict(await repo.get_latest_machine_review(db, third_id))
+    assert third_stored["incomplete_reason"] == ""
+    assert is_environment_refusal(third_stored) is False
+    third_updates = [dict(u) for u in await repo.get_task_updates(db, third_id)]
+    assert not [u for u in third_updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
+
+
+async def test_environment_refusals_are_counted_with_their_sample_size(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1238): счёт повторяемости, и рядом — размер выборки.
+
+    Два случая за 09.09.2026 заметил человек, читавший карточки подряд.
+    Механизма, который считает такие отчёты, не было вовсе; здесь он есть, и
+    он не имеет права печатать долю, не сказав, из чего она взята.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-e2"}, "run": {"id": "run-e2"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-refusal-count")
+
+    # Пока причину не назвал никто, доли нет — есть слово «недобор».
+    await _seed_report(db, task_id, incomplete=True, reason=None)
+    await _seed_report(db, task_id, incomplete=False, reason=None)
+    empty = await count_environment_refusals(db, since_days=30)
+    assert empty["environment_refusals"] == 0
+    assert empty["reason_declared"] == 0
+    assert empty["environment_share"] is None
+    assert "недобор" in empty["share_note"]
+
+    await _seed_report(db, task_id, incomplete=True, reason="environment")
+    await _seed_report(db, task_id, incomplete=True, reason="environment")
+    await _seed_report(db, task_id, incomplete=True, reason="profile")
+    counted = await count_environment_refusals(db, since_days=30)
+
+    assert counted["environment_refusals"] == 2
+    assert counted["profile_exhausted"] == 1
+    assert counted["reason_declared"] == 3
+    assert counted["reason_unstated"] == 1
+    assert counted["incomplete_total"] == 4
+    assert counted["reports_total"] == 5
+    assert counted["environment_share"] == round(2 / 3, 3)
+    # Размер выборки идёт вместе с числом, а не отдельной строкой ниже
+    # (#1153): «2» без «из 3 назвавших причину» решения не выдерживает.
+    note = counted["share_note"]
+    assert "2 из 3" in note
+    assert "4" in note and "5" in note
+    assert "недобор" not in note
+
+
+async def test_reports_without_the_field_are_not_counted_as_refusals(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1238): старые отчёты читаются и НЕ становятся отказом среды.
+
+    МУТАЦИЯ, которую обязан ловить этот тест: трактовать пустую причину как
+    отказ среды. Тогда каждый неполный отчёт, написанный до появления поля,
+    задним числом получил бы показание, которого никто не давал, — та же
+    подмена «не измерено» на «измерено», ради которой всё это заведено.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-e3"}, "run": {"id": "run-e3"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-old-reports")
+
+    for _ in range(3):
+        await _seed_report(db, task_id, incomplete=True, reason=None)
+
+    stats = await count_environment_refusals(db, since_days=30)
+    assert stats["incomplete_total"] == 3
+    assert stats["environment_refusals"] == 0
+    assert stats["profile_exhausted"] == 0
+    assert stats["reason_unstated"] == 3
+    assert stats["environment_share"] is None
+    assert "недобор" in stats["share_note"]
+
+    # Чтение таких строк не ломается: причина пустая, а не отсутствующая.
+    row = dict(await repo.get_latest_machine_review(db, task_id))
+    assert row["incomplete_reason"] == ""
+    assert is_environment_refusal(row) is False
+    view = MachineReviewView(**row)
+    assert view.incomplete_reason == ""
+    assert view.incomplete is True
+
+
+async def test_the_mcp_path_carries_the_environment_refusal_to_storage(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1238 (ревью, P2): отчёт, сданный через MCP, доносит причину.
+
+    До этой правки аргумента не было вовсе: вызов проходил успешно, лишний
+    аргумент молча отбрасывался, и в строке оставалось умолчание — «причина
+    не заявлена». Отказ среды, приехавший этим путём, выпадал и из алерта, и
+    из счётчика, ради которых поле заведено.
+
+    Проверяется ОПУБЛИКОВАННЫМ входом — ``mcp.call_tool`` поверх настоящего
+    приёма, — потому что питонова функция приняла бы аргумент и тогда, когда
+    в схеме его нет: вызов .fn ничего не доказывает.
+    """
+    from hub.mcp_server import mcp
+
+    task_id = await _submitted(client, db, "spike-mcp-refusal")
+
+    async def _post(path: str, body: dict | None = None, **_kw):
+        resp = await client.post(path, json=body or {})
+        resp.raise_for_status()
+        return resp.json()
+
+    with patch("hub.mcp_server._api_post", side_effect=_post):
+        await mcp.call_tool(
+            "hub_submit_machine_review",
+            {
+                "task_id": task_id,
+                "raw_count": 0,
+                "incomplete": True,
+                "incomplete_reason": "environment",
+                "lost_dimensions": ["прогон тестов: в среде нет uv/pytest"],
+                "agent": "cursor-cloud-reviewer",
+                "model": "grok-4.6",
+            },
+        )
+
+    stored = dict(await repo.get_latest_machine_review(db, task_id))
+    assert stored["incomplete_reason"] == "environment"
+    assert is_environment_refusal(stored) is True
+
+    # И карточка получает тот же алерт, что и на HTTP-пути: паритет — это про
+    # поведение, а не про то, что аргумент принят.
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert [u for u in updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
+
+
+async def test_a_report_sent_through_mcp_without_a_reason_is_not_a_refusal(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-3 на MCP-пути (#1238): умолчание аргумента — «не заявлена».
+
+    У опубликованного аргумента есть ДЕФОЛТ, и это отдельное место, где
+    можно ошибиться: дефолт `environment` записал бы отказом среды каждый
+    неполный отчёт, никем этого не заявивший, — ровно ту подмену, против
+    которой поле и заведено. Сидящие в базе отчёты старого образца такую
+    мутацию не ловят: они приходят мимо инструмента.
+    """
+    from hub.mcp_server import mcp
+
+    task_id = await _submitted(client, db, "spike-mcp-no-reason")
+
+    async def _post(path: str, body: dict | None = None, **_kw):
+        resp = await client.post(path, json=body or {})
+        resp.raise_for_status()
+        return resp.json()
+
+    with patch("hub.mcp_server._api_post", side_effect=_post):
+        await mcp.call_tool(
+            "hub_submit_machine_review",
+            {
+                "task_id": task_id,
+                "raw_count": 0,
+                "incomplete": True,
+                "lost_dimensions": ["20 файлов не дочитаны"],
+                "agent": "cursor-cloud-reviewer",
+                "model": "grok-4.6",
+            },
+        )
+
+    stored = dict(await repo.get_latest_machine_review(db, task_id))
+    assert stored["incomplete_reason"] == ""
+    assert is_environment_refusal(stored) is False
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert not [u for u in updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
+
+
+# ---------------------------------------------------------------------------
+# #1235 — круг ревью: заходы, где находки ЗАКРЫВАЛИСЬ
+# ---------------------------------------------------------------------------
+
+
+def _confirmed(title: str, category: str, line: int) -> dict:
+    """Подтверждённая находка в форме, в которой она лежит в отчёте."""
+    return {
+        "title": title,
+        "severity": "high",
+        "category": category,
+        "file": "hub/services/probe.py",
+        "line": line,
+        "start_line": line,
+        "end_line": line,
+        "locator": "lines",
+        "detail": "",
+    }
+
+
+def _unresolved(title: str) -> dict:
+    """Неразрешённая находка: категории у неё нет по модели (#1085)."""
+    return {"title": title, "why": "адъюдикаторы разошлись"}
+
+
+async def _generation_with_findings(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    *,
+    confirmed: list[dict] | None = None,
+    unresolved: list[dict] | None = None,
+) -> int:
+    """Поставить задачу на поколение N и положить на него отчёт."""
+    await db.execute(
+        "UPDATE tasks SET submission_generation=? WHERE id=?", (generation, task_id)
+    )
+    review_id = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        harness_skill="deep-review",
+        model="grok-4.6",
+        raw_count=len(confirmed or []) + len(unresolved or []),
+        findings_confirmed=json.dumps(confirmed or [], ensure_ascii=False),
+        unresolved=json.dumps(unresolved or [], ensure_ascii=False),
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+    return review_id
+
+
+async def _author_closed_them(
+    db: aiosqlite.Connection,
+    task_id: int,
+    review_id: int,
+    generation: int,
+    *,
+    confirmed: list[dict],
+    unresolved: list[dict],
+    outcome_confirmed: str = "fixed",
+    outcome_unresolved: str = "real_fixed",
+) -> None:
+    """Автор отчитался, что находки этого поколения закрыты правкой.
+
+    Ровно тот путь, которым исходы попадают в базу на живой задаче: они
+    пишутся на СДАЧЕ СЛЕДУЮЩЕГО поколения против отчёта, который вернул
+    работу (lifecycle._step_finding_outcomes), и потому лежат с номером
+    поколения ОТЧЁТА, а не новой сдачи.
+    """
+    from hub.services.finding_identity import finding_uids, unresolved_uids
+
+    for index, (uid, finding) in enumerate(zip(finding_uids(confirmed), confirmed)):
+        await repo.upsert_finding_outcome(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            submission_generation=generation,
+            finding_uid=uid,
+            finding_index=index,
+            finding_title=finding["title"],
+            outcome=outcome_confirmed,
+            note="разобрано опытом",
+            linked_task_id=None,
+            reported_by="dev-agent",
+            finding_kind="confirmed",
+        )
+    for index, (uid, finding) in enumerate(
+        zip(unresolved_uids(unresolved), unresolved)
+    ):
+        await repo.upsert_finding_outcome(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            submission_generation=generation,
+            finding_uid=uid,
+            finding_index=index,
+            finding_title=finding["title"],
+            outcome=outcome_unresolved,
+            note="воспроизведено зондом",
+            linked_task_id=None,
+            reported_by="dev-agent",
+            finding_kind="unresolved",
+        )
+    await db.commit()
+
+
+async def _circle_notices(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    """Всё, что карточка сказала о круге."""
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if "идёт по кругу" in dict(u)["content"]
+    ]
+
+
+async def _walk_the_circle(
+    db: aiosqlite.Connection,
+    task_id: int,
+    layers: list[tuple[list[dict], list[dict]]],
+) -> None:
+    """Пройти заданные слои находок: каждый закрыт, следующий принёс новые."""
+    previous: tuple[int, int, list[dict], list[dict]] | None = None
+    for generation, (confirmed, unresolved) in enumerate(layers, start=1):
+        review_id = await _generation_with_findings(
+            db, task_id, generation, confirmed=confirmed, unresolved=unresolved
+        )
+        if previous is not None:
+            prev_review, prev_generation, prev_conf, prev_unres = previous
+            await _author_closed_them(
+                db,
+                task_id,
+                prev_review,
+                prev_generation,
+                confirmed=prev_conf,
+                unresolved=prev_unres,
+            )
+        previous = (review_id, generation, confirmed, unresolved)
+
+
+async def test_a_task_going_in_circles_is_named_and_escalated(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1235): три захода — круг назван, и человека зовут решать.
+
+    Образец взят с прода 09.09.2026 без округления. #1171: отчёт #307 дал
+    три подтверждённые и пять неразрешённых, все восемь разобраны и
+    закрыты, пересдача — и отчёт #323 принёс ПЯТЬ НОВЫХ неразрешённых. То
+    же на #1208 и #1169. Ни один существующий потолок не сработал:
+    review_cycle на #1171 оставался нулём при третьем заходе, потому что
+    работу автору никто не возвращал — он пересдавал сам.
+
+    Последний отчёт приходит НАСТОЯЩИМ путём приёма, а не записью в
+    таблицу: круг обязан называться в тот момент, когда очередной отчёт
+    принесли, иначе он не позовёт никого.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1235"}, "run": {"id": "r-1235"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+
+    task_id = await _submitted(client, db, "spike-1235-circle")
+
+    # Три первых слоя: каждый закрыт, следующий принёс новые находки.
+    layer1 = ([_confirmed("гонка на записи", "concurrency", 10)], [_unresolved("A")])
+    layer2 = ([_confirmed("необработанный код возврата", "error-handling", 20)], [])
+    layer3 = ([_confirmed("тест не убивает мутацию", "test-adequacy", 30)], [])
+    await _walk_the_circle(db, task_id, [layer1, layer2, layer3])
+
+    from hub.services.review_dispatch import review_circle
+
+    assert (await review_circle(db, task_id)).count == 2, (
+        "предпосылка: до четвёртого отчёта заходов два, круг ещё не назван"
+    )
+    assert await _circle_notices(db, task_id) == [], "порог ещё не достигнут"
+
+    # Третий заход: закрываем слой 3 и принимаем ЧЕТВЁРТЫЙ отчёт как отчёт.
+    await _author_closed_them(
+        db,
+        task_id,
+        (await _last_review_id(db, task_id)),
+        3,
+        confirmed=layer3[0],
+        unresolved=layer3[1],
+    )
+    await db.execute("UPDATE tasks SET submission_generation=4 WHERE id=?", (task_id,))
+    await db.commit()
+    from hub.services.machine_review_intake import record_machine_review
+    from hub.models import MachineReviewSubmit
+
+    await record_machine_review(
+        db,
+        task_id,
+        MachineReviewSubmit(
+            harness_skill="deep-review",
+            model="grok-4.6",
+            raw_count=1,
+            incomplete=False,
+            findings_confirmed=[_confirmed("утечка дескриптора", "resource-leak", 40)],
+        ),
+        principal_id=None,
+        username="cursor-cloud-reviewer",
+    )
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 3, "три захода: 1→2, 2→3, 3→4"
+
+    notices = await _circle_notices(db, task_id)
+    assert len(notices) == 1, (
+        "круг обязан быть назван в карточке: пока он не назван, его не видит "
+        "ни автор, ни человек, ни метрики"
+    )
+    said = notices[0]
+    assert "3-й раз" in said, "число заходов названо"
+    for ordinal in (1, 2, 3):
+        assert f"заход {ordinal}" in said, "разбивка приводится по КАЖДОМУ заходу"
+    assert "закрыто 2, пришло новых 1" in said, (
+        "первый заход закрыл две находки (одну подтверждённую и одну "
+        "неразрешённую) и получил одну новую — оба числа стоят рядом"
+    )
+    for outcome in ("принять как есть", "отпустить", "продолжать"):
+        assert outcome in said, (
+            "три исхода названы явно: сигнал о круге легко прочесть как "
+            "разрешение перестать чинить настоящие дефекты"
+        )
+    assert "Ревью НЕ выключено и пересдача не запрещена" in said
+
+    events = [
+        dict(r)
+        for r in await repo.list_events(
+            db, since=0, kinds=["review_circle_named"], limit=10
+        )
+    ]
+    assert len(events) == 1, "событие в ленте, а не только строка в карточке"
+    assert json.loads(events[0]["payload"])["laps"] == 3
+
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "review", "сигнал не двигает задачу сам"
+    assert row["review_cycle"] == 0, (
+        "и это ровно тот случай, который существующий потолок не видит: "
+        "циклов ревью ноль при третьем заходе (наблюдено на #1171)"
+    )
+
+    from hub.services.review_brief import build_review_brief
+
+    brief = await build_review_brief(db, task_id)
+    assert brief.review_circle.laps == 3 and brief.review_circle.named, (
+        "число заходов видно и в брифе ревью, тем же счётом, что в карточке"
+    )
+    assert len(brief.review_circle.breakdown) == 3
+
+    from hub.mcp_server import _review_circle_line
+
+    rendered = _review_circle_line(brief.model_dump())
+    assert "Круг ревью: заходов 3" in rendered and "заход 1" in rendered, (
+        "ревьюер читает бриф ТЕКСТОМ: число, не дошедшее до строки, не прочитает никто"
+    )
+
+
+async def _last_review_id(db: aiosqlite.Connection, task_id: int) -> int:
+    rows = await db.execute_fetchall(
+        "SELECT id FROM machine_reviews WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    )
+    return int(dict(rows[0])["id"])
+
+
+async def test_a_plain_resubmission_is_not_a_circle(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1235): столько же пересдач, но находок между ними не было.
+
+    МУТАЦИЯ, которую этот тест обязан ловить: считать заходом любую
+    пересдачу. Счётчик, растущий на каждое поколение, назвал бы кругом
+    обычную работу — задачу, которую пересдавали четыре раза с чистыми
+    отчётами, — и позвал бы человека к тому, где решать нечего.
+
+    Проверяется НОЛЬ заходов, а не отсутствие алерта: алерта нет и при
+    пороге, которого не достигли, так что одно только молчание карточки
+    отличить эти два случая не может.
+    """
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-plain"}, "run": {"id": "r-plain"}}
+    )
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+
+    task_id = await _submitted(client, db, "spike-1235-plain")
+    for generation in (1, 2, 3, 4):
+        await _generation_with_findings(db, task_id, generation)
+
+    from hub.services.review_dispatch import name_the_circle, review_circle
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 0, (
+        "четыре поколения с чистыми отчётами — это не круг, а работа: "
+        "находок не было, закрывать было нечего"
+    )
+    assert not circle.named
+    assert await name_the_circle(db, task_id) is False
+    assert await _circle_notices(db, task_id) == []
+
+
+async def test_a_closed_layer_without_new_findings_ends_the_circle(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Контроль к AC-2: находки были и закрыты, но нового слоя не пришло.
+
+    Отдельный тест, потому что «находок не было вовсе» и «находки были,
+    круг кончился» — разные состояния, и правило, потерявшее второе,
+    прошло бы предыдущий тест целиком. Здесь же проверяется, что серия
+    считается ПОДРЯД: чистый отчёт обнуляет счёт, а не откладывается в
+    заслугу, по которой человека позовут к уже вышедшей задаче.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-end"}, "run": {"id": "r-end"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-ended")
+    layer1 = ([_confirmed("гонка", "concurrency", 10)], [])
+    layer2 = ([_confirmed("код возврата", "error-handling", 20)], [])
+    layer3 = ([_confirmed("мутация выжила", "test-adequacy", 30)], [])
+    await _walk_the_circle(db, task_id, [layer1, layer2, layer3])
+
+    from hub.services.review_dispatch import review_circle
+
+    assert (await review_circle(db, task_id)).count == 2, "предпосылка: два захода"
+
+    # Автор закрыл третий слой, и новый отчёт пришёл чистым.
+    await _author_closed_them(
+        db,
+        task_id,
+        await _last_review_id(db, task_id),
+        3,
+        confirmed=layer3[0],
+        unresolved=layer3[1],
+    )
+    await _generation_with_findings(db, task_id, 4)
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 0, (
+        "круг кончился на чистом отчёте — считается хвостовая серия подряд"
+    )
+    assert not circle.named
+
+
+async def test_a_repeating_category_is_named_apart_from_the_count(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1235): повтор категории отмечен ОТДЕЛЬНО от числа заходов.
+
+    Признак другой и важнее: три захода с находками разного рода — работа,
+    идущая вглубь, а повтор категории означает, что харнесс ходит по одному
+    и тому же месту. Поэтому проверяется не только наличие слов, но и то,
+    что при РАЗНЫХ категориях отметки нет — иначе «отмечено отдельно» было
+    бы совместимо с «отмечается всегда».
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-cat"}, "run": {"id": "r-cat"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-category")
+    same = "test-adequacy"
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("мутация выжила в А", same, 10)], []),
+            ([_confirmed("мутация выжила в Б", same, 20)], []),
+            ([_confirmed("мутация выжила в В", same, 30)], []),
+        ],
+    )
+
+    from hub.services.review_dispatch import name_the_circle, review_circle
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 2, "заходов два"
+    assert circle.repeated_categories == (same,), (
+        "категория повторяется — это отдельный факт, а не следствие счёта"
+    )
+    assert await name_the_circle(db, task_id) is True
+    said = (await _circle_notices(db, task_id))[0]
+    assert "ОТДЕЛЬНО" in said and same in said, "повтор назван своим абзацем"
+    assert "харнесс ходит по одному" in said, (
+        "названо, ЧТО этот признак означает, а не только что он есть"
+    )
+
+    # Контроль: те же два захода, но категории разные — отметки нет.
+    other = await _submitted(client, db, "spike-1235-varied")
+    await _walk_the_circle(
+        db,
+        other,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+    varied = await review_circle(db, other)
+    assert varied.count == 2, "заходов столько же"
+    assert varied.repeated_categories == (), (
+        "категории разные — повтора нет, и число заходов этого не подменяет"
+    )
+    assert await name_the_circle(db, other) is True
+    assert "ОТДЕЛЬНО" not in (await _circle_notices(db, other))[0]
+
+
+async def test_the_circle_threshold_comes_from_the_config(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Порог читается из конфига и проверен на трёх значениях.
+
+    Он выбран по трём наблюдениям одного дня — для числа это недобор, и
+    менять его придётся без правки кода. Значение, зашитое в коде, стоило
+    бы выката на каждое уточнение.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-thr"}, "run": {"id": "r-thr"}})
+    _wire(monkeypatch, recorder)
+
+    task_id = await _submitted(client, db, "spike-1235-threshold")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+
+    from hub.services.review_dispatch import review_circle
+
+    for threshold, expected in ((2, True), (3, False), (5, False)):
+        monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", threshold)
+        circle = await review_circle(db, task_id)
+        assert circle.count == 2, "заходов два при любом пороге"
+        assert circle.threshold == threshold
+        assert circle.named is expected, (
+            f"порог {threshold}: круг называется только когда заходов не меньше"
+        )
+
+
+async def test_the_circle_is_named_once_per_generation(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Дедуп в пределах поколения: второй отчёт заходов не прибавляет.
+
+    Лестница добора (#879) кладёт на одно поколение два отчёта. Без дедупа
+    карточка получила бы вторую одинаковую запись про тот же круг.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-once"}, "run": {"id": "r-once"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-once")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+
+    from hub.services.review_dispatch import name_the_circle
+
+    assert await name_the_circle(db, task_id) is True
+    assert await name_the_circle(db, task_id) is False
+    assert len(await _circle_notices(db, task_id)) == 1
+
+
+async def test_findings_left_unclosed_are_not_a_lap(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Заход требует, чтобы находки БЫЛИ ЗАКРЫТЫ правкой.
+
+    Пересдача, на которой автор объявил находки ложными или отложил их, —
+    не круг: работы по коду на ней не было, а разговор про ложные находки
+    — это разговор про точность харнесса, и у него свои метрики. Без этого
+    теста мутация «считать заходом любую пересдачу, где отчёты были»
+    осталась бы живой: предыдущий контроль ловит только пересдачу вообще
+    без находок.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-open"}, "run": {"id": "r-open"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-unclosed")
+    layers = [
+        ([_confirmed("гонка", "concurrency", 10)], [_unresolved("A")]),
+        ([_confirmed("код возврата", "error-handling", 20)], [_unresolved("B")]),
+        ([_confirmed("утечка", "resource-leak", 30)], [_unresolved("C")]),
+    ]
+    previous: tuple[int, int, list[dict], list[dict]] | None = None
+    for generation, (confirmed, unresolved) in enumerate(layers, start=1):
+        review_id = await _generation_with_findings(
+            db, task_id, generation, confirmed=confirmed, unresolved=unresolved
+        )
+        if previous is not None:
+            prev_review, prev_generation, prev_conf, prev_unres = previous
+            await _author_closed_them(
+                db,
+                task_id,
+                prev_review,
+                prev_generation,
+                confirmed=prev_conf,
+                unresolved=prev_unres,
+                outcome_confirmed="false_positive",
+                outcome_unresolved="not_a_defect",
+            )
+        previous = (review_id, generation, confirmed, unresolved)
+
+    from hub.services.review_dispatch import name_the_circle, review_circle
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 0, (
+        "находки были и новые приходили, но чинить автор ничего не стал — "
+        "заходом это не считается"
+    )
+    assert await name_the_circle(db, task_id) is False
+    assert await _circle_notices(db, task_id) == []
+
+
+async def test_a_circle_of_uncategorised_findings_claims_no_repeat(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Круг из ОДНИХ неразрешённых находок не объявляет повтор категории.
+
+    Это форма круга, который оплачивался живьём: #1171 — ноль
+    подтверждённых и пять НОВЫХ неразрешённых, #1208 — четыре
+    неразрешённые. У неразрешённой записи категории нет по модели (#1085),
+    и здесь она остаётся пустой.
+
+    МУТАЦИЯ, которую тест обязан ловить: снять отсев пустой категории в
+    сравнении на повтор. Тогда «неизвестно» склеилось бы с «то же самое», и
+    САМЫЙ СИЛЬНЫЙ сигнал этой задачи — «харнесс ходит по одному месту, и
+    это важнее числа заходов» — срабатывал бы на каждом круге, собранном из
+    неразрешённых находок, то есть на самом частом. Человека звали бы
+    разбираться с повтором, которого никто не наблюдал, да ещё и с пустым
+    именем категории в тексте.
+    """
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-nocat"}, "run": {"id": "r-nocat"}}
+    )
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-uncategorised")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([], [_unresolved("адъюдикаторы разошлись про А")]),
+            ([], [_unresolved("адъюдикаторы разошлись про Б")]),
+            ([], [_unresolved("адъюдикаторы разошлись про В")]),
+        ],
+    )
+
+    from hub.services.review_dispatch import name_the_circle, review_circle
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 2, (
+        "заходы считаются и по неразрешённым: круг с прода состоял в "
+        "основном из них, и счёт по одним подтверждённым не увидел бы его"
+    )
+    assert circle.repeated_categories == (), (
+        "категории у неразрешённых находок нет — это «неизвестно», а не «та же самая»"
+    )
+    assert [lap.repeated_categories for lap in circle.laps] == [(), ()]
+
+    assert await name_the_circle(db, task_id) is True
+    said = (await _circle_notices(db, task_id))[0]
+    assert "ОТДЕЛЬНО" not in said and "Повтор категории" not in said, (
+        "круг назван, а повтор категории — нет: это разные признаки"
+    )
+
+
+async def test_the_repeat_reaches_the_reviewer_brief_text(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Повтор категории доходит до СТРОКИ брифа, а не только до поля.
+
+    Ревьюер читает бриф текстом (hub_get_review_brief склеивает его в
+    строки), и признак, оставшийся в структуре, до него не доходит. Тест
+    ловит мутацию, снимающую повтор из строки: число заходов в ней при
+    этом остаётся, и по нему одному подмену не заметить.
+    """
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-brief"}, "run": {"id": "r-brief"}}
+    )
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-brief")
+    same = "test-adequacy"
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("мутация выжила в А", same, 10)], []),
+            ([_confirmed("мутация выжила в Б", same, 20)], []),
+            ([_confirmed("мутация выжила в В", same, 30)], []),
+        ],
+    )
+
+    from hub.mcp_server import _review_circle_line
+    from hub.services.review_brief import build_review_brief
+
+    brief = await build_review_brief(db, task_id)
+    assert brief.review_circle.repeated_categories == [same]
+    rendered = _review_circle_line(brief.model_dump())
+    assert "Круг ревью: заходов 2" in rendered
+    assert f"Повтор категории: {same}" in rendered, (
+        "признак, не дошедший до строки брифа, ревьюер не прочитает"
+    )
+    assert "важнее числа заходов" in rendered
+
+
+async def test_a_zero_threshold_switches_the_signal_off(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Порог 0 выключает сигнал, а не зовёт человека на каждую задачу.
+
+    Ноль — это то, чем такую вещь выключают в конфиге, и без явной защиты
+    сравнение «заходов не меньше порога» стало бы истинным при НУЛЕ
+    заходов: карточка каждой задачи получила бы алерт о круге, которого
+    нет. Порог выбран по трём наблюдениям одного дня, так что выключатель
+    ему понадобится раньше, чем следующее уточнение.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-off"}, "run": {"id": "r-off"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 0)
+
+    from hub.services.review_dispatch import name_the_circle, review_circle
+
+    quiet = await _submitted(client, db, "spike-1235-off-quiet")
+    circle = await review_circle(db, quiet)
+    assert circle.count == 0 and circle.threshold == 0
+    assert not circle.named, "ноль заходов при пороге 0 — это не круг"
+    assert await name_the_circle(db, quiet) is False
+    assert await _circle_notices(db, quiet) == []
+
+    # И на задаче, которая по кругу действительно идёт, ноль тоже молчит.
+    spinning = await _submitted(client, db, "spike-1235-off-spinning")
+    await _walk_the_circle(
+        db,
+        spinning,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+    spun = await review_circle(db, spinning)
+    assert spun.count == 2, "заходы считаются по-прежнему"
+    assert not spun.named, "но при пороге 0 человека не зовут"
+    assert await name_the_circle(db, spinning) is False
+
+
+async def test_a_deeper_lap_is_named_again_on_the_next_generation(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Следующий заход называется СНОВА: дедуп живёт в пределах поколения.
+
+    МУТАЦИЯ, которую тест обязан ловить: убрать номер поколения из метки
+    дедупа. Одна запись за всю жизнь задачи прошла бы тест на дедуп в
+    пределах одной сдачи целиком, а на проде означала бы, что про третий,
+    четвёртый и пятый заходы человеку не скажут ничего — как раз тогда,
+    когда круг стал дороже всего.
+    """
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-again"}, "run": {"id": "r-again"}}
+    )
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-again")
+    layers = [
+        ([_confirmed("гонка", "concurrency", 10)], []),
+        ([_confirmed("код возврата", "error-handling", 20)], []),
+        ([_confirmed("утечка", "resource-leak", 30)], []),
+    ]
+    await _walk_the_circle(db, task_id, layers)
+
+    from hub.services.review_dispatch import name_the_circle, review_circle
+
+    assert await name_the_circle(db, task_id) is True
+    assert len(await _circle_notices(db, task_id)) == 1
+
+    # Автор закрыл третий слой, пересдал, и четвёртый отчёт принёс новое.
+    await _author_closed_them(
+        db,
+        task_id,
+        await _last_review_id(db, task_id),
+        3,
+        confirmed=layers[2][0],
+        unresolved=layers[2][1],
+    )
+    await _generation_with_findings(
+        db,
+        task_id,
+        4,
+        confirmed=[_confirmed("дескриптор не закрыт", "resource-leak", 40)],
+    )
+
+    assert (await review_circle(db, task_id)).count == 3, "заходов стало три"
+    assert await name_the_circle(db, task_id) is True, (
+        "новый заход — новая сдача — новая запись: молчание про углубившийся "
+        "круг было бы худшим из возможных исходов"
+    )
+    notices = await _circle_notices(db, task_id)
+    assert len(notices) == 2
+    assert "3-й раз" in notices[1], "и во второй раз названо новое число заходов"
+
+
+async def test_two_reports_on_one_generation_do_not_double_count_a_finding(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Разбивка «пришло новых N» считает НАХОДКИ, а не строки отчётов.
+
+    Лестница добора (#879) кладёт на одно поколение два отчёта, и второй
+    часто повторяет находки первого. Находки поколения сливаются в один
+    список, поэтому длина списка — не число находок: тот же дефект,
+    названный дважды, дал бы двойку там, где находка одна.
+
+    Число дорогое: человек по нему решает, стоит ли продолжать круг. «Слой
+    из двух находок» вместо одной — ровно то завышение, из-за которого он
+    решит иначе.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-dbl"}, "run": {"id": "r-dbl"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 2)
+
+    task_id = await _submitted(client, db, "spike-1235-double")
+    first = [_confirmed("гонка на записи", "concurrency", 10)]
+    review_id = await _generation_with_findings(db, task_id, 1, confirmed=first)
+
+    # Поколение 2: ДВА отчёта. Второй повторяет находку первого и приносит
+    # свою. Строк в слитом списке четыре, РАЗНЫХ находок — три.
+    leak = _confirmed("утечка дескриптора", "resource-leak", 40)
+    hang = _confirmed("необработанный код возврата", "error-handling", 50)
+    starve = _confirmed("тест не убивает мутацию", "test-adequacy", 60)
+    await _generation_with_findings(db, task_id, 2, confirmed=[leak, hang])
+    await _generation_with_findings(db, task_id, 2, confirmed=[leak, starve])
+    await _author_closed_them(db, task_id, review_id, 1, confirmed=first, unresolved=[])
+
+    from hub.services.review_dispatch import review_circle
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 1, (
+        "заход один: два отчёта на поколении — всё ещё одно поколение"
+    )
+    assert circle.laps[0].arrived == 3, (
+        "находок три, а строк в слитом списке четыре: считать надо "
+        "уникальные finding_uid. Число не константа — оно обязано ЗАВИСЕТЬ "
+        "от размера слоя, иначе человеку показывают не то, по чему он решает"
+    )
+    assert "пришло новых 3" in circle.breakdown()[0]
+
+
+async def test_the_lap_count_stands_on_the_card_before_the_threshold(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Счёт заходов виден в КАРТОЧКЕ, а не только в алерте после порога.
+
+    Постановка требует, чтобы число было видно в карточке и в брифе, и
+    комментарий к REVIEW_CIRCLE_THRESHOLD обещает то же при пороге 0:
+    «заходы считаются по-прежнему и видны в карточке и в брифе, но
+    человека не зовут». Пока число доходит до карточки одним алертом на
+    пороге, до порога карточка выглядит так, будто круга нет вовсе, —
+    а молчание читается как «чисто» (#516, #549).
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-card"}, "run": {"id": "r-card"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+
+    task_id = await _submitted(client, db, "spike-1235-card")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+
+    assert await _circle_notices(db, task_id) == [], "порог не достигнут: не зовём"
+
+    card = (await client.get(f"/api/tasks/{task_id}")).json()
+    circle = card.get("review_circle") or {}
+    assert circle.get("laps") == 2, (
+        "два захода из трёх обязаны стоять в карточке ДО порога: иначе "
+        "человек видит круг только тогда, когда круг уже стал дорогим"
+    )
+    assert circle.get("named") is False, "видно — не значит позвали"
+    assert len(circle.get("breakdown") or []) == 2, (
+        "разбивка «закрыто / пришло новых» едет вместе с числом"
+    )
+
+
+async def test_a_switched_off_threshold_still_counts_on_the_card(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Порог 0 гасит ЗОВ, а не счёт: ровно то, что обещает конфиг.
+
+    Выключатель, прячущий заодно и число, отнял бы у человека
+    единственный способ увидеть, что выключил он не то.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-off"}, "run": {"id": "r-off"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 0)
+
+    task_id = await _submitted(client, db, "spike-1235-off")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+
+    card = (await client.get(f"/api/tasks/{task_id}")).json()
+    circle = card.get("review_circle") or {}
+    assert circle.get("laps") == 2 and circle.get("named") is False
+    assert await _circle_notices(db, task_id) == []
+
+
+async def test_an_incomplete_empty_report_does_not_wipe_the_laps(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Неполный отчёт без находок — «неизвестно», а не «чисто».
+
+    Пустой ПОЛНЫЙ отчёт круг кончает: харнесс дочитал и не нашёл ничего.
+    Неполный отчёт говорит о себе сам, что дочитал не всё, и лестница
+    добора (#879) существует ровно затем, чтобы добрать непрочитанное. Тот
+    же файл уже исключает incomplete из «код прочитан» по этой самой
+    причине, а докстринг review_circle обещает, что поколение без сведений
+    цепь не рвёт: «неизвестно» не равно «чисто».
+
+    Пока цепь рвалась, пустая строка оставалась в machine_reviews
+    навсегда, и КАЖДАЯ следующая сдача снова упиралась в ту же пару и
+    снова сбрасывала хвост: круг переставал быть видимым насовсем.
+
+    Наблюдено на этой же задаче 10.09.2026: отчёт #366 по поколению 2
+    пришёл с incomplete=true и нулём находок, после чего хаб сам вызвал
+    глубокий добор.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-inc"}, "run": {"id": "r-inc"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+
+    task_id = await _submitted(client, db, "spike-1235-incomplete")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+
+    from hub.services.review_dispatch import review_circle
+
+    assert (await review_circle(db, task_id)).count == 2, "предпосылка: два захода"
+
+    # Поколение 4: НЕПОЛНЫЙ отчёт, находок ноль.
+    await db.execute("UPDATE tasks SET submission_generation=4 WHERE id=?", (task_id,))
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=4,
+        harness_skill="lite-diff-review",
+        model="grok-4.6",
+        raw_count=0,
+        incomplete=True,
+        findings_confirmed="[]",
+        unresolved="[]",
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+
+    assert (await review_circle(db, task_id)).count == 2, (
+        "неполный отчёт не рвёт цепь: он сам говорит, что дочитал не всё, "
+        "и обнулять по нему счёт значит объявить «чисто» там, где сказано "
+        "«неизвестно»"
+    )
+
+    # КОНТРОЛЬ: полный пустой отчёт круг по-прежнему кончает.
+    await db.execute("UPDATE tasks SET submission_generation=5 WHERE id=?", (task_id,))
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=5,
+        harness_skill="deep-review",
+        model="grok-4.6",
+        raw_count=0,
+        incomplete=False,
+        findings_confirmed="[]",
+        unresolved="[]",
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+
+    assert (await review_circle(db, task_id)).count == 0, (
+        "а вот ПОЛНЫЙ пустой отчёт круг кончает: харнесс дочитал и не нашёл "
+        "ничего, и звать человека к вышедшей задаче незачем"
+    )
+
+
+async def test_the_brief_text_carries_the_count_before_the_circle_is_named(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Строка брифа несёт число и ДО того, как круг назван.
+
+    Все прочие проверки _review_circle_line идут при named=true, поэтому
+    мутация «молчать, пока не названо» осталась бы зелёной: ревьюер
+    очередной сдачи читал бы отчёт как первый ровно в том случае, ради
+    которого строка и заведена.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-txt"}, "run": {"id": "r-txt"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+
+    task_id = await _submitted(client, db, "spike-1235-brieftext")
+    await _walk_the_circle(
+        db,
+        task_id,
+        [
+            ([_confirmed("гонка", "concurrency", 10)], []),
+            ([_confirmed("код возврата", "error-handling", 20)], []),
+            ([_confirmed("утечка", "resource-leak", 30)], []),
+        ],
+    )
+
+    from hub.mcp_server import _review_circle_line
+    from hub.services.review_brief import build_review_brief
+
+    brief = await build_review_brief(db, task_id)
+    assert brief.review_circle.laps == 2 and not brief.review_circle.named
+    rendered = _review_circle_line(brief.model_dump())
+    assert "Круг ревью: заходов 2" in rendered, (
+        "число обязано стоять в ТЕКСТЕ брифа и до порога: ревьюер, не "
+        "знающий, что предыдущий слой был разобран, читает отчёт как первый"
+    )
+    assert "заход 1" in rendered and "заход 2" in rendered
+
+
+async def test_an_incomplete_report_that_found_things_still_counts(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Неполнота отменяет ЧИСТОТУ отчёта, а не его находки.
+
+    Пропускается только отчёт, не принёсший НИЧЕГО: там сведений ноль.
+    Неполный отчёт, который что-то нашёл, — обычный слой находок, и
+    выбросить его значило бы спрятать заход, который человек оплатил.
+
+    Наблюдено на этой же задаче 10.09.2026: глубокий отчёт #369 пришёл с
+    incomplete=true И с находками — то есть это не редкий угол, а обычный
+    исход лестницы добора (#879).
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-inc2"}, "run": {"id": "r-inc2"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+
+    task_id = await _submitted(client, db, "spike-1235-incomplete-found")
+    first = [_confirmed("гонка на записи", "concurrency", 10)]
+    review_id = await _generation_with_findings(db, task_id, 1, confirmed=first)
+
+    await db.execute("UPDATE tasks SET submission_generation=2 WHERE id=?", (task_id,))
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=2,
+        harness_skill="deep-review",
+        model="grok-4.6",
+        raw_count=1,
+        incomplete=True,
+        findings_confirmed=json.dumps(
+            [_confirmed("утечка дескриптора", "resource-leak", 40)],
+            ensure_ascii=False,
+        ),
+        unresolved="[]",
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await db.commit()
+    await _author_closed_them(db, task_id, review_id, 1, confirmed=first, unresolved=[])
+
+    from hub.services.review_dispatch import review_circle
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 1, (
+        "заход есть: отчёт неполон, но находку он принёс, и заход этой "
+        "находкой и состоялся"
+    )
+    assert circle.laps[0].arrived == 1
+
+
+# --- #1252: вторая дверь ревью после НАБЛЮДЁННОГО отказа облака -------------
+#
+# Замерено 10.09.2026 на проде: HTTP 400, код usage_limit_exceeded, тело
+# называет причину («Background Agent requires at least $2 remaining until
+# your hard limit»). Наблюдалось на задачах #1250 в 09:46 UTC и #1172 в 10:03.
+_LIMIT_REFUSAL = cursor_cloud.Refusal(
+    status=400,
+    code="usage_limit_exceeded",
+    detail="Background Agent requires at least $2 remaining until your hard limit",
+)
+
+
+def _no_local_path(monkeypatch) -> None:
+    """Локальный путь ВЫКЛЮЧЕН явно, а не по счастливому умолчанию."""
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "")
+
+
+async def test_a_refused_cloud_call_still_gets_a_report_from_the_local_path(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-1 (#1252): облако отказало НА СОЗДАНИИ — отчёт всё равно есть.
+
+    Форж github, то есть облако сюда дотягивается и пробуется ПЕРВЫМ; это и
+    есть случай, у которого второй двери не было вовсе. Проверяется
+    НАБЛЮДАЕМЫМ СОСТОЯНИЕМ карточки — строка в machine_reviews текущего
+    поколения под принципалом ревьюера, — а не тем, что функцию позвали.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder(None, refusal=_LIMIT_REFUSAL)
+    _wire(monkeypatch, recorder)
+    reviewer_pid = await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-second-door", policy={"review": "dispatch"}
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert len(recorder.calls) == 1, (
+        "порядок не меняется: облако пробуется ПЕРВЫМ и ровно один раз "
+        "(повтор на 400 покупает тот же отказ)"
+    )
+    reports = [
+        dict(r) for r in await repo.machine_reviews_of_generation(db, task_id, 1)
+    ]
+    assert len(reports) == 1, (
+        "ровно это и не получалось 10.09.2026: сдача оставалась без отчёта "
+        "навсегда, потому что второго способа не было"
+    )
+    assert reports[0]["principal_id"] == reviewer_pid, (
+        "отчёт ложится под принципалом РЕВЬЮЕРА, иначе гейт его не засчитает"
+    )
+    assert not reports[0]["self_reviewed"], (
+        "self_reviewed=1 означал бы оплаченный впустую прогон (#1128)"
+    )
+    dispatches = [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=? ORDER BY id", (task_id,)
+        )
+    ]
+    assert [d["channel"] for d in dispatches] == ["local"], (
+        "облачной строки нет — агент не создался; локальная одна"
+    )
+    assert dispatches[0]["status"] == "done"
+
+
+async def test_a_run_that_ended_without_a_report_opens_the_second_door(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-2 (#1252): ВТОРОЕ место применения — прогон кончился без отчёта.
+
+    Отказ здесь асинхронный и лежит в другом пути кода: агент создался,
+    деньги потрачены, прогон дошёл до ERROR, а machine_review так и не
+    пришёл (замерено 10.09.2026 на агентах bc-6e7cc3e1 и bc-9b077f68).
+    Закрыть только синхронный случай значит оставить эту половину сдач без
+    отчёта ровно так же, как сегодня.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-6e7cc3e1"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    reviewer_pid = await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-dead-run", policy={"review": "dispatch"}
+    )
+    assert len(recorder.calls) == 1, "облако пробуется первым и агент СОЗДАЁТСЯ"
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert any("отчёт НЕ сдан" in u for u in updates), (
+        "отказ облака остаётся наблюдённым фактом в карточке"
+    )
+    reports = [
+        dict(r) for r in await repo.machine_reviews_of_generation(db, task_id, 1)
+    ]
+    assert len(reports) == 1, (
+        "второй дверью открывается и этот путь: одного потребителя правила недостаточно"
+    )
+    assert reports[0]["principal_id"] == reviewer_pid
+    assert not reports[0]["self_reviewed"]
+    channels = [
+        dict(r)["channel"]
+        for r in await db.execute_fetchall(
+            "SELECT channel FROM review_dispatches WHERE task_id=? ORDER BY id",
+            (task_id,),
+        )
+    ]
+    assert channels == ["cloud", "local"], (
+        "облачный прогон был оплачен и остаётся в истории; локальный — второй"
+    )
+
+
+async def test_an_unconfigured_local_path_changes_nothing_on_github(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1252): настройки нет — поведение байт в байт прежнее.
+
+    Тот же форж и тот же отказ облака, но локальный путь не настроен. Тогда
+    в карточке ровно тот же единственный алерт об отказе облака, ни одной
+    новой записи и ни одной попытки запуска. Настройка, которой нет, не
+    имеет права менять сегодняшний путь — и это проверяется ПОПЫТКОЙ, а не
+    чтением кода: подставка на месте запуска процесса обязана остаться
+    нетронутой.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LIMIT_REFUSAL)
+    _wire(monkeypatch, recorder)
+    _no_local_path(monkeypatch)
+    launched: list[str] = []
+
+    async def _never(prompt):
+        launched.append(prompt)
+        raise AssertionError("локального прогона тут быть не должно")
+
+    monkeypatch.setattr(local_reviewer, "run_review", _never)
+
+    task_id = await _submitted(
+        client, db, "spike-no-local", policy={"review": "dispatch"}
+    )
+    await db.commit()
+
+    assert launched == [], "ненастроенный путь не запускает НИЧЕГО"
+    alerts = [
+        dict(r)["content"]
+        for r in await db.execute_fetchall(
+            "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+            (task_id,),
+        )
+    ]
+    about_review = [a for a in alerts if "ревью НЕ вызвано" in a]
+    assert len(about_review) == 1, (
+        "алерт об отказе облака остаётся ОДИН — второго объяснения одному "
+        "состоянию не заводим (#1188)"
+    )
+    assert "провайдер отказал" in about_review[0], about_review[0]
+    assert "HTTP 400, usage_limit_exceeded" in about_review[0], about_review[0]
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM review_dispatches WHERE task_id=?", (task_id,)
+    ), "ни одной новой строки диспетчера"
+    assert not await repo.machine_reviews_of_generation(db, task_id, 1)
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert not any("ЛОКАЛЬНО" in u for u in updates), (
+        "карточка не обещает того, чего не было"
+    )
+
+
+async def test_the_card_names_which_provider_gave_the_report_and_why(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-4 (#1252): карточка называет, КТО дал отчёт и ПОЧЕМУ не первый.
+
+    Названной причиной отказа облака, а не общими словами. Отчёт без
+    указания автора читается как облачный и вводит человека в заблуждение
+    ровно так же, как сегодня вводит молчание. И «форж облаку недоступен»
+    здесь было бы ЛОЖЬЮ: форж github, облако до него дотягивается.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder(None, refusal=_LIMIT_REFUSAL)
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-named-author", policy={"review": "dispatch"}
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    started = [u for u in updates if "запущено ЛОКАЛЬНО" in u]
+    assert len(started) == 1, "запуск второй двери называется в карточке"
+    note = started[0]
+    assert "ВТОРЫМ поставщиком" in note and "локальным" in note, (
+        "кто дал отчёт — сказано поимённо"
+    )
+    assert "usage_limit_exceeded" in note and "HTTP 400" in note, (
+        "почему не первый — НАЗВАННОЙ причиной отказа облака, с кодом "
+        "провайдера, а не «облако недоступно»"
+    )
+    assert "недоступен" not in note, (
+        "форж github облаку доступен; старый текст на этом месте был бы ложью"
+    )
+
+
+async def _cloud_dispatch_that_died(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path, slug: str
+) -> int:
+    """Задача с облачным заказом, чей прогон кончился ERROR без отчёта."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-stale"}, "run": {"id": "r-s"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    task_id = await _submitted(client, db, slug, policy={"review": "dispatch"})
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    return task_id
+
+
+async def _local_dispatches(db: aiosqlite.Connection, task_id: int) -> list[dict]:
+    return [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=? AND channel='local'",
+            (task_id,),
+        )
+    ]
+
+
+async def test_the_second_door_does_not_buy_a_run_for_a_superseded_submission(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1252: свип разбирает заказ ПОЗЖЕ, и сдача могла успеть смениться.
+
+    Заказ был на поколение 1, автор с тех пор пересдал. Купить второго
+    ревьюера по мёртвому поколению — это оплатить чтение кода, которого на
+    ветке уже нет, и положить в карточку отчёт не про ту сдачу.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    task_id = await _cloud_dispatch_that_died(
+        client, db, monkeypatch, tmp_path, "spike-superseded"
+    )
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 2 WHERE id = ?", (task_id,)
+    )
+    await db.commit()
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert await _local_dispatches(db, task_id) == [], (
+        "вторая дверь открывается по ЖИВОЙ сдаче, а не по той, которую заказ "
+        "успел пережить"
+    )
+
+
+async def test_the_second_door_stays_shut_on_a_task_that_left_review(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1252: задача ушла из review — отчёт больше некому засчитывать.
+
+    Свип бежит по расписанию, и между заказом и его разбором задачу могли
+    вернуть в работу. Прогон по ней был бы куплен впустую: гейта, который
+    ждёт этот отчёт, больше нет.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    task_id = await _cloud_dispatch_that_died(
+        client, db, monkeypatch, tmp_path, "spike-left-review"
+    )
+    await db.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,))
+    await db.commit()
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert await _local_dispatches(db, task_id) == [], (
+        "ревьюер не покупается для задачи, которая ревью больше не ждёт"
+    )
+
+
+# --- #1252, второй заход ревью: находки 1–3 --------------------------------
+
+
+async def test_a_blind_creation_does_not_open_the_second_door(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1252, находка 1: СЛЕПОЙ исход — не отказ, и дверь на нём не открывается.
+
+    Ответ на создание не дошёл, и спросить провайдера, создался ли агент,
+    тоже не вышло. Это состояние ``_Started.blind``: агент, возможно, УЖЕ
+    создан и оплачен. Локальный путь на нём купил бы ВТОРОГО ревьюера на ту
+    же сдачу и принёс бы два соперничающих отчёта — ровно то, ради чего
+    запрет на слепой повтор и стоит двумя строками выше по коду.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder(
+        None, refusal=cursor_cloud.Refusal(status=0, detail="таймаут ответа")
+    )
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    async def _cannot_ask(name, pages=3):
+        return cursor_cloud.Reconciliation("", "", False)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _cannot_ask)
+
+    task_id = await _submitted(
+        client, db, "spike-blind-door", policy={"review": "dispatch"}
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert await _local_dispatches(db, task_id) == [], (
+        "агент, возможно, УЖЕ создан — локальный путь купил бы второго судью"
+    )
+
+
+async def test_the_replacement_keeps_the_profile_the_top_up_ordered(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1252, находка 2: замена упавшего добора обязана остаться deep.
+
+    Принудительный добор лестницы (#879) заказал deep, прогон кончился без
+    отчёта, и локальная замена считала профиль ЗАНОВО — на сдаче низкого
+    риска это lite. Хуже понижения его последствие: упавший заказ и его
+    замена вместе выводят счёт заходов за REVIEW_LADDER_MAX_STEPS, и
+    неполный отчёт lite нового deep уже не позовёт. Лестница ломается молча
+    и в сторону более дешёвого прогона. Тот же класс, что находка 7ed386a8.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-deep"}, "run": {"id": "r-deep"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-deep-replacement", policy={"review": "dispatch"}
+    )
+    first = await _any_dispatch_row(db, task_id)
+    assert first["profile"] == LITE, "исходный прогон дешёвый — иначе добора нет"
+    await repo.set_review_dispatch_status(db, first["id"], "done")
+    await db.commit()
+
+    assert await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+    top_up = await _any_dispatch_row(db, task_id)
+    assert top_up["profile"] == DEEP and top_up["id"] != first["id"]
+
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    local = await _local_dispatches(db, task_id)
+    assert len(local) == 1, "замена должна быть"
+    assert local[0]["profile"] == DEEP, (
+        "добор заказывали ТЕМ ЖЕ профилем: понижение до lite ломает лестницу молча"
+    )
+
+
+async def test_the_sync_second_door_rechecks_the_submission_is_still_live(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1252, находка 3: свежесть перечитывает и СИНХРОННЫЙ путь.
+
+    Сторожа свежести стояли только в свипе, а мест применения два: пока
+    летел запрос на создание облачного агента, автор успел пересдать.
+    Синхронный путь передавал локальному диспетчеру устаревшие задачу,
+    ветку и поколение — и покупал ревью по замещённой сдаче. Один
+    потребитель правила ≠ все.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "test-key")
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "reviewer-token")
+
+    async def _no_usage(agent_id, run_id=None):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _no_usage)
+
+    async def _refuse_and_resubmit(**kwargs):
+        # Пока летел запрос, автор пересдал: поколение уже другое.
+        await db.execute(
+            "UPDATE tasks SET submission_generation = 2 "
+            "WHERE submission_generation = 1 AND status = 'review'"
+        )
+        return None, _LIMIT_REFUSAL
+
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _refuse_and_resubmit)
+
+    task_id = await _submitted(
+        client, db, "spike-sync-stale", policy={"review": "dispatch"}
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert await _local_dispatches(db, task_id) == [], (
+        "сдача сменилась, пока летел запрос: локальный прогон купил бы чтение "
+        "кода, которого на этой сдаче уже нет"
+    )
+
+
+# --- #1252, сдача №3: находки внешнего ревьюера по коммиту c939276 ----------
+
+
+async def test_the_ceiling_counts_what_the_failed_run_already_cost(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находка 1 (P1): потолок расходов не видел денег УПАВШЕГО прогона.
+
+    На асинхронном пути свип строкой выше спрашивает у провайдера счёт за
+    прогон и кладёт его в ``review_dispatches.provider_tokens`` — сумма уже
+    НАЗВАНА. А потолок считал ``_tokens_already_spent``, и та суммировала
+    только ``machine_reviews``, где строки нет: отчёта-то не было. Оплаченный
+    прогон учитывался как ноль ровно в тот момент, когда открывается вторая
+    дверь, и ``LOCAL_REVIEW_TOKEN_CEILING`` (deploy/LOCAL-REVIEW.md)
+    обходился.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-costly"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TOKEN_CEILING", 1_000)
+
+    task_id = await _submitted(
+        client, db, "spike-ceiling-blind", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    async def _billed(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": 5_000}}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    monkeypatch.setattr(cursor_cloud, "get_usage", _billed)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    cloud = [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+            (task_id,),
+        )
+    ]
+    assert cloud and cloud[0]["provider_tokens"] == 5_000, (
+        "счёт за упавший прогон СКАЗАН провайдером и записан — это не незнание"
+    )
+    assert await _local_dispatches(db, task_id) == [], (
+        "потолок в 1000 токенов уже пробит оплаченным прогоном: вторая дверь "
+        "не имеет права покупать ещё один"
+    )
+    alerts = [
+        dict(r)["content"]
+        for r in await repo.get_task_updates(db, task_id)
+        if dict(r)["kind"] == "alert"
+    ]
+    assert any("потолок стоимости исчерпан" in a for a in alerts), (
+        "отказ по потолку называет причину, а не молчит (#1152)"
+    )
+
+
+async def test_a_crash_before_the_second_door_does_not_lose_it(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находка 2 (P2): вторая попытка терялась НАВСЕГДА.
+
+    Строка облачного заказа переводилась в ``failed`` и коммитилась ДО вызова
+    второй двери. Любой сбой после этого коммита — упавший процесс хаба или
+    исключение в подготовке заказа (git-операции ходят в сеть) — оставлял
+    сдачу без локального заказа, а свипы грузят только активные строки.
+    Обещанной второй двери больше не существовало: поллер глотает исключение
+    (hub/poller.py: «the sweep must not kill the loop») и идёт дальше.
+    """
+    from hub.services import review_dispatch as rd
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-crash"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-crash-second-door", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_order = rd.prepare_review_order
+    attempts = {"n": 0}
+
+    async def _flaky_order(*args, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("подготовка заказа сорвалась: git-операция не прошла")
+        return await real_order(*args, **kwargs)
+
+    monkeypatch.setattr(rd, "prepare_review_order", _flaky_order)
+
+    try:
+        await sweep_review_dispatches(db)
+    except RuntimeError:
+        pass  # ровно то, что поллер глотает и забывает
+    await db.commit()
+
+    # Перезапуск: следующий проход свипа обязан ЗАСТАТЬ долг второй двери.
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert len(await _local_dispatches(db, task_id)) == 1, (
+        "долг второй двери переживает сбой: иначе сдача теряет обещанный "
+        "второй способ добыть отчёт безвозвратно"
+    )
+    reports = [
+        dict(r) for r in await repo.machine_reviews_of_generation(db, task_id, 1)
+    ]
+    assert len(reports) == 1
+    alerts = [
+        dict(r)["content"]
+        for r in await repo.get_task_updates(db, task_id)
+        if dict(r)["kind"] == "alert" and "отчёт НЕ сдан" in dict(r)["content"]
+    ]
+    assert len(alerts) == 1, (
+        "повтор долга не превращается в поток алертов: отказ облака назван один раз"
+    )
+
+
+@pytest.mark.parametrize(
+    "reads_before_revocation",
+    # Чтений принципала на пути второй двери ТРИ, и отзыв токена между любыми
+    # двумя из них даёт разное состояние. 1 — отозван после проверки
+    # готовности у зовущего: ways вызываемого уже без локального канала.
+    # 2 — отозван после ЕГО собственного review_reach: ways ещё с локальным
+    # каналом, а принципала уже нет. Второй случай ловится только
+    # перечитыванием принципала, и без него первый сторож пропускает.
+    (1, 2),
+    ids=("revoked-before-the-callee-looks", "revoked-between-reach-and-order"),
+)
+async def test_the_local_order_refuses_without_the_reviewers_principal(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    monkeypatch,
+    tmp_path,
+    reads_before_revocation: int,
+):
+    """Находка 3 (P2): заказ мог уехать БЕЗ принципала ревьюера.
+
+    ``open_second_door`` требует LOCAL_CHANNEL в ways, а вызываемый
+    ``dispatch_local_review`` делал СВОЙ ``review_reach`` и смотрел только на
+    ``runnable``. На github ``runnable`` истинно из-за облака даже тогда,
+    когда локального канала уже нет, — и ``principal_id`` мог оказаться
+    None. Между двумя чтениями лежит await, и токен ревьюера успевает быть
+    отозванным: заказ создавался под NULL, то есть отчёт переставал быть
+    чужим автору — ровно то, что обесценивает прогон (#1128).
+    """
+    from hub.services import review_dispatch as rd
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder(None, refusal=_LIMIT_REFUSAL)
+    _wire(monkeypatch, recorder)
+    pid = await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    real_principal = rd.local_reviewer_principal_id
+    reads = {"n": 0}
+
+    async def _revoked_after_the_first_read(conn):
+        reads["n"] += 1
+        got = await real_principal(conn)
+        if reads["n"] == reads_before_revocation:
+            # Токен ревьюера отозвали ПОСЛЕ того, как готовность уже сказали.
+            await conn.execute(
+                "UPDATE api_keys SET revoked_at = datetime('now') "
+                "WHERE principal_id = ?",
+                (pid,),
+            )
+            await conn.commit()
+        return got
+
+    monkeypatch.setattr(
+        rd, "local_reviewer_principal_id", _revoked_after_the_first_read
+    )
+
+    task_id = await _submitted(
+        client, db, "spike-no-principal", policy={"review": "dispatch"}
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    _rows = await _local_dispatches(db, task_id)
+    assert [(r["id"], r["reviewer_principal_id"]) for r in _rows] == [], (
+        "заказ без принципала независимого ревьюера не создаётся вовсе: "
+        "отчёт под NULL читается как свой собственному вызову"
+    )
+    alerts = [
+        dict(r)["content"]
+        for r in await repo.get_task_updates(db, task_id)
+        if dict(r)["kind"] == "alert"
+    ]
+    assert any("LOCAL_REVIEWER_HUB_TOKEN" in a for a in alerts), (
+        "отказ называет, ЧЕГО не хватает, именем настройки (#1083)"
+    )
+
+
+async def test_the_local_order_refuses_a_forge_where_only_the_cloud_is_ready(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 3, вторая половина: правило живёт в ВЫЗЫВАЕМОЙ функции.
+
+    Проверяется собственный вход ``dispatch_local_review``, а не путь через
+    ``open_second_door``: сегодня сторож стоит у зовущего, и достаточность
+    этого — свойство сегодняшнего списка зовущих, а не функции. На форже из
+    CLOUD_REVIEW_FORGES ``reach.runnable`` истинно ИЗ-ЗА ОБЛАКА даже тогда,
+    когда локального канала нет вовсе, и старая проверка пропускала заказ
+    дальше: строка диспетчера создавалась под путь, которым исполнить её
+    нечем.
+    """
+    from hub.services.review_dispatch import dispatch_local_review
+
+    await _local_principal(db, monkeypatch)
+    # Токен ревьюера есть и разрешается, а CLI и песочницы нет: локального
+    # канала нет, но ways на github непуст — там стоит облако.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", "")
+
+    task_id = await _submitted(client, db, "spike-cloud-only-reach")
+    task = dict(await repo.get_task(db, task_id))
+
+    assert not await dispatch_local_review(db, task, "github", task["branch"], 1), (
+        "локального канала нет — заказывать нечем"
+    )
+    assert await _local_dispatches(db, task_id) == [], (
+        "строка диспетчера под путь, которым исполнить нечем, — оплаченный "
+        "заказ в никуда"
+    )
+    alerts = [
+        dict(r)["content"]
+        for r in await repo.get_task_updates(db, task_id)
+        if dict(r)["kind"] == "alert"
+    ]
+    assert any("LOCAL_REVIEW_CMD" in a for a in alerts), (
+        "отказ называет отсутствующие настройки по именам (#1083)"
+    )
+
+
+# --- #1252, сдача №4: находки внешнего ревьюера по коммиту 6bdc607 ----------
+
+
+def _contract_reporting_stub(db, principal_id: int, report: dict | None = None):
+    """Ревьюер, сдающий отчёт ПО КОНТРАКТУ и не оставляющий блока в тексте.
+
+    Основной путь локального ревьюера — ``hub_submit_machine_review`` под
+    своим токеном (#1180); блок в выводе — запасной (#1036). Заглушки этого
+    файла до сих пор изображали только запасной, и контрактный путь второй
+    двери ни одним тестом не проходился.
+    """
+
+    async def _run(prompt: str, *, timeout: int | None = None, prompt_at_slot=None):
+        from hub.models import MachineReviewSubmit
+        from hub.services.machine_review_intake import record_machine_review
+
+        payload = {**(report or _LOCAL_REPORT)}
+        payload.pop("orchestrator", None)
+        await record_machine_review(
+            db,
+            _run.task_id,
+            MachineReviewSubmit(**payload),
+            principal_id=principal_id,
+            username="local-reviewer",
+        )
+        await db.commit()
+        return local_reviewer.LocalRun(
+            rc=0, output="", dropped=0, timed_out=False, duration_ms=1_000
+        )
+
+    return _run
+
+
+async def test_a_contract_report_from_the_local_reviewer_closes_its_dispatch(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """P1-1: отчёт локального ревьюера не опознавался СВОИМ заказом.
+
+    Ступень заказа считалась по ВСЕМ заказам поколения, а отчёты отбирались
+    по принципалу заказа. На пути второй двери заказов два и принципалы
+    разные: облачный — ступень 0, локальный — ступень 1, а у локального
+    принципала отчёт всего один, с индексом 0. Годный отчёт не опознавался,
+    локальный заказ помечался упавшим, и пустое ревью не могло дать
+    автовердикт: ни один заказ не закрылся.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-contract"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    reviewer_pid = await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-contract-report", policy={"review": "dispatch"}
+    )
+    stub = _contract_reporting_stub(db, reviewer_pid)
+    stub.task_id = task_id
+    monkeypatch.setattr(local_reviewer, "run_review", stub)
+
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    local = await _local_dispatches(db, task_id)
+    assert len(local) == 1
+    assert local[0]["status"] == "done", (
+        "отчёт сдан по контракту под принципалом ревьюера — заказ обязан "
+        "закрыться им, а не быть объявленным упавшим"
+    )
+    alerts = [
+        dict(r)["content"]
+        for r in await repo.get_task_updates(db, task_id)
+        if dict(r)["kind"] == "alert"
+    ]
+    assert not any("Локальное машинное ревью" in a for a in alerts), (
+        "«ревью не состоялось» по годному отчёту — ложь в карточке"
+    )
+
+
+async def test_a_late_cloud_report_closes_the_dispatch_instead_of_the_second_door(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """P1-2: гонка с поздним отчётом облака покупала второго ревьюера.
+
+    Между первой проверкой отчёта и открытием второй двери свип успевает
+    сходить в сеть дважды — за терминальным состоянием прогона и за расходом.
+    Контрактный отчёт, пришедший в это окно, блок не останавливал: писался
+    алерт «отчёт НЕ сдан», открывалась вторая дверь, и на одну сдачу
+    приезжали два соперничающих отчёта за лишние деньги.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-late"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-late-cloud", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    submitted: list[int] = []
+
+    async def _usage_and_a_late_report(agent_id, run_id=None):
+        # Пока свип ходит за расходом, облачный ревьюер сдаёт отчёт по
+        # контракту: сеть и MCP работают параллельно. Сдаёт ОДИН раз —
+        # ревьюер не отчитывается дважды.
+        from hub.models import MachineReviewSubmit
+        from hub.services.machine_review_intake import record_machine_review
+
+        if submitted:
+            return None
+        submitted.append(1)
+        payload = {**_LOCAL_REPORT}
+        payload.pop("orchestrator", None)
+        await record_machine_review(
+            db,
+            task_id,
+            MachineReviewSubmit(**payload),
+            principal_id=cloud_pid,
+            username="cloud-reviewer",
+        )
+        await db.commit()
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage_and_a_late_report)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+    # Доехавший отчёт закрывает заказ СЛЕДУЮЩИМ проходом, обычным путём — со
+    # сверкой расхода по данным провайдера (#1026), а не вторым автором
+    # закрытия здесь.
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert await _local_dispatches(db, task_id) == [], (
+        "отчёт УЖЕ есть: второй ревьюер здесь — лишние деньги и второй "
+        "отчёт-соперник на ту же сдачу"
+    )
+    reports = [
+        dict(r) for r in await repo.machine_reviews_of_generation(db, task_id, 1)
+    ]
+    assert len(reports) == 1
+    cloud = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert cloud["status"] == "done", "заказ закрывается СВОИМ доехавшим отчётом"
+    alerts = [
+        dict(r)["content"]
+        for r in await repo.get_task_updates(db, task_id)
+        if dict(r)["kind"] == "alert"
+    ]
+    assert not any("отчёт НЕ сдан" in a for a in alerts), (
+        "алерт об отсутствии отчёта при доехавшем отчёте — ложь в карточке"
+    )
+
+
+async def test_the_debt_is_paid_once_even_after_a_death_mid_settlement(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """P2: отдача долга второй двери была неидемпотентна.
+
+    Хаб остановился после того, как локальный заказ закоммичен, но до того,
+    как облачный долг помечен failed. При рестарте видны обе строки, а
+    отдача долга существующего локального заказа не замечала: облачная
+    разбиралась первой и покупала ВТОРОЙ прогон на то же поколение.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-twice"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    # Принципал облачного ревьюера настоящий, как на проде. Без него заказ
+    # пишется с NULL, сопоставление отчёта падает на старое правило «любой
+    # отчёт этого поколения», и отчёт ЛОКАЛЬНОГО прогона закрывал бы дверь
+    # вместо сторожа идемпотентности — то есть проверялся бы не тот сторож.
+    await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-debt-twice", policy={"review": "dispatch"}
+    )
+    cloud_id = (await _any_dispatch_row(db, task_id))["id"]
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_set = repo.set_review_dispatch_status
+    died = {"n": 0}
+
+    async def _dies_closing_the_debt(conn, dispatch_id, status):
+        if int(dispatch_id) == int(cloud_id) and status == "failed":
+            died["n"] += 1
+            raise RuntimeError("хаб остановлен между двумя записями")
+        return await real_set(conn, dispatch_id, status)
+
+    monkeypatch.setattr(repo, "set_review_dispatch_status", _dies_closing_the_debt)
+
+    try:
+        await sweep_review_dispatches(db)
+    except RuntimeError:
+        pass
+    await wait_for_local_runs()
+    await db.commit()
+    assert died["n"] == 1, "предпосылка: смерть случилась именно на закрытии долга"
+    assert len(await _local_dispatches(db, task_id)) == 1, (
+        "предпосылка: локальный заказ уже создан и закоммичен"
+    )
+
+    monkeypatch.setattr(repo, "set_review_dispatch_status", real_set)
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert len(await _local_dispatches(db, task_id)) == 1, (
+        "долг отдаётся ОДИН раз: второй прогон на то же поколение — "
+        "оплаченный дважды отчёт"
+    )
+    assert (
+        dict(
+            (
+                await db.execute_fetchall(
+                    "SELECT * FROM review_dispatches WHERE id=?", (cloud_id,)
+                )
+            )[0]
+        )["status"]
+        == "failed"
+    ), "отданный долг закрывается"
+
+
+async def _a_report_from(db, task_id: int, principal_id: int, username: str) -> int:
+    """Отчёт этого принципала по текущему поколению. Возвращает его id."""
+    from hub.models import MachineReviewSubmit
+    from hub.services.machine_review_intake import record_machine_review
+
+    payload = {**_LOCAL_REPORT}
+    payload.pop("orchestrator", None)
+    await record_machine_review(
+        db,
+        task_id,
+        MachineReviewSubmit(**payload),
+        principal_id=principal_id,
+        username=username,
+    )
+    await db.commit()
+    rows = await repo.machine_reviews_of_generation(db, task_id, 1)
+    return int(dict(rows[-1])["id"])
+
+
+async def test_the_rung_is_counted_inside_its_own_channel(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1252: канал в мерке ступени нужен САМ ПО СЕБЕ.
+
+    Отдельный токен у локального ревьюера — требование выката, а не свойство
+    кода: ничто не мешает поставить на обоих каналах ОДИН токен. Тогда
+    принципал у двух заказов поколения общий, и мерки «свои заказы того же
+    принципала» не хватает — локальный заказ снова оказывается ступенью 1
+    при единственном отчёте.
+    """
+    from hub.services.review_dispatch import _dispatch_report
+
+    monkeypatch.setattr(hub_auth, "_is_open_mode", lambda: False)
+    shared_pid, _ = await _agent_key(db, "one-token-for-both")
+    task_id = await _submitted(client, db, "spike-shared-token")
+
+    await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-shared",
+        run_id="r-1",
+        model="grok-4.6",
+        reviewer_principal_id=shared_pid,
+        channel="cloud",
+    )
+    local_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="local:shared",
+        run_id="r-2",
+        model="grok-4.6",
+        reviewer_principal_id=shared_pid,
+        channel="local",
+    )
+    await db.commit()
+    report_id = await _a_report_from(db, task_id, shared_pid, "one-token-for-both")
+
+    local = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE id=?", (local_id,)
+            )
+        )[0]
+    )
+    matched = await _dispatch_report(db, task_id, 1, local)
+    assert matched is not None and int(matched["id"]) == report_id, (
+        "единственный отчёт принадлежит локальному заказу: ступень считается "
+        "внутри своего канала, иначе общий токен ломает сопоставление"
+    )
+
+
+async def test_the_rung_is_counted_inside_its_own_principal(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1252: принципал в мерке ступени нужен САМ ПО СЕБЕ.
+
+    Два заказа одного канала в одном поколении бывают и без второй двери:
+    добор лестницы (#879). Если между ними токен ревьюера сменили, отчёт
+    нового принципала — первый ЕГО отчёт, а заказ стоит вторым в канале.
+    Мерки «свои заказы того же канала» тут не хватает.
+    """
+    from hub.services.review_dispatch import _dispatch_report
+
+    monkeypatch.setattr(hub_auth, "_is_open_mode", lambda: False)
+    old_pid, _ = await _agent_key(db, "reviewer-before-rotation")
+    new_pid, _ = await _agent_key(db, "reviewer-after-rotation")
+    task_id = await _submitted(client, db, "spike-rotated-token")
+
+    await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-old",
+        run_id="r-1",
+        model="grok-4.6",
+        reviewer_principal_id=old_pid,
+        channel="cloud",
+    )
+    top_up_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-new",
+        run_id="r-2",
+        model="grok-4.6",
+        reviewer_principal_id=new_pid,
+        channel="cloud",
+    )
+    await db.commit()
+    report_id = await _a_report_from(db, task_id, new_pid, "reviewer-after-rotation")
+
+    top_up = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE id=?", (top_up_id,)
+            )
+        )[0]
+    )
+    matched = await _dispatch_report(db, task_id, 1, top_up)
+    assert matched is not None and int(matched["id"]) == report_id, (
+        "отчёт нового принципала — ПЕРВЫЙ его отчёт: ступень считается "
+        "внутри заказов того же принципала"
+    )
+
+
+async def test_a_report_arriving_while_the_debt_settles_still_stops_the_order(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1252: последнее слово перед заказом говорится ПЕРЕД заказом.
+
+    Одной проверки мало. Отчёт может доехать уже после того, как свип назвал
+    его отсутствующим, — пока пишется долг, читается задача и читается
+    проект, а на возобновлении ещё и между проходами. Деньги тратятся в
+    момент заказа, и смотреть надо там.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-mid"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-report-mid-settle", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_resolve = repo.resolve_project_for_task
+    landed: list[int] = []
+
+    async def _report_lands_mid_settlement(conn, tid):
+        # Отчёт доехал ПОСЛЕ первой проверки: долг уже записан, заказ ещё нет.
+        if not landed:
+            landed.append(-1)
+            landed[0] = await _a_report_from(db, task_id, cloud_pid, "cloud-reviewer")
+        return await real_resolve(conn, tid)
+
+    monkeypatch.setattr(repo, "resolve_project_for_task", _report_lands_mid_settlement)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert landed and landed[0] > 0, "предпосылка: отчёт доехал именно в это окно"
+    assert await _local_dispatches(db, task_id) == [], (
+        "отчёт уже сдан: заказ второго ревьюера — оплаченный отчёт-соперник"
+    )
+
+
+# --- #1252: находки внешнего ревьюера по коммиту e69a3d5 --------------------
+
+
+_INCOMPLETE_LOCAL_REPORT = {
+    **_LOCAL_REPORT,
+    "incomplete": True,
+    "lost_dimensions": ["hub/services/big.py"],
+}
+
+
+async def test_a_deep_top_up_is_not_silenced_by_an_earlier_lite_debt(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находка 1 (P1): ключ идемпотентности не различает РАЗНЫЕ долги.
+
+    Первый облачный вызов отказывает на создании -> открывается первая
+    вторая дверь -> локальный LITE-прогон сдаёт отчёт incomplete=true ->
+    лестница (#879) заказывает тяжёлый добор -> второй облачный вызов
+    СОЗДАЁТСЯ, но кончается без отчёта -> открывается ВТОРАЯ вторая дверь.
+
+    ``_second_door_already_opened`` спрашивал только task_id+generation+
+    channel='local'+status, не различая, какой ИМЕННО долг локальный заказ
+    оплатил. Он находил первый (LITE, уже done) заказ и считал ВТОРОЙ
+    (DEEP) долг уже оплаченным — тяжёлый добор так и не заказывался, а
+    сдача оставалась с одним неполным отчётом.
+    """
+    from hub.services.review_dispatch import DEEP, wait_for_local_runs
+
+    calls: list[dict] = []
+
+    async def _create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            # Первый вызов (первичная сдача): облако отказывает НА СОЗДАНИИ.
+            return None, _LIMIT_REFUSAL
+        # Второй вызов (добор лестницы): облако СОЗДАЁТ агента на этот раз.
+        return {"agent": {"id": "bc-deep"}, "run": {"id": "r-deep"}}, None
+
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "test-key")
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _create)
+
+    async def _no_usage(agent_id, run_id=None):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _no_usage)
+    # Принципал облачного ревьюера настоящий, как на проде (без него отчёт
+    # сопоставляется по старому правилу «любой отчёт этого поколения», и
+    # LITE-отчёт замаскировал бы находку 1 под находку рунг-сопоставления).
+    await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub(_INCOMPLETE_LOCAL_REPORT))
+
+    task_id = await _submitted(
+        client, db, "spike-topup-after-lite-debt", policy={"review": "dispatch"}
+    )
+    # Первый (синхронный) отказ уже случился внутри _submitted; локальный
+    # LITE-прогон запущен асинхронно.
+    await wait_for_local_runs()
+    await db.commit()
+
+    local_after_first_door = await _local_dispatches(db, task_id)
+    assert len(local_after_first_door) == 1
+    assert local_after_first_door[0]["status"] == "done"
+    assert local_after_first_door[0]["profile"] == "lite"
+    # Предпосылка: неполный LITE-отчёт купил тяжёлый добор ВТОРЫМ облачным
+    # вызовом (лестница #879 срабатывает автоматически при приёме отчёта).
+    assert len(calls) == 2, "неполный отчёт обязан купить добор лестницы"
+
+    deep_cloud = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert deep_cloud["profile"] == DEEP
+
+    # Тяжёлый добор дошёл до терминального статуса без отчёта.
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes') "
+        "WHERE id = ?",
+        (deep_cloud["id"],),
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    local_after_second_door = await _local_dispatches(db, task_id)
+    assert len(local_after_second_door) == 2, (
+        "тяжёлый добор кончился без отчёта — ему причитается СВОЯ вторая "
+        "дверь, а не долг, уже оплаченный чужим (LITE) заказом"
+    )
+    newest = max(local_after_second_door, key=lambda d: d["id"])
+    assert newest["profile"] == DEEP, (
+        "замена обязана доехать тем же (тяжёлым) профилем, каким заказывали "
+        "упавший добор"
+    )
+
+
+async def test_a_late_report_during_debt_settlement_settles_its_own_dispatch(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находка 2 (P1): доехавший отчёт обязан закрыть СВОЙ заказ как done.
+
+    Сценарий тот же, что и в ``test_a_report_arriving_while_the_debt_settles_
+    still_stops_the_order`` — отчёт доезжает, пока отдаётся долг второй
+    двери, и локальный соперник верно не покупается. Но ``_settle_second_
+    door`` безусловно закрывал СТРОКУ ОБЛАЧНОГО заказа в ``failed`` — даже
+    когда его же отчёт только что нашёлся. ``failed``-строки свип больше не
+    разбирает, а ``get_settled_review_dispatch`` берёт только ``done``, то
+    есть годный отчёт никогда не сверяется как успешный заказ.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-late2"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-late-settles-done", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_resolve = repo.resolve_project_for_task
+    landed: list[int] = []
+
+    async def _report_lands_mid_settlement(conn, tid):
+        if not landed:
+            landed.append(-1)
+            landed[0] = await _a_report_from(db, task_id, cloud_pid, "cloud-reviewer")
+        return await real_resolve(conn, tid)
+
+    monkeypatch.setattr(repo, "resolve_project_for_task", _report_lands_mid_settlement)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert landed and landed[0] > 0, "предпосылка: отчёт доехал именно в это окно"
+    assert await _local_dispatches(db, task_id) == [], (
+        "отчёт уже сдан: заказ второго ревьюера — оплаченный отчёт-соперник"
+    )
+    cloud = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert cloud["status"] == "done", (
+        "доехавший отчёт принадлежит ЭТОМУ заказу — он обязан закрыться им, "
+        "а не быть объявленным упавшим одновременно с годным отчётом"
+    )
+    settled = await repo.get_settled_review_dispatch(db, task_id, 1)
+    assert settled is not None and int(settled["id"]) == int(cloud["id"]), (
+        "get_settled_review_dispatch обязана видеть этот заказ доставленным, "
+        "иначе доказательство пустого ревью (#769) никогда не соберётся"
+    )
+
+
+async def test_a_report_arriving_while_the_local_order_is_being_prepared_stops_it(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Находка 3 (P1): последнее слово должно звучать НЕПОСРЕДСТВЕННО перед заказом.
+
+    Рунг-проверка в ``_second_door_after_run`` — только ПЕРВАЯ из двух:
+    после неё ``open_second_door`` перечитывает свежесть сдачи и достижимость
+    (несколько await в базу), а ``dispatch_local_review`` считает потолок
+    стоимости и готовит заказ через ``prepare_review_order`` (диф/правила) —
+    и только потом вставляет строку и запускает прогон. Отчёт, доехавший в
+    ЭТО окно, эту проверку не видит вовсе и покупает оплаченного соперника.
+    """
+    from hub.services import review_dispatch as review_dispatch_module
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-prep"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-report-during-prep", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_prepare = review_dispatch_module.prepare_review_order
+    landed: list[int] = []
+
+    async def _report_lands_during_prep(
+        db_conn, task, *, branch, generation, force_profile, principal_id
+    ):
+        # Отчёт доезжает ПОСЛЕ рунг-проверки в _second_door_after_run (она
+        # уже прошла — отчёта тогда не было), но ДО вставки строки локального
+        # заказа: подготовка заказа (git/дифф) идёт прямо сейчас.
+        if not landed:
+            landed.append(-1)
+            landed[0] = await _a_report_from(db, task_id, cloud_pid, "cloud-reviewer")
+        return await real_prepare(
+            db_conn,
+            task,
+            branch=branch,
+            generation=generation,
+            force_profile=force_profile,
+            principal_id=principal_id,
+        )
+
+    monkeypatch.setattr(
+        review_dispatch_module, "prepare_review_order", _report_lands_during_prep
+    )
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert landed and landed[0] > 0, "предпосылка: отчёт доехал именно в это окно"
+    assert await _local_dispatches(db, task_id) == [], (
+        "отчёт доехал во время подготовки заказа: локальный заказ здесь — "
+        "оплаченный отчёт-соперник"
+    )
+    cloud = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert cloud["status"] == "done", (
+        "доехавший отчёт принадлежит этому заказу — закрывается им"
+    )
+
+
+# --- #1266: пять остаточных находок доставки #1252 --------------------------
+
+
+async def test_a_replacement_does_not_spend_the_ladder_step(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-1: локальная замена упавшего облачного LITE не тратит шаг лестницы.
+
+    Облачный LITE СОЗДАЁТСЯ (в отличие от test_a_deep_top_up_is_not_
+    silenced_by_an_earlier_lite_debt, где он отказывает на создании и строки
+    не пишет) и кончается без отчёта. Вторая дверь заказывает локальную
+    замену, её отчёт неполный. count_review_dispatches сегодня считает ОБЕ
+    строки (облачную и локальную замену) как два шага, REVIEW_LADDER_MAX_
+    STEPS=2 достигнут — DEEP-добор молча не заказывается.
+    """
+    from hub.services.review_dispatch import DEEP, wait_for_local_runs
+
+    recorder = _DispatchRecorder(
+        {"agent": {"id": "bc-ladder"}, "run": {"id": "r-ladder"}}
+    )
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub(_INCOMPLETE_LOCAL_REPORT))
+
+    task_id = await _submitted(
+        client, db, "spike-ladder-replacement", policy={"review": "dispatch"}
+    )
+    cloud_before = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert cloud_before["profile"] == "lite"
+
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes') "
+        "WHERE id = ?",
+        (cloud_before["id"],),
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    locals_ = await _local_dispatches(db, task_id)
+    assert len(locals_) == 1 and locals_[0]["status"] == "done"
+    assert locals_[0]["profile"] == "lite"
+
+    deep_rows = [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud' "
+            "AND profile=?",
+            (task_id, DEEP),
+        )
+    ]
+    assert deep_rows, (
+        "замена упавшего облачного LITE не должна тратить шаг лестницы: "
+        "DEEP-добор обязан быть заказан по неполному отчёту локальной замены"
+    )
+
+
+async def test_a_sync_refusal_keeps_the_second_door_debt_through_a_crash(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-2: синхронный отказ облака обязан оставить долг ДО риска сломаться.
+
+    Облако отказывает НА СОЗДАНИИ (синхронно, строки не бывает вовсе).
+    Подготовка локального заказа (``prepare_review_order`` для локального
+    принципала) падает — ровно то, что может случиться из-за сети внутри
+    неё. Сегодня ``open_second_door`` зовётся БЕЗ строки долга, и падение
+    внутри нею не оставляет НИЧЕГО, что свип мог бы повторить: вторая дверь
+    потеряна навсегда.
+    """
+    from hub.services import review_dispatch as rd
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    _wire(monkeypatch, _DispatchRecorder(None, _LIMIT_REFUSAL))
+
+    local_pid = await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    real_order = rd.prepare_review_order
+    local_attempts = {"n": 0}
+
+    async def _flaky_for_local(*args, **kwargs):
+        if kwargs.get("principal_id") == local_pid:
+            local_attempts["n"] += 1
+            if local_attempts["n"] == 1:
+                raise RuntimeError(
+                    "подготовка локального заказа сорвалась: git-операция не прошла"
+                )
+        return await real_order(*args, **kwargs)
+
+    monkeypatch.setattr(rd, "prepare_review_order", _flaky_for_local)
+
+    task_id = await _submitted(
+        client, db, "spike-sync-debt-crash", policy={"review": "dispatch"}
+    )
+
+    rows_after_crash = list(
+        await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=?", (task_id,)
+        )
+    )
+    assert rows_after_crash, (
+        "долг второй двери обязан быть записан ДО рискованного вызова: иначе "
+        "падение внутри подготовки локального заказа теряет обещанную вторую "
+        "дверь безвозвратно"
+    )
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    locals_ = await _local_dispatches(db, task_id)
+    assert len(locals_) == 1 and locals_[0]["status"] == "done", (
+        "долг второй двери обязан быть отдан на следующем проходе свипа, "
+        "как и в асинхронном случае (test_a_crash_before_the_second_door_"
+        "does_not_lose_it)"
+    )
+
+
+async def test_a_submission_moved_during_preparation_buys_no_local_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-4: сдачу пересдали, пока готовился локальный заказ — прогон не покупается.
+
+    ``_submission_still_live`` сегодня перечитывается только в начале
+    ``open_second_door`` — ДО ``review_reach``, счёта потраченного и
+    медленной ``prepare_review_order``. Пересдача, случившаяся ВНУТРИ
+    подготовки заказа, этой ранней проверке не видна вовсе, а
+    ``late_report_recheck`` перед вставкой строки смотрит только на поздний
+    отчёт, не на актуальность сдачи.
+    """
+    from hub.services import review_dispatch as review_dispatch_module
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-move"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-resubmit-during-prep", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_prepare = review_dispatch_module.prepare_review_order
+    moved: list[bool] = []
+
+    async def _resubmit_during_prep(
+        db_conn, task, *, branch, generation, force_profile, principal_id
+    ):
+        if not moved:
+            moved.append(True)
+            # Пересдача поднимает submission_generation — ровно то, что
+            # увидел бы _submission_still_live, если бы его спросили ЗДЕСЬ,
+            # а не только в самом начале open_second_door.
+            await repo.update_task(
+                db_conn, task_id, submission_generation=generation + 1
+            )
+            await db_conn.commit()
+        return await real_prepare(
+            db_conn,
+            task,
+            branch=branch,
+            generation=generation,
+            force_profile=force_profile,
+            principal_id=principal_id,
+        )
+
+    monkeypatch.setattr(
+        review_dispatch_module, "prepare_review_order", _resubmit_during_prep
+    )
+
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert moved, "предпосылка: пересдача произошла именно во время подготовки заказа"
+    assert await _local_dispatches(db, task_id) == [], (
+        "сдачу пересдали, пока готовился локальный заказ — прогон по уехавшей "
+        "сдаче не покупается"
+    )
+
+
+async def test_a_late_cloud_report_wins_over_an_existing_fallback(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-5: поздний СВОЙ отчёт закрывает заказ как done, а не failed.
+
+    Локальная замена уже закоммичена (долг «отдан»), но финальную запись
+    статуса ОБЛАЧНОГО заказа обрывает «падение процесса» — строка остаётся
+    ``second_door``. Поздний отчёт ЭТОГО облачного заказа доезжает до
+    следующего прохода свипа. Сегодня ``_settle_second_door`` спрашивает
+    ``_second_door_already_opened`` РАНЬШЕ своего отчёта — находит локальную
+    замену и БЕЗУСЛОВНО закрывает облачный заказ ``failed``, хотя его
+    собственный отчёт уже лежит в базе.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-late5"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-late-cloud-wins", policy={"review": "dispatch"}
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    real_set_status = repo.set_review_dispatch_status
+    crashed = {"done": False}
+
+    async def _crash_on_first_status_write(db_conn, dispatch_id, status):
+        if not crashed["done"]:
+            crashed["done"] = True
+            raise RuntimeError("падение процесса перед закрытием долга")
+        return await real_set_status(db_conn, dispatch_id, status)
+
+    monkeypatch.setattr(
+        repo, "set_review_dispatch_status", _crash_on_first_status_write
+    )
+
+    try:
+        await sweep_review_dispatches(db)
+    except RuntimeError:
+        pass
+    await db.commit()
+
+    monkeypatch.setattr(repo, "set_review_dispatch_status", real_set_status)
+    await wait_for_local_runs()
+    await db.commit()
+
+    cloud = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE task_id=? AND channel='cloud'",
+                (task_id,),
+            )
+        )[0]
+    )
+    assert cloud["status"] == "second_door", (
+        "предпосылка: долг остался неотданным — процесс упал перед записью статуса"
+    )
+    assert await _local_dispatches(db, task_id) != [], (
+        "предпосылка: локальная замена уже закоммичена к моменту падения"
+    )
+
+    await _a_report_from(db, task_id, cloud_pid, "cloud-reviewer")
+
+    await sweep_review_dispatches(db)
+    await db.commit()
+
+    cloud_after = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT * FROM review_dispatches WHERE id=?", (cloud["id"],)
+            )
+        )[0]
+    )
+    assert cloud_after["status"] == "done", (
+        "СВОЙ поздний отчёт обязан закрыть заказ как done, а не failed — иначе "
+        "get_settled_review_dispatch никогда не сверит этот отчёт как заказ (#769)"
+    )
+
+
+async def test_two_real_cloud_runs_still_hit_the_ladder_ceiling(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """Мутационный щит: правка count_review_dispatches не расширяет потолок.
+
+    Два НАСТОЯЩИХ облачных прогона (agent_id непуст, replaces_dispatch_id
+    пуст у обоих — ни один не замена) обязаны по-прежнему считаться ДВУМЯ
+    шагами лестницы, а не одним: #1266 чинит замену, а не потолок.
+    """
+    from hub.services.review_dispatch import REVIEW_LADDER_MAX_STEPS
+
+    task_id = await _submitted(client, db, "spike-ceiling-two-real-cloud")
+    generation = 1
+    for i in range(REVIEW_LADDER_MAX_STEPS):
+        await repo.create_review_dispatch(
+            db,
+            task_id=task_id,
+            submission_generation=generation,
+            agent_id=f"bc-real-{i}",
+            run_id=f"r-{i}",
+            model="grok-4.6",
+            profile="lite" if i == 0 else "deep",
+            channel="cloud",
+        )
+    await db.commit()
+
+    steps = await repo.count_review_dispatches(db, task_id, generation)
+    assert steps == REVIEW_LADDER_MAX_STEPS, (
+        "два настоящих облачных прогона обязаны считаться двумя шагами — "
+        "починка счёта логического шага не должна расширить потолок"
+    )
+
+
+async def test_a_sync_refusal_names_the_refusal_not_a_finished_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """F3 (раунд 2, 7a78080de93938ae): синхронный отказ — не «прогон кончился».
+
+    _second_door_after_run строит текст шаблоном «прогон облачного агента
+    ... кончился статусом ... и отчёта не оставил», и после унификации
+    синхронного и асинхронного путей (#1266) этот же шаблон достаётся и
+    заглушке долга синхронного отказа — с пустым agent_id, где не было ни
+    агента, ни рана. Карточка и second_door_reason обязаны назвать
+    НАБЛЮДЁННЫЙ отказ провайдера НА СОЗДАНИИ, а не сочинённое «кончился
+    статусом» про событие, которого не было.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    _wire(monkeypatch, _DispatchRecorder(None, _LIMIT_REFUSAL))
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+
+    task_id = await _submitted(
+        client, db, "spike-sync-refusal-wording", policy={"review": "dispatch"}
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    started = [u for u in updates if "запущено ЛОКАЛЬНО" in u]
+    assert len(started) == 1, "запуск второй двери называется в карточке"
+    note = started[0]
+    assert "кончился статусом" not in note, (
+        "создание агента отказало СИНХРОННО — рана, который бы «кончился», не было"
+    )
+    assert "usage_limit_exceeded" in note and "HTTP 400" in note, (
+        "причина — наблюдённый отказ провайдера НА СОЗДАНИИ, с кодом"
+    )
+
+    local = (await _local_dispatches(db, task_id))[0]
+    assert "кончился статусом" not in local["second_door_reason"], (
+        "second_door_reason — тот же текст, что и в карточке; третьей копии "
+        "не заводится"
+    )
+    assert "usage_limit_exceeded" in local["second_door_reason"]
+
+
+# --- Закрепление сдачи на отчёте, восстановленном из текста (#1260) ----------
+#
+# record_machine_review умеет отвергать отчёт, выписанный на другое поколение
+# (#1084), но путь восстановления из текста прогона закрепления не передавал:
+# прогон судил сдачу №1, работу пересдали, и отчёт ложился на №2 — отчёт о
+# прежнем диффе читался как отчёт о новом. _store_report одна на облачный и
+# локальный каналы, поэтому оба проверяются поимённо.
+
+
+async def _cloud_report_on_moved_submission(
+    client: AsyncClient, db: aiosqlite.Connection, slug: str
+) -> int:
+    """Облачный заказ на поколении 1; пока прогон шёл, работу пересдали."""
+    task_id = await _submitted(client, db, slug, policy={"review": "dispatch"})
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 2 WHERE id = ?", (task_id,)
+    )
+    await db.commit()
+    return task_id
+
+
+def _gated_reporting_stub(marker) -> str:
+    """Локальная заглушка, которая сдаёт отчёт только после сигнала теста.
+
+    Сигнал — файл: тест пересдаёт работу ПОКА прогон идёт, и лишь потом
+    отпускает его. Без шлюза исход зависел бы от того, кто успеет первым.
+    """
+    payload = json.dumps(_LOCAL_REPORT, ensure_ascii=False)
+    return (
+        "import os, sys, time\n"
+        "sys.stdin.read()\n"
+        "for _ in range(400):\n"
+        f"    if os.path.exists({str(marker)!r}):\n"
+        "        break\n"
+        "    time.sleep(0.05)\n"
+        "print('```haiplane-review')\n"
+        f"print({payload!r})\n"
+        "print('```')\n"
+    )
+
+
+async def _local_report_on_moved_submission(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    monkeypatch,
+    tmp_path,
+    slug: str,
+    *,
+    move: bool = True,
+) -> int:
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    marker = tmp_path / f"{slug}.go"
+    _stub_reviewer(monkeypatch, tmp_path, _gated_reporting_stub(marker))
+    task_id = await _submitted(
+        client,
+        db,
+        slug,
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    if move:
+        await db.execute(
+            "UPDATE tasks SET submission_generation = 2 WHERE id = ?", (task_id,)
+        )
+        await db.commit()
+    marker.write_text("go")
+    await wait_for_local_runs()
+    await db.commit()
+    return task_id
+
+
+async def _reports_by_generation(db: aiosqlite.Connection, task_id: int) -> list[int]:
+    return [
+        len(await repo.machine_reviews_of_generation(db, task_id, generation))
+        for generation in (1, 2)
+    ]
+
+
+def _moved_refusals(updates: list[dict]) -> list[str]:
+    return [
+        u["content"]
+        for u in updates
+        if u["kind"] == "alert"
+        and "выписан на сдачу #1" in u["content"]
+        and "текущая — #2" in u["content"]
+    ]
+
+
+async def test_a_report_from_a_superseded_run_is_not_stamped_on_the_new_submission(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1260): проверяется СОСТОЯНИЕМ — строк отчётов на обоих
+    # поколениях столько же, сколько было до свипа. И свип после отказа
+    # продолжает работу: соседний заказ того же прохода записывается.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-mv"}, "run": {"id": "run-mv"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    moved = await _cloud_report_on_moved_submission(client, db, "spike-moved")
+    steady = await _submitted(client, db, "spike-steady", policy={"review": "dispatch"})
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+    before = await _reports_by_generation(db, moved)
+    dispatches_before = len(
+        await db.execute_fetchall("SELECT id FROM review_dispatches")
+    )
+
+    await sweep_review_dispatches(db)
+
+    assert await _reports_by_generation(db, moved) == before == [0, 0], (
+        "отчёт о прежнем диффе не ложится ни на прежнюю, ни на новую сдачу"
+    )
+    assert len(await repo.machine_reviews_of_generation(db, steady, 1)) == 1, (
+        "свип обязан пережить отказ и записать соседний отчёт"
+    )
+    rows = await db.execute_fetchall(
+        "SELECT status FROM review_dispatches WHERE task_id = ?", (moved,)
+    )
+    assert [dict(r)["status"] for r in rows] == ["failed"], (
+        "строка прогона закрыта, а не висит активной"
+    )
+    assert (
+        len(await db.execute_fetchall("SELECT id FROM review_dispatches"))
+        == dispatches_before
+    ), "за прогон по уехавшей сдаче вторая дверь не покупается"
+
+
+async def test_the_card_names_why_the_recovered_report_was_refused(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1260): отказ виден в карточке названной причиной. Молчание — и
+    # ложное «отчёт НЕ сдан» — критерий не закрывают: отчёт был, но о другом.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-nm"}, "run": {"id": "run-nm"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    task_id = await _cloud_report_on_moved_submission(client, db, "spike-named")
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+
+    await sweep_review_dispatches(db)
+
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert len(_moved_refusals(updates)) == 1, (
+        f"причина отказа обязана быть в карточке ровно раз: {updates}"
+    )
+    assert not [u for u in updates if "отчёт НЕ сдан" in u["content"]], (
+        "отчёт был сдан — о прежней сдаче; «не сдан» подменило бы причину"
+    )
+    assert not [u for u in updates if "восстановлен из текста" in u["content"]]
+
+
+async def test_both_report_paths_carry_the_submission_pin(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    # AC-3 (#1260): два зовущих _store_report поимённо — облачное
+    # восстановление из текста рана и локальный отчёт из вывода прогона.
+    # Один потребитель правила не доказывает второго.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-bt"}, "run": {"id": "run-bt"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+
+    cloud = await _cloud_report_on_moved_submission(client, db, "spike-pin-cloud")
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+    await sweep_review_dispatches(db)
+
+    local = await _local_report_on_moved_submission(
+        client, db, monkeypatch, tmp_path, "spike-pin-local"
+    )
+
+    for name, task_id in (("облачный", cloud), ("локальный", local)):
+        assert await _reports_by_generation(db, task_id) == [0, 0], (
+            f"{name} путь записал отчёт о прежней сдаче"
+        )
+        updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+        assert len(_moved_refusals(updates)) == 1, (
+            f"{name} путь не назвал отказ в карточке: {updates}"
+        )
+        assert not [
+            u
+            for u in updates
+            if "отчёт НЕ сдан" in u["content"]
+            or "завершилось без отчёта" in u["content"]
+        ], f"{name} путь выдал отказ по поколению за отсутствие отчёта"
+        rows = await db.execute_fetchall(
+            "SELECT status FROM review_dispatches WHERE task_id = ?", (task_id,)
+        )
+        assert [dict(r)["status"] for r in rows] == ["failed"], name
+    local_updates = [dict(u) for u in await repo.get_task_updates(db, local)]
+    assert not [u for u in local_updates if "восстановлен из вывода" in u["content"]], (
+        "локальный путь не выдаёт отказ за восстановление"
+    )
+
+
+async def test_a_matching_generation_is_recorded_on_both_channels(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    # AC-4 (#1260): совпавшее поколение ложится как раньше — с владельцем и
+    # происхождением. Сторож, отказывающий всегда, неотличим от работающего.
+    from hub.services.machine_review_intake import ORIGIN_LOCAL_TEXT, ORIGIN_RUN_TEXT
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ok"}, "run": {"id": "run-ok"}})
+    _wire(monkeypatch, recorder)
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    local_pid = await _local_principal(db, monkeypatch)
+
+    cloud = await _submitted(
+        client, db, "spike-same-cloud", policy={"review": "dispatch"}
+    )
+    await _expire_grace(db)
+    await _finished_run_with(monkeypatch, _report_block())
+    await sweep_review_dispatches(db)
+
+    local = await _local_report_on_moved_submission(
+        client, db, monkeypatch, tmp_path, "spike-same-local", move=False
+    )
+
+    for task_id, owner, origin in (
+        (cloud, cloud_pid, ORIGIN_RUN_TEXT),
+        (local, local_pid, ORIGIN_LOCAL_TEXT),
+    ):
+        rows = [
+            dict(r) for r in await repo.machine_reviews_of_generation(db, task_id, 1)
+        ]
+        assert len(rows) == 1, f"{origin}: отчёт совпавшего поколения не записан"
+        assert rows[0]["principal_id"] == owner, origin
+        assert rows[0]["orchestrator"].startswith(origin), rows[0]["orchestrator"]
+        updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+        assert not _moved_refusals(updates), origin
+        status = await db.execute_fetchall(
+            "SELECT status FROM review_dispatches WHERE task_id = ?", (task_id,)
+        )
+        assert [dict(r)["status"] for r in status] == ["done"], origin
+
+
+# Названные исключения из правила «вызывающий record_machine_review передаёт
+# закрепление». Ключ — (файл относительно корня, функция-владелец вызова),
+# значение — причина. Пусто сознательно: сегодня исключений нет, и новое
+# обязано прийти сюда с объяснением, а не проскочить молча.
+_INTAKE_PIN_EXCEPTIONS: dict[tuple[str, str], str] = {}
+
+
+def _intake_callers() -> list[tuple[str, str, bool]]:
+    """Все вызовы record_machine_review в hub/, собранные разбором AST.
+
+    Функция-владелец — ближайшая объемлющая def: оба сегодняшних вызова
+    импортируют функцию ЛОКАЛЬНО, из тела, и сторож по импортам верхнего
+    уровня их бы не увидел. Поэтому ищутся сами вызовы, а не импорты.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    found: list[tuple[str, str, bool]] = []
+
+    def _walk(node: ast.AST, owner: str, rel: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                _walk(child, child.name, rel)
+                continue
+            if isinstance(child, ast.Call):
+                func = child.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr
+                    if isinstance(func, ast.Attribute)
+                    else ""
+                )
+                if name == "record_machine_review":
+                    pinned = any(k.arg == "expected_generation" for k in child.keywords)
+                    found.append((rel, owner, pinned))
+            _walk(child, owner, rel)
+
+    for path in sorted((root / "hub").rglob("*.py")):
+        rel = path.relative_to(root).as_posix()
+        _walk(ast.parse(path.read_text(encoding="utf-8")), "<module>", rel)
+    return found
+
+
+def test_every_intake_caller_pins_the_submission_or_is_a_named_exception():
+    # AC-5 (#1260): вызывающие перечисляются разбором исходника, а не списком
+    # из головы. Новый вызывающий роняет тест, а не стареет молча.
+    callers = _intake_callers()
+    owners = {(rel, owner) for rel, owner, _ in callers}
+    assert ("hub/services/review_dispatch.py", "_store_report") in owners, (
+        f"сторож не видит вызова из _store_report — он слеп: {callers}"
+    )
+    assert any(rel == "hub/app.py" for rel, _ in owners), (
+        f"сторож не видит приёма по контракту в hub/app.py: {callers}"
+    )
+    unpinned = [
+        (rel, owner)
+        for rel, owner, pinned in callers
+        if not pinned and (rel, owner) not in _INTAKE_PIN_EXCEPTIONS
+    ]
+    assert not unpinned, (
+        "вызывающий record_machine_review без expected_generation и без "
+        f"названной причины: {unpinned}"
+    )
+    stale = set(_INTAKE_PIN_EXCEPTIONS) - owners
+    assert not stale, f"исключение названо для вызова, которого больше нет: {stale}"
+
+
+# --- #1206: список без поля name -----------------------------------------
+
+
+async def test_a_listing_without_names_stops_instead_of_buying_a_second_agent(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1206: потребитель читает «поля нет» как blind, а не как пустоту.
+
+    Если провайдер перестанет возвращать метку, сверка не найдёт агента
+    никогда. Прежде это доезжало до _create_or_adopt как подтверждённая
+    пустота и разрешало повторный POST — то есть механизм против двойной
+    покупки сам покупал бы второго на каждом обрыве.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, recorder)
+    # Агент у провайдера ЕСТЬ и он наш — просто имени в ответе нет.
+    listing = _Listing([[{"id": "bc-paid", "latestRunId": "run-paid"}]])
+    monkeypatch.setattr(cursor_cloud, "list_agents", listing)
+
+    task_id = await _submitted(client, db, "spike-nameless")
+
+    assert listing.calls == 1, "спросить обязаны"
+    assert len(recorder.calls) == 1, (
+        "второй POST — это второй оплаченный агент поверх уже созданного"
+    )
+    assert not await repo.list_active_review_dispatches(db), (
+        "подобрать нечем: любой агент из такого ответа был бы угадан"
+    )
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    alerts = " ".join(dict(r)["content"] for r in rows)
+    assert "СПРОСИТЬ" in alerts, "состояние названо как есть, а не как пустота"
+
+
+# --- #1206: имена есть, но ни одно не наше --------------------------------
+
+
+async def test_foreign_names_stop_instead_of_buying_a_second_agent(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1206: наблюдённая форма — имя ЕСТЬ, просто чужое.
+
+    06.09 у осиротевших агентов поле name было заполнено автоименем из
+    промта. На такой странице страж «ключа name нет ни у кого» молчит,
+    сверка на равенство не находит метку — и до _create_or_adopt приезжает
+    подтверждённая пустота, разрешающая купить второго оплаченного агента
+    поверх уже созданного. Потребитель обязан увидеть blind.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, recorder)
+    # Агент у провайдера ЕСТЬ и он наш — но имя ему придумал провайдер.
+    listing = _Listing(
+        [
+            [
+                {"id": "bc-paid", "name": "Код-ревью задачи haiplane"},
+                {"id": "bc-other", "name": "Суждение стюарда гейта"},
+            ]
+        ]
+    )
+    monkeypatch.setattr(cursor_cloud, "list_agents", listing)
+
+    task_id = await _submitted(client, db, "spike-foreign-names")
+
+    assert listing.calls == 1, "спросить обязаны"
+    assert len(recorder.calls) == 1, (
+        "второй POST — это второй оплаченный агент поверх уже созданного"
+    )
+    assert not await repo.list_active_review_dispatches(db), (
+        "подобрать нечем: любой агент из такого ответа был бы угадан"
+    )
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    alerts = " ".join(dict(r)["content"] for r in rows)
+    assert "СПРОСИТЬ" in alerts, "состояние названо как есть, а не как пустота"
+
+
+# --- #1208: документ выката и охват стражей песочницы -------------------------
+#
+# Найдено ВЫКАТОМ 08.09.2026, а не чтением: развёртывание локального ревьюера
+# по собственному документу #1180 остановилось четырежды. Имена настроек в
+# документе стояли без префикса HAIPLANE_, который подставляет config.env_get,
+# — и это не ломало запуск, а МОЛЧА выключало локальный путь. Рекомендованная
+# строка systemd-run --uid= от непривилегированного хаба не запускалась вовсе.
+# А стражи знали ровно ту форму записи, которой на рабочей конфигурации нет.
+
+_HUB_ROOT = Path(__file__).resolve().parents[1]
+_CONFIG_SOURCE = _HUB_ROOT / "hub/config.py"
+_DEPLOY_DOC = _HUB_ROOT / "deploy/LOCAL-REVIEW.md"
+_ENV_EXAMPLE = _HUB_ROOT / "deploy/local-hub.env.example"
+
+
+def _documented_hub_deadline() -> int:
+    """Хабский срок прогона, КАК ЕГО НАЗЫВАЕТ документ выката.
+
+    Нужен там, где суждение стража зависит от ``LOCAL_REVIEW_TIMEOUT_SEC``:
+    с 10.09.2026 контейнерный ``--timeout`` больше хабского отвергается, и
+    тест, оставивший этот срок на волю окружения, был бы зелёным или красным
+    по чужой переменной, а не по содержанию документа. Значение берётся ИЗ
+    ФАЙЛА — переписанное сюда числом, оно проверяло бы тест, а не документ.
+    """
+    # Число берётся регулярным выражением, а не хвостом строки: то же имя со
+    # значением стоит и внутри таблицы отказов, где за ним идёт разметка.
+    named = re.compile(
+        re.escape(config.brand.ENV_PREFIX + "LOCAL_REVIEW_TIMEOUT_SEC") + r"=(\d+)"
+    )
+    values = [
+        found.group(1)
+        for path in (_ENV_EXAMPLE, _DEPLOY_DOC)
+        for line in path.read_text().splitlines()
+        if (found := named.search(line))
+    ]
+    assert values, (
+        f"в примере окружения и документе не назван {named.pattern} — "
+        "проверка срока была бы привязана к переменной окружения, а не к "
+        "документу"
+    )
+    assert len(set(values)) == 1, (
+        f"документ называет хабский срок по-разному: {values}. Оператор "
+        "скопирует одно из двух, и какое — неизвестно"
+    )
+    return int(values[0])
+
+
+# Строка вида ``Environment=ИМЯ=…``, ``# ИМЯ=…`` или просто ``ИМЯ=…`` — то, что
+# оператор КОПИРУЕТ к себе. Именно она и разошлась с кодом.
+_ASSIGNED = re.compile(r"^\s*(?:#\s*)?(?:Environment=)?([A-Z][A-Z0-9_]*)=")
+# Имя настройки локального ревьюера БЕЗ префикса: \b не срабатывает внутри
+# HAIPLANE_LOCAL_REVIEW…, поэтому лишний lookbehind не нужен.
+_BARE_NAME = re.compile(r"\bLOCAL_REVIEW[A-Z0-9_]*")
+
+
+def _suffixes_read_by_config() -> set[str]:
+    """Суффиксы env_get(...) из ИСХОДНИКА hub/config.py, а не из списка в тесте.
+
+    Список имён, переписанный в тест, — третье описание тех же имён, и оно
+    разойдётся следующим ровно так же, как разошёлся документ.
+    """
+    tree = ast.parse(_CONFIG_SOURCE.read_text())
+    found = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id != "env_get" or not node.args:
+            continue
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            found.add(arg.value)
+    return {name for name in found if name.startswith("LOCAL_REVIEW")}
+
+
+def _names_assigned_in(path: Path) -> set[str]:
+    return {
+        m.group(1)
+        for line in path.read_text().splitlines()
+        if (m := _ASSIGNED.match(line)) and "LOCAL_REVIEW" in m.group(1)
+    }
+
+
+def test_the_deploy_doc_names_the_settings_the_code_reads() -> None:
+    """AC-1: имена в документе сверяются С ИСХОДНИКОМ машиной, а не глазами.
+
+    Расхождение уже случилось один раз и было незаметным ровно потому, что
+    глазами оно не ловится: HAIPLANE_HUB_HOST двумя строками выше в том же
+    файле выглядит так же убедительно, как LOCAL_REVIEW_CMD без префикса.
+    """
+    read_by_code = _suffixes_read_by_config()
+    assert read_by_code, (
+        "разбор hub/config.py не нашёл ни одного env_get с именем "
+        "LOCAL_REVIEW* — сверка была бы пустой и зелёной на любом документе"
+    )
+    expected = {config.brand.ENV_PREFIX + suffix for suffix in read_by_code}
+
+    for path in (_DEPLOY_DOC, _ENV_EXAMPLE):
+        named = _names_assigned_in(path)
+        assert named == expected, (
+            f"{path.name} называет настройки локального ревьюера как "
+            f"{sorted(named)}, а код читает {sorted(expected)}. Разница в "
+            "префиксе не ломает запуск, а МОЛЧА выключает локальный путь: в "
+            "карточке встанет «локальный не настроен» при верной во всём "
+            "остальном конфигурации (найдено выкатом 08.09.2026, #1208)"
+        )
+
+    # Ни одного упоминания без префикса — включая прозу: оператор, который
+    # грепает по имени из текста, обязан найти то же самое имя.
+    for path in (_DEPLOY_DOC, _ENV_EXAMPLE):
+        bare = _BARE_NAME.findall(path.read_text())
+        assert not bare, (
+            f"{path.name} упоминает {sorted(set(bare))} без префикса "
+            f"{config.brand.ENV_PREFIX} — а config.env_get читает только с ним"
+        )
+
+
+# ПЕРЕСМОТР 10.09.2026: закрытый набор форм вместо перечисления флагов.
+#
+# Тесты ниже НЕ выброшены и не ослаблены. Каждый из них кодирует настоящий
+# вход, на котором страж когда-то ошибался, и все девять кругов ошибка шла в
+# одну сторону — ложного ПРОПУСКА. Новое правило отвергает эти входы тем
+# более, поэтому у большинства тестов входы остались прежними, а изменился
+# ПРИГОВОР: там, где прежде проверялось «отвергнут по такому-то флагу»,
+# теперь проверяется «отвергнут, и причина названа». Каждый такой поворот
+# назван в докстроке своего теста поимённо — молча не перевёрнут ни один.
+
+
+def test_every_blessed_sandbox_shape_still_passes(monkeypatch) -> None:
+    """AC-6: рабочая строка прода и обе формы набора проходят стража.
+
+    Строгое правило, отвергающее рабочий выкат, хуже прежнего мягкого,
+    поэтому эта половина проверяется ТЕМ ЖЕ набором тестов, что и AC-5: иначе
+    строгость чинилась бы ценой поломки, и поломка вскрылась бы на проде.
+
+    Строки берутся из ``SANDBOX_SHAPES``, а не переписываются сюда: список,
+    переписанный в тест, — третье описание тех же форм, и оно разойдётся
+    следующим ровно так же, как пять раз расходился документ.
+    """
+    prod = "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run"
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", prod)
+    assert local_reviewer.sandbox_problem() == [], (
+        f"рабочая строка прода отвергнута: {local_reviewer.sandbox_problem()}"
+    )
+    assert local_reviewer.sandbox_uid() == "haiplane-reviewer"
+    assert local_reviewer.sandbox_shape() == "sudo"
+
+    for shape in local_reviewer.SANDBOX_SHAPES:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", shape.example)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"форма «{shape.name}» отвергает собственный пример "
+            f"«{shape.example}»: {local_reviewer.sandbox_problem()}"
+        )
+        assert local_reviewer.sandbox_shape() == shape.name
+        assert local_reviewer.sandbox_uid() == "haiplane-reviewer", (
+            f"в примере формы «{shape.name}» страж не видит пользователя — "
+            "значит проверка его членства в группе каталога прогонов на этой "
+            "конфигурации молча не сработает вовсе, ровно как было до #1208"
+        )
+
+    # Необязательные флаги формы — тоже часть обещания: названный в документе
+    # флаг обязан проходить, иначе документ рекомендует то, что хаб отвергнет.
+    for sandbox in (
+        "/usr/bin/systemd-run --scope --quiet --uid=haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --uid=haiplane-reviewer --slice=review.slice "
+        "--property=MemoryMax=1500M --property=CPUQuota=150% /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --uid haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -n --user haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -n --user=haiplane-reviewer /usr/local/bin/wrap",
+        # Имя инструмента без пути: PATH прогону собирает сам хаб.
+        "sudo -n -u haiplane-reviewer /usr/local/bin/wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"«{sandbox}» состоит из флагов, названных в наборе, и отвергаться "
+            f"не должна: {local_reviewer.sandbox_problem()}"
+        )
+        assert local_reviewer.sandbox_uid() == "haiplane-reviewer"
+
+    # Повтор НАКАПЛИВАЮЩЕГОСЯ флага — не тот повтор, что перекрывает: две
+    # --property у systemd-run складываются, и запрещать их значило бы
+    # отвергать строку с двумя лимитами, то есть рабочий рецепт.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=r --setenv=A=1 --setenv=B=2 /usr/local/bin/wrap",
+    )
+    assert local_reviewer.sandbox_problem() == [], (
+        f"--setenv накапливается, а не перекрывает: {local_reviewer.sandbox_problem()}"
+    )
+
+
+def test_a_sandbox_outside_the_closed_set_is_refused(monkeypatch) -> None:
+    """AC-5: строка вне закрытого набора отвергается с названной причиной.
+
+    Здесь собраны входы, каждый из которых КОГДА-ТО ПРОХОДИЛ стража, а
+    обязан был быть отвергнут, — и входы, которые страж отвергал по частному
+    флагу, а теперь отвергает по правилу. Ни один не выброшен: это
+    накопленное за девять кругов доказательство, и оно переживает смену
+    правила.
+
+    Проверяется ДВА следствия разом. Первое: отказ есть и он назван. Второе:
+    ``sandbox_uid()`` на такой строке пуст — раньше страж отвечал «кто» и про
+    строку, которой не понял, и именно в этих ответах ошибался (имя из
+    аргументов полезной нагрузки, из значения соседнего флага, из первого
+    вхождения повторённого флага).
+    """
+    outside = [
+        # Инструмент, о котором набор не знает вовсе. Прежнее ограничение
+        # «чего не знаем — пропускаем» отменено решением владельца 10.09.2026.
+        "/usr/bin/env",
+        "/usr/bin/env -u HOME /usr/local/bin/wrap",
+        "/bin/sh -c /usr/local/bin/wrap",
+        # Относительное имя со слэшем: «какая-то программа», а не названная.
+        "./sudo -n -u haiplane-reviewer /usr/local/bin/wrap",
+        # Контейнерные движки — целиком, любой подкомандой и с любым сроком.
+        "/usr/bin/podman run --rm -i img",
+        "/usr/bin/podman run --rm -i --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout=1800 img",
+        "/usr/bin/podman ps",
+        "/usr/bin/docker run --rm -i img",
+        "sudo -n -u haiplane-reviewer podman run --timeout 60 img",
+        # Слипшийся короткий токен во всех записях, что находили читатели.
+        "/usr/bin/sudo -nu haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -nuhaiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -uhaiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -niu haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -pu haiplane-reviewer /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u=haiplane-reviewer /usr/local/bin/wrap",
+        # Повтор перекрывающего флага: инструмент возьмёт последнее вхождение,
+        # читатель глазами — первое, и на этой разнице страж уже ошибался.
+        "/usr/bin/sudo -n -u alice -u bob /usr/local/bin/wrap",
+        "/usr/bin/sudo -n --user alice --user bob /usr/local/bin/wrap",
+        "/usr/bin/sudo -n --user=alice -u bob /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --uid=alice --uid=bob /usr/local/bin/wrap",
+        # Флаг, которого в форме нет.
+        "/usr/bin/sudo -n -u haiplane-reviewer -g haiplane /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --pipe --uid=r /usr/local/bin/wrap",
+        # Терминатор и аргументы полезной нагрузки в самой песочнице.
+        "/usr/bin/systemd-run --scope --uid=alice -- /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u alice -- -u bob",
+        "/usr/bin/systemd-run --scope --uid=alice /wrap --uid=bob",
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap",
+        # Пути к обёртке нет вовсе либо он относительный.
+        "/usr/bin/sudo -n -u haiplane-reviewer",
+        "/usr/bin/sudo -n -u haiplane-reviewer wrap",
+        # Обязательного флага нет: без -n sudo может спросить пароль, а stdin
+        # занят промтом с одноразовым кодом доступа к хабу.
+        "/usr/bin/sudo -u 1234 /usr/local/bin/wrap",
+        "/usr/bin/sudo /usr/local/bin/wrap",
+        # Пользователь не назван вовсе — запуск шёл бы от самого хаба.
+        "/usr/bin/sudo -n /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u  /usr/local/bin/wrap",
+        # Флаг есть, значения нет: «флага нет» и «флаг пуст» — разные отказы,
+        # и чинятся они по-разному.
+        "/usr/bin/systemd-run --scope --uid= /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u",
+        # И наоборот: значение написано флагу, который его не берёт.
+        "/usr/bin/systemd-run --scope=1 --uid=r /usr/local/bin/wrap",
+        # Одинокий дефис позиционным путём не является.
+        "/usr/bin/sudo -n -u r -",
+    ]
+    for sandbox in outside:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons, (
+            f"«{sandbox}» не совпадает ни с одной формой закрытого набора, а "
+            "хаб пропустил её молча. Пустой список здесь означает «посмотрел "
+            "и одобрил» — то есть ровно ту ошибку в сторону пропуска, из-за "
+            "которой правило и переписано"
+        )
+        assert all(r.startswith("LOCAL_REVIEW_SANDBOX:") for r in reasons), (
+            f"отказ обязан называть НАСТРОЙКУ, которую чинить: {reasons}"
+        )
+        assert all("deploy/LOCAL-REVIEW.md" in r for r in reasons), (
+            f"отказ обязан указывать на документ, где набор форм назван: {reasons}"
+        )
+        assert local_reviewer.sandbox_uid() == "", (
+            f"на отвергнутой строке «{sandbox}» страж назвал пользователя "
+            f"«{local_reviewer.sandbox_uid()}». Прогона не будет, и судить о "
+            "членстве в группе каталога прогонов не о чем — а имя, названное "
+            "по непрочитанной строке, и есть источник всех девяти кругов"
+        )
+        assert local_reviewer.sandbox_shape() == ""
+
+    # Пустая настройка второй причиной не шумит: её называет not_ready()
+    # отдельной строкой, и повторять то же самое другими словами — это
+    # два разных имени одной поломки в одной карточке.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "")
+    assert local_reviewer.sandbox_problem() == []
+
+
+def test_the_guard_reads_the_sudo_form_of_the_sandbox_user(monkeypatch) -> None:
+    """AC-2: форма sudo видна стражу так же, как --uid= от systemd-run.
+
+    Рабочий рецепт выката использует ``sudo -n -u haiplane-reviewer``, а
+    страж знал только ``--uid``. Он возвращал пустую строку, и проверка
+    членства в группе каталога прогонов (заведённая ради находки ревью
+    45971e09) на этой конфигурации не срабатывала ВОВСЕ — то есть создавала
+    впечатление проверки там, где её нет.
+
+    ПОВОРОТ 10.09.2026. Прежняя редакция этого теста держала таблицу «строка
+    → имя пользователя» и на строках ВНЕ набора: ``sudo -nu X`` давало X,
+    ``sudo -u alice -u bob`` — bob. Теперь такие строки не запускаются вовсе,
+    и страж на них молчит; сами строки переехали в
+    test_a_sandbox_outside_the_closed_set_is_refused, где проверяется их
+    отказ. Здесь остались формы, которые набор ПРИНИМАЕТ, — и на них ответ
+    обязан быть точным, потому что по нему судится доступ к каталогу.
+    """
+    cases = {
+        # Три формы записи пользователя у sudo, названные в AC-2.
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/sudo -n --user haiplane-reviewer /usr/local/bin/wrap": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/sudo -n --user=haiplane-reviewer /usr/local/bin/wrap": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/sudo -n -u 1234 /usr/local/bin/wrap": "1234",
+        # Старая форма НЕ сломана — иначе починено одно ценой другого.
+        "/usr/bin/systemd-run --scope --uid=haiplane-reviewer /usr/local/bin/wrap": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/systemd-run --scope --uid haiplane-reviewer /usr/local/bin/wrap": (
+            "haiplane-reviewer"
+        ),
+        "/usr/bin/systemd-run --scope --uid=65534 /usr/local/bin/wrap": "65534",
+    }
+    for sandbox, expected in cases.items():
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"«{sandbox}» — форма из набора, и отвергаться она не должна: "
+            f"{local_reviewer.sandbox_problem()}"
+        )
+        assert local_reviewer.sandbox_uid() == expected, (
+            f"песочница «{sandbox}» называет пользователя «{expected}», а "
+            f"страж вернул «{local_reviewer.sandbox_uid()}»: пустая строка "
+            "здесь означает, что проверка группы каталога прогонов молча не "
+            "сработает вовсе"
+        )
+
+
+def test_the_user_guard_reads_only_the_wrappers_own_arguments(monkeypatch) -> None:
+    """Имя пользователя не берётся из аргументов полезной нагрузки.
+
+    Воспроизведено на HEAD 21629cde до починки — обе формы давали чужой
+    ответ: ``sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap`` давало
+    ``HOME`` (находка 64e89a8683b01db1), а ``systemd-run --scope --uid=alice
+    -- /bin/true --uid=bob`` — ``bob`` (находка d228b0eb3310a9cc). Следствие
+    названо: ``scratch_problem`` судил членство в группе каталога прогонов у
+    пользователя, которого в строке нет вовсе.
+
+    ПОВОРОТ 10.09.2026. Прежде тест требовал, чтобы на таких строках страж
+    называл ПРАВИЛЬНОЕ имя. Теперь у песочницы аргументов полезной нагрузки
+    не бывает вовсе: их дописывает сам хаб из LOCAL_REVIEW_CMD, а форма
+    кончается путём к обёртке. Поэтому те же входы обязаны быть ОТВЕРГНУТЫ, а
+    имя — не называться вообще: ответ по строке, которую хаб не запустит,
+    никому не нужен, а именно такие ответы девять кругов и были неверны.
+    """
+    for sandbox in (
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/bin/env -u HOME /wrap",
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/bin/env -u HOME -u PATH /wrap",
+        "/usr/bin/systemd-run --scope --uid=alice -- /bin/true --uid=bob",
+        "/usr/bin/systemd-run --scope --uid alice -- /wrap --uid bob",
+        "/usr/bin/systemd-run --scope --uid=alice /wrap --uid=bob",
+        "/usr/bin/sudo -n -u alice -- -u bob",
+        "/usr/bin/systemd-run --scope --uid=alice -- --uid=bob",
+        "/usr/bin/sudo -n /wrap --uid=bob",
+        "/usr/bin/sudo -n /usr/bin/env -u HOME /wrap",
+        "/usr/bin/sudo -n -u alice -u bob /wrap --user carol",
+        "/usr/bin/sudo -n /wrap podman run --timeout 60 --user 1000 img",
+        "/usr/bin/sudo -nu haiplane-reviewer /usr/bin/env -u HOME /wrap",
+        # --user за podman/docker — пользователь ВНУТРИ контейнера, а не на
+        # хосте: принять его за хостового значило бы проверить членство в
+        # группе каталога совсем не того пользователя.
+        "/usr/bin/podman run --rm -i --timeout 60 --user 1000 img",
+        "/usr/bin/docker run --user haiplane-reviewer img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem(), (
+            f"«{sandbox}» несёт аргументы полезной нагрузки прямо в песочнице "
+            "— форма набора кончается путём к обёртке, и разбирать чужие "
+            "флаги хаб не обязан и не берётся"
+        )
+        assert local_reviewer.sandbox_uid() == "", (
+            f"в отвергнутой строке «{sandbox}» страж назвал "
+            f"«{local_reviewer.sandbox_uid()}»: имя из аргументов полезной "
+            "нагрузки означает, что членство в группе каталога прогонов "
+            "проверяется НЕ У ТОГО пользователя"
+        )
+
+
+def test_the_scope_flag_is_read_only_from_systemd_runs_own_arguments(
+    monkeypatch,
+) -> None:
+    """``--scope`` засчитывается только как СОБСТВЕННЫЙ флаг обёртки.
+
+    Отказ уходил В СТОРОНУ ПРОПУСКА: страж искал ``--scope`` во всей строке,
+    и ``--scope`` полезной нагрузки снимал отказ, хотя transient service от
+    этого в scope не превращается. Воспроизведено на HEAD 21629cde: строка
+    ``systemd-run --quiet --pipe --uid=x -- /wrap --scope`` возвращала ``[]``
+    (находка 3d5938a9a645c39d).
+
+    Отказ по НЕДОСТАЮЩЕМУ ОБЯЗАТЕЛЬНОМУ флагу идёт первым — раньше любого
+    другого: оператору важнее узнать, что он забыл ``--scope``, чем что хаб
+    не принимает ``--pipe``. Иначе он чинил бы по одному незнакомому флагу за
+    круг, так и не увидев главного.
+    """
+    for hidden in (
+        "/usr/bin/systemd-run --quiet --pipe --uid=x -- /wrap --scope",
+        "/usr/bin/systemd-run --quiet --uid=x /wrap --scope",
+        "/usr/bin/systemd-run --uid=x -- /usr/bin/env SCOPE=1 /wrap --scope",
+        "/usr/bin/systemd-run --quiet --pipe --uid=haiplane-reviewer --",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", hidden)
+        reasons = local_reviewer.sandbox_problem()
+        # Подстроки «--scope» мало: она стоит и в ИМЕНИ формы, поэтому её
+        # находит любой другой отказ этой же формы. Найдено мутацией
+        # 10.09.2026: «if missing:» -> «if False:» оставляла тест зелёным,
+        # потому что отказ по терминатору называет форму «systemd-run
+        # --scope». Отказ обязан называть ПРИЧИНУ, а она одна — transient
+        # service, переживающий снятие прогона.
+        assert reasons and all(
+            "--scope" in r and "transient service" in r for r in reasons
+        ), (
+            f"«{hidden}» — systemd-run БЕЗ --scope: ``--scope`` здесь стоит "
+            "среди аргументов полезной нагрузки и transient service в scope "
+            f"не превращает, а страж пропустил запуск молча: {reasons}"
+        )
+
+    # Собственный ``--scope`` обёртки по-прежнему снимает этот отказ — иначе
+    # рабочая форма из #1180 оказалась бы сломана.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=x /usr/local/bin/wrap",
+    )
+    assert local_reviewer.sandbox_problem() == [], (
+        "«systemd-run --scope --uid=x /usr/local/bin/wrap» называет --scope "
+        f"собственным флагом: {local_reviewer.sandbox_problem()}"
+    )
+
+
+def test_a_non_run_engine_call_does_not_hide_a_later_run(monkeypatch) -> None:
+    """Движок отвергается любой подкомандой, а не только на ``run``.
+
+    Отказ уходил В СТОРОНУ ПРОПУСКА: страж возвращал «движка нет» на первом
+    же ``podman``, за которым не стоит ``run``, и настоящий запуск правее
+    оставался невидимым. Воспроизведено на HEAD 21629cde:
+    ``podman ps /usr/bin/podman run --timeout 0 img`` давало ``[]``, тогда
+    как одиночный ``podman run --timeout 0`` отвергался (находка
+    96144e6317c1d7ac).
+
+    ПОВОРОТ 10.09.2026: искать подкоманду больше не нужно вовсе. Движок в
+    закрытый набор форм не входит, и ``podman ps`` отвергается ровно так же,
+    как ``podman run``, — вопрос «а не спрятан ли запуск правее» просто
+    перестал существовать. Прежняя редакция теста ждала на ``podman ps``
+    пустого списка, то есть ОДОБРЕНИЯ; это и есть поворот, и он назван.
+    """
+    for sandbox in (
+        "/usr/bin/podman ps /usr/bin/podman run --timeout 0 img",
+        "/usr/bin/podman version /usr/bin/podman run --rm -i img",
+        "/usr/bin/docker ps /usr/bin/docker run --rm -i img",
+        "/usr/bin/podman ps",
+        "/usr/bin/podman ps /usr/bin/podman version",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem(), (
+            f"«{sandbox}» начинается с контейнерного движка, а он в набор "
+            "форм не входит ни одной подкомандой: пропустить его значит "
+            "разрешить прогон, который снять нельзя"
+        )
+
+
+def test_a_container_launch_without_its_own_deadline_is_refused(monkeypatch) -> None:
+    """AC-3: контейнерный запуск отвергнут, и отказ называет НЕДОСТАЮЩИЙ ФЛАГ.
+
+    Требование «прямой потомок хаба» для контейнеров недостижимо: измерено
+    08.09.2026 — podman run переживает kill -KILL по группе, через 7 с
+    контейнер «Up», потому что conmon отсоединён от клиента намеренно. Зато
+    с --timeout 5 контейнер умирает сам (через 12 с живых нет).
+
+    ПОВОРОТ 10.09.2026. Прежде отсюда следовало «потомок ИЛИ свой срок», и
+    хаб разбирал строку podman до образа, чтобы этот срок найти. Разбор и дал
+    шесть находок из пятнадцати, все — в сторону пропуска. Теперь
+    контейнерный запуск отвергается ЦЕЛИКОМ, а срок жизни переехал внутрь
+    root-ового враппера, где флаги зафиксированы и sudoers не допускает
+    подстановок. Отказ по-прежнему обязан называть НЕДОСТАЮЩИЙ ФЛАГ, а не
+    «песочница неверна»: оператору нужно знать, что во враппере обязан стоять
+    ``--timeout``, и что у docker такого флага нет вовсе.
+
+    Строки со сроком жизни (``--timeout 1800``), которые прежняя редакция
+    теста требовала ПРИНИМАТЬ, теперь отвергаются вместе с остальными — и
+    это тот самый поворот. Ни одна из них не выброшена: они стоят здесь же,
+    ниже, и проверяются на отказ.
+    """
+    containers = [
+        "/usr/bin/podman run --rm -i img",
+        "/usr/bin/podman run --rm -i --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout=1800 img",
+        "/usr/bin/podman run --rm -i -m 1500m --cpus 1.5 --pids-limit 512 "
+        "--env-file /etc/haiplane-review/env --network none --timeout 1800 img",
+        "/usr/bin/podman --log-level debug run --rm -i --timeout 1800 img",
+        "/usr/bin/podman --url unix:///run/x run --rm -i --timeout 1800 img",
+        "/usr/bin/podman run --rm -i img cursor-agent --timeout 60",
+        "/usr/bin/podman run --rm -i img agent --timeout=60",
+        "/usr/bin/podman --log-level debug run --rm -i img",
+        "/usr/bin/podman -c remote run --rm -i img",
+        "/usr/bin/podman run --rm -i --timeout 0 img",
+        "/usr/bin/podman run --rm -i --timeout=0 img",
+        "/usr/bin/podman run --rm -i --timeout 00 img",
+        "/usr/bin/podman run --rm -i --timeout abc img",
+        "/usr/bin/podman run --rm -i --timeout",
+        "/usr/bin/podman run --rm -i --timeout 1 img",
+        "/usr/bin/podman run --rm -i --timeout 1800 --timeout 0 img",
+        "/usr/bin/podman run --rm -i --timeout=1800 --timeout=0 img",
+        "/usr/bin/podman run --rm -i --timeout 1800 --timeout abc img",
+        "/usr/bin/podman run --rm -i --timeout 1800 --timeout 5 --timeout 0 img",
+        "/usr/bin/podman run --rm -i --timeout 0 --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout abc --timeout=1800 img",
+    ]
+    for sandbox in containers:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons and all("--timeout" in r for r in reasons), (
+            f"«{sandbox}» — контейнерный запуск: отказ обязан назвать флаг, "
+            f"без которого контейнер переживёт снятие прогона: {reasons}"
+        )
+
+    # У docker штатного аналога --timeout нет вовсе, и отказ обязан сказать,
+    # ЧЕМ его заменить, а не просто «нельзя».
+    for sandbox in (
+        "/usr/bin/docker run --rm -i --timeout 60 img",
+        "/usr/bin/docker run --rm -i img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons and any("docker" in r and "podman" in r for r in reasons), (
+            f"docker run обязан быть отвергнут с названной заменой: {reasons}"
+        )
+
+    # Старое требование не ослаблено: systemd-run без --scope — прежний отказ,
+    # и назван по-прежнему недостающий флаг.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/systemd-run --quiet --pipe --uid=x --"
+    )
+    reasons = local_reviewer.sandbox_problem()
+    assert reasons and all(
+        "--scope" in r and "transient service" in r for r in reasons
+    ), f"systemd-run без --scope остаётся отказом: {reasons}"
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=x /usr/local/bin/wrap",
+    )
+    assert local_reviewer.sandbox_problem() == []
+
+
+def test_a_detached_container_launch_is_refused_by_flag(monkeypatch) -> None:
+    """Отсоединённый запуск — отказ, и ``--timeout`` его не снимал никогда.
+
+    Найдено ревьюером Codex 10.09.2026, воспроизведено на 5b7b813::
+
+        podman run -d --timeout 1800 img        -> []       # пропуск
+        podman run --detach --timeout=1800 img  -> []       # пропуск
+        podman run --rm -i img                  -> ОТКАЗ    # правильно
+
+    ``-d`` заставляет клиента podman вернуть управление НЕМЕДЛЕННО: хаб
+    видит завершившийся процесс, закрывает прогон как законченный и может
+    снести его каталог, а ревьюер внутри контейнера продолжает работать и
+    способен прислать отчёт по уже закрытому прогону.
+
+    ПОВОРОТ 10.09.2026. Прежде тест держал две половины: отсоединённые строки
+    отвергнуть, «передний план» (``--detach=false``, ``-d=false``, ``-it``)
+    принять — иначе починка была бы оплачена ложным отказом. Теперь
+    отвергаются ОБЕ половины, потому что отвергается движок целиком, и
+    ложного отказа тут нет: строка не «плоха», она вне набора, и починка
+    названа — тот же podman внутри враппера. Важное осталось: отказ НЕ
+    ВЫДУМЫВАЕТ отсоединения там, где его нет. ``--detach=false`` — это
+    передний план, и обвинять строку в ``-d`` было бы ложью о ней.
+    """
+    detached = [
+        "/usr/bin/podman run -d --timeout 1800 img",
+        "/usr/bin/podman run --detach --timeout=1800 img",
+        "/usr/bin/podman run --rm -i -d --timeout 1800 img",
+        "/usr/bin/podman run -itd --timeout 1800 img",
+        "/usr/bin/podman run -dt --read-only --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --detach=true --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --detach=false -d --timeout 1800 img",
+    ]
+    foreground = [
+        "/usr/bin/podman run --rm -i --timeout 1800 img",
+        "/usr/bin/podman run --rm -it --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --detach=false --timeout 1800 img",
+        "/usr/bin/podman run --rm -i -d=false --timeout 1800 img",
+        "/usr/bin/podman run --rm -i -d --detach=false --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout 1800 img agent -d",
+    ]
+    for sandbox in detached + foreground:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem(), (
+            f"«{sandbox}» — контейнерный запуск, и в набор форм он не входит"
+        )
+
+    for sandbox in foreground:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert not any("отсоедин" in r and "«-d»" in r for r in reasons), (
+            f"«{sandbox}» идёт на переднем плане, и обвинять её в -d значит "
+            f"назвать оператору причину, которой в строке нет: {reasons}"
+        )
+
+
+def test_a_container_deadline_may_not_outlive_the_hubs(monkeypatch) -> None:
+    """Срок контейнера в песочнице не судится вовсе — контейнера там нет.
+
+    Найдено ревьюером Codex 10.09.2026, воспроизведено на 5b7b813:
+    ``podman run --rm -i --timeout 3600 img`` при хабских 1800 проходило
+    молча, хотя контейнер переживает снятие прогона ровно так же, как без
+    ``--timeout`` вовсе, — только тише.
+
+    ПОВОРОТ 10.09.2026. Правило «не больше хабского» держалось на разборе
+    чужой командной строки и на сравнении с числом, по которому прогон
+    снимут. Обе опоры ушли вместе с контейнерами: приговор этому классу
+    строк теперь ОДИН и от ``LOCAL_REVIEW_TIMEOUT_SEC`` не зависит вовсе.
+    Это и проверяется — иначе поворот был бы заявлен, а не измерен. Сам срок
+    жизни контейнера никуда не делся: он стоит во враппере, равен хабскому и
+    держится тестами документа (test_the_doc_wrapper_deadline_follows_the_conf_file).
+    """
+    verdicts = set()
+    for deadline in (1800, 7200):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", deadline)
+        for sandbox in (
+            "/usr/bin/podman run --rm -i --timeout 3600 img",
+            "/usr/bin/podman run --rm -i --timeout=1801 img",
+            "/usr/bin/podman run --rm -i --timeout 1800 --timeout 7200 img",
+            "/usr/bin/podman run --rm -i --timeout 1800 img",
+            "/usr/bin/podman run --rm -i --timeout 60 img",
+            "/usr/bin/podman run --rm -i --timeout 7200 --timeout 900 img",
+            "/usr/bin/podman run --rm -i --timeout 7201 img",
+        ):
+            monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+            reasons = local_reviewer.sandbox_problem()
+            assert reasons, f"«{sandbox}» — контейнерный запуск, и он отвергнут"
+            verdicts.add((sandbox, tuple(reasons)))
+
+    assert len({sandbox for sandbox, _ in verdicts}) == len(verdicts), (
+        "приговор одной и той же строке разошёлся на разном хабском сроке — "
+        "значит суждение всё ещё зависит от LOCAL_REVIEW_TIMEOUT_SEC, а "
+        "зависеть ему больше не от чего"
+    )
+
+
+def test_the_run_guard_refuses_the_string_it_cannot_parse(monkeypatch) -> None:
+    """Строка, которую страж не может прочитать целиком, — отказ, а не «ок».
+
+    Воспроизведено на ff617db (найдено ревьюером Codex 10.09.2026)::
+
+        podman run --timeout 60 --blkio-weight 500 --timeout 0 img
+        detaching_sandbox() -> []            # пропуск
+
+    ``--blkio-weight`` не был назван в списке флагов со значением, поэтому
+    ``500`` принято за имя образа, разбор кончился, и ВТОРОЙ ``--timeout 0``
+    остался невиден. У podman действующим будет последний, то есть ноль, то
+    есть срока жизни нет.
+
+    ПОВОРОТ 10.09.2026: списка флагов podman у хаба больше нет, и угадывать
+    нечего — движок не входит в набор форм. Правило, ради которого тест
+    написан, стало ШИРЕ: страж отвергает всё, что не прочитал целиком, а не
+    только то, о чём успел вынести суждение. Поэтому здесь же проверяются
+    строки, которые прежняя редакция ПРИНИМАЛА как «однозначные»
+    (``--blkio-weight=500``, ``-itq``): они тоже вне набора.
+    """
+    for sandbox in (
+        "/usr/bin/podman run --timeout 60 --blkio-weight 500 --timeout 0 img",
+        "/usr/bin/podman run --blkio-weight 500 --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --blkio-weight 500 img",
+        "/usr/bin/podman run --rm -i --blkio-weight=500 --timeout=1800 img",
+        "/usr/bin/podman run --rm -it --privileged --timeout 1800 img",
+        "/usr/bin/podman run -itq --read-only --timeout 1800 img",
+        "/usr/bin/podman run --rm -i --timeout 1800 img cursor-agent --blkio-weight 5",
+        # Тот же класс в форме, которую набор ЗНАЕТ по инструменту: флаг, о
+        # котором форма не договаривалась, отвергается по имени.
+        "/usr/bin/systemd-run --scope --uid=r --blkio-weight=500 /usr/local/bin/wrap",
+        "/usr/bin/sudo -n -u r --blkio-weight=500 /usr/local/bin/wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons, (
+            f"«{sandbox}» страж прочитать целиком не может. Пустой список "
+            "здесь означает «посмотрел и одобрил» — то есть контейнер без "
+            "срока жизни пройдёт молча"
+        )
+
+    # Флаг, которого форма не знает, назван в отказе ПО ИМЕНИ: иначе
+    # оператору не видно, что убирать.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/systemd-run --scope --uid=r --blkio-weight=500 /usr/local/bin/wrap",
+    )
+    assert any("--blkio-weight" in r for r in local_reviewer.sandbox_problem()), (
+        "отказ обязан НАЗВАТЬ флаг, которого форма не знает: "
+        f"{local_reviewer.sandbox_problem()}"
+    )
+
+
+def test_the_unknown_flag_refusal_advises_a_form_podman_has(monkeypatch) -> None:
+    """Отказ советует починку, КОТОРАЯ РАБОТАЕТ, — и это проверяется запуском.
+
+    Один шаблон на обе формы флага советовал невозможное: на коротком токене
+    он предлагал ``-p80:80=<значение>`` — записи, которой у podman нет вовсе
+    (pflag разберёт ``-p80:80=x`` как значение ``80:80=x`` у ``-p``), и
+    оператор, сделавший ровно то, что сказано, получал тот же отказ.
+
+    ПОВОРОТ 10.09.2026: советовать форму записи флага podman хаб больше не
+    берётся — он не разбирает podman вовсе. Обещание осталось прежним и стало
+    проверяемым строже: КАЖДЫЙ отказ называет починку, и починка приводит к
+    строке, которую хаб принимает. Здесь это проверяется исполнением, а не
+    чтением: сделали, как сказано, — прогнали через стража.
+    """
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/podman run --rm -p80:80 --timeout 1800 img",
+    )
+    reasons = local_reviewer.sandbox_problem()
+    assert reasons, "неизвестный короткий флаг обязан давать отказ"
+    assert not any("-p80:80=<значение>" in r for r in reasons), (
+        "отказ советует дописать «=<значение>» к целому короткому токену — "
+        f"записи, которой у podman нет: {reasons}"
+    )
+    assert all("sudo -n -u" in r for r in reasons), (
+        f"отказ обязан назвать форму, к которой оператору идти: {reasons}"
+    )
+
+    # Починка, названная в отказе, ИСПОЛНЯЕТСЯ и приводит к принятой строке.
+    fixed = "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run"
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", fixed)
+    assert local_reviewer.sandbox_problem() == [], (
+        f"страж советует форму, которую сам же отвергает: "
+        f"{local_reviewer.sandbox_problem()}"
+    )
+
+    # То же обещание на слипшемся токене: сказано «напишите отдельными
+    # токенами» — делаем так и получаем принятую строку.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/sudo -nu r /usr/local/bin/wrap"
+    )
+    bundled = local_reviewer.sandbox_problem()
+    assert bundled and all("отдельным токеном" in r for r in bundled), (
+        f"отказ на слипшемся токене обязан назвать починку: {bundled}"
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/sudo -n -u r /usr/local/bin/wrap"
+    )
+    assert local_reviewer.sandbox_problem() == [], (
+        f"починка, названная в отказе, не работает: {local_reviewer.sandbox_problem()}"
+    )
+
+
+def test_a_consumed_value_does_not_pass_for_the_scope_flag(monkeypatch) -> None:
+    """``--scope``, съеденный как ЗНАЧЕНИЕ соседа, флагом ``--scope`` не является.
+
+    Неразрешённая 5a59af8d620685d0 машинного ревью #371. Воспроизведено на
+    ff617db и на HEAD 149cd825::
+
+        systemd-run --description --scope --uid=haiplane-reviewer /wrap
+        окно -> ['--description', '--scope', '--uid=haiplane-reviewer']
+        detaching_sandbox() -> []            # пропуск
+
+    Настоящий systemd-run возьмёт ``--scope`` описанием и поднимет transient
+    SERVICE, то есть ровно то, ради чего отказ и написан. Ошибка шла В
+    СТОРОНУ ПРОПУСКА.
+
+    Возражение опровергателя («рекомендованный рецепт — sudo-враппер, а не
+    systemd-run») отклонено и здесь: страж существует не для рекомендованной
+    строки, а для той, которую напишет оператор, — рекомендованную проверять
+    было бы незачем. И systemd-run --scope остаётся формой набора.
+    """
+    for sandbox in (
+        "/usr/bin/systemd-run --description --scope --uid=r /wrap",
+        "/usr/bin/systemd-run --unit --scope --uid=r /wrap",
+        "/usr/bin/systemd-run --slice --scope -- /wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons and all(
+            "--scope" in r and "transient service" in r for r in reasons
+        ), (
+            f"в «{sandbox}» слово «--scope» стоит ЗНАЧЕНИЕМ соседнего флага, "
+            "а не флагом. systemd-run поднимет transient service, который "
+            f"переживёт снятие прогона: {reasons}"
+        )
+
+    # А рабочие формы, где --scope настоящий, приниматься не перестали:
+    # починка не оплачена ложным отказом (возражение опровергателя учтено).
+    for fine in (
+        "/usr/bin/systemd-run --description=review --scope --uid=r /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --description review --uid=r /usr/local/bin/wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", fine)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"«{fine}» называет --scope собственным флагом systemd-run: "
+            f"{local_reviewer.sandbox_problem()}"
+        )
+
+    # Та же поправка на пользователе: имя берётся у флага, а не у соседа.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/sudo --prompt -u alice /wrap"
+    )
+    assert local_reviewer.sandbox_uid() == "", (
+        "«-u» здесь съедено значением --prompt, и пользователя строка не "
+        f"называет вовсе; страж назвал «{local_reviewer.sandbox_uid()}»"
+    )
+
+
+def test_the_run_options_end_at_the_double_dash(monkeypatch) -> None:
+    """``--`` в песочнице не принимается — ни у движка, ни у формы набора.
+
+    Неразрешённая a58d77e268b2d709 машинного ревью #371. Воспроизведено на
+    ff617db и на HEAD 149cd825::
+
+        podman run -- --timeout 1800 img
+        окно флагов -> [('--', None), ('--timeout', '1800')]
+        detaching_sandbox() -> []            # пропуск
+
+    Для podman образ здесь — ``--timeout``, а ``1800`` и ``img`` уже команда
+    внутри контейнера: собственного срока жизни у запуска НЕТ. Страж же
+    находил ``--timeout 1800`` и засчитывал срок, ошибаясь В СТОРОНУ
+    ПРОПУСКА. Хуже того, прошлый круг числил ``--`` среди беззначных флагов,
+    то есть отказ по неизвестному флагу на этой строке заведомо не срабатывал.
+
+    ПОВОРОТ 10.09.2026: терминатор не принимается ни в одной форме набора —
+    за флагами стоит ровно один аргумент, путь к обёртке, и отделять от него
+    нечего. Класс дефектов «что считается за ``--``» закрыт целиком, а не
+    разобран правильнее.
+    """
+    for sandbox in (
+        "/usr/bin/podman run -- --timeout 1800 img",
+        "/usr/bin/podman run --rm -i -- --timeout 1800 img",
+        "/usr/bin/podman run -- --rm -i img",
+        "/usr/bin/podman run --rm -i --timeout 1800 -- img",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem(), (
+            f"в «{sandbox}» всё, что стоит за «--», — это образ и команда "
+            "внутри контейнера. Своего срока жизни у запуска нет, и "
+            "контейнер переживёт снятие прогона"
+        )
+
+    for sandbox in (
+        "/usr/bin/sudo -n -u haiplane-reviewer -- /usr/local/bin/wrap",
+        "/usr/bin/systemd-run --scope --uid=r -- /usr/local/bin/wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons and all("--»" in r for r in reasons), (
+            f"«{sandbox}» пишет терминатор там, где отделять нечего, и отказ "
+            f"обязан назвать именно его: {reasons}"
+        )
+
+
+def test_sudo_names_a_numeric_uid_with_a_hash(monkeypatch, tmp_path) -> None:
+    """``sudo -u '#1000'`` — числовой uid, а не имя, которого нет в системе.
+
+    sudo(8): «The user may be either a user name or a numeric user ID (UID)
+    prefixed with the '#' character». Воспроизведено на ff617db (найдено
+    ревьюером Codex 10.09.2026)::
+
+        sudo -n -u #1000 /usr/local/bin/wrap
+        sandbox_uid() -> '#1000'   _resolve_user('#1000') -> None
+
+    ``'#1000'.isdigit()`` ложно, разбор уходил в ``getpwnam('#1000')`` и падал
+    ВСЕГДА. Отказ шёл в безопасную сторону, но причину называл неверную:
+    оператор читал «пользователь не разрешается в системе» про пользователя,
+    который в системе есть.
+
+    Решётка снимает неоднозначность именно У SUDO: там ``1000`` — это ИМЯ, а
+    ``#1000`` — uid, и обе записи законны. У systemd-run такой формы нет, и
+    принимать её там значит разрешить строку, которую сам systemd-run
+    отвергнет, — поэтому тест держит и это.
+    """
+    import pwd
+
+    me = pwd.getpwuid(os.getuid())
+    uid = me.pw_uid
+
+    # Слипшаяся запись той же решётки в набор форм не входит с 10.09.2026 —
+    # но вход не выброшен: он проверяется на ОТКАЗ, а не на разбор.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -nu#{uid} /usr/local/bin/wrap"
+    )
+    assert local_reviewer.sandbox_problem(), (
+        "слипшийся токен «-nu#N» набор форм не принимает: из одного токена не "
+        "видно, где кончается флаг и начинается значение"
+    )
+
+    # Форма sudo с решёткой разрешается в НАСТОЯЩЕГО пользователя.
+    for sandbox in (
+        f"/usr/bin/sudo -n -u #{uid} /usr/local/bin/wrap",
+        f"/usr/bin/sudo -n --user=#{uid} /usr/local/bin/wrap",
+    ):
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        tool, user = local_reviewer._named_sandbox_user()
+        entry = local_reviewer._resolve_user(user, tool)
+        assert entry is not None and entry.pw_uid == uid, (
+            f"«{sandbox}» называет uid {uid} синтаксисом самого sudo, а страж "
+            f"его не разрешил ({tool!r}, {user!r} -> {entry}): годная "
+            "настройка отвергается, и человеку называется ложная причина"
+        )
+
+    # Различение сохранено: у systemd-run решётки нет, и придумывать её там
+    # нельзя — а голое число он принимает как uid по-прежнему.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/systemd-run --scope --uid=#{uid} /usr/local/bin/wrap",
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    assert local_reviewer._resolve_user(user, tool) is None, (
+        "у systemd-run записи --uid=#N не существует; принять её значило бы "
+        "разрешить строку, на которой запуск упадёт уже внутри systemd-run"
+    )
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/systemd-run --scope --uid={uid} /usr/local/bin/wrap",
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    entry = local_reviewer._resolve_user(user, tool)
+    assert entry is not None and entry.pw_uid == uid, (
+        "числовая форма systemd-run (неразрешённая 534e16e4) не сломана"
+    )
+
+    # И обратная сторона того же правила: у sudo ГОЛОЕ число — это ИМЯ.
+    # Замерено 10.09.2026 на машине разработки, где uid 501 существует и
+    # принадлежит вызывающему::
+    #
+    #     sudo -n -u 501 true    -> «sudo: unknown user 501», rc 1
+    #     sudo -n -u '#501' true -> rc 0
+    #
+    # Значит ``getpwuid`` на такой записи отвечает про пользователя, которого
+    # sudo в строке НЕ ВИДИТ, — и страж одобрял бы песочницу, падающую на
+    # первом запуске. Ревьюер называл только форму с решёткой; эта половина
+    # доделана преемником.
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -n -u {uid} /usr/local/bin/wrap"
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    assert (tool, user) == ("sudo", str(uid)), (
+        f"пользователь из «sudo -u {uid}» не извлёкся ({tool!r}, {user!r}) — "
+        "всё, что ниже, судило бы не тот вход"
+    )
+    bare = local_reviewer._resolve_user(user, tool)
+    try:
+        by_name = pwd.getpwnam(str(uid))
+    except KeyError:
+        by_name = None
+    # РАВЕНСТВО, а не «None или имя из цифр». Прежнее утверждение
+    # «bare is None or bare.pw_name == str(uid)» getpwnam от getpwuid не
+    # отличало: на машине, где учётка названа цифрами собственного uid
+    # (обычная запись в образах и в LDAP), обе ветки дают одну и ту же
+    # запись, pw_name == str(uid), и регресс в getpwuid проходил бы
+    # зелёным (неразрешённая ревью #373; проверено на struct_passwd
+    # ('1000', uid 1000) — утверждение True на обеих ветках).
+    assert bare == by_name, (
+        f"«sudo -u {uid}» — это ИМЯ «{uid}», и страж обязан ответить ровно "
+        f"то же, что getpwnam('{uid}') ({by_name}); он ответил {bare}. "
+        "Разрешать голое число через getpwuid значит проверить членство в "
+        "группе у постороннего и объявить настроенной песочницу, на которой "
+        "sudo скажет «unknown user»"
+    )
+
+    # Та же строка, доведённая до САМОГО стража каталога прогонов: прежде эта
+    # половина не проверялась вовсе, и «страж одобрял бы песочницу, падающую
+    # на первом запуске» держалось одним лишь _resolve_user.
+    scratch = tmp_path / "runs"
+    scratch.mkdir()
+    # chown ДО chmod: непривилегированный chown снимает setgid, и каталог
+    # увёл бы scratch_problem() в ветку «нет setgid», где про пользователя не
+    # спрашивают вовсе.
+    os.chown(scratch, -1, me.pw_gid)
+    scratch.chmod(0o2770)
+    assert os.stat(scratch).st_mode & stat.S_ISGID, "каталог без setgid судит другое"
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(scratch))
+    problems = local_reviewer.scratch_problem()
+    if by_name is None:
+        assert problems and all("не разрешается в системе" in p for p in problems), (
+            f"«sudo -u {uid}» называет ИМЯ «{uid}», которого в системе нет. "
+            "Страж обязан назвать это причиной, а не промолчать: молчание "
+            f"здесь — обещание работы, которой не будет ({problems})"
+        )
+        assert any(f"«{uid}»" in p for p in problems), (
+            f"отказ обязан назвать неразрешённого пользователя: {problems}"
+        )
+    else:  # pragma: no cover — учётка, названная цифрами uid, на CI не заводится
+        assert not any("не разрешается в системе" in p for p in problems), (
+            f"пользователь «{uid}» в системе ЕСТЬ, и отказ по разрешению "
+            f"имени был бы ложным: {problems}"
+        )
+    # А у systemd-run голое число uid-ом БЫТЬ ОБЯЗАНО — иначе доделка выше
+    # сломала бы неразрешённую 534e16e4, ради которой числовая форма и заведена.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/systemd-run --scope --uid={uid} /usr/local/bin/wrap",
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    entry = local_reviewer._resolve_user(user, tool)
+    assert entry is not None and entry.pw_uid == uid
+
+    # Имя пользователя по-прежнему разрешается по имени, а мусор с решёткой —
+    # по-прежнему нет: отказ остаётся отказом.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/sudo -n -u {me.pw_name} /usr/local/bin/wrap",
+    )
+    tool, user = local_reviewer._named_sandbox_user()
+    assert local_reviewer._resolve_user(user, tool) is not None
+    for junk in ("#", "#abc", "#-1"):
+        monkeypatch.setattr(
+            config,
+            "LOCAL_REVIEW_SANDBOX",
+            f"/usr/bin/sudo -n -u '{junk}' /usr/local/bin/wrap",
+        )
+        tool, user = local_reviewer._named_sandbox_user()
+        assert local_reviewer._resolve_user(user, tool) is None, (
+            f"«{junk}» числовым uid не является, и разрешаться не должен"
+        )
+
+
+def test_the_scratch_check_reaches_the_group_through_a_hash_uid(
+    monkeypatch, tmp_path
+) -> None:
+    """Проверка группы каталога прогонов ДОХОДИТ до существа на форме ``#UID``.
+
+    Отдельный тест, а не хвост предыдущего, по двум причинам. Первая — так
+    видно, ЧТО именно ломается: прямые вызовы ``_resolve_user`` рядом падают
+    первыми и накрывают собой эту проверку. Вторая важнее: прошлая редакция
+    ставила здесь ``LOCAL_REVIEW_SCRATCH_DIR = ""`` и ждала ``[]`` — а
+    ``scratch_problem()`` на пустой настройке возвращает ``[]`` ПЕРВОЙ ЖЕ
+    СТРОКОЙ, не дойдя ни до ``_uid_outside_group``, ни до ``_resolve_user``.
+    Утверждение было верным при любом состоянии кода, то есть не держало
+    ничего; комментарий при нём обещал ровно обратное («scratch_problem зовёт
+    его сам»). Поэтому каталог здесь настоящий.
+
+    Существо: пользователь РАЗРЕШЁН, значит «не смогли проверить» звучать не
+    должно.
+
+    Утверждениями ПОЛОЖИТЕЛЬНЫМИ, а не запретом фразы. Прошлая редакция
+    запрещала здесь только слова «не разрешается в системе» — и оставалась
+    зелёной, когда извлечение пользователя ломалось совсем: при пустом
+    ``user`` ``_uid_outside_group`` возвращает ``[]`` первой же строкой, до
+    ``_resolve_user`` дело не доходит, и запрещать в пустом списке нечего.
+    Замерено на HEAD 684bab0b: подменить ``_named_sandbox_user`` на
+    ``("", "")`` — ``scratch_problem()`` даёт ``[]``, утверждение True
+    (неразрешённая ревью #373). Поэтому тест теперь называет и извлечение, и
+    ОБА исхода сравнения с группой.
+    """
+    import grp
+    import pwd
+
+    me = pwd.getpwuid(os.getuid())
+    uid = me.pw_uid
+    scratch = tmp_path / "runs"
+    scratch.mkdir()
+    # chown ДО chmod: непривилегированный chown снимает setgid.
+    os.chown(scratch, -1, me.pw_gid)
+    scratch.chmod(0o2770)
+    st = os.stat(scratch)
+    assert st.st_mode & stat.S_ISGID, (
+        "каталог без setgid уводит scratch_problem() в ДРУГУЮ ветку, и тест "
+        "снова ничего не проверит — как это уже было с пустой настройкой"
+    )
+    assert st.st_gid == me.pw_gid, "группа каталога не та, о которой судит тест"
+
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(scratch))
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", f"/usr/bin/sudo -n -u #{uid} /wrap"
+    )
+
+    # 1. Пользователь ИЗВЛЁКСЯ. Без этого всё ниже вырождается в проверку
+    #    пустого списка, а вырожденный тест хуже отсутствующего: он показывает
+    #    покрытие там, где его нет.
+    assert local_reviewer._named_sandbox_user() == ("sudo", f"#{uid}"), (
+        "форма «-u #UID» не извлеклась из песочницы: "
+        f"{local_reviewer._named_sandbox_user()}"
+    )
+
+    # 2. Группа СВОЯ — путь доходит до сравнения и разрешает. Пустой список
+    #    здесь означает «проверил и допустил», и держит его пункт 1.
+    problems = local_reviewer.scratch_problem()
+    assert problems == [], (
+        f"«sudo -u #{uid}» называет существующего пользователя синтаксисом "
+        "самого sudo, каталог принадлежит его же основной группе — а хаб "
+        f"всё равно нашёл причину: {problems}"
+    )
+
+    # 3. Группа ЧУЖАЯ — тот же путь доходит до сравнения и НАЗЫВАЕТ имена.
+    #    Это и есть утверждение, которого не хватало: если ``#UID`` перестанет
+    #    разрешаться, здесь встанет «не разрешается в системе», а если
+    #    извлечение сломается — пустой список. Оба падают.
+    mine = set(os.getgroups()) | {me.pw_gid}
+    foreign = next(
+        (
+            g
+            for g in grp.getgrall()
+            if g.gr_gid not in mine and me.pw_name not in g.gr_mem
+        ),
+        None,
+    )
+    assert foreign is not None, "на машине не нашлось группы, в которой мы не состоим"
+    outside = local_reviewer._uid_outside_group(str(scratch), foreign.gr_gid)
+    assert len(outside) == 1, (
+        f"членство в чужой группе «{foreign.gr_name}» обязано быть названо "
+        f"причиной, а страж вернул {outside}"
+    )
+    assert "не разрешается в системе" not in outside[0], (
+        f"форма «#{uid}» снова не разрешилась, и оператору называется ложная "
+        f"причина: {outside[0]}"
+    )
+    assert me.pw_name in outside[0] and foreign.gr_name in outside[0], (
+        "отказ обязан назвать И пользователя, И группу — иначе чинить нечего: "
+        f"{outside[0]}"
+    )
+
+
+def _doc_limits_probe() -> str:
+    """Фрагмент пробы лимитов ИЗ ДОКУМЕНТА — от шага 3 до конца блока.
+
+    Берётся текстом из файла, а не переписывается сюда: переписанная проба
+    проверяла бы тест, а не документ.
+    """
+    blocks = [
+        b
+        for b in re.findall(r"```bash\n(.*?)```", _DEPLOY_DOC.read_text(), re.S)
+        if "memory.max" in b
+    ]
+    assert len(blocks) == 1, (
+        f"в {_DEPLOY_DOC.name} ожидался ровно один bash-блок с пробой "
+        f"memory.max, найдено {len(blocks)}"
+    )
+    lines = blocks[0].splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("# 3."))
+    return "\n".join(lines[start:])
+
+
+def test_the_doc_limits_probe_tells_failure_from_success(tmp_path) -> None:
+    """Проба лимитов ОТЛИЧАЕТ отказ движка от успеха, а не читает молчание.
+
+    Прежняя редакция запускала `haiplane-review:latest` — литерал, который
+    абзац «Остальные расхождения» того же документа называет разошедшимся с
+    настоящим именем образа (`localhost/haiplane-reviewer:1`). Образа с таким
+    именем на хосте нет, podman отказывает и НИЧЕГО не печатает, а критерий
+    был написан отрицанием: «не должно быть 'max'». Замерено::
+
+        rc=125, stdout=[] -> слова 'max' нет -> оператор читает УСПЕХ
+
+    То есть проба доказывала лимиты собственным отказом. Здесь она
+    ИСПОЛНЯЕТСЯ с подставным движком, и проверяется ровно то, что чинит
+    находка: четыре исхода — лимиты есть, лимитов нет, ответа нет, проба не
+    запустилась — обязаны звучать ПО-РАЗНОМУ.
+    """
+    probe = _doc_limits_probe()
+    # Судятся ИСПОЛНЯЕМЫЕ строки: комментарий рядом называет старый литерал
+    # именно затем, чтобы его сюда не вернули, и запретом на слово это не
+    # проверить.
+    runnable = "\n".join(
+        line for line in probe.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "haiplane-review:latest" not in runnable, (
+        "проба запускает образ, который этот же документ называет выдуманным "
+        "литералом прежней редакции"
+    )
+    assert "/etc/haiplane-review/image" in runnable, (
+        "образ обязан читаться из того же файла, что читает враппер: литерал "
+        "в пробе уже расходился с настоящим именем образа"
+    )
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "sudo").write_text('#!/bin/sh\n[ "$1" = "-u" ] && shift 2\nexec "$@"\n')
+    imagefile = tmp_path / "image"
+    imagefile.write_text("localhost/haiplane-reviewer:1\n")
+    argv_log = tmp_path / "argv.log"
+
+    engines = {
+        # Образа нет — ровно исход прежней редакции: rc 125, stdout пуст.
+        "отказ движка": '#!/bin/sh\necho "Error: no such image" >&2\nexit 125\n',
+        # Движок отработал, но лимитов нет.
+        "лимитов нет": "#!/bin/sh\necho max\n",
+        # Движок отработал и не напечатал ничего — то же молчание, что у
+        # отказа, но с нулевым кодом.
+        "пустой вывод": "#!/bin/sh\nexit 0\n",
+        # Лимиты применены.
+        "лимиты есть": "#!/bin/sh\necho 1572864000\n",
+    }
+    verdicts: dict[str, str] = {}
+    for label, body in engines.items():
+        podman = bindir / "podman"
+        podman.write_text(
+            body.replace(
+                "#!/bin/sh\n",
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$ARGV_LOG"\n',
+                1,
+            )
+        )
+        for path in (bindir / "sudo", podman):
+            path.chmod(0o755)
+        done = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                probe.replace("/etc/haiplane-review/image", str(imagefile)),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={
+                **os.environ,
+                "PATH": f"{bindir}:{os.environ['PATH']}",
+                "ARGV_LOG": str(argv_log),
+            },
+        )
+        printed = done.stdout.strip()
+        assert printed, (
+            f"на исходе «{label}» проба не сказала НИЧЕГО: оператору нечего "
+            f"прочитать (stderr: {done.stderr!r})"
+        )
+        # Приговор — то, что стоит ДО двоеточия. Сравнивать целые строки
+        # значило бы различать исходы по подставленному числу: мутация,
+        # печатающая на отказе движка «лимиты применены: memory.max=» с
+        # пустым значением, отличалась бы от успеха одним лишь числом и
+        # ВЫЖИЛА (замерено в мутационной серии, M2).
+        verdicts[label] = printed.split(":", 1)[0].strip()
+
+    assert len(set(verdicts.values())) == len(verdicts), (
+        "исходы пробы неразличимы по приговору: оператор не сможет отличить "
+        f"отказ движка от применённых лимитов, читая одно и то же — {verdicts}"
+    )
+
+    # И образ — тот, что лежит в файле, а не зашитый в пробу литерал.
+    seen = argv_log.read_text()
+    assert "localhost/haiplane-reviewer:1" in seen, (
+        f"проба запустила не тот образ, что назван в файле: {seen!r}"
+    )
+
+
+def _doc_table(heading: str) -> list[list[str]]:
+    """Строки таблицы под НАЗВАННЫМ заголовком документа, ячейками.
+
+    Заголовок обязателен: таблиц в документе несколько, и брать «все строки,
+    начинающиеся с | `» значило бы судить таблицу принятых форм правилами
+    таблицы отказов. Пустая выборка — провал теста, а не зелёный прогон: она
+    была бы зелёной при любом содержании документа.
+    """
+    lines = _DEPLOY_DOC.read_text().splitlines()
+    start = next(
+        (i for i, line in enumerate(lines) if line.strip() == heading.strip()), -1
+    )
+    assert start >= 0, f"в {_DEPLOY_DOC.name} нет заголовка «{heading}»"
+    rows: list[list[str]] = []
+    for line in lines[start:]:
+        if line.startswith("## ") or line.startswith("### "):
+            if rows:
+                break
+            continue
+        if line.startswith("| `"):
+            rows.append([cell.strip() for cell in line.strip("|").split("|")])
+    assert rows, f"под «{heading}» не нашлось таблицы — проверка была бы пустой"
+    return rows
+
+
+def _backticked(cell: str) -> str:
+    assert cell.count("`") >= 2, f"в ячейке «{cell}» нет строки в обратных кавычках"
+    return cell.split("`")[1]
+
+
+def test_the_doc_names_the_closed_set_the_guard_accepts(monkeypatch) -> None:
+    """AC-5/AC-6: набор форм в документе — это набор форм В КОДЕ, сверено машиной.
+
+    Расхождение документа с кодом на этой задаче случалось ПЯТЬ раз и глазами
+    не поймалось ни разу: документ рекомендовал `systemd-run --uid=`, который
+    на проде не стартует; советовал `--timeout` «не меньше» хабского, тогда
+    как страж отвергает «больше»; обещал, что незнакомое пропускается, тогда
+    как незнакомый флаг давал отказ. Поэтому сверяется не глазами: имена форм,
+    строки целиком и ОБА списка флагов берутся из таблицы документа и
+    сравниваются с ``SANDBOX_SHAPES``, а каждая строка прогоняется через
+    самого стража.
+    """
+    rows = _doc_table("### Что хаб принимает")
+    shapes = {shape.name: shape for shape in local_reviewer.SANDBOX_SHAPES}
+    documented = {_backticked(row[0]) for row in rows}
+    assert documented == set(shapes), (
+        f"документ называет формы {sorted(documented)}, а код принимает "
+        f"{sorted(shapes)}. Форма, которой нет в одном из двух мест, — это "
+        "либо обещание без кода, либо код без обещания"
+    )
+
+    for row in rows:
+        shape = shapes[_backticked(row[0])]
+        example = _backticked(row[1])
+        assert example == shape.example, (
+            f"документ печатает для формы «{shape.name}» строку «{example}», а "
+            f"код держит «{shape.example}». Оператор скопирует первую"
+        )
+        required = {
+            flag.strip()
+            for cell in row[2].split(",")
+            for flag in cell.replace("`", " ").split("/")
+            if flag.strip().startswith("-")
+        }
+        assert required == {flag for group in shape.required for flag in group}, (
+            f"обязательные флаги формы «{shape.name}»: документ называет "
+            f"{sorted(required)}, код требует "
+            f"{sorted(flag for group in shape.required for flag in group)}"
+        )
+        optional = {
+            flag.strip()
+            for flag in row[3].replace("`", " ").split(",")
+            if flag.strip().startswith("-")
+        }
+        in_code = (shape.valueless | shape.valued) - {
+            flag for group in shape.required for flag in group
+        }
+        assert optional == in_code, (
+            f"необязательные флаги формы «{shape.name}»: документ называет "
+            f"{sorted(optional)}, код принимает {sorted(in_code)}. Флаг, "
+            "названный в документе и не принятый кодом, — это отказ на строке, "
+            "которую документ рекомендует"
+        )
+
+        # И то же самое ИСПОЛНЕНИЕМ: строка из документа прогоняется через
+        # стража и обязана подойти именно той форме, которой её назвали.
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", example)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"документ печатает «{example}» как форму «{shape.name}», а хаб её "
+            f"отвергает: {local_reviewer.sandbox_problem()}"
+        )
+        assert local_reviewer.sandbox_shape() == shape.name
+
+
+def test_the_doc_table_of_refusals_is_what_the_guard_actually_refuses(
+    monkeypatch,
+) -> None:
+    """AC-4, обратная сторона: строки из таблицы ОТКАЗОВ хаб и вправду отвергает.
+
+    Пара к test_the_doc_recommends_only_sandboxes_the_hub_accepts. Документ,
+    обещающий отказ там, где хаб молча пропускает, готовит ровно тот выкат, из
+    которого выросла задача. Строки берутся из таблицы, а не переписываются
+    сюда.
+
+    В таблице стоят НАСТОЯЩИЕ входы, на которых страж когда-то ошибался, —
+    включая те, что прежняя редакция документа обещала ПРИНИМАТЬ (`podman run
+    --timeout 1800`). Смена правила не выбросила ни одного из них: они
+    отвергаются тем более, и документ обязан говорить об этом ровно то же,
+    что делает код.
+    """
+    refused = [_backticked(row[0]) for row in _doc_table("### Что хаб отвергает")]
+    assert len(refused) >= 10, (
+        f"таблица отказов слишком коротка ({len(refused)}): накопленные за "
+        "девять кругов входы обязаны стоять в документе, а не только в тестах"
+    )
+    # Суждение о сроке зависело от хабского, и брать его из окружения значило
+    # бы судить документ по чужой переменной. Приговор от него больше не
+    # зависит, но число в документе и в примере окружения обязано быть одно —
+    # это и проверяет _documented_hub_deadline.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", _documented_hub_deadline())
+
+    for sandbox in refused:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        reasons = local_reviewer.sandbox_problem()
+        assert reasons, (
+            f"документ обещает отказ на «{sandbox}», а хаб пропускает её "
+            "молча: обещание в тексте, которого нет в коде, — это тот же "
+            "выкат, ради которого писан весь документ"
+        )
+        assert local_reviewer.sandbox_uid() == "", (
+            f"на отвергнутой «{sandbox}» страж назвал пользователя "
+            f"«{local_reviewer.sandbox_uid()}»"
+        )
+
+    # Классы, за которыми документ обязан следить поимённо: контейнерный
+    # запуск (отказ называет недостающий --timeout), отсоединённый запуск и
+    # срок ДЛИННЕЕ хабского — все три страж когда-то пропускал молча.
+    assert any("podman" in s and "--timeout" in s for s in refused), (
+        "контейнерный запуск со сроком жизни в таблице не назван, а прежняя "
+        "редакция документа его РЕКОМЕНДОВАЛА"
+    )
+    assert any("-d" in s or "--detach" in s for s in refused), (
+        "отсоединённый запуск в таблице отказов не назван, а он проходил "
+        "стража молча (воспроизведено на 5b7b813)"
+    )
+    assert any("3600" in s for s in refused), (
+        "срок контейнера ДЛИННЕЕ хабского в таблице отказов не назван, а "
+        "документ до 10.09.2026 такой срок прямо СОВЕТОВАЛ («не меньше»)"
+    )
+    assert any("-p80:80" in s for s in refused), (
+        "строка с неизвестным флагом при ЖИВОМ сроке в таблице не названа, а "
+        "именно на ней текст документа расходился с кодом"
+    )
+
+
+def test_the_doc_recommends_only_sandboxes_the_hub_accepts(monkeypatch) -> None:
+    """AC-4: строки песочницы ИЗ ДОКУМЕНТА прогоняются через самих стражей.
+
+    Документ, рекомендующий то, что хаб сам же отклонит, хуже отсутствующего.
+    Строки берутся из файлов, а не переписываются сюда: переписанная строка
+    проверяла бы тест, а не документ.
+    """
+    key = config.brand.ENV_PREFIX + "LOCAL_REVIEW_SANDBOX"
+    # Значение — всё после первого '<ИМЯ>=' в строке.
+    recommended = [
+        line.split(key + "=", 1)[1]
+        for path in (_DEPLOY_DOC, _ENV_EXAMPLE)
+        for line in path.read_text().splitlines()
+        if key + "=" in line
+    ]
+    assert len(recommended) >= 2, (
+        "в документе и примере окружения не нашлось рекомендованных строк "
+        f"{key}= — проверка была бы пустой и зелёной при любом их содержании"
+    )
+
+    for sandbox in recommended:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        assert local_reviewer.sandbox_problem() == [], (
+            f"документ рекомендует «{sandbox}», а хаб её отвергает: "
+            f"{local_reviewer.sandbox_problem()}"
+        )
+        assert local_reviewer.sandbox_uid(), (
+            f"в рекомендованной строке «{sandbox}» страж не видит "
+            "пользователя — значит проверка его членства в группе каталога "
+            "прогонов на этой конфигурации молча не сработает вовсе, ровно "
+            "как было до #1208"
+        )
+
+
+def test_the_doc_wrapper_carries_the_argv_the_hub_appends(
+    monkeypatch, tmp_path
+) -> None:
+    """Скелет враппера ИЗ ДОКУМЕНТА доносит до движка argv, дописанный хабом.
+
+    Хаб запускает ``shlex.split(SANDBOX) + shlex.split(CMD)``. Враппер без
+    ``"$@"`` этот хвост молча выбрасывает: измерено на прежней редакции
+    скелета — ``haiplane-review-run cursor-agent --print`` доходило до podman
+    строкой БЕЗ ``cursor-agent``, код возврата 0, ни ошибки, ни следа.
+    Запускалось бы то, что зашито в образ, а не то, что стоит в настройке —
+    тот же класс отказа, который чинила задача: не ломает, а тихо подменяет
+    (найдено машинным ревью 09.09.2026, находка 8d363dc407782056).
+
+    Скелет берётся ИЗ ФАЙЛА и ИСПОЛНЯЕТСЯ, а не читается глазами: переписанный
+    в тест, он проверял бы тест, а прочитанный — ничего.
+    """
+    # 1. Хаб действительно дописывает CMD к SANDBOX — это наблюдение, а не
+    #    посылка: на ней держится всё остальное в этом тесте.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/sudo -n -u r /wrap")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "cursor-agent --print")
+    assert local_reviewer.argv() == [
+        "/usr/bin/sudo",
+        "-n",
+        "-u",
+        "r",
+        "/wrap",
+        "cursor-agent",
+        "--print",
+    ], "хаб склеивает песочницу и CMD — если это не так, весь тест ниже мимо"
+
+    # 2. Скелет враппера из документа, с подменённым движком на заглушку,
+    #    печатающую свой argv.
+    blocks = [
+        b
+        for b in re.findall(r"```sh\n(.*?)```", _DEPLOY_DOC.read_text(), re.S)
+        if "podman run" in b
+    ]
+    assert len(blocks) == 1, (
+        f"в {_DEPLOY_DOC.name} ожидался ровно один sh-скелет враппера с "
+        f"podman run, найдено {len(blocks)}"
+    )
+    script = textwrap.dedent(blocks[0])
+    engine = next(
+        tok
+        for tok in shlex.split(script.replace("\\\n", " "))
+        if tok.rsplit("/", 1)[-1] == "podman"
+    )
+    stub = tmp_path / "podman"
+    stub.write_text('#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n')
+    stub.chmod(0o755)
+    wrapper = tmp_path / "haiplane-review-run"
+    wrapper.write_text(script.replace(engine, str(stub)))
+    wrapper.chmod(0o755)
+
+    cmd = ["cursor-agent", "--print", "--model", "grok-4.6"]
+    done = subprocess.run(
+        [str(wrapper), *cmd],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            **os.environ,
+            "HAIPLANE_REVIEW_CONF": str(_wrapper_conf(tmp_path, deadline=None)),
+        },
+    )
+    assert done.returncode == 0, f"скелет враппера не запустился: {done.stderr}"
+    seen = done.stdout.split("\n")
+    assert seen[-1 - len(cmd) : -1] == cmd, (
+        "скелет враппера из документа НЕ донёс до движка argv, который хаб к "
+        f"нему дописал: движок получил {seen[:-1]}, а хвостом обязан был "
+        f'стоять {cmd}. Молча: код возврата 0. Добавьте "$@" последним '
+        "аргументом podman run"
+    )
+
+
+def test_the_doc_probe_runs_the_same_command_the_hub_will_run(monkeypatch) -> None:
+    """Проба песочницы в документе гоняет тот же argv, что и живой запуск.
+
+    Проба, которая запускает враппер голым, проходит и на скелете, молча
+    выбрасывающем argv, — то есть доказывает не то, что проверяет.
+    """
+    key = config.brand.ENV_PREFIX + "LOCAL_REVIEW_SANDBOX"
+    text = _DEPLOY_DOC.read_text()
+    recommended = [
+        line.split(key + "=", 1)[1] for line in text.splitlines() if key + "=" in line
+    ]
+    assert recommended, f"в {_DEPLOY_DOC.name} нет рекомендованной строки {key}="
+    wrapper = shlex.split(recommended[0])[-1]
+
+    probes = [
+        line
+        for block in re.findall(r"```bash\n(.*?)```", text, re.S)
+        for line in block.splitlines()
+        if wrapper in line
+    ]
+    assert probes, (
+        f"в {_DEPLOY_DOC.name} нет пробы, запускающей враппер {wrapper} — "
+        "проверка была бы пустой и зелёной при любом её содержании"
+    )
+    for line in probes:
+        assert "$CMD" in line, (
+            f"проба «{line.strip()}» запускает враппер БЕЗ дописанного argv "
+            "CLI, а хаб запускает песочницу вместе с ним "
+            f"({key[:-7]}CMD). Такая проба пройдёт там, где живой запуск "
+            "пойдёт другой командой"
+        )
+
+
+# Флаги ``podman run``, которые встречаются в СКЕЛЕТЕ ВРАППЕРА из документа.
+# Список живёт здесь, а не в хабе: с 10.09.2026 хаб строку podman не разбирает
+# вовсе — контейнерного запуска нет в закрытом наборе форм песочницы (#1208),
+# а внутрь враппера он не заглядывает по определению. Тесты документа читают
+# скелет сами, и незнакомый флаг для них — ПРОВАЛ разбора, о котором тест
+# кричит, а не угадывает: иначе проверка «--timeout доехал» была бы зелёной на
+# строке, которую тест не понял.
+_WRAPPER_VALUE_FLAGS = frozenset(
+    {
+        "--cpus",
+        "--env-file",
+        "-m",
+        "--memory",
+        "--name",
+        "--net",
+        "--network",
+        "--pids-limit",
+        "--timeout",
+        "--userns",
+        "-v",
+        "--volume",
+    }
+)
+_WRAPPER_VALUELESS_FLAGS = frozenset(
+    {"--init", "-i", "-it", "--read-only", "--replace", "--rm", "-t"}
+)
+
+
+def _wrapper_run_flags(parts: list[str]) -> list[tuple[str, str | None]]:
+    """Флаги самого ``podman run`` из скелета враппера — ДО образа.
+
+    Всё, что стоит после образа, — команда внутри контейнера, и её флаги к
+    запуску отношения не имеют.
+    """
+    assert "run" in parts, f"в строке запуска нет подкоманды run: {parts}"
+    i = parts.index("run")
+    assert parts[i - 1].rsplit("/", 1)[-1] in ("podman", "docker"), (
+        f"«run» стоит не за движком: {parts}"
+    )
+    flags: list[tuple[str, str | None]] = []
+    k = i + 1
+    while k < len(parts) and parts[k].startswith("-"):
+        name, sep, value = parts[k].partition("=")
+        if sep:
+            flags.append((name, value))
+            k += 1
+        elif name in _WRAPPER_VALUE_FLAGS:
+            flags.append((name, parts[k + 1] if k + 1 < len(parts) else None))
+            k += 2
+        else:
+            assert name in _WRAPPER_VALUELESS_FLAGS, (
+                f"скелет враппера содержит флаг «{name}», о котором этот тест "
+                f"не знает, берёт ли тот значение отдельным токеном: {parts}. "
+                "Разбор недостоверен, и судить по нему нельзя"
+            )
+            flags.append((name, None))
+            k += 1
+    return flags
+
+
+def _wrapper_flag(flags: list[tuple[str, str | None]], flag: str) -> str | None:
+    """ДЕЙСТВУЮЩЕЕ значение флага — последнее вхождение, как берёт его pflag."""
+    values = [value for name, value in flags if name == flag]
+    return values[-1] if values else None
+
+
+def _wrapper_conf(tmp_path, *, deadline: int | None) -> Path:
+    """Каталог ``$CONF`` враппера: то, что оператор кладёт в /etc по шагу 3a.
+
+    Скелет читает оттуда образ и срок — сам он их не зашивает, иначе срок ни
+    за какой настройкой не следовал бы (находка 10.09.2026). Файл ``timeout``
+    при ``deadline is None`` НЕ создаётся: это вход «оператор файла не писал»,
+    на котором действует умолчание скелета.
+    """
+    conf = tmp_path / "conf"
+    conf.mkdir(exist_ok=True)
+    (conf / "image").write_text("localhost/haiplane-reviewer:1\n")
+    (conf / "model.env").write_text("KEY=x\n")
+    if deadline is None:
+        (conf / "timeout").unlink(missing_ok=True)
+    else:
+        (conf / "timeout").write_text(f"{deadline}\n")
+    return conf
+
+
+def _doc_wrapper_argv(tmp_path, *, deadline: int | None) -> list[str]:
+    """ВСЕ вызовы движка, которые сделал скелет враппера из документа.
+
+    Скелет не читается глазами и не разбирается регулярками: он ИСПОЛНЯЕТСЯ с
+    подменённым на заглушку движком, и наружу отдаётся то, что заглушка
+    получила — каждый вызов отдельной строкой, в порядке вызова. Разница не
+    косметическая — в скелете стоят переменные (``--timeout="$TIMEOUT"``,
+    ``"$IMAGE"``), и текст «--timeout "$TIMEOUT"» выглядит убедительно ровно
+    так же при пустом TIMEOUT, при опечатке в имени переменной и при её потере
+    под ``set -u``. Проверять текст значило бы проверять намерение, а не
+    команду.
+
+    ``deadline`` — что лежит в ``$CONF/timeout``; ``None`` значит файла нет, и
+    тогда действует умолчание самого скелета. Каталог настроек подставляется
+    через ``HAIPLANE_REVIEW_CONF``: без него скелет читал бы боевой
+    ``/etc/haiplane-review``, которого на машине проверки нет, а с зашитым в
+    скелет литералом срок вообще не следовал бы ни за чем (находка 10.09.2026,
+    находки 2 и 3 одного и того же числа).
+
+    Возвращаются ВСЕ вызовы, а не только ``run``: то, что скелет делает ДО
+    запуска, — часть рецепта, и именно там жил ``podman rm -af``, сносивший
+    чужие контейнеры.
+    """
+    conf = _wrapper_conf(tmp_path, deadline=deadline)
+    blocks = [
+        b
+        for b in re.findall(r"```sh\n(.*?)```", _DEPLOY_DOC.read_text(), re.S)
+        if "podman run" in b
+    ]
+    assert len(blocks) == 1, (
+        f"в {_DEPLOY_DOC.name} ожидался ровно один sh-скелет враппера с "
+        f"podman run, найдено {len(blocks)}"
+    )
+    script = textwrap.dedent(blocks[0])
+    engine = next(
+        tok
+        for tok in shlex.split(script.replace("\\\n", " "))
+        if tok.rsplit("/", 1)[-1] == "podman"
+    )
+    # Свой файл на КАЖДЫЙ прогон: заглушка дописывает, и общий файл склеил бы
+    # вызовы соседнего запуска скелета в том же tmp_path.
+    log = tmp_path / f"argv-{uuid.uuid4().hex}.log"
+    stub = tmp_path / "podman"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, shlex, sys\n"
+        "open(os.environ['ARGV_LOG'], 'a').write(shlex.join(sys.argv[1:]) + '\\n')\n"
+    )
+    stub.chmod(0o755)
+    wrapper = tmp_path / "haiplane-review-run"
+    wrapper.write_text(script.replace(engine, str(stub)))
+    wrapper.chmod(0o755)
+
+    done = subprocess.run(
+        [str(wrapper), "cursor-agent", "--print"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            **os.environ,
+            "ARGV_LOG": str(log),
+            "HAIPLANE_REVIEW_CONF": str(conf),
+        },
+    )
+    assert done.returncode == 0, f"скелет враппера не запустился: {done.stderr}"
+    seen = [line for line in log.read_text().splitlines() if line]
+    log.unlink()
+    return [shlex.join([engine, *shlex.split(line)]) for line in seen]
+
+
+def _doc_wrapper_launch(tmp_path, *, deadline: int | None = None) -> str:
+    """Единственная строка ``<engine> run`` скелета — то, что судит страж."""
+    calls = _doc_wrapper_argv(tmp_path, deadline=deadline)
+    runs = [c for c in calls if shlex.split(c)[1:2] == ["run"]]
+    assert len(runs) == 1, (
+        f"скелет враппера обязан один раз позвать «podman run»; движок получил {calls}"
+    )
+    return runs[0]
+
+
+def test_the_doc_wrapper_skeleton_names_its_own_deadline(monkeypatch, tmp_path) -> None:
+    """Срок жизни контейнера в скелете враппера держится тестом, а не текстом.
+
+    Рекомендованная песочница — ``sudo … /usr/local/bin/haiplane-review-run``,
+    и стражам хаба она непрозрачна: podman лежит ВНУТРИ скрипта. Значит на
+    рекомендованном рецепте единственное место, где срок жизни вообще
+    существует, — это скелет враппера в документе. Замер: вычеркнуть из него
+    ``--timeout 1800`` — и весь набор оставался зелёным, включая AC-1..AC-4,
+    тест argv и тест пробы (09.09.2026, находка машинного ревью
+    b3a35600e66e971d). То есть флаг, ради которого писан страж, на
+    рекомендованном пути не держался ничем.
+
+    Проверяется не глазами и не подстрокой: строка запуска берётся ИЗ ФАЙЛА и
+    ИСПОЛНЯЕТСЯ (переменные скелета подставляются оболочкой, а не читателем).
+
+    ПОВОРОТ 10.09.2026. Прежде эту строку прогоняли через самого стража хаба.
+    Теперь так нельзя, и не потому, что стало хуже: контейнерный запуск в
+    закрытый набор форм песочницы не входит, и страж отверг бы ЛЮБУЮ строку
+    podman — в том числе верную. Судить скелет ему больше нечем и незачем: он
+    и на рекомендованном рецепте его не видел. Поэтому срок берётся из
+    исполненного скелета и сравнивается с ХАБСКИМ СРОКОМ ИЗ ДОКУМЕНТА — с тем
+    самым числом, которое оператор скопирует к себе.
+    """
+    launch = _doc_wrapper_launch(tmp_path)
+    # Хвост ``cursor-agent --print`` — команда ВНУТРИ контейнера; флаги
+    # запуска кончаются на образе, и до хвоста разбор не доходит.
+    flags = _wrapper_run_flags(shlex.split(launch))
+    lifetime = _wrapper_flag(flags, "--timeout")
+    assert lifetime and lifetime.isdigit() and int(lifetime) > 0, (
+        f"скелет враппера из документа запускает «{launch}» без собственного "
+        "срока жизни. Контейнер переживёт снятие прогона — измерено "
+        "08.09.2026: kill -KILL по группе, через 7 с контейнер «Up», — а хаб "
+        "напишет в ленту, что снял"
+    )
+    # Срок контейнера не может быть БОЛЬШЕ хабского: он истёк бы уже после
+    # того, как хаб закрыл прогон. Хабский берётся из документа, а не из
+    # окружения, иначе скелет судился бы чужой переменной.
+    hub_deadline = _documented_hub_deadline()
+    assert int(lifetime) <= hub_deadline, (
+        f"скелет даёт контейнеру {lifetime} с при хабских {hub_deadline}: "
+        "контейнер переживёт снятие прогона ровно так же, как без --timeout "
+        "вовсе, только тише"
+    )
+
+
+def test_the_doc_wrapper_deadline_follows_the_conf_file(monkeypatch, tmp_path) -> None:
+    """Срок контейнера СЛЕДУЕТ за настройкой, а не зашит в скелет числом.
+
+    Находка 10.09.2026 (ревьюер Codex, воспроизведено на ef2198fc): оператор
+    ставит ``HAIPLANE_LOCAL_REVIEW_TIMEOUT_SEC=600`` и копирует скелет как
+    есть — а в скелете стояло ``TIMEOUT=1800`` литералом, ни с чем не
+    связанным. Контейнер переживал прогон втрое, и страж этого не видел вовсе:
+    на рекомендованном рецепте ему виден только ``sudo …
+    /haiplane-review-run``, podman лежит внутри скрипта.
+
+    Проверяется исполнением: скелет запускается с подставленным каталогом
+    настроек, и наружу берётся то число, которое ПОЛУЧИЛ движок. Замер на
+    прежней редакции: файл ``timeout`` с любым содержимым не менял ничего —
+    движку уходило 1800.
+    """
+    hub_deadline = _documented_hub_deadline()
+
+    # 1. Умолчание скелета (файла нет) — это ХАБСКОЕ умолчание, а не «просто
+    #    число»: разойдись они, рецепт по умолчанию был бы уже сломан.
+    launch = _doc_wrapper_launch(tmp_path, deadline=None)
+    flags = _wrapper_run_flags(shlex.split(launch))
+    assert _wrapper_flag(flags, "--timeout") == str(hub_deadline), (
+        f"без файла настроек скелет ставит контейнеру срок из «{launch}», а "
+        f"хабское умолчание — {hub_deadline}. Умолчания обязаны совпадать: "
+        "иначе рецепт ломается ещё до того, как оператор что-либо тронул"
+    )
+
+    # 2. Файл настроек ДЕЙСТВУЕТ: оператор укоротил хабский срок, вписал то же
+    #    число в файл — и контейнер получил именно его. Это и есть то, чего в
+    #    прежней редакции не было: связь между двумя местами.
+    shortened = 600
+    assert shortened != hub_deadline, "проверка беспредметна на равных числах"
+    launch = _doc_wrapper_launch(tmp_path, deadline=shortened)
+    flags = _wrapper_run_flags(shlex.split(launch))
+    assert _wrapper_flag(flags, "--timeout") == str(shortened), (
+        f"скелет не взял срок из $CONF/timeout: движку ушло «{launch}». "
+        "Значит число в скелете зашито, и согласовать его с настройкой хаба "
+        "оператору нечем"
+    )
+    # ПОВОРОТ 10.09.2026: прежде здесь стояла третья проверка — что строку
+    # запуска враппера принимает сам страж хаба. Она потеряла предмет:
+    # контейнерный запуск в закрытый набор форм песочницы не входит, и хаб
+    # эту строку не увидит вовсе — ему видна только форма sudo, а podman
+    # лежит внутри скрипта. Согласие двух чисел от этого не ослабло: оно и
+    # есть то, что проверено выше, — и проверено ИСПОЛНЕНИЕМ скелета.
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TIMEOUT_SEC", shortened)
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        "/usr/bin/sudo -n -u haiplane-reviewer /usr/local/bin/haiplane-review-run",
+    )
+    assert local_reviewer.sandbox_problem() == [], (
+        "хаб видит не строку podman, а форму sudo, и она обязана проходить "
+        f"при любом сроке: {local_reviewer.sandbox_problem()}"
+    )
+
+    # 3. И РАСХОЖДЕНИЕ — это дыра, а не мелочь: не тронув файл, оператор
+    #    получит на укороченном хабе контейнер с прежним умолчанием. Страж
+    #    этого не увидит НИКОГДА — ни прежде, ни теперь: на рекомендованном
+    #    рецепте podman лежит внутри скрипта. Поэтому файл из шага 3a и есть
+    #    единственное место, где расхождение закрывается, и здесь измеряется
+    #    именно оно.
+    stale = _wrapper_flag(
+        _wrapper_run_flags(shlex.split(_doc_wrapper_launch(tmp_path))), "--timeout"
+    )
+    assert stale == str(hub_deadline) and int(stale) > shortened, (
+        f"без файла скелет даёт контейнеру {stale} с — и на хабских "
+        f"{shortened} это переживший прогон контейнер. Если бы умолчание "
+        "скелета следовало за настройкой само, шаг 3a был бы не нужен вовсе"
+    )
+
+
+def test_the_doc_wrapper_cleans_up_only_its_own_container(tmp_path) -> None:
+    """Уборка хвоста адресована ОДНОМУ контейнеру, а не всем подряд.
+
+    Находка 10.09.2026 (ревьюер Codex, подтверждена на хосте хаба:
+    /usr/local/bin/haiplane-review-run, строка 22). Скелет содержал
+    ``podman rm -af`` — снос ВСЕХ контейнеров пользователя-ревьюера.
+    Основание было названо тут же в комментарии («два ревьюера разом хосту не
+    по карману»), но ``rm -af`` такого ограничения не устанавливает: он не
+    сдерживает второй прогон, а УБИВАЕТ первый — и заодно всё постороннее,
+    что этот пользователь запустил. Одновременность держит хаб
+    (``local_reviewer._HOST_BUDGET``, тест
+    ``test_two_local_runs_never_overlap_on_the_host``), а здесь держится то,
+    что уборка никого чужого не задевает.
+
+    Судится не текст, а argv, которые движок ФАКТИЧЕСКИ получил.
+    """
+    calls = _doc_wrapper_argv(tmp_path, deadline=None)
+    # ``--all``/``-a`` у любой снимающей подкоманды — это «все контейнеры
+    # пользователя», то есть ровно та находка. Перечислены по имени: список
+    # узкий и о подкомандах podman, а не догадка про CLI вообще.
+    for call in calls:
+        argv = shlex.split(call)[1:]
+        if not argv or argv[0] not in ("rm", "stop", "kill", "pod"):
+            continue
+        wholesale = [
+            tok
+            for tok in argv[1:]
+            if tok in ("-a", "--all")
+            or (tok.startswith("-") and not tok.startswith("--") and "a" in tok[1:])
+        ]
+        assert not wholesale, (
+            f"скелет враппера зовёт «{call}»: {wholesale} значит ВСЕ "
+            "контейнеры пользователя-ревьюера, а не хвост своего прошлого "
+            "прогона. Так уборка сносит живое чужое ревью, и в карточке это "
+            "ляжет отказом прогона с ложной причиной"
+        )
+    # А адресат уборки обязан БЫТЬ: снести хвост всё-таки надо, и адресуется
+    # он именем. Без имени ``--replace`` бессмыслен, а без ``--replace``
+    # хвост пережил бы запуск и занял бы имя.
+    launch = _doc_wrapper_launch(tmp_path, deadline=None)
+    flags = _wrapper_run_flags(shlex.split(launch))
+    name = _wrapper_flag(flags, "--name")
+    assert isinstance(name, str) and name, (
+        f"скелет не даёт контейнеру имени: {launch}. Тогда адресной уборки "
+        "нет вовсе, и вернуться к «rm -af» — вопрос одного коммита"
+    )
+    assert any(flag == "--replace" for flag, _ in flags), (
+        f"имя «{name}» есть, а --replace нет: {launch}. Хвост прошлого "
+        "прогона займёт имя, и запуск упадёт «name already in use»"
+    )
+
+
+def test_the_doc_wrapper_leaves_the_network_the_hub_hands_the_run(tmp_path) -> None:
+    """Скелет враппера НЕ отрезает контейнеру сеть, которой хаб его снабжает.
+
+    Прежняя редакция документа рекомендовала ``--network none`` — четвёртый
+    экземпляр того же дефекта, ради которого заведена #1208: документ учил
+    настройке, на которой выкат останавливается. Настоящий враппер на хосте
+    хаба флага ``--network`` не имеет вовсе (снят 10.09.2026).
+
+    Требование не выдумано и не переписано в тест словами: оно берётся у
+    САМОГО ХАБА. ``review_dispatch._delivery_block`` — та функция, что
+    собирает промт, — кладёт в него ``curl`` на публичный адрес установки:
+    обменять одноразовый код, прочитать постановку, СДАТЬ ОТЧЁТ. Контейнер
+    без сети до этого адреса не дойдёт, и остаётся только запасной путь —
+    блок в тексте (#1036), который хаб помечает как более слабый. Измерено на
+    хосте хаба 10.09.2026 тем же образом: с сетью по умолчанию ``getent
+    hosts`` внутри контейнера отвечает про agenthai.ru и api.cursor.com
+    (rc 0), с ``--network none`` — rc 2 и ни одной строки.
+    """
+    hub_base = "https://hub.example"
+    delivery = _delivery_block(1208, "CODE-1", hub_base)
+    assert hub_base in delivery and "curl" in delivery, (
+        "хаб перестал давать прогону сетевой адрес — тогда и требование "
+        f"ниже беспредметно, и этот тест надо переписать: {delivery!r}"
+    )
+
+    launch = shlex.split(_doc_wrapper_launch(tmp_path))
+    # Всё, что стоит ДО образа, — флаги запуска; сеть настраивается только там.
+    flags = _wrapper_run_flags(launch)
+    for name, value in flags:
+        assert name not in ("--network", "--net"), (
+            f"скелет враппера из документа задаёт «{name} {value}». Сеть "
+            "контейнеру нужна В ДВЕ стороны: к поставщику (agentский CLI "
+            "авторизуется ключом из --env-file и ходит в api.cursor.com) и К "
+            "САМОМУ ХАБУ — отчёт по контракту сдаётся обычным HTTP на адрес "
+            f"из промта ({hub_base} в примере выше). Отрезав её, выкат "
+            "остановится молча: прогон кончится без отчёта. Если сеть надо "
+            "сузить, сужайте до СПИСКА АДРЕСОВ, а не до нуля"
+        )
+
+
+def test_the_doc_probe_passes_the_cli_argv_as_arguments(monkeypatch) -> None:
+    """В пробе ``$CMD`` — ПОЗИЦИОННЫЙ аргумент враппера, а не что попало.
+
+    Прежняя проверка требовала лишь подстроки ``$CMD`` в строке. Замер: строка
+    ``CMD=$CMD /usr/local/bin/haiplane-review-run`` — то есть враппер запущен
+    ГОЛЫМ, ровно та регрессия, ради которой тест писан, — оставляла весь набор
+    зелёным (09.09.2026, находка машинного ревью dc051e23e80f3cdd). Подстрока
+    не отличает аргумент от присваивания перед командой и от ``<<<"$CMD"``.
+    """
+    key = config.brand.ENV_PREFIX + "LOCAL_REVIEW_SANDBOX"
+    text = _DEPLOY_DOC.read_text()
+    recommended = [
+        line.split(key + "=", 1)[1] for line in text.splitlines() if key + "=" in line
+    ]
+    assert recommended, f"в {_DEPLOY_DOC.name} нет рекомендованной строки {key}="
+    wrapper = shlex.split(recommended[0])[-1]
+
+    probes = [
+        line
+        for block in re.findall(r"```bash\n(.*?)```", text, re.S)
+        # Продолжения строк склеиваются: проба разнесена по строкам обратным
+        # слешем, и разорванную строку токенами не разобрать.
+        for line in block.replace("\\\n", " ").splitlines()
+        if wrapper in line
+    ]
+    assert probes, (
+        f"в {_DEPLOY_DOC.name} нет пробы, запускающей враппер {wrapper} — "
+        "проверка была бы пустой и зелёной при любом её содержании"
+    )
+    for line in probes:
+        tokens = shlex.split(line, comments=True)
+        assert wrapper in tokens, (
+            f"в пробе «{line.strip()}» {wrapper} — не отдельное слово команды: "
+            "разобрать такую пробу нельзя, и что она запускает, неизвестно"
+        )
+        tail = tokens[tokens.index(wrapper) + 1 :]
+        assert "$CMD" in tail, (
+            f"проба «{line.strip()}» запускает враппер БЕЗ дописанного argv "
+            f"CLI ПОЗИЦИОННЫМ аргументом, а хаб запускает песочницу именно "
+            f"так ({key[:-7]}CMD дописывается хвостом argv). Присваивание "
+            "перед командой или подача через heredoc сюда не годятся: "
+            "враппер получит пустой argv, и проба пройдёт там, где живой "
+            "запуск пойдёт другой командой"
+        )
+
+
+def test_the_recommended_sudo_recipe_still_checks_the_scratch_group(
+    monkeypatch, tmp_path
+) -> None:
+    """Рецепт ИЗ ДОКУМЕНТА прогоняется через not_ready(), а не через страж.
+
+    AC-2 проверяет sandbox_uid() прямым вызовом — и этого мало: решение о
+    запуске принимает not_ready(), а его единственная интеграционная проверка
+    кормили формой ``systemd-run --uid=``. Замер: вернуть в _uid_outside_group
+    разбор ТОЛЬКО ``--uid`` — sandbox_uid() на sudo остаётся верным, AC-2 и
+    AC-4 зелёные, весь набор зелёный (rc=0), а not_ready() на рецепте из
+    документа возвращает [] и прогон упирается в EACCES внутри чужого
+    процесса, где причину уже никто не назовёт (09.09.2026, находка машинного
+    ревью 2bdf3c910e8d581c). Ровно то же расхождение, что и на #1155: дверь
+    заперта по прямому вызову и открыта по дороге, которой ходят.
+
+    Форма берётся ИЗ ДОКУМЕНТА; подменяется только имя пользователя — оно на
+    машине проверки не заведено, а проверяется здесь не оно, а то, что
+    проверка вообще СРАБАТЫВАЕТ на рекомендованной форме записи.
+    """
+    key = config.brand.ENV_PREFIX + "LOCAL_REVIEW_SANDBOX"
+    recommended = [
+        line.split(key + "=", 1)[1]
+        for line in _DEPLOY_DOC.read_text().splitlines()
+        if key + "=" in line
+    ]
+    assert recommended, f"в {_DEPLOY_DOC.name} нет рекомендованной строки {key}="
+
+    import os
+
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "/bin/true")
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "token")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o2770)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(shared))
+
+    for sandbox in recommended:
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", sandbox)
+        named = local_reviewer.sandbox_uid()
+        assert named, (
+            f"в рекомендованной строке «{sandbox}» страж не видит пользователя"
+        )
+        # «nobody» есть на обеих системах, где это гоняется, и в группе
+        # каталога не состоит — как и в соседней проверке 45971e09.
+        probe = sandbox.replace(named, "nobody")
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", probe)
+        assert any("не состоит в группе" in r for r in local_reviewer.not_ready()), (
+            f"на рекомендованной форме «{probe}» not_ready() НЕ назвал "
+            "проблему с группой каталога прогонов: значит проверка, заведённая "
+            "ради 45971e09, на рецепте из документа молча не срабатывает — "
+            f"ровно как было до #1208. Вернулось: {local_reviewer.not_ready()}"
+        )
+
+
+async def test_the_queued_local_run_starts_with_a_live_access_code(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Код доступа обязан быть жив В МОМЕНТ СТАРТА прогона, а не сдачи.
+
+    Находка ревьюера Codex 11.09.2026 на ff5b518. Код чеканится в
+    ``prepare_review_order`` — то есть внутри HTTP-запроса автора, — а слот
+    хоста (``local_reviewer._HOST_BUDGET``) берётся уже в фоне, и ждать его
+    можно дольше, чем живёт код (``CHAT_PAIR_CODE_SECONDS``, на проде 300 с
+    против ревью в десятки минут). Второй в очереди стартовал бы с мёртвым
+    кодом: основной HTTP-канал отчёта ему не выкупить, и прогон сваливается
+    в слабый путь через stdout либо теряет отчёт вовсе.
+
+    Проверяется ТЕМ ЖЕ предикатом, которым живость кода судит сам
+    ``redeem_code`` (не redeem'ом: он потратил бы код), и ровно в тот момент,
+    когда хаб порождает процесс. Первый прогон проверяется вместе со вторым —
+    иначе починка очереди могла бы сломать нормальный путь.
+    """
+    import re
+    import time as _time
+
+    from hub.services import chat_pair
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-nope"}, "run": {"id": "r-nope"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _own_host_budget(monkeypatch)
+    # Прогон держит слот ДОЛЬШЕ, чем живёт код: на проде это 300 с против
+    # ревью в десятки минут, здесь — те же отношения в секундах.
+    monkeypatch.setattr(config, "CHAT_PAIR_CODE_SECONDS", 1)
+    _stub_reviewer(
+        monkeypatch,
+        tmp_path,
+        "import sys, time; sys.stdin.read(); time.sleep(2.5)",
+    )
+
+    alive: list[bool] = []
+    spawn = local_reviewer._spawn
+
+    async def _watching(prompt: str, workdir: str, limit: int, started: float):
+        found = re.search(r'"code":"([^"]+)"', prompt)
+        assert found, "в промте нет кода доступа — тогда судить не о чем"
+        rows = await db.execute_fetchall(
+            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? "
+            "AND redeemed_at IS NULL AND expires_at > datetime('now')",
+            (chat_pair.hash_pair_code(chat_pair.normalize_pair_code(found.group(1))),),
+        )
+        alive.append(bool(rows))
+        return await spawn(prompt, workdir, limit, started)
+
+    monkeypatch.setattr(local_reviewer, "_spawn", _watching)
+
+    began = _time.monotonic()
+    for slug in ("queued-first", "queued-second"):
+        await _submitted(
+            client,
+            db,
+            slug,
+            policy={"review": "dispatch"},
+            repo_name="mrpda/snip-portal",
+            forge="gitverse",
+        )
+    await wait_for_local_runs()
+
+    assert len(alive) == 2, f"оба прогона обязаны были стартовать: {alive}"
+    assert _time.monotonic() - began > config.CHAT_PAIR_CODE_SECONDS, (
+        "очередь оказалась короче срока жизни кода — тогда тест ничего не "
+        "измерил; удлините полезную нагрузку заглушки"
+    )
+    assert alive == [True, True], (
+        f"код доступа был мёртв на старте прогона: {alive}. Второй в очереди "
+        "не выкупит основной канал отчёта и свалится в слабый путь через "
+        "stdout — или потеряет отчёт вовсе"
+    )
+
+
+async def test_the_slot_prompt_mints_a_code_or_says_why_not(
+    db: aiosqlite.Connection, db_dsn: str, monkeypatch, caplog
+):
+    """Промт на слоте: либо свежий код, либо названная в журнале причина.
+
+    Журнал здесь единственный след того, что отчёт поедет слабым путём
+    (блоком в тексте прогона, #1036), и цена ложной строки высока в обе
+    стороны. «Кода не выдавали вовсе» — это открытый режим или отозванный
+    токен, и говорить там «код не выписать» значит звать оператора искать то,
+    чего не было. Молчать же о настоящей неудаче значит оставить слабый путь
+    незамеченным.
+
+    Заодно проверяется, что подмена доходит до базы обоими способами, как и
+    на проде: своим соединением по пути базы и на переданном живом
+    соединении.
+    """
+    import logging
+    import re
+
+    from hub.services import chat_pair
+    from hub.services.review_dispatch import _prompt_at_slot, instance_base_url
+
+    principal = await _local_principal(db, monkeypatch)
+    # Задача настоящая: код привязывается к ней внешним ключом, и выдуманный
+    # номер проверял бы отказ базы, а не поведение подмены.
+    task_id = await _node(db, title="слот", task_type="task", parent_id=None)
+    # Запись зафиксирована: второй путь до базы открывает СВОЁ соединение, и
+    # незакрытая транзакция фикстуры отдала бы ему «database is locked» —
+    # то есть тест мерил бы блокировку, а не подмену.
+    # Задача СТОИТ НА РЕВЬЮ своего поколения: код вида reviewer годен только
+    # против той сдачи, на которую выписан, и без этого «код выписан» нельзя
+    # было бы отличить от «кодом можно воспользоваться».
+    await db.execute(
+        "UPDATE tasks SET status='review', submission_generation=1 WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    base = instance_base_url().rstrip("/")
+    stale = "AH-11111111"
+    prompt = "шапка\n" + _delivery_block(task_id, stale, base) + "хвост\n"
+
+    async def _at_slot(db_path, live_db, **kw):
+        return await _prompt_at_slot(
+            db_path,
+            live_db,
+            prompt=kw.pop("prompt", prompt),
+            code=kw.pop("code", stale),
+            task_id=task_id,
+            generation=1,
+            principal_id=kw.pop("principal_id", principal),
+        )
+
+    with caplog.at_level(logging.WARNING, logger="hub.services.review_dispatch"):
+        assert await _at_slot(db_dsn, None, code="") == prompt, (
+            "промт без блока доставки трогать нечем"
+        )
+        assert await _at_slot("", None) == prompt, "базы нет — менять нечем"
+        assert caplog.records == [], (
+            "сказано о коде, которого не выдавали: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+        assert await _at_slot(db_dsn, None, principal_id=None) == prompt, (
+            "без принципала код не выписать — промт обязан остаться прежним"
+        )
+        assert await _at_slot(db_dsn, None, prompt="без блока") == "без блока", (
+            "блока доставки в промте нет — подменять нечего"
+        )
+
+    said = [r.getMessage() for r in caplog.records]
+    assert len(said) == 2, f"о каждой неудаче обязаны были сказать один раз: {said}"
+    assert all("stdout" in message for message in said), (
+        f"в журнале не названо следствие — отчёт поедет слабым путём: {said}"
+    )
+
+    for db_path, live in ((db_dsn, None), ("", db)):
+        produced = await _at_slot(db_path, live)
+        assert produced != prompt, (
+            f"промт не переписан (путь к базе {db_path!r}) — прогон унёс бы "
+            "код, который к этому времени может быть уже удалён сборщиком"
+        )
+        found = re.search(r'"code":"([^"]+)"', produced)
+        assert found and found.group(1) != stale, f"код не сменился: {produced[:200]}"
+        # Проверяется ВЫКУП, а не строка в таблице. Живая строка не значит
+        # годный код: reviewer-код приколот к задаче И К ПОКОЛЕНИЮ сдачи, и
+        # код, выписанный не на то поколение, лежит в базе живым, а на двери
+        # получает отказ — мутация «generation + 1» на проверке строки
+        # выживала, на выкупе гибнет.
+        assert await chat_pair.redeem_code(db, found.group(1)) is not None, (
+            "выписанный код не выкупается: ревьюер не войдёт в основной канал "
+            f"отчёта (путь к базе {db_path!r})"
+        )
+        assert prompt.replace(
+            _delivery_block(task_id, stale, base), ""
+        ) == produced.replace(_delivery_block(task_id, found.group(1), base), ""), (
+            "переписан не только блок доставки — промт обязан отличаться ровно кодом"
+        )
+
+
+async def test_a_purged_access_code_is_replaced_before_the_run_starts(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Код, который сборщик уже УДАЛИЛ, обязан быть заменён к старту прогона.
+
+    Находка ревьюера Codex 11.09.2026 на c6af952: продления мало. Пока прогон
+    стоит в очереди, по часовому кругу поллера отрабатывает ``purge_expired``,
+    и протухшую строку она не щадит — ``DELETE FROM chat_pair_codes WHERE
+    expires_at < datetime('now')``. Продлять тогда нечего, и второй в очереди
+    всё равно стартует с мёртвым кодом: основной канал отчёта не выкуплен,
+    прогон куплен впустую.
+
+    Гонка здесь ВОСПРОИЗВОДИТСЯ БЕЗ ЧАСОВ, а не подгадывается спячками.
+    Первый прогон, уже взявший слот, останавливается перед порождением
+    процесса и ждёт, пока вторая сдача встанет в очередь; тогда он состаривает
+    коды и гоняет сборщик — ровно тот порядок, что описан в находке, — и
+    только после этого отпускает себя. Время в этом тесте не участвует
+    вовсе, поэтому и флака в нём нет.
+    """
+    import re
+
+    from hub.services import chat_pair
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-nope"}, "run": {"id": "r-nope"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _own_host_budget(monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, "import sys; sys.stdin.read()")
+
+    queued = asyncio.Event()
+    purged: list[int] = []
+    alive: list[bool] = []
+    spawn = local_reviewer._spawn
+
+    async def _watching(prompt: str, workdir: str, limit: int, started: float):
+        found = re.search(r'"code":"([^"]+)"', prompt)
+        assert found, "в промте нет кода доступа — тогда судить не о чем"
+        rows = await db.execute_fetchall(
+            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? "
+            "AND redeemed_at IS NULL AND expires_at > datetime('now')",
+            (chat_pair.hash_pair_code(chat_pair.normalize_pair_code(found.group(1))),),
+        )
+        alive.append(bool(rows))
+        if not purged:
+            # Слот держит этот прогон, поэтому вторая сдача сейчас стоит в
+            # очереди — и её код доживает здесь свой срок ровно так, как
+            # дожил бы на проде.
+            await queued.wait()
+            await db.execute(
+                "UPDATE chat_pair_codes SET expires_at = datetime('now', '-1 hour')"
+            )
+            await db.commit()
+            purged.append(await chat_pair.purge_expired(db))
+        return await spawn(prompt, workdir, limit, started)
+
+    monkeypatch.setattr(local_reviewer, "_spawn", _watching)
+
+    for slug in ("purged-first", "purged-second"):
+        await _submitted(
+            client,
+            db,
+            slug,
+            policy={"review": "dispatch"},
+            repo_name="mrpda/snip-portal",
+            forge="gitverse",
+        )
+    queued.set()
+    await wait_for_local_runs()
+
+    assert purged and purged[0] >= 1, (
+        f"сборщик ничего не удалил ({purged}) — тогда тест не воспроизвёл "
+        "находку и зелен не за то"
+    )
+    assert len(alive) == 2, f"оба прогона обязаны были стартовать: {alive}"
+    assert alive == [True, True], (
+        f"прогон стартовал с кодом, которого в базе уже нет: {alive}. "
+        "Продления мало: сборщик протухшего УДАЛЯЕТ строку, и продлять "
+        "становится нечего — код к старту обязан быть выписан заново"
     )

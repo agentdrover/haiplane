@@ -637,6 +637,50 @@ def session_owned_by_other_detail(*, session_id: str) -> dict[str, Any]:
     )
 
 
+def session_address_conflict_detail(
+    *,
+    session_id: str,
+    registered: dict[str, str],
+    declared: dict[str, str],
+) -> dict[str, Any]:
+    """409 when a taken session_id is re-declared from another work address (#1288).
+
+    The owner check (#977) has already passed here, so both sides are the same
+    principal and naming the registered address leaks nothing across identities
+    — while NOT naming it would leave the caller unable to tell whether it hit
+    its own moved session or someone else's id. Only the fields that actually
+    differ are listed: the payload says what is in conflict, not everything the
+    registry knows.
+    """
+    differences = {
+        field: {"registered": registered.get(field, ""), "declared": value}
+        for field, value in declared.items()
+    }
+    named = "; ".join(
+        f"{field}: registered '{pair['registered']}', declared '{pair['declared']}'"
+        for field, pair in differences.items()
+    )
+    return enrich_error_payload(
+        {
+            "reason": "session_address_conflict",
+            "actor_hint": "agent",
+            "message": (
+                f"session '{session_id}' is already registered at another work "
+                f"address ({named})"
+            ),
+            "hint": (
+                "This session_id is taken by work at a different address. "
+                "Register your own id with "
+                "hub_session_register(session_id=...) instead of reusing one, "
+                "and reuse that id in hub_claim_task and hub_pair_start."
+            ),
+            "session_id": session_id,
+            "differences": differences,
+            "suggested_tool": "hub_session_register",
+        }
+    )
+
+
 def hierarchy_error_detail(
     raw_message: str,
     *,

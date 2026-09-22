@@ -13,6 +13,8 @@ from hub.services.dashboard import (
     list_tasks,
 )
 from hub.services.delivery_state import (
+    ObservationRefused,
+    record_delivery_observation,
     scan_completed_deliveries,
     task_delivery,
     undelivered_completed_tasks,
@@ -142,6 +144,8 @@ from hub.services.orchestration import (
     STACK_UNKNOWN_PREFIX,
     STACKED_BASE_PREFIX,
     STACKED_UNDETERMINED_PREFIX,
+    STRANDED_BASE_PREFIX,
+    UNPROBED_STRANDED_BASE_PREFIX,
     PR_DRAFT_WAIT_HINT,
     RECOVERABLE_GATE_PREFIXES,
     RESUBMIT_AFTER_FIX_HINT,
@@ -172,6 +176,9 @@ from hub.services.orchestration import (
     review_budget_exhausted,
     scan_text_for_verdict,
     transition_after_agent_done,
+    DeliveryPR,
+    pr_for_delivery,
+    resolve_delivery_pr,
 )
 
 __all__ = [
@@ -189,6 +196,8 @@ __all__ = [
     "STACK_UNKNOWN_PREFIX",
     "STACKED_BASE_PREFIX",
     "STACKED_UNDETERMINED_PREFIX",
+    "STRANDED_BASE_PREFIX",
+    "UNPROBED_STRANDED_BASE_PREFIX",
     "PR_DRAFT_WAIT_HINT",
     "RECOVERABLE_GATE_PREFIXES",
     "RESUBMIT_AFTER_FIX_HINT",
@@ -286,6 +295,9 @@ __all__ = [
     "maybe_destroy_vast",
     "charge_ci_fix_budget",
     "merge_before_completion",
+    "DeliveryPR",
+    "pr_for_delivery",
+    "resolve_delivery_pr",
     "stacking_gate_step",
     "request_missing_ci_run",
     "reorder_task",
@@ -302,6 +314,8 @@ __all__ = [
     "scan_completed_deliveries",
     "task_delivery",
     "undelivered_completed_tasks",
+    "record_delivery_observation",
+    "ObservationRefused",
     "project_git_context",
     "provision_project",
     "record_review_verdict",
