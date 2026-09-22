@@ -21,9 +21,15 @@ import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
+from hub.integrations.git_ops import MERGE_UNCONFIRMED
 from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 from hub.integrations.registry import plugins
+from hub.models import TaskStatus
 from hub.services.delivery_gate import undelivered_warning
+from hub.services.orchestration import (
+    STACK_UNKNOWN_PREFIX,
+    STACKED_BASE_PREFIX,
+)
 from hub.services.delivery_state import (
     DELIVERED,
     PR_CLOSED,
@@ -2477,3 +2483,205 @@ async def test_a_failed_replacement_search_waits_instead_of_calling_a_human(
     assert db.in_transaction is False, (
         "проход по этой ветке не должен оставлять соединение в открытой транзакции"
     )
+
+
+# ---- #1271: разбиение перечней, а не копия перечня ----
+#
+# Тест выше (test_every_status_that_owns_an_unmerged_branch_is_a_base) сверяет
+# STACK_DELIVERY_STATUSES с копией, выписанной руками: он ловит удаление члена,
+# но не заставляет решать про статус, о котором автор не подумал (#1186:
+# pending_report, его повтор, needs_info). Здесь перебирается TaskStatus
+# целиком: у каждого члена должно быть решение — либо он в перечне, либо
+# исключён с названной причиной, либо открыт находкой со ссылкой на драфт.
+
+# Статус исключён, и вот почему. Причина — наблюдение о коде, а не мнение.
+STACK_EXCLUDED_STATUSES: dict[str, str] = {
+    TaskStatus.draft.value: (
+        "не одобрена к работе: переходы из draft ведут только в open или "
+        "rejected, ветки задачи ещё нет, стопке не на чем стоять"
+    ),
+    TaskStatus.rejected.value: (
+        "reject_task отказывает всему, кроме draft — отклонённая задача ветки "
+        "не заводила"
+    ),
+    TaskStatus.completed.value: (
+        "принятая без доставки — не ожидание, а вопрос к человеку: обходится "
+        "отдельно через list_undelivered_completed_branch_tasks (#1204), "
+        "доставленная — стопки не образует"
+    ),
+}
+
+# Решения нет, и это находка на develop (#1271): статус достижим из running,
+# то есть задача в нём может владеть запушенной несмерженной веткой, а обход
+# стопки её не видит. Код в этой задаче не правится — драфт ниже.
+STACK_UNDECIDED_STATUSES: dict[str, str] = {
+    TaskStatus.needs_info.value: "драфт #1275: running → needs_info (hub_ask_question)",
+    TaskStatus.open.value: "драфт #1275: running → open (chat_pair_reaper), needs_info → open",
+    TaskStatus.claimed.value: "драфт #1275: open → claimed после возврата из running",
+    TaskStatus.failed.value: "драфт #1275: running → failed (упавший headless-прогон)",
+}
+
+
+def test_every_task_status_is_either_stacked_or_excluded_with_a_reason() -> None:
+    """#1271 AC-1: новый член TaskStatus без решения роняет этот тест.
+
+    Решение — одно из трёх: статус в STACK_DELIVERY_STATUSES, в словаре
+    исключённых с причиной, или в словаре открытых находок со ссылкой на
+    драфт. Члены берутся из перечисления, а не из головы — ровно та ошибка,
+    из-за которой pending_report и needs_info были упущены в #1186.
+    """
+    from hub.services.orchestration import STACK_DELIVERY_STATUSES
+
+    stacked = set(STACK_DELIVERY_STATUSES)
+    buckets = {
+        "STACK_DELIVERY_STATUSES": stacked,
+        "STACK_EXCLUDED_STATUSES": set(STACK_EXCLUDED_STATUSES),
+        "STACK_UNDECIDED_STATUSES": set(STACK_UNDECIDED_STATUSES),
+    }
+    members = {status.value for status in TaskStatus}
+
+    undecided = sorted(members - set().union(*buckets.values()))
+    assert not undecided, (
+        f"статус без решения: {undecided} — внесите его в "
+        "STACK_DELIVERY_STATUSES (может владеть несмерженной веткой) или в "
+        "STACK_EXCLUDED_STATUSES с причиной"
+    )
+    for name, bucket in buckets.items():
+        stale = sorted(bucket - members)
+        assert not stale, f"{name} называет статусы, которых нет в TaskStatus: {stale}"
+    names = list(buckets)
+    for i, left in enumerate(names):
+        for right in names[i + 1 :]:
+            both = sorted(buckets[left] & buckets[right])
+            assert not both, f"статус решён дважды ({left} и {right}): {both}"
+    for status, reason in {
+        **STACK_EXCLUDED_STATUSES,
+        **STACK_UNDECIDED_STATUSES,
+    }.items():
+        assert reason.strip(), f"исключение {status} без причины"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#1271 находка на develop, драфт #1275: статусы, достижимые "
+    "из running, не входят в STACK_DELIVERY_STATUSES и решения не имеют",
+)
+def test_undecided_stack_statuses_are_decided() -> None:
+    # Проверяет код, а не словарь: статус, достижимый из running, входит в
+    # обход стопки. Когда драфт это решит, strict уронит XPASS, а основной
+    # тест — «решён дважды», и словарь находок придётся убрать.
+    from hub.services.orchestration import STACK_DELIVERY_STATUSES
+
+    missing = sorted(set(STACK_UNDECIDED_STATUSES) - set(STACK_DELIVERY_STATUSES))
+    assert not missing, f"не решены: {missing}"
+
+
+# ---- #1271 AC-2: у каждого транзитного префикса своя подсказка ----
+
+# Префиксы, которым общая подсказка положена по смыслу: ключ делит подсказку
+# со значением, и сказано почему.
+TRANSIENT_SHARED_HINTS: dict[str, tuple[str, str]] = {
+    STACK_UNKNOWN_PREFIX: (
+        STACKED_BASE_PREFIX,
+        "повторяемый unknown стопки ждёт того же, что стопка: следующего цикла, "
+        "а не пересдачи; CI уже зелёный (#1186)",
+    ),
+}
+
+# Префиксы, чья подсказка унаследована от чужой ветки, — находка на develop.
+TRANSIENT_HINT_FINDINGS: dict[str, str] = {
+    MERGE_UNCONFIRMED: (
+        "драфт #1276: мерж состоялся, CI уже зелёный, а лесенка "
+        "done-flow говорит «отчитайтесь снова, когда CI станет зелёным»"
+    ),
+}
+
+
+async def _transient_hint(db: aiosqlite.Connection, monkeypatch, prefix: str) -> str:
+    """Подсказка, которую лесенка done-flow даёт отказу с этим префиксом."""
+    from hub.services import orchestration
+
+    task_id = await _approved_pair_task(db, pr_number=4242)
+    detail = f"{prefix}: проба #1271"
+
+    async def _refuse(db_, task_):
+        return False, detail
+
+    monkeypatch.setattr(orchestration, "merge_before_completion", _refuse)
+    task = dict(await repo.get_task(db, task_id))
+    outcome = await orchestration._deliver_completed_pair_task(
+        db, task, orchestration.DeliveryPR(number=4242)
+    )
+    assert outcome == "running", f"{prefix}: транзитный отказ обязан оставить running"
+    lead = f"Доставка отложена: PR #4242 — {detail}. "
+    alerts = [
+        dict(u)["content"] or ""
+        for u in await repo.get_task_updates(db, task_id)
+        if (dict(u)["content"] or "").startswith(lead)
+    ]
+    assert len(alerts) == 1, f"{prefix}: ожидалась одна нота ожидания, есть {alerts}"
+    return alerts[0][len(lead) :]
+
+
+async def test_every_transient_gate_prefix_has_its_own_hint(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1271 AC-2: префикс, добавленный без своей ветки подсказки, роняет тест.
+
+    #1186 ×2: STACKED_BASE и STACK_UNKNOWN попали в кортеж, а лесенка их не
+    знала — и они унаследовали фразу про CI, которая советовала пересдачу,
+    сбрасывающую вердикт. Правило: фраза про CI принадлежит префиксам CI
+    (ci_<CIProbeOutcome>, выводятся из перечисления), любой другой префикс
+    обязан получить иную подсказку, а общая подсказка двух не-CI префиксов
+    объявляется в TRANSIENT_SHARED_HINTS с причиной.
+    """
+    from hub.integrations.protocols import CIProbeOutcome
+    from hub.services.orchestration import TRANSIENT_GATE_PREFIXES
+
+    ci_family = {f"ci_{o.value}" for o in CIProbeOutcome}
+    hints = {
+        prefix: await _transient_hint(db, monkeypatch, prefix)
+        for prefix in TRANSIENT_GATE_PREFIXES
+    }
+    ci_hints = {hints[p] for p in TRANSIENT_GATE_PREFIXES if p in ci_family}
+    assert ci_hints, "в кортеже нет ни одного CI-префикса — правило не о чем"
+
+    for key in {*TRANSIENT_SHARED_HINTS, *TRANSIENT_HINT_FINDINGS}:
+        assert key in TRANSIENT_GATE_PREFIXES, f"{key!r} уже не в кортеже"
+
+    by_hint: dict[str, list[str]] = {}
+    for prefix in TRANSIENT_GATE_PREFIXES:
+        if prefix in ci_family or prefix in TRANSIENT_HINT_FINDINGS:
+            continue
+        assert hints[prefix] not in ci_hints, (
+            f"префикс {prefix!r} унаследовал подсказку CI: {hints[prefix]!r} — "
+            "дайте ему свою ветку в лесенке _deliver_completed_pair_task"
+        )
+        by_hint.setdefault(hints[prefix], []).append(prefix)
+
+    for hint, group in by_hint.items():
+        for prefix in group[1:]:
+            declared = TRANSIENT_SHARED_HINTS.get(prefix, ("", ""))
+            assert declared[0] in group and declared[1].strip(), (
+                f"префиксы {group} делят подсказку {hint!r}, а общая подсказка "
+                f"для {prefix!r} не объявлена в TRANSIENT_SHARED_HINTS с причиной"
+            )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#1271 находка на develop, драфт #1276: MERGE_UNCONFIRMED "
+    "получает в done-flow фразу про CI",
+)
+async def test_transient_hint_findings_are_resolved(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    from hub.integrations.protocols import CIProbeOutcome
+
+    ci_hint = await _transient_hint(
+        db, monkeypatch, f"ci_{CIProbeOutcome.pending.value}"
+    )
+    for prefix in TRANSIENT_HINT_FINDINGS:
+        assert await _transient_hint(db, monkeypatch, prefix) != ci_hint
