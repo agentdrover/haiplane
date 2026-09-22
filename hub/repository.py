@@ -490,11 +490,18 @@ async def list_unmerged_branch_tasks(
     exclude_task_id: int,
     statuses: list[str],
 ) -> list[aiosqlite.Row]:
-    """Active tasks (other than ``exclude_task_id``) that own a branch (#438)."""
+    """Active tasks (other than ``exclude_task_id``) that own a branch (#438).
+
+    ``submission_sha`` travels with the row (#1283): it is the hub's OWN
+    observation of ``origin/<branch>`` (``resolve_branch_tip``, #572), so an
+    empty value is what tells a branch nobody has pushed yet from a branch
+    that was on origin and is gone. The stacking walk reads it; callers that
+    do not care simply ignore the column.
+    """
     placeholders = ",".join("?" for _ in statuses)
     return await fetchall(
         db,
-        f"SELECT id, title, status, branch FROM tasks "  # nosec B608
+        f"SELECT id, title, status, branch, submission_sha FROM tasks "  # nosec B608
         f"WHERE archived=0 AND id != ? AND status IN ({placeholders}) "
         "AND branch IS NOT NULL AND TRIM(branch) != '' ORDER BY id",
         (exclude_task_id, *statuses),
