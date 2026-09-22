@@ -329,3 +329,241 @@ async def test_the_marker_separates_a_top_up_from_the_first_order():
     top_up = cursor_cloud.agent_marker("review", 1199, 1, 2)
     assert first != top_up
     assert cursor_cloud.agent_marker("review", 1199, 1, 1) == first
+
+
+# --- #1206: подбор по имени держится на поле, которого может не быть ------
+
+
+class _Pages:
+    """Подставка страниц списка агентов.
+
+    Форма ответа — `items` и `nextCursor`, как у настоящего API (проверено
+    вызовом 06.09.2026 и записано в докстроке list_agents).
+    """
+
+    def __init__(self, pages: list[list[object]]):
+        self.pages = pages
+        self.calls = 0
+
+    async def __call__(self, limit: int = 50, cursor: str = ""):
+        self.calls += 1
+        index = int(cursor or 0)
+        if index >= len(self.pages):
+            return {"items": [], "nextCursor": ""}
+        nxt = str(index + 1) if index + 1 < len(self.pages) else ""
+        return {"items": self.pages[index], "nextCursor": nxt}
+
+
+async def test_a_listing_without_the_name_field_is_not_a_confirmed_absence(
+    monkeypatch, caplog
+):
+    """#1206 AC-2: элементы без поля name — «спросить не удалось».
+
+    Весь подбор сравнивает item['name'] с меткой. Если провайдер имя не
+    возвращает, обход не найдёт ничего НИКОГДА, а прежний код называл это
+    подтверждённой пустотой — тем самым разрешением купить второго
+    оплаченного агента. Отсутствие поля не есть отсутствие агента (#762).
+    """
+    pages = _Pages([[{"id": "bc-1", "createdAt": "2026-09-09T00:00:00Z"}]])
+    monkeypatch.setattr(cursor_cloud, "list_agents", pages)
+
+    with caplog.at_level("WARNING"):
+        seen = await cursor_cloud.find_agent_by_name("haiplane:review:t1206:g1:a1")
+
+    assert seen.asked is False, (
+        "ответ без поля name неотличим от «агента нет» — значит, спросить "
+        "не удалось, ровно как на теле не той формы"
+    )
+    assert seen.agent_id == "" and seen.run_id == ""
+    assert "1 agents listed, 0 carry a name" in caplog.text, (
+        "лог обязан различать два мира: поля нет вовсе (0 named) против "
+        "поле есть, но метка в нём не выжила — живого замера у нас нет, и "
+        "эта запись его заменяет"
+    )
+    assert "unproven" in caplog.text, "молчащее поле обязано быть названо в логе"
+
+
+async def test_an_empty_listing_is_still_a_confirmed_absence(monkeypatch):
+    """#1206: пустой список остаётся «агента нет» — это не поломано.
+
+    Без этого граница повтор после подтверждённой пустоты (#1199 AC-2)
+    перестал бы существовать, и каждый обрыв уходил бы к человеку.
+    """
+    pages = _Pages([[]])
+    monkeypatch.setattr(cursor_cloud, "list_agents", pages)
+
+    seen = await cursor_cloud.find_agent_by_name("haiplane:review:t1206:g1:a1")
+
+    assert seen.asked is True, "спросили и получили ответ: агентов нет"
+    assert seen.agent_id == ""
+
+
+async def test_a_named_neighbour_still_answers_for_the_whole_page(monkeypatch):
+    """#1206: поле есть хотя бы у одного — страница прочитана.
+
+    Чужой агент без имени рядом с нашим не должен превращать удачный
+    подбор в «спросить не удалось»: иначе новое правило съело бы сам путь.
+    """
+    marker = "haiplane:review:t1206:g1:a1"
+    pages = _Pages(
+        [
+            [
+                {"id": "bc-anon"},
+                {"id": "bc-mine", "name": marker, "latestRunId": "run-9"},
+            ]
+        ]
+    )
+    monkeypatch.setattr(cursor_cloud, "list_agents", pages)
+
+    seen = await cursor_cloud.find_agent_by_name(marker)
+
+    assert seen == cursor_cloud.Reconciliation("bc-mine", "run-9", True)
+
+
+# --- #1206: имя есть, но чужое — наблюдённая форма ------------------------
+
+
+async def test_foreign_names_are_not_a_confirmed_absence(monkeypatch, caplog):
+    """#1206: страница с чужими именами не доказывает, что метка дожила.
+
+    Форма, наблюдённая 06.09: у осиротевших агентов поле name БЫЛО, а
+    значения провайдер придумал из промта («Суждение стюарда гейта»,
+    «Код-ревью задачи haiplane») — см. комментарий у AGENT_MARKER_PREFIX.
+    Страж «ключа name нет ни у кого» на такой странице не срабатывает:
+    имена есть. Сверка на равенство не находит метку и заканчивается
+    подтверждённой пустотой — тем самым разрешением купить второго.
+
+    Различить два мира — «провайдер метку не сохранил» и «нашего агента
+    правда нет» — по такой странице НЕЛЬЗЯ: в обоих метка не встречается
+    ни разу. Значит, спросить не удалось.
+    """
+    pages = _Pages(
+        [
+            [
+                {"id": "bc-1", "name": "Суждение стюарда гейта"},
+                {"id": "bc-2", "name": "Код-ревью задачи haiplane"},
+            ]
+        ]
+    )
+    monkeypatch.setattr(cursor_cloud, "list_agents", pages)
+
+    with caplog.at_level("WARNING"):
+        seen = await cursor_cloud.find_agent_by_name("haiplane:review:t1206:g1:a1")
+
+    assert seen.asked is False, (
+        "ни одно имя не несёт нашей метки — round-trip не подтверждён, "
+        "и «не нашли» здесь неотличимо от «имя не сохраняется»"
+    )
+    assert seen.agent_id == "" and seen.run_id == ""
+    assert "2 agents listed, 2 carry a name" in caplog.text, (
+        "мир «поле есть, метка не выжила» обязан быть отличим в логе от "
+        "мира «поля нет вовсе»: другого замера round-trip у нас нет"
+    )
+    assert "marker" in caplog.text, "непроверенный round-trip обязан быть назван"
+
+
+async def test_the_marker_is_recognised_by_prefix_not_by_substring(monkeypatch):
+    """#1206: «Код-ревью задачи haiplane» — не метка.
+
+    Признак своего заказа — начало строки `haiplane:`, а не слово
+    «haiplane» где-то внутри: автоимя из промта почти всегда упоминает
+    проект, и вхождение объявило бы round-trip доказанным по чужой
+    строке. Тогда страж умер бы ровно там, где он нужен.
+    """
+    pages = _Pages([[{"id": "bc-1", "name": "haiplane review of task 1206"}]])
+    monkeypatch.setattr(cursor_cloud, "list_agents", pages)
+
+    seen = await cursor_cloud.find_agent_by_name("haiplane:review:t1206:g1:a1")
+
+    assert seen.asked is False, "упоминание проекта в чужом имени ничего не доказывает"
+
+
+async def test_an_empty_name_value_is_not_evidence(monkeypatch):
+    """#1206: ключ есть, значения нет — доказательства тоже нет.
+
+    `name: ""` и `name: null` проходят проверку «ключ на месте», но
+    сравнивать с меткой в них нечего. Считать такую страницу прочитанной
+    значило бы вернуть подтверждённую пустоту на пустом месте.
+    """
+    pages = _Pages([[{"id": "bc-1", "name": ""}, {"id": "bc-2", "name": None}]])
+    monkeypatch.setattr(cursor_cloud, "list_agents", pages)
+
+    seen = await cursor_cloud.find_agent_by_name("haiplane:review:t1206:g1:a1")
+
+    assert seen.asked is False, "пустое имя не отличает наш заказ от чужого"
+
+
+async def test_a_marker_of_another_order_confirms_the_absence(monkeypatch):
+    """#1206: чужая НАША метка на странице — доказательство round-trip.
+
+    Если провайдер вернул метку соседнего поколения или другой задачи,
+    значит поле переживает создание. Тогда «нашей метки здесь нет» —
+    настоящий ответ, и повтор после подтверждённой пустоты (#1199 AC-2)
+    остаётся живым. Иначе новое правило съело бы весь путь повтора.
+    """
+    pages = _Pages(
+        [
+            [
+                {
+                    "id": "bc-other",
+                    "name": cursor_cloud.agent_marker("review", 1198, 1),
+                },
+                {"id": "bc-alien", "name": "Суждение стюарда гейта"},
+            ]
+        ]
+    )
+    monkeypatch.setattr(cursor_cloud, "list_agents", pages)
+
+    seen = await cursor_cloud.find_agent_by_name("haiplane:review:t1206:g1:a1")
+
+    assert seen.asked is True, "метка дожила у соседа — значит спросить удалось"
+    assert seen.agent_id == "", "нашего агента нет, и это сказано прямо"
+
+
+async def test_a_marker_on_a_later_page_still_answers(monkeypatch):
+    """#1206: доказательство round-trip копится по всем прочитанным страницам.
+
+    Первая страница может целиком состоять из чужих имён — список идёт
+    newest-first, и свежие заказы могли быть не наши. Обрывать обход на
+    ней значило бы уходить в blind там, где ответ есть страницей ниже.
+    """
+    marker = "haiplane:review:t1206:g1:a1"
+    pages = _Pages(
+        [
+            [{"id": "bc-alien", "name": "Суждение стюарда гейта"}],
+            [{"id": "bc-mine", "name": marker, "latestRunId": "run-7"}],
+        ]
+    )
+    monkeypatch.setattr(cursor_cloud, "list_agents", pages)
+
+    seen = await cursor_cloud.find_agent_by_name(marker)
+
+    assert seen == cursor_cloud.Reconciliation("bc-mine", "run-7", True)
+    assert pages.calls == 2, "вторая страница обязана быть прочитана"
+
+
+async def test_a_marker_seen_on_an_earlier_page_still_answers(monkeypatch):
+    """#1206: доказательство round-trip не сгорает на следующей странице.
+
+    Метка нашей формы, встреченная на первой странице, доказывает, что
+    поле переживает создание, — и продолжает доказывать это на второй.
+    Если бы признак пересчитывался с нуля на каждой странице, обход
+    последней страницы с чужими именами уводил бы в blind даже там, где
+    round-trip уже подтверждён этим же ответом, и повтор после
+    подтверждённой пустоты (#1199 AC-2) исчезал бы от одной чужой строки.
+    """
+    pages = _Pages(
+        [
+            [{"id": "bc-old", "name": cursor_cloud.agent_marker("review", 1198, 1)}],
+            [{"id": "bc-alien", "name": "Суждение стюарда гейта"}],
+        ]
+    )
+    monkeypatch.setattr(cursor_cloud, "list_agents", pages)
+
+    seen = await cursor_cloud.find_agent_by_name("haiplane:review:t1206:g1:a1")
+
+    assert pages.calls == 2, "обход обязан дойти до конца"
+    assert seen.asked is True, (
+        "метка дожила на первой странице — round-trip доказан для всего ответа"
+    )
+    assert seen.agent_id == "", "нашего агента нет, и это сказано прямо"

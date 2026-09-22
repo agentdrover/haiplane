@@ -37,6 +37,7 @@ from hub.services.recommendations import calculate_readiness_with_recommendation
 from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
 from hub.services.test_locator import validate_test_locators
+from hub.services.live_probe import validate_declared_probe
 
 
 # Statuses where the Definition of Ready gate still applies. DoR is a
@@ -79,6 +80,11 @@ STATEMENT_FIELDS = frozenset(
         "validation_commands",
         "out_of_scope_for_review",
         "review_checklist",
+        # #1236: какое поведение наблюдать после доставки — это часть того, что
+        # задача утверждает, а не бухгалтерия вокруг неё. Правка объявления
+        # пере-штампует дату постановки по той же причине, что и правка
+        # problem_statement: изменилось то, на чём задача стоит.
+        "live_probe",
         "risks",
         "acceptance_criteria",
     }
@@ -334,6 +340,16 @@ async def _apply_refine_writes(
             payload.acceptance_criteria,
             enforce=config.SDD_AC_LOCATOR == "require",
         )
+
+    if payload.live_probe is not None:
+        # #1236: объявление живого зонда проверяется ЗДЕСЬ, а не у исполнителя.
+        # Здесь сходятся оба пути записи постановки — одиночный refine и
+        # массовый, — и второй набор условий разошёлся бы с первым, а
+        # настоящим стал бы слабейший (#519). Отказ до записи означает, что
+        # имени вне закрытого реестра в колонке не бывает вовсе: исполнение
+        # проверит это ещё раз, но не потому, что первой проверки могло не
+        # быть, а потому что реестр правят руками.
+        validate_declared_probe(payload.live_probe)
 
     # #616: both the single and the bulk flow funnel through here, so the
     # statement date is stamped in ONE place — verified by enumerating every

@@ -2690,6 +2690,10 @@ async def test_the_sweep_order_is_pinned(db):
         "stale_statuses",
         "unrefined_drafts",
         "human_queue",
+        # #1171: сторож очереди находок стоит РЯДОМ с человеческой очередью и
+        # ДО дайджеста — секция дайджеста читает уже поднятое этим проходом
+        # событие, а не гадает о нём.
+        "unjudged_findings",
         "autopilot_digests",
         "delivery_discrepancies",
         "review_dispatches",

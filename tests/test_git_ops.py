@@ -2733,3 +2733,330 @@ async def test_unknown_mergeability_still_is_not_a_conflict() -> None:
     assert outcome is MergeabilityOutcome.unknown
     assert "не посчитал" in detail
     forge.pr_refs.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Трёхточечный дифф по голому имени базы (#1239)
+# ---------------------------------------------------------------------------
+#
+# Настоящий git, а не мок: предмет проверки — то, ЧТО ИМЕННО git отвечает на
+# два разных имени одной базы, и мок ответил бы то, что в него положили.
+# Клон строится ровно тот, в котором ошибка и живёт: общий клон хаба, где
+# локальный ``develop`` отстаёт от ``origin/develop`` — локальную ветку не
+# двигает никто, фетч трогает remote-ветку.
+
+
+def _lagging_clone(tmp_path):
+    """Клон с отставшим локальным develop. Возвращает (клон, sha, что менялось).
+
+    Наблюдение, ради которого фикстура существует (снято руками до правки):
+    для одного и того же коммита ``git diff --name-only develop...<sha>``
+    и ``origin/develop...<sha>`` дают РАЗНЫЕ списки файлов, потому что у них
+    разные merge-base.
+    """
+    origin = tmp_path / "origin.git"
+    _run_git("git", "init", "--bare", "-b", "develop", str(origin), cwd=tmp_path)
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _run_git("git", "clone", str(origin), str(seed), cwd=tmp_path)
+    _run_git("git", "config", "user.email", "t@e", cwd=seed)
+    _run_git("git", "config", "user.name", "t", cwd=seed)
+    (seed / "base.txt").write_text("base\n")
+    _run_git("git", "add", "-A", cwd=seed)
+    _run_git("git", "commit", "-qm", "baseline", cwd=seed)
+    _run_git("git", "branch", "-M", "develop", cwd=seed)
+    _run_git("git", "push", "-q", "origin", "develop", cwd=seed)
+
+    # Клон хаба снимается ЗДЕСЬ: его локальный develop навсегда останется на
+    # этой точке, что бы дальше ни делала база.
+    clone = tmp_path / "hub-clone"
+    _run_git("git", "clone", str(origin), str(clone), cwd=tmp_path)
+    _run_git("git", "config", "user.email", "t@e", cwd=clone)
+    _run_git("git", "config", "user.name", "t", cwd=clone)
+
+    # База уезжает вперёд ЧУЖОЙ работой — этого файла в сдаче нет.
+    (seed / "someone-else.txt").write_text("not mine\n")
+    _run_git("git", "add", "-A", cwd=seed)
+    _run_git("git", "commit", "-qm", "somebody else", cwd=seed)
+    _run_git("git", "push", "-q", "origin", "develop", cwd=seed)
+
+    # Сдача снимается с НОВОЙ базы и меняет один файл.
+    _run_git("git", "checkout", "-qb", "task-1239/probe", cwd=seed)
+    (seed / "mine.txt").write_text("mine\n")
+    _run_git("git", "add", "-A", cwd=seed)
+    _run_git("git", "commit", "-qm", "the submission", cwd=seed)
+    import subprocess
+
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=seed, capture_output=True, text=True
+    ).stdout.strip()
+    _run_git("git", "push", "-q", "origin", "task-1239/probe", cwd=seed)
+    _run_git("git", "fetch", "-q", "origin", cwd=clone)
+    return clone, sha, seed
+
+
+async def test_the_card_diff_resolves_its_base_against_origin(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """AC-1, место 1: ``commit_diff`` считает против origin/<база> (#1239).
+
+    До правки имена интерполировались как есть, и в этом клоне голое имя
+    ``develop`` указывает на точку ДО чужого коммита: дифф приезжал с
+    ``someone-else.txt`` внутри, то есть человек на гейте видел в сдаче
+    файл, которого сдача не трогала. Мутация «вернуть ``f"{base}...{sha}"``»
+    роняет ровно этот assert.
+    """
+    clone, sha, _ = _lagging_clone(tmp_path)
+
+    diff = await git_ops.commit_diff(str(clone), "develop", sha)
+
+    assert diff is not None
+    assert "mine.txt" in diff
+    assert "someone-else.txt" not in diff
+
+
+async def test_the_change_map_resolves_its_base_against_origin(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """AC-1, место 2: ``commit_diff_stat`` — своя проверка, не общая (#1239).
+
+    Отдельным тестом намеренно: у карточки два вычисления, карта изменений
+    считается своим вызовом, и «починили одно — значит оба» — ровно та
+    посылка, из-за которой эта задача и заведена. Мутация в
+    ``commit_diff_stat`` роняет этот тест и НЕ трогает предыдущий.
+    """
+    clone, sha, _ = _lagging_clone(tmp_path)
+
+    rows = await git_ops.commit_diff_stat(str(clone), "develop", sha)
+
+    assert rows is not None
+    assert [path for _, _, path in rows] == ["mine.txt"]
+
+
+async def test_an_empty_card_diff_is_asked_whether_the_commit_is_merged(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """AC-1/AC-2, детектор: пустой дифф допрашивается, а не показывается (#1239).
+
+    И вопрос задаётся ТОЙ ЖЕ вершине, против которой дифф посчитан. Голое имя
+    здесь ответило бы «не предок» (локальный develop отстал), то есть
+    коллапс остался бы неопознанным — это и есть мутация, которую тест ловит.
+    """
+    clone, sha, seed = _lagging_clone(tmp_path)
+    # Сдача доставлена: коммит уезжает в историю базы.
+    _run_git("git", "checkout", "-q", "develop", cwd=seed)
+    _run_git(
+        "git", "merge", "-q", "--no-ff", "-m", "deliver", "task-1239/probe", cwd=seed
+    )
+    _run_git("git", "push", "-q", "origin", "develop", cwd=seed)
+    _run_git("git", "fetch", "-q", "origin", cwd=clone)
+
+    # Дифф теперь действительно схлопнулся — это наблюдение, а не посылка.
+    assert await git_ops.commit_diff(str(clone), "develop", sha) == ""
+    assert await git_ops.commit_diff_stat(str(clone), "develop", sha) == []
+
+    assert await git_ops.commit_in_base_history(str(clone), "develop", sha) is True
+
+
+async def test_a_commit_still_outside_the_base_is_not_called_merged(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """Три ответа, а не два: «не предок» обязан остаться «не предок» (#1239)."""
+    clone, sha, _ = _lagging_clone(tmp_path)
+
+    assert await git_ops.commit_in_base_history(str(clone), "develop", sha) is False
+
+
+async def test_an_unreadable_origin_is_named_not_silently_downgraded(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """AC-3: нечитаемо — это None, а не пустой дифф и не откат на голое имя.
+
+    Два входа в одну дыру: репозитория нет вовсе, и база не резолвится ни
+    origin-первым именем, ни голым. Пустая строка и пустой список читаются
+    как «изменений нет» — именно поэтому ни одна из трёх функций их здесь не
+    возвращает.
+    """
+    nowhere = tmp_path / "not-a-repo"
+    nowhere.mkdir()
+
+    assert await git_ops.commit_diff(str(nowhere), "develop", "deadbee") is None
+    assert await git_ops.commit_diff_stat(str(nowhere), "develop", "deadbee") is None
+    assert (
+        await git_ops.commit_in_base_history(str(nowhere), "develop", "deadbee") is None
+    )
+
+    clone, sha, _ = _lagging_clone(tmp_path)
+    assert await git_ops.commit_diff(str(clone), "no-such-base", sha) is None
+    assert await git_ops.commit_diff_stat(str(clone), "no-such-base", sha) is None
+    assert await git_ops.commit_in_base_history(str(clone), "no-such-base", sha) is None
+
+
+async def test_a_clone_without_origin_still_gets_the_collapse_named(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """Граница отката, названная вслух (#1239).
+
+    ``_resolve_ref_remote_first`` откатывается на локальное имя, когда
+    ``origin/<имя>`` не существует ВОВСЕ — иначе клон без remote перестал бы
+    читаться. Молчаливым этот откат здесь быть не может: дифф и вопрос о
+    предке идут через один и тот же ``_diff_ends``, поэтому спрашивается
+    ровно та вершина, против которой дифф посчитан, и коллапс называется
+    даже там, где origin нет.
+    """
+    local = _seed_repo(tmp_path)
+    _run_git("git", "checkout", "-qb", "develop", cwd=local)
+    _run_git("git", "checkout", "-qb", "feature", cwd=local)
+    (local / "app.py").write_text("changed\n")
+    _run_git("git", "commit", "-aqm", "work", cwd=local)
+    import subprocess
+
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=local, capture_output=True, text=True
+    ).stdout.strip()
+    _run_git("git", "checkout", "-q", "develop", cwd=local)
+    _run_git("git", "merge", "-q", "--no-ff", "-m", "deliver", "feature", cwd=local)
+
+    assert await git_ops.commit_diff(str(local), "develop", sha) == ""
+    assert await git_ops.commit_in_base_history(str(local), "develop", sha) is True
+
+
+# ---- #1271 AC-3: докстринг branch_ancestry называет каждый исход ----
+#
+# #1193: докстринг перечислял 4 исхода из 5 — same_tip добавили в константы,
+# а в текст, по которому вызывающий решает, как формулировать ответ, нет.
+# Исходы берутся из модуля по префиксу имени, а не выписываются здесь: новый
+# STACK_ANCESTRY_* без упоминания в докстринге роняет тест сам.
+#
+# «Назван» значит буквально: имя константы или значение литералом — в
+# бэктиках (``unknown``) или в кавычках ("unknown"). Слово английской фразы
+# именем исхода не становится, даже если стоит в самом предложении-перечне:
+# «Returns one of …: the two are unrelated by ancestry …, or the question
+# could not be answered» — это проза, и значения `ancestry`, `answered`,
+# `unrelated` по ней не сверить (#1271, находка ba85e024). Пересказ («the head
+# is the descendant») не считается по той же причине.
+#
+# Исходы, которые докстринг на develop не называет, — находка (#1271), код в
+# этой задаче не правится. Ключ — имя константы, значение — ссылка на драфт.
+BRANCH_ANCESTRY_UNNAMED_FINDINGS: dict[str, str] = {
+    "STACK_ANCESTRY_HEAD_IS_DESCENDANT": "драфт #1277: только пересказом",
+    "STACK_ANCESTRY_HEAD_IS_ANCESTOR": "драфт #1277: только пересказом",
+    "STACK_ANCESTRY_SAME_TIP": "драфт #1277: не назван вовсе (#1193)",
+    "STACK_ANCESTRY_UNRELATED": "драфт #1277: только словом фразы, не литералом",
+}
+
+
+def _ancestry_outcomes() -> dict[str, str]:
+    from hub.integrations import git_ops
+
+    return {
+        name: getattr(git_ops, name)
+        for name in dir(git_ops)
+        if name.startswith("STACK_ANCESTRY_")
+    }
+
+
+def _outcomes_not_named_in(doc: str, outcomes: dict[str, str]) -> list[str]:
+    """Исходы, которых докстринг не называет ни константой, ни литералом.
+
+    Токен перечня — имя константы или значение в бэктиках либо кавычках.
+    Слово английской фразы токеном не является: значение, совпавшее со словом
+    предложения «Returns one of …», названным не считается.
+    """
+    import re
+
+    return sorted(
+        name
+        for name, value in outcomes.items()
+        if name not in doc
+        and not re.search(
+            rf"``{re.escape(value)}``|`{re.escape(value)}`"
+            rf"|\"{re.escape(value)}\"|'{re.escape(value)}'",
+            doc,
+        )
+    )
+
+
+def _unnamed_ancestry_outcomes() -> list[str]:
+    return _outcomes_not_named_in(
+        GitOpsIntegration.branch_ancestry.__doc__ or "", _ancestry_outcomes()
+    )
+
+
+def test_only_a_constant_or_a_literal_names_an_outcome() -> None:
+    """#1271: значение, совпавшее со словом английской фразы, считалось названным.
+
+    Сначала (находка прошлого круга) засчитывались слова пересказа вокруг
+    перечня — order, first, symmetric, stacked, head, side. Потом (находка
+    ba85e024) — слова самого предложения-перечня: `ancestry` и `answered`
+    стоят в нём как пересказ чужого исхода, и новый STACK_ANCESTRY_* с таким
+    значением проходил незамеченным. Названным считается только токен: имя
+    константы или значение литералом.
+    """
+    doc = (
+        "Which of two branches stands on the other.\n\n"
+        "The answer is symmetric, and the advisory named the merge order from "
+        "whichever task submitted first, so it flipped to the other side; a "
+        "stacked pair reads true in either direction.\n\n"
+        "Returns one of ``STACK_ANCESTRY_*``: the head is the descendant (the "
+        "other branch merges first), the two are unrelated by ancestry (no "
+        "order to name), or the question could not be answered; an "
+        "unresolvable ref is ``unknown``.\n"
+    )
+    outcomes = {
+        "STACK_ANCESTRY_UNKNOWN": "unknown",  # литерал — назван
+        "STACK_ANCESTRY_UNRELATED": "unrelated",  # слово перечня — нет
+        "STACK_ANCESTRY_ANCESTRY": "ancestry",  # слово перечня — нет
+        "STACK_ANCESTRY_ANSWERED": "answered",  # слово перечня — нет
+        "STACK_ANCESTRY_ORDER": "order",  # пересказ вокруг перечня — нет
+        "STACK_ANCESTRY_FIRST": "first",
+        "STACK_ANCESTRY_SYMMETRIC": "symmetric",
+        "STACK_ANCESTRY_STACKED": "stacked",
+        "STACK_ANCESTRY_SIDE": "side",
+        "STACK_ANCESTRY_HEAD": "head",
+    }
+    assert _outcomes_not_named_in(doc, outcomes) == [
+        "STACK_ANCESTRY_ANCESTRY",
+        "STACK_ANCESTRY_ANSWERED",
+        "STACK_ANCESTRY_FIRST",
+        "STACK_ANCESTRY_HEAD",
+        "STACK_ANCESTRY_ORDER",
+        "STACK_ANCESTRY_SIDE",
+        "STACK_ANCESTRY_STACKED",
+        "STACK_ANCESTRY_SYMMETRIC",
+        "STACK_ANCESTRY_UNRELATED",
+    ]
+
+
+def test_branch_ancestry_docstring_names_every_outcome() -> None:
+    """#1271 AC-3: исход STACK_ANCESTRY_*, не названный в докстринге, роняет тест."""
+    outcomes = _ancestry_outcomes()
+    assert outcomes, "в git_ops нет ни одной STACK_ANCESTRY_* — проверять нечего"
+    stale = sorted(set(BRANCH_ANCESTRY_UNNAMED_FINDINGS) - set(outcomes))
+    assert not stale, f"находки называют исходы, которых нет в git_ops: {stale}"
+
+    unnamed = [
+        name
+        for name in _unnamed_ancestry_outcomes()
+        if name not in BRANCH_ANCESTRY_UNNAMED_FINDINGS
+    ]
+    assert not unnamed, (
+        f"докстринг GitOpsIntegration.branch_ancestry не называет исходы "
+        f"{unnamed} — вызывающий решает по этому тексту, как формулировать ответ"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#1271 находка на develop, драфт #1277: докстринг branch_ancestry "
+    "не называет head_is_descendant, head_is_ancestor, same_tip; после "
+    "сужения правила до токенов перечня (ba85e024) — и unrelated, которое "
+    "стоит в докстринге словом фразы, а не литералом",
+)
+def test_branch_ancestry_unnamed_findings_are_resolved() -> None:
+    still = sorted(
+        set(_unnamed_ancestry_outcomes()) & set(BRANCH_ANCESTRY_UNNAMED_FINDINGS)
+    )
+    assert not still, f"всё ещё не названы: {still}"
