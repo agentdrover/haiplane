@@ -3881,9 +3881,11 @@ async def upsert_agent_session(
     not quietly erase what the registry knows.
 
     ON CONFLICT does not overwrite another principal's ``principal_id`` or
-    ``agent`` (#977). A WHERE miss leaves the existing row as-is so a raced
-    register cannot steal the address between the service's owner check and
-    this write.
+    ``agent`` (#977), and does not move a declared ``host`` or ``workspace``
+    that contradicts the stored one (#1288). A WHERE miss leaves the existing
+    row as-is so a raced register cannot steal the address between the
+    service's checks and this write — the same-principal collision that made
+    a task's ``claim_session_id`` point at another machine's worktree.
     """
     await db.execute(
         "INSERT INTO agent_sessions "
@@ -3900,8 +3902,15 @@ async def upsert_agent_session(
         "  workspace    = CASE WHEN excluded.workspace = '' "
         "                 THEN agent_sessions.workspace ELSE excluded.workspace END, "
         "  last_seen_at = datetime('now') "
-        "WHERE agent_sessions.principal_id IS NULL "
-        "   OR agent_sessions.principal_id = excluded.principal_id",
+        "WHERE (agent_sessions.principal_id IS NULL "
+        "       OR agent_sessions.principal_id = excluded.principal_id) "
+        # An empty declaration is "not declared" and an empty stored value is
+        # "unknown": neither is a different address, so both stay writable.
+        "  AND (excluded.host = '' OR COALESCE(agent_sessions.host, '') = '' "
+        "       OR agent_sessions.host = excluded.host) "
+        "  AND (excluded.workspace = '' "
+        "       OR COALESCE(agent_sessions.workspace, '') = '' "
+        "       OR agent_sessions.workspace = excluded.workspace)",
         (session_id, principal_id, agent, model, host, workspace),
     )
 
