@@ -1670,3 +1670,80 @@ async def test_a_finished_dispatch_without_a_report_does_not_defer(
 
     assert await order_due_runs(db) == 1
     assert await open_run(db, task_id, 1) is not None
+
+
+async def test_a_second_door_debt_without_a_report_defers_too(
+    db: aiosqlite.Connection,
+):
+    """#1289, находка bec6db75314abd83: долг второй двери — тоже «ещё идёт».
+
+    ``second_door`` не состояние прогона, а ДОЛГ: облачный прогон кончился
+    без отчёта, строка нарочно оставлена открытой, чтобы свип пришёл и
+    открыл вторую дверь. Пока долг не отдан, отчёта этой сдачи нет — и
+    купленный здесь прогон стюарда прочитал бы ровно то же отсутствие и
+    эскалировал бы по no_current_report, не начав судить. Постановка так и
+    определяет активный заказ: ``active`` ИЛИ ``second_door``.
+
+    Вечной отсрочки это не создаёт: долг закрывает ``_settle_second_door``
+    — либо второй дверью (новый заказ, ``active``), либо ``failed``, а
+    ``failed`` прогон покупает (тест выше).
+    """
+    project_id = await _project(db, "steward-second-door", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    await _dispatch(db, task_id, status="second_door")
+
+    assert await order_due_runs(db) == 0
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE task_id=?", (task_id,))
+    assert list(rows) == [], "долг второй двери не смеет оставлять строку прогона"
+    assert await runs_today(db, project_id) == 0, "квота на отложенный заказ потрачена"
+    deferrals = await _events(db, EVENT_DEFERRED)
+    assert len(deferrals) == 1
+    payload = json.loads(deferrals[0]["payload"])
+    assert payload["reason"] == REFUSED_REVIEW_IN_FLIGHT
+    assert "вторая дверь" in payload["detail"], (
+        "причина обязана назвать долг второй двери, а не выдавать его за идущий прогон"
+    )
+
+
+async def test_a_second_door_debt_still_comes_back_when_the_report_lands(
+    db: aiosqlite.Connection,
+):
+    """#1289 AC-2 для долга второй двери: отсрочка кончается заказом.
+
+    Отчёт спрашивается вторым и решает в пользу прогона — и на долге тоже:
+    поздний отчёт облачного прогона может лечь раньше, чем свип закроет
+    строку.
+    """
+    project_id = await _project(db, "steward-second-door-back", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    await _dispatch(db, task_id, status="second_door")
+
+    assert await order_due_runs(db) == 0
+    await _report(db, task_id)
+
+    assert await order_due_runs(db) == 1
+    assert await open_run(db, task_id, 1) is not None
+
+
+async def test_the_brief_does_not_call_a_second_door_debt_a_flying_review(
+    db: aiosqlite.Connection,
+):
+    """Расширен ОДИН читатель, и ровно на одном месте применения (#1289).
+
+    Долг второй двери — не летящий прогон: облачный уже кончился, а
+    локальный ещё не заказан. Карточка и бриф (``review_in_flight``) не
+    смеют показывать его как идущее ревью, иначе человек у гейта прочитает
+    «подожди, платный прогон в воздухе» там, где ждать нечего. Широкий
+    ответ берёт только тот, кто спросил широко — диспетчер стюарда.
+    """
+    from hub.services.review_evidence import inflight_view
+
+    project_id = await _project(db, "steward-second-door-brief", steward=True)
+    task_id = await _submitted_task(db, project_id)
+    await _dispatch(db, task_id, status="second_door")
+    task = dict(await repo.get_task(db, task_id))
+
+    assert await inflight_view(db, task) is None, "бриф показал долг как полёт"
+    wide = await inflight_view(db, task, include_owed=True)
+    assert wide is not None
+    assert "вторая дверь" in wide.headline

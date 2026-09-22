@@ -580,6 +580,16 @@ async def _review_still_running(db: aiosqlite.Connection, task: dict[str, Any]) 
     читатель того же факта разошёлся бы с первым, и разошёлся бы в сторону
     «заказывать»: экономия всегда тише осторожности.
 
+    Спрашивается он ШИРОКО (``include_owed``). Находка bec6db75314abd83:
+    узкий ответ говорит «ревью нет» на долге второй двери — строке, чей
+    прогон ревью кончился без отчёта и которую свип ещё не разобрал
+    (#1252). Отчёта этой сдачи в том окне нет ровно так же, как при живом
+    прогоне, и купленный там прогон стюарда эскалировал бы по
+    no_current_report, не начав судить. Постановка #1289 так активный заказ
+    и определяет: ``active`` ИЛИ ``second_door``. Вечной отсрочки это не
+    даёт: долг кончается либо второй дверью (новый заказ, ``active``), либо
+    ``failed``, а по ``failed`` прогон покупается.
+
     Отчёт спрашивается вторым и решает в пользу прогона: ревью может
     сдать отчёт раньше, чем свип переведёт свою строку в done, и ждать
     того, что уже пришло, значило бы задерживать суждение ради
@@ -588,7 +598,7 @@ async def _review_still_running(db: aiosqlite.Connection, task: dict[str, Any]) 
     """
     from hub.services.review_evidence import inflight_view
 
-    view = await inflight_view(db, task)
+    view = await inflight_view(db, task, include_owed=True)
     if view is None:
         return ""
     task_id = int(task["id"])
@@ -596,9 +606,9 @@ async def _review_still_running(db: aiosqlite.Connection, task: dict[str, Any]) 
     if await repo.machine_reviews_of_generation(db, task_id, generation):
         return ""
     return (
-        f"ревью этой сдачи ещё идёт ({view.headline}) — прогон прочитал бы "
-        "отсутствие отчёта и эскалировал по no_current_report, не начав "
-        "судить; заказ ждёт отчёта"
+        f"ревью этой сдачи ещё не кончено ({view.headline}) — прогон "
+        "прочитал бы отсутствие отчёта и эскалировал по no_current_report, "
+        "не начав судить; заказ ждёт отчёта"
     )
 
 

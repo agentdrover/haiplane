@@ -631,29 +631,61 @@ def _parse_dispatch_created(raw: str) -> datetime:
     return datetime.now(UTC)
 
 
+#: Долг второй двери: прогон ревью кончился без отчёта, строка нарочно
+#: оставлена открытой, пока долг не отдан (#1252, ``review_dispatch.
+#: SECOND_DOOR_OWED``). Имя повторено здесь строкой, а не импортировано:
+#: ``review_dispatch`` тянет ``review_evidence`` обратно, и импорт на уровне
+#: модуля замкнул бы круг.
+OWED_SECOND_DOOR = "second_door"
+
+
 def inflight_headline(dispatch: dict[str, Any], *, now: datetime | None = None) -> str:
-    """One line: model, profile, elapsed, grace — the four facts #1027 named."""
+    """One line: model, profile, elapsed, grace — the four facts #1027 named.
+
+    Долг второй двери получает СВОЮ первую половину строки: прогон по нему
+    уже кончился, и назвать его «в полёте» значило бы обещать читателю
+    прилетающий отчёт там, где ждут открытия второй двери.
+    """
     now = now or datetime.now(UTC)
     created = _parse_dispatch_created(str(dispatch.get("created_at") or ""))
     elapsed = max(0, int((now - created).total_seconds() // 60))
     grace = created + timedelta(minutes=config.CURSOR_REVIEW_GRACE_MINUTES)
     model = (dispatch.get("model") or "").strip() or "не заявлена"
     profile = (dispatch.get("profile") or "").strip() or "не заявлен"
+    lead = "ревью в полёте"
+    if dispatch.get("status") == OWED_SECOND_DOOR:
+        lead = "прогон ревью кончился без отчёта, вторая дверь ещё не открыта"
     return (
-        f"ревью в полёте: {model}, профиль {profile}, идёт {elapsed} мин, "
+        f"{lead}: {model}, профиль {profile}, идёт {elapsed} мин, "
         f"grace до {grace.strftime('%Y-%m-%d %H:%M')}"
     )
 
 
-async def inflight_view(db, task_row: dict[str, Any]) -> ReviewInFlight | None:
-    """Active dispatch of the current submission, or None (#1027)."""
+async def inflight_view(
+    db, task_row: dict[str, Any], *, include_owed: bool = False
+) -> ReviewInFlight | None:
+    """Active dispatch of the current submission, or None (#1027).
+
+    ``include_owed`` расширяет ответ ровно на один статус — ``second_door``,
+    долг после прогона, кончившегося без отчёта (#1289, находка
+    bec6db75314abd83). Расширен ЧИТАТЕЛЬ, а не заведён второй: спрашивать
+    ``review_dispatches`` из диспетчера стюарда отдельным запросом значило бы
+    завести второе правило «идёт ли ревью», и разошлось бы оно в сторону
+    «заказывать».
+
+    По умолчанию ответ прежний и узкий: карточка и бриф зовут этот факт
+    ``review_in_flight``, и долг второй двери там не полёт — облачный прогон
+    уже кончился, локальный ещё не заказан. Широко спрашивает только тот,
+    кому важно «есть ли смысл судить сейчас», а не «летит ли платный прогон».
+    """
     task_id = int(task_row["id"])
     generation = int(task_row.get("submission_generation") or 0)
     row = await repo_module.get_review_dispatch_for_generation(db, task_id, generation)
     if row is None:
         return None
     dispatch = dict(row)
-    if dispatch.get("status") != "active":
+    unsettled = {"active"} | ({OWED_SECOND_DOOR} if include_owed else set())
+    if dispatch.get("status") not in unsettled:
         return None
     headline = inflight_headline(dispatch)
     created = _parse_dispatch_created(str(dispatch.get("created_at") or ""))
