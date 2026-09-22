@@ -3528,6 +3528,9 @@ async def hub_session_register(
     you declare and your sign of life without starting a new session. The
     agent name and principal come from your token — they cannot be passed in.
 
+    An id registered at another host or workspace is refused (#1288): register
+    your own, never reuse one.
+
     Args:
         session_id: Your session identifier; reuse the one you pass to hub_claim_task
         model: The model running this session — a declaration, like the one on submit
