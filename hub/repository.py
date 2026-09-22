@@ -27,6 +27,7 @@ from hub.models import (
     FINAL_STATUSES,
     IN_FLIGHT_STATUSES,
     QUEUED_STATUSES,
+    ReviewVerdict,
 )
 
 # One spelling of "this row is finished", derived from the model instead of
@@ -490,11 +491,26 @@ async def list_unmerged_branch_tasks(
     exclude_task_id: int,
     statuses: list[str],
 ) -> list[aiosqlite.Row]:
-    """Active tasks (other than ``exclude_task_id``) that own a branch (#438)."""
+    """Active tasks (other than ``exclude_task_id``) that own a branch (#438).
+
+    ``submission_generation`` travels with the row (#1283): it counts the
+    submissions the task actually made, so zero is the hub's own record that
+    this task has never handed work in — and therefore owns nothing on origin
+    to compare against.
+
+    ``submission_sha`` travels with it too, and it used to carry that meaning
+    alone — wrongly, which is why the count is here: an empty sha does not say
+    "never published". ``resolve_branch_tip`` documents the empty value as
+    "could not look" (no workspace, a failed fetch, an exception), the
+    submission is accepted anyway, and a verdict on a moved tip wipes the pin.
+    The stacking walk reads both; callers that do not care simply ignore the
+    columns.
+    """
     placeholders = ",".join("?" for _ in statuses)
     return await fetchall(
         db,
-        f"SELECT id, title, status, branch FROM tasks "  # nosec B608
+        f"SELECT id, title, status, branch, submission_sha, "  # nosec B608
+        f"submission_generation FROM tasks "
         f"WHERE archived=0 AND id != ? AND status IN ({placeholders}) "
         "AND branch IS NOT NULL AND TRIM(branch) != '' ORDER BY id",
         (exclude_task_id, *statuses),
@@ -2345,15 +2361,74 @@ async def record_review_verdict(
     ``self_approved`` marks verdicts accepted only via the
     ``HAIPLANE_REVIEW_SELF_APPROVE=allow`` solo opt-out (#434); it belongs
     to the verdict, so every new verdict overwrites the flag.
+    ``review_verdict_closed_generation`` is cleared for the same reason
+    (#1286): a window closed by a human decision belonged to the PREVIOUS
+    verdict, and a new verdict opens its own.
     """
     await db.execute(
         "UPDATE tasks SET review_verdict=?, "
         "review_verdict_generation=submission_generation, "
         "review_findings=?, "
         "review_self_approved=?, "
+        "review_verdict_closed_generation=NULL, "
         "updated_at=datetime('now') WHERE id=?",
         (verdict, findings_json, 1 if self_approved else 0, task_id),
     )
+
+
+async def close_review_verdict_window(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> int | None:
+    """Close the CURRENT submission's APPROVAL, revoked by a decision (#1286).
+
+    Returns the generation whose window was closed, or ``None`` when there was
+    nothing to close. The caller uses that answer to decide whether the feed
+    has anything to say, so "nothing was closed" is an answer and not a
+    silence.
+
+    Nothing to close means one of three things, and the third one was this
+    function's own defect: no verdict at all; a verdict belonging to an
+    earlier submission; or a verdict that never authorised a delivery.
+    CHANGES_REQUESTED is the live case of the third — reachable on the current
+    generation without any bump, e.g. when the fix dispatch fails and drops
+    the task into needs_decision, or when the arbiter finishes on that same
+    submission. A window exists only where the verdict grants the right to
+    deliver, which is APPROVED and nothing else: rework does not revoke a
+    rejection, it agrees with it. Closing one anyway made the feed announce a
+    revoked approval over a task nobody had approved.
+
+    Written in SQL against ``submission_generation`` for the same reason
+    ``record_review_verdict`` binds the verdict there: nothing read before the
+    statement can be stale by the time it runs. The verdict itself, its
+    generation, its findings and its self-approved flag are left ALONE — the
+    window closes, the history stays (#1286 constraint).
+    """
+    rows = await fetchall(
+        db,
+        "SELECT submission_generation, review_verdict, review_verdict_generation "
+        "FROM tasks WHERE id=?",
+        (task_id,),
+    )
+    if not rows:
+        return None
+    row = dict(rows[0])
+    generation = int(row.get("submission_generation") or 0)
+    if (row.get("review_verdict") or "").strip() != ReviewVerdict.approved.value:
+        return None
+    if generation <= 0 or row.get("review_verdict_generation") != generation:
+        return None
+    cur = await db.execute(
+        "UPDATE tasks SET review_verdict_closed_generation=submission_generation, "
+        "updated_at=datetime('now') WHERE id=? AND review_verdict=? "
+        "AND review_verdict_generation=submission_generation",
+        (task_id, ReviewVerdict.approved.value),
+    )
+    if not cur.rowcount:
+        # A concurrent verdict landed between the read and the write: it owns
+        # its own window, and this decision closed nothing.
+        return None
+    return generation
 
 
 async def transition_status_if(
@@ -3881,9 +3956,11 @@ async def upsert_agent_session(
     not quietly erase what the registry knows.
 
     ON CONFLICT does not overwrite another principal's ``principal_id`` or
-    ``agent`` (#977). A WHERE miss leaves the existing row as-is so a raced
-    register cannot steal the address between the service's owner check and
-    this write.
+    ``agent`` (#977), and does not move a declared ``host`` or ``workspace``
+    that contradicts the stored one (#1288). A WHERE miss leaves the existing
+    row as-is so a raced register cannot steal the address between the
+    service's checks and this write — the same-principal collision that made
+    a task's ``claim_session_id`` point at another machine's worktree.
     """
     await db.execute(
         "INSERT INTO agent_sessions "
@@ -3900,8 +3977,15 @@ async def upsert_agent_session(
         "  workspace    = CASE WHEN excluded.workspace = '' "
         "                 THEN agent_sessions.workspace ELSE excluded.workspace END, "
         "  last_seen_at = datetime('now') "
-        "WHERE agent_sessions.principal_id IS NULL "
-        "   OR agent_sessions.principal_id = excluded.principal_id",
+        "WHERE (agent_sessions.principal_id IS NULL "
+        "       OR agent_sessions.principal_id = excluded.principal_id) "
+        # An empty declaration is "not declared" and an empty stored value is
+        # "unknown": neither is a different address, so both stay writable.
+        "  AND (excluded.host = '' OR COALESCE(agent_sessions.host, '') = '' "
+        "       OR agent_sessions.host = excluded.host) "
+        "  AND (excluded.workspace = '' "
+        "       OR COALESCE(agent_sessions.workspace, '') = '' "
+        "       OR agent_sessions.workspace = excluded.workspace)",
         (session_id, principal_id, agent, model, host, workspace),
     )
 

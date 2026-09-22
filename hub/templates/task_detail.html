@@ -661,7 +661,7 @@
                 {% if task.latest_review and task.latest_review.findings %}
                 <div class="task-action-note">
                     Находки последнего вердикта ({{ task.latest_review.verdict.value|upper }},
-                    сдача #{{ task.latest_review.submission_generation }}{{ '' if task.latest_review.is_current else ', устарел — работа пересдана' }}):
+                    сдача #{{ task.latest_review.submission_generation }}{% if not task.latest_review.is_current %}{{ ', закрыт решением «на доработку» — нужна новая сдача' if task.latest_review.closed_by_decision else ', устарел — работа пересдана' }}{% endif %}):
                     <ul class="task-review-findings">
                         {% for f in task.latest_review.findings %}
                         <li>{{ f.id }}. [{{ f.severity.value }}] {{ f.message }}

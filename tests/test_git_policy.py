@@ -174,6 +174,22 @@ def test_a_task_branch_still_goes_through(clone: Path):
     assert pushed.returncode == 0, pushed.stderr
 
 
+def test_a_dependabot_branch_goes_through(clone: Path):
+    """#1291: the bot names its own branches and we cannot rename them.
+
+    .github/dependabot.yml can only change the separator, not the
+    "dependabot/" prefix, so a branch the bot opened has to be pushable from a
+    clone — otherwise fixing a lock conflict on a bot PR is blocked by our own
+    hook.
+    """
+    git_policy.activate(str(clone))
+    _git(clone, "checkout", "-q", "-b", "dependabot/uv/anyio-4.14.2")
+
+    pushed = _git(clone, "push", "origin", "dependabot/uv/anyio-4.14.2")
+
+    assert pushed.returncode == 0, pushed.stderr
+
+
 # ---- AC-2: the doctor makes the state a fact, not an assumption ----
 
 
