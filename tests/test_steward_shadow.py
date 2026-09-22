@@ -2827,6 +2827,247 @@ async def test_a_recovery_that_recovers_nothing_does_not_hold_the_write_lock(
     assert row["agent_id"].startswith(sh.PENDING_PREFIX), "метку никто не трогал"
 
 
+# ---------------------------------------------------------------------------
+# Живой пакет доказательств и схлопнувшийся дифф (#1239)
+# ---------------------------------------------------------------------------
+#
+# У живого пакета сторожа не было ВОВСЕ. Не ломался он не потому, что защищён,
+# а потому, что его субъект — ветка ДО мержа: схлопываться было нечему. Защита
+# стечением обстоятельств не переживает смены обстоятельств, а цена ошибки
+# здесь — суждение на ложных данных, а не пустой экран.
+#
+# Настоящий git, а не MockGitOps из conftest: предмет проверки — что ответит
+# ``git diff base...branch`` на ветке, которая уже влита. Мок ответил бы то,
+# что в него положили, и проверял бы фикстуру.
+
+
+def _task_branch_clone(tmp_path, *, delivered: bool):
+    """Клон с веткой задачи; ``delivered`` — влита ли она уже в базу."""
+    import subprocess
+
+    def run(*args, cwd):
+        subprocess.run(args, cwd=cwd, check=True, capture_output=True)
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "develop", str(origin)],
+        check=True,
+        capture_output=True,
+    )
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    run("git", "clone", str(origin), str(seed), cwd=tmp_path)
+    run("git", "config", "user.email", "t@e", cwd=seed)
+    run("git", "config", "user.name", "t", cwd=seed)
+    (seed / "hub").mkdir()
+    (seed / "hub" / "base.py").write_text("base\n")
+    run("git", "add", "-A", cwd=seed)
+    run("git", "commit", "-qm", "baseline", cwd=seed)
+    run("git", "branch", "-M", "develop", cwd=seed)
+    run("git", "push", "-q", "origin", "develop", cwd=seed)
+
+    branch = "task-9001/delivered"
+    run("git", "checkout", "-qb", branch, cwd=seed)
+    # Сдача трогает файл ВНЕ заявленных областей: если бы поверхность
+    # измерялась на самом деле, сверка сказала бы «вне заявленного».
+    (seed / "hub" / "secrets.py").write_text("undeclared\n")
+    run("git", "add", "-A", cwd=seed)
+    run("git", "commit", "-qm", "the submission", cwd=seed)
+    run("git", "push", "-q", "origin", branch, cwd=seed)
+    if delivered:
+        run("git", "checkout", "-q", "develop", cwd=seed)
+        run("git", "merge", "-q", "--no-ff", "-m", "deliver", branch, cwd=seed)
+        run("git", "push", "-q", "origin", "develop", cwd=seed)
+
+    clone = tmp_path / "hub-clone"
+    run("git", "clone", str(origin), str(clone), cwd=tmp_path)
+    run("git", "config", "user.email", "t@e", cwd=clone)
+    run("git", "config", "user.name", "t", cwd=clone)
+    return clone, branch
+
+
+async def _packet_task(db: aiosqlite.Connection, clone, branch: str) -> int:
+    """``clone=None`` — проект БЕЗ рабочей копии: та самая дыра из #1239."""
+    project_id = await repo.create_project(
+        db,
+        slug="collapse-probe",
+        name="collapse probe",
+        workspace_path="" if clone is None else str(clone),
+        default_branch="develop",
+        status="active",
+    )
+    task_id = await repo.create_task(
+        db,
+        title="доставленная сдача",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="a",
+        rationale="",
+        status="review",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(
+        db,
+        task_id,
+        project_id=project_id,
+        branch=branch,
+        affected_areas=json.dumps(["hub/base.py"]),
+        risk_class="R1",
+    )
+    await db.commit()
+    return task_id
+
+
+def _real_git(monkeypatch) -> None:
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(plugins, "git_ops", GitOpsIntegration())
+
+
+async def test_a_live_packet_does_not_call_a_collapsed_diff_within_bounds(
+    db: aiosqlite.Connection, tmp_path, monkeypatch
+) -> None:
+    """AC-2: пустой дифф доставленной задачи — дыра, а не «в границах».
+
+    До правки: ``branch_diff_paths`` возвращал ПУСТОЙ СПИСОК (не None),
+    ``_surface_fact`` отвечал ``present`` с ``within_declared=True``, класс
+    риска не пересчитывался — и судья получал зелёный факт о поверхности,
+    которую никто не измерял. Сдача здесь трогает ``hub/secrets.py`` при
+    заявленном ``hub/base.py``: настоящая сверка сказала бы «вне заявленного»,
+    и именно это утверждение пустота стирала.
+
+    Мутация «убрать вопрос о предке в ``_guard_collapsed_diff``» роняет
+    именно этот тест и не трогает тесты карточки: это разные места
+    применения одного правила.
+    """
+    from hub.services.steward_evidence import DIFF_COLLAPSED, build_evidence_packet
+
+    _real_git(monkeypatch)
+    clone, branch = _task_branch_clone(tmp_path, delivered=True)
+    task_id = await _packet_task(db, clone, branch)
+
+    packet = await build_evidence_packet(db, task_id)
+
+    surface = packet.fact("diff_vs_areas")
+    assert surface.is_absent
+    assert surface.reason == DIFF_COLLAPSED
+    assert "схлопнулся" in surface.detail
+    # И класс риска не смеет считаться непревышенным по той же пустоте.
+    risk = packet.fact("risk_class")
+    assert risk.is_absent
+    assert risk.reason == DIFF_COLLAPSED
+
+
+async def test_a_live_packet_still_measures_a_branch_before_delivery(
+    db: aiosqlite.Connection, tmp_path, monkeypatch
+) -> None:
+    """Сторож не съедает нормальный случай: неслитая ветка меряется как прежде.
+
+    Без этого теста «дыра всегда» прошло бы как «дыра там, где надо» — а это
+    сломало бы гейт на каждой живой сдаче.
+    """
+    from hub.services.steward_evidence import build_evidence_packet
+
+    _real_git(monkeypatch)
+    clone, branch = _task_branch_clone(tmp_path, delivered=False)
+    task_id = await _packet_task(db, clone, branch)
+
+    packet = await build_evidence_packet(db, task_id)
+
+    surface = packet.fact("diff_vs_areas")
+    assert surface.is_present
+    assert surface.value["paths"] == ["hub/secrets.py"]
+    assert surface.value["within_declared"] is False
+
+
+async def test_a_live_packet_without_a_workspace_does_not_measure_a_foreign_clone(
+    db: aiosqlite.Connection, tmp_path, monkeypatch
+) -> None:
+    """У проекта нет клона — поверхность НЕ измерена, а не «в границах».
+
+    Находка 95907d9c52c474b8. Сторож обещает три ответа, но выходил четвёртым:
+    без ``workspace`` он возвращал исходный ПУСТОЙ СПИСОК без дыры. А дальше
+    цепочка уже сработала: ``_resolve_branch_diff`` зовёт ``branch_diff_paths``
+    с ``repo=None``, та молча падает на ``_repo_root()`` — клон ХАБА, а не
+    проекта. В нём ветка задачи вполне может быть уже влита, и пустой дифф
+    ЧУЖОГО клона приезжал как ``[]``. ``_surface_fact`` писал ``present`` и
+    ``within_declared=True``: судья видел зелёную поверхность, которой никто
+    не мерил. Вход в ту же ложь другой — «нет рабочей копии» вместо «не
+    спросили предка», а цена та же.
+
+    Здесь это воспроизведено настоящим git: проект без ``workspace_path``,
+    а подменённый ``_repo_root`` указывает на клон, где ветка уже доставлена.
+    Сдача трогает ``hub/secrets.py`` при заявленном ``hub/base.py`` — будь
+    поверхность измерена, сверка сказала бы «вне заявленного».
+    """
+    from hub.integrations import git_ops as git_ops_mod
+    from hub.services.steward_evidence import DIFF_UNREADABLE, build_evidence_packet
+
+    _real_git(monkeypatch)
+    clone, branch = _task_branch_clone(tmp_path, delivered=True)
+    monkeypatch.setattr(git_ops_mod, "_repo_root", lambda: str(clone))
+    task_id = await _packet_task(db, None, branch)
+
+    packet = await build_evidence_packet(db, task_id)
+
+    surface = packet.fact("diff_vs_areas")
+    assert surface.is_absent, (
+        "без клона проекта поверхность не измерена — сказать «в границах» "
+        f"по чужому клону нельзя: {surface.value}"
+    )
+    assert surface.reason == DIFF_UNREADABLE
+    risk = packet.fact("risk_class")
+    assert risk.is_absent
+    assert risk.reason == DIFF_UNREADABLE
+
+
+async def test_a_live_packet_names_an_unanswered_ancestry_as_unreadable(
+    db: aiosqlite.Connection, tmp_path, monkeypatch
+) -> None:
+    """Третий ответ сторожа закрыт своим тестом (5d67b34d6bb2f77f).
+
+    ``commit_in_base_history`` отвечает тремя значениями, и ветка ``None`` —
+    «git не ответил» — до сих пор не была прогнана НИ ОДНИМ тестом живого
+    пакета: мутация ``None`` -> ``[]`` в этой ветке оставляла набор зелёным.
+    Дыра покрытия, а не продуктовый дефект, — но именно она и разрешает
+    будущей правке свернуть три ответа в два, ровно против ограничения
+    задачи.
+
+    Ответ ``None`` здесь подставлен точечно: сам вопрос задаётся настоящему
+    git, а «не ответил» на живом репозитории не ставится честно — оба конца
+    диффа только что зарезолвились, иначе дифф не был бы пустым списком.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.steward_evidence import DIFF_UNREADABLE, build_evidence_packet
+
+    _real_git(monkeypatch)
+    clone, branch = _task_branch_clone(tmp_path, delivered=True)
+    task_id = await _packet_task(db, clone, branch)
+
+    async def _no_answer(repo: str, base: str, sha: str) -> bool | None:
+        return None
+
+    monkeypatch.setattr(plugins.git_ops, "commit_in_base_history", _no_answer)
+
+    packet = await build_evidence_packet(db, task_id)
+
+    surface = packet.fact("diff_vs_areas")
+    assert surface.is_absent
+    assert surface.reason == DIFF_UNREADABLE, (
+        "«git не ответил» — не «дифф схлопнулся» и не «изменений нет»: "
+        f"{surface.reason}"
+    )
+    assert "не ответил" in surface.detail
+    risk = packet.fact("risk_class")
+    assert risk.is_absent
+    assert risk.reason == DIFF_UNREADABLE
+
+
 # --------------------------------------------------------------------------
 # Судья выбирается из имён, чей ЗАПУСК наблюдали (#1237)
 # --------------------------------------------------------------------------
