@@ -47,9 +47,15 @@ while read -r local_ref local_oid remote_ref remote_oid; do
     case "$local_ref" in
       refs/heads/task-*/*|refs/heads/fix/*|refs/heads/chore/*|refs/heads/docs/*|refs/heads/ci/*)
         ;;
+      # Dependabot opens its PRs from branches it names itself
+      # ("dependabot/uv/anyio-4.14.2"); the prefix is not configurable in
+      # .github/dependabot.yml, so the allowlist has to know it or a local
+      # push onto a bot branch is refused.
+      refs/heads/dependabot/*)
+        ;;
       *)
         echo "Blocked push from branch '${local_ref#refs/heads/}' to ${remote_name}." >&2
-        echo "Use $base_branch, task-<hub-task-id>/<short-slug>, fix/<short-slug>, chore/<short-slug>, docs/<short-slug>, or ci/<short-slug>." >&2
+        echo "Use $base_branch, task-<hub-task-id>/<short-slug>, fix/<short-slug>, chore/<short-slug>, docs/<short-slug>, ci/<short-slug>, or dependabot/<bot-branch>." >&2
         exit 1
         ;;
     esac

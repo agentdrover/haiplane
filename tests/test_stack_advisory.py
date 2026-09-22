@@ -18,7 +18,7 @@ from hub import repository as repo
 from hub import services
 from hub.integrations.git_ops import GitOpsIntegration
 from hub.integrations.noop import NoopGitOps
-from hub.integrations.protocols import StackProbeOutcome
+from hub.integrations.protocols import StackProbeOutcome, StackProbeResult
 from hub.integrations.registry import plugins
 from hub.models import TaskCreate, TaskSubmitReview
 
@@ -1261,3 +1261,250 @@ async def test_an_unreachable_remote_is_never_remembered() -> None:
     assert second[0][1].outcome is StackProbeOutcome.stacked, (
         "неответ не запоминается: тот же вопрос задаётся заново"
     )
+
+
+# ---- #1283: ветка соседа, которой ещё нет на origin, — не «проверить не смогли» ----
+#
+# Наблюдено на проде 22.09.2026: #1208 и #1158 одобрены, CI зелёный, отчёты
+# чистые — и обе не доставлены одним сообщением «stack_unknown ... ref_unresolved:
+# task-1281/...». Ветка соседа записана хабом при pair_start, а на origin её ещё
+# нет: исполнитель не сделал первый пуш. Между pair_start и первым пушем лежит вся
+# работа над задачей, то есть часы, и всё это время ни одна одобренная задача
+# проекта не доставляется.
+#
+# Различие строится на двух наблюдаемых фактах сразу, и оба нужны: origin на
+# прямой вопрос ответил, что такой ветки нет (ref_unresolved по ИМЕНИ кандидата),
+# И хаб ни разу не наблюдал вершину этой ветки на origin (submission_sha пуст —
+# его пишет resolve_branch_tip по origin/<ветка>, это наблюдение хаба, а не
+# заявление исполнителя).
+
+
+class _ScriptedProbeGitOps(NoopGitOps):
+    """Плагин, отвечающий обходу ПО КАЖДОМУ кандидату отдельно (#1283).
+
+    Батч NoopGitOps маршрутизируется через собственный ``branch_stacking_probe``
+    подкласса, поэтому переопределения одной пробы достаточно — обход получит
+    разные ответы на разные строки, как в жизни.
+    """
+
+    def __init__(
+        self,
+        answers: dict[str, StackProbeResult],
+        ancestry: dict[str, str] | None = None,
+    ):
+        self.answers = answers
+        self.ancestry = ancestry or {}
+
+    async def branch_stacking_probe(
+        self,
+        branch: str,
+        other_branch: str,
+        base_branch: str | None = None,
+        repo: str | None = None,
+    ) -> StackProbeResult:
+        return self.answers[other_branch]
+
+    async def branch_ancestry(
+        self,
+        branch: str,
+        other_branch: str,
+        repo: str | None = None,
+    ) -> str:
+        return self.ancestry.get(other_branch, "unknown")
+
+
+def _ref_unresolved(branch: str) -> StackProbeResult:
+    """Ровно то, что пишет настоящая проба: origin такой ветки не знает."""
+    return StackProbeResult(
+        outcome=StackProbeOutcome.unavailable,
+        reason="ref_unresolved",
+        details=branch,
+    )
+
+
+async def _neighbour(
+    db: aiosqlite.Connection,
+    branch: str,
+    *,
+    status: str = "running",
+    submission_sha: str = "",
+    submission_generation: int | None = None,
+) -> int:
+    """Соседняя задача с записанной веткой и (не)наблюдённой вершиной.
+
+    ``submission_generation`` по умолчанию выводится из sha — так, как это
+    выглядит на счастливом пути: сдача была, вершину прочитали и закрепили.
+    Передаётся ОТДЕЛЬНО там, где эти два факта расходятся: сдача была, а sha
+    пуст.
+    """
+    tv = await services.create_task(db, TaskCreate(title=f"Сосед {branch}"))
+    generation = (
+        submission_generation
+        if submission_generation is not None
+        else (1 if submission_sha.strip() else 0)
+    )
+    await repo.update_task(
+        db,
+        tv.id,
+        status=status,
+        branch=branch,
+        submission_sha=submission_sha,
+        submission_generation=generation,
+    )
+    await db.commit()
+    return tv.id
+
+
+async def _gate(db: aiosqlite.Connection, task_id: int) -> str:
+    task = dict(await repo.get_task(db, task_id))
+    return await services.stacking_gate_step(db, task)
+
+
+async def _feed(db: aiosqlite.Connection, task_id: int) -> str:
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    return " ".join(u.get("content") or "" for u in updates)
+
+
+async def test_an_unpublished_neighbour_branch_does_not_hold_the_merge(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-1. Сосед в running: ветка записана pair_start, на origin её нет,
+    # вершину хаб не наблюдал ни разу. Коммитов этой задачи нет нигде, унести
+    # их мержем нельзя — сравнивать не с чем. Мерж идёт, и молчаливым он не
+    # бывает: в ленте названа причина и номер соседа.
+    task_id, branch = await _pair_running_task(db, "Одобренная задача")
+    neighbour_branch = "task-1281/dependency-delivery-one-reader"
+    neighbour_id = await _neighbour(db, neighbour_branch)
+    plugins.git_ops = _ScriptedProbeGitOps(
+        {neighbour_branch: _ref_unresolved(neighbour_branch)}
+    )
+
+    detail = await _gate(db, task_id)
+
+    assert detail == "", (
+        "ветка, которой ещё нет на origin, не повод откладывать чужую доставку"
+    )
+    body = await _feed(db, task_id)
+    assert f"#{neighbour_id}" in body, (
+        "в ленте названа задача, чью ветку не с чем сравнить"
+    )
+    assert neighbour_branch in body
+    assert "не опубликована" in body, (
+        "названа именно эта причина, а не общее «не удалось»"
+    )
+
+
+async def test_a_vanished_branch_still_defers_the_merge(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-2. Тот же ответ пробы, другой наблюдаемый факт: сдача была, значит
+    # вершину этой ветки на origin хаб видел, а сейчас её там нет. Это «ветка
+    # исчезла», и она по-прежнему откладывает мерж с причиной ref_unresolved.
+    task_id, branch = await _pair_running_task(db, "Одобренная задача")
+    gone = "task-1175/image-capture"
+    await _neighbour(db, gone, status="review", submission_sha="a" * 40)
+    plugins.git_ops = _ScriptedProbeGitOps({gone: _ref_unresolved(gone)})
+
+    detail = await _gate(db, task_id)
+
+    assert detail.startswith(services.STACK_UNKNOWN_PREFIX), (
+        "ветка, которую хаб на origin видел, а теперь не видит, — это не "
+        "«ещё не опубликована»"
+    )
+    assert "ref_unresolved" in detail
+
+
+async def test_a_submitted_neighbour_without_a_pinned_tip_still_defers(
+    db: aiosqlite.Connection,
+) -> None:
+    # Находка 1dd76966e24dfa20. Пустой submission_sha значит НЕ только «сдачи
+    # не было». resolve_branch_tip сам документирует пустое значение как
+    # «посмотреть не удалось» (нет рабочей копии, упал fetch, исключение), и
+    # _step_pin_submission_sha в этом случае сдачу всё равно принимает; после
+    # вердикта с уехавшей вершиной закреплённый sha и вовсе стирается. Сосед
+    # здесь именно такой: сдача была, вершину прочитать не смогли, а теперь
+    # ветка с origin исчезла. Это ровно AC-2, и послабление #1283 его касаться
+    # не вправе.
+    task_id, branch = await _pair_running_task(db, "Одобренная задача")
+    gone = "task-1175/image-capture"
+    neighbour_id = await _neighbour(
+        db, gone, status="review", submission_sha="", submission_generation=1
+    )
+    plugins.git_ops = _ScriptedProbeGitOps({gone: _ref_unresolved(gone)})
+
+    detail = await _gate(db, task_id)
+
+    assert detail.startswith(services.STACK_UNKNOWN_PREFIX), (
+        f"сдача у соседа #{neighbour_id} была — «ветки никогда не было» про "
+        f"него сказать нельзя, и мерж обязан подождать: {detail!r}"
+    )
+    assert "ref_unresolved" in detail
+    body = await _feed(db, task_id)
+    assert "не опубликована" not in body, (
+        f"и лента не вправе объявлять такую ветку неопубликованной: {body}"
+    )
+
+
+async def test_a_real_stack_is_still_caught_when_a_neighbour_is_unpublished(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-3. Послабление не должно пропускать настоящую стопку. Неопубликованный
+    # сосед стоит в обходе ПЕРВЫМ (строки идут по id), и если его ответ
+    # возвращать сразу, настоящее основание ниже по списку никто не увидит.
+    task_id, branch = await _pair_running_task(db, "Одобренная задача")
+    unpublished = "task-1281/dependency-delivery-one-reader"
+    await _neighbour(db, unpublished)
+    real_base = "task-1175/image-capture"
+    base_id = await _neighbour(db, real_base, status="review", submission_sha="b" * 40)
+    plugins.git_ops = _ScriptedProbeGitOps(
+        {
+            unpublished: _ref_unresolved(unpublished),
+            real_base: StackProbeResult(
+                outcome=StackProbeOutcome.stacked, reason="scripted"
+            ),
+        },
+        ancestry={real_base: "head_is_descendant"},
+    )
+
+    detail = await _gate(db, task_id)
+
+    assert detail.startswith(services.STACKED_BASE_PREFIX), (
+        "настоящая стопка сильнее любого послабления: мерж унёс бы чужую работу"
+    )
+    assert f"#{base_id}" in detail and real_base in detail
+
+
+async def test_a_blinking_git_still_outranks_an_unpublished_neighbour(
+    db: aiosqlite.Connection,
+) -> None:
+    # Точность послабления, а не его широта. #1283 ослабляет ОДИН случай и не
+    # трогает правило #1186: обычный повторяемый unknown (git моргнул,
+    # rev-list не сработал) по-прежнему сильнее и по-прежнему ждёт. Иначе
+    # достаточно было бы ОДНОГО соседа с ещё не запушенной веткой, чтобы
+    # непроверенная строка рядом с ним перестала кого-либо держать, — а это
+    # ровно тот инцидент, ради которого #1186 написан. Мутация «поднять
+    # неопубликованную ветку выше unknown в порядке старшинства» роняет этот
+    # тест; без него она не роняла ничего.
+    task_id, branch = await _pair_running_task(db, "Одобренная задача")
+    unpublished = "task-1281/dependency-delivery-one-reader"
+    await _neighbour(db, unpublished)
+    blinked = "task-1175/image-capture"
+    await _neighbour(db, blinked, status="review", submission_sha="c" * 40)
+    plugins.git_ops = _ScriptedProbeGitOps(
+        {
+            unpublished: _ref_unresolved(unpublished),
+            blinked: StackProbeResult(
+                outcome=StackProbeOutcome.unavailable,
+                reason="rev_list_failed",
+                details=f"rc=1/0 for {blinked}",
+            ),
+        }
+    )
+
+    detail = await _gate(db, task_id)
+
+    assert detail.startswith(services.STACK_UNKNOWN_PREFIX), (
+        "строку, на которую посмотреть не удалось, по-прежнему ждут: "
+        "неопубликованный сосед рядом ничего про неё не говорит"
+    )
+    assert "rev_list_failed" in detail

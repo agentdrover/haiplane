@@ -39,7 +39,10 @@ from fastapi import HTTPException
 
 from hub import config
 from hub import repository as repo
-from hub.actionable_errors import session_owned_by_other_detail
+from hub.actionable_errors import (
+    session_address_conflict_detail,
+    session_owned_by_other_detail,
+)
 from hub.models import SessionRegister, SessionView, UnaddressableTask
 
 _NOT_REGISTERED = (
@@ -106,6 +109,37 @@ def _owned_by_other(row: aiosqlite.Row | dict, principal_id: int | None) -> bool
     return principal_id != owner
 
 
+_ADDRESS_FIELDS = ("host", "workspace")
+
+
+def _address_conflict(
+    row: aiosqlite.Row | dict, declared: dict[str, str]
+) -> dict[str, str] | None:
+    """Declared address fields that contradict the stored ones (#1288).
+
+    The second question the registry was missing. #977 asks whether the row
+    belongs to someone else; every executor runs under the same principal, so
+    that check passes and an id collision reads as the same session saying
+    hello twice — which is how the row a task's ``claim_session_id`` pointed at
+    came to describe another machine and another worktree.
+
+    Only DECLARED non-empty values are compared. An omitted field means "not
+    declared" — it neither erases what is stored (the CASE WHEN rule) nor
+    counts as a mismatch, so a heartbeat-shaped register stays idempotent. A
+    stored empty value is unknown, not different: the first declaration fills
+    it in.
+    """
+    stored = dict(row)
+    differing = {
+        field: value
+        for field in _ADDRESS_FIELDS
+        if (value := declared.get(field, "").strip())
+        and (known := str(stored.get(field) or "").strip())
+        and known != value
+    }
+    return differing or None
+
+
 async def register_session(
     db: aiosqlite.Connection,
     body: SessionRegister,
@@ -124,10 +158,22 @@ async def register_session(
     session_id = body.session_id.strip()
     if not session_id:
         raise HTTPException(422, "session_id is required")
+    declared = {"host": body.host.strip(), "workspace": body.workspace.strip()}
     existing = await repo.get_agent_session(db, session_id)
     if existing is not None and _owned_by_other(existing, principal_id):
+        # Ownership is asked first, on purpose: a stranger learns the id is
+        # taken and nothing about where its work lives.
         raise HTTPException(
             409, detail=session_owned_by_other_detail(session_id=session_id)
+        )
+    if existing is not None and (diff := _address_conflict(existing, declared)):
+        raise HTTPException(
+            409,
+            detail=session_address_conflict_detail(
+                session_id=session_id,
+                registered={f: str(dict(existing).get(f) or "") for f in diff},
+                declared=diff,
+            ),
         )
     await repo.upsert_agent_session(
         db,
@@ -135,8 +181,8 @@ async def register_session(
         principal_id=principal_id,
         agent=agent,
         model=body.model.strip(),
-        host=body.host.strip(),
-        workspace=body.workspace.strip(),
+        host=declared["host"],
+        workspace=declared["workspace"],
     )
     await db.commit()
     row = await repo.get_agent_session(db, session_id)
@@ -145,6 +191,19 @@ async def register_session(
         # their row untouched. Refuse without returning it.
         raise HTTPException(
             409, detail=session_owned_by_other_detail(session_id=session_id)
+        )
+    if row is not None and (diff := _address_conflict(row, declared)):
+        # Same race, other question: a register that slipped in between the
+        # check above and this write kept its address (the UPSERT WHERE), so
+        # what we read back is not the address we declared. Refuse rather than
+        # return a row describing someone else's machine.
+        raise HTTPException(
+            409,
+            detail=session_address_conflict_detail(
+                session_id=session_id,
+                registered={f: str(dict(row).get(f) or "") for f in diff},
+                declared=diff,
+            ),
         )
     return SessionView(**session_view(row))  # type: ignore[arg-type]
 
