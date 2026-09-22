@@ -10219,6 +10219,7 @@ async def test_a_dead_run_is_asked_again(
     )
     _wire(monkeypatch, provider)
     _no_local_path(monkeypatch)
+    reviewer_pid, _, _ = await _pinned_setup(db, monkeypatch)
     task_id = await _submitted(
         client, db, "ask-again-dead-run", policy={"review": "dispatch"}
     )
@@ -10245,7 +10246,9 @@ async def test_a_dead_run_is_asked_again(
 
     from hub.services.review_dispatch import _dispatch_report
 
-    reviewer_pid = rows[1]["reviewer_principal_id"]
+    assert rows[1]["reviewer_principal_id"] == reviewer_pid, (
+        "ревьюер закреплён — сопоставление идёт по ступеням, а не по поколению"
+    )
     await repo.insert_machine_review(
         db,
         task_id=task_id,
@@ -10347,3 +10350,34 @@ async def test_exhausted_retries_name_themselves_to_a_human(
     assert f"{REVIEW_ASK_AGAIN_MAX}" in exhausted[0]
     assert "HTTP 429" in exhausted[0], exhausted[0]
     assert "человек" in exhausted[0], exhausted[0]
+
+
+async def test_a_blind_retry_is_not_repeated(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Ограничение #1199 в переспросе (#1242): вслепую не повторять.
+
+    Переспрос не дошёл до ответа, и спросить провайдера, создался ли агент,
+    тоже не вышло — строки заказа нет. Следующий проход не покупает ещё
+    одного поверх, возможно, уже оплаченного: он называет это человеку.
+    """
+    provider = _Sequence(
+        [(None, _RATE_LIMIT), (None, cursor_cloud.Refusal(status=0, detail="timeout"))]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+
+    async def _cannot_ask(name, pages=3):
+        return cursor_cloud.Reconciliation("", "", False)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _cannot_ask)
+    task_id = await _submitted(
+        client, db, "ask-again-blind", policy={"review": "dispatch"}
+    )
+    for _ in range(3):
+        await _age_dispatches(db)
+        await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 2, "после слепого переспроса — ни одного вызова"
+    stopped = [a for a in await _alerts_of(db, task_id) if "исчерпан" in a]
+    assert len(stopped) == 1 and "вслепую" in stopped[0], stopped
