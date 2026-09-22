@@ -26,7 +26,9 @@ from hub.services.steward_dispatch import (
     order_run,
 )
 from hub.services.steward_shadow import (
+    EVENT_RUN_REFUSED,
     EVENT_RUN_STARTED,
+    REFUSED_NOT_CONFIGURED,
     REFUSED_SAME_FAMILY_IMPLEMENTER,
     REFUSED_SAME_FAMILY_REVIEWER,
     REFUSED_UNDECLARED_MODEL,
@@ -1330,6 +1332,156 @@ async def test_waiting_for_a_reviewer_still_ends(
     # Заказ ждал ревьюера и не начинался — с #1181 это отдельный исход, а не
     # таймаут судьи: обвинять того, кто не работал, статистика не должна.
     assert run["status"] == RUN_NEVER_STARTED
+
+
+# ---------------------------------------------------------------------------
+# #1290: ожидание ревьюера пишется один раз, а не на каждом проходе поллера
+# ---------------------------------------------------------------------------
+
+
+async def _tick_waiting(db: aiosqlite.Connection, times: int) -> None:
+    """Прогнать поллер несколько раз, как он ходит в проде — раз в 30 секунд."""
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
+    ):
+        for _ in range(times):
+            assert await start_due_runs(db) == 0
+
+
+async def test_a_waiting_refusal_is_recorded_once_not_every_tick(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """#1290 AC-1: одно ожидание — одна запись, а не одна на проход.
+
+    Измерено 22.09.2026 спайком #1269: 160 из 217 событий стюарда за вечер
+    были повторами этого самого отказа, ровно по 51 на задачу за полчаса.
+    Запись, которую никто не может прочитать, равна отсутствию записи.
+
+    Молчания при этом быть не должно: первая запись обязана лечь, иначе
+    ожидание становится невидимым. И смена причины обязана дать новую —
+    иначе дедуп прячет уже не повтор, а новость.
+    """
+    project_id = await _project(db, "shadow-waiting-once")
+    task_id = await _task(db, project_id)
+    await _no_dispatch(db, task_id)
+    await order_run(db, task_id, 1)
+
+    await _tick_waiting(db, 5)
+
+    assert (await _runs(db, task_id))[0]["status"] == RUN_OPEN, (
+        "дедуп события не должен трогать сам слот"
+    )
+    events = await _events(db, EVENT_RUN_REFUSED)
+    assert len(events) == 1, (
+        f"пять проходов дали {len(events)} записей — это и есть шум задачи"
+    )
+    first = json.loads(events[0]["payload"])
+    assert first["reason"] == REFUSED_UNDECLARED_MODEL
+    assert first["retryable"] is True
+
+    # Причина сменилась: ревьюер появился, но провайдера нечем звать.
+    await db.execute(
+        "INSERT INTO review_dispatches "
+        "(task_id, submission_generation, agent_id, model, status) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, 1, "rev-agent", "grok-4.6", "done"),
+    )
+    await db.commit()
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "")
+
+    await _tick_waiting(db, 3)
+
+    events = await _events(db, EVENT_RUN_REFUSED)
+    assert len(events) == 2, (
+        "смена причины обязана дать новую запись — иначе дедуп вечный"
+    )
+    assert json.loads(events[1]["payload"])["reason"] == REFUSED_NOT_CONFIGURED
+
+
+async def test_waiting_still_ends_when_the_reviewer_arrives(
+    db: aiosqlite.Connection, with_identity
+):
+    """#1290 AC-2: дедуп записи — не отказ навсегда.
+
+    Мутация «отказывать навсегда после первой записи» роняет этот тест:
+    ожидание обязано кончиться стартом, как только ревьюер назван. «Пока
+    неизвестно» не превращается в «неизвестно никогда» оттого, что про
+    ожидание перестали писать в ленту.
+    """
+    project_id = await _project(db, "shadow-waiting-ends")
+    task_id = await _task(db, project_id)
+    await _no_dispatch(db, task_id)
+    await order_run(db, task_id, 1)
+
+    await _tick_waiting(db, 4)
+    assert (await _runs(db, task_id))[0]["status"] == RUN_OPEN
+
+    await db.execute(
+        "INSERT INTO review_dispatches "
+        "(task_id, submission_generation, agent_id, model, status) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, 1, "rev-agent", "grok-4.6", "done"),
+    )
+    await db.commit()
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
+    ) as started:
+        assert await start_due_runs(db) == 1
+
+    assert started.await_count == 1
+    assert (await _runs(db, task_id))[0]["agent_id"] == "agent-1"
+
+
+async def test_a_slot_that_waited_for_a_reviewer_says_so_when_it_closes(
+    db: aiosqlite.Connection, with_identity, monkeypatch
+):
+    """#1290 AC-3: закрытие по дедлайну называет именно это ожидание.
+
+    По журналу первого вечера нельзя было отличить «ждали ревьюера полчаса и
+    не дождались» от любого другого заказа, который не начался: оба читались
+    как never_started с общим текстом. Статус остаётся прежним — он отделяет
+    «не начинался» от таймаута судьи, — а причина обязана назвать ожидание.
+    """
+    project_id = await _project(db, "shadow-waited-and-closed")
+    task_id = await _task(db, project_id)
+    await _no_dispatch(db, task_id)
+    await order_run(db, task_id, 1)
+    await _tick_waiting(db, 2)
+
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now','-1 minute') "
+        "WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+
+    assert await close_finished_runs(db) == 1
+    run = (await _runs(db, task_id))[0]
+    assert run["status"] == RUN_NEVER_STARTED
+    assert "ревьюер" in run["closed_reason"], (
+        f"причина не называет ожидание ревьюера: {run['closed_reason']}"
+    )
+
+    # Контраст: заказ, который не начался по другой причине, называет её же,
+    # а не ожидание ревьюера — иначе «называет причину» ничего не значит.
+    other_id = await _task(db, project_id)
+    await order_run(db, other_id, 1)
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "")
+    await _tick_waiting(db, 1)
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now','-1 minute') "
+        "WHERE task_id=?",
+        (other_id,),
+    )
+    await db.commit()
+
+    assert await close_finished_runs(db) == 1
+    other = (await _runs(db, other_id))[0]
+    assert other["status"] == RUN_NEVER_STARTED
+    assert "ревьюер" not in other["closed_reason"], other["closed_reason"]
 
 
 async def test_waiting_needs_a_project_that_asks_for_review(
