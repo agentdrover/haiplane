@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import json
+
 import aiosqlite
 import pytest
 from fastapi import HTTPException
@@ -369,6 +371,10 @@ def _brief(**over) -> ReviewBrief:
                 "lost_dimensions": [],
                 "self_reviewed": False,
                 "submitted_by": "cursor-cloud-reviewer",
+                # Владелец отчёта по ТОКЕНУ (#1025): без него «не автор»
+                # никто не устанавливал, и ноль в self_reviewed значит
+                # «вопрос не задавали», а не «второй взгляд».
+                "principal_id": 77,
                 **mr_over,
             }
         ),
@@ -694,16 +700,58 @@ async def test_a_self_issued_approval_is_visible_and_sampled(
     )
     mine = [dict(e) for e in events if dict(e)["task_id"] == task_id]
     assert mine and mine[-1]["actor"] == "steward"
-    # 3. Выборка на спот-чек: переиспользуется механика #1144, а не заводится
-    #    вторая. Самостоятельное одобрение обязано попасть в oversample.
-    from hub.services.digest import _audit_pool_and_oversample
+    # 3. Дайджест — НАСТОЯЩИЙ ``generate_due_digests``, а не его помощник:
+    #    раздел, который собирается из вызова в тесте, а не из событий дня,
+    #    доказывал бы согласие теста с собой (находка 418ab62b734cb596).
+    #    Рядом — задача, по которой стюард только ПОСОВЕТОВАЛ approve, и
+    #    задача, которую одобрил человек: ни та, ни другая строкой
+    #    самоодобрения стать не должны.
+    advised = await _client_task(db, project_id)
+    await _judge(db, advised, verdict="approve")
+    by_human = await _client_task(db, project_id)
+    from hub.services.lifecycle import record_review_verdict
 
+    await record_review_verdict(
+        db,
+        by_human,
+        TaskReviewVerdict(agent="denis", verdict=ReviewVerdict.approved),
+    )
+
+    from datetime import UTC, datetime, timedelta
+
+    from hub.services.digest import (
+        SELF_APPROVALS_KEY,
+        _audit_pool_and_oversample,
+        generate_due_digests,
+    )
+
+    assert (
+        await generate_due_digests(db, now=datetime.now(UTC) + timedelta(days=1)) == 1
+    )
+    payload = json.loads(dict((await repo.list_digests(db))[0])["payload"])
+    applied = payload[SELF_APPROVALS_KEY]
+    assert [a["task_id"] for a in applied] == [task_id], (
+        "дайджест обязан назвать ПРИМЕНЁННОЕ самоодобрение отдельной строкой — "
+        "и только его: совет стюарда и человеческий вердикт ею не являются"
+    )
+    assert applied[0]["generation"] == 1
+    # Выборка на спот-чек: механика #1144, а не вторая. Пул и oversample
+    # считаются из ТЕХ ЖЕ списков, что лежат в дайджесте.
     pool, oversample = _audit_pool_and_oversample(
-        [], [], [], [{"task_id": task_id, "verdict": "approve"}]
+        payload["auto_approvals"],
+        payload["auto_verdicts"],
+        payload["escalations"],
+        payload["steward_judgements"],
+        applied,
     )
     assert task_id in pool and task_id in oversample, (
         "решение, которого человек не видел, обязано проверяться чаще среднего"
     )
+    announced = [
+        json.loads(dict(e)["payload"])
+        for e in await repo.list_events(db, since=0, kinds=["digest_created"], limit=10)
+    ]
+    assert announced[-1]["steward_self_approvals"] == 1
 
 
 async def test_a_decision_that_did_not_converge_never_applies(
@@ -1167,3 +1215,93 @@ async def test_an_unverified_deployment_is_not_a_live_check(db: aiosqlite.Connec
     # сторож, отказывающий всегда, был бы неотличим от работающего.
     verified = await _decide_with("in_prod")
     assert verified.allowed, verified.reason
+
+
+async def test_a_self_approval_is_named_apart_on_the_digest_page(
+    db: aiosqlite.Connection, client, monkeypatch
+):
+    """Страница дайджеста не называет применённое одобрение рекомендацией.
+
+    До #1231 раздел стюарда говорил «Решение остаётся человеческим» про
+    любое суждение — и это была правда, пока стюард только советовал. С
+    самоодобрением эта строка стала бы ложью ровно про ту задачу, которую
+    человек не видел (находка 418ab62b734cb596).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from hub.services.digest import generate_due_digests
+
+    monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
+    project_id = await _project(db, "self-approval-page")
+    task_id = await _client_task(db, project_id)
+    await _judge(db, task_id, verdict="approve")
+    outcome, _ = await approve_without_a_human(db, task_id, 1, _decide())
+    assert outcome == APPLIED
+
+    assert (
+        await generate_due_digests(db, now=datetime.now(UTC) + timedelta(days=1)) == 1
+    )
+    page = await client.get("/digests")
+    assert page.status_code == 200
+    assert "Одобрено стюардом без человека" in page.text
+    assert "Решение остаётся человеческим" not in page.text, (
+        "в дайджесте, где стюард одобрил сам, строка «решение человеческое» ложна"
+    )
+
+
+async def test_independence_nobody_established_is_not_a_second_look(
+    db: aiosqlite.Connection,
+):
+    """``self_reviewed=False`` двузначен, и только одно из значений — «не автор».
+
+    Колонка добавлена с DEFAULT 0 (#728): на строках до неё ноль значит
+    «вопрос не задавали», а не «проверил другой». Владелец отчёта по токену
+    (``principal_id``, #1025) появился ПОСЛЕ неё, поэтому отчёт с владельцем
+    — это отчёт, про который вопрос задан и отвечен. Без владельца признак
+    не сходится: незнание не имеет права читаться как второй взгляд
+    (находка f9ac6478eaeb2ac2).
+
+    Отчёт записывается настоящим ``insert_machine_review`` и читается тем
+    же построителем, что кормит бриф: поле, потерянное по дороге из строки
+    в вид, уронило бы этот тест, а не прошло молча.
+    """
+    from hub.services.review_evidence import review_report
+
+    project_id = await _project(db, "self-review-unestablished")
+    task_id = await _client_task(db, project_id, submission_generation=1)
+
+    async def _view(**owner):
+        await repo.insert_machine_review(
+            db,
+            task_id=task_id,
+            submission_generation=1,
+            harness_skill="multi-agent-review",
+            self_reviewed=False,
+            **owner,
+        )
+        await db.commit()
+        task_row = await repo.get_task(db, task_id)
+        mr_row = await repo.get_latest_machine_review(db, task_id)
+        report = await review_report(db, dict(task_row), mr_row)
+        return report.machine_review.model_dump()
+
+    unowned = await _view()
+    assert unowned["self_reviewed"] is False and unowned["principal_id"] is None
+    decision = _decide(
+        machine_review_fields={**unowned, "is_current": True, "incomplete": False}
+    )
+    assert not decision.allowed
+    assert [code for code, _ in decision.missing] == ["reviewed_by_someone_else"], (
+        decision.reason
+    )
+    assert "не установ" in decision.missing[0][1], (
+        "отказ обязан назвать, что независимость НЕ УСТАНОВЛЕНА, а не что "
+        "отчёт сдан автором: это разные факты, и чинятся они по-разному"
+    )
+
+    owned = await _view(principal_id=77)
+    assert owned["principal_id"] == 77
+    decision = _decide(
+        machine_review_fields={**owned, "is_current": True, "incomplete": False}
+    )
+    assert decision.allowed, decision.reason
