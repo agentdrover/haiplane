@@ -42,6 +42,7 @@ from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
 from hub.services import chat_pair as chat_pair_svc
 from hub.services import project_policy
+from hub.services import steward_dispatch
 from hub.services.finding_evidence import evidence_for_findings, evidence_for_report
 from hub.services.finding_identity import finding_uids
 from hub.services.review_evidence import inflight_view
@@ -1055,8 +1056,25 @@ def _parse_policy_form(raw: str) -> tuple[dict[str, Any] | None, str | None]:
 # form showed them, so the submitter had a say. Everything else in the stored
 # policy is carried through untouched (#886).
 _FORM_GATE_POLICY_KEYS = frozenset(
-    {"dor", "verdict", "review", "dor_max_class", "risk_map", "release"}
+    {
+        "dor",
+        "verdict",
+        "review",
+        "dor_max_class",
+        "risk_map",
+        "release",
+        # #1280: теневое участие стюарда — седьмая ручка ЭТОЙ формы, и потому
+        # живёт здесь: иначе перенос ниже (#886) вернул бы сохранённое true
+        # поверх снятой галочки, и рычаг работал бы в одну сторону.
+        steward_dispatch.STEWARD_SHADOW_KEY,
+    }
 )
+
+#: Имя поля переключателя теневого участия в форме проекта (#1280). Скрытое
+#: поле и чекбокс носят ЕГО ОБА: снятый чекбокс браузер не присылает вовсе, и
+#: без скрытого спутника «выключить» было бы неотличимо от «этот POST про
+#: переключатель не знает».
+_SHADOW_FIELD = f"gate_policy_{steward_dispatch.STEWARD_SHADOW_KEY}"
 
 
 # Отказ, привязанный к проекту, показывается У ЕГО КАРТОЧКИ (#1188). Общая
@@ -1177,6 +1195,7 @@ async def web_edit_project(project_id: int, request: Request):
             "gate_policy_release",
             "gate_policy_dor_max_class",
             "gate_policy_risk_map",
+            _SHADOW_FIELD,
         )
     ):
         gate_policy: dict[str, Any] = {
@@ -1207,6 +1226,23 @@ async def web_edit_project(project_id: int, request: Request):
             == project_policy.RELEASE_AUTO
         ):
             gate_policy["release"] = project_policy.RELEASE_AUTO
+        # #1280: теневое участие стюарда — не значение гейта, а отдельный
+        # булев ключ: проект просит суждения, не отдавая решения, поэтому
+        # переключатель предлагается и проекту default и замок #743 его не
+        # касается. Читается СПИСОК значений поля: скрытое "off" приезжает
+        # всегда, чекбокс добавляет "on" сверху, и «выключить» становится
+        # наблюдаемым намерением, а не выведенным из молчания браузера.
+        # Пустого списка у этой формы не бывает: скрытое поле стоит вне
+        # чекбокса и уезжает всегда. Если он всё же пуст — отправка пришла
+        # не из формы, и ключ разделяет судьбу release: он назван ручкой
+        # ЭТОЙ формы (см. _FORM_GATE_POLICY_KEYS), поэтому не приезжает =
+        # снят. Иначе выключение работало бы в одну сторону.
+        shadow = [str(value).strip() for value in form.getlist(_SHADOW_FIELD)]
+        if shadow:
+            # Строго bool: валидация ключа (#1268) не примет ни "on", ни 1, а
+            # явный False честнее удаления ключа — он говорит, что участие
+            # выключили, а не что о нём не спрашивали.
+            gate_policy[steward_dispatch.STEWARD_SHADOW_KEY] = "on" in shadow
         # #760: the form carries the WHOLE policy, so an emptied field means
         # "remove this knob", not "leave it alone" — the same semantics the
         # selects already have, and the only ones a form can honestly offer.
