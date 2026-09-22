@@ -1861,6 +1861,108 @@ async def test_unknown_origin_still_lets_the_submitted_diff_buy_deep(
     )
 
 
+async def test_an_empty_brought_half_names_the_squash_case(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Сжатие базы названо в карточке, а не только в комментарии кода (#1240).
+
+    Постановка #1249 требует: на форже, где доставка идёт сжатием, коммиты
+    базы не предки по хешу, и этот случай «должен быть назван, а не пройти
+    мимо». Разбор по достижимости тогда целиком отдаёт привезённое автору —
+    промах в безопасную сторону, но человек, читающий карточку, должен знать,
+    что «файлов только из базы нет» может означать и это.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o7"}, "run": {"id": "r-o7"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-squash")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=_MERGED_DELTA
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    cards = [
+        u["content"] for u in data["updates"] or [] if "Предмет ревью" in u["content"]
+    ]
+    assert "сжатием" in cards[-1] and "#1240" in cards[-1], (
+        "случай сжатия назван там, где его читает человек"
+    )
+
+
+async def test_a_bare_merge_of_the_base_reads_the_whole_delta_and_says_why(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Круг без своей правки — голый мерж базы (#1249).
+
+    Сузить предмет до нуля файлов значило бы выдать ревьюеру пустую команду.
+    Поэтому читается вся дельта, а карточка говорит, почему она такая
+    широкая: всё привезено базой, своей правки в этом круге нет.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o8"}, "run": {"id": "r-o8"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-bare-merge")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=""
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert f"'{_AUTHOR_FILE}'" in prompt and f"'{_BASE_FILE}'" in prompt, (
+        "голый мерж не сужает предмет до пустой команды"
+    )
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    cards = [
+        u["content"] for u in data["updates"] or [] if "Предмет ревью" in u["content"]
+    ]
+    assert "2 файл(ов), все привезены базой" in cards[-1], (
+        "ширина предмета объяснена числом и причиной"
+    )
+    assert "своей правки в этом круге нет" in cards[-1]
+
+
+async def test_generation_delta_splits_origin_with_real_git(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Место вызова ``delta_without_base`` — настоящим git (находка #1249).
+
+    Все AC диспатча подменяют git двойником, который отвечает вложенное и
+    не смотрит на аргументы. Перестановка ``prev``/``current`` на месте
+    вызова тогда невидима. Здесь ``generation_delta`` идёт по клону, собранному
+    настоящим git: автор сдал ``mine.py``, слил базу с чужим ``theirs.py`` и
+    дописал второй круг. Переставь концы — ``git log prev --not current``
+    пуст, и разбор скажет «всё привезено базой».
+    """
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import review_dispatch as rd
+    from tests.test_git_ops import _delta_clone
+
+    clone, prev, current = _delta_clone(tmp_path)
+    task_id = await _second_generation(client, db, "spike-origin-real-git")
+    await repo.record_submission(
+        db, task_id=task_id, generation=1, sha=prev, base_branch="develop"
+    )
+    await db.execute(
+        "UPDATE tasks SET submission_sha = ? WHERE id = ?", (current, task_id)
+    )
+    await db.commit()
+
+    async def _clone_context(_db, _task_id):
+        return str(clone), "develop"
+
+    monkeypatch.setattr(rd, "_git_context", _clone_context)
+    plugins.git_ops = GitOpsIntegration()
+    task = dict(await repo.get_task(db, task_id))
+
+    subject = await rd.generation_delta(db, task, "develop")
+
+    assert subject.paths == ["mine.py"], subject.note
+    assert subject.base_paths == ["theirs.py"], subject.note
+    assert "починка второго круга" in subject.author_diff
+    assert "1 файл(ов) автора и 1 привезено базой" in subject.note
+
+
 async def test_previous_findings_travel_with_the_delta(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
