@@ -2884,6 +2884,44 @@ async def test_hub_submit_machine_review(mock_api_post: AsyncMock) -> None:
     assert "duration_ms" not in body  # omitted optionals stay omitted
 
 
+async def test_hub_submit_machine_review_names_the_report_outcome(
+    mock_api_post: AsyncMock,
+) -> None:
+    """The receipt names the stored report's outcome, not just its count (#1234).
+
+    "0 confirmed / 3 rejected" beside a non-empty ``unresolved`` was read by
+    agents as a clean report and quoted into tasks. The outcome comes from the
+    STORED row the API returns, the same place the numbers come from; a row
+    without one adds nothing rather than inventing a verdict.
+    """
+    from hub.mcp_server import hub_submit_machine_review
+
+    label = "неразрешённые находки: никто не смог их рассудить"
+    mock_api_post.return_value = {
+        "id": 1,
+        "task_id": 42,
+        "submission_generation": 1,
+        "raw_count": 4,
+        "findings_confirmed": [],
+        "findings_rejected": [{"title": "n", "category": "style", "reason": "r"}],
+        "unresolved": [{"title": "u", "why": "w"}],
+        "outcome": "unresolved_findings",
+        "outcome_label": label,
+    }
+    out = await hub_submit_machine_review(42, raw_count=4, incomplete=False)
+    text = out.content[0].text
+    assert "0 confirmed / 1 rejected" in text
+    assert f"Исход отчёта: {label}." in text
+
+    mock_api_post.return_value = {
+        k: v
+        for k, v in mock_api_post.return_value.items()
+        if k not in ("outcome", "outcome_label")
+    }
+    out = await hub_submit_machine_review(42, raw_count=4, incomplete=False)
+    assert "Исход отчёта" not in out.content[0].text
+
+
 async def test_hub_submit_steward_judgement(mock_api_post: AsyncMock) -> None:
     from hub.mcp_server import hub_submit_steward_judgement
 

@@ -729,3 +729,43 @@ async def test_the_digest_ignores_a_report_that_landed_after_the_verdict(db):
         "вердикт стоял на ПЕРВОМ отчёте — его ступень и показывают"
     )
     assert entry["models"]["reviewer"] == "grok-4.6"
+
+
+async def test_the_report_feed_carries_unresolved_and_the_outcome(client, db):
+    """Лента приёма отчёта — четвёртый читатель, и она тоже говорила «чисто».
+
+    Событие ``machine_review_completed`` и строка журнала активности несли
+    только raw/confirmed/rejected: отчёт с нулём подтверждённых и непустым
+    unresolved выглядел в ленте ровно как чистый — «0 confirmed, 1 rejected».
+    Ступень берётся из той же функции, что и на карточке, а число
+    неразрешённых пишется рядом с числом подтверждённых.
+    """
+    import json as _json
+
+    from hub import repository as repo_module
+    from tests.test_web import _web_task_in_review_with_test_ac
+
+    task_id = await _web_task_in_review_with_test_ac(client, db)
+    await _report_with_unresolved(client, task_id)
+
+    rows = await repo_module.list_events(
+        db, since=0, kinds=["machine_review_completed"], limit=100
+    )
+    payloads = [
+        _json.loads(dict(r)["payload"] or "{}")
+        for r in rows
+        if dict(r)["task_id"] == task_id
+    ]
+    assert len(payloads) == 1
+    assert payloads[0]["unresolved"] == 1
+    assert payloads[0]["outcome"] == OUTCOME_UNRESOLVED
+
+    cur = await db.execute(
+        "SELECT summary FROM activity_log WHERE kind='machine_review_completed' "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    summary = (await cur.fetchone())[0]
+    assert f"Task #{task_id}" in summary
+    assert "1 unresolved" in summary
+    assert outcome_label(OUTCOME_UNRESOLVED) in summary
+    assert CLEAN_WORDS not in summary
