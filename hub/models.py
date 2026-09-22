@@ -705,13 +705,38 @@ class LatestReview(BaseModel):
     ``self_approved`` is True when the verdict was accepted only because of
     the ``HAIPLANE_REVIEW_SELF_APPROVE=allow`` solo opt-out: the implementer
     reviewed their own work, so the verdict is not independent (#434).
+    ``closed_by_decision`` is the OTHER way a verdict stops being current
+    (#1286): a human sent the work back for rework and revoked the approval
+    it carried. Told apart from a resubmission on purpose — the reader sees a
+    verdict that nothing has superseded and needs to know why it no longer
+    counts. Both halves are narrow. Only an APPROVAL has a window to revoke,
+    so a CHANGES_REQUESTED verdict is never closed by the decision that agrees
+    with it; and a resubmission supersedes the closure, because from then on
+    the answer to "why doesn't it count" is that the work changed.
     """
 
     verdict: ReviewVerdict
     submission_generation: int = 0
     is_current: bool = False
+    closed_by_decision: bool = False
     self_approved: bool = False
     findings: list[ReviewFinding] = Field(default_factory=list)
+
+
+def latest_review_freshness(is_current: bool, closed_by_decision: bool = False) -> str:
+    """Why a verdict no longer counts — in the words that are true of it.
+
+    Every reader of ``latest_review`` used to have the same two-way sentence:
+    current, or "stale — work resubmitted". After #1286 there is a second way
+    to stop counting, and that sentence became false for it — the work was NOT
+    resubmitted, a human called it back. One function so the four places that
+    say this cannot drift into saying different things.
+    """
+    if is_current:
+        return "current"
+    if closed_by_decision:
+        return "closed by the rework decision — resubmit"
+    return "stale — work resubmitted"
 
 
 class SelfReviewWarning(BaseModel):

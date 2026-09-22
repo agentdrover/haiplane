@@ -2064,6 +2064,17 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE review_dispatches ADD COLUMN second_door_reason TEXT "
         "NOT NULL DEFAULT ''",
     ),
+    (
+        # #1286: поколение сдачи, чьё одобрение закрыто решением человека
+        # «на доработку». Отдельная колонка, а не обнуление review_verdict:
+        # карточка строит latest_review из полей вердикта, и стирание унесло
+        # бы вместе с окном и находки, и то, что именно было одобрено.
+        # NULL — окно никто не закрывал; новый вердикт снимает отметку
+        # (record_review_verdict), потому что она принадлежит вердикту так же,
+        # как review_self_approved.
+        "add_review_verdict_closed_generation_column",
+        "ALTER TABLE tasks ADD COLUMN review_verdict_closed_generation INTEGER",
+    ),
 ]
 
 
