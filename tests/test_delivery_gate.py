@@ -1414,6 +1414,12 @@ async def test_the_gate_path_runs_the_validation_and_stops_on_a_red_code(
         "ровно ловушка 09.09: зелёный хвост при красном коде возврата"
     )
     assert seen.get("tip") == pinned, "и мержит она закреплённое, а не вершину"
+    # Находка 2327bd9255c601cc: пуш сверяет конфликт с ТОЙ ЖЕ пробой, по
+    # которой считалось разрешение. Гейт, забывший её передать, превращал бы
+    # каждый хвостовой автомерж в отказ «не с чем сверить» — молча и навсегда.
+    assert seen.get("probed") == {"tests/test_review_dispatch.py": _TAIL_CONFLICT}, (
+        "гейт обязан отдать пушу ту пробу, по которой посчитано разрешение"
+    )
     task = dict(await repo.get_task(db, task_id))
     assert task["status"] == "needs_decision", (
         "красный код возврата ведёт к человеку, а не к доставке"
@@ -3673,3 +3679,43 @@ async def test_a_push_without_the_probe_refuses_instead_of_resolving_blind(
 
     assert not ok and "не с чем сверить" in detail
     assert _tip(repo, "task-1233/probe") == before
+
+
+async def test_a_cancelled_base_merge_leaves_no_scratch_worktree(
+    tmp_path, monkeypatch
+) -> None:
+    """Отмена посреди мержа базы не бросает одноразовое дерево (#1233).
+
+    Находка f529be6df1e61160. Между ``worktree add`` и возвратом пути мерж
+    базы шёл без страховки: ``CancelledError`` (гашение поллера, отмена
+    вызова) пролетал мимо, а вызывающие чистят дерево только когда путь им
+    вернули. Дерево оставалось рядом с клоном с незавершённым мержем внутри,
+    и убиралось лишь следующей попыткой той же задачи — если она будет.
+    """
+    import asyncio
+    import os
+
+    from hub.integrations import git_ops as git_ops_mod
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    repo = _repo_with_a_tail_conflict(tmp_path)
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1233/probe")
+    real_git = git_ops_mod._git
+
+    async def _cancelled_merge(*args, **kw):
+        if "merge" in args and "--no-commit" in args:
+            raise asyncio.CancelledError
+        return await real_git(*args, **kw)
+
+    monkeypatch.setattr(git_ops_mod, "_git", _cancelled_merge)
+
+    with pytest.raises(asyncio.CancelledError):
+        await ops.base_merge_conflicts(
+            str(repo), "develop", "task-1233/probe", 1233, pinned
+        )
+
+    scratch = git_ops_mod._scratch_worktree(str(repo), "basemerge", 1233)
+    assert not os.path.exists(scratch), "отменённый мерж не оставляет дерево"
+    listed = await real_git("worktree", "list", "--porcelain", repo=str(repo))
+    assert scratch not in (listed[1] or ""), "и git о нём тоже не помнит"

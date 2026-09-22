@@ -2897,16 +2897,23 @@ class GitOpsIntegration:
         )
         if rc != 0:
             return "", f"не удалось подготовить дерево для мержа базы: {err[:150]}"
-        rc, _, err = await _git(
-            "-c",
-            "merge.conflictStyle=diff3",
-            "merge",
-            "--no-commit",
-            "--no-ff",
-            f"origin/{base}",
-            repo=path,
-            check=False,
-        )
+        try:
+            rc, _, err = await _git(
+                "-c",
+                "merge.conflictStyle=diff3",
+                "merge",
+                "--no-commit",
+                "--no-ff",
+                f"origin/{base}",
+                repo=path,
+                check=False,
+            )
+        except BaseException:
+            # Вызывающие чистят дерево, только когда путь им вернули. Отмена
+            # посреди мержа (гашение поллера) иначе бросала его рядом с клоном
+            # с незавершённым мержем внутри (находка f529be6df1e61160).
+            await _git("worktree", "remove", "--force", path, repo=repo, check=False)
+            raise
         if rc == _TIMEOUT_RC or rc >= 128:
             # Таймаут и падение самого git — «спросить не удалось», а не
             # конфликт: лечится повтором, а не человеком (#970, #1116).
