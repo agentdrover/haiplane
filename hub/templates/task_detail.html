@@ -751,6 +751,23 @@
                     <dt>Review</dt>
                     <dd>cycle {{ task.review_cycle }}/3 {% if task.review_job_id %}<code class="code-sm">{{ task.review_job_id[:16] }}...</code>{% endif %}</dd>
                     {% endif %}
+                    {# #1235: заходы «закрыли находки — пришли новые». Стоят
+                       ОТДЕЛЬНОЙ строкой от cycle: то другой счёт (возвраты
+                       работы автору) и другой потолок, который задачу
+                       останавливает. Здесь не останавливается ничего. #}
+                    {% if task.review_circle.laps %}
+                    <dt>Circle</dt>
+                    <dd>
+                      заходов {{ task.review_circle.laps }}{% if task.review_circle.threshold %}/{{ task.review_circle.threshold }}{% endif %}
+                      {% if task.review_circle.named %}<span class="badge badge-circle">круг назван</span>{% endif %}
+                      <ul class="circle-laps">
+                        {% for line in task.review_circle.breakdown %}<li>{{ line }}</li>{% endfor %}
+                      </ul>
+                      {% if task.review_circle.repeated_categories %}
+                      <div class="circle-repeat">Повтор категории: {{ task.review_circle.repeated_categories | join(', ') }} — харнесс ходит по одному месту, и это важнее числа заходов.</div>
+                      {% endif %}
+                    </dd>
+                    {% endif %}
                     {% if task.ci_fix_cycle > 0 %}
                     <dt>CI Fix</dt>
                     <dd>cycle {{ task.ci_fix_cycle }}/3</dd>

@@ -728,6 +728,31 @@ async def review_report(
     if mr_row is not None:
         machine_review = MachineReviewView(**dict(mr_row))
         machine_review.is_current = machine_review.submission_generation == generation
+        # #1266 (round 2, 715481fedbf41130): channel and reason belong to
+        # THIS report's OWN dispatch, not "the latest DONE dispatch"
+        # (get_settled_review_dispatch orders by DISPATCH id, while the
+        # report shown here is the latest by REPORT id — get_latest_machine_
+        # review). In the AC-5 shape those diverge: a local replacement can
+        # settle with its own report before an earlier cloud order settles
+        # with its late report, so the local dispatch carries the higher id
+        # even though the CLOUD report is the one actually displayed here.
+        # dispatch_for_report answers "which dispatch produced THIS report"
+        # with the same principal+channel+rung rule _dispatch_report already
+        # uses — not a second rule. Cloud, or no matching dispatch, leaves
+        # both fields empty — never guessed, never shown as if it were local.
+        from hub.services.review_dispatch import LOCAL_CHANNEL, dispatch_for_report
+
+        own_dispatch = await dispatch_for_report(
+            db,
+            int(task_row["id"]),
+            machine_review.submission_generation,
+            dict(mr_row),
+        )
+        if own_dispatch is not None and own_dispatch.get("channel") == LOCAL_CHANNEL:
+            machine_review.second_door_channel = LOCAL_CHANNEL
+            machine_review.second_door_reason = (
+                own_dispatch.get("second_door_reason") or ""
+            )
         await attach_dispositions(db, machine_review)
         state = "current" if machine_review.is_current else "stale"
 

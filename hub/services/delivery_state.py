@@ -43,6 +43,11 @@ from typing import Any
 
 from hub import config
 from hub import repository as repo
+
+# Пороги доказательства доставки живут в hub/db.py: их применяют ДВА места
+# — живая дверь в этом файле и SQL засыпки, — и пока определений было два,
+# они разошлись (находка 80fcb9c9).
+from hub.db import MIN_EVIDENCE_CHARS, MIN_SHA_CHARS
 from hub.integrations.registry import plugins
 
 log = logging.getLogger("hub")
@@ -359,11 +364,83 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
     )
 
 
+#: Один текст на обоих потребителей — строку зависимости и реестр (#1214).
+#:
+#: До задачи их было два: «проверить базовую ветку не удалось» у строки
+#: зависимости и «базовую ветку проверить не удалось» у реестра. Разные слова
+#: об одном факте заставляют читателя гадать, разные ли это факты, — а вся
+#: ценность обеих строк в том, что им верят с одного взгляда.
+BASE_UNCHECKED_NOTE = "проверить базовую ветку не удалось"
+
+#: Отдельный текст для случая, который и завёл #1214: посмотреть МОЖНО, но
+#: смотреть бесполезно — метод неприменим по построению.
+#:
+#: Не сводится к предыдущему намеренно. «Не удалось» зовёт попробовать ещё раз
+#: (сеть, клон, права — всё это чинится и проходит). Здесь чинить нечего:
+#: сколько ни спрашивай родословную о squash-мерже, ответ будет один и тот же
+#: и одинаково бессодержательный. Читателю нужно знать, какой из двух случаев
+#: перед ним, иначе он будет ждать, что строка когда-нибудь дозреет.
+BASE_UNANSWERABLE_NOTE = (
+    "родословная о доставке здесь не судит: конвейер мержит squash-ом, "
+    "и сдаточный коммит не станет предком базовой ветки даже после доставки"
+)
+
+
+async def merged_into_base_detail(
+    db: Any, task_row: dict[str, Any]
+) -> tuple[bool | None, str]:
+    """То же, что ``merged_into_base``, но с ПРИЧИНОЙ молчания (#1214).
+
+    Возвращает ``(ответ, примечание)``. Примечание непусто только у ``None`` и
+    называет, ПОЧЕМУ ответа нет: посмотреть не удалось или смотреть этим
+    способом нельзя. Пустое примечание при ``None`` — третий случай: искать
+    было нечего, сдаточный коммит не закреплён, и говорить тут не о чем.
+
+    Почему причина возвращается вместе с ответом, а не выясняется потребителем
+    заново: потребителей два, вопрос один, и разъехавшиеся формулировки — уже
+    случившийся дефект, а не гипотеза (см. константы выше).
+    """
+    sha = (task_row.get("submission_sha") or "").strip()
+    if not sha:
+        return (None, "")
+    try:
+        from hub import services
+
+        ctx = await services.project_git_context(db, task_row["id"])
+        workspace = (ctx.get("repo") or "").strip()
+        base = (ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
+        forge = (ctx.get("forge") or "").strip()
+    except Exception as exc:  # noqa: BLE001 - advisory path, never fatal
+        log.warning("delivery check for #%s: no git context: %s", task_row["id"], exc)
+        return (None, BASE_UNCHECKED_NOTE)
+    if not workspace:
+        return (None, BASE_UNCHECKED_NOTE)
+    # ПРИМЕНИМОСТЬ МЕТОДА — ДО ВЫЗОВА GIT, и это не оптимизация.
+    #
+    # Спросить сначала git, а потом решать, что значил его ответ, значит один
+    # раз обязательно забыть про второй шаг. Здесь вопрос вообще не задаётся:
+    # если конвейер мержит squash, сдаточный коммит не предок базы по
+    # построению, и «нет» от git было бы утверждением, которого никто не
+    # проверял. Стоимость при этом падает, а не растёт — git не зовут вовсе.
+    if not plugins.git_ops.merge_preserves_ancestry(forge):
+        return (None, BASE_UNANSWERABLE_NOTE)
+    # origin/<base> rather than <base>: the shared clone sits on the base
+    # branch but may be behind, and the question is about what has landed
+    # upstream, not about this checkout.
+    reached = await plugins.git_ops.is_ancestor(workspace, sha, f"origin/{base}")
+    return (reached, "" if reached is not None else BASE_UNCHECKED_NOTE)
+
+
 async def merged_into_base(db: Any, task_row: dict[str, Any]) -> bool | None:
     """Is this task's submitted commit already in its project's base branch (#885)?
 
     True — yes, wherever the merge came from. False — looked and it is not.
     None — could not look, which is NOT the same as "not delivered" (#725).
+
+    #1214: с 09.09.2026 ``None`` покрывает и второй случай незнания — вопрос
+    задан методом, который к стратегии мержа этого проекта неприменим. Для
+    вызывающего разницы нет (незнание есть незнание), поэтому подпись прежняя;
+    кому нужна ПРИЧИНА молчания — тот зовёт ``merged_into_base_detail``.
 
     Exists because delivery was read from ``pipeline_merges`` alone — merges
     the hub performed itself (#534). A merge made outside the gate leaves no
@@ -376,24 +453,8 @@ async def merged_into_base(db: Any, task_row: dict[str, Any]) -> bool | None:
     Cheap by construction: callers ask ONLY for blockers with no pipeline
     merge, so in the normal path this runs zero git commands.
     """
-    sha = (task_row.get("submission_sha") or "").strip()
-    if not sha:
-        return None
-    try:
-        from hub import services
-
-        ctx = await services.project_git_context(db, task_row["id"])
-        workspace = (ctx.get("repo") or "").strip()
-        base = (ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
-    except Exception as exc:  # noqa: BLE001 - advisory path, never fatal
-        log.warning("delivery check for #%s: no git context: %s", task_row["id"], exc)
-        return None
-    if not workspace:
-        return None
-    # origin/<base> rather than <base>: the shared clone sits on the base
-    # branch but may be behind, and the question is about what has landed
-    # upstream, not about this checkout.
-    return await plugins.git_ops.is_ancestor(workspace, sha, f"origin/{base}")
+    reached, _note = await merged_into_base_detail(db, task_row)
+    return reached
 
 
 async def blocker_delivery(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
@@ -410,11 +471,12 @@ async def blocker_delivery(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
         return {**blocker, "delivery_path": "gate"}
     row = await repo.get_task(db, blocker["task_id"])
     task = dict(row) if row is not None else {}
-    reached = await merged_into_base(db, task) if task else None
+    reached, note = await merged_into_base_detail(db, task) if task else (None, "")
     # A blocker that never pinned a commit has nothing to look for, so the
     # second source staying silent is not news — saying "could not check"
-    # there would add noise to a reason that is already complete.
-    had_something_to_check = bool((task.get("submission_sha") or "").strip())
+    # there would add noise to a reason that is already complete. Именно этот
+    # случай и отдаёт пустое примечание (#1214), поэтому отдельная проверка
+    # submission_sha здесь больше не нужна: правило живёт в одном месте.
     if reached is True:
         return {
             **blocker,
@@ -422,13 +484,13 @@ async def blocker_delivery(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
             "delivery_path": "outside_gate",
             "reason": "код в базовой ветке, но мерж прошёл мимо гейта",
         }
-    if reached is None and had_something_to_check and blocker.get("reason"):
+    if reached is None and note and blocker.get("reason"):
         # Keep the original reason and say the second source stayed silent —
         # "could not look" must not read as "looked and it is not there".
         return {
             **blocker,
             "delivery_path": "unknown",
-            "reason": f"{blocker['reason']}; проверить базовую ветку не удалось",
+            "reason": f"{blocker['reason']}; {note}",
         }
     return {**blocker, "delivery_path": "none"}
 
@@ -525,7 +587,7 @@ async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
             delivery_path="gate",
         )
 
-    reached = await merged_into_base(db, task)
+    reached, base_note_text = await merged_into_base_detail(db, task)
     if reached is True:
         return _task_answer(
             DELIVERED,
@@ -534,20 +596,39 @@ async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
             delivery_path="outside_gate",
         )
 
+    # Ровно тот же текст, что уходит в строку зависимости (#1214). Реестр и
+    # строка описывают один факт, и до задачи описывали его двумя разными
+    # фразами — «базовую ветку проверить не удалось» здесь против «проверить
+    # базовую ветку не удалось» там. Читателю приходилось решать, один это
+    # случай или два; теперь текст берётся из одной константы через один
+    # вопрос, и разъехаться им негде.
+    #
+    # Пустое примечание при reached is None означает «искать было нечего»
+    # (сдаточный коммит не закреплён) — там молчать правильнее, чем говорить
+    # о неудаче, которой не было. Раньше эта ветка тоже дописывала «не
+    # удалось», и это была маленькая версия того же дефекта.
+    base_note = f"; {base_note_text}" if base_note_text else ""
+
     if pr_number is None:
         # Assumption stated on the task: a completed task with no pinned PR is
         # indistinguishable here from work that never needed one. Saying so is
         # the honest answer; guessing would put research and spikes on a list
         # about undelivered pull requests.
+        #
+        # Причин молчания тут может быть две, и вторая уже посчитана. Говорить
+        # только про незакреплённый PR значит отправить читателя проверять
+        # базовую ветку руками — тем самым способом, о котором эта задача и
+        # говорит, что он о squash-мерже не судит. Слова берутся из той же
+        # константы, что у строки зависимости, поэтому разъехаться им негде.
         return _task_answer(
             UNKNOWN,
             "у задачи не закреплён PR — по нему сверять нечего. "
-            "Это не «не доставлено»: работы без ветки здесь не отличить",
+            "Это не «не доставлено»: работы без ветки здесь не отличить"
+            f"{base_note}",
             pr_number=None,
             delivery_path="none",
         )
 
-    base_note = "" if reached is False else "; базовую ветку проверить не удалось"
     workspace, gh_repo = "", ""
     try:
         from hub import services
@@ -614,6 +695,68 @@ async def task_delivery(db: Any, task: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+#: #1267: the named cause of a row whose closed recorded PR could not be
+#: checked for a live replacement — the branch search RAISED. Kept as a
+#: constant because the accept path and the sweep must say the same words.
+SEARCH_UNANSWERED_CAUSE = "поиск PR не ответил"
+
+
+def _search_unanswered(answer: dict[str, Any]) -> dict[str, Any]:
+    """A closed recorded PR whose replacement search failed: silence, not a fact.
+
+    ``task_delivery`` is right that the recorded number is closed. What it
+    cannot know is whether the branch carries a live PR elsewhere (#959) —
+    and when the search for one raised, "работу свернули намеренно" would be
+    silence written down as a decision (#802). The row stays ``unknown``: the
+    registry lists it and the sweep asks again (#1267). No new state, no second
+    computation — only the verdict on an answer already computed is withheld.
+    """
+    pr = answer["pr_number"]
+    return _task_answer(
+        UNKNOWN,
+        f"{SEARCH_UNANSWERED_CAUSE}: записанный PR #{pr} закрыт без мержа, но "
+        "есть ли у ветки открытая замена, узнать не удалось. Это незнание, а "
+        "не решение свернуть работу и не «доставлено» (#1267)",
+        pr_number=pr,
+        delivery_path="unknown",
+    )
+
+
+async def _answer_past_closed_number(
+    db: Any, task: dict[str, Any], answer: dict[str, Any]
+) -> dict[str, Any]:
+    """Re-ask a closed recorded PR the way #959 asks it: through the branch.
+
+    The sweep keys on ``pr_number``, which is a cached observation. Reading
+    "closed" off it as the final answer turned an ``unknown`` row — written
+    when the replacement search failed at accept — into ``pr_closed`` on the
+    very next pass, and ``pr_closed`` is never asked again (#1267, AC-3). The
+    replacement is found by ``resolve_delivery_pr``, the one rule the gate and
+    the human decision already use; the live PR's state is then asked through
+    ``task_delivery`` like any other — no second copy of either.
+    """
+    if answer["state"] != PR_CLOSED:
+        return answer
+    from hub import services
+
+    live_task, delivery_pr = await services.resolve_delivery_pr(db, task)
+    if delivery_pr.unusable and delivery_pr.search_unanswered:
+        return _search_unanswered(answer)
+    if (
+        not delivery_pr.unusable
+        and delivery_pr.number
+        and delivery_pr.number != answer["pr_number"]
+    ):
+        return await task_delivery(db, live_task)
+    if not delivery_pr.unusable and not delivery_pr.established:
+        # Cursor #390 (7bc5ff2093e7b0bb): the second pr_state read went silent,
+        # and pr_for_delivery hands back the recorded number unestablished —
+        # «could not ask», not an answer. Keeping the first «closed» here would
+        # write pr_closed, which is never asked again (#802, #959).
+        return _search_unanswered(answer)
+    return answer
+
+
 def _acceptance_note(answer: dict[str, Any], disposition: str) -> str:
     """The sentence a manual acceptance leaves behind instead of silence."""
     intent = _DISPOSITION_TEXT.get(disposition, _DISPOSITION_TEXT[""])
@@ -642,6 +785,7 @@ async def note_completion_without_delivery(
     via: str,
     actor: str = "human",
     disposition: str = "",
+    search_unanswered: bool = False,
 ) -> dict[str, Any] | None:
     """Say out loud what a completion outside the delivery gate left behind.
 
@@ -654,6 +798,11 @@ async def note_completion_without_delivery(
     be undone because GitHub was slow, and manual acceptance stays available in
     every form. Returns the answer it recorded, or ``None`` if it could not
     look at the task at all.
+
+    ``search_unanswered`` (#1267) is what ``deliver_on_disposition`` already
+    learned: the recorded PR is closed and the branch search for its live
+    replacement raised. A ``pr_closed`` answer is then written as ``unknown``
+    with that cause — never as "свернули намеренно".
     """
     try:
         row = await repo.get_task(db, task_id)
@@ -666,6 +815,8 @@ async def note_completion_without_delivery(
             # different findings under one name.
             return None
         answer = await task_delivery(db, task)
+        if search_unanswered and answer["state"] == PR_CLOSED:
+            answer = _search_unanswered(answer)
         disposition = disposition if disposition in DISPOSITIONS else ""
         await repo.record_delivery_discrepancy(
             db,
@@ -768,6 +919,19 @@ def _discrepancy_voice(
     if (prior.get("acknowledged_at") or "").strip() and settled_fact == state:
         return None
 
+    # Наблюдение — тоже законный выход, не только признание (#1215, находка
+    # ревью fa215699bb39343a). Строка, закрытая наблюдением, ушла из списка
+    # расхождений, но свип продолжает её проверять (наблюдение не отменяет
+    # вопроса), и без этой проверки следующий пройденный возрастной рубеж
+    # заново писал «Доставку подтвердить НЕ УДАЛОСЬ ... проверьте вручную» —
+    # ровно то, что уже проверили и подтвердили. observed_state сравнивается
+    # с ТЕКУЩИМ answer["state"], а не с прежним d.state: если источник ожил и
+    # заговорил другое, наблюдение относилось не к этому факту, и строка
+    # обязана снова заговорить (#1215, комментарий record_delivery_observation).
+    observed_state = (prior.get("observed_state") or "").strip()
+    if (prior.get("observed_at") or "").strip() and observed_state == state:
+        return None
+
     age_hours = _age_hours(task, prior)
     bucket = _crossed_bucket(age_hours)
     # Память о сказанном — МНОЖЕСТВО состояний, а не одна ячейка, и это не
@@ -851,7 +1015,9 @@ async def scan_completed_deliveries(
         task = dict(row)
         task_id = int(task["id"])
         try:
-            answer = await task_delivery(db, task)
+            answer = await _answer_past_closed_number(
+                db, task, await task_delivery(db, task)
+            )
             prior = await repo.get_delivery_discrepancy(db, task_id) or {}
             voice = _discrepancy_voice(task, answer, prior)
             if voice:
@@ -910,6 +1076,290 @@ async def scan_completed_deliveries(
     return found
 
 
+# --- Наблюдение доставки: выход у строки, которую спросить больше некого ----
+#
+# #1215. Три источника (строка pipeline_merges, базовая ветка, провайдер)
+# могут молчать одновременно и навсегда: репозиторий, где жил PR, удалён;
+# строки о мерже нет; базовая ветка не отвечает из-за squash. Тогда ответ
+# unknown ВЕРЕН — и у строки нет ни одного выхода, кроме того, чтобы источник
+# однажды заговорил. Он не заговорит.
+#
+# Единственный существовавший выход — архивация — хуже болезни: тем же
+# фильтром ``archived = 0`` читается outcome-долг, и строка уходила бы ценой
+# молча потерянного разбора результата. Поэтому её здесь нет и не будет ни в
+# одном тексте отказа: подменять одну потерю другой — ровно то, против чего
+# этот механизм написан.
+
+_HEX = set("0123456789abcdefABCDEF")
+
+
+class ObservationRefused(ValueError):
+    """Наблюдение не принято, и причина названа словами (#1215).
+
+    Отдельный класс, а не HTTPException: этот модуль зовут и из REST, и из
+    свипа, и из тестов, и решать про коды ответа — дело того слоя, который
+    говорит по HTTP.
+    """
+
+    def __init__(self, reason: str, message: str, hint: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+        self.hint = hint
+
+
+def _check_evidence(probe: str, evidence: str, sha: str) -> tuple[str, str, str]:
+    """Три обязательных факта, иначе строка не закрывается.
+
+    Требование ровно то же, что у живых проверок (#813, hub_record_live_check):
+    что запускал и что увидел — двумя полями, потому что одно поле принимает
+    «проверено, всё хорошо» как полноценную запись. Здесь к ним добавлен
+    коммит: живая проверка говорит о поведении в проде, а наблюдение доставки
+    — о наличии кода в конкретном месте истории, и место обязано быть названо.
+    """
+    probe, evidence, sha = probe.strip(), evidence.strip(), sha.strip()
+
+    if not probe or not evidence:
+        raise ObservationRefused(
+            "incomplete_evidence",
+            "наблюдение доставки требует и того, что вы запускали, и того, что увидели",
+            "Два поля намеренно: «проверено, всё хорошо» — это форма штампа, "
+            "а не доказательства. Назовите команду или запрос в probe и его "
+            "результат в observation.",
+        )
+    if len(probe) < MIN_EVIDENCE_CHARS or len(evidence) < MIN_EVIDENCE_CHARS:
+        raise ObservationRefused(
+            "evidence_too_thin",
+            f"и probe, и observation должны быть длиннее {MIN_EVIDENCE_CHARS} знаков",
+            "Строка закрывается доказательством, которое читатель может "
+            "оспорить. «Проверено» и «всё хорошо» оспорить нечем: назовите "
+            "конкретную команду и конкретный ответ на неё.",
+        )
+    if len(sha) < MIN_SHA_CHARS or not set(sha) <= _HEX:
+        raise ObservationRefused(
+            "missing_commit",
+            "наблюдение доставки требует коммита, в котором вы видели работу",
+            "Утверждение «работа доставлена» — это утверждение о том, что код "
+            f"есть в конкретном коммите. Назовите его хотя бы {MIN_SHA_CHARS} "
+            "знаками хеша, чтобы наблюдение можно было перепроверить.",
+        )
+    return probe, evidence, sha
+
+
+def _observation_note(prior: dict[str, Any], by: str, sha: str, probe: str) -> str:
+    """Предложение, которое закрытие дописывает в ленту задачи."""
+    return (
+        f"Доставка подтверждена НАБЛЮДЕНИЕМ, а не хабом: {by} проверил "
+        f"коммит {sha} ({probe}). Прежний ответ реестра остаётся в силе как "
+        f"история: {prior.get('state', '')} — {prior.get('reason', '')}. "
+        "Строка ушла из списка расхождений; задача не архивирована и её "
+        "статус не менялся — реестр зеркало, а не гейт (#1215)."
+    )
+
+
+async def record_delivery_observation(
+    db: Any,
+    task_id: int,
+    *,
+    by: str,
+    probe: str,
+    evidence: str,
+    sha: str,
+) -> dict[str, Any]:
+    """Закрыть строку реестра тем, что проверили своими глазами (#1215).
+
+    Возвращает то, что видит читатель: прежний ответ реестра (он никуда не
+    делся) и приписанное наблюдение, которым строка закрыта.
+
+    Права — те же, что у живых проверок, и второй модели прав здесь нет
+    намеренно: и то и другое есть запись наблюдения, приписанная тому, кто её
+    сделал, и разводить их значило бы завести два разных ответа на один
+    вопрос «кому верим на слово».
+    """
+    probe, evidence, sha = _check_evidence(probe, evidence, sha)
+    current = await repo.get_delivery_discrepancy(db, task_id)
+    if current is None:
+        raise ObservationRefused(
+            "no_discrepancy",
+            f"по задаче #{task_id} расхождения доставки не записано",
+            "Закрывать нечего: реестр про эту задачу ничего не утверждает. "
+            "Список расхождений покажет строки, у которых есть что закрывать.",
+        )
+    # ТОЛЬКО unknown, и это ограничение по существу, а не осторожность.
+    # Наблюдение — выход для строки, у которой ЗАКРЫТЫ все источники. Когда
+    # источник говорит («PR #N открыт»), он не молчит, и заглушать его чужим
+    # наблюдением значит завести способ спорить с фактом вместо того, чтобы
+    # его чинить. Для pr_open выход другой и он уже есть: доставить работу
+    # или признать расхождение законным с причиной (#1198).
+    if current.get("state") != UNKNOWN:
+        raise ObservationRefused(
+            "source_still_answers",
+            f"источник по задаче #{task_id} отвечает: {current.get('reason', '')}",
+            "Наблюдением закрывают строку, у которой спросить больше некого. "
+            "Здесь есть кого: довезите работу или признайте расхождение "
+            "законным с причиной.",
+        )
+    prior = await repo.record_delivery_observation(
+        db,
+        task_id,
+        by=by,
+        probe=probe,
+        evidence=evidence,
+        sha=sha,
+        expect_state=UNKNOWN,
+    )
+    # Запись не легла. Проверку выше строка прошла, значит за это время под
+    # ней что-то изменилось, и предикат сторожа поймал ровно это. Три разные
+    # причины, три разных ответа — молчаливое «не легла» не годится ни для
+    # одной:
+    #  1. свип успел зафиксировать ответ ожившего источника (находка 493a0ee9);
+    #  2. строку уже закрыло чужое наблюдение, пока это шло (находка ревью
+    #     Codex, коммит 86150e7) — retry после потерянного ответа или второй
+    #     наблюдатель той же строки не переписывает чужой акт молча;
+    #  3. строку унёс каскад от удаления задачи.
+    # Перечитываем, чтобы назвать читателю ту причину, которая случилась на
+    # самом деле, а не падение и не тихую запись поверх чужого факта.
+    if prior is None:
+        fresh = await repo.get_delivery_discrepancy(db, task_id)
+        if fresh is not None and fresh.get("state") != UNKNOWN:
+            raise ObservationRefused(
+                "source_answered_meanwhile",
+                f"источник по задаче #{task_id} заговорил, пока запись шла: "
+                f"{fresh.get('reason', '')}",
+                "Наблюдение сделано о состоянии «спросить некого», а строка "
+                "теперь утверждает другое, и закрывать этим наблюдением "
+                "нечего. Перечитайте строку: если источник отвечает, выход "
+                "другой — довезти работу или признать расхождение законным.",
+            )
+        if fresh is not None and (fresh.get("observed_at") or "").strip():
+            raise ObservationRefused(
+                "already_observed",
+                f"по задаче #{task_id} наблюдение уже записано: "
+                f"{fresh.get('observed_by', '')}",
+                "Строку уже закрыли наблюдением — второй раз тем же актом "
+                "закрыть нечего. Если это ваш же повторный запрос после "
+                "потерянного ответа, запись уже сохранена: прочитайте строку "
+                "вместо повтора. Если факт по-вашему неверен, это повод "
+                "обсудить с тем, кто наблюдал, а не молча переписать чужое "
+                "доказательство.",
+            )
+        raise ObservationRefused(
+            "no_discrepancy",
+            f"по задаче #{task_id} расхождения доставки не записано",
+            "Закрывать нечего: реестр про эту задачу ничего не утверждает.",
+        )
+    await repo.add_task_update(
+        db, task_id, "hub", "alert", _observation_note(prior, by, sha, probe)
+    )
+    await repo.insert_event(
+        db,
+        kind="delivery_observed",
+        task_id=task_id,
+        actor=by,
+        payload={"closed_state": prior.get("state", ""), "sha": sha},
+    )
+    await db.commit()
+    return {
+        "task_id": task_id,
+        "closed_state": prior.get("state", ""),
+        "closed_reason": prior.get("reason", ""),
+        "observed_by": by,
+        "observed_probe": probe,
+        "observed_evidence": evidence,
+        "observed_sha": sha,
+    }
+
+
+async def close_row_from_live_check(
+    db: Any,
+    task_id: int,
+    *,
+    by: str,
+    probe: str,
+    observation: str,
+    sha: str,
+) -> bool:
+    """Вторая дверь в тот же вход: живая проверка закрывает строку (#1215).
+
+    Живая проверка (#813) — уже названное и приписанное наблюдение: что
+    запускали, что увидели, в каком коммите, кем записано. По задачам #878,
+    #875 и #909 такие записи лежат с 09.09.2026 (проверки 54, 55, 56), и они
+    сильнее состояния PR: код всех трёх присутствует в раскатанном коммите
+    19ee3f6faf9f, проверено их собственными AC-тестами по имени. Требовать
+    записать то же самое второй раз, другим глаголом, значит брать плату за
+    форму.
+
+    ДВЕ ДВЕРИ, НО ОДНО ОПРЕДЕЛЕНИЕ: обе пишут те же колонки через
+    ``record_delivery_observation`` и обе подчиняются той же проверке
+    доказательства. Второго ответа на вопрос «закрыта ли строка» не заводится.
+
+    Никогда не роняет живую проверку. Наблюдение за прод-поведением — сама по
+    себе законченная запись, и она не может провалиться из-за того, что
+    реестру эта строка не подошла: подходящей строки может не быть вовсе,
+    источник может отвечать, доказательство может не дотянуть до порога. Всё
+    это — причины НЕ закрывать строку, а не причины потерять проверку.
+
+    Возвращает True, если строка закрыта.
+
+    SAVEPOINT (находка ревью Codex, коммит 86150e7): на успехе
+    ``record_delivery_observation`` сама коммитит один раз на весь свой акт
+    (см. её докстрок) — и этот ``db.commit()`` закрывает всю транзакцию,
+    вместе с любым открытым SAVEPOINT внутри неё. На провале — до этого
+    коммита дело не доходит, а ``record_live_check`` (вызывающий этой
+    функции) держит на ЭТОМ ЖЕ соединении уже вставленную, ещё не
+    закоммиченную строку живой проверки и закоммитит всё разом сама, позже.
+    Без изоляции провал ``add_task_update`` или ``insert_event`` ПОСЛЕ
+    репозиторного UPDATE оставлял бы этот UPDATE висеть в той же
+    неоткоченной транзакции: except ниже возвращает False, ничего не
+    подозревая, а следующий commit вызывающего — тот, что закрывает саму
+    живую проверку, — уносил бы с собой и чужой недописанный акт. Строка
+    уезжала бы в closed_by_observation без журнала и без события, хотя этот
+    метод честно сказал «не закрыл». ROLLBACK TO SAVEPOINT на провале
+    откатывает только то, что успел сделать этот акт, и не трогает то, что
+    вызывающий уже записал на том же соединении раньше — решение коммитить
+    или откатывать ЭТО остаётся за ним.
+    """
+    await db.execute("SAVEPOINT close_row_from_live_check")
+    try:
+        await record_delivery_observation(
+            db, task_id, by=by, probe=probe, evidence=observation, sha=sha
+        )
+    except ObservationRefused:
+        await db.execute("ROLLBACK TO SAVEPOINT close_row_from_live_check")
+        await db.execute("RELEASE SAVEPOINT close_row_from_live_check")
+        return False
+    except Exception:  # noqa: BLE001 - реестр не вправе уронить живую проверку
+        log.exception("could not close delivery row for #%s", task_id)
+        await db.execute("ROLLBACK TO SAVEPOINT close_row_from_live_check")
+        await db.execute("RELEASE SAVEPOINT close_row_from_live_check")
+        return False
+    else:
+        # Успех уже закоммичен ВНУТРИ record_delivery_observation — сама
+        # транзакция и вместе с ней SAVEPOINT уже закрыты этим коммитом,
+        # RELEASE здесь означал бы «нет такого savepoint».
+        return True
+
+
+def _still_swept(row: dict[str, Any], lookback_days: int) -> bool:
+    """Будет ли свип ещё перепрашивать источники по этой строке.
+
+    СКАЗАТЬ ЭТО ВСЛУХ — требование постановки, а не украшение выдачи. Свип
+    берёт кандидатов с ``completed_at`` не старше окна; за его краем строка
+    не обновляется больше никогда и застывает на том, что источники сказали
+    последний раз. До #1215 это было побочным эффектом границы, о котором
+    читатель узнавал, только заметив, что ``checked_at`` перестал двигаться.
+
+    Теперь про такую строку сказано прямо, и сказано вместе с выходом: запись
+    наблюдения окна НЕ СПРАШИВАЕТ — она работает по сохранённой строке в любом
+    возрасте. Именно поэтому у трёх живых строк (#878, #875, #909), которые
+    около 20-21.09.2026 выпадут из окна, выход есть и после этой даты.
+    """
+    age = row.get("age_hours")
+    if age is None:
+        return True
+    return int(age) <= max(int(lookback_days), 1) * 24
+
+
 async def undelivered_completed_tasks(
     db: Any, *, project_id: int | None = None, limit: int = 50
 ) -> dict[str, Any]:
@@ -918,6 +1368,15 @@ async def undelivered_completed_tasks(
     ``unknown`` rows travel beside the list, never inside it: a question the
     hub could not ask is not a task somebody forgot to deliver, and mixing the
     two is how a list stops being believed.
+
+    ТРЕТЬЕ ВЕДРО — ``closed_by_observation`` (#1215), и оно отдельное по той же
+    причине, по которой отдельно ``unknown``. Строка, закрытая наблюдением,
+    ушла из списка расхождений: список ценен, только пока пустой список значит
+    «расхождений нет». Но исчезнуть бесследно она не имеет права — тогда
+    наблюдение стало бы кнопкой «убрать строку». Поэтому она видна здесь, с
+    именем того, кто наблюдал, с коммитом, с доказательством И с прежним
+    ответом реестра: читателю ВИДНО, что доставку подтвердило наблюдение, а не
+    установил хаб.
     """
     open_rows = await repo.list_delivery_discrepancies(
         db, states=(PR_OPEN,), project_id=project_id, limit=limit
@@ -925,4 +1384,19 @@ async def undelivered_completed_tasks(
     unknown_rows = await repo.list_delivery_discrepancies(
         db, states=(UNKNOWN,), project_id=project_id, limit=limit
     )
-    return {"undelivered": open_rows, "unknown": unknown_rows}
+    observed_rows = await repo.list_delivery_discrepancies(
+        db,
+        states=(PR_OPEN, UNKNOWN),
+        project_id=project_id,
+        limit=limit,
+        closed_by_observation=True,
+    )
+    lookback = config.DELIVERY_SCAN_LOOKBACK_DAYS
+    for row in (*open_rows, *unknown_rows):
+        row["still_swept"] = _still_swept(row, lookback)
+    return {
+        "undelivered": open_rows,
+        "unknown": unknown_rows,
+        "closed_by_observation": observed_rows,
+        "sweep_lookback_days": lookback,
+    }

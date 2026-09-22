@@ -875,3 +875,221 @@ async def test_the_brief_feeds_its_base_merge_block_into_the_coverage_verdict(
     assert "base_merge" not in [
         c["check"] for c in coverage["checks_not_applicable"]
     ], "«спрашивать нечего» — это не про блок, который прямо сейчас показан"
+
+
+async def test_the_brief_names_the_second_provider_and_why(client: AsyncClient, db):
+    """AC-3 (#1266): бриф называет канал отчёта и причину, когда это не облако.
+
+    Текст «ВТОРЫМ поставщиком... причина» сегодня живёт только в ленте
+    задачи (review_dispatch.py, находка при create). MachineReviewView не
+    несёт channel и причину отказа облака, и бриф показывает локальный
+    отчёт неотличимым от облачного.
+    """
+    from hub.services.review_dispatch import LOCAL_CHANNEL
+
+    task_id = await _submitted_task(client, db, "Second door brief task")
+    row = dict(await repo.get_task(db, task_id))
+    generation = row["submission_generation"]
+
+    dispatch_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        agent_id="local:abc123",
+        run_id="abc123",
+        model="local-reviewer",
+        profile="lite",
+        channel=LOCAL_CHANNEL,
+        second_door_reason=(
+            "облако отчёта НЕ дало — usage_limit_exceeded; отчёт добывается "
+            "ВТОРЫМ поставщиком, локальным (#1252)"
+        ),
+    )
+    await repo.set_review_dispatch_status(db, dispatch_id, "done")
+    await db.commit()
+
+    await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "model": "local-reviewer",
+            "raw_count": 1,
+            "findings_confirmed": [],
+            "findings_rejected": [],
+            "incomplete": False,
+            "unresolved": [],
+            "lost_dimensions": [],
+            "agent": "local-reviewer",
+        },
+    )
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    machine_review = brief["review_report"]["machine_review"]
+    assert machine_review["second_door_channel"] == "local", (
+        "бриф обязан назвать канал отчёта — иначе локальный читается как облачный"
+    )
+    assert "usage_limit_exceeded" in machine_review["second_door_reason"], (
+        "бриф обязан назвать причину, по которой отчёт не облачный"
+    )
+
+
+async def test_the_brief_top_level_and_review_report_agree_on_the_provider(
+    client: AsyncClient, db
+):
+    """F2 (раунд 2, c0babbdf6d557c91): в брифе ДВЕ независимые MachineReviewView.
+
+    Верхнеуровневый ``machine_review`` строится в build_review_brief напрямую
+    из ``machine_reviews`` и не получает second_door_channel/reason — их
+    заполняет только ``review_evidence.review_report()``. MCP hub_get_review_
+    brief и CLI читают верхнеуровневое поле и не могут отличить локальный
+    отчёт от облачного, хотя review_report.machine_review уже умеет.
+    """
+    from hub.services.review_dispatch import LOCAL_CHANNEL
+
+    task_id = await _submitted_task(client, db, "Two copies brief task")
+    row = dict(await repo.get_task(db, task_id))
+    generation = row["submission_generation"]
+
+    dispatch_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        agent_id="local:f2",
+        run_id="f2",
+        model="local-reviewer",
+        profile="lite",
+        channel=LOCAL_CHANNEL,
+        second_door_reason=(
+            "облако отчёта НЕ дало — usage_limit_exceeded; отчёт добывается "
+            "ВТОРЫМ поставщиком, локальным (#1252)"
+        ),
+    )
+    await repo.set_review_dispatch_status(db, dispatch_id, "done")
+    await db.commit()
+
+    await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "model": "local-reviewer",
+            "raw_count": 1,
+            "findings_confirmed": [],
+            "findings_rejected": [],
+            "incomplete": False,
+            "unresolved": [],
+            "lost_dimensions": [],
+            "agent": "local-reviewer",
+        },
+    )
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert brief["machine_review"]["second_door_channel"] == "local", (
+        "верхнеуровневое поле machine_review — то, что читает MCP "
+        "hub_get_review_brief и CLI — обязано называть канал, как и "
+        "review_report.machine_review"
+    )
+    assert brief["review_report"]["machine_review"]["second_door_channel"] == "local"
+
+
+async def test_the_brief_pairs_the_displayed_report_with_its_own_dispatch(
+    client: AsyncClient, db
+):
+    """F1 (раунд 2, 715481fedbf41130): показанный отчёт красится СВОИМ заказом.
+
+    get_settled_review_dispatch отдаёт ПОСЛЕДНИЙ done ЗАКАЗ (по id заказа), а
+    показывается ПОСЛЕДНИЙ ОТЧЁТ (по id отчёта, get_latest_machine_review). В
+    сценарии AC-5 (#1266): локальная замена закрылась СВОИМ отчётом первой,
+    затем облачный заказ закрылся своим поздним отчётом. «Последний done
+    заказ» — локальный (он вставлен позже облачного и тоже done), а
+    «последний отчёт» — облачный (он пришёл позже). Бриф красит облачный
+    отчёт как локальный — ровно то, что AC-3 должна была закрыть.
+    """
+    from hub.services.machine_review_intake import record_machine_review
+    from hub.models import MachineReviewSubmit
+    from hub.services import admin as admin_svc
+    from hub.services.review_dispatch import CLOUD_CHANNEL, LOCAL_CHANNEL
+
+    task_id = await _submitted_task(client, db, "Own-dispatch pairing task")
+    row = dict(await repo.get_task(db, task_id))
+    generation = row["submission_generation"]
+
+    cloud_principal = await admin_svc.create_principal(
+        db, kind="agent", username="cloud-reviewer-f1"
+    )
+    local_principal = await admin_svc.create_principal(
+        db, kind="agent", username="local-reviewer-f1"
+    )
+    cloud_pid, local_pid = cloud_principal["id"], local_principal["id"]
+
+    cloud_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        agent_id="bc-f1",
+        run_id="r-cloud",
+        model="grok-4.6",
+        profile="lite",
+        channel=CLOUD_CHANNEL,
+        reviewer_principal_id=cloud_pid,
+    )
+    local_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        agent_id="local:f1",
+        run_id="r-local",
+        model="local-reviewer",
+        profile="lite",
+        channel=LOCAL_CHANNEL,
+        reviewer_principal_id=local_pid,
+        replaces_dispatch_id=cloud_id,
+        second_door_reason=(
+            "облако отчёта НЕ дало — refused; ВТОРЫМ поставщиком, локальным"
+        ),
+    )
+    await db.commit()
+
+    payload = dict(
+        harness_skill="lite-diff-review",
+        raw_count=1,
+        findings_confirmed=[],
+        findings_rejected=[],
+        incomplete=False,
+        unresolved=[],
+        lost_dimensions=[],
+    )
+
+    # Локальный отчёт приходит и закрывает ЛОКАЛЬНЫЙ заказ ПЕРВЫМ.
+    await record_machine_review(
+        db,
+        task_id,
+        MachineReviewSubmit(model="local-reviewer", **payload),
+        principal_id=local_pid,
+        username="local-reviewer-f1",
+    )
+    await repo.set_review_dispatch_status(db, local_id, "done")
+    await db.commit()
+
+    # Поздний облачный отчёт приходит ПОСЛЕ и закрывает облачный заказ.
+    await record_machine_review(
+        db,
+        task_id,
+        MachineReviewSubmit(model="grok-4.6", **payload),
+        principal_id=cloud_pid,
+        username="cloud-reviewer-f1",
+    )
+    await repo.set_review_dispatch_status(db, cloud_id, "done")
+    await db.commit()
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    machine_review = brief["review_report"]["machine_review"]
+    # Предпосылка: показанный отчёт — облачный (он пришёл последним).
+    assert machine_review["submitted_by"] == "cloud-reviewer-f1", (
+        "предпосылка: get_latest_machine_review обязана отдать облачный отчёт "
+        "как самый свежий"
+    )
+    assert machine_review["second_door_channel"] == "", (
+        "показан ОБЛАЧНЫЙ отчёт — second_door_channel обязан остаться пустым, "
+        "иначе облачный отчёт подписан как локальный по чужому (более "
+        "позднему по id) заказу"
+    )

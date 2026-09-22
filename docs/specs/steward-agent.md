@@ -296,7 +296,7 @@ scope и `affected_areas`, вычисленный класс риска, зав�
 `report_sibling_mismatch` · `report_incomplete` · `risk_class_raised` ·
 `class_above_policy_ceiling` · `low_confidence` · `passes_disagree` ·
 `author_disputes` · `no_new_information` · `budget_exhausted` · `daily_cap` ·
-`run_failed` · `run_timeout` · `injection_suspected`
+`run_failed` · `run_timeout` · `injection_suspected` · `policy_not_delegated`
 
 Перечень **закрыт**: кода `unknown` в нём нет — иначе перечень не закрыт, а
 любая новая причина молча складывается в мусорную корзину. Причина, которой в

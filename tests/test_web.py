@@ -6047,6 +6047,7 @@ async def _local_reviewer_ready(db, monkeypatch, tmp_path) -> None:
     решает, — tests/test_forge_links.py на пути записи.
     """
     import os
+    import pwd
 
     from hub import config
     from hub.services import review_dispatch
@@ -6055,7 +6056,15 @@ async def _local_reviewer_ready(db, monkeypatch, tmp_path) -> None:
     scratch.mkdir(exist_ok=True)
     os.chmod(scratch, 0o2770)
     monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "/bin/true")
-    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "/usr/bin/env")
+    # Песочница обязана быть формой из ЗАКРЫТОГО НАБОРА (#1208): «/usr/bin/env»
+    # хаб больше не принимает, и готовность на такой строке была бы «не
+    # настроено» — то есть тест судил бы не то, что называет. Пользователь —
+    # сам вызывающий: он владеет каталогом прогонов и проходит по группе.
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_SANDBOX",
+        f"/usr/bin/sudo -n -u {pwd.getpwuid(os.getuid()).pw_name} /usr/local/bin/wrap",
+    )
     monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(scratch))
     monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "reviewer-key")
 
@@ -6282,4 +6291,132 @@ async def test_the_base_merge_block_is_painted_where_approve_is_clicked(
     )
     assert resp.text.index("Мерж в базу:") < resp.text.rindex('value="approved"'), (
         "блок стоит ДО кнопки Approve: после неё вердикт уже потрачен"
+    )
+
+
+# --- Теневое участие стюарда включается формой, а не PATCH руками (#1280) ----
+#
+# #1268 завела ключ steward_shadow: проект участвует в теневой фазе, вердикт
+# остаётся человеку, применение суждения запрещено. Ключ принимал только API,
+# и теневая фаза не начиналась ни на одном проекте, пока её включение стоило
+# человеческого токена и ручного запроса.
+#
+# Отдельного внимания стоит ВЫКЛЮЧЕНИЕ. Снятый чекбокс браузер не присылает
+# вовсе, поэтому рычаг, собранный «наивно», работает в одну сторону: включить
+# можно, выключить нельзя. Здесь это закрыто скрытым полем с тем же именем —
+# намерение «выключить» приезжает в запросе, а не выводится из молчания.
+
+
+async def test_the_project_form_turns_shadow_participation_on(client: AsyncClient):
+    """AC-1: галочка на default включает теневое участие, гейты не трогая."""
+    import json
+
+    from hub.services.steward_dispatch import STEWARD_SHADOW_KEY, _policy_wants_steward
+
+    pid = await _project_with_policy(client, "default", {})
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_steward_shadow": ["off", "on"]},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", ""), (
+        "теневое участие ничего не делегирует, поэтому замок #743 его "
+        f"пропускает: {resp.headers.get('location', '')}"
+    )
+
+    policy = await _policy_of(client, pid)
+    assert policy.get(STEWARD_SHADOW_KEY) is True, (
+        "читатель ключа сравнивает именно с True (#1268), так что строка "
+        f"'on' в политике была бы ключом, которого никто не читает: {policy}"
+    )
+    assert _policy_wants_steward({"gate_policy": json.dumps(policy)}), (
+        f"включённым участие считает диспетчер прогонов, а не форма: {policy}"
+    )
+    assert policy.get("dor") == "human" and policy.get("verdict") == "human", (
+        f"вердикт и DoR остаются у человека: {policy}"
+    )
+
+
+async def test_the_project_form_turns_shadow_participation_off(client: AsyncClient):
+    """AC-2: снятая галочка выключает участие, а не сохраняет прежнее."""
+    import json
+
+    from hub.services.steward_dispatch import STEWARD_SHADOW_KEY, _policy_wants_steward
+
+    pid = await _project_with_policy(client, "default", {STEWARD_SHADOW_KEY: True})
+
+    # Ровно то, что шлёт браузер со снятым чекбоксом: скрытое поле и ничего
+    # больше. Без него запрос был бы неотличим от «этот POST про переключатель
+    # не знает», и выключить участие через форму стало бы нельзя.
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_steward_shadow": "off"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", "")
+
+    policy = await _policy_of(client, pid)
+    assert policy.get(STEWARD_SHADOW_KEY) is False, (
+        f"участие выключено, а не оставлено прежним: {policy}"
+    )
+    assert not _policy_wants_steward({"gate_policy": json.dumps(policy)}), (
+        "и диспетчер больше не заказывает теневой прогон на этом проекте"
+    )
+
+
+async def test_saving_the_shadow_toggle_keeps_unknown_policy_keys(
+    client: AsyncClient,
+):
+    """AC-3: ключи, которых форма не показывает, переживают сохранение (#1163)."""
+    from hub.services.steward_dispatch import STEWARD_SHADOW_KEY
+
+    pid = await _project_with_policy(
+        client, "spike-shadow-carry", {"ci_runner": "make test", "release": "auto"}
+    )
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={
+            "gate_policy_steward_shadow": ["off", "on"],
+            "gate_policy_release": "auto",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    policy = await _policy_of(client, pid)
+    assert policy.get("ci_runner") == "make test", (
+        "формы для ci_runner нет, поэтому её отправка не может значить "
+        f"«убрать ci_runner» (#886): {policy}"
+    )
+    assert policy.get(STEWARD_SHADOW_KEY) is True and policy.get("release") == "auto"
+
+
+async def test_the_projects_page_shows_shadow_participation_state(
+    client: AsyncClient,
+):
+    """AC-4: переключатель показывает сохранённое состояние и честную подпись."""
+    from hub.services.steward_dispatch import STEWARD_SHADOW_KEY
+
+    await _project_with_policy(client, "spike-shadow-on", {STEWARD_SHADOW_KEY: True})
+    await _project_with_policy(client, "spike-shadow-off", {})
+
+    page = (await client.get("/projects")).text
+    on_card = _card(page, "spike-shadow-on")
+    off_card = _card(page, "spike-shadow-off")
+
+    assert 'name="gate_policy_steward_shadow"' in on_card, "переключатель на месте"
+    assert "checked" in on_card.split('name="gate_policy_steward_shadow"')[-1][:120], (
+        "включённое участие показано включённым: переключатель, всегда "
+        "рисующий своё значение по умолчанию, врёт о состоянии проекта"
+    )
+    assert (
+        "checked" not in off_card.split('name="gate_policy_steward_shadow"')[-1][:120]
+    ), f"выключенное участие не показывается включённым: {off_card[:400]}"
+    assert "вердикт остаётся у человека" in on_card, (
+        "подпись рядом обязана сказать, что суждение записывается, а решение "
+        "остаётся человеку — иначе переключатель обещает больше, чем делает"
     )
