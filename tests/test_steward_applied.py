@@ -1292,6 +1292,23 @@ async def test_a_day_with_only_a_self_approval_still_gets_a_digest(
     payload = json.loads(dict((await repo.list_digests(db))[0])["payload"])
     assert payload["steward_judgements"] == []
     assert [a["task_id"] for a in payload[SELF_APPROVALS_KEY]] == [task_id]
+    # Здесь самоодобрение — ЕДИНСТВЕННОЕ решение дня: суждения стюарда рядом
+    # нет, и в выборку #1144 задача может попасть только через свой раздел.
+    # В тесте AC-4 её туда же приводит и суждение того же дня, и поэтому там
+    # потеря самоодобрения из пула и oversample не видна.
+    assert payload["audit_sample"] == [task_id], (
+        "решение, которого человек не видел, обязано быть в выборке"
+    )
+    from hub.services.digest import _audit_pool_and_oversample
+
+    _pool, oversample = _audit_pool_and_oversample(
+        payload["auto_approvals"],
+        payload["auto_verdicts"],
+        payload["escalations"],
+        payload["steward_judgements"],
+        payload[SELF_APPROVALS_KEY],
+    )
+    assert task_id in oversample, "и проверяться чаще среднего"
 
 
 async def test_independence_nobody_established_is_not_a_second_look(
