@@ -490,11 +490,26 @@ async def list_unmerged_branch_tasks(
     exclude_task_id: int,
     statuses: list[str],
 ) -> list[aiosqlite.Row]:
-    """Active tasks (other than ``exclude_task_id``) that own a branch (#438)."""
+    """Active tasks (other than ``exclude_task_id``) that own a branch (#438).
+
+    ``submission_generation`` travels with the row (#1283): it counts the
+    submissions the task actually made, so zero is the hub's own record that
+    this task has never handed work in — and therefore owns nothing on origin
+    to compare against.
+
+    ``submission_sha`` travels with it too, and it used to carry that meaning
+    alone — wrongly, which is why the count is here: an empty sha does not say
+    "never published". ``resolve_branch_tip`` documents the empty value as
+    "could not look" (no workspace, a failed fetch, an exception), the
+    submission is accepted anyway, and a verdict on a moved tip wipes the pin.
+    The stacking walk reads both; callers that do not care simply ignore the
+    columns.
+    """
     placeholders = ",".join("?" for _ in statuses)
     return await fetchall(
         db,
-        f"SELECT id, title, status, branch FROM tasks "  # nosec B608
+        f"SELECT id, title, status, branch, submission_sha, "  # nosec B608
+        f"submission_generation FROM tasks "
         f"WHERE archived=0 AND id != ? AND status IN ({placeholders}) "
         "AND branch IS NOT NULL AND TRIM(branch) != '' ORDER BY id",
         (exclude_task_id, *statuses),

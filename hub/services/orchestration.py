@@ -2037,6 +2037,12 @@ class StackAssessment:
     # #1204 (Cursor #385): the registry state of a stranded base — pr_open or
     # pr_closed. Empty for a base still on the conveyor.
     base_delivery_state: str = ""
+    # #1283: the id of a candidate whose branch origin does not have AND whose
+    # tip the hub has never observed there. Not «could not look»: there is
+    # nothing to look AT yet. Kept apart from every other unknown because only
+    # this one says the candidate owns no commits anywhere — see
+    # ``_a_branch_origin_never_had``.
+    unpublished_branch_task_id: int | None = None
 
     def as_advisory(self) -> dict[str, Any] | None:
         """The pre-#1186 shape: a dict for a stack, None for anything else."""
@@ -2253,6 +2259,105 @@ def _stranded_with_a_dead_ref(
     )
 
 
+def _a_branch_origin_never_had(
+    other: dict[str, Any],
+    other_branch: str,
+    result: Any,
+    stranded: set[int],
+) -> "StackAssessment | None":
+    """A candidate branch that has not been published yet (#1283).
+
+    НАБЛЮДЕНО НА ПРОДЕ 22.09.2026. #1208 и #1158 — одобрены человеком, CI
+    зелёный, отчёты ревью чистые — обе не доставлены одним и тем же
+    сообщением: «stack_unknown … ref_unresolved: task-1281/…». Ветка соседа
+    записана хабом в момент ``hub_pair_start``, а на origin её ещё нет:
+    исполнитель не сделал первый пуш. Между pair_start и первым пушем лежит
+    вся работа над задачей — часы, — и всё это время ни одна одобренная
+    задача проекта не доставляется. Чем больше исполнителей работает
+    параллельно, тем чаще состояние.
+
+    Правило #1186 при этом верное и не трогается: неизвестность сильнее
+    «чисто». Неверна КЛАССИФИКАЦИЯ. «Спросить не удалось» и «спрашивать пока
+    не о чем» — разные факты, и ответ у них разный.
+
+    ДВА наблюдаемых факта, и нужны оба:
+
+    * ``ref_unresolved`` по ИМЕНИ этого кандидата и только по нему. Проба
+      перед таким ответом делает целевое обновление ссылки и отличает «origin
+      ответил, что ветки нет» от «origin не ответил» (``remote_unreachable``,
+      #1204). Равенство, а не вхождение — по той же причине, что и у соседа
+      выше: сломанный клон кладёт в ``details`` и нашу ветку, и это факт про
+      машину, а не про ту задачу.
+    * ``submission_generation`` кандидата равен нулю: сдачи не было ни одной.
+      Это СОБСТВЕННАЯ запись хаба о том, что задача ни разу не сдавала
+      работу, и она не зависит от того, удалось ли кому-то посмотреть на
+      origin.
+
+    Сначала здесь стоял другой признак — пустой ``submission_sha``, — и он
+    был неточен (находка ревью 1dd76966e24dfa20 на сдаче #1). Пустой sha
+    значит не только «публиковать было нечего»: ``resolve_branch_tip`` сам
+    документирует пустое значение как «посмотреть не удалось» (нет рабочей
+    копии, упал fetch, исключение), ``_step_pin_submission_sha`` в этом
+    случае сдачу всё равно принимает, а вердикт на уехавшую вершину уже
+    закреплённый sha стирает. Задача со сдачей, чью вершину прочитать не
+    смогли, читалась бы тогда как «ветки никогда не было» и переставала бы
+    задерживать чужую доставку — то есть ровно AC-2 держался бы только до
+    первого сбоя пина. Отсутствие пина — не положительный факт; количество
+    сдач — положительный.
+
+    ``submission_sha`` вторым условием НЕ стоит, и это проверено, а не
+    забыто: пин пишется единственным местом — тем же шагом сдачи, сразу
+    после ``bump_submission_generation`` (lifecycle ~2933). Непустой sha без
+    единой сдачи недостижим, так что такое условие было бы кодом, который
+    никогда не выполняется, и мутацию по нему ничто бы не поймало. В обратную
+    сторону — сдача без пина — состояние живое, и его ловит счётчик сдач.
+
+    Вместе с ответом пробы это замыкается без дырок: origin говорит, что
+    ветки нет, и задача ничего не сдавала => коммитов той задачи нет нигде, и
+    унести их мержем невозможно. Сравнивать не с чем — а это не то же самое,
+    что «проверить не удалось». Если ветка на origin ЕСТЬ, проба её разрешит
+    и сюда дело не дойдёт вовсе.
+
+    Не молча: исход остаётся ``unknown``, только неповторяемый, поэтому мерж
+    идёт, а причина с номером задачи ложится в ленту алертом
+    (``_unchecked_stack_alert``). Ограничение постановки — молчаливого
+    «стопки нет» быть не должно.
+
+    Застрявшие строки (#1204) сюда не попадают по построению: у них свой,
+    более сильный разбор выше, и принятая без доставки задача — это как раз
+    тот случай, когда ветка БЫЛА и исчезла.
+
+    Остаточный риск назван в постановке: ветка, опубликованная и удалённая ДО
+    первой сдачи, пройдёт этим путём. Такого случая не наблюдали; если он
+    встретится, признак публикации станет отдельным наблюдаемым фактом
+    (условие пересмотра задачи), а не выводом из отсутствия sha.
+    """
+    if int(other["id"]) in stranded:
+        return None
+    if result.outcome is not StackProbeOutcome.unavailable:
+        return None
+    if result.reason != "ref_unresolved":
+        return None
+    unresolved = {n.strip() for n in (result.details or "").split(",") if n.strip()}
+    if unresolved != {other_branch}:
+        return None
+    if int(other.get("submission_generation") or 0) > 0:
+        # Сдача была. Значит работу эта задача уже отдавала, ветка на origin
+        # была, и её отсутствие сейчас — исчезновение, а не «ещё не родилась».
+        # Пустой пин тут ничего не смягчает: он может быть пустым и оттого,
+        # что вершину не смогли прочитать (1dd76966e24dfa20).
+        return None
+    return StackAssessment(
+        outcome=STACK_UNKNOWN,
+        reason=f"branch_never_published: {other_branch}",
+        retryable=False,
+        base_task_id=int(other["id"]),
+        base_task_branch=other_branch,
+        base_task_status=other.get("status") or "",
+        unpublished_branch_task_id=int(other["id"]),
+    )
+
+
 def _file_dead_ref(
     dead: "StackAssessment",
     stranded_unprobed: "StackAssessment | None",
@@ -2266,6 +2371,89 @@ def _file_dead_ref(
     if dead.unprobed_stranded_task_id:
         return stranded_unprobed or dead, closed_gone
     return stranded_unprobed, closed_gone or dead
+
+
+@dataclass
+class _UnansweredRows:
+    """Строки обхода, которые не дали ни стопки, ни «чисто» (#1186, #1204, #1283).
+
+    Четыре РАЗНЫХ факта, которые нельзя складывать в один: git моргнул;
+    ветку застрявшей задачи origin не знает; ветка соседа ещё не
+    опубликована; проба вообще подняла исключение. Каждый помнится отдельно,
+    первый в своём роде, и порядок между ними — это ``best``.
+
+    Собрано в один объект, потому что раньше это были четыре локальные
+    переменные в ``assess_branch_stacking``, и каждый новый различённый факт
+    добавлял туда и переменную, и ветку. Правило первого-в-роде и порядок
+    старшинства теперь лежат рядом друг с другом, а не разъезжаются по телу
+    обхода.
+    """
+
+    stranded_unprobed: StackAssessment | None = None
+    # #1204 (Cursor #385): a closed base whose branch is gone. Not a hold.
+    closed_gone: StackAssessment | None = None
+    # #1283: a neighbour whose branch has not reached origin yet. Not a hold
+    # either — and REMEMBERED rather than returned, for the same reason every
+    # other answer here is: a definite stack further down the list is the more
+    # useful answer, and returning early would hide it.
+    unpublished: StackAssessment | None = None
+    unknown: StackAssessment | None = None
+
+    def raised(self, other_branch: str) -> None:
+        """Проба подняла исключение: не ответ, и не приговор соседним строкам."""
+        self.unknown = self.unknown or StackAssessment(
+            outcome=STACK_UNKNOWN,
+            reason=f"probe_raised: {other_branch}",
+            retryable=True,
+        )
+
+    def file(
+        self,
+        other: dict[str, Any],
+        other_branch: str,
+        result: Any,
+        stranded: set[int],
+    ) -> None:
+        """Разложить «не чисто и не стопка» по своим полкам, в порядке разбора."""
+        dead = _stranded_with_a_dead_ref(other, other_branch, result, stranded)
+        if dead is not None:
+            self.stranded_unprobed, self.closed_gone = _file_dead_ref(
+                dead, self.stranded_unprobed, self.closed_gone
+            )
+            return
+        unborn = _a_branch_origin_never_had(other, other_branch, result, stranded)
+        if unborn is not None:
+            self.unpublished = self.unpublished or unborn
+            return
+        # Remembered, not returned: a later row may still be a definite
+        # stack, and a definite stack is the more useful answer. Only
+        # after the whole walk finds none does the unknown stand.
+        self.unknown = self.unknown or StackAssessment(
+            outcome=STACK_UNKNOWN,
+            reason=f"{result.reason}: {other_branch}",
+            retryable=result.outcome is StackProbeOutcome.unavailable,
+        )
+
+    def best(self, benign: StackAssessment | None) -> StackAssessment | None:
+        """Старшинство всего, что осталось после обхода (#1186, #1204, #1283).
+
+        Unknown outranks benign for the same reason it outranks clear: a row
+        we could not look at may be the dangerous one, and "the pair I DID
+        look at is safe" says nothing about it.
+
+        #1283 стоит НИЖЕ обычного unknown и ВЫШЕ безобидной стопки. Ниже —
+        потому что моргнувший git по-прежнему лечится следующим циклом, и
+        ослаблять это правило задача не просит. Выше — потому что оба исхода
+        ведут к мержу, но «мы и есть база» молчит, а неопубликованная ветка
+        обязана назвать причину в ленте.
+        """
+        return _first_of(
+            self.stranded_unprobed,
+            self.unknown,
+            self.closed_gone,
+            self.unpublished,
+            benign,
+        )
 
 
 async def assess_branch_stacking(
@@ -2343,11 +2531,7 @@ async def assess_branch_stacking(
             db, exclude_task_id=task_id, statuses=statuses or STACK_ADVISORY_STATUSES
         )
     )
-    unknown: StackAssessment | None = None
-    # Held apart from ``unknown``: see StackAssessment.unprobed_stranded_task_id.
-    stranded_unprobed: StackAssessment | None = None
-    # #1204 (Cursor #385): a closed base whose branch is gone. Not a hold.
-    closed_gone: StackAssessment | None = None
+    unanswered = _UnansweredRows()
     # #1186 round 2: a match that says "the OTHER branch stands on ME" is
     # benign — but only for that pair. The walk answers with the first match
     # it finds, and while every match meant a refusal that was safe: order
@@ -2397,11 +2581,7 @@ async def assess_branch_stacking(
         if result is None:
             # The probe raised. Not an answer either — and not a verdict about
             # the rows it never reached, which is why the walk goes on.
-            unknown = unknown or StackAssessment(
-                outcome=STACK_UNKNOWN,
-                reason=f"probe_raised: {other_branch}",
-                retryable=True,
-            )
+            unanswered.raised(other_branch)
             continue
         if result.outcome is StackProbeOutcome.stacked:
             other_id = other["id"]
@@ -2425,24 +2605,8 @@ async def assess_branch_stacking(
                 continue
             return found
         if result.outcome is not StackProbeOutcome.clear:
-            dead = _stranded_with_a_dead_ref(other, other_branch, result, stranded)
-            if dead is not None:
-                stranded_unprobed, closed_gone = _file_dead_ref(
-                    dead, stranded_unprobed, closed_gone
-                )
-                continue
-            # Remembered, not returned: a later row may still be a definite
-            # stack, and a definite stack is the more useful answer. Only
-            # after the whole walk finds none does the unknown stand.
-            unknown = unknown or StackAssessment(
-                outcome=STACK_UNKNOWN,
-                reason=f"{result.reason}: {other_branch}",
-                retryable=result.outcome is StackProbeOutcome.unavailable,
-            )
-    # Unknown outranks benign for the same reason it outranks clear: a row we
-    # could not look at may be the dangerous one, and "the pair I DID look at
-    # is safe" says nothing about it.
-    answer = _first_of(stranded_unprobed, unknown, closed_gone, benign)
+            unanswered.file(other, other_branch, result, stranded)
+    answer = unanswered.best(benign)
     if answer is not None:
         return answer
     return StackAssessment(outcome=STACK_CLEAR, reason="no_unmerged_branch_shares")
@@ -2811,6 +2975,10 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
       that the stack could not be checked: the reader can tell that from
       "checked, and there was none", which today they cannot (#1197 drew the
       same line between ``unavailable`` and ``unsupported``).
+      The same slot holds #1283's case, which is not "could not look" at all
+      but "nothing to look at yet": a neighbour branch that has not reached
+      origin, whose tip the hub has never observed there. It merges and the
+      alert names that neighbour — see ``_a_branch_origin_never_had``.
 
     A merged base is not a stack, and this does NOT rest on the base having
     left some status: git answers it. A delivered base owns no commits outside
@@ -2960,6 +3128,26 @@ def _unchecked_stack_alert(assessment: "StackAssessment") -> str:
     """
     from hub.services.delivery_state import PR_CLOSED
 
+    if assessment.unpublished_branch_task_id:
+        # #1283. Третий факт, доехавший до этого алерта, и он опять не тот же
+        # самый: проба ОТВЕТИЛА, и ответ был «такой ветки у origin нет», а
+        # вершину этой ветки хаб там ни разу не наблюдал. Сказать тут «хаб не
+        # получил ответа» значило бы повторить ровно ту ложь, которую Cursor
+        # #385 нашёл в текстах про застрявшие основания.
+        return (
+            f"Стопку веток сравнивать не с чем ({assessment.reason}) — "
+            f"доставка идёт без этой проверки. Ветка "
+            f"'{assessment.base_task_branch}' задачи "
+            f"#{assessment.base_task_id} ещё не опубликована: origin на "
+            f"прямой вопрос ответил, что такой ветки у него нет, а сдач у "
+            f"той задачи не было ни одной. "
+            f"Значит коммитов той задачи нет нигде и унести их этим мержем "
+            f"нельзя. Ждать тут нечего: ветка появится, когда исполнитель "
+            f"сделает первый пуш, и до тех пор сравнивать не с чем. Если "
+            f"ветка всё же была опубликована и удалена ДО первой сдачи, её "
+            f"коммиты уедут в базовую ветку под номером этой задачи — их "
+            f"видно в диффе этой задачи (#1283)."
+        )
     if assessment.base_delivery_state == PR_CLOSED:
         return (
             f"Стопку веток проверить нечем ({assessment.reason}) — доставка "
