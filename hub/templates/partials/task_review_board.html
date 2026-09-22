@@ -542,7 +542,7 @@
     <div class="task-action-note">
         Last verdict: {{ task.latest_review.verdict.value|upper }}
         for submission #{{ task.latest_review.submission_generation }}
-        ({{ 'current' if task.latest_review.is_current else 'stale — work resubmitted' }})
+        ({% if task.latest_review.is_current %}current{% elif task.latest_review.closed_by_decision %}закрыт решением «на доработку» — нужна новая сдача{% else %}stale — work resubmitted{% endif %})
         {% if task.latest_review.self_approved %}
         <span class="badge badge-self-approved" title="Verdict submitted by the implementer via HAIPLANE_REVIEW_SELF_APPROVE=allow — not an independent review">self-approved</span>
         {% endif %}

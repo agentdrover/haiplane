@@ -261,6 +261,17 @@ class NoopGitOps:
         """No git here — "could not look", never "nothing changed" (#825)."""
         return None
 
+    async def commit_in_base_history(
+        self, repo: str, base: str, sha: str
+    ) -> bool | None:
+        """No git here — "could not look", never "not merged yet" (#1239).
+
+        False would tell the card and the evidence packet that an empty diff
+        is an honest "this changed nothing", which is the very reading #1239
+        exists to stop.
+        """
+        return None
+
     async def content_differs(
         self,
         base: str,

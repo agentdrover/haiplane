@@ -913,12 +913,44 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
                 RUN_TIMEOUT if started else RUN_NEVER_STARTED,
                 "прогон не вернул суждение до дедлайна слота"
                 if started
-                else "заказ не удалось начать за отведённое ожидание — "
-                "судья не работал, и таймаут судьи здесь был бы обвинением "
-                "того, кто не начинал",
+                else await _never_started_reason(db, run),
             ):
                 closed += 1
     return closed
+
+
+async def _never_started_reason(db: aiosqlite.Connection, run: dict[str, Any]) -> str:
+    """Почему заказ так и не начался — названо, а не сведено к «не начался».
+
+    Статус остаётся ``never_started``: он отделяет заказ, который не
+    работал, от таймаута судьи, который работал и не ответил (#1181). Но в
+    первый вечер теневой фазы (#1290) три слота из трёх закрылись этим
+    статусом, ожидая кросс-модельного ревьюера, — и по журналу «ждали
+    ревьюера полчаса» ничем не отличалось от любого другого незапуска.
+
+    Спрашивается последний ВРЕМЕННЫЙ отказ этого прогона, то есть ровно та
+    причина, по которой каждый проход поллера уходил ни с чем. Своего учёта
+    ожиданий здесь нет: событие отказа уже написано, и второй источник
+    правды об одном и том же разъехался бы с первым.
+    """
+    from hub.services.steward_shadow import (
+        REFUSED_UNDECLARED_MODEL,
+        waiting_refusal_code,
+    )
+
+    generic = (
+        "заказ не удалось начать за отведённое ожидание — судья не работал, "
+        "и таймаут судьи здесь был бы обвинением того, кто не начинал"
+    )
+    code = await waiting_refusal_code(db, run["task_id"], run["id"])
+    if code == REFUSED_UNDECLARED_MODEL:
+        return (
+            "заказ ждал кросс-модельного ревьюера и не дождался его до "
+            "дедлайна слота: прогон не начинался — " + generic
+        )
+    if code:
+        return f"{generic} (последний отказ: {code})"
+    return generic
 
 
 async def order_due_dor_runs(db: aiosqlite.Connection) -> int:
