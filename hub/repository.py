@@ -2676,12 +2676,20 @@ async def get_review_dispatch_for_generation(
     Deliberately status-agnostic, unlike get_settled_review_dispatch: the
     profile is decided when the run is launched, and the report normally
     arrives while the dispatch is still 'active'.
+
+    One exception (#1242): a SETTLED sync-refusal stub (empty ``agent_id``,
+    no longer active or owed) is skipped. It now outlives the call as the
+    ask-again trace, and it never ran — its model and profile are what
+    would have been launched, not a fact about any reviewer, so the
+    auto-verdict's "which model reviewed" and the intake's profile must not
+    read it.
     """
     rows = list(
         await fetchall(
             db,
             "SELECT * FROM review_dispatches "
             "WHERE task_id=? AND submission_generation=? "
+            "AND (agent_id != '' OR status IN ('active', 'second_door')) "
             "ORDER BY id DESC LIMIT 1",
             (task_id, generation),
         )
@@ -2761,12 +2769,19 @@ async def count_review_dispatches(
     Two genuine cloud runs (LITE then a DEEP top-up) both have empty
     ``replaces_dispatch_id`` and non-empty ``agent_id`` — they still count as
     two and still hit ``REVIEW_LADDER_MAX_STEPS``.
+
+    #1242 sharpens the second rule: a replacement is free only when the row
+    it replaces was a PAID run. The ask-again pass replaces a sync-refusal
+    stub too, and that stub never counted — so the first real run of the
+    rung is the replacement itself, and skipping it would hand the ladder a
+    step it never paid for.
     """
     rows = await fetchall(
         db,
-        "SELECT COUNT(*) AS n FROM review_dispatches "
-        "WHERE task_id=? AND submission_generation=? "
-        "AND agent_id != '' AND replaces_dispatch_id IS NULL",
+        "SELECT COUNT(*) AS n FROM review_dispatches d "
+        "WHERE d.task_id=? AND d.submission_generation=? AND d.agent_id != '' "
+        "AND NOT EXISTS (SELECT 1 FROM review_dispatches r "
+        "WHERE r.id = d.replaces_dispatch_id AND r.agent_id != '')",
         (task_id, generation),
     )
     return int(dict(rows[0])["n"]) if rows else 0
