@@ -328,3 +328,79 @@ async def test_a_file_that_would_not_parse_is_not_called_text_only(
         "unreadable_subject"
         not in presence.reason.split("вовсе:", 1)[1].split(".", 1)[0]
     )
+
+
+# Шесть файлов называют имя; определение — в шестом по порядку сортировки.
+# Так на develop лежит delivery_state: первые пять файлов со словом его только
+# импортируют или упоминают, определение — шестым (находка 9e1947701d5527a8).
+MENTIONS = [f"hub/services/a{i}_mentions.py" for i in range(1, 6)]
+DEFINER = "hub/services/z_definer.py"
+
+
+def _clone_with_a_far_definition(tmp_path: Path) -> str:
+    root = tmp_path / "far-clone"
+    (root / "hub" / "services").mkdir(parents=True)
+    _git(root, "init", "-b", "develop")
+    (root / DECLARED_AREA).write_text(DECLARED_SOURCE)
+    for path in MENTIONS:
+        (root / path).write_text(
+            '"""Mentions it only."""\n\nKEY = "far_defined_subject"\n'
+        )
+    (root / DEFINER).write_text(
+        '"""The real one."""\n\n\ndef far_defined_subject() -> int:\n    return 6\n'
+    )
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "base")
+    return str(root)
+
+
+async def _presence_for_far_definition(client, db, monkeypatch, tmp_path):
+    from hub.services.readiness import subject_presence
+
+    workspace = _clone_with_a_far_definition(tmp_path)
+    _use_real_git_reads(monkeypatch)
+    project_id = await _project_at(db, workspace)
+    task_id = await _task_named(
+        client, db, project_id, "Опереться на far_defined_subject."
+    )
+    row = await repo.get_task(db, task_id)
+    return await subject_presence(db, dict(row))
+
+
+async def test_a_definition_past_the_fifth_file_is_found(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path: Path
+):
+    """Определение в шестом файле со словом — присутствие, а не «не определением».
+
+    Находка ревью 9e1947701d5527a8: разбор обрывался на пятом файле и печатал
+    частичный просмотр как законченный ответ (#725).
+    """
+    from hub.services.readiness import SUBJECT_PRESENT
+
+    presence = await _presence_for_far_definition(client, db, monkeypatch, tmp_path)
+
+    assert presence.verdict == SUBJECT_PRESENT, presence.reason
+    assert "far_defined_subject" not in presence.missing
+    assert "far_defined_subject" not in presence.text_only
+
+
+async def test_hitting_the_file_ceiling_says_the_look_was_partial(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path: Path
+):
+    """Упор в потолок разбора называется вслух: «просмотрено N из M».
+
+    Потолок остаётся — он про стоимость открытия. Но за ним определение может
+    лежать, и сказать про имя «есть, но не определением» значило бы выдать
+    неполный просмотр за полный.
+    """
+    import hub.services.readiness as readiness
+
+    monkeypatch.setattr(readiness, "MAX_WIDE_FILES", 2)
+    presence = await _presence_for_far_definition(client, db, monkeypatch, tmp_path)
+
+    assert "far_defined_subject" in presence.missing
+    assert "far_defined_subject" not in presence.text_only
+    assert "не определением" not in presence.reason
+    assert "far_defined_subject (просмотрено 2 из 6)" in presence.reason
+    assert "Ответ неполный" in presence.reason
+    assert "вовсе" not in presence.reason

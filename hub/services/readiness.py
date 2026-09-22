@@ -288,9 +288,12 @@ MAX_SUBJECT_BRANCHES = 25
 MAX_SUBJECT_NAMES = 40
 # Сколько файлов разбирать на одно имя, когда поиск выходит за объявленные
 # области (#1287). Файлы берутся в отсортированном порядке, так что выбор
-# воспроизводим; определение обычно лежит в первом же модуле, а хвост из
-# десятков совпадений — это имя таблицы, которое определения не имеет вовсе.
-MAX_WIDE_FILES = 5
+# воспроизводим. Потолок — про стоимость одного открытия, а не про то, где
+# «обычно» лежит определение: при потолке 5 определение delivery_state
+# оказалось шестым файлом из двадцати, и имя назвали «не определением».
+# Поэтому потолок высокий, а упор в него — отдельный, вслух названный исход
+# «просмотрено N из M, ответ неполный», никогда не «не определено» (#725).
+MAX_WIDE_FILES = 50
 
 # Paths are named by affected_areas; identifiers are named in prose. Strip the
 # paths first so that ``hub/services/delivery_state.py`` does not also donate
@@ -503,6 +506,10 @@ class _WideSearch:
     defined: set[str]
     text_only: dict[str, list[str]]
     unsearched: set[str]
+    # Упёрлись в MAX_WIDE_FILES, не найдя определения: имя -> (разобрано,
+    # всего файлов со словом). Про такое имя нельзя сказать ни «не
+    # определением», ни «нет вовсе» — только что просмотр неполон.
+    partial: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
 async def _widen_the_search(repo_path: str, ref: str, names: list[str]) -> _WideSearch:
@@ -524,32 +531,47 @@ async def _widen_the_search(repo_path: str, ref: str, names: list[str]) -> _Wide
         if where is None:
             found.unsearched.add(name)
             continue
-        paths = sorted(p for p in where if p.endswith(".py"))[:MAX_WIDE_FILES]
-        if not paths:
+        candidates = sorted(p for p in where if p.endswith(".py"))
+        if not candidates:
             # Слова нет в дереве вовсе — остаток, который назовёт отказ.
             continue
-        read_any = False
-        defined_here = False
-        for path in paths:
-            source = await plugins.git_ops.file_at_ref(repo_path, ref, path)
-            if source is None:
-                continue
-            bound = defined_names(source)
-            if bound is None:
-                continue
-            read_any = True
-            if name in bound or name.split(".")[-1] in bound:
-                defined_here = True
-                break
+        paths = candidates[:MAX_WIDE_FILES]
+        read_count, defined_here = await _look_for_definition(
+            repo_path, ref, name, paths
+        )
         if defined_here:
             found.defined.add(name)
-        elif read_any:
-            found.text_only[name] = paths
-        else:
+        elif not read_count:
             # Файлы нашлись, но ни один не прочитался: «посмотреть не
             # удалось» — не «есть только как текст» (#725).
             found.unsearched.add(name)
+        elif len(candidates) > len(paths):
+            # Определение может лежать в неразобранном хвосте: сказать «не
+            # определением» значило бы выдать частичный просмотр за полный.
+            found.partial[name] = (len(paths), len(candidates))
+        else:
+            found.text_only[name] = paths
     return found
+
+
+async def _look_for_definition(
+    repo_path: str, ref: str, name: str, paths: list[str]
+) -> tuple[int, bool]:
+    """Сколько из ``paths`` разобралось и нашлось ли среди них определение."""
+    from hub.integrations.registry import plugins
+
+    read_count = 0
+    for path in paths:
+        source = await plugins.git_ops.file_at_ref(repo_path, ref, path)
+        if source is None:
+            continue
+        bound = defined_names(source)
+        if bound is None:
+            continue
+        read_count += 1
+        if name in bound or name.split(".")[-1] in bound:
+            return read_count, True
+    return read_count, False
 
 
 def _how_we_looked() -> str:
@@ -568,6 +590,7 @@ def _what_is_missing(
     *,
     text_only: dict[str, list[str]],
     unsearched: set[str],
+    partial: dict[str, tuple[int, int]] | None = None,
 ) -> str:
     """Чего именно нет — тремя разными утверждениями вместо одного общего.
 
@@ -576,7 +599,12 @@ def _what_is_missing(
     неправдой про четыре имени из пяти (#1287).
     """
     parts: list[str] = []
-    absent = [m for m in missing if m not in text_only and m not in unsearched]
+    partial = partial or {}
+    absent = [
+        m
+        for m in missing
+        if m not in text_only and m not in unsearched and m not in partial
+    ]
     if absent:
         parts.append(f"Не найдено в {base} вовсе: {', '.join(absent)}.")
     if text_only:
@@ -587,6 +615,17 @@ def _what_is_missing(
             f"Есть в {base}, но не определением — имя таблицы или колонки, ключ "
             f"словаря, упоминание: {named}. Предметом это не считается: назвать "
             "имя не значит создать его."
+        )
+    cut = sorted(m for m in missing if m in partial)
+    if cut:
+        named = "; ".join(
+            f"{name} (просмотрено {partial[name][0]} из {partial[name][1]})"
+            for name in cut
+        )
+        parts.append(
+            f"Слово есть в {base}, но файлов с ним больше потолка разбора, и в "
+            f"просмотренных определения нет: {named}. Ответ неполный — "
+            "определение может лежать в непросмотренных файлах."
         )
     still = sorted(m for m in missing if m in unsearched)
     if still:
@@ -610,10 +649,18 @@ def _stranded_reason(
     supplied: set[str],
     text_only: dict[str, list[str]] | None = None,
     unsearched: set[str] | None = None,
+    partial: dict[str, tuple[int, int]] | None = None,
 ) -> str:
+    said = _what_is_missing(
+        missing,
+        base,
+        text_only=text_only or {},
+        unsearched=unsearched or set(),
+        partial=partial,
+    )
     return (
         f"Задача не открыта: её предмета нет в базовой ветке {base}. "
-        f"{_what_is_missing(missing, base, text_only=text_only or {}, unsearched=unsearched or set())} "
+        f"{said} "
         f"Найдено в ветке {branch} задачи #{other_id} "
         f"«{title}» ({status}): {', '.join(sorted(supplied))} — "
         f"надо дождаться её доставки. "
@@ -746,6 +793,7 @@ async def subject_presence(db: Any, task: dict[str, Any]) -> SubjectPresence:
                 supplied=there,
                 text_only=text_only,
                 unsearched=wide.unsearched,
+                partial=wide.partial,
             ),
         )
 
@@ -754,7 +802,7 @@ async def subject_presence(db: Any, task: dict[str, Any]) -> SubjectPresence:
         missing=tuple(missing),
         text_only=tuple(sorted(text_only)),
         reason=(
-            f"{_what_is_missing(missing, base_ref, text_only=text_only, unsearched=wide.unsearched)} "
+            f"{_what_is_missing(missing, base_ref, text_only=text_only, unsearched=wide.unsearched, partial=wide.partial)} "
             "Ни в одной незавершённой ветке этого тоже нет — обычная новая работа"
         ),
     )
