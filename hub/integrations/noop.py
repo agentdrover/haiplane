@@ -295,6 +295,7 @@ class NoopGitOps:
         resolutions: dict[str, str],
         validate: Any = None,
         tip: str = "",
+        probed: dict[str, str] | None = None,
     ) -> tuple[bool, str]:
         """Нет git — автомерж не состоялся, с названной причиной (#1233)."""
         return False, "git integration is not configured"

@@ -2914,6 +2914,31 @@ class GitOpsIntegration:
             return "", f"мерж базы не состоялся (git rc={rc}): {err[:150]}"
         return path, ""
 
+    @staticmethod
+    async def _conflicting_texts(path: str) -> tuple[dict[str, str] | None, str]:
+        """Конфликтующие файлы готового дерева и их текст С МАРКЕРАМИ diff3.
+
+        Один вход для пробы и для пуша: класс конфликта судится по одной и той
+        же разметке в обоих местах, и сверять их между собой можно байт в байт
+        (#1233, находка 2327bd9255c601cc). ``None`` — спросить не удалось.
+        """
+        rc, out, _ = await _git(
+            "diff", "--name-only", "--diff-filter=U", repo=path, check=False
+        )
+        if rc != 0:
+            return None, "не удалось перечислить конфликтующие файлы"
+        paths = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+        files: dict[str, str] = {}
+        for rel in paths[:20]:
+            try:
+                with open(os.path.join(path, rel), encoding="utf-8") as fh:
+                    files[rel] = fh.read()
+            except (OSError, UnicodeDecodeError) as exc:
+                # Двоичный или нечитаемый файл — не наш класс, и молчать
+                # об этом нельзя: пустой словарь читается как «чисто».
+                return None, f"конфликтующий файл {rel} не прочитан: {exc}"
+        return files, ""
+
     async def base_merge_conflicts(
         self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
     ) -> tuple[dict[str, str] | None, str]:
@@ -2933,22 +2958,7 @@ class GitOpsIntegration:
         if not path:
             return None, why
         try:
-            rc, out, _ = await _git(
-                "diff", "--name-only", "--diff-filter=U", repo=path, check=False
-            )
-            if rc != 0:
-                return None, "не удалось перечислить конфликтующие файлы"
-            paths = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
-            files: dict[str, str] = {}
-            for rel in paths[:20]:
-                try:
-                    with open(os.path.join(path, rel), encoding="utf-8") as fh:
-                        files[rel] = fh.read()
-                except (OSError, UnicodeDecodeError) as exc:
-                    # Двоичный или нечитаемый файл — не наш класс, и молчать
-                    # об этом нельзя: пустой словарь читается как «чисто».
-                    return None, f"конфликтующий файл {rel} не прочитан: {exc}"
-            return files, ""
+            return await self._conflicting_texts(path)
         finally:
             await _git("merge", "--abort", repo=path, check=False)
             await _git("worktree", "remove", "--force", path, repo=repo, check=False)
@@ -2962,6 +2972,7 @@ class GitOpsIntegration:
         resolutions: dict[str, str],
         validate: Any = None,
         tip: str = "",
+        probed: dict[str, str] | None = None,
     ) -> tuple[bool, str]:
         """Слить базу в ветку с готовым разрешением и запушить (#1233, AC-3).
 
@@ -2974,6 +2985,16 @@ class GitOpsIntegration:
         ``tip`` — закреплённый коммит сдачи. Дерево строится на нём, и пуш идёт
         с арендой (``--force-with-lease``) на то же значение: если ветка уехала
         между пробой и пушем, пуш обязан отказать, а не затереть чужой коммит.
+
+        ``probed`` — конфликтующие файлы ТОЙ САМОЙ пробы, по которой считалось
+        ``resolutions``. Аренда стережёт ветку задачи, но не базу, а дерево
+        здесь строится заново и сливает уже НОВЫЙ ``origin/<base>``. Без сверки
+        байты разрешения, посчитанные на старой базе, ложились поверх свежих
+        файлов, ``git add`` снимал с них признак U, и проверка «остались ли
+        конфликты» ничего не видела: строки, приехавшие в базу между пробой и
+        пушем, пропадали молча, а следующий squash в базу мог бы стереть их и
+        там (находка 2327bd9255c601cc, high). Поэтому конфликт пересчитывается
+        и сверяется байт в байт; разошёлся — отказ, а не догадка.
         """
         path, why = await self._prepare_base_merge_tree(
             repo, base, branch, task_id, tip
@@ -2981,6 +3002,27 @@ class GitOpsIntegration:
         if not path:
             return False, why
         try:
+            if probed is None:
+                # Разрешение без пробы сверить не с чем, а применять его
+                # вслепую — ровно тот отказ, ради которого сверка и заведена.
+                return False, "разрешение конфликта не с чем сверить: пробы нет"
+            fresh, why = await self._conflicting_texts(path)
+            if fresh is None:
+                return False, f"конфликт не пересчитан: {why}"
+            if fresh != probed:
+                gone = sorted(set(probed) - set(fresh))
+                new = sorted(set(fresh) - set(probed))
+                changed = sorted(
+                    rel for rel in set(fresh) & set(probed) if fresh[rel] != probed[rel]
+                )
+                return False, (
+                    "база сдвинулась между пробой и пушем: конфликт пересчитан "
+                    "и не совпал с тем, по которому считалось разрешение "
+                    f"(ушли: {', '.join(gone) or '—'}; появились: "
+                    f"{', '.join(new) or '—'}; изменились: "
+                    f"{', '.join(changed) or '—'}) — старые байты на новое "
+                    "дерево не кладём"
+                )
             for rel, text in resolutions.items():
                 target = os.path.join(path, rel)
                 if not os.path.realpath(target).startswith(

@@ -1196,7 +1196,7 @@ async def test_the_automerge_is_judged_by_the_return_code_not_the_output(
         return 2, "All checks passed"  # ровно та ловушка 09.09
 
     ok, detail = await ops.push_resolved_base_merge(
-        str(repo), "develop", "task-1233/probe", 1233, resolutions, _red, pinned
+        str(repo), "develop", "task-1233/probe", 1233, resolutions, _red, pinned, files
     )
     assert not ok and "код возврата 2" in detail, (
         "хвост вывода не доказательство — судим по коду возврата"
@@ -1207,7 +1207,14 @@ async def test_the_automerge_is_judged_by_the_return_code_not_the_output(
         return 0, "ok"
 
     ok, sha = await ops.push_resolved_base_merge(
-        str(repo), "develop", "task-1233/probe", 1233, resolutions, _green, pinned
+        str(repo),
+        "develop",
+        "task-1233/probe",
+        1233,
+        resolutions,
+        _green,
+        pinned,
+        files,
     )
     assert ok, sha
     assert _tip(repo, "task-1233/probe") != before, "зелёная валидация обновляет ветку"
@@ -1377,9 +1384,12 @@ async def test_the_gate_path_runs_the_validation_and_stops_on_a_red_code(
     """
     seen: dict[str, object] = {}
 
-    async def _push(repo, base, branch, task_id, resolutions, validate=None, tip=""):
+    async def _push(
+        repo, base, branch, task_id, resolutions, validate=None, tip="", probed=None
+    ):
         seen["rc"], seen["log"] = await validate("/tmp/basemerge")
         seen["tip"] = tip
+        seen["probed"] = probed
         return False, f"валидация после автомержа упала (код возврата {seen['rc']})"
 
     g = _seeing(monkeypatch, "approved0commit", merged=False)
@@ -1455,7 +1465,14 @@ async def test_a_push_in_the_await_window_never_rides_the_verdict_in(
         return 0, "ok"
 
     ok, detail = await ops.push_resolved_base_merge(
-        str(repo), "develop", "task-1233/probe", 1233, resolutions, _green, approved
+        str(repo),
+        "develop",
+        "task-1233/probe",
+        1233,
+        resolutions,
+        _green,
+        approved,
+        files,
     )
     assert not ok, (
         "ветка ушла с одобренного коммита — автомерж обязан отказать, а не "
@@ -1510,7 +1527,14 @@ async def test_an_unreadable_merge_commit_is_a_refusal_not_an_empty_pin(
         return 0, "ok"
 
     ok, detail = await ops.push_resolved_base_merge(
-        str(repo), "develop", "task-1233/probe", 1233, resolutions, _green, pinned
+        str(repo),
+        "develop",
+        "task-1233/probe",
+        1233,
+        resolutions,
+        _green,
+        pinned,
+        files,
     )
 
     assert not ok, "неудача чтения коммита — это отказ, а не успех"
@@ -1569,6 +1593,7 @@ async def test_a_branch_rewound_under_the_automerge_is_not_clobbered(
         resolutions,
         _green_but_someone_rewinds,
         pinned,
+        files,
     )
 
     assert not ok, (
@@ -3540,3 +3565,111 @@ async def test_transient_hint_findings_are_resolved(
     )
     for prefix in TRANSIENT_HINT_FINDINGS:
         assert await _transient_hint(db, monkeypatch, prefix) != ci_hint
+
+
+async def test_a_base_that_moved_between_probe_and_push_refuses_the_stale_resolution(
+    tmp_path,
+) -> None:
+    """Находка 2327bd9255c601cc (high), воспроизведённая настоящим git.
+
+    Аренда пуша стережёт ВЕТКУ задачи, а дерево для пуша строится заново и
+    сливает уже новый ``origin/develop``. Разрешение же посчитано на пробе, то
+    есть на старой базе. Раньше его байты просто ложились поверх свежего файла
+    и шли в ``git add``: признак U с пути снимался, проверка «остались ли
+    конфликты» видела чистое дерево, и строки, приехавшие в базу между пробой
+    и пушем, пропадали молча — в мерж-коммите, у которого MERGE_HEAD как раз
+    новый develop.
+
+    Здесь третья доставка кладёт в develop ещё один хвост ровно в окне между
+    пробой и пушем (изнутри валидации, которая гонится в готовом дереве).
+    Автомерж обязан отказать, а не сложить старое разрешение на новое дерево.
+    """
+    import subprocess
+
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import base_merge
+
+    repo = _repo_with_a_tail_conflict(tmp_path)
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1233/probe")
+
+    files, why = await ops.base_merge_conflicts(
+        str(repo), "develop", "task-1233/probe", 1233, pinned
+    )
+    assert files, why
+    resolutions, _ = base_merge.plan_resolution(files)
+    assert resolutions
+    # ОКНО МЕЖДУ ПРОБОЙ И ПУШЕМ: третья доставка кладёт на develop ещё хвост.
+    # Дерево для пуша строится заново и сливает уже ЭТОТ develop, а разрешение
+    # посчитано на прежнем.
+    _run_git("git", "checkout", "-q", "develop", cwd=repo)
+    suite = repo / "tests_suite.py"
+    suite.write_text(suite.read_text() + "\n\ndef test_from_the_third():\n    pass\n")
+    _run_git("git", "commit", "-q", "-am", "third delivery lands on develop", cwd=repo)
+    _run_git("git", "push", "-q", "origin", "develop", cwd=repo)
+
+    async def _green_but_the_base_moves(_path):
+        return 0, "ok"
+
+    before = _tip(repo, "task-1233/probe")
+    ok, detail = await ops.push_resolved_base_merge(
+        str(repo),
+        "develop",
+        "task-1233/probe",
+        1233,
+        resolutions,
+        _green_but_the_base_moves,
+        pinned,
+        files,
+    )
+
+    assert not ok, (
+        "база сдвинулась под разрешением — старые байты на новое дерево класть нельзя"
+    )
+    assert "база сдвинулась между пробой и пушем" in detail
+    assert _tip(repo, "task-1233/probe") == before, (
+        "отказавший автомерж не двигает ветку"
+    )
+    _run_git("git", "fetch", "-q", "origin", cwd=repo)
+    on_branch = subprocess.run(
+        ["git", "show", "origin/task-1233/probe:tests_suite.py"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "test_from_the_base" not in on_branch, (
+        "ничего не слито: ветка стоит там же, где стояла"
+    )
+
+
+async def test_a_push_without_the_probe_refuses_instead_of_resolving_blind(
+    tmp_path,
+) -> None:
+    """Сверять разрешение не с чем — отказ, а не «ну применим как есть».
+
+    Вторая половина той же находки: без пробы пуш физически не может узнать,
+    на том ли дереве считалось разрешение. Раньше этот вход был единственным,
+    и именно он и применял старые байты вслепую.
+    """
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import base_merge
+
+    repo = _repo_with_a_tail_conflict(tmp_path)
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1233/probe")
+    files, _ = await ops.base_merge_conflicts(
+        str(repo), "develop", "task-1233/probe", 1233, pinned
+    )
+    resolutions, _ = base_merge.plan_resolution(files or {})
+
+    async def _green(_path):
+        return 0, "ok"
+
+    before = _tip(repo, "task-1233/probe")
+    ok, detail = await ops.push_resolved_base_merge(
+        str(repo), "develop", "task-1233/probe", 1233, resolutions, _green, pinned
+    )
+
+    assert not ok and "не с чем сверить" in detail
+    assert _tip(repo, "task-1233/probe") == before

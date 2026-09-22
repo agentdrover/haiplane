@@ -384,6 +384,7 @@ class GitOpsPlugin(Protocol):
         resolutions: dict[str, str],
         validate: Any = None,
         tip: str = "",
+        probed: dict[str, str] | None = None,
     ) -> tuple[bool, str]: ...
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str

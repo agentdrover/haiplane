@@ -3274,8 +3274,12 @@ async def base_automerge_step(
     async def _validate(path: str) -> tuple[int, str] | None:
         return await validation_run.default_validation_runner(commands, path)
 
+    # ``files`` — та самая проба, по которой посчитано ``resolutions``. Пуш
+    # строит дерево заново и сливает уже НОВЫЙ origin/base, поэтому сверка
+    # конфликта байт в байт идёт туда вместе с разрешением: разошлось — отказ
+    # (находка 2327bd9255c601cc).
     ok, detail = await plugins.git_ops.push_resolved_base_merge(
-        workspace, base, branch, task_id, resolutions, _validate, pinned
+        workspace, base, branch, task_id, resolutions, _validate, pinned, files
     )
     if not ok:
         return "", f"автомерж не состоялся: {detail}"

@@ -877,6 +877,61 @@ async def test_the_brief_feeds_its_base_merge_block_into_the_coverage_verdict(
     ], "«спрашивать нечего» — это не про блок, который прямо сейчас показан"
 
 
+async def test_the_brief_feeds_an_unasked_base_merge_into_the_coverage_too(
+    client: AsyncClient, monkeypatch
+):
+    """Через бриф проверен и второй исход блока — «спросить не удалось».
+
+    Находка 17a0fa0673a52b4f. Сосед выше идёт через бриф, но мокает ТОЛЬКО
+    ``conflicting``, а это сигнал: покрытие остаётся полным, и равенство
+    сходится. Поэтому мутация «передавать блок в счёт, лишь когда он дал
+    сигнал» оставляла его зелёным: при ``unknown`` счётчик читал бы ``None``
+    как «блока нет вовсе» и объявлял ПОЛНОЕ покрытие — ровно подмену «спросить
+    не удалось» на «чисто», ради снятия которой блок в счёт и заводили.
+    Рядом стоящий тест пинит счётчик напрямую и проводки не видит.
+    """
+    from unittest.mock import AsyncMock
+
+    from hub.services import review_brief
+
+    task_id = (await client.post("/api/tasks", json={"title": "Base merge"})).json()[
+        "id"
+    ]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: go"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    monkeypatch.setattr(
+        review_brief,
+        "base_merge_section",
+        AsyncMock(
+            return_value=review_brief.BaseMergeState(
+                state="unknown",
+                reason="клон не ответил про расхождение с базой",
+                files=[],
+            )
+        ),
+    )
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    coverage = brief["evidence_coverage"]
+
+    assert brief["base_merge"]["state"] == "unknown", "блок в брифе есть"
+    assert "base_merge" in [c["check"] for c in coverage["checks_missing"]], (
+        "блок показан и сигнала не дал — это недостающий сигнал, а не "
+        f"отсутствующий блок: {coverage}"
+    )
+    assert "base_merge" not in [
+        c["check"] for c in coverage["checks_not_applicable"]
+    ], "«спрашивать нечего» — это не про блок, который прямо сейчас показан"
+    assert coverage["state"] != "complete", (
+        "покрытие не может быть полным, пока показанный блок молчит"
+    )
+
+
 async def test_the_brief_names_the_second_provider_and_why(client: AsyncClient, db):
     """AC-3 (#1266): бриф называет канал отчёта и причину, когда это не облако.
 
