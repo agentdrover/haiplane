@@ -1328,11 +1328,28 @@ async def _neighbour(
     *,
     status: str = "running",
     submission_sha: str = "",
+    submission_generation: int | None = None,
 ) -> int:
-    """Соседняя задача с записанной веткой и (не)наблюдённой вершиной."""
+    """Соседняя задача с записанной веткой и (не)наблюдённой вершиной.
+
+    ``submission_generation`` по умолчанию выводится из sha — так, как это
+    выглядит на счастливом пути: сдача была, вершину прочитали и закрепили.
+    Передаётся ОТДЕЛЬНО там, где эти два факта расходятся: сдача была, а sha
+    пуст.
+    """
     tv = await services.create_task(db, TaskCreate(title=f"Сосед {branch}"))
+    generation = (
+        submission_generation
+        if submission_generation is not None
+        else (1 if submission_sha.strip() else 0)
+    )
     await repo.update_task(
-        db, tv.id, status=status, branch=branch, submission_sha=submission_sha
+        db,
+        tv.id,
+        status=status,
+        branch=branch,
+        submission_sha=submission_sha,
+        submission_generation=generation,
     )
     await db.commit()
     return tv.id
@@ -1395,6 +1412,37 @@ async def test_a_vanished_branch_still_defers_the_merge(
         "«ещё не опубликована»"
     )
     assert "ref_unresolved" in detail
+
+
+async def test_a_submitted_neighbour_without_a_pinned_tip_still_defers(
+    db: aiosqlite.Connection,
+) -> None:
+    # Находка 1dd76966e24dfa20. Пустой submission_sha значит НЕ только «сдачи
+    # не было». resolve_branch_tip сам документирует пустое значение как
+    # «посмотреть не удалось» (нет рабочей копии, упал fetch, исключение), и
+    # _step_pin_submission_sha в этом случае сдачу всё равно принимает; после
+    # вердикта с уехавшей вершиной закреплённый sha и вовсе стирается. Сосед
+    # здесь именно такой: сдача была, вершину прочитать не смогли, а теперь
+    # ветка с origin исчезла. Это ровно AC-2, и послабление #1283 его касаться
+    # не вправе.
+    task_id, branch = await _pair_running_task(db, "Одобренная задача")
+    gone = "task-1175/image-capture"
+    neighbour_id = await _neighbour(
+        db, gone, status="review", submission_sha="", submission_generation=1
+    )
+    plugins.git_ops = _ScriptedProbeGitOps({gone: _ref_unresolved(gone)})
+
+    detail = await _gate(db, task_id)
+
+    assert detail.startswith(services.STACK_UNKNOWN_PREFIX), (
+        f"сдача у соседа #{neighbour_id} была — «ветки никогда не было» про "
+        f"него сказать нельзя, и мерж обязан подождать: {detail!r}"
+    )
+    assert "ref_unresolved" in detail
+    body = await _feed(db, task_id)
+    assert "не опубликована" not in body, (
+        f"и лента не вправе объявлять такую ветку неопубликованной: {body}"
+    )
 
 
 async def test_a_real_stack_is_still_caught_when_a_neighbour_is_unpublished(
