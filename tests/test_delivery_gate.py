@@ -2568,6 +2568,8 @@ async def test_a_reworked_task_waits_for_resubmission_not_a_human(
     assert "stale_approval" not in feed, (
         f"гейт расхождения не должен даже спрашиваться: одобрения нет — {feed}"
     )
+
+
 # ---- #1271: разбиение перечней, а не копия перечня ----
 #
 # Тест выше (test_every_status_that_owns_an_unmerged_branch_is_a_base) сверяет

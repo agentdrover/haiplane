@@ -706,9 +706,13 @@ class LatestReview(BaseModel):
     the ``HAIPLANE_REVIEW_SELF_APPROVE=allow`` solo opt-out: the implementer
     reviewed their own work, so the verdict is not independent (#434).
     ``closed_by_decision`` is the OTHER way a verdict stops being current
-    (#1286): a human sent the work back for rework. Told apart from a
-    resubmission on purpose — the reader sees a verdict that nothing has
-    superseded and needs to know why it no longer counts.
+    (#1286): a human sent the work back for rework and revoked the approval
+    it carried. Told apart from a resubmission on purpose — the reader sees a
+    verdict that nothing has superseded and needs to know why it no longer
+    counts. Both halves are narrow. Only an APPROVAL has a window to revoke,
+    so a CHANGES_REQUESTED verdict is never closed by the decision that agrees
+    with it; and a resubmission supersedes the closure, because from then on
+    the answer to "why doesn't it count" is that the work changed.
     """
 
     verdict: ReviewVerdict
