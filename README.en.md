@@ -38,8 +38,12 @@ Haiplane Hub keeps the claim and the fact apart:
 ```bash
 git clone https://github.com/agentdrover/haiplane.git
 cd haiplane
-docker compose up
+docker compose up -d --build
 ```
+
+That builds the image from this clone. There is no separately published
+image; the Python and uv bases in the Dockerfile are digest-pinned, so
+`--build` does not float onto `latest`.
 
 The dashboard is on <http://localhost:8080> with a seeded demo project. The
 compose file runs the hub without authentication for local demo use only — see
