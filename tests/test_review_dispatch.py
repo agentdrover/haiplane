@@ -10083,3 +10083,251 @@ async def test_a_purged_access_code_is_replaced_before_the_run_starts(
         "Продления мало: сборщик протухшего УДАЛЯЕТ строку, и продлять "
         "становится нечего — код к старту обязан быть выписан заново"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1255 — несходимость находок по поколениям: прогон не покупается
+# ---------------------------------------------------------------------------
+
+#: Размеченные траектории открытых находок по поколениям, как они лежат в
+#: постановке #1255 (замер machine_reviews прода 11.09.2026). True —
+#: задача сошлась, False — нет.
+NON_CONVERGENCE_HISTORY: dict[int, tuple[tuple[int, ...], bool]] = {
+    1167: ((9, 5, 6, 3, 2, 1, 0), True),
+    1204: ((6, 2, 2, 2, 1, 3, 1, 0), True),
+    1208: ((3, 4, 2, 4, 2, 4), False),
+    1081: ((5, 6, 6), False),
+    1084: ((3, 6, 3), False),
+    1186: ((7, 2, 13), False),
+}
+
+
+def _calibrate(window: int) -> tuple[list[int], list[int]]:
+    """(сошедшиеся, остановленные зря; несошедшиеся, пропущенные)."""
+    from hub.services.review_dispatch import non_convergence_point
+
+    false_stops = [
+        tid
+        for tid, (counts, converged) in NON_CONVERGENCE_HISTORY.items()
+        if converged and non_convergence_point(counts, window) is not None
+    ]
+    misses = [
+        tid
+        for tid, (counts, converged) in NON_CONVERGENCE_HISTORY.items()
+        if not converged and non_convergence_point(counts, window) is None
+    ]
+    return false_stops, misses
+
+
+def test_the_threshold_is_measured_on_the_history_not_chosen():
+    """AC-1 (#1255): число в коде — результат прогона по истории.
+
+    Окна 2..5 прогоняются по размеченным траекториям. Порог в коде обязан
+    быть ЕДИНСТВЕННЫМ окном, которое не останавливает ни одной сошедшейся и
+    ловит все несошедшиеся; рядом названо, скольких сошедшихся он
+    останавливает зря — ноль.
+    """
+    from hub.services.review_dispatch import (
+        NON_CONVERGENCE_WINDOW,
+        non_convergence_point,
+    )
+
+    table = {window: _calibrate(window) for window in range(2, 6)}
+    assert table[2][0] == [1204], "окно 2 останавливает #1204 на плато"
+    assert table[4][1] == [1081, 1084, 1186], "окно 4 пропускает короткие"
+    clean = [w for w, (stops, misses) in table.items() if not stops and not misses]
+    assert clean == [NON_CONVERGENCE_WINDOW] == [3], (
+        f"замер даёт {clean}, в коде стоит {NON_CONVERGENCE_WINDOW}"
+    )
+    false_stops, _ = table[NON_CONVERGENCE_WINDOW]
+    assert false_stops == [], "сошедшихся остановлено зря: 0"
+    assert non_convergence_point(NON_CONVERGENCE_HISTORY[1208][0]) == 4, (
+        "#1208 ловится на четвёртом поколении"
+    )
+
+
+def _layer(generation: int, size: int) -> list[dict]:
+    """``size`` РАЗНЫХ подтверждённых находок поколения: у каждой свой uid."""
+    return [
+        _confirmed(f"дефект {generation}.{n}", f"cat-{generation}", 100 * generation + n)
+        for n in range(size)
+    ]
+
+
+async def _next_submission(db: aiosqlite.Connection, task_id: int, generation: int):
+    """Сдача ``generation`` с НОВЫМ кодом, ещё без ревьюера."""
+    await db.execute(
+        "UPDATE tasks SET submission_generation=?, submission_sha=?, "
+        "review_job_id=NULL, status='review' WHERE id=?",
+        (generation, f"{generation:x}".rjust(40, "d"), task_id),
+    )
+    await db.commit()
+
+
+async def _non_convergence_notices(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if "несходимость находок" in dict(u)["content"]
+    ]
+
+
+async def _walk_counts(db, task_id: int, counts: list[int]) -> None:
+    """Положить отчёты по поколениям 1..N; каждый слой автор ЧИНИЛ."""
+    previous: tuple[int, int, list[dict]] | None = None
+    for generation, size in enumerate(counts, start=1):
+        layer = _layer(generation, size)
+        review_id = await _generation_with_findings(db, task_id, generation, confirmed=layer)
+        if previous is not None:
+            await _author_closed_them(
+                db, task_id, previous[0], previous[1], confirmed=previous[2], unresolved=[]
+            )
+        previous = (review_id, generation, layer)
+
+
+async def test_a_flat_finding_count_stops_the_next_run_and_asks_the_human(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1255): три поколения по три находки при настоящих правках.
+
+    Проверяется НАБЛЮДАЕМОЕ отсутствие заказа у провайдера: подставка
+    провайдера не получила второго вызова. Вопрос задан один раз и несёт
+    саму последовательность; после ответа человека круги продолжаются.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1255"}, "run": {"id": "r-1255"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-1255-flat")
+    assert len(recorder.calls) == 1, "предпосылка: первая сдача заказала прогон"
+
+    await _walk_counts(db, task_id, [3, 3, 3])
+    await _next_submission(db, task_id, 4)
+    from hub.services.review_dispatch import maybe_dispatch_review
+
+    assert await maybe_dispatch_review(db, task_id) is False
+    assert len(recorder.calls) == 1, "прогон НЕ заказан у провайдера"
+    notices = await _non_convergence_notices(db, task_id)
+    assert len(notices) == 1
+    assert "постановка или код" in notices[0]
+    assert "сдача 1: 3, сдача 2: 3, сдача 3: 3" in notices[0]
+    events = [
+        json.loads(dict(r)["payload"])
+        for r in await repo.list_events(
+            db, since=0, kinds=["review_non_convergence"], limit=10
+        )
+    ]
+    assert [e["counts"] for e in events] == [[3, 3, 3]]
+
+    # Без ответа следующая сдача тоже стоит, но вопрос не повторяется.
+    await _next_submission(db, task_id, 5)
+    assert await maybe_dispatch_review(db, task_id) is False
+    assert len(recorder.calls) == 1
+    assert len(await _non_convergence_notices(db, task_id)) == 1, "вопрос один раз"
+
+    # Человек ответил вердиктом по остановленной сдаче — круги продолжаются.
+    await db.execute(
+        "UPDATE tasks SET review_verdict_generation=5 WHERE id=?", (task_id,)
+    )
+    await _next_submission(db, task_id, 6)
+    assert await maybe_dispatch_review(db, task_id) is True
+    assert len(recorder.calls) == 2, "после ответа прогон снова покупается"
+
+
+async def _stops_along(db, task_id: int, counts: tuple[int, ...]) -> list[int]:
+    """Поколения, перед которыми правило остановило бы прогон."""
+    from hub.services.review_dispatch import findings_stopped_converging
+
+    stopped: list[int] = []
+    for generation, size in enumerate(counts, start=1):
+        await _generation_with_findings(
+            db, task_id, generation, confirmed=_layer(generation, size)
+        )
+        await _next_submission(db, task_id, generation + 1)
+        task = dict(await repo.get_task(db, task_id))
+        if await findings_stopped_converging(db, task):
+            stopped.append(generation + 1)
+    return stopped
+
+
+async def test_a_long_but_converging_task_is_not_stopped(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1255): #1167 и #1204 — длинные, с колебаниями, но сошлись.
+
+    Настоящие последовательности прогоняются через базу поколение за
+    поколением, как их видел бы хаб на каждой сдаче. Контроль — #1208 на
+    том же пути останавливается, иначе «не сработало» ничего не доказывает.
+    """
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-c"}, "run": {"id": "r"}}))
+    for tid in (1167, 1204):
+        task_id = await _submitted(client, db, f"spike-1255-conv-{tid}")
+        assert await _stops_along(db, task_id, NON_CONVERGENCE_HISTORY[tid][0]) == [], (
+            f"#{tid} сошлась сама — останавливать её нельзя"
+        )
+    control = await _submitted(client, db, "spike-1255-control")
+    stops = await _stops_along(db, control, NON_CONVERGENCE_HISTORY[1208][0])
+    assert stops and stops[0] == 5, "#1208 стоит перед пятой сдачей: четвёртый отчёт"
+
+
+async def test_dispositions_count_as_progress_and_an_incomplete_zero_does_not(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4 (#1255): открытые находки, а не сырые; неполный ноль — не чисто."""
+    from hub.services.review_dispatch import findings_stopped_converging
+
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-d"}, "run": {"id": "r"}}))
+
+    async def _stopped(task_id: int, generation: int) -> bool:
+        await _next_submission(db, task_id, generation)
+        return await findings_stopped_converging(db, dict(await repo.get_task(db, task_id)))
+
+    # Разбор: две из трёх находок третьего поколения автор отложил и
+    # признал не дефектом — открытых 3, 3, 1, это схождение.
+    for outcome, expected in (("deferred", False), ("fixed", True)):
+        task_id = await _submitted(client, db, f"spike-1255-disp-{outcome}")
+        await _walk_counts(db, task_id, [3, 3])
+        third = _layer(3, 3)
+        review_id = await _generation_with_findings(db, task_id, 3, confirmed=third)
+        await _author_closed_them(
+            db, task_id, review_id, 3, confirmed=third[:2], unresolved=[],
+            outcome_confirmed=outcome,
+        )
+        assert await _stopped(task_id, 4) is expected, (
+            f"исход {outcome}: разбор — прогресс, починка проверяется отчётом"
+        )
+
+    # Неполный отчёт с нулём находок: 3, 4, 3 и затем «не дочитал».
+    task_id = await _submitted(client, db, "spike-1255-incomplete")
+    for generation, size in enumerate((3, 4, 3), start=1):
+        await _generation_with_findings(db, task_id, generation, confirmed=_layer(generation, size))
+    await db.execute("UPDATE tasks SET submission_generation=4 WHERE id=?", (task_id,))
+    await _seed_report(db, task_id, incomplete=True, reason=None)
+    await db.commit()
+    assert await _stopped(task_id, 5) is True, (
+        "неполный ноль не схождение: последним известным остаётся 3 из 3"
+    )
+
+
+async def test_several_reports_of_one_generation_fold_into_their_union(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1255: lite и добор deep на одно поколение сворачиваются ОБЪЕДИНЕНИЕМ.
+
+    Два случая, и каждый отличает объединение от своей альтернативы:
+    максимум прятал бы находку, которую нашёл только один отчёт, сумма
+    считала бы повтор дважды.
+    """
+    from hub.services.review_dispatch import finding_trajectory
+
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-u"}, "run": {"id": "r"}}))
+    a, b, c = _layer(1, 3)
+    task_id = await _submitted(client, db, "spike-1255-union-max")
+    await _generation_with_findings(db, task_id, 1, confirmed=[a, b])
+    await _generation_with_findings(db, task_id, 1, confirmed=[b, c])
+    trajectory = await finding_trajectory(db, task_id, 2)
+    assert trajectory.counts == (3,), "объединение: a, b, c — не максимум 2"
+
+    task_id = await _submitted(client, db, "spike-1255-union-sum")
+    await _generation_with_findings(db, task_id, 1, confirmed=[a, b])
+    await _generation_with_findings(db, task_id, 1, confirmed=[a, b])
+    trajectory = await finding_trajectory(db, task_id, 2)
+    assert trajectory.counts == (2,), "повтор того же отчёта — не сумма 4"
