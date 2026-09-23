@@ -157,15 +157,43 @@ def dispatcher_enabled() -> bool:
 
 
 async def _refuse(
-    db: aiosqlite.Connection, task_id: int, reason: str, detail: str
+    db: aiosqlite.Connection,
+    task_id: int,
+    reason: str,
+    detail: str,
+    *,
+    generation: int,
+    kind: str,
 ) -> None:
-    """Say no in the feed. A silent refusal is indistinguishable from a bug."""
+    """Say no in the feed. A silent refusal is indistinguishable from a bug.
+
+    Но сказать нет — один раз на смену причины, а не на каждом тике (#1330).
+    Поллер зовёт order_run по каждой задаче в review раз в полминуты, и
+    исчерпанный потолок 22.09.2026 дал 216 одинаковых событий за два часа,
+    а 23.09 — 1520 к пяти утра. Приём и читатель прошлого события те же,
+    что у временного отказа прогона (#1290): второго механизма дедупа нет.
+
+    Ключ — задача, поколение, вид заказа и UTC-сутки. Сутки нужны потолку:
+    исчерпанный вчера и исчерпанный сегодня — два факта, не один.
+    """
+    from hub.services.steward_shadow import _last_event_payload
+
+    previous = await _last_event_payload(
+        db, EVENT_REFUSED, task_id=task_id, order=(generation, kind), today=True
+    )
+    if previous.get("reason") == reason:
+        return
     await repo.insert_event(
         db,
         kind=EVENT_REFUSED,
         task_id=task_id,
         actor="hub",
-        payload={"reason": reason, "detail": detail},
+        payload={
+            "reason": reason,
+            "detail": detail,
+            "generation": generation,
+            "kind": kind,
+        },
     )
     await db.commit()
 
@@ -251,11 +279,20 @@ async def order_run(
             task_id,
             REFUSED_MODE_OFF,
             f"STEWARD_MODE={config.STEWARD_MODE!r} — контур закрыт",
+            generation=generation,
+            kind=kind,
         )
         return None
     missing = await _revision_missing(db, task_id, generation, kind)
     if missing:
-        await _refuse(db, task_id, REFUSED_NO_GENERATION, missing)
+        await _refuse(
+            db,
+            task_id,
+            REFUSED_NO_GENERATION,
+            missing,
+            generation=generation,
+            kind=kind,
+        )
         return None
 
     project = await repo.resolve_project_for_task(db, task_id)
@@ -268,6 +305,8 @@ async def order_run(
             REFUSED_DAILY_CAP,
             f"суточный потолок исчерпан: {used}/{config.STEWARD_DAILY_CAP} "
             "прогонов на проект за UTC-сутки — задача идёт человеческим маршрутом",
+            generation=generation,
+            kind=kind,
         )
         return None
 
@@ -297,6 +336,8 @@ async def order_run(
             task_id,
             REFUSED_ALREADY_ORDERED,
             f"прогон на генерацию {generation} ({kind}) уже заказан",
+            generation=generation,
+            kind=kind,
         )
         return None
 
