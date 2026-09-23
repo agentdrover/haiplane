@@ -198,6 +198,13 @@ async def _profile_exec(
     except OSError as exc:
         await kill_process_group(proc)
         return COMMAND_NOT_FOUND_RC, f"команда не запустилась: {argv[0]} ({exc})"
+    except BaseException:
+        # Отмена тика поллера на остановке сервиса приходит CancelledError и
+        # мимо веток выше пролетала: дочерний процесс доживал сиротой. Группу
+        # гасим, отмену пробрасываем дальше — как #544 (находка
+        # 2ce63622f499a563).
+        await asyncio.shield(kill_process_group(proc))
+        raise
     rc = proc.returncode or 0
     text = (out or b"")[:_MAX_OUTPUT].decode(errors="replace").strip()
     if rc == COMMAND_NOT_FOUND_RC and not text:

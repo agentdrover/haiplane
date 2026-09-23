@@ -3949,6 +3949,22 @@ async def test_automerge_validates_with_a_command_the_host_can_run(
     assert "CI на новой вершине" in card, (
         "и чем будет проверено поведение: карточка не обещает больше, чем сделал хост"
     )
+    # Находка 9da109934917487c: карточка и подсказка ожидания читаются вместе,
+    # в СКЛЕЕННОМ алерте «Доставка отложена». Подсказка, говорящая «CI уже
+    # зелёный», противоречила бы карточке: CI на новой вершине только пошёл.
+    waits = [
+        u["content"]
+        for u in updates
+        if (u["content"] or "").startswith("Доставка отложена")
+        and "base_automerged" in u["content"]
+    ]
+    assert len(waits) == 1, await _feed(db, task_id)
+    assert "уже зелёный" not in waits[0], waits[0]
+    hint = waits[0].partition("Это временное состояние")[2]
+    assert hint, waits[0]
+    assert "CI на новой вершине" in hint and "следующим циклом" in hint, (
+        "подсказка сама говорит, чего ждёт доставка"
+    )
 
     # Следующий цикл: CI на слитой вершине ещё не зелёный — гейт ждёт его, а
     # не мержит сложенное без проверки поведения.
@@ -4029,3 +4045,47 @@ async def test_the_host_profile_catches_a_leftover_conflict_marker(tmp_path) -> 
     _run_git("git", "add", "NOTES.txt", cwd=workdir)
     rc, log_tail = await validation_run.host_profile_runner(str(workdir))
     assert rc == 0, log_tail
+
+
+async def test_a_cancelled_profile_leaves_no_orphan_process(
+    tmp_path, monkeypatch
+) -> None:
+    """Отмена проверки не бросает дочерний процесс сиротой (находка 2ce63622f499a563).
+
+    Тик поллера гасится на остановке сервиса отменой. Пока группа процессов
+    убивалась только на таймауте и OSError, ``CancelledError`` пролетал мимо,
+    и компиляция (или зависший git) доживала до конца сама по себе — ровно то,
+    что #544 закрыл в default_validation_runner.
+    """
+    import asyncio
+    import sys
+
+    pidfile = tmp_path / "child.pid"
+    sleeper = (
+        "import os, time; "
+        f"open({str(pidfile)!r}, 'w').write(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+    task = asyncio.create_task(
+        validation_run._profile_exec([sys.executable, "-c", sleeper], str(tmp_path))
+    )
+    for _ in range(200):
+        if pidfile.exists() and pidfile.read_text():
+            break
+        await asyncio.sleep(0.05)
+    pid = int(pidfile.read_text())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    import os
+
+    for _ in range(100):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        os.kill(pid, 9)
+        pytest.fail("отменённая проверка оставила дочерний процесс жить")
