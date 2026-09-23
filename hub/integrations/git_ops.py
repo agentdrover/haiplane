@@ -885,13 +885,21 @@ class GitOpsIntegration:
         one submitted. The order is a property of the branches, so ask git
         about it directly.
 
-        Returns one of ``STACK_ANCESTRY_*``: the head is the descendant (the
-        other branch merges first), the head is the ancestor (the head merges
-        first), the two are unrelated by ancestry (no order to name), or the
-        question could not be answered. Never raises and never guesses: an
-        unresolvable ref, an unreadable repository or a commit this clone does
-        not carry is ``unknown``, which the caller must report as "order not
-        determined" rather than fall back to a side.
+        Returns one of ``STACK_ANCESTRY_*``, each named by its value:
+
+        - ``head_is_descendant`` — the head stands on the other branch; the
+          other branch merges first.
+        - ``head_is_ancestor`` — the other branch stands on the head; the head
+          merges first.
+        - ``same_tip`` — both names point at one commit (#1193): each branch
+          IS the other's history, so there is no order to name, and the caller
+          must not word it as ``unrelated``, whose fact is the opposite.
+        - ``unrelated`` — neither branch is in the other's history; no order
+          to name.
+        - ``unknown`` — the question could not be answered. Never raises and
+          never guesses: an unresolvable ref, an unreadable repository or a
+          commit this clone does not carry lands here, and the caller must
+          report "order not determined" rather than fall back to a side.
         """
         if repo is None:
             reason = await _default_workspace_error()
@@ -1855,6 +1863,47 @@ class GitOpsIntegration:
         if rc != 0:
             return None
         return {line.strip() for line in out.splitlines() if line.strip()}
+
+    async def files_naming_at_ref(
+        self, repo: str, ref: str, word: str, pathspec: str = "*.py"
+    ) -> set[str] | None:
+        """Files of ``ref`` where ``word`` occurs as a WHOLE WORD (#1287).
+
+        ``-w`` is the whole point, and it is git's own word rule rather than a
+        rule written here: ``ledger_row`` does not match inside
+        ``ledger_rows``, and a substring hit must never read as presence — it
+        would open a task whose subject does not exist under a name that
+        merely resembles it. ``-F`` keeps a name with regex characters in it
+        from being read as a pattern.
+
+        Three answers, not two, like every other read of a ref here (#725):
+        the empty set means "looked and it is nowhere", ``None`` means the
+        look itself did not happen. Git says the first with exit code 1 and
+        the second with anything above it.
+        """
+        rc, out, _ = await _git(
+            "grep",
+            "-l",
+            "-w",
+            "-F",
+            "-e",
+            word,
+            ref,
+            "--",
+            pathspec,
+            repo=repo,
+            check=False,
+        )
+        if rc == 1:
+            return set()
+        if rc != 0:
+            return None
+        prefix = f"{ref}:"
+        return {
+            line[len(prefix) :].strip()
+            for line in out.splitlines()
+            if line.startswith(prefix) and line[len(prefix) :].strip()
+        }
 
     async def commit_exists(self, repo: str, sha: str) -> bool | None:
         """Is this commit here? ``None`` when the repository could not be read.
@@ -2973,6 +3022,273 @@ class GitOpsIntegration:
             return []
         lines = [ln.strip() for ln in (out or "").splitlines()[1:] if ln.strip()]
         return lines[:10]
+
+    async def _prepare_base_merge_tree(
+        self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
+    ) -> tuple[str, str]:
+        """Одноразовое дерево на ЗАКРЕПЛЁННОМ коммите со слитой в него базой (#1233).
+
+        Возвращает ``(путь, причина)``: путь непустой — мерж выполнен (чисто
+        или с конфликтами, это спрашивают отдельно), непустая причина — спросить
+        не удалось. Разметка diff3 включена НАРОЧНО: без секции общего предка
+        нельзя доказать, что ни одна сторона не переписала существующую строку,
+        а без этого доказательства автомерж не имеет права срабатывать.
+
+        ``tip`` — коммит, НА КОТОРОМ строится дерево, и он обязан быть тем самым
+        закреплённым коммитом сдачи. Пока здесь стоял ``origin/<branch>``,
+        автомерж брал вершину ветки КАКОЙ ОНА СТАЛА: пуш, приехавший в окно
+        ожидания, попадал в дерево, в слитый коммит и в перезакрепление, и
+        человеческий вердикт переезжал на код, которого человек не видел.
+        Наблюдено на настоящем git: неодобренный коммит оказывался предком
+        перезакреплённого (tests/test_delivery_gate.py). Это ровно обратное
+        предмету #1233, поэтому якорь здесь — закрепление, а не вершина.
+        """
+        rc, _, err = await _git(
+            "fetch",
+            "origin",
+            f"+{base}:refs/remotes/origin/{base}",
+            f"+{branch}:refs/remotes/origin/{branch}",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            return "", f"не удалось получить ветки из origin: {err[:150]}"
+        if not (tip or "").strip():
+            # Без закрепления опереться не на что: строить на вершине ветки
+            # значило бы согласиться слить что угодно, что туда приехало.
+            return "", (
+                "автомерж не на чем закрепить: коммит сдачи не закреплён, "
+                "а вершину ветки автомерж не берёт (#1233)"
+            )
+        tip = tip.strip()
+        rc, moved, _ = await _git(
+            "rev-parse", f"origin/{branch}", repo=repo, check=False
+        )
+        if rc != 0:
+            return "", f"не удалось прочитать вершину ветки {branch}"
+        moved = (moved or "").strip()
+        if moved != tip:
+            # Ветка уехала с закреплённого коммита. Слить базу в закрепление и
+            # запушить значило бы затереть чужой пуш, а слить в вершину —
+            # перенести вердикт на неодобренное. Оба выхода хуже человека.
+            return "", (
+                f"ветка {branch} ушла с закреплённого коммита {tip[:12]} на "
+                f"{moved[:12]} — автомерж не трогает то, чего не одобряли"
+            )
+        path = _scratch_worktree(repo, "basemerge", task_id)
+        await _git("worktree", "remove", "--force", path, repo=repo, check=False)
+        rc, _, err = await _git(
+            "worktree",
+            "add",
+            "--force",
+            "--detach",
+            path,
+            tip,
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            return "", f"не удалось подготовить дерево для мержа базы: {err[:150]}"
+        try:
+            rc, _, err = await _git(
+                "-c",
+                "merge.conflictStyle=diff3",
+                "merge",
+                "--no-commit",
+                "--no-ff",
+                f"origin/{base}",
+                repo=path,
+                check=False,
+            )
+        except BaseException:
+            # Вызывающие чистят дерево, только когда путь им вернули. Отмена
+            # посреди мержа (гашение поллера) иначе бросала его рядом с клоном
+            # с незавершённым мержем внутри (находка f529be6df1e61160).
+            await _git("worktree", "remove", "--force", path, repo=repo, check=False)
+            raise
+        if rc == _TIMEOUT_RC or rc >= 128:
+            # Таймаут и падение самого git — «спросить не удалось», а не
+            # конфликт: лечится повтором, а не человеком (#970, #1116).
+            await _git("worktree", "remove", "--force", path, repo=repo, check=False)
+            return "", f"мерж базы не состоялся (git rc={rc}): {err[:150]}"
+        return path, ""
+
+    @staticmethod
+    async def _conflicting_texts(path: str) -> tuple[dict[str, str] | None, str]:
+        """Конфликтующие файлы готового дерева и их текст С МАРКЕРАМИ diff3.
+
+        Один вход для пробы и для пуша: класс конфликта судится по одной и той
+        же разметке в обоих местах, и сверять их между собой можно байт в байт
+        (#1233, находка 2327bd9255c601cc). ``None`` — спросить не удалось.
+        """
+        rc, out, _ = await _git(
+            "diff", "--name-only", "--diff-filter=U", repo=path, check=False
+        )
+        if rc != 0:
+            return None, "не удалось перечислить конфликтующие файлы"
+        paths = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+        files: dict[str, str] = {}
+        for rel in paths[:20]:
+            try:
+                with open(os.path.join(path, rel), encoding="utf-8") as fh:
+                    files[rel] = fh.read()
+            except (OSError, UnicodeDecodeError) as exc:
+                # Двоичный или нечитаемый файл — не наш класс, и молчать
+                # об этом нельзя: пустой словарь читается как «чисто».
+                return None, f"конфликтующий файл {rel} не прочитан: {exc}"
+        return files, ""
+
+    async def base_merge_conflicts(
+        self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
+    ) -> tuple[dict[str, str] | None, str]:
+        """Что помешает слить базу в ветку — пробой, которая ничего не меняет (#1233).
+
+        ``({}, "")`` — база сливается чисто. Непустой словарь — путь файла и его
+        содержимое С МАРКЕРАМИ diff3, чтобы класс конфликта судили по разметке
+        git, а не по догадке. ``None`` — спросить не удалось, и это НЕ «конфликта
+        нет»: одно чинится повтором, другое руками человека (#725).
+
+        ``tip`` — закреплённый коммит сдачи: пробу задают о ТОМ коде, который
+        одобряли, а не о вершине ветки.
+        """
+        path, why = await self._prepare_base_merge_tree(
+            repo, base, branch, task_id, tip
+        )
+        if not path:
+            return None, why
+        try:
+            return await self._conflicting_texts(path)
+        finally:
+            await _git("merge", "--abort", repo=path, check=False)
+            await _git("worktree", "remove", "--force", path, repo=repo, check=False)
+
+    async def push_resolved_base_merge(
+        self,
+        repo: str,
+        base: str,
+        branch: str,
+        task_id: int,
+        resolutions: dict[str, str],
+        validate: Any = None,
+        tip: str = "",
+        probed: dict[str, str] | None = None,
+    ) -> tuple[bool, str]:
+        """Слить базу в ветку с готовым разрешением и запушить (#1233, AC-3).
+
+        ``validate`` — асинхронный вызов ``(путь) -> (rc, лог) | None``, который
+        гонится в том же дереве ПОСЛЕ разрешения. Судим по коду возврата: 09.09
+        дважды наблюдали «All checks passed» при коде 2, и хвост вывода здесь
+        не доказательство. Валидации нет или она не запустилась — не пушим:
+        сложить два блока текста мало, они могут конфликтовать по именам.
+
+        ``tip`` — закреплённый коммит сдачи. Дерево строится на нём, и пуш идёт
+        с арендой (``--force-with-lease``) на то же значение: если ветка уехала
+        между пробой и пушем, пуш обязан отказать, а не затереть чужой коммит.
+
+        ``probed`` — конфликтующие файлы ТОЙ САМОЙ пробы, по которой считалось
+        ``resolutions``. Аренда стережёт ветку задачи, но не базу, а дерево
+        здесь строится заново и сливает уже НОВЫЙ ``origin/<base>``. Без сверки
+        байты разрешения, посчитанные на старой базе, ложились поверх свежих
+        файлов, ``git add`` снимал с них признак U, и проверка «остались ли
+        конфликты» ничего не видела: строки, приехавшие в базу между пробой и
+        пушем, пропадали молча, а следующий squash в базу мог бы стереть их и
+        там (находка 2327bd9255c601cc, high). Поэтому конфликт пересчитывается
+        и сверяется байт в байт; разошёлся — отказ, а не догадка.
+        """
+        path, why = await self._prepare_base_merge_tree(
+            repo, base, branch, task_id, tip
+        )
+        if not path:
+            return False, why
+        try:
+            if probed is None:
+                # Разрешение без пробы сверить не с чем, а применять его
+                # вслепую — ровно тот отказ, ради которого сверка и заведена.
+                return False, "разрешение конфликта не с чем сверить: пробы нет"
+            fresh, why = await self._conflicting_texts(path)
+            if fresh is None:
+                return False, f"конфликт не пересчитан: {why}"
+            if fresh != probed:
+                gone = sorted(set(probed) - set(fresh))
+                new = sorted(set(fresh) - set(probed))
+                changed = sorted(
+                    rel for rel in set(fresh) & set(probed) if fresh[rel] != probed[rel]
+                )
+                return False, (
+                    "база сдвинулась между пробой и пушем: конфликт пересчитан "
+                    "и не совпал с тем, по которому считалось разрешение "
+                    f"(ушли: {', '.join(gone) or '—'}; появились: "
+                    f"{', '.join(new) or '—'}; изменились: "
+                    f"{', '.join(changed) or '—'}) — старые байты на новое "
+                    "дерево не кладём"
+                )
+            for rel, text in resolutions.items():
+                target = os.path.join(path, rel)
+                if not os.path.realpath(target).startswith(
+                    os.path.realpath(path) + os.sep
+                ):
+                    return False, f"путь {rel} ведёт наружу рабочего дерева"
+                with open(target, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                await _git("add", "--", rel, repo=path, check=False)
+            rc, out, _ = await _git(
+                "diff", "--name-only", "--diff-filter=U", repo=path, check=False
+            )
+            left = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+            if rc != 0 or left:
+                return False, (
+                    "после разрешения остались конфликтующие файлы: "
+                    + (", ".join(left) or "перечислить не удалось")
+                )
+            if validate is None:
+                return False, "валидацию после автомержа гонять нечем"
+            result = await validate(path)
+            if result is None:
+                return False, "валидация после автомержа не запустилась"
+            rc, _log = result
+            if rc != 0:
+                return False, f"валидация после автомержа упала (код возврата {rc})"
+            rc, _, err = await _git(
+                "commit",
+                "-m",
+                f"chore(task-{task_id}): merge {base} into {branch}",
+                "--no-verify",
+                repo=path,
+                check=False,
+            )
+            if rc != 0:
+                return False, f"коммит мержа не состоялся: {err[:150]}"
+            # Коммит слитой ветки читается ДО пуша: закрепление сдачи будет
+            # переставлено именно на него, и переставлять его вслепую нельзя.
+            rc, sha, _ = await _git("rev-parse", "HEAD", repo=path, check=False)
+            sha = (sha or "").strip()
+            if rc != 0 or not sha:
+                # Раньше код возврата здесь не смотрели и возвращали
+                # ``True, ""``. Пустая строка уезжала в submission_sha и СТИРАЛА
+                # закрепление, а пустое закрепление гейт читает как «сверка не
+                # проводилась» и доставляет без неё (#572). Молчаливая потеря
+                # закрепления хуже несостоявшегося автомержа.
+                return False, "коммит слитой ветки не прочитан — закрепление не трогаем"
+            # Аренда — это сравнение-и-запись: пуш пройдёт, только если ветка
+            # ВСЁ ЕЩЁ стоит на закреплённом коммите. Дерево тоже построено на
+            # нём, так что это обычный fast-forward; аренда закрывает окно между
+            # пробой и пушем, где чужой коммит успел бы лечь под наш вердикт.
+            # Пустой ``tip`` сюда не доходит: дерево на нём и строится.
+            rc, _, err = await _git(
+                "push",
+                f"--force-with-lease=refs/heads/{branch}:{tip.strip()}",
+                "origin",
+                f"HEAD:refs/heads/{branch}",
+                repo=path,
+                check=False,
+                timeout=60,
+            )
+            if rc != 0:
+                return False, f"пуш слитой ветки не прошёл: {err[:150]}"
+            return True, sha
+        finally:
+            await _git("merge", "--abort", repo=path, check=False)
+            await _git("worktree", "remove", "--force", path, repo=repo, check=False)
 
     async def release_range(
         self,

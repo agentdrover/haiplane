@@ -146,6 +146,7 @@ def _audit_pool_and_oversample(
     verdicts: list[dict],
     escalations: list[dict],
     steward: list[dict],
+    self_approvals: list[dict] | tuple[()] = (),
 ) -> tuple[list[int], set[int]]:
     """Кого спот-чек вообще может выбрать, и кого — выбрать охотнее (#1144).
 
@@ -164,12 +165,18 @@ def _audit_pool_and_oversample(
     входят — это как раз решения «на всякий случай / отказ судить», ошибка
     в которых стоит дешевле (лишний цикл ревью или лишний взгляд человека),
     а не дороже.
+
+    ``self_approvals`` — вердикты, которые стюард ПРИМЕНИЛ сам (#1231). Они
+    всегда в oversample: это ровно то решение, которого человек не видел.
+    Суждение стюарда в ``steward`` рядом с ним — совет, и в тени он ничего
+    не применил; одно по другому не угадывается.
     """
     approval_ids = [a["task_id"] for a in approvals]
     verdict_ids = [v["task_id"] for v in verdicts]
     escalation_ids = [e["task_id"] for e in escalations]
     steward_ids = [s["task_id"] for s in steward]
-    pool = approval_ids + verdict_ids + escalation_ids + steward_ids
+    self_approved_ids = [s["task_id"] for s in self_approvals]
+    pool = approval_ids + verdict_ids + escalation_ids + steward_ids + self_approved_ids
 
     oversample = set(approval_ids)
     oversample.update(
@@ -180,6 +187,7 @@ def _audit_pool_and_oversample(
     oversample.update(
         s["task_id"] for s in steward if s.get("verdict") == _STEWARD_VERDICT_APPROVE
     )
+    oversample.update(self_approved_ids)
     return pool, oversample
 
 
@@ -226,6 +234,14 @@ _PRECISION_WINDOW_DAYS = PRACTICE_METRICS_DEFAULT_DAYS
 # vocabulary it mirrors.
 STEWARD_SECTION_KEY = "steward_judgements"
 
+# Вердикты, которые стюард ПРИМЕНИЛ без человека (#1231). Отдельным ключом, а
+# не пометкой внутри раздела суждений: суждение — совет, и в тени (#1268) их
+# пишется много; применённое одобрение — исход, которого человек не видел.
+# Смешать их значит сделать самоодобрение неотличимым от совета — ровно то,
+# что постановка запрещает («тихое одобрение неотличимо от подлога»).
+# Дайджест без ключа старше раздела: там «ноль» не измерялся.
+SELF_APPROVALS_KEY = "steward_self_approvals"
+
 MEASURED = "measured"
 UNMEASURED = "unmeasured"
 
@@ -240,6 +256,31 @@ def steward_section_state(payload: dict) -> str:
     about a day nobody looked at.
     """
     return MEASURED if STEWARD_SECTION_KEY in payload else UNMEASURED
+
+
+def self_approvals_state(payload: dict) -> str:
+    """Считал ли этот дайджест самоодобрения стюарда вообще (#1231).
+
+    Тот же вопрос, что у раздела суждений, и тот же ответ: ключа нет —
+    дайджест старше раздела, и ноль был бы утверждением о дне, на который
+    никто не смотрел.
+    """
+    return MEASURED if SELF_APPROVALS_KEY in payload else UNMEASURED
+
+
+def _is_self_approval(event: dict, payload: dict) -> bool:
+    """Применённое стюардом одобрение — вердикт с актором steward, а не совет.
+
+    Актор пишет ``record_review_verdict``, которым стюард применяет
+    суждение (steward_applied._record); вердикт — ``ReviewVerdict.value``,
+    с «d». Человеческий вердикт и вердикт автопилота сюда не попадают по
+    актору, совет стюарда — по kind события.
+    """
+    return (
+        event["kind"] == "review_verdict_recorded"
+        and event["actor"] == "steward"
+        and str(payload.get("verdict") or "").lower() == _POLICY_VERDICT_APPROVED
+    )
 
 
 async def _steward_entry(db: aiosqlite.Connection, entry: dict, payload: dict) -> dict:
@@ -383,6 +424,7 @@ async def generate_due_digests(
         verdicts: list[dict] = []
         escalations: list[dict] = []
         steward: list[dict] = []
+        self_approvals: list[dict] = []
         for event in events:
             if event["task_id"] is None:
                 continue
@@ -417,12 +459,19 @@ async def generate_due_digests(
                     "reviewer": (dict(mr).get("model", "") if mr else ""),
                 }
                 verdicts.append(entry)
+            elif _is_self_approval(dict(event), payload):
+                self_approvals.append(
+                    {
+                        **entry,
+                        "generation": int(payload.get("submission_generation") or 0),
+                    }
+                )
             elif event["kind"] == "verdict_escalated":
                 escalations.append(entry)
             elif event["kind"] == STEWARD_JUDGEMENT and event["actor"] == "steward":
                 steward.append(await _steward_entry(db, entry, payload))
 
-        if not (approvals or verdicts or escalations or steward):
+        if not (approvals or verdicts or escalations or steward or self_approvals):
             # The empty-day rule now covers the steward too, in both
             # directions: a day of steward-only activity IS a day worth a
             # digest, and a day with neither still produces nothing. An
@@ -437,7 +486,7 @@ async def generate_due_digests(
             (project["id"], day_start, day_end),
         )
         pool, oversample = _audit_pool_and_oversample(
-            approvals, verdicts, escalations, steward
+            approvals, verdicts, escalations, steward, self_approvals
         )
         sample = deterministic_sample(pool, day, oversample_ids=oversample)
         # #878: the debt rides along with a digest that is being created for
@@ -475,6 +524,7 @@ async def generate_due_digests(
             "auto_verdicts": verdicts,
             "escalations": escalations,
             STEWARD_SECTION_KEY: steward,
+            SELF_APPROVALS_KEY: self_approvals,
             "deliveries": [dict(m) for m in merges],
             "audit_sample": sample,
             "audit_results": {},
@@ -499,6 +549,7 @@ async def generate_due_digests(
                 "auto_verdicts": len(verdicts),
                 "escalations": len(escalations),
                 "steward_judgements": len(steward),
+                "steward_self_approvals": len(self_approvals),
                 "audit_sample": sample,
             },
         )

@@ -826,6 +826,15 @@ class LiveCheckState(BaseModel):
 
     ``sha_mismatch`` names the case the card must not hide: the observation
     exists but was taken against another build than the one delivered.
+
+    ``deploy_state`` is the OTHER half of that question, and it is not the
+    same one (#837, #1231 review). The sha says which commit the observer
+    named; this says whether the hub could confirm that commit is what
+    production runs — ``in_prod``, ``unknown`` when the hub has no delivery
+    facts to check against, or empty for rows written before the check
+    existed. Recording an unverified observation is deliberate: an
+    installation that knows nothing about production must not have its
+    ignorance turned into a gate. Reading it as confirmation is not.
     """
 
     state: str = "unknown"
@@ -837,6 +846,7 @@ class LiveCheckState(BaseModel):
     sha: str = ""
     delivered_sha: str = ""
     sha_mismatch: bool = False
+    deploy_state: str = ""
     recorded_agent: str = ""
     created_at: str = ""
 
@@ -898,6 +908,25 @@ class DiffBaseState(BaseModel):
     state: str = "unverified"
     reason: str = ""
     sha: str = ""
+
+
+class BaseMergeState(BaseModel):
+    """Разойдётся ли ветка с базой при доставке — ДО вердикта (#1233).
+
+    ``state``: ``clean`` | ``conflicting`` | ``unknown`` | ``not_applicable``.
+    Четыре, и они не схлопываются: «конфликта нет» и «спросить не удалось»
+    ведут к противоположным действиям, а «нечего спрашивать» (нет PR) — это не
+    зелёный свет. 09.09.2026 человек узнал о конфликте #1204 через четырнадцать
+    секунд ПОСЛЕ того, как потратил вердикт: гейт отказал в доставке, задача
+    ушла на второй круг ревью, и то же одобрение пришлось выдавать снова.
+
+    ``files`` — имена конфликтующих файлов, когда git смог их назвать. Пусто —
+    это «назвать не удалось», а не «их не было»: конфликт остаётся конфликтом.
+    """
+
+    state: str = "unknown"
+    reason: str = ""
+    files: list[str] = Field(default_factory=list)
 
 
 class EvidenceCoverage(BaseModel):
@@ -1044,6 +1073,9 @@ class ReviewBrief(BaseModel):
     # whether it resolves. An unresolved base leaves diff_command empty — a
     # command that cannot run reads as an offer to verify.
     diff_base: DiffBaseState = Field(default_factory=DiffBaseState)
+    # #1233: расхождение с базой названо ДО вердикта, а не после отказа
+    # доставки. Читатель у поля тот же, что у diff_base, — человек на гейте.
+    base_merge: BaseMergeState = Field(default_factory=BaseMergeState)
     # #725: one verdict over all evidence blocks below.
     evidence_coverage: EvidenceCoverage = Field(default_factory=EvidenceCoverage)
     review_cycle: int = 0
@@ -2810,6 +2842,12 @@ class MachineReviewView(BaseModel):
     # about itself. False on rows written before the column existed — there
     # the question was never asked, which is not the same as "independent".
     self_reviewed: bool = False
+    # Who owns the report, from the TOKEN (#1025). The column arrived AFTER
+    # ``self_reviewed``, so a report with an owner is one about which the
+    # "did the author review it" question was actually asked. None means
+    # nobody established independence — which a reader of ``self_reviewed``
+    # alone would mistake for "someone else looked" (#1231, f9ac6478eaeb2ac2).
+    principal_id: int | None = None
     created_at: str = ""
     # What the gate said each confirmed finding turned out to be (#876). An
     # empty list means nobody judged them — never that they were all fine.
@@ -3338,6 +3376,10 @@ STEWARD_ESCALATE_REASONS: tuple[str, ...] = (
     # #1268: привратник применения на проекте, где вердикт стюарду не отдан
     # (теневое участие): суждение записано, применять его нельзя.
     "policy_not_delegated",
+    # #1327: одобрение или возврат без названного основания либо без
+    # уверенности нельзя перепроверить — хаб пишет их эскалацией.
+    "no_grounds",
+    "no_confidence",
 )
 STEWARD_CLOSURE_TYPES: tuple[str, ...] = (
     "fixed",

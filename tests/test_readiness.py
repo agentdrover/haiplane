@@ -536,6 +536,15 @@ def _use_real_git_reads(monkeypatch) -> None:
     monkeypatch.setattr(
         plugins.git_ops, "files_at_ref", real.files_at_ref, raising=False
     )
+    # #1287 расширил поиск за объявленные области: без этой подмены проверка
+    # получила бы от мока «посмотреть не удалось» и свойство #1232 — имя в
+    # комментарии не есть предмет — здесь бы уже не проверялось.
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "files_naming_at_ref",
+        real.files_naming_at_ref,
+        raising=False,
+    )
 
 
 async def _point_project_at(db: aiosqlite.Connection, workspace: str) -> int:

@@ -398,6 +398,7 @@ async def _judge(
     verdict: str = "approve",
     generation: int = 1,
     confidence: str = "high",
+    grounds: list[dict] | None = None,
 ) -> None:
     """Суждение приходит контрактом #1022 — тем же путём, что у живого прогона."""
     from hub.config import TokenIdentity
@@ -412,6 +413,7 @@ async def _judge(
             kind="verdict",
             verdict=verdict,
             confidence=confidence,
+            grounds=[{"source": "ci_pinned_sha"}] if grounds is None else grounds,
             escalate_reason="precondition_failed" if verdict == "escalate" else None,
             model="gpt-5.3-codex",
         ),
@@ -555,7 +557,8 @@ async def test_empty_grounds_are_not_shown_as_a_list(db: aiosqlite.Connection, c
     """
     project_id = await _project(db, "shadow-empty-grounds")
     task_id = await _task(db, project_id)
-    await _judge(db, task_id)
+    # #1327: суждение без оснований хаб принимает только как эскалацию.
+    await _judge(db, task_id, verdict="escalate", grounds=[])
 
     page = await client.get(f"/tasks/{task_id}")
 
