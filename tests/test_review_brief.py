@@ -995,3 +995,107 @@ async def test_the_brief_pairs_the_displayed_report_with_its_own_dispatch(
         "иначе облачный отчёт подписан как локальный по чужому (более "
         "позднему по id) заказу"
     )
+
+
+# --- #1262: есть ли ревью у ТЕКУЩЕГО поколения — один правдивый ответ ---------
+
+
+_FULL_REPORT = {
+    "harness_skill": "lite-diff-review",
+    "agent_count": 1,
+    "model": "grok-4.6",
+    "raw_count": 1,
+    "findings_confirmed": [],
+    "findings_rejected": [],
+    "incomplete": False,
+    "unresolved": [],
+    "lost_dimensions": [],
+    "agent": "cursor-cloud-reviewer",
+}
+
+
+async def test_brief_says_whether_the_current_generation_has_a_review(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-3 (#1262): отказ провайдера — «ревью у поколения N нет» с причиной;
+    полный отчёт — ревьюер (принципал и модель), sha и полнота."""
+    from tests.test_review_dispatch import (
+        _LIMIT_REFUSAL,
+        _DispatchRecorder,
+        _no_local_path,
+        _submitted,
+        _wire,
+    )
+
+    _wire(monkeypatch, _DispatchRecorder(None, refusal=_LIMIT_REFUSAL))
+    _no_local_path(monkeypatch)
+    refused = await _submitted(
+        client, db, "spike-brief-refused", policy={"review": "dispatch"}
+    )
+    reviewed = await _submitted_task(client, db, "Reviewed in full")
+    resp = await client.post(f"/api/tasks/{reviewed}/machine-review", json=_FULL_REPORT)
+    assert resp.status_code in (200, 201), resp.text
+
+    refused_brief = (await client.get(f"/api/tasks/{refused}/review-brief")).json()
+    answer = refused_brief["current_generation_review"]
+    assert answer["has_review"] is False
+    assert answer["generation"] == refused_brief["submission_generation"] == 1
+    assert answer["reason"] == "provider_refused"
+    assert "usage_limit_exceeded" in answer["reason_detail"]
+    assert "ревью у поколения 1 НЕТ" in answer["headline"]
+
+    reviewed_brief = (await client.get(f"/api/tasks/{reviewed}/review-brief")).json()
+    answer = reviewed_brief["current_generation_review"]
+    assert answer["has_review"] is True
+    assert answer["reviewer_principal"] == "cursor-cloud-reviewer"
+    assert answer["reviewer_model"] == "grok-4.6"
+    assert answer["sha"] == _PINNED_SHA
+    assert answer["complete"] is True
+    assert answer["reason"] == ""
+
+
+async def test_an_old_generation_report_is_not_a_review_of_the_current_one(
+    client: AsyncClient, db
+):
+    """AC-4 (#1262): полный отчёт поколения N-1 не ревью поколения N."""
+    task_id = await _submitted_task(client, db, "Resubmitted after review")
+    resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=_FULL_REPORT)
+    assert resp.status_code in (200, 201), resp.text
+    await repo.update_task(db, task_id, submission_generation=2)
+    await repo.record_submission(
+        db, task_id=task_id, generation=2, sha="b" * 40, base_branch="develop"
+    )
+    await db.commit()
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    answer = brief["current_generation_review"]
+    assert answer["generation"] == 2
+    assert answer["has_review"] is False, "отчёт прошлой сдачи — не ревью текущей"
+    assert answer["reason"] == "not_dispatched"
+    assert answer["previous_generation"] == 1
+    assert "отчёт поколения 1 — отчёт прошлой сдачи" in answer["headline"]
+    assert answer["sha"] == "b" * 40
+
+
+async def test_an_incomplete_or_evidence_free_report_is_no_review(
+    client: AsyncClient, db
+):
+    """Неполный отчёт и отчёт без улики исполнения — отсутствие ревью (#750, #841)."""
+    incomplete = await _submitted_task(client, db, "Incomplete report")
+    await client.post(
+        f"/api/tasks/{incomplete}/machine-review",
+        json={**_FULL_REPORT, "incomplete": True},
+    )
+    empty = await _submitted_task(client, db, "Evidence-free report")
+    await client.post(
+        f"/api/tasks/{empty}/machine-review", json={**_FULL_REPORT, "raw_count": 0}
+    )
+
+    for task_id, reason in (
+        (incomplete, "incomplete_report"),
+        (empty, "no_execution_evidence"),
+    ):
+        brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+        answer = brief["current_generation_review"]
+        assert answer["has_review"] is False
+        assert answer["reason"] == reason

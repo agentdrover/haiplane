@@ -2213,6 +2213,10 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
             f"| review cycle {brief.get('review_cycle', 0)}",
         ]
     )
+    # #1262: есть ли ревью у текущей сдачи — строкой, а не догадкой по отчёту.
+    generation_line = (brief.get("current_generation_review") or {}).get("headline")
+    if generation_line:
+        parts.append("Ревью текущей сдачи: " + generation_line)
     circle_line = _review_circle_line(brief)
     if circle_line:
         parts.append(circle_line)

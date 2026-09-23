@@ -1295,6 +1295,69 @@ async def _sweep_unjudged_findings(db) -> None:
     )
 
 
+async def _sweep_reviewer_unavailable(db) -> None:
+    """Провайдер ревью отказывает подряд — одно событие хаба, не карточка (#1262).
+
+    Образец — сторож очереди находок выше: ключ дедупа — собственное событие,
+    а не запись в задаче, потому что недоступность ревьюера — свойство
+    провайдера, а не одной сдачи. Пока сигнал поднят, повтор идёт не чаще
+    раза в сутки; как только провайдер снова создал агента, сигнал снимается
+    событием снятия без ручного действия.
+    """
+    from hub.services import review_availability as ra
+
+    outage = await ra.provider_outage(db)
+    raised = await ra.signal_state(db) == ra.REVIEWER_UNAVAILABLE
+    if outage is None:
+        if raised:
+            await _clear_reviewer_unavailable(db)
+        return
+    if raised and await repo.event_raised_since(db, ra.REVIEWER_UNAVAILABLE, "-1 day"):
+        return  # уже сказано в этих сутках
+    waiting = [row["task_id"] for row in outage.waiting]
+    await repo.insert_event(
+        db,
+        kind=ra.REVIEWER_UNAVAILABLE,
+        actor="hub",
+        payload={
+            "provider": ra.PROVIDER,
+            "since": outage.since,
+            "refusals": outage.refusals,
+            "refused_tasks": outage.refused_tasks,
+            "waiting_count": len(waiting),
+            "waiting": outage.waiting,
+            "threshold_hours": config.REVIEWER_UNAVAILABLE_HOURS,
+        },
+    )
+    await db.commit()
+    await log_activity(
+        db,
+        ra.REVIEWER_UNAVAILABLE,
+        (
+            f"Ревьюер недоступен с {outage.since}: {outage.refusals} отказов "
+            f"провайдера; в review без ревью текущей сдачи {len(waiting)}: "
+            + ", ".join(f"#{t}" for t in waiting)
+        )[:200],
+    )
+    log.warning(
+        "Poll: review provider refusing since %s; %d tasks in review unreviewed",
+        outage.since,
+        len(waiting),
+    )
+
+
+async def _clear_reviewer_unavailable(db) -> None:
+    from hub.services import review_availability as ra
+
+    await repo.insert_event(
+        db, kind=ra.REVIEWER_AVAILABLE, actor="hub", payload={"provider": ra.PROVIDER}
+    )
+    await db.commit()
+    await log_activity(
+        db, ra.REVIEWER_AVAILABLE, "Ревьюер снова отвечает: сигнал недоступности снят"
+    )
+
+
 # What each human-owned instance is actually waiting for. The age alone does
 # not tell a person what to do with the task — and "someone should look at
 # this" is what the single lifetime alert already said, to no effect.
@@ -2061,6 +2124,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("unrefined_drafts", _sweep_unrefined_drafts),
     Sweep("human_queue", _sweep_human_queue),
     Sweep("unjudged_findings", _sweep_unjudged_findings),
+    Sweep("reviewer_unavailable", _sweep_reviewer_unavailable),
     Sweep("autopilot_digests", _sweep_autopilot_digests),
     Sweep("delivery_discrepancies", _sweep_delivery_discrepancies),
     Sweep("review_dispatches", _sweep_review_dispatches),

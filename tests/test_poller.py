@@ -2694,6 +2694,9 @@ async def test_the_sweep_order_is_pinned(db):
         # ДО дайджеста — секция дайджеста читает уже поднятое этим проходом
         # событие, а не гадает о нём.
         "unjudged_findings",
+        # #1262: сторож недоступного ревьюера — рядом со сторожем находок,
+        # тот же образец дедупа по собственному событию.
+        "reviewer_unavailable",
         "autopilot_digests",
         "delivery_discrepancies",
         "review_dispatches",
@@ -3113,3 +3116,133 @@ async def test_headless_delivery_calls_a_human_when_waiting_cannot_help(db):
     body = " ".join(u.get("content") or "" for u in updates)
     assert "Ожидание здесь ничего не решит" in body
     assert "Доставка отложена" not in body, "это не отложенная доставка"
+
+
+# --- #1262: ревьюер недоступен — одно событие хаба, а не алерт в каждой карточке
+
+
+async def _refused_review_queue(client, db, monkeypatch, slugs: list[str]) -> list[int]:
+    """Сдачи, у которых НАСТОЯЩИЙ диспетчер получил отказ провайдера.
+
+    Отказ проходит через maybe_dispatch_review, а не пишется руками: сторож
+    читает алерт, который пишет диспетчер, и связь с его текстом держит этот
+    путь, а не копия строки в тесте.
+    """
+    from tests.test_review_dispatch import (
+        _LIMIT_REFUSAL,
+        _DispatchRecorder,
+        _no_local_path,
+        _submitted,
+        _wire,
+    )
+
+    _wire(monkeypatch, _DispatchRecorder(None, refusal=_LIMIT_REFUSAL))
+    _no_local_path(monkeypatch)
+    task_ids = [
+        await _submitted(client, db, slug, policy={"review": "dispatch"})
+        for slug in slugs
+    ]
+    # Отказы идут дольше порога: первый — три часа назад, сдачи — раньше них.
+    await db.execute(
+        "UPDATE submissions SET submitted_at = datetime('now', '-4 hours')"
+    )
+    await db.execute(
+        "UPDATE task_updates SET created_at = datetime('now', '-3 hours') "
+        "WHERE kind='alert' AND content LIKE '%провайдер отказал%'"
+    )
+    await db.commit()
+    return task_ids
+
+
+async def _reviewer_events(db, kind: str) -> list[dict]:
+    rows = await fetchall(
+        db, "SELECT payload FROM events WHERE kind=? ORDER BY id", (kind,)
+    )
+    import json as _json
+
+    return [_json.loads(dict(r)["payload"]) for r in rows]
+
+
+async def test_reviewer_unavailable_is_one_hub_event_not_a_card_each(
+    client, db, monkeypatch
+):
+    """AC-1 (#1262): отказы провайдера на двух сдачах старше порога — ОДНО
+    событие хаба с числом и номерами задач без ревью; второй свип в окне
+    дедупа нового события не порождает."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import REVIEWER_UNAVAILABLE
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
+    task_ids = await _refused_review_queue(
+        client, db, monkeypatch, ["spike-limit-a", "spike-limit-b"]
+    )
+
+    await _sweep_reviewer_unavailable(db)
+    await _sweep_reviewer_unavailable(db)
+
+    events = await _reviewer_events(db, REVIEWER_UNAVAILABLE)
+    assert len(events) == 1, (
+        "ровно одно событие хаба на провайдера и окно, а не одно на свип"
+    )
+    payload = events[0]
+    assert payload["waiting_count"] == 2
+    assert [w["task_id"] for w in payload["waiting"]] == sorted(task_ids)
+    assert {w["reason"] for w in payload["waiting"]} == {"provider_refused"}
+    assert payload["refused_tasks"] == sorted(task_ids)
+
+
+async def test_reviewer_unavailable_waits_for_the_threshold(client, db, monkeypatch):
+    """Отказы моложе порога сигнала не поднимают — единичный всплеск не шум."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import REVIEWER_UNAVAILABLE
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 4.0)
+    await _refused_review_queue(
+        client, db, monkeypatch, ["spike-young-a", "spike-young-b"]
+    )
+
+    await _sweep_reviewer_unavailable(db)
+
+    assert await _reviewer_events(db, REVIEWER_UNAVAILABLE) == []
+
+
+async def test_reviewer_answering_again_clears_the_signal(client, db, monkeypatch):
+    """AC-2 (#1262): провайдер снова создал агента — сигнал снят без ручного
+    действия, и задача с успешным вызовом больше не числится без ревью."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services import review_dispatch
+    from hub.services.review_availability import (
+        REVIEWER_AVAILABLE,
+        REVIEWER_UNAVAILABLE,
+        generation_review,
+        signal_state,
+    )
+    from tests.test_review_dispatch import _DispatchRecorder, _wire
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
+    first, second = await _refused_review_queue(
+        client, db, monkeypatch, ["spike-back-a", "spike-back-b"]
+    )
+    await _sweep_reviewer_unavailable(db)
+    assert await signal_state(db) == REVIEWER_UNAVAILABLE
+
+    _wire(
+        monkeypatch, _DispatchRecorder({"agent": {"id": "bc-ok"}, "run": {"id": "r"}})
+    )
+    assert await review_dispatch.maybe_dispatch_review(db, first)
+
+    await _sweep_reviewer_unavailable(db)
+
+    assert await signal_state(db) == REVIEWER_AVAILABLE, "сигнал снят сам"
+    assert len(await _reviewer_events(db, REVIEWER_AVAILABLE)) == 1
+    view = await generation_review(db, dict(await repo.get_task(db, first)))
+    assert view.reason == "in_flight", (
+        "задача с успешным вызовом больше не числится отказанной провайдером"
+    )
+    still = await generation_review(db, dict(await repo.get_task(db, second)))
+    assert still.reason == "provider_refused"
+
+    await _sweep_reviewer_unavailable(db)
+    assert len(await _reviewer_events(db, REVIEWER_AVAILABLE)) == 1, (
+        "снятие тоже одно, а не на каждом свипе"
+    )
