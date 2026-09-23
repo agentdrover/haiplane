@@ -1748,3 +1748,176 @@ async def test_the_brief_does_not_call_a_second_door_debt_a_flying_review(
     wide = await inflight_view(db, task, include_owed=True)
     assert wide is not None
     assert "вторая дверь" in wide.headline
+
+
+# ---------------------------------------------------------------------------
+# #1330: отказ заказа пишется один раз, а не на каждом тике поллера
+# ---------------------------------------------------------------------------
+
+
+async def _refusals_of(
+    db: aiosqlite.Connection, task_id: int, reason: str
+) -> list[dict]:
+    rows = await fetchall(
+        db,
+        "SELECT * FROM events WHERE kind=? AND task_id=? "
+        "AND json_extract(payload, '$.reason')=? ORDER BY id",
+        (EVENT_REFUSED, task_id, reason),
+    )
+    return [dict(r) for r in rows]
+
+
+async def _cap_spent_by_a_neighbour(
+    db: aiosqlite.Connection, monkeypatch, slug: str
+) -> int:
+    """Потолок в один прогон, и его уже потратила соседняя сдача."""
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 1)
+    project_id = await _project(db, slug, steward=True)
+    neighbour = await _submitted_task(db, project_id)
+    assert await order_run(db, neighbour, 1) is not None
+    return project_id
+
+
+async def test_a_daily_cap_refusal_is_said_once_per_generation(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1330 AC-1: исчерпанный потолок — одно событие, а не одно на тик.
+
+    Наблюдено 22.09.2026: 216 одинаковых отказов daily_cap за два часа, до 74
+    на одну задачу; 23.09 к пяти утра — 1520. Первая запись обязана лечь
+    (#1150: молчаливый отказ неотличим от бага), повторы — нет. Новое
+    поколение сдачи — новый факт, и оно снова получает свою запись.
+    """
+    project_id = await _cap_spent_by_a_neighbour(db, monkeypatch, "cap-once")
+    task_id = await _submitted_task(db, project_id)
+
+    assert await order_due_runs(db) == 0
+    assert await order_due_runs(db) == 0
+
+    events = await _refusals_of(db, task_id, REFUSED_DAILY_CAP)
+    assert len(events) == 1, f"два прохода дали {len(events)} отказов"
+    payload = json.loads(events[0]["payload"])
+    assert payload["generation"] == 1
+    assert payload["kind"] == "verdict"
+
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+    assert await order_due_runs(db) == 0
+    assert await order_due_runs(db) == 0
+
+    events = await _refusals_of(db, task_id, REFUSED_DAILY_CAP)
+    assert [json.loads(e["payload"])["generation"] for e in events] == [1, 2]
+
+
+async def test_a_new_utc_day_says_the_cap_refusal_again(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1330 AC-2: вчерашний отказ не глушит сегодняшний.
+
+    Потолок считается за UTC-сутки: исчерпанный сегодня — это новый факт, а
+    не повтор вчерашнего, даже на той же задаче и том же поколении.
+    """
+    project_id = await _cap_spent_by_a_neighbour(db, monkeypatch, "cap-new-day")
+    task_id = await _submitted_task(db, project_id)
+    assert await order_due_runs(db) == 0
+    await db.execute(
+        "UPDATE events SET created_at=datetime('now', '-1 day') "
+        "WHERE kind=? AND task_id=?",
+        (EVENT_REFUSED, task_id),
+    )
+    await db.commit()
+
+    assert await order_due_runs(db) == 0
+    assert await order_due_runs(db) == 0
+
+    events = await _refusals_of(db, task_id, REFUSED_DAILY_CAP)
+    assert len(events) == 2, f"новые сутки дали {len(events) - 1} новых отказов"
+
+
+async def test_every_order_refusal_is_said_once(db: aiosqlite.Connection, monkeypatch):
+    """#1330: каждое место вызова _refuse в order_run проверено поимённо.
+
+    daily_cap — не единственный отказ, который поллер повторяет: DoR-путь
+    зовёт order_run на каждом тике так же, а mode_off, no_generation и
+    already_ordered стоят в той же функции и пишут тем же _refuse.
+    """
+    project_id = await _project(db, "every-refusal", steward=True)
+
+    ordered = await _submitted_task(db, project_id)
+    assert await order_run(db, ordered, 1) is not None
+    unsubmitted = await _submitted_task(db, project_id)
+    switched_off = await _submitted_task(db, project_id)
+
+    for _ in range(3):
+        assert await order_run(db, ordered, 1) is None
+        assert await order_run(db, unsubmitted, 0) is None
+    monkeypatch.setattr(config, "STEWARD_MODE", "off")
+    for _ in range(3):
+        assert await order_run(db, switched_off, 1) is None
+
+    assert len(await _refusals_of(db, ordered, REFUSED_ALREADY_ORDERED)) == 1
+    assert len(await _refusals_of(db, unsubmitted, REFUSED_NO_GENERATION)) == 1
+    assert len(await _refusals_of(db, switched_off, REFUSED_MODE_OFF)) == 1
+
+
+async def test_a_waiting_refusal_is_said_once_and_still_read(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1330 AC-3: регрессионная защита дедупа #1290 рядом с его расширением.
+
+    Отказ undeclared_model приходит из steward_shadow, а дедуп заказных
+    отказов — тот же читатель прошлого события. Эта правка его расширяет, и
+    тест падает, если расширение сломало исходный приём: ожидание ревьюера
+    пишется один раз, а waiting_refusal_code по-прежнему его читает.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from hub.services import steward_shadow as sh
+
+    async def _delivery(_db, _task_id, _generation, _base_url):
+        return "код доступа: ABC-123"
+
+    monkeypatch.setattr(sh, "identity_delivery", _delivery)
+    monkeypatch.setattr(config, "STEWARD_MODEL", "gpt-5.3-codex")
+    monkeypatch.setattr(config, "STEWARD_HUB_TOKEN", "steward-token")
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "cursor-key")
+    project_id = await _project(db, "waiting-once", steward=True)
+    await db.execute(
+        "UPDATE projects SET repo=? WHERE id=?", ("agentdrover/haiplane", project_id)
+    )
+    task_id = await _submitted_task(db, project_id)
+    await repo.update_task(
+        db, task_id, submission_model="claude-opus-5", branch=f"task-{task_id}/w"
+    )
+    await db.commit()
+    run = await order_run(db, task_id, 1)
+    assert run is not None
+
+    created = {"agent": {"id": "agent-1"}, "run": {"id": "run-1"}}
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(created, None)),
+    ) as started:
+        for _ in range(4):
+            assert await sh.start_due_runs(db) == 0
+    assert started.await_count == 0
+
+    waiting = await _refusals_of(db, task_id, sh.REFUSED_UNDECLARED_MODEL)
+    assert len(waiting) == 1, f"четыре прохода дали {len(waiting)} записей"
+    assert json.loads(waiting[0]["payload"])["retryable"] is True
+    assert (
+        await sh.waiting_refusal_code(db, task_id, run["id"])
+        == sh.REFUSED_UNDECLARED_MODEL
+    )
+
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now','-1 minute') WHERE id=?",
+        (run["id"],),
+    )
+    await db.commit()
+    assert await close_finished_runs(db) == 1
+    closed = dict(
+        (await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],)))[0]
+    )
+    assert closed["status"] == RUN_NEVER_STARTED
+    assert "ревьюер" in closed["closed_reason"], closed["closed_reason"]
