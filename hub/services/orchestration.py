@@ -2191,6 +2191,43 @@ def _why_base_never_delivers(assessment: "StackAssessment") -> str:
     )
 
 
+def _unprobed_undeliverable(assessment: "StackAssessment") -> str:
+    """A base that never delivers itself, whose branch origin no longer has.
+
+    #1204 wrote this for a task accepted without delivery; review of #1275
+    (9bc10bd45785a1af) brought a failed one here too, and neither was accepted
+    by anyone nor has a PR the registry knows — so the text names its status.
+    """
+    base_id = assessment.unprobed_stranded_task_id
+    unknown_part = (
+        f"её ветку '{assessment.base_task_branch}' origin на прямой вопрос "
+        f"назвал несуществующей. Поэтому хаб НЕ знает, не стоит ли эта ветка "
+        f"на ней, и «не смог проверить» тут не то же самое, что «стопки нет»."
+    )
+    if assessment.base_task_status in STACK_TERMINAL_STATUSES:
+        return (
+            f"задача #{base_id} упала (статус {assessment.base_task_status} "
+            f"финальный) после того, как сдавала работу, а {unknown_part} "
+            f"Ждать бесполезно: к упавшей задаче конвейер не вернётся, её "
+            f"ветку никто не вернёт. Решение за человеком: подтвердить, что "
+            f"эта ветка от неё не отведена, либо спасти работу #{base_id} "
+            f"отдельной доставкой"
+        )
+    return (
+        f"задачу #{base_id} человек принял, НЕ доставив "
+        f"({_base_pr_phrase(assessment.base_delivery_state)}), а её ветку "
+        f"'{assessment.base_task_branch}' не разрешается, а origin на "
+        f"прямой вопрос ответил, что такой ветки у него нет — обычно так "
+        f"выглядит удаление ветки после ручного мержа. Поэтому хаб НЕ "
+        f"знает, не стоит ли эта ветка на ней, и «не смог проверить» тут "
+        f"не то же самое, что «стопки нет». Ждать бесполезно: принятая "
+        f"задача терминальна, её ветку никто не вернёт. Решение за "
+        f"человеком: доставить или закрыть PR задачи "
+        f"#{base_id}, либо подтвердить, что "
+        f"эта ветка от неё не отведена"
+    )
+
+
 def _base_pr_phrase(delivery_state: str) -> str:
     """What the stranded base's PR is, as the registry recorded it (#1204).
 
@@ -2308,6 +2345,49 @@ def _stranded_with_a_dead_ref(
         base_can_deliver_itself=False,
         unprobed_stranded_task_id=int(other["id"]),
         base_delivery_state=other.get("delivery_state") or "",
+    )
+
+
+def _terminal_with_a_dead_ref(
+    other: dict[str, Any],
+    other_branch: str,
+    result: Any,
+    terminal: set[int],
+) -> "StackAssessment | None":
+    """A failed base that DID publish its branch, and origin no longer has it.
+
+    Review of #1275, 9bc10bd45785a1af (high). Left to the generic path this row
+    became a retryable unknown — a silent hold on every delivery in the
+    project that nothing will ever lift, because a failed task is final and
+    nobody pushes its branch back. The #1204 brick through the #1275 door. So
+    it calls a human, like a stranded base with a dead ref.
+
+    Only once the task has submitted: a failed task that never did is #1283's
+    "nothing to compare yet" and merges with an alert (see
+    ``_a_branch_origin_never_had``). The same equality guard as the stranded
+    twin: our own branch among the unresolved names is a fact about this
+    machine, not about that task.
+    """
+    if int(other["id"]) not in terminal:
+        return None
+    if result.outcome is not StackProbeOutcome.unavailable:
+        return None
+    if result.reason != "ref_unresolved":
+        return None
+    unresolved = {n.strip() for n in (result.details or "").split(",") if n.strip()}
+    if unresolved != {other_branch}:
+        return None
+    if int(other.get("submission_generation") or 0) == 0:
+        return None
+    return StackAssessment(
+        outcome=STACK_UNKNOWN,
+        reason=f"terminal_ref_unresolved: {other_branch}",
+        retryable=False,
+        base_task_id=int(other["id"]),
+        base_task_branch=other_branch,
+        base_task_status=other.get("status") or "",
+        base_can_deliver_itself=False,
+        unprobed_stranded_task_id=int(other["id"]),
     )
 
 
@@ -2465,9 +2545,12 @@ class _UnansweredRows:
         other_branch: str,
         result: Any,
         stranded: set[int],
+        terminal: set[int],
     ) -> None:
         """Разложить «не чисто и не стопка» по своим полкам, в порядке разбора."""
-        dead = _stranded_with_a_dead_ref(other, other_branch, result, stranded)
+        dead = _stranded_with_a_dead_ref(
+            other, other_branch, result, stranded
+        ) or _terminal_with_a_dead_ref(other, other_branch, result, terminal)
         if dead is not None:
             self.stranded_unprobed, self.closed_gone = _file_dead_ref(
                 dead, self.stranded_unprobed, self.closed_gone
@@ -2665,7 +2748,7 @@ async def assess_branch_stacking(
                 continue
             return found
         if result.outcome is not StackProbeOutcome.clear:
-            unanswered.file(other, other_branch, result, stranded)
+            unanswered.file(other, other_branch, result, stranded, terminal)
     answer = unanswered.best(benign)
     if answer is not None:
         return answer
@@ -3167,20 +3250,7 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
         # основания — ровно тот инцидент, ради которого условие написано.
         # Значит третий исход: не ждать и не мержить, а позвать человека,
         # назвав задачу и то, чего именно хаб не смог проверить.
-        return (
-            f"{UNPROBED_STRANDED_BASE_PREFIX}: задачу "
-            f"#{assessment.unprobed_stranded_task_id} человек принял, НЕ "
-            f"доставив ({_base_pr_phrase(assessment.base_delivery_state)}), а её ветку "
-            f"'{assessment.base_task_branch}' не разрешается, а origin на "
-            f"прямой вопрос ответил, что такой ветки у него нет — обычно так "
-            f"выглядит удаление ветки после ручного мержа. Поэтому хаб НЕ "
-            f"знает, не стоит ли эта ветка на ней, и «не смог проверить» тут "
-            f"не то же самое, что «стопки нет». Ждать бесполезно: принятая "
-            f"задача терминальна, её ветку никто не вернёт. Решение за "
-            f"человеком: доставить или закрыть PR задачи "
-            f"#{assessment.unprobed_stranded_task_id}, либо подтвердить, что "
-            f"эта ветка от неё не отведена"
-        )
+        return f"{UNPROBED_STRANDED_BASE_PREFIX}: {_unprobed_undeliverable(assessment)}"
     if assessment.outcome == STACK_UNKNOWN and assessment.retryable:
         return (
             f"{STACK_UNKNOWN_PREFIX}: проверить, не стоит ли ветка на чужой "
@@ -3194,6 +3264,25 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             db, task["id"], "hub", "alert", _unchecked_stack_alert(assessment)
         )
     return ""
+
+
+def _unpublished_wait_phrase(assessment: "StackAssessment") -> str:
+    """Why nothing is waited for on an unpublished neighbour (#1283, #1275).
+
+    Review of #1275, 6fc293188dd34632: «ветка появится после первого пуша» is
+    true of a task still on the conveyor and false of a failed one — there is
+    no way out of failed, so no push is coming.
+    """
+    if assessment.base_task_status in STACK_TERMINAL_STATUSES:
+        return (
+            f"Ждать тут нечего: задача упала (статус "
+            f"{assessment.base_task_status} финальный), пуша уже не будет, и "
+            f"сравнивать эту ветку не с чем и не будет."
+        )
+    return (
+        "Ждать тут нечего: ветка появится, когда исполнитель сделает первый "
+        "пуш, и до тех пор сравнивать не с чем."
+    )
 
 
 def _unchecked_stack_alert(assessment: "StackAssessment") -> str:
@@ -3221,8 +3310,7 @@ def _unchecked_stack_alert(assessment: "StackAssessment") -> str:
             f"прямой вопрос ответил, что такой ветки у него нет, а сдач у "
             f"той задачи не было ни одной. "
             f"Значит коммитов той задачи нет нигде и унести их этим мержем "
-            f"нельзя. Ждать тут нечего: ветка появится, когда исполнитель "
-            f"сделает первый пуш, и до тех пор сравнивать не с чем. Если "
+            f"нельзя. {_unpublished_wait_phrase(assessment)} Если "
             f"ветка всё же была опубликована и удалена ДО первой сдачи, её "
             f"коммиты уедут в базовую ветку под номером этой задачи — их "
             f"видно в диффе этой задачи (#1283)."
