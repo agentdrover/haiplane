@@ -10545,6 +10545,9 @@ async def test_the_readout_follows_the_order_of_the_shown_report(
         principal_id=reviewer,
     )
     await db.commit()
+    # У запасного пути (раздел брифа) — свой, третий набор: итог обязан прийти
+    # из заказа отчёта, а не совпасть с ним случайно (находка 4a226dcf).
+    _analyse_returns(monkeypatch, _only_tests_report("fallback_sym"))
 
     section = await _only_tests_section(client, task_id)
     assert section["only_tests"] == [
