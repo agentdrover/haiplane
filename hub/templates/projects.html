@@ -254,6 +254,19 @@
                         <input type="checkbox" name="gate_policy_steward_shadow" value="on" {% if c.project.gate_policy.get('steward_shadow') is true %}checked{% endif %}>
                         суждение стюарда записывается, вердикт остаётся у человека, применение запрещено
                     </label>
+                    {# #1335: лимит очереди review (#1264) — не гейт и ничего не
+                       делегирует, поэтому стоит ВНЕ ветки замка #743. Поле
+                       показывает сохранённое: страница, которая лимита не
+                       видит, при сохранении не может честно его сохранить.
+                       Пустое поле снимает лимит явно; проверка значений — та
+                       же, что у API. #}
+                    {% set stored_limit = c.project.gate_policy.get('review_limit') %}
+                    <label class="task-action-label">Лимит очереди review (пусто = без лимита)</label>
+                    <input type="number" min="1" step="1" name="gate_policy_review_limit" class="task-action-control" value="{{ stored_limit if stored_limit is not none else '' }}">
+                    <select name="gate_policy_review_limit_mode" class="task-action-control">
+                        <option value="enforce" {% if c.project.gate_policy.get('review_limit_mode') != 'warn' %}selected{% endif %}>enforce — сверх лимита новую работу не начинать</option>
+                        <option value="warn" {% if c.project.gate_policy.get('review_limit_mode') == 'warn' %}selected{% endif %}>warn — предупреждать, но не останавливать</option>
+                    </select>
                     {% if c.project.slug == 'default' %}
                     <label class="task-action-label">Автопилот гейтов</label>
                     <span class="badge badge-needs_decision" title="Хаб не ослабляет надзор над собой (#743)">заперт: всегда human</span>
