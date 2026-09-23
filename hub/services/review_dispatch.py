@@ -1859,8 +1859,11 @@ async def maybe_dispatch_review(
     # диффом и правилами, и за это окно сдача могла смениться — ЛЮБОЙ
     # облачный заказ, не только переспрос (находка dcd7da1fa88023c5): тот же
     # фильтр свежести, что у второй двери (#1252). Для переспроса ещё и отчёт,
-    # доехавший в это окно (находка 17a9ca6ea3451163) — его отмену называет
-    # сам переспрос (_ask_again), тихий отказ здесь верен.
+    # доехавший в это окно (находка 17a9ca6ea3451163). Отказ здесь тихий:
+    # у переспроса ОБА отказа — и по отчёту, и по свежести — называет сам
+    # переспрос (_name_a_cancelled_retry, находка 40a8fd8b727c82ec), а
+    # первичный заказ сменившейся сдачи заменит заказ её новой сдачи, как и
+    # у второй двери (#1252).
     if not await _submission_still_live(db, task, branch, generation) or (
         replaces_dispatch_id is not None
         and await repo.machine_reviews_of_generation(db, task_id, generation)
@@ -3673,24 +3676,40 @@ async def _ask_again(db: aiosqlite.Connection, failed: dict[str, Any]) -> None:
         "не съедает (#1242).",
     )
     await db.commit()
+    task_row = await repo.get_task(db, task_id)
+    branch = (dict(task_row).get("branch") or "").strip() if task_row else ""
     if await maybe_dispatch_review(db, task_id, replaces_dispatch_id=int(failed["id"])):
         return
-    # Находка 2007bee302b71bf4: запись выше обещала ревьюера ДО вызова. Если
-    # последнее слово отменило трату потому, что отчёт успел лечь, карточка
-    # обязана это сказать — иначе она говорит о прогоне, которого не было.
-    # Прочие отказы называет сам диспетчер своим алертом.
+    await _name_a_cancelled_retry(db, task_id, generation, branch, asked + 1)
+
+
+async def _name_a_cancelled_retry(
+    db: aiosqlite.Connection, task_id: int, generation: int, branch: str, n: int
+) -> None:
+    """Назвать переспрос, отменённый последним словом перед тратой.
+
+    Запись о переспросе стоит ДО вызова и обещает ревьюера (находка
+    2007bee302b71bf4). Два отказа последнего слова своего алерта не пишут —
+    отчёт, успевший лечь, и сдача, сменившаяся за подготовку (находка
+    40a8fd8b727c82ec), — поэтому их называет переспрос. Остальные отказы
+    (конфигурация, политика, страж второй читки, слепой исход) диспетчер
+    называет сам, и второго объяснения им здесь не заводим.
+    """
     if await repo.machine_reviews_of_generation(db, task_id, generation):
-        await repo.add_task_update(
-            db,
-            task_id,
-            "hub",
-            "alert",
-            # Без метки: счёт попыток ведут записи о вызове, а не об отмене.
-            f"Переспрос ревью {asked + 1} отменён: отчёт этой сдачи "
-            "успел лечь, пока заказ готовился, — второго ревьюера не "
-            "покупали (#1242).",
-        )
-        await db.commit()
+        why = "отчёт этой сдачи успел лечь, пока заказ готовился"
+    elif not await _submission_still_live(db, {"id": task_id}, branch, generation):
+        why = "сдача сменилась, пока заказ готовился, — облако не зовётся"
+    else:
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        # Без метки: счёт попыток ведут записи о вызове, а не об отмене.
+        f"Переспрос ревью {n} отменён: {why}; второго ревьюера не покупали (#1242).",
+    )
+    await db.commit()
 
 
 async def _count_marked_alerts(
@@ -3746,8 +3765,9 @@ async def _name_the_exhausted_retries(
         f"потолок {REVIEW_ASK_AGAIN_MAX} переспросов на сдачу исчерпан"
         if asked >= REVIEW_ASK_AGAIN_MAX
         else "прошлый переспрос не оставил заказа, причина — в алерте "
-        "диспетчера после него (конфигурация, политика, страж второй читки "
-        "или ответ, который не дошёл, #1199); не зная исхода, хаб не повторяет"
+        "после него (конфигурация, политика, страж второй читки, сменившаяся "
+        "сдача или ответ, который не дошёл, #1199); не зная исхода, хаб не "
+        "повторяет"
     )
     await repo.add_task_update(
         db,

@@ -10559,3 +10559,57 @@ async def test_a_submission_moved_during_preparation_buys_no_cloud_run(
 
     assert provider.calls == [], "сдача сменилась — облако не покупается"
     assert not await _rows_of(db, task_id)
+
+
+async def test_a_retry_cancelled_by_a_moved_submission_says_so(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 40a8fd8b727c82ec (#1242, сдача 3): отмена по свежести названа.
+
+    Переспрос уже записал «ревьюер зовётся снова», а проверка свежести перед
+    облачной тратой его отменила: сдачу переставили на другую ветку, пока
+    готовился заказ. Своего алерта у этого отказа нет, поэтому карточка
+    обязана назвать отмену — иначе она обещает прогон, которого не было, а
+    остановка потом ссылается на алерт, которого нет.
+    """
+    from hub.services import review_dispatch as rd
+
+    provider = _Sequence(
+        [
+            ({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None),
+            ({"agent": {"id": "bc-extra"}, "run": {"id": "run-extra"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-moved", policy={"review": "dispatch"}
+    )
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    real_prepare = rd.prepare_review_order
+
+    async def _branch_moves(db_, task, **kw):
+        order = await real_prepare(db_, task, **kw)
+        await repo.update_task(db_, task_id, branch="task-x/moved")
+        await db_.commit()
+        return order
+
+    monkeypatch.setattr(rd, "prepare_review_order", _branch_moves)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 1, "сдача сменилась — облако не покупается"
+    alerts = await _alerts_of(db, task_id)
+    asked = [i for i, a in enumerate(alerts) if "Переспрос ревью 1 из" in a]
+    assert asked, alerts
+    after = alerts[asked[-1] + 1 :]
+    assert any("отменён" in a and "сдача сменилась" in a for a in after), (
+        f"отмена по свежести сдачи не названа в карточке: {after}"
+    )
