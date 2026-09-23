@@ -1176,7 +1176,9 @@ def _run_git(*args: str, cwd) -> None:
 
 
 def _repo_with_a_tail_conflict(
-    tmp_path, branch_tail: str = "\n\ndef test_from_the_branch():\n    pass\n"
+    tmp_path,
+    branch_tail: str = "\n\ndef test_from_the_branch():\n    pass\n",
+    name: str = "tests_suite.py",
 ):
     """Клон, где база и ветка дописали каждая свой хвост одного файла.
 
@@ -1193,7 +1195,7 @@ def _repo_with_a_tail_conflict(
     subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
     _run_git("git", "config", "user.email", "t@example.com", cwd=repo)
     _run_git("git", "config", "user.name", "t", cwd=repo)
-    suite = repo / "tests_suite.py"
+    suite = repo / name
     suite.write_text("def test_common():\n    assert True\n")
     _run_git("git", "add", "-A", cwd=repo)
     _run_git("git", "commit", "-q", "-m", "common", cwd=repo)
@@ -3995,34 +3997,33 @@ async def test_the_host_profile_catches_a_leftover_conflict_marker(tmp_path) -> 
     """AC-3 (#1332), вторая половина: маркер конфликта в сложенном дереве.
 
     Настоящий git в состоянии незавершённого мержа, как в дереве автомержа:
-    файл, разрешённый с забытым маркером, застейджен. ``git diff --check``
-    обязан это увидеть и назвать файл.
+    файл, разрешённый с забытым маркером, застейджен. Файл НЕ .py нарочно:
+    компиляция его не видит, и отказ здесь — заслуга ``git diff --check``.
     """
     import subprocess
 
-    workdir = _repo_with_a_tail_conflict(tmp_path)
+    workdir = _repo_with_a_tail_conflict(tmp_path, name="NOTES.txt")
     _run_git("git", "checkout", "-q", "task-1233/probe", cwd=workdir)
     subprocess.run(
         ["git", "merge", "--no-commit", "--no-ff", "origin/develop"],
         cwd=workdir,
         capture_output=True,
     )
-    suite = workdir / "tests_suite.py"
-    assert "<<<<<<<" in suite.read_text(), "сцене нужен настоящий конфликт"
-    _run_git("git", "add", "tests_suite.py", cwd=workdir)
+    notes = workdir / "NOTES.txt"
+    assert "<<<<<<<" in notes.read_text(), "сцене нужен настоящий конфликт"
+    _run_git("git", "add", "NOTES.txt", cwd=workdir)
 
     rc, log_tail = await validation_run.host_profile_runner(str(workdir))
 
     assert rc != 0 and rc != validation_run.COMMAND_NOT_FOUND_RC, log_tail
-    assert "tests_suite.py" in log_tail
+    assert "NOTES.txt" in log_tail and "git diff --check" in log_tail
 
     # И тот же файл, разрешённый честно, профиль пропускает.
-    suite.write_text(
+    notes.write_text(
         "def test_common():\n    assert True\n\n\n"
         "def test_from_the_branch():\n    pass\n\n\n"
         "def test_from_the_base():\n    pass\n"
     )
-    _run_git("git", "add", "tests_suite.py", cwd=workdir)
+    _run_git("git", "add", "NOTES.txt", cwd=workdir)
     rc, log_tail = await validation_run.host_profile_runner(str(workdir))
     assert rc == 0, log_tail
-    assert not list(workdir.rglob("__pycache__")), "профиль не пишет байткод в дерево"
