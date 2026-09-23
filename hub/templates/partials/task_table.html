@@ -1,4 +1,4 @@
-{% from "partials/pr_disposition.html" import pr_disposition_select %}
+{% from "partials/pr_disposition.html" import pr_disposition_select, pr_accept_confirm %}
 {% if tasks %}
 <table class="data-table">
     <thead>
@@ -73,11 +73,13 @@
                 {% elif t.status.value == 'needs_info' %}
                 <a href="/tasks/{{ t.id }}" class="btn btn-warning btn-xs task-table-action">Answer</a>
                 {% elif t.status.value == 'needs_decision' %}
-                {{ pr_disposition_select(t, 'row-pr-disposition-' ~ t.id, 'task-table-action') }}
+                {{ pr_disposition_select(t, 'row-pr-disposition-' ~ t.id, 'task-table-action', 'row-accept-' ~ t.id) }}
                 <button class="btn btn-success btn-xs task-table-action"
+                        id="row-accept-{{ t.id }}"
                         hx-post="/tasks/{{ t.id }}/web-decide"
                         hx-vals='{"action": "accept"}'
                         hx-include="#row-pr-disposition-{{ t.id }}"
+                        hx-confirm="{{ pr_accept_confirm(t, default_pr_disposition(t)) }}"
                         hx-target="#task-row-{{ t.id }}"
                         hx-swap="outerHTML">Accept</button>
                 {% endif %}

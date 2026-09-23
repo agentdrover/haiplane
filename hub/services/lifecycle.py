@@ -4993,6 +4993,20 @@ class RegistryDeliveryRefused(ValueError):
 
 REGISTRY_DELIVERY_VIA = "registry_deliver"
 
+#: Начало строки ленты, которой реестр записывает свой отказ. Инбокс читает
+#: причину отказа ИЗ ЛЕНТЫ по этому началу, а не из адреса — адрес можно
+#: собрать руками, лента пишется только хабом.
+REGISTRY_REFUSAL_PREFIX = "Доставка из реестра не выполнена"
+
+
+async def _refuse_registry_delivery(
+    db: aiosqlite.Connection, task_id: int, reason: str, message: str
+) -> RegistryDeliveryRefused:
+    """Записать отказ реестра в ленту задачи и вернуть его для raise."""
+    await repo.add_task_update(db, task_id, "hub", "alert", message)
+    await db.commit()
+    return RegistryDeliveryRefused(reason, message)
+
 
 async def deliver_from_registry(
     db: aiosqlite.Connection, task_id: int, *, by: str
@@ -5023,20 +5037,24 @@ async def deliver_from_registry(
             not_found=True,
         )
     if dict(row)["status"] != "completed" or stored["state"] != PR_OPEN:
-        raise RegistryDeliveryRefused(
+        raise await _refuse_registry_delivery(
+            db,
+            task_id,
             "not_pr_open",
-            f"Строка реестра #{task_id} — {stored['state']} у задачи в статусе "
-            f"{dict(row)['status']}; доставлять из реестра можно только "
-            "закрытую задачу с открытым PR.",
+            f"{REGISTRY_REFUSAL_PREFIX} (#{task_id}): строка реестра — "
+            f"{stored['state']} у задачи в статусе {dict(row)['status']}; "
+            "доставлять из реестра можно только закрытую задачу с открытым PR.",
         )
     ok, reason, _ = await deliver_on_disposition(
         db, task_id, DELIVER_DISPOSITION, via=REGISTRY_DELIVERY_VIA
     )
     if not ok:
-        raise RegistryDeliveryRefused(
+        raise await _refuse_registry_delivery(
+            db,
+            task_id,
             reason or "not_delivered",
-            f"Доставка #{task_id} из реестра не выполнена: {reason}. Условия те "
-            "же, что у гейта; строка осталась в реестре.",
+            f"{REGISTRY_REFUSAL_PREFIX} (#{task_id}): {reason}. Условия те же, "
+            "что у гейта; строка осталась в реестре.",
         )
     task = dict(await repo.get_task(db, task_id) or {})
     answer = await task_delivery(db, task)

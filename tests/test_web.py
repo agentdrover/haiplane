@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import re
 
 from httpx import AsyncClient
@@ -6572,3 +6573,141 @@ async def test_the_inbox_registry_row_delivers_through_the_gate(
     )
     assert resp.status_code == 303, resp.text
     assert spy.merged == [1506]
+
+
+# ---- #1333, сдача 2: находки машинного ревью (отчёт #479) ----
+
+
+async def _accepted_red_ci_row(client: AsyncClient, db, monkeypatch, *, pr: int):
+    """Строка реестра pr_open, доставка которой упрётся в красный CI."""
+    from tests.test_accept_without_delivery import _install, _MergeSpy, _pr_states
+
+    spy = _MergeSpy(ci="failed")
+    _install(monkeypatch, spy)
+    _pr_states(monkeypatch, {pr: "open"})
+    task_id = await _decision_with_open_pr(client, db, pr=pr, approved=True)
+    await client.post(f"/api/tasks/{task_id}/decide", json={"action": "accept"})
+    return task_id, spy
+
+
+async def test_a_refused_registry_delivery_returns_to_the_inbox_with_the_reason(
+    client: AsyncClient, db, monkeypatch
+):
+    """aa0b738677921a18: отказ гейта — ожидаемый исход, а не ошибка ввода.
+    Человек остаётся на инбоксе и видит причину, а не сырой JSON."""
+    task_id, spy = await _accepted_red_ci_row(client, db, monkeypatch, pr=1507)
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-deliver-undelivered",
+        data={"return_project": ""},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303, resp.text
+    location = resp.headers["location"]
+    assert location.startswith("/?") and f"delivery_refused={task_id}" in location
+    assert spy.merged == []
+
+    page = (await client.get(location)).text
+    banner = re.search(r'<div class="delivery-refusal"[^>]*>(.*?)</div>', page, re.S)
+    assert banner, "на инбоксе нет строки с причиной отказа"
+    assert f"#{task_id}" in banner.group(1) and "ci_" in banner.group(1)
+
+    # HTMX-вариант: фрагмент с причиной на месте, код 200.
+    htmx = await client.post(
+        f"/tasks/{task_id}/web-deliver-undelivered",
+        headers={"HX-Request": "true"},
+    )
+    assert htmx.status_code == 200, htmx.text
+    assert "ci_" in htmx.text and "не выполнена" in htmx.text
+
+
+async def test_the_accept_confirm_names_the_pr_fate(client: AsyncClient, db):
+    """feb9db856b3d78d9: подтверждение называет судьбу PR на каждой кнопке."""
+    approved = await _decision_with_open_pr(client, db, pr=1508, approved=True)
+    bare = await _decision_with_open_pr(client, db, pr=1509, approved=False)
+    surfaces = {
+        "inbox": "/",
+        "task_card": "/partials/kanban",
+        "task_table": "/tasks/list?status=needs_decision",
+    }
+    for name, url in surfaces.items():
+        page = (await client.get(url)).text
+        for task_id, words in (
+            (approved, f"Accept #{approved} и доставить PR #1508?"),
+            (bare, "PR #1509 останется открытым"),
+        ):
+            button = re.search(
+                rf'<button[^>]*hx-post="/tasks/{task_id}/web-decide".*?</button>',
+                page,
+                re.S,
+            )
+            assert button, f"{name}: нет кнопки Accept у #{task_id}"
+            confirm = re.search(r'hx-confirm="([^"]*)"', button.group(0))
+            assert confirm, f"{name}: Accept #{task_id} без подтверждения"
+            assert words in html.unescape(confirm.group(1)), (name, confirm.group(1))
+        # Смена выбора меняет и текст подтверждения.
+        assert 'data-confirm="' in page and "onchange=" in page, name
+
+
+async def test_the_htmx_accept_names_the_delivery_outcome(
+    client: AsyncClient, db, monkeypatch
+):
+    """feb9db856b3d78d9: после ответа строка называет исход доставки, а
+    секция «Completed, PR still open» обновляется без перезагрузки."""
+    from tests.test_accept_without_delivery import _install, _MergeSpy, _pr_states
+
+    spy = _MergeSpy(ci="failed")
+    _install(monkeypatch, spy)
+    _pr_states(monkeypatch, {1510: "open", 1511: "open"})
+    red = await _decision_with_open_pr(client, db, pr=1510, approved=True)
+
+    resp = await client.post(
+        f"/tasks/{red}/web-decide",
+        data={
+            "action": "accept",
+            "pr_disposition": "deliver",
+            "from_inbox": "true",
+            "inbox_project": "",
+        },
+        headers={"HX-Request": "true"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert "PR #1510 НЕ доставлен" in resp.text and "ci_" in resp.text
+    oob = re.search(
+        r'<div id="inbox-undelivered" hx-swap-oob="true">(.*?)</div>\s*$',
+        resp.text,
+        re.S,
+    )
+    assert oob, "секция «Completed, PR still open» не обновлена"
+    assert f"/tasks/{red}/web-deliver-undelivered" in oob.group(1)
+
+    spy.ci = "passed"
+    green = await _decision_with_open_pr(client, db, pr=1511, approved=True)
+    resp = await client.post(
+        f"/tasks/{green}/web-decide",
+        data={"action": "accept", "pr_disposition": "deliver"},
+        headers={"HX-Request": "true"},
+    )
+    assert "PR #1511 доставлен" in resp.text
+    assert spy.merged == [1511]
+
+
+async def test_web_decide_names_the_field_that_failed(client: AsyncClient, db):
+    """40ac6a807ddad21b: ошибка валидации называет то поле, что не прошло."""
+    task_id = await _decision_with_open_pr(client, db, pr=1512, approved=False)
+    resp = await client.post(
+        f"/tasks/{task_id}/web-decide",
+        data={"action": "bogus", "pr_disposition": "deliver"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "action" in detail and "pr_disposition" not in detail, detail
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-decide",
+        data={"action": "accept", "pr_disposition": "merge-it"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert "pr_disposition" in resp.json()["detail"]

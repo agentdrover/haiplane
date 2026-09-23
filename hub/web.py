@@ -45,7 +45,7 @@ from hub.services import project_policy
 from hub.services import steward_dispatch
 from hub.services.finding_evidence import evidence_for_findings, evidence_for_report
 from hub.services.finding_identity import finding_uids
-from hub.services.lifecycle import DELIVER_DISPOSITION
+from hub.services.lifecycle import DELIVER_DISPOSITION, REGISTRY_REFUSAL_PREFIX
 from hub.services.review_evidence import inflight_view
 from hub.version import get_app_version
 from hub.models import (
@@ -644,21 +644,31 @@ async def _apply_analyst_ready_filter(
     return tasks, ready_by_id
 
 
-async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLResponse:
-    """Return a small 'done' indicator for HTMX-swapped items."""
-    db = _db(request)
+async def _task_done_html(
+    db: aiosqlite.Connection, task_id: int, note: str = ""
+) -> str:
+    """The small 'done' row, optionally with a plain-text note (escaped)."""
     row = await repo.get_task(db, task_id)
     if not row:
-        return HTMLResponse("")
+        return ""
     t = services.row_to_task(row)
     safe_title = html.escape(t.title[:40])
     safe_status = html.escape(t.status.value)
-    fragment = (
+    tail = (
+        f' <span class="inbox-item-desc delivery-outcome">{html.escape(note)}</span>'
+        if note
+        else ""
+    )
+    return (
         f'<div class="inbox-item-done" id="inbox-task-{t.id}">'
         f'<span class="badge badge-{safe_status}">{safe_status}</span> '
-        f"#{t.id} {safe_title}</div>"
+        f"#{t.id} {safe_title}{tail}</div>"
     )
-    return HTMLResponse(fragment)
+
+
+async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLResponse:
+    """Return a small 'done' indicator for HTMX-swapped items."""
+    return HTMLResponse(await _task_done_html(_db(request), task_id))
 
 
 def _htmx_dor_failed_fragment(task_id: int, detail: dict[str, Any]) -> HTMLResponse:
@@ -891,8 +901,24 @@ async def _project_filter_ctx(
     return allowed, projects, current
 
 
+async def _registry_refusal(db: aiosqlite.Connection, task_ref: str | None) -> str:
+    """The registry's own words for a refused delivery (#1333).
+
+    Read from the task feed, never from the query string: the address only
+    names which task to look at, so a hand-made link cannot put a reason on
+    the page that the hub did not write.
+    """
+    if not task_ref or not task_ref.strip().isdigit():
+        return ""
+    return await _latest_alert(db, int(task_ref.strip()), REGISTRY_REFUSAL_PREFIX)
+
+
 @router.get("/", response_class=HTMLResponse)
-async def web_dashboard(request: Request, project: str | None = Query(None)):
+async def web_dashboard(
+    request: Request,
+    project: str | None = Query(None),
+    delivery_refused: str | None = Query(None),
+):
     # #955: аноним (токены настроены, сессии нет) видит визитку продукта.
     # Открытый режим и живая сессия получают дашборд как прежде — их
     # идентичность не анонимная. Ветка стоит до первого обращения к БД:
@@ -952,6 +978,7 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
     agent_sessions = await services.get_agent_sessions_panel(db)
     message_threads = await services.get_message_threads_panel(db)
     ctx: dict[str, Any] = {
+        "delivery_refusal": await _registry_refusal(db, delivery_refused),
         "data": data,
         "agent_sessions": agent_sessions,
         "message_threads": message_threads,
@@ -1452,6 +1479,8 @@ async def web_deliver_undelivered(task_id: int, request: Request):
     """
     identity = require_human_or_admin(request)
     form = await request.form()
+    back_project = str(form.get("return_project") or "").strip()
+    query = [f"project={quote(back_project, safe='')}"] if back_project else []
     try:
         await services.deliver_from_registry(
             _db(request), task_id, by=identity.username
@@ -1459,9 +1488,17 @@ async def web_deliver_undelivered(task_id: int, request: Request):
     except services.RegistryDeliveryRefused as exc:
         if exc.not_found:
             raise HTTPException(404, exc.message) from exc
-        raise HTTPException(409, exc.message) from exc
-    back_project = str(form.get("return_project") or "").strip()
-    back = f"/?project={quote(back_project, safe='')}" if back_project else "/"
+        # A gate refusal is an expected outcome, not bad input (#1333 review,
+        # aa0b738677921a18): the reader stays on the inbox and sees why. The
+        # reason travels in the task feed, where the service wrote it; the
+        # address carries only the task id, so it cannot put words on the page.
+        if _is_htmx(request):
+            return HTMLResponse(
+                f'<div class="delivery-refusal" id="inbox-undelivered-{task_id}">'
+                f"{html.escape(exc.message)}</div>"
+            )
+        query.append(f"delivery_refused={task_id}")
+    back = "/?" + "&".join(query) if query else "/"
     return RedirectResponse(back, status_code=303)
 
 
@@ -2712,6 +2749,12 @@ async def web_decide_task(
     # the undelivering one — MCP and REST took pr_disposition (#1037), the
     # form did not. Empty stays legal and is still recorded (#897).
     pr_disposition: str = Form(""),
+    # Set only by the inbox's Accept: the answer then redraws the "Completed,
+    # PR still open" section in the project on screen (#1333, #626).
+    # An empty project arrives as "no value" from a form, so "came from the
+    # inbox" needs its own flag rather than inbox_project being present.
+    from_inbox: bool = Form(False),
+    inbox_project: str = Form(""),
 ):
     _require_human_web(request)
     try:
@@ -2723,11 +2766,83 @@ async def web_decide_task(
             pr_disposition=pr_disposition.strip(),
         )
     except ValidationError as exc:
-        raise HTTPException(400, "pr_disposition: deliver, abandon or empty") from exc
+        # The field that actually failed, not the newest one (#1333 review,
+        # 40ac6a807ddad21b): a bad action must not read as a bad PR fate.
+        raise HTTPException(400, _invalid_fields_detail(exc)) from exc
     await services.decide_task(_db(request), task_id, body)
     if _is_htmx(request):
-        return await _htmx_task_done_fragment(request, task_id)
+        return await _htmx_decide_fragment(
+            request, task_id, body.pr_disposition, inbox_project if from_inbox else None
+        )
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+def _invalid_fields_detail(exc: ValidationError) -> str:
+    """Name the form fields a model refused, each once, in order."""
+    fields: list[str] = []
+    for err in exc.errors():
+        name = str(err.get("loc", ("?",))[0]) if err.get("loc") else "?"
+        if name not in fields:
+            fields.append(name)
+    return "не прошло проверку поле: " + ", ".join(fields)
+
+
+async def _latest_alert(db: aiosqlite.Connection, task_id: int, prefix: str) -> str:
+    """The newest hub alert on the task that starts with ``prefix``, or ``""``."""
+    found = ""
+    for u in await repo.get_task_updates(db, task_id):
+        row = dict(u)
+        content = str(row.get("content") or "")
+        if row.get("kind") == "alert" and content.startswith(prefix):
+            found = content
+    return found
+
+
+async def _decide_delivery_note(
+    db: aiosqlite.Connection, task_id: int, disposition: str
+) -> str:
+    """What the acceptance did to the PR, in words (#1333, feb9db856b3d78d9).
+
+    "completed" alone read the same whether the gate merged the PR or refused
+    it — which is how #1276/#1249/#1234 were closed believing it was done.
+    """
+    row = await repo.get_task(db, task_id)
+    task = dict(row) if row else {}
+    pr = task.get("pr_number")
+    if not pr or task.get("status") != "completed":
+        return ""
+    if disposition == DELIVER_DISPOSITION:
+        if await repo.pipeline_merge_recorded(db, task_id, int(pr)):
+            return f"PR #{pr} доставлен под условиями гейта."
+        alert = await _latest_alert(
+            db, task_id, "Доставка по решению человека НЕ выполнена"
+        )
+        return f"PR #{pr} НЕ доставлен: {alert or 'причина — в ленте задачи'}"
+    if disposition == "abandon":
+        return f"От PR #{pr} отказались: мержа нет, PR открыт, пока его не закроют."
+    return (
+        f"Судьба PR #{pr} не выбрана: работа НЕ доставлена и стоит в "
+        "«Completed, PR still open»."
+    )
+
+
+async def _htmx_decide_fragment(
+    request: Request, task_id: int, disposition: str, inbox_project: str | None
+) -> HTMLResponse:
+    """The done row plus the delivery outcome, and — from the inbox — the
+    redrawn "Completed, PR still open" section (hx-swap-oob)."""
+    db = _db(request)
+    note = await _decide_delivery_note(db, task_id, disposition)
+    done = await _task_done_html(db, task_id, note)
+    if inbox_project is None:
+        return HTMLResponse(done)
+    inbox = await services.get_inbox_data(db, project=inbox_project.strip() or None)
+    section = TEMPLATES.get_template("partials/inbox_undelivered.html").render(
+        undelivered=inbox["undelivered"], filter_project=inbox["filter_project"]
+    )
+    return HTMLResponse(
+        f'{done}\n<div id="inbox-undelivered" hx-swap-oob="true">{section}</div>'
+    )
 
 
 @router.post("/tasks/web-batch-approve-selected")
