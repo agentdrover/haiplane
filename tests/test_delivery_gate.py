@@ -1170,7 +1170,9 @@ def _run_git(*args: str, cwd) -> None:
     subprocess.run(args, cwd=cwd, check=True, capture_output=True)
 
 
-def _repo_with_a_tail_conflict(tmp_path):
+def _repo_with_a_tail_conflict(
+    tmp_path, branch_tail: str = "\n\ndef test_from_the_branch():\n    pass\n"
+):
     """Клон, где база и ветка дописали каждая свой хвост одного файла.
 
     Ровно случай 09.09.2026: #1206, #1208 и #1216 дописывали тесты в конец
@@ -1193,7 +1195,7 @@ def _repo_with_a_tail_conflict(tmp_path):
     _run_git("git", "push", "-q", "origin", "develop", cwd=repo)
 
     _run_git("git", "checkout", "-q", "-b", "task-1233/probe", cwd=repo)
-    suite.write_text(suite.read_text() + "\n\ndef test_from_the_branch():\n    pass\n")
+    suite.write_text(suite.read_text() + branch_tail)
     _run_git("git", "commit", "-q", "-am", "branch tail", cwd=repo)
     _run_git("git", "push", "-q", "origin", "task-1233/probe", cwd=repo)
 
@@ -3807,3 +3809,213 @@ async def test_a_cancelled_base_merge_leaves_no_scratch_worktree(
     assert not os.path.exists(scratch), "отменённый мерж не оставляет дерево"
     listed = await real_git("worktree", "list", "--porcelain", repo=str(repo))
     assert scratch not in (listed[1] or ""), "и git о нём тоже не помнит"
+
+
+# ---- #1332: сложенное проверяет профиль хоста, а не команды автора ----
+#
+# 23.09.2026 первая же попытка автомержа на проде (#1242) упала «валидация
+# после автомержа упала (код возврата 127)»: validation_commands автора
+# начинались с «uv run», а uv у пользователя сервиса нет. Решение владельца —
+# вариант (б): хост проверяет только то, что может (git diff --check и
+# компиляция изменённых .py тем python, на котором работает сам хаб), а
+# поведение слитого кода проверяет CI на новой вершине.
+
+_AUTHOR_COMMANDS = '["uv run pytest -q tests/test_review_dispatch.py", "make check"]'
+
+
+async def _automerge_on_real_git(db, monkeypatch, tmp_path, **repo_kw):
+    """Гейт с НАСТОЯЩИМ git под хвостовым конфликтом (#1332).
+
+    Проба конфликта и пуш слитой ветки — настоящие методы GitOpsIntegration на
+    временном клоне; двойник только у форжа (CI, мерж PR). Отказ мержа PR
+    заставляет гейт пойти в автомерж — ровно путь #1242.
+    """
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import orchestration
+
+    workdir = _repo_with_a_tail_conflict(tmp_path, **repo_kw)
+    pinned = _tip(workdir, "task-1233/probe")
+    g = _seeing(monkeypatch, pinned, merged=False)
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(return_value={"repo": str(workdir), "base_branch": "develop"}),
+    )
+    ops = GitOpsIntegration()
+    g.base_merge_conflicts = ops.base_merge_conflicts
+    g.push_resolved_base_merge = ops.push_resolved_base_merge
+    task_id = await _approved_pair_task(db)
+    await repo.update_task(
+        db,
+        task_id,
+        branch="task-1233/probe",
+        validation_commands=_AUTHOR_COMMANDS,
+    )
+    await db.commit()
+    assert dict(await repo.get_task(db, task_id))["submission_sha"] == pinned
+    return g, task_id, workdir, pinned
+
+
+def _spy_on_author_commands(monkeypatch) -> list:
+    calls: list = []
+    real = validation_run.default_validation_runner
+
+    async def _spy(commands, path):
+        calls.append(commands)
+        return await real(commands, path)
+
+    monkeypatch.setattr(validation_run, "default_validation_runner", _spy)
+    return calls
+
+
+async def test_a_missing_validation_command_is_named_as_the_environment(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+) -> None:
+    """AC-1 (#1332): инструмента профиля нет — это дефект среды, с именем.
+
+    На проде 23.09 человек прочёл «валидация упала (код возврата 127)» и не
+    мог понять, что упал не код задачи, а окружение сервиса: какого бинаря
+    нет, пришлось выяснять по ssh. Отказ обязан сказать это сам.
+    """
+    g, task_id, workdir, pinned = await _automerge_on_real_git(
+        db, monkeypatch, tmp_path
+    )
+    monkeypatch.setattr(validation_run, "_profile_python", lambda: "python3-absent-1332")
+
+    await _report_done(db, task_id)
+
+    feed = await _feed(db, task_id)
+    assert "дефект среды" in feed, feed
+    assert "команда не найдена" in feed and "python3-absent-1332" in feed, (
+        "отказ называет ненайденную команду по имени"
+    )
+    assert "валидация после автомержа упала" not in feed, (
+        "среда не код: «валидация упала» здесь — неверный диагноз"
+    )
+    assert _tip(workdir, "task-1233/probe") == pinned, "непроверенное не пушится"
+
+
+async def test_automerge_validates_with_a_command_the_host_can_run(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+) -> None:
+    """AC-2 (#1332): команды автора с uv в среде без uv — автомерж состоялся.
+
+    Среда воспроизводит прод: в PATH только каталог git, uv там нет. Команды
+    автора (как у #1242) в автомерже не запускаются вовсе; сложенное проверено
+    профилем хоста; ветка обновлена; исход base_automerged, не needs_decision.
+    И второе обещание решения (б): поведение проверяет CI на новой вершине —
+    следующий цикл при незелёном CI не мержит, а ждёт.
+    """
+    import os
+    import shutil
+
+    git_dir = os.path.dirname(shutil.which("git") or "")
+    assert git_dir, "сцене нужен git"
+    if shutil.which("uv", path=git_dir):
+        pytest.skip("uv лежит рядом с git — среду без uv здесь не собрать")
+    g, task_id, workdir, pinned = await _automerge_on_real_git(
+        db, monkeypatch, tmp_path
+    )
+    monkeypatch.setenv("PATH", git_dir)
+    author_runs = _spy_on_author_commands(monkeypatch)
+
+    await _report_done(db, task_id)
+
+    assert author_runs == [], "validation_commands автора в автомерже не запускаются"
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] != "needs_decision", await _feed(db, task_id)
+    moved = _tip(workdir, "task-1233/probe")
+    assert moved != pinned, "ветка обновлена слитым коммитом"
+    assert task["submission_sha"] == moved, "и сдача перезакреплена на него"
+    feed = await _feed(db, task_id)
+    assert "base_automerged" in feed or "Автомерж базы" in feed, feed
+    assert "git diff --check" in feed and "компиляция" in feed, (
+        "карточка называет, ЧЕМ проверено сложенное"
+    )
+    assert "CI на новой вершине" in feed, (
+        "и чем будет проверено поведение: карточка не обещает больше, чем "
+        "сделал хост"
+    )
+
+    # Следующий цикл: CI на слитой вершине ещё не зелёный — гейт ждёт его, а
+    # не мержит сложенное без проверки поведения.
+    merges_before = g.merge_pr.await_count
+    g.head_sha = AsyncMock(return_value=moved)
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.pending, "checks_pending")
+    )
+    from tests.test_pair_merge_gate import _drain_pair_delivery
+
+    await _drain_pair_delivery(db)
+
+    assert g.check_pr_ci.await_count >= 1, "следующий цикл спрашивает CI"
+    assert g.merge_pr.await_count == merges_before, (
+        "без зелёного CI на новой вершине слитое не доставляется"
+    )
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] not in ("needs_decision", "completed")
+
+
+async def test_a_broken_merged_tree_is_not_pushed(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+) -> None:
+    """AC-3 (#1332): синтаксически сломанный .py после сложения — не пушим.
+
+    Профиль хоста обязан уметь сказать «нет»: профиль, который всегда
+    зелёный, пропустил бы это дерево в ветку под чужим одобрением. Отказ
+    называет файл, чтобы человек не искал его сам.
+    """
+    g, task_id, workdir, pinned = await _automerge_on_real_git(
+        db,
+        monkeypatch,
+        tmp_path,
+        branch_tail="\n\ndef test_from_the_branch(:\n    pass\n",
+    )
+
+    await _report_done(db, task_id)
+
+    assert _tip(workdir, "task-1233/probe") == pinned, "сломанное дерево не пушится"
+    task = dict(await repo.get_task(db, task_id))
+    assert task["submission_sha"] == pinned
+    feed = await _feed(db, task_id)
+    assert "tests_suite.py" in feed, feed
+    assert "Автомерж базы" not in feed
+
+
+async def test_the_host_profile_catches_a_leftover_conflict_marker(tmp_path) -> None:
+    """AC-3 (#1332), вторая половина: маркер конфликта в сложенном дереве.
+
+    Настоящий git в состоянии незавершённого мержа, как в дереве автомержа:
+    файл, разрешённый с забытым маркером, застейджен. ``git diff --check``
+    обязан это увидеть и назвать файл.
+    """
+    import subprocess
+
+    workdir = _repo_with_a_tail_conflict(tmp_path)
+    _run_git("git", "checkout", "-q", "task-1233/probe", cwd=workdir)
+    subprocess.run(
+        ["git", "merge", "--no-commit", "--no-ff", "origin/develop"],
+        cwd=workdir,
+        capture_output=True,
+    )
+    suite = workdir / "tests_suite.py"
+    assert "<<<<<<<" in suite.read_text(), "сцене нужен настоящий конфликт"
+    _run_git("git", "add", "tests_suite.py", cwd=workdir)
+
+    rc, log_tail = await validation_run.host_profile_runner(str(workdir))
+
+    assert rc != 0 and rc != validation_run.COMMAND_NOT_FOUND_RC, log_tail
+    assert "tests_suite.py" in log_tail
+
+    # И тот же файл, разрешённый честно, профиль пропускает.
+    text = suite.read_text()
+    clean = "\n".join(
+        ln
+        for ln in text.splitlines()
+        if not ln.startswith(("<<<<<<<", "|||||||", "=======", ">>>>>>>"))
+    )
+    suite.write_text(clean + "\n")
+    _run_git("git", "add", "tests_suite.py", cwd=workdir)
+    rc, log_tail = await validation_run.host_profile_runner(str(workdir))
+    assert rc == 0, log_tail
+    assert not list(workdir.rglob("__pycache__")), "профиль не пишет байткод в дерево"
