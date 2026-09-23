@@ -1381,6 +1381,25 @@ async def machine_reviews_of_generation(
     )
 
 
+async def latest_reviewed_generation(
+    db: aiosqlite.Connection, task_id: int, at_most: int
+) -> int | None:
+    """The newest generation, no newer than ``at_most``, that has a report (#1331).
+
+    ``None`` when no submission up to ``at_most`` was ever reviewed. A
+    generation whose review never happened (429, exhausted limit, crashed run)
+    leaves no row at all, so skipping it skips the gap and nothing else.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT MAX(submission_generation) AS g FROM machine_reviews "
+        "WHERE task_id=? AND submission_generation<=?",
+        (task_id, at_most),
+    )
+    value = dict(rows[0])["g"] if rows else None
+    return None if value is None else int(value)
+
+
 async def list_machine_reviews(
     db: aiosqlite.Connection, task_id: int
 ) -> list[aiosqlite.Row]:
