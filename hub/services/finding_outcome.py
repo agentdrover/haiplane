@@ -44,10 +44,40 @@ KIND_UNRESOLVED = "unresolved"
 NO_CONFIRMED_INDEX = -1
 
 
+async def reports_owed_an_answer(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> list[Any]:
+    """The reports a submission replacing ``generation`` answers to (#1331).
+
+    Those of ``generation`` itself when it was reviewed; otherwise those of the
+    newest EARLIER generation that was. A submission the provider never
+    reviewed (429, exhausted limit) sent nothing back, so the question still
+    owed is the one the last actual report asked. Before this, its findings
+    were unreachable: every outcome about them got 422 and a deferred defect
+    left no draft (#1231 and #1234 on 23.09).
+
+    Never older than the newest reviewed generation: a fresher report is the
+    one being asked, and findings it no longer carries are not revived.
+
+    The ONE place that decides this. The open-findings set (and through it the
+    debt named on submission and on a done report) and the same-commit retry
+    all read it from here, so they cannot drift apart.
+    """
+    reviewed = await repo.latest_reviewed_generation(db, task_id, generation)
+    if reviewed is None:
+        return []
+    return await repo.machine_reviews_of_generation(db, task_id, reviewed)
+
+
 async def open_findings(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> list[dict[str, Any]]:
-    """Findings of THIS generation that their author has not closed — BOTH sections.
+    """Findings still owed an answer by a submission over ``generation`` — BOTH sections.
+
+    Which reports count is :func:`reports_owed_an_answer`: this generation's,
+    or, when it went unreviewed, the newest earlier one's (#1331). Every item
+    carries its report's ``generation``, and the outcome is stored under it:
+    the answer belongs to the report that asked.
 
     Confirmed findings and the ones no adjudicator could resolve (#1085). The
     second half is not an afterthought: measured over five deep runs it carried
@@ -66,10 +96,10 @@ async def open_findings(
     measured. The author still answers ONCE per defect; it is the storage that
     fans out, in :func:`plan_outcomes`.
     """
-    reports = await repo.machine_reviews_of_generation(db, task_id, generation)
     out: list[dict[str, Any]] = []
-    for row in reports:
+    for row in await reports_owed_an_answer(db, task_id, generation):
         review = dict(row)
+        asked_by = int(review.get("submission_generation") or 0)
         confirmed = _section(review, "findings_confirmed")
         unresolved = _section(review, "unresolved")
         if not confirmed and not unresolved:
@@ -86,6 +116,7 @@ async def open_findings(
             out.append(
                 {
                     "review_id": review_id,
+                    "generation": asked_by,
                     "finding_index": index,
                     "finding_uid": uid,
                     "finding_kind": KIND_CONFIRMED,
@@ -101,6 +132,7 @@ async def open_findings(
             out.append(
                 {
                     "review_id": review_id,
+                    "generation": asked_by,
                     "finding_index": NO_CONFIRMED_INDEX,
                     "finding_uid": uid,
                     "finding_kind": KIND_UNRESOLVED,
@@ -299,6 +331,12 @@ async def apply_outcomes(
     The draft is a DRAFT on purpose. An outcome is one agent's sentence about
     its own work, and turning that into scheduled work without a human would
     let an author create the backlog that judges it.
+
+    The row is stored under the generation of the REPORT that asked (#1331),
+    carried by :func:`open_findings`; ``generation`` is only the fallback for
+    an item that does not name one. Usually the two are the same. Behind an
+    unreviewed submission they are not, and the review circle pairs what was
+    closed with the findings by the report's generation.
     """
     drafts: list[int] = []
     spawned_for: set[str] = set()
@@ -307,7 +345,7 @@ async def apply_outcomes(
             db,
             review_id=int(found["review_id"]),
             task_id=task_id,
-            submission_generation=generation,
+            submission_generation=int(found.get("generation") or generation),
             finding_uid=item.finding_uid,
             finding_index=int(found["finding_index"]),
             finding_title=str(found["title"]),
