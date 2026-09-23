@@ -6153,9 +6153,23 @@ async def test_an_unconfigured_local_path_changes_nothing_on_github(
     )
     assert "провайдер отказал" in about_review[0], about_review[0]
     assert "HTTP 400, usage_limit_exceeded" in about_review[0], about_review[0]
-    assert not await db.execute_fetchall(
-        "SELECT 1 FROM review_dispatches WHERE task_id=?", (task_id,)
-    ), "ни одной новой строки диспетчера"
+    # #1242 уточняет «ни одной строки»: след сорвавшегося вызова остаётся —
+    # одна облачная заглушка, закрытая в failed, ничего не стоившая. Без неё
+    # переспросу не за что зацепиться, и сдача стоит без отчёта навсегда
+    # (22.09: #1162, #1281, HTTP 429). Локальной строки по-прежнему нет.
+    rows = [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=?", (task_id,)
+        )
+    ]
+    assert [(r["channel"], r["agent_id"], r["status"]) for r in rows] == [
+        ("cloud", "", "failed")
+    ], rows
+    assert await repo.count_review_dispatches(db, task_id, 1) == 0
+    assert await repo.get_review_dispatch_for_generation(db, task_id, 1) is None, (
+        "осевшая заглушка не выдаёт себя за запущенного ревьюера"
+    )
     assert not await repo.machine_reviews_of_generation(db, task_id, 1)
     updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
     assert not any("ЛОКАЛЬНО" in u for u in updates), (
@@ -10833,4 +10847,520 @@ async def test_flat_self_reports_do_not_stop_the_first_independent_order(
     task = dict(await repo.get_task(db, task_id))
     assert await findings_stopped_converging(db, task) is False, (
         "плоские самоотчёты не останавливают первый независимый заказ"
+    )
+
+
+# --- #1242: несостоявшееся ревью переспрашивается во времени ----------------
+#
+# Наблюдено 22.09.2026 стюардом: сдачи #1162 (сдача 3) и #1281 (сдача 2)
+# получили «провайдер отказал: HTTP 429» и остались без отчёта и без повтора.
+# Вторая дверь (#1252) закрывает случай, где настроен локальный путь; здесь
+# он НЕ настроен — и именно здесь переспрашивать было некому.
+_RATE_LIMIT = cursor_cloud.Refusal(
+    status=429, code="rate_limited", detail="Too Many Requests"
+)
+
+
+class _Sequence:
+    """Подставка провайдера с заготовленной ОЧЕРЕДЬЮ исходов по вызовам."""
+
+    def __init__(self, outcomes: list[tuple]):
+        self.outcomes = list(outcomes)
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.outcomes) > 1:
+            return self.outcomes.pop(0)
+        return self.outcomes[0]
+
+
+async def _age_dispatches(db: aiosqlite.Connection) -> None:
+    """Все заказы старше паузы переспроса и окна grace."""
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+
+async def _alerts_of(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return [
+        dict(r)["content"]
+        for r in await db.execute_fetchall(
+            "SELECT content FROM task_updates WHERE task_id=? AND kind='alert' "
+            "ORDER BY id",
+            (task_id,),
+        )
+    ]
+
+
+async def _rows_of(db: aiosqlite.Connection, task_id: int) -> list[dict]:
+    return [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=? ORDER BY id", (task_id,)
+        )
+    ]
+
+
+async def test_a_refused_call_is_asked_again(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1242): отказ провайдера НА ВЫЗОВЕ, отчёта нет — второй вызов.
+
+    Путь синхронный: maybe_dispatch_review, агент не создался. Локальный путь
+    не настроен, то есть вторая дверь (#1252) не открылась — ровно случай
+    22.09. Следующий проход свипа после паузы зовёт ревьюера снова, и
+    карточка называет причину ПЕРВОГО сбоя.
+    """
+    provider = _Sequence(
+        [
+            (None, _RATE_LIMIT),
+            ({"agent": {"id": "bc-second"}, "run": {"id": "run-second"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+
+    task_id = await _submitted(
+        client, db, "ask-again-refused", policy={"review": "dispatch"}
+    )
+    assert len(provider.calls) == 1, "первый вызов отказан"
+
+    await sweep_review_dispatches(db)
+    assert len(provider.calls) == 1, (
+        "пауза: отказ по лимиту не переспрашивается в ту же минуту"
+    )
+
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 2, "второй вызов ревью состоялся"
+    rows = await _rows_of(db, task_id)
+    assert rows[-1]["agent_id"] == "bc-second" and rows[-1]["status"] == "active"
+    assert rows[-1]["replaces_dispatch_id"] == rows[0]["id"], (
+        "переспрос продолжает ту же ступень, а не открывает новую (#879)"
+    )
+    asked = [a for a in await _alerts_of(db, task_id) if "Переспрос ревью" in a]
+    assert len(asked) == 1, asked
+    assert "HTTP 429" in asked[0], (
+        f"причина первого сбоя обязана стоять в карточке: {asked[0]}"
+    )
+    assert "1 из" in asked[0], asked[0]
+    assert await repo.count_review_dispatches(db, task_id, 1) == 1, (
+        "повтор не съедает ступень лестницы"
+    )
+
+
+async def test_a_dead_run_is_asked_again(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1242): прогон кончился терминальным статусом без отчёта.
+
+    Другая функция — sweep_review_dispatches, агент создан и оплачен. Первый
+    проход закрывает прогон как упавший (алерт «отчёт НЕ сдан»), следующий
+    зовёт ревьюера снова. Свежий ревьюер узнаёт СВОЙ отчёт: упавший заказ,
+    замещённый повтором, ступенью в сопоставлении отчётов не считается.
+    """
+    provider = _Sequence(
+        [
+            ({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None),
+            ({"agent": {"id": "bc-fresh"}, "run": {"id": "run-fresh"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    reviewer_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-dead-run", policy={"review": "dispatch"}
+    )
+    await _age_dispatches(db)
+
+    async def _errored(agent_id, run_id):
+        if agent_id == "bc-dead":
+            return {"id": run_id, "status": "ERROR"}
+        return {"id": run_id, "status": "RUNNING"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    await sweep_review_dispatches(db)
+    assert any("отчёт НЕ сдан" in a for a in await _alerts_of(db, task_id))
+    await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 2, "второй вызов ревью по мёртвому прогону"
+    rows = await _rows_of(db, task_id)
+    assert [r["agent_id"] for r in rows] == ["bc-dead", "bc-fresh"]
+    assert rows[0]["status"] == "failed" and rows[1]["status"] == "active"
+    asked = [a for a in await _alerts_of(db, task_id) if "Переспрос ревью" in a]
+    assert len(asked) == 1 and "ERROR" in asked[0], asked
+    assert await repo.count_review_dispatches(db, task_id, 1) == 1
+
+    from hub.services.review_dispatch import _dispatch_report
+
+    assert rows[1]["reviewer_principal_id"] == reviewer_pid, (
+        "ревьюер закреплён — сопоставление идёт по ступеням, а не по поколению"
+    )
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="grok-4.6",
+        submitted_by="cursor-cloud-reviewer",
+        principal_id=reviewer_pid,
+    )
+    await db.commit()
+    own = await _dispatch_report(db, task_id, 1, rows[1])
+    assert own is not None, (
+        "отчёт свежего ревьюера — ЕГО отчёт: замещённый заказ не занимает "
+        "ступень в сопоставлении (#1025)"
+    )
+
+
+async def test_an_existing_report_is_not_bought_twice(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1242): отчёт уже есть — пусть неполный — переспроса нет.
+
+    Неполнота — предмет лестницы добора (#879). Отчёт здесь неполный
+    намеренно: страж второй читки неполный отчёт покрытием не считает и
+    пропустил бы повтор, то есть мутация «переспрашивать всегда» видна
+    ТОЛЬКО этим тестом.
+    """
+    provider = _Sequence(
+        [
+            ({"agent": {"id": "bc-late"}, "run": {"id": "run-late"}}, None),
+            ({"agent": {"id": "bc-extra"}, "run": {"id": "run-extra"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-has-report", policy={"review": "dispatch"}
+    )
+    await _age_dispatches(db)
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await sweep_review_dispatches(db)
+    assert (await _rows_of(db, task_id))[0]["status"] == "failed"
+
+    # Отчёт доехал ПОСЛЕ того, как прогон назван упавшим: заказ закрыт, а
+    # отчёт этого поколения в базе есть.
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="grok-4.6",
+        submitted_by="someone-else",
+        incomplete=True,
+        lost_dimensions='["hub/services/big.py"]',
+    )
+    await db.commit()
+
+    await sweep_review_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 1, "второго ревьюера на сданный отчёт не купили"
+    assert len(await _rows_of(db, task_id)) == 1
+    assert not [a for a in await _alerts_of(db, task_id) if "Переспрос ревью" in a]
+
+
+async def test_exhausted_retries_name_themselves_to_a_human(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4 (#1242): потолок на поколение исчерпан — к человеку, с числом.
+
+    Отказ постоянный (тот же 429 на каждом вызове). После потолка третий
+    переспрос не покупается, а карточка называет число попыток и причину
+    последнего сбоя — один раз, а не на каждом проходе свипа.
+    """
+    from hub.services.review_dispatch import REVIEW_ASK_AGAIN_MAX
+
+    provider = _Sequence([(None, _RATE_LIMIT)])
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-exhausted", policy={"review": "dispatch"}
+    )
+
+    for _ in range(REVIEW_ASK_AGAIN_MAX + 3):
+        await _age_dispatches(db)
+        await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 1 + REVIEW_ASK_AGAIN_MAX, (
+        f"вызовов {len(provider.calls)}: потолок {REVIEW_ASK_AGAIN_MAX} "
+        "переспросов на поколение"
+    )
+    alerts = await _alerts_of(db, task_id)
+    asked = [a for a in alerts if "Переспрос ревью" in a]
+    assert len(asked) == REVIEW_ASK_AGAIN_MAX, asked
+    exhausted = [a for a in alerts if "исчерпан" in a]
+    assert len(exhausted) == 1, exhausted
+    assert f"{REVIEW_ASK_AGAIN_MAX}" in exhausted[0]
+    assert "HTTP 429" in exhausted[0], exhausted[0]
+    assert "человек" in exhausted[0], exhausted[0]
+
+
+async def test_a_blind_retry_is_not_repeated(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Ограничение #1199 в переспросе (#1242): вслепую не повторять.
+
+    Переспрос не дошёл до ответа, и спросить провайдера, создался ли агент,
+    тоже не вышло — строки заказа нет. Следующий проход не покупает ещё
+    одного поверх, возможно, уже оплаченного: он называет это человеку.
+    """
+    provider = _Sequence(
+        [(None, _RATE_LIMIT), (None, cursor_cloud.Refusal(status=0, detail="timeout"))]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+
+    async def _cannot_ask(name, pages=3):
+        return cursor_cloud.Reconciliation("", "", False)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _cannot_ask)
+    task_id = await _submitted(
+        client, db, "ask-again-blind", policy={"review": "dispatch"}
+    )
+    for _ in range(3):
+        await _age_dispatches(db)
+        await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 2, "после слепого переспроса — ни одного вызова"
+    stopped = [a for a in await _alerts_of(db, task_id) if "исчерпан" in a]
+    assert len(stopped) == 1 and "не оставил заказа" in stopped[0], stopped
+
+
+async def test_a_mixed_chain_is_still_one_ladder_step(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка b9943fc18e24a30c (#1242, сдача 1): смешанная цепочка повторов.
+
+    Оплаченный прогон упал (ERROR) → переспрос словил 429, осталась
+    бесплатная заглушка → следующий переспрос успешен. Все три строки — одна
+    ступень: успех продолжает заглушку, заглушка — оплаченный прогон. Счёт,
+    глядящий только на непосредственного предка, называл успех второй
+    ступенью, и лестница ложно отказывала в DEEP-доборе («потолок достигнут»).
+    """
+    provider = _Sequence(
+        [
+            ({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None),
+            (None, _RATE_LIMIT),
+            ({"agent": {"id": "bc-fresh"}, "run": {"id": "run-fresh"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-mixed-chain", policy={"review": "dispatch"}
+    )
+
+    async def _runs(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR" if agent_id == "bc-dead" else "RUNNING"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _runs)
+    for _ in range(3):
+        await _age_dispatches(db)
+        await sweep_review_dispatches(db)
+
+    rows = await _rows_of(db, task_id)
+    assert [r["agent_id"] for r in rows] == ["bc-dead", "", "bc-fresh"], rows
+    assert rows[1]["replaces_dispatch_id"] == rows[0]["id"]
+    assert rows[2]["replaces_dispatch_id"] == rows[1]["id"]
+    assert await repo.count_review_dispatches(db, task_id, 1) == 1, (
+        "оплаченный упал, заглушка бесплатна, успех — продолжение той же ступени"
+    )
+
+
+async def test_a_retry_that_left_no_order_does_not_claim_blindness(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка c82b1af523ba9dd7 (#1242, сдача 1): остановка не выдумывает причину.
+
+    Переспрос отказан по конфигурации — наблюдённый отказ, строки заказа нет.
+    Остановка верна (исход неизвестен переспросу, повтор ничего не изменит),
+    но называть его «слепотой #1199» — ложь в карточке: причина стоит в
+    алерте диспетчера, и остановка обязана на него сослаться, а не подменять.
+    """
+    provider = _Sequence(
+        [({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None)]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-no-config", policy={"review": "dispatch"}
+    )
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "")
+    for _ in range(3):
+        await _age_dispatches(db)
+        await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 1
+    alerts = await _alerts_of(db, task_id)
+    assert any("не хватает конфигурации" in a for a in alerts), alerts
+    stopped = [a for a in alerts if "исчерпан" in a]
+    assert len(stopped) == 1, stopped
+    assert "не оставил заказа" in stopped[0], stopped[0]
+    assert "вслепую нельзя" not in stopped[0], (
+        f"отказ конфигурации — не слепой исход #1199: {stopped[0]}"
+    )
+
+
+async def test_a_report_landing_while_the_retry_is_prepared_buys_nothing(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 17a9ca6ea3451163 (#1242, сдача 1): последнее слово перед тратой.
+
+    Отчёт доезжает, пока переспрос готовит заказ (дифф, правила — сеть).
+    Проверка в начале переспроса его не видит; облако не должно покупаться,
+    как не покупает его вторая дверь в том же окне (#1266).
+    """
+    from hub.services import review_dispatch as rd
+
+    provider = _Sequence(
+        [
+            ({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None),
+            ({"agent": {"id": "bc-extra"}, "run": {"id": "run-extra"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-late-report", policy={"review": "dispatch"}
+    )
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    real_prepare = rd.prepare_review_order
+
+    async def _report_arrives(db_, task, **kw):
+        await repo.insert_machine_review(
+            db_,
+            task_id=task_id,
+            submission_generation=1,
+            model="grok-4.6",
+            submitted_by="late-reviewer",
+        )
+        await db_.commit()
+        return await real_prepare(db_, task, **kw)
+
+    monkeypatch.setattr(rd, "prepare_review_order", _report_arrives)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 1, "отчёт уже есть — облако не покупается"
+    assert len(await _rows_of(db, task_id)) == 1
+    # Находка 2007bee302b71bf4 (сдача 2): запись о переспросе стоит ДО
+    # вызова и обещает ревьюера. Отменённая трата обязана быть названа, иначе
+    # карточка говорит о прогоне, которого не было.
+    alerts = await _alerts_of(db, task_id)
+    asked = [i for i, a in enumerate(alerts) if "Переспрос ревью 1 из" in a]
+    assert asked, alerts
+    after = alerts[asked[-1] + 1 :]
+    assert any("отменён" in a and "отчёт" in a for a in after), (
+        f"отменённый переспрос не назван в карточке: {after}"
+    )
+
+
+async def test_a_submission_moved_during_preparation_buys_no_cloud_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка dcd7da1fa88023c5 (#1242, сдача 2): свежесть сдачи перед тратой.
+
+    Подготовка заказа ходит в сеть; за это время задачу могут вернуть в
+    работу или пересдать. Облачный агент тогда читал бы код, которого на
+    живой сдаче уже нет. Проверка общая для ВСЕХ облачных заказов, не только
+    для переспроса: здесь — самый первый вызов при сдаче.
+    """
+    from hub.services import review_dispatch as rd
+
+    provider = _Sequence(
+        [({"agent": {"id": "bc-stale"}, "run": {"id": "run-stale"}}, None)]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    real_prepare = rd.prepare_review_order
+
+    async def _task_leaves_review(db_, task, **kw):
+        order = await real_prepare(db_, task, **kw)
+        # Сдачу переставили на другую ветку, пока шла подготовка.
+        await repo.update_task(db_, int(task["id"]), branch="task-x/other")
+        await db_.commit()
+        return order
+
+    monkeypatch.setattr(rd, "prepare_review_order", _task_leaves_review)
+    task_id = await _submitted(
+        client, db, "cloud-stale-submission", policy={"review": "dispatch"}
+    )
+
+    assert provider.calls == [], "сдача сменилась — облако не покупается"
+    assert not await _rows_of(db, task_id)
+
+
+async def test_a_retry_cancelled_by_a_moved_submission_says_so(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 40a8fd8b727c82ec (#1242, сдача 3): отмена по свежести названа.
+
+    Переспрос уже записал «ревьюер зовётся снова», а проверка свежести перед
+    облачной тратой его отменила: сдачу переставили на другую ветку, пока
+    готовился заказ. Своего алерта у этого отказа нет, поэтому карточка
+    обязана назвать отмену — иначе она обещает прогон, которого не было, а
+    остановка потом ссылается на алерт, которого нет.
+    """
+    from hub.services import review_dispatch as rd
+
+    provider = _Sequence(
+        [
+            ({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None),
+            ({"agent": {"id": "bc-extra"}, "run": {"id": "run-extra"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-moved", policy={"review": "dispatch"}
+    )
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    real_prepare = rd.prepare_review_order
+
+    async def _branch_moves(db_, task, **kw):
+        order = await real_prepare(db_, task, **kw)
+        await repo.update_task(db_, task_id, branch="task-x/moved")
+        await db_.commit()
+        return order
+
+    monkeypatch.setattr(rd, "prepare_review_order", _branch_moves)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 1, "сдача сменилась — облако не покупается"
+    alerts = await _alerts_of(db, task_id)
+    asked = [i for i, a in enumerate(alerts) if "Переспрос ревью 1 из" in a]
+    assert asked, alerts
+    after = alerts[asked[-1] + 1 :]
+    assert any("отменён" in a and "сдача сменилась" in a for a in after), (
+        f"отмена по свежести сдачи не названа в карточке: {after}"
     )

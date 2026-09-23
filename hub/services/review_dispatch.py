@@ -1908,7 +1908,11 @@ async def _create_or_adopt(
 
 
 async def maybe_dispatch_review(
-    db: aiosqlite.Connection, task_id: int, *, force_profile: str = ""
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    force_profile: str = "",
+    replaces_dispatch_id: int | None = None,
 ) -> bool:
     """Queue a cloud reviewer for a fresh submission when policy allows.
 
@@ -1919,6 +1923,10 @@ async def maybe_dispatch_review(
     ``force_profile`` skips the profile choice and runs the named one — the
     top-up step of the ladder (#879), where the profile is no longer a guess
     about the task but a fact about the run that just failed to finish.
+
+    ``replaces_dispatch_id`` is set only by the ask-again pass (#1242): the
+    new order CONTINUES the rung of the failed one it names instead of
+    opening a new one, both for the ladder count and for report matching.
     """
     row = await repo.get_task(db, task_id)
     if row is None:
@@ -2008,6 +2016,20 @@ async def maybe_dispatch_review(
         principal_id=expected_principal,
     )
     model_id, profile, profile_reasons = order.model, order.profile, order.reasons
+    # Последнее слово перед тратой. Подготовка заказа выше ходит в сеть за
+    # диффом и правилами, и за это окно сдача могла смениться — ЛЮБОЙ
+    # облачный заказ, не только переспрос (находка dcd7da1fa88023c5): тот же
+    # фильтр свежести, что у второй двери (#1252). Для переспроса ещё и отчёт,
+    # доехавший в это окно (находка 17a9ca6ea3451163). Отказ здесь тихий:
+    # у переспроса ОБА отказа — и по отчёту, и по свежести — называет сам
+    # переспрос (_name_a_cancelled_retry, находка 40a8fd8b727c82ec), а
+    # первичный заказ сменившейся сдачи заменит заказ её новой сдачи, как и
+    # у второй двери (#1252).
+    if not await _submission_still_live(db, task, branch, generation) or (
+        replaces_dispatch_id is not None
+        and await repo.machine_reviews_of_generation(db, task_id, generation)
+    ):
+        return False
     started = await _create_or_adopt(
         cursor_cloud.agent_marker(
             "review",
@@ -2050,57 +2072,15 @@ async def maybe_dispatch_review(
             # провайдер отверг создание, либо сверка подтвердила, что агента
             # нет. Слепота — ни то, ни другое, и остаётся человеку.
             return False
-        # Долг второй двери записывается ДО попытки её открыть (#1266), тем
-        # же способом, каким это уже делает асинхронный путь (owe_second_
-        # door, _close_a_run_without_a_report): строка-заглушка коммитится
-        # первой, и только потом идёт рискованный вызов (review_reach,
-        # счёт токенов, сетевая prepare_review_order). Без этого порядка
-        # падение ВНУТРИ open_second_door не оставляло свипу ничего, что
-        # повторить, — вторая дверь терялась навсегда, потому что строки не
-        # было вовсе. agent_id пуст здесь НЕ временно: ничего не создано и
-        # не оплачено, и count_review_dispatches (#1266) такую строку в шаг
-        # лестницы не считает.
-        stub_id = await repo.create_review_dispatch(
+        return await _owe_the_refused_call(
             db,
-            task_id=task_id,
-            submission_generation=generation,
-            agent_id="",
-            run_id="",
+            task,
+            detail,
             model=model_id,
             profile=profile,
-            reviewer_principal_id=expected_principal,
-            channel=CLOUD_CHANNEL,
+            principal_id=expected_principal,
+            replaces_dispatch_id=replaces_dispatch_id,
         )
-        await repo.owe_second_door(db, stub_id, detail)
-        await db.commit()
-        stub_row = await repo.get_review_dispatch_for_generation(
-            db, task_id, generation
-        )
-        stub = dict(stub_row) if stub_row is not None else None
-        if stub is None:  # pragma: no cover - defensive, row was just committed
-            return False
-        # Дальше долг разбирает ТОТ ЖЕ путь, что и асинхронный отказ:
-        # _settle_second_door сама решает, открывать ли дверь, и сама же
-        # закрывает строку. Успех отсюда виден тем же наблюдением, каким
-        # _second_door_already_opened судит повтор — живой или удавшийся
-        # локальный заказ по ЭТОМУ долгу, а не догадкой по пути, которым
-        # сюда пришли.
-        await _settle_second_door(db, stub, task_row=task)
-        opened = await _second_door_already_opened(db, stub)
-        # Заглушка была ТОЛЬКО страховкой от падения внутри вызова выше —
-        # раз мы досюда дошли без исключения, падения не было, и сама она
-        # больше не нужна ни свипу, ни счёту шагов. Не убрать её значило бы
-        # оставить облачную строку там, где по AC-3 #1252 её не бывает
-        # вовсе (ненастроенный путь — байт в байт как раньше) и там, где
-        # AC-1 #1252 требует ровно одну строку, локальную. Падение МЕЖДУ
-        # _settle_second_door и этим удалением не теряет долг: строка к
-        # тому моменту уже закрыта (done/failed) самой _settle_second_door,
-        # а следующий свип такую строку не трогает — то есть худшее, что
-        # оставляет несостоявшееся удаление, это лишняя закрытая строка в
-        # истории, не потерянная вторая дверь.
-        await repo.delete_review_dispatch(db, stub["id"])
-        await db.commit()
-        return opened
 
     # #1025: pin whose report this dispatch waits for, resolved from the
     # reviewer token at dispatch time (above, where the code was minted under
@@ -2122,6 +2102,7 @@ async def maybe_dispatch_review(
         model=model_id,
         profile=profile,
         reviewer_principal_id=expected_principal,
+        replaces_dispatch_id=replaces_dispatch_id,
     )
     profile_note = (
         f"профиль {profile} (один проход по диффу)"
@@ -2177,6 +2158,85 @@ async def maybe_dispatch_review(
         agent_id,
     )
     return True
+
+
+async def _owe_the_refused_call(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    detail: str,
+    *,
+    model: str,
+    profile: str,
+    principal_id: int | None,
+    replaces_dispatch_id: int | None,
+) -> bool:
+    """Синхронный отказ облака: долг второй двери и след для переспроса.
+
+    Вынесено из ``maybe_dispatch_review`` (#1242): та стоит на потолке в 60
+    операторов, а у этого пути появилась развилка.
+
+    Заглушка переживает вызов, если вторая дверь НЕ открылась (#1242). До
+    этого она удалялась всегда, и синхронный отказ без настроенного
+    локального пути не оставлял в базе ничего, кроме алерта: переспросу было
+    не за что зацепиться, и сдача стояла без отчёта навсегда — ровно так
+    #1162 и #1281 получили 22.09 «HTTP 429» и не получили повтора. Осевшая
+    заглушка (``failed``, пустой ``agent_id``) ничего не стоила и ступенью
+    лестницы не считается (``count_review_dispatches``); она — единственная
+    запись о том, что вызов был и сорвался.
+    """
+    task_id = int(task["id"])
+    generation = int(task.get("submission_generation") or 0)
+    # Долг второй двери записывается ДО попытки её открыть (#1266), тем
+    # же способом, каким это уже делает асинхронный путь (owe_second_
+    # door, _close_a_run_without_a_report): строка-заглушка коммитится
+    # первой, и только потом идёт рискованный вызов (review_reach,
+    # счёт токенов, сетевая prepare_review_order). Без этого порядка
+    # падение ВНУТРИ open_second_door не оставляло свипу ничего, что
+    # повторить, — вторая дверь терялась навсегда, потому что строки не
+    # было вовсе. agent_id пуст здесь НЕ временно: ничего не создано и
+    # не оплачено, и count_review_dispatches (#1266) такую строку в шаг
+    # лестницы не считает.
+    stub_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        agent_id="",
+        run_id="",
+        model=model,
+        profile=profile,
+        reviewer_principal_id=principal_id,
+        channel=CLOUD_CHANNEL,
+        replaces_dispatch_id=replaces_dispatch_id,
+    )
+    await repo.owe_second_door(db, stub_id, detail)
+    await db.commit()
+    stub_row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    stub = dict(stub_row) if stub_row is not None else None
+    if stub is None:  # pragma: no cover - defensive, row was just committed
+        return False
+    # Дальше долг разбирает ТОТ ЖЕ путь, что и асинхронный отказ:
+    # _settle_second_door сама решает, открывать ли дверь, и сама же
+    # закрывает строку. Успех отсюда виден тем же наблюдением, каким
+    # _second_door_already_opened судит повтор — живой или удавшийся
+    # локальный заказ по ЭТОМУ долгу, а не догадкой по пути, которым
+    # сюда пришли.
+    await _settle_second_door(db, stub, task_row=task)
+    opened = await _second_door_already_opened(db, stub)
+    # Открытая дверь: заглушка была ТОЛЬКО страховкой от падения внутри
+    # вызова выше, и AC-1 #1252 требует ровно одну строку, локальную.
+    # Падение МЕЖДУ _settle_second_door и этим удалением не теряет долг:
+    # строка к тому моменту уже закрыта самой _settle_second_door.
+    #
+    # Закрытая дверь (#1242): заглушка ОСТАЁТСЯ закрытой в failed. Это
+    # след сорвавшегося вызова, по которому свип переспрашивает облако
+    # (_ask_again_lost_reviews); удалить её значило вернуть случай 22.09 —
+    # отказ без отчёта и без повтора. Прежнее «ни одной строки» по AC-3
+    # #1252 уточнено этим: локального прогона по-прежнему нет, строка —
+    # облачная и ничего не стоившая.
+    if opened:
+        await repo.delete_review_dispatch(db, stub["id"])
+        await db.commit()
+    return opened
 
 
 @dataclass(frozen=True)
@@ -3048,12 +3108,22 @@ async def _dispatch_report(
     # был первым (индекс 0), и годный контрактный отчёт не опознавался своим
     # же заказом: прогон объявлялся упавшим, а закрытого заказа не
     # оставалось вовсе — то есть пустое ревью не могло дать автовердикт.
+    #
+    # #1242: заказ, ЗАМЕЩЁННЫЙ переспросом того же канала, ступени не
+    # занимает. Он кончился без отчёта, и повтор — продолжение той же
+    # ступени, а не следующая: без этого свежий ревьюер ждал бы второго
+    # отчёта принципала, а его первый отчёт оставался бы ничьим. Замена
+    # второй дверью (другой канал) сюда не попадает намеренно — у неё свой
+    # порядок и свой разбор (#1252).
+    channel = dispatch.get("channel") or CLOUD_CHANNEL
     dispatch_ids = await fetchall(
         db,
         "SELECT id FROM review_dispatches WHERE task_id = ? "
         "AND submission_generation = ? AND reviewer_principal_id = ? "
-        "AND channel = ? ORDER BY id",
-        (task_id, generation, expected, dispatch.get("channel") or CLOUD_CHANNEL),
+        "AND channel = ? AND id NOT IN (SELECT replaces_dispatch_id "
+        "FROM review_dispatches WHERE task_id = ? AND submission_generation = ? "
+        "AND channel = ? AND replaces_dispatch_id IS NOT NULL) ORDER BY id",
+        (task_id, generation, expected, channel, task_id, generation, channel),
     )
     order = [int(dict(r)["id"]) for r in dispatch_ids]
     try:
@@ -3336,8 +3406,13 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     - report arrived → cross-check tokens against the provider's usage
       (mismatch is an audit flag, never a mechanical block) → done;
     - run terminal, no report, grace expired → one loud alert → failed;
-    - run still going / API unreachable → leave for the next pass.
+    - run still going / API unreachable → leave for the next pass;
+    - the last order of a live submission failed without any report →
+      ask again, up to a per-generation ceiling (#1242).
     """
+    # #1242: переспрос — ДО разбора активных строк. Заказ, закрытый упавшим
+    # на этом проходе, переспрашивается на следующем, а не в ту же минуту.
+    await _ask_again_lost_reviews(db)
     for row in await repo.list_active_review_dispatches(db):
         dispatch = dict(row)
         task_id = dispatch["task_id"]
@@ -3649,15 +3724,7 @@ async def _second_door_after_run(
         # ложью про событие, которого не случилось. run_status для заглушки
         # несёт НАБЛЮДЁННУЮ причину отказа (_lost_call_detail), а не код
         # статуса рана, и печатается как есть, без обёртки «кончился».
-        cloud_refusal=(
-            f"провайдер отказал в создании агента: {run_status}"
-            if not (dispatch.get("agent_id") or "").strip()
-            else (
-                f"прогон облачного агента {dispatch['agent_id']} "
-                f"({dispatch.get('model') or 'модель не названа'}) кончился "
-                f"статусом {run_status} и отчёта не оставил"
-            )
-        ),
+        cloud_refusal=_cloud_refusal_text(dispatch, run_status),
         late_report_recheck=dispatch,
     )
     # Последнее слово — уже ПОСЛЕ попытки открыть дверь, а не только до неё
@@ -3667,6 +3734,213 @@ async def _second_door_after_run(
     # если СВОЙ отчёт этого заказа тем временем нашёлся, статус решает он, а
     # не путь, которым мы сюда пришли.
     return await _dispatch_report(db, int(task["id"]), generation, dispatch) is not None
+
+
+def _cloud_refusal_text(dispatch: dict[str, Any], run_status: Any) -> str:
+    """Наблюдённая причина, по которой облачный заказ отчёта не дал.
+
+    Один автор на два места: вторая дверь (#1252) и переспрос (#1242)
+    называют один и тот же сбой одними словами.
+    """
+    # #1266 раунд 2 (7a78080de93938ae): пустой agent_id здесь значит
+    # СИНХРОННЫЙ отказ на СОЗДАНИИ (заглушка долга из maybe_dispatch_
+    # review, а не прогон, дошедший до терминального статуса) — агента и
+    # рана не было вовсе, и текст «прогон... кончился статусом» был бы
+    # ложью про событие, которого не случилось. run_status для заглушки
+    # несёт НАБЛЮДЁННУЮ причину отказа (_lost_call_detail), а не код
+    # статуса рана, и печатается как есть, без обёртки «кончился».
+    if not (dispatch.get("agent_id") or "").strip():
+        return f"провайдер отказал в создании агента: {run_status}"
+    return (
+        f"прогон облачного агента {dispatch['agent_id']} "
+        f"({dispatch.get('model') or 'модель не названа'}) кончился "
+        f"статусом {run_status} и отчёта не оставил"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Переспрос несостоявшегося ревью (#1242)
+# ---------------------------------------------------------------------------
+#
+# Облачный заказ, не давший отчёта, — синхронный отказ (429, 400) или
+# прогон, дошедший до терминального статуса без отчёта, — до #1242 был
+# концом пути, если вторая дверь (#1252) не открылась: локальный путь не
+# настроен или его прогон не запустился. Сдача стояла в review без отчёта
+# навсегда. Переспрос живёт в свипе, а не рядом с ним: кандидат — последний
+# заказ поколения, облачный и упавший, у сдачи, которая всё ещё его ждёт.
+#
+# Чем он НЕ является. Не лестницей добора (#879): та поднимает профиль по
+# СУЩЕСТВУЮЩЕМУ неполному отчёту, переспрос срабатывает только там, где
+# отчёта этого поколения нет вовсе. Не обходом стража второй читки: повтор
+# идёт через maybe_dispatch_review без force_profile, то есть через тот же
+# страж; пропускает он его законно — код этой вершины никто не прочитал. И не
+# второй дверью: открытая дверь делает последним заказом локальный, и
+# переспрос облака её не дублирует.
+
+#: Сколько раз облако переспрашивается на ОДНО поколение сдачи. Не на
+#: задачу: пересдача — новый код и новый счёт. Два — потому что сбои, ради
+#: которых это заведено (429 по лимиту, упавший ран), разовые; постоянный
+#: сбой после двух повторов — вопрос к форме вызова, а не к числу попыток.
+REVIEW_ASK_AGAIN_MAX = 2
+
+#: Пауза между сбоем и переспросом, от создания упавшего заказа. Отказ 429 —
+#: это «не сейчас»; переспрос в ту же минуту купил бы тот же отказ.
+REVIEW_ASK_AGAIN_PAUSE_MINUTES = 10
+
+#: Метки записей, по которым переспрос считается и находится снова. Номер
+#: поколения внутри — по образцу NO_REVIEWER_MARK: счёт в пределах сдачи.
+#: Запись делается ДО вызова, поэтому попытка видна и тогда, когда вызов не
+#: оставил строки (слепой исход #1199, упавший процесс).
+ASK_AGAIN_MARK = "[переспрос ревью: сдача {generation}]"
+ASK_AGAIN_EXHAUSTED_MARK = "[переспрос ревью исчерпан: сдача {generation}]"
+
+
+async def _ask_again_lost_reviews(db: aiosqlite.Connection) -> None:
+    """Переспросить облако по сдачам, чей последний заказ упал без отчёта."""
+    rows = await fetchall(
+        db,
+        "SELECT d.* FROM review_dispatches d JOIN tasks t ON t.id = d.task_id "
+        "WHERE d.status = 'failed' AND d.channel = ? AND t.status = 'review' "
+        "AND t.submission_generation = d.submission_generation "
+        "AND d.id = (SELECT MAX(x.id) FROM review_dispatches x "
+        "WHERE x.task_id = d.task_id "
+        "AND x.submission_generation = d.submission_generation) "
+        "AND d.created_at <= datetime('now', ?) ORDER BY d.id",
+        (CLOUD_CHANNEL, f"-{REVIEW_ASK_AGAIN_PAUSE_MINUTES} minutes"),
+    )
+    for row in rows:
+        await _ask_again(db, dict(row))
+
+
+async def _ask_again(db: aiosqlite.Connection, failed: dict[str, Any]) -> None:
+    task_id = int(failed["task_id"])
+    generation = int(failed["submission_generation"])
+    # Отчёт этого поколения есть — любой, в том числе неполный или чужой:
+    # переспрос не покупается. Неполнота — предмет лестницы (#879).
+    if await repo.machine_reviews_of_generation(db, task_id, generation):
+        return
+    mark = ASK_AGAIN_MARK.format(generation=generation)
+    asked = await _count_marked_alerts(db, task_id, mark)
+    retried = await _count_retry_orders(db, task_id, generation)
+    cause = _cloud_refusal_text(failed, failed.get("run_status") or "не записан")
+    if asked >= REVIEW_ASK_AGAIN_MAX or asked > retried:
+        await _name_the_exhausted_retries(db, task_id, generation, asked, cause)
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"{mark} Переспрос ревью {asked + 1} из {REVIEW_ASK_AGAIN_MAX}: заказ "
+        f"#{failed['id']} отчёта не дал — {cause}. Отчёта этой сдачи нет "
+        "вовсе, поэтому ревьюер зовётся снова; ступень лестницы (#879) он "
+        "не съедает (#1242).",
+    )
+    await db.commit()
+    task_row = await repo.get_task(db, task_id)
+    branch = (dict(task_row).get("branch") or "").strip() if task_row else ""
+    if await maybe_dispatch_review(db, task_id, replaces_dispatch_id=int(failed["id"])):
+        return
+    await _name_a_cancelled_retry(db, task_id, generation, branch, asked + 1)
+
+
+async def _name_a_cancelled_retry(
+    db: aiosqlite.Connection, task_id: int, generation: int, branch: str, n: int
+) -> None:
+    """Назвать переспрос, отменённый последним словом перед тратой.
+
+    Запись о переспросе стоит ДО вызова и обещает ревьюера (находка
+    2007bee302b71bf4). Два отказа последнего слова своего алерта не пишут —
+    отчёт, успевший лечь, и сдача, сменившаяся за подготовку (находка
+    40a8fd8b727c82ec), — поэтому их называет переспрос. Остальные отказы
+    (конфигурация, политика, страж второй читки, слепой исход) диспетчер
+    называет сам, и второго объяснения им здесь не заводим.
+    """
+    if await repo.machine_reviews_of_generation(db, task_id, generation):
+        why = "отчёт этой сдачи успел лечь, пока заказ готовился"
+    elif not await _submission_still_live(db, {"id": task_id}, branch, generation):
+        why = "сдача сменилась, пока заказ готовился, — облако не зовётся"
+    else:
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        # Без метки: счёт попыток ведут записи о вызове, а не об отмене.
+        f"Переспрос ревью {n} отменён: {why}; второго ревьюера не покупали (#1242).",
+    )
+    await db.commit()
+
+
+async def _count_marked_alerts(
+    db: aiosqlite.Connection, task_id: int, mark: str
+) -> int:
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM task_updates WHERE task_id = ? "
+        "AND kind = 'alert' AND instr(content, ?) > 0",
+        (task_id, mark),
+    )
+    return int(dict(rows[0])["n"]) if rows else 0
+
+
+async def _count_retry_orders(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> int:
+    """Сколько облачных заказов поколения оставили переспросы.
+
+    Замена второй дверью — строка другого канала и сюда не входит. Меньше
+    записанных попыток — значит, какая-то попытка строки не оставила: слепой
+    исход (#1199), отказ конфигурации или политики, упавший процесс.
+    Повторять вслепую нельзя — это и есть «наивный повтор» #1199.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM review_dispatches WHERE task_id = ? "
+        "AND submission_generation = ? AND channel = ? "
+        "AND replaces_dispatch_id IS NOT NULL",
+        (task_id, generation, CLOUD_CHANNEL),
+    )
+    return int(dict(rows[0])["n"]) if rows else 0
+
+
+async def _name_the_exhausted_retries(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    asked: int,
+    cause: str,
+) -> None:
+    """Один алерт человеку на поколение: сколько раз спросили и что сорвалось."""
+    mark = ASK_AGAIN_EXHAUSTED_MARK.format(generation=generation)
+    if await _count_marked_alerts(db, task_id, mark):
+        return
+    # Находка c82b1af523ba9dd7: попытка без строки заказа — это не всегда
+    # слепой исход #1199. Отказ конфигурации, политики или стража второй
+    # читки тоже не оставляет строки, и его причина уже стоит в карточке
+    # алертом диспетчера. Переспрос исхода не знает — и не выдумывает его:
+    # останавливается (повтор ни одного из этих исходов не меняет, а слепой
+    # запрещает) и ссылается на алерт, который причину называет.
+    why = (
+        f"потолок {REVIEW_ASK_AGAIN_MAX} переспросов на сдачу исчерпан"
+        if asked >= REVIEW_ASK_AGAIN_MAX
+        else "прошлый переспрос не оставил заказа, причина — в алерте "
+        "после него (конфигурация, политика, страж второй читки, сменившаяся "
+        "сдача или ответ, который не дошёл, #1199); не зная исхода, хаб не "
+        "повторяет"
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"{mark} Ревью этой сдачи так и не состоялось: {why}. Переспросов: "
+        f"{asked}, последний упавший заказ — {cause}. Ещё одного ревьюера хаб "
+        "не покупает; решение за человеком. Если сбой один и тот же — смотреть "
+        "форму вызова, а не число попыток (#1242).",
+    )
+    await db.commit()
 
 
 # ---------------------------------------------------------------------------

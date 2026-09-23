@@ -2700,12 +2700,20 @@ async def get_review_dispatch_for_generation(
     Deliberately status-agnostic, unlike get_settled_review_dispatch: the
     profile is decided when the run is launched, and the report normally
     arrives while the dispatch is still 'active'.
+
+    One exception (#1242): a SETTLED sync-refusal stub (empty ``agent_id``,
+    no longer active or owed) is skipped. It now outlives the call as the
+    ask-again trace, and it never ran — its model and profile are what
+    would have been launched, not a fact about any reviewer, so the
+    auto-verdict's "which model reviewed" and the intake's profile must not
+    read it.
     """
     rows = list(
         await fetchall(
             db,
             "SELECT * FROM review_dispatches "
             "WHERE task_id=? AND submission_generation=? "
+            "AND (agent_id != '' OR status IN ('active', 'second_door')) "
             "ORDER BY id DESC LIMIT 1",
             (task_id, generation),
         )
@@ -2778,20 +2786,41 @@ async def count_review_dispatches(
       another). A sync cloud-create refusal writes a debt-tracking stub with
       an empty ``agent_id`` (#1266, ``owe_second_door`` on the sync path) —
       that costs nothing and never did, before or after this fix.
-    - ``replaces_dispatch_id IS NULL`` — the row is not a replacement. A
-      replacement continues the rung it replaces rather than opening a new
-      one; the row it replaces already counted (it had a real ``agent_id``).
+    - no PAID row up its ``replaces_dispatch_id`` chain — a replacement
+      continues the rung it replaces rather than opening a new one, and that
+      rung already counted where it was paid for.
 
     Two genuine cloud runs (LITE then a DEEP top-up) both have empty
     ``replaces_dispatch_id`` and non-empty ``agent_id`` — they still count as
     two and still hit ``REVIEW_LADDER_MAX_STEPS``.
+
+    #1242 sharpens the second rule: a replacement is free only when the row
+    it replaces was a PAID run. The ask-again pass replaces a sync-refusal
+    stub too, and that stub never counted — so the first real run of the
+    rung is the replacement itself, and skipping it would hand the ladder a
+    step it never paid for.
+
+    The paid row is looked for along the WHOLE ``replaces_dispatch_id``
+    chain, not only at the direct parent (finding b9943fc18e24a30c): paid run
+    failed → ask-again hit a 429 and left a free stub → the next ask-again
+    succeeded. The success's parent is the free stub, yet the rung was paid
+    two links up — counting it made one rung two, and the ladder refused its
+    DEEP top-up claiming the ceiling was hit. ``replaces_dispatch_id`` always
+    points to an earlier row, so the walk ends.
     """
     rows = await fetchall(
         db,
-        "SELECT COUNT(*) AS n FROM review_dispatches "
-        "WHERE task_id=? AND submission_generation=? "
-        "AND agent_id != '' AND replaces_dispatch_id IS NULL",
-        (task_id, generation),
+        "WITH RECURSIVE chain(start, parent) AS ("
+        "SELECT id, replaces_dispatch_id FROM review_dispatches "
+        "WHERE task_id=? AND submission_generation=? AND agent_id != '' "
+        "UNION ALL SELECT c.start, r.replaces_dispatch_id FROM chain c "
+        "JOIN review_dispatches r ON r.id = c.parent) "
+        "SELECT COUNT(*) AS n FROM review_dispatches d "
+        "WHERE d.task_id=? AND d.submission_generation=? AND d.agent_id != '' "
+        "AND NOT EXISTS (SELECT 1 FROM chain c "
+        "JOIN review_dispatches r ON r.id = c.parent "
+        "WHERE c.start = d.id AND r.agent_id != '')",
+        (task_id, generation, task_id, generation),
     )
     return int(dict(rows[0])["n"]) if rows else 0
 
