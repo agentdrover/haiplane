@@ -38,6 +38,7 @@ from hub import repository as repo
 from hub.services.gate_events import STEWARD_JUDGEMENT
 from hub.services.orchestration import PRACTICE_METRICS_DEFAULT_DAYS
 from hub.services.project_policy import DELEGATED_VERDICTS
+from hub.services.steward_corridor import names_clean, outcome_label, report_outcome
 
 log = logging.getLogger(__name__)
 
@@ -258,6 +259,90 @@ def steward_section_state(payload: dict) -> str:
     return MEASURED if STEWARD_SECTION_KEY in payload else UNMEASURED
 
 
+def _report_outcome_of(mr) -> dict:
+    """Ступень лестницы исходов у отчёта, стоящего за автовердиктом (#1234).
+
+    Отсутствие отчёта названо словом, а не пустым словарём: автовердикт без
+    отчёта и автовердикт по чистому отчёту — разные вещи, и пустое место
+    рядом с задачей читается как «всё в порядке» ровно так же, как читались
+    «0 подтверждённых».
+    """
+    if mr is None:
+        return {"state": "absent", "label": "отчёта нет", "names_clean": False}
+    row = dict(mr)
+
+    def _list(key: str) -> list:
+        raw = row.get(key)
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw or "[]")
+            except ValueError:
+                return []
+            return parsed if isinstance(parsed, list) else []
+        return list(raw or [])
+
+    # ``incomplete`` хранится как 0/1/NULL, и NULL значит «полнота не
+    # заявлена», а не «прогон полный» (#549): ``is True`` здесь тот же приём,
+    # что в модели представления.
+    outcome = report_outcome(
+        confirmed=_list("findings_confirmed"),
+        unresolved=_list("unresolved"),
+        incomplete=bool(row.get("incomplete"))
+        if row.get("incomplete") is not None
+        else False,
+        raw_count=int(row.get("raw_count") or 0),
+    )
+    return {
+        "state": "present",
+        "outcome": outcome,
+        "label": outcome_label(outcome),
+        "names_clean": names_clean(outcome),
+    }
+
+
+async def _report_of_generation(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int | None,
+    verdict_at: str | None = None,
+):
+    """Отчёт ТОГО поколения, о котором вынесен вердикт (#1234).
+
+    Здесь стоял ``get_latest_machine_review`` — «самый свежий отчёт задачи».
+    Свежесть и поколение события совпадают ровно до первого расхождения: если
+    после вердикта, но до полуночного дайджеста, ляжет ещё один отчёт (добор
+    лестницы #879 кладёт второй прямо в то же поколение, пересдача — в
+    следующее), дайджест припишет более раннему вердикту чужую ступень и
+    чужого ревьюера. Это ровно та подмена, против которой написан весь
+    раздел: под автовердиктом по неразрешённым находкам показался бы «clean»
+    от следующего, чистого отчёта.
+
+    Поколение у события своё — ``submission_generation`` пишется вместе с
+    вердиктом, — и берётся отсюда, а не из сегодняшнего состояния задачи.
+
+    Поколения не оказалось (событие старше поля) — отчёт НЕ подбирается по
+    свежести: «не знаю, о каком диффе вердикт» отвечается отсутствием отчёта,
+    и дайджест печатает «отчёта нет». Догадка здесь дороже пустоты — пустота
+    видна, а подставленный чужой отчёт читается как свой.
+    """
+    if not generation:
+        return None
+    rows = await repo.machine_reviews_of_generation(db, task_id, int(generation))
+    # Одного поколения МАЛО. Лестница добора (#879) кладёт в одно поколение
+    # ДВА отчёта, и «последний из поколения» снова оказывается не тем: второй
+    # отчёт, легший ПОСЛЕ вердикта, приписывал более раннему вердикту свою
+    # ступень и своего ревьюера — тот же дефект, что и выбор по свежести,
+    # только на один шаг уже.
+    #
+    # Отсекается временем СОБЫТИЯ: вердикт мог опираться только на отчёт,
+    # который к тому моменту уже существовал. Отчёты и события пишутся одной
+    # базой в одном формате времени (``datetime('now')``), поэтому сравнение
+    # строк здесь — сравнение моментов, а не догадка о формате.
+    if verdict_at:
+        rows = [r for r in rows if str(dict(r).get("created_at") or "") <= verdict_at]
+    return rows[-1] if rows else None
+
+
 def self_approvals_state(payload: dict) -> str:
     """Считал ли этот дайджест самоодобрения стюарда вообще (#1231).
 
@@ -451,13 +536,28 @@ async def generate_due_digests(
                 # Model diversity (#758): the digest shows WHO wrote and WHO
                 # reviewed — the pair the monoculture rule compares.
                 task_row = await repo.get_task(db, event["task_id"])
-                mr = await repo.get_latest_machine_review(db, event["task_id"])
+                # Отчёт СВОЕГО поколения, а не самый свежий (#1234): иначе
+                # отчёт, легший после вердикта, подменяет собой тот, под
+                # которым вердикт вынесен.
+                mr = await _report_of_generation(
+                    db,
+                    event["task_id"],
+                    payload.get("submission_generation"),
+                    event["created_at"],
+                )
                 entry["models"] = {
                     "implementer": (
                         dict(task_row).get("submission_model", "") if task_row else ""
                     ),
                     "reviewer": (dict(mr).get("model", "") if mr else ""),
                 }
+                # #1234: дайджест показывал автовердикт числом и молчал о том,
+                # ЧТО стояло в отчёте под ним. Отчёт с нулём подтверждённых и
+                # непустым unresolved попадал сюда неотличимо от чистого — а
+                # это ровно те отчёты, которые 09.09.2026 пришлось разбирать
+                # вручную. Ступень берётся из той же функции, что и на
+                # карточке: одно правило на трёх читателей.
+                entry["machine_review"] = _report_outcome_of(mr)
                 verdicts.append(entry)
             elif _is_self_approval(dict(event), payload):
                 self_approvals.append(

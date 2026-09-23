@@ -231,6 +231,12 @@ class NoopGitOps:
         """No git here — the section must read this as "could not look" (#601)."""
         return None
 
+    async def delta_without_base(
+        self, repo: str, base: str, prev: str, current: str
+    ) -> str | None:
+        """No git here — origin is unknown, so the whole delta is read (#1249)."""
+        return None
+
     async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None:
         """No git here — there is no rules file to read (#873)."""
         return None

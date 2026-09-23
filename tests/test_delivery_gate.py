@@ -3573,14 +3573,6 @@ TRANSIENT_SHARED_HINTS: dict[str, tuple[str, str]] = {
     ),
 }
 
-# Префиксы, чья подсказка унаследована от чужой ветки, — находка на develop.
-TRANSIENT_HINT_FINDINGS: dict[str, str] = {
-    MERGE_UNCONFIRMED: (
-        "драфт #1276: мерж состоялся, CI уже зелёный, а лесенка "
-        "done-flow говорит «отчитайтесь снова, когда CI станет зелёным»"
-    ),
-}
-
 
 async def _transient_hint(db: aiosqlite.Connection, monkeypatch, prefix: str) -> str:
     """Подсказка, которую лесенка done-flow даёт отказу с этим префиксом."""
@@ -3631,12 +3623,12 @@ async def test_every_transient_gate_prefix_has_its_own_hint(
     ci_hints = {hints[p] for p in TRANSIENT_GATE_PREFIXES if p in ci_family}
     assert ci_hints, "в кортеже нет ни одного CI-префикса — правило не о чем"
 
-    for key in {*TRANSIENT_SHARED_HINTS, *TRANSIENT_HINT_FINDINGS}:
+    for key in TRANSIENT_SHARED_HINTS:
         assert key in TRANSIENT_GATE_PREFIXES, f"{key!r} уже не в кортеже"
 
     by_hint: dict[str, list[str]] = {}
     for prefix in TRANSIENT_GATE_PREFIXES:
-        if prefix in ci_family or prefix in TRANSIENT_HINT_FINDINGS:
+        if prefix in ci_family:
             continue
         assert hints[prefix] not in ci_hints, (
             f"префикс {prefix!r} унаследовал подсказку CI: {hints[prefix]!r} — "
@@ -3653,22 +3645,20 @@ async def test_every_transient_gate_prefix_has_its_own_hint(
             )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#1271 находка на develop, драфт #1276: MERGE_UNCONFIRMED "
-    "получает в done-flow фразу про CI",
-)
-async def test_transient_hint_findings_are_resolved(
+async def test_merge_unconfirmed_hint_names_the_merge_not_the_ci(
     db: aiosqlite.Connection, monkeypatch
 ) -> None:
-    from hub.integrations.protocols import CIProbeOutcome
+    """#1276 AC-1: мерж прошёл, а попадание в базу не подтверждено.
 
-    ci_hint = await _transient_hint(
-        db, monkeypatch, f"ci_{CIProbeOutcome.pending.value}"
-    )
-    for prefix in TRANSIENT_HINT_FINDINGS:
-        assert await _transient_hint(db, monkeypatch, prefix) != ci_hint
+    Ждать тут нечего, кроме следующего цикла: CI был зелёным до мержа, и
+    «отчитайтесь снова, когда CI станет зелёным» — ложь, толкающая к
+    пересдаче, которая сбросит вердикт (#612).
+    """
+    from hub.services.orchestration import MERGE_UNCONFIRMED_WAIT_HINT
+
+    hint = await _transient_hint(db, monkeypatch, MERGE_UNCONFIRMED)
+    assert hint == MERGE_UNCONFIRMED_WAIT_HINT
+    assert "CI станет зелёным" not in hint
 
 
 async def test_a_base_that_moved_between_probe_and_push_refuses_the_stale_resolution(
