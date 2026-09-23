@@ -3450,6 +3450,15 @@ STACKED_BASE_WAIT_HINT = (
     "нужно и вредно — CI уже зелёный, новых коммитов нет, а пересдача сбросит "
     "вердикт (#612). Если ждать нечего, доставьте основание раньше."
 )
+# #1276: the merge itself went through (CI was green before it), only its
+# landing in the base branch is not confirmed yet. The next cycle confirms it;
+# a resubmission would stale the verdict for nothing (#612).
+MERGE_UNCONFIRMED_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: мерж прошёл, "
+    "не подтверждено только его попадание в базовую ветку — хаб проверит это "
+    "следующим циклом. Ждать CI не нужно, он был зелёным до мержа; "
+    "пересдавать НЕ нужно — новых коммитов нет, пересдача сбросит вердикт (#612)."
+)
 BASE_AUTOMERGE_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: гейт сам слил "
     "базу в ветку, разрешил хвостовые добавления и запушил — доставка "
@@ -4202,6 +4211,11 @@ async def _deliver_completed_pair_task(
                 # the verdict (#612) — the very trap PR_DRAFT_WAIT_HINT exists
                 # to avoid, re-opened for the neighbour added beside it.
                 cause = STACKED_BASE_WAIT_HINT
+            elif detail.startswith(MERGE_UNCONFIRMED):
+                # #1276, found by the #1271 invariant: the same inheritance as
+                # #1186 — the merge happened, and the CI sentence below would
+                # send the executor to wait for a check that was green already.
+                cause = MERGE_UNCONFIRMED_WAIT_HINT
             elif delivery_pr.established:
                 cause = (
                     "Это временное состояние, решение человека не требуется: "
