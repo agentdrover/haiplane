@@ -1,3 +1,4 @@
+{% from "partials/pr_disposition.html" import pr_disposition_select, pr_accept_confirm %}
 <article class="kanban-card" id="kanban-card-{{ t.id }}">
     <a class="card-link" href="/tasks/{{ t.id }}" title="#{{ t.id }} {{ t.title }}">
         <span class="card-id">#{{ t.id }}</span>{{ t.title[:48] }}{% if t.title|length > 48 %}…{% endif %}
@@ -56,9 +57,13 @@
     </div>
     {% elif t.status.value == 'needs_decision' %}
     <div class="card-actions">
+        {{ pr_disposition_select(t, 'card-pr-disposition-' ~ t.id, '', 'card-accept-' ~ t.id) }}
         <button class="btn btn-success btn-xs"
+                id="card-accept-{{ t.id }}"
                 hx-post="/tasks/{{ t.id }}/web-decide"
                 hx-vals='{"action": "accept"}'
+                hx-include="#card-pr-disposition-{{ t.id }}"
+                hx-confirm="{{ pr_accept_confirm(t, default_pr_disposition(t)) }}"
                 hx-target="#kanban-card-{{ t.id }}"
                 hx-swap="outerHTML">Accept</button>
         <a href="/tasks/{{ t.id }}" class="btn btn-warning btn-xs">Review</a>

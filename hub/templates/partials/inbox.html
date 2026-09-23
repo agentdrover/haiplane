@@ -1,3 +1,4 @@
+{% from "partials/pr_disposition.html" import pr_disposition_select, pr_accept_confirm %}
 {% set undelivered = undelivered if undelivered is defined else [] %}
 {# #1038: не список задач, а счёт находок — они переживают статус задачи и
    поэтому не собираются ни одним разделом выше. #}
@@ -183,12 +184,18 @@
             <span class="badge badge-needs_decision">arbiter report</span>
         </div>
         <div class="inbox-item-actions">
+            {{ pr_disposition_select(t, 'inbox-pr-disposition-' ~ t.id, '', 'inbox-accept-' ~ t.id) }}
+            {# inbox_project: ответ перерисует секцию «Completed, PR still open»
+               в ТОМ ЖЕ проекте, что на экране (#626), — принятие без доставки
+               кладёт туда строку, и она не должна ждать перезагрузки. #}
             <button class="btn btn-success btn-xs"
+                    id="inbox-accept-{{ t.id }}"
                     hx-post="/tasks/{{ t.id }}/web-decide"
-                    hx-vals='{"action": "accept"}'
+                    hx-vals='{"action": "accept", "from_inbox": "true", "inbox_project": {{ (filter_project or "")|tojson }}}'
+                    hx-include="#inbox-pr-disposition-{{ t.id }}"
                     hx-target="#inbox-task-{{ t.id }}"
                     hx-swap="outerHTML"
-                    hx-confirm="Accept #{{ t.id }} as completed?">Accept</button>
+                    hx-confirm="{{ pr_accept_confirm(t, default_pr_disposition(t)) }}">Accept</button>
             <a href="/tasks/{{ t.id }}" class="btn btn-warning btn-xs">Review &amp; Decide</a>
         </div>
     </article>
@@ -280,72 +287,9 @@
 </section>
 {% endif %}
 
-{% if undelivered %}
-<section class="inbox-group inbox-undelivered">
-    <h3 class="inbox-group-title">
-        {# Одно определение «непризнанных» на файл — вверху. Второе, своё,
-           уже разошлось бы с общим счётом при первой же правке. #}
-        ⚠ Completed, PR still open <span class="inbox-count inbox-count-danger">{{ undelivered_unacked|length }}</span>
-    </h3>
-    {% for d in undelivered %}
-    <article class="inbox-item" id="inbox-undelivered-{{ d.task_id }}">
-        <div class="inbox-item-header">
-            <a href="/tasks/{{ d.task_id }}" class="inbox-item-link">#{{ d.task_id }} {{ d.title[:60] }}{% if d.title|length > 60 %}…{% endif %}</a>
-            <span class="badge {% if d.acknowledged_now %}badge-muted{% else %}badge-failed{% endif %}">PR #{{ d.pr_number }} открыт</span>
-        </div>
-        <div class="inbox-item-meta">
-            расхождению {{ d.age_hours }} ч{% if d.accepted_via %} · принято через {{ d.accepted_via }}{% endif %}{% if d.disposition %} · владелец: {{ d.disposition }}{% else %} · судьба PR не выбрана{% endif %}
-        </div>
-        <div class="inbox-item-desc">{{ d.reason }}</div>
-        {% if d.acknowledged_now %}
-        {# Признанное расхождение не исчезает из списка: заткнуть можно,
-           стереть нельзя. Оно лишь перестаёт кричать — и видно, ЧЬЁ это
-           решение и почему, иначе тишина неотличима от забывчивости.
-           Спрашиваем acknowledged_now, а не сам факт признания: решение
-           относится к ФАКТУ, и если факт сменился, строке снова нужна кнопка,
-           иначе она кричит в ленту и молчит на доске одновременно (#294). #}
-        <div class="inbox-item-meta">
-            признано законным{% if d.acknowledged_by %} ({{ d.acknowledged_by }}){% endif %}: {{ d.ack_reason }}
-        </div>
-        <div class="inbox-item-actions">
-            <a href="/tasks/{{ d.task_id }}" class="btn btn-secondary btn-xs">Открыть</a>
-        </div>
-        {% else %}
-        {% if d.acknowledged_at %}
-        {# Прежнее решение не прячем, даже когда оно перестало применяться:
-           иначе человек видит, что строка снова кричит, и не понимает почему,
-           а причину для новой формы вводит вслепую. Тишина о своём же
-           суждении неотличима от того, что доска его потеряла (#294). #}
-        <div class="inbox-item-meta">
-            признавалось для другого факта{% if d.acknowledged_by %} ({{ d.acknowledged_by }}){% endif %}: {{ d.ack_reason }} — обстоятельства изменились, решение нужно принять заново
-        </div>
-        {% endif %}
-        <div class="inbox-item-actions">
-            <a href="/tasks/{{ d.task_id }}" class="btn btn-warning btn-xs">Разобрать</a>
-        </div>
-        {# Признание стоит здесь, а не на отдельной странице: решать «так и
-           задумано» имеет смысл там, где видно возраст и номер PR. Причина —
-           обязательное поле, потому что признание без причины есть
-           выключатель, а не решение. #}
-        <form method="post" action="/tasks/{{ d.task_id }}/web-acknowledge-delivery"
-              class="inbox-item-actions inbox-ack-form">
-            {# Фильтр проекта переживает нажатие — так же, как его переживает
-               batch-approve выше и ссылка «Разобрать» ниже. Без этого поля
-               человек, разбирающий расхождения по одному проекту, после
-               каждого признания оказывается в общем списке и ищет следующую
-               строку заново (#1210). Слаг едет как ДАННЫЕ, а не как адрес:
-               обработчик подставляет его в один известный путь. #}
-            <input type="hidden" name="return_project" value="{{ filter_project or '' }}">
-            <input type="text" name="reason" required minlength="3" maxlength="1000"
-                   class="inbox-ack-reason"
-                   placeholder="Почему это законно — без причины не признать">
-            <button type="submit" class="btn btn-secondary btn-xs">Признать законным</button>
-        </form>
-        {% endif %}
-    </article>
-    {% endfor %}
-</section>
-{% endif %}
+<div id="inbox-undelivered">
+{% include "partials/inbox_undelivered.html" %}
+</div>
 
 {% if unjudged_findings.findings %}
 <section class="inbox-group inbox-unjudged-findings">
