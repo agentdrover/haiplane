@@ -3909,14 +3909,17 @@ async def test_automerge_validates_with_a_command_the_host_can_run(
     import os
     import shutil
 
-    git_dir = os.path.dirname(shutil.which("git") or "")
-    assert git_dir, "сцене нужен git"
-    if shutil.which("uv", path=git_dir):
-        pytest.skip("uv лежит рядом с git — среду без uv здесь не собрать")
+    real_git = shutil.which("git")
+    assert real_git, "сцене нужен git"
+    # PATH сервиса на проде: git есть, uv нет. Каталог с одним git.
+    host_bin = tmp_path / "host-bin"
+    host_bin.mkdir()
+    os.symlink(real_git, host_bin / "git")
+    assert shutil.which("uv", path=str(host_bin)) is None
     g, task_id, workdir, pinned = await _automerge_on_real_git(
         db, monkeypatch, tmp_path
     )
-    monkeypatch.setenv("PATH", git_dir)
+    monkeypatch.setenv("PATH", str(host_bin))
     author_runs = _spy_on_author_commands(monkeypatch)
 
     await _report_done(db, task_id)
