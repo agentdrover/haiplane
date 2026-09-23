@@ -10392,3 +10392,60 @@ async def test_several_reports_of_one_generation_fold_into_their_union(
     await _generation_with_findings(db, task_id, 1, confirmed=[a, b])
     trajectory = await finding_trajectory(db, task_id, 2)
     assert trajectory.counts == (2,), "повтор того же отчёта — не сумма 4"
+
+
+async def _self_report(db, task_id: int, generation: int, size: int) -> None:
+    """Самоотчёт исполнителя о своей работе: не независимое чтение."""
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        harness_skill="deep-review",
+        model="claude-fable-5",
+        raw_count=size,
+        findings_confirmed=json.dumps(_layer(generation, size), ensure_ascii=False),
+        self_reviewed=True,
+        submitted_by="dev-agent",
+    )
+    await db.commit()
+
+
+async def test_a_self_report_is_neither_a_point_nor_a_reset_of_the_trajectory(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1255, находка e6250c505eb42e95, следствие 1: самоотчёт — не сброс.
+
+    Тот же признак, которым страж новизны не считает самоотчёт чтением:
+    полный самоотчёт с нулём находок не снимает остановку.
+    """
+    from hub.services.review_dispatch import findings_stopped_converging
+
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-s"}, "run": {"id": "r"}}))
+
+    async def _stopped(task_id: int, generation: int) -> bool:
+        await _next_submission(db, task_id, generation)
+        return await findings_stopped_converging(
+            db, dict(await repo.get_task(db, task_id))
+        )
+
+    task_id = await _submitted(client, db, "spike-1255-self-reset")
+    await _walk_counts(db, task_id, [3, 3, 3])
+    await _self_report(db, task_id, 4, 0)
+    assert await _stopped(task_id, 5) is True, "чистый самоотчёт — не схождение"
+
+
+async def test_flat_self_reports_do_not_stop_the_first_independent_order(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1255, находка e6250c505eb42e95, следствие 2: самоотчёт — не точка."""
+    from hub.services.review_dispatch import findings_stopped_converging
+
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-s"}, "run": {"id": "r"}}))
+    task_id = await _submitted(client, db, "spike-1255-self-point")
+    for generation in (1, 2, 3):
+        await _self_report(db, task_id, generation, 3)
+    await _next_submission(db, task_id, 4)
+    task = dict(await repo.get_task(db, task_id))
+    assert await findings_stopped_converging(db, task) is False, (
+        "плоские самоотчёты не останавливают первый независимый заказ"
+    )

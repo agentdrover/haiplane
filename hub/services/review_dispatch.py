@@ -1370,6 +1370,14 @@ async def _this_code_was_already_read(
     return True
 
 
+#: Отчёт — независимое чтение, а не самоотчёт исполнителя о своей работе.
+#: Одно условие на всех читателей machine_reviews, которым это важно: страж
+#: новизны не считает самоотчёт покрытием кода (#1011, #1025), траектория
+#: несходимости (#1255) не берёт его ни точкой, ни сбросом. Второй редакции
+#: этого правила не заводим. Псевдоним таблицы в запросе — ``mr``.
+INDEPENDENT_READ = "COALESCE(mr.self_reviewed, 0) = 0"
+
+
 async def _report_already_covers_this_sha(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> int | None:
@@ -1430,7 +1438,7 @@ async def _report_already_covers_this_sha(
         # диспетчер как выполненный (#1011, #1025) — здесь он закрывал бы
         # его ещё до старта. «Код прочитан» имеет смысл только про того,
         # кто читал его со стороны.
-        "AND COALESCE(mr.self_reviewed, 0) = 0",
+        f"AND {INDEPENDENT_READ}",
         (task_id, generation),
     )
     for row in rows:
@@ -4016,9 +4024,13 @@ async def finding_trajectory(
     """
     rows = await fetchall(
         db,
-        "SELECT submission_generation, findings_confirmed, unresolved, incomplete "
-        "FROM machine_reviews WHERE task_id=? AND submission_generation < ? "
-        "ORDER BY submission_generation, id",
+        "SELECT mr.submission_generation, mr.findings_confirmed, mr.unresolved, "
+        "mr.incomplete FROM machine_reviews mr "
+        "WHERE mr.task_id=? AND mr.submission_generation < ? "
+        # Самоотчёт — не чтение со стороны: ни точка траектории, ни сброс её
+        # хвоста чистым нулём (находка e6250c505eb42e95).
+        f"AND {INDEPENDENT_READ} "
+        "ORDER BY mr.submission_generation, mr.id",
         (task_id, before_generation),
     )
     per_generation: dict[int, set[str]] = {}
