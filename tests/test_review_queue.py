@@ -522,3 +522,81 @@ async def test_every_surface_reads_one_queue(
     monkeypatch.setattr(review_queue, "review_queue", AsyncMock(return_value=sentinel))
     assert (await client.get("/api/review-queue")).json()["note"] == sentinel.note
     assert sentinel.note in (await client.get("/review-queue")).text
+
+
+def _queue_text(rows: list[dict[str, Any]]) -> str:
+    """Human output of ``oc-hub review-queue`` over a canned API answer."""
+    from hub import cli
+
+    out = StringIO()
+    with (
+        patch.object(cli, "_api", MagicMock(return_value={"rows": rows})),
+        patch("sys.stdout", new=out),
+    ):
+        args = cli.build_parser().parse_args(["review-queue"])
+        assert args.func(args) == 0
+    return out.getvalue()
+
+
+def _queue_row(**over: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "task_id": 7,
+        "title": "t",
+        "status": "review",
+        "submission_generation": 1,
+        "report_status": "present",
+        "findings_confirmed": 0,
+        "findings_unresolved": 0,
+        "readiness": "ready_sha_unverified",
+        "waiting_minutes": 5,
+    }
+    row.update(over)
+    return row
+
+
+def test_the_human_line_names_why_sha_is_not_a_match() -> None:
+    """Находка c80a9b7c: четыре разных unknown печатались одинаково.
+
+    После OBSERVED_TIP_MAX_AGE_MINUTES вершина обнуляется, и причина живёт
+    только в sha_check_reason — страница кладёт её в title, --json её несёт,
+    а человеческая строка печатала голое «sha unknown».
+    """
+    reason = "последнее наблюдение вершины 45 мин назад — старше 30 мин"
+    text = _queue_text(
+        [
+            _queue_row(
+                sha_check="unknown",
+                sha_check_reason=reason,
+                tip_observed_minutes_ago=None,
+            )
+        ]
+    )
+    assert f"sha unknown ({reason})" in text, text
+
+
+def test_a_fresh_observation_is_named_once() -> None:
+    """Свежее наблюдение: минуты называются один раз, match не зашумлён."""
+    fresh = "наблюдение вершины 3 мин назад. вершина ветки совпадает со сдачей"
+    matched = _queue_text(
+        [
+            _queue_row(
+                sha_check="match",
+                sha_check_reason=fresh,
+                tip_observed_minutes_ago=3,
+            )
+        ]
+    )
+    assert "sha match (наблюдение 3 мин назад)" in matched, matched
+    assert "совпадает со сдачей" not in matched, matched
+
+    diverged = _queue_text(
+        [
+            _queue_row(
+                sha_check="diverged",
+                sha_check_reason="наблюдение вершины 3 мин назад. ветка ушла",
+                tip_observed_minutes_ago=3,
+            )
+        ]
+    )
+    assert "ветка ушла" in diverged, diverged
+    assert diverged.count("3 мин назад") == 1, diverged

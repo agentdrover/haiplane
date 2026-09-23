@@ -1126,7 +1126,11 @@ def _review_queue_line(row: dict) -> str:
     if readiness == "ready_sha_unverified":
         readiness = "ready, sha не проверен"
     sha = f"sha {row.get('sha_check')}"
-    if row.get("tip_observed_minutes_ago") is not None:
+    # Not a match: the reason says why, and when the tip is fresh it already
+    # opens with the observation age — so it replaces the minutes, not joins them.
+    if row.get("sha_check") != "match" and row.get("sha_check_reason"):
+        sha += f" ({row['sha_check_reason']})"
+    elif row.get("tip_observed_minutes_ago") is not None:
         sha += f" (наблюдение {row['tip_observed_minutes_ago']} мин назад)"
     return (
         f"[{readiness}] #{row['task_id']} {row.get('title', '')} — "
