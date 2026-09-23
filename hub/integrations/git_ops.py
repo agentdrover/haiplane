@@ -885,13 +885,21 @@ class GitOpsIntegration:
         one submitted. The order is a property of the branches, so ask git
         about it directly.
 
-        Returns one of ``STACK_ANCESTRY_*``: the head is the descendant (the
-        other branch merges first), the head is the ancestor (the head merges
-        first), the two are unrelated by ancestry (no order to name), or the
-        question could not be answered. Never raises and never guesses: an
-        unresolvable ref, an unreadable repository or a commit this clone does
-        not carry is ``unknown``, which the caller must report as "order not
-        determined" rather than fall back to a side.
+        Returns one of ``STACK_ANCESTRY_*``, each named by its value:
+
+        - ``head_is_descendant`` — the head stands on the other branch; the
+          other branch merges first.
+        - ``head_is_ancestor`` — the other branch stands on the head; the head
+          merges first.
+        - ``same_tip`` — both names point at one commit (#1193): each branch
+          IS the other's history, so there is no order to name, and the caller
+          must not word it as ``unrelated``, whose fact is the opposite.
+        - ``unrelated`` — neither branch is in the other's history; no order
+          to name.
+        - ``unknown`` — the question could not be answered. Never raises and
+          never guesses: an unresolvable ref, an unreadable repository or a
+          commit this clone does not carry lands here, and the caller must
+          report "order not determined" rather than fall back to a side.
         """
         if repo is None:
             reason = await _default_workspace_error()
