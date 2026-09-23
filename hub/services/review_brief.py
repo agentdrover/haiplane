@@ -34,6 +34,7 @@ from hub.models import (
     ACTestResultView,
     CallSiteEntry,
     CallSiteSection,
+    OnlyTestsOutcomeView,
     CIRunReportState,
     DiffBaseState,
     EvidenceCoverage,
@@ -177,6 +178,27 @@ async def build_call_sites_section(
             for s in report.symbols
         ],
     )
+
+
+def _read_only_tests_back(section: CallSiteSection, machine_review) -> None:
+    """Per only_tests symbol, what the CURRENT report answered (#1254).
+
+    The symbols come from the section itself — one source, call_sites.analyse.
+    A report of an older generation answers nothing about this code.
+    """
+    named = (
+        [e.symbol for e in section.entries if e.state == call_sites.ONLY_TESTS]
+        if section.status == call_sites.ANALYSED
+        else None
+    )
+    current = machine_review if machine_review and machine_review.is_current else None
+    readout = call_sites.only_tests_readout(named, current)
+    section.only_tests_state = readout.state
+    section.only_tests_summary = readout.summary()
+    section.only_tests = [
+        OnlyTestsOutcomeView(symbol=o.symbol, outcome=o.outcome, call_path=o.call_path)
+        for o in readout.outcomes
+    ]
 
 
 async def build_review_brief(
@@ -417,6 +439,7 @@ async def build_review_brief(
     # #1266 (round 2, c0babbdf6d557c91): the top-level field is the SAME
     # object review_report just built — not a second construction of it.
     machine_review = brief_review_report.machine_review
+    _read_only_tests_back(call_sites_section, machine_review)
 
     # #890: scope accepted at submission, newest first. Read from the feed
     # rather than a column: the growth IS an event, and an event that only

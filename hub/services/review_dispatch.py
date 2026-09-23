@@ -45,7 +45,7 @@ from hub.models import (
     INCOMPLETE_REASON_PROFILE,
     RiskClass,
 )
-from hub.services import project_policy
+from hub.services import call_sites, project_policy
 from hub.services.model_family import family
 from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
 
@@ -835,6 +835,7 @@ def _review_prompt(
     diff_block: str,
     prepass_block: str,
     delivery_block: str = "",
+    only_tests_block: str = "",
 ) -> str:
     common = (
         f"Ты — независимый код-ревьюер задачи #{task_id} хаба Haiplane "
@@ -849,6 +850,9 @@ def _review_prompt(
         # And the prepass (#875): both profiles pay model prices for what a
         # linter already proved, and the expensive one pays them per pass.
         f"{prepass_block}\n\n"
+        # #1254: symbols only tests call, as a question with two answers.
+        # Empty adds nothing, so an order without candidates is unchanged.
+        + only_tests_block
         # #1238: and the order of attempts before "the environment refused".
         # Both profiles get it: the deep harness lost the test dimension on
         # exactly the same missing tool as a cheap one would.
@@ -1492,6 +1496,27 @@ class ReviewOrder:
     #: отмерить срок заново, а для этого нужен сам код (#1208). Пусто там, где
     #: кода не выдавали: открытый режим, отозванный токен.
     access_code: str = ""
+    #: #1254: символы, которых вне tests/ не зовёт никто, — названные в
+    #: ``prompt`` как предмет проверки. Пусто — ни одного не названо.
+    only_tests: tuple[str, ...] = ()
+
+
+async def _only_tests_of(
+    ctx: tuple[str, str] | None, diff: str | None
+) -> list[call_sites.SymbolReport]:
+    """Кандидаты only_tests по диффу сдачи (#1254); пусто, если не смотрели.
+
+    Источник один — ``call_sites.analyse``, тот же, что у брифа. Неудача
+    разбора заказ не роняет: без кандидатов он остаётся прежним.
+    """
+    if ctx is None or not diff:
+        return []
+    try:
+        report = await asyncio.to_thread(call_sites.analyse, ctx[0], diff)
+    except Exception as exc:  # noqa: BLE001 - советующий блок, не гейт
+        log.warning("only_tests: call-site walk failed: %s", exc)
+        return []
+    return call_sites.only_tests_symbols(report) or []
 
 
 async def prepare_review_order(
@@ -1545,6 +1570,7 @@ async def prepare_review_order(
     from hub.services import review_evidence
 
     prepass = await review_evidence.prepass_state(db, task)
+    only_tests = await _only_tests_of(ctx, diff)
     hub_base = instance_base_url().rstrip("/")
     code = await _access_code(db, task_id, generation, principal_id)
     return ReviewOrder(
@@ -1560,11 +1586,13 @@ async def prepare_review_order(
             diff_block,
             review_evidence.prepass_block(prepass),
             _delivery_block(task_id, code, hub_base),
+            call_sites.only_tests_block(only_tests),
         ),
         rules_note=rules_note,
         diff_note=diff_note,
         prepass=prepass,
         access_code=code,
+        only_tests=tuple(s.symbol for s in only_tests),
     )
 
 
