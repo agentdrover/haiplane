@@ -3339,9 +3339,57 @@ async def test_signal_clears_when_the_refused_queue_drops_below_two(
     assert len(cleared) == 1
     # Находка cdcea07930c55ac5: провайдер НЕ ожил — снятие не смеет говорить
     # «ревьюер снова отвечает», оно называет сжавшуюся очередь.
-    assert cleared[0]["reason"] == "queue_below_threshold"
+    assert cleared[0]["reason"] == "below_threshold"
     assert cleared[0]["remaining"] == 1
     assert cleared[0]["remaining_tasks"] == [_second]
     assert "снова отвечает" not in cleared[0]["message"]
     assert f"осталось 1 (#{_second})" in cleared[0]["message"]
     assert await _cleared_feed(db) == [cleared[0]["message"]]
+
+
+async def test_fresh_refusals_keep_a_raised_signal_instead_of_a_false_clear(
+    client, db, monkeypatch
+):
+    """Находка 655778c064b7d0b8 (#1262, сдача 3): третий выход — отказанных
+    сдач две и больше, но их отказы моложе порога. Сигнал поднят по старым
+    отказам, старые сдачи получили отчёты, а новые сданы и тоже отказаны:
+    провайдер агента так и не создал, отказы просто обновились. Снимать
+    сигнал тут — сказать неправду; он держится, и наблюдение называет
+    исход too_young честным текстом, а не «осталось N» из ветки порога.
+    """
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import (
+        REVIEWER_SIGNAL_CLEARED,
+        REVIEWER_UNAVAILABLE,
+        observe_outage,
+        signal_state,
+    )
+    from tests.test_review_dispatch import _submitted
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
+    old = await _refused_review_queue(
+        client, db, monkeypatch, ["spike-young-old-a", "spike-young-old-b"]
+    )
+    await _sweep_reviewer_unavailable(db)
+    assert await signal_state(db) == REVIEWER_UNAVAILABLE
+
+    for task_id in old:
+        await repo.update_task(db, task_id, status="running")
+    fresh = [
+        await _submitted(client, db, slug, policy={"review": "dispatch"})
+        for slug in ("spike-young-new-a", "spike-young-new-b")
+    ]
+    await db.commit()
+
+    observed = await observe_outage(db)
+    assert observed.kind == "too_young"
+    assert observed.refused_tasks == sorted(fresh)
+    assert "осталось" not in observed.message
+    assert "меньше 2" in observed.message and "провайдер" in observed.message
+
+    await _sweep_reviewer_unavailable(db)
+
+    assert await signal_state(db) == REVIEWER_UNAVAILABLE, (
+        "провайдер не ожил — сигнал, поднятый по старым отказам, держится"
+    )
+    assert await _reviewer_events(db, REVIEWER_SIGNAL_CLEARED) == []

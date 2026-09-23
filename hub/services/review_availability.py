@@ -10,7 +10,7 @@
 
 - :func:`generation_review` — ответ по одной задаче: у текущего поколения
   есть ревью (кем, по какому sha, полное ли) или его нет и почему;
-- :func:`provider_outage` — ответ по хабу: провайдер отказывает подряд
+- :func:`observe_outage` — ответ по хабу: провайдер отказывает подряд
   дольше порога, и какие задачи в review из-за этого стоят без ревью.
 
 Отказ провайдера читается из алерта, который пишет
@@ -228,11 +228,20 @@ async def _generation_review_since(
 
 
 @dataclass
-class Outage:
-    """Провайдер отказывает подряд: с какого момента и кого это держит."""
+class Observation:
+    """Наблюдённый исход сторожа — с причиной, а не None (#1262, находка
+    655778c064b7d0b8).
 
-    since: str
-    refused_tasks: list[int]
+    ``kind``: ``watch_disabled`` (порог 0), ``below_threshold`` (отказанных
+    сдач в review меньше двух), ``too_young`` (две и больше, но первому
+    отказу меньше порога часов), ``outage`` (сигнал по делу). Снятие берёт
+    причину и текст отсюда, а не угадывает её заново.
+    """
+
+    kind: str
+    message: str
+    since: str = ""
+    refused_tasks: list[int] = field(default_factory=list)
     waiting: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -278,29 +287,54 @@ async def _review_queue(
     return waiting, starts
 
 
-async def provider_outage(db, *, now: datetime | None = None) -> Outage | None:
-    """Провайдер держит очередь review дольше порога, или None.
+def _named(tasks: list[int]) -> str:
+    return " (" + ", ".join(f"#{t}" for t in tasks) + ")" if tasks else ""
+
+
+async def observe_outage(db, *, now: datetime | None = None) -> Observation:
+    """Держит ли провайдер очередь review дольше порога — и если нет, почему.
 
     Считаются только сдачи, которые СЕЙЧАС в review и у которых текущее
     поколение стоит без ревью из-за отказа провайдера после его последнего
     успеха. Нужно минимум две такие сдачи — отказ на одной может быть
-    свойством сдачи (validation_error у #1214), а не провайдера. Как только
-    их меньше двух или отказы моложе порога, ответ None — и сигнал снимается.
+    свойством сдачи (validation_error у #1214), а не провайдера.
     """
     hours = config.REVIEWER_UNAVAILABLE_HOURS
     if hours <= 0:
-        return None
+        return Observation(
+            "watch_disabled",
+            "сторож выключен настройкой REVIEWER_UNAVAILABLE_HOURS=0",
+        )
     waiting, starts = await _review_queue(db, await _last_provider_success(db))
+    refused = [w["task_id"] for w in waiting if "refused_since" in w]
     if len(starts) < MIN_REFUSED_TASKS:
-        return None
+        return Observation(
+            "below_threshold",
+            f"отказанных сдач в review меньше порога {MIN_REFUSED_TASKS} — "
+            f"осталось {len(refused)}{_named(refused)}; провайдер, возможно, "
+            "всё ещё отказывает",
+            refused_tasks=refused,
+            waiting=waiting,
+        )
     since = min(starts)
     now = now or datetime.now(UTC)
     threshold = (now - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     if since > threshold:
-        return None
-    return Outage(
+        return Observation(
+            "too_young",
+            f"отказанных сдач в review {len(refused)}{_named(refused)}, но "
+            f"первому отказу меньше {hours:g} ч — порог возраста не пройден; "
+            "провайдер, возможно, всё ещё отказывает",
+            since=since,
+            refused_tasks=refused,
+            waiting=waiting,
+        )
+    return Observation(
+        "outage",
+        f"провайдер отказывает с {since}: отказано {len(refused)} сдачам"
+        f"{_named(refused)}",
         since=since,
-        refused_tasks=[w["task_id"] for w in waiting if "refused_since" in w],
+        refused_tasks=refused,
         waiting=waiting,
     )
 
@@ -321,13 +355,14 @@ async def signal_state(db) -> str:
     return str(last["kind"]) if last else ""
 
 
-async def clearing(db) -> dict[str, Any]:
-    """Почему сигнал снимается — наблюдённая причина, одна для события и ленты.
+async def clearing(db, observed: Observation) -> dict[str, Any] | None:
+    """Снимать ли поднятый сигнал и с какой причиной; None — держать.
 
     ``provider_answered`` — только если облачный агент создан после подъёма
-    сигнала. Иначе провайдер, возможно, всё ещё отказывает, и причина —
-    очередь: отказанных сдач в review стало меньше порога (или сторож
-    выключен настройкой).
+    сигнала. Иначе причина — наблюдённый исход сторожа, без угадывания.
+    ``too_young`` сигнал НЕ снимает: провайдер агента не создал, отказы
+    лишь обновились на новых сдачах, и снятие было бы неправдой (AC-2
+    снимает сигнал, когда провайдер ответил или картины очереди больше нет).
     """
     last = await _last_signal(db)
     raised_at = str(last["created_at"]) if last else ""
@@ -338,23 +373,13 @@ async def clearing(db) -> dict[str, Any]:
             "message": "Ревьюер снова отвечает: провайдер создал агента — "
             "сигнал недоступности снят",
         }
-    if config.REVIEWER_UNAVAILABLE_HOURS <= 0:
-        return {
-            "reason": "watch_disabled",
-            "message": "Сигнал недоступности ревьюера снят: сторож выключен "
-            "настройкой REVIEWER_UNAVAILABLE_HOURS=0",
-        }
-    waiting, _starts = await _review_queue(db, last_success)
-    refused = [w["task_id"] for w in waiting if "refused_since" in w]
-    named = ", ".join(f"#{t}" for t in refused)
-    return {
-        "reason": "queue_below_threshold",
-        "remaining": len(refused),
-        "remaining_tasks": refused,
-        "message": (
-            "Сигнал недоступности ревьюера снят: отказанных сдач в review "
-            f"меньше порога {MIN_REFUSED_TASKS} — осталось {len(refused)}"
-            + (f" ({named})" if named else "")
-            + "; провайдер агента не создавал и, возможно, всё ещё отказывает"
-        ),
+    if observed.kind in ("too_young", "outage"):
+        return None
+    why: dict[str, Any] = {
+        "reason": observed.kind,
+        "message": f"Сигнал недоступности ревьюера снят: {observed.message}",
     }
+    if observed.kind == "below_threshold":
+        why["remaining"] = len(observed.refused_tasks)
+        why["remaining_tasks"] = observed.refused_tasks
+    return why

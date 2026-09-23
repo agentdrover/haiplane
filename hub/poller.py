@@ -1306,11 +1306,11 @@ async def _sweep_reviewer_unavailable(db) -> None:
     """
     from hub.services import review_availability as ra
 
-    outage = await ra.provider_outage(db)
+    outage = await ra.observe_outage(db)
     raised = await ra.signal_state(db) == ra.REVIEWER_UNAVAILABLE
-    if outage is None:
+    if outage.kind != "outage":
         if raised:
-            await _clear_reviewer_unavailable(db)
+            await _clear_reviewer_unavailable(db, outage)
         return
     if raised and await repo.event_raised_since(db, ra.REVIEWER_UNAVAILABLE, "-1 day"):
         return  # уже сказано в этих сутках
@@ -1345,11 +1345,17 @@ async def _sweep_reviewer_unavailable(db) -> None:
     )
 
 
-async def _clear_reviewer_unavailable(db) -> None:
-    """Снять сигнал, назвав фактическую причину — в событии и в ленте одно."""
+async def _clear_reviewer_unavailable(db, observed) -> None:
+    """Снять сигнал, назвав фактическую причину — в событии и в ленте одно.
+
+    Причина приходит из наблюдения сторожа; ``clearing`` может сказать
+    «держать» (too_young), и тогда не пишется ничего.
+    """
     from hub.services import review_availability as ra
 
-    why = await ra.clearing(db)
+    why = await ra.clearing(db, observed)
+    if why is None:
+        return
     await repo.insert_event(
         db,
         kind=ra.REVIEWER_SIGNAL_CLEARED,
