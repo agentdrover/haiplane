@@ -409,3 +409,261 @@ async def test_an_unknown_gate_value_is_still_refused(client: AsyncClient):
 
     assert resp.status_code == 422, resp.text
     assert "gate_policy" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# #1264: лимит очереди review — вход новой работы, а не её сдача
+# ---------------------------------------------------------------------------
+#
+# Все тесты ниже строят очередь напрямую в базе: задача ставится в review
+# записью статуса, потому что вопрос здесь не «как задача туда попала», а
+# «что делает вход в работу, когда она там». Проект задачи — через
+# project_id на самой строке: resolve_project_for_task читает его с любой.
+
+
+async def _project_with_policy(db, slug: str, policy: dict) -> int:
+    from hub import repository as repo
+
+    existing = await repo.get_project_by_slug(db, slug)
+    if existing is not None:
+        pid = int(existing["id"])
+    else:
+        pid = await repo.create_project(db, slug=slug, name=slug.title())
+    await repo.update_project(db, pid, gate_policy=json.dumps(policy))
+    await db.commit()
+    return pid
+
+
+async def _task_in(db, project_id: int, *, status: str, title: str = "t") -> int:
+    from hub import repository as repo
+    from hub import services
+    from hub.models import TaskCreate
+
+    tv = await services.create_task(db, TaskCreate(title=title))
+    await repo.update_task(db, tv.id, project_id=project_id)
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: work")
+    if status != "open":
+        await repo.update_task(db, tv.id, status=status)
+    await db.commit()
+    return tv.id
+
+
+async def _feed(db, task_id: int) -> str:
+    from hub import repository as repo
+
+    return " ".join(
+        (u["content"] or "") for u in await repo.get_task_updates(db, task_id)
+    )
+
+
+async def test_a_full_review_queue_refuses_to_open_new_work(client: AsyncClient, db):
+    """AC-1 (#1264): K=3, в review три задачи проекта — pair_start отказывает.
+
+    Отказ называет K, текущее число и номера задач очереди; статус и claim
+    задачи не меняются, а карточка говорит то же вслух — один раз.
+    """
+    from hub import repository as repo
+
+    pid = await _project_with_policy(db, "wip-a", {"review_limit": 3})
+    queue = [await _task_in(db, pid, status="review") for _ in range(3)]
+    task_id = await _task_in(db, pid, status="open", title="new work")
+    resp = await client.post(f"/api/tasks/{task_id}/claim", json={"agent": "dev"})
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "review_queue_full"
+    assert detail["review_limit"] == 3
+    assert detail["in_review"] == 3
+    assert detail["queue"] == sorted(queue)
+    row = await repo.get_task(db, task_id)
+    assert row["status"] == "claimed", "отказ не открывает задачу"
+    assert row["claimed_by"] == "dev", "и не снимает claim"
+    feed = await _feed(db, task_id)
+    assert all(f"#{q}" in feed for q in queue), "карточка называет очередь"
+    assert "лимите 3" in feed
+
+    # Повтор не засоряет карточку: та же очередь — та же запись.
+    before = len(await repo.get_task_updates(db, task_id))
+    again = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    assert again.status_code == 409
+    assert len(await repo.get_task_updates(db, task_id)) == before
+
+
+async def test_a_full_review_queue_refuses_dispatch_start_too(client: AsyncClient, db):
+    """AC-1 (#1264), второй вход: start_task (диспетчерский) держит тот же лимит."""
+    from hub import repository as repo
+
+    pid = await _project_with_policy(db, "wip-start", {"review_limit": 2})
+    queue = [await _task_in(db, pid, status="review") for _ in range(2)]
+    task_id = await _task_in(db, pid, status="open", title="dispatch me")
+
+    resp = await client.post(f"/api/tasks/{task_id}/start", json={})
+
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "review_queue_full"
+    assert detail["queue"] == sorted(queue)
+    assert (await repo.get_task(db, task_id))["status"] == "open"
+
+
+async def test_a_full_review_queue_never_blocks_draining_it(db):
+    """AC-2 (#1264): пересдача, вердикт, исправление, доставка — как без лимита.
+
+    Очередь держится выше лимита на КАЖДОМ шаге (четыре при K=3): иначе шаг,
+    который прошёл бы только потому, что сама задача на миг вышла из review,
+    ничего бы не доказал.
+    """
+    from hub import repository as repo
+    from hub import services
+    from hub.models import TaskCreate, TaskReviewVerdict, TaskUpdateCreate
+
+    # Задачи без проекта относятся к default (resolve_project_for_task).
+    pid = await _project_with_policy(db, "default", {})
+
+    # Разбираемая задача открыта ДО включения лимита — как на проде: очередь
+    # уже стоит, когда владелец лимит включает.
+    tv = await services.create_task(db, TaskCreate(title="in the queue"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: build")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev")
+    await services.submit_for_review(db, tv.id)
+    for _ in range(4):
+        await _task_in(db, pid, status="review")
+    await _project_with_policy(db, "default", {"review_limit": 3})
+
+    # Пересдача из review.
+    await services.submit_for_review(db, tv.id)
+    assert (await repo.get_task(db, tv.id))["status"] == "review"
+    # Вердикт «вернуть» — задача уходит в исправление.
+    await services.record_review_verdict(
+        db,
+        tv.id,
+        TaskReviewVerdict(
+            verdict="changes_requested", agent="reviewer", comments="Поправить тест."
+        ),
+    )
+    assert (await repo.get_task(db, tv.id))["status"] == "running"
+    # Исправление сдаётся снова.
+    await services.submit_for_review(db, tv.id)
+    assert (await repo.get_task(db, tv.id))["status"] == "review"
+    # Вердикт «принять».
+    await services.record_review_verdict(
+        db, tv.id, TaskReviewVerdict(verdict="approved", agent="reviewer")
+    )
+    # Доставка.
+    await services.add_update(
+        db, tv.id, TaskUpdateCreate(agent="dev", kind="done", content="Готово")
+    )
+    assert (await repo.get_task(db, tv.id))["status"] == "completed"
+    assert "review_queue_full" not in await _feed(db, tv.id)
+
+
+async def test_no_review_limit_means_todays_behaviour(client: AsyncClient, db):
+    """AC-3 (#1264): без ключа 15 задач в review ничего не держат."""
+    pid = await _project_with_policy(db, "wip-none", {})
+    for _ in range(15):
+        await _task_in(db, pid, status="review")
+    task_id = await _task_in(db, pid, status="open", title="new work")
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "running"
+    assert "review" not in (await _feed(db, task_id)).replace("Plan: work", "")
+
+
+async def test_review_limit_counts_only_the_projects_own_queue(client: AsyncClient, db):
+    """AC-4 (#1264): две свои в review и пять чужих при K=3 — задача открывается."""
+    pid_a = await _project_with_policy(db, "wip-own", {"review_limit": 3})
+    pid_b = await _project_with_policy(db, "wip-other", {})
+    for _ in range(2):
+        await _task_in(db, pid_a, status="review")
+    for _ in range(5):
+        await _task_in(db, pid_b, status="review")
+    task_id = await _task_in(db, pid_a, status="open", title="new work")
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "running"
+
+
+async def test_expedite_is_not_held_by_the_review_limit(client: AsyncClient, db):
+    """AC-5 (#1264): expedite открывается при полной очереди, обход — в ленте."""
+    from hub import repository as repo
+
+    pid = await _project_with_policy(db, "wip-exp", {"review_limit": 1})
+    queue = [await _task_in(db, pid, status="review") for _ in range(2)]
+    task_id = await _task_in(db, pid, status="open", title="hotfix")
+    await repo.update_task(db, task_id, class_of_service="expedite")
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "running"
+    feed = await _feed(db, task_id)
+    assert "expedite" in feed, "обход виден в ленте"
+    assert all(f"#{q}" in feed for q in queue)
+
+
+async def test_warn_mode_opens_and_says_what_it_would_have_held(
+    client: AsyncClient, db
+):
+    """#1264, выход для включения: режим warn не держит, а пишет в ленту.
+
+    Владелец включает лимит на проекте, где очередь уже выше K (default: 20+
+    сдач) — enforce сразу остановил бы всех, включая стюарда. warn даёт
+    увидеть, кого лимит держал бы, прежде чем держать.
+    """
+    pid = await _project_with_policy(
+        db, "wip-warn", {"review_limit": 1, "review_limit_mode": "warn"}
+    )
+    queue = [await _task_in(db, pid, status="review") for _ in range(2)]
+    task_id = await _task_in(db, pid, status="open", title="new work")
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    feed = await _feed(db, task_id)
+    assert "warn" in feed
+    assert all(f"#{q}" in feed for q in queue)
+
+
+async def test_review_limit_keys_are_validated(client: AsyncClient, db):
+    """#1264: лимит — целое ≥ 1, режим — enforce или warn; прочее отказ."""
+    pid = await _create_project(client, "wip-shape")
+    for bad in (
+        {"review_limit": 0},
+        {"review_limit": -2},
+        {"review_limit": "3"},
+        {"review_limit": True},
+        {"review_limit": 3, "review_limit_mode": "shadow"},
+    ):
+        resp = await client.patch(f"/api/projects/{pid}", json={"gate_policy": bad})
+        assert resp.status_code == 422, f"{bad} must be refused: {resp.text}"
+    good = {"review_limit": 3, "review_limit_mode": "warn"}
+    resp = await client.patch(f"/api/projects/{pid}", json={"gate_policy": good})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["gate_policy"] == good
+    # Проект default принимает лимит: он не делегирует гейт (#743 не о нём).
+    default_id = await _project_with_policy(db, "default", {})
+    resp = await client.patch(
+        f"/api/projects/{default_id}", json={"gate_policy": {"review_limit": 20}}
+    )
+    assert resp.status_code == 200, resp.text

@@ -50,6 +50,7 @@ from hub.services import finding_outcome
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.review_evidence import inflight_verdict_note
+from hub.services.review_limit import refuse_opening_over_review_limit
 from hub.services.outcomes import outcome_status_for_task
 from hub.services.task_idempotency import (
     IdempotencyRecord,
@@ -1451,6 +1452,9 @@ async def start_task(
     # #1232: before anything is written — the plan update below is a write, and
     # a task refused after it would carry a plan for work it never began.
     await refuse_opening_without_subject(db, task_id, task)
+    # #1264: the same place for the same reason — new work does not open
+    # while the project's review queue is at its limit.
+    await refuse_opening_over_review_limit(db, task_id, task)
 
     body = body or TaskStart()
 
@@ -1578,6 +1582,7 @@ async def pair_start_task(
     # follows writes the plan and prepares a branch, and a task refused after
     # that would leave both behind.
     await refuse_opening_without_subject(db, task_id, task)
+    await refuse_opening_over_review_limit(db, task_id, task)
 
     body = body or TaskPairStart()
 
