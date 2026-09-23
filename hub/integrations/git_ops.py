@@ -558,6 +558,27 @@ async def _git(*args: str, repo: str | None = None, **kw) -> tuple[int, str, str
     return await _run("git", "-C", repo, *args, cwd=repo, **kw)
 
 
+# #1332: код возврата shell для «команда не найдена». Проверка, которая не
+# смогла запустить свой инструмент, ничего не сказала о дереве — это дефект
+# среды хоста, и читатель обязан увидеть именно его и имя команды, а не
+# «валидация упала»: 23.09.2026 так прочли #1242, и искать бинарь пришлось
+# по ssh.
+_COMMAND_NOT_FOUND_RC = 127
+
+
+def _automerge_check_refusal(rc: int, log_tail: str) -> str:
+    """Отказ автомержа по проверке сложенного: среда или дерево (#1332)."""
+    said = " ".join((log_tail or "").split())[:400]
+    if rc == _COMMAND_NOT_FOUND_RC:
+        return (
+            "дефект среды, а не кода: инструмент проверки сложенного не найден "
+            f"в окружении сервиса (код возврата {rc}) — {said or 'команда не названа'}"
+        )
+    return (
+        f"валидация после автомержа упала (код возврата {rc}): {said or 'вывода нет'}"
+    )
+
+
 async def _reject_broken_files(repo: str) -> list[str]:
     """Revert .py files that look single-line-serialized (literal \\n instead of newlines)."""
     import pathlib
@@ -3245,9 +3266,9 @@ class GitOpsIntegration:
             result = await validate(path)
             if result is None:
                 return False, "валидация после автомержа не запустилась"
-            rc, _log = result
+            rc, log_tail = result
             if rc != 0:
-                return False, f"валидация после автомержа упала (код возврата {rc})"
+                return False, _automerge_check_refusal(rc, log_tail)
             rc, _, err = await _git(
                 "commit",
                 "-m",
