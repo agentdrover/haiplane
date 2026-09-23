@@ -667,3 +667,64 @@ async def test_review_limit_keys_are_validated(client: AsyncClient, db):
         f"/api/projects/{default_id}", json={"gate_policy": {"review_limit": 20}}
     )
     assert resp.status_code == 200, resp.text
+
+
+# Находка ce6159d160b95a4b (сдача 1): create_task(run_immediately) и
+# approve_task(run=true) открывают работу мимо лимита. Оба входа — только
+# человеческие (#360: не-agent source требует человека; /approve стоит за
+# require_human_or_admin), поэтому это выход «решение владельца»: работа
+# открывается, но обход пишется в карточку, а не проходит молча.
+
+
+async def _default_queue_over_limit(db, *, limit: int, size: int) -> list[int]:
+    pid = await _project_with_policy(db, "default", {"review_limit": limit})
+    return [await _task_in(db, pid, status="review") for _ in range(size)]
+
+
+async def test_create_run_immediately_opens_but_names_the_human_bypass(
+    client: AsyncClient, db
+):
+    queue = await _default_queue_over_limit(db, limit=2, size=3)
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "run now", "run_immediately": True}
+    )
+
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["id"]
+    feed = await _feed(db, task_id)
+    assert "лимит review (2, сейчас 3) обойдён решением человека" in feed
+    assert "run_immediately" in feed
+    assert all(f"#{q}" in feed for q in queue)
+
+
+async def test_approve_with_run_opens_but_names_the_human_bypass(
+    client: AsyncClient, db
+):
+    from hub import services
+    from hub.models import TaskCreate
+
+    queue = await _default_queue_over_limit(db, limit=2, size=3)
+    draft = await services.create_task(db, TaskCreate(title="draft", source="agent"))
+
+    resp = await client.post(
+        f"/api/tasks/{draft.id}/approve", json={"run": True, "force": True}
+    )
+
+    assert resp.status_code == 200, resp.text
+    feed = await _feed(db, draft.id)
+    assert "лимит review (2, сейчас 3) обойдён решением человека" in feed
+    assert "approve run" in feed
+    assert all(f"#{q}" in feed for q in queue)
+
+
+async def test_human_entrances_stay_silent_below_the_limit(client: AsyncClient, db):
+    """Зеркало: запись — про обход, а не про каждый запуск."""
+    await _default_queue_over_limit(db, limit=5, size=3)
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "run now", "run_immediately": True}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert "обойдён" not in await _feed(db, resp.json()["id"])

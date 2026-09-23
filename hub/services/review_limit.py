@@ -147,3 +147,33 @@ async def refuse_opening_over_review_limit(
             }
         ),
     )
+
+
+async def note_human_bypass(
+    db: aiosqlite.Connection, task_id: int, entrance: str
+) -> None:
+    """Вход, открывающий работу решением человека, лимит не держит — но называет.
+
+    ``create_task(run_immediately)`` и ``approve_task(run=true)`` доступны только
+    человеку (#360: не-agent source требует человека; /approve — за
+    require_human_or_admin). Человек, запускающий работу при полной очереди,
+    принимает решение владельца, и это законный выход. Незаконно одно —
+    молчание: без записи обход неотличим от лимита, который не работает.
+    """
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        return
+    try:
+        check = await check_review_queue(db, dict(row))
+    except Exception as exc:  # noqa: BLE001 - a note must not break the start
+        log.warning("review queue note for #%s failed: %s", task_id, exc)
+        return
+    if check is None:
+        return
+    listed = ", ".join(f"#{q}" for q in check.queue)
+    text = (
+        f"Очередь review проекта «{check.project_slug}»: "
+        f"лимит review ({check.limit}, сейчас {len(check.queue)}) обойдён "
+        f"решением человека: {entrance}. В очереди: {listed} (#1264)."
+    )
+    await _note_once(db, task_id, text)

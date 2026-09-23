@@ -50,7 +50,10 @@ from hub.services import finding_outcome
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.review_evidence import inflight_verdict_note
-from hub.services.review_limit import refuse_opening_over_review_limit
+from hub.services.review_limit import (
+    note_human_bypass,
+    refuse_opening_over_review_limit,
+)
 from hub.services.outcomes import outcome_status_for_task
 from hub.services.task_idempotency import (
     IdempotencyRecord,
@@ -915,6 +918,7 @@ async def create_task(
     if normalized.run_immediately and normalized.source != TaskSource.agent:
         row = await repo.get_task(db, task_id)
         result = await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
+        await note_human_bypass(db, task_id, "create run_immediately")
 
     await log_activity(
         db,
@@ -1146,6 +1150,7 @@ async def approve_task(
     if body.run:
         task["status"] = "open"
         await dispatch_task(db, task_id, task)
+        await note_human_bypass(db, task_id, "approve run")
 
     activity_suffix = ""
     if body.run:
