@@ -36,6 +36,17 @@ from hub.services.gate_events import (
 
 log = logging.getLogger(__name__)
 
+# Почему у суждения нет числа токенов (#1328). Пустая строка — число есть.
+# Ноль и «неизвестно» — разные состояния: ноль говорит провайдер, а
+# «неизвестно» говорит хаб, и путать их значит выдать молчание за бесплатность.
+TOKENS_PENDING = "pending"
+TOKENS_PROVIDER_NO_ANSWER = "provider_no_answer"
+TOKENS_NO_RUN = "no_run"
+# Сколько ждать usage после записи суждения, прежде чем назвать молчание
+# провайдера окончательным. Usage приходит с задержкой, и прогон может ещё
+# дописывать свой ответ после того, как суждение легло.
+USAGE_ANSWER_WINDOW_MIN = 60
+
 
 def _require_member(field: str, got: str, allowed: tuple[str, ...]) -> None:
     if got not in allowed:
