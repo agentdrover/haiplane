@@ -434,6 +434,42 @@ async def release_policy_for_task(db: aiosqlite.Connection, task_id: int) -> str
     return RELEASE_AUTO if release_auto_enabled(policy) else RELEASE_MANUAL
 
 
+# Лимит очереди review на входе новой работы (#1264). Нет ключа — нет
+# лимита: поведение ровно как до этой задачи. Режим enforce держит вход,
+# warn только пишет в ленту, кого держал бы, — это ступень включения на
+# проекте, где очередь уже выше лимита (default: 20+ сдач), чтобы первый же
+# шаг не остановил всех исполнителей, стюарда в том числе.
+REVIEW_LIMIT_KEY = "review_limit"
+REVIEW_LIMIT_MODE_KEY = "review_limit_mode"
+REVIEW_LIMIT_ENFORCE = "enforce"
+REVIEW_LIMIT_WARN = "warn"
+REVIEW_LIMIT_MODES: tuple[str, ...] = (REVIEW_LIMIT_ENFORCE, REVIEW_LIMIT_WARN)
+
+
+def review_limit_of(policy: dict) -> int | None:
+    """K для очереди review проекта; ``None`` — лимита нет.
+
+    Нечитаемое значение — не лимит: запись такое не пропускает, а положенное
+    мимо API не должно останавливать работу целого проекта.
+    """
+    if not isinstance(policy, dict):
+        return None
+    limit = policy.get(REVIEW_LIMIT_KEY)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        return None
+    return limit
+
+
+def review_limit_mode_of(policy: dict) -> str:
+    """``warn`` только когда так и записано; иначе ``enforce``."""
+    if (
+        isinstance(policy, dict)
+        and policy.get(REVIEW_LIMIT_MODE_KEY) == REVIEW_LIMIT_WARN
+    ):
+        return REVIEW_LIMIT_WARN
+    return REVIEW_LIMIT_ENFORCE
+
+
 # Recognised key of the CI test command in ``gate_policy`` (#476). The hub
 # lays a CI workflow into a provisioned repository, and that workflow reports
 # acceptance-test results back — but HOW this repository runs its tests is a

@@ -318,11 +318,40 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # гейт и ничего не делегирует — поэтому замок #743 (default) его не
     # трогает. Читатель: steward_dispatch._policy_wants_steward.
     "steward_shadow",
+    # #1264: лимит очереди review на входе новой работы. Не гейт и ничего не
+    # делегирует — замок #743 его не трогает. Читатели:
+    # project_policy.review_limit_of / review_limit_mode_of.
+    "review_limit",
+    "review_limit_mode",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
 _RISK_MAP_MAX_RULES = 100
 _RISK_MAP_MAX_PATTERN = 200
+
+
+def _validate_review_limit(policy: dict[str, Any]) -> None:
+    """Refuse a review-queue limit nobody could read as meant (#1264).
+
+    Strictly an int, never a bool or a string: "3" read as three and "3"
+    read as "no limit" are both plausible, and a limiter must not be the
+    place where that guess is made.
+    """
+    from hub.services.project_policy import REVIEW_LIMIT_MODES
+
+    if "review_limit" in policy:
+        limit = policy["review_limit"]
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError(
+                f"gate_policy review_limit must be an integer >= 1, got: {limit!r}"
+            )
+    if "review_limit_mode" in policy:
+        mode = policy["review_limit_mode"]
+        if mode not in REVIEW_LIMIT_MODES:
+            raise ValueError(
+                "gate_policy review_limit_mode must be one of "
+                f"{', '.join(REVIEW_LIMIT_MODES)}, got: {mode!r}"
+            )
 
 
 def _validated_risk_map(value: Any) -> dict[str, str]:
@@ -2226,6 +2255,7 @@ class ProjectPatch(BaseModel):
                 )
         if "risk_map" in v:
             v["risk_map"] = _validated_risk_map(v["risk_map"])
+        _validate_review_limit(v)
         return v
 
     @model_validator(mode="before")
