@@ -95,12 +95,14 @@ async def _report(
     confirmed: list[dict] | None = None,
     unresolved: list[dict] | None = None,
     incomplete: bool | None = False,
+    generation_offset: int = 0,
 ) -> None:
     row = dict(await repo.get_task(db, task_id))
     await repo.insert_machine_review(
         db,
         task_id=task_id,
-        submission_generation=int(row["submission_generation"] or 0),
+        submission_generation=int(row["submission_generation"] or 0)
+        + generation_offset,
         model="gpt-5.3-codex",
         agent_count=3,
         tokens_spent=1000,
@@ -165,7 +167,17 @@ async def _five_states(client: AsyncClient, db, git: _Git) -> dict[str, int]:
         "none": await _submitted(client, git, "No report", "n1"),
         "incomplete": await _submitted(client, git, "Incomplete report", "p1"),
         "merge_failed": await _submitted(client, git, "Merge failed", "m1"),
+        "stale": await _submitted(client, git, "Report of an earlier submission", "o1"),
     }
+    # Отчёт и вердикт ПРОШЛОЙ сдачи: ровно то место, где своё правило
+    # «текущий» разошлось бы с брифом.
+    await _report(db, ids["stale"], confirmed=[_FINDING], generation_offset=-1)
+    await db.execute(
+        "UPDATE tasks SET review_verdict='changes_requested', "
+        "review_verdict_generation=submission_generation - 1 WHERE id=?",
+        (ids["stale"],),
+    )
+    await db.commit()
     await _report(db, ids["clean"])
     await _report(
         db,
@@ -246,6 +258,7 @@ async def test_the_queue_matches_the_brief_field_by_field(
                 "in_flight": "i1",
                 "incomplete": "p1",
                 "merge_failed": "m1",
+                "stale": "o1",
             }[name]
         )
         briefs[name] = await build_review_brief(db, task_id)
@@ -268,6 +281,10 @@ async def test_the_queue_matches_the_brief_field_by_field(
     assert rows[ids["in_flight"]].report_status == "in_flight"
     assert rows[ids["none"]].report_status == "none"
     assert rows[ids["incomplete"]].report_status == "incomplete"
+    stale = rows[ids["stale"]]
+    assert stale.report_state == "stale" and stale.report_status == "none"
+    assert stale.findings_confirmed is None, "находки прошлой сдачи — не находки этой"
+    assert stale.verdict == "changes_requested" and not stale.verdict_is_current
 
     stalled = rows[ids["merge_failed"]]
     assert stalled.status == "needs_decision"
