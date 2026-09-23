@@ -843,19 +843,7 @@ async def create_task(
 
     initial_status, normalized = normalize_task_create(body)
     request_hash = hash_task_create_payload(normalized) if idem_key else None
-    # #1264: the review-queue limit decides the run BEFORE the row exists. A
-    # held run inserts the row as open straight away — never running without
-    # a job, not even between two commits. Only the status changes, not
-    # ``normalized``: the idempotency hash must not depend on the queue.
-    wants_run = normalized.run_immediately and normalized.source != TaskSource.agent
-    run_check = (
-        await review_limit.check_review_queue_for_new_task(
-            db, normalized.parent_id, normalized.class_of_service
-        )
-        if wants_run
-        else None
-    )
-    run_held = run_check is not None and run_check.outcome == review_limit.HELD
+    run_check, run_held = await _plan_created_run(db, normalized)
     if run_held:
         initial_status = "open"
 
@@ -931,11 +919,8 @@ async def create_task(
         return CreateTaskOutcome(task=task, is_new=False)
 
     result: dict[str, Any] = {}
-    if wants_run:
-        await review_limit.note_run_check(db, task_id, run_check, "создана")
-        if not run_held:
-            row = await repo.get_task(db, task_id)
-            result = await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
+    if _wants_run(normalized):
+        result = await _run_created_task(db, task_id, run_check, run_held)
 
     await log_activity(
         db,
@@ -946,6 +931,41 @@ async def create_task(
 
     task = await _load_task_view(db, task_id)
     return CreateTaskOutcome(task=task, is_new=True)
+
+
+def _wants_run(normalized: TaskCreate) -> bool:
+    return normalized.run_immediately and normalized.source != TaskSource.agent
+
+
+async def _plan_created_run(
+    db: aiosqlite.Connection, normalized: TaskCreate
+) -> tuple[review_limit.ReviewQueueCheck | None, bool]:
+    """Decide the run of create(run_immediately) BEFORE the row exists (#1264).
+
+    A held run inserts the row as open straight away — never running without
+    a job, not even between two commits. Only the initial status changes, not
+    ``normalized``: the idempotency hash must not depend on the queue.
+    """
+    if not _wants_run(normalized):
+        return None, False
+    check = await review_limit.check_review_queue_for_new_task(
+        db, normalized.parent_id, normalized.class_of_service
+    )
+    return check, check is not None and check.outcome == review_limit.HELD
+
+
+async def _run_created_task(
+    db: aiosqlite.Connection,
+    task_id: int,
+    check: review_limit.ReviewQueueCheck | None,
+    held: bool,
+) -> dict[str, Any]:
+    """Card note for the limit's outcome, then the dispatch it allowed."""
+    await review_limit.note_run_check(db, task_id, check, "создана")
+    if held:
+        return {}
+    row = await repo.get_task(db, task_id)
+    return await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
 
 
 async def create_subtasks_bulk(
