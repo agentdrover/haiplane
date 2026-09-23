@@ -10189,7 +10189,7 @@ async def test_every_review_path_carries_the_only_tests_symbols(
     brief = await client.get(f"/api/tasks/{cloud_id}/review-brief")
     assert brief.status_code == 200, brief.text
     section = brief.json()["call_sites"]
-    assert section["only_tests_state"] == "named", section
+    assert section["only_tests_state"] == "no_report", section
     assert [o["symbol"] for o in section["only_tests"]] == ["mechanical_step"]
 
     # 2) локально, промт — в момент старта
@@ -10384,10 +10384,16 @@ async def test_an_empty_list_is_not_sold_as_a_clean_verdict(
     )
     cleared = await _only_tests_section(client, cleared_id)
 
+    # Третий ответ: разбор при заказе не состоялся вовсе.
     _analyse_returns(
         monkeypatch, call_sites.CallSiteReport(call_sites.UNKNOWN, reason="no tree")
     )
-    unknown = await _only_tests_section(client, cleared_id)
+    _wire(
+        monkeypatch, _DispatchRecorder({"agent": {"id": "bc-unk"}, "run": {"id": "r"}})
+    )
+    unknown_id = await _submitted(client, db, "spike-ot-unknown-walk")
+    await _report_on(client, unknown_id)
+    unknown = await _only_tests_section(client, unknown_id)
 
     assert empty["only_tests_state"] == "none_named"
     assert empty["only_tests"] == []
@@ -10403,3 +10409,92 @@ async def test_an_empty_list_is_not_sold_as_a_clean_verdict(
     }
     assert len(summaries) == 3, "три разных итога обязаны читаться по-разному"
     assert "отсутствие данных" in empty["only_tests_summary"]
+
+
+async def test_the_readout_scores_exactly_what_the_order_named(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находки c7488ab8 / d848b4a0 / 80985368: бриф судит по ЗАКАЗУ.
+
+    Второй разбор при чтении брифа мог дать другой набор: база протухла и
+    бриф разбор выключил, дерево сдвинулось между вызовами, потолок списка
+    обрезал промт. Набор названных символов запоминается в строке заказа, и
+    итог считается ровно по нему.
+    """
+    from hub.services import call_sites
+
+    many = [f"tool_{i:02d}" for i in range(25)]
+    task_id = await _only_tests_submission(
+        client, db, monkeypatch, "spike-ot-pinned", *many
+    )
+    recorder_prompt = (await _any_dispatch_row(db, task_id))["only_tests"]
+    assert json.loads(recorder_prompt) == many, "заказ помнит ровно названное"
+
+    # Дрейф: второй разбор видит другой символ; и протухшая база: не видит ничего.
+    _analyse_returns(monkeypatch, _only_tests_report("drifted_symbol"))
+    drifted = await _only_tests_section(client, task_id)
+    _analyse_returns(
+        monkeypatch, call_sites.CallSiteReport(call_sites.UNKNOWN, reason="stale")
+    )
+    stale = await _only_tests_section(client, task_id)
+
+    for section in (drifted, stale):
+        assert [o["symbol"] for o in section["only_tests"]] == many, section
+        assert section["only_tests_state"] == "no_report"
+
+
+async def test_the_order_names_every_candidate(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находка 80985368: промт называет ВСЕ символы, которые потом судят."""
+    many = [f"tool_{i:02d}" for i in range(25)]
+    recorder = _DispatchRecorder({"agent": {"id": "bc-many"}, "run": {"id": "r"}})
+    _analyse_returns(monkeypatch, _only_tests_report(*many))
+    _wire(monkeypatch, recorder)
+    await _submitted(client, db, "spike-ot-many")
+    prompt = recorder.calls[0]["prompt_text"]
+    missing = [name for name in many if f"- {name} (" not in prompt]
+    assert missing == [], f"в заказе не названы: {missing}"
+
+
+async def test_no_current_report_is_said_as_such(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находка 33559ae2: нет отчёта — это не «ревьюер промолчал»."""
+    task_id = await _only_tests_submission(
+        client, db, monkeypatch, "spike-ot-noreport", "mechanical_step"
+    )
+    before = await _only_tests_section(client, task_id)
+    assert before["only_tests_state"] == "no_report"
+    assert [o["outcome"] for o in before["only_tests"]] == ["pending"]
+    assert "актуального отчёта нет" in before["only_tests_summary"]
+
+    await _report_on(client, task_id)
+    after = await _only_tests_section(client, task_id)
+    assert after["only_tests_state"] == "named"
+    assert [o["outcome"] for o in after["only_tests"]] == ["silent"], (
+        "а вот отчёт, который промолчал, — это уже «без исхода»"
+    )
+
+
+async def test_the_card_shows_the_only_tests_outcome(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находка bf42c7bf: итог виден там, куда смотрит человек — в карточке."""
+    task_id = await _only_tests_submission(
+        client, db, monkeypatch, "spike-ot-card", "mechanical_step"
+    )
+    await _report_on(
+        client,
+        task_id,
+        rejected=[
+            {
+                "title": "mechanical_step",
+                "category": "only_tests",
+                "reason": "hub/poller.py: _sweep зовёт его по имени",
+            }
+        ],
+    )
+    page = await client.get(f"/tasks/{task_id}")
+    assert page.status_code == 200
+    assert "снято с путём вызова 1" in page.text, "итог only_tests — на панели"

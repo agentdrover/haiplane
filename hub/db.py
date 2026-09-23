@@ -2075,6 +2075,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_review_verdict_closed_generation_column",
         "ALTER TABLE tasks ADD COLUMN review_verdict_closed_generation INTEGER",
     ),
+    (
+        # #1254: символы only_tests, названные ревьюеру в ЭТОМ заказе, JSON-
+        # списком. Бриф судит итог ровно по нему, а не по второму разбору,
+        # который мог увидеть другое дерево или протухшую базу. NULL — разбор
+        # при заказе не состоялся (или строка старше колонки), «[]» — прошёл
+        # и не назвал никого: разные ответы (#750).
+        "add_review_dispatches_only_tests",
+        "ALTER TABLE review_dispatches ADD COLUMN only_tests TEXT",
+    ),
 ]
 
 

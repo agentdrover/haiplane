@@ -445,15 +445,15 @@ ONLY_TESTS_CATEGORY = "only_tests"
 UNREACHABLE = "unreachable"
 CLEARED = "cleared"
 SILENT = "silent"
+PENDING = "pending"
 # What the readout as a whole can say. Three answers, never collapsed (#750):
 # nobody looked, looked and found no candidate, candidates were named.
 NOT_ANALYSED = "not_analysed"
 NONE_NAMED = "none_named"
 NAMED = "named"
-
-# A prompt is not a place to dump a hundred names. Past this, the rest is
-# counted, not listed, and the reader is told so.
-ONLY_TESTS_ORDER_CAP = 20
+# Named, and no report of the current generation to answer yet: not the same
+# as a report that stayed silent about a symbol.
+NO_REPORT = "no_report"
 
 
 def only_tests_symbols(report: CallSiteReport) -> list[SymbolReport] | None:
@@ -467,15 +467,13 @@ def only_tests_block(symbols: list[SymbolReport] | None) -> str:
     """The review-order paragraph naming them; empty when there is none.
 
     Empty means the order stays byte for byte what it was — a line saying
-    "nothing to check" would read as a check that passed.
+    "nothing to check" would read as a check that passed. Every candidate is
+    listed: the readout is scored on exactly this set, so a name cut from the
+    prompt would be judged without ever having been asked about.
     """
     if not symbols:
         return ""
-    shown = symbols[:ONLY_TESTS_ORDER_CAP]
-    lines = "".join(f"- {s.symbol} ({s.defined_in})\n" for s in shown)
-    rest = len(symbols) - len(shown)
-    if rest:
-        lines += f"- и ещё {rest}: полный список в брифе, call_sites\n"
+    lines = "".join(f"- {s.symbol} ({s.defined_in})\n" for s in symbols)
     return (
         "ПРОВЕРЬ ДОСТИЖИМОСТЬ (#1254). Вне tests/ эти символы не зовёт никто "
         "— по статическому разбору:\n"
@@ -512,6 +510,11 @@ class OnlyTestsReadout:
                 "only_tests: разбор не назвал ни одного кандидата — это "
                 "отсутствие данных, а не проверенная достижимость"
             )
+        if self.state == NO_REPORT:
+            return (
+                f"only_tests: названо {len(self.outcomes)} — актуального "
+                "отчёта нет, исходов ещё быть не может"
+            )
         count = {k: 0 for k in (UNREACHABLE, CLEARED, SILENT)}
         for o in self.outcomes:
             count[o.outcome] += 1
@@ -543,13 +546,18 @@ def only_tests_readout(named: list[str] | None, report: object) -> OnlyTestsRead
 
     ``named`` is None when the walk did not run. ``report`` is the current
     machine review (a dict or a view with ``findings_confirmed`` and
-    ``findings_rejected``) or None. A clearing counts only with a call path
-    in its reason; a confirmation wins over a clearing of the same symbol.
+    ``findings_rejected``) or None when there is none yet. A clearing counts
+    only with a call path in its reason; a confirmation wins over a clearing
+    of the same symbol.
     """
     if named is None:
         return OnlyTestsReadout(NOT_ANALYSED)
     if not named:
         return OnlyTestsReadout(NONE_NAMED)
+    if report is None:
+        return OnlyTestsReadout(
+            NO_REPORT, [OnlyTestsOutcome(symbol, PENDING) for symbol in named]
+        )
     confirmed = _get_list(report, "findings_confirmed")
     rejected = _get_list(report, "findings_rejected")
     outcomes = []
@@ -577,6 +585,8 @@ __all__ = [
     "ANALYSED",
     "CLEARED",
     "NAMED",
+    "NO_REPORT",
+    "PENDING",
     "NONE_NAMED",
     "NOT_ANALYSED",
     "ONLY_TESTS_CATEGORY",

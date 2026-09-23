@@ -246,6 +246,7 @@
             <span class="badge badge--xs badge-{{ 'test' if evidence.call_sites.status == 'analysed' else 'pending' }}">{{ evidence.call_sites.status }}</span>
             {% if evidence.call_sites.status == 'analysed' %}<span class="muted">{{ evidence.call_sites.summary }}</span>
             {% else %}<span class="muted">{{ evidence.call_sites.reason }}</span>{% endif %}
+            {% if evidence.call_sites.only_tests_summary %}<span class="muted">{{ evidence.call_sites.only_tests_summary }}</span>{% endif %}
         </div>
 
         {% if change_map and change_map.unavailable %}

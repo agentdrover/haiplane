@@ -562,8 +562,8 @@ async def test_a_registry_call_is_removable_and_charges_nothing(
     named = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()[
         "call_sites"
     ]
-    assert named["only_tests_state"] == "named", named
-    assert [o["outcome"] for o in named["only_tests"]] == ["silent"]
+    assert named["only_tests_state"] == "no_report", named
+    assert [o["outcome"] for o in named["only_tests"]] == ["pending"]
 
     path = "hub/registry.py:call_tool -> getattr(hub.tools, name)"
     resp = await client.post(

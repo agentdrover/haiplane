@@ -1497,26 +1497,28 @@ class ReviewOrder:
     #: кода не выдавали: открытый режим, отозванный токен.
     access_code: str = ""
     #: #1254: символы, которых вне tests/ не зовёт никто, — названные в
-    #: ``prompt`` как предмет проверки. Пусто — ни одного не названо.
-    only_tests: tuple[str, ...] = ()
+    #: ``prompt`` как предмет проверки. Пусто — разбор прошёл и не назвал
+    #: никого; None — разбор не состоялся. Уезжает в строку заказа, и бриф
+    #: судит итог ровно по этому набору.
+    only_tests: tuple[str, ...] | None = None
 
 
 async def _only_tests_of(
     ctx: tuple[str, str] | None, diff: str | None
-) -> list[call_sites.SymbolReport]:
-    """Кандидаты only_tests по диффу сдачи (#1254); пусто, если не смотрели.
+) -> list[call_sites.SymbolReport] | None:
+    """Кандидаты only_tests по диффу сдачи (#1254); None — не смотрели.
 
     Источник один — ``call_sites.analyse``, тот же, что у брифа. Неудача
     разбора заказ не роняет: без кандидатов он остаётся прежним.
     """
     if ctx is None or not diff:
-        return []
+        return None
     try:
         report = await asyncio.to_thread(call_sites.analyse, ctx[0], diff)
     except Exception as exc:  # noqa: BLE001 - советующий блок, не гейт
         log.warning("only_tests: call-site walk failed: %s", exc)
-        return []
-    return call_sites.only_tests_symbols(report) or []
+        return None
+    return call_sites.only_tests_symbols(report)
 
 
 async def prepare_review_order(
@@ -1592,7 +1594,7 @@ async def prepare_review_order(
         diff_note=diff_note,
         prepass=prepass,
         access_code=code,
-        only_tests=tuple(s.symbol for s in only_tests),
+        only_tests=None if only_tests is None else tuple(s.symbol for s in only_tests),
     )
 
 
@@ -1937,6 +1939,7 @@ async def maybe_dispatch_review(
             profile=profile,
             reviewer_principal_id=expected_principal,
             channel=CLOUD_CHANNEL,
+            only_tests=order.only_tests,
         )
         await repo.owe_second_door(db, stub_id, detail)
         await db.commit()
@@ -1989,6 +1992,7 @@ async def maybe_dispatch_review(
         model=model_id,
         profile=profile,
         reviewer_principal_id=expected_principal,
+        only_tests=order.only_tests,
     )
     profile_note = (
         f"профиль {profile} (один проход по диффу)"
@@ -2337,6 +2341,7 @@ async def dispatch_local_review(
             int(late_report_recheck["id"]) if late_report_recheck is not None else None
         ),
         second_door_reason=why,
+        only_tests=order.only_tests,
     )
     await repo.add_task_update(
         db,
