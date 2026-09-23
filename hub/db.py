@@ -2087,6 +2087,26 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE tasks ADD COLUMN gate_squashed_sha TEXT NOT NULL DEFAULT ''",
     ),
     (
+        # #1328: когда прогон стюарда НАЧАЛ работу. created_at — время
+        # заказа, а заказ может ждать исполнителя долго (#1181): длительность
+        # суждения, отмеренная от заказа, приписала бы судье чужое ожидание.
+        # Ставит её старт прогона (start_run) той же записью, что называет
+        # агента. NULL — прогон не начинался или начат до этой колонки;
+        # старые строки не пересчитываются (scope_out #1328).
+        "add_steward_runs_started_at",
+        "ALTER TABLE steward_runs ADD COLUMN started_at TEXT",
+    ),
+    (
+        # #1328: почему у суждения нет числа токенов. '' — число есть (или
+        # суждение старше колонки); pending — ждём ответа провайдера;
+        # provider_no_answer — окно ответа вышло, провайдер молчал; no_run —
+        # у суждения нет начатого прогона, спрашивать не о чем. Ноль в
+        # tokens_spent означает только ответ провайдера «ноль».
+        "add_steward_judgements_tokens_unknown_reason",
+        "ALTER TABLE steward_judgements ADD COLUMN tokens_unknown_reason TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
+    (
         # #1254: символы only_tests, названные ревьюеру в ЭТОМ заказе, JSON-
         # списком. Бриф судит итог ровно по нему, а не по второму разбору,
         # который мог увидеть другое дерево или протухшую базу. NULL — разбор

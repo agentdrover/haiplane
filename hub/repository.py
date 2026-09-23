@@ -1262,6 +1262,7 @@ async def insert_steward_judgement(
     duration_ms: int | None = None,
     submitted_by: str = "",
     principal_id: int | None = None,
+    tokens_unknown_reason: str = "",
 ) -> int | None:
     """Insert one judgement. None when the (task, generation, kind) slot is taken."""
     try:
@@ -1269,7 +1270,8 @@ async def insert_steward_judgement(
             "INSERT INTO steward_judgements (task_id, generation, kind, "
             "submitted_verdict, verdict, confidence, escalate_reason, grounds, "
             "findings, closures, model, tokens_spent, duration_ms, submitted_by, "
-            "principal_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "principal_id, tokens_unknown_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 generation,
@@ -1286,11 +1288,30 @@ async def insert_steward_judgement(
                 duration_ms,
                 submitted_by,
                 principal_id,
+                tokens_unknown_reason,
             ),
         )
     except aiosqlite.IntegrityError:
         return None
     return cur.lastrowid
+
+
+async def set_steward_judgement_tokens(
+    db: aiosqlite.Connection,
+    judgement_id: int,
+    tokens: int | None,
+    unknown_reason: str,
+) -> None:
+    """Record the provider's answer about a judgement's tokens (#1328).
+
+    Only a judgement still waiting is touched: an answer already written is
+    not overwritten by a later, emptier one.
+    """
+    await db.execute(
+        "UPDATE steward_judgements SET tokens_spent=?, tokens_unknown_reason=? "
+        "WHERE id=? AND tokens_unknown_reason='pending'",
+        (tokens, unknown_reason, judgement_id),
+    )
 
 
 async def get_steward_judgement(

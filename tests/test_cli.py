@@ -2411,3 +2411,18 @@ def test_cmd_undelivered_still_says_all_clear_when_it_really_is() -> None:
         rc = cli.cmd_undelivered(args)
     assert rc == 0
     assert "No completed task is waiting on an open PR." in out.getvalue()
+
+
+def test_delivery_deliver_posts_to_the_registry_deliver_endpoint() -> None:
+    """#1333: CLI-вход действия реестра «доставить» — рядом с undelivered."""
+    rc, api = _run_main(
+        ["delivery-deliver", "1276"],
+        api_result={
+            "task_id": 1276,
+            "delivered": True,
+            "state": "delivered",
+            "pr_number": 425,
+        },
+    )
+    assert rc == 0
+    api.assert_called_once_with("POST", "/api/delivery/discrepancies/1276/deliver", {})
