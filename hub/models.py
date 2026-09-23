@@ -318,11 +318,40 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # гейт и ничего не делегирует — поэтому замок #743 (default) его не
     # трогает. Читатель: steward_dispatch._policy_wants_steward.
     "steward_shadow",
+    # #1264: лимит очереди review на входе новой работы. Не гейт и ничего не
+    # делегирует — замок #743 его не трогает. Читатели:
+    # project_policy.review_limit_of / review_limit_mode_of.
+    "review_limit",
+    "review_limit_mode",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
 _RISK_MAP_MAX_RULES = 100
 _RISK_MAP_MAX_PATTERN = 200
+
+
+def _validate_review_limit(policy: dict[str, Any]) -> None:
+    """Refuse a review-queue limit nobody could read as meant (#1264).
+
+    Strictly an int, never a bool or a string: "3" read as three and "3"
+    read as "no limit" are both plausible, and a limiter must not be the
+    place where that guess is made.
+    """
+    from hub.services.project_policy import REVIEW_LIMIT_MODES
+
+    if "review_limit" in policy:
+        limit = policy["review_limit"]
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError(
+                f"gate_policy review_limit must be an integer >= 1, got: {limit!r}"
+            )
+    if "review_limit_mode" in policy:
+        mode = policy["review_limit_mode"]
+        if mode not in REVIEW_LIMIT_MODES:
+            raise ValueError(
+                "gate_policy review_limit_mode must be one of "
+                f"{', '.join(REVIEW_LIMIT_MODES)}, got: {mode!r}"
+            )
 
 
 def _validated_risk_map(value: Any) -> dict[str, str]:
@@ -826,6 +855,15 @@ class LiveCheckState(BaseModel):
 
     ``sha_mismatch`` names the case the card must not hide: the observation
     exists but was taken against another build than the one delivered.
+
+    ``deploy_state`` is the OTHER half of that question, and it is not the
+    same one (#837, #1231 review). The sha says which commit the observer
+    named; this says whether the hub could confirm that commit is what
+    production runs — ``in_prod``, ``unknown`` when the hub has no delivery
+    facts to check against, or empty for rows written before the check
+    existed. Recording an unverified observation is deliberate: an
+    installation that knows nothing about production must not have its
+    ignorance turned into a gate. Reading it as confirmation is not.
     """
 
     state: str = "unknown"
@@ -837,6 +875,7 @@ class LiveCheckState(BaseModel):
     sha: str = ""
     delivered_sha: str = ""
     sha_mismatch: bool = False
+    deploy_state: str = ""
     recorded_agent: str = ""
     created_at: str = ""
 
@@ -900,6 +939,25 @@ class DiffBaseState(BaseModel):
     sha: str = ""
 
 
+class BaseMergeState(BaseModel):
+    """Разойдётся ли ветка с базой при доставке — ДО вердикта (#1233).
+
+    ``state``: ``clean`` | ``conflicting`` | ``unknown`` | ``not_applicable``.
+    Четыре, и они не схлопываются: «конфликта нет» и «спросить не удалось»
+    ведут к противоположным действиям, а «нечего спрашивать» (нет PR) — это не
+    зелёный свет. 09.09.2026 человек узнал о конфликте #1204 через четырнадцать
+    секунд ПОСЛЕ того, как потратил вердикт: гейт отказал в доставке, задача
+    ушла на второй круг ревью, и то же одобрение пришлось выдавать снова.
+
+    ``files`` — имена конфликтующих файлов, когда git смог их назвать. Пусто —
+    это «назвать не удалось», а не «их не было»: конфликт остаётся конфликтом.
+    """
+
+    state: str = "unknown"
+    reason: str = ""
+    files: list[str] = Field(default_factory=list)
+
+
 class EvidenceCoverage(BaseModel):
     """How much of this brief is evidence, and how much is absence (#725).
 
@@ -930,6 +988,32 @@ class ReviewInFlight(BaseModel):
     profile: str = ""
     elapsed_minutes: int = 0
     grace_until: str = ""
+    headline: str = ""
+
+
+class GenerationReview(BaseModel):
+    """Есть ли ревью у ТЕКУЩЕГО поколения сдачи — один правдивый ответ (#1262).
+
+    ``has_review`` истинно только для отчёта этого поколения, который не
+    назван неполным и несёт улику исполнения (#750, #841): «ревью нет» не
+    смеет читаться как «ревью чистое». Когда ревью нет, ``reason`` — код
+    причины (``provider_refused``, ``incomplete_report``,
+    ``no_execution_evidence``, ``run_failed``, ``in_flight``,
+    ``not_dispatched``), а ``reason_detail`` — наблюдённая деталь. Отчёт
+    прошлого поколения назван в ``previous_generation`` и ревью текущего
+    не считается.
+    """
+
+    generation: int = 0
+    has_review: bool = False
+    reviewer_principal: str = ""
+    reviewer_model: str = ""
+    sha: str = ""
+    # None — отчёт полноту не заявлял (строки до #549), не «полный».
+    complete: bool | None = None
+    reason: str = ""
+    reason_detail: str = ""
+    previous_generation: int | None = None
     headline: str = ""
 
 
@@ -1044,6 +1128,9 @@ class ReviewBrief(BaseModel):
     # whether it resolves. An unresolved base leaves diff_command empty — a
     # command that cannot run reads as an offer to verify.
     diff_base: DiffBaseState = Field(default_factory=DiffBaseState)
+    # #1233: расхождение с базой названо ДО вердикта, а не после отказа
+    # доставки. Читатель у поля тот же, что у diff_base, — человек на гейте.
+    base_merge: BaseMergeState = Field(default_factory=BaseMergeState)
     # #725: one verdict over all evidence blocks below.
     evidence_coverage: EvidenceCoverage = Field(default_factory=EvidenceCoverage)
     review_cycle: int = 0
@@ -1072,6 +1159,9 @@ class ReviewBrief(BaseModel):
     review_report: "ReviewReport | None" = None
     # #1027: a hub-called review still in the air for THIS submission.
     review_in_flight: ReviewInFlight | None = None
+    # #1262: has THIS generation been reviewed — by whom, on which sha, how
+    # completely — or why not. None means this path did not assemble it.
+    current_generation_review: GenerationReview | None = None
     # #433: fail-fast notice when the caller implemented this task.
     self_review_warning: SelfReviewWarning | None = None
     # #438: advisory — non-empty when the branch carries commits of another
@@ -2194,6 +2284,7 @@ class ProjectPatch(BaseModel):
                 )
         if "risk_map" in v:
             v["risk_map"] = _validated_risk_map(v["risk_map"])
+        _validate_review_limit(v)
         return v
 
     @model_validator(mode="before")
@@ -2810,6 +2901,12 @@ class MachineReviewView(BaseModel):
     # about itself. False on rows written before the column existed — there
     # the question was never asked, which is not the same as "independent".
     self_reviewed: bool = False
+    # Who owns the report, from the TOKEN (#1025). The column arrived AFTER
+    # ``self_reviewed``, so a report with an owner is one about which the
+    # "did the author review it" question was actually asked. None means
+    # nobody established independence — which a reader of ``self_reviewed``
+    # alone would mistake for "someone else looked" (#1231, f9ac6478eaeb2ac2).
+    principal_id: int | None = None
     created_at: str = ""
     # What the gate said each confirmed finding turned out to be (#876). An
     # empty list means nobody judged them — never that they were all fine.
@@ -3338,6 +3435,10 @@ STEWARD_ESCALATE_REASONS: tuple[str, ...] = (
     # #1268: привратник применения на проекте, где вердикт стюарду не отдан
     # (теневое участие): суждение записано, применять его нельзя.
     "policy_not_delegated",
+    # #1327: одобрение или возврат без названного основания либо без
+    # уверенности нельзя перепроверить — хаб пишет их эскалацией.
+    "no_grounds",
+    "no_confidence",
 )
 STEWARD_CLOSURE_TYPES: tuple[str, ...] = (
     "fixed",

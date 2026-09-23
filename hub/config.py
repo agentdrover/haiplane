@@ -332,6 +332,13 @@ UNREFINED_DRAFT_MINUTES = int(env_get("UNREFINED_DRAFT_MINUTES", "240"))
 UNJUDGED_FINDINGS_ALERT_THRESHOLD = int(
     env_get("UNJUDGED_FINDINGS_ALERT_THRESHOLD", "40")
 )
+# Сторож недоступного ревьюера (#1262). 10–13.09.2026 провайдер ревью
+# отказывал трое суток подряд (usage_limit_exceeded), очередь review стояла
+# без отчётов, а хаб писал отказ только в карточку каждой задачи — картину
+# собрали вручную. Сторож поднимает ОДНО событие хаба, когда отказы идут
+# дольше этого числа часов подряд. Стартовое значение — рубеж stale-review
+# (2 ч). 0 выключает сторожа.
+REVIEWER_UNAVAILABLE_HOURS = float(env_get("REVIEWER_UNAVAILABLE_HOURS", "2"))
 # Delivery reconciliation (#897): how often the poller compares "completed"
 # against "the PR is still open", and how far back it looks. On a timer because
 # every candidate costs a call to GitHub; bounded in time because history from

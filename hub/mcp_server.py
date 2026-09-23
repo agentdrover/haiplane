@@ -2152,6 +2152,12 @@ async def hub_submit_for_review(
     )
 
 
+def _generation_review_line(brief: dict[str, Any]) -> str:
+    """Есть ли ревью у текущей сдачи — строкой, а не догадкой по отчёту (#1262)."""
+    headline = (brief.get("current_generation_review") or {}).get("headline")
+    return f"Ревью текущей сдачи: {headline}" if headline else ""
+
+
 def _review_circle_line(brief: dict[str, Any]) -> str:
     """Строка про круг ревью, или пустая, когда заходов не было (#1235).
 
@@ -2175,6 +2181,65 @@ def _review_circle_line(brief: dict[str, Any]) -> str:
             + " — харнесс ходит по одному месту, и это важнее числа заходов"
         )
     return line
+
+
+def _brief_statement_lines(brief: dict[str, Any]) -> list[str]:
+    """Scope, checklist, validation commands, constraints and hints.
+
+    Split out of ``hub_get_review_brief`` when the merge of #1233 with develop
+    pushed that function past the statement budget. The cut follows a seam that
+    was already there: every line here comes from the STATEMENT of the task and
+    none of them looks at the branch, the diff or the verdict.
+    """
+    parts: list[str] = []
+    if brief.get("scope_in"):
+        parts.append("\nIn scope: " + "; ".join(brief["scope_in"]))
+    if brief.get("scope_out"):
+        parts.append("Out of scope: " + "; ".join(brief["scope_out"]))
+    if brief.get("out_of_scope_for_review"):
+        parts.append(
+            "Out of scope for review: " + "; ".join(brief["out_of_scope_for_review"])
+        )
+    if brief.get("review_checklist"):
+        parts.append("\nReview checklist:")
+        parts.extend(f"  - {item}" for item in brief["review_checklist"])
+    if brief.get("validation_commands"):
+        parts.append("\nValidation commands:")
+        parts.extend(f"  - {cmd}" for cmd in brief["validation_commands"])
+    if brief.get("constraints"):
+        parts.append("\nConstraints: " + "; ".join(brief["constraints"]))
+    if brief.get("technical_hints"):
+        parts.append(f"\nTechnical hints:\n{brief['technical_hints']}")
+    return parts
+
+
+def _brief_evidence_lines(brief: dict[str, Any]) -> list[str]:
+    """Base-merge divergence (#1233) and the coverage verdict over the blocks.
+
+    Both answer the same question — what the reviewer is NOT being told — so
+    they move together, and the base-merge block stays immediately above the
+    coverage line that counts it.
+    """
+    parts: list[str] = []
+    # #1233: расхождение с базой — ДО вердикта. Раньше человек узнавал о нём
+    # из отказа доставки, то есть после того, как одобрение уже потрачено.
+    merge_state = brief.get("base_merge") or {}
+    if merge_state.get("state") in ("conflicting", "unknown"):
+        parts.append(
+            f"\nМерж в базу [{merge_state['state']}]: {merge_state.get('reason', '')}"
+        )
+        parts.extend(f"  - {path}" for path in merge_state.get("files") or [])
+    coverage = brief.get("evidence_coverage") or {}
+    if coverage.get("headline"):
+        parts.append(
+            f"\nEvidence coverage [{coverage.get('state', '?')}]: "
+            f"{coverage['headline']}"
+        )
+        parts.extend(
+            f"  - {miss.get('check', '?')}: {miss.get('reason', '')}"
+            for miss in coverage.get("checks_missing") or []
+        )
+    return parts
 
 
 @mcp.tool()
@@ -2213,9 +2278,11 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
             f"| review cycle {brief.get('review_cycle', 0)}",
         ]
     )
-    circle_line = _review_circle_line(brief)
-    if circle_line:
-        parts.append(circle_line)
+    parts.extend(
+        line
+        for line in (_generation_review_line(brief), _review_circle_line(brief))
+        if line
+    )
     if brief.get("description"):
         parts.append(f"\nDescription:\n{brief['description']}")
     acs = brief.get("acceptance_criteria") or []
@@ -2227,26 +2294,7 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
                 f"Given: {ac.get('given', '')} | When: {ac.get('when', '')} "
                 f"| Then: {ac.get('then', '')}"
             )
-    if brief.get("scope_in"):
-        parts.append("\nIn scope: " + "; ".join(brief["scope_in"]))
-    if brief.get("scope_out"):
-        parts.append("Out of scope: " + "; ".join(brief["scope_out"]))
-    if brief.get("out_of_scope_for_review"):
-        parts.append(
-            "Out of scope for review: " + "; ".join(brief["out_of_scope_for_review"])
-        )
-    if brief.get("review_checklist"):
-        parts.append("\nReview checklist:")
-        for item in brief["review_checklist"]:
-            parts.append(f"  - {item}")
-    if brief.get("validation_commands"):
-        parts.append("\nValidation commands:")
-        for cmd in brief["validation_commands"]:
-            parts.append(f"  - {cmd}")
-    if brief.get("constraints"):
-        parts.append("\nConstraints: " + "; ".join(brief["constraints"]))
-    if brief.get("technical_hints"):
-        parts.append(f"\nTechnical hints:\n{brief['technical_hints']}")
+    parts.extend(_brief_statement_lines(brief))
     if brief.get("branch"):
         pr = f" | PR #{brief['pr_number']}" if brief.get("pr_number") else ""
         parts.append(f"\nBranch: {brief['branch']}{pr}")
@@ -2261,14 +2309,7 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
                 parts.append(f"  base NOT verified: {base['reason']}")
         elif base.get("reason"):
             parts.append(f"Diff: NOT AVAILABLE — {base['reason']}")
-    coverage = brief.get("evidence_coverage") or {}
-    if coverage.get("headline"):
-        parts.append(
-            f"\nEvidence coverage [{coverage.get('state', '?')}]: "
-            f"{coverage['headline']}"
-        )
-        for miss in coverage.get("checks_missing") or []:
-            parts.append(f"  - {miss.get('check', '?')}: {miss.get('reason', '')}")
+    parts.extend(_brief_evidence_lines(brief))
     if brief.get("stacking_warning"):
         parts.append(f"\n{brief['stacking_warning']}")
     if brief.get("latest_submission_summary"):

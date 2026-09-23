@@ -34,7 +34,7 @@ from hub.integrations.protocols import (
 )
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
-from hub.services import workflow_seed
+from hub.services import base_merge, workflow_seed
 from hub.services.gate_events import (
     HUMAN_GATE_EVENT_KINDS,
     NON_HUMAN_GATE_ACTORS,
@@ -1993,7 +1993,32 @@ STACK_DELIVERY_STATUSES = [
     # from the statuses I had in mind rather than from the enum. A task
     # waiting to report owns a pushed branch like any other.
     "pending_report",
+    # #1275, found by the #1271 partition test, which walks TaskStatus whole
+    # instead of the statuses in mind. Each is reachable from running with the
+    # branch already pushed, and each goes back to running by an ordinary
+    # transition, so the base will deliver itself and a hold is the answer:
+    #   needs_info — running → needs_info (hub_ask_question); the answer sends
+    #                it to open.
+    #   open       — running → open (chat_pair_reaper), needs_info → open.
+    #   claimed    — open → claimed on the way back to running.
+    # An open or claimed task that never started has no branch, and the walk
+    # already skips rows without one (list_unmerged_branch_tasks).
+    "needs_info",
+    "open",
+    "claimed",
 ]
+
+# #1275: statuses whose branch may be unmerged and which will NEVER deliver
+# themselves. `failed` is final (FINAL_STATUSES; LIFECYCLE_TRANSITIONS has no
+# way out of it) and reached from running when a headless run fails — with its
+# branch possibly pushed. Waiting for it would be a promise the hub cannot
+# keep, so it is not in the list above: the delivery walk reads it as a base
+# that cannot deliver itself, and a definite stack on it goes to a human, like
+# the stranded `completed` of #1204. Kept apart from that one on purpose: a
+# failed task has no delivery registry row, and its branch is often never
+# published at all (the run failed before a push) — that case must stay #1283's
+# merge-with-alert, not call a human on every delivery in the project.
+STACK_TERMINAL_STATUSES = ["failed"]
 
 
 # #1186: the three answers the delivery gate needs and the advisory hint
@@ -2143,6 +2168,70 @@ async def _walk_stacking_candidates(
             yield row, name, result
 
 
+def _why_base_never_delivers(assessment: "StackAssessment") -> str:
+    """Why waiting for this base is pointless, and what a human can do (#1204, #1275).
+
+    Two different facts reach ``stranded_base``, and the text must name the
+    true one. A task accepted without delivery has a PR the registry knows
+    about. A failed task (#1275) was not accepted by anyone and may have no PR
+    at all — «человек принял» and «её PR открыт» would both be false there.
+    """
+    if assessment.base_task_status in STACK_TERMINAL_STATUSES:
+        return (
+            f"и эта задача упала (статус {assessment.base_task_status} "
+            f"финальный). Ждать нечего: конвейер к упавшей задаче не вернётся, "
+            f"а мерж сейчас унёс бы её работу в базовую ветку под номером этой "
+            f"задачи. Решение за человеком: спасти работу "
+            f"#{assessment.base_task_id} отдельной доставкой или отвязать от "
+            f"неё эту ветку"
+        )
+    return (
+        f"и эту задачу человек принял, НЕ доставив — "
+        f"{_base_pr_phrase(assessment.base_delivery_state)}. Ждать нечего: "
+        f"конвейер к принятой задаче не вернётся, а мерж сейчас унёс "
+        f"бы её работу в базовую ветку под номером этой задачи. "
+        f"Решение за человеком: доставить "
+        f"#{assessment.base_task_id} или отвязать от неё эту ветку"
+    )
+
+
+def _unprobed_undeliverable(assessment: "StackAssessment") -> str:
+    """A base that never delivers itself, whose branch origin no longer has.
+
+    #1204 wrote this for a task accepted without delivery; review of #1275
+    (9bc10bd45785a1af) brought a failed one here too, and neither was accepted
+    by anyone nor has a PR the registry knows — so the text names its status.
+    """
+    base_id = assessment.unprobed_stranded_task_id
+    unknown_part = (
+        f"её ветку '{assessment.base_task_branch}' origin на прямой вопрос "
+        f"назвал несуществующей. Поэтому хаб НЕ знает, не стоит ли эта ветка "
+        f"на ней, и «не смог проверить» тут не то же самое, что «стопки нет»."
+    )
+    if assessment.base_task_status in STACK_TERMINAL_STATUSES:
+        return (
+            f"задача #{base_id} упала (статус {assessment.base_task_status} "
+            f"финальный) после того, как сдавала работу, а {unknown_part} "
+            f"Ждать бесполезно: к упавшей задаче конвейер не вернётся, её "
+            f"ветку никто не вернёт. Решение за человеком: подтвердить, что "
+            f"эта ветка от неё не отведена, либо спасти работу #{base_id} "
+            f"отдельной доставкой"
+        )
+    return (
+        f"задачу #{base_id} человек принял, НЕ доставив "
+        f"({_base_pr_phrase(assessment.base_delivery_state)}), а её ветку "
+        f"'{assessment.base_task_branch}' не разрешается, а origin на "
+        f"прямой вопрос ответил, что такой ветки у него нет — обычно так "
+        f"выглядит удаление ветки после ручного мержа. Поэтому хаб НЕ "
+        f"знает, не стоит ли эта ветка на ней, и «не смог проверить» тут "
+        f"не то же самое, что «стопки нет». Ждать бесполезно: принятая "
+        f"задача терминальна, её ветку никто не вернёт. Решение за "
+        f"человеком: доставить или закрыть PR задачи "
+        f"#{base_id}, либо подтвердить, что "
+        f"эта ветка от неё не отведена"
+    )
+
+
 def _base_pr_phrase(delivery_state: str) -> str:
     """What the stranded base's PR is, as the registry recorded it (#1204).
 
@@ -2260,6 +2349,49 @@ def _stranded_with_a_dead_ref(
         base_can_deliver_itself=False,
         unprobed_stranded_task_id=int(other["id"]),
         base_delivery_state=other.get("delivery_state") or "",
+    )
+
+
+def _terminal_with_a_dead_ref(
+    other: dict[str, Any],
+    other_branch: str,
+    result: Any,
+    terminal: set[int],
+) -> "StackAssessment | None":
+    """A failed base that DID publish its branch, and origin no longer has it.
+
+    Review of #1275, 9bc10bd45785a1af (high). Left to the generic path this row
+    became a retryable unknown — a silent hold on every delivery in the
+    project that nothing will ever lift, because a failed task is final and
+    nobody pushes its branch back. The #1204 brick through the #1275 door. So
+    it calls a human, like a stranded base with a dead ref.
+
+    Only once the task has submitted: a failed task that never did is #1283's
+    "nothing to compare yet" and merges with an alert (see
+    ``_a_branch_origin_never_had``). The same equality guard as the stranded
+    twin: our own branch among the unresolved names is a fact about this
+    machine, not about that task.
+    """
+    if int(other["id"]) not in terminal:
+        return None
+    if result.outcome is not StackProbeOutcome.unavailable:
+        return None
+    if result.reason != "ref_unresolved":
+        return None
+    unresolved = {n.strip() for n in (result.details or "").split(",") if n.strip()}
+    if unresolved != {other_branch}:
+        return None
+    if int(other.get("submission_generation") or 0) == 0:
+        return None
+    return StackAssessment(
+        outcome=STACK_UNKNOWN,
+        reason=f"terminal_ref_unresolved: {other_branch}",
+        retryable=False,
+        base_task_id=int(other["id"]),
+        base_task_branch=other_branch,
+        base_task_status=other.get("status") or "",
+        base_can_deliver_itself=False,
+        unprobed_stranded_task_id=int(other["id"]),
     )
 
 
@@ -2417,9 +2549,12 @@ class _UnansweredRows:
         other_branch: str,
         result: Any,
         stranded: set[int],
+        terminal: set[int],
     ) -> None:
         """Разложить «не чисто и не стопка» по своим полкам, в порядке разбора."""
-        dead = _stranded_with_a_dead_ref(other, other_branch, result, stranded)
+        dead = _stranded_with_a_dead_ref(
+            other, other_branch, result, stranded
+        ) or _terminal_with_a_dead_ref(other, other_branch, result, terminal)
         if dead is not None:
             self.stranded_unprobed, self.closed_gone = _file_dead_ref(
                 dead, self.stranded_unprobed, self.closed_gone
@@ -2512,6 +2647,7 @@ async def assess_branch_stacking(
     own_project = await _project_id_for(db, task_id)
     rows: list[Any] = []
     stranded: set[int] = set()
+    terminal: set[int] = set()
     if statuses is not None:
         # #1204: the delivery question only. The advisory callers keep asking
         # "is someone working on top of me", and a task nobody is working on
@@ -2530,6 +2666,13 @@ async def assess_branch_stacking(
         ):
             rows.append(row)
             stranded.add(int(dict(row)["id"]))
+        # #1275: the same "never delivers itself", and first in the walk for
+        # the same reason — but its own set, see STACK_TERMINAL_STATUSES.
+        for row in await repo.list_unmerged_branch_tasks(
+            db, exclude_task_id=task_id, statuses=STACK_TERMINAL_STATUSES
+        ):
+            rows.append(row)
+            terminal.add(int(dict(row)["id"]))
     rows.extend(
         await repo.list_unmerged_branch_tasks(
             db, exclude_task_id=task_id, statuses=statuses or STACK_ADVISORY_STATUSES
@@ -2598,7 +2741,7 @@ async def assess_branch_stacking(
                 base_task_branch=other_branch,
                 base_task_status=other_status,
                 relation=relation,
-                base_can_deliver_itself=other_id not in stranded,
+                base_can_deliver_itself=other_id not in stranded | terminal,
                 base_delivery_state=other.get("delivery_state") or "",
                 message=_stacking_message(
                     relation, branch, other_branch, other_id, other_status, base
@@ -2609,7 +2752,7 @@ async def assess_branch_stacking(
                 continue
             return found
         if result.outcome is not StackProbeOutcome.clear:
-            unanswered.file(other, other_branch, result, stranded)
+            unanswered.file(other, other_branch, result, stranded, terminal)
     answer = unanswered.best(benign)
     if answer is not None:
         return answer
@@ -2819,12 +2962,62 @@ async def _approved_code_check(
             f"Одобрен коммит {pinned[:12]}."
         )
     if current_tip != pinned:
+        # #1233: вершина сдвинулась — но ЧЕМ? Если в ветку приехала только база,
+        # авторская работа та же, и второй человеческий вердикт за неё — плата
+        # за механику, а не за содержание. Признак механический: дифф ветки к
+        # базе до и после мержа. Проверка стоит два чтения диффа и делается
+        # только здесь, на уже разошедшейся вершине.
+        kept, why = await base_merge_kept_the_verdict(db, task, pinned, current_tip)
+        if kept:
+            return "", (
+                f"Мерж базы в ветку: одобренный коммит {pinned[:12]} сменился "
+                f"на {current_tip[:12]}, но {why}. Вердикт остаётся текущим, "
+                f"второго одобрения не требуется (#1233). Зелёная валидация на "
+                f"новой вершине проверяется отдельно, ниже по этому же гейту."
+            )
         return (
             f"stale_approval: одобрен {pinned[:12]}, ветка на "
             f"{current_tip[:12]} — пересдайте, чтобы ревью увидело текущий код "
-            f"(PR #{pr_num})"
+            f"(PR #{pr_num}). {why}"
         ), ""
     return "", ""
+
+
+async def base_merge_kept_the_verdict(
+    db: aiosqlite.Connection, task: dict[str, Any], pinned: str, current_tip: str
+) -> tuple[bool, str]:
+    """Пережил ли вердикт сдвиг вершины: приехала база или правил автор (#1233).
+
+    Возвращает ``(сохранён, причина)``, и причина заполнена в обоих исходах —
+    сохранение вердикта без сказанного вслух основания ничем не отличается от
+    доверия.
+
+    Сравниваются два диффа ветки к базе: одобренной вершины и текущей. Совпали
+    байт в байт — привезена только база. Это НАБЛЮДЕНИЕ, а не разбор сообщения
+    коммита: «merge develop» в заголовке пишется рукой и ничего не доказывает.
+
+    Известная узость, и она в безопасную сторону: если база тронула тот же файл,
+    что и автор, дифф перестаёт совпадать (другой блоб базы — другая строка
+    ``index``, вставка базы — другие смещения ханков), и вердикт слетает, то
+    есть ровно сегодняшнее поведение. Наблюдено на настоящем git в
+    tests/test_delivery_gate.py. Обратной ошибки — сохранить вердикт там, где
+    автор правил, — такое сравнение не допускает, и это здесь важнее полноты.
+    """
+    branch = (task.get("branch") or "").strip()
+    if not branch:
+        return False, "у задачи нет ветки, сверять дифф не с чем"
+    try:
+        ctx = await project_git_context(db, task["id"])
+        workspace = ctx.get("repo")
+        base = git_ops_mod._resolve_base(ctx.get("base_branch"))
+        if not workspace:
+            return False, "у проекта нет клона, чтобы сверить дифф к базе"
+        before = await plugins.git_ops.branch_diff(workspace, base, pinned)
+        after = await plugins.git_ops.branch_diff(workspace, base, current_tip)
+    except Exception as exc:  # noqa: BLE001 - деградация, а не отказ гейта
+        log.warning("base-merge check failed for #%s: %s", task["id"], exc)
+        return False, f"сверка диффа к базе не состоялась: {exc}"
+    return base_merge.author_diff_unchanged(before, after)
 
 
 def _seconds_since_ci_start(iso_ts: str | None) -> float | None:
@@ -3072,13 +3265,7 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
                     f"подтвердил, сторону хаб не называет)"
                 )
             return (
-                f"{STRANDED_BASE_PREFIX}: {how}, и эту задачу человек принял, "
-                f"НЕ доставив — "
-                f"{_base_pr_phrase(assessment.base_delivery_state)}. Ждать нечего: "
-                f"конвейер к принятой задаче не вернётся, а мерж сейчас унёс "
-                f"бы её работу в базовую ветку под номером этой задачи. "
-                f"Решение за человеком: доставить "
-                f"#{assessment.base_task_id} или отвязать от неё эту ветку"
+                f"{STRANDED_BASE_PREFIX}: {how}, {_why_base_never_delivers(assessment)}"
             )
         if assessment.relation != git_ops_mod.STACK_ANCESTRY_HEAD_IS_DESCENDANT:
             # #1186, found by the machine review of this very change. Waiting
@@ -3117,20 +3304,7 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
         # основания — ровно тот инцидент, ради которого условие написано.
         # Значит третий исход: не ждать и не мержить, а позвать человека,
         # назвав задачу и то, чего именно хаб не смог проверить.
-        return (
-            f"{UNPROBED_STRANDED_BASE_PREFIX}: задачу "
-            f"#{assessment.unprobed_stranded_task_id} человек принял, НЕ "
-            f"доставив ({_base_pr_phrase(assessment.base_delivery_state)}), а её ветку "
-            f"'{assessment.base_task_branch}' не разрешается, а origin на "
-            f"прямой вопрос ответил, что такой ветки у него нет — обычно так "
-            f"выглядит удаление ветки после ручного мержа. Поэтому хаб НЕ "
-            f"знает, не стоит ли эта ветка на ней, и «не смог проверить» тут "
-            f"не то же самое, что «стопки нет». Ждать бесполезно: принятая "
-            f"задача терминальна, её ветку никто не вернёт. Решение за "
-            f"человеком: доставить или закрыть PR задачи "
-            f"#{assessment.unprobed_stranded_task_id}, либо подтвердить, что "
-            f"эта ветка от неё не отведена"
-        )
+        return f"{UNPROBED_STRANDED_BASE_PREFIX}: {_unprobed_undeliverable(assessment)}"
     if assessment.outcome == STACK_UNKNOWN and assessment.retryable:
         return (
             f"{STACK_UNKNOWN_PREFIX}: проверить, не стоит ли ветка на чужой "
@@ -3144,6 +3318,25 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             db, task["id"], "hub", "alert", _unchecked_stack_alert(assessment)
         )
     return ""
+
+
+def _unpublished_wait_phrase(assessment: "StackAssessment") -> str:
+    """Why nothing is waited for on an unpublished neighbour (#1283, #1275).
+
+    Review of #1275, 6fc293188dd34632: «ветка появится после первого пуша» is
+    true of a task still on the conveyor and false of a failed one — there is
+    no way out of failed, so no push is coming.
+    """
+    if assessment.base_task_status in STACK_TERMINAL_STATUSES:
+        return (
+            f"Ждать тут нечего: задача упала (статус "
+            f"{assessment.base_task_status} финальный), пуша уже не будет, и "
+            f"сравнивать эту ветку не с чем и не будет."
+        )
+    return (
+        "Ждать тут нечего: ветка появится, когда исполнитель сделает первый "
+        "пуш, и до тех пор сравнивать не с чем."
+    )
 
 
 def _unchecked_stack_alert(assessment: "StackAssessment") -> str:
@@ -3171,8 +3364,7 @@ def _unchecked_stack_alert(assessment: "StackAssessment") -> str:
             f"прямой вопрос ответил, что такой ветки у него нет, а сдач у "
             f"той задачи не было ни одной. "
             f"Значит коммитов той задачи нет нигде и унести их этим мержем "
-            f"нельзя. Ждать тут нечего: ветка появится, когда исполнитель "
-            f"сделает первый пуш, и до тех пор сравнивать не с чем. Если "
+            f"нельзя. {_unpublished_wait_phrase(assessment)} Если "
             f"ветка всё же была опубликована и удалена ДО первой сдачи, её "
             f"коммиты уедут в базовую ветку под номером этой задачи — их "
             f"видно в диффе этой задачи (#1283)."
@@ -3214,6 +3406,8 @@ PR_DRAFT_PREFIX = "pr_draft"
 # retryable kind; see _stacking_gate_step for why the other kind does not
 # refuse at all.
 STACKED_BASE_PREFIX = "stacked_base"
+# #1233: гейт сам разрешил конфликт названного класса и обновил ветку.
+BASE_AUTOMERGE_PREFIX = "base_automerged"
 STACK_UNKNOWN_PREFIX = "stack_unknown"
 # Deliberately NOT in TRANSIENT_GATE_PREFIXES: a stack whose order does not
 # follow from ancestry has nothing to wait for, and a wait would be mutual and
@@ -3244,6 +3438,10 @@ TRANSIENT_GATE_PREFIXES = (
     PR_DRAFT_PREFIX,
     STACKED_BASE_PREFIX,
     STACK_UNKNOWN_PREFIX,
+    # #1233: база слита в ветку и запушена, конфликта больше нет — доставка
+    # состоится следующим циклом. Решать человеку нечего, а needs_decision
+    # здесь стоил бы ровно того вердикта, который задача и снимает.
+    BASE_AUTOMERGE_PREFIX,
     # #1116 (по ревью): мерж СОСТОЯЛСЯ, а подтвердить его не вышло. Раньше
     # это давало обычный merge_failed и уводило к человеку задачу, код
     # которой уже лежит в базовой ветке: PR открыт, реестр пуст, решать
@@ -3255,6 +3453,13 @@ STACKED_BASE_WAIT_HINT = (
     "задачу, как только её основание уедет в базовую ветку. Пересдавать НЕ "
     "нужно и вредно — CI уже зелёный, новых коммитов нет, а пересдача сбросит "
     "вердикт (#612). Если ждать нечего, доставьте основание раньше."
+)
+BASE_AUTOMERGE_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: гейт сам слил "
+    "базу в ветку, разрешил хвостовые добавления и запушил — доставка "
+    "повторится следующим циклом. Пересдавать НЕ нужно и вредно: CI по этой "
+    "работе уже зелёный, авторского кода не прибавилось, а пересдача сбросила "
+    "бы вердикт (#612) — ровно тот, который автомерж и бережёт."
 )
 PR_DRAFT_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: хаб пометит "
@@ -3359,6 +3564,142 @@ def _merge_sha_or_detail(merge_sha: str, detail: str) -> str:
     return detail if re.fullmatch(r"[0-9a-f]{7,40}", detail or "") else ""
 
 
+async def base_automerge_step(
+    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
+) -> tuple[str, str]:
+    """Разрешить конфликт с базой самому — только названного класса (#1233).
+
+    Возвращает ``(отказ, причина)``. Непустой отказ — временный: база слита в
+    ветку и запушена, доставка повторится следующим циклом. Пустой отказ с
+    непустой причиной — класс не наш, и причина уезжает в merge_failed, чтобы
+    человек прочитал не «GitHub отказал», а ЧТО именно не сложилось (AC-4).
+    Пусто и там и там — конфликта не видно или спросить не удалось: обычный
+    отказ доставки, ничего не выдумываем.
+
+    Класс сужен нарочно: только хвостовые добавления с обеих сторон
+    (hub/services/base_merge.py). 09.09.2026 три ветки — #1206, #1208, #1216 —
+    дописывали тесты в конец одного файла, и каждая такая мелочь стоила круга
+    ревью. Смысловой конфликт (#1204) обязан остаться человеческим, и остаётся:
+    у него непустая секция общего предка.
+
+    Автомерж НИКОГДА не молчалив и НИКОГДА не верит хвосту вывода: что именно
+    сложено, пишется в карточку, а валидация после разрешения судится по коду
+    возврата — 09.09 дважды видели «All checks passed» при коде 2.
+    """
+    from hub.db import deserialize_str_list
+    from hub.services import validation_run
+
+    task_id = task["id"]
+    branch = (task.get("branch") or "").strip()
+    workspace = ctx.get("repo")
+    base = git_ops_mod._resolve_base(ctx.get("base_branch"))
+    if not branch or not workspace:
+        return "", ""
+    # ЯКОРЬ АВТОМЕРЖА — закреплённый коммит сдачи, а не вершина ветки. Вершина
+    # к этому моменту могла уехать: между сверкой с одобрением и этим шагом
+    # стоят проба CI, условие стопки и сам отказ мержа, и в это окно в ветку
+    # может лечь чужой пуш. Дерево на вершине означало бы, что автомерж слил и
+    # запушил неодобренный код, а потом перезакрепил на него вердикт человека —
+    # ровно то, против чего #1233 и заведена.
+    pinned = (task.get("submission_sha") or "").strip()
+    if not pinned:
+        return "", (
+            "коммит сдачи не закреплён — автомержу не на чем закрепиться, "
+            "и вершину ветки он не берёт"
+        )
+    files, why = await plugins.git_ops.base_merge_conflicts(
+        workspace, base, branch, task_id, pinned
+    )
+    if files is None:
+        # «Посмотреть не удалось» — не «конфликта нет» и не «конфликт есть».
+        return "", f"проба мержа базы не удалась ({why})"
+    if not files:
+        # База сливается чисто: мерж отказал по другой причине, и приписывать
+        # ему конфликт значит поставить человеку неверный диагноз.
+        return "", ""
+    resolutions, note = base_merge.plan_resolution(files)
+    if not resolutions:
+        return "", f"конфликт вне класса автомержа — {note}"
+
+    commands = deserialize_str_list(task.get("validation_commands"))
+    if not commands:
+        # Нечем доказать, что сложенное вместе работает. Складывать вслепую и
+        # пушить в ветку под чужим одобрением гейт права не имеет.
+        return "", (
+            "конфликт хвостовой, но у задачи нет validation_commands — "
+            "проверить сложенное нечем, поэтому разрешает человек"
+        )
+
+    async def _validate(path: str) -> tuple[int, str] | None:
+        return await validation_run.default_validation_runner(commands, path)
+
+    # ``files`` — та самая проба, по которой посчитано ``resolutions``. Пуш
+    # строит дерево заново и сливает уже НОВЫЙ origin/base, поэтому сверка
+    # конфликта байт в байт идёт туда вместе с разрешением: разошлось — отказ
+    # (находка 2327bd9255c601cc).
+    ok, detail = await plugins.git_ops.push_resolved_base_merge(
+        workspace, base, branch, task_id, resolutions, _validate, pinned, files
+    )
+    if not ok:
+        return "", f"автомерж не состоялся: {detail}"
+    detail = (detail or "").strip()
+    if not detail:
+        # Успех без коммита — не успех. Записать пустоту в submission_sha значит
+        # СТЕРЕТЬ закрепление, а гейт читает пустое закрепление как «сверка не
+        # проводилась» и доставляет без неё (#572). Молчаливая потеря
+        # закрепления опаснее несостоявшегося автомержа, поэтому зовём человека.
+        return "", (
+            "автомерж прошёл, но коммит слитой ветки не назван — закрепление "
+            "сдачи не трогаем, разбирается человек"
+        )
+    # Перезакрепление коммита сдачи — не поблажка, а точность. Этот мерж сделал
+    # САМ гейт: авторского кода в нём нет по построению, и ему не нужно
+    # доказывать это сравнением диффов. Сравнение здесь и не сработало бы —
+    # проверено делом (tests/test_delivery_gate.py): мерж базы меняет в
+    # `git diff base...tip` и строку index, и смещения ханков, даже когда
+    # авторская работа та же. Оставить старый коммит закреплённым значило бы
+    # уронить вердикт, который автомерж только что спас, — то есть отменить
+    # самого себя и всё равно взять с человека второе одобрение.
+    await repo.update_task(db, task_id, submission_sha=detail)
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Автомерж базы (#1233): конфликт с {base} разрешён «оставить оба» — "
+        f"{note}. Ничего не переписано, авторский блок остался первым. "
+        f"Валидация после разрешения прогнана и зелёная по коду возврата: "
+        f"{'; '.join(commands)}. Коммит мержа {detail[:12]}, и коммит сдачи "
+        f"перезакреплён на него: этот коммит сделал гейт, авторского кода в "
+        f"нём нет. Доставка повторится следующим циклом.",
+    )
+    return (
+        f"{BASE_AUTOMERGE_PREFIX}: конфликт с базой был из хвостовых добавлений "
+        f"и разрешён гейтом ({note}); валидация зелёная, ветка обновлена "
+        f"коммитом {detail[:12]} — доставка повторится следующим циклом"
+    ), ""
+
+
+async def refusal_after_automerge(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    merge_detail: str,
+) -> str:
+    """Отказ доставки после того, как автомерж сказал своё слово (#1233).
+
+    Временный отказ, если гейт разрешил конфликт сам, и обычный merge_failed
+    иначе — но с НАЗВАННОЙ причиной, почему автомерж не применён. Человек,
+    которого зовут, обязан читать «обе стороны правят одни и те же строки», а
+    не «GitHub отказал в мерже»: второе не ведёт никуда.
+    """
+    healed, cause = await base_automerge_step(db, task, ctx)
+    if healed:
+        return healed
+    detail = _merge_failure_detail(merge_detail)
+    return f"{detail}. Автомерж не применён: {cause}" if cause else detail
+
+
 async def merge_before_completion(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -3459,7 +3800,10 @@ async def merge_before_completion(
             forge=ctx.get("forge", ""),
         )
         if not merged:
-            return False, _merge_failure_detail(merge_detail)
+            # #1233: прежде чем звать человека — не тот ли это класс конфликта,
+            # который разрешается однозначно. Спрашивается ТОЛЬКО после отказа
+            # мержа: у зелёной доставки нет причины платить за пробу.
+            return False, await refusal_after_automerge(db, task, ctx, merge_detail)
 
         # The commit THIS pull request produced — never the branch tip,
         # which is whatever landed last (#534, review round 3).
@@ -3843,6 +4187,14 @@ async def _deliver_completed_pair_task(
             # already green, and resubmitting would stale the verdict.
             if detail.startswith(PR_DRAFT_PREFIX):
                 cause = PR_DRAFT_WAIT_HINT
+            elif detail.startswith(BASE_AUTOMERGE_PREFIX):
+                # #1271 в мерже с #1233: попасть в TRANSIENT_GATE_PREFIXES —
+                # только половина вступления в этот набор. Не названный здесь
+                # префикс наследует фразу про CI, а она тут ложна дважды: CI
+                # зелёный, и «отчитайтесь о готовности снова» — это ровно та
+                # пересдача, которая сбросит вердикт, ради сохранения которого
+                # автомерж и написан.
+                cause = BASE_AUTOMERGE_WAIT_HINT
             elif detail.startswith((STACKED_BASE_PREFIX, STACK_UNKNOWN_PREFIX)):
                 # #1186, found by the machine review of the change that added
                 # these two: putting a prefix in TRANSIENT_GATE_PREFIXES is
@@ -4091,6 +4443,53 @@ async def _complete_without_review(
     )
     log.info("Task #%d → completed after done report", task_id)
     return "completed"
+
+
+async def _local_tip(branch: str, git_repo: str | None) -> str:
+    """Вершина ветки в рабочем каталоге доставки, или "" если не прочесть."""
+    try:
+        state, detail = await plugins.git_ops.resolve_ref(branch, git_repo or "")
+    except Exception as exc:  # noqa: BLE001 - a fact for later, never fatal
+        log.warning("cannot read the tip of %s: %s", branch, exc)
+        return ""
+    return detail if state == "resolved" and isinstance(detail, str) else ""
+
+
+async def _squash_and_record(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    branch: str,
+    git_repo: str | None,
+    base_branch: str | None,
+) -> bool:
+    """Сжать ветку задачи и записать, если гейт переписал её историю (#1240).
+
+    Сдача закрепила коммит вершины. Если сжатие породило новый коммит, в базу
+    уйдёт он, и закреплённый перестанет быть предком базы на доставленной
+    работе. Проверке доставки нужен ФАКТ, а не догадка по числу коммитов, —
+    поэтому вершина читается до и после: сменилась — гейт переписал ветку, и
+    старая вершина записывается. Не прочиталась — факт не пишется: лучше
+    промолчать о сжатии, чем выдумать его.
+    """
+    before = await _local_tip(branch, git_repo)
+    squashed = await plugins.git_ops.squash_branch(
+        task["id"],
+        task.get("title", ""),
+        branch,
+        repo=git_repo,
+        base_branch=base_branch,
+    )
+    after = await _local_tip(branch, git_repo)
+    if before and after and before != after:
+        await repo.update_task(db, task["id"], gate_squashed_sha=before)
+        log.info(
+            "Task #%d: gate squashed %s (%s → %s)",
+            task["id"],
+            branch,
+            before[:12],
+            after[:12],
+        )
+    return squashed
 
 
 async def _route_after_done(
@@ -4342,12 +4741,8 @@ async def _route_after_done(
     # squash, push and PR all have no subject, and the task still owes a
     # verdict — it just owes no pull request (#991).
     if not nothing_to_deliver:
-        squashed = await plugins.git_ops.squash_branch(
-            task_id,
-            task.get("title", ""),
-            branch,
-            repo=git_repo,
-            base_branch=ctx.get("base_branch"),
+        squashed = await _squash_and_record(
+            db, task, branch, git_repo, ctx.get("base_branch")
         )
         await plugins.git_ops.push_branch(branch, repo=git_repo, force=squashed)
         if not task.get("pr_number"):

@@ -50,6 +50,11 @@ from hub.services import finding_outcome
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.review_evidence import inflight_verdict_note
+from hub.services import review_limit
+from hub.services.review_limit import (
+    run_allowed_by_review_limit,
+    refuse_opening_over_review_limit,
+)
 from hub.services.outcomes import outcome_status_for_task
 from hub.services.task_idempotency import (
     IdempotencyRecord,
@@ -838,6 +843,9 @@ async def create_task(
 
     initial_status, normalized = normalize_task_create(body)
     request_hash = hash_task_create_payload(normalized) if idem_key else None
+    run_check, run_held = await _plan_created_run(db, normalized)
+    if run_held:
+        initial_status = "open"
 
     try:
         if idem_key:
@@ -911,9 +919,8 @@ async def create_task(
         return CreateTaskOutcome(task=task, is_new=False)
 
     result: dict[str, Any] = {}
-    if normalized.run_immediately and normalized.source != TaskSource.agent:
-        row = await repo.get_task(db, task_id)
-        result = await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
+    if _wants_run(normalized):
+        result = await _run_created_task(db, task_id, run_check, run_held)
 
     await log_activity(
         db,
@@ -924,6 +931,41 @@ async def create_task(
 
     task = await _load_task_view(db, task_id)
     return CreateTaskOutcome(task=task, is_new=True)
+
+
+def _wants_run(normalized: TaskCreate) -> bool:
+    return normalized.run_immediately and normalized.source != TaskSource.agent
+
+
+async def _plan_created_run(
+    db: aiosqlite.Connection, normalized: TaskCreate
+) -> tuple[review_limit.ReviewQueueCheck | None, bool]:
+    """Decide the run of create(run_immediately) BEFORE the row exists (#1264).
+
+    A held run inserts the row as open straight away — never running without
+    a job, not even between two commits. Only the initial status changes, not
+    ``normalized``: the idempotency hash must not depend on the queue.
+    """
+    if not _wants_run(normalized):
+        return None, False
+    check = await review_limit.check_review_queue_for_new_task(
+        db, normalized.parent_id, normalized.class_of_service
+    )
+    return check, check is not None and check.outcome == review_limit.HELD
+
+
+async def _run_created_task(
+    db: aiosqlite.Connection,
+    task_id: int,
+    check: review_limit.ReviewQueueCheck | None,
+    held: bool,
+) -> dict[str, Any]:
+    """Card note for the limit's outcome, then the dispatch it allowed."""
+    await review_limit.note_run_check(db, task_id, check, "создана")
+    if held:
+        return {}
+    row = await repo.get_task(db, task_id)
+    return await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
 
 
 async def create_subtasks_bulk(
@@ -1142,13 +1184,19 @@ async def approve_task(
     if not transitioned:
         raise HTTPException(409, "task is no longer draft (concurrent approve?)")
 
-    if body.run:
+    # #1264: the approval stands; only the run waits for the review queue.
+    run_held = bool(body.run) and not await run_allowed_by_review_limit(
+        db, task_id, "одобрена"
+    )
+    if body.run and not run_held:
         task["status"] = "open"
         await dispatch_task(db, task_id, task)
 
     activity_suffix = ""
     if body.run:
         activity_suffix = f" (run={body.run})"
+    if run_held:
+        activity_suffix += " (run held by the review-queue limit)"
     if dor_override_summary is not None:
         activity_suffix += f" (force=true, missing={dor_override_summary})"
     elif body.force:
@@ -1425,6 +1473,11 @@ async def refuse_opening_without_subject(
                 ),
                 "hint": presence.reason,
                 "missing": list(presence.missing),
+                # Подмножество missing, про которое «не найдено» было бы
+                # неправдой: имя в базовой ветке есть, но не определением
+                # (#1287). Отдельным полем, потому что читатель отказа —
+                # человек или агент — решает по нему, что чинить.
+                "text_only": list(presence.text_only),
                 "found_in_branch": presence.found_in_branch,
                 "found_in_task_id": presence.found_in_task_id,
                 "task_id": task_id,
@@ -1451,6 +1504,9 @@ async def start_task(
     # #1232: before anything is written — the plan update below is a write, and
     # a task refused after it would carry a plan for work it never began.
     await refuse_opening_without_subject(db, task_id, task)
+    # #1264: the same place for the same reason — new work does not open
+    # while the project's review queue is at its limit.
+    await refuse_opening_over_review_limit(db, task_id, task)
 
     body = body or TaskStart()
 
@@ -1578,6 +1634,7 @@ async def pair_start_task(
     # follows writes the plan and prepares a branch, and a task refused after
     # that would leave both behind.
     await refuse_opening_without_subject(db, task_id, task)
+    await refuse_opening_over_review_limit(db, task_id, task)
 
     body = body or TaskPairStart()
 
