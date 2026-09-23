@@ -1796,6 +1796,47 @@ class GitOpsIntegration:
             return None
         return {line.strip() for line in out.splitlines() if line.strip()}
 
+    async def files_naming_at_ref(
+        self, repo: str, ref: str, word: str, pathspec: str = "*.py"
+    ) -> set[str] | None:
+        """Files of ``ref`` where ``word`` occurs as a WHOLE WORD (#1287).
+
+        ``-w`` is the whole point, and it is git's own word rule rather than a
+        rule written here: ``ledger_row`` does not match inside
+        ``ledger_rows``, and a substring hit must never read as presence — it
+        would open a task whose subject does not exist under a name that
+        merely resembles it. ``-F`` keeps a name with regex characters in it
+        from being read as a pattern.
+
+        Three answers, not two, like every other read of a ref here (#725):
+        the empty set means "looked and it is nowhere", ``None`` means the
+        look itself did not happen. Git says the first with exit code 1 and
+        the second with anything above it.
+        """
+        rc, out, _ = await _git(
+            "grep",
+            "-l",
+            "-w",
+            "-F",
+            "-e",
+            word,
+            ref,
+            "--",
+            pathspec,
+            repo=repo,
+            check=False,
+        )
+        if rc == 1:
+            return set()
+        if rc != 0:
+            return None
+        prefix = f"{ref}:"
+        return {
+            line[len(prefix) :].strip()
+            for line in out.splitlines()
+            if line.startswith(prefix) and line[len(prefix) :].strip()
+        }
+
     async def commit_exists(self, repo: str, sha: str) -> bool | None:
         """Is this commit here? ``None`` when the repository could not be read.
 
