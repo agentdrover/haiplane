@@ -253,6 +253,11 @@ async def live_check_state(
     sha = row.get("sha") or ""
     mismatch = bool(delivered_sha and sha and sha != delivered_sha)
     reason = row.get("reason") or ""
+    # #837: whether the hub could confirm that what was observed is what
+    # production runs. Carried through rather than dropped (#1231 review): a
+    # reader that sees only the sha learns which commit the OBSERVER named,
+    # which is a claim by the same caller, not a fact the hub checked.
+    deploy_state = row.get("deploy_state") or ""
     if outcome == "failed":
         # #1236: зонд отработал и ответа не принёс. Это НЕ наблюдение, и
         # именно здесь оно могло бы стать им: до появления третьего исхода
@@ -267,6 +272,7 @@ async def live_check_state(
             "sha": sha,
             "delivered_sha": delivered_sha or "",
             "sha_mismatch": mismatch,
+            "deploy_state": deploy_state,
             "recorded_agent": row.get("recorded_agent") or "",
             "created_at": row.get("created_at") or "",
         }
@@ -278,6 +284,7 @@ async def live_check_state(
             "sha": sha,
             "delivered_sha": delivered_sha or "",
             "sha_mismatch": mismatch,
+            "deploy_state": deploy_state,
             "recorded_agent": row.get("recorded_agent") or "",
             "created_at": row.get("created_at") or "",
         }
@@ -295,6 +302,7 @@ async def live_check_state(
         "sha": sha,
         "delivered_sha": delivered_sha or "",
         "sha_mismatch": mismatch,
+        "deploy_state": deploy_state,
         "recorded_agent": row.get("recorded_agent") or "",
         "created_at": row.get("created_at") or "",
     }
