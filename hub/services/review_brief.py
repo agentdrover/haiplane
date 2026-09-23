@@ -365,30 +365,16 @@ async def build_review_brief(
     # itself, not as "nothing moved". Costs one fetch, and only when there is
     # a pinned submission to compare against.
     submission_sha = (task_view.submission_sha or "").strip()
-    current_tip = ""
-    sha_check = "unknown"
-    sha_check_reason = "branch tip was not pinned at submission"
+    current_tip, tip_reason = "", ""
     if submission_sha and task_view.branch:
         current_tip, tip_reason = await services.resolve_branch_tip(
             db, task_id, task_view.branch
         )
-        if not current_tip:
-            sha_check_reason = tip_reason
-        elif current_tip == submission_sha:
-            sha_check = "match"
-            # #725: never a bare green word. Beside blocks that produced no
-            # signal, "match" with an empty reason was read as verification,
-            # while this check only knows where a branch pointer stands.
-            sha_check_reason = review_evidence.sha_check_statement(
-                sha_check, submission_sha, current_tip, task_view.branch or ""
-            )
-        else:
-            sha_check = "diverged"
-            sha_check_reason = (
-                f"submitted at {submission_sha[:12]}, branch now at "
-                f"{current_tip[:12]} — the diff under review is not the code "
-                "in the branch"
-            )
+    # #1334: the classification is one function, shared with the review
+    # queue — which feeds it the tip the hub last observed instead of a fetch.
+    sha_check, sha_check_reason = review_evidence.sha_check_of(
+        submission_sha, task_view.branch or "", current_tip, tip_reason
+    )
 
     # #1233: разойдётся ли ветка с базой при доставке — ДО вердикта, а не
     # после отказа доставки. Спрашивается только на гейте и только при наличии

@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% set active = "review_queue" %}
+{% block title %}Очередь ревью — {{ product_title }}{% endblock %}
+{% block content %}
+<header class="page-header">
+    <h1 class="page-title">Очередь ревью
+        <span class="badge badge-review">{{ queue.rows|length }}</span></h1>
+</header>
+
+{# #1334: строки идут в порядке сборщика — готовые к одобрению, с находками,
+   ждущие отчёта, заблокированные. sha unknown печатается как есть: очередь
+   в сеть не ходит, и вершина, которую хаб давно не наблюдал, не «совпадает». #}
+<p class="muted">Всё читается из хранимых фактов теми же функциями, что и бриф;
+   дифф и сеть не трогаются. Полная картина по задаче — в её брифе.</p>
+{% if queue.note %}<p class="muted">{{ queue.note }}</p>{% endif %}
+
+{% if not queue.rows %}
+<p>В review и needs_decision нет ни одной задачи.</p>
+{% else %}
+<table class="task-table">
+    <thead>
+        <tr>
+            <th>Готовность</th><th>Задача</th><th>Сдача</th><th>sha</th>
+            <th>Отчёт</th><th>Находки</th><th>Вердикт</th><th>Стойло</th><th>Ждёт</th>
+        </tr>
+    </thead>
+    <tbody>
+    {% for r in queue.rows %}
+        <tr>
+            <td>{{ r.readiness }}</td>
+            <td><a href="/tasks/{{ r.task_id }}">#{{ r.task_id }} {{ r.title }}</a>
+                <div class="muted">{{ r.status }}</div></td>
+            <td>{{ r.submission_generation }}</td>
+            <td title="{{ r.sha_check_reason }}">{{ r.sha_check }}</td>
+            <td>{{ r.report_status }}{% if r.review_in_flight %}
+                <div class="muted">{{ r.review_in_flight.headline }}</div>{% endif %}</td>
+            <td>{% if r.findings_confirmed is none %}—{% else %}{{ r.findings_confirmed }} / {{ r.findings_unresolved }}{% endif %}</td>
+            <td>{% if r.verdict %}{{ r.verdict }} (сдача {{ r.verdict_generation }}{% if not r.verdict_is_current %}, не текущий{% endif %}){% else %}—{% endif %}</td>
+            <td>{{ r.stall_reason or "—" }}</td>
+            <td>{% if r.waiting_minutes is none %}?{% else %}{{ r.waiting_minutes }} мин{% endif %}</td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+{% endblock %}

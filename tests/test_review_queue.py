@@ -85,7 +85,7 @@ async def _submitted(client: AsyncClient, git: _Git, title: str, tip: str) -> in
     return task_id
 
 
-_FINDING = {"title": "Off by one", "severity": "major", "category": "logic"}
+_FINDING = {"title": "Off by one", "severity": "high", "category": "logic"}
 
 
 async def _report(
@@ -130,6 +130,13 @@ async def _in_flight(db: aiosqlite.Connection, task_id: int) -> None:
 async def _merge_failed(db: aiosqlite.Connection, task_id: int) -> None:
     """Отказ доставки так, как его пишет гейт (``_deliver_pair_task``)."""
     detail = "merge_failed: GitHub refused the merge"
+    row = dict(await repo.get_task(db, task_id))
+    # Гейт доставляет только одобренное: вердикт текущей сдачи уже записан.
+    await db.execute(
+        "UPDATE tasks SET review_verdict='approved', review_verdict_generation=? "
+        "WHERE id=?",
+        (int(row["submission_generation"] or 0), task_id),
+    )
     await repo.update_task(db, task_id, status="needs_decision")
     await repo.add_task_update(
         db,
@@ -230,19 +237,25 @@ async def test_the_queue_matches_the_brief_field_by_field(
     # повторить ЕГО ответ, а не свой.
     briefs = {}
     for name, task_id in ids.items():
-        git.tip = "moved999" if name == "none" else {
-            "clean": "c1",
-            "findings": "f1",
-            "in_flight": "i1",
-            "incomplete": "p1",
-            "merge_failed": "m1",
-        }[name]
+        git.tip = (
+            "moved999"
+            if name == "none"
+            else {
+                "clean": "c1",
+                "findings": "f1",
+                "in_flight": "i1",
+                "incomplete": "p1",
+                "merge_failed": "m1",
+            }[name]
+        )
         briefs[name] = await build_review_brief(db, task_id)
 
     queue = await review_queue.review_queue(db)
     rows = {row.task_id: row for row in queue.rows}
 
-    assert set(rows) == set(ids.values()), "строка на каждую задачу review/needs_decision"
+    assert set(rows) == set(ids.values()), (
+        "строка на каждую задачу review/needs_decision"
+    )
     for name, task_id in ids.items():
         assert _row_fields(rows[task_id]) == _brief_fields(briefs[name]), name
 
@@ -258,6 +271,7 @@ async def test_the_queue_matches_the_brief_field_by_field(
 
     stalled = rows[ids["merge_failed"]]
     assert stalled.status == "needs_decision"
+    assert stalled.verdict == "approved" and stalled.verdict_is_current
     assert "merge_failed" in stalled.stall_reason, (
         "причина стойла лежала последней строкой ленты — очередь обязана её назвать"
     )

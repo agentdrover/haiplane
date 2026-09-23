@@ -1897,10 +1897,51 @@ async def resolve_branch_tip(
         sha = await plugins.git_ops.head_sha(workspace, branch)
         if not sha:
             return "", f"origin/{branch} did not resolve to a commit"
+        _observed_tips[(int(task_id), branch)] = (sha, datetime.now(UTC))
         return sha, ""
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
         log.warning("could not resolve tip of %s for #%s: %s", branch, task_id, exc)
         return "", f"tip resolution failed: {exc}"
+
+
+#: What ``resolve_branch_tip`` last SAW, per task and branch (#1334). Filled
+#: only by an actual observation — submission, the brief, the delivery gate,
+#: the steward all pass through it — and read by the review queue, which must
+#: not fetch per task. In-process on purpose: a restart forgets it, and the
+#: reader then answers ``unknown``, never a remembered ``match``.
+_observed_tips: dict[tuple[int, str], tuple[str, datetime]] = {}
+
+#: How old an observation may be and still be said. Older is ``unknown``: a
+#: tip seen an hour ago says little about where the branch stands now.
+OBSERVED_TIP_MAX_AGE_MINUTES = 30
+
+
+def observed_branch_tip(task_id: int, branch: str) -> tuple[str, str]:
+    """The last observed tip, without touching the network (#1334).
+
+    Same ``(sha, reason)`` contract as :func:`resolve_branch_tip`: an empty
+    sha means "not known" and the reason says why, so the one classifier
+    (``review_evidence.sha_check_of``) reads both the same way.
+    """
+    branch = (branch or "").strip()
+    if not branch:
+        return "", "task has no branch"
+    seen = _observed_tips.get((int(task_id), branch))
+    if seen is None:
+        return "", "вершину ветки хаб с запуска не наблюдал, а очередь в сеть не ходит"
+    sha, at = seen
+    age = int((datetime.now(UTC) - at).total_seconds() // 60)
+    if age > OBSERVED_TIP_MAX_AGE_MINUTES:
+        return "", (
+            f"последнее наблюдение вершины {age} мин назад — старше "
+            f"{OBSERVED_TIP_MAX_AGE_MINUTES} мин, а очередь в сеть не ходит"
+        )
+    return sha, ""
+
+
+def forget_observed_tips() -> None:
+    """Drop every remembered observation (tests; a restart does the same)."""
+    _observed_tips.clear()
 
 
 def wait_baseline_for(task: dict[str, Any]) -> dict[str, Any]:

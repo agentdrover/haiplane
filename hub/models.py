@@ -1042,6 +1042,51 @@ class ReviewReport(BaseModel):
     machine_review: "MachineReviewView | None" = None
 
 
+class ReviewQueueRow(BaseModel):
+    """One submission in the review queue (#1334).
+
+    Every field is the brief's own answer, read by the brief's own functions
+    from stored facts — no diff, no fetch. ``sha_check`` rests on the tip the
+    hub last OBSERVED; without a fresh observation it is ``unknown`` with a
+    reason, never ``match``. ``findings_*`` are None when there is no current
+    report: "nobody reported" is not "zero findings" (#549).
+    """
+
+    task_id: int
+    title: str = ""
+    status: str = ""
+    submission_generation: int = 0
+    submission_sha: str = ""
+    sha_check: str = "unknown"
+    sha_check_reason: str = ""
+    # none | in_flight | current | incomplete — the report of THIS generation.
+    report_status: str = "none"
+    # The brief's review_report.state verbatim: none | current | stale.
+    report_state: str = "none"
+    report_outcome: str = ""
+    findings_confirmed: int | None = None
+    findings_unresolved: int | None = None
+    review_in_flight: ReviewInFlight | None = None
+    generation_has_review: bool = False
+    generation_review_reason: str = ""
+    verdict: str | None = None
+    verdict_generation: int | None = None
+    verdict_is_current: bool = False
+    stall_reason: str = ""
+    stall_at: str = ""
+    waiting_since: str = ""
+    waiting_minutes: int | None = None
+    # ready | findings | awaiting_report | blocked — the sort key's name.
+    readiness: str = "awaiting_report"
+
+
+class ReviewQueueView(BaseModel):
+    """The whole review queue, ordered by readiness (#1334)."""
+
+    rows: list[ReviewQueueRow] = Field(default_factory=list)
+    note: str = ""
+
+
 class ReviewCircleView(BaseModel):
     """Заходы «закрыли находки — пришли новые», подряд (#1235).
 

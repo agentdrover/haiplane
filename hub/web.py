@@ -1613,6 +1613,21 @@ async def _attach_queue_inputs(db, groups: list[dict[str, Any]]) -> None:
             item["author"] = _author_said(author.get(uid))
 
 
+@router.get("/review-queue", response_class=HTMLResponse)
+async def web_review_queue(request: Request, project: str = Query(default="")):
+    """The review queue as a table (#1334) — the collector the API serves."""
+    from hub.services import review_queue
+
+    db = _db(request)
+    project_id = await services.project_id_for(db, project or None)
+    queue = await review_queue.review_queue(db, project_id=project_id)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "review_queue.html",
+        {"queue": queue, "project": project or ""},
+    )
+
+
 @router.get("/findings", response_class=HTMLResponse)
 async def web_findings_queue(
     request: Request,
