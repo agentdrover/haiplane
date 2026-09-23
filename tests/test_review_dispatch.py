@@ -9830,7 +9830,7 @@ def test_the_recommended_sudo_recipe_still_checks_the_scratch_group(
 async def test_the_queued_local_run_starts_with_a_live_access_code(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
 ):
-    """Код доступа обязан быть жив В МОМЕНТ СТАРТА прогона, а не сдачи.
+    """Код доступа второго в очереди чеканится К ЕГО СТАРТУ, а не при сдаче.
 
     Находка ревьюера Codex 11.09.2026 на ff5b518. Код чеканится в
     ``prepare_review_order`` — то есть внутри HTTP-запроса автора, — а слот
@@ -9840,13 +9840,28 @@ async def test_the_queued_local_run_starts_with_a_live_access_code(
     кодом: основной HTTP-канал отчёта ему не выкупить, и прогон сваливается
     в слабый путь через stdout либо теряет отчёт вовсе.
 
-    Проверяется ТЕМ ЖЕ предикатом, которым живость кода судит сам
-    ``redeem_code`` (не redeem'ом: он потратил бы код), и ровно в тот момент,
-    когда хаб порождает процесс. Первый прогон проверяется вместе со вторым —
-    иначе починка очереди могла бы сломать нормальный путь.
+    ПОЧЕМУ ПРОВЕРКА ЗДЕСЬ НЕ СМОТРИТ НА ЧАСЫ (#1325). Прежняя редакция ставила
+    ``CHAT_PAIR_CODE_SECONDS = 1``, держала слот 2.5 с и спрашивала у базы
+    ``expires_at > datetime('now')``. Требование она держала, но измеряла его
+    гонкой: между чеканкой и чтением на нагруженном бегунке проходило больше
+    секунды, и тест краснел при ВЕРНОМ продукте — прогон CI 35785728735 на
+    develop, где менялся один документ. Воспроизведено на месте: вставь в эту
+    же проверку ``await asyncio.sleep(1.2)`` перед запросом — и на неизменном
+    коде получишь ``[False, False]``.
+
+    Измеряется теперь ПОРЯДОК СОБЫТИЙ, а не разница времён. Снимок всех кодов
+    берётся в момент, когда хаб порождает процесс; код, с которым стартовал
+    второй прогон, обязан в снимке ПЕРВОГО старта отсутствовать — то есть быть
+    отчеканен позже, уже на своём слоте. Мутация, ради которой тест и стоит:
+    ``_prompt_at_slot`` возвращает исходный промт (код выдан при постановке в
+    очередь) — тогда второй стартует с кодом, который существовал уже на
+    старте первого, и снимок это показывает. Живость кода проверяется тем же
+    предикатом, что и у ``redeem_code`` (не redeem'ом: он потратил бы код), но
+    без ``expires_at``: срок жизни здесь продовый, а гонку создавала именно
+    его подмена. Первый прогон проверяется вместе со вторым — иначе починка
+    очереди могла бы сломать нормальный путь.
     """
     import re
-    import time as _time
 
     from hub.services import chat_pair
     from hub.services.review_dispatch import wait_for_local_runs
@@ -9855,32 +9870,47 @@ async def test_the_queued_local_run_starts_with_a_live_access_code(
     _wire(monkeypatch, recorder)
     await _local_principal(db, monkeypatch)
     _own_host_budget(monkeypatch)
-    # Прогон держит слот ДОЛЬШЕ, чем живёт код: на проде это 300 с против
-    # ревью в десятки минут, здесь — те же отношения в секундах.
-    monkeypatch.setattr(config, "CHAT_PAIR_CODE_SECONDS", 1)
-    _stub_reviewer(
-        monkeypatch,
-        tmp_path,
-        "import sys, time; sys.stdin.read(); time.sleep(2.5)",
-    )
+    _stub_reviewer(monkeypatch, tmp_path, "import sys; sys.stdin.read()")
 
-    alive: list[bool] = []
+    # Первый прогон держит слот, пока в очередь не встал второй. Держит СОБЫТИЕ,
+    # а не сон: сон здесь и был гонкой — он задавал срок, который нагруженный
+    # бегунок не обязан соблюдать, а событие задаёт ПОРЯДОК, и его бегунок
+    # нарушить не может.
+    both_queued = asyncio.Event()
+    starts: list[dict[str, object]] = []
+    queue_snapshot: set[str] = set()
+    in_flight = 0
     spawn = local_reviewer._spawn
 
     async def _watching(prompt: str, workdir: str, limit: int, started: float):
+        nonlocal in_flight
         found = re.search(r'"code":"([^"]+)"', prompt)
         assert found, "в промте нет кода доступа — тогда судить не о чем"
-        rows = await db.execute_fetchall(
-            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? "
-            "AND redeemed_at IS NULL AND expires_at > datetime('now')",
-            (chat_pair.hash_pair_code(chat_pair.normalize_pair_code(found.group(1))),),
+        if not starts:
+            # Снимок берётся здесь, а не раньше: к этому моменту ОБА заказа
+            # уже в очереди, то есть код, выданный «при постановке», в базе
+            # непременно есть. Снимок до второй сдачи не доказывал бы ничего.
+            await both_queued.wait()
+            rows = await db.execute_fetchall("SELECT code_hash FROM chat_pair_codes")
+            queue_snapshot.update(dict(r)["code_hash"] for r in rows)
+        code_hash = chat_pair.hash_pair_code(
+            chat_pair.normalize_pair_code(found.group(1))
         )
-        alive.append(bool(rows))
-        return await spawn(prompt, workdir, limit, started)
+        mine = await db.execute_fetchall(
+            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? AND redeemed_at IS NULL",
+            (code_hash,),
+        )
+        in_flight += 1
+        starts.append(
+            {"hash": code_hash, "unredeemed": bool(mine), "at_once": in_flight}
+        )
+        try:
+            return await spawn(prompt, workdir, limit, started)
+        finally:
+            in_flight -= 1
 
     monkeypatch.setattr(local_reviewer, "_spawn", _watching)
 
-    began = _time.monotonic()
     for slug in ("queued-first", "queued-second"):
         await _submitted(
             client,
@@ -9890,17 +9920,31 @@ async def test_the_queued_local_run_starts_with_a_live_access_code(
             repo_name="mrpda/snip-portal",
             forge="gitverse",
         )
+    both_queued.set()
     await wait_for_local_runs()
 
-    assert len(alive) == 2, f"оба прогона обязаны были стартовать: {alive}"
-    assert _time.monotonic() - began > config.CHAT_PAIR_CODE_SECONDS, (
-        "очередь оказалась короче срока жизни кода — тогда тест ничего не "
-        "измерил; удлините полезную нагрузку заглушки"
+    assert len(starts) == 2, f"оба прогона обязаны были стартовать: {starts}"
+    first, second = starts
+    assert [s["at_once"] for s in starts] == [1, 1], (
+        "прогоны шли одновременно — очереди не было, и про «второй в очереди» "
+        f"тест ничего не проверил: {starts}"
     )
-    assert alive == [True, True], (
-        f"код доступа был мёртв на старте прогона: {alive}. Второй в очереди "
-        "не выкупит основной канал отчёта и свалится в слабый путь через "
-        "stdout — или потеряет отчёт вовсе"
+    assert first["hash"] != second["hash"], (
+        "оба прогона стартовали с ОДНИМ кодом: второй его уже не выкупит, "
+        "потому что первый его потратит"
+    )
+    for n, start in enumerate(starts, 1):
+        assert start["unredeemed"], (
+            f"прогон #{n} стартовал с кодом, которого нет в chat_pair_codes "
+            "или который уже потрачен: основной канал отчёта ему не выкупить"
+        )
+    assert queue_snapshot, "снимок очереди пуст — сверять не с чем"
+    assert second["hash"] not in queue_snapshot, (
+        "второй в очереди стартовал с кодом, который существовал уже тогда, "
+        "когда очередь только собралась, — то есть код выдан ПРИ ПОСТАНОВКЕ В "
+        "ОЧЕРЕДЬ, а не к старту. Ждать слота можно дольше, чем живёт код, и "
+        "такой прогон свалится в слабый путь через stdout или потеряет отчёт "
+        "вовсе"
     )
 
 
