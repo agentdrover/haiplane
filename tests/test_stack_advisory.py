@@ -1609,3 +1609,28 @@ async def test_a_failed_unpublished_neighbour_is_not_promised_a_push(
     body = await _feed(db, task_id)
     assert "первый пуш" not in body, "обещание пуша, которого не будет"
     assert "упала" in body
+
+
+async def test_a_broken_clone_is_not_blamed_on_the_failed_task(
+    db: aiosqlite.Connection,
+) -> None:
+    # Двойник #1204: наша ветка среди неразрешённых имён — факт о машине, а не
+    # о той задаче. Такой ответ остаётся повторяемым unknown, человека не зовут.
+    from hub.services.orchestration import STACK_UNKNOWN_PREFIX
+
+    task_id, branch = await _pair_running_task(db, "Клон сломан")
+    base_branch = "task-1304/failed-submitted"
+    await _neighbour(db, base_branch, status="failed", submission_sha="c" * 40)
+    plugins.git_ops = _ScriptedProbeGitOps(
+        {
+            base_branch: StackProbeResult(
+                outcome=StackProbeOutcome.unavailable,
+                reason="ref_unresolved",
+                details=f"{branch},{base_branch}",
+            )
+        }
+    )
+
+    detail = await _gate(db, task_id)
+
+    assert detail.startswith(f"{STACK_UNKNOWN_PREFIX}:"), detail
