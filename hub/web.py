@@ -42,8 +42,10 @@ from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
 from hub.services import chat_pair as chat_pair_svc
 from hub.services import project_policy
+from hub.services import steward_dispatch
 from hub.services.finding_evidence import evidence_for_findings, evidence_for_report
 from hub.services.finding_identity import finding_uids
+from hub.services.lifecycle import DELIVER_DISPOSITION, REGISTRY_REFUSAL_PREFIX
 from hub.services.review_evidence import inflight_view
 from hub.version import get_app_version
 from hub.models import (
@@ -87,6 +89,30 @@ TEMPLATES = Jinja2Templates(
 TEMPLATES.env.globals["product_name"] = brand.PRODUCT_NAME
 TEMPLATES.env.globals["product_title"] = brand.PRODUCT_TITLE
 TEMPLATES.env.globals["app_version"] = get_app_version()
+
+
+def default_pr_disposition(task: Any) -> str:
+    """What the accept form preselects for the PR's fate (#1333).
+
+    ``deliver`` only when there is something the gate could deliver: a
+    recorded PR AND an approved verdict on the CURRENT submission. Anything
+    else leaves the choice empty — the legal "not chosen" of #897 — because
+    preselecting a merge the gate would refuse anyway only teaches the reader
+    that the default means nothing. The gate still checks sha and CI on
+    submit; this is a default, not a verdict.
+    """
+
+    def _field(name: str) -> Any:
+        if isinstance(task, dict):
+            return task.get(name)
+        return getattr(task, name, None)
+
+    if _field("pr_number") and _field("review_approved_current"):
+        return DELIVER_DISPOSITION
+    return ""
+
+
+TEMPLATES.env.globals["default_pr_disposition"] = default_pr_disposition
 
 router = APIRouter()
 
@@ -618,21 +644,31 @@ async def _apply_analyst_ready_filter(
     return tasks, ready_by_id
 
 
-async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLResponse:
-    """Return a small 'done' indicator for HTMX-swapped items."""
-    db = _db(request)
+async def _task_done_html(
+    db: aiosqlite.Connection, task_id: int, note: str = ""
+) -> str:
+    """The small 'done' row, optionally with a plain-text note (escaped)."""
     row = await repo.get_task(db, task_id)
     if not row:
-        return HTMLResponse("")
+        return ""
     t = services.row_to_task(row)
     safe_title = html.escape(t.title[:40])
     safe_status = html.escape(t.status.value)
-    fragment = (
+    tail = (
+        f' <span class="inbox-item-desc delivery-outcome">{html.escape(note)}</span>'
+        if note
+        else ""
+    )
+    return (
         f'<div class="inbox-item-done" id="inbox-task-{t.id}">'
         f'<span class="badge badge-{safe_status}">{safe_status}</span> '
-        f"#{t.id} {safe_title}</div>"
+        f"#{t.id} {safe_title}{tail}</div>"
     )
-    return HTMLResponse(fragment)
+
+
+async def _htmx_task_done_fragment(request: Request, task_id: int) -> HTMLResponse:
+    """Return a small 'done' indicator for HTMX-swapped items."""
+    return HTMLResponse(await _task_done_html(_db(request), task_id))
 
 
 def _htmx_dor_failed_fragment(task_id: int, detail: dict[str, Any]) -> HTMLResponse:
@@ -865,8 +901,24 @@ async def _project_filter_ctx(
     return allowed, projects, current
 
 
+async def _registry_refusal(db: aiosqlite.Connection, task_ref: str | None) -> str:
+    """The registry's own words for a refused delivery (#1333).
+
+    Read from the task feed, never from the query string: the address only
+    names which task to look at, so a hand-made link cannot put a reason on
+    the page that the hub did not write.
+    """
+    if not task_ref or not task_ref.strip().isdigit():
+        return ""
+    return await _latest_alert(db, int(task_ref.strip()), REGISTRY_REFUSAL_PREFIX)
+
+
 @router.get("/", response_class=HTMLResponse)
-async def web_dashboard(request: Request, project: str | None = Query(None)):
+async def web_dashboard(
+    request: Request,
+    project: str | None = Query(None),
+    delivery_refused: str | None = Query(None),
+):
     # #955: аноним (токены настроены, сессии нет) видит визитку продукта.
     # Открытый режим и живая сессия получают дашборд как прежде — их
     # идентичность не анонимная. Ветка стоит до первого обращения к БД:
@@ -926,6 +978,7 @@ async def web_dashboard(request: Request, project: str | None = Query(None)):
     agent_sessions = await services.get_agent_sessions_panel(db)
     message_threads = await services.get_message_threads_panel(db)
     ctx: dict[str, Any] = {
+        "delivery_refusal": await _registry_refusal(db, delivery_refused),
         "data": data,
         "agent_sessions": agent_sessions,
         "message_threads": message_threads,
@@ -1055,8 +1108,32 @@ def _parse_policy_form(raw: str) -> tuple[dict[str, Any] | None, str | None]:
 # form showed them, so the submitter had a say. Everything else in the stored
 # policy is carried through untouched (#886).
 _FORM_GATE_POLICY_KEYS = frozenset(
-    {"dor", "verdict", "review", "dor_max_class", "risk_map", "release"}
+    {
+        "dor",
+        "verdict",
+        "review",
+        "dor_max_class",
+        "risk_map",
+        "release",
+        # #1280: теневое участие стюарда — седьмая ручка ЭТОЙ формы, и потому
+        # живёт здесь: иначе перенос ниже (#886) вернул бы сохранённое true
+        # поверх снятой галочки, и рычаг работал бы в одну сторону.
+        steward_dispatch.STEWARD_SHADOW_KEY,
+    }
 )
+
+#: Имя поля переключателя теневого участия в форме проекта (#1280). Скрытое
+#: поле и чекбокс носят ЕГО ОБА: снятый чекбокс браузер не присылает вовсе, и
+#: без скрытого спутника «выключить» было бы неотличимо от «этот POST про
+#: переключатель не знает».
+_SHADOW_FIELD = f"gate_policy_{steward_dispatch.STEWARD_SHADOW_KEY}"
+
+#: Поля лимита очереди review в форме проекта (#1335). В отличие от ручек
+#: _FORM_GATE_POLICY_KEYS, ключи лимита принадлежат форме, только когда поле
+#: пришло в запросе: запрос без него (старая страница, скрипт, один
+#: переключатель) о лимите не знает и снять его не может.
+_REVIEW_LIMIT_FIELD = f"gate_policy_{project_policy.REVIEW_LIMIT_KEY}"
+_REVIEW_LIMIT_MODE_FIELD = f"gate_policy_{project_policy.REVIEW_LIMIT_MODE_KEY}"
 
 
 # Отказ, привязанный к проекту, показывается У ЕГО КАРТОЧКИ (#1188). Общая
@@ -1149,6 +1226,113 @@ async def _web_patch_project(
     )
 
 
+#: Поля формы проекта, из которых собирается gate_policy. Хоть одно в запросе
+#: — и политика пересобирается; ни одного — запрос не про политику (#753).
+_GATE_POLICY_FORM_FIELDS = (
+    "gate_policy_dor",
+    "gate_policy_verdict",
+    "gate_policy_review",
+    "gate_policy_release",
+    "gate_policy_dor_max_class",
+    "gate_policy_risk_map",
+    _SHADOW_FIELD,
+    _REVIEW_LIMIT_FIELD,
+)
+
+
+def _review_limit_from_form(form: Any, policy: dict[str, Any]) -> None:
+    """Лимит очереди review из формы (#1335) — только если поле в запросе.
+
+    Нет поля — запрос о лимите не знает, и сохранённое остаётся (так ключи и
+    не попали в _FORM_GATE_POLICY_KEYS). Поле есть и пусто — явное «снять
+    лимит»: уходят оба ключа, режим без лимита ничего не значит. Значения не
+    проверяются здесь: число кладётся числом, всё прочее — как пришло, и
+    отказывает та же _validate_review_limit в ProjectPatch, что и у API.
+    """
+    if _REVIEW_LIMIT_FIELD not in form:
+        return
+    policy.pop(project_policy.REVIEW_LIMIT_KEY, None)
+    policy.pop(project_policy.REVIEW_LIMIT_MODE_KEY, None)
+    raw = str(form.get(_REVIEW_LIMIT_FIELD) or "").strip()
+    if not raw:
+        return
+    try:
+        policy[project_policy.REVIEW_LIMIT_KEY] = int(raw)
+    except ValueError:
+        policy[project_policy.REVIEW_LIMIT_KEY] = raw
+    mode = str(form.get(_REVIEW_LIMIT_MODE_FIELD) or "").strip()
+    if mode:
+        policy[project_policy.REVIEW_LIMIT_MODE_KEY] = mode
+
+
+async def _gate_policy_from_form(
+    request: Request, form: Any, project_id: int
+) -> tuple[dict[str, Any] | None, str | None]:
+    """(gate_policy | None если запрос не про политику, ошибка | None).
+
+    #1335: сборка начинается с СОХРАНЁННОЙ политики, а форма перезаписывает
+    только свои ручки. PATCH заменяет политику целиком, поэтому ключ, которого
+    форма не показывает (#886: ci_runner; #1264: лимит очереди review, когда
+    его поля нет в запросе), держится ровно на этом старте.
+
+    Ручки формы (_FORM_GATE_POLICY_KEYS) сначала снимаются: форма несёт их
+    целиком, и пустое поле значит «убрать ручку» (#760), а не «оставить».
+    Замок #743 перепроверяется общим путём PATCH — слою представления не верят.
+    """
+    if not any(key in form for key in _GATE_POLICY_FORM_FIELDS):
+        return None, None
+    stored = await repo.get_project(_db(request), project_id)
+    kept = project_policy.gate_policy_of(stored) if stored is not None else {}
+    gate_policy: dict[str, Any] = {
+        key: value for key, value in kept.items() if key not in _FORM_GATE_POLICY_KEYS
+    }
+    gate_policy["dor"] = str(form.get("gate_policy_dor") or "").strip() or "human"
+    gate_policy["verdict"] = (
+        str(form.get("gate_policy_verdict") or "").strip() or "human"
+    )
+    # #805: the review key is offered to EVERY project, including default
+    # — dispatching a reviewer takes no human out of any gate, so the
+    # #743 lock (which is about 'auto' on dor/verdict) does not apply.
+    # Only the recognised value is stored; anything else is dropped
+    # rather than saved as a knob nothing reads.
+    if str(form.get("gate_policy_review") or "").strip() == "dispatch":
+        gate_policy["review"] = "dispatch"
+    # #926: the release knob follows the same shape as review — one
+    # recognised value stored, everything else dropped — and for the same
+    # reason it is offered to EVERY project including default: the #743
+    # lock is about taking a human OUT of a gate, and the content of a
+    # release was already approved task by task (#812). manual is the
+    # ABSENCE of the key, which is why 'release' belongs in
+    # _FORM_GATE_POLICY_KEYS: the form shows this knob, so an un-chosen one
+    # really does mean "remove it" — otherwise the switch would only work in
+    # one direction, a stop-lever that cannot stop.
+    if (
+        str(form.get("gate_policy_release") or "").strip()
+        == project_policy.RELEASE_AUTO
+    ):
+        gate_policy["release"] = project_policy.RELEASE_AUTO
+    # #1280: теневое участие стюарда — отдельный булев ключ, замок #743 его не
+    # касается. Читается СПИСОК значений поля: скрытое "off" приезжает всегда,
+    # чекбокс добавляет "on" сверху, и «выключить» становится наблюдаемым
+    # намерением. Пустой список — отправка не из формы, и ключ, как ручка
+    # ЭТОЙ формы (_FORM_GATE_POLICY_KEYS), снят. Строго bool (#1268): явный
+    # False говорит, что участие выключили, а не что о нём не спрашивали.
+    shadow = [str(value).strip() for value in form.getlist(_SHADOW_FIELD)]
+    if shadow:
+        gate_policy[steward_dispatch.STEWARD_SHADOW_KEY] = "on" in shadow
+    # #760: an emptied field means "remove this knob", not "leave it alone".
+    ceiling = str(form.get("gate_policy_dor_max_class") or "").strip()
+    if ceiling:
+        gate_policy["dor_max_class"] = ceiling
+    risk_map, err = _parse_policy_form(str(form.get("gate_policy_risk_map") or ""))
+    if err:
+        return None, err.replace("policy:", "risk_map:")
+    if risk_map is not None:
+        gate_policy["risk_map"] = risk_map
+    _review_limit_from_form(form, gate_policy)
+    return gate_policy, None
+
+
 @router.post("/projects/{project_id}/web-edit")
 async def web_edit_project(project_id: int, request: Request):
     """Inline-edit form (#344): exactly the ProjectPatch fields."""
@@ -1165,73 +1349,10 @@ async def web_edit_project(project_id: int, request: Request):
         return _projects_error_redirect(err, project_id)
     if policy is not None:
         fields["default_branch_policy"] = policy
-    # Gate policy selects (#753). Present only for non-default projects in
-    # the template; the shared PATCH path below re-checks the default lock
-    # anyway — the presentation layer is not trusted.
-    if any(
-        key in form
-        for key in (
-            "gate_policy_dor",
-            "gate_policy_verdict",
-            "gate_policy_review",
-            "gate_policy_release",
-            "gate_policy_dor_max_class",
-            "gate_policy_risk_map",
-        )
-    ):
-        gate_policy: dict[str, Any] = {
-            "dor": str(form.get("gate_policy_dor") or "human").strip() or "human",
-            "verdict": str(form.get("gate_policy_verdict") or "human").strip()
-            or "human",
-        }
-        # #805: the review key is offered to EVERY project, including default
-        # — dispatching a reviewer takes no human out of any gate, so the
-        # #743 lock (which is about 'auto' on dor/verdict) does not apply.
-        # Only the recognised value is stored; anything else is dropped
-        # rather than saved as a knob nothing reads.
-        if str(form.get("gate_policy_review") or "").strip() == "dispatch":
-            gate_policy["review"] = "dispatch"
-        # #926: the release knob follows the same shape as review — one
-        # recognised value stored, everything else dropped — and for the same
-        # reason it is offered to EVERY project including default: the #743
-        # lock is about taking a human OUT of a gate, and the content of a
-        # release was already approved task by task (#812). manual is the
-        # ABSENCE of the key, which is why 'release' belongs in
-        # _FORM_GATE_POLICY_KEYS above: the form shows this knob, so an
-        # un-chosen one really does mean "remove it". Left out of that set,
-        # the carry-through below would restore the stored 'auto' and the
-        # switch would only work in one direction — a stop-lever that cannot
-        # stop.
-        if (
-            str(form.get("gate_policy_release") or "").strip()
-            == project_policy.RELEASE_AUTO
-        ):
-            gate_policy["release"] = project_policy.RELEASE_AUTO
-        # #760: the form carries the WHOLE policy, so an emptied field means
-        # "remove this knob", not "leave it alone" — the same semantics the
-        # selects already have, and the only ones a form can honestly offer.
-        ceiling = str(form.get("gate_policy_dor_max_class") or "").strip()
-        if ceiling:
-            gate_policy["dor_max_class"] = ceiling
-        risk_map, err = _parse_policy_form(str(form.get("gate_policy_risk_map") or ""))
-        if err:
-            return _projects_error_redirect(
-                err.replace("policy:", "risk_map:"), project_id
-            )
-        if risk_map is not None:
-            gate_policy["risk_map"] = risk_map
-        # Keys the form does not offer (#886: ci_runner) are carried
-        # over untouched. "The form carries the whole policy" is true of the
-        # knobs it shows; a knob it never showed cannot be said to have been
-        # emptied by the person who submitted it, and dropping it here would
-        # undo an API-set value with no trace — the silent rollback this
-        # task exists to remove.
-        stored = await repo.get_project(_db(request), project_id)
-        if stored is not None:
-            kept = project_policy.gate_policy_of(stored)
-            for key, value in kept.items():
-                if key not in _FORM_GATE_POLICY_KEYS:
-                    gate_policy[key] = value
+    gate_policy, err = await _gate_policy_from_form(request, form, project_id)
+    if err:
+        return _projects_error_redirect(err, project_id)
+    if gate_policy is not None:
         fields["gate_policy"] = gate_policy
     if not fields:
         return RedirectResponse("/projects", status_code=303)
@@ -1377,6 +1498,40 @@ async def web_acknowledge_delivery(task_id: int, request: Request):
     # тогда доказательство «увести нельзя» держится на том, что значение стоит
     # в query, а не в пути, — рассуждение, которое переживёт не всякую правку.
     back = f"/?project={quote(back_project, safe='')}" if back_project else "/"
+    return RedirectResponse(back, status_code=303)
+
+
+@router.post("/tasks/{task_id}/web-deliver-undelivered")
+async def web_deliver_undelivered(task_id: int, request: Request):
+    """Довести строку реестра pr_open из инбокса (#1333).
+
+    Тот же сервис, что у REST: ``deliver_from_registry`` зовёт
+    ``deliver_on_disposition``, второго пути мержа нет. Отказ гейта
+    записывается в ленту задачи самим путём доставки, поэтому страница
+    просто возвращается — строка остаётся в реестре с тем же номером PR.
+    """
+    identity = require_human_or_admin(request)
+    form = await request.form()
+    back_project = str(form.get("return_project") or "").strip()
+    query = [f"project={quote(back_project, safe='')}"] if back_project else []
+    try:
+        await services.deliver_from_registry(
+            _db(request), task_id, by=identity.username
+        )
+    except services.RegistryDeliveryRefused as exc:
+        if exc.not_found:
+            raise HTTPException(404, exc.message) from exc
+        # A gate refusal is an expected outcome, not bad input (#1333 review,
+        # aa0b738677921a18): the reader stays on the inbox and sees why. The
+        # reason travels in the task feed, where the service wrote it; the
+        # address carries only the task id, so it cannot put words on the page.
+        if _is_htmx(request):
+            return HTMLResponse(
+                f'<div class="delivery-refusal" id="inbox-undelivered-{task_id}">'
+                f"{html.escape(exc.message)}</div>"
+            )
+        query.append(f"delivery_refused={task_id}")
+    back = "/?" + "&".join(query) if query else "/"
     return RedirectResponse(back, status_code=303)
 
 
@@ -1683,7 +1838,7 @@ async def web_digests(request: Request):
     """Autopilot daily digests with the audit sample (#739)."""
     import json as _json
 
-    from hub.services.digest import steward_section_state
+    from hub.services.digest import self_approvals_state, steward_section_state
 
     rows = await repo.list_digests(_db(request), limit=30)
     digests = []
@@ -1697,6 +1852,7 @@ async def web_digests(request: Request):
         # template: a missing key and an empty list are different facts, and
         # a counting filter cannot tell them apart (#1143 review).
         d["steward_state"] = steward_section_state(d["data"])
+        d["self_approvals_state"] = self_approvals_state(d["data"])
         digests.append(d)
     return TEMPLATES.TemplateResponse(request, "digests.html", {"digests": digests})
 
@@ -2622,18 +2778,104 @@ async def web_decide_task(
     instructions: str = Form(""),
     decision_summary: str = Form(""),
     record_decision: bool = Form(False),
+    # #1333: without this field an acceptance in the UI could only ever be
+    # the undelivering one — MCP and REST took pr_disposition (#1037), the
+    # form did not. Empty stays legal and is still recorded (#897).
+    pr_disposition: str = Form(""),
+    # Set only by the inbox's Accept: the answer then redraws the "Completed,
+    # PR still open" section in the project on screen (#1333, #626).
+    # An empty project arrives as "no value" from a form, so "came from the
+    # inbox" needs its own flag rather than inbox_project being present.
+    from_inbox: bool = Form(False),
+    inbox_project: str = Form(""),
 ):
     _require_human_web(request)
-    body = TaskDecide(
-        action=action,
-        instructions=instructions,
-        decision_summary=decision_summary,
-        record_decision=record_decision,
-    )
+    try:
+        body = TaskDecide(
+            action=action,
+            instructions=instructions,
+            decision_summary=decision_summary,
+            record_decision=record_decision,
+            pr_disposition=pr_disposition.strip(),
+        )
+    except ValidationError as exc:
+        # The field that actually failed, not the newest one (#1333 review,
+        # 40ac6a807ddad21b): a bad action must not read as a bad PR fate.
+        raise HTTPException(400, _invalid_fields_detail(exc)) from exc
     await services.decide_task(_db(request), task_id, body)
     if _is_htmx(request):
-        return await _htmx_task_done_fragment(request, task_id)
+        return await _htmx_decide_fragment(
+            request, task_id, body.pr_disposition, inbox_project if from_inbox else None
+        )
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+def _invalid_fields_detail(exc: ValidationError) -> str:
+    """Name the form fields a model refused, each once, in order."""
+    fields: list[str] = []
+    for err in exc.errors():
+        name = str(err.get("loc", ("?",))[0]) if err.get("loc") else "?"
+        if name not in fields:
+            fields.append(name)
+    return "не прошло проверку поле: " + ", ".join(fields)
+
+
+async def _latest_alert(db: aiosqlite.Connection, task_id: int, prefix: str) -> str:
+    """The newest hub alert on the task that starts with ``prefix``, or ``""``."""
+    found = ""
+    for u in await repo.get_task_updates(db, task_id):
+        row = dict(u)
+        content = str(row.get("content") or "")
+        if row.get("kind") == "alert" and content.startswith(prefix):
+            found = content
+    return found
+
+
+async def _decide_delivery_note(
+    db: aiosqlite.Connection, task_id: int, disposition: str
+) -> str:
+    """What the acceptance did to the PR, in words (#1333, feb9db856b3d78d9).
+
+    "completed" alone read the same whether the gate merged the PR or refused
+    it — which is how #1276/#1249/#1234 were closed believing it was done.
+    """
+    row = await repo.get_task(db, task_id)
+    task = dict(row) if row else {}
+    pr = task.get("pr_number")
+    if not pr or task.get("status") != "completed":
+        return ""
+    if disposition == DELIVER_DISPOSITION:
+        if await repo.pipeline_merge_recorded(db, task_id, int(pr)):
+            return f"PR #{pr} доставлен под условиями гейта."
+        alert = await _latest_alert(
+            db, task_id, "Доставка по решению человека НЕ выполнена"
+        )
+        return f"PR #{pr} НЕ доставлен: {alert or 'причина — в ленте задачи'}"
+    if disposition == "abandon":
+        return f"От PR #{pr} отказались: мержа нет, PR открыт, пока его не закроют."
+    return (
+        f"Судьба PR #{pr} не выбрана: работа НЕ доставлена и стоит в "
+        "«Completed, PR still open»."
+    )
+
+
+async def _htmx_decide_fragment(
+    request: Request, task_id: int, disposition: str, inbox_project: str | None
+) -> HTMLResponse:
+    """The done row plus the delivery outcome, and — from the inbox — the
+    redrawn "Completed, PR still open" section (hx-swap-oob)."""
+    db = _db(request)
+    note = await _decide_delivery_note(db, task_id, disposition)
+    done = await _task_done_html(db, task_id, note)
+    if inbox_project is None:
+        return HTMLResponse(done)
+    inbox = await services.get_inbox_data(db, project=inbox_project.strip() or None)
+    section = TEMPLATES.get_template("partials/inbox_undelivered.html").render(
+        undelivered=inbox["undelivered"], filter_project=inbox["filter_project"]
+    )
+    return HTMLResponse(
+        f'{done}\n<div id="inbox-undelivered" hx-swap-oob="true">{section}</div>'
+    )
 
 
 @router.post("/tasks/web-batch-approve-selected")

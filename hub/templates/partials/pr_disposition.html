@@ -1,0 +1,31 @@
+{# #1333: судьба PR при принятии — одно определение на все формы web-decide.
+   Умолчание считает default_pr_disposition (hub/web.py): «доставить», только
+   если у задачи есть PR и одобрение ТЕКУЩЕЙ сдачи; иначе пусто — законное
+   «не выбрано» (#897). Гейт при доставке всё равно проверяет sha и CI. #}
+
+{# Текст подтверждения называет судьбу PR: при умолчании «доставить» Accept
+   мержит, и подтверждение, которое молчит об этом, — полуправда (#1333,
+   находка feb9db856b3d78d9). #}
+{% macro pr_accept_confirm(t, choice) -%}
+{%- if not t.pr_number -%}
+Accept #{{ t.id }} as completed?
+{%- elif choice == 'deliver' -%}
+Accept #{{ t.id }} и доставить PR #{{ t.pr_number }}? Гейт вольёт его, только если одобрение, код и CI в порядке.
+{%- elif choice == 'abandon' -%}
+Accept #{{ t.id }} и отказаться от PR #{{ t.pr_number }}? Мержа не будет.
+{%- else -%}
+Accept #{{ t.id }} без выбора судьбы PR? PR #{{ t.pr_number }} останется открытым — работа не будет доставлена.
+{%- endif -%}
+{%- endmacro %}
+
+{# button_id: кнопка Accept рядом. Смена выбора переписывает её hx-confirm —
+   htmx читает атрибут в момент клика, поэтому подтверждение говорит о том,
+   что выбрано сейчас, а не о том, что было выбрано при отрисовке. #}
+{% macro pr_disposition_select(t, field_id, css_class='', button_id='') -%}
+{%- set chosen = default_pr_disposition(t) -%}
+<select name="pr_disposition" id="{{ field_id }}" class="{{ css_class }}" aria-label="Судьба PR при принятии #{{ t.id }}" title="Что сделать с PR при принятии"{% if button_id %} onchange="var b=document.getElementById('{{ button_id }}');if(b){b.setAttribute('hx-confirm',this.options[this.selectedIndex].dataset.confirm);}"{% endif %}>
+    <option value="deliver" data-confirm="{{ pr_accept_confirm(t, 'deliver') }}"{% if chosen == 'deliver' %} selected{% endif %}>PR: доставить</option>
+    <option value="abandon" data-confirm="{{ pr_accept_confirm(t, 'abandon') }}"{% if chosen == 'abandon' %} selected{% endif %}>PR: отказаться</option>
+    <option value="" data-confirm="{{ pr_accept_confirm(t, '') }}"{% if chosen == '' %} selected{% endif %}>PR: не выбрано</option>
+</select>
+{%- endmacro %}

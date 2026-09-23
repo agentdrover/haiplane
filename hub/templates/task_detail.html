@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "partials/pr_disposition.html" import pr_disposition_select %}
 {% set active = "tasks" %}
 
 {% block title %}Task #{{ task.id }} - {{ product_title }}{% endblock %}
@@ -646,6 +647,8 @@
                         <input type="checkbox" name="record_decision" value="true">
                         Save decision to notes
                     </label>
+                    <label class="task-action-label" for="task-pr-disposition">PR при принятии{% if task.pr_number %} (#{{ task.pr_number }}){% endif %}</label>
+                    {{ pr_disposition_select(task, 'task-pr-disposition', 'task-action-control') }}
                     <button class="btn btn-success task-action-btn" type="submit" name="action" value="accept">Accept as Completed</button>
                     <label class="task-action-label" for="task-rework-instructions">Instructions for rework</label>
                     <textarea id="task-rework-instructions" name="instructions" class="task-action-control task-action-textarea" placeholder="What specifically needs to be fixed..."></textarea>
@@ -661,7 +664,7 @@
                 {% if task.latest_review and task.latest_review.findings %}
                 <div class="task-action-note">
                     Находки последнего вердикта ({{ task.latest_review.verdict.value|upper }},
-                    сдача #{{ task.latest_review.submission_generation }}{{ '' if task.latest_review.is_current else ', устарел — работа пересдана' }}):
+                    сдача #{{ task.latest_review.submission_generation }}{% if not task.latest_review.is_current %}{{ ', закрыт решением «на доработку» — нужна новая сдача' if task.latest_review.closed_by_decision else ', устарел — работа пересдана' }}{% endif %}):
                     <ul class="task-review-findings">
                         {% for f in task.latest_review.findings %}
                         <li>{{ f.id }}. [{{ f.severity.value }}] {{ f.message }}

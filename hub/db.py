@@ -2064,6 +2064,48 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE review_dispatches ADD COLUMN second_door_reason TEXT "
         "NOT NULL DEFAULT ''",
     ),
+    (
+        # #1286: поколение сдачи, чьё одобрение закрыто решением человека
+        # «на доработку». Отдельная колонка, а не обнуление review_verdict:
+        # карточка строит latest_review из полей вердикта, и стирание унесло
+        # бы вместе с окном и находки, и то, что именно было одобрено.
+        # NULL — окно никто не закрывал; новый вердикт снимает отметку
+        # (record_review_verdict), потому что она принадлежит вердикту так же,
+        # как review_self_approved.
+        "add_review_verdict_closed_generation_column",
+        "ALTER TABLE tasks ADD COLUMN review_verdict_closed_generation INTEGER",
+    ),
+    (
+        # #1240: вершина ветки задачи, которую гейт сам переписал сжатием при
+        # доставке (squash_branch). Сдача закрепляет коммит вершины; после
+        # сжатия в базу уходит ДРУГОЙ коммит, и «предок ли сдача базы»
+        # отвечает «нет» на доставленной работе. Этот факт — единственное, по
+        # чему такое «нет» отличимо от настоящего: угадывать по числу коммитов
+        # постановка запрещает. '' — гейт ветку не переписывал или запись
+        # старше этой колонки; ни то, ни другое не читается как «сжато».
+        "add_tasks_gate_squashed_sha",
+        "ALTER TABLE tasks ADD COLUMN gate_squashed_sha TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1328: когда прогон стюарда НАЧАЛ работу. created_at — время
+        # заказа, а заказ может ждать исполнителя долго (#1181): длительность
+        # суждения, отмеренная от заказа, приписала бы судье чужое ожидание.
+        # Ставит её старт прогона (start_run) той же записью, что называет
+        # агента. NULL — прогон не начинался или начат до этой колонки;
+        # старые строки не пересчитываются (scope_out #1328).
+        "add_steward_runs_started_at",
+        "ALTER TABLE steward_runs ADD COLUMN started_at TEXT",
+    ),
+    (
+        # #1328: почему у суждения нет числа токенов. '' — число есть (или
+        # суждение старше колонки); pending — ждём ответа провайдера;
+        # provider_no_answer — окно ответа вышло, провайдер молчал; no_run —
+        # у суждения нет начатого прогона, спрашивать не о чем. Ноль в
+        # tokens_spent означает только ответ провайдера «ноль».
+        "add_steward_judgements_tokens_unknown_reason",
+        "ALTER TABLE steward_judgements ADD COLUMN tokens_unknown_reason TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
 ]
 
 

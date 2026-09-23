@@ -377,3 +377,441 @@ async def test_alert_text_does_not_round_across_the_boundary(
     assert "1 из 21" in detail, "счётчик — то, что не округляется"
     assert "4.8%" in detail, "доля с десятыми, а не с округлением к границе"
     assert "5% — ниже 5%" not in detail and "5% ниже 5%" not in detail
+
+
+# ---------------------------------------------------------------------------
+# #1234: неразрешённая находка — это незаданный вопрос, а не чистота.
+#
+# ЗАМЕР. Ранее по пяти отчётам: тринадцать ПОДТВЕРЖДЁННЫХ находок — ни одной
+# настоящей, шесть НЕРАЗРЕШЁННЫХ — настоящими все шесть. 09.09.2026 замер
+# повторён на новых данных: из семи неразрешённых настоящими шесть. При этом
+# отчёт с нулём подтверждённых и непустым unresolved читался всеми
+# поверхностями как «находок нет».
+#
+# ГРАНИЦА, КОТОРУЮ ЭТИ ТЕСТЫ ДЕРЖАТ. Неразрешённая находка не приравнивается
+# к подтверждённой: подтверждённой становится только та, под которой УПАЛ
+# ТЕСТ. Здесь проверяется видимость и счёт, а не объявление разногласия
+# дефектом.
+# ---------------------------------------------------------------------------
+
+from hub.services.steward_corridor import (  # noqa: E402
+    CLEAN_OUTCOMES,
+    OUTCOME_CLEAN,
+    OUTCOME_CONFIRMED,
+    OUTCOME_INCOMPLETE,
+    OUTCOME_NO_DATA,
+    OUTCOME_UNRESOLVED,
+    REPORT_OUTCOMES,
+    names_clean,
+    outcome_label,
+    report_outcome,
+)
+
+#: Ровно та подпись, которую поверхность печатает, объявляя отчёт чистым.
+#: Берётся из источника, а не переписывается словами: искать слово «чисто»
+#: вообще нельзя — подписи ступеней unresolved и no_data сами его цитируют,
+#: чтобы ОПРОВЕРГНУТЬ, и совпадение по такому поиску ничего бы не значило.
+CLEAN_WORDS = outcome_label(OUTCOME_CLEAN)
+
+
+async def _report_with_unresolved(client, task_id: int) -> dict:
+    """Ровно тот отчёт, из-за которого заведена задача: 0 подтверждённых при
+    непустом unresolved. Возвращает СОХРАНЁННУЮ запись, как её отдаёт API."""
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "agent_count": 3,
+            "tokens_spent": 12000,
+            "model": "grok-4.6",
+            "raw_count": 4,
+            "findings_confirmed": [],
+            "findings_rejected": [
+                {"title": "style nit", "category": "style", "reason": "не дефект"}
+            ],
+            "incomplete": False,
+            "unresolved": [
+                {
+                    "title": "путь записи полей из карточки может выдать автоодобрение",
+                    "why": "адъюдикаторы не сошлись: hub/web.py:1871 читает отчёт",
+                }
+            ],
+            "lost_dimensions": [],
+            "agent": "cursor-cloud-reviewer",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def test_unresolved_findings_are_never_shown_as_clean(client, db):
+    """AC-1: три поверхности, одно правило, и ни одна не говорит «чисто».
+
+    Карточка, дайджест и квитанция ревью раньше выводили чистоту каждая
+    сама — по длине ``findings_confirmed``, — и все три выводили одинаково и
+    неверно. Теперь право назвать отчёт чистым принадлежит ступени лестницы,
+    и мутация, снимающая проверку ``unresolved`` в :func:`report_outcome`,
+    роняет этот тест: ступень станет ``clean``, и все три поверхности
+    послушно напечатают чистоту.
+    """
+    from tests.test_web import _web_task_in_review_with_test_ac
+
+    task_id = await _web_task_in_review_with_test_ac(client, db)
+    stored = await _report_with_unresolved(client, task_id)
+
+    # Сама ступень: unresolved — свой исход, а не отсутствие находок.
+    assert stored["outcome"] == OUTCOME_UNRESOLVED
+    assert stored["outcome_names_clean"] is False
+    # ...и он НЕ приравнен к подтверждённому: автор не отвечает за то, в чём
+    # ревьюер сам не сошёлся.
+    assert stored["outcome"] != OUTCOME_CONFIRMED
+    assert stored["findings_confirmed"] == []
+
+    # ПОВЕРХНОСТЬ 1 — карточка.
+    page = (await client.get(f"/tasks/{task_id}")).text
+    strip = page[page.index("task-review-strip") : page.index("task-evidence")]
+    tile_at = strip.index("Машинное ревью")
+    # Якорь — ПРОБЕЛ после имени класса: внутренний ``task-review-tile-label``
+    # тоже начинается с «task-review-tile», и поиск без пробела находит его,
+    # а не саму плитку. Проверяется открывающий тег: цвет живёт в нём.
+    tile_open = strip.rfind('<div class="task-review-tile ', 0, tile_at)
+    tile = strip[tile_open : strip.index(">", tile_open)]
+    # Не просто «не зелёная»: непустой unresolved — САМОСТОЯТЕЛЬНЫЙ исход, а
+    # значит громкий. Пока плитка красилась по длине findings_confirmed, эти
+    # отчёты попадали в жёлтое вместе с «полнота не заявлена» — и жёлтое от
+    # «есть находки, которых никто не рассудил» неотличимо.
+    assert "task-review-tile--bad" in tile, (
+        "0 подтверждённых при непустом unresolved — не зелёная и не жёлтая плитка"
+    )
+    assert "task-review-tile--ok" not in tile
+    assert outcome_label(OUTCOME_UNRESOLVED) in strip, (
+        "плитка обязана назвать ступень словами, а не только числом"
+    )
+    assert CLEAN_WORDS not in strip
+
+    # ПОВЕРХНОСТЬ 2 — отчёт в карточке, та строка, которую цитируют в гейт.
+    note = page[page.index("Machine review:") :][:1200]
+    assert outcome_label(OUTCOME_UNRESOLVED) in note
+    assert CLEAN_WORDS not in note
+
+    # ПОВЕРХНОСТЬ 3 — дайджест: под автовердиктом видно, ЧТО стояло в отчёте.
+    from hub import repository as repo_module
+    from hub.services.digest import _report_outcome_of
+
+    row = await repo_module.get_latest_machine_review(db, task_id)
+    digest_view = _report_outcome_of(row)
+    assert digest_view["outcome"] == OUTCOME_UNRESOLVED
+    assert digest_view["names_clean"] is False
+    assert CLEAN_WORDS not in digest_view["label"]
+
+    # ПОВЕРХНОСТЬ 4 — квитанция MCP: агент цитирует её в задачу дословно.
+    from unittest.mock import AsyncMock, patch
+
+    from hub.mcp_server import hub_submit_machine_review
+
+    with patch("hub.mcp_server._api_post", new_callable=AsyncMock) as post:
+        post.return_value = stored
+        receipt = await hub_submit_machine_review(
+            task_id, raw_count=4, incomplete=False
+        )
+    text = receipt.content[0].text
+    assert "0 confirmed" in text, "счёт остаётся — меняется то, чем он назван"
+    assert outcome_label(OUTCOME_UNRESOLVED) in text
+    assert CLEAN_WORDS not in text
+
+
+async def test_the_outcome_ladder_lets_exactly_one_step_say_clean(client, db):
+    """Полнота лестницы — перечислением, а не внимательностью читателя.
+
+    Ступень, добавленная без подписи, печаталась бы пустым местом рядом с
+    числом находок, а пустое место читается как «всё в порядке» — ровно та
+    подмена, против которой заведена задача.
+    """
+    assert set(CLEAN_OUTCOMES) == {OUTCOME_CLEAN}
+    for outcome in REPORT_OUTCOMES:
+        label = outcome_label(outcome)
+        assert label and "неизвестный исход" not in label
+        assert (label == CLEAN_WORDS) == (outcome == OUTCOME_CLEAN)
+        assert names_clean(outcome) == (outcome == OUTCOME_CLEAN)
+
+    # Порядок ступеней: первым называется то, что дороже всего пропустить.
+    assert (
+        report_outcome(confirmed=[], unresolved=[{"title": "x"}], incomplete=True)
+        == OUTCOME_INCOMPLETE
+    )
+    assert (
+        report_outcome(confirmed=[{"title": "c"}], unresolved=[{"title": "u"}])
+        == OUTCOME_CONFIRMED
+    )
+    assert report_outcome(confirmed=[], unresolved=[], raw_count=0) == OUTCOME_NO_DATA
+    assert report_outcome(confirmed=[], unresolved=[], raw_count=3) == OUTCOME_CLEAN
+
+
+async def test_the_digest_reads_the_report_of_the_verdicts_own_generation(db):
+    """Ступень берётся у отчёта ТОГО поколения, а не у самого свежего.
+
+    Дайджест собирается ночью, а вердикт выносится днём. Между ними ложится
+    ещё один отчёт — добор лестницы (#879) кладёт второй в то же поколение,
+    пересдача кладёт первый в следующее, — и «самый свежий отчёт задачи»
+    перестаёт быть тем, под которым вердикт вынесен. Здесь именно этот
+    случай: под автовердиктом стоял отчёт с неразрешёнными находками, а
+    после него лёг чистый. Пока отчёт брался по свежести, дайджест показывал
+    на месте неразрешённых «находок нет» — то самое, против чего вся задача.
+    """
+    import json as _json
+
+    from hub import repository as repo_module
+    from hub.services.digest import generate_due_digests
+    from tests.test_autopilot_digest import _autopilot_project, _node, _tomorrow
+
+    _pid, feature = await _autopilot_project(db, "spike-1234-gen")
+    task_id = await _node(db, title="ступень", task_type="task", parent_id=feature)
+    await repo_module.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="grok-4.6",
+        raw_count=4,
+        findings_confirmed="[]",
+        unresolved=_json.dumps([{"title": "никто не рассудил"}], ensure_ascii=False),
+    )
+    await repo_module.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="policy",
+        payload={"verdict": "approved", "submission_generation": 1},
+    )
+    # Пересдача: отчёт о ДРУГОМ диффе ложится ПОСЛЕ вердикта и раньше дайджеста.
+    await repo_module.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=2,
+        model="sonnet-4.5",
+        raw_count=3,
+        findings_confirmed="[]",
+        unresolved="[]",
+    )
+    await db.commit()
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    payload = _json.loads((await repo_module.list_digests(db))[0]["payload"])
+    entry = payload["auto_verdicts"][0]
+
+    assert entry["machine_review"]["outcome"] == OUTCOME_UNRESOLVED, (
+        "под вердиктом стоял отчёт с неразрешёнными — его ступень и показывают"
+    )
+    assert entry["machine_review"]["names_clean"] is False
+    assert CLEAN_WORDS not in entry["machine_review"]["label"]
+    # Ревьюер — тоже свой: пара «кто писал / кто ревьюил» сравнивается
+    # правилом монокультуры (#758), и чужой ревьюер в ней ничего не значит.
+    assert entry["models"]["reviewer"] == "grok-4.6"
+
+
+async def test_a_verdict_without_a_report_of_its_generation_says_so(db):
+    """Отчёта своего поколения нет — дайджест говорит «отчёта нет».
+
+    Подстановка по свежести здесь была бы тем же дефектом, только тише:
+    чужой отчёт на месте своего читается как свой, а пустота видна.
+    """
+    import json as _json
+
+    from hub import repository as repo_module
+    from hub.services.digest import generate_due_digests
+    from tests.test_autopilot_digest import _autopilot_project, _node, _tomorrow
+
+    _pid, feature = await _autopilot_project(db, "spike-1234-absent")
+    task_id = await _node(db, title="без отчёта", task_type="task", parent_id=feature)
+    await repo_module.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="policy",
+        payload={"verdict": "approved", "submission_generation": 2},
+    )
+    await repo_module.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="grok-4.6",
+        raw_count=3,
+        findings_confirmed="[]",
+        unresolved="[]",
+    )
+    await db.commit()
+
+    # И вердикт, у которого поколения в событии нет вовсе (запись старше
+    # поля): подстановка «самого свежего» здесь была бы тем же дефектом, что
+    # и в тесте выше, только тише — чужой отчёт на месте своего.
+    await repo_module.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="policy",
+        payload={"verdict": "approved"},
+    )
+    await db.commit()
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    payload = _json.loads((await repo_module.list_digests(db))[0]["payload"])
+    assert len(payload["auto_verdicts"]) == 2
+    for entry in payload["auto_verdicts"]:
+        assert entry["machine_review"]["state"] == "absent"
+        assert entry["models"]["reviewer"] == ""
+
+
+async def test_the_digest_ignores_a_report_that_landed_after_the_verdict(db):
+    """Второй отчёт ТОГО ЖЕ поколения, легший после вердикта, — не его отчёт.
+
+    Поколения мало: добор кладёт в одно поколение два отчёта, и «последний из
+    поколения» снова оказывается не тем. Вердикт мог опираться только на то,
+    что к его моменту уже существовало.
+    """
+    import json as _json
+
+    from hub import repository as repo_module
+    from hub.services.digest import generate_due_digests
+    from tests.test_autopilot_digest import _autopilot_project, _node, _tomorrow
+
+    _pid, feature = await _autopilot_project(db, "spike-1234-two-reports")
+    task_id = await _node(db, title="добор", task_type="task", parent_id=feature)
+    first = await repo_module.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="grok-4.6",
+        raw_count=4,
+        findings_confirmed="[]",
+        unresolved=_json.dumps([{"title": "никто не рассудил"}], ensure_ascii=False),
+    )
+    second = await repo_module.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="sonnet-4.5",
+        raw_count=3,
+        findings_confirmed="[]",
+        unresolved="[]",
+    )
+    await repo_module.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="policy",
+        payload={"verdict": "approved", "submission_generation": 1},
+    )
+    # Время расставляется явно: два отчёта и событие иначе делят одну секунду,
+    # и тест мерил бы разрешение секунды, а не правило. День берётся
+    # сегодняшний — окно дайджеста именно его, и дата в тесте, написанная
+    # руками, протухла бы вместе с календарём.
+    from datetime import UTC, datetime
+
+    day = datetime.now(UTC).strftime("%Y-%m-%d")
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=? WHERE id=?",
+        (f"{day} 10:00:00", first),
+    )
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=? WHERE id=?",
+        (f"{day} 12:00:00", second),
+    )
+    await db.execute(
+        "UPDATE events SET created_at=? "
+        "WHERE kind='review_verdict_recorded' AND task_id=?",
+        (f"{day} 11:00:00", task_id),
+    )
+    await db.commit()
+
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+    payload = _json.loads((await repo_module.list_digests(db))[0]["payload"])
+    entry = payload["auto_verdicts"][0]
+    assert entry["machine_review"]["outcome"] == OUTCOME_UNRESOLVED, (
+        "вердикт стоял на ПЕРВОМ отчёте — его ступень и показывают"
+    )
+    assert entry["models"]["reviewer"] == "grok-4.6"
+
+
+async def test_the_report_feed_carries_unresolved_and_the_outcome(client, db):
+    """Лента приёма отчёта — четвёртый читатель, и она тоже говорила «чисто».
+
+    Событие ``machine_review_completed`` и строка журнала активности несли
+    только raw/confirmed/rejected: отчёт с нулём подтверждённых и непустым
+    unresolved выглядел в ленте ровно как чистый — «0 confirmed, 1 rejected».
+    Ступень берётся из той же функции, что и на карточке, а число
+    неразрешённых пишется рядом с числом подтверждённых.
+    """
+    import json as _json
+
+    from hub import repository as repo_module
+    from tests.test_web import _web_task_in_review_with_test_ac
+
+    task_id = await _web_task_in_review_with_test_ac(client, db)
+    await _report_with_unresolved(client, task_id)
+
+    rows = await repo_module.list_events(
+        db, since=0, kinds=["machine_review_completed"], limit=100
+    )
+    payloads = [
+        _json.loads(dict(r)["payload"] or "{}")
+        for r in rows
+        if dict(r)["task_id"] == task_id
+    ]
+    assert len(payloads) == 1
+    assert payloads[0]["unresolved"] == 1
+    assert payloads[0]["outcome"] == OUTCOME_UNRESOLVED
+
+    cur = await db.execute(
+        "SELECT summary FROM activity_log WHERE kind='machine_review_completed' "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    summary = (await cur.fetchone())[0]
+    assert f"Task #{task_id}" in summary
+    assert "1 unresolved" in summary
+    assert outcome_label(OUTCOME_UNRESOLVED) in summary
+    assert CLEAN_WORDS not in summary
+
+
+async def test_the_digest_page_prints_the_outcome_under_an_auto_verdict(client, db):
+    """Страница /digests — та поверхность, которую читает человек.
+
+    Тесты выше проверяют полезную нагрузку дайджеста, а шаблон печатает её
+    сам: блок «Автовердикты», сломанный в digests.html, оставлял их
+    зелёными. Здесь под автовердиктом стоит отчёт с неразрешёнными
+    находками, и страница обязана назвать его ступень словами и красным
+    бейджем — не «находок нет» и не зелёным.
+    """
+    import json as _json
+
+    from hub import repository as repo_module
+    from hub.services.digest import generate_due_digests
+    from tests.test_autopilot_digest import _autopilot_project, _node, _tomorrow
+
+    _pid, feature = await _autopilot_project(db, "spike-1234-page")
+    task_id = await _node(db, title="страница", task_type="task", parent_id=feature)
+    await repo_module.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="grok-4.6",
+        raw_count=4,
+        findings_confirmed="[]",
+        unresolved=_json.dumps([{"title": "никто не рассудил"}], ensure_ascii=False),
+    )
+    await repo_module.insert_event(
+        db,
+        kind="review_verdict_recorded",
+        task_id=task_id,
+        actor="policy",
+        payload={"verdict": "approved", "submission_generation": 1},
+    )
+    await db.commit()
+    assert await generate_due_digests(db, now=_tomorrow()) == 1
+
+    page = (await client.get("/digests")).text
+    section = page[page.index("<h3>Автовердикты</h3>") :]
+    section = section[: section.index("</ul>")]
+    assert f"/tasks/{task_id}" in section
+    assert outcome_label(OUTCOME_UNRESOLVED) in section
+    assert "badge-failed" in section
+    assert "badge-completed" not in section
+    assert CLEAN_WORDS not in section

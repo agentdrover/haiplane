@@ -1452,10 +1452,20 @@ async def test_top_up_never_fires_on_an_unknown_profile(
 class _AncestryGitOps(_PinnedGitOps):
     """Git that answers the three questions the delta stands on."""
 
-    def __init__(self, *args, ancestor: bool | None = True, delta: str = "", **kw):
+    def __init__(
+        self,
+        *args,
+        ancestor: bool | None = True,
+        delta: str = "",
+        own: str | None = "",
+        **kw,
+    ):
         super().__init__(*args, **kw)
         self._ancestor = ancestor
         self._delta = delta
+        # #1249: the author's OWN commits inside the delta. None is the answer
+        # a clone gives when reachability cannot be established at all.
+        self._own = own
 
     async def is_ancestor(self, repo, ancestor, descendant):
         return self._ancestor
@@ -1467,9 +1477,37 @@ class _AncestryGitOps(_PinnedGitOps):
             return self._delta
         return self._diff
 
+    async def delta_without_base(self, repo, base, prev, current):
+        return self._own
+
 
 _PREV_SHA = "b" * 40
 _DELTA = "+++ b/hub/services/fixed.py\n+исправление\n"
+
+# --- Whose change is this? (#1249) ------------------------------------------
+#
+# The previous submission is an ancestor of the current tip, so the plain
+# prev..current diff also carries everything a merge of the base branch
+# brought in. Measured on the live resubmission of #1172 (generation 2,
+# 10.09.2026): 25 files in that diff, 2 written by the author, 9 of the 11
+# commits in the range already reachable from origin/develop. The marker that
+# bought the deep harness — workspace_path — appeared 0 times in the author's
+# own commit and twice in the delta as a whole.
+#
+# The doubles below are that shape in miniature: one file the author wrote,
+# one file that arrived with the base and carries the process-surface marker.
+_AUTHOR_FILE = "hub/services/fixed.py"
+_BASE_FILE = "hub/services/readiness.py"
+_MERGED_DELTA = (
+    f"+++ b/{_AUTHOR_FILE}\n"
+    "+исправление\n"
+    f"+++ b/{_BASE_FILE}\n"
+    "+        workspace_path = project.workspace_path\n"
+)
+_OWN_PLAIN = f"+++ b/{_AUTHOR_FILE}\n+исправление\n"
+_OWN_WITH_SURFACE = (
+    f"+++ b/{_AUTHOR_FILE}\n+        workspace_path = project.workspace_path\n"
+)
 
 
 async def _second_generation(
@@ -1620,6 +1658,309 @@ async def test_unreadable_ancestry_reads_everything(
     prompt = recorder.calls[-1]["prompt_text"]
     assert "историю проверить не удалось" in prompt
     assert "прочитана ДЕЛЬТА" not in prompt
+
+
+# --- The delta is split by AUTHORSHIP, not trimmed (#1249) -------------------
+
+
+async def test_a_surface_that_came_with_the_base_does_not_raise_the_profile(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1249): the deep harness is bought for the AUTHOR's change. A
+    # process surface that arrived with the base branch is somebody else's
+    # work — it has already passed its own gate — and buying ~0.6M extra
+    # provider tokens on its account is paying twice for one review.
+    #
+    # MUTATION that must kill this test: return the whole delta as the
+    # author's work from generation_delta. Then the workspace_path line in
+    # the file the base brought decides, and the profile goes deep.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o1"}, "run": {"id": "r-o1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-base")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=_OWN_PLAIN
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    assert (await _dispatch_row(db, task_id))["profile"] == "lite", (
+        "a marker only the base brought must not buy the expensive profile"
+    )
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    notes = [u["content"] for u in data["updates"] or [] if "профиль" in u["content"]]
+    assert "workspace_path" not in notes[-1], (
+        "the reason must not quote a marker the author never wrote"
+    )
+
+
+async def test_a_surface_written_by_the_author_still_raises_the_profile(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1249): the distinction sharpens the rule's INPUT, it does not
+    # weaken the rule. The same marker, written by the author this round,
+    # still buys the deep harness and still says which surface bought it.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o2"}, "run": {"id": "r-o2"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-author")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=_OWN_WITH_SURFACE
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    assert (await _dispatch_row(db, task_id))["profile"] == "deep"
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    notes = [
+        u["content"] for u in data["updates"] or [] if "профиль deep" in u["content"]
+    ]
+    assert notes and "workspace_path" in notes[-1], (
+        "the surface the author wrote still names itself in the card"
+    )
+
+
+async def test_the_subject_names_both_halves(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#1249): what came with the base does not disappear from sight.
+    # #1238 found a defect that exists ONLY where two branches meet; a
+    # reviewer who never learns the base moved cannot look for one. So the
+    # card carries BOTH numbers and the prompt names the foreign files.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o3"}, "run": {"id": "r-o3"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-both")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=_OWN_PLAIN
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    cards = [
+        u["content"] for u in data["updates"] or [] if "Предмет ревью" in u["content"]
+    ]
+    assert cards, "the dispatch card must state the subject"
+    assert "1 файл(ов) автора и 1 привезено базой" in cards[-1], (
+        "both halves are counted where a person reads the card"
+    )
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert "ПРИВЕЗЕНО БАЗОЙ" in prompt and _BASE_FILE in prompt, (
+        "the foreign half is named to the reviewer, not removed"
+    )
+    assert f"'{_AUTHOR_FILE}'" in prompt, "the command narrows to the author's file"
+    assert f"'{_BASE_FILE}'" not in prompt, (
+        "the command itself is the author's work; the base half is named beside it"
+    )
+
+
+async def test_unknown_origin_reads_everything_and_says_so(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4 (#1249): a clone that cannot answer "whose commit is this" gets no
+    # split at all. Everything in the delta is read, exactly as before, and
+    # the reason is named — a silently narrowed subject is worse than a wide
+    # one, because the report would claim a coverage nobody had.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o4"}, "run": {"id": "r-o4"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-unknown")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=None
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert f"'{_AUTHOR_FILE}'" in prompt and f"'{_BASE_FILE}'" in prompt, (
+        "nothing is dropped when origin could not be established"
+    )
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    cards = [
+        u["content"] for u in data["updates"] or [] if "Предмет ревью" in u["content"]
+    ]
+    assert "происхождение коммитов установить не удалось" in cards[-1], (
+        "the wider subject states its cause instead of being inferred"
+    )
+    # "as before" is asserted against the rule itself, not against a literal:
+    # with no split the profile is whatever the whole submitted diff buys.
+    row = dict(await repo.get_task(db, task_id))
+    assert (await _dispatch_row(db, task_id))["profile"] == (
+        pick_review_profile(row, _HARMLESS_DIFF)[0]
+    ), "an unanswerable origin changes the subject's width, not the rule"
+
+
+async def test_an_empty_brought_half_claims_only_what_was_measured(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Карточка называет измеренное, а не вывод из него (6ea44f6f, 21ad18b5).
+
+    Пустая привезённая половина НЕ значит «база не двигалась». Спрошена
+    достижимость, и тот же пустой набор даёт ещё два случая: база влита
+    сжатием — её коммиты не предки по хешу (#1240) — и полное перекрытие
+    путей, когда автор тронул ровно те же файлы, что приехали, а разбор идёт
+    по путям. Оба раза база двигалась, а прежняя формулировка это отрицала.
+
+    Здесь воспроизведено полное перекрытие: автор сам написал ОБА файла
+    дельты, привезённого сверх них нет.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o6"}, "run": {"id": "r-o6"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-overlap")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=_MERGED_DELTA
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    cards = [
+        u["content"] for u in data["updates"] or [] if "Предмет ревью" in u["content"]
+    ]
+    assert "файлов только из базы нет" in cards[-1], (
+        "измерено отсутствие ФАЙЛОВ чужого происхождения, не покой базы"
+    )
+    assert "база не двигалась" not in cards[-1], (
+        "про саму базу разбор по достижимости путей ничего не знает"
+    )
+
+
+async def test_unknown_origin_still_lets_the_submitted_diff_buy_deep(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Вторая половина AC-4, которой не было (находка b4bf6acce462a2a6).
+
+    Сосед выше сверяет профиль с ``pick_review_profile(row, _HARMLESS_DIFF)``,
+    а безобидный дифф даёт ``lite`` — ровно столько же, сколько ПУСТАЯ
+    авторская дельта. Поэтому мутация, снимающая запасной вариант
+    (``profile_diff = subject.author_diff`` без ``or diff``), оставляла тот
+    assert зелёным: обе стороны равенства сходились на ``lite``.
+
+    Здесь дифф сдачи сам по себе стоит ``deep`` — в нём процессная поверхность
+    автора, — а происхождение коммитов не установлено. Если запасной вариант
+    сломать, профиль посчитается по пустой строке и упадёт до ``lite``:
+    неустановленное происхождение расширяет предмет, но правило не смягчает.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o5"}, "run": {"id": "r-o5"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-fallback")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP,
+        ["docs/notes.md"],
+        diff=_OWN_WITH_SURFACE,
+        delta=_MERGED_DELTA,
+        own=None,
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    row = dict(await repo.get_task(db, task_id))
+    assert pick_review_profile(row, _OWN_WITH_SURFACE)[0] == "deep", (
+        "предпосылка теста: дифф сдачи сам по себе покупает дорогой профиль"
+    )
+    assert (await _dispatch_row(db, task_id))["profile"] == "deep", (
+        "происхождение неизвестно — решает весь дифф сдачи, как и раньше, "
+        "а не пустая авторская дельта"
+    )
+
+
+async def test_an_empty_brought_half_names_the_squash_case(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Сжатие базы названо в карточке, а не только в комментарии кода (#1240).
+
+    Постановка #1249 требует: на форже, где доставка идёт сжатием, коммиты
+    базы не предки по хешу, и этот случай «должен быть назван, а не пройти
+    мимо». Разбор по достижимости тогда целиком отдаёт привезённое автору —
+    промах в безопасную сторону, но человек, читающий карточку, должен знать,
+    что «файлов только из базы нет» может означать и это.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o7"}, "run": {"id": "r-o7"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-squash")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=_MERGED_DELTA
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    cards = [
+        u["content"] for u in data["updates"] or [] if "Предмет ревью" in u["content"]
+    ]
+    assert "сжатием" in cards[-1] and "#1240" in cards[-1], (
+        "случай сжатия назван там, где его читает человек"
+    )
+
+
+async def test_a_bare_merge_of_the_base_reads_the_whole_delta_and_says_why(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Круг без своей правки — голый мерж базы (#1249).
+
+    Сузить предмет до нуля файлов значило бы выдать ревьюеру пустую команду.
+    Поэтому читается вся дельта, а карточка говорит, почему она такая
+    широкая: всё привезено базой, своей правки в этом круге нет.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-o8"}, "run": {"id": "r-o8"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-origin-bare-merge")
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=""
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert f"'{_AUTHOR_FILE}'" in prompt and f"'{_BASE_FILE}'" in prompt, (
+        "голый мерж не сужает предмет до пустой команды"
+    )
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    cards = [
+        u["content"] for u in data["updates"] or [] if "Предмет ревью" in u["content"]
+    ]
+    assert "2 файл(ов), все привезены базой" in cards[-1], (
+        "ширина предмета объяснена числом и причиной"
+    )
+    assert "своей правки в этом круге нет" in cards[-1]
+
+
+async def test_generation_delta_splits_origin_with_real_git(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Место вызова ``delta_without_base`` — настоящим git (находка #1249).
+
+    Все AC диспатча подменяют git двойником, который отвечает вложенное и
+    не смотрит на аргументы. Перестановка ``prev``/``current`` на месте
+    вызова тогда невидима. Здесь ``generation_delta`` идёт по клону, собранному
+    настоящим git: автор сдал ``mine.py``, слил базу с чужим ``theirs.py`` и
+    дописал второй круг. Переставь концы — ``git log prev --not current``
+    пуст, и разбор скажет «всё привезено базой».
+    """
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import review_dispatch as rd
+    from tests.test_git_ops import _delta_clone
+
+    clone, prev, current = _delta_clone(tmp_path)
+    task_id = await _second_generation(client, db, "spike-origin-real-git")
+    await repo.record_submission(
+        db, task_id=task_id, generation=1, sha=prev, base_branch="develop"
+    )
+    await db.execute(
+        "UPDATE tasks SET submission_sha = ? WHERE id = ?", (current, task_id)
+    )
+    await db.commit()
+
+    async def _clone_context(_db, _task_id):
+        return str(clone), "develop"
+
+    monkeypatch.setattr(rd, "_git_context", _clone_context)
+    plugins.git_ops = GitOpsIntegration()
+    task = dict(await repo.get_task(db, task_id))
+
+    subject = await rd.generation_delta(db, task, "develop")
+
+    assert subject.paths == ["mine.py"], subject.note
+    assert subject.base_paths == ["theirs.py"], subject.note
+    assert "починка второго круга" in subject.author_diff
+    assert "1 файл(ов) автора и 1 привезено базой" in subject.note
 
 
 async def test_previous_findings_travel_with_the_delta(
@@ -5812,9 +6153,23 @@ async def test_an_unconfigured_local_path_changes_nothing_on_github(
     )
     assert "провайдер отказал" in about_review[0], about_review[0]
     assert "HTTP 400, usage_limit_exceeded" in about_review[0], about_review[0]
-    assert not await db.execute_fetchall(
-        "SELECT 1 FROM review_dispatches WHERE task_id=?", (task_id,)
-    ), "ни одной новой строки диспетчера"
+    # #1242 уточняет «ни одной строки»: след сорвавшегося вызова остаётся —
+    # одна облачная заглушка, закрытая в failed, ничего не стоившая. Без неё
+    # переспросу не за что зацепиться, и сдача стоит без отчёта навсегда
+    # (22.09: #1162, #1281, HTTP 429). Локальной строки по-прежнему нет.
+    rows = [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=?", (task_id,)
+        )
+    ]
+    assert [(r["channel"], r["agent_id"], r["status"]) for r in rows] == [
+        ("cloud", "", "failed")
+    ], rows
+    assert await repo.count_review_dispatches(db, task_id, 1) == 0
+    assert await repo.get_review_dispatch_for_generation(db, task_id, 1) is None, (
+        "осевшая заглушка не выдаёт себя за запущенного ревьюера"
+    )
     assert not await repo.machine_reviews_of_generation(db, task_id, 1)
     updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
     assert not any("ЛОКАЛЬНО" in u for u in updates), (
@@ -7722,6 +8077,86 @@ def test_every_intake_caller_pins_the_submission_or_is_a_named_exception():
     )
     stale = set(_INTAKE_PIN_EXCEPTIONS) - owners
     assert not stale, f"исключение названо для вызова, которого больше нет: {stale}"
+
+
+# --- #1206: список без поля name -----------------------------------------
+
+
+async def test_a_listing_without_names_stops_instead_of_buying_a_second_agent(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1206: потребитель читает «поля нет» как blind, а не как пустоту.
+
+    Если провайдер перестанет возвращать метку, сверка не найдёт агента
+    никогда. Прежде это доезжало до _create_or_adopt как подтверждённая
+    пустота и разрешало повторный POST — то есть механизм против двойной
+    покупки сам покупал бы второго на каждом обрыве.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, recorder)
+    # Агент у провайдера ЕСТЬ и он наш — просто имени в ответе нет.
+    listing = _Listing([[{"id": "bc-paid", "latestRunId": "run-paid"}]])
+    monkeypatch.setattr(cursor_cloud, "list_agents", listing)
+
+    task_id = await _submitted(client, db, "spike-nameless")
+
+    assert listing.calls == 1, "спросить обязаны"
+    assert len(recorder.calls) == 1, (
+        "второй POST — это второй оплаченный агент поверх уже созданного"
+    )
+    assert not await repo.list_active_review_dispatches(db), (
+        "подобрать нечем: любой агент из такого ответа был бы угадан"
+    )
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    alerts = " ".join(dict(r)["content"] for r in rows)
+    assert "СПРОСИТЬ" in alerts, "состояние названо как есть, а не как пустота"
+
+
+# --- #1206: имена есть, но ни одно не наше --------------------------------
+
+
+async def test_foreign_names_stop_instead_of_buying_a_second_agent(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1206: наблюдённая форма — имя ЕСТЬ, просто чужое.
+
+    06.09 у осиротевших агентов поле name было заполнено автоименем из
+    промта. На такой странице страж «ключа name нет ни у кого» молчит,
+    сверка на равенство не находит метку — и до _create_or_adopt приезжает
+    подтверждённая пустота, разрешающая купить второго оплаченного агента
+    поверх уже созданного. Потребитель обязан увидеть blind.
+    """
+    recorder = _DispatchRecorder(None, refusal=_LOST_ANSWER)
+    _wire(monkeypatch, recorder)
+    # Агент у провайдера ЕСТЬ и он наш — но имя ему придумал провайдер.
+    listing = _Listing(
+        [
+            [
+                {"id": "bc-paid", "name": "Код-ревью задачи haiplane"},
+                {"id": "bc-other", "name": "Суждение стюарда гейта"},
+            ]
+        ]
+    )
+    monkeypatch.setattr(cursor_cloud, "list_agents", listing)
+
+    task_id = await _submitted(client, db, "spike-foreign-names")
+
+    assert listing.calls == 1, "спросить обязаны"
+    assert len(recorder.calls) == 1, (
+        "второй POST — это второй оплаченный агент поверх уже созданного"
+    )
+    assert not await repo.list_active_review_dispatches(db), (
+        "подобрать нечем: любой агент из такого ответа был бы угадан"
+    )
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    alerts = " ".join(dict(r)["content"] for r in rows)
+    assert "СПРОСИТЬ" in alerts, "состояние названо как есть, а не как пустота"
 
 
 # --- #1208: документ выката и охват стражей песочницы -------------------------
@@ -9750,7 +10185,7 @@ def test_the_recommended_sudo_recipe_still_checks_the_scratch_group(
 async def test_the_queued_local_run_starts_with_a_live_access_code(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
 ):
-    """Код доступа обязан быть жив В МОМЕНТ СТАРТА прогона, а не сдачи.
+    """Код доступа второго в очереди чеканится К ЕГО СТАРТУ, а не при сдаче.
 
     Находка ревьюера Codex 11.09.2026 на ff5b518. Код чеканится в
     ``prepare_review_order`` — то есть внутри HTTP-запроса автора, — а слот
@@ -9760,13 +10195,28 @@ async def test_the_queued_local_run_starts_with_a_live_access_code(
     кодом: основной HTTP-канал отчёта ему не выкупить, и прогон сваливается
     в слабый путь через stdout либо теряет отчёт вовсе.
 
-    Проверяется ТЕМ ЖЕ предикатом, которым живость кода судит сам
-    ``redeem_code`` (не redeem'ом: он потратил бы код), и ровно в тот момент,
-    когда хаб порождает процесс. Первый прогон проверяется вместе со вторым —
-    иначе починка очереди могла бы сломать нормальный путь.
+    ПОЧЕМУ ПРОВЕРКА ЗДЕСЬ НЕ СМОТРИТ НА ЧАСЫ (#1325). Прежняя редакция ставила
+    ``CHAT_PAIR_CODE_SECONDS = 1``, держала слот 2.5 с и спрашивала у базы
+    ``expires_at > datetime('now')``. Требование она держала, но измеряла его
+    гонкой: между чеканкой и чтением на нагруженном бегунке проходило больше
+    секунды, и тест краснел при ВЕРНОМ продукте — прогон CI 35785728735 на
+    develop, где менялся один документ. Воспроизведено на месте: вставь в эту
+    же проверку ``await asyncio.sleep(1.2)`` перед запросом — и на неизменном
+    коде получишь ``[False, False]``.
+
+    Измеряется теперь ПОРЯДОК СОБЫТИЙ, а не разница времён. Снимок всех кодов
+    берётся в момент, когда хаб порождает процесс; код, с которым стартовал
+    второй прогон, обязан в снимке ПЕРВОГО старта отсутствовать — то есть быть
+    отчеканен позже, уже на своём слоте. Мутация, ради которой тест и стоит:
+    ``_prompt_at_slot`` возвращает исходный промт (код выдан при постановке в
+    очередь) — тогда второй стартует с кодом, который существовал уже на
+    старте первого, и снимок это показывает. Живость кода проверяется тем же
+    предикатом, что и у ``redeem_code`` (не redeem'ом: он потратил бы код), но
+    без ``expires_at``: срок жизни здесь продовый, а гонку создавала именно
+    его подмена. Первый прогон проверяется вместе со вторым — иначе починка
+    очереди могла бы сломать нормальный путь.
     """
     import re
-    import time as _time
 
     from hub.services import chat_pair
     from hub.services.review_dispatch import wait_for_local_runs
@@ -9775,32 +10225,47 @@ async def test_the_queued_local_run_starts_with_a_live_access_code(
     _wire(monkeypatch, recorder)
     await _local_principal(db, monkeypatch)
     _own_host_budget(monkeypatch)
-    # Прогон держит слот ДОЛЬШЕ, чем живёт код: на проде это 300 с против
-    # ревью в десятки минут, здесь — те же отношения в секундах.
-    monkeypatch.setattr(config, "CHAT_PAIR_CODE_SECONDS", 1)
-    _stub_reviewer(
-        monkeypatch,
-        tmp_path,
-        "import sys, time; sys.stdin.read(); time.sleep(2.5)",
-    )
+    _stub_reviewer(monkeypatch, tmp_path, "import sys; sys.stdin.read()")
 
-    alive: list[bool] = []
+    # Первый прогон держит слот, пока в очередь не встал второй. Держит СОБЫТИЕ,
+    # а не сон: сон здесь и был гонкой — он задавал срок, который нагруженный
+    # бегунок не обязан соблюдать, а событие задаёт ПОРЯДОК, и его бегунок
+    # нарушить не может.
+    both_queued = asyncio.Event()
+    starts: list[dict[str, object]] = []
+    queue_snapshot: set[str] = set()
+    in_flight = 0
     spawn = local_reviewer._spawn
 
     async def _watching(prompt: str, workdir: str, limit: int, started: float):
+        nonlocal in_flight
         found = re.search(r'"code":"([^"]+)"', prompt)
         assert found, "в промте нет кода доступа — тогда судить не о чем"
-        rows = await db.execute_fetchall(
-            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? "
-            "AND redeemed_at IS NULL AND expires_at > datetime('now')",
-            (chat_pair.hash_pair_code(chat_pair.normalize_pair_code(found.group(1))),),
+        if not starts:
+            # Снимок берётся здесь, а не раньше: к этому моменту ОБА заказа
+            # уже в очереди, то есть код, выданный «при постановке», в базе
+            # непременно есть. Снимок до второй сдачи не доказывал бы ничего.
+            await both_queued.wait()
+            rows = await db.execute_fetchall("SELECT code_hash FROM chat_pair_codes")
+            queue_snapshot.update(dict(r)["code_hash"] for r in rows)
+        code_hash = chat_pair.hash_pair_code(
+            chat_pair.normalize_pair_code(found.group(1))
         )
-        alive.append(bool(rows))
-        return await spawn(prompt, workdir, limit, started)
+        mine = await db.execute_fetchall(
+            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? AND redeemed_at IS NULL",
+            (code_hash,),
+        )
+        in_flight += 1
+        starts.append(
+            {"hash": code_hash, "unredeemed": bool(mine), "at_once": in_flight}
+        )
+        try:
+            return await spawn(prompt, workdir, limit, started)
+        finally:
+            in_flight -= 1
 
     monkeypatch.setattr(local_reviewer, "_spawn", _watching)
 
-    began = _time.monotonic()
     for slug in ("queued-first", "queued-second"):
         await _submitted(
             client,
@@ -9810,17 +10275,31 @@ async def test_the_queued_local_run_starts_with_a_live_access_code(
             repo_name="mrpda/snip-portal",
             forge="gitverse",
         )
+    both_queued.set()
     await wait_for_local_runs()
 
-    assert len(alive) == 2, f"оба прогона обязаны были стартовать: {alive}"
-    assert _time.monotonic() - began > config.CHAT_PAIR_CODE_SECONDS, (
-        "очередь оказалась короче срока жизни кода — тогда тест ничего не "
-        "измерил; удлините полезную нагрузку заглушки"
+    assert len(starts) == 2, f"оба прогона обязаны были стартовать: {starts}"
+    first, second = starts
+    assert [s["at_once"] for s in starts] == [1, 1], (
+        "прогоны шли одновременно — очереди не было, и про «второй в очереди» "
+        f"тест ничего не проверил: {starts}"
     )
-    assert alive == [True, True], (
-        f"код доступа был мёртв на старте прогона: {alive}. Второй в очереди "
-        "не выкупит основной канал отчёта и свалится в слабый путь через "
-        "stdout — или потеряет отчёт вовсе"
+    assert first["hash"] != second["hash"], (
+        "оба прогона стартовали с ОДНИМ кодом: второй его уже не выкупит, "
+        "потому что первый его потратит"
+    )
+    for n, start in enumerate(starts, 1):
+        assert start["unredeemed"], (
+            f"прогон #{n} стартовал с кодом, которого нет в chat_pair_codes "
+            "или который уже потрачен: основной канал отчёта ему не выкупить"
+        )
+    assert queue_snapshot, "снимок очереди пуст — сверять не с чем"
+    assert second["hash"] not in queue_snapshot, (
+        "второй в очереди стартовал с кодом, который существовал уже тогда, "
+        "когда очередь только собралась, — то есть код выдан ПРИ ПОСТАНОВКЕ В "
+        "ОЧЕРЕДЬ, а не к старту. Ждать слота можно дольше, чем живёт код, и "
+        "такой прогон свалится в слабый путь через stdout или потеряет отчёт "
+        "вовсе"
     )
 
 
@@ -10002,4 +10481,886 @@ async def test_a_purged_access_code_is_replaced_before_the_run_starts(
         f"прогон стартовал с кодом, которого в базе уже нет: {alive}. "
         "Продления мало: сборщик протухшего УДАЛЯЕТ строку, и продлять "
         "становится нечего — код к старту обязан быть выписан заново"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1255 — несходимость находок по поколениям: прогон не покупается
+# ---------------------------------------------------------------------------
+
+#: Размеченные траектории находок по поколениям. True — задача сошлась по
+#: критерию постановки #1255 (на последнем поколении ноль либо убыло и
+#: осталось не больше одной), False — нет.
+#:
+#: ДВА ИСТОЧНИКА, и у них разная мера — это названо, а не склеено:
+#:
+#: ``st-*`` — шесть траекторий из постановки #1255: замер machine_reviews
+#:     прода 11.09.2026, счёт confirmed + unresolved. Единственный источник
+#:     НЕСОШЕДШИХСЯ примеров.
+#: ``feed-*`` — лента событий прода (GET /api/events, kind
+#:     machine_review_completed, снято 23.09.2026; БАЗА НЕ ЧИТАЛАСЬ). Все
+#:     задачи с тремя и более поколениями в ленте — 20. Ограничения:
+#:     payload несёт только ЧИСЛО confirmed — ни unresolved, ни диспозиций,
+#:     ни uid, поэтому несколько отчётов поколения свёрнуты максимумом (не
+#:     объединением, как в коде: объединять нечего), а счёт ниже настоящего.
+#:     Лента начинается с события 2657, старшие задачи (#1081, #1084, #1186)
+#:     в неё не попали. #1208 по одной confirmed выглядит сошедшейся
+#:     [3,0,0,…] — её несходимость целиком в unresolved; ровно поэтому
+#:     правило в коде считает обе секции.
+NON_CONVERGENCE_HISTORY: dict[str, tuple[tuple[int, ...], bool]] = {
+    "st-1167": ((9, 5, 6, 3, 2, 1, 0), True),
+    "st-1204": ((6, 2, 2, 2, 1, 3, 1, 0), True),
+    "st-1208": ((3, 4, 2, 4, 2, 4), False),
+    "st-1081": ((5, 6, 6), False),
+    "st-1084": ((3, 6, 3), False),
+    "st-1186": ((7, 2, 13), False),
+    "feed-1155": ((0, 0, 0), True),
+    "feed-1158": ((0, 0, 0, 0), True),
+    "feed-1167": ((6, 5, 0, 3, 2, 0, 0), True),
+    "feed-1168": ((3, 2, 1, 0), True),
+    "feed-1169": ((5, 1, 1, 0), True),
+    "feed-1171": ((3, 0, 0, 0), True),
+    "feed-1172": ((0, 0, 0), True),
+    "feed-1176": ((2, 1, 0), True),
+    "feed-1195": ((1, 1, 0), True),
+    "feed-1204": ((0, 1, 0, 2, 1, 0), True),
+    "feed-1206": ((2, 1, 0, 0), True),
+    "feed-1208": ((3, 0, 0, 0, 0, 0, 0), True),
+    "feed-1233": ((0, 2, 0), True),
+    "feed-1235": ((2, 1, 0), True),
+    "feed-1249": ((1, 0, 0), True),
+    "feed-1261": ((0, 1, 1, 1, 0), True),
+    "feed-1265": ((0, 2, 2, 1, 0), True),
+    "feed-1271": ((2, 2, 0), True),
+    "feed-1273": ((2, 0, 0, 0), True),
+    "feed-1287": ((1, 0, 0, 0), True),
+}
+
+
+def _calibrate(window: int) -> tuple[list[str], list[str]]:
+    """(сошедшиеся, остановленные зря; несошедшиеся, пропущенные)."""
+    from hub.services.review_dispatch import non_convergence_point
+
+    false_stops = [
+        key
+        for key, (counts, converged) in NON_CONVERGENCE_HISTORY.items()
+        if converged and non_convergence_point(counts, window) is not None
+    ]
+    misses = [
+        key
+        for key, (counts, converged) in NON_CONVERGENCE_HISTORY.items()
+        if not converged and non_convergence_point(counts, window) is None
+    ]
+    return false_stops, misses
+
+
+def test_the_threshold_is_measured_on_the_history_not_chosen(monkeypatch):
+    """AC-1 (#1255): числа в коде — результат прогона по истории.
+
+    26 траекторий (6 из постановки, 20 из ленты событий) прогоняются по
+    окнам 2..5. Окно в коде обязано быть ЕДИНСТВЕННЫМ, которое не
+    останавливает ни одной сошедшейся и ловит все несошедшиеся; рядом
+    названо, скольких сошедшихся оно останавливает зря — ноль. Нижний край
+    проверяется так же: без него плато единиц #1261 останавливается зря.
+    """
+    from hub.services import review_dispatch as rd
+
+    table = {window: _calibrate(window) for window in range(2, 6)}
+    assert table[2][0] == ["st-1204", "feed-1265", "feed-1271"], (
+        "окно 2 останавливает плато"
+    )
+    assert table[4][1] == ["st-1081", "st-1084", "st-1186"], (
+        "окно 4 пропускает короткие"
+    )
+    clean = [w for w, (stops, misses) in table.items() if not stops and not misses]
+    assert clean == [rd.NON_CONVERGENCE_WINDOW] == [3], (
+        f"замер даёт {clean}, в коде стоит {rd.NON_CONVERGENCE_WINDOW}"
+    )
+    false_stops, _ = table[rd.NON_CONVERGENCE_WINDOW]
+    assert false_stops == [], "сошедшихся остановлено зря: 0 из 22"
+    assert rd.non_convergence_point(NON_CONVERGENCE_HISTORY["st-1208"][0]) == 4, (
+        "#1208 ловится на четвёртом поколении"
+    )
+    assert rd.NON_CONVERGENCE_FLOOR == 2
+    monkeypatch.setattr(rd, "NON_CONVERGENCE_FLOOR", 1)
+    assert _calibrate(rd.NON_CONVERGENCE_WINDOW)[0] == ["feed-1261"], (
+        "без нижнего края плато из единиц останавливается зря"
+    )
+
+
+def _layer(generation: int, size: int) -> list[dict]:
+    """``size`` РАЗНЫХ подтверждённых находок поколения: у каждой свой uid."""
+    return [
+        _confirmed(
+            f"дефект {generation}.{n}", f"cat-{generation}", 100 * generation + n
+        )
+        for n in range(size)
+    ]
+
+
+async def _next_submission(db: aiosqlite.Connection, task_id: int, generation: int):
+    """Сдача ``generation`` с НОВЫМ кодом, ещё без ревьюера."""
+    await db.execute(
+        "UPDATE tasks SET submission_generation=?, submission_sha=?, "
+        "review_job_id=NULL, status='review' WHERE id=?",
+        (generation, f"{generation:x}".rjust(40, "d"), task_id),
+    )
+    await db.commit()
+
+
+async def _non_convergence_notices(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if "несходимость находок" in dict(u)["content"]
+    ]
+
+
+async def _walk_counts(db, task_id: int, counts: list[int]) -> None:
+    """Положить отчёты по поколениям 1..N; каждый слой автор ЧИНИЛ."""
+    previous: tuple[int, int, list[dict]] | None = None
+    for generation, size in enumerate(counts, start=1):
+        layer = _layer(generation, size)
+        review_id = await _generation_with_findings(
+            db, task_id, generation, confirmed=layer
+        )
+        if previous is not None:
+            await _author_closed_them(
+                db,
+                task_id,
+                previous[0],
+                previous[1],
+                confirmed=previous[2],
+                unresolved=[],
+            )
+        previous = (review_id, generation, layer)
+
+
+async def test_a_flat_finding_count_stops_the_next_run_and_asks_the_human(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1255): три поколения по три находки при настоящих правках.
+
+    Проверяется НАБЛЮДАЕМОЕ отсутствие заказа у провайдера: подставка
+    провайдера не получила второго вызова. Вопрос задан один раз и несёт
+    саму последовательность; после ответа человека круги продолжаются.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1255"}, "run": {"id": "r-1255"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-1255-flat")
+    assert len(recorder.calls) == 1, "предпосылка: первая сдача заказала прогон"
+
+    await _walk_counts(db, task_id, [3, 3, 3])
+    await _next_submission(db, task_id, 4)
+    from hub.services.review_dispatch import maybe_dispatch_review
+
+    assert await maybe_dispatch_review(db, task_id) is False
+    assert len(recorder.calls) == 1, "прогон НЕ заказан у провайдера"
+    notices = await _non_convergence_notices(db, task_id)
+    assert len(notices) == 1
+    assert "постановка или код" in notices[0]
+    assert "сдача 1: 3, сдача 2: 3, сдача 3: 3" in notices[0]
+    events = [
+        json.loads(dict(r)["payload"])
+        for r in await repo.list_events(
+            db, since=0, kinds=["review_non_convergence"], limit=10
+        )
+    ]
+    assert [e["counts"] for e in events] == [[3, 3, 3]]
+
+    # Без ответа следующая сдача тоже стоит, но вопрос не повторяется.
+    await _next_submission(db, task_id, 5)
+    assert await maybe_dispatch_review(db, task_id) is False
+    assert len(recorder.calls) == 1
+    assert len(await _non_convergence_notices(db, task_id)) == 1, "вопрос один раз"
+
+    # Человек ответил вердиктом по остановленной сдаче — круги продолжаются.
+    await db.execute(
+        "UPDATE tasks SET review_verdict_generation=5 WHERE id=?", (task_id,)
+    )
+    await _next_submission(db, task_id, 6)
+    assert await maybe_dispatch_review(db, task_id) is True
+    assert len(recorder.calls) == 2, "после ответа прогон снова покупается"
+
+
+async def _stops_along(db, task_id: int, counts: tuple[int, ...]) -> list[int]:
+    """Поколения, перед которыми правило остановило бы прогон."""
+    from hub.services.review_dispatch import findings_stopped_converging
+
+    stopped: list[int] = []
+    for generation, size in enumerate(counts, start=1):
+        await _generation_with_findings(
+            db, task_id, generation, confirmed=_layer(generation, size)
+        )
+        await _next_submission(db, task_id, generation + 1)
+        task = dict(await repo.get_task(db, task_id))
+        if await findings_stopped_converging(db, task):
+            stopped.append(generation + 1)
+    return stopped
+
+
+async def test_a_long_but_converging_task_is_not_stopped(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1255): #1167 и #1204 — длинные, с колебаниями, но сошлись.
+
+    Настоящие последовательности прогоняются через базу поколение за
+    поколением, как их видел бы хаб на каждой сдаче. Контроль — #1208 на
+    том же пути останавливается, иначе «не сработало» ничего не доказывает.
+    """
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-c"}, "run": {"id": "r"}}))
+    for tid in ("st-1167", "st-1204", "feed-1204", "feed-1261", "feed-1265"):
+        task_id = await _submitted(client, db, f"spike-1255-conv-{tid}")
+        assert await _stops_along(db, task_id, NON_CONVERGENCE_HISTORY[tid][0]) == [], (
+            f"{tid} сошлась сама — останавливать её нельзя"
+        )
+    control = await _submitted(client, db, "spike-1255-control")
+    stops = await _stops_along(db, control, NON_CONVERGENCE_HISTORY["st-1208"][0])
+    assert stops and stops[0] == 5, "#1208 стоит перед пятой сдачей: четвёртый отчёт"
+
+
+async def test_dispositions_count_as_progress_and_an_incomplete_zero_does_not(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4 (#1255): открытые находки, а не сырые; неполный ноль — не чисто."""
+    from hub.services.review_dispatch import findings_stopped_converging
+
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-d"}, "run": {"id": "r"}}))
+
+    async def _stopped(task_id: int, generation: int) -> bool:
+        await _next_submission(db, task_id, generation)
+        return await findings_stopped_converging(
+            db, dict(await repo.get_task(db, task_id))
+        )
+
+    # Разбор: две из трёх находок третьего поколения автор отложил и
+    # признал не дефектом — открытых 3, 3, 1, это схождение.
+    for outcome, expected in (("deferred", False), ("fixed", True)):
+        task_id = await _submitted(client, db, f"spike-1255-disp-{outcome}")
+        await _walk_counts(db, task_id, [3, 3])
+        third = _layer(3, 3)
+        review_id = await _generation_with_findings(db, task_id, 3, confirmed=third)
+        await _author_closed_them(
+            db,
+            task_id,
+            review_id,
+            3,
+            confirmed=third[:2],
+            unresolved=[],
+            outcome_confirmed=outcome,
+        )
+        assert await _stopped(task_id, 4) is expected, (
+            f"исход {outcome}: разбор — прогресс, починка проверяется отчётом"
+        )
+
+    # Неполный отчёт с нулём находок: 3, 4, 3 и затем «не дочитал».
+    task_id = await _submitted(client, db, "spike-1255-incomplete")
+    for generation, size in enumerate((3, 4, 3), start=1):
+        await _generation_with_findings(
+            db, task_id, generation, confirmed=_layer(generation, size)
+        )
+    await db.execute("UPDATE tasks SET submission_generation=4 WHERE id=?", (task_id,))
+    await _seed_report(db, task_id, incomplete=True, reason=None)
+    await db.commit()
+    assert await _stopped(task_id, 5) is True, (
+        "неполный ноль не схождение: последним известным остаётся 3 из 3"
+    )
+
+
+async def test_several_reports_of_one_generation_fold_into_their_union(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1255: lite и добор deep на одно поколение сворачиваются ОБЪЕДИНЕНИЕМ.
+
+    Два случая, и каждый отличает объединение от своей альтернативы:
+    максимум прятал бы находку, которую нашёл только один отчёт, сумма
+    считала бы повтор дважды.
+    """
+    from hub.services.review_dispatch import finding_trajectory
+
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-u"}, "run": {"id": "r"}}))
+    a, b, c = _layer(1, 3)
+    task_id = await _submitted(client, db, "spike-1255-union-max")
+    await _generation_with_findings(db, task_id, 1, confirmed=[a, b])
+    await _generation_with_findings(db, task_id, 1, confirmed=[b, c])
+    trajectory = await finding_trajectory(db, task_id, 2)
+    assert trajectory.counts == (3,), "объединение: a, b, c — не максимум 2"
+
+    task_id = await _submitted(client, db, "spike-1255-union-sum")
+    await _generation_with_findings(db, task_id, 1, confirmed=[a, b])
+    await _generation_with_findings(db, task_id, 1, confirmed=[a, b])
+    trajectory = await finding_trajectory(db, task_id, 2)
+    assert trajectory.counts == (2,), "повтор того же отчёта — не сумма 4"
+
+
+async def _self_report(db, task_id: int, generation: int, size: int) -> None:
+    """Самоотчёт исполнителя о своей работе: не независимое чтение."""
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        harness_skill="deep-review",
+        model="claude-fable-5",
+        raw_count=size,
+        findings_confirmed=json.dumps(_layer(generation, size), ensure_ascii=False),
+        self_reviewed=True,
+        submitted_by="dev-agent",
+    )
+    await db.commit()
+
+
+async def test_a_self_report_is_neither_a_point_nor_a_reset_of_the_trajectory(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1255, находка e6250c505eb42e95, следствие 1: самоотчёт — не сброс.
+
+    Тот же признак, которым страж новизны не считает самоотчёт чтением:
+    полный самоотчёт с нулём находок не снимает остановку.
+    """
+    from hub.services.review_dispatch import findings_stopped_converging
+
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-s"}, "run": {"id": "r"}}))
+
+    async def _stopped(task_id: int, generation: int) -> bool:
+        await _next_submission(db, task_id, generation)
+        return await findings_stopped_converging(
+            db, dict(await repo.get_task(db, task_id))
+        )
+
+    task_id = await _submitted(client, db, "spike-1255-self-reset")
+    await _walk_counts(db, task_id, [3, 3, 3])
+    await _self_report(db, task_id, 4, 0)
+    assert await _stopped(task_id, 5) is True, "чистый самоотчёт — не схождение"
+
+
+async def test_flat_self_reports_do_not_stop_the_first_independent_order(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1255, находка e6250c505eb42e95, следствие 2: самоотчёт — не точка."""
+    from hub.services.review_dispatch import findings_stopped_converging
+
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-s"}, "run": {"id": "r"}}))
+    task_id = await _submitted(client, db, "spike-1255-self-point")
+    for generation in (1, 2, 3):
+        await _self_report(db, task_id, generation, 3)
+    await _next_submission(db, task_id, 4)
+    task = dict(await repo.get_task(db, task_id))
+    assert await findings_stopped_converging(db, task) is False, (
+        "плоские самоотчёты не останавливают первый независимый заказ"
+    )
+
+
+# --- #1242: несостоявшееся ревью переспрашивается во времени ----------------
+#
+# Наблюдено 22.09.2026 стюардом: сдачи #1162 (сдача 3) и #1281 (сдача 2)
+# получили «провайдер отказал: HTTP 429» и остались без отчёта и без повтора.
+# Вторая дверь (#1252) закрывает случай, где настроен локальный путь; здесь
+# он НЕ настроен — и именно здесь переспрашивать было некому.
+_RATE_LIMIT = cursor_cloud.Refusal(
+    status=429, code="rate_limited", detail="Too Many Requests"
+)
+
+
+class _Sequence:
+    """Подставка провайдера с заготовленной ОЧЕРЕДЬЮ исходов по вызовам."""
+
+    def __init__(self, outcomes: list[tuple]):
+        self.outcomes = list(outcomes)
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.outcomes) > 1:
+            return self.outcomes.pop(0)
+        return self.outcomes[0]
+
+
+async def _age_dispatches(db: aiosqlite.Connection) -> None:
+    """Все заказы старше паузы переспроса и окна grace."""
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+
+async def _alerts_of(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return [
+        dict(r)["content"]
+        for r in await db.execute_fetchall(
+            "SELECT content FROM task_updates WHERE task_id=? AND kind='alert' "
+            "ORDER BY id",
+            (task_id,),
+        )
+    ]
+
+
+async def _rows_of(db: aiosqlite.Connection, task_id: int) -> list[dict]:
+    return [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=? ORDER BY id", (task_id,)
+        )
+    ]
+
+
+async def test_a_refused_call_is_asked_again(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1242): отказ провайдера НА ВЫЗОВЕ, отчёта нет — второй вызов.
+
+    Путь синхронный: maybe_dispatch_review, агент не создался. Локальный путь
+    не настроен, то есть вторая дверь (#1252) не открылась — ровно случай
+    22.09. Следующий проход свипа после паузы зовёт ревьюера снова, и
+    карточка называет причину ПЕРВОГО сбоя.
+    """
+    provider = _Sequence(
+        [
+            (None, _RATE_LIMIT),
+            ({"agent": {"id": "bc-second"}, "run": {"id": "run-second"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+
+    task_id = await _submitted(
+        client, db, "ask-again-refused", policy={"review": "dispatch"}
+    )
+    assert len(provider.calls) == 1, "первый вызов отказан"
+
+    await sweep_review_dispatches(db)
+    assert len(provider.calls) == 1, (
+        "пауза: отказ по лимиту не переспрашивается в ту же минуту"
+    )
+
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 2, "второй вызов ревью состоялся"
+    rows = await _rows_of(db, task_id)
+    assert rows[-1]["agent_id"] == "bc-second" and rows[-1]["status"] == "active"
+    assert rows[-1]["replaces_dispatch_id"] == rows[0]["id"], (
+        "переспрос продолжает ту же ступень, а не открывает новую (#879)"
+    )
+    asked = [a for a in await _alerts_of(db, task_id) if "Переспрос ревью" in a]
+    assert len(asked) == 1, asked
+    assert "HTTP 429" in asked[0], (
+        f"причина первого сбоя обязана стоять в карточке: {asked[0]}"
+    )
+    assert "1 из" in asked[0], asked[0]
+    assert await repo.count_review_dispatches(db, task_id, 1) == 1, (
+        "повтор не съедает ступень лестницы"
+    )
+
+
+async def test_a_dead_run_is_asked_again(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1242): прогон кончился терминальным статусом без отчёта.
+
+    Другая функция — sweep_review_dispatches, агент создан и оплачен. Первый
+    проход закрывает прогон как упавший (алерт «отчёт НЕ сдан»), следующий
+    зовёт ревьюера снова. Свежий ревьюер узнаёт СВОЙ отчёт: упавший заказ,
+    замещённый повтором, ступенью в сопоставлении отчётов не считается.
+    """
+    provider = _Sequence(
+        [
+            ({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None),
+            ({"agent": {"id": "bc-fresh"}, "run": {"id": "run-fresh"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    reviewer_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-dead-run", policy={"review": "dispatch"}
+    )
+    await _age_dispatches(db)
+
+    async def _errored(agent_id, run_id):
+        if agent_id == "bc-dead":
+            return {"id": run_id, "status": "ERROR"}
+        return {"id": run_id, "status": "RUNNING"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+
+    await sweep_review_dispatches(db)
+    assert any("отчёт НЕ сдан" in a for a in await _alerts_of(db, task_id))
+    await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 2, "второй вызов ревью по мёртвому прогону"
+    rows = await _rows_of(db, task_id)
+    assert [r["agent_id"] for r in rows] == ["bc-dead", "bc-fresh"]
+    assert rows[0]["status"] == "failed" and rows[1]["status"] == "active"
+    asked = [a for a in await _alerts_of(db, task_id) if "Переспрос ревью" in a]
+    assert len(asked) == 1 and "ERROR" in asked[0], asked
+    assert await repo.count_review_dispatches(db, task_id, 1) == 1
+
+    from hub.services.review_dispatch import _dispatch_report
+
+    assert rows[1]["reviewer_principal_id"] == reviewer_pid, (
+        "ревьюер закреплён — сопоставление идёт по ступеням, а не по поколению"
+    )
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="grok-4.6",
+        submitted_by="cursor-cloud-reviewer",
+        principal_id=reviewer_pid,
+    )
+    await db.commit()
+    own = await _dispatch_report(db, task_id, 1, rows[1])
+    assert own is not None, (
+        "отчёт свежего ревьюера — ЕГО отчёт: замещённый заказ не занимает "
+        "ступень в сопоставлении (#1025)"
+    )
+
+
+async def test_an_existing_report_is_not_bought_twice(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1242): отчёт уже есть — пусть неполный — переспроса нет.
+
+    Неполнота — предмет лестницы добора (#879). Отчёт здесь неполный
+    намеренно: страж второй читки неполный отчёт покрытием не считает и
+    пропустил бы повтор, то есть мутация «переспрашивать всегда» видна
+    ТОЛЬКО этим тестом.
+    """
+    provider = _Sequence(
+        [
+            ({"agent": {"id": "bc-late"}, "run": {"id": "run-late"}}, None),
+            ({"agent": {"id": "bc-extra"}, "run": {"id": "run-extra"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-has-report", policy={"review": "dispatch"}
+    )
+    await _age_dispatches(db)
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await sweep_review_dispatches(db)
+    assert (await _rows_of(db, task_id))[0]["status"] == "failed"
+
+    # Отчёт доехал ПОСЛЕ того, как прогон назван упавшим: заказ закрыт, а
+    # отчёт этого поколения в базе есть.
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        model="grok-4.6",
+        submitted_by="someone-else",
+        incomplete=True,
+        lost_dimensions='["hub/services/big.py"]',
+    )
+    await db.commit()
+
+    await sweep_review_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 1, "второго ревьюера на сданный отчёт не купили"
+    assert len(await _rows_of(db, task_id)) == 1
+    assert not [a for a in await _alerts_of(db, task_id) if "Переспрос ревью" in a]
+
+
+async def test_exhausted_retries_name_themselves_to_a_human(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4 (#1242): потолок на поколение исчерпан — к человеку, с числом.
+
+    Отказ постоянный (тот же 429 на каждом вызове). После потолка третий
+    переспрос не покупается, а карточка называет число попыток и причину
+    последнего сбоя — один раз, а не на каждом проходе свипа.
+    """
+    from hub.services.review_dispatch import REVIEW_ASK_AGAIN_MAX
+
+    provider = _Sequence([(None, _RATE_LIMIT)])
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-exhausted", policy={"review": "dispatch"}
+    )
+
+    for _ in range(REVIEW_ASK_AGAIN_MAX + 3):
+        await _age_dispatches(db)
+        await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 1 + REVIEW_ASK_AGAIN_MAX, (
+        f"вызовов {len(provider.calls)}: потолок {REVIEW_ASK_AGAIN_MAX} "
+        "переспросов на поколение"
+    )
+    alerts = await _alerts_of(db, task_id)
+    asked = [a for a in alerts if "Переспрос ревью" in a]
+    assert len(asked) == REVIEW_ASK_AGAIN_MAX, asked
+    exhausted = [a for a in alerts if "исчерпан" in a]
+    assert len(exhausted) == 1, exhausted
+    assert f"{REVIEW_ASK_AGAIN_MAX}" in exhausted[0]
+    assert "HTTP 429" in exhausted[0], exhausted[0]
+    assert "человек" in exhausted[0], exhausted[0]
+
+
+async def test_a_blind_retry_is_not_repeated(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Ограничение #1199 в переспросе (#1242): вслепую не повторять.
+
+    Переспрос не дошёл до ответа, и спросить провайдера, создался ли агент,
+    тоже не вышло — строки заказа нет. Следующий проход не покупает ещё
+    одного поверх, возможно, уже оплаченного: он называет это человеку.
+    """
+    provider = _Sequence(
+        [(None, _RATE_LIMIT), (None, cursor_cloud.Refusal(status=0, detail="timeout"))]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+
+    async def _cannot_ask(name, pages=3):
+        return cursor_cloud.Reconciliation("", "", False)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _cannot_ask)
+    task_id = await _submitted(
+        client, db, "ask-again-blind", policy={"review": "dispatch"}
+    )
+    for _ in range(3):
+        await _age_dispatches(db)
+        await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 2, "после слепого переспроса — ни одного вызова"
+    stopped = [a for a in await _alerts_of(db, task_id) if "исчерпан" in a]
+    assert len(stopped) == 1 and "не оставил заказа" in stopped[0], stopped
+
+
+async def test_a_mixed_chain_is_still_one_ladder_step(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка b9943fc18e24a30c (#1242, сдача 1): смешанная цепочка повторов.
+
+    Оплаченный прогон упал (ERROR) → переспрос словил 429, осталась
+    бесплатная заглушка → следующий переспрос успешен. Все три строки — одна
+    ступень: успех продолжает заглушку, заглушка — оплаченный прогон. Счёт,
+    глядящий только на непосредственного предка, называл успех второй
+    ступенью, и лестница ложно отказывала в DEEP-доборе («потолок достигнут»).
+    """
+    provider = _Sequence(
+        [
+            ({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None),
+            (None, _RATE_LIMIT),
+            ({"agent": {"id": "bc-fresh"}, "run": {"id": "run-fresh"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-mixed-chain", policy={"review": "dispatch"}
+    )
+
+    async def _runs(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR" if agent_id == "bc-dead" else "RUNNING"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _runs)
+    for _ in range(3):
+        await _age_dispatches(db)
+        await sweep_review_dispatches(db)
+
+    rows = await _rows_of(db, task_id)
+    assert [r["agent_id"] for r in rows] == ["bc-dead", "", "bc-fresh"], rows
+    assert rows[1]["replaces_dispatch_id"] == rows[0]["id"]
+    assert rows[2]["replaces_dispatch_id"] == rows[1]["id"]
+    assert await repo.count_review_dispatches(db, task_id, 1) == 1, (
+        "оплаченный упал, заглушка бесплатна, успех — продолжение той же ступени"
+    )
+
+
+async def test_a_retry_that_left_no_order_does_not_claim_blindness(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка c82b1af523ba9dd7 (#1242, сдача 1): остановка не выдумывает причину.
+
+    Переспрос отказан по конфигурации — наблюдённый отказ, строки заказа нет.
+    Остановка верна (исход неизвестен переспросу, повтор ничего не изменит),
+    но называть его «слепотой #1199» — ложь в карточке: причина стоит в
+    алерте диспетчера, и остановка обязана на него сослаться, а не подменять.
+    """
+    provider = _Sequence(
+        [({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None)]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-no-config", policy={"review": "dispatch"}
+    )
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "")
+    for _ in range(3):
+        await _age_dispatches(db)
+        await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 1
+    alerts = await _alerts_of(db, task_id)
+    assert any("не хватает конфигурации" in a for a in alerts), alerts
+    stopped = [a for a in alerts if "исчерпан" in a]
+    assert len(stopped) == 1, stopped
+    assert "не оставил заказа" in stopped[0], stopped[0]
+    assert "вслепую нельзя" not in stopped[0], (
+        f"отказ конфигурации — не слепой исход #1199: {stopped[0]}"
+    )
+
+
+async def test_a_report_landing_while_the_retry_is_prepared_buys_nothing(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 17a9ca6ea3451163 (#1242, сдача 1): последнее слово перед тратой.
+
+    Отчёт доезжает, пока переспрос готовит заказ (дифф, правила — сеть).
+    Проверка в начале переспроса его не видит; облако не должно покупаться,
+    как не покупает его вторая дверь в том же окне (#1266).
+    """
+    from hub.services import review_dispatch as rd
+
+    provider = _Sequence(
+        [
+            ({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None),
+            ({"agent": {"id": "bc-extra"}, "run": {"id": "run-extra"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-late-report", policy={"review": "dispatch"}
+    )
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    real_prepare = rd.prepare_review_order
+
+    async def _report_arrives(db_, task, **kw):
+        await repo.insert_machine_review(
+            db_,
+            task_id=task_id,
+            submission_generation=1,
+            model="grok-4.6",
+            submitted_by="late-reviewer",
+        )
+        await db_.commit()
+        return await real_prepare(db_, task, **kw)
+
+    monkeypatch.setattr(rd, "prepare_review_order", _report_arrives)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 1, "отчёт уже есть — облако не покупается"
+    assert len(await _rows_of(db, task_id)) == 1
+    # Находка 2007bee302b71bf4 (сдача 2): запись о переспросе стоит ДО
+    # вызова и обещает ревьюера. Отменённая трата обязана быть названа, иначе
+    # карточка говорит о прогоне, которого не было.
+    alerts = await _alerts_of(db, task_id)
+    asked = [i for i, a in enumerate(alerts) if "Переспрос ревью 1 из" in a]
+    assert asked, alerts
+    after = alerts[asked[-1] + 1 :]
+    assert any("отменён" in a and "отчёт" in a for a in after), (
+        f"отменённый переспрос не назван в карточке: {after}"
+    )
+
+
+async def test_a_submission_moved_during_preparation_buys_no_cloud_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка dcd7da1fa88023c5 (#1242, сдача 2): свежесть сдачи перед тратой.
+
+    Подготовка заказа ходит в сеть; за это время задачу могут вернуть в
+    работу или пересдать. Облачный агент тогда читал бы код, которого на
+    живой сдаче уже нет. Проверка общая для ВСЕХ облачных заказов, не только
+    для переспроса: здесь — самый первый вызов при сдаче.
+    """
+    from hub.services import review_dispatch as rd
+
+    provider = _Sequence(
+        [({"agent": {"id": "bc-stale"}, "run": {"id": "run-stale"}}, None)]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    real_prepare = rd.prepare_review_order
+
+    async def _task_leaves_review(db_, task, **kw):
+        order = await real_prepare(db_, task, **kw)
+        # Сдачу переставили на другую ветку, пока шла подготовка.
+        await repo.update_task(db_, int(task["id"]), branch="task-x/other")
+        await db_.commit()
+        return order
+
+    monkeypatch.setattr(rd, "prepare_review_order", _task_leaves_review)
+    task_id = await _submitted(
+        client, db, "cloud-stale-submission", policy={"review": "dispatch"}
+    )
+
+    assert provider.calls == [], "сдача сменилась — облако не покупается"
+    assert not await _rows_of(db, task_id)
+
+
+async def test_a_retry_cancelled_by_a_moved_submission_says_so(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 40a8fd8b727c82ec (#1242, сдача 3): отмена по свежести названа.
+
+    Переспрос уже записал «ревьюер зовётся снова», а проверка свежести перед
+    облачной тратой его отменила: сдачу переставили на другую ветку, пока
+    готовился заказ. Своего алерта у этого отказа нет, поэтому карточка
+    обязана назвать отмену — иначе она обещает прогон, которого не было, а
+    остановка потом ссылается на алерт, которого нет.
+    """
+    from hub.services import review_dispatch as rd
+
+    provider = _Sequence(
+        [
+            ({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None),
+            ({"agent": {"id": "bc-extra"}, "run": {"id": "run-extra"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-moved", policy={"review": "dispatch"}
+    )
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    real_prepare = rd.prepare_review_order
+
+    async def _branch_moves(db_, task, **kw):
+        order = await real_prepare(db_, task, **kw)
+        await repo.update_task(db_, task_id, branch="task-x/moved")
+        await db_.commit()
+        return order
+
+    monkeypatch.setattr(rd, "prepare_review_order", _branch_moves)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 1, "сдача сменилась — облако не покупается"
+    alerts = await _alerts_of(db, task_id)
+    asked = [i for i, a in enumerate(alerts) if "Переспрос ревью 1 из" in a]
+    assert asked, alerts
+    after = alerts[asked[-1] + 1 :]
+    assert any("отменён" in a and "сдача сменилась" in a for a in after), (
+        f"отмена по свежести сдачи не названа в карточке: {after}"
     )

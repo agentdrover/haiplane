@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import re
 
 from httpx import AsyncClient
@@ -6246,3 +6247,697 @@ async def test_the_refusal_names_the_project_and_the_field(client: AsyncClient):
         "цена отказа — вся отправка, и молчать об этом значит оставить человека "
         "с мыслью, что сохранилось хоть что-то"
     )
+
+
+async def test_the_base_merge_block_is_painted_where_approve_is_clicked(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-1 доходит до КАРТОЧКИ, а не только до API брифа (#1233).
+
+    Находка b3d276963b8303bf, и она настоящая. 09.09.2026 человек одобрил #1204
+    именно на этой карточке и через четырнадцать секунд узнал из отказа
+    доставки, что ветка конфликтует с базой в трёх файлах. Блок, посчитанный в
+    брифе, но не нарисованный там, где нажимают Approve, не успевает ни к
+    какому решению — а «до вердикта» и есть весь предмет AC-1.
+    """
+    from unittest.mock import AsyncMock
+
+    from hub.services import review_brief
+
+    task_id = await _web_task_in_review_with_test_ac(client, db)
+    monkeypatch.setattr(
+        review_brief,
+        "base_merge_section",
+        AsyncMock(
+            return_value=review_brief.BaseMergeState(
+                state="conflicting",
+                reason="мерж в базу НЕ будет чистым",
+                files=[
+                    "tests/test_review_dispatch.py",
+                    "hub/services/orchestration.py",
+                ],
+            )
+        ),
+    )
+
+    resp = await client.get(f"/tasks/{task_id}")
+
+    assert resp.status_code == 200
+    assert "Мерж в базу:" in resp.text, (
+        "расхождение с базой обязано быть видно на карточке до вердикта"
+    )
+    assert "conflicting" in resp.text
+    assert "tests/test_review_dispatch.py" in resp.text, (
+        "имена конфликтующих файлов названы человеку, а не только агенту"
+    )
+    assert resp.text.index("Мерж в базу:") < resp.text.rindex('value="approved"'), (
+        "блок стоит ДО кнопки Approve: после неё вердикт уже потрачен"
+    )
+
+
+# --- Теневое участие стюарда включается формой, а не PATCH руками (#1280) ----
+#
+# #1268 завела ключ steward_shadow: проект участвует в теневой фазе, вердикт
+# остаётся человеку, применение суждения запрещено. Ключ принимал только API,
+# и теневая фаза не начиналась ни на одном проекте, пока её включение стоило
+# человеческого токена и ручного запроса.
+#
+# Отдельного внимания стоит ВЫКЛЮЧЕНИЕ. Снятый чекбокс браузер не присылает
+# вовсе, поэтому рычаг, собранный «наивно», работает в одну сторону: включить
+# можно, выключить нельзя. Здесь это закрыто скрытым полем с тем же именем —
+# намерение «выключить» приезжает в запросе, а не выводится из молчания.
+
+
+async def test_the_project_form_turns_shadow_participation_on(client: AsyncClient):
+    """AC-1: галочка на default включает теневое участие, гейты не трогая."""
+    import json
+
+    from hub.services.steward_dispatch import STEWARD_SHADOW_KEY, _policy_wants_steward
+
+    pid = await _project_with_policy(client, "default", {})
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_steward_shadow": ["off", "on"]},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", ""), (
+        "теневое участие ничего не делегирует, поэтому замок #743 его "
+        f"пропускает: {resp.headers.get('location', '')}"
+    )
+
+    policy = await _policy_of(client, pid)
+    assert policy.get(STEWARD_SHADOW_KEY) is True, (
+        "читатель ключа сравнивает именно с True (#1268), так что строка "
+        f"'on' в политике была бы ключом, которого никто не читает: {policy}"
+    )
+    assert _policy_wants_steward({"gate_policy": json.dumps(policy)}), (
+        f"включённым участие считает диспетчер прогонов, а не форма: {policy}"
+    )
+    assert policy.get("dor") == "human" and policy.get("verdict") == "human", (
+        f"вердикт и DoR остаются у человека: {policy}"
+    )
+
+
+async def test_the_project_form_turns_shadow_participation_off(client: AsyncClient):
+    """AC-2: снятая галочка выключает участие, а не сохраняет прежнее."""
+    import json
+
+    from hub.services.steward_dispatch import STEWARD_SHADOW_KEY, _policy_wants_steward
+
+    pid = await _project_with_policy(client, "default", {STEWARD_SHADOW_KEY: True})
+
+    # Ровно то, что шлёт браузер со снятым чекбоксом: скрытое поле и ничего
+    # больше. Без него запрос был бы неотличим от «этот POST про переключатель
+    # не знает», и выключить участие через форму стало бы нельзя.
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_steward_shadow": "off"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", "")
+
+    policy = await _policy_of(client, pid)
+    assert policy.get(STEWARD_SHADOW_KEY) is False, (
+        f"участие выключено, а не оставлено прежним: {policy}"
+    )
+    assert not _policy_wants_steward({"gate_policy": json.dumps(policy)}), (
+        "и диспетчер больше не заказывает теневой прогон на этом проекте"
+    )
+
+
+async def test_saving_the_shadow_toggle_keeps_unknown_policy_keys(
+    client: AsyncClient,
+):
+    """AC-3: ключи, которых форма не показывает, переживают сохранение (#1163)."""
+    from hub.services.steward_dispatch import STEWARD_SHADOW_KEY
+
+    pid = await _project_with_policy(
+        client, "spike-shadow-carry", {"ci_runner": "make test", "release": "auto"}
+    )
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={
+            "gate_policy_steward_shadow": ["off", "on"],
+            "gate_policy_release": "auto",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    policy = await _policy_of(client, pid)
+    assert policy.get("ci_runner") == "make test", (
+        "формы для ci_runner нет, поэтому её отправка не может значить "
+        f"«убрать ci_runner» (#886): {policy}"
+    )
+    assert policy.get(STEWARD_SHADOW_KEY) is True and policy.get("release") == "auto"
+
+
+async def test_the_projects_page_shows_shadow_participation_state(
+    client: AsyncClient,
+):
+    """AC-4: переключатель показывает сохранённое состояние и честную подпись."""
+    from hub.services.steward_dispatch import STEWARD_SHADOW_KEY
+
+    await _project_with_policy(client, "spike-shadow-on", {STEWARD_SHADOW_KEY: True})
+    await _project_with_policy(client, "spike-shadow-off", {})
+
+    page = (await client.get("/projects")).text
+    on_card = _card(page, "spike-shadow-on")
+    off_card = _card(page, "spike-shadow-off")
+
+    assert 'name="gate_policy_steward_shadow"' in on_card, "переключатель на месте"
+    assert "checked" in on_card.split('name="gate_policy_steward_shadow"')[-1][:120], (
+        "включённое участие показано включённым: переключатель, всегда "
+        "рисующий своё значение по умолчанию, врёт о состоянии проекта"
+    )
+    assert (
+        "checked" not in off_card.split('name="gate_policy_steward_shadow"')[-1][:120]
+    ), f"выключенное участие не показывается включённым: {off_card[:400]}"
+    assert "вердикт остаётся у человека" in on_card, (
+        "подпись рядом обязана сказать, что суждение записывается, а решение "
+        "остаётся человеку — иначе переключатель обещает больше, чем делает"
+    )
+
+
+# --- Сохранение формы проекта не теряет ключей политики (#1335) --------------
+#
+# #1264 завёл лимит очереди review — ключи review_limit и review_limit_mode,
+# которые выставлялись только через API. Форма проекта собирает gate_policy
+# сама, а PATCH заменяет политику целиком, поэтому любой ключ, который форма
+# не знает, держится только на том, что сборщик начинает с сохранённой
+# политики. Здесь это проверено и на именах лимита, и на классе, и на том,
+# что форма теперь показывает и правит сам лимит.
+
+#: Политика default на проде в день постановки #1335: сохранение формы обязано
+#: оставить её ровно такой, какой она была, кроме правленого поля.
+_PROD_DEFAULT_POLICY = {
+    "dor": "human",
+    "verdict": "human",
+    "review": "dispatch",
+    "release": "auto",
+    "steward_shadow": True,
+    "review_limit": 8,
+    "review_limit_mode": "warn",
+}
+
+
+async def test_saving_the_project_form_keeps_the_review_limit(client: AsyncClient):
+    """AC-1: правка тени стюарда не стирает review_limit и review_limit_mode."""
+    pid = await _project_with_policy(client, "default", dict(_PROD_DEFAULT_POLICY))
+
+    # Запрос, который знает только о переключателе: полей лимита в нём нет.
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_steward_shadow": "off"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    assert policy.get("review_limit") == 8, f"лимит стёрт сохранением: {policy}"
+    assert policy.get("review_limit_mode") == "warn", f"режим стёрт: {policy}"
+
+    # И запрос, который шлёт браузер с настоящей страницы: форма показывает
+    # сохранённый лимит, человек меняет только тень — политика та же, кроме
+    # тени, и замок #743 на default этот запрос пропускает.
+    card = _card((await client.get("/projects")).text, "default")
+    assert re.search(r'name="gate_policy_review_limit"[^>]*value="8"', card), (
+        f"форма показывает сохранённый лимит: {card[:600]}"
+    )
+    assert re.search(r'<option value="warn"\s+selected', card), (
+        "форма показывает сохранённый режим лимита"
+    )
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={
+            "gate_policy_review": "dispatch",
+            "gate_policy_release": "auto",
+            "gate_policy_steward_shadow": ["off", "on"],
+            "gate_policy_review_limit": "8",
+            "gate_policy_review_limit_mode": "warn",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    assert await _policy_of(client, pid) == _PROD_DEFAULT_POLICY
+
+
+async def test_saving_the_project_form_keeps_unknown_policy_keys(
+    client: AsyncClient, db
+):
+    """AC-2: ключ, которого форма не знает, переживает сохранение — любой.
+
+    Класс выводится, а не перечисляется: это все ключи, которые принимает
+    запись (GATE_POLICY_KEYS), за вычетом ручек, которые форма показывает
+    всегда (_FORM_GATE_POLICY_KEYS). Новый ключ попадает в проверку сам — от
+    автора нужен только образец значения, и без него тест падает, называя
+    ключ. Ключ, которого запись не знает вовсе, форма потерять тоже не может:
+    сохранение отказывает вслух и не пишет ничего.
+    """
+    import json
+
+    from hub.models import GATE_POLICY_KEYS
+    from hub.web import _FORM_GATE_POLICY_KEYS
+
+    samples = {
+        "ci_runner": "make test",
+        "review_limit": 3,
+        "review_limit_mode": "warn",
+    }
+    not_shown = set(GATE_POLICY_KEYS) - _FORM_GATE_POLICY_KEYS
+    assert not_shown, "класс пуст — проверять нечего, тест бы лгал"
+    missing = not_shown - set(samples)
+    assert not missing, f"дайте образец значения для {sorted(missing)}"
+    stored = {key: samples[key] for key in not_shown}
+    pid = await _project_with_policy(client, "spike-unknown-keys", stored)
+
+    for data in (
+        {"gate_policy_steward_shadow": "off"},
+        {"gate_policy_dor": "human", "gate_policy_verdict": "human"},
+        {"gate_policy_release": "manual", "gate_policy_review": "off"},
+        {"gate_policy_dor_max_class": "", "gate_policy_risk_map": ""},
+    ):
+        resp = await client.post(
+            f"/projects/{pid}/web-edit", data=data, follow_redirects=False
+        )
+        assert resp.status_code == 303
+        assert "project_error" not in resp.headers.get("location", ""), (data, resp)
+        policy = await _policy_of(client, pid)
+        lost = {k: v for k, v in stored.items() if policy.get(k) != v}
+        assert not lost, f"сохранение {data} потеряло {lost}: {policy}"
+
+    # Ключ, положенный мимо API и неизвестный записи: сохранение не роняет его
+    # молча, а отказывает и оставляет политику как была.
+    legacy = {**stored, "legacy_knob": {"nested": [1, 2]}}
+    await db.execute(
+        "UPDATE projects SET gate_policy = ? WHERE id = ?", (json.dumps(legacy), pid)
+    )
+    await db.commit()
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_steward_shadow": "off"},
+        follow_redirects=False,
+    )
+    assert "legacy_knob" in resp.headers.get("location", ""), resp.headers
+    assert await _policy_of(client, pid) == legacy
+
+
+async def test_the_project_form_edits_the_review_limit(client: AsyncClient):
+    """AC-3: лимит 8/warn записывается, пустое поле его снимает, неверное — отказ."""
+    from urllib.parse import unquote_plus
+
+    import pytest
+
+    from hub.models import _validate_review_limit
+
+    pid = await _project_with_policy(client, "spike-limit-form", {})
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_review_limit": "8", "gate_policy_review_limit_mode": "warn"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    assert policy.get("review_limit") == 8, f"число, а не строка: {policy}"
+    assert policy.get("review_limit_mode") == "warn", policy
+
+    # Неверные значения отказывает ТА ЖЕ проверка, что у API: текст отказа —
+    # её текст, и сохранённое не меняется.
+    for raw, mode in (("0", "warn"), ("abc", "warn"), ("2.5", "warn"), ("3", "loud")):
+        resp = await client.post(
+            f"/projects/{pid}/web-edit",
+            data={
+                "gate_policy_review_limit": raw,
+                "gate_policy_review_limit_mode": mode,
+            },
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        location = unquote_plus(resp.headers.get("location", ""))
+        assert "project_error" in location, (raw, mode, location)
+        with pytest.raises(ValueError) as refused:
+            _validate_review_limit(
+                {
+                    "review_limit": int(raw) if raw.isdigit() else raw,
+                    "review_limit_mode": mode,
+                }
+            )
+        assert str(refused.value) in location, (raw, mode, location)
+        assert await _policy_of(client, pid) == policy, "отказ ничего не записал"
+
+    # Пустое поле — явное «снять лимит»: оба ключа уходят.
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_review_limit": "", "gate_policy_review_limit_mode": "warn"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    assert "review_limit" not in policy and "review_limit_mode" not in policy, policy
+
+
+async def test_emptied_project_form_fields_still_clear_their_keys(
+    client: AsyncClient,
+):
+    """Риск #1335: каждое поле, которое форма сбрасывала пустым, сбрасывает и теперь.
+
+    Сборщик начинает с сохранённой политики, поэтому снятие ручки держится на
+    том, что её ключ назван ручкой формы. Проверяется поимённо.
+    """
+    pid = await _project_with_policy(
+        client,
+        "spike-clear-all",
+        {
+            "dor": "auto",
+            "verdict": "auto",
+            "review": "dispatch",
+            "release": "auto",
+            "steward_shadow": True,
+            "dor_max_class": "r1",
+            "risk_map": {"docs/**": "docs"},
+            "review_limit": 5,
+            "review_limit_mode": "warn",
+            "ci_runner": "make test",
+        },
+    )
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={
+            "gate_policy_dor": "",
+            "gate_policy_verdict": "",
+            "gate_policy_review": "off",
+            "gate_policy_release": "manual",
+            "gate_policy_steward_shadow": "off",
+            "gate_policy_dor_max_class": "",
+            "gate_policy_risk_map": "",
+            "gate_policy_review_limit": "",
+            "gate_policy_review_limit_mode": "enforce",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    assert await _policy_of(client, pid) == {
+        "dor": "human",
+        "verdict": "human",
+        "steward_shadow": False,
+        "ci_runner": "make test",
+    }
+
+
+# ---------------------------------------------------------------------------
+# #1333: принятие в интерфейсе умеет доставить.
+#
+# 23.09.2026 #1276, #1249 и #1234 приняты в веб-форме и закрыты со строкой
+# «Судьба PR не выбрана»: web_decide_task не знал поля pr_disposition, и
+# пустое значение было единственно возможным. Тесты читают форму так, как её
+# отправит браузер, если человек ничего не трогал.
+# ---------------------------------------------------------------------------
+
+
+def _pr_choice_blocks(page: str) -> list[str]:
+    return re.findall(r'<select name="pr_disposition".*?</select>', page, re.S)
+
+
+def _preselected(block: str) -> str:
+    chosen = re.findall(r'<option value="([^"]*)"[^>]*\bselected\b', block)
+    assert len(chosen) == 1, f"выбранным помечено {len(chosen)} вариантов: {block}"
+    return chosen[0]
+
+
+async def _decision_with_open_pr(client: AsyncClient, db, *, pr: int, approved: bool):
+    from tests.test_accept_without_delivery import (
+        _approved_task,
+        _task_awaiting_decision,
+    )
+
+    if approved:
+        return await _approved_task(client, db, title=f"web accept {pr}", pr=pr)
+    return await _task_awaiting_decision(client, db, title=f"web accept {pr}", pr=pr)
+
+
+async def test_web_accept_delivers_by_default(client: AsyncClient, db, monkeypatch):
+    from tests.test_accept_without_delivery import _install, _MergeSpy, _pr_states
+
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    _pr_states(monkeypatch, {1501: "open"})
+    task_id = await _decision_with_open_pr(client, db, pr=1501, approved=True)
+
+    page = (await client.get(f"/tasks/{task_id}")).text
+    blocks = _pr_choice_blocks(page)
+    assert len(blocks) == 1, "в форме решения есть выбор судьбы PR"
+    shown = _preselected(blocks[0])
+    assert shown == "deliver", "открытый PR и одобрение текущей сдачи — доставить"
+    assert 'value="abandon"' in blocks[0], "отказаться — видимый выбор"
+
+    # Браузер отправляет то, что показано выбранным.
+    resp = await client.post(
+        f"/tasks/{task_id}/web-decide",
+        data={"action": "accept", "pr_disposition": shown},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303, resp.text
+    assert spy.merged == [1501], "принятие в интерфейсе доставило PR"
+    assert await repo.pipeline_merge_recorded(db, task_id, 1501)
+    stored = await repo.get_delivery_discrepancy(db, task_id)
+    assert stored is None or stored["state"] != "pr_open"
+
+    # Без одобрения текущей сдачи умолчание пустое: доставлять нечего решать.
+    unapproved = await _decision_with_open_pr(client, db, pr=1502, approved=False)
+    page = (await client.get(f"/tasks/{unapproved}")).text
+    assert _preselected(_pr_choice_blocks(page)[0]) == ""
+
+
+async def test_web_accept_can_abandon_the_pr(client: AsyncClient, db, monkeypatch):
+    from tests.test_accept_without_delivery import _install, _MergeSpy, _pr_states
+
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    _pr_states(monkeypatch, {1503: "open"})
+    task_id = await _decision_with_open_pr(client, db, pr=1503, approved=True)
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-decide",
+        data={"action": "accept", "pr_disposition": "abandon"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303, resp.text
+    assert (await repo.get_task(db, task_id))["status"] == "completed"
+    assert spy.merged == [], "отказ от PR ничего не вливает"
+    stored = await repo.get_delivery_discrepancy(db, task_id)
+    assert stored is not None
+    assert stored["disposition"] == "abandon"
+
+
+async def test_every_web_decide_surface_carries_the_pr_choice(client: AsyncClient, db):
+    """Поимённо: inbox, карточка канбана, строка таблицы — у каждой кнопки
+    Accept свой селектор, и кнопка его отправляет (hx-include)."""
+    approved = await _decision_with_open_pr(client, db, pr=1504, approved=True)
+    bare = await _decision_with_open_pr(client, db, pr=1505, approved=False)
+
+    surfaces = {
+        "inbox": ("/", "inbox-pr-disposition"),
+        "task_card": ("/partials/kanban", "card-pr-disposition"),
+        "task_table": ("/tasks/list?status=needs_decision", "row-pr-disposition"),
+    }
+    for name, (url, prefix) in surfaces.items():
+        page = (await client.get(url)).text
+        for task_id, expected in ((approved, "deliver"), (bare, "")):
+            field_id = f"{prefix}-{task_id}"
+            found = re.search(
+                rf'<select name="pr_disposition" id="{field_id}".*?</select>',
+                page,
+                re.S,
+            )
+            assert found, f"{name}: нет селектора судьбы PR у #{task_id}"
+            assert _preselected(found.group(0)) == expected, name
+            assert f'hx-include="#{field_id}"' in page, (
+                f"{name}: кнопка Accept #{task_id} не отправляет выбор"
+            )
+
+
+async def test_the_inbox_registry_row_delivers_through_the_gate(
+    client: AsyncClient, db, monkeypatch
+):
+    """#1333: строка «Completed, PR still open» в инбоксе несёт кнопку
+    «доставить», и она идёт тем же путём, что REST; агенту — 403."""
+    from hub import config
+    from hub.config import TokenIdentity
+    from tests.test_accept_without_delivery import _install, _MergeSpy, _pr_states
+
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    _pr_states(monkeypatch, {1506: "open"})
+    task_id = await _decision_with_open_pr(client, db, pr=1506, approved=True)
+    await client.post(f"/api/tasks/{task_id}/decide", json={"action": "accept"})
+
+    page = (await client.get("/")).text
+    assert f'action="/tasks/{task_id}/web-deliver-undelivered"' in page
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {"agent-token": TokenIdentity("bot", "agent", principal_id=7)},
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = await client.post(
+        f"/tasks/{task_id}/web-deliver-undelivered",
+        headers={"Authorization": "Bearer agent-token"},
+        follow_redirects=False,
+    )
+    assert agent.status_code == 403
+    assert spy.merged == []
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", True)
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-deliver-undelivered", follow_redirects=False
+    )
+    assert resp.status_code == 303, resp.text
+    assert spy.merged == [1506]
+
+
+# ---- #1333, сдача 2: находки машинного ревью (отчёт #479) ----
+
+
+async def _accepted_red_ci_row(client: AsyncClient, db, monkeypatch, *, pr: int):
+    """Строка реестра pr_open, доставка которой упрётся в красный CI."""
+    from tests.test_accept_without_delivery import _install, _MergeSpy, _pr_states
+
+    spy = _MergeSpy(ci="failed")
+    _install(monkeypatch, spy)
+    _pr_states(monkeypatch, {pr: "open"})
+    task_id = await _decision_with_open_pr(client, db, pr=pr, approved=True)
+    await client.post(f"/api/tasks/{task_id}/decide", json={"action": "accept"})
+    return task_id, spy
+
+
+async def test_a_refused_registry_delivery_returns_to_the_inbox_with_the_reason(
+    client: AsyncClient, db, monkeypatch
+):
+    """aa0b738677921a18: отказ гейта — ожидаемый исход, а не ошибка ввода.
+    Человек остаётся на инбоксе и видит причину, а не сырой JSON."""
+    task_id, spy = await _accepted_red_ci_row(client, db, monkeypatch, pr=1507)
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-deliver-undelivered",
+        data={"return_project": ""},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303, resp.text
+    location = resp.headers["location"]
+    assert location.startswith("/?") and f"delivery_refused={task_id}" in location
+    assert spy.merged == []
+
+    page = (await client.get(location)).text
+    banner = re.search(r'<div class="delivery-refusal"[^>]*>(.*?)</div>', page, re.S)
+    assert banner, "на инбоксе нет строки с причиной отказа"
+    assert f"#{task_id}" in banner.group(1) and "ci_" in banner.group(1)
+
+    # HTMX-вариант: фрагмент с причиной на месте, код 200.
+    htmx = await client.post(
+        f"/tasks/{task_id}/web-deliver-undelivered",
+        headers={"HX-Request": "true"},
+    )
+    assert htmx.status_code == 200, htmx.text
+    assert "ci_" in htmx.text and "не выполнена" in htmx.text
+
+
+async def test_the_accept_confirm_names_the_pr_fate(client: AsyncClient, db):
+    """feb9db856b3d78d9: подтверждение называет судьбу PR на каждой кнопке."""
+    approved = await _decision_with_open_pr(client, db, pr=1508, approved=True)
+    bare = await _decision_with_open_pr(client, db, pr=1509, approved=False)
+    surfaces = {
+        "inbox": "/",
+        "task_card": "/partials/kanban",
+        "task_table": "/tasks/list?status=needs_decision",
+    }
+    for name, url in surfaces.items():
+        page = (await client.get(url)).text
+        for task_id, words in (
+            (approved, f"Accept #{approved} и доставить PR #1508?"),
+            (bare, "PR #1509 останется открытым"),
+        ):
+            button = re.search(
+                rf'<button[^>]*hx-post="/tasks/{task_id}/web-decide".*?</button>',
+                page,
+                re.S,
+            )
+            assert button, f"{name}: нет кнопки Accept у #{task_id}"
+            confirm = re.search(r'hx-confirm="([^"]*)"', button.group(0))
+            assert confirm, f"{name}: Accept #{task_id} без подтверждения"
+            assert words in html.unescape(confirm.group(1)), (name, confirm.group(1))
+        # Смена выбора меняет и текст подтверждения.
+        assert 'data-confirm="' in page and "onchange=" in page, name
+
+
+async def test_the_htmx_accept_names_the_delivery_outcome(
+    client: AsyncClient, db, monkeypatch
+):
+    """feb9db856b3d78d9: после ответа строка называет исход доставки, а
+    секция «Completed, PR still open» обновляется без перезагрузки."""
+    from tests.test_accept_without_delivery import _install, _MergeSpy, _pr_states
+
+    spy = _MergeSpy(ci="failed")
+    _install(monkeypatch, spy)
+    _pr_states(monkeypatch, {1510: "open", 1511: "open"})
+    red = await _decision_with_open_pr(client, db, pr=1510, approved=True)
+
+    resp = await client.post(
+        f"/tasks/{red}/web-decide",
+        data={
+            "action": "accept",
+            "pr_disposition": "deliver",
+            "from_inbox": "true",
+            "inbox_project": "",
+        },
+        headers={"HX-Request": "true"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert "PR #1510 НЕ доставлен" in resp.text and "ci_" in resp.text
+    oob = re.search(
+        r'<div id="inbox-undelivered" hx-swap-oob="true">(.*?)</div>\s*$',
+        resp.text,
+        re.S,
+    )
+    assert oob, "секция «Completed, PR still open» не обновлена"
+    assert f"/tasks/{red}/web-deliver-undelivered" in oob.group(1)
+
+    spy.ci = "passed"
+    green = await _decision_with_open_pr(client, db, pr=1511, approved=True)
+    resp = await client.post(
+        f"/tasks/{green}/web-decide",
+        data={"action": "accept", "pr_disposition": "deliver"},
+        headers={"HX-Request": "true"},
+    )
+    assert "PR #1511 доставлен" in resp.text
+    assert spy.merged == [1511]
+
+
+async def test_web_decide_names_the_field_that_failed(client: AsyncClient, db):
+    """40ac6a807ddad21b: ошибка валидации называет то поле, что не прошло."""
+    task_id = await _decision_with_open_pr(client, db, pr=1512, approved=False)
+    resp = await client.post(
+        f"/tasks/{task_id}/web-decide",
+        data={"action": "bogus", "pr_disposition": "deliver"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "action" in detail and "pr_disposition" not in detail, detail
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-decide",
+        data={"action": "accept", "pr_disposition": "merge-it"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert "pr_disposition" in resp.json()["detail"]

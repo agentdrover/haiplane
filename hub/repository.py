@@ -27,6 +27,7 @@ from hub.models import (
     FINAL_STATUSES,
     IN_FLIGHT_STATUSES,
     QUEUED_STATUSES,
+    ReviewVerdict,
 )
 
 # One spelling of "this row is finished", derived from the model instead of
@@ -490,11 +491,26 @@ async def list_unmerged_branch_tasks(
     exclude_task_id: int,
     statuses: list[str],
 ) -> list[aiosqlite.Row]:
-    """Active tasks (other than ``exclude_task_id``) that own a branch (#438)."""
+    """Active tasks (other than ``exclude_task_id``) that own a branch (#438).
+
+    ``submission_generation`` travels with the row (#1283): it counts the
+    submissions the task actually made, so zero is the hub's own record that
+    this task has never handed work in — and therefore owns nothing on origin
+    to compare against.
+
+    ``submission_sha`` travels with it too, and it used to carry that meaning
+    alone — wrongly, which is why the count is here: an empty sha does not say
+    "never published". ``resolve_branch_tip`` documents the empty value as
+    "could not look" (no workspace, a failed fetch, an exception), the
+    submission is accepted anyway, and a verdict on a moved tip wipes the pin.
+    The stacking walk reads both; callers that do not care simply ignore the
+    columns.
+    """
     placeholders = ",".join("?" for _ in statuses)
     return await fetchall(
         db,
-        f"SELECT id, title, status, branch FROM tasks "  # nosec B608
+        f"SELECT id, title, status, branch, submission_sha, "  # nosec B608
+        f"submission_generation FROM tasks "
         f"WHERE archived=0 AND id != ? AND status IN ({placeholders}) "
         "AND branch IS NOT NULL AND TRIM(branch) != '' ORDER BY id",
         (exclude_task_id, *statuses),
@@ -590,6 +606,30 @@ async def list_review_tasks(
         "SELECT * FROM tasks WHERE archived=0 AND status='review' "
         "AND review_job_id IS NOT NULL",
     )
+
+
+async def list_review_task_ids_in_project(
+    db: aiosqlite.Connection, project_id: int
+) -> list[int]:
+    """Live tasks of this project sitting in review, by id (#1264).
+
+    The project is resolved exactly as everywhere else — through
+    ``resolve_project_for_task`` — not through PROJECT_SUBTREE_CONDITION: the
+    subtree misses the tasks default owns by fallback (no epic, or an epic
+    whose project is still a pending proposal), and those are most of
+    default's queue. The review queue is tens of rows, so resolving each one
+    costs less than a second definition of "belongs to the project" would.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT id FROM tasks WHERE archived=0 AND status='review' ORDER BY id",
+    )
+    ids: list[int] = []
+    for row in rows:
+        project = await resolve_project_for_task(db, int(row["id"]))
+        if project is not None and int(project["id"]) == project_id:
+            ids.append(int(row["id"]))
+    return ids
 
 
 async def list_pair_tasks_awaiting_delivery(
@@ -1221,6 +1261,7 @@ async def insert_steward_judgement(
     duration_ms: int | None = None,
     submitted_by: str = "",
     principal_id: int | None = None,
+    tokens_unknown_reason: str = "",
 ) -> int | None:
     """Insert one judgement. None when the (task, generation, kind) slot is taken."""
     try:
@@ -1228,7 +1269,8 @@ async def insert_steward_judgement(
             "INSERT INTO steward_judgements (task_id, generation, kind, "
             "submitted_verdict, verdict, confidence, escalate_reason, grounds, "
             "findings, closures, model, tokens_spent, duration_ms, submitted_by, "
-            "principal_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "principal_id, tokens_unknown_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 generation,
@@ -1245,11 +1287,30 @@ async def insert_steward_judgement(
                 duration_ms,
                 submitted_by,
                 principal_id,
+                tokens_unknown_reason,
             ),
         )
     except aiosqlite.IntegrityError:
         return None
     return cur.lastrowid
+
+
+async def set_steward_judgement_tokens(
+    db: aiosqlite.Connection,
+    judgement_id: int,
+    tokens: int | None,
+    unknown_reason: str,
+) -> None:
+    """Record the provider's answer about a judgement's tokens (#1328).
+
+    Only a judgement still waiting is touched: an answer already written is
+    not overwritten by a later, emptier one.
+    """
+    await db.execute(
+        "UPDATE steward_judgements SET tokens_spent=?, tokens_unknown_reason=? "
+        "WHERE id=? AND tokens_unknown_reason='pending'",
+        (tokens, unknown_reason, judgement_id),
+    )
 
 
 async def get_steward_judgement(
@@ -1339,6 +1400,25 @@ async def machine_reviews_of_generation(
             (task_id, generation),
         )
     )
+
+
+async def latest_reviewed_generation(
+    db: aiosqlite.Connection, task_id: int, at_most: int
+) -> int | None:
+    """The newest generation, no newer than ``at_most``, that has a report (#1331).
+
+    ``None`` when no submission up to ``at_most`` was ever reviewed. A
+    generation whose review never happened (429, exhausted limit, crashed run)
+    leaves no row at all, so skipping it skips the gap and nothing else.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT MAX(submission_generation) AS g FROM machine_reviews "
+        "WHERE task_id=? AND submission_generation<=?",
+        (task_id, at_most),
+    )
+    value = dict(rows[0])["g"] if rows else None
+    return None if value is None else int(value)
 
 
 async def list_machine_reviews(
@@ -2345,15 +2425,74 @@ async def record_review_verdict(
     ``self_approved`` marks verdicts accepted only via the
     ``HAIPLANE_REVIEW_SELF_APPROVE=allow`` solo opt-out (#434); it belongs
     to the verdict, so every new verdict overwrites the flag.
+    ``review_verdict_closed_generation`` is cleared for the same reason
+    (#1286): a window closed by a human decision belonged to the PREVIOUS
+    verdict, and a new verdict opens its own.
     """
     await db.execute(
         "UPDATE tasks SET review_verdict=?, "
         "review_verdict_generation=submission_generation, "
         "review_findings=?, "
         "review_self_approved=?, "
+        "review_verdict_closed_generation=NULL, "
         "updated_at=datetime('now') WHERE id=?",
         (verdict, findings_json, 1 if self_approved else 0, task_id),
     )
+
+
+async def close_review_verdict_window(
+    db: aiosqlite.Connection,
+    task_id: int,
+) -> int | None:
+    """Close the CURRENT submission's APPROVAL, revoked by a decision (#1286).
+
+    Returns the generation whose window was closed, or ``None`` when there was
+    nothing to close. The caller uses that answer to decide whether the feed
+    has anything to say, so "nothing was closed" is an answer and not a
+    silence.
+
+    Nothing to close means one of three things, and the third one was this
+    function's own defect: no verdict at all; a verdict belonging to an
+    earlier submission; or a verdict that never authorised a delivery.
+    CHANGES_REQUESTED is the live case of the third — reachable on the current
+    generation without any bump, e.g. when the fix dispatch fails and drops
+    the task into needs_decision, or when the arbiter finishes on that same
+    submission. A window exists only where the verdict grants the right to
+    deliver, which is APPROVED and nothing else: rework does not revoke a
+    rejection, it agrees with it. Closing one anyway made the feed announce a
+    revoked approval over a task nobody had approved.
+
+    Written in SQL against ``submission_generation`` for the same reason
+    ``record_review_verdict`` binds the verdict there: nothing read before the
+    statement can be stale by the time it runs. The verdict itself, its
+    generation, its findings and its self-approved flag are left ALONE — the
+    window closes, the history stays (#1286 constraint).
+    """
+    rows = await fetchall(
+        db,
+        "SELECT submission_generation, review_verdict, review_verdict_generation "
+        "FROM tasks WHERE id=?",
+        (task_id,),
+    )
+    if not rows:
+        return None
+    row = dict(rows[0])
+    generation = int(row.get("submission_generation") or 0)
+    if (row.get("review_verdict") or "").strip() != ReviewVerdict.approved.value:
+        return None
+    if generation <= 0 or row.get("review_verdict_generation") != generation:
+        return None
+    cur = await db.execute(
+        "UPDATE tasks SET review_verdict_closed_generation=submission_generation, "
+        "updated_at=datetime('now') WHERE id=? AND review_verdict=? "
+        "AND review_verdict_generation=submission_generation",
+        (task_id, ReviewVerdict.approved.value),
+    )
+    if not cur.rowcount:
+        # A concurrent verdict landed between the read and the write: it owns
+        # its own window, and this decision closed nothing.
+        return None
+    return generation
 
 
 async def transition_status_if(
@@ -2601,12 +2740,20 @@ async def get_review_dispatch_for_generation(
     Deliberately status-agnostic, unlike get_settled_review_dispatch: the
     profile is decided when the run is launched, and the report normally
     arrives while the dispatch is still 'active'.
+
+    One exception (#1242): a SETTLED sync-refusal stub (empty ``agent_id``,
+    no longer active or owed) is skipped. It now outlives the call as the
+    ask-again trace, and it never ran — its model and profile are what
+    would have been launched, not a fact about any reviewer, so the
+    auto-verdict's "which model reviewed" and the intake's profile must not
+    read it.
     """
     rows = list(
         await fetchall(
             db,
             "SELECT * FROM review_dispatches "
             "WHERE task_id=? AND submission_generation=? "
+            "AND (agent_id != '' OR status IN ('active', 'second_door')) "
             "ORDER BY id DESC LIMIT 1",
             (task_id, generation),
         )
@@ -2679,20 +2826,41 @@ async def count_review_dispatches(
       another). A sync cloud-create refusal writes a debt-tracking stub with
       an empty ``agent_id`` (#1266, ``owe_second_door`` on the sync path) —
       that costs nothing and never did, before or after this fix.
-    - ``replaces_dispatch_id IS NULL`` — the row is not a replacement. A
-      replacement continues the rung it replaces rather than opening a new
-      one; the row it replaces already counted (it had a real ``agent_id``).
+    - no PAID row up its ``replaces_dispatch_id`` chain — a replacement
+      continues the rung it replaces rather than opening a new one, and that
+      rung already counted where it was paid for.
 
     Two genuine cloud runs (LITE then a DEEP top-up) both have empty
     ``replaces_dispatch_id`` and non-empty ``agent_id`` — they still count as
     two and still hit ``REVIEW_LADDER_MAX_STEPS``.
+
+    #1242 sharpens the second rule: a replacement is free only when the row
+    it replaces was a PAID run. The ask-again pass replaces a sync-refusal
+    stub too, and that stub never counted — so the first real run of the
+    rung is the replacement itself, and skipping it would hand the ladder a
+    step it never paid for.
+
+    The paid row is looked for along the WHOLE ``replaces_dispatch_id``
+    chain, not only at the direct parent (finding b9943fc18e24a30c): paid run
+    failed → ask-again hit a 429 and left a free stub → the next ask-again
+    succeeded. The success's parent is the free stub, yet the rung was paid
+    two links up — counting it made one rung two, and the ladder refused its
+    DEEP top-up claiming the ceiling was hit. ``replaces_dispatch_id`` always
+    points to an earlier row, so the walk ends.
     """
     rows = await fetchall(
         db,
-        "SELECT COUNT(*) AS n FROM review_dispatches "
-        "WHERE task_id=? AND submission_generation=? "
-        "AND agent_id != '' AND replaces_dispatch_id IS NULL",
-        (task_id, generation),
+        "WITH RECURSIVE chain(start, parent) AS ("
+        "SELECT id, replaces_dispatch_id FROM review_dispatches "
+        "WHERE task_id=? AND submission_generation=? AND agent_id != '' "
+        "UNION ALL SELECT c.start, r.replaces_dispatch_id FROM chain c "
+        "JOIN review_dispatches r ON r.id = c.parent) "
+        "SELECT COUNT(*) AS n FROM review_dispatches d "
+        "WHERE d.task_id=? AND d.submission_generation=? AND d.agent_id != '' "
+        "AND NOT EXISTS (SELECT 1 FROM chain c "
+        "JOIN review_dispatches r ON r.id = c.parent "
+        "WHERE c.start = d.id AND r.agent_id != '')",
+        (task_id, generation, task_id, generation),
     )
     return int(dict(rows[0])["n"]) if rows else 0
 
@@ -3881,9 +4049,11 @@ async def upsert_agent_session(
     not quietly erase what the registry knows.
 
     ON CONFLICT does not overwrite another principal's ``principal_id`` or
-    ``agent`` (#977). A WHERE miss leaves the existing row as-is so a raced
-    register cannot steal the address between the service's owner check and
-    this write.
+    ``agent`` (#977), and does not move a declared ``host`` or ``workspace``
+    that contradicts the stored one (#1288). A WHERE miss leaves the existing
+    row as-is so a raced register cannot steal the address between the
+    service's checks and this write — the same-principal collision that made
+    a task's ``claim_session_id`` point at another machine's worktree.
     """
     await db.execute(
         "INSERT INTO agent_sessions "
@@ -3900,8 +4070,15 @@ async def upsert_agent_session(
         "  workspace    = CASE WHEN excluded.workspace = '' "
         "                 THEN agent_sessions.workspace ELSE excluded.workspace END, "
         "  last_seen_at = datetime('now') "
-        "WHERE agent_sessions.principal_id IS NULL "
-        "   OR agent_sessions.principal_id = excluded.principal_id",
+        "WHERE (agent_sessions.principal_id IS NULL "
+        "       OR agent_sessions.principal_id = excluded.principal_id) "
+        # An empty declaration is "not declared" and an empty stored value is
+        # "unknown": neither is a different address, so both stay writable.
+        "  AND (excluded.host = '' OR COALESCE(agent_sessions.host, '') = '' "
+        "       OR agent_sessions.host = excluded.host) "
+        "  AND (excluded.workspace = '' "
+        "       OR COALESCE(agent_sessions.workspace, '') = '' "
+        "       OR agent_sessions.workspace = excluded.workspace)",
         (session_id, principal_id, agent, model, host, workspace),
     )
 

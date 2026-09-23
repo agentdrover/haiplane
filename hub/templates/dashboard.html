@@ -52,6 +52,11 @@
             {% if inbox_total > 0 %}<span class="section-count section-count-warn">{{ inbox_total }}</span>{% endif %}
         </h2>
     </div>
+    {# #1333: отказ «доставить» из реестра — вне inbox-content, чтобы 30-секундное
+       обновление инбокса не стёрло причину раньше, чем её прочтут. #}
+    {% if delivery_refusal %}
+    <div class="delivery-refusal" role="alert">{{ delivery_refusal }}</div>
+    {% endif %}
     <div id="inbox-content"
          hx-get="/partials/inbox{% if current_project %}?project={{ current_project }}{% endif %}"
          hx-trigger="every 30s"
