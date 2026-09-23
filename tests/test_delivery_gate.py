@@ -473,6 +473,37 @@ async def test_an_escalated_base_is_still_a_base(db: aiosqlite.Connection) -> No
         await db.commit()
 
 
+async def test_a_needs_info_base_holds_the_stacked_delivery(
+    db: aiosqlite.Connection,
+) -> None:
+    """#1275 AC-2: основание спросило человека — и перестало быть основанием.
+
+    running → needs_info (hub_ask_question) оставляет ветку запушенной и
+    несмерженной, а обход стопки этот статус не видел: потомок проходил
+    условие как clear и уезжал в базовую ветку с чужой работой — инцидент
+    #1186 через ещё одну дверь. Вопрос ответится, задача вернётся в running
+    и доставит себя сама, поэтому это ожидание, а не решение человека.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+    task_id = await _approved_pair_task(db)
+    base_id = await _base_task_with_status(
+        db, "task-1263/asked-a-question", "needs_info"
+    )
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", "основание вернётся само — это ожидание"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{base_id}" in body, "в ленте названо основание"
+    assert "task-1263/asked-a-question" in body
+
+
 async def test_the_same_commit_under_two_names_never_waits_on_itself(
     db: aiosqlite.Connection,
 ) -> None:
@@ -705,6 +736,11 @@ async def test_every_status_in_the_delivery_list_is_actually_seen(
         "fix_requested",
         "needs_decision",
         "pending_report",
+        # #1275: достижимы из running, ветка уже запушена, и каждый обычным
+        # переходом возвращается в running — основание доставит себя само.
+        "needs_info",
+        "open",
+        "claimed",
     )
     assert set(STACK_DELIVERY_STATUSES) == set(expected), (
         "член добавлен или убран — решение осознанное, значит и здесь его надо "
@@ -3463,7 +3499,7 @@ async def test_a_reworked_task_waits_for_resubmission_not_a_human(
 # но не заставляет решать про статус, о котором автор не подумал (#1186:
 # pending_report, его повтор, needs_info). Здесь перебирается TaskStatus
 # целиком: у каждого члена должно быть решение — либо он в перечне, либо
-# исключён с названной причиной, либо открыт находкой со ссылкой на драфт.
+# исключён с названной причиной.
 
 # Статус исключён, и вот почему. Причина — наблюдение о коде, а не мнение.
 STACK_EXCLUDED_STATUSES: dict[str, str] = {
@@ -3480,25 +3516,22 @@ STACK_EXCLUDED_STATUSES: dict[str, str] = {
         "отдельно через list_undelivered_completed_branch_tasks (#1204), "
         "доставленная — стопки не образует"
     ),
-}
-
-# Решения нет, и это находка на develop (#1271): статус достижим из running,
-# то есть задача в нём может владеть запушенной несмерженной веткой, а обход
-# стопки её не видит. Код в этой задаче не правится — драфт ниже.
-STACK_UNDECIDED_STATUSES: dict[str, str] = {
-    TaskStatus.needs_info.value: "драфт #1275: running → needs_info (hub_ask_question)",
-    TaskStatus.open.value: "драфт #1275: running → open (chat_pair_reaper), needs_info → open",
-    TaskStatus.claimed.value: "драфт #1275: open → claimed после возврата из running",
-    TaskStatus.failed.value: "драфт #1275: running → failed (упавший headless-прогон)",
+    TaskStatus.failed.value: (
+        "финальный статус (FINAL_STATUSES), выхода из него в "
+        "LIFECYCLE_TRANSITIONS нет — ждать нечего, поэтому не в перечне "
+        "ожидания: обходится отдельно через STACK_TERMINAL_STATUSES как "
+        "основание, которое само не доставится, и стопка на нём идёт к "
+        "человеку (#1275)"
+    ),
 }
 
 
 def test_every_task_status_is_either_stacked_or_excluded_with_a_reason() -> None:
     """#1271 AC-1: новый член TaskStatus без решения роняет этот тест.
 
-    Решение — одно из трёх: статус в STACK_DELIVERY_STATUSES, в словаре
-    исключённых с причиной, или в словаре открытых находок со ссылкой на
-    драфт. Члены берутся из перечисления, а не из головы — ровно та ошибка,
+    Решение — одно из двух: статус в STACK_DELIVERY_STATUSES или в словаре
+    исключённых с причиной. Словарь открытых находок (#1271) закрыт в #1275.
+    Члены берутся из перечисления, а не из головы — ровно та ошибка,
     из-за которой pending_report и needs_info были упущены в #1186.
     """
     from hub.services.orchestration import STACK_DELIVERY_STATUSES
@@ -3507,7 +3540,6 @@ def test_every_task_status_is_either_stacked_or_excluded_with_a_reason() -> None
     buckets = {
         "STACK_DELIVERY_STATUSES": stacked,
         "STACK_EXCLUDED_STATUSES": set(STACK_EXCLUDED_STATUSES),
-        "STACK_UNDECIDED_STATUSES": set(STACK_UNDECIDED_STATUSES),
     }
     members = {status.value for status in TaskStatus}
 
@@ -3525,27 +3557,8 @@ def test_every_task_status_is_either_stacked_or_excluded_with_a_reason() -> None
         for right in names[i + 1 :]:
             both = sorted(buckets[left] & buckets[right])
             assert not both, f"статус решён дважды ({left} и {right}): {both}"
-    for status, reason in {
-        **STACK_EXCLUDED_STATUSES,
-        **STACK_UNDECIDED_STATUSES,
-    }.items():
+    for status, reason in STACK_EXCLUDED_STATUSES.items():
         assert reason.strip(), f"исключение {status} без причины"
-
-
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#1271 находка на develop, драфт #1275: статусы, достижимые "
-    "из running, не входят в STACK_DELIVERY_STATUSES и решения не имеют",
-)
-def test_undecided_stack_statuses_are_decided() -> None:
-    # Проверяет код, а не словарь: статус, достижимый из running, входит в
-    # обход стопки. Когда драфт это решит, strict уронит XPASS, а основной
-    # тест — «решён дважды», и словарь находок придётся убрать.
-    from hub.services.orchestration import STACK_DELIVERY_STATUSES
-
-    missing = sorted(set(STACK_UNDECIDED_STATUSES) - set(STACK_DELIVERY_STATUSES))
-    assert not missing, f"не решены: {missing}"
 
 
 # ---- #1271 AC-2: у каждого транзитного префикса своя подсказка ----
