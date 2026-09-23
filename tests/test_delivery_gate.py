@@ -3939,12 +3939,14 @@ async def test_automerge_validates_with_a_command_the_host_can_run(
     moved = _tip(workdir, "task-1233/probe")
     assert moved != pinned, "ветка обновлена слитым коммитом"
     assert task["submission_sha"] == moved, "и сдача перезакреплена на него"
-    feed = await _feed(db, task_id)
-    assert "base_automerged" in feed or "Автомерж базы" in feed, feed
-    assert "git diff --check" in feed and "компиляция" in feed, (
-        "карточка называет, ЧЕМ проверено сложенное"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    cards = [u["content"] for u in updates if "Автомерж базы" in (u["content"] or "")]
+    assert len(cards) == 1, await _feed(db, task_id)
+    card = cards[0]
+    assert "git diff --check" in card and "компиляция" in card, (
+        "карточка автомержа называет, ЧЕМ проверено сложенное"
     )
-    assert "CI на новой вершине" in feed, (
+    assert "CI на новой вершине" in card, (
         "и чем будет проверено поведение: карточка не обещает больше, чем сделал хост"
     )
 
