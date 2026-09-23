@@ -1566,3 +1566,46 @@ async def test_a_failed_neighbour_that_never_published_does_not_hold_the_project
     assert detail == "", f"неопубликованная ветка не держит доставку: {detail!r}"
     body = await _feed(db, task_id)
     assert f"#{base_id}" in body and "не опубликована" in body
+
+
+async def test_a_failed_base_whose_published_branch_vanished_calls_a_human(
+    db: aiosqlite.Connection,
+) -> None:
+    # Ревью #1275, 9bc10bd45785a1af. Упавшая задача сдавалась (ветка была на
+    # origin), а теперь ветки нет. Это не #1283 — ветка БЫЛА — и не моргнувший
+    # git: задача финальна, ветку никто не вернёт. Повторяемый unknown здесь —
+    # тихое вечное удержание всех доставок проекта, поэтому к человеку.
+    from hub.services.orchestration import UNPROBED_STRANDED_BASE_PREFIX
+
+    task_id, _branch = await _pair_running_task(db, "Сосед упал, ветку удалили")
+    base_branch = "task-1302/failed-then-deleted"
+    base_id = await _neighbour(
+        db, base_branch, status="failed", submission_sha="b" * 40
+    )
+    plugins.git_ops = _ScriptedProbeGitOps({base_branch: _ref_unresolved(base_branch)})
+
+    detail = await _gate(db, task_id)
+
+    assert detail.startswith(f"{UNPROBED_STRANDED_BASE_PREFIX}:"), (
+        f"ветка упавшей задачи не вернётся — ждать нечего: {detail!r}"
+    )
+    assert f"#{base_id}" in detail and base_branch in detail
+    assert "упала" in detail, "названа настоящая причина"
+    assert "человек принял" not in detail and "PR открыт" not in detail, (
+        "у упавшей задачи нет ни приёмки, ни записанного PR"
+    )
+
+
+async def test_a_failed_unpublished_neighbour_is_not_promised_a_push(
+    db: aiosqlite.Connection,
+) -> None:
+    # Ревью #1275, 6fc293188dd34632: из failed выхода нет, пуша не будет.
+    task_id, _branch = await _pair_running_task(db, "Сосед упал до пуша")
+    base_branch = "task-1303/failed-never-pushed"
+    await _neighbour(db, base_branch, status="failed")
+    plugins.git_ops = _ScriptedProbeGitOps({base_branch: _ref_unresolved(base_branch)})
+
+    assert await _gate(db, task_id) == ""
+    body = await _feed(db, task_id)
+    assert "первый пуш" not in body, "обещание пуша, которого не будет"
+    assert "упала" in body
