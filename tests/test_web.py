@@ -6420,3 +6420,233 @@ async def test_the_projects_page_shows_shadow_participation_state(
         "подпись рядом обязана сказать, что суждение записывается, а решение "
         "остаётся человеку — иначе переключатель обещает больше, чем делает"
     )
+
+
+# --- Сохранение формы проекта не теряет ключей политики (#1335) --------------
+#
+# #1264 завёл лимит очереди review — ключи review_limit и review_limit_mode,
+# которые выставлялись только через API. Форма проекта собирает gate_policy
+# сама, а PATCH заменяет политику целиком, поэтому любой ключ, который форма
+# не знает, держится только на том, что сборщик начинает с сохранённой
+# политики. Здесь это проверено и на именах лимита, и на классе, и на том,
+# что форма теперь показывает и правит сам лимит.
+
+#: Политика default на проде в день постановки #1335: сохранение формы обязано
+#: оставить её ровно такой, какой она была, кроме правленого поля.
+_PROD_DEFAULT_POLICY = {
+    "dor": "human",
+    "verdict": "human",
+    "review": "dispatch",
+    "release": "auto",
+    "steward_shadow": True,
+    "review_limit": 8,
+    "review_limit_mode": "warn",
+}
+
+
+async def test_saving_the_project_form_keeps_the_review_limit(client: AsyncClient):
+    """AC-1: правка тени стюарда не стирает review_limit и review_limit_mode."""
+    pid = await _project_with_policy(client, "default", dict(_PROD_DEFAULT_POLICY))
+
+    # Запрос, который знает только о переключателе: полей лимита в нём нет.
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_steward_shadow": "off"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    assert policy.get("review_limit") == 8, f"лимит стёрт сохранением: {policy}"
+    assert policy.get("review_limit_mode") == "warn", f"режим стёрт: {policy}"
+
+    # И запрос, который шлёт браузер с настоящей страницы: форма показывает
+    # сохранённый лимит, человек меняет только тень — политика та же, кроме
+    # тени, и замок #743 на default этот запрос пропускает.
+    card = _card((await client.get("/projects")).text, "default")
+    assert re.search(r'name="gate_policy_review_limit"[^>]*value="8"', card), (
+        f"форма показывает сохранённый лимит: {card[:600]}"
+    )
+    assert re.search(r'<option value="warn"\s+selected', card), (
+        "форма показывает сохранённый режим лимита"
+    )
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={
+            "gate_policy_review": "dispatch",
+            "gate_policy_release": "auto",
+            "gate_policy_steward_shadow": ["off", "on"],
+            "gate_policy_review_limit": "8",
+            "gate_policy_review_limit_mode": "warn",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    assert await _policy_of(client, pid) == _PROD_DEFAULT_POLICY
+
+
+async def test_saving_the_project_form_keeps_unknown_policy_keys(
+    client: AsyncClient, db
+):
+    """AC-2: ключ, которого форма не знает, переживает сохранение — любой.
+
+    Класс выводится, а не перечисляется: это все ключи, которые принимает
+    запись (GATE_POLICY_KEYS), за вычетом ручек, которые форма показывает
+    всегда (_FORM_GATE_POLICY_KEYS). Новый ключ попадает в проверку сам — от
+    автора нужен только образец значения, и без него тест падает, называя
+    ключ. Ключ, которого запись не знает вовсе, форма потерять тоже не может:
+    сохранение отказывает вслух и не пишет ничего.
+    """
+    import json
+
+    from hub.models import GATE_POLICY_KEYS
+    from hub.web import _FORM_GATE_POLICY_KEYS
+
+    samples = {
+        "ci_runner": "make test",
+        "review_limit": 3,
+        "review_limit_mode": "warn",
+    }
+    not_shown = set(GATE_POLICY_KEYS) - _FORM_GATE_POLICY_KEYS
+    assert not_shown, "класс пуст — проверять нечего, тест бы лгал"
+    missing = not_shown - set(samples)
+    assert not missing, f"дайте образец значения для {sorted(missing)}"
+    stored = {key: samples[key] for key in not_shown}
+    pid = await _project_with_policy(client, "spike-unknown-keys", stored)
+
+    for data in (
+        {"gate_policy_steward_shadow": "off"},
+        {"gate_policy_dor": "human", "gate_policy_verdict": "human"},
+        {"gate_policy_release": "manual", "gate_policy_review": "off"},
+        {"gate_policy_dor_max_class": "", "gate_policy_risk_map": ""},
+    ):
+        resp = await client.post(
+            f"/projects/{pid}/web-edit", data=data, follow_redirects=False
+        )
+        assert resp.status_code == 303
+        assert "project_error" not in resp.headers.get("location", ""), (data, resp)
+        policy = await _policy_of(client, pid)
+        lost = {k: v for k, v in stored.items() if policy.get(k) != v}
+        assert not lost, f"сохранение {data} потеряло {lost}: {policy}"
+
+    # Ключ, положенный мимо API и неизвестный записи: сохранение не роняет его
+    # молча, а отказывает и оставляет политику как была.
+    legacy = {**stored, "legacy_knob": {"nested": [1, 2]}}
+    await db.execute(
+        "UPDATE projects SET gate_policy = ? WHERE id = ?", (json.dumps(legacy), pid)
+    )
+    await db.commit()
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_steward_shadow": "off"},
+        follow_redirects=False,
+    )
+    assert "legacy_knob" in resp.headers.get("location", ""), resp.headers
+    assert await _policy_of(client, pid) == legacy
+
+
+async def test_the_project_form_edits_the_review_limit(client: AsyncClient):
+    """AC-3: лимит 8/warn записывается, пустое поле его снимает, неверное — отказ."""
+    from urllib.parse import unquote_plus
+
+    import pytest
+
+    from hub.models import _validate_review_limit
+
+    pid = await _project_with_policy(client, "spike-limit-form", {})
+
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_review_limit": "8", "gate_policy_review_limit_mode": "warn"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    assert policy.get("review_limit") == 8, f"число, а не строка: {policy}"
+    assert policy.get("review_limit_mode") == "warn", policy
+
+    # Неверные значения отказывает ТА ЖЕ проверка, что у API: текст отказа —
+    # её текст, и сохранённое не меняется.
+    for raw, mode in (("0", "warn"), ("abc", "warn"), ("2.5", "warn"), ("3", "loud")):
+        resp = await client.post(
+            f"/projects/{pid}/web-edit",
+            data={
+                "gate_policy_review_limit": raw,
+                "gate_policy_review_limit_mode": mode,
+            },
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        location = unquote_plus(resp.headers.get("location", ""))
+        assert "project_error" in location, (raw, mode, location)
+        with pytest.raises(ValueError) as refused:
+            _validate_review_limit(
+                {
+                    "review_limit": int(raw) if raw.isdigit() else raw,
+                    "review_limit_mode": mode,
+                }
+            )
+        assert str(refused.value) in location, (raw, mode, location)
+        assert await _policy_of(client, pid) == policy, "отказ ничего не записал"
+
+    # Пустое поле — явное «снять лимит»: оба ключа уходят.
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_review_limit": "", "gate_policy_review_limit_mode": "warn"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    policy = await _policy_of(client, pid)
+    assert "review_limit" not in policy and "review_limit_mode" not in policy, policy
+
+
+async def test_emptied_project_form_fields_still_clear_their_keys(
+    client: AsyncClient,
+):
+    """Риск #1335: каждое поле, которое форма сбрасывала пустым, сбрасывает и теперь.
+
+    Сборщик начинает с сохранённой политики, поэтому снятие ручки держится на
+    том, что её ключ назван ручкой формы. Проверяется поимённо.
+    """
+    pid = await _project_with_policy(
+        client,
+        "spike-clear-all",
+        {
+            "dor": "auto",
+            "verdict": "auto",
+            "review": "dispatch",
+            "release": "auto",
+            "steward_shadow": True,
+            "dor_max_class": "r1",
+            "risk_map": {"docs/**": "docs"},
+            "review_limit": 5,
+            "review_limit_mode": "warn",
+            "ci_runner": "make test",
+        },
+    )
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={
+            "gate_policy_dor": "",
+            "gate_policy_verdict": "",
+            "gate_policy_review": "off",
+            "gate_policy_release": "manual",
+            "gate_policy_steward_shadow": "off",
+            "gate_policy_dor_max_class": "",
+            "gate_policy_risk_map": "",
+            "gate_policy_review_limit": "",
+            "gate_policy_review_limit_mode": "enforce",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "project_error" not in resp.headers.get("location", ""), resp.headers
+    assert await _policy_of(client, pid) == {
+        "dor": "human",
+        "verdict": "human",
+        "steward_shadow": False,
+        "ci_runner": "make test",
+    }
