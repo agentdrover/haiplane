@@ -222,14 +222,6 @@
     {
       "path": "hub/services/review_brief.py",
       "function": "build_review_brief",
-      "rule": "C901",
-      "measured": 17,
-      "max": 20,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/services/review_brief.py",
-      "function": "build_review_brief",
       "rule": "PLR0915",
       "measured": 74,
       "max": 86,
