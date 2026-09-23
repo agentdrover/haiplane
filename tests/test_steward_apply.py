@@ -1326,6 +1326,7 @@ async def _dor_judged(
     *,
     confidence: str = "high",
     escalate_reason: str = "",
+    grounds: list[dict] | None = None,
 ) -> None:
     """Суждение стюарда о ПОСТАНОВКЕ — настоящим записывающим путём.
 
@@ -1333,7 +1334,12 @@ async def _dor_judged(
     постановки, вердикт — в поколении сдачи. Совпадение поколений было бы
     случайностью теста, и проверка, опершаяся на него, прошла бы мимо
     настоящего входа.
+
+    Не-escalate вердикт несёт основание: без него #1327 записывает approve
+    как escalate/no_grounds, и тест проверял бы понижение, а не одобрение.
     """
+    if grounds is None:
+        grounds = [] if verdict == "escalate" else [{"source": "ci_pinned_sha"}]
     from hub.config import TokenIdentity
     from hub.models import StewardJudgementSubmit
     from hub.services.steward_judgement import record_steward_judgement
@@ -1347,6 +1353,7 @@ async def _dor_judged(
             verdict=verdict,
             confidence=confidence,
             escalate_reason=escalate_reason,
+            grounds=grounds,
             model="gpt-5.3-codex",
         ),
         TokenIdentity("steward-bot", "steward", principal_id=42),
@@ -1438,6 +1445,9 @@ async def test_an_approval_downgraded_to_escalate_is_not_self_authorship(
     assert dict(saved)["submitted_verdict"] == "approve"
     assert dict(saved)["verdict"] == "escalate", (
         "предпосылка теста: понижение сработало"
+    )
+    assert dict(saved)["escalate_reason"] == "low_confidence", (
+        "понижено за низкую уверенность, а не за отсутствие оснований"
     )
 
     refusals = await apply_refusals(db, task_id)
