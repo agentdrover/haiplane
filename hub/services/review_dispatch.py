@@ -45,7 +45,7 @@ from hub.models import (
     INCOMPLETE_REASON_PROFILE,
     RiskClass,
 )
-from hub.services import project_policy
+from hub.services import call_sites, project_policy
 from hub.services.model_family import family
 from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
 
@@ -968,6 +968,7 @@ def _review_prompt(
     diff_block: str,
     prepass_block: str,
     delivery_block: str = "",
+    only_tests_block: str = "",
 ) -> str:
     common = (
         f"Ты — независимый код-ревьюер задачи #{task_id} хаба Haiplane "
@@ -982,6 +983,9 @@ def _review_prompt(
         # And the prepass (#875): both profiles pay model prices for what a
         # linter already proved, and the expensive one pays them per pass.
         f"{prepass_block}\n\n"
+        # #1254: symbols only tests call, as a question with two answers.
+        # Empty adds nothing, so an order without candidates is unchanged.
+        + only_tests_block
         # #1238: and the order of attempts before "the environment refused".
         # Both profiles get it: the deep harness lost the test dimension on
         # exactly the same missing tool as a cheap one would.
@@ -1640,6 +1644,29 @@ class ReviewOrder:
     #: отмерить срок заново, а для этого нужен сам код (#1208). Пусто там, где
     #: кода не выдавали: открытый режим, отозванный токен.
     access_code: str = ""
+    #: #1254: символы, которых вне tests/ не зовёт никто, — названные в
+    #: ``prompt`` как предмет проверки. Пусто — разбор прошёл и не назвал
+    #: никого; None — разбор не состоялся. Уезжает в строку заказа, и бриф
+    #: судит итог ровно по этому набору.
+    only_tests: tuple[str, ...] | None = None
+
+
+async def _only_tests_of(
+    ctx: tuple[str, str] | None, diff: str | None
+) -> list[call_sites.SymbolReport] | None:
+    """Кандидаты only_tests по диффу сдачи (#1254); None — не смотрели.
+
+    Источник один — ``call_sites.analyse``, тот же, что у брифа. Неудача
+    разбора заказ не роняет: без кандидатов он остаётся прежним.
+    """
+    if ctx is None or not diff:
+        return None
+    try:
+        report = await asyncio.to_thread(call_sites.analyse, ctx[0], diff)
+    except Exception as exc:  # noqa: BLE001 - советующий блок, не гейт
+        log.warning("only_tests: call-site walk failed: %s", exc)
+        return None
+    return call_sites.only_tests_symbols(report)
 
 
 async def prepare_review_order(
@@ -1706,6 +1733,7 @@ async def prepare_review_order(
     from hub.services import review_evidence
 
     prepass = await review_evidence.prepass_state(db, task)
+    only_tests = await _only_tests_of(ctx, diff)
     hub_base = instance_base_url().rstrip("/")
     code = await _access_code(db, task_id, generation, principal_id)
     return ReviewOrder(
@@ -1721,11 +1749,13 @@ async def prepare_review_order(
             diff_block,
             review_evidence.prepass_block(prepass),
             _delivery_block(task_id, code, hub_base),
+            call_sites.only_tests_block(only_tests),
         ),
         rules_note=rules_note,
         diff_note=diff_note,
         prepass=prepass,
         access_code=code,
+        only_tests=None if only_tests is None else tuple(s.symbol for s in only_tests),
     )
 
 
@@ -2080,6 +2110,7 @@ async def maybe_dispatch_review(
             profile=profile,
             principal_id=expected_principal,
             replaces_dispatch_id=replaces_dispatch_id,
+            only_tests=order.only_tests,
         )
 
     # #1025: pin whose report this dispatch waits for, resolved from the
@@ -2103,6 +2134,7 @@ async def maybe_dispatch_review(
         profile=profile,
         reviewer_principal_id=expected_principal,
         replaces_dispatch_id=replaces_dispatch_id,
+        only_tests=order.only_tests,
     )
     profile_note = (
         f"профиль {profile} (один проход по диффу)"
@@ -2169,6 +2201,7 @@ async def _owe_the_refused_call(
     profile: str,
     principal_id: int | None,
     replaces_dispatch_id: int | None,
+    only_tests: tuple[str, ...] | None,
 ) -> bool:
     """Синхронный отказ облака: долг второй двери и след для переспроса.
 
@@ -2207,6 +2240,7 @@ async def _owe_the_refused_call(
         reviewer_principal_id=principal_id,
         channel=CLOUD_CHANNEL,
         replaces_dispatch_id=replaces_dispatch_id,
+        only_tests=only_tests,
     )
     await repo.owe_second_door(db, stub_id, detail)
     await db.commit()
@@ -2530,6 +2564,7 @@ async def dispatch_local_review(
             int(late_report_recheck["id"]) if late_report_recheck is not None else None
         ),
         second_door_reason=why,
+        only_tests=order.only_tests,
     )
     await repo.add_task_update(
         db,

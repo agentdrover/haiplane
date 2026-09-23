@@ -478,3 +478,124 @@ def test_it_would_have_caught_the_defect_it_was_written_for(repo: Path):
     assert "hub/bulk.py" in untouched, (
         "the fifth path has to appear by itself; that is the whole point"
     )
+
+
+# ---- #1254: only_tests is removable, and removing it charges nothing ----
+
+
+async def test_a_registry_call_is_removable_and_charges_nothing(
+    repo: Path, client, monkeypatch
+):
+    """AC-4 (#1254): the analyser's known false positive can be cleared.
+
+    A tool registered by NAME (the MCP case: hub_submit_machine_review came
+    out only_tests on 11.09.2026) is invisible to a static walk. The reviewer
+    clears it by naming the call path; the clearing is accepted, and the
+    task's readiness, dor_passed and ability to be approved are read from the
+    task itself before and after — none of them moves.
+    """
+    from unittest.mock import AsyncMock
+
+    from hub import app as hub_app
+    from hub.integrations.registry import plugins
+
+    (repo / "hub" / "registry.py").write_text(
+        "import importlib\n"
+        "\n"
+        "\n"
+        "def call_tool(name, *args):\n"
+        "    return getattr(importlib.import_module('hub.tools'), name)(*args)\n"
+    )
+    (repo / "hub" / "tools.py").write_text(
+        "def hub_submit_probe(value):\n    return value\n"
+    )
+    (repo / "tests" / "test_tools.py").write_text(
+        "from hub.tools import hub_submit_probe\n"
+        "\n"
+        "\n"
+        "def test_probe():\n"
+        "    assert hub_submit_probe(1) == 1\n"
+    )
+    diff = _diff(repo)
+    report = call_sites.analyse(str(repo), diff)
+    probe = next(s for s in report.symbols if s.symbol == "hub_submit_probe")
+    assert probe.state == call_sites.ONLY_TESTS, "the false positive must be real"
+
+    task_id = (
+        await client.post("/api/tasks", json={"title": "Probe", "source": "agent"})
+    ).json()["id"]
+    for url, payload in (
+        (f"/api/tasks/{task_id}/approve", {"force": True}),
+        (f"/api/tasks/{task_id}/claim", {"agent": "dev"}),
+        (
+            f"/api/tasks/{task_id}/updates",
+            {"agent": "dev", "kind": "status", "content": "Plan: register it"},
+        ),
+        (f"/api/tasks/{task_id}/pair-start", {"assigned_agent": "dev"}),
+        (f"/api/tasks/{task_id}/submit-review", {"agent": "dev"}),
+    ):
+        resp = await client.post(url, json=payload)
+        assert resp.status_code == 200, f"{url}: {resp.text}"
+
+    monkeypatch.setattr(
+        hub_app.services,
+        "project_git_context",
+        AsyncMock(return_value={"repo": str(repo), "base_branch": "develop"}),
+    )
+    monkeypatch.setattr(
+        plugins.git_ops, "branch_diff", AsyncMock(return_value=diff), raising=False
+    )
+
+    async def _charge() -> tuple:
+        # Readiness first: reading it stores the score on the task row.
+        readiness = (await client.get(f"/api/tasks/{task_id}/readiness")).json()
+        task = (await client.get(f"/api/tasks/{task_id}")).json()
+        return (
+            task["readiness_score"],
+            task["dor_passed"],
+            task["status"],
+            readiness.get("score"),
+            readiness.get("dor_passed"),
+        )
+
+    before = await _charge()
+    named = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()[
+        "call_sites"
+    ]
+    assert named["only_tests_state"] == "no_report", named
+    assert [o["outcome"] for o in named["only_tests"]] == ["pending"]
+
+    path = "hub/registry.py:call_tool -> getattr(hub.tools, name)"
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "agent_count": 1,
+            "tokens_spent": 1000,
+            "model": "grok-4.6",
+            "raw_count": 1,
+            "findings_confirmed": [],
+            "findings_rejected": [
+                {"title": "hub_submit_probe", "category": "only_tests", "reason": path}
+            ],
+            "incomplete": False,
+            "unresolved": [],
+            "lost_dimensions": [],
+            "agent": "cursor-cloud-reviewer",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    cleared = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()[
+        "call_sites"
+    ]
+    assert cleared["only_tests"] == [
+        {"symbol": "hub_submit_probe", "outcome": "cleared", "call_path": path}
+    ], "the clearing is accepted with its named path"
+    assert await _charge() == before, "the clearing must charge nothing"
+
+    verdict = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "reviewer"},
+    )
+    assert verdict.status_code == 200, verdict.text

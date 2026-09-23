@@ -22,6 +22,7 @@ half-truth #549 and #725 were written to remove.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -35,6 +36,7 @@ from hub.models import (
     BaseMergeState,
     CallSiteEntry,
     CallSiteSection,
+    OnlyTestsOutcomeView,
     CIRunReportState,
     DiffBaseState,
     EvidenceCoverage,
@@ -232,6 +234,66 @@ async def base_merge_section(db, task_view) -> BaseMergeState:
         ),
         files=files,
     )
+
+
+async def _named_only_tests(
+    db, task_id: int, generation: int, section: CallSiteSection, report_row
+) -> list[str] | None:
+    """The only_tests set the judging party was actually shown (#1254).
+
+    A hub-dispatched order remembers what it named, and that set is scored —
+    a second walk here could see another tree or a stale base and judge the
+    reviewer on questions never asked. With a current report, the order is
+    THE ONE that produced it (``dispatch_for_report``, as second_door_* does):
+    on a ladder or a second door the latest order of the generation may be
+    another one. With no report yet, the latest order is the question still
+    open. With no order (a reviewer who came through the brief itself) the
+    brief's own section is what was shown.
+    """
+    from hub.services.review_dispatch import dispatch_for_report
+
+    row: dict | None
+    if report_row is not None:
+        row = await dispatch_for_report(db, task_id, generation, dict(report_row))
+    else:
+        latest = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+        row = dict(latest) if latest is not None else None
+    if row is not None:
+        raw = row.get("only_tests")
+        try:
+            return None if raw is None else [str(n) for n in json.loads(raw)]
+        except (TypeError, ValueError):
+            log.warning("only_tests of task #%s is not a JSON list", task_id)
+            return None
+    if section.status != call_sites.ANALYSED:
+        return None
+    return [e.symbol for e in section.entries if e.state == call_sites.ONLY_TESTS]
+
+
+async def _read_only_tests_back(
+    db,
+    task_id: int,
+    generation: int,
+    section: CallSiteSection,
+    machine_review,
+    mr_row,
+) -> None:
+    """Per only_tests symbol, what the CURRENT report answered (#1254).
+
+    A report of an older generation answers nothing about this code, so it
+    reads as "no report yet", not as a reviewer who stayed silent.
+    """
+    current = machine_review if machine_review and machine_review.is_current else None
+    named = await _named_only_tests(
+        db, task_id, generation, section, mr_row if current is not None else None
+    )
+    readout = call_sites.only_tests_readout(named, current)
+    section.only_tests_state = readout.state
+    section.only_tests_summary = readout.summary()
+    section.only_tests = [
+        OnlyTestsOutcomeView(symbol=o.symbol, outcome=o.outcome, call_path=o.call_path)
+        for o in readout.outcomes
+    ]
 
 
 async def build_review_brief(
@@ -480,6 +542,14 @@ async def build_review_brief(
     # #1266 (round 2, c0babbdf6d557c91): the top-level field is the SAME
     # object review_report just built — not a second construction of it.
     machine_review = brief_review_report.machine_review
+    await _read_only_tests_back(
+        db,
+        task_id,
+        task_view.submission_generation or 0,
+        call_sites_section,
+        machine_review,
+        mr_row,
+    )
 
     # #890: scope accepted at submission, newest first. Read from the feed
     # rather than a column: the growth IS an event, and an event that only
