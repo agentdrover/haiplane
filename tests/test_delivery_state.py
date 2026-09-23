@@ -1309,3 +1309,46 @@ async def test_records_without_the_fact_are_not_called_squashed(
     # И обычная доставка без сжатия по-прежнему «да».
     _merge_no_ff(work, "task-1240/old-record")
     assert await merged_into_base_detail(db, stored) == (True, "")
+
+
+async def test_the_squash_fact_is_read_when_git_no_longer_sees_the_submission(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    ancestry_forge: dict[str, Any],
+    monkeypatch,
+):
+    """Находка 599cb7e8f2b1b9e4: факт о сжатии терялся на «git не смог».
+
+    После сжатия и force-push сдаточный коммит держится в клоне только
+    рефлогом. Свежий клон, prune или gc — и git его больше не видит:
+    ``is_ancestor`` отвечает ``None``. Первая редакция на этом ответе
+    возвращала «проверить не удалось», не спросив записанный факт, хотя
+    равенство sha решается без git вовсе. Здесь коммит вычищается настоящим
+    ``gc --prune=now``, а не подменой ответа.
+    """
+    from hub.services.delivery_state import (
+        BASE_SQUASHED_BY_GATE_NOTE,
+        merged_into_base_detail,
+    )
+
+    work = Path(ancestry_forge["repo"])
+    branch = "task-1240/pruned"
+    submitted = _two_commit_branch(work, branch, "pruned")
+    _real_git_for(monkeypatch, ancestry_forge, "gitverse")
+    task_id = await _submitted_task(client, db, branch, submitted)
+    await _gate_delivers(db, task_id, branch, ancestry_forge, monkeypatch)
+    _merge_no_ff(work, branch)
+
+    _hermetic_git(work, "reflog", "expire", "--expire=now", "--all")
+    _hermetic_git(work, "gc", "-q", "--prune=now")
+    real = GitOpsIntegration()
+    assert await real.is_ancestor(str(work), submitted, "origin/develop") is None, (
+        "вход находки: git сдаточный коммит больше не видит"
+    )
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["gate_squashed_sha"] == submitted
+    assert await merged_into_base_detail(db, task) == (
+        None,
+        BASE_SQUASHED_BY_GATE_NOTE,
+    )
