@@ -1989,7 +1989,32 @@ STACK_DELIVERY_STATUSES = [
     # from the statuses I had in mind rather than from the enum. A task
     # waiting to report owns a pushed branch like any other.
     "pending_report",
+    # #1275, found by the #1271 partition test, which walks TaskStatus whole
+    # instead of the statuses in mind. Each is reachable from running with the
+    # branch already pushed, and each goes back to running by an ordinary
+    # transition, so the base will deliver itself and a hold is the answer:
+    #   needs_info — running → needs_info (hub_ask_question); the answer sends
+    #                it to open.
+    #   open       — running → open (chat_pair_reaper), needs_info → open.
+    #   claimed    — open → claimed on the way back to running.
+    # An open or claimed task that never started has no branch, and the walk
+    # already skips rows without one (list_unmerged_branch_tasks).
+    "needs_info",
+    "open",
+    "claimed",
 ]
+
+# #1275: statuses whose branch may be unmerged and which will NEVER deliver
+# themselves. `failed` is final (FINAL_STATUSES; LIFECYCLE_TRANSITIONS has no
+# way out of it) and reached from running when a headless run fails — with its
+# branch possibly pushed. Waiting for it would be a promise the hub cannot
+# keep, so it is not in the list above: the delivery walk reads it as a base
+# that cannot deliver itself, and a definite stack on it goes to a human, like
+# the stranded `completed` of #1204. Kept apart from that one on purpose: a
+# failed task has no delivery registry row, and its branch is often never
+# published at all (the run failed before a push) — that case must stay #1283's
+# merge-with-alert, not call a human on every delivery in the project.
+STACK_TERMINAL_STATUSES = ["failed"]
 
 
 # #1186: the three answers the delivery gate needs and the advisory hint
@@ -2139,6 +2164,70 @@ async def _walk_stacking_candidates(
             yield row, name, result
 
 
+def _why_base_never_delivers(assessment: "StackAssessment") -> str:
+    """Why waiting for this base is pointless, and what a human can do (#1204, #1275).
+
+    Two different facts reach ``stranded_base``, and the text must name the
+    true one. A task accepted without delivery has a PR the registry knows
+    about. A failed task (#1275) was not accepted by anyone and may have no PR
+    at all — «человек принял» and «её PR открыт» would both be false there.
+    """
+    if assessment.base_task_status in STACK_TERMINAL_STATUSES:
+        return (
+            f"и эта задача упала (статус {assessment.base_task_status} "
+            f"финальный). Ждать нечего: конвейер к упавшей задаче не вернётся, "
+            f"а мерж сейчас унёс бы её работу в базовую ветку под номером этой "
+            f"задачи. Решение за человеком: спасти работу "
+            f"#{assessment.base_task_id} отдельной доставкой или отвязать от "
+            f"неё эту ветку"
+        )
+    return (
+        f"и эту задачу человек принял, НЕ доставив — "
+        f"{_base_pr_phrase(assessment.base_delivery_state)}. Ждать нечего: "
+        f"конвейер к принятой задаче не вернётся, а мерж сейчас унёс "
+        f"бы её работу в базовую ветку под номером этой задачи. "
+        f"Решение за человеком: доставить "
+        f"#{assessment.base_task_id} или отвязать от неё эту ветку"
+    )
+
+
+def _unprobed_undeliverable(assessment: "StackAssessment") -> str:
+    """A base that never delivers itself, whose branch origin no longer has.
+
+    #1204 wrote this for a task accepted without delivery; review of #1275
+    (9bc10bd45785a1af) brought a failed one here too, and neither was accepted
+    by anyone nor has a PR the registry knows — so the text names its status.
+    """
+    base_id = assessment.unprobed_stranded_task_id
+    unknown_part = (
+        f"её ветку '{assessment.base_task_branch}' origin на прямой вопрос "
+        f"назвал несуществующей. Поэтому хаб НЕ знает, не стоит ли эта ветка "
+        f"на ней, и «не смог проверить» тут не то же самое, что «стопки нет»."
+    )
+    if assessment.base_task_status in STACK_TERMINAL_STATUSES:
+        return (
+            f"задача #{base_id} упала (статус {assessment.base_task_status} "
+            f"финальный) после того, как сдавала работу, а {unknown_part} "
+            f"Ждать бесполезно: к упавшей задаче конвейер не вернётся, её "
+            f"ветку никто не вернёт. Решение за человеком: подтвердить, что "
+            f"эта ветка от неё не отведена, либо спасти работу #{base_id} "
+            f"отдельной доставкой"
+        )
+    return (
+        f"задачу #{base_id} человек принял, НЕ доставив "
+        f"({_base_pr_phrase(assessment.base_delivery_state)}), а её ветку "
+        f"'{assessment.base_task_branch}' не разрешается, а origin на "
+        f"прямой вопрос ответил, что такой ветки у него нет — обычно так "
+        f"выглядит удаление ветки после ручного мержа. Поэтому хаб НЕ "
+        f"знает, не стоит ли эта ветка на ней, и «не смог проверить» тут "
+        f"не то же самое, что «стопки нет». Ждать бесполезно: принятая "
+        f"задача терминальна, её ветку никто не вернёт. Решение за "
+        f"человеком: доставить или закрыть PR задачи "
+        f"#{base_id}, либо подтвердить, что "
+        f"эта ветка от неё не отведена"
+    )
+
+
 def _base_pr_phrase(delivery_state: str) -> str:
     """What the stranded base's PR is, as the registry recorded it (#1204).
 
@@ -2256,6 +2345,49 @@ def _stranded_with_a_dead_ref(
         base_can_deliver_itself=False,
         unprobed_stranded_task_id=int(other["id"]),
         base_delivery_state=other.get("delivery_state") or "",
+    )
+
+
+def _terminal_with_a_dead_ref(
+    other: dict[str, Any],
+    other_branch: str,
+    result: Any,
+    terminal: set[int],
+) -> "StackAssessment | None":
+    """A failed base that DID publish its branch, and origin no longer has it.
+
+    Review of #1275, 9bc10bd45785a1af (high). Left to the generic path this row
+    became a retryable unknown — a silent hold on every delivery in the
+    project that nothing will ever lift, because a failed task is final and
+    nobody pushes its branch back. The #1204 brick through the #1275 door. So
+    it calls a human, like a stranded base with a dead ref.
+
+    Only once the task has submitted: a failed task that never did is #1283's
+    "nothing to compare yet" and merges with an alert (see
+    ``_a_branch_origin_never_had``). The same equality guard as the stranded
+    twin: our own branch among the unresolved names is a fact about this
+    machine, not about that task.
+    """
+    if int(other["id"]) not in terminal:
+        return None
+    if result.outcome is not StackProbeOutcome.unavailable:
+        return None
+    if result.reason != "ref_unresolved":
+        return None
+    unresolved = {n.strip() for n in (result.details or "").split(",") if n.strip()}
+    if unresolved != {other_branch}:
+        return None
+    if int(other.get("submission_generation") or 0) == 0:
+        return None
+    return StackAssessment(
+        outcome=STACK_UNKNOWN,
+        reason=f"terminal_ref_unresolved: {other_branch}",
+        retryable=False,
+        base_task_id=int(other["id"]),
+        base_task_branch=other_branch,
+        base_task_status=other.get("status") or "",
+        base_can_deliver_itself=False,
+        unprobed_stranded_task_id=int(other["id"]),
     )
 
 
@@ -2413,9 +2545,12 @@ class _UnansweredRows:
         other_branch: str,
         result: Any,
         stranded: set[int],
+        terminal: set[int],
     ) -> None:
         """Разложить «не чисто и не стопка» по своим полкам, в порядке разбора."""
-        dead = _stranded_with_a_dead_ref(other, other_branch, result, stranded)
+        dead = _stranded_with_a_dead_ref(
+            other, other_branch, result, stranded
+        ) or _terminal_with_a_dead_ref(other, other_branch, result, terminal)
         if dead is not None:
             self.stranded_unprobed, self.closed_gone = _file_dead_ref(
                 dead, self.stranded_unprobed, self.closed_gone
@@ -2508,6 +2643,7 @@ async def assess_branch_stacking(
     own_project = await _project_id_for(db, task_id)
     rows: list[Any] = []
     stranded: set[int] = set()
+    terminal: set[int] = set()
     if statuses is not None:
         # #1204: the delivery question only. The advisory callers keep asking
         # "is someone working on top of me", and a task nobody is working on
@@ -2526,6 +2662,13 @@ async def assess_branch_stacking(
         ):
             rows.append(row)
             stranded.add(int(dict(row)["id"]))
+        # #1275: the same "never delivers itself", and first in the walk for
+        # the same reason — but its own set, see STACK_TERMINAL_STATUSES.
+        for row in await repo.list_unmerged_branch_tasks(
+            db, exclude_task_id=task_id, statuses=STACK_TERMINAL_STATUSES
+        ):
+            rows.append(row)
+            terminal.add(int(dict(row)["id"]))
     rows.extend(
         await repo.list_unmerged_branch_tasks(
             db, exclude_task_id=task_id, statuses=statuses or STACK_ADVISORY_STATUSES
@@ -2594,7 +2737,7 @@ async def assess_branch_stacking(
                 base_task_branch=other_branch,
                 base_task_status=other_status,
                 relation=relation,
-                base_can_deliver_itself=other_id not in stranded,
+                base_can_deliver_itself=other_id not in stranded | terminal,
                 base_delivery_state=other.get("delivery_state") or "",
                 message=_stacking_message(
                     relation, branch, other_branch, other_id, other_status, base
@@ -2605,7 +2748,7 @@ async def assess_branch_stacking(
                 continue
             return found
         if result.outcome is not StackProbeOutcome.clear:
-            unanswered.file(other, other_branch, result, stranded)
+            unanswered.file(other, other_branch, result, stranded, terminal)
     answer = unanswered.best(benign)
     if answer is not None:
         return answer
@@ -3118,13 +3261,7 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
                     f"подтвердил, сторону хаб не называет)"
                 )
             return (
-                f"{STRANDED_BASE_PREFIX}: {how}, и эту задачу человек принял, "
-                f"НЕ доставив — "
-                f"{_base_pr_phrase(assessment.base_delivery_state)}. Ждать нечего: "
-                f"конвейер к принятой задаче не вернётся, а мерж сейчас унёс "
-                f"бы её работу в базовую ветку под номером этой задачи. "
-                f"Решение за человеком: доставить "
-                f"#{assessment.base_task_id} или отвязать от неё эту ветку"
+                f"{STRANDED_BASE_PREFIX}: {how}, {_why_base_never_delivers(assessment)}"
             )
         if assessment.relation != git_ops_mod.STACK_ANCESTRY_HEAD_IS_DESCENDANT:
             # #1186, found by the machine review of this very change. Waiting
@@ -3163,20 +3300,7 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
         # основания — ровно тот инцидент, ради которого условие написано.
         # Значит третий исход: не ждать и не мержить, а позвать человека,
         # назвав задачу и то, чего именно хаб не смог проверить.
-        return (
-            f"{UNPROBED_STRANDED_BASE_PREFIX}: задачу "
-            f"#{assessment.unprobed_stranded_task_id} человек принял, НЕ "
-            f"доставив ({_base_pr_phrase(assessment.base_delivery_state)}), а её ветку "
-            f"'{assessment.base_task_branch}' не разрешается, а origin на "
-            f"прямой вопрос ответил, что такой ветки у него нет — обычно так "
-            f"выглядит удаление ветки после ручного мержа. Поэтому хаб НЕ "
-            f"знает, не стоит ли эта ветка на ней, и «не смог проверить» тут "
-            f"не то же самое, что «стопки нет». Ждать бесполезно: принятая "
-            f"задача терминальна, её ветку никто не вернёт. Решение за "
-            f"человеком: доставить или закрыть PR задачи "
-            f"#{assessment.unprobed_stranded_task_id}, либо подтвердить, что "
-            f"эта ветка от неё не отведена"
-        )
+        return f"{UNPROBED_STRANDED_BASE_PREFIX}: {_unprobed_undeliverable(assessment)}"
     if assessment.outcome == STACK_UNKNOWN and assessment.retryable:
         return (
             f"{STACK_UNKNOWN_PREFIX}: проверить, не стоит ли ветка на чужой "
@@ -3190,6 +3314,25 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
             db, task["id"], "hub", "alert", _unchecked_stack_alert(assessment)
         )
     return ""
+
+
+def _unpublished_wait_phrase(assessment: "StackAssessment") -> str:
+    """Why nothing is waited for on an unpublished neighbour (#1283, #1275).
+
+    Review of #1275, 6fc293188dd34632: «ветка появится после первого пуша» is
+    true of a task still on the conveyor and false of a failed one — there is
+    no way out of failed, so no push is coming.
+    """
+    if assessment.base_task_status in STACK_TERMINAL_STATUSES:
+        return (
+            f"Ждать тут нечего: задача упала (статус "
+            f"{assessment.base_task_status} финальный), пуша уже не будет, и "
+            f"сравнивать эту ветку не с чем и не будет."
+        )
+    return (
+        "Ждать тут нечего: ветка появится, когда исполнитель сделает первый "
+        "пуш, и до тех пор сравнивать не с чем."
+    )
 
 
 def _unchecked_stack_alert(assessment: "StackAssessment") -> str:
@@ -3217,8 +3360,7 @@ def _unchecked_stack_alert(assessment: "StackAssessment") -> str:
             f"прямой вопрос ответил, что такой ветки у него нет, а сдач у "
             f"той задачи не было ни одной. "
             f"Значит коммитов той задачи нет нигде и унести их этим мержем "
-            f"нельзя. Ждать тут нечего: ветка появится, когда исполнитель "
-            f"сделает первый пуш, и до тех пор сравнивать не с чем. Если "
+            f"нельзя. {_unpublished_wait_phrase(assessment)} Если "
             f"ветка всё же была опубликована и удалена ДО первой сдачи, её "
             f"коммиты уедут в базовую ветку под номером этой задачи — их "
             f"видно в диффе этой задачи (#1283)."

@@ -47,6 +47,7 @@ from hub.models import (
 from hub.services import call_sites, review_evidence
 from hub.services.ac_tests import current_ac_test_results
 from hub.services.ci_report import ci_report_state
+from hub.services.review_availability import generation_review
 from hub.services.statement_freshness import statement_freshness
 from hub.services.test_existence import (
     collect_test_nodeids,
@@ -553,6 +554,7 @@ async def build_review_brief(
         self_review_warning=self_review_warning,
         stacking_warning=stacking_warning,
         review_in_flight=await review_evidence.inflight_view(db, task_row),
+        current_generation_review=await generation_review(db, task_row),
     )
 
 

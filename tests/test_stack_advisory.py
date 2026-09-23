@@ -1508,3 +1508,129 @@ async def test_a_blinking_git_still_outranks_an_unpublished_neighbour(
         "неопубликованный сосед рядом ничего про неё не говорит"
     )
     assert "rev_list_failed" in detail
+
+
+# ---- #1275: упавшее основание — не ожидание ----
+#
+# failed финален: FINAL_STATUSES, и выхода из него в LIFECYCLE_TRANSITIONS нет.
+# Ветка упавшего headless-прогона может быть запушена, и стопка на ней уносит
+# чужую работу так же, как на любой другой. Но ждать её доставки — обещание,
+# которое хаб не сдержит, поэтому стопка на упавшем основании идёт к человеку.
+
+
+async def test_a_failed_base_calls_a_human_instead_of_a_wait(
+    db: aiosqlite.Connection,
+) -> None:
+    from hub.services.orchestration import STRANDED_BASE_PREFIX
+
+    task_id, _branch = await _pair_running_task(db, "Стоит на упавшей")
+    base_branch = "task-1300/headless-run-failed"
+    base_id = await _neighbour(
+        db, base_branch, status="failed", submission_sha="a" * 40
+    )
+    plugins.git_ops = _ScriptedProbeGitOps(
+        {
+            base_branch: StackProbeResult(
+                outcome=StackProbeOutcome.stacked, reason="scripted"
+            )
+        },
+        ancestry={base_branch: "head_is_descendant"},
+    )
+
+    detail = await _gate(db, task_id)
+
+    assert detail.startswith(f"{STRANDED_BASE_PREFIX}:"), (
+        f"упавшее основание не доставит себя само — ждать нечего: {detail!r}"
+    )
+    assert f"#{base_id}" in detail and base_branch in detail
+    assert "Ждём доставки" not in detail, "обещание ожидания, которого не будет"
+    assert "упала" in detail, "названа настоящая причина"
+    assert "человек принял" not in detail, (
+        "это не принятая без доставки задача — у неё и PR может не быть"
+    )
+
+
+async def test_a_failed_neighbour_that_never_published_does_not_hold_the_project(
+    db: aiosqlite.Connection,
+) -> None:
+    # Headless-прогон, упавший до первого пуша: ветка записана, на origin её
+    # нет, сдач не было. Звать человека на каждую доставку проекта из-за такой
+    # строки — кирпич #1204; это случай #1283, мерж с алертом.
+    task_id, _branch = await _pair_running_task(db, "Сосед упал до пуша")
+    base_branch = "task-1301/failed-before-push"
+    base_id = await _neighbour(db, base_branch, status="failed")
+    plugins.git_ops = _ScriptedProbeGitOps({base_branch: _ref_unresolved(base_branch)})
+
+    detail = await _gate(db, task_id)
+
+    assert detail == "", f"неопубликованная ветка не держит доставку: {detail!r}"
+    body = await _feed(db, task_id)
+    assert f"#{base_id}" in body and "не опубликована" in body
+
+
+async def test_a_failed_base_whose_published_branch_vanished_calls_a_human(
+    db: aiosqlite.Connection,
+) -> None:
+    # Ревью #1275, 9bc10bd45785a1af. Упавшая задача сдавалась (ветка была на
+    # origin), а теперь ветки нет. Это не #1283 — ветка БЫЛА — и не моргнувший
+    # git: задача финальна, ветку никто не вернёт. Повторяемый unknown здесь —
+    # тихое вечное удержание всех доставок проекта, поэтому к человеку.
+    from hub.services.orchestration import UNPROBED_STRANDED_BASE_PREFIX
+
+    task_id, _branch = await _pair_running_task(db, "Сосед упал, ветку удалили")
+    base_branch = "task-1302/failed-then-deleted"
+    base_id = await _neighbour(
+        db, base_branch, status="failed", submission_sha="b" * 40
+    )
+    plugins.git_ops = _ScriptedProbeGitOps({base_branch: _ref_unresolved(base_branch)})
+
+    detail = await _gate(db, task_id)
+
+    assert detail.startswith(f"{UNPROBED_STRANDED_BASE_PREFIX}:"), (
+        f"ветка упавшей задачи не вернётся — ждать нечего: {detail!r}"
+    )
+    assert f"#{base_id}" in detail and base_branch in detail
+    assert "упала" in detail, "названа настоящая причина"
+    assert "человек принял" not in detail and "PR открыт" not in detail, (
+        "у упавшей задачи нет ни приёмки, ни записанного PR"
+    )
+
+
+async def test_a_failed_unpublished_neighbour_is_not_promised_a_push(
+    db: aiosqlite.Connection,
+) -> None:
+    # Ревью #1275, 6fc293188dd34632: из failed выхода нет, пуша не будет.
+    task_id, _branch = await _pair_running_task(db, "Сосед упал до пуша")
+    base_branch = "task-1303/failed-never-pushed"
+    await _neighbour(db, base_branch, status="failed")
+    plugins.git_ops = _ScriptedProbeGitOps({base_branch: _ref_unresolved(base_branch)})
+
+    assert await _gate(db, task_id) == ""
+    body = await _feed(db, task_id)
+    assert "первый пуш" not in body, "обещание пуша, которого не будет"
+    assert "упала" in body
+
+
+async def test_a_broken_clone_is_not_blamed_on_the_failed_task(
+    db: aiosqlite.Connection,
+) -> None:
+    # Двойник #1204: наша ветка среди неразрешённых имён — факт о машине, а не
+    # о той задаче. Такой ответ остаётся повторяемым unknown, человека не зовут.
+    from hub.services.orchestration import STACK_UNKNOWN_PREFIX
+
+    task_id, branch = await _pair_running_task(db, "Клон сломан")
+    base_branch = "task-1304/failed-submitted"
+    await _neighbour(db, base_branch, status="failed", submission_sha="c" * 40)
+    plugins.git_ops = _ScriptedProbeGitOps(
+        {
+            base_branch: StackProbeResult(
+                outcome=StackProbeOutcome.unavailable,
+                reason="ref_unresolved",
+                details=f"{branch},{base_branch}",
+            )
+        }
+    )
+
+    detail = await _gate(db, task_id)
+
+    assert detail.startswith(f"{STACK_UNKNOWN_PREFIX}:"), detail

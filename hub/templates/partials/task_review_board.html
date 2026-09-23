@@ -150,6 +150,10 @@
         {% if evidence.review_in_flight %}
         <div class="task-action-note--warning">{{ evidence.review_in_flight.headline }}</div>
         {% endif %}
+        {% if evidence.current_generation_review %}
+        {# #1262: есть ли ревью у ЭТОЙ сдачи — кем, по какому sha — или почему нет. #}
+        <div class="{{ '' if evidence.current_generation_review.has_review else 'task-action-note--warning' }}">{{ evidence.current_generation_review.headline }}</div>
+        {% endif %}
         <span class="badge badge--xs badge-{{ 'failed' if evidence.evidence_coverage.state == 'none' else ('pending' if evidence.evidence_coverage.state == 'partial' else 'test') }}">{{ evidence.evidence_coverage.state }}</span>
         {{ evidence.evidence_coverage.headline }}
 
