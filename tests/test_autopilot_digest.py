@@ -272,7 +272,7 @@ async def _steward_judged_task(
             verdict=verdict,
             confidence="high",
             escalate_reason="precondition_failed" if verdict == "escalate" else None,
-            grounds=grounds or [],
+            grounds=[{"source": "ci_pinned_sha"}] if grounds is None else grounds,
             model="gpt-5.3-codex",
         ),
         TokenIdentity("steward-bot", "steward", principal_id=42),
@@ -298,7 +298,11 @@ async def test_digest_covers_steward_actions(
         verdict="changes_requested",
         grounds=[{"source": "ci_pinned_sha", "detail": "CI на закреплённом sha упал"}],
     )
-    bare = await _steward_judged_task(db, feature, "судил молча", verdict="approve")
+    # #1327: без оснований хаб принимает только эскалацию — approve без
+    # фактов записался бы эскалацией и так.
+    bare = await _steward_judged_task(
+        db, feature, "судил молча", verdict="escalate", grounds=[]
+    )
 
     assert await generate_due_digests(db, now=_tomorrow()) == 1
     payload = json.loads((await repo.list_digests(db))[0]["payload"])
