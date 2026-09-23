@@ -54,8 +54,34 @@ async def check_review_queue(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> ReviewQueueCheck | None:
     """``None`` — лимита нет или очередь ниже него; иначе исход проверки."""
-    task_id = int(task["id"])
-    project = await repo.resolve_project_for_task(db, task_id)
+    project = await repo.resolve_project_for_task(db, int(task["id"]))
+    return await _check_project(db, project, task.get("class_of_service"))
+
+
+async def check_review_queue_for_new_task(
+    db: aiosqlite.Connection, parent_id: int | None, class_of_service: str
+) -> ReviewQueueCheck | None:
+    """То же для задачи, которой ещё нет: решение до вставки строки.
+
+    Проект новой задачи — проект её родителя (обход вверх до эпика), без
+    родителя — default: ровно то, что resolve_project_for_task скажет о ней
+    после вставки. Сбой проверки — ``None``: вход не держится.
+    """
+    try:
+        project = (
+            await repo.get_project_by_slug(db, "default")
+            if parent_id is None
+            else await repo.resolve_project_for_task(db, parent_id)
+        )
+        return await _check_project(db, project, class_of_service)
+    except Exception as exc:  # noqa: BLE001 - a gate that raises blocks everything
+        log.warning("review queue check for a new task failed: %s", exc)
+        return None
+
+
+async def _check_project(
+    db: aiosqlite.Connection, project: Any, class_of_service: Any
+) -> ReviewQueueCheck | None:
     if project is None:
         return None
     policy = project_policy.gate_policy_of(project)
@@ -65,7 +91,7 @@ async def check_review_queue(
     queue = await repo.list_review_task_ids_in_project(db, int(project["id"]))
     if len(queue) < limit:
         return None
-    if task.get("class_of_service") == "expedite":
+    if str(getattr(class_of_service, "value", class_of_service)) == "expedite":
         outcome = EXPEDITED
     elif (
         project_policy.review_limit_mode_of(policy) == project_policy.REVIEW_LIMIT_WARN
@@ -152,17 +178,13 @@ async def refuse_opening_over_review_limit(
 async def run_allowed_by_review_limit(
     db: aiosqlite.Connection, task_id: int, done: str
 ) -> bool:
-    """Может ли вход, запускающий работу вместе с другим действием, запустить её.
+    """Может ли approve(run=true) запустить уже одобренную задачу.
 
-    ``create_task(run_immediately)`` и ``approve_task(run=true)`` переводят
-    задачу в running так же, как start и pair_start, — и лимит на них тот же
-    (#1264, находка a4cf336071a7be3b): что вход только человеческий, ничего не
-    меняет, /start тоже только человеческий и держится. Отличие одно: у этих
-    входов есть вторая половина — создать или одобрить, — и она не теряется.
-    Задача остаётся open, карточка говорит, что запуск удержан, ответ API
-    отдаёт статус open. ``done`` — «создана» или «одобрена».
-
-    expedite и warn пропускают запуск с записью, как на остальных входах.
+    approve переводит задачу в running так же, как start и pair_start, — и
+    лимит на нём тот же (#1264, находка a4cf336071a7be3b): что вход только
+    человеческий, ничего не меняет, /start тоже только человеческий и
+    держится. Вторая половина входа — одобрение — не теряется: задача
+    остаётся open, карточка говорит, что запуск удержан. ``done`` — «одобрена».
     Сбой самой проверки запуск не держит.
     """
     row = await repo.get_task(db, task_id)
@@ -173,11 +195,26 @@ async def run_allowed_by_review_limit(
     except Exception as exc:  # noqa: BLE001 - a gate that raises blocks everything
         log.warning("review queue check for #%s failed: %s", task_id, exc)
         return True
+    await note_run_check(db, task_id, check, done)
+    return check is None or check.outcome != HELD
+
+
+async def note_run_check(
+    db: aiosqlite.Connection,
+    task_id: int,
+    check: ReviewQueueCheck | None,
+    done: str,
+) -> None:
+    """Запись в карточку об исходе лимита на запускающем входе create/approve.
+
+    expedite и warn пишут то же, что на pair_start и start; удержанный запуск
+    говорит, что вторая половина входа выполнена, а запуск — нет.
+    """
     if check is None:
-        return True
+        return
     if check.outcome != HELD:
         await _note_once(db, task_id, _card_text(check))
-        return True
+        return
     listed = ", ".join(f"#{q}" for q in check.queue)
     await _note_once(
         db,
@@ -189,4 +226,3 @@ async def run_allowed_by_review_limit(
             f"«{check.project_slug}»: {listed} (#1264)."
         ),
     )
-    return False

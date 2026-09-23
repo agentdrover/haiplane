@@ -777,3 +777,49 @@ async def test_run_entrances_honour_expedite_and_warn(client: AsyncClient, db):
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "running"
     assert "Режим warn" in await _feed(db, draft.id)
+
+
+async def test_a_held_create_run_is_never_running_not_even_between_commits(
+    client: AsyncClient, db, monkeypatch
+):
+    """Находка 7d3317471e3e0f61: решение о запуске — ДО вставки строки.
+
+    Вставка в running с последующим откатом в open оставляла окно, где задача
+    жила в running без job. Здесь перехвачены все пути записи статуса: строка
+    вставляется сразу open, и ни одна запись не ставит running.
+    """
+    from hub import repository as repo
+
+    await _default_queue_over_limit(db, limit=2, size=3)
+    statuses: list[str] = []
+
+    real_insert = repo.create_task_full
+    real_update = repo.update_task
+    real_transition = repo.transition_status_if
+
+    async def insert(conn, body, *, status, **kw):
+        statuses.append(f"insert:{status}")
+        return await real_insert(conn, body, status=status, **kw)
+
+    async def update(conn, task_id, **fields):
+        if "status" in fields:
+            statuses.append(f"update:{fields['status']}")
+        return await real_update(conn, task_id, **fields)
+
+    async def transition(conn, task_id, *, expected_from, new_status, **kw):
+        statuses.append(f"transition:{expected_from}->{new_status}")
+        return await real_transition(
+            conn, task_id, expected_from=expected_from, new_status=new_status, **kw
+        )
+
+    monkeypatch.setattr(repo, "create_task_full", insert)
+    monkeypatch.setattr(repo, "update_task", update)
+    monkeypatch.setattr(repo, "transition_status_if", transition)
+
+    resp = await client.post(
+        "/api/tasks", json={"title": "run now", "run_immediately": True}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "open"
+    assert statuses == ["insert:open"], statuses

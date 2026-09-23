@@ -50,6 +50,7 @@ from hub.services import finding_outcome
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.review_evidence import inflight_verdict_note
+from hub.services import review_limit
 from hub.services.review_limit import (
     run_allowed_by_review_limit,
     refuse_opening_over_review_limit,
@@ -842,6 +843,21 @@ async def create_task(
 
     initial_status, normalized = normalize_task_create(body)
     request_hash = hash_task_create_payload(normalized) if idem_key else None
+    # #1264: the review-queue limit decides the run BEFORE the row exists. A
+    # held run inserts the row as open straight away — never running without
+    # a job, not even between two commits. Only the status changes, not
+    # ``normalized``: the idempotency hash must not depend on the queue.
+    wants_run = normalized.run_immediately and normalized.source != TaskSource.agent
+    run_check = (
+        await review_limit.check_review_queue_for_new_task(
+            db, normalized.parent_id, normalized.class_of_service
+        )
+        if wants_run
+        else None
+    )
+    run_held = run_check is not None and run_check.outcome == review_limit.HELD
+    if run_held:
+        initial_status = "open"
 
     try:
         if idem_key:
@@ -915,8 +931,11 @@ async def create_task(
         return CreateTaskOutcome(task=task, is_new=False)
 
     result: dict[str, Any] = {}
-    if normalized.run_immediately and normalized.source != TaskSource.agent:
-        result = await _run_created_task(db, task_id)
+    if wants_run:
+        await review_limit.note_run_check(db, task_id, run_check, "создана")
+        if not run_held:
+            row = await repo.get_task(db, task_id)
+            result = await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
 
     await log_activity(
         db,
@@ -927,25 +946,6 @@ async def create_task(
 
     task = await _load_task_view(db, task_id)
     return CreateTaskOutcome(task=task, is_new=True)
-
-
-async def _run_created_task(db: aiosqlite.Connection, task_id: int) -> dict[str, Any]:
-    """The run half of create(run_immediately), under the review-queue limit.
-
-    #1264: it obeys the limit like every other way into running; the create
-    half is never lost to it. The row was inserted as ``running`` (the
-    normalisation decides before the id exists), so a held run returns it to
-    ``open`` — the status the API then reports, rather than a running task
-    that no dispatcher owns.
-    """
-    if not await run_allowed_by_review_limit(db, task_id, "создана"):
-        await repo.transition_status_if(
-            db, task_id, expected_from="running", new_status="open"
-        )
-        await db.commit()
-        return {}
-    row = await repo.get_task(db, task_id)
-    return await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
 
 
 async def create_subtasks_bulk(
