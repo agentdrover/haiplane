@@ -312,6 +312,7 @@ def evidence_coverage(
     freshness: dict[str, Any] | None,
     sha_check: str,
     live_check: dict[str, Any] | None = None,
+    base_merge: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One verdict over every evidence block in the brief (#725).
 
@@ -404,6 +405,28 @@ def evidence_coverage(
         applicable=(
             live_state != "not_applicable" and (delivered or live_state == "done")
         ),
+    )
+    # #1233: разойдётся ли ветка с базой при доставке. СЧЁТНЫЙ блок, а не
+    # сосед у счётчика — по правилу, которое эта же функция записала выше для
+    # #814: блок, показанный в брифе, но не посчитанный, оставляет заголовок
+    # врущим в успокаивающую сторону. Здесь это особенно дорого: «спросить не
+    # удалось» и «мерж будет чистым» ведут человека к разным решениям, а
+    # заголовок «все блоки дали сигнал» стирает между ними разницу — ровно
+    # перед тем вердиктом, который #1233 и бережёт.
+    #
+    # ``sha_check`` не в счёте потому, что отвечает, КУДА показывает ветка;
+    # этот блок отвечает, что доставка сделает с кодом, — вопрос ревью.
+    #
+    # ``None`` — блока в брифе нет вовсе, и требовать сигнала не с чего.
+    # Непустой блок со state=unknown — блок ЕСТЬ, но сигнала не дал, и это
+    # ровно тот случай, ради которого он здесь посчитан.
+    bm = base_merge if base_merge is not None else {"state": "not_applicable"}
+    bm_state = bm.get("state") or "unknown"
+    _note(
+        "base_merge",
+        bm_state in ("clean", "conflicting"),
+        bm.get("reason") or "расхождение с базой спросить не удалось",
+        applicable=bm_state != "not_applicable",
     )
     freshness_state = (freshness or {}).get("state") or "not_checked"
     _note(
