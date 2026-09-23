@@ -182,16 +182,25 @@ async def build_call_sites_section(
 
 
 async def _named_only_tests(
-    db, task_id: int, generation: int, section: CallSiteSection
+    db, task_id: int, generation: int, section: CallSiteSection, report_row
 ) -> list[str] | None:
     """The only_tests set the judging party was actually shown (#1254).
 
     A hub-dispatched order remembers what it named, and that set is scored —
     a second walk here could see another tree or a stale base and judge the
-    reviewer on questions never asked. With no order (a reviewer who came
-    through the brief itself) the brief's own section is what was shown.
+    reviewer on questions never asked. With a current report, the order is
+    THE ONE that produced it (``dispatch_for_report``, as second_door_* does):
+    on a ladder or a second door the latest order of the generation may be
+    another one. With no report yet, the latest order is the question still
+    open. With no order (a reviewer who came through the brief itself) the
+    brief's own section is what was shown.
     """
-    row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    from hub.services.review_dispatch import dispatch_for_report
+
+    if report_row is not None:
+        row = await dispatch_for_report(db, task_id, generation, dict(report_row))
+    else:
+        row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
     if row is not None:
         raw = dict(row).get("only_tests")
         try:
@@ -205,15 +214,22 @@ async def _named_only_tests(
 
 
 async def _read_only_tests_back(
-    db, task_id: int, generation: int, section: CallSiteSection, machine_review
+    db,
+    task_id: int,
+    generation: int,
+    section: CallSiteSection,
+    machine_review,
+    mr_row,
 ) -> None:
     """Per only_tests symbol, what the CURRENT report answered (#1254).
 
     A report of an older generation answers nothing about this code, so it
     reads as "no report yet", not as a reviewer who stayed silent.
     """
-    named = await _named_only_tests(db, task_id, generation, section)
     current = machine_review if machine_review and machine_review.is_current else None
+    named = await _named_only_tests(
+        db, task_id, generation, section, mr_row if current is not None else None
+    )
     readout = call_sites.only_tests_readout(named, current)
     section.only_tests_state = readout.state
     section.only_tests_summary = readout.summary()
@@ -467,6 +483,7 @@ async def build_review_brief(
         task_view.submission_generation or 0,
         call_sites_section,
         machine_review,
+        mr_row,
     )
 
     # #890: scope accepted at submission, newest first. Read from the feed

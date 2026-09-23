@@ -10498,3 +10498,130 @@ async def test_the_card_shows_the_only_tests_outcome(
     page = await client.get(f"/tasks/{task_id}")
     assert page.status_code == 200
     assert "снято с путём вызова 1" in page.text, "итог only_tests — на панели"
+
+
+async def test_the_readout_follows_the_order_of_the_shown_report(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находка 63a14461: набор берётся у заказа ПОКАЗАННОГО отчёта.
+
+    Лестница (#879): лёгкий заказ назвал одно, добор deep — другое, а
+    показан пока отчёт лёгкого. Последний заказ поколения здесь чужой.
+    """
+    task_id = await _only_tests_submission(
+        client, db, monkeypatch, "spike-ot-ladder", "lite_sym"
+    )
+    reviewer = 77
+    await db.execute(
+        "UPDATE review_dispatches SET reviewer_principal_id = ? WHERE task_id = ?",
+        (reviewer, task_id),
+    )
+    await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-deep",
+        run_id="r-deep",
+        model="grok-4.6",
+        profile=DEEP,
+        reviewer_principal_id=reviewer,
+        only_tests=["deep_sym"],
+    )
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        raw_count=1,
+        incomplete=True,
+        findings_rejected=json.dumps(
+            [
+                {
+                    "title": "lite_sym",
+                    "category": "only_tests",
+                    "reason": "hub/poller.py: зовётся по имени",
+                }
+            ]
+        ),
+        principal_id=reviewer,
+    )
+    await db.commit()
+
+    section = await _only_tests_section(client, task_id)
+    assert section["only_tests"] == [
+        {
+            "symbol": "lite_sym",
+            "outcome": "cleared",
+            "call_path": "hub/poller.py: зовётся по имени",
+        }
+    ], section
+
+
+async def test_a_report_of_the_previous_submission_is_no_report(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находка 6e76db6b: пересдача без нового отчёта — это no_report.
+
+    Отчёт прошлого поколения снял символ; о новом коде он не говорит ничего.
+    """
+    task_id = await _only_tests_submission(
+        client, db, monkeypatch, "spike-ot-resubmit", "mechanical_step"
+    )
+    await _report_on(
+        client,
+        task_id,
+        rejected=[
+            {
+                "title": "mechanical_step",
+                "category": "only_tests",
+                "reason": "hub/poller.py: _sweep зовёт его по имени",
+            }
+        ],
+    )
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 2, submission_sha = ? WHERE id = ?",
+        ("d" * 40, task_id),
+    )
+    await db.commit()
+
+    section = await _only_tests_section(client, task_id)
+    assert section["only_tests_state"] == "no_report", section
+    assert [o["outcome"] for o in section["only_tests"]] == ["pending"]
+
+
+@pytest.mark.parametrize("case", ["no_context", "empty_diff", "walk_raises"])
+async def test_a_walk_that_did_not_run_is_recorded_as_null(case, monkeypatch):
+    """#1254, находка 0b1110ec: «не смотрели» — это None, а не пустой список.
+
+    Пустой список в строке заказа читается как «разбор прошёл и никого не
+    назвал»; ранний выход обязан оставить NULL.
+    """
+    from hub.services import call_sites
+    from hub.services import review_dispatch as rd
+
+    def _boom(root, diff):
+        raise RuntimeError("walk failed")
+
+    monkeypatch.setattr(call_sites, "analyse", _boom)
+    ctx, diff = {
+        "no_context": (None, _HARMLESS_DIFF),
+        "empty_diff": (("/tmp/ws", "develop"), ""),
+        "walk_raises": (("/tmp/ws", "develop"), _HARMLESS_DIFF),
+    }[case]
+    assert await rd._only_tests_of(ctx, diff) is None
+
+
+async def test_a_failed_walk_leaves_null_in_the_order_row(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находка 0b1110ec: сквозь заказ — NULL в строке, а не '[]'."""
+    from hub.services import call_sites
+
+    def _boom(root, diff):
+        raise RuntimeError("walk failed")
+
+    monkeypatch.setattr(call_sites, "analyse", _boom)
+    _wire(
+        monkeypatch, _DispatchRecorder({"agent": {"id": "bc-null"}, "run": {"id": "r"}})
+    )
+    task_id = await _submitted(client, db, "spike-ot-null")
+    assert (await _any_dispatch_row(db, task_id))["only_tests"] is None
