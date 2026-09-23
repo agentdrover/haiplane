@@ -964,7 +964,11 @@ async def _review_dispatch_spend_metrics(
         "AS unknown_usage, "
         "COALESCE(SUM(CASE WHEN status IN ('done', 'failed') "
         "THEN 1 ELSE 0 END), 0) AS closed_dispatches "
-        "FROM review_dispatches WHERE created_at >= datetime('now', ?)",
+        # #1242: a sync-refusal stub now outlives its call as the ask-again
+        # trace. It never ran and nothing was billed — it is not a closed
+        # dispatch with unknown usage.
+        "FROM review_dispatches WHERE created_at >= datetime('now', ?) "
+        "AND agent_id != ''",
         (since,),
     )
     if not rows:
