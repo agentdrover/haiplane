@@ -10089,60 +10089,103 @@ async def test_a_purged_access_code_is_replaced_before_the_run_starts(
 # #1255 — несходимость находок по поколениям: прогон не покупается
 # ---------------------------------------------------------------------------
 
-#: Размеченные траектории открытых находок по поколениям, как они лежат в
-#: постановке #1255 (замер machine_reviews прода 11.09.2026). True —
-#: задача сошлась, False — нет.
-NON_CONVERGENCE_HISTORY: dict[int, tuple[tuple[int, ...], bool]] = {
-    1167: ((9, 5, 6, 3, 2, 1, 0), True),
-    1204: ((6, 2, 2, 2, 1, 3, 1, 0), True),
-    1208: ((3, 4, 2, 4, 2, 4), False),
-    1081: ((5, 6, 6), False),
-    1084: ((3, 6, 3), False),
-    1186: ((7, 2, 13), False),
+#: Размеченные траектории находок по поколениям. True — задача сошлась по
+#: критерию постановки #1255 (на последнем поколении ноль либо убыло и
+#: осталось не больше одной), False — нет.
+#:
+#: ДВА ИСТОЧНИКА, и у них разная мера — это названо, а не склеено:
+#:
+#: ``st-*`` — шесть траекторий из постановки #1255: замер machine_reviews
+#:     прода 11.09.2026, счёт confirmed + unresolved. Единственный источник
+#:     НЕСОШЕДШИХСЯ примеров.
+#: ``feed-*`` — лента событий прода (GET /api/events, kind
+#:     machine_review_completed, снято 23.09.2026; БАЗА НЕ ЧИТАЛАСЬ). Все
+#:     задачи с тремя и более поколениями в ленте — 20. Ограничения:
+#:     payload несёт только ЧИСЛО confirmed — ни unresolved, ни диспозиций,
+#:     ни uid, поэтому несколько отчётов поколения свёрнуты максимумом (не
+#:     объединением, как в коде: объединять нечего), а счёт ниже настоящего.
+#:     Лента начинается с события 2657, старшие задачи (#1081, #1084, #1186)
+#:     в неё не попали. #1208 по одной confirmed выглядит сошедшейся
+#:     [3,0,0,…] — её несходимость целиком в unresolved; ровно поэтому
+#:     правило в коде считает обе секции.
+NON_CONVERGENCE_HISTORY: dict[str, tuple[tuple[int, ...], bool]] = {
+    "st-1167": ((9, 5, 6, 3, 2, 1, 0), True),
+    "st-1204": ((6, 2, 2, 2, 1, 3, 1, 0), True),
+    "st-1208": ((3, 4, 2, 4, 2, 4), False),
+    "st-1081": ((5, 6, 6), False),
+    "st-1084": ((3, 6, 3), False),
+    "st-1186": ((7, 2, 13), False),
+    "feed-1155": ((0, 0, 0), True),
+    "feed-1158": ((0, 0, 0, 0), True),
+    "feed-1167": ((6, 5, 0, 3, 2, 0, 0), True),
+    "feed-1168": ((3, 2, 1, 0), True),
+    "feed-1169": ((5, 1, 1, 0), True),
+    "feed-1171": ((3, 0, 0, 0), True),
+    "feed-1172": ((0, 0, 0), True),
+    "feed-1176": ((2, 1, 0), True),
+    "feed-1195": ((1, 1, 0), True),
+    "feed-1204": ((0, 1, 0, 2, 1, 0), True),
+    "feed-1206": ((2, 1, 0, 0), True),
+    "feed-1208": ((3, 0, 0, 0, 0, 0, 0), True),
+    "feed-1233": ((0, 2, 0), True),
+    "feed-1235": ((2, 1, 0), True),
+    "feed-1249": ((1, 0, 0), True),
+    "feed-1261": ((0, 1, 1, 1, 0), True),
+    "feed-1265": ((0, 2, 2, 1, 0), True),
+    "feed-1271": ((2, 2, 0), True),
+    "feed-1273": ((2, 0, 0, 0), True),
+    "feed-1287": ((1, 0, 0, 0), True),
 }
 
 
-def _calibrate(window: int) -> tuple[list[int], list[int]]:
+def _calibrate(window: int) -> tuple[list[str], list[str]]:
     """(сошедшиеся, остановленные зря; несошедшиеся, пропущенные)."""
     from hub.services.review_dispatch import non_convergence_point
 
     false_stops = [
-        tid
-        for tid, (counts, converged) in NON_CONVERGENCE_HISTORY.items()
+        key
+        for key, (counts, converged) in NON_CONVERGENCE_HISTORY.items()
         if converged and non_convergence_point(counts, window) is not None
     ]
     misses = [
-        tid
-        for tid, (counts, converged) in NON_CONVERGENCE_HISTORY.items()
+        key
+        for key, (counts, converged) in NON_CONVERGENCE_HISTORY.items()
         if not converged and non_convergence_point(counts, window) is None
     ]
     return false_stops, misses
 
 
-def test_the_threshold_is_measured_on_the_history_not_chosen():
-    """AC-1 (#1255): число в коде — результат прогона по истории.
+def test_the_threshold_is_measured_on_the_history_not_chosen(monkeypatch):
+    """AC-1 (#1255): числа в коде — результат прогона по истории.
 
-    Окна 2..5 прогоняются по размеченным траекториям. Порог в коде обязан
-    быть ЕДИНСТВЕННЫМ окном, которое не останавливает ни одной сошедшейся и
-    ловит все несошедшиеся; рядом названо, скольких сошедшихся он
-    останавливает зря — ноль.
+    26 траекторий (6 из постановки, 20 из ленты событий) прогоняются по
+    окнам 2..5. Окно в коде обязано быть ЕДИНСТВЕННЫМ, которое не
+    останавливает ни одной сошедшейся и ловит все несошедшиеся; рядом
+    названо, скольких сошедшихся оно останавливает зря — ноль. Нижний край
+    проверяется так же: без него плато единиц #1261 останавливается зря.
     """
-    from hub.services.review_dispatch import (
-        NON_CONVERGENCE_WINDOW,
-        non_convergence_point,
-    )
+    from hub.services import review_dispatch as rd
 
     table = {window: _calibrate(window) for window in range(2, 6)}
-    assert table[2][0] == [1204], "окно 2 останавливает #1204 на плато"
-    assert table[4][1] == [1081, 1084, 1186], "окно 4 пропускает короткие"
-    clean = [w for w, (stops, misses) in table.items() if not stops and not misses]
-    assert clean == [NON_CONVERGENCE_WINDOW] == [3], (
-        f"замер даёт {clean}, в коде стоит {NON_CONVERGENCE_WINDOW}"
+    assert table[2][0] == ["st-1204", "feed-1265", "feed-1271"], (
+        "окно 2 останавливает плато"
     )
-    false_stops, _ = table[NON_CONVERGENCE_WINDOW]
-    assert false_stops == [], "сошедшихся остановлено зря: 0"
-    assert non_convergence_point(NON_CONVERGENCE_HISTORY[1208][0]) == 4, (
+    assert table[4][1] == ["st-1081", "st-1084", "st-1186"], (
+        "окно 4 пропускает короткие"
+    )
+    clean = [w for w, (stops, misses) in table.items() if not stops and not misses]
+    assert clean == [rd.NON_CONVERGENCE_WINDOW] == [3], (
+        f"замер даёт {clean}, в коде стоит {rd.NON_CONVERGENCE_WINDOW}"
+    )
+    false_stops, _ = table[rd.NON_CONVERGENCE_WINDOW]
+    assert false_stops == [], "сошедшихся остановлено зря: 0 из 22"
+    assert rd.non_convergence_point(NON_CONVERGENCE_HISTORY["st-1208"][0]) == 4, (
         "#1208 ловится на четвёртом поколении"
+    )
+    assert rd.NON_CONVERGENCE_FLOOR == 2
+    monkeypatch.setattr(rd, "NON_CONVERGENCE_FLOOR", 1)
+    assert _calibrate(rd.NON_CONVERGENCE_WINDOW)[0] == ["feed-1261"], (
+        "без нижнего края плато из единиц останавливается зря"
     )
 
 
@@ -10267,13 +10310,13 @@ async def test_a_long_but_converging_task_is_not_stopped(
     том же пути останавливается, иначе «не сработало» ничего не доказывает.
     """
     _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-c"}, "run": {"id": "r"}}))
-    for tid in (1167, 1204):
+    for tid in ("st-1167", "st-1204", "feed-1204", "feed-1261", "feed-1265"):
         task_id = await _submitted(client, db, f"spike-1255-conv-{tid}")
         assert await _stops_along(db, task_id, NON_CONVERGENCE_HISTORY[tid][0]) == [], (
-            f"#{tid} сошлась сама — останавливать её нельзя"
+            f"{tid} сошлась сама — останавливать её нельзя"
         )
     control = await _submitted(client, db, "spike-1255-control")
-    stops = await _stops_along(db, control, NON_CONVERGENCE_HISTORY[1208][0])
+    stops = await _stops_along(db, control, NON_CONVERGENCE_HISTORY["st-1208"][0])
     assert stops and stops[0] == 5, "#1208 стоит перед пятой сдачей: четвёртый отчёт"
 
 
