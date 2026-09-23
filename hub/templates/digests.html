@@ -20,8 +20,26 @@
         <dt>суждений стюарда</dt>
         <dd>{% if d.steward_state == 'measured' %}{{ d.data.steward_judgements | length }}
             {%- else %}<span class="text-muted">не измерялось — дайджест старше раздела</span>{% endif %}</dd>
+        <dt>одобрено стюардом без человека</dt>
+        <dd>{% if d.self_approvals_state == 'measured' %}{{ d.data.steward_self_approvals | length }}
+            {%- else %}<span class="text-muted">не измерялось — дайджест старше раздела</span>{% endif %}</dd>
         <dt>доставок</dt><dd>{{ d.data.deliveries | length }}</dd>
     </dl>
+
+    {% if d.data.steward_self_approvals %}
+    {# #1231: применённое одобрение — исход, которого человек не видел. Своим
+       разделом, а не пометкой в суждениях: суждение — совет, и в тени их
+       много; смешать два значило бы спрятать самоодобрение среди советов. #}
+    <h3>Одобрено стюардом без человека</h3>
+    <p class="text-muted">Вердикт вынесен и применён стюардом: все восемь признаков сошлись, человек задачу не видел. Такие решения попадают в выборку на проверку чаще остальных.</p>
+    <ul>
+        {% for s in d.data.steward_self_approvals %}
+        <li><a href="/tasks/{{ s.task_id }}">#{{ s.task_id }}</a>
+            <span class="badge badge-approved">одобрено без человека</span>
+            <span class="text-muted">сдача {{ s.generation }} · {{ s.at }}</span></li>
+        {% endfor %}
+    </ul>
+    {% endif %}
 
     {% if d.data.auto_approvals %}
     <h3>Автоодобрения</h3>
@@ -67,7 +85,11 @@
 
     {% if d.data.steward_judgements %}
     <h3>Суждения стюарда</h3>
+    {% if d.data.steward_self_approvals %}
+    <p class="text-muted">Суждения — рекомендации, раздел показывает, на чём стюард их построил. Те, что стюард применил сам, перечислены выше отдельно: по ним решение принял не человек.</p>
+    {% else %}
     <p class="text-muted">Это рекомендации. Решение остаётся человеческим — раздел показывает, на чём стюард их построил.</p>
+    {% endif %}
     <ul>
         {% for j in d.data.steward_judgements %}
         <li><a href="/tasks/{{ j.task_id }}">#{{ j.task_id }}</a>

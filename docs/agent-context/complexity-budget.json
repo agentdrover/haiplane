@@ -69,14 +69,6 @@
     },
     {
       "path": "hub/mcp_server.py",
-      "function": "hub_get_review_brief",
-      "rule": "C901",
-      "measured": 25,
-      "max": 29,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/mcp_server.py",
       "function": "hub_list_tasks",
       "rule": "C901",
       "measured": 16,
