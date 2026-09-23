@@ -239,6 +239,12 @@ class NoopGitOps:
         """No git here — "could not look", never "the submission lacks it" (#764)."""
         return None
 
+    async def files_naming_at_ref(
+        self, repo: str, ref: str, word: str, pathspec: str = "*.py"
+    ) -> set[str] | None:
+        """No git here — "could not look", never "the name is nowhere" (#1287)."""
+        return None
+
     async def commit_exists(self, repo: str, sha: str) -> bool | None:
         """No git here — "could not look", never "the commit is gone" (#824)."""
         return None
@@ -285,6 +291,31 @@ class NoopGitOps:
         release, None makes the caller say why it did nothing.
         """
         return None
+
+    async def base_merge_conflicts(
+        self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
+    ) -> tuple[dict[str, str] | None, str]:
+        """Нет git — «посмотреть не удалось», и никогда «конфликта нет» (#1233).
+
+        Пустой словарь здесь означал бы «база сливается чисто», то есть
+        разрешение доставлять. Это утверждение о репозитории, которого эта
+        интеграция не видит.
+        """
+        return None, "git integration is not configured"
+
+    async def push_resolved_base_merge(
+        self,
+        repo: str,
+        base: str,
+        branch: str,
+        task_id: int,
+        resolutions: dict[str, str],
+        validate: Any = None,
+        tip: str = "",
+        probed: dict[str, str] | None = None,
+    ) -> tuple[bool, str]:
+        """Нет git — автомерж не состоялся, с названной причиной (#1233)."""
+        return False, "git integration is not configured"
 
     async def check_pr_mergeable(
         self,

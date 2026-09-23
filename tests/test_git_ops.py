@@ -2936,15 +2936,6 @@ async def test_a_clone_without_origin_still_gets_the_collapse_named(
 # could not be answered» — это проза, и значения `ancestry`, `answered`,
 # `unrelated` по ней не сверить (#1271, находка ba85e024). Пересказ («the head
 # is the descendant») не считается по той же причине.
-#
-# Исходы, которые докстринг на develop не называет, — находка (#1271), код в
-# этой задаче не правится. Ключ — имя константы, значение — ссылка на драфт.
-BRANCH_ANCESTRY_UNNAMED_FINDINGS: dict[str, str] = {
-    "STACK_ANCESTRY_HEAD_IS_DESCENDANT": "драфт #1277: только пересказом",
-    "STACK_ANCESTRY_HEAD_IS_ANCESTOR": "драфт #1277: только пересказом",
-    "STACK_ANCESTRY_SAME_TIP": "драфт #1277: не назван вовсе (#1193)",
-    "STACK_ANCESTRY_UNRELATED": "драфт #1277: только словом фразы, не литералом",
-}
 
 
 def _ancestry_outcomes() -> dict[str, str]:
@@ -3033,30 +3024,9 @@ def test_branch_ancestry_docstring_names_every_outcome() -> None:
     """#1271 AC-3: исход STACK_ANCESTRY_*, не названный в докстринге, роняет тест."""
     outcomes = _ancestry_outcomes()
     assert outcomes, "в git_ops нет ни одной STACK_ANCESTRY_* — проверять нечего"
-    stale = sorted(set(BRANCH_ANCESTRY_UNNAMED_FINDINGS) - set(outcomes))
-    assert not stale, f"находки называют исходы, которых нет в git_ops: {stale}"
 
-    unnamed = [
-        name
-        for name in _unnamed_ancestry_outcomes()
-        if name not in BRANCH_ANCESTRY_UNNAMED_FINDINGS
-    ]
+    unnamed = _unnamed_ancestry_outcomes()
     assert not unnamed, (
         f"докстринг GitOpsIntegration.branch_ancestry не называет исходы "
         f"{unnamed} — вызывающий решает по этому тексту, как формулировать ответ"
     )
-
-
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#1271 находка на develop, драфт #1277: докстринг branch_ancestry "
-    "не называет head_is_descendant, head_is_ancestor, same_tip; после "
-    "сужения правила до токенов перечня (ba85e024) — и unrelated, которое "
-    "стоит в докстринге словом фразы, а не литералом",
-)
-def test_branch_ancestry_unnamed_findings_are_resolved() -> None:
-    still = sorted(
-        set(_unnamed_ancestry_outcomes()) & set(BRANCH_ANCESTRY_UNNAMED_FINDINGS)
-    )
-    assert not still, f"всё ещё не названы: {still}"

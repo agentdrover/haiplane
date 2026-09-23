@@ -1719,7 +1719,7 @@ async def web_digests(request: Request):
     """Autopilot daily digests with the audit sample (#739)."""
     import json as _json
 
-    from hub.services.digest import steward_section_state
+    from hub.services.digest import self_approvals_state, steward_section_state
 
     rows = await repo.list_digests(_db(request), limit=30)
     digests = []
@@ -1733,6 +1733,7 @@ async def web_digests(request: Request):
         # template: a missing key and an empty list are different facts, and
         # a counting filter cannot tell them apart (#1143 review).
         d["steward_state"] = steward_section_state(d["data"])
+        d["self_approvals_state"] = self_approvals_state(d["data"])
         digests.append(d)
     return TEMPLATES.TemplateResponse(request, "digests.html", {"digests": digests})
 

@@ -233,6 +233,9 @@ async def test_a_task_without_test_acs_is_not_reported_as_lost_evidence():
         # #814 joins the same list here, and for the same reason: nothing has
         # shipped yet, so a live check is not a check that failed to run.
         "live_check",
+        # #1233 joins it too: this call names no base-merge block at all, and a
+        # block the brief does not carry is not a block that stayed silent.
+        "base_merge",
     ]
 
 
@@ -779,6 +782,156 @@ async def test_foreign_locator_is_read_even_when_collection_succeeded(
     assert "could not read" not in resolution["reason"], resolution
 
 
+async def test_an_unasked_base_merge_does_not_pass_for_full_coverage():
+    """Блок мержа базы посчитан, а не показан рядом со счётчиком (#1233).
+
+    Находка 84b9b04c160f8350. Правило записала сама эта функция для #814: блок,
+    который в брифе есть, но в счёте не участвует, оставляет заголовок врущим в
+    успокаивающую сторону. Здесь цена особенно высока — «спросить не удалось» и
+    «мерж будет чистым» ведут человека к разным решениям ровно перед тем
+    вердиктом, который #1233 бережёт.
+    """
+    common = {
+        "diff_base": {"state": review_evidence.BASE_RESOLVED, "base": "main"},
+        "branch": "task-1233/x",
+        "call_sites_status": "analysed",
+        "has_test_acs": False,
+        "locator_resolution": [],
+        "ac_test_results": [],
+        "ci_state": "current",
+        "freshness": {"state": "no_overlap"},
+        "sha_check": "unknown",
+    }
+
+    blind = review_evidence.evidence_coverage(
+        **common, base_merge={"state": "unknown", "reason": "спросить не удалось"}
+    )
+    assert blind["state"] != review_evidence.COVERAGE_COMPLETE, (
+        "«все блоки дали сигнал» при неспрошенном расхождении с базой — это "
+        "тот самый успокаивающий заголовок, который #725/#814 запретили"
+    )
+    assert "base_merge" in [c["check"] for c in blind["checks_missing"]]
+
+    seen = review_evidence.evidence_coverage(
+        **common, base_merge={"state": "conflicting", "reason": "не будет чистым"}
+    )
+    assert seen["state"] == review_evidence.COVERAGE_COMPLETE, (
+        "названный конфликт — это СИГНАЛ, а не отсутствие его: человек узнал "
+        "о расхождении до вердикта, чего AC-1 и требует"
+    )
+    assert "base_merge" in seen["checks_ran"]
+
+    absent = review_evidence.evidence_coverage(**common)
+    assert "base_merge" in [c["check"] for c in absent["checks_not_applicable"]], (
+        "блока в брифе нет вовсе — требовать с него сигнала не с чего"
+    )
+
+
+async def test_the_brief_feeds_its_base_merge_block_into_the_coverage_verdict(
+    client: AsyncClient, monkeypatch
+):
+    """Блок, показанный в брифе, обязан быть в его же счёте (#1233).
+
+    Вторая половина находки 84b9b04c160f8350: мало научить счётчик принимать
+    блок — бриф обязан его туда ПЕРЕДАТЬ. Без передачи счёт видит «блока нет»,
+    объявляет полное покрытие, а рядом в том же брифе стоит названный конфликт
+    с базой. Один документ, два несогласных утверждения — ровно та подмена,
+    против которой #725 и заводил единый вердикт над блоками.
+    """
+    from unittest.mock import AsyncMock
+
+    from hub.services import review_brief
+
+    task_id = (await client.post("/api/tasks", json={"title": "Base merge"})).json()[
+        "id"
+    ]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: go"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    monkeypatch.setattr(
+        review_brief,
+        "base_merge_section",
+        AsyncMock(
+            return_value=review_brief.BaseMergeState(
+                state="conflicting",
+                reason="мерж в базу НЕ будет чистым",
+                files=["tests/test_review_dispatch.py"],
+            )
+        ),
+    )
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    coverage = brief["evidence_coverage"]
+
+    assert brief["base_merge"]["state"] == "conflicting", "блок в брифе есть"
+    assert "base_merge" in coverage["checks_ran"], (
+        "и он посчитан: блок, который виден в брифе, но не участвует в счёте, "
+        "оставляет заголовок покрытия несогласным с самим брифом"
+    )
+    assert "base_merge" not in [
+        c["check"] for c in coverage["checks_not_applicable"]
+    ], "«спрашивать нечего» — это не про блок, который прямо сейчас показан"
+
+
+async def test_the_brief_feeds_an_unasked_base_merge_into_the_coverage_too(
+    client: AsyncClient, monkeypatch
+):
+    """Через бриф проверен и второй исход блока — «спросить не удалось».
+
+    Находка 17a0fa0673a52b4f. Сосед выше идёт через бриф, но мокает ТОЛЬКО
+    ``conflicting``, а это сигнал: покрытие остаётся полным, и равенство
+    сходится. Поэтому мутация «передавать блок в счёт, лишь когда он дал
+    сигнал» оставляла его зелёным: при ``unknown`` счётчик читал бы ``None``
+    как «блока нет вовсе» и объявлял ПОЛНОЕ покрытие — ровно подмену «спросить
+    не удалось» на «чисто», ради снятия которой блок в счёт и заводили.
+    Рядом стоящий тест пинит счётчик напрямую и проводки не видит.
+    """
+    from unittest.mock import AsyncMock
+
+    from hub.services import review_brief
+
+    task_id = (await client.post("/api/tasks", json={"title": "Base merge"})).json()[
+        "id"
+    ]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: go"},
+    )
+    await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    monkeypatch.setattr(
+        review_brief,
+        "base_merge_section",
+        AsyncMock(
+            return_value=review_brief.BaseMergeState(
+                state="unknown",
+                reason="клон не ответил про расхождение с базой",
+                files=[],
+            )
+        ),
+    )
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    coverage = brief["evidence_coverage"]
+
+    assert brief["base_merge"]["state"] == "unknown", "блок в брифе есть"
+    assert "base_merge" in [c["check"] for c in coverage["checks_missing"]], (
+        "блок показан и сигнала не дал — это недостающий сигнал, а не "
+        f"отсутствующий блок: {coverage}"
+    )
+    assert "base_merge" not in [
+        c["check"] for c in coverage["checks_not_applicable"]
+    ], "«спрашивать нечего» — это не про блок, который прямо сейчас показан"
+    assert coverage["state"] != "complete", (
+        "покрытие не может быть полным, пока показанный блок молчит"
+    )
+
+
 async def test_the_brief_names_the_second_provider_and_why(client: AsyncClient, db):
     """AC-3 (#1266): бриф называет канал отчёта и причину, когда это не облако.
 
@@ -995,3 +1148,107 @@ async def test_the_brief_pairs_the_displayed_report_with_its_own_dispatch(
         "иначе облачный отчёт подписан как локальный по чужому (более "
         "позднему по id) заказу"
     )
+
+
+# --- #1262: есть ли ревью у ТЕКУЩЕГО поколения — один правдивый ответ ---------
+
+
+_FULL_REPORT = {
+    "harness_skill": "lite-diff-review",
+    "agent_count": 1,
+    "model": "grok-4.6",
+    "raw_count": 1,
+    "findings_confirmed": [],
+    "findings_rejected": [],
+    "incomplete": False,
+    "unresolved": [],
+    "lost_dimensions": [],
+    "agent": "cursor-cloud-reviewer",
+}
+
+
+async def test_brief_says_whether_the_current_generation_has_a_review(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-3 (#1262): отказ провайдера — «ревью у поколения N нет» с причиной;
+    полный отчёт — ревьюер (принципал и модель), sha и полнота."""
+    from tests.test_review_dispatch import (
+        _LIMIT_REFUSAL,
+        _DispatchRecorder,
+        _no_local_path,
+        _submitted,
+        _wire,
+    )
+
+    _wire(monkeypatch, _DispatchRecorder(None, refusal=_LIMIT_REFUSAL))
+    _no_local_path(monkeypatch)
+    refused = await _submitted(
+        client, db, "spike-brief-refused", policy={"review": "dispatch"}
+    )
+    reviewed = await _submitted_task(client, db, "Reviewed in full")
+    resp = await client.post(f"/api/tasks/{reviewed}/machine-review", json=_FULL_REPORT)
+    assert resp.status_code in (200, 201), resp.text
+
+    refused_brief = (await client.get(f"/api/tasks/{refused}/review-brief")).json()
+    answer = refused_brief["current_generation_review"]
+    assert answer["has_review"] is False
+    assert answer["generation"] == refused_brief["submission_generation"] == 1
+    assert answer["reason"] == "provider_refused"
+    assert "usage_limit_exceeded" in answer["reason_detail"]
+    assert "ревью у поколения 1 НЕТ" in answer["headline"]
+
+    reviewed_brief = (await client.get(f"/api/tasks/{reviewed}/review-brief")).json()
+    answer = reviewed_brief["current_generation_review"]
+    assert answer["has_review"] is True
+    assert answer["reviewer_principal"] == "cursor-cloud-reviewer"
+    assert answer["reviewer_model"] == "grok-4.6"
+    assert answer["sha"] == _PINNED_SHA
+    assert answer["complete"] is True
+    assert answer["reason"] == ""
+
+
+async def test_an_old_generation_report_is_not_a_review_of_the_current_one(
+    client: AsyncClient, db
+):
+    """AC-4 (#1262): полный отчёт поколения N-1 не ревью поколения N."""
+    task_id = await _submitted_task(client, db, "Resubmitted after review")
+    resp = await client.post(f"/api/tasks/{task_id}/machine-review", json=_FULL_REPORT)
+    assert resp.status_code in (200, 201), resp.text
+    await repo.update_task(db, task_id, submission_generation=2)
+    await repo.record_submission(
+        db, task_id=task_id, generation=2, sha="b" * 40, base_branch="develop"
+    )
+    await db.commit()
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    answer = brief["current_generation_review"]
+    assert answer["generation"] == 2
+    assert answer["has_review"] is False, "отчёт прошлой сдачи — не ревью текущей"
+    assert answer["reason"] == "not_dispatched"
+    assert answer["previous_generation"] == 1
+    assert "отчёт поколения 1 — отчёт прошлой сдачи" in answer["headline"]
+    assert answer["sha"] == "b" * 40
+
+
+async def test_an_incomplete_or_evidence_free_report_is_no_review(
+    client: AsyncClient, db
+):
+    """Неполный отчёт и отчёт без улики исполнения — отсутствие ревью (#750, #841)."""
+    incomplete = await _submitted_task(client, db, "Incomplete report")
+    await client.post(
+        f"/api/tasks/{incomplete}/machine-review",
+        json={**_FULL_REPORT, "incomplete": True},
+    )
+    empty = await _submitted_task(client, db, "Evidence-free report")
+    await client.post(
+        f"/api/tasks/{empty}/machine-review", json={**_FULL_REPORT, "raw_count": 0}
+    )
+
+    for task_id, reason in (
+        (incomplete, "incomplete_report"),
+        (empty, "no_execution_evidence"),
+    ):
+        brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+        answer = brief["current_generation_review"]
+        assert answer["has_review"] is False
+        assert answer["reason"] == reason

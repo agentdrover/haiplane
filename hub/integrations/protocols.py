@@ -375,6 +375,20 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
     ) -> tuple[MergeabilityOutcome, str]: ...
+    async def base_merge_conflicts(
+        self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
+    ) -> tuple[dict[str, str] | None, str]: ...
+    async def push_resolved_base_merge(
+        self,
+        repo: str,
+        base: str,
+        branch: str,
+        task_id: int,
+        resolutions: dict[str, str],
+        validate: Any = None,
+        tip: str = "",
+        probed: dict[str, str] | None = None,
+    ) -> tuple[bool, str]: ...
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str
     ) -> str | None: ...
@@ -473,6 +487,9 @@ class GitOpsPlugin(Protocol):
     async def branch_diff(self, repo: str, base: str, branch: str) -> str | None: ...
     async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None: ...
     async def files_at_ref(self, repo: str, ref: str) -> set[str] | None: ...
+    async def files_naming_at_ref(
+        self, repo: str, ref: str, word: str, pathspec: str = "*.py"
+    ) -> set[str] | None: ...
     async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]: ...
     async def first_parent_log(
         self, repo: str, base: str, limit: int

@@ -9830,7 +9830,7 @@ def test_the_recommended_sudo_recipe_still_checks_the_scratch_group(
 async def test_the_queued_local_run_starts_with_a_live_access_code(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
 ):
-    """Код доступа обязан быть жив В МОМЕНТ СТАРТА прогона, а не сдачи.
+    """Код доступа второго в очереди чеканится К ЕГО СТАРТУ, а не при сдаче.
 
     Находка ревьюера Codex 11.09.2026 на ff5b518. Код чеканится в
     ``prepare_review_order`` — то есть внутри HTTP-запроса автора, — а слот
@@ -9840,13 +9840,28 @@ async def test_the_queued_local_run_starts_with_a_live_access_code(
     кодом: основной HTTP-канал отчёта ему не выкупить, и прогон сваливается
     в слабый путь через stdout либо теряет отчёт вовсе.
 
-    Проверяется ТЕМ ЖЕ предикатом, которым живость кода судит сам
-    ``redeem_code`` (не redeem'ом: он потратил бы код), и ровно в тот момент,
-    когда хаб порождает процесс. Первый прогон проверяется вместе со вторым —
-    иначе починка очереди могла бы сломать нормальный путь.
+    ПОЧЕМУ ПРОВЕРКА ЗДЕСЬ НЕ СМОТРИТ НА ЧАСЫ (#1325). Прежняя редакция ставила
+    ``CHAT_PAIR_CODE_SECONDS = 1``, держала слот 2.5 с и спрашивала у базы
+    ``expires_at > datetime('now')``. Требование она держала, но измеряла его
+    гонкой: между чеканкой и чтением на нагруженном бегунке проходило больше
+    секунды, и тест краснел при ВЕРНОМ продукте — прогон CI 35785728735 на
+    develop, где менялся один документ. Воспроизведено на месте: вставь в эту
+    же проверку ``await asyncio.sleep(1.2)`` перед запросом — и на неизменном
+    коде получишь ``[False, False]``.
+
+    Измеряется теперь ПОРЯДОК СОБЫТИЙ, а не разница времён. Снимок всех кодов
+    берётся в момент, когда хаб порождает процесс; код, с которым стартовал
+    второй прогон, обязан в снимке ПЕРВОГО старта отсутствовать — то есть быть
+    отчеканен позже, уже на своём слоте. Мутация, ради которой тест и стоит:
+    ``_prompt_at_slot`` возвращает исходный промт (код выдан при постановке в
+    очередь) — тогда второй стартует с кодом, который существовал уже на
+    старте первого, и снимок это показывает. Живость кода проверяется тем же
+    предикатом, что и у ``redeem_code`` (не redeem'ом: он потратил бы код), но
+    без ``expires_at``: срок жизни здесь продовый, а гонку создавала именно
+    его подмена. Первый прогон проверяется вместе со вторым — иначе починка
+    очереди могла бы сломать нормальный путь.
     """
     import re
-    import time as _time
 
     from hub.services import chat_pair
     from hub.services.review_dispatch import wait_for_local_runs
@@ -9855,32 +9870,47 @@ async def test_the_queued_local_run_starts_with_a_live_access_code(
     _wire(monkeypatch, recorder)
     await _local_principal(db, monkeypatch)
     _own_host_budget(monkeypatch)
-    # Прогон держит слот ДОЛЬШЕ, чем живёт код: на проде это 300 с против
-    # ревью в десятки минут, здесь — те же отношения в секундах.
-    monkeypatch.setattr(config, "CHAT_PAIR_CODE_SECONDS", 1)
-    _stub_reviewer(
-        monkeypatch,
-        tmp_path,
-        "import sys, time; sys.stdin.read(); time.sleep(2.5)",
-    )
+    _stub_reviewer(monkeypatch, tmp_path, "import sys; sys.stdin.read()")
 
-    alive: list[bool] = []
+    # Первый прогон держит слот, пока в очередь не встал второй. Держит СОБЫТИЕ,
+    # а не сон: сон здесь и был гонкой — он задавал срок, который нагруженный
+    # бегунок не обязан соблюдать, а событие задаёт ПОРЯДОК, и его бегунок
+    # нарушить не может.
+    both_queued = asyncio.Event()
+    starts: list[dict[str, object]] = []
+    queue_snapshot: set[str] = set()
+    in_flight = 0
     spawn = local_reviewer._spawn
 
     async def _watching(prompt: str, workdir: str, limit: int, started: float):
+        nonlocal in_flight
         found = re.search(r'"code":"([^"]+)"', prompt)
         assert found, "в промте нет кода доступа — тогда судить не о чем"
-        rows = await db.execute_fetchall(
-            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? "
-            "AND redeemed_at IS NULL AND expires_at > datetime('now')",
-            (chat_pair.hash_pair_code(chat_pair.normalize_pair_code(found.group(1))),),
+        if not starts:
+            # Снимок берётся здесь, а не раньше: к этому моменту ОБА заказа
+            # уже в очереди, то есть код, выданный «при постановке», в базе
+            # непременно есть. Снимок до второй сдачи не доказывал бы ничего.
+            await both_queued.wait()
+            rows = await db.execute_fetchall("SELECT code_hash FROM chat_pair_codes")
+            queue_snapshot.update(dict(r)["code_hash"] for r in rows)
+        code_hash = chat_pair.hash_pair_code(
+            chat_pair.normalize_pair_code(found.group(1))
         )
-        alive.append(bool(rows))
-        return await spawn(prompt, workdir, limit, started)
+        mine = await db.execute_fetchall(
+            "SELECT 1 FROM chat_pair_codes WHERE code_hash = ? AND redeemed_at IS NULL",
+            (code_hash,),
+        )
+        in_flight += 1
+        starts.append(
+            {"hash": code_hash, "unredeemed": bool(mine), "at_once": in_flight}
+        )
+        try:
+            return await spawn(prompt, workdir, limit, started)
+        finally:
+            in_flight -= 1
 
     monkeypatch.setattr(local_reviewer, "_spawn", _watching)
 
-    began = _time.monotonic()
     for slug in ("queued-first", "queued-second"):
         await _submitted(
             client,
@@ -9890,17 +9920,31 @@ async def test_the_queued_local_run_starts_with_a_live_access_code(
             repo_name="mrpda/snip-portal",
             forge="gitverse",
         )
+    both_queued.set()
     await wait_for_local_runs()
 
-    assert len(alive) == 2, f"оба прогона обязаны были стартовать: {alive}"
-    assert _time.monotonic() - began > config.CHAT_PAIR_CODE_SECONDS, (
-        "очередь оказалась короче срока жизни кода — тогда тест ничего не "
-        "измерил; удлините полезную нагрузку заглушки"
+    assert len(starts) == 2, f"оба прогона обязаны были стартовать: {starts}"
+    first, second = starts
+    assert [s["at_once"] for s in starts] == [1, 1], (
+        "прогоны шли одновременно — очереди не было, и про «второй в очереди» "
+        f"тест ничего не проверил: {starts}"
     )
-    assert alive == [True, True], (
-        f"код доступа был мёртв на старте прогона: {alive}. Второй в очереди "
-        "не выкупит основной канал отчёта и свалится в слабый путь через "
-        "stdout — или потеряет отчёт вовсе"
+    assert first["hash"] != second["hash"], (
+        "оба прогона стартовали с ОДНИМ кодом: второй его уже не выкупит, "
+        "потому что первый его потратит"
+    )
+    for n, start in enumerate(starts, 1):
+        assert start["unredeemed"], (
+            f"прогон #{n} стартовал с кодом, которого нет в chat_pair_codes "
+            "или который уже потрачен: основной канал отчёта ему не выкупить"
+        )
+    assert queue_snapshot, "снимок очереди пуст — сверять не с чем"
+    assert second["hash"] not in queue_snapshot, (
+        "второй в очереди стартовал с кодом, который существовал уже тогда, "
+        "когда очередь только собралась, — то есть код выдан ПРИ ПОСТАНОВКЕ В "
+        "ОЧЕРЕДЬ, а не к старту. Ждать слота можно дольше, чем живёт код, и "
+        "такой прогон свалится в слабый путь через stdout или потеряет отчёт "
+        "вовсе"
     )
 
 
@@ -10082,6 +10126,372 @@ async def test_a_purged_access_code_is_replaced_before_the_run_starts(
         f"прогон стартовал с кодом, которого в базе уже нет: {alive}. "
         "Продления мало: сборщик протухшего УДАЛЯЕТ строку, и продлять "
         "становится нечего — код к старту обязан быть выписан заново"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1255 — несходимость находок по поколениям: прогон не покупается
+# ---------------------------------------------------------------------------
+
+#: Размеченные траектории находок по поколениям. True — задача сошлась по
+#: критерию постановки #1255 (на последнем поколении ноль либо убыло и
+#: осталось не больше одной), False — нет.
+#:
+#: ДВА ИСТОЧНИКА, и у них разная мера — это названо, а не склеено:
+#:
+#: ``st-*`` — шесть траекторий из постановки #1255: замер machine_reviews
+#:     прода 11.09.2026, счёт confirmed + unresolved. Единственный источник
+#:     НЕСОШЕДШИХСЯ примеров.
+#: ``feed-*`` — лента событий прода (GET /api/events, kind
+#:     machine_review_completed, снято 23.09.2026; БАЗА НЕ ЧИТАЛАСЬ). Все
+#:     задачи с тремя и более поколениями в ленте — 20. Ограничения:
+#:     payload несёт только ЧИСЛО confirmed — ни unresolved, ни диспозиций,
+#:     ни uid, поэтому несколько отчётов поколения свёрнуты максимумом (не
+#:     объединением, как в коде: объединять нечего), а счёт ниже настоящего.
+#:     Лента начинается с события 2657, старшие задачи (#1081, #1084, #1186)
+#:     в неё не попали. #1208 по одной confirmed выглядит сошедшейся
+#:     [3,0,0,…] — её несходимость целиком в unresolved; ровно поэтому
+#:     правило в коде считает обе секции.
+NON_CONVERGENCE_HISTORY: dict[str, tuple[tuple[int, ...], bool]] = {
+    "st-1167": ((9, 5, 6, 3, 2, 1, 0), True),
+    "st-1204": ((6, 2, 2, 2, 1, 3, 1, 0), True),
+    "st-1208": ((3, 4, 2, 4, 2, 4), False),
+    "st-1081": ((5, 6, 6), False),
+    "st-1084": ((3, 6, 3), False),
+    "st-1186": ((7, 2, 13), False),
+    "feed-1155": ((0, 0, 0), True),
+    "feed-1158": ((0, 0, 0, 0), True),
+    "feed-1167": ((6, 5, 0, 3, 2, 0, 0), True),
+    "feed-1168": ((3, 2, 1, 0), True),
+    "feed-1169": ((5, 1, 1, 0), True),
+    "feed-1171": ((3, 0, 0, 0), True),
+    "feed-1172": ((0, 0, 0), True),
+    "feed-1176": ((2, 1, 0), True),
+    "feed-1195": ((1, 1, 0), True),
+    "feed-1204": ((0, 1, 0, 2, 1, 0), True),
+    "feed-1206": ((2, 1, 0, 0), True),
+    "feed-1208": ((3, 0, 0, 0, 0, 0, 0), True),
+    "feed-1233": ((0, 2, 0), True),
+    "feed-1235": ((2, 1, 0), True),
+    "feed-1249": ((1, 0, 0), True),
+    "feed-1261": ((0, 1, 1, 1, 0), True),
+    "feed-1265": ((0, 2, 2, 1, 0), True),
+    "feed-1271": ((2, 2, 0), True),
+    "feed-1273": ((2, 0, 0, 0), True),
+    "feed-1287": ((1, 0, 0, 0), True),
+}
+
+
+def _calibrate(window: int) -> tuple[list[str], list[str]]:
+    """(сошедшиеся, остановленные зря; несошедшиеся, пропущенные)."""
+    from hub.services.review_dispatch import non_convergence_point
+
+    false_stops = [
+        key
+        for key, (counts, converged) in NON_CONVERGENCE_HISTORY.items()
+        if converged and non_convergence_point(counts, window) is not None
+    ]
+    misses = [
+        key
+        for key, (counts, converged) in NON_CONVERGENCE_HISTORY.items()
+        if not converged and non_convergence_point(counts, window) is None
+    ]
+    return false_stops, misses
+
+
+def test_the_threshold_is_measured_on_the_history_not_chosen(monkeypatch):
+    """AC-1 (#1255): числа в коде — результат прогона по истории.
+
+    26 траекторий (6 из постановки, 20 из ленты событий) прогоняются по
+    окнам 2..5. Окно в коде обязано быть ЕДИНСТВЕННЫМ, которое не
+    останавливает ни одной сошедшейся и ловит все несошедшиеся; рядом
+    названо, скольких сошедшихся оно останавливает зря — ноль. Нижний край
+    проверяется так же: без него плато единиц #1261 останавливается зря.
+    """
+    from hub.services import review_dispatch as rd
+
+    table = {window: _calibrate(window) for window in range(2, 6)}
+    assert table[2][0] == ["st-1204", "feed-1265", "feed-1271"], (
+        "окно 2 останавливает плато"
+    )
+    assert table[4][1] == ["st-1081", "st-1084", "st-1186"], (
+        "окно 4 пропускает короткие"
+    )
+    clean = [w for w, (stops, misses) in table.items() if not stops and not misses]
+    assert clean == [rd.NON_CONVERGENCE_WINDOW] == [3], (
+        f"замер даёт {clean}, в коде стоит {rd.NON_CONVERGENCE_WINDOW}"
+    )
+    false_stops, _ = table[rd.NON_CONVERGENCE_WINDOW]
+    assert false_stops == [], "сошедшихся остановлено зря: 0 из 22"
+    assert rd.non_convergence_point(NON_CONVERGENCE_HISTORY["st-1208"][0]) == 4, (
+        "#1208 ловится на четвёртом поколении"
+    )
+    assert rd.NON_CONVERGENCE_FLOOR == 2
+    monkeypatch.setattr(rd, "NON_CONVERGENCE_FLOOR", 1)
+    assert _calibrate(rd.NON_CONVERGENCE_WINDOW)[0] == ["feed-1261"], (
+        "без нижнего края плато из единиц останавливается зря"
+    )
+
+
+def _layer(generation: int, size: int) -> list[dict]:
+    """``size`` РАЗНЫХ подтверждённых находок поколения: у каждой свой uid."""
+    return [
+        _confirmed(
+            f"дефект {generation}.{n}", f"cat-{generation}", 100 * generation + n
+        )
+        for n in range(size)
+    ]
+
+
+async def _next_submission(db: aiosqlite.Connection, task_id: int, generation: int):
+    """Сдача ``generation`` с НОВЫМ кодом, ещё без ревьюера."""
+    await db.execute(
+        "UPDATE tasks SET submission_generation=?, submission_sha=?, "
+        "review_job_id=NULL, status='review' WHERE id=?",
+        (generation, f"{generation:x}".rjust(40, "d"), task_id),
+    )
+    await db.commit()
+
+
+async def _non_convergence_notices(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if "несходимость находок" in dict(u)["content"]
+    ]
+
+
+async def _walk_counts(db, task_id: int, counts: list[int]) -> None:
+    """Положить отчёты по поколениям 1..N; каждый слой автор ЧИНИЛ."""
+    previous: tuple[int, int, list[dict]] | None = None
+    for generation, size in enumerate(counts, start=1):
+        layer = _layer(generation, size)
+        review_id = await _generation_with_findings(
+            db, task_id, generation, confirmed=layer
+        )
+        if previous is not None:
+            await _author_closed_them(
+                db,
+                task_id,
+                previous[0],
+                previous[1],
+                confirmed=previous[2],
+                unresolved=[],
+            )
+        previous = (review_id, generation, layer)
+
+
+async def test_a_flat_finding_count_stops_the_next_run_and_asks_the_human(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1255): три поколения по три находки при настоящих правках.
+
+    Проверяется НАБЛЮДАЕМОЕ отсутствие заказа у провайдера: подставка
+    провайдера не получила второго вызова. Вопрос задан один раз и несёт
+    саму последовательность; после ответа человека круги продолжаются.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1255"}, "run": {"id": "r-1255"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-1255-flat")
+    assert len(recorder.calls) == 1, "предпосылка: первая сдача заказала прогон"
+
+    await _walk_counts(db, task_id, [3, 3, 3])
+    await _next_submission(db, task_id, 4)
+    from hub.services.review_dispatch import maybe_dispatch_review
+
+    assert await maybe_dispatch_review(db, task_id) is False
+    assert len(recorder.calls) == 1, "прогон НЕ заказан у провайдера"
+    notices = await _non_convergence_notices(db, task_id)
+    assert len(notices) == 1
+    assert "постановка или код" in notices[0]
+    assert "сдача 1: 3, сдача 2: 3, сдача 3: 3" in notices[0]
+    events = [
+        json.loads(dict(r)["payload"])
+        for r in await repo.list_events(
+            db, since=0, kinds=["review_non_convergence"], limit=10
+        )
+    ]
+    assert [e["counts"] for e in events] == [[3, 3, 3]]
+
+    # Без ответа следующая сдача тоже стоит, но вопрос не повторяется.
+    await _next_submission(db, task_id, 5)
+    assert await maybe_dispatch_review(db, task_id) is False
+    assert len(recorder.calls) == 1
+    assert len(await _non_convergence_notices(db, task_id)) == 1, "вопрос один раз"
+
+    # Человек ответил вердиктом по остановленной сдаче — круги продолжаются.
+    await db.execute(
+        "UPDATE tasks SET review_verdict_generation=5 WHERE id=?", (task_id,)
+    )
+    await _next_submission(db, task_id, 6)
+    assert await maybe_dispatch_review(db, task_id) is True
+    assert len(recorder.calls) == 2, "после ответа прогон снова покупается"
+
+
+async def _stops_along(db, task_id: int, counts: tuple[int, ...]) -> list[int]:
+    """Поколения, перед которыми правило остановило бы прогон."""
+    from hub.services.review_dispatch import findings_stopped_converging
+
+    stopped: list[int] = []
+    for generation, size in enumerate(counts, start=1):
+        await _generation_with_findings(
+            db, task_id, generation, confirmed=_layer(generation, size)
+        )
+        await _next_submission(db, task_id, generation + 1)
+        task = dict(await repo.get_task(db, task_id))
+        if await findings_stopped_converging(db, task):
+            stopped.append(generation + 1)
+    return stopped
+
+
+async def test_a_long_but_converging_task_is_not_stopped(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1255): #1167 и #1204 — длинные, с колебаниями, но сошлись.
+
+    Настоящие последовательности прогоняются через базу поколение за
+    поколением, как их видел бы хаб на каждой сдаче. Контроль — #1208 на
+    том же пути останавливается, иначе «не сработало» ничего не доказывает.
+    """
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-c"}, "run": {"id": "r"}}))
+    for tid in ("st-1167", "st-1204", "feed-1204", "feed-1261", "feed-1265"):
+        task_id = await _submitted(client, db, f"spike-1255-conv-{tid}")
+        assert await _stops_along(db, task_id, NON_CONVERGENCE_HISTORY[tid][0]) == [], (
+            f"{tid} сошлась сама — останавливать её нельзя"
+        )
+    control = await _submitted(client, db, "spike-1255-control")
+    stops = await _stops_along(db, control, NON_CONVERGENCE_HISTORY["st-1208"][0])
+    assert stops and stops[0] == 5, "#1208 стоит перед пятой сдачей: четвёртый отчёт"
+
+
+async def test_dispositions_count_as_progress_and_an_incomplete_zero_does_not(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4 (#1255): открытые находки, а не сырые; неполный ноль — не чисто."""
+    from hub.services.review_dispatch import findings_stopped_converging
+
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-d"}, "run": {"id": "r"}}))
+
+    async def _stopped(task_id: int, generation: int) -> bool:
+        await _next_submission(db, task_id, generation)
+        return await findings_stopped_converging(
+            db, dict(await repo.get_task(db, task_id))
+        )
+
+    # Разбор: две из трёх находок третьего поколения автор отложил и
+    # признал не дефектом — открытых 3, 3, 1, это схождение.
+    for outcome, expected in (("deferred", False), ("fixed", True)):
+        task_id = await _submitted(client, db, f"spike-1255-disp-{outcome}")
+        await _walk_counts(db, task_id, [3, 3])
+        third = _layer(3, 3)
+        review_id = await _generation_with_findings(db, task_id, 3, confirmed=third)
+        await _author_closed_them(
+            db,
+            task_id,
+            review_id,
+            3,
+            confirmed=third[:2],
+            unresolved=[],
+            outcome_confirmed=outcome,
+        )
+        assert await _stopped(task_id, 4) is expected, (
+            f"исход {outcome}: разбор — прогресс, починка проверяется отчётом"
+        )
+
+    # Неполный отчёт с нулём находок: 3, 4, 3 и затем «не дочитал».
+    task_id = await _submitted(client, db, "spike-1255-incomplete")
+    for generation, size in enumerate((3, 4, 3), start=1):
+        await _generation_with_findings(
+            db, task_id, generation, confirmed=_layer(generation, size)
+        )
+    await db.execute("UPDATE tasks SET submission_generation=4 WHERE id=?", (task_id,))
+    await _seed_report(db, task_id, incomplete=True, reason=None)
+    await db.commit()
+    assert await _stopped(task_id, 5) is True, (
+        "неполный ноль не схождение: последним известным остаётся 3 из 3"
+    )
+
+
+async def test_several_reports_of_one_generation_fold_into_their_union(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1255: lite и добор deep на одно поколение сворачиваются ОБЪЕДИНЕНИЕМ.
+
+    Два случая, и каждый отличает объединение от своей альтернативы:
+    максимум прятал бы находку, которую нашёл только один отчёт, сумма
+    считала бы повтор дважды.
+    """
+    from hub.services.review_dispatch import finding_trajectory
+
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-u"}, "run": {"id": "r"}}))
+    a, b, c = _layer(1, 3)
+    task_id = await _submitted(client, db, "spike-1255-union-max")
+    await _generation_with_findings(db, task_id, 1, confirmed=[a, b])
+    await _generation_with_findings(db, task_id, 1, confirmed=[b, c])
+    trajectory = await finding_trajectory(db, task_id, 2)
+    assert trajectory.counts == (3,), "объединение: a, b, c — не максимум 2"
+
+    task_id = await _submitted(client, db, "spike-1255-union-sum")
+    await _generation_with_findings(db, task_id, 1, confirmed=[a, b])
+    await _generation_with_findings(db, task_id, 1, confirmed=[a, b])
+    trajectory = await finding_trajectory(db, task_id, 2)
+    assert trajectory.counts == (2,), "повтор того же отчёта — не сумма 4"
+
+
+async def _self_report(db, task_id: int, generation: int, size: int) -> None:
+    """Самоотчёт исполнителя о своей работе: не независимое чтение."""
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        harness_skill="deep-review",
+        model="claude-fable-5",
+        raw_count=size,
+        findings_confirmed=json.dumps(_layer(generation, size), ensure_ascii=False),
+        self_reviewed=True,
+        submitted_by="dev-agent",
+    )
+    await db.commit()
+
+
+async def test_a_self_report_is_neither_a_point_nor_a_reset_of_the_trajectory(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1255, находка e6250c505eb42e95, следствие 1: самоотчёт — не сброс.
+
+    Тот же признак, которым страж новизны не считает самоотчёт чтением:
+    полный самоотчёт с нулём находок не снимает остановку.
+    """
+    from hub.services.review_dispatch import findings_stopped_converging
+
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-s"}, "run": {"id": "r"}}))
+
+    async def _stopped(task_id: int, generation: int) -> bool:
+        await _next_submission(db, task_id, generation)
+        return await findings_stopped_converging(
+            db, dict(await repo.get_task(db, task_id))
+        )
+
+    task_id = await _submitted(client, db, "spike-1255-self-reset")
+    await _walk_counts(db, task_id, [3, 3, 3])
+    await _self_report(db, task_id, 4, 0)
+    assert await _stopped(task_id, 5) is True, "чистый самоотчёт — не схождение"
+
+
+async def test_flat_self_reports_do_not_stop_the_first_independent_order(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1255, находка e6250c505eb42e95, следствие 2: самоотчёт — не точка."""
+    from hub.services.review_dispatch import findings_stopped_converging
+
+    _wire(monkeypatch, _DispatchRecorder({"agent": {"id": "bc-s"}, "run": {"id": "r"}}))
+    task_id = await _submitted(client, db, "spike-1255-self-point")
+    for generation in (1, 2, 3):
+        await _self_report(db, task_id, generation, 3)
+    await _next_submission(db, task_id, 4)
+    task = dict(await repo.get_task(db, task_id))
+    assert await findings_stopped_converging(db, task) is False, (
+        "плоские самоотчёты не останавливают первый независимый заказ"
     )
 
 

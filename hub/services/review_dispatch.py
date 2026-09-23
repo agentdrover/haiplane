@@ -1226,7 +1226,14 @@ async def _policy_and_novelty_allow(
         # REVIEW_LADDER_MAX_STEPS ограничивает число прогонов на
         # генерацию, а подниматься выше дешёвого профиля некуда.
         return True
-    return not await _this_code_was_already_read(db, task)
+    if await _this_code_was_already_read(db, task):
+        return False
+    # #1255: третий тихий отказ той же природы — новое чтение уже не купит
+    # ничего нового, потому что находки перестали убывать. Стоит ПОСЛЕ
+    # проверки новизны: повтор того же кода — её вопрос, а здесь код менялся.
+    # Добор выше сюда не доходит намеренно: он дочитывает УЖЕ оплаченное
+    # поколение, а не покупает следующее.
+    return not await findings_stopped_converging(db, task)
 
 
 #: Метка записи об отсутствующем ревьюере, по которой она находится снова.
@@ -1367,6 +1374,14 @@ async def _this_code_was_already_read(
     return True
 
 
+#: Отчёт — независимое чтение, а не самоотчёт исполнителя о своей работе.
+#: Одно условие на всех читателей machine_reviews, которым это важно: страж
+#: новизны не считает самоотчёт покрытием кода (#1011, #1025), траектория
+#: несходимости (#1255) не берёт его ни точкой, ни сбросом. Второй редакции
+#: этого правила не заводим. Псевдоним таблицы в запросе — ``mr``.
+INDEPENDENT_READ = "COALESCE(mr.self_reviewed, 0) = 0"
+
+
 async def _report_already_covers_this_sha(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> int | None:
@@ -1411,7 +1426,7 @@ async def _report_already_covers_this_sha(
         return None
     rows = await fetchall(
         db,
-        "SELECT mr.id AS review_id, s.sha AS sha "
+        "SELECT mr.id AS review_id, s.sha AS sha "  # nosec B608 - константа модуля, не ввод
         "FROM machine_reviews mr "
         "JOIN submissions s ON s.task_id = mr.task_id "
         "AND s.generation = mr.submission_generation "
@@ -1427,7 +1442,7 @@ async def _report_already_covers_this_sha(
         # диспетчер как выполненный (#1011, #1025) — здесь он закрывал бы
         # его ещё до старта. «Код прочитан» имеет смысл только про того,
         # кто читал его со стороны.
-        "AND COALESCE(mr.self_reviewed, 0) = 0",
+        f"AND {INDEPENDENT_READ}",
         (task_id, generation),
     )
     for row in rows:
@@ -3889,3 +3904,267 @@ async def _already_named_the_circle(
         (task_id, f"%{mark}%"),
     )
     return bool(rows)
+
+
+# ---------------------------------------------------------------------------
+# Несходимость находок по поколениям (#1255)
+# ---------------------------------------------------------------------------
+#
+# Круг (#1235) НАЗЫВАЕТ задачу, но прогон всё равно покупается. Здесь другой
+# вопрос и другое действие: убывают ли ОТКРЫТЫЕ находки от поколения к
+# поколению. Если нет — следующий прогон не покупается, а человеку задаётся
+# вопрос «постановка или код» с самой последовательностью перед глазами.
+# Решает человек; хаб только перестаёт платить за ответ, который уже виден.
+
+#: Сколько поколений с отчётом правило смотрит, прежде чем судить.
+#:
+#: ИЗМЕРЕНО, а не выбрано: прогон правила по окнам 2..5 на 26 размеченных
+#: траекториях (tests/test_review_dispatch.py::NON_CONVERGENCE_HISTORY):
+#: 6 из постановки #1255 (confirmed + unresolved, замер 11.09.2026) и 20 из
+#: ленты событий прода (/api/events, machine_review_completed — только
+#: confirmed, 23.09.2026). Сошедшихся 22, несошедшихся 4.
+#: Окно 2 останавливает зря три сошедшиеся (#1204 на плато [6,2,2,2],
+#: #1265, #1271). Окно 4 и шире пропускает все три короткие несошедшиеся
+#: (#1081 [5,6,6], #1084 [3,6,3], #1186 [7,2,13]). Окно 3 — единственное,
+#: при котором сошедшихся остановлено зря НОЛЬ из 22, а поймано четыре из
+#: четырёх, #1208 — на четвёртом поколении. Оговорка: несошедшиеся примеры
+#: есть только в постановке — в ленте нет unresolved, а по одной confirmed
+#: несходимость #1208 не видна. Тест
+#: test_the_threshold_is_measured_on_the_history_not_chosen повторяет этот
+#: прогон и падает, если число здесь разойдётся с замером.
+NON_CONVERGENCE_WINDOW = 3
+
+#: Меньше скольких открытых находок задача считается сходящейся. Тот же
+#: край, что в разметке замера #1255: «убыло и осталось не больше одной» —
+#: сошлась. Измерено по ленте: без него плато из единиц (#1261 [0,1,1,1,0])
+#: останавливалось зря, хотя следующей сдачей задача сошлась.
+NON_CONVERGENCE_FLOOR = 2
+
+#: Исходы, которыми находка ЗАКРЫТА разбором, а не правкой: автор или
+#: человек сказал «это не дефект» или «уходит в другую задачу». Такая
+#: находка не открыта ни в одном поколении, где её нашли, — иначе честный
+#: разбор читался бы как несходимость (AC-4). ``fixed``/``real_fixed`` сюда
+#: НЕ входят намеренно: «починено» проверяет следующий отчёт, и находка,
+#: найденная снова, остаётся открытой, а новый слой после починки — это и
+#: есть та смена одного набора дефектов на другой, которую правило ловит.
+#: ``not_judged`` — «не смотрел», это не закрытие.
+DISPOSED_OUTCOMES: frozenset[str] = frozenset(
+    {"false_positive", "wont_fix", "deferred", "real_deferred", "not_a_defect"}
+)
+
+#: Метка вопроса в карточке: сдача, на которой остановлен прогон, и
+#: поколение постановки в этот момент. По ней вопрос находится снова, и по
+#: ней же видно, ответил ли человек (_non_convergence_answered).
+NON_CONVERGENCE_MARK = (
+    "[несходимость находок: сдача {generation}, постановка {statement}]"
+)
+_NON_CONVERGENCE_MARK_RE = re.compile(
+    r"\[несходимость находок: сдача (\d+), постановка (\d+)\]"
+)
+
+
+def _fires_at_last(counts: Sequence[int], window: int) -> bool:
+    """Выполнено ли условие несходимости на ПОСЛЕДНЕЙ позиции ``counts``.
+
+    Судится только ХВОСТ после последнего нуля: чистый отчёт — схождение, и
+    находки после него — новый заход, а не продолжение старого (тот же
+    приём, которым review_circle обнуляет круг на чистом отчёте). Без этого
+    [0, 1, 0, 2] (#1204 по ленте событий) читался бы как «ниже нуля не
+    опустилась» и останавливался зря.
+
+    Условие стоит, когда в хвосте не меньше ``window`` отчётов, на последнем
+    открытых находок НЕ МЕНЬШЕ ``NON_CONVERGENCE_FLOOR`` и верно одно из
+    двух:
+
+    * находок не меньше, чем в первом отчёте хвоста: после window−1 кругов
+      правок задача не ушла ниже старта (#1081, #1084, #1186, #1208);
+    * наименьший счёт не обновлялся ``window`` отчётов подряд — колебание,
+      не опускающееся ниже уже достигнутого.
+    """
+    zeros = [i for i, count in enumerate(counts) if count == 0]
+    tail = counts[zeros[-1] + 1 :] if zeros else counts
+    if len(tail) < window or tail[-1] < NON_CONVERGENCE_FLOOR:
+        return False
+    best_at = min(range(len(tail)), key=lambda i: (tail[i], i))
+    return tail[-1] >= tail[0] or len(tail) - 1 - best_at >= window
+
+
+def non_convergence_point(
+    counts: Sequence[int], window: int = NON_CONVERGENCE_WINDOW
+) -> int | None:
+    """Позиция (с 1), на которой правило срабатывает впервые, или None.
+
+    Длинная, но убывающая с колебаниями траектория (#1167, #1204) не
+    ловится: минимум она обновляет раньше, чем истечёт окно, и ниже старта
+    уходит сразу.
+    """
+    for position in range(1, len(counts) + 1):
+        if _fires_at_last(counts[:position], window):
+            return position
+    return None
+
+
+@dataclass(frozen=True)
+class FindingTrajectory:
+    """Открытые находки по поколениям С ОТЧЁТОМ в хабе, по порядку."""
+
+    generations: tuple[int, ...]
+    counts: tuple[int, ...]
+
+    def fires_now(self) -> bool:
+        """Стоит ли условие на последнем известном поколении."""
+        return _fires_at_last(self.counts, NON_CONVERGENCE_WINDOW)
+
+    def sequence(self) -> str:
+        """``сдача 1: 3, сдача 2: 4, …`` — то, по чему решает человек."""
+        return ", ".join(
+            f"сдача {g}: {c}" for g, c in zip(self.generations, self.counts)
+        )
+
+
+async def _disposed_uids(db: aiosqlite.Connection, task_id: int) -> set[str]:
+    """Находки, закрытые разбором: исход автора или диспозиция человека."""
+    marks = ",".join("?" for _ in DISPOSED_OUTCOMES)
+    params = (task_id, *sorted(DISPOSED_OUTCOMES))
+    rows = await fetchall(
+        db,
+        f"SELECT finding_uid FROM finding_outcomes WHERE task_id=? "  # nosec B608
+        f"AND outcome IN ({marks}) "
+        f"UNION SELECT finding_uid FROM finding_dispositions WHERE task_id=? "
+        f"AND disposition IN ({marks})",
+        params + params,
+    )
+    return {str(dict(r)["finding_uid"] or "") for r in rows} - {""}
+
+
+async def finding_trajectory(
+    db: aiosqlite.Connection, task_id: int, before_generation: int
+) -> FindingTrajectory:
+    """Счёт ОТКРЫТЫХ находок по поколениям до ``before_generation``.
+
+    СВЁРТКА нескольких отчётов одного поколения — ОБЪЕДИНЕНИЕ по
+    ``finding_uid``. Лестница (#879) кладёт на поколение lite и добор deep;
+    второй часто повторяет первый. Сумма посчитала бы повтор дважды, а
+    максимум спрятал бы находки, которые нашёл только один из двух, — хотя
+    они такие же открытые. Объединение по uid — тот же приём, которым
+    review_circle считает «пришло новых».
+
+    НЕПОЛНЫЙ отчёт без находок пропускается: «машина не дочитала» — не
+    «чисто» (#1234), и нулём, то есть схождением, он не становится.
+
+    Поколения без отчёта в хабе (внешний ревьюер, #1252) не видны вовсе:
+    правило сужено до них честно, и вопрос человеку это говорит.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT mr.submission_generation, mr.findings_confirmed, mr.unresolved, "  # nosec B608 - константа модуля, не ввод
+        "mr.incomplete FROM machine_reviews mr "
+        "WHERE mr.task_id=? AND mr.submission_generation < ? "
+        # Самоотчёт — не чтение со стороны: ни точка траектории, ни сброс её
+        # хвоста чистым нулём (находка e6250c505eb42e95).
+        f"AND {INDEPENDENT_READ} "
+        "ORDER BY mr.submission_generation, mr.id",
+        (task_id, before_generation),
+    )
+    per_generation: dict[int, set[str]] = {}
+    for raw in rows:
+        row = dict(raw)
+        uids = {uid for uid, _ in _findings_of(row)}
+        if not uids and bool(row.get("incomplete")):
+            continue
+        generation = int(row.get("submission_generation") or 0)
+        per_generation.setdefault(generation, set()).update(uids)
+    disposed = await _disposed_uids(db, task_id)
+    generations = tuple(sorted(per_generation))
+    return FindingTrajectory(
+        generations=generations,
+        counts=tuple(len(per_generation[g] - disposed) for g in generations),
+    )
+
+
+def non_convergence_question(trajectory: FindingTrajectory, submissions: int) -> str:
+    """Текст вопроса человеку. Один на все места, где он звучит (#1188)."""
+    return (
+        "Следующий прогон машинного ревью НЕ заказан: открытые находки не "
+        f"убывают ({trajectory.sequence()}). Вопрос человеку — постановка "
+        "или код? Если находки меняют один набор дефектов на другой при "
+        "настоящих правках, причина обычно в постановке (так было на "
+        "#1208: ограничение, которое девять кругов никто не оспорил). "
+        "Ответ — вердикт по этой сдаче или правка постановки; после него "
+        "круги продолжаются. Посчитаны только сдачи с отчётом в хабе: "
+        f"{len(trajectory.generations)} из {submissions}; ревью, пришедшее "
+        "мимо хаба, здесь не видно. Порог "
+        f"NON_CONVERGENCE_WINDOW={NON_CONVERGENCE_WINDOW} измерен на истории (#1255)."
+    )
+
+
+async def _non_convergence_asked(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[int, int] | None:
+    """(сдача, постановка) из заданного вопроса, или None — не спрашивали."""
+    rows = await fetchall(
+        db,
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert' "
+        "AND content LIKE ? ORDER BY id DESC LIMIT 1",
+        (task_id, "%[несходимость находок: сдача %"),
+    )
+    if not rows:
+        return None
+    found = _NON_CONVERGENCE_MARK_RE.search(str(dict(rows[0])["content"]))
+    if found is None:  # pragma: no cover - метку пишет только этот модуль
+        return None
+    return int(found.group(1)), int(found.group(2))
+
+
+def _non_convergence_answered(task: dict[str, Any], asked: tuple[int, int]) -> bool:
+    """Ответил ли человек: вердикт по остановленной сдаче или новая постановка."""
+    generation, statement = asked
+    return (
+        int(task.get("review_verdict_generation") or 0) >= generation
+        or int(task.get("statement_generation") or 0) > statement
+    )
+
+
+async def findings_stopped_converging(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> bool:
+    """Не покупать прогон: находки не сходятся. True — прогон остановлен.
+
+    Вопрос задаётся ОДИН раз, на достижении порога. Пока человек не
+    ответил, следующие сдачи тоже стоят без прогона — молча: вопрос уже в
+    карточке. После ответа правило больше не останавливает эту задачу —
+    круги продолжаются, это решение человека, а не хаба.
+    """
+    task_id = int(task["id"])
+    asked = await _non_convergence_asked(db, task_id)
+    if asked is not None:
+        return not _non_convergence_answered(task, asked)
+    generation = int(task.get("submission_generation") or 0)
+    trajectory = await finding_trajectory(db, task_id, generation)
+    if not trajectory.fires_now():
+        return False
+    mark = NON_CONVERGENCE_MARK.format(
+        generation=generation, statement=int(task.get("statement_generation") or 0)
+    )
+    question = non_convergence_question(trajectory, generation - 1)
+    await repo.add_task_update(db, task_id, "hub", "alert", f"{question} {mark}")
+    await repo.insert_event(
+        db,
+        kind="review_non_convergence",
+        task_id=task_id,
+        actor="hub",
+        payload={
+            "generation": generation,
+            "generations": list(trajectory.generations),
+            "counts": list(trajectory.counts),
+            "window": NON_CONVERGENCE_WINDOW,
+            "question": question,
+        },
+    )
+    await db.commit()
+    log.info(
+        "task #%s: findings do not converge (%s), review run not bought",
+        task_id,
+        trajectory.sequence(),
+    )
+    return True

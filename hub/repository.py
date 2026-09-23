@@ -609,6 +609,30 @@ async def list_review_tasks(
     )
 
 
+async def list_review_task_ids_in_project(
+    db: aiosqlite.Connection, project_id: int
+) -> list[int]:
+    """Live tasks of this project sitting in review, by id (#1264).
+
+    The project is resolved exactly as everywhere else — through
+    ``resolve_project_for_task`` — not through PROJECT_SUBTREE_CONDITION: the
+    subtree misses the tasks default owns by fallback (no epic, or an epic
+    whose project is still a pending proposal), and those are most of
+    default's queue. The review queue is tens of rows, so resolving each one
+    costs less than a second definition of "belongs to the project" would.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT id FROM tasks WHERE archived=0 AND status='review' ORDER BY id",
+    )
+    ids: list[int] = []
+    for row in rows:
+        project = await resolve_project_for_task(db, int(row["id"]))
+        if project is not None and int(project["id"]) == project_id:
+            ids.append(int(row["id"]))
+    return ids
+
+
 async def list_pair_tasks_awaiting_delivery(
     db: aiosqlite.Connection,
 ) -> list[aiosqlite.Row]:
