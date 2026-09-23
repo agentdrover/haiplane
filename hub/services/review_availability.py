@@ -41,9 +41,14 @@ REFUSAL_ALERT_PREFIXES: tuple[str, ...] = (
     "Кросс-модельное ревью НЕ вызвано: ответ провайдера не дошёл",
 )
 
-#: Событие хаба «ревьюер недоступен» и его снятие.
+#: Событие хаба «ревьюер недоступен» и его снятие. Снятие названо нейтрально
+#: намеренно: сигнал снимается и тогда, когда провайдер НЕ ожил, а очередь
+#: отказанных сжалась, — «ревьюер снова отвечает» было бы там неправдой.
+#: Фактическая причина — поле ``reason`` в событии и та же строка в ленте.
 REVIEWER_UNAVAILABLE = "reviewer_unavailable"
-REVIEWER_AVAILABLE = "reviewer_available"
+REVIEWER_SIGNAL_CLEARED = "reviewer_unavailable_cleared"
+#: Сколько отказанных сдач в review держит сигнал (одна — свойство сдачи).
+MIN_REFUSED_TASKS = 2
 #: Провайдер, о котором говорит сигнал. Один сегодня, но ключ дедупа —
 #: провайдер, а не задача: сигнал не зависит от одной карточки.
 PROVIDER = "cursor_cloud"
@@ -286,7 +291,7 @@ async def provider_outage(db, *, now: datetime | None = None) -> Outage | None:
     if hours <= 0:
         return None
     waiting, starts = await _review_queue(db, await _last_provider_success(db))
-    if len(starts) < 2:
+    if len(starts) < MIN_REFUSED_TASKS:
         return None
     since = min(starts)
     now = now or datetime.now(UTC)
@@ -300,12 +305,56 @@ async def provider_outage(db, *, now: datetime | None = None) -> Outage | None:
     )
 
 
-async def signal_state(db) -> str:
-    """Последнее слово сторожа: поднят ли сигнал, и когда."""
+async def _last_signal(db) -> dict[str, Any] | None:
     rows = await fetchall(
         db,
         "SELECT kind, created_at FROM events WHERE kind IN (?, ?) "
         "ORDER BY id DESC LIMIT 1",
-        (REVIEWER_UNAVAILABLE, REVIEWER_AVAILABLE),
+        (REVIEWER_UNAVAILABLE, REVIEWER_SIGNAL_CLEARED),
     )
-    return str(dict(rows[0])["kind"]) if rows else ""
+    return dict(rows[0]) if rows else None
+
+
+async def signal_state(db) -> str:
+    """Последнее слово сторожа: поднят ли сигнал или снят."""
+    last = await _last_signal(db)
+    return str(last["kind"]) if last else ""
+
+
+async def clearing(db) -> dict[str, Any]:
+    """Почему сигнал снимается — наблюдённая причина, одна для события и ленты.
+
+    ``provider_answered`` — только если облачный агент создан после подъёма
+    сигнала. Иначе провайдер, возможно, всё ещё отказывает, и причина —
+    очередь: отказанных сдач в review стало меньше порога (или сторож
+    выключен настройкой).
+    """
+    last = await _last_signal(db)
+    raised_at = str(last["created_at"]) if last else ""
+    last_success = await _last_provider_success(db)
+    if last_success and last_success >= raised_at:
+        return {
+            "reason": "provider_answered",
+            "message": "Ревьюер снова отвечает: провайдер создал агента — "
+            "сигнал недоступности снят",
+        }
+    if config.REVIEWER_UNAVAILABLE_HOURS <= 0:
+        return {
+            "reason": "watch_disabled",
+            "message": "Сигнал недоступности ревьюера снят: сторож выключен "
+            "настройкой REVIEWER_UNAVAILABLE_HOURS=0",
+        }
+    waiting, _starts = await _review_queue(db, last_success)
+    refused = [w["task_id"] for w in waiting if "refused_since" in w]
+    named = ", ".join(f"#{t}" for t in refused)
+    return {
+        "reason": "queue_below_threshold",
+        "remaining": len(refused),
+        "remaining_tasks": refused,
+        "message": (
+            "Сигнал недоступности ревьюера снят: отказанных сдач в review "
+            f"меньше порога {MIN_REFUSED_TASKS} — осталось {len(refused)}"
+            + (f" ({named})" if named else "")
+            + "; провайдер агента не создавал и, возможно, всё ещё отказывает"
+        ),
+    }

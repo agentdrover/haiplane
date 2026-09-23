@@ -3163,6 +3163,17 @@ async def _reviewer_events(db, kind: str) -> list[dict]:
     return [_json.loads(dict(r)["payload"]) for r in rows]
 
 
+async def _cleared_feed(db) -> list[str]:
+    from hub.services.review_availability import REVIEWER_SIGNAL_CLEARED
+
+    rows = await fetchall(
+        db,
+        "SELECT summary FROM activity_log WHERE kind=? ORDER BY id",
+        (REVIEWER_SIGNAL_CLEARED,),
+    )
+    return [str(dict(r)["summary"]) for r in rows]
+
+
 async def test_reviewer_unavailable_is_one_hub_event_not_a_card_each(
     client, db, monkeypatch
 ):
@@ -3212,7 +3223,7 @@ async def test_reviewer_answering_again_clears_the_signal(client, db, monkeypatc
     from hub.poller import _sweep_reviewer_unavailable
     from hub.services import review_dispatch
     from hub.services.review_availability import (
-        REVIEWER_AVAILABLE,
+        REVIEWER_SIGNAL_CLEARED,
         REVIEWER_UNAVAILABLE,
         generation_review,
         signal_state,
@@ -3233,8 +3244,14 @@ async def test_reviewer_answering_again_clears_the_signal(client, db, monkeypatc
 
     await _sweep_reviewer_unavailable(db)
 
-    assert await signal_state(db) == REVIEWER_AVAILABLE, "сигнал снят сам"
-    assert len(await _reviewer_events(db, REVIEWER_AVAILABLE)) == 1
+    assert await signal_state(db) == REVIEWER_SIGNAL_CLEARED, "сигнал снят сам"
+    cleared = await _reviewer_events(db, REVIEWER_SIGNAL_CLEARED)
+    assert len(cleared) == 1
+    # Находка cdcea07930c55ac5: снятие называет ФАКТИЧЕСКУЮ причину, и лента
+    # говорит то же, что событие.
+    assert cleared[0]["reason"] == "provider_answered"
+    assert await _cleared_feed(db) == [cleared[0]["message"]]
+    assert "провайдер создал агента" in cleared[0]["message"]
     view = await generation_review(db, dict(await repo.get_task(db, first)))
     assert view.reason == "in_flight", (
         "задача с успешным вызовом больше не числится отказанной провайдером"
@@ -3243,7 +3260,7 @@ async def test_reviewer_answering_again_clears_the_signal(client, db, monkeypatc
     assert still.reason == "provider_refused"
 
     await _sweep_reviewer_unavailable(db)
-    assert len(await _reviewer_events(db, REVIEWER_AVAILABLE)) == 1, (
+    assert len(await _reviewer_events(db, REVIEWER_SIGNAL_CLEARED)) == 1, (
         "снятие тоже одно, а не на каждом свипе"
     )
 
@@ -3285,7 +3302,7 @@ async def test_signal_clears_when_the_refused_queue_drops_below_two(
     отчёт текущего поколения (вторая дверь, #1252)."""
     from hub.poller import _sweep_reviewer_unavailable
     from hub.services.review_availability import (
-        REVIEWER_AVAILABLE,
+        REVIEWER_SIGNAL_CLEARED,
         REVIEWER_UNAVAILABLE,
         signal_state,
     )
@@ -3315,6 +3332,16 @@ async def test_signal_clears_when_the_refused_queue_drops_below_two(
     assert resp.status_code in (200, 201), resp.text
     await _sweep_reviewer_unavailable(db)
 
-    assert await signal_state(db) == REVIEWER_AVAILABLE, (
+    assert await signal_state(db) == REVIEWER_SIGNAL_CLEARED, (
         "одна сдача без ревью из-за провайдера — уже не картина очереди"
     )
+    cleared = await _reviewer_events(db, REVIEWER_SIGNAL_CLEARED)
+    assert len(cleared) == 1
+    # Находка cdcea07930c55ac5: провайдер НЕ ожил — снятие не смеет говорить
+    # «ревьюер снова отвечает», оно называет сжавшуюся очередь.
+    assert cleared[0]["reason"] == "queue_below_threshold"
+    assert cleared[0]["remaining"] == 1
+    assert cleared[0]["remaining_tasks"] == [_second]
+    assert "снова отвечает" not in cleared[0]["message"]
+    assert f"осталось 1 (#{_second})" in cleared[0]["message"]
+    assert await _cleared_feed(db) == [cleared[0]["message"]]

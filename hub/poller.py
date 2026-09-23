@@ -1346,15 +1346,18 @@ async def _sweep_reviewer_unavailable(db) -> None:
 
 
 async def _clear_reviewer_unavailable(db) -> None:
+    """Снять сигнал, назвав фактическую причину — в событии и в ленте одно."""
     from hub.services import review_availability as ra
 
+    why = await ra.clearing(db)
     await repo.insert_event(
-        db, kind=ra.REVIEWER_AVAILABLE, actor="hub", payload={"provider": ra.PROVIDER}
+        db,
+        kind=ra.REVIEWER_SIGNAL_CLEARED,
+        actor="hub",
+        payload={"provider": ra.PROVIDER, **why},
     )
     await db.commit()
-    await log_activity(
-        db, ra.REVIEWER_AVAILABLE, "Ревьюер снова отвечает: сигнал недоступности снят"
-    )
+    await log_activity(db, ra.REVIEWER_SIGNAL_CLEARED, why["message"])
 
 
 # What each human-owned instance is actually waiting for. The age alone does
