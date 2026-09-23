@@ -197,12 +197,14 @@ async def _named_only_tests(
     """
     from hub.services.review_dispatch import dispatch_for_report
 
+    row: dict | None
     if report_row is not None:
         row = await dispatch_for_report(db, task_id, generation, dict(report_row))
     else:
-        row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+        latest = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+        row = dict(latest) if latest is not None else None
     if row is not None:
-        raw = dict(row).get("only_tests")
+        raw = row.get("only_tests")
         try:
             return None if raw is None else [str(n) for n in json.loads(raw)]
         except (TypeError, ValueError):
