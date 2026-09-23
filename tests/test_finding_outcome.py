@@ -88,10 +88,14 @@ async def _report_then_a_gap(
     finding_uid)`` находки отчёта сдачи 1.
     """
     task_id = await _started(client, title)
-    assert (await client.post(f"/api/tasks/{task_id}/submit-review", json={})).status_code == 200
+    assert (
+        await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    ).status_code == 200
     review_id = await _report(db, task_id, 1, [_finding(finding)])
     await _sent_back(client, task_id)
-    assert (await client.post(f"/api/tasks/{task_id}/submit-review", json={})).status_code == 200
+    assert (
+        await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    ).status_code == 200
     # Сдача 2 ревью не получила: отчёта о поколении 2 нет вовсе — ровно форма
     # прода (#1231: отчёты 353 о сдаче 1 и 447 о сдаче 4, между ними ничего).
     assert await _generation(db, task_id) == 2
@@ -218,3 +222,34 @@ async def test_no_report_at_all_owes_nothing(
     await client.post(f"/api/tasks/{task_id}/submit-review", json={})
     assert await finding_outcome.open_findings(db, task_id, 1) == []
     assert await finding_outcome.open_findings(db, task_id, 0) == []
+
+
+async def test_a_same_commit_retry_behind_a_gap_reads_the_same_reports(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Повтор сдачи того же коммита читает отвеченное из тех же отчётов (#1331).
+
+    Повтор сверяет «уже отвечено» с «открыто». Если первое читать по
+    поколению сдачи, а второе — по последнему отчёту, повтор тела, чьи
+    исходы уже записаны, за пропуском получал бы 422 вместо того же ответа.
+    """
+    from tests.test_submit_gates import _install_fixed_tip_git
+
+    monkeypatch.setattr("hub.config.FINDING_OUTCOME", "warn")
+    git = _install_fixed_tip_git(monkeypatch, "tip-1")
+    task_id = await _started(client, "Повтор за пропуском")
+    assert (
+        await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    ).status_code == 200
+    await _report(db, task_id, 1, [_finding("утечка при повторе")])
+    await _sent_back(client, task_id)
+    uid = (await finding_outcome.open_findings(db, task_id, 1))[0]["finding_uid"]
+
+    git.tip = "tip-2"
+    body = {"finding_outcomes": [{"finding_uid": uid, "outcome": "fixed"}]}
+    first = await client.post(f"/api/tasks/{task_id}/submit-review", json=body)
+    assert first.status_code == 200, first.text
+    assert await _generation(db, task_id) == 2
+    replay = await client.post(f"/api/tasks/{task_id}/submit-review", json=body)
+    assert replay.status_code == 200, replay.text
+    assert await _generation(db, task_id) == 2, "повтор того же коммита не бампает"
