@@ -10149,7 +10149,9 @@ def test_the_threshold_is_measured_on_the_history_not_chosen():
 def _layer(generation: int, size: int) -> list[dict]:
     """``size`` РАЗНЫХ подтверждённых находок поколения: у каждой свой uid."""
     return [
-        _confirmed(f"дефект {generation}.{n}", f"cat-{generation}", 100 * generation + n)
+        _confirmed(
+            f"дефект {generation}.{n}", f"cat-{generation}", 100 * generation + n
+        )
         for n in range(size)
     ]
 
@@ -10177,10 +10179,17 @@ async def _walk_counts(db, task_id: int, counts: list[int]) -> None:
     previous: tuple[int, int, list[dict]] | None = None
     for generation, size in enumerate(counts, start=1):
         layer = _layer(generation, size)
-        review_id = await _generation_with_findings(db, task_id, generation, confirmed=layer)
+        review_id = await _generation_with_findings(
+            db, task_id, generation, confirmed=layer
+        )
         if previous is not None:
             await _author_closed_them(
-                db, task_id, previous[0], previous[1], confirmed=previous[2], unresolved=[]
+                db,
+                task_id,
+                previous[0],
+                previous[1],
+                confirmed=previous[2],
+                unresolved=[],
             )
         previous = (review_id, generation, layer)
 
@@ -10278,7 +10287,9 @@ async def test_dispositions_count_as_progress_and_an_incomplete_zero_does_not(
 
     async def _stopped(task_id: int, generation: int) -> bool:
         await _next_submission(db, task_id, generation)
-        return await findings_stopped_converging(db, dict(await repo.get_task(db, task_id)))
+        return await findings_stopped_converging(
+            db, dict(await repo.get_task(db, task_id))
+        )
 
     # Разбор: две из трёх находок третьего поколения автор отложил и
     # признал не дефектом — открытых 3, 3, 1, это схождение.
@@ -10288,7 +10299,12 @@ async def test_dispositions_count_as_progress_and_an_incomplete_zero_does_not(
         third = _layer(3, 3)
         review_id = await _generation_with_findings(db, task_id, 3, confirmed=third)
         await _author_closed_them(
-            db, task_id, review_id, 3, confirmed=third[:2], unresolved=[],
+            db,
+            task_id,
+            review_id,
+            3,
+            confirmed=third[:2],
+            unresolved=[],
             outcome_confirmed=outcome,
         )
         assert await _stopped(task_id, 4) is expected, (
@@ -10298,7 +10314,9 @@ async def test_dispositions_count_as_progress_and_an_incomplete_zero_does_not(
     # Неполный отчёт с нулём находок: 3, 4, 3 и затем «не дочитал».
     task_id = await _submitted(client, db, "spike-1255-incomplete")
     for generation, size in enumerate((3, 4, 3), start=1):
-        await _generation_with_findings(db, task_id, generation, confirmed=_layer(generation, size))
+        await _generation_with_findings(
+            db, task_id, generation, confirmed=_layer(generation, size)
+        )
     await db.execute("UPDATE tasks SET submission_generation=4 WHERE id=?", (task_id,))
     await _seed_report(db, task_id, incomplete=True, reason=None)
     await db.commit()
