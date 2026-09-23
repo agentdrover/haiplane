@@ -1158,8 +1158,12 @@ async def test_a_branch_squashed_by_the_gate_is_silence_not_denial(
     _real_git_for(monkeypatch, ancestry_forge, "gitverse")
     task_id = await _submitted_task(client, db, branch, submitted)
 
-    delivered_tip = await _gate_delivers(db, task_id, branch, ancestry_forge, monkeypatch)
-    assert delivered_tip != submitted, "гейт обязан был сжать ветку — иначе тест не о том"
+    delivered_tip = await _gate_delivers(
+        db, task_id, branch, ancestry_forge, monkeypatch
+    )
+    assert delivered_tip != submitted, (
+        "гейт обязан был сжать ветку — иначе тест не о том"
+    )
     _merge_no_ff(work, branch)
 
     # Вход — настоящий git: работа в базе, а сдача ей не предок.
@@ -1173,7 +1177,9 @@ async def test_a_branch_squashed_by_the_gate_is_silence_not_denial(
     reached, note = await merged_into_base_detail(db, task)
     assert reached is None, "«не предок» после сжатия гейтом — не отрицание"
     assert note == BASE_SQUASHED_BY_GATE_NOTE, note
-    assert note != BASE_UNANSWERABLE_NOTE, "это не случай #1214: форж родословную хранит"
+    assert note != BASE_UNANSWERABLE_NOTE, (
+        "это не случай #1214: форж родословную хранит"
+    )
 
     # Оба потребителя — строка зависимости и реестр — одними словами.
     entry = await blocker_delivery(
@@ -1244,7 +1250,9 @@ async def test_real_undelivered_work_still_says_no_after_the_fix(
     first = _two_commit_branch(work, branch, "again")
     task_id = await _submitted_task(client, db, branch, first)
     await _gate_delivers(db, task_id, branch, ancestry_forge, monkeypatch)
-    assert (dict(await repo.get_task(db, task_id)).get("gate_squashed_sha") or "") == first
+    assert (
+        dict(await repo.get_task(db, task_id)).get("gate_squashed_sha") or ""
+    ) == first
     _hermetic_git(work, "checkout", "-q", branch)
     (work / "later.py").write_text("later = True\n")
     _hermetic_git(work, "add", ".")
@@ -1284,11 +1292,14 @@ async def test_records_without_the_fact_are_not_called_squashed(
     task_id = await _submitted_task(client, db, "task-1240/old-record", sha)
 
     cols = {
-        r[1]: r[4] for r in await (await db.execute("PRAGMA table_info(tasks)")).fetchall()
+        r[1]: r[4]
+        for r in await (await db.execute("PRAGMA table_info(tasks)")).fetchall()
     }
     assert "gate_squashed_sha" in cols, "факт должен где-то храниться"
     stored = dict(await repo.get_task(db, task_id))
-    assert stored["gate_squashed_sha"] == "", "у старой строки факта нет — и он не выдуман"
+    assert stored["gate_squashed_sha"] == "", (
+        "у старой строки факта нет — и он не выдуман"
+    )
 
     assert await merged_into_base_detail(db, stored) == (False, "")
 

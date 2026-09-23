@@ -2075,6 +2075,17 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_review_verdict_closed_generation_column",
         "ALTER TABLE tasks ADD COLUMN review_verdict_closed_generation INTEGER",
     ),
+    (
+        # #1240: вершина ветки задачи, которую гейт сам переписал сжатием при
+        # доставке (squash_branch). Сдача закрепляет коммит вершины; после
+        # сжатия в базу уходит ДРУГОЙ коммит, и «предок ли сдача базы»
+        # отвечает «нет» на доставленной работе. Этот факт — единственное, по
+        # чему такое «нет» отличимо от настоящего: угадывать по числу коммитов
+        # постановка запрещает. '' — гейт ветку не переписывал или запись
+        # старше этой колонки; ни то, ни другое не читается как «сжато».
+        "add_tasks_gate_squashed_sha",
+        "ALTER TABLE tasks ADD COLUMN gate_squashed_sha TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 

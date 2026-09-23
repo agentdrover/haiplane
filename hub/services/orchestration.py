@@ -4089,6 +4089,53 @@ async def _complete_without_review(
     return "completed"
 
 
+async def _local_tip(branch: str, git_repo: str | None) -> str:
+    """Вершина ветки в рабочем каталоге доставки, или "" если не прочесть."""
+    try:
+        state, detail = await plugins.git_ops.resolve_ref(branch, git_repo or "")
+    except Exception as exc:  # noqa: BLE001 - a fact for later, never fatal
+        log.warning("cannot read the tip of %s: %s", branch, exc)
+        return ""
+    return detail if state == "resolved" and isinstance(detail, str) else ""
+
+
+async def _squash_and_record(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    branch: str,
+    git_repo: str | None,
+    base_branch: str | None,
+) -> bool:
+    """Сжать ветку задачи и записать, если гейт переписал её историю (#1240).
+
+    Сдача закрепила коммит вершины. Если сжатие породило новый коммит, в базу
+    уйдёт он, и закреплённый перестанет быть предком базы на доставленной
+    работе. Проверке доставки нужен ФАКТ, а не догадка по числу коммитов, —
+    поэтому вершина читается до и после: сменилась — гейт переписал ветку, и
+    старая вершина записывается. Не прочиталась — факт не пишется: лучше
+    промолчать о сжатии, чем выдумать его.
+    """
+    before = await _local_tip(branch, git_repo)
+    squashed = await plugins.git_ops.squash_branch(
+        task["id"],
+        task.get("title", ""),
+        branch,
+        repo=git_repo,
+        base_branch=base_branch,
+    )
+    after = await _local_tip(branch, git_repo)
+    if before and after and before != after:
+        await repo.update_task(db, task["id"], gate_squashed_sha=before)
+        log.info(
+            "Task #%d: gate squashed %s (%s → %s)",
+            task["id"],
+            branch,
+            before[:12],
+            after[:12],
+        )
+    return squashed
+
+
 async def _route_after_done(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -4338,12 +4385,8 @@ async def _route_after_done(
     # squash, push and PR all have no subject, and the task still owes a
     # verdict — it just owes no pull request (#991).
     if not nothing_to_deliver:
-        squashed = await plugins.git_ops.squash_branch(
-            task_id,
-            task.get("title", ""),
-            branch,
-            repo=git_repo,
-            base_branch=ctx.get("base_branch"),
+        squashed = await _squash_and_record(
+            db, task, branch, git_repo, ctx.get("base_branch")
         )
         await plugins.git_ops.push_branch(branch, repo=git_repo, force=squashed)
         if not task.get("pr_number"):
