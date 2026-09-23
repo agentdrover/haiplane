@@ -566,16 +566,22 @@ async def _last_event_payload(
     *,
     task_id: int | None = None,
     run_id: int | None = None,
+    order: tuple[int, str] | None = None,
+    today: bool = False,
 ) -> dict[str, Any]:
     """Полезная нагрузка ПОСЛЕДНЕГО события такого рода — или пустая.
 
     Один читатель на весь приём «пиши только при смене причины» (#1290).
-    Им пользуются и отказ режима act, и временный отказ прогона: два почти
-    одинаковых запроса в двух местах разъехались бы ровно на условии, по
-    которому событие считается тем же самым.
+    Им пользуются отказ режима act, временный отказ прогона и отказ самого
+    заказа (#1330): почти одинаковые запросы в разных местах разъехались бы
+    ровно на условии, по которому событие считается тем же самым.
 
     ``run_id`` сужает до одного прогона: у задачи их несколько поколений, и
-    отказ соседнего слота — не повтор этого.
+    отказ соседнего слота — не повтор этого. ``order`` — (поколение, вид)
+    заказа, который ещё не размещён и поэтому прогона не имеет. ``today``
+    отсекает прошлые UTC-сутки: суточный потолок — факт одних суток, и
+    вчерашний отказ не повтор сегодняшнего. Граница стоит на created_at,
+    по которому есть индекс, — дедуп на каждом тике не сканирует ленту.
     """
     where = ["kind=?"]
     params: list[Any] = [kind]
@@ -585,6 +591,12 @@ async def _last_event_payload(
     if run_id is not None:
         where.append("json_extract(payload, '$.run_id')=?")
         params.append(run_id)
+    if order is not None:
+        where.append("json_extract(payload, '$.generation')=?")
+        where.append("json_extract(payload, '$.kind')=?")
+        params.extend(order)
+    if today:
+        where.append("created_at >= date('now')")
     rows = await fetchall(
         db,
         f"SELECT payload FROM events WHERE {' AND '.join(where)} "  # nosec B608 - placeholders only, values are params
