@@ -1422,7 +1422,7 @@ async def _report_already_covers_this_sha(
         return None
     rows = await fetchall(
         db,
-        "SELECT mr.id AS review_id, s.sha AS sha "
+        "SELECT mr.id AS review_id, s.sha AS sha "  # nosec B608 - константа модуля, не ввод
         "FROM machine_reviews mr "
         "JOIN submissions s ON s.task_id = mr.task_id "
         "AND s.generation = mr.submission_generation "
@@ -4024,7 +4024,7 @@ async def finding_trajectory(
     """
     rows = await fetchall(
         db,
-        "SELECT mr.submission_generation, mr.findings_confirmed, mr.unresolved, "
+        "SELECT mr.submission_generation, mr.findings_confirmed, mr.unresolved, "  # nosec B608 - константа модуля, не ввод
         "mr.incomplete FROM machine_reviews mr "
         "WHERE mr.task_id=? AND mr.submission_generation < ? "
         # Самоотчёт — не чтение со стороны: ни точка траектории, ни сброс её
