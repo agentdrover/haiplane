@@ -1128,6 +1128,13 @@ _FORM_GATE_POLICY_KEYS = frozenset(
 #: переключатель не знает».
 _SHADOW_FIELD = f"gate_policy_{steward_dispatch.STEWARD_SHADOW_KEY}"
 
+#: Поля лимита очереди review в форме проекта (#1335). В отличие от ручек
+#: _FORM_GATE_POLICY_KEYS, ключи лимита принадлежат форме, только когда поле
+#: пришло в запросе: запрос без него (старая страница, скрипт, один
+#: переключатель) о лимите не знает и снять его не может.
+_REVIEW_LIMIT_FIELD = f"gate_policy_{project_policy.REVIEW_LIMIT_KEY}"
+_REVIEW_LIMIT_MODE_FIELD = f"gate_policy_{project_policy.REVIEW_LIMIT_MODE_KEY}"
+
 
 # Отказ, привязанный к проекту, показывается У ЕГО КАРТОЧКИ (#1188). Общая
 # нота внизу страницы остаётся для отказов, у которых проекта нет, — форма
@@ -1219,6 +1226,113 @@ async def _web_patch_project(
     )
 
 
+#: Поля формы проекта, из которых собирается gate_policy. Хоть одно в запросе
+#: — и политика пересобирается; ни одного — запрос не про политику (#753).
+_GATE_POLICY_FORM_FIELDS = (
+    "gate_policy_dor",
+    "gate_policy_verdict",
+    "gate_policy_review",
+    "gate_policy_release",
+    "gate_policy_dor_max_class",
+    "gate_policy_risk_map",
+    _SHADOW_FIELD,
+    _REVIEW_LIMIT_FIELD,
+)
+
+
+def _review_limit_from_form(form: Any, policy: dict[str, Any]) -> None:
+    """Лимит очереди review из формы (#1335) — только если поле в запросе.
+
+    Нет поля — запрос о лимите не знает, и сохранённое остаётся (так ключи и
+    не попали в _FORM_GATE_POLICY_KEYS). Поле есть и пусто — явное «снять
+    лимит»: уходят оба ключа, режим без лимита ничего не значит. Значения не
+    проверяются здесь: число кладётся числом, всё прочее — как пришло, и
+    отказывает та же _validate_review_limit в ProjectPatch, что и у API.
+    """
+    if _REVIEW_LIMIT_FIELD not in form:
+        return
+    policy.pop(project_policy.REVIEW_LIMIT_KEY, None)
+    policy.pop(project_policy.REVIEW_LIMIT_MODE_KEY, None)
+    raw = str(form.get(_REVIEW_LIMIT_FIELD) or "").strip()
+    if not raw:
+        return
+    try:
+        policy[project_policy.REVIEW_LIMIT_KEY] = int(raw)
+    except ValueError:
+        policy[project_policy.REVIEW_LIMIT_KEY] = raw
+    mode = str(form.get(_REVIEW_LIMIT_MODE_FIELD) or "").strip()
+    if mode:
+        policy[project_policy.REVIEW_LIMIT_MODE_KEY] = mode
+
+
+async def _gate_policy_from_form(
+    request: Request, form: Any, project_id: int
+) -> tuple[dict[str, Any] | None, str | None]:
+    """(gate_policy | None если запрос не про политику, ошибка | None).
+
+    #1335: сборка начинается с СОХРАНЁННОЙ политики, а форма перезаписывает
+    только свои ручки. PATCH заменяет политику целиком, поэтому ключ, которого
+    форма не показывает (#886: ci_runner; #1264: лимит очереди review, когда
+    его поля нет в запросе), держится ровно на этом старте.
+
+    Ручки формы (_FORM_GATE_POLICY_KEYS) сначала снимаются: форма несёт их
+    целиком, и пустое поле значит «убрать ручку» (#760), а не «оставить».
+    Замок #743 перепроверяется общим путём PATCH — слою представления не верят.
+    """
+    if not any(key in form for key in _GATE_POLICY_FORM_FIELDS):
+        return None, None
+    stored = await repo.get_project(_db(request), project_id)
+    kept = project_policy.gate_policy_of(stored) if stored is not None else {}
+    gate_policy: dict[str, Any] = {
+        key: value for key, value in kept.items() if key not in _FORM_GATE_POLICY_KEYS
+    }
+    gate_policy["dor"] = str(form.get("gate_policy_dor") or "").strip() or "human"
+    gate_policy["verdict"] = (
+        str(form.get("gate_policy_verdict") or "").strip() or "human"
+    )
+    # #805: the review key is offered to EVERY project, including default
+    # — dispatching a reviewer takes no human out of any gate, so the
+    # #743 lock (which is about 'auto' on dor/verdict) does not apply.
+    # Only the recognised value is stored; anything else is dropped
+    # rather than saved as a knob nothing reads.
+    if str(form.get("gate_policy_review") or "").strip() == "dispatch":
+        gate_policy["review"] = "dispatch"
+    # #926: the release knob follows the same shape as review — one
+    # recognised value stored, everything else dropped — and for the same
+    # reason it is offered to EVERY project including default: the #743
+    # lock is about taking a human OUT of a gate, and the content of a
+    # release was already approved task by task (#812). manual is the
+    # ABSENCE of the key, which is why 'release' belongs in
+    # _FORM_GATE_POLICY_KEYS: the form shows this knob, so an un-chosen one
+    # really does mean "remove it" — otherwise the switch would only work in
+    # one direction, a stop-lever that cannot stop.
+    if (
+        str(form.get("gate_policy_release") or "").strip()
+        == project_policy.RELEASE_AUTO
+    ):
+        gate_policy["release"] = project_policy.RELEASE_AUTO
+    # #1280: теневое участие стюарда — отдельный булев ключ, замок #743 его не
+    # касается. Читается СПИСОК значений поля: скрытое "off" приезжает всегда,
+    # чекбокс добавляет "on" сверху, и «выключить» становится наблюдаемым
+    # намерением. Пустой список — отправка не из формы, и ключ, как ручка
+    # ЭТОЙ формы (_FORM_GATE_POLICY_KEYS), снят. Строго bool (#1268): явный
+    # False говорит, что участие выключили, а не что о нём не спрашивали.
+    shadow = [str(value).strip() for value in form.getlist(_SHADOW_FIELD)]
+    if shadow:
+        gate_policy[steward_dispatch.STEWARD_SHADOW_KEY] = "on" in shadow
+    # #760: an emptied field means "remove this knob", not "leave it alone".
+    ceiling = str(form.get("gate_policy_dor_max_class") or "").strip()
+    if ceiling:
+        gate_policy["dor_max_class"] = ceiling
+    risk_map, err = _parse_policy_form(str(form.get("gate_policy_risk_map") or ""))
+    if err:
+        return None, err.replace("policy:", "risk_map:")
+    if risk_map is not None:
+        gate_policy["risk_map"] = risk_map
+    _review_limit_from_form(form, gate_policy)
+    return gate_policy, None
+
+
 @router.post("/projects/{project_id}/web-edit")
 async def web_edit_project(project_id: int, request: Request):
     """Inline-edit form (#344): exactly the ProjectPatch fields."""
@@ -1235,91 +1349,10 @@ async def web_edit_project(project_id: int, request: Request):
         return _projects_error_redirect(err, project_id)
     if policy is not None:
         fields["default_branch_policy"] = policy
-    # Gate policy selects (#753). Present only for non-default projects in
-    # the template; the shared PATCH path below re-checks the default lock
-    # anyway — the presentation layer is not trusted.
-    if any(
-        key in form
-        for key in (
-            "gate_policy_dor",
-            "gate_policy_verdict",
-            "gate_policy_review",
-            "gate_policy_release",
-            "gate_policy_dor_max_class",
-            "gate_policy_risk_map",
-            _SHADOW_FIELD,
-        )
-    ):
-        gate_policy: dict[str, Any] = {
-            "dor": str(form.get("gate_policy_dor") or "human").strip() or "human",
-            "verdict": str(form.get("gate_policy_verdict") or "human").strip()
-            or "human",
-        }
-        # #805: the review key is offered to EVERY project, including default
-        # — dispatching a reviewer takes no human out of any gate, so the
-        # #743 lock (which is about 'auto' on dor/verdict) does not apply.
-        # Only the recognised value is stored; anything else is dropped
-        # rather than saved as a knob nothing reads.
-        if str(form.get("gate_policy_review") or "").strip() == "dispatch":
-            gate_policy["review"] = "dispatch"
-        # #926: the release knob follows the same shape as review — one
-        # recognised value stored, everything else dropped — and for the same
-        # reason it is offered to EVERY project including default: the #743
-        # lock is about taking a human OUT of a gate, and the content of a
-        # release was already approved task by task (#812). manual is the
-        # ABSENCE of the key, which is why 'release' belongs in
-        # _FORM_GATE_POLICY_KEYS above: the form shows this knob, so an
-        # un-chosen one really does mean "remove it". Left out of that set,
-        # the carry-through below would restore the stored 'auto' and the
-        # switch would only work in one direction — a stop-lever that cannot
-        # stop.
-        if (
-            str(form.get("gate_policy_release") or "").strip()
-            == project_policy.RELEASE_AUTO
-        ):
-            gate_policy["release"] = project_policy.RELEASE_AUTO
-        # #1280: теневое участие стюарда — не значение гейта, а отдельный
-        # булев ключ: проект просит суждения, не отдавая решения, поэтому
-        # переключатель предлагается и проекту default и замок #743 его не
-        # касается. Читается СПИСОК значений поля: скрытое "off" приезжает
-        # всегда, чекбокс добавляет "on" сверху, и «выключить» становится
-        # наблюдаемым намерением, а не выведенным из молчания браузера.
-        # Пустого списка у этой формы не бывает: скрытое поле стоит вне
-        # чекбокса и уезжает всегда. Если он всё же пуст — отправка пришла
-        # не из формы, и ключ разделяет судьбу release: он назван ручкой
-        # ЭТОЙ формы (см. _FORM_GATE_POLICY_KEYS), поэтому не приезжает =
-        # снят. Иначе выключение работало бы в одну сторону.
-        shadow = [str(value).strip() for value in form.getlist(_SHADOW_FIELD)]
-        if shadow:
-            # Строго bool: валидация ключа (#1268) не примет ни "on", ни 1, а
-            # явный False честнее удаления ключа — он говорит, что участие
-            # выключили, а не что о нём не спрашивали.
-            gate_policy[steward_dispatch.STEWARD_SHADOW_KEY] = "on" in shadow
-        # #760: the form carries the WHOLE policy, so an emptied field means
-        # "remove this knob", not "leave it alone" — the same semantics the
-        # selects already have, and the only ones a form can honestly offer.
-        ceiling = str(form.get("gate_policy_dor_max_class") or "").strip()
-        if ceiling:
-            gate_policy["dor_max_class"] = ceiling
-        risk_map, err = _parse_policy_form(str(form.get("gate_policy_risk_map") or ""))
-        if err:
-            return _projects_error_redirect(
-                err.replace("policy:", "risk_map:"), project_id
-            )
-        if risk_map is not None:
-            gate_policy["risk_map"] = risk_map
-        # Keys the form does not offer (#886: ci_runner) are carried
-        # over untouched. "The form carries the whole policy" is true of the
-        # knobs it shows; a knob it never showed cannot be said to have been
-        # emptied by the person who submitted it, and dropping it here would
-        # undo an API-set value with no trace — the silent rollback this
-        # task exists to remove.
-        stored = await repo.get_project(_db(request), project_id)
-        if stored is not None:
-            kept = project_policy.gate_policy_of(stored)
-            for key, value in kept.items():
-                if key not in _FORM_GATE_POLICY_KEYS:
-                    gate_policy[key] = value
+    gate_policy, err = await _gate_policy_from_form(request, form, project_id)
+    if err:
+        return _projects_error_redirect(err, project_id)
+    if gate_policy is not None:
         fields["gate_policy"] = gate_policy
     if not fields:
         return RedirectResponse("/projects", status_code=303)
