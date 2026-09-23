@@ -460,19 +460,23 @@ async def merged_into_base_detail(
     # branch but may be behind, and the question is about what has landed
     # upstream, not about this checkout.
     reached = await plugins.git_ops.is_ancestor(workspace, sha, f"origin/{base}")
-    if reached is None:
-        return (None, BASE_UNCHECKED_NOTE)
+    if reached is True:
+        return (True, "")
     # «Нет» от git честно только там, где гейт не переписывал сдачу сам
-    # (#1240). Спрашивается ПОСЛЕ ответа и только при «нет»: «да» остаётся
-    # «да» при любой истории ветки, а факт о сжатии меняет смысл только
-    # отрицания — ровно того ответа, который был ложным.
-    if reached is False:
-        squashed = await _squashed_by_gate(workspace, task_row, sha)
-        if squashed is None:
-            return (None, BASE_UNCHECKED_NOTE)
-        if squashed:
-            return (None, BASE_SQUASHED_BY_GATE_NOTE)
-    return (reached, "")
+    # (#1240). Спрашивается ПОСЛЕ ответа: «да» остаётся «да» при любой
+    # истории ветки, а факт о сжатии меняет смысл только того, что не «да».
+    #
+    # И при «нет», и при «не смог» (находка 599cb7e8f2b1b9e4). После сжатия и
+    # force-push сдаточный коммит держится в клоне только рефлогом; свежий
+    # клон или gc — и git его не видит, is_ancestor отвечает None. Равенство
+    # же сдачи и записанной вершины решается без git, и выбрасывать этот факт
+    # из-за молчания git значило бы назвать «не удалось» то, что известно.
+    squashed = await _squashed_by_gate(workspace, task_row, sha)
+    if squashed:
+        return (None, BASE_SQUASHED_BY_GATE_NOTE)
+    if reached is None or squashed is None:
+        return (None, BASE_UNCHECKED_NOTE)
+    return (False, "")
 
 
 async def merged_into_base(db: Any, task_row: dict[str, Any]) -> bool | None:
