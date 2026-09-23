@@ -3807,3 +3807,122 @@ async def test_a_cancelled_base_merge_leaves_no_scratch_worktree(
     assert not os.path.exists(scratch), "отменённый мерж не оставляет дерево"
     listed = await real_git("worktree", "list", "--porcelain", repo=str(repo))
     assert scratch not in (listed[1] or ""), "и git о нём тоже не помнит"
+
+
+# ---------------------------------------------------------------------------
+# #1333: принятая, но недоставленная работа доводится ИЗ РЕЕСТРА.
+#
+# 23.09.2026 #1276, #1249 и #1234 приняты в интерфейсе без судьбы PR и закрыты
+# с открытым PR. Решение (decide) работает только из needs_decision,
+# force-complete отказывает на закрытых — штатного пути доставить закрытую
+# задачу не было, и три PR влил человек мимо гейта. Действие реестра — тот же
+# deliver_on_disposition, открытый для закрытой задачи, а не второй путь мержа.
+# ---------------------------------------------------------------------------
+
+
+async def _accepted_undelivered(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, *, pr: int, title: str
+) -> int:
+    """Одобренная задача, принятая БЕЗ судьбы PR — ровно строка реестра 23.09."""
+    from tests.test_accept_without_delivery import _pr_states
+
+    _pr_states(monkeypatch, {pr: "open"})
+    task_id = await _approved_task(client, db, title=title, pr=pr)
+    resp = await client.post(f"/api/tasks/{task_id}/decide", json={"action": "accept"})
+    assert resp.status_code == 200, resp.text
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert row is not None and row["state"] == PR_OPEN, "предпосылка: строка pr_open"
+    return task_id
+
+
+async def test_an_accepted_undelivered_task_is_delivered_from_the_registry(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    from hub import config
+    from hub.config import TokenIdentity
+    from hub.services.delivery_state import undelivered_completed_tasks
+
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    task_id = await _accepted_undelivered(
+        client, db, monkeypatch, pr=1401, title="accepted in the UI"
+    )
+    assert spy.merged == [], "принятие без судьбы PR ничего не вливает (#897)"
+
+    # Агентскому токену действие закрыто: мерж — решение человека.
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {"agent-token": TokenIdentity("bot", "agent", principal_id=7)},
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = await client.post(
+        f"/api/delivery/discrepancies/{task_id}/deliver",
+        headers={"Authorization": "Bearer agent-token"},
+    )
+    assert agent.status_code == 403, agent.text
+    assert spy.merged == [], "отказ агенту не должен успеть ничего влить"
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", True)
+
+    # Человек: мерж через тот же вход гейта, и строка уходит из реестра.
+    from hub.services import orchestration as orch
+
+    gate_calls: list[int] = []
+    real_merge = orch.merge_before_completion
+
+    async def spy_merge(db_, task_):
+        gate_calls.append(int(task_["id"]))
+        return await real_merge(db_, task_)
+
+    monkeypatch.setattr(orch, "merge_before_completion", spy_merge)
+    resp = await client.post(f"/api/delivery/discrepancies/{task_id}/deliver")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["delivered"] is True
+    assert spy.merged == [1401]
+    assert gate_calls == [task_id], "доставка идёт через функцию гейта"
+    assert await repo.pipeline_merge_recorded(db, task_id, 1401)
+    listed = await undelivered_completed_tasks(db)
+    assert task_id not in [r["task_id"] for r in listed["undelivered"]]
+    assert (await repo.get_task(db, task_id))["status"] == "completed"
+
+    # Невыполненное условие гейта — названный отказ, а не мерж.
+    spy.ci = "failed"
+    red = await _accepted_undelivered(
+        client, db, monkeypatch, pr=1402, title="red ci after accept"
+    )
+    refused = await client.post(f"/api/delivery/discrepancies/{red}/deliver")
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["reason"].startswith("ci_"), refused.text
+    assert 1402 not in spy.merged
+    still = await repo.get_delivery_discrepancy(db, red)
+    assert still["state"] == PR_OPEN, "отказ оставляет строку в реестре"
+
+    # Без одобрения текущей сдачи — тоже отказ с названной причиной.
+    spy.ci = "passed"
+    unapproved = await _accepted_undelivered(
+        client, db, monkeypatch, pr=1403, title="approval went stale"
+    )
+    await repo.update_task(db, unapproved, review_verdict="changes_requested")
+    await db.commit()
+    refused = await client.post(f"/api/delivery/discrepancies/{unapproved}/deliver")
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["reason"] == "no_approved_review"
+    assert 1403 not in spy.merged
+
+
+async def test_the_registry_delivers_only_rows_it_lists_as_pr_open(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Действие реестра — не дверь к мержу чего угодно: нет строки pr_open — нет
+    мержа, даже у одобренной задачи с PR."""
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    live = await _approved_task(client, db, title="still deciding", pr=1404)
+
+    resp = await client.post(f"/api/delivery/discrepancies/{live}/deliver")
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"]["reason"] == "not_in_registry"
+    assert spy.merged == []
+
+    missing = await client.post("/api/delivery/discrepancies/999999/deliver")
+    assert missing.status_code == 404

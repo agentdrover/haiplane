@@ -6420,3 +6420,155 @@ async def test_the_projects_page_shows_shadow_participation_state(
         "подпись рядом обязана сказать, что суждение записывается, а решение "
         "остаётся человеку — иначе переключатель обещает больше, чем делает"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1333: принятие в интерфейсе умеет доставить.
+#
+# 23.09.2026 #1276, #1249 и #1234 приняты в веб-форме и закрыты со строкой
+# «Судьба PR не выбрана»: web_decide_task не знал поля pr_disposition, и
+# пустое значение было единственно возможным. Тесты читают форму так, как её
+# отправит браузер, если человек ничего не трогал.
+# ---------------------------------------------------------------------------
+
+
+def _pr_choice_blocks(page: str) -> list[str]:
+    return re.findall(r'<select name="pr_disposition".*?</select>', page, re.S)
+
+
+def _preselected(block: str) -> str:
+    chosen = re.findall(r'<option value="([^"]*)"[^>]*\bselected\b', block)
+    assert len(chosen) == 1, f"выбранным помечено {len(chosen)} вариантов: {block}"
+    return chosen[0]
+
+
+async def _decision_with_open_pr(client: AsyncClient, db, *, pr: int, approved: bool):
+    from tests.test_accept_without_delivery import (
+        _approved_task,
+        _task_awaiting_decision,
+    )
+
+    if approved:
+        return await _approved_task(client, db, title=f"web accept {pr}", pr=pr)
+    return await _task_awaiting_decision(client, db, title=f"web accept {pr}", pr=pr)
+
+
+async def test_web_accept_delivers_by_default(client: AsyncClient, db, monkeypatch):
+    from tests.test_accept_without_delivery import _install, _MergeSpy, _pr_states
+
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    _pr_states(monkeypatch, {1501: "open"})
+    task_id = await _decision_with_open_pr(client, db, pr=1501, approved=True)
+
+    page = (await client.get(f"/tasks/{task_id}")).text
+    blocks = _pr_choice_blocks(page)
+    assert len(blocks) == 1, "в форме решения есть выбор судьбы PR"
+    shown = _preselected(blocks[0])
+    assert shown == "deliver", "открытый PR и одобрение текущей сдачи — доставить"
+    assert 'value="abandon"' in blocks[0], "отказаться — видимый выбор"
+
+    # Браузер отправляет то, что показано выбранным.
+    resp = await client.post(
+        f"/tasks/{task_id}/web-decide",
+        data={"action": "accept", "pr_disposition": shown},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303, resp.text
+    assert spy.merged == [1501], "принятие в интерфейсе доставило PR"
+    assert await repo.pipeline_merge_recorded(db, task_id, 1501)
+    stored = await repo.get_delivery_discrepancy(db, task_id)
+    assert stored is None or stored["state"] != "pr_open"
+
+    # Без одобрения текущей сдачи умолчание пустое: доставлять нечего решать.
+    unapproved = await _decision_with_open_pr(client, db, pr=1502, approved=False)
+    page = (await client.get(f"/tasks/{unapproved}")).text
+    assert _preselected(_pr_choice_blocks(page)[0]) == ""
+
+
+async def test_web_accept_can_abandon_the_pr(client: AsyncClient, db, monkeypatch):
+    from tests.test_accept_without_delivery import _install, _MergeSpy, _pr_states
+
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    _pr_states(monkeypatch, {1503: "open"})
+    task_id = await _decision_with_open_pr(client, db, pr=1503, approved=True)
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-decide",
+        data={"action": "accept", "pr_disposition": "abandon"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303, resp.text
+    assert (await repo.get_task(db, task_id))["status"] == "completed"
+    assert spy.merged == [], "отказ от PR ничего не вливает"
+    stored = await repo.get_delivery_discrepancy(db, task_id)
+    assert stored is not None
+    assert stored["disposition"] == "abandon"
+
+
+async def test_every_web_decide_surface_carries_the_pr_choice(client: AsyncClient, db):
+    """Поимённо: inbox, карточка канбана, строка таблицы — у каждой кнопки
+    Accept свой селектор, и кнопка его отправляет (hx-include)."""
+    approved = await _decision_with_open_pr(client, db, pr=1504, approved=True)
+    bare = await _decision_with_open_pr(client, db, pr=1505, approved=False)
+
+    surfaces = {
+        "inbox": ("/", "inbox-pr-disposition"),
+        "task_card": ("/partials/kanban", "card-pr-disposition"),
+        "task_table": ("/tasks/list?status=needs_decision", "row-pr-disposition"),
+    }
+    for name, (url, prefix) in surfaces.items():
+        page = (await client.get(url)).text
+        for task_id, expected in ((approved, "deliver"), (bare, "")):
+            field_id = f"{prefix}-{task_id}"
+            found = re.search(
+                rf'<select name="pr_disposition" id="{field_id}".*?</select>',
+                page,
+                re.S,
+            )
+            assert found, f"{name}: нет селектора судьбы PR у #{task_id}"
+            assert _preselected(found.group(0)) == expected, name
+            assert f'hx-include="#{field_id}"' in page, (
+                f"{name}: кнопка Accept #{task_id} не отправляет выбор"
+            )
+
+
+async def test_the_inbox_registry_row_delivers_through_the_gate(
+    client: AsyncClient, db, monkeypatch
+):
+    """#1333: строка «Completed, PR still open» в инбоксе несёт кнопку
+    «доставить», и она идёт тем же путём, что REST; агенту — 403."""
+    from hub import config
+    from hub.config import TokenIdentity
+    from tests.test_accept_without_delivery import _install, _MergeSpy, _pr_states
+
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    _pr_states(monkeypatch, {1506: "open"})
+    task_id = await _decision_with_open_pr(client, db, pr=1506, approved=True)
+    await client.post(f"/api/tasks/{task_id}/decide", json={"action": "accept"})
+
+    page = (await client.get("/")).text
+    assert f'action="/tasks/{task_id}/web-deliver-undelivered"' in page
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {"agent-token": TokenIdentity("bot", "agent", principal_id=7)},
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = await client.post(
+        f"/tasks/{task_id}/web-deliver-undelivered",
+        headers={"Authorization": "Bearer agent-token"},
+        follow_redirects=False,
+    )
+    assert agent.status_code == 403
+    assert spy.merged == []
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", True)
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-deliver-undelivered", follow_redirects=False
+    )
+    assert resp.status_code == 303, resp.text
+    assert spy.merged == [1506]

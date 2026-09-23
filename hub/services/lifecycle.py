@@ -4976,6 +4976,97 @@ async def deliver_on_disposition(
     return ok, reason, bool(delivery_pr.unusable and delivery_pr.search_unanswered)
 
 
+class RegistryDeliveryRefused(ValueError):
+    """The registry's deliver action did not merge, and says why (#1333).
+
+    A class rather than an HTTPException for the same reason as
+    ``ObservationRefused``: the HTTP layer picks the code. ``not_found`` is
+    True when there is no registry row to act on at all.
+    """
+
+    def __init__(self, reason: str, message: str, *, not_found: bool = False) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+        self.not_found = not_found
+
+
+REGISTRY_DELIVERY_VIA = "registry_deliver"
+
+
+async def deliver_from_registry(
+    db: aiosqlite.Connection, task_id: int, *, by: str
+) -> dict[str, Any]:
+    """Deliver a completed task's open PR from the discrepancy registry (#1333).
+
+    23.09.2026: #1276, #1249 and #1234 were accepted in the UI without a PR
+    fate and closed with their PRs open. decide works only from
+    needs_decision and force-complete refuses closed tasks, so the only way
+    left was a manual merge past the gate.
+
+    This is NOT a second merge path. It acts only on a row the registry
+    itself lists as ``pr_open`` for a completed task, and the merge is
+    ``deliver_on_disposition`` — the same call a ``pr_disposition=deliver``
+    decision makes, with the gate's own conditions (approved current
+    submission, unchanged tip, green CI). A refusal raises
+    ``RegistryDeliveryRefused`` naming the unmet condition; the row stays.
+    Who may call it is the route's business (human only).
+    """
+    from hub.services.delivery_state import DELIVERED, PR_OPEN, task_delivery
+
+    row = await repo.get_task(db, task_id)
+    stored = await repo.get_delivery_discrepancy(db, task_id) if row else None
+    if row is None or stored is None:
+        raise RegistryDeliveryRefused(
+            "not_in_registry",
+            f"У задачи #{task_id} нет строки в реестре расхождений доставки.",
+            not_found=True,
+        )
+    if dict(row)["status"] != "completed" or stored["state"] != PR_OPEN:
+        raise RegistryDeliveryRefused(
+            "not_pr_open",
+            f"Строка реестра #{task_id} — {stored['state']} у задачи в статусе "
+            f"{dict(row)['status']}; доставлять из реестра можно только "
+            "закрытую задачу с открытым PR.",
+        )
+    ok, reason, _ = await deliver_on_disposition(
+        db, task_id, DELIVER_DISPOSITION, via=REGISTRY_DELIVERY_VIA
+    )
+    if not ok:
+        raise RegistryDeliveryRefused(
+            reason or "not_delivered",
+            f"Доставка #{task_id} из реестра не выполнена: {reason}. Условия те "
+            "же, что у гейта; строка осталась в реестре.",
+        )
+    task = dict(await repo.get_task(db, task_id) or {})
+    answer = await task_delivery(db, task)
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=task_id,
+        state=answer["state"],
+        reason=answer["reason"],
+        pr_number=answer["pr_number"],
+        delivery_path=answer["delivery_path"],
+        disposition=DELIVER_DISPOSITION,
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        f"Доставлено из реестра расхождений по решению {by}: PR "
+        f"#{task.get('pr_number')} влит через deliver_on_disposition (#1333).",
+    )
+    await db.commit()
+    return {
+        "task_id": task_id,
+        "delivered": True,
+        "state": answer["state"],
+        "pr_number": task.get("pr_number"),
+        "left_registry": answer["state"] == DELIVERED,
+    }
+
+
 async def withdraw_own_draft(
     db: aiosqlite.Connection,
     task_id: int,

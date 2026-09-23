@@ -45,6 +45,7 @@ from hub.services import project_policy
 from hub.services import steward_dispatch
 from hub.services.finding_evidence import evidence_for_findings, evidence_for_report
 from hub.services.finding_identity import finding_uids
+from hub.services.lifecycle import DELIVER_DISPOSITION
 from hub.services.review_evidence import inflight_view
 from hub.version import get_app_version
 from hub.models import (
@@ -88,6 +89,30 @@ TEMPLATES = Jinja2Templates(
 TEMPLATES.env.globals["product_name"] = brand.PRODUCT_NAME
 TEMPLATES.env.globals["product_title"] = brand.PRODUCT_TITLE
 TEMPLATES.env.globals["app_version"] = get_app_version()
+
+
+def default_pr_disposition(task: Any) -> str:
+    """What the accept form preselects for the PR's fate (#1333).
+
+    ``deliver`` only when there is something the gate could deliver: a
+    recorded PR AND an approved verdict on the CURRENT submission. Anything
+    else leaves the choice empty — the legal "not chosen" of #897 — because
+    preselecting a merge the gate would refuse anyway only teaches the reader
+    that the default means nothing. The gate still checks sha and CI on
+    submit; this is a default, not a verdict.
+    """
+
+    def _field(name: str) -> Any:
+        if isinstance(task, dict):
+            return task.get(name)
+        return getattr(task, name, None)
+
+    if _field("pr_number") and _field("review_approved_current"):
+        return DELIVER_DISPOSITION
+    return ""
+
+
+TEMPLATES.env.globals["default_pr_disposition"] = default_pr_disposition
 
 router = APIRouter()
 
@@ -1416,6 +1441,30 @@ async def web_acknowledge_delivery(task_id: int, request: Request):
     return RedirectResponse(back, status_code=303)
 
 
+@router.post("/tasks/{task_id}/web-deliver-undelivered")
+async def web_deliver_undelivered(task_id: int, request: Request):
+    """Довести строку реестра pr_open из инбокса (#1333).
+
+    Тот же сервис, что у REST: ``deliver_from_registry`` зовёт
+    ``deliver_on_disposition``, второго пути мержа нет. Отказ гейта
+    записывается в ленту задачи самим путём доставки, поэтому страница
+    просто возвращается — строка остаётся в реестре с тем же номером PR.
+    """
+    identity = require_human_or_admin(request)
+    form = await request.form()
+    try:
+        await services.deliver_from_registry(
+            _db(request), task_id, by=identity.username
+        )
+    except services.RegistryDeliveryRefused as exc:
+        if exc.not_found:
+            raise HTTPException(404, exc.message) from exc
+        raise HTTPException(409, exc.message) from exc
+    back_project = str(form.get("return_project") or "").strip()
+    back = f"/?project={quote(back_project, safe='')}" if back_project else "/"
+    return RedirectResponse(back, status_code=303)
+
+
 @router.post("/tasks/{task_id}/web-finding-dispositions")
 async def web_finding_dispositions(task_id: int, request: Request):
     """The gate says what each confirmed finding turned out to be (#876).
@@ -2659,14 +2708,22 @@ async def web_decide_task(
     instructions: str = Form(""),
     decision_summary: str = Form(""),
     record_decision: bool = Form(False),
+    # #1333: without this field an acceptance in the UI could only ever be
+    # the undelivering one — MCP and REST took pr_disposition (#1037), the
+    # form did not. Empty stays legal and is still recorded (#897).
+    pr_disposition: str = Form(""),
 ):
     _require_human_web(request)
-    body = TaskDecide(
-        action=action,
-        instructions=instructions,
-        decision_summary=decision_summary,
-        record_decision=record_decision,
-    )
+    try:
+        body = TaskDecide(
+            action=action,
+            instructions=instructions,
+            decision_summary=decision_summary,
+            record_decision=record_decision,
+            pr_disposition=pr_disposition.strip(),
+        )
+    except ValidationError as exc:
+        raise HTTPException(400, "pr_disposition: deliver, abandon or empty") from exc
     await services.decide_task(_db(request), task_id, body)
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)

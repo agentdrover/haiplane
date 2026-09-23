@@ -1,0 +1,12 @@
+{# #1333: судьба PR при принятии — одно определение на все формы web-decide.
+   Умолчание считает default_pr_disposition (hub/web.py): «доставить», только
+   если у задачи есть PR и одобрение ТЕКУЩЕЙ сдачи; иначе пусто — законное
+   «не выбрано» (#897). Гейт при доставке всё равно проверяет sha и CI. #}
+{% macro pr_disposition_select(t, field_id, css_class='') -%}
+{%- set chosen = default_pr_disposition(t) -%}
+<select name="pr_disposition" id="{{ field_id }}" class="{{ css_class }}" aria-label="Судьба PR при принятии #{{ t.id }}" title="Что сделать с PR при принятии">
+    <option value="deliver"{% if chosen == 'deliver' %} selected{% endif %}>PR: доставить</option>
+    <option value="abandon"{% if chosen == 'abandon' %} selected{% endif %}>PR: отказаться</option>
+    <option value=""{% if chosen == '' %} selected{% endif %}>PR: не выбрано</option>
+</select>
+{%- endmacro %}

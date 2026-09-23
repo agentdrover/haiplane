@@ -1094,6 +1094,25 @@ def cmd_delivery_observe(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delivery_deliver(args: argparse.Namespace) -> int:
+    """Довести строку реестра pr_open до базы под условиями гейта (#1333).
+
+    Тот же путь, что pr_disposition=deliver: хаб мержит или отказывает,
+    назвав невыполненное условие. Только человеческий токен.
+    """
+    result = _api(
+        "POST", f"/api/delivery/discrepancies/{int(args.task_id)}/deliver", {}
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(
+        f"#{args.task_id}: PR #{result.get('pr_number')} влит под условиями гейта "
+        f"(состояние доставки: {result.get('state')})."
+    )
+    return 0
+
+
 def cmd_undelivered(args: argparse.Namespace) -> int:
     """Completed tasks whose PR is neither merged nor closed (#897).
 
@@ -1154,7 +1173,8 @@ def cmd_undelivered(args: argparse.Namespace) -> int:
             f"({result.get('sweep_lookback_days', '?')} дней) с открытым PR: "
             f"источники больше не перепрашиваются, ответ застыл. Наблюдением "
             f"эту строку не закрыть — источник ещё отвечает. Выход — довезти "
-            f"работу или признать расхождение законным с причиной."
+            f"работу (oc-hub delivery-deliver <id>) или признать расхождение "
+            f"законным с причиной."
         )
         for row in frozen_pr_open:
             print(f"    #{row['task_id']} — {row.get('age_hours', '?')}ч")
@@ -2268,6 +2288,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Почему это законно. Без причины признание было бы выключателем",
     )
     p_delivery_ack.set_defaults(func=cmd_delivery_ack)
+
+    p_delivery_deliver = sub.add_parser(
+        "delivery-deliver",
+        help="Довести строку реестра с открытым PR под условиями гейта (#1333)",
+    )
+    p_delivery_deliver.add_argument("task_id", type=int)
+    p_delivery_deliver.add_argument(
+        "--json", action="store_true", help="Print raw JSON"
+    )
+    p_delivery_deliver.set_defaults(func=cmd_delivery_deliver)
 
     p_delivery_observe = sub.add_parser(
         "delivery-observe",

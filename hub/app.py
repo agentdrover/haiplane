@@ -2174,6 +2174,49 @@ async def api_acknowledge_delivery_discrepancy(
     return {"task_id": task_id, "acknowledged": True, "reason": body.reason.strip()}
 
 
+@app.post("/api/delivery/discrepancies/{task_id}/deliver")
+async def api_deliver_delivery_discrepancy(
+    task_id: int,
+    request: Request,
+    identity=Depends(require_human_or_admin),
+):
+    """Довести закрытую задачу с открытым PR из реестра расхождений (#1333).
+
+    Тот же путь, что ``pr_disposition=deliver`` при решении: мержит
+    ``deliver_on_disposition`` под условиями гейта (одобрение текущей сдачи,
+    неизменный код, зелёный CI) или отказывает, назвав невыполненное условие.
+    Второго пути мержа здесь нет.
+
+    Только человек: мерж — решение о работе, и агенту, чья задача в реестре,
+    оно не открывается (как и признание рядом). MCP-инструмента нет намеренно
+    — каталог на потолке (#1241), вход через REST, CLI и веб.
+    """
+    try:
+        return await services.deliver_from_registry(
+            _db(request),
+            task_id,
+            by=str(getattr(identity, "username", "") or "human"),
+        )
+    except services.RegistryDeliveryRefused as exc:
+        raise HTTPException(
+            404 if exc.not_found else 409,
+            detail=enrich_error_payload(
+                {
+                    "reason": exc.reason,
+                    "actor_hint": "human",
+                    "message": exc.message,
+                    "hint": (
+                        "Строки реестра: GET /api/delivery/discrepancies."
+                        if exc.not_found
+                        else "Устраните названное условие (сдача, ревью, CI) и "
+                        "повторите; признать расхождение законным — "
+                        f"POST /api/delivery/discrepancies/{task_id}/acknowledge."
+                    ),
+                }
+            ),
+        ) from exc
+
+
 @app.post("/api/deploys", response_model=DeployView)
 async def api_record_deploy(
     body: DeployCallback,

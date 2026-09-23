@@ -1,3 +1,4 @@
+{% from "partials/pr_disposition.html" import pr_disposition_select %}
 {% set undelivered = undelivered if undelivered is defined else [] %}
 {# #1038: не список задач, а счёт находок — они переживают статус задачи и
    поэтому не собираются ни одним разделом выше. #}
@@ -183,9 +184,11 @@
             <span class="badge badge-needs_decision">arbiter report</span>
         </div>
         <div class="inbox-item-actions">
+            {{ pr_disposition_select(t, 'inbox-pr-disposition-' ~ t.id) }}
             <button class="btn btn-success btn-xs"
                     hx-post="/tasks/{{ t.id }}/web-decide"
                     hx-vals='{"action": "accept"}'
+                    hx-include="#inbox-pr-disposition-{{ t.id }}"
                     hx-target="#inbox-task-{{ t.id }}"
                     hx-swap="outerHTML"
                     hx-confirm="Accept #{{ t.id }} as completed?">Accept</button>
@@ -342,6 +345,15 @@
             <button type="submit" class="btn btn-secondary btn-xs">Признать законным</button>
         </form>
         {% endif %}
+        {# #1333: довести принятую работу — тем же путём, что pr_disposition=deliver:
+           хаб мержит под условиями гейта или называет невыполненное условие.
+           Ручного мержа мимо гейта больше не нужно; агенту действие закрыто. #}
+        <form method="post" action="/tasks/{{ d.task_id }}/web-deliver-undelivered"
+              class="inbox-item-actions inbox-deliver-form">
+            <input type="hidden" name="return_project" value="{{ filter_project or '' }}">
+            <button type="submit" class="btn btn-success btn-xs"
+                    title="Влить PR #{{ d.pr_number }} под условиями гейта: одобрение, неизменный код, зелёный CI">Доставить PR #{{ d.pr_number }}</button>
+        </form>
     </article>
     {% endfor %}
 </section>
