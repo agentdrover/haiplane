@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -347,6 +348,27 @@ async def _last_signal(db) -> dict[str, Any] | None:
         (REVIEWER_UNAVAILABLE, REVIEWER_SIGNAL_CLEARED),
     )
     return dict(rows[0]) if rows else None
+
+
+def _picture(waiting: list[dict[str, Any]]) -> list[tuple[int, str]]:
+    """Набор ожидающих сдач и их причин — ключ дедупа поднятого сигнала."""
+    return sorted((int(w["task_id"]), str(w.get("reason") or "")) for w in waiting)
+
+
+async def same_picture_as_raised(db, observed: Observation) -> bool:
+    """Называет ли последнее событие подъёма тот же набор сдач и причин."""
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind=? ORDER BY id DESC LIMIT 1",
+        (REVIEWER_UNAVAILABLE,),
+    )
+    if not rows:
+        return False
+    try:
+        payload = json.loads(dict(rows[0])["payload"] or "{}")
+    except ValueError:
+        return False
+    return _picture(payload.get("waiting") or []) == _picture(observed.waiting)
 
 
 async def signal_state(db) -> str:

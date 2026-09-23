@@ -1303,17 +1303,22 @@ async def _sweep_reviewer_unavailable(db) -> None:
     провайдера, а не одной сдачи. Пока сигнал поднят, повтор идёт не чаще
     раза в сутки; как только провайдер снова создал агента, сигнал снимается
     событием снятия без ручного действия.
+
+    Пока сигнал поднят и не снимается (любой исход, включая too_young), смена
+    НАБОРА ожидающих сдач или их причин пишет обновлённое событие с текущей
+    картиной (находка 74abbd8f1a22b8b2): поднятое событие не смеет называть
+    сдачи, которых уже нет в review. Тот же набор — без нового события.
     """
     from hub.services import review_availability as ra
 
     outage = await ra.observe_outage(db)
     raised = await ra.signal_state(db) == ra.REVIEWER_UNAVAILABLE
     if outage.kind != "outage":
-        if raised:
-            await _clear_reviewer_unavailable(db, outage)
-        return
-    if raised and await repo.event_raised_since(db, ra.REVIEWER_UNAVAILABLE, "-1 day"):
-        return  # уже сказано в этих сутках
+        if not raised or await _clear_reviewer_unavailable(db, outage):
+            return
+    if raised and await ra.same_picture_as_raised(db, outage):
+        if await repo.event_raised_since(db, ra.REVIEWER_UNAVAILABLE, "-1 day"):
+            return  # тот же набор и уже сказано в этих сутках
     waiting = [row["task_id"] for row in outage.waiting]
     await repo.insert_event(
         db,
@@ -1326,6 +1331,7 @@ async def _sweep_reviewer_unavailable(db) -> None:
             "waiting_count": len(waiting),
             "waiting": outage.waiting,
             "threshold_hours": config.REVIEWER_UNAVAILABLE_HOURS,
+            "observed": outage.kind,
         },
     )
     await db.commit()
@@ -1345,17 +1351,18 @@ async def _sweep_reviewer_unavailable(db) -> None:
     )
 
 
-async def _clear_reviewer_unavailable(db, observed) -> None:
+async def _clear_reviewer_unavailable(db, observed) -> bool:
     """Снять сигнал, назвав фактическую причину — в событии и в ленте одно.
 
     Причина приходит из наблюдения сторожа; ``clearing`` может сказать
-    «держать» (too_young), и тогда не пишется ничего.
+    «держать» (too_young) — тогда снятия нет и ответ False: сигнал остаётся
+    поднятым, и его картину сверяет вызывающий.
     """
     from hub.services import review_availability as ra
 
     why = await ra.clearing(db, observed)
     if why is None:
-        return
+        return False
     await repo.insert_event(
         db,
         kind=ra.REVIEWER_SIGNAL_CLEARED,
@@ -1364,6 +1371,7 @@ async def _clear_reviewer_unavailable(db, observed) -> None:
     )
     await db.commit()
     await log_activity(db, ra.REVIEWER_SIGNAL_CLEARED, why["message"])
+    return True
 
 
 # What each human-owned instance is actually waiting for. The age alone does

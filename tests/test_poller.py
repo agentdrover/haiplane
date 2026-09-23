@@ -3393,3 +3393,65 @@ async def test_fresh_refusals_keep_a_raised_signal_instead_of_a_false_clear(
         "провайдер не ожил — сигнал, поднятый по старым отказам, держится"
     )
     assert await _reviewer_events(db, REVIEWER_SIGNAL_CLEARED) == []
+
+
+async def _held_by_fresh_refusals(
+    client, db, monkeypatch
+) -> tuple[list[int], list[int]]:
+    """Сценарий удержания: сигнал поднят по A и B, они ушли из review, C и D
+    сданы и сразу отказаны — провайдер не ожил, картина очереди сменилась."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from tests.test_review_dispatch import _submitted
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
+    old = await _refused_review_queue(
+        client, db, monkeypatch, ["spike-set-old-a", "spike-set-old-b"]
+    )
+    await _sweep_reviewer_unavailable(db)
+    for task_id in old:
+        await repo.update_task(db, task_id, status="running")
+    fresh = [
+        await _submitted(client, db, slug, policy={"review": "dispatch"})
+        for slug in ("spike-set-new-c", "spike-set-new-d")
+    ]
+    await db.commit()
+    return old, fresh
+
+
+async def test_a_held_signal_republishes_the_current_queue(client, db, monkeypatch):
+    """Находка 74abbd8f1a22b8b2 (#1262, сдача 4): пока сигнал поднят, смена
+    НАБОРА ожидающих сдач пишет обновлённое событие с текущей картиной —
+    последнее событие называет C и D, а не ушедшие из review A и B."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import REVIEWER_UNAVAILABLE, signal_state
+
+    old, fresh = await _held_by_fresh_refusals(client, db, monkeypatch)
+
+    await _sweep_reviewer_unavailable(db)
+
+    assert await signal_state(db) == REVIEWER_UNAVAILABLE
+    raised = await _reviewer_events(db, REVIEWER_UNAVAILABLE)
+    assert len(raised) == 2, "другой набор — новое событие, не суточный повтор"
+    latest = raised[-1]
+    assert latest["refused_tasks"] == sorted(fresh)
+    assert [w["task_id"] for w in latest["waiting"]] == sorted(fresh)
+    assert not set(old) & {w["task_id"] for w in latest["waiting"]}, (
+        "в текущей картине нет сдач, которых уже нет в review"
+    )
+
+
+async def test_a_held_signal_with_the_same_queue_writes_nothing_new(
+    client, db, monkeypatch
+):
+    """Тот же набор при следующем свипе нового события не даёт: дедуп по
+    набору, а не по каждому проходу."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import REVIEWER_UNAVAILABLE
+
+    await _held_by_fresh_refusals(client, db, monkeypatch)
+    await _sweep_reviewer_unavailable(db)
+    before = len(await _reviewer_events(db, REVIEWER_UNAVAILABLE))
+
+    await _sweep_reviewer_unavailable(db)
+
+    assert len(await _reviewer_events(db, REVIEWER_UNAVAILABLE)) == before
