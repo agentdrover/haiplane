@@ -1,4 +1,7 @@
-# Haiplane Hub — one-command cold start (#944).
+# Haiplane Hub — one-command cold start (#944, image refreshed #1336).
+# The image is built from this directory. Nothing is pulled from a registry
+# except the pinned bases in the Dockerfile, and `--build` is what drops a
+# previously built local image.
 #
 #   docker compose up -d --build
 #   open http://localhost:8080
