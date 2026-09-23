@@ -386,9 +386,11 @@ async def test_every_surface_reads_one_queue(
     git: _Git,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Порядок создания нарочно не совпадает с порядком готовности ни прямо,
+    # ни обратно: иначе сортировка по номеру прошла бы за сортировку по делу.
+    ready = await _submitted(client, git, "Ready to approve", "r1")
     waiting = await _submitted(client, git, "Waits for a report", "w1")
     with_findings = await _submitted(client, git, "Has findings", "h1")
-    ready = await _submitted(client, git, "Ready to approve", "r1")
     await _report(db, with_findings, confirmed=[_FINDING])
     await _report(db, ready)
 
