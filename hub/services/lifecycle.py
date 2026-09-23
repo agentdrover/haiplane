@@ -51,7 +51,7 @@ from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.review_evidence import inflight_verdict_note
 from hub.services.review_limit import (
-    note_human_bypass,
+    run_allowed_by_review_limit,
     refuse_opening_over_review_limit,
 )
 from hub.services.outcomes import outcome_status_for_task
@@ -916,9 +916,7 @@ async def create_task(
 
     result: dict[str, Any] = {}
     if normalized.run_immediately and normalized.source != TaskSource.agent:
-        row = await repo.get_task(db, task_id)
-        result = await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
-        await note_human_bypass(db, task_id, "create run_immediately")
+        result = await _run_created_task(db, task_id)
 
     await log_activity(
         db,
@@ -929,6 +927,25 @@ async def create_task(
 
     task = await _load_task_view(db, task_id)
     return CreateTaskOutcome(task=task, is_new=True)
+
+
+async def _run_created_task(db: aiosqlite.Connection, task_id: int) -> dict[str, Any]:
+    """The run half of create(run_immediately), under the review-queue limit.
+
+    #1264: it obeys the limit like every other way into running; the create
+    half is never lost to it. The row was inserted as ``running`` (the
+    normalisation decides before the id exists), so a held run returns it to
+    ``open`` — the status the API then reports, rather than a running task
+    that no dispatcher owns.
+    """
+    if not await run_allowed_by_review_limit(db, task_id, "создана"):
+        await repo.transition_status_if(
+            db, task_id, expected_from="running", new_status="open"
+        )
+        await db.commit()
+        return {}
+    row = await repo.get_task(db, task_id)
+    return await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
 
 
 async def create_subtasks_bulk(
@@ -1147,14 +1164,19 @@ async def approve_task(
     if not transitioned:
         raise HTTPException(409, "task is no longer draft (concurrent approve?)")
 
-    if body.run:
+    # #1264: the approval stands; only the run waits for the review queue.
+    run_held = bool(body.run) and not await run_allowed_by_review_limit(
+        db, task_id, "одобрена"
+    )
+    if body.run and not run_held:
         task["status"] = "open"
         await dispatch_task(db, task_id, task)
-        await note_human_bypass(db, task_id, "approve run")
 
     activity_suffix = ""
     if body.run:
         activity_suffix = f" (run={body.run})"
+    if run_held:
+        activity_suffix += " (run held by the review-queue limit)"
     if dor_override_summary is not None:
         activity_suffix += f" (force=true, missing={dor_override_summary})"
     elif body.force:

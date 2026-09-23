@@ -669,21 +669,28 @@ async def test_review_limit_keys_are_validated(client: AsyncClient, db):
     assert resp.status_code == 200, resp.text
 
 
-# Находка ce6159d160b95a4b (сдача 1): create_task(run_immediately) и
-# approve_task(run=true) открывают работу мимо лимита. Оба входа — только
-# человеческие (#360: не-agent source требует человека; /approve стоит за
-# require_human_or_admin), поэтому это выход «решение владельца»: работа
-# открывается, но обход пишется в карточку, а не проходит молча.
+# Находки ce6159d160b95a4b и a4cf336071a7be3b: create_task(run_immediately) и
+# approve_task(run=true) переводят задачу в running — лимит на них тот же, что
+# на start и pair_start (/start тоже только человеческий, и он держится).
+# Вторая половина входа — создать, одобрить — не теряется: задача остаётся
+# open, карточка и ответ API говорят, что запуск удержан.
 
 
-async def _default_queue_over_limit(db, *, limit: int, size: int) -> list[int]:
-    pid = await _project_with_policy(db, "default", {"review_limit": limit})
+async def _default_queue_over_limit(
+    db, *, limit: int, size: int, mode: str = ""
+) -> list[int]:
+    policy: dict = {"review_limit": limit}
+    if mode:
+        policy["review_limit_mode"] = mode
+    pid = await _project_with_policy(db, "default", policy)
     return [await _task_in(db, pid, status="review") for _ in range(size)]
 
 
-async def test_create_run_immediately_opens_but_names_the_human_bypass(
+async def test_create_run_immediately_creates_but_does_not_run_over_the_limit(
     client: AsyncClient, db
 ):
+    from hub import repository as repo
+
     queue = await _default_queue_over_limit(db, limit=2, size=3)
 
     resp = await client.post(
@@ -691,16 +698,23 @@ async def test_create_run_immediately_opens_but_names_the_human_bypass(
     )
 
     assert resp.status_code == 200, resp.text
-    task_id = resp.json()["id"]
-    feed = await _feed(db, task_id)
-    assert "лимит review (2, сейчас 3) обойдён решением человека" in feed
-    assert "run_immediately" in feed
+    body = resp.json()
+    assert body["status"] == "open", "ответ честно говорит: создана, не запущена"
+    row = await repo.get_task(db, body["id"])
+    assert row["status"] == "open"
+    assert not row["job_id"], "диспетчер не вызывался"
+    feed = await _feed(db, body["id"])
+    assert (
+        "Запуск удержан лимитом review (2, сейчас 3) — задача создана, "
+        "но не запущена" in feed
+    )
     assert all(f"#{q}" in feed for q in queue)
 
 
-async def test_approve_with_run_opens_but_names_the_human_bypass(
+async def test_approve_with_run_approves_but_does_not_run_over_the_limit(
     client: AsyncClient, db
 ):
+    from hub import repository as repo
     from hub import services
     from hub.models import TaskCreate
 
@@ -712,14 +726,20 @@ async def test_approve_with_run_opens_but_names_the_human_bypass(
     )
 
     assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "open", "одобрение не потеряно, запуск удержан"
+    row = await repo.get_task(db, draft.id)
+    assert row["status"] == "open"
+    assert not row["job_id"]
     feed = await _feed(db, draft.id)
-    assert "лимит review (2, сейчас 3) обойдён решением человека" in feed
-    assert "approve run" in feed
+    assert (
+        "Запуск удержан лимитом review (2, сейчас 3) — задача одобрена, "
+        "но не запущена" in feed
+    )
     assert all(f"#{q}" in feed for q in queue)
 
 
-async def test_human_entrances_stay_silent_below_the_limit(client: AsyncClient, db):
-    """Зеркало: запись — про обход, а не про каждый запуск."""
+async def test_run_entrances_run_below_the_limit(client: AsyncClient, db):
+    """Зеркало: ниже лимита запуск идёт, как сегодня, и карточка молчит."""
     await _default_queue_over_limit(db, limit=5, size=3)
 
     resp = await client.post(
@@ -727,4 +747,33 @@ async def test_human_entrances_stay_silent_below_the_limit(client: AsyncClient, 
     )
 
     assert resp.status_code == 200, resp.text
-    assert "обойдён" not in await _feed(db, resp.json()["id"])
+    assert resp.json()["status"] == "running"
+    assert "удержан" not in await _feed(db, resp.json()["id"])
+
+
+async def test_run_entrances_honour_expedite_and_warn(client: AsyncClient, db):
+    """expedite и warn работают на этих входах так же, как на pair_start."""
+    from hub import services
+    from hub.models import TaskCreate
+
+    await _default_queue_over_limit(db, limit=2, size=3)
+    resp = await client.post(
+        "/api/tasks",
+        json={
+            "title": "hotfix",
+            "run_immediately": True,
+            "class_of_service": "expedite",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "running"
+    assert "expedite" in await _feed(db, resp.json()["id"])
+
+    await _default_queue_over_limit(db, limit=2, size=0, mode="warn")
+    draft = await services.create_task(db, TaskCreate(title="draft", source="agent"))
+    resp = await client.post(
+        f"/api/tasks/{draft.id}/approve", json={"run": True, "force": True}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "running"
+    assert "Режим warn" in await _feed(db, draft.id)

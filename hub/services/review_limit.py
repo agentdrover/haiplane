@@ -149,31 +149,44 @@ async def refuse_opening_over_review_limit(
     )
 
 
-async def note_human_bypass(
-    db: aiosqlite.Connection, task_id: int, entrance: str
-) -> None:
-    """Вход, открывающий работу решением человека, лимит не держит — но называет.
+async def run_allowed_by_review_limit(
+    db: aiosqlite.Connection, task_id: int, done: str
+) -> bool:
+    """Может ли вход, запускающий работу вместе с другим действием, запустить её.
 
-    ``create_task(run_immediately)`` и ``approve_task(run=true)`` доступны только
-    человеку (#360: не-agent source требует человека; /approve — за
-    require_human_or_admin). Человек, запускающий работу при полной очереди,
-    принимает решение владельца, и это законный выход. Незаконно одно —
-    молчание: без записи обход неотличим от лимита, который не работает.
+    ``create_task(run_immediately)`` и ``approve_task(run=true)`` переводят
+    задачу в running так же, как start и pair_start, — и лимит на них тот же
+    (#1264, находка a4cf336071a7be3b): что вход только человеческий, ничего не
+    меняет, /start тоже только человеческий и держится. Отличие одно: у этих
+    входов есть вторая половина — создать или одобрить, — и она не теряется.
+    Задача остаётся open, карточка говорит, что запуск удержан, ответ API
+    отдаёт статус open. ``done`` — «создана» или «одобрена».
+
+    expedite и warn пропускают запуск с записью, как на остальных входах.
+    Сбой самой проверки запуск не держит.
     """
     row = await repo.get_task(db, task_id)
     if row is None:
-        return
+        return True
     try:
         check = await check_review_queue(db, dict(row))
-    except Exception as exc:  # noqa: BLE001 - a note must not break the start
-        log.warning("review queue note for #%s failed: %s", task_id, exc)
-        return
+    except Exception as exc:  # noqa: BLE001 - a gate that raises blocks everything
+        log.warning("review queue check for #%s failed: %s", task_id, exc)
+        return True
     if check is None:
-        return
+        return True
+    if check.outcome != HELD:
+        await _note_once(db, task_id, _card_text(check))
+        return True
     listed = ", ".join(f"#{q}" for q in check.queue)
-    text = (
-        f"Очередь review проекта «{check.project_slug}»: "
-        f"лимит review ({check.limit}, сейчас {len(check.queue)}) обойдён "
-        f"решением человека: {entrance}. В очереди: {listed} (#1264)."
+    await _note_once(
+        db,
+        task_id,
+        (
+            f"Запуск удержан лимитом review ({check.limit}, сейчас "
+            f"{len(check.queue)}) — задача {done}, но не запущена; выход: "
+            f"expedite, режим warn или поднять K. Очередь проекта "
+            f"«{check.project_slug}»: {listed} (#1264)."
+        ),
     )
-    await _note_once(db, task_id, text)
+    return False
