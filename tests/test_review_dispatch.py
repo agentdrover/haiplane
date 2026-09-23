@@ -10514,3 +10514,48 @@ async def test_a_report_landing_while_the_retry_is_prepared_buys_nothing(
 
     assert len(provider.calls) == 1, "отчёт уже есть — облако не покупается"
     assert len(await _rows_of(db, task_id)) == 1
+    # Находка 2007bee302b71bf4 (сдача 2): запись о переспросе стоит ДО
+    # вызова и обещает ревьюера. Отменённая трата обязана быть названа, иначе
+    # карточка говорит о прогоне, которого не было.
+    alerts = await _alerts_of(db, task_id)
+    asked = [i for i, a in enumerate(alerts) if "Переспрос ревью 1 из" in a]
+    assert asked, alerts
+    after = alerts[asked[-1] + 1 :]
+    assert any("отменён" in a and "отчёт" in a for a in after), (
+        f"отменённый переспрос не назван в карточке: {after}"
+    )
+
+
+async def test_a_submission_moved_during_preparation_buys_no_cloud_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка dcd7da1fa88023c5 (#1242, сдача 2): свежесть сдачи перед тратой.
+
+    Подготовка заказа ходит в сеть; за это время задачу могут вернуть в
+    работу или пересдать. Облачный агент тогда читал бы код, которого на
+    живой сдаче уже нет. Проверка общая для ВСЕХ облачных заказов, не только
+    для переспроса: здесь — самый первый вызов при сдаче.
+    """
+    from hub.services import review_dispatch as rd
+
+    provider = _Sequence(
+        [({"agent": {"id": "bc-stale"}, "run": {"id": "run-stale"}}, None)]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    real_prepare = rd.prepare_review_order
+
+    async def _task_leaves_review(db_, task, **kw):
+        order = await real_prepare(db_, task, **kw)
+        # Сдачу переставили на другую ветку, пока шла подготовка.
+        await repo.update_task(db_, int(task["id"]), branch="task-x/other")
+        await db_.commit()
+        return order
+
+    monkeypatch.setattr(rd, "prepare_review_order", _task_leaves_review)
+    task_id = await _submitted(
+        client, db, "cloud-stale-submission", policy={"review": "dispatch"}
+    )
+
+    assert provider.calls == [], "сдача сменилась — облако не покупается"
+    assert not await _rows_of(db, task_id)

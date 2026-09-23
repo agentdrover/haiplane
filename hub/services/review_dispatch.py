@@ -1855,12 +1855,15 @@ async def maybe_dispatch_review(
         principal_id=expected_principal,
     )
     model_id, profile, profile_reasons = order.model, order.profile, order.reasons
-    # Последнее слово переспроса перед тратой (находка 17a9ca6ea3451163):
-    # подготовка заказа выше ходит в сеть за диффом и правилами, и отчёт,
-    # доехавший в это окно, проверка в начале переспроса не видит. Вторая
-    # дверь делает то же самое перед своей вставкой (#1266).
-    if replaces_dispatch_id is not None and (
-        await repo.machine_reviews_of_generation(db, task_id, generation)
+    # Последнее слово перед тратой. Подготовка заказа выше ходит в сеть за
+    # диффом и правилами, и за это окно сдача могла смениться — ЛЮБОЙ
+    # облачный заказ, не только переспрос (находка dcd7da1fa88023c5): тот же
+    # фильтр свежести, что у второй двери (#1252). Для переспроса ещё и отчёт,
+    # доехавший в это окно (находка 17a9ca6ea3451163) — его отмену называет
+    # сам переспрос (_ask_again), тихий отказ здесь верен.
+    if not await _submission_still_live(db, task, branch, generation) or (
+        replaces_dispatch_id is not None
+        and await repo.machine_reviews_of_generation(db, task_id, generation)
     ):
         return False
     started = await _create_or_adopt(
@@ -3670,7 +3673,24 @@ async def _ask_again(db: aiosqlite.Connection, failed: dict[str, Any]) -> None:
         "не съедает (#1242).",
     )
     await db.commit()
-    await maybe_dispatch_review(db, task_id, replaces_dispatch_id=int(failed["id"]))
+    if await maybe_dispatch_review(db, task_id, replaces_dispatch_id=int(failed["id"])):
+        return
+    # Находка 2007bee302b71bf4: запись выше обещала ревьюера ДО вызова. Если
+    # последнее слово отменило трату потому, что отчёт успел лечь, карточка
+    # обязана это сказать — иначе она говорит о прогоне, которого не было.
+    # Прочие отказы называет сам диспетчер своим алертом.
+    if await repo.machine_reviews_of_generation(db, task_id, generation):
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            # Без метки: счёт попыток ведут записи о вызове, а не об отмене.
+            f"Переспрос ревью {asked + 1} отменён: отчёт этой сдачи "
+            "успел лечь, пока заказ готовился, — второго ревьюера не "
+            "покупали (#1242).",
+        )
+        await db.commit()
 
 
 async def _count_marked_alerts(
