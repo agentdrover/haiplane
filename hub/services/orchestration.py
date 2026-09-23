@@ -3404,9 +3404,9 @@ PR_DRAFT_PREFIX = "pr_draft"
 STACKED_BASE_PREFIX = "stacked_base"
 # #1233: гейт сам разрешил конфликт названного класса и обновил ветку.
 BASE_AUTOMERGE_PREFIX = "base_automerged"
-# #1332: чем хост проверяет сложенное автомержем. Имя одно для карточки и
-# для hub/services/validation_run.host_profile_runner — обещание в карточке
-# не расходится с тем, что прогнано.
+# #1332: чем хост проверяет сложенное автомержем — так это названо в карточке.
+# Сам профиль — hub/services/validation_run.host_profile_runner; правится одно,
+# правится и другое, иначе карточка обещает не то, что прогнано.
 HOST_PROFILE_NAME = "git diff --check и компиляция изменённых .py"
 STACK_UNKNOWN_PREFIX = "stack_unknown"
 # Deliberately NOT in TRANSIENT_GATE_PREFIXES: a stack whose order does not
