@@ -2125,7 +2125,9 @@ async def _step_finding_outcomes(state: SubmitContext) -> None:
     # The generation asked about is the CURRENT one, before the bump below: the
     # report for the submission being made does not exist yet. On a first
     # submission there are no reports and the gate is silent, which is the
-    # point — it asks only where an answer is owed.
+    # point — it asks only where an answer is owed. If the current generation
+    # went unreviewed, the question is the newest earlier report's (#1331,
+    # finding_outcome.reports_owed_an_answer).
     # Режим берётся у конвейера, если тот его назвал: done-путь объявляет
     # потолок warn, и шаг обязан его соблюдать, а не перечитывать политику
     # мимо потолка (#1122, #1155) — та же правка, что уже сделана у поверхностей.
@@ -2661,8 +2663,13 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         # (опечатка), — не повтор: обычная сдача ответила бы на него 422, и
         # здесь ответ тот же, а не молчаливый успех над выброшенными данными
         # (AC-5; Cursor #380, 97ee0d78bda22c1c).
+        # Отчёты — те же, из которых собран open_items (#1331): у поколения
+        # без ревью это отчёты последнего поколения, где ревью было. Свой
+        # перебор поколения здесь развёл бы «отвечено» и «открыто».
         already_answered: set[str] = set()
-        for report in await repo.machine_reviews_of_generation(db, task_id, generation):
+        for report in await finding_outcome.reports_owed_an_answer(
+            db, task_id, generation
+        ):
             already_answered.update(
                 str(dict(row)["finding_uid"])
                 for row in await repo.list_finding_outcomes(db, int(dict(report)["id"]))
