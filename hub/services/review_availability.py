@@ -58,12 +58,12 @@ _REASON_TEXT = {
 }
 
 
-def _refusal_clause() -> tuple[str, tuple[str, ...]]:
-    parts = " OR ".join("substr(content, 1, ?) = ?" for _ in REFUSAL_ALERT_PREFIXES)
-    params: list[str] = []
-    for prefix in REFUSAL_ALERT_PREFIXES:
-        params.extend([str(len(prefix)), prefix])
-    return f"kind='alert' AND ({parts})", tuple(params)
+#: Параметры к ``substr(content, 1, ?) = ?`` в запросах ниже: длина и начало
+#: каждого из двух алертов, по порядку ``REFUSAL_ALERT_PREFIXES``. Запросы
+#: написаны литералом на два начала: третье начало — правка и запросов тоже.
+_REFUSAL_PARAMS: tuple[Any, ...] = tuple(
+    value for prefix in REFUSAL_ALERT_PREFIXES for value in (len(prefix), prefix)
+)
 
 
 def refusal_detail(content: str) -> str:
@@ -73,13 +73,14 @@ def refusal_detail(content: str) -> str:
 
 
 async def _latest_refusal(db, task_id: int, since: str | None) -> dict[str, Any] | None:
-    clause, params = _refusal_clause()
-    sql = f"SELECT content, created_at FROM task_updates WHERE task_id=? AND {clause}"
-    args: tuple[Any, ...] = (task_id, *params)
-    if since:
-        sql += " AND created_at >= ?"
-        args += (since,)
-    rows = await fetchall(db, sql + " ORDER BY id DESC LIMIT 1", args)
+    args: tuple[Any, ...] = (task_id, *_REFUSAL_PARAMS, since or "")
+    rows = await fetchall(
+        db,
+        "SELECT content, created_at FROM task_updates WHERE task_id=? "
+        "AND kind='alert' AND (substr(content, 1, ?) = ? OR substr(content, 1, ?) = ?) "
+        "AND created_at >= ? ORDER BY id DESC LIMIT 1",
+        args,
+    )
     return dict(rows[0]) if rows else None
 
 
@@ -240,12 +241,12 @@ async def provider_outage(db, *, now: datetime | None = None) -> Outage | None:
     hours = config.REVIEWER_UNAVAILABLE_HOURS
     if hours <= 0:
         return None
-    clause, params = _refusal_clause()
     rows = await fetchall(
         db,
-        f"SELECT task_id, created_at FROM task_updates WHERE {clause} "
+        "SELECT task_id, created_at FROM task_updates WHERE kind='alert' "
+        "AND (substr(content, 1, ?) = ? OR substr(content, 1, ?) = ?) "
         "AND created_at > ? ORDER BY created_at",
-        (*params, await _last_provider_success(db)),
+        (*_REFUSAL_PARAMS, await _last_provider_success(db)),
     )
     refusals = [dict(r) for r in rows]
     tasks = sorted({int(r["task_id"]) for r in refusals})

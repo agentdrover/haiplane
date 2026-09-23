@@ -2152,6 +2152,12 @@ async def hub_submit_for_review(
     )
 
 
+def _generation_review_line(brief: dict[str, Any]) -> str:
+    """Есть ли ревью у текущей сдачи — строкой, а не догадкой по отчёту (#1262)."""
+    headline = (brief.get("current_generation_review") or {}).get("headline")
+    return f"Ревью текущей сдачи: {headline}" if headline else ""
+
+
 def _review_circle_line(brief: dict[str, Any]) -> str:
     """Строка про круг ревью, или пустая, когда заходов не было (#1235).
 
@@ -2213,13 +2219,11 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
             f"| review cycle {brief.get('review_cycle', 0)}",
         ]
     )
-    # #1262: есть ли ревью у текущей сдачи — строкой, а не догадкой по отчёту.
-    generation_line = (brief.get("current_generation_review") or {}).get("headline")
-    if generation_line:
-        parts.append("Ревью текущей сдачи: " + generation_line)
-    circle_line = _review_circle_line(brief)
-    if circle_line:
-        parts.append(circle_line)
+    parts.extend(
+        line
+        for line in (_generation_review_line(brief), _review_circle_line(brief))
+        if line
+    )
     if brief.get("description"):
         parts.append(f"\nDescription:\n{brief['description']}")
     acs = brief.get("acceptance_criteria") or []
