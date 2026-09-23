@@ -3246,3 +3246,75 @@ async def test_reviewer_answering_again_clears_the_signal(client, db, monkeypatc
     assert len(await _reviewer_events(db, REVIEWER_AVAILABLE)) == 1, (
         "снятие тоже одно, а не на каждом свипе"
     )
+
+
+async def test_refusals_of_tasks_that_left_review_raise_no_signal(
+    client, db, monkeypatch
+):
+    """Находка 49c7069e5d2547d2 (#1262, сдача 1): исторические отказы не держат
+    сигнал. Из трёх отказанных задач одна вышла из review, другая пересдана
+    новым поколением, отказа у которого не было, — в очереди осталась ОДНА
+    сдача без ревью из-за провайдера, и сигнала быть не должно. Каждая из
+    двух выбывших по отдельности подняла бы его, будь она засчитана."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import REVIEWER_UNAVAILABLE
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
+    left, resubmitted, _still = await _refused_review_queue(
+        client, db, monkeypatch, ["spike-left-a", "spike-left-b", "spike-left-c"]
+    )
+    await repo.update_task(db, left, status="running")
+    await repo.update_task(db, resubmitted, submission_generation=2)
+    await repo.record_submission(
+        db, task_id=resubmitted, generation=2, sha="c" * 40, base_branch="develop"
+    )
+    await db.commit()
+
+    await _sweep_reviewer_unavailable(db)
+
+    assert await _reviewer_events(db, REVIEWER_UNAVAILABLE) == [], (
+        "отказы прошлых сдач и задач вне review — история, а не очередь"
+    )
+
+
+async def test_signal_clears_when_the_refused_queue_drops_below_two(
+    client, db, monkeypatch
+):
+    """Находка 49c7069e5d2547d2: сигнал снимается и без нового агента, когда
+    отказанных сдач в review стало меньше двух — здесь одна получила полный
+    отчёт текущего поколения (вторая дверь, #1252)."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import (
+        REVIEWER_AVAILABLE,
+        REVIEWER_UNAVAILABLE,
+        signal_state,
+    )
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
+    first, _second = await _refused_review_queue(
+        client, db, monkeypatch, ["spike-drop-a", "spike-drop-b"]
+    )
+    await _sweep_reviewer_unavailable(db)
+    assert await signal_state(db) == REVIEWER_UNAVAILABLE
+
+    resp = await client.post(
+        f"/api/tasks/{first}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "agent_count": 1,
+            "model": "local-reviewer",
+            "raw_count": 1,
+            "findings_confirmed": [],
+            "findings_rejected": [],
+            "incomplete": False,
+            "unresolved": [],
+            "lost_dimensions": [],
+            "agent": "local-reviewer",
+        },
+    )
+    assert resp.status_code in (200, 201), resp.text
+    await _sweep_reviewer_unavailable(db)
+
+    assert await signal_state(db) == REVIEWER_AVAILABLE, (
+        "одна сдача без ревью из-за провайдера — уже не картина очереди"
+    )

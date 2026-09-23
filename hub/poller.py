@@ -1322,7 +1322,6 @@ async def _sweep_reviewer_unavailable(db) -> None:
         payload={
             "provider": ra.PROVIDER,
             "since": outage.since,
-            "refusals": outage.refusals,
             "refused_tasks": outage.refused_tasks,
             "waiting_count": len(waiting),
             "waiting": outage.waiting,
@@ -1334,9 +1333,9 @@ async def _sweep_reviewer_unavailable(db) -> None:
         db,
         ra.REVIEWER_UNAVAILABLE,
         (
-            f"Ревьюер недоступен с {outage.since}: {outage.refusals} отказов "
-            f"провайдера; в review без ревью текущей сдачи {len(waiting)}: "
-            + ", ".join(f"#{t}" for t in waiting)
+            f"Ревьюер недоступен с {outage.since}: отказано "
+            f"{len(outage.refused_tasks)} сдачам; в review без ревью текущей "
+            f"сдачи {len(waiting)}: " + ", ".join(f"#{t}" for t in waiting)
         )[:200],
     )
     log.warning(

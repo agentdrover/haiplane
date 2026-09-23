@@ -84,6 +84,18 @@ async def _latest_refusal(db, task_id: int, since: str | None) -> dict[str, Any]
     return dict(rows[0]) if rows else None
 
 
+async def _first_refusal_at(db, task_id: int, since: str) -> str:
+    """Когда начались отказы этой задачи после ``since`` — пусто, если не было."""
+    rows = await fetchall(
+        db,
+        "SELECT MIN(created_at) AS at FROM task_updates WHERE task_id=? "
+        "AND kind='alert' AND (substr(content, 1, ?) = ? OR substr(content, 1, ?) = ?) "
+        "AND created_at >= ?",
+        (task_id, *_REFUSAL_PARAMS, since),
+    )
+    return str(dict(rows[0]).get("at") or "") if rows else ""
+
+
 async def _latest_real_dispatch(
     db, task_id: int, generation: int
 ) -> dict[str, Any] | None:
@@ -170,6 +182,18 @@ def _headline(view: GenerationReview) -> str:
 
 async def generation_review(db, task_row: dict[str, Any]) -> GenerationReview:
     """Ответ «есть ли ревью у текущего поколения» для одной задачи."""
+    view, _since = await _generation_review_since(db, task_row)
+    return view
+
+
+async def _generation_review_since(
+    db, task_row: dict[str, Any]
+) -> tuple[GenerationReview, str]:
+    """Тот же ответ плюс момент сдачи текущего поколения (пусто — не записан).
+
+    Одно правило на двоих: бриф и сторож очереди читают ответ отсюда, и
+    второго определения «у сдачи нет ревью из-за провайдера» не заводится.
+    """
     task_id = int(task_row["id"])
     generation = int(task_row.get("submission_generation") or 0)
     submission = await repo.get_submission(db, task_id, generation)
@@ -195,7 +219,7 @@ async def generation_review(db, task_row: dict[str, Any]) -> GenerationReview:
         )
         view.previous_generation = await _previous_generation(db, task_id, generation)
     view.headline = _headline(view)
-    return view
+    return view, since or ""
 
 
 @dataclass
@@ -203,7 +227,6 @@ class Outage:
     """Провайдер отказывает подряд: с какого момента и кого это держит."""
 
     since: str
-    refusals: int
     refused_tasks: list[int]
     waiting: list[dict[str, Any]] = field(default_factory=list)
 
@@ -217,51 +240,63 @@ async def _last_provider_success(db) -> str:
     return str(dict(rows[0]).get("at") or "") if rows else ""
 
 
-async def _review_queue_without_review(db) -> list[dict[str, Any]]:
+async def _review_queue(
+    db, last_success: str
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Сдачи в review без ревью текущего поколения и начала их отказов.
+
+    Отказ засчитывается провайдеру, только если ``generation_review`` этой
+    сдачи называет его причиной (отказ текущего поколения, ревью нет) и он
+    случился после последнего созданного облачного агента: отказ до успеха —
+    уже не «подряд».
+    """
     rows = await fetchall(
         db,
         "SELECT * FROM tasks WHERE status='review' AND archived=0 ORDER BY id",
     )
-    waiting = []
+    waiting: list[dict[str, Any]] = []
+    starts: list[str] = []
     for row in rows:
-        view = await generation_review(db, dict(row))
-        if not view.has_review:
-            waiting.append({"task_id": int(dict(row)["id"]), "reason": view.reason})
-    return waiting
+        task = dict(row)
+        view, submitted_at = await _generation_review_since(db, task)
+        if view.has_review:
+            continue
+        waiting.append({"task_id": int(task["id"]), "reason": view.reason})
+        if view.reason != "provider_refused":
+            continue
+        began = await _first_refusal_at(
+            db, int(task["id"]), max(submitted_at, last_success)
+        )
+        if began and began > last_success:
+            waiting[-1]["refused_since"] = began
+            starts.append(began)
+    return waiting, starts
 
 
 async def provider_outage(db, *, now: datetime | None = None) -> Outage | None:
-    """Отказы провайдера после его последнего успеха, дольше порога, или None.
+    """Провайдер держит очередь review дольше порога, или None.
 
-    «Подряд» считается по хабу, не по задаче: успехом провайдера считается
-    любой созданный облачный агент. Нужны отказы минимум на двух задачах —
-    отказ на одной может быть свойством сдачи (validation_error у #1214), а
-    не провайдера.
+    Считаются только сдачи, которые СЕЙЧАС в review и у которых текущее
+    поколение стоит без ревью из-за отказа провайдера после его последнего
+    успеха. Нужно минимум две такие сдачи — отказ на одной может быть
+    свойством сдачи (validation_error у #1214), а не провайдера. Как только
+    их меньше двух или отказы моложе порога, ответ None — и сигнал снимается.
     """
     hours = config.REVIEWER_UNAVAILABLE_HOURS
     if hours <= 0:
         return None
-    rows = await fetchall(
-        db,
-        "SELECT task_id, created_at FROM task_updates WHERE kind='alert' "
-        "AND (substr(content, 1, ?) = ? OR substr(content, 1, ?) = ?) "
-        "AND created_at > ? ORDER BY created_at",
-        (*_REFUSAL_PARAMS, await _last_provider_success(db)),
-    )
-    refusals = [dict(r) for r in rows]
-    tasks = sorted({int(r["task_id"]) for r in refusals})
-    if len(tasks) < 2:
+    waiting, starts = await _review_queue(db, await _last_provider_success(db))
+    if len(starts) < 2:
         return None
-    since = str(refusals[0]["created_at"])
+    since = min(starts)
     now = now or datetime.now(UTC)
     threshold = (now - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     if since > threshold:
         return None
     return Outage(
         since=since,
-        refusals=len(refusals),
-        refused_tasks=tasks,
-        waiting=await _review_queue_without_review(db),
+        refused_tasks=[w["task_id"] for w in waiting if "refused_since" in w],
+        waiting=waiting,
     )
 
 
