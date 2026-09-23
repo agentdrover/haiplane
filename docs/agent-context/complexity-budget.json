@@ -242,14 +242,6 @@
       "measured": 62,
       "max": 72,
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/web.py",
-      "function": "web_edit_project",
-      "rule": "C901",
-      "measured": 19,
-      "max": 22,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
     }
   ]
 }
