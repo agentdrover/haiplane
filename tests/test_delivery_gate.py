@@ -21,9 +21,16 @@ import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
+from hub.integrations.git_ops import MERGE_UNCONFIRMED
 from hub.integrations.protocols import CIProbeOutcome, CIProbeResult
 from hub.integrations.registry import plugins
+from hub.models import TaskStatus
+from hub.services import validation_run
 from hub.services.delivery_gate import undelivered_warning
+from hub.services.orchestration import (
+    STACK_UNKNOWN_PREFIX,
+    STACKED_BASE_PREFIX,
+)
 from hub.services.delivery_state import (
     DELIVERED,
     PR_CLOSED,
@@ -41,6 +48,7 @@ from tests.test_pair_merge_gate import (
     _approved_pair_task,
     _drain_pair_delivery,
     _git,
+    _git_seeing,
     _git_with_state,
     _report_done,
 )
@@ -465,6 +473,37 @@ async def test_an_escalated_base_is_still_a_base(db: aiosqlite.Connection) -> No
         await db.commit()
 
 
+async def test_a_needs_info_base_holds_the_stacked_delivery(
+    db: aiosqlite.Connection,
+) -> None:
+    """#1275 AC-2: основание спросило человека — и перестало быть основанием.
+
+    running → needs_info (hub_ask_question) оставляет ветку запушенной и
+    несмерженной, а обход стопки этот статус не видел: потомок проходил
+    условие как clear и уезжал в базовую ветку с чужой работой — инцидент
+    #1186 через ещё одну дверь. Вопрос ответится, задача вернётся в running
+    и доставит себя сама, поэтому это ожидание, а не решение человека.
+    """
+    from hub.integrations.protocols import StackProbeOutcome
+
+    g = _probes(_git(CIProbeOutcome.passed, merged=True), StackProbeOutcome.stacked)
+    g.branch_ancestry = AsyncMock(return_value="head_is_descendant")
+    task_id = await _approved_pair_task(db)
+    base_id = await _base_task_with_status(
+        db, "task-1263/asked-a-question", "needs_info"
+    )
+
+    await _report_done(db, task_id)
+
+    g.merge_pr.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", "основание вернётся само — это ожидание"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    body = " ".join(u.get("content") or "" for u in updates)
+    assert f"#{base_id}" in body, "в ленте названо основание"
+    assert "task-1263/asked-a-question" in body
+
+
 async def test_the_same_commit_under_two_names_never_waits_on_itself(
     db: aiosqlite.Connection,
 ) -> None:
@@ -697,6 +736,11 @@ async def test_every_status_in_the_delivery_list_is_actually_seen(
         "fix_requested",
         "needs_decision",
         "pending_report",
+        # #1275: достижимы из running, ветка уже запушена, и каждый обычным
+        # переходом возвращается в running — основание доставит себя само.
+        "needs_info",
+        "open",
+        "claimed",
     )
     assert set(STACK_DELIVERY_STATUSES) == set(expected), (
         "член добавлен или убран — решение осознанное, значит и здесь его надо "
@@ -725,6 +769,900 @@ async def test_every_status_in_the_delivery_list_is_actually_seen(
         await repo.update_task(db, base_id, status="completed", branch="")
         await repo.update_task(db, task_id, status="completed", branch="")
         await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# #1233: мерж базы не должен стоить человеку второго вердикта, а расхождение
+# с базой обязано всплывать ДО одобрения.
+#
+# ИЗМЕРЕННЫЙ СЛУЧАЙ, 09.09.2026. #1204 одобрена в 05:48, через 14 секунд —
+# merge_failed: конфликт с только что доставленной #1205 в трёх файлах. Задача
+# ушла в needs_decision, исполнитель слил базу и пересдался шестым разом, и тот
+# же человек одобрял ту же работу второй раз. В тот же день #1206, #1208 и
+# #1216 дописывали тесты в конец одного файла: каждая пара давала конфликт
+# «оставить оба», безобидный по смыслу и стоивший круга ревью.
+
+
+def _seeing(monkeypatch, tip: str, **kw):
+    """Git-двойник с наблюдаемой вершиной ветки и клоном у проекта.
+
+    Без клона resolve_branch_tip отвечает «неоткуда смотреть» раньше, чем
+    спросит git, и любой сценарий про сдвиг вершины проверял бы пустоту.
+    """
+    from hub.services import orchestration
+
+    g = _git(**kw)
+    g.fetch_base = AsyncMock(return_value=(True, ""))
+    g.head_sha = AsyncMock(return_value=tip)
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(return_value={"repo": "/srv/ws", "base_branch": "develop"}),
+    )
+    return g
+
+
+async def _feed(db, task_id) -> str:
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    return " ".join(u.get("content") or "" for u in updates)
+
+
+_TAIL_CONFLICT = (
+    "def test_one():\n"
+    "    assert True\n"
+    "<<<<<<< HEAD\n"
+    "def test_from_the_branch():\n"
+    "    assert True\n"
+    "||||||| merged common ancestors\n"
+    "=======\n"
+    "def test_from_the_base():\n"
+    "    assert True\n"
+    ">>>>>>> origin/develop\n"
+)
+
+_OVERLAPPING_CONFLICT = (
+    "def deliver():\n"
+    "<<<<<<< HEAD\n"
+    "    return remote_unreachable()\n"
+    "||||||| merged common ancestors\n"
+    "    return unknown()\n"
+    "=======\n"
+    "    return ci_absent()\n"
+    ">>>>>>> origin/develop\n"
+)
+
+
+# ---- AC-1: расхождение названо ДО вердикта ----
+
+
+async def test_a_future_conflict_is_named_before_the_verdict(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-1 (#1233): ветка отстала от базы так, что мерж не будет чистым. Человек
+    # обязан прочитать это в брифе ДО вердикта, с именами файлов, а не через
+    # четырнадцать секунд ПОСЛЕ него — из отказа доставки, как было с #1204.
+    from hub.integrations.protocols import MergeabilityOutcome
+    from hub.services import review_brief
+
+    g = _git()
+    g.check_pr_mergeable = AsyncMock(
+        return_value=(
+            MergeabilityOutcome.conflicting,
+            "конфликт с базовой веткой: hub/poller.py, tests/test_poller.py",
+        )
+    )
+    monkeypatch.setattr(
+        "hub.services.orchestration.project_git_context",
+        AsyncMock(return_value={"repo": "/srv/ws", "base_branch": "develop"}),
+        raising=False,
+    )
+    task_id = await _approved_pair_task(db, pr_number=1204)
+    await repo.update_task(db, task_id, status="review")
+    await db.commit()
+
+    brief = await review_brief.build_review_brief(db, task_id)
+
+    assert brief is not None
+    assert brief.base_merge.state == "conflicting", (
+        "расхождение с базой обязано быть в брифе, а не всплывать отказом доставки"
+    )
+    assert brief.base_merge.files == ["hub/poller.py", "tests/test_poller.py"], (
+        "имена конфликтующих файлов — это и есть то, что человек не мог узнать"
+    )
+    assert g.check_pr_mergeable.await_count == 1, (
+        "расхождение считается там же, где его читает доставка, а не вторым счётом"
+    )
+
+
+async def test_a_clean_branch_does_not_cry_conflict_before_the_verdict(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # Обратная сторона AC-1: тревога, которая звучит всегда, не значит ничего.
+    # И «спросить не удалось» — это не «чисто»: исходы не схлопываются (#725).
+    from hub.integrations.protocols import MergeabilityOutcome
+    from hub.services import review_brief
+
+    g = _git()
+    monkeypatch.setattr(
+        "hub.services.orchestration.project_git_context",
+        AsyncMock(return_value={"repo": "/srv/ws", "base_branch": "develop"}),
+        raising=False,
+    )
+    task_id = await _approved_pair_task(db, pr_number=1205)
+    await repo.update_task(db, task_id, status="review")
+    await db.commit()
+
+    g.check_pr_mergeable = AsyncMock(
+        return_value=(MergeabilityOutcome.mergeable, "мерж пройдёт")
+    )
+    clean = await review_brief.build_review_brief(db, task_id)
+    g.check_pr_mergeable = AsyncMock(
+        return_value=(MergeabilityOutcome.unavailable, "gh не ответил")
+    )
+    blind = await review_brief.build_review_brief(db, task_id)
+
+    assert clean is not None and blind is not None
+    assert clean.base_merge.state == "clean"
+    assert clean.base_merge.files == []
+    assert blind.base_merge.state == "unknown", (
+        "«спросить не удалось» обязано читаться как оно есть, а не как «чисто»"
+    )
+
+
+# ---- AC-2: мерж базы не убивает одобрение ----
+
+
+async def test_merging_the_base_alone_keeps_the_verdict(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-2 (#1233): в ветку приехала база и больше ничего. Вершина другая,
+    # авторская работа та же — дифф ветки к базе совпал байт в байт. Вердикт
+    # остаётся текущим, доставка идёт, второго одобрения человек не тратит.
+    g = _seeing(monkeypatch, "approved0commit", merged=True)
+    task_id = await _approved_pair_task(db)
+    assert dict(await repo.get_task(db, task_id))["submission_sha"] == (
+        "approved0commit"
+    ), "предусловие: хаб закрепил одобренный коммит"
+
+    g.head_sha = AsyncMock(return_value="tip0after0base0merge")
+    g.branch_diff = AsyncMock(return_value="@@ -1,0 +2 @@\n+авторская строка\n")
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", (
+        "мерж базы — это не новая работа, и платить за него вторым вердиктом "
+        "человеку не за что"
+    )
+    assert g.merge_pr.await_count == 1
+    assert g.branch_diff.await_count == 2, (
+        "сравниваются ИМЕННО два диффа — одобренной вершины и текущей"
+    )
+    seen = [c.args[2] for c in g.branch_diff.await_args_list]
+    assert seen == ["approved0commit", "tip0after0base0merge"]
+    feed = await _feed(db, task_id)
+    assert "Вердикт остаётся текущим" in feed, (
+        "сохранённый вердикт без сказанного вслух основания — это доверие"
+    )
+
+
+async def test_an_author_edit_with_the_merge_drops_the_verdict(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # МУТАЦИОННЫЙ НАПАРНИК AC-2: правило «считать вердикт текущим при ЛЮБОМ
+    # мерже» обязано ронять именно этот тест. Дифф к базе изменился — значит в
+    # ветке есть байт, которого ревью не видело, и вердикт слетает, как сегодня.
+    g = _seeing(monkeypatch, "approved0commit", merged=True)
+    task_id = await _approved_pair_task(db)
+
+    g.head_sha = AsyncMock(return_value="tip0with0author0edit")
+    g.branch_diff = AsyncMock(
+        side_effect=[
+            "@@ -1,0 +2 @@\n+авторская строка\n",
+            "@@ -1,0 +2,2 @@\n+авторская строка\n+и ещё одна, которой ревью не видело\n",
+        ]
+    )
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] != "completed"
+    g.merge_pr.assert_not_awaited()
+    feed = await _feed(db, task_id)
+    assert "stale_approval" in feed
+    assert "авторская правка" in feed, "отказ обязан назвать, ЧТО именно не сошлось"
+
+
+async def test_an_unreadable_diff_never_keeps_the_verdict(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # Третий исход, который нельзя схлопывать с двумя: git не ответил. Прочесть
+    # молчание как «приехала только база» значило бы продлить вердикт на код,
+    # которого никто не видел, — ровно то, ради чего #572 закреплял коммит.
+    g = _seeing(monkeypatch, "approved0commit", merged=True)
+    task_id = await _approved_pair_task(db)
+
+    g.head_sha = AsyncMock(return_value="tip0after0base0merge")
+    g.branch_diff = AsyncMock(return_value=None)
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] != "completed"
+    g.merge_pr.assert_not_awaited()
+    assert "прочитать не удалось" in await _feed(db, task_id)
+
+
+# ---- AC-3 / AC-4: автомерж только названного класса ----
+
+
+async def test_tail_only_additions_are_merged_and_named(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-3 (#1233): конфликт из двух непересекающихся добавлений в конец файла —
+    # образец 09.09 (#1206, #1208, #1216). Гейт разрешает его сам, «оставить
+    # оба», гонит валидацию и судит её ПО КОДУ ВОЗВРАТА, а что именно сложено —
+    # пишет в карточку. Человека здесь не будят.
+    g = _seeing(monkeypatch, "approved0commit", merged=False)
+    g.base_merge_conflicts = AsyncMock(
+        return_value=({"tests/test_review_dispatch.py": _TAIL_CONFLICT}, "")
+    )
+    g.push_resolved_base_merge = AsyncMock(return_value=(True, "merged0by0the0gate"))
+    task_id = await _approved_pair_task(db)
+    await repo.update_task(db, task_id, validation_commands='["uv run pytest -q"]')
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] not in ("needs_decision", "completed"), (
+        "решать человеку нечего: конфликт разрешён, доставка повторится циклом"
+    )
+    g.push_resolved_base_merge.assert_awaited_once()
+    resolved = g.push_resolved_base_merge.await_args.args[4]
+    merged_text = resolved["tests/test_review_dispatch.py"]
+    assert "<<<<<<<" not in merged_text and ">>>>>>>" not in merged_text
+    assert "test_from_the_branch" in merged_text and "test_from_the_base" in merged_text
+    assert merged_text.index("test_from_the_branch") < merged_text.index(
+        "test_from_the_base"
+    ), (
+        "наше идёт первым: этот порядок сохраняет смещение авторского блока, "
+        "а с ним и вердикт, который AC-2 бережёт"
+    )
+    validate = g.push_resolved_base_merge.await_args.args[5]
+    assert validate is not None, "автомерж без прогона валидации не бывает"
+    feed = await _feed(db, task_id)
+    assert "Автомерж базы" in feed and "хвостовые добавления" in feed, (
+        "что именно сложено, обязано быть видно в карточке"
+    )
+    assert task["submission_sha"] == "merged0by0the0gate", (
+        "коммит сдачи перезакреплён на коммит, который сделал сам гейт: иначе "
+        "следующий круг увидит сдвинутую вершину и снимет вердикт, который "
+        "автомерж только что спас — то есть автомерж отменит сам себя"
+    )
+    assert "перезакреплён" in feed, "перезакрепление коммита не бывает молчаливым"
+
+
+async def test_an_overlapping_conflict_still_calls_a_human(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-4 (#1233): обе стороны правят одни и те же строки — случай #1204, он
+    # смысловой. Автомержа НЕТ, задача идёт к человеку, и причина названа, а не
+    # оставлена в виде «GitHub отказал в мерже».
+    g = _seeing(monkeypatch, "approved0commit", merged=False)
+    g.base_merge_conflicts = AsyncMock(
+        return_value=({"hub/services/orchestration.py": _OVERLAPPING_CONFLICT}, "")
+    )
+    g.push_resolved_base_merge = AsyncMock(return_value=(True, "should0not0happen"))
+    task_id = await _approved_pair_task(db)
+    await repo.update_task(db, task_id, validation_commands='["uv run pytest -q"]')
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    g.push_resolved_base_merge.assert_not_awaited()
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "смысловой конфликт обязан оставаться человеческим"
+    )
+    feed = await _feed(db, task_id)
+    assert "одни и те же строки" in feed, (
+        "человек читает причину, а не «GitHub отказал»"
+    )
+
+
+async def test_a_task_without_validation_commands_is_checked_by_the_host_profile(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # До #1332 здесь стоял отказ «у задачи нет validation_commands — проверить
+    # сложенное нечем». Теперь сложенное проверяет фиксированный профиль хоста,
+    # и он есть всегда: команды автора автомержу больше не нужны и не
+    # запускаются. Проверять по-прежнему обязаны — валидатор передаётся.
+    g = _seeing(monkeypatch, "approved0commit", merged=False)
+    g.base_merge_conflicts = AsyncMock(
+        return_value=({"tests/test_review_dispatch.py": _TAIL_CONFLICT}, "")
+    )
+    g.push_resolved_base_merge = AsyncMock(return_value=(True, "merged0by0the0gate"))
+    task_id = await _approved_pair_task(db)
+
+    await _report_done(db, task_id)
+
+    g.push_resolved_base_merge.assert_awaited_once()
+    validate = g.push_resolved_base_merge.await_args.args[5]
+    assert validate is validation_run.host_profile_runner, (
+        "сложенное проверяет профиль хоста, а не команды автора"
+    )
+
+
+async def test_a_merge_that_failed_without_a_conflict_is_not_dressed_as_one(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # Отказ мержа бывает и не про конфликт (протухший токен, защита ветки).
+    # Приписать ему конфликт значит поставить человеку неверный диагноз, а
+    # «спросить не удалось» — это не «конфликта нет» (#725).
+    g = _seeing(monkeypatch, "approved0commit", merged=False)
+    g.base_merge_conflicts = AsyncMock(return_value=({}, ""))
+    g.push_resolved_base_merge = AsyncMock(return_value=(True, "should0not0happen"))
+    task_id = await _approved_pair_task(db)
+
+    await _report_done(db, task_id)
+
+    g.push_resolved_base_merge.assert_not_awaited()
+    feed = await _feed(db, task_id)
+    assert "merge_failed" in feed
+    assert "Автомерж не применён" not in feed
+
+
+async def test_a_probe_that_could_not_look_is_not_read_as_no_conflict(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # Третий исход и здесь: проба мержа не состоялась. Прочесть это как
+    # «конфликта нет» значит поставить человеку диагноз «GitHub отказал» там,
+    # где гейт просто не смог посмотреть, — #725 с другой стороны. Найдено
+    # мутацией: без этого теста подмена None на пустой словарь проходила молча.
+    g = _seeing(monkeypatch, "approved0commit", merged=False)
+    g.base_merge_conflicts = AsyncMock(return_value=(None, "клон не отвечает"))
+    g.push_resolved_base_merge = AsyncMock(return_value=(True, "should0not0happen"))
+    task_id = await _approved_pair_task(db)
+
+    await _report_done(db, task_id)
+
+    g.push_resolved_base_merge.assert_not_awaited()
+    feed = await _feed(db, task_id)
+    assert "проба мержа базы не удалась" in feed and "клон не отвечает" in feed, (
+        "«посмотреть не удалось» обязано звучать как оно есть"
+    )
+
+
+# ---- класс автомержа, поштучно ----
+
+
+def test_the_automerge_class_is_read_from_the_diff3_ancestor() -> None:
+    # Признак берётся у git, а не у глаза: пустая секция общего предка = ни одна
+    # сторона не переписала существующую строку. Непустая = переписала, и это
+    # человеческий случай, как #1204.
+    from hub.services import base_merge
+
+    assert base_merge.classify_conflict(_TAIL_CONFLICT)[0] == base_merge.TAIL_ADDITIONS
+    kind, why = base_merge.classify_conflict(_OVERLAPPING_CONFLICT)
+    assert kind == base_merge.UNRESOLVABLE
+    assert "одни и те же строки" in why
+
+    not_at_the_end = _TAIL_CONFLICT + "def test_after_the_conflict():\n    pass\n"
+    assert base_merge.classify_conflict(not_at_the_end)[0] == base_merge.UNRESOLVABLE
+    assert base_merge.resolve_tail_additions(not_at_the_end) is None
+
+    no_ancestor = _TAIL_CONFLICT.replace("||||||| merged common ancestors\n", "")
+    assert base_merge.classify_conflict(no_ancestor)[0] == base_merge.UNRESOLVABLE, (
+        "без разметки diff3 доказать «ничего не переписано» нечем"
+    )
+
+
+def test_one_file_outside_the_class_stops_the_whole_resolution() -> None:
+    # Полуразрешённый мерж хуже неразрешённого: он выглядит как решение.
+    from hub.services import base_merge
+
+    resolutions, why = base_merge.plan_resolution(
+        {"tests/a.py": _TAIL_CONFLICT, "hub/b.py": _OVERLAPPING_CONFLICT}
+    )
+    assert resolutions == {}
+    assert "hub/b.py" in why
+
+
+# ---- механика автомержа на НАСТОЯЩЕМ git, а не на двойнике ----
+
+
+def _run_git(*args: str, cwd) -> None:
+    import subprocess
+
+    subprocess.run(args, cwd=cwd, check=True, capture_output=True)
+
+
+def _repo_with_a_tail_conflict(
+    tmp_path,
+    branch_tail: str = "\n\ndef test_from_the_branch():\n    pass\n",
+    name: str = "tests_suite.py",
+):
+    """Клон, где база и ветка дописали каждая свой хвост одного файла.
+
+    Ровно случай 09.09.2026: #1206, #1208 и #1216 дописывали тесты в конец
+    tests/test_review_dispatch.py, и каждая пара давала конфликт «оставить оба».
+    """
+    import subprocess
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "develop", str(origin)], check=True
+    )
+    repo = tmp_path / "work"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    _run_git("git", "config", "user.email", "t@example.com", cwd=repo)
+    _run_git("git", "config", "user.name", "t", cwd=repo)
+    suite = repo / name
+    suite.write_text("def test_common():\n    assert True\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-q", "-m", "common", cwd=repo)
+    _run_git("git", "push", "-q", "origin", "develop", cwd=repo)
+
+    _run_git("git", "checkout", "-q", "-b", "task-1233/probe", cwd=repo)
+    suite.write_text(suite.read_text() + branch_tail)
+    _run_git("git", "commit", "-q", "-am", "branch tail", cwd=repo)
+    _run_git("git", "push", "-q", "origin", "task-1233/probe", cwd=repo)
+
+    _run_git("git", "checkout", "-q", "develop", cwd=repo)
+    suite.write_text(
+        "def test_common():\n    assert True\n\n\ndef test_from_the_base():\n    pass\n"
+    )
+    _run_git("git", "commit", "-q", "-am", "base tail", cwd=repo)
+    _run_git("git", "push", "-q", "origin", "develop", cwd=repo)
+    return repo
+
+
+async def test_the_automerge_is_judged_by_the_return_code_not_the_output(
+    tmp_path,
+) -> None:
+    # Ограничение из постановки, и оно наблюдалось дважды 09.09: «All checks
+    # passed» при коде возврата 2. Здесь настоящий git и настоящий конфликт:
+    # красная валидация не пушит НИЧЕГО, зелёная — пушит слитую ветку, и в ней
+    # лежат оба блока, авторский первым.
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import base_merge
+
+    repo = _repo_with_a_tail_conflict(tmp_path)
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1233/probe")
+
+    files, why = await ops.base_merge_conflicts(
+        str(repo), "develop", "task-1233/probe", 1233, pinned
+    )
+    assert files, f"настоящий конфликт обязан быть виден: {why}"
+    resolutions, note = base_merge.plan_resolution(files)
+    assert resolutions and "хвостовые добавления" in note
+
+    before = _tip(repo, "task-1233/probe")
+
+    async def _red(_path):
+        return 2, "All checks passed"  # ровно та ловушка 09.09
+
+    ok, detail = await ops.push_resolved_base_merge(
+        str(repo), "develop", "task-1233/probe", 1233, resolutions, _red, pinned, files
+    )
+    assert not ok and "код возврата 2" in detail, (
+        "хвост вывода не доказательство — судим по коду возврата"
+    )
+    assert _tip(repo, "task-1233/probe") == before, "красная валидация не пушит ничего"
+
+    async def _green(_path):
+        return 0, "ok"
+
+    ok, sha = await ops.push_resolved_base_merge(
+        str(repo),
+        "develop",
+        "task-1233/probe",
+        1233,
+        resolutions,
+        _green,
+        pinned,
+        files,
+    )
+    assert ok, sha
+    assert _tip(repo, "task-1233/probe") != before, "зелёная валидация обновляет ветку"
+    _run_git("git", "fetch", "-q", "origin", cwd=repo)
+    import subprocess
+
+    merged = subprocess.run(
+        ["git", "show", "origin/task-1233/probe:tests_suite.py"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "<<<<<<<" not in merged
+    assert merged.index("test_from_the_branch") < merged.index("test_from_the_base"), (
+        "авторский блок остаётся первым: это и сохраняет его смещение в диффе"
+    )
+    # И наблюдение, ради которого этот тест написан на настоящем git, а не на
+    # двойнике: сырой `git diff base...tip` после мержа базы НЕ совпадает с
+    # прежним, даже когда авторская работа буква в букву та же. Меняются
+    # строка index (блоб базы стал другим) и смещения ханков. Поэтому
+    # сохранение вердикта в этом пути стоит не на сравнении диффов, а на том,
+    # что коммит сделал сам гейт, — и он перезакрепляет коммит сдачи.
+    author_before = await ops.branch_diff(str(repo), "develop", before)
+    author_after = await ops.branch_diff(
+        str(repo), "develop", _tip(repo, "task-1233/probe")
+    )
+    assert not base_merge.author_diff_unchanged(author_before, author_after)[0], (
+        "если это когда-нибудь совпадёт — сравнение диффов станет годным и "
+        "здесь, и перезакрепление коммита можно будет снять"
+    )
+
+
+def _tip(repo, branch: str) -> str:
+    import subprocess
+
+    _run_git("git", "fetch", "-q", "origin", cwd=repo)
+    return subprocess.run(
+        ["git", "rev-parse", f"origin/{branch}"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+# ---- находки машинного ревью #345 по сдаче №1 (#1233) ----
+
+
+async def test_the_automerge_anchors_on_the_pinned_commit_not_the_branch_tip(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Автомерж строит дерево на ЗАКРЕПЛЁННОМ коммите, а не на вершине ветки.
+
+    Находка ee0c1eb000fe012b, и она была настоящей. Между сверкой с одобрением
+    и этим шагом стоят проба CI, условие стопки и сам отказ мержа; в это окно в
+    ветку может лечь чужой пуш. Пока автомерж брал ``origin/<branch>``, этот
+    пуш попадал в слитый коммит И в перезакрепление — то есть человеческий
+    вердикт переезжал на код, которого человек не видел.
+    """
+    g = _seeing(monkeypatch, "approved0commit", merged=False)
+    g.base_merge_conflicts = AsyncMock(return_value=({}, ""))
+    task_id = await _approved_pair_task(db)
+    await repo.update_task(db, task_id, validation_commands='["uv run pytest -q"]')
+    await db.commit()
+    pinned = dict(await repo.get_task(db, task_id))["submission_sha"]
+    assert pinned, "сцена бессмысленна без закрепления"
+
+    await _report_done(db, task_id)
+
+    g.base_merge_conflicts.assert_awaited_once()
+    assert g.base_merge_conflicts.await_args.args[4] == pinned, (
+        "проба конфликта задаётся о закреплённом коммите: вершина ветки могла "
+        "уехать, и мержить её значило бы взять неодобренный код"
+    )
+
+
+async def test_an_unpinned_submission_gets_no_automerge_at_all(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Нет закрепления — нет якоря, и вершину ветки автомерж не берёт (#1233)."""
+    g = _seeing(monkeypatch, "approved0commit", merged=False)
+    g.base_merge_conflicts = AsyncMock(return_value=({}, ""))
+    task_id = await _approved_pair_task(db)
+    await repo.update_task(db, task_id, submission_sha="")
+    await db.commit()
+
+    await _report_done(db, task_id)
+
+    g.base_merge_conflicts.assert_not_awaited()
+    feed = await _feed(db, task_id)
+    assert "не закреплён" in feed, "причина отказа называется, а не молчит"
+
+
+async def test_an_automerge_without_a_commit_never_wipes_the_pin(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Успех с пустым sha не стирает закрепление (находка 66436b8dfb8ce18b).
+
+    Пустая строка в submission_sha читается гейтом как «сверка не проводилась»,
+    и доставка идёт БЕЗ неё (#572). Тихая потеря закрепления опаснее
+    несостоявшегося автомержа, поэтому здесь зовут человека.
+    """
+    g = _seeing(monkeypatch, "approved0commit", merged=False)
+    g.base_merge_conflicts = AsyncMock(
+        return_value=({"tests/test_review_dispatch.py": _TAIL_CONFLICT}, "")
+    )
+    g.push_resolved_base_merge = AsyncMock(return_value=(True, "   "))
+    task_id = await _approved_pair_task(db)
+    await repo.update_task(db, task_id, validation_commands='["uv run pytest -q"]')
+    await db.commit()
+    pinned = dict(await repo.get_task(db, task_id))["submission_sha"]
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["submission_sha"] == pinned, (
+        "закрепление осталось на месте: пустое закрепление снимает сверку с "
+        "одобрением, а её снимать никто не просил"
+    )
+    feed = await _feed(db, task_id)
+    assert "коммит слитой ветки не назван" in feed
+
+
+async def test_a_path_both_sides_created_is_not_a_tail_addition() -> None:
+    """add/add одного пути — не хвостовые добавления (находка db22bf1440791d71).
+
+    Воспроизведено на настоящем git: ветка и база завели каждая свой thing.py,
+    diff3 дал ПУСТОГО общего предка и ничего до маркера, класс выходил
+    «хвостовые добавления», а «оставить оба» склеивало два целых файла — в
+    Python побеждает последнее определение, то есть версия базы молча
+    переписывала авторскую. Пустой предок доказывает «ничего не переписано»
+    только тогда, когда переписывать БЫЛО что: эти строки стоят над маркером.
+    """
+    from hub.services import base_merge
+
+    add_add = (
+        "<<<<<<< HEAD\n"
+        "def handle(x):\n"
+        "    return x + 1\n"
+        "||||||| merged common ancestors\n"
+        "=======\n"
+        "def handle(x):\n"
+        "    return x * 100\n"
+        ">>>>>>> origin/develop\n"
+    )
+    kind, why = base_merge.classify_conflict(add_add)
+    assert kind == base_merge.UNRESOLVABLE, (
+        "склейка двух целых файлов не бывает «ничего не переписано»"
+    )
+    assert "завели этот путь заново" in why
+    assert base_merge.resolve_tail_additions(add_add) is None
+    # А настоящий хвост к существующему файлу разрешается по-прежнему.
+    assert base_merge.classify_conflict(_TAIL_CONFLICT)[0] == base_merge.TAIL_ADDITIONS
+
+
+async def test_the_gate_path_runs_the_validation_and_stops_on_a_red_code(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Красный код возврата останавливает ГЕЙТ, а не только git_ops (#1233).
+
+    Находка 43e5205bf49151b7: AC-3 подменял push_resolved_base_merge двойником
+    и проверял лишь, что callback не None. «Callback передан» и «callback
+    вызван, а его код возврата решил судьбу доставки» — разные утверждения, и
+    ограничение постановки (09.09 дважды видели «All checks passed» при коде 2)
+    про второе. Здесь двойник ВЫЗЫВАЕТ переданную валидацию.
+    """
+    seen: dict[str, object] = {}
+
+    async def _push(
+        repo, base, branch, task_id, resolutions, validate=None, tip="", probed=None
+    ):
+        seen["rc"], seen["log"] = await validate("/tmp/basemerge")
+        seen["tip"] = tip
+        seen["probed"] = probed
+        return False, f"валидация после автомержа упала (код возврата {seen['rc']})"
+
+    g = _seeing(monkeypatch, "approved0commit", merged=False)
+    g.base_merge_conflicts = AsyncMock(
+        return_value=({"tests/test_review_dispatch.py": _TAIL_CONFLICT}, "")
+    )
+    g.push_resolved_base_merge = _push
+    monkeypatch.setattr(
+        validation_run,
+        "host_profile_runner",
+        AsyncMock(return_value=(2, "All checks passed")),
+    )
+    task_id = await _approved_pair_task(db)
+    await repo.update_task(db, task_id, validation_commands='["uv run pytest -q"]')
+    await db.commit()
+    pinned = dict(await repo.get_task(db, task_id))["submission_sha"]
+
+    await _report_done(db, task_id)
+
+    assert seen.get("rc") == 2, "валидация обязана быть ВЫЗВАНА, а не только передана"
+    assert seen.get("log") == "All checks passed", (
+        "ровно ловушка 09.09: зелёный хвост при красном коде возврата"
+    )
+    assert seen.get("tip") == pinned, "и мержит она закреплённое, а не вершину"
+    # Находка 2327bd9255c601cc: пуш сверяет конфликт с ТОЙ ЖЕ пробой, по
+    # которой считалось разрешение. Гейт, забывший её передать, превращал бы
+    # каждый хвостовой автомерж в отказ «не с чем сверить» — молча и навсегда.
+    assert seen.get("probed") == {"tests/test_review_dispatch.py": _TAIL_CONFLICT}, (
+        "гейт обязан отдать пушу ту пробу, по которой посчитано разрешение"
+    )
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "красный код возврата ведёт к человеку, а не к доставке"
+    )
+    assert task["submission_sha"] == pinned, "провалившийся автомерж не перезакрепляет"
+    feed = await _feed(db, task_id)
+    assert "Автомерж базы" not in feed, "несостоявшийся автомерж не пишет об успехе"
+
+
+async def test_a_push_in_the_await_window_never_rides_the_verdict_in(
+    tmp_path,
+) -> None:
+    """НАСТОЯЩИЙ git: неодобренный пуш не попадает под чужой вердикт (#1233).
+
+    Находка ee0c1eb000fe012b, воспроизведённая делом ДО починки: автомерж брал
+    ``origin/<branch>``, поэтому коммит, легший в ветку после одобрения,
+    оказывался предком слитого — и предком того самого sha, который уезжал в
+    submission_sha. Человеческий вердикт переезжал на код, которого человек не
+    видел. Цена ошибки здесь выше всех прочих находок вместе, поэтому проверка
+    на настоящем git, а не на двойнике.
+    """
+    import subprocess
+
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import base_merge
+
+    repo = _repo_with_a_tail_conflict(tmp_path)
+    approved = _tip(repo, "task-1233/probe")
+
+    ops = GitOpsIntegration()
+    files, why = await ops.base_merge_conflicts(
+        str(repo), "develop", "task-1233/probe", 1233, approved
+    )
+    assert files, why
+    resolutions, _ = base_merge.plan_resolution(files)
+    assert resolutions
+
+    # ОКНО ОЖИДАНИЯ: между пробой и пушем в ветку ложится чужая работа.
+    _run_git("git", "checkout", "-q", "task-1233/probe", cwd=repo)
+    _run_git("git", "reset", "-q", "--hard", "origin/task-1233/probe", cwd=repo)
+    (repo / "unreviewed.py").write_text("SECRET = 'этого никто не одобрял'\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-q", "-m", "push in the await window", cwd=repo)
+    _run_git("git", "push", "-q", "origin", "task-1233/probe", cwd=repo)
+    intruder = _tip(repo, "task-1233/probe")
+    assert intruder != approved
+
+    async def _green(_path):
+        return 0, "ok"
+
+    ok, detail = await ops.push_resolved_base_merge(
+        str(repo),
+        "develop",
+        "task-1233/probe",
+        1233,
+        resolutions,
+        _green,
+        approved,
+        files,
+    )
+    assert not ok, (
+        "ветка ушла с одобренного коммита — автомерж обязан отказать, а не "
+        "слить и перезакрепить вердикт на неодобренное"
+    )
+    assert "ушла с закреплённого коммита" in detail
+    assert _tip(repo, "task-1233/probe") == intruder, (
+        "отказавший автомерж не двигает ветку и ничего не затирает"
+    )
+    carries = subprocess.run(
+        ["git", "cat-file", "-e", f"{approved}:unreviewed.py"],
+        cwd=repo,
+        capture_output=True,
+    )
+    assert carries.returncode != 0, "неодобренного кода нет в закреплённом коммите"
+
+
+async def test_an_unreadable_merge_commit_is_a_refusal_not_an_empty_pin(
+    tmp_path, monkeypatch
+) -> None:
+    """(True, "") не бывает: пустое закрепление хуже несостоявшегося автомержа.
+
+    Находка 66436b8dfb8ce18b. ``rev-parse HEAD`` читался без кода возврата, и
+    его молчание превращалось в успех с пустым sha. Пустота уезжала в
+    submission_sha, а пустое закрепление гейт читает как «сверка с одобрением
+    не проводилась» и доставляет БЕЗ неё (#572) — то есть неудача чтения
+    снимала бы проверку, ради которой закрепление и заведено.
+    """
+    from hub.integrations import git_ops as git_ops_mod
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import base_merge
+
+    repo = _repo_with_a_tail_conflict(tmp_path)
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1233/probe")
+    files, why = await ops.base_merge_conflicts(
+        str(repo), "develop", "task-1233/probe", 1233, pinned
+    )
+    assert files, why
+    resolutions, _ = base_merge.plan_resolution(files)
+
+    real_git = git_ops_mod._git
+
+    async def _blind_rev_parse(*args, **kw):
+        if args[:2] == ("rev-parse", "HEAD"):
+            return 128, "", "fatal: ambiguous argument 'HEAD'"
+        return await real_git(*args, **kw)
+
+    monkeypatch.setattr(git_ops_mod, "_git", _blind_rev_parse)
+
+    async def _green(_path):
+        return 0, "ok"
+
+    ok, detail = await ops.push_resolved_base_merge(
+        str(repo),
+        "develop",
+        "task-1233/probe",
+        1233,
+        resolutions,
+        _green,
+        pinned,
+        files,
+    )
+
+    assert not ok, "неудача чтения коммита — это отказ, а не успех"
+    assert detail.strip(), "у отказа всегда есть названная причина"
+    assert "закрепление не трогаем" in detail
+    assert _tip(repo, "task-1233/probe") == pinned, (
+        "ветка не сдвинулась: пушить то, чего не смогли назвать, автомерж не станет"
+    )
+
+
+async def test_a_branch_rewound_under_the_automerge_is_not_clobbered(
+    tmp_path,
+) -> None:
+    """Аренда пуша: ветку, уехавшую ПОСЛЕ пробы, автомерж не затирает (#1233).
+
+    Дерево строится на закреплённом коммите, поэтому обычный пуш и так отказал
+    бы любому коммиту ПОВЕРХ него — не fast-forward. Аренда закрывает другой
+    случай, который простой пуш пропустил бы молча: ветку откатили НАЗАД (чужой
+    force-push в окно ожидания). Слитый коммит тогда оказывается потомком новой
+    вершины, обычный пуш прошёл бы как fast-forward и стёр бы этот откат.
+    Момент отката подстроен точно: ``validate`` вызывается между подготовкой
+    дерева и пушем, то есть ровно в то окно, которое аренда и стережёт.
+    """
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import base_merge
+
+    repo = _repo_with_a_tail_conflict(tmp_path)
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1233/probe")
+    rewound_to = _run_git_out("git", "rev-parse", f"{pinned}^", cwd=repo)
+
+    files, why = await ops.base_merge_conflicts(
+        str(repo), "develop", "task-1233/probe", 1233, pinned
+    )
+    assert files, why
+    resolutions, _ = base_merge.plan_resolution(files)
+
+    async def _green_but_someone_rewinds(_path):
+        # Окно между подготовкой дерева и пушем — здесь и живёт гонка.
+        _run_git(
+            "git",
+            "push",
+            "-q",
+            "--force",
+            "origin",
+            f"{rewound_to}:refs/heads/task-1233/probe",
+            cwd=repo,
+        )
+        return 0, "ok"
+
+    ok, detail = await ops.push_resolved_base_merge(
+        str(repo),
+        "develop",
+        "task-1233/probe",
+        1233,
+        resolutions,
+        _green_but_someone_rewinds,
+        pinned,
+        files,
+    )
+
+    assert not ok, (
+        "ветку откатили под нами — пуш обязан отказать, а не пройти "
+        "fast-forward'ом поверх чужого отката"
+    )
+    assert _tip(repo, "task-1233/probe") == rewound_to, (
+        "чужой откат остался на месте: автомерж ничего не затёр"
+    )
+
+
+def _run_git_out(*args: str, cwd) -> str:
+    import subprocess
+
+    return subprocess.run(
+        args, cwd=cwd, capture_output=True, text=True, check=True
+    ).stdout.strip()
 
 
 async def _stranded_base(db: aiosqlite.Connection, branch: str) -> int:
@@ -2477,3 +3415,796 @@ async def test_a_failed_replacement_search_waits_instead_of_calling_a_human(
     assert db.in_transaction is False, (
         "проход по этой ветке не должен оставлять соединение в открытой транзакции"
     )
+
+
+# ---- #1286: решение «на доработку» закрывает окно одобрения ----------------
+#
+# Наблюдено на проде 22.09.2026 дважды, на #1162 и #1206. Возврат на доработку
+# сбрасывал цикл ревью и метку арбитра, но вердикт оставлял: одобрение
+# продолжало относиться к текущей сдаче до самой пересдачи. Отсюда два неверных
+# исхода, и это ровно два теста ниже: свип доставлял работу, которую человек
+# только что вернул, а как только исполнитель пушил правки — отказ по
+# stale_approval уводил задачу в needs_decision к тому же человеку.
+
+
+async def _returned_for_rework(db: aiosqlite.Connection, task_id: int) -> None:
+    """Человек вернул одобренную работу на доработку, и исполнитель вернулся.
+
+    Задача проходит тот же путь, что на проде: needs_decision → решение rework
+    (диспетчера в тестах нет, поэтому задача уходит в ``open``) → исполнитель
+    снова берёт её в pair-режиме и оказывается в ``running`` — состоянии, в
+    котором её и видит свип доставки.
+    """
+    from hub import services
+    from hub.models import TaskDecide
+
+    await repo.update_task(db, task_id, status="needs_decision")
+    await db.commit()
+    await services.decide_task(
+        db, task_id, TaskDecide(action="rework", instructions="Доделать AC-2.")
+    )
+    await services.pair_start_task(db, task_id, caller="dev")
+
+
+async def test_rework_stops_delivery_of_the_returned_submission(
+    db: aiosqlite.Connection,
+) -> None:
+    # AC-1: между возвратом и первой правкой ветка стоит там же, где её
+    # одобрили, а CI зелёный — то есть выполнено ВСЁ, чего свип ждёт. Решение
+    # человека «ещё не берём» и есть единственное, что должно его остановить.
+    g = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+
+    await _returned_for_rework(db, task_id)
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] != "completed", (
+        "возвращённую работу доставил свип — машина отменила решение человека"
+    )
+    g.merge_pr.assert_not_awaited()
+    from hub.services.orchestration import review_approved_for_current_submission
+
+    assert not review_approved_for_current_submission(task), (
+        "одобрение обязано перестать быть текущим сразу, а не к пересдаче"
+    )
+
+
+async def test_a_reworked_task_waits_for_resubmission_not_a_human(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-2: исполнитель сделал ровно то, о чём его попросили, — запушил правки
+    # на ту же ветку. Вершина разошлась с закреплённым коммитом, и на прежнем
+    # коде это давало stale_approval и возврат к человеку, который только что
+    # принял решение. Одобрения больше нет — значит и сверять нечего: задача
+    # просто ждёт пересдачи.
+    g = _git_seeing(monkeypatch, "approved0commit")
+    task_id = await _approved_pair_task(db)
+    await _returned_for_rework(db, task_id)
+
+    g.head_sha = AsyncMock(return_value="rework0pushed")
+    await _drain_pair_delivery(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", (
+        "правка по решению человека не должна возвращаться к нему же вопросом"
+    )
+    g.merge_pr.assert_not_awaited()
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert not any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    ), "возврат на доработку не должен рождать второе решение"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    feed = " ".join(u.get("content") or "" for u in updates)
+    assert "stale_approval" not in feed, (
+        f"гейт расхождения не должен даже спрашиваться: одобрения нет — {feed}"
+    )
+
+
+# ---- #1271: разбиение перечней, а не копия перечня ----
+#
+# Тест выше (test_every_status_that_owns_an_unmerged_branch_is_a_base) сверяет
+# STACK_DELIVERY_STATUSES с копией, выписанной руками: он ловит удаление члена,
+# но не заставляет решать про статус, о котором автор не подумал (#1186:
+# pending_report, его повтор, needs_info). Здесь перебирается TaskStatus
+# целиком: у каждого члена должно быть решение — либо он в перечне, либо
+# исключён с названной причиной.
+
+# Статус исключён, и вот почему. Причина — наблюдение о коде, а не мнение.
+STACK_EXCLUDED_STATUSES: dict[str, str] = {
+    TaskStatus.draft.value: (
+        "не одобрена к работе: переходы из draft ведут только в open или "
+        "rejected, ветки задачи ещё нет, стопке не на чем стоять"
+    ),
+    TaskStatus.rejected.value: (
+        "reject_task отказывает всему, кроме draft — отклонённая задача ветки "
+        "не заводила"
+    ),
+    TaskStatus.completed.value: (
+        "принятая без доставки — не ожидание, а вопрос к человеку: обходится "
+        "отдельно через list_undelivered_completed_branch_tasks (#1204), "
+        "доставленная — стопки не образует"
+    ),
+    TaskStatus.failed.value: (
+        "финальный статус (FINAL_STATUSES), выхода из него в "
+        "LIFECYCLE_TRANSITIONS нет — ждать нечего, поэтому не в перечне "
+        "ожидания: обходится отдельно через STACK_TERMINAL_STATUSES как "
+        "основание, которое само не доставится, и стопка на нём идёт к "
+        "человеку (#1275)"
+    ),
+}
+
+
+def test_every_task_status_is_either_stacked_or_excluded_with_a_reason() -> None:
+    """#1271 AC-1: новый член TaskStatus без решения роняет этот тест.
+
+    Решение — одно из двух: статус в STACK_DELIVERY_STATUSES или в словаре
+    исключённых с причиной. Словарь открытых находок (#1271) закрыт в #1275.
+    Члены берутся из перечисления, а не из головы — ровно та ошибка,
+    из-за которой pending_report и needs_info были упущены в #1186.
+    """
+    from hub.services.orchestration import STACK_DELIVERY_STATUSES
+
+    stacked = set(STACK_DELIVERY_STATUSES)
+    buckets = {
+        "STACK_DELIVERY_STATUSES": stacked,
+        "STACK_EXCLUDED_STATUSES": set(STACK_EXCLUDED_STATUSES),
+    }
+    members = {status.value for status in TaskStatus}
+
+    undecided = sorted(members - set().union(*buckets.values()))
+    assert not undecided, (
+        f"статус без решения: {undecided} — внесите его в "
+        "STACK_DELIVERY_STATUSES (может владеть несмерженной веткой) или в "
+        "STACK_EXCLUDED_STATUSES с причиной"
+    )
+    for name, bucket in buckets.items():
+        stale = sorted(bucket - members)
+        assert not stale, f"{name} называет статусы, которых нет в TaskStatus: {stale}"
+    names = list(buckets)
+    for i, left in enumerate(names):
+        for right in names[i + 1 :]:
+            both = sorted(buckets[left] & buckets[right])
+            assert not both, f"статус решён дважды ({left} и {right}): {both}"
+    for status, reason in STACK_EXCLUDED_STATUSES.items():
+        assert reason.strip(), f"исключение {status} без причины"
+
+
+# ---- #1271 AC-2: у каждого транзитного префикса своя подсказка ----
+
+# Префиксы, которым общая подсказка положена по смыслу: ключ делит подсказку
+# со значением, и сказано почему.
+TRANSIENT_SHARED_HINTS: dict[str, tuple[str, str]] = {
+    STACK_UNKNOWN_PREFIX: (
+        STACKED_BASE_PREFIX,
+        "повторяемый unknown стопки ждёт того же, что стопка: следующего цикла, "
+        "а не пересдачи; CI уже зелёный (#1186)",
+    ),
+}
+
+
+async def _transient_hint(db: aiosqlite.Connection, monkeypatch, prefix: str) -> str:
+    """Подсказка, которую лесенка done-flow даёт отказу с этим префиксом."""
+    from hub.services import orchestration
+
+    task_id = await _approved_pair_task(db, pr_number=4242)
+    detail = f"{prefix}: проба #1271"
+
+    async def _refuse(db_, task_):
+        return False, detail
+
+    monkeypatch.setattr(orchestration, "merge_before_completion", _refuse)
+    task = dict(await repo.get_task(db, task_id))
+    outcome = await orchestration._deliver_completed_pair_task(
+        db, task, orchestration.DeliveryPR(number=4242)
+    )
+    assert outcome == "running", f"{prefix}: транзитный отказ обязан оставить running"
+    lead = f"Доставка отложена: PR #4242 — {detail}. "
+    alerts = [
+        dict(u)["content"] or ""
+        for u in await repo.get_task_updates(db, task_id)
+        if (dict(u)["content"] or "").startswith(lead)
+    ]
+    assert len(alerts) == 1, f"{prefix}: ожидалась одна нота ожидания, есть {alerts}"
+    return alerts[0][len(lead) :]
+
+
+async def test_every_transient_gate_prefix_has_its_own_hint(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1271 AC-2: префикс, добавленный без своей ветки подсказки, роняет тест.
+
+    #1186 ×2: STACKED_BASE и STACK_UNKNOWN попали в кортеж, а лесенка их не
+    знала — и они унаследовали фразу про CI, которая советовала пересдачу,
+    сбрасывающую вердикт. Правило: фраза про CI принадлежит префиксам CI
+    (ci_<CIProbeOutcome>, выводятся из перечисления), любой другой префикс
+    обязан получить иную подсказку, а общая подсказка двух не-CI префиксов
+    объявляется в TRANSIENT_SHARED_HINTS с причиной.
+    """
+    from hub.integrations.protocols import CIProbeOutcome
+    from hub.services.orchestration import TRANSIENT_GATE_PREFIXES
+
+    ci_family = {f"ci_{o.value}" for o in CIProbeOutcome}
+    hints = {
+        prefix: await _transient_hint(db, monkeypatch, prefix)
+        for prefix in TRANSIENT_GATE_PREFIXES
+    }
+    ci_hints = {hints[p] for p in TRANSIENT_GATE_PREFIXES if p in ci_family}
+    assert ci_hints, "в кортеже нет ни одного CI-префикса — правило не о чем"
+
+    for key in TRANSIENT_SHARED_HINTS:
+        assert key in TRANSIENT_GATE_PREFIXES, f"{key!r} уже не в кортеже"
+
+    by_hint: dict[str, list[str]] = {}
+    for prefix in TRANSIENT_GATE_PREFIXES:
+        if prefix in ci_family:
+            continue
+        assert hints[prefix] not in ci_hints, (
+            f"префикс {prefix!r} унаследовал подсказку CI: {hints[prefix]!r} — "
+            "дайте ему свою ветку в лесенке _deliver_completed_pair_task"
+        )
+        by_hint.setdefault(hints[prefix], []).append(prefix)
+
+    for hint, group in by_hint.items():
+        for prefix in group[1:]:
+            declared = TRANSIENT_SHARED_HINTS.get(prefix, ("", ""))
+            assert declared[0] in group and declared[1].strip(), (
+                f"префиксы {group} делят подсказку {hint!r}, а общая подсказка "
+                f"для {prefix!r} не объявлена в TRANSIENT_SHARED_HINTS с причиной"
+            )
+
+
+async def test_merge_unconfirmed_hint_names_the_merge_not_the_ci(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1276 AC-1: мерж прошёл, а попадание в базу не подтверждено.
+
+    Ждать тут нечего, кроме следующего цикла: CI был зелёным до мержа, и
+    «отчитайтесь снова, когда CI станет зелёным» — ложь, толкающая к
+    пересдаче, которая сбросит вердикт (#612).
+    """
+    from hub.services.orchestration import MERGE_UNCONFIRMED_WAIT_HINT
+
+    hint = await _transient_hint(db, monkeypatch, MERGE_UNCONFIRMED)
+    assert hint == MERGE_UNCONFIRMED_WAIT_HINT
+    assert "CI станет зелёным" not in hint
+
+
+async def test_a_base_that_moved_between_probe_and_push_refuses_the_stale_resolution(
+    tmp_path,
+) -> None:
+    """Находка 2327bd9255c601cc (high), воспроизведённая настоящим git.
+
+    Аренда пуша стережёт ВЕТКУ задачи, а дерево для пуша строится заново и
+    сливает уже новый ``origin/develop``. Разрешение же посчитано на пробе, то
+    есть на старой базе. Раньше его байты просто ложились поверх свежего файла
+    и шли в ``git add``: признак U с пути снимался, проверка «остались ли
+    конфликты» видела чистое дерево, и строки, приехавшие в базу между пробой
+    и пушем, пропадали молча — в мерж-коммите, у которого MERGE_HEAD как раз
+    новый develop.
+
+    Здесь третья доставка кладёт в develop ещё один хвост ровно в окне между
+    пробой и пушем (изнутри валидации, которая гонится в готовом дереве).
+    Автомерж обязан отказать, а не сложить старое разрешение на новое дерево.
+    """
+    import subprocess
+
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import base_merge
+
+    repo = _repo_with_a_tail_conflict(tmp_path)
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1233/probe")
+
+    files, why = await ops.base_merge_conflicts(
+        str(repo), "develop", "task-1233/probe", 1233, pinned
+    )
+    assert files, why
+    resolutions, _ = base_merge.plan_resolution(files)
+    assert resolutions
+    # ОКНО МЕЖДУ ПРОБОЙ И ПУШЕМ: третья доставка кладёт на develop ещё хвост.
+    # Дерево для пуша строится заново и сливает уже ЭТОТ develop, а разрешение
+    # посчитано на прежнем.
+    _run_git("git", "checkout", "-q", "develop", cwd=repo)
+    suite = repo / "tests_suite.py"
+    suite.write_text(suite.read_text() + "\n\ndef test_from_the_third():\n    pass\n")
+    _run_git("git", "commit", "-q", "-am", "third delivery lands on develop", cwd=repo)
+    _run_git("git", "push", "-q", "origin", "develop", cwd=repo)
+
+    async def _green_but_the_base_moves(_path):
+        return 0, "ok"
+
+    before = _tip(repo, "task-1233/probe")
+    ok, detail = await ops.push_resolved_base_merge(
+        str(repo),
+        "develop",
+        "task-1233/probe",
+        1233,
+        resolutions,
+        _green_but_the_base_moves,
+        pinned,
+        files,
+    )
+
+    assert not ok, (
+        "база сдвинулась под разрешением — старые байты на новое дерево класть нельзя"
+    )
+    assert "база сдвинулась между пробой и пушем" in detail
+    assert _tip(repo, "task-1233/probe") == before, (
+        "отказавший автомерж не двигает ветку"
+    )
+    _run_git("git", "fetch", "-q", "origin", cwd=repo)
+    on_branch = subprocess.run(
+        ["git", "show", "origin/task-1233/probe:tests_suite.py"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "test_from_the_base" not in on_branch, (
+        "ничего не слито: ветка стоит там же, где стояла"
+    )
+
+
+async def test_a_push_without_the_probe_refuses_instead_of_resolving_blind(
+    tmp_path,
+) -> None:
+    """Сверять разрешение не с чем — отказ, а не «ну применим как есть».
+
+    Вторая половина той же находки: без пробы пуш физически не может узнать,
+    на том ли дереве считалось разрешение. Раньше этот вход был единственным,
+    и именно он и применял старые байты вслепую.
+    """
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import base_merge
+
+    repo = _repo_with_a_tail_conflict(tmp_path)
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1233/probe")
+    files, _ = await ops.base_merge_conflicts(
+        str(repo), "develop", "task-1233/probe", 1233, pinned
+    )
+    resolutions, _ = base_merge.plan_resolution(files or {})
+
+    async def _green(_path):
+        return 0, "ok"
+
+    before = _tip(repo, "task-1233/probe")
+    ok, detail = await ops.push_resolved_base_merge(
+        str(repo), "develop", "task-1233/probe", 1233, resolutions, _green, pinned
+    )
+
+    assert not ok and "не с чем сверить" in detail
+    assert _tip(repo, "task-1233/probe") == before
+
+
+async def test_a_cancelled_base_merge_leaves_no_scratch_worktree(
+    tmp_path, monkeypatch
+) -> None:
+    """Отмена посреди мержа базы не бросает одноразовое дерево (#1233).
+
+    Находка f529be6df1e61160. Между ``worktree add`` и возвратом пути мерж
+    базы шёл без страховки: ``CancelledError`` (гашение поллера, отмена
+    вызова) пролетал мимо, а вызывающие чистят дерево только когда путь им
+    вернули. Дерево оставалось рядом с клоном с незавершённым мержем внутри,
+    и убиралось лишь следующей попыткой той же задачи — если она будет.
+    """
+    import asyncio
+    import os
+
+    from hub.integrations import git_ops as git_ops_mod
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    repo = _repo_with_a_tail_conflict(tmp_path)
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1233/probe")
+    real_git = git_ops_mod._git
+
+    async def _cancelled_merge(*args, **kw):
+        if "merge" in args and "--no-commit" in args:
+            raise asyncio.CancelledError
+        return await real_git(*args, **kw)
+
+    monkeypatch.setattr(git_ops_mod, "_git", _cancelled_merge)
+
+    with pytest.raises(asyncio.CancelledError):
+        await ops.base_merge_conflicts(
+            str(repo), "develop", "task-1233/probe", 1233, pinned
+        )
+
+    scratch = git_ops_mod._scratch_worktree(str(repo), "basemerge", 1233)
+    assert not os.path.exists(scratch), "отменённый мерж не оставляет дерево"
+    listed = await real_git("worktree", "list", "--porcelain", repo=str(repo))
+    assert scratch not in (listed[1] or ""), "и git о нём тоже не помнит"
+
+
+# ---- #1332: сложенное проверяет профиль хоста, а не команды автора ----
+#
+# 23.09.2026 первая же попытка автомержа на проде (#1242) упала «валидация
+# после автомержа упала (код возврата 127)»: validation_commands автора
+# начинались с «uv run», а uv у пользователя сервиса нет. Решение владельца —
+# вариант (б): хост проверяет только то, что может (git diff --check и
+# компиляция изменённых .py тем python, на котором работает сам хаб), а
+# поведение слитого кода проверяет CI на новой вершине.
+
+_AUTHOR_COMMANDS = '["uv run pytest -q tests/test_review_dispatch.py", "make check"]'
+
+
+async def _automerge_on_real_git(db, monkeypatch, tmp_path, **repo_kw):
+    """Гейт с НАСТОЯЩИМ git под хвостовым конфликтом (#1332).
+
+    Проба конфликта и пуш слитой ветки — настоящие методы GitOpsIntegration на
+    временном клоне; двойник только у форжа (CI, мерж PR). Отказ мержа PR
+    заставляет гейт пойти в автомерж — ровно путь #1242.
+    """
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import orchestration
+
+    workdir = _repo_with_a_tail_conflict(tmp_path, **repo_kw)
+    pinned = _tip(workdir, "task-1233/probe")
+    g = _seeing(monkeypatch, pinned, merged=False)
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(return_value={"repo": str(workdir), "base_branch": "develop"}),
+    )
+    ops = GitOpsIntegration()
+    g.base_merge_conflicts = ops.base_merge_conflicts
+    g.push_resolved_base_merge = ops.push_resolved_base_merge
+    task_id = await _approved_pair_task(db)
+    await repo.update_task(
+        db,
+        task_id,
+        branch="task-1233/probe",
+        validation_commands=_AUTHOR_COMMANDS,
+    )
+    await db.commit()
+    assert dict(await repo.get_task(db, task_id))["submission_sha"] == pinned
+    return g, task_id, workdir, pinned
+
+
+def _spy_on_author_commands(monkeypatch) -> list:
+    calls: list = []
+    real = validation_run.default_validation_runner
+
+    async def _spy(commands, path):
+        calls.append(commands)
+        return await real(commands, path)
+
+    monkeypatch.setattr(validation_run, "default_validation_runner", _spy)
+    return calls
+
+
+async def test_a_missing_validation_command_is_named_as_the_environment(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+) -> None:
+    """AC-1 (#1332): инструмента профиля нет — это дефект среды, с именем.
+
+    На проде 23.09 человек прочёл «валидация упала (код возврата 127)» и не
+    мог понять, что упал не код задачи, а окружение сервиса: какого бинаря
+    нет, пришлось выяснять по ssh. Отказ обязан сказать это сам.
+    """
+    g, task_id, workdir, pinned = await _automerge_on_real_git(
+        db, monkeypatch, tmp_path
+    )
+    monkeypatch.setattr(
+        validation_run, "_profile_python", lambda: "python3-absent-1332"
+    )
+
+    await _report_done(db, task_id)
+
+    feed = await _feed(db, task_id)
+    assert "дефект среды" in feed, feed
+    assert "команда не найдена" in feed and "python3-absent-1332" in feed, (
+        "отказ называет ненайденную команду по имени"
+    )
+    assert "валидация после автомержа упала" not in feed, (
+        "среда не код: «валидация упала» здесь — неверный диагноз"
+    )
+    assert _tip(workdir, "task-1233/probe") == pinned, "непроверенное не пушится"
+
+
+async def test_automerge_validates_with_a_command_the_host_can_run(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+) -> None:
+    """AC-2 (#1332): команды автора с uv в среде без uv — автомерж состоялся.
+
+    Среда воспроизводит прод: в PATH только каталог git, uv там нет. Команды
+    автора (как у #1242) в автомерже не запускаются вовсе; сложенное проверено
+    профилем хоста; ветка обновлена; исход base_automerged, не needs_decision.
+    И второе обещание решения (б): поведение проверяет CI на новой вершине —
+    следующий цикл при незелёном CI не мержит, а ждёт.
+    """
+    import os
+    import shutil
+
+    real_git = shutil.which("git")
+    assert real_git, "сцене нужен git"
+    # PATH сервиса на проде: git есть, uv нет. Каталог с одним git.
+    host_bin = tmp_path / "host-bin"
+    host_bin.mkdir()
+    os.symlink(real_git, host_bin / "git")
+    assert shutil.which("uv", path=str(host_bin)) is None
+    g, task_id, workdir, pinned = await _automerge_on_real_git(
+        db, monkeypatch, tmp_path
+    )
+    monkeypatch.setenv("PATH", str(host_bin))
+    author_runs = _spy_on_author_commands(monkeypatch)
+
+    await _report_done(db, task_id)
+
+    assert author_runs == [], "validation_commands автора в автомерже не запускаются"
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] != "needs_decision", await _feed(db, task_id)
+    moved = _tip(workdir, "task-1233/probe")
+    assert moved != pinned, "ветка обновлена слитым коммитом"
+    assert task["submission_sha"] == moved, "и сдача перезакреплена на него"
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    cards = [u["content"] for u in updates if "Автомерж базы" in (u["content"] or "")]
+    assert len(cards) == 1, await _feed(db, task_id)
+    card = cards[0]
+    assert "git diff --check" in card and "компиляция" in card, (
+        "карточка автомержа называет, ЧЕМ проверено сложенное"
+    )
+    assert "CI на новой вершине" in card, (
+        "и чем будет проверено поведение: карточка не обещает больше, чем сделал хост"
+    )
+    # Находка 9da109934917487c: карточка и подсказка ожидания читаются вместе,
+    # в СКЛЕЕННОМ алерте «Доставка отложена». Подсказка, говорящая «CI уже
+    # зелёный», противоречила бы карточке: CI на новой вершине только пошёл.
+    waits = [
+        u["content"]
+        for u in updates
+        if (u["content"] or "").startswith("Доставка отложена")
+        and "base_automerged" in u["content"]
+    ]
+    assert len(waits) == 1, await _feed(db, task_id)
+    assert "уже зелёный" not in waits[0], waits[0]
+    hint = waits[0].partition("Это временное состояние")[2]
+    assert hint, waits[0]
+    assert "CI на новой вершине" in hint and "следующим циклом" in hint, (
+        "подсказка сама говорит, чего ждёт доставка"
+    )
+
+    # Следующий цикл: CI на слитой вершине ещё не зелёный — гейт ждёт его, а
+    # не мержит сложенное без проверки поведения.
+    merges_before = g.merge_pr.await_count
+    g.head_sha = AsyncMock(return_value=moved)
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.pending, "checks_pending")
+    )
+    from tests.test_pair_merge_gate import _drain_pair_delivery
+
+    await _drain_pair_delivery(db)
+
+    assert g.check_pr_ci.await_count >= 1, "следующий цикл спрашивает CI"
+    assert g.merge_pr.await_count == merges_before, (
+        "без зелёного CI на новой вершине слитое не доставляется"
+    )
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] not in ("needs_decision", "completed")
+
+
+async def test_a_broken_merged_tree_is_not_pushed(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+) -> None:
+    """AC-3 (#1332): синтаксически сломанный .py после сложения — не пушим.
+
+    Профиль хоста обязан уметь сказать «нет»: профиль, который всегда
+    зелёный, пропустил бы это дерево в ветку под чужим одобрением. Отказ
+    называет файл, чтобы человек не искал его сам.
+    """
+    g, task_id, workdir, pinned = await _automerge_on_real_git(
+        db,
+        monkeypatch,
+        tmp_path,
+        branch_tail="\n\ndef test_from_the_branch(:\n    pass\n",
+    )
+
+    await _report_done(db, task_id)
+
+    assert _tip(workdir, "task-1233/probe") == pinned, "сломанное дерево не пушится"
+    task = dict(await repo.get_task(db, task_id))
+    assert task["submission_sha"] == pinned
+    feed = await _feed(db, task_id)
+    assert "tests_suite.py" in feed, feed
+    assert "Автомерж базы" not in feed
+
+
+async def test_the_host_profile_catches_a_leftover_conflict_marker(tmp_path) -> None:
+    """AC-3 (#1332), вторая половина: маркер конфликта в сложенном дереве.
+
+    Настоящий git в состоянии незавершённого мержа, как в дереве автомержа:
+    файл, разрешённый с забытым маркером, застейджен. Файл НЕ .py нарочно:
+    компиляция его не видит, и отказ здесь — заслуга ``git diff --check``.
+    """
+    import subprocess
+
+    workdir = _repo_with_a_tail_conflict(tmp_path, name="NOTES.txt")
+    _run_git("git", "checkout", "-q", "task-1233/probe", cwd=workdir)
+    subprocess.run(
+        ["git", "merge", "--no-commit", "--no-ff", "origin/develop"],
+        cwd=workdir,
+        capture_output=True,
+    )
+    notes = workdir / "NOTES.txt"
+    assert "<<<<<<<" in notes.read_text(), "сцене нужен настоящий конфликт"
+    _run_git("git", "add", "NOTES.txt", cwd=workdir)
+
+    rc, log_tail = await validation_run.host_profile_runner(str(workdir))
+
+    assert rc != 0 and rc != validation_run.COMMAND_NOT_FOUND_RC, log_tail
+    assert "NOTES.txt" in log_tail and "git diff --check" in log_tail
+
+    # И тот же файл, разрешённый честно, профиль пропускает.
+    notes.write_text(
+        "def test_common():\n    assert True\n\n\n"
+        "def test_from_the_branch():\n    pass\n\n\n"
+        "def test_from_the_base():\n    pass\n"
+    )
+    _run_git("git", "add", "NOTES.txt", cwd=workdir)
+    rc, log_tail = await validation_run.host_profile_runner(str(workdir))
+    assert rc == 0, log_tail
+
+
+async def test_a_cancelled_profile_leaves_no_orphan_process(
+    tmp_path, monkeypatch
+) -> None:
+    """Отмена проверки не бросает дочерний процесс сиротой (находка 2ce63622f499a563).
+
+    Тик поллера гасится на остановке сервиса отменой. Пока группа процессов
+    убивалась только на таймауте и OSError, ``CancelledError`` пролетал мимо,
+    и компиляция (или зависший git) доживала до конца сама по себе — ровно то,
+    что #544 закрыл в default_validation_runner.
+    """
+    import asyncio
+    import sys
+
+    pidfile = tmp_path / "child.pid"
+    sleeper = (
+        "import os, time; "
+        f"open({str(pidfile)!r}, 'w').write(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+    task = asyncio.create_task(
+        validation_run._profile_exec([sys.executable, "-c", sleeper], str(tmp_path))
+    )
+    for _ in range(200):
+        if pidfile.exists() and pidfile.read_text():
+            break
+        await asyncio.sleep(0.05)
+    pid = int(pidfile.read_text())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    import os
+
+    for _ in range(100):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        os.kill(pid, 9)
+        pytest.fail("отменённая проверка оставила дочерний процесс жить")
+
+
+# ---------------------------------------------------------------------------
+# #1333: принятая, но недоставленная работа доводится ИЗ РЕЕСТРА.
+#
+# 23.09.2026 #1276, #1249 и #1234 приняты в интерфейсе без судьбы PR и закрыты
+# с открытым PR. Решение (decide) работает только из needs_decision,
+# force-complete отказывает на закрытых — штатного пути доставить закрытую
+# задачу не было, и три PR влил человек мимо гейта. Действие реестра — тот же
+# deliver_on_disposition, открытый для закрытой задачи, а не второй путь мержа.
+# ---------------------------------------------------------------------------
+
+
+async def _accepted_undelivered(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, *, pr: int, title: str
+) -> int:
+    """Одобренная задача, принятая БЕЗ судьбы PR — ровно строка реестра 23.09."""
+    from tests.test_accept_without_delivery import _pr_states
+
+    _pr_states(monkeypatch, {pr: "open"})
+    task_id = await _approved_task(client, db, title=title, pr=pr)
+    resp = await client.post(f"/api/tasks/{task_id}/decide", json={"action": "accept"})
+    assert resp.status_code == 200, resp.text
+    row = await repo.get_delivery_discrepancy(db, task_id)
+    assert row is not None and row["state"] == PR_OPEN, "предпосылка: строка pr_open"
+    return task_id
+
+
+async def test_an_accepted_undelivered_task_is_delivered_from_the_registry(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    from hub import config
+    from hub.config import TokenIdentity
+    from hub.services.delivery_state import undelivered_completed_tasks
+
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    task_id = await _accepted_undelivered(
+        client, db, monkeypatch, pr=1401, title="accepted in the UI"
+    )
+    assert spy.merged == [], "принятие без судьбы PR ничего не вливает (#897)"
+
+    # Агентскому токену действие закрыто: мерж — решение человека.
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {"agent-token": TokenIdentity("bot", "agent", principal_id=7)},
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    agent = await client.post(
+        f"/api/delivery/discrepancies/{task_id}/deliver",
+        headers={"Authorization": "Bearer agent-token"},
+    )
+    assert agent.status_code == 403, agent.text
+    assert spy.merged == [], "отказ агенту не должен успеть ничего влить"
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", True)
+
+    # Человек: мерж через тот же вход гейта, и строка уходит из реестра.
+    from hub.services import orchestration as orch
+
+    gate_calls: list[int] = []
+    real_merge = orch.merge_before_completion
+
+    async def spy_merge(db_, task_):
+        gate_calls.append(int(task_["id"]))
+        return await real_merge(db_, task_)
+
+    monkeypatch.setattr(orch, "merge_before_completion", spy_merge)
+    resp = await client.post(f"/api/delivery/discrepancies/{task_id}/deliver")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["delivered"] is True
+    assert spy.merged == [1401]
+    assert gate_calls == [task_id], "доставка идёт через функцию гейта"
+    assert await repo.pipeline_merge_recorded(db, task_id, 1401)
+    listed = await undelivered_completed_tasks(db)
+    assert task_id not in [r["task_id"] for r in listed["undelivered"]]
+    assert (await repo.get_task(db, task_id))["status"] == "completed"
+
+    # Невыполненное условие гейта — названный отказ, а не мерж.
+    spy.ci = "failed"
+    red = await _accepted_undelivered(
+        client, db, monkeypatch, pr=1402, title="red ci after accept"
+    )
+    refused = await client.post(f"/api/delivery/discrepancies/{red}/deliver")
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["reason"].startswith("ci_"), refused.text
+    assert 1402 not in spy.merged
+    still = await repo.get_delivery_discrepancy(db, red)
+    assert still["state"] == PR_OPEN, "отказ оставляет строку в реестре"
+
+    # Без одобрения текущей сдачи — тоже отказ с названной причиной.
+    spy.ci = "passed"
+    unapproved = await _accepted_undelivered(
+        client, db, monkeypatch, pr=1403, title="approval went stale"
+    )
+    await repo.update_task(db, unapproved, review_verdict="changes_requested")
+    await db.commit()
+    refused = await client.post(f"/api/delivery/discrepancies/{unapproved}/deliver")
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["reason"] == "no_approved_review"
+    assert 1403 not in spy.merged
+
+
+async def test_the_registry_delivers_only_rows_it_lists_as_pr_open(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Действие реестра — не дверь к мержу чего угодно: нет строки pr_open — нет
+    мержа, даже у одобренной задачи с PR."""
+    spy = _MergeSpy()
+    _install(monkeypatch, spy)
+    live = await _approved_task(client, db, title="still deciding", pr=1404)
+
+    resp = await client.post(f"/api/delivery/discrepancies/{live}/deliver")
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"]["reason"] == "not_in_registry"
+    assert spy.merged == []
+
+    missing = await client.post("/api/delivery/discrepancies/999999/deliver")
+    assert missing.status_code == 404

@@ -349,6 +349,7 @@ async def test_at_most_once_now_counts_revisions(db: aiosqlite.Connection):
                 kind="dor",
                 verdict="changes_requested",
                 confidence="high",
+                grounds=[{"source": "ci_pinned_sha"}],
                 model="gpt-5.3-codex",
             ),
             TokenIdentity("steward-bot", "steward", principal_id=42),

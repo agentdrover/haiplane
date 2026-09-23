@@ -1032,3 +1032,323 @@ async def test_a_task_without_a_pinned_pr_still_names_the_silent_ancestry(
     # Те же слова, что у строки зависимости про тот же факт.
     entry = await blocker_delivery(db, blocker)
     assert BASE_UNANSWERABLE_NOTE in entry["reason"], entry["reason"]
+
+
+# ---- #1240: гейт сам сжимает ветку, и сдача перестаёт быть предком базы ----
+#
+# Вторая половина класса #1214. Там молчание было известно заранее: форж мержит
+# squash, и родословная рвётся по устройству. Здесь форж мержит без потери
+# родословной (GitVerse, ``merge --no-ff``), но ещё раньше, при доставке, гейт
+# сам сжимает ветку задачи (``squash_branch``). Сдача закрепила коммит вершины;
+# после сжатия в ветке лежит ДРУГОЙ коммит, и в историю базы попадает он.
+# Спросить git «предок ли сдача» — получить «нет» на доставленной работе.
+#
+# Отличить этот случай хаб может только по факту, а не по виду ветки: сколько
+# в ней коммитов и как подписан последний — угадывание, постановка его прямо
+# запрещает. Поэтому фикстура ниже прогоняет НАСТОЯЩИЙ git-хвост доставки
+# (``_route_after_done``) на настоящем репозитории: сжимает гейт, и факт
+# записывает гейт, а тест ничего за него не подставляет.
+
+
+@pytest.fixture
+def ancestry_forge(tmp_path: Path) -> dict[str, Any]:
+    """Клон с bare-remote, базой develop и одним базовым коммитом."""
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _hermetic_git(remote, "init", "--bare", "-b", "develop")
+    work = tmp_path / "clone"
+    _hermetic_git(tmp_path, "clone", str(remote), str(work))
+    # squash_branch коммитит обычным git хаба, без герметичного окружения —
+    # имя автора должно найтись в самом репозитории, а не на машине прогона.
+    _hermetic_git(work, "config", "user.email", "t@t")
+    _hermetic_git(work, "config", "user.name", "t")
+    (work / "base.py").write_text("base = 1\n")
+    _hermetic_git(work, "add", ".")
+    _hermetic_git(work, "commit", "-m", "base")
+    _hermetic_git(work, "push", "origin", "develop")
+    return {"repo": str(work), "base": "develop"}
+
+
+def _two_commit_branch(work: Path, branch: str, stem: str) -> str:
+    """Ветка из двух коммитов поверх develop; возвращает вершину — сдачу."""
+    _hermetic_git(work, "checkout", "-q", "-b", branch, "develop")
+    for n in (1, 2):
+        (work / f"{stem}_{n}.py").write_text(f"{stem} = {n}\n")
+        _hermetic_git(work, "add", ".")
+        _hermetic_git(work, "commit", "-m", f"{stem} step {n}")
+    tip = _hermetic_git(work, "rev-parse", "HEAD")
+    _hermetic_git(work, "push", "-q", "origin", branch)
+    _hermetic_git(work, "checkout", "-q", "develop")
+    return tip
+
+
+async def _submitted_task(
+    client: AsyncClient, db: aiosqlite.Connection, branch: str, sha: str
+) -> int:
+    task_id = (await client.post("/api/tasks", json={"title": "gate squash"})).json()[
+        "id"
+    ]
+    await repo.update_task(
+        db, task_id, status="running", branch=branch, submission_sha=sha
+    )
+    await db.commit()
+    return task_id
+
+
+async def _gate_delivers(
+    db: aiosqlite.Connection,
+    task_id: int,
+    branch: str,
+    ancestry_forge: dict[str, Any],
+    monkeypatch,
+) -> str:
+    """Настоящий git-хвост доставки: checkout, commit, squash, push.
+
+    Единственное, что подменено, — открытие PR: форжа здесь нет. Сжатие,
+    push и запись факта делает код гейта, а не тест.
+    """
+    from hub.services import orchestration
+
+    monkeypatch.setattr(
+        plugins.git_ops, "create_pr", AsyncMock(return_value=None), raising=False
+    )
+    row = dict(await repo.get_task(db, task_id))
+    status = await orchestration._route_after_done(
+        db, row, branch=branch, has_done=True, exit_code=0, result_text=""
+    )
+    await db.commit()
+    assert status == "ci_check", status
+    return _hermetic_git(Path(ancestry_forge["repo"]), "rev-parse", f"origin/{branch}")
+
+
+def _merge_no_ff(work: Path, branch: str) -> None:
+    """Мерж без потери родословной — так мержит GitVerse (#1214)."""
+    _hermetic_git(work, "checkout", "-q", "develop")
+    _hermetic_git(work, "fetch", "-q", "origin")
+    _hermetic_git(work, "merge", "--no-ff", "-m", f"merge {branch}", f"origin/{branch}")
+    _hermetic_git(work, "push", "-q", "origin", "develop")
+    _hermetic_git(work, "fetch", "-q", "origin")
+
+
+async def test_a_branch_squashed_by_the_gate_is_silence_not_denial(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    ancestry_forge: dict[str, Any],
+    monkeypatch,
+):
+    """AC-1: гейт сжал ветку из двух коммитов — ответ молчание с причиной.
+
+    Форж сохраняет родословную, поэтому #1214 здесь не срабатывает: вопрос к
+    git задаётся, и git честно отвечает «не предок». Этот ответ и был ложным
+    отрицанием. Теперь он читается как молчание — потому что гейт записал,
+    что сам переписал ветку, а не потому, что ветка выглядит сжатой.
+    """
+    from hub.services.delivery_state import (
+        BASE_SQUASHED_BY_GATE_NOTE,
+        BASE_UNANSWERABLE_NOTE,
+        UNKNOWN,
+        blocker_delivery,
+        merged_into_base_detail,
+        task_delivery,
+    )
+
+    work = Path(ancestry_forge["repo"])
+    branch = "task-1240/two-commits"
+    submitted = _two_commit_branch(work, branch, "feature")
+    _real_git_for(monkeypatch, ancestry_forge, "gitverse")
+    task_id = await _submitted_task(client, db, branch, submitted)
+
+    delivered_tip = await _gate_delivers(
+        db, task_id, branch, ancestry_forge, monkeypatch
+    )
+    assert delivered_tip != submitted, (
+        "гейт обязан был сжать ветку — иначе тест не о том"
+    )
+    _merge_no_ff(work, branch)
+
+    # Вход — настоящий git: работа в базе, а сдача ей не предок.
+    real = GitOpsIntegration()
+    assert await real.is_ancestor(str(work), delivered_tip, "origin/develop") is True
+    assert await real.is_ancestor(str(work), submitted, "origin/develop") is False, (
+        "фикстура обязана воспроизводить вход, на котором жил дефект"
+    )
+
+    task = dict(await repo.get_task(db, task_id))
+    reached, note = await merged_into_base_detail(db, task)
+    assert reached is None, "«не предок» после сжатия гейтом — не отрицание"
+    assert note == BASE_SQUASHED_BY_GATE_NOTE, note
+    assert note != BASE_UNANSWERABLE_NOTE, (
+        "это не случай #1214: форж родословную хранит"
+    )
+
+    # Оба потребителя — строка зависимости и реестр — одними словами.
+    entry = await blocker_delivery(
+        db,
+        {
+            "task_id": task_id,
+            "title": "gate squash",
+            "status": "completed",
+            "delivered": False,
+            "reason": "PR #347 не смержен гейтом",
+        },
+    )
+    assert entry["delivery_path"] == "unknown", entry
+    assert entry["delivered"] is False, "молчание — не подтверждение доставки"
+    assert BASE_SQUASHED_BY_GATE_NOTE in entry["reason"], entry["reason"]
+    assert "PR #347 не смержен гейтом" in entry["reason"], "исходная причина цела"
+
+    task["pr_number"] = None
+    answer = await task_delivery(db, task)
+    assert answer["state"] == UNKNOWN, answer
+    assert BASE_SQUASHED_BY_GATE_NOTE in answer["reason"], answer["reason"]
+
+
+async def test_real_undelivered_work_still_says_no_after_the_fix(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    ancestry_forge: dict[str, Any],
+    monkeypatch,
+):
+    """AC-2: работа, которой в базе нет, по-прежнему «не доставлена».
+
+    Два входа. Первый — сдача, которую гейт не трогал и никто не мержил.
+    Второй точнее: гейт сжимал ветку раньше, а закреплённая сдача сделана
+    ПОСЛЕ сжатия и в сжатый диапазон не входит — факт о сжатии есть, но про
+    эту сдачу он ничего не говорит. «Молчать всегда» обязано ронять этот тест.
+    """
+    from hub.services.delivery_state import (
+        BASE_SQUASHED_BY_GATE_NOTE,
+        blocker_delivery,
+        merged_into_base_detail,
+    )
+
+    work = Path(ancestry_forge["repo"])
+    _real_git_for(monkeypatch, ancestry_forge, "gitverse")
+
+    # 1. Не сжата, не доставлена.
+    lonely = _two_commit_branch(work, "task-1240/never-merged", "lonely")
+    lonely_id = await _submitted_task(client, db, "task-1240/never-merged", lonely)
+    reached, note = await merged_into_base_detail(
+        db, dict(await repo.get_task(db, lonely_id))
+    )
+    assert (reached, note) == (False, ""), (reached, note)
+    entry = await blocker_delivery(
+        db,
+        {
+            "task_id": lonely_id,
+            "title": "never merged",
+            "status": "completed",
+            "delivered": False,
+            "reason": "PR #1 не смержен гейтом",
+        },
+    )
+    assert entry["delivery_path"] == "none", entry
+    assert BASE_SQUASHED_BY_GATE_NOTE not in entry["reason"], entry["reason"]
+
+    # 2. Сжата гейтом раньше, но сдача — новая и в сжатое не входит.
+    branch = "task-1240/resubmitted"
+    first = _two_commit_branch(work, branch, "again")
+    task_id = await _submitted_task(client, db, branch, first)
+    await _gate_delivers(db, task_id, branch, ancestry_forge, monkeypatch)
+    assert (
+        dict(await repo.get_task(db, task_id)).get("gate_squashed_sha") or ""
+    ) == first
+    _hermetic_git(work, "checkout", "-q", branch)
+    (work / "later.py").write_text("later = True\n")
+    _hermetic_git(work, "add", ".")
+    _hermetic_git(work, "commit", "-m", "work after the squash, never delivered")
+    later = _hermetic_git(work, "rev-parse", "HEAD")
+    _hermetic_git(work, "checkout", "-q", "develop")
+    await repo.update_task(db, task_id, submission_sha=later)
+    await db.commit()
+
+    reached, note = await merged_into_base_detail(
+        db, dict(await repo.get_task(db, task_id))
+    )
+    assert (reached, note) == (False, ""), (
+        "факт о сжатии относится к сжатому диапазону, а не к ветке навсегда",
+        reached,
+        note,
+    )
+
+
+async def test_records_without_the_fact_are_not_called_squashed(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    ancestry_forge: dict[str, Any],
+    monkeypatch,
+):
+    """AC-3: записи до этой работы читаются как прежде.
+
+    Новая колонка у старых строк пуста, а у словаря, собранного по старой
+    форме, её нет вовсе. Ни то, ни другое не читается как «сжато гейтом»:
+    обе записи получают обычный ответ родословной.
+    """
+    from hub.services.delivery_state import merged_into_base_detail
+
+    work = Path(ancestry_forge["repo"])
+    _real_git_for(monkeypatch, ancestry_forge, "gitverse")
+    sha = _two_commit_branch(work, "task-1240/old-record", "old")
+    task_id = await _submitted_task(client, db, "task-1240/old-record", sha)
+
+    cols = {
+        r[1]: r[4]
+        for r in await (await db.execute("PRAGMA table_info(tasks)")).fetchall()
+    }
+    assert "gate_squashed_sha" in cols, "факт должен где-то храниться"
+    stored = dict(await repo.get_task(db, task_id))
+    assert stored["gate_squashed_sha"] == "", (
+        "у старой строки факта нет — и он не выдуман"
+    )
+
+    assert await merged_into_base_detail(db, stored) == (False, "")
+
+    legacy = {k: v for k, v in stored.items() if k != "gate_squashed_sha"}
+    assert await merged_into_base_detail(db, legacy) == (False, "")
+
+    # И обычная доставка без сжатия по-прежнему «да».
+    _merge_no_ff(work, "task-1240/old-record")
+    assert await merged_into_base_detail(db, stored) == (True, "")
+
+
+async def test_the_squash_fact_is_read_when_git_no_longer_sees_the_submission(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    ancestry_forge: dict[str, Any],
+    monkeypatch,
+):
+    """Находка 599cb7e8f2b1b9e4: факт о сжатии терялся на «git не смог».
+
+    После сжатия и force-push сдаточный коммит держится в клоне только
+    рефлогом. Свежий клон, prune или gc — и git его больше не видит:
+    ``is_ancestor`` отвечает ``None``. Первая редакция на этом ответе
+    возвращала «проверить не удалось», не спросив записанный факт, хотя
+    равенство sha решается без git вовсе. Здесь коммит вычищается настоящим
+    ``gc --prune=now``, а не подменой ответа.
+    """
+    from hub.services.delivery_state import (
+        BASE_SQUASHED_BY_GATE_NOTE,
+        merged_into_base_detail,
+    )
+
+    work = Path(ancestry_forge["repo"])
+    branch = "task-1240/pruned"
+    submitted = _two_commit_branch(work, branch, "pruned")
+    _real_git_for(monkeypatch, ancestry_forge, "gitverse")
+    task_id = await _submitted_task(client, db, branch, submitted)
+    await _gate_delivers(db, task_id, branch, ancestry_forge, monkeypatch)
+    _merge_no_ff(work, branch)
+
+    _hermetic_git(work, "reflog", "expire", "--expire=now", "--all")
+    _hermetic_git(work, "gc", "-q", "--prune=now")
+    real = GitOpsIntegration()
+    assert await real.is_ancestor(str(work), submitted, "origin/develop") is None, (
+        "вход находки: git сдаточный коммит больше не видит"
+    )
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["gate_squashed_sha"] == submitted
+    assert await merged_into_base_detail(db, task) == (
+        None,
+        BASE_SQUASHED_BY_GATE_NOTE,
+    )

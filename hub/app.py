@@ -33,6 +33,7 @@ from hub.version import get_app_version
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
+    latest_review_freshness,
     DeliveryAcknowledgement,
     DeliveryObservation,
     DeployCallback,
@@ -1866,7 +1867,7 @@ async def api_task_context(
         lines.append(f"Risks ({len(task_view.risks)}): {risk_brief}")
     if task_view.latest_review:
         lr = task_view.latest_review
-        freshness = "current" if lr.is_current else "stale — work resubmitted"
+        freshness = latest_review_freshness(lr.is_current, lr.closed_by_decision)
         solo = " [SELF-APPROVED: solo mode]" if lr.self_approved else ""
         lines.append(
             f"Latest review: {lr.verdict.value.upper()} "
@@ -2171,6 +2172,49 @@ async def api_acknowledge_delivery_discrepancy(
     )
     await db.commit()
     return {"task_id": task_id, "acknowledged": True, "reason": body.reason.strip()}
+
+
+@app.post("/api/delivery/discrepancies/{task_id}/deliver")
+async def api_deliver_delivery_discrepancy(
+    task_id: int,
+    request: Request,
+    identity=Depends(require_human_or_admin),
+):
+    """Довести закрытую задачу с открытым PR из реестра расхождений (#1333).
+
+    Тот же путь, что ``pr_disposition=deliver`` при решении: мержит
+    ``deliver_on_disposition`` под условиями гейта (одобрение текущей сдачи,
+    неизменный код, зелёный CI) или отказывает, назвав невыполненное условие.
+    Второго пути мержа здесь нет.
+
+    Только человек: мерж — решение о работе, и агенту, чья задача в реестре,
+    оно не открывается (как и признание рядом). MCP-инструмента нет намеренно
+    — каталог на потолке (#1241), вход через REST, CLI и веб.
+    """
+    try:
+        return await services.deliver_from_registry(
+            _db(request),
+            task_id,
+            by=str(getattr(identity, "username", "") or "human"),
+        )
+    except services.RegistryDeliveryRefused as exc:
+        raise HTTPException(
+            404 if exc.not_found else 409,
+            detail=enrich_error_payload(
+                {
+                    "reason": exc.reason,
+                    "actor_hint": "human",
+                    "message": exc.message,
+                    "hint": (
+                        "Строки реестра: GET /api/delivery/discrepancies."
+                        if exc.not_found
+                        else "Устраните названное условие (сдача, ревью, CI) и "
+                        "повторите; признать расхождение законным — "
+                        f"POST /api/delivery/discrepancies/{task_id}/acknowledge."
+                    ),
+                }
+            ),
+        ) from exc
 
 
 @app.post("/api/deploys", response_model=DeployView)

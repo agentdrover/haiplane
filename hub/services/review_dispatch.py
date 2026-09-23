@@ -275,14 +275,30 @@ async def previous_findings(
     return titles
 
 
+@dataclass(frozen=True)
+class DeltaSubject:
+    """What a resubmission puts in front of the reviewer, split by AUTHORSHIP.
+
+    ``paths`` is what the review command narrows to and what the profile is
+    judged on; ``base_paths`` arrived with the base branch and is NAMED to the
+    reviewer rather than removed from sight. ``author_diff`` is the author's
+    own patch series — empty when origin could not be established, and then
+    the caller falls back to the whole submitted diff, loudly.
+    """
+
+    paths: list[str]
+    base_paths: list[str]
+    author_diff: str
+    note: str
+
+
 async def generation_delta(
     db: aiosqlite.Connection, task: dict, base: str
-) -> tuple[list[str], str]:
-    """Files touched since the previous submission, and why, or (empty, reason).
+) -> DeltaSubject:
+    """What changed since the previous submission, and WHOSE change it is.
 
-    Returns ``(paths, note)``. A non-empty ``paths`` narrows the review to the
-    files this round of fixes touched; an empty one means the whole diff is the
-    subject, and ``note`` always says which of those it is and on what grounds.
+    ``paths`` empty means the whole diff is the subject, and ``note`` always
+    says which of those it is and on what grounds.
 
     Three facts have to hold, and each is checked rather than assumed:
 
@@ -296,29 +312,49 @@ async def generation_delta(
     Anything unproven means the full diff. Reviewing a delta we cannot justify
     would be the one failure this feature must not have — silently reading less
     than the report claims.
+
+    #1249 adds a fourth fact, and it is about AUTHORSHIP rather than about
+    trust. The previous submission is an ancestor of the current tip, so a
+    plain ``prev..current`` diff also carries whatever the author pulled in by
+    merging the base branch — on #1172 generation 2 that was 23 of 25 files,
+    written by other tasks that had already passed the gate. The subject is
+    therefore split: the author's own commits (those the base branch does not
+    already contain) decide what the command narrows to and what the profile
+    is bought for, and the files that came with the base are named beside
+    them. Named, not dropped: #1238 found a defect that exists only where two
+    branches meet, and a reviewer blind to a moved base could not have seen
+    it. Origin that cannot be established is not origin "base" — it reads
+    everything, and says so.
     """
     task_id = int(task.get("id") or 0)
     generation = int(task.get("submission_generation") or 0)
     current = (task.get("submission_sha") or "").strip()
     if generation <= 1 or not current:
-        return [], "первая сдача — предмет ревью весь дифф"
+        return DeltaSubject([], [], "", "первая сдача — предмет ревью весь дифф")
 
     previous = await repo.previous_submission(db, task_id, generation)
     if previous is None:
-        return [], "предыдущая сдача не записана — читается весь дифф"
+        return DeltaSubject(
+            [], [], "", "предыдущая сдача не записана — читается весь дифф"
+        )
     prev = dict(previous)
     prev_sha = (prev.get("sha") or "").strip()
     if not prev_sha:
-        return [], "у предыдущей сдачи не закреплён коммит — читается весь дифф"
+        return DeltaSubject(
+            [], [], "", "у предыдущей сдачи не закреплён коммит — читается весь дифф"
+        )
     if (prev.get("base_branch") or "") != base:
-        return [], (
+        return DeltaSubject(
+            [],
+            [],
+            "",
             f"базовая ветка сменилась ({prev.get('base_branch') or '—'} → {base}) "
-            "— дельта невалидна, читается весь дифф"
+            "— дельта невалидна, читается весь дифф",
         )
 
     ctx = await _git_context(db, task_id)
     if ctx is None:
-        return [], "воркспейс недоступен — читается весь дифф"
+        return DeltaSubject([], [], "", "воркспейс недоступен — читается весь дифф")
     workspace, _ = ctx
     try:
         ancestor = await plugins.git_ops.is_ancestor(workspace, prev_sha, current)
@@ -326,11 +362,16 @@ async def generation_delta(
         log.warning("ancestry check failed for task #%s: %s", task_id, exc)
         ancestor = None
     if ancestor is None:
-        return [], "историю проверить не удалось — читается весь дифф"
+        return DeltaSubject(
+            [], [], "", "историю проверить не удалось — читается весь дифф"
+        )
     if not ancestor:
-        return [], (
+        return DeltaSubject(
+            [],
+            [],
+            "",
             f"коммит {prev_sha[:12]} не предок текущего — ветку перебазировали "
-            "или переписали, читается весь дифф"
+            "или переписали, читается весь дифф",
         )
 
     try:
@@ -339,15 +380,90 @@ async def generation_delta(
         log.warning("delta diff failed for task #%s: %s", task_id, exc)
         delta = None
     if delta is None:
-        return [], "дельту прочитать не удалось — читается весь дифф"
+        return DeltaSubject(
+            [], [], "", "дельту прочитать не удалось — читается весь дифф"
+        )
     paths = [p for p in changed_paths(delta) if not is_generated(p)]
     if not paths:
-        return [], (
-            f"с поколения #{prev.get('generation')} код не менялся — читается весь дифф"
+        return DeltaSubject(
+            [],
+            [],
+            "",
+            f"с поколения #{prev.get('generation')} код не менялся — читается весь дифф",
         )
-    return paths, (
-        f"дельта к поколению #{prev.get('generation')} ({prev_sha[:12]}): "
-        f"{len(paths)} файл(ов)"
+    head = f"дельта к поколению #{prev.get('generation')} ({prev_sha[:12]})"
+    return await _split_by_origin(
+        task_id, workspace, base, prev_sha, current, paths, head
+    )
+
+
+async def _split_by_origin(
+    task_id: int,
+    workspace: str,
+    base: str,
+    prev_sha: str,
+    current: str,
+    paths: list[str],
+    head: str,
+) -> DeltaSubject:
+    """Whose change is which, inside a delta already proven trustworthy (#1249).
+
+    Asked of git by REACHABILITY from the base branch — never guessed from a
+    commit message or an author name, because a merge commit says "Merge ..."
+    whoever wrote the code inside it. Every answer git cannot give leaves the
+    WHOLE delta as the subject with the cause named; none of them narrows it.
+    """
+    try:
+        own = await plugins.git_ops.delta_without_base(
+            workspace, base, prev_sha, current
+        )
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.warning("origin split failed for task #%s: %s", task_id, exc)
+        own = None
+    if own is None:
+        return DeltaSubject(
+            paths,
+            [],
+            "",
+            f"{head}: {len(paths)} файл(ов), происхождение коммитов установить "
+            "не удалось — привезённое базой не отделено, читается вся дельта",
+        )
+    author_set = {p for p in changed_paths(own) if not is_generated(p)}
+    author = [p for p in paths if p in author_set]
+    brought = [p for p in paths if p not in author_set]
+    if not author:
+        # The round added nothing of the author's own — a bare merge of the
+        # base. Narrowing to zero files would hand the reviewer an empty
+        # command, so the whole delta stays the subject and says why.
+        return DeltaSubject(
+            paths,
+            [],
+            "",
+            f"{head}: {len(paths)} файл(ов), все привезены базой — своей правки "
+            "в этом круге нет, читается вся дельта",
+        )
+    if not brought:
+        # Сказать здесь «база не двигалась» значило бы заявить больше, чем
+        # спрошено (находки 6ea44f6f, 21ad18b5). Спрошена ДОСТИЖИМОСТЬ, и
+        # пустой ``brought`` получается ещё двумя способами: автор влил базу
+        # сжатием — коммиты базы тогда не предки по хешу и целиком считаются
+        # его работой (#1240); или тронул РОВНО те же файлы, что приехали, и
+        # разбор по путям отдал их автору целиком. Оба промаха в безопасную
+        # сторону — предмет шире, профиль дороже, — но карточка обязана
+        # называть измеренное, а не вывод из него.
+        return DeltaSubject(
+            author,
+            [],
+            own,
+            f"{head}: {len(author)} файл(ов) автора, файлов только из базы нет "
+            "(база, влитая сжатием, по хешу не отличима и считается правкой "
+            "автора, #1240)",
+        )
+    return DeltaSubject(
+        author,
+        brought,
+        own,
+        f"{head}: {len(author)} файл(ов) автора и {len(brought)} привезено базой",
     )
 
 
@@ -358,6 +474,7 @@ def diff_plan(
     delta_paths: list[str] | None = None,
     delta_note: str = "",
     prior_findings: list[str] | None = None,
+    base_paths: list[str] | None = None,
 ) -> tuple[str, str]:
     """What the reviewer should read, and the note for the task update (#874).
 
@@ -372,6 +489,11 @@ def diff_plan(
     stays visible, which bare changed lines would have hidden. The coverage is
     stated in the block, because "read the delta" and "read the whole diff"
     are different claims about the same report (#549).
+
+    ``base_paths`` are the files that arrived with the base branch rather than
+    from the author (#1249). They are NAMED, not removed: a defect can exist
+    only where two branches meet — #1238 was exactly that — and a reviewer who
+    never learns the base moved cannot look for one.
     """
     if diff is None:
         return (
@@ -395,6 +517,17 @@ def diff_plan(
             "на прошлом поколении и сейчас НЕ пересматриваются — если "
             "найдёшь причину усомниться в этом, скажи об этом в отчёте."
         )
+        if base_paths:
+            named = ", ".join(base_paths[:30])
+            more = "" if len(base_paths) <= 30 else f" и ещё {len(base_paths) - 30}"
+            lines.append(
+                f"ПРИВЕЗЕНО БАЗОЙ, НЕ АВТОРОМ: {len(base_paths)} файл(ов) — "
+                f"{named}{more}. Это чужая работа: она уже прошла свой гейт, "
+                "и находки по ней адресованы не этому автору. Но база "
+                "СДВИНУЛАСЬ под правкой, а дефект бывает только на стыке двух "
+                "веток — если увидишь, что привезённое ломается о правку "
+                "автора, это находка, и назови её именно так."
+            )
     elif delta_note:
         lines.append(f"ОХВАТ: прочитан ВЕСЬ дифф ветки — {delta_note}.")
     if prior_findings:
@@ -1222,7 +1355,14 @@ async def _policy_and_novelty_allow(
         # REVIEW_LADDER_MAX_STEPS ограничивает число прогонов на
         # генерацию, а подниматься выше дешёвого профиля некуда.
         return True
-    return not await _this_code_was_already_read(db, task)
+    if await _this_code_was_already_read(db, task):
+        return False
+    # #1255: третий тихий отказ той же природы — новое чтение уже не купит
+    # ничего нового, потому что находки перестали убывать. Стоит ПОСЛЕ
+    # проверки новизны: повтор того же кода — её вопрос, а здесь код менялся.
+    # Добор выше сюда не доходит намеренно: он дочитывает УЖЕ оплаченное
+    # поколение, а не покупает следующее.
+    return not await findings_stopped_converging(db, task)
 
 
 #: Метка записи об отсутствующем ревьюере, по которой она находится снова.
@@ -1363,6 +1503,14 @@ async def _this_code_was_already_read(
     return True
 
 
+#: Отчёт — независимое чтение, а не самоотчёт исполнителя о своей работе.
+#: Одно условие на всех читателей machine_reviews, которым это важно: страж
+#: новизны не считает самоотчёт покрытием кода (#1011, #1025), траектория
+#: несходимости (#1255) не берёт его ни точкой, ни сбросом. Второй редакции
+#: этого правила не заводим. Псевдоним таблицы в запросе — ``mr``.
+INDEPENDENT_READ = "COALESCE(mr.self_reviewed, 0) = 0"
+
+
 async def _report_already_covers_this_sha(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> int | None:
@@ -1407,7 +1555,7 @@ async def _report_already_covers_this_sha(
         return None
     rows = await fetchall(
         db,
-        "SELECT mr.id AS review_id, s.sha AS sha "
+        "SELECT mr.id AS review_id, s.sha AS sha "  # nosec B608 - константа модуля, не ввод
         "FROM machine_reviews mr "
         "JOIN submissions s ON s.task_id = mr.task_id "
         "AND s.generation = mr.submission_generation "
@@ -1423,7 +1571,7 @@ async def _report_already_covers_this_sha(
         # диспетчер как выполненный (#1011, #1025) — здесь он закрывал бы
         # его ещё до старта. «Код прочитан» имеет смысл только про того,
         # кто читал его со стороны.
-        "AND COALESCE(mr.self_reviewed, 0) = 0",
+        f"AND {INDEPENDENT_READ}",
         (task_id, generation),
     )
     for row in rows:
@@ -1516,14 +1664,6 @@ async def prepare_review_order(
     # areas the author declared — self-assessment cannot exempt work from
     # oversight (#582). An unreadable diff buys deep, it does not excuse it.
     diff = await _submission_diff(db, task_id, branch)
-    if force_profile:
-        profile, profile_reasons = (
-            force_profile,
-            ["профиль задан заказом: добор лестницы или его замена"],
-        )
-    else:
-        profile, profile_reasons = pick_review_profile(task, diff)
-    rules_block, rules_note = await collect_review_rules(db, task_id, diff)
     # #874: which base the reviewer diffs against. Unknown base falls back to
     # the configured one rather than to nothing — a command the reviewer cannot
     # run would send it back to inventing its own, which is what we are fixing.
@@ -1532,10 +1672,31 @@ async def prepare_review_order(
     # #880: a resubmission reads what changed since the previous generation,
     # not the whole branch again. Every reason the delta cannot be trusted
     # falls back to the full diff and says so.
-    delta_paths, delta_note = await generation_delta(db, task, base)
+    subject = await generation_delta(db, task, base)
+    # #1249: the profile is bought for the AUTHOR's change. On a resubmission
+    # that merged the base branch, the plain delta also carries other people's
+    # work — code that already passed its own gate — and a process surface
+    # found only there used to buy the deep harness on somebody else's behalf.
+    # An origin that could not be established leaves ``author_diff`` empty and
+    # the whole submitted diff decides, exactly as before.
+    profile_diff = subject.author_diff or diff
+    if force_profile:
+        profile, profile_reasons = (
+            force_profile,
+            ["профиль задан заказом: добор лестницы или его замена"],
+        )
+    else:
+        profile, profile_reasons = pick_review_profile(task, profile_diff)
+    rules_block, rules_note = await collect_review_rules(db, task_id, diff)
     prior = await previous_findings(db, task_id, generation)
     diff_block, diff_note = diff_plan(
-        diff, base, branch, delta_paths, delta_note, prior
+        diff,
+        base,
+        branch,
+        subject.paths,
+        subject.note,
+        prior,
+        subject.base_paths,
     )
     # #875: what the toolchain already proved on THIS commit. Built from the
     # task row the caller already read, so no extra query for the common case.
@@ -1747,7 +1908,11 @@ async def _create_or_adopt(
 
 
 async def maybe_dispatch_review(
-    db: aiosqlite.Connection, task_id: int, *, force_profile: str = ""
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    force_profile: str = "",
+    replaces_dispatch_id: int | None = None,
 ) -> bool:
     """Queue a cloud reviewer for a fresh submission when policy allows.
 
@@ -1758,6 +1923,10 @@ async def maybe_dispatch_review(
     ``force_profile`` skips the profile choice and runs the named one — the
     top-up step of the ladder (#879), where the profile is no longer a guess
     about the task but a fact about the run that just failed to finish.
+
+    ``replaces_dispatch_id`` is set only by the ask-again pass (#1242): the
+    new order CONTINUES the rung of the failed one it names instead of
+    opening a new one, both for the ladder count and for report matching.
     """
     row = await repo.get_task(db, task_id)
     if row is None:
@@ -1847,6 +2016,20 @@ async def maybe_dispatch_review(
         principal_id=expected_principal,
     )
     model_id, profile, profile_reasons = order.model, order.profile, order.reasons
+    # Последнее слово перед тратой. Подготовка заказа выше ходит в сеть за
+    # диффом и правилами, и за это окно сдача могла смениться — ЛЮБОЙ
+    # облачный заказ, не только переспрос (находка dcd7da1fa88023c5): тот же
+    # фильтр свежести, что у второй двери (#1252). Для переспроса ещё и отчёт,
+    # доехавший в это окно (находка 17a9ca6ea3451163). Отказ здесь тихий:
+    # у переспроса ОБА отказа — и по отчёту, и по свежести — называет сам
+    # переспрос (_name_a_cancelled_retry, находка 40a8fd8b727c82ec), а
+    # первичный заказ сменившейся сдачи заменит заказ её новой сдачи, как и
+    # у второй двери (#1252).
+    if not await _submission_still_live(db, task, branch, generation) or (
+        replaces_dispatch_id is not None
+        and await repo.machine_reviews_of_generation(db, task_id, generation)
+    ):
+        return False
     started = await _create_or_adopt(
         cursor_cloud.agent_marker(
             "review",
@@ -1889,57 +2072,15 @@ async def maybe_dispatch_review(
             # провайдер отверг создание, либо сверка подтвердила, что агента
             # нет. Слепота — ни то, ни другое, и остаётся человеку.
             return False
-        # Долг второй двери записывается ДО попытки её открыть (#1266), тем
-        # же способом, каким это уже делает асинхронный путь (owe_second_
-        # door, _close_a_run_without_a_report): строка-заглушка коммитится
-        # первой, и только потом идёт рискованный вызов (review_reach,
-        # счёт токенов, сетевая prepare_review_order). Без этого порядка
-        # падение ВНУТРИ open_second_door не оставляло свипу ничего, что
-        # повторить, — вторая дверь терялась навсегда, потому что строки не
-        # было вовсе. agent_id пуст здесь НЕ временно: ничего не создано и
-        # не оплачено, и count_review_dispatches (#1266) такую строку в шаг
-        # лестницы не считает.
-        stub_id = await repo.create_review_dispatch(
+        return await _owe_the_refused_call(
             db,
-            task_id=task_id,
-            submission_generation=generation,
-            agent_id="",
-            run_id="",
+            task,
+            detail,
             model=model_id,
             profile=profile,
-            reviewer_principal_id=expected_principal,
-            channel=CLOUD_CHANNEL,
+            principal_id=expected_principal,
+            replaces_dispatch_id=replaces_dispatch_id,
         )
-        await repo.owe_second_door(db, stub_id, detail)
-        await db.commit()
-        stub_row = await repo.get_review_dispatch_for_generation(
-            db, task_id, generation
-        )
-        stub = dict(stub_row) if stub_row is not None else None
-        if stub is None:  # pragma: no cover - defensive, row was just committed
-            return False
-        # Дальше долг разбирает ТОТ ЖЕ путь, что и асинхронный отказ:
-        # _settle_second_door сама решает, открывать ли дверь, и сама же
-        # закрывает строку. Успех отсюда виден тем же наблюдением, каким
-        # _second_door_already_opened судит повтор — живой или удавшийся
-        # локальный заказ по ЭТОМУ долгу, а не догадкой по пути, которым
-        # сюда пришли.
-        await _settle_second_door(db, stub, task_row=task)
-        opened = await _second_door_already_opened(db, stub)
-        # Заглушка была ТОЛЬКО страховкой от падения внутри вызова выше —
-        # раз мы досюда дошли без исключения, падения не было, и сама она
-        # больше не нужна ни свипу, ни счёту шагов. Не убрать её значило бы
-        # оставить облачную строку там, где по AC-3 #1252 её не бывает
-        # вовсе (ненастроенный путь — байт в байт как раньше) и там, где
-        # AC-1 #1252 требует ровно одну строку, локальную. Падение МЕЖДУ
-        # _settle_second_door и этим удалением не теряет долг: строка к
-        # тому моменту уже закрыта (done/failed) самой _settle_second_door,
-        # а следующий свип такую строку не трогает — то есть худшее, что
-        # оставляет несостоявшееся удаление, это лишняя закрытая строка в
-        # истории, не потерянная вторая дверь.
-        await repo.delete_review_dispatch(db, stub["id"])
-        await db.commit()
-        return opened
 
     # #1025: pin whose report this dispatch waits for, resolved from the
     # reviewer token at dispatch time (above, where the code was minted under
@@ -1961,6 +2102,7 @@ async def maybe_dispatch_review(
         model=model_id,
         profile=profile,
         reviewer_principal_id=expected_principal,
+        replaces_dispatch_id=replaces_dispatch_id,
     )
     profile_note = (
         f"профиль {profile} (один проход по диффу)"
@@ -2016,6 +2158,85 @@ async def maybe_dispatch_review(
         agent_id,
     )
     return True
+
+
+async def _owe_the_refused_call(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    detail: str,
+    *,
+    model: str,
+    profile: str,
+    principal_id: int | None,
+    replaces_dispatch_id: int | None,
+) -> bool:
+    """Синхронный отказ облака: долг второй двери и след для переспроса.
+
+    Вынесено из ``maybe_dispatch_review`` (#1242): та стоит на потолке в 60
+    операторов, а у этого пути появилась развилка.
+
+    Заглушка переживает вызов, если вторая дверь НЕ открылась (#1242). До
+    этого она удалялась всегда, и синхронный отказ без настроенного
+    локального пути не оставлял в базе ничего, кроме алерта: переспросу было
+    не за что зацепиться, и сдача стояла без отчёта навсегда — ровно так
+    #1162 и #1281 получили 22.09 «HTTP 429» и не получили повтора. Осевшая
+    заглушка (``failed``, пустой ``agent_id``) ничего не стоила и ступенью
+    лестницы не считается (``count_review_dispatches``); она — единственная
+    запись о том, что вызов был и сорвался.
+    """
+    task_id = int(task["id"])
+    generation = int(task.get("submission_generation") or 0)
+    # Долг второй двери записывается ДО попытки её открыть (#1266), тем
+    # же способом, каким это уже делает асинхронный путь (owe_second_
+    # door, _close_a_run_without_a_report): строка-заглушка коммитится
+    # первой, и только потом идёт рискованный вызов (review_reach,
+    # счёт токенов, сетевая prepare_review_order). Без этого порядка
+    # падение ВНУТРИ open_second_door не оставляло свипу ничего, что
+    # повторить, — вторая дверь терялась навсегда, потому что строки не
+    # было вовсе. agent_id пуст здесь НЕ временно: ничего не создано и
+    # не оплачено, и count_review_dispatches (#1266) такую строку в шаг
+    # лестницы не считает.
+    stub_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        agent_id="",
+        run_id="",
+        model=model,
+        profile=profile,
+        reviewer_principal_id=principal_id,
+        channel=CLOUD_CHANNEL,
+        replaces_dispatch_id=replaces_dispatch_id,
+    )
+    await repo.owe_second_door(db, stub_id, detail)
+    await db.commit()
+    stub_row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    stub = dict(stub_row) if stub_row is not None else None
+    if stub is None:  # pragma: no cover - defensive, row was just committed
+        return False
+    # Дальше долг разбирает ТОТ ЖЕ путь, что и асинхронный отказ:
+    # _settle_second_door сама решает, открывать ли дверь, и сама же
+    # закрывает строку. Успех отсюда виден тем же наблюдением, каким
+    # _second_door_already_opened судит повтор — живой или удавшийся
+    # локальный заказ по ЭТОМУ долгу, а не догадкой по пути, которым
+    # сюда пришли.
+    await _settle_second_door(db, stub, task_row=task)
+    opened = await _second_door_already_opened(db, stub)
+    # Открытая дверь: заглушка была ТОЛЬКО страховкой от падения внутри
+    # вызова выше, и AC-1 #1252 требует ровно одну строку, локальную.
+    # Падение МЕЖДУ _settle_second_door и этим удалением не теряет долг:
+    # строка к тому моменту уже закрыта самой _settle_second_door.
+    #
+    # Закрытая дверь (#1242): заглушка ОСТАЁТСЯ закрытой в failed. Это
+    # след сорвавшегося вызова, по которому свип переспрашивает облако
+    # (_ask_again_lost_reviews); удалить её значило вернуть случай 22.09 —
+    # отказ без отчёта и без повтора. Прежнее «ни одной строки» по AC-3
+    # #1252 уточнено этим: локального прогона по-прежнему нет, строка —
+    # облачная и ничего не стоившая.
+    if opened:
+        await repo.delete_review_dispatch(db, stub["id"])
+        await db.commit()
+    return opened
 
 
 @dataclass(frozen=True)
@@ -2887,12 +3108,22 @@ async def _dispatch_report(
     # был первым (индекс 0), и годный контрактный отчёт не опознавался своим
     # же заказом: прогон объявлялся упавшим, а закрытого заказа не
     # оставалось вовсе — то есть пустое ревью не могло дать автовердикт.
+    #
+    # #1242: заказ, ЗАМЕЩЁННЫЙ переспросом того же канала, ступени не
+    # занимает. Он кончился без отчёта, и повтор — продолжение той же
+    # ступени, а не следующая: без этого свежий ревьюер ждал бы второго
+    # отчёта принципала, а его первый отчёт оставался бы ничьим. Замена
+    # второй дверью (другой канал) сюда не попадает намеренно — у неё свой
+    # порядок и свой разбор (#1252).
+    channel = dispatch.get("channel") or CLOUD_CHANNEL
     dispatch_ids = await fetchall(
         db,
         "SELECT id FROM review_dispatches WHERE task_id = ? "
         "AND submission_generation = ? AND reviewer_principal_id = ? "
-        "AND channel = ? ORDER BY id",
-        (task_id, generation, expected, dispatch.get("channel") or CLOUD_CHANNEL),
+        "AND channel = ? AND id NOT IN (SELECT replaces_dispatch_id "
+        "FROM review_dispatches WHERE task_id = ? AND submission_generation = ? "
+        "AND channel = ? AND replaces_dispatch_id IS NOT NULL) ORDER BY id",
+        (task_id, generation, expected, channel, task_id, generation, channel),
     )
     order = [int(dict(r)["id"]) for r in dispatch_ids]
     try:
@@ -3175,8 +3406,13 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     - report arrived → cross-check tokens against the provider's usage
       (mismatch is an audit flag, never a mechanical block) → done;
     - run terminal, no report, grace expired → one loud alert → failed;
-    - run still going / API unreachable → leave for the next pass.
+    - run still going / API unreachable → leave for the next pass;
+    - the last order of a live submission failed without any report →
+      ask again, up to a per-generation ceiling (#1242).
     """
+    # #1242: переспрос — ДО разбора активных строк. Заказ, закрытый упавшим
+    # на этом проходе, переспрашивается на следующем, а не в ту же минуту.
+    await _ask_again_lost_reviews(db)
     for row in await repo.list_active_review_dispatches(db):
         dispatch = dict(row)
         task_id = dispatch["task_id"]
@@ -3488,15 +3724,7 @@ async def _second_door_after_run(
         # ложью про событие, которого не случилось. run_status для заглушки
         # несёт НАБЛЮДЁННУЮ причину отказа (_lost_call_detail), а не код
         # статуса рана, и печатается как есть, без обёртки «кончился».
-        cloud_refusal=(
-            f"провайдер отказал в создании агента: {run_status}"
-            if not (dispatch.get("agent_id") or "").strip()
-            else (
-                f"прогон облачного агента {dispatch['agent_id']} "
-                f"({dispatch.get('model') or 'модель не названа'}) кончился "
-                f"статусом {run_status} и отчёта не оставил"
-            )
-        ),
+        cloud_refusal=_cloud_refusal_text(dispatch, run_status),
         late_report_recheck=dispatch,
     )
     # Последнее слово — уже ПОСЛЕ попытки открыть дверь, а не только до неё
@@ -3506,6 +3734,213 @@ async def _second_door_after_run(
     # если СВОЙ отчёт этого заказа тем временем нашёлся, статус решает он, а
     # не путь, которым мы сюда пришли.
     return await _dispatch_report(db, int(task["id"]), generation, dispatch) is not None
+
+
+def _cloud_refusal_text(dispatch: dict[str, Any], run_status: Any) -> str:
+    """Наблюдённая причина, по которой облачный заказ отчёта не дал.
+
+    Один автор на два места: вторая дверь (#1252) и переспрос (#1242)
+    называют один и тот же сбой одними словами.
+    """
+    # #1266 раунд 2 (7a78080de93938ae): пустой agent_id здесь значит
+    # СИНХРОННЫЙ отказ на СОЗДАНИИ (заглушка долга из maybe_dispatch_
+    # review, а не прогон, дошедший до терминального статуса) — агента и
+    # рана не было вовсе, и текст «прогон... кончился статусом» был бы
+    # ложью про событие, которого не случилось. run_status для заглушки
+    # несёт НАБЛЮДЁННУЮ причину отказа (_lost_call_detail), а не код
+    # статуса рана, и печатается как есть, без обёртки «кончился».
+    if not (dispatch.get("agent_id") or "").strip():
+        return f"провайдер отказал в создании агента: {run_status}"
+    return (
+        f"прогон облачного агента {dispatch['agent_id']} "
+        f"({dispatch.get('model') or 'модель не названа'}) кончился "
+        f"статусом {run_status} и отчёта не оставил"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Переспрос несостоявшегося ревью (#1242)
+# ---------------------------------------------------------------------------
+#
+# Облачный заказ, не давший отчёта, — синхронный отказ (429, 400) или
+# прогон, дошедший до терминального статуса без отчёта, — до #1242 был
+# концом пути, если вторая дверь (#1252) не открылась: локальный путь не
+# настроен или его прогон не запустился. Сдача стояла в review без отчёта
+# навсегда. Переспрос живёт в свипе, а не рядом с ним: кандидат — последний
+# заказ поколения, облачный и упавший, у сдачи, которая всё ещё его ждёт.
+#
+# Чем он НЕ является. Не лестницей добора (#879): та поднимает профиль по
+# СУЩЕСТВУЮЩЕМУ неполному отчёту, переспрос срабатывает только там, где
+# отчёта этого поколения нет вовсе. Не обходом стража второй читки: повтор
+# идёт через maybe_dispatch_review без force_profile, то есть через тот же
+# страж; пропускает он его законно — код этой вершины никто не прочитал. И не
+# второй дверью: открытая дверь делает последним заказом локальный, и
+# переспрос облака её не дублирует.
+
+#: Сколько раз облако переспрашивается на ОДНО поколение сдачи. Не на
+#: задачу: пересдача — новый код и новый счёт. Два — потому что сбои, ради
+#: которых это заведено (429 по лимиту, упавший ран), разовые; постоянный
+#: сбой после двух повторов — вопрос к форме вызова, а не к числу попыток.
+REVIEW_ASK_AGAIN_MAX = 2
+
+#: Пауза между сбоем и переспросом, от создания упавшего заказа. Отказ 429 —
+#: это «не сейчас»; переспрос в ту же минуту купил бы тот же отказ.
+REVIEW_ASK_AGAIN_PAUSE_MINUTES = 10
+
+#: Метки записей, по которым переспрос считается и находится снова. Номер
+#: поколения внутри — по образцу NO_REVIEWER_MARK: счёт в пределах сдачи.
+#: Запись делается ДО вызова, поэтому попытка видна и тогда, когда вызов не
+#: оставил строки (слепой исход #1199, упавший процесс).
+ASK_AGAIN_MARK = "[переспрос ревью: сдача {generation}]"
+ASK_AGAIN_EXHAUSTED_MARK = "[переспрос ревью исчерпан: сдача {generation}]"
+
+
+async def _ask_again_lost_reviews(db: aiosqlite.Connection) -> None:
+    """Переспросить облако по сдачам, чей последний заказ упал без отчёта."""
+    rows = await fetchall(
+        db,
+        "SELECT d.* FROM review_dispatches d JOIN tasks t ON t.id = d.task_id "
+        "WHERE d.status = 'failed' AND d.channel = ? AND t.status = 'review' "
+        "AND t.submission_generation = d.submission_generation "
+        "AND d.id = (SELECT MAX(x.id) FROM review_dispatches x "
+        "WHERE x.task_id = d.task_id "
+        "AND x.submission_generation = d.submission_generation) "
+        "AND d.created_at <= datetime('now', ?) ORDER BY d.id",
+        (CLOUD_CHANNEL, f"-{REVIEW_ASK_AGAIN_PAUSE_MINUTES} minutes"),
+    )
+    for row in rows:
+        await _ask_again(db, dict(row))
+
+
+async def _ask_again(db: aiosqlite.Connection, failed: dict[str, Any]) -> None:
+    task_id = int(failed["task_id"])
+    generation = int(failed["submission_generation"])
+    # Отчёт этого поколения есть — любой, в том числе неполный или чужой:
+    # переспрос не покупается. Неполнота — предмет лестницы (#879).
+    if await repo.machine_reviews_of_generation(db, task_id, generation):
+        return
+    mark = ASK_AGAIN_MARK.format(generation=generation)
+    asked = await _count_marked_alerts(db, task_id, mark)
+    retried = await _count_retry_orders(db, task_id, generation)
+    cause = _cloud_refusal_text(failed, failed.get("run_status") or "не записан")
+    if asked >= REVIEW_ASK_AGAIN_MAX or asked > retried:
+        await _name_the_exhausted_retries(db, task_id, generation, asked, cause)
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"{mark} Переспрос ревью {asked + 1} из {REVIEW_ASK_AGAIN_MAX}: заказ "
+        f"#{failed['id']} отчёта не дал — {cause}. Отчёта этой сдачи нет "
+        "вовсе, поэтому ревьюер зовётся снова; ступень лестницы (#879) он "
+        "не съедает (#1242).",
+    )
+    await db.commit()
+    task_row = await repo.get_task(db, task_id)
+    branch = (dict(task_row).get("branch") or "").strip() if task_row else ""
+    if await maybe_dispatch_review(db, task_id, replaces_dispatch_id=int(failed["id"])):
+        return
+    await _name_a_cancelled_retry(db, task_id, generation, branch, asked + 1)
+
+
+async def _name_a_cancelled_retry(
+    db: aiosqlite.Connection, task_id: int, generation: int, branch: str, n: int
+) -> None:
+    """Назвать переспрос, отменённый последним словом перед тратой.
+
+    Запись о переспросе стоит ДО вызова и обещает ревьюера (находка
+    2007bee302b71bf4). Два отказа последнего слова своего алерта не пишут —
+    отчёт, успевший лечь, и сдача, сменившаяся за подготовку (находка
+    40a8fd8b727c82ec), — поэтому их называет переспрос. Остальные отказы
+    (конфигурация, политика, страж второй читки, слепой исход) диспетчер
+    называет сам, и второго объяснения им здесь не заводим.
+    """
+    if await repo.machine_reviews_of_generation(db, task_id, generation):
+        why = "отчёт этой сдачи успел лечь, пока заказ готовился"
+    elif not await _submission_still_live(db, {"id": task_id}, branch, generation):
+        why = "сдача сменилась, пока заказ готовился, — облако не зовётся"
+    else:
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        # Без метки: счёт попыток ведут записи о вызове, а не об отмене.
+        f"Переспрос ревью {n} отменён: {why}; второго ревьюера не покупали (#1242).",
+    )
+    await db.commit()
+
+
+async def _count_marked_alerts(
+    db: aiosqlite.Connection, task_id: int, mark: str
+) -> int:
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM task_updates WHERE task_id = ? "
+        "AND kind = 'alert' AND instr(content, ?) > 0",
+        (task_id, mark),
+    )
+    return int(dict(rows[0])["n"]) if rows else 0
+
+
+async def _count_retry_orders(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> int:
+    """Сколько облачных заказов поколения оставили переспросы.
+
+    Замена второй дверью — строка другого канала и сюда не входит. Меньше
+    записанных попыток — значит, какая-то попытка строки не оставила: слепой
+    исход (#1199), отказ конфигурации или политики, упавший процесс.
+    Повторять вслепую нельзя — это и есть «наивный повтор» #1199.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM review_dispatches WHERE task_id = ? "
+        "AND submission_generation = ? AND channel = ? "
+        "AND replaces_dispatch_id IS NOT NULL",
+        (task_id, generation, CLOUD_CHANNEL),
+    )
+    return int(dict(rows[0])["n"]) if rows else 0
+
+
+async def _name_the_exhausted_retries(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    asked: int,
+    cause: str,
+) -> None:
+    """Один алерт человеку на поколение: сколько раз спросили и что сорвалось."""
+    mark = ASK_AGAIN_EXHAUSTED_MARK.format(generation=generation)
+    if await _count_marked_alerts(db, task_id, mark):
+        return
+    # Находка c82b1af523ba9dd7: попытка без строки заказа — это не всегда
+    # слепой исход #1199. Отказ конфигурации, политики или стража второй
+    # читки тоже не оставляет строки, и его причина уже стоит в карточке
+    # алертом диспетчера. Переспрос исхода не знает — и не выдумывает его:
+    # останавливается (повтор ни одного из этих исходов не меняет, а слепой
+    # запрещает) и ссылается на алерт, который причину называет.
+    why = (
+        f"потолок {REVIEW_ASK_AGAIN_MAX} переспросов на сдачу исчерпан"
+        if asked >= REVIEW_ASK_AGAIN_MAX
+        else "прошлый переспрос не оставил заказа, причина — в алерте "
+        "после него (конфигурация, политика, страж второй читки, сменившаяся "
+        "сдача или ответ, который не дошёл, #1199); не зная исхода, хаб не "
+        "повторяет"
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"{mark} Ревью этой сдачи так и не состоялось: {why}. Переспросов: "
+        f"{asked}, последний упавший заказ — {cause}. Ещё одного ревьюера хаб "
+        "не покупает; решение за человеком. Если сбой один и тот же — смотреть "
+        "форму вызова, а не число попыток (#1242).",
+    )
+    await db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -3856,3 +4291,267 @@ async def _already_named_the_circle(
         (task_id, f"%{mark}%"),
     )
     return bool(rows)
+
+
+# ---------------------------------------------------------------------------
+# Несходимость находок по поколениям (#1255)
+# ---------------------------------------------------------------------------
+#
+# Круг (#1235) НАЗЫВАЕТ задачу, но прогон всё равно покупается. Здесь другой
+# вопрос и другое действие: убывают ли ОТКРЫТЫЕ находки от поколения к
+# поколению. Если нет — следующий прогон не покупается, а человеку задаётся
+# вопрос «постановка или код» с самой последовательностью перед глазами.
+# Решает человек; хаб только перестаёт платить за ответ, который уже виден.
+
+#: Сколько поколений с отчётом правило смотрит, прежде чем судить.
+#:
+#: ИЗМЕРЕНО, а не выбрано: прогон правила по окнам 2..5 на 26 размеченных
+#: траекториях (tests/test_review_dispatch.py::NON_CONVERGENCE_HISTORY):
+#: 6 из постановки #1255 (confirmed + unresolved, замер 11.09.2026) и 20 из
+#: ленты событий прода (/api/events, machine_review_completed — только
+#: confirmed, 23.09.2026). Сошедшихся 22, несошедшихся 4.
+#: Окно 2 останавливает зря три сошедшиеся (#1204 на плато [6,2,2,2],
+#: #1265, #1271). Окно 4 и шире пропускает все три короткие несошедшиеся
+#: (#1081 [5,6,6], #1084 [3,6,3], #1186 [7,2,13]). Окно 3 — единственное,
+#: при котором сошедшихся остановлено зря НОЛЬ из 22, а поймано четыре из
+#: четырёх, #1208 — на четвёртом поколении. Оговорка: несошедшиеся примеры
+#: есть только в постановке — в ленте нет unresolved, а по одной confirmed
+#: несходимость #1208 не видна. Тест
+#: test_the_threshold_is_measured_on_the_history_not_chosen повторяет этот
+#: прогон и падает, если число здесь разойдётся с замером.
+NON_CONVERGENCE_WINDOW = 3
+
+#: Меньше скольких открытых находок задача считается сходящейся. Тот же
+#: край, что в разметке замера #1255: «убыло и осталось не больше одной» —
+#: сошлась. Измерено по ленте: без него плато из единиц (#1261 [0,1,1,1,0])
+#: останавливалось зря, хотя следующей сдачей задача сошлась.
+NON_CONVERGENCE_FLOOR = 2
+
+#: Исходы, которыми находка ЗАКРЫТА разбором, а не правкой: автор или
+#: человек сказал «это не дефект» или «уходит в другую задачу». Такая
+#: находка не открыта ни в одном поколении, где её нашли, — иначе честный
+#: разбор читался бы как несходимость (AC-4). ``fixed``/``real_fixed`` сюда
+#: НЕ входят намеренно: «починено» проверяет следующий отчёт, и находка,
+#: найденная снова, остаётся открытой, а новый слой после починки — это и
+#: есть та смена одного набора дефектов на другой, которую правило ловит.
+#: ``not_judged`` — «не смотрел», это не закрытие.
+DISPOSED_OUTCOMES: frozenset[str] = frozenset(
+    {"false_positive", "wont_fix", "deferred", "real_deferred", "not_a_defect"}
+)
+
+#: Метка вопроса в карточке: сдача, на которой остановлен прогон, и
+#: поколение постановки в этот момент. По ней вопрос находится снова, и по
+#: ней же видно, ответил ли человек (_non_convergence_answered).
+NON_CONVERGENCE_MARK = (
+    "[несходимость находок: сдача {generation}, постановка {statement}]"
+)
+_NON_CONVERGENCE_MARK_RE = re.compile(
+    r"\[несходимость находок: сдача (\d+), постановка (\d+)\]"
+)
+
+
+def _fires_at_last(counts: Sequence[int], window: int) -> bool:
+    """Выполнено ли условие несходимости на ПОСЛЕДНЕЙ позиции ``counts``.
+
+    Судится только ХВОСТ после последнего нуля: чистый отчёт — схождение, и
+    находки после него — новый заход, а не продолжение старого (тот же
+    приём, которым review_circle обнуляет круг на чистом отчёте). Без этого
+    [0, 1, 0, 2] (#1204 по ленте событий) читался бы как «ниже нуля не
+    опустилась» и останавливался зря.
+
+    Условие стоит, когда в хвосте не меньше ``window`` отчётов, на последнем
+    открытых находок НЕ МЕНЬШЕ ``NON_CONVERGENCE_FLOOR`` и верно одно из
+    двух:
+
+    * находок не меньше, чем в первом отчёте хвоста: после window−1 кругов
+      правок задача не ушла ниже старта (#1081, #1084, #1186, #1208);
+    * наименьший счёт не обновлялся ``window`` отчётов подряд — колебание,
+      не опускающееся ниже уже достигнутого.
+    """
+    zeros = [i for i, count in enumerate(counts) if count == 0]
+    tail = counts[zeros[-1] + 1 :] if zeros else counts
+    if len(tail) < window or tail[-1] < NON_CONVERGENCE_FLOOR:
+        return False
+    best_at = min(range(len(tail)), key=lambda i: (tail[i], i))
+    return tail[-1] >= tail[0] or len(tail) - 1 - best_at >= window
+
+
+def non_convergence_point(
+    counts: Sequence[int], window: int = NON_CONVERGENCE_WINDOW
+) -> int | None:
+    """Позиция (с 1), на которой правило срабатывает впервые, или None.
+
+    Длинная, но убывающая с колебаниями траектория (#1167, #1204) не
+    ловится: минимум она обновляет раньше, чем истечёт окно, и ниже старта
+    уходит сразу.
+    """
+    for position in range(1, len(counts) + 1):
+        if _fires_at_last(counts[:position], window):
+            return position
+    return None
+
+
+@dataclass(frozen=True)
+class FindingTrajectory:
+    """Открытые находки по поколениям С ОТЧЁТОМ в хабе, по порядку."""
+
+    generations: tuple[int, ...]
+    counts: tuple[int, ...]
+
+    def fires_now(self) -> bool:
+        """Стоит ли условие на последнем известном поколении."""
+        return _fires_at_last(self.counts, NON_CONVERGENCE_WINDOW)
+
+    def sequence(self) -> str:
+        """``сдача 1: 3, сдача 2: 4, …`` — то, по чему решает человек."""
+        return ", ".join(
+            f"сдача {g}: {c}" for g, c in zip(self.generations, self.counts)
+        )
+
+
+async def _disposed_uids(db: aiosqlite.Connection, task_id: int) -> set[str]:
+    """Находки, закрытые разбором: исход автора или диспозиция человека."""
+    marks = ",".join("?" for _ in DISPOSED_OUTCOMES)
+    params = (task_id, *sorted(DISPOSED_OUTCOMES))
+    rows = await fetchall(
+        db,
+        f"SELECT finding_uid FROM finding_outcomes WHERE task_id=? "  # nosec B608
+        f"AND outcome IN ({marks}) "
+        f"UNION SELECT finding_uid FROM finding_dispositions WHERE task_id=? "
+        f"AND disposition IN ({marks})",
+        params + params,
+    )
+    return {str(dict(r)["finding_uid"] or "") for r in rows} - {""}
+
+
+async def finding_trajectory(
+    db: aiosqlite.Connection, task_id: int, before_generation: int
+) -> FindingTrajectory:
+    """Счёт ОТКРЫТЫХ находок по поколениям до ``before_generation``.
+
+    СВЁРТКА нескольких отчётов одного поколения — ОБЪЕДИНЕНИЕ по
+    ``finding_uid``. Лестница (#879) кладёт на поколение lite и добор deep;
+    второй часто повторяет первый. Сумма посчитала бы повтор дважды, а
+    максимум спрятал бы находки, которые нашёл только один из двух, — хотя
+    они такие же открытые. Объединение по uid — тот же приём, которым
+    review_circle считает «пришло новых».
+
+    НЕПОЛНЫЙ отчёт без находок пропускается: «машина не дочитала» — не
+    «чисто» (#1234), и нулём, то есть схождением, он не становится.
+
+    Поколения без отчёта в хабе (внешний ревьюер, #1252) не видны вовсе:
+    правило сужено до них честно, и вопрос человеку это говорит.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT mr.submission_generation, mr.findings_confirmed, mr.unresolved, "  # nosec B608 - константа модуля, не ввод
+        "mr.incomplete FROM machine_reviews mr "
+        "WHERE mr.task_id=? AND mr.submission_generation < ? "
+        # Самоотчёт — не чтение со стороны: ни точка траектории, ни сброс её
+        # хвоста чистым нулём (находка e6250c505eb42e95).
+        f"AND {INDEPENDENT_READ} "
+        "ORDER BY mr.submission_generation, mr.id",
+        (task_id, before_generation),
+    )
+    per_generation: dict[int, set[str]] = {}
+    for raw in rows:
+        row = dict(raw)
+        uids = {uid for uid, _ in _findings_of(row)}
+        if not uids and bool(row.get("incomplete")):
+            continue
+        generation = int(row.get("submission_generation") or 0)
+        per_generation.setdefault(generation, set()).update(uids)
+    disposed = await _disposed_uids(db, task_id)
+    generations = tuple(sorted(per_generation))
+    return FindingTrajectory(
+        generations=generations,
+        counts=tuple(len(per_generation[g] - disposed) for g in generations),
+    )
+
+
+def non_convergence_question(trajectory: FindingTrajectory, submissions: int) -> str:
+    """Текст вопроса человеку. Один на все места, где он звучит (#1188)."""
+    return (
+        "Следующий прогон машинного ревью НЕ заказан: открытые находки не "
+        f"убывают ({trajectory.sequence()}). Вопрос человеку — постановка "
+        "или код? Если находки меняют один набор дефектов на другой при "
+        "настоящих правках, причина обычно в постановке (так было на "
+        "#1208: ограничение, которое девять кругов никто не оспорил). "
+        "Ответ — вердикт по этой сдаче или правка постановки; после него "
+        "круги продолжаются. Посчитаны только сдачи с отчётом в хабе: "
+        f"{len(trajectory.generations)} из {submissions}; ревью, пришедшее "
+        "мимо хаба, здесь не видно. Порог "
+        f"NON_CONVERGENCE_WINDOW={NON_CONVERGENCE_WINDOW} измерен на истории (#1255)."
+    )
+
+
+async def _non_convergence_asked(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[int, int] | None:
+    """(сдача, постановка) из заданного вопроса, или None — не спрашивали."""
+    rows = await fetchall(
+        db,
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert' "
+        "AND content LIKE ? ORDER BY id DESC LIMIT 1",
+        (task_id, "%[несходимость находок: сдача %"),
+    )
+    if not rows:
+        return None
+    found = _NON_CONVERGENCE_MARK_RE.search(str(dict(rows[0])["content"]))
+    if found is None:  # pragma: no cover - метку пишет только этот модуль
+        return None
+    return int(found.group(1)), int(found.group(2))
+
+
+def _non_convergence_answered(task: dict[str, Any], asked: tuple[int, int]) -> bool:
+    """Ответил ли человек: вердикт по остановленной сдаче или новая постановка."""
+    generation, statement = asked
+    return (
+        int(task.get("review_verdict_generation") or 0) >= generation
+        or int(task.get("statement_generation") or 0) > statement
+    )
+
+
+async def findings_stopped_converging(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> bool:
+    """Не покупать прогон: находки не сходятся. True — прогон остановлен.
+
+    Вопрос задаётся ОДИН раз, на достижении порога. Пока человек не
+    ответил, следующие сдачи тоже стоят без прогона — молча: вопрос уже в
+    карточке. После ответа правило больше не останавливает эту задачу —
+    круги продолжаются, это решение человека, а не хаба.
+    """
+    task_id = int(task["id"])
+    asked = await _non_convergence_asked(db, task_id)
+    if asked is not None:
+        return not _non_convergence_answered(task, asked)
+    generation = int(task.get("submission_generation") or 0)
+    trajectory = await finding_trajectory(db, task_id, generation)
+    if not trajectory.fires_now():
+        return False
+    mark = NON_CONVERGENCE_MARK.format(
+        generation=generation, statement=int(task.get("statement_generation") or 0)
+    )
+    question = non_convergence_question(trajectory, generation - 1)
+    await repo.add_task_update(db, task_id, "hub", "alert", f"{question} {mark}")
+    await repo.insert_event(
+        db,
+        kind="review_non_convergence",
+        task_id=task_id,
+        actor="hub",
+        payload={
+            "generation": generation,
+            "generations": list(trajectory.generations),
+            "counts": list(trajectory.counts),
+            "window": NON_CONVERGENCE_WINDOW,
+            "question": question,
+        },
+    )
+    await db.commit()
+    log.info(
+        "task #%s: findings do not converge (%s), review run not bought",
+        task_id,
+        trajectory.sequence(),
+    )
+    return True

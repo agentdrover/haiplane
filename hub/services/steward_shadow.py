@@ -560,6 +560,75 @@ async def _project_expects_a_reviewer(db: aiosqlite.Connection, task_id: int) ->
     )
 
 
+async def _last_event_payload(
+    db: aiosqlite.Connection,
+    kind: str,
+    *,
+    task_id: int | None = None,
+    run_id: int | None = None,
+    order: tuple[int, str] | None = None,
+    today: bool = False,
+) -> dict[str, Any]:
+    """Полезная нагрузка ПОСЛЕДНЕГО события такого рода — или пустая.
+
+    Один читатель на весь приём «пиши только при смене причины» (#1290).
+    Им пользуются отказ режима act, временный отказ прогона и отказ самого
+    заказа (#1330): почти одинаковые запросы в разных местах разъехались бы
+    ровно на условии, по которому событие считается тем же самым.
+
+    ``run_id`` сужает до одного прогона: у задачи их несколько поколений, и
+    отказ соседнего слота — не повтор этого. ``order`` — (поколение, вид)
+    заказа, который ещё не размещён и поэтому прогона не имеет. ``today``
+    отсекает прошлые UTC-сутки: суточный потолок — факт одних суток, и
+    вчерашний отказ не повтор сегодняшнего. Граница стоит на created_at,
+    по которому есть индекс, — дедуп на каждом тике не сканирует ленту.
+    """
+    where = ["kind=?"]
+    params: list[Any] = [kind]
+    if task_id is not None:
+        where.append("task_id=?")
+        params.append(task_id)
+    if run_id is not None:
+        where.append("json_extract(payload, '$.run_id')=?")
+        params.append(run_id)
+    if order is not None:
+        where.append("json_extract(payload, '$.generation')=?")
+        where.append("json_extract(payload, '$.kind')=?")
+        params.extend(order)
+    if today:
+        where.append("created_at >= date('now')")
+    rows = await fetchall(
+        db,
+        f"SELECT payload FROM events WHERE {' AND '.join(where)} "  # nosec B608 - placeholders only, values are params
+        "ORDER BY id DESC LIMIT 1",
+        tuple(params),
+    )
+    if not rows:
+        return {}
+    try:
+        payload = json.loads(dict(rows[0]).get("payload") or "{}")
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+async def waiting_refusal_code(
+    db: aiosqlite.Connection, task_id: int, run_id: int
+) -> str:
+    """Код последнего ВРЕМЕННОГО отказа этого прогона — или пусто.
+
+    Нужен закрытию слота по дедлайну (#1290 AC-3): «не начался» и «ждал
+    ревьюера полчаса и не дождался» читались одинаково, а это разные
+    события. Окончательный отказ здесь не считается: он слот уже закрыл.
+    """
+    payload = await _last_event_payload(
+        db, EVENT_RUN_REFUSED, task_id=task_id, run_id=run_id
+    )
+    if not payload.get("retryable"):
+        return ""
+    return str(payload.get("reason") or "")
+
+
 async def _refuse_transiently(
     db: aiosqlite.Connection, order: dict, code: str, detail: str
 ) -> None:
@@ -574,25 +643,39 @@ async def _refuse_transiently(
 
     A same-family refusal is different and still closes the order: retrying it
     would refuse identically every time.
+
+    В ленту отказ ложится ОДИН РАЗ НА СМЕНУ ПРИЧИНЫ, а не на каждом проходе
+    поллера (#1290). Измерено 22.09.2026: 160 из 217 событий стюарда за
+    вечер — повторы одного этого отказа, по 51 на задачу за полчаса, и
+    восемь настоящих суждений тонули между ними. Приём тот же, что у
+    ``_announce_refusal_once`` ниже, и читатель прошлого события у них
+    общий: второго механизма дедупа здесь нет.
+
+    Дедуплицируется ЗАПИСЬ, а не ожидание: слот по-прежнему освобождается
+    каждый проход и живёт до дедлайна, а следующий тик пробует снова.
     """
     await db.execute(
         "UPDATE steward_runs SET agent_id='' WHERE id=? AND agent_id LIKE ?",
         (order["id"], f"{PENDING_PREFIX}%"),
     )
-    await repo.insert_event(
-        db,
-        kind=EVENT_RUN_REFUSED,
-        task_id=order["task_id"],
-        actor="hub",
-        payload={
-            "reason": code,
-            "detail": detail,
-            "run_id": order["id"],
-            "retryable": True,
-        },
+    previous = await _last_event_payload(
+        db, EVENT_RUN_REFUSED, task_id=order["task_id"], run_id=order["id"]
     )
+    if previous.get("reason") != code:
+        await repo.insert_event(
+            db,
+            kind=EVENT_RUN_REFUSED,
+            task_id=order["task_id"],
+            actor="hub",
+            payload={
+                "reason": code,
+                "detail": detail,
+                "run_id": order["id"],
+                "retryable": True,
+            },
+        )
+        log.info("steward run not started (retryable): %s — %s", code, detail)
     await db.commit()
-    log.info("steward run not started (retryable): %s — %s", code, detail)
 
 
 #: Метка в карточке, по которой запись «судьи нет» узнаётся повторно (#1237).
@@ -871,8 +954,12 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     # кто работал двенадцать минут из тридцати. Отдельным UPDATE окно
     # досталось бы и тому, кто слот не брал: условие agent_id=claim здесь
     # не украшение, а то, что делает запись принадлежащей захватившему.
+    #
+    # Отметка старта — тоже здесь (#1328): от неё суждение меряет свою
+    # длительность, и принадлежит она тому же захватившему.
     await db.execute(
         "UPDATE steward_runs SET agent_id=?, run_id=?, model=?, "
+        "started_at=strftime('%Y-%m-%d %H:%M:%f', 'now'), "
         "deadline_at=datetime('now', ?) WHERE id=? AND agent_id=?",
         (
             agent_id,
@@ -1163,18 +1250,9 @@ async def _announce_refusal_once(
     db: aiosqlite.Connection, codes: list[str], refusals: list[tuple[str, str]]
 ) -> None:
     """Write the refusal only when its REASONS changed since last time."""
-    rows = await fetchall(
-        db,
-        "SELECT payload FROM events WHERE kind=? ORDER BY id DESC LIMIT 1",
-        (EVENT_ACT_REFUSED,),
-    )
-    if rows:
-        try:
-            previous = json.loads(dict(rows[0]).get("payload") or "{}")
-        except ValueError:
-            previous = {}
-        if list(previous.get("reasons") or []) == codes:
-            return
+    previous = await _last_event_payload(db, EVENT_ACT_REFUSED)
+    if list(previous.get("reasons") or []) == codes:
+        return
     await repo.insert_event(
         db,
         kind=EVENT_ACT_REFUSED,
