@@ -442,3 +442,7 @@ async def test_an_unreadable_candidate_among_readable_ones_says_the_look_was_par
     assert "не определением" not in presence.reason
     assert "far_defined_subject (просмотрено 5 из 6)" in presence.reason
     assert "Ответ неполный" in presence.reason
+    # Потолок (50) не задет: текст не вправе называть его причиной
+    # (неразрешённая находка 2f977dfbc5233196).
+    assert "больше потолка" not in presence.reason
+    assert "не прочитались" in presence.reason
