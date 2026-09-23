@@ -1117,9 +1117,13 @@ async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
     same pass may have just recorded closing runs above, but touches no run
     and no order — it only ever writes an alert, never a mode.
     """
+    from hub.services.steward_judgement import stamp_judgement_usage
     from hub.services.steward_shadow import check_escalation_corridor, start_due_runs
 
     await close_finished_runs(db)
+    # Цена суждений, закрытых раньше (#1328): только чтение у провайдера, ни
+    # одного заказа — поэтому место в проходе ей безразлично.
+    await stamp_judgement_usage(db)
     await order_due_runs(db)
     await order_due_dor_runs(db)
     await start_due_runs(db)
