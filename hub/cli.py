@@ -1103,10 +1103,16 @@ def _review_queue_line(row: dict) -> str:
     verdict = row.get("verdict") or "без вердикта"
     if row.get("verdict") and not row.get("verdict_is_current"):
         verdict += f" (поколения {row.get('verdict_generation')}, не текущий)"
+    readiness = row.get("readiness")
+    if readiness == "ready_sha_unverified":
+        readiness = "ready, sha не проверен"
+    sha = f"sha {row.get('sha_check')}"
+    if row.get("tip_observed_minutes_ago") is not None:
+        sha += f" (наблюдение {row['tip_observed_minutes_ago']} мин назад)"
     return (
-        f"[{row.get('readiness')}] #{row['task_id']} {row.get('title', '')} — "
+        f"[{readiness}] #{row['task_id']} {row.get('title', '')} — "
         f"{row.get('status')}, сдача {row.get('submission_generation')}, "
-        f"sha {row.get('sha_check')}, отчёт {row.get('report_status')}, "
+        f"{sha}, отчёт {row.get('report_status')}, "
         f"{findings}, {verdict}, ждёт {row.get('waiting_minutes', '?')} мин"
     )
 

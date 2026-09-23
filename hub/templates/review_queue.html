@@ -27,11 +27,12 @@
     <tbody>
     {% for r in queue.rows %}
         <tr>
-            <td>{{ r.readiness }}</td>
+            <td>{% if r.readiness == "ready_sha_unverified" %}ready, sha не проверен{% else %}{{ r.readiness }}{% endif %}</td>
             <td><a href="/tasks/{{ r.task_id }}">#{{ r.task_id }} {{ r.title }}</a>
                 <div class="muted">{{ r.status }}</div></td>
             <td>{{ r.submission_generation }}</td>
-            <td title="{{ r.sha_check_reason }}">{{ r.sha_check }}</td>
+            <td title="{{ r.sha_check_reason }}">{{ r.sha_check }}{% if r.tip_observed_minutes_ago is not none %}
+                <div class="muted">наблюдение {{ r.tip_observed_minutes_ago }} мин назад</div>{% endif %}</td>
             <td>{{ r.report_status }}{% if r.review_in_flight %}
                 <div class="muted">{{ r.review_in_flight.headline }}</div>{% endif %}</td>
             <td>{% if r.findings_confirmed is none %}—{% else %}{{ r.findings_confirmed }} / {{ r.findings_unresolved }}{% endif %}</td>

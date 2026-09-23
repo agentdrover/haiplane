@@ -1939,6 +1939,19 @@ def observed_branch_tip(task_id: int, branch: str) -> tuple[str, str]:
     return sha, ""
 
 
+def observed_tip_age_minutes(task_id: int, branch: str) -> int | None:
+    """How long ago the remembered tip was seen; None when it never was.
+
+    Said beside every ``sha_check`` the queue prints (#1334, finding
+    b88a2b25931bce2a): a ``match`` resting on an observation is only as good as
+    its age, and the reader must see that age rather than trust a window.
+    """
+    seen = _observed_tips.get((int(task_id), (branch or "").strip()))
+    if seen is None:
+        return None
+    return max(0, int((datetime.now(UTC) - seen[1]).total_seconds() // 60))
+
+
 def forget_observed_tips() -> None:
     """Drop every remembered observation (tests; a restart does the same)."""
     _observed_tips.clear()

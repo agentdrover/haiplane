@@ -1059,6 +1059,9 @@ class ReviewQueueRow(BaseModel):
     submission_sha: str = ""
     sha_check: str = "unknown"
     sha_check_reason: str = ""
+    # How long ago the tip behind ``sha_check`` was observed; None when the
+    # answer rests on no observation (then ``sha_check`` is ``unknown``).
+    tip_observed_minutes_ago: int | None = None
     # none | in_flight | current | incomplete — the report of THIS generation.
     report_status: str = "none"
     # The brief's review_report.state verbatim: none | current | stale.
@@ -1076,7 +1079,7 @@ class ReviewQueueRow(BaseModel):
     stall_at: str = ""
     waiting_since: str = ""
     waiting_minutes: int | None = None
-    # ready | findings | awaiting_report | blocked — the sort key's name.
+    # ready | ready_sha_unverified | findings | awaiting_report | blocked.
     readiness: str = "awaiting_report"
 
 

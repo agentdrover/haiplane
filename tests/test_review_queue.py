@@ -293,6 +293,10 @@ async def test_the_queue_matches_the_brief_field_by_field(
         "причина стойла лежала последней строкой ленты — очередь обязана её назвать"
     )
     assert rows[ids["clean"]].stall_reason == ""
+    # Находка 5e8e505bc67ba3e0: задача после merge_failed с чистым отчётом и
+    # совпавшим sha не «можно одобрять» — её двигает решение, не вердикт.
+    assert rows[ids["clean"]].readiness == "ready"
+    assert stalled.readiness == "blocked"
     assert all(r.waiting_minutes is not None for r in queue.rows)
 
 
@@ -311,6 +315,90 @@ async def test_an_unobserved_tip_is_unknown_not_match(
     assert row.task_id == task_id
     assert row.sha_check == "unknown", "неизвестное не выдаётся за match"
     assert row.sha_check_reason
+
+
+async def test_a_provider_refusal_is_named_from_the_feed_line(
+    client: AsyncClient, db: aiosqlite.Connection, git: _Git
+) -> None:
+    """Находка 031fe60556868e97: отказ провайдера события needs_decision не
+    пишет — только алерт в ленту. Эта половина last_stall проверяется одна."""
+    from hub.services.review_availability import REFUSAL_ALERT_PREFIXES
+
+    task_id = await _submitted(client, git, "Reviewer refused", "z1")
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"{REFUSAL_ALERT_PREFIXES[0]}: HTTP 429 usage_limit_exceeded. Вердикт "
+        "остаётся за человеком.",
+    )
+    # Строка не гейта с похожими словами причиной не становится.
+    await repo.add_task_update(db, task_id, "dev", "status", "HTTP 500 locally")
+    await db.commit()
+
+    row = (await review_queue.review_queue(db)).rows[0]
+
+    assert row.status == "review"
+    assert "429" in row.stall_reason
+    assert row.stall_reason.startswith(REFUSAL_ALERT_PREFIXES[0])
+    assert row.stall_at
+
+
+async def test_a_clean_report_over_an_unverified_tip_is_not_plain_ready(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    git: _Git,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Находка 522c9ff79cdad14e и b88a2b25931bce2a: готовность без проверенного
+    sha — своё ведро сразу после ready, и возраст наблюдения виден."""
+    from hub.services import lifecycle
+
+    unverified = await _submitted(client, git, "Tip not observed", "v1")
+    verified = await _submitted(client, git, "Tip observed", "v2")
+    with_findings = await _submitted(client, git, "Findings", "v3")
+    for task_id in (unverified, verified):
+        await _report(db, task_id)
+    await _report(db, with_findings, confirmed=[_FINDING])
+    lifecycle.forget_observed_tips()
+    git.tip = "v2"
+    await build_review_brief(db, verified)  # бриф наблюдает вершину сам
+    git.tip = "v3"
+    await build_review_brief(db, with_findings)
+
+    queue = await review_queue.review_queue(db)
+    rows = {r.task_id: r for r in queue.rows}
+
+    assert [r.task_id for r in queue.rows] == [verified, unverified, with_findings]
+    assert rows[verified].readiness == "ready"
+    assert rows[verified].tip_observed_minutes_ago == 0
+    assert "мин назад" in rows[verified].sha_check_reason
+    assert rows[unverified].sha_check == "unknown"
+    assert rows[unverified].readiness == "ready_sha_unverified"
+    assert rows[unverified].tip_observed_minutes_ago is None
+
+    api = (await client.get("/api/review-queue")).json()
+    from hub import cli
+
+    out = StringIO()
+    with (
+        patch.object(cli, "_api", MagicMock(return_value=api)),
+        patch("sys.stdout", new=out),
+    ):
+        args = cli.build_parser().parse_args(["review-queue"])
+        assert args.func(args) == 0
+    lines = {line.split(" — ")[0]: line for line in out.getvalue().splitlines()}
+    assert any(
+        k.startswith("[ready, sha не проверен]") and f"#{unverified} " in k
+        for k in lines
+    ), out.getvalue()
+    verified_line = next(v for k, v in lines.items() if f"#{verified} " in k)
+    assert "sha match (наблюдение 0 мин назад)" in verified_line
+
+    html = (await client.get("/review-queue")).text
+    assert "ready, sha не проверен" in html
+    assert "наблюдение 0 мин назад" in html
 
 
 # ---- AC-2: без диффа, без сети, без брифа ----

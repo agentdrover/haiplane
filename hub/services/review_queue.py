@@ -34,7 +34,11 @@ from hub import repository as repo
 from hub.db import fetchall
 from hub.models import ReviewQueueRow, ReviewQueueView
 from hub.services import review_evidence
-from hub.services.lifecycle import latest_review_projection, observed_branch_tip
+from hub.services.lifecycle import (
+    latest_review_projection,
+    observed_branch_tip,
+    observed_tip_age_minutes,
+)
 from hub.services.review_availability import (
     REFUSAL_ALERT_PREFIXES,
     generation_review,
@@ -55,10 +59,24 @@ STALL_LINE_PREFIXES: tuple[str, ...] = (
     *REFUSAL_ALERT_PREFIXES,
 )
 
-#: Order of the groups: what can be approved now, what needs its findings
-#: answered, what waits for a report, and what no verdict can move (a
-#: diverged branch needs a resubmission, needs_decision needs a decision).
-READINESS_ORDER = ("ready", "findings", "awaiting_report", "blocked")
+#: Order of the groups: what can be approved now, what would be but the
+#: branch tip is not verified, what needs its findings answered, what waits
+#: for a report, and what no verdict can move (a diverged branch needs a
+#: resubmission, needs_decision needs a decision).
+#:
+#: ``ready_sha_unverified`` is its own group, not ``ready`` and not
+#: ``blocked`` (finding 522c9ff79cdad14e): a clean report over a branch
+#: nobody observed recently is not ready to approve, but after a restart every
+#: tip is unobserved, and ``blocked`` would swallow the whole queue.
+READY = "ready"
+READY_SHA_UNVERIFIED = "ready_sha_unverified"
+READINESS_ORDER = (
+    READY,
+    READY_SHA_UNVERIFIED,
+    "findings",
+    "awaiting_report",
+    "blocked",
+)
 
 QUEUE_LIMIT = 200
 
@@ -122,7 +140,9 @@ def readiness(row: ReviewQueueRow) -> str:
         return "awaiting_report"
     if row.findings_confirmed or row.findings_unresolved:
         return "findings"
-    return "ready" if row.generation_has_review else "awaiting_report"
+    if not row.generation_has_review:
+        return "awaiting_report"
+    return READY if row.sha_check == "match" else READY_SHA_UNVERIFIED
 
 
 async def queue_row(db, task_row: dict[str, Any]) -> ReviewQueueRow:
@@ -132,6 +152,9 @@ async def queue_row(db, task_row: dict[str, Any]) -> ReviewQueueRow:
     sha_check, sha_reason = review_evidence.sha_check_of(
         str(task_row.get("submission_sha") or ""), branch, tip, tip_reason
     )
+    tip_age = observed_tip_age_minutes(task_id, branch) if tip else None
+    if tip_age is not None:
+        sha_reason = f"наблюдение вершины {tip_age} мин назад. {sha_reason}"
     mr_row = await repo.get_latest_machine_review(db, task_id)
     report = await review_evidence.report_view(db, task_row, mr_row)
     mr = report.machine_review
@@ -150,6 +173,7 @@ async def queue_row(db, task_row: dict[str, Any]) -> ReviewQueueRow:
         submission_sha=report.submission_sha,
         sha_check=sha_check,
         sha_check_reason=sha_reason,
+        tip_observed_minutes_ago=tip_age,
         report_state=report.state,
         report_status=report_status(report.state, mr, flight),
         report_outcome=mr.outcome if mr is not None else "",
