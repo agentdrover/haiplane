@@ -1508,3 +1508,61 @@ async def test_a_blinking_git_still_outranks_an_unpublished_neighbour(
         "неопубликованный сосед рядом ничего про неё не говорит"
     )
     assert "rev_list_failed" in detail
+
+
+# ---- #1275: упавшее основание — не ожидание ----
+#
+# failed финален: FINAL_STATUSES, и выхода из него в LIFECYCLE_TRANSITIONS нет.
+# Ветка упавшего headless-прогона может быть запушена, и стопка на ней уносит
+# чужую работу так же, как на любой другой. Но ждать её доставки — обещание,
+# которое хаб не сдержит, поэтому стопка на упавшем основании идёт к человеку.
+
+
+async def test_a_failed_base_calls_a_human_instead_of_a_wait(
+    db: aiosqlite.Connection,
+) -> None:
+    from hub.services.orchestration import STRANDED_BASE_PREFIX
+
+    task_id, _branch = await _pair_running_task(db, "Стоит на упавшей")
+    base_branch = "task-1300/headless-run-failed"
+    base_id = await _neighbour(
+        db, base_branch, status="failed", submission_sha="a" * 40
+    )
+    plugins.git_ops = _ScriptedProbeGitOps(
+        {
+            base_branch: StackProbeResult(
+                outcome=StackProbeOutcome.stacked, reason="scripted"
+            )
+        },
+        ancestry={base_branch: "head_is_descendant"},
+    )
+
+    detail = await _gate(db, task_id)
+
+    assert detail.startswith(f"{STRANDED_BASE_PREFIX}:"), (
+        f"упавшее основание не доставит себя само — ждать нечего: {detail!r}"
+    )
+    assert f"#{base_id}" in detail and base_branch in detail
+    assert "Ждём доставки" not in detail, "обещание ожидания, которого не будет"
+    assert "упала" in detail, "названа настоящая причина"
+    assert "человек принял" not in detail, (
+        "это не принятая без доставки задача — у неё и PR может не быть"
+    )
+
+
+async def test_a_failed_neighbour_that_never_published_does_not_hold_the_project(
+    db: aiosqlite.Connection,
+) -> None:
+    # Headless-прогон, упавший до первого пуша: ветка записана, на origin её
+    # нет, сдач не было. Звать человека на каждую доставку проекта из-за такой
+    # строки — кирпич #1204; это случай #1283, мерж с алертом.
+    task_id, _branch = await _pair_running_task(db, "Сосед упал до пуша")
+    base_branch = "task-1301/failed-before-push"
+    base_id = await _neighbour(db, base_branch, status="failed")
+    plugins.git_ops = _ScriptedProbeGitOps({base_branch: _ref_unresolved(base_branch)})
+
+    detail = await _gate(db, task_id)
+
+    assert detail == "", f"неопубликованная ветка не держит доставку: {detail!r}"
+    body = await _feed(db, task_id)
+    assert f"#{base_id}" in body and "не опубликована" in body
