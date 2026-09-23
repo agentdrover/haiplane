@@ -2762,9 +2762,9 @@ async def count_review_dispatches(
       another). A sync cloud-create refusal writes a debt-tracking stub with
       an empty ``agent_id`` (#1266, ``owe_second_door`` on the sync path) —
       that costs nothing and never did, before or after this fix.
-    - ``replaces_dispatch_id IS NULL`` — the row is not a replacement. A
-      replacement continues the rung it replaces rather than opening a new
-      one; the row it replaces already counted (it had a real ``agent_id``).
+    - no PAID row up its ``replaces_dispatch_id`` chain — a replacement
+      continues the rung it replaces rather than opening a new one, and that
+      rung already counted where it was paid for.
 
     Two genuine cloud runs (LITE then a DEEP top-up) both have empty
     ``replaces_dispatch_id`` and non-empty ``agent_id`` — they still count as
@@ -2775,14 +2775,28 @@ async def count_review_dispatches(
     stub too, and that stub never counted — so the first real run of the
     rung is the replacement itself, and skipping it would hand the ladder a
     step it never paid for.
+
+    The paid row is looked for along the WHOLE ``replaces_dispatch_id``
+    chain, not only at the direct parent (finding b9943fc18e24a30c): paid run
+    failed → ask-again hit a 429 and left a free stub → the next ask-again
+    succeeded. The success's parent is the free stub, yet the rung was paid
+    two links up — counting it made one rung two, and the ladder refused its
+    DEEP top-up claiming the ceiling was hit. ``replaces_dispatch_id`` always
+    points to an earlier row, so the walk ends.
     """
     rows = await fetchall(
         db,
+        "WITH RECURSIVE chain(start, parent) AS ("
+        "SELECT id, replaces_dispatch_id FROM review_dispatches "
+        "WHERE task_id=? AND submission_generation=? AND agent_id != '' "
+        "UNION ALL SELECT c.start, r.replaces_dispatch_id FROM chain c "
+        "JOIN review_dispatches r ON r.id = c.parent) "
         "SELECT COUNT(*) AS n FROM review_dispatches d "
         "WHERE d.task_id=? AND d.submission_generation=? AND d.agent_id != '' "
-        "AND NOT EXISTS (SELECT 1 FROM review_dispatches r "
-        "WHERE r.id = d.replaces_dispatch_id AND r.agent_id != '')",
-        (task_id, generation),
+        "AND NOT EXISTS (SELECT 1 FROM chain c "
+        "JOIN review_dispatches r ON r.id = c.parent "
+        "WHERE c.start = d.id AND r.agent_id != '')",
+        (task_id, generation, task_id, generation),
     )
     return int(dict(rows[0])["n"]) if rows else 0
 

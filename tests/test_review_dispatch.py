@@ -10380,4 +10380,137 @@ async def test_a_blind_retry_is_not_repeated(
 
     assert len(provider.calls) == 2, "после слепого переспроса — ни одного вызова"
     stopped = [a for a in await _alerts_of(db, task_id) if "исчерпан" in a]
-    assert len(stopped) == 1 and "вслепую" in stopped[0], stopped
+    assert len(stopped) == 1 and "не оставил заказа" in stopped[0], stopped
+
+
+async def test_a_mixed_chain_is_still_one_ladder_step(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка b9943fc18e24a30c (#1242, сдача 1): смешанная цепочка повторов.
+
+    Оплаченный прогон упал (ERROR) → переспрос словил 429, осталась
+    бесплатная заглушка → следующий переспрос успешен. Все три строки — одна
+    ступень: успех продолжает заглушку, заглушка — оплаченный прогон. Счёт,
+    глядящий только на непосредственного предка, называл успех второй
+    ступенью, и лестница ложно отказывала в DEEP-доборе («потолок достигнут»).
+    """
+    provider = _Sequence(
+        [
+            ({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None),
+            (None, _RATE_LIMIT),
+            ({"agent": {"id": "bc-fresh"}, "run": {"id": "run-fresh"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-mixed-chain", policy={"review": "dispatch"}
+    )
+
+    async def _runs(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR" if agent_id == "bc-dead" else "RUNNING"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _runs)
+    for _ in range(3):
+        await _age_dispatches(db)
+        await sweep_review_dispatches(db)
+
+    rows = await _rows_of(db, task_id)
+    assert [r["agent_id"] for r in rows] == ["bc-dead", "", "bc-fresh"], rows
+    assert rows[1]["replaces_dispatch_id"] == rows[0]["id"]
+    assert rows[2]["replaces_dispatch_id"] == rows[1]["id"]
+    assert await repo.count_review_dispatches(db, task_id, 1) == 1, (
+        "оплаченный упал, заглушка бесплатна, успех — продолжение той же ступени"
+    )
+
+
+async def test_a_retry_that_left_no_order_does_not_claim_blindness(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка c82b1af523ba9dd7 (#1242, сдача 1): остановка не выдумывает причину.
+
+    Переспрос отказан по конфигурации — наблюдённый отказ, строки заказа нет.
+    Остановка верна (исход неизвестен переспросу, повтор ничего не изменит),
+    но называть его «слепотой #1199» — ложь в карточке: причина стоит в
+    алерте диспетчера, и остановка обязана на него сослаться, а не подменять.
+    """
+    provider = _Sequence(
+        [({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None)]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-no-config", policy={"review": "dispatch"}
+    )
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "")
+    for _ in range(3):
+        await _age_dispatches(db)
+        await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 1
+    alerts = await _alerts_of(db, task_id)
+    assert any("не хватает конфигурации" in a for a in alerts), alerts
+    stopped = [a for a in alerts if "исчерпан" in a]
+    assert len(stopped) == 1, stopped
+    assert "не оставил заказа" in stopped[0], stopped[0]
+    assert "вслепую нельзя" not in stopped[0], (
+        f"отказ конфигурации — не слепой исход #1199: {stopped[0]}"
+    )
+
+
+async def test_a_report_landing_while_the_retry_is_prepared_buys_nothing(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 17a9ca6ea3451163 (#1242, сдача 1): последнее слово перед тратой.
+
+    Отчёт доезжает, пока переспрос готовит заказ (дифф, правила — сеть).
+    Проверка в начале переспроса его не видит; облако не должно покупаться,
+    как не покупает его вторая дверь в том же окне (#1266).
+    """
+    from hub.services import review_dispatch as rd
+
+    provider = _Sequence(
+        [
+            ({"agent": {"id": "bc-dead"}, "run": {"id": "run-dead"}}, None),
+            ({"agent": {"id": "bc-extra"}, "run": {"id": "run-extra"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "ask-again-late-report", policy={"review": "dispatch"}
+    )
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    real_prepare = rd.prepare_review_order
+
+    async def _report_arrives(db_, task, **kw):
+        await repo.insert_machine_review(
+            db_,
+            task_id=task_id,
+            submission_generation=1,
+            model="grok-4.6",
+            submitted_by="late-reviewer",
+        )
+        await db_.commit()
+        return await real_prepare(db_, task, **kw)
+
+    monkeypatch.setattr(rd, "prepare_review_order", _report_arrives)
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+
+    assert len(provider.calls) == 1, "отчёт уже есть — облако не покупается"
+    assert len(await _rows_of(db, task_id)) == 1

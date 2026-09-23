@@ -1855,6 +1855,14 @@ async def maybe_dispatch_review(
         principal_id=expected_principal,
     )
     model_id, profile, profile_reasons = order.model, order.profile, order.reasons
+    # Последнее слово переспроса перед тратой (находка 17a9ca6ea3451163):
+    # подготовка заказа выше ходит в сеть за диффом и правилами, и отчёт,
+    # доехавший в это окно, проверка в начале переспроса не видит. Вторая
+    # дверь делает то же самое перед своей вставкой (#1266).
+    if replaces_dispatch_id is not None and (
+        await repo.machine_reviews_of_generation(db, task_id, generation)
+    ):
+        return False
     started = await _create_or_adopt(
         cursor_cloud.agent_marker(
             "review",
@@ -3708,10 +3716,18 @@ async def _name_the_exhausted_retries(
     mark = ASK_AGAIN_EXHAUSTED_MARK.format(generation=generation)
     if await _count_marked_alerts(db, task_id, mark):
         return
+    # Находка c82b1af523ba9dd7: попытка без строки заказа — это не всегда
+    # слепой исход #1199. Отказ конфигурации, политики или стража второй
+    # читки тоже не оставляет строки, и его причина уже стоит в карточке
+    # алертом диспетчера. Переспрос исхода не знает — и не выдумывает его:
+    # останавливается (повтор ни одного из этих исходов не меняет, а слепой
+    # запрещает) и ссылается на алерт, который причину называет.
     why = (
         f"потолок {REVIEW_ASK_AGAIN_MAX} переспросов на сдачу исчерпан"
         if asked >= REVIEW_ASK_AGAIN_MAX
-        else "прошлый переспрос не оставил заказа — повторять вслепую нельзя (#1199)"
+        else "прошлый переспрос не оставил заказа, причина — в алерте "
+        "диспетчера после него (конфигурация, политика, страж второй читки "
+        "или ответ, который не дошёл, #1199); не зная исхода, хаб не повторяет"
     )
     await repo.add_task_update(
         db,
@@ -3719,8 +3735,8 @@ async def _name_the_exhausted_retries(
         "hub",
         "alert",
         f"{mark} Ревью этой сдачи так и не состоялось: {why}. Переспросов: "
-        f"{asked}, последний сбой — {cause}. Третьего ревьюера хаб не "
-        "покупает; решение за человеком. Если сбой один и тот же — смотреть "
+        f"{asked}, последний упавший заказ — {cause}. Ещё одного ревьюера хаб "
+        "не покупает; решение за человеком. Если сбой один и тот же — смотреть "
         "форму вызова, а не число попыток (#1242).",
     )
     await db.commit()
