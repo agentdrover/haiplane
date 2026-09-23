@@ -991,6 +991,32 @@ class ReviewInFlight(BaseModel):
     headline: str = ""
 
 
+class GenerationReview(BaseModel):
+    """Есть ли ревью у ТЕКУЩЕГО поколения сдачи — один правдивый ответ (#1262).
+
+    ``has_review`` истинно только для отчёта этого поколения, который не
+    назван неполным и несёт улику исполнения (#750, #841): «ревью нет» не
+    смеет читаться как «ревью чистое». Когда ревью нет, ``reason`` — код
+    причины (``provider_refused``, ``incomplete_report``,
+    ``no_execution_evidence``, ``run_failed``, ``in_flight``,
+    ``not_dispatched``), а ``reason_detail`` — наблюдённая деталь. Отчёт
+    прошлого поколения назван в ``previous_generation`` и ревью текущего
+    не считается.
+    """
+
+    generation: int = 0
+    has_review: bool = False
+    reviewer_principal: str = ""
+    reviewer_model: str = ""
+    sha: str = ""
+    # None — отчёт полноту не заявлял (строки до #549), не «полный».
+    complete: bool | None = None
+    reason: str = ""
+    reason_detail: str = ""
+    previous_generation: int | None = None
+    headline: str = ""
+
+
 class ReviewReport(BaseModel):
     """What the human reads at the verdict gate instead of the diff (#808).
 
@@ -1133,6 +1159,9 @@ class ReviewBrief(BaseModel):
     review_report: "ReviewReport | None" = None
     # #1027: a hub-called review still in the air for THIS submission.
     review_in_flight: ReviewInFlight | None = None
+    # #1262: has THIS generation been reviewed — by whom, on which sha, how
+    # completely — or why not. None means this path did not assemble it.
+    current_generation_review: GenerationReview | None = None
     # #433: fail-fast notice when the caller implemented this task.
     self_review_warning: SelfReviewWarning | None = None
     # #438: advisory — non-empty when the branch carries commits of another

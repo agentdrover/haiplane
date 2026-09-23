@@ -2694,6 +2694,9 @@ async def test_the_sweep_order_is_pinned(db):
         # ДО дайджеста — секция дайджеста читает уже поднятое этим проходом
         # событие, а не гадает о нём.
         "unjudged_findings",
+        # #1262: сторож недоступного ревьюера — рядом со сторожем находок,
+        # тот же образец дедупа по собственному событию.
+        "reviewer_unavailable",
         "autopilot_digests",
         "delivery_discrepancies",
         "review_dispatches",
@@ -3113,3 +3116,342 @@ async def test_headless_delivery_calls_a_human_when_waiting_cannot_help(db):
     body = " ".join(u.get("content") or "" for u in updates)
     assert "Ожидание здесь ничего не решит" in body
     assert "Доставка отложена" not in body, "это не отложенная доставка"
+
+
+# --- #1262: ревьюер недоступен — одно событие хаба, а не алерт в каждой карточке
+
+
+async def _refused_review_queue(client, db, monkeypatch, slugs: list[str]) -> list[int]:
+    """Сдачи, у которых НАСТОЯЩИЙ диспетчер получил отказ провайдера.
+
+    Отказ проходит через maybe_dispatch_review, а не пишется руками: сторож
+    читает алерт, который пишет диспетчер, и связь с его текстом держит этот
+    путь, а не копия строки в тесте.
+    """
+    from tests.test_review_dispatch import (
+        _LIMIT_REFUSAL,
+        _DispatchRecorder,
+        _no_local_path,
+        _submitted,
+        _wire,
+    )
+
+    _wire(monkeypatch, _DispatchRecorder(None, refusal=_LIMIT_REFUSAL))
+    _no_local_path(monkeypatch)
+    task_ids = [
+        await _submitted(client, db, slug, policy={"review": "dispatch"})
+        for slug in slugs
+    ]
+    # Отказы идут дольше порога: первый — три часа назад, сдачи — раньше них.
+    await db.execute(
+        "UPDATE submissions SET submitted_at = datetime('now', '-4 hours')"
+    )
+    await db.execute(
+        "UPDATE task_updates SET created_at = datetime('now', '-3 hours') "
+        "WHERE kind='alert' AND content LIKE '%провайдер отказал%'"
+    )
+    await db.commit()
+    return task_ids
+
+
+async def _reviewer_events(db, kind: str) -> list[dict]:
+    rows = await fetchall(
+        db, "SELECT payload FROM events WHERE kind=? ORDER BY id", (kind,)
+    )
+    import json as _json
+
+    return [_json.loads(dict(r)["payload"]) for r in rows]
+
+
+async def _cleared_feed(db) -> list[str]:
+    from hub.services.review_availability import REVIEWER_SIGNAL_CLEARED
+
+    rows = await fetchall(
+        db,
+        "SELECT summary FROM activity_log WHERE kind=? ORDER BY id",
+        (REVIEWER_SIGNAL_CLEARED,),
+    )
+    return [str(dict(r)["summary"]) for r in rows]
+
+
+async def test_reviewer_unavailable_is_one_hub_event_not_a_card_each(
+    client, db, monkeypatch
+):
+    """AC-1 (#1262): отказы провайдера на двух сдачах старше порога — ОДНО
+    событие хаба с числом и номерами задач без ревью; второй свип в окне
+    дедупа нового события не порождает."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import REVIEWER_UNAVAILABLE
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
+    task_ids = await _refused_review_queue(
+        client, db, monkeypatch, ["spike-limit-a", "spike-limit-b"]
+    )
+
+    await _sweep_reviewer_unavailable(db)
+    await _sweep_reviewer_unavailable(db)
+
+    events = await _reviewer_events(db, REVIEWER_UNAVAILABLE)
+    assert len(events) == 1, (
+        "ровно одно событие хаба на провайдера и окно, а не одно на свип"
+    )
+    payload = events[0]
+    assert payload["waiting_count"] == 2
+    assert [w["task_id"] for w in payload["waiting"]] == sorted(task_ids)
+    assert {w["reason"] for w in payload["waiting"]} == {"provider_refused"}
+    assert payload["refused_tasks"] == sorted(task_ids)
+
+
+async def test_reviewer_unavailable_waits_for_the_threshold(client, db, monkeypatch):
+    """Отказы моложе порога сигнала не поднимают — единичный всплеск не шум."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import REVIEWER_UNAVAILABLE
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 4.0)
+    await _refused_review_queue(
+        client, db, monkeypatch, ["spike-young-a", "spike-young-b"]
+    )
+
+    await _sweep_reviewer_unavailable(db)
+
+    assert await _reviewer_events(db, REVIEWER_UNAVAILABLE) == []
+
+
+async def test_reviewer_answering_again_clears_the_signal(client, db, monkeypatch):
+    """AC-2 (#1262): провайдер снова создал агента — сигнал снят без ручного
+    действия, и задача с успешным вызовом больше не числится без ревью."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services import review_dispatch
+    from hub.services.review_availability import (
+        REVIEWER_SIGNAL_CLEARED,
+        REVIEWER_UNAVAILABLE,
+        generation_review,
+        signal_state,
+    )
+    from tests.test_review_dispatch import _DispatchRecorder, _wire
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
+    first, second = await _refused_review_queue(
+        client, db, monkeypatch, ["spike-back-a", "spike-back-b"]
+    )
+    await _sweep_reviewer_unavailable(db)
+    assert await signal_state(db) == REVIEWER_UNAVAILABLE
+
+    _wire(
+        monkeypatch, _DispatchRecorder({"agent": {"id": "bc-ok"}, "run": {"id": "r"}})
+    )
+    assert await review_dispatch.maybe_dispatch_review(db, first)
+
+    await _sweep_reviewer_unavailable(db)
+
+    assert await signal_state(db) == REVIEWER_SIGNAL_CLEARED, "сигнал снят сам"
+    cleared = await _reviewer_events(db, REVIEWER_SIGNAL_CLEARED)
+    assert len(cleared) == 1
+    # Находка cdcea07930c55ac5: снятие называет ФАКТИЧЕСКУЮ причину, и лента
+    # говорит то же, что событие.
+    assert cleared[0]["reason"] == "provider_answered"
+    assert await _cleared_feed(db) == [cleared[0]["message"]]
+    assert "провайдер создал агента" in cleared[0]["message"]
+    view = await generation_review(db, dict(await repo.get_task(db, first)))
+    assert view.reason == "in_flight", (
+        "задача с успешным вызовом больше не числится отказанной провайдером"
+    )
+    still = await generation_review(db, dict(await repo.get_task(db, second)))
+    assert still.reason == "provider_refused"
+
+    await _sweep_reviewer_unavailable(db)
+    assert len(await _reviewer_events(db, REVIEWER_SIGNAL_CLEARED)) == 1, (
+        "снятие тоже одно, а не на каждом свипе"
+    )
+
+
+async def test_refusals_of_tasks_that_left_review_raise_no_signal(
+    client, db, monkeypatch
+):
+    """Находка 49c7069e5d2547d2 (#1262, сдача 1): исторические отказы не держат
+    сигнал. Из трёх отказанных задач одна вышла из review, другая пересдана
+    новым поколением, отказа у которого не было, — в очереди осталась ОДНА
+    сдача без ревью из-за провайдера, и сигнала быть не должно. Каждая из
+    двух выбывших по отдельности подняла бы его, будь она засчитана."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import REVIEWER_UNAVAILABLE
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
+    left, resubmitted, _still = await _refused_review_queue(
+        client, db, monkeypatch, ["spike-left-a", "spike-left-b", "spike-left-c"]
+    )
+    await repo.update_task(db, left, status="running")
+    await repo.update_task(db, resubmitted, submission_generation=2)
+    await repo.record_submission(
+        db, task_id=resubmitted, generation=2, sha="c" * 40, base_branch="develop"
+    )
+    await db.commit()
+
+    await _sweep_reviewer_unavailable(db)
+
+    assert await _reviewer_events(db, REVIEWER_UNAVAILABLE) == [], (
+        "отказы прошлых сдач и задач вне review — история, а не очередь"
+    )
+
+
+async def test_signal_clears_when_the_refused_queue_drops_below_two(
+    client, db, monkeypatch
+):
+    """Находка 49c7069e5d2547d2: сигнал снимается и без нового агента, когда
+    отказанных сдач в review стало меньше двух — здесь одна получила полный
+    отчёт текущего поколения (вторая дверь, #1252)."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import (
+        REVIEWER_SIGNAL_CLEARED,
+        REVIEWER_UNAVAILABLE,
+        signal_state,
+    )
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
+    first, _second = await _refused_review_queue(
+        client, db, monkeypatch, ["spike-drop-a", "spike-drop-b"]
+    )
+    await _sweep_reviewer_unavailable(db)
+    assert await signal_state(db) == REVIEWER_UNAVAILABLE
+
+    resp = await client.post(
+        f"/api/tasks/{first}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "agent_count": 1,
+            "model": "local-reviewer",
+            "raw_count": 1,
+            "findings_confirmed": [],
+            "findings_rejected": [],
+            "incomplete": False,
+            "unresolved": [],
+            "lost_dimensions": [],
+            "agent": "local-reviewer",
+        },
+    )
+    assert resp.status_code in (200, 201), resp.text
+    await _sweep_reviewer_unavailable(db)
+
+    assert await signal_state(db) == REVIEWER_SIGNAL_CLEARED, (
+        "одна сдача без ревью из-за провайдера — уже не картина очереди"
+    )
+    cleared = await _reviewer_events(db, REVIEWER_SIGNAL_CLEARED)
+    assert len(cleared) == 1
+    # Находка cdcea07930c55ac5: провайдер НЕ ожил — снятие не смеет говорить
+    # «ревьюер снова отвечает», оно называет сжавшуюся очередь.
+    assert cleared[0]["reason"] == "below_threshold"
+    assert cleared[0]["remaining"] == 1
+    assert cleared[0]["remaining_tasks"] == [_second]
+    assert "снова отвечает" not in cleared[0]["message"]
+    assert f"осталось 1 (#{_second})" in cleared[0]["message"]
+    assert await _cleared_feed(db) == [cleared[0]["message"]]
+
+
+async def test_fresh_refusals_keep_a_raised_signal_instead_of_a_false_clear(
+    client, db, monkeypatch
+):
+    """Находка 655778c064b7d0b8 (#1262, сдача 3): третий выход — отказанных
+    сдач две и больше, но их отказы моложе порога. Сигнал поднят по старым
+    отказам, старые сдачи получили отчёты, а новые сданы и тоже отказаны:
+    провайдер агента так и не создал, отказы просто обновились. Снимать
+    сигнал тут — сказать неправду; он держится, и наблюдение называет
+    исход too_young честным текстом, а не «осталось N» из ветки порога.
+    """
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import (
+        REVIEWER_SIGNAL_CLEARED,
+        REVIEWER_UNAVAILABLE,
+        observe_outage,
+        signal_state,
+    )
+    from tests.test_review_dispatch import _submitted
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
+    old = await _refused_review_queue(
+        client, db, monkeypatch, ["spike-young-old-a", "spike-young-old-b"]
+    )
+    await _sweep_reviewer_unavailable(db)
+    assert await signal_state(db) == REVIEWER_UNAVAILABLE
+
+    for task_id in old:
+        await repo.update_task(db, task_id, status="running")
+    fresh = [
+        await _submitted(client, db, slug, policy={"review": "dispatch"})
+        for slug in ("spike-young-new-a", "spike-young-new-b")
+    ]
+    await db.commit()
+
+    observed = await observe_outage(db)
+    assert observed.kind == "too_young"
+    assert observed.refused_tasks == sorted(fresh)
+    assert "осталось" not in observed.message
+    assert "меньше 2" in observed.message and "провайдер" in observed.message
+
+    await _sweep_reviewer_unavailable(db)
+
+    assert await signal_state(db) == REVIEWER_UNAVAILABLE, (
+        "провайдер не ожил — сигнал, поднятый по старым отказам, держится"
+    )
+    assert await _reviewer_events(db, REVIEWER_SIGNAL_CLEARED) == []
+
+
+async def _held_by_fresh_refusals(
+    client, db, monkeypatch
+) -> tuple[list[int], list[int]]:
+    """Сценарий удержания: сигнал поднят по A и B, они ушли из review, C и D
+    сданы и сразу отказаны — провайдер не ожил, картина очереди сменилась."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from tests.test_review_dispatch import _submitted
+
+    monkeypatch.setattr(config, "REVIEWER_UNAVAILABLE_HOURS", 2.0)
+    old = await _refused_review_queue(
+        client, db, monkeypatch, ["spike-set-old-a", "spike-set-old-b"]
+    )
+    await _sweep_reviewer_unavailable(db)
+    for task_id in old:
+        await repo.update_task(db, task_id, status="running")
+    fresh = [
+        await _submitted(client, db, slug, policy={"review": "dispatch"})
+        for slug in ("spike-set-new-c", "spike-set-new-d")
+    ]
+    await db.commit()
+    return old, fresh
+
+
+async def test_a_held_signal_republishes_the_current_queue(client, db, monkeypatch):
+    """Находка 74abbd8f1a22b8b2 (#1262, сдача 4): пока сигнал поднят, смена
+    НАБОРА ожидающих сдач пишет обновлённое событие с текущей картиной —
+    последнее событие называет C и D, а не ушедшие из review A и B."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import REVIEWER_UNAVAILABLE, signal_state
+
+    old, fresh = await _held_by_fresh_refusals(client, db, monkeypatch)
+
+    await _sweep_reviewer_unavailable(db)
+
+    assert await signal_state(db) == REVIEWER_UNAVAILABLE
+    raised = await _reviewer_events(db, REVIEWER_UNAVAILABLE)
+    assert len(raised) == 2, "другой набор — новое событие, не суточный повтор"
+    latest = raised[-1]
+    assert latest["refused_tasks"] == sorted(fresh)
+    assert [w["task_id"] for w in latest["waiting"]] == sorted(fresh)
+    assert not set(old) & {w["task_id"] for w in latest["waiting"]}, (
+        "в текущей картине нет сдач, которых уже нет в review"
+    )
+
+
+async def test_a_held_signal_with_the_same_queue_writes_nothing_new(
+    client, db, monkeypatch
+):
+    """Тот же набор при следующем свипе нового события не даёт: дедуп по
+    набору, а не по каждому проходу."""
+    from hub.poller import _sweep_reviewer_unavailable
+    from hub.services.review_availability import REVIEWER_UNAVAILABLE
+
+    await _held_by_fresh_refusals(client, db, monkeypatch)
+    await _sweep_reviewer_unavailable(db)
+    before = len(await _reviewer_events(db, REVIEWER_UNAVAILABLE))
+
+    await _sweep_reviewer_unavailable(db)
+
+    assert len(await _reviewer_events(db, REVIEWER_UNAVAILABLE)) == before
