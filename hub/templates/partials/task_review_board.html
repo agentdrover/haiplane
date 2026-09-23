@@ -215,6 +215,23 @@
             {% if evidence.ci_run_report.state != 'current' %}<span class="muted">{{ evidence.ci_run_report.reason }}</span>{% endif %}
         </div>
 
+        {# #1233: расхождение с базой — ЗДЕСЬ, над кнопкой Approve, а не только
+           в API брифа. 09.09.2026 человек одобрил #1204 именно на этой карточке
+           и через четырнадцать секунд узнал из отказа доставки, что ветка
+           конфликтует с базой в трёх файлах. Вердикт к тому моменту был уже
+           потрачен. Блок, которого нет там, где нажимают кнопку, не успевает
+           ни к какому решению. #}
+        {% if evidence.base_merge and evidence.base_merge.state != 'not_applicable' %}
+        <div class="task-evidence-row">
+            <span class="u-text-muted">Мерж в базу:</span>
+            <span class="badge badge--xs badge-{{ 'test' if evidence.base_merge.state == 'clean' else ('failed' if evidence.base_merge.state == 'conflicting' else 'pending') }}">{{ evidence.base_merge.state }}</span>
+            <span class="muted">{{ evidence.base_merge.reason }}</span>
+            {% if evidence.base_merge.files %}
+            <span class="badge badge-failed">конфликтуют: {{ evidence.base_merge.files|join(', ') }}</span>
+            {% endif %}
+        </div>
+        {% endif %}
+
         {# #875: КАКИЕ проверки прошли, а не только «прогон был».
            Право сказать ревьюеру «этот класс покрыт» даёт только
            шаг, выполнившийся и прошедший на этом коммите. #}
