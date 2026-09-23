@@ -239,12 +239,23 @@ async def _cost_of_the_run(
     (:func:`stamp_judgement_usage`). Провайдер здесь не зовётся вовсе:
     запись суждения не ждёт его и не падает из-за него.
 
+    Прогон берётся НАЧАТЫЙ, в любом статусе, а не только открытый (находка
+    cff86ddcaa7db372): код стюарда живёт дольше дедлайна слота, и суждение,
+    пришедшее после таймаута, судил тот же прогон — с той же моделью, тем же
+    стартом и тем же usage. Слот на тройку (задача, поколение, вид) один по
+    уникальному индексу, так что строка однозначна.
+
     Без начатого прогона (суждение, поданное мимо заказа) источника нет:
     модель остаётся заявленной, длительности нет, токены — ``no_run``.
     """
-    from hub.services.steward_dispatch import open_run, run_has_started
+    from hub.services.steward_dispatch import run_has_started
 
-    run = await open_run(db, task_id, generation, kind)
+    rows = await fetchall(
+        db,
+        "SELECT * FROM steward_runs WHERE task_id=? AND generation=? AND kind=?",
+        (task_id, generation, kind),
+    )
+    run = dict(rows[0]) if rows else None
     if run is None or not run_has_started(run):
         return declared_model, None, TOKENS_NO_RUN
     duration_ms: int | None = None
