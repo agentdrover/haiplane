@@ -285,3 +285,39 @@ async def test_an_unanswered_usage_is_unknown_not_zero(
     row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
     assert row["tokens_spent"] is None
     assert row["tokens_unknown_reason"] == TOKENS_PROVIDER_NO_ANSWER
+
+
+async def test_a_judgement_after_the_run_timed_out_still_costs_its_run(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Находка cff86ddcaa7db372: суждение после таймаута слота.
+
+    Код стюарда живёт дольше дедлайна прогона, и приём суждения статус
+    прогона не смотрит. Прогон, закрытый по таймауту, всё равно НАЧИНАЛСЯ:
+    модель, старт и usage у него есть, и «прогона нет» (no_run) здесь ложь.
+    """
+    from hub.services.steward_dispatch import RUN_TIMEOUT, close_finished_runs
+
+    task_id = await _started_run(db, monkeypatch, "cost-timeout")
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now', '-1 minute') "
+        "WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+    assert await close_finished_runs(db) == 1
+    status = (
+        await fetchall(
+            db, "SELECT status FROM steward_runs WHERE task_id=?", (task_id,)
+        )
+    )[0]["status"]
+    assert status == RUN_TIMEOUT
+
+    row = await _judge(db, task_id, model="codex-5.3")
+    assert row["model"] == "gpt-5.3-codex"
+    assert row["duration_ms"] is not None
+    assert row["tokens_unknown_reason"] == TOKENS_PENDING
+
+    await _sweep(db, usage={"totalUsage": {"totalTokens": 321}})
+    row = dict(await repo.get_steward_judgement(db, task_id, 1, "verdict"))
+    assert row["tokens_spent"] == 321
