@@ -3404,6 +3404,10 @@ PR_DRAFT_PREFIX = "pr_draft"
 STACKED_BASE_PREFIX = "stacked_base"
 # #1233: гейт сам разрешил конфликт названного класса и обновил ветку.
 BASE_AUTOMERGE_PREFIX = "base_automerged"
+# #1332: чем хост проверяет сложенное автомержем. Имя одно для карточки и
+# для hub/services/validation_run.host_profile_runner — обещание в карточке
+# не расходится с тем, что прогнано.
+HOST_PROFILE_NAME = "git diff --check и компиляция изменённых .py"
 STACK_UNKNOWN_PREFIX = "stack_unknown"
 # Deliberately NOT in TRANSIENT_GATE_PREFIXES: a stack whose order does not
 # follow from ancestry has nothing to wait for, and a wait would be mutual and
@@ -3591,7 +3595,6 @@ async def base_automerge_step(
     сложено, пишется в карточку, а валидация после разрешения судится по коду
     возврата — 09.09 дважды видели «All checks passed» при коде 2.
     """
-    from hub.db import deserialize_str_list
     from hub.services import validation_run
 
     task_id = task["id"]
@@ -3626,17 +3629,14 @@ async def base_automerge_step(
     if not resolutions:
         return "", f"конфликт вне класса автомержа — {note}"
 
-    commands = deserialize_str_list(task.get("validation_commands"))
-    if not commands:
-        # Нечем доказать, что сложенное вместе работает. Складывать вслепую и
-        # пушить в ветку под чужим одобрением гейт права не имеет.
-        return "", (
-            "конфликт хвостовой, но у задачи нет validation_commands — "
-            "проверить сложенное нечем, поэтому разрешает человек"
-        )
-
-    async def _validate(path: str) -> tuple[int, str] | None:
-        return await validation_run.default_validation_runner(commands, path)
+    # #1332: сложенное проверяет ФИКСИРОВАННЫЙ профиль хоста, а не
+    # validation_commands автора. Те писались под машину разработчика («uv run
+    # pytest», «make check»); на проде uv нет, в venv сервиса нет pytest и
+    # ruff, и 23.09 первая же попытка (#1242) упала кодом 127. Хост отсекает
+    # заведомо сломанное (маркеры, синтаксис) тем, что у него есть всегда;
+    # поведение проверяет CI на новой вершине — пуш слитой ветки запускает
+    # его, и гейт следующим циклом доставляет только при зелёном.
+    _validate = validation_run.host_profile_runner
 
     # ``files`` — та самая проба, по которой посчитано ``resolutions``. Пуш
     # строит дерево заново и сливает уже НОВЫЙ origin/base, поэтому сверка
@@ -3673,15 +3673,18 @@ async def base_automerge_step(
         "alert",
         f"Автомерж базы (#1233): конфликт с {base} разрешён «оставить оба» — "
         f"{note}. Ничего не переписано, авторский блок остался первым. "
-        f"Валидация после разрешения прогнана и зелёная по коду возврата: "
-        f"{'; '.join(commands)}. Коммит мержа {detail[:12]}, и коммит сдачи "
-        f"перезакреплён на него: этот коммит сделал гейт, авторского кода в "
-        f"нём нет. Доставка повторится следующим циклом.",
+        f"Сложенное проверено профилем хоста (#1332): {HOST_PROFILE_NAME} — "
+        f"зелёное по коду возврата. validation_commands автора здесь не "
+        f"запускаются: поведение слитого кода проверяет CI на новой вершине, "
+        f"и доставка следующим циклом ждёт его зелёным. Коммит мержа "
+        f"{detail[:12]}, и коммит сдачи перезакреплён на него: этот коммит "
+        f"сделал гейт, авторского кода в нём нет.",
     )
     return (
         f"{BASE_AUTOMERGE_PREFIX}: конфликт с базой был из хвостовых добавлений "
-        f"и разрешён гейтом ({note}); валидация зелёная, ветка обновлена "
-        f"коммитом {detail[:12]} — доставка повторится следующим циклом"
+        f"и разрешён гейтом ({note}); профиль хоста зелёный, ветка обновлена "
+        f"коммитом {detail[:12]} — доставка повторится следующим циклом, "
+        f"когда CI на новой вершине станет зелёным"
     ), ""
 
 

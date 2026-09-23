@@ -1068,22 +1068,27 @@ async def test_an_overlapping_conflict_still_calls_a_human(
     )
 
 
-async def test_the_gate_never_merges_what_it_cannot_validate(
+async def test_a_task_without_validation_commands_is_checked_by_the_host_profile(
     db: aiosqlite.Connection, monkeypatch
 ) -> None:
-    # Ограничение из постановки: сложить два блока текста мало — они могут
-    # конфликтовать по именам. Прогонять нечем — не пушим и зовём человека.
+    # До #1332 здесь стоял отказ «у задачи нет validation_commands — проверить
+    # сложенное нечем». Теперь сложенное проверяет фиксированный профиль хоста,
+    # и он есть всегда: команды автора автомержу больше не нужны и не
+    # запускаются. Проверять по-прежнему обязаны — валидатор передаётся.
     g = _seeing(monkeypatch, "approved0commit", merged=False)
     g.base_merge_conflicts = AsyncMock(
         return_value=({"tests/test_review_dispatch.py": _TAIL_CONFLICT}, "")
     )
-    g.push_resolved_base_merge = AsyncMock(return_value=(True, "should0not0happen"))
+    g.push_resolved_base_merge = AsyncMock(return_value=(True, "merged0by0the0gate"))
     task_id = await _approved_pair_task(db)
 
     await _report_done(db, task_id)
 
-    g.push_resolved_base_merge.assert_not_awaited()
-    assert "validation_commands" in await _feed(db, task_id)
+    g.push_resolved_base_merge.assert_awaited_once()
+    validate = g.push_resolved_base_merge.await_args.args[5]
+    assert validate is validation_run.host_profile_runner, (
+        "сложенное проверяет профиль хоста, а не команды автора"
+    )
 
 
 async def test_a_merge_that_failed_without_a_conflict_is_not_dressed_as_one(
@@ -1438,7 +1443,7 @@ async def test_the_gate_path_runs_the_validation_and_stops_on_a_red_code(
     g.push_resolved_base_merge = _push
     monkeypatch.setattr(
         validation_run,
-        "default_validation_runner",
+        "host_profile_runner",
         AsyncMock(return_value=(2, "All checks passed")),
     )
     task_id = await _approved_pair_task(db)
@@ -3880,7 +3885,9 @@ async def test_a_missing_validation_command_is_named_as_the_environment(
     g, task_id, workdir, pinned = await _automerge_on_real_git(
         db, monkeypatch, tmp_path
     )
-    monkeypatch.setattr(validation_run, "_profile_python", lambda: "python3-absent-1332")
+    monkeypatch.setattr(
+        validation_run, "_profile_python", lambda: "python3-absent-1332"
+    )
 
     await _report_done(db, task_id)
 
@@ -3936,8 +3943,7 @@ async def test_automerge_validates_with_a_command_the_host_can_run(
         "карточка называет, ЧЕМ проверено сложенное"
     )
     assert "CI на новой вершине" in feed, (
-        "и чем будет проверено поведение: карточка не обещает больше, чем "
-        "сделал хост"
+        "и чем будет проверено поведение: карточка не обещает больше, чем сделал хост"
     )
 
     # Следующий цикл: CI на слитой вершине ещё не зелёный — гейт ждёт его, а
@@ -4011,13 +4017,11 @@ async def test_the_host_profile_catches_a_leftover_conflict_marker(tmp_path) -> 
     assert "tests_suite.py" in log_tail
 
     # И тот же файл, разрешённый честно, профиль пропускает.
-    text = suite.read_text()
-    clean = "\n".join(
-        ln
-        for ln in text.splitlines()
-        if not ln.startswith(("<<<<<<<", "|||||||", "=======", ">>>>>>>"))
+    suite.write_text(
+        "def test_common():\n    assert True\n\n\n"
+        "def test_from_the_branch():\n    pass\n\n\n"
+        "def test_from_the_base():\n    pass\n"
     )
-    suite.write_text(clean + "\n")
     _run_git("git", "add", "tests_suite.py", cwd=workdir)
     rc, log_tail = await validation_run.host_profile_runner(str(workdir))
     assert rc == 0, log_tail
