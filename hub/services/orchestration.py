@@ -1989,7 +1989,32 @@ STACK_DELIVERY_STATUSES = [
     # from the statuses I had in mind rather than from the enum. A task
     # waiting to report owns a pushed branch like any other.
     "pending_report",
+    # #1275, found by the #1271 partition test, which walks TaskStatus whole
+    # instead of the statuses in mind. Each is reachable from running with the
+    # branch already pushed, and each goes back to running by an ordinary
+    # transition, so the base will deliver itself and a hold is the answer:
+    #   needs_info — running → needs_info (hub_ask_question); the answer sends
+    #                it to open.
+    #   open       — running → open (chat_pair_reaper), needs_info → open.
+    #   claimed    — open → claimed on the way back to running.
+    # An open or claimed task that never started has no branch, and the walk
+    # already skips rows without one (list_unmerged_branch_tasks).
+    "needs_info",
+    "open",
+    "claimed",
 ]
+
+# #1275: statuses whose branch may be unmerged and which will NEVER deliver
+# themselves. `failed` is final (FINAL_STATUSES; LIFECYCLE_TRANSITIONS has no
+# way out of it) and reached from running when a headless run fails — with its
+# branch possibly pushed. Waiting for it would be a promise the hub cannot
+# keep, so it is not in the list above: the delivery walk reads it as a base
+# that cannot deliver itself, and a definite stack on it goes to a human, like
+# the stranded `completed` of #1204. Kept apart from that one on purpose: a
+# failed task has no delivery registry row, and its branch is often never
+# published at all (the run failed before a push) — that case must stay #1283's
+# merge-with-alert, not call a human on every delivery in the project.
+STACK_TERMINAL_STATUSES = ["failed"]
 
 
 # #1186: the three answers the delivery gate needs and the advisory hint
@@ -2137,6 +2162,33 @@ async def _walk_stacking_candidates(
             row, name = pending[consumed]
             consumed += 1
             yield row, name, result
+
+
+def _why_base_never_delivers(assessment: "StackAssessment") -> str:
+    """Why waiting for this base is pointless, and what a human can do (#1204, #1275).
+
+    Two different facts reach ``stranded_base``, and the text must name the
+    true one. A task accepted without delivery has a PR the registry knows
+    about. A failed task (#1275) was not accepted by anyone and may have no PR
+    at all — «человек принял» and «её PR открыт» would both be false there.
+    """
+    if assessment.base_task_status in STACK_TERMINAL_STATUSES:
+        return (
+            f"и эта задача упала (статус {assessment.base_task_status} "
+            f"финальный). Ждать нечего: конвейер к упавшей задаче не вернётся, "
+            f"а мерж сейчас унёс бы её работу в базовую ветку под номером этой "
+            f"задачи. Решение за человеком: спасти работу "
+            f"#{assessment.base_task_id} отдельной доставкой или отвязать от "
+            f"неё эту ветку"
+        )
+    return (
+        f"и эту задачу человек принял, НЕ доставив — "
+        f"{_base_pr_phrase(assessment.base_delivery_state)}. Ждать нечего: "
+        f"конвейер к принятой задаче не вернётся, а мерж сейчас унёс "
+        f"бы её работу в базовую ветку под номером этой задачи. "
+        f"Решение за человеком: доставить "
+        f"#{assessment.base_task_id} или отвязать от неё эту ветку"
+    )
 
 
 def _base_pr_phrase(delivery_state: str) -> str:
@@ -2508,6 +2560,7 @@ async def assess_branch_stacking(
     own_project = await _project_id_for(db, task_id)
     rows: list[Any] = []
     stranded: set[int] = set()
+    terminal: set[int] = set()
     if statuses is not None:
         # #1204: the delivery question only. The advisory callers keep asking
         # "is someone working on top of me", and a task nobody is working on
@@ -2526,6 +2579,13 @@ async def assess_branch_stacking(
         ):
             rows.append(row)
             stranded.add(int(dict(row)["id"]))
+        # #1275: the same "never delivers itself", and first in the walk for
+        # the same reason — but its own set, see STACK_TERMINAL_STATUSES.
+        for row in await repo.list_unmerged_branch_tasks(
+            db, exclude_task_id=task_id, statuses=STACK_TERMINAL_STATUSES
+        ):
+            rows.append(row)
+            terminal.add(int(dict(row)["id"]))
     rows.extend(
         await repo.list_unmerged_branch_tasks(
             db, exclude_task_id=task_id, statuses=statuses or STACK_ADVISORY_STATUSES
@@ -2594,7 +2654,7 @@ async def assess_branch_stacking(
                 base_task_branch=other_branch,
                 base_task_status=other_status,
                 relation=relation,
-                base_can_deliver_itself=other_id not in stranded,
+                base_can_deliver_itself=other_id not in stranded | terminal,
                 base_delivery_state=other.get("delivery_state") or "",
                 message=_stacking_message(
                     relation, branch, other_branch, other_id, other_status, base
@@ -3068,13 +3128,7 @@ async def stacking_gate_step(db: aiosqlite.Connection, task: dict[str, Any]) -> 
                     f"подтвердил, сторону хаб не называет)"
                 )
             return (
-                f"{STRANDED_BASE_PREFIX}: {how}, и эту задачу человек принял, "
-                f"НЕ доставив — "
-                f"{_base_pr_phrase(assessment.base_delivery_state)}. Ждать нечего: "
-                f"конвейер к принятой задаче не вернётся, а мерж сейчас унёс "
-                f"бы её работу в базовую ветку под номером этой задачи. "
-                f"Решение за человеком: доставить "
-                f"#{assessment.base_task_id} или отвязать от неё эту ветку"
+                f"{STRANDED_BASE_PREFIX}: {how}, {_why_base_never_delivers(assessment)}"
             )
         if assessment.relation != git_ops_mod.STACK_ANCESTRY_HEAD_IS_DESCENDANT:
             # #1186, found by the machine review of this very change. Waiting

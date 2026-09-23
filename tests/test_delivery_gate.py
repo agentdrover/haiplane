@@ -2639,6 +2639,7 @@ STACK_EXCLUDED_STATUSES: dict[str, str] = {
     ),
 }
 
+
 def test_every_task_status_is_either_stacked_or_excluded_with_a_reason() -> None:
     """#1271 AC-1: новый член TaskStatus без решения роняет этот тест.
 
