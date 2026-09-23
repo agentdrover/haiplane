@@ -3448,6 +3448,9 @@ class StewardJudgementView(BaseModel):
     closures: list[StewardClosure] = Field(default_factory=list)
     model: str = ""
     tokens_spent: int | None = None
+    # Почему tokens_spent пуст (#1328): pending | provider_no_answer | no_run;
+    # '' — число есть. Ноль и «неизвестно» не смешиваются.
+    tokens_unknown_reason: str = ""
     duration_ms: int | None = None
     submitted_by: str = ""
     created_at: str = ""

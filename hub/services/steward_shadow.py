@@ -942,8 +942,12 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
     # кто работал двенадцать минут из тридцати. Отдельным UPDATE окно
     # досталось бы и тому, кто слот не брал: условие agent_id=claim здесь
     # не украшение, а то, что делает запись принадлежащей захватившему.
+    #
+    # Отметка старта — тоже здесь (#1328): от неё суждение меряет свою
+    # длительность, и принадлежит она тому же захватившему.
     await db.execute(
         "UPDATE steward_runs SET agent_id=?, run_id=?, model=?, "
+        "started_at=strftime('%Y-%m-%d %H:%M:%f', 'now'), "
         "deadline_at=datetime('now', ?) WHERE id=? AND agent_id=?",
         (
             agent_id,

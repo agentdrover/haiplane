@@ -16,6 +16,7 @@ from hub.actionable_errors import (
     steward_verdict_required_detail,
 )
 from hub.config import TokenIdentity
+from hub.db import fetchall
 from hub.models import (
     STEWARD_CLOSURE_TYPES,
     STEWARD_CONFIDENCE,
@@ -146,6 +147,9 @@ async def record_steward_judgement(
     if body.closures:
         await _refuse_unknown_closure_uids(db, task_id, body.generation, body.closures)
 
+    model, duration_ms, tokens_reason = await _cost_of_the_run(
+        db, task_id, body.generation, body.kind, body.model
+    )
     inserted = await repo.insert_steward_judgement(
         db,
         task_id=task_id,
@@ -160,11 +164,12 @@ async def record_steward_judgement(
         closures=json.dumps(
             [c.model_dump() for c in body.closures], ensure_ascii=False
         ),
-        model=body.model,
-        tokens_spent=body.tokens_spent,
-        duration_ms=body.duration_ms,
+        model=model,
+        tokens_spent=None,
+        duration_ms=duration_ms,
         submitted_by=identity.username[:100],
         principal_id=identity.principal_id,
+        tokens_unknown_reason=tokens_reason,
     )
     if inserted is None:
         raise HTTPException(
@@ -213,6 +218,101 @@ async def record_steward_judgement(
             f"steward judgement {inserted} missing after insert for task #{task_id}"
         )
     return StewardJudgementView(**dict(saved))
+
+
+async def _cost_of_the_run(
+    db, task_id: int, generation: int, kind: str, declared_model: str
+) -> tuple[str, int | None, str]:
+    """Модель, длительность и состояние токенов — по прогону, не по словам (#1328).
+
+    Стюард декларирует модель, токены и длительность сам, и на проде
+    22.09.2026 писал пустую строку или «codex-5.3», пока прогон шёл на
+    gpt-5.3-codex. Хаб знает всё это лучше судьи: модель — в строке прогона
+    (её пишет старт, с учётом замены судьи #1182), старт — там же.
+
+    Длительность меряется от ``started_at``, а не от ``created_at``: второе —
+    время заказа, и заказ мог ждать исполнителя сколько угодно (#1181).
+
+    Токены при записи не известны НИКОМУ: провайдер отдаёт usage после
+    конца прогона, а судья заявляет цифру, которую никто не сверял. Поэтому
+    здесь только причина ``pending`` — число дописывает свип
+    (:func:`stamp_judgement_usage`). Провайдер здесь не зовётся вовсе:
+    запись суждения не ждёт его и не падает из-за него.
+
+    Без начатого прогона (суждение, поданное мимо заказа) источника нет:
+    модель остаётся заявленной, длительности нет, токены — ``no_run``.
+    """
+    from hub.services.steward_dispatch import open_run, run_has_started
+
+    run = await open_run(db, task_id, generation, kind)
+    if run is None or not run_has_started(run):
+        return declared_model, None, TOKENS_NO_RUN
+    duration_ms: int | None = None
+    if run.get("started_at"):
+        rows = await fetchall(
+            db,
+            "SELECT CAST(ROUND((julianday('now') - julianday(?)) * 86400000) "
+            "AS INTEGER) AS ms",
+            (run["started_at"],),
+        )
+        ms = dict(rows[0]).get("ms") if rows else None
+        duration_ms = max(int(ms), 0) if ms is not None else None
+    return str(run.get("model") or "") or declared_model, duration_ms, TOKENS_PENDING
+
+
+async def stamp_judgement_usage(db) -> int:
+    """Дописать токены суждениям, которые их ждут (#1328). Шаг свипа.
+
+    Спрашивается ТОЛЬКО закончившийся прогон: судья кладёт суждение
+    посреди своей работы и дописывает ответ после, и usage, снятый в эту
+    секунду, был бы неполным числом, которое уже никто не поправит.
+
+    Молчание провайдера не становится нулём. Пока окно ответа
+    (``USAGE_ANSWER_WINDOW_MIN``) не вышло, суждение ждёт следующего прохода;
+    после — причина ``provider_no_answer``, а ``tokens_spent`` остаётся NULL.
+    Ошибка провайдера — то же молчание: свип best-effort и не падает.
+    """
+    from hub.integrations import cursor_cloud
+    from hub.services.review_dispatch import (
+        _TERMINAL_RUN_STATUSES,
+        _provider_token_total,
+    )
+
+    rows = await fetchall(
+        db,
+        "SELECT j.id, r.agent_id, r.run_id, "
+        "j.created_at <= datetime('now', ?) AS window_over "
+        "FROM steward_judgements j JOIN steward_runs r "
+        "ON r.task_id=j.task_id AND r.generation=j.generation AND r.kind=j.kind "
+        "WHERE j.tokens_unknown_reason=? AND r.status != 'open'",
+        (f"-{USAGE_ANSWER_WINDOW_MIN} minutes", TOKENS_PENDING),
+    )
+    stamped = 0
+    for row in rows:
+        item = dict(row)
+        total: int | None = None
+        try:
+            run = await cursor_cloud.get_run(item["agent_id"], item["run_id"])
+            if str((run or {}).get("status") or "").upper() in _TERMINAL_RUN_STATUSES:
+                total = _provider_token_total(
+                    await cursor_cloud.get_usage(
+                        item["agent_id"], item["run_id"] or None
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 — молчание, а не авария свипа
+            log.warning("steward usage not read for judgement %s: %s", item["id"], exc)
+        if total is not None:
+            await repo.set_steward_judgement_tokens(db, item["id"], total, "")
+        elif item["window_over"]:
+            await repo.set_steward_judgement_tokens(
+                db, item["id"], None, TOKENS_PROVIDER_NO_ANSWER
+            )
+        else:
+            continue
+        stamped += 1
+    if stamped:
+        await db.commit()
+    return stamped
 
 
 async def _self_approve_if_everything_converged(

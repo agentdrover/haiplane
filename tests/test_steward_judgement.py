@@ -244,7 +244,9 @@ async def test_a_judgement_records_tokens_and_duration(
     assert row["tokens_spent"] is None
     assert row["tokens_unknown_reason"] == TOKENS_PENDING
     status = (
-        await fetchall(db, "SELECT status FROM steward_runs WHERE task_id=?", (task_id,))
+        await fetchall(
+            db, "SELECT status FROM steward_runs WHERE task_id=?", (task_id,)
+        )
     )[0]["status"]
     assert status == RUN_JUDGED
 
