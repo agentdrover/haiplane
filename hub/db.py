@@ -2106,6 +2106,82 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE steward_judgements ADD COLUMN tokens_unknown_reason TEXT "
         "NOT NULL DEFAULT ''",
     ),
+    # --- #1343: реестр мержей гейта держится за мерж, а не за номер PR. ------
+    #
+    # UNIQUE (project_id, pr_number) плюс INSERT OR IGNORE молча выбрасывали
+    # новый мерж, если его номер PR уже занят строкой старого репозитория:
+    # проект переехал, нумерация PR началась заново, 224 строки до PR 471
+    # остались. С 15.09 так потеряны 31 доставка, и drift-guard называл мержи
+    # гейта «мимо гейта». Номер PR — текст для контекста (#534), доказательство
+    # мержа — merge_sha, им и ключуемся.
+    #
+    # В SQLite ограничение таблицы снимается только пересборкой. Шаги идут
+    # отдельными записями, потому что _migrate исполняет по одному оператору,
+    # но транзакция у них одна: _migrate коммитит один раз в конце, а первая
+    # же отметка в _migrations открывает транзакцию. Упадёт любой шаг — откат
+    # вернёт старую таблицу со строками, и ни одна отметка rekey_* не
+    # сохранится (test_pipeline_merges_rekey_is_all_or_nothing). Первым шагом
+    # идёт уборка копии, чтобы повтор после сбоя начинал с чистого места.
+    (
+        "rekey_pipeline_merges_clear",
+        "DROP TABLE IF EXISTS pipeline_merges_rekeyed",
+    ),
+    (
+        "rekey_pipeline_merges_create",
+        """CREATE TABLE pipeline_merges_rekeyed (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id   INTEGER,
+            pr_number    INTEGER NOT NULL,
+            task_id      INTEGER,
+            merged_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+            merge_sha    TEXT,
+            released_pr  INTEGER,
+            released_sha TEXT
+        )""",
+    ),
+    (
+        # id переносится явно: на него ссылаются ORDER BY id в читателях, и
+        # строки остаются теми же строками, а не новыми с теми же данными.
+        "rekey_pipeline_merges_copy",
+        "INSERT INTO pipeline_merges_rekeyed (id, project_id, pr_number, "
+        "task_id, merged_at, merge_sha, released_pr, released_sha) "
+        "SELECT id, project_id, pr_number, task_id, merged_at, merge_sha, "
+        "released_pr, released_sha FROM pipeline_merges",
+    ),
+    (
+        # AUTOINCREMENT обещает не выдавать id повторно, в том числе id
+        # удалённых строк. Копия знает только максимум уцелевших, поэтому
+        # счётчик старой таблицы переносится, пока она ещё есть.
+        "rekey_pipeline_merges_sequence",
+        "UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE((SELECT s.seq "
+        "FROM sqlite_sequence s WHERE s.name = 'pipeline_merges'), 0)) "
+        "WHERE name = 'pipeline_merges_rekeyed'",
+    ),
+    (
+        "rekey_pipeline_merges_drop",
+        "DROP TABLE pipeline_merges",
+    ),
+    (
+        "rekey_pipeline_merges_rename",
+        "ALTER TABLE pipeline_merges_rekeyed RENAME TO pipeline_merges",
+    ),
+    (
+        # Ключ — мерж. Индекс частичный: пустой merge_sha значит «коммит не
+        # прочитан» (писатели передают '' при сбое чтения), и это не ключ.
+        # Без WHERE все такие строки проекта схлопнулись бы в одну, то есть
+        # пустой sha глотал бы чужие мержи — та же болезнь, что лечится.
+        # Повтор мержа с пустым sha гасит record_pipeline_merge.
+        "rekey_pipeline_merges_unique_sha",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_pipeline_merges_project_sha "
+        "ON pipeline_merges (project_id, merge_sha) WHERE merge_sha <> ''",
+    ),
+    (
+        # Прежний UNIQUE служил и индексом по проекту; поиск остаётся, а
+        # уникальности больше нет.
+        "rekey_pipeline_merges_project_pr_index",
+        "CREATE INDEX IF NOT EXISTS ix_pipeline_merges_project_pr "
+        "ON pipeline_merges (project_id, pr_number)",
+    ),
 ]
 
 
