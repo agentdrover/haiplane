@@ -8,6 +8,7 @@ published ``tools/list`` grew, which is the exact failure it exists to prevent.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -740,3 +741,37 @@ def test_measured_records_the_freeze_not_the_present(tmp_path: Path) -> None:
             "not minus the live catalog — otherwise it changes under every "
             "edit and stops answering 'how much of the slack has been spent'"
         )
+
+
+def _catalog_bullets(path: Path) -> list[str]:
+    """Top-level bullets of a doc that talk about the catalog budget script."""
+    bullets: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("- "):
+            bullets.append(line)
+        elif bullets and line.startswith("  ") and line.strip():
+            bullets[-1] += " " + line.strip()
+    return [b for b in bullets if "mcp_catalog_budget.py" in b]
+
+
+@pytest.mark.parametrize("doc", ["AGENTS.md", "docs/agent-context/change-map.md"])
+def test_agent_docs_point_to_the_refill_policy_not_to_update(doc: str) -> None:
+    """#1241 review: the refill policy lives in ONE place, working_headroom_note.
+
+    AGENTS.md and change-map.md used to tell the reader to raise the ceiling
+    with --update, which the note forbids an agent to do. They may point at the
+    note; they may not offer --update as the way to raise a ceiling.
+    """
+    bullets = _catalog_bullets(REPO_ROOT / doc)
+    assert bullets, f"{doc} no longer mentions scripts/mcp_catalog_budget.py"
+    for bullet in bullets:
+        assert "working_headroom_note" in bullet, (
+            f"{doc}: the catalog bullet must point to working_headroom_note, "
+            f"the one refill policy, instead of restating it: {bullet!r}"
+        )
+        for clause in re.split(r"[.;,]\s", bullet):
+            if "--update" in clause:
+                assert re.search(r"\bnot\b", clause), (
+                    f"{doc}: --update is offered as a way to move the budget, "
+                    f"which working_headroom_note forbids: {clause!r}"
+                )
