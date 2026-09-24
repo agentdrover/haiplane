@@ -171,6 +171,7 @@ async def _submitted(
     diff: str | None = None,
     rules: dict[str, str] | None = None,
     forge: str = "github",
+    validation_commands: list[str] | None = None,
 ) -> int:
     areas = ["docs/notes.md"] if areas is None else areas
     pid = await repo.create_project(
@@ -195,7 +196,13 @@ async def _submitted(
     task_id = await _node(db, title="probe", task_type="task", parent_id=feature)
     await repo.add_task_update(db, task_id, "dev", "status", "Plan: work")
     await repo.update_task_structured(
-        db, task_id, TaskRefine(affected_areas=areas, risks=risks)
+        db,
+        task_id,
+        TaskRefine(
+            affected_areas=areas,
+            risks=risks,
+            validation_commands=validation_commands,
+        ),
     )
     if clear_risk_class:
         # A task whose class was never computed: the state #582 calls
@@ -11364,3 +11371,116 @@ async def test_a_retry_cancelled_by_a_moved_submission_says_so(
     assert any("отменён" in a and "сдача сменилась" in a for a in after), (
         f"отмена по свежести сдачи не названа в карточке: {after}"
     )
+
+
+# --- #1357: попытка Docker до «среда отказала», и только там, где она нужна ---
+
+
+def _prompt_for(profile: str, needs_container: bool) -> str:
+    from hub.services.review_dispatch import _review_prompt
+
+    return _review_prompt(
+        1357,
+        "task-1357/x",
+        "grok-4.6",
+        profile,
+        "RULES",
+        "DIFF",
+        "PREPASS",
+        needs_container=needs_container,
+    )
+
+
+@pytest.mark.parametrize("profile", [LITE, DEEP])
+def test_prompt_orders_docker_attempt_when_task_needs_container(profile: str) -> None:
+    """AC-1: задача с docker compose в проверках получает попытку поднять демон,
+    и отсутствие команды docker до попытки отказом среды не называется."""
+    from hub.services.review_dispatch import task_needs_container
+
+    task = {
+        "validation_commands": json.dumps(
+            ["docker compose up -d --build && curl -fsS http://localhost:8080/healthz"]
+        ),
+        "review_checklist": "[]",
+    }
+    assert task_needs_container(task)
+
+    prompt = _prompt_for(profile, task_needs_container(task))
+    assert "sudo apt-get install -y docker.io docker-compose-v2" in prompt
+    assert "sudo docker info" in prompt
+    assert "это ещё не отказ среды" in prompt
+    # Ловушка пробы 24.09: на порт ответил хостовый процесс, а не контейнер.
+    assert "sudo docker compose ps" in prompt
+    assert "ports: !override" in prompt
+    # Порядок: попытка идёт ДО итогового правила об отказе среды.
+    assert prompt.index("docker.io") < prompt.index('incomplete_reason="environment"')
+
+
+@pytest.mark.parametrize("profile", [LITE, DEEP])
+def test_prompt_requires_named_step_when_docker_attempt_fails(profile: str) -> None:
+    """AC-2: провал попытки — incomplete с причиной environment и названным шагом."""
+    prompt = _prompt_for(profile, needs_container=True)
+    assert "incomplete=true" in prompt
+    assert 'incomplete_reason="environment"' in prompt
+    for step in (
+        "нет sudo",
+        "пакет не встал",
+        "dockerd не стартовал",
+        "контейнер не поднялся",
+    ):
+        assert step in prompt, step
+
+
+@pytest.mark.parametrize("profile", [LITE, DEEP])
+def test_prompt_forbids_repo_changes_but_allows_tool_install(profile: str) -> None:
+    """AC-3: запрет на коммит, пуш и правку файлов репозитория остаётся, а
+    установка инструмента во временную машину названа частью проверки. Для
+    задачи без контейнерных проверок абзаца про Docker нет вовсе."""
+    from hub.services.review_dispatch import task_needs_container
+
+    prompt = _prompt_for(profile, needs_container=False)
+    assert "НИЧЕГО не коммить, не пушить и не менять в файлах репозитория" in prompt
+    assert "Поставить во временную машину недостающий инструмент" in prompt
+    assert "docker.io" not in prompt
+    # Блок #1238 про pytest и базу на месте в обоих случаях.
+    assert "python -m pip install -q pytest" in prompt
+
+    # Слово Docker в чеклисте — не команда: правка самого промпта не должна
+    # покупать себе установку демона.
+    assert not task_needs_container(
+        {
+            "validation_commands": json.dumps(["uv run pytest -q"]),
+            "review_checklist": json.dumps(
+                ["Попытка Docker условная: без контейнерных проверок не ставить"]
+            ),
+        }
+    )
+    assert task_needs_container(
+        {"validation_commands": None, "review_checklist": ["docker build ."]}
+    )
+
+
+async def test_dispatched_prompt_carries_docker_attempt_only_for_container_tasks(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1357, место вызова: флаг доезжает от задачи до промпта, уходящего в
+    облако. Тесты выше зовут _review_prompt напрямую и пропустили бы
+    prepare_review_order, забывший передать признак."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-d"}, "run": {"id": "run-d"}})
+    _wire(monkeypatch, recorder)
+
+    await _submitted(
+        client,
+        db,
+        "spike-container",
+        validation_commands=["docker compose up -d --build"],
+    )
+    await _submitted(
+        client, db, "spike-plain", validation_commands=["uv run pytest -q"]
+    )
+
+    assert len(recorder.calls) == 2
+    with_docker, plain = (c["prompt_text"] for c in recorder.calls)
+    assert "sudo apt-get install -y docker.io docker-compose-v2" in with_docker
+    assert "docker.io" not in plain
+    assert "не менять в файлах репозитория" in plain
