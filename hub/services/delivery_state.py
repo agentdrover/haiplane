@@ -805,6 +805,76 @@ async def _answer_past_closed_number(
     return answer
 
 
+async def blocker_delivery_cached(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
+    """Доставка одного блокера БЕЗ вопроса провайдеру (#1281).
+
+    Не второе определение «доставлено», а тот же читатель с другим бюджетом.
+    Ответ собирается из трёх источников, и все три уже существуют:
+
+    1. ``blocker_delivery`` (#885) — мерж гейта (бесплатно) и базовая ветка
+       локальным git; сети здесь нет;
+    2. записанный ответ свипа (#897) — та самая строка, которую читает
+       ``undelivered_completed_tasks``, и единственное место, где за этот
+       вопрос платят вызовом провайдера. Squash-доставка видна только
+       отсюда: ancestry её не сохраняет, и на squash-конвейере шаг 1 даже
+       не спрашивает git — он отвечает ``BASE_UNANSWERABLE_NOTE``, то есть
+       честным незнанием вместо ненаблюдённого «нет» (#1214);
+    3. если не записано ничего — остаётся ответ шага 1, и его незнание
+       остаётся незнанием.
+
+    Отличие от ``with_delivery`` одно и оно в типе: ``delivered`` здесь
+    ТРЁХЗНАЧЕН — ``True``, ``False`` и ``None`` = «узнать не удалось», ровно
+    триада ``merged_into_base`` (#725/#885). Схлопывать ``None`` в любой из
+    двух определённых ответов здесь нельзя: это та самая ошибка, которую
+    реестр уже перестал делать дважды (#897, #1198).
+    """
+    enriched = await blocker_delivery(db, blocker)
+    if enriched.get("delivered"):
+        return {**enriched, "delivered": True}
+
+    stored = await repo.get_delivery_discrepancy(db, int(blocker["task_id"])) or {}
+    state = (stored.get("state") or "").strip()
+    reason = (stored.get("reason") or "").strip()
+    path = (stored.get("delivery_path") or "").strip()
+    if state == DELIVERED:
+        return {
+            **enriched,
+            "delivered": True,
+            "delivery_path": path or "outside_gate",
+            "reason": reason,
+        }
+    if state == UNKNOWN:
+        return {
+            **enriched,
+            "delivered": None,
+            "delivery_path": "unknown",
+            "reason": reason or enriched.get("reason", ""),
+        }
+    if state:
+        # pr_open и pr_closed — оба «работы в базовой ветке нет», и оба
+        # названы своими словами свипа: закрытый без мержа PR и открытый
+        # требуют разных следующих шагов.
+        return {
+            **enriched,
+            "delivered": False,
+            "delivery_path": path or enriched.get("delivery_path", "none"),
+            "reason": reason or enriched.get("reason", ""),
+        }
+
+    # Про эту задачу свип ещё не отвечал. Тогда говорит шаг 1 — и его
+    # «посмотреть не удалось» остаётся незнанием, а не отказом.
+    if enriched.get("delivery_path") == "unknown":
+        return {**enriched, "delivered": None}
+    return {**enriched, "delivered": False}
+
+
+async def with_cached_delivery(
+    db: Any, blockers: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """``with_delivery`` для читателя, которому нельзя платить сетью (#1281)."""
+    return [await blocker_delivery_cached(db, b) for b in blockers]
+
+
 def _acceptance_note(answer: dict[str, Any], disposition: str) -> str:
     """The sentence a manual acceptance leaves behind instead of silence."""
     intent = _DISPOSITION_TEXT.get(disposition, _DISPOSITION_TEXT[""])

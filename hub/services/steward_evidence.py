@@ -50,6 +50,7 @@ from hub.services.ci_report import (
     VALIDATION_FAIL,
     VALIDATION_PASS,
 )
+from hub.services.delivery_state import with_cached_delivery
 
 PRESENT = "present"
 ABSENT = "absent"
@@ -456,25 +457,50 @@ async def dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFac
     "blocked by nothing" from two different computations could not be told
     which one it read.
 
-    Delivery is read from the ``delivered`` key the repository already put on
-    the edge (#485). It used to be recomputed here from ``merges``, a column
-    ``_blocker_entry`` pops on its way out — so ``get`` always answered None,
-    every blocker came back undelivered, and a task whose blockers had all
-    landed still read "не доставлено N". The steward would have refused a
-    ready draft on a fact the hub itself contradicts.
+    Доставку здесь НЕ считают заново. Читатель тот же, что у реестра
+    недоставленной работы (#897) — ``with_cached_delivery`` поверх #885, — и
+    по той же причине: пока источников два, суждение стюарда не сойдётся с
+    тем, что хаб считает истиной в другом окне.
+
+    Что было до этого, двумя слоями. Сперва факт считался по ``merges``, а
+    этой колонки в строке уже нет — ``_blocker_entry`` снимает её, разбирая
+    в ``delivered``, — так что недоставленным выходил КАЖДЫЙ блокер (#1158
+    это и починило). Но и сам ``delivered`` с ребра — это счёт по
+    ``pipeline_merges``, то есть по мержам, которые сделал гейт: доставка
+    squash-ом и мерж мимо записи гейта по-прежнему читались как «не
+    доставлено» (#1214, находка 42b59be386311b35). Второй слой снимается
+    здесь.
+
+    Ответ трёхзначный, как и у реестра: ``delivered`` True, False и None =
+    «узнать не удалось». Третье состояние существует, чтобы молчание
+    провайдера не работало основанием эскалации и отказа, — и чтобы случай,
+    в котором родословная не судит по построению (squash-конвейер,
+    ``BASE_UNANSWERABLE_NOTE``), не выдавался за наблюдённое «нет».
+
+    Провайдера пакет не спрашивает: за этот вопрос платит свип, а пакет
+    читает записанное. Сборка пакета не должна стоить сетевого вызова на
+    каждую зависимость.
     """
     source = "dependency_state"
     edges = await repo.list_task_dependencies(db, task_id)
-    blocked_by = [dict(e) for e in edges.get("blocked_by", [])]
-    undelivered = [e for e in blocked_by if not e.get("delivered")]
+    blocked_by = await with_cached_delivery(
+        db, [dict(e) for e in edges.get("blocked_by", [])]
+    )
+    undelivered = [e for e in blocked_by if e.get("delivered") is False]
+    unanswerable = [e for e in blocked_by if e.get("delivered") is None]
     return present(
         source,
-        f"блокеров {len(blocked_by)}, не доставлено {len(undelivered)}",
+        f"блокеров {len(blocked_by)}, не доставлено {len(undelivered)}, "
+        f"узнать не удалось {len(unanswerable)}",
         blocked_by=[
             {
                 "task_id": e.get("task_id"),
                 "status": e.get("status"),
-                "delivered": bool(e.get("delivered")),
+                # Трёхзначно: True, False и None = «узнать не удалось».
+                # bool() здесь схлопнул бы незнание в отказ — ровно то, что
+                # реестр перестал делать дважды (#897, #1198).
+                "delivered": e.get("delivered"),
+                "delivery_path": e.get("delivery_path", ""),
                 # Почему не доставлено: «PR не заявлен» и «PR не смержен
                 # гейтом» — разные следующие шаги, и репозиторий их уже
                 # различил (#485).
@@ -483,6 +509,7 @@ async def dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFac
             for e in blocked_by
         ],
         undelivered=len(undelivered),
+        unanswerable=len(unanswerable),
     )
 
 

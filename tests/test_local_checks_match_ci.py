@@ -63,6 +63,7 @@ SIGNATURES: dict[str, str] = {
 }
 
 _STEP_NAME_RE = re.compile(r"^\s*- name:\s*(.+?)\s*$", re.MULTILINE)
+_JOB_HEADER_RE = re.compile(r"^  [A-Za-z0-9_-]+:\n$")
 
 
 def _ci_test_steps(text: str) -> list[tuple[str, str]]:
@@ -75,7 +76,11 @@ def _ci_test_steps(text: str) -> list[tuple[str, str]]:
     """
     lines = text.splitlines(keepends=True)
     start = next(i for i, line in enumerate(lines) if line == "  test:\n")
-    end = next(i for i, line in enumerate(lines) if line == "  deploy:\n" and i > start)
+    # Граница — заголовок СЛЕДУЮЩЕГО джоба, а не имя deploy: джоб compose-smoke
+    # (#1358) стоит между ними и в make check не входит — ему нужен Docker.
+    end = next(
+        i for i, line in enumerate(lines) if i > start and _JOB_HEADER_RE.match(line)
+    )
     body = "".join(lines[start:end])
 
     matches = list(_STEP_NAME_RE.finditer(body))
@@ -175,7 +180,13 @@ def test_a_new_uncovered_step_breaks_the_build() -> None:
     injected_step = (
         "      - name: Imaginary new check\n        run: uv run imaginary-tool hub\n"
     )
-    mutated = ci_text.replace("  deploy:\n", injected_step + "  deploy:\n", 1)
+    # В конец джоба test — перед заголовком следующего джоба, каким бы он ни был.
+    lines = ci_text.splitlines(keepends=True)
+    start = lines.index("  test:\n")
+    end = next(
+        i for i, line in enumerate(lines) if i > start and _JOB_HEADER_RE.match(line)
+    )
+    mutated = "".join(lines[:end] + [injected_step] + lines[end:])
     assert mutated != ci_text
 
     problems = _uncovered_steps(mutated, makefile_text)
