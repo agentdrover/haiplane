@@ -677,7 +677,9 @@ def _claims_green(clause: str) -> bool:
     if _PASSED_COUNT_RE.search(clause):
         return not _FAILURE_RE.search(_ZERO_FAILURES_RE.sub("", clause))
     green = _GREEN_WORD_RE.search(clause)
-    return bool(green) and not _NEGATION_RE.search(clause[: green.start()])
+    if green is None:
+        return False
+    return not _NEGATION_RE.search(clause[: green.start()])
 
 
 def author_green_claims(text: str) -> list[str]:
