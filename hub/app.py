@@ -93,6 +93,7 @@ from hub.models import (
     SkillCreate,
     SkillView,
     TaskDecide,
+    TaskReturnToWork,
     TaskDeclareWait,
     TaskForceComplete,
     TaskQuestion,
@@ -2755,6 +2756,25 @@ async def api_decide_task(
     _identity=Depends(require_human_or_admin),
 ):
     return await services.decide_task(_db(request), task_id, body)
+
+
+@app.post("/api/tasks/{task_id}/return-to-work", response_model=TaskView)
+async def api_return_to_work(
+    task_id: int,
+    body: TaskReturnToWork,
+    request: Request,
+    identity=Depends(require_human_or_admin),
+):
+    """Return an abandoned submission from review/fix_requested to open (#1356).
+
+    Human or admin only; the reason is required (422 when blank). Closes the
+    current approval exactly as rework does, takes the claim off, and leaves
+    branch, PR and submission history in place. No MCP tool on purpose: the
+    catalog is at its budget and the action belongs to a human.
+    """
+    return await services.return_to_work(
+        _db(request), task_id, body, actor=identity.username
+    )
 
 
 @app.post("/api/tasks/{task_id}/force-complete", response_model=TaskView)

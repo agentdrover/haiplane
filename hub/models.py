@@ -1429,6 +1429,28 @@ class TaskDecide(BaseModel):
     pr_disposition: str = Field("", pattern=PR_DISPOSITION_PATTERN)
 
 
+class TaskReturnToWork(BaseModel):
+    """Human return of an abandoned submission to ``open`` (#1356).
+
+    The reason is required and must say something: it is the only record of
+    why somebody else's claim was taken off the task.
+    """
+
+    reason: str = Field(..., max_length=5000)
+    # fix_requested always carries a job_id, and a killed executor's job stays
+    # "running" in the registry forever. Without this the return is a 409 that
+    # names the job; with it the job is dropped from the task (not killed).
+    abandon_active_job: bool = False
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("reason is required: say why the task goes back to work")
+        return stripped
+
+
 REPORT_KINDS = frozenset({"done", "status", "blocker"})
 
 

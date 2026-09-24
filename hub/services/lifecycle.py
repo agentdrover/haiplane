@@ -83,6 +83,7 @@ from hub.models import (
     TaskChildSummary,
     TaskCreate,
     TaskDecide,
+    TaskReturnToWork,
     TaskForceComplete,
     TaskPairStart,
     TaskProgress,
@@ -4145,6 +4146,235 @@ async def declare_task_wait(
     return row_to_task(_existing_task(fresh, task_id))
 
 
+async def close_approval_for_rework(
+    db: aiosqlite.Connection, task_id: int, task: dict[str, Any]
+) -> int | None:
+    """Close the approval window a human decision has just revoked (#422, #1286).
+
+    ONE rule for every human "back to work": the rework branch of
+    :func:`decide_task` and :func:`return_to_work` (#1356) both call this, so
+    what a revocation closes cannot drift between two copies. Returns the
+    generation whose approval was closed, or ``None`` when there was none.
+
+    Rework is the boundary that closes the old arbiter/approval window
+    (#422): reset the cycle, clear the arbiter marker, and close the
+    approval the decision has just revoked, so the reworked submission
+    starts clean and the stale approval cannot count as current.
+    An approval and nothing else: a CHANGES_REQUESTED verdict on this
+    same submission authorised no delivery, so this revokes nothing from it
+    and says nothing about it (#1286 review).
+
+    That last clause used to be a promise the rework branch did not keep
+    (#1286). The verdict stayed bound to the current submission
+    generation, and generations move only on a resubmission — so between
+    the decision and the next submit the work went on counting as
+    approved. Both halves of that were observed on 22.09.2026: the
+    delivery sweep merged #1162 and #1206 after their owner had called
+    them back, and once the executor pushed the fix the branch outran the
+    pinned commit and the task returned to the same human as a
+    stale_approval. The window closes here; the verdict itself, its
+    findings and its generation stay on the card as history.
+    """
+    await repo.update_task(db, task_id, review_cycle=0)
+    await repo.reset_arbiter_state(db, task_id)
+    closed_generation = await repo.close_review_verdict_window(db, task_id)
+    if closed_generation is not None:
+        # Said out loud, because the card now shows an APPROVED verdict
+        # that authorises nothing, and silence there reads as a bug.
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            f"Одобрение ревью (сдача #{closed_generation}"
+            + (
+                f", коммит {(task.get('submission_sha') or '')[:12]}"
+                if (task.get("submission_sha") or "").strip()
+                else ""
+            )
+            + ") закрыто этим решением: работа по нему больше не "
+            "доставляется. Вердикт остаётся в истории задачи; чтобы "
+            "работа поехала, нужна новая сдача через "
+            "hub_submit_for_review и новый вердикт.",
+        )
+    return closed_generation
+
+
+#: Statuses a human may return to work from (#1356): a submission waiting on
+#: a verdict, or sent back and waiting on its executor. Both can be stranded
+#: by an executor who is gone; every other status already has its own exit.
+RETURN_TO_WORK_STATUSES = frozenset({"review", "fix_requested"})
+
+
+def _active_jobs_on_task(task: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """Dispatch jobs the registry still calls active: ``(field, job, status)``.
+
+    Same test as force-complete's: missing or terminal jobs do not count. The
+    registry reads the status from the job's JSON file, and a killed executor
+    leaves ``running`` there forever — so "active" here is the registry's
+    word, not a proof that a process is alive (#1356, finding 8582271d7f92112c).
+    """
+    active: list[tuple[str, str, str]] = []
+    for field in ("job_id", "review_job_id"):
+        job_ref = (task.get(field) or "").strip()
+        if not job_ref:
+            continue
+        blocks, dispatch_status = _dispatch_job_blocks_force_complete(
+            job_ref, plugins.dispatch.get_job(job_ref)
+        )
+        if blocks:
+            active.append((field, job_ref, dispatch_status or "unknown"))
+    return active
+
+
+def _refuse_return_over_active_job(
+    active: list[tuple[str, str, str]], *, abandon: bool
+) -> None:
+    """An active job refuses the return unless the human abandons it by name.
+
+    fix_requested is set ONLY together with a job_id, so without this flag the
+    main case — an executor that died mid-fix — would be a 409 forever.
+    """
+    if not active or abandon:
+        return
+    named = ", ".join(
+        f"{field} {job!r} status={status!r}" for field, job, status in active
+    )
+    raise HTTPException(
+        409,
+        f"active dispatch {named} blocks return to work; if the executor is "
+        "dead, repeat with abandon_active_job=true",
+    )
+
+
+def _abandoned_job_note(field: str, job: str, status: str, *, actor: str) -> str:
+    return (
+        f"Брошен {field} {job} (статус в реестре: {status}): его бросил человек "
+        f"{actor} при возврате в работу. Процесс не остановлен — у хаба нет "
+        "отмены; если он ещё жив, он больше не связан с задачей (#509)."
+    )
+
+
+def _return_to_work_note(
+    task: dict[str, Any], *, actor: str, reason: str, from_status: str
+) -> str:
+    holder = (task.get("claimed_by") or "").strip() or "нет"
+    session = (task.get("claim_session_id") or "").strip() or "—"
+    principal = task.get("implementer_principal_id")
+    return (
+        f"Возвращена в работу человеком {actor} из {from_status}: {reason}\n"
+        f"Прежний держатель: {holder} (сессия {session}, принципал "
+        f"{principal if principal is not None else '—'}); захват снят. "
+        "Ветка, PR, история сдач и находки сохранены. Новый исполнитель "
+        "берёт задачу штатно: hub_claim_task → hub_pair_start "
+        "(git_mode=remote, тот же branch_slug) → hub_submit_for_review."
+    )
+
+
+async def return_to_work(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: TaskReturnToWork,
+    *,
+    actor: str,
+) -> TaskView:
+    """Human action: take an abandoned submission back to ``open`` (#1356).
+
+    From ``review`` or ``fix_requested`` only. It is the rework decision
+    without the dispatch: the approval window closes through the SAME
+    :func:`close_approval_for_rework`, the claim comes off exactly as in
+    :func:`release_task` (implementer principal included), and the task is
+    open for any executor to claim. Branch, PR, submission sha, submissions
+    and findings are left alone.
+
+    The transition is conditional on the status that was read. The delivery
+    gate may be carrying an approved task out of ``review`` at this very
+    moment; if it got there first the return is a 409 and nothing — claim,
+    approval window, feed — has been touched.
+    """
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    task = dict(row)
+    from_status = task["status"]
+    if from_status not in RETURN_TO_WORK_STATUSES:
+        raise HTTPException(
+            400,
+            "can only return review or fix_requested tasks to work, "
+            f"current status: {from_status}",
+        )
+    active_jobs = _active_jobs_on_task(task)
+    _refuse_return_over_active_job(active_jobs, abandon=body.abandon_active_job)
+
+    if not await repo.transition_status_if(
+        db, task_id, expected_from=from_status, new_status="open"
+    ):
+        current = dict(_existing_task(await repo.get_task(db, task_id), task_id))
+        raise HTTPException(
+            409,
+            f"Task #{task_id} moved from {from_status} to {current['status']} "
+            "while being returned to work; nothing was changed",
+        )
+
+    closed_generation = await close_approval_for_rework(db, task_id, task)
+    await repo.update_task(
+        db,
+        task_id,
+        claimed_by=None,
+        claim_session_id=None,
+        claimed_at=None,
+        implementer_principal_id=None,
+        # Terminal, missing or abandoned by the human: a job id left on an
+        # open task would keep it out of the pair delivery sweep later.
+        job_id=None,
+        review_job_id=None,
+    )
+    await note_session_task(db, task.get("claim_session_id") or "", None)
+    await repo.add_task_update(
+        db,
+        task_id,
+        actor,
+        "decision",
+        _return_to_work_note(
+            task, actor=actor, reason=body.reason, from_status=from_status
+        ),
+    )
+    for field, job, job_status in active_jobs:
+        await repo.add_task_update(
+            db,
+            task_id,
+            actor,
+            "alert",
+            _abandoned_job_note(field, job, job_status, actor=actor),
+        )
+    await repo.insert_event(
+        db,
+        kind="task_returned_to_work",
+        task_id=task_id,
+        actor=actor,
+        payload={
+            "from_status": from_status,
+            "reason": body.reason,
+            "previous_holder": task.get("claimed_by") or "",
+            "previous_session": task.get("claim_session_id") or "",
+            "previous_principal_id": task.get("implementer_principal_id"),
+            "closed_verdict_generation": closed_generation,
+            "abandoned_jobs": [job for _field, job, _status in active_jobs],
+        },
+    )
+    await db.commit()
+    await log_activity(
+        db,
+        "task_returned_to_work",
+        f"Task #{task_id} returned to work from {from_status} by {actor}",
+        detail=mutation_activity_detail(),
+    )
+
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
 async def decide_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -4228,46 +4458,7 @@ async def decide_task(
         if summary_text:
             update_content += f"\nDecision: {summary_text}"
         await repo.add_task_update(db, task_id, "human", "decision", update_content)
-        # Rework is the boundary that closes the old arbiter/approval window
-        # (#422): reset the cycle, clear the arbiter marker, and close the
-        # approval the decision has just revoked, so the reworked submission
-        # starts clean and the stale approval cannot count as current.
-        # An approval and nothing else: a CHANGES_REQUESTED verdict on this
-        # same submission authorised no delivery, so this branch revokes
-        # nothing from it and says nothing about it (#1286 review).
-        #
-        # That last clause used to be a promise this branch did not keep
-        # (#1286). The verdict stayed bound to the current submission
-        # generation, and generations move only on a resubmission — so between
-        # the decision and the next submit the work went on counting as
-        # approved. Both halves of that were observed on 22.09.2026: the
-        # delivery sweep merged #1162 and #1206 after their owner had called
-        # them back, and once the executor pushed the fix the branch outran the
-        # pinned commit and the task returned to the same human as a
-        # stale_approval. The window closes here; the verdict itself, its
-        # findings and its generation stay on the card as history.
-        await repo.update_task(db, task_id, review_cycle=0)
-        await repo.reset_arbiter_state(db, task_id)
-        closed_generation = await repo.close_review_verdict_window(db, task_id)
-        if closed_generation is not None:
-            # Said out loud, because the card now shows an APPROVED verdict
-            # that authorises nothing, and silence there reads as a bug.
-            await repo.add_task_update(
-                db,
-                task_id,
-                "hub",
-                "status",
-                f"Одобрение ревью (сдача #{closed_generation}"
-                + (
-                    f", коммит {(task.get('submission_sha') or '')[:12]}"
-                    if (task.get("submission_sha") or "").strip()
-                    else ""
-                )
-                + ") закрыто этим решением: работа по нему больше не "
-                "доставляется. Вердикт остаётся в истории задачи; чтобы "
-                "работа поехала, нужна новая сдача через "
-                "hub_submit_for_review и новый вердикт.",
-            )
+        closed_generation = await close_approval_for_rework(db, task_id, task)
         # #737: same trace as the accept branch — rework is the "override"
         # outcome of the decision gate.
         await repo.insert_event(
