@@ -324,15 +324,11 @@ async def build_review_brief(
 
     # Latest submission context: the most recent done report, falling back
     # to the most recent status update when the task has not reported yet.
-    latest_submission_summary = ""
-    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
-    for kind in ("done", "status"):
-        for u in reversed(updates):
-            if u.get("kind") == kind:
-                latest_submission_summary = u.get("content", "")
-                break
-        if latest_submission_summary:
-            break
+    # #1246: one reader of "the submission text", shared with the dispatch
+    # prompt, so both read the author's word from the same place.
+    latest_submission_summary = await review_evidence.latest_submission_text(
+        db, task_id
+    )
 
     # #725: the base comes from the project (or the PR), and is resolved in the
     # project workspace before the command is printed. A hardcoded "develop"
@@ -486,6 +482,9 @@ async def build_review_brief(
     prepass = await review_evidence.prepass_state(
         db, {"id": task_id, "submission_sha": task_view.submission_sha}
     )
+    # #1246: the prepass decides whether the submission is checked; the
+    # submission text only contributes the author's word beside it.
+    validation = review_evidence.validation_standing(prepass, latest_submission_summary)
 
     # #615: the statement the reviewer is judging may predate the work that
     # invalidated it. Same computation as pair-start, one source.
@@ -573,6 +572,7 @@ async def build_review_brief(
         ac_test_results=ac_test_results,
         ci_run_report=ci_run_report,
         prepass=prepass,
+        validation=validation,
         live_check=LiveCheckState(**live_check),
         statement_freshness=freshness,
         scope_in=task_view.scope_in,

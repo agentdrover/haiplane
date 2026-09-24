@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -592,8 +593,20 @@ async def prepass_state(db, task: dict):
     )
 
 
-def prepass_block(state) -> str:
-    """The prepass as the reviewer reads it, in its prompt (#875)."""
+def prepass_block(state, standing=None) -> str:
+    """The prepass as the reviewer reads it, in its prompt (#875).
+
+    ``standing`` (#1246) adds whether the submission is checked at all and
+    what the author wrote about runs — as his word, beside the prepass, never
+    in its place.
+    """
+    text = _prepass_lines(state)
+    if standing is not None and (not standing.verified or standing.author_run_lines):
+        text += f" {standing.headline}"
+    return text
+
+
+def _prepass_lines(state) -> str:
     if state.state == "unknown":
         return (
             "ДЕТЕРМИНИРОВАННЫЙ ПРЕДПАС: данных нет — "
@@ -621,6 +634,152 @@ def prepass_block(state) -> str:
     if state.skipped:
         lines.append(f"Пропущены (ничего не доказывают): {', '.join(state.skipped)}.")
     return " ".join(lines)
+
+
+# --- The prepass over the author's word (#1246) ------------------------------
+#
+# Spike #1168 went to review with a FAILED prepass while its text listed green
+# runs of lint, security and the budget; the full suite was never run. The hub
+# cannot see how an author ran a command, so an "rc=0" in a submission stays a
+# word. The rule: the prepass the hub ran is the only basis for "checked"; the
+# author's lines about runs stay visible, quoted as his.
+#
+# The hub does NOT judge what those lines mean. Three review rounds tried to
+# tell "green claimed" from "failure described" with regular expressions and
+# each round found a new negation ("0 passed, 3 failed", "rc=0 не получен",
+# "rc=0, no failures", "expected rc=0, got rc=1"). The owner's decision of
+# 24.09: extract broadly, quote, and hand the comparison to a human whenever
+# the prepass failed and the author wrote about runs at all.
+
+AUTHOR_WORD = "СЛОВО АВТОРА"
+
+# Broad on purpose: any line that talks about a run, whatever it says of it.
+_RUN_WORD_RE = re.compile(
+    r"\brc\s*=|\bexit(?:\s+code)?\b|\bpassed\b|\bfailed\b|\bgreen\b|"
+    r"зел[её]н|all checks",
+    re.IGNORECASE,
+)
+_CLAUSE_SPLIT_RE = re.compile(r"[;\n]|\.\s")
+_MAX_CLAIMS = 5
+_MAX_CLAIM_LEN = 100
+
+VALIDATION_PASSED = "passed"
+VALIDATION_FAILED = "failed"
+VALIDATION_NOT_RUN = "not_run"
+
+
+def author_run_lines(text: str) -> list[str]:
+    """The clauses of a submission text that talk about a run — his word.
+
+    No judgement of meaning: a clause is taken when it names a run at all.
+    """
+    out: list[str] = []
+    for clause in _CLAUSE_SPLIT_RE.split(text or ""):
+        clause = clause.strip()
+        if clause and _RUN_WORD_RE.search(clause) and clause not in out:
+            out.append(clause[:_MAX_CLAIM_LEN])
+        if len(out) >= _MAX_CLAIMS:
+            break
+    return out
+
+
+def validation_standing(prepass, submission_text: str):
+    """Whether the submission is checked: the prepass decides, the text does not.
+
+    Three states, never two: a prepass that did not run is neither a pass nor
+    a failure. ``needs_human_compare`` is set only where the prepass FAILED
+    and the author wrote about runs — the hub cannot tell whether his lines
+    agree with the failure, so a human compares them.
+    """
+    from hub.models import ValidationStanding
+
+    lines = author_run_lines(submission_text)
+    word = f"{AUTHOR_WORD}: «{'; '.join(lines)}»" if lines else ""
+    sha = (prepass.head_sha or "")[:12] or "—"
+    if prepass.state == "covered":
+        headline = (
+            f"Сдача проверена предпасом хаба на {sha}: прошли "
+            f"{', '.join(prepass.passed)}."
+        )
+        if lines:
+            headline += f" {word} — основанием не служит."
+        return ValidationStanding(
+            state=VALIDATION_PASSED,
+            verified=True,
+            author_run_lines=lines,
+            headline=headline,
+        )
+    if prepass.state == "failed":
+        headline = (
+            f"Сдача НЕ проверена: предпас хаба на {sha} упал "
+            f"({', '.join(prepass.failed)})."
+        )
+        if lines:
+            headline += (
+                f" Предпас упал; автор пишет: {word}. "
+                "Сверяет человек — смысл строк хаб не судит."
+            )
+        return ValidationStanding(
+            state=VALIDATION_FAILED,
+            author_run_lines=lines,
+            needs_human_compare=bool(lines),
+            headline=headline,
+        )
+    headline = (
+        f"Сдача НЕ проверена: предпас не запускался — {prepass.reason}. "
+        "Это не «прошёл» и не «упал»."
+    )
+    if lines:
+        headline += f" {word} — предпасом не подтверждено."
+    return ValidationStanding(
+        state=VALIDATION_NOT_RUN, author_run_lines=lines, headline=headline
+    )
+
+
+async def latest_submission_text(db, task_id: int) -> str:
+    """The text of the latest SUBMISSION — not the latest line in the feed.
+
+    Finding c5f04f6bc0d366a4: "newest done, else newest status" read the
+    hub's own "Кросс-модельное ревью вызвано хабом…", written right after
+    every pair submission, and the author's claim vanished from every surface.
+    A submission is the pair row (``SUBMISSION_UPDATE_PREFIX``) or a done
+    report the agent itself filed (``agent_claimed``; a passage the hub
+    transcribed is not the author's word, #1018). Whichever is newer wins:
+    a done report after APPROVED is the author speaking about the same work
+    again, and his latest word is the one to weigh.
+    """
+    updates = [dict(u) for u in await repo_module.get_task_updates(db, task_id)]
+    for u in reversed(updates):
+        content = str(u.get("content") or "")
+        if u.get("kind") == "status" and content.startswith(
+            repo_module.SUBMISSION_UPDATE_PREFIX
+        ):
+            return content
+        if u.get("kind") == "done" and u.get("agent_claimed", 1) != 0:
+            return content
+    return ""
+
+
+def run_lines_tally(standings) -> dict[str, Any]:
+    """Submissions with a failed prepass AND lines about runs, with the sample.
+
+    A count, not a claim about meaning: the hub does not know whether those
+    lines contradict the failure. The sample is every submission the prepass
+    judged (passed or failed); ``not_run`` is counted beside it, never inside.
+    """
+    judged = [s for s in standings if s.state != VALIDATION_NOT_RUN]
+    sample = len(judged)
+    flagged = sum(1 for s in judged if s.needs_human_compare)
+    not_run = len(standings) - sample
+    return {
+        "failed_with_run_lines": flagged,
+        "sample": sample,
+        "not_run": not_run,
+        "line": (
+            f"предпас упал, а автор пишет о прогонах: {flagged} из {sample} "
+            f"сдач с предпасом; без предпаса ещё {not_run}"
+        ),
+    }
 
 
 async def attach_dispositions(db, view) -> None:

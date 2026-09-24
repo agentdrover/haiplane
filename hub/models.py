@@ -932,6 +932,24 @@ class PrepassState(BaseModel):
     head_sha: str = ""
 
 
+class ValidationStanding(BaseModel):
+    """Whether a submission is checked — by the prepass, not by its text (#1246).
+
+    ``state`` is ``passed``, ``failed`` or ``not_run``: three, never two. Only
+    ``passed`` makes ``verified`` true. ``author_run_lines`` are the lines of
+    the submission text that talk about runs — quoted as the author's word,
+    never judged for meaning and never a basis. ``needs_human_compare`` is
+    true only where the prepass failed and such lines exist: the hub cannot
+    tell whether they agree with the failure, so a human compares.
+    """
+
+    state: str = "not_run"
+    verified: bool = False
+    author_run_lines: list[str] = Field(default_factory=list)
+    needs_human_compare: bool = False
+    headline: str = ""
+
+
 class DiffBaseState(BaseModel):
     """Which base the diff is taken against, and whether it exists (#725).
 
@@ -1156,6 +1174,10 @@ class ReviewBrief(BaseModel):
     # reviewer reads it to stop paying model prices for what a linter proved
     # minutes earlier; the human reads it beside the report.
     prepass: PrepassState = Field(default_factory=lambda: PrepassState())
+    # #1246: the prepass read against the submission text. The one field any
+    # surface consults to say "checked"; the author's claim rides along as
+    # his word.
+    validation: ValidationStanding = Field(default_factory=lambda: ValidationStanding())
     live_check: LiveCheckState = Field(default_factory=lambda: LiveCheckState())
     # #615: the reviewer judges a statement too — and it may be older than the
     # work that invalidated it.

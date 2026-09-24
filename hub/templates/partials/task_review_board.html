@@ -261,6 +261,14 @@
             {% if evidence.prepass.state == 'unknown' %}<span class="muted">{{ evidence.prepass.reason }}</span>{% endif %}
         </div>
 
+        {# #1246: проверена ли сдача — решает предпас, а не текст сдачи.
+           Заявление автора видно, но помечено как его слово. #}
+        <div class="task-evidence-row">
+            <span class="u-text-muted">Сдача проверена:</span>
+            <span class="badge badge--xs badge-{{ 'test' if evidence.validation.state == 'passed' else ('failed' if evidence.validation.state == 'failed' else 'pending') }}">{{ evidence.validation.state }}</span>
+            <span{% if evidence.validation.needs_human_compare %} class="badge badge-failed"{% endif %}>{{ evidence.validation.headline }}</span>
+        </div>
+
         {% if evidence.statement_freshness %}
         <div class="task-evidence-row">
             <span class="u-text-muted">Свежесть постановки:</span>
