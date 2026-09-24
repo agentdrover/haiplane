@@ -809,6 +809,14 @@ class CallSiteEntry(BaseModel):
     untouched: list[str] = Field(default_factory=list)
 
 
+class OnlyTestsOutcomeView(BaseModel):
+    """One only_tests symbol and what the review said about it (#1254)."""
+
+    symbol: str
+    outcome: str
+    call_path: str = ""
+
+
 class CallSiteSection(BaseModel):
     """Call sites of everything the diff changes (#601).
 
@@ -823,6 +831,13 @@ class CallSiteSection(BaseModel):
     note: str = ""
     entries: list[CallSiteEntry] = Field(default_factory=list)
     unparsed: list[str] = Field(default_factory=list)
+    # #1254: what the current machine review answered for each symbol only
+    # tests call. ``not_analysed`` / ``none_named`` / ``named`` never collapse
+    # into one another (#750); ``outcome`` is unreachable, cleared (with the
+    # call path the reviewer named) or silent.
+    only_tests_state: str = "not_analysed"
+    only_tests_summary: str = ""
+    only_tests: list[OnlyTestsOutcomeView] = Field(default_factory=list)
 
 
 class ACLocatorResolution(BaseModel):
