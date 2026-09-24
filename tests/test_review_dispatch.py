@@ -1449,6 +1449,236 @@ async def test_top_up_never_fires_on_an_unknown_profile(
     )
 
 
+# --- The second axis: same work, same profile, a stronger model (#1243) ------
+#
+# The ladder above climbs the PROFILE and stops at deep with «выше дешёвого
+# подниматься некуда». Measured by spike #1168: 30 of 51 incomplete reports
+# in the 90-day window were already deep, i.e. most of the unfinished reading
+# sits exactly on the rung where the ladder has nothing to offer. The second
+# axis keeps the profile and changes the MODEL, with its own ceiling per
+# generation and its own outcome metric.
+
+_CASCADE_MARK = "вторая ось"
+
+
+async def _deep_submitted(
+    client: AsyncClient, db: aiosqlite.Connection, slug: str
+) -> int:
+    """A submission whose first run was already deep — the ladder's dead end."""
+    task_id = await _submitted(client, db, slug)
+    await db.execute(
+        "UPDATE review_dispatches SET profile = ? WHERE task_id = ?", (DEEP, task_id)
+    )
+    await db.commit()
+    return task_id
+
+
+async def _cascade_alerts(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert" and _CASCADE_MARK in dict(u)["content"]
+    ]
+
+
+async def test_a_deep_incomplete_report_is_asked_again_of_a_stronger_model(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1243): неполный deep-отчёт переспрашивается ТОЙ ЖЕ работой, тем
+    же профилем, но ДРУГОЙ моделью — и карточка называет причину и модель."""
+    from hub.services import review_dispatch
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-m1"}, "run": {"id": "r-m1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _deep_submitted(client, db, "spike-cascade")
+    first_model = recorder.calls[0]["model_id"]
+
+    await _machine_report(client, task_id, incomplete=True)
+
+    assert len(recorder.calls) == 2, "the deep incomplete report bought a second run"
+    second = recorder.calls[1]
+    stronger = second["model_id"]
+    assert stronger != first_model, "the same model would read the same way"
+    assert stronger in config.SUBSCRIPTION_LAUNCHABLE_MODELS, (
+        "only a model whose launch was observed may be bought"
+    )
+    assert stronger in review_dispatch.config.REVIEW_CASCADE_MODELS
+    assert family(stronger) != family("claude-fable-5"), "monoculture gate held"
+    assert "multi-agent-review" in second["prompt_text"], "the profile stays deep"
+    row = await _dispatch_row(db, task_id)
+    assert row["profile"] == DEEP and row["model"] == stronger
+    task = dict(await repo.get_task(db, task_id))
+    assert row["submission_generation"] == task["submission_generation"]
+    assert task["status"] == "review", "still under review, not handed over"
+
+    alerts = await _cascade_alerts(db, task_id)
+    assert alerts, "the second purchase is visible in the card, not silent"
+    assert stronger in alerts[-1] and first_model in alerts[-1], "models named"
+    assert "неполн" in alerts[-1].lower(), "the cause is named"
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert not [u for u in updates if "добор не положен" in u], (
+        "the ladder's dead end is no longer the last word on a deep report"
+    )
+
+
+async def test_the_stronger_model_is_taken_only_from_observed_launches(
+    monkeypatch,
+):
+    """Constraint (#1243): a name in the catalogue is not a launch.
+
+    The shipped list is a subset of the observed launches, and a configured
+    name outside them is skipped rather than bought — the same distinction
+    #1237 got wrong."""
+    from hub.services import review_dispatch
+
+    assert set(config.REVIEW_CASCADE_MODELS) <= set(
+        config.SUBSCRIPTION_LAUNCHABLE_MODELS
+    )
+    monkeypatch.setattr(
+        config, "REVIEW_CASCADE_MODELS", ("gpt-9-imaginary", "gemini-3.1-pro")
+    )
+    assert review_dispatch.pick_cascade_model("claude-fable-5", {"grok-4.6"}) == (
+        "gemini-3.1-pro"
+    )
+    # Monoculture on the second attempt too: the implementer's family is out.
+    monkeypatch.setattr(
+        config, "REVIEW_CASCADE_MODELS", ("gpt-5.3-codex", "gemini-3.1-pro")
+    )
+    assert review_dispatch.pick_cascade_model("gpt-5.3-codex", set()) == (
+        "gemini-3.1-pro"
+    )
+    # A model that already read this generation is not "another" model.
+    assert review_dispatch.pick_cascade_model("claude-fable-5", {"gpt-5.3-codex"}) == (
+        "gemini-3.1-pro"
+    )
+    assert (
+        review_dispatch.pick_cascade_model(
+            "claude-fable-5", {"gpt-5.3-codex", "gemini-3.1-pro"}
+        )
+        == ""
+    )
+
+
+async def test_an_environment_refusal_is_not_asked_of_another_model(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Risk (#1243, #1238): another model in the same environment hits the same
+    wall, so an environment refusal buys nothing and the card says why."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-m5"}, "run": {"id": "r-m5"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _deep_submitted(client, db, "spike-cascade-env")
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "multi-agent-review",
+            "raw_count": 0,
+            "findings_confirmed": [],
+            "findings_rejected": [],
+            "incomplete": True,
+            "incomplete_reason": "environment",
+            "unresolved": [],
+            "lost_dimensions": ["прогон тестов: в среде нет uv/pytest"],
+            "agent": "cursor-cloud-reviewer",
+            "model": "grok-4.6",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert len(recorder.calls) == 1, "an environment refusal buys no second model"
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    dead_end = [u for u in updates if "добор не положен" in u]
+    assert dead_end and ENVIRONMENT_REFUSAL_NOTE in dead_end[-1]
+
+
+async def test_a_complete_report_is_not_asked_again(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1243): a complete report of ANY profile buys nothing.
+
+    Mutation «переспрашивать всегда» must drop exactly this test."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-m2"}, "run": {"id": "r-m2"}})
+    _wire(monkeypatch, recorder)
+    deep_task = await _deep_submitted(client, db, "spike-cascade-complete-deep")
+    await _machine_report(client, deep_task, incomplete=False)
+    lite_task = await _submitted(client, db, "spike-cascade-complete-lite")
+    assert (await _any_dispatch_row(db, lite_task))["profile"] == LITE
+    await _machine_report(client, lite_task, incomplete=False)
+
+    assert len(recorder.calls) == 2, "one run per submission, no second purchase"
+    for task_id in (deep_task, lite_task):
+        assert not await _cascade_alerts(db, task_id)
+    events = await db.execute_fetchall(
+        "SELECT id FROM events WHERE kind = 'review_model_cascade'"
+    )
+    assert not list(events)
+
+
+async def test_the_second_axis_has_its_own_ceiling(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1243): the second attempt coming back incomplete buys no third
+    agent; the task goes to the human with the cause and the attempt count."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-m3"}, "run": {"id": "r-m3"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _deep_submitted(client, db, "spike-cascade-ceiling")
+
+    await _machine_report(client, task_id, incomplete=True)
+    assert len(recorder.calls) == 2
+    await _machine_report(client, task_id, incomplete=True)
+
+    assert len(recorder.calls) == 2, "no third agent is bought"
+    alerts = await _cascade_alerts(db, task_id)
+    ceiling = alerts[-1]
+    assert "потолок" in ceiling
+    limit = config.REVIEW_MODEL_CASCADE_MAX
+    assert f"{limit} из {limit}" in ceiling, "the number of attempts is named"
+    assert recorder.calls[1]["model_id"] in ceiling
+    assert "решение за человеком" in ceiling.lower()
+
+
+async def test_the_second_axis_reports_its_own_outcome(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4 (#1243): how many second attempts there were and how many of them
+    came back COMPLETE, both with the sample size; «недобор» instead of a
+    number when the sample is short."""
+    from hub.services import review_dispatch
+    from hub.services.orchestration import practice_metrics
+
+    empty = await review_dispatch.count_model_cascade_outcomes(db, since_days=30)
+    assert empty["attempts"] == 0 and empty["complete_share"] is None
+    assert "недобор" in empty["share_note"]
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-m4"}, "run": {"id": "r-m4"}})
+    _wire(monkeypatch, recorder)
+    healed = await _deep_submitted(client, db, "spike-cascade-healed")
+    await _machine_report(client, healed, incomplete=True)
+    await _machine_report(client, healed, incomplete=False)
+    stuck = await _deep_submitted(client, db, "spike-cascade-stuck")
+    await _machine_report(client, stuck, incomplete=True)
+    await _machine_report(client, stuck, incomplete=True)
+    pending = await _deep_submitted(client, db, "spike-cascade-pending")
+    await _machine_report(client, pending, incomplete=True)
+
+    short = await review_dispatch.count_model_cascade_outcomes(db, since_days=30)
+    assert short["attempts"] == 3
+    assert short["reported"] == 2 and short["pending"] == 1
+    assert short["complete"] == 1 and short["incomplete"] == 1
+    assert short["complete_share"] is None, "a short sample prints no share"
+    assert "недобор" in short["share_note"]
+    assert "из 2" in short["share_note"], "the sample size stands by the words"
+
+    monkeypatch.setattr(review_dispatch, "MODEL_CASCADE_MIN_SAMPLE", 2)
+    enough = await review_dispatch.count_model_cascade_outcomes(db, since_days=30)
+    assert enough["complete_share"] == 0.5
+    assert "1 из 2" in enough["share_note"]
+    assert "недобор" not in enough["share_note"]
+
+    metrics = await practice_metrics(db, since_days=30)
+    assert metrics["review_model_cascade"]["attempts"] == 3
+    assert metrics["review_model_cascade"]["complete"] == 1
+
+
 # --- Incremental review: pay for the fixes, not the branch (#880) ------------
 #
 # A report is pinned to a generation, so a resubmission makes it stale — right
@@ -11577,11 +11807,12 @@ async def test_every_review_path_carries_the_only_tests_symbols(
         "maybe_dispatch_review",
         "dispatch_local_review",
     }
-    # Добор лестницы (#879), переспрос (#1242) и вторая дверь (#1252) — те же
-    # два транспорта.
+    # Добор лестницы (#879), переспрос (#1242), вторая ось каскада (#1243) и
+    # вторая дверь (#1252) — те же два транспорта.
     assert _callers_of(tree, "maybe_dispatch_review") == {
         "maybe_top_up_incomplete",
         "_ask_again",
+        "_ask_a_stronger_model",
     }
     assert _callers_of(tree, "dispatch_local_review") == {
         "maybe_dispatch_review",

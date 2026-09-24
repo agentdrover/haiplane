@@ -90,6 +90,26 @@ def pick_review_model(implementer_model: str) -> str:
     return _REVIEW_MODEL_PREFERENCES[0]
 
 
+def pick_cascade_model(implementer_model: str, already_read: set[str]) -> str:
+    """Модель второй оси каскада (#1243), или "" — если брать некого.
+
+    Три фильтра, и каждый — ограничение постановки, а не вкус:
+    имя должно быть в SUBSCRIPTION_LAUNCHABLE_MODELS (наблюдённая попытка
+    создания, а не каталог — ровно на этом различении ошиблась #1237);
+    семейство не совпадает с исполнителем (гейт монокультуры #758);
+    модель ещё не читала эту сдачу — иначе это не «другая» модель, а повтор.
+    """
+    launchable = set(config.SUBSCRIPTION_LAUNCHABLE_MODELS)
+    impl_family = family(implementer_model)
+    for candidate in config.REVIEW_CASCADE_MODELS:
+        if candidate not in launchable or candidate in already_read:
+            continue
+        if impl_family and family(candidate) == impl_family:
+            continue
+        return candidate
+    return ""
+
+
 LITE = "lite"
 DEEP = "deep"
 
@@ -1290,6 +1310,17 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
     if not report.get("incomplete"):
         return False
 
+    # #1243: a submission that already went along the second axis is that
+    # axis's business, with its own ceiling — checked BEFORE the ladder's,
+    # because the report here is the stronger model's own, and the ladder's
+    # step count (which does include that run) would announce the wrong
+    # ceiling in the wrong words.
+    attempts = await _count_marked_alerts(
+        db, task_id, MODEL_CASCADE_MARK.format(generation=generation)
+    )
+    if attempts:
+        return await _ask_a_stronger_model(db, task, generation, report, attempts)
+
     # Order matters here. The ceiling is checked BEFORE the profile, because
     # the report that hits it is the top-up's own — a deep one — and a
     # profile-first check would return on it silently, leaving the ladder's
@@ -1314,6 +1345,10 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
     # a cheap one, and a deep run that did not finish has nothing above it to
     # climb to — both go to the human, and both say so.
     profile = (report.get("profile") or "").strip()
+    if profile == DEEP and _second_axis_applies(report):
+        # #1243: the ladder has nothing above deep; the second axis keeps the
+        # profile and changes the model.
+        return await _ask_a_stronger_model(db, task, generation, report, 0)
     if profile != LITE:
         await repo.add_task_update(
             db,
@@ -1343,6 +1378,247 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
         )
         await db.commit()
     return dispatched
+
+
+# ---------------------------------------------------------------------------
+# Вторая ось каскада: та же работа, тот же профиль, другая модель (#1243)
+# ---------------------------------------------------------------------------
+#
+# Лестница выше поднимает ПРОФИЛЬ и на deep честно говорит «выше подниматься
+# некуда». Замер спайка #1168: 30 из 51 неполного отчёта за 90 дней — уже
+# deep, то есть большая часть неполноты лежит ровно на той ступени, где
+# лестница молчит. Эта ось профиль не трогает и меняет МОДЕЛЬ.
+#
+# Чем она НЕ является. Не переспросом #1242: тот срабатывает там, где отчёта
+# нет вовсе, эта — только на ЗАЯВЛЕННОЙ неполноте существующего отчёта. Не
+# лекарством от отказа среды (#1238): другая модель в той же среде упрётся
+# в то же, поэтому отказ среды на эту ось не пускается.
+#
+# Ценность второй попытки НЕ доказана, доказан только размер корзины; поэтому
+# у оси свой счёт исхода (count_model_cascade_outcomes), без которого
+# добавка к счёту была бы измерена, а польза — нет.
+
+#: Метка записи о переспросе по второй оси. Номер поколения внутри — счёт в
+#: пределах сдачи, по образцу ASK_AGAIN_MARK. Запись делается ДО вызова:
+#: попытка видна и тогда, когда вызов не оставил строки.
+MODEL_CASCADE_MARK = "[вторая ось ревью: сдача {generation}]"
+MODEL_CASCADE_EXHAUSTED_MARK = "[вторая ось ревью исчерпана: сдача {generation}]"
+
+#: Вид события, по которому считается исход второй оси.
+MODEL_CASCADE_EVENT = "review_model_cascade"
+
+#: Сколько вторых попыток С ОТЧЁТОМ нужно, чтобы печатать долю полных. Ниже —
+#: слово «недобор» (#1153). Пять — меньше месяца ожидаемого потока (около
+#: девяти в месяц по спайку #1168), и достаточно, чтобы «хотя бы половина»
+#: из условия пересмотра не решалась одним случаем.
+MODEL_CASCADE_MIN_SAMPLE = 5
+
+
+def _second_axis_applies(report: Mapping[str, Any]) -> bool:
+    """Пускать ли неполный deep-отчёт на вторую ось.
+
+    Ось выключена потолком 0 — рубильник владельца. Отказ среды на неё не
+    пускается: переспрос моделью отказ среды не лечит (#1238).
+    """
+    return config.REVIEW_MODEL_CASCADE_MAX > 0 and not is_environment_refusal(report)
+
+
+async def _models_that_read(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> list[str]:
+    """Модели оплаченных прогонов этой сдачи, в порядке заказа."""
+    rows = await fetchall(
+        db,
+        "SELECT model FROM review_dispatches WHERE task_id = ? "
+        "AND submission_generation = ? AND agent_id != '' AND model != '' "
+        "ORDER BY id",
+        (task_id, generation),
+    )
+    return list(dict.fromkeys(str(dict(r)["model"]) for r in rows))
+
+
+async def _alert(db: aiosqlite.Connection, task_id: int, text: str) -> None:
+    await repo.add_task_update(db, task_id, "hub", "alert", text)
+    await db.commit()
+
+
+async def _second_axis_blocked(
+    db: aiosqlite.Connection, task: dict[str, Any], model: str
+) -> str:
+    """Почему вторую ось нельзя пройти на этой сдаче, или "" — если можно."""
+    project = await repo.resolve_project_for_task(db, int(task["id"]))
+    forge = project_policy.forge_of(project) if project is not None else ""
+    if forge not in CLOUD_REVIEW_FORGES:
+        # Локальный ревьюер модель не выбирает — заказ «другой модели» туда
+        # был бы ещё одним прогоном той же модели под чужим именем.
+        return f"форж «{forge or 'не известен'}» облаку недоступен, а локальный ревьюер модель не выбирает"
+    if not model:
+        return (
+            "нет модели, которая наблюдалась запускающейся, не совпадает "
+            "семейством с исполнителем и ещё не читала эту сдачу "
+            "(REVIEW_CASCADE_MODELS, SUBSCRIPTION_LAUNCHABLE_MODELS)"
+        )
+    return ""
+
+
+async def _ask_a_stronger_model(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    generation: int,
+    report: Mapping[str, Any],
+    attempts: int,
+) -> bool:
+    """Переспросить ТУ ЖЕ сдачу тем же профилем другой моделью (#1243).
+
+    Возвращает True, когда заказ поставлен. Каждый иной исход называется в
+    карточке: тихая повторная покупка хуже отсутствия повтора, а тихий отказ
+    — это решение человека по отчёту, чей автор сам сказал, что не дочитал.
+    """
+    task_id = int(task["id"])
+    limit = config.REVIEW_MODEL_CASCADE_MAX
+    used = await _models_that_read(db, task_id, generation)
+    read_by = ", ".join(used) or "не записано"
+    if attempts >= limit or not _second_axis_applies(report):
+        await _alert(
+            db,
+            task_id,
+            MODEL_CASCADE_EXHAUSTED_MARK.format(generation=generation)
+            + f" Неполный отчёт и после переспроса другой моделью: потолок "
+            f"второй оси — {attempts} из {limit} попыток на сдачу, третий "
+            f"агент НЕ покупается. Модели, читавшие эту сдачу: {read_by}. "
+            "Ревью так и не состоялось полностью — решение за человеком "
+            "(#1243)." + _ladder_cause_note(report),
+        )
+        return False
+    implementer = (task.get("submission_model") or "").strip()
+    model = pick_cascade_model(implementer, set(used))
+    blocked = await _second_axis_blocked(db, task, model)
+    if blocked:
+        await _alert(
+            db,
+            task_id,
+            "Неполный отчёт профиля «deep»: выше дешёвого подниматься некуда, "
+            f"а вторая ось (другая модель) недоступна — {blocked}. Решение "
+            "за человеком (#879, #1243)." + _ladder_cause_note(report),
+        )
+        return False
+    await _alert(
+        db,
+        task_id,
+        MODEL_CASCADE_MARK.format(generation=generation)
+        + f" Переспрос {attempts + 1} из {limit}: отчёт профиля deep сам "
+        "объявил себя неполным, а выше по профилю подниматься некуда, поэтому "
+        f"ТА ЖЕ сдача тем же профилем заказывается другой модели — {model} "
+        f"(читали: {read_by}; семейство ≠ исполнителя "
+        f"{implementer or 'не заявлено'}). Модель взята из наблюдённых "
+        "запусков, а не из каталога (#1237, #1243).",
+    )
+    if not await maybe_dispatch_review(
+        db, task_id, force_profile=DEEP, force_model=model
+    ):
+        await _alert(
+            db,
+            task_id,
+            f"Переспрос моделью {model} поставить не удалось. Решение за "
+            "человеком (#1243).",
+        )
+        return False
+    row = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    await repo.insert_event(
+        db,
+        kind=MODEL_CASCADE_EVENT,
+        task_id=task_id,
+        actor="policy",
+        payload={
+            "generation": generation,
+            "model": model,
+            "attempt": attempts + 1,
+            "dispatch_id": dict(row)["id"] if row is not None else None,
+            "after_review_id": report.get("id"),
+        },
+    )
+    await db.commit()
+    return True
+
+
+async def _cascade_outcome(db: aiosqlite.Connection, event: dict[str, Any]) -> str:
+    """Чем кончилась одна вторая попытка: complete | incomplete | pending.
+
+    Отчёт попытки — первый отчёт той же сдачи ПОСЛЕ того, что её купил, и
+    (когда принципал ревьюера известен) от него. Сопоставление по ступеням
+    (_dispatch_report) тут не годится: без принципала оно отдаёт последний
+    отчёт поколения, то есть ещё не ответившая попытка читалась бы
+    неполной — по отчёту, который её и купил.
+    """
+    payload = json.loads(event.get("payload") or "{}")
+    after = int(payload.get("after_review_id") or 0)
+    expected = None
+    if payload.get("dispatch_id"):
+        rows = await fetchall(
+            db,
+            "SELECT reviewer_principal_id FROM review_dispatches WHERE id = ?",
+            (payload["dispatch_id"],),
+        )
+        expected = dict(rows[0])["reviewer_principal_id"] if rows else None
+    reviews = await repo.machine_reviews_of_generation(
+        db, int(event["task_id"]), int(payload.get("generation") or 0)
+    )
+    later = [
+        dict(r)
+        for r in reviews
+        if int(dict(r)["id"]) > after
+        and (expected is None or dict(r).get("principal_id") == expected)
+    ]
+    if not later:
+        return "pending"
+    return "incomplete" if later[0].get("incomplete") else "complete"
+
+
+async def count_model_cascade_outcomes(
+    db: aiosqlite.Connection,
+    since_days: int = ENVIRONMENT_REFUSAL_WINDOW_DAYS,
+) -> dict[str, Any]:
+    """Исход второй оси: сколько попыток и сколько дали ПОЛНЫЙ отчёт (#1243).
+
+    Обе цифры идут с размером выборки. Доля полных печатается только при
+    MODEL_CASCADE_MIN_SAMPLE попыток с отчётом; ниже — слово «недобор», а не
+    число (#1153): «1 из 1» решения о выкате не выдерживает.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT task_id, payload FROM events WHERE kind = ? "
+        "AND created_at >= datetime('now', ?) ORDER BY id",
+        (MODEL_CASCADE_EVENT, f"-{int(since_days)} days"),
+    )
+    outcomes = [await _cascade_outcome(db, dict(r)) for r in rows]
+    attempts = len(outcomes)
+    complete = outcomes.count("complete")
+    incomplete = outcomes.count("incomplete")
+    reported = complete + incomplete
+    enough = reported >= MODEL_CASCADE_MIN_SAMPLE
+    if enough:
+        share_note = (
+            f"полных отчётов после переспроса другой моделью: {complete} из "
+            f"{reported} с отчётом (попыток {attempts} за {since_days} дн., "
+            f"ждут отчёта {attempts - reported})"
+        )
+    else:
+        share_note = (
+            f"недобор: вторых попыток по модели {attempts} за {since_days} дн., "
+            f"с отчётом {reported}, полных {complete} из {reported}; доля "
+            f"печатается от {MODEL_CASCADE_MIN_SAMPLE} попыток с отчётом"
+        )
+    return {
+        "since_days": int(since_days),
+        "attempts": attempts,
+        "reported": reported,
+        "pending": attempts - reported,
+        "complete": complete,
+        "incomplete": incomplete,
+        "min_sample": MODEL_CASCADE_MIN_SAMPLE,
+        "complete_share": round(complete / reported, 3) if enough else None,
+        "share_note": share_note,
+    }
 
 
 #: Форжи, до которых дотягивается облачный ревьюер Cursor (#1119).
@@ -1739,6 +2015,7 @@ async def prepare_review_order(
     generation: int,
     force_profile: str,
     principal_id: int | None,
+    force_model: str = "",
 ) -> ReviewOrder:
     """Собрать заказ: профиль по диффу, правила, предмет ревью, доступ.
 
@@ -1746,9 +2023,14 @@ async def prepare_review_order(
     под ним минтуется одноразовый код доступа, и его же ждёт диспетчер как
     владельца отчёта (#1025). Разные транспорты — разные принципалы, и это
     единственное, что заказу нужно знать о том, кто его исполнит.
+
+    ``force_model`` — модель второй оси каскада (#1243): её уже выбрал
+    pick_cascade_model, и заказ не выбирает заново.
     """
     task_id = int(task["id"])
-    model_id = pick_review_model((task.get("submission_model") or "").strip())
+    model_id = force_model or pick_review_model(
+        (task.get("submission_model") or "").strip()
+    )
     # #820: the profile is decided against the SUBMITTED diff, not against the
     # areas the author declared — self-assessment cannot exempt work from
     # oversight (#582). An unreadable diff buys deep, it does not excuse it.
@@ -2006,6 +2288,7 @@ async def maybe_dispatch_review(
     *,
     force_profile: str = "",
     replaces_dispatch_id: int | None = None,
+    force_model: str = "",
 ) -> bool:
     """Queue a cloud reviewer for a fresh submission when policy allows.
 
@@ -2020,6 +2303,9 @@ async def maybe_dispatch_review(
     ``replaces_dispatch_id`` is set only by the ask-again pass (#1242): the
     new order CONTINUES the rung of the failed one it names instead of
     opening a new one, both for the ladder count and for report matching.
+
+    ``force_model`` is set only by the second axis of the cascade (#1243):
+    the same work, the same profile, a model chosen by pick_cascade_model.
     """
     row = await repo.get_task(db, task_id)
     if row is None:
@@ -2107,6 +2393,7 @@ async def maybe_dispatch_review(
         generation=generation,
         force_profile=force_profile,
         principal_id=expected_principal,
+        force_model=force_model,
     )
     model_id, profile, profile_reasons = order.model, order.profile, order.reasons
     # Последнее слово перед тратой. Подготовка заказа выше ходит в сеть за
