@@ -797,12 +797,29 @@ async def record_pipeline_merge(
     context only: it lives in the commit subject, which the person pushing
     controls, so matching on it left the guard bypassable by typing a number
     that had been merged before (#534, review of submission #2).
+
+    The merge is also the idempotency key (#1343). Keying on the PR number
+    dropped new merges silently once the project moved repositories and
+    numbering started over. An empty ``merge_sha`` (the commit could not be
+    read) is not a key: such a row never swallows another merge, and a
+    repeat of the same unreadable merge — same project, PR and task — is
+    recognised here instead of by the index.
     """
-    await db.execute(
-        "INSERT OR IGNORE INTO pipeline_merges "
-        "(project_id, pr_number, task_id, merge_sha) VALUES (?, ?, ?, ?)",
-        (project_id, int(pr_number), task_id, merge_sha or ""),
-    )
+    sha = (merge_sha or "").strip()
+    if sha:
+        await db.execute(
+            "INSERT OR IGNORE INTO pipeline_merges "
+            "(project_id, pr_number, task_id, merge_sha) VALUES (?, ?, ?, ?)",
+            (project_id, int(pr_number), task_id, sha),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+            "SELECT ?, ?, ?, '' WHERE NOT EXISTS (SELECT 1 FROM pipeline_merges "
+            "WHERE project_id IS ? AND pr_number = ? AND task_id IS ? "
+            "AND COALESCE(merge_sha, '') = '')",
+            (project_id, int(pr_number), task_id, project_id, int(pr_number), task_id),
+        )
     await db.commit()
 
 

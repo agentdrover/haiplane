@@ -1327,6 +1327,7 @@ async def _dor_judged(
     confidence: str = "high",
     escalate_reason: str = "",
     grounds: list[dict] | None = None,
+    generation: int = 0,
 ) -> None:
     """Суждение стюарда о ПОСТАНОВКЕ — настоящим записывающим путём.
 
@@ -1348,7 +1349,7 @@ async def _dor_judged(
         db,
         task_id,
         StewardJudgementSubmit(
-            generation=0,
+            generation=generation,
             kind="dor",
             verdict=verdict,
             confidence=confidence,
@@ -1454,6 +1455,122 @@ async def test_an_approval_downgraded_to_escalate_is_not_self_authorship(
 
     assert REFUSED_SELF_AUTHORED not in _codes(refusals), (
         "escalate на постановке означает, что решал человек"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1282 — самоодобрение относится к РЕДАКЦИИ постановки, а не к задаче
+# ---------------------------------------------------------------------------
+
+
+def _statement_refusal(refusals: list[tuple[str, str]]) -> list[str]:
+    """Отказы self_authored, данные ПО ПОСТАНОВКЕ.
+
+    Тот же код выдаёт и второе основание — self_reviewed отчёта (#1022), оно
+    здесь вне предмета. Отличаются они основанием: это называет kind=dor.
+    """
+    return [d for c, d in refusals if c == REFUSED_SELF_AUTHORED and "kind=dor" in d]
+
+
+async def _baselined(db: aiosqlite.Connection, project_id: int) -> int:
+    """Задача с снятым базисом постановки — как её видит диспетчер DoR (#1160)."""
+    from hub.services.statement_generation import baseline_if_absent
+
+    task_id = await _task(db, project_id)
+    await _green(db, task_id)
+    await baseline_if_absent(db, task_id)
+    await db.commit()
+    return task_id
+
+
+async def _rewrite_statement(db: aiosqlite.Connection, task_id: int) -> int:
+    """Переписать постановку настоящим счётчиком #1156; вернуть новое поколение."""
+    from hub.services.statement_generation import bump_if_the_statement_changed
+
+    await repo.update_task(db, task_id, description="постановку переписали")
+    generation = await bump_if_the_statement_changed(db, task_id)
+    await db.commit()
+    return generation
+
+
+async def test_a_rewritten_statement_clears_the_self_authored_refusal(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1282 AC-1: стюард одобрил редакцию 0, судят редакцию 1 — отказа нет.
+
+    Человек после правки одобрил задачу сам: в steward_judgements этот
+    апрув строки не оставляет, и единственный признак того, что стюард
+    судит НЕ ту редакцию, которую одобрял, — поднятое поколение.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-rewritten-statement")
+    task_id = await _baselined(db, project_id)
+    await _dor_judged(db, task_id, "approve", generation=0)
+
+    assert await _rewrite_statement(db, task_id) == 1, (
+        "предпосылка теста: правка подняла поколение постановки"
+    )
+    await repo.update_task(db, task_id, dor_passed=1, prepared_by="Denis")
+    await db.commit()
+
+    refusals = await apply_refusals(db, task_id)
+
+    assert not _statement_refusal(refusals), (
+        "стюард одобрял редакцию 0, а на вердикт пришла редакция 1 — "
+        f"самоодобрения нет: {_statement_refusal(refusals)}"
+    )
+
+
+async def test_the_same_revision_is_still_self_authored(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1282 AC-2: одобрена и судится одна и та же редакция — отказ стоит.
+
+    Редакция здесь 1, а не 0: совпадение с нулевым поколением сдачи или
+    дефолтом колонки было бы случайностью, которую тест не отличил бы от
+    правила.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-same-revision")
+    task_id = await _baselined(db, project_id)
+    assert await _rewrite_statement(db, task_id) == 1
+    await _dor_judged(db, task_id, "approve", generation=1)
+
+    refusals = await apply_refusals(db, task_id)
+
+    details = _statement_refusal(refusals)
+    assert details, "одобрил и судит одну и ту же редакцию — это самоодобрение"
+    assert REFUSED_SELF_AUTHORED in STEWARD_ESCALATE_REASONS, "код вне словаря #1022"
+    assert any("поколение постановки 1" in d for d in details), (
+        f"отказ обязан назвать поколение, по которому сработал: {details!r}"
+    )
+
+
+async def test_a_record_without_a_generation_refuses_toward_the_human(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1282 AC-3: базис постановки не снят — поколение неизвестно, отказ остаётся.
+
+    Пустой отпечаток означает, что счётчик ни разу не сверялся с текстом
+    (db.py, add_tasks_statement_generation): его значение — не «редакция N»,
+    а «не знаю, правили ли». Здесь счётчик нарочно стоит на 1 при одобрении
+    на 0: правило, читающее одно поколение без отпечатка, молча сняло бы
+    отказ — ровно то, что запрещает ограничение задачи.
+    """
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "apply-unknown-generation")
+    task_id = await _task(db, project_id)
+    await _green(db, task_id)
+    await _dor_judged(db, task_id, "approve", generation=0)
+    await repo.update_task(db, task_id, statement_generation=1)
+    await db.commit()
+
+    refusals = await apply_refusals(db, task_id)
+
+    details = _statement_refusal(refusals)
+    assert details, "поколение неизвестно — решение в сторону человека"
+    assert any("поколение постановки неизвестно" in d for d in details), (
+        f"отказ обязан назвать причину: {details!r}"
     )
 
 

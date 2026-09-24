@@ -1161,3 +1161,154 @@ async def test_steward_judgements_table_and_unique_triple():
             )
     finally:
         await conn.close()
+
+
+# --- #1343: pipeline_merges rekeyed from the PR number to the merge ----------
+
+_REKEY_PREFIX = "rekey_pipeline_merges_"
+
+
+def _before_rekey() -> list[tuple[str, str]]:
+    trimmed = [m for m in _MIGRATIONS if not m[0].startswith(_REKEY_PREFIX)]
+    assert len(trimmed) < len(_MIGRATIONS), (
+        "the rekey migrations under test must exist in _MIGRATIONS"
+    )
+    return trimmed
+
+
+_OLD_MERGE_ROWS = [
+    # id, project_id, pr_number, task_id, merged_at, merge_sha,
+    # released_pr, released_sha
+    (5, 1, 406, 816, "2026-08-21 10:00:00", "0e785d04c0", 83, "rel0083"),
+    (88, 1, 438, None, "2026-08-21 11:00:00", "backmerge1", None, None),
+    (89, None, 12, 900, "2026-08-22 09:00:00", None, None, ""),
+    (90, 1, 471, 950, "2026-08-22 10:00:00", "", 85, "rel0085"),
+]
+
+
+async def _pipeline_merges_rows(conn: aiosqlite.Connection) -> list[tuple]:
+    rows = await conn.execute_fetchall(
+        "SELECT id, project_id, pr_number, task_id, merged_at, merge_sha, "
+        "released_pr, released_sha FROM pipeline_merges ORDER BY id"
+    )
+    return [tuple(r) for r in rows]
+
+
+async def _pipeline_merges_schema(conn: aiosqlite.Connection) -> list[tuple]:
+    rows = await conn.execute_fetchall(
+        "SELECT type, name, sql FROM sqlite_master "
+        "WHERE tbl_name = 'pipeline_merges' ORDER BY type, name"
+    )
+    return [tuple(r) for r in rows]
+
+
+async def test_pipeline_merges_rekey_preserves_rows(monkeypatch):
+    """#1343 AC-3. The table is rebuilt to drop UNIQUE (project_id,
+    pr_number); every row keeps its id and every column, released_* included,
+    and a second run changes nothing."""
+    import hub.db as db_module
+
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.execute("PRAGMA foreign_keys = ON")
+        await conn.executescript(_SCHEMA)
+        monkeypatch.setattr(db_module, "_MIGRATIONS", _before_rekey())
+        await _migrate(conn)
+        await conn.executemany(
+            "INSERT INTO pipeline_merges (id, project_id, pr_number, task_id, "
+            "merged_at, merge_sha, released_pr, released_sha) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            _OLD_MERGE_ROWS,
+        )
+        # A deleted row: its id must not be handed out again.
+        await conn.execute(
+            "INSERT INTO pipeline_merges (id, project_id, pr_number) VALUES (95, 1, 1)"
+        )
+        await conn.execute("DELETE FROM pipeline_merges WHERE id = 95")
+        await conn.commit()
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO pipeline_merges (project_id, pr_number, merge_sha) "
+                "VALUES (1, 438, 'probe')"
+            )
+        await conn.rollback()
+
+        monkeypatch.setattr(db_module, "_MIGRATIONS", _MIGRATIONS)
+        await _migrate(conn)
+
+        assert await _pipeline_merges_rows(conn) == _OLD_MERGE_ROWS
+        tables = await conn.execute_fetchall(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'pipeline_merges%' "
+            "AND type = 'table'"
+        )
+        assert [r[0] for r in tables] == ["pipeline_merges"], "no leftover copy"
+
+        # The (project_id, pr_number) constraint is gone...
+        cur = await conn.execute(
+            "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+            "VALUES (1, 438, 1281, 'new0438')"
+        )
+        assert cur.lastrowid == 96, "ids continue past the old sequence"
+        # ...and the merge itself is the key now.
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO pipeline_merges (project_id, pr_number, merge_sha) "
+                "VALUES (1, 999, 'new0438')"
+            )
+        await conn.rollback()
+
+        schema = await _pipeline_merges_schema(conn)
+        await _migrate(conn)
+        await _migrate(conn)
+        assert await _pipeline_merges_rows(conn) == _OLD_MERGE_ROWS
+        assert await _pipeline_merges_schema(conn) == schema
+    finally:
+        await conn.close()
+
+
+async def test_pipeline_merges_rekey_is_all_or_nothing(monkeypatch):
+    """#1343 risk: a rebuild that fails half way must leave the old table and
+    its rows where they were, not a dropped table and an orphaned copy."""
+    import hub.db as db_module
+
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.execute("PRAGMA foreign_keys = ON")
+        await conn.executescript(_SCHEMA)
+        monkeypatch.setattr(db_module, "_MIGRATIONS", _before_rekey())
+        await _migrate(conn)
+        await conn.executemany(
+            "INSERT INTO pipeline_merges (id, project_id, pr_number, task_id, "
+            "merged_at, merge_sha, released_pr, released_sha) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            _OLD_MERGE_ROWS,
+        )
+        await conn.commit()
+        old_schema = await _pipeline_merges_schema(conn)
+
+        rekey = [m for m in _MIGRATIONS if m[0].startswith(_REKEY_PREFIX)]
+        drop_at = next(
+            i for i, m in enumerate(rekey) if "DROP TABLE pipeline_merges" in m[1]
+        )
+        broken = rekey[: drop_at + 1] + [
+            ("test_broken_after_drop", "SELECT nope FROM nowhere")
+        ]
+        monkeypatch.setattr(db_module, "_MIGRATIONS", _before_rekey() + broken)
+        with pytest.raises(Exception):
+            await _migrate(conn)
+
+        assert await _pipeline_merges_rows(conn) == _OLD_MERGE_ROWS
+        assert await _pipeline_merges_schema(conn) == old_schema
+        applied = await conn.execute_fetchall(
+            "SELECT name FROM _migrations WHERE name LIKE ?", (_REKEY_PREFIX + "%",)
+        )
+        assert applied == [], "a failed rebuild is not recorded as applied"
+
+        # The next start completes it.
+        monkeypatch.setattr(db_module, "_MIGRATIONS", _MIGRATIONS)
+        await _migrate(conn)
+        assert await _pipeline_merges_rows(conn) == _OLD_MERGE_ROWS
+    finally:
+        await conn.close()
