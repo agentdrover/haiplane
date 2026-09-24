@@ -1321,6 +1321,19 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
     if attempts:
         return await _ask_a_stronger_model(db, task, generation, report, attempts)
 
+    # The profile comes from the dispatch, never from the report about itself
+    # (#807, #750).
+    profile = (report.get("profile") or "").strip()
+    if profile == DEEP and _second_axis_applies(report):
+        # #1243: the ladder has nothing above deep; the second axis keeps the
+        # profile and changes the model. BEFORE the ladder's ceiling (finding
+        # 123ea6f62ddd2919): lite → deep top-up → deep incomplete is two paid
+        # rungs, and the ceiling there used to answer a question that is not
+        # the ladder's — the report is deep, the next step is a model, not a
+        # profile. The ceiling still guards what it was built for: a third
+        # PROFILE step.
+        return await _ask_a_stronger_model(db, task, generation, report, 0)
+
     # Order matters here. The ceiling is checked BEFORE the profile, because
     # the report that hits it is the top-up's own — a deep one — and a
     # profile-first check would return on it silently, leaving the ladder's
@@ -1340,15 +1353,9 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
         await db.commit()
         return False
 
-    # The profile comes from the dispatch, never from the report about itself
-    # (#807, #750). Only a CHEAP run earns a top-up: an unknown profile is not
-    # a cheap one, and a deep run that did not finish has nothing above it to
-    # climb to — both go to the human, and both say so.
-    profile = (report.get("profile") or "").strip()
-    if profile == DEEP and _second_axis_applies(report):
-        # #1243: the ladder has nothing above deep; the second axis keeps the
-        # profile and changes the model.
-        return await _ask_a_stronger_model(db, task, generation, report, 0)
+    # Only a CHEAP run earns a top-up: an unknown profile is not a cheap one,
+    # and a deep run that did not finish has nothing above it to climb to —
+    # both go to the human, and both say so.
     if profile != LITE:
         await repo.add_task_update(
             db,

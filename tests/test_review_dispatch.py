@@ -1408,6 +1408,12 @@ async def test_escalation_ladder_has_a_ceiling(
     # declaring itself unfinished is a problem to look at, not to fund.
     recorder = _DispatchRecorder({"agent": {"id": "bc-3"}, "run": {"id": "r-3"}})
     _wire(monkeypatch, recorder)
+    # #1243: an incomplete DEEP top-up now goes to the second axis (another
+    # model) before this ceiling — finding 123ea6f62ddd2919. Switched off
+    # here so the test keeps guarding what it always guarded: the ladder's
+    # own ceiling on PROFILE steps. With the axis on, the same path is
+    # test_a_deep_top_up_that_stays_incomplete_goes_to_the_second_axis.
+    monkeypatch.setattr(config, "REVIEW_MODEL_CASCADE_MAX", 0)
     task_id = await _submitted(client, db, "spike-ceiling")
 
     await _machine_report(client, task_id, incomplete=True)
@@ -1519,6 +1525,60 @@ async def test_a_deep_incomplete_report_is_asked_again_of_a_stronger_model(
     assert not [u for u in updates if "добор не положен" in u], (
         "the ladder's dead end is no longer the last word on a deep report"
     )
+
+
+async def test_a_deep_top_up_that_stays_incomplete_goes_to_the_second_axis(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Finding 123ea6f62ddd2919 (#1243): lite → deep top-up → deep incomplete.
+
+    That is the spike's main bucket — a deep report with nothing above it on
+    the profile ladder. With the ladder's ceiling checked first, the two
+    paid rungs silenced the second axis exactly there."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-m6"}, "run": {"id": "r-m6"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-cascade-after-ladder")
+    assert (await _dispatch_row(db, task_id))["profile"] == LITE
+
+    await _machine_report(client, task_id, incomplete=True)
+    assert len(recorder.calls) == 2, "the ladder bought its deep top-up"
+    await _machine_report(client, task_id, incomplete=True)
+
+    assert len(recorder.calls) == 3, "the incomplete deep top-up asks another model"
+    models = [c["model_id"] for c in recorder.calls]
+    assert models[2] not in models[:2], "a model that has not read this submission"
+    assert "multi-agent-review" in recorder.calls[2]["prompt_text"]
+    alerts = await _cascade_alerts(db, task_id)
+    assert alerts and models[2] in alerts[-1]
+    events = await db.execute_fetchall(
+        "SELECT id FROM events WHERE kind = 'review_model_cascade' AND task_id = ?",
+        (task_id,),
+    )
+    assert len(list(events)) == 1
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert not [u for u in updates if "потолок лестницы" in u], (
+        "the ladder's ceiling is not the answer to a deep report"
+    )
+
+
+async def test_after_the_ladder_the_second_axis_ceiling_is_the_one_named(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Finding 123ea6f62ddd2919 (#1243): lite → deep → other model → still
+    incomplete. The ceiling that stops it is the second axis's own."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-m7"}, "run": {"id": "r-m7"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-cascade-after-ladder-ceiling")
+
+    for _ in range(3):
+        await _machine_report(client, task_id, incomplete=True)
+
+    assert len(recorder.calls) == 3, "no fourth agent is bought"
+    ceiling = (await _cascade_alerts(db, task_id))[-1]
+    limit = config.REVIEW_MODEL_CASCADE_MAX
+    assert "потолок второй оси" in ceiling and f"{limit} из {limit}" in ceiling
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert not [u for u in updates if "потолок лестницы" in u]
 
 
 async def test_the_stronger_model_is_taken_only_from_observed_launches(
