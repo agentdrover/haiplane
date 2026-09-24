@@ -32,7 +32,7 @@ Use this file to avoid blind repo-wide reading. Start from the row that matches 
 - Adding a REST route does NOT grant it to chat-pair sessions: access for `auth_source=chat_pair` is the deny-by-default allowlist in `hub/auth.py` (#961). Widening that list is a decision with a reason in the task, never a step in an unrelated change.
 - Changing DoR or readiness logic can break approval behavior even if the API schema stays the same.
 - Changing plugin protocols is a cross-cutting contract change; inspect noop and real adapters together.
-- Editing a tool docstring or adding a parameter changes the published `tools/list` and eats headroom under the catalog ceiling (#780, #829). CI runs `uv run python scripts/mcp_catalog_budget.py` and prints how much headroom is left. Ordinary delivery fits under the ceiling and must NOT touch `mcp-catalog-budget.json` — that file is edited only when the ceiling itself is being raised (`--update`), with the reason stated.
+- Editing a tool docstring or adding a parameter changes the published `tools/list` and eats headroom under the catalog ceiling (#780, #829). CI runs `uv run python scripts/mcp_catalog_budget.py` and prints how much headroom is left. Ordinary delivery fits under the ceiling and must NOT touch `mcp-catalog-budget.json`. When the headroom does not fit the work, follow `working_headroom_note` in that file — the one refill policy (#1241); `--update` is not the way to raise a ceiling.
 
 ## Safe Read Order
 
