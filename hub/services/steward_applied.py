@@ -512,12 +512,14 @@ def _commit_signal(brief: ReviewBrief) -> list[tuple[str, str]]:
             )
         ]
     prepass = brief.prepass
-    if prepass.state != "covered":
+    # #1246: "checked" is read from the prepass alone; the headline carries
+    # the author's word and names a contradiction with it.
+    if not brief.validation.verified:
         return [
             (
                 "checks_ran_on_the_submitted_commit",
-                f"предпас {prepass.state!r}: "
-                + (prepass.reason or "детерминированные проверки не прогонялись"),
+                brief.validation.headline
+                or f"предпас {prepass.state!r}: {prepass.reason}",
             )
         ]
     if (prepass.head_sha or "").strip() != pinned:

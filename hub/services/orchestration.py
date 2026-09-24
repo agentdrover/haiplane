@@ -905,6 +905,7 @@ async def practice_metrics(
     human_touches = await _human_touch_metrics(db, since)
     review_outcomes = await _review_outcome_metrics(db, since)
     review_dispatches = await _review_dispatch_spend_metrics(db, since)
+    validation_claims = await _validation_claim_metrics(db, since)
     # #1238: повторяемость отказов среды. Считается тем же кодом, что решает,
     # является ли отдельный отчёт отказом среды, — двух ответов на один
     # вопрос здесь быть не должно. Окно берётся то же, что у остальных
@@ -935,7 +936,38 @@ async def practice_metrics(
         "steward_shadow": steward_shadow_metrics,
         "human_touches": human_touches,
         "review_outcomes": review_outcomes,
+        # #1246: how often the author's green claim contradicts the prepass,
+        # with the sample printed beside the count.
+        "validation_claims": validation_claims,
     }
+
+
+async def _validation_claim_metrics(
+    db: aiosqlite.Connection, since: str
+) -> dict[str, Any]:
+    """Author's claim against the prepass, per current submission (#1246).
+
+    The same two functions the brief uses decide each row, so the count and
+    the brief cannot disagree about a submission. The sample is the
+    submissions the prepass judged; those it never ran on are counted beside
+    it, never inside — no run cannot contradict a claim.
+    """
+    from hub.services import review_evidence
+
+    rows = await fetchall(
+        db,
+        "SELECT id, submission_sha FROM tasks "
+        "WHERE COALESCE(submission_sha, '') != '' "
+        "AND updated_at >= datetime('now', ?)",
+        (since,),
+    )
+    standings = []
+    for row in rows:
+        task = {"id": row["id"], "submission_sha": row["submission_sha"]}
+        prepass = await review_evidence.prepass_state(db, task)
+        text = await review_evidence.latest_submission_text(db, int(row["id"]))
+        standings.append(review_evidence.validation_standing(prepass, text))
+    return review_evidence.discrepancy_tally(standings)
 
 
 async def _review_dispatch_spend_metrics(

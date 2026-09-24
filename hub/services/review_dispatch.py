@@ -1795,6 +1795,11 @@ async def prepare_review_order(
     from hub.services import review_evidence
 
     prepass = await review_evidence.prepass_state(db, task)
+    # #1246: the reviewer is told whether the submission is checked — by the
+    # prepass — and sees the author's claim only as the author's word.
+    validation = review_evidence.validation_standing(
+        prepass, await review_evidence.latest_submission_text(db, task_id)
+    )
     only_tests = await _only_tests_of(ctx, diff)
     hub_base = instance_base_url().rstrip("/")
     code = await _access_code(db, task_id, generation, principal_id)
@@ -1809,7 +1814,7 @@ async def prepare_review_order(
             profile,
             rules_block,
             diff_block,
-            review_evidence.prepass_block(prepass),
+            review_evidence.prepass_block(prepass, validation),
             _delivery_block(task_id, code, hub_base),
             call_sites.only_tests_block(only_tests),
             needs_container=task_needs_container(task),

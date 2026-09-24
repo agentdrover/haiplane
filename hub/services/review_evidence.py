@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -592,8 +593,20 @@ async def prepass_state(db, task: dict):
     )
 
 
-def prepass_block(state) -> str:
-    """The prepass as the reviewer reads it, in its prompt (#875)."""
+def prepass_block(state, standing=None) -> str:
+    """The prepass as the reviewer reads it, in its prompt (#875).
+
+    ``standing`` (#1246) adds whether the submission is checked at all and
+    what the author claimed — as the author's word, beside the prepass, never
+    in its place.
+    """
+    text = _prepass_lines(state)
+    if standing is not None and (not standing.verified or standing.author_claims):
+        text += f" {standing.headline}"
+    return text
+
+
+def _prepass_lines(state) -> str:
     if state.state == "unknown":
         return (
             "ДЕТЕРМИНИРОВАННЫЙ ПРЕДПАС: данных нет — "
@@ -621,6 +634,134 @@ def prepass_block(state) -> str:
     if state.skipped:
         lines.append(f"Пропущены (ничего не доказывают): {', '.join(state.skipped)}.")
     return " ".join(lines)
+
+
+# --- The prepass over the author's word (#1246) ------------------------------
+#
+# Spike #1168 went to review with a FAILED prepass while its text listed green
+# runs of lint, security and the budget; the full suite was never run. The hub
+# cannot see how an author ran a command, so an "rc=0" in a submission stays a
+# word. The rule: the prepass the hub ran is the only basis for "checked"; the
+# author's claim stays visible, labelled as his, and a contradiction between
+# the two is named and counted.
+
+AUTHOR_WORD = "СЛОВО АВТОРА"
+
+# Deliberately narrow: phrases an author uses to say a run was green. The hub's
+# own submission prose ("validation passed") must not match — a claim the hub
+# wrote is not the author's.
+_GREEN_CLAIM_PATTERNS = (
+    r"\brc\s*=\s*0\b",
+    r"\bexit(?:\s+code)?\s*[:=]?\s*0\b",
+    r"\b\d+\s+passed\b",
+    r"all checks passed",
+    r"зел[её]н",
+    r"\bgreen\b",
+)
+_CLAIM_RE = re.compile("|".join(_GREEN_CLAIM_PATTERNS), re.IGNORECASE)
+_CLAUSE_SPLIT_RE = re.compile(r"[;\n]|\.\s")
+_MAX_CLAIMS = 5
+_MAX_CLAIM_LEN = 100
+
+VALIDATION_PASSED = "passed"
+VALIDATION_FAILED = "failed"
+VALIDATION_NOT_RUN = "not_run"
+
+
+def author_green_claims(text: str) -> list[str]:
+    """The clauses of a submission text that claim a green run — his word."""
+    out: list[str] = []
+    for clause in _CLAUSE_SPLIT_RE.split(text or ""):
+        clause = clause.strip()
+        if clause and _CLAIM_RE.search(clause) and clause not in out:
+            out.append(clause[:_MAX_CLAIM_LEN])
+        if len(out) >= _MAX_CLAIMS:
+            break
+    return out
+
+
+def validation_standing(prepass, submission_text: str):
+    """Whether the submission is checked: the prepass decides, the text does not.
+
+    Three states, never two (#1246): a prepass that did not run is neither a
+    pass nor a failure, and it contradicts no claim — it only fails to confirm
+    one.
+    """
+    from hub.models import ValidationStanding
+
+    claims = author_green_claims(submission_text)
+    word = f"{AUTHOR_WORD}: «{'; '.join(claims)}»" if claims else ""
+    sha = (prepass.head_sha or "")[:12] or "—"
+    if prepass.state == "covered":
+        headline = (
+            f"Сдача проверена предпасом хаба на {sha}: прошли "
+            f"{', '.join(prepass.passed)}."
+        )
+        if claims:
+            headline += f" {word} — ничего к этому не добавляет."
+        return ValidationStanding(
+            state=VALIDATION_PASSED,
+            verified=True,
+            author_claims=claims,
+            headline=headline,
+        )
+    if prepass.state == "failed":
+        headline = (
+            f"Сдача НЕ проверена: предпас хаба на {sha} упал "
+            f"({', '.join(prepass.failed)})."
+        )
+        if claims:
+            headline += (
+                f" {word} — расходится с предпасом: заявлены зелёные прогоны, "
+                "а основание — предпас, не текст сдачи."
+            )
+        return ValidationStanding(
+            state=VALIDATION_FAILED,
+            author_claims=claims,
+            discrepancy=bool(claims),
+            headline=headline,
+        )
+    headline = (
+        f"Сдача НЕ проверена: предпас не запускался — {prepass.reason}. "
+        "Это не «прошёл» и не «упал»."
+    )
+    if claims:
+        headline += f" {word} — не подтверждено и не опровергнуто."
+    return ValidationStanding(
+        state=VALIDATION_NOT_RUN, author_claims=claims, headline=headline
+    )
+
+
+async def latest_submission_text(db, task_id: int) -> str:
+    """The latest submission's text: the newest done report, else status."""
+    updates = [dict(u) for u in await repo_module.get_task_updates(db, task_id)]
+    for kind in ("done", "status"):
+        for u in reversed(updates):
+            if u.get("kind") == kind:
+                return str(u.get("content") or "")
+    return ""
+
+
+def discrepancy_tally(standings) -> dict[str, Any]:
+    """How often the author's claim contradicts the prepass, with the sample.
+
+    The sample is every submission the prepass could judge (passed or
+    failed); ``not_run`` is counted beside it, never inside — no run cannot
+    contradict anything.
+    """
+    judged = [s for s in standings if s.state != VALIDATION_NOT_RUN]
+    sample = len(judged)
+    discrepant = sum(1 for s in judged if s.discrepancy)
+    not_run = len(standings) - sample
+    return {
+        "discrepant": discrepant,
+        "sample": sample,
+        "not_run": not_run,
+        "line": (
+            f"заявление автора расходится с предпасом: {discrepant} из {sample} "
+            f"сдач с предпасом; без предпаса ещё {not_run}"
+        ),
+    }
 
 
 async def attach_dispositions(db, view) -> None:
