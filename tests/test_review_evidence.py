@@ -268,6 +268,14 @@ _CLAIM_TABLE = {
     "4210 passed": True,
     "4210 passed in 99s": True,
     "rc=0": True,
+    "exit code 0": True,
+    # Finding 0b51aa0af5130742: an exit status is negated too — before it or
+    # after it, in the same clause.
+    "rc=0 не получен": False,
+    "not rc=0": False,
+    "без exit 0": False,
+    "never got exit code 0": False,
+    "exit 0 not reached": False,
     "всё зелёное": True,
     "ruff: All checks passed!": True,
     "green on CI": True,

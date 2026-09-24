@@ -661,6 +661,10 @@ _FAILURE_RE = re.compile(r"\b(?:failed|errors?)\b", re.I)
 # clause: "Not all checks passed", "не зелёный", "no longer green".
 _GREEN_WORD_RE = re.compile(r"all checks passed|зел[её]н|\bgreen\b", re.I)
 _NEGATION_RE = re.compile(r"\b(?:not|no|не|нет)\b", re.I)
+# An exit status is negated from either side — "rc=0 не получен", "not rc=0"
+# (finding 0b51aa0af5130742) — and by "без"/"without"/"never" as well: the
+# claim is one token, so anything in its clause that denies it wins.
+_EXIT_NEGATION_RE = re.compile(r"\b(?:not|no|не|нет|без|without|never)\b", re.I)
 _CLAUSE_SPLIT_RE = re.compile(r"[;\n]|\.\s")
 _MAX_CLAIMS = 5
 _MAX_CLAIM_LEN = 100
@@ -673,7 +677,7 @@ VALIDATION_NOT_RUN = "not_run"
 def _claims_green(clause: str) -> bool:
     """Does this one clause say a run was green? Narrow on purpose (#1246)."""
     if _EXIT_ZERO_RE.search(clause):
-        return True
+        return not _EXIT_NEGATION_RE.search(clause)
     if _PASSED_COUNT_RE.search(clause):
         return not _FAILURE_RE.search(_ZERO_FAILURES_RE.sub("", clause))
     green = _GREEN_WORD_RE.search(clause)
