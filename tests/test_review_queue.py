@@ -1,0 +1,602 @@
+"""Очередь ревью одним вызовом (#1334).
+
+НАБЛЮДЕНО 22–23.09.2026. Стюард собирал сводку очереди брифом на задачу:
+20+ вызовов ``/api/tasks/{id}/review-brief`` по 8–60 секунд, и вынимал из
+каждого пять полей. Бриф дорог, потому что считает всё — дифф, call sites,
+предпас. Два прохода упали по таймауту.
+
+Очередь читает только хранимые факты. Главный риск — она заведёт своё
+правило «отчёт текущий» или «вердикт текущий» и разойдётся с брифом; поэтому
+AC-1 сверяет её с брифом поле в поле, а AC-2 роняет любой вызов диффа, сети
+или самого брифа изнутри сборщика.
+"""
+
+from __future__ import annotations
+
+import json
+from io import StringIO
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import aiosqlite
+import pytest
+from httpx import AsyncClient
+
+from hub import repository as repo
+from hub.integrations.noop import NoopGitOps
+from hub.integrations.registry import plugins
+from hub.services import review_queue
+from hub.services.review_brief import build_review_brief
+
+
+class _Git(NoopGitOps):
+    """Вершина ветки, которую хаб наблюдает, задаётся тестом."""
+
+    def __init__(self, tip: str = "aaa111"):
+        self.tip = tip
+
+    async def fetch_base(self, repo: str, base: str):
+        return (True, "")
+
+    async def head_sha(self, repo: str, base: str) -> str:
+        return self.tip
+
+    async def branch_diff(self, repo: str, base: str, branch: str):
+        return "+++ b/x.py\n+line\n"
+
+
+@pytest.fixture(autouse=True)
+def _forget_observed_tips():
+    from hub.services import lifecycle
+
+    lifecycle.forget_observed_tips()
+    yield
+    lifecycle.forget_observed_tips()
+
+
+@pytest.fixture
+def git(monkeypatch):
+    from hub.services import orchestration
+
+    monkeypatch.setattr(
+        orchestration,
+        "project_git_context",
+        AsyncMock(return_value={"repo": "/srv/ws", "base_branch": "develop"}),
+    )
+    g = _Git()
+    monkeypatch.setattr(plugins, "git_ops", g)
+    return g
+
+
+async def _submitted(client: AsyncClient, git: _Git, title: str, tip: str) -> int:
+    git.tip = tip
+    resp = await client.post("/api/tasks", json={"title": title})
+    task_id = resp.json()["id"]
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: do it"},
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    return task_id
+
+
+_FINDING = {"title": "Off by one", "severity": "high", "category": "logic"}
+
+
+async def _report(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    confirmed: list[dict] | None = None,
+    unresolved: list[dict] | None = None,
+    incomplete: bool | None = False,
+    generation_offset: int = 0,
+) -> None:
+    row = dict(await repo.get_task(db, task_id))
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=int(row["submission_generation"] or 0)
+        + generation_offset,
+        model="gpt-5.3-codex",
+        agent_count=3,
+        tokens_spent=1000,
+        raw_count=len(confirmed or []),
+        findings_confirmed=json.dumps(confirmed or []),
+        unresolved=json.dumps(unresolved or []),
+        incomplete=incomplete,
+        submitted_by="reviewer",
+    )
+    await db.commit()
+
+
+async def _in_flight(db: aiosqlite.Connection, task_id: int) -> None:
+    row = dict(await repo.get_task(db, task_id))
+    await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=int(row["submission_generation"] or 0),
+        agent_id="bc-1",
+        run_id="run-1",
+        model="grok-4.6",
+        profile="standard",
+    )
+    await db.commit()
+
+
+async def _merge_failed(db: aiosqlite.Connection, task_id: int) -> None:
+    """Отказ доставки так, как его пишет гейт (``_deliver_pair_task``)."""
+    detail = "merge_failed: GitHub refused the merge"
+    row = dict(await repo.get_task(db, task_id))
+    # Гейт доставляет только одобренное: вердикт текущей сдачи уже записан.
+    await db.execute(
+        "UPDATE tasks SET review_verdict='approved', review_verdict_generation=? "
+        "WHERE id=?",
+        (int(row["submission_generation"] or 0), task_id),
+    )
+    await repo.update_task(db, task_id, status="needs_decision")
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Ревью одобрено, но PR #7 не доставлен — {detail}. Задача не может "
+        "считаться выполненной, пока работа не в базовой ветке. Решение за "
+        "человеком (hub_decide_task).",
+    )
+    await repo.insert_event(
+        db,
+        kind="needs_decision",
+        task_id=task_id,
+        actor="hub",
+        payload={"reason": "merge_gate", "detail": detail, "via": "poller"},
+    )
+    await db.commit()
+
+
+async def _five_states(client: AsyncClient, db, git: _Git) -> dict[str, int]:
+    ids = {
+        "clean": await _submitted(client, git, "Clean report", "c1"),
+        "findings": await _submitted(client, git, "Report with findings", "f1"),
+        "in_flight": await _submitted(client, git, "Review in flight", "i1"),
+        "none": await _submitted(client, git, "No report", "n1"),
+        "incomplete": await _submitted(client, git, "Incomplete report", "p1"),
+        "merge_failed": await _submitted(client, git, "Merge failed", "m1"),
+        "stale": await _submitted(client, git, "Report of an earlier submission", "o1"),
+    }
+    # Отчёт и вердикт ПРОШЛОЙ сдачи: ровно то место, где своё правило
+    # «текущий» разошлось бы с брифом.
+    await _report(db, ids["stale"], confirmed=[_FINDING], generation_offset=-1)
+    await db.execute(
+        "UPDATE tasks SET review_verdict='changes_requested', "
+        "review_verdict_generation=submission_generation - 1 WHERE id=?",
+        (ids["stale"],),
+    )
+    await db.commit()
+    await _report(db, ids["clean"])
+    await _report(
+        db,
+        ids["findings"],
+        confirmed=[_FINDING],
+        unresolved=[{"title": "Unjudged", "why": "verifier died"}],
+    )
+    await _in_flight(db, ids["in_flight"])
+    await _report(db, ids["incomplete"], incomplete=True)
+    await _report(db, ids["merge_failed"])
+    await _merge_failed(db, ids["merge_failed"])
+    return ids
+
+
+def _brief_fields(brief) -> dict[str, Any]:
+    """Те же пять полей, что стюард 23.09 вынимал jq-ом из брифа."""
+    mr = brief.machine_review
+    current = mr is not None and mr.is_current
+    flight = brief.review_in_flight
+    latest = brief.latest_review
+    gen_review = brief.current_generation_review
+    return {
+        "submission_generation": brief.submission_generation,
+        "submission_sha": brief.submission_sha,
+        "sha_check": brief.sha_check,
+        "report_state": brief.review_report.state,
+        "report_outcome": mr.outcome if mr is not None else "",
+        "findings_confirmed": len(mr.findings_confirmed) if current else None,
+        "findings_unresolved": len(mr.unresolved) if current else None,
+        "in_flight_model": flight.model if flight else None,
+        "in_flight_grace_until": flight.grace_until if flight else None,
+        "verdict": latest.verdict.value if latest else None,
+        "verdict_generation": latest.submission_generation if latest else None,
+        "verdict_is_current": latest.is_current if latest else False,
+        "generation_has_review": gen_review.has_review,
+        "generation_review_reason": gen_review.reason,
+    }
+
+
+def _row_fields(row) -> dict[str, Any]:
+    return {
+        "submission_generation": row.submission_generation,
+        "submission_sha": row.submission_sha,
+        "sha_check": row.sha_check,
+        "report_state": row.report_state,
+        "report_outcome": row.report_outcome,
+        "findings_confirmed": row.findings_confirmed,
+        "findings_unresolved": row.findings_unresolved,
+        "in_flight_model": row.review_in_flight.model if row.review_in_flight else None,
+        "in_flight_grace_until": (
+            row.review_in_flight.grace_until if row.review_in_flight else None
+        ),
+        "verdict": row.verdict,
+        "verdict_generation": row.verdict_generation,
+        "verdict_is_current": row.verdict_is_current,
+        "generation_has_review": row.generation_has_review,
+        "generation_review_reason": row.generation_review_reason,
+    }
+
+
+# ---- AC-1: поле в поле с брифом ----
+
+
+async def test_the_queue_matches_the_brief_field_by_field(
+    client: AsyncClient, db: aiosqlite.Connection, git: _Git
+) -> None:
+    ids = await _five_states(client, db, git)
+    # Ветка одной задачи ушла после сдачи: бриф это видит, очередь обязана
+    # повторить ЕГО ответ, а не свой.
+    briefs = {}
+    for name, task_id in ids.items():
+        git.tip = (
+            "moved999"
+            if name == "none"
+            else {
+                "clean": "c1",
+                "findings": "f1",
+                "in_flight": "i1",
+                "incomplete": "p1",
+                "merge_failed": "m1",
+                "stale": "o1",
+            }[name]
+        )
+        briefs[name] = await build_review_brief(db, task_id)
+
+    queue = await review_queue.review_queue(db)
+    rows = {row.task_id: row for row in queue.rows}
+
+    assert set(rows) == set(ids.values()), (
+        "строка на каждую задачу review/needs_decision"
+    )
+    for name, task_id in ids.items():
+        assert _row_fields(rows[task_id]) == _brief_fields(briefs[name]), name
+
+    assert rows[ids["none"]].sha_check == "diverged"
+    assert rows[ids["clean"]].sha_check == "match"
+    assert rows[ids["clean"]].report_status == "current"
+    assert rows[ids["findings"]].report_status == "current"
+    assert rows[ids["findings"]].findings_confirmed == 1
+    assert rows[ids["findings"]].findings_unresolved == 1
+    assert rows[ids["in_flight"]].report_status == "in_flight"
+    assert rows[ids["none"]].report_status == "none"
+    assert rows[ids["incomplete"]].report_status == "incomplete"
+    stale = rows[ids["stale"]]
+    assert stale.report_state == "stale" and stale.report_status == "none"
+    assert stale.findings_confirmed is None, "находки прошлой сдачи — не находки этой"
+    assert stale.verdict == "changes_requested" and not stale.verdict_is_current
+
+    stalled = rows[ids["merge_failed"]]
+    assert stalled.status == "needs_decision"
+    assert stalled.verdict == "approved" and stalled.verdict_is_current
+    assert "merge_failed" in stalled.stall_reason, (
+        "причина стойла лежала последней строкой ленты — очередь обязана её назвать"
+    )
+    assert rows[ids["clean"]].stall_reason == ""
+    # Находка 5e8e505bc67ba3e0: задача после merge_failed с чистым отчётом и
+    # совпавшим sha не «можно одобрять» — её двигает решение, не вердикт.
+    assert rows[ids["clean"]].readiness == "ready"
+    assert stalled.readiness == "blocked"
+    assert all(r.waiting_minutes is not None for r in queue.rows)
+
+
+async def test_an_unobserved_tip_is_unknown_not_match(
+    client: AsyncClient, db: aiosqlite.Connection, git: _Git
+) -> None:
+    task_id = await _submitted(client, git, "Never observed", "u1")
+    from hub.services import lifecycle
+
+    # Рестарт хаба: наблюдений нет. Сдача закрепила u1, ветка стоит на u1 —
+    # но очередь в сеть не ходит и потому этого не знает.
+    lifecycle.forget_observed_tips()
+
+    row = (await review_queue.review_queue(db)).rows[0]
+
+    assert row.task_id == task_id
+    assert row.sha_check == "unknown", "неизвестное не выдаётся за match"
+    assert row.sha_check_reason
+
+
+async def test_a_provider_refusal_is_named_from_the_feed_line(
+    client: AsyncClient, db: aiosqlite.Connection, git: _Git
+) -> None:
+    """Находка 031fe60556868e97: отказ провайдера события needs_decision не
+    пишет — только алерт в ленту. Эта половина last_stall проверяется одна."""
+    from hub.services.review_availability import REFUSAL_ALERT_PREFIXES
+
+    task_id = await _submitted(client, git, "Reviewer refused", "z1")
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"{REFUSAL_ALERT_PREFIXES[0]}: HTTP 429 usage_limit_exceeded. Вердикт "
+        "остаётся за человеком.",
+    )
+    # Строка не гейта с похожими словами причиной не становится.
+    await repo.add_task_update(db, task_id, "dev", "status", "HTTP 500 locally")
+    await db.commit()
+
+    row = (await review_queue.review_queue(db)).rows[0]
+
+    assert row.status == "review"
+    assert "429" in row.stall_reason
+    assert row.stall_reason.startswith(REFUSAL_ALERT_PREFIXES[0])
+    assert row.stall_at
+
+
+async def test_a_clean_report_over_an_unverified_tip_is_not_plain_ready(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    git: _Git,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Находка 522c9ff79cdad14e и b88a2b25931bce2a: готовность без проверенного
+    sha — своё ведро сразу после ready, и возраст наблюдения виден."""
+    from hub.services import lifecycle
+
+    unverified = await _submitted(client, git, "Tip not observed", "v1")
+    verified = await _submitted(client, git, "Tip observed", "v2")
+    with_findings = await _submitted(client, git, "Findings", "v3")
+    for task_id in (unverified, verified):
+        await _report(db, task_id)
+    await _report(db, with_findings, confirmed=[_FINDING])
+    lifecycle.forget_observed_tips()
+    git.tip = "v2"
+    await build_review_brief(db, verified)  # бриф наблюдает вершину сам
+    git.tip = "v3"
+    await build_review_brief(db, with_findings)
+
+    queue = await review_queue.review_queue(db)
+    rows = {r.task_id: r for r in queue.rows}
+
+    assert [r.task_id for r in queue.rows] == [verified, unverified, with_findings]
+    assert rows[verified].readiness == "ready"
+    assert rows[verified].tip_observed_minutes_ago == 0
+    assert "мин назад" in rows[verified].sha_check_reason
+    assert rows[unverified].sha_check == "unknown"
+    assert rows[unverified].readiness == "ready_sha_unverified"
+    assert rows[unverified].tip_observed_minutes_ago is None
+
+    api = (await client.get("/api/review-queue")).json()
+    from hub import cli
+
+    out = StringIO()
+    with (
+        patch.object(cli, "_api", MagicMock(return_value=api)),
+        patch("sys.stdout", new=out),
+    ):
+        args = cli.build_parser().parse_args(["review-queue"])
+        assert args.func(args) == 0
+    lines = {line.split(" — ")[0]: line for line in out.getvalue().splitlines()}
+    assert any(
+        k.startswith("[ready, sha не проверен]") and f"#{unverified} " in k
+        for k in lines
+    ), out.getvalue()
+    verified_line = next(v for k, v in lines.items() if f"#{verified} " in k)
+    assert "sha match (наблюдение 0 мин назад)" in verified_line
+
+    html = (await client.get("/review-queue")).text
+    assert "ready, sha не проверен" in html
+    assert "наблюдение 0 мин назад" in html
+
+
+# ---- AC-2: без диффа, без сети, без брифа ----
+
+
+class _Forbidden(NoopGitOps):
+    """Любой вызов git/forge из сборщика — записывается и роняет вызов."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def __getattribute__(self, name: str):
+        if name.startswith("_") or name == "calls":
+            return object.__getattribute__(self, name)
+        calls = object.__getattribute__(self, "calls")
+
+        async def refuse(*args, **kwargs):
+            calls.append(name)
+            raise AssertionError(f"очередь позвала git_ops.{name}")
+
+        return refuse
+
+
+async def test_the_queue_does_not_recompute_diffs_or_call_the_forge(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    git: _Git,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for n in range(20):
+        task_id = await _submitted(client, git, f"Queued {n}", f"s{n}")
+        if n % 3 == 0:
+            await _report(db, task_id, confirmed=[_FINDING] if n % 2 else [])
+
+    forbidden = _Forbidden()
+    monkeypatch.setattr(plugins, "git_ops", forbidden)
+    called: list[str] = []
+
+    def trap(name: str):
+        async def refuse(*args, **kwargs):
+            called.append(name)
+            raise AssertionError(f"очередь позвала {name}")
+
+        return refuse
+
+    from hub import services
+    from hub.services import lifecycle, orchestration, review_brief, review_evidence
+
+    monkeypatch.setattr(review_brief, "build_review_brief", trap("build_review_brief"))
+    monkeypatch.setattr(review_evidence, "review_report", trap("review_report"))
+    monkeypatch.setattr(lifecycle, "resolve_branch_tip", trap("resolve_branch_tip"))
+    monkeypatch.setattr(services, "resolve_branch_tip", trap("resolve_branch_tip"))
+    monkeypatch.setattr(
+        orchestration, "project_git_context", trap("project_git_context")
+    )
+    monkeypatch.setattr(services, "project_git_context", trap("project_git_context"))
+
+    queue = await review_queue.review_queue(db)
+
+    assert len(queue.rows) == 20
+    assert forbidden.calls == [], forbidden.calls
+    assert called == [], called
+    # Наблюдения, сделанные при сдаче, очередь прочитала — не спросив сеть.
+    assert {r.sha_check for r in queue.rows} == {"match"}
+
+
+# ---- AC-3: три читателя, один сборщик, порядок готовности ----
+
+
+async def test_every_surface_reads_one_queue(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    git: _Git,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Порядок создания нарочно не совпадает с порядком готовности ни прямо,
+    # ни обратно: иначе сортировка по номеру прошла бы за сортировку по делу.
+    ready = await _submitted(client, git, "Ready to approve", "r1")
+    waiting = await _submitted(client, git, "Waits for a report", "w1")
+    with_findings = await _submitted(client, git, "Has findings", "h1")
+    await _report(db, with_findings, confirmed=[_FINDING])
+    await _report(db, ready)
+
+    resp = await client.get("/api/review-queue")
+    assert resp.status_code == 200, resp.text
+    api = resp.json()
+    order = [r["task_id"] for r in api["rows"]]
+    assert order == [ready, with_findings, waiting], (
+        "сначала готовые к одобрению, потом с находками, потом ждущие отчёта"
+    )
+    assert [r["readiness"] for r in api["rows"]] == [
+        "ready",
+        "findings",
+        "awaiting_report",
+    ]
+
+    from hub import cli
+
+    out = StringIO()
+    with (
+        patch.object(cli, "_api", MagicMock(return_value=api)) as cli_api,
+        patch("sys.stdout", new=out),
+    ):
+        args = cli.build_parser().parse_args(["review-queue"])
+        assert args.func(args) == 0
+    assert cli_api.call_args.args[:2] == ("GET", "/api/review-queue")
+    text = out.getvalue()
+    positions = [text.index(f"#{task_id} ") for task_id in order]
+    assert positions == sorted(positions), text
+
+    page = await client.get("/review-queue")
+    assert page.status_code == 200, page.text
+    html = page.text
+    positions = [html.index(f"#{task_id} ") for task_id in order]
+    assert positions == sorted(positions)
+
+    # Один сборщик: подменённый ответ видят обе серверные поверхности.
+    from hub.models import ReviewQueueView
+
+    sentinel = ReviewQueueView(rows=[], note="подменено сборщиком")
+    monkeypatch.setattr(review_queue, "review_queue", AsyncMock(return_value=sentinel))
+    assert (await client.get("/api/review-queue")).json()["note"] == sentinel.note
+    assert sentinel.note in (await client.get("/review-queue")).text
+
+
+def _queue_text(rows: list[dict[str, Any]]) -> str:
+    """Human output of ``oc-hub review-queue`` over a canned API answer."""
+    from hub import cli
+
+    out = StringIO()
+    with (
+        patch.object(cli, "_api", MagicMock(return_value={"rows": rows})),
+        patch("sys.stdout", new=out),
+    ):
+        args = cli.build_parser().parse_args(["review-queue"])
+        assert args.func(args) == 0
+    return out.getvalue()
+
+
+def _queue_row(**over: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "task_id": 7,
+        "title": "t",
+        "status": "review",
+        "submission_generation": 1,
+        "report_status": "present",
+        "findings_confirmed": 0,
+        "findings_unresolved": 0,
+        "readiness": "ready_sha_unverified",
+        "waiting_minutes": 5,
+    }
+    row.update(over)
+    return row
+
+
+def test_the_human_line_names_why_sha_is_not_a_match() -> None:
+    """Находка c80a9b7c: четыре разных unknown печатались одинаково.
+
+    После OBSERVED_TIP_MAX_AGE_MINUTES вершина обнуляется, и причина живёт
+    только в sha_check_reason — страница кладёт её в title, --json её несёт,
+    а человеческая строка печатала голое «sha unknown».
+    """
+    reason = "последнее наблюдение вершины 45 мин назад — старше 30 мин"
+    text = _queue_text(
+        [
+            _queue_row(
+                sha_check="unknown",
+                sha_check_reason=reason,
+                tip_observed_minutes_ago=None,
+            )
+        ]
+    )
+    assert f"sha unknown ({reason})" in text, text
+
+
+def test_a_fresh_observation_is_named_once() -> None:
+    """Свежее наблюдение: минуты называются один раз, match не зашумлён."""
+    fresh = "наблюдение вершины 3 мин назад. вершина ветки совпадает со сдачей"
+    matched = _queue_text(
+        [
+            _queue_row(
+                sha_check="match",
+                sha_check_reason=fresh,
+                tip_observed_minutes_ago=3,
+            )
+        ]
+    )
+    assert "sha match (наблюдение 3 мин назад)" in matched, matched
+    assert "совпадает со сдачей" not in matched, matched
+
+    diverged = _queue_text(
+        [
+            _queue_row(
+                sha_check="diverged",
+                sha_check_reason="наблюдение вершины 3 мин назад. ветка ушла",
+                tip_observed_minutes_ago=3,
+            )
+        ]
+    )
+    assert "ветка ушла" in diverged, diverged
+    assert diverged.count("3 мин назад") == 1, diverged

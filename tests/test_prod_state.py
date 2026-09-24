@@ -129,8 +129,10 @@ async def test_window_is_stated_not_implied(
     # #824's lesson, applied here: the snapshot is bounded, and a bound nobody
     # is told about reads as the whole board.
     _use_real_git(monkeypatch, history["repo"])
-    for _ in range(3):
-        await _completed(client, db, history["shipped"])
+    # Three merges, three commits: the registry is keyed by the merge (#1343),
+    # so one commit cannot stand for three deliveries.
+    for sha_key in ("shipped", "released", "pending"):
+        await _completed(client, db, history[sha_key])
 
     snapshot = await prod_state(db, limit=2)
 

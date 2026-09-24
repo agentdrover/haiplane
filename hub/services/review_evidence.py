@@ -213,6 +213,32 @@ def sha_check_statement(
     )
 
 
+def sha_check_of(
+    submission_sha: str, branch: str, current_tip: str, tip_reason: str
+) -> tuple[str, str]:
+    """Where the branch stands against the pinned submission: ``(state, reason)``.
+
+    One classifier for every reader (#572, #1334). The brief hands it a tip it
+    has just fetched; the review queue hands it the tip the hub last observed,
+    without fetching. The TIP differs in freshness, the rule does not — and an
+    empty tip is ``unknown`` with its cause, never a ``match``.
+    """
+    submission_sha = (submission_sha or "").strip()
+    if not submission_sha or not branch:
+        return "unknown", "branch tip was not pinned at submission"
+    if not current_tip:
+        return "unknown", tip_reason
+    if current_tip == submission_sha:
+        return "match", sha_check_statement(
+            "match", submission_sha, current_tip, branch
+        )
+    return "diverged", (
+        f"submitted at {submission_sha[:12]}, branch now at "
+        f"{current_tip[:12]} — the diff under review is not the code "
+        "in the branch"
+    )
+
+
 async def live_check_state(
     db: Any, task_id: int, *, delivered_sha: str = "", declared_probe: str = ""
 ) -> dict[str, Any]:
@@ -760,6 +786,20 @@ async def review_report(
     diff volume that could not be measured is None with a reason (not zero,
     which would claim the branch changed nothing — #518).
     """
+    report = await report_view(db, task_row, mr_row)
+    return await _measure_diff(db, task_row, report)
+
+
+async def report_view(
+    db: Any, task_row: dict[str, Any], mr_row: Any = None
+) -> "ReviewReport":
+    """The report WITHOUT its diff volume: stored facts only (#1334).
+
+    :func:`review_report` is this plus one diff read. The review queue reads
+    this half alone — twenty diffs per call is exactly what made the brief
+    loop time out — and because both go through here, "is the report current"
+    has one answer, not two.
+    """
     from hub.models import MachineReviewView, ReviewReport
 
     generation = task_row.get("submission_generation") or 0
@@ -796,14 +836,19 @@ async def review_report(
         await attach_dispositions(db, machine_review)
         state = "current" if machine_review.is_current else "stale"
 
-    branch = (task_row.get("branch") or "").strip()
-    report = ReviewReport(
+    return ReviewReport(
         state=state,
-        branch=branch,
+        branch=(task_row.get("branch") or "").strip(),
         submission_sha=(task_row.get("submission_sha") or "").strip(),
         machine_review=machine_review,
     )
 
+
+async def _measure_diff(
+    db: Any, task_row: dict[str, Any], report: "ReviewReport"
+) -> "ReviewReport":
+    """Fill the report's diff volume, or say why it could not be read (#518)."""
+    branch = report.branch
     if not branch:
         report.diff_note = "у задачи нет ветки — объём диффа не измерялся"
         return report

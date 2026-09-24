@@ -60,6 +60,7 @@ from hub.models import (
     BatchApproveResult,
     FindingScope,
     ReviewBrief,
+    ReviewQueueView,
     TaskAnswer,
     TaskReviewVerdict,
     TaskSubmitReview,
@@ -2076,6 +2077,21 @@ async def api_delivery_discrepancies(
     return await services.undelivered_completed_tasks(
         db, project_id=project_id, limit=max(1, min(limit, 200))
     )
+
+
+@app.get("/api/review-queue", response_model=ReviewQueueView)
+async def api_review_queue(request: Request, project: str | None = None):
+    """Every submission in review and needs_decision, one row each (#1334).
+
+    Stored facts only — no diff, no fetch per task — so the whole queue costs
+    what one brief's cheapest block does. The CLI and the /review-queue page
+    read the same collector.
+    """
+    from hub.services import review_queue
+
+    db = _db(request)
+    project_id = await services.project_id_for(db, project or None)
+    return await review_queue.review_queue(db, project_id=project_id)
 
 
 @app.post("/api/delivery/discrepancies/{task_id}/observation")

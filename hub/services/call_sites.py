@@ -427,9 +427,176 @@ def analyse(
     )
 
 
+# ---- #1254: the only_tests list, addressed to whoever judges the diff ----
+#
+# ONLY_TESTS used to end as one sentence in the review brief, which neither the
+# cloud reviewer nor the person at the gate reads: on 11.09.2026 two
+# submissions reached a human carrying a mechanism no product line called.
+# The state is NOT a gate — a tool reached by name through a registry lands
+# here by construction — so it travels as a question with two answers the
+# reviewer must choose between, and the answer is read back per symbol.
+#
+# The answer rides on fields every report path already carries (confirmed,
+# rejected), under one category, so neither the report contract nor any of its
+# four delivery paths (MCP, HTTP, run text, local stdout) had to grow.
+
+ONLY_TESTS_CATEGORY = "only_tests"
+# What one named symbol came back as.
+UNREACHABLE = "unreachable"
+CLEARED = "cleared"
+SILENT = "silent"
+PENDING = "pending"
+# What the readout as a whole can say. Three answers, never collapsed (#750):
+# nobody looked, looked and found no candidate, candidates were named.
+NOT_ANALYSED = "not_analysed"
+NONE_NAMED = "none_named"
+NAMED = "named"
+# Named, and no report of the current generation to answer yet: not the same
+# as a report that stayed silent about a symbol.
+NO_REPORT = "no_report"
+
+
+def only_tests_symbols(report: CallSiteReport) -> list[SymbolReport] | None:
+    """The symbols only tests call, or None when the walk did not run."""
+    if not report.analysed:
+        return None
+    return [s for s in report.symbols if s.state == ONLY_TESTS]
+
+
+def only_tests_block(symbols: list[SymbolReport] | None) -> str:
+    """The review-order paragraph naming them; empty when there is none.
+
+    Empty means the order stays byte for byte what it was — a line saying
+    "nothing to check" would read as a check that passed. Every candidate is
+    listed: the readout is scored on exactly this set, so a name cut from the
+    prompt would be judged without ever having been asked about.
+    """
+    if not symbols:
+        return ""
+    lines = "".join(f"- {s.symbol} ({s.defined_in})\n" for s in symbols)
+    return (
+        "ПРОВЕРЬ ДОСТИЖИМОСТЬ (#1254). Вне tests/ эти символы не зовёт никто "
+        "— по статическому разбору:\n"
+        f"{lines}"
+        "Вызовы через реестр, getattr и строковые имена разбор не видит: это "
+        "кандидаты, не находки. По КАЖДОМУ дай исход с "
+        f'category="{ONLY_TESTS_CATEGORY}" и title=<имя символа>: недостижим '
+        "из прода — в findings_confirmed; зовётся иначе — в findings_rejected, "
+        "и в reason назови путь вызова (файл, механизм). Снятие без пути и "
+        "умолчание исходом не считаются.\n\n"
+    )
+
+
+@dataclass
+class OnlyTestsOutcome:
+    symbol: str
+    outcome: str
+    call_path: str = ""
+
+
+@dataclass
+class OnlyTestsReadout:
+    state: str
+    outcomes: list[OnlyTestsOutcome] = field(default_factory=list)
+
+    def summary(self) -> str:
+        if self.state == NOT_ANALYSED:
+            return (
+                "only_tests: разбор вызовов не состоялся — о недостижимых "
+                "символах ничего не известно"
+            )
+        if self.state == NONE_NAMED:
+            return (
+                "only_tests: разбор не назвал ни одного кандидата — это "
+                "отсутствие данных, а не проверенная достижимость"
+            )
+        if self.state == NO_REPORT:
+            return (
+                f"only_tests: названо {len(self.outcomes)} — актуального "
+                "отчёта нет, исходов ещё быть не может"
+            )
+        count = {k: 0 for k in (UNREACHABLE, CLEARED, SILENT)}
+        for o in self.outcomes:
+            count[o.outcome] += 1
+        return (
+            f"only_tests: названо {len(self.outcomes)} — подтверждено "
+            f"недостижимыми {count[UNREACHABLE]}, снято с путём вызова "
+            f"{count[CLEARED]}, без исхода {count[SILENT]}"
+        )
+
+
+def _get(item: object, name: str) -> str:
+    value = item.get(name) if isinstance(item, dict) else getattr(item, name, "")
+    return str(value or "").strip()
+
+
+def _answers(items: object, symbol: str) -> list[object]:
+    """Report entries of the only_tests category that name ``symbol``."""
+    word = re.compile(rf"(?<![\w.]){re.escape(symbol)}(?!\w)")
+    return [
+        item
+        for item in (items if isinstance(items, list) else [])
+        if _get(item, "category").lower() == ONLY_TESTS_CATEGORY
+        and word.search(_get(item, "title"))
+    ]
+
+
+def only_tests_readout(named: list[str] | None, report: object) -> OnlyTestsReadout:
+    """Per named symbol, what the report said about it (#1254).
+
+    ``named`` is None when the walk did not run. ``report`` is the current
+    machine review (a dict or a view with ``findings_confirmed`` and
+    ``findings_rejected``) or None when there is none yet. A clearing counts
+    only with a call path in its reason; a confirmation wins over a clearing
+    of the same symbol.
+    """
+    if named is None:
+        return OnlyTestsReadout(NOT_ANALYSED)
+    if not named:
+        return OnlyTestsReadout(NONE_NAMED)
+    if report is None:
+        return OnlyTestsReadout(
+            NO_REPORT, [OnlyTestsOutcome(symbol, PENDING) for symbol in named]
+        )
+    confirmed = _get_list(report, "findings_confirmed")
+    rejected = _get_list(report, "findings_rejected")
+    outcomes = []
+    for symbol in named:
+        paths = [_get(r, "reason") for r in _answers(rejected, symbol)]
+        paths = [p for p in paths if p]
+        if _answers(confirmed, symbol):
+            outcomes.append(OnlyTestsOutcome(symbol, UNREACHABLE))
+        elif paths:
+            outcomes.append(OnlyTestsOutcome(symbol, CLEARED, paths[0]))
+        else:
+            outcomes.append(OnlyTestsOutcome(symbol, SILENT))
+    return OnlyTestsReadout(NAMED, outcomes)
+
+
+def _get_list(report: object, name: str) -> list:
+    if report is None:
+        return []
+    value = report.get(name) if isinstance(report, dict) else getattr(report, name, [])
+    return value if isinstance(value, list) else []
+
+
 __all__ = [
     "ALL_TOUCHED",
     "ANALYSED",
+    "CLEARED",
+    "NAMED",
+    "NO_REPORT",
+    "PENDING",
+    "NONE_NAMED",
+    "NOT_ANALYSED",
+    "ONLY_TESTS_CATEGORY",
+    "SILENT",
+    "UNREACHABLE",
+    "OnlyTestsOutcome",
+    "OnlyTestsReadout",
+    "only_tests_block",
+    "only_tests_readout",
+    "only_tests_symbols",
     "DYNAMIC_CALLS_NOTE",
     "NO_CALLERS",
     "ONLY_TESTS",

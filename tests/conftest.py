@@ -92,6 +92,16 @@ def _forget_stacking_probe_answers():
 
 
 @pytest.fixture(autouse=True)
+def _forget_observed_branch_tips():
+    """Task ids restart at 1 per test db, so a remembered tip must not leak (#1334)."""
+    from hub.services import lifecycle
+
+    lifecycle.forget_observed_tips()
+    yield
+    lifecycle.forget_observed_tips()
+
+
+@pytest.fixture(autouse=True)
 def _forget_pair_delivery_waits():
     """Empty the poller's delivery-wait dedupe memory around every test (#1261).
 

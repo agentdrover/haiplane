@@ -11484,3 +11484,579 @@ async def test_dispatched_prompt_carries_docker_attempt_only_for_container_tasks
     assert "sudo apt-get install -y docker.io docker-compose-v2" in with_docker
     assert "docker.io" not in plain
     assert "не менять в файлах репозитория" in plain
+
+
+# ---- #1254: символы «только тесты» доезжают до того, кто судит ----------
+#
+# call_sites.analyse вычислял ONLY_TESTS и отдавал его одной фразе брифа,
+# которую судящая сторона не читает: 11.09.2026 две сдачи (#1231, #1234) ушли
+# к человеку с механизмом, недостижимым из прода. Анализатор здесь подменён
+# готовым отчётом: его точность — не предмет этой задачи, предмет — адресат.
+
+
+def _only_tests_report(*symbols: str):
+    from hub.services import call_sites
+
+    reports = [
+        call_sites.SymbolReport(
+            symbol=name,
+            defined_in="hub/services/steward_corridor.py",
+            state=call_sites.ONLY_TESTS,
+            sites=[
+                call_sites.CallSite(
+                    file="tests/test_steward_corridor.py",
+                    line=10,
+                    caller="test_it",
+                    touched=True,
+                )
+            ],
+        )
+        for name in symbols
+    ]
+    reports.append(
+        call_sites.SymbolReport(
+            symbol="ordinary_helper",
+            defined_in="hub/services/digest.py",
+            state=call_sites.ALL_TOUCHED,
+        )
+    )
+    return call_sites.CallSiteReport(call_sites.ANALYSED, symbols=reports)
+
+
+def _analyse_returns(monkeypatch, report) -> None:
+    from hub.services import call_sites
+
+    monkeypatch.setattr(call_sites, "analyse", lambda root, diff: report)
+
+
+def _callers_of(tree: ast.Module, name: str) -> set[str]:
+    callers: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Name)
+                    and inner.func.id == name
+                ):
+                    callers.add(node.name)
+    return callers
+
+
+async def test_every_review_path_carries_the_only_tests_symbols(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-1 (#1254): символы only_tests уезжают судящей стороне по КАЖДОМУ пути.
+
+    Пути перечислены поимённо, а не показаны на одном:
+    1) облачный заказ (и добор лестницы, и вторая дверь — они собирают заказ
+       той же ``prepare_review_order``, что доказывает перечисление вызовов);
+    2) локальный заказ — промт в том виде, в каком его получает ревьюер после
+       перевыписки кода доступа в момент старта (#1208);
+    3) бриф ревью — то, что читает ревьюер, пришедший через MCP или HTTP.
+    """
+    from hub.services import review_dispatch as rd
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    _analyse_returns(monkeypatch, _only_tests_report("mechanical_step"))
+
+    # Перечисление: ревьюер получает промт ТОЛЬКО из prepare_review_order, а
+    # её зовут ровно два транспорта. Новый путь, собравший промт мимо неё,
+    # уронит эту строку, а не проедет молча.
+    tree = ast.parse(Path(rd.__file__).read_text())
+    assert _callers_of(tree, "_review_prompt") == {"prepare_review_order"}
+    assert _callers_of(tree, "prepare_review_order") == {
+        "maybe_dispatch_review",
+        "dispatch_local_review",
+    }
+    # Добор лестницы (#879), переспрос (#1242) и вторая дверь (#1252) — те же
+    # два транспорта.
+    assert _callers_of(tree, "maybe_dispatch_review") == {
+        "maybe_top_up_incomplete",
+        "_ask_again",
+    }
+    assert _callers_of(tree, "dispatch_local_review") == {
+        "maybe_dispatch_review",
+        "open_second_door",
+    }
+
+    # 1) облако
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ot"}, "run": {"id": "r-ot"}})
+    _wire(monkeypatch, recorder)
+    cloud_id = await _submitted(client, db, "spike-only-tests-cloud")
+    cloud_prompt = recorder.calls[0]["prompt_text"]
+    assert "mechanical_step" in cloud_prompt
+    assert "hub/services/steward_corridor.py" in cloud_prompt
+    assert "ordinary_helper" not in cloud_prompt, "назван только only_tests"
+    assert 'category="only_tests"' in cloud_prompt, "ревьюеру сказано, как ответить"
+
+    # 3) бриф — тот, что читает ревьюер через MCP/HTTP
+    brief = await client.get(f"/api/tasks/{cloud_id}/review-brief")
+    assert brief.status_code == 200, brief.text
+    section = brief.json()["call_sites"]
+    assert section["only_tests_state"] == "no_report", section
+    assert [o["symbol"] for o in section["only_tests"]] == ["mechanical_step"]
+
+    # 2) локально, промт — в момент старта
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    seen: list[str] = []
+
+    async def _capturing(prompt, *, timeout=None, prompt_at_slot=None):
+        if prompt_at_slot is not None:
+            prompt = await prompt_at_slot(prompt)
+        seen.append(prompt)
+        return None
+
+    monkeypatch.setattr(local_reviewer, "run_review", _capturing)
+    await _submitted(
+        client,
+        db,
+        "spike-only-tests-local",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    await wait_for_local_runs()
+    assert len(seen) == 1, "локальный прогон обязан был стартовать"
+    assert "mechanical_step" in seen[0]
+    assert 'category="only_tests"' in seen[0]
+
+
+async def test_an_empty_only_tests_list_leaves_the_order_as_it_was(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, риск «общий канал»: без кандидатов заказ не получает ни строки.
+
+    И «анализ не состоялся», и «анализ прошёл, кандидатов нет» оставляют
+    промт тем же, каким он был до этой задачи — сравнивается с промтом,
+    собранным вовсе без анализа.
+    """
+    from hub.services import call_sites
+
+    prompts: list[str] = []
+    for slug, report in (
+        ("spike-ot-none", _only_tests_report()),
+        (
+            "spike-ot-unknown",
+            call_sites.CallSiteReport(call_sites.UNKNOWN, reason="no tree"),
+        ),
+    ):
+        _analyse_returns(monkeypatch, report)
+        recorder = _DispatchRecorder(
+            {"agent": {"id": f"bc-{slug}"}, "run": {"id": "r"}}
+        )
+        _wire(monkeypatch, recorder)
+        await _submitted(client, db, slug)
+        prompts.append(recorder.calls[0]["prompt_text"])
+
+    for prompt in prompts:
+        assert "only_tests" not in prompt
+        assert "ПРОВЕРЬ ДОСТИЖИМОСТЬ" not in prompt
+    # Две задачи отличаются номером — его и снимаем, остальное байт в байт.
+    first, second = (
+        re.sub(r"#\d+|task_id=\d+|/tasks/\d+|task-\d+", "N", p) for p in prompts
+    )
+    assert first == second
+
+
+async def _only_tests_submission(client, db, monkeypatch, slug, *symbols) -> int:
+    _analyse_returns(monkeypatch, _only_tests_report(*symbols))
+    _wire(
+        monkeypatch,
+        _DispatchRecorder({"agent": {"id": f"bc-{slug}"}, "run": {"id": "r"}}),
+    )
+    return await _submitted(client, db, slug)
+
+
+async def _report_on(client, task_id: int, *, confirmed=(), rejected=()) -> None:
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "agent_count": 1,
+            "tokens_spent": 1000,
+            "model": "grok-4.6",
+            "raw_count": len(confirmed) + len(rejected),
+            "findings_confirmed": list(confirmed),
+            "findings_rejected": list(rejected),
+            "incomplete": False,
+            "unresolved": [],
+            "lost_dimensions": [],
+            "agent": "cursor-cloud-reviewer",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def _only_tests_section(client, task_id: int) -> dict:
+    brief = await client.get(f"/api/tasks/{task_id}/review-brief")
+    assert brief.status_code == 200, brief.text
+    return brief.json()["call_sites"]
+
+
+async def test_every_named_symbol_comes_back_with_an_outcome(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1254): у каждого названного символа — исход, молчание исходом нет.
+
+    Четыре символа, четыре ответа отчёта: подтверждён, снят с путём, «снят»
+    без пути, не упомянут. Засчитываются только первые два.
+    """
+    task_id = await _only_tests_submission(
+        client,
+        db,
+        monkeypatch,
+        "spike-ot-outcomes",
+        "mechanical_step",
+        "hub_submit_probe",
+        "self_approval_for",
+        "approve_without_a_human",
+    )
+    await _report_on(
+        client,
+        task_id,
+        confirmed=[
+            {
+                "title": "mechanical_step",
+                "category": "only_tests",
+                "severity": "high",
+                "locator": "file",
+                "file": "hub/services/steward_corridor.py",
+                "detail": "ни одна строка прода его не зовёт",
+            }
+        ],
+        rejected=[
+            {
+                "title": "hub_submit_probe",
+                "category": "only_tests",
+                "reason": "hub/mcp_server.py: зарегистрирован @mcp.tool, зовётся по имени через tools/call",
+            },
+            {"title": "self_approval_for", "category": "only_tests", "reason": ""},
+        ],
+    )
+
+    section = await _only_tests_section(client, task_id)
+    outcomes = {o["symbol"]: o for o in section["only_tests"]}
+    assert section["only_tests_state"] == "named"
+    assert set(outcomes) == {
+        "mechanical_step",
+        "hub_submit_probe",
+        "self_approval_for",
+        "approve_without_a_human",
+    }, "каждый названный символ обязан быть в итоге, отвеченный или нет"
+    assert outcomes["mechanical_step"]["outcome"] == "unreachable"
+    assert outcomes["hub_submit_probe"]["outcome"] == "cleared"
+    assert "tools/call" in outcomes["hub_submit_probe"]["call_path"]
+    assert outcomes["self_approval_for"]["outcome"] == "silent", (
+        "снятие без названного пути исходом не считается"
+    )
+    assert outcomes["approve_without_a_human"]["outcome"] == "silent", (
+        "символ, о котором отчёт молчит, исходом не считается"
+    )
+    assert "без исхода 2" in section["only_tests_summary"]
+
+
+async def test_an_empty_list_is_not_sold_as_a_clean_verdict(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1254): «символов не названо» ≠ «символы названы и сняты» (#750)."""
+    from hub.services import call_sites
+
+    empty_id = await _only_tests_submission(client, db, monkeypatch, "spike-ot-empty")
+    await _report_on(client, empty_id)
+    empty = await _only_tests_section(client, empty_id)
+
+    cleared_id = await _only_tests_submission(
+        client,
+        db,
+        monkeypatch,
+        "spike-ot-cleared",
+        "hub_submit_probe",
+        "hub_other_tool",
+    )
+    await _report_on(
+        client,
+        cleared_id,
+        rejected=[
+            {
+                "title": name,
+                "category": "only_tests",
+                "reason": f"hub/mcp_server.py: @mcp.tool {name}",
+            }
+            for name in ("hub_submit_probe", "hub_other_tool")
+        ],
+    )
+    cleared = await _only_tests_section(client, cleared_id)
+
+    # Третий ответ: разбор при заказе не состоялся вовсе.
+    _analyse_returns(
+        monkeypatch, call_sites.CallSiteReport(call_sites.UNKNOWN, reason="no tree")
+    )
+    _wire(
+        monkeypatch, _DispatchRecorder({"agent": {"id": "bc-unk"}, "run": {"id": "r"}})
+    )
+    unknown_id = await _submitted(client, db, "spike-ot-unknown-walk")
+    await _report_on(client, unknown_id)
+    unknown = await _only_tests_section(client, unknown_id)
+
+    assert empty["only_tests_state"] == "none_named"
+    assert empty["only_tests"] == []
+    assert cleared["only_tests_state"] == "named"
+    assert [o["outcome"] for o in cleared["only_tests"]] == ["cleared", "cleared"]
+    assert unknown["only_tests_state"] == "not_analysed", (
+        "не смотрели — это третий ответ, а не «кандидатов нет»"
+    )
+    summaries = {
+        empty["only_tests_summary"],
+        cleared["only_tests_summary"],
+        unknown["only_tests_summary"],
+    }
+    assert len(summaries) == 3, "три разных итога обязаны читаться по-разному"
+    assert "отсутствие данных" in empty["only_tests_summary"]
+
+
+async def test_the_readout_scores_exactly_what_the_order_named(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находки c7488ab8 / d848b4a0 / 80985368: бриф судит по ЗАКАЗУ.
+
+    Второй разбор при чтении брифа мог дать другой набор: база протухла и
+    бриф разбор выключил, дерево сдвинулось между вызовами, потолок списка
+    обрезал промт. Набор названных символов запоминается в строке заказа, и
+    итог считается ровно по нему.
+    """
+    from hub.services import call_sites
+
+    many = [f"tool_{i:02d}" for i in range(25)]
+    task_id = await _only_tests_submission(
+        client, db, monkeypatch, "spike-ot-pinned", *many
+    )
+    recorder_prompt = (await _any_dispatch_row(db, task_id))["only_tests"]
+    assert json.loads(recorder_prompt) == many, "заказ помнит ровно названное"
+
+    # Дрейф: второй разбор видит другой символ; и протухшая база: не видит ничего.
+    _analyse_returns(monkeypatch, _only_tests_report("drifted_symbol"))
+    drifted = await _only_tests_section(client, task_id)
+    _analyse_returns(
+        monkeypatch, call_sites.CallSiteReport(call_sites.UNKNOWN, reason="stale")
+    )
+    stale = await _only_tests_section(client, task_id)
+
+    for section in (drifted, stale):
+        assert [o["symbol"] for o in section["only_tests"]] == many, section
+        assert section["only_tests_state"] == "no_report"
+
+
+async def test_the_order_names_every_candidate(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находка 80985368: промт называет ВСЕ символы, которые потом судят."""
+    many = [f"tool_{i:02d}" for i in range(25)]
+    recorder = _DispatchRecorder({"agent": {"id": "bc-many"}, "run": {"id": "r"}})
+    _analyse_returns(monkeypatch, _only_tests_report(*many))
+    _wire(monkeypatch, recorder)
+    await _submitted(client, db, "spike-ot-many")
+    prompt = recorder.calls[0]["prompt_text"]
+    missing = [name for name in many if f"- {name} (" not in prompt]
+    assert missing == [], f"в заказе не названы: {missing}"
+
+
+async def test_no_current_report_is_said_as_such(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находка 33559ae2: нет отчёта — это не «ревьюер промолчал»."""
+    task_id = await _only_tests_submission(
+        client, db, monkeypatch, "spike-ot-noreport", "mechanical_step"
+    )
+    before = await _only_tests_section(client, task_id)
+    assert before["only_tests_state"] == "no_report"
+    assert [o["outcome"] for o in before["only_tests"]] == ["pending"]
+    assert "актуального отчёта нет" in before["only_tests_summary"]
+
+    await _report_on(client, task_id)
+    after = await _only_tests_section(client, task_id)
+    assert after["only_tests_state"] == "named"
+    assert [o["outcome"] for o in after["only_tests"]] == ["silent"], (
+        "а вот отчёт, который промолчал, — это уже «без исхода»"
+    )
+
+
+async def test_the_card_shows_the_only_tests_outcome(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находка bf42c7bf: итог виден там, куда смотрит человек — в карточке."""
+    task_id = await _only_tests_submission(
+        client, db, monkeypatch, "spike-ot-card", "mechanical_step"
+    )
+    await _report_on(
+        client,
+        task_id,
+        rejected=[
+            {
+                "title": "mechanical_step",
+                "category": "only_tests",
+                "reason": "hub/poller.py: _sweep зовёт его по имени",
+            }
+        ],
+    )
+    page = await client.get(f"/tasks/{task_id}")
+    assert page.status_code == 200
+    assert "снято с путём вызова 1" in page.text, "итог only_tests — на панели"
+
+
+async def test_the_readout_follows_the_order_of_the_shown_report(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находка 63a14461: набор берётся у заказа ПОКАЗАННОГО отчёта.
+
+    Лестница (#879): лёгкий заказ назвал одно, добор deep — другое, а
+    показан пока отчёт лёгкого. Последний заказ поколения здесь чужой.
+    """
+    task_id = await _only_tests_submission(
+        client, db, monkeypatch, "spike-ot-ladder", "lite_sym"
+    )
+    reviewer = 77
+    await db.execute(
+        "UPDATE review_dispatches SET reviewer_principal_id = ? WHERE task_id = ?",
+        (reviewer, task_id),
+    )
+    await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-deep",
+        run_id="r-deep",
+        model="grok-4.6",
+        profile=DEEP,
+        reviewer_principal_id=reviewer,
+        only_tests=["deep_sym"],
+    )
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        raw_count=1,
+        incomplete=True,
+        findings_rejected=json.dumps(
+            [
+                {
+                    "title": "lite_sym",
+                    "category": "only_tests",
+                    "reason": "hub/poller.py: зовётся по имени",
+                }
+            ]
+        ),
+        principal_id=reviewer,
+    )
+    await db.commit()
+    # У запасного пути (раздел брифа) — свой, третий набор: итог обязан прийти
+    # из заказа отчёта, а не совпасть с ним случайно (находка 4a226dcf).
+    _analyse_returns(monkeypatch, _only_tests_report("fallback_sym"))
+
+    section = await _only_tests_section(client, task_id)
+    assert section["only_tests"] == [
+        {
+            "symbol": "lite_sym",
+            "outcome": "cleared",
+            "call_path": "hub/poller.py: зовётся по имени",
+        }
+    ], section
+
+
+async def test_a_report_of_the_previous_submission_is_no_report(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находка 6e76db6b: пересдача без нового отчёта — это no_report.
+
+    Отчёт прошлого поколения снял символ; о новом коде он не говорит ничего.
+    """
+    task_id = await _only_tests_submission(
+        client, db, monkeypatch, "spike-ot-resubmit", "mechanical_step"
+    )
+    await _report_on(
+        client,
+        task_id,
+        rejected=[
+            {
+                "title": "mechanical_step",
+                "category": "only_tests",
+                "reason": "hub/poller.py: _sweep зовёт его по имени",
+            }
+        ],
+    )
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 2, submission_sha = ? WHERE id = ?",
+        ("d" * 40, task_id),
+    )
+    await db.commit()
+
+    section = await _only_tests_section(client, task_id)
+    assert section["only_tests_state"] == "no_report", section
+    assert [o["outcome"] for o in section["only_tests"]] == ["pending"]
+
+
+@pytest.mark.parametrize("case", ["no_context", "empty_diff", "walk_raises"])
+async def test_a_walk_that_did_not_run_is_recorded_as_null(case, monkeypatch):
+    """#1254, находка 0b1110ec: «не смотрели» — это None, а не пустой список.
+
+    Пустой список в строке заказа читается как «разбор прошёл и никого не
+    назвал»; ранний выход обязан оставить NULL.
+    """
+    from hub.services import call_sites
+    from hub.services import review_dispatch as rd
+
+    def _boom(root, diff):
+        raise RuntimeError("walk failed")
+
+    monkeypatch.setattr(call_sites, "analyse", _boom)
+    ctx, diff = {
+        "no_context": (None, _HARMLESS_DIFF),
+        "empty_diff": (("/tmp/ws", "develop"), ""),
+        "walk_raises": (("/tmp/ws", "develop"), _HARMLESS_DIFF),
+    }[case]
+    assert await rd._only_tests_of(ctx, diff) is None
+
+
+async def test_a_failed_walk_leaves_null_in_the_order_row(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1254, находка 0b1110ec: сквозь заказ — NULL в строке, а не '[]'."""
+    from hub.services import call_sites
+
+    def _boom(root, diff):
+        raise RuntimeError("walk failed")
+
+    monkeypatch.setattr(call_sites, "analyse", _boom)
+    _wire(
+        monkeypatch, _DispatchRecorder({"agent": {"id": "bc-null"}, "run": {"id": "r"}})
+    )
+    task_id = await _submitted(client, db, "spike-ot-null")
+    assert (await _any_dispatch_row(db, task_id))["only_tests"] is None
+
+
+async def test_a_refused_call_stub_carries_the_orders_only_tests(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1337): заглушка синхронного отказа несёт only_tests заказа.
+
+    #1242 перенесла создание заглушки в ``_owe_the_refused_call``; строка
+    #1254 ``only_tests=order.only_tests`` там потеряла точку приложения. Без
+    сопряжения заглушка осела бы с NULL, и бриф не узнал бы, что заказ
+    называл ревьюеру. Локальный путь выключен: вторая дверь не открылась, и
+    заглушка — единственная строка заказа.
+    """
+    _analyse_returns(monkeypatch, _only_tests_report("mechanical_step"))
+    _wire(monkeypatch, _Sequence([(None, _RATE_LIMIT)]))
+    _no_local_path(monkeypatch)
+
+    task_id = await _submitted(
+        client, db, "refused-stub-only-tests", policy={"review": "dispatch"}
+    )
+
+    rows = await _rows_of(db, task_id)
+    assert len(rows) == 1, rows
+    stub = rows[0]
+    assert stub["agent_id"] == "", "это заглушка отказа, а не созданный агент"
+    assert stub["only_tests"] is not None, "заглушка потеряла only_tests заказа"
+    assert json.loads(stub["only_tests"]) == ["mechanical_step"]

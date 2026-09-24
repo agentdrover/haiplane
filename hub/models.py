@@ -809,6 +809,14 @@ class CallSiteEntry(BaseModel):
     untouched: list[str] = Field(default_factory=list)
 
 
+class OnlyTestsOutcomeView(BaseModel):
+    """One only_tests symbol and what the review said about it (#1254)."""
+
+    symbol: str
+    outcome: str
+    call_path: str = ""
+
+
 class CallSiteSection(BaseModel):
     """Call sites of everything the diff changes (#601).
 
@@ -823,6 +831,13 @@ class CallSiteSection(BaseModel):
     note: str = ""
     entries: list[CallSiteEntry] = Field(default_factory=list)
     unparsed: list[str] = Field(default_factory=list)
+    # #1254: what the current machine review answered for each symbol only
+    # tests call. ``not_analysed`` / ``none_named`` / ``named`` never collapse
+    # into one another (#750); ``outcome`` is unreachable, cleared (with the
+    # call path the reviewer named) or silent.
+    only_tests_state: str = "not_analysed"
+    only_tests_summary: str = ""
+    only_tests: list[OnlyTestsOutcomeView] = Field(default_factory=list)
 
 
 class ACLocatorResolution(BaseModel):
@@ -1040,6 +1055,54 @@ class ReviewReport(BaseModel):
     diff_lines: int | None = None
     diff_note: str = ""
     machine_review: "MachineReviewView | None" = None
+
+
+class ReviewQueueRow(BaseModel):
+    """One submission in the review queue (#1334).
+
+    Every field is the brief's own answer, read by the brief's own functions
+    from stored facts — no diff, no fetch. ``sha_check`` rests on the tip the
+    hub last OBSERVED; without a fresh observation it is ``unknown`` with a
+    reason, never ``match``. ``findings_*`` are None when there is no current
+    report: "nobody reported" is not "zero findings" (#549).
+    """
+
+    task_id: int
+    title: str = ""
+    status: str = ""
+    submission_generation: int = 0
+    submission_sha: str = ""
+    sha_check: str = "unknown"
+    sha_check_reason: str = ""
+    # How long ago the tip behind ``sha_check`` was observed; None when the
+    # answer rests on no observation (then ``sha_check`` is ``unknown``).
+    tip_observed_minutes_ago: int | None = None
+    # none | in_flight | current | incomplete — the report of THIS generation.
+    report_status: str = "none"
+    # The brief's review_report.state verbatim: none | current | stale.
+    report_state: str = "none"
+    report_outcome: str = ""
+    findings_confirmed: int | None = None
+    findings_unresolved: int | None = None
+    review_in_flight: ReviewInFlight | None = None
+    generation_has_review: bool = False
+    generation_review_reason: str = ""
+    verdict: str | None = None
+    verdict_generation: int | None = None
+    verdict_is_current: bool = False
+    stall_reason: str = ""
+    stall_at: str = ""
+    waiting_since: str = ""
+    waiting_minutes: int | None = None
+    # ready | ready_sha_unverified | findings | awaiting_report | blocked.
+    readiness: str = "awaiting_report"
+
+
+class ReviewQueueView(BaseModel):
+    """The whole review queue, ordered by readiness (#1334)."""
+
+    rows: list[ReviewQueueRow] = Field(default_factory=list)
+    note: str = ""
 
 
 class ReviewCircleView(BaseModel):
