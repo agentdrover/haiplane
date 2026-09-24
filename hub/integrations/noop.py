@@ -808,6 +808,11 @@ class NoopForge:
     ) -> str:
         return ""
 
+    async def pr_for_merge_commit(
+        self, sha: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> dict[str, Any] | None:
+        raise RuntimeError("форж не настроен — провайдера спросить нельзя")
+
     async def merge_pr(
         self,
         pr_number: int,
