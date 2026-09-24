@@ -338,3 +338,73 @@ def test_cli_next_task_prints_the_answer() -> None:
     assert rc == 0
     mock_api.assert_called_once_with("GET", "/api/orchestrator/next?project=default")
     assert "Следующей взял бы #7." in out.getvalue()
+
+
+async def test_every_started_status_holds_areas_and_wip(db):
+    """Находка ревью (1): ci_check и needs_decision — начатая работа.
+
+    Их ветку ещё будут править или доставлять: область занята, слот WIP тоже.
+    Множество выведено из hub/models.py, а не перечислено руками.
+    """
+    from hub.models import ACTIVE_STATUSES, QUEUED_STATUSES
+
+    assert oq.STARTED_STATUSES == {s.value for s in ACTIVE_STATUSES - QUEUED_STATUSES}
+    assert {"claimed", "ci_check", "needs_decision", "pending_report"} <= (
+        oq.STARTED_STATUSES
+    )
+    assert not {"open", "draft", "completed"} & oq.STARTED_STATUSES
+
+    for status in ("ci_check", "needs_decision"):
+        project = await _project(db, f"oq-{status}", {"wip_limit": 2})
+        pid = int(project["id"])
+        holder = await _task(db, pid, status=status, areas=["hub/services/"])
+        overlapping = await _task(db, pid, areas=["hub/services/x.py"])
+        free = await _task(db, pid, areas=["hub/c.py"])
+
+        answer = await oq.next_task(db, project)
+
+        skip = _skip(answer, overlapping)
+        assert skip["reason"] == oq.SKIP_OVERLAP, status
+        assert skip["with_task_id"] == holder, status
+        assert answer["in_progress"] == [holder], status
+        assert answer["next_task_id"] == free, status
+
+        await _task(db, pid, status=status, areas=["docs/z.md"])
+        full = await oq.next_task(db, project)
+        assert full["wip_full"] is True, f"{status} держит слот WIP"
+
+
+async def test_an_undeclared_area_in_progress_blocks_the_candidate(db):
+    """Находка ревью (3): незнание с той стороны — не «не пересекается»."""
+    project = await _project(db, "oq-blind", {})
+    pid = int(project["id"])
+    blind = await _task(db, pid, status="running", areas=[])
+    candidate = await _task(db, pid, areas=["hub/c.py"])
+
+    answer = await oq.next_task(db, project)
+
+    assert answer["next_task_id"] is None
+    skip = _skip(answer, candidate)
+    assert skip["reason"] == oq.SKIP_ACTIVE_UNDECLARED
+    assert skip["with_task_ids"] == [blind]
+    assert f"#{blind}" in skip["detail"]
+    assert "не объявлена" in skip["detail"]
+
+
+async def test_project_status_names_a_failed_queue_read() -> None:
+    """Находка ревью (2): сбой чтения очереди назван, обзор не падает."""
+    from hub.mcp_server import HubApiError, hub_project_status
+
+    async def fake_get(path: str, **_kw):
+        if path.startswith("/api/orchestrator/next"):
+            raise HubApiError({"message": "очередь недоступна"})
+        return {}
+
+    with patch("hub.mcp_server._api_get", new=AsyncMock(side_effect=fake_get)):
+        out = await hub_project_status()
+
+    text = json.loads(out.content[0].text)["message"]
+    assert "Next Task: не удалось прочитать очередь" in text
+    assert "очередь недоступна" in text
+    assert out.structuredContent["orchestrator_queue"] == []
+    assert "очередь недоступна" in out.structuredContent["orchestrator_queue_error"]

@@ -15,9 +15,10 @@ F2 (#1365). До этой задачи порядок держала памят�
 * объявила ``affected_areas`` — пустая декларация не «ни с чем не
   пересекается», а «неизвестно с чем», и такой кандидат пропускается с
   причиной;
-* ни один её путь не пересекается с путями задач проекта в running/review.
+* ни один её путь не пересекается с путями начатых задач проекта
+  (``STARTED_STATUSES``), и у каждой из них области объявлены.
 
-И проект целиком — WIP (running + review) ниже ``wip_limit`` политики.
+И проект целиком — WIP (начатые задачи) ниже ``wip_limit`` политики.
 Порядок кандидатов: priority, затем position, затем id.
 
 Пересечение — префиксное, в ОБЕ стороны и по границе пути. В одну сторону
@@ -39,6 +40,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall
+from hub.models import ACTIVE_STATUSES, QUEUED_STATUSES
 from hub.services import project_policy
 from hub.services.delivery_state import with_cached_delivery
 
@@ -47,10 +49,20 @@ EVENT_NEXT_CANDIDATE = "orchestrator_next_candidate"
 SKIP_DEPENDENCY = "dependency_undelivered"
 SKIP_UNDECLARED = "area_undeclared"
 SKIP_OVERLAP = "area_overlap"
+SKIP_ACTIVE_UNDECLARED = "active_area_undeclared"
 
-#: Что занимает WIP и с чем сверяются области. Ровно то, что названо в
-#: постановке: задача в работе и задача, ждущая ревью.
-ACTIVE_STATUSES: tuple[str, ...] = ("running", "review")
+#: Что занимает WIP и с чем сверяются области — ВЫВЕДЕНО из hub/models.py,
+#: не перечислено руками (находка ревью #1274): живые статусы без очереди.
+#: Это все начатые и незавершённые задачи — claimed, running, ci_check,
+#: review, fix_requested, needs_info, needs_decision, pending_report. Ветку
+#: каждой из них ещё будут править или доставлять, значит её области заняты,
+#: и слот WIP она держит. needs_decision здесь по той же причине: решение
+#: человека не снимает ветку. Не занимают open (очередь, QUEUED_STATUSES),
+#: draft (не одобрена) и терминальные (FINAL_STATUSES). Статус, добавленный
+#: в TaskStatus позже, попадёт сюда вместе с ACTIVE_STATUSES.
+STARTED_STATUSES: frozenset[str] = frozenset(
+    s.value for s in ACTIVE_STATUSES - QUEUED_STATUSES
+)
 
 _PRIORITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
@@ -89,17 +101,20 @@ def _sort_key(task: dict[str, Any]) -> tuple[int, int, int]:
 async def _project_tasks(
     db: aiosqlite.Connection, project_id: int
 ) -> list[dict[str, Any]]:
-    """Живые задачи проекта в open/running/review.
+    """Живые задачи проекта: очередь (open) и начатые (STARTED_STATUSES).
 
     Принадлежность проекту — через ``resolve_project_for_task``, как у
     очереди review (#1264): поддерево теряет задачи, которые default держит
     по умолчанию, а они — большая часть его очереди.
     """
+    statuses = sorted({"open", *STARTED_STATUSES})
+    marks = ", ".join("?" for _ in statuses)
     rows = await fetchall(
         db,
         "SELECT id, title, status, task_type, priority, position, dor_passed, "
-        "affected_areas FROM tasks WHERE archived=0 "
-        "AND status IN ('open', 'running', 'review') ORDER BY id",
+        f"affected_areas FROM tasks WHERE archived=0 AND status IN ({marks}) "  # nosec B608 - placeholders only, values are params
+        "ORDER BY id",
+        tuple(statuses),
     )
     tasks: list[dict[str, Any]] = []
     for row in rows:
@@ -167,6 +182,17 @@ async def _skip_reason(
             "detail": "область не объявлена: affected_areas пусты, "
             "пересечение с работой в полёте не проверить",
         }
+    blind = [t for t in active if not t["areas"]]
+    if blind:
+        # Незнание с той стороны — не «не пересекается» (находка ревью #1274):
+        # задача в работе без объявленных областей может править что угодно.
+        listed = ", ".join(f"#{t['id']}" for t in blind)
+        return {
+            "task_id": task_id,
+            "reason": SKIP_ACTIVE_UNDECLARED,
+            "detail": f"область задачи в работе не объявлена: {listed}",
+            "with_task_ids": [int(t["id"]) for t in blind],
+        }
     hit = _first_overlap(candidate, active)
     if hit is not None:
         return {
@@ -203,7 +229,7 @@ async def next_task(db: aiosqlite.Connection, project: Any) -> dict[str, Any]:
     policy = project_policy.gate_policy_of(project)
     limit = project_policy.wip_limit_of(policy)
     tasks = await _project_tasks(db, int(project["id"]))
-    active = [t for t in tasks if t["status"] in ACTIVE_STATUSES]
+    active = [t for t in tasks if t["status"] in STARTED_STATUSES]
     candidates = sorted(
         (
             t
@@ -261,7 +287,7 @@ def _answer_key(answer: dict[str, Any]) -> dict[str, Any]:
             [
                 s["task_id"],
                 s["reason"],
-                s.get("with_task_id"),
+                s.get("with_task_id") or s.get("with_task_ids"),
                 s.get("path"),
                 [b["task_id"] for b in s.get("blockers", [])],
             ]
