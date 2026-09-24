@@ -960,8 +960,11 @@ _ENVIRONMENT_ATTEMPT_TAIL = (
 ENVIRONMENT_ATTEMPT_BLOCK = _ENVIRONMENT_ATTEMPT_HEAD + _ENVIRONMENT_ATTEMPT_TAIL
 
 # Команда, а не слово: «Docker» в чеклисте может описывать саму правку промпта.
+# У docker-compose после имени — пробел или конец: `\b` пропускал имя файла
+# docker-compose.yml и пакет docker-compose-v2 (ревью #1357, поколение 1).
 _CONTAINER_COMMAND = re.compile(
-    r"\bdocker(?:-compose\b|\s+(?:compose|build|buildx|run|info)\b)", re.IGNORECASE
+    r"\bdocker(?:-compose(?=\s|$)|\s+(?:compose|build|buildx|run|info)\b)",
+    re.IGNORECASE,
 )
 
 

@@ -11458,6 +11458,14 @@ def test_prompt_forbids_repo_changes_but_allows_tool_install(profile: str) -> No
     assert task_needs_container(
         {"validation_commands": None, "review_checklist": ["docker build ."]}
     )
+    # Имя файла и пакета — тоже не команда (ревью #1357, поколение 1).
+    for text in ("Не править docker-compose.yml", "пакет docker-compose-v2"):
+        assert not task_needs_container(
+            {"validation_commands": "[]", "review_checklist": json.dumps([text])}
+        ), text
+    assert task_needs_container(
+        {"validation_commands": json.dumps(["docker-compose up -d"])}
+    )
 
 
 async def test_dispatched_prompt_carries_docker_attempt_only_for_container_tasks(
