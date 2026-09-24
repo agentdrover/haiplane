@@ -650,15 +650,17 @@ AUTHOR_WORD = "СЛОВО АВТОРА"
 # Deliberately narrow: phrases an author uses to say a run was green. The hub's
 # own submission prose ("validation passed") must not match — a claim the hub
 # wrote is not the author's.
-_GREEN_CLAIM_PATTERNS = (
-    r"\brc\s*=\s*0\b",
-    r"\bexit(?:\s+code)?\s*[:=]?\s*0\b",
-    r"\b\d+\s+passed\b",
-    r"all checks passed",
-    r"зел[её]н",
-    r"\bgreen\b",
-)
-_CLAIM_RE = re.compile("|".join(_GREEN_CLAIM_PATTERNS), re.IGNORECASE)
+# Unambiguous exit statuses: a zero is a zero whatever surrounds it.
+_EXIT_ZERO_RE = re.compile(r"\brc\s*=\s*0\b|\bexit(?:\s+code)?\s*[:=]?\s*0\b", re.I)
+# A pytest tally counts only with a NONZERO passed and no failure in the same
+# clause: "0 passed, 3 failed" is a red run (finding 0caf1bf5c4c9dda8).
+_PASSED_COUNT_RE = re.compile(r"\b[1-9]\d*\s+passed\b", re.I)
+_ZERO_FAILURES_RE = re.compile(r"\b0\s+(?:failed|errors?)\b", re.I)
+_FAILURE_RE = re.compile(r"\b(?:failed|errors?)\b", re.I)
+# Phrases that read green only when nothing negates them before, in the same
+# clause: "Not all checks passed", "не зелёный", "no longer green".
+_GREEN_WORD_RE = re.compile(r"all checks passed|зел[её]н|\bgreen\b", re.I)
+_NEGATION_RE = re.compile(r"\b(?:not|no|не|нет)\b", re.I)
 _CLAUSE_SPLIT_RE = re.compile(r"[;\n]|\.\s")
 _MAX_CLAIMS = 5
 _MAX_CLAIM_LEN = 100
@@ -668,12 +670,22 @@ VALIDATION_FAILED = "failed"
 VALIDATION_NOT_RUN = "not_run"
 
 
+def _claims_green(clause: str) -> bool:
+    """Does this one clause say a run was green? Narrow on purpose (#1246)."""
+    if _EXIT_ZERO_RE.search(clause):
+        return True
+    if _PASSED_COUNT_RE.search(clause):
+        return not _FAILURE_RE.search(_ZERO_FAILURES_RE.sub("", clause))
+    green = _GREEN_WORD_RE.search(clause)
+    return bool(green) and not _NEGATION_RE.search(clause[: green.start()])
+
+
 def author_green_claims(text: str) -> list[str]:
     """The clauses of a submission text that claim a green run — his word."""
     out: list[str] = []
     for clause in _CLAUSE_SPLIT_RE.split(text or ""):
         clause = clause.strip()
-        if clause and _CLAIM_RE.search(clause) and clause not in out:
+        if clause and _claims_green(clause) and clause not in out:
             out.append(clause[:_MAX_CLAIM_LEN])
         if len(out) >= _MAX_CLAIMS:
             break
@@ -733,12 +745,26 @@ def validation_standing(prepass, submission_text: str):
 
 
 async def latest_submission_text(db, task_id: int) -> str:
-    """The latest submission's text: the newest done report, else status."""
+    """The text of the latest SUBMISSION — not the latest line in the feed.
+
+    Finding c5f04f6bc0d366a4: "newest done, else newest status" read the
+    hub's own "Кросс-модельное ревью вызвано хабом…", written right after
+    every pair submission, and the author's claim vanished from every surface.
+    A submission is the pair row (``SUBMISSION_UPDATE_PREFIX``) or a done
+    report the agent itself filed (``agent_claimed``; a passage the hub
+    transcribed is not the author's word, #1018). Whichever is newer wins:
+    a done report after APPROVED is the author speaking about the same work
+    again, and his latest word is the one to weigh.
+    """
     updates = [dict(u) for u in await repo_module.get_task_updates(db, task_id)]
-    for kind in ("done", "status"):
-        for u in reversed(updates):
-            if u.get("kind") == kind:
-                return str(u.get("content") or "")
+    for u in reversed(updates):
+        content = str(u.get("content") or "")
+        if u.get("kind") == "status" and content.startswith(
+            repo_module.SUBMISSION_UPDATE_PREFIX
+        ):
+            return content
+        if u.get("kind") == "done" and u.get("agent_claimed", 1) != 0:
+            return content
     return ""
 
 

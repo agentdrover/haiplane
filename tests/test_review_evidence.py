@@ -167,3 +167,117 @@ async def test_not_run_is_its_own_state(client: AsyncClient, db):
 
     claims = (await practice_metrics(db))["validation_claims"]
     assert (claims["discrepant"], claims["sample"], claims["not_run"]) == (0, 0, 1)
+
+
+# --- The real path: submission, then the dispatch note (#1246, round 2) -----
+#
+# Finding c5f04f6bc0d366a4: the submission text was read as "the newest done,
+# else the newest status". Right after a submission the hub writes its own
+# status — "Кросс-модельное ревью вызвано хабом…" — and every surface then
+# read the hub's line instead of the author's: no claims, no discrepancy, on
+# every production submission. The AC tests above built the prompt by hand
+# and never dispatched (7c096fa939f686f0), which is how it passed green.
+
+
+async def test_the_authors_claim_survives_the_dispatch_note(
+    client: AsyncClient, db, monkeypatch
+):
+    from hub.models import TaskRefine, TaskSubmitReview
+    from hub.services import lifecycle
+    from hub.services.ci_report import accept_ci_run_report
+    from hub.services.orchestration import practice_metrics
+    from hub.services.review_brief import build_review_brief
+    from hub.services.steward_applied import _commit_signal
+    from hub.integrations.registry import plugins
+    from tests.test_review_dispatch import (
+        _TIP,
+        _DispatchRecorder,
+        _node,
+        _PinnedGitOps,
+        _wire,
+    )
+    import json
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    pid = await repo.create_project(
+        db,
+        slug="claim-path",
+        name="Claim path",
+        repo_name="mrPDA/spike-repo",
+        workspace_path="/tmp/ws",
+    )
+    await repo.update_project(db, pid, gate_policy=json.dumps({"verdict": "auto"}))
+    epic = await _node(db, title="epic", task_type="epic", parent_id=None)
+    await repo.update_task(db, epic, project_id=pid)
+    feature = await _node(db, title="feature", task_type="feature", parent_id=epic)
+    task_id = await _node(db, title="probe", task_type="task", parent_id=feature)
+    await repo.add_task_update(db, task_id, "dev", "status", "Plan: work")
+    await repo.update_task_structured(
+        db, task_id, TaskRefine(affected_areas=["docs/notes.md"])
+    )
+    await db.commit()
+    plugins.git_ops = _PinnedGitOps(_TIP, ["docs/notes.md"])
+    await lifecycle.pair_start_task(db, task_id, caller="dev-agent")
+    # The prepass of #1168: lint and security green, the suite red.
+    await accept_ci_run_report(
+        db,
+        task_id,
+        head_sha=_TIP,
+        ac_results={},
+        checks={"lint": "pass", "security": "pass", "tests": "fail"},
+        reported_by="github-actions",
+    )
+
+    await lifecycle.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5", summary=_GREEN_CLAIM)
+    )
+
+    # The dispatch really happened, and wrote its note AFTER the submission.
+    assert len(recorder.calls) == 1
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert updates[-1]["content"].startswith("Кросс-модельное ревью вызвано хабом")
+
+    prompt = recorder.calls[0]["prompt_text"]
+    assert "СЛОВО АВТОРА" in prompt and "расходится" in prompt
+
+    brief = await build_review_brief(db, task_id)
+    assert brief.validation.state == "failed"
+    assert brief.validation.author_claims, "the author's claim must be found"
+    assert brief.validation.discrepancy is True
+    assert "расходится" in dict(_commit_signal(brief)).get(
+        "checks_ran_on_the_submitted_commit", ""
+    )
+    card = (await client.get(f"/tasks/{task_id}")).text
+    assert "СЛОВО АВТОРА" in card and "расходится" in card
+    claims = (await practice_metrics(db))["validation_claims"]
+    assert (claims["discrepant"], claims["sample"]) == (1, 1)
+
+
+# --- What counts as a green claim (finding 0caf1bf5c4c9dda8) ----------------
+
+_CLAIM_TABLE = {
+    "0 passed, 3 failed": False,
+    "12 passed, 1 failed": False,
+    "5 passed, 2 errors": False,
+    "Not all checks passed": False,
+    "не все проверки: All checks passed не вышло": False,
+    "не зелёный": False,
+    "not green": False,
+    "CI is no longer green": False,
+    "4210 passed": True,
+    "4210 passed in 99s": True,
+    "rc=0": True,
+    "всё зелёное": True,
+    "ruff: All checks passed!": True,
+    "green on CI": True,
+}
+
+
+def test_a_negated_or_failed_run_is_not_a_green_claim():
+    wrong = {
+        text: expected
+        for text, expected in _CLAIM_TABLE.items()
+        if bool(review_evidence.author_green_claims(text)) is not expected
+    }
+    assert not wrong, f"misclassified (text → expected claim): {wrong}"
