@@ -551,3 +551,188 @@ async def test_the_watchdog_says_precision_is_uncomputable_when_nothing_is_judge
     )
     line = dict(rows[-1])["summary"]
     assert "Ни одной диспозиции нет, поэтому precision не считается вовсе." in line
+
+
+# --- #1244: a live check that names a finding closes it — by another hand ---
+#
+# Pair-start in ``_task_with_report`` runs as ``dev`` with no principal, so the
+# author's principal is written straight onto the row: the rule compares
+# principals, never agent names, and a test that left it empty would be testing
+# the "author unknown" branch instead of the author.
+_AUTHOR_PID = 7
+_OTHER_PID = 8
+
+
+async def _observe(
+    db,
+    task_id: int,
+    *,
+    observation: str,
+    recorded_by: int | None,
+    at: str,
+    agent: str = "someone",
+    outcome: str = "done",
+) -> int:
+    from hub import repository as repo_module
+
+    check_id = await repo_module.insert_live_check(
+        db,
+        task_id=task_id,
+        sha="",
+        outcome=outcome,
+        probe="GET /v1/agents",
+        observation=observation,
+        recorded_by=recorded_by,
+        recorded_agent=agent,
+    )
+    await db.execute(
+        "UPDATE live_checks SET created_at = ? WHERE id = ?", (at, check_id)
+    )
+    await db.commit()
+    return check_id
+
+
+async def _observed_task(client: AsyncClient, db) -> tuple[int, int, str]:
+    """A task with a report dated 12:00 and an author with a principal."""
+    task_id, review_id = await _task_with_report(client, db)
+    await db.execute(
+        "UPDATE tasks SET implementer_principal_id = ? WHERE id = ?",
+        (_AUTHOR_PID, task_id),
+    )
+    await db.execute(
+        "UPDATE machine_reviews SET created_at = '2026-09-09 12:00:00' WHERE id = ?",
+        (review_id,),
+    )
+    await db.commit()
+    return task_id, review_id, finding_uids(_FINDINGS)[1]
+
+
+async def _brief_report(db, task_id: int):
+    from hub.services.review_brief import build_review_brief
+
+    brief = await build_review_brief(db, task_id)
+    assert brief is not None and brief.review_report is not None
+    return brief.review_report.machine_review
+
+
+async def test_an_observation_closes_the_finding_it_names(client: AsyncClient, db):
+    from hub import repository as repo_module
+    from hub.services.review_evidence import undisposed_confirmed
+
+    task_id, review_id, uid = await _observed_task(client, db)
+    stored_before = dict(await repo_module.get_machine_review(db, review_id))
+    check_id = await _observe(
+        db,
+        task_id,
+        observation=f"находка {uid}: 50 агентов, имя совпало посимвольно",
+        recorded_by=_OTHER_PID,
+        at="2026-09-09 13:00:00",
+    )
+
+    mr = await _brief_report(db, task_id)
+
+    closures = {c.finding_uid: c for c in mr.observation_closures}
+    assert set(closures) == {uid}
+    assert closures[uid].live_check_id == check_id
+    # It does not stand in the way of approval: only the other finding is
+    # still unanswered.
+    assert undisposed_confirmed(mr) == (2, 1)
+    # The report itself stays what it was: the finding is still listed, and
+    # the stored row is untouched.
+    assert [f.finding_uid for f in mr.findings_confirmed] == finding_uids(_FINDINGS)
+    assert dict(await repo_module.get_machine_review(db, review_id)) == stored_before
+
+
+async def test_the_author_cannot_close_their_own_finding(client: AsyncClient, db):
+    from hub.services.review_evidence import undisposed_confirmed
+
+    task_id, _, uid = await _observed_task(client, db)
+    # Named, later, done — everything right except the hand. A different
+    # agent NAME on purpose: every executor of one principal shares it, so
+    # the name must not be what lets this through.
+    await _observe(
+        db,
+        task_id,
+        observation=f"находка {uid} опровергнута: всё совпало",
+        recorded_by=_AUTHOR_PID,
+        at="2026-09-09 13:00:00",
+        agent="not-the-assigned-agent",
+    )
+
+    mr = await _brief_report(db, task_id)
+
+    assert mr.observation_closures == []
+    assert undisposed_confirmed(mr) == (2, 2)
+
+
+async def test_only_a_named_and_later_observation_counts(client: AsyncClient, db):
+    from hub.services.review_evidence import undisposed_confirmed
+
+    task_id, _, uid = await _observed_task(client, db)
+    # Later and foreign, but names only the topic — the title word for word.
+    await _observe(
+        db,
+        task_id,
+        observation="race on retry: не воспроизводится, hub/b.py чист",
+        recorded_by=_OTHER_PID,
+        at="2026-09-09 13:00:00",
+    )
+    # Named and foreign, but recorded BEFORE the report existed.
+    await _observe(
+        db,
+        task_id,
+        observation=f"находка {uid}: всё совпало",
+        recorded_by=_OTHER_PID,
+        at="2026-09-09 11:00:00",
+    )
+    # A longer hex run that merely contains the id is not the id.
+    await _observe(
+        db,
+        task_id,
+        observation=f"коммит {uid}abcd0123",
+        recorded_by=_OTHER_PID,
+        at="2026-09-09 13:00:00",
+    )
+
+    mr = await _brief_report(db, task_id)
+
+    assert mr.observation_closures == []
+    assert undisposed_confirmed(mr) == (2, 2)
+
+
+async def test_only_the_hubs_own_probe_counts_as_the_hubs_hand(client: AsyncClient, db):
+    from hub import repository as repo_module
+    from hub.services.live_probe import PROBES
+
+    task_id, _, uid = await _observed_task(client, db)
+    # No principal and the name "hub", but a probe text the registry does not
+    # hold: a name anyone can take is not the hub's hand.
+    await _observe(
+        db,
+        task_id,
+        observation=f"находка {uid}: всё совпало",
+        recorded_by=None,
+        at="2026-09-09 13:00:00",
+        agent="hub",
+    )
+    assert (await _brief_report(db, task_id)).observation_closures == []
+
+    check_id = await repo_module.insert_live_check(
+        db,
+        task_id=task_id,
+        sha="",
+        outcome="done",
+        probe=PROBES["review_agent_name_roundtrip"].call,
+        observation=f"находка {uid}: 50 агентов, имя совпало",
+        recorded_by=None,
+        recorded_agent="hub",
+    )
+    await db.execute(
+        "UPDATE live_checks SET created_at = '2026-09-09 14:00:00' WHERE id = ?",
+        (check_id,),
+    )
+    await db.commit()
+    closures = (await _brief_report(db, task_id)).observation_closures
+    assert [(c.finding_uid, c.live_check_id, c.hand) for c in closures] == [
+        (uid, check_id, "hub")
+    ]
