@@ -65,6 +65,7 @@ from hub.models import (
     TaskApprove,
     TaskCreate,
     TaskDecide,
+    TaskReturnToWork,
     TaskForceComplete,
     TaskReject,
     TaskReviewVerdict,
@@ -3128,6 +3129,27 @@ async def web_force_complete_task(
     reason = request.headers.get("HX-Prompt", "") or comment
     body = TaskForceComplete(comment=reason) if reason else None
     await services.force_complete_task(_db(request), task_id, body)
+    if _is_htmx(request):
+        return await _htmx_task_done_fragment(request, task_id)
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
+@router.post("/tasks/{task_id}/web-return-to-work")
+async def web_return_to_work(
+    task_id: int,
+    request: Request,
+    reason: str = Form(""),
+    abandon_active_job: bool = Form(False),
+):
+    """The task page's "return to work" button (#1356): same service as REST."""
+    _require_human_web(request)
+    try:
+        body = TaskReturnToWork(reason=reason, abandon_active_job=abandon_active_job)
+    except ValidationError as exc:
+        raise HTTPException(422, _invalid_fields_detail(exc)) from exc
+    await services.return_to_work(
+        _db(request), task_id, body, actor=current_identity(request).username
+    )
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)

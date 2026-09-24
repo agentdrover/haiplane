@@ -33,7 +33,7 @@ from typing import Any, NamedTuple
 
 import aiosqlite
 
-from hub.db import fetchall
+from hub.db import deserialize_str_list, fetchall
 from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
@@ -911,7 +911,7 @@ REPORT_BLOCK_INSTRUCTION = (
 # Обещаний про среду провайдера здесь нет — только порядок попыток и
 # требование назвать отказ отказом, если ни одна не сработала. Сработает ли
 # он, покажет счётчик отказов среды, а не этот комментарий.
-ENVIRONMENT_ATTEMPT_BLOCK = (
+_ENVIRONMENT_ATTEMPT_HEAD = (
     "ЧЕМ СМОТРЕТЬ — СНАЧАЛА ПОПРОБУЙ, ПОТОМ ЗАЯВЛЯЙ ОТКАЗ.\n"
     "Тесты: `uv run pytest -q`; нет uv — `python -m pytest -q`; нет pytest — "
     "`python -m pip install -q pytest` и повтори. Код возврата смотри "
@@ -920,11 +920,68 @@ ENVIRONMENT_ATTEMPT_BLOCK = (
     "`git fetch origin <база>` и сравнивай с `origin/<база>`. Взять ДРУГОЙ "
     "диапазон — значит судить о другом наборе изменений; если пришлось, "
     "скажи об этом прямо.\n"
+)
+
+# #1357. Ревью PR haiplane#442 (#1336) сдало холодный старт, healthz и базу
+# без демо-сида как «no Docker daemon»: демона в снимке среды нет, а блок выше
+# учил ставить только pytest. Проба в облаке Cursor 24.09: sudo без пароля,
+# docker.io и docker-compose-v2 ставятся из apt, dockerd отвечает за секунду
+# без обходов. И ловушка той же пробы: в среде уже крутился хаб на 8080,
+# контейнер упал на bind, а curl /healthz ответил «ok» — от хостового
+# процесса. Отсюда правило про состояние контейнера и переназначение порта.
+#
+# Абзац идёт только задачам, чьи проверки сами про контейнер: обычному
+# Python-диффу установка демона — минуты оплаченного прогона ни за что.
+_ENVIRONMENT_CONTAINER_ATTEMPT = (
+    "Контейнер: проверки этой задачи требуют Docker. Нет команды `docker` "
+    "или `docker info` не отвечает — это ещё не отказ среды: подними демон "
+    "во временной машине, файлы репозитория не трогай. На Ubuntu: "
+    "`sudo apt-get update && sudo apt-get install -y docker.io "
+    "docker-compose-v2`, затем `sudo dockerd > /tmp/dockerd.log 2>&1 &` и "
+    "жди, пока `sudo docker info` не ответит; не встал — один повтор с "
+    "`--iptables=false --bridge=none`. Дальше выполняй команды задачи через "
+    "sudo.\n"
+    "Порт может быть занят процессом самой машины, и тогда на запрос "
+    "отвечает он, а не контейнер. Ответ засчитывай, только когда "
+    "`sudo docker compose ps` показывает контейнер в состоянии running; "
+    "занятый порт переназначь отдельным override-файлом вне репозитория "
+    '(`ports: !override ["<свободный>:<порт>"]`).\n'
+    "Не вышло — назови в lost_dimensions шаг, на котором остановилось: нет "
+    "sudo, пакет не встал, dockerd не стартовал, контейнер не поднялся.\n"
+)
+
+_ENVIRONMENT_ATTEMPT_TAIL = (
     "Если после попыток измерение так и не сделано — incomplete=true и "
     'incomplete_reason="environment", а в lost_dimensions перечисли, чего '
     "именно не хватило. Чтение кода вместо прогона тестов прогоном не "
     "называется.\n\n"
 )
+
+ENVIRONMENT_ATTEMPT_BLOCK = _ENVIRONMENT_ATTEMPT_HEAD + _ENVIRONMENT_ATTEMPT_TAIL
+
+# Команда, а не слово: «Docker» в чеклисте может описывать саму правку промпта.
+# У docker-compose после имени — пробел или конец: `\b` пропускал имя файла
+# docker-compose.yml и пакет docker-compose-v2 (ревью #1357, поколение 1).
+_CONTAINER_COMMAND = re.compile(
+    r"\bdocker(?:-compose(?=\s|$)|\s+(?:compose|build|buildx|run|info)\b)",
+    re.IGNORECASE,
+)
+
+
+def task_needs_container(task: dict[str, Any]) -> bool:
+    """Требуют ли проверки задачи Docker: validation_commands или чеклист (#1357)."""
+    for field in ("validation_commands", "review_checklist"):
+        raw = task.get(field)
+        items = raw if isinstance(raw, list) else deserialize_str_list(raw)
+        if any(_CONTAINER_COMMAND.search(str(item)) for item in items):
+            return True
+    return False
+
+
+def environment_attempt_block(needs_container: bool) -> str:
+    """Порядок попыток до «среда отказала»; абзац про Docker — по требованию."""
+    middle = _ENVIRONMENT_CONTAINER_ATTEMPT if needs_container else ""
+    return _ENVIRONMENT_ATTEMPT_HEAD + middle + _ENVIRONMENT_ATTEMPT_TAIL
 
 
 def _delivery_block(task_id: int, code: str, base_url: str) -> str:
@@ -969,11 +1026,16 @@ def _review_prompt(
     prepass_block: str,
     delivery_block: str = "",
     only_tests_block: str = "",
+    needs_container: bool = False,
 ) -> str:
     common = (
         f"Ты — независимый код-ревьюер задачи #{task_id} хаба Haiplane "
         f"(ветка {branch}). Строгие правила: НИЧЕГО не коммить, не пушить и "
-        "не менять — только читать код и запускать проверки.\n\n"
+        "не менять в файлах репозитория — только читать код и запускать "
+        # #1357: «не менять» читалось как запрет трогать машину, хотя блок
+        # попыток #1238 и так велит ставить pytest. Граница — репозиторий.
+        "проверки. Поставить во временную машину недостающий инструмент — "
+        "не правка репозитория, а часть проверки.\n\n"
         # The rules travel with BOTH profiles: the expensive harness has no
         # more knowledge of this repository's history than the cheap pass.
         f"{rules_block}\n\n"
@@ -989,7 +1051,7 @@ def _review_prompt(
         # #1238: and the order of attempts before "the environment refused".
         # Both profiles get it: the deep harness lost the test dimension on
         # exactly the same missing tool as a cheap one would.
-        + ENVIRONMENT_ATTEMPT_BLOCK
+        + environment_attempt_block(needs_container)
         # #1036: the report has to survive a run with no MCP. Since 22.08 the
         # hub's MCP stopped reaching cloud runs at all — the reviewer works,
         # finishes, and its findings die in the final text nobody parses. So
@@ -1750,6 +1812,7 @@ async def prepare_review_order(
             review_evidence.prepass_block(prepass),
             _delivery_block(task_id, code, hub_base),
             call_sites.only_tests_block(only_tests),
+            needs_container=task_needs_container(task),
         ),
         rules_note=rules_note,
         diff_note=diff_note,

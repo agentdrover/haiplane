@@ -638,6 +638,16 @@ def cmd_decide(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_return_to_work(args: argparse.Namespace) -> int:
+    """Human-only: return an abandoned review/fix_requested task to open (#1356)."""
+    body: dict[str, Any] = {"reason": args.reason}
+    if getattr(args, "abandon_active_job", False):
+        body["abandon_active_job"] = True
+    result = _api("POST", f"/api/tasks/{args.task_id}/return-to-work", body)
+    _print_json(result)
+    return 0
+
+
 def cmd_force_complete(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {"comment": args.message or ""}
     result = _api("POST", f"/api/tasks/{args.task_id}/force-complete", body)
@@ -1949,6 +1959,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also persist the decision through the notes integration",
     )
     p_decide.set_defaults(func=cmd_decide)
+
+    # return-to-work — human return of an abandoned submission (#1356)
+    p_return = sub.add_parser(
+        "return-to-work",
+        help=(
+            "Human-only: return a review/fix_requested task to open — closes the "
+            "current approval like rework, takes the claim off, keeps branch/PR"
+        ),
+    )
+    p_return.add_argument("task_id", type=int)
+    p_return.add_argument(
+        "--reason", required=True, help="Why the task goes back to work (recorded)"
+    )
+    p_return.add_argument(
+        "--abandon-active-job",
+        dest="abandon_active_job",
+        action="store_true",
+        help=(
+            "Drop a dispatch job the registry still calls active (a dead "
+            "executor's job stays 'running'); without it such a task is a 409. "
+            "The process is not killed, only unlinked from the task"
+        ),
+    )
+    p_return.set_defaults(func=cmd_return_to_work)
 
     # force-complete — human override of the completion gate
     p_force_complete = sub.add_parser(
