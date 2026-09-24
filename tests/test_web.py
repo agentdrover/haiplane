@@ -6941,3 +6941,82 @@ async def test_web_decide_names_the_field_that_failed(client: AsyncClient, db):
     )
     assert resp.status_code == 400
     assert "pr_disposition" in resp.json()["detail"]
+
+
+# ---- #1356: кнопка «вернуть в работу» на странице задачи ----
+
+
+async def test_return_to_work_button_on_the_task_page(client: AsyncClient, db):
+    # AC-4: кнопка есть в review (доска ревью) и в fix_requested (карточка
+    # действий), причина обязательна в самой форме, и нажатие зовёт тот же
+    # сервис, что REST: задача в open, захват снят, в ленте причина.
+    task_id = await _web_task_in_review(client)
+    await repo.update_task(db, task_id, claimed_by="agent-a", claim_session_id="sess-a")
+    await db.commit()
+    action = f'action="/tasks/{task_id}/web-return-to-work"'
+
+    page = (await client.get(f"/tasks/{task_id}")).text
+    assert action in page, "в review кнопка на доске ревью"
+    form = page[page.index(action) :]
+    form = form[: form.index("</form>")]
+    assert 'name="reason"' in form and "required" in form, (
+        "причина обязательна уже в форме"
+    )
+
+    await repo.update_task(db, task_id, status="fix_requested")
+    await db.commit()
+    page = (await client.get(f"/tasks/{task_id}")).text
+    assert action in page, "в fix_requested кнопка в карточке действий"
+
+    await repo.update_task(db, task_id, status="running")
+    await db.commit()
+    page = (await client.get(f"/tasks/{task_id}")).text
+    assert action not in page, "из running возврата нет — нет и кнопки"
+
+    await repo.update_task(db, task_id, status="review")
+    await db.commit()
+    resp = await client.post(
+        f"/tasks/{task_id}/web-return-to-work",
+        data={"reason": "Держатель молчит"},
+        follow_redirects=False,
+    )
+    assert resp.status_code in (200, 303), resp.text
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert data["status"] == "open"
+    assert data["claimed_by"] is None
+    assert any(
+        "Возвращена в работу" in (u["content"] or "")
+        and "Держатель молчит" in (u["content"] or "")
+        for u in data["updates"]
+    )
+
+
+async def test_web_return_to_work_rejects_agent_token(
+    client: AsyncClient, db, monkeypatch
+):
+    from hub import config
+    from hub.config import TokenIdentity
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-token": TokenIdentity("bot", "agent"),
+            "human-token": TokenIdentity("denis", "human"),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human = {"Authorization": "Bearer human-token"}
+    resp = await client.post("/api/tasks", json={"title": "Web return"}, headers=human)
+    task_id = resp.json()["id"]
+    await repo.update_task(db, task_id, status="review", claimed_by="bot")
+    await db.commit()
+
+    resp = await client.post(
+        f"/tasks/{task_id}/web-return-to-work",
+        data={"reason": "перехват"},
+        headers={"Authorization": "Bearer agent-token"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 403
+    assert (await repo.get_task(db, task_id))["status"] == "review"

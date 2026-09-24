@@ -769,6 +769,28 @@ def test_cmd_decide_rework_with_summary() -> None:
     )
 
 
+def test_return_to_work_command_calls_the_rest_action() -> None:
+    # AC-4 (#1356): CLI — обёртка над тем же REST-действием, что и кнопка.
+    result = {"id": 1241, "status": "open"}
+    mock_api = MagicMock(return_value=result)
+    args = argparse.Namespace(task_id=1241, reason="Держатель молчит с 17.09")
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_return_to_work(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/1241/return-to-work",
+        {"reason": "Держатель молчит с 17.09"},
+    )
+
+    parser = cli.build_parser()
+    parsed = parser.parse_args(["return-to-work", "1241", "--reason", "пропал"])
+    assert parsed.func is cli.cmd_return_to_work
+    assert parsed.task_id == 1241 and parsed.reason == "пропал"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["return-to-work", "1241"])  # причина обязательна
+
+
 def test_cmd_decide_without_summary() -> None:
     result = {"id": 12, "status": "completed"}
     mock_api = MagicMock(return_value=result)

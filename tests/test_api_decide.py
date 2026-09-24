@@ -226,3 +226,342 @@ async def test_a_resubmission_supersedes_the_rework_closure(
         latest_review_freshness(latest["is_current"], latest["closed_by_decision"])
         == "stale — work resubmitted"
     ), "после пересдачи причина именно такая"
+
+
+# ---- #1356: вернуть в работу сдачу, чей исполнитель пропал ----
+#
+# 23.09.2026: #1241 стоит в review с подтверждённой находкой, держатель —
+# облачная сессия 17.09, и hub_claim_task отвечает 400 «can only claim open
+# tasks». Из review и fix_requested не было пути ни в open, ни к другому
+# исполнителю — даже решением человека.
+
+
+def _return_tokens() -> dict:
+    from hub.config import TokenIdentity
+
+    return {
+        # A — ушедший держатель, под своим принципалом.
+        "a-token": TokenIdentity("agent-a", "agent", principal_id=7),
+        # B — преемник: агентский токен без принципала. Так видно, остался ли
+        # на задаче принципал A: у B нечем его перезаписать.
+        "b-token": TokenIdentity("agent-b", "agent"),
+        "human-token": TokenIdentity("denis", "human"),
+    }
+
+
+_HUMAN = {"Authorization": "Bearer human-token"}
+_AGENT_A = {"Authorization": "Bearer a-token"}
+_AGENT_B = {"Authorization": "Bearer b-token"}
+
+
+async def _abandoned_review(db: aiosqlite.Connection, *, approved: bool = True) -> int:
+    """Сдача в review у агента A (сессия S, принципал 7); одобрена по желанию."""
+    if approved:
+        task_id = await _approved_pair_task(db)
+    else:
+        task_id = await _changes_requested_pair_task(db)
+    await repo.update_task(
+        db,
+        task_id,
+        status="review",
+        claimed_by="agent-a",
+        claim_session_id="sess-a",
+        claimed_at="2026-09-17T10:00:00+00:00",
+        implementer_principal_id=7,
+        assigned_agent="agent-a",
+        branch=f"task-{task_id}/return-review-to-work",
+    )
+    await db.commit()
+    return task_id
+
+
+async def test_a_human_returns_an_abandoned_review_to_open(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-1: статус open, захват снят, окно одобрения закрыто, гейт не
+    # доставляет, лента называет кто/почему/у кого; ветка, PR и sha прежние.
+    from hub import config
+    from hub.poller import _sweep_pair_delivery
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _return_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    g = _git()
+    task_id = await _abandoned_review(db)
+    before = dict(await repo.get_task(db, task_id))
+    assert before["review_verdict"] == "approved"
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/return-to-work",
+        json={"reason": "Держатель молчит с 17.09, находка ждёт с 06:35."},
+        headers=_HUMAN,
+    )
+    assert resp.status_code == 200, resp.text
+    card = resp.json()
+    assert card["status"] == "open"
+    assert card["claimed_by"] is None
+    assert card["claim_session_id"] is None
+    assert card["claimed_at"] is None
+    assert card["review_approved_current"] is False, (
+        "одобрение отозванной работы не может оставаться текущим"
+    )
+    assert card["review_cycle"] == 0
+
+    after = dict(await repo.get_task(db, task_id))
+    assert after["implementer_principal_id"] is None, (
+        "принципал A снят вместе с захватом"
+    )
+    assert after["branch"] == before["branch"], "ветка остаётся"
+    assert after["pr_number"] == before["pr_number"] == 77, "PR остаётся"
+    assert after["submission_sha"] == before["submission_sha"], "sha сдачи остаётся"
+    assert after["submission_generation"] == before["submission_generation"]
+    assert after["review_verdict"] == "approved", "вердикт остаётся историей"
+
+    feed = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    returned = [u for u in feed if "Возвращена в работу" in (u.get("content") or "")]
+    assert returned, f"лента обязана назвать возврат: {feed}"
+    text = returned[-1]["content"]
+    assert returned[-1]["agent"] == "denis", "кто вернул — из токена"
+    assert "Держатель молчит с 17.09" in text, "почему"
+    assert "agent-a" in text and "sess-a" in text and "7" in text, (
+        f"у кого был захват: имя, сессия, принципал — {text}"
+    )
+    closed = " ".join(u.get("content") or "" for u in feed)
+    assert "Одобрение ревью" in closed and "закрыто" in closed, (
+        "закрытое одобрение названо тем же текстом, что у rework"
+    )
+
+    events = [
+        dict(e)
+        for e in await repo.list_events(db, since=0)
+        if e["kind"] == "task_returned_to_work" and e["task_id"] == task_id
+    ]
+    assert events, "возврат — событие, а не только строка ленты"
+    assert '"closed_verdict_generation": 1' in events[-1]["payload"]
+
+    # Гейт доставки: даже если задачу снова поставят в running без пересдачи,
+    # закрытое одобрение ничего не везёт.
+    await repo.update_task(db, task_id, status="running")
+    await db.commit()
+    await _sweep_pair_delivery(db)
+    assert g.merge_pr.await_count == 0, "одобрение отозванной работы не доставляется"
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+
+
+async def test_another_agent_resubmits_a_returned_task(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-2: B берёт задачу штатно — claim, pair_start(remote, тот же slug),
+    # пересдача — и получает следующее поколение с заказом ревью. Бывший
+    # держатель A после этого — посторонний: его вердикт не саморевью.
+    from hub import config
+    from hub.services import review_dispatch
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _return_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.setattr(config, "REVIEW_SELF_APPROVE", "forbid")
+    _git()
+    task_id = await _abandoned_review(db)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "agent-b", "session_id": "sess-b"},
+        headers=_AGENT_B,
+    )
+    assert resp.status_code == 400, "до возврата задача в review не берётся"
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/return-to-work",
+        json={"reason": "Исполнитель пропал"},
+        headers=_HUMAN,
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/claim",
+        json={"agent": "agent-b", "session_id": "sess-b"},
+        headers=_AGENT_B,
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={
+            "assigned_agent": "agent-b",
+            "session_id": "sess-b",
+            "git_mode": "remote",
+            "branch_slug": "return-review-to-work",
+        },
+        headers=_AGENT_B,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "running"
+    assert resp.json()["branch"] == f"task-{task_id}/return-review-to-work"
+
+    dispatched: list[int] = []
+
+    async def _spy(db_, task_id_, **kwargs):
+        dispatched.append(task_id_)
+        return False
+
+    monkeypatch.setattr(review_dispatch, "maybe_dispatch_review", _spy)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={"agent": "agent-b", "model": "claude-opus-5.5"},
+        headers=_AGENT_B,
+    )
+    assert resp.status_code == 200, resp.text
+    card = resp.json()
+    assert card["status"] == "review"
+    assert card["submission_generation"] == 2, "следующее поколение"
+    assert dispatched == [task_id], "пересдача заказывает ревью"
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["implementer_principal_id"] != 7, (
+        "работу B нельзя записывать на принципал A"
+    )
+    # Бывший держатель теперь посторонний этой сдаче: владелец под тем же
+    # токеном (#1241) не должен упираться в запрет саморевью.
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "agent": "agent-a"},
+        headers=_AGENT_A,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["review_approved_current"] is True
+
+
+async def test_returning_to_work_is_human_only_and_status_bound(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-3: агент — 403, без причины — 422, чужой статус — 400; задача не
+    # меняется ни в одном из отказов. Работает из review И из fix_requested.
+    from hub import config
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _return_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    _git()
+    task_id = await _abandoned_review(db)
+    snapshot = dict(await repo.get_task(db, task_id))
+
+    async def _unchanged() -> None:
+        now = dict(await repo.get_task(db, task_id))
+        for field in (
+            "status",
+            "claimed_by",
+            "claim_session_id",
+            "implementer_principal_id",
+            "review_verdict_closed_generation",
+        ):
+            assert now[field] == snapshot[field], field
+
+    for headers in (_AGENT_A, _AGENT_B):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/return-to-work",
+            json={"reason": "перехват"},
+            headers=headers,
+        )
+        assert resp.status_code == 403, resp.text
+        await _unchanged()
+
+    for body in ({}, {"reason": ""}, {"reason": "   "}):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/return-to-work", json=body, headers=_HUMAN
+        )
+        assert resp.status_code == 422, (body, resp.text)
+        await _unchanged()
+
+    for status in ("open", "running", "needs_decision", "completed", "claimed"):
+        await repo.update_task(db, task_id, status=status)
+        await db.commit()
+        snapshot["status"] = status
+        resp = await client.post(
+            f"/api/tasks/{task_id}/return-to-work",
+            json={"reason": "не отсюда"},
+            headers=_HUMAN,
+        )
+        assert resp.status_code == 400, (status, resp.text)
+        await _unchanged()
+
+    await repo.update_task(db, task_id, status="fix_requested")
+    await db.commit()
+    resp = await client.post(
+        f"/api/tasks/{task_id}/return-to-work",
+        json={"reason": "из fix_requested тоже"},
+        headers=_HUMAN,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "open"
+    assert resp.json()["claimed_by"] is None
+
+
+async def test_return_to_work_loses_the_race_to_the_delivery_gate(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # Гонка из рисков: сервис прочёл задачу в review, а гейт доставки в это
+    # время уже увёл её (доставил и завершил). Переход обязан проверить
+    # статус В ЗАПИСИ: возврат получает 409 и не трогает ничего — ни статус
+    # доставленной задачи, ни захват, ни окно одобрения.
+    _git()
+    task_id = await _abandoned_review(db)
+    stale = await repo.get_task(db, task_id)
+    await repo.update_task(db, task_id, status="completed")
+    await db.commit()
+
+    real_get_task = repo.get_task
+    served = {"stale": False}
+
+    async def _stale_first(db_, tid):
+        if tid == task_id and not served["stale"]:
+            served["stale"] = True
+            return stale
+        return await real_get_task(db_, tid)
+
+    monkeypatch.setattr(repo, "get_task", _stale_first)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/return-to-work", json={"reason": "гонка"}
+    )
+    assert served["stale"], "сервис должен был прочесть устаревший снимок"
+    assert resp.status_code == 409, resp.text
+
+    task = dict(await real_get_task(db, task_id))
+    assert task["status"] == "completed", "доставленная задача не возвращается в open"
+    assert task["claimed_by"] == "agent-a", "захват не снят проигравшим возвратом"
+    assert task["implementer_principal_id"] == 7
+    assert task["review_verdict_closed_generation"] in (None, 0), (
+        "окно одобрения не закрыто проигравшим возвратом"
+    )
+    feed = " ".join(
+        dict(u).get("content") or "" for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "Возвращена в работу" not in feed
+
+
+async def test_a_late_machine_review_lands_on_a_returned_task_without_approving_it(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # Риск «ревью, уже заказанное по сдаче, отчитается задаче в open». Приём
+    # отчёта статус не проверяет: отчёт ложится на то же поколение как
+    # свидетельство о той же сдаче. Но всё, что из отчёта СЛЕДУЕТ —
+    # автовердикт, лестница профилей, — спрашивает status == review, и задача
+    # в open остаётся без одобрения. Без возврата тот же отчёт одобряет
+    # (test_auto_verdict::test_clean_submission_gets_policy_approved).
+    from hub import config
+    from tests.test_auto_verdict import _post_review, _submitted_task
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(client, db, "late-report", {"verdict": "auto"})
+    resp = await client.post(
+        f"/api/tasks/{task_id}/return-to-work", json={"reason": "исполнитель пропал"}
+    )
+    assert resp.status_code == 200, resp.text
+
+    await _post_review(client, task_id)
+
+    card = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert card["status"] == "open", "отчёт не двигает возвращённую задачу"
+    assert card["review_verdict"] is None, "автовердикт не выдан задаче в open"
+    assert card["review_approved_current"] is False
+    rows = await db.execute_fetchall(
+        "SELECT submission_generation FROM machine_reviews WHERE task_id=?",
+        (task_id,),
+    )
+    assert [r[0] for r in rows] == [1], "отчёт сохранён за той сдачей, которую читал"
