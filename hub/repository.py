@@ -8,6 +8,7 @@ No Pydantic models, no business logic.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from typing import Any
 from urllib.parse import urlencode
 
@@ -2658,8 +2659,12 @@ async def create_review_dispatch(
     channel: str = "cloud",
     replaces_dispatch_id: int | None = None,
     second_door_reason: str = "",
+    only_tests: Sequence[str] | None = None,
 ) -> int:
     """Insert a review-dispatch row (#757, #1180, #1252, #1266).
+
+    ``only_tests`` (#1254) — the symbols this order named to the reviewer;
+    None when the call-site walk did not run for it.
 
     ``replaces_dispatch_id`` is set ONLY when this row is the second door's
     local replacement of an earlier failed order of the SAME rung — it marks
@@ -2673,8 +2678,8 @@ async def create_review_dispatch(
         "INSERT INTO review_dispatches "
         "(task_id, submission_generation, agent_id, run_id, model, profile, "
         "reviewer_principal_id, channel, replaces_dispatch_id, "
-        "second_door_reason) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "second_door_reason, only_tests) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -2686,6 +2691,7 @@ async def create_review_dispatch(
             channel,
             replaces_dispatch_id,
             second_door_reason,
+            None if only_tests is None else json.dumps(list(only_tests)),
         ),
     )
     return inserted_id(cur)
