@@ -20,8 +20,10 @@
   снимается удалением строки: если нарушения больше нет, проверка сама
   потребует её убрать.
 - If a change touches MCP tool docstrings or signatures, it changes the published
-  `tools/list`: run `uv run python scripts/mcp_catalog_budget.py` (CI runs it too)
-  and re-freeze the budget with `--update` only as a deliberate, explained decision.
+  `tools/list`: run `uv run python scripts/mcp_catalog_budget.py` (CI runs it too).
+  If the headroom is not enough, follow `working_headroom_note` in
+  `docs/agent-context/mcp-catalog-budget.json` — the one refill policy (#1241);
+  do not raise the budget with `--update`.
 - Prefer focused validation:
   - `uv run ruff check hub tests`
   - `uv run ruff format hub tests`

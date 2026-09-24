@@ -8,6 +8,7 @@ published ``tools/list`` grew, which is the exact failure it exists to prevent.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -158,6 +159,38 @@ async def test_typo_in_a_budget_key_is_a_failure_not_a_silent_no_op():
     assert not result["ok"]
     assert result["unknown_budget_keys"] == ["descriptions_chars"]
     assert "never applied" in format_report(result)
+
+
+def test_the_budget_names_the_headroom_it_leaves():
+    """AC-1 (#1241): the printed report must say the remaining room as a
+    NUMBER of characters, for every ceiling, in a catalog that PASSES —
+    not only a percentage, and not only when something is already over.
+
+    A percentage alone does not answer the question an author actually has
+    before starting work — "does a ~90-character parameter fit under THIS
+    ceiling" — and #1155/#1236/#1215 each hit that gap the same day (2026-09-
+    09), one of them by raising a ceiling that had 5 characters of room left
+    with nothing in the report saying so in absolute terms. Existing coverage
+    (test_report_names_remaining_headroom) only checks the DATA has a
+    ``remaining`` field and that the phrase "of headroom spent" appears — it
+    does not check that the absolute count is actually printed, and a report
+    that dropped the number while keeping the percentage passed every test in
+    this file before this one was added.
+    """
+    snapshot = _fake_catalog({"hub_a": 100, "hub_b": 100})
+    measured = {key: snapshot[key] for key in BUDGET_KEYS}
+    ceilings = {key: int(value * 1.5) for key, value in measured.items()}
+
+    result = check_budget(snapshot, ceilings, {}, measured)
+    assert result["ok"], "given: a catalog state that passes the check"
+    report = format_report(result)
+
+    for row in result["headroom"]:
+        assert f"{row['metric']}" in report and f"{row['remaining']} left" in report, (
+            f"{row['metric']}: the report must print how many characters are "
+            "left under this ceiling as a number, not only as a percentage — "
+            "a reader deciding whether a new parameter fits needs the count"
+        )
 
 
 def test_report_names_remaining_headroom():
@@ -708,3 +741,37 @@ def test_measured_records_the_freeze_not_the_present(tmp_path: Path) -> None:
             "not minus the live catalog — otherwise it changes under every "
             "edit and stops answering 'how much of the slack has been spent'"
         )
+
+
+def _catalog_bullets(path: Path) -> list[str]:
+    """Top-level bullets of a doc that talk about the catalog budget script."""
+    bullets: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("- "):
+            bullets.append(line)
+        elif bullets and line.startswith("  ") and line.strip():
+            bullets[-1] += " " + line.strip()
+    return [b for b in bullets if "mcp_catalog_budget.py" in b]
+
+
+@pytest.mark.parametrize("doc", ["AGENTS.md", "docs/agent-context/change-map.md"])
+def test_agent_docs_point_to_the_refill_policy_not_to_update(doc: str) -> None:
+    """#1241 review: the refill policy lives in ONE place, working_headroom_note.
+
+    AGENTS.md and change-map.md used to tell the reader to raise the ceiling
+    with --update, which the note forbids an agent to do. They may point at the
+    note; they may not offer --update as the way to raise a ceiling.
+    """
+    bullets = _catalog_bullets(REPO_ROOT / doc)
+    assert bullets, f"{doc} no longer mentions scripts/mcp_catalog_budget.py"
+    for bullet in bullets:
+        assert "working_headroom_note" in bullet, (
+            f"{doc}: the catalog bullet must point to working_headroom_note, "
+            f"the one refill policy, instead of restating it: {bullet!r}"
+        )
+        for clause in re.split(r"[.;,]\s", bullet):
+            if "--update" in clause:
+                assert re.search(r"\bnot\b", clause), (
+                    f"{doc}: --update is offered as a way to move the budget, "
+                    f"which working_headroom_note forbids: {clause!r}"
+                )
