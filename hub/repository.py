@@ -963,7 +963,7 @@ async def list_drift_commits(
     where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
     return await fetchall(
         db,
-        f"SELECT d.* FROM base_branch_drift d {where}"  # nosec B608 - fixed clauses
+        f"SELECT d.* FROM base_branch_drift d {where}"  # nosec B608
         "ORDER BY d.detected_at DESC, d.id DESC",
         tuple(params),
     )
