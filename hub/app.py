@@ -80,6 +80,7 @@ from hub.models import (
     TaskCreate,
     TaskProjectRef,
     MachineReviewSubmit,
+    MergeLedgerBackfillRequest,
     MachineReviewView,
     StewardJudgementSubmit,
     StewardJudgementView,
@@ -131,6 +132,7 @@ from hub.auth import (
     _extract_bearer,
     client_ip,
     current_identity,
+    require_admin,
     require_agent_caller,
     require_human_or_admin,
     require_permission,
@@ -3483,6 +3485,30 @@ async def api_admin_audit(
 
     rows = await admin_svc.list_audit(_db(request), limit=limit, offset=offset)
     return [AuditEntry(**r) for r in rows]
+
+
+@app.post("/api/admin/merge-ledger/backfill")
+async def api_admin_merge_ledger_backfill(
+    body: MergeLedgerBackfillRequest,
+    request: Request,
+    _identity=Depends(require_admin),
+):
+    """Restore merge-ledger rows lost before #1343, by the hub's own records (#1367).
+
+    Dry run unless ``apply`` is true. A row is written only where the hub
+    itself recorded the merge (feed record "PR #N влит", or a release return
+    activity with the same sha); a PR number is not evidence (#534). Admin
+    only; no MCP tool — the catalog is at its ceiling and the action is an
+    admin's, run once by the owner.
+    """
+    from hub.services.merge_ledger_backfill import backfill_merge_ledger
+
+    try:
+        return await backfill_merge_ledger(
+            _db(request), project=body.project, apply=body.apply
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.post("/api/admin/bootstrap")

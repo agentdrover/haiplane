@@ -511,6 +511,13 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
     ) -> str: ...
+    async def pr_for_merge_commit(
+        self,
+        sha: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> dict[str, Any] | None: ...
     async def pr_state(
         self,
         pr_number: int,
