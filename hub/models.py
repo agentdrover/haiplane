@@ -1437,6 +1437,10 @@ class TaskReturnToWork(BaseModel):
     """
 
     reason: str = Field(..., max_length=5000)
+    # fix_requested always carries a job_id, and a killed executor's job stays
+    # "running" in the registry forever. Without this the return is a 409 that
+    # names the job; with it the job is dropped from the task (not killed).
+    abandon_active_job: bool = False
 
     @field_validator("reason")
     @classmethod

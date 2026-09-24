@@ -7,6 +7,15 @@
     <label class="task-action-label" for="task-return-reason">Вернуть в работу{% if task.claimed_by %} (сейчас держит {{ task.claimed_by }}){% endif %}</label>
     <textarea id="task-return-reason" name="reason" class="task-action-control task-action-textarea" required placeholder="Почему сдачу забирают у держателя..."></textarea>
     <p class="task-action-help">Задача уйдёт в open: захват снимется, одобрение текущей сдачи закроется, ветка, PR и находки останутся.</p>
+    {% if task.job_id or task.review_job_id %}
+    {# fix_requested всегда несёт job_id, а у убитого исполнителя job навсегда
+       «running» в реестре: без галочки хаб ответит 409 и назовёт job. #}
+    <label class="task-action-checkbox">
+        <input type="checkbox" name="abandon_active_job" value="true">
+        Бросить активный job {{ task.job_id or task.review_job_id }}
+    </label>
+    <p class="task-action-help">Если реестр считает job активным, без этой галочки возврат получит 409. С ней job отвязывается от задачи и остаётся в ленте; процесс хаб не останавливает — если исполнитель жив, его работа больше не связана с задачей.</p>
+    {% endif %}
     <button class="btn btn-warning task-action-btn" type="submit">Вернуть в работу</button>
 </form>
 {% endif %}

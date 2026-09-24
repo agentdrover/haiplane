@@ -3139,11 +3139,12 @@ async def web_return_to_work(
     task_id: int,
     request: Request,
     reason: str = Form(""),
+    abandon_active_job: bool = Form(False),
 ):
     """The task page's "return to work" button (#1356): same service as REST."""
     _require_human_web(request)
     try:
-        body = TaskReturnToWork(reason=reason)
+        body = TaskReturnToWork(reason=reason, abandon_active_job=abandon_active_job)
     except ValidationError as exc:
         raise HTTPException(422, _invalid_fields_detail(exc)) from exc
     await services.return_to_work(

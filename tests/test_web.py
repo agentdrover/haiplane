@@ -6963,17 +6963,23 @@ async def test_return_to_work_button_on_the_task_page(client: AsyncClient, db):
         "причина обязательна уже в форме"
     )
 
-    await repo.update_task(db, task_id, status="fix_requested")
+    # fix_requested, как его ставит сервис: с job_id. Кнопка несёт галочку
+    # «бросить активный job» и честно говорит про 409.
+    await repo.update_task(db, task_id, status="fix_requested", job_id="job-fix-1")
     await db.commit()
     page = (await client.get(f"/tasks/{task_id}")).text
     assert action in page, "в fix_requested кнопка в карточке действий"
+    form = page[page.index(action) :]
+    form = form[: form.index("</form>")]
+    assert 'name="abandon_active_job"' in form and "job-fix-1" in form
+    assert "409" in form, "help-текст называет отказ без галочки"
 
     await repo.update_task(db, task_id, status="running")
     await db.commit()
     page = (await client.get(f"/tasks/{task_id}")).text
     assert action not in page, "из running возврата нет — нет и кнопки"
 
-    await repo.update_task(db, task_id, status="review")
+    await repo.update_task(db, task_id, status="review", job_id=None)
     await db.commit()
     resp = await client.post(
         f"/tasks/{task_id}/web-return-to-work",

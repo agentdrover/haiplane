@@ -4206,12 +4206,15 @@ async def close_approval_for_rework(
 RETURN_TO_WORK_STATUSES = frozenset({"review", "fix_requested"})
 
 
-def _refuse_return_over_active_job(task: dict[str, Any]) -> None:
-    """A live dispatch job still owns the task: returning it would orphan it.
+def _active_jobs_on_task(task: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """Dispatch jobs the registry still calls active: ``(field, job, status)``.
 
-    Same test as force-complete's (#force_complete_task): missing or terminal
-    jobs do not block, an active one is a 409 naming it.
+    Same test as force-complete's: missing or terminal jobs do not count. The
+    registry reads the status from the job's JSON file, and a killed executor
+    leaves ``running`` there forever — so "active" here is the registry's
+    word, not a proof that a process is alive (#1356, finding 8582271d7f92112c).
     """
+    active: list[tuple[str, str, str]] = []
     for field in ("job_id", "review_job_id"):
         job_ref = (task.get(field) or "").strip()
         if not job_ref:
@@ -4220,11 +4223,36 @@ def _refuse_return_over_active_job(task: dict[str, Any]) -> None:
             job_ref, plugins.dispatch.get_job(job_ref)
         )
         if blocks:
-            raise HTTPException(
-                409,
-                f"active dispatch {field} {job_ref!r} status={dispatch_status!r} "
-                "blocks return to work",
-            )
+            active.append((field, job_ref, dispatch_status or "unknown"))
+    return active
+
+
+def _refuse_return_over_active_job(
+    active: list[tuple[str, str, str]], *, abandon: bool
+) -> None:
+    """An active job refuses the return unless the human abandons it by name.
+
+    fix_requested is set ONLY together with a job_id, so without this flag the
+    main case — an executor that died mid-fix — would be a 409 forever.
+    """
+    if not active or abandon:
+        return
+    named = ", ".join(
+        f"{field} {job!r} status={status!r}" for field, job, status in active
+    )
+    raise HTTPException(
+        409,
+        f"active dispatch {named} blocks return to work; if the executor is "
+        "dead, repeat with abandon_active_job=true",
+    )
+
+
+def _abandoned_job_note(field: str, job: str, status: str, *, actor: str) -> str:
+    return (
+        f"Брошен {field} {job} (статус в реестре: {status}): его бросил человек "
+        f"{actor} при возврате в работу. Процесс не остановлен — у хаба нет "
+        "отмены; если он ещё жив, он больше не связан с задачей (#509)."
+    )
 
 
 def _return_to_work_note(
@@ -4275,7 +4303,8 @@ async def return_to_work(
             "can only return review or fix_requested tasks to work, "
             f"current status: {from_status}",
         )
-    _refuse_return_over_active_job(task)
+    active_jobs = _active_jobs_on_task(task)
+    _refuse_return_over_active_job(active_jobs, abandon=body.abandon_active_job)
 
     if not await repo.transition_status_if(
         db, task_id, expected_from=from_status, new_status="open"
@@ -4295,8 +4324,8 @@ async def return_to_work(
         claim_session_id=None,
         claimed_at=None,
         implementer_principal_id=None,
-        # Terminal or missing by the check above: a finished job's id left on
-        # an open task would keep it out of the pair delivery sweep later.
+        # Terminal, missing or abandoned by the human: a job id left on an
+        # open task would keep it out of the pair delivery sweep later.
         job_id=None,
         review_job_id=None,
     )
@@ -4310,6 +4339,14 @@ async def return_to_work(
             task, actor=actor, reason=body.reason, from_status=from_status
         ),
     )
+    for field, job, job_status in active_jobs:
+        await repo.add_task_update(
+            db,
+            task_id,
+            actor,
+            "alert",
+            _abandoned_job_note(field, job, job_status, actor=actor),
+        )
     await repo.insert_event(
         db,
         kind="task_returned_to_work",
@@ -4322,6 +4359,7 @@ async def return_to_work(
             "previous_session": task.get("claim_session_id") or "",
             "previous_principal_id": task.get("implementer_principal_id"),
             "closed_verdict_generation": closed_generation,
+            "abandoned_jobs": [job for _field, job, _status in active_jobs],
         },
     )
     await db.commit()

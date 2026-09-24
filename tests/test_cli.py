@@ -790,6 +790,19 @@ def test_return_to_work_command_calls_the_rest_action() -> None:
     with pytest.raises(SystemExit):
         parser.parse_args(["return-to-work", "1241"])  # причина обязательна
 
+    # Флаг брошенного job доезжает до того же REST-действия.
+    mock_api.reset_mock()
+    parsed = parser.parse_args(
+        ["return-to-work", "1241", "--reason", "умер", "--abandon-active-job"]
+    )
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        assert cli.cmd_return_to_work(parsed) == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/1241/return-to-work",
+        {"reason": "умер", "abandon_active_job": True},
+    )
+
 
 def test_cmd_decide_without_summary() -> None:
     result = {"id": 12, "status": "completed"}

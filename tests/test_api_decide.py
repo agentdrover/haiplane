@@ -481,7 +481,10 @@ async def test_returning_to_work_is_human_only_and_status_bound(
         assert resp.status_code == 400, (status, resp.text)
         await _unchanged()
 
-    await repo.update_task(db, task_id, status="fix_requested")
+    # fix_requested в том виде, в каком его ставит сервис: всегда с job_id.
+    # Здесь job завершён — возврат проходит без флага.
+    _job_status(monkeypatch, "completed")
+    await repo.update_task(db, task_id, status="fix_requested", job_id="job-fix-1")
     await db.commit()
     resp = await client.post(
         f"/api/tasks/{task_id}/return-to-work",
@@ -491,6 +494,91 @@ async def test_returning_to_work_is_human_only_and_status_bound(
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "open"
     assert resp.json()["claimed_by"] is None
+    assert resp.json()["job_id"] is None
+
+
+def _job_status(monkeypatch, status: str | None) -> None:
+    """The registry's word on every job: ``None`` is a job it never heard of."""
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(
+        plugins.dispatch,
+        "get_job",
+        lambda job_id: None if status is None else {"id": job_id, "status": status},
+    )
+
+
+async def _fix_requested_with_job(db: aiosqlite.Connection) -> int:
+    """fix_requested как его ставит сервис (decide rework, dispatch_fix): с job_id."""
+    task_id = await _abandoned_review(db, approved=False)
+    await repo.update_task(db, task_id, status="fix_requested", job_id="job-fix-1")
+    await db.commit()
+    return task_id
+
+
+async def test_a_live_job_refuses_the_return_without_the_abandon_flag(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # Находка 8582271d7f92112c: у убитого исполнителя job в реестре навсегда
+    # «running». Без флага — 409, который называет job, статус и сам флаг.
+    _git()
+    _job_status(monkeypatch, "running")
+    task_id = await _fix_requested_with_job(db)
+    before = dict(await repo.get_task(db, task_id))
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/return-to-work", json={"reason": "исполнитель умер"}
+    )
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert "job-fix-1" in detail and "running" in detail, detail
+    assert "abandon_active_job=true" in detail, "отказ называет выход"
+    after = dict(await repo.get_task(db, task_id))
+    for field in ("status", "job_id", "claimed_by", "claim_session_id"):
+        assert after[field] == before[field], field
+
+
+async def test_the_abandon_flag_returns_a_task_over_a_live_job(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    _git()
+    _job_status(monkeypatch, "running")
+    task_id = await _fix_requested_with_job(db)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/return-to-work",
+        json={"reason": "исполнитель умер", "abandon_active_job": True},
+    )
+    assert resp.status_code == 200, resp.text
+    card = resp.json()
+    assert card["status"] == "open"
+    assert card["job_id"] is None, "брошенный job отвязан от задачи"
+    assert card["claimed_by"] is None
+    feed = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    abandoned = [u for u in feed if "Брошен job_id job-fix-1" in (u["content"] or "")]
+    assert abandoned, f"лента называет брошенный job: {feed}"
+    text = abandoned[-1]["content"]
+    assert "running" in text and "не остановлен" in text and "#509" in text, text
+
+
+async def test_a_finished_job_does_not_block_the_return(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    _git()
+    for status in ("completed", "failed", None):
+        _job_status(monkeypatch, status)
+        task_id = await _fix_requested_with_job(db)
+        resp = await client.post(
+            f"/api/tasks/{task_id}/return-to-work", json={"reason": "job закончился"}
+        )
+        assert resp.status_code == 200, (status, resp.text)
+        assert resp.json()["status"] == "open"
+        assert resp.json()["job_id"] is None
+        feed = " ".join(
+            dict(u).get("content") or ""
+            for u in await repo.get_task_updates(db, task_id)
+        )
+        assert "Брошен" not in feed, "бросать было нечего"
 
 
 async def test_return_to_work_loses_the_race_to_the_delivery_gate(
