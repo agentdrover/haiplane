@@ -154,6 +154,15 @@ mcp = InstrumentedFastMCP(
     brand.MCP_SERVER_NAME,
     instructions=build_mcp_instructions(),
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    # #1364: no Mcp-Session-Id. Sessions lived in this process's memory, so a
+    # release restart answered each client's next call with 404 "Session not
+    # found"; the client's recovery retry then wrote while its own reconnect
+    # dropped the reply ("session expired" on a write that went through).
+    # The hub uses no per-session server features (notifications, sampling,
+    # elicitation, ctx), and the caller's bearer and identity are request
+    # scoped (AuthMiddleware contextvars), so each POST stands alone.
+    # Must be set here: hub.app builds the streamable app from these settings.
+    stateless_http=True,
 )
 
 
