@@ -314,11 +314,44 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # now refuses to let happen again (#886).
     "release",
     "ci_runner",
+    # #1268: стюард судит в тени, вердикт остаётся за человеком. Ключ не
+    # гейт и ничего не делегирует — поэтому замок #743 (default) его не
+    # трогает. Читатель: steward_dispatch._policy_wants_steward.
+    "steward_shadow",
+    # #1264: лимит очереди review на входе новой работы. Не гейт и ничего не
+    # делегирует — замок #743 его не трогает. Читатели:
+    # project_policy.review_limit_of / review_limit_mode_of.
+    "review_limit",
+    "review_limit_mode",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
 _RISK_MAP_MAX_RULES = 100
 _RISK_MAP_MAX_PATTERN = 200
+
+
+def _validate_review_limit(policy: dict[str, Any]) -> None:
+    """Refuse a review-queue limit nobody could read as meant (#1264).
+
+    Strictly an int, never a bool or a string: "3" read as three and "3"
+    read as "no limit" are both plausible, and a limiter must not be the
+    place where that guess is made.
+    """
+    from hub.services.project_policy import REVIEW_LIMIT_MODES
+
+    if "review_limit" in policy:
+        limit = policy["review_limit"]
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError(
+                f"gate_policy review_limit must be an integer >= 1, got: {limit!r}"
+            )
+    if "review_limit_mode" in policy:
+        mode = policy["review_limit_mode"]
+        if mode not in REVIEW_LIMIT_MODES:
+            raise ValueError(
+                "gate_policy review_limit_mode must be one of "
+                f"{', '.join(REVIEW_LIMIT_MODES)}, got: {mode!r}"
+            )
 
 
 def _validated_risk_map(value: Any) -> dict[str, str]:
@@ -701,13 +734,38 @@ class LatestReview(BaseModel):
     ``self_approved`` is True when the verdict was accepted only because of
     the ``HAIPLANE_REVIEW_SELF_APPROVE=allow`` solo opt-out: the implementer
     reviewed their own work, so the verdict is not independent (#434).
+    ``closed_by_decision`` is the OTHER way a verdict stops being current
+    (#1286): a human sent the work back for rework and revoked the approval
+    it carried. Told apart from a resubmission on purpose — the reader sees a
+    verdict that nothing has superseded and needs to know why it no longer
+    counts. Both halves are narrow. Only an APPROVAL has a window to revoke,
+    so a CHANGES_REQUESTED verdict is never closed by the decision that agrees
+    with it; and a resubmission supersedes the closure, because from then on
+    the answer to "why doesn't it count" is that the work changed.
     """
 
     verdict: ReviewVerdict
     submission_generation: int = 0
     is_current: bool = False
+    closed_by_decision: bool = False
     self_approved: bool = False
     findings: list[ReviewFinding] = Field(default_factory=list)
+
+
+def latest_review_freshness(is_current: bool, closed_by_decision: bool = False) -> str:
+    """Why a verdict no longer counts — in the words that are true of it.
+
+    Every reader of ``latest_review`` used to have the same two-way sentence:
+    current, or "stale — work resubmitted". After #1286 there is a second way
+    to stop counting, and that sentence became false for it — the work was NOT
+    resubmitted, a human called it back. One function so the four places that
+    say this cannot drift into saying different things.
+    """
+    if is_current:
+        return "current"
+    if closed_by_decision:
+        return "closed by the rework decision — resubmit"
+    return "stale — work resubmitted"
 
 
 class SelfReviewWarning(BaseModel):
@@ -751,6 +809,14 @@ class CallSiteEntry(BaseModel):
     untouched: list[str] = Field(default_factory=list)
 
 
+class OnlyTestsOutcomeView(BaseModel):
+    """One only_tests symbol and what the review said about it (#1254)."""
+
+    symbol: str
+    outcome: str
+    call_path: str = ""
+
+
 class CallSiteSection(BaseModel):
     """Call sites of everything the diff changes (#601).
 
@@ -765,6 +831,13 @@ class CallSiteSection(BaseModel):
     note: str = ""
     entries: list[CallSiteEntry] = Field(default_factory=list)
     unparsed: list[str] = Field(default_factory=list)
+    # #1254: what the current machine review answered for each symbol only
+    # tests call. ``not_analysed`` / ``none_named`` / ``named`` never collapse
+    # into one another (#750); ``outcome`` is unreachable, cleared (with the
+    # call path the reviewer named) or silent.
+    only_tests_state: str = "not_analysed"
+    only_tests_summary: str = ""
+    only_tests: list[OnlyTestsOutcomeView] = Field(default_factory=list)
 
 
 class ACLocatorResolution(BaseModel):
@@ -797,6 +870,15 @@ class LiveCheckState(BaseModel):
 
     ``sha_mismatch`` names the case the card must not hide: the observation
     exists but was taken against another build than the one delivered.
+
+    ``deploy_state`` is the OTHER half of that question, and it is not the
+    same one (#837, #1231 review). The sha says which commit the observer
+    named; this says whether the hub could confirm that commit is what
+    production runs — ``in_prod``, ``unknown`` when the hub has no delivery
+    facts to check against, or empty for rows written before the check
+    existed. Recording an unverified observation is deliberate: an
+    installation that knows nothing about production must not have its
+    ignorance turned into a gate. Reading it as confirmation is not.
     """
 
     state: str = "unknown"
@@ -808,6 +890,7 @@ class LiveCheckState(BaseModel):
     sha: str = ""
     delivered_sha: str = ""
     sha_mismatch: bool = False
+    deploy_state: str = ""
     recorded_agent: str = ""
     created_at: str = ""
 
@@ -871,6 +954,25 @@ class DiffBaseState(BaseModel):
     sha: str = ""
 
 
+class BaseMergeState(BaseModel):
+    """Разойдётся ли ветка с базой при доставке — ДО вердикта (#1233).
+
+    ``state``: ``clean`` | ``conflicting`` | ``unknown`` | ``not_applicable``.
+    Четыре, и они не схлопываются: «конфликта нет» и «спросить не удалось»
+    ведут к противоположным действиям, а «нечего спрашивать» (нет PR) — это не
+    зелёный свет. 09.09.2026 человек узнал о конфликте #1204 через четырнадцать
+    секунд ПОСЛЕ того, как потратил вердикт: гейт отказал в доставке, задача
+    ушла на второй круг ревью, и то же одобрение пришлось выдавать снова.
+
+    ``files`` — имена конфликтующих файлов, когда git смог их назвать. Пусто —
+    это «назвать не удалось», а не «их не было»: конфликт остаётся конфликтом.
+    """
+
+    state: str = "unknown"
+    reason: str = ""
+    files: list[str] = Field(default_factory=list)
+
+
 class EvidenceCoverage(BaseModel):
     """How much of this brief is evidence, and how much is absence (#725).
 
@@ -904,6 +1006,32 @@ class ReviewInFlight(BaseModel):
     headline: str = ""
 
 
+class GenerationReview(BaseModel):
+    """Есть ли ревью у ТЕКУЩЕГО поколения сдачи — один правдивый ответ (#1262).
+
+    ``has_review`` истинно только для отчёта этого поколения, который не
+    назван неполным и несёт улику исполнения (#750, #841): «ревью нет» не
+    смеет читаться как «ревью чистое». Когда ревью нет, ``reason`` — код
+    причины (``provider_refused``, ``incomplete_report``,
+    ``no_execution_evidence``, ``run_failed``, ``in_flight``,
+    ``not_dispatched``), а ``reason_detail`` — наблюдённая деталь. Отчёт
+    прошлого поколения назван в ``previous_generation`` и ревью текущего
+    не считается.
+    """
+
+    generation: int = 0
+    has_review: bool = False
+    reviewer_principal: str = ""
+    reviewer_model: str = ""
+    sha: str = ""
+    # None — отчёт полноту не заявлял (строки до #549), не «полный».
+    complete: bool | None = None
+    reason: str = ""
+    reason_detail: str = ""
+    previous_generation: int | None = None
+    headline: str = ""
+
+
 class ReviewReport(BaseModel):
     """What the human reads at the verdict gate instead of the diff (#808).
 
@@ -927,6 +1055,54 @@ class ReviewReport(BaseModel):
     diff_lines: int | None = None
     diff_note: str = ""
     machine_review: "MachineReviewView | None" = None
+
+
+class ReviewQueueRow(BaseModel):
+    """One submission in the review queue (#1334).
+
+    Every field is the brief's own answer, read by the brief's own functions
+    from stored facts — no diff, no fetch. ``sha_check`` rests on the tip the
+    hub last OBSERVED; without a fresh observation it is ``unknown`` with a
+    reason, never ``match``. ``findings_*`` are None when there is no current
+    report: "nobody reported" is not "zero findings" (#549).
+    """
+
+    task_id: int
+    title: str = ""
+    status: str = ""
+    submission_generation: int = 0
+    submission_sha: str = ""
+    sha_check: str = "unknown"
+    sha_check_reason: str = ""
+    # How long ago the tip behind ``sha_check`` was observed; None when the
+    # answer rests on no observation (then ``sha_check`` is ``unknown``).
+    tip_observed_minutes_ago: int | None = None
+    # none | in_flight | current | incomplete — the report of THIS generation.
+    report_status: str = "none"
+    # The brief's review_report.state verbatim: none | current | stale.
+    report_state: str = "none"
+    report_outcome: str = ""
+    findings_confirmed: int | None = None
+    findings_unresolved: int | None = None
+    review_in_flight: ReviewInFlight | None = None
+    generation_has_review: bool = False
+    generation_review_reason: str = ""
+    verdict: str | None = None
+    verdict_generation: int | None = None
+    verdict_is_current: bool = False
+    stall_reason: str = ""
+    stall_at: str = ""
+    waiting_since: str = ""
+    waiting_minutes: int | None = None
+    # ready | ready_sha_unverified | findings | awaiting_report | blocked.
+    readiness: str = "awaiting_report"
+
+
+class ReviewQueueView(BaseModel):
+    """The whole review queue, ordered by readiness (#1334)."""
+
+    rows: list[ReviewQueueRow] = Field(default_factory=list)
+    note: str = ""
 
 
 class ReviewCircleView(BaseModel):
@@ -1015,6 +1191,9 @@ class ReviewBrief(BaseModel):
     # whether it resolves. An unresolved base leaves diff_command empty — a
     # command that cannot run reads as an offer to verify.
     diff_base: DiffBaseState = Field(default_factory=DiffBaseState)
+    # #1233: расхождение с базой названо ДО вердикта, а не после отказа
+    # доставки. Читатель у поля тот же, что у diff_base, — человек на гейте.
+    base_merge: BaseMergeState = Field(default_factory=BaseMergeState)
     # #725: one verdict over all evidence blocks below.
     evidence_coverage: EvidenceCoverage = Field(default_factory=EvidenceCoverage)
     review_cycle: int = 0
@@ -1043,6 +1222,9 @@ class ReviewBrief(BaseModel):
     review_report: "ReviewReport | None" = None
     # #1027: a hub-called review still in the air for THIS submission.
     review_in_flight: ReviewInFlight | None = None
+    # #1262: has THIS generation been reviewed — by whom, on which sha, how
+    # completely — or why not. None means this path did not assemble it.
+    current_generation_review: GenerationReview | None = None
     # #433: fail-fast notice when the caller implemented this task.
     self_review_warning: SelfReviewWarning | None = None
     # #438: advisory — non-empty when the branch carries commits of another
@@ -1245,6 +1427,28 @@ class TaskDecide(BaseModel):
     decision_summary: str = Field("", max_length=5000)
     record_decision: bool = False
     pr_disposition: str = Field("", pattern=PR_DISPOSITION_PATTERN)
+
+
+class TaskReturnToWork(BaseModel):
+    """Human return of an abandoned submission to ``open`` (#1356).
+
+    The reason is required and must say something: it is the only record of
+    why somebody else's claim was taken off the task.
+    """
+
+    reason: str = Field(..., max_length=5000)
+    # fix_requested always carries a job_id, and a killed executor's job stays
+    # "running" in the registry forever. Without this the return is a 409 that
+    # names the job; with it the job is dropped from the task (not killed).
+    abandon_active_job: bool = False
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("reason is required: say why the task goes back to work")
+        return stripped
 
 
 REPORT_KINDS = frozenset({"done", "status", "blocker"})
@@ -2143,6 +2347,13 @@ class ProjectPatch(BaseModel):
             raise ValueError(
                 f"gate_policy values must be one of {sorted(GATE_VALUES)}, got: {bad}"
             )
+        if "steward_shadow" in v and not isinstance(v["steward_shadow"], bool):
+            # Читатель понимает только true (#835); запись отказывает громко,
+            # чтобы «"true"» строкой не выглядело включённым, ничего не включая.
+            raise ValueError(
+                "gate_policy steward_shadow must be true or false, "
+                f"got: {v['steward_shadow']!r}"
+            )
         if "review" in v and v["review"] not in REVIEW_POLICY_VALUES:
             raise ValueError(
                 "gate_policy review must be one of "
@@ -2158,6 +2369,7 @@ class ProjectPatch(BaseModel):
                 )
         if "risk_map" in v:
             v["risk_map"] = _validated_risk_map(v["risk_map"])
+        _validate_review_limit(v)
         return v
 
     @model_validator(mode="before")
@@ -2345,6 +2557,11 @@ class CIRunReportSubmit(BaseModel):
     # pass | fail | skipped. Optional, and an omitted map means "this report
     # names no checks" — never "everything passed".
     checks: dict[str, str] = Field(default_factory=dict)
+    # The mutation run over changed functions (#1270), kept under its own key:
+    # a warning with named survivors, not a check outcome — putting it into
+    # ``checks`` would tell the reviewer the code is "known-broken" whenever a
+    # weak test exists. Omitted ⇒ stored as {} and reported as not_reported.
+    mutations: dict[str, Any] = Field(default_factory=dict)
     validation_status: str = Field("", max_length=20)
     validation_log: str = Field("", max_length=4000)
     reason: str = Field("", max_length=500)
@@ -2361,6 +2578,7 @@ class CIRunReportResult(BaseModel):
     ac_recorded: list[dict[str, Any]] = Field(default_factory=list)
     ac_ignored: list[str] = Field(default_factory=list)
     validation_status: str = ""
+    mutations_state: str = "not_reported"
 
 
 class OutcomeVerdict(str, Enum):
@@ -2768,10 +2986,28 @@ class MachineReviewView(BaseModel):
     # about itself. False on rows written before the column existed — there
     # the question was never asked, which is not the same as "independent".
     self_reviewed: bool = False
+    # Who owns the report, from the TOKEN (#1025). The column arrived AFTER
+    # ``self_reviewed``, so a report with an owner is one about which the
+    # "did the author review it" question was actually asked. None means
+    # nobody established independence — which a reader of ``self_reviewed``
+    # alone would mistake for "someone else looked" (#1231, f9ac6478eaeb2ac2).
+    principal_id: int | None = None
     created_at: str = ""
     # What the gate said each confirmed finding turned out to be (#876). An
     # empty list means nobody judged them — never that they were all fine.
     dispositions: list[FindingDispositionView] = Field(default_factory=list)
+    # На какой ступени лестницы исходов стоит отчёт (#1234), и что об этой
+    # ступени печатают. Поля, а не свойства: читатели — карточка, дайджест и
+    # квитанция MCP, и последняя видит модель уже сериализованной в JSON, где
+    # свойства не доезжают. Штампуются на выходе тем же приёмом, что и
+    # finding_uid: ступень — функция содержимого отчёта, и хранимая копия
+    # могла бы разъехаться с содержимым, которое описывает.
+    outcome: str = ""
+    outcome_label: str = ""
+    #: Имеет ли эта ступень право называться чистотой. Отдельным полем, чтобы
+    #: шаблон не сравнивал строки сам: сравнение, повторённое в трёх
+    #: поверхностях, — это ровно то, как «0 подтверждённых» стало «чисто».
+    outcome_names_clean: bool = False
     # Which channel actually produced this report, and why it is not cloud
     # (#1266). Set by the brief builder from the settled review_dispatches
     # row, never from this table — a report row carries no channel of its
@@ -2808,6 +3044,37 @@ class MachineReviewView(BaseModel):
         # found, and none of them could be addressed at all.
         for record, uid in zip(self.unresolved, unresolved_uids(self.unresolved)):
             record.finding_uid = uid
+        return self
+
+    @model_validator(mode="after")
+    def _stamp_report_outcome(self) -> "MachineReviewView":
+        """Поставить отчёту его ступень лестницы исходов (#1234).
+
+        Здесь, а не в каждой поверхности: карточка, дайджест и квитанция
+        ревью читали «0 подтверждённых» и печатали чистоту, пока
+        ``unresolved`` был непустым. Один расчёт на трёх читателей — то же
+        решение и по той же причине, что свело пять громких оснований в
+        ``gate_grounds`` (#1147): второй список рядом с первым разъезжается,
+        и разъезжается тот, который мягче.
+        """
+        from hub.services.steward_corridor import (
+            names_clean,
+            outcome_label,
+            report_outcome,
+        )
+
+        # ``incomplete is None`` значит «полнота не заявлена», а не «прогон
+        # полный»: обратное back-fill'ило бы утверждение в отчёты, которые
+        # его не делали (#549). Ступени «не заявлено» здесь не заводится —
+        # это отдельный флаг, который карточка показывает своим бейджем.
+        self.outcome = report_outcome(
+            confirmed=self.findings_confirmed,
+            unresolved=self.unresolved,
+            incomplete=self.incomplete is True,
+            raw_count=self.raw_count,
+        )
+        self.outcome_label = outcome_label(self.outcome)
+        self.outcome_names_clean = names_clean(self.outcome)
         return self
 
     @field_validator(
@@ -3293,6 +3560,13 @@ STEWARD_ESCALATE_REASONS: tuple[str, ...] = (
     "run_failed",
     "run_timeout",
     "injection_suspected",
+    # #1268: привратник применения на проекте, где вердикт стюарду не отдан
+    # (теневое участие): суждение записано, применять его нельзя.
+    "policy_not_delegated",
+    # #1327: одобрение или возврат без названного основания либо без
+    # уверенности нельзя перепроверить — хаб пишет их эскалацией.
+    "no_grounds",
+    "no_confidence",
 )
 STEWARD_CLOSURE_TYPES: tuple[str, ...] = (
     "fixed",
@@ -3361,6 +3635,9 @@ class StewardJudgementView(BaseModel):
     closures: list[StewardClosure] = Field(default_factory=list)
     model: str = ""
     tokens_spent: int | None = None
+    # Почему tokens_spent пуст (#1328): pending | provider_no_answer | no_run;
+    # '' — число есть. Ноль и «неизвестно» не смешиваются.
+    tokens_unknown_reason: str = ""
     duration_ms: int | None = None
     submitted_by: str = ""
     created_at: str = ""

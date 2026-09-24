@@ -3554,6 +3554,35 @@ async def test_ci_reports_validation_result(client: AsyncClient, db, monkeypatch
     assert validation_gap(task) is None, "a green reported run must close the gap"
 
 
+async def test_ci_report_keeps_the_mutation_run_under_its_own_key(
+    client: AsyncClient, db, monkeypatch
+):
+    # #1270: the mutation step's result must reach the hub as a key of its own.
+    # The intake model used to drop unknown fields silently, so a reporter that
+    # sent it would have "delivered" nothing — the row is read back here.
+    import json as _json
+
+    from hub import repository as _repo
+
+    task_id = await _ci_reporting_task(client, monkeypatch, "sha-report-mut")
+    mutations = {
+        "state": "ran",
+        "survived": 1,
+        "survivors": [{"file": "hub/x.py", "function": "f", "line": 3}],
+    }
+    resp = await client.post(
+        f"/api/tasks/{task_id}/ci-run-report",
+        json={"head_sha": "sha-report-mut", "mutations": mutations},
+        headers=_ci_headers(monkeypatch),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["mutations_state"] == "ran"
+
+    row = dict(await _repo.get_ci_run_report(db, task_id, "sha-report-mut"))
+    assert _json.loads(row["mutations"]) == mutations
+    assert _json.loads(row["checks"]) == {}, "mutations are not a check outcome"
+
+
 async def test_ci_report_rejects_bad_token_and_stale_generation(
     client: AsyncClient, monkeypatch
 ):

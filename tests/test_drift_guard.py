@@ -232,6 +232,90 @@ async def test_one_project_cannot_vouch_for_another(db: aiosqlite.Connection):
     assert known == set(), "a merge with no project vouches for no project"
 
 
+# --- #1343: the registry is keyed by the merge, not by the PR number ---------
+
+
+async def _merges(db: aiosqlite.Connection, pr_number: int) -> list[tuple]:
+    rows = await db.execute_fetchall(
+        "SELECT task_id, merge_sha FROM pipeline_merges "
+        "WHERE pr_number = ? ORDER BY id",
+        (pr_number,),
+    )
+    return [(r["task_id"], r["merge_sha"]) for r in rows]
+
+
+async def test_a_merge_reusing_an_old_pr_number_is_recorded(
+    db: aiosqlite.Connection, git
+):
+    """#1343 AC-1. The project moved to a new repository and PR numbering
+    started over, so the hub's new PR 438 shares its number with a row the
+    old repository left behind. INSERT OR IGNORE on UNIQUE (project_id,
+    pr_number) dropped the new merge silently, and the guard then called the
+    hub's own delivery a commit past the gate (live: #1281, PR #406)."""
+    project_id = await _project_with_baseline(db)
+    await repo.record_pipeline_merge(
+        db, pr_number=438, merge_sha="old0438", project_id=project_id, task_id=816
+    )
+
+    await repo.record_pipeline_merge(
+        db, pr_number=438, merge_sha="new0438", project_id=project_id, task_id=1281
+    )
+
+    assert await _merges(db, 438) == [(816, "old0438"), (1281, "new0438")]
+    assert "new0438" in await repo.known_pipeline_shas(db, project_id)
+    git(
+        log=_log(
+            ("new0438", "feat(task): delivered by the gate (#438)", "hub"),
+            ("base000", "older history", "hub"),
+        )
+    )
+    reports = await drift_guard.check_all_projects(db)
+    assert [r.status for r in reports if r.project_slug == "p"] == ["clean"]
+
+
+async def test_recording_the_same_merge_twice_is_idempotent(
+    db: aiosqlite.Connection,
+):
+    """#1343 AC-2. The merge is the key: recording it again adds nothing.
+
+    An empty merge_sha means the commit could not be read. It is not a key,
+    so it must neither swallow another merge's row nor be swallowed by one:
+    two different empty-sha merges both land, and repeating one of them is
+    still a single row."""
+    project_id = await _project_row(db)
+    for _ in range(2):
+        await repo.record_pipeline_merge(
+            db, pr_number=500, merge_sha="aaa500", project_id=project_id, task_id=7
+        )
+    assert await _merges(db, 500) == [(7, "aaa500")]
+
+    # Same PR number, commit unreadable: not the recorded merge, not dropped.
+    await repo.record_pipeline_merge(
+        db, pr_number=500, merge_sha="", project_id=project_id, task_id=8
+    )
+    # Two different merges whose commits could not be read.
+    await repo.record_pipeline_merge(
+        db, pr_number=501, merge_sha="", project_id=project_id, task_id=9
+    )
+    await repo.record_pipeline_merge(
+        db, pr_number=502, merge_sha="", project_id=project_id, task_id=10
+    )
+    # The same unreadable merge reported twice stays one row.
+    await repo.record_pipeline_merge(
+        db, pr_number=502, merge_sha="", project_id=project_id, task_id=10
+    )
+
+    assert await _merges(db, 500) == [(7, "aaa500"), (8, "")]
+    assert await _merges(db, 501) == [(9, "")]
+    assert await _merges(db, 502) == [(10, "")]
+    assert await repo.known_pipeline_shas(db, project_id) == {"aaa500"}
+    # The row that WAS recorded is untouched by the empty-sha writes.
+    rows = await db.execute_fetchall(
+        "SELECT task_id FROM pipeline_merges WHERE merge_sha = 'aaa500'"
+    )
+    assert [r["task_id"] for r in rows] == [7]
+
+
 # --- AC-3: the base branch is never assumed --------------------------------
 
 

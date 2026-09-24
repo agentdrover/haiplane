@@ -101,10 +101,20 @@ REFUSED_DAILY_CAP = "daily_cap"
 REFUSED_ALREADY_ORDERED = "already_ordered"
 REFUSED_NO_GENERATION = "no_generation"
 REFUSED_NO_NEW_INFORMATION = "no_new_information"
+# Не отказ, а ОТСРОЧКА (#1289): ревью этой сдачи ещё идёт, и судить пока
+# нечего. Слово то же, что бриф даёт этому факту, — чтобы отсрочка здесь и
+# плашка там назывались одинаково, а не походили друг на друга.
+REFUSED_REVIEW_IN_FLIGHT = "review_in_flight"
 
 EVENT_ORDERED = "steward_run_ordered"
 EVENT_REFUSED = "steward_run_refused"
 EVENT_CLOSED = "steward_run_closed"
+# Своё слово, а не steward_run_refused (#1289). Отказ РЕШАЕТ генерацию:
+# рядом с ним стоит строка steward_runs, и второго заказа не будет никогда.
+# Отсрочка не решает ничего — она говорит «ещё рано», строки не пишет, и
+# следующий проход поллера обязан вернуться к этой задаче. Назвать их одним
+# словом значило бы потерять ровно ту разницу, ради которой это заведено.
+EVENT_DEFERRED = "steward_run_deferred"
 
 _MODES = {"off", "shadow", "act"}
 
@@ -147,15 +157,43 @@ def dispatcher_enabled() -> bool:
 
 
 async def _refuse(
-    db: aiosqlite.Connection, task_id: int, reason: str, detail: str
+    db: aiosqlite.Connection,
+    task_id: int,
+    reason: str,
+    detail: str,
+    *,
+    generation: int,
+    kind: str,
 ) -> None:
-    """Say no in the feed. A silent refusal is indistinguishable from a bug."""
+    """Say no in the feed. A silent refusal is indistinguishable from a bug.
+
+    Но сказать нет — один раз на смену причины, а не на каждом тике (#1330).
+    Поллер зовёт order_run по каждой задаче в review раз в полминуты, и
+    исчерпанный потолок 22.09.2026 дал 216 одинаковых событий за два часа,
+    а 23.09 — 1520 к пяти утра. Приём и читатель прошлого события те же,
+    что у временного отказа прогона (#1290): второго механизма дедупа нет.
+
+    Ключ — задача, поколение, вид заказа и UTC-сутки. Сутки нужны потолку:
+    исчерпанный вчера и исчерпанный сегодня — два факта, не один.
+    """
+    from hub.services.steward_shadow import _last_event_payload
+
+    previous = await _last_event_payload(
+        db, EVENT_REFUSED, task_id=task_id, order=(generation, kind), today=True
+    )
+    if previous.get("reason") == reason:
+        return
     await repo.insert_event(
         db,
         kind=EVENT_REFUSED,
         task_id=task_id,
         actor="hub",
-        payload={"reason": reason, "detail": detail},
+        payload={
+            "reason": reason,
+            "detail": detail,
+            "generation": generation,
+            "kind": kind,
+        },
     )
     await db.commit()
 
@@ -241,11 +279,20 @@ async def order_run(
             task_id,
             REFUSED_MODE_OFF,
             f"STEWARD_MODE={config.STEWARD_MODE!r} — контур закрыт",
+            generation=generation,
+            kind=kind,
         )
         return None
     missing = await _revision_missing(db, task_id, generation, kind)
     if missing:
-        await _refuse(db, task_id, REFUSED_NO_GENERATION, missing)
+        await _refuse(
+            db,
+            task_id,
+            REFUSED_NO_GENERATION,
+            missing,
+            generation=generation,
+            kind=kind,
+        )
         return None
 
     project = await repo.resolve_project_for_task(db, task_id)
@@ -258,6 +305,8 @@ async def order_run(
             REFUSED_DAILY_CAP,
             f"суточный потолок исчерпан: {used}/{config.STEWARD_DAILY_CAP} "
             "прогонов на проект за UTC-сутки — задача идёт человеческим маршрутом",
+            generation=generation,
+            kind=kind,
         )
         return None
 
@@ -287,6 +336,8 @@ async def order_run(
             task_id,
             REFUSED_ALREADY_ORDERED,
             f"прогон на генерацию {generation} ({kind}) уже заказан",
+            generation=generation,
+            kind=kind,
         )
         return None
 
@@ -421,7 +472,14 @@ async def close_run(
     return True
 
 
-def _policy_wants_steward(project_row: Any | None, gate: str = "verdict") -> bool:
+#: Признак политики «стюард судит в тени» (#1268). Не значение гейта, а
+#: отдельный ключ: он ничего не делегирует, поэтому замок #743 его пропускает.
+STEWARD_SHADOW_KEY = "steward_shadow"
+
+
+def _policy_wants_steward(
+    project_row: Any | None, gate: str = "verdict", *, shadow: bool = True
+) -> bool:
     """Does the project's own gate policy hand THIS gate to the steward (#743)?
 
     Один вопрос на два гейта, а не два похожих читателя: вердикт и DoR
@@ -435,10 +493,25 @@ def _policy_wants_steward(project_row: Any | None, gate: str = "verdict") -> boo
     Сравнение со строкой ``steward`` живёт ровно здесь и нигде больше — #1157
     заводит перечень делегирующих значений ключа ``dor`` и один читатель для
     него, и заменить придётся одно место, а не каждое употребление.
+
+    Теневое участие (#1268) — второй вход в тот же вопрос, и только для
+    вердикта: проект просит суждения, не отдавая решения. Вход открывает
+    ровно ``true`` JSON; строка «true», единица и прочее читаются как «не
+    участвует» (#835). ``shadow=False`` спрашивает про делегирование в
+    чистом виде — это вопрос привратника применения: суждение применяется
+    только там, где вердикт стюарду ОТДАН, а не где его лишь слушают.
     """
     if project_row is None:
         return False
-    return gate_policy_of(project_row).get(gate) == "steward"
+    policy = gate_policy_of(project_row)
+    if policy.get(gate) == "steward":
+        return True
+    return shadow and gate == "verdict" and policy.get(STEWARD_SHADOW_KEY) is True
+
+
+def verdict_delegated_to_steward(project_row: Any | None) -> bool:
+    """Отдан ли вердикт проекта стюарду — без теневого входа (#1268)."""
+    return _policy_wants_steward(project_row, shadow=False)
 
 
 async def _nothing_new_since(
@@ -526,6 +599,97 @@ async def _nothing_new_since(
     )
 
 
+async def _review_still_running(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
+    """Почему заказывать рано, или "" если пора.
+
+    Наблюдено 22.09.2026, первый день тени на default: из восьми суждений
+    три — эскалации no_current_report, и две из них (#1283, #1286)
+    искусственные. Прогон заказывали через минуту после сдачи, пока
+    кросс-модельное ревью ЭТОЙ сдачи ещё работало; gate_grounds читает
+    отчёт первым и при его отсутствии эскалирует сразу. Исход такого
+    прогона предрешён до его начала — а стоит он денег и суточной квоты, и
+    портит измерение: доля эскалаций и есть порог выхода стюарда из тени.
+
+    Приём тот же, что steward_shadow применяет к неназванной модели
+    ревьюера: «пока неизвестно» не то же самое, что «неизвестно никогда».
+    Разница с тамошним ожиданием одна и она в цене: там ждёт УЖЕ
+    РАЗМЕЩЁННЫЙ заказ, здесь заказ ещё не размещён — и не размещается,
+    поэтому ожидание не стоит ни прогона, ни квоты.
+
+    Про ход ревью спрашивается ОДИН читатель — ``inflight_view``, тот
+    самый, чей ответ бриф показывает как ``review_in_flight``. Второй
+    читатель того же факта разошёлся бы с первым, и разошёлся бы в сторону
+    «заказывать»: экономия всегда тише осторожности.
+
+    Спрашивается он ШИРОКО (``include_owed``). Находка bec6db75314abd83:
+    узкий ответ говорит «ревью нет» на долге второй двери — строке, чей
+    прогон ревью кончился без отчёта и которую свип ещё не разобрал
+    (#1252). Отчёта этой сдачи в том окне нет ровно так же, как при живом
+    прогоне, и купленный там прогон стюарда эскалировал бы по
+    no_current_report, не начав судить. Постановка #1289 так активный заказ
+    и определяет: ``active`` ИЛИ ``second_door``. Вечной отсрочки это не
+    даёт: долг кончается либо второй дверью (новый заказ, ``active``), либо
+    ``failed``, а по ``failed`` прогон покупается.
+
+    Отчёт спрашивается вторым и решает в пользу прогона: ревью может
+    сдать отчёт раньше, чем свип переведёт свою строку в done, и ждать
+    того, что уже пришло, значило бы задерживать суждение ради
+    аккуратности учёта. Полное отсутствие ревью (#1241) сюда не попадает
+    вовсе: ждать нечего, прогон покупается, и эскалация по нему законна.
+    """
+    from hub.services.review_evidence import inflight_view
+
+    view = await inflight_view(db, task, include_owed=True)
+    if view is None:
+        return ""
+    task_id = int(task["id"])
+    generation = int(task.get("submission_generation") or 0)
+    if await repo.machine_reviews_of_generation(db, task_id, generation):
+        return ""
+    return (
+        f"ревью этой сдачи ещё не кончено ({view.headline}) — прогон "
+        "прочитал бы отсутствие отчёта и эскалировал по no_current_report, "
+        "не начав судить; заказ ждёт отчёта"
+    )
+
+
+async def _defer(
+    db: aiosqlite.Connection, task_id: int, generation: int, detail: str
+) -> None:
+    """Сказать в ленте, что заказ отложен, — один раз на поколение.
+
+    Поллер тикает каждые тридцать секунд, а ревью идёт минутами: сказать
+    на каждом тике значило бы утопить ленту задачи в повторе одной мысли.
+    Молчать нельзя — отложенный заказ, о котором не сказано, неотличим от
+    диспетчера, который эту задачу не увидел.
+
+    Запирать генерацию строкой, как это делает отказ, здесь НЕЛЬЗЯ по
+    построению: строка в steward_runs закрывает её навсегда (``_settled``),
+    а отсрочка обязана кончиться заказом. Поэтому дедупликация — по ленте.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM events WHERE task_id=? AND kind=? "
+        "AND json_extract(payload, '$.generation')=? LIMIT 1",
+        (task_id, EVENT_DEFERRED, generation),
+    )
+    if rows:
+        return
+    await repo.insert_event(
+        db,
+        kind=EVENT_DEFERRED,
+        task_id=task_id,
+        actor="hub",
+        payload={
+            "reason": REFUSED_REVIEW_IN_FLIGHT,
+            "detail": detail,
+            "generation": generation,
+            "kind": KIND_VERDICT,
+        },
+    )
+    await db.commit()
+
+
 async def order_due_runs(db: aiosqlite.Connection) -> int:
     """Order a run for every submission that is waiting for one."""
     if not dispatcher_enabled():
@@ -546,6 +710,13 @@ async def order_due_runs(db: aiosqlite.Connection) -> int:
         if await open_run(db, task_id, generation) is not None:
             continue
         if await _settled(db, task_id, generation):
+            continue
+        # Шестой страж (#1289), и единственный, который НЕ решает генерацию:
+        # пока ревью этой сдачи идёт, судить нечего, и прогон кончился бы
+        # эскалацией «нет отчёта», предрешённой до его начала.
+        waiting = await _review_still_running(db, task)
+        if waiting:
+            await _defer(db, task_id, generation, waiting)
             continue
         # Пятый страж, и единственный, который экономит деньги: отказ ДО
         # заказа стоит ноль, отказ после — полный прогон (#1150).
@@ -793,12 +964,44 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
                 RUN_TIMEOUT if started else RUN_NEVER_STARTED,
                 "прогон не вернул суждение до дедлайна слота"
                 if started
-                else "заказ не удалось начать за отведённое ожидание — "
-                "судья не работал, и таймаут судьи здесь был бы обвинением "
-                "того, кто не начинал",
+                else await _never_started_reason(db, run),
             ):
                 closed += 1
     return closed
+
+
+async def _never_started_reason(db: aiosqlite.Connection, run: dict[str, Any]) -> str:
+    """Почему заказ так и не начался — названо, а не сведено к «не начался».
+
+    Статус остаётся ``never_started``: он отделяет заказ, который не
+    работал, от таймаута судьи, который работал и не ответил (#1181). Но в
+    первый вечер теневой фазы (#1290) три слота из трёх закрылись этим
+    статусом, ожидая кросс-модельного ревьюера, — и по журналу «ждали
+    ревьюера полчаса» ничем не отличалось от любого другого незапуска.
+
+    Спрашивается последний ВРЕМЕННЫЙ отказ этого прогона, то есть ровно та
+    причина, по которой каждый проход поллера уходил ни с чем. Своего учёта
+    ожиданий здесь нет: событие отказа уже написано, и второй источник
+    правды об одном и том же разъехался бы с первым.
+    """
+    from hub.services.steward_shadow import (
+        REFUSED_UNDECLARED_MODEL,
+        waiting_refusal_code,
+    )
+
+    generic = (
+        "заказ не удалось начать за отведённое ожидание — судья не работал, "
+        "и таймаут судьи здесь был бы обвинением того, кто не начинал"
+    )
+    code = await waiting_refusal_code(db, run["task_id"], run["id"])
+    if code == REFUSED_UNDECLARED_MODEL:
+        return (
+            "заказ ждал кросс-модельного ревьюера и не дождался его до "
+            "дедлайна слота: прогон не начинался — " + generic
+        )
+    if code:
+        return f"{generic} (последний отказ: {code})"
+    return generic
 
 
 async def order_due_dor_runs(db: aiosqlite.Connection) -> int:
@@ -914,9 +1117,13 @@ async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
     same pass may have just recorded closing runs above, but touches no run
     and no order — it only ever writes an alert, never a mode.
     """
+    from hub.services.steward_judgement import stamp_judgement_usage
     from hub.services.steward_shadow import check_escalation_corridor, start_due_runs
 
     await close_finished_runs(db)
+    # Цена суждений, закрытых раньше (#1328): только чтение у провайдера, ни
+    # одного заказа — поэтому место в проходе ей безразлично.
+    await stamp_judgement_usage(db)
     await order_due_runs(db)
     await order_due_dor_runs(db)
     await start_due_runs(db)

@@ -22,6 +22,7 @@ half-truth #549 and #725 were written to remove.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -32,8 +33,10 @@ from hub.integrations.registry import plugins
 from hub.models import (
     ACLocatorResolution,
     ACTestResultView,
+    BaseMergeState,
     CallSiteEntry,
     CallSiteSection,
+    OnlyTestsOutcomeView,
     CIRunReportState,
     DiffBaseState,
     EvidenceCoverage,
@@ -46,6 +49,7 @@ from hub.models import (
 from hub.services import call_sites, review_evidence
 from hub.services.ac_tests import current_ac_test_results
 from hub.services.ci_report import ci_report_state
+from hub.services.review_availability import generation_review
 from hub.services.statement_freshness import statement_freshness
 from hub.services.test_existence import (
     collect_test_nodeids,
@@ -179,6 +183,119 @@ async def build_call_sites_section(
     )
 
 
+async def base_merge_section(db, task_view) -> BaseMergeState:
+    """Будущий конфликт с базой, названный ДО вердикта (#1233, AC-1).
+
+    Четыре исхода, и ни один не подменяет другой. ``not_applicable`` — спрашивать
+    нечего (не гейт или нет PR). ``unknown`` — спросить не удалось; это НЕ
+    «чисто», и человек должен видеть разницу. ``conflicting`` — мерж не будет
+    чистым, и файлы названы, когда git смог их назвать.
+
+    09.09.2026 человек одобрил #1204 в 05:48 и через четырнадцать секунд узнал
+    из отказа доставки, что ветка конфликтует с базой в трёх файлах. Вердикт к
+    тому моменту уже был потрачен.
+    """
+    if task_view.status not in GATE_STATUSES or not task_view.pr_number:
+        return BaseMergeState(
+            state="not_applicable",
+            reason="расхождение с базой спрашивается на гейте и только при PR",
+        )
+    from hub import services
+
+    try:
+        ctx = await services.project_git_context(db, task_view.id)
+        outcome, detail = await plugins.git_ops.check_pr_mergeable(
+            task_view.pr_number,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
+        )
+    except Exception as exc:  # noqa: BLE001 - блок отвечает причиной, не молчанием
+        log.warning("base-merge probe failed for #%s: %s", task_view.id, exc)
+        return BaseMergeState(state="unknown", reason=f"спросить не удалось: {exc}")
+    value = getattr(outcome, "value", str(outcome))
+    if value == "mergeable":
+        return BaseMergeState(state="clean", reason=detail or "мерж будет чистым")
+    if value != "conflicting":
+        return BaseMergeState(state="unknown", reason=detail or value)
+    # Имена файлов приезжают в детали от того же расчёта, что читает доставка;
+    # разбираются здесь, чтобы читателю не пришлось разбирать строку глазами.
+    files = [
+        part.strip()
+        for part in detail.split(":", 1)[-1].split(",")
+        if ":" in detail and part.strip()
+    ]
+    return BaseMergeState(
+        state="conflicting",
+        reason=(
+            f"мерж в базу НЕ будет чистым: {detail}. Вердикт сейчас прибит к "
+            f"коммиту, поэтому мерж базы в ветку до доставки может стоить "
+            f"второго одобрения (#1233)"
+        ),
+        files=files,
+    )
+
+
+async def _named_only_tests(
+    db, task_id: int, generation: int, section: CallSiteSection, report_row
+) -> list[str] | None:
+    """The only_tests set the judging party was actually shown (#1254).
+
+    A hub-dispatched order remembers what it named, and that set is scored —
+    a second walk here could see another tree or a stale base and judge the
+    reviewer on questions never asked. With a current report, the order is
+    THE ONE that produced it (``dispatch_for_report``, as second_door_* does):
+    on a ladder or a second door the latest order of the generation may be
+    another one. With no report yet, the latest order is the question still
+    open. With no order (a reviewer who came through the brief itself) the
+    brief's own section is what was shown.
+    """
+    from hub.services.review_dispatch import dispatch_for_report
+
+    row: dict | None
+    if report_row is not None:
+        row = await dispatch_for_report(db, task_id, generation, dict(report_row))
+    else:
+        latest = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+        row = dict(latest) if latest is not None else None
+    if row is not None:
+        raw = row.get("only_tests")
+        try:
+            return None if raw is None else [str(n) for n in json.loads(raw)]
+        except (TypeError, ValueError):
+            log.warning("only_tests of task #%s is not a JSON list", task_id)
+            return None
+    if section.status != call_sites.ANALYSED:
+        return None
+    return [e.symbol for e in section.entries if e.state == call_sites.ONLY_TESTS]
+
+
+async def _read_only_tests_back(
+    db,
+    task_id: int,
+    generation: int,
+    section: CallSiteSection,
+    machine_review,
+    mr_row,
+) -> None:
+    """Per only_tests symbol, what the CURRENT report answered (#1254).
+
+    A report of an older generation answers nothing about this code, so it
+    reads as "no report yet", not as a reviewer who stayed silent.
+    """
+    current = machine_review if machine_review and machine_review.is_current else None
+    named = await _named_only_tests(
+        db, task_id, generation, section, mr_row if current is not None else None
+    )
+    readout = call_sites.only_tests_readout(named, current)
+    section.only_tests_state = readout.state
+    section.only_tests_summary = readout.summary()
+    section.only_tests = [
+        OnlyTestsOutcomeView(symbol=o.symbol, outcome=o.outcome, call_path=o.call_path)
+        for o in readout.outcomes
+    ]
+
+
 async def build_review_brief(
     db, task_id: int, *, self_review_warning: SelfReviewWarning | None = None
 ) -> ReviewBrief | None:
@@ -310,30 +427,23 @@ async def build_review_brief(
     # itself, not as "nothing moved". Costs one fetch, and only when there is
     # a pinned submission to compare against.
     submission_sha = (task_view.submission_sha or "").strip()
-    current_tip = ""
-    sha_check = "unknown"
-    sha_check_reason = "branch tip was not pinned at submission"
+    current_tip, tip_reason = "", ""
     if submission_sha and task_view.branch:
         current_tip, tip_reason = await services.resolve_branch_tip(
             db, task_id, task_view.branch
         )
-        if not current_tip:
-            sha_check_reason = tip_reason
-        elif current_tip == submission_sha:
-            sha_check = "match"
-            # #725: never a bare green word. Beside blocks that produced no
-            # signal, "match" with an empty reason was read as verification,
-            # while this check only knows where a branch pointer stands.
-            sha_check_reason = review_evidence.sha_check_statement(
-                sha_check, submission_sha, current_tip, task_view.branch or ""
-            )
-        else:
-            sha_check = "diverged"
-            sha_check_reason = (
-                f"submitted at {submission_sha[:12]}, branch now at "
-                f"{current_tip[:12]} — the diff under review is not the code "
-                "in the branch"
-            )
+    # #1334: the classification is one function, shared with the review
+    # queue — which feeds it the tip the hub last observed instead of a fetch.
+    sha_check, sha_check_reason = review_evidence.sha_check_of(
+        submission_sha, task_view.branch or "", current_tip, tip_reason
+    )
+
+    # #1233: разойдётся ли ветка с базой при доставке — ДО вердикта, а не
+    # после отказа доставки. Спрашивается только на гейте и только при наличии
+    # PR: у карточки драфта нет причины платить за пробный мерж. Ответ идёт
+    # тем же путём, которым его уже узнаёт доставка (#970/#1116), — второй
+    # расчёт расхождения здесь не заводится.
+    base_merge_state = await base_merge_section(db, task_view)
 
     # #601: where else is each changed symbol called, and does this diff touch
     # those places. Same shape as #506 above and for the same reason: the
@@ -409,6 +519,7 @@ async def build_review_brief(
         freshness=freshness,
         sha_check=sha_check,
         live_check=live_check,
+        base_merge=base_merge_state.model_dump(),
     )
 
     # #808: the block the human reads at the gate, built by the same function
@@ -417,6 +528,14 @@ async def build_review_brief(
     # #1266 (round 2, c0babbdf6d557c91): the top-level field is the SAME
     # object review_report just built — not a second construction of it.
     machine_review = brief_review_report.machine_review
+    await _read_only_tests_back(
+        db,
+        task_id,
+        task_view.submission_generation or 0,
+        call_sites_section,
+        machine_review,
+        mr_row,
+    )
 
     # #890: scope accepted at submission, newest first. Read from the feed
     # rather than a column: the growth IS an event, and an event that only
@@ -476,6 +595,7 @@ async def build_review_brief(
         pr_number=task_view.pr_number,
         diff_command=diff_command,
         diff_base=DiffBaseState(**diff_base),
+        base_merge=base_merge_state,
         evidence_coverage=EvidenceCoverage(**coverage),
         submission_sha=submission_sha,
         current_branch_tip=current_tip,
@@ -490,6 +610,7 @@ async def build_review_brief(
         self_review_warning=self_review_warning,
         stacking_warning=stacking_warning,
         review_in_flight=await review_evidence.inflight_view(db, task_row),
+        current_generation_review=await generation_review(db, task_row),
     )
 
 

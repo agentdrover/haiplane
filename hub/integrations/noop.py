@@ -231,12 +231,24 @@ class NoopGitOps:
         """No git here — the section must read this as "could not look" (#601)."""
         return None
 
+    async def delta_without_base(
+        self, repo: str, base: str, prev: str, current: str
+    ) -> str | None:
+        """No git here — origin is unknown, so the whole delta is read (#1249)."""
+        return None
+
     async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None:
         """No git here — there is no rules file to read (#873)."""
         return None
 
     async def files_at_ref(self, repo: str, ref: str) -> set[str] | None:
         """No git here — "could not look", never "the submission lacks it" (#764)."""
+        return None
+
+    async def files_naming_at_ref(
+        self, repo: str, ref: str, word: str, pathspec: str = "*.py"
+    ) -> set[str] | None:
+        """No git here — "could not look", never "the name is nowhere" (#1287)."""
         return None
 
     async def commit_exists(self, repo: str, sha: str) -> bool | None:
@@ -261,6 +273,17 @@ class NoopGitOps:
         """No git here — "could not look", never "nothing changed" (#825)."""
         return None
 
+    async def commit_in_base_history(
+        self, repo: str, base: str, sha: str
+    ) -> bool | None:
+        """No git here — "could not look", never "not merged yet" (#1239).
+
+        False would tell the card and the evidence packet that an empty diff
+        is an honest "this changed nothing", which is the very reading #1239
+        exists to stop.
+        """
+        return None
+
     async def content_differs(
         self,
         base: str,
@@ -274,6 +297,31 @@ class NoopGitOps:
         release, None makes the caller say why it did nothing.
         """
         return None
+
+    async def base_merge_conflicts(
+        self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
+    ) -> tuple[dict[str, str] | None, str]:
+        """Нет git — «посмотреть не удалось», и никогда «конфликта нет» (#1233).
+
+        Пустой словарь здесь означал бы «база сливается чисто», то есть
+        разрешение доставлять. Это утверждение о репозитории, которого эта
+        интеграция не видит.
+        """
+        return None, "git integration is not configured"
+
+    async def push_resolved_base_merge(
+        self,
+        repo: str,
+        base: str,
+        branch: str,
+        task_id: int,
+        resolutions: dict[str, str],
+        validate: Any = None,
+        tip: str = "",
+        probed: dict[str, str] | None = None,
+    ) -> tuple[bool, str]:
+        """Нет git — автомерж не состоялся, с названной причиной (#1233)."""
+        return False, "git integration is not configured"
 
     async def check_pr_mergeable(
         self,
@@ -588,6 +636,18 @@ class NoopGitOps:
         # runs" is a different answer that would read as a green base (#929).
         return None
 
+    def merge_preserves_ancestry(self, forge: str = "") -> bool:
+        """Заглушка не мержит — значит и родословную ничем не рвёт (#1214).
+
+        Единственное место в этом классе, где содержательный ответ честнее
+        молчания. Остальные заглушки отвечают «спросить не удалось», потому
+        что за ними стоит вопрос к внешнему миру; здесь вопрос к СЕБЕ — какую
+        стратегию мержа применит вот этот код, — и ответ на него известен:
+        никакой. Сказать «метод неприменим» значило бы объявить сломанным то,
+        что ничто не ломало, и погасить настоящее «не доставлено».
+        """
+        return True
+
     async def merge_pr(
         self,
         pr_number: int,
@@ -660,6 +720,13 @@ class NoopForge:
 
     name = "noop"
     can_merge_via_api = False
+    #: Заглушка не сливает ничего, поэтому и переписать сдаточный коммит ей
+    #: нечем (#1214). А раз ``can_merge_via_api=False``, то доставка — если
+    #: она вообще случится — пойдёт через ``merge --no-ff`` в git_ops, где
+    #: родословная сохраняется. Оба соображения дают один ответ, и это тот
+    #: редкий случай, когда заглушке есть что утверждать: молчать здесь
+    #: значило бы объявить неприменимым метод, который ничто не ломало.
+    merge_preserves_ancestry = True
 
     def repo_url(self, gh_repo: str | None = None) -> str:
         return ""

@@ -16,6 +16,7 @@ from hub.actionable_errors import (
     steward_verdict_required_detail,
 )
 from hub.config import TokenIdentity
+from hub.db import fetchall
 from hub.models import (
     STEWARD_CLOSURE_TYPES,
     STEWARD_CONFIDENCE,
@@ -36,6 +37,17 @@ from hub.services.gate_events import (
 
 log = logging.getLogger(__name__)
 
+# Почему у суждения нет числа токенов (#1328). Пустая строка — число есть.
+# Ноль и «неизвестно» — разные состояния: ноль говорит провайдер, а
+# «неизвестно» говорит хаб, и путать их значит выдать молчание за бесплатность.
+TOKENS_PENDING = "pending"
+TOKENS_PROVIDER_NO_ANSWER = "provider_no_answer"
+TOKENS_NO_RUN = "no_run"
+# Сколько ждать usage после записи суждения, прежде чем назвать молчание
+# провайдера окончательным. Usage приходит с задержкой, и прогон может ещё
+# дописывать свой ответ после того, как суждение легло.
+USAGE_ANSWER_WINDOW_MIN = 60
+
 
 def _require_member(field: str, got: str, allowed: tuple[str, ...]) -> None:
     if got not in allowed:
@@ -43,6 +55,25 @@ def _require_member(field: str, got: str, allowed: tuple[str, ...]) -> None:
             422,
             detail=steward_closed_vocabulary_detail(field, got, allowed),
         )
+
+
+def _downgrade_reason(verdict: str, confidence: str, grounds: list) -> str:
+    """Why a verdict is stored as an escalation, or "" when it stands.
+
+    ``low`` confidence beats any verdict (#1022). An approve or a return that
+    names no ground, or states no confidence, cannot be checked by a human or
+    by the hub — it is stored as an escalation too (#1327). An escalation
+    needs neither: it already says "I cannot judge this".
+    """
+    if confidence == "low":
+        return "low_confidence"
+    if verdict == "escalate":
+        return ""
+    if not grounds:
+        return "no_grounds"
+    if not confidence:
+        return "no_confidence"
+    return ""
 
 
 async def record_steward_judgement(
@@ -88,9 +119,10 @@ async def record_steward_judgement(
         _require_member("closure.type", closure.type, STEWARD_CLOSURE_TYPES)
 
     escalate_reason = (body.escalate_reason or "").strip()
-    if confidence == "low":
+    downgrade = _downgrade_reason(submitted_verdict, confidence, body.grounds)
+    if downgrade:
         effective_verdict = "escalate"
-        effective_reason = "low_confidence"
+        effective_reason = downgrade
     else:
         effective_verdict = submitted_verdict
         if effective_verdict == "escalate":
@@ -115,6 +147,9 @@ async def record_steward_judgement(
     if body.closures:
         await _refuse_unknown_closure_uids(db, task_id, body.generation, body.closures)
 
+    model, duration_ms, tokens_reason = await _cost_of_the_run(
+        db, task_id, body.generation, body.kind, body.model
+    )
     inserted = await repo.insert_steward_judgement(
         db,
         task_id=task_id,
@@ -129,11 +164,12 @@ async def record_steward_judgement(
         closures=json.dumps(
             [c.model_dump() for c in body.closures], ensure_ascii=False
         ),
-        model=body.model,
-        tokens_spent=body.tokens_spent,
-        duration_ms=body.duration_ms,
+        model=model,
+        tokens_spent=None,
+        duration_ms=duration_ms,
         submitted_by=identity.username[:100],
         principal_id=identity.principal_id,
+        tokens_unknown_reason=tokens_reason,
     )
     if inserted is None:
         raise HTTPException(
@@ -173,12 +209,160 @@ async def record_steward_judgement(
     )
     await _close_the_order(db, task_id, body.generation, body.kind)
     await db.commit()
+    await _self_approve_if_everything_converged(
+        db, task_id, body.generation, body.kind, effective_verdict
+    )
     saved = await repo.get_steward_judgement_by_id(db, inserted)
     if saved is None:
         raise RuntimeError(
             f"steward judgement {inserted} missing after insert for task #{task_id}"
         )
     return StewardJudgementView(**dict(saved))
+
+
+async def _cost_of_the_run(
+    db, task_id: int, generation: int, kind: str, declared_model: str
+) -> tuple[str, int | None, str]:
+    """Модель, длительность и состояние токенов — по прогону, не по словам (#1328).
+
+    Стюард декларирует модель, токены и длительность сам, и на проде
+    22.09.2026 писал пустую строку или «codex-5.3», пока прогон шёл на
+    gpt-5.3-codex. Хаб знает всё это лучше судьи: модель — в строке прогона
+    (её пишет старт, с учётом замены судьи #1182), старт — там же.
+
+    Длительность меряется от ``started_at``, а не от ``created_at``: второе —
+    время заказа, и заказ мог ждать исполнителя сколько угодно (#1181).
+
+    Токены при записи не известны НИКОМУ: провайдер отдаёт usage после
+    конца прогона, а судья заявляет цифру, которую никто не сверял. Поэтому
+    здесь только причина ``pending`` — число дописывает свип
+    (:func:`stamp_judgement_usage`). Провайдер здесь не зовётся вовсе:
+    запись суждения не ждёт его и не падает из-за него.
+
+    Прогон берётся НАЧАТЫЙ, в любом статусе, а не только открытый (находка
+    cff86ddcaa7db372): код стюарда живёт дольше дедлайна слота, и суждение,
+    пришедшее после таймаута, судил тот же прогон — с той же моделью, тем же
+    стартом и тем же usage. Слот на тройку (задача, поколение, вид) один по
+    уникальному индексу, так что строка однозначна.
+
+    Без начатого прогона (суждение, поданное мимо заказа) источника нет:
+    модель остаётся заявленной, длительности нет, токены — ``no_run``.
+    """
+    from hub.services.steward_dispatch import run_has_started
+
+    rows = await fetchall(
+        db,
+        "SELECT * FROM steward_runs WHERE task_id=? AND generation=? AND kind=?",
+        (task_id, generation, kind),
+    )
+    run = dict(rows[0]) if rows else None
+    if run is None or not run_has_started(run):
+        return declared_model, None, TOKENS_NO_RUN
+    duration_ms: int | None = None
+    if run.get("started_at"):
+        rows = await fetchall(
+            db,
+            "SELECT CAST(ROUND((julianday('now') - julianday(?)) * 86400000) "
+            "AS INTEGER) AS ms",
+            (run["started_at"],),
+        )
+        ms = dict(rows[0]).get("ms") if rows else None
+        duration_ms = max(int(ms), 0) if ms is not None else None
+    return str(run.get("model") or "") or declared_model, duration_ms, TOKENS_PENDING
+
+
+async def stamp_judgement_usage(db) -> int:
+    """Дописать токены суждениям, которые их ждут (#1328). Шаг свипа.
+
+    Спрашивается ТОЛЬКО закончившийся прогон: судья кладёт суждение
+    посреди своей работы и дописывает ответ после, и usage, снятый в эту
+    секунду, был бы неполным числом, которое уже никто не поправит.
+
+    Молчание провайдера не становится нулём. Пока окно ответа
+    (``USAGE_ANSWER_WINDOW_MIN``) не вышло, суждение ждёт следующего прохода;
+    после — причина ``provider_no_answer``, а ``tokens_spent`` остаётся NULL.
+    Ошибка провайдера — то же молчание: свип best-effort и не падает.
+    """
+    from hub.integrations import cursor_cloud
+    from hub.services.review_dispatch import (
+        _TERMINAL_RUN_STATUSES,
+        _provider_token_total,
+    )
+
+    rows = await fetchall(
+        db,
+        "SELECT j.id, r.agent_id, r.run_id, "
+        "j.created_at <= datetime('now', ?) AS window_over "
+        "FROM steward_judgements j JOIN steward_runs r "
+        "ON r.task_id=j.task_id AND r.generation=j.generation AND r.kind=j.kind "
+        "WHERE j.tokens_unknown_reason=? AND r.status != 'open'",
+        (f"-{USAGE_ANSWER_WINDOW_MIN} minutes", TOKENS_PENDING),
+    )
+    stamped = 0
+    for row in rows:
+        item = dict(row)
+        total: int | None = None
+        try:
+            run = await cursor_cloud.get_run(item["agent_id"], item["run_id"])
+            if str((run or {}).get("status") or "").upper() in _TERMINAL_RUN_STATUSES:
+                total = _provider_token_total(
+                    await cursor_cloud.get_usage(
+                        item["agent_id"], item["run_id"] or None
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 — молчание, а не авария свипа
+            log.warning("steward usage not read for judgement %s: %s", item["id"], exc)
+        if total is not None:
+            await repo.set_steward_judgement_tokens(db, item["id"], total, "")
+        elif item["window_over"]:
+            await repo.set_steward_judgement_tokens(
+                db, item["id"], None, TOKENS_PROVIDER_NO_ANSWER
+            )
+        else:
+            continue
+        stamped += 1
+    if stamped:
+        await db.commit()
+    return stamped
+
+
+async def _self_approve_if_everything_converged(
+    db, task_id: int, generation: int, kind: str, verdict: str
+) -> None:
+    """Записанный approve может уехать без человека — если всё сошлось (#1231).
+
+    ТОЛЬКО ``kind=verdict`` и ТОЛЬКО ``approve``. Про драфт здесь решать
+    нечего — у DoR свой привратник (#1159), он в scope_out #1231. А
+    ``changes_requested`` и ``escalate`` самостоятельного одобрения не
+    порождают по определению, и звать правило на них значило бы спрашивать
+    «сошлись ли свидетельства» там, где судья уже сказал «нет».
+
+    Вызов стоит здесь, а не в проходе поллера, ради at-most-once: запись
+    суждения случается ровно один раз на тройку (задача, поколение, kind) —
+    повтор отбивает 409 контракта #1022. Поллер писал бы строку в карточку
+    каждые тридцать секунд, пока задача стоит в review.
+
+    Best effort ТЕМ ЖЕ договором, что и закрытие заказа выше: суждение уже
+    записано и стоит независимо от того, чем кончилось применение. Но
+    молчать про отказ нельзя — проглоченное исключение здесь неотличимо от
+    «правило посмотрело и не одобрило», а это разные вещи: во втором случае
+    задача ждёт человека осознанно, в первом — по недосмотру.
+    """
+    from hub.services.steward_dispatch import KIND_VERDICT
+
+    if kind != KIND_VERDICT or verdict != "approve":
+        return
+    try:
+        from hub.services.steward_applied import apply_self_approval
+
+        await apply_self_approval(db, task_id, generation)
+    except Exception as exc:  # noqa: BLE001 — суждение стоит в любом случае
+        log.warning(
+            "self-approval not applied for task #%s gen %s: %s",
+            task_id,
+            generation,
+            exc,
+        )
 
 
 async def _refuse_unknown_closure_uids(

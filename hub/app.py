@@ -33,6 +33,7 @@ from hub.version import get_app_version
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
+    latest_review_freshness,
     DeliveryAcknowledgement,
     DeliveryObservation,
     DeployCallback,
@@ -59,6 +60,7 @@ from hub.models import (
     BatchApproveResult,
     FindingScope,
     ReviewBrief,
+    ReviewQueueView,
     TaskAnswer,
     TaskReviewVerdict,
     TaskSubmitReview,
@@ -91,6 +93,7 @@ from hub.models import (
     SkillCreate,
     SkillView,
     TaskDecide,
+    TaskReturnToWork,
     TaskDeclareWait,
     TaskForceComplete,
     TaskQuestion,
@@ -1866,7 +1869,7 @@ async def api_task_context(
         lines.append(f"Risks ({len(task_view.risks)}): {risk_brief}")
     if task_view.latest_review:
         lr = task_view.latest_review
-        freshness = "current" if lr.is_current else "stale — work resubmitted"
+        freshness = latest_review_freshness(lr.is_current, lr.closed_by_decision)
         solo = " [SELF-APPROVED: solo mode]" if lr.self_approved else ""
         lines.append(
             f"Latest review: {lr.verdict.value.upper()} "
@@ -2077,6 +2080,21 @@ async def api_delivery_discrepancies(
     )
 
 
+@app.get("/api/review-queue", response_model=ReviewQueueView)
+async def api_review_queue(request: Request, project: str | None = None):
+    """Every submission in review and needs_decision, one row each (#1334).
+
+    Stored facts only — no diff, no fetch per task — so the whole queue costs
+    what one brief's cheapest block does. The CLI and the /review-queue page
+    read the same collector.
+    """
+    from hub.services import review_queue
+
+    db = _db(request)
+    project_id = await services.project_id_for(db, project or None)
+    return await review_queue.review_queue(db, project_id=project_id)
+
+
 @app.post("/api/delivery/discrepancies/{task_id}/observation")
 async def api_record_delivery_observation(
     task_id: int,
@@ -2171,6 +2189,49 @@ async def api_acknowledge_delivery_discrepancy(
     )
     await db.commit()
     return {"task_id": task_id, "acknowledged": True, "reason": body.reason.strip()}
+
+
+@app.post("/api/delivery/discrepancies/{task_id}/deliver")
+async def api_deliver_delivery_discrepancy(
+    task_id: int,
+    request: Request,
+    identity=Depends(require_human_or_admin),
+):
+    """Довести закрытую задачу с открытым PR из реестра расхождений (#1333).
+
+    Тот же путь, что ``pr_disposition=deliver`` при решении: мержит
+    ``deliver_on_disposition`` под условиями гейта (одобрение текущей сдачи,
+    неизменный код, зелёный CI) или отказывает, назвав невыполненное условие.
+    Второго пути мержа здесь нет.
+
+    Только человек: мерж — решение о работе, и агенту, чья задача в реестре,
+    оно не открывается (как и признание рядом). MCP-инструмента нет намеренно
+    — каталог на потолке (#1241), вход через REST, CLI и веб.
+    """
+    try:
+        return await services.deliver_from_registry(
+            _db(request),
+            task_id,
+            by=str(getattr(identity, "username", "") or "human"),
+        )
+    except services.RegistryDeliveryRefused as exc:
+        raise HTTPException(
+            404 if exc.not_found else 409,
+            detail=enrich_error_payload(
+                {
+                    "reason": exc.reason,
+                    "actor_hint": "human",
+                    "message": exc.message,
+                    "hint": (
+                        "Строки реестра: GET /api/delivery/discrepancies."
+                        if exc.not_found
+                        else "Устраните названное условие (сдача, ревью, CI) и "
+                        "повторите; признать расхождение законным — "
+                        f"POST /api/delivery/discrepancies/{task_id}/acknowledge."
+                    ),
+                }
+            ),
+        ) from exc
 
 
 @app.post("/api/deploys", response_model=DeployView)
@@ -2269,6 +2330,7 @@ async def api_ci_run_report(
             reason=body.reason,
             reported_by=body.reported_by or identity.username,
             checks=body.checks,
+            mutations=body.mutations,
         )
     except LookupError:
         raise HTTPException(404, "task not found") from None
@@ -2694,6 +2756,25 @@ async def api_decide_task(
     _identity=Depends(require_human_or_admin),
 ):
     return await services.decide_task(_db(request), task_id, body)
+
+
+@app.post("/api/tasks/{task_id}/return-to-work", response_model=TaskView)
+async def api_return_to_work(
+    task_id: int,
+    body: TaskReturnToWork,
+    request: Request,
+    identity=Depends(require_human_or_admin),
+):
+    """Return an abandoned submission from review/fix_requested to open (#1356).
+
+    Human or admin only; the reason is required (422 when blank). Closes the
+    current approval exactly as rework does, takes the claim off, and leaves
+    branch, PR and submission history in place. No MCP tool on purpose: the
+    catalog is at its budget and the action belongs to a human.
+    """
+    return await services.return_to_work(
+        _db(request), task_id, body, actor=identity.username
+    )
 
 
 @app.post("/api/tasks/{task_id}/force-complete", response_model=TaskView)

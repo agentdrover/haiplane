@@ -638,6 +638,16 @@ def cmd_decide(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_return_to_work(args: argparse.Namespace) -> int:
+    """Human-only: return an abandoned review/fix_requested task to open (#1356)."""
+    body: dict[str, Any] = {"reason": args.reason}
+    if getattr(args, "abandon_active_job", False):
+        body["abandon_active_job"] = True
+    result = _api("POST", f"/api/tasks/{args.task_id}/return-to-work", body)
+    _print_json(result)
+    return 0
+
+
 def cmd_force_complete(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {"comment": args.message or ""}
     result = _api("POST", f"/api/tasks/{args.task_id}/force-complete", body)
@@ -1094,6 +1104,78 @@ def cmd_delivery_observe(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delivery_deliver(args: argparse.Namespace) -> int:
+    """Довести строку реестра pr_open до базы под условиями гейта (#1333).
+
+    Тот же путь, что pr_disposition=deliver: хаб мержит или отказывает,
+    назвав невыполненное условие. Только человеческий токен.
+    """
+    result = _api(
+        "POST", f"/api/delivery/discrepancies/{int(args.task_id)}/deliver", {}
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(
+        f"#{args.task_id}: PR #{result.get('pr_number')} влит под условиями гейта "
+        f"(состояние доставки: {result.get('state')})."
+    )
+    return 0
+
+
+def _review_queue_line(row: dict) -> str:
+    findings = (
+        "нет текущего отчёта"
+        if row.get("findings_confirmed") is None
+        else f"находки {row['findings_confirmed']}/{row.get('findings_unresolved')}"
+    )
+    verdict = row.get("verdict") or "без вердикта"
+    if row.get("verdict") and not row.get("verdict_is_current"):
+        verdict += f" (поколения {row.get('verdict_generation')}, не текущий)"
+    readiness = row.get("readiness")
+    if readiness == "ready_sha_unverified":
+        readiness = "ready, sha не проверен"
+    sha = f"sha {row.get('sha_check')}"
+    # Not a match: the reason says why, and when the tip is fresh it already
+    # opens with the observation age — so it replaces the minutes, not joins them.
+    if row.get("sha_check") != "match" and row.get("sha_check_reason"):
+        sha += f" ({row['sha_check_reason']})"
+    elif row.get("tip_observed_minutes_ago") is not None:
+        sha += f" (наблюдение {row['tip_observed_minutes_ago']} мин назад)"
+    return (
+        f"[{readiness}] #{row['task_id']} {row.get('title', '')} — "
+        f"{row.get('status')}, сдача {row.get('submission_generation')}, "
+        f"{sha}, отчёт {row.get('report_status')}, "
+        f"{findings}, {verdict}, ждёт {row.get('waiting_minutes', '?')} мин"
+    )
+
+
+def cmd_review_queue(args: argparse.Namespace) -> int:
+    """The review queue in one call (#1334) — the same rows the page shows.
+
+    Printed in the API's order (ready, findings, awaiting report, blocked).
+    ``sha unknown`` is printed as itself: the queue does not fetch, and a tip
+    the hub has not observed recently is not a match.
+    """
+    path = "/api/review-queue"
+    if args.project:
+        path += f"?project={urllib.parse.quote(args.project)}"
+    result = _api("GET", path)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    rows = result.get("rows") or []
+    if not rows:
+        print("В review и needs_decision нет ни одной задачи.")
+    for row in rows:
+        print(_review_queue_line(row))
+        if row.get("stall_reason"):
+            print(f"    стойло: {row['stall_reason']}")
+    if result.get("note"):
+        print(result["note"])
+    return 0
+
+
 def cmd_undelivered(args: argparse.Namespace) -> int:
     """Completed tasks whose PR is neither merged nor closed (#897).
 
@@ -1154,7 +1236,8 @@ def cmd_undelivered(args: argparse.Namespace) -> int:
             f"({result.get('sweep_lookback_days', '?')} дней) с открытым PR: "
             f"источники больше не перепрашиваются, ответ застыл. Наблюдением "
             f"эту строку не закрыть — источник ещё отвечает. Выход — довезти "
-            f"работу или признать расхождение законным с причиной."
+            f"работу (oc-hub delivery-deliver <id>) или признать расхождение "
+            f"законным с причиной."
         )
         for row in frozen_pr_open:
             print(f"    #{row['task_id']} — {row.get('age_hours', '?')}ч")
@@ -1877,6 +1960,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_decide.set_defaults(func=cmd_decide)
 
+    # return-to-work — human return of an abandoned submission (#1356)
+    p_return = sub.add_parser(
+        "return-to-work",
+        help=(
+            "Human-only: return a review/fix_requested task to open — closes the "
+            "current approval like rework, takes the claim off, keeps branch/PR"
+        ),
+    )
+    p_return.add_argument("task_id", type=int)
+    p_return.add_argument(
+        "--reason", required=True, help="Why the task goes back to work (recorded)"
+    )
+    p_return.add_argument(
+        "--abandon-active-job",
+        dest="abandon_active_job",
+        action="store_true",
+        help=(
+            "Drop a dispatch job the registry still calls active (a dead "
+            "executor's job stays 'running'); without it such a task is a 409. "
+            "The process is not killed, only unlinked from the task"
+        ),
+    )
+    p_return.set_defaults(func=cmd_return_to_work)
+
     # force-complete — human override of the completion gate
     p_force_complete = sub.add_parser(
         "force-complete",
@@ -2257,6 +2364,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_undelivered.add_argument("--json", action="store_true", help="Print raw JSON")
     p_undelivered.set_defaults(func=cmd_undelivered)
 
+    p_review_queue = sub.add_parser(
+        "review-queue",
+        help="Очередь ревью одной строкой на сдачу: отчёт, находки, вердикт, стойло",
+    )
+    p_review_queue.add_argument("--project", default="", help="Project slug")
+    p_review_queue.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_review_queue.set_defaults(func=cmd_review_queue)
+
     p_delivery_ack = sub.add_parser(
         "delivery-ack",
         help="Признать расхождение доставки законным: оно замолчит, но останется",
@@ -2268,6 +2383,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Почему это законно. Без причины признание было бы выключателем",
     )
     p_delivery_ack.set_defaults(func=cmd_delivery_ack)
+
+    p_delivery_deliver = sub.add_parser(
+        "delivery-deliver",
+        help="Довести строку реестра с открытым PR под условиями гейта (#1333)",
+    )
+    p_delivery_deliver.add_argument("task_id", type=int)
+    p_delivery_deliver.add_argument(
+        "--json", action="store_true", help="Print raw JSON"
+    )
+    p_delivery_deliver.set_defaults(func=cmd_delivery_deliver)
 
     p_delivery_observe = sub.add_parser(
         "delivery-observe",

@@ -25,6 +25,7 @@ from hub import repository as repo
 from hub import services
 from hub.db import fetchall
 from hub.models import MachineReviewSubmit, MachineReviewView
+from hub.services.steward_corridor import outcome_label, report_outcome
 
 log = logging.getLogger("hub")
 
@@ -292,6 +293,15 @@ async def record_machine_review(
         # matches on this and on nothing self-reported.
         principal_id=principal_id,
     )
+    # #1234: лента приёма — тоже читатель ступени. С одними raw/confirmed/
+    # rejected отчёт с нулём подтверждённых и непустым unresolved выглядел в
+    # ней ровно как чистый. Ступень — из той же функции, что и на карточке.
+    outcome = report_outcome(
+        confirmed=body.findings_confirmed,
+        unresolved=body.unresolved,
+        incomplete=body.incomplete is True,
+        raw_count=raw_count,
+    )
     await repo.insert_event(
         db,
         kind="machine_review_completed",
@@ -300,6 +310,8 @@ async def record_machine_review(
         payload={
             "confirmed": len(body.findings_confirmed),
             "rejected": len(body.findings_rejected),
+            "unresolved": len(body.unresolved),
+            "outcome": outcome,
             "raw": raw_count,
             "generation": generation,
         },
@@ -358,7 +370,8 @@ async def record_machine_review(
         "machine_review_completed",
         f"Task #{task_id}: machine review — {raw_count} raw → "
         f"{len(body.findings_confirmed)} confirmed, "
-        f"{len(body.findings_rejected)} rejected",
+        f"{len(body.findings_rejected)} rejected, "
+        f"{len(body.unresolved)} unresolved — {outcome_label(outcome)}",
     )
     saved = await repo.get_latest_machine_review(db, task_id)
     if saved is None:  # pragma: no cover - the INSERT above just ran

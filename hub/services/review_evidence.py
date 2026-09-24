@@ -213,6 +213,32 @@ def sha_check_statement(
     )
 
 
+def sha_check_of(
+    submission_sha: str, branch: str, current_tip: str, tip_reason: str
+) -> tuple[str, str]:
+    """Where the branch stands against the pinned submission: ``(state, reason)``.
+
+    One classifier for every reader (#572, #1334). The brief hands it a tip it
+    has just fetched; the review queue hands it the tip the hub last observed,
+    without fetching. The TIP differs in freshness, the rule does not — and an
+    empty tip is ``unknown`` with its cause, never a ``match``.
+    """
+    submission_sha = (submission_sha or "").strip()
+    if not submission_sha or not branch:
+        return "unknown", "branch tip was not pinned at submission"
+    if not current_tip:
+        return "unknown", tip_reason
+    if current_tip == submission_sha:
+        return "match", sha_check_statement(
+            "match", submission_sha, current_tip, branch
+        )
+    return "diverged", (
+        f"submitted at {submission_sha[:12]}, branch now at "
+        f"{current_tip[:12]} — the diff under review is not the code "
+        "in the branch"
+    )
+
+
 async def live_check_state(
     db: Any, task_id: int, *, delivered_sha: str = "", declared_probe: str = ""
 ) -> dict[str, Any]:
@@ -253,6 +279,11 @@ async def live_check_state(
     sha = row.get("sha") or ""
     mismatch = bool(delivered_sha and sha and sha != delivered_sha)
     reason = row.get("reason") or ""
+    # #837: whether the hub could confirm that what was observed is what
+    # production runs. Carried through rather than dropped (#1231 review): a
+    # reader that sees only the sha learns which commit the OBSERVER named,
+    # which is a claim by the same caller, not a fact the hub checked.
+    deploy_state = row.get("deploy_state") or ""
     if outcome == "failed":
         # #1236: зонд отработал и ответа не принёс. Это НЕ наблюдение, и
         # именно здесь оно могло бы стать им: до появления третьего исхода
@@ -267,6 +298,7 @@ async def live_check_state(
             "sha": sha,
             "delivered_sha": delivered_sha or "",
             "sha_mismatch": mismatch,
+            "deploy_state": deploy_state,
             "recorded_agent": row.get("recorded_agent") or "",
             "created_at": row.get("created_at") or "",
         }
@@ -278,6 +310,7 @@ async def live_check_state(
             "sha": sha,
             "delivered_sha": delivered_sha or "",
             "sha_mismatch": mismatch,
+            "deploy_state": deploy_state,
             "recorded_agent": row.get("recorded_agent") or "",
             "created_at": row.get("created_at") or "",
         }
@@ -295,6 +328,7 @@ async def live_check_state(
         "sha": sha,
         "delivered_sha": delivered_sha or "",
         "sha_mismatch": mismatch,
+        "deploy_state": deploy_state,
         "recorded_agent": row.get("recorded_agent") or "",
         "created_at": row.get("created_at") or "",
     }
@@ -312,6 +346,7 @@ def evidence_coverage(
     freshness: dict[str, Any] | None,
     sha_check: str,
     live_check: dict[str, Any] | None = None,
+    base_merge: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One verdict over every evidence block in the brief (#725).
 
@@ -404,6 +439,28 @@ def evidence_coverage(
         applicable=(
             live_state != "not_applicable" and (delivered or live_state == "done")
         ),
+    )
+    # #1233: разойдётся ли ветка с базой при доставке. СЧЁТНЫЙ блок, а не
+    # сосед у счётчика — по правилу, которое эта же функция записала выше для
+    # #814: блок, показанный в брифе, но не посчитанный, оставляет заголовок
+    # врущим в успокаивающую сторону. Здесь это особенно дорого: «спросить не
+    # удалось» и «мерж будет чистым» ведут человека к разным решениям, а
+    # заголовок «все блоки дали сигнал» стирает между ними разницу — ровно
+    # перед тем вердиктом, который #1233 и бережёт.
+    #
+    # ``sha_check`` не в счёте потому, что отвечает, КУДА показывает ветка;
+    # этот блок отвечает, что доставка сделает с кодом, — вопрос ревью.
+    #
+    # ``None`` — блока в брифе нет вовсе, и требовать сигнала не с чего.
+    # Непустой блок со state=unknown — блок ЕСТЬ, но сигнала не дал, и это
+    # ровно тот случай, ради которого он здесь посчитан.
+    bm = base_merge if base_merge is not None else {"state": "not_applicable"}
+    bm_state = bm.get("state") or "unknown"
+    _note(
+        "base_merge",
+        bm_state in ("clean", "conflicting"),
+        bm.get("reason") or "расхождение с базой спросить не удалось",
+        applicable=bm_state != "not_applicable",
     )
     freshness_state = (freshness or {}).get("state") or "not_checked"
     _note(
@@ -631,29 +688,61 @@ def _parse_dispatch_created(raw: str) -> datetime:
     return datetime.now(UTC)
 
 
+#: Долг второй двери: прогон ревью кончился без отчёта, строка нарочно
+#: оставлена открытой, пока долг не отдан (#1252, ``review_dispatch.
+#: SECOND_DOOR_OWED``). Имя повторено здесь строкой, а не импортировано:
+#: ``review_dispatch`` тянет ``review_evidence`` обратно, и импорт на уровне
+#: модуля замкнул бы круг.
+OWED_SECOND_DOOR = "second_door"
+
+
 def inflight_headline(dispatch: dict[str, Any], *, now: datetime | None = None) -> str:
-    """One line: model, profile, elapsed, grace — the four facts #1027 named."""
+    """One line: model, profile, elapsed, grace — the four facts #1027 named.
+
+    Долг второй двери получает СВОЮ первую половину строки: прогон по нему
+    уже кончился, и назвать его «в полёте» значило бы обещать читателю
+    прилетающий отчёт там, где ждут открытия второй двери.
+    """
     now = now or datetime.now(UTC)
     created = _parse_dispatch_created(str(dispatch.get("created_at") or ""))
     elapsed = max(0, int((now - created).total_seconds() // 60))
     grace = created + timedelta(minutes=config.CURSOR_REVIEW_GRACE_MINUTES)
     model = (dispatch.get("model") or "").strip() or "не заявлена"
     profile = (dispatch.get("profile") or "").strip() or "не заявлен"
+    lead = "ревью в полёте"
+    if dispatch.get("status") == OWED_SECOND_DOOR:
+        lead = "прогон ревью кончился без отчёта, вторая дверь ещё не открыта"
     return (
-        f"ревью в полёте: {model}, профиль {profile}, идёт {elapsed} мин, "
+        f"{lead}: {model}, профиль {profile}, идёт {elapsed} мин, "
         f"grace до {grace.strftime('%Y-%m-%d %H:%M')}"
     )
 
 
-async def inflight_view(db, task_row: dict[str, Any]) -> ReviewInFlight | None:
-    """Active dispatch of the current submission, or None (#1027)."""
+async def inflight_view(
+    db, task_row: dict[str, Any], *, include_owed: bool = False
+) -> ReviewInFlight | None:
+    """Active dispatch of the current submission, or None (#1027).
+
+    ``include_owed`` расширяет ответ ровно на один статус — ``second_door``,
+    долг после прогона, кончившегося без отчёта (#1289, находка
+    bec6db75314abd83). Расширен ЧИТАТЕЛЬ, а не заведён второй: спрашивать
+    ``review_dispatches`` из диспетчера стюарда отдельным запросом значило бы
+    завести второе правило «идёт ли ревью», и разошлось бы оно в сторону
+    «заказывать».
+
+    По умолчанию ответ прежний и узкий: карточка и бриф зовут этот факт
+    ``review_in_flight``, и долг второй двери там не полёт — облачный прогон
+    уже кончился, локальный ещё не заказан. Широко спрашивает только тот,
+    кому важно «есть ли смысл судить сейчас», а не «летит ли платный прогон».
+    """
     task_id = int(task_row["id"])
     generation = int(task_row.get("submission_generation") or 0)
     row = await repo_module.get_review_dispatch_for_generation(db, task_id, generation)
     if row is None:
         return None
     dispatch = dict(row)
-    if dispatch.get("status") != "active":
+    unsettled = {"active"} | ({OWED_SECOND_DOOR} if include_owed else set())
+    if dispatch.get("status") not in unsettled:
         return None
     headline = inflight_headline(dispatch)
     created = _parse_dispatch_created(str(dispatch.get("created_at") or ""))
@@ -697,6 +786,20 @@ async def review_report(
     diff volume that could not be measured is None with a reason (not zero,
     which would claim the branch changed nothing — #518).
     """
+    report = await report_view(db, task_row, mr_row)
+    return await _measure_diff(db, task_row, report)
+
+
+async def report_view(
+    db: Any, task_row: dict[str, Any], mr_row: Any = None
+) -> "ReviewReport":
+    """The report WITHOUT its diff volume: stored facts only (#1334).
+
+    :func:`review_report` is this plus one diff read. The review queue reads
+    this half alone — twenty diffs per call is exactly what made the brief
+    loop time out — and because both go through here, "is the report current"
+    has one answer, not two.
+    """
     from hub.models import MachineReviewView, ReviewReport
 
     generation = task_row.get("submission_generation") or 0
@@ -733,14 +836,19 @@ async def review_report(
         await attach_dispositions(db, machine_review)
         state = "current" if machine_review.is_current else "stale"
 
-    branch = (task_row.get("branch") or "").strip()
-    report = ReviewReport(
+    return ReviewReport(
         state=state,
-        branch=branch,
+        branch=(task_row.get("branch") or "").strip(),
         submission_sha=(task_row.get("submission_sha") or "").strip(),
         machine_review=machine_review,
     )
 
+
+async def _measure_diff(
+    db: Any, task_row: dict[str, Any], report: "ReviewReport"
+) -> "ReviewReport":
+    """Fill the report's diff volume, or say why it could not be read (#518)."""
+    branch = report.branch
     if not branch:
         report.diff_note = "у задачи нет ветки — объём диффа не измерялся"
         return report

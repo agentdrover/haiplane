@@ -50,6 +50,7 @@ from hub.services.ci_report import (
     VALIDATION_FAIL,
     VALIDATION_PASS,
 )
+from hub.services.delivery_state import with_cached_delivery
 
 PRESENT = "present"
 ABSENT = "absent"
@@ -64,6 +65,11 @@ NO_CI_FOR_SHA = "no_ci_for_sha"
 CI_RUN_INCONCLUSIVE = "ci_run_inconclusive"
 TIP_UNREADABLE = "tip_unreadable"
 DIFF_UNREADABLE = "diff_unreadable"
+#: Трёхточечный дифф СХЛОПНУЛСЯ: коммит ветки уже лежит в истории базы, и
+#: ``base...branch`` пуст независимо от того, что сдача меняла. Отдельный код,
+#: а не ``diff_unreadable``: репозиторий прочитан прекрасно, невосстановима
+#: именно поверхность, и отчёту нужно уметь эти две дыры считать порознь.
+DIFF_COLLAPSED = "diff_collapsed"
 SURFACE_UNKNOWN = "surface_unknown"
 NO_STORED_CLASS = "no_stored_class"
 NO_TEST_LOCATORS = "no_test_locators"
@@ -289,14 +295,28 @@ async def _tip_fact(
 
 
 def _surface_fact(
-    task: dict[str, Any], diff_paths: list[str] | None, diff_reason: str
+    task: dict[str, Any],
+    diff_paths: list[str] | None,
+    diff_reason: str,
+    hole: str = "",
 ) -> EvidenceFact:
-    """The actual diff against the declared areas (#550)."""
+    """The actual diff against the declared areas (#550).
+
+    ``hole`` names WHICH absence this is when the diff is gone (#1239): a
+    repository that could not be read and a diff that collapsed are both
+    "no measurement", but only the second one is a measurement the hub
+    destroyed by asking the question the wrong way, and the digest has to be
+    able to count them apart.
+    """
     from hub.services.lifecycle import _surface_check
 
     source = "diff_vs_areas"
     if diff_paths is None:
-        return absent(source, DIFF_UNREADABLE, diff_reason or "дифф ветки не прочитать")
+        return absent(
+            source,
+            hole or DIFF_UNREADABLE,
+            diff_reason or "дифф ветки не прочитать",
+        )
     verdict, undeclared, detail = _surface_check(task, diff_paths, diff_reason)
     if verdict == "unknown":
         return absent(source, SURFACE_UNKNOWN, detail or "сверка областей не выполнена")
@@ -315,6 +335,7 @@ async def _risk_fact(
     task: dict[str, Any],
     diff_paths: list[str] | None,
     diff_reason: str,
+    hole: str = "",
 ) -> EvidenceFact:
     """The stored class beside the one this diff implies (#550/#583).
 
@@ -336,7 +357,7 @@ async def _risk_fact(
     if diff_paths is None:
         return absent(
             source,
-            DIFF_UNREADABLE,
+            hole or DIFF_UNREADABLE,
             f"класс сдачи не пересчитать: {diff_reason or 'дифф не прочитан'}",
         )
     diff_class, reasons = derive_risk_class(
@@ -428,25 +449,148 @@ async def _base_fact(db: aiosqlite.Connection, project_row: Any | None) -> Evide
     )
 
 
-async def _dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFact:
-    """What this task waits for, judged by DELIVERY rather than status (#484/#485)."""
+async def dependency_fact(db: aiosqlite.Connection, task_id: int) -> EvidenceFact:
+    """What this task waits for, judged by DELIVERY rather than status (#484/#485).
+
+    Public because the draft packet (#1158) assembles the same fact from the
+    same edges: two builders of one source would drift, and a steward reading
+    "blocked by nothing" from two different computations could not be told
+    which one it read.
+
+    Доставку здесь НЕ считают заново. Читатель тот же, что у реестра
+    недоставленной работы (#897) — ``with_cached_delivery`` поверх #885, — и
+    по той же причине: пока источников два, суждение стюарда не сойдётся с
+    тем, что хаб считает истиной в другом окне.
+
+    Что было до этого, двумя слоями. Сперва факт считался по ``merges``, а
+    этой колонки в строке уже нет — ``_blocker_entry`` снимает её, разбирая
+    в ``delivered``, — так что недоставленным выходил КАЖДЫЙ блокер (#1158
+    это и починило). Но и сам ``delivered`` с ребра — это счёт по
+    ``pipeline_merges``, то есть по мержам, которые сделал гейт: доставка
+    squash-ом и мерж мимо записи гейта по-прежнему читались как «не
+    доставлено» (#1214, находка 42b59be386311b35). Второй слой снимается
+    здесь.
+
+    Ответ трёхзначный, как и у реестра: ``delivered`` True, False и None =
+    «узнать не удалось». Третье состояние существует, чтобы молчание
+    провайдера не работало основанием эскалации и отказа, — и чтобы случай,
+    в котором родословная не судит по построению (squash-конвейер,
+    ``BASE_UNANSWERABLE_NOTE``), не выдавался за наблюдённое «нет».
+
+    Провайдера пакет не спрашивает: за этот вопрос платит свип, а пакет
+    читает записанное. Сборка пакета не должна стоить сетевого вызова на
+    каждую зависимость.
+    """
     source = "dependency_state"
     edges = await repo.list_task_dependencies(db, task_id)
-    blocked_by = [dict(e) for e in edges.get("blocked_by", [])]
-    undelivered = [e for e in blocked_by if not (e.get("merges") or 0)]
+    blocked_by = await with_cached_delivery(
+        db, [dict(e) for e in edges.get("blocked_by", [])]
+    )
+    undelivered = [e for e in blocked_by if e.get("delivered") is False]
+    unanswerable = [e for e in blocked_by if e.get("delivered") is None]
     return present(
         source,
-        f"блокеров {len(blocked_by)}, не доставлено {len(undelivered)}",
+        f"блокеров {len(blocked_by)}, не доставлено {len(undelivered)}, "
+        f"узнать не удалось {len(unanswerable)}",
         blocked_by=[
             {
                 "task_id": e.get("task_id"),
                 "status": e.get("status"),
-                "delivered": bool(e.get("merges") or 0),
+                # Трёхзначно: True, False и None = «узнать не удалось».
+                # bool() здесь схлопнул бы незнание в отказ — ровно то, что
+                # реестр перестал делать дважды (#897, #1198).
+                "delivered": e.get("delivered"),
+                "delivery_path": e.get("delivery_path", ""),
+                # Почему не доставлено: «PR не заявлен» и «PR не смержен
+                # гейтом» — разные следующие шаги, и репозиторий их уже
+                # различил (#485).
+                "reason": e.get("reason") or "",
             }
             for e in blocked_by
         ],
         undelivered=len(undelivered),
+        unanswerable=len(unanswerable),
     )
+
+
+async def _guard_collapsed_diff(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    diff_paths: list[str] | None,
+    diff_reason: str,
+) -> tuple[list[str] | None, str, str]:
+    """Пустой дифф — не «в границах заявленного», пока не спрошено про предка.
+
+    До #1239 у живого пакета сторожа не было ВОВСЕ, и держался он не проверкой,
+    а стечением обстоятельств: субъект живого пакета — ветка ДО мержа, и пока
+    это так, схлопнуться диффу не на чем. Обстоятельства меняются раньше кода.
+    Собери пакет по уже доставленной задаче — ``branch_diff_paths`` вернёт
+    пустой СПИСОК (не ``None``), ``_surface_fact`` скажет ``present`` и
+    ``within_declared=True``, класс риска не поднимется, и суждение пройдёт по
+    измерению, которого не было. Цена ошибки здесь дороже, чем у карточки: там
+    человек видит пустой экран, здесь судья видит зелёный факт.
+
+    Вопрос задаётся тому же концу, против которого дифф и посчитан:
+    ``commit_in_base_history`` резолвит базу тем же origin-first резолвером,
+    что и ``branch_diff_paths`` (#762). Второго детектора здесь нет — он один
+    и лежит в ``git_ops`` (#1239), рядом с самим вычислением диффа.
+
+    Три ответа, как у git: предок — дыра ``diff_collapsed``; не предок — дифф
+    честно пуст и остаётся пустым; не ответили — дыра ``diff_unreadable``.
+    Свести их в два значило бы вернуть ровно то умолчание, ради снятия
+    которого функция написана.
+
+    И вопрос должно быть КОМУ задать. У проекта без рабочей копии такого
+    конца нет: пустой список тогда приезжает не из сдачи, а из клона хаба,
+    на который ``branch_diff_paths`` молча падает по ``repo=None``. Это
+    та же ложь «в границах заявленного», только вход в неё другой, поэтому
+    здесь тоже ``diff_unreadable``, а не исходная пустота.
+    """
+    from hub import config
+    from hub.integrations.registry import plugins
+    from hub.services.orchestration import project_git_context
+
+    if diff_paths is None or diff_paths:
+        return diff_paths, diff_reason, ""
+    branch = (task.get("branch") or "").strip()
+    if not branch:
+        return diff_paths, diff_reason, ""
+    ctx = await project_git_context(db, task["id"])
+    workspace = (ctx.get("repo") or "").strip()
+    base = (ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
+    if not workspace:
+        # Четвёртого ответа у сторожа нет. Отдать здесь исходный пустой список
+        # значило бы сказать «поверхность измерена и пуста» — а мерить было
+        # негде: ``_resolve_branch_diff`` звал ``branch_diff_paths`` с
+        # ``repo=None``, и та молча упала на ``_repo_root()``, клон ХАБА. В
+        # чужом клоне ветка задачи вполне может быть уже влита, и пустота
+        # приезжает оттуда, а не из сдачи. Спросить о предке не у кого:
+        # вопрос задаётся тому концу, против которого дифф посчитан, а такого
+        # конца у проекта без рабочей копии нет вовсе.
+        return (
+            None,
+            f"дифф {base}...{branch} пуст, а рабочей копии у проекта нет: "
+            "спросить о предке не у кого, и пустота недоказуема как "
+            "измеренная поверхность",
+            DIFF_UNREADABLE,
+        )
+    merged = await plugins.git_ops.commit_in_base_history(workspace, base, branch)
+    if merged is None:
+        return (
+            None,
+            f"дифф {base}...{branch} пуст, а предок ли ветка базы — git не "
+            "ответил: пустота недоказуема как измеренная поверхность",
+            DIFF_UNREADABLE,
+        )
+    if merged:
+        return (
+            None,
+            f"ветка {branch} уже лежит в истории базы {base}: трёхточечный "
+            f"дифф {base}...{branch} схлопнулся в пустой список, и поверхность "
+            "этой сдачи по нему невосстановима",
+            DIFF_COLLAPSED,
+        )
+    return diff_paths, diff_reason, ""
 
 
 async def build_evidence_packet(
@@ -478,6 +622,9 @@ async def build_evidence_packet(
 
     # One walk of the branch feeds two facts, as in auto_verdict (#583).
     diff_paths, diff_reason = await _resolve_branch_diff(db, task)
+    diff_paths, diff_reason, diff_hole = await _guard_collapsed_diff(
+        db, task, diff_paths, diff_reason
+    )
 
     facts = {
         f.source: f
@@ -485,11 +632,11 @@ async def build_evidence_packet(
             await _report_fact(db, task_id, generation),
             await _ci_fact(db, task_id, pinned_sha),
             await _tip_fact(db, task, pinned_sha),
-            _surface_fact(task, diff_paths, diff_reason),
-            await _risk_fact(db, task, diff_paths, diff_reason),
+            _surface_fact(task, diff_paths, diff_reason, diff_hole),
+            await _risk_fact(db, task, diff_paths, diff_reason, diff_hole),
             _locator_fact(brief),
             await _base_fact(db, project_row),
-            await _dependency_fact(db, task_id),
+            await dependency_fact(db, task_id),
         ]
     }
     return EvidencePacket(
@@ -569,6 +716,27 @@ def _quotes(
 QUOTE_TASK_STATEMENT = "task_statement"
 QUOTE_SUBMISSION_SUMMARY = "submission_summary"
 QUOTE_REVIEW_FINDING = "review_finding"
+# Драфтовые входы (#1158). Их объединяет не место в схеме, а происхождение:
+# строку набрал автор постановки, а хаб её только ПЕРЕНОСИТ в факт. Перенос
+# делает такую строку похожей на вычисление хаба, и ровно поэтому она обязана
+# ехать ещё и цитатой: иначе пакет утверждает "подозрений нет" про текст,
+# который никто не смотрел.
+QUOTE_AC_TEST_REF = "ac_test_ref"
+QUOTE_DECLARED_AREA = "declared_area"
+# Предложение про класс риска составляет хаб, но в скобки он вставляет
+# заявленные области ДОСЛОВНО. Авторская здесь половина, и цитируется
+# предложение целиком: резать хабовскую рамку от авторской вставки значило бы
+# завести второй разбор той же строки.
+QUOTE_RISK_CLASS_REASON = "risk_class_reason"
+# Текст постановки, который стюард на драфте читает как техлид (§6.2 спеки,
+# решение владельца по #1158 от 17.09): формулировки критериев, заявленный
+# охват и размер. Фактом ни одно из них не является — хаб не может их
+# перепроверить (§3), — поэтому они едут цитатами, как описание, и проходят ту
+# же проверку на приказ судье.
+QUOTE_AC_TEXT = "ac_text"
+QUOTE_SCOPE_IN = "scope_in"
+QUOTE_SCOPE_OUT = "scope_out"
+QUOTE_SIZE = "size"
 
 # Each signal is (code, matcher). Two shapes only, both about ADDRESSING the
 # judge — not about tone, not about imperatives in general. A statement telling

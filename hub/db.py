@@ -1383,6 +1383,16 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE ci_run_reports ADD COLUMN checks TEXT NOT NULL DEFAULT '{}'",
     ),
     (
+        # Mutation run over the functions a PR changed (#1270): warning only.
+        # Its own column rather than an entry in ``checks``: a check outcome
+        # feeds the reviewer's prepass, and a surviving mutant is a named
+        # suspicion about a test, not proof the code is broken. '{}' for every
+        # older report means "no mutation run was reported" — never "none
+        # survived".
+        "add_ci_run_reports_mutations",
+        "ALTER TABLE ci_run_reports ADD COLUMN mutations TEXT NOT NULL DEFAULT '{}'",
+    ),
+    (
         # Defect passport (#909, epic #900): the stage a defect was caught at.
         #
         # Until now the answer was reconstructed — ``escaped_defects`` infers a
@@ -2053,6 +2063,133 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_review_dispatches_second_door_reason",
         "ALTER TABLE review_dispatches ADD COLUMN second_door_reason TEXT "
         "NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1286: поколение сдачи, чьё одобрение закрыто решением человека
+        # «на доработку». Отдельная колонка, а не обнуление review_verdict:
+        # карточка строит latest_review из полей вердикта, и стирание унесло
+        # бы вместе с окном и находки, и то, что именно было одобрено.
+        # NULL — окно никто не закрывал; новый вердикт снимает отметку
+        # (record_review_verdict), потому что она принадлежит вердикту так же,
+        # как review_self_approved.
+        "add_review_verdict_closed_generation_column",
+        "ALTER TABLE tasks ADD COLUMN review_verdict_closed_generation INTEGER",
+    ),
+    (
+        # #1240: вершина ветки задачи, которую гейт сам переписал сжатием при
+        # доставке (squash_branch). Сдача закрепляет коммит вершины; после
+        # сжатия в базу уходит ДРУГОЙ коммит, и «предок ли сдача базы»
+        # отвечает «нет» на доставленной работе. Этот факт — единственное, по
+        # чему такое «нет» отличимо от настоящего: угадывать по числу коммитов
+        # постановка запрещает. '' — гейт ветку не переписывал или запись
+        # старше этой колонки; ни то, ни другое не читается как «сжато».
+        "add_tasks_gate_squashed_sha",
+        "ALTER TABLE tasks ADD COLUMN gate_squashed_sha TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1328: когда прогон стюарда НАЧАЛ работу. created_at — время
+        # заказа, а заказ может ждать исполнителя долго (#1181): длительность
+        # суждения, отмеренная от заказа, приписала бы судье чужое ожидание.
+        # Ставит её старт прогона (start_run) той же записью, что называет
+        # агента. NULL — прогон не начинался или начат до этой колонки;
+        # старые строки не пересчитываются (scope_out #1328).
+        "add_steward_runs_started_at",
+        "ALTER TABLE steward_runs ADD COLUMN started_at TEXT",
+    ),
+    (
+        # #1328: почему у суждения нет числа токенов. '' — число есть (или
+        # суждение старше колонки); pending — ждём ответа провайдера;
+        # provider_no_answer — окно ответа вышло, провайдер молчал; no_run —
+        # у суждения нет начатого прогона, спрашивать не о чем. Ноль в
+        # tokens_spent означает только ответ провайдера «ноль».
+        "add_steward_judgements_tokens_unknown_reason",
+        "ALTER TABLE steward_judgements ADD COLUMN tokens_unknown_reason TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1254: символы only_tests, названные ревьюеру в ЭТОМ заказе, JSON-
+        # списком. Бриф судит итог ровно по нему, а не по второму разбору,
+        # который мог увидеть другое дерево или протухшую базу. NULL — разбор
+        # при заказе не состоялся (или строка старше колонки), «[]» — прошёл
+        # и не назвал никого: разные ответы (#750).
+        "add_review_dispatches_only_tests",
+        "ALTER TABLE review_dispatches ADD COLUMN only_tests TEXT",
+    ),
+    # --- #1343: реестр мержей гейта держится за мерж, а не за номер PR. ------
+    #
+    # UNIQUE (project_id, pr_number) плюс INSERT OR IGNORE молча выбрасывали
+    # новый мерж, если его номер PR уже занят строкой старого репозитория:
+    # проект переехал, нумерация PR началась заново, 224 строки до PR 471
+    # остались. С 15.09 так потеряны 31 доставка, и drift-guard называл мержи
+    # гейта «мимо гейта». Номер PR — текст для контекста (#534), доказательство
+    # мержа — merge_sha, им и ключуемся.
+    #
+    # В SQLite ограничение таблицы снимается только пересборкой. Шаги идут
+    # отдельными записями, потому что _migrate исполняет по одному оператору,
+    # но транзакция у них одна: _migrate коммитит один раз в конце, а первая
+    # же отметка в _migrations открывает транзакцию. Упадёт любой шаг — откат
+    # вернёт старую таблицу со строками, и ни одна отметка rekey_* не
+    # сохранится (test_pipeline_merges_rekey_is_all_or_nothing). Первым шагом
+    # идёт уборка копии, чтобы повтор после сбоя начинал с чистого места.
+    (
+        "rekey_pipeline_merges_clear",
+        "DROP TABLE IF EXISTS pipeline_merges_rekeyed",
+    ),
+    (
+        "rekey_pipeline_merges_create",
+        """CREATE TABLE pipeline_merges_rekeyed (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id   INTEGER,
+            pr_number    INTEGER NOT NULL,
+            task_id      INTEGER,
+            merged_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+            merge_sha    TEXT,
+            released_pr  INTEGER,
+            released_sha TEXT
+        )""",
+    ),
+    (
+        # id переносится явно: на него ссылаются ORDER BY id в читателях, и
+        # строки остаются теми же строками, а не новыми с теми же данными.
+        "rekey_pipeline_merges_copy",
+        "INSERT INTO pipeline_merges_rekeyed (id, project_id, pr_number, "
+        "task_id, merged_at, merge_sha, released_pr, released_sha) "
+        "SELECT id, project_id, pr_number, task_id, merged_at, merge_sha, "
+        "released_pr, released_sha FROM pipeline_merges",
+    ),
+    (
+        # AUTOINCREMENT обещает не выдавать id повторно, в том числе id
+        # удалённых строк. Копия знает только максимум уцелевших, поэтому
+        # счётчик старой таблицы переносится, пока она ещё есть.
+        "rekey_pipeline_merges_sequence",
+        "UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE((SELECT s.seq "
+        "FROM sqlite_sequence s WHERE s.name = 'pipeline_merges'), 0)) "
+        "WHERE name = 'pipeline_merges_rekeyed'",
+    ),
+    (
+        "rekey_pipeline_merges_drop",
+        "DROP TABLE pipeline_merges",
+    ),
+    (
+        "rekey_pipeline_merges_rename",
+        "ALTER TABLE pipeline_merges_rekeyed RENAME TO pipeline_merges",
+    ),
+    (
+        # Ключ — мерж. Индекс частичный: пустой merge_sha значит «коммит не
+        # прочитан» (писатели передают '' при сбое чтения), и это не ключ.
+        # Без WHERE все такие строки проекта схлопнулись бы в одну, то есть
+        # пустой sha глотал бы чужие мержи — та же болезнь, что лечится.
+        # Повтор мержа с пустым sha гасит record_pipeline_merge.
+        "rekey_pipeline_merges_unique_sha",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_pipeline_merges_project_sha "
+        "ON pipeline_merges (project_id, merge_sha) WHERE merge_sha <> ''",
+    ),
+    (
+        # Прежний UNIQUE служил и индексом по проекту; поиск остаётся, а
+        # уникальности больше нет.
+        "rekey_pipeline_merges_project_pr_index",
+        "CREATE INDEX IF NOT EXISTS ix_pipeline_merges_project_pr "
+        "ON pipeline_merges (project_id, pr_number)",
     ),
 ]
 

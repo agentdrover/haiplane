@@ -39,6 +39,7 @@ from typing import Any
 import aiosqlite
 
 from hub import config
+from hub.db import fetchall
 from hub.services import gate_grounds as grounds
 from hub.services.auto_approve import ladder_hits
 from hub.services.steward_evidence import EvidencePacket, build_evidence_packet
@@ -48,6 +49,11 @@ log = logging.getLogger(__name__)
 REFUSED_PRECONDITION = "precondition_failed"
 REFUSED_LADDER = "ladder_surface"
 REFUSED_UNCLOSED = "unclosed_finding"
+# Один актор на обоих гейтах: тот, кто одобрил AC, судит их выполнение
+# (#1162). Код из того же закрытого словаря #1022, где он и заводился;
+# им же названо саморевью в громких основаниях — написание одно.
+REFUSED_SELF_AUTHORED = "self_authored"
+REFUSED_NOT_DELEGATED = "policy_not_delegated"
 
 # Типы закрытия из закрытого словаря #1022, и рядом — ЧЕМ каждый
 # подтверждается. Соответствие публичное, потому что его полноту проверяет
@@ -203,7 +209,7 @@ async def loud_refusals(
             ),
         ),
         (
-            "self_authored",
+            REFUSED_SELF_AUTHORED,
             grounds.self_review_ground(
                 bool(value.get("self_reviewed")),
                 config.REVIEW_SELF_APPROVE == "allow",
@@ -588,6 +594,100 @@ def mode_refusal() -> tuple[str, str] | None:
     )
 
 
+async def self_authored_refusal(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[str, str] | None:
+    """Постановку одобрил стюард — вердикт по ней остаётся человеку (#1162).
+
+    Гейт ревью держится на том, что сдающий и выносящий вердикт — разные
+    акторы (#306, #433). Стюард на двух гейтах разом нарушает это по сути:
+    он одобрил AC, а потом судит, выполнены ли ОНИ, — и слабый критерий,
+    пропущенный на первом гейте, на втором прикроет сам себя.
+
+    Признак — ЗАПИСЬ суждения kind='dor' с вердиктом approve, а не факт
+    прогона: драфт, который стюард прочитал и ВЕРНУЛ, а человек потом
+    одобрил руками, самоавторством не является — решение на том гейте
+    принял человек. По той же причине читается ``verdict``, а не
+    ``submitted_verdict``: одобрение, понижённое политикой до escalate
+    (низкая уверенность, #1022), драфт с гейта не сняло.
+
+    Одобрение относится к РЕДАКЦИИ постановки, а не к задаче (#1282). У
+    строки ``kind='dor'`` колонка ``generation`` и есть поколение
+    постановки (#1156, #1160 — слот dor на уникальном индексе), поэтому
+    второе поле или сверка по времени правки были бы вторым источником той
+    же правды; время к тому же не отличает переписанную постановку от
+    пересохранённой. Если постановку после одобрения переписали, стюард
+    судит не ту редакцию, которую одобрял, — отказа нет: человеческий апрув
+    строки в steward_judgements не оставляет, и поднятое поколение
+    единственный его след.
+
+    Поколение неизвестно, пока базис постановки не снят: при пустом
+    отпечатке счётчик означает «не знаю, правили ли», а не «редакция N»
+    (db.py, add_tasks_statement_generation). Тогда отказ остаётся — решение
+    в сторону человека. Разграничитель именно отпечаток, а не нулевое
+    поколение: ``baseline_if_absent`` снимает базис, не двигая счётчик, и
+    законное одобрение лежит на поколении 0.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT j.generation, t.statement_generation, t.statement_fingerprint "
+        "FROM steward_judgements j JOIN tasks t ON t.id = j.task_id "
+        "WHERE j.task_id=? AND j.kind='dor' AND j.verdict='approve' "
+        "ORDER BY j.id",
+        (task_id,),
+    )
+    if not rows:
+        return None
+    if not str(rows[0]["statement_fingerprint"] or ""):
+        return (
+            REFUSED_SELF_AUTHORED,
+            "постановку этой задачи снял с гейта DoR сам стюард (суждение "
+            "kind=dor, approve), а поколение постановки неизвестно — базис "
+            "не снимался, и нельзя сказать, ту ли редакцию он одобрял; "
+            "решение остаётся человеку",
+        )
+    current = int(rows[0]["statement_generation"] or 0)
+    if not any(int(r["generation"]) == current for r in rows):
+        return None
+    return (
+        REFUSED_SELF_AUTHORED,
+        "постановку этой задачи снял с гейта DoR сам стюард (суждение "
+        f"kind=dor, approve, поколение постановки {current}) — судить "
+        "выполнение им же одобренных AC остаётся человеку",
+    )
+
+
+async def policy_refusal(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[str, str] | None:
+    """Вердикт проекта не отдан стюарду — применять нечего и некому (#1268).
+
+    Теневое участие открывает заказ и суждение, но не решение: вердикт там
+    выносит человек. Проверка стоит здесь, а не на заказе, потому что
+    автономия (``steward_shadow.effective_mode``) глобальна — выданная по
+    измерению одного проекта, она иначе дотянулась бы до любого, где стюарда
+    только слушают, включая репозиторий самого хаба. Режим и автономия этот
+    отказ не снимают: он о том, ЧЬЁ решение, а не о том, насколько судье
+    доверяют.
+
+    Вопрос «отдан ли» задаётся единственному читателю политики стюарда;
+    непрочитанный проект — не отданный.
+    """
+    from hub import repository as repo
+    from hub.services.project_policy import gate_policy_of
+    from hub.services.steward_dispatch import verdict_delegated_to_steward
+
+    project = await repo.resolve_project_for_task(db, task_id)
+    if verdict_delegated_to_steward(project):
+        return None
+    stored = gate_policy_of(project).get("verdict") if project is not None else None
+    return (
+        REFUSED_NOT_DELEGATED,
+        f"политика проекта: verdict={stored or 'human'} — вердикт не отдан "
+        "стюарду, суждение записано в тени и не применяется",
+    )
+
+
 async def apply_refusals(
     db: aiosqlite.Connection, task_id: int, generation: int | None = None
 ) -> list[tuple[str, str]]:
@@ -602,6 +702,7 @@ async def apply_refusals(
     mode = mode_refusal()
     if mode:
         return [mode]
+    not_delegated = await policy_refusal(db, task_id)
     packet = await build_evidence_packet(db, task_id, generation)
     if packet is None:
         return [(REFUSED_PRECONDITION, f"задачи #{task_id} нет")]
@@ -610,7 +711,11 @@ async def apply_refusals(
     row = await repo.get_task(db, task_id)
     task = dict(row) if row is not None else {"id": task_id}
 
-    out = precondition_refusals(packet)
+    out = [not_delegated] if not_delegated else []
+    out.extend(precondition_refusals(packet))
+    self_authored = await self_authored_refusal(db, task_id)
+    if self_authored:
+        out.append(self_authored)
     out.extend(await loud_refusals(db, task, packet))
     out.extend(await closure_refusals(db, task_id, packet))
     ladder = ladder_refusal(packet)

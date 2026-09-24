@@ -345,6 +345,9 @@ class GitOpsPlugin(Protocol):
     async def commit_diff_stat(
         self, repo: str, base: str, sha: str
     ) -> list[tuple[int, int, str]] | None: ...
+    async def commit_in_base_history(
+        self, repo: str, base: str, sha: str
+    ) -> bool | None: ...
     async def is_ancestor(
         self, repo: str, ancestor: str, descendant: str
     ) -> bool | None: ...
@@ -372,6 +375,20 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
     ) -> tuple[MergeabilityOutcome, str]: ...
+    async def base_merge_conflicts(
+        self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
+    ) -> tuple[dict[str, str] | None, str]: ...
+    async def push_resolved_base_merge(
+        self,
+        repo: str,
+        base: str,
+        branch: str,
+        task_id: int,
+        resolutions: dict[str, str],
+        validate: Any = None,
+        tip: str = "",
+        probed: dict[str, str] | None = None,
+    ) -> tuple[bool, str]: ...
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str
     ) -> str | None: ...
@@ -397,6 +414,11 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         base_branch: str | None = None,
     ) -> bool: ...
+    # Синхронный намеренно (#1214): это объявление конвейера, а не запрос к
+    # миру. Асинхронная подпись позвала бы вызывающего платить за ответ,
+    # который известен заранее, — и тем вернула бы стоимость, которой у
+    # проверки применимости метода быть не должно.
+    def merge_preserves_ancestry(self, forge: str = "") -> bool: ...
     async def push_branch(
         self, branch: str, repo: str | None = None, force: bool = False
     ) -> bool: ...
@@ -463,8 +485,14 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
     ) -> tuple[str, str]: ...
     async def branch_diff(self, repo: str, base: str, branch: str) -> str | None: ...
+    async def delta_without_base(
+        self, repo: str, base: str, prev: str, current: str
+    ) -> str | None: ...
     async def file_at_ref(self, repo: str, ref: str, path: str) -> str | None: ...
     async def files_at_ref(self, repo: str, ref: str) -> set[str] | None: ...
+    async def files_naming_at_ref(
+        self, repo: str, ref: str, word: str, pathspec: str = "*.py"
+    ) -> set[str] | None: ...
     async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]: ...
     async def first_parent_log(
         self, repo: str, base: str, limit: int
@@ -609,6 +637,25 @@ class ForgePlugin(Protocol):
     #: То есть форж не сообщает об успехе даже задним числом — вызывающий
     #: обязан знать заранее, что доказательство придётся искать в другом месте.
     can_merge_via_api: bool
+
+    #: Переживёт ли доставка родословную сдаточного коммита (#1214).
+    #:
+    #: True — после мержа сдаточный коммит ОСТАЁТСЯ предком базовой ветки, и
+    #: значит вопрос ``is_ancestor(submission_sha, origin/base)`` содержателен:
+    #: «нет» там означает «работы в базовой ветке нет».
+    #:
+    #: False — доставка пишет НОВЫЙ коммит вместо переноса истории (squash), и
+    #: сдаточный коммит не станет предком базы НИКОГДА. Тот же вопрос тогда
+    #: тоже отвечает «нет» — но это «нет» не про код, а про метод: спросить
+    #: этим способом нельзя. Замер 09.09.2026 на четырёх сдачах (#1186, #878,
+    #: #875, #909) показал 4 из 4: код каждой в develop, предком не является
+    #: ни одна.
+    #:
+    #: Объявлено флагом рядом с ``can_merge_via_api`` и по той же причине:
+    #: стратегию задаёт сам гейт, она известна ДО git-вызова и стоит ноль.
+    #: Выяснять её по истории значило бы задавать тот самый вопрос, чья
+    #: применимость и проверяется.
+    merge_preserves_ancestry: bool
 
     # Адрес репозитория и адрес PR в вебе (#1119). Строит форж, потому что
     # только он знает свой хост И свою форму пути. Форма — не мелочь:

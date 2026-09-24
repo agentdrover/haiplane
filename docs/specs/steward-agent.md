@@ -176,12 +176,17 @@ duration_ms)`
   прогон).
 - `confidence`: `high` | `medium` | `low`. **`low` побеждает `verdict` всегда**:
   хаб применяет такое суждение как `escalate` с кодом `low_confidence`, что бы
-  ни стояло в поле вердикта.
+  ни стояло в поле вердикта. Пустая `confidence` у `approve` или
+  `changes_requested` тоже пишется как `escalate`, с кодом `no_confidence`
+  (#1327).
 - `grounds`: список фактов, каждый с `source` из закрытого множества
   (`ci_pinned_sha`, `machine_review_report`, `diff_vs_areas`, `risk_class`,
   `ac_locator`, `branch_tip`, `red_base`, `dependency_state`). Основание,
   которое хаб не может перепроверить сам, записывается, но **не участвует в
-  допуске**.
+  допуске**. `approve` или `changes_requested` без единого основания хаб
+  пишет как `escalate` с кодом `no_grounds`: такое суждение нельзя
+  перепроверить (#1327). Эскалации основания не нужны. Поданный вердикт в обоих
+  случаях сохраняется в `submitted_verdict`.
 - `closures`: закрытия находок для `approve` на грязном пути (§6.1) — на каждую
   confirmed-находку ровно одно, с типом и ссылкой на проверяемый факт.
 - `findings`: формат вердикта как есть сегодня, со `scope` (`in_scope` /
@@ -296,7 +301,8 @@ scope и `affected_areas`, вычисленный класс риска, зав�
 `report_sibling_mismatch` · `report_incomplete` · `risk_class_raised` ·
 `class_above_policy_ceiling` · `low_confidence` · `passes_disagree` ·
 `author_disputes` · `no_new_information` · `budget_exhausted` · `daily_cap` ·
-`run_failed` · `run_timeout` · `injection_suspected`
+`run_failed` · `run_timeout` · `injection_suspected` · `policy_not_delegated` ·
+`no_grounds` · `no_confidence`
 
 Перечень **закрыт**: кода `unknown` в нём нет — иначе перечень не закрыт, а
 любая новая причина молча складывается в мусорную корзину. Причина, которой в

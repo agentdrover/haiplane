@@ -173,6 +173,27 @@ jobs:
           uv run python scripts/surface_parity.py \
             --base "origin/${{ github.base_ref }}"
 
+      # #1270: spike #1263 — 37 of 234 confirmed findings in 30 days were "this
+      # test does not fail on broken behaviour", and the reviewer named the
+      # surviving mutation himself in 33. The script mutates ONLY the Python
+      # functions this PR changed, runs the tests that reference their files,
+      # and names every survivor. It observes a green baseline by rc first: a
+      # red one is reported as "the series did not run", never as "no
+      # survivors". Warning only, like Surface parity: the script exits 0,
+      # continue-on-error keeps a crash out of the delivery gate, and the
+      # timeout caps the cost (outcome revisit condition: 10 minutes).
+      # Pull requests only: on a push the branch IS the base, the diff is empty.
+      - name: Mutations of changed functions (warning only)
+        id: mutations
+        if: ${{ github.event_name == 'pull_request' }}
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          uv run python scripts/mutation_changed.py \
+            --base "origin/${{ github.base_ref }}" \
+            --budget-seconds 540 \
+            --json-out mutation-report.json
+
       # #546: the hub has no test runner by design, so the evidence for its two
       # SDD gates is produced here and reported back. Placed AFTER the main test
       # step and marked continue-on-error on purpose: the delivery gate
@@ -195,6 +216,8 @@ jobs:
           hub-token: ${{ secrets.HAIPLANE_HUB_CI_TOKEN }}
           head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
           ac-runner: uv run pytest
+          # #1270: its own key in the hub's report, not a `checks` entry.
+          mutations-file: mutation-report.json
           # A step that never ran reports its outcome as '' and is dropped by
           # the reporter — silence, not a pass (#875).
           checks: >-
@@ -241,6 +264,50 @@ jobs:
       # зовёт и `make security` — определение одно, разъехаться нечему.
       - name: Secret scan
         run: uv run python scripts/secret_scan.py
+
+  # #1358: холодный старт из docker-compose.yml (#944, #1336) не проверял ни
+  # один шаг — ни сборку образа, ни /healthz, ни старт без демо-сида. Ревью
+  # PR haiplane#442 потеряло ровно эти три измерения: у облачного ревьюера нет
+  # Docker, а на раннере он есть. Job идёт параллельно test и в needs деплоя
+  # не стоит: прод живёт не в этом образе, и путь выката он не удлиняет.
+  compose-smoke:
+    name: Compose cold start
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # На PR — только когда дифф задевает то, из чего собирается образ.
+      # Push и ручной запуск гоняют всегда: там нет базы для сравнения, а
+      # прогон стоит пару минут.
+      - name: Decide whether the image is touched
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "event $EVENT: smoke runs unconditionally"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          if echo "$changed" | grep -qE '^(Dockerfile|docker-compose\.yml|\.dockerignore|pyproject\.toml|uv\.lock|hub/|scripts/|deploy/docker/)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "image inputs changed: smoke runs"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no image inputs in the diff: smoke skipped"
+          fi
+
+      - name: Compose cold start smoke
+        if: ${{ steps.scope.outputs.run == 'true' }}
+        run: deploy/docker/compose_smoke.sh
 
   deploy:
     name: Deploy to server

@@ -50,6 +50,11 @@ from hub.services import finding_outcome
 from hub.services.ci_report import adopt_ci_run_report
 from hub.services.delivery_state import note_completion_without_delivery
 from hub.services.review_evidence import inflight_verdict_note
+from hub.services import review_limit
+from hub.services.review_limit import (
+    run_allowed_by_review_limit,
+    refuse_opening_over_review_limit,
+)
 from hub.services.outcomes import outcome_status_for_task
 from hub.services.task_idempotency import (
     IdempotencyRecord,
@@ -78,6 +83,7 @@ from hub.models import (
     TaskChildSummary,
     TaskCreate,
     TaskDecide,
+    TaskReturnToWork,
     TaskForceComplete,
     TaskPairStart,
     TaskProgress,
@@ -106,6 +112,7 @@ from hub.services.orchestration import (
     prepare_pair_branch,
     restore_pair_workspace_base,
     review_approved_for_current_submission,
+    review_verdict_covers_current_submission,
     switch_pair_workspace_to_task,
     transition_after_agent_done,
 )
@@ -595,15 +602,35 @@ def parse_review_findings(raw: Any) -> list[ReviewFinding]:
 
 
 def latest_review_projection(task: dict[str, Any]) -> LatestReview | None:
-    """Build the latest-review projection for status/context (#308)."""
+    """Build the latest-review projection for status/context (#308).
+
+    ``is_current`` is asked of the one predicate that owns the question
+    (#1286) instead of being recomputed here: a second copy of the rule would
+    have this card saying the verdict is current while
+    ``review_approved_current`` next to it said the work is not approved.
+
+    ``closed_by_decision`` answers WHY it stopped being current, so it holds
+    only while the closed generation is still the one being worked on.
+    """
     verdict = task.get("review_verdict")
     if not verdict:
         return None
     verdict_generation = task.get("review_verdict_generation") or 0
+    generation = task.get("submission_generation") or 0
+    closed_generation = task.get("review_verdict_closed_generation")
     return LatestReview(
         verdict=verdict,
         submission_generation=verdict_generation,
-        is_current=verdict_generation == (task.get("submission_generation") or 0),
+        is_current=review_verdict_covers_current_submission(task),
+        # The closure speaks about the submission it closed, and only while
+        # that submission is still the current one (#1286). Once the executor
+        # resubmits, the generation moves on: the verdict stops being current
+        # because the work changed, not because a human called it back, and a
+        # card still flying the rework flag would ask for a resubmission that
+        # has already happened.
+        closed_by_decision=(
+            closed_generation == verdict_generation and closed_generation == generation
+        ),
         self_approved=bool(task.get("review_self_approved") or 0),
         findings=parse_review_findings(task.get("review_findings")),
     )
@@ -817,6 +844,9 @@ async def create_task(
 
     initial_status, normalized = normalize_task_create(body)
     request_hash = hash_task_create_payload(normalized) if idem_key else None
+    run_check, run_held = await _plan_created_run(db, normalized)
+    if run_held:
+        initial_status = "open"
 
     try:
         if idem_key:
@@ -890,9 +920,8 @@ async def create_task(
         return CreateTaskOutcome(task=task, is_new=False)
 
     result: dict[str, Any] = {}
-    if normalized.run_immediately and normalized.source != TaskSource.agent:
-        row = await repo.get_task(db, task_id)
-        result = await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
+    if _wants_run(normalized):
+        result = await _run_created_task(db, task_id, run_check, run_held)
 
     await log_activity(
         db,
@@ -903,6 +932,41 @@ async def create_task(
 
     task = await _load_task_view(db, task_id)
     return CreateTaskOutcome(task=task, is_new=True)
+
+
+def _wants_run(normalized: TaskCreate) -> bool:
+    return normalized.run_immediately and normalized.source != TaskSource.agent
+
+
+async def _plan_created_run(
+    db: aiosqlite.Connection, normalized: TaskCreate
+) -> tuple[review_limit.ReviewQueueCheck | None, bool]:
+    """Decide the run of create(run_immediately) BEFORE the row exists (#1264).
+
+    A held run inserts the row as open straight away — never running without
+    a job, not even between two commits. Only the initial status changes, not
+    ``normalized``: the idempotency hash must not depend on the queue.
+    """
+    if not _wants_run(normalized):
+        return None, False
+    check = await review_limit.check_review_queue_for_new_task(
+        db, normalized.parent_id, normalized.class_of_service
+    )
+    return check, check is not None and check.outcome == review_limit.HELD
+
+
+async def _run_created_task(
+    db: aiosqlite.Connection,
+    task_id: int,
+    check: review_limit.ReviewQueueCheck | None,
+    held: bool,
+) -> dict[str, Any]:
+    """Card note for the limit's outcome, then the dispatch it allowed."""
+    await review_limit.note_run_check(db, task_id, check, "создана")
+    if held:
+        return {}
+    row = await repo.get_task(db, task_id)
+    return await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
 
 
 async def create_subtasks_bulk(
@@ -1121,13 +1185,19 @@ async def approve_task(
     if not transitioned:
         raise HTTPException(409, "task is no longer draft (concurrent approve?)")
 
-    if body.run:
+    # #1264: the approval stands; only the run waits for the review queue.
+    run_held = bool(body.run) and not await run_allowed_by_review_limit(
+        db, task_id, "одобрена"
+    )
+    if body.run and not run_held:
         task["status"] = "open"
         await dispatch_task(db, task_id, task)
 
     activity_suffix = ""
     if body.run:
         activity_suffix = f" (run={body.run})"
+    if run_held:
+        activity_suffix += " (run held by the review-queue limit)"
     if dor_override_summary is not None:
         activity_suffix += f" (force=true, missing={dor_override_summary})"
     elif body.force:
@@ -1404,6 +1474,11 @@ async def refuse_opening_without_subject(
                 ),
                 "hint": presence.reason,
                 "missing": list(presence.missing),
+                # Подмножество missing, про которое «не найдено» было бы
+                # неправдой: имя в базовой ветке есть, но не определением
+                # (#1287). Отдельным полем, потому что читатель отказа —
+                # человек или агент — решает по нему, что чинить.
+                "text_only": list(presence.text_only),
                 "found_in_branch": presence.found_in_branch,
                 "found_in_task_id": presence.found_in_task_id,
                 "task_id": task_id,
@@ -1430,6 +1505,9 @@ async def start_task(
     # #1232: before anything is written — the plan update below is a write, and
     # a task refused after it would carry a plan for work it never began.
     await refuse_opening_without_subject(db, task_id, task)
+    # #1264: the same place for the same reason — new work does not open
+    # while the project's review queue is at its limit.
+    await refuse_opening_over_review_limit(db, task_id, task)
 
     body = body or TaskStart()
 
@@ -1557,6 +1635,7 @@ async def pair_start_task(
     # follows writes the plan and prepares a branch, and a task refused after
     # that would leave both behind.
     await refuse_opening_without_subject(db, task_id, task)
+    await refuse_opening_over_review_limit(db, task_id, task)
 
     body = body or TaskPairStart()
 
@@ -1819,10 +1898,64 @@ async def resolve_branch_tip(
         sha = await plugins.git_ops.head_sha(workspace, branch)
         if not sha:
             return "", f"origin/{branch} did not resolve to a commit"
+        _observed_tips[(int(task_id), branch)] = (sha, datetime.now(UTC))
         return sha, ""
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
         log.warning("could not resolve tip of %s for #%s: %s", branch, task_id, exc)
         return "", f"tip resolution failed: {exc}"
+
+
+#: What ``resolve_branch_tip`` last SAW, per task and branch (#1334). Filled
+#: only by an actual observation — submission, the brief, the delivery gate,
+#: the steward all pass through it — and read by the review queue, which must
+#: not fetch per task. In-process on purpose: a restart forgets it, and the
+#: reader then answers ``unknown``, never a remembered ``match``.
+_observed_tips: dict[tuple[int, str], tuple[str, datetime]] = {}
+
+#: How old an observation may be and still be said. Older is ``unknown``: a
+#: tip seen an hour ago says little about where the branch stands now.
+OBSERVED_TIP_MAX_AGE_MINUTES = 30
+
+
+def observed_branch_tip(task_id: int, branch: str) -> tuple[str, str]:
+    """The last observed tip, without touching the network (#1334).
+
+    Same ``(sha, reason)`` contract as :func:`resolve_branch_tip`: an empty
+    sha means "not known" and the reason says why, so the one classifier
+    (``review_evidence.sha_check_of``) reads both the same way.
+    """
+    branch = (branch or "").strip()
+    if not branch:
+        return "", "task has no branch"
+    seen = _observed_tips.get((int(task_id), branch))
+    if seen is None:
+        return "", "вершину ветки хаб с запуска не наблюдал, а очередь в сеть не ходит"
+    sha, at = seen
+    age = int((datetime.now(UTC) - at).total_seconds() // 60)
+    if age > OBSERVED_TIP_MAX_AGE_MINUTES:
+        return "", (
+            f"последнее наблюдение вершины {age} мин назад — старше "
+            f"{OBSERVED_TIP_MAX_AGE_MINUTES} мин, а очередь в сеть не ходит"
+        )
+    return sha, ""
+
+
+def observed_tip_age_minutes(task_id: int, branch: str) -> int | None:
+    """How long ago the remembered tip was seen; None when it never was.
+
+    Said beside every ``sha_check`` the queue prints (#1334, finding
+    b88a2b25931bce2a): a ``match`` resting on an observation is only as good as
+    its age, and the reader must see that age rather than trust a window.
+    """
+    seen = _observed_tips.get((int(task_id), (branch or "").strip()))
+    if seen is None:
+        return None
+    return max(0, int((datetime.now(UTC) - seen[1]).total_seconds() // 60))
+
+
+def forget_observed_tips() -> None:
+    """Drop every remembered observation (tests; a restart does the same)."""
+    _observed_tips.clear()
 
 
 def wait_baseline_for(task: dict[str, Any]) -> dict[str, Any]:
@@ -2047,7 +2180,9 @@ async def _step_finding_outcomes(state: SubmitContext) -> None:
     # The generation asked about is the CURRENT one, before the bump below: the
     # report for the submission being made does not exist yet. On a first
     # submission there are no reports and the gate is silent, which is the
-    # point — it asks only where an answer is owed.
+    # point — it asks only where an answer is owed. If the current generation
+    # went unreviewed, the question is the newest earlier report's (#1331,
+    # finding_outcome.reports_owed_an_answer).
     # Режим берётся у конвейера, если тот его назвал: done-путь объявляет
     # потолок warn, и шаг обязан его соблюдать, а не перечитывать политику
     # мимо потолка (#1122, #1155) — та же правка, что уже сделана у поверхностей.
@@ -2583,8 +2718,13 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         # (опечатка), — не повтор: обычная сдача ответила бы на него 422, и
         # здесь ответ тот же, а не молчаливый успех над выброшенными данными
         # (AC-5; Cursor #380, 97ee0d78bda22c1c).
+        # Отчёты — те же, из которых собран open_items (#1331): у поколения
+        # без ревью это отчёты последнего поколения, где ревью было. Свой
+        # перебор поколения здесь развёл бы «отвечено» и «открыто».
         already_answered: set[str] = set()
-        for report in await repo.machine_reviews_of_generation(db, task_id, generation):
+        for report in await finding_outcome.reports_owed_an_answer(
+            db, task_id, generation
+        ):
             already_answered.update(
                 str(dict(row)["finding_uid"])
                 for row in await repo.list_finding_outcomes(db, int(dict(report)["id"]))
@@ -4006,6 +4146,235 @@ async def declare_task_wait(
     return row_to_task(_existing_task(fresh, task_id))
 
 
+async def close_approval_for_rework(
+    db: aiosqlite.Connection, task_id: int, task: dict[str, Any]
+) -> int | None:
+    """Close the approval window a human decision has just revoked (#422, #1286).
+
+    ONE rule for every human "back to work": the rework branch of
+    :func:`decide_task` and :func:`return_to_work` (#1356) both call this, so
+    what a revocation closes cannot drift between two copies. Returns the
+    generation whose approval was closed, or ``None`` when there was none.
+
+    Rework is the boundary that closes the old arbiter/approval window
+    (#422): reset the cycle, clear the arbiter marker, and close the
+    approval the decision has just revoked, so the reworked submission
+    starts clean and the stale approval cannot count as current.
+    An approval and nothing else: a CHANGES_REQUESTED verdict on this
+    same submission authorised no delivery, so this revokes nothing from it
+    and says nothing about it (#1286 review).
+
+    That last clause used to be a promise the rework branch did not keep
+    (#1286). The verdict stayed bound to the current submission
+    generation, and generations move only on a resubmission — so between
+    the decision and the next submit the work went on counting as
+    approved. Both halves of that were observed on 22.09.2026: the
+    delivery sweep merged #1162 and #1206 after their owner had called
+    them back, and once the executor pushed the fix the branch outran the
+    pinned commit and the task returned to the same human as a
+    stale_approval. The window closes here; the verdict itself, its
+    findings and its generation stay on the card as history.
+    """
+    await repo.update_task(db, task_id, review_cycle=0)
+    await repo.reset_arbiter_state(db, task_id)
+    closed_generation = await repo.close_review_verdict_window(db, task_id)
+    if closed_generation is not None:
+        # Said out loud, because the card now shows an APPROVED verdict
+        # that authorises nothing, and silence there reads as a bug.
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            f"Одобрение ревью (сдача #{closed_generation}"
+            + (
+                f", коммит {(task.get('submission_sha') or '')[:12]}"
+                if (task.get("submission_sha") or "").strip()
+                else ""
+            )
+            + ") закрыто этим решением: работа по нему больше не "
+            "доставляется. Вердикт остаётся в истории задачи; чтобы "
+            "работа поехала, нужна новая сдача через "
+            "hub_submit_for_review и новый вердикт.",
+        )
+    return closed_generation
+
+
+#: Statuses a human may return to work from (#1356): a submission waiting on
+#: a verdict, or sent back and waiting on its executor. Both can be stranded
+#: by an executor who is gone; every other status already has its own exit.
+RETURN_TO_WORK_STATUSES = frozenset({"review", "fix_requested"})
+
+
+def _active_jobs_on_task(task: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """Dispatch jobs the registry still calls active: ``(field, job, status)``.
+
+    Same test as force-complete's: missing or terminal jobs do not count. The
+    registry reads the status from the job's JSON file, and a killed executor
+    leaves ``running`` there forever — so "active" here is the registry's
+    word, not a proof that a process is alive (#1356, finding 8582271d7f92112c).
+    """
+    active: list[tuple[str, str, str]] = []
+    for field in ("job_id", "review_job_id"):
+        job_ref = (task.get(field) or "").strip()
+        if not job_ref:
+            continue
+        blocks, dispatch_status = _dispatch_job_blocks_force_complete(
+            job_ref, plugins.dispatch.get_job(job_ref)
+        )
+        if blocks:
+            active.append((field, job_ref, dispatch_status or "unknown"))
+    return active
+
+
+def _refuse_return_over_active_job(
+    active: list[tuple[str, str, str]], *, abandon: bool
+) -> None:
+    """An active job refuses the return unless the human abandons it by name.
+
+    fix_requested is set ONLY together with a job_id, so without this flag the
+    main case — an executor that died mid-fix — would be a 409 forever.
+    """
+    if not active or abandon:
+        return
+    named = ", ".join(
+        f"{field} {job!r} status={status!r}" for field, job, status in active
+    )
+    raise HTTPException(
+        409,
+        f"active dispatch {named} blocks return to work; if the executor is "
+        "dead, repeat with abandon_active_job=true",
+    )
+
+
+def _abandoned_job_note(field: str, job: str, status: str, *, actor: str) -> str:
+    return (
+        f"Брошен {field} {job} (статус в реестре: {status}): его бросил человек "
+        f"{actor} при возврате в работу. Процесс не остановлен — у хаба нет "
+        "отмены; если он ещё жив, он больше не связан с задачей (#509)."
+    )
+
+
+def _return_to_work_note(
+    task: dict[str, Any], *, actor: str, reason: str, from_status: str
+) -> str:
+    holder = (task.get("claimed_by") or "").strip() or "нет"
+    session = (task.get("claim_session_id") or "").strip() or "—"
+    principal = task.get("implementer_principal_id")
+    return (
+        f"Возвращена в работу человеком {actor} из {from_status}: {reason}\n"
+        f"Прежний держатель: {holder} (сессия {session}, принципал "
+        f"{principal if principal is not None else '—'}); захват снят. "
+        "Ветка, PR, история сдач и находки сохранены. Новый исполнитель "
+        "берёт задачу штатно: hub_claim_task → hub_pair_start "
+        "(git_mode=remote, тот же branch_slug) → hub_submit_for_review."
+    )
+
+
+async def return_to_work(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: TaskReturnToWork,
+    *,
+    actor: str,
+) -> TaskView:
+    """Human action: take an abandoned submission back to ``open`` (#1356).
+
+    From ``review`` or ``fix_requested`` only. It is the rework decision
+    without the dispatch: the approval window closes through the SAME
+    :func:`close_approval_for_rework`, the claim comes off exactly as in
+    :func:`release_task` (implementer principal included), and the task is
+    open for any executor to claim. Branch, PR, submission sha, submissions
+    and findings are left alone.
+
+    The transition is conditional on the status that was read. The delivery
+    gate may be carrying an approved task out of ``review`` at this very
+    moment; if it got there first the return is a 409 and nothing — claim,
+    approval window, feed — has been touched.
+    """
+    row = await repo.get_task(db, task_id)
+    if not row:
+        raise HTTPException(404, "task not found")
+    task = dict(row)
+    from_status = task["status"]
+    if from_status not in RETURN_TO_WORK_STATUSES:
+        raise HTTPException(
+            400,
+            "can only return review or fix_requested tasks to work, "
+            f"current status: {from_status}",
+        )
+    active_jobs = _active_jobs_on_task(task)
+    _refuse_return_over_active_job(active_jobs, abandon=body.abandon_active_job)
+
+    if not await repo.transition_status_if(
+        db, task_id, expected_from=from_status, new_status="open"
+    ):
+        current = dict(_existing_task(await repo.get_task(db, task_id), task_id))
+        raise HTTPException(
+            409,
+            f"Task #{task_id} moved from {from_status} to {current['status']} "
+            "while being returned to work; nothing was changed",
+        )
+
+    closed_generation = await close_approval_for_rework(db, task_id, task)
+    await repo.update_task(
+        db,
+        task_id,
+        claimed_by=None,
+        claim_session_id=None,
+        claimed_at=None,
+        implementer_principal_id=None,
+        # Terminal, missing or abandoned by the human: a job id left on an
+        # open task would keep it out of the pair delivery sweep later.
+        job_id=None,
+        review_job_id=None,
+    )
+    await note_session_task(db, task.get("claim_session_id") or "", None)
+    await repo.add_task_update(
+        db,
+        task_id,
+        actor,
+        "decision",
+        _return_to_work_note(
+            task, actor=actor, reason=body.reason, from_status=from_status
+        ),
+    )
+    for field, job, job_status in active_jobs:
+        await repo.add_task_update(
+            db,
+            task_id,
+            actor,
+            "alert",
+            _abandoned_job_note(field, job, job_status, actor=actor),
+        )
+    await repo.insert_event(
+        db,
+        kind="task_returned_to_work",
+        task_id=task_id,
+        actor=actor,
+        payload={
+            "from_status": from_status,
+            "reason": body.reason,
+            "previous_holder": task.get("claimed_by") or "",
+            "previous_session": task.get("claim_session_id") or "",
+            "previous_principal_id": task.get("implementer_principal_id"),
+            "closed_verdict_generation": closed_generation,
+            "abandoned_jobs": [job for _field, job, _status in active_jobs],
+        },
+    )
+    await db.commit()
+    await log_activity(
+        db,
+        "task_returned_to_work",
+        f"Task #{task_id} returned to work from {from_status} by {actor}",
+        detail=mutation_activity_detail(),
+    )
+
+    row = await repo.get_task(db, task_id)
+    updates = await repo.get_task_updates(db, task_id)
+    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
 async def decide_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -4089,11 +4458,7 @@ async def decide_task(
         if summary_text:
             update_content += f"\nDecision: {summary_text}"
         await repo.add_task_update(db, task_id, "human", "decision", update_content)
-        # Rework is the boundary that closes the old arbiter/verdict window
-        # (#422): reset the cycle and clear the arbiter marker so the reworked
-        # submission starts clean and the stale verdict cannot count as current.
-        await repo.update_task(db, task_id, review_cycle=0)
-        await repo.reset_arbiter_state(db, task_id)
+        closed_generation = await close_approval_for_rework(db, task_id, task)
         # #737: same trace as the accept branch — rework is the "override"
         # outcome of the decision gate.
         await repo.insert_event(
@@ -4104,6 +4469,10 @@ async def decide_task(
             payload={
                 "action": "rework",
                 "entered_at": task.get("status_entered_at") or "",
+                # #1286: how many approvals a rework revokes is a number
+                # somebody will want; reading it out of feed prose is not a
+                # way to count. Null when there was nothing to close.
+                "closed_verdict_generation": closed_generation,
             },
         )
         await db.commit()
@@ -4857,6 +5226,115 @@ async def deliver_on_disposition(
         )
     await db.commit()
     return ok, reason, bool(delivery_pr.unusable and delivery_pr.search_unanswered)
+
+
+class RegistryDeliveryRefused(ValueError):
+    """The registry's deliver action did not merge, and says why (#1333).
+
+    A class rather than an HTTPException for the same reason as
+    ``ObservationRefused``: the HTTP layer picks the code. ``not_found`` is
+    True when there is no registry row to act on at all.
+    """
+
+    def __init__(self, reason: str, message: str, *, not_found: bool = False) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+        self.not_found = not_found
+
+
+REGISTRY_DELIVERY_VIA = "registry_deliver"
+
+#: Начало строки ленты, которой реестр записывает свой отказ. Инбокс читает
+#: причину отказа ИЗ ЛЕНТЫ по этому началу, а не из адреса — адрес можно
+#: собрать руками, лента пишется только хабом.
+REGISTRY_REFUSAL_PREFIX = "Доставка из реестра не выполнена"
+
+
+async def _refuse_registry_delivery(
+    db: aiosqlite.Connection, task_id: int, reason: str, message: str
+) -> RegistryDeliveryRefused:
+    """Записать отказ реестра в ленту задачи и вернуть его для raise."""
+    await repo.add_task_update(db, task_id, "hub", "alert", message)
+    await db.commit()
+    return RegistryDeliveryRefused(reason, message)
+
+
+async def deliver_from_registry(
+    db: aiosqlite.Connection, task_id: int, *, by: str
+) -> dict[str, Any]:
+    """Deliver a completed task's open PR from the discrepancy registry (#1333).
+
+    23.09.2026: #1276, #1249 and #1234 were accepted in the UI without a PR
+    fate and closed with their PRs open. decide works only from
+    needs_decision and force-complete refuses closed tasks, so the only way
+    left was a manual merge past the gate.
+
+    This is NOT a second merge path. It acts only on a row the registry
+    itself lists as ``pr_open`` for a completed task, and the merge is
+    ``deliver_on_disposition`` — the same call a ``pr_disposition=deliver``
+    decision makes, with the gate's own conditions (approved current
+    submission, unchanged tip, green CI). A refusal raises
+    ``RegistryDeliveryRefused`` naming the unmet condition; the row stays.
+    Who may call it is the route's business (human only).
+    """
+    from hub.services.delivery_state import DELIVERED, PR_OPEN, task_delivery
+
+    row = await repo.get_task(db, task_id)
+    stored = await repo.get_delivery_discrepancy(db, task_id) if row else None
+    if row is None or stored is None:
+        raise RegistryDeliveryRefused(
+            "not_in_registry",
+            f"У задачи #{task_id} нет строки в реестре расхождений доставки.",
+            not_found=True,
+        )
+    if dict(row)["status"] != "completed" or stored["state"] != PR_OPEN:
+        raise await _refuse_registry_delivery(
+            db,
+            task_id,
+            "not_pr_open",
+            f"{REGISTRY_REFUSAL_PREFIX} (#{task_id}): строка реестра — "
+            f"{stored['state']} у задачи в статусе {dict(row)['status']}; "
+            "доставлять из реестра можно только закрытую задачу с открытым PR.",
+        )
+    ok, reason, _ = await deliver_on_disposition(
+        db, task_id, DELIVER_DISPOSITION, via=REGISTRY_DELIVERY_VIA
+    )
+    if not ok:
+        raise await _refuse_registry_delivery(
+            db,
+            task_id,
+            reason or "not_delivered",
+            f"{REGISTRY_REFUSAL_PREFIX} (#{task_id}): {reason}. Условия те же, "
+            "что у гейта; строка осталась в реестре.",
+        )
+    task = dict(await repo.get_task(db, task_id) or {})
+    answer = await task_delivery(db, task)
+    await repo.record_delivery_discrepancy(
+        db,
+        task_id=task_id,
+        state=answer["state"],
+        reason=answer["reason"],
+        pr_number=answer["pr_number"],
+        delivery_path=answer["delivery_path"],
+        disposition=DELIVER_DISPOSITION,
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        f"Доставлено из реестра расхождений по решению {by}: PR "
+        f"#{task.get('pr_number')} влит через deliver_on_disposition (#1333).",
+    )
+    await db.commit()
+    return {
+        "task_id": task_id,
+        "delivered": True,
+        "state": answer["state"],
+        "pr_number": task.get("pr_number"),
+        "left_registry": answer["state"] == DELIVERED,
+    }
 
 
 async def withdraw_own_draft(
