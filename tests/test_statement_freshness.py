@@ -24,6 +24,7 @@ from hub.services.statement_freshness import (
     STATE_NO_OVERLAP,
     STATE_NOT_CHECKED,
     STATE_PARTIAL,
+    gate_blind_spot,
     render_freshness,
     statement_freshness,
 )
@@ -370,3 +371,43 @@ async def test_a_real_delivery_still_leads_the_verdict(db):
     assert out["state"] == STATE_DELIVERIES
     assert out["deliveries"], "the recorded delivery is still the headline"
     assert "И это не весь список" in out["reason"]
+
+
+async def test_a_drift_commit_the_ledger_knows_is_not_a_gap(db):
+    # #1367: a gate delivery the ledger lost before #1343 sits in
+    # base_branch_drift. Once its merge_sha is in pipeline_merges of the SAME
+    # project it is the gate's work, not a commit "мимо гейта"; the drift
+    # history row stays. A drift commit without a ledger row counts as before.
+    project_id = await _watched(db)
+    task_id = await _task(db, areas=["hub/app.py"])
+    known, unknown = "1" * 40, "2" * 40
+    for sha in (known, unknown):
+        await repo.record_drift_commit(
+            db,
+            project_id=project_id,
+            sha=sha,
+            branch="develop",
+            subject=f"feat(task): x (#{sha[:2]})",
+            author="someone",
+        )
+    await db.execute(
+        "UPDATE base_branch_drift SET detected_at=? WHERE project_id=?",
+        ("2026-08-05 12:00:00", project_id),
+    )
+    await repo.record_pipeline_merge(
+        db, pr_number=406, merge_sha=known, project_id=project_id, task_id=None
+    )
+    # The same sha recorded for ANOTHER project does not reconcile this one.
+    other = await repo.create_project(db, slug="other", name="Other")
+    await repo.record_pipeline_merge(
+        db, pr_number=7, merge_sha=unknown, project_id=other, task_id=None
+    )
+    await db.commit()
+
+    out = await gate_blind_spot(db, task_id, "2026-08-01 10:00:00")
+
+    assert out["state"] == "gap"
+    assert [c["sha"] for c in out["commits"]] == [unknown[:12]]
+    assert "коммитов мимо гейта: 1" in out["reason"]
+    history = await repo.list_drift_commits(db, project_id, include_ledgered=True)
+    assert len(history) == 2, "история base_branch_drift не удаляется"

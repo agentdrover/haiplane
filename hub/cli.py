@@ -1123,6 +1123,26 @@ def cmd_delivery_deliver(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_merge_ledger_backfill(args: argparse.Namespace) -> int:
+    """Досыпать реестр мержей по собственным записям хаба (#1367).
+
+    По умолчанию сухой прогон: построчно — что допишется, что остаётся
+    дрейфом и почему. Пишет только с ``--apply``. Только админский токен.
+    """
+    from hub.services.merge_ledger_backfill import render_backfill
+
+    result = _api(
+        "POST",
+        "/api/admin/merge-ledger/backfill",
+        {"project": args.project, "apply": bool(args.apply)},
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(render_backfill(result))
+    return 0
+
+
 def _review_queue_line(row: dict) -> str:
     findings = (
         "нет текущего отчёта"
@@ -2363,6 +2383,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_undelivered.add_argument("--json", action="store_true", help="Print raw JSON")
     p_undelivered.set_defaults(func=cmd_undelivered)
+
+    p_ledger = sub.add_parser(
+        "merge-ledger-backfill",
+        help="Досыпать реестр мержей по записям хаба (сухой прогон без --apply)",
+    )
+    p_ledger.add_argument("--project", default="default", help="Project slug")
+    p_ledger.add_argument(
+        "--apply", action="store_true", help="Записать строки (иначе сухой прогон)"
+    )
+    p_ledger.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_ledger.set_defaults(func=cmd_merge_ledger_backfill)
 
     p_review_queue = sub.add_parser(
         "review-queue",

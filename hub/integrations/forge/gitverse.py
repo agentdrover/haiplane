@@ -508,6 +508,12 @@ class GitVerseForge:
             return ""
         return str(resp.data.get("merge_commit_sha") or "").strip()
 
+    async def pr_for_merge_commit(
+        self, sha: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> dict[str, Any] | None:
+        """Поиска PR по коммиту у GitVerse API нет — это причина, не «нет PR»."""
+        raise RuntimeError("GitVerse не ищет PR по мерж-коммиту")
+
     async def pr_mergeability(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> tuple[MergeabilityOutcome, str]:
