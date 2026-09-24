@@ -513,7 +513,7 @@ def _commit_signal(brief: ReviewBrief) -> list[tuple[str, str]]:
         ]
     prepass = brief.prepass
     # #1246: "checked" is read from the prepass alone; the headline carries
-    # the author's word and names a contradiction with it. Derived here by the
+    # the author's lines about runs for a human to compare. Derived here by the
     # function the brief uses, from the same two fields, rather than read from
     # a third one that could disagree with them.
     from hub.services.review_evidence import validation_standing

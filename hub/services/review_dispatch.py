@@ -2085,7 +2085,7 @@ async def prepare_review_order(
 
     prepass = await review_evidence.prepass_state(db, task)
     # #1246: the reviewer is told whether the submission is checked — by the
-    # prepass — and sees the author's claim only as the author's word.
+    # prepass — and sees the author's lines about runs only as his word.
     validation = review_evidence.validation_standing(
         prepass, await review_evidence.latest_submission_text(db, task_id)
     )

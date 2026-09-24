@@ -936,16 +936,17 @@ class ValidationStanding(BaseModel):
     """Whether a submission is checked — by the prepass, not by its text (#1246).
 
     ``state`` is ``passed``, ``failed`` or ``not_run``: three, never two. Only
-    ``passed`` makes ``verified`` true. ``author_claims`` are the green runs
-    the submission TEXT names — the author's word, kept visible and never a
-    basis. ``discrepancy`` is true only where the prepass failed while the
-    text claims green; a prepass that did not run contradicts nothing.
+    ``passed`` makes ``verified`` true. ``author_run_lines`` are the lines of
+    the submission text that talk about runs — quoted as the author's word,
+    never judged for meaning and never a basis. ``needs_human_compare`` is
+    true only where the prepass failed and such lines exist: the hub cannot
+    tell whether they agree with the failure, so a human compares.
     """
 
     state: str = "not_run"
     verified: bool = False
-    author_claims: list[str] = Field(default_factory=list)
-    discrepancy: bool = False
+    author_run_lines: list[str] = Field(default_factory=list)
+    needs_human_compare: bool = False
     headline: str = ""
 
 

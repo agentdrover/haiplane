@@ -266,7 +266,7 @@
         <div class="task-evidence-row">
             <span class="u-text-muted">Сдача проверена:</span>
             <span class="badge badge--xs badge-{{ 'test' if evidence.validation.state == 'passed' else ('failed' if evidence.validation.state == 'failed' else 'pending') }}">{{ evidence.validation.state }}</span>
-            <span{% if evidence.validation.discrepancy %} class="badge badge-failed"{% endif %}>{{ evidence.validation.headline }}</span>
+            <span{% if evidence.validation.needs_human_compare %} class="badge badge-failed"{% endif %}>{{ evidence.validation.headline }}</span>
         </div>
 
         {% if evidence.statement_freshness %}

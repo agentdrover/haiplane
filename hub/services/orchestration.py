@@ -905,7 +905,7 @@ async def practice_metrics(
     human_touches = await _human_touch_metrics(db, since)
     review_outcomes = await _review_outcome_metrics(db, since)
     review_dispatches = await _review_dispatch_spend_metrics(db, since)
-    validation_claims = await _validation_claim_metrics(db, since)
+    validation_run_lines = await _validation_run_line_metrics(db, since)
     # #1238: повторяемость отказов среды. Считается тем же кодом, что решает,
     # является ли отдельный отчёт отказом среды, — двух ответов на один
     # вопрос здесь быть не должно. Окно берётся то же, что у остальных
@@ -943,21 +943,21 @@ async def practice_metrics(
         "steward_shadow": steward_shadow_metrics,
         "human_touches": human_touches,
         "review_outcomes": review_outcomes,
-        # #1246: how often the author's green claim contradicts the prepass,
-        # with the sample printed beside the count.
-        "validation_claims": validation_claims,
+        # #1246: submissions whose prepass failed while the author wrote about
+        # runs — a count for a human to compare, not a claim about meaning.
+        "validation_run_lines": validation_run_lines,
     }
 
 
-async def _validation_claim_metrics(
+async def _validation_run_line_metrics(
     db: aiosqlite.Connection, since: str
 ) -> dict[str, Any]:
-    """Author's claim against the prepass, per current submission (#1246).
+    """Failed prepass with author's lines about runs, per submission (#1246).
 
     The same two functions the brief uses decide each row, so the count and
     the brief cannot disagree about a submission. The sample is the
     submissions the prepass judged; those it never ran on are counted beside
-    it, never inside — no run cannot contradict a claim.
+    it, never inside. The count says nothing about what the lines mean.
     """
     from hub.services import review_evidence
 
@@ -974,7 +974,7 @@ async def _validation_claim_metrics(
         prepass = await review_evidence.prepass_state(db, task)
         text = await review_evidence.latest_submission_text(db, int(row["id"]))
         standings.append(review_evidence.validation_standing(prepass, text))
-    return review_evidence.discrepancy_tally(standings)
+    return review_evidence.run_lines_tally(standings)
 
 
 async def _review_dispatch_spend_metrics(

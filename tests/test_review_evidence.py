@@ -78,8 +78,9 @@ async def _surfaces(client: AsyncClient, db, task_id: int):
 
 
 async def test_a_failed_prepass_outweighs_the_authors_claim(client: AsyncClient, db):
-    # AC-1: prepass failed, the text is green. Nowhere reads it as checked, and
-    # the discrepancy with the claim is named.
+    # AC-1: prepass failed, the text talks green. Nowhere reads it as checked;
+    # the author's lines are quoted and handed to a human to compare — the hub
+    # does not claim to know what they mean (owner's decision, 24.09).
     task_id = await _submitted(client, db, "Spike 1168 shape", _GREEN_CLAIM)
     await _prepass(db, task_id, {"lint": "pass", "security": "pass", "tests": "fail"})
 
@@ -88,33 +89,34 @@ async def test_a_failed_prepass_outweighs_the_authors_claim(client: AsyncClient,
     standing = s["brief"]
     assert standing.state == "failed"
     assert standing.verified is False
-    assert standing.discrepancy is True
-    assert standing.author_claims, "the author's word stays visible"
+    assert standing.needs_human_compare is True
+    assert standing.author_run_lines, "the author's word stays visible"
     assert "СЛОВО АВТОРА" in standing.headline
-    assert "расходится" in standing.headline
+    assert "предпас упал; автор пишет" in standing.headline.lower()
+    assert "расходится" not in standing.headline, "the hub does not know that"
     assert "tests" in standing.headline
 
     prompt = s["reviewer_prompt"]
-    assert "СЛОВО АВТОРА" in prompt and "расходится" in prompt
+    assert "СЛОВО АВТОРА" in prompt and "автор пишет" in prompt
     assert "не проверена" in prompt.lower()
 
     assert "Сдача проверена:" in s["card"]
-    assert "расходится" in s["card"] and "СЛОВО АВТОРА" in s["card"]
+    assert "автор пишет" in s["card"] and "СЛОВО АВТОРА" in s["card"]
 
     steward = dict(s["steward"])
     assert "checks_ran_on_the_submitted_commit" in steward
-    assert "расходится" in steward["checks_ran_on_the_submitted_commit"]
+    assert "автор пишет" in steward["checks_ran_on_the_submitted_commit"]
 
     # And it is counted, with the sample beside it.
-    tally = review_evidence.discrepancy_tally([standing])
-    assert tally["discrepant"] == 1 and tally["sample"] == 1
+    tally = review_evidence.run_lines_tally([standing])
+    assert tally["failed_with_run_lines"] == 1 and tally["sample"] == 1
     assert "1 из 1" in tally["line"]
 
     # The practice metric counts it through the same functions.
     from hub.services.orchestration import practice_metrics
 
-    claims = (await practice_metrics(db))["validation_claims"]
-    assert (claims["discrepant"], claims["sample"]) == (1, 1)
+    runs = (await practice_metrics(db))["validation_run_lines"]
+    assert (runs["failed_with_run_lines"], runs["sample"]) == (1, 1)
 
 
 async def test_a_passing_prepass_needs_no_words(client: AsyncClient, db):
@@ -127,8 +129,8 @@ async def test_a_passing_prepass_needs_no_words(client: AsyncClient, db):
     standing = s["brief"]
     assert standing.state == "passed"
     assert standing.verified is True
-    assert standing.author_claims == []
-    assert standing.discrepancy is False
+    assert standing.author_run_lines == []
+    assert standing.needs_human_compare is False
     assert "СЛОВО АВТОРА" not in s["reviewer_prompt"]
     assert "Сдача проверена предпасом хаба" in s["card"]
     # The steward may still hold on sha or CI grounds (no git here); what it
@@ -136,13 +138,13 @@ async def test_a_passing_prepass_needs_no_words(client: AsyncClient, db):
     steward_reason = dict(s["steward"]).get("checks_ran_on_the_submitted_commit", "")
     assert "предпас" not in steward_reason and "НЕ проверена" not in steward_reason
 
-    tally = review_evidence.discrepancy_tally([standing])
-    assert tally == {**tally, "discrepant": 0, "sample": 1}
+    tally = review_evidence.run_lines_tally([standing])
+    assert tally == {**tally, "failed_with_run_lines": 0, "sample": 1}
 
 
 async def test_not_run_is_its_own_state(client: AsyncClient, db):
     # AC-3: no prepass for this commit. Neither passed nor failed, whatever
-    # the author says — and not counted as a discrepancy either.
+    # the author says — and not flagged for comparison either.
     task_id = await _submitted(client, db, "Nobody ran it", _GREEN_CLAIM)
 
     s = await _surfaces(client, db, task_id)
@@ -151,22 +153,26 @@ async def test_not_run_is_its_own_state(client: AsyncClient, db):
     assert standing.state == "not_run"
     assert standing.state not in {"passed", "failed"}
     assert standing.verified is False
-    assert standing.discrepancy is False, "no run is not a contradiction"
-    assert standing.author_claims, "the claim is still shown"
+    assert standing.needs_human_compare is False, "nothing ran to compare with"
+    assert standing.author_run_lines, "the author's lines are still shown"
     assert "не запускался" in standing.headline
     assert "не проверена" in s["reviewer_prompt"].lower()
     assert "не запускался" in s["card"]
     assert "checks_ran_on_the_submitted_commit" in dict(s["steward"])
 
     # The sample counts only submissions the prepass could judge.
-    tally = review_evidence.discrepancy_tally([standing])
-    assert tally["discrepant"] == 0 and tally["sample"] == 0
+    tally = review_evidence.run_lines_tally([standing])
+    assert tally["failed_with_run_lines"] == 0 and tally["sample"] == 0
     assert tally["not_run"] == 1
 
     from hub.services.orchestration import practice_metrics
 
-    claims = (await practice_metrics(db))["validation_claims"]
-    assert (claims["discrepant"], claims["sample"], claims["not_run"]) == (0, 0, 1)
+    runs = (await practice_metrics(db))["validation_run_lines"]
+    assert (runs["failed_with_run_lines"], runs["sample"], runs["not_run"]) == (
+        0,
+        0,
+        1,
+    )
 
 
 # --- The real path: submission, then the dispatch note (#1246, round 2) -----
@@ -174,7 +180,7 @@ async def test_not_run_is_its_own_state(client: AsyncClient, db):
 # Finding c5f04f6bc0d366a4: the submission text was read as "the newest done,
 # else the newest status". Right after a submission the hub writes its own
 # status — "Кросс-модельное ревью вызвано хабом…" — and every surface then
-# read the hub's line instead of the author's: no claims, no discrepancy, on
+# read the hub's line instead of the author's: no lines, no flag, on
 # every production submission. The AC tests above built the prompt by hand
 # and never dispatched (7c096fa939f686f0), which is how it passed green.
 
@@ -239,53 +245,49 @@ async def test_the_authors_claim_survives_the_dispatch_note(
     assert updates[-1]["content"].startswith("Кросс-модельное ревью вызвано хабом")
 
     prompt = recorder.calls[0]["prompt_text"]
-    assert "СЛОВО АВТОРА" in prompt and "расходится" in prompt
+    assert "СЛОВО АВТОРА" in prompt and "автор пишет" in prompt
 
     brief = await build_review_brief(db, task_id)
     assert brief.validation.state == "failed"
-    assert brief.validation.author_claims, "the author's claim must be found"
-    assert brief.validation.discrepancy is True
-    assert "расходится" in dict(_commit_signal(brief)).get(
+    assert brief.validation.author_run_lines, "the author's lines must be found"
+    assert brief.validation.needs_human_compare is True
+    assert "автор пишет" in dict(_commit_signal(brief)).get(
         "checks_ran_on_the_submitted_commit", ""
     )
     card = (await client.get(f"/tasks/{task_id}")).text
-    assert "СЛОВО АВТОРА" in card and "расходится" in card
-    claims = (await practice_metrics(db))["validation_claims"]
-    assert (claims["discrepant"], claims["sample"]) == (1, 1)
+    assert "СЛОВО АВТОРА" in card and "автор пишет" in card
+    runs = (await practice_metrics(db))["validation_run_lines"]
+    assert (runs["failed_with_run_lines"], runs["sample"]) == (1, 1)
 
 
-# --- What counts as a green claim (finding 0caf1bf5c4c9dda8) ----------------
+# --- Which lines are quoted (owner's decision 24.09, after three rounds) ----
+#
+# The hub no longer judges whether a line claims green: three rounds of
+# regular expressions each found a new negation. Every line that talks about
+# a run is quoted, whatever it says; a text that never mentions one yields
+# nothing.
 
-_CLAIM_TABLE = {
-    "0 passed, 3 failed": False,
-    "12 passed, 1 failed": False,
-    "5 passed, 2 errors": False,
-    "Not all checks passed": False,
-    "не все проверки: All checks passed не вышло": False,
-    "не зелёный": False,
-    "not green": False,
-    "CI is no longer green": False,
-    "4210 passed": True,
-    "4210 passed in 99s": True,
-    "rc=0": True,
-    "exit code 0": True,
-    # Finding 0b51aa0af5130742: an exit status is negated too — before it or
-    # after it, in the same clause.
-    "rc=0 не получен": False,
-    "not rc=0": False,
-    "без exit 0": False,
-    "never got exit code 0": False,
-    "exit 0 not reached": False,
-    "всё зелёное": True,
-    "ruff: All checks passed!": True,
-    "green on CI": True,
-}
+_RUN_LINES = (
+    "rc=0, no failures",
+    "expected rc=0, got rc=1",
+    "0 passed, 3 failed",
+    "всё зелёное",
+    "4210 passed",
+    "Not all checks passed",
+    "exit code 0",
+)
 
 
-def test_a_negated_or_failed_run_is_not_a_green_claim():
-    wrong = {
-        text: expected
-        for text, expected in _CLAIM_TABLE.items()
-        if bool(review_evidence.author_green_claims(text)) is not expected
-    }
-    assert not wrong, f"misclassified (text → expected claim): {wrong}"
+def test_every_line_about_a_run_is_quoted_and_nothing_else():
+    missed = [t for t in _RUN_LINES if review_evidence.author_run_lines(t) != [t]]
+    assert not missed, f"lines about a run that were not quoted: {missed}"
+    assert (
+        review_evidence.author_run_lines(
+            "Сделано. Поправил шаблон карточки; обновил документацию"
+        )
+        == []
+    )
+    # One clause per line, several lines from one text.
+    assert review_evidence.author_run_lines(
+        "ruff: All checks passed; pytest: 0 passed, 3 failed"
+    ) == ["ruff: All checks passed", "pytest: 0 passed, 3 failed"]
