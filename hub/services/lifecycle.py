@@ -108,6 +108,8 @@ from hub.services.orchestration import (
     completion_requires_review,
     detect_branch_stacking,
     dispatch_task,
+    is_base_conflict_entry,
+    needs_decision_entry,
     pair_worktree_info,
     prepare_pair_branch,
     restore_pair_workspace_base,
@@ -1992,6 +1994,8 @@ class SubmitContext:
     body: TaskSubmitReview = dc_field(default_factory=TaskSubmitReview)
 
     resubmitted_from_review: bool = False
+    #: #1362: сдача пришла из needs_decision после конфликта с базой.
+    resubmitted_after_base_conflict: bool = False
     replaced_sha: str = ""
     canonical: str = ""
     reported: str = ""
@@ -2038,7 +2042,9 @@ async def _step_task_is_submittable(state: SubmitContext) -> None:
             "headless tasks are submitted for review by their done report; "
             "submit-for-review is only for pair tasks without a dispatch job",
         )
-    if state.task["status"] not in ("running", "review"):
+    if state.task["status"] == "needs_decision":
+        await _require_base_conflict_entry(state)
+    elif state.task["status"] not in ("running", "review"):
         raise HTTPException(
             400,
             f"can only submit running or under-review pair tasks for review, "
@@ -2047,6 +2053,37 @@ async def _step_task_is_submittable(state: SubmitContext) -> None:
     # #1054: what this submission replaces, read before anything is written.
     state.resubmitted_from_review = state.task["status"] == "review"
     state.replaced_sha = (state.task.get("submission_sha") or "").strip()
+
+
+async def _require_base_conflict_entry(state: SubmitContext) -> None:
+    """Из needs_decision сдаёт автор — только после конфликта с базой (#1362).
+
+    23.09.2026 #1333 и #1337 получили merge_failed по конфликту с develop
+    после доставки соседа, и каждый раз владелец давал rework лишь затем,
+    чтобы агент смог заново взять задачу и пересдать: слить базу — работа
+    автора, решать человеку там нечего. Все прочие причины needs_decision —
+    арбитраж, лимит кругов (#1235), стопка, недоставляемая база, смысловое
+    решение (#1204) — остаются за человеком, и отказ называет, какая именно.
+
+    Причина — из события needs_decision (``needs_decision_entry``), не из
+    ленты. Проверки автора и ветки дальше по конвейеру те же, что у обычной
+    сдачи; судьбу прежнего одобрения решает гейт по своим правилам — новое
+    поколение делает его нетекущим (#1286).
+    """
+    entry = await needs_decision_entry(state.db, state.task)
+    if is_base_conflict_entry(entry):
+        state.resubmitted_after_base_conflict = True
+        return
+    cause = str(entry.get("reason") or "причина не записана")
+    detail = str(entry.get("detail") or "")
+    raise HTTPException(
+        400,
+        "can only submit running or under-review pair tasks for review, "
+        f"current status: needs_decision ({cause}{': ' + detail if detail else ''}). "
+        "From needs_decision the author resubmits only after merge_failed on a "
+        "conflict with the base branch; this cause is a human decision "
+        "(hub_decide_task).",
+    )
 
 
 async def _step_canonical_branch(state: SubmitContext) -> None:
@@ -2842,6 +2879,11 @@ def _submission_update_text(
             f" Пересдача из review: сдача {replaced} заменена на "
             f"{state.submission_sha[:12] if state.submission_sha else '—'}; вердикт "
             "по заменённой сдаче больше не текущий."
+        )
+    if state.resubmitted_after_base_conflict:
+        content += (
+            " Пересдача из needs_decision после merge_failed: конфликт с базой "
+            "слит автором, без решения человека (#1362)."
         )
     if adopted:
         # #1056: the count used to stand here, so five not_found results
