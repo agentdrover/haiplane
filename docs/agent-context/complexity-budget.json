@@ -220,14 +220,6 @@
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
     },
     {
-      "path": "hub/services/review_brief.py",
-      "function": "build_review_brief",
-      "rule": "PLR0915",
-      "measured": 74,
-      "max": 86,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
       "path": "hub/services/risk_class.py",
       "function": "derive_risk_class",
       "rule": "C901",
