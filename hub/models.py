@@ -3359,6 +3359,13 @@ class ApiKeyCreated(ApiKeyView):
     plaintext_key: str
 
 
+class MergeLedgerBackfillRequest(BaseModel):
+    """Body of the merge-ledger backfill (#1367): dry run unless ``apply``."""
+
+    project: str = Field("default", min_length=1, max_length=100)
+    apply: bool = False
+
+
 class AuditEntry(BaseModel):
     id: int
     actor_principal_id: int | None = None

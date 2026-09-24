@@ -511,6 +511,13 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
     ) -> str: ...
+    async def pr_for_merge_commit(
+        self,
+        sha: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> dict[str, Any] | None: ...
     async def pr_state(
         self,
         pr_number: int,
@@ -711,6 +718,11 @@ class ForgePlugin(Protocol):
     async def merge_commit_sha(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> str: ...
+    # #1367: читатель, обратный merge_commit_sha — влитый PR, чей мерж-коммит
+    # и есть этот sha. Только чтение; «спросить не удалось» — исключение.
+    async def pr_for_merge_commit(
+        self, sha: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> dict[str, Any] | None: ...
     async def merge_pr(
         self,
         pr_number: int,

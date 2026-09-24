@@ -246,6 +246,21 @@ lite в среднем 1.38M, deep 3.85M. Столбец Tokens рядом — �
 {{ m.incomplete_reasons.reports_total }} отчётов за
 {{ m.incomplete_reasons.since_days }} дн.</p>
 
+{% if m.review_model_cascade is defined %}
+<h3>Переспрос другой моделью</h3>
+<p class="muted">#1243. Когда отчёт профиля deep сам объявил себя неполным,
+лестница по профилю останавливается, и ТА ЖЕ сдача тем же профилем
+заказывается другой модели. Ценность второй попытки не доказана — поэтому
+рядом с числом попыток стоит, сколько из них дали полный отчёт.</p>
+<p>{{ m.review_model_cascade.share_note }}</p>
+<p class="muted">Попыток: {{ m.review_model_cascade.attempts }} ·
+с отчётом: {{ m.review_model_cascade.reported }} ·
+полных: {{ m.review_model_cascade.complete }} ·
+неполных: {{ m.review_model_cascade.incomplete }} ·
+ждут отчёта: {{ m.review_model_cascade.pending }} за
+{{ m.review_model_cascade.since_days }} дн.</p>
+{% endif %}
+
 <h2>По модели-ревьюеру</h2>
 <p class="muted">Кросс-модельность (#758) выбирает семейство, отличное от
 исполнителя, но до сих пор нечем было сказать, какая из моделей находит

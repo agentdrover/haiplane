@@ -447,6 +447,37 @@ class GitHubForge:
             return ""
         return str((data.get("mergeCommit") or {}).get("oid") or "").strip()
 
+    async def pr_for_merge_commit(
+        self, sha: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> dict[str, Any] | None:
+        """The merged PR whose merge commit is ``sha``, or None (#1367).
+
+        Read-only: ``GET /repos/{repo}/commits/{sha}/pulls``. A PR merely
+        CONTAINING the commit is not an answer — only the one whose
+        ``merge_commit_sha`` equals it and that was merged. Raises when the
+        provider did not answer, so the caller can name the cause.
+        """
+        rc, out, err = await _gh(
+            "api",
+            f"repos/{gh_repo or REPO_NAME}/commits/{sha}/pulls",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            raise RuntimeError((err or out or f"gh api rc={rc}").strip()[:300])
+        try:
+            prs = json.loads(out or "[]")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"нечитаемый ответ провайдера: {exc}") from exc
+        for pr in prs if isinstance(prs, list) else []:
+            if (pr.get("merge_commit_sha") or "") == sha and pr.get("merged_at"):
+                return {
+                    "number": int(pr["number"]),
+                    "head": str((pr.get("head") or {}).get("ref") or ""),
+                    "merge_sha": sha,
+                }
+        return None
+
     async def merge_pr(
         self,
         pr_number: int,

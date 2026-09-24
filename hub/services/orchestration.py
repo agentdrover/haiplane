@@ -910,14 +910,21 @@ async def practice_metrics(
     # является ли отдельный отчёт отказом среды, — двух ответов на один
     # вопрос здесь быть не должно. Окно берётся то же, что у остальных
     # метрик, чтобы число сравнивалось с соседними по строке.
-    from hub.services.review_dispatch import count_environment_refusals
+    from hub.services.review_dispatch import (
+        count_environment_refusals,
+        count_model_cascade_outcomes,
+    )
 
     incomplete_reasons = await count_environment_refusals(db, since_days=since_days)
+    # #1243: исход второй оси каскада — без него выкат был бы добавкой к
+    # счёту, измеренной без пользы. Тот же приём и то же окно.
+    model_cascade = await count_model_cascade_outcomes(db, since_days=since_days)
 
     return {
         "since_days": since_days,
         "machine_reviews": totals,
         "incomplete_reasons": incomplete_reasons,
+        "review_model_cascade": model_cascade,
         "review_dispatches": review_dispatches,
         "by_harness": [dict(r) for r in harness_rows],
         "by_profile": profile_dicts,

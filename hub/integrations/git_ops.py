@@ -3468,6 +3468,24 @@ class GitOpsIntegration:
             pr_number, repo=repo, gh_repo=gh_repo
         )
 
+    async def pr_for_merge_commit(
+        self,
+        sha: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> dict[str, Any] | None:
+        """The merged PR whose merge commit IS ``sha``, or None (#1367).
+
+        Read-only. Returns ``{"number", "head", "merge_sha"}``. Raises when
+        the provider could not be asked — the caller names that as a reason
+        rather than reading it as "no such PR". A forge that cannot answer
+        this question (GitVerse, none configured) raises too, for that reason.
+        """
+        return await self._forge_for(forge).pr_for_merge_commit(
+            sha, repo=repo, gh_repo=gh_repo
+        )
+
     def merge_preserves_ancestry(self, forge: str = "") -> bool:
         """Останется ли сдаточный коммит предком базовой ветки после доставки.
 
