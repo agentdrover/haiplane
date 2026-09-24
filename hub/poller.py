@@ -2116,6 +2116,15 @@ async def _sweep_mcp_retention(db) -> None:
         )
 
 
+async def _sweep_orchestrator_queue(db) -> None:
+    # Очередь исполнения в тени (#1274): для каждого проекта с
+    # orchestrator_queue=shadow — событие «следующей взял бы #N» с причинами
+    # пропуска, только при смене ответа. Ни статуса, ни claim, ни воркспейса.
+    from hub.services.orchestrator_queue import shadow_pass
+
+    await shadow_pass(db)
+
+
 @dataclass(frozen=True)
 class Sweep:
     """One sweep in the tick: a name for the log and the coroutine to run."""
@@ -2152,6 +2161,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("stale_worktrees", _sweep_stale_worktrees),
     Sweep("sessions_retention", _sweep_sessions_retention),
     Sweep("release_policy", _sweep_release_policy),
+    Sweep("orchestrator_queue", _sweep_orchestrator_queue),
     Sweep("messages_retention", _sweep_messages_retention),
     Sweep("mcp_retention", _sweep_mcp_retention),
 )

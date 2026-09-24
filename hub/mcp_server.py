@@ -847,10 +847,42 @@ async def hub_project_status() -> CallToolResult:
             title = d.get("title", "Decision")
             parts.append(f"- {title}")
 
+    queue = await _orchestrator_queue()
+    parts.extend(_queue_lines(queue))
+
     return structured_echo_result(
         "\n".join(parts) if parts else "No activity found.",
         dashboard=data,
+        orchestrator_queue=queue,
     )
+
+
+async def _orchestrator_queue() -> list[dict[str, Any]]:
+    """Ответы очереди исполнения проектов в тени (#1274); пусто при сбое.
+
+    Отдельного инструмента нет намеренно: каталог MCP упёрся в рабочую
+    заморозку описаний (#1241), а обзор проекта — то место, куда агент и
+    так смотрит за «что дальше». Сбой этого чтения не роняет обзор.
+    """
+    try:
+        body = await _api_get("/api/orchestrator/next")
+    except Exception:  # noqa: BLE001 - the overview must survive a missing section
+        return []
+    projects = body.get("projects") if isinstance(body, dict) else None
+    return [p for p in projects or [] if isinstance(p, dict)]
+
+
+def _queue_lines(queue: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for answer in queue:
+        lines.append(
+            f"\n## Next Task (orchestrator queue, {answer.get('mode', 'shadow')}) "
+            f"— {answer.get('project', '?')}"
+        )
+        lines.append(str(answer.get("summary") or ""))
+        for skip in answer.get("skipped") or []:
+            lines.append(f"- #{skip.get('task_id')} {skip.get('detail', '')}")
+    return lines
 
 
 def _tree_query_string(

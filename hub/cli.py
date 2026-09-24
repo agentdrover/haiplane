@@ -1196,6 +1196,25 @@ def cmd_review_queue(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_next_task(args: argparse.Namespace) -> int:
+    """Какую задачу хаб взял бы следующей и почему ждут остальные (#1274)."""
+    path = "/api/orchestrator/next"
+    if args.project:
+        path += "?" + urllib.parse.urlencode({"project": args.project})
+    result = _api("GET", path)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    answers = result.get("projects") or []
+    if not answers:
+        print("No project runs the orchestrator queue (orchestrator_queue=shadow).")
+    for answer in answers:
+        print(
+            f"[{answer.get('project')} · {answer.get('mode')}] {answer.get('summary')}"
+        )
+    return 0
+
+
 def cmd_undelivered(args: argparse.Namespace) -> int:
     """Completed tasks whose PR is neither merged nor closed (#897).
 
@@ -2374,6 +2393,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_prod.add_argument("--json", action="store_true", help="Print raw JSON")
     p_prod.set_defaults(func=cmd_prod_state)
+
+    p_next = sub.add_parser(
+        "next-task", help="Which task the hub would start next, and why others wait"
+    )
+    p_next.add_argument(
+        "--project", default="", help="Project slug (default: shadow ones)"
+    )
+    p_next.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_next.set_defaults(func=cmd_next_task)
 
     p_undelivered = sub.add_parser(
         "undelivered", help="Completed tasks whose PR is still open"

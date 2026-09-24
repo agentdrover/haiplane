@@ -323,6 +323,11 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # project_policy.review_limit_of / review_limit_mode_of.
     "review_limit",
     "review_limit_mode",
+    # #1274: очередь исполнения в тени и WIP-лимит проекта. Не гейт и ничего
+    # не делегирует: тень только пишет событие. Читатели:
+    # project_policy.queue_mode_of / wip_limit_of.
+    "orchestrator_queue",
+    "wip_limit",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -351,6 +356,26 @@ def _validate_review_limit(policy: dict[str, Any]) -> None:
             raise ValueError(
                 "gate_policy review_limit_mode must be one of "
                 f"{', '.join(REVIEW_LIMIT_MODES)}, got: {mode!r}"
+            )
+
+
+def _validate_orchestrator_queue(policy: dict[str, Any]) -> None:
+    """Refuse a queue mode or WIP limit the reader would silently ignore (#1274)."""
+    from hub.services.project_policy import QUEUE_MODES
+
+    if (
+        "orchestrator_queue" in policy
+        and policy["orchestrator_queue"] not in QUEUE_MODES
+    ):
+        raise ValueError(
+            "gate_policy orchestrator_queue must be one of "
+            f"{', '.join(QUEUE_MODES)}, got: {policy['orchestrator_queue']!r}"
+        )
+    if "wip_limit" in policy:
+        limit = policy["wip_limit"]
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError(
+                f"gate_policy wip_limit must be an integer >= 1, got: {limit!r}"
             )
 
 
@@ -2392,6 +2417,7 @@ class ProjectPatch(BaseModel):
         if "risk_map" in v:
             v["risk_map"] = _validated_risk_map(v["risk_map"])
         _validate_review_limit(v)
+        _validate_orchestrator_queue(v)
         return v
 
     @model_validator(mode="before")

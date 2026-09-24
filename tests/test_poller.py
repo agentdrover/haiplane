@@ -2711,6 +2711,9 @@ async def test_the_sweep_order_is_pinned(db):
         "stale_worktrees",
         "sessions_retention",
         "release_policy",
+        # #1274: очередь исполнения в тени — после релиза, чтобы доставка
+        # этого прохода уже снимала зависимости; только пишет событие.
+        "orchestrator_queue",
         "messages_retention",
         "mcp_retention",
     ]
