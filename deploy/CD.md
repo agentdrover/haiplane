@@ -9,6 +9,10 @@
 Workflow: `.github/workflows/ci.yml`, job `deploy`.
 
 1. Job `test` гоняет `ruff check`, `ruff format --check` и `pytest`.
+   Рядом, параллельно, job `compose-smoke` (#1358) поднимает образ из
+   `docker-compose.yml` (`deploy/docker/compose_smoke.sh`): `/healthz` с
+   демо-сидом и без него, на свежем томе. В `needs` деплоя он не стоит —
+   прод живёт не в этом образе. Локально: `deploy/docker/compose_smoke.sh`.
 2. Job `deploy` стартует только если:
    - `test` прошёл (`needs: test`);
    - событие — это `push` в `main` (на `pull_request` деплой не запускается).

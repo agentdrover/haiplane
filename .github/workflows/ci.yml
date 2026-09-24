@@ -265,6 +265,50 @@ jobs:
       - name: Secret scan
         run: uv run python scripts/secret_scan.py
 
+  # #1358: холодный старт из docker-compose.yml (#944, #1336) не проверял ни
+  # один шаг — ни сборку образа, ни /healthz, ни старт без демо-сида. Ревью
+  # PR haiplane#442 потеряло ровно эти три измерения: у облачного ревьюера нет
+  # Docker, а на раннере он есть. Job идёт параллельно test и в needs деплоя
+  # не стоит: прод живёт не в этом образе, и путь выката он не удлиняет.
+  compose-smoke:
+    name: Compose cold start
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # На PR — только когда дифф задевает то, из чего собирается образ.
+      # Push и ручной запуск гоняют всегда: там нет базы для сравнения, а
+      # прогон стоит пару минут.
+      - name: Decide whether the image is touched
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "event $EVENT: smoke runs unconditionally"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          if echo "$changed" | grep -qE '^(Dockerfile|docker-compose\.yml|\.dockerignore|pyproject\.toml|uv\.lock|hub/|scripts/|deploy/docker/)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "image inputs changed: smoke runs"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no image inputs in the diff: smoke skipped"
+          fi
+
+      - name: Compose cold start smoke
+        if: ${{ steps.scope.outputs.run == 'true' }}
+        run: deploy/docker/compose_smoke.sh
+
   deploy:
     name: Deploy to server
     runs-on: ubuntu-latest
