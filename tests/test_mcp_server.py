@@ -4924,3 +4924,244 @@ def test_the_empty_pointer_says_it_in_words_and_not_in_a_placeholder() -> None:
         assert advice.startswith(core), advice
         assert len(advice) > len(core) + 20, advice
         assert advice.rstrip().endswith("."), advice
+
+
+# ---------------------------------------------------------------------------
+# #1364: stateless streamable-HTTP transport
+# ---------------------------------------------------------------------------
+
+_MCP_HEADERS = {
+    "Accept": "application/json, text/event-stream",
+    "Content-Type": "application/json",
+}
+_AGENT_TOKEN = "stateless-agent-token"
+_HUMAN_TOKEN = "stateless-human-token"
+_AGENT_PID = 1101
+_HUMAN_PID = 2202
+
+
+@contextlib.asynccontextmanager
+async def _hub_process():
+    """One "process lifetime" of the MCP transport mounted in the real app.
+
+    A release restarts the hub, and the new process starts with an empty
+    session table. Here that is a fresh session manager — built with the SAME
+    settings the mounted one has, so the mode under test is the production
+    one — swapped into the mounted route and run for the block. Requests still
+    travel through the real app: AuthMiddleware, bearer and identity included.
+    """
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    from hub.app import _mcp_streamable_app
+
+    route = next(
+        r
+        for r in _mcp_streamable_app.routes
+        if hasattr(getattr(r, "endpoint", None), "session_manager")
+    )
+    endpoint: Any = getattr(route, "endpoint")
+    mounted = endpoint.session_manager
+    fresh = StreamableHTTPSessionManager(
+        app=mounted.app,
+        event_store=None,
+        json_response=mounted.json_response,
+        stateless=mounted.stateless,
+        security_settings=mounted.security_settings,
+    )
+    endpoint.session_manager = fresh
+    try:
+        async with fresh.run():
+            yield
+    finally:
+        endpoint.session_manager = mounted
+
+
+@pytest.fixture
+async def stateless_hub(client, db, monkeypatch):
+    """Real app with auth on; tools reach its REST API in-process."""
+    import httpx
+    from httpx import ASGITransport
+
+    from hub import config
+    from hub.app import app
+    from hub.services import mcp_telemetry
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            _AGENT_TOKEN: config.TokenIdentity(
+                "stateless-agent", "agent", principal_id=_AGENT_PID
+            ),
+            _HUMAN_TOKEN: config.TokenIdentity(
+                "stateless-human", "human", principal_id=_HUMAN_PID
+            ),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    # The tool must take the caller's bearer, never a token from the shell.
+    monkeypatch.delenv("HAIPLANE_HUB_TOKEN", raising=False)
+
+    real_client = httpx.AsyncClient
+
+    def _in_process(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = ASGITransport(app=app)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _in_process)
+    mcp_telemetry.set_telemetry_sink(db)
+    try:
+        yield client
+    finally:
+        mcp_telemetry.set_telemetry_sink(None)
+
+
+def _rpc_result(resp: Any) -> dict[str, Any]:
+    """The JSON-RPC result of a streamable-HTTP answer (JSON or one SSE event)."""
+    assert resp.status_code == 200, (resp.status_code, resp.text)
+    if resp.headers.get("content-type", "").startswith("application/json"):
+        body = resp.json()
+    else:
+        data = [
+            line[len("data:") :].strip()
+            for line in resp.text.splitlines()
+            if line.startswith("data:")
+        ]
+        assert data, resp.text
+        body = json.loads(data[-1])
+    assert "error" not in body, body
+    return body["result"]
+
+
+async def _call_tool(
+    client: Any,
+    token: str,
+    name: str,
+    arguments: dict[str, Any],
+    session_id: str | None = None,
+) -> Any:
+    headers = {**_MCP_HEADERS, "Authorization": f"Bearer {token}"}
+    if session_id is not None:
+        headers["Mcp-Session-Id"] = session_id
+    return await client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+    )
+
+
+def _tool_text(result: dict[str, Any]) -> str:
+    assert result.get("isError") is not True, result
+    return "".join(part.get("text", "") for part in result["content"])
+
+
+async def test_stateless_call_after_restart_writes_once(stateless_hub, db):
+    """AC-1 (#1364): a restart between two calls costs the client nothing.
+
+    Before the fix the second process answered the first call of every old
+    session with 404 "Session not found" and ran nothing; Claude Code retried
+    it, the retry wrote, and its reply was lost to the client's own reconnect.
+    """
+    client = stateless_hub
+    created = await client.post(
+        "/api/tasks",
+        json={"title": "stateless restart"},
+        headers={"Authorization": f"Bearer {_HUMAN_TOKEN}"},
+    )
+    assert created.status_code in (200, 201), created.text
+    task_id = created.json()["id"]
+
+    async with _hub_process():
+        init = await client.post(
+            "/mcp",
+            headers={**_MCP_HEADERS, "Authorization": f"Bearer {_AGENT_TOKEN}"},
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "0.0"},
+                },
+            },
+        )
+        _rpc_result(init)
+        # No session is handed out, so there is none a restart can lose.
+        assert "mcp-session-id" not in init.headers
+        first = await _call_tool(
+            client,
+            _AGENT_TOKEN,
+            "hub_task_update",
+            {"task_id": task_id, "content": "before restart", "agent": "a"},
+        )
+        _tool_text(_rpc_result(first))
+
+    async with _hub_process():  # the release restart
+        after = await _call_tool(
+            client,
+            _AGENT_TOKEN,
+            "hub_task_update",
+            {"task_id": task_id, "content": "after restart", "agent": "a"},
+            session_id="id-issued-by-the-previous-process",
+        )
+        assert after.status_code != 404, after.text
+        _tool_text(_rpc_result(after))
+
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id = ? AND content IN (?, ?)",
+        (task_id, "before restart", "after restart"),
+    )
+    assert sorted(r["content"] for r in rows) == ["after restart", "before restart"]
+
+
+async def test_stateless_keeps_caller_identity(stateless_hub, db):
+    """AC-2 (#1364): each caller is itself inside the tool, not the one before.
+
+    The bearer reaches the REST call (whoami answers with the caller's name)
+    and the principal reaches telemetry. Both callers share one process and
+    alternate, so an identity captured once and reused would show here.
+    """
+    client = stateless_hub
+    async with _hub_process():
+        answers = {}
+        for token in (_AGENT_TOKEN, _HUMAN_TOKEN, _AGENT_TOKEN):
+            resp = await _call_tool(client, token, "hub_whoami", {})
+            answers.setdefault(token, []).append(_tool_text(_rpc_result(resp)))
+
+    assert all("stateless-agent" in text for text in answers[_AGENT_TOKEN])
+    assert all("stateless-human" not in text for text in answers[_AGENT_TOKEN])
+    assert "stateless-human" in answers[_HUMAN_TOKEN][0]
+
+    rows = await db.execute_fetchall(
+        "SELECT principal_id, principal_role FROM mcp_call_events "
+        "WHERE tool = 'hub_whoami' ORDER BY id"
+    )
+    assert [(r["principal_id"], r["principal_role"]) for r in rows] == [
+        (_AGENT_PID, "agent"),
+        (_HUMAN_PID, "human"),
+        (_AGENT_PID, "agent"),
+    ]
+
+
+def test_stateless_transport_leaves_no_tool_without_its_session():
+    """#1364: stateless is safe only while no tool needs an MCP session.
+
+    A tool taking the FastMCP ``Context`` could send notifications, sample or
+    elicit — all of which need a session the stateless transport no longer
+    keeps. The flag and this guard travel together.
+    """
+    from hub.mcp_server import mcp
+
+    assert mcp.settings.stateless_http is True
+    needs_session = [
+        tool.name
+        for tool in mcp._tool_manager.list_tools()
+        if tool.context_kwarg is not None
+    ]
+    assert needs_session == []

@@ -208,6 +208,32 @@ SUBSCRIPTION_LAUNCHABLE_MODELS: tuple[str, ...] = (
     "gemini-3.1-pro",
     "claude-sonnet-5",
 )
+#: Вторая ось каскада ревью (#1243): модели, которые переспрашивают ТУ ЖЕ
+#: работу ТЕМ ЖЕ профилем, когда deep-прогон сам объявил себя неполным, —
+#: там, где лестница по профилю (#879) говорит «выше подниматься некуда».
+#:
+#: Порядок — предпочтение, и это ЗАЯВЛЕНИЕ, а не замер: цена и качество
+#: прогона на этих моделях не измерялись ни разу (by_reviewer_model пуст за
+#: всё окно спайка #1168). Берётся первая, что наблюдалась запускающейся
+#: (SUBSCRIPTION_LAUNCHABLE_MODELS), не совпадает семейством с исполнителем
+#: и ещё не читала эту сдачу. Имя вне наблюдённых запусков пропускается при
+#: выборе, а не покупается: каталог доказательством не считается (#1237).
+#:
+#: Список предпочтений первого ревьюера (_REVIEW_MODEL_PREFERENCES) этим НЕ
+#: расширяется — его сужение решение владельца.
+REVIEW_CASCADE_MODELS = tuple(
+    m.strip()
+    for m in env_get(
+        "REVIEW_CASCADE_MODELS", "gpt-5.3-codex,claude-sonnet-5,gemini-3.1-pro"
+    ).split(",")
+    if m.strip()
+)
+#: Сколько переспросов по второй оси положено ОДНОЙ сдаче (#1243). Свой
+#: потолок, отдельный от REVIEW_LADDER_MAX_STEPS: лестница считает ступени
+#: профиля, эта ось — смены модели. 0 выключает ось целиком — рубильник
+#: владельца, если добавка к счёту (оценка спайка #1168: около +17% к счёту
+#: за ревью) окажется не той, что названа.
+REVIEW_MODEL_CASCADE_MAX = int(env_get("REVIEW_MODEL_CASCADE_MAX", "1"))
 # The model the steward runs on (#994 §4): a third family, distinct from the
 # implementer's and from the reviewer's. Declared on the order so the
 # diversity rule has something to check before the run starts.
