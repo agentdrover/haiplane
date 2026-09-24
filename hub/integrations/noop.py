@@ -227,6 +227,16 @@ class NoopGitOps:
     ) -> str:
         return ""
 
+    async def pr_for_merge_commit(
+        self,
+        sha: str,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> dict[str, Any] | None:
+        """No git here: "could not ask" is a reason, never "no such PR"."""
+        raise RuntimeError("git не настроен — провайдера спросить нельзя")
+
     async def branch_diff(self, repo: str, base: str, branch: str) -> str | None:
         """No git here — the section must read this as "could not look" (#601)."""
         return None
@@ -797,6 +807,11 @@ class NoopForge:
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> str:
         return ""
+
+    async def pr_for_merge_commit(
+        self, sha: str, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> dict[str, Any] | None:
+        raise RuntimeError("форж не настроен — провайдера спросить нельзя")
 
     async def merge_pr(
         self,

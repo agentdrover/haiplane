@@ -790,6 +790,7 @@ async def record_pipeline_merge(
     merge_sha: str = "",
     project_id: int | None = None,
     task_id: int | None = None,
+    merged_at: str | None = None,
 ) -> None:
     """Remember a merge the hub performed itself, by the commit it produced.
 
@@ -804,13 +805,18 @@ async def record_pipeline_merge(
     read) is not a key: such a row never swallows another merge, and a
     repeat of the same unreadable merge — same project, PR and task — is
     recognised here instead of by the index.
+
+    ``merged_at`` is for a row written after the fact (#1367): the backfill
+    dates it by the hub's own record of the merge, not by the moment of the
+    backfill — statement freshness reads this date as "delivered then".
     """
     sha = (merge_sha or "").strip()
     if sha:
         await db.execute(
             "INSERT OR IGNORE INTO pipeline_merges "
-            "(project_id, pr_number, task_id, merge_sha) VALUES (?, ?, ?, ?)",
-            (project_id, int(pr_number), task_id, sha),
+            "(project_id, pr_number, task_id, merge_sha, merged_at) "
+            "VALUES (?, ?, ?, ?, COALESCE(?, datetime('now')))",
+            (project_id, int(pr_number), task_id, sha, merged_at),
         )
     else:
         await db.execute(
@@ -931,17 +937,73 @@ async def record_drift_commit(
 
 
 async def list_drift_commits(
-    db: aiosqlite.Connection, project_id: int | None = None
+    db: aiosqlite.Connection,
+    project_id: int | None = None,
+    *,
+    include_ledgered: bool = False,
 ) -> list[aiosqlite.Row]:
-    if project_id is None:
-        return await fetchall(
-            db, "SELECT * FROM base_branch_drift ORDER BY detected_at DESC, id DESC"
+    """Commits the drift guard saw land outside the gate (#534).
+
+    Reconciled at read time (#1367): a drift commit whose sha the SAME
+    project's ``pipeline_merges`` holds is the gate's own merge, recorded
+    late — before #1343 the ledger lost merges whose PR number collided with
+    the previous repository. It is left out unless ``include_ledgered``; the
+    drift row itself is history and is never deleted.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if project_id is not None:
+        clauses.append("d.project_id = ?")
+        params.append(project_id)
+    if not include_ledgered:
+        clauses.append(
+            "NOT EXISTS (SELECT 1 FROM pipeline_merges m "
+            "WHERE m.project_id = d.project_id AND m.merge_sha = d.sha)"
         )
+    where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
     return await fetchall(
         db,
-        "SELECT * FROM base_branch_drift WHERE project_id=? "
-        "ORDER BY detected_at DESC, id DESC",
-        (project_id,),
+        f"SELECT d.* FROM base_branch_drift d {where}"  # nosec B608
+        "ORDER BY d.detected_at DESC, d.id DESC",
+        tuple(params),
+    )
+
+
+async def tasks_on_branch(db: aiosqlite.Connection, branch: str) -> list[aiosqlite.Row]:
+    """Tasks that carry this branch name (#1367)."""
+    return await fetchall(
+        db, "SELECT id, branch, pr_number FROM tasks WHERE branch = ?", (branch,)
+    )
+
+
+async def hub_authored_updates(
+    db: aiosqlite.Connection, task_id: int
+) -> list[aiosqlite.Row]:
+    """Feed records the hub itself wrote on this task (#559, #1367).
+
+    Authorship is ``author_kind='hub'`` with no principal: a request handler
+    stamps the caller's principal, so an agent cannot write one of these by
+    naming itself "hub". The display name is required too, as a second key.
+    """
+    return await fetchall(
+        db,
+        "SELECT id, content, created_at FROM task_updates "
+        "WHERE task_id = ? AND author_kind = 'hub' AND principal_id IS NULL "
+        "AND agent = 'hub' ORDER BY id",
+        (task_id,),
+    )
+
+
+async def release_return_activities(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    """Activity records of main returned into the base branch after a release.
+
+    Written by ``release._return_the_release`` together with the ledger row
+    (#1367 reads them to restore rows the ledger lost).
+    """
+    return await fetchall(
+        db,
+        "SELECT id, summary, detail, timestamp FROM activity_log "
+        "WHERE kind = 'release' AND summary LIKE '%после релиза' ORDER BY id",
     )
 
 
