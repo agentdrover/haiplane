@@ -1113,6 +1113,59 @@ def cmd_delivery_deliver(args: argparse.Namespace) -> int:
     return 0
 
 
+def _review_queue_line(row: dict) -> str:
+    findings = (
+        "нет текущего отчёта"
+        if row.get("findings_confirmed") is None
+        else f"находки {row['findings_confirmed']}/{row.get('findings_unresolved')}"
+    )
+    verdict = row.get("verdict") or "без вердикта"
+    if row.get("verdict") and not row.get("verdict_is_current"):
+        verdict += f" (поколения {row.get('verdict_generation')}, не текущий)"
+    readiness = row.get("readiness")
+    if readiness == "ready_sha_unverified":
+        readiness = "ready, sha не проверен"
+    sha = f"sha {row.get('sha_check')}"
+    # Not a match: the reason says why, and when the tip is fresh it already
+    # opens with the observation age — so it replaces the minutes, not joins them.
+    if row.get("sha_check") != "match" and row.get("sha_check_reason"):
+        sha += f" ({row['sha_check_reason']})"
+    elif row.get("tip_observed_minutes_ago") is not None:
+        sha += f" (наблюдение {row['tip_observed_minutes_ago']} мин назад)"
+    return (
+        f"[{readiness}] #{row['task_id']} {row.get('title', '')} — "
+        f"{row.get('status')}, сдача {row.get('submission_generation')}, "
+        f"{sha}, отчёт {row.get('report_status')}, "
+        f"{findings}, {verdict}, ждёт {row.get('waiting_minutes', '?')} мин"
+    )
+
+
+def cmd_review_queue(args: argparse.Namespace) -> int:
+    """The review queue in one call (#1334) — the same rows the page shows.
+
+    Printed in the API's order (ready, findings, awaiting report, blocked).
+    ``sha unknown`` is printed as itself: the queue does not fetch, and a tip
+    the hub has not observed recently is not a match.
+    """
+    path = "/api/review-queue"
+    if args.project:
+        path += f"?project={urllib.parse.quote(args.project)}"
+    result = _api("GET", path)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    rows = result.get("rows") or []
+    if not rows:
+        print("В review и needs_decision нет ни одной задачи.")
+    for row in rows:
+        print(_review_queue_line(row))
+        if row.get("stall_reason"):
+            print(f"    стойло: {row['stall_reason']}")
+    if result.get("note"):
+        print(result["note"])
+    return 0
+
+
 def cmd_undelivered(args: argparse.Namespace) -> int:
     """Completed tasks whose PR is neither merged nor closed (#897).
 
@@ -2276,6 +2329,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_undelivered.add_argument("--json", action="store_true", help="Print raw JSON")
     p_undelivered.set_defaults(func=cmd_undelivered)
+
+    p_review_queue = sub.add_parser(
+        "review-queue",
+        help="Очередь ревью одной строкой на сдачу: отчёт, находки, вердикт, стойло",
+    )
+    p_review_queue.add_argument("--project", default="", help="Project slug")
+    p_review_queue.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_review_queue.set_defaults(func=cmd_review_queue)
 
     p_delivery_ack = sub.add_parser(
         "delivery-ack",
