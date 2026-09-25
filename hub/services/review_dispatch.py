@@ -2294,6 +2294,103 @@ async def _create_or_adopt(
     return _Started(agent_id, run_id, adopted, blind, attempts, refusal)
 
 
+async def _cloud_config_missing(
+    db: aiosqlite.Connection, task_id: int, gh_repo: str, reviewer_token: str
+) -> bool:
+    """Назвать в карточке, какой настройки облачного вызова нет (#1083).
+
+    Вынесено из maybe_dispatch_review (#1399): та стоит на потолке в 60
+    операторов, а бронь заказа добавила ей строк.
+    """
+    # #1083: three independent preconditions, and the message used to list all
+    # three with "or" whichever one fired. Two of them live in the process
+    # environment on the host, so the card could not say which — telling "no
+    # API key" from "the project has no repo" took an ssh to the box. This
+    # alert is the ONLY trace a failed dispatch leaves (best-effort means
+    # nothing else breaks), so it names what is missing and only that.
+    #
+    # Names, never values: what goes into a card is the setting's name, which
+    # is already written in the open in hub/config.py. No value, no prefix, no
+    # length — a length is a guess narrowed.
+    missing = [
+        label
+        for ok, label in (
+            (cursor_cloud.is_configured(), "CURSOR_API_KEY (ключ Cursor API)"),
+            (bool(gh_repo), "repo проекта (owner/name на его форже)"),
+            (
+                bool(reviewer_token),
+                "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера)",
+            ),
+        )
+        if not ok
+    ]
+    if missing:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
+            + "; ".join(missing)
+            + ". Вердикт остаётся человеку (#757).",
+        )
+        await db.commit()
+        return True
+    return False
+
+
+async def _claim_the_order(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    profile: str,
+    replaces_dispatch_id: int | None,
+    force_model: str,
+) -> bool:
+    """Один облачный заказ профиля на сдачу (#1399).
+
+    Прод: #1301 gen2 (deep, 347/348) и #1378 gen1 (lite, 412/413) — по два
+    оплаченных ревьюера на одну сдачу. Второй триггер — повторный
+    hub_submit_for_review того же коммита из review: #1265 оставляет
+    поколение прежним и снова зовёт диспетчер (lifecycle.py,
+    _same_sha_noop_response), а страж новизны (_this_code_was_already_read)
+    смотрит только на ОТЧЁТЫ — пока ревьюер работает, отчёта нет.
+
+    Бронь не берут два задуманных вторых вызова: переспрос после отказа
+    (``replaces_dispatch_id``, #1242) и вторая ось каскада (``force_model``,
+    #1243) — у каждого свой потолок. Добор лестницы (#879) бронь берёт, но
+    под другим профилем (deep после lite) и поэтому проходит.
+    """
+    if replaces_dispatch_id is not None or force_model:
+        return True
+    if await repo.claim_review_order(db, task_id, generation, profile):
+        return True
+    log.info(
+        "review dispatch for task #%s gen %s (%s) skipped: already ordered",
+        task_id,
+        generation,
+        profile,
+    )
+    return False
+
+
+async def _release_the_order(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    profile: str,
+    replaces_dispatch_id: int | None,
+    force_model: str,
+) -> None:
+    """Снять бронь, если её брал ЭТОТ вызов (#1399).
+
+    Переспрос и вторая ось брони не берут — и снимать не должны: иначе их
+    отказ снял бы бронь параллельного первичного триггера.
+    """
+    if replaces_dispatch_id is None and not force_model:
+        await repo.release_review_order(db, task_id, generation, profile)
+
+
 async def maybe_dispatch_review(
     db: aiosqlite.Connection,
     task_id: int,
@@ -2358,39 +2455,7 @@ async def maybe_dispatch_review(
         )
 
     reviewer_token = (config.CURSOR_REVIEWER_HUB_TOKEN or "").strip()
-    # #1083: three independent preconditions, and the message used to list all
-    # three with "or" whichever one fired. Two of them live in the process
-    # environment on the host, so the card could not say which — telling "no
-    # API key" from "the project has no repo" took an ssh to the box. This
-    # alert is the ONLY trace a failed dispatch leaves (best-effort means
-    # nothing else breaks), so it names what is missing and only that.
-    #
-    # Names, never values: what goes into a card is the setting's name, which
-    # is already written in the open in hub/config.py. No value, no prefix, no
-    # length — a length is a guess narrowed.
-    missing = [
-        label
-        for ok, label in (
-            (cursor_cloud.is_configured(), "CURSOR_API_KEY (ключ Cursor API)"),
-            (bool(gh_repo), "repo проекта (owner/name на его форже)"),
-            (
-                bool(reviewer_token),
-                "CURSOR_REVIEWER_HUB_TOKEN (токен ревьюера)",
-            ),
-        )
-        if not ok
-    ]
-    if missing:
-        await repo.add_task_update(
-            db,
-            task_id,
-            "hub",
-            "alert",
-            "Кросс-модельное ревью НЕ вызвано: не хватает конфигурации — "
-            + "; ".join(missing)
-            + ". Вердикт остаётся человеку (#757).",
-        )
-        await db.commit()
+    if await _cloud_config_missing(db, task_id, gh_repo, reviewer_token):
         return False
 
     # #1180: подготовка вызова — общая для обоих способов добыть отчёт.
@@ -2417,9 +2482,16 @@ async def maybe_dispatch_review(
     # переспрос (_name_a_cancelled_retry, находка 40a8fd8b727c82ec), а
     # первичный заказ сменившейся сдачи заменит заказ её новой сдачи, как и
     # у второй двери (#1252).
-    if not await _submission_still_live(db, task, branch, generation) or (
-        replaces_dispatch_id is not None
-        and await repo.machine_reviews_of_generation(db, task_id, generation)
+    if (
+        not await _submission_still_live(db, task, branch, generation)
+        or (
+            replaces_dispatch_id is not None
+            and await repo.machine_reviews_of_generation(db, task_id, generation)
+        )
+        # #1399: бронь — последней, иначе отказ выше оставил бы её висеть.
+        or not await _claim_the_order(
+            db, task_id, generation, profile, replaces_dispatch_id, force_model
+        )
     ):
         return False
     started = await _create_or_adopt(
@@ -2444,6 +2516,10 @@ async def maybe_dispatch_review(
         # облака — наблюдённый факт, и он стоит в карточке независимо от
         # того, добыл ли отчёт кто-то второй.
         detail = _lost_call_detail(started)
+        # #1399: отказ сдачу не держит — бронь снимается вместе с алертом.
+        await _release_the_order(
+            db, task_id, generation, profile, replaces_dispatch_id, force_model
+        )
         await repo.add_task_update(
             db,
             task_id,
@@ -2497,6 +2573,10 @@ async def maybe_dispatch_review(
         reviewer_principal_id=expected_principal,
         replaces_dispatch_id=replaces_dispatch_id,
         only_tests=order.only_tests,
+    )
+    # #1399: строка заказа и снятие брони — одна транзакция (коммит ниже).
+    await _release_the_order(
+        db, task_id, generation, profile, replaces_dispatch_id, force_model
     )
     profile_note = (
         f"профиль {profile} (один проход по диффу)"
