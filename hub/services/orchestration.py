@@ -941,6 +941,8 @@ async def practice_metrics(
     review_outcomes = await _review_outcome_metrics(db, since)
     review_dispatches = await _review_dispatch_spend_metrics(db, since)
     validation_run_lines = await _validation_run_line_metrics(db, since)
+    from hub.services.executor_dispatch import executor_run_metrics
+
     # #1238: повторяемость отказов среды. Считается тем же кодом, что решает,
     # является ли отдельный отчёт отказом среды, — двух ответов на один
     # вопрос здесь быть не должно. Окно берётся то же, что у остальных
@@ -980,6 +982,9 @@ async def practice_metrics(
         # #1246: submissions whose prepass failed while the author wrote about
         # runs — a count for a human to compare, not a claim about meaning.
         "validation_run_lines": validation_run_lines,
+        # #1410: стоимость облачного исполнителя за окно — центы по счёту
+        # провайдера (chargedCents) и число прогонов рядом с суммой.
+        "executor_runs": await executor_run_metrics(db, since),
         # #1406: сводка ревью для владельца — один агрегат на все поверхности.
         "review_economy": await review_economy(
             db, since_days=since_days, escaped=escaped

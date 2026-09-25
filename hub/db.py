@@ -2217,6 +2217,37 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_machine_reviews_carried_from_review_id",
         "ALTER TABLE machine_reviews ADD COLUMN carried_from_review_id INTEGER",
     ),
+    (
+        # #1410 (F2.2): строка прогона облачного исполнителя. В F0 прогон
+        # висел 12 часов, а цену узнали вручную — хаб её не писал. tokens и
+        # cents (chargedCents провайдера) NULL, пока провайдер их не назвал:
+        # неизвестно — не ноль. outcome: running | finished | cancelled |
+        # failed | over_ceiling | taken_down; reason — почему строка стоит
+        # как стоит (например, провайдер не ответил на опрос).
+        "create_executor_runs",
+        """CREATE TABLE IF NOT EXISTS executor_runs (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id               INTEGER NOT NULL
+                                  REFERENCES tasks(id) ON DELETE CASCADE,
+            submission_generation INTEGER NOT NULL DEFAULT 0,
+            agent_id              TEXT    NOT NULL DEFAULT '',
+            run_id                TEXT    NOT NULL DEFAULT '',
+            model                 TEXT    NOT NULL DEFAULT '',
+            tokens                INTEGER,
+            cents                 REAL,
+            started_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+            finished_at           TEXT,
+            duration_ms           INTEGER,
+            outcome               TEXT    NOT NULL DEFAULT 'running',
+            reason                TEXT    NOT NULL DEFAULT '',
+            polled_at             TEXT
+        )""",
+    ),
+    (
+        "idx_executor_runs_outcome",
+        "CREATE INDEX IF NOT EXISTS idx_executor_runs_outcome "
+        "ON executor_runs(outcome, task_id)",
+    ),
 ]
 
 

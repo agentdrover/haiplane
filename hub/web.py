@@ -2303,6 +2303,10 @@ async def _web_task_detail_page(
     review_in_flight = await inflight_view(db, dict(row))
 
     steward_judgement = await _steward_recommendation(db, task_id, dict(row))
+    # #1410: прогоны облачного исполнителя — центы и исход по каждому.
+    from hub.services.executor_dispatch import executor_runs_view
+
+    executor_runs = await executor_runs_view(db, task_id)
 
     finding_touch: list[dict[str, Any]] = []
     if machine_review is not None and machine_review.findings_confirmed:
@@ -2452,6 +2456,7 @@ async def _web_task_detail_page(
             "change_map": change_map,
             "machine_review": machine_review,
             "steward_judgement": steward_judgement,
+            "executor_runs": executor_runs,
             "finding_touch": finding_touch,
             "mr_confirmed": mr_confirmed,
             "mr_undisposed": mr_undisposed,

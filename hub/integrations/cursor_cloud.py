@@ -388,5 +388,28 @@ async def get_usage(agent_id: str, run_id: str | None = None) -> dict[str, Any] 
     return await _request("GET", path)
 
 
+def usage_totals(usage: dict[str, Any] | None) -> tuple[int | None, float | None]:
+    """``(токены, центы)`` из ответа ``/usage``; ``None`` — провайдер не назвал.
+
+    Токены — ``totalUsage.totalTokens`` (как у ревью). Центы — ``chargedCents``
+    (наблюдено в F0, docs/specs/orchestrator-executor-environment.md): где
+    именно в теле лежит поле, F0 не записал, поэтому читается и из
+    ``totalUsage``, и с верхнего уровня (#1410). Нечисловое значение —
+    не ноль, а ``None``.
+    """
+    if not isinstance(usage, dict):
+        return None, None
+    total = usage.get("totalUsage")
+    total = total if isinstance(total, dict) else {}
+    tokens = total.get("totalTokens")
+    cents = total.get("chargedCents", usage.get("chargedCents"))
+    return (
+        tokens if isinstance(tokens, int) and not isinstance(tokens, bool) else None,
+        float(cents)
+        if isinstance(cents, int | float) and not isinstance(cents, bool)
+        else None,
+    )
+
+
 async def list_models() -> dict[str, Any] | None:
     return await _request("GET", "/v1/models")
