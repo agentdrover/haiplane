@@ -20,7 +20,9 @@ from hub.integrations import cursor_cloud
 from hub.services.executor_dispatch import (
     OUTCOME_CANCELLED,
     OUTCOME_FINISHED,
+    OUTCOME_OVER_CEILING,
     OUTCOME_RUNNING,
+    OUTCOME_TAKEN_DOWN,
     REASON_COST_NEVER_CAME,
     REASON_COST_PENDING,
     REASON_RUNS_SILENT,
@@ -389,3 +391,262 @@ async def test_executor_cost_is_visible_on_the_card_and_in_metrics(
     assert metrics["cents_total"] == pytest.approx(369.6)
     assert metrics["tokens_total"] == 1_332_835 + 10_909_965
     assert metrics["runs_without_cents"] == 0
+
+
+# ---- #1411 (F2.3): отмена с повторами, потолок, снятие по факту сдачи ----
+
+
+def _cancelling_provider(
+    monkeypatch,
+    *,
+    usage: dict | None,
+    refusals: int = 0,
+    stops: bool = True,
+) -> dict:
+    """Провайдер, у которого отмена сначала отвечает 429 ``refusals`` раз.
+
+    ``stops=False`` — отмена отвечает 2xx, а прогон так и читается RUNNING:
+    ответ на POST — не подтверждение.
+    """
+    state: dict = {"cancel_calls": 0, "cancelled": set(), "run_reads": 0}
+
+    async def _get_run(agent_id: str, run_id: str):
+        state["run_reads"] += 1
+        return {
+            "id": run_id,
+            "status": "CANCELLED" if run_id in state["cancelled"] else "RUNNING",
+        }
+
+    async def _get_usage(agent_id: str, run_id: str | None = None):
+        return usage
+
+    async def _cancel_run(agent_id: str, run_id: str):
+        state["cancel_calls"] += 1
+        if state["cancel_calls"] <= refusals:
+            return None, cursor_cloud.Refusal(
+                status=429, code="rate_limit_exceeded", detail="rate limited"
+            )
+        if stops:
+            state["cancelled"].add(run_id)
+        return {"id": run_id}, None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _get_run)
+    monkeypatch.setattr(cursor_cloud, "get_usage", _get_usage)
+    monkeypatch.setattr(cursor_cloud, "cancel_run", _cancel_run)
+    return state
+
+
+async def _submitted(db: aiosqlite.Connection, task_id: int, generation: int) -> None:
+    await db.execute(
+        "UPDATE tasks SET submission_generation=?, status='review' WHERE id=?",
+        (generation, task_id),
+    )
+    await db.commit()
+
+
+async def _pause_passed(db: aiosqlite.Connection, row_id: int) -> None:
+    await db.execute(
+        "UPDATE executor_runs SET cancel_last_at=datetime('now', '-1 hour') WHERE id=?",
+        (row_id,),
+    )
+    await db.commit()
+
+
+async def _alerts(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+    ]
+
+
+async def test_a_run_is_taken_down_once_its_submission_lands(db, monkeypatch):
+    """AC-1: сдача этого поколения легла, прогон RUNNING — хаб его снимает."""
+    # Потолки с большим запасом: снимает сдача, а не потолок.
+    monkeypatch.setattr(config, "EXECUTOR_TOKEN_CEILING", 50_000_000)
+    monkeypatch.setattr(config, "EXECUTOR_CENTS_CEILING", 100_000)
+    task_id = await _task(db)
+    row_id = await _run(db, task_id, generation=1)
+
+    # Сдачи ещё нет: прогон работает, отмены нет.
+    state = _cancelling_provider(monkeypatch, usage=_usage(10_000, 5.0))
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 0
+    assert (await _row(db, row_id))["outcome"] == OUTCOME_RUNNING
+
+    # Прогон следующего поколения сдачей первого не снимается.
+    later = await _run(db, task_id, agent_id="bc-exec-2", run_id="run-2", generation=2)
+
+    # F0: после сдачи прогон висел RUNNING на 10 909 965 токенах и 322.5 цента.
+    await _submitted(db, task_id, 1)
+    state = _cancelling_provider(monkeypatch, usage=_usage(10_909_965, 322.5))
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 1
+    row = await _row(db, row_id)
+    assert row["outcome"] == OUTCOME_TAKEN_DOWN
+    assert row["cents"] == pytest.approx(322.5)
+    assert row["tokens"] == 10_909_965
+    assert row["finished_at"]
+    assert row["duration_ms"] is not None
+    _no_key_in(row)
+    assert (await _row(db, later))["outcome"] == OUTCOME_RUNNING
+    assert not any(_FAKE_KEY in a for a in await _alerts(db, task_id))
+
+
+async def test_cancel_retries_through_rate_limits(db, monkeypatch):
+    """AC-2: пять 429 подряд, шестая успешна — отмена доведена до CANCELLED."""
+    monkeypatch.setattr(config, "EXECUTOR_CANCEL_MAX_ATTEMPTS", 8)
+    monkeypatch.setattr(config, "EXECUTOR_CANCEL_PAUSE_S", 60)
+    task_id = await _task(db)
+    row_id = await _run(db, task_id, generation=1)
+    await _submitted(db, task_id, 1)
+    state = _cancelling_provider(monkeypatch, usage=_usage(2000, 1.0), refusals=5)
+
+    for attempt in range(1, 6):
+        await poll_executor_runs(db)
+        assert state["cancel_calls"] == attempt
+        row = await _row(db, row_id)
+        assert row["outcome"] == OUTCOME_RUNNING, "429 — не отмена"
+        assert "429" in row["reason"]
+        # Пауза не вышла — следующий проход отмену не повторяет.
+        await poll_executor_runs(db)
+        assert state["cancel_calls"] == attempt
+        await _pause_passed(db, row_id)
+
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 6
+    row = await _row(db, row_id)
+    assert row["outcome"] == OUTCOME_TAKEN_DOWN
+    assert row["finished_at"]
+    _no_key_in(row)
+
+
+async def test_a_2xx_cancel_is_confirmed_by_reading_the_run(db, monkeypatch):
+    """Ответ 2xx на отмену — не отмена, пока прогон не читается CANCELLED."""
+    monkeypatch.setattr(config, "EXECUTOR_CANCEL_PAUSE_S", 60)
+    task_id = await _task(db)
+    row_id = await _run(db, task_id, generation=1)
+    await _submitted(db, task_id, 1)
+    state = _cancelling_provider(monkeypatch, usage=_usage(2000, 1.0), stops=False)
+
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 1
+    row = await _row(db, row_id)
+    assert row["outcome"] == OUTCOME_RUNNING
+    assert row["finished_at"] is None
+    assert "RUNNING" in row["reason"]
+
+    # Прогон так и не остановился — хаб пробует снова после паузы.
+    await _pause_passed(db, row_id)
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 2
+
+
+async def test_cancel_exhaustion_is_named_to_a_human(db, monkeypatch):
+    monkeypatch.setattr(config, "EXECUTOR_CANCEL_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(config, "EXECUTOR_CANCEL_PAUSE_S", 60)
+    task_id = await _task(db)
+    row_id = await _run(db, task_id, generation=1)
+    await _submitted(db, task_id, 1)
+    state = _cancelling_provider(monkeypatch, usage=_usage(2000, 1.0), refusals=99)
+
+    for _ in range(5):
+        await poll_executor_runs(db)
+        await _pause_passed(db, row_id)
+    assert state["cancel_calls"] == 3
+    row = await _row(db, row_id)
+    assert row["outcome"] == OUTCOME_RUNNING
+    exhausted = [a for a in await _alerts(db, task_id) if "3 из 3" in a]
+    assert len(exhausted) == 1, "исчерпание называется человеку один раз"
+    assert "run-1" in exhausted[0]
+
+
+async def test_crossing_the_ceiling_cancels_and_escalates(db, monkeypatch):
+    """AC-3: usage пересёк потолок — отмена, over_ceiling, эскалация с цифрами."""
+    monkeypatch.setattr(config, "EXECUTOR_CEILING_MARGIN_PCT", 15)
+    task_id = await _task(db)
+    row_id = await repo.create_executor_run(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-exec-1",
+        run_id="run-1",
+        model="gpt-5.3-codex",
+        token_ceiling=8_000_000,
+        cents_ceiling=3500,
+    )
+    await db.commit()
+
+    # Далеко от потолка: ничего не происходит.
+    state = _cancelling_provider(monkeypatch, usage=_usage(1_000_000, 40.0))
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 0
+
+    # F0: 10 909 965 токенов при потолке 8M.
+    state = _cancelling_provider(monkeypatch, usage=_usage(10_909_965, 322.5))
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 1
+    row = await _row(db, row_id)
+    assert row["outcome"] == OUTCOME_OVER_CEILING
+    assert row["tokens"] == 10_909_965
+    assert row["cents"] == pytest.approx(322.5)
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision"
+    alerts = [a for a in await _alerts(db, task_id) if "потол" in a]
+    assert len(alerts) == 1
+    for number in ("10909965", "8000000", "322.5", "3500"):
+        assert number in alerts[0], number
+    assert _FAKE_KEY not in alerts[0]
+
+    # Повторный проход не эскалирует второй раз.
+    await poll_executor_runs(db)
+    assert len([a for a in await _alerts(db, task_id) if "потол" in a]) == 1
+
+
+async def test_the_ceiling_cancel_starts_before_the_limit(db, monkeypatch):
+    """Отмена стартует с запасом: 429 на отмене не должен пропустить предел."""
+    monkeypatch.setattr(config, "EXECUTOR_CEILING_MARGIN_PCT", 15)
+    task_id = await _task(db)
+    row_id = await repo.create_executor_run(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-exec-1",
+        run_id="run-1",
+        model="gpt-5.3-codex",
+        token_ceiling=8_000_000,
+        cents_ceiling=3500,
+    )
+    await db.commit()
+    # 88% токенов: предел не пересечён, но запас уже съеден.
+    state = _cancelling_provider(monkeypatch, usage=_usage(7_040_000, 300.0))
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 1
+    assert (await _row(db, row_id))["outcome"] == OUTCOME_OVER_CEILING
+
+    # По деньгам — так же: 3000 из 3500 центов.
+    other = await _task(db, "дорогая")
+    money_row = await repo.create_executor_run(
+        db,
+        task_id=other,
+        submission_generation=1,
+        agent_id="bc-exec-3",
+        run_id="run-3",
+        model="gpt-5.3-codex",
+        token_ceiling=8_000_000,
+        cents_ceiling=3500,
+    )
+    await db.commit()
+    state = _cancelling_provider(monkeypatch, usage=_usage(100_000, 3000.0))
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 1
+    assert (await _row(db, money_row))["outcome"] == OUTCOME_OVER_CEILING
+
+
+async def test_ceilings_default_from_config_at_order_time(db, monkeypatch):
+    monkeypatch.setattr(config, "EXECUTOR_TOKEN_CEILING", 1234)
+    monkeypatch.setattr(config, "EXECUTOR_CENTS_CEILING", 56.0)
+    task_id = await _task(db)
+    row = await _row(db, await _run(db, task_id))
+    assert row["token_ceiling"] == 1234
+    assert row["cents_ceiling"] == pytest.approx(56.0)
