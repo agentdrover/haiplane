@@ -847,10 +847,46 @@ async def hub_project_status() -> CallToolResult:
             title = d.get("title", "Decision")
             parts.append(f"- {title}")
 
+    queue, queue_error = await _orchestrator_queue()
+    parts.extend(_queue_lines(queue))
+    if queue_error:
+        parts.append(f"\n## Next Task: не удалось прочитать очередь — {queue_error}")
+
     return structured_echo_result(
         "\n".join(parts) if parts else "No activity found.",
         dashboard=data,
+        orchestrator_queue=queue,
+        orchestrator_queue_error=queue_error,
     )
+
+
+async def _orchestrator_queue() -> tuple[list[dict[str, Any]], str]:
+    """Ответы очереди исполнения проектов в тени (#1274) и причина сбоя.
+
+    Отдельного инструмента нет намеренно: каталог MCP упёрся в рабочую
+    заморозку описаний (#1241), а обзор проекта — то место, куда агент и
+    так смотрит за «что дальше». Сбой этого чтения не роняет обзор, но и не
+    молчит: пустой список без причины читался бы как «очереди нет».
+    """
+    try:
+        body = await _api_get("/api/orchestrator/next")
+    except Exception as exc:  # noqa: BLE001 - the overview must survive, named
+        return [], f"{type(exc).__name__}: {exc}"
+    projects = body.get("projects") if isinstance(body, dict) else None
+    return [p for p in projects or [] if isinstance(p, dict)], ""
+
+
+def _queue_lines(queue: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for answer in queue:
+        lines.append(
+            f"\n## Next Task (orchestrator queue, {answer.get('mode', 'shadow')}) "
+            f"— {answer.get('project', '?')}"
+        )
+        lines.append(str(answer.get("summary") or ""))
+        for skip in answer.get("skipped") or []:
+            lines.append(f"- #{skip.get('task_id')} {skip.get('detail', '')}")
+    return lines
 
 
 def _tree_query_string(
@@ -3311,6 +3347,42 @@ async def hub_answer_outcome(
     )
 
 
+def _review_economy_lines(econ: dict[str, Any]) -> list[str]:
+    """Owner's review summary (#1406): provider bill only, never tokens_spent."""
+    if not econ:
+        return []
+    runs = econ.get("runs") or {}
+    findings = econ.get("findings") or {}
+    red = econ.get("red_ci") or {}
+    rec = econ.get("reconciliation") or {}
+    by_profile = ", ".join(
+        f"{r.get('profile')} {r.get('runs', 0)} ({r.get('provider_tokens_total', 0)})"
+        for r in runs.get("by_profile") or []
+    )
+    buckets = ", ".join(
+        f"{b.get('bucket')} {b.get('count', 0)}" for b in rec.get("buckets") or []
+    )
+    return [
+        f"Review economy: {runs.get('total', 0)} run(s), "
+        f"{runs.get('billed', 0)} billed / {runs.get('unbilled', 0)} without a bill, "
+        f"{runs.get('provider_tokens_total', 0)} provider tokens"
+        + (f"; by profile: {by_profile}" if by_profile else ""),
+        f"Unresolved: {findings.get('unresolved_total', 0)} in "
+        f"{findings.get('reports_with_unresolved', 0)}/"
+        f"{findings.get('independent_reports', 0)} independent report(s)"
+        + (" (undersampled)" if findings.get("undersampled") else "")
+        + f"; confirmed: {findings.get('confirmed_total', 0)}",
+        f"Runs on red CI: {red.get('runs', 0)} "
+        f"({red.get('provider_tokens', 0)} provider tokens); green "
+        f"{red.get('runs_on_green_ci', 0)}, CI undetermined "
+        f"{red.get('runs_ci_undetermined', 0)}, checks skipped "
+        f"{red.get('runs_ci_skipped', 0)}, no CI report "
+        f"{red.get('runs_without_ci_report', 0)}",
+        f"Reports vs paid runs: {rec.get('reports', 0)} vs "
+        f"{rec.get('paid_runs', 0)}, gap {rec.get('gap', 0)} = {buckets}",
+    ]
+
+
 @mcp.tool()
 async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
     """Practice metrics (#384): machine-review economics, harness-version
@@ -3332,6 +3404,7 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
         f"{mr.get('tokens_per_confirmed') or '—'} per confirmed finding, "
         f"{mr.get('tokens_per_fixed') or '—'} per FIXED finding",
     ]
+    lines.extend(_review_economy_lines(data.get("review_economy") or {}))
     rd = data.get("review_dispatches") or {}
     lines.append(
         "Wasted dispatch spend (no report): "

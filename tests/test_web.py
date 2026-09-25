@@ -6589,6 +6589,8 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
         "ci_runner": "make test",
         "review_limit": 3,
         "review_limit_mode": "warn",
+        "orchestrator_queue": "shadow",
+        "wip_limit": 2,
     }
     not_shown = set(GATE_POLICY_KEYS) - _FORM_GATE_POLICY_KEYS
     assert not_shown, "класс пуст — проверять нечего, тест бы лгал"

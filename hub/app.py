@@ -1620,6 +1620,24 @@ async def api_list_task_dependencies(task_id: int, request: Request):
     )
 
 
+@app.get("/api/orchestrator/next")
+async def api_orchestrator_next(
+    request: Request, project: str = Query(default="")
+) -> dict:
+    """Какую задачу хаб взял бы следующей и почему ждут остальные (#1274).
+
+    С ``project`` — ответ этого проекта в любом режиме; без него — ответы
+    всех проектов с ``orchestrator_queue=shadow``. Только чтение: событие
+    кандидата пишет поллер, а не этот вызов.
+    """
+    from hub.services.orchestrator_queue import next_tasks
+
+    answers = await next_tasks(_db(request), project.strip() or None)
+    if answers is None:
+        raise HTTPException(404, detail=f"project {project!r} not found")
+    return {"projects": answers}
+
+
 @app.post("/api/tasks/{task_id}/archive", response_model=TaskView)
 async def api_archive_task(
     task_id: int,
