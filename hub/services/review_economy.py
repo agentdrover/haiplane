@@ -376,6 +376,45 @@ async def _reconciliation_section(
     }
 
 
+async def _deep_cap_section(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+    """Сколько сдач окна суточный потолок deep увёл в lite (#1414).
+
+    Считаются сдачи (задача, поколение) по записям «ревью вызвано»: та же
+    причина, что видна в карточке. Доля — от всех вызванных сдач окна;
+    пересмотр потолка обещан при доле выше половины за неделю.
+    """
+    from hub.services.review_dispatch import DEEP_CAP_REASON_MARK
+
+    rows = await fetchall(
+        db,
+        "SELECT task_id, payload FROM events WHERE kind = 'review_dispatched' "
+        "AND created_at >= datetime('now', ?)",
+        (since,),
+    )
+    dispatched: set[tuple[Any, Any]] = set()
+    capped: set[tuple[Any, Any]] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        key = (row["task_id"], payload.get("generation"))
+        dispatched.add(key)
+        reasons = payload.get("profile_reasons") or []
+        if isinstance(reasons, list) and any(
+            DEEP_CAP_REASON_MARK in str(r) for r in reasons
+        ):
+            capped.add(key)
+    return {
+        "downgraded_submissions": len(capped),
+        "dispatched_submissions": len(dispatched),
+        "downgraded_share": _share(len(capped), len(dispatched)),
+        **_sample(len(dispatched)),
+    }
+
+
 def _escapes_section(escaped: dict[str, Any]) -> dict[str, Any]:
     """Эскейпы (#528) с корзинами непосчитанного рядом, не внутри."""
     return {
@@ -404,5 +443,6 @@ async def review_economy(
         "red_ci": await _red_ci_section(db, runs),
         "profile_assignment": await _cohort_section(db, runs),
         "reconciliation": await _reconciliation_section(db, since, runs),
+        "deep_cap": await _deep_cap_section(db, since),
         "escapes": _escapes_section(escaped),
     }

@@ -816,6 +816,126 @@ def pick_review_profile(
     return LITE, [f"класс риска {risk_class.value}, процессных поверхностей нет"]
 
 
+# Суточный потолок deep на проект (#1414). Правило выше решает, заслуживает
+# ли сдача харнесс; потолок решает, может ли проект его сегодня купить. Рычаги
+# «правило профиля» срезали 8-15% и ничего не гарантировали при всплеске
+# сдач: прод, облачный канал — 21, 40 и 29 deep за 22-24.09.
+DEEP_DAILY_CAP_KEY = "deep_daily_cap"
+#: Слова причины понижения; по ним сводка ревью находит такие сдачи.
+DEEP_CAP_REASON_MARK = "суточный потолок"
+
+
+def _cap_value(raw: Any) -> int | None:
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return None
+    return raw
+
+
+def deep_daily_cap_of(policy: dict[str, Any]) -> int | None:
+    """Потолок deep в сутки для проекта; None — потолка нет.
+
+    Ключ проекта главнее глобального REVIEW_DEEP_DAILY_CAP. Нечитаемое
+    значение — не потолок: запись такое не пропускает, а положенное мимо API
+    не должно молча перевести проект на lite.
+    """
+    if isinstance(policy, dict) and DEEP_DAILY_CAP_KEY in policy:
+        cap = _cap_value(policy[DEEP_DAILY_CAP_KEY])
+        if cap is not None:
+            return cap
+    raw = str(config.REVIEW_DEEP_DAILY_CAP or "").strip()
+    return _cap_value(int(raw)) if raw.isdigit() else None
+
+
+def _deep_cap_exempt(task: dict[str, Any]) -> bool:
+    """Ручной запрос человека и риск security потолком не режутся (#1414)."""
+    if (task.get("machine_review_override") or "").strip() == "require":
+        return True
+    try:
+        risks = json.loads(task.get("risks") or "[]")
+    except ValueError:
+        return False
+    return isinstance(risks, list) and any(
+        isinstance(r, dict) and str(r.get("kind") or "").strip() == "security"
+        for r in risks
+    )
+
+
+async def deep_cap_exhausted(
+    db: aiosqlite.Connection, task: dict[str, Any], generation: int
+) -> int | None:
+    """Потолок, если облачный deep этой сдаче сегодня не положен; иначе None.
+
+    Положен — значит место под потолком забронировано атомарно
+    (repo.claim_deep_seat): два параллельных заказа вместе потолок не
+    превышают. Сдача, уже занявшая место, второго не занимает. Исключения —
+    ручной запрос и риск security (#1414).
+    """
+    if _deep_cap_exempt(task):
+        return None
+    task_id = int(task["id"])
+    project = await repo.resolve_project_for_task(db, task_id)
+    if project is None:
+        return None
+    cap = deep_daily_cap_of(gate_policy_of(project))
+    if cap is None:
+        return None
+    if await repo.claim_deep_seat(db, int(project["id"]), task_id, generation, cap):
+        return None
+    return cap
+
+
+async def apply_deep_daily_cap(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    generation: int,
+    profile: str,
+    reasons: list[str],
+) -> tuple[str, list[str]]:
+    """Deep по правилу сверх суточного потолка становится lite с причиной."""
+    if profile != DEEP:
+        return profile, reasons
+    cap = await deep_cap_exhausted(db, task, generation)
+    if cap is None:
+        return profile, reasons
+    why = "; ".join(reasons) or "причина не названа"
+    return LITE, [
+        f"deep по правилу ({why}), но {DEEP_CAP_REASON_MARK} {cap} исчерпан — lite"
+    ]
+
+
+async def _forced_deep_over_cap(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    generation: int,
+    force_profile: str,
+    force_model: str,
+) -> bool:
+    """Принудительный облачный deep сверх потолка не покупается (#1414).
+
+    Добор лестницы (#879) и вторая ось (#1243) приходят с force_profile=deep
+    и мимо правила профиля — значит, и мимо понижения. Понизить их некуда:
+    добор lite после неполного lite — тот же прогон второй раз. Поэтому
+    отказ с названной причиной; лестница после него не повторяется —
+    вызывающий уже пишет, что решение за человеком.
+    """
+    if force_profile != DEEP:
+        return False
+    cap = await deep_cap_exhausted(db, task, generation)
+    if cap is None:
+        return False
+    what = "переспрос другой моделью" if force_model else "добор"
+    await repo.add_task_update(
+        db,
+        int(task["id"]),
+        "hub",
+        "alert",
+        f"Облачный deep для этой сдачи не заказан: {DEEP_CAP_REASON_MARK} deep "
+        f"исчерпан — {what} не куплен (потолок {cap} в сутки на проект, #1414).",
+    )
+    await db.commit()
+    return True
+
+
 # Repository review rules (#873). Until now the reviewer got the diff and
 # nothing about the code it came from: the prompt named no known defect class,
 # while ``_PROCESS_SURFACES`` above already listed the ones this repository
@@ -2232,6 +2352,7 @@ async def prepare_review_order(
     force_profile: str,
     principal_id: int | None,
     force_model: str = "",
+    cloud: bool = False,
 ) -> ReviewOrder:
     """Собрать заказ: профиль по диффу, правила, предмет ревью, доступ.
 
@@ -2242,6 +2363,10 @@ async def prepare_review_order(
 
     ``force_model`` — модель второй оси каскада (#1243): её уже выбрал
     pick_cascade_model, и заказ не выбирает заново.
+
+    ``cloud`` — заказ облачного канала: только он тратит квоту провайдера и
+    только он подчиняется суточному потолку deep (#1414). Локальный
+    ревьюер квоту Cursor не тратит — решение владельца 25.09.
     """
     task_id = int(task["id"])
     model_id = force_model or pick_review_model(
@@ -2274,6 +2399,10 @@ async def prepare_review_order(
         )
     else:
         profile, profile_reasons = pick_review_profile(task, profile_diff)
+        if cloud:
+            profile, profile_reasons = await apply_deep_daily_cap(
+                db, task, generation, profile, profile_reasons
+            )
     rules_block, rules_note = await collect_review_rules(db, task_id, diff)
     prior = await previous_findings(db, task_id, generation)
     diff_block, diff_note = diff_plan(
@@ -2720,6 +2849,19 @@ async def _prepare_claimed_order(
     ):
         return None
     try:
+        if await _forced_deep_over_cap(
+            db, task, generation, force_profile, force_model
+        ):
+            await _release_the_order(
+                db,
+                task_id,
+                generation,
+                force_profile,
+                replaces_dispatch_id,
+                force_model,
+            )
+            await db.commit()
+            return None
         order = await prepare_review_order(
             db,
             task,
@@ -2728,6 +2870,7 @@ async def _prepare_claimed_order(
             force_profile=force_profile,
             principal_id=principal_id,
             force_model=force_model,
+            cloud=True,
         )
         # Последнее слово перед тратой. Подготовка заказа выше ходит в сеть
         # за диффом и правилами, и за это окно сдача могла смениться — ЛЮБОЙ
