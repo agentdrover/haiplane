@@ -3617,6 +3617,13 @@ def _merge_sha_or_detail(merge_sha: str, detail: str) -> str:
     return detail if re.fullmatch(r"[0-9a-f]{7,40}", detail or "") else ""
 
 
+# #1362: писатель (base_automerge_step, refusal_after_automerge) и читатель
+# (is_base_conflict_entry) делят ОДНИ строки — разойдись они, и конфликт с
+# базой молча перестанет узнаваться, а задача снова пойдёт к человеку.
+AUTOMERGE_NOT_APPLIED = "Автомерж не применён: "
+BASE_CONFLICT_CAUSE = "конфликт вне класса автомержа"
+
+
 async def base_automerge_step(
     db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
 ) -> tuple[str, str]:
@@ -3671,7 +3678,7 @@ async def base_automerge_step(
         return "", ""
     resolutions, note = base_merge.plan_resolution(files)
     if not resolutions:
-        return "", f"конфликт вне класса автомержа — {note}"
+        return "", f"{BASE_CONFLICT_CAUSE} — {note}"
 
     # #1332: сложенное проверяет ФИКСИРОВАННЫЙ профиль хоста, а не
     # validation_commands автора. Те писались под машину разработчика («uv run
@@ -3749,7 +3756,65 @@ async def refusal_after_automerge(
     if healed:
         return healed
     detail = _merge_failure_detail(merge_detail)
-    return f"{detail}. Автомерж не применён: {cause}" if cause else detail
+    return f"{detail}. {AUTOMERGE_NOT_APPLIED}{cause}" if cause else detail
+
+
+async def needs_decision_entry(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> dict[str, Any]:
+    """Payload события, которым задача вошла в НЫНЕШНИЙ needs_decision (#1362).
+
+    Только из событий, не из ленты карточки: текст ленты пишется для человека
+    и меняется, а решение «кто действует дальше» по нему принимать нельзя.
+    Событие старше входа в статус — от прошлого захода и ничего не говорит о
+    нынешнем. Нет события — пустой словарь: причина неизвестна, и это не
+    конфликт.
+    """
+    since = str(task.get("status_entered_at") or "")
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE task_id=? AND kind='needs_decision' "
+        "AND created_at >= ? ORDER BY id DESC LIMIT 1",
+        (task["id"], since),
+    )
+    if not rows:
+        return {}
+    try:
+        payload = json.loads(dict(rows[0])["payload"] or "{}")
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+BASE_CONFLICT_RESUBMIT_HINT = (
+    " Это конфликт с базой, а не решение: автор может слить базу в ветку и "
+    "пересдать прямо из needs_decision через hub_submit_for_review, без rework "
+    "(#1362). Прежнее одобрение новым поколением станет нетекущим."
+)
+
+
+def base_conflict_resubmit_hint(reason: str, detail: str) -> str:
+    """Хвост строки о needs_decision: автору — его ход, если он есть (#1362)."""
+    if is_base_conflict_entry({"reason": reason, "detail": detail}):
+        return BASE_CONFLICT_RESUBMIT_HINT
+    return ""
+
+
+def is_base_conflict_entry(payload: dict[str, Any]) -> bool:
+    """Вход в needs_decision — merge_failed по конфликту с базой (#1362).
+
+    Узко и нарочно: гейт доставки (reason=merge_gate), мерж отказал, и
+    автомерж ПОСМОТРЕЛ и увидел конфликт, который не взял (BASE_CONFLICT_CAUSE).
+    Эту связку пишет только ``refusal_after_automerge``, и только после
+    merge_failed — отдельная проверка префикса была бы недостижимой. «Проба не удалась», «конфликта нет», стопка,
+    недоставляемая база, лимит кругов, арбитраж — решения человека, и сюда не
+    попадают. Слить базу — работа автора; остальное — нет.
+    """
+    detail = str(payload.get("detail") or "")
+    return (
+        payload.get("reason") == "merge_gate"
+        and f"{AUTOMERGE_NOT_APPLIED}{BASE_CONFLICT_CAUSE}" in detail
+    )
 
 
 async def merge_before_completion(
@@ -4347,7 +4412,10 @@ async def _deliver_completed_pair_task(
             + " Решение за человеком "
             "(hub_decide_task): rework вернёт задачу в running — "
             "устраните причину и пересдайте done; accept завершит "
-            "задачу БЕЗ доставки PR.",
+            "задачу БЕЗ доставки PR."
+            + base_conflict_resubmit_hint(
+                "ci_fix_cycle_limit" if budget_spent else "merge_gate", detail
+            ),
         )
         await repo.insert_event(
             db,

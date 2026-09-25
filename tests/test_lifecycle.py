@@ -1060,3 +1060,185 @@ async def test_a_probe_never_leaks_its_secret(
         "реестр носит ИМЯ настройки, а не её значение"
     )
     assert planted not in spec.call and planted not in spec.summary
+
+
+# --- #1362: конфликт с базой после одобрения — работа автора ----------------
+#
+# 23.09.2026 #1333 и #1337 получили merge_failed по конфликту с develop после
+# доставки соседа и ушли в needs_decision. Пересдача оттуда отвечала 400, и
+# каждый раз владелец давал rework только затем, чтобы агент мог заново взять
+# задачу и пересдать. Решать человеку в этом круге было нечего.
+
+
+async def _conflicted_after_approval(db: aiosqlite.Connection, monkeypatch) -> int:
+    """Одобренная задача, которую НАСТОЯЩИЙ гейт увёл в needs_decision.
+
+    Конфликт смысловой (обе стороны правят одни и те же строки) — автомерж его
+    не берёт, и задача идёт к человеку с событием needs_decision, которое
+    пишет сам гейт. Событие не подделывается: разойдись формат писателя и
+    читателя — этот тест упадёт первым.
+    """
+    from unittest.mock import AsyncMock
+
+    from tests.test_delivery_gate import _OVERLAPPING_CONFLICT, _seeing
+    from tests.test_pair_merge_gate import _approved_pair_task, _report_done
+
+    g = _seeing(monkeypatch, "approved0commit", merged=False)
+    g.base_merge_conflicts = AsyncMock(
+        return_value=({"hub/services/orchestration.py": _OVERLAPPING_CONFLICT}, "")
+    )
+    task_id = await _approved_pair_task(db)
+    await _report_done(db, task_id)
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", "предпосылка: гейт позвал человека"
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "пересдать прямо из needs_decision" in feed, (
+        "строка о needs_decision называет автору его ход, а не только rework"
+    )
+    # Автор слил базу в ветку и запушил: вершина уехала.
+    g.head_sha = AsyncMock(return_value="tip0after0author0merge")
+    return task_id
+
+
+async def test_a_base_conflict_after_approval_is_resubmitted_by_the_author(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1362 AC-1: merge_failed по конфликту с базой → пересдача автора."""
+    from hub import services
+    from hub.models import TaskSubmitReview
+
+    task_id = await _conflicted_after_approval(db, monkeypatch)
+    before = dict(await repo.get_task(db, task_id))
+
+    view = await services.submit_for_review(
+        db, task_id, TaskSubmitReview(agent="dev", branch=before["branch"] or "")
+    )
+
+    assert view.status.value == "review", "сдача принята, задача на ревью"
+    after = dict(await repo.get_task(db, task_id))
+    assert after["submission_generation"] == before["submission_generation"] + 1, (
+        "новая сдача — новое поколение: старое одобрение по нему не текущее"
+    )
+    assert after["submission_sha"] == "tip0after0author0merge"
+    assert not view.review_approved_current, (
+        "#1286: одобрение, данное до слияния базы, не доставляется само"
+    )
+    decided = await db.execute_fetchall(
+        "SELECT id FROM events WHERE task_id=? AND kind='task_decided'", (task_id,)
+    )
+    assert not decided, "между merge_failed и пересдачей решения человека нет"
+    feed = " ".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "конфликт с базой" in feed, "лента называет, откуда пришла пересдача"
+
+
+async def test_other_needs_decision_causes_still_need_a_human(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1362 AC-2: прочие причины needs_decision остаются за человеком.
+
+    Мутационный напарник: правило «пересдавать из любого needs_decision»
+    обязано ронять этот тест на каждой строке перечня.
+    """
+    from fastapi import HTTPException
+
+    from hub import services
+    from hub.models import TaskSubmitReview
+    from tests.test_pair_merge_gate import _approved_pair_task, _git
+
+    _git(merged=False)
+    conflict_detail = (
+        "merge_failed: GitHub refused the merge. Автомерж не применён: "
+        "конфликт вне класса автомержа — обе стороны правят одни и те же строки"
+    )
+    causes: list[tuple[str, list[dict]]] = [
+        ("арбитраж", [{"reason": "no_clear_verdict"}]),
+        ("лимит кругов", [{"reason": "review_cycle_limit"}]),
+        (
+            "недоставляемая база",
+            [{"reason": "merge_gate", "detail": "stranded_base: основание #1 закрыто"}],
+        ),
+        ("стопка", [{"reason": "stacking", "detail": "stacked_on_unmerged"}]),
+        (
+            "бюджет CI",
+            [{"reason": "ci_fix_cycle_limit", "detail": "ci_failed: red"}],
+        ),
+        (
+            "мерж без конфликта",
+            [
+                {
+                    "reason": "merge_gate",
+                    "detail": "merge_failed: GitHub refused the merge",
+                }
+            ],
+        ),
+        (
+            "конфликт не установлен",
+            [
+                {
+                    "reason": "merge_gate",
+                    "detail": "merge_failed: x. Автомерж не применён: "
+                    "проба мержа базы не удалась (клон не отвечает)",
+                }
+            ],
+        ),
+        (
+            "конфликт в тексте, но причина другая",
+            [{"reason": "review_cycle_limit", "detail": conflict_detail}],
+        ),
+        (
+            "конфликт был, потом новая причина",
+            [
+                {"reason": "merge_gate", "detail": conflict_detail},
+                {"reason": "review_cycle_limit"},
+            ],
+        ),
+        ("события нет вовсе", []),
+    ]
+    for label, payloads in causes:
+        task_id = await _approved_pair_task(db)
+        await repo.update_task(db, task_id, status="needs_decision")
+        for payload in payloads:
+            await repo.insert_event(
+                db, kind="needs_decision", task_id=task_id, actor="hub", payload=payload
+            )
+        await db.commit()
+
+        try:
+            await services.submit_for_review(db, task_id, TaskSubmitReview(agent="dev"))
+        except HTTPException as exc:
+            assert exc.status_code == 400, label
+            text = str(exc.detail)
+            assert "can only submit running or under-review" in text, label
+            assert "hub_decide_task" in text, f"{label}: отказ называет решение"
+            if payloads:
+                assert payloads[-1]["reason"] in text, f"{label}: причина названа"
+        else:
+            raise AssertionError(f"{label}: пересдача из needs_decision прошла")
+        task = dict(await repo.get_task(db, task_id))
+        assert task["status"] == "needs_decision", label
+
+    # Конфликт из ПРОШЛОГО захода в needs_decision не открывает нынешний.
+    task_id = await _approved_pair_task(db)
+    await repo.insert_event(
+        db,
+        kind="needs_decision",
+        task_id=task_id,
+        actor="hub",
+        payload={"reason": "merge_gate", "detail": conflict_detail},
+    )
+    await db.execute(
+        "UPDATE events SET created_at=datetime('now', '-1 day') WHERE task_id=?",
+        (task_id,),
+    )
+    await repo.update_task(db, task_id, status="needs_decision")
+    await db.commit()
+    try:
+        await services.submit_for_review(db, task_id, TaskSubmitReview(agent="dev"))
+    except HTTPException as exc:
+        assert exc.status_code == 400
+    else:
+        raise AssertionError("событие прошлого захода открыло пересдачу")
