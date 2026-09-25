@@ -275,10 +275,20 @@ async def test_catalog_without_slow_pair_or_model_orders_bare(monkeypatch, _conf
     ],
 )
 async def test_unreadable_catalog_orders_bare(monkeypatch, _configured, catalog):
-    """#1423: каталог не прочитан — заказ без params, ревью не теряется."""
+    """#1423: каталог не прочитан — заказ без params, ревью не теряется.
+
+    И неудача не кэшируется: следующий заказ спрашивает каталог снова.
+    """
     provider = _Provider(catalog)
     await _order(monkeypatch, provider, "grok-4.6")
-    assert provider.ordered_models() == [{"id": "grok-4.6"}]
+    provider.catalog = httpx.Response(200, json=RECORDED_MODELS_CATALOG)
+    await _order(monkeypatch, provider, "grok-4.6")
+    first, second = provider.ordered_models()
+    assert first == {"id": "grok-4.6"}
+    assert second["params"] == [
+        {"id": "effort", "value": "high"},
+        {"id": "fast", "value": "false"},
+    ]
 
 
 async def test_explicit_review_params_win_over_catalog(monkeypatch, _configured):
