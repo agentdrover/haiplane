@@ -5450,3 +5450,108 @@ async def release_by_id(
         await fetchall(db, "SELECT * FROM releases WHERE id = ?", (release_id,))
     )
     return dict(rows[0]) if rows else None
+
+
+# ---- #1410 (F2.2): строка прогона облачного исполнителя ----
+
+
+async def create_executor_run(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    submission_generation: int,
+    agent_id: str,
+    run_id: str,
+    model: str,
+) -> int:
+    """Записать прогон исполнителя при заказе (#1410). Коммит — за вызывающим.
+
+    Токены и центы не пишутся: их называет только провайдер при опросе, а
+    ноль на месте неизвестного выдал бы непрочитанный счёт за бесплатный.
+    """
+    cur = await db.execute(
+        "INSERT INTO executor_runs "
+        "(task_id, submission_generation, agent_id, run_id, model) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, submission_generation, agent_id, run_id, model),
+    )
+    return inserted_id(cur)
+
+
+async def get_executor_run(
+    db: aiosqlite.Connection, row_id: int
+) -> aiosqlite.Row | None:
+    rows = await fetchall(db, "SELECT * FROM executor_runs WHERE id=?", (row_id,))
+    return rows[0] if rows else None
+
+
+async def list_executor_runs(
+    db: aiosqlite.Connection, task_id: int
+) -> list[aiosqlite.Row]:
+    return await fetchall(
+        db,
+        "SELECT * FROM executor_runs WHERE task_id=? ORDER BY id",
+        (task_id,),
+    )
+
+
+async def list_executor_runs_in_outcome(
+    db: aiosqlite.Connection, outcome: str
+) -> list[aiosqlite.Row]:
+    return await fetchall(
+        db,
+        "SELECT * FROM executor_runs WHERE outcome=? ORDER BY id",
+        (outcome,),
+    )
+
+
+async def update_executor_run(
+    db: aiosqlite.Connection,
+    row_id: int,
+    *,
+    tokens: int | None = None,
+    cents: float | None = None,
+    outcome: str | None = None,
+    reason: str = "",
+    finish: bool = False,
+) -> None:
+    """Обновить строку по опросу (#1410). Коммит — за вызывающим.
+
+    ``None`` в ``tokens``/``cents``/``outcome`` — «провайдер этого не назвал»:
+    прежнее значение остаётся, а не обнуляется. ``reason`` пишется всегда —
+    пустая строка снимает прежнюю причину. ``finish`` ставит ``finished_at``
+    и длительность от ``started_at``.
+    """
+    await db.execute(
+        "UPDATE executor_runs SET "
+        "tokens=COALESCE(?, tokens), cents=COALESCE(?, cents), "
+        "outcome=COALESCE(?, outcome), reason=?, polled_at=datetime('now'), "
+        "finished_at=CASE WHEN ? THEN datetime('now') ELSE finished_at END, "
+        "duration_ms=CASE WHEN ? THEN CAST(ROUND("
+        "(julianday('now') - julianday(started_at)) * 86400000) AS INTEGER) "
+        "ELSE duration_ms END "
+        "WHERE id=?",
+        (tokens, cents, outcome, reason, finish, finish, row_id),
+    )
+
+
+async def wait_for_executor_cost(
+    db: aiosqlite.Connection, row_id: int, minutes: int
+) -> bool:
+    """Отметить ожидание цены (#1410); True — срок ожидания исчерпан.
+
+    Отметка ставится один раз — при первом конце прогона без цены — и дальше
+    не сдвигается, иначе ожидание не кончилось бы никогда.
+    """
+    await db.execute(
+        "UPDATE executor_runs SET cost_wait_since=COALESCE(cost_wait_since, "
+        "datetime('now')) WHERE id=?",
+        (row_id,),
+    )
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM executor_runs WHERE id=? "
+        "AND cost_wait_since <= datetime('now', ?)",
+        (row_id, f"-{minutes} minutes"),
+    )
+    return bool(rows)
