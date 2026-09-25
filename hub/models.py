@@ -2969,6 +2969,23 @@ class FindingDispositionView(BaseModel):
     decided_at: str = ""
 
 
+class FindingObservationClosure(BaseModel):
+    """A confirmed finding a later live check refuted by name (#1244).
+
+    NOT a disposition (#876): nobody judged the finding, an observation made
+    after the report contradicted it. ``live_check_id`` is the record to open;
+    the finding itself stays in the report, only its state changes.
+    """
+
+    finding_uid: str
+    live_check_id: int
+    recorded_agent: str = ""
+    recorded_at: str = ""
+    # "hub" — a probe from the hub's own registry (#1236); "principal" — a
+    # principal other than the author recorded it.
+    hand: str = ""
+
+
 class MachineReviewView(BaseModel):
     id: int
     task_id: int
@@ -3018,6 +3035,10 @@ class MachineReviewView(BaseModel):
     # What the gate said each confirmed finding turned out to be (#876). An
     # empty list means nobody judged them — never that they were all fine.
     dispositions: list[FindingDispositionView] = Field(default_factory=list)
+    # Confirmed findings a later live check closed by naming their uid, and by
+    # a hand other than the author's (#1244). Computed when the report is read,
+    # never stored on it: the report stays what it was.
+    observation_closures: list[FindingObservationClosure] = Field(default_factory=list)
     # На какой ступени лестницы исходов стоит отчёт (#1234), и что об этой
     # ступени печатают. Поля, а не свойства: читатели — карточка, дайджест и
     # квитанция MCP, и последняя видит модель уже сериализованной в JSON, где
