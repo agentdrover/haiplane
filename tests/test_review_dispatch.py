@@ -1815,9 +1815,18 @@ async def _second_generation(
     ancestor: bool | None = True,
     base_branch: str = "develop",
     record_previous: bool = True,
+    reviewed: bool = True,
 ) -> int:
-    """A task on its SECOND submission, with the first one in the ledger."""
+    """A task on its SECOND submission, with the first one in the ledger.
+
+    ``reviewed`` records a report on generation 1: since #1400 the delta is
+    taken only from a generation somebody's review actually covered.
+    """
     task_id = await _submitted(client, db, slug)
+    if reviewed:
+        await repo.insert_machine_review(
+            db, task_id=task_id, submission_generation=1, incomplete=False
+        )
     if record_previous:
         # submit_for_review already wrote this row; the upsert pins the sha and
         # base the test wants to reason about.
@@ -1955,6 +1964,147 @@ async def test_unreadable_ancestry_reads_everything(
     prompt = recorder.calls[-1]["prompt_text"]
     assert "историю проверить не удалось" in prompt
     assert "прочитана ДЕЛЬТА" not in prompt
+
+
+# --- The delta starts where a recorded review ended (#1400) ------------------
+#
+# #1378, 25.09: generation 2 carried the fixes and got a deep run whose report
+# was discarded (#1260) because generation 3 — a test tweak — arrived three
+# minutes later. Generation 3 was reviewed as "delta to #2", so the fixes of
+# generation 2 were read by nobody, and the clean report of generation 3 made
+# the task look ready. The doubles below are that shape: gen2 touches a
+# process-surface file, gen3 only a test.
+_GEN2_SHA = "d" * 40
+_GEN2_FILE = "hub/services/fs.py"
+_GEN3_FILE = "tests/test_fs.py"
+_GEN2_PART = f"+++ b/{_GEN2_FILE}\n+        workspace_path = project.workspace_path\n"
+_GEN3_PART = f"+++ b/{_GEN3_FILE}\n+правка теста\n"
+
+
+class _ThreeGenerationsGitOps(_AncestryGitOps):
+    """Git whose answers depend on WHICH generation the delta starts from."""
+
+    def _since(self, base: str) -> str | None:
+        if base == _PREV_SHA:
+            return _GEN2_PART + _GEN3_PART
+        if base == _GEN2_SHA:
+            return _GEN3_PART
+        return None
+
+    async def branch_diff(self, repo, base, branch):
+        since = self._since(base)
+        return self._diff if since is None else since
+
+    async def delta_without_base(self, repo, base, prev, current):
+        return self._since(prev)
+
+
+async def _third_generation(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    slug: str,
+    *,
+    reviewed: tuple[int, ...],
+) -> int:
+    """A task on its THIRD submission; ``reviewed`` names generations with a report."""
+    task_id = await _second_generation(client, db, slug, reviewed=False)
+    await repo.record_submission(
+        db, task_id=task_id, generation=2, sha=_GEN2_SHA, base_branch="develop"
+    )
+    for generation in reviewed:
+        await repo.insert_machine_review(
+            db,
+            task_id=task_id,
+            submission_generation=generation,
+            findings_confirmed=json.dumps(
+                [{"title": f"finding of gen{generation}", "file": _GEN2_FILE}]
+            ),
+            incomplete=False,
+        )
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 3 WHERE id = ?", (task_id,)
+    )
+    await db.commit()
+    return task_id
+
+
+async def _subject_card(client: AsyncClient, task_id: int) -> str:
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    cards = [
+        u["content"] for u in data["updates"] or [] if "Предмет ревью" in u["content"]
+    ]
+    assert cards, "the dispatch card must state the subject"
+    return cards[-1]
+
+
+async def test_delta_base_skips_generation_without_recorded_review(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1400): gen2 has no recorded report, so the delta of gen3 starts
+    # at gen1 — the last generation a review actually covered — and carries
+    # gen2's fixes. The card names the base and why it skipped a generation,
+    # and the profile is bought for the WIDENED delta: gen2's process surface
+    # buys deep even though gen3 alone is a test tweak.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-g1"}, "run": {"id": "r-g1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _third_generation(client, db, "spike-skip-gen2", reviewed=(1,))
+    plugins.git_ops = _ThreeGenerationsGitOps(_TIP, ["docs/notes.md"])
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert f"'{_GEN2_FILE}'" in prompt, "gen2's fixes are in the subject"
+    assert f"'{_GEN3_FILE}'" in prompt
+    assert "прочитана ДЕЛЬТА" in prompt
+    card = await _subject_card(client, task_id)
+    assert "дельта к поколению #1" in card, card
+    assert "отчёт по #2 не записан" in card, card
+    assert "finding of gen1" in prompt, "the base review's findings travel along"
+    assert (await _dispatch_row(db, task_id))["profile"] == "deep", (
+        "the profile is judged on the widened delta, not on gen3 alone"
+    )
+
+
+async def test_delta_without_any_recorded_review_reads_whole_diff(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1400): no earlier generation has a recorded report, so there is
+    # no point a delta could honestly start from — the whole diff, named.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-g2"}, "run": {"id": "r-g2"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _third_generation(client, db, "spike-no-review", reviewed=())
+    plugins.git_ops = _ThreeGenerationsGitOps(_TIP, ["docs/notes.md"])
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert "прочитан ВЕСЬ дифф" in prompt
+    assert "прочитана ДЕЛЬТА" not in prompt
+    card = await _subject_card(client, task_id)
+    assert "ни по одному прежнему поколению отчёт ревью не записан" in card, card
+
+
+async def test_delta_base_is_previous_generation_when_its_review_is_recorded(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#1400): when gen2's report IS recorded nothing changes — the delta
+    # is to gen2, narrow, with no skip named, and gen3's test tweak stays lite.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-g3"}, "run": {"id": "r-g3"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _third_generation(
+        client, db, "spike-gen2-reviewed", reviewed=(1, 2)
+    )
+    plugins.git_ops = _ThreeGenerationsGitOps(_TIP, ["docs/notes.md"])
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert f"'{_GEN3_FILE}'" in prompt
+    assert f"'{_GEN2_FILE}'" not in prompt, "gen2 was reviewed, its files stay out"
+    card = await _subject_card(client, task_id)
+    assert "дельта к поколению #2" in card, card
+    assert "не записан" not in card, card
+    assert (await _dispatch_row(db, task_id))["profile"] == "lite"
 
 
 # --- The delta is split by AUTHORSHIP, not trimmed (#1249) -------------------

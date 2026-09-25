@@ -273,8 +273,11 @@ async def previous_findings(
     Travels with the delta so the new run can check whether the fixes landed,
     instead of rediscovering the same defects from scratch — or, worse, not
     looking at them because their files are the ones it was told to skip.
+    Taken from the generation the delta starts at (#1400): a generation with
+    no recorded report has no findings, and the ones that matter are those
+    of the last review that did land.
     """
-    previous = await repo.previous_submission(db, task_id, generation)
+    previous = await repo.last_reviewed_submission(db, task_id, generation)
     if previous is None:
         return []
     titles: list[str] = []
@@ -312,6 +315,34 @@ class DeltaSubject:
     note: str
 
 
+async def _delta_base(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> tuple[dict | None, str]:
+    """Where the delta may start: the newest submission a REPORT covered (#1400).
+
+    Returns the base submission and, when it is not the previous generation,
+    which generations were skipped and why; no base means the whole diff, and
+    the string then says why. "Previous generation" is not enough: on #1378 the
+    report on generation 2 was discarded as stale (#1260) when generation 3
+    arrived, and a delta to #2 left generation 2's fixes read by nobody.
+    """
+    if await repo.previous_submission(db, task_id, generation) is None:
+        return None, "предыдущая сдача не записана — читается весь дифф"
+    reviewed = await repo.last_reviewed_submission(db, task_id, generation)
+    if reviewed is None:
+        return None, (
+            "ни по одному прежнему поколению отчёт ревью не записан — "
+            "читается весь дифф"
+        )
+    prev = dict(reviewed)
+    gaps = [f"#{n}" for n in range(int(prev.get("generation") or 0) + 1, generation)]
+    if not gaps:
+        return prev, ""
+    if len(gaps) == 1:
+        return prev, f"отчёт по {gaps[0]} не записан"
+    return prev, f"отчёты по {', '.join(gaps)} не записаны"
+
+
 async def generation_delta(
     db: aiosqlite.Connection, task: dict, base: str
 ) -> DeltaSubject:
@@ -322,7 +353,9 @@ async def generation_delta(
 
     Three facts have to hold, and each is checked rather than assumed:
 
-    1. the previous submission was recorded — before #880 nothing kept it;
+    1. the previous submission was recorded — before #880 nothing kept it —
+       and the base is the newest one a recorded REPORT covered (#1400), not
+       simply generation N−1: an unreviewed generation stays in the delta;
     2. its commit is an ANCESTOR of the current one. That is the rebase and
        force-push test: after either, "what changed since last time" compares
        commits that no longer share a history;
@@ -352,12 +385,9 @@ async def generation_delta(
     if generation <= 1 or not current:
         return DeltaSubject([], [], "", "первая сдача — предмет ревью весь дифф")
 
-    previous = await repo.previous_submission(db, task_id, generation)
-    if previous is None:
-        return DeltaSubject(
-            [], [], "", "предыдущая сдача не записана — читается весь дифф"
-        )
-    prev = dict(previous)
+    prev, skipped = await _delta_base(db, task_id, generation)
+    if prev is None:
+        return DeltaSubject([], [], "", skipped)
     prev_sha = (prev.get("sha") or "").strip()
     if not prev_sha:
         return DeltaSubject(
@@ -412,6 +442,10 @@ async def generation_delta(
             f"с поколения #{prev.get('generation')} код не менялся — читается весь дифф",
         )
     head = f"дельта к поколению #{prev.get('generation')} ({prev_sha[:12]})"
+    if skipped:
+        head += (
+            f", {skipped} — правки после #{prev.get('generation')} в предмете (#1400)"
+        )
     return await _split_by_origin(
         task_id, workspace, base, prev_sha, current, paths, head
     )
