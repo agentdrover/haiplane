@@ -2386,16 +2386,17 @@ class _Started(NamedTuple):
     params_refusal: cursor_cloud.Refusal | None = None
 
 
-#: Коды 400, которые НАЗЫВАЮТ причину помимо параметров: лимит счёта,
-#: недоступная модель (#1036, #1182). Повтор без параметров на них купил бы
-#: тот же отказ вторым запросом — ровно то, что #1199 запретил.
-_NOT_ABOUT_PARAMS_CODES: frozenset[str] = frozenset(
+#: Коды 400, при которых повтор без параметров не нужен: лимит счёта
+#: (#1036) — голый заказ купил бы тот же отказ вторым запросом, ровно то,
+#: что #1199 запретил. Только они (#1423): invalid_model и
+#: model_not_available Cursor отдаёт и на отвергнутые params — 25.09.2026
+#: ``[{fast:false}]`` для grok-4.6 пришёл как invalid_model, и исключение
+#: остановило ревью для всех задач. Недоступная модель стоит тут лишний
+#: запрос без агента; потерянное ревью стоит больше.
+_ACCOUNT_LIMIT_CODES: frozenset[str] = frozenset(
     {
         "usage_limit_exceeded",
         "insufficient_quota",
-        "invalid_model",
-        "model_not_available",
-        "model_unavailable",
     }
 )
 
@@ -2407,8 +2408,9 @@ def _params_were_refused(
     """400 на заказ с параметрами — повод один раз заказать без них (#1417).
 
     Cursor на 400 причину толком не называет («[invalid_argument] Error»),
-    поэтому признак — сам факт: параметры были, провайдер отверг, и код
-    отказа не называет другой причины. Повтор ничего не стоит — отвергнутый
+    поэтому признак — сам факт: параметры были, провайдер отверг, и это
+    не лимит счёта. Любой другой код 400, invalid_model в том числе (#1423),
+    — повод к одному голому заказу. Повтор ничего не стоит — отвергнутый
     заказ агента не создаёт, — а вину параметров доказывает только его успех
     (см. ``_name_the_dropped_params``).
     """
@@ -2416,7 +2418,7 @@ def _params_were_refused(
         bool(params)
         and refusal is not None
         and refusal.status == 400
-        and refusal.code not in _NOT_ABOUT_PARAMS_CODES
+        and refusal.code not in _ACCOUNT_LIMIT_CODES
     )
 
 
@@ -2854,7 +2856,7 @@ async def maybe_dispatch_review(
         prompt_text=order.prompt,
         hub_mcp_url=f"{instance_base_url().rstrip('/')}/mcp",
         reviewer_token=reviewer_token,
-        model_params=cursor_cloud.review_model_params(),
+        model_params=await cursor_cloud.review_params_for(model_id),
     )
     agent_id, run_id = started.agent_id, started.run_id
     variant = await _name_the_dropped_params(db, task_id, model_id, started)
