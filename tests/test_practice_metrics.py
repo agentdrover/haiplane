@@ -1878,6 +1878,45 @@ async def test_review_economy_reconciles_reports_with_paid_runs(
     assert all(b["label"] for b in rec["buckets"]), "каждая корзина названа"
 
 
+async def test_review_economy_does_not_count_a_carried_report(
+    db: aiosqlite.Connection,
+):
+    # Находка deep-ревью сдачи 3 #1361: перенос отчёта на пересдачу «только
+    # слита база» (#1361) — не прогон и не чтение. Сводка #1406 читала
+    # machine_reviews без фильтра переноса, и одна копия давала два
+    # независимых отчёта, вдвое больше находок и отчёт «без счёта».
+    task_id = await _task(db, title="merge-only resubmission")
+    await _order(db, task_id, bill=1_000_000)
+    rid = await _economy_report(db, task_id, confirmed=2, bill=1_000_000)
+    source = dict(await repo.get_machine_review(db, rid))
+    await db.execute("UPDATE tasks SET submission_generation=2 WHERE id=?", (task_id,))
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=2,
+        harness_skill=source["harness_skill"],
+        raw_count=int(source["raw_count"] or 0),
+        findings_confirmed=source["findings_confirmed"],
+        unresolved=source["unresolved"],
+        incomplete=False,
+        profile=source["profile"],
+        carried_from_review_id=rid,
+    )
+    await db.commit()
+
+    econ = (await practice_metrics(db))["review_economy"]
+
+    assert econ["findings"]["independent_reports"] == 1, "перенос — не отчёт"
+    assert econ["findings"]["confirmed_total"] == 2, "находки не удваиваются"
+    rec = econ["reconciliation"]
+    assert rec["reports"] == 1
+    assert rec["gap"] == 0
+    buckets = {b["bucket"]: b["count"] for b in rec["buckets"]}
+    assert all(count == 0 for count in buckets.values()), (
+        "перенос не попадает ни в одну корзину «без счёта»"
+    )
+
+
 async def test_review_economy_is_the_same_on_every_surface(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):

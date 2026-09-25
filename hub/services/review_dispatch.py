@@ -47,6 +47,7 @@ from hub.models import (
 )
 from hub.services import call_sites, project_policy
 from hub.services.model_family import family
+from hub.services.orchestration import ORIGINAL_READ_SQL
 from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
 
 log = logging.getLogger(__name__)
@@ -273,8 +274,11 @@ async def previous_findings(
     Travels with the delta so the new run can check whether the fixes landed,
     instead of rediscovering the same defects from scratch — or, worse, not
     looking at them because their files are the ones it was told to skip.
+    Taken from the generation the delta starts at (#1400): a generation with
+    no recorded report has no findings, and the ones that matter are those
+    of the last review that did land.
     """
-    previous = await repo.previous_submission(db, task_id, generation)
+    previous = await _last_read_submission(db, task_id, generation)
     if previous is None:
         return []
     titles: list[str] = []
@@ -312,6 +316,88 @@ class DeltaSubject:
     note: str
 
 
+async def _last_read_submission(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> aiosqlite.Row | None:
+    """The newest submission BEFORE this generation whose code was READ (#1400).
+
+    "Read" is ``CODE_READ`` — the same rule the second-read guard uses: a
+    complete, independent report. A generation whose report never landed
+    (discarded as stale by #1260, crashed, still in flight), or whose only
+    report is incomplete or the author's own, is skipped, so its changes stay
+    in the subject instead of falling between two reviews nobody finished.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT s.* FROM submissions s WHERE s.task_id=? AND s.generation<? "  # nosec B608 - константа модуля, не ввод
+        "AND EXISTS (SELECT 1 FROM machine_reviews mr WHERE mr.task_id=s.task_id "
+        f"AND mr.submission_generation=s.generation AND {CODE_READ}) "
+        "ORDER BY s.generation DESC LIMIT 1",
+        (task_id, generation),
+    )
+    return rows[0] if rows else None
+
+
+async def _skipped_note(
+    db: aiosqlite.Connection, task_id: int, base_generation: int, generation: int
+) -> str:
+    """Why the delta starts before N−1: name each skipped generation's cause.
+
+    Two causes, told apart because "not recorded" would be a lie about a
+    report that exists but does not count as reading the code.
+    """
+    gaps = list(range(base_generation + 1, generation))
+    if not gaps:
+        return ""
+    rows = await fetchall(
+        db,
+        "SELECT DISTINCT submission_generation AS g FROM machine_reviews "
+        "WHERE task_id=? AND submission_generation>? AND submission_generation<?",
+        (task_id, base_generation, generation),
+    )
+    uncounted = {int(dict(r)["g"]) for r in rows}
+    missing = [f"#{n}" for n in gaps if n not in uncounted]
+    partial = [f"#{n}" for n in gaps if n in uncounted]
+    parts = []
+    if missing:
+        parts.append(
+            f"отчёт по {missing[0]} не записан"
+            if len(missing) == 1
+            else f"отчёты по {', '.join(missing)} не записаны"
+        )
+    if partial:
+        parts.append(
+            f"отчёт по {', '.join(partial)} неполный или самоотчёт — "
+            "чтением кода не засчитан"
+        )
+    return "; ".join(parts)
+
+
+async def _delta_base(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> tuple[dict | None, str]:
+    """Where the delta may start: the newest submission whose code was read (#1400).
+
+    Returns the base submission and, when it is not the previous generation,
+    which generations were skipped and why; no base means the whole diff, and
+    the string then says why. "Previous generation" is not enough: on #1378 the
+    report on generation 2 was discarded as stale (#1260) when generation 3
+    arrived, and a delta to #2 left generation 2's fixes read by nobody.
+    """
+    if await repo.previous_submission(db, task_id, generation) is None:
+        return None, "предыдущая сдача не записана — читается весь дифф"
+    reviewed = await _last_read_submission(db, task_id, generation)
+    if reviewed is None:
+        return None, (
+            "ни по одному прежнему поколению полный независимый отчёт ревью "
+            "не записан — читается весь дифф"
+        )
+    prev = dict(reviewed)
+    return prev, await _skipped_note(
+        db, task_id, int(prev.get("generation") or 0), generation
+    )
+
+
 async def generation_delta(
     db: aiosqlite.Connection, task: dict, base: str
 ) -> DeltaSubject:
@@ -322,7 +408,9 @@ async def generation_delta(
 
     Three facts have to hold, and each is checked rather than assumed:
 
-    1. the previous submission was recorded — before #880 nothing kept it;
+    1. the previous submission was recorded — before #880 nothing kept it —
+       and the base is the newest one a recorded REPORT covered (#1400), not
+       simply generation N−1: an unreviewed generation stays in the delta;
     2. its commit is an ANCESTOR of the current one. That is the rebase and
        force-push test: after either, "what changed since last time" compares
        commits that no longer share a history;
@@ -352,12 +440,9 @@ async def generation_delta(
     if generation <= 1 or not current:
         return DeltaSubject([], [], "", "первая сдача — предмет ревью весь дифф")
 
-    previous = await repo.previous_submission(db, task_id, generation)
-    if previous is None:
-        return DeltaSubject(
-            [], [], "", "предыдущая сдача не записана — читается весь дифф"
-        )
-    prev = dict(previous)
+    prev, skipped = await _delta_base(db, task_id, generation)
+    if prev is None:
+        return DeltaSubject([], [], "", skipped)
     prev_sha = (prev.get("sha") or "").strip()
     if not prev_sha:
         return DeltaSubject(
@@ -412,6 +497,10 @@ async def generation_delta(
             f"с поколения #{prev.get('generation')} код не менялся — читается весь дифф",
         )
     head = f"дельта к поколению #{prev.get('generation')} ({prev_sha[:12]})"
+    if skipped:
+        head += (
+            f", {skipped} — правки после #{prev.get('generation')} в предмете (#1400)"
+        )
     return await _split_by_origin(
         task_id, workspace, base, prev_sha, current, paths, head
     )
@@ -1840,7 +1929,9 @@ async def _this_code_was_already_read(
     """
     already = await _report_already_covers_this_sha(db, task)
     if not already:
-        return False
+        # #1361: вершина другая — но правка автора может быть той же, если в
+        # ветку приехала только база. Тогда отчёт переносится, а не покупается.
+        return await _carry_the_report_over(db, task)
     # #1265: пересдача того же sha из review теперь штатный повтор (таймаут,
     # две сессии) и приходит сюда на ТОМ ЖЕ поколении снова и снова. Отказ
     # говорится один раз на отчёт — тем же приёмом, каким свип не повторяет
@@ -1858,6 +1949,13 @@ async def _this_code_was_already_read(
 #: несходимости (#1255) не берёт его ни точкой, ни сбросом. Второй редакции
 #: этого правила не заводим. Псевдоним таблицы в запросе — ``mr``.
 INDEPENDENT_READ = "COALESCE(mr.self_reviewed, 0) = 0"
+
+#: «Код прочитан»: отчёт ПОЛНЫЙ и независимый. Одно определение на двух
+#: читателей — страж повторного чтения (``_report_already_covers_this_sha``)
+#: и базу дельты пересдачи (#1400). Неполный отчёт сам говорит, что дочитал
+#: не всё; самоотчёт — не чтение со стороны. Ни тот ни другой не может ни
+#: запереть добор, ни стать точкой, от которой дельта перестаёт читать.
+CODE_READ = f"COALESCE(mr.incomplete, 0) = 0 AND {INDEPENDENT_READ}"
 
 
 async def _report_already_covers_this_sha(
@@ -1914,19 +2012,130 @@ async def _report_already_covers_this_sha(
         # непрочитанное. Назвать его чтением значило бы запереть добор
         # утверждением, которое отчёт опровергает о себе — та же ошибка,
         # против которой стоит #762, только с другой стороны.
-        "AND COALESCE(mr.incomplete, 0) = 0 "
         # Самоотчёт исполнителя не отменяет независимого ревьюера. Автор,
         # приславший отчёт о собственной работе, уже однажды закрыл чужой
         # диспетчер как выполненный (#1011, #1025) — здесь он закрывал бы
         # его ещё до старта. «Код прочитан» имеет смысл только про того,
-        # кто читал его со стороны.
-        f"AND {INDEPENDENT_READ}",
+        # кто читал его со стороны. Оба условия — в CODE_READ (#1400).
+        f"AND {CODE_READ}",
         (task_id, generation),
     )
     for row in rows:
         if ((dict(row).get("sha") or "").strip()) == pinned:
             return int(dict(row)["review_id"])
     return None
+
+
+async def _latest_full_report(
+    db: aiosqlite.Connection, task_id: int, before_generation: int
+) -> dict[str, Any] | None:
+    """Последний независимый отчёт прошлых поколений со sha его сдачи (#1361).
+
+    Берётся ПОСЛЕДНИЙ, а не лучший: если последнее чтение неполное, переносить
+    нечего — лестница #879 существует затем, чтобы его добрать, и полный отчёт
+    поколением раньше говорит о другом коде.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT mr.*, s.sha AS sha "  # nosec B608 - константа модуля, не ввод
+        "FROM machine_reviews mr "
+        "JOIN submissions s ON s.task_id = mr.task_id "
+        "AND s.generation = mr.submission_generation "
+        "WHERE mr.task_id = ? AND mr.submission_generation < ? "
+        f"AND {INDEPENDENT_READ} "
+        "ORDER BY mr.submission_generation DESC, mr.id DESC LIMIT 1",
+        (task_id, before_generation),
+    )
+    return dict(rows[0]) if rows else None
+
+
+async def _carry_the_report_over(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> bool:
+    """Перенести отчёт на пересдачу, где слита только база (#1361). True — перенесён.
+
+    Измерено 23.09.2026: #1333 сдача 3 — только слияние develop, заказано
+    deep-ревью, ~4,7 млн токенов, отчёт чистый; #1334 и #1337 — ещё два
+    полных прогона за то же. Хаб сам писал «своей правки в этом круге нет» и
+    всё равно платил за новое чтение.
+
+    «Правка та же» решает ОДНО правило на гейт и на ревью —
+    ``orchestration.base_merge_kept_the_verdict`` над
+    ``base_merge.author_edit_same``: упорядоченные строки +/- по файлам.
+    Новая строка разрешения конфликта или перестановка — новая работа, и
+    ревью заказывается как раньше. Не смогли прочитать дифф — тоже.
+
+    Перенос — не новое чтение, и он так и записан: в новом поколении лежит
+    копия отчёта с ``carried_from_review_id`` исходного, без токенов и
+    длительности (денег он не стоил), а метрики чтения его не считают.
+    Копия нужна, а не одна запись в ленте: гейт и стюард спрашивают отчёт
+    ТЕКУЩЕГО поколения и без него встали бы на «machine-review устарел».
+    """
+    from hub.services.orchestration import (
+        base_merge_kept_the_verdict,
+        report_has_evidence,
+    )
+
+    pinned = (task.get("submission_sha") or "").strip()
+    generation = int(task.get("submission_generation") or 0)
+    source = await _latest_full_report(db, int(task["id"]), generation)
+    if (
+        not pinned
+        or source is None
+        or bool(source.get("incomplete"))
+        or not report_has_evidence(source)
+        or not (source.get("sha") or "").strip()
+    ):
+        return False
+    same, why = await base_merge_kept_the_verdict(
+        db, task, source["sha"].strip(), pinned
+    )
+    if not same:
+        return False
+    root = int(source.get("carried_from_review_id") or source["id"])
+    carried = await repo.insert_machine_review(
+        db,
+        task_id=int(task["id"]),
+        submission_generation=generation,
+        harness_skill=source.get("harness_skill") or "",
+        harness_version=source.get("harness_version"),
+        agent_count=source.get("agent_count"),
+        orchestrator=source.get("orchestrator") or "",
+        model=source.get("model") or "",
+        raw_count=int(source.get("raw_count") or 0),
+        findings_confirmed=source.get("findings_confirmed") or "[]",
+        findings_rejected=source.get("findings_rejected") or "[]",
+        submitted_by=source.get("submitted_by") or "",
+        incomplete=False,
+        unresolved=source.get("unresolved") or "[]",
+        lost_dimensions=source.get("lost_dimensions") or "[]",
+        profile=source.get("profile") or "",
+        principal_id=source.get("principal_id"),
+        carried_from_review_id=root,
+    )
+    await repo.add_task_update(
+        db,
+        int(task["id"]),
+        "hub",
+        "alert",
+        (
+            f"Кросс-модельное ревью не заказано: отчёт #{root} перенесён с "
+            f"поколения {int(source['submission_generation'])}: правка та же, "
+            f"слита база. {why}. Перенос — не новое чтение: в этом поколении "
+            f"лежит отчёт #{carried} с пометкой «перенесён», провайдер не "
+            "зван, в метриках чтения он не считается (#1361). CI на новой "
+            "вершине по-прежнему обязателен."
+        ),
+        author_kind="hub",
+    )
+    await db.commit()
+    log.info(
+        "review dispatch skipped for task #%s: report #%s carried over as #%s",
+        task["id"],
+        root,
+        carried,
+    )
+    return True
 
 
 async def _refuse_second_read(
@@ -4659,8 +4868,11 @@ async def review_circle(db: aiosqlite.Connection, task_id: int) -> ReviewCircle:
     """
     rows = await fetchall(
         db,
-        "SELECT submission_generation, findings_confirmed, unresolved, incomplete "
+        "SELECT submission_generation, findings_confirmed, unresolved, incomplete "  # nosec B608 - константа модуля, не ввод
         "FROM machine_reviews WHERE task_id=? "
+        # #1361: перенесённый отчёт — не новый круг: те же находки на том же
+        # коде, и засчитать их кругом значило бы назвать экономию повтором.
+        f"AND {ORIGINAL_READ_SQL} "
         "ORDER BY submission_generation, id",
         (task_id,),
     )
@@ -4984,6 +5196,8 @@ async def finding_trajectory(
         # Самоотчёт — не чтение со стороны: ни точка траектории, ни сброс её
         # хвоста чистым нулём (находка e6250c505eb42e95).
         f"AND {INDEPENDENT_READ} "
+        # #1361: перенос — не точка траектории, чтения в нём не было.
+        f"AND {ORIGINAL_READ_SQL} "
         "ORDER BY mr.submission_generation, mr.id",
         (task_id, before_generation),
     )

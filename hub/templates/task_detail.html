@@ -821,6 +821,12 @@
                             {% endfor %}
                         </ul>
                     </details>
+                    {# #1361: перенос — не прогон: денег не стоил, кода не читал. #}
+                    {% for carry in review_carries or [] %}
+                    <div class="muted">
+                        сдача #{{ carry.generation }}: отчёт перенесён с поколения {{ carry.from_generation if carry.from_generation is not none else '?' }}, счёта нет &mdash; прогона не было
+                    </div>
+                    {% endfor %}
                 </div>
             </section>
             {% endif %}

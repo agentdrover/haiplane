@@ -990,6 +990,70 @@ async def test_an_unreadable_diff_never_keeps_the_verdict(
     assert "прочитать не удалось" in await _feed(db, task_id)
 
 
+# ---- #1361: общий файл с базой больше не стоит второго вердикта ----
+
+
+def _real_diffs(g, clone) -> None:
+    """``branch_diff`` двойника отвечает настоящим git из клона ``clone``."""
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    ops = GitOpsIntegration()
+
+    async def _diff(_workspace, _base, ref):
+        return await ops.branch_diff(str(clone), "develop", ref)
+
+    g.branch_diff = AsyncMock(side_effect=_diff)
+
+
+async def test_a_base_merge_in_a_shared_file_keeps_the_verdict(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+) -> None:
+    # AC-1 (#1361): база тронула файл автора — правка строки, вставка сверху,
+    # хвост с конфликтом. Конфликт разрешён «обе стороны, ничего сверх», git
+    # настоящий. Побайтно дифф к базе другой (index, смещения ханков), по смыслу
+    # правка автора та же — и вердикт сохраняется с названной причиной.
+    from tests.test_base_merge import shared_file_merge
+
+    clone, approved, tip = shared_file_merge(tmp_path, "both")
+    g = _seeing(monkeypatch, approved, merged=True)
+    task_id = await _approved_pair_task(db)
+    _real_diffs(g, clone)
+    g.head_sha = AsyncMock(return_value=tip)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    feed = await _feed(db, task_id)
+    assert "stale_approval" not in feed, feed
+    assert task["status"] == "completed", feed
+    assert g.merge_pr.await_count == 1
+    assert "Вердикт остаётся текущим" in feed
+    assert "правка та же" in feed, "причина сохранения обязана быть названа"
+
+
+async def test_a_resolution_line_in_a_shared_file_drops_the_verdict(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+) -> None:
+    # Обратная сторона AC-1 на том же настоящем git: строка сопряжения, которой
+    # ревью не видело, — новая авторская правка. Вердикт слетает, файл назван.
+    from tests.test_base_merge import shared_file_merge
+
+    clone, approved, tip = shared_file_merge(tmp_path, "new_line")
+    g = _seeing(monkeypatch, approved, merged=True)
+    task_id = await _approved_pair_task(db)
+    _real_diffs(g, clone)
+    g.head_sha = AsyncMock(return_value=tip)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] != "completed"
+    g.merge_pr.assert_not_awaited()
+    feed = await _feed(db, task_id)
+    assert "stale_approval" in feed
+    assert "mod.py" in feed, "отказ обязан назвать файл, где правка разошлась"
+
+
 # ---- AC-3 / AC-4: автомерж только названного класса ----
 
 
@@ -1284,11 +1348,18 @@ async def test_the_automerge_is_judged_by_the_return_code_not_the_output(
     # строка index (блоб базы стал другим) и смещения ханков. Поэтому
     # сохранение вердикта в этом пути стоит не на сравнении диффов, а на том,
     # что коммит сделал сам гейт, — и он перезакрепляет коммит сдачи.
+    #
+    # #1361 сравнивает правку по смыслу, без index и смещений, — и здесь это
+    # ВСЁ РАВНО не совпадает, по другой причине: git сдвигает пустые строки
+    # хвоста. До мержа автор добавил «пусто, пусто, def, pass», после —
+    # «def, pass, пусто, пусто». Для упорядоченного сравнения это другая
+    # последовательность; ошибка в безопасную сторону, а перезакрепление
+    # остаётся нужным.
     author_before = await ops.branch_diff(str(repo), "develop", before)
     author_after = await ops.branch_diff(
         str(repo), "develop", _tip(repo, "task-1233/probe")
     )
-    assert not base_merge.author_diff_unchanged(author_before, author_after)[0], (
+    assert not base_merge.author_edit_same(author_before, author_after)[0], (
         "если это когда-нибудь совпадёт — сравнение диффов станет годным и "
         "здесь, и перезакрепление коммита можно будет снять"
     )
