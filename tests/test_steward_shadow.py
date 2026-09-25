@@ -1231,11 +1231,15 @@ async def test_a_dispatch_landing_mid_decision_does_not_burn_the_slot(
     with (
         patch("hub.repository.resolve_project_for_task", new=_resolve_and_land),
         patch(
-            "hub.integrations.cursor_cloud.create_review_agent",
-            new=AsyncMock(return_value=_CREATED),
-        ),
+            "hub.integrations.cursor_cloud.create_agent_attempt",
+            new=AsyncMock(return_value=(_CREATED, None)),
+        ) as premature,
     ):
         await start_due_runs(db)
+
+    # Тик, на котором строка диспетча легла посреди решения, судью не
+    # заказывает: он откладывается, а не стартует по старому снимку.
+    assert premature.await_count == 0
 
     assert landed, "подставка не сработала — тест не проверил то, ради чего написан"
     run = (await _runs(db, task_id))[0]

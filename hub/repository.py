@@ -3038,6 +3038,81 @@ async def release_review_order(
     )
 
 
+#: Бронь места под суточным потолком deep (#1414) — в той же таблице броней,
+#: что и #1399, под своим «профилем»: с бронью заказа она не сталкивается.
+DEEP_SEAT_CLAIM = "deep_cap_seat"
+
+# Оплаченный deep сегодня: строка с агентом (заглушка отказа #1242 ничего не
+# запускала), не отказ и не переданная второй двери (её место займёт строка
+# двери). Локальный канал квоту провайдера не тратит и в счёт не идёт. Считается СДАЧА, а не строка: переспрос, вторая ось и вторая дверь
+# той же сдачи второго места не занимают. Проект задачи — по её эпику
+# (resolve_project_for_task), поэтому фильтр по проекту делается в Python:
+# за сутки таких строк десятки.
+_DEEP_SEATS_SQL = (
+    "SELECT task_id, submission_generation FROM review_dispatches "
+    "WHERE profile = 'deep' AND agent_id != '' AND channel != 'local' "
+    "AND status NOT IN ('failed', 'second_door') "
+    "AND created_at >= date('now') "
+    "UNION "
+    "SELECT task_id, submission_generation FROM review_order_claims "
+    "WHERE profile = ? "
+    "AND claimed_at >= date('now') AND claimed_at >= datetime('now', ?)"
+)
+
+
+async def _deep_seats_of_project(
+    db: aiosqlite.Connection, project_id: int, ttl: str
+) -> set[tuple[int, int]]:
+    rows = await fetchall(db, _DEEP_SEATS_SQL, (DEEP_SEAT_CLAIM, ttl))
+    project_of: dict[int, int | None] = {}
+    seats: set[tuple[int, int]] = set()
+    for row in rows:
+        tid = int(row[0])
+        if tid not in project_of:
+            project = await resolve_project_for_task(db, tid)
+            project_of[tid] = int(project["id"]) if project is not None else None
+        if project_of[tid] == project_id:
+            seats.add((tid, int(row[1])))
+    return seats
+
+
+async def claim_deep_seat(
+    db: aiosqlite.Connection,
+    project_id: int,
+    task_id: int,
+    generation: int,
+    cap: int,
+) -> bool:
+    """Место под суточным потолком deep проекта — атомарно (#1414).
+
+    Счёт и бронь одной транзакцией BEGIN IMMEDIATE, как у брони заказа
+    (#1399): строка заказа пишется ПОСЛЕ оплаченного вызова провайдера, и
+    два параллельных заказа, считающие только строки, оба увидели бы
+    свободное место. Бронь живёт срок брони заказа и в счёте склеивается со
+    строкой своей сдачи; снимать её не нужно.
+
+    Сдача, уже занявшая место сегодня, получает его снова: переспрос и
+    повторный триггер той же сдачи — не новый deep.
+    """
+    await db.commit()
+    ttl = f"-{REVIEW_ORDER_CLAIM_TTL_MINUTES} minutes"
+    async with write_transaction(db):
+        seats = await _deep_seats_of_project(db, project_id, ttl)
+        if (task_id, generation) not in seats and len(seats) >= cap:
+            return False
+        await db.execute(
+            "DELETE FROM review_order_claims WHERE task_id=? "
+            "AND submission_generation=? AND profile=?",
+            (task_id, generation, DEEP_SEAT_CLAIM),
+        )
+        await db.execute(
+            "INSERT INTO review_order_claims "
+            "(task_id, submission_generation, profile) VALUES (?, ?, ?)",
+            (task_id, generation, DEEP_SEAT_CLAIM),
+        )
+        return True
+
+
 async def set_review_dispatch_status(
     db: aiosqlite.Connection, dispatch_id: int, status: str
 ) -> None:

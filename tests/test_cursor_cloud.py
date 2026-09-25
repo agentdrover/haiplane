@@ -65,17 +65,15 @@ async def test_unconfigured_client_degrades(monkeypatch, client):
     assert not cursor_cloud.is_configured()
     assert await cursor_cloud.list_models() is None
     assert await cursor_cloud.get_run("bc-x", "run-y") is None
-    assert (
-        await cursor_cloud.create_review_agent(
-            repo_url="https://github.com/o/r",
-            starting_ref="task-1/x",
-            model_id="grok-4",
-            prompt_text="review",
-            hub_mcp_url="https://hub/mcp",
-            reviewer_token="tok",
-        )
-        is None
+    created, _refusal = await cursor_cloud.create_agent_attempt(
+        repo_url="https://github.com/o/r",
+        starting_ref="task-1/x",
+        model_id="grok-4",
+        prompt_text="review",
+        hub_mcp_url="https://hub/mcp",
+        reviewer_token="tok",
     )
+    assert created is None
 
 
 async def test_review_agent_request_matches_spec(monkeypatch, _configured):
@@ -87,16 +85,18 @@ async def test_review_agent_request_matches_spec(monkeypatch, _configured):
     # проверяет test_review_model_shape_matches_recorded_models_catalog.
     monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL_PARAMS", "")
 
-    result = await cursor_cloud.create_review_agent(
+    result, refusal = await cursor_cloud.create_agent_attempt(
         repo_url="https://github.com/mrPDA/spike",
         starting_ref="task-9/branch",
         model_id="grok-4",
         prompt_text="review per skill v8",
         hub_mcp_url="https://agenthai.ru/mcp",
         reviewer_token="reviewer-token",
+        model_params=await cursor_cloud.review_params_for("grok-4"),
     )
 
     assert result == {"agent": {"id": "bc-1"}}
+    assert refusal is None
     assert recorder.request is not None
     assert recorder.request.method == "POST"
     assert str(recorder.request.url) == "https://api.cursor.test/v1/agents"
@@ -121,13 +121,15 @@ async def _ordered_review_body(monkeypatch) -> dict:
 
     recorder = _Recorder(httpx.Response(200, json={"agent": {"id": "bc-1"}}))
     _patch_transport(monkeypatch, recorder)
-    await cursor_cloud.create_review_agent(
+    # Параметры ревьюера — как их берёт диспетч ревью (#1423): каталог, потом заказ.
+    await cursor_cloud.create_agent_attempt(
         repo_url="https://github.com/o/r",
         starting_ref="task-1/x",
         model_id="grok-4.6",
         prompt_text="review",
         hub_mcp_url="https://hub/mcp",
         reviewer_token="tok",
+        model_params=await cursor_cloud.review_params_for("grok-4.6"),
     )
     assert recorder.request is not None
     return json.loads(recorder.request.content)
@@ -177,13 +179,15 @@ async def _order(monkeypatch, provider: _Provider, model_id: str) -> None:
         original_init(self, *args, **kwargs)
 
     monkeypatch.setattr(httpx.AsyncClient, "__init__", patched)
-    await cursor_cloud.create_review_agent(
+    # Параметры ревьюера — как их берёт диспетч ревью (#1423): каталог, потом заказ.
+    await cursor_cloud.create_agent_attempt(
         repo_url="https://github.com/o/r",
         starting_ref="task-1/x",
         model_id=model_id,
         prompt_text="review",
         hub_mcp_url="https://hub/mcp",
         reviewer_token="tok",
+        model_params=await cursor_cloud.review_params_for(model_id),
     )
 
 
@@ -784,3 +788,20 @@ async def test_a_marker_seen_on_an_earlier_page_still_answers(monkeypatch):
         "метка дожила на первой странице — round-trip доказан для всего ответа"
     )
     assert seen.agent_id == "", "нашего агента нет, и это сказано прямо"
+
+
+def test_no_dead_review_agent_wrapper():
+    # #1424 AC-1: обёртку над create_agent_attempt прод не звал — заказ
+    # ревьюера и судьи идёт через сам шов. Имя собрано из частей, чтобы
+    # этот тест сам не оставлял упоминания в tests/.
+    dead = "create_" + "review_agent"
+    root = Path(__file__).resolve().parent.parent
+    assert not hasattr(cursor_cloud, dead)
+    mentions = [
+        f"{path.relative_to(root)}:{lineno}"
+        for top in ("hub", "tests")
+        for path in sorted((root / top).rglob("*.py"))
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if dead in line
+    ]
+    assert mentions == []
