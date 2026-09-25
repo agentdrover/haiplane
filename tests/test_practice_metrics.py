@@ -1892,6 +1892,7 @@ async def test_review_economy_is_the_same_on_every_surface(
     await _order(db, red, profile="deep", bill=None)
     await _economy_report(db, red, confirmed=2, unresolved=1, bill=1_000_000)
     other = await _task(db, title="outside")
+    await _order(db, other, profile="deep", bill=4_000_000)
     await _economy_report(db, other, unresolved=2, profile="deep")
     await db.commit()
 
@@ -1931,4 +1932,6 @@ async def test_review_economy_is_the_same_on_every_surface(
     for bucket in econ["reconciliation"]["buckets"]:
         expected[f"reconciliation.{bucket['bucket']}"] = bucket["count"]
     assert {k: int(v) for k, v in shown.items() if k in expected} == expected
-    assert econ["runs"]["total"] == 2 and econ["findings"]["unresolved_total"] == 3
+    # Числа попарно различны, иначе подмена одного другим прошла бы молча.
+    assert (econ["runs"]["billed"], econ["runs"]["unbilled"]) == (2, 1)
+    assert econ["findings"]["unresolved_total"] == 3
