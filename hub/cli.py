@@ -378,6 +378,13 @@ def cmd_outcome_debt(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_review_economy(args: argparse.Namespace) -> int:
+    """Owner's review summary (#1406): the review_economy section."""
+    result = _api("GET", f"/api/metrics/practices?since_days={args.since_days}")
+    _print_json((result or {}).get("review_economy", {}))
+    return 0
+
+
 def cmd_answer_outcome(args: argparse.Namespace) -> int:
     """Record one check of a completed task's outcome (#819)."""
     body = {
@@ -1706,6 +1713,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Outcome promises and the answers to them (#766, #819)",
     )
     p_outcomes.set_defaults(func=cmd_outcome_debt)
+
+    p_economy = sub.add_parser(
+        "review-economy",
+        help="Review runs by profile with the provider bill, unresolved, "
+        "red-CI runs and reports-vs-bill reconciliation (#1406)",
+    )
+    p_economy.add_argument("--since-days", type=int, default=90)
+    p_economy.set_defaults(func=cmd_review_economy)
 
     p_answer = sub.add_parser(
         "answer-outcome",
