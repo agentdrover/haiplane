@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import logging
@@ -3474,6 +3475,15 @@ STRANDED_BASE_PREFIX = "stranded_base"
 # в этом файле сравнивают детали через startswith, и префикс, являющийся
 # приставкой другого, рано или поздно молча попадёт в чужую ветку разбора.
 UNPROBED_STRANDED_BASE_PREFIX = "unprobed_stranded_base"
+# #1398: форж отказал в мерже, а перечитать PR после отказа не вышло. Это не
+# отказ и не доставка: отказ по уже влитому PR (гонка двух путей гейта) и
+# настоящий отказ выглядят одинаково, пока PR не прочитан. Ждём следующего
+# цикла, а не зовём человека по доставке, которая могла уже случиться.
+MERGE_REFUSAL_UNVERIFIED_PREFIX = "merge_refusal_unverified"
+# #1398: PR уже MERGED, но гейт его не вливал — строки pipeline_merges этой
+# задачи нет. Терминальный: доставку сделал не гейт, и молча записать её как
+# свою значило бы ослепить drift-guard (#534).
+MERGED_OUTSIDE_GATE_PREFIX = "merged_outside_gate"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",
@@ -3490,6 +3500,7 @@ TRANSIENT_GATE_PREFIXES = (
     # которой уже лежит в базовой ветке: PR открыт, реестр пуст, решать
     # нечего. Лечится следующим циклом, а не решением.
     MERGE_UNCONFIRMED,
+    MERGE_REFUSAL_UNVERIFIED_PREFIX,
 )
 STACKED_BASE_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: хаб доставит "
@@ -3505,6 +3516,15 @@ MERGE_UNCONFIRMED_WAIT_HINT = (
     "не подтверждено только его попадание в базовую ветку — хаб проверит это "
     "следующим циклом. Ждать CI не нужно, он был зелёным до мержа; "
     "пересдавать НЕ нужно — новых коммитов нет, пересдача сбросит вердикт (#612)."
+)
+# #1398: отказ форжа не подтверждён чтением PR — возможно, PR уже влит
+# соседним путём гейта. Следующий цикл перечитает; пересдача сбросила бы
+# вердикт (#612) без новых коммитов.
+MERGE_REFUSAL_UNVERIFIED_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: форж отказал в "
+    "мерже, а прочитать PR после отказа не удалось — возможно, его уже влил "
+    "соседний путь гейта. Хаб перечитает PR следующим циклом. Пересдавать НЕ "
+    "нужно — новых коммитов нет, пересдача сбросит вердикт (#612)."
 )
 BASE_AUTOMERGE_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: гейт сам слил "
@@ -3817,6 +3837,131 @@ def is_base_conflict_entry(payload: dict[str, Any]) -> bool:
     )
 
 
+# #1398: мержи гейта, идущие или прошедшие В ЭТОМ процессе, по (задача, PR).
+# Два пути доставки — report_done (соединение запроса, BEGIN IMMEDIATE на весь
+# done-flow) и поллер (своё соединение) — живут в одном цикле событий, но не
+# видят незакоммиченных записей друг друга. Будущее ставится ДО вызова форжа и
+# разрешается СРАЗУ после его ответа, до любой записи в базу: проигравший ждёт
+# его, не держа того, что нужно победителю. Лок вокруг всего гейта здесь не
+# годится — report_done держит write-лок SQLite, и победитель-поллер упёрся бы
+# в него на записи pipeline_merges, пока report_done ждёт asyncio-лок (5 с
+# busy_timeout, затем merge_gate_error по влитому PR). Успешные записи
+# остаются: между ответом форжа и коммитом строки победителем её не видно из
+# другого соединения, и только эта память отличает мерж гейта от ручного.
+_gate_merges: dict[tuple[int, int], asyncio.Future[bool]] = {}
+GATE_MERGE_WAIT_SECONDS = 60.0
+
+
+async def _gate_merge_outcome(key: tuple[int, int]) -> bool:
+    """Влил ли гейт этот PR в этом процессе — дождавшись идущего мержа (#1398).
+
+    False — «гейт в этом процессе его не вливал» (или не дождались): решает
+    вызывающий, как решал бы без этой памяти.
+    """
+    fut = _gate_merges.get(key)
+    if fut is None:
+        return False
+    try:
+        return await asyncio.wait_for(asyncio.shield(fut), GATE_MERGE_WAIT_SECONDS)
+    except TimeoutError:
+        log.warning("gate merge of %s did not answer in time", key)
+        return False
+
+
+async def _registered_gate_merge(
+    key: tuple[int, int], task: dict[str, Any], ctx: dict[str, Any]
+) -> tuple[bool, str]:
+    """Мерж форжем под записью в ``_gate_merges`` (#1398).
+
+    Между проверкой ``_gate_merge_outcome`` и записью здесь нет ни одного
+    ``await``, поэтому второй путь не может встать между ними.
+    """
+    fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    _gate_merges[key] = fut
+    merged = False
+    try:
+        merged, detail = await plugins.git_ops.merge_pr_with_detail(
+            key[1],
+            key[0],
+            task.get("title") or "",
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
+        )
+    finally:
+        fut.set_result(merged)
+        if not merged and _gate_merges.get(key) is fut:
+            _gate_merges.pop(key, None)
+    return merged, detail
+
+
+async def _refused_merge_outcome(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    merge_detail: str,
+) -> tuple[bool, str]:
+    """Отказ форжа — отказ ли это, или PR уже влит (#1398).
+
+    24.09.2026, #1376: поллер влил PR, report_done в ту же секунду получил
+    отказ GitHub и увёл задачу в needs_decision — человеку предложили решать
+    по доставке, которая уже случилась. Поэтому PR перечитывается:
+
+    * MERGED и мерж гейта известен (строка pipeline_merges этой задачи и PR,
+      идущий или прошедший мерж гейта в этом процессе, merge-коммит среди
+      записанных гейтом) — доставка, без второй строки реестра;
+    * MERGED без следа гейта — терминально, с названной причиной: ручной мерж
+      в то же окно не должен тихо стать мержем гейта (drift-guard, #534);
+    * PR не прочитан — после молчаливого отказа это временное ожидание, а
+      не решение; при названной форжем причине — прежний путь с ней;
+    * иначе (open/closed/absent) — прежний путь отказа.
+    """
+    if merge_detail.startswith(MERGE_UNCONFIRMED):
+        return False, _merge_failure_detail(merge_detail)
+    pr_num = int(task["pr_number"])
+    state, why = await _recorded_pr_state(db, task, pr_num)
+    if state == "merged":
+        if await _merged_by_gate(db, task, ctx, pr_num):
+            return True, "already delivered"
+        return False, (
+            f"{MERGED_OUTSIDE_GATE_PREFIX}: PR влит не гейтом — PR #{pr_num} уже "
+            "MERGED, но мержа гейта по нему нет (ни строки pipeline_merges этой "
+            "задачи, ни merge-коммита из реестра гейта). Строка реестра не "
+            "создана: drift-guard должен видеть этот мерж как ручной"
+        )
+    if not state and not merge_detail:
+        return False, (
+            f"{MERGE_REFUSAL_UNVERIFIED_PREFIX}: форж отказал в мерже PR "
+            f"#{pr_num}, а перечитать PR после отказа не удалось ({why})"
+        )
+    return False, await refusal_after_automerge(db, task, ctx, merge_detail)
+
+
+async def _merged_by_gate(
+    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any], pr_num: int
+) -> bool:
+    """Влит ли MERGED-PR гейтом — по его собственным следам (#1398)."""
+    task_id = task["id"]
+    if await repo.pipeline_merge_recorded(db, task_id, pr_num):
+        return True
+    if await _gate_merge_outcome((task_id, pr_num)):
+        return True
+    try:
+        sha = await plugins.git_ops.merge_commit_sha(
+            pr_num,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
+        )
+        proj = await repo.resolve_project_for_task(db, task_id)
+    except Exception:  # noqa: BLE001 - «не узнали» не делает мерж гейтовым
+        log.exception("merge commit of PR #%s unreadable (#%s)", pr_num, task_id)
+        return False
+    if not sha or not proj:
+        return False
+    return sha in await repo.known_pipeline_shas(db, dict(proj)["id"])
+
+
 async def merge_before_completion(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -3908,19 +4053,20 @@ async def merge_before_completion(
                     "пометить его ready"
                 )
 
-        merged, merge_detail = await plugins.git_ops.merge_pr_with_detail(
-            pr_num,
-            task_id,
-            task.get("title") or "",
-            repo=workspace,
-            gh_repo=gh_repo,
-            forge=ctx.get("forge", ""),
-        )
+        # #1398: второй путь гейта (поллер или report_done) уже вливает этот
+        # PR в этом процессе — дождаться его исхода, а не спрашивать форж
+        # второй раз: второй мерж GitHub отклонит, и отказ прочитался бы как
+        # merge_failed по уже доставленной работе.
+        key = (task_id, int(pr_num))
+        if await _gate_merge_outcome(key):
+            return True, "already delivered"
+        merged, merge_detail = await _registered_gate_merge(key, task, ctx)
         if not merged:
-            # #1233: прежде чем звать человека — не тот ли это класс конфликта,
-            # который разрешается однозначно. Спрашивается ТОЛЬКО после отказа
-            # мержа: у зелёной доставки нет причины платить за пробу.
-            return False, await refusal_after_automerge(db, task, ctx, merge_detail)
+            # #1398: отказ по PR, который уже MERGED, — не отказ. #1233:
+            # прежде чем звать человека — не тот ли это класс конфликта,
+            # который разрешается однозначно. Оба вопроса задаются ТОЛЬКО
+            # после отказа мержа: у зелёной доставки нет причины за них платить.
+            return await _refused_merge_outcome(db, task, ctx, merge_detail)
 
         # The commit THIS pull request produced — never the branch tip,
         # which is whatever landed last (#534, review round 3).
@@ -4323,6 +4469,8 @@ async def _deliver_completed_pair_task(
                 # the verdict (#612) — the very trap PR_DRAFT_WAIT_HINT exists
                 # to avoid, re-opened for the neighbour added beside it.
                 cause = STACKED_BASE_WAIT_HINT
+            elif detail.startswith(MERGE_REFUSAL_UNVERIFIED_PREFIX):
+                cause = MERGE_REFUSAL_UNVERIFIED_WAIT_HINT
             elif detail.startswith(MERGE_UNCONFIRMED):
                 # #1276, found by the #1271 invariant: the same inheritance as
                 # #1186 — the merge happened, and the CI sentence below would

@@ -124,6 +124,22 @@ def _forget_pair_delivery_waits():
 
 
 @pytest.fixture(autouse=True)
+def _forget_gate_merges():
+    """Empty the gate's in-process merge memory around every test (#1398).
+
+    ``orchestration._gate_merges`` is keyed by (task id, PR number), and both
+    restart in every test's fresh SQLite file — a merge one test delivered
+    would read as "the gate already merged this PR" in the next. Same shape
+    as ``_forget_pair_delivery_waits`` above.
+    """
+    from hub.services import orchestration
+
+    orchestration._gate_merges.clear()
+    yield
+    orchestration._gate_merges.clear()
+
+
+@pytest.fixture(autouse=True)
 def _setup_mock_plugins():
     """Install mock plugins for all tests, restore originals after."""
     orig_dispatch = plugins.dispatch
