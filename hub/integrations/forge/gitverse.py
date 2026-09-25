@@ -34,6 +34,7 @@ from hub.integrations.protocols import (
     CIProbeResult,
     CIRunRequestOutcome,
     CIRunRequestResult,
+    FOREIGN_PR_ONLY,
     MergeabilityOutcome,
 )
 
@@ -348,14 +349,15 @@ class GitVerseForge:
                 continue
             head_repo = pr_head.get("repo")
             name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
-            if name and str(name).lower() != slug.lower():
-                foreign.append(f"#{pr['number']} ({name}:{head})")
+            # Без head.repo голова не доказана своей — fail-closed, как у GitHub.
+            if not name or str(name).lower() != slug.lower():
+                foreign.append(f"#{pr['number']} ({name or '?'}:{head})")
                 continue
             return (int(pr["number"]), "")
         if foreign:
             return (
                 None,
-                f"PR из чужого репозитория не принят за возврат: {', '.join(foreign)}",
+                f"{FOREIGN_PR_ONLY}: {', '.join(foreign)}",
             )
         return (None, "")
 

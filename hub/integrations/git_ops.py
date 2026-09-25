@@ -29,6 +29,7 @@ from hub.integrations.forge.github import GitHubForge
 from hub.integrations.protocols import (
     CIProbeResult,
     CIRunRequestResult,
+    FOREIGN_PR_ONLY,
     ForgePlugin,
     MergeabilityOutcome,
     StackProbeOutcome,
@@ -3007,7 +3008,9 @@ class GitOpsIntegration:
         """
         adapter = self._forge_for(forge)
         found, why = await adapter.pr_between(base, head, repo=repo, gh_repo=gh_repo)
-        if found or why:
+        # Чужой PR с той же парой — не сбой чтения: свой всё равно создаётся,
+        # иначе любой форк с веткой main останавливает возврат.
+        if found or (why and not why.startswith(FOREIGN_PR_ONLY)):
             return (found, why)
         await adapter.create_pr(title, body, head, base, repo=repo, gh_repo=gh_repo)
         found, why = await adapter.pr_between(base, head, repo=repo, gh_repo=gh_repo)

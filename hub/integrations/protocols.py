@@ -15,6 +15,12 @@ from typing import Any, Protocol, runtime_checkable
 import aiosqlite
 
 
+# Причина ``pr_between``, когда под базу+голову попали только PR из чужих
+# репозиториев (#1426). Это не сбой чтения: свой PR возврата создавать можно,
+# иначе любой форк с веткой ``main`` останавливает возврат.
+FOREIGN_PR_ONLY = "PR из чужого репозитория не принят за возврат"
+
+
 class CIProbeOutcome(str, Enum):
     """Every observable result of probing a PR's CI checks (#419).
 

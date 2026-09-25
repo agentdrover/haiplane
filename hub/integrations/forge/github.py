@@ -25,6 +25,7 @@ from hub.integrations.protocols import (
     CIProbeResult,
     CIRunRequestOutcome,
     CIRunRequestResult,
+    FOREIGN_PR_ONLY,
     MergeabilityOutcome,
 )
 
@@ -1163,6 +1164,6 @@ def _own_repo_pr(prs: object, slug: str, head: str) -> tuple[int | None, str]:
     if foreign:
         return (
             None,
-            f"PR из чужого репозитория не принят за возврат: {', '.join(foreign)}",
+            f"{FOREIGN_PR_ONLY}: {', '.join(foreign)}",
         )
     return (None, "")

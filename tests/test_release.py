@@ -441,6 +441,61 @@ async def test_opening_the_return_leaves_a_pr_into_another_base_alone() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_fork_pr_does_not_stop_the_own_return_from_being_opened() -> None:
+    # Неразрешённая находка сдачи 2: открытый PR attacker:main → develop не
+    # должен блокировать возврат. Чужой PR не трогается, свой создаётся.
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    state = {"created": False}
+
+    async def fake(*args, **_kw):
+        if args[:2] == ("pr", "list"):
+            listed = [_pr(66, cross=True, owner="attacker")]
+            if state["created"]:
+                listed.append(_pr(RETURN_PR))
+            return (0, json.dumps(listed), "")
+        if args[:2] == ("pr", "create"):
+            state["created"] = True
+            return (0, f"https://github.com/agentdrover/haiplane/pull/{RETURN_PR}", "")
+        return (0, "", "")
+
+    with patch("hub.integrations.forge.github._gh", side_effect=fake) as gh:
+        pr, why = await GitOpsIntegration().open_return_pr(
+            "develop", "main", "t", "b", gh_repo="agentdrover/haiplane"
+        )
+
+    assert (pr, why) == (RETURN_PR, ""), why
+    calls = [[str(a) for a in c.args] for c in gh.await_args_list]
+    assert not any(c[:2] == ["pr", "edit"] for c in calls), "чужой PR тронут"
+
+
+@pytest.mark.asyncio
+async def test_gitverse_does_not_take_a_pr_without_head_repo_for_its_own() -> None:
+    # Неразрешённая находка сдачи 2: у GitVerse нет head.repo (удалённый форк,
+    # урезанный ответ) — голова не доказана своей, PR не принимается.
+    from hub.integrations.forge.gitverse import GitVerseForge, GitVerseResponse
+
+    forge = GitVerseForge(token="t", base_url="https://api.example", version="1")
+    listed = [
+        {"number": 66, "base": {"ref": "develop"}, "head": {"ref": "main"}},
+        {
+            "number": 67,
+            "base": {"ref": "develop"},
+            "head": {"ref": "main", "repo": None},
+        },
+    ]
+    with patch.object(
+        forge, "_request", AsyncMock(return_value=GitVerseResponse(200, listed))
+    ):
+        found, why = await forge.pr_between(
+            "develop", "main", gh_repo="agentdrover/haiplane"
+        )
+
+    assert found is None, "PR без head.repo принят за свой"
+    assert "#66" in why and "#67" in why, why
+
+
+@pytest.mark.asyncio
 async def test_a_failed_listing_is_a_reason_not_no_pr() -> None:
     # Неразрешённая находка: сбой чтения нельзя свести к «PR нет» (#516) —
     # иначе открытие возврата пошло бы создавать второй PR вслепую.
