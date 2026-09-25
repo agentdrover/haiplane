@@ -4344,28 +4344,37 @@ async def test_a_slow_gate_merge_is_not_merged_twice(
     assert await first == (True, "")
 
 
+@pytest.mark.parametrize(
+    "unread",
+    [
+        pytest.param({"side_effect": RuntimeError("gh молчит")}, id="raised"),
+        # Прод-путь «не прочитано»: GitHub и GitVerse при сбое чтения
+        # отвечают пустой строкой, а не исключением (ревью сдачи 1).
+        pytest.param({"return_value": ""}, id="empty_sha"),
+    ],
+)
 async def test_an_unreadable_merge_commit_is_not_called_a_manual_merge(
-    db: aiosqlite.Connection,
+    db: aiosqlite.Connection, unread: dict
 ) -> None:
     """#1407 AC-2: «проверить не удалось» — не «гейт не вливал».
 
-    PR MERGED, строки pipeline_merges нет, а merge-коммит не читается — это
-    временный исход с названной причиной, а не терминальный
-    MERGED_OUTSIDE_GATE (#516/#549: отсутствие данных не вывод). Прочитанный
-    sha без следа гейта — по-прежнему ручной мерж.
+    PR MERGED, строки pipeline_merges нет, а merge-коммит не читается
+    (исключение или пустой sha) — это временный исход с названной причиной,
+    а не терминальный MERGED_OUTSIDE_GATE (#516/#549: отсутствие данных не
+    вывод). Прочитанный sha без следа гейта — по-прежнему ручной мерж.
     """
     from hub.services import orchestration
 
     g = _git(CIProbeOutcome.passed, merged=False)
     g.pr_state = AsyncMock(return_value="merged")
-    g.merge_commit_sha = AsyncMock(side_effect=RuntimeError("gh молчит"))
-    unread = await _approved_pair_task(db)
+    g.merge_commit_sha = AsyncMock(**unread)
+    task_id = await _approved_pair_task(db)
 
-    await _report_done(db, unread)
+    await _report_done(db, task_id)
 
-    assert dict(await repo.get_task(db, unread))["status"] == "running"
-    assert not await _called_a_human(db, unread)
-    feed = _feed_text(await repo.get_task_updates(db, unread))
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+    assert not await _called_a_human(db, task_id)
+    feed = _feed_text(await repo.get_task_updates(db, task_id))
     assert orchestration.MERGE_COMMIT_UNVERIFIED_PREFIX in feed, "причина названа"
     assert orchestration.MERGED_OUTSIDE_GATE_PREFIX not in feed
     assert not list(await db.execute_fetchall("SELECT 1 FROM pipeline_merges"))
