@@ -271,6 +271,30 @@ async def test_a_finished_run_without_cost_waits_for_it(db, monkeypatch):
     assert row["reason"] == ""
 
 
+async def test_a_price_read_while_running_closes_the_run_at_once(db, monkeypatch):
+    """Цена уже в строке с опроса во время RUNNING: конец без cost её не теряет."""
+    monkeypatch.setattr(config, "EXECUTOR_COST_WAIT_MIN", 30)
+    task_id = await _task(db)
+    row_id = await _run(db, task_id)
+    _provider(
+        monkeypatch, run={"id": "run-1", "status": "RUNNING"}, usage=_usage(1000, 1.5)
+    )
+    await poll_executor_runs(db)
+
+    _provider(
+        monkeypatch,
+        run={"id": "run-1", "status": "FINISHED"},
+        usage=_sdk_usage(1200, None),
+    )
+    await poll_executor_runs(db)
+    row = await _row(db, row_id)
+    assert row["outcome"] == OUTCOME_FINISHED
+    assert row["cents"] == pytest.approx(1.5)
+    assert row["tokens"] == 1200
+    assert row["finished_at"]
+    assert row["reason"] == ""
+
+
 async def test_cost_wait_has_a_ceiling_and_names_it(db, monkeypatch):
     monkeypatch.setattr(config, "EXECUTOR_COST_WAIT_MIN", 30)
     task_id = await _task(db)

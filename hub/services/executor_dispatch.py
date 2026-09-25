@@ -85,7 +85,10 @@ async def _poll_one(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
         await repo.update_executor_run(db, row["id"], reason=REASON_USAGE_SILENT)
         return
     outcome = _TERMINAL_OUTCOMES.get(str(run.get("status") or "").upper())
-    if outcome is not None and cents is None:
+    # Ждать цену — только если её нет ни в ответе, ни в строке: цена,
+    # прочитанная опросом во время RUNNING, известна, и конец без cost её не
+    # отменяет (COALESCE в update_executor_run её сохранит).
+    if outcome is not None and cents is None and row["cents"] is None:
         await _wait_for_cost(db, row["id"], tokens, outcome)
         return
     await repo.update_executor_run(
