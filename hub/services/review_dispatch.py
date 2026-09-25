@@ -816,6 +816,79 @@ def pick_review_profile(
     return LITE, [f"класс риска {risk_class.value}, процессных поверхностей нет"]
 
 
+# Суточный потолок deep на проект (#1414). Правило выше решает, заслуживает
+# ли сдача харнесс; потолок решает, может ли проект его сегодня купить. Рычаги
+# «правило профиля» срезали 8-15% и ничего не гарантировали при всплеске
+# сдач: прод, облачный канал — 21, 40 и 29 deep за 22-24.09.
+DEEP_DAILY_CAP_KEY = "deep_daily_cap"
+#: Слова причины понижения; по ним сводка ревью находит такие сдачи.
+DEEP_CAP_REASON_MARK = "суточный потолок"
+
+
+def _cap_value(raw: Any) -> int | None:
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return None
+    return raw
+
+
+def deep_daily_cap_of(policy: dict[str, Any]) -> int | None:
+    """Потолок deep в сутки для проекта; None — потолка нет.
+
+    Ключ проекта главнее глобального REVIEW_DEEP_DAILY_CAP. Нечитаемое
+    значение — не потолок: запись такое не пропускает, а положенное мимо API
+    не должно молча перевести проект на lite.
+    """
+    if isinstance(policy, dict) and DEEP_DAILY_CAP_KEY in policy:
+        cap = _cap_value(policy[DEEP_DAILY_CAP_KEY])
+        if cap is not None:
+            return cap
+    raw = str(config.REVIEW_DEEP_DAILY_CAP or "").strip()
+    return _cap_value(int(raw)) if raw.isdigit() else None
+
+
+def _deep_cap_exempt(task: dict[str, Any]) -> bool:
+    """Ручной запрос человека и риск security потолком не режутся (#1414)."""
+    if (task.get("machine_review_override") or "").strip() == "require":
+        return True
+    try:
+        risks = json.loads(task.get("risks") or "[]")
+    except ValueError:
+        return False
+    return isinstance(risks, list) and any(
+        isinstance(r, dict) and str(r.get("kind") or "").strip() == "security"
+        for r in risks
+    )
+
+
+async def apply_deep_daily_cap(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    generation: int,
+    profile: str,
+    reasons: list[str],
+) -> tuple[str, list[str]]:
+    """Deep сверх суточного потолка проекта становится lite с причиной (#1414).
+
+    Место под потолком бронируется атомарно (repo.claim_deep_seat): два
+    параллельных заказа вместе потолок не превышают.
+    """
+    if profile != DEEP or _deep_cap_exempt(task):
+        return profile, reasons
+    task_id = int(task["id"])
+    project = await repo.resolve_project_for_task(db, task_id)
+    if project is None:
+        return profile, reasons
+    cap = deep_daily_cap_of(gate_policy_of(project))
+    if cap is None:
+        return profile, reasons
+    if await repo.claim_deep_seat(db, int(project["id"]), task_id, generation, cap):
+        return profile, reasons
+    why = "; ".join(reasons) or "причина не названа"
+    return LITE, [
+        f"deep по правилу ({why}), но {DEEP_CAP_REASON_MARK} {cap} исчерпан — lite"
+    ]
+
+
 # Repository review rules (#873). Until now the reviewer got the diff and
 # nothing about the code it came from: the prompt named no known defect class,
 # while ``_PROCESS_SURFACES`` above already listed the ones this repository
@@ -2273,7 +2346,9 @@ async def prepare_review_order(
             ["профиль задан заказом: добор лестницы или его замена"],
         )
     else:
-        profile, profile_reasons = pick_review_profile(task, profile_diff)
+        profile, profile_reasons = await apply_deep_daily_cap(
+            db, task, generation, *pick_review_profile(task, profile_diff)
+        )
     rules_block, rules_note = await collect_review_rules(db, task_id, diff)
     prior = await previous_findings(db, task_id, generation)
     diff_block, diff_note = diff_plan(

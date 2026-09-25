@@ -13074,3 +13074,232 @@ async def test_refused_call_holds_the_claim_until_the_stub_is_written(
 
     assert in_window == [False], "триггер в окне отказа купил ревьюера"
     assert len(provider.calls) == 1
+
+
+# --- #1414: суточный потолок deep-ревью на проект ---------------------------
+#
+# Прод, облачный канал: 22.09 — 21 deep, 23.09 — 40, 24.09 — 29. Правило
+# профиля покупало deep, не зная, сколько deep проект уже купил сегодня.
+
+
+async def _cap_project(db: aiosqlite.Connection, slug: str, policy: dict) -> int:
+    pid = await repo.create_project(
+        db,
+        slug=slug,
+        name=slug.title(),
+        repo_name="mrPDA/spike-repo",
+        workspace_path="/tmp/ws",
+    )
+    await repo.update_project(
+        db, pid, gate_policy=json.dumps({"verdict": "auto", **policy})
+    )
+    return pid
+
+
+async def _submitted_in(
+    db: aiosqlite.Connection,
+    pid: int,
+    *,
+    diff: str = _DIFF_506,
+    risks: list[dict] | None = None,
+    override: str = "",
+) -> int:
+    """Сдача в УЖЕ заведённый проект: потолок считается по проекту."""
+    epic = await _node(db, title="epic", task_type="epic", parent_id=None)
+    await repo.update_task(db, epic, project_id=pid)
+    feature = await _node(db, title="feature", task_type="feature", parent_id=epic)
+    task_id = await _node(db, title="probe", task_type="task", parent_id=feature)
+    await repo.add_task_update(db, task_id, "dev", "status", "Plan: work")
+    await repo.update_task_structured(
+        db, task_id, TaskRefine(affected_areas=["docs/notes.md"], risks=risks)
+    )
+    if override:
+        await db.execute(
+            "UPDATE tasks SET machine_review_override = ? WHERE id = ?",
+            (override, task_id),
+        )
+    await db.commit()
+    plugins.git_ops = _PinnedGitOps(_TIP, ["docs/notes.md"], diff)
+    started = await services.pair_start_task(db, task_id, caller="dev-agent")
+    assert started.status.value == "running"
+    view = await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+    assert view.status.value == "review"
+    return task_id
+
+
+async def _dispatch_notes(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND content LIKE ?",
+        (task_id, "Кросс-модельное ревью вызвано хабом%"),
+    )
+    return [r[0] for r in rows]
+
+
+async def test_deep_over_daily_cap_downgrades_to_lite_with_reason(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1414): два неотказавших deep сегодня при потолке 2 — третья
+    сдача, которой правило дало бы deep, получает lite и названную причину."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-cap"}, "run": {"id": "r-cap"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "")
+    pid = await _cap_project(db, "deep-cap", {"deep_daily_cap": 2})
+
+    first = await _submitted_in(db, pid)
+    second = await _submitted_in(db, pid)
+    third = await _submitted_in(db, pid)
+
+    assert [(await _any_dispatch_row(db, t))["profile"] for t in (first, second)] == [
+        "deep",
+        "deep",
+    ]
+    assert (await _any_dispatch_row(db, third))["profile"] == "lite"
+    assert "ЛЁГКОЕ ревью" in recorder.calls[-1]["prompt_text"]
+    notes = await _dispatch_notes(db, third)
+    assert len(notes) == 1
+    assert "профиль lite" in notes[0]
+    assert "deep по правилу (процессная поверхность" in notes[0], notes[0]
+    assert "суточный потолок 2 исчерпан — lite" in notes[0], notes[0]
+    events = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE kind='review_dispatched' AND task_id=?",
+        (third,),
+    )
+    reasons = json.loads(events[-1][0])["profile_reasons"]
+    assert any("суточный потолок 2 исчерпан" in r for r in reasons), reasons
+
+    # Другой проект потолком этого не связан.
+    other = await _cap_project(db, "deep-cap-other", {"deep_daily_cap": 2})
+    assert (await _any_dispatch_row(db, await _submitted_in(db, other)))[
+        "profile"
+    ] == "deep"
+
+    # Отказ провайдера и вчерашний заказ — не оплаченный сегодня deep.
+    await db.execute(
+        "UPDATE review_dispatches SET status='failed' WHERE task_id=?", (first,)
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at=datetime('now', '-1 day') "
+        "WHERE task_id=?",
+        (second,),
+    )
+    await db.execute("DELETE FROM review_order_claims")
+    await db.commit()
+    fourth = await _submitted_in(db, pid)
+    fifth = await _submitted_in(db, pid)
+    sixth = await _submitted_in(db, pid)
+    assert [
+        (await _any_dispatch_row(db, t))["profile"] for t in (fourth, fifth, sixth)
+    ] == ["deep", "deep", "lite"], "отказ и вчерашний deep в счёт не идут"
+
+    # Сводка ревью (#1406) называет, сколько сдач потолок увёл в lite.
+    from hub.services.review_economy import review_economy
+
+    economy = await review_economy(db, since_days=7, escaped={})
+    assert economy["deep_cap"]["downgraded_submissions"] == 2, economy["deep_cap"]
+
+
+async def test_security_and_human_request_bypass_deep_cap(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1414): риск security и ручной запрос человека потолком не
+    режутся, даже когда потолок исчерпан."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-by"}, "run": {"id": "r-by"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "")
+    pid = await _cap_project(db, "deep-cap-bypass", {"deep_daily_cap": 0})
+
+    ordinary = await _submitted_in(db, pid)
+    assert (await _any_dispatch_row(db, ordinary))["profile"] == "lite", (
+        "потолок 0 исчерпан с первой сдачи"
+    )
+    security = await _submitted_in(
+        db,
+        pid,
+        risks=[{"kind": "security", "severity": "low", "description": "d"}],
+    )
+    human = await _submitted_in(db, pid, diff=_HARMLESS_DIFF, override="require")
+
+    assert (await _any_dispatch_row(db, security))["profile"] == "deep"
+    assert (await _any_dispatch_row(db, human))["profile"] == "deep"
+    for task_id in (security, human):
+        assert all("потолок" not in n for n in await _dispatch_notes(db, task_id))
+
+
+async def test_deep_cap_holds_under_concurrent_orders(
+    client: AsyncClient, db: aiosqlite.Connection, db_dsn: str, monkeypatch
+):
+    """AC-3 (#1414): потолок 1 и два параллельных заказа deep по разным
+    задачам проекта, каждый на своём соединении — ровно один deep."""
+    from hub import db as hub_db
+    from hub.services import lifecycle
+
+    recorder = _SlowRecorder(None)
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "")
+
+    async def _no_dispatch(_db, _task_id):
+        return None
+
+    monkeypatch.setattr(lifecycle, "_dispatch_cross_model_review", _no_dispatch)
+    pid = await _cap_project(db, "deep-cap-race", {"deep_daily_cap": 1})
+    one = await _submitted_in(db, pid)
+    two = await _submitted_in(db, pid)
+    assert recorder.calls == []
+
+    first = await hub_db.connect(db_dsn)
+    second = await hub_db.connect(db_dsn)
+    try:
+        results = await asyncio.gather(
+            maybe_dispatch_review(first, one),
+            maybe_dispatch_review(second, two),
+        )
+    finally:
+        await first.close()
+        await second.close()
+
+    assert results == [True, True], results
+    profiles = sorted(
+        [(await _any_dispatch_row(db, one))["profile"]]
+        + [(await _any_dispatch_row(db, two))["profile"]]
+    )
+    assert profiles == ["deep", "lite"], profiles
+
+
+async def test_no_deep_cap_means_unchanged_behaviour(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4 (#1414): без ключа и с пустым REVIEW_DEEP_DAILY_CAP всё deep, как
+    до задачи; отрицательный потолок API отклоняет 422."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-nc"}, "run": {"id": "r-nc"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "")
+    pid = await _cap_project(db, "deep-no-cap", {})
+
+    tasks = [await _submitted_in(db, pid) for _ in range(3)]
+    assert [(await _any_dispatch_row(db, t))["profile"] for t in tasks] == ["deep"] * 3
+    for task_id in tasks:
+        notes = await _dispatch_notes(db, task_id)
+        assert len(notes) == 1
+        assert "потолок" not in notes[0]
+    assert not (
+        await db.execute_fetchall(
+            "SELECT 1 FROM review_order_claims WHERE profile LIKE 'deep_cap%'"
+        )
+    ), "без потолка мест не бронируют"
+
+    # Глобальное умолчание работает, когда ключа нет.
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "3")
+    capped = await _submitted_in(db, pid)
+    assert (await _any_dispatch_row(db, capped))["profile"] == "lite"
+
+    for bad in (-1, "2", True, 1.5):
+        resp = await client.patch(
+            f"/api/projects/{pid}", json={"gate_policy": {"deep_daily_cap": bad}}
+        )
+        assert resp.status_code == 422, (bad, resp.text)
+    ok = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"deep_daily_cap": 0}}
+    )
+    assert ok.status_code == 200, ok.text

@@ -325,6 +325,12 @@ LOCAL_REVIEW_TOKEN_CEILING = int(env_get("LOCAL_REVIEW_TOKEN_CEILING", "2000000"
 # size. The unit that tracks cost is the RUN: none billed under 777k, lite
 # averages 1.38M, deep 3.85M.
 REVIEW_LITE_TOKEN_BUDGET = int(env_get("REVIEW_LITE_TOKEN_BUDGET", "40000"))
+# #1414: сколько deep-ревью проект покупает за сутки UTC, когда в его
+# gate_policy нет своего deep_daily_cap. Пусто — потолка нет (как до задачи);
+# нечитаемое значение — тоже нет: опечатка в окружении не должна молча
+# перевести все проекты на lite. Считается по числу, не по токенам: счёт
+# провайдера deep занижен до #1413.
+REVIEW_DEEP_DAILY_CAP = env_get("REVIEW_DEEP_DAILY_CAP", "")
 MAX_CI_FIX_CYCLES = int(env_get("MAX_CI_FIX_CYCLES", "3"))
 # Seconds after CI start / first missing-run probe before "no run for this
 # SHA" is a named fact rather than a wait. Same window the poller already
