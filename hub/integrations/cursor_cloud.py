@@ -15,8 +15,9 @@ behavior, the same shadow-step pattern as #581 and #743.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import httpx
 
@@ -307,17 +308,36 @@ async def find_agent_by_name(name: str, pages: int = 3) -> Reconciliation:
 #: Параметр модели в заказе: ``{"id": "fast", "value": "false"}`` (#1417).
 ModelParam = dict[str, str]
 
+#: Значение CURSOR_REVIEW_MODEL_PARAMS «подобрать по каталогу» (#1423).
+REVIEW_PARAMS_FROM_CATALOG = "auto"
 
-def review_model_params() -> list[ModelParam]:
-    """Параметры модели для заказа ревьюера из CURSOR_REVIEW_MODEL_PARAMS.
+#: Сколько живёт прочитанный каталог моделей (#1423). Час: варианты у
+#: Cursor меняются с выпуском моделей, а не между заказами, а заказов ревью —
+#: единицы в час, так что чтение на каждый заказ удваивало бы запросы ради
+#: свежести, которой никто не ждёт. Устаревание дороже одного лишнего
+#: запроса не выходит: вариант, который провайдер перестал принимать, ловит
+#: запасной путь (любой 400 → один заказ без params), а через час каталог
+#: перечитывается сам. Неудачное чтение не кэшируется — следующий заказ
+#: спросит снова.
+MODELS_CATALOG_TTL_SECONDS = 3600.0
 
-    Читается при каждом заказе, а не при импорте: настройка живёт в drop-in
-    службы, и тест подменяет её так же. Запись без ``=`` или с пустым именем
-    пропускается с предупреждением — послать провайдеру параметр, которого
-    владелец не называл, хуже, чем не послать никакого.
+_models_catalog: dict[str, Any] = {}
+
+
+def forget_models_catalog() -> None:
+    """Забыть прочитанный каталог — для тестов и ручного сброса."""
+    _models_catalog.clear()
+
+
+def parse_model_params(raw: str) -> list[ModelParam]:
+    """``"effort=high,fast=false"`` → ``[{id, value}, ...]``.
+
+    Запись без ``=`` или с пустым именем пропускается с предупреждением —
+    послать провайдеру параметр, которого владелец не называл, хуже, чем не
+    послать никакого.
     """
     params: list[ModelParam] = []
-    for chunk in (config.CURSOR_REVIEW_MODEL_PARAMS or "").split(","):
+    for chunk in (raw or "").split(","):
         item = chunk.strip()
         if not item:
             continue
@@ -327,6 +347,105 @@ def review_model_params() -> list[ModelParam]:
             continue
         params.append({"id": key.strip(), "value": value.strip()})
     return params
+
+
+def _as_params(raw: Any) -> list[ModelParam] | None:
+    """``variants[].params`` в виде ``[{id, value}]`` или None, если форма чужая."""
+    if not isinstance(raw, list):
+        return None
+    params: list[ModelParam] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        key, value = item.get("id"), item.get("value")
+        if not isinstance(key, str) or not isinstance(value, str):
+            return None
+        params.append({"id": key, "value": value})
+    return params
+
+
+def _catalog_item(catalog: dict[str, Any], model_id: str) -> dict[str, Any] | None:
+    items = catalog.get("items")
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        aliases = item.get("aliases")
+        names = [item.get("id")] + (aliases if isinstance(aliases, list) else [])
+        if model_id in names:
+            return item
+    return None
+
+
+def slow_default_variant(catalog: dict[str, Any], model_id: str) -> list[ModelParam]:
+    """Вариант isDefault модели с fast=false — только если он есть в variants.
+
+    Cursor принимает в ``model.params`` лишь полные пары из ``variants``
+    (25.09.2026: ``[{fast:false}]`` для grok-4.6 → 400 invalid_model, #1423),
+    поэтому пара не собирается, а находится: берётся вариант по умолчанию,
+    в нём меняется только fast, и получившийся набор обязан стоять в
+    variants. Нет модели, нет isDefault, нет fast или нет такой пары —
+    пустой список, заказ без params: вариант по умолчанию дороже, но он
+    заведомо допустим.
+    """
+    item = _catalog_item(catalog, model_id)
+    variants = item.get("variants") if item else None
+    if not isinstance(variants, list):
+        return []
+    offered = [
+        p
+        for p in (_as_params(v.get("params")) for v in variants if isinstance(v, dict))
+        if p is not None
+    ]
+    default = next(
+        (
+            _as_params(v.get("params"))
+            for v in variants
+            if isinstance(v, dict) and v.get("isDefault") is True
+        ),
+        None,
+    )
+    if not default or not any(p["id"] == "fast" for p in default):
+        return []
+    wanted = {p["id"]: ("false" if p["id"] == "fast" else p["value"]) for p in default}
+    for params in offered:
+        if {p["id"]: p["value"] for p in params} == wanted and len(params) == len(
+            wanted
+        ):
+            return params
+    return []
+
+
+async def _read_models_catalog() -> dict[str, Any] | None:
+    """Каталог моделей из кэша или свежим чтением; None — прочитать не вышло."""
+    now = time.monotonic()
+    cached = _models_catalog.get("body")
+    if cached is not None and now - _models_catalog.get("at", 0.0) < (
+        MODELS_CATALOG_TTL_SECONDS
+    ):
+        return cast(dict[str, Any], cached)
+    body = await list_models()
+    if body is None or not isinstance(body.get("items"), list):
+        return None
+    _models_catalog.update(body=body, at=now)
+    return body
+
+
+async def review_params_for(model_id: str) -> list[ModelParam]:
+    """Параметры заказа ревьюера под КОНКРЕТНУЮ модель (#1423).
+
+    Порядок: пустая настройка — без params (быстрая мера владельца, как до
+    #1417); явные пары — как есть, их выбрал человек, и если провайдер их
+    отвергнет, запасной путь закажет без них; ``auto`` (умолчание) — вариант
+    по умолчанию этой модели с fast=false из GET /v1/models. Каталог не
+    прочитан — без params: ревью дороже, но оно есть.
+    """
+    raw = (config.CURSOR_REVIEW_MODEL_PARAMS or "").strip()
+    if raw.lower() != REVIEW_PARAMS_FROM_CATALOG:
+        return parse_model_params(raw)
+    catalog = await _read_models_catalog()
+    return slow_default_variant(catalog, model_id) if catalog is not None else []
 
 
 def model_variant(model_id: str, params: list[ModelParam] | None) -> str:
@@ -354,8 +473,8 @@ async def create_review_agent(
     ``autoCreatePR=false`` and ``workOnCurrentBranch=false`` keep any
     accidental commits on a throwaway cursor/ branch.
 
-    ``model_params=None`` — параметры ревьюера из настройки (#1417): по
-    умолчанию ``fast=false``, та же модель без наценки за скорость.
+    ``model_params=None`` — параметры ревьюера под эту модель (#1423): по
+    умолчанию вариант из каталога с fast=false, та же модель без наценки.
     """
     created, _ = await create_agent_attempt(
         repo_url=repo_url,
@@ -365,7 +484,9 @@ async def create_review_agent(
         hub_mcp_url=hub_mcp_url,
         reviewer_token=reviewer_token,
         name=name,
-        model_params=review_model_params() if model_params is None else model_params,
+        model_params=(
+            await review_params_for(model_id) if model_params is None else model_params
+        ),
     )
     return created
 
