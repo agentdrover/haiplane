@@ -1519,7 +1519,10 @@ async def list_machine_reviews(
         await fetchall(
             db,
             "SELECT id, submission_generation, profile, model, agent_count, "
-            "tokens_spent, provider_tokens, incomplete, created_at "
+            "tokens_spent, provider_tokens, incomplete, created_at, "
+            # #1361: a carried report is a row but NOT a run; the reader
+            # needs the mark to tell the two apart.
+            "carried_from_review_id "
             "FROM machine_reviews WHERE task_id=? ORDER BY id",
             (task_id,),
         )

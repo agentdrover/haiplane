@@ -2357,6 +2357,14 @@ async def _web_task_detail_page(
     # five resubmissions cost five entry prices. A sum alone would hide that;
     # the count is the point. Runs whose bill never arrived say "неизвестно",
     # never nothing, because a missing bill is not a free run (#725).
+    #
+    # #1361: a report CARRIED over a base-only merge is a row, not a run — it
+    # cost nothing and read nothing. Counting it made the card say "2 runs,
+    # bill known for 1 of 2" about a single paid run. Carries are listed apart.
+    report_rows = [dict(r) for r in await repo.list_machine_reviews(db, task_id)]
+    generation_of = {
+        int(r["id"]): int(r["submission_generation"] or 0) for r in report_rows
+    }
     review_runs = [
         {
             "generation": int(r["submission_generation"] or 0),
@@ -2365,7 +2373,16 @@ async def _web_task_detail_page(
             "tokens_spent": r["tokens_spent"],
             "created_at": r["created_at"],
         }
-        for r in map(dict, await repo.list_machine_reviews(db, task_id))
+        for r in report_rows
+        if r.get("carried_from_review_id") is None
+    ]
+    review_carries = [
+        {
+            "generation": int(r["submission_generation"] or 0),
+            "from_generation": generation_of.get(int(r["carried_from_review_id"])),
+        }
+        for r in report_rows
+        if r.get("carried_from_review_id") is not None
     ]
     review_runs_billed = [
         r["provider_tokens"] for r in review_runs if r["provider_tokens"] is not None
@@ -2440,6 +2457,7 @@ async def _web_task_detail_page(
             "mr_undisposed": mr_undisposed,
             "review_runs": review_runs,
             "review_runs_cost": review_runs_cost,
+            "review_carries": review_carries,
             "review_report": review_report,
             "machine_review_gap": machine_review_gap_text,
             "readiness": readiness,

@@ -81,8 +81,10 @@ def _git(*args: str, cwd: Path) -> str:
     ).stdout.strip()
 
 
-def shared_file_merge(tmp_path: Path, resolution: str) -> tuple[Path, str, str]:
-    """Клон, где база тронула файл автора, и слияние разрешено руками.
+def _merge_repo(
+    tmp_path: Path, name: str, common: str, branch: str, base: str, resolved: str
+) -> tuple[Path, str, str]:
+    """Клон, где база и ветка правят один файл, а конфликт разрешён руками.
 
     Возвращает ``(клон, одобренная вершина, вершина после слияния)``.
     """
@@ -94,20 +96,20 @@ def shared_file_merge(tmp_path: Path, resolution: str) -> tuple[Path, str, str]:
     subprocess.run(["git", "clone", "-q", str(origin), str(work)], check=True)
     _git("config", "user.email", "t@example.com", cwd=work)
     _git("config", "user.name", "t", cwd=work)
-    mod = work / "mod.py"
-    mod.write_text(_COMMON)
+    target = work / name
+    target.write_text(common)
     _git("add", "-A", cwd=work)
     _git("commit", "-q", "-m", "common", cwd=work)
     _git("push", "-q", "origin", "develop", cwd=work)
 
     _git("checkout", "-q", "-b", BRANCH, cwd=work)
-    mod.write_text(_BRANCH)
+    target.write_text(branch)
     _git("commit", "-q", "-am", "author", cwd=work)
     _git("push", "-q", "origin", BRANCH, cwd=work)
     approved = _git("rev-parse", "HEAD", cwd=work)
 
     _git("checkout", "-q", "develop", cwd=work)
-    mod.write_text(_BASE)
+    target.write_text(base)
     _git("commit", "-q", "-am", "base", cwd=work)
     _git("push", "-q", "origin", "develop", cwd=work)
 
@@ -119,15 +121,25 @@ def shared_file_merge(tmp_path: Path, resolution: str) -> tuple[Path, str, str]:
         text=True,
     )
     assert merged.returncode != 0, "предусловие: слияние обязано конфликтовать"
-    mod.write_text(RESOLUTIONS[resolution])
-    _git("add", "mod.py", cwd=work)
+    target.write_text(resolved)
+    _git("add", name, cwd=work)
     _git("commit", "-q", "--no-edit", cwd=work)
     _git("push", "-q", "origin", BRANCH, cwd=work)
     return work, approved, _git("rev-parse", "HEAD", cwd=work)
 
 
+def shared_file_merge(tmp_path: Path, resolution: str) -> tuple[Path, str, str]:
+    """База тронула ``mod.py`` автора; разрешение — одно из ``RESOLUTIONS``."""
+    return _merge_repo(
+        tmp_path, "mod.py", _COMMON, _BRANCH, _BASE, RESOLUTIONS[resolution]
+    )
+
+
 async def _diffs(tmp_path: Path, resolution: str) -> tuple[str, str]:
-    work, approved, tip = shared_file_merge(tmp_path, resolution)
+    return await _real_diffs(*shared_file_merge(tmp_path, resolution))
+
+
+async def _real_diffs(work: Path, approved: str, tip: str) -> tuple[str, str]:
     ops = GitOpsIntegration()
     before = await ops.branch_diff(str(work), "develop", approved)
     after = await ops.branch_diff(str(work), "develop", tip)
@@ -158,6 +170,58 @@ async def test_reordered_or_new_author_lines_are_a_change(tmp_path):
         same, why = base_merge.author_edit_same(before, after)
         assert not same, f"{case}: {why}"
         assert "mod.py" in why, f"{case}: отличие обязано быть названо файлом: {why}"
+
+
+# ---- Находка ревью: строка содержимого, похожая на заголовок файла ----
+#
+# В ``-U0`` удалённая строка ``-- verbose`` печатается как ``--- verbose``, а
+# добавленная ``++ x`` — как ``+++ x``. Первая редакция отбрасывала ``---``/
+# ``+++`` в любом месте диффа, и такие правки пропадали с обеих сторон:
+# разрешение, выронившее строку базы ``-- base only``, читалось «той же
+# правкой». Заголовок файла — только до первого ``@@`` этого файла.
+
+_SQL_COMMON = "SELECT 1;\n-- verbose\n-- keep\nTAIL;\n"
+_SQL_BRANCH = "SELECT 1;\n-- keep\nTAIL;\n++ x\n"
+_SQL_BASE = "SELECT 2;\n-- verbose\n-- keep\nTAIL;\n-- base only\n"
+# Разрешение взяло правку базы сверху, но выронило её хвост «-- base only».
+_SQL_DROPS_BASE_LINE = "SELECT 2;\n-- keep\nTAIL;\n++ x\n"
+
+
+async def test_a_dropped_line_that_looks_like_a_file_header_is_a_change(tmp_path):
+    before, after = await _real_diffs(
+        *_merge_repo(
+            tmp_path,
+            "schema.sql",
+            _SQL_COMMON,
+            _SQL_BRANCH,
+            _SQL_BASE,
+            _SQL_DROPS_BASE_LINE,
+        )
+    )
+    assert "\n--- verbose\n" in before and "\n+++ x" in before, (
+        "предусловие: в -U0 правки автора выглядят как заголовки файла"
+    )
+    assert "\n--- base only" in after, "предусловие: разрешение выронило строку"
+    same, why = base_merge.author_edit_same(before, after)
+    assert not same, why
+    assert "schema.sql" in why
+
+
+def test_content_lines_after_a_hunk_header_are_the_author_edit():
+    before = (
+        "diff --git a/s.sql b/s.sql\n"
+        "--- a/s.sql\n"
+        "+++ b/s.sql\n"
+        "@@ -2 +1,0 @@\n"
+        "--- verbose\n"
+    )
+    assert not base_merge.author_edit_same(before, before.replace("verbose", "quiet"))[
+        0
+    ]
+    no_content = before.rsplit("--- verbose\n", 1)[0]
+    assert not base_merge.author_edit_same(before, no_content)[0], (
+        "строка «--- …» после @@ — содержимое, а не заголовок"
+    )
 
 
 # ---- Разбор диффа: что отбрасывается, а что — нет ----

@@ -48,6 +48,11 @@ _THEIRS = "======="
 _END = ">>>>>>>"
 
 
+#: Строки заголовка файла, которые мерж базы меняет без правки автора.
+#: Отбрасываются ТОЛЬКО в заголовке — см. ``_author_edit``.
+_HEADER_NOISE = ("--- ", "+++ ", "similarity index ", "dissimilarity index ")
+
+
 def _author_edit(diff: str) -> dict[str, list[str]]:
     """Авторская правка по файлам: упорядоченные строки +/- и заголовки смысла.
 
@@ -55,7 +60,9 @@ def _author_edit(diff: str) -> dict[str, list[str]]:
     читается как изменение. Отбрасывается только то, что сдвигает мерж базы
     при неизменной работе автора: строки ``index`` (блоб базы другой),
     заголовки ханков ``@@`` (вставка базы сдвигает смещения), ``---``/``+++``
-    (пути уже в ключе), ``similarity index`` и строки контекста.
+    (пути уже в ключе), ``similarity index`` и строки контекста. ``index``,
+    ``---``/``+++`` и ``similarity`` — ТОЛЬКО в заголовке файла, до его
+    первого ``@@``: после него это содержимое.
 
     Всё прочее остаётся В ПОРЯДКЕ ПОЯВЛЕНИЯ: ``+``/``-`` вместе с содержимым,
     смена режима, создание, удаление, переименование. У бинарного файла строк
@@ -66,18 +73,27 @@ def _author_edit(diff: str) -> dict[str, list[str]]:
     files: dict[str, list[str]] = {}
     index: dict[str, str] = {}
     key = ""
+    # Заголовок файла — только от ``diff --git`` до его первого ``@@``. После
+    # ``@@`` всё содержимое, даже строка «--- …»: в ``-U0`` так печатается
+    # удалённая ``-- verbose``, а «+++ …» — добавленная ``++ x``. Отбрасывать
+    # их где угодно значило терять настоящие правки с обеих сторон (находка
+    # deep-ревью первой сдачи #1361, воспроизведена на настоящем git).
+    in_header = False
     for line in diff.splitlines():
         if line.startswith("diff --git "):
             key = line[len("diff --git ") :]
             files.setdefault(key, [])
+            in_header = True
             continue
-        if line.startswith("index "):
-            index[key] = line
+        if line.startswith("@@"):
+            in_header = False
             continue
-        if line.startswith(("@@", "--- ", "+++ ", "similarity index ")) or (
-            line.startswith("dissimilarity index ")
-        ):
-            continue
+        if in_header:
+            if line.startswith("index "):
+                index[key] = line
+                continue
+            if line.startswith(_HEADER_NOISE):
+                continue
         if not line or line.startswith(" "):
             continue
         files.setdefault(key, []).append(line)

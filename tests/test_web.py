@@ -5675,6 +5675,39 @@ async def test_task_card_shows_review_runs_and_their_provider_cost(
     assert "25 000" in page.text, "and the self-report stays visible beside it"
 
 
+async def test_a_carried_report_is_not_a_review_run_on_the_card(
+    client: AsyncClient, db
+):
+    # Находка deep-ревью #1361: после пересдачи «только слита база» в новом
+    # поколении лежит перенесённый отчёт, и карточка считала его прогоном с
+    # неизвестным счётом — «Прогонов ревью: 2», «счёт есть у 1 из 2». Прогона
+    # не было, и денег он не стоил: перенос показывается своей строкой.
+    from hub import repository as repo_module
+
+    task_id = await _web_task_in_review(client)
+    await _machine_report(client, task_id, tokens_spent=25_000)
+    await repo_module.set_machine_review_provider_tokens(db, task_id, 1, 777_389)
+    source = dict(await repo_module.get_latest_machine_review(db, task_id))
+    await repo_module.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=2,
+        harness_skill=source["harness_skill"],
+        model=source["model"],
+        raw_count=int(source["raw_count"] or 0),
+        carried_from_review_id=int(source["id"]),
+    )
+    await db.commit()
+
+    page = await client.get(f"/tasks/{task_id}")
+
+    assert "Прогонов ревью: 1" in page.text, "перенос — не прогон"
+    assert "счёт есть у 1 из 2" not in page.text
+    assert "перенесён с поколения 1" in page.text, (
+        "перенос виден отдельной строкой и называет источник"
+    )
+
+
 async def test_unbilled_review_run_reads_as_unknown_not_free(client: AsyncClient, db):
     # A run whose bill never arrived is an unknown cost, not a free one.
     # Printing nothing (or a zero) would make the runs we failed to measure
