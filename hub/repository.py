@@ -5533,3 +5533,25 @@ async def update_executor_run(
         "WHERE id=?",
         (tokens, cents, outcome, reason, finish, finish, row_id),
     )
+
+
+async def wait_for_executor_cost(
+    db: aiosqlite.Connection, row_id: int, minutes: int
+) -> bool:
+    """Отметить ожидание цены (#1410); True — срок ожидания исчерпан.
+
+    Отметка ставится один раз — при первом конце прогона без цены — и дальше
+    не сдвигается, иначе ожидание не кончилось бы никогда.
+    """
+    await db.execute(
+        "UPDATE executor_runs SET cost_wait_since=COALESCE(cost_wait_since, "
+        "datetime('now')) WHERE id=?",
+        (row_id,),
+    )
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM executor_runs WHERE id=? "
+        "AND cost_wait_since <= datetime('now', ?)",
+        (row_id, f"-{minutes} minutes"),
+    )
+    return bool(rows)

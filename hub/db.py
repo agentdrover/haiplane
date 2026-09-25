@@ -2248,6 +2248,12 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_executor_runs_outcome "
         "ON executor_runs(outcome, task_id)",
     ),
+    (
+        # #1410: когда опрос впервые увидел конец прогона без цены. От этой
+        # отметки считается EXECUTOR_COST_WAIT_MIN; NULL — цены не ждём.
+        "add_executor_runs_cost_wait_since",
+        "ALTER TABLE executor_runs ADD COLUMN cost_wait_since TEXT",
+    ),
 ]
 
 

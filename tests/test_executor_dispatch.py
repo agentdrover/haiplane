@@ -21,6 +21,8 @@ from hub.services.executor_dispatch import (
     OUTCOME_CANCELLED,
     OUTCOME_FINISHED,
     OUTCOME_RUNNING,
+    REASON_COST_NEVER_CAME,
+    REASON_COST_PENDING,
     REASON_RUNS_SILENT,
     REASON_USAGE_SILENT,
     poll_executor_runs,
@@ -205,6 +207,106 @@ async def test_a_silent_provider_is_named_not_zeroed(db, monkeypatch):
     assert row["outcome"] == OUTCOME_FINISHED
     assert row["tokens"] == 9000
     assert row["reason"] == ""
+
+
+# ---- находки ревью сдачи 1: где лежит цена и когда прогон закрывается ----
+
+
+def _sdk_usage(tokens: int, cents: float | None) -> dict:
+    """Тело /usage по типам Cloud Agents API/SDK: деньги в соседнем ``cost``."""
+    body: dict = {"totalUsage": {"totalTokens": tokens}}
+    if cents is not None:
+        body["cost"] = {"rawCostCents": 50.0, "chargedCents": cents}
+    return body
+
+
+async def test_cost_is_read_from_the_sdk_cost_object(db, monkeypatch):
+    assert cursor_cloud.usage_totals(_sdk_usage(1_332_835, 47.1)) == (
+        1_332_835,
+        47.1,
+    )
+    task_id = await _task(db)
+    row_id = await _run(db, task_id)
+    _provider(
+        monkeypatch,
+        run={"id": "run-1", "status": "FINISHED"},
+        usage=_sdk_usage(1_332_835, 47.1),
+    )
+    await poll_executor_runs(db)
+    row = await _row(db, row_id)
+    assert row["cents"] == pytest.approx(47.1)
+    assert row["outcome"] == OUTCOME_FINISHED
+
+
+async def test_a_finished_run_without_cost_waits_for_it(db, monkeypatch):
+    monkeypatch.setattr(config, "EXECUTOR_COST_WAIT_MIN", 30)
+    task_id = await _task(db)
+    row_id = await _run(db, task_id)
+
+    # Прогон кончился, токены пришли, цена — ещё нет: не закрывать.
+    _provider(
+        monkeypatch,
+        run={"id": "run-1", "status": "FINISHED"},
+        usage=_sdk_usage(1_332_835, None),
+    )
+    await poll_executor_runs(db)
+    row = await _row(db, row_id)
+    assert row["tokens"] == 1_332_835
+    assert row["cents"] is None
+    assert row["outcome"] == OUTCOME_RUNNING
+    assert row["finished_at"] is None
+    assert row["reason"] == REASON_COST_PENDING
+
+    # Цена пришла на следующем опросе — закрыт с центами.
+    _provider(
+        monkeypatch,
+        run={"id": "run-1", "status": "FINISHED"},
+        usage=_usage(1_332_835, 47.1),
+    )
+    await poll_executor_runs(db)
+    row = await _row(db, row_id)
+    assert row["outcome"] == OUTCOME_FINISHED
+    assert row["cents"] == pytest.approx(47.1)
+    assert row["finished_at"]
+    assert row["reason"] == ""
+
+
+async def test_cost_wait_has_a_ceiling_and_names_it(db, monkeypatch):
+    monkeypatch.setattr(config, "EXECUTOR_COST_WAIT_MIN", 30)
+    task_id = await _task(db)
+    row_id = await _run(db, task_id)
+    _provider(
+        monkeypatch,
+        run={"id": "run-1", "status": "FINISHED"},
+        usage=_sdk_usage(1000, None),
+    )
+    await poll_executor_runs(db)
+    assert (await _row(db, row_id))["outcome"] == OUTCOME_RUNNING
+
+    # Ещё не срок: 29 минут ожидания.
+    await db.execute(
+        "UPDATE executor_runs SET cost_wait_since=datetime('now', '-29 minutes') "
+        "WHERE id=?",
+        (row_id,),
+    )
+    await db.commit()
+    await poll_executor_runs(db)
+    assert (await _row(db, row_id))["outcome"] == OUTCOME_RUNNING
+
+    # Срок исчерпан: закрыт исходом провайдера, центы неизвестны, причина названа.
+    await db.execute(
+        "UPDATE executor_runs SET cost_wait_since=datetime('now', '-31 minutes') "
+        "WHERE id=?",
+        (row_id,),
+    )
+    await db.commit()
+    await poll_executor_runs(db)
+    row = await _row(db, row_id)
+    assert row["outcome"] == OUTCOME_FINISHED
+    assert row["cents"] is None
+    assert row["tokens"] == 1000
+    assert row["finished_at"]
+    assert row["reason"] == REASON_COST_NEVER_CAME.format(minutes=30)
 
 
 # ---- AC-3: карточка и practice_metrics ----

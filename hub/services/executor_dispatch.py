@@ -23,6 +23,7 @@ from typing import Any
 
 import aiosqlite
 
+from hub import config
 from hub import repository as repo
 from hub.db import fetchall
 from hub.integrations import cursor_cloud
@@ -52,6 +53,10 @@ REASON_USAGE_SILENT = (
     "провайдер не ответил на /usage — токены и центы не прочитаны, прогон не закрыт"
 )
 REASON_NO_RUN_ID = "у строки нет agent_id или run_id — опрашивать нечего"
+REASON_COST_PENDING = (
+    "прогон закончился, цена ещё не пришла — строка ждёт следующего опроса"
+)
+REASON_COST_NEVER_CAME = "цена не пришла за {minutes} мин после конца прогона"
 
 
 async def _ask(call: Any, *args: Any) -> dict[str, Any] | None:
@@ -80,6 +85,9 @@ async def _poll_one(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
         await repo.update_executor_run(db, row["id"], reason=REASON_USAGE_SILENT)
         return
     outcome = _TERMINAL_OUTCOMES.get(str(run.get("status") or "").upper())
+    if outcome is not None and cents is None:
+        await _wait_for_cost(db, row["id"], tokens, outcome)
+        return
     await repo.update_executor_run(
         db,
         row["id"],
@@ -88,6 +96,32 @@ async def _poll_one(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
         outcome=outcome or OUTCOME_RUNNING,
         reason="",
         finish=outcome is not None,
+    )
+
+
+async def _wait_for_cost(
+    db: aiosqlite.Connection, row_id: int, tokens: int | None, outcome: str
+) -> None:
+    """Конец прогона без цены: ждать её, но не вечно (#1410).
+
+    Cost у Cursor «eventually consistent» и сразу после конца может не
+    прийти. Пока срок не вышел, строка остаётся running с причиной; по
+    истечении закрывается исходом провайдера с названной причиной, а центы
+    остаются неизвестными (прежнее прочитанное значение не обнуляется).
+    """
+    minutes = config.EXECUTOR_COST_WAIT_MIN
+    if await repo.wait_for_executor_cost(db, row_id, minutes):
+        await repo.update_executor_run(
+            db,
+            row_id,
+            tokens=tokens,
+            outcome=outcome,
+            reason=REASON_COST_NEVER_CAME.format(minutes=minutes),
+            finish=True,
+        )
+        return
+    await repo.update_executor_run(
+        db, row_id, tokens=tokens, reason=REASON_COST_PENDING
     )
 
 
