@@ -3462,7 +3462,9 @@ async def test_a_held_signal_with_the_same_queue_writes_nothing_new(
 # ---------------------------------------------------------------------------
 
 
-async def test_concurrent_poller_and_report_done_deliver_once_without_alert(db, db_dsn):
+async def test_concurrent_poller_and_report_done_deliver_once_without_alert(
+    db, db_dsn, monkeypatch
+):
     """AC-3: два пути мержа в одном окне — одна доставка и ни одного отказа.
 
     Топология прода (#1065): report_done идёт по соединению запроса и держит
@@ -3484,7 +3486,16 @@ async def test_concurrent_poller_and_report_done_deliver_once_without_alert(db, 
     await services.record_review_verdict(
         db, tv.id, TaskReviewVerdict(verdict="approved", agent="reviewer")
     )
+    # Как на проде: сдача закреплена, вершина не сдвинулась. Иначе гейт пишет
+    # в карточку «сверка не проводилась» ДО мержа, и write-лок SQLite, который
+    # держит done-flow, сам сериализует пути — гонка в тесте не случается.
+    await repo.update_task(db, tv.id, submission_sha="a" * 40)
     await db.commit()
+
+    async def _tip_unchanged(*_a, **_k):
+        return "a" * 40, ""
+
+    monkeypatch.setattr("hub.services.lifecycle.resolve_branch_tip", _tip_unchanged)
 
     merges: list[bool] = []
     arrived = asyncio.Event()
