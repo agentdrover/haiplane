@@ -542,6 +542,32 @@ async def test_a_2xx_cancel_is_confirmed_by_reading_the_run(db, monkeypatch):
     assert state["cancel_calls"] == 2
 
 
+async def test_a_silent_usage_does_not_stop_holding_the_run(db, monkeypatch):
+    """Молчание /usage не обрывает снятие по сдаче и начатую отмену (#1411)."""
+    monkeypatch.setattr(config, "EXECUTOR_CANCEL_PAUSE_S", 60)
+    task_id = await _task(db)
+    row_id = await _run(db, task_id, generation=1)
+    await _submitted(db, task_id, 1)
+
+    # Сдача легла, /usage молчит — снятие всё равно просится.
+    state = _cancelling_provider(monkeypatch, usage=None, refusals=1)
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 1
+    row = await _row(db, row_id)
+    assert row["cancel_intent"] == OUTCOME_TAKEN_DOWN
+    assert "429" in row["reason"]
+
+    # Пауза вышла, /usage всё ещё молчит — отмена повторяется и доводится.
+    await _pause_passed(db, row_id)
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 2
+    # Прогон отменён; цены нет — строка ждёт её, а не отменяет снова.
+    assert (await _row(db, row_id))["reason"] == REASON_COST_PENDING
+    await _pause_passed(db, row_id)
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 2
+
+
 async def test_cancel_exhaustion_is_named_to_a_human(db, monkeypatch):
     monkeypatch.setattr(config, "EXECUTOR_CANCEL_MAX_ATTEMPTS", 3)
     monkeypatch.setattr(config, "EXECUTOR_CANCEL_PAUSE_S", 60)

@@ -98,10 +98,13 @@ async def _poll_one(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
     tokens, cents = cursor_cloud.usage_totals(
         await _ask(cursor_cloud.get_usage, agent_id, run_id)
     )
+    # Держать прогон — до проверки молчания /usage: снятие по сдаче и
+    # начатая отмена от свежего счёта не зависят, потолок судит по прежнему
+    # из строки (_spent).
+    if _outcome_of(row, run) is None and await _hold_the_run(db, row, tokens, cents):
+        return
     if tokens is None and cents is None:
         await repo.update_executor_run(db, row["id"], reason=REASON_USAGE_SILENT)
-        return
-    if _outcome_of(row, run) is None and await _hold_the_run(db, row, tokens, cents):
         return
     await _settle(db, row, run, tokens, cents)
 
