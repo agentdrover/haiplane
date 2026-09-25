@@ -860,6 +860,30 @@ def _deep_cap_exempt(task: dict[str, Any]) -> bool:
     )
 
 
+async def deep_cap_exhausted(
+    db: aiosqlite.Connection, task: dict[str, Any], generation: int
+) -> int | None:
+    """Потолок, если облачный deep этой сдаче сегодня не положен; иначе None.
+
+    Положен — значит место под потолком забронировано атомарно
+    (repo.claim_deep_seat): два параллельных заказа вместе потолок не
+    превышают. Сдача, уже занявшая место, второго не занимает. Исключения —
+    ручной запрос и риск security (#1414).
+    """
+    if _deep_cap_exempt(task):
+        return None
+    task_id = int(task["id"])
+    project = await repo.resolve_project_for_task(db, task_id)
+    if project is None:
+        return None
+    cap = deep_daily_cap_of(gate_policy_of(project))
+    if cap is None:
+        return None
+    if await repo.claim_deep_seat(db, int(project["id"]), task_id, generation, cap):
+        return None
+    return cap
+
+
 async def apply_deep_daily_cap(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -867,26 +891,49 @@ async def apply_deep_daily_cap(
     profile: str,
     reasons: list[str],
 ) -> tuple[str, list[str]]:
-    """Deep сверх суточного потолка проекта становится lite с причиной (#1414).
-
-    Место под потолком бронируется атомарно (repo.claim_deep_seat): два
-    параллельных заказа вместе потолок не превышают.
-    """
-    if profile != DEEP or _deep_cap_exempt(task):
+    """Deep по правилу сверх суточного потолка становится lite с причиной."""
+    if profile != DEEP:
         return profile, reasons
-    task_id = int(task["id"])
-    project = await repo.resolve_project_for_task(db, task_id)
-    if project is None:
-        return profile, reasons
-    cap = deep_daily_cap_of(gate_policy_of(project))
+    cap = await deep_cap_exhausted(db, task, generation)
     if cap is None:
-        return profile, reasons
-    if await repo.claim_deep_seat(db, int(project["id"]), task_id, generation, cap):
         return profile, reasons
     why = "; ".join(reasons) or "причина не названа"
     return LITE, [
         f"deep по правилу ({why}), но {DEEP_CAP_REASON_MARK} {cap} исчерпан — lite"
     ]
+
+
+async def _forced_deep_over_cap(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    generation: int,
+    force_profile: str,
+    force_model: str,
+) -> bool:
+    """Принудительный облачный deep сверх потолка не покупается (#1414).
+
+    Добор лестницы (#879) и вторая ось (#1243) приходят с force_profile=deep
+    и мимо правила профиля — значит, и мимо понижения. Понизить их некуда:
+    добор lite после неполного lite — тот же прогон второй раз. Поэтому
+    отказ с названной причиной; лестница после него не повторяется —
+    вызывающий уже пишет, что решение за человеком.
+    """
+    if force_profile != DEEP:
+        return False
+    cap = await deep_cap_exhausted(db, task, generation)
+    if cap is None:
+        return False
+    what = "переспрос другой моделью" if force_model else "добор"
+    await repo.add_task_update(
+        db,
+        int(task["id"]),
+        "hub",
+        "alert",
+        f"Облачный deep для этой сдачи не заказан: {DEEP_CAP_REASON_MARK} deep "
+        f"исчерпан — {what} не куплен (потолок {cap} в сутки на проект, #1414).",
+    )
+    await db.commit()
+    return True
 
 
 # Repository review rules (#873). Until now the reviewer got the diff and
@@ -2800,6 +2847,19 @@ async def _prepare_claimed_order(
     ):
         return None
     try:
+        if await _forced_deep_over_cap(
+            db, task, generation, force_profile, force_model
+        ):
+            await _release_the_order(
+                db,
+                task_id,
+                generation,
+                force_profile,
+                replaces_dispatch_id,
+                force_model,
+            )
+            await db.commit()
+            return None
         order = await prepare_review_order(
             db,
             task,

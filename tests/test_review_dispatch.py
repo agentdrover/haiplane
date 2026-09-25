@@ -13452,3 +13452,104 @@ async def test_deep_cap_binds_only_the_cloud_channel(
     assert [
         ((r := await _any_dispatch_row(db, t))["channel"], r["profile"]) for t in cloud
     ] == [("cloud", "deep"), ("cloud", "lite")], "локальные deep в счёт не вошли"
+
+
+async def test_ladder_top_up_respects_deep_cap(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1414, находка high: добор лестницы (#879) — принудительный облачный
+    deep, и потолок его тоже держит. Потолок исчерпан — добор не куплен,
+    причина названа, лестница не повторяется."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-tu"}, "run": {"id": "r-tu"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "")
+    pid = await _cap_project(db, "deep-cap-topup", {"deep_daily_cap": 1})
+
+    taken = await _submitted_in(db, pid)
+    assert (await _any_dispatch_row(db, taken))["profile"] == "deep"
+    cheap = await _submitted_in(db, pid, diff=_HARMLESS_DIFF)
+    assert [r["profile"] for r in await _rows_of(db, cheap)] == ["lite"]
+    calls = len(recorder.calls)
+
+    await _machine_report(client, cheap, incomplete=True)
+
+    assert len(recorder.calls) == calls, "добор deep сверх потолка не куплен"
+    assert [r["profile"] for r in await _rows_of(db, cheap)] == ["lite"]
+    alerts = [
+        r[0]
+        for r in await db.execute_fetchall(
+            "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+            (cheap,),
+        )
+    ]
+    assert any(
+        "суточный потолок deep исчерпан — добор не куплен" in a for a in alerts
+    ), alerts
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM review_order_claims WHERE task_id=? AND profile=?",
+        (cheap, "deep"),
+    ), "бронь заказа добора снята"
+
+
+async def test_global_deep_cap_default_applies_without_project_key(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1414: REVIEW_DEEP_DAILY_CAP='3' и проект без ключа — три deep куплены,
+    четвёртый понижен до lite с причиной."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-gl"}, "run": {"id": "r-gl"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "3")
+    pid = await _cap_project(db, "deep-cap-global", {})
+
+    tasks = [await _submitted_in(db, pid) for _ in range(4)]
+    assert [(await _any_dispatch_row(db, t))["profile"] for t in tasks] == [
+        "deep",
+        "deep",
+        "deep",
+        "lite",
+    ]
+    notes = await _dispatch_notes(db, tasks[-1])
+    assert "суточный потолок 3 исчерпан — lite" in notes[0], notes
+
+
+async def test_same_submission_takes_one_deep_seat(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1414: переспрос той же сдачи (replaces_dispatch_id, #1242) второго
+    места не занимает — ни себе в отказ, ни соседям в счёт."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-rs"}, "run": {"id": "r-rs"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "")
+    pid = await _cap_project(db, "deep-cap-seat", {"deep_daily_cap": 2})
+
+    first = await _submitted_in(db, pid)
+    original = await _any_dispatch_row(db, first)
+    assert original["profile"] == "deep"
+    await db.execute(
+        "UPDATE review_dispatches SET status='failed' WHERE id=?", (original["id"],)
+    )
+    await db.commit()
+
+    assert await maybe_dispatch_review(db, first, replaces_dispatch_id=original["id"])
+    retry = await _any_dispatch_row(db, first)
+    assert retry["replaces_dispatch_id"] == original["id"]
+    assert retry["profile"] == "deep", "переспрос своей сдачи места не теряет"
+
+    second = await _submitted_in(db, pid)
+    assert (await _any_dispatch_row(db, second))["profile"] == "deep", (
+        "сдача с переспросом заняла одно место из двух, не два"
+    )
+
+    # Потолок теперь полон (first, second) — а переспрос first всё равно deep:
+    # его место уже его.
+    await db.execute(
+        "UPDATE review_dispatches SET status='failed' WHERE id=?", (retry["id"],)
+    )
+    await db.commit()
+    assert await maybe_dispatch_review(db, first, replaces_dispatch_id=retry["id"])
+    again = await _any_dispatch_row(db, first)
+    assert again["replaces_dispatch_id"] == retry["id"]
+    assert again["profile"] == "deep", "полный потолок свою сдачу не режет"
+
+    third = await _submitted_in(db, pid)
+    assert (await _any_dispatch_row(db, third))["profile"] == "lite"
