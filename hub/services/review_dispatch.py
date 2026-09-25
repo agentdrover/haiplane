@@ -2305,6 +2305,7 @@ async def prepare_review_order(
     force_profile: str,
     principal_id: int | None,
     force_model: str = "",
+    cloud: bool = False,
 ) -> ReviewOrder:
     """Собрать заказ: профиль по диффу, правила, предмет ревью, доступ.
 
@@ -2315,6 +2316,10 @@ async def prepare_review_order(
 
     ``force_model`` — модель второй оси каскада (#1243): её уже выбрал
     pick_cascade_model, и заказ не выбирает заново.
+
+    ``cloud`` — заказ облачного канала: только он тратит квоту провайдера и
+    только он подчиняется суточному потолку deep (#1414). Локальный
+    ревьюер квоту Cursor не тратит — решение владельца 25.09.
     """
     task_id = int(task["id"])
     model_id = force_model or pick_review_model(
@@ -2346,9 +2351,11 @@ async def prepare_review_order(
             ["профиль задан заказом: добор лестницы или его замена"],
         )
     else:
-        profile, profile_reasons = await apply_deep_daily_cap(
-            db, task, generation, *pick_review_profile(task, profile_diff)
-        )
+        profile, profile_reasons = pick_review_profile(task, profile_diff)
+        if cloud:
+            profile, profile_reasons = await apply_deep_daily_cap(
+                db, task, generation, profile, profile_reasons
+            )
     rules_block, rules_note = await collect_review_rules(db, task_id, diff)
     prior = await previous_findings(db, task_id, generation)
     diff_block, diff_note = diff_plan(
@@ -2711,6 +2718,7 @@ async def _prepare_claimed_order(
             force_profile=force_profile,
             principal_id=principal_id,
             force_model=force_model,
+            cloud=True,
         )
         # Последнее слово перед тратой. Подготовка заказа выше ходит в сеть
         # за диффом и правилами, и за это окно сдача могла смениться — ЛЮБОЙ

@@ -13303,3 +13303,48 @@ async def test_no_deep_cap_means_unchanged_behaviour(
         f"/api/projects/{pid}", json={"gate_policy": {"deep_daily_cap": 0}}
     )
     assert ok.status_code == 200, ok.text
+
+
+async def test_deep_cap_binds_only_the_cloud_channel(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1414, решение владельца 25.09: потолок — только облачный канал.
+
+    Локальный ревьюер квоту Cursor не тратит: при исчерпанном потолке он
+    получает deep, места не бронирует и в счёт не идёт. Облачная сдача с тем
+    же профилем в том же проекте — lite.
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ch"}, "run": {"id": "r-ch"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "")
+    pid = await _cap_project(
+        db, "deep-cap-channel", {"review": "dispatch", "deep_daily_cap": 1}
+    )
+    await repo.update_project(db, pid, forge="gitverse")
+    await db.commit()
+
+    local = [await _submitted_in(db, pid) for _ in range(2)]
+    await wait_for_local_runs()
+    await db.commit()
+    assert recorder.calls == [], "gitverse облаком не ревьюится"
+    for task_id in local:
+        row = await _any_dispatch_row(db, task_id)
+        assert (row["channel"], row["profile"]) == ("local", "deep"), row
+        assert all("потолок" not in n for n in await _dispatch_notes(db, task_id))
+    assert not (
+        await db.execute_fetchall(
+            "SELECT 1 FROM review_order_claims WHERE profile = ?",
+            (repo.DEEP_SEAT_CLAIM,),
+        )
+    ), "локальный заказ места под потолком не бронирует"
+
+    await repo.update_project(db, pid, forge="github")
+    await db.commit()
+    cloud = [await _submitted_in(db, pid) for _ in range(2)]
+    assert [
+        ((r := await _any_dispatch_row(db, t))["channel"], r["profile"]) for t in cloud
+    ] == [("cloud", "deep"), ("cloud", "lite")], "локальные deep в счёт не вошли"

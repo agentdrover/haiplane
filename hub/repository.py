@@ -3044,13 +3044,13 @@ DEEP_SEAT_CLAIM = "deep_cap_seat"
 
 # Оплаченный deep сегодня: строка с агентом (заглушка отказа #1242 ничего не
 # запускала), не отказ и не переданная второй двери (её место займёт строка
-# двери). Считается СДАЧА, а не строка: переспрос, вторая ось и вторая дверь
+# двери). Локальный канал квоту провайдера не тратит и в счёт не идёт. Считается СДАЧА, а не строка: переспрос, вторая ось и вторая дверь
 # той же сдачи второго места не занимают. Проект задачи — по её эпику
 # (resolve_project_for_task), поэтому фильтр по проекту делается в Python:
 # за сутки таких строк десятки.
 _DEEP_SEATS_SQL = (
     "SELECT task_id, submission_generation FROM review_dispatches "
-    "WHERE profile = 'deep' AND agent_id != '' "
+    "WHERE profile = 'deep' AND agent_id != '' AND channel != 'local' "
     "AND status NOT IN ('failed', 'second_door') "
     "AND created_at >= date('now') "
     "UNION "
