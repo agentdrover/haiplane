@@ -19,6 +19,7 @@ from hub import brand, commit_scope, config
 from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
 from hub.integrations import git_ops as git_ops_mod
+from hub.services.executor_dispatch import executor_run_metrics
 from hub.integrations.git_ops import (
     MERGE_UNCONFIRMED,
     WorkspaceBranchMismatchError,
@@ -941,8 +942,6 @@ async def practice_metrics(
     review_outcomes = await _review_outcome_metrics(db, since)
     review_dispatches = await _review_dispatch_spend_metrics(db, since)
     validation_run_lines = await _validation_run_line_metrics(db, since)
-    from hub.services.executor_dispatch import executor_run_metrics
-
     # #1238: повторяемость отказов среды. Считается тем же кодом, что решает,
     # является ли отдельный отчёт отказом среды, — двух ответов на один
     # вопрос здесь быть не должно. Окно берётся то же, что у остальных
