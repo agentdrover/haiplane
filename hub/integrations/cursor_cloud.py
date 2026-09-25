@@ -304,6 +304,37 @@ async def find_agent_by_name(name: str, pages: int = 3) -> Reconciliation:
     return Reconciliation("", "", True)
 
 
+#: Параметр модели в заказе: ``{"id": "fast", "value": "false"}`` (#1417).
+ModelParam = dict[str, str]
+
+
+def review_model_params() -> list[ModelParam]:
+    """Параметры модели для заказа ревьюера из CURSOR_REVIEW_MODEL_PARAMS.
+
+    Читается при каждом заказе, а не при импорте: настройка живёт в drop-in
+    службы, и тест подменяет её так же. Запись без ``=`` или с пустым именем
+    пропускается с предупреждением — послать провайдеру параметр, которого
+    владелец не называл, хуже, чем не послать никакого.
+    """
+    params: list[ModelParam] = []
+    for chunk in (config.CURSOR_REVIEW_MODEL_PARAMS or "").split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            log.warning("CURSOR_REVIEW_MODEL_PARAMS: skipped malformed %r", item)
+            continue
+        params.append({"id": key.strip(), "value": value.strip()})
+    return params
+
+
+def model_variant(model_id: str, params: list[ModelParam] | None) -> str:
+    """Модель с параметрами одной строкой: ``grok-4.6 fast=false`` (#1417)."""
+    tail = ",".join(f"{p['id']}={p['value']}" for p in params or [])
+    return f"{model_id} {tail}" if tail else model_id
+
+
 async def create_review_agent(
     *,
     repo_url: str,
@@ -313,6 +344,7 @@ async def create_review_agent(
     hub_mcp_url: str,
     reviewer_token: str,
     name: str = "",
+    model_params: list[ModelParam] | None = None,
 ) -> dict[str, Any] | None:
     """Queue a cloud agent that reviews ``starting_ref`` of ``repo_url``.
 
@@ -321,6 +353,9 @@ async def create_review_agent(
     (hub_get_review_brief / hub_submit_machine_review), not through git:
     ``autoCreatePR=false`` and ``workOnCurrentBranch=false`` keep any
     accidental commits on a throwaway cursor/ branch.
+
+    ``model_params=None`` — параметры ревьюера из настройки (#1417): по
+    умолчанию ``fast=false``, та же модель без наценки за скорость.
     """
     created, _ = await create_agent_attempt(
         repo_url=repo_url,
@@ -330,6 +365,7 @@ async def create_review_agent(
         hub_mcp_url=hub_mcp_url,
         reviewer_token=reviewer_token,
         name=name,
+        model_params=review_model_params() if model_params is None else model_params,
     )
     return created
 
@@ -343,6 +379,7 @@ async def create_agent_attempt(
     hub_mcp_url: str,
     reviewer_token: str,
     name: str = "",
+    model_params: list[ModelParam] | None = None,
 ) -> tuple[dict[str, Any] | None, Refusal | None]:
     """То же, что :func:`create_review_agent`, но с причиной отказа (#1182).
 
@@ -351,10 +388,18 @@ async def create_agent_attempt(
     здесь, а ``create_review_agent`` остаётся видом на неё: два способа
     собрать один и тот же запрос разошлись бы, и разошёлся бы тот, который
     реже читают.
+
+    ``model_params`` (#1417) уходят в ``model.params`` как есть; пусто или
+    ``None`` — голый ``model.id``, как до задачи. Умолчания тут нет
+    намеренно: судья стюарда зовёт этот же шов, и параметры ревьюера ему
+    не принадлежат.
     """
+    model: dict[str, Any] = {"id": model_id}
+    if model_params:
+        model["params"] = [dict(p) for p in model_params]
     body: dict[str, Any] = {
         "prompt": {"text": prompt_text},
-        "model": {"id": model_id},
+        "model": model,
         "repos": [{"url": repo_url, "startingRef": starting_ref}],
         "autoCreatePR": False,
         "workOnCurrentBranch": False,

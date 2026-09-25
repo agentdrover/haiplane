@@ -1290,14 +1290,16 @@ async def insert_machine_review(
     profile: str = "",
     self_reviewed: bool = False,
     principal_id: int | None = None,
+    carried_from_review_id: int | None = None,
 ) -> int:
     cur = await db.execute(
         "INSERT INTO machine_reviews (task_id, submission_generation, "
         "harness_skill, harness_version, agent_count, tokens_spent, "
         "duration_ms, orchestrator, model, raw_count, findings_confirmed, "
         "findings_rejected, submitted_by, incomplete, incomplete_reason, "
-        "unresolved, lost_dimensions, profile, self_reviewed, principal_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "unresolved, lost_dimensions, profile, self_reviewed, principal_id, "
+        "carried_from_review_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -1319,6 +1321,7 @@ async def insert_machine_review(
             profile,
             int(self_reviewed),
             principal_id,
+            carried_from_review_id,
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
@@ -1517,7 +1520,10 @@ async def list_machine_reviews(
         await fetchall(
             db,
             "SELECT id, submission_generation, profile, model, agent_count, "
-            "tokens_spent, provider_tokens, incomplete, created_at "
+            "tokens_spent, provider_tokens, incomplete, created_at, "
+            # #1361: a carried report is a row but NOT a run; the reader
+            # needs the mark to tell the two apart.
+            "carried_from_review_id "
             "FROM machine_reviews WHERE task_id=? ORDER BY id",
             (task_id,),
         )
@@ -1624,13 +1630,18 @@ async def list_judged_findings(db: aiosqlite.Connection) -> list[aiosqlite.Row]:
 #: The disposition is matched per FINDING, not per report. Subtracting one
 #: total from another (what ``confirmed_unjudged`` did before) treats a
 #: judgement on a stale report as an answer about a live one.
+#:
+#: #1361: a CARRIED report is the same reading on the same author edit, so a
+#: judgement made on its source still answers it. Without this every carry
+#: would put already-judged findings back in front of a person.
 _UNJUDGED_FINDINGS_FROM = (
     "FROM machine_reviews mr "
     "JOIN tasks t ON t.id = mr.task_id "
     "AND t.submission_generation = mr.submission_generation "
     "JOIN json_each(mr.findings_confirmed) f "
     "LEFT JOIN finding_dispositions d "
-    "ON d.review_id = mr.id AND d.finding_index = f.key "
+    "ON d.review_id IN (mr.id, mr.carried_from_review_id) "
+    "AND d.finding_index = f.key "
     "WHERE d.id IS NULL"
 )
 

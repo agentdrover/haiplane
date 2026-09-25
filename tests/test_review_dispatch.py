@@ -82,6 +82,12 @@ class _PinnedGitOps(NoopGitOps):
         self._rules = rules or {}
 
     async def branch_diff(self, repo, base, branch):
+        if branch != self._tip and re.fullmatch(r"[0-9a-f]{40}", branch or ""):
+            # #1361: a pinned commit other than the tip is ANOTHER submission,
+            # and by default another author edit — every fixture here models
+            # resubmissions as new code. One diff for every sha would read as
+            # "only the base was merged" and carry the report over.
+            return self._diff + f"+{branch}\n"
         return self._diff
 
     async def file_at_ref(self, repo, ref, path):
@@ -1772,7 +1778,7 @@ class _AncestryGitOps(_PinnedGitOps):
         # the ordinary branch diff.
         if base == _PREV_SHA:
             return self._delta
-        return self._diff
+        return await super().branch_diff(repo, base, branch)
 
     async def delta_without_base(self, repo, base, prev, current):
         return self._own
@@ -1815,9 +1821,18 @@ async def _second_generation(
     ancestor: bool | None = True,
     base_branch: str = "develop",
     record_previous: bool = True,
+    reviewed: bool = True,
 ) -> int:
-    """A task on its SECOND submission, with the first one in the ledger."""
+    """A task on its SECOND submission, with the first one in the ledger.
+
+    ``reviewed`` records a report on generation 1: since #1400 the delta is
+    taken only from a generation somebody's review actually covered.
+    """
     task_id = await _submitted(client, db, slug)
+    if reviewed:
+        await repo.insert_machine_review(
+            db, task_id=task_id, submission_generation=1, incomplete=False
+        )
     if record_previous:
         # submit_for_review already wrote this row; the upsert pins the sha and
         # base the test wants to reason about.
@@ -1955,6 +1970,215 @@ async def test_unreadable_ancestry_reads_everything(
     prompt = recorder.calls[-1]["prompt_text"]
     assert "историю проверить не удалось" in prompt
     assert "прочитана ДЕЛЬТА" not in prompt
+
+
+# --- The delta starts where a recorded review ended (#1400) ------------------
+#
+# #1378, 25.09: generation 2 carried the fixes and got a deep run whose report
+# was discarded (#1260) because generation 3 — a test tweak — arrived three
+# minutes later. Generation 3 was reviewed as "delta to #2", so the fixes of
+# generation 2 were read by nobody, and the clean report of generation 3 made
+# the task look ready. The doubles below are that shape: gen2 touches a
+# process-surface file, gen3 only a test.
+_GEN2_SHA = "d" * 40
+_GEN2_FILE = "hub/services/fs.py"
+_GEN3_FILE = "tests/test_fs.py"
+_GEN2_PART = f"+++ b/{_GEN2_FILE}\n+        workspace_path = project.workspace_path\n"
+_GEN3_PART = f"+++ b/{_GEN3_FILE}\n+правка теста\n"
+
+
+class _ThreeGenerationsGitOps(_AncestryGitOps):
+    """Git whose answers depend on WHICH generation the delta starts from."""
+
+    def _since(self, base: str) -> str | None:
+        if base == _PREV_SHA:
+            return _GEN2_PART + _GEN3_PART
+        if base == _GEN2_SHA:
+            return _GEN3_PART
+        return None
+
+    async def branch_diff(self, repo, base, branch):
+        since = self._since(base)
+        if since is not None:
+            return since
+        # #1418: the whole-branch diff goes through _PinnedGitOps, which gives
+        # every pinned sha other than the tip its OWN author edit. Returning
+        # self._diff for any sha read gen3 as "only the base was merged", and
+        # #1361 carried the report over instead of ordering a review.
+        return await _PinnedGitOps.branch_diff(self, repo, base, branch)
+
+    async def delta_without_base(self, repo, base, prev, current):
+        return self._since(prev)
+
+
+async def _third_generation(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    slug: str,
+    *,
+    reviewed: tuple[int, ...],
+    uncounted: dict[int, dict] | None = None,
+) -> int:
+    """A task on its THIRD submission; ``reviewed`` names generations with a report.
+
+    ``uncounted`` adds reports that exist but do not count as reading the
+    code (#1400, finding 452b39e570a0620b): generation -> extra columns.
+    """
+    task_id = await _second_generation(client, db, slug, reviewed=False)
+    for generation, extra in (uncounted or {}).items():
+        await repo.insert_machine_review(
+            db, task_id=task_id, submission_generation=generation, **extra
+        )
+    await repo.record_submission(
+        db, task_id=task_id, generation=2, sha=_GEN2_SHA, base_branch="develop"
+    )
+    for generation in reviewed:
+        await repo.insert_machine_review(
+            db,
+            task_id=task_id,
+            submission_generation=generation,
+            findings_confirmed=json.dumps(
+                [{"title": f"finding of gen{generation}", "file": _GEN2_FILE}]
+            ),
+            incomplete=False,
+        )
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 3 WHERE id = ?", (task_id,)
+    )
+    await db.commit()
+    return task_id
+
+
+async def _subject_card(client: AsyncClient, task_id: int) -> str:
+    data = (await client.get(f"/api/tasks/{task_id}")).json()
+    cards = [
+        u["content"] for u in data["updates"] or [] if "Предмет ревью" in u["content"]
+    ]
+    assert cards, "the dispatch card must state the subject"
+    return cards[-1]
+
+
+async def test_delta_base_skips_generation_without_recorded_review(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1400): gen2 has no recorded report, so the delta of gen3 starts
+    # at gen1 — the last generation a review actually covered — and carries
+    # gen2's fixes. The card names the base and why it skipped a generation,
+    # and the profile is bought for the WIDENED delta: gen2's process surface
+    # buys deep even though gen3 alone is a test tweak.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-g1"}, "run": {"id": "r-g1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _third_generation(client, db, "spike-skip-gen2", reviewed=(1,))
+    plugins.git_ops = _ThreeGenerationsGitOps(_TIP, ["docs/notes.md"])
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert f"'{_GEN2_FILE}'" in prompt, "gen2's fixes are in the subject"
+    assert f"'{_GEN3_FILE}'" in prompt
+    assert "прочитана ДЕЛЬТА" in prompt
+    card = await _subject_card(client, task_id)
+    assert "дельта к поколению #1" in card, card
+    assert "отчёт по #2 не записан" in card, card
+    assert "finding of gen1" in prompt, "the base review's findings travel along"
+    assert (await _dispatch_row(db, task_id))["profile"] == "deep", (
+        "the profile is judged on the widened delta, not on gen3 alone"
+    )
+
+
+async def test_delta_without_any_recorded_review_reads_whole_diff(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1400): no earlier generation has a recorded report, so there is
+    # no point a delta could honestly start from — the whole diff, named.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-g2"}, "run": {"id": "r-g2"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _third_generation(client, db, "spike-no-review", reviewed=())
+    plugins.git_ops = _ThreeGenerationsGitOps(_TIP, ["docs/notes.md"])
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert "прочитан ВЕСЬ дифф" in prompt
+    assert "прочитана ДЕЛЬТА" not in prompt
+    card = await _subject_card(client, task_id)
+    assert "ни по одному прежнему поколению" in card and "не записан" in card, card
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"incomplete": True}, {"incomplete": False, "self_reviewed": True}],
+    ids=["incomplete", "self_reviewed"],
+)
+async def test_an_uncounted_report_is_not_a_delta_base(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, extra
+):
+    # #1400, finding 452b39e570a0620b: gen2's only report is incomplete, or
+    # the author's own. Neither is reading the code — the same rule as the
+    # second-read guard (CODE_READ) — so the delta still starts at gen1,
+    # carries gen2's files and gen1's findings, and the card says why.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-g4"}, "run": {"id": "r-g4"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _third_generation(
+        client, db, "spike-uncounted", reviewed=(1,), uncounted={2: extra}
+    )
+    plugins.git_ops = _ThreeGenerationsGitOps(_TIP, ["docs/notes.md"])
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert f"'{_GEN2_FILE}'" in prompt, "gen2's unread fixes stay in the subject"
+    assert "finding of gen1" in prompt, "findings come from the base that was read"
+    card = await _subject_card(client, task_id)
+    assert "дельта к поколению #1" in card, card
+    assert "отчёт по #2 неполный или самоотчёт" in card, card
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"incomplete": True}, {"incomplete": False, "self_reviewed": True}],
+    ids=["incomplete", "self_reviewed"],
+)
+async def test_only_uncounted_reports_read_the_whole_diff(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, extra
+):
+    # #1400: when every earlier report is incomplete or self-written, no
+    # generation was read — the whole diff, not a delta to one of them.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-g5"}, "run": {"id": "r-g5"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _third_generation(
+        client, db, "spike-only-uncounted", reviewed=(), uncounted={1: extra, 2: extra}
+    )
+    plugins.git_ops = _ThreeGenerationsGitOps(_TIP, ["docs/notes.md"])
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert "прочитан ВЕСЬ дифф" in prompt
+    assert "прочитана ДЕЛЬТА" not in prompt
+
+
+async def test_delta_base_is_previous_generation_when_its_review_is_recorded(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#1400): when gen2's report IS recorded nothing changes — the delta
+    # is to gen2, narrow, with no skip named, and gen3's test tweak stays lite.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-g3"}, "run": {"id": "r-g3"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _third_generation(
+        client, db, "spike-gen2-reviewed", reviewed=(1, 2)
+    )
+    plugins.git_ops = _ThreeGenerationsGitOps(_TIP, ["docs/notes.md"])
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert f"'{_GEN3_FILE}'" in prompt
+    assert f"'{_GEN2_FILE}'" not in prompt, "gen2 was reviewed, its files stay out"
+    card = await _subject_card(client, task_id)
+    assert "дельта к поколению #2" in card, card
+    assert "не записан" not in card, card
+    assert (await _dispatch_row(db, task_id))["profile"] == "lite"
 
 
 # --- The delta is split by AUTHORSHIP, not trimmed (#1249) -------------------
@@ -3125,11 +3349,202 @@ async def test_a_real_resubmission_still_gets_reviewed(
     assert len(recorder.calls) == 3
     await _report_on_current(db, moved)
     await db.commit()
-    plugins.git_ops = _PinnedGitOps("b" * 40, ["docs/notes.md"])
+    # #1361: новая вершина с НОВОЙ авторской строкой. Двойник, отдающий один
+    # дифф на любую вершину, здесь больше не годится: такая пересдача теперь
+    # честно читается как «слита только база».
+    plugins.git_ops = _ShaDiffGitOps(
+        "b" * 40,
+        {_TIP: _HARMLESS_DIFF, "b" * 40: _HARMLESS_DIFF + "+новая строка\n"},
+    )
     await services.submit_for_review(
         db, moved, TaskSubmitReview(model="claude-fable-5")
     )
     assert len(recorder.calls) == 4, "новый sha — новая работа, ревью заказывается"
+
+
+# ---------------------------------------------------------------------------
+# #1361 — пересдача «только слита база» не покупает второго ревью
+# ---------------------------------------------------------------------------
+
+
+class _ShaDiffGitOps(_PinnedGitOps):
+    """Дифф ветки к базе — свой у каждой вершины; имя ветки — текущая вершина."""
+
+    def __init__(self, tip: str, diffs: dict[str, str]) -> None:
+        super().__init__(tip, ["docs/notes.md"], diffs[tip])
+        self._diffs = diffs
+
+    async def branch_diff(self, repo, base, branch):
+        return self._diffs.get(branch, self._diffs[self._tip])
+
+
+# Та же правка автора, что и в _MERGE_OLD, после слияния базы в тот же файл:
+# другие строка index и смещение ханка, строки +/- те же и в том же порядке.
+_MERGE_OLD = (
+    "diff --git a/docs/notes.md b/docs/notes.md\n"
+    "index 1111111..2222222 100644\n"
+    "--- a/docs/notes.md\n"
+    "+++ b/docs/notes.md\n"
+    "@@ -3,0 +4,2 @@ intro\n"
+    "+первая авторская строка\n"
+    "+вторая авторская строка\n"
+)
+_MERGE_NEW = _MERGE_OLD.replace("1111111..2222222", "3333333..4444444").replace(
+    "@@ -3,0 +4,2 @@", "@@ -5,0 +6,2 @@"
+)
+
+
+async def test_a_merge_only_resubmission_carries_the_report_over(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1361): слита только база — отчёт переносится, провайдер не зван.
+
+    Измерено 23.09.2026: #1333 сдача 3 — только слияние develop, заказано
+    deep-ревью, ~4,7 млн токенов, отчёт чистый. Здесь вершина новая, дифф к
+    базе побайтно другой, а правка автора та же — и ревью не покупается: в
+    новом поколении лежит перенесённый отчёт с пометкой, откуда он.
+
+    Обратная сторона в том же тесте: новая авторская строка — ревью
+    заказывается как раньше.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-merge-only", diff=_MERGE_OLD)
+    assert len(recorder.calls) == 1, "первая сдача ревью получает"
+    review_id = await _report_on_current(db, task_id)
+    await db.commit()
+
+    plugins.git_ops = _ShaDiffGitOps("b" * 40, {_TIP: _MERGE_OLD, "b" * 40: _MERGE_NEW})
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+
+    assert len(recorder.calls) == 1, "слияние базы не покупает второго ревью"
+    rows = await db.execute_fetchall(
+        "SELECT id FROM review_dispatches WHERE task_id=?", (task_id,)
+    )
+    assert len(rows) == 1, "заказа не появляется: заказ и есть оплата"
+    task = dict(await repo.get_task(db, task_id))
+    carried = [
+        dict(r)
+        for r in await repo.machine_reviews_of_generation(
+            db, task_id, int(task["submission_generation"])
+        )
+    ]
+    assert len(carried) == 1, "в новом поколении лежит перенесённый отчёт"
+    assert carried[0]["carried_from_review_id"] == review_id, (
+        "перенесённый отчёт помечен как перенесённый и называет источник"
+    )
+    assert not carried[0]["provider_tokens"] and not carried[0]["tokens_spent"], (
+        "перенос не выдаётся за новое чтение: денег он не стоил"
+    )
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert any("перенесён с поколения 1" in c for c in updates), updates
+
+    # Новая авторская строка — это новая работа, ревью заказывается.
+    plugins.git_ops = _ShaDiffGitOps(
+        "d" * 40,
+        {
+            _TIP: _MERGE_OLD,
+            "b" * 40: _MERGE_NEW,
+            "d" * 40: _MERGE_NEW + "+строка, которой ревью не видело\n",
+        },
+    )
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+    assert len(recorder.calls) == 2, "новая авторская строка покупает ревью"
+
+
+async def test_a_carried_report_is_not_a_new_read_in_the_metrics(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Перенос не считается новым чтением в метриках практики (#1361).
+
+    Чек-лист постановки: перенесённый отчёт помечен и в числе прочитанных
+    отчётов не появляется — иначе экономия выглядела бы как лишний прогон.
+    """
+    from hub.services.orchestration import practice_metrics
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-merge-metrics", diff=_MERGE_OLD)
+    await _report_on_current(db, task_id)
+    await db.commit()
+    before = (await practice_metrics(db))["machine_reviews"]
+
+    plugins.git_ops = _ShaDiffGitOps("b" * 40, {_TIP: _MERGE_OLD, "b" * 40: _MERGE_NEW})
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+    after = (await practice_metrics(db))["machine_reviews"]
+
+    assert after["reports_total"] == before["reports_total"]
+    assert after["reviews"] == before["reviews"]
+    assert after["carried_over"] == before["carried_over"] + 1, (
+        "перенос виден отдельным счётом, а не прячется и не выдаётся за чтение"
+    )
+
+
+async def test_a_carried_report_stands_for_the_current_generation(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Перенесённый отчёт — отчёт ТЕКУЩЕГО поколения, с суждениями источника.
+
+    Без этого перенос кончался бы тупиком: гейт сказал бы «machine-review
+    устарел», а очередь находок снова показала бы человеку то, что он уже
+    разметил на исходном отчёте.
+    """
+    from hub.services.orchestration import machine_review_gap
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-merge-queue", diff=_MERGE_OLD)
+    source = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        harness_skill="lite-diff-review",
+        model="grok-4.6",
+        raw_count=1,
+        findings_confirmed=json.dumps(
+            [{"title": "race on retry", "severity": "high", "file": "hub/a.py"}]
+        ),
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await repo.upsert_finding_disposition(
+        db,
+        review_id=source,
+        task_id=task_id,
+        submission_generation=1,
+        finding_index=0,
+        finding_title="race on retry",
+        disposition="wont_fix",
+        note="принято осознанно",
+        decided_by="owner",
+        finding_uid="",
+    )
+    await db.commit()
+    assert (await repo.count_unjudged_findings(db))["findings"] == 0
+
+    plugins.git_ops = _ShaDiffGitOps("b" * 40, {_TIP: _MERGE_OLD, "b" * 40: _MERGE_NEW})
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+    task = dict(await repo.get_task(db, task_id))
+    current = await repo.machine_reviews_of_generation(
+        db, task_id, int(task["submission_generation"])
+    )
+    assert [dict(r)["carried_from_review_id"] for r in current] == [source]
+    assert "race on retry" in dict(current[0])["findings_confirmed"], (
+        "находки переносятся вместе с отчётом, а не теряются"
+    )
+    assert await machine_review_gap(db, task) is None, (
+        "перенесённый отчёт закрывает требование отчёта текущего поколения"
+    )
+    assert (await repo.count_unjudged_findings(db))["findings"] == 0, (
+        "суждение по исходному отчёту отвечает и за перенесённый"
+    )
 
 
 async def test_a_submission_without_a_pinned_sha_is_not_a_match(
@@ -4597,6 +5012,104 @@ async def test_a_real_refusal_is_neither_reconciled_nor_retried(
     assert "не принял запрос (бета" not in alerts, (
         "прежний текст утверждал причину, которой не было"
     )
+
+
+class _ParamsRefusingProvider:
+    """Провайдер, отвергающий заказ с params 400-м, а голый — по сценарию."""
+
+    def __init__(self, bare_refusal=None):
+        self.bare_refusal = bare_refusal
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("model_params"):
+            return None, cursor_cloud.Refusal(
+                status=400, code="invalid_argument", detail="Unknown param fast"
+            )
+        if self.bare_refusal is not None:
+            return None, self.bare_refusal
+        return {"agent": {"id": "bc-bare"}, "run": {"id": "run-bare"}}, None
+
+
+async def _alerts(db: aiosqlite.Connection, task_id: int) -> str:
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    return " ".join(dict(r)["content"] for r in rows)
+
+
+async def test_rejected_model_params_fall_back_once_and_alert(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1417 AC-3: 400 на заказ с params — один повтор без них, и alert.
+
+    Параметр fast=false может не поддерживаться моделью или называться
+    иначе. Ревью от этого пропасть не должно: повтор без params проходит,
+    причина названа в карточке, а оплачен ровно один прогон.
+    """
+    provider = _ParamsRefusingProvider()
+    _wire(monkeypatch, _DispatchRecorder(None))
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", provider)
+    monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL_PARAMS", "fast=false")
+
+    task_id = await _submitted(client, db, "spike-params-refused")
+
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["model_params"] == [{"id": "fast", "value": "false"}]
+    assert not provider.calls[1]["model_params"]
+    assert provider.calls[0]["name"] == provider.calls[1]["name"]
+    active = await repo.list_active_review_dispatches(db)
+    assert len(active) == 1, "заказано ровно один раз"
+    assert dict(active[0])["agent_id"] == "bc-bare"
+    assert dict(active[0])["model"] == "grok-4.6", "семейство (#758) — по id"
+    alerts = await _alerts(db, task_id)
+    assert "fast=false" in alerts and "HTTP 400" in alerts
+    assert "invalid_argument" in alerts
+
+
+async def test_a_bare_retry_refused_too_is_not_blamed_on_params(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1417: если голый заказ тоже отвергнут — причина не в параметрах.
+
+    Повтор ровно один, и alert о параметрах не пишется: он назвал бы чужую
+    причину. Карточка получает обычный отказ провайдера.
+    """
+    provider = _ParamsRefusingProvider(bare_refusal=_REAL_REFUSAL)
+    _wire(monkeypatch, _DispatchRecorder(None))
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", provider)
+    monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL_PARAMS", "fast=false")
+
+    task_id = await _submitted(client, db, "spike-params-bare-refused")
+
+    assert len(provider.calls) == 2
+    assert not await repo.list_active_review_dispatches(db)
+    alerts = await _alerts(db, task_id)
+    assert "провайдер отказал: HTTP 400, invalid_model" in alerts
+    assert "fast=false" not in alerts
+
+
+async def test_the_dispatched_notice_names_the_variant(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1417: запись «ревью вызвано» называет фактический вариант модели."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL_PARAMS", "fast=false")
+
+    task_id = await _submitted(client, db, "spike-variant-named")
+
+    assert recorder.calls[0]["model_params"] == [{"id": "fast", "value": "false"}]
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='status' "
+        "AND content LIKE 'Кросс-модельное ревью вызвано%'",
+        (task_id,),
+    )
+    assert rows
+    assert "модель grok-4.6 fast=false " in dict(rows[-1])["content"]
+    assert "Повтор без параметров" not in await _alerts(db, task_id)
 
 
 async def test_an_unreadable_reconciliation_never_guesses(

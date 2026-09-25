@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import functools
 import json
 import logging
@@ -211,14 +212,26 @@ def machine_review_required(task: dict[str, Any], project_policy: str = "auto") 
 # The condition is written ONCE. Both the gate below and the two metric
 # aggregates use this fragment; a copy would drift, and the whole point is
 # that the gate and the number agree on what a review is.
+#
+# #1361: a CARRIED report (``carried_from_review_id``) is evidence by
+# construction — it is only ever made from a report that passed this very
+# check — while its own tokens are deliberately empty: the carry cost nothing.
 REPORT_HAS_EVIDENCE_SQL = (
     "(raw_count > 0 "
     "OR json_array_length(findings_confirmed) > 0 "
     "OR json_array_length(findings_rejected) > 0 "
     "OR COALESCE(tokens_spent, 0) > 0 "
     "OR COALESCE(provider_tokens, 0) > 0 "
-    "OR COALESCE(agent_count, 0) > 1)"
+    "OR COALESCE(agent_count, 0) > 1 "
+    "OR carried_from_review_id IS NOT NULL)"
 )
+
+#: #1361: a report READ for this submission, not carried over from an earlier
+#: one. Every metric that counts reads, findings or reviewer models filters on
+#: it: a carry is the absence of a read, and counting it would make the saving
+#: look like one more run. Unqualified on purpose — no other table joined to
+#: machine_reviews has this column.
+ORIGINAL_READ_SQL = "carried_from_review_id IS NULL"
 
 
 def report_has_evidence(review: Any) -> bool:
@@ -257,6 +270,7 @@ def report_has_evidence(review: Any) -> bool:
         or (col("tokens_spent") or 0) > 0
         or (col("provider_tokens") or 0) > 0
         or (col("agent_count") or 0) > 1
+        or col("carried_from_review_id") is not None
     )
 
 
@@ -404,6 +418,7 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
         "LEFT JOIN (SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
         "GROUP BY review_id) AS judged ON judged.review_id = mr.id "
         f"WHERE mr.created_at >= datetime('now', ?) AND {REPORT_HAS_EVIDENCE_SQL} "
+        f"AND {ORIGINAL_READ_SQL} "
         "AND json_array_length(mr.findings_confirmed) > 0",
         (since,),
     )
@@ -494,8 +509,8 @@ async def recurring_categories(
         db,
         "SELECT COALESCE(json_extract(f.value, '$.category'), '') AS category, "
         "COUNT(*) AS findings, COUNT(DISTINCT mr.task_id) AS tasks "
-        "FROM machine_reviews mr, json_each(mr.findings_confirmed) f "
-        "WHERE mr.created_at >= datetime('now', ?) "
+        "FROM machine_reviews mr, json_each(mr.findings_confirmed) f "  # nosec B608 - constant fragment
+        f"WHERE mr.created_at >= datetime('now', ?) AND {ORIGINAL_READ_SQL} "
         "GROUP BY category HAVING category != '' "
         "ORDER BY findings DESC LIMIT 50",
         (since,),
@@ -615,6 +630,21 @@ async def _steward_shadow_metrics(db: aiosqlite.Connection) -> dict[str, Any]:
 PRACTICE_METRICS_DEFAULT_DAYS = 90
 
 
+async def _carried_over_count(db: aiosqlite.Connection, since: str) -> int:
+    """Reports carried over a base-only merge in the window (#1361).
+
+    Counted BESIDE the reads, never inside them: the saving stays visible
+    without passing for a run.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM machine_reviews "  # nosec B608 - constant fragment
+        f"WHERE created_at >= datetime('now', ?) AND NOT ({ORIGINAL_READ_SQL})",
+        (since,),
+    )
+    return int(dict(rows[0])["n"] or 0) if rows else 0
+
+
 async def practice_metrics(
     db: aiosqlite.Connection, *, since_days: int = PRACTICE_METRICS_DEFAULT_DAYS
 ) -> dict[str, Any]:
@@ -686,10 +716,12 @@ async def practice_metrics(
         "COALESCE(SUM(CASE WHEN provider_tokens IS NOT NULL "
         "THEN json_array_length(findings_confirmed) ELSE 0 END), 0) "
         "AS confirmed_with_provider "
-        "FROM machine_reviews WHERE created_at >= datetime('now', ?)",
+        "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        f"AND {ORIGINAL_READ_SQL}",
         (since,),
     )
     totals = dict(totals_rows[0])
+    totals["carried_over"] = await _carried_over_count(db, since)
     confirmed = totals["confirmed_total"] or 0
     raw = totals["raw_total"] or 0
     # Cost per finding has to take its numerator and denominator from the same
@@ -757,6 +789,7 @@ async def practice_metrics(
         "AS billed_runs, "
         "SUM(CASE WHEN incomplete = 1 THEN 1 ELSE 0 END) AS incomplete_runs "
         "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        f"AND {ORIGINAL_READ_SQL} "
         "GROUP BY profile ORDER BY reviews DESC",
         (since,),
     )
@@ -771,6 +804,7 @@ async def practice_metrics(
         "COALESCE(SUM(json_array_length(findings_confirmed)), 0) AS confirmed_total, "
         "COALESCE(SUM(tokens_spent), 0) AS tokens_total "
         "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        f"AND {ORIGINAL_READ_SQL} "
         "GROUP BY harness_skill, harness_version "
         "ORDER BY harness_skill, harness_version",
         (since,),
@@ -1273,8 +1307,8 @@ async def _model_declaration_metrics(
     rows = await fetchall(
         db,
         "SELECT mr.model AS reviewer_model, t.submission_model AS implementer_model "
-        "FROM machine_reviews mr JOIN tasks t ON t.id = mr.task_id "
-        "WHERE mr.created_at >= datetime('now', ?)",
+        "FROM machine_reviews mr JOIN tasks t ON t.id = mr.task_id "  # nosec B608 - constant fragment
+        f"WHERE mr.created_at >= datetime('now', ?) AND {ORIGINAL_READ_SQL}",
         (since,),
     )
 
@@ -3008,9 +3042,10 @@ async def _approved_code_check(
     if current_tip != pinned:
         # #1233: вершина сдвинулась — но ЧЕМ? Если в ветку приехала только база,
         # авторская работа та же, и второй человеческий вердикт за неё — плата
-        # за механику, а не за содержание. Признак механический: дифф ветки к
-        # базе до и после мержа. Проверка стоит два чтения диффа и делается
-        # только здесь, на уже разошедшейся вершине.
+        # за механику, а не за содержание. Признак механический: авторская
+        # правка в диффе ветки к базе до и после мержа (#1361 — по смыслу, не
+        # побайтно). Проверка стоит два чтения диффа и делается только здесь,
+        # на уже разошедшейся вершине.
         kept, why = await base_merge_kept_the_verdict(db, task, pinned, current_tip)
         if kept:
             return "", (
@@ -3036,16 +3071,15 @@ async def base_merge_kept_the_verdict(
     сохранение вердикта без сказанного вслух основания ничем не отличается от
     доверия.
 
-    Сравниваются два диффа ветки к базе: одобренной вершины и текущей. Совпали
-    байт в байт — привезена только база. Это НАБЛЮДЕНИЕ, а не разбор сообщения
-    коммита: «merge develop» в заголовке пишется рукой и ничего не доказывает.
+    Сравниваются два диффа ветки к базе: одобренной вершины и текущей, одним
+    правилом ``base_merge.author_edit_same`` — упорядоченные строки +/- по
+    файлам, без ``index``, заголовков ханков и контекста (#1361). Это
+    НАБЛЮДЕНИЕ, а не разбор сообщения коммита: «merge develop» в заголовке
+    пишется рукой и ничего не доказывает.
 
-    Известная узость, и она в безопасную сторону: если база тронула тот же файл,
-    что и автор, дифф перестаёт совпадать (другой блоб базы — другая строка
-    ``index``, вставка базы — другие смещения ханков), и вердикт слетает, то
-    есть ровно сегодняшнее поведение. Наблюдено на настоящем git в
-    tests/test_delivery_gate.py. Обратной ошибки — сохранить вердикт там, где
-    автор правил, — такое сравнение не допускает, и это здесь важнее полноты.
+    Тем же чтением пользуется заказ ревью на пересдаче (review_dispatch,
+    #1361): «правка та же» у гейта и у ревью — один ответ, а не два.
+    ``pinned`` и ``current_tip`` — любые две вершины одной ветки.
     """
     branch = (task.get("branch") or "").strip()
     if not branch:
@@ -3061,7 +3095,7 @@ async def base_merge_kept_the_verdict(
     except Exception as exc:  # noqa: BLE001 - деградация, а не отказ гейта
         log.warning("base-merge check failed for #%s: %s", task["id"], exc)
         return False, f"сверка диффа к базе не состоялась: {exc}"
-    return base_merge.author_diff_unchanged(before, after)
+    return base_merge.author_edit_same(before, after)
 
 
 def _seconds_since_ci_start(iso_ts: str | None) -> float | None:
@@ -3488,6 +3522,15 @@ MERGE_REFUSAL_UNVERIFIED_PREFIX = "merge_refusal_unverified"
 # задачи нет. Терминальный: доставку сделал не гейт, и молча записать её как
 # свою значило бы ослепить drift-guard (#534).
 MERGED_OUTSIDE_GATE_PREFIX = "merged_outside_gate"
+# #1407: соседний путь гейта ещё ждёт ответа форжа по этому PR дольше
+# GATE_MERGE_WAIT_SECONDS. Истёкшее ожидание — не «мержа нет»: второй вызов
+# форжа, пока первый жив, — та же гонка #1376/#1398. Ждём следующего цикла.
+GATE_MERGE_IN_FLIGHT_PREFIX = "gate_merge_in_flight"
+# #1407: PR MERGED, строки pipeline_merges нет, а merge-коммит прочитать не
+# вышло (исключение чтения, пустой sha). Это «проверить не удалось», а не
+# «гейт не вливал» (#516/#549): терминальный MERGED_OUTSIDE_GATE здесь был бы
+# выводом из отсутствия данных. Следующий цикл перечитает.
+MERGE_COMMIT_UNVERIFIED_PREFIX = "merge_commit_unverified"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",
@@ -3505,6 +3548,8 @@ TRANSIENT_GATE_PREFIXES = (
     # нечего. Лечится следующим циклом, а не решением.
     MERGE_UNCONFIRMED,
     MERGE_REFUSAL_UNVERIFIED_PREFIX,
+    GATE_MERGE_IN_FLIGHT_PREFIX,
+    MERGE_COMMIT_UNVERIFIED_PREFIX,
 )
 STACKED_BASE_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: хаб доставит "
@@ -3529,6 +3574,21 @@ MERGE_REFUSAL_UNVERIFIED_WAIT_HINT = (
     "мерже, а прочитать PR после отказа не удалось — возможно, его уже влил "
     "соседний путь гейта. Хаб перечитает PR следующим циклом. Пересдавать НЕ "
     "нужно — новых коммитов нет, пересдача сбросит вердикт (#612)."
+)
+# #1407: мерж гейта по этому PR уже идёт в этом процессе — форж отвечает
+# медленно. Второго вызова не будет; следующий цикл увидит его исход.
+GATE_MERGE_IN_FLIGHT_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: соседний путь "
+    "гейта уже вливает этот PR, а форж ещё не ответил. Второй мерж не "
+    "запускается — хаб увидит исход следующим циклом. Пересдавать НЕ нужно — "
+    "новых коммитов нет, пересдача сбросит вердикт (#612)."
+)
+# #1407: PR влит, но чей это мерж — проверить не удалось.
+MERGE_COMMIT_UNVERIFIED_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: PR уже влит, но "
+    "прочитать его merge-коммит и сверить с реестром гейта не удалось. Хаб "
+    "проверит следующим циклом, гейт ли это влил. Пересдавать НЕ нужно — "
+    "новых коммитов нет, пересдача сбросит вердикт (#612)."
 )
 BASE_AUTOMERGE_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: гейт сам слил "
@@ -3856,20 +3916,35 @@ _gate_merges: dict[tuple[int, int], asyncio.Future[bool]] = {}
 GATE_MERGE_WAIT_SECONDS = 60.0
 
 
-async def _gate_merge_outcome(key: tuple[int, int]) -> bool:
+class GateMergeSeen(enum.Enum):
+    """Что память ``_gate_merges`` знает о мерже гейта (#1398, #1407).
+
+    Три состояния, а не bool: истёкшее ожидание идущего мержа — не «мержа
+    нет». Прочитай его как «нет», и вызывающий зовёт форж второй раз, пока
+    первый вызов ещё жив (#1407).
+    """
+
+    MERGED = "merged"
+    ABSENT = "absent"
+    IN_FLIGHT = "in_flight"
+
+
+async def _gate_merge_outcome(key: tuple[int, int]) -> GateMergeSeen:
     """Влил ли гейт этот PR в этом процессе — дождавшись идущего мержа (#1398).
 
-    False — «гейт в этом процессе его не вливал» (или не дождались): решает
-    вызывающий, как решал бы без этой памяти.
+    ABSENT — «гейт в этом процессе его не вливал»: решает вызывающий, как
+    решал бы без этой памяти. IN_FLIGHT — мерж идёт дольше
+    GATE_MERGE_WAIT_SECONDS; второй вызов форжа сейчас запрещён (#1407).
     """
     fut = _gate_merges.get(key)
     if fut is None:
-        return False
+        return GateMergeSeen.ABSENT
     try:
-        return await asyncio.wait_for(asyncio.shield(fut), GATE_MERGE_WAIT_SECONDS)
+        merged = await asyncio.wait_for(asyncio.shield(fut), GATE_MERGE_WAIT_SECONDS)
     except TimeoutError:
         log.warning("gate merge of %s did not answer in time", key)
-        return False
+        return GateMergeSeen.IN_FLIGHT
+    return GateMergeSeen.MERGED if merged else GateMergeSeen.ABSENT
 
 
 async def _registered_gate_merge(
@@ -3913,8 +3988,18 @@ async def _gate_merge_step(
     у зелёной доставки нет причины за них платить.
     """
     key = (int(task["id"]), int(task["pr_number"]))
-    if await _gate_merge_outcome(key):
+    seen = await _gate_merge_outcome(key)
+    if seen is GateMergeSeen.MERGED:
         return (True, "already delivered"), ""
+    if seen is GateMergeSeen.IN_FLIGHT:
+        # #1407: ожидание истекло, а первый вызов форжа жив. Второй вызов
+        # перезаписал бы его Future и получил бы отказ по уже влитому PR.
+        return (
+            False,
+            f"{GATE_MERGE_IN_FLIGHT_PREFIX}: мерж гейта ещё идёт — PR "
+            f"#{key[1]} вливает соседний путь гейта, форж не ответил за "
+            f"{GATE_MERGE_WAIT_SECONDS:g} с; второй мерж не запускается",
+        ), ""
     merged, merge_detail = await _registered_gate_merge(key, task, ctx)
     if not merged:
         return await _refused_merge_outcome(db, task, ctx, merge_detail), ""
@@ -3938,6 +4023,8 @@ async def _refused_merge_outcome(
       записанных гейтом) — доставка, без второй строки реестра;
     * MERGED без следа гейта — терминально, с названной причиной: ручной мерж
       в то же окно не должен тихо стать мержем гейта (drift-guard, #534);
+    * MERGED, а след проверить не удалось (merge-коммит не прочитан, мерж
+      соседнего пути ещё идёт) — временное ожидание, не ручной мерж (#1407);
     * PR не прочитан — после молчаливого отказа это временное ожидание, а
       не решение; при названной форжем причине — прежний путь с ней;
     * иначе (open/closed/absent) — прежний путь отказа.
@@ -3947,8 +4034,15 @@ async def _refused_merge_outcome(
     pr_num = int(task["pr_number"])
     state, why = await _recorded_pr_state(db, task, pr_num)
     if state == "merged":
-        if await _merged_by_gate(db, task, ctx, pr_num):
+        trace = await _merged_by_gate(db, task, ctx, pr_num)
+        if trace is GateTrace.GATE:
             return True, "already delivered"
+        if trace is GateTrace.UNVERIFIED:
+            return False, (
+                f"{MERGE_COMMIT_UNVERIFIED_PREFIX}: PR #{pr_num} уже MERGED, но "
+                "проверить, гейт ли его влил, не удалось — merge-коммит не "
+                "прочитан или мерж соседнего пути ещё идёт. Это не ручной мерж, а непроверенный"
+            )
         return False, (
             f"{MERGED_OUTSIDE_GATE_PREFIX}: PR влит не гейтом — PR #{pr_num} уже "
             "MERGED, но мержа гейта по нему нет (ни строки pipeline_merges этой "
@@ -3963,15 +4057,30 @@ async def _refused_merge_outcome(
     return False, await refusal_after_automerge(db, task, ctx, merge_detail)
 
 
+class GateTrace(enum.Enum):
+    """Нашёлся ли у MERGED-PR след гейта (#1398, #1407).
+
+    UNVERIFIED — «проверить не удалось», и это не NOT_GATE: отсутствие данных
+    не вывод (#516/#549), а NOT_GATE терминален и зовёт человека.
+    """
+
+    GATE = "gate"
+    NOT_GATE = "not_gate"
+    UNVERIFIED = "unverified"
+
+
 async def _merged_by_gate(
     db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any], pr_num: int
-) -> bool:
+) -> GateTrace:
     """Влит ли MERGED-PR гейтом — по его собственным следам (#1398)."""
     task_id = task["id"]
     if await repo.pipeline_merge_recorded(db, task_id, pr_num):
-        return True
-    if await _gate_merge_outcome((task_id, pr_num)):
-        return True
+        return GateTrace.GATE
+    seen = await _gate_merge_outcome((task_id, pr_num))
+    if seen is GateMergeSeen.MERGED:
+        return GateTrace.GATE
+    if seen is GateMergeSeen.IN_FLIGHT:
+        return GateTrace.UNVERIFIED
     try:
         sha = await plugins.git_ops.merge_commit_sha(
             pr_num,
@@ -3980,12 +4089,19 @@ async def _merged_by_gate(
             forge=ctx.get("forge", ""),
         )
         proj = await repo.resolve_project_for_task(db, task_id)
-    except Exception:  # noqa: BLE001 - «не узнали» не делает мерж гейтовым
+    except Exception:  # noqa: BLE001 - «не узнали» — не «не гейт» (#1407)
         log.exception("merge commit of PR #%s unreadable (#%s)", pr_num, task_id)
-        return False
-    if not sha or not proj:
-        return False
-    return sha in await repo.known_pipeline_shas(db, dict(proj)["id"])
+        return GateTrace.UNVERIFIED
+    if not sha:
+        # Форж не назвал merge-коммит влитого PR — сверять нечего (#1407).
+        return GateTrace.UNVERIFIED
+    # Нет проекта — это ответ, а не сбой чтения: реестр гейта без проекта
+    # пуст по определению (known_pipeline_shas намеренно не берёт строки с
+    # NULL project_id, #534). Мерж самой задачи уже поймал
+    # pipeline_merge_recorded выше.
+    if proj and sha in await repo.known_pipeline_shas(db, dict(proj)["id"]):
+        return GateTrace.GATE
+    return GateTrace.NOT_GATE
 
 
 async def merge_before_completion(
@@ -4423,6 +4539,51 @@ async def resolve_delivery_pr(
     return task, delivery_pr
 
 
+# Подсказка ожидания по префиксу транзитного отказа (#1271): у каждого
+# не-CI префикса своя фраза. Фраза про CI советует пересдачу, а пересдача
+# сбрасывает вердикт (#612) — префикс, не названный здесь, наследует её.
+# Комментарии к каждому входу — у констант подсказок выше.
+# * PR_DRAFT (#1053): CI уже зелёный, пересдача сбросит вердикт.
+# * BASE_AUTOMERGE (#1271 в мерже с #1233): «отчитайтесь снова» — ровно та
+#   пересдача, ради избежания которой автомерж и написан.
+# * STACKED_BASE/STACK_UNKNOWN (#1186, машинное ревью): ждут другой задачи,
+#   CI уже зелёный.
+# * MERGE_UNCONFIRMED (#1276): мерж прошёл, CI был зелёным до него.
+# * GATE_MERGE_IN_FLIGHT/MERGE_COMMIT_UNVERIFIED (#1407): ждут исхода мержа
+#   соседнего пути или повторного чтения, а не CI.
+_TRANSIENT_WAIT_HINTS: tuple[tuple[str | tuple[str, ...], str], ...] = (
+    (PR_DRAFT_PREFIX, PR_DRAFT_WAIT_HINT),
+    (BASE_AUTOMERGE_PREFIX, BASE_AUTOMERGE_WAIT_HINT),
+    ((STACKED_BASE_PREFIX, STACK_UNKNOWN_PREFIX), STACKED_BASE_WAIT_HINT),
+    (MERGE_REFUSAL_UNVERIFIED_PREFIX, MERGE_REFUSAL_UNVERIFIED_WAIT_HINT),
+    (MERGE_UNCONFIRMED, MERGE_UNCONFIRMED_WAIT_HINT),
+    (GATE_MERGE_IN_FLIGHT_PREFIX, GATE_MERGE_IN_FLIGHT_WAIT_HINT),
+    (MERGE_COMMIT_UNVERIFIED_PREFIX, MERGE_COMMIT_UNVERIFIED_WAIT_HINT),
+)
+
+
+def _transient_wait_cause(detail: str, delivery_pr: DeliveryPR) -> str:
+    """Чего ждёт транзитный отказ гейта — фраза для ленты задачи (#959, #1271).
+
+    Вынесено из _deliver_completed_pair_task по бюджету сложности (#1407):
+    каждая новая причина ожидания добавляла ветку в лесенку диспетчера.
+    """
+    for prefixes, hint in _TRANSIENT_WAIT_HINTS:
+        if detail.startswith(prefixes):
+            return hint
+    if delivery_pr.established:
+        return (
+            "Это временное состояние, решение человека не требуется: "
+            "отчитайтесь о готовности снова, когда CI станет зелёным."
+        )
+    return (
+        "Состояние самого PR прочитать не удалось, поэтому "
+        "про CI тут сказать нечего: отчитайтесь о готовности "
+        "снова, когда PR станет доступен. Если он недоступен "
+        "не временно — это вопрос к человеку."
+    )
+
+
 async def _deliver_completed_pair_task(
     db: aiosqlite.Connection, task: dict[str, Any], delivery_pr: DeliveryPR
 ) -> str | None:
@@ -4463,46 +4624,7 @@ async def _deliver_completed_pair_task(
             # #952 removed from the terminal branch, here in the
             # patient one. A draft is a third cause (#1053): CI is
             # already green, and resubmitting would stale the verdict.
-            if detail.startswith(PR_DRAFT_PREFIX):
-                cause = PR_DRAFT_WAIT_HINT
-            elif detail.startswith(BASE_AUTOMERGE_PREFIX):
-                # #1271 в мерже с #1233: попасть в TRANSIENT_GATE_PREFIXES —
-                # только половина вступления в этот набор. Не названный здесь
-                # префикс наследует фразу про CI, а «отчитайтесь о готовности
-                # снова» — это ровно та
-                # пересдача, которая сбросит вердикт, ради сохранения которого
-                # автомерж и написан.
-                cause = BASE_AUTOMERGE_WAIT_HINT
-            elif detail.startswith((STACKED_BASE_PREFIX, STACK_UNKNOWN_PREFIX)):
-                # #1186, found by the machine review of the change that added
-                # these two: putting a prefix in TRANSIENT_GATE_PREFIXES is
-                # only half of joining that set. This ladder words the wait per
-                # cause, and an unlisted member inherits the CI sentence — here
-                # a false one, because the CI is already green and the wait is
-                # for another task. Worse than false: it tells the executor to
-                # report done again, which is the one action that would stale
-                # the verdict (#612) — the very trap PR_DRAFT_WAIT_HINT exists
-                # to avoid, re-opened for the neighbour added beside it.
-                cause = STACKED_BASE_WAIT_HINT
-            elif detail.startswith(MERGE_REFUSAL_UNVERIFIED_PREFIX):
-                cause = MERGE_REFUSAL_UNVERIFIED_WAIT_HINT
-            elif detail.startswith(MERGE_UNCONFIRMED):
-                # #1276, found by the #1271 invariant: the same inheritance as
-                # #1186 — the merge happened, and the CI sentence below would
-                # send the executor to wait for a check that was green already.
-                cause = MERGE_UNCONFIRMED_WAIT_HINT
-            elif delivery_pr.established:
-                cause = (
-                    "Это временное состояние, решение человека не требуется: "
-                    "отчитайтесь о готовности снова, когда CI станет зелёным."
-                )
-            else:
-                cause = (
-                    "Состояние самого PR прочитать не удалось, поэтому "
-                    "про CI тут сказать нечего: отчитайтесь о готовности "
-                    "снова, когда PR станет доступен. Если он недоступен "
-                    "не временно — это вопрос к человеку."
-                )
+            cause = _transient_wait_cause(detail, delivery_pr)
             await repo.add_task_update(
                 db,
                 task_id,

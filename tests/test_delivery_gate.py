@@ -990,6 +990,70 @@ async def test_an_unreadable_diff_never_keeps_the_verdict(
     assert "прочитать не удалось" in await _feed(db, task_id)
 
 
+# ---- #1361: общий файл с базой больше не стоит второго вердикта ----
+
+
+def _real_diffs(g, clone) -> None:
+    """``branch_diff`` двойника отвечает настоящим git из клона ``clone``."""
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    ops = GitOpsIntegration()
+
+    async def _diff(_workspace, _base, ref):
+        return await ops.branch_diff(str(clone), "develop", ref)
+
+    g.branch_diff = AsyncMock(side_effect=_diff)
+
+
+async def test_a_base_merge_in_a_shared_file_keeps_the_verdict(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+) -> None:
+    # AC-1 (#1361): база тронула файл автора — правка строки, вставка сверху,
+    # хвост с конфликтом. Конфликт разрешён «обе стороны, ничего сверх», git
+    # настоящий. Побайтно дифф к базе другой (index, смещения ханков), по смыслу
+    # правка автора та же — и вердикт сохраняется с названной причиной.
+    from tests.test_base_merge import shared_file_merge
+
+    clone, approved, tip = shared_file_merge(tmp_path, "both")
+    g = _seeing(monkeypatch, approved, merged=True)
+    task_id = await _approved_pair_task(db)
+    _real_diffs(g, clone)
+    g.head_sha = AsyncMock(return_value=tip)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    feed = await _feed(db, task_id)
+    assert "stale_approval" not in feed, feed
+    assert task["status"] == "completed", feed
+    assert g.merge_pr.await_count == 1
+    assert "Вердикт остаётся текущим" in feed
+    assert "правка та же" in feed, "причина сохранения обязана быть названа"
+
+
+async def test_a_resolution_line_in_a_shared_file_drops_the_verdict(
+    db: aiosqlite.Connection, monkeypatch, tmp_path
+) -> None:
+    # Обратная сторона AC-1 на том же настоящем git: строка сопряжения, которой
+    # ревью не видело, — новая авторская правка. Вердикт слетает, файл назван.
+    from tests.test_base_merge import shared_file_merge
+
+    clone, approved, tip = shared_file_merge(tmp_path, "new_line")
+    g = _seeing(monkeypatch, approved, merged=True)
+    task_id = await _approved_pair_task(db)
+    _real_diffs(g, clone)
+    g.head_sha = AsyncMock(return_value=tip)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] != "completed"
+    g.merge_pr.assert_not_awaited()
+    feed = await _feed(db, task_id)
+    assert "stale_approval" in feed
+    assert "mod.py" in feed, "отказ обязан назвать файл, где правка разошлась"
+
+
 # ---- AC-3 / AC-4: автомерж только названного класса ----
 
 
@@ -1284,11 +1348,18 @@ async def test_the_automerge_is_judged_by_the_return_code_not_the_output(
     # строка index (блоб базы стал другим) и смещения ханков. Поэтому
     # сохранение вердикта в этом пути стоит не на сравнении диффов, а на том,
     # что коммит сделал сам гейт, — и он перезакрепляет коммит сдачи.
+    #
+    # #1361 сравнивает правку по смыслу, без index и смещений, — и здесь это
+    # ВСЁ РАВНО не совпадает, по другой причине: git сдвигает пустые строки
+    # хвоста. До мержа автор добавил «пусто, пусто, def, pass», после —
+    # «def, pass, пусто, пусто». Для упорядоченного сравнения это другая
+    # последовательность; ошибка в безопасную сторону, а перезакрепление
+    # остаётся нужным.
     author_before = await ops.branch_diff(str(repo), "develop", before)
     author_after = await ops.branch_diff(
         str(repo), "develop", _tip(repo, "task-1233/probe")
     )
-    assert not base_merge.author_diff_unchanged(author_before, author_after)[0], (
+    assert not base_merge.author_edit_same(author_before, author_after)[0], (
         "если это когда-нибудь совпадёт — сравнение диффов станет годным и "
         "здесь, и перезакрепление коммита можно будет снять"
     )
@@ -4208,3 +4279,123 @@ async def test_the_registry_delivers_only_rows_it_lists_as_pr_open(
 
     missing = await client.post("/api/delivery/discrepancies/999999/deliver")
     assert missing.status_code == 404
+
+
+# ---- #1407: два различения гейта доставки после #1398 ----
+
+
+def _feed_text(updates) -> str:
+    return " ".join(dict(u)["content"] or "" for u in updates)
+
+
+async def _called_a_human(db: aiosqlite.Connection, task_id: int) -> bool:
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    return any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    )
+
+
+async def test_a_slow_gate_merge_is_not_merged_twice(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1407 AC-1: истёкшее ожидание — «мерж ещё идёт», а не «мержа нет».
+
+    Первый путь гейта вливает PR, форж отвечает дольше GATE_MERGE_WAIT_SECONDS.
+    Второй путь (report_done) не зовёт форж второй раз, пока первый вызов жив:
+    второй мерж GitHub отклонил бы, и это та же гонка #1376/#1398.
+    """
+    import asyncio
+
+    from hub.services import orchestration
+
+    g = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+    release = asyncio.Event()
+    calls: list[int] = []
+
+    async def _slow_merge(pr_number, *_a, **_k):
+        calls.append(pr_number)
+        if len(calls) == 1:
+            await release.wait()
+            return True, ""
+        return False, ""
+
+    g.merge_pr_with_detail = AsyncMock(side_effect=_slow_merge)
+    monkeypatch.setattr(orchestration, "GATE_MERGE_WAIT_SECONDS", 0.05)
+
+    task = dict(await repo.get_task(db, task_id))
+    first = asyncio.create_task(
+        orchestration._registered_gate_merge((task_id, 77), task, {})
+    )
+    await asyncio.sleep(0)
+    assert calls == [77], "первый путь уже в форже"
+
+    await _report_done(db, task_id)
+
+    assert calls == [77], "второй вызов форжа, пока первый жив, — гонка #1398"
+    status = dict(await repo.get_task(db, task_id))["status"]
+    assert status == "running", "идущий мерж — ожидание, а не решение человека"
+    assert not await _called_a_human(db, task_id)
+    feed = _feed_text(await repo.get_task_updates(db, task_id))
+    assert orchestration.GATE_MERGE_IN_FLIGHT_PREFIX in feed, "причина названа"
+    assert "merge_failed" not in feed
+
+    release.set()
+    assert await first == (True, "")
+
+
+@pytest.mark.parametrize(
+    "unread",
+    [
+        pytest.param({"side_effect": RuntimeError("gh молчит")}, id="raised"),
+        # Прод-путь «не прочитано»: GitHub и GitVerse при сбое чтения
+        # отвечают пустой строкой, а не исключением (ревью сдачи 1).
+        pytest.param({"return_value": ""}, id="empty_sha"),
+    ],
+)
+async def test_an_unreadable_merge_commit_is_not_called_a_manual_merge(
+    db: aiosqlite.Connection, unread: dict
+) -> None:
+    """#1407 AC-2: «проверить не удалось» — не «гейт не вливал».
+
+    PR MERGED, строки pipeline_merges нет, а merge-коммит не читается
+    (исключение или пустой sha) — это временный исход с названной причиной,
+    а не терминальный MERGED_OUTSIDE_GATE (#516/#549: отсутствие данных не
+    вывод). Прочитанный sha без следа гейта — по-прежнему ручной мерж.
+    """
+    from hub.services import orchestration
+
+    g = _git(CIProbeOutcome.passed, merged=False)
+    g.pr_state = AsyncMock(return_value="merged")
+    g.merge_commit_sha = AsyncMock(**unread)
+    task_id = await _approved_pair_task(db)
+
+    await _report_done(db, task_id)
+
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+    assert not await _called_a_human(db, task_id)
+    feed = _feed_text(await repo.get_task_updates(db, task_id))
+    assert orchestration.MERGE_COMMIT_UNVERIFIED_PREFIX in feed, "причина названа"
+    assert orchestration.MERGED_OUTSIDE_GATE_PREFIX not in feed
+    assert not list(await db.execute_fetchall("SELECT 1 FROM pipeline_merges"))
+
+    g.merge_commit_sha = AsyncMock(return_value="manual0merge0sha")
+    manual = await _approved_pair_task(db, pr_number=78)
+
+    await _report_done(db, manual)
+
+    assert dict(await repo.get_task(db, manual))["status"] == "needs_decision"
+    feed = _feed_text(await repo.get_task_updates(db, manual))
+    assert orchestration.MERGED_OUTSIDE_GATE_PREFIX in feed
+
+
+@pytest.mark.parametrize(
+    "prefix", ["GATE_MERGE_IN_FLIGHT_PREFIX", "MERGE_COMMIT_UNVERIFIED_PREFIX"]
+)
+def test_the_1407_outcomes_are_transient(prefix: str) -> None:
+    """#1407: оба новых исхода — ожидание цикла, а не вызов человека."""
+    from hub.services import orchestration
+
+    value = getattr(orchestration, prefix)
+    assert value.startswith(orchestration.TRANSIENT_GATE_PREFIXES)
+    assert not value.startswith(orchestration.MERGED_OUTSIDE_GATE_PREFIX)
