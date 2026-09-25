@@ -2005,9 +2005,18 @@ async def _third_generation(
     slug: str,
     *,
     reviewed: tuple[int, ...],
+    uncounted: dict[int, dict] | None = None,
 ) -> int:
-    """A task on its THIRD submission; ``reviewed`` names generations with a report."""
+    """A task on its THIRD submission; ``reviewed`` names generations with a report.
+
+    ``uncounted`` adds reports that exist but do not count as reading the
+    code (#1400, finding 452b39e570a0620b): generation -> extra columns.
+    """
     task_id = await _second_generation(client, db, slug, reviewed=False)
+    for generation, extra in (uncounted or {}).items():
+        await repo.insert_machine_review(
+            db, task_id=task_id, submission_generation=generation, **extra
+        )
     await repo.record_submission(
         db, task_id=task_id, generation=2, sha=_GEN2_SHA, base_branch="develop"
     )
@@ -2081,7 +2090,60 @@ async def test_delta_without_any_recorded_review_reads_whole_diff(
     assert "прочитан ВЕСЬ дифф" in prompt
     assert "прочитана ДЕЛЬТА" not in prompt
     card = await _subject_card(client, task_id)
-    assert "ни по одному прежнему поколению отчёт ревью не записан" in card, card
+    assert "ни по одному прежнему поколению" in card and "не записан" in card, card
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"incomplete": True}, {"incomplete": False, "self_reviewed": True}],
+    ids=["incomplete", "self_reviewed"],
+)
+async def test_an_uncounted_report_is_not_a_delta_base(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, extra
+):
+    # #1400, finding 452b39e570a0620b: gen2's only report is incomplete, or
+    # the author's own. Neither is reading the code — the same rule as the
+    # second-read guard (CODE_READ) — so the delta still starts at gen1,
+    # carries gen2's files and gen1's findings, and the card says why.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-g4"}, "run": {"id": "r-g4"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _third_generation(
+        client, db, "spike-uncounted", reviewed=(1,), uncounted={2: extra}
+    )
+    plugins.git_ops = _ThreeGenerationsGitOps(_TIP, ["docs/notes.md"])
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert f"'{_GEN2_FILE}'" in prompt, "gen2's unread fixes stay in the subject"
+    assert "finding of gen1" in prompt, "findings come from the base that was read"
+    card = await _subject_card(client, task_id)
+    assert "дельта к поколению #1" in card, card
+    assert "отчёт по #2 неполный или самоотчёт" in card, card
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"incomplete": True}, {"incomplete": False, "self_reviewed": True}],
+    ids=["incomplete", "self_reviewed"],
+)
+async def test_only_uncounted_reports_read_the_whole_diff(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, extra
+):
+    # #1400: when every earlier report is incomplete or self-written, no
+    # generation was read — the whole diff, not a delta to one of them.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-g5"}, "run": {"id": "r-g5"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _third_generation(
+        client, db, "spike-only-uncounted", reviewed=(), uncounted={1: extra, 2: extra}
+    )
+    plugins.git_ops = _ThreeGenerationsGitOps(_TIP, ["docs/notes.md"])
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    assert "прочитан ВЕСЬ дифф" in prompt
+    assert "прочитана ДЕЛЬТА" not in prompt
 
 
 async def test_delta_base_is_previous_generation_when_its_review_is_recorded(

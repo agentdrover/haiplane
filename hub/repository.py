@@ -2896,27 +2896,6 @@ async def previous_submission(
     return rows[0] if rows else None
 
 
-async def last_reviewed_submission(
-    db: aiosqlite.Connection, task_id: int, generation: int
-) -> aiosqlite.Row | None:
-    """The newest submission BEFORE this generation that has a report (#1400).
-
-    The delta of a resubmission must start where some recorded review ended.
-    A generation whose report never landed — discarded as stale (#1260),
-    crashed, or still in flight — is skipped, so its changes stay in the
-    subject instead of falling between two reviews nobody wrote.
-    """
-    rows = await fetchall(
-        db,
-        "SELECT s.* FROM submissions s WHERE s.task_id=? AND s.generation<? "
-        "AND EXISTS (SELECT 1 FROM machine_reviews m WHERE m.task_id=s.task_id "
-        "AND m.submission_generation=s.generation) "
-        "ORDER BY s.generation DESC LIMIT 1",
-        (task_id, generation),
-    )
-    return rows[0] if rows else None
-
-
 async def count_review_dispatches(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> int:

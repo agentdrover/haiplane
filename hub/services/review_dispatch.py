@@ -277,7 +277,7 @@ async def previous_findings(
     no recorded report has no findings, and the ones that matter are those
     of the last review that did land.
     """
-    previous = await repo.last_reviewed_submission(db, task_id, generation)
+    previous = await _last_read_submission(db, task_id, generation)
     if previous is None:
         return []
     titles: list[str] = []
@@ -315,10 +315,67 @@ class DeltaSubject:
     note: str
 
 
+async def _last_read_submission(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> aiosqlite.Row | None:
+    """The newest submission BEFORE this generation whose code was READ (#1400).
+
+    "Read" is ``CODE_READ`` — the same rule the second-read guard uses: a
+    complete, independent report. A generation whose report never landed
+    (discarded as stale by #1260, crashed, still in flight), or whose only
+    report is incomplete or the author's own, is skipped, so its changes stay
+    in the subject instead of falling between two reviews nobody finished.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT s.* FROM submissions s WHERE s.task_id=? AND s.generation<? "  # nosec B608 - константа модуля, не ввод
+        "AND EXISTS (SELECT 1 FROM machine_reviews mr WHERE mr.task_id=s.task_id "
+        f"AND mr.submission_generation=s.generation AND {CODE_READ}) "
+        "ORDER BY s.generation DESC LIMIT 1",
+        (task_id, generation),
+    )
+    return rows[0] if rows else None
+
+
+async def _skipped_note(
+    db: aiosqlite.Connection, task_id: int, base_generation: int, generation: int
+) -> str:
+    """Why the delta starts before N−1: name each skipped generation's cause.
+
+    Two causes, told apart because "not recorded" would be a lie about a
+    report that exists but does not count as reading the code.
+    """
+    gaps = list(range(base_generation + 1, generation))
+    if not gaps:
+        return ""
+    rows = await fetchall(
+        db,
+        "SELECT DISTINCT submission_generation AS g FROM machine_reviews "
+        "WHERE task_id=? AND submission_generation>? AND submission_generation<?",
+        (task_id, base_generation, generation),
+    )
+    uncounted = {int(dict(r)["g"]) for r in rows}
+    missing = [f"#{n}" for n in gaps if n not in uncounted]
+    partial = [f"#{n}" for n in gaps if n in uncounted]
+    parts = []
+    if missing:
+        parts.append(
+            f"отчёт по {missing[0]} не записан"
+            if len(missing) == 1
+            else f"отчёты по {', '.join(missing)} не записаны"
+        )
+    if partial:
+        parts.append(
+            f"отчёт по {', '.join(partial)} неполный или самоотчёт — "
+            "чтением кода не засчитан"
+        )
+    return "; ".join(parts)
+
+
 async def _delta_base(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> tuple[dict | None, str]:
-    """Where the delta may start: the newest submission a REPORT covered (#1400).
+    """Where the delta may start: the newest submission whose code was read (#1400).
 
     Returns the base submission and, when it is not the previous generation,
     which generations were skipped and why; no base means the whole diff, and
@@ -328,19 +385,16 @@ async def _delta_base(
     """
     if await repo.previous_submission(db, task_id, generation) is None:
         return None, "предыдущая сдача не записана — читается весь дифф"
-    reviewed = await repo.last_reviewed_submission(db, task_id, generation)
+    reviewed = await _last_read_submission(db, task_id, generation)
     if reviewed is None:
         return None, (
-            "ни по одному прежнему поколению отчёт ревью не записан — "
-            "читается весь дифф"
+            "ни по одному прежнему поколению полный независимый отчёт ревью "
+            "не записан — читается весь дифф"
         )
     prev = dict(reviewed)
-    gaps = [f"#{n}" for n in range(int(prev.get("generation") or 0) + 1, generation)]
-    if not gaps:
-        return prev, ""
-    if len(gaps) == 1:
-        return prev, f"отчёт по {gaps[0]} не записан"
-    return prev, f"отчёты по {', '.join(gaps)} не записаны"
+    return prev, await _skipped_note(
+        db, task_id, int(prev.get("generation") or 0), generation
+    )
 
 
 async def generation_delta(
@@ -1893,6 +1947,13 @@ async def _this_code_was_already_read(
 #: этого правила не заводим. Псевдоним таблицы в запросе — ``mr``.
 INDEPENDENT_READ = "COALESCE(mr.self_reviewed, 0) = 0"
 
+#: «Код прочитан»: отчёт ПОЛНЫЙ и независимый. Одно определение на двух
+#: читателей — страж повторного чтения (``_report_already_covers_this_sha``)
+#: и базу дельты пересдачи (#1400). Неполный отчёт сам говорит, что дочитал
+#: не всё; самоотчёт — не чтение со стороны. Ни тот ни другой не может ни
+#: запереть добор, ни стать точкой, от которой дельта перестаёт читать.
+CODE_READ = f"COALESCE(mr.incomplete, 0) = 0 AND {INDEPENDENT_READ}"
+
 
 async def _report_already_covers_this_sha(
     db: aiosqlite.Connection, task: dict[str, Any]
@@ -1948,13 +2009,12 @@ async def _report_already_covers_this_sha(
         # непрочитанное. Назвать его чтением значило бы запереть добор
         # утверждением, которое отчёт опровергает о себе — та же ошибка,
         # против которой стоит #762, только с другой стороны.
-        "AND COALESCE(mr.incomplete, 0) = 0 "
         # Самоотчёт исполнителя не отменяет независимого ревьюера. Автор,
         # приславший отчёт о собственной работе, уже однажды закрыл чужой
         # диспетчер как выполненный (#1011, #1025) — здесь он закрывал бы
         # его ещё до старта. «Код прочитан» имеет смысл только про того,
-        # кто читал его со стороны.
-        f"AND {INDEPENDENT_READ}",
+        # кто читал его со стороны. Оба условия — в CODE_READ (#1400).
+        f"AND {CODE_READ}",
         (task_id, generation),
     )
     for row in rows:
