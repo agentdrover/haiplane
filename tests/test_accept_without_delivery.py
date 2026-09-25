@@ -556,6 +556,12 @@ class _MergeSpy:
     ):
         return f"{int(pr_number):040d}"
 
+    async def pr_state(self, pr_number, repo=None, gh_repo=None, forge: str = ""):
+        # #1398: после отказа гейт перечитывает PR — отказ по уже влитому PR
+        # доставкой и остаётся. Дублёр, который не мержит, держит PR открытым:
+        # это и есть настоящий отказ, а не молчание форжа.
+        return "merged" if self.merged else "open"
+
     async def head_sha(self, repo, ref):
         return "a" * 40
 
@@ -598,6 +604,7 @@ def _install(monkeypatch, spy: _MergeSpy) -> None:
         # метод, а работал бы другой, и дублёр молча переставал бы дублировать.
         "merge_pr_with_detail",
         "merge_commit_sha",
+        "pr_state",
         "head_sha",
         "pull_main",
         "delete_branch",
