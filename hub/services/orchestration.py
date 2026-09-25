@@ -3895,6 +3895,28 @@ async def _registered_gate_merge(
     return merged, detail
 
 
+async def _gate_merge_step(
+    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
+) -> tuple[tuple[bool, str] | None, str]:
+    """Сам мерж гейта: ``(исход, деталь)``; исход None — влит, пишите реестр.
+
+    #1398: второй путь гейта (поллер или report_done) уже вливает этот PR в
+    этом процессе — дождаться его исхода, а не спрашивать форж второй раз:
+    второй мерж GitHub отклонит, и отказ прочитался бы как merge_failed по
+    уже доставленной работе. Отказ по PR, который уже MERGED, — не отказ.
+    #1233: прежде чем звать человека — не тот ли это класс конфликта, который
+    разрешается однозначно. Оба вопроса задаются ТОЛЬКО после отказа мержа:
+    у зелёной доставки нет причины за них платить.
+    """
+    key = (int(task["id"]), int(task["pr_number"]))
+    if await _gate_merge_outcome(key):
+        return (True, "already delivered"), ""
+    merged, merge_detail = await _registered_gate_merge(key, task, ctx)
+    if not merged:
+        return await _refused_merge_outcome(db, task, ctx, merge_detail), ""
+    return None, merge_detail
+
+
 async def _refused_merge_outcome(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -4053,20 +4075,9 @@ async def merge_before_completion(
                     "пометить его ready"
                 )
 
-        # #1398: второй путь гейта (поллер или report_done) уже вливает этот
-        # PR в этом процессе — дождаться его исхода, а не спрашивать форж
-        # второй раз: второй мерж GitHub отклонит, и отказ прочитался бы как
-        # merge_failed по уже доставленной работе.
-        key = (task_id, int(pr_num))
-        if await _gate_merge_outcome(key):
-            return True, "already delivered"
-        merged, merge_detail = await _registered_gate_merge(key, task, ctx)
-        if not merged:
-            # #1398: отказ по PR, который уже MERGED, — не отказ. #1233:
-            # прежде чем звать человека — не тот ли это класс конфликта,
-            # который разрешается однозначно. Оба вопроса задаются ТОЛЬКО
-            # после отказа мержа: у зелёной доставки нет причины за них платить.
-            return await _refused_merge_outcome(db, task, ctx, merge_detail)
+        decided, merge_detail = await _gate_merge_step(db, task, ctx)
+        if decided is not None:
+            return decided
 
         # The commit THIS pull request produced — never the branch tip,
         # which is whatever landed last (#534, review round 3).
