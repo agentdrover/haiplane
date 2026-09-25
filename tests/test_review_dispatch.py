@@ -1999,7 +1999,12 @@ class _ThreeGenerationsGitOps(_AncestryGitOps):
 
     async def branch_diff(self, repo, base, branch):
         since = self._since(base)
-        return self._diff if since is None else since
+        if since is None:
+            # #1361 и #1400 встретились в develop: без родительского ответа
+            # закреплённый sha чужого поколения отдавал дифф вершины, и
+            # сдача читалась как «влита только база» — отчёт переносился.
+            return await super().branch_diff(repo, base, branch)
+        return since
 
     async def delta_without_base(self, repo, base, prev, current):
         return self._since(prev)
@@ -5006,6 +5011,104 @@ async def test_a_real_refusal_is_neither_reconciled_nor_retried(
     assert "не принял запрос (бета" not in alerts, (
         "прежний текст утверждал причину, которой не было"
     )
+
+
+class _ParamsRefusingProvider:
+    """Провайдер, отвергающий заказ с params 400-м, а голый — по сценарию."""
+
+    def __init__(self, bare_refusal=None):
+        self.bare_refusal = bare_refusal
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("model_params"):
+            return None, cursor_cloud.Refusal(
+                status=400, code="invalid_argument", detail="Unknown param fast"
+            )
+        if self.bare_refusal is not None:
+            return None, self.bare_refusal
+        return {"agent": {"id": "bc-bare"}, "run": {"id": "run-bare"}}, None
+
+
+async def _alerts(db: aiosqlite.Connection, task_id: int) -> str:
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='alert'",
+        (task_id,),
+    )
+    return " ".join(dict(r)["content"] for r in rows)
+
+
+async def test_rejected_model_params_fall_back_once_and_alert(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1417 AC-3: 400 на заказ с params — один повтор без них, и alert.
+
+    Параметр fast=false может не поддерживаться моделью или называться
+    иначе. Ревью от этого пропасть не должно: повтор без params проходит,
+    причина названа в карточке, а оплачен ровно один прогон.
+    """
+    provider = _ParamsRefusingProvider()
+    _wire(monkeypatch, _DispatchRecorder(None))
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", provider)
+    monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL_PARAMS", "fast=false")
+
+    task_id = await _submitted(client, db, "spike-params-refused")
+
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["model_params"] == [{"id": "fast", "value": "false"}]
+    assert not provider.calls[1]["model_params"]
+    assert provider.calls[0]["name"] == provider.calls[1]["name"]
+    active = await repo.list_active_review_dispatches(db)
+    assert len(active) == 1, "заказано ровно один раз"
+    assert dict(active[0])["agent_id"] == "bc-bare"
+    assert dict(active[0])["model"] == "grok-4.6", "семейство (#758) — по id"
+    alerts = await _alerts(db, task_id)
+    assert "fast=false" in alerts and "HTTP 400" in alerts
+    assert "invalid_argument" in alerts
+
+
+async def test_a_bare_retry_refused_too_is_not_blamed_on_params(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1417: если голый заказ тоже отвергнут — причина не в параметрах.
+
+    Повтор ровно один, и alert о параметрах не пишется: он назвал бы чужую
+    причину. Карточка получает обычный отказ провайдера.
+    """
+    provider = _ParamsRefusingProvider(bare_refusal=_REAL_REFUSAL)
+    _wire(monkeypatch, _DispatchRecorder(None))
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", provider)
+    monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL_PARAMS", "fast=false")
+
+    task_id = await _submitted(client, db, "spike-params-bare-refused")
+
+    assert len(provider.calls) == 2
+    assert not await repo.list_active_review_dispatches(db)
+    alerts = await _alerts(db, task_id)
+    assert "провайдер отказал: HTTP 400, invalid_model" in alerts
+    assert "fast=false" not in alerts
+
+
+async def test_the_dispatched_notice_names_the_variant(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1417: запись «ревью вызвано» называет фактический вариант модели."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL_PARAMS", "fast=false")
+
+    task_id = await _submitted(client, db, "spike-variant-named")
+
+    assert recorder.calls[0]["model_params"] == [{"id": "fast", "value": "false"}]
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND kind='status' "
+        "AND content LIKE 'Кросс-модельное ревью вызвано%'",
+        (task_id,),
+    )
+    assert rows
+    assert "модель grok-4.6 fast=false " in dict(rows[-1])["content"]
+    assert "Повтор без параметров" not in await _alerts(db, task_id)
 
 
 async def test_an_unreadable_reconciliation_never_guesses(

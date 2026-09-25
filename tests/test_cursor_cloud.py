@@ -80,6 +80,9 @@ async def test_review_agent_request_matches_spec(monkeypatch, _configured):
     # model.id, hub MCP with the REVIEWER bearer, no auto-PR.
     recorder = _Recorder(httpx.Response(200, json={"agent": {"id": "bc-1"}}))
     _patch_transport(monkeypatch, recorder)
+    # Голый model.id — форма без параметров (#1417 AC-2); умолчание fast=false
+    # проверяет test_review_agent_is_ordered_without_fast_by_default.
+    monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL_PARAMS", "")
 
     result = await cursor_cloud.create_review_agent(
         repo_url="https://github.com/mrPDA/spike",
@@ -108,6 +111,64 @@ async def test_review_agent_request_matches_spec(monkeypatch, _configured):
     assert mcp["name"] == brand.MCP_SERVER_NAME
     assert mcp["url"] == "https://agenthai.ru/mcp"
     assert mcp["headers"]["Authorization"] == "Bearer reviewer-token"
+
+
+async def _ordered_review_body(monkeypatch) -> dict:
+    import json
+
+    recorder = _Recorder(httpx.Response(200, json={"agent": {"id": "bc-1"}}))
+    _patch_transport(monkeypatch, recorder)
+    await cursor_cloud.create_review_agent(
+        repo_url="https://github.com/o/r",
+        starting_ref="task-1/x",
+        model_id="grok-4.6",
+        prompt_text="review",
+        hub_mcp_url="https://hub/mcp",
+        reviewer_token="tok",
+    )
+    assert recorder.request is not None
+    return json.loads(recorder.request.content)
+
+
+async def test_review_agent_is_ordered_without_fast_by_default(
+    monkeypatch, _configured
+):
+    """#1417 AC-1: без настройки ревьюер заказывается с fast=false.
+
+    Cursor без params подставляет вариант Fast — та же модель вдвое дороже.
+    Умолчание проверяется как есть: переменной в окружении теста нет, и
+    значение в config — то, что служба получит без drop-in'а.
+    """
+    import os
+
+    assert "CURSOR_REVIEW_MODEL_PARAMS" not in os.environ
+    body = await _ordered_review_body(monkeypatch)
+    assert body["model"] == {
+        "id": "grok-4.6",
+        "params": [{"id": "fast", "value": "false"}],
+    }
+
+
+async def test_empty_review_model_params_sends_bare_model(monkeypatch, _configured):
+    """#1417 AC-2: явно пустая настройка — тело без params, как до задачи."""
+    monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL_PARAMS", "")
+    body = await _ordered_review_body(monkeypatch)
+    assert body["model"] == {"id": "grok-4.6"}
+
+
+def test_review_model_params_parse_pairs_and_skip_junk(monkeypatch):
+    monkeypatch.setattr(
+        config, "CURSOR_REVIEW_MODEL_PARAMS", " fast=false , effort=high,junk,=x,"
+    )
+    params = cursor_cloud.review_model_params()
+    assert params == [
+        {"id": "fast", "value": "false"},
+        {"id": "effort", "value": "high"},
+    ]
+    assert cursor_cloud.model_variant("grok-4.6", params) == (
+        "grok-4.6 fast=false,effort=high"
+    )
+    assert cursor_cloud.model_variant("grok-4.6", []) == "grok-4.6"
 
 
 async def test_api_errors_degrade_to_none(monkeypatch, _configured):

@@ -2377,6 +2377,74 @@ class _Started(NamedTuple):
     blind: bool
     attempts: int
     refusal: cursor_cloud.Refusal | None
+    #: Параметры модели, с которыми ушёл последний заказ (#1417).
+    params: list[cursor_cloud.ModelParam] | None = None
+    #: Параметры, которые провайдер отверг 400-м, и сам отказ (#1417).
+    #: Пусто — не отвергались. Вина их доказана, только если после них
+    #: голый заказ создал агента (см. ``_name_the_dropped_params``).
+    refused_params: list[cursor_cloud.ModelParam] | None = None
+    params_refusal: cursor_cloud.Refusal | None = None
+
+
+#: Коды 400, которые НАЗЫВАЮТ причину помимо параметров: лимит счёта,
+#: недоступная модель (#1036, #1182). Повтор без параметров на них купил бы
+#: тот же отказ вторым запросом — ровно то, что #1199 запретил.
+_NOT_ABOUT_PARAMS_CODES: frozenset[str] = frozenset(
+    {
+        "usage_limit_exceeded",
+        "insufficient_quota",
+        "invalid_model",
+        "model_not_available",
+        "model_unavailable",
+    }
+)
+
+
+def _params_were_refused(
+    params: list[cursor_cloud.ModelParam],
+    refusal: cursor_cloud.Refusal | None,
+) -> bool:
+    """400 на заказ с параметрами — повод один раз заказать без них (#1417).
+
+    Cursor на 400 причину толком не называет («[invalid_argument] Error»),
+    поэтому признак — сам факт: параметры были, провайдер отверг, и код
+    отказа не называет другой причины. Повтор ничего не стоит — отвергнутый
+    заказ агента не создаёт, — а вину параметров доказывает только его успех
+    (см. ``_name_the_dropped_params``).
+    """
+    return (
+        bool(params)
+        and refusal is not None
+        and refusal.status == 400
+        and refusal.code not in _NOT_ABOUT_PARAMS_CODES
+    )
+
+
+async def _name_the_dropped_params(
+    db: aiosqlite.Connection, task_id: int, model_id: str, started: _Started
+) -> str:
+    """Записать отказ параметров, если он доказан; вернуть фактический вариант.
+
+    Alert пишется только тогда, когда голый заказ прошёл: иначе отказ не про
+    параметры, и сообщение о них назвало бы чужую причину (#1199).
+    """
+    refused = started.params_refusal
+    if refused is not None and started.agent_id:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "alert",
+            "Заказ ревьюера "
+            f"{cursor_cloud.model_variant(model_id, started.refused_params)} "
+            f"провайдер отверг: HTTP {refused.status}"
+            + (f", {refused.code}" if refused.code else "")
+            + (f" ({refused.detail[:120]})" if refused.detail else "")
+            + ". Повтор без параметров прошёл — прогон идёт в варианте модели "
+            "по умолчанию (у Cursor это Fast, вдвое дороже). Проверьте "
+            "CURSOR_REVIEW_MODEL_PARAMS по GET /v1/models (#1417).",
+        )
+    return cursor_cloud.model_variant(model_id, started.params)
 
 
 def _lost_call_detail(started: _Started) -> str:
@@ -2439,6 +2507,7 @@ async def _create_or_adopt(
     prompt_text: str,
     hub_mcp_url: str,
     reviewer_token: str,
+    model_params: list[cursor_cloud.ModelParam] | None = None,
 ) -> _Started:
     """Создать ревьюера, а если ответ не дошёл — спросить, не создан ли он.
 
@@ -2446,10 +2515,17 @@ async def _create_or_adopt(
     нашёлся живой оплаченный агент (08:49:06Z, 08:50:53Z, 11:28:05Z).
     Наивный повтор покупал бы второго каждый раз, поэтому порядок такой:
     спросить, подобрать, и только на подтверждённой пустоте повторить.
+
+    ``model_params`` (#1417): 400 на заказ с ними — один заказ без них.
+    Отвергнутый заказ агента не создаёт, так что второго ревьюера этот
+    повтор не покупает; дальше (сверка, повтор по обрыву) — без параметров.
     """
     adopted = False
     blind = False
     attempts = 1
+    params = list(model_params or [])
+    refused_params: list[cursor_cloud.ModelParam] | None = None
+    params_refusal: cursor_cloud.Refusal | None = None
 
     async def _attempt() -> tuple[str, str, cursor_cloud.Refusal | None]:
         created, refusal = await cursor_cloud.create_agent_attempt(
@@ -2460,6 +2536,7 @@ async def _create_or_adopt(
             hub_mcp_url=hub_mcp_url,
             reviewer_token=reviewer_token,
             name=marker,
+            model_params=params,
         )
         agent = (created or {}).get("agent") or {}
         run = (created or {}).get("run") or {}
@@ -2472,6 +2549,9 @@ async def _create_or_adopt(
         )
 
     agent_id, run_id, refusal = await _attempt()
+    if not agent_id and _params_were_refused(params, refusal):
+        refused_params, params_refusal, params = params, refusal, []
+        agent_id, run_id, refusal = await _attempt()
     while not agent_id and refusal is not None and refusal.is_transport:
         seen = await cursor_cloud.find_agent_by_name(marker)
         if not seen.asked:
@@ -2500,7 +2580,17 @@ async def _create_or_adopt(
         attempts += 1
         agent_id, run_id, refusal = await _attempt()
 
-    return _Started(agent_id, run_id, adopted, blind, attempts, refusal)
+    return _Started(
+        agent_id,
+        run_id,
+        adopted,
+        blind,
+        attempts,
+        refusal,
+        params,
+        refused_params,
+        params_refusal,
+    )
 
 
 async def _cloud_config_missing(
@@ -2764,8 +2854,10 @@ async def maybe_dispatch_review(
         prompt_text=order.prompt,
         hub_mcp_url=f"{instance_base_url().rstrip('/')}/mcp",
         reviewer_token=reviewer_token,
+        model_params=cursor_cloud.review_model_params(),
     )
     agent_id, run_id = started.agent_id, started.run_id
+    variant = await _name_the_dropped_params(db, task_id, model_id, started)
     if not agent_id:
         # МЕСТО ПРИМЕНЕНИЯ №1 второй двери (#1252): отказ СИНХРОННЫЙ — агент
         # не создался, денег не потрачено. Алерт остаётся на месте: отказ
@@ -2857,7 +2949,7 @@ async def maybe_dispatch_review(
         task_id,
         "hub",
         "status",
-        f"Кросс-модельное ревью вызвано хабом: модель {model_id} "
+        f"Кросс-модельное ревью вызвано хабом: модель {variant} "
         f"(семейство ≠ {task.get('submission_model') or 'не заявлено'}), "
         f"{profile_note}, агент {agent_id}. Правила репозитория: "
         f"{order.rules_note} (#873). Предмет ревью: {order.diff_note} (#874). "
@@ -2881,6 +2973,7 @@ async def maybe_dispatch_review(
         actor="policy",
         payload={
             "model": model_id,
+            "model_params": started.params,
             "agent_id": agent_id,
             "adopted": started.adopted,
             "run_id": run_id,
