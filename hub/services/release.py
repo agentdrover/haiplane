@@ -570,9 +570,8 @@ async def _return_the_release(
         "сливается. Squash здесь нельзя: коммит релиза должен стать предком "
         f"{head}, иначе расхождение копится снова."
     )
-    why = "форж отказал"
     try:
-        return_pr = await plugins.git_ops.open_release_pr(
+        return_pr, why = await plugins.git_ops.open_return_pr(
             head,
             base,
             title,
@@ -584,6 +583,7 @@ async def _return_the_release(
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure
         log.warning("release: return PR %s → %s not opened: %s", base, head, exc)
         return_pr, why = None, str(exc)
+    why = why or "форж отказал"
     if not return_pr:
         await log_activity(
             db, "release", f"{slug}: PR возврата {base} в {head} не открыт", why
@@ -617,11 +617,12 @@ async def _merge_pending_return(
     repo_path, gh_repo = ctx.get("repo"), ctx.get("gh_repo")
     forge = ctx.get("forge", "")
     try:
-        return_pr = await plugins.git_ops.open_pr_between(
+        return_pr, lookup = await plugins.git_ops.open_pr_between(
             head, base, repo=repo_path, gh_repo=gh_repo, forge=forge
         )
         if not return_pr:
-            return ""
+            # #516: a failed lookup and a stranger's PR are causes, not "none".
+            return f"возврат {base} в {head}: {lookup}" if lookup else ""
         waits = await _why_the_return_waits(return_pr, ctx)
         if waits == "":
             return ""

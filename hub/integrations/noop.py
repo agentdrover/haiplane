@@ -357,8 +357,21 @@ class NoopGitOps:
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
-    ) -> int | None:
-        return None
+    ) -> tuple[int | None, str]:
+        return (None, "")
+
+    async def open_return_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[int | None, str]:
+        return (None, "git integration is not configured")
 
     async def merge_return_pr(
         self,
@@ -765,6 +778,16 @@ class NoopForge:
         self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
     ) -> int | None:
         return None
+
+    async def pr_between(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[int | None, str]:
+        return (None, "форж не настроен")
 
     async def open_or_update_pr(
         self,

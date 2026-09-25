@@ -2969,24 +2969,51 @@ class GitOpsIntegration:
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
-    ) -> int | None:
-        """The open PR carrying ``head`` into ``base``, or None (#1426).
+    ) -> tuple[int | None, str]:
+        """The open PR ``head`` → ``base`` from this repository (#1426).
 
-        Both ends are checked, not only the head. The release return is the
-        PR main → develop, and a PR from main into anything else is not ours:
-        merging it as "the return" would put main somewhere nobody asked.
-        The forge lists PRs by head only, so the base is read back from the
-        PR itself. The first open PR with this head is the one judged — a
-        second PR from main is a state a human made and a human sorts out.
+        ``(number, "")``, ``(None, "")`` when there is none, ``(None, reason)``
+        when the list could not be read or only a stranger's PR matched. The
+        forge filters by base AND head, and accepts only a head that lives in
+        this repository: a fork's ``main`` is not the release branch, and a PR
+        from main into anything but ``base`` is not the return.
+        """
+        return await self._forge_for(forge).pr_between(
+            base, head, repo=repo, gh_repo=gh_repo
+        )
+
+    async def open_return_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[int | None, str]:
+        """Find the return PR ``head`` → ``base``, or create exactly that one (#1426).
+
+        Not ``open_release_pr``: that one finds a PR by head alone and edits
+        it, so an open PR main → staging would have been renamed into "the
+        return" while main → develop was never created. Here nobody else's PR
+        is touched. A lookup that failed stops the call — creating blindly on
+        "could not read" is how a second PR appears (#516).
+
+        The number ``create_pr`` answers is not trusted either: on "already
+        exists" it falls back to a head-only lookup. The PR is looked up again
+        by base and head instead, and that answer is the result.
         """
         adapter = self._forge_for(forge)
-        pr_number = await adapter.pr_for_branch(head, repo=repo, gh_repo=gh_repo)
-        if not pr_number:
-            return None
-        pr_base, pr_head = await adapter.pr_refs(pr_number, repo=repo, gh_repo=gh_repo)
-        if (pr_base, pr_head) != (base, head):
-            return None
-        return pr_number
+        found, why = await adapter.pr_between(base, head, repo=repo, gh_repo=gh_repo)
+        if found or why:
+            return (found, why)
+        await adapter.create_pr(title, body, head, base, repo=repo, gh_repo=gh_repo)
+        found, why = await adapter.pr_between(base, head, repo=repo, gh_repo=gh_repo)
+        if found or why:
+            return (found, why)
+        return (None, "форж не создал PR")
 
     async def merge_return_pr(
         self,

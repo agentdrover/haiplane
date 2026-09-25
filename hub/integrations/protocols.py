@@ -358,8 +358,9 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> bool | None: ...
-    # #1426: возврат релиза идёт PR-ом. Открытый PR ``head`` → ``base``
-    # (обе ветки сверены), и его мерж мерж-коммитом с сохранением головы.
+    # #1426: возврат релиза идёт PR-ом. Открытый PR ``head`` → ``base`` из
+    # этого же репозитория — ``(номер | None, причина)``; его открытие по паре
+    # база+голова; его мерж мерж-коммитом с сохранением головы.
     async def open_pr_between(
         self,
         base: str,
@@ -368,7 +369,18 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
-    ) -> int | None: ...
+    ) -> tuple[int | None, str]: ...
+    async def open_return_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[int | None, str]: ...
     async def merge_return_pr(
         self,
         pr_number: int,
@@ -695,6 +707,17 @@ class ForgePlugin(Protocol):
     async def pr_for_branch(
         self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
     ) -> int | None: ...
+    # #1426: открытый PR ``head`` → ``base`` только из ЭТОГО репозитория.
+    # ``(номер, "")`` | ``(None, "")`` | ``(None, причина)`` — сбой чтения и
+    # PR из форка называются, а не читаются как «PR нет» (#516).
+    async def pr_between(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[int | None, str]: ...
     async def open_or_update_pr(
         self,
         base: str,

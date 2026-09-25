@@ -154,6 +154,7 @@ _FORGE_REACHING = (
     "merge_pr_with_detail",
     "merge_return_pr",
     "open_pr_between",
+    "open_return_pr",
     "open_release_pr",
     "pr_for_branch",
     "pr_is_draft",

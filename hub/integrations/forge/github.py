@@ -126,6 +126,54 @@ class GitHubForge:
                 pass
         return None
 
+    async def pr_between(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[int | None, str]:
+        """The open PR ``head`` → ``base`` from THIS repository (#1426).
+
+        ``(number, "")`` — found; ``(None, "")`` — there is none;
+        ``(None, reason)`` — the list could not be read, or only PRs from
+        other repositories matched. The last two are named, never collapsed
+        into "none" (#516): the caller would otherwise create a second PR
+        blindly, or stay silent while a stranger's PR sits there.
+
+        ``--head`` filters by branch NAME only: a fork's ``attacker:main``
+        passes it. Pull-request CI runs for forks too, so a green fork PR
+        would have been merged into develop as "the return". Only a PR whose
+        head lives in this repository — not cross-repository, and owned by
+        this repository's owner — is accepted.
+        """
+        slug = gh_repo or REPO_NAME
+        rc, out, err = await _gh(
+            "pr",
+            "list",
+            "--repo",
+            slug,
+            "--base",
+            base,
+            "--head",
+            head,
+            "--state",
+            "open",
+            "--json",
+            "number,isCrossRepository,headRepositoryOwner",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            said = (err or out or "").strip() or f"gh rc={rc}"
+            return (None, f"список PR {head} → {base} не прочитан: {said[:150]}")
+        try:
+            prs = json.loads(out or "[]")
+        except json.JSONDecodeError:
+            return (None, f"список PR {head} → {base} не разобран")
+        return _own_repo_pr(prs, slug, head)
+
     async def open_or_update_pr(
         self,
         base: str,
@@ -1097,3 +1145,24 @@ class GitHubForge:
         if rc != 0 or not out:
             return []
         return [line.strip() for line in reversed(out.splitlines()) if line.strip()]
+
+
+def _own_repo_pr(prs: object, slug: str, head: str) -> tuple[int | None, str]:
+    """The first listed PR whose head is in ``slug`` itself (#1426)."""
+    if not isinstance(prs, list):
+        return (None, f"список PR с головой {head} не разобран")
+    owner = slug.split("/", 1)[0].lower()
+    foreign: list[str] = []
+    for pr in prs:
+        if not isinstance(pr, dict) or not isinstance(pr.get("number"), int):
+            continue
+        login = str((pr.get("headRepositoryOwner") or {}).get("login") or "")
+        if pr.get("isCrossRepository") is False and login.lower() == owner:
+            return (int(pr["number"]), "")
+        foreign.append(f"#{pr['number']} ({login or '?'}:{head})")
+    if foreign:
+        return (
+            None,
+            f"PR из чужого репозитория не принят за возврат: {', '.join(foreign)}",
+        )
+    return (None, "")

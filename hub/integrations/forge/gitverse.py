@@ -316,6 +316,49 @@ class GitVerseForge:
                 return int(pr["number"])
         return None
 
+    async def pr_between(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[int | None, str]:
+        """Открытый PR ``head`` → ``base`` из ЭТОГО репозитория (#1426).
+
+        Контракт тот же, что у GitHub: сбой чтения и PR из чужого репозитория
+        называются причиной, а не сводятся к «PR нет» (#516).
+        """
+        slug = self._repo(gh_repo)
+        if not slug:
+            return (None, "репозиторий не назван")
+        resp = await self._request(
+            "GET", f"/repos/{slug}/pulls", params={"state": "open"}
+        )
+        if not resp.ok or not isinstance(resp.data, list):
+            return (None, f"список PR {head} → {base} не прочитан")
+        foreign: list[str] = []
+        for pr in resp.data:
+            if not isinstance(pr, dict) or not isinstance(pr.get("number"), int):
+                continue
+            pr_base, pr_head = pr.get("base"), pr.get("head")
+            if not isinstance(pr_base, dict) or not isinstance(pr_head, dict):
+                continue
+            if (pr_base.get("ref"), pr_head.get("ref")) != (base, head):
+                continue
+            head_repo = pr_head.get("repo")
+            name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+            if name and str(name).lower() != slug.lower():
+                foreign.append(f"#{pr['number']} ({name}:{head})")
+                continue
+            return (int(pr["number"]), "")
+        if foreign:
+            return (
+                None,
+                f"PR из чужого репозитория не принят за возврат: {', '.join(foreign)}",
+            )
+        return (None, "")
+
     async def open_or_update_pr(
         self,
         base: str,
