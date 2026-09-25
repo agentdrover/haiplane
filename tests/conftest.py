@@ -140,6 +140,20 @@ def _forget_gate_merges():
 
 
 @pytest.fixture(autouse=True)
+def _forget_models_catalog():
+    """Empty the Cursor models-catalog cache around every test (#1423).
+
+    The cache is process-wide for an hour; one test's catalog would otherwise
+    choose the reviewer's model params for the next.
+    """
+    from hub.integrations import cursor_cloud
+
+    cursor_cloud.forget_models_catalog()
+    yield
+    cursor_cloud.forget_models_catalog()
+
+
+@pytest.fixture(autouse=True)
 def _setup_mock_plugins():
     """Install mock plugins for all tests, restore originals after."""
     orig_dispatch = plugins.dispatch

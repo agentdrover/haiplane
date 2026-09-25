@@ -154,6 +154,14 @@ def _wire(monkeypatch, recorder: _DispatchRecorder) -> None:
 
     monkeypatch.setattr(cursor_cloud, "get_usage", _no_usage)
 
+    async def _no_catalog():
+        # Умолчание params — подбор по каталогу (#1423), а ключ выше фальшивый:
+        # без подставки заказ пошёл бы за каталогом в настоящий Cursor.
+        # «Не ответил» — заказ без params; каталог дают тесты, которым он нужен.
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "list_models", _no_catalog)
+
 
 async def _any_dispatch_row(db: aiosqlite.Connection, task_id: int) -> dict:
     rows = await db.execute_fetchall(
@@ -5017,15 +5025,16 @@ async def test_a_real_refusal_is_neither_reconciled_nor_retried(
 class _ParamsRefusingProvider:
     """Провайдер, отвергающий заказ с params 400-м, а голый — по сценарию."""
 
-    def __init__(self, bare_refusal=None):
+    def __init__(self, bare_refusal=None, code="invalid_argument"):
         self.bare_refusal = bare_refusal
+        self.code = code
         self.calls: list[dict] = []
 
     async def __call__(self, **kwargs):
         self.calls.append(kwargs)
         if kwargs.get("model_params"):
             return None, cursor_cloud.Refusal(
-                status=400, code="invalid_argument", detail="Unknown param fast"
+                status=400, code=self.code, detail="Unknown param fast"
             )
         if self.bare_refusal is not None:
             return None, self.bare_refusal
@@ -5067,6 +5076,68 @@ async def test_rejected_model_params_fall_back_once_and_alert(
     alerts = await _alerts(db, task_id)
     assert "fast=false" in alerts and "HTTP 400" in alerts
     assert "invalid_argument" in alerts
+
+
+def _recorded_catalog() -> dict:
+    """Выдержка GET /v1/models, та же, что сверяет test_cursor_cloud (#1423)."""
+    path = Path(__file__).parent / "fixtures" / "cursor_models_catalog.json"
+    return json.loads(path.read_text())
+
+
+async def test_invalid_model_on_params_falls_back_to_bare_order(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1423 AC-1: 400 invalid_model на заказ с params — один заказ без них.
+
+    Ровно так Cursor ответил на ``[{fast:false}]`` для grok-4.6 25.09 (заказы
+    449–457), а запасной путь #1417 invalid_model пропускал как «не про
+    параметры» — и ревью встало для всех. Params здесь — из каталога, как
+    на проде по умолчанию: даже верно подобранный вариант может оказаться
+    отвергнут, и ревью от этого теряться не должно.
+    """
+    provider = _ParamsRefusingProvider(code="invalid_model")
+    _wire(monkeypatch, _DispatchRecorder(None))
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", provider)
+    catalog = _recorded_catalog()
+
+    async def _catalog():
+        return catalog
+
+    monkeypatch.setattr(cursor_cloud, "list_models", _catalog)
+
+    task_id = await _submitted(client, db, "spike-invalid-model-params")
+
+    assert len(provider.calls) == 2, "ровно два запроса: с params и без"
+    assert provider.calls[0]["model_params"] == [
+        {"id": "effort", "value": "high"},
+        {"id": "fast", "value": "false"},
+    ]
+    assert not provider.calls[1]["model_params"]
+    active = await repo.list_active_review_dispatches(db)
+    assert len(active) == 1
+    assert dict(active[0])["agent_id"] == "bc-bare"
+    alerts = await _alerts(db, task_id)
+    assert "grok-4.6 effort=high,fast=false" in alerts
+    assert "HTTP 400, invalid_model" in alerts
+    assert "Кросс-модельное ревью НЕ вызвано" not in alerts
+
+
+async def test_quota_refusal_with_params_is_not_retried(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1423 AC-2: лимит счёта — не про параметры, повтор купил бы тот же отказ."""
+    provider = _ParamsRefusingProvider(code="usage_limit_exceeded")
+    _wire(monkeypatch, _DispatchRecorder(None))
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", provider)
+    monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL_PARAMS", "effort=high,fast=false")
+
+    task_id = await _submitted(client, db, "spike-quota-params")
+
+    assert len(provider.calls) == 1, "на лимит счёта повтора без params нет"
+    assert not await repo.list_active_review_dispatches(db)
+    alerts = await _alerts(db, task_id)
+    assert "провайдер отказал: HTTP 400, usage_limit_exceeded" in alerts
+    assert "Повтор без параметров" not in alerts
 
 
 async def test_a_bare_retry_refused_too_is_not_blamed_on_params(
