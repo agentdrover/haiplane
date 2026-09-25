@@ -4279,3 +4279,114 @@ async def test_the_registry_delivers_only_rows_it_lists_as_pr_open(
 
     missing = await client.post("/api/delivery/discrepancies/999999/deliver")
     assert missing.status_code == 404
+
+
+# ---- #1407: два различения гейта доставки после #1398 ----
+
+
+def _feed_text(updates) -> str:
+    return " ".join(dict(u)["content"] or "" for u in updates)
+
+
+async def _called_a_human(db: aiosqlite.Connection, task_id: int) -> bool:
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    return any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    )
+
+
+async def test_a_slow_gate_merge_is_not_merged_twice(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1407 AC-1: истёкшее ожидание — «мерж ещё идёт», а не «мержа нет».
+
+    Первый путь гейта вливает PR, форж отвечает дольше GATE_MERGE_WAIT_SECONDS.
+    Второй путь (report_done) не зовёт форж второй раз, пока первый вызов жив:
+    второй мерж GitHub отклонил бы, и это та же гонка #1376/#1398.
+    """
+    import asyncio
+
+    from hub.services import orchestration
+
+    g = _git(CIProbeOutcome.passed, merged=True)
+    task_id = await _approved_pair_task(db)
+    release = asyncio.Event()
+    calls: list[int] = []
+
+    async def _slow_merge(pr_number, *_a, **_k):
+        calls.append(pr_number)
+        if len(calls) == 1:
+            await release.wait()
+            return True, ""
+        return False, ""
+
+    g.merge_pr_with_detail = AsyncMock(side_effect=_slow_merge)
+    monkeypatch.setattr(orchestration, "GATE_MERGE_WAIT_SECONDS", 0.05)
+
+    task = dict(await repo.get_task(db, task_id))
+    first = asyncio.create_task(
+        orchestration._registered_gate_merge((task_id, 77), task, {})
+    )
+    await asyncio.sleep(0)
+    assert calls == [77], "первый путь уже в форже"
+
+    await _report_done(db, task_id)
+
+    assert calls == [77], "второй вызов форжа, пока первый жив, — гонка #1398"
+    status = dict(await repo.get_task(db, task_id))["status"]
+    assert status == "running", "идущий мерж — ожидание, а не решение человека"
+    assert not await _called_a_human(db, task_id)
+    feed = _feed_text(await repo.get_task_updates(db, task_id))
+    assert orchestration.GATE_MERGE_IN_FLIGHT_PREFIX in feed, "причина названа"
+    assert "merge_failed" not in feed
+
+    release.set()
+    assert await first == (True, "")
+
+
+async def test_an_unreadable_merge_commit_is_not_called_a_manual_merge(
+    db: aiosqlite.Connection,
+) -> None:
+    """#1407 AC-2: «проверить не удалось» — не «гейт не вливал».
+
+    PR MERGED, строки pipeline_merges нет, а merge-коммит не читается — это
+    временный исход с названной причиной, а не терминальный
+    MERGED_OUTSIDE_GATE (#516/#549: отсутствие данных не вывод). Прочитанный
+    sha без следа гейта — по-прежнему ручной мерж.
+    """
+    from hub.services import orchestration
+
+    g = _git(CIProbeOutcome.passed, merged=False)
+    g.pr_state = AsyncMock(return_value="merged")
+    g.merge_commit_sha = AsyncMock(side_effect=RuntimeError("gh молчит"))
+    unread = await _approved_pair_task(db)
+
+    await _report_done(db, unread)
+
+    assert dict(await repo.get_task(db, unread))["status"] == "running"
+    assert not await _called_a_human(db, unread)
+    feed = _feed_text(await repo.get_task_updates(db, unread))
+    assert orchestration.MERGE_COMMIT_UNVERIFIED_PREFIX in feed, "причина названа"
+    assert orchestration.MERGED_OUTSIDE_GATE_PREFIX not in feed
+    assert not list(await db.execute_fetchall("SELECT 1 FROM pipeline_merges"))
+
+    g.merge_commit_sha = AsyncMock(return_value="manual0merge0sha")
+    manual = await _approved_pair_task(db, pr_number=78)
+
+    await _report_done(db, manual)
+
+    assert dict(await repo.get_task(db, manual))["status"] == "needs_decision"
+    feed = _feed_text(await repo.get_task_updates(db, manual))
+    assert orchestration.MERGED_OUTSIDE_GATE_PREFIX in feed
+
+
+@pytest.mark.parametrize(
+    "prefix", ["GATE_MERGE_IN_FLIGHT_PREFIX", "MERGE_COMMIT_UNVERIFIED_PREFIX"]
+)
+def test_the_1407_outcomes_are_transient(prefix: str) -> None:
+    """#1407: оба новых исхода — ожидание цикла, а не вызов человека."""
+    from hub.services import orchestration
+
+    value = getattr(orchestration, prefix)
+    assert value.startswith(orchestration.TRANSIENT_GATE_PREFIXES)
+    assert not value.startswith(orchestration.MERGED_OUTSIDE_GATE_PREFIX)
