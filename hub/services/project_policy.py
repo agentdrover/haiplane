@@ -499,3 +499,33 @@ async def risk_map_for_task(
     if not isinstance(raw, dict) or not raw:
         return None
     return {str(k): str(v) for k, v in raw.items()}
+
+
+# Очередь исполнения проекта (#1274). Режим ``shadow`` — хаб пишет в ленту,
+# какую задачу взял бы следующей и почему пропустил остальные, но сам ничего
+# не стартует; запуск исполнителя — F2. Нет ключа, опечатка, значение из
+# будущей версии — всё это ``off`` (#835): нечитаемая политика не включает
+# даже тень. ``wip_limit`` — сколько задач проекта может стоять в running и
+# review разом; нет ключа — лимита нет.
+QUEUE_MODE_KEY = "orchestrator_queue"
+WIP_LIMIT_KEY = "wip_limit"
+QUEUE_OFF = "off"
+QUEUE_SHADOW = "shadow"
+QUEUE_MODES: tuple[str, ...] = (QUEUE_OFF, QUEUE_SHADOW)
+
+
+def queue_mode_of(policy: dict) -> str:
+    """``shadow`` только когда так и записано; всё остальное — ``off``."""
+    if isinstance(policy, dict) and policy.get(QUEUE_MODE_KEY) == QUEUE_SHADOW:
+        return QUEUE_SHADOW
+    return QUEUE_OFF
+
+
+def wip_limit_of(policy: dict) -> int | None:
+    """WIP-лимит проекта; ``None`` — лимита нет (как и нечитаемое значение)."""
+    if not isinstance(policy, dict):
+        return None
+    limit = policy.get(WIP_LIMIT_KEY)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        return None
+    return limit

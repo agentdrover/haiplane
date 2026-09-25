@@ -10,6 +10,118 @@
 latency и размер ответов — на отдельной странице:
 <a href="/metrics/agent-api">Agent API usage</a>.</p>
 
+{% set e = m.review_economy %}
+<h2 id="review-economy">Сводка ревью: что куплено и что дало</h2>
+<p class="muted">Цена — только счёт провайдера. Самоотчёт харнесса
+(<code>tokens_spent</code>) занижен в 12–62 раза и сюда не входит ни в одно
+число. Прогон без счёта — отдельная строка: он не бесплатный, и его цена
+неизвестна (#1406).</p>
+<table class="task-table">
+    <thead><tr><th>Прогоны</th><th>Всего</th><th>Со счётом</th><th>Без счёта</th>
+        <th>Provider-токены</th><th>На прогон со счётом</th></tr></thead>
+    <tbody>
+        <tr><td><strong>Итого</strong></td>
+            <td data-metric="runs.total">{{ e.runs.total }}</td>
+            <td data-metric="runs.billed">{{ e.runs.billed }}</td>
+            <td data-metric="runs.unbilled">{{ e.runs.unbilled }}</td>
+            <td data-metric="runs.provider_tokens_total">{{ e.runs.provider_tokens_total }}</td>
+            <td>{{ e.runs.provider_tokens_per_billed_run if e.runs.provider_tokens_per_billed_run is not none else "нет счёта" }}</td></tr>
+        {% for row in e.runs.by_profile %}
+        <tr><td>профиль {{ row.profile }}</td><td>{{ row.runs }}</td><td>{{ row.billed_runs }}</td>
+            <td>{{ row.unbilled_runs }}</td><td>{{ row.provider_tokens_total }}</td>
+            <td>{{ row.provider_tokens_per_run if row.provider_tokens_per_run is not none else "нет счёта" }}</td></tr>
+        {% endfor %}
+        {% for row in e.runs.by_kind %}
+        <tr><td>{{ row.label }}</td><td>{{ row.runs }}</td><td>{{ row.billed_runs }}</td>
+            <td>{{ row.unbilled_runs }}</td><td>{{ row.provider_tokens_total }}</td>
+            <td>{{ row.provider_tokens_per_run if row.provider_tokens_per_run is not none else "нет счёта" }}</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h3>Находки: unresolved отдельно от confirmed</h3>
+<table class="task-table">
+    <tbody>
+        <tr><td>Независимых отчётов с данными</td><td>{{ e.findings.independent_reports }}
+            {% if e.findings.undersampled %}<span class="muted">(недобор: n={{ e.findings.n }} &lt; {{ e.min_sample }})</span>{% endif %}</td></tr>
+        <tr><td>Отчётов с unresolved</td>
+            <td data-metric="findings.reports_with_unresolved">{{ e.findings.reports_with_unresolved }}</td></tr>
+        <tr><td>Доля отчётов с unresolved</td>
+            <td>{{ e.findings.unresolved_report_share if e.findings.unresolved_report_share is not none else "нет данных" }}</td></tr>
+        <tr><td>unresolved всего</td>
+            <td data-metric="findings.unresolved_total">{{ e.findings.unresolved_total }}</td></tr>
+        <tr><td>Отчётов с confirmed</td><td>{{ e.findings.reports_with_confirmed }}</td></tr>
+        <tr><td>confirmed всего</td>
+            <td data-metric="findings.confirmed_total">{{ e.findings.confirmed_total }}</td></tr>
+        <tr><td>Самоотчёты <span class="muted">(не независимое ревью, рядом, не внутри)</span></td>
+            <td>{{ e.findings.self_reviewed.reports }} отчётов: confirmed {{ e.findings.self_reviewed.confirmed }}, unresolved {{ e.findings.self_reviewed.unresolved }}</td></tr>
+        {% for row in e.findings.by_profile %}
+        <tr><td>профиль {{ row.profile }}</td>
+            <td>{{ row.reports }} отчётов: confirmed {{ row.confirmed }}, unresolved {{ row.unresolved }}</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h3>Прогоны, купленные на красном CI</h3>
+<table class="task-table">
+    <tbody>
+        <tr><td>На красном CI закреплённого sha</td>
+            <td data-metric="red_ci.runs">{{ e.red_ci.runs }}</td></tr>
+        <tr><td>Provider-токены на красном CI <span class="muted">(без счёта: {{ e.red_ci.unbilled_runs }})</span></td>
+            <td data-metric="red_ci.provider_tokens">{{ e.red_ci.provider_tokens }}</td></tr>
+        <tr><td>На зелёном CI</td><td data-metric="red_ci.runs_on_green_ci">{{ e.red_ci.runs_on_green_ci }}</td></tr>
+        <tr><td>CI не определился <span class="muted">(unknown — не успех и не провал)</span></td>
+            <td data-metric="red_ci.runs_ci_undetermined">{{ e.red_ci.runs_ci_undetermined }}</td></tr>
+        <tr><td>Проверки пропущены <span class="muted">(skipped)</span></td>
+            <td data-metric="red_ci.runs_ci_skipped">{{ e.red_ci.runs_ci_skipped }}</td></tr>
+        <tr><td>Без отчёта CI <span class="muted">(в «красные» не входят)</span></td>
+            <td data-metric="red_ci.runs_without_ci_report">{{ e.red_ci.runs_without_ci_report }}</td></tr>
+    </tbody>
+</table>
+
+<h3>Когорта назначения профиля (#1403)</h3>
+{% if e.profile_assignment.available %}
+<table class="task-table">
+    <tbody>
+        {% for row in e.profile_assignment.cohorts %}
+        <tr><td>{{ row.cohort }}</td><td>{{ row.runs }} прогонов, {{ row.provider_tokens_total }} provider-токенов</td></tr>
+        {% else %}
+        <tr><td colspan="2" class="muted">прогонов в окне нет</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="muted">{{ e.profile_assignment.note }}</p>
+{% endif %}
+
+<h3>Сверка отчётов со счётом провайдера</h3>
+<table class="task-table">
+    <tbody>
+        <tr><td>Отчётов machine_reviews</td>
+            <td data-metric="reconciliation.reports">{{ e.reconciliation.reports }}</td></tr>
+        <tr><td>Оплаченных прогонов</td>
+            <td data-metric="reconciliation.paid_runs">{{ e.reconciliation.paid_runs }}</td></tr>
+        <tr><td>Расхождение</td>
+            <td data-metric="reconciliation.gap">{{ e.reconciliation.gap }}</td></tr>
+        {% for b in e.reconciliation.buckets %}
+        <tr><td>{{ b.label }}</td>
+            <td data-metric="reconciliation.{{ b.bucket }}">{{ b.count }}</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% if e.reconciliation.main_cause %}
+<p class="muted">Главная названная причина: {{ e.reconciliation.main_cause }}.</p>
+{% endif %}
+
+<h3>Эскейпы и непосчитанное (#528)</h3>
+<table class="task-table">
+    <tbody>
+        <tr><td>Багов на закрытые фичи</td><td>{{ e.escapes.escaped }} из {{ e.escapes.bugs_in_window }}</td></tr>
+        <tr><td>Непосчитано: багов без фичи-предка</td><td>{{ e.escapes.uncounted.bugs_without_feature }}</td></tr>
+        <tr><td>Непосчитано: закрытых фич без отметки завершения</td><td>{{ e.escapes.uncounted.features_without_completion }}</td></tr>
+    </tbody>
+</table>
+
 <h2>Machine reviews</h2>
 <table class="task-table">
     <tbody>

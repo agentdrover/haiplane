@@ -2461,3 +2461,15 @@ def test_delivery_deliver_posts_to_the_registry_deliver_endpoint() -> None:
     )
     assert rc == 0
     api.assert_called_once_with("POST", "/api/delivery/discrepancies/1276/deliver", {})
+
+
+def test_review_economy_prints_the_section_of_practice_metrics(capsys) -> None:
+    # #1406: CLI reads the same REST section the page and MCP read.
+    econ = {"runs": {"total": 3, "billed": 2, "unbilled": 1}}
+    rc, api = _run_main(
+        ["review-economy", "--since-days", "30"],
+        api_result={"since_days": 30, "review_economy": econ},
+    )
+    assert rc == 0
+    assert api.call_args.args[:2] == ("GET", "/api/metrics/practices?since_days=30")
+    assert json.loads(capsys.readouterr().out) == econ

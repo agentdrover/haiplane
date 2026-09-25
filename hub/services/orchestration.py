@@ -45,6 +45,7 @@ from hub.services.gate_events import (
     sql_in,
 )
 from hub.integrations import forge as forge_urls
+from hub.services.review_economy import review_economy
 from hub.services.project_policy import (
     base_branch_of,
     ci_runner_of,
@@ -920,7 +921,6 @@ async def practice_metrics(
     # #1243: исход второй оси каскада — без него выкат был бы добавкой к
     # счёту, измеренной без пользы. Тот же приём и то же окно.
     model_cascade = await count_model_cascade_outcomes(db, since_days=since_days)
-
     return {
         "since_days": since_days,
         "machine_reviews": totals,
@@ -947,6 +947,10 @@ async def practice_metrics(
         # #1246: submissions whose prepass failed while the author wrote about
         # runs — a count for a human to compare, not a claim about meaning.
         "validation_run_lines": validation_run_lines,
+        # #1406: сводка ревью для владельца — один агрегат на все поверхности.
+        "review_economy": await review_economy(
+            db, since_days=since_days, escaped=escaped
+        ),
     }
 
 
