@@ -82,6 +82,12 @@ class _PinnedGitOps(NoopGitOps):
         self._rules = rules or {}
 
     async def branch_diff(self, repo, base, branch):
+        if branch != self._tip and re.fullmatch(r"[0-9a-f]{40}", branch or ""):
+            # #1361: a pinned commit other than the tip is ANOTHER submission,
+            # and by default another author edit — every fixture here models
+            # resubmissions as new code. One diff for every sha would read as
+            # "only the base was merged" and carry the report over.
+            return self._diff + f"+{branch}\n"
         return self._diff
 
     async def file_at_ref(self, repo, ref, path):
@@ -1772,7 +1778,7 @@ class _AncestryGitOps(_PinnedGitOps):
         # the ordinary branch diff.
         if base == _PREV_SHA:
             return self._delta
-        return self._diff
+        return await super().branch_diff(repo, base, branch)
 
     async def delta_without_base(self, repo, base, prev, current):
         return self._own
@@ -3125,11 +3131,202 @@ async def test_a_real_resubmission_still_gets_reviewed(
     assert len(recorder.calls) == 3
     await _report_on_current(db, moved)
     await db.commit()
-    plugins.git_ops = _PinnedGitOps("b" * 40, ["docs/notes.md"])
+    # #1361: новая вершина с НОВОЙ авторской строкой. Двойник, отдающий один
+    # дифф на любую вершину, здесь больше не годится: такая пересдача теперь
+    # честно читается как «слита только база».
+    plugins.git_ops = _ShaDiffGitOps(
+        "b" * 40,
+        {_TIP: _HARMLESS_DIFF, "b" * 40: _HARMLESS_DIFF + "+новая строка\n"},
+    )
     await services.submit_for_review(
         db, moved, TaskSubmitReview(model="claude-fable-5")
     )
     assert len(recorder.calls) == 4, "новый sha — новая работа, ревью заказывается"
+
+
+# ---------------------------------------------------------------------------
+# #1361 — пересдача «только слита база» не покупает второго ревью
+# ---------------------------------------------------------------------------
+
+
+class _ShaDiffGitOps(_PinnedGitOps):
+    """Дифф ветки к базе — свой у каждой вершины; имя ветки — текущая вершина."""
+
+    def __init__(self, tip: str, diffs: dict[str, str]) -> None:
+        super().__init__(tip, ["docs/notes.md"], diffs[tip])
+        self._diffs = diffs
+
+    async def branch_diff(self, repo, base, branch):
+        return self._diffs.get(branch, self._diffs[self._tip])
+
+
+# Та же правка автора, что и в _MERGE_OLD, после слияния базы в тот же файл:
+# другие строка index и смещение ханка, строки +/- те же и в том же порядке.
+_MERGE_OLD = (
+    "diff --git a/docs/notes.md b/docs/notes.md\n"
+    "index 1111111..2222222 100644\n"
+    "--- a/docs/notes.md\n"
+    "+++ b/docs/notes.md\n"
+    "@@ -3,0 +4,2 @@ intro\n"
+    "+первая авторская строка\n"
+    "+вторая авторская строка\n"
+)
+_MERGE_NEW = _MERGE_OLD.replace("1111111..2222222", "3333333..4444444").replace(
+    "@@ -3,0 +4,2 @@", "@@ -5,0 +6,2 @@"
+)
+
+
+async def test_a_merge_only_resubmission_carries_the_report_over(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1361): слита только база — отчёт переносится, провайдер не зван.
+
+    Измерено 23.09.2026: #1333 сдача 3 — только слияние develop, заказано
+    deep-ревью, ~4,7 млн токенов, отчёт чистый. Здесь вершина новая, дифф к
+    базе побайтно другой, а правка автора та же — и ревью не покупается: в
+    новом поколении лежит перенесённый отчёт с пометкой, откуда он.
+
+    Обратная сторона в том же тесте: новая авторская строка — ревью
+    заказывается как раньше.
+    """
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-merge-only", diff=_MERGE_OLD)
+    assert len(recorder.calls) == 1, "первая сдача ревью получает"
+    review_id = await _report_on_current(db, task_id)
+    await db.commit()
+
+    plugins.git_ops = _ShaDiffGitOps("b" * 40, {_TIP: _MERGE_OLD, "b" * 40: _MERGE_NEW})
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+
+    assert len(recorder.calls) == 1, "слияние базы не покупает второго ревью"
+    rows = await db.execute_fetchall(
+        "SELECT id FROM review_dispatches WHERE task_id=?", (task_id,)
+    )
+    assert len(rows) == 1, "заказа не появляется: заказ и есть оплата"
+    task = dict(await repo.get_task(db, task_id))
+    carried = [
+        dict(r)
+        for r in await repo.machine_reviews_of_generation(
+            db, task_id, int(task["submission_generation"])
+        )
+    ]
+    assert len(carried) == 1, "в новом поколении лежит перенесённый отчёт"
+    assert carried[0]["carried_from_review_id"] == review_id, (
+        "перенесённый отчёт помечен как перенесённый и называет источник"
+    )
+    assert not carried[0]["provider_tokens"] and not carried[0]["tokens_spent"], (
+        "перенос не выдаётся за новое чтение: денег он не стоил"
+    )
+    updates = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert any("перенесён с поколения 1" in c for c in updates), updates
+
+    # Новая авторская строка — это новая работа, ревью заказывается.
+    plugins.git_ops = _ShaDiffGitOps(
+        "d" * 40,
+        {
+            _TIP: _MERGE_OLD,
+            "b" * 40: _MERGE_NEW,
+            "d" * 40: _MERGE_NEW + "+строка, которой ревью не видело\n",
+        },
+    )
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+    assert len(recorder.calls) == 2, "новая авторская строка покупает ревью"
+
+
+async def test_a_carried_report_is_not_a_new_read_in_the_metrics(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Перенос не считается новым чтением в метриках практики (#1361).
+
+    Чек-лист постановки: перенесённый отчёт помечен и в числе прочитанных
+    отчётов не появляется — иначе экономия выглядела бы как лишний прогон.
+    """
+    from hub.services.orchestration import practice_metrics
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-merge-metrics", diff=_MERGE_OLD)
+    await _report_on_current(db, task_id)
+    await db.commit()
+    before = (await practice_metrics(db))["machine_reviews"]
+
+    plugins.git_ops = _ShaDiffGitOps("b" * 40, {_TIP: _MERGE_OLD, "b" * 40: _MERGE_NEW})
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+    after = (await practice_metrics(db))["machine_reviews"]
+
+    assert after["reports_total"] == before["reports_total"]
+    assert after["reviews"] == before["reviews"]
+    assert after["carried_over"] == before["carried_over"] + 1, (
+        "перенос виден отдельным счётом, а не прячется и не выдаётся за чтение"
+    )
+
+
+async def test_a_carried_report_stands_for_the_current_generation(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Перенесённый отчёт — отчёт ТЕКУЩЕГО поколения, с суждениями источника.
+
+    Без этого перенос кончался бы тупиком: гейт сказал бы «machine-review
+    устарел», а очередь находок снова показала бы человеку то, что он уже
+    разметил на исходном отчёте.
+    """
+    from hub.services.orchestration import machine_review_gap
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-merge-queue", diff=_MERGE_OLD)
+    source = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        harness_skill="lite-diff-review",
+        model="grok-4.6",
+        raw_count=1,
+        findings_confirmed=json.dumps(
+            [{"title": "race on retry", "severity": "high", "file": "hub/a.py"}]
+        ),
+        submitted_by="cursor-cloud-reviewer",
+    )
+    await repo.upsert_finding_disposition(
+        db,
+        review_id=source,
+        task_id=task_id,
+        submission_generation=1,
+        finding_index=0,
+        finding_title="race on retry",
+        disposition="wont_fix",
+        note="принято осознанно",
+        decided_by="owner",
+        finding_uid="",
+    )
+    await db.commit()
+    assert (await repo.count_unjudged_findings(db))["findings"] == 0
+
+    plugins.git_ops = _ShaDiffGitOps("b" * 40, {_TIP: _MERGE_OLD, "b" * 40: _MERGE_NEW})
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+    task = dict(await repo.get_task(db, task_id))
+    current = await repo.machine_reviews_of_generation(
+        db, task_id, int(task["submission_generation"])
+    )
+    assert [dict(r)["carried_from_review_id"] for r in current] == [source]
+    assert "race on retry" in dict(current[0])["findings_confirmed"], (
+        "находки переносятся вместе с отчётом, а не теряются"
+    )
+    assert await machine_review_gap(db, task) is None, (
+        "перенесённый отчёт закрывает требование отчёта текущего поколения"
+    )
+    assert (await repo.count_unjudged_findings(db))["findings"] == 0, (
+        "суждение по исходному отчёту отвечает и за перенесённый"
+    )
 
 
 async def test_a_submission_without_a_pinned_sha_is_not_a_match(

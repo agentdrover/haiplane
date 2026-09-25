@@ -47,6 +47,7 @@ from hub.models import (
 )
 from hub.services import call_sites, project_policy
 from hub.services.model_family import family
+from hub.services.orchestration import ORIGINAL_READ_SQL
 from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
 
 log = logging.getLogger(__name__)
@@ -1840,7 +1841,9 @@ async def _this_code_was_already_read(
     """
     already = await _report_already_covers_this_sha(db, task)
     if not already:
-        return False
+        # #1361: вершина другая — но правка автора может быть той же, если в
+        # ветку приехала только база. Тогда отчёт переносится, а не покупается.
+        return await _carry_the_report_over(db, task)
     # #1265: пересдача того же sha из review теперь штатный повтор (таймаут,
     # две сессии) и приходит сюда на ТОМ ЖЕ поколении снова и снова. Отказ
     # говорится один раз на отчёт — тем же приёмом, каким свип не повторяет
@@ -1927,6 +1930,118 @@ async def _report_already_covers_this_sha(
         if ((dict(row).get("sha") or "").strip()) == pinned:
             return int(dict(row)["review_id"])
     return None
+
+
+async def _latest_full_report(
+    db: aiosqlite.Connection, task_id: int, before_generation: int
+) -> dict[str, Any] | None:
+    """Последний независимый отчёт прошлых поколений со sha его сдачи (#1361).
+
+    Берётся ПОСЛЕДНИЙ, а не лучший: если последнее чтение неполное, переносить
+    нечего — лестница #879 существует затем, чтобы его добрать, и полный отчёт
+    поколением раньше говорит о другом коде.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT mr.*, s.sha AS sha "  # nosec B608 - константа модуля, не ввод
+        "FROM machine_reviews mr "
+        "JOIN submissions s ON s.task_id = mr.task_id "
+        "AND s.generation = mr.submission_generation "
+        "WHERE mr.task_id = ? AND mr.submission_generation < ? "
+        f"AND {INDEPENDENT_READ} "
+        "ORDER BY mr.submission_generation DESC, mr.id DESC LIMIT 1",
+        (task_id, before_generation),
+    )
+    return dict(rows[0]) if rows else None
+
+
+async def _carry_the_report_over(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> bool:
+    """Перенести отчёт на пересдачу, где слита только база (#1361). True — перенесён.
+
+    Измерено 23.09.2026: #1333 сдача 3 — только слияние develop, заказано
+    deep-ревью, ~4,7 млн токенов, отчёт чистый; #1334 и #1337 — ещё два
+    полных прогона за то же. Хаб сам писал «своей правки в этом круге нет» и
+    всё равно платил за новое чтение.
+
+    «Правка та же» решает ОДНО правило на гейт и на ревью —
+    ``orchestration.base_merge_kept_the_verdict`` над
+    ``base_merge.author_edit_same``: упорядоченные строки +/- по файлам.
+    Новая строка разрешения конфликта или перестановка — новая работа, и
+    ревью заказывается как раньше. Не смогли прочитать дифф — тоже.
+
+    Перенос — не новое чтение, и он так и записан: в новом поколении лежит
+    копия отчёта с ``carried_from_review_id`` исходного, без токенов и
+    длительности (денег он не стоил), а метрики чтения его не считают.
+    Копия нужна, а не одна запись в ленте: гейт и стюард спрашивают отчёт
+    ТЕКУЩЕГО поколения и без него встали бы на «machine-review устарел».
+    """
+    from hub.services.orchestration import (
+        base_merge_kept_the_verdict,
+        report_has_evidence,
+    )
+
+    pinned = (task.get("submission_sha") or "").strip()
+    generation = int(task.get("submission_generation") or 0)
+    source = await _latest_full_report(db, int(task["id"]), generation)
+    if (
+        not pinned
+        or source is None
+        or bool(source.get("incomplete"))
+        or not report_has_evidence(source)
+        or not (source.get("sha") or "").strip()
+    ):
+        return False
+    same, why = await base_merge_kept_the_verdict(
+        db, task, source["sha"].strip(), pinned
+    )
+    if not same:
+        return False
+    root = int(source.get("carried_from_review_id") or source["id"])
+    carried = await repo.insert_machine_review(
+        db,
+        task_id=int(task["id"]),
+        submission_generation=generation,
+        harness_skill=source.get("harness_skill") or "",
+        harness_version=source.get("harness_version"),
+        agent_count=source.get("agent_count"),
+        orchestrator=source.get("orchestrator") or "",
+        model=source.get("model") or "",
+        raw_count=int(source.get("raw_count") or 0),
+        findings_confirmed=source.get("findings_confirmed") or "[]",
+        findings_rejected=source.get("findings_rejected") or "[]",
+        submitted_by=source.get("submitted_by") or "",
+        incomplete=False,
+        unresolved=source.get("unresolved") or "[]",
+        lost_dimensions=source.get("lost_dimensions") or "[]",
+        profile=source.get("profile") or "",
+        principal_id=source.get("principal_id"),
+        carried_from_review_id=root,
+    )
+    await repo.add_task_update(
+        db,
+        int(task["id"]),
+        "hub",
+        "alert",
+        (
+            f"Кросс-модельное ревью не заказано: отчёт #{root} перенесён с "
+            f"поколения {int(source['submission_generation'])}: правка та же, "
+            f"слита база. {why}. Перенос — не новое чтение: в этом поколении "
+            f"лежит отчёт #{carried} с пометкой «перенесён», провайдер не "
+            "зван, в метриках чтения он не считается (#1361). CI на новой "
+            "вершине по-прежнему обязателен."
+        ),
+        author_kind="hub",
+    )
+    await db.commit()
+    log.info(
+        "review dispatch skipped for task #%s: report #%s carried over as #%s",
+        task["id"],
+        root,
+        carried,
+    )
+    return True
 
 
 async def _refuse_second_read(
@@ -4659,8 +4774,11 @@ async def review_circle(db: aiosqlite.Connection, task_id: int) -> ReviewCircle:
     """
     rows = await fetchall(
         db,
-        "SELECT submission_generation, findings_confirmed, unresolved, incomplete "
+        "SELECT submission_generation, findings_confirmed, unresolved, incomplete "  # nosec B608 - константа модуля, не ввод
         "FROM machine_reviews WHERE task_id=? "
+        # #1361: перенесённый отчёт — не новый круг: те же находки на том же
+        # коде, и засчитать их кругом значило бы назвать экономию повтором.
+        f"AND {ORIGINAL_READ_SQL} "
         "ORDER BY submission_generation, id",
         (task_id,),
     )
@@ -4984,6 +5102,8 @@ async def finding_trajectory(
         # Самоотчёт — не чтение со стороны: ни точка траектории, ни сброс её
         # хвоста чистым нулём (находка e6250c505eb42e95).
         f"AND {INDEPENDENT_READ} "
+        # #1361: перенос — не точка траектории, чтения в нём не было.
+        f"AND {ORIGINAL_READ_SQL} "
         "ORDER BY mr.submission_generation, mr.id",
         (task_id, before_generation),
     )
