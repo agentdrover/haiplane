@@ -153,7 +153,7 @@ def _runs_section(runs: list[dict[str, Any]]) -> dict[str, Any]:
 
 async def _findings_section(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
     """confirmed и unresolved — разными строками; самоотчёт — рядом."""
-    from hub.services.orchestration import REPORT_HAS_EVIDENCE_SQL
+    from hub.services.orchestration import ORIGINAL_READ_SQL, REPORT_HAS_EVIDENCE_SQL
 
     rows = await fetchall(
         db,
@@ -162,7 +162,10 @@ async def _findings_section(db: aiosqlite.Connection, since: str) -> dict[str, A
         f"{REPORT_HAS_EVIDENCE_SQL} AS has_evidence, "  # nosec B608 - module constant
         "json_array_length(findings_confirmed) AS confirmed, "
         "json_array_length(COALESCE(unresolved, '[]')) AS unresolved "
-        "FROM machine_reviews WHERE created_at >= datetime('now', ?)",
+        "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        # #1361: перенос — не отчёт и не чтение; его находки уже посчитаны
+        # в исходном отчёте.
+        f"AND {ORIGINAL_READ_SQL}",
         (_UNDECLARED, since),
     )
     reports = [dict(r) for r in rows]
@@ -297,9 +300,11 @@ async def _unbilled_report_buckets(
     db: aiosqlite.Connection, since: str
 ) -> dict[str, int]:
     """Разложить отчёты без своего счёта по заказам их сдачи."""
+    from hub.services.orchestration import ORIGINAL_READ_SQL
+
     rows = await fetchall(
         db,
-        "SELECT m.self_reviewed, "
+        "SELECT m.self_reviewed, "  # nosec B608 - module constant
         "SUM(CASE WHEN d.id IS NOT NULL THEN 1 ELSE 0 END) AS orders, "
         "SUM(CASE WHEN d.channel = 'local' THEN 1 ELSE 0 END) AS local_orders, "
         "SUM(CASE WHEN d.channel != 'local' AND d.provider_tokens IS NULL "
@@ -309,6 +314,9 @@ async def _unbilled_report_buckets(
         "AND d.submission_generation = m.submission_generation "
         "AND d.agent_id != '' "
         "WHERE m.created_at >= datetime('now', ?) AND m.provider_tokens IS NULL "
+        # #1361: у переноса счёта нет потому, что прогона не было, — это не
+        # отчёт «без счёта». Столбец есть только у machine_reviews.
+        f"AND {ORIGINAL_READ_SQL} "
         "GROUP BY m.id",
         (since,),
     )
@@ -338,10 +346,13 @@ async def _reconciliation_section(
     объясняет, публикуется отдельной корзиной с числом, а не распределяется
     по остальным. Сумма корзин равна расхождению по построению.
     """
+    from hub.services.orchestration import ORIGINAL_READ_SQL
+
     total = await fetchall(
         db,
-        "SELECT COUNT(*) AS n FROM machine_reviews "
-        "WHERE created_at >= datetime('now', ?)",
+        "SELECT COUNT(*) AS n FROM machine_reviews "  # nosec B608 - module constant
+        # #1361: сверяются отчёты с прогонами; перенос прогоном не был.
+        f"WHERE created_at >= datetime('now', ?) AND {ORIGINAL_READ_SQL}",
         (since,),
     )
     reports = int(total[0]["n"] or 0)
