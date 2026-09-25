@@ -454,43 +454,6 @@ def model_variant(model_id: str, params: list[ModelParam] | None) -> str:
     return f"{model_id} {tail}" if tail else model_id
 
 
-async def create_review_agent(
-    *,
-    repo_url: str,
-    starting_ref: str,
-    model_id: str,
-    prompt_text: str,
-    hub_mcp_url: str,
-    reviewer_token: str,
-    name: str = "",
-    model_params: list[ModelParam] | None = None,
-) -> dict[str, Any] | None:
-    """Queue a cloud agent that reviews ``starting_ref`` of ``repo_url``.
-
-    The agent gets the hub's own MCP inline, authenticated as the REVIEWER
-    principal — the report comes back through our contract
-    (hub_get_review_brief / hub_submit_machine_review), not through git:
-    ``autoCreatePR=false`` and ``workOnCurrentBranch=false`` keep any
-    accidental commits on a throwaway cursor/ branch.
-
-    ``model_params=None`` — параметры ревьюера под эту модель (#1423): по
-    умолчанию вариант из каталога с fast=false, та же модель без наценки.
-    """
-    created, _ = await create_agent_attempt(
-        repo_url=repo_url,
-        starting_ref=starting_ref,
-        model_id=model_id,
-        prompt_text=prompt_text,
-        hub_mcp_url=hub_mcp_url,
-        reviewer_token=reviewer_token,
-        name=name,
-        model_params=(
-            await review_params_for(model_id) if model_params is None else model_params
-        ),
-    )
-    return created
-
-
 async def create_agent_attempt(
     *,
     repo_url: str,
@@ -502,13 +465,18 @@ async def create_agent_attempt(
     name: str = "",
     model_params: list[ModelParam] | None = None,
 ) -> tuple[dict[str, Any] | None, Refusal | None]:
-    """То же, что :func:`create_review_agent`, но с причиной отказа (#1182).
+    """Заказать облачного агента на ``starting_ref`` из ``repo_url``.
 
-    Нужна одному потребителю — выбору судьи, который обязан отличить
-    «эта модель недоступна» от «связь оборвалась». Тело запроса собирается
-    здесь, а ``create_review_agent`` остаётся видом на неё: два способа
-    собрать один и тот же запрос разошлись бы, и разошёлся бы тот, который
-    реже читают.
+    Возвращает созданного агента или причину отказа (#1182): выбор судьи
+    обязан отличить «эта модель недоступна» от «связь оборвалась». Это
+    единственный шов заказа — им пользуются и диспетч ревью, и судья
+    стюарда.
+
+    Агент получает MCP самого хаба, авторизованный как РЕВЬЮЕР: отчёт
+    возвращается через наш контракт (hub_get_review_brief /
+    hub_submit_machine_review), а не через git. ``autoCreatePR=false`` и
+    ``workOnCurrentBranch=false`` уводят случайные коммиты в одноразовую
+    ветку cursor/.
 
     ``model_params`` (#1417) уходят в ``model.params`` как есть; пусто или
     ``None`` — голый ``model.id``, как до задачи. Умолчания тут нет
