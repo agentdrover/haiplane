@@ -1542,6 +1542,18 @@ async def _sweep_steward_runs(db) -> None:
         log.exception("steward run sweep failed")
 
 
+async def _sweep_executor_runs(db) -> None:
+    # #1410 (F2.2): опрос прогонов облачного исполнителя — токены, центы и
+    # исход каждой строки в running. Только чтение у провайдера; молчание
+    # остаётся названной причиной в строке, а не нулём.
+    try:
+        from hub.services.executor_dispatch import sweep_executor_runs
+
+        await sweep_executor_runs(db)
+    except Exception:  # noqa: BLE001 - the sweep must not kill the loop
+        log.exception("executor run sweep failed")
+
+
 async def _sweep_expired_claims(db) -> None:
     # Claim lease expiry (#417): a claim held past the lease without a
     # pair start is auto-released back to open so the task returns to
@@ -2155,6 +2167,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("delivery_discrepancies", _sweep_delivery_discrepancies),
     Sweep("review_dispatches", _sweep_review_dispatches),
     Sweep("steward_runs", _sweep_steward_runs),
+    Sweep("executor_runs", _sweep_executor_runs),
     Sweep("expired_claims", _sweep_expired_claims),
     Sweep("machine_deadlines", _sweep_machine_deadlines),
     Sweep("stale_arbiter", _sweep_stale_arbiter),

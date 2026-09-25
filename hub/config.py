@@ -176,6 +176,11 @@ STEWARD_DAILY_CAP = int(env_get("STEWARD_DAILY_CAP", "20"))
 # human-owned slot with no deadline of its own, so a hung cloud agent would
 # otherwise never escalate — it would just sit there looking ordered.
 STEWARD_RUN_DEADLINE_MIN = int(env_get("STEWARD_RUN_DEADLINE_MIN", "30"))
+# #1410: сколько ждать цену прогона исполнителя после его конца. Cost у
+# Cursor «eventually consistent» и сразу после конца прогона может не прийти;
+# закрыть прогон без неё — выдать непрочитанную цену за окончательную. По
+# истечении срока строка закрывается с названной причиной, центы — NULL.
+EXECUTOR_COST_WAIT_MIN = int(env_get("EXECUTOR_COST_WAIT_MIN", "30"))
 #: Сколько ждать ВОЗМОЖНОСТИ стартовать — отдельно от того, сколько ждать
 #: суждения (#1181). Одно число на два вопроса делало ответ на второй
 #: зависимым от того, как долго не отвечали на первый: на первом прогоне
