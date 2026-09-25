@@ -62,6 +62,9 @@ _TIP = "c" * 40
 
 
 _HARMLESS_DIFF = "+++ b/docs/notes.md\n+одна строка текста\n"
+# #1415: _HARMLESS_DIFF is documentation only, which now buys lite whatever the
+# class. A test that means "ordinary code, let the class decide" serves this.
+_CODE_DIFF = "+++ b/hub/x.py\n+x = 1\n"
 
 
 class _PinnedGitOps(NoopGitOps):
@@ -630,7 +633,9 @@ async def test_high_risk_task_gets_deep_profile(
     recorder = _DispatchRecorder({"agent": {"id": "bc-deep"}, "run": {"id": "r-deep"}})
     _wire(monkeypatch, recorder)
 
-    by_class = await _submitted(client, db, "spike-deep-class", areas=["hub/db.py"])
+    by_class = await _submitted(
+        client, db, "spike-deep-class", areas=["hub/db.py"], diff=_CODE_DIFF
+    )
     assert (await _dispatch_row(db, by_class))["profile"] == "deep"
     assert "multi-agent-review" in recorder.calls[0]["prompt_text"]
 
@@ -638,12 +643,13 @@ async def test_high_risk_task_gets_deep_profile(
         client,
         db,
         "spike-deep-risk",
-        # #827: a TECHNICAL high risk. A product one no longer buys the
-        # harness — see test_product_high_risk_does_not_buy_deep.
-        risks=[{"kind": "breaking_change", "severity": "high", "description": "d"}],
+        # #1415: only a security risk buys the harness now; a declared
+        # technical high one stays with the class — see
+        # test_declared_technical_high_risk_no_longer_buys_deep.
+        risks=[{"kind": "security", "severity": "low", "description": "d"}],
     )
     assert (await _dispatch_row(db, by_risk))["profile"] == "deep", (
-        "a declared technical high risk is what the expensive harness is for"
+        "a declared security risk is what the expensive harness is for"
     )
 
 
@@ -658,7 +664,12 @@ async def test_unclassified_task_gets_deep_profile(
     # No declared areas and an empty diff: the class stays uncomputed all the
     # way through the submit-time recalculation (#583/#762).
     task_id = await _submitted(
-        client, db, "spike-unclassified", areas=[], clear_risk_class=True
+        client,
+        db,
+        "spike-unclassified",
+        areas=[],
+        clear_risk_class=True,
+        diff=_CODE_DIFF,
     )
     row = dict(await repo.get_task(db, task_id))
     assert not row["risk_class"], "the fixture must leave the class uncomputed"
@@ -666,7 +677,7 @@ async def test_unclassified_task_gets_deep_profile(
     assert (await _dispatch_row(db, task_id))["profile"] == "deep"
     # And the same for a class the enum cannot read at all.
     # #820: the rule now answers with its reasons, and judges against a diff.
-    assert pick_review_profile({"risk_class": "R99"}, _HARMLESS_DIFF)[0] == "deep"
+    assert pick_review_profile({"risk_class": "R99"}, _CODE_DIFF)[0] == "deep"
     assert pick_review_profile({"risk_class": "R0"}, _HARMLESS_DIFF)[0] == "lite"
     assert (
         pick_review_profile(
@@ -1027,19 +1038,93 @@ async def test_product_high_risk_does_not_buy_deep(
     assert (await _dispatch_row(db, task_id))["profile"] == "lite"
 
 
-def test_technical_high_risk_buys_deep_with_named_kind():
-    # AC-2 (#827): technical high still buys the harness, and the reason says
-    # WHICH kind — "high" alone was never enough to argue with.
-    for kind in ("breaking_change", "data_migration", "performance"):
+def test_declared_technical_high_risk_no_longer_buys_deep():
+    # AC-1 (#1415): a declared technical high risk, and a high risk of a kind
+    # nobody recognises, no longer buy the harness. Measured 23.09 over 328
+    # reports: deep bought by a declared risk is the weakest reason there is,
+    # 0.54 confirmed findings per report. The class and the process surfaces
+    # still decide, exactly as before.
+    for kind in ("data_migration", "что-тонеизвестное"):
         profile, reasons = pick_review_profile(
             {
-                "risk_class": "R0",
+                "risk_class": "R1",
                 "risks": json.dumps([{"kind": kind, "severity": "high"}]),
             },
-            _HARMLESS_DIFF,
+            _CODE_DIFF,
         )
-        assert profile == "deep", kind
-        assert kind in reasons[0], f"the reason must name the kind: {reasons}"
+        assert profile == LITE, (kind, reasons)
+        assert reasons == ["класс риска R1, процессных поверхностей нет"], reasons
+
+
+def test_security_risk_still_buys_deep():
+    # AC-2 (#1415): security keeps the harness at any severity, on code and on
+    # a documentation-only diff alike.
+    for diff in (_CODE_DIFF, "+++ b/docs/spikes/x.md\n+текст\n"):
+        profile, reasons = pick_review_profile(
+            {
+                "risk_class": "R1",
+                "risks": json.dumps([{"kind": "security", "severity": "low"}]),
+            },
+            diff,
+        )
+        assert profile == DEEP, diff
+        assert reasons == ["заявлен риск security"], reasons
+
+
+def _docs_diff(*paths: str) -> str:
+    return "".join(
+        f"diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n+строка\n" for p in paths
+    )
+
+
+def test_docs_only_diff_gets_lite_mixed_diff_keeps_rule():
+    # AC-3 (#1415): a diff of documentation alone has no executable code for
+    # the harness to read — spike #1402 bought deep order 430 for one document.
+    # One non-documentation file keeps the old rule.
+    task = {"risk_class": "R3", "risks": "[]"}
+    profile, reasons = pick_review_profile(task, _docs_diff("docs/spikes/x.md"))
+    assert profile == LITE
+    assert reasons == ["дифф только из документации"], reasons
+
+    profile, reasons = pick_review_profile(task, _docs_diff("docs/x.md", "hub/x.py"))
+    assert profile == DEEP
+    assert reasons == ["класс риска R3"], reasons
+
+
+def test_documentation_is_an_explicit_list():
+    # #1415 constraint: tests, configs, templates and workflows are NOT
+    # documentation, and a deleted or renamed code file is a code change.
+    task = {"risk_class": "R3", "risks": "[]"}
+    not_docs = (
+        "hub/cli_templates/work_types/feature.md",
+        ".github/workflows/ci.yml",
+        ".github/pull_request_template.md",
+        "tests/fixtures/x.md",
+        "docs/agent-context/complexity-budget.json",
+        "pyproject.toml",
+        "skills/hub-testing/SKILL.md",
+        "agents/code-reviewer.md",
+        ".claude/steward-handoff.md",
+    )
+    for path in not_docs:
+        profile, _ = pick_review_profile(task, _docs_diff("docs/x.md", path))
+        assert profile == DEEP, path
+    deleted = (
+        "diff --git a/hub/x.py b/hub/x.py\n--- a/hub/x.py\n+++ /dev/null\n-x = 1\n"
+    )
+    profile, _ = pick_review_profile(task, _docs_diff("docs/x.md") + deleted)
+    assert profile == DEEP, "a deleted code file is not documentation"
+    renamed = "diff --git a/hub/x.py b/docs/x.md\nrename from hub/x.py\n"
+    profile, _ = pick_review_profile(task, renamed)
+    assert profile == DEEP, "code renamed into docs/ is still a code change"
+    for path in ("README.md", "deploy/CD.md", "docs/a/b.rst", "CONTRIBUTING.md"):
+        profile, _ = pick_review_profile(task, _docs_diff(path))
+        assert profile == LITE, path
+    # An empty diff names no files: nothing proves it is documentation.
+    assert pick_review_profile(task, "")[0] == DEEP
+    # A human request still buys deep on a document.
+    task_req = dict(task, machine_review_override="require")
+    assert pick_review_profile(task_req, _docs_diff("docs/x.md"))[0] == DEEP
 
 
 def test_security_kind_still_buys_deep_at_any_severity():
@@ -1070,21 +1155,6 @@ async def test_process_surface_wins_over_product_risk(
     )
 
     assert (await _dispatch_row(db, task_id))["profile"] == "deep"
-
-
-def test_unknown_risk_kind_at_high_stays_deep():
-    # AC-5 (#827): not knowing what a risk is must never be the cheap answer
-    # (#582) — and it closes the obvious way around the rule.
-    for kind in ("", "какой-то-новый-вид"):
-        profile, reasons = pick_review_profile(
-            {
-                "risk_class": "R0",
-                "risks": json.dumps([{"kind": kind, "severity": "high"}]),
-            },
-            _HARMLESS_DIFF,
-        )
-        assert profile == "deep", repr(kind)
-        assert "нераспознанным" in reasons[0]
 
 
 async def test_provider_usage_is_stored_on_the_report(
