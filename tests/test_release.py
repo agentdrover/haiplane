@@ -153,7 +153,9 @@ async def test_the_release_return_needs_no_role_bypass(db) -> None:
     g.return_release_into_base.assert_not_awaited()
 
     rows = await _return_rows(db)
-    assert rows == [{"pr_number": RETURN_PR, "task_id": None, "merge_sha": RETURN_SHA}], (
+    assert rows == [
+        {"pr_number": RETURN_PR, "task_id": None, "merge_sha": RETURN_SHA}
+    ], (
         "мерж PR возврата обязан лечь в pipeline_merges, иначе drift-guard "
         f"назовёт собственный мерж хаба посторонним: {rows}"
     )

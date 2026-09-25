@@ -533,6 +533,7 @@ class GitVerseForge:
         delete_branch: bool = True,
         repo: str | None = None,
         gh_repo: str | None = None,
+        method: str = "squash",
     ) -> bool:
         """Форж слить не может — и говорит это, а не молчит (#1116).
 
@@ -1033,15 +1034,3 @@ class GitVerseForge:
                 subjects.append(subject)
         subjects.reverse()
         return subjects
-
-    async def merge_branches(
-        self,
-        into_branch: str,
-        from_branch: str,
-        message: str,
-        *,
-        repo: str | None = None,
-        gh_repo: str | None = None,
-    ) -> tuple[str, str]:
-        """Сводится в #1116: серверного мержа веток у GitVerse тоже нет."""
-        return ("unavailable", _MERGE_PENDING)

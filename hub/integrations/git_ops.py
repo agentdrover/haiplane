@@ -2961,7 +2961,7 @@ class GitOpsIntegration:
             return []
         return await self._conflicting_files(head, base, repo=repo)
 
-    async def return_release_into_base(
+    async def open_pr_between(
         self,
         base: str,
         head: str,
@@ -2969,41 +2969,72 @@ class GitOpsIntegration:
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
-    ) -> tuple[str, str]:
-        """Merge the release branch back into the integration branch (#969).
+    ) -> int | None:
+        """The open PR carrying ``head`` into ``base``, or None (#1426).
 
-        ``(returned <sha> | nothing | conflict | unavailable, detail)``. Four
-        names rather than three, because a conflict and a git that could not
-        be asked need different hands: one is a merge somebody has to resolve,
-        the other is a question to ask again next cycle. Collapsing them is
-        how #725 gets repeated with new words.
-
-        Called the moment the release merge lands, and the moment matters. A
-        squash release writes a NEW commit on the release branch instead of
-        carrying the originals, so the branch it came from does not contain
-        it, and the two diverge by one commit per release. Right here that
-        commit holds EXACTLY the tree the integration branch already has and
-        the merge base is fresh, so the merge is trivial by construction.
-        Left to age it stops being trivial: on 26.08.2026 five releases'
-        worth of them collided in ``hub/db.py`` and release PR #83 stood
-        conflicted with 13 tasks undelivered.
-
-        The merge itself is the forge's job — the clone is shared, may sit on
-        someone else's branch with a dirty tree, and carries an armed pre-push
-        hook (#949). Naming the conflicting files is git's job, and stays here.
+        Both ends are checked, not only the head. The release return is the
+        PR main → develop, and a PR from main into anything else is not ours:
+        merging it as "the return" would put main somewhere nobody asked.
+        The forge lists PRs by head only, so the base is read back from the
+        PR itself. The first open PR with this head is the one judged — a
+        second PR from main is a state a human made and a human sorts out.
         """
-        state, detail = await self._forge_for(forge).merge_branches(
-            head,
-            base,
-            f"chore: return {base} into {head} after the release",
+        adapter = self._forge_for(forge)
+        pr_number = await adapter.pr_for_branch(head, repo=repo, gh_repo=gh_repo)
+        if not pr_number:
+            return None
+        pr_base, pr_head = await adapter.pr_refs(pr_number, repo=repo, gh_repo=gh_repo)
+        if (pr_base, pr_head) != (base, head):
+            return None
+        return pr_number
+
+    async def merge_return_pr(
+        self,
+        pr_number: int,
+        subject: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[bool, str]:
+        """Merge the release-return PR: ``(True, merge sha)`` or ``(False, why)``.
+
+        Replaces the direct branch merge of #969 (#1426). That merge went
+        through ``POST /merges`` with no PR, and the ruleset's pull_request
+        rule let it through only because the Write role could bypass it — a
+        bypass every writer had, not only the hub. As a PR merged at green
+        CI the return needs no bypass at all.
+
+        Two things differ from a task merge, and both are load-bearing:
+
+        * a MERGE COMMIT, not a squash. The point of the return is to make
+          the release commit an ancestor of the integration branch; a squash
+          would write one more new commit and leave the drift in place;
+        * the head is never deleted. The head of this PR is the release
+          branch — main.
+
+        A forge that cannot merge through its API merges by push, which is a
+        ``--no-ff`` merge already and never deletes a branch (#1116).
+        The merge sha may come back empty when the forge would not name it;
+        the merge still happened, and the caller records it keyed by the PR.
+        """
+        adapter = self._forge_for(forge)
+        if not adapter.can_merge_via_api:
+            return await self.merge_pr_by_push(
+                pr_number, subject, repo=repo, gh_repo=gh_repo, forge=forge
+            )
+        merged = await adapter.merge_pr(
+            pr_number,
+            subject,
+            delete_branch=False,
             repo=repo,
             gh_repo=gh_repo,
+            method="merge",
         )
-        if state != "conflict":
-            return (state, detail)
-        files = await self._conflicting_files(base, head, repo=repo)
-        named = f": {', '.join(files)}" if files else ""
-        return ("conflict", f"{base} не сливается с {head} без конфликта{named}")
+        if not merged:
+            return (False, "")
+        sha = await adapter.merge_commit_sha(pr_number, repo=repo, gh_repo=gh_repo)
+        return (True, sha)
 
     async def _conflicting_files(
         self, base: str, head: str, repo: str | None = None

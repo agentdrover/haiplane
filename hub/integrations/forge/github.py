@@ -486,6 +486,7 @@ class GitHubForge:
         delete_branch: bool = True,
         repo: str | None = None,
         gh_repo: str | None = None,
+        method: str = "squash",
     ) -> bool:
         """Merge one PR; ``delete_branch`` says what happens to its head (#949).
 
@@ -496,14 +497,22 @@ class GitHubForge:
         delete_branch_on_merge=false proves it was us, not GitHub. The default
         stays True so the task path is untouched; the release path passes
         False, because a release must not remove the branch work lands on.
+
+        ``method`` is the merge strategy (#1426). Squash stays the default —
+        linear main was a deliberate choice (#946). The release RETURN is the
+        one PR merged with a merge commit: squashing main into develop would
+        write yet another new commit and leave the release commit outside
+        develop's history, which is exactly the drift #969 closes.
         """
+        if method not in ("squash", "merge"):
+            raise ValueError(f"unknown merge method: {method!r}")
         args = [
             "pr",
             "merge",
             str(pr_number),
             "--repo",
             gh_repo or REPO_NAME,
-            "--squash",
+            f"--{method}",
             "--admin",
         ]
         if delete_branch:
@@ -516,7 +525,7 @@ class GitHubForge:
             timeout=30,
         )
         if rc == 0:
-            log.info("Merged PR #%d (squash, admin)", pr_number)
+            log.info("Merged PR #%d (%s, admin)", pr_number, method)
             return True
         log.error("Failed to merge PR #%d: %s", pr_number, err)
         return False
@@ -1088,65 +1097,3 @@ class GitHubForge:
         if rc != 0 or not out:
             return []
         return [line.strip() for line in reversed(out.splitlines()) if line.strip()]
-
-    async def merge_branches(
-        self,
-        into_branch: str,
-        from_branch: str,
-        message: str,
-        *,
-        repo: str | None = None,
-        gh_repo: str | None = None,
-    ) -> tuple[str, str]:
-        """Merge ``from_branch`` into ``into_branch`` server-side (#969).
-
-        ``(returned <sha> | nothing | conflict | unavailable, detail)``. Four
-        names rather than three, because a conflict and a git that could not
-        be asked need different hands: one is a merge somebody has to resolve,
-        the other is a question to ask again next cycle. Collapsing them is
-        how #725 gets repeated with new words.
-
-        Asks GitHub to do the merge rather than driving the workspace clone.
-        The clone is shared, may sit on someone else's branch with a dirty
-        tree, and carries an armed pre-push hook — three ways for a
-        bookkeeping merge to damage work in progress (#949 was one of them).
-        The merges endpoint has no such surface: it answers 201 with the new
-        commit, 204 when there is nothing to merge, 409 on a conflict.
-
-        The conflict detail names no files — those come from the clone, and
-        the clone is git_ops' side of the fence (#1113).
-        """
-        if not gh_repo and not REPO_NAME:
-            return ("unavailable", "не названо, в каком репозитории возвращать")
-        rc, out, err = await _gh(
-            "api",
-            "--method",
-            "POST",
-            f"repos/{gh_repo or REPO_NAME}/merges",
-            "-f",
-            f"base={into_branch}",
-            "-f",
-            f"head={from_branch}",
-            "-f",
-            f"commit_message={message}",
-            repo=repo,
-            check=False,
-        )
-        if rc == 0:
-            # 204 — «уже содержит», и gh печатает пустоту. Это ответ, а не
-            # промах: возвращать нечего.
-            body = (out or "").strip()
-            if not body:
-                return ("nothing", f"{into_branch} уже содержит {from_branch}")
-            try:
-                sha = str(json.loads(body).get("sha") or "").strip()
-            except json.JSONDecodeError:
-                return ("unavailable", f"ответ GitHub не разобран: {body[:150]}")
-            if not sha:
-                return ("unavailable", "GitHub не назвал коммит возврата")
-            return ("returned", sha)
-
-        detail = (err or "").strip() or "gh молчит"
-        if "409" in detail or "conflict" in detail.lower():
-            return ("conflict", "")
-        return ("unavailable", detail[:200])
