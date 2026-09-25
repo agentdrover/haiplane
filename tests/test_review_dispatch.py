@@ -3063,6 +3063,10 @@ async def test_same_sha_buys_no_second_review(
     assert len(recorder.calls) == 1, "первая сдача ревью получает"
     review_id = await _report_on_current(db, task_id)
     await db.commit()
+    # #1399: после #1265 пересдача из review поколение не поднимает, и отчёт
+    # оказывался на ТОЙ ЖЕ генерации — граница «<=» в страже переставала
+    # проверяться («=» оставался зелёным). Отчёт — на прошлом поколении.
+    await _back_to_running(db, task_id)
 
     # Пересдача НА ТОМ ЖЕ коммите: поколение растёт, вершина та же.
     await services.submit_for_review(
@@ -3084,6 +3088,20 @@ async def test_same_sha_buys_no_second_review(
     )
 
 
+async def _back_to_running(db: aiosqlite.Connection, task_id: int) -> None:
+    """Вернуть сдачу исполнителю, чтобы пересдача того же sha открыла НОВОЕ
+    поколение (#1399).
+
+    Эти тесты написаны до #1265, когда любая пересдача поднимала поколение:
+    страж новизны ключуется по коду именно затем, чтобы видеть «поколения
+    разные, sha тот же». Пересдача из review теперь поколение не поднимает,
+    и второй заказ того же профиля на ТУ ЖЕ сдачу — дубль, который #1399
+    закрывает. Вопрос тестов — про новое поколение, его и воспроизводим.
+    """
+    await db.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,))
+    await db.commit()
+
+
 async def test_a_real_resubmission_still_gets_reviewed(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
@@ -3100,6 +3118,7 @@ async def test_a_real_resubmission_still_gets_reviewed(
     # Тот же sha, но отчёта нет вовсе — сравнивать не с чем, прогон нужен.
     fresh = await _submitted(client, db, "spike-no-report")
     assert len(recorder.calls) == 1
+    await _back_to_running(db, fresh)
     await services.submit_for_review(
         db, fresh, TaskSubmitReview(model="claude-fable-5")
     )
@@ -3356,6 +3375,7 @@ async def test_an_incomplete_report_does_not_lock_the_sha(
     assert len(recorder.calls) == 1
     await _report_on_current(db, task_id, incomplete=True)
     await db.commit()
+    await _back_to_running(db, task_id)
 
     await services.submit_for_review(
         db, task_id, TaskSubmitReview(model="claude-fable-5")
@@ -3384,6 +3404,7 @@ async def test_a_self_report_does_not_cancel_the_independent_reviewer(
     assert len(recorder.calls) == 1
     await _report_on_current(db, task_id, self_reviewed=True)
     await db.commit()
+    await _back_to_running(db, task_id)
 
     await services.submit_for_review(
         db, task_id, TaskSubmitReview(model="claude-fable-5")
@@ -12061,9 +12082,11 @@ async def test_every_review_path_carries_the_only_tests_symbols(
     tree = ast.parse(Path(rd.__file__).read_text())
     assert _callers_of(tree, "_review_prompt") == {"prepare_review_order"}
     assert _callers_of(tree, "prepare_review_order") == {
-        "maybe_dispatch_review",
+        "_prepare_claimed_order",
         "dispatch_local_review",
     }
+    # #1399: облачный транспорт собирает заказ через бронь — и только он.
+    assert _callers_of(tree, "_prepare_claimed_order") == {"maybe_dispatch_review"}
     # Добор лестницы (#879), переспрос (#1242), вторая ось каскада (#1243) и
     # вторая дверь (#1252) — те же два транспорта.
     assert _callers_of(tree, "maybe_dispatch_review") == {
@@ -12556,3 +12579,286 @@ async def test_a_refused_call_stub_carries_the_orders_only_tests(
     assert stub["agent_id"] == "", "это заглушка отказа, а не созданный агент"
     assert stub["only_tests"] is not None, "заглушка потеряла only_tests заказа"
     assert json.loads(stub["only_tests"]) == ["mechanical_step"]
+
+
+# --- #1399: одна сдача и один профиль — один облачный вызов -----------------
+#
+# Прод, 23.09 и 25.09: #1301 gen2 (deep, 347/348) и #1378 gen1 (lite, 412/413)
+# получили по два оплаченных облачных ревьюера на одну сдачу, оба без
+# replaces_dispatch_id. У #1301 второй вызов пришёл от ВТОРОГО
+# hub_submit_for_review того же коммита из review (mcp_call_events 8434 и
+# 8439): пересдача того же sha не поднимает поколение (#1265) и зовёт
+# диспетчер снова, а страж новизны видит только ОТЧЁТЫ, не заказы.
+
+_DISPATCHED_NOTE = "Кросс-модельное ревью вызвано хабом"
+
+
+async def _dispatched_notes(db: aiosqlite.Connection, task_id: int) -> int:
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? AND content LIKE ?",
+        (task_id, f"{_DISPATCHED_NOTE}%"),
+    )
+    return len(rows)
+
+
+async def test_second_trigger_same_generation_and_profile_is_noop(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1399): уже вызванная сдача второго ревьюера того же профиля не
+    покупает — ни повтором сдачи того же коммита, ни прямым вызовом."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "once-per-submission")
+    rows = await _rows_of(db, task_id)
+    assert [(r["profile"], r["status"]) for r in rows] == [("lite", "active")]
+
+    # Триггер №1: тот же коммит сдан ещё раз из review — путь #1301.
+    view = await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+    assert view.status.value == "review"
+    # Триггер №2: диспетчер позван напрямую на ту же сдачу.
+    assert await maybe_dispatch_review(db, task_id) is False
+
+    assert len(recorder.calls) == 1, "второго агента Cursor не создавали"
+    assert len(await _rows_of(db, task_id)) == 1, "второй строки заказа нет"
+    assert await _dispatched_notes(db, task_id) == 1, (
+        "запись «ревью вызвано» в карточке одна"
+    )
+
+
+class _SlowRecorder(_DispatchRecorder):
+    """Создание агента занимает время — окно, в которое прилетает второй
+    триггер (у #1378 вызовы разошлись на 5 секунд)."""
+
+    async def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        await asyncio.sleep(0.3)
+        n = len(self.calls)
+        return {"agent": {"id": f"bc-{n}"}, "run": {"id": f"run-{n}"}}, None
+
+
+async def test_concurrent_triggers_create_one_dispatch(
+    client: AsyncClient, db: aiosqlite.Connection, db_dsn: str, monkeypatch
+):
+    """AC-2 (#1399): два триггера одной сдачи параллельно, каждый на СВОЁМ
+    соединении, как запросы на проде (#1065): ровно один вызов и одна строка."""
+    from hub import db as hub_db
+    from hub.services import lifecycle
+
+    recorder = _SlowRecorder(None)
+    _wire(monkeypatch, recorder)
+
+    async def _no_dispatch(_db, _task_id):
+        return None
+
+    # Сдача без диспетча: оба вызова ниже — первые на эту сдачу.
+    monkeypatch.setattr(lifecycle, "_dispatch_cross_model_review", _no_dispatch)
+    task_id = await _submitted(client, db, "concurrent-triggers")
+    assert recorder.calls == []
+
+    first = await hub_db.connect(db_dsn)
+    second = await hub_db.connect(db_dsn)
+    try:
+        results = await asyncio.gather(
+            maybe_dispatch_review(first, task_id),
+            maybe_dispatch_review(second, task_id),
+        )
+    finally:
+        await first.close()
+        await second.close()
+
+    assert sorted(results) == [False, True], results
+    assert len(recorder.calls) == 1, "create_agent вызван ровно один раз"
+    assert len(await _rows_of(db, task_id)) == 1, "строка заказа одна"
+    assert await _dispatched_notes(db, task_id) == 1
+
+
+async def test_escalation_and_retry_after_failure_still_dispatch(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1399): защита от дубля не глушит задуманные вторые вызовы —
+    добор lite→deep, переспрос после отказа 429 и новый вызов после отказа."""
+    # (а) Эскалация: неполный lite-отчёт покупает deep на той же сдаче.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    _no_local_path(monkeypatch)
+    escalated = await _submitted(client, db, "guard-escalation")
+    await _machine_report(client, escalated, incomplete=True)
+    assert len(recorder.calls) == 2, "добор deep поставлен"
+    assert [r["profile"] for r in await _rows_of(db, escalated)] == ["lite", "deep"]
+
+    # (б) Отказ 429 и переспрос свипом: новая строка с replaces_dispatch_id.
+    provider = _Sequence(
+        [
+            (None, _RATE_LIMIT),
+            ({"agent": {"id": "bc-second"}, "run": {"id": "run-second"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    retried = await _submitted(client, db, "guard-retry", policy={"review": "dispatch"})
+    assert len(provider.calls) == 1
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+    assert len(provider.calls) == 2, "переспрос после отказа состоялся"
+    rows = await _rows_of(db, retried)
+    assert rows[0]["status"] == "failed"
+    assert rows[-1]["agent_id"] == "bc-second"
+    assert rows[-1]["replaces_dispatch_id"] == rows[0]["id"]
+
+    # (в) Отказ на вызове не держит сдачу: следующий триггер той же сдачи
+    # зовёт ревьюера, а не упирается в собственную несостоявшуюся попытку.
+    again = _Sequence(
+        [
+            (None, _RATE_LIMIT),
+            ({"agent": {"id": "bc-after"}, "run": {"id": "run-after"}}, None),
+        ]
+    )
+    _wire(monkeypatch, again)
+    refused = await _submitted(
+        client, db, "guard-after-refusal", policy={"review": "dispatch"}
+    )
+    assert len(again.calls) == 1
+    assert await maybe_dispatch_review(db, refused) is True
+    assert len(again.calls) == 2, "отказ не заблокировал следующий вызов"
+    assert (await _rows_of(db, refused))[-1]["agent_id"] == "bc-after"
+
+
+async def test_order_claims_migration_survives_existing_duplicates(
+    db: aiosqlite.Connection,
+):
+    """#1399, риск data_migration: миграция ложится на базу, где дубли уже
+    есть (как 412/413 на проде), не трогает их, и бронь на такой сдаче
+    отказывает, а на другом профиле — выдаётся."""
+    from hub.db import _migrate
+
+    await db.execute("DROP TABLE review_order_claims")
+    await db.execute(
+        "DELETE FROM _migrations WHERE name = 'create_review_order_claims'"
+    )
+    task_id = await _node(db, title="dup", task_type="epic", parent_id=None)
+    for agent in ("bc-a", "bc-b"):
+        await repo.create_review_dispatch(
+            db,
+            task_id=task_id,
+            submission_generation=1,
+            agent_id=agent,
+            run_id="",
+            model="grok-4.6",
+            profile="lite",
+        )
+    await db.commit()
+
+    await _migrate(db)
+
+    assert len(await _rows_of(db, task_id)) == 2, "дубли пережили миграцию"
+    assert await repo.claim_review_order(db, task_id, 1, "lite") is False
+    assert await repo.claim_review_order(db, task_id, 1, "deep") is True
+    assert await repo.claim_review_order(db, task_id, 1, "deep") is False, (
+        "вторая бронь того же профиля не выдаётся"
+    )
+
+
+async def test_second_trigger_leaves_the_running_reviewers_code_alive(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1399, находка a1d2d6301a527145: повторный триггер НЕ гасит код доступа
+    уже запущенного ревьюера.
+
+    issue_code удаляет невыкупленные коды того же принципала на эту задачу и
+    поколение. Если второй триггер доходит до выпуска кода раньше, чем бронь
+    ему откажет, у оплаченного агента в промпте мёртвый код: redeem — 401,
+    отчёта нет. Принципал здесь настоящий — без него код не выпускается и
+    дефект не виден.
+    """
+    from hub.services import chat_pair
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-1"}, "run": {"id": "run-1"}})
+    _wire(monkeypatch, recorder)
+    await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(client, db, "code-survives-retrigger")
+    assert len(recorder.calls) == 1
+    found = re.search(r'"code":"([^"]+)"', recorder.calls[0]["prompt_text"])
+    assert found, "в промпте первого ревьюера нет кода доступа"
+
+    await services.submit_for_review(
+        db, task_id, TaskSubmitReview(model="claude-fable-5")
+    )
+    assert await maybe_dispatch_review(db, task_id) is False
+    assert len(recorder.calls) == 1
+
+    assert await chat_pair.redeem_code(db, found.group(1)) is not None, (
+        "код запущенного ревьюера погашен повторным триггером — отчёт не дойдёт"
+    )
+
+
+async def test_blind_create_keeps_the_order_claimed(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1399, находка 815b0841472792be: слепой исход (ответ не дошёл и
+    спросить провайдера не вышло) бронь НЕ снимает — агент, возможно, уже
+    оплачен, и следующий триггер купил бы второго."""
+    recorder = _DispatchRecorder(
+        None, refusal=cursor_cloud.Refusal(status=0, detail="таймаут ответа")
+    )
+    _wire(monkeypatch, recorder)
+    _no_local_path(monkeypatch)
+
+    async def _cannot_ask(name, pages=3):
+        return cursor_cloud.Reconciliation("", "", False)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _cannot_ask)
+    task_id = await _submitted(
+        client, db, "blind-keeps-claim", policy={"review": "dispatch"}
+    )
+    assert len(recorder.calls) == 1
+
+    assert await maybe_dispatch_review(db, task_id) is False
+    assert len(recorder.calls) == 1, (
+        "после слепого исхода второй вызов провайдера покупал бы второго агента"
+    )
+
+
+async def test_refused_call_holds_the_claim_until_the_stub_is_written(
+    client: AsyncClient, db: aiosqlite.Connection, db_dsn: str, monkeypatch
+):
+    """#1399, находка 6d0bd1c790fb24eb: отказ провайдера не отпускает бронь
+    ДО записи заглушки второй двери. Триггер, пришедший в это окно (здесь —
+    ровно на входе в _owe_the_refused_call), ревьюера не покупает."""
+    from hub import db as hub_db
+    from hub.services import lifecycle
+    from hub.services import review_dispatch as rd
+
+    provider = _Sequence(
+        [
+            (None, _RATE_LIMIT),
+            ({"agent": {"id": "bc-window"}, "run": {"id": "run-window"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+
+    async def _no_dispatch(_db, _task_id):
+        return None
+
+    monkeypatch.setattr(lifecycle, "_dispatch_cross_model_review", _no_dispatch)
+    task_id = await _submitted(
+        client, db, "refusal-window", policy={"review": "dispatch"}
+    )
+
+    original = rd._owe_the_refused_call
+    in_window: list[bool] = []
+
+    async def _trigger_in_the_window(*args, **kwargs):
+        other = await hub_db.connect(db_dsn)
+        try:
+            in_window.append(await maybe_dispatch_review(other, task_id))
+        finally:
+            await other.close()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(rd, "_owe_the_refused_call", _trigger_in_the_window)
+    assert await maybe_dispatch_review(db, task_id) is False
+
+    assert in_window == [False], "триггер в окне отказа купил ревьюера"
+    assert len(provider.calls) == 1

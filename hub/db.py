@@ -2192,6 +2192,24 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ON pipeline_merges (project_id, pr_number)",
     ),
     (
+        # #1399: бронь облачного заказа ревью на (сдача, профиль). Ключ —
+        # первичный, и INSERT OR IGNORE по нему решает, кто из параллельных
+        # триггеров покупает ревьюера. Отдельной таблицей, а не уникальным
+        # индексом на review_dispatches: строка заказа пишется ПОСЛЕ
+        # оплаченного вызова провайдера, и индекс остановил бы второго уже
+        # купившим агента. Заодно миграции не нужно переживать дубли, уже
+        # лежащие в review_dispatches (412/413, 347/348): их она не трогает.
+        "create_review_order_claims",
+        """CREATE TABLE IF NOT EXISTS review_order_claims (
+            task_id               INTEGER NOT NULL
+                                  REFERENCES tasks(id) ON DELETE CASCADE,
+            submission_generation INTEGER NOT NULL,
+            profile               TEXT    NOT NULL,
+            claimed_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (task_id, submission_generation, profile)
+        )""",
+    ),
+    (
         # #1361: отчёт, ПЕРЕНЕСЁННЫЙ на пересдачу «только слита база», а не
         # прочитанный заново. Непустое значение — id исходного отчёта: по нему
         # перенос помечен в карточке и исключён из метрик чтения. NULL — всё,

@@ -17,6 +17,7 @@ import aiosqlite
 from hub import config
 from hub.db import (
     inserted_id,
+    write_transaction,
     STRUCTURED_TASK_FIELDS,
     ac_to_row_kwargs,
     fetchall,
@@ -2959,6 +2960,82 @@ async def count_review_dispatches(
         (task_id, generation, task_id, generation),
     )
     return int(dict(rows[0])["n"]) if rows else 0
+
+
+#: Сколько живёт бронь заказа ревью (#1399). Бронь снимается в той же
+#: транзакции, что пишет строку заказа, или сразу после отказа провайдера;
+#: пережить её может только падение процесса посреди вызова. Тогда через
+#: этот срок сдачу снова можно заказать — вместо вечной блокировки.
+REVIEW_ORDER_CLAIM_TTL_MINUTES = 10
+
+
+async def claim_review_order(
+    db: aiosqlite.Connection, task_id: int, generation: int, profile: str
+) -> bool:
+    """Забронировать облачный заказ профиля на сдачу — атомарно (#1399).
+
+    Проверка «заказ уже есть» и бронь идут ОДНОЙ транзакцией BEGIN IMMEDIATE:
+    второй триггер, пришедший в окно между созданием агента и записью строки
+    (у #1378 это пять секунд), ждёт на write-локе и видит бронь первого, а не
+    пустоту. Проверка по одним строкам review_dispatches этого окна не
+    закрывает: строка пишется ПОСЛЕ оплаченного вызова провайдера.
+
+    Заказом считается любая неотказавшая строка того же профиля на ту же
+    сдачу — active, done или долг второй двери. Отказ (failed) сдачу не
+    держит: по нему свип переспрашивает (#1242), а новый триггер вправе
+    позвать ревьюера снова. Возвращает False, если заказ уже есть или
+    забронирован другим.
+
+    Пустой ``profile`` — бронь ПЕРВИЧНОГО заказа, профиль которого ещё не
+    выбран: бронь берётся до подготовки заказа, у которой есть побочные
+    эффекты (выпуск кода доступа гасит код уже запущенного ревьюера). Такой
+    заказ отказывает при любой неотказавшей строке этой сдачи: первичный
+    триггер профиль сам не выбирает, и второй прогон на сдаче — дело
+    лестницы (#879) или второй оси (#1243), а не повтора сдачи.
+    """
+    # Чужие незакоммиченные записи этого соединения фиксируются до брони:
+    # BEGIN IMMEDIATE нужен свой, иначе бронь уехала бы в чужую транзакцию.
+    await db.commit()
+    async with write_transaction(db):
+        rows = await fetchall(
+            db,
+            "SELECT id FROM review_dispatches WHERE task_id=? "
+            "AND submission_generation=? AND (? = '' OR profile=?) "
+            "AND status <> 'failed' LIMIT 1",
+            (task_id, generation, profile, profile),
+        )
+        if rows:
+            return False
+        await db.execute(
+            "DELETE FROM review_order_claims WHERE task_id=? "
+            "AND submission_generation=? AND profile=? "
+            "AND claimed_at < datetime('now', ?)",
+            (
+                task_id,
+                generation,
+                profile,
+                f"-{REVIEW_ORDER_CLAIM_TTL_MINUTES} minutes",
+            ),
+        )
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO review_order_claims "
+            "(task_id, submission_generation, profile) VALUES (?, ?, ?)",
+            (task_id, generation, profile),
+        )
+        return cur.rowcount == 1
+
+
+async def release_review_order(
+    db: aiosqlite.Connection, task_id: int, generation: int, profile: str
+) -> None:
+    """Снять бронь заказа (#1399). Коммит — за вызывающим: на успехе бронь
+    уходит в ОДНОЙ транзакции со строкой заказа, чтобы между ними не было
+    момента, когда нет ни брони, ни строки."""
+    await db.execute(
+        "DELETE FROM review_order_claims WHERE task_id=? "
+        "AND submission_generation=? AND profile=?",
+        (task_id, generation, profile),
+    )
 
 
 async def set_review_dispatch_status(
