@@ -1999,12 +1999,13 @@ class _ThreeGenerationsGitOps(_AncestryGitOps):
 
     async def branch_diff(self, repo, base, branch):
         since = self._since(base)
-        if since is None:
-            # #1361 и #1400 встретились в develop: без родительского ответа
-            # закреплённый sha чужого поколения отдавал дифф вершины, и
-            # сдача читалась как «влита только база» — отчёт переносился.
-            return await super().branch_diff(repo, base, branch)
-        return since
+        if since is not None:
+            return since
+        # #1418: the whole-branch diff goes through _PinnedGitOps, which gives
+        # every pinned sha other than the tip its OWN author edit. Returning
+        # self._diff for any sha read gen3 as "only the base was merged", and
+        # #1361 carried the report over instead of ordering a review.
+        return await _PinnedGitOps.branch_diff(self, repo, base, branch)
 
     async def delta_without_base(self, repo, base, prev, current):
         return self._since(prev)
