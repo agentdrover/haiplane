@@ -7,6 +7,9 @@ dispatcher (#757) never builds payloads itself.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -80,8 +83,8 @@ async def test_review_agent_request_matches_spec(monkeypatch, _configured):
     # model.id, hub MCP with the REVIEWER bearer, no auto-PR.
     recorder = _Recorder(httpx.Response(200, json={"agent": {"id": "bc-1"}}))
     _patch_transport(monkeypatch, recorder)
-    # Голый model.id — форма без параметров (#1417 AC-2); умолчание fast=false
-    # проверяет test_review_agent_is_ordered_without_fast_by_default.
+    # Голый model.id — форма без параметров (#1417 AC-2); умолчание по каталогу
+    # проверяет test_review_model_shape_matches_recorded_models_catalog.
     monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL_PARAMS", "")
 
     result = await cursor_cloud.create_review_agent(
@@ -130,23 +133,179 @@ async def _ordered_review_body(monkeypatch) -> dict:
     return json.loads(recorder.request.content)
 
 
-async def test_review_agent_is_ordered_without_fast_by_default(
+#: Записанная выдержка GET /v1/models (#1423): откуда и что в ней — поле
+#: ``_recorded`` в самом файле. Умолчание заказа сверяется с ней, а не с
+#: тем, что тест считает правильным форматом.
+RECORDED_MODELS_CATALOG: dict = json.loads(
+    (Path(__file__).parent / "fixtures" / "cursor_models_catalog.json").read_text()
+)
+
+
+class _Provider:
+    """Каталог на GET /v1/models, агент на POST /v1/agents; помнит всё."""
+
+    def __init__(self, catalog: httpx.Response | Exception):
+        self.catalog = catalog
+        self.requests: list[httpx.Request] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if request.method == "GET" and request.url.path == "/v1/models":
+            if isinstance(self.catalog, Exception):
+                raise self.catalog
+            return self.catalog
+        if request.method == "POST" and request.url.path == "/v1/agents":
+            return httpx.Response(200, json={"agent": {"id": "bc-1"}})
+        raise AssertionError(f"unexpected call {request.method} {request.url}")
+
+    def catalog_reads(self) -> int:
+        return sum(1 for r in self.requests if r.url.path == "/v1/models")
+
+    def ordered_models(self) -> list[dict]:
+        return [
+            json.loads(r.content)["model"]
+            for r in self.requests
+            if r.url.path == "/v1/agents"
+        ]
+
+
+async def _order(monkeypatch, provider: _Provider, model_id: str) -> None:
+    original_init = httpx.AsyncClient.__init__
+
+    def patched(self, *args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(provider.handler)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched)
+    await cursor_cloud.create_review_agent(
+        repo_url="https://github.com/o/r",
+        starting_ref="task-1/x",
+        model_id=model_id,
+        prompt_text="review",
+        hub_mcp_url="https://hub/mcp",
+        reviewer_token="tok",
+    )
+
+
+async def test_review_model_shape_matches_recorded_models_catalog(
     monkeypatch, _configured
 ):
-    """#1417 AC-1: без настройки ревьюер заказывается с fast=false.
+    """#1423 AC-3: умолчание берёт вариант из каталога, а не собирает свой.
 
-    Cursor без params подставляет вариант Fast — та же модель вдвое дороже.
-    Умолчание проверяется как есть: переменной в окружении теста нет, и
-    значение в config — то, что служба получит без drop-in'а.
+    #1417 слал ``[{fast:false}]`` — пары такой в variants grok-4.6 нет, и
+    Cursor отвечал 400 invalid_model на каждый заказ. Теперь: вариант
+    isDefault этой модели, в нём только fast → false, и такая пара обязана
+    СТОЯТЬ в variants. Умолчание проверяется как есть: переменной в
+    окружении теста нет, значение в config — то, что служба получит без
+    drop-in'а.
     """
     import os
 
     assert "CURSOR_REVIEW_MODEL_PARAMS" not in os.environ
-    body = await _ordered_review_body(monkeypatch)
-    assert body["model"] == {
+    provider = _Provider(httpx.Response(200, json=RECORDED_MODELS_CATALOG))
+
+    await _order(monkeypatch, provider, "grok-4.6")
+    await _order(monkeypatch, provider, "grok-4.7")
+    await _order(monkeypatch, provider, "composer-2.5")
+
+    grok46, grok47, composer = provider.ordered_models()
+    assert grok46 == {
         "id": "grok-4.6",
+        "params": [{"id": "effort", "value": "high"}, {"id": "fast", "value": "false"}],
+    }
+    assert grok47 == {
+        "id": "grok-4.7",
+        "params": [
+            {"id": "context", "value": "500k"},
+            {"id": "reasoning_effort", "value": "high"},
+            {"id": "fast", "value": "false"},
+        ],
+    }
+    assert composer == {
+        "id": "composer-2.5",
         "params": [{"id": "fast", "value": "false"}],
     }
+    # Каждая отправленная форма — дословно пара из записанных variants.
+    for model in provider.ordered_models():
+        (item,) = [
+            i for i in RECORDED_MODELS_CATALOG["items"] if i["id"] == model["id"]
+        ]
+        assert model["params"] in [v["params"] for v in item["variants"]]
+    assert provider.catalog_reads() == 1, "каталог кэшируется, а не читается на заказ"
+
+
+async def test_catalog_without_slow_pair_or_model_orders_bare(monkeypatch, _configured):
+    """#1423: нет пары с fast=false или модели в каталоге — заказ без params."""
+    catalog = {
+        "items": [
+            {
+                "id": "grok-4.6",
+                "variants": [
+                    {
+                        "params": [
+                            {"id": "effort", "value": "high"},
+                            {"id": "fast", "value": "true"},
+                        ],
+                        "isDefault": True,
+                    },
+                    {
+                        "params": [
+                            {"id": "effort", "value": "low"},
+                            {"id": "fast", "value": "false"},
+                        ]
+                    },
+                ],
+            }
+        ]
+    }
+    provider = _Provider(httpx.Response(200, json=catalog))
+
+    await _order(monkeypatch, provider, "grok-4.6")
+    await _order(monkeypatch, provider, "gpt-unknown")
+
+    assert provider.ordered_models() == [{"id": "grok-4.6"}, {"id": "gpt-unknown"}]
+
+
+@pytest.mark.parametrize(
+    "catalog",
+    [
+        httpx.Response(500, text="boom"),
+        httpx.Response(200, json={"items": "junk"}),
+        httpx.ConnectTimeout("slow"),
+    ],
+)
+async def test_unreadable_catalog_orders_bare(monkeypatch, _configured, catalog):
+    """#1423: каталог не прочитан — заказ без params, ревью не теряется.
+
+    И неудача не кэшируется: следующий заказ спрашивает каталог снова.
+    """
+    provider = _Provider(catalog)
+    await _order(monkeypatch, provider, "grok-4.6")
+    provider.catalog = httpx.Response(200, json=RECORDED_MODELS_CATALOG)
+    await _order(monkeypatch, provider, "grok-4.6")
+    first, second = provider.ordered_models()
+    assert first == {"id": "grok-4.6"}
+    assert second["params"] == [
+        {"id": "effort", "value": "high"},
+        {"id": "fast", "value": "false"},
+    ]
+
+
+async def test_explicit_review_params_win_over_catalog(monkeypatch, _configured):
+    """#1423: явная настройка владельца — как есть, каталог даже не читается."""
+    monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL_PARAMS", "effort=high,fast=false")
+    provider = _Provider(httpx.Response(200, json=RECORDED_MODELS_CATALOG))
+    await _order(monkeypatch, provider, "grok-4.6")
+    assert provider.ordered_models() == [
+        {
+            "id": "grok-4.6",
+            "params": [
+                {"id": "effort", "value": "high"},
+                {"id": "fast", "value": "false"},
+            ],
+        }
+    ]
+    assert provider.catalog_reads() == 0
 
 
 async def test_empty_review_model_params_sends_bare_model(monkeypatch, _configured):
@@ -156,11 +315,8 @@ async def test_empty_review_model_params_sends_bare_model(monkeypatch, _configur
     assert body["model"] == {"id": "grok-4.6"}
 
 
-def test_review_model_params_parse_pairs_and_skip_junk(monkeypatch):
-    monkeypatch.setattr(
-        config, "CURSOR_REVIEW_MODEL_PARAMS", " fast=false , effort=high,junk,=x,"
-    )
-    params = cursor_cloud.review_model_params()
+def test_review_model_params_parse_pairs_and_skip_junk():
+    params = cursor_cloud.parse_model_params(" fast=false , effort=high,junk,=x,")
     assert params == [
         {"id": "fast", "value": "false"},
         {"id": "effort", "value": "high"},

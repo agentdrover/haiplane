@@ -1,0 +1,57 @@
+{
+  "_recorded": "Excerpt of GET https://api.cursor.com/v1/models taken on prod 25.09.2026 via cursor_cloud.list_models() (task #1423, card update #8502). Field shape per Cursor v1 docs: items[].parameters, items[].variants[].params, isDefault. grok-4.6: parameters, values, full effort x fast pairs and isDefault (effort=high, fast=true) as observed. grok-4.7 (default 500k/high/fast=true) and composer-2.5 (fast only) as observed, variant lists shortened. grok-4.5: parameters as observed; isDefault here is illustrative, not recorded.",
+  "items": [
+    {
+      "id": "grok-4.6",
+      "parameters": [
+        {"id": "effort", "values": [{"value": "low"}, {"value": "medium"}, {"value": "high"}, {"value": "xhigh"}]},
+        {"id": "fast", "values": [{"value": "false"}, {"value": "true"}]}
+      ],
+      "variants": [
+        {"params": [{"id": "effort", "value": "low"}, {"id": "fast", "value": "false"}]},
+        {"params": [{"id": "effort", "value": "low"}, {"id": "fast", "value": "true"}]},
+        {"params": [{"id": "effort", "value": "medium"}, {"id": "fast", "value": "false"}]},
+        {"params": [{"id": "effort", "value": "medium"}, {"id": "fast", "value": "true"}]},
+        {"params": [{"id": "effort", "value": "high"}, {"id": "fast", "value": "false"}]},
+        {"params": [{"id": "effort", "value": "high"}, {"id": "fast", "value": "true"}], "isDefault": true},
+        {"params": [{"id": "effort", "value": "xhigh"}, {"id": "fast", "value": "false"}]},
+        {"params": [{"id": "effort", "value": "xhigh"}, {"id": "fast", "value": "true"}]}
+      ]
+    },
+    {
+      "id": "grok-4.7",
+      "parameters": [
+        {"id": "context", "values": [{"value": "256k"}, {"value": "500k"}]},
+        {"id": "reasoning_effort", "values": [{"value": "low"}, {"value": "medium"}, {"value": "high"}, {"value": "xhigh"}]},
+        {"id": "fast", "values": [{"value": "false"}, {"value": "true"}]}
+      ],
+      "variants": [
+        {"params": [{"id": "context", "value": "500k"}, {"id": "reasoning_effort", "value": "high"}, {"id": "fast", "value": "true"}], "isDefault": true},
+        {"params": [{"id": "context", "value": "500k"}, {"id": "reasoning_effort", "value": "high"}, {"id": "fast", "value": "false"}]},
+        {"params": [{"id": "context", "value": "256k"}, {"id": "reasoning_effort", "value": "high"}, {"id": "fast", "value": "false"}]}
+      ]
+    },
+    {
+      "id": "grok-4.5",
+      "parameters": [
+        {"id": "effort", "values": [{"value": "low"}, {"value": "medium"}, {"value": "high"}]},
+        {"id": "fast", "values": [{"value": "false"}, {"value": "true"}]}
+      ],
+      "variants": [
+        {"params": [{"id": "effort", "value": "high"}, {"id": "fast", "value": "true"}], "isDefault": true},
+        {"params": [{"id": "effort", "value": "high"}, {"id": "fast", "value": "false"}]},
+        {"params": [{"id": "effort", "value": "medium"}, {"id": "fast", "value": "false"}]}
+      ]
+    },
+    {
+      "id": "composer-2.5",
+      "parameters": [
+        {"id": "fast", "values": [{"value": "false"}, {"value": "true"}]}
+      ],
+      "variants": [
+        {"params": [{"id": "fast", "value": "true"}], "isDefault": true},
+        {"params": [{"id": "fast", "value": "false"}]}
+      ]
+    }
+  ]
+}
