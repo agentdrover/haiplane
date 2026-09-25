@@ -554,5 +554,40 @@ async def get_usage(agent_id: str, run_id: str | None = None) -> dict[str, Any] 
     return await _request("GET", path)
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _first_present(key: str, *places: dict[str, Any]) -> Any:
+    """Значение ``key`` из первого места, где оно есть и не ``None``."""
+    for place in places:
+        if place.get(key) is not None:
+            return place[key]
+    return None
+
+
+def usage_totals(usage: dict[str, Any] | None) -> tuple[int | None, float | None]:
+    """``(токены, центы)`` из ответа ``/usage``; ``None`` — провайдер не назвал.
+
+    Токены — ``totalUsage.totalTokens`` (как у ревью). Центы — ``chargedCents``
+    (наблюдено в F0, docs/specs/orchestrator-executor-environment.md). По
+    типам Cloud Agents API/SDK деньги лежат в соседнем объекте ``cost``
+    (``V1AgentUsageResponse.cost``: ``rawCostCents``, ``chargedCents``) —
+    оттуда и читаются. ``totalUsage`` и верхний уровень остались запасными
+    местами (#1410). Нечисловое значение — не ноль, а ``None``.
+    """
+    if not isinstance(usage, dict):
+        return None, None
+    total = _as_dict(usage.get("totalUsage"))
+    tokens = total.get("totalTokens")
+    cents = _first_present("chargedCents", _as_dict(usage.get("cost")), total, usage)
+    return (
+        tokens if isinstance(tokens, int) and not isinstance(tokens, bool) else None,
+        float(cents)
+        if isinstance(cents, int | float) and not isinstance(cents, bool)
+        else None,
+    )
+
+
 async def list_models() -> dict[str, Any] | None:
     return await _request("GET", "/v1/models")

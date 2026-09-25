@@ -20,6 +20,7 @@ from hub import brand, commit_scope, config
 from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
 from hub.integrations import git_ops as git_ops_mod
+from hub.services.executor_dispatch import executor_run_metrics
 from hub.integrations.git_ops import (
     MERGE_UNCONFIRMED,
     WorkspaceBranchMismatchError,
@@ -981,6 +982,9 @@ async def practice_metrics(
         # #1246: submissions whose prepass failed while the author wrote about
         # runs — a count for a human to compare, not a claim about meaning.
         "validation_run_lines": validation_run_lines,
+        # #1410: стоимость облачного исполнителя за окно — центы по счёту
+        # провайдера (chargedCents) и число прогонов рядом с суммой.
+        "executor_runs": await executor_run_metrics(db, since),
         # #1406: сводка ревью для владельца — один агрегат на все поверхности.
         "review_economy": await review_economy(
             db, since_days=since_days, escaped=escaped
