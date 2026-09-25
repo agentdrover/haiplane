@@ -761,6 +761,12 @@ def _risk_profile_reason(risks: Any) -> str | None:
 # is behaviour even when it is Markdown — task templates under hub/, test
 # fixtures, workflow and PR templates, skills and agent prompts. Those keep
 # the old rule; so does any path this list does not name.
+#
+# Two choices on purpose, both erring toward the old rule (a false deep costs
+# tokens, a false lite costs a missed defect): a denied directory name matches
+# at ANY depth, so a nested ``pkg/templates/x.md`` stays behaviour even though
+# ``docs/hub/x.md`` then stays deep too; and ``.html`` is not documentation,
+# because a page under docs/ can carry script.
 _DOC_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
 _NOT_DOC_DIRS = frozenset(
     {
@@ -789,35 +795,116 @@ def is_documentation(path: str) -> bool:
     return not any(d.startswith(".") or d in _NOT_DOC_DIRS for d in parts[:-1])
 
 
-def _diff_touched_paths(diff: str) -> list[str]:
+_C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13}
+
+
+def _unquote_path(raw: str) -> str | None:
+    """A path as git prints it in a header, or None when it cannot be read.
+
+    With ``core.quotepath`` (the default) a name with non-ASCII bytes, quotes
+    or control characters comes C-quoted: ``"a/docs/\\320\\267.md"``.
+    Undecodable means unknown, never documentation.
+    """
+    raw = raw.strip()
+    if not raw.startswith('"'):
+        return raw
+    if len(raw) < 2 or not raw.endswith('"'):
+        return None
+    body, out, i = raw[1:-1], bytearray(), 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\":
+            out += ch.encode("utf-8")
+            i += 1
+        elif body[i + 1 : i + 4].isdigit() and len(body[i + 1 : i + 4]) == 3:
+            out.append(int(body[i + 1 : i + 4], 8) & 0xFF)
+            i += 4
+        elif i + 1 < len(body):
+            nxt = body[i + 1]
+            out.append(_C_ESCAPES.get(nxt, ord(nxt) if nxt.isascii() else 0))
+            i += 2
+        else:
+            return None
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _git_line_paths(rest: str) -> list[str | None]:
+    """The two sides of ``diff --git <a> <b>``, quoted or not."""
+    if rest.startswith('"'):
+        end = rest.find('" ', 1)
+        if end < 0:
+            return [None]
+        return [_unquote_path(rest[: end + 1]), _unquote_path(rest[end + 2 :])]
+    left, sep, right = rest.partition(" b/")
+    if not sep or not left.startswith("a/"):
+        return [None]
+    return [left, "b/" + right]
+
+
+def _header_paths(line: str) -> list[str | None] | None:
+    """Paths a FILE HEADER line names; None when the line is not a header.
+
+    ``None`` inside the list means "a header whose path could not be read".
+    """
+    if line.startswith("diff --git "):
+        found = _git_line_paths(line[len("diff --git ") :])
+    elif line.startswith(("diff --cc ", "diff --combined ")):
+        # A merge's combined diff (#1249 feeds one on resubmission): a binary
+        # resolution is named ONLY here, with no ---/+++ after it (7efb59b1).
+        found = [_unquote_path(line.split(" ", 2)[2])]
+    elif line.startswith(("--- ", "+++ ")):
+        found = [_unquote_path(line[4:])]
+    elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+        found = [_unquote_path(line.split(" ", 2)[2])]
+    else:
+        return None
+    return [
+        None if p is None else p.removeprefix("a/").removeprefix("b/") for p in found
+    ]
+
+
+def _diff_touched_paths(diff: str) -> list[str | None]:
     """Every path the diff touches — deleted and renamed-away ones included.
 
     :func:`changed_paths` skips ``+++ /dev/null`` on purpose, which is right
     for rules lookup and wrong here: deleting ``hub/x.py`` next to a README
     edit is a code change, and so is renaming code into ``docs/``.
+
+    Headers are read only OUTSIDE a hunk: after ``@@`` a line starting with
+    ``---`` is a deleted line of text (44f0ab2a), until the next ``diff``
+    line opens another file. A ``diff`` line that names no readable path
+    yields ``None`` — unknown, which the caller must never read as prose.
     """
-    paths: list[str] = []
+    paths: list[str | None] = []
+    in_hunk = False
     for line in diff.splitlines():
-        if line.startswith("diff --git "):
-            found = line[len("diff --git ") :].split(" b/", 1)
-            raw = [found[0].removeprefix("a/"), *found[1:]]
-        elif line.startswith(("+++ ", "--- ")):
-            raw = [line[4:].strip().removeprefix("a/").removeprefix("b/")]
-        elif line.startswith(("rename from ", "rename to ")):
-            raw = [line.split(" ", 2)[2]]
-        else:
+        if line.startswith("diff "):
+            in_hunk = False
+            found = _header_paths(line)
+            paths.extend(found if found is not None else [None])
             continue
-        for path in raw:
-            path = path.strip()
-            if path and path != "/dev/null" and path not in paths:
-                paths.append(path)
-    return paths
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if in_hunk:
+            continue
+        found = _header_paths(line)
+        if found:
+            paths.extend(p for p in found if p != "/dev/null")
+    return list(dict.fromkeys(paths))
 
 
 def is_docs_only_diff(diff: str) -> bool:
-    """Is every path this diff touches documentation? An empty diff is not."""
+    """Is every path this diff touches documentation? An empty diff is not.
+
+    Conservative by construction: a path that could not be read counts as
+    not documentation, so the old rule decides.
+    """
     paths = _diff_touched_paths(diff)
-    return bool(paths) and all(is_documentation(p) for p in paths)
+    return bool(paths) and all(p is not None and is_documentation(p) for p in paths)
 
 
 def pick_review_profile(

@@ -61,9 +61,10 @@ from hub.services.review_dispatch import (
 _TIP = "c" * 40
 
 
-_HARMLESS_DIFF = "+++ b/docs/notes.md\n+одна строка текста\n"
-# #1415: _HARMLESS_DIFF is documentation only, which now buys lite whatever the
-# class. A test that means "ordinary code, let the class decide" serves this.
+# Ordinary code with no process surface: the class and the risks decide. It
+# must NOT be documentation — a docs-only diff buys lite before the class or
+# the risks are read (#1415), and a lite assertion on it would witness nothing.
+_HARMLESS_DIFF = "+++ b/app/notes.py\n+NOTE = 'одна строка'\n"
 _CODE_DIFF = "+++ b/hub/x.py\n+x = 1\n"
 
 
@@ -628,8 +629,9 @@ async def test_low_risk_task_gets_lite_profile(
 async def test_high_risk_task_gets_deep_profile(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
-    # AC-2 (#807): a migration-class change and a declared high risk each
-    # buy the expensive harness on their own.
+    # AC-2 (#807, #1415): a migration-class change and a declared security
+    # risk each buy the expensive harness on their own. A declared high risk
+    # of any other kind no longer does (#1415).
     recorder = _DispatchRecorder({"agent": {"id": "bc-deep"}, "run": {"id": "r-deep"}})
     _wire(monkeypatch, recorder)
 
@@ -1026,6 +1028,74 @@ _PRODUCT_RISK = [
 ]
 
 
+# Real `git log -p -U0 --cc` output (#1415, finding 7efb59b1): the author
+# resolved a binary conflict in a merge and edited a document. The combined
+# diff names the binary ONLY in its `diff --cc` line — no ---/+++ headers.
+_CC_BINARY_AND_DOCS = (
+    "diff --git a/docs/notes.md b/docs/notes.md\n"
+    "index 7898192..422c2b7 100644\n"
+    "--- a/docs/notes.md\n"
+    "+++ b/docs/notes.md\n"
+    "@@ -1,0 +2 @@ a\n"
+    "+b\n"
+    "diff --cc x.wasm\n"
+    "index e73ddff,3e29efb..c5ff1d1\n"
+    "Binary files differ\n"
+)
+
+
+def test_combined_diff_path_is_not_lost():
+    # 7efb59b1: a path named only by `diff --cc` / `diff --combined` counts.
+    task = {"risk_class": "R3", "risks": "[]"}
+    profile, reasons = pick_review_profile(task, _CC_BINARY_AND_DOCS)
+    assert profile == DEEP, reasons
+    combined = _CC_BINARY_AND_DOCS.replace("diff --cc ", "diff --combined ")
+    assert pick_review_profile(task, combined)[0] == DEEP
+    # A file block whose path cannot be read is not documentation either.
+    unreadable = _docs_diff("docs/x.md") + "diff --git garbage\nBinary files differ\n"
+    assert pick_review_profile(task, unreadable)[0] == DEEP
+    # And a `diff` header of a shape nobody taught the parser is unknown too.
+    unknown = _docs_diff("docs/x.md") + "diff --tree x.wasm\nBinary files differ\n"
+    assert pick_review_profile(task, unknown)[0] == DEEP
+
+
+def test_hunk_body_is_not_read_as_a_header():
+    # 44f0ab2a: real `git diff -U0` deleting the line "-- verbose" from a
+    # document prints "--- verbose" INSIDE the hunk. That is text, not a file.
+    diff = (
+        "diff --git a/docs/x.md b/docs/x.md\n"
+        "index 02dbddc..587be6b 100644\n"
+        "--- a/docs/x.md\n"
+        "+++ b/docs/x.md\n"
+        "@@ -2 +1,0 @@ x\n"
+        "--- verbose\n"
+        "@@ -5,0 +5 @@ y\n"
+        "+++ added\n"
+    )
+    task = {"risk_class": "R3", "risks": "[]"}
+    assert pick_review_profile(task, diff) == (LITE, ["дифф только из документации"])
+
+
+def test_quoted_paths_are_decoded():
+    # ab56be42: with core.quotepath (the default) git prints non-ASCII names
+    # as quoted octal. Real header for docs/заметки.md:
+    q = '"a/docs/\\320\\267\\320\\260\\320\\274\\320\\265\\321\\202\\320\\272\\320\\270.md"'
+    qb = '"b/' + q[3:]
+    diff = (
+        f"diff --git {q} {qb}\n"
+        "index 02dbddc..587be6b 100644\n"
+        f"--- {q}\n"
+        f"+++ {qb}\n"
+        "@@ -2 +1,0 @@ x\n"
+        "-строка\n"
+    )
+    task = {"risk_class": "R3", "risks": "[]"}
+    assert pick_review_profile(task, diff)[0] == LITE
+    # Decoding must not launder code: a quoted path under hub/ stays code.
+    code = diff.replace("docs/", "hub/").replace(".md", ".py")
+    assert pick_review_profile(task, code)[0] == DEEP
+
+
 async def test_product_high_risk_does_not_buy_deep(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
@@ -1117,6 +1187,10 @@ def test_documentation_is_an_explicit_list():
     renamed = "diff --git a/hub/x.py b/docs/x.md\nrename from hub/x.py\n"
     profile, _ = pick_review_profile(task, renamed)
     assert profile == DEEP, "code renamed into docs/ is still a code change"
+    for path in ("AGENTS.md", "CLAUDE.md", "docs/AGENTS.md", "sub/CLAUDE.md"):
+        # Instruction files an agent loads are behaviour, not prose.
+        profile, _ = pick_review_profile(task, _docs_diff(path))
+        assert profile == DEEP, path
     for path in ("README.md", "deploy/CD.md", "docs/a/b.rst", "CONTRIBUTING.md"):
         profile, _ = pick_review_profile(task, _docs_diff(path))
         assert profile == LITE, path

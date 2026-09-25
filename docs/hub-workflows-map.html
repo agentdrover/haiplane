@@ -532,7 +532,7 @@
   <thead><tr><th>Профиль</th><th>Когда</th><th>Бюджет</th></tr></thead>
   <tbody>
     <tr><td><code>lite</code></td><td>дефолт</td><td><code>REVIEW_LITE_TOKEN_BUDGET</code> = 40k</td></tr>
-    <tr><td><code>deep</code></td><td>класс риска ≥ R3; процессные поверхности в добавленных строках (не в комментариях); технический профиль рисков; не удалось прочитать дифф</td><td><code>REVIEW_TOKEN_BUDGET</code> = 300k</td></tr>
+    <tr><td><code>deep</code></td><td>ручной запрос; заявлен риск <code>security</code> (любая severity); не удалось прочитать дифф; процессные поверхности в добавленных строках (не в комментариях); класс риска ≥ R3 или не посчитан. Заявленный риск high другого вида deep не покупает, а авторский дифф только из документации получает lite, если нет ручного запроса и security (#1415)</td><td><code>REVIEW_TOKEN_BUDGET</code> = 300k</td></tr>
     <tr><td>top-up</td><td>дешёвый прогон сам объявил <code>incomplete</code> → один тяжёлый догон</td><td>потолок <code>REVIEW_LADDER_MAX_STEPS</code> = 2 прогона на сабмишен</td></tr>
   </tbody>
 </table>
