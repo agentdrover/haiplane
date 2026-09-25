@@ -3455,3 +3455,103 @@ async def test_a_held_signal_with_the_same_queue_writes_nothing_new(
     await _sweep_reviewer_unavailable(db)
 
     assert len(await _reviewer_events(db, REVIEWER_UNAVAILABLE)) == before
+
+
+# ---------------------------------------------------------------------------
+# #1398 — поллер и report_done доставляют одну задачу одновременно
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrent_poller_and_report_done_deliver_once_without_alert(
+    db, db_dsn, monkeypatch
+):
+    """AC-3: два пути мержа в одном окне — одна доставка и ни одного отказа.
+
+    Топология прода (#1065): report_done идёт по соединению запроса и держит
+    BEGIN IMMEDIATE на всём done-flow, поллер — по своему соединению. Форж
+    принимает ровно один merge; второй получает отказ, как GitHub по уже
+    влитому PR (24.09.2026, #1376).
+    """
+    from hub import poller
+    from hub.db import connect
+    from hub.models import TaskCreate, TaskReviewVerdict, TaskUpdateCreate
+
+    tv = await services.create_task(db, TaskCreate(title="Deliver me once"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: build")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev")
+    await repo.update_task(db, tv.id, pr_number=77)
+    await db.commit()
+    await services.submit_for_review(db, tv.id)
+    await services.record_review_verdict(
+        db, tv.id, TaskReviewVerdict(verdict="approved", agent="reviewer")
+    )
+    # Как на проде: сдача закреплена, вершина не сдвинулась. Иначе гейт пишет
+    # в карточку «сверка не проводилась» ДО мержа, и write-лок SQLite, который
+    # держит done-flow, сам сериализует пути — гонка в тесте не случается.
+    await repo.update_task(db, tv.id, submission_sha="a" * 40)
+    await db.commit()
+
+    async def _tip_unchanged(*_a, **_k):
+        return "a" * 40, ""
+
+    monkeypatch.setattr("hub.services.lifecycle.resolve_branch_tip", _tip_unchanged)
+
+    merges: list[bool] = []
+    arrived = asyncio.Event()
+    calls = 0
+
+    async def _merge_once(*_a, **_k):
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            arrived.set()
+        try:
+            # Оба пути доходят до мержа в одном окне — если оба вообще идут.
+            await asyncio.wait_for(arrived.wait(), 0.5)
+        except asyncio.TimeoutError:
+            pass
+        accepted = not merges
+        merges.append(accepted)
+        return accepted
+
+    g = NoopGitOps()
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.passed, "checks_passed")
+    )
+    g.merge_pr = AsyncMock(side_effect=_merge_once)
+    g.pr_state = AsyncMock(side_effect=lambda *a, **k: "merged" if merges else "open")
+    g.merge_commit_sha = AsyncMock(return_value="gate0merge0sha")
+    g.pull_main = AsyncMock(return_value=True)
+    g.delete_branch = AsyncMock(return_value=True)
+    plugins.git_ops = g
+    plugins.dispatch = NoopDispatch()
+
+    poller_db = await connect(db_dsn)
+    try:
+        await asyncio.gather(
+            services.add_update(
+                db,
+                tv.id,
+                TaskUpdateCreate(agent="dev", kind="done", content="done"),
+            ),
+            poller._sweep_pair_delivery(poller_db),
+        )
+    finally:
+        await poller_db.close()
+    await db.commit()
+
+    rows = await db.execute_fetchall(
+        "SELECT merge_sha FROM pipeline_merges WHERE task_id = ?", (tv.id,)
+    )
+    assert [dict(r)["merge_sha"] for r in rows] == ["gate0merge0sha"], (
+        "ровно одна строка pipeline_merges — одна доставка"
+    )
+    task = dict(await repo.get_task(db, tv.id))
+    assert task["status"] == "completed"
+    feed = [dict(u)["content"] or "" for u in await repo.get_task_updates(db, tv.id)]
+    assert not any("merge_failed" in c for c in feed), feed
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert not any(
+        e["kind"] == "needs_decision" and e["task_id"] == tv.id for e in events
+    ), "ни одного перехода в needs_decision"

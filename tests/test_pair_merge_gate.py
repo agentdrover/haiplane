@@ -1493,3 +1493,109 @@ async def test_a_refused_ready_merge_still_calls_a_human(db):
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     assert any("merge_failed" in (u.get("content") or "") for u in updates)
     g.merge_pr.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# #1398 — гонка двух путей доставки: отказ форжа по уже влитому PR
+# ---------------------------------------------------------------------------
+#
+# 24.09.2026, #1376: вердикт в 19:52:09, report_done в 19:52:31, поллер влил PR
+# в 19:52:36. Путь report_done в ту же секунду получил отказ GitHub и записал
+# «merge_failed: GitHub refused the merge», задача ушла в needs_decision —
+# человеку предложили решать по доставке, которая уже случилась.
+
+
+def _merged_meanwhile(g, db, task_id: int, *, by_gate: bool):
+    """Форж отказывает в мерже, потому что PR уже влит кем-то ещё.
+
+    ``by_gate`` — кем: соседним путём гейта (он пишет строку pipeline_merges)
+    или руками (строки нет). Строка кладётся В МОМЕНТ отказа, а не до вызова:
+    проверку ``pipeline_merge_recorded`` в начале гейта гонка и проходит.
+    """
+
+    async def _refuse(*_a, **_k):
+        if by_gate:
+            await repo.record_pipeline_merge(
+                db, pr_number=77, merge_sha="poller0merge0sha", task_id=task_id
+            )
+        return False
+
+    g.merge_pr = AsyncMock(side_effect=_refuse)
+    g.pr_state = AsyncMock(return_value="merged")
+    g.merge_commit_sha = AsyncMock(return_value="poller0merge0sha")
+
+
+async def test_report_done_after_poller_merged_is_delivered_not_merge_failed(db):
+    g = _git(CIProbeOutcome.passed, merged=False)
+    task_id = await _approved_pair_task(db)
+    _merged_meanwhile(g, db, task_id, by_gate=True)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed", (
+        "PR влит соседним путём гейта — это доставка, а не отказ"
+    )
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "merge_failed" not in feed, "чужая доставка не называется отказом"
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert not any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    ), "решать человеку нечего — awaiting не human_decision"
+    rows = await db.execute_fetchall(
+        "SELECT merge_sha FROM pipeline_merges WHERE task_id = ?", (task_id,)
+    )
+    assert [dict(r)["merge_sha"] for r in rows] == ["poller0merge0sha"], (
+        "строку пишет тот, кто влил; проигравший второй не добавляет"
+    )
+
+
+async def test_report_done_after_manual_merge_names_cause(db):
+    g = _git(CIProbeOutcome.passed, merged=False)
+    task_id = await _approved_pair_task(db)
+    _merged_meanwhile(g, db, task_id, by_gate=False)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "needs_decision", (
+        "ручной мерж в то же окно — не доставка гейта, drift-guard должен его видеть"
+    )
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "PR влит не гейтом" in feed, "причина названа своим именем"
+    assert "GitHub refused the merge" not in feed, (
+        "отказа не было — PR уже влит, и «GitHub отказал» ведёт человека не туда"
+    )
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM pipeline_merges WHERE task_id = ?", (task_id,)
+    )
+    assert not list(rows), "ручной мерж не записывается как мерж гейта"
+
+
+async def test_silent_refusal_with_unreadable_pr_waits_instead_of_calling_a_human(db):
+    # #1398, ограничение постановки: PR после отказа прочитать не удалось —
+    # это не доставка и не отказ. Молчаливый отказ GitHub по уже влитому PR и
+    # настоящий отказ неразличимы, пока PR не прочитан: ждём следующего цикла.
+    g = _git(CIProbeOutcome.passed, merged=False)
+    g.merge_pr_with_detail = AsyncMock(return_value=(False, ""))
+    g.pr_state = AsyncMock(return_value="")
+    task_id = await _approved_pair_task(db)
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", "сеть моргнула — это ожидание, не решение"
+    events = [dict(e) for e in await repo.list_events(db, since=0)]
+    assert not any(
+        e["kind"] == "needs_decision" and e["task_id"] == task_id for e in events
+    )
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, task_id)
+    )
+    assert "merge_refusal_unverified" in feed
+    assert "GitHub refused the merge" not in feed
+    assert not list(await db.execute_fetchall("SELECT 1 FROM pipeline_merges"))
