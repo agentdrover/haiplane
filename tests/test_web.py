@@ -5556,6 +5556,54 @@ async def test_partial_judgement_stays_partial(client: AsyncClient, db):
     assert "судьба не названа" in page.text
 
 
+async def test_card_agrees_on_a_finding_an_observation_closed(client: AsyncClient, db):
+    # #1244 (review finding): the #1012 badge already discounts a finding a
+    # foreign live check closed by name; the summary and the finding's own row
+    # must say the same, or one card gives two answers to one question.
+    # Counted SEPARATELY from dispositions: a closure by observation is not a
+    # judgement (#876 stays human), so folding it into "размечено" would claim
+    # somebody judged a finding nobody did.
+    from hub import repository as repo_module
+    from hub.services.finding_identity import finding_uids
+
+    task_id = await _web_task_in_review(client)
+    await _machine_report(
+        client, task_id, findings_confirmed=_TWO_FINDINGS, raw_count=3
+    )
+    review = await repo_module.get_latest_machine_review(db, task_id)
+    await db.execute(
+        "UPDATE tasks SET implementer_principal_id = 7 WHERE id = ?", (task_id,)
+    )
+    await db.execute(
+        "UPDATE machine_reviews SET created_at = '2026-09-09 12:00:00' WHERE id = ?",
+        (review["id"],),
+    )
+    uid = finding_uids(_TWO_FINDINGS)[1]
+    check_id = await repo_module.insert_live_check(
+        db,
+        task_id=task_id,
+        sha="",
+        outcome="done",
+        probe="GET /v1/agents",
+        observation=f"находка {uid}: не воспроизводится",
+        recorded_by=8,
+        recorded_agent="someone",
+    )
+    await db.execute(
+        "UPDATE live_checks SET created_at = '2026-09-09 13:00:00' WHERE id = ?",
+        (check_id,),
+    )
+    await db.commit()
+
+    page = (await client.get(f"/tasks/{task_id}")).text
+
+    assert "1 из 2 находок без диспозиции" in page
+    assert "размечено 0, закрыто наблюдением 1 из 2" in page
+    assert f"закрыта наблюдением: живая проверка #{check_id}" in page
+    # Only the other finding is still without a fate.
+    assert page.count("судьба не названа") == 1
+
+
 async def test_disposition_is_corrected_not_duplicated(client: AsyncClient, db):
     # A gate that changes its mind corrects the row instead of leaving two
     # contradictory ones for the metrics to average.
