@@ -2191,6 +2191,14 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS ix_pipeline_merges_project_pr "
         "ON pipeline_merges (project_id, pr_number)",
     ),
+    (
+        # #1361: отчёт, ПЕРЕНЕСЁННЫЙ на пересдачу «только слита база», а не
+        # прочитанный заново. Непустое значение — id исходного отчёта: по нему
+        # перенос помечен в карточке и исключён из метрик чтения. NULL — всё,
+        # что было до этого, и каждое настоящее чтение после.
+        "add_machine_reviews_carried_from_review_id",
+        "ALTER TABLE machine_reviews ADD COLUMN carried_from_review_id INTEGER",
+    ),
 ]
 
 

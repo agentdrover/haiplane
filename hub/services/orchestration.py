@@ -209,14 +209,26 @@ def machine_review_required(task: dict[str, Any], project_policy: str = "auto") 
 # The condition is written ONCE. Both the gate below and the two metric
 # aggregates use this fragment; a copy would drift, and the whole point is
 # that the gate and the number agree on what a review is.
+#
+# #1361: a CARRIED report (``carried_from_review_id``) is evidence by
+# construction — it is only ever made from a report that passed this very
+# check — while its own tokens are deliberately empty: the carry cost nothing.
 REPORT_HAS_EVIDENCE_SQL = (
     "(raw_count > 0 "
     "OR json_array_length(findings_confirmed) > 0 "
     "OR json_array_length(findings_rejected) > 0 "
     "OR COALESCE(tokens_spent, 0) > 0 "
     "OR COALESCE(provider_tokens, 0) > 0 "
-    "OR COALESCE(agent_count, 0) > 1)"
+    "OR COALESCE(agent_count, 0) > 1 "
+    "OR carried_from_review_id IS NOT NULL)"
 )
+
+#: #1361: a report READ for this submission, not carried over from an earlier
+#: one. Every metric that counts reads, findings or reviewer models filters on
+#: it: a carry is the absence of a read, and counting it would make the saving
+#: look like one more run. Unqualified on purpose — no other table joined to
+#: machine_reviews has this column.
+ORIGINAL_READ_SQL = "carried_from_review_id IS NULL"
 
 
 def report_has_evidence(review: Any) -> bool:
@@ -255,6 +267,7 @@ def report_has_evidence(review: Any) -> bool:
         or (col("tokens_spent") or 0) > 0
         or (col("provider_tokens") or 0) > 0
         or (col("agent_count") or 0) > 1
+        or col("carried_from_review_id") is not None
     )
 
 
@@ -402,6 +415,7 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
         "LEFT JOIN (SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
         "GROUP BY review_id) AS judged ON judged.review_id = mr.id "
         f"WHERE mr.created_at >= datetime('now', ?) AND {REPORT_HAS_EVIDENCE_SQL} "
+        f"AND {ORIGINAL_READ_SQL} "
         "AND json_array_length(mr.findings_confirmed) > 0",
         (since,),
     )
@@ -492,8 +506,8 @@ async def recurring_categories(
         db,
         "SELECT COALESCE(json_extract(f.value, '$.category'), '') AS category, "
         "COUNT(*) AS findings, COUNT(DISTINCT mr.task_id) AS tasks "
-        "FROM machine_reviews mr, json_each(mr.findings_confirmed) f "
-        "WHERE mr.created_at >= datetime('now', ?) "
+        "FROM machine_reviews mr, json_each(mr.findings_confirmed) f "  # nosec B608 - constant fragment
+        f"WHERE mr.created_at >= datetime('now', ?) AND {ORIGINAL_READ_SQL} "
         "GROUP BY category HAVING category != '' "
         "ORDER BY findings DESC LIMIT 50",
         (since,),
@@ -684,10 +698,20 @@ async def practice_metrics(
         "COALESCE(SUM(CASE WHEN provider_tokens IS NOT NULL "
         "THEN json_array_length(findings_confirmed) ELSE 0 END), 0) "
         "AS confirmed_with_provider "
-        "FROM machine_reviews WHERE created_at >= datetime('now', ?)",
+        "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        f"AND {ORIGINAL_READ_SQL}",
         (since,),
     )
     totals = dict(totals_rows[0])
+    # #1361: carries are counted BESIDE the reads, never inside them — the
+    # saving stays visible without passing for a run.
+    carried_rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM machine_reviews "  # nosec B608 - constant fragment
+        f"WHERE created_at >= datetime('now', ?) AND NOT ({ORIGINAL_READ_SQL})",
+        (since,),
+    )
+    totals["carried_over"] = int(dict(carried_rows[0])["n"] or 0)
     confirmed = totals["confirmed_total"] or 0
     raw = totals["raw_total"] or 0
     # Cost per finding has to take its numerator and denominator from the same
@@ -755,6 +779,7 @@ async def practice_metrics(
         "AS billed_runs, "
         "SUM(CASE WHEN incomplete = 1 THEN 1 ELSE 0 END) AS incomplete_runs "
         "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        f"AND {ORIGINAL_READ_SQL} "
         "GROUP BY profile ORDER BY reviews DESC",
         (since,),
     )
@@ -769,6 +794,7 @@ async def practice_metrics(
         "COALESCE(SUM(json_array_length(findings_confirmed)), 0) AS confirmed_total, "
         "COALESCE(SUM(tokens_spent), 0) AS tokens_total "
         "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        f"AND {ORIGINAL_READ_SQL} "
         "GROUP BY harness_skill, harness_version "
         "ORDER BY harness_skill, harness_version",
         (since,),
@@ -1268,8 +1294,8 @@ async def _model_declaration_metrics(
     rows = await fetchall(
         db,
         "SELECT mr.model AS reviewer_model, t.submission_model AS implementer_model "
-        "FROM machine_reviews mr JOIN tasks t ON t.id = mr.task_id "
-        "WHERE mr.created_at >= datetime('now', ?)",
+        "FROM machine_reviews mr JOIN tasks t ON t.id = mr.task_id "  # nosec B608 - constant fragment
+        f"WHERE mr.created_at >= datetime('now', ?) AND {ORIGINAL_READ_SQL}",
         (since,),
     )
 
@@ -3003,9 +3029,10 @@ async def _approved_code_check(
     if current_tip != pinned:
         # #1233: вершина сдвинулась — но ЧЕМ? Если в ветку приехала только база,
         # авторская работа та же, и второй человеческий вердикт за неё — плата
-        # за механику, а не за содержание. Признак механический: дифф ветки к
-        # базе до и после мержа. Проверка стоит два чтения диффа и делается
-        # только здесь, на уже разошедшейся вершине.
+        # за механику, а не за содержание. Признак механический: авторская
+        # правка в диффе ветки к базе до и после мержа (#1361 — по смыслу, не
+        # побайтно). Проверка стоит два чтения диффа и делается только здесь,
+        # на уже разошедшейся вершине.
         kept, why = await base_merge_kept_the_verdict(db, task, pinned, current_tip)
         if kept:
             return "", (
@@ -3031,16 +3058,15 @@ async def base_merge_kept_the_verdict(
     сохранение вердикта без сказанного вслух основания ничем не отличается от
     доверия.
 
-    Сравниваются два диффа ветки к базе: одобренной вершины и текущей. Совпали
-    байт в байт — привезена только база. Это НАБЛЮДЕНИЕ, а не разбор сообщения
-    коммита: «merge develop» в заголовке пишется рукой и ничего не доказывает.
+    Сравниваются два диффа ветки к базе: одобренной вершины и текущей, одним
+    правилом ``base_merge.author_edit_same`` — упорядоченные строки +/- по
+    файлам, без ``index``, заголовков ханков и контекста (#1361). Это
+    НАБЛЮДЕНИЕ, а не разбор сообщения коммита: «merge develop» в заголовке
+    пишется рукой и ничего не доказывает.
 
-    Известная узость, и она в безопасную сторону: если база тронула тот же файл,
-    что и автор, дифф перестаёт совпадать (другой блоб базы — другая строка
-    ``index``, вставка базы — другие смещения ханков), и вердикт слетает, то
-    есть ровно сегодняшнее поведение. Наблюдено на настоящем git в
-    tests/test_delivery_gate.py. Обратной ошибки — сохранить вердикт там, где
-    автор правил, — такое сравнение не допускает, и это здесь важнее полноты.
+    Тем же чтением пользуется заказ ревью на пересдаче (review_dispatch,
+    #1361): «правка та же» у гейта и у ревью — один ответ, а не два.
+    ``pinned`` и ``current_tip`` — любые две вершины одной ветки.
     """
     branch = (task.get("branch") or "").strip()
     if not branch:
@@ -3056,7 +3082,7 @@ async def base_merge_kept_the_verdict(
     except Exception as exc:  # noqa: BLE001 - деградация, а не отказ гейта
         log.warning("base-merge check failed for #%s: %s", task["id"], exc)
         return False, f"сверка диффа к базе не состоялась: {exc}"
-    return base_merge.author_diff_unchanged(before, after)
+    return base_merge.author_edit_same(before, after)
 
 
 def _seconds_since_ci_start(iso_ts: str | None) -> float | None:
