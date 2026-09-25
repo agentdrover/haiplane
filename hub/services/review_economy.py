@@ -201,28 +201,47 @@ async def _findings_section(db: aiosqlite.Connection, since: str) -> dict[str, A
     }
 
 
+#: Строки «CI закреплённого sha» в порядке показа. Вместе дают все прогоны:
+#: молчание CI — не успех и не провал, у него свои строки (находка
+#: a5370258c13e33c0, тот же принцип, что в ci_report.py и red_base.py).
+CI_ROWS: tuple[str, ...] = ("red", "green", "undetermined", "skipped", "no_report")
+
+
+def _ci_row(reported: bool, status: str | None) -> str:
+    """Строка прогона по отчёту CI на закреплённом sha его сдачи."""
+    from hub.services.validation_run import FAIL, PASS, SKIPPED
+
+    if not reported:
+        return "no_report"
+    return {FAIL: "red", PASS: "green", SKIPPED: "skipped"}.get(
+        status or "", "undetermined"
+    )
+
+
 async def _red_ci_section(
     db: aiosqlite.Connection, runs: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """Прогоны, купленные на сдаче, чей закреплённый sha CI назвал fail."""
-    from hub.services.validation_run import FAIL, PASS
+    """Прогоны, купленные на сдаче, чей закреплённый sha CI назвал fail.
 
+    ``unknown`` (и любой непризнанный статус) — «CI не определился»,
+    ``skipped`` — «проверки пропущены»: ни то, ни другое не красное и не
+    зелёное, и ни то, ни другое не «отчёта нет» — отчёт есть.
+    """
     rows = await fetchall(
         db,
-        "SELECT s.task_id, s.generation, c.validation_status AS ci "
+        "SELECT s.task_id, s.generation, c.id IS NOT NULL AS reported, "
+        "c.validation_status AS ci "
         "FROM submissions s LEFT JOIN ci_run_reports c "
         "ON c.task_id = s.task_id AND c.head_sha = s.sha",
     )
-    ci_of = {(r["task_id"], r["generation"]): r["ci"] for r in rows}
-    red, green, silent = [], [], []
+    ci_of = {
+        (r["task_id"], r["generation"]): _ci_row(bool(r["reported"]), r["ci"])
+        for r in rows
+    }
+    by_row: dict[str, list[dict[str, Any]]] = {name: [] for name in CI_ROWS}
     for run in runs:
-        status = ci_of.get((run["task_id"], run["generation"]))
-        if status == FAIL:
-            red.append(run)
-        elif status == PASS:
-            green.append(run)
-        elif not status:
-            silent.append(run)
+        by_row[ci_of.get((run["task_id"], run["generation"]), "no_report")].append(run)
+    red, green = by_row["red"], by_row["green"]
     bill = _bill_row(red)
     return {
         "runs": bill["runs"],
@@ -230,7 +249,9 @@ async def _red_ci_section(
         "unbilled_runs": bill["unbilled_runs"],
         "provider_tokens": bill["provider_tokens_total"],
         "runs_on_green_ci": len(green),
-        "runs_without_ci_report": len(silent),
+        "runs_ci_undetermined": len(by_row["undetermined"]),
+        "runs_ci_skipped": len(by_row["skipped"]),
+        "runs_without_ci_report": len(by_row["no_report"]),
         "red_share": _share(len(red), len(red) + len(green)),
         **_sample(len(red) + len(green)),
     }

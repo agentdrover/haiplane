@@ -1912,6 +1912,12 @@ async def test_review_economy_is_the_same_on_every_surface(
         f"{econ['runs']['provider_tokens_total']} provider tokens"
     ) in text
     assert f"Unresolved: {econ['findings']['unresolved_total']} in" in text
+    red_ci = econ["red_ci"]
+    assert (
+        f"CI undetermined {red_ci['runs_ci_undetermined']}, checks skipped "
+        f"{red_ci['runs_ci_skipped']}, no CI report "
+        f"{red_ci['runs_without_ci_report']}"
+    ) in text
 
     page = (await client.get("/metrics?since_days=90")).text
     shown = dict(re.findall(r'data-metric="([\w.]+)"[^>]*>\s*(-?\d+)\s*<', page))
@@ -1925,6 +1931,10 @@ async def test_review_economy_is_the_same_on_every_surface(
         "findings.confirmed_total": econ["findings"]["confirmed_total"],
         "red_ci.runs": econ["red_ci"]["runs"],
         "red_ci.provider_tokens": econ["red_ci"]["provider_tokens"],
+        "red_ci.runs_on_green_ci": econ["red_ci"]["runs_on_green_ci"],
+        "red_ci.runs_ci_undetermined": econ["red_ci"]["runs_ci_undetermined"],
+        "red_ci.runs_ci_skipped": econ["red_ci"]["runs_ci_skipped"],
+        "red_ci.runs_without_ci_report": econ["red_ci"]["runs_without_ci_report"],
         "reconciliation.reports": econ["reconciliation"]["reports"],
         "reconciliation.paid_runs": econ["reconciliation"]["paid_runs"],
         "reconciliation.gap": econ["reconciliation"]["gap"],
@@ -1935,3 +1945,38 @@ async def test_review_economy_is_the_same_on_every_surface(
     # Числа попарно различны, иначе подмена одного другим прошла бы молча.
     assert (econ["runs"]["billed"], econ["runs"]["unbilled"]) == (2, 1)
     assert econ["findings"]["unresolved_total"] == 3
+
+
+async def test_review_economy_red_ci_rows_cover_every_run(
+    db: aiosqlite.Connection,
+):
+    # Находка a5370258c13e33c0 (#1406): unknown и skipped — полноправные
+    # статусы CI. Молчание не успех и не провал: у них своя строка, и строки
+    # вместе дают все прогоны, без безымянного остатка.
+    for title, ci in (
+        ("red", "fail"),
+        ("green", "pass"),
+        ("undetermined", "unknown"),
+        ("skipped", "skipped"),
+        ("no report", None),
+    ):
+        task_id = await _task(db, title=title)
+        await _pin(db, task_id, f"sha-{title}", ci)
+        await _order(db, task_id, bill=1_000_000)
+    await db.commit()
+
+    econ = (await practice_metrics(db))["review_economy"]
+    red_ci = econ["red_ci"]
+
+    assert red_ci["runs"] == 1, "unknown и skipped не красные"
+    assert red_ci["runs_on_green_ci"] == 1
+    assert red_ci["runs_ci_undetermined"] == 1
+    assert red_ci["runs_ci_skipped"] == 1
+    assert red_ci["runs_without_ci_report"] == 1
+    assert (
+        red_ci["runs"]
+        + red_ci["runs_on_green_ci"]
+        + red_ci["runs_ci_undetermined"]
+        + red_ci["runs_ci_skipped"]
+        + red_ci["runs_without_ci_report"]
+    ) == econ["runs"]["total"]

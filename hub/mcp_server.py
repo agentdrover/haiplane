@@ -3337,7 +3337,11 @@ def _review_economy_lines(econ: dict[str, Any]) -> list[str]:
         + (" (undersampled)" if findings.get("undersampled") else "")
         + f"; confirmed: {findings.get('confirmed_total', 0)}",
         f"Runs on red CI: {red.get('runs', 0)} "
-        f"({red.get('provider_tokens', 0)} provider tokens)",
+        f"({red.get('provider_tokens', 0)} provider tokens); green "
+        f"{red.get('runs_on_green_ci', 0)}, CI undetermined "
+        f"{red.get('runs_ci_undetermined', 0)}, checks skipped "
+        f"{red.get('runs_ci_skipped', 0)}, no CI report "
+        f"{red.get('runs_without_ci_report', 0)}",
         f"Reports vs paid runs: {rec.get('reports', 0)} vs "
         f"{rec.get('paid_runs', 0)}, gap {rec.get('gap', 0)} = {buckets}",
     ]
