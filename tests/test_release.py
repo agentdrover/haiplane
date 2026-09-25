@@ -53,6 +53,7 @@ def _git(
     ),
     return_merge: tuple[bool, str] = (True, RETURN_SHA),
     opened_return: int | None = RETURN_PR,
+    return_lookup_failure: str = "",
 ):
     """Плагин git, где релизный PR зелёный, а PR возврата — как скажут.
 
@@ -78,13 +79,18 @@ def _git(
     g.check_pr_ci = AsyncMock(side_effect=ci)
     g.check_pr_mergeable = AsyncMock(side_effect=mergeable)
     g.pr_for_branch = AsyncMock(return_value=release_pr)
-    g.open_pr_between = AsyncMock(return_value=return_pr)
+    g.open_pr_between = AsyncMock(return_value=(return_pr, return_lookup_failure))
     g.merge_pr = AsyncMock(return_value=True)
     g.merge_return_pr = AsyncMock(return_value=return_merge)
     g.merge_commit_sha = AsyncMock(return_value="c" * 40)
     g.content_differs = AsyncMock(return_value=release_pr is not None)
     g.ensure_remote_branch = AsyncMock(return_value=("present", "b" * 12))
-    g.open_release_pr = AsyncMock(return_value=opened_return)
+    # Релизный PR открывается старым путём, PR возврата — своим (#1426):
+    # по паре база+голова и только из этого же репозитория.
+    g.open_release_pr = AsyncMock(return_value=777)
+    g.open_return_pr = AsyncMock(
+        return_value=(opened_return, "" if opened_return else "форж отказал")
+    )
     g.merge_branches = AsyncMock(return_value=("returned", "d" * 40))
     g.return_release_into_base = AsyncMock(return_value=("returned", "d" * 40))
     plugins.git_ops = g
@@ -129,8 +135,9 @@ async def test_the_release_return_needs_no_role_bypass(db) -> None:
     merged, reason = await merge_ready_release(db, project)
 
     assert merged is True, reason
-    g.open_release_pr.assert_awaited_once()
-    call = g.open_release_pr.await_args
+    g.open_release_pr.assert_not_awaited()
+    g.open_return_pr.assert_awaited_once()
+    call = g.open_return_pr.await_args
     assert call.args[0] == "develop", "PR возврата вливается в интеграционную"
     assert call.args[1] == "main", "...из релизной ветки, а не наоборот"
     assert f"PR #{RETURN_PR}" in reason, f"возврат виден в отчёте: {reason!r}"
@@ -139,7 +146,7 @@ async def test_the_release_return_needs_no_role_bypass(db) -> None:
     # Второй тик: релизного PR больше нет, PR возврата зелёный.
     g.pr_for_branch.return_value = None
     g.content_differs.return_value = False
-    g.open_pr_between.return_value = RETURN_PR
+    g.open_pr_between.return_value = (RETURN_PR, "")
 
     merged, reason = await merge_ready_release(db, project)
 
@@ -305,26 +312,159 @@ async def test_the_return_is_merged_as_a_merge_commit_keeping_main() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_pr_from_main_into_another_base_is_not_the_return() -> None:
-    # PR с головой main бывает не только нашим. Влить чужой PR main → X под
-    # видом возврата значило бы слить main туда, куда никто не просил.
-    from hub.integrations.forge.github import GitHubForge
+async def test_a_failed_return_lookup_is_named_not_read_as_no_pr(db) -> None:
+    # #516: «не смог прочитать список PR» и «PR возврата нет» ведут к разным
+    # действиям. Сбой чтения — причина, а не тишина.
+    g = _git(release_pr=None, return_lookup_failure="список PR не прочитан: 502")
+    project = await _project(db)
+
+    merged, reason = await merge_ready_release(db, project)
+
+    assert merged is False
+    assert "502" in reason and "возврат" in reason, reason
+    g.merge_return_pr.assert_not_awaited()
+
+
+def _gh_listing(prs: list[dict] | None, *, fail: bool = False):
+    """``_gh`` для GitHubForge: отвечает на ``pr list``, записывает ``pr create``."""
+    calls: list[list[str]] = []
+
+    async def fake(*args, **_kw):
+        calls.append([str(a) for a in args])
+        if args[:2] == ("pr", "list"):
+            if fail:
+                return (1, "", "HTTP 502")
+            return (0, json.dumps(prs or []), "")
+        if args[:2] == ("pr", "create"):
+            return (0, f"https://github.com/agentdrover/haiplane/pull/{RETURN_PR}", "")
+        return (0, "", "")
+
+    return fake, calls
+
+
+def _pr(number: int, *, cross: bool = False, owner: str = "agentdrover") -> dict:
+    return {
+        "number": number,
+        "isCrossRepository": cross,
+        "headRepositoryOwner": {"login": owner},
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_fork_pr_from_main_into_develop_is_not_the_return() -> None:
+    # Находка deep-ревью №1. ``--head main`` фильтрует только имя ветки, и под
+    # него попадает attacker:main из форка. CI для PR из форка идёт, PR
+    # зелёный — и без проверки он вливался бы в develop мерж-коммитом.
     from hub.integrations.git_ops import GitOpsIntegration
 
-    with (
-        patch.object(GitHubForge, "pr_for_branch", AsyncMock(return_value=5)),
-        patch.object(
-            GitHubForge, "pr_refs", AsyncMock(return_value=("staging", "main"))
-        ),
-    ):
-        found = await GitOpsIntegration().open_pr_between("develop", "main")
+    fake, calls = _gh_listing(
+        [_pr(66, cross=True, owner="attacker"), _pr(67, owner="attacker")]
+    )
+    with patch("hub.integrations.forge.github._gh", side_effect=fake):
+        found, why = await GitOpsIntegration().open_pr_between(
+            "develop", "main", gh_repo="agentdrover/haiplane"
+        )
 
-    assert found is None
+    assert found is None, "PR из чужого репозитория принят за возврат"
+    assert "#66" in why and "#67" in why, f"пропуск обязан быть назван: {why!r}"
+    listing = next(c for c in calls if c[:2] == ["pr", "list"])
+    assert listing[listing.index("--base") + 1] == "develop", listing
+    assert listing[listing.index("--head") + 1] == "main", listing
+
+
+@pytest.mark.asyncio
+async def test_a_fork_pr_is_never_merged_as_the_return(db) -> None:
+    # Та же находка на уровне релиза: зелёный PR из форка не вливается.
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    g = _git(release_pr=None)
+    real = GitOpsIntegration()
+    g.open_pr_between = real.open_pr_between
+    project = await _project(db)
+
+    fake, _ = _gh_listing([_pr(66, cross=True, owner="attacker")])
+    with patch("hub.integrations.forge.github._gh", side_effect=fake):
+        merged, reason = await merge_ready_release(db, project)
+
+    assert merged is False
+    g.merge_return_pr.assert_not_awaited()
+    assert "#66" in reason, reason
+
+
+@pytest.mark.asyncio
+async def test_the_own_repo_pr_is_the_return_even_next_to_a_fork_pr() -> None:
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    fake, _ = _gh_listing([_pr(66, cross=True, owner="attacker"), _pr(RETURN_PR)])
+    with patch("hub.integrations.forge.github._gh", side_effect=fake):
+        found, why = await GitOpsIntegration().open_pr_between(
+            "develop", "main", gh_repo="agentdrover/haiplane"
+        )
+
+    assert (found, why) == (RETURN_PR, "")
+
+
+@pytest.mark.asyncio
+async def test_opening_the_return_leaves_a_pr_into_another_base_alone() -> None:
+    # Находка deep-ревью №2. Уже открыт PR main → staging. Старый путь
+    # (open_or_update_pr) нашёл бы его по голове, переименовал в «возврат» и
+    # не создал бы main → develop. Возврат ищется по паре база+голова.
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    state = {"created": False}
+
+    async def fake(*args, **_kw):
+        if args[:2] == ("pr", "list"):
+            assert "--base" in args, f"PR возврата ищется без базы: {args}"
+            listed = [_pr(RETURN_PR)] if state["created"] else []
+            return (0, json.dumps(listed), "")
+        if args[:2] == ("pr", "create"):
+            state["created"] = True
+            return (0, f"https://github.com/agentdrover/haiplane/pull/{RETURN_PR}", "")
+        return (0, "", "")
+
+    with patch("hub.integrations.forge.github._gh", side_effect=fake) as gh:
+        pr, why = await GitOpsIntegration().open_return_pr(
+            "develop",
+            "main",
+            "chore: return main into develop after the release",
+            "body",
+            gh_repo="agentdrover/haiplane",
+        )
+
+    assert (pr, why) == (RETURN_PR, "")
+    calls = [[str(a) for a in c.args] for c in gh.await_args_list]
+    assert not any(c[:2] == ["pr", "edit"] for c in calls), "чужой PR переименован"
+    create = next(c for c in calls if c[:2] == ["pr", "create"])
+    assert create[create.index("--base") + 1] == "develop", create
+    assert create[create.index("--head") + 1] == "main", create
+
+
+@pytest.mark.asyncio
+async def test_a_failed_listing_is_a_reason_not_no_pr() -> None:
+    # Неразрешённая находка: сбой чтения нельзя свести к «PR нет» (#516) —
+    # иначе открытие возврата пошло бы создавать второй PR вслепую.
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    fake, calls = _gh_listing(None, fail=True)
+    with patch("hub.integrations.forge.github._gh", side_effect=fake):
+        found, why = await GitOpsIntegration().open_pr_between(
+            "develop", "main", gh_repo="agentdrover/haiplane"
+        )
+        pr, open_why = await GitOpsIntegration().open_return_pr(
+            "develop", "main", "t", "b", gh_repo="agentdrover/haiplane"
+        )
+
+    assert found is None and "502" in why, why
+    assert pr is None and "502" in open_why, open_why
+    assert not any(c[:2] == ["pr", "create"] for c in calls), "создан вслепую"
 
 
 @pytest.mark.asyncio
 async def test_the_noop_integration_cannot_return_and_says_so() -> None:
     g = NoopGitOps()
-    assert await g.open_pr_between("develop", "main") is None
+    assert await g.open_pr_between("develop", "main") == (None, "")
+    pr, why = await g.open_return_pr("develop", "main", "t", "b")
+    assert pr is None and why
     ok, why = await g.merge_return_pr(RETURN_PR, "subject")
     assert ok is False and why
