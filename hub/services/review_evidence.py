@@ -802,6 +802,99 @@ async def attach_dispositions(db, view) -> None:
     ]
 
 
+#: The agent name the hub's own probe runner records under (#1236). Counts as
+#: the hub's hand only together with an empty principal AND a probe text from
+#: the closed registry — a name alone is what every caller can choose.
+HUB_PROBE_AGENT = "hub"
+
+
+def _parsed_ts(value: str) -> datetime | None:
+    """A stored timestamp as an aware datetime, or None when unreadable."""
+    from hub.models import to_iso_utc
+
+    try:
+        parsed = datetime.fromisoformat(str(to_iso_utc(value) or ""))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _closing_hand(check: dict[str, Any], author_pid: int | None) -> str:
+    """Whose hand recorded ``check``, if it may close a finding — else "".
+
+    By PRINCIPAL, never by agent name: every executor of one principal shares
+    the name, and #728 already learned that the name proves nothing. An author
+    whose principal is unknown cannot be told apart from anyone, so nothing a
+    principal records closes a finding of theirs.
+    """
+    from hub.services.live_probe import PROBES
+
+    recorded_by = check.get("recorded_by")
+    if recorded_by is None:
+        registry_calls = {spec.call for spec in PROBES.values()}
+        hub_ran_it = (check.get("recorded_agent") or "") == HUB_PROBE_AGENT and (
+            check.get("probe") or ""
+        ) in registry_calls
+        return "hub" if hub_ran_it else ""
+    if author_pid is None or int(recorded_by) == int(author_pid):
+        return ""
+    return "principal"
+
+
+def _names_uid(text: str, uid: str) -> bool:
+    """Whether ``text`` names ``uid`` as a whole token, not as part of a hex run."""
+    pattern = rf"(?<![0-9a-fA-F]){re.escape(uid)}(?![0-9a-fA-F])"
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+
+async def attach_observation_closures(db, view, task_row: dict[str, Any]) -> None:
+    """Mark confirmed findings a later live check refuted by name (#1244).
+
+    Three conditions, all required, and each is a way the rule would otherwise
+    become a way around fixing:
+
+    * the check NAMES the finding's uid — a topic or a file is not a name;
+    * it was recorded AFTER the report — an older observation is what the
+      report already had the chance to weigh;
+    * the hand is not the author's (:func:`_closing_hand`) — otherwise a
+      finding is withdrawn by the word of the party it was raised against.
+
+    Only a ``done`` check counts: ``failed`` and ``not_applicable`` observed
+    nothing. The report is not touched; the closure stands beside it.
+    """
+    from hub.models import FindingObservationClosure
+
+    uids = [f.finding_uid for f in view.findings_confirmed if f.finding_uid]
+    report_at = _parsed_ts(view.created_at or "")
+    if not uids or report_at is None:
+        view.observation_closures = []
+        return
+    author_pid = task_row.get("implementer_principal_id")
+    closures: dict[str, FindingObservationClosure] = {}
+    rows = await repo_module.list_live_checks(db, int(view.task_id), limit=200)
+    for row in reversed(rows):  # oldest first: the first refutation is cited
+        check = dict(row)
+        if (check.get("outcome") or "done") != "done":
+            continue
+        recorded_at = _parsed_ts(check.get("created_at") or "")
+        if recorded_at is None or recorded_at <= report_at:
+            continue
+        hand = _closing_hand(check, author_pid)
+        if not hand:
+            continue
+        text = f"{check.get('probe') or ''}\n{check.get('observation') or ''}"
+        for uid in uids:
+            if uid not in closures and _names_uid(text, uid):
+                closures[uid] = FindingObservationClosure(
+                    finding_uid=uid,
+                    live_check_id=int(check["id"]),
+                    recorded_agent=check.get("recorded_agent") or "",
+                    recorded_at=check.get("created_at") or "",
+                    hand=hand,
+                )
+    view.observation_closures = [closures[u] for u in uids if u in closures]
+
+
 def undisposed_confirmed(machine_review) -> tuple[int, int]:
     """How many confirmed findings the report carries, and how many nobody judged.
 
@@ -818,7 +911,14 @@ def undisposed_confirmed(machine_review) -> tuple[int, int]:
         return 0, 0
     confirmed = len(machine_review.findings_confirmed)
     judged = {d.finding_index for d in machine_review.dispositions}
-    return confirmed, sum(1 for i in range(confirmed) if i not in judged)
+    # #1244: a finding a later foreign observation refuted by name is not
+    # "unanswered" — the answer is the live check it links to.
+    observed = {c.finding_uid for c in machine_review.observation_closures}
+    return confirmed, sum(
+        1
+        for i, finding in enumerate(machine_review.findings_confirmed)
+        if i not in judged and finding.finding_uid not in observed
+    )
 
 
 def undisposed_note(confirmed: int, undisposed: int) -> str:
@@ -993,6 +1093,7 @@ async def report_view(
                 own_dispatch.get("second_door_reason") or ""
             )
         await attach_dispositions(db, machine_review)
+        await attach_observation_closures(db, machine_review, task_row)
         state = "current" if machine_review.is_current else "stale"
 
     return ReviewReport(

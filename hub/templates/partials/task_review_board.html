@@ -511,9 +511,17 @@
         {% for d in machine_review.dispositions %}
         {% if judged.update({d.finding_index: d}) %}{% endif %}
         {% endfor %}
+        {# #1244: закрытие живой проверкой — не диспозиция (#876 остаётся за
+           человеком), поэтому считается ОТДЕЛЬНО от «размечено»: слитое, оно
+           утверждало бы, что находку кто-то рассудил. Но и молчать о нём
+           нельзя — бейдж #1012 выше его уже учитывает. #}
+        {% set observed = {} %}
+        {% for c in machine_review.observation_closures %}
+        {% if observed.update({c.finding_uid: c}) %}{% endif %}
+        {% endfor %}
         <details>
             <summary class="project-edit-summary">confirmed findings — {#
-                #}размечено {{ machine_review.dispositions|length }} из {{ machine_review.findings_confirmed|length }}</summary>
+                #}размечено {{ machine_review.dispositions|length }}{% if observed %}, закрыто наблюдением {{ observed|length }}{% endif %} из {{ machine_review.findings_confirmed|length }}</summary>
             <form method="post"
                   action="/tasks/{{ task.id }}/web-finding-dispositions">
                 <p class="u-text-muted">
@@ -552,7 +560,10 @@
                             value="wont_fix"
                             {% if judged.get(loop.index0) and judged.get(loop.index0).disposition.value == 'wont_fix' %}checked{% endif %}>
                             неважно</label>
-                        {% if not judged.get(loop.index0) %}
+                        {% set closure = observed.get(f.finding_uid) %}
+                        {% if closure %}
+                        <span class="badge badge--xs">закрыта наблюдением: живая проверка #{{ closure.live_check_id }}</span>
+                        {% elif not judged.get(loop.index0) %}
                         <span class="badge badge-self-approved">судьба не названа</span>
                         {% endif %}
                     </li>

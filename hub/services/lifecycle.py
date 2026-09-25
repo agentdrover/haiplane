@@ -3513,6 +3513,7 @@ async def _vstep_approval_blind_spots(state: VerdictContext) -> None:
     if state.body.verdict.value == "approved":
         from hub.services.review_evidence import (
             attach_dispositions,
+            attach_observation_closures,
             undisposed_confirmed,
         )
         from hub.services.review_evidence import undisposed_note as _undisposed_note
@@ -3525,6 +3526,9 @@ async def _vstep_approval_blind_spots(state: VerdictContext) -> None:
                 state.task.get("submission_generation") or 0
             )
             await attach_dispositions(state.db, mr_view)
+            # #1244: the card discounts findings a foreign observation closed;
+            # the record written with the verdict must say the same.
+            await attach_observation_closures(state.db, mr_view, state.task)
             state.undisposed_note = _undisposed_note(*undisposed_confirmed(mr_view))
 
         has_current_report = False
