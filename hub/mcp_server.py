@@ -3311,6 +3311,38 @@ async def hub_answer_outcome(
     )
 
 
+def _review_economy_lines(econ: dict[str, Any]) -> list[str]:
+    """Owner's review summary (#1406): provider bill only, never tokens_spent."""
+    if not econ:
+        return []
+    runs = econ.get("runs") or {}
+    findings = econ.get("findings") or {}
+    red = econ.get("red_ci") or {}
+    rec = econ.get("reconciliation") or {}
+    by_profile = ", ".join(
+        f"{r.get('profile')} {r.get('runs', 0)} ({r.get('provider_tokens_total', 0)})"
+        for r in runs.get("by_profile") or []
+    )
+    buckets = ", ".join(
+        f"{b.get('bucket')} {b.get('count', 0)}" for b in rec.get("buckets") or []
+    )
+    return [
+        f"Review economy: {runs.get('total', 0)} run(s), "
+        f"{runs.get('billed', 0)} billed / {runs.get('unbilled', 0)} without a bill, "
+        f"{runs.get('provider_tokens_total', 0)} provider tokens"
+        + (f"; by profile: {by_profile}" if by_profile else ""),
+        f"Unresolved: {findings.get('unresolved_total', 0)} in "
+        f"{findings.get('reports_with_unresolved', 0)}/"
+        f"{findings.get('independent_reports', 0)} independent report(s)"
+        + (" (undersampled)" if findings.get("undersampled") else "")
+        + f"; confirmed: {findings.get('confirmed_total', 0)}",
+        f"Runs on red CI: {red.get('runs', 0)} "
+        f"({red.get('provider_tokens', 0)} provider tokens)",
+        f"Reports vs paid runs: {rec.get('reports', 0)} vs "
+        f"{rec.get('paid_runs', 0)}, gap {rec.get('gap', 0)} = {buckets}",
+    ]
+
+
 @mcp.tool()
 async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
     """Practice metrics (#384): machine-review economics, harness-version
@@ -3332,6 +3364,7 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
         f"{mr.get('tokens_per_confirmed') or '—'} per confirmed finding, "
         f"{mr.get('tokens_per_fixed') or '—'} per FIXED finding",
     ]
+    lines.extend(_review_economy_lines(data.get("review_economy") or {}))
     rd = data.get("review_dispatches") or {}
     lines.append(
         "Wasted dispatch spend (no report): "

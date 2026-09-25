@@ -1593,3 +1593,342 @@ async def test_an_empty_window_prints_zero_not_a_blank(client: AsyncClient):
     start = page.index("Без данных")
     row = page[start : page.index("</tr>", start)]
     assert "0 из 0" in row, f"пустое окно печатает нули, а не пустоту: {row!r}"
+
+
+# --- Сводка ревью для владельца (#1406) -------------------------------------
+#
+# Цена берётся только из счёта провайдера (review_dispatches.provider_tokens):
+# tokens_spent — самоотчёт харнесса, занижен в 12–62 раза и в цену не входит.
+# Прогон без счёта — отдельная строка, а не ноль и не среднее.
+
+_SELF_REPORT_TOKENS = 99_999_999  # tokens_spent, которого не должно быть нигде
+
+
+async def _order(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    generation: int = 1,
+    profile: str = "lite",
+    bill: int | None = None,
+    status: str = "done",
+    channel: str = "cloud",
+    replaces: int | None = None,
+    agent_id: str = "bc-run",
+) -> int:
+    did = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        agent_id=agent_id,
+        run_id="run",
+        model="gpt-5.3-codex",
+        profile=profile,
+        channel=channel,
+        replaces_dispatch_id=replaces,
+    )
+    if bill is not None:
+        await repo.set_review_dispatch_provider_tokens(db, did, bill)
+    await repo.set_review_dispatch_status(db, did, status)
+    return did
+
+
+async def _economy_report(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    generation: int = 1,
+    confirmed: int = 0,
+    unresolved: int = 0,
+    profile: str = "lite",
+    self_reviewed: bool = False,
+    bill: int | None = None,
+) -> int:
+    await db.execute(
+        "UPDATE tasks SET submission_generation=? WHERE id=?", (generation, task_id)
+    )
+    rid = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        harness_skill="multi-agent-review",
+        tokens_spent=_SELF_REPORT_TOKENS,
+        raw_count=confirmed + unresolved,
+        findings_confirmed=json.dumps(
+            [{"title": f"c{i}", "severity": "medium"} for i in range(confirmed)]
+        ),
+        unresolved=json.dumps(
+            [{"title": f"u{i}", "severity": "medium"} for i in range(unresolved)]
+        ),
+        incomplete=False,
+        profile=profile,
+        self_reviewed=self_reviewed,
+    )
+    if bill is not None:
+        await repo.set_machine_review_provider_tokens(
+            db, task_id, generation, bill, review_id=rid
+        )
+    return rid
+
+
+def _row(rows: list[dict], key: str, value: str) -> dict:
+    found = [r for r in rows if r[key] == value]
+    assert found, f"нет строки {key}={value}: {rows}"
+    return found[0]
+
+
+async def test_review_economy_counts_runs_by_profile_from_the_provider_bill(
+    db: aiosqlite.Connection,
+):
+    # AC-1 (#1406): прогоны по профилям и типам заказа — из счёта провайдера.
+    from hub.services.review_dispatch import MODEL_CASCADE_EVENT
+
+    a = await _task(db, title="first + ladder")
+    await _order(db, a, profile="lite", bill=1_000_000)
+    await _order(db, a, profile="deep", bill=3_000_000)
+    await _economy_report(db, a, confirmed=1)
+
+    b = await _task(db, title="unbilled run")
+    await _order(db, b, profile="deep", bill=None)
+    await _economy_report(db, b, confirmed=1)
+
+    c = await _task(db, title="ask again")
+    lost = await _order(db, c, profile="lite", bill=500_000, status="failed")
+    await _order(db, c, profile="lite", bill=700_000, replaces=lost)
+
+    d = await _task(db, title="cascade")
+    await _order(db, d, profile="deep", bill=2_000_000)
+    cascade = await _order(db, d, profile="deep", bill=2_500_000)
+    await repo.insert_event(
+        db,
+        kind=MODEL_CASCADE_EVENT,
+        task_id=d,
+        actor="policy",
+        payload={"generation": 1, "dispatch_id": cascade, "attempt": 1},
+    )
+
+    e = await _task(db, title="second door")
+    refused = await _order(db, e, profile="lite", bill=None, status="failed")
+    await _order(db, e, profile="lite", bill=None, channel="local", replaces=refused)
+    # Заглушка отказа (#1242) — не прогон: агента не было, счёта тоже.
+    await _order(db, e, profile="lite", agent_id="", status="failed")
+    await db.commit()
+
+    econ = (await practice_metrics(db))["review_economy"]
+    runs = econ["runs"]
+
+    assert runs["total"] == 9
+    assert runs["billed"] == 6
+    assert runs["unbilled"] == 3, "прогон без счёта — своя строка, не ноль"
+    assert runs["provider_tokens_total"] == 9_700_000
+
+    lite = _row(runs["by_profile"], "profile", "lite")
+    assert (lite["runs"], lite["billed_runs"], lite["unbilled_runs"]) == (5, 3, 2)
+    assert lite["provider_tokens_total"] == 2_200_000
+    deep = _row(runs["by_profile"], "profile", "deep")
+    assert (deep["runs"], deep["billed_runs"], deep["unbilled_runs"]) == (4, 3, 1)
+    assert deep["provider_tokens_total"] == 7_500_000
+    assert deep["provider_tokens_per_run"] == 2_500_000
+
+    by_kind = runs["by_kind"]
+    first = _row(by_kind, "kind", "first")
+    assert (first["runs"], first["billed_runs"]) == (5, 3)
+    assert first["provider_tokens_total"] == 3_500_000
+    assert _row(by_kind, "kind", "ladder")["provider_tokens_total"] == 3_000_000
+    assert _row(by_kind, "kind", "ask_again")["provider_tokens_total"] == 700_000
+    assert _row(by_kind, "kind", "cascade")["provider_tokens_total"] == 2_500_000
+    second = _row(by_kind, "kind", "second_door")
+    assert (second["runs"], second["unbilled_runs"]) == (1, 1)
+
+    assert str(_SELF_REPORT_TOKENS) not in json.dumps(econ), (
+        "tokens_spent не входит ни в одно число сводки"
+    )
+
+
+async def test_review_economy_shows_unresolved_apart_from_confirmed(
+    db: aiosqlite.Connection,
+):
+    # AC-2 (#1406): unresolved и confirmed — разные строки; самоотчёт —
+    # не независимое ревью.
+    t1 = await _task(db, title="confirmed only")
+    await _economy_report(db, t1, confirmed=2, profile="lite")
+    t2 = await _task(db, title="unresolved only")
+    await _economy_report(db, t2, unresolved=3, profile="deep")
+    t3 = await _task(db, title="both")
+    await _economy_report(db, t3, confirmed=1, unresolved=1, profile="deep")
+    t4 = await _task(db, title="self review")
+    await _economy_report(db, t4, confirmed=1, unresolved=5, self_reviewed=True)
+    await db.commit()
+
+    f = (await practice_metrics(db))["review_economy"]["findings"]
+
+    assert f["independent_reports"] == 3
+    assert f["reports_with_unresolved"] == 2
+    assert f["unresolved_total"] == 4
+    assert f["reports_with_confirmed"] == 2
+    assert f["confirmed_total"] == 3
+    assert f["reports_with_both"] == 1
+    assert f["unresolved_report_share"] == round(2 / 3, 3)
+    assert f["n"] == 3
+    assert f["undersampled"] is True, "n<20 помечается недобором"
+
+    assert f["self_reviewed"] == {"reports": 1, "confirmed": 1, "unresolved": 5}
+
+    deep = _row(f["by_profile"], "profile", "deep")
+    assert (deep["reports"], deep["confirmed"], deep["unresolved"]) == (2, 1, 4)
+    lite = _row(f["by_profile"], "profile", "lite")
+    assert (lite["reports"], lite["confirmed"], lite["unresolved"]) == (1, 2, 0)
+
+
+async def _pin(db: aiosqlite.Connection, task_id: int, sha: str, ci: str | None):
+    await repo.record_submission(
+        db, task_id=task_id, generation=1, sha=sha, base_branch="develop"
+    )
+    if ci is not None:
+        await repo.upsert_ci_run_report(
+            db,
+            task_id=task_id,
+            head_sha=sha,
+            ac_results="{}",
+            validation_status=ci,
+            validation_log="",
+            reason="",
+            reported_by="ci",
+        )
+
+
+async def test_review_economy_counts_runs_bought_on_red_ci(
+    db: aiosqlite.Connection,
+):
+    # AC-3 (#1406): прогоны на сдачах, чей закреплённый sha CI назвал fail.
+    red = await _task(db, title="red")
+    await _pin(db, red, "sha-red", "fail")
+    await _order(db, red, profile="lite", bill=1_000_000)
+    await _order(db, red, profile="deep", bill=3_000_000)
+
+    red_unbilled = await _task(db, title="red without bill")
+    await _pin(db, red_unbilled, "sha-red-2", "fail")
+    await _order(db, red_unbilled, bill=None)
+
+    green = await _task(db, title="green, red on an old sha")
+    await _pin(db, green, "sha-old", "fail")
+    await _pin(db, green, "sha-green", "pass")
+    await _order(db, green, bill=2_000_000)
+
+    silent = await _task(db, title="no CI report")
+    await _pin(db, silent, "sha-silent", None)
+    await _order(db, silent, bill=5_000_000)
+    await db.commit()
+
+    red_ci = (await practice_metrics(db))["review_economy"]["red_ci"]
+
+    assert red_ci["runs"] == 3
+    assert red_ci["billed_runs"] == 2
+    assert red_ci["provider_tokens"] == 4_000_000
+    assert red_ci["runs_without_ci_report"] == 1, (
+        "прогон без отчёта CI в строку «на красном CI» не попадает"
+    )
+    assert red_ci["runs_on_green_ci"] == 1
+
+
+async def test_review_economy_reconciles_reports_with_paid_runs(
+    db: aiosqlite.Connection,
+):
+    # AC-4 (#1406): расхождение отчётов и оплаченных прогонов — по корзинам.
+    paid = await _task(db, title="paid run, billed report")
+    await _order(db, paid, bill=1_000_000)
+    await _economy_report(db, paid, confirmed=1, bill=1_000_000)
+
+    own = await _task(db, title="self report")
+    await _economy_report(db, own, confirmed=1, self_reviewed=True)
+
+    outside = await _task(db, title="report without an order")
+    await _economy_report(db, outside, confirmed=1)
+
+    local = await _task(db, title="local door")
+    await _order(db, local, bill=None, channel="local")
+    await _economy_report(db, local, confirmed=1)
+
+    unbilled = await _task(db, title="cloud order without a bill")
+    await _order(db, unbilled, bill=None)
+    await _economy_report(db, unbilled, confirmed=1)
+
+    burnt = await _task(db, title="paid run without a report")
+    await _order(db, burnt, bill=2_000_000, status="failed")
+
+    twice = await _task(db, title="two reports of one paid run")
+    await _order(db, twice, bill=3_000_000)
+    await _economy_report(db, twice, confirmed=1, bill=3_000_000)
+    await _economy_report(db, twice, confirmed=1)
+    await db.commit()
+
+    rec = (await practice_metrics(db))["review_economy"]["reconciliation"]
+
+    assert rec["reports"] == 7
+    assert rec["paid_runs"] == 3
+    assert rec["gap"] == 4
+    buckets = {b["bucket"]: b["count"] for b in rec["buckets"]}
+    assert buckets["self_reviewed"] == 1
+    assert buckets["no_dispatch"] == 1
+    assert buckets["local_door"] == 1
+    assert buckets["dispatch_without_bill"] == 1
+    assert buckets["paid_without_report"] == -1
+    assert buckets["unexplained"] == 1, "необъяснённый остаток — своя корзина"
+    assert sum(buckets.values()) == rec["gap"]
+    assert all(b["label"] for b in rec["buckets"]), "каждая корзина названа"
+
+
+async def test_review_economy_is_the_same_on_every_surface(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-5 (#1406): REST, MCP и /metrics отдают одни и те же числа.
+    import re
+
+    from hub import mcp_server
+
+    red = await _task(db, title="red")
+    await _pin(db, red, "sha-red", "fail")
+    await _order(db, red, profile="lite", bill=1_000_000)
+    await _order(db, red, profile="deep", bill=None)
+    await _economy_report(db, red, confirmed=2, unresolved=1, bill=1_000_000)
+    other = await _task(db, title="outside")
+    await _economy_report(db, other, unresolved=2, profile="deep")
+    await db.commit()
+
+    rest = (await client.get("/api/metrics/practices?since_days=90")).json()
+    econ = rest["review_economy"]
+
+    async def _via_client(path: str, **_: object) -> object:
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _via_client)
+    out = await mcp_server.hub_practice_metrics(since_days=90)
+    assert out.structuredContent["metrics"]["review_economy"] == econ
+    text = out.content[0].text
+    assert (
+        f"Review economy: {econ['runs']['total']} run(s), "
+        f"{econ['runs']['billed']} billed / {econ['runs']['unbilled']} without a bill, "
+        f"{econ['runs']['provider_tokens_total']} provider tokens"
+    ) in text
+    assert f"Unresolved: {econ['findings']['unresolved_total']} in" in text
+
+    page = (await client.get("/metrics?since_days=90")).text
+    shown = dict(re.findall(r'data-metric="([\w.]+)"[^>]*>\s*(-?\d+)\s*<', page))
+    expected = {
+        "runs.total": econ["runs"]["total"],
+        "runs.billed": econ["runs"]["billed"],
+        "runs.unbilled": econ["runs"]["unbilled"],
+        "runs.provider_tokens_total": econ["runs"]["provider_tokens_total"],
+        "findings.reports_with_unresolved": econ["findings"]["reports_with_unresolved"],
+        "findings.unresolved_total": econ["findings"]["unresolved_total"],
+        "findings.confirmed_total": econ["findings"]["confirmed_total"],
+        "red_ci.runs": econ["red_ci"]["runs"],
+        "red_ci.provider_tokens": econ["red_ci"]["provider_tokens"],
+        "reconciliation.reports": econ["reconciliation"]["reports"],
+        "reconciliation.paid_runs": econ["reconciliation"]["paid_runs"],
+        "reconciliation.gap": econ["reconciliation"]["gap"],
+    }
+    for bucket in econ["reconciliation"]["buckets"]:
+        expected[f"reconciliation.{bucket['bucket']}"] = bucket["count"]
+    assert {k: int(v) for k, v in shown.items() if k in expected} == expected
+    assert econ["runs"]["total"] == 2 and econ["findings"]["unresolved_total"] == 3
