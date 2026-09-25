@@ -1924,7 +1924,8 @@ async def _deliver_pair_task(db, task: dict) -> None:
             "alert",
             f"Ревью одобрено, но PR #{pr_num} не доставлен — {detail}. "
             "Задача не может считаться выполненной, пока работа не в базовой "
-            "ветке. Решение за человеком (hub_decide_task).",
+            "ветке. Решение за человеком (hub_decide_task)."
+            + services.base_conflict_resubmit_hint(reason, detail),
         )
         await repo.insert_event(
             db,
