@@ -278,6 +278,12 @@ CURSOR_API_URL = os.environ.get("CURSOR_API_URL", "https://api.cursor.com")
 # without touching the implementers' tokens.
 CURSOR_REVIEW_MODEL = os.environ.get("CURSOR_REVIEW_MODEL", "")
 CURSOR_REVIEWER_HUB_TOKEN = os.environ.get("CURSOR_REVIEWER_HUB_TOKEN", "")
+# Параметры модели в заказе облачного ревьюера (#1417): строка вида
+# "fast=false[,effort=high]" → model.params = [{id, value}, ...]. Без них
+# Cursor подставляет вариант Fast — та же модель вдвое дороже (Grok 4.6:
+# 4/1/12 против 2/0,5/6 $ за 1 млн токенов ввода/кэша/вывода). Пустая строка
+# — заказ без params, как до #1417. Семейство модели (#758) они не меняют.
+CURSOR_REVIEW_MODEL_PARAMS = os.environ.get("CURSOR_REVIEW_MODEL_PARAMS", "fast=false")
 CURSOR_REVIEW_GRACE_MINUTES = int(os.environ.get("CURSOR_REVIEW_GRACE_MINUTES", "15"))
 # Локальный ревьюер (#1180): ВТОРОЙ СПОСОБ ДОБЫТЬ тот же отчёт, а не второй
 # механизм ревью. Облачный агент Cursor принимает только GitHub (измерено
