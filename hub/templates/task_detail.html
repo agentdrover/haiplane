@@ -785,6 +785,37 @@
                 </dl>
             </section>
 
+            {# #1410: прогоны облачного исполнителя — центы по счёту провайдера
+               (chargedCents) и исход. Непрочитанная цена — «неизвестно», не ноль. #}
+            {% if executor_runs %}
+            <section class="task-sidebar-card">
+                <div class="task-sidebar-title">Прогоны исполнителя</div>
+                <div class="task-action-note">
+                    Прогонов: {{ executor_runs.count }}
+                    {% if executor_runs.cents_total is not none %}
+                    &mdash; {{ executor_runs.cents_total }} ¢ по счёту провайдера
+                    {% if executor_runs.billed < executor_runs.count %}
+                    <span class="badge badge-self-approved">счёт есть у {{ executor_runs.billed }} из {{ executor_runs.count }}</span>
+                    {% endif %}
+                    {% else %}
+                    <span class="badge badge-self-approved">счёт провайдера неизвестен</span>
+                    {% endif %}
+                    <ul class="tight-list">
+                        {% for run in executor_runs.runs %}
+                        <li>
+                            сдача #{{ run.generation }}{% if run.model %}, {{ run.model }}{% endif %} &mdash;
+                            исход {{ run.outcome }},
+                            {% if run.cents is not none %}{{ run.cents }} ¢{% else %}<span class="muted">центы неизвестны</span>{% endif %},
+                            {% if run.tokens is not none %}{{ '{:,}'.format(run.tokens).replace(',', ' ') }} токенов{% else %}<span class="muted">токены неизвестны</span>{% endif %}
+                            {% if run.duration_ms is not none %}, {{ (run.duration_ms // 1000) }} с{% endif %}
+                            {% if run.reason %}<div class="muted">{{ run.reason }}</div>{% endif %}
+                        </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            </section>
+            {% endif %}
+
             {# #893: цена задачи считается в ПРОГОНАХ. Порог входа одного
                прогона — 777k токенов по счёту провайдера, и размер диффа
                разброс не объясняет: пять пересдач стоят пять входов.
