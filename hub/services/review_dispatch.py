@@ -2369,7 +2369,7 @@ async def _claim_the_order(
         "review dispatch for task #%s gen %s (%s) skipped: already ordered",
         task_id,
         generation,
-        profile,
+        profile or "primary",
     )
     return False
 
@@ -2389,6 +2389,71 @@ async def _release_the_order(
     """
     if replaces_dispatch_id is None and not force_model:
         await repo.release_review_order(db, task_id, generation, profile)
+
+
+async def _prepare_claimed_order(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    *,
+    branch: str,
+    generation: int,
+    force_profile: str,
+    principal_id: int | None,
+    force_model: str,
+    replaces_dispatch_id: int | None,
+) -> ReviewOrder | None:
+    """Бронь, подготовка заказа и последнее слово перед тратой (#1399).
+
+    Бронь — ПЕРВОЙ, до подготовки (находка a1d2d6301a527145): подготовка
+    выпускает код доступа ревьюера, а issue_code гасит невыкупленные коды
+    того же принципала на эту сдачу. Повторный триггер, дошедший до выпуска
+    раньше отказа брони, оставлял уже оплаченного ревьюера с мёртвым кодом.
+    Ключ брони — ``force_profile``: у первичного заказа профиль ещё не выбран.
+
+    Любой отказ после брони её снимает, в том числе исключение подготовки:
+    иначе сдача стояла бы без ревью весь срок брони.
+    """
+    task_id = int(task["id"])
+    if not await _claim_the_order(
+        db, task_id, generation, force_profile, replaces_dispatch_id, force_model
+    ):
+        return None
+    try:
+        order = await prepare_review_order(
+            db,
+            task,
+            branch=branch,
+            generation=generation,
+            force_profile=force_profile,
+            principal_id=principal_id,
+            force_model=force_model,
+        )
+        # Последнее слово перед тратой. Подготовка заказа выше ходит в сеть
+        # за диффом и правилами, и за это окно сдача могла смениться — ЛЮБОЙ
+        # облачный заказ, не только переспрос (находка dcd7da1fa88023c5):
+        # тот же фильтр свежести, что у второй двери (#1252). Для переспроса
+        # ещё и отчёт, доехавший в это окно (находка 17a9ca6ea3451163). Отказ
+        # здесь тихий: у переспроса ОБА отказа — и по отчёту, и по свежести —
+        # называет сам переспрос (_name_a_cancelled_retry, находка
+        # 40a8fd8b727c82ec), а первичный заказ сменившейся сдачи заменит
+        # заказ её новой сдачи, как и у второй двери (#1252).
+        live = await _submission_still_live(db, task, branch, generation) and not (
+            replaces_dispatch_id is not None
+            and await repo.machine_reviews_of_generation(db, task_id, generation)
+        )
+    except BaseException:
+        await _release_the_order(
+            db, task_id, generation, force_profile, replaces_dispatch_id, force_model
+        )
+        await db.commit()
+        raise
+    if not live:
+        await _release_the_order(
+            db, task_id, generation, force_profile, replaces_dispatch_id, force_model
+        )
+        await db.commit()
+        return None
+    return order
 
 
 async def maybe_dispatch_review(
@@ -2463,7 +2528,7 @@ async def maybe_dispatch_review(
     # ревьюер получает один и тот же, где бы он ни исполнялся; расходятся
     # только транспорт и то, чей принципал подпишет отчёт.
     expected_principal = await reviewer_principal_id(db)
-    order = await prepare_review_order(
+    order = await _prepare_claimed_order(
         db,
         task,
         branch=branch,
@@ -2471,29 +2536,11 @@ async def maybe_dispatch_review(
         force_profile=force_profile,
         principal_id=expected_principal,
         force_model=force_model,
+        replaces_dispatch_id=replaces_dispatch_id,
     )
-    model_id, profile, profile_reasons = order.model, order.profile, order.reasons
-    # Последнее слово перед тратой. Подготовка заказа выше ходит в сеть за
-    # диффом и правилами, и за это окно сдача могла смениться — ЛЮБОЙ
-    # облачный заказ, не только переспрос (находка dcd7da1fa88023c5): тот же
-    # фильтр свежести, что у второй двери (#1252). Для переспроса ещё и отчёт,
-    # доехавший в это окно (находка 17a9ca6ea3451163). Отказ здесь тихий:
-    # у переспроса ОБА отказа — и по отчёту, и по свежести — называет сам
-    # переспрос (_name_a_cancelled_retry, находка 40a8fd8b727c82ec), а
-    # первичный заказ сменившейся сдачи заменит заказ её новой сдачи, как и
-    # у второй двери (#1252).
-    if (
-        not await _submission_still_live(db, task, branch, generation)
-        or (
-            replaces_dispatch_id is not None
-            and await repo.machine_reviews_of_generation(db, task_id, generation)
-        )
-        # #1399: бронь — последней, иначе отказ выше оставил бы её висеть.
-        or not await _claim_the_order(
-            db, task_id, generation, profile, replaces_dispatch_id, force_model
-        )
-    ):
+    if order is None:
         return False
+    model_id, profile, profile_reasons = order.model, order.profile, order.reasons
     started = await _create_or_adopt(
         cursor_cloud.agent_marker(
             "review",
@@ -2516,10 +2563,6 @@ async def maybe_dispatch_review(
         # облака — наблюдённый факт, и он стоит в карточке независимо от
         # того, добыл ли отчёт кто-то второй.
         detail = _lost_call_detail(started)
-        # #1399: отказ сдачу не держит — бронь снимается вместе с алертом.
-        await _release_the_order(
-            db, task_id, generation, profile, replaces_dispatch_id, force_model
-        )
         await repo.add_task_update(
             db,
             task_id,
@@ -2539,8 +2582,13 @@ async def maybe_dispatch_review(
             # только НАБЛЮДЁННЫЙ факт (deploy/LOCAL-REVIEW.md): либо
             # провайдер отверг создание, либо сверка подтвердила, что агента
             # нет. Слепота — ни то, ни другое, и остаётся человеку.
+            #
+            # #1399 (находка 815b0841472792be): по той же причине бронь
+            # остаётся — снять её значило бы разрешить следующему триггеру
+            # купить второго агента поверх, возможно, оплаченного. Держится
+            # она срок брони (REVIEW_ORDER_CLAIM_TTL_MINUTES).
             return False
-        return await _owe_the_refused_call(
+        owed = await _owe_the_refused_call(
             db,
             task,
             detail,
@@ -2550,6 +2598,15 @@ async def maybe_dispatch_review(
             replaces_dispatch_id=replaces_dispatch_id,
             only_tests=order.only_tests,
         )
+        # #1399 (находка 6d0bd1c790fb24eb): бронь снимается только ПОСЛЕ
+        # того, как долг второй двери записан и разобран. Раньше — и
+        # триггер, пришедший между алертом и заглушкой, покупал облачного
+        # ревьюера, пока вторая дверь открывала локального.
+        await _release_the_order(
+            db, task_id, generation, force_profile, replaces_dispatch_id, force_model
+        )
+        await db.commit()
+        return owed
 
     # #1025: pin whose report this dispatch waits for, resolved from the
     # reviewer token at dispatch time (above, where the code was minted under
@@ -2576,7 +2633,7 @@ async def maybe_dispatch_review(
     )
     # #1399: строка заказа и снятие брони — одна транзакция (коммит ниже).
     await _release_the_order(
-        db, task_id, generation, profile, replaces_dispatch_id, force_model
+        db, task_id, generation, force_profile, replaces_dispatch_id, force_model
     )
     profile_note = (
         f"профиль {profile} (один проход по диффу)"

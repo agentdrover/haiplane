@@ -2974,6 +2974,13 @@ async def claim_review_order(
     держит: по нему свип переспрашивает (#1242), а новый триггер вправе
     позвать ревьюера снова. Возвращает False, если заказ уже есть или
     забронирован другим.
+
+    Пустой ``profile`` — бронь ПЕРВИЧНОГО заказа, профиль которого ещё не
+    выбран: бронь берётся до подготовки заказа, у которой есть побочные
+    эффекты (выпуск кода доступа гасит код уже запущенного ревьюера). Такой
+    заказ отказывает при любой неотказавшей строке этой сдачи: первичный
+    триггер профиль сам не выбирает, и второй прогон на сдаче — дело
+    лестницы (#879) или второй оси (#1243), а не повтора сдачи.
     """
     # Чужие незакоммиченные записи этого соединения фиксируются до брони:
     # BEGIN IMMEDIATE нужен свой, иначе бронь уехала бы в чужую транзакцию.
@@ -2982,9 +2989,9 @@ async def claim_review_order(
         rows = await fetchall(
             db,
             "SELECT id FROM review_dispatches WHERE task_id=? "
-            "AND submission_generation=? AND profile=? AND status <> 'failed' "
-            "LIMIT 1",
-            (task_id, generation, profile),
+            "AND submission_generation=? AND (? = '' OR profile=?) "
+            "AND status <> 'failed' LIMIT 1",
+            (task_id, generation, profile, profile),
         )
         if rows:
             return False
