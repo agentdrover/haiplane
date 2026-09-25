@@ -627,6 +627,21 @@ async def _steward_shadow_metrics(db: aiosqlite.Connection) -> dict[str, Any]:
 PRACTICE_METRICS_DEFAULT_DAYS = 90
 
 
+async def _carried_over_count(db: aiosqlite.Connection, since: str) -> int:
+    """Reports carried over a base-only merge in the window (#1361).
+
+    Counted BESIDE the reads, never inside them: the saving stays visible
+    without passing for a run.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM machine_reviews "  # nosec B608 - constant fragment
+        f"WHERE created_at >= datetime('now', ?) AND NOT ({ORIGINAL_READ_SQL})",
+        (since,),
+    )
+    return int(dict(rows[0])["n"] or 0) if rows else 0
+
+
 async def practice_metrics(
     db: aiosqlite.Connection, *, since_days: int = PRACTICE_METRICS_DEFAULT_DAYS
 ) -> dict[str, Any]:
@@ -703,15 +718,7 @@ async def practice_metrics(
         (since,),
     )
     totals = dict(totals_rows[0])
-    # #1361: carries are counted BESIDE the reads, never inside them — the
-    # saving stays visible without passing for a run.
-    carried_rows = await fetchall(
-        db,
-        "SELECT COUNT(*) AS n FROM machine_reviews "  # nosec B608 - constant fragment
-        f"WHERE created_at >= datetime('now', ?) AND NOT ({ORIGINAL_READ_SQL})",
-        (since,),
-    )
-    totals["carried_over"] = int(dict(carried_rows[0])["n"] or 0)
+    totals["carried_over"] = await _carried_over_count(db, since)
     confirmed = totals["confirmed_total"] or 0
     raw = totals["raw_total"] or 0
     # Cost per finding has to take its numerator and denominator from the same
