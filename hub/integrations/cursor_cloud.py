@@ -30,6 +30,8 @@ _TIMEOUT = 30.0
 #: при общем терпении в 30, и клиент бросал вызов, который на деле удался
 #: (#1199). Остальные вызовы модуля — короткие GET, им общий срок годится.
 _CREATE_TIMEOUT = 120.0
+#: Публично для брони запуска исполнителя (#1412): сколько длится один заказ.
+CREATE_TIMEOUT_S = _CREATE_TIMEOUT
 
 
 def is_configured() -> bool:
@@ -460,8 +462,8 @@ async def create_agent_attempt(
     starting_ref: str,
     model_id: str,
     prompt_text: str,
-    hub_mcp_url: str,
-    reviewer_token: str,
+    hub_mcp_url: str = "",
+    reviewer_token: str = "",
     name: str = "",
     model_params: list[ModelParam] | None = None,
 ) -> tuple[dict[str, Any] | None, Refusal | None]:
@@ -492,15 +494,18 @@ async def create_agent_attempt(
         "repos": [{"url": repo_url, "startingRef": starting_ref}],
         "autoCreatePR": False,
         "workOnCurrentBranch": False,
-        "mcpServers": [
+    }
+    if hub_mcp_url:
+        # Исполнитель F2.4 (#1412) идёт в хаб по HTTP через код implementer,
+        # а не через MCP ревьюера: без адреса блок не кладётся вовсе.
+        body["mcpServers"] = [
             {
                 "name": brand.MCP_SERVER_NAME,
                 "type": "http",
                 "url": hub_mcp_url,
                 "headers": {"Authorization": f"Bearer {reviewer_token}"},
             }
-        ],
-    }
+        ]
     if name:
         # Метка кладётся ТОЛЬКО когда её попросили: пустое имя означает, что
         # вызывающий подбирать не собирается, и придумывать за него метку —

@@ -1064,10 +1064,15 @@ async def web_projects(
     # epics and three numbers, computed server-side.
     cards = await services.get_project_cards(_db(request))
     reach = await _review_reach_by_project(_db(request), rows)
-    return TEMPLATES.TemplateResponse(
+    # #1412: кнопка запуска исполнителя выписывает код implementer от имени
+    # человека — форма несёт CSRF, как и выдача кода руками (#961, #990).
+    csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
+    response = TEMPLATES.TemplateResponse(
         request,
         "projects.html",
         {
+            "csrf_token": csrf_token,
+            "executor_launch_mode": _executor_launch_mode,
             "projects": [dict(r) for r in rows],
             "cards": cards,
             "project_error": project_error,
@@ -1096,6 +1101,59 @@ async def web_projects(
             "orphan_live": await repo.count_live_orphan_tasks(_db(request)),
         },
     )
+    response.set_cookie(
+        key=CSRF_COOKIE_NAME,
+        value=csrf_token,
+        max_age=600,
+        httponly=True,
+        samesite="strict",
+        secure=config.HUB_COOKIE_SECURE,
+    )
+    return response
+
+
+def _executor_launch_mode(project: Any) -> str:
+    """Режим запуска исполнителя проекта для шаблона (#1412)."""
+    from hub.services.executor_launch import launch_mode_of
+
+    # Карточка несёт политику уже разобранной; строка из базы — через
+    # общего читателя.
+    raw = project.get("gate_policy") if isinstance(project, dict) else None
+    if isinstance(raw, dict):
+        return launch_mode_of(raw)
+    return launch_mode_of(project_policy.gate_policy_of(project))
+
+
+@router.post("/projects/{slug}/web-executor-launch")
+async def web_executor_launch(
+    slug: str, request: Request, csrf_token: str = Form(default="")
+):
+    """Кнопка «запустить исполнителя» (#1412): тот же сервис, что у REST."""
+    from hub.services.executor_launch import launch_executor
+
+    _require_human_web(request)
+    if not _check_web_csrf(request, csrf_token):
+        return _projects_error_redirect(
+            "Форма устарела. Обновите страницу и попробуйте снова."
+        )
+    identity = current_identity(request)
+    if identity.principal_id is None:
+        return _projects_error_redirect(
+            "Код исполнителю выписывается от имени принципала хаба; "
+            "вход по env-токену для этого не подходит."
+        )
+    db = _db(request)
+    project = await repo.get_project_by_slug(db, slug)
+    if project is None:
+        return _projects_error_redirect("project not found")
+    result = await launch_executor(
+        db, project, issuer_principal_id=int(identity.principal_id)
+    )
+    if not result.launched:
+        return _projects_error_redirect(
+            f"Исполнитель не запущен: {result.reason}", int(project["id"])
+        )
+    return RedirectResponse(f"/tasks/{result.task_id}", status_code=303)
 
 
 def _parse_policy_form(raw: str) -> tuple[dict[str, Any] | None, str | None]:

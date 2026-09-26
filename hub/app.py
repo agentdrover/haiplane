@@ -1073,6 +1073,43 @@ async def api_list_digests(
     return out
 
 
+@app.post("/api/projects/{slug}/executor-launch")
+async def api_executor_launch(
+    slug: str,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Запустить облачного исполнителя на задачу из очереди F1 (#1412, F2.4).
+
+    Только человек или админ: в режиме manual кнопку жмёт человек, и код
+    implementer выписывается от ЕГО имени — агентского пути «запусти себе
+    исполнителя» нет (F4 #1368). Отказ — 409 с названной причиной, провайдер
+    при этом не зван.
+    """
+    from hub.services.executor_launch import launch_executor
+
+    # Те же двери, что у выдачи кода руками (#961): запуск выписывает код
+    # implementer от имени человека, и cookie-сессия без CSRF дала бы любой
+    # странице в интернете заказать исполнителя за счёт владельца.
+    _guard_chat_pair_enabled()
+    issuer = await _chat_pair_issuer(request)
+    db = _db(request)
+    project = await repo.get_project_by_slug(db, slug)
+    if project is None:
+        raise HTTPException(404, detail=f"project {slug!r} not found")
+    result = await launch_executor(db, project, issuer_principal_id=int(issuer))
+    if not result.launched:
+        raise HTTPException(
+            409, detail={"reason": result.reason, "task_id": result.task_id}
+        )
+    return {
+        "task_id": result.task_id,
+        "agent_id": result.agent_id,
+        "run_id": result.run_id,
+        "row_id": result.row_id,
+    }
+
+
 @app.post("/api/digests/{digest_id}/audit")
 async def api_digest_audit(
     digest_id: int,
