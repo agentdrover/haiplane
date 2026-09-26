@@ -13,10 +13,12 @@ nothing. An accusation made out of ignorance is worse than saying nothing.
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import aiosqlite
+import httpx
 import pytest
 from httpx import AsyncClient
 
@@ -28,6 +30,10 @@ from hub.models import TaskStatus
 from hub.services import validation_run
 from hub.services.delivery_gate import undelivered_warning
 from hub.services.orchestration import (
+    BASE_FRESHNESS_UNKNOWN_PREFIX,
+    BASE_UPDATE_PENDING_PREFIX,
+    BASE_UPDATE_RETRY_PREFIX,
+    BASE_UPDATED_PREFIX,
     STACK_UNKNOWN_PREFIX,
     STACKED_BASE_PREFIX,
 )
@@ -37,6 +43,9 @@ from hub.services.delivery_state import (
     PR_OPEN,
     UNKNOWN,
 )
+from tests.test_forge_gitverse_client import _no_sleep, patched_httpx  # noqa: F401
+from tests.test_forge_gitverse_delivery import _git as _gv_git
+from tests.test_forge_gitverse_delivery import repo_pair  # noqa: F401
 from tests.test_accept_without_delivery import (
     _alerts,
     _approved_task,
@@ -3651,6 +3660,21 @@ TRANSIENT_SHARED_HINTS: dict[str, tuple[str, str]] = {
         "повторяемый unknown стопки ждёт того же, что стопка: следующего цикла, "
         "а не пересдачи; CI уже зелёный (#1186)",
     ),
+    # #1419: все четыре — одно ожидание «ветки на актуальной базе»: гейт сам
+    # обновит ветку и доставит после зелёного CI на новой голове, а пересдача
+    # сбросила бы вердикт, который слияние базы гейтом не трогает (#1361).
+    BASE_UPDATED_PREFIX: (
+        BASE_FRESHNESS_UNKNOWN_PREFIX,
+        "база слита гейтом — ждать CI на новой голове, не пересдавать (#1419)",
+    ),
+    BASE_UPDATE_PENDING_PREFIX: (
+        BASE_FRESHNESS_UNKNOWN_PREFIX,
+        "обновление уже запрошено — ждать новой головы, не пересдавать (#1419)",
+    ),
+    BASE_UPDATE_RETRY_PREFIX: (
+        BASE_FRESHNESS_UNKNOWN_PREFIX,
+        "обновление не долетело — повтор гейтом, не пересдавать (#1419)",
+    ),
 }
 
 
@@ -4399,3 +4423,195 @@ def test_the_1407_outcomes_are_transient(prefix: str) -> None:
     value = getattr(orchestration, prefix)
     assert value.startswith(orchestration.TRANSIENT_GATE_PREFIXES)
     assert not value.startswith(orchestration.MERGED_OUTSIDE_GATE_PREFIX)
+
+
+# ---- #1419: обе реализации форжа и git_ops — отставание и обновление ветки ----
+#
+# Форма ответа GitHub compare снята живым read-only запросом 26.09.2026:
+# compare/develop...task-1404/review-economy-spec отдал status=diverged,
+# ahead_by=1, behind_by=62; ветка на develop — identical, 0, 0. Коды
+# update-branch — из документации GitHub: 202, 403, 422 (+404 на невидимый PR).
+
+
+def _gh_freshness_router(view, compare, calls):
+    async def route(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("pr", "view"):
+            return view
+        if args[0] == "api" and "/compare/" in args[1]:
+            return compare
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    return route
+
+
+async def test_github_freshness_reads_behind_by_of_compare_base_head() -> None:
+    from unittest.mock import patch
+
+    from hub.integrations.forge.github import GitHubForge
+    from hub.integrations.protocols import BaseFreshnessState
+
+    view = (0, json.dumps({"baseRefName": "develop", "headRefOid": "abc123"}), "")
+    forge = GitHubForge()
+    for compare, state, behind in (
+        ((0, '{"behind_by": 62, "status": "diverged"}', ""), "behind", 62),
+        ((0, '{"behind_by": 0, "status": "ahead"}', ""), "current", 0),
+        ((1, "", "gh: Not Found (HTTP 404)"), "unknown", None),
+        ((0, '{"status": "ahead"}', ""), "unknown", None),
+    ):
+        calls: list = []
+        with patch(
+            "hub.integrations.forge.github._gh",
+            side_effect=_gh_freshness_router(view, compare, calls),
+        ):
+            fresh = await forge.pr_base_freshness(77, gh_repo="o/r")
+        assert fresh.state is BaseFreshnessState(state), compare
+        assert fresh.behind_by == behind
+        assert fresh.head_sha == "abc123", "ответ — о голове, которой арендуется"
+        assert calls[-1][1] == "repos/o/r/compare/develop...abc123"
+
+    calls = []
+    with patch(
+        "hub.integrations.forge.github._gh",
+        side_effect=_gh_freshness_router((1, "", "boom"), None, calls),
+    ):
+        fresh = await forge.pr_base_freshness(77, gh_repo="o/r")
+    assert fresh.state is BaseFreshnessState.unknown, "PR не прочитан — не «свежий»"
+
+
+async def test_github_update_branch_leases_the_head_and_classifies_refusals() -> None:
+    from unittest.mock import patch
+
+    from hub.integrations.forge.github import GitHubForge
+    from hub.integrations.protocols import BranchUpdateOutcome as O
+
+    forge = GitHubForge()
+    with patch(
+        "hub.integrations.forge.github._gh",
+        new_callable=AsyncMock,
+        return_value=(0, '{"message": "Updating pull request branch."}', ""),
+    ) as gh:
+        outcome, _ = await forge.update_pr_branch(77, "abc123", gh_repo="o/r")
+    assert outcome is O.updated
+    args = gh.await_args.args
+    assert args[:4] == ("api", "-X", "PUT", "repos/o/r/pulls/77/update-branch")
+    assert "expected_head_sha=abc123" in args
+
+    for err, expected in (
+        ("gh: merge conflict between base and head (HTTP 422)", O.conflict),
+        (
+            "gh: expected head sha didn't match current head ref (HTTP 422)",
+            O.head_moved,
+        ),
+        ("gh: Resource not accessible by integration (HTTP 403)", O.refused),
+        ("gh: Not Found (HTTP 404)", O.refused),
+        ("gh: Validation Failed (HTTP 422)", O.refused),
+        ("gh: Bad Gateway (HTTP 502)", O.unavailable),
+        ("error connecting to api.github.com", O.unavailable),
+    ):
+        with patch(
+            "hub.integrations.forge.github._gh",
+            new_callable=AsyncMock,
+            return_value=(1, "", err),
+        ):
+            outcome, detail = await forge.update_pr_branch(77, "abc", gh_repo="o/r")
+        assert outcome is expected, err
+        assert detail
+
+
+async def test_gitverse_freshness_reads_compare_status_and_has_no_update_call(
+    request, monkeypatch
+) -> None:
+    from hub.integrations.forge.gitverse import GitVerseForge
+    from hub.integrations.protocols import BaseFreshnessState, BranchUpdateOutcome
+
+    seen, responses = request.getfixturevalue("patched_httpx")
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    forge = GitVerseForge(token="t", base_url="https://api.example", version="1")
+    pr = {"base": {"ref": "main"}, "head": {"sha": "abc", "ref": "task-1/x"}}
+    for status, state in (
+        ("behind", "behind"),
+        ("diverged", "behind"),
+        ("ahead", "current"),
+        ("identical", "current"),
+        ("неведомое", "unknown"),
+    ):
+        responses.extend(
+            [
+                httpx.Response(200, json=pr),
+                httpx.Response(200, json={"status": status, "behind_by": 2}),
+            ]
+        )
+        fresh = await forge.pr_base_freshness(7, gh_repo="own/rep")
+        assert fresh.state is BaseFreshnessState(state), status
+        assert fresh.head_sha == "abc"
+        assert seen[-1].url.path.endswith("/compare/main...abc")
+
+    outcome, _ = await forge.update_pr_branch(7, "abc", gh_repo="own/rep")
+    assert outcome is BranchUpdateOutcome.unsupported
+
+
+async def test_git_ops_updates_the_branch_by_push_when_the_forge_cannot(
+    request,
+) -> None:
+    # GitVerse: вызова нет — база сливается локальным git и пушится с арендой
+    # головы. Настоящий git: bare-«форж» и клон.
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.protocols import BranchUpdateOutcome
+
+    bare, work = request.getfixturevalue("repo_pair")
+    forge = AsyncMock()
+    forge.update_pr_branch.return_value = (BranchUpdateOutcome.unsupported, "нет")
+    forge.pr_refs.return_value = ("main", "task-1/x")
+    ops = GitOpsIntegration(forge=forge)
+    _gv_git(work, "checkout", "-q", "main")
+    (work / "later.txt").write_text("база ушла вперёд\n")
+    _gv_git(work, "add", "-A")
+    _gv_git(work, "commit", "-qm", "base moved")
+    _gv_git(work, "push", "-q", "origin", "main")
+    base_tip = _gv_git(work, "rev-parse", "HEAD")
+    head = _gv_git(bare, "rev-parse", "task-1/x")
+
+    outcome, detail = await ops.update_pr_branch(7, head, task_id=1, repo=str(work))
+
+    assert outcome is BranchUpdateOutcome.updated, detail
+    new_head = _gv_git(bare, "rev-parse", "task-1/x")
+    assert new_head != head
+    assert _gv_git(bare, "merge-base", "task-1/x", "main") == base_tip, (
+        "в ветке теперь вся база"
+    )
+
+    # Аренда: голова уже не та — ветку не трогаем.
+    outcome, _ = await ops.update_pr_branch(7, head, task_id=1, repo=str(work))
+    assert outcome is not BranchUpdateOutcome.updated
+    assert _gv_git(bare, "rev-parse", "task-1/x") == new_head
+
+
+async def test_git_ops_names_conflict_files_and_leaves_the_branch(request) -> None:
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.protocols import BranchUpdateOutcome
+
+    bare, work = request.getfixturevalue("repo_pair")
+    forge = AsyncMock()
+    forge.update_pr_branch.return_value = (BranchUpdateOutcome.unsupported, "нет")
+    forge.pr_refs.return_value = ("main", "task-1/x")
+    ops = GitOpsIntegration(forge=forge)
+    _gv_git(work, "checkout", "-q", "main")
+    (work / "feature.txt").write_text("база пишет своё\n")
+    _gv_git(work, "add", "-A")
+    _gv_git(work, "commit", "-qm", "base edits the same file")
+    _gv_git(work, "push", "-q", "origin", "main")
+    head = _gv_git(bare, "rev-parse", "task-1/x")
+
+    outcome, detail = await ops.update_pr_branch(7, head, task_id=1, repo=str(work))
+
+    assert outcome is BranchUpdateOutcome.conflict
+    assert detail == "feature.txt"
+    assert _gv_git(bare, "rev-parse", "task-1/x") == head, "конфликт ничего не пушит"
+
+    # Форж с вызовом (GitHub) сообщил конфликт без файлов — их называет клон.
+    forge.update_pr_branch.return_value = (BranchUpdateOutcome.conflict, "HTTP 422")
+    outcome, detail = await ops.update_pr_branch(7, head, task_id=1, repo=str(work))
+    assert outcome is BranchUpdateOutcome.conflict
+    # merge-tree дописывает после имён свои сообщения — важно, что имя первое.
+    assert detail.startswith("feature.txt"), detail

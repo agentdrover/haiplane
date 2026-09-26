@@ -136,9 +136,11 @@ def _forget_gate_merges():
 
     orchestration._gate_merges.clear()
     orchestration._unrecorded_gate_merges.clear()
+    orchestration._gate_branch_updates.clear()
     yield
     orchestration._gate_merges.clear()
     orchestration._unrecorded_gate_merges.clear()
+    orchestration._gate_branch_updates.clear()
 
 
 @pytest.fixture(autouse=True)

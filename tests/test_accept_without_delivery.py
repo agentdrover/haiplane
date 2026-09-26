@@ -565,6 +565,13 @@ class _MergeSpy:
     async def head_sha(self, repo, ref):
         return "a" * 40
 
+    async def pr_base_freshness(self, pr_number, *, repo=None, gh_repo=None, forge=""):
+        # #1419: гейт спрашивает, стоит ли голова на актуальной базе. Дублёр
+        # отвечает «стоит» — голова та же, что закреплена, и мерж идёт.
+        from hub.integrations.protocols import BaseFreshness, BaseFreshnessState
+
+        return BaseFreshness(BaseFreshnessState.current, head_sha="a" * 40)
+
     async def pull_main(self, repo=None, base_branch=None):
         return True
 
@@ -606,6 +613,7 @@ def _install(monkeypatch, spy: _MergeSpy) -> None:
         "merge_commit_sha",
         "pr_state",
         "head_sha",
+        "pr_base_freshness",
         "pull_main",
         "delete_branch",
     ):

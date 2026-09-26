@@ -30,6 +30,9 @@ from hub.integrations.git_ops import (
     WorkspaceNotReadyError,
 )
 from hub.integrations.protocols import (
+    BaseFreshness,
+    BaseFreshnessState,
+    BranchUpdateOutcome,
     CIProbeOutcome,
     CIProbeResult,
     CIRunRequestOutcome,
@@ -3547,6 +3550,26 @@ GATE_RECORD_PENDING_PREFIX = "gate_record_pending"
 # соседнего done-flow, который держит лок на время сети.
 GATE_RECORD_WAIT_SECONDS = 60.0
 GATE_RECORD_RETRY_PAUSE_SECONDS = 1.0
+# #1419: гейт мержит только голову, стоящую на актуальной базе. 25.09.2026
+# #1361 и #1400 влиты за 57 с, каждая зелёная на своей базе, — и develop
+# покраснел на 1 ч 43 мин: CI #1400 шёл на базе без #1361.
+# Временные: отставание не прочитано; база слита гейтом и ждёт CI на новой
+# голове; обновление уже запрошено с этой головы; обновление не долетело.
+BASE_FRESHNESS_UNKNOWN_PREFIX = "base_freshness_unknown"
+BASE_UPDATED_PREFIX = "base_updated"
+BASE_UPDATE_PENDING_PREFIX = "base_update_pending"
+BASE_UPDATE_RETRY_PREFIX = "base_update_retry"
+# Терминальные — к человеку с причиной: конфликт при слиянии базы, отказ
+# форжа (права, защита ветки), красный CI на свежей базе. Последний нарочно
+# НЕ начинается с "ci_fail": это не красный CI автора, который он чинит на
+# конвейере (#1030), а семантический конфликт с чужой доставкой.
+BASE_UPDATE_CONFLICT_PREFIX = "base_update_conflict"
+BASE_UPDATE_REFUSED_PREFIX = "base_update_refused"
+FRESH_BASE_CI_FAILED_PREFIX = "fresh_base_ci_failed"
+# Событие «гейт слил базу в ветку с головы X в поколении сдачи N». По нему
+# следующий цикл узнаёт и красный CI на свежей базе, и уже потраченное
+# обновление (не больше одного без нового прогона CI).
+GATE_BRANCH_UPDATE_EVENT = "gate_branch_update"
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",
@@ -3567,6 +3590,12 @@ TRANSIENT_GATE_PREFIXES = (
     GATE_MERGE_IN_FLIGHT_PREFIX,
     MERGE_COMMIT_UNVERIFIED_PREFIX,
     GATE_RECORD_PENDING_PREFIX,
+    # #1419: отставание от базы — ждать ответа форжа, CI на новой голове или
+    # следующей попытки обновления, но не мержить и не звать человека.
+    BASE_FRESHNESS_UNKNOWN_PREFIX,
+    BASE_UPDATED_PREFIX,
+    BASE_UPDATE_PENDING_PREFIX,
+    BASE_UPDATE_RETRY_PREFIX,
 )
 STACKED_BASE_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: хаб доставит "
@@ -4210,6 +4239,195 @@ async def _record_gate_delivery(
             await asyncio.sleep(GATE_RECORD_RETRY_PAUSE_SECONDS)
 
 
+# #1419: головы, с которых гейт В ЭТОМ процессе уже просил слить базу, по
+# (задача, PR). Ставится до вызова форжа без единого await между проверкой и
+# записью: второй путь гейта (поллер или report_done) не просит второго
+# обновления той же головы, пока событие первого не закоммичено.
+# Значение — (поколение сдачи, голова): пересдача начинает счёт заново.
+_gate_branch_updates: dict[tuple[int, int], tuple[int, str]] = {}
+
+
+async def gate_branch_update_from(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> str:
+    """С какой головы гейт сливал базу в ветку в ЭТОМ поколении сдачи, или "" (#1419)."""
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE task_id=? AND kind=? ORDER BY id DESC",
+        (task["id"], GATE_BRANCH_UPDATE_EVENT),
+    )
+    generation = int(task.get("submission_generation") or 0)
+    pr_num = int(task.get("pr_number") or 0)
+    for row in rows:
+        try:
+            payload = json.loads(dict(row)["payload"] or "{}")
+        except ValueError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("generation") == generation
+            and payload.get("pr") == pr_num
+        ):
+            return str(payload.get("from_sha") or "")
+    return ""
+
+
+async def _ci_gate_refusal(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    ci: CIProbeResult,
+) -> str:
+    """Отказ гейта по исходу CI, или "" при зелёном (вынесено по бюджету, #1419)."""
+    if ci.outcome == CIProbeOutcome.missing_run:
+        return await _missing_run_gate_step(db, task, ctx, ci)
+    if ci.outcome == CIProbeOutcome.failed:
+        return await _red_ci_detail(db, task, ci)
+    if ci.outcome != CIProbeOutcome.passed:
+        return f"ci_{ci.outcome.value}: {ci.reason}"
+    return ""
+
+
+async def _red_ci_detail(
+    db: aiosqlite.Connection, task: dict[str, Any], ci: CIProbeResult
+) -> str:
+    """Красный CI: авторский (чинит исполнитель) или на свежей базе (человек, #1419).
+
+    Гейт слил базу в ветку этого поколения, а CI после этого красный — это
+    конфликт с чужой доставкой, а не недоделка автора: авторская правка та же
+    (иначе сверка #612/#1361 выше уже отказала бы). Решать человеку.
+    """
+    if await gate_branch_update_from(db, task):
+        run = f" ({ci.details})" if ci.details else ""
+        return (
+            f"{FRESH_BASE_CI_FAILED_PREFIX}: CI красный на свежей базе — гейт "
+            f"слил базу в ветку PR #{task['pr_number']}, и прогон на новой "
+            f"голове упал: {ci.reason}{run}. Авторская правка не менялась; "
+            "это конфликт с уже доставленной работой, мержа нет"
+        )
+    return f"ci_{ci.outcome.value}: {ci.reason}"
+
+
+async def base_freshness_step(
+    db: aiosqlite.Connection, task: dict[str, Any], ctx: dict[str, Any]
+) -> str:
+    """Стоит ли голова PR на актуальной базе; если нет — обновить ветку (#1419).
+
+    "" — стоит (или плагин не умеет спрашивать): мержить. Иначе причина:
+    временная (не прочитано, обновлено и ждём CI, обновление уже запрошено
+    с этой головы) или терминальная (конфликт, отказ форжа).
+
+    Не больше одного обновления на голову: следующая голова появляется
+    только после обновления, и до мержа на ней обязан пройти CI (проба выше
+    по гейту). Значит, второе обновление без нового прогона CI невозможно.
+    """
+    key = (int(task["id"]), int(task["pr_number"]))
+    if key in _gate_merges:
+        # #1398: мерж гейта по этому PR идёт или прошёл в этом процессе —
+        # ветку под ним не трогать; исход разберёт _gate_merge_step.
+        return ""
+    forge = ctx.get("forge", "")
+    fresh = await plugins.git_ops.pr_base_freshness(
+        key[1], repo=ctx.get("repo"), gh_repo=ctx.get("gh_repo"), forge=forge
+    )
+    if fresh.state in (BaseFreshnessState.current, BaseFreshnessState.unsupported):
+        return ""
+    if fresh.state is not BaseFreshnessState.behind or not fresh.head_sha:
+        return (
+            f"{BASE_FRESHNESS_UNKNOWN_PREFIX}: не удалось узнать, отстала ли "
+            f"ветка PR #{key[1]} от базы ({fresh.reason or 'форж не ответил'}) — "
+            "мерж отложен до ответа"
+        )
+    spent = (int(task.get("submission_generation") or 0), fresh.head_sha)
+    if _gate_branch_updates.get(key) == spent or (
+        await gate_branch_update_from(db, task) == fresh.head_sha
+    ):
+        return (
+            f"{BASE_UPDATE_PENDING_PREFIX}: гейт уже слил базу в ветку PR "
+            f"#{key[1]} с головы {fresh.head_sha[:12]}, новой головы ещё нет — "
+            "второго обновления без нового прогона CI не будет"
+        )
+    _gate_branch_updates[key] = spent
+    outcome, detail = await plugins.git_ops.update_pr_branch(
+        key[1],
+        fresh.head_sha,
+        task_id=key[0],
+        repo=ctx.get("repo"),
+        gh_repo=ctx.get("gh_repo"),
+        forge=forge,
+    )
+    if outcome is not BranchUpdateOutcome.updated:
+        _gate_branch_updates.pop(key, None)
+        return _branch_update_refusal(key[1], fresh, outcome, detail)
+    await _record_branch_update(db, task, ctx, fresh)
+    behind = f" на {fresh.behind_by} комм." if fresh.behind_by else ""
+    return (
+        f"{BASE_UPDATED_PREFIX}: ветка PR #{key[1]} отстала от базы{behind} — "
+        f"гейт слил базу в ветку (голова была {fresh.head_sha[:12]}: {detail}). "
+        "Мерж — после зелёного CI на новой голове, следующим циклом"
+    )
+
+
+def _branch_update_refusal(
+    pr_num: int, fresh: BaseFreshness, outcome: BranchUpdateOutcome, detail: str
+) -> str:
+    """Причина несостоявшегося обновления ветки — временная или к человеку (#1419)."""
+    if outcome is BranchUpdateOutcome.conflict:
+        return (
+            f"{BASE_UPDATE_CONFLICT_PREFIX}: ветка PR #{pr_num} отстала от базы: "
+            f"конфликт в {detail or 'файлах, которые не удалось назвать'} — "
+            "слить базу без человека нельзя, мержа нет"
+        )
+    if outcome in (BranchUpdateOutcome.refused, BranchUpdateOutcome.unsupported):
+        return (
+            f"{BASE_UPDATE_REFUSED_PREFIX}: ветка PR #{pr_num} отстала от базы, "
+            f"а обновить её гейту не дали ({detail}) — нет права обновить ветку "
+            "или форж не умеет; мержа отставшей ветки нет"
+        )
+    return (
+        f"{BASE_UPDATE_RETRY_PREFIX}: ветка PR #{pr_num} отстала от базы, "
+        f"обновление с головы {fresh.head_sha[:12]} не состоялось "
+        f"({outcome.value}: {detail}) — повтор следующим циклом, мержа нет"
+    )
+
+
+async def _record_branch_update(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    ctx: dict[str, Any],
+    fresh: BaseFreshness,
+) -> None:
+    """След обновления гейтом: событие, окно CI заново, свежая база в клоне (#1419).
+
+    Окно ожидания прогона (#1041) перезапускается: новой голове нужен свой
+    прогон, а старая отметка превратила бы его отсутствие в ci_untested
+    сразу. База в клоне обновляется затем, чтобы сверка #1361 на новой
+    голове считала дифф от той базы, что в неё слита, — иначе чужие коммиты
+    базы читались бы как авторская правка. Запись — после сети (#1428).
+    """
+    workspace = ctx.get("repo")
+    if workspace:
+        try:
+            await plugins.git_ops.fetch_base(
+                workspace, git_ops_mod._resolve_base(ctx.get("base_branch"))
+            )
+        except Exception as exc:  # noqa: BLE001 - сверка сама скажет, если не вышло
+            log.warning("base fetch after branch update failed: %s", exc)
+    await repo.mark_ci_check_started(db, task["id"])
+    await repo.insert_event(
+        db,
+        kind=GATE_BRANCH_UPDATE_EVENT,
+        task_id=task["id"],
+        actor="hub",
+        payload={
+            "pr": int(task["pr_number"]),
+            "from_sha": fresh.head_sha,
+            "behind_by": fresh.behind_by,
+            "generation": int(task.get("submission_generation") or 0),
+        },
+    )
+
+
 async def merge_before_completion(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -4266,10 +4484,9 @@ async def merge_before_completion(
         ci = await plugins.git_ops.check_pr_ci(
             pr_num, repo=workspace, gh_repo=gh_repo, forge=ctx.get("forge", "")
         )
-        if ci.outcome == CIProbeOutcome.missing_run:
-            return False, await _missing_run_gate_step(db, task, ctx, ci)
-        if ci.outcome != CIProbeOutcome.passed:
-            return False, f"ci_{ci.outcome.value}: {ci.reason}"
+        ci_refusal = await _ci_gate_refusal(db, task, ctx, ci)
+        if ci_refusal:
+            return False, ci_refusal
 
         # #1186: mergeable is not deliverable. A green, conflict-free PR whose
         # branch stands on ANOTHER task's unmerged branch carries that task's
@@ -4280,6 +4497,13 @@ async def merge_before_completion(
         stacked = await stacking_gate_step(db, task)
         if stacked:
             return False, stacked
+
+        # #1419: зелёный CI головы — не зелёный CI на базе, в которую она
+        # ляжет. Отставшую ветку гейт обновляет и ждёт CI на новой голове.
+        # После стопки: ветку на чужом основании обновлять не за чем.
+        stale_base = await base_freshness_step(db, task, ctx)
+        if stale_base:
+            return False, stale_base
 
         # #1053: Cloud Agent opens drafts; Hub create_pr does not. Approval
         # here is the ready signal. Asking merge_pr first collapses a draft
@@ -4648,6 +4872,13 @@ GATE_RECORD_PENDING_WAIT_HINT = (
     "хаб допишет строку реестра доставок следующим циклом, без второго "
     "мержа. Пересдавать и отчитываться снова не нужно."
 )
+# #1419: ветка отстала от базы, гейт её обновляет сам.
+BASE_FRESHNESS_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: гейт мержит "
+    "только ветку на актуальной базе и доставит задачу следующим циклом после "
+    "зелёного CI на новой голове. Пересдавать НЕ нужно: слияние базы гейтом — "
+    "не авторская правка, вердикт сохраняется (#1361)."
+)
 _TRANSIENT_WAIT_HINTS: tuple[tuple[str | tuple[str, ...], str], ...] = (
     (PR_DRAFT_PREFIX, PR_DRAFT_WAIT_HINT),
     (BASE_AUTOMERGE_PREFIX, BASE_AUTOMERGE_WAIT_HINT),
@@ -4657,6 +4888,15 @@ _TRANSIENT_WAIT_HINTS: tuple[tuple[str | tuple[str, ...], str], ...] = (
     (GATE_MERGE_IN_FLIGHT_PREFIX, GATE_MERGE_IN_FLIGHT_WAIT_HINT),
     (MERGE_COMMIT_UNVERIFIED_PREFIX, MERGE_COMMIT_UNVERIFIED_WAIT_HINT),
     (GATE_RECORD_PENDING_PREFIX, GATE_RECORD_PENDING_WAIT_HINT),
+    (
+        (
+            BASE_FRESHNESS_UNKNOWN_PREFIX,
+            BASE_UPDATED_PREFIX,
+            BASE_UPDATE_PENDING_PREFIX,
+            BASE_UPDATE_RETRY_PREFIX,
+        ),
+        BASE_FRESHNESS_WAIT_HINT,
+    ),
 )
 
 

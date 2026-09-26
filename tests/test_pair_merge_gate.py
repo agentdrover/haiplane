@@ -1599,3 +1599,190 @@ async def test_silent_refusal_with_unreadable_pr_waits_instead_of_calling_a_huma
     assert "merge_refusal_unverified" in feed
     assert "GitHub refused the merge" not in feed
     assert not list(await db.execute_fetchall("SELECT 1 FROM pipeline_merges"))
+
+
+# ---- #1419: гейт мержит только голову на актуальной базе ----
+#
+# 25.09.2026 гейт влил #1361 и через 57 с #1400. Каждая была зелёной на своей
+# базе, вместе они роняли три теста test_review_dispatch.py, и develop стоял
+# красным 1 ч 43 мин: CI #1400 шёл на базе без #1361. Гейт проверял зелёный CI
+# головы PR, но не то, что голова стоит на актуальной базе.
+
+
+def _behind(head: str, by: int = 1):
+    from hub.integrations.protocols import BaseFreshness, BaseFreshnessState
+
+    return BaseFreshness(BaseFreshnessState.behind, head_sha=head, behind_by=by)
+
+
+def _current(head: str):
+    from hub.integrations.protocols import BaseFreshness, BaseFreshnessState
+
+    return BaseFreshness(BaseFreshnessState.current, head_sha=head, behind_by=0)
+
+
+async def _sweep(db) -> None:
+    from hub import poller
+
+    await poller._sweep_pair_delivery(db)
+
+
+async def _feed_of(db, task_id) -> str:
+    return " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, task_id)
+    )
+
+
+async def _needs_decision_events(db, task_id) -> list[dict]:
+    return [
+        dict(e)
+        for e in await repo.list_events(db, since=0)
+        if e["kind"] == "needs_decision" and e["task_id"] == task_id
+    ]
+
+
+async def test_behind_branch_is_updated_and_merged_only_after_fresh_green_ci(
+    db, monkeypatch
+):
+    # AC-1 (#1419): CI головы зелёный, но ветка отстала от базы. Гейт сливает
+    # базу в ветку (update-branch с арендой головы), НЕ мержит и ждёт; после
+    # зелёного CI на новой голове следующий цикл мержит без второго вердикта.
+    from hub.integrations.protocols import BranchUpdateOutcome
+
+    g = _git_seeing(monkeypatch, "approved0commit")
+    g.pr_base_freshness = AsyncMock(return_value=_behind("approved0commit", 3))
+    g.update_pr_branch = AsyncMock(
+        return_value=(BranchUpdateOutcome.updated, "GitHub принял")
+    )
+    task_id = await _approved_pair_task(db)
+    before = dict(await repo.get_task(db, task_id))
+
+    await _report_done(db, task_id)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "running", "отставшая ветка — ожидание, не решение"
+    g.merge_pr.assert_not_awaited()
+    assert g.update_pr_branch.await_count == 1
+    assert g.update_pr_branch.await_args.args[:2] == (77, "approved0commit"), (
+        "обновление арендует ту голову, о которой ответил форж"
+    )
+    assert "base_updated" in await _feed_of(db, task_id)
+    assert not await _needs_decision_events(db, task_id)
+
+    # Цикл поллера, пока новой головы ещё нет (GitHub сливает асинхронно):
+    # второго обновления той же головы без нового прогона CI нет.
+    await _sweep(db)
+    assert g.update_pr_branch.await_count == 1, "не крутить update-branch"
+    g.merge_pr.assert_not_awaited()
+
+    # Новая голова появилась, CI на ней ещё идёт — ждём, не мержим.
+    g.head_sha = AsyncMock(return_value="tip0after0gate0update")
+    g.branch_diff = AsyncMock(return_value="@@ -1,0 +2 @@\n+авторская строка\n")
+    g.pr_base_freshness = AsyncMock(return_value=_current("tip0after0gate0update"))
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.pending, "checks_pending")
+    )
+    await _sweep(db)
+    g.merge_pr.assert_not_awaited()
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+
+    # CI на новой голове зелёный — следующий цикл мержит.
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(CIProbeOutcome.passed, "checks_passed")
+    )
+    await _sweep(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "completed"
+    assert g.merge_pr.await_count == 1
+    assert g.update_pr_branch.await_count == 1
+    assert task["submission_generation"] == before["submission_generation"], (
+        "второго вердикта нет: поколение сдачи то же"
+    )
+    assert task["review_verdict"] == "approved"
+
+
+async def test_behind_branch_conflict_or_red_fresh_ci_goes_to_human_without_merge(
+    db, monkeypatch
+):
+    # AC-2 (#1419), случай 1: база не сливается в ветку — конфликт. Мержа нет,
+    # needs_decision с названными файлами.
+    from hub.integrations.protocols import BranchUpdateOutcome
+
+    g = _git_seeing(monkeypatch, "approved0commit")
+    g.pr_base_freshness = AsyncMock(return_value=_behind("approved0commit"))
+    g.update_pr_branch = AsyncMock(
+        return_value=(BranchUpdateOutcome.conflict, "hub/a.py, tests/test_b.py")
+    )
+    conflicted = await _approved_pair_task(db)
+
+    await _report_done(db, conflicted)
+
+    task = dict(await repo.get_task(db, conflicted))
+    assert task["status"] == "needs_decision"
+    g.merge_pr.assert_not_awaited()
+    feed = await _feed_of(db, conflicted)
+    assert "ветка PR #77 отстала от базы: конфликт в hub/a.py, tests/test_b.py" in (
+        feed
+    )
+
+    # Случай 2: обновление прошло, CI на новой голове красный. Мержа нет,
+    # needs_decision с причиной «CI красный на свежей базе» и прогоном.
+    g.update_pr_branch = AsyncMock(
+        return_value=(BranchUpdateOutcome.updated, "GitHub принял")
+    )
+    red = await _approved_pair_task(db, pr_number=78)
+    await _report_done(db, red)
+    assert dict(await repo.get_task(db, red))["status"] == "running"
+
+    g.head_sha = AsyncMock(return_value="tip0after0gate0update")
+    g.branch_diff = AsyncMock(return_value="@@ -1,0 +2 @@\n+авторская строка\n")
+    g.check_pr_ci = AsyncMock(
+        return_value=CIProbeResult(
+            CIProbeOutcome.failed, "checks_fail", details="run 36125058990"
+        )
+    )
+    await _sweep(db)
+
+    task = dict(await repo.get_task(db, red))
+    assert task["status"] == "needs_decision", (
+        "красный CI на свежей базе — конфликт с чужой доставкой, а не работа "
+        "исполнителя"
+    )
+    g.merge_pr.assert_not_awaited()
+    feed = await _feed_of(db, red)
+    assert "CI красный на свежей базе" in feed
+    assert "run 36125058990" in feed, "причина называет прогон"
+    assert await _needs_decision_events(db, red)
+
+
+async def test_up_to_date_merges_and_unknown_behind_waits(db, monkeypatch):
+    # AC-3 (#1419), случай 1: ветка на актуальной базе — мерж как до задачи.
+    from hub.integrations.protocols import BaseFreshness, BaseFreshnessState
+
+    g = _git_seeing(monkeypatch, "approved0commit")
+    g.pr_base_freshness = AsyncMock(return_value=_current("approved0commit"))
+    g.update_pr_branch = AsyncMock()
+    fresh = await _approved_pair_task(db)
+
+    await _report_done(db, fresh)
+
+    assert dict(await repo.get_task(db, fresh))["status"] == "completed"
+    assert g.merge_pr.await_count == 1
+    g.update_pr_branch.assert_not_awaited()
+
+    # Случай 2: форж не ответил, отстала ли ветка. Временное ожидание: мержа
+    # нет, человека не зовут, обновление не запрашивается вслепую.
+    g.merge_pr.reset_mock()
+    g.pr_base_freshness = AsyncMock(
+        return_value=BaseFreshness(BaseFreshnessState.unknown, reason="gh молчит")
+    )
+    unknown = await _approved_pair_task(db, pr_number=78)
+
+    await _report_done(db, unknown)
+
+    assert dict(await repo.get_task(db, unknown))["status"] == "running"
+    g.merge_pr.assert_not_awaited()
+    g.update_pr_branch.assert_not_awaited()
+    assert not await _needs_decision_events(db, unknown)
+    assert "base_freshness_unknown" in await _feed_of(db, unknown)
