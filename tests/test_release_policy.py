@@ -371,7 +371,11 @@ async def test_failed_open_is_reported_once(db: aiosqlite.Connection, caplog):
     )
     said = [r.getMessage() for r in caplog.records if "не открыт" in r.getMessage()]
     assert len(said) == 1, f"one line per reason, not per cycle: {said}"
-    entries = await _release_activity(db)
+    # #1420: a refused open is an alert, not routine — its own kind.
+    cur = await db.execute(
+        "SELECT summary FROM activity_log WHERE kind='release_blocked' ORDER BY id"
+    )
+    entries = [dict(r) for r in await cur.fetchall()]
     assert len(entries) == 1 and "не открыт" in entries[0]["summary"]
 
 

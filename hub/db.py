@@ -2284,6 +2284,13 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE executor_runs ADD COLUMN cancel_last_at TEXT",
     ),
     (
+        # #1420: открытые аварии релиза читаются каждым общим hub_my_context —
+        # последнее событие release_blocked/unblocked по проекту без скана ленты.
+        "idx_events_kind_project",
+        "CREATE INDEX IF NOT EXISTS idx_events_kind_project "
+        "ON events(kind, project_id, id)",
+    ),
+    (
         # #1405: состояние отложенного до CI заказа ревью живёт в events
         # (задача, вид, поколение в payload), и свип поллера читает его на
         # каждом тике — без индекса это полный проход по ленте событий.

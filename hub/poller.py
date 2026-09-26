@@ -33,11 +33,22 @@ _release_notices: dict[str, str] = {}
 # and whether it already reached the activity feed (#962). In memory like
 # _release_notices — a restart re-counting the threshold costs ~3 cycles,
 # while the silent alternative cost a day of reading server logs on 26.08.
-_release_stalls: dict[str, tuple[str, int, bool]] = {}
+# #1420 adds when the reason was first seen, on _release_clock: routine waits
+# are judged by time, not by cycles.
+_release_stalls: dict[str, tuple[str, int, bool, float]] = {}
 
-# One refused cycle is a flicker (a network hiccup, a race with CI); the same
-# refusal this many cycles in a row is a stall a human has to resolve.
+# A probe that could not look (the forge answered nothing usable) this many
+# cycles in a row is a release nobody can see — an alert. One such cycle is a
+# network hiccup. A definite red does not wait at all (#1420).
 RELEASE_STALL_CYCLES = 3
+
+# CI that is still running is routine (#1420): on 25.09.2026 five ordinary
+# releases were written up as «релиз стоит» after three cycles and buried the
+# one red CI among them. A running CI reaches the feed only after this long.
+RELEASE_ROUTINE_STALL_MINUTES = 30
+
+# Monotonic clock of the release sweep; a name of its own so tests can move it.
+_release_clock = time.monotonic
 
 # Per task: the delivery-gate refusal already reported while waiting (#971).
 # In memory for the same reason as _release_notices — it exists to stop the
@@ -2050,49 +2061,137 @@ async def _sweep_release_policy(db) -> None:
         for project_row in await repo.list_projects(db):
             merged, reason = await merge_ready_release(db, project_row)
             slug = dict(project_row).get("slug") or "?"
+            project_id = int(dict(project_row).get("id") or 0)
             if merged:
                 log.info("Poll: %s — %s", slug, reason)
                 _release_notices.pop(slug, None)
                 _release_stalls.pop(slug, None)
+                await _clear_release_block(db, project_id, slug, reason)
                 continue
             if not reason:
                 _release_stalls.pop(slug, None)
+                await _clear_release_block(db, project_id, slug, "")
                 continue
             if _release_notices.get(slug) != reason:
                 _release_notices[slug] = reason
                 log.warning("Poll: %s — %s", slug, reason)
-            await _note_release_stall(db, slug, reason)
+            await _note_release_stall(db, slug, reason, project_row)
     except Exception:
         log.exception("Poll: release policy sweep failed")
 
 
-async def _note_release_stall(db, slug: str, reason: str) -> None:
-    """Raise a persistent release refusal into the activity feed (#962).
+async def _note_release_stall(db, slug: str, reason: str, project_row) -> None:
+    """Sort a release refusal into routine and alert, and write each once.
 
-    On 26.08.2026 GitHub refused the release merge three cycles in a row —
-    develop and main had diverged after a squash release — and the only trace
-    was the deduplicated warning above: the stalled policy was discovered by
-    a human reading server logs, and resolved by a manual sync. The feed gets
-    one entry per stall; a failed write is retried next cycle instead of
-    breaking the sweep for the remaining projects.
+    #962 put a persistent refusal into the activity feed — on 26.08.2026 a
+    diverged develop/main stood three cycles with no trace but a server log.
+    #1420 splits what #962 wrote with one phrase: a running CI is routine and
+    reaches the feed only after RELEASE_ROUTINE_STALL_MINUTES; a red CI, a
+    conflict, a refused merge or a reason nobody recognises is an alert from
+    the first cycle (a probe that could not look — after RELEASE_STALL_CYCLES).
+    A failed write is retried next cycle instead of breaking the sweep.
     """
-    prev_reason, streak, noted = _release_stalls.get(slug, ("", 0, False))
+    from hub.services.release_alert import ALERT, PROBE, classify_release_reason
+
+    project_id = int(dict(project_row).get("id") or 0)
+    prev_reason, streak, noted, first_seen = _release_stalls.get(
+        slug, ("", 0, False, 0.0)
+    )
     if prev_reason != reason:
-        streak, noted = 0, False
+        streak, noted, first_seen = 0, False, _release_clock()
     streak += 1
-    if streak >= RELEASE_STALL_CYCLES and not noted:
-        try:
-            await log_activity(
-                db,
-                "release",
-                f"{slug}: релиз стоит — {reason}",
-                f"{streak} цикл(ов) поллера подряд; политика ретраит сама, "
-                "но расшивка причины — за человеком",
-            )
-            noted = True
-        except Exception:
-            log.exception("Poll: release stall of %s not written to activity", slug)
-    _release_stalls[slug] = (reason, streak, noted)
+    _release_stalls[slug] = (reason, streak, noted, first_seen)
+    severity = classify_release_reason(reason)
+    if severity == ALERT or (severity == PROBE and streak >= RELEASE_STALL_CYCLES):
+        await _open_release_block(db, project_row, slug, reason)
+        return
+    if severity == PROBE:
+        return
+    # Routine: the release moves again — a block still open ends here (#9114:
+    # after the fix, CI simply started running again).
+    await _clear_release_block(db, project_id, slug, reason)
+    waited = _release_clock() - first_seen
+    if not noted and waited >= RELEASE_ROUTINE_STALL_MINUTES * 60:
+        noted = await _write_release_note(
+            db,
+            "release",
+            f"{slug}: релиз ждёт дольше {RELEASE_ROUTINE_STALL_MINUTES} мин — {reason}",
+            "CI идёт — это не авария; запись одна на ожидание",
+        )
+        _release_stalls[slug] = (reason, streak, noted, first_seen)
+
+
+async def _write_release_note(
+    db, kind: str, summary: str, detail: str, event: dict | None = None
+) -> bool:
+    """Event (when given) and feed entry in one commit; False if it failed."""
+    try:
+        if event is not None:
+            await repo.insert_event(db, kind=kind, actor="hub", **event)
+        await log_activity(db, kind, summary, detail)
+        return True
+    except Exception:
+        with contextlib.suppress(Exception):
+            await db.rollback()
+        log.exception("Poll: release note not written: %s", summary)
+        return False
+
+
+async def _open_release_block(db, project_row, slug: str, reason: str) -> None:
+    """Write the alert once per reason (#534); the open state lives in events.
+
+    A red CI carries its run and failed checks, asked of the forge once here
+    rather than every cycle (#1420 review, 7c1d20f701b32445).
+    """
+    from hub.services import release_alert as ra
+
+    project_id = int(dict(project_row).get("id") or 0)
+    active = await ra.active_release_block(db, project_id)
+    if active is not None and active["reason"] == reason:
+        return
+    since = active["since"] if active else ra.utc_stamp()
+    ci = await ra.release_ci_evidence(project_row, reason)
+    evidence = ra.ci_evidence_text(ci)
+    payload: dict[str, Any] = {"project": slug, "reason": reason, "since": since}
+    if ci is not None:
+        payload["ci"] = ci
+    await _write_release_note(
+        db,
+        ra.KIND_BLOCKED,
+        f"{slug}: авария — релиз стоит: {reason}",
+        f"Релиз заблокирован с {since} UTC."
+        + (f" {evidence}." if evidence else "")
+        + " Политика повторяет сама, снять причину — за человеком; снятие "
+        "будет записано отдельно.",
+        {"project_id": project_id, "payload": payload},
+    )
+
+
+async def _clear_release_block(db, project_id: int, slug: str, now: str) -> None:
+    """Close an open alert with how long it held; nothing open — nothing written."""
+    from hub.services import release_alert as ra
+
+    active = await ra.active_release_block(db, project_id)
+    if active is None:
+        return
+    minutes = active["minutes"]
+    held = "длительность не прочитана" if minutes is None else f"длилась {minutes} мин"
+    await _write_release_note(
+        db,
+        ra.KIND_UNBLOCKED,
+        f"{slug}: релиз снова идёт — блокировка снята, {held}",
+        f"была: {active['reason']}; сейчас: {now or 'причины нет'}",
+        {
+            "project_id": project_id,
+            "payload": {
+                "project": slug,
+                "reason": active["reason"],
+                "since": active["since"],
+                "minutes": minutes,
+                "now": now,
+            },
+        },
+    )
 
 
 async def _sweep_messages_retention(db) -> None:

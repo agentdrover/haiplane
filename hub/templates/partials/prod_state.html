@@ -16,6 +16,17 @@
     </div>
 
     {% if prod_state %}
+    {# #1420: открытая авария релиза — первой строкой карточки: пока релиз
+       заблокирован, «что раскатано» — ответ, который не сдвинется. #}
+    {% for b in prod_state.release_blocks %}
+    <div class="task-action-note">
+        <span class="badge badge--xs badge-failed">авария</span>
+        <strong>Релиз заблокирован</strong> с {{ b.since or '?' }} UTC
+        ({{ b.project or '?' }}, {% if b.minutes is none %}время не прочитано{% else %}{{ b.minutes }} мин{% endif %}):
+        {{ b.reason }}
+        {% if b.ci %}<div class="muted">{{ release_ci_text(b.ci) }}</div>{% endif %}
+    </div>
+    {% endfor %}
     <div class="task-action-note">
         {% if prod_state.deployed.sha %}
         Раскатано: <code class="code-sm">{{ prod_state.deployed.sha[:12] }}</code>

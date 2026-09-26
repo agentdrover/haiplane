@@ -38,6 +38,7 @@ from hub import repository as repo
 from hub.services.gate_events import STEWARD_JUDGEMENT
 from hub.services.orchestration import PRACTICE_METRICS_DEFAULT_DAYS
 from hub.services.project_policy import DELEGATED_VERDICTS
+from hub.services.release_alert import release_block_history
 from hub.services.steward_corridor import names_clean, outcome_label, report_outcome
 
 log = logging.getLogger(__name__)
@@ -571,7 +572,19 @@ async def generate_due_digests(
             elif event["kind"] == STEWARD_JUDGEMENT and event["actor"] == "steward":
                 steward.append(await _steward_entry(db, entry, payload))
 
-        if not (approvals or verdicts or escalations or steward or self_approvals):
+        # #1420: a release that stood blocked is news for the owner even on a
+        # day the autopilot was quiet — it holds back everything merged.
+        release_blocks = await release_block_history(
+            db, project["id"], day_start, day_end
+        )
+        if not (
+            approvals
+            or verdicts
+            or escalations
+            or steward
+            or self_approvals
+            or release_blocks
+        ):
             # The empty-day rule now covers the steward too, in both
             # directions: a day of steward-only activity IS a day worth a
             # digest, and a day with neither still produces nothing. An
@@ -617,6 +630,7 @@ async def generate_due_digests(
         payload = {
             "date": day,
             "project": project["slug"],
+            "release_blocks": release_blocks,
             "category_debt": debt,
             "human_queue": human_queue,
             "findings_queue": await findings_queue_section(db),
