@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import os
+import sqlite3
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -3535,6 +3536,15 @@ GATE_MERGE_IN_FLIGHT_PREFIX = "gate_merge_in_flight"
 # «гейт не вливал» (#516/#549): терминальный MERGED_OUTSIDE_GATE здесь был бы
 # выводом из отсутствия данных. Следующий цикл перечитает.
 MERGE_COMMIT_UNVERIFIED_PREFIX = "merge_commit_unverified"
+# #1428: форж влил PR, а строку pipeline_merges записать не дали — база занята
+# чужой write-транзакцией дольше всего ожидания. Это не недоставка: код уже в
+# базовой ветке. Ждём следующего цикла — он допишет строку без второго мержа.
+GATE_RECORD_PENDING_PREFIX = "gate_record_pending"
+# Сколько ждать занятую базу после влитого PR и с какой паузой повторять.
+# Каждая попытка сама ждёт busy_timeout; ожидание целиком перекрывает мерж
+# соседнего done-flow, который держит лок на время сети.
+GATE_RECORD_WAIT_SECONDS = 60.0
+GATE_RECORD_RETRY_PAUSE_SECONDS = 1.0
 TRANSIENT_GATE_PREFIXES = (
     f"ci_{CIProbeOutcome.pending.value}",
     f"ci_{CIProbeOutcome.unavailable.value}",
@@ -3554,6 +3564,7 @@ TRANSIENT_GATE_PREFIXES = (
     MERGE_REFUSAL_UNVERIFIED_PREFIX,
     GATE_MERGE_IN_FLIGHT_PREFIX,
     MERGE_COMMIT_UNVERIFIED_PREFIX,
+    GATE_RECORD_PENDING_PREFIX,
 )
 STACKED_BASE_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: хаб доставит "
@@ -4108,6 +4119,95 @@ async def _merged_by_gate(
     return GateTrace.NOT_GATE
 
 
+_ALREADY_DELIVERED = (True, "already delivered")
+# #1428: мержи гейта, чью строку реестра записать не дали (занятая база).
+# Только по ним «уже доставлено» дописывает строку: проигравший гонки #1398
+# строку победителя ещё не видит, и без этой памяти писал бы вторую — у
+# задачи без проекта уникальный индекс её не отсечёт (NULL ≠ NULL).
+#
+# Память процесса, и это граница, а не недосмотр: прочного следа здесь нет.
+# «Запись не легла» случается ровно тогда, когда чужая транзакция держит лок
+# всё ожидание, — и любой след в SQLite (запись в ленте) упирается в тот же
+# лок. След в ленте к тому же подделываем: текст сдачи ложится записью хаба.
+# Перезапуск в этом окне читает влитый PR как merged_outside_gate — к
+# человеку, как до #1428. Корень — сеть под write-транзакцией done-flow;
+# он вынесен отдельной задачей.
+_unrecorded_gate_merges: set[tuple[int, int]] = set()
+
+
+async def _gate_merge_commit(
+    task_id: int, pr_num: int, ctx: dict[str, Any], merge_detail: str
+) -> str:
+    """The commit THIS pull request produced — never the branch tip (#534)."""
+    try:
+        merge_sha = await plugins.git_ops.merge_commit_sha(
+            pr_num,
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=ctx.get("forge", ""),
+        )
+        return _merge_sha_or_detail(merge_sha, merge_detail)
+    except Exception:  # noqa: BLE001 - the drift guard flags it once
+        log.exception(
+            "could not read the merge commit for task #%s; "
+            "the drift guard will flag it once",
+            task_id,
+        )
+        return ""
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
+
+
+async def _record_gate_delivery(
+    db: aiosqlite.Connection, task: dict[str, Any], merge_sha: str, *, sha_note: str
+) -> str:
+    """Записать влитый PR в реестр; "" — записано, иначе причина ожидания (#1428).
+
+    Форж уже влил PR, поэтому сбой записи здесь — не недоставка. Занятая база
+    (чужая write-транзакция держит лок дольше busy_timeout) — повод повторить,
+    а не звать человека: 26.09.2026 ровно это увело влитую #1411 в
+    needs_decision без строки pipeline_merges. Не легло за всё ожидание —
+    причина с GATE_RECORD_PENDING_PREFIX: задача ждёт, следующий цикл
+    допишет строку без второго мержа (память _gate_merges, #1398).
+
+    Повтор — только когда соединение не в транзакции: в своей транзакции оно
+    уже держит лок, и «locked» тогда не про очередь, а сломанное состояние.
+    """
+    task_id = int(task["id"])
+    pr_num = int(task["pr_number"])
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + GATE_RECORD_WAIT_SECONDS
+    while True:
+        try:
+            if sha_note:
+                # Delivered WITHOUT the comparison — the reader must be able
+                # to tell that apart from "compared and matched" (#605 AC-5).
+                await repo.add_task_update(db, task_id, "hub", "alert", sha_note)
+            proj = await repo.resolve_project_for_task(db, task_id)
+            await repo.record_pipeline_merge(
+                db,
+                pr_number=pr_num,
+                merge_sha=merge_sha,
+                project_id=(dict(proj)["id"] if proj else None),
+                task_id=task_id,
+            )
+            return ""
+        except sqlite3.OperationalError as exc:
+            if not _is_lock_error(exc) or db.in_transaction:
+                raise
+            if loop.time() >= deadline:
+                log.warning("gate record of PR #%s (#%s) did not land", pr_num, task_id)
+                return (
+                    f"{GATE_RECORD_PENDING_PREFIX}: PR #{pr_num} влит, но строку "
+                    "реестра доставок записать не дали — база занята чужой "
+                    f"записью дольше {GATE_RECORD_WAIT_SECONDS:g} с ({exc}). "
+                    "Следующий цикл допишет её без второго мержа"
+                )
+            await asyncio.sleep(GATE_RECORD_RETRY_PAUSE_SECONDS)
+
+
 async def merge_before_completion(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -4152,12 +4252,10 @@ async def merge_before_completion(
         diverged, sha_note = await _approved_code_check(db, task, pr_num)
         if diverged:
             return False, diverged
-        if sha_note:
-            # Delivered WITHOUT the comparison — the reader must be able to
-            # tell that apart from "compared and matched". Written here rather
-            # than returned: the gate's (ok, reason) contract feeds a refusal
-            # message, and a success has no channel of its own (#605 AC-5).
-            await repo.add_task_update(db, task_id, "hub", "alert", sha_note)
+        # sha_note — «доставлено без сверки» — пишется ПОСЛЕ мержа, в
+        # _record_gate_delivery (#1428): запись здесь, до сети, держала
+        # write-лок соединения на всё время вызова форжа, и соседний путь
+        # гейта падал на «database is locked» по влитому PR.
 
         ctx = await project_git_context(db, task_id)
         workspace = ctx.get("repo")
@@ -4200,34 +4298,21 @@ async def merge_before_completion(
                 )
 
         decided, merge_detail = await _gate_merge_step(db, task, ctx)
-        if decided is not None:
+        key = (int(task_id), int(pr_num))
+        if decided is not None and not (
+            decided == _ALREADY_DELIVERED and key in _unrecorded_gate_merges
+        ):
             return decided
-
-        # The commit THIS pull request produced — never the branch tip,
-        # which is whatever landed last (#534, review round 3).
-        merge_sha = ""
-        try:
-            merge_sha = await plugins.git_ops.merge_commit_sha(
-                pr_num,
-                repo=workspace,
-                gh_repo=gh_repo,
-                forge=ctx.get("forge", ""),
-            )
-            merge_sha = _merge_sha_or_detail(merge_sha, merge_detail)
-        except Exception:  # noqa: BLE001 - the drift guard flags it once
-            log.exception(
-                "could not read the merge commit for task #%s; "
-                "the drift guard will flag it once",
-                task_id,
-            )
-        proj = await repo.resolve_project_for_task(db, task_id)
-        await repo.record_pipeline_merge(
-            db,
-            pr_number=pr_num,
-            merge_sha=merge_sha,
-            project_id=(dict(proj)["id"] if proj else None),
-            task_id=task_id,
-        )
+        # #1428: «уже доставлено» по мержу, чью строку прошлый проход не смог
+        # записать на занятой базе, — дописать её, а не считать записанной.
+        merge_sha = await _gate_merge_commit(task_id, pr_num, ctx, merge_detail)
+        # sha_note и при дописывании: прошлый проход не записал ни строку,
+        # ни заметку «без сверки» — пропасть вместе со строкой она не должна.
+        pending = await _record_gate_delivery(db, task, merge_sha, sha_note=sha_note)
+        if pending:
+            _unrecorded_gate_merges.add(key)
+            return False, pending
+        _unrecorded_gate_merges.discard(key)
 
         # Post-merge tidying, not delivery (#552): the work is merged, so a
         # workspace that cannot be returned to base is logged, never fatal.
@@ -4555,6 +4640,12 @@ async def resolve_delivery_pr(
 # * MERGE_UNCONFIRMED (#1276): мерж прошёл, CI был зелёным до него.
 # * GATE_MERGE_IN_FLIGHT/MERGE_COMMIT_UNVERIFIED (#1407): ждут исхода мержа
 #   соседнего пути или повторного чтения, а не CI.
+# #1428: PR влит, не записана только строка реестра — база была занята.
+GATE_RECORD_PENDING_WAIT_HINT = (
+    "Это временное состояние, решение человека не требуется: PR уже влит, "
+    "хаб допишет строку реестра доставок следующим циклом, без второго "
+    "мержа. Пересдавать и отчитываться снова не нужно."
+)
 _TRANSIENT_WAIT_HINTS: tuple[tuple[str | tuple[str, ...], str], ...] = (
     (PR_DRAFT_PREFIX, PR_DRAFT_WAIT_HINT),
     (BASE_AUTOMERGE_PREFIX, BASE_AUTOMERGE_WAIT_HINT),
@@ -4563,6 +4654,7 @@ _TRANSIENT_WAIT_HINTS: tuple[tuple[str | tuple[str, ...], str], ...] = (
     (MERGE_UNCONFIRMED, MERGE_UNCONFIRMED_WAIT_HINT),
     (GATE_MERGE_IN_FLIGHT_PREFIX, GATE_MERGE_IN_FLIGHT_WAIT_HINT),
     (MERGE_COMMIT_UNVERIFIED_PREFIX, MERGE_COMMIT_UNVERIFIED_WAIT_HINT),
+    (GATE_RECORD_PENDING_PREFIX, GATE_RECORD_PENDING_WAIT_HINT),
 )
 
 

@@ -135,8 +135,10 @@ def _forget_gate_merges():
     from hub.services import orchestration
 
     orchestration._gate_merges.clear()
+    orchestration._unrecorded_gate_merges.clear()
     yield
     orchestration._gate_merges.clear()
+    orchestration._unrecorded_gate_merges.clear()
 
 
 @pytest.fixture(autouse=True)
