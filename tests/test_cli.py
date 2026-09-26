@@ -2473,3 +2473,29 @@ def test_review_economy_prints_the_section_of_practice_metrics(capsys) -> None:
     assert rc == 0
     assert api.call_args.args[:2] == ("GET", "/api/metrics/practices?since_days=30")
     assert json.loads(capsys.readouterr().out) == econ
+
+
+def test_main_release_blocks(capsys) -> None:
+    # #1420: `oc-hub release-blocks` reads the cheap route and prints the same
+    # «Релиз заблокирован с …» line as prod-state and hub_my_context.
+    blocks = {
+        "release_blocks": [
+            {
+                "project": "default",
+                "reason": "релизный PR #484 не смержен: ci_fail (checks_failed)",
+                "since": "2026-09-25 10:43:47",
+                "minutes": 99,
+                "ci": {"run_url": "", "failed_checks": ["Ruff and pytest"]},
+            }
+        ]
+    }
+    rc, api = _run_main(["release-blocks"], api_result=blocks)
+    assert rc == 0
+    assert api.call_args.args[1] == "/api/release-blocks"
+    out = capsys.readouterr().out
+    assert "Релиз заблокирован с 2026-09-25 10:43:47 UTC (default, 99 мин)" in out
+    assert "упали: Ruff and pytest" in out
+
+    rc, _ = _run_main(["release-blocks"], api_result={"release_blocks": []})
+    assert rc == 0
+    assert "Открытых аварий релиза нет" in capsys.readouterr().out

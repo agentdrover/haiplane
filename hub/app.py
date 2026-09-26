@@ -39,6 +39,7 @@ from hub.models import (
     DeployCallback,
     DeployView,
     ProdStateView,
+    ReleaseBlocksView,
     ChatPairRedeem,
     ChatPairRedeemed,
     ChatPairRevoked,
@@ -2119,6 +2120,14 @@ async def api_run_validation(task_id: int, request: Request):
     if not await repo.get_task(db, task_id):
         raise HTTPException(404, "task not found")
     return await run_validation_commands(db, task_id)
+
+
+@app.get("/api/release-blocks", response_model=ReleaseBlocksView)
+async def api_release_blocks(request: Request):
+    """Open release alerts (#1420): one indexed query, no delivery walk."""
+    from hub.services.release_alert import active_release_blocks
+
+    return ReleaseBlocksView(release_blocks=await active_release_blocks(_db(request)))
 
 
 @app.get("/api/prod-state", response_model=ProdStateView)

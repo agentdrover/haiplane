@@ -26,6 +26,19 @@
         <dt>доставок</dt><dd>{{ d.data.deliveries | length }}</dd>
     </dl>
 
+    {% if d.data.release_blocks %}
+    {# #1420: красный CI релиза — авария, а не рутина: отдельным блоком первым. #}
+    <h3>Релиз был заблокирован</h3>
+    <ul>
+        {% for b in d.data.release_blocks %}
+        <li>{% if b.kind == 'release_blocked' %}<span class="badge badge-failed">заблокирован</span>
+            {%- else %}<span class="badge badge-completed">снято{% if b.minutes is not none %}, длилось {{ b.minutes }} мин{% endif %}</span>{% endif %}
+            <span class="text-muted">{{ b.at }} UTC</span> {{ b.reason }}
+            {% if b.ci %}<div class="text-muted">{{ b.ci }}</div>{% endif %}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
     {% if d.data.steward_self_approvals %}
     {# #1231: применённое одобрение — исход, которого человек не видел. Своим
        разделом, а не пометкой в суждениях: суждение — совет, и в тени их

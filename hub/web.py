@@ -92,6 +92,12 @@ TEMPLATES.env.globals["product_title"] = brand.PRODUCT_TITLE
 TEMPLATES.env.globals["app_version"] = get_app_version()
 
 
+def _release_ci_text(ci: Any) -> str:
+    from hub.services.release_alert import ci_evidence_text
+
+    return ci_evidence_text(ci)
+
+
 def default_pr_disposition(task: Any) -> str:
     """What the accept form preselects for the PR's fate (#1333).
 
@@ -114,6 +120,10 @@ def default_pr_disposition(task: Any) -> str:
 
 
 TEMPLATES.env.globals["default_pr_disposition"] = default_pr_disposition
+
+# #1420: the CI run and failed checks of a release alert, worded once for the
+# dashboard card, prod_state and hub_my_context.
+TEMPLATES.env.globals["release_ci_text"] = _release_ci_text
 
 router = APIRouter()
 
