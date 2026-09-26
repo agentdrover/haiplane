@@ -6593,6 +6593,7 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
         "wip_limit": 2,
         "deep_daily_cap": 10,
         "small_delta_lines": 40,
+        "circle_deep_stop": 2,
     }
     not_shown = set(GATE_POLICY_KEYS) - _FORM_GATE_POLICY_KEYS
     assert not_shown, "класс пуст — проверять нечего, тест бы лгал"
