@@ -4721,3 +4721,35 @@ async def test_git_ops_update_by_push_classifies_push_failures(
 
     assert outcome is BranchUpdateOutcome(expected), detail
     assert _gv_git(bare, "rev-parse", "task-1/x") == head
+
+
+async def test_git_ops_update_by_push_passes_the_armed_pre_push_hook(request) -> None:
+    # Класс #949: pre-push хук (.githooks/pre-push) читает ЛОКАЛЬНЫЙ ref строки
+    # пуша. ``HEAD:refs/heads/<ветка>`` даёт local ref «HEAD», которого нет в
+    # списке разрешённых, и в любом вооружённом клоне (хаб вооружает их сам,
+    # #532) пуш режется: «Blocked push from branch 'HEAD'». Клон здесь
+    # вооружён настоящим хуком репозитория; обход хука не допускается.
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.protocols import BranchUpdateOutcome
+
+    bare, work = request.getfixturevalue("repo_pair")
+    hooks = Path(__file__).resolve().parent.parent / ".githooks"
+    _gv_git(work, "config", "core.hooksPath", str(hooks))
+    forge = AsyncMock()
+    forge.update_pr_branch.return_value = (BranchUpdateOutcome.unsupported, "нет")
+    forge.pr_refs.return_value = ("main", "task-1/x")
+    ops = GitOpsIntegration(forge=forge)
+    (work / "later.txt").write_text("база ушла вперёд\n")
+    _gv_git(work, "add", "-A")
+    _gv_git(work, "commit", "-qm", "base moved")
+    # Базу двигает «человек» мимо хука: предмет теста — пуш гейта, не этот.
+    _gv_git(work, "-c", "core.hooksPath=/dev/null", "push", "-q", "origin", "main")
+    base_tip = _gv_git(work, "rev-parse", "HEAD")
+    head = _gv_git(bare, "rev-parse", "task-1/x")
+
+    outcome, detail = await ops.update_pr_branch(7, head, task_id=1, repo=str(work))
+
+    assert outcome is BranchUpdateOutcome.updated, detail
+    assert "Blocked push" not in detail
+    assert _gv_git(bare, "merge-base", "task-1/x", "main") == base_tip
+    assert _gv_git(bare, "rev-parse", "task-1/x") != head

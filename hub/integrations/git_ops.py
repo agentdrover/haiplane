@@ -3320,11 +3320,23 @@ class GitOpsIntegration:
             )
             if rc != 0:
                 return (BranchUpdateOutcome.unavailable, f"коммит мержа: {err[:150]}")
+            # #949: pre-push хук читает ЛОКАЛЬНЫЙ ref строки пуша, и «HEAD» из
+            # одноразового дерева в его списке нет — в вооружённом клоне (#532)
+            # такой пуш режется всегда. Пушится настоящая локальная ветка с
+            # именем задачи: хук видит refs/heads/<ветка>, как у любого пуша.
+            # Ветку, занятую другим рабочим деревом клона, не двигаем — это
+            # чужая рабочая копия, и отказ называется, а не обходится.
+            rc, _, err = await _git("checkout", "-B", branch, repo=path, check=False)
+            if rc != 0:
+                return (
+                    BranchUpdateOutcome.refused,
+                    f"локальная ветка {branch} не заведена: {(err or '')[:150]}",
+                )
             rc, _, err = await _git(
                 "push",
                 f"--force-with-lease=refs/heads/{branch}:{tip.strip()}",
                 "origin",
-                f"HEAD:refs/heads/{branch}",
+                f"refs/heads/{branch}:refs/heads/{branch}",
                 repo=path,
                 check=False,
                 timeout=60,
