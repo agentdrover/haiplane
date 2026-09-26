@@ -156,6 +156,13 @@
                 <dt>workspace</dt><dd>{{ c.project.workspace_path or '—' }}</dd>
             </dl>
             <div class="project-admin-actions">
+                {% if executor_launch_mode(c.project) == 'manual' and not c.project.archived %}
+                <form method="post" action="/projects/{{ c.project.slug }}/web-executor-launch" class="project-inline-form">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button class="btn btn-primary" type="submit"
+                            onclick="return confirm('Запустить облачного исполнителя на следующую задачу очереди проекта {{ c.project.slug }}? Это платный прогон.')">Запустить исполнителя</button>
+                </form>
+                {% endif %}
                 {% if c.project.repo and not c.project.archived %}
                 <form method="post" action="/projects/{{ c.project.id }}/web-provision" class="project-inline-form">
                     <button class="btn btn-primary" type="submit"

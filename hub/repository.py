@@ -5661,6 +5661,16 @@ async def update_executor_run(
     )
 
 
+async def set_executor_run_agent(
+    db: aiosqlite.Connection, row_id: int, *, agent_id: str, run_id: str
+) -> None:
+    """Дописать агента и прогон в бронь запуска (#1412). Коммит — за вызывающим."""
+    await db.execute(
+        "UPDATE executor_runs SET agent_id=?, run_id=? WHERE id=?",
+        (agent_id, run_id, row_id),
+    )
+
+
 async def wait_for_executor_cost(
     db: aiosqlite.Connection, row_id: int, minutes: int
 ) -> bool:
