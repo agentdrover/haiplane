@@ -708,58 +708,203 @@ def process_surface_reasons(diff: str) -> list[str]:
     return reasons
 
 
-# Which risks buy the expensive harness (#827). The catalogue mixes two
-# different things: some risks are about the code and its behaviour, others
-# about the statement and the product. A multi-agent code review answers the
-# first kind and cannot answer the second.
+# Which risks buy the expensive harness (#827, #1415). The catalogue mixes
+# two different things: some risks are about the code and its behaviour,
+# others about the statement and the product. A multi-agent code review
+# answers the first kind and cannot answer the second.
 #
 # Measured on the first live dispatch (#818, 21.08.2026): the run went deep
 # because the task honestly declared a high risk reading "the daily message
 # turns into noise and devalues the bot". Dogfooding answers that; reading
 # the diff does not. We paid for a harness that had nothing to say.
-_TECHNICAL_RISK_KINDS = frozenset(
-    {
-        "security",
-        "breaking_change",
-        "data_migration",
-        "performance",
-        "unknown_unknowns",
-    }
-)
-_PRODUCT_RISK_KINDS = frozenset({"ambiguous_requirements", "large_scope", "other"})
+#
+# #1415 narrowed it further, to security alone. Measured 23.09.2026 over 328
+# reports: deep bought by a DECLARED risk was the weakest reason of all — 0.54
+# confirmed findings per report against 1.02 for lite. Priced from the
+# Cursor export of 25.09.2026, deep costs ≈4M tokens a run (10-14M when it
+# takes several passes) and lite ≈1.7M. From 13 to 25.09 declared risk bought
+# deep 36 times: security 14, technical high 13, high of an unrecognised kind
+# 9 — the last 22 now go by the class and the process surfaces like any other
+# submission. The technical/product split of #827 went with them: with
+# severity out of the rule there is nothing left for it to sort. The revisit
+# condition stays on the task: an escape (#528) after lite on a former
+# "technical high" brings that kind back.
+
+
+def _declares_security(risks: Any) -> bool:
+    """Does any declared risk have ``kind=security``, at whatever severity?"""
+    return isinstance(risks, list) and any(
+        isinstance(r, dict) and str(r.get("kind") or "").strip() == "security"
+        for r in risks
+    )
 
 
 def _risk_profile_reason(risks: Any) -> str | None:
-    """Why the declared risks buy deep, or None when they do not (#827).
+    """Why the declared risks buy deep, or None when they do not (#827, #1415).
 
-    Two rules, and the asymmetry between them is deliberate:
+    One rule: ``kind=security`` buys deep at ANY severity — unchanged from
+    #807, because a security risk somebody rated 'low' is still a security
+    risk.
 
-    * ``kind=security`` buys deep at ANY severity — unchanged from #807,
-      because a security risk somebody rated 'low' is still a security risk.
-    * a ``high`` severity buys deep only for TECHNICAL kinds. A product or
-      statement risk stays with the class: it is not that such a task is
-      safe, it is that this particular instrument cannot read it.
-
-    A kind nobody recognises counts as technical at high severity. Not
-    knowing what a risk is must never be the cheap answer (#582) — and it
-    also closes the obvious way around the rule.
+    A ``high`` severity no longer buys deep by itself, whether the kind is
+    technical, product or unrecognised (#1415, measured 23.09: 0.54 confirmed
+    per report, the weakest reason). That is not "unknown is cheap" (#582):
+    the class and the process surfaces still read the actual change, and an
+    uncomputed class still buys deep. What goes is paying ≈4M tokens for a
+    word the author typed into the statement.
     """
-    if not isinstance(risks, list):
+    return "заявлен риск security" if _declares_security(risks) else None
+
+
+# What counts as documentation (#1415). An explicit list, not "anything that
+# is not code": a file the hub or an agent EXECUTES or LOADS as instructions
+# is behaviour even when it is Markdown — task templates under hub/, test
+# fixtures, workflow and PR templates, skills and agent prompts. Those keep
+# the old rule; so does any path this list does not name.
+#
+# Two choices on purpose, both erring toward the old rule (a false deep costs
+# tokens, a false lite costs a missed defect): a denied directory name matches
+# at ANY depth, so a nested ``pkg/templates/x.md`` stays behaviour even though
+# ``docs/hub/x.md`` then stays deep too; and ``.html`` is not documentation,
+# because a page under docs/ can carry script.
+_DOC_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
+_NOT_DOC_DIRS = frozenset(
+    {
+        "hub",
+        "tests",
+        "test",
+        "scripts",
+        "skills",
+        "agents",
+        "templates",
+        "cli_templates",
+        "fixtures",
+        "prompts",
+    }
+)
+_NOT_DOC_NAMES = frozenset({"AGENTS.md", "CLAUDE.md"})
+
+
+def is_documentation(path: str) -> bool:
+    """Is this repository path documentation by the explicit list above?"""
+    parts = path.split("/")
+    if not parts[-1].endswith(_DOC_SUFFIXES) or parts[-1] in _NOT_DOC_NAMES:
+        return False
+    # Hidden directories (.github, .claude, .hub) carry configuration and
+    # instructions for tools, not prose for readers.
+    return not any(d.startswith(".") or d in _NOT_DOC_DIRS for d in parts[:-1])
+
+
+_C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13}
+
+
+def _unquote_path(raw: str) -> str | None:
+    """A path as git prints it in a header, or None when it cannot be read.
+
+    With ``core.quotepath`` (the default) a name with non-ASCII bytes, quotes
+    or control characters comes C-quoted: ``"a/docs/\\320\\267.md"``.
+    Undecodable means unknown, never documentation.
+    """
+    raw = raw.strip()
+    if not raw.startswith('"'):
+        return raw
+    if len(raw) < 2 or not raw.endswith('"'):
         return None
-    for risk in risks:
-        if not isinstance(risk, dict):
+    body, out, i = raw[1:-1], bytearray(), 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\":
+            out += ch.encode("utf-8")
+            i += 1
+        elif body[i + 1 : i + 4].isdigit() and len(body[i + 1 : i + 4]) == 3:
+            out.append(int(body[i + 1 : i + 4], 8) & 0xFF)
+            i += 4
+        elif i + 1 < len(body):
+            nxt = body[i + 1]
+            out.append(_C_ESCAPES.get(nxt, ord(nxt) if nxt.isascii() else 0))
+            i += 2
+        else:
+            return None
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _git_line_paths(rest: str) -> list[str | None]:
+    """The two sides of ``diff --git <a> <b>``, quoted or not."""
+    if rest.startswith('"'):
+        end = rest.find('" ', 1)
+        if end < 0:
+            return [None]
+        return [_unquote_path(rest[: end + 1]), _unquote_path(rest[end + 2 :])]
+    left, sep, right = rest.partition(" b/")
+    if not sep or not left.startswith("a/"):
+        return [None]
+    return [left, "b/" + right]
+
+
+def _header_paths(line: str) -> list[str | None] | None:
+    """Paths a FILE HEADER line names; None when the line is not a header.
+
+    ``None`` inside the list means "a header whose path could not be read".
+    """
+    if line.startswith("diff --git "):
+        found = _git_line_paths(line[len("diff --git ") :])
+    elif line.startswith(("diff --cc ", "diff --combined ")):
+        # A merge's combined diff (#1249 feeds one on resubmission): a binary
+        # resolution is named ONLY here, with no ---/+++ after it (7efb59b1).
+        found = [_unquote_path(line.split(" ", 2)[2])]
+    elif line.startswith(("--- ", "+++ ")):
+        found = [_unquote_path(line[4:])]
+    elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+        found = [_unquote_path(line.split(" ", 2)[2])]
+    else:
+        return None
+    return [
+        None if p is None else p.removeprefix("a/").removeprefix("b/") for p in found
+    ]
+
+
+def _diff_touched_paths(diff: str) -> list[str | None]:
+    """Every path the diff touches — deleted and renamed-away ones included.
+
+    :func:`changed_paths` skips ``+++ /dev/null`` on purpose, which is right
+    for rules lookup and wrong here: deleting ``hub/x.py`` next to a README
+    edit is a code change, and so is renaming code into ``docs/``.
+
+    Headers are read only OUTSIDE a hunk: after ``@@`` a line starting with
+    ``---`` is a deleted line of text (44f0ab2a), until the next ``diff``
+    line opens another file. A ``diff`` line that names no readable path
+    yields ``None`` — unknown, which the caller must never read as prose.
+    """
+    paths: list[str | None] = []
+    in_hunk = False
+    for line in diff.splitlines():
+        if line.startswith("diff "):
+            in_hunk = False
+            found = _header_paths(line)
+            paths.extend(found if found is not None else [None])
             continue
-        kind = str(risk.get("kind") or "").strip()
-        severity = str(risk.get("severity") or "").strip()
-        if kind == "security":
-            return "заявлен риск security"
-        if severity != "high":
+        if line.startswith("@@"):
+            in_hunk = True
             continue
-        if kind in _TECHNICAL_RISK_KINDS:
-            return f"заявлен технический риск high: {kind}"
-        if kind not in _PRODUCT_RISK_KINDS:
-            return f"заявлен риск high с нераспознанным видом: {kind or 'не указан'}"
-    return None
+        if in_hunk:
+            continue
+        found = _header_paths(line)
+        if found:
+            paths.extend(p for p in found if p != "/dev/null")
+    return list(dict.fromkeys(paths))
+
+
+def is_docs_only_diff(diff: str) -> bool:
+    """Is every path this diff touches documentation? An empty diff is not.
+
+    Conservative by construction: a path that could not be read counts as
+    not documentation, so the old rule decides.
+    """
+    paths = _diff_touched_paths(diff)
+    return bool(paths) and all(p is not None and is_documentation(p) for p in paths)
 
 
 def pick_review_profile(
@@ -776,7 +921,9 @@ def pick_review_profile(
     ignorance:
 
     * a human who pressed "request machine review" asked for the real thing;
-    * a high or security risk is exactly what the expensive harness is for;
+    * a security risk is exactly what the expensive harness is for — a
+      declared high of any other kind no longer is (#1415, see
+      :func:`_risk_profile_reason`);
     * an UNCOMPUTED risk class is not a low one (#582) — an unknown path is
       not cheaper than a known-harmless one, and treating a missing class as
       lite would let any task skip the harness by never being classified.
@@ -784,6 +931,14 @@ def pick_review_profile(
     Everything else is ordinary work inside known contracts, and paying
     434k tokens per confirmed finding for it is what made "review every
     submission" unaffordable in the first place.
+
+    A diff made of documentation alone (#1415, :func:`is_documentation`) is
+    lite whatever the class, unless a human asked or security was declared:
+    there is no executable code for the harness to run against, and spike
+    #1402 bought deep order 430 for one document at ≈4M tokens against ≈1.7M
+    for lite (Cursor export, 25.09.2026). The caller passes the AUTHOR's part
+    of the diff (#1249), so documents a base merge brought in cannot hide the
+    author's code, nor can the author's document ride on the base's.
     """
     if (task.get("machine_review_override") or "").strip() == "require":
         return DEEP, ["ревью запрошено человеком"]
@@ -792,13 +947,15 @@ def pick_review_profile(
     # harmless one — the same rule the ladder uses for "class not computed".
     if diff is None:
         return DEEP, ["дифф сдачи прочитать не удалось"]
-    surfaces = process_surface_reasons(diff)
-    if surfaces:
-        return DEEP, [f"процессная поверхность — {r}" for r in surfaces]
     try:
         risks = json.loads(task.get("risks") or "[]")
     except ValueError:
         risks = []
+    if is_docs_only_diff(diff) and not _declares_security(risks):
+        return LITE, ["дифф только из документации"]
+    surfaces = process_surface_reasons(diff)
+    if surfaces:
+        return DEEP, [f"процессная поверхность — {r}" for r in surfaces]
     risk_reason = _risk_profile_reason(risks)
     if risk_reason:
         return DEEP, [risk_reason]
@@ -854,10 +1011,7 @@ def _deep_cap_exempt(task: dict[str, Any]) -> bool:
         risks = json.loads(task.get("risks") or "[]")
     except ValueError:
         return False
-    return isinstance(risks, list) and any(
-        isinstance(r, dict) and str(r.get("kind") or "").strip() == "security"
-        for r in risks
-    )
+    return _declares_security(risks)
 
 
 async def deep_cap_exhausted(
