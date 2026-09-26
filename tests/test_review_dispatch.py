@@ -14135,6 +14135,10 @@ async def test_missing_ci_is_named_once_after_the_wait_ceiling(
     await db.commit()
     for _ in range(3):
         await sweep_review_dispatches(db)
+    # Потолок не держит сдачу без ревью навсегда: заказ сделан, и один.
+    assert len(recorder.calls) == 1
+    # Добор лестницы по той же сдаче снова проходит условие — и тоже молчит.
+    await maybe_dispatch_review(db, task_id, force_profile=DEEP)
 
     missing = [c for c in await _card(db, task_id) if "ревью ждёт CI, CI нет" in c]
     assert len(missing) == 1, "одно событие на сдачу, а не на тик"
@@ -14143,8 +14147,6 @@ async def test_missing_ci_is_named_once_after_the_wait_ceiling(
     assert f"CI отчитался о коммите {_OTHER_SHA[:12]}" in missing[0]
     [event] = await _events(db, "review_ci_missing")
     assert event["sha"] == _TIP and event["waited_minutes"] == 30
-    # Потолок не держит сдачу без ревью навсегда: заказ сделан, и один.
-    assert len(recorder.calls) == 1
 
 
 async def test_projects_without_ci_and_human_requests_are_ordered_as_before(
