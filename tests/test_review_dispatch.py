@@ -409,12 +409,58 @@ async def test_missing_usage_leaves_dispatch_tokens_null(
     assert closed["provider_tokens"] is None
 
 
-async def test_usage_mismatch_is_flagged(
+def _usage_review(**extra) -> dict:
+    return {
+        "harness_skill": "multi-agent-review",
+        "harness_version": 8,
+        "raw_count": 3,
+        "findings_confirmed": [],
+        "findings_rejected": [
+            {"title": "x", "category": "correctness", "reason": "no"}
+        ],
+        "incomplete": False,
+        "unresolved": [],
+        "lost_dimensions": [],
+        "agent": "cursor-cloud-reviewer",
+        "model": "grok-4.6",
+        **extra,
+    }
+
+
+async def test_missing_tokens_spent_is_not_a_mismatch(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
-    # AC-3 (#757): the report's tokens are cross-checked against the
-    # provider's usage — a big gap is flagged to the audit, the dispatch
-    # settles as done either way.
+    # AC-1 (#1431): the cloud reviewer never reports tokens_spent. A missing
+    # number is not a disagreement — no alert; the provider's bill still lands
+    # on the report and the dispatch settles.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-n"}, "run": {"id": "run-n"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-usage-none")
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review", json=_usage_review()
+    )
+    assert resp.status_code == 200, resp.text
+
+    async def _usage(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": 100_000}}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+
+    await sweep_review_dispatches(db)
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert not [u for u in updates if "расходится с данными провайдера" in u["content"]]
+    stamped = dict(await repo.get_latest_machine_review(db, task_id))
+    assert stamped["tokens_spent"] is None
+    assert stamped["provider_tokens"] == 100_000
+    assert (await _any_dispatch_row(db, task_id))["status"] == "done"
+
+
+async def test_a_real_usage_mismatch_is_still_flagged_once(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#757), AC-2 (#1431): the report's tokens are cross-checked against
+    # the provider's usage — a big gap is flagged to the audit once, with both
+    # numbers; the dispatch settles as done either way.
     recorder = _DispatchRecorder({"agent": {"id": "bc-3"}, "run": {"id": "run-3"}})
     _wire(monkeypatch, recorder)
     task_id = await _submitted(client, db, "spike-usage")
@@ -446,6 +492,8 @@ async def test_usage_mismatch_is_flagged(
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     flags = [u for u in updates if "расходится с данными провайдера" in u["content"]]
     assert len(flags) == 1
+    assert "tokens_spent=1000" in flags[0]["content"]
+    assert "Cursor usage=100000" in flags[0]["content"]
     assert not await repo.list_active_review_dispatches(db)
 
 
