@@ -3056,6 +3056,9 @@ async def _approved_code_check(
         # правка в диффе ветки к базе до и после мержа (#1361 — по смыслу, не
         # побайтно). Проверка стоит два чтения диффа и делается только здесь,
         # на уже разошедшейся вершине.
+        waiting = await _gate_update_base(db, task)
+        if waiting:
+            return waiting, ""
         kept, why = await base_merge_kept_the_verdict(db, task, pinned, current_tip)
         if kept:
             return "", (
@@ -3070,6 +3073,35 @@ async def _approved_code_check(
             f"(PR #{pr_num}). {why}"
         ), ""
     return "", ""
+
+
+async def _gate_update_base(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
+    """База в клоне — не старее той, что гейт слил в ветку (#1419); "" — да.
+
+    Вершина ушла с закреплённой после слияния базы гейтом. Сверка #1361
+    считает дифф ветки к базе клона, и старая база там читала бы коммиты,
+    приехавшие слиянием, как правку автора — второй вердикт за механику.
+    Базу не получили — временное ожидание с причиной, не мерж и не stale.
+    """
+    if not await gate_branch_update_from(db, task):
+        return ""
+    ctx = await project_git_context(db, task["id"])
+    workspace = ctx.get("repo")
+    base = git_ops_mod._resolve_base(ctx.get("base_branch"))
+    if not workspace:
+        return ""
+    try:
+        ok, err = await plugins.git_ops.fetch_base(workspace, base)
+    except Exception as exc:  # noqa: BLE001 - «не получили» — повод ждать
+        ok, err = False, str(exc)
+    if ok:
+        return ""
+    return (
+        f"{BASE_FETCH_PENDING_PREFIX}: гейт слил {base} в ветку, а свежую {base} "
+        f"в клон получить не удалось ({(err or 'fetch не прошёл').strip()[:150]}) — "
+        "без неё сверка с одобрением приняла бы базу за правку автора; "
+        "повтор следующим циклом, мержа нет"
+    )
 
 
 async def base_merge_kept_the_verdict(
@@ -3119,6 +3151,22 @@ def _seconds_since_ci_start(iso_ts: str | None) -> float | None:
     return (datetime.now(UTC) - started).total_seconds()
 
 
+async def _gate_made_head(
+    db: aiosqlite.Connection, task: dict[str, Any], observed: str
+) -> bool:
+    """Сделал ли эту голову гейт слиянием базы в ЭТОМ поколении (#1419).
+
+    Два факта, и оба наблюдаемы: событие gate_branch_update этого поколения
+    с головы, закреплённой сдачей, и авторская правка головы та же, что у
+    закреплённой (#1361). Чужой пуш поверх слияния второе не пройдёт.
+    """
+    pinned = (task.get("submission_sha") or "").strip()
+    if not pinned or await gate_branch_update_from(db, task) != pinned:
+        return False
+    kept, _why = await base_merge_kept_the_verdict(db, task, pinned, observed)
+    return kept
+
+
 async def request_missing_ci_run(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -3161,11 +3209,14 @@ async def request_missing_ci_run(
         )
     if not observed:
         return False, "вершина ветки не прочитана — просить прогон вслепую нельзя"
-    if pinned != observed:
+    if pinned != observed and not await _gate_made_head(db, task, observed):
         return False, (
             f"ветка на {observed[:12]}, а закреплён {pinned[:12]} — прогон по "
             f"чужому коммиту ничего не даст, запроса нет"
         )
+    # #1419: голова, которую сделал гейт слиянием базы, — законный предмет
+    # прогона: ею будет судиться доставка. Попытка по-прежнему одна на коммит.
+    pinned = observed
 
     # The attempt is RESERVED before the paid call, never checked against a
     # snapshot and then spent after an await. Two callers share this population
@@ -3559,6 +3610,7 @@ BASE_FRESHNESS_UNKNOWN_PREFIX = "base_freshness_unknown"
 BASE_UPDATED_PREFIX = "base_updated"
 BASE_UPDATE_PENDING_PREFIX = "base_update_pending"
 BASE_UPDATE_RETRY_PREFIX = "base_update_retry"
+BASE_FETCH_PENDING_PREFIX = "base_fetch_pending"
 # Терминальные — к человеку с причиной: конфликт при слиянии базы, отказ
 # форжа (права, защита ветки), красный CI на свежей базе. Последний нарочно
 # НЕ начинается с "ci_fail": это не красный CI автора, который он чинит на
@@ -3596,6 +3648,7 @@ TRANSIENT_GATE_PREFIXES = (
     BASE_UPDATED_PREFIX,
     BASE_UPDATE_PENDING_PREFIX,
     BASE_UPDATE_RETRY_PREFIX,
+    BASE_FETCH_PENDING_PREFIX,
 )
 STACKED_BASE_WAIT_HINT = (
     "Это временное состояние, решение человека не требуется: хаб доставит "
@@ -4339,25 +4392,33 @@ async def base_freshness_step(
             "мерж отложен до ответа"
         )
     spent = (int(task.get("submission_generation") or 0), fresh.head_sha)
-    if _gate_branch_updates.get(key) == spent or (
-        await gate_branch_update_from(db, task) == fresh.head_sha
-    ):
-        return (
-            f"{BASE_UPDATE_PENDING_PREFIX}: гейт уже слил базу в ветку PR "
-            f"#{key[1]} с головы {fresh.head_sha[:12]}, новой головы ещё нет — "
-            "второго обновления без нового прогона CI не будет"
-        )
-    _gate_branch_updates[key] = spent
-    outcome, detail = await plugins.git_ops.update_pr_branch(
-        key[1],
-        fresh.head_sha,
-        task_id=key[0],
-        repo=ctx.get("repo"),
-        gh_repo=ctx.get("gh_repo"),
-        forge=forge,
+    pending = (
+        f"{BASE_UPDATE_PENDING_PREFIX}: гейт уже слил базу в ветку PR "
+        f"#{key[1]} с головы {fresh.head_sha[:12]}, новой головы ещё нет — "
+        "второго обновления без нового прогона CI не будет"
     )
+    if _gate_branch_updates.get(key) == spent:
+        return pending
+    # Бронь — в том же синхронном участке, что и проверка, до первого await
+    # (#421, #1398): иначе второй путь гейта проходит проверку, пока первый
+    # ждёт базу или форж, и зовёт update второй раз.
+    _gate_branch_updates[key] = spent
+    try:
+        if await gate_branch_update_from(db, task) == fresh.head_sha:
+            return pending
+        outcome, detail = await plugins.git_ops.update_pr_branch(
+            key[1],
+            fresh.head_sha,
+            task_id=key[0],
+            repo=ctx.get("repo"),
+            gh_repo=ctx.get("gh_repo"),
+            forge=forge,
+        )
+    except BaseException:
+        _release_branch_update(key, spent)
+        raise
     if outcome is not BranchUpdateOutcome.updated:
-        _gate_branch_updates.pop(key, None)
+        _release_branch_update(key, spent)
         return _branch_update_refusal(key[1], fresh, outcome, detail)
     await _record_branch_update(db, task, ctx, fresh)
     behind = f" на {fresh.behind_by} комм." if fresh.behind_by else ""
@@ -4366,6 +4427,12 @@ async def base_freshness_step(
         f"гейт слил базу в ветку (голова была {fresh.head_sha[:12]}: {detail}). "
         "Мерж — после зелёного CI на новой голове, следующим циклом"
     )
+
+
+def _release_branch_update(key: tuple[int, int], spent: tuple[int, str]) -> None:
+    """Снять СВОЮ бронь обновления: обновления не было (#1419)."""
+    if _gate_branch_updates.get(key) == spent:
+        _gate_branch_updates.pop(key, None)
 
 
 def _branch_update_refusal(
@@ -4397,22 +4464,13 @@ async def _record_branch_update(
     ctx: dict[str, Any],
     fresh: BaseFreshness,
 ) -> None:
-    """След обновления гейтом: событие, окно CI заново, свежая база в клоне (#1419).
+    """След обновления гейтом: событие и окно CI заново (#1419).
 
     Окно ожидания прогона (#1041) перезапускается: новой голове нужен свой
     прогон, а старая отметка превратила бы его отсутствие в ci_untested
-    сразу. База в клоне обновляется затем, чтобы сверка #1361 на новой
-    голове считала дифф от той базы, что в неё слита, — иначе чужие коммиты
-    базы читались бы как авторская правка. Запись — после сети (#1428).
+    сразу. Базу в клоне обновляет сверка на новой голове (_gate_update_base),
+    а не этот шаг: там её отказ останавливает мерж. Запись — после сети (#1428).
     """
-    workspace = ctx.get("repo")
-    if workspace:
-        try:
-            await plugins.git_ops.fetch_base(
-                workspace, git_ops_mod._resolve_base(ctx.get("base_branch"))
-            )
-        except Exception as exc:  # noqa: BLE001 - сверка сама скажет, если не вышло
-            log.warning("base fetch after branch update failed: %s", exc)
     await repo.mark_ci_check_started(db, task["id"])
     await repo.insert_event(
         db,
@@ -4894,6 +4952,7 @@ _TRANSIENT_WAIT_HINTS: tuple[tuple[str | tuple[str, ...], str], ...] = (
             BASE_UPDATED_PREFIX,
             BASE_UPDATE_PENDING_PREFIX,
             BASE_UPDATE_RETRY_PREFIX,
+            BASE_FETCH_PENDING_PREFIX,
         ),
         BASE_FRESHNESS_WAIT_HINT,
     ),

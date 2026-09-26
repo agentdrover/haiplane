@@ -1667,9 +1667,6 @@ async def test_behind_branch_is_updated_and_merged_only_after_fresh_green_ci(
     assert task["ci_check_started_at"], (
         "окно ожидания прогона перезапущено: у новой головы свой прогон"
     )
-    assert any(c.args[1:] == ("develop",) for c in g.fetch_base.await_args_list), (
-        "база в клоне обновлена — сверка #1361 считает дифф от слитой базы"
-    )
     assert g.update_pr_branch.await_args.args[:2] == (77, "approved0commit"), (
         "обновление арендует ту голову, о которой ответил форж"
     )
@@ -1707,6 +1704,9 @@ async def test_behind_branch_is_updated_and_merged_only_after_fresh_green_ci(
         "второго вердикта нет: поколение сдачи то же"
     )
     assert task["review_verdict"] == "approved"
+    assert any(c.args[1:] == ("develop",) for c in g.fetch_base.await_args_list), (
+        "база в клоне обновлена — сверка #1361 считает дифф от слитой базы"
+    )
 
 
 async def test_behind_branch_conflict_or_red_fresh_ci_goes_to_human_without_merge(
@@ -1831,3 +1831,157 @@ async def test_noop_plugins_do_not_ask_about_the_base_at_all():
         assert fresh.state is BaseFreshnessState.unsupported
         outcome, _ = await plugin.update_pr_branch(1, "abc")
         assert outcome is BranchUpdateOutcome.unsupported
+
+
+# ---- #1419, ревью lite #659: четыре подтверждённые находки ----
+
+
+def _fetch_base_by_ref(base_ok: bool):
+    """fetch_base двойника: ветка задачи читается, база — как скажут."""
+
+    async def fetch(workspace, ref):
+        if ref == "develop":
+            return (True, "") if base_ok else (False, "fatal: unable to access")
+        return (True, "")
+
+    return AsyncMock(side_effect=fetch)
+
+
+async def test_unfetched_base_after_gate_update_waits_instead_of_merging(
+    db, monkeypatch
+):
+    # bec4a75621f2f278: база в клоне не обновилась после слияния гейтом —
+    # сверка #1361 приняла бы чужие коммиты базы за правку автора. Не мержить
+    # и не звать человека: временное ожидание с причиной, повтор следующим
+    # циклом; база дошла — мерж.
+    from hub.integrations.protocols import BranchUpdateOutcome
+
+    g = _git_seeing(monkeypatch, "approved0commit")
+    g.fetch_base = _fetch_base_by_ref(base_ok=False)
+    g.pr_base_freshness = AsyncMock(return_value=_behind("approved0commit"))
+    g.update_pr_branch = AsyncMock(
+        return_value=(BranchUpdateOutcome.updated, "GitHub принял")
+    )
+    task_id = await _approved_pair_task(db)
+    await _report_done(db, task_id)
+
+    g.head_sha = AsyncMock(return_value="tip0after0gate0update")
+    g.branch_diff = AsyncMock(return_value="@@ -1,0 +2 @@\n+авторская строка\n")
+    g.pr_base_freshness = AsyncMock(return_value=_current("tip0after0gate0update"))
+    await _sweep(db)
+
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+    g.merge_pr.assert_not_awaited()
+    assert not await _needs_decision_events(db, task_id)
+    feed = await _feed_of(db, task_id)
+    assert "base_fetch_pending" in feed and "unable to access" in feed
+    assert "stale_approval" not in feed
+
+    g.fetch_base = _fetch_base_by_ref(base_ok=True)
+    await _sweep(db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+    assert g.merge_pr.await_count == 1
+
+
+async def test_two_gate_paths_racing_request_one_branch_update(db, monkeypatch):
+    # e0b9c86a1139f6af: поллер и report_done в одном цикле событий. Бронь
+    # ставится в том же синхронном участке, что и проверка, — второй путь
+    # видит её и не зовёт update второй раз.
+    import asyncio
+
+    from hub.integrations.protocols import BranchUpdateOutcome
+    from hub.services import orchestration
+
+    g = _git_seeing(monkeypatch, "approved0commit")
+    g.pr_base_freshness = AsyncMock(return_value=_behind("approved0commit"))
+
+    async def slow_update(*args, **kwargs):
+        await asyncio.sleep(0.01)
+        return (BranchUpdateOutcome.updated, "GitHub принял")
+
+    g.update_pr_branch = AsyncMock(side_effect=slow_update)
+    task_id = await _approved_pair_task(db)
+    task = dict(await repo.get_task(db, task_id))
+    ctx = {"repo": "/srv/ws", "base_branch": "develop"}
+
+    first, second = await asyncio.gather(
+        orchestration.base_freshness_step(db, task, ctx),
+        orchestration.base_freshness_step(db, task, ctx),
+    )
+
+    assert g.update_pr_branch.await_count == 1
+    assert sorted(d.split(":")[0] for d in (first, second)) == [
+        "base_update_pending",
+        "base_updated",
+    ]
+
+
+async def test_failed_update_releases_the_reservation(db, monkeypatch):
+    # Та же находка, обратная сторона: отказ или исключение снимают бронь,
+    # иначе следующий цикл вечно ждал бы обновления, которого не было.
+    from hub.integrations.protocols import BranchUpdateOutcome
+    from hub.services import orchestration
+
+    g = _git_seeing(monkeypatch, "approved0commit")
+    g.pr_base_freshness = AsyncMock(return_value=_behind("approved0commit"))
+    task_id = await _approved_pair_task(db)
+    task = dict(await repo.get_task(db, task_id))
+    ctx = {"repo": "/srv/ws", "base_branch": "develop"}
+
+    g.update_pr_branch = AsyncMock(side_effect=RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        await orchestration.base_freshness_step(db, task, ctx)
+    assert (task_id, 77) not in orchestration._gate_branch_updates
+
+    g.update_pr_branch = AsyncMock(
+        return_value=(BranchUpdateOutcome.unavailable, "сеть")
+    )
+    detail = await orchestration.base_freshness_step(db, task, ctx)
+    assert detail.startswith("base_update_retry")
+    assert (task_id, 77) not in orchestration._gate_branch_updates
+
+
+async def test_ci_run_is_requested_for_the_head_the_gate_made(db, monkeypatch):
+    # 814f91676ca6eb8d: у головы, которую сделал гейт, прогона может не быть
+    # (update-branch от токена без триггера). Заказ разрешён: голова — та,
+    # что гейт сделал из закреплённой в этом поколении, авторская правка та
+    # же (#1361). Чужая голова без обновления гейтом — отказ, как раньше.
+    from hub.integrations.protocols import (
+        BranchUpdateOutcome,
+        CIRunRequestOutcome,
+        CIRunRequestResult,
+    )
+
+    def _wire(g):
+        g.request_ci_run = AsyncMock(
+            return_value=CIRunRequestResult(CIRunRequestOutcome.requested, "ok")
+        )
+        g.branch_diff = AsyncMock(return_value="@@ -1,0 +2 @@\n+авторская строка\n")
+        g.check_pr_ci = AsyncMock(
+            return_value=CIProbeResult(
+                CIProbeOutcome.missing_run,
+                "no_run_for_head",
+                details="tip0after0gate0update",
+            )
+        )
+
+    g = _git_seeing(monkeypatch, "approved0commit")
+    g.pr_base_freshness = AsyncMock(return_value=_behind("approved0commit"))
+    g.update_pr_branch = AsyncMock(
+        return_value=(BranchUpdateOutcome.updated, "GitHub принял")
+    )
+    gated = await _approved_pair_task(db)
+    await _report_done(db, gated)
+    g.head_sha = AsyncMock(return_value="tip0after0gate0update")
+    _wire(g)
+    await _sweep(db)
+    assert g.request_ci_run.await_count == 1, "голова гейта получает свой прогон"
+    g.merge_pr.assert_not_awaited()
+
+    g2 = _git_seeing(monkeypatch, "approved0commit")
+    foreign = await _approved_pair_task(db, pr_number=78)
+    g2.head_sha = AsyncMock(return_value="tip0after0gate0update")
+    _wire(g2)
+    await _report_done(db, foreign)
+    g2.request_ci_run.assert_not_awaited()
+    assert dict(await repo.get_task(db, foreign))["status"] == "running"

@@ -30,6 +30,7 @@ from hub.models import TaskStatus
 from hub.services import validation_run
 from hub.services.delivery_gate import undelivered_warning
 from hub.services.orchestration import (
+    BASE_FETCH_PENDING_PREFIX,
     BASE_FRESHNESS_UNKNOWN_PREFIX,
     BASE_UPDATE_PENDING_PREFIX,
     BASE_UPDATE_RETRY_PREFIX,
@@ -3675,6 +3676,10 @@ TRANSIENT_SHARED_HINTS: dict[str, tuple[str, str]] = {
         BASE_FRESHNESS_UNKNOWN_PREFIX,
         "обновление не долетело — повтор гейтом, не пересдавать (#1419)",
     ),
+    BASE_FETCH_PENDING_PREFIX: (
+        BASE_FRESHNESS_UNKNOWN_PREFIX,
+        "база не получена в клон после слияния гейтом — повтор, не пересдавать",
+    ),
 }
 
 
@@ -4658,5 +4663,61 @@ async def test_git_ops_update_by_push_never_overwrites_a_racing_push(
     finally:
         ops._conflicting_texts = real  # type: ignore[method-assign]
 
-    assert outcome is not BranchUpdateOutcome.updated
+    assert outcome is BranchUpdateOutcome.head_moved, (
+        "отказ аренды — голова уехала, повтор следующим циклом, а не «нет прав»"
+    )
     assert _gv_git(bare, "rev-parse", "task-1/x") == raced, "чужой пуш цел"
+
+
+@pytest.mark.parametrize(
+    ("rc", "err", "expected"),
+    [
+        (-9, "", "unavailable"),
+        (
+            128,
+            "fatal: unable to access 'https://x/': Could not resolve host",
+            "unavailable",
+        ),
+        (1, "remote: Permission to own/rep.git denied to bot.", "refused"),
+        (
+            1,
+            " ! [remote rejected] HEAD -> task-1/x (protected branch hook declined)",
+            "refused",
+        ),
+        (1, " ! [rejected]        HEAD -> task-1/x (stale info)", "head_moved"),
+    ],
+)
+async def test_git_ops_update_by_push_classifies_push_failures(
+    request, monkeypatch, rc, err, expected
+) -> None:
+    # a7e5e2e50a9a4364: локальный путь различает причины отказа пуша так же,
+    # как путь API: аренда — head_moved, сеть и таймаут — unavailable, и
+    # только настоящий отказ прав — refused (терминальный, к человеку).
+    from hub.integrations import git_ops as git_ops_mod
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.protocols import BranchUpdateOutcome
+
+    bare, work = request.getfixturevalue("repo_pair")
+    forge = AsyncMock()
+    forge.update_pr_branch.return_value = (BranchUpdateOutcome.unsupported, "нет")
+    forge.pr_refs.return_value = ("main", "task-1/x")
+    ops = GitOpsIntegration(forge=forge)
+    _gv_git(work, "checkout", "-q", "main")
+    (work / "later.txt").write_text("база ушла вперёд\n")
+    _gv_git(work, "add", "-A")
+    _gv_git(work, "commit", "-qm", "base moved")
+    _gv_git(work, "push", "-q", "origin", "main")
+    head = _gv_git(bare, "rev-parse", "task-1/x")
+    real = git_ops_mod._git
+    code = git_ops_mod._TIMEOUT_RC if rc == -9 else rc
+
+    async def fake(*args, **kwargs):
+        if args and args[0] == "push":
+            return (code, "", err)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(git_ops_mod, "_git", fake)
+    outcome, detail = await ops.update_pr_branch(7, head, task_id=1, repo=str(work))
+
+    assert outcome is BranchUpdateOutcome(expected), detail
+    assert _gv_git(bare, "rev-parse", "task-1/x") == head

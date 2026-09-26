@@ -851,6 +851,26 @@ def _stack_probe_cache_put(
 # ---------------------------------------------------------------------------
 
 
+def _push_refusal(rc: int, err: str) -> BranchUpdateOutcome:
+    """Отказ пуша обновлённой ветки — чьи руки его лечат (#1419).
+
+    Как у пути API: аренда (голова уехала) — head_moved, повтор; таймаут и
+    сеть — unavailable, повтор; к человеку (refused) — только отказ прав или
+    защиты ветки на стороне сервера.
+    """
+    low = (err or "").lower()
+    if rc == _TIMEOUT_RC:
+        return BranchUpdateOutcome.unavailable
+    if any(w in low for w in ("permission", "denied", "protected", "declined", "403")):
+        return BranchUpdateOutcome.refused
+    if any(
+        w in low
+        for w in ("stale info", "[rejected]", "non-fast-forward", "fetch first")
+    ):
+        return BranchUpdateOutcome.head_moved
+    return BranchUpdateOutcome.unavailable
+
+
 class GitOpsIntegration:
     """Concrete git_ops plugin: local git here, the repository host behind a forge.
 
@@ -3310,7 +3330,7 @@ class GitOpsIntegration:
                 timeout=60,
             )
             if rc != 0:
-                return (BranchUpdateOutcome.refused, f"пуш ветки: {err[:150]}")
+                return (_push_refusal(rc, err), f"пуш ветки: {(err or '')[:150]}")
             return (BranchUpdateOutcome.updated, f"база {base} слита в {branch}")
         finally:
             await _git("merge", "--abort", repo=path, check=False)
