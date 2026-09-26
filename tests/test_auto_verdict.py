@@ -410,6 +410,24 @@ async def test_unproven_empty_review_stays_human(
     assert body["review_verdict"] is None
 
 
+async def test_empty_review_without_tokens_spent_is_not_proven(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-1 (#1435): the #769 setup that DOES approve, minus tokens_spent.
+    # Settled dispatch, billed usage over the floor, class under the ceiling —
+    # but a report with no number of its own cannot agree with the bill, so
+    # nothing is proven and the verdict stays with the human.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    task_id = await _submitted_task(client, db, "spike-no-tokens", {"verdict": "auto"})
+    await _settled_dispatch(db, task_id, usage_total=250_000, monkeypatch=monkeypatch)
+
+    await _post_review(client, task_id, raw_count=0, findings_rejected=[])
+
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert body["status"] == "review"
+    assert body["review_verdict"] is None
+
+
 async def test_proven_empty_above_class_ceiling_stays_human(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ) -> None:
