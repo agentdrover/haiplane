@@ -974,6 +974,7 @@ def pick_review_profile(
     task: dict[str, Any],
     diff: str | None = None,
     small_delta: tuple[int, int] | None = None,
+    circle_stop: int | None = None,
 ) -> tuple[str, list[str]]:
     """Which review profile this submission deserves, and why (#807, #820).
 
@@ -1012,27 +1013,38 @@ def pick_review_profile(
     human request and a security risk keep deep at any size: they are checked
     first. The ladder top-up and the cascade come with ``force_profile`` and
     never reach this function.
+
+    ``circle_stop`` is the number of review-circle laps when the deep stop
+    stands for this task (#1432, :func:`circle_deep_stop`), None otherwise.
+    Deep bought by the rule becomes lite the same way and names the cancelled
+    reason; a human request and a security risk keep deep. The forced paths
+    meet the stop in :func:`_forced_deep_past_circle`.
     """
     if (task.get("machine_review_override") or "").strip() == "require":
         return DEEP, ["ревью запрошено человеком"]
 
-    # #820: the diff decides before the class does. A missing diff is not a
-    # harmless one — the same rule the ladder uses for "class not computed".
-    if diff is None:
-        return DEEP, ["дифф сдачи прочитать не удалось"]
     try:
         risks = json.loads(task.get("risks") or "[]")
     except ValueError:
         risks = []
-    profile, reasons = _profile_by_rule(task, diff, risks)
-    if small_delta is None or profile != DEEP or _declares_security(risks):
+    # #820: the diff decides before the class does. A missing diff is not a
+    # harmless one — the same rule the ladder uses for "class not computed".
+    # #1432: it is still a deep by rule, so the circle stop applies to it.
+    if diff is None:
+        profile, reasons = DEEP, ["дифф сдачи прочитать не удалось"]
+    else:
+        profile, reasons = _profile_by_rule(task, diff, risks)
+    if profile != DEEP or _declares_security(risks):
+        return profile, reasons
+    cancelled = [f"отменён повод deep: {r}" for r in reasons]
+    if circle_stop is not None:
+        return LITE, [circle_stop_reason(circle_stop), *cancelled]
+    if small_delta is None or small_delta[0] > small_delta[1]:
         return profile, reasons
     lines, limit = small_delta
-    if lines > limit:
-        return profile, reasons
     return LITE, [
         f"{SMALL_DELTA_REASON_MARK}: {lines} ≤ {limit} строк авторской дельты",
-        *(f"отменён повод deep: {r}" for r in reasons),
+        *cancelled,
     ]
 
 
@@ -1060,6 +1072,146 @@ def _profile_by_rule(
     if order.index(risk_class) >= order.index(_DEEP_FROM_CLASS):
         return DEEP, [f"класс риска {risk_class.value}"]
     return LITE, [f"класс риска {risk_class.value}, процессных поверхностей нет"]
+
+
+# Остановка deep кругом ревью (#1432). Круг (#1235) на пороге только звал
+# человека, и следующая пересдача снова покупала deep: #1306 — 7 deep подряд,
+# #1311 — 6, #1242, #1265 и #1405 — по 5 (замер 26.09). С порога остановки
+# пересдача получает lite, а добор и вторая ось deep не докупают, пока человек
+# не решит. Ревью не выключается: lite идёт всегда.
+CIRCLE_DEEP_STOP_KEY = "circle_deep_stop"
+#: Слова причины понижения; по ним сводка ревью находит такие сдачи.
+CIRCLE_STOP_REASON = "deep приостановлен до решения человека"
+#: Событие остановки — одно на поколение; по нему же и дедуп (урок #1330).
+CIRCLE_STOP_EVENT = "review_circle_deep_stopped"
+
+
+def circle_deep_stop_of(policy: dict[str, Any]) -> int | None:
+    """Порог остановки deep в заходах круга; None — остановки нет.
+
+    Ключ проекта главнее REVIEW_CIRCLE_DEEP_STOP. Ноль выключает. Нечитаемое
+    значение — тоже, и у ключа проекта без отката к конфигу: ошибка в
+    настройке не должна удешевлять ревью молча.
+    """
+    if isinstance(policy, dict) and CIRCLE_DEEP_STOP_KEY in policy:
+        return _cap_value(policy[CIRCLE_DEEP_STOP_KEY]) or None
+    text = str(config.REVIEW_CIRCLE_DEEP_STOP or "").strip()
+    return (int(text) if text.isdigit() else 0) or None
+
+
+def _laps_phrase(count: int) -> str:
+    """«1 заход», «2 захода», «5 заходов»."""
+    if count % 10 == 1 and count % 100 != 11:
+        return f"{count} заход"
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return f"{count} захода"
+    return f"{count} заходов"
+
+
+def circle_stop_reason(laps: int) -> str:
+    """Причина профиля при остановке: «круг: N заходов, deep приостановлен…»."""
+    return f"круг: {_laps_phrase(laps)}, {CIRCLE_STOP_REASON}"
+
+
+async def circle_deep_stop(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[int, int] | None:
+    """``(заходы, порог)``, если остановка deep стоит для задачи; иначе None.
+
+    Исключения — ручной запрос и security — проверяет место применения:
+    pick_review_profile и _forced_deep_past_circle.
+    """
+    task_id = int(task["id"])
+    project = await repo.resolve_project_for_task(db, task_id)
+    threshold = circle_deep_stop_of(gate_policy_of(project) if project else {})
+    if threshold is None:
+        return None
+    laps = (await review_circle(db, task_id)).count
+    return (laps, threshold) if laps >= threshold else None
+
+
+async def announce_circle_deep_stop(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    laps: int,
+    threshold: int,
+) -> bool:
+    """Один алерт и одно событие на поколение остановки. True — записали сейчас.
+
+    Дедуп по событию, а не по тексту карточки: текст правят и цитируют, а
+    событие пишется только здесь.
+    """
+    already = await fetchall(
+        db,
+        "SELECT 1 FROM events WHERE kind=? AND task_id=? "
+        "AND json_extract(payload, '$.generation')=? LIMIT 1",
+        (CIRCLE_STOP_EVENT, task_id, generation),
+    )
+    if already:
+        return False
+    laps_text = "; ".join((await review_circle(db, task_id)).breakdown())
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Круг ревью остановил deep: {_laps_phrase(laps)} подряд с новыми "
+        f"находками (порог остановки {threshold}): {laps_text}. До "
+        "решения человека пересдачи этой задачи идут на lite, а лестница "
+        "добора и переспрос другой моделью deep не докупают. Ревью не "
+        "выключено: lite идёт на каждую сдачу. Исходов три: принять как есть, "
+        "отпустить оставшееся в отдельную задачу или продолжать круг "
+        "сознательно. Снять остановку — ручной запрос машинного ревью "
+        "(machine_review_override=require): он покупает deep; заявленный риск "
+        "security deep сохраняет и так. Порог — ключ circle_deep_stop в "
+        "gate_policy проекта или REVIEW_CIRCLE_DEEP_STOP, 0 выключает "
+        f"(#1432). [сдача {generation}]",
+    )
+    await repo.insert_event(
+        db,
+        kind=CIRCLE_STOP_EVENT,
+        task_id=task_id,
+        actor="hub",
+        payload={"generation": generation, "laps": laps, "threshold": threshold},
+    )
+    await db.commit()
+    return True
+
+
+async def _forced_deep_past_circle(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    force_profile: str,
+    force_model: str,
+) -> bool:
+    """Принудительный deep при остановке кругом не покупается (#1432).
+
+    Добор лестницы (#879) и вторая ось (#1243) приходят с force_profile=deep
+    мимо правила профиля — значит, и мимо остановки. Понизить их некуда (см.
+    _forced_deep_over_cap), поэтому отказ с названной причиной. Ручной
+    запрос и security остановкой не режутся.
+    """
+    if force_profile != DEEP or _deep_cap_exempt(task):
+        return False
+    stop = await circle_deep_stop(db, task)
+    if stop is None:
+        return False
+    task_id = int(task["id"])
+    await announce_circle_deep_stop(
+        db, task_id, int(task.get("submission_generation") or 0), *stop
+    )
+    what = "переспрос другой моделью" if force_model else "добор"
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Deep для этой сдачи не заказан: {circle_stop_reason(stop[0])} — "
+        f"{what} не куплен (#1432).",
+    )
+    await db.commit()
+    return True
 
 
 # Суточный потолок deep на проект (#1414). Правило выше решает, заслуживает
@@ -2117,6 +2269,7 @@ async def _policy_and_novelty_allow(
     task: dict[str, Any],
     project: Any,
     force_profile: str = "",
+    force_model: str = "",
 ) -> bool:
     """Два тихих отказа диспетчера, стоящих рядом по одной причине.
 
@@ -2161,7 +2314,11 @@ async def _policy_and_novelty_allow(
         # Без потолка это не оставляет: у добора свой, и он строже —
         # REVIEW_LADDER_MAX_STEPS ограничивает число прогонов на
         # генерацию, а подниматься выше дешёвого профиля некуда.
-        return True
+        #
+        # #1432: остановка deep кругом держит и добор, и вторую ось — до
+        # развилки облако/локальный путь, чтобы не обходил ни один. Отказ
+        # называет себя сам, поэтому для _name_the_missing_reviewer он тихий.
+        return not await _forced_deep_past_circle(db, task, force_profile, force_model)
     if await _this_code_was_already_read(db, task):
         return False
     # #1255: третий тихий отказ той же природы — новое чтение уже не купит
@@ -2610,6 +2767,36 @@ async def _only_tests_of(
     return call_sites.only_tests_symbols(report)
 
 
+async def _chosen_profile(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    generation: int,
+    profile_diff: str | None,
+    subject: DeltaSubject,
+    cloud: bool,
+) -> tuple[str, list[str]]:
+    """Профиль заказа без force_profile: правило, круг (#1432), потолок (#1414).
+
+    Круг — раньше потолка: сдача, пониженная кругом, места под потолком не
+    занимает.
+    """
+    task_id = int(task["id"])
+    stop = await circle_deep_stop(db, task)
+    profile, reasons = pick_review_profile(
+        task,
+        profile_diff,
+        await _small_delta(db, task_id, subject),
+        stop[0] if stop else None,
+    )
+    if stop and reasons[:1] == [circle_stop_reason(stop[0])]:
+        await announce_circle_deep_stop(db, task_id, generation, *stop)
+    if cloud:
+        profile, reasons = await apply_deep_daily_cap(
+            db, task, generation, profile, reasons
+        )
+    return profile, reasons
+
+
 async def prepare_review_order(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -2665,13 +2852,9 @@ async def prepare_review_order(
             ["профиль задан заказом: добор лестницы или его замена"],
         )
     else:
-        profile, profile_reasons = pick_review_profile(
-            task, profile_diff, await _small_delta(db, task_id, subject)
+        profile, profile_reasons = await _chosen_profile(
+            db, task, generation, profile_diff, subject, cloud
         )
-        if cloud:
-            profile, profile_reasons = await apply_deep_daily_cap(
-                db, task, generation, profile, profile_reasons
-            )
     rules_block, rules_note = await collect_review_rules(db, task_id, diff)
     prior = await previous_findings(db, task_id, generation)
     diff_block, diff_note = diff_plan(
@@ -3208,7 +3391,9 @@ async def maybe_dispatch_review(
     project = await repo.resolve_project_for_task(db, task_id)
     if project is None:
         return False
-    if not await _policy_and_novelty_allow(db, task, project, force_profile):
+    if not await _policy_and_novelty_allow(
+        db, task, project, force_profile, force_model
+    ):
         # #1216: тихий отказ по политике перестаёт быть тихим. Помощник сам
         # разбирает, КТО отказал: у проверки новизны своя запись, и вторую
         # писать поверх неё нечего. Строка остаётся одной — функция стоит на
@@ -5233,6 +5418,14 @@ async def _name_the_exhausted_retries(
 #: не круг, а разговор о точности харнесса, и у него свои метрики.
 CIRCLE_CLOSING_OUTCOMES: frozenset[str] = frozenset({"fixed", "real_fixed"})
 
+#: Исходы явного ОТКАЗА чинить (#1432). Цепь круга рвёт только поколение, где
+#: так названы ВСЕ находки: разговор о точности харнесса, а не работа по коду.
+#: Неназванный исход — «неизвестно» и цепь не рвёт: на #1405 отчёт #640 без
+#: исходов обнулял счёт, и пять deep подряд читались как один заход.
+CIRCLE_REFUSAL_OUTCOMES: frozenset[str] = frozenset(
+    {"false_positive", "not_a_defect", "wont_fix"}
+)
+
 #: Метка записи о круге, по которой она находится снова. Внутри — номер
 #: поколения: дедуп обязан быть в его пределах, иначе одна запись за всю
 #: жизнь задачи молчала бы про каждый следующий заход. Образец —
@@ -5294,9 +5487,14 @@ class ReviewCircle:
         """По строке на заход: «закрыто / пришло новых», в порядке заходов."""
         lines: list[str] = []
         for ordinal, lap in enumerate(self.laps, start=1):
+            # #1432: заход бывает и без названных закрытий (исходы не
+            # названы) — правки тогда не утверждаются.
+            closed = (
+                f"закрыто {lap.closed}" if lap.closed else "закрытий правкой не названо"
+            )
             line = (
                 f"заход {ordinal} (сдача {lap.generation}): "
-                f"закрыто {lap.closed}, пришло новых {lap.arrived}"
+                f"{closed}, пришло новых {lap.arrived}"
             )
             if lap.repeated_categories:
                 line += f"; повтор категории: {', '.join(lap.repeated_categories)}"
@@ -5343,10 +5541,16 @@ def _findings_of(row: dict[str, Any]) -> list[tuple[str, str]]:
 async def review_circle(db: aiosqlite.Connection, task_id: int) -> ReviewCircle:
     """Заходы этой задачи: «находки закрыли — пришли новые», подряд.
 
-    ЗАХОД — это пара поколений: в поколении N отчёт нашёл находки, автор их
-    ЗАКРЫЛ правкой (``CIRCLE_CLOSING_OUTCOMES``), а отчёт поколения N+1
-    принёс находки, которых в N не было. Условий ДВА, и каждое стоит
-    против своей ошибки:
+    ЗАХОД — это пара поколений: в поколении N отчёт нашёл находки, автор НЕ
+    отказался от всех них явно (#1432, ``CIRCLE_REFUSAL_OUTCOMES``), а отчёт
+    поколения N+1 принёс находки, которых в N не было. Неназванный исход —
+    «неизвестно», а не «не закрыто»: до #1432 он обрывал цепь, и автор, не
+    назвавший исходов, обнулял круг. ``closed`` захода по-прежнему считает
+    только названные закрытия правкой. Условий ДВА, и каждое стоит против
+    своей ошибки (текст ниже — редакция #1235, условие закрытия с #1432
+    читается как «не отказ по всем»). ``deferred``/``real_deferred`` цепь
+    не рвут: это признание, что дефект настоящий; ``not_judged`` — то же
+    «неизвестно», что и неназванный исход:
 
     * ЗАКРЫТИЕ находок поколения N правкой. Оно же закрывает и требование
       «находки в N были»: закрыть можно только то, что нашли, поэтому
@@ -5406,12 +5610,18 @@ async def review_circle(db: aiosqlite.Connection, task_id: int) -> ReviewCircle:
         (task_id,),
     )
     closed: dict[int, set[str]] = {}
+    refused: dict[int, set[str]] = {}
     for raw in closed_rows:
         row = dict(raw)
-        if str(row.get("outcome") or "") not in CIRCLE_CLOSING_OUTCOMES:
+        outcome = str(row.get("outcome") or "")
+        if outcome in CIRCLE_CLOSING_OUTCOMES:
+            into = closed
+        elif outcome in CIRCLE_REFUSAL_OUTCOMES:
+            into = refused
+        else:
             continue
         generation = int(row.get("submission_generation") or 0)
-        closed.setdefault(generation, set()).add(str(row.get("finding_uid") or ""))
+        into.setdefault(generation, set()).add(str(row.get("finding_uid") or ""))
 
     generations = sorted(per_generation)
     laps: list[CircleLap] = []
@@ -5420,7 +5630,9 @@ async def review_circle(db: aiosqlite.Connection, task_id: int) -> ReviewCircle:
         seen = {uid for uid, _ in before}
         shut = seen & closed.get(previous, set())
         fresh = [(uid, cat) for uid, cat in per_generation[current] if uid not in seen]
-        if not shut or not fresh:
+        # #1432: рвёт отказ по ВСЕМ находкам (пустое ``seen`` — тоже: находок
+        # не было, круга нет), а не отсутствие названного закрытия.
+        if seen <= refused.get(previous, set()) or not fresh:
             # Цепь оборвалась: дальше считается заново, а не поверх.
             laps = []
             continue
@@ -5488,7 +5700,7 @@ async def name_the_circle(db: aiosqlite.Connection, task_id: int) -> bool:
         "alert",
         (
             f"Задача идёт по кругу {circle.count}-й раз: каждый заход "
-            f"закрывал находки и получал новые. "
+            f"приносил новые находки. "
             + "; ".join(circle.breakdown())
             + f".{category_line} Ревью НЕ выключено и пересдача не запрещена — "
             "находки настоящие, и молча перестать их искать было бы хуже "

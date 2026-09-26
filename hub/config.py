@@ -83,6 +83,12 @@ MAX_REVIEW_CYCLES = int(env_get("MAX_REVIEW_CYCLES", "3"))
 # потому что порог назначен по трём наблюдениям одного дня, и первым
 # вопросом к нему будет «как это выключить», а не «на сколько подвинуть».
 REVIEW_CIRCLE_THRESHOLD = int(env_get("REVIEW_CIRCLE_THRESHOLD", "3"))
+# #1432: с этого числа заходов круга пересдача, которой правило дало бы deep,
+# получает lite, а лестница добора и вторая ось deep не докупают — до решения
+# человека (ручной запрос ревью). Ключ circle_deep_stop в gate_policy проекта
+# главнее; 0 выключает; нечитаемое значение — тоже выключает: ошибка в
+# настройке не должна удешевлять ревью молча.
+REVIEW_CIRCLE_DEEP_STOP = env_get("REVIEW_CIRCLE_DEEP_STOP", "2")
 # Universal Review Gate (#318): 'forbid' (default) rejects review verdicts
 # from the agent principal that implemented the task (assigned_agent or
 # claimed_by); 'allow' is the explicit solo-mode opt-out.
