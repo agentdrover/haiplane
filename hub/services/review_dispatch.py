@@ -45,7 +45,7 @@ from hub.models import (
     INCOMPLETE_REASON_PROFILE,
     RiskClass,
 )
-from hub.services import call_sites, project_policy
+from hub.services import call_sites, project_policy, review_ci_gate
 from hub.services.model_family import family
 from hub.services.orchestration import ORIGINAL_READ_SQL
 from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
@@ -2139,6 +2139,12 @@ async def _policy_and_novelty_allow(
     # key, which forced the hub's own project to choose between no review
     # and no human.
     if not review_dispatch_enabled(gate_policy_of(project)):
+        return False
+    # #1405: прогон покупается только на зелёном CI закреплённого коммита.
+    # Стоит ДО добора: лестница, вторая ось (#1243) и переспрос (#1242) идут
+    # сюда же и обойти условие не должны. Красный и «CI ещё идёт» — отказ,
+    # о котором карточке говорит сам review_may_be_bought.
+    if not await review_ci_gate.review_may_be_bought(db, task, project):
         return False
     if force_profile:
         # Добор лестницы #879 проверку новизны не проходит и не должен.
@@ -4657,6 +4663,8 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     # #1242: переспрос — ДО разбора активных строк. Заказ, закрытый упавшим
     # на этом проходе, переспрашивается на следующем, а не в ту же минуту.
     await _ask_again_lost_reviews(db)
+    # #1405: отложенные до отчёта CI заказы — дождавшиеся отчёта или потолка.
+    await review_ci_gate.order_reviews_waiting_for_ci(db)
     for row in await repo.list_active_review_dispatches(db):
         dispatch = dict(row)
         task_id = dispatch["task_id"]

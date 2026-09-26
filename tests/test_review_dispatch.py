@@ -190,6 +190,8 @@ async def _submitted(
     rules: dict[str, str] | None = None,
     forge: str = "github",
     validation_commands: list[str] | None = None,
+    ci_reports: list[dict] | None = None,
+    override: str = "",
 ) -> int:
     areas = ["docs/notes.md"] if areas is None else areas
     pid = await repo.create_project(
@@ -227,6 +229,12 @@ async def _submitted(
         # "not computed", which must never be read as low risk. NULL is that
         # state in the column; the empty string is not a valid class.
         await db.execute("UPDATE tasks SET risk_class = NULL WHERE id = ?", (task_id,))
+    for report in ci_reports or []:
+        # #1405: CI раньше сдачи — обычный порядок; отчёт ложится до сдачи и
+        # подхватывается ею (adopt_ci_run_report).
+        await _ci_report(db, task_id, **report)
+    if override:
+        await repo.update_task(db, task_id, machine_review_override=override)
     await db.commit()
 
     plugins.git_ops = _PinnedGitOps(_TIP, areas, diff, rules)
@@ -237,6 +245,27 @@ async def _submitted(
     )
     assert view.status.value == "review"
     return task_id
+
+
+async def _ci_report(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    head_sha: str = _TIP,
+    validation_status: str = "pass",
+    checks: dict[str, str] | None = None,
+) -> None:
+    await repo.upsert_ci_run_report(
+        db,
+        task_id=task_id,
+        head_sha=head_sha,
+        ac_results="{}",
+        validation_status=validation_status,
+        validation_log="",
+        reason="",
+        reported_by="github-actions",
+        checks=json.dumps(checks or {}),
+    )
 
 
 def test_pick_review_model_prefers_another_family(monkeypatch):
@@ -13959,3 +13988,185 @@ def test_author_delta_lines_counts_changed_lines_only():
     )
     assert author_delta_lines(combined) == 2
     assert author_delta_lines(_author_patch(30, generated=200)) == 30
+
+
+# --- #1405: ревью покупается только на зелёном CI закреплённого коммита -------
+
+_OTHER_SHA = "d" * 40
+# Проект, CI которого хаб видит: отчёт о каком-то коммите у него уже есть.
+_PROJECT_HAS_CI = [{"head_sha": _OTHER_SHA, "validation_status": "pass"}]
+
+
+async def _card(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? ORDER BY id", (task_id,)
+    )
+    return [r[0] for r in rows]
+
+
+async def _events(db: aiosqlite.Connection, kind: str) -> list[dict]:
+    return [
+        json.loads(dict(r)["payload"])
+        for r in await repo.list_events(db, since=0, kinds=[kind], limit=50)
+    ]
+
+
+async def test_red_ci_on_the_pinned_sha_buys_no_review_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1: CI отчитался раньше сдачи (обычный порядок) и назвал проверку fail.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-red"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(
+        client,
+        db,
+        "red-ci",
+        ci_reports=[
+            {
+                "validation_status": "fail",
+                "checks": {"lint": "pass", "mutations": "fail", "types": "skipped"},
+            }
+        ],
+    )
+    assert recorder.calls == [], "красный CI — провайдер не вызван"
+
+    # Лестница, вторая ось каскада и переспрос идут через тот же ранний отказ.
+    assert not await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+    assert not await maybe_dispatch_review(
+        db, task_id, force_profile=DEEP, force_model="gpt-5.3-codex"
+    )
+    assert not await maybe_dispatch_review(db, task_id, replaces_dispatch_id=1)
+    assert recorder.calls == []
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM review_dispatches WHERE task_id=?", (task_id,)
+    )
+    assert rows == []
+
+    red = [c for c in await _card(db, task_id) if "ревью не куплено" in c.lower()]
+    assert len(red) == 1, "одно событие на сдачу, не на каждый триггер"
+    assert "CI красный" in red[0]
+    assert "mutations" in red[0] and "validation" in red[0]
+    assert "lint" not in red[0] and "types" not in red[0]
+    [event] = await _events(db, "review_withheld_red_ci")
+    assert event["failed"] == ["mutations", "validation"]
+    assert event["sha"] == _TIP
+
+
+async def test_a_green_report_arriving_after_submission_orders_exactly_one_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2: проект с CI, отчёта о закреплённом sha к сдаче нет.
+    from hub.services.ci_report import accept_ci_run_report
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-green"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "late-ci", ci_reports=_PROJECT_HAS_CI)
+    assert recorder.calls == [], "CI ещё идёт — ждать, а не заказывать"
+    assert any("ревью ждёт CI" in c for c in await _card(db, task_id))
+
+    other = await accept_ci_run_report(
+        db, task_id, head_sha="e" * 40, ac_results={}, validation_status="pass"
+    )
+    assert other["applied"] is False
+    assert recorder.calls == [], "отчёт о другом sha — не отчёт о закреплённом"
+
+    await accept_ci_run_report(
+        db,
+        task_id,
+        head_sha=_TIP,
+        ac_results={},
+        validation_status="pass",
+        checks={"lint": "pass"},
+    )
+    assert len(recorder.calls) == 1, "зелёный отчёт заказывает ревью"
+
+    # Повторный отчёт, сдача того же коммита (#1265) и тик поллера — не второй
+    # заказ.
+    await accept_ci_run_report(
+        db, task_id, head_sha=_TIP, ac_results={}, validation_status="pass"
+    )
+    await maybe_dispatch_review(db, task_id)
+
+    async def _no_run(agent_id, run_id=None):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _no_run)
+    await sweep_review_dispatches(db)
+    assert len(recorder.calls) == 1
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM review_dispatches WHERE task_id=?", (task_id,)
+    )
+    assert len(rows) == 1
+
+    # Обратный порядок: зелёный отчёт раньше сдачи — ровно один заказ сразу.
+    early = await _submitted(
+        client, db, "early-ci", ci_reports=[{"validation_status": "pass"}]
+    )
+    assert len(recorder.calls) == 2
+    await accept_ci_run_report(
+        db, early, head_sha=_TIP, ac_results={}, validation_status="pass"
+    )
+    assert len(recorder.calls) == 2
+
+
+async def test_missing_ci_is_named_once_after_the_wait_ceiling(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3: отложенный заказ, CI не пришёл за потолок ожидания.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-late"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+
+    async def _no_run(agent_id, run_id=None):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _no_run)
+    monkeypatch.setattr(config, "REVIEW_CI_WAIT_MINUTES", 30)
+    task_id = await _submitted(client, db, "no-ci-yet", ci_reports=_PROJECT_HAS_CI)
+
+    await sweep_review_dispatches(db)
+    assert recorder.calls == [], "до потолка — ждать"
+    assert not [c for c in await _card(db, task_id) if "CI нет" in c]
+
+    await db.execute(
+        "UPDATE submissions SET submitted_at = datetime('now', '-31 minutes') "
+        "WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+    for _ in range(3):
+        await sweep_review_dispatches(db)
+
+    missing = [c for c in await _card(db, task_id) if "ревью ждёт CI, CI нет" in c]
+    assert len(missing) == 1, "одно событие на сдачу, а не на тик"
+    assert _TIP[:12] in missing[0]
+    # Причина названа: CI отчитался, но о другом коммите.
+    assert f"CI отчитался о коммите {_OTHER_SHA[:12]}" in missing[0]
+    [event] = await _events(db, "review_ci_missing")
+    assert event["sha"] == _TIP and event["waited_minutes"] == 30
+    # Потолок не держит сдачу без ревью навсегда: заказ сделан, и один.
+    assert len(recorder.calls) == 1
+
+
+async def test_projects_without_ci_and_human_requests_are_ordered_as_before(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4: проект, у которого хаб CI не видит, — заказ сразу.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-asis"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+    plain = await _submitted(client, db, "no-ci-project")
+    assert len(recorder.calls) == 1
+    assert not [c for c in await _card(db, plain) if "ждёт CI" in c]
+
+    # Ручной запрос человека: ни отсутствие отчёта, ни красный CI его не держат.
+    await _submitted(
+        client, db, "asked-no-report", ci_reports=_PROJECT_HAS_CI, override="require"
+    )
+    assert len(recorder.calls) == 2
+    await _submitted(
+        client,
+        db,
+        "asked-red",
+        ci_reports=[{"validation_status": "fail", "checks": {"tests": "fail"}}],
+        override="require",
+    )
+    assert len(recorder.calls) == 3

@@ -198,6 +198,8 @@ async def accept_ci_run_report(
             validation_log=validation_log or "",
         )
     await db.commit()
+    if applied:
+        await _order_deferred_review(db, task_id)
 
     return {
         "applied": applied,
@@ -209,6 +211,20 @@ async def accept_ci_run_report(
         "validation_status": validation_status,
         "mutations_state": str((mutations or {}).get("state") or "not_reported"),
     }
+
+
+async def _order_deferred_review(db: Any, task_id: int) -> None:
+    """Отчёт о закреплённом коммите ставит отложенный заказ ревью (#1405).
+
+    Best-effort, как заказ при сдаче: сбой диспетча пишет в лог и не ломает
+    приём отчёта — отчёт уже сохранён, а свип поллера подберёт заказ сам.
+    """
+    from hub.services.review_ci_gate import order_after_ci_report
+
+    try:
+        await order_after_ci_report(db, task_id)
+    except Exception:  # noqa: BLE001 - an order must never break a CI report
+        log.exception("deferred review order failed for task #%s", task_id)
 
 
 async def _stamp(
