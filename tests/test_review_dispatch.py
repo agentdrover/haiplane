@@ -14419,3 +14419,59 @@ async def test_an_exhausted_deferred_order_stays_with_the_human(
     assert recorder.calls == []
     attempts = await _events(db, "review_ci_order_attempt")
     assert len(attempts) == review_ci_gate.ORDER_ATTEMPTS
+
+
+async def test_a_lost_claim_race_is_not_read_as_a_blind_create(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # Находка ревью сдачи 3 (отчёт не сдан, uid нет): проигравший гонку за
+    # бронь #1399 видит чужую бронь без строки заказа. Это не его слепой
+    # исход — заказ ставит победитель, и тревоги «ответ потерян» быть не должно.
+    from hub.services import review_dispatch as rd
+    from hub.services.ci_report import accept_ci_run_report
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-race"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "claim-race", ci_reports=_PROJECT_HAS_CI)
+
+    real_claim = rd._claim_the_order
+
+    async def _winner_claims_first(db_, task_id_, generation, profile, *rest):
+        # Второй триггер (свип или сдача) взял бронь раньше и сейчас создаёт
+        # агента: его строка заказа появится после нашего отказа.
+        await db_.execute(
+            "INSERT OR IGNORE INTO review_order_claims "
+            "(task_id, submission_generation, profile) VALUES (?, ?, ?)",
+            (task_id_, generation, profile),
+        )
+        await db_.commit()
+        return await real_claim(db_, task_id_, generation, profile, *rest)
+
+    monkeypatch.setattr(rd, "_claim_the_order", _winner_claims_first)
+    await accept_ci_run_report(
+        db, task_id, head_sha=_TIP, ac_results={}, validation_status="pass"
+    )
+    assert recorder.calls == [], "проигравший гонку провайдера не зовёт"
+    assert await _events(db, "review_ci_order_uncertain") == []
+    assert await _events(db, "review_ci_order_attempt") == []
+    assert not [c for c in await _card(db, task_id) if "ответ провайдера" in c]
+
+    # Победитель дописал заказ и снял бронь — отложенный заказ состоялся.
+    await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-winner",
+        run_id="run-winner",
+        model="grok-4.6",
+    )
+    await repo.release_review_order(db, task_id, 1, "")
+    await db.commit()
+    monkeypatch.setattr(rd, "_claim_the_order", real_claim)
+
+    async def _no_run(agent_id, run_id=None):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _no_run)
+    await sweep_review_dispatches(db)
+    assert recorder.calls == []

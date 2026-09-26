@@ -431,7 +431,7 @@ async def _attempt_the_order(
             ),
         )
         return False
-    await repo.insert_event(
+    attempt_id = await repo.insert_event(
         db,
         kind=ATTEMPT_EVENT,
         task_id=task_id,
@@ -439,10 +439,22 @@ async def _attempt_the_order(
         payload={"generation": generation},
     )
     await db.commit()
-    if await review_dispatch.maybe_dispatch_review(db, task_id):
-        return True
+    claimed = review_dispatch.ORDER_CLAIMED_HERE.set(None)
+    try:
+        if await review_dispatch.maybe_dispatch_review(db, task_id):
+            return True
+        mine = review_dispatch.ORDER_CLAIMED_HERE.get() == (task_id, generation)
+    finally:
+        review_dispatch.ORDER_CLAIMED_HERE.reset(claimed)
     if await _ordered(db, task_id, generation):
         return True
+    if await _order_in_flight(db, task_id, generation) and not mine:
+        # Бронь чужая: гонку за неё выиграл другой триггер, и заказ ставит он.
+        # Не попытка этого вызова и не повод для событий — свою запись о
+        # попытке вызов забирает назад, чтобы не тратить чужой бюджет.
+        await db.execute("DELETE FROM events WHERE id=?", (attempt_id,))
+        await db.commit()
+        return False
     if await _order_in_flight(db, task_id, generation):
         await _say_once(
             db,

@@ -20,6 +20,7 @@ stamps with data instead of discipline.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import math
@@ -3038,6 +3039,17 @@ async def _cloud_config_missing(
     return False
 
 
+#: Бронь, взятая ЭТИМ вызовом (#1405, находка ревью сдачи 3). Отложенный
+#: заказ отличает по ней свой слепой исход от чужой брони: бронь без строки
+#: заказа после отказа значит «ответ потерян» только тогда, когда её брал сам
+#: вызывающий. Проигравший гонку видит бронь победителя — это не его дело.
+#: ContextVar, а не возврат maybe_dispatch_review: у той потолок сложности,
+#: а конкурентные пути (приём отчёта, свип, сдача) — разные asyncio-задачи.
+ORDER_CLAIMED_HERE: contextvars.ContextVar[tuple[int, int] | None] = (
+    contextvars.ContextVar("review_order_claimed_here", default=None)
+)
+
+
 async def _claim_the_order(
     db: aiosqlite.Connection,
     task_id: int,
@@ -3063,6 +3075,7 @@ async def _claim_the_order(
     if replaces_dispatch_id is not None or force_model:
         return True
     if await repo.claim_review_order(db, task_id, generation, profile):
+        ORDER_CLAIMED_HERE.set((task_id, generation))
         return True
     log.info(
         "review dispatch for task #%s gen %s (%s) skipped: already ordered",
