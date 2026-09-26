@@ -346,6 +346,11 @@ REVIEW_LITE_TOKEN_BUDGET = int(env_get("REVIEW_LITE_TOKEN_BUDGET", "40000"))
 # перевести все проекты на lite. Считается по числу, не по токенам: счёт
 # провайдера deep занижен до #1413.
 REVIEW_DEEP_DAILY_CAP = env_get("REVIEW_DEEP_DAILY_CAP", "")
+# #1416: пересдача, чья АВТОРСКАЯ дельта (#1249) не длиннее стольких
+# изменённых строк (добавлено + удалено, без сгенерированных файлов), получает
+# lite вместо deep. Ключ small_delta_lines в gate_policy проекта главнее;
+# 0 выключает правило; нечитаемое значение — тоже выключает (дорогая сторона).
+REVIEW_SMALL_DELTA_LINES = env_get("REVIEW_SMALL_DELTA_LINES", "80")
 MAX_CI_FIX_CYCLES = int(env_get("MAX_CI_FIX_CYCLES", "3"))
 # Seconds after CI start / first missing-run probe before "no run for this
 # SHA" is a named fact rather than a wait. Same window the poller already
