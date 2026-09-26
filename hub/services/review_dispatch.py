@@ -907,8 +907,73 @@ def is_docs_only_diff(diff: str) -> bool:
     return bool(paths) and all(p is not None and is_documentation(p) for p in paths)
 
 
+# Маленькая пересдача (#1416). 13-25.09: 73 из 125 deep — пересдачи, и на
+# пересдаче deep даёт подтверждённых почти столько же, сколько lite (0,48
+# против 0,43 на отчёт). Фиксированная цена харнесса (~4M токенов, 10-14M
+# многопрогонный) при паре правленых строк не окупается. Большие пересдачи
+# остаются на deep: unresolved-находок он там даёт в 5 раз больше.
+SMALL_DELTA_KEY = "small_delta_lines"
+#: Слова причины; по ним сводка ревью находит такие пересдачи.
+SMALL_DELTA_REASON_MARK = "маленькая пересдача"
+
+
+def small_delta_lines_of(policy: dict[str, Any]) -> int | None:
+    """Порог маленькой пересдачи в строках; None — правило выключено.
+
+    Ключ проекта главнее REVIEW_SMALL_DELTA_LINES. Ноль выключает. Нечитаемое
+    значение — тоже: ошибка в настройке не должна удешевлять ревью молча.
+    """
+    raw: Any = None
+    if isinstance(policy, dict) and SMALL_DELTA_KEY in policy:
+        raw = _cap_value(policy[SMALL_DELTA_KEY])
+    if raw is None:
+        text = str(config.REVIEW_SMALL_DELTA_LINES or "").strip()
+        raw = int(text) if text.isdigit() else None
+    return raw or None
+
+
+def author_delta_lines(diff: str) -> int:
+    """Изменённые строки авторской дельты: добавленные плюс удалённые (#1416).
+
+    Заголовки файлов читаются только ВНЕ ханка (строка «---» внутри ханка —
+    удалённый текст). Комбинированный дифф слияния (``@@@``, #1249 подаёт
+    его на пересдаче) несёт по колонке на родителя, и строка считается, если
+    хоть в одной колонке правка. Сгенерированные файлы не считаются, как и
+    везде при выборе профиля (#874). Серия коммитов считается как есть:
+    правка и её откат дают две строки — перебор в сторону deep.
+    """
+    count, width, in_hunk, skip = 0, 1, False, False
+    for line in diff.splitlines():
+        if line.startswith("diff "):
+            in_hunk = False
+            skip = _all_generated(_header_paths(line))
+        elif line.startswith("@@"):
+            in_hunk = True
+            width = max(len(line) - len(line.lstrip("@")) - 1, 1)
+        elif not in_hunk:
+            if line.startswith("+++ "):
+                # «+++ /dev/null» у удалённого файла имени не несёт — решает
+                # строка «diff» над ним.
+                if line[4:].strip() != "/dev/null":
+                    skip = _all_generated(_header_paths(line))
+                # Двойники и обрезанные диффы бывают без «@@»: строки
+                # после «+++» — уже содержимое файла.
+                in_hunk, width = True, 1
+        elif not skip and any(c in "+-" for c in line[:width]):
+            count += 1
+    return count
+
+
+def _all_generated(paths: list[str | None] | None) -> bool:
+    """Все названные пути — сгенерированные; нечитаемый путь — не такой."""
+    found = [p for p in paths or [] if p != "/dev/null"]
+    return bool(found) and all(p is not None and is_generated(p) for p in found)
+
+
 def pick_review_profile(
-    task: dict[str, Any], diff: str | None = None
+    task: dict[str, Any],
+    diff: str | None = None,
+    small_delta: tuple[int, int] | None = None,
 ) -> tuple[str, list[str]]:
     """Which review profile this submission deserves, and why (#807, #820).
 
@@ -939,6 +1004,14 @@ def pick_review_profile(
     for lite (Cursor export, 25.09.2026). The caller passes the AUTHOR's part
     of the diff (#1249), so documents a base merge brought in cannot hide the
     author's code, nor can the author's document ride on the base's.
+
+    ``small_delta`` is ``(lines, limit)`` of a resubmission whose delta was
+    PROVEN and whose author's part was separated (#1416); the caller passes
+    None otherwise. When the author's lines fit the limit, deep bought by the
+    rest of the rule becomes lite, and the cancelled reason stays named. A
+    human request and a security risk keep deep at any size: they are checked
+    first. The ladder top-up and the cascade come with ``force_profile`` and
+    never reach this function.
     """
     if (task.get("machine_review_override") or "").strip() == "require":
         return DEEP, ["ревью запрошено человеком"]
@@ -951,6 +1024,22 @@ def pick_review_profile(
         risks = json.loads(task.get("risks") or "[]")
     except ValueError:
         risks = []
+    profile, reasons = _profile_by_rule(task, diff, risks)
+    if small_delta is None or profile != DEEP or _declares_security(risks):
+        return profile, reasons
+    lines, limit = small_delta
+    if lines > limit:
+        return profile, reasons
+    return LITE, [
+        f"{SMALL_DELTA_REASON_MARK}: {lines} ≤ {limit} строк авторской дельты",
+        *(f"отменён повод deep: {r}" for r in reasons),
+    ]
+
+
+def _profile_by_rule(
+    task: dict[str, Any], diff: str, risks: Any
+) -> tuple[str, list[str]]:
+    """The rule after the human request: documents, surfaces, risk, class."""
     if is_docs_only_diff(diff) and not _declares_security(risks):
         return LITE, ["дифф только из документации"]
     surfaces = process_surface_reasons(diff)
@@ -2479,6 +2568,24 @@ class ReviewOrder:
     only_tests: tuple[str, ...] | None = None
 
 
+async def _small_delta(
+    db: aiosqlite.Connection, task_id: int, subject: DeltaSubject
+) -> tuple[int, int] | None:
+    """``(строки, порог)`` для правила маленькой пересдачи (#1416), или None.
+
+    None, когда дельта не доказана (предмет — весь дифф: первая сдача, не
+    предок, смена базы, нет прочитанного поколения) или авторская часть не
+    отделена от привезённого базой: мерить тогда нечего, правило молчит.
+    """
+    if not subject.paths or not subject.author_diff:
+        return None
+    project = await repo.resolve_project_for_task(db, task_id)
+    limit = small_delta_lines_of(gate_policy_of(project) if project else {})
+    if limit is None:
+        return None
+    return author_delta_lines(subject.author_diff), limit
+
+
 async def _only_tests_of(
     ctx: tuple[str, str] | None, diff: str | None
 ) -> list[call_sites.SymbolReport] | None:
@@ -2552,7 +2659,9 @@ async def prepare_review_order(
             ["профиль задан заказом: добор лестницы или его замена"],
         )
     else:
-        profile, profile_reasons = pick_review_profile(task, profile_diff)
+        profile, profile_reasons = pick_review_profile(
+            task, profile_diff, await _small_delta(db, task_id, subject)
+        )
         if cloud:
             profile, profile_reasons = await apply_deep_daily_cap(
                 db, task, generation, profile, profile_reasons

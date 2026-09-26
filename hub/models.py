@@ -332,6 +332,9 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # делегирует — замок #743 его не трогает. Читатель:
     # review_dispatch.deep_daily_cap_of.
     "deep_daily_cap",
+    # #1416: порог маленькой пересдачи в строках авторской дельты. Не гейт и
+    # ничего не делегирует. Читатель: review_dispatch.small_delta_lines_of.
+    "small_delta_lines",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -339,19 +342,18 @@ _RISK_MAP_MAX_RULES = 100
 _RISK_MAP_MAX_PATTERN = 200
 
 
-def _validate_deep_daily_cap(policy: dict[str, Any]) -> None:
-    """Потолок deep-ревью в сутки — целое ≥ 0 или ничего (#1414).
+def _validate_count(policy: dict[str, Any], key: str) -> None:
+    """Счётный ключ — целое ≥ 0 или ничего (#1414 deep_daily_cap, #1416
+    small_delta_lines).
 
     ``True`` — тоже int в Python, и «потолок true» читался бы как 1; строка
-    «2» выглядела бы потолком, не будучи им для читателя. Обе — отказ.
+    «2» выглядела бы числом, не будучи им для читателя. Обе — отказ.
     """
-    if "deep_daily_cap" not in policy:
+    if key not in policy:
         return
-    cap = policy["deep_daily_cap"]
-    if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
-        raise ValueError(
-            f"gate_policy deep_daily_cap must be an integer >= 0, got: {cap!r}"
-        )
+    value = policy[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"gate_policy {key} must be an integer >= 0, got: {value!r}")
 
 
 def _validate_review_limit(policy: dict[str, Any]) -> None:
@@ -2420,7 +2422,8 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
         v["risk_map"] = _validated_risk_map(v["risk_map"])
     _validate_review_limit(v)
     _validate_orchestrator_queue(v)
-    _validate_deep_daily_cap(v)
+    _validate_count(v, "deep_daily_cap")
+    _validate_count(v, "small_delta_lines")
     return v
 
 
