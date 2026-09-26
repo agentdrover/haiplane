@@ -966,3 +966,101 @@ def test_the_policy_refuses_auto_until_the_dispatcher_issues_codes():
         validated_gate_policy({"executor_launch": "auto"})
     with pytest.raises(ValueError, match="executor_push_rights_task"):
         validated_gate_policy({"executor_push_rights_task": "1409"})
+
+
+async def test_two_simultaneous_launches_buy_one_executor(db, db_dsn, monkeypatch):
+    """Находка ревью #1412 (high): два нажатия одновременно — один заказ.
+
+    Бронь (строка прогона) ложится ДО оплаченного вызова, одной транзакцией
+    с проверкой; второй запуск её видит и отказывает. Соединения — как на
+    проде: своё на каждый запрос (#1065)."""
+    import asyncio
+
+    from hub import db as db_module
+
+    _launch_config(monkeypatch)
+    calls: list[dict] = []
+
+    async def _slow_create(**kw):
+        calls.append(kw)
+        await asyncio.sleep(0.3)
+        return _CREATED, None
+
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _slow_create)
+    project, task_id = await _launch_project(db, slug="exec-race")
+    human_id = await _human(db)
+    await db.commit()
+    first = await db_module.connect(db_dsn)
+    second = await db_module.connect(db_dsn)
+    try:
+        results = await asyncio.gather(
+            el.launch_executor(first, project, issuer_principal_id=human_id),
+            el.launch_executor(second, project, issuer_principal_id=human_id),
+        )
+    finally:
+        await first.close()
+        await second.close()
+
+    assert len(calls) == 1, "оплачен один исполнитель"
+    assert sorted(r.launched for r in results) == [False, True], results
+    refused = next(r for r in results if not r.launched)
+    assert refused.reason.startswith(el.REASON_ALREADY_RUNNING), refused
+    rows = [dict(r) for r in await repo.list_executor_runs(db, task_id)]
+    assert [(r["agent_id"], r["outcome"]) for r in rows] == [("bc-exec-9", "running")]
+
+
+async def test_a_failed_order_releases_its_reservation(db, monkeypatch):
+    """Отказ провайдера закрывает бронь исходом failed с причиной — следующий
+    запуск не упирается в «уже идёт прогон»."""
+    _launch_config(monkeypatch)
+    _creator(monkeypatch, [cursor_cloud.Refusal(status=400, code="invalid_model")])
+    project, task_id = await _launch_project(db, slug="exec-release")
+    human_id = await _human(db)
+
+    first = await el.launch_executor(db, project, issuer_principal_id=human_id)
+    assert not first.launched
+    rows = [dict(r) for r in await repo.list_executor_runs(db, task_id)]
+    assert [r["outcome"] for r in rows] == ["failed"], rows
+    assert "invalid_model" in rows[0]["reason"]
+
+    calls = _creator(monkeypatch, [_CREATED])
+    second = await el.launch_executor(db, project, issuer_principal_id=human_id)
+    assert second.launched, second
+    assert len(calls) == 1
+
+
+async def test_an_abandoned_reservation_does_not_block_the_task_forever(
+    db, monkeypatch
+):
+    """Бронь без агента старше всех попыток заказа — брошена: закрывается с
+    причиной, и задачу можно запустить снова."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, task_id = await _launch_project(db, slug="exec-abandoned")
+    stale = await repo.create_executor_run(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="",
+        run_id="",
+        model=_EXEC_MODEL,
+    )
+    await db.execute(
+        "UPDATE executor_runs SET started_at=datetime('now', '-2 hours') WHERE id=?",
+        (stale,),
+    )
+    await db.commit()
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert result.launched, result
+    assert len(calls) == 1
+    old = next(
+        dict(r)
+        for r in await repo.list_executor_runs(db, task_id)
+        if dict(r)["id"] == stale
+    )
+    assert (old["outcome"], old["reason"]) == (
+        "failed",
+        el.REASON_RESERVATION_ABANDONED,
+    )

@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aiosqlite
@@ -37,7 +38,8 @@ from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
 from hub.services import chat_pair, orchestrator_queue, project_policy
-from hub.services.executor_dispatch import OUTCOME_RUNNING
+from hub.db import write_transaction
+from hub.services.executor_dispatch import OUTCOME_FAILED, OUTCOME_RUNNING
 from hub.services.model_family import same_family
 
 log = logging.getLogger(__name__)
@@ -62,6 +64,9 @@ REASON_NO_ACTING_AGENT = "нет агента chat-pair"
 REASON_CREATE_REFUSED = "провайдер отказал в создании агента"
 REASON_CREATE_EXHAUSTED = "создание агента не удалось за все попытки"
 REASON_ANSWER_LOST = "ответ на создание агента не дошёл"
+REASON_RESERVATION_ABANDONED = (
+    "бронь запуска брошена: агент так и не был записан за отведённое время"
+)
 
 #: Отказы, которые стоит повторить с паузой (F0 и 22–24.09): лимит частоты
 #: и исчерпанный лимит аккаунта, который Cursor отдаёт то 429, то кодом.
@@ -142,6 +147,19 @@ async def _preflight(db: aiosqlite.Connection, project: Any) -> str:
     return _family_refusal((config.EXECUTOR_MODEL or "").strip())
 
 
+def _reservation_abandoned(row: dict[str, Any]) -> bool:
+    """Бронь без агента пережила все попытки заказа с паузами (#1412)."""
+    started = str(row.get("started_at") or "")
+    try:
+        at = datetime.fromisoformat(started).replace(tzinfo=UTC)
+    except ValueError:
+        return False
+    budget = config.EXECUTOR_LAUNCH_MAX_ATTEMPTS * (
+        cursor_cloud.CREATE_TIMEOUT_S + config.EXECUTOR_LAUNCH_PAUSE_S
+    )
+    return datetime.now(UTC) - at > timedelta(seconds=budget + 60)
+
+
 async def _candidate(db: aiosqlite.Connection, project: Any) -> tuple[int | None, str]:
     answer = await orchestrator_queue.next_task(db, project)
     task_id = answer.get("next_task_id")
@@ -149,8 +167,21 @@ async def _candidate(db: aiosqlite.Connection, project: Any) -> tuple[int | None
         return None, f"{REASON_NO_CANDIDATE}: {answer.get('summary') or ''}".strip()
     for row in await repo.list_executor_runs(db, int(task_id)):
         r = dict(row)
-        if r["outcome"] == OUTCOME_RUNNING:
-            return None, f"{REASON_ALREADY_RUNNING} #{task_id} ({r['agent_id']})"
+        if r["outcome"] != OUTCOME_RUNNING:
+            continue
+        if not r["agent_id"] and _reservation_abandoned(r):
+            # Бронь без агента старше всех попыток заказа: запрос, что её
+            # положил, не дожил до ответа провайдера (выкат, падение). Иначе
+            # задача навсегда читалась бы «уже идёт прогон».
+            await repo.update_executor_run(
+                db,
+                int(r["id"]),
+                outcome=OUTCOME_FAILED,
+                reason=REASON_RESERVATION_ABANDONED,
+                finish=True,
+            )
+            continue
+        return None, f"{REASON_ALREADY_RUNNING} #{task_id} ({r['agent_id'] or 'бронь'})"
     return int(task_id), ""
 
 
@@ -217,6 +248,40 @@ def _refusal_text(refusal: cursor_cloud.Refusal | None) -> str:
     return f"HTTP {refusal.status or 'без ответа'}{code}"
 
 
+async def _reserve(
+    db: aiosqlite.Connection, project: Any, issuer_principal_id: int, model: str
+) -> LaunchResult | tuple[dict[str, Any], int, int, str]:
+    """Бронь запуска: кандидат, проверка «прогона нет», строка и код — одной
+    write-транзакцией, ДО оплаченного заказа (находка ревью #1412, high).
+
+    Без брони два одновременных нажатия оба видели «прогона нет» и оба
+    платили Cursor; второй код к тому же гасил невыкупленный первый. Тот же
+    класс, что два ревьюера на одну сдачу (#1399). BEGIN IMMEDIATE ставит
+    второй запрос в очередь за первым, и тот уже видит бронь.
+    """
+    async with write_transaction(db):
+        task_id, why = await _candidate(db, project)
+        if task_id is None:
+            return _refused(why)
+        row = await repo.get_task(db, task_id)
+        if row is None:
+            return _refused(f"{REASON_NO_CANDIDATE}: #{task_id} не найдена", task_id)
+        task = dict(row)
+        generation = int(task.get("submission_generation") or 0) + 1
+        row_id = await repo.create_executor_run(
+            db,
+            task_id=task_id,
+            submission_generation=generation,
+            agent_id="",
+            run_id="",
+            model=model,
+        )
+        code, _ttl = await chat_pair.issue_code(
+            db, issuer_principal_id, kind="implementer", bound_task_id=task_id
+        )
+    return task, generation, row_id, code
+
+
 async def launch_executor(
     db: aiosqlite.Connection, project: Any, *, issuer_principal_id: int
 ) -> LaunchResult:
@@ -226,22 +291,15 @@ async def launch_executor(
     refusal = await _preflight(db, project)
     if refusal:
         return _refused(refusal)
-    task_id, why = await _candidate(db, project)
-    if task_id is None:
-        return _refused(why)
     if await chat_pair.get_acting_agent(db) is None:
-        return _refused(f"{REASON_NO_ACTING_AGENT} (CHAT_PAIR_AGENT)", task_id)
-    row = await repo.get_task(db, task_id)
-    if row is None:
-        return _refused(f"{REASON_NO_CANDIDATE}: #{task_id} не найдена", task_id)
-    task = dict(row)
-    generation = int(task.get("submission_generation") or 0) + 1
-    code, _ttl = await chat_pair.issue_code(
-        db, issuer_principal_id, kind="implementer", bound_task_id=task_id
-    )
-    await db.commit()
-    base = project_policy.base_branch_of(project)
+        return _refused(f"{REASON_NO_ACTING_AGENT} (CHAT_PAIR_AGENT)")
     model = config.EXECUTOR_MODEL.strip()
+    reserved = await _reserve(db, project, issuer_principal_id, model)
+    if isinstance(reserved, LaunchResult):
+        return reserved
+    task, generation, row_id, code = reserved
+    task_id = int(task["id"])
+    base = project_policy.base_branch_of(project)
     order = {
         "repo_url": f"https://github.com/{project['repo']}",
         "starting_ref": base,
@@ -250,19 +308,16 @@ async def launch_executor(
     }
     agent_id, run_id, failed = await _create(task_id, generation, order)
     if failed:
+        # Бронь закрывается: следующий запуск не должен упереться в «уже идёт».
+        await repo.update_executor_run(
+            db, row_id, outcome=OUTCOME_FAILED, reason=failed, finish=True
+        )
         await repo.add_task_update(
             db, task_id, "hub", "alert", f"Исполнитель НЕ запущен: {failed}."
         )
         await db.commit()
         return _refused(failed, task_id)
-    row_id = await repo.create_executor_run(
-        db,
-        task_id=task_id,
-        submission_generation=generation,
-        agent_id=agent_id,
-        run_id=run_id,
-        model=model,
-    )
+    await repo.set_executor_run_agent(db, row_id, agent_id=agent_id, run_id=run_id)
     await repo.add_task_update(
         db,
         task_id,
