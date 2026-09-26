@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import functools
 import json
@@ -11,6 +12,7 @@ import re
 import os
 import sqlite3
 from collections.abc import AsyncIterator, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -4924,6 +4926,11 @@ async def _complete_without_review(
         # here would read as "there was nothing to deliver" (AC-4).
         await repo.add_task_update(db, task_id, "hub", "alert", pr_note)
     if task.get("pr_number") and not task.get("job_id"):
+        if _running_deferred.get():
+            # #1430: заметки выше (pr_note, «PR открыт хабом») не должны
+            # держать лок на время мержа. Здесь чужой транзакции нет по
+            # построению — отложенный шаг идёт после коммита done-flow.
+            await db.commit()
         delivered = await _deliver_completed_pair_task(db, task, delivery_pr)
         if delivered is not None:
             return delivered
@@ -5321,6 +5328,58 @@ async def _run_headless_submit_gates(
     await write_submission_notices(gates)
 
 
+# #1430: done-отчёт pair-задачи без ревью завершается ПОСЛЕ коммита своей
+# транзакции. Список, выставленный в контексте, — знак «идёт done-flow под
+# write_transaction»: поллер и headless-пути его не ставят и завершают как
+# раньше, сразу.
+DEFERRED_COMPLETION = "deferred"
+_deferred_completions: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "_deferred_completions", default=None
+)
+# Истина, пока run_deferred_completions завершает отложенное: соединение не
+# в чужой транзакции, и записи можно коммитить до сети.
+_running_deferred: ContextVar[bool] = ContextVar("_running_deferred", default=False)
+
+
+@contextlib.asynccontextmanager
+async def defer_completions() -> AsyncIterator[list[dict[str, Any]]]:
+    """Собрать завершения, которые done-flow отложил до своего коммита."""
+    pending: list[dict[str, Any]] = []
+    token = _deferred_completions.set(pending)
+    try:
+        yield pending
+    finally:
+        _deferred_completions.reset(token)
+
+
+async def run_deferred_completions(
+    db: aiosqlite.Connection, pending: list[dict[str, Any]]
+) -> None:
+    """Завершить отложенное вне транзакции: сеть — без лока базы (#1430).
+
+    Задача перечитывается: между коммитом done-flow и этим шагом её мог
+    доставить поллер (память _gate_merges, #1398), и тогда она уже не в
+    running — делать нечего. Каждая запись коммитится сразу, чтобы соединение
+    не держало лок и здесь.
+    """
+    token = _running_deferred.set(True)
+    try:
+        for item in pending:
+            row = await repo.get_task(db, item["task_id"])
+            if row is None or dict(row)["status"] not in ("running", "claimed"):
+                continue
+            await _complete_without_review(
+                db,
+                dict(row),
+                has_done=True,
+                exit_code=item["exit_code"],
+                result_text=item["result_text"],
+            )
+            await db.commit()
+    finally:
+        _running_deferred.reset(token)
+
+
 async def transition_after_agent_done(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -5367,6 +5426,16 @@ async def transition_after_agent_done(
         still_open_note = await unanswered_findings_note(db, task)
         if still_open_note:
             await repo.add_task_update(db, task_id, "hub", "alert", still_open_note)
+        deferred = _deferred_completions.get()
+        if deferred is not None and not task.get("job_id"):
+            # #1430: done-flow держит write-транзакцию. Всё ниже ходит в
+            # сеть (поиск и открытие PR, CI, мерж), и под транзакцией это
+            # держало лок базы на время вызова форжа. Завершение идёт после
+            # коммита — run_deferred_completions.
+            deferred.append(
+                {"task_id": task_id, "exit_code": exit_code, "result_text": result_text}
+            )
+            return DEFERRED_COMPLETION
         return await _complete_without_review(
             db,
             task,

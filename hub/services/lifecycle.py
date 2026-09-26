@@ -105,6 +105,7 @@ from hub.models import (
 from hub.integrations.git_ops import PairBranchConflictError, canonical_task_branch
 from hub.services.orchestration import (
     apply_live_worktree,
+    defer_completions,
     completion_requires_review,
     detect_branch_stacking,
     dispatch_task,
@@ -115,6 +116,7 @@ from hub.services.orchestration import (
     restore_pair_workspace_base,
     review_approved_for_current_submission,
     review_verdict_covers_current_submission,
+    run_deferred_completions,
     switch_pair_workspace_to_task,
     transition_after_agent_done,
 )
@@ -4586,6 +4588,24 @@ async def _release_done_flow(
         await db.execute("RELEASE SAVEPOINT done_flow")
 
 
+async def _finish_deferred_done(
+    db: aiosqlite.Connection, task_id: int, deferred: list[dict[str, Any]]
+) -> None:
+    """Завершить отложенное done-flow после его коммита (#1430).
+
+    Завершение pair-задачи — поиск PR, CI, мерж — идёт без write-лока на
+    время сети. Откат #364 охраняет путь сдачи внутри транзакции и не
+    меняется: сюда доходит только уже законно записанный done-отчёт.
+    """
+    if not deferred:
+        return
+    await run_deferred_completions(db, deferred)
+    row = await repo.get_task(db, task_id)
+    if row is not None and dict(row)["status"] == "completed":
+        await maybe_rollup_parent(db, task_id)
+        await db.commit()
+
+
 async def add_update(
     db: aiosqlite.Connection,
     task_id: int,
@@ -4638,7 +4658,7 @@ async def add_update(
     # SAVEPOINT (see get_write_lock). Nothing inside acquires the lock again, so
     # there is no re-entrancy/deadlock. Note: log_activity commits inside here,
     # which is why it must run under the same lock.
-    async with write_transaction(db):
+    async with defer_completions() as deferred_done, write_transaction(db):
         # #364: the done row and the generation bump are written before the
         # git tail runs, and a git adapter that raises used to leave both
         # behind — reproduced: one done row and generation 1 after the
@@ -4827,6 +4847,8 @@ async def add_update(
         finally:
             if not released:
                 await _release_done_flow(db)
+
+    await _finish_deferred_done(db, task_id, deferred_done)
 
     if body.kind == "done":
         await _try_restore_pair_workspace(db, task_id)
