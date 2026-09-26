@@ -72,6 +72,12 @@ MISSING_EVENT = "review_ci_missing"
 GREEN_EVENT = "review_ci_green"
 ATTEMPT_EVENT = "review_ci_order_attempt"
 EXHAUSTED_EVENT = "review_ci_order_exhausted"
+#: Ответ на создание потерян: агент, возможно, оплачен (#1199, #1399).
+UNCERTAIN_EVENT = "review_ci_order_uncertain"
+#: Диспетчер отказал по своей причине (политика, новизна, несходимость).
+DECLINED_EVENT = "review_ci_order_declined"
+#: После этих событий отложенный заказ больше не ставится автоматически.
+FINAL_EVENTS = (EXHAUSTED_EVENT, UNCERTAIN_EVENT, DECLINED_EVENT)
 #: Заказ сдачи отложен: ждал отчёта или стоял на красном.
 DEFERRED_EVENTS = (WAIT_EVENT, RED_EVENT)
 
@@ -322,11 +328,39 @@ async def _ordered(db: aiosqlite.Connection, task_id: int, generation: int) -> b
     return bool(await repo.machine_reviews_of_generation(db, task_id, generation))
 
 
+async def _order_in_flight(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> bool:
+    """Бронь заказа #1399 на этой сдаче стоит без строки заказа.
+
+    Это либо заказ, который прямо сейчас ставит другой триггер, либо слепой
+    исход (_Started.blind): ответ на создание потерян, спросить провайдера не
+    вышло, и бронь оставлена намеренно — агент, возможно, уже оплачен
+    (находка f11ae1e8510a48ff). Срок брони тут не читается: истёкшая бронь
+    слепого исхода не делает второго агента бесплатным.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM review_order_claims WHERE task_id=? "
+        "AND submission_generation=? LIMIT 1",
+        (task_id, generation),
+    )
+    return bool(rows)
+
+
 async def _may_try_again(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> bool:
-    """Пауза между попытками. Потолок попыток держит выборка свипа; приём
-    нового отчёта CI — новое свидетельство и пробует сверх него."""
+    """Итог и пауза попыток — на ОБОИХ путях, свипе и приёме отчёта.
+
+    Потолок попыток — это событие review_ci_order_exhausted, которое пишется
+    на ORDER_ATTEMPTS-й несостоявшейся попытке; вместе со слепым исходом и
+    отказом диспетчера оно окончательно. Находка e734ba93c19b49be: после «хаб больше не повторяет» поздний отчёт
+    CI не ставит заказ, иначе запись в карточке стала бы неправдой. Вернуть
+    сдачу в работу может человек — пересдачей или ручным запросом ревью.
+    """
+    if await _events_of(db, task_id, generation, FINAL_EVENTS):
+        return False
     return not await _events_of(
         db, task_id, generation, (ATTEMPT_EVENT,), ORDER_RETRY_PAUSE_MINUTES
     )
@@ -346,8 +380,10 @@ async def order_after_ci_report(db: aiosqlite.Connection, task_id: int) -> bool:
     generation = int(task.get("submission_generation") or 0)
     if task.get("status") != "review" or task.get("review_job_id") or generation <= 0:
         return False
-    if not await _deferred(db, task_id, generation) or await _ordered(
-        db, task_id, generation
+    if (
+        not await _deferred(db, task_id, generation)
+        or await _ordered(db, task_id, generation)
+        or await _order_in_flight(db, task_id, generation)
     ):
         return False
     project = await repo.resolve_project_for_task(db, task_id)
@@ -360,6 +396,41 @@ async def order_after_ci_report(db: aiosqlite.Connection, task_id: int) -> bool:
         return False
     if not await _may_try_again(db, task_id, generation):
         return False
+    return await _attempt_the_order(db, task, project, generation)
+
+
+async def _attempt_the_order(
+    db: aiosqlite.Connection, task: dict[str, Any], project: Any, generation: int
+) -> bool:
+    """Одна попытка и разбор её исхода по фактам в базе, а не по False.
+
+    False из maybe_dispatch_review означает разное (находки f11ae1e8510a48ff
+    и 86c9b242e6cf7042), поэтому исход читается так:
+    - отказ диспетчера по своей причине — спрошен ДО попытки тем же ранним
+      отказом, что у сдачи; это не попытка, повтора нет;
+    - строка заказа или отчёт — заказ состоялся;
+    - бронь осталась без строки — слепой исход, повтора нет;
+    - иначе вызов не встал (нет настройки, сбой подготовки) — попытка
+      засчитана, свип повторит до потолка.
+    """
+    from hub.services import review_dispatch
+
+    task_id = int(task["id"])
+    if not await review_dispatch._policy_and_novelty_allow(db, task, project):
+        await _say_once(
+            db,
+            task_id,
+            generation,
+            (DECLINED_EVENT, {}),
+            (
+                "status",
+                f"Отложенный до CI заказ ревью снят (сдача {generation}): "
+                "диспетчер отказал по своей причине — политика, уже прочитанный "
+                "код или несходящиеся находки; она названа в записях выше. "
+                "CI тут ни при чём, повторов не будет (#1405).",
+            ),
+        )
+        return False
     await repo.insert_event(
         db,
         kind=ATTEMPT_EVENT,
@@ -368,10 +439,25 @@ async def order_after_ci_report(db: aiosqlite.Connection, task_id: int) -> bool:
         payload={"generation": generation},
     )
     await db.commit()
-    from hub.services.review_dispatch import maybe_dispatch_review
-
-    if await maybe_dispatch_review(db, task_id):
+    if await review_dispatch.maybe_dispatch_review(db, task_id):
         return True
+    if await _ordered(db, task_id, generation):
+        return True
+    if await _order_in_flight(db, task_id, generation):
+        await _say_once(
+            db,
+            task_id,
+            generation,
+            (UNCERTAIN_EVENT, {}),
+            (
+                "status",
+                f"Отложенный до CI заказ ревью не повторяется (сдача "
+                f"{generation}): ответ провайдера на создание потерян, и агент, "
+                "возможно, уже оплачен — второй покупать нельзя (#1399). "
+                "Решение за человеком (#1405).",
+            ),
+        )
+        return False
     await _name_exhausted_order(db, task_id, generation)
     return False
 
@@ -402,8 +488,9 @@ async def order_reviews_waiting_for_ci(db: aiosqlite.Connection) -> int:
 
     Выбираются сдачи с событием отложенного заказа (ожидание ИЛИ красный —
     зелёный перепрогон того же sha, находка a9afb5ea8b295634), без
-    состоявшегося заказа и с неисчерпанными попытками. Пауза между попытками
-    и красный отчёт отсеиваются в order_after_ci_report без записей.
+    состоявшегося заказа, без брони #1399 и без окончательного итога
+    (FINAL_EVENTS). Пауза между попытками и красный отчёт отсеиваются в
+    order_after_ci_report без записей.
     """
     rows = await fetchall(
         db,
@@ -414,18 +501,20 @@ async def order_reviews_waiting_for_ci(db: aiosqlite.Connection) -> int:
         "AND EXISTS (SELECT 1 FROM events e WHERE e.task_id = t.id "
         "  AND e.kind IN (?, ?) "
         "  AND json_extract(e.payload, '$.generation') = t.submission_generation) "
-        "AND (SELECT COUNT(*) FROM events e WHERE e.task_id = t.id AND e.kind = ? "
-        "  AND json_extract(e.payload, '$.generation') = t.submission_generation"
-        ") < ? "
         "AND NOT EXISTS (SELECT 1 FROM review_dispatches d WHERE d.task_id = t.id "
         "  AND d.submission_generation = t.submission_generation) "
+        "AND NOT EXISTS (SELECT 1 FROM review_order_claims oc "
+        "  WHERE oc.task_id = t.id "
+        "  AND oc.submission_generation = t.submission_generation) "
+        "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.task_id = t.id "
+        "  AND e.kind IN (?, ?, ?) "
+        "  AND json_extract(e.payload, '$.generation') = t.submission_generation) "
         "AND (s.submitted_at <= datetime('now', ?) OR EXISTS ("
         "  SELECT 1 FROM ci_run_reports c WHERE c.task_id = t.id "
         "  AND c.head_sha = t.submission_sha))",
         (
             *DEFERRED_EVENTS,
-            ATTEMPT_EVENT,
-            ORDER_ATTEMPTS,
+            *FINAL_EVENTS,
             f"-{config.REVIEW_CI_WAIT_MINUTES} minutes",
         ),
     )

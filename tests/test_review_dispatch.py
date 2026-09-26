@@ -14285,3 +14285,137 @@ async def test_free_text_resembling_a_mark_does_not_silence_the_order(
         checks={"tests": "fail"},
     )
     assert len(await _events(db, "review_withheld_red_ci")) == 1
+
+    # Находка 4c59def751489bcf: и свип, а не только приём отчёта, решает не
+    # по тексту ленты — отчёт лёг мимо приёма, цитаты старых меток на месте.
+    swept = await _submitted(client, db, "text-sweep", ci_reports=_PROJECT_HAS_CI)
+    for text in (
+        "[CI зелёный, ревью заказывается: сдача 1]",
+        "[ревью ждёт CI, CI нет: сдача 1]",
+        "[ревью не куплено, CI красный: сдача 1]",
+    ):
+        await repo.add_task_update(db, swept, "dev", "status", text)
+    await _ci_report(db, swept, validation_status="pass")
+    await db.commit()
+
+    async def _no_run(agent_id, run_id=None):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _no_run)
+    before = len(recorder.calls)
+    await sweep_review_dispatches(db)
+    assert len(recorder.calls) == before + 1
+
+
+async def test_a_blind_deferred_order_is_not_bought_twice(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # Находка f11ae1e8510a48ff: ответ на создание потерян и спросить
+    # провайдера не вышло — агент, возможно, оплачен. Повтора нет.
+    from hub.services import review_ci_gate
+    from hub.services.ci_report import accept_ci_run_report
+
+    recorder = _DispatchRecorder(
+        None, refusal=cursor_cloud.Refusal(status=0, detail="таймаут ответа")
+    )
+    _wire(monkeypatch, recorder)
+    _no_local_path(monkeypatch)
+
+    async def _cannot_ask(name, pages=3):
+        return cursor_cloud.Reconciliation("", "", False)
+
+    async def _no_run(agent_id, run_id=None):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _cannot_ask)
+    monkeypatch.setattr(cursor_cloud, "get_run", _no_run)
+    monkeypatch.setattr(review_ci_gate, "ORDER_RETRY_PAUSE_MINUTES", 0)
+    task_id = await _submitted(
+        client,
+        db,
+        "blind-deferred",
+        policy={"review": "dispatch"},
+        ci_reports=_PROJECT_HAS_CI,
+    )
+    assert recorder.calls == []
+    await accept_ci_run_report(
+        db, task_id, head_sha=_TIP, ac_results={}, validation_status="pass"
+    )
+    assert len(recorder.calls) == 1
+    # Бронь #1399 истекла бы через свой срок — повтор держит не только она.
+    await db.execute(
+        "UPDATE review_order_claims SET claimed_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+    for _ in range(3):
+        await sweep_review_dispatches(db)
+    await accept_ci_run_report(
+        db, task_id, head_sha=_TIP, ac_results={}, validation_status="pass"
+    )
+    assert len(recorder.calls) == 1, "слепой исход — второго ревьюера не покупать"
+    [uncertain] = await _events(db, "review_ci_order_uncertain")
+    assert uncertain["generation"] == 1
+    assert await _events(db, "review_ci_order_exhausted") == []
+
+
+async def test_a_dispatcher_refusal_is_not_a_failed_create(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # Находка 86c9b242e6cf7042: отказ диспетчера по своей причине (здесь —
+    # находки перестали сходиться, #1255) не попытка и не повод повторять.
+    from hub.services import review_ci_gate
+    from hub.services import review_dispatch as rd
+    from hub.services.ci_report import accept_ci_run_report
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-no"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(review_ci_gate, "ORDER_RETRY_PAUSE_MINUTES", 0)
+    task_id = await _submitted(client, db, "declined", ci_reports=_PROJECT_HAS_CI)
+
+    async def _stopped(_db, _task):
+        return True
+
+    monkeypatch.setattr(rd, "findings_stopped_converging", _stopped)
+    await accept_ci_run_report(
+        db, task_id, head_sha=_TIP, ac_results={}, validation_status="pass"
+    )
+    for _ in range(4):
+        await sweep_review_dispatches(db)
+    assert recorder.calls == []
+    assert await _events(db, "review_ci_order_attempt") == []
+    assert len(await _events(db, "review_ci_order_declined")) == 1
+    assert not [c for c in await _card(db, task_id) if "не поставлен" in c]
+
+
+async def test_an_exhausted_deferred_order_stays_with_the_human(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # Находка e734ba93c19b49be: после «хаб больше не повторяет» новый отчёт CI
+    # заказа не ставит — иначе запись в карточке стала бы неправдой.
+    from hub.services import review_ci_gate
+    from hub.services.ci_report import accept_ci_run_report
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-ex"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+
+    async def _no_run(agent_id, run_id=None):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _no_run)
+    monkeypatch.setattr(review_ci_gate, "ORDER_RETRY_PAUSE_MINUTES", 0)
+    task_id = await _submitted(client, db, "exhausted", ci_reports=_PROJECT_HAS_CI)
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "")
+    await _ci_report(db, task_id, validation_status="pass")
+    await db.commit()
+    for _ in range(5):
+        await sweep_review_dispatches(db)
+    assert len(await _events(db, "review_ci_order_exhausted")) == 1
+
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "reviewer-token")
+    await accept_ci_run_report(
+        db, task_id, head_sha=_TIP, ac_results={}, validation_status="pass"
+    )
+    await sweep_review_dispatches(db)
+    assert recorder.calls == []
+    attempts = await _events(db, "review_ci_order_attempt")
+    assert len(attempts) == review_ci_gate.ORDER_ATTEMPTS
