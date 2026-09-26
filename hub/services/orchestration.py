@@ -5253,6 +5253,13 @@ async def _complete_without_review(
         actor=task.get("assigned_agent") or "agent",
         payload={"via": "report_done"},
     )
+    # #1437: сюда сходятся все пути transition_after_agent_done — headless
+    # поллер, одобрение ревью поллером, ручное обновление задания. Не все
+    # сворачивали родителя; повтор за done-flow безвреден (закрытый родитель
+    # пропускается).
+    from hub.services.lifecycle import maybe_rollup_parent
+
+    await maybe_rollup_parent(db, task_id)
     log.info("Task #%d → completed after done report", task_id)
     return "completed"
 
