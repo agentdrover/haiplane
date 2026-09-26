@@ -1974,13 +1974,15 @@ async def _second_generation(
     base_branch: str = "develop",
     record_previous: bool = True,
     reviewed: bool = True,
+    **submitted: object,
 ) -> int:
     """A task on its SECOND submission, with the first one in the ledger.
 
     ``reviewed`` records a report on generation 1: since #1400 the delta is
     taken only from a generation somebody's review actually covered.
+    ``submitted`` goes to :func:`_submitted` as is (risks, policy, ...).
     """
-    task_id = await _submitted(client, db, slug)
+    task_id = await _submitted(client, db, slug, **submitted)  # type: ignore[arg-type]
     if reviewed:
         await repo.insert_machine_review(
             db, task_id=task_id, submission_generation=1, incomplete=False
@@ -2220,6 +2222,10 @@ async def test_delta_base_skips_generation_without_recorded_review(
     # buys deep even though gen3 alone is a test tweak.
     recorder = _DispatchRecorder({"agent": {"id": "bc-g1"}, "run": {"id": "r-g1"}})
     _wire(monkeypatch, recorder)
+    # The widened delta is a few lines: the small-resubmission rule (#1416)
+    # would make it lite whatever it holds. What is witnessed here is WHICH
+    # delta the rule of #820 reads, so the size rule is switched off.
+    monkeypatch.setattr(config, "REVIEW_SMALL_DELTA_LINES", "0")
     task_id = await _third_generation(client, db, "spike-skip-gen2", reviewed=(1,))
     plugins.git_ops = _ThreeGenerationsGitOps(_TIP, ["docs/notes.md"])
 
@@ -2374,6 +2380,9 @@ async def test_a_surface_written_by_the_author_still_raises_the_profile(
     # still buys the deep harness and still says which surface bought it.
     recorder = _DispatchRecorder({"agent": {"id": "bc-o2"}, "run": {"id": "r-o2"}})
     _wire(monkeypatch, recorder)
+    # One author line: the small-resubmission rule (#1416) would buy lite on
+    # size alone. The surface rule is what is witnessed, so size is off here.
+    monkeypatch.setattr(config, "REVIEW_SMALL_DELTA_LINES", "0")
     task_id = await _second_generation(client, db, "spike-origin-author")
     plugins.git_ops = _AncestryGitOps(
         _TIP, ["docs/notes.md"], delta=_MERGED_DELTA, own=_OWN_WITH_SURFACE
@@ -13768,3 +13777,185 @@ async def test_same_submission_takes_one_deep_seat(
 
     third = await _submitted_in(db, pid)
     assert (await _any_dispatch_row(db, third))["profile"] == "lite"
+
+
+# --- Маленькая пересдача получает lite (#1416) --------------------------------
+#
+# 13-25.09: 73 из 125 deep — пересдачи. На пересдаче deep даёт подтверждённых
+# почти столько же, сколько lite (0,48 против 0,43 на отчёт), а фиксированная
+# цена харнесса (~4M токенов) при паре правленых строк не окупается. Правило
+# меряет АВТОРСКУЮ часть дельты (#1249) и не трогает ни ручной запрос, ни
+# security, ни пересдачу, где дельту не доказать.
+
+
+def _author_patch(lines: int, *, generated: int = 0) -> str:
+    """Авторская серия правок: ``lines`` изменённых строк, последняя —
+    маркер процессной поверхности. ``generated`` строк сверху — в uv.lock,
+    которые в счёт не идут."""
+    body = [f"+    value_{i} = {i}" for i in range(lines - 1)]
+    body.append("+    subprocess.run(['true'], check=False)")
+    patch = (
+        f"diff --git a/{_AUTHOR_FILE} b/{_AUTHOR_FILE}\n"
+        f"--- a/{_AUTHOR_FILE}\n+++ b/{_AUTHOR_FILE}\n"
+        f"@@ -0,0 +1,{lines} @@\n" + "\n".join(body) + "\n"
+    )
+    if generated:
+        patch += (
+            "diff --git a/uv.lock b/uv.lock\n--- a/uv.lock\n+++ b/uv.lock\n"
+            f"@@ -0,0 +1,{generated} @@\n"
+            + "\n".join(f'+name = "pkg-{i}"' for i in range(generated))
+            + "\n"
+        )
+    return patch
+
+
+async def _gen2_reasons(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    rows = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE kind='review_dispatched' AND task_id=?",
+        (task_id,),
+    )
+    payloads = [json.loads(r[0]) for r in rows]
+    gen2 = [p for p in payloads if p.get("generation") == 2]
+    assert gen2, payloads
+    return list(gen2[-1]["profile_reasons"])
+
+
+async def _small_delta_profile(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    monkeypatch,
+    slug: str,
+    lines: int,
+    *,
+    ancestor: bool = True,
+    override: str = "",
+    **submitted: object,
+) -> tuple[str, list[str]]:
+    recorder = _DispatchRecorder({"agent": {"id": f"bc-{slug}"}, "run": {"id": slug}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, slug, **submitted)
+    if override:
+        await db.execute(
+            "UPDATE tasks SET machine_review_override = ? WHERE id = ?",
+            (override, task_id),
+        )
+        await db.commit()
+    patch = _author_patch(lines, generated=200)
+    plugins.git_ops = _AncestryGitOps(
+        _TIP, ["docs/notes.md"], patch, ancestor=ancestor, delta=patch, own=patch
+    )
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    return (await _any_dispatch_row(db, task_id))["profile"], await _gen2_reasons(
+        db, task_id
+    )
+
+
+async def test_small_resubmission_delta_gets_lite_and_names_the_cancelled_reason(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1416): пересдача gen2 с доказанной дельтой к gen1, авторская
+    часть 30 строк с subprocess.run (и 200 строк uv.lock рядом, вне счёта),
+    порог 80 — lite, и в причинах названы и правило, и отменённый повод."""
+    monkeypatch.setattr(config, "REVIEW_SMALL_DELTA_LINES", "80")
+
+    profile, reasons = await _small_delta_profile(
+        client, db, monkeypatch, "spike-small-delta", 30
+    )
+
+    assert profile == "lite", reasons
+    assert any("маленькая пересдача: 30 ≤ 80" in r for r in reasons), reasons
+    cancelled = [r for r in reasons if "отменён повод deep" in r]
+    assert cancelled and all(
+        "процессная поверхность — запуск подпроцессов" in r for r in cancelled
+    ), reasons
+
+    # Сводка ревью (#1406): сколько пересдач правило увело в lite.
+    from hub.services.review_economy import review_economy
+
+    economy = await review_economy(db, since_days=7, escaped={})
+    assert economy["small_delta"]["downgraded_submissions"] == 1, economy
+    assert economy["small_delta"]["resubmissions"] == 1, economy
+
+
+async def test_large_or_unprovable_delta_keeps_deep(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1416): 200 строк авторской дельты — deep как раньше; 30 строк,
+    но прежний коммит не предок (предмет — весь дифф) — тоже deep."""
+    monkeypatch.setattr(config, "REVIEW_SMALL_DELTA_LINES", "80")
+
+    large, large_reasons = await _small_delta_profile(
+        client, db, monkeypatch, "spike-large-delta", 200
+    )
+    assert large == "deep", large_reasons
+    assert not any("маленькая пересдача" in r for r in large_reasons)
+
+    whole, whole_reasons = await _small_delta_profile(
+        client, db, monkeypatch, "spike-unprovable-delta", 30, ancestor=False
+    )
+    assert whole == "deep", whole_reasons
+    assert not any("маленькая пересдача" in r for r in whole_reasons)
+
+
+async def test_small_delta_rule_respects_security_human_request_and_off_switch(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1416): дельта 10 строк — но риск security, ручной запрос
+    человека или выключенный порог: профиль как до задачи (deep)."""
+    monkeypatch.setattr(config, "REVIEW_SMALL_DELTA_LINES", "80")
+    security = [{"kind": "security", "severity": "low", "description": "d"}]
+    cases = {
+        "security": await _small_delta_profile(
+            client, db, monkeypatch, "spike-small-sec", 10, risks=security
+        ),
+        "human": await _small_delta_profile(
+            client, db, monkeypatch, "spike-small-human", 10, override="require"
+        ),
+        "project-off": await _small_delta_profile(
+            client,
+            db,
+            monkeypatch,
+            "spike-small-project-off",
+            10,
+            policy={"verdict": "auto", "small_delta_lines": 0},
+        ),
+    }
+    monkeypatch.setattr(config, "REVIEW_SMALL_DELTA_LINES", "0")
+    cases["off"] = await _small_delta_profile(
+        client, db, monkeypatch, "spike-small-off", 10
+    )
+
+    for name, (profile, reasons) in cases.items():
+        assert profile == "deep", (name, reasons)
+        assert not any("маленькая пересдача" in r for r in reasons), (name, reasons)
+
+
+def test_small_delta_lines_policy_key_is_validated():
+    """#1416: ключ проекта small_delta_lines — целое ≥ 0, иначе отказ."""
+    from hub.models import validated_gate_policy
+
+    assert validated_gate_policy({"small_delta_lines": 40}) == {"small_delta_lines": 40}
+    for bad in (-1, True, "40", 1.5):
+        with pytest.raises(ValueError, match="small_delta_lines"):
+            validated_gate_policy({"small_delta_lines": bad})
+
+
+def test_author_delta_lines_counts_changed_lines_only():
+    """#1416: счёт — добавленные и удалённые строки, без заголовков и без
+    сгенерированных файлов; комбинированный дифф слияния тоже читается."""
+    from hub.services.review_dispatch import author_delta_lines
+
+    plain = (
+        "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+        "@@ -1,2 +1,2 @@\n-old\n---- deleted dashes\n+new\n"
+        "\\ No newline at end of file\n"
+    )
+    assert author_delta_lines(plain) == 3
+    combined = (
+        "diff --cc a.py\nindex 1,2..3\n--- a/a.py\n+++ b/a.py\n"
+        "@@@ -1,1 -1,1 +1,2 @@@\n++resolved\n+ ours\n  context\n"
+    )
+    assert author_delta_lines(combined) == 2
+    assert author_delta_lines(_author_patch(30, generated=200)) == 30

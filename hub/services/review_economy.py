@@ -376,6 +376,32 @@ async def _reconciliation_section(
     }
 
 
+async def _dispatched_payloads(
+    db: aiosqlite.Connection, since: str
+) -> list[tuple[tuple[Any, Any], dict[str, Any]]]:
+    """Записи «ревью вызвано» окна: ключ сдачи (задача, поколение) и payload."""
+    rows = await fetchall(
+        db,
+        "SELECT task_id, payload FROM events WHERE kind = 'review_dispatched' "
+        "AND created_at >= datetime('now', ?)",
+        (since,),
+    )
+    out: list[tuple[tuple[Any, Any], dict[str, Any]]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            out.append(((row["task_id"], payload.get("generation")), payload))
+    return out
+
+
+def _names_reason(payload: dict[str, Any], mark: str) -> bool:
+    reasons = payload.get("profile_reasons") or []
+    return isinstance(reasons, list) and any(mark in str(r) for r in reasons)
+
+
 async def _deep_cap_section(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
     """Сколько сдач окна суточный потолок deep увёл в lite (#1414).
 
@@ -385,33 +411,42 @@ async def _deep_cap_section(db: aiosqlite.Connection, since: str) -> dict[str, A
     """
     from hub.services.review_dispatch import DEEP_CAP_REASON_MARK
 
-    rows = await fetchall(
-        db,
-        "SELECT task_id, payload FROM events WHERE kind = 'review_dispatched' "
-        "AND created_at >= datetime('now', ?)",
-        (since,),
-    )
-    dispatched: set[tuple[Any, Any]] = set()
-    capped: set[tuple[Any, Any]] = set()
-    for row in rows:
-        try:
-            payload = json.loads(row["payload"] or "{}")
-        except ValueError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        key = (row["task_id"], payload.get("generation"))
-        dispatched.add(key)
-        reasons = payload.get("profile_reasons") or []
-        if isinstance(reasons, list) and any(
-            DEEP_CAP_REASON_MARK in str(r) for r in reasons
-        ):
-            capped.add(key)
+    payloads = await _dispatched_payloads(db, since)
+    dispatched = {key for key, _ in payloads}
+    capped = {key for key, p in payloads if _names_reason(p, DEEP_CAP_REASON_MARK)}
     return {
         "downgraded_submissions": len(capped),
         "dispatched_submissions": len(dispatched),
         "downgraded_share": _share(len(capped), len(dispatched)),
         **_sample(len(dispatched)),
+    }
+
+
+def _is_resubmission(key: tuple[Any, Any]) -> bool:
+    generation = key[1]
+    return isinstance(generation, int) and generation >= 2
+
+
+async def _small_delta_section(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+    """Сколько пересдач окна правило маленькой дельты увело в lite (#1416).
+
+    Доля — от вызванных пересдач (поколение ≥ 2): по ней подбирается порог,
+    а эскейпы (#528) на таких пересдачах — условие его пересмотра.
+    """
+    from hub.services.review_dispatch import SMALL_DELTA_REASON_MARK
+
+    payloads = await _dispatched_payloads(db, since)
+    resubmitted = {key for key, _ in payloads if _is_resubmission(key)}
+    small = {
+        key
+        for key, p in payloads
+        if key in resubmitted and _names_reason(p, SMALL_DELTA_REASON_MARK)
+    }
+    return {
+        "downgraded_submissions": len(small),
+        "resubmissions": len(resubmitted),
+        "downgraded_share": _share(len(small), len(resubmitted)),
+        **_sample(len(resubmitted)),
     }
 
 
@@ -444,5 +479,6 @@ async def review_economy(
         "profile_assignment": await _cohort_section(db, runs),
         "reconciliation": await _reconciliation_section(db, since, runs),
         "deep_cap": await _deep_cap_section(db, since),
+        "small_delta": await _small_delta_section(db, since),
         "escapes": _escapes_section(escaped),
     }
