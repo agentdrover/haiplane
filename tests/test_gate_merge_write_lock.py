@@ -228,42 +228,6 @@ async def test_the_forge_merge_is_not_called_under_a_write_transaction(db):
     assert dict(await repo.get_task(db, task_id))["status"] == "completed"
 
 
-async def test_a_restart_in_the_pending_window_is_not_merged_outside_gate(
-    db, monkeypatch
-):
-    """Находка ревью #1428: память процесса пропала — след в ленте остаётся.
-
-    Проход влил PR, запись не легла (gate_record_pending). Хаб перезапущен:
-    ``_gate_merges`` и ``_unrecorded_gate_merges`` пусты. Следующий проход
-    зовёт форж, тот отказывает по уже влитому PR — это мерж гейта, а не
-    ручной (merged_outside_gate терминален и зовёт человека).
-    """
-    from hub import poller
-
-    monkeypatch.setattr(orchestration, "GATE_RECORD_WAIT_SECONDS", 0.2)
-    task_id = await _approved_pair_task(db)
-    g = _git()
-    _locked_record(monkeypatch, failures=10_000)
-    await poller._sweep_pair_delivery(db)
-    assert dict(await repo.get_task(db, task_id))["status"] == "running"
-
-    # Перезапуск: память процесса пуста, база свободна, PR на форже MERGED.
-    monkeypatch.undo()
-    monkeypatch.setattr(orchestration, "GATE_RECORD_WAIT_SECONDS", 3.0)
-    orchestration._gate_merges.clear()
-    orchestration._unrecorded_gate_merges.clear()
-    poller._pair_delivery_waits.clear()
-    g.merge_pr = AsyncMock(return_value=False)
-    g.pr_state = AsyncMock(return_value="merged")
-    await poller._sweep_pair_delivery(db)
-
-    task = dict(await repo.get_task(db, task_id))
-    notes = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
-    assert task["status"] == "completed", notes
-    assert not any("merged_outside_gate" in n for n in notes), notes
-    assert await _rows(db, task_id) == [{"pr_number": 501, "merge_sha": MERGE_SHA}]
-
-
 async def test_a_human_delivery_with_an_unwritten_record_is_named_merged(
     db, monkeypatch
 ):
@@ -288,31 +252,3 @@ async def test_a_human_delivery_with_an_unwritten_record_is_named_merged(
     assert reason.startswith(orchestration.GATE_RECORD_PENDING_PREFIX), reason
     assert not any("PR остался открытым" in n for n in notes), notes
     assert any("реестр — нет" in n and "PR #501 влит" in n for n in notes), notes
-
-
-async def test_the_process_memory_heals_when_the_feed_note_did_not_land(
-    db, monkeypatch
-):
-    """Ожидание в ленту не записалось (база занята и для него), процесс жив.
-
-    Прочного следа нет — долг помнит память процесса, и следующий проход
-    дописывает строку без второго мержа.
-    """
-    from hub import poller
-
-    monkeypatch.setattr(orchestration, "GATE_RECORD_WAIT_SECONDS", 0.2)
-    task_id = await _approved_pair_task(db)
-    g = _git()
-    _locked_record(monkeypatch, failures=10_000)
-    await poller._sweep_pair_delivery(db)
-    assert g.merge_pr.await_count == 1
-
-    # Лента ничего не знает о долге: запись ожидания не легла.
-    monkeypatch.undo()
-    monkeypatch.setattr(orchestration, "GATE_RECORD_WAIT_SECONDS", 3.0)
-    monkeypatch.setattr(repo, "hub_authored_updates", AsyncMock(return_value=[]))
-    await poller._sweep_pair_delivery(db)
-
-    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
-    assert g.merge_pr.await_count == 1, "PR не вливается второй раз"
-    assert await _rows(db, task_id) == [{"pr_number": 501, "merge_sha": MERGE_SHA}]

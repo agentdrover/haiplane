@@ -4096,10 +4096,6 @@ async def _merged_by_gate(
         return GateTrace.GATE
     if seen is GateMergeSeen.IN_FLIGHT:
         return GateTrace.UNVERIFIED
-    if await _gate_record_owed(db, int(task_id), pr_num):
-        # #1428: гейт влил, строку записать не дали, а память процесса
-        # пропала (перезапуск). След — запись хаба в ленте.
-        return GateTrace.GATE
     try:
         sha = await plugins.git_ops.merge_commit_sha(
             pr_num,
@@ -4128,29 +4124,15 @@ _ALREADY_DELIVERED = (True, "already delivered")
 # Только по ним «уже доставлено» дописывает строку: проигравший гонки #1398
 # строку победителя ещё не видит, и без этой памяти писал бы вторую — у
 # задачи без проекта уникальный индекс её не отсечёт (NULL ≠ NULL).
+#
+# Память процесса, и это граница, а не недосмотр: прочного следа здесь нет.
+# «Запись не легла» случается ровно тогда, когда чужая транзакция держит лок
+# всё ожидание, — и любой след в SQLite (запись в ленте) упирается в тот же
+# лок. След в ленте к тому же подделываем: текст сдачи ложится записью хаба.
+# Перезапуск в этом окне читает влитый PR как merged_outside_gate — к
+# человеку, как до #1428. Корень — сеть под write-транзакцией done-flow;
+# он вынесен отдельной задачей.
 _unrecorded_gate_merges: set[tuple[int, int]] = set()
-
-
-async def _gate_record_owed(
-    db: aiosqlite.Connection, task_id: int, pr_num: int
-) -> bool:
-    """Должен ли гейт строку реестра за мерж, который сам и влил (#1428).
-
-    Память процесса — быстрый ответ; запись хаба в ленте — прочный. Память
-    теряется при перезапуске в окне ожидания, и тогда отказ форжа по уже
-    влитому PR читался бы как «влит не гейтом» (терминально, к человеку).
-    Лента переживает перезапуск: причина ожидания «gate_record_pending:
-    PR #N влит» — та же запись хаба, которую досыпка реестра (#1367)
-    принимает доказательством мержа гейта. Автор — только сам хаб
-    (hub_authored_updates): агент такую строку подделать не может.
-    """
-    if (task_id, pr_num) in _unrecorded_gate_merges:
-        return True
-    said = f"{GATE_RECORD_PENDING_PREFIX}: PR #{int(pr_num)} влит"
-    return any(
-        said in (dict(row).get("content") or "")
-        for row in await repo.hub_authored_updates(db, task_id)
-    )
 
 
 async def _gate_merge_commit(
@@ -4318,8 +4300,7 @@ async def merge_before_completion(
         decided, merge_detail = await _gate_merge_step(db, task, ctx)
         key = (int(task_id), int(pr_num))
         if decided is not None and not (
-            decided == _ALREADY_DELIVERED
-            and await _gate_record_owed(db, int(task_id), int(pr_num))
+            decided == _ALREADY_DELIVERED and key in _unrecorded_gate_merges
         ):
             return decided
         # #1428: «уже доставлено» по мержу, чью строку прошлый проход не смог
