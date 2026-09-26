@@ -231,7 +231,10 @@ async def launch_executor(
         return _refused(why)
     if await chat_pair.get_acting_agent(db) is None:
         return _refused(f"{REASON_NO_ACTING_AGENT} (CHAT_PAIR_AGENT)", task_id)
-    task = dict(await repo.get_task(db, task_id))
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        return _refused(f"{REASON_NO_CANDIDATE}: #{task_id} не найдена", task_id)
+    task = dict(row)
     generation = int(task.get("submission_generation") or 0) + 1
     code, _ttl = await chat_pair.issue_code(
         db, issuer_principal_id, kind="implementer", bound_task_id=task_id
