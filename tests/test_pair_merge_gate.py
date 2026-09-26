@@ -1599,3 +1599,94 @@ async def test_silent_refusal_with_unreadable_pr_waits_instead_of_calling_a_huma
     assert "merge_refusal_unverified" in feed
     assert "GitHub refused the merge" not in feed
     assert not list(await db.execute_fetchall("SELECT 1 FROM pipeline_merges"))
+
+
+# ---- #1437: доставка вне done-flow сворачивает родителя ----
+
+
+async def _feature_with_children(db, *, own_work: bool = False) -> tuple[int, int, int]:
+    """Фича с двумя подзадачами: первая completed, вторая одобрена (PR 77)."""
+    epic = await services.create_task(db, TaskCreate(title="Эпик", task_type="epic"))
+    feature = await services.create_task(
+        db, TaskCreate(title="Фича", task_type="feature", parent_id=epic.id)
+    )
+    if own_work:
+        await repo.update_task(db, feature.id, branch="task-f/own")
+    done = await services.create_task(db, TaskCreate(title="Готово"))
+    await repo.update_task(db, done.id, parent_id=feature.id, status="completed")
+    await db.commit()
+    last = await _approved_pair_task(db)
+    await repo.update_task(db, last, parent_id=feature.id)
+    await db.commit()
+    return feature.id, done.id, last
+
+
+async def test_poller_delivery_rolls_up_the_parent_feature(db):
+    """AC-1: поллер доставил последнюю подзадачу — фича completed сразу."""
+    _git(CIProbeOutcome.passed, merged=True)
+    feature, _, last = await _feature_with_children(db)
+
+    await _drain_pair_delivery(db)
+
+    assert dict(await repo.get_task(db, last))["status"] == "completed"
+    assert dict(await repo.get_task(db, feature))["status"] == "completed", (
+        "фича не должна ждать перезапуска хаба"
+    )
+
+
+async def test_poller_delivery_does_not_close_a_parent_with_own_work(db):
+    """AC-2: у фичи своя работа (#1043) — доставка ребёнка её не закрывает."""
+    _git(CIProbeOutcome.passed, merged=True)
+    feature, _, last = await _feature_with_children(db, own_work=True)
+
+    await _drain_pair_delivery(db)
+
+    assert dict(await repo.get_task(db, last))["status"] == "completed"
+    assert dict(await repo.get_task(db, feature))["status"] != "completed"
+
+
+async def test_a_transition_completion_rolls_up_the_parent(db):
+    """Прочие пути transition_after_agent_done (headless-поллер, одобрение
+    ревью поллером, ручное обновление задания) тоже сворачивают родителя."""
+    _git(CIProbeOutcome.passed, merged=True)
+    feature, _, last = await _feature_with_children(db)
+    await repo.update_task(db, last, pr_number=None)
+    await db.commit()
+
+    task = dict(await repo.get_task(db, last))
+    outcome = await services.transition_after_agent_done(db, task, has_done=True)
+    await db.commit()
+
+    assert outcome == "completed", outcome
+    assert dict(await repo.get_task(db, feature))["status"] == "completed"
+
+
+async def test_a_failed_rollup_is_closed_by_the_parent_rollup_sweep(db, monkeypatch):
+    """Находка ревью #1437: свёртка упала после completed ребёнка — ребёнок
+    доставлен и закоммичен, а родителя закрывает свип следующим циклом, без
+    перезапуска хаба."""
+    from hub import poller
+    from hub.services import lifecycle
+
+    _git(CIProbeOutcome.passed, merged=True)
+    feature, _, last = await _feature_with_children(db)
+
+    async def _boom(*_a, **_kw):
+        raise RuntimeError("rollup exploded")
+
+    monkeypatch.setattr(lifecycle, "maybe_rollup_parent", _boom)
+    await _drain_pair_delivery(db)
+    assert dict(await repo.get_task(db, last))["status"] == "completed"
+    assert dict(await repo.get_task(db, feature))["status"] == "open"
+    assert not db.in_transaction, "полсвёртки не висит на соединении"
+
+    monkeypatch.undo()
+    await poller._sweep_parent_rollup(db)
+
+    assert dict(await repo.get_task(db, feature))["status"] == "completed"
+
+
+async def test_the_parent_rollup_sweep_runs_every_tick():
+    from hub import poller
+
+    assert "parent_rollup" in [s.name for s in poller.SWEEPS]
