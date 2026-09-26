@@ -5112,6 +5112,31 @@ async def force_complete_task(
 DELIVER_DISPOSITION = "deliver"
 
 
+async def _name_the_owed_record(
+    db: aiosqlite.Connection, task_id: int, reason: str
+) -> bool:
+    """Доставка по решению человека, где PR влит, а строка реестра — нет (#1428).
+
+    Сказать правду: код в базовой ветке, строки pipeline_merges нет. Задача
+    уже завершена (decide/force-complete закоммитили это до вызова), и
+    поллер её не допишет. Запись одна и без повтора: база, не отпустившая
+    лок всё ожидание гейта, может не отпустить его и здесь — тогда запрос
+    человека упадёт на «locked» ПОСЛЕ мержа, без ложной фразы в ленте.
+    Корень — сеть под write-транзакцией done-flow — вынесен отдельной
+    задачей (#1428).
+    """
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Доставка по решению человека выполнена, реестр — нет: {reason}. "
+        "Задача завершена, свип доставки к ней не вернётся; до досыпки "
+        "реестра (#1367) drift-guard увидит этот мерж как ручной.",
+    )
+    return True
+
+
 async def deliver_on_disposition(
     db: aiosqlite.Connection, task_id: int, disposition: str, *, via: str
 ) -> tuple[bool, str, bool]:
@@ -5160,6 +5185,7 @@ async def deliver_on_disposition(
         return False, "no_pr", False
 
     from hub.services.orchestration import (
+        GATE_RECORD_PENDING_PREFIX,
         merge_before_completion,
         resolve_delivery_pr,
         review_approved_for_current_submission,
@@ -5198,6 +5224,10 @@ async def deliver_on_disposition(
         ok, reason = False, delivery_pr.reason
     else:
         ok, reason = await merge_before_completion(db, task)
+        # #1428: PR влит, не легла только строка реестра — это доставка, а не
+        # «PR остался открытым». Задача уже завершена, свип её не вернёт.
+        if not ok and reason.startswith(GATE_RECORD_PENDING_PREFIX):
+            ok = await _name_the_owed_record(db, task_id, reason)
     if ok:
         await repo.add_task_update(
             db,
