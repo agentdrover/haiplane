@@ -1663,6 +1663,13 @@ async def test_behind_branch_is_updated_and_merged_only_after_fresh_green_ci(
     assert task["status"] == "running", "отставшая ветка — ожидание, не решение"
     g.merge_pr.assert_not_awaited()
     assert g.update_pr_branch.await_count == 1
+    assert before["ci_check_started_at"] is None
+    assert task["ci_check_started_at"], (
+        "окно ожидания прогона перезапущено: у новой головы свой прогон"
+    )
+    assert any(c.args[1:] == ("develop",) for c in g.fetch_base.await_args_list), (
+        "база в клоне обновлена — сверка #1361 считает дифф от слитой базы"
+    )
     assert g.update_pr_branch.await_args.args[:2] == (77, "approved0commit"), (
         "обновление арендует ту голову, о которой ответил форж"
     )
@@ -1786,3 +1793,41 @@ async def test_up_to_date_merges_and_unknown_behind_waits(db, monkeypatch):
     g.update_pr_branch.assert_not_awaited()
     assert not await _needs_decision_events(db, unknown)
     assert "base_freshness_unknown" in await _feed_of(db, unknown)
+
+
+async def test_gate_merge_in_progress_is_not_disturbed_by_a_branch_update(
+    db, monkeypatch
+):
+    # #1419, ограничение: метка «мерж идёт» (#1398) сохраняется. Мерж гейта по
+    # этому PR уже прошёл в этом процессе — ветку под ним гейт не обновляет и
+    # не спрашивает об отставании, исход берёт память мержей.
+    import asyncio
+
+    from hub.services import orchestration
+
+    g = _git_seeing(monkeypatch, "approved0commit")
+    g.pr_base_freshness = AsyncMock(return_value=_behind("approved0commit"))
+    g.update_pr_branch = AsyncMock()
+    task_id = await _approved_pair_task(db)
+    merged: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    merged.set_result(True)
+    orchestration._gate_merges[(task_id, 77)] = merged
+
+    await _report_done(db, task_id)
+
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+    g.pr_base_freshness.assert_not_awaited()
+    g.update_pr_branch.assert_not_awaited()
+
+
+async def test_noop_plugins_do_not_ask_about_the_base_at_all():
+    # Заглушка без форжа отвечает unsupported, а не unknown: unknown держал бы
+    # гейт в ожидании ответа, которого некому дать (#1419).
+    from hub.integrations.noop import NoopForge
+    from hub.integrations.protocols import BaseFreshnessState, BranchUpdateOutcome
+
+    for plugin in (NoopGitOps(), NoopForge()):
+        fresh = await plugin.pr_base_freshness(1)
+        assert fresh.state is BaseFreshnessState.unsupported
+        outcome, _ = await plugin.update_pr_branch(1, "abc")
+        assert outcome is BranchUpdateOutcome.unsupported

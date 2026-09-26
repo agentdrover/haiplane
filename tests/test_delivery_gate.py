@@ -4615,3 +4615,48 @@ async def test_git_ops_names_conflict_files_and_leaves_the_branch(request) -> No
     assert outcome is BranchUpdateOutcome.conflict
     # merge-tree дописывает после имён свои сообщения — важно, что имя первое.
     assert detail.startswith("feature.txt"), detail
+
+
+async def test_git_ops_update_by_push_never_overwrites_a_racing_push(
+    request, tmp_path
+) -> None:
+    # Аренда пуша: чужой коммит лёг в ветку между подготовкой дерева и пушем.
+    # Обновление гейта обязано отказать, а не затереть его.
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.protocols import BranchUpdateOutcome
+
+    bare, work = request.getfixturevalue("repo_pair")
+    forge = AsyncMock()
+    forge.update_pr_branch.return_value = (BranchUpdateOutcome.unsupported, "нет")
+    forge.pr_refs.return_value = ("main", "task-1/x")
+    ops = GitOpsIntegration(forge=forge)
+    _gv_git(work, "checkout", "-q", "main")
+    (work / "later.txt").write_text("база ушла вперёд\n")
+    _gv_git(work, "add", "-A")
+    _gv_git(work, "commit", "-qm", "base moved")
+    _gv_git(work, "push", "-q", "origin", "main")
+    head = _gv_git(bare, "rev-parse", "task-1/x")
+
+    other = tmp_path / "other"
+    _gv_git(tmp_path, "clone", "-q", "-b", "task-1/x", str(bare), str(other))
+    real = ops._conflicting_texts
+
+    async def racing(path):
+        (other / "race.txt").write_text("чужой пуш\n")
+        _gv_git(other, "add", "-A")
+        _gv_git(
+            other, "-c", "user.name=T", "-c", "user.email=t@e", "commit", "-qm", "race"
+        )
+        _gv_git(other, "push", "-q", "origin", "task-1/x")
+        return await real(path)
+
+    ops._conflicting_texts = racing  # type: ignore[method-assign]
+    raced = None
+    try:
+        outcome, _ = await ops.update_pr_branch(7, head, task_id=1, repo=str(work))
+        raced = _gv_git(other, "rev-parse", "HEAD")
+    finally:
+        ops._conflicting_texts = real  # type: ignore[method-assign]
+
+    assert outcome is not BranchUpdateOutcome.updated
+    assert _gv_git(bare, "rev-parse", "task-1/x") == raced, "чужой пуш цел"
