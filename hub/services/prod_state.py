@@ -82,7 +82,13 @@ async def prod_state(db: Any, *, limit: int = DEFAULT_WINDOW) -> dict[str, Any]:
             "Это незнание, а не «ничего не доехало»"
         )
 
+    # #1420: an open release alert is the first thing the steward must read
+    # here — «what runs in production» is a stale answer while the release
+    # that would change it stands blocked.
+    from hub.services.release_alert import active_release_blocks
+
     return {
+        "release_blocks": await active_release_blocks(db),
         "deployed": deployed,
         "in_prod": buckets[IN_PROD],
         "not_in_prod": buckets[NOT_IN_PROD],
@@ -99,9 +105,11 @@ def format_prod_state(data: dict[str, Any]) -> str:
     One formatter as well as one builder: two renderings of the same facts
     drift, and then two readers disagree about production.
     """
+    from hub.services.release_alert import release_block_lines
+
     deployed = data.get("deployed") or {}
     sha = str(deployed.get("sha") or "")
-    lines = []
+    lines = release_block_lines(list(data.get("release_blocks") or []))
     if sha:
         where = f" ({deployed.get('ref')})" if deployed.get("ref") else ""
         when = f" от {deployed['at']}" if deployed.get("at") else ""
