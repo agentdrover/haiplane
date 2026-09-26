@@ -190,6 +190,8 @@ async def _submitted(
     rules: dict[str, str] | None = None,
     forge: str = "github",
     validation_commands: list[str] | None = None,
+    ci_reports: list[dict] | None = None,
+    override: str = "",
 ) -> int:
     areas = ["docs/notes.md"] if areas is None else areas
     pid = await repo.create_project(
@@ -227,6 +229,12 @@ async def _submitted(
         # "not computed", which must never be read as low risk. NULL is that
         # state in the column; the empty string is not a valid class.
         await db.execute("UPDATE tasks SET risk_class = NULL WHERE id = ?", (task_id,))
+    for report in ci_reports or []:
+        # #1405: CI раньше сдачи — обычный порядок; отчёт ложится до сдачи и
+        # подхватывается ею (adopt_ci_run_report).
+        await _ci_report(db, task_id, **report)
+    if override:
+        await repo.update_task(db, task_id, machine_review_override=override)
     await db.commit()
 
     plugins.git_ops = _PinnedGitOps(_TIP, areas, diff, rules)
@@ -237,6 +245,27 @@ async def _submitted(
     )
     assert view.status.value == "review"
     return task_id
+
+
+async def _ci_report(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    head_sha: str = _TIP,
+    validation_status: str = "pass",
+    checks: dict[str, str] | None = None,
+) -> None:
+    await repo.upsert_ci_run_report(
+        db,
+        task_id=task_id,
+        head_sha=head_sha,
+        ac_results="{}",
+        validation_status=validation_status,
+        validation_log="",
+        reason="",
+        reported_by="github-actions",
+        checks=json.dumps(checks or {}),
+    )
 
 
 def test_pick_review_model_prefers_another_family(monkeypatch):
@@ -380,12 +409,58 @@ async def test_missing_usage_leaves_dispatch_tokens_null(
     assert closed["provider_tokens"] is None
 
 
-async def test_usage_mismatch_is_flagged(
+def _usage_review(**extra) -> dict:
+    return {
+        "harness_skill": "multi-agent-review",
+        "harness_version": 8,
+        "raw_count": 3,
+        "findings_confirmed": [],
+        "findings_rejected": [
+            {"title": "x", "category": "correctness", "reason": "no"}
+        ],
+        "incomplete": False,
+        "unresolved": [],
+        "lost_dimensions": [],
+        "agent": "cursor-cloud-reviewer",
+        "model": "grok-4.6",
+        **extra,
+    }
+
+
+async def test_missing_tokens_spent_is_not_a_mismatch(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
-    # AC-3 (#757): the report's tokens are cross-checked against the
-    # provider's usage — a big gap is flagged to the audit, the dispatch
-    # settles as done either way.
+    # AC-1 (#1431): the cloud reviewer never reports tokens_spent. A missing
+    # number is not a disagreement — no alert; the provider's bill still lands
+    # on the report and the dispatch settles.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-n"}, "run": {"id": "run-n"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "spike-usage-none")
+    resp = await client.post(
+        f"/api/tasks/{task_id}/machine-review", json=_usage_review()
+    )
+    assert resp.status_code == 200, resp.text
+
+    async def _usage(agent_id, run_id=None):
+        return {"totalUsage": {"totalTokens": 100_000}}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+
+    await sweep_review_dispatches(db)
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    assert not [u for u in updates if "расходится с данными провайдера" in u["content"]]
+    stamped = dict(await repo.get_latest_machine_review(db, task_id))
+    assert stamped["tokens_spent"] is None
+    assert stamped["provider_tokens"] == 100_000
+    assert (await _any_dispatch_row(db, task_id))["status"] == "done"
+
+
+async def test_a_real_usage_mismatch_is_still_flagged_once(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#757), AC-2 (#1431): the report's tokens are cross-checked against
+    # the provider's usage — a big gap is flagged to the audit once, with both
+    # numbers; the dispatch settles as done either way.
     recorder = _DispatchRecorder({"agent": {"id": "bc-3"}, "run": {"id": "run-3"}})
     _wire(monkeypatch, recorder)
     task_id = await _submitted(client, db, "spike-usage")
@@ -417,6 +492,8 @@ async def test_usage_mismatch_is_flagged(
     updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
     flags = [u for u in updates if "расходится с данными провайдера" in u["content"]]
     assert len(flags) == 1
+    assert "tokens_spent=1000" in flags[0]["content"]
+    assert "Cursor usage=100000" in flags[0]["content"]
     assert not await repo.list_active_review_dispatches(db)
 
 
@@ -13959,3 +14036,496 @@ def test_author_delta_lines_counts_changed_lines_only():
     )
     assert author_delta_lines(combined) == 2
     assert author_delta_lines(_author_patch(30, generated=200)) == 30
+
+
+# --- #1405: ревью покупается только на зелёном CI закреплённого коммита -------
+
+_OTHER_SHA = "d" * 40
+# Проект, CI которого хаб видит: отчёт о каком-то коммите у него уже есть.
+_PROJECT_HAS_CI = [{"head_sha": _OTHER_SHA, "validation_status": "pass"}]
+
+
+async def _card(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    rows = await db.execute_fetchall(
+        "SELECT content FROM task_updates WHERE task_id=? ORDER BY id", (task_id,)
+    )
+    return [r[0] for r in rows]
+
+
+async def _events(db: aiosqlite.Connection, kind: str) -> list[dict]:
+    return [
+        json.loads(dict(r)["payload"])
+        for r in await repo.list_events(db, since=0, kinds=[kind], limit=50)
+    ]
+
+
+async def test_red_ci_on_the_pinned_sha_buys_no_review_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1: CI отчитался раньше сдачи (обычный порядок) и назвал проверку fail.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-red"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(
+        client,
+        db,
+        "red-ci",
+        ci_reports=[
+            {
+                "validation_status": "fail",
+                "checks": {"lint": "pass", "mutations": "fail", "types": "skipped"},
+            }
+        ],
+    )
+    assert recorder.calls == [], "красный CI — провайдер не вызван"
+
+    # Лестница, вторая ось каскада и переспрос идут через тот же ранний отказ.
+    assert not await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+    assert not await maybe_dispatch_review(
+        db, task_id, force_profile=DEEP, force_model="gpt-5.3-codex"
+    )
+    assert not await maybe_dispatch_review(db, task_id, replaces_dispatch_id=1)
+    assert recorder.calls == []
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM review_dispatches WHERE task_id=?", (task_id,)
+    )
+    assert rows == []
+
+    red = [c for c in await _card(db, task_id) if "ревью не куплено" in c.lower()]
+    assert len(red) == 1, "одно событие на сдачу, не на каждый триггер"
+    assert "CI красный" in red[0]
+    assert "mutations" in red[0] and "validation" in red[0]
+    assert "lint" not in red[0] and "types" not in red[0]
+    [event] = await _events(db, "review_withheld_red_ci")
+    assert event["failed"] == ["mutations", "validation"]
+    assert event["sha"] == _TIP
+
+
+async def test_projects_without_ci_and_human_requests_are_ordered_as_before(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-4: проект, у которого хаб CI не видит, — заказ сразу.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-asis"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+    plain = await _submitted(client, db, "no-ci-project")
+    assert len(recorder.calls) == 1
+    assert not [c for c in await _card(db, plain) if "ждёт CI" in c]
+
+    # Ручной запрос человека: ни отсутствие отчёта, ни красный CI его не держат.
+    await _submitted(
+        client, db, "asked-no-report", ci_reports=_PROJECT_HAS_CI, override="require"
+    )
+    assert len(recorder.calls) == 2
+    await _submitted(
+        client,
+        db,
+        "asked-red",
+        ci_reports=[{"validation_status": "fail", "checks": {"tests": "fail"}}],
+        override="require",
+    )
+    assert len(recorder.calls) == 3
+
+
+async def test_a_submission_without_ci_report_is_ordered_now_and_says_so(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2: проект с CI, отчёта о закреплённом sha к сдаче нет — заказ сразу,
+    # как до задачи, и это названо в ленте одной строкой.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-now"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "no-report", ci_reports=_PROJECT_HAS_CI)
+    assert len(recorder.calls) == 1, "отчёта нет — заказ сразу, не ожидание"
+
+    # Лестница по той же сдаче снова проходит условие — строка не повторяется.
+    await maybe_dispatch_review(db, task_id, force_profile=DEEP)
+    lines = [
+        c for c in await _card(db, task_id) if "без отчёта CI о закреплённом sha" in c
+    ]
+    assert len(lines) == 1
+    assert _TIP[:12] in lines[0]
+    [event] = await _events(db, "review_ordered_without_ci")
+    assert event["generation"] == 1 and event["sha"] == _TIP
+
+    # Зелёный отчёт на закреплённом sha (находка 30d8d47c25e52e26): один
+    # заказ, строка заказа, и ни события о красном, ни строки «без отчёта».
+    before = len(recorder.calls)
+    green = await _submitted(
+        client, db, "green-pinned", ci_reports=[{"validation_status": "pass"}]
+    )
+    assert len(recorder.calls) == before + 1
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM review_dispatches WHERE task_id=?", (green,)
+    )
+    assert len(rows) == 1
+    silent = await db.execute_fetchall(
+        "SELECT 1 FROM events WHERE task_id=? AND kind IN "
+        "('review_withheld_red_ci', 'review_ordered_without_ci')",
+        (green,),
+    )
+    assert silent == []
+
+
+async def test_a_late_ci_report_orders_nothing(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3: отложенного пути нет — ни приём отчёта CI, ни поллер ревью не
+    # заказывают; событие о красном остаётся одним.
+    from hub.services.ci_report import accept_ci_run_report
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-late"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+
+    async def _no_run(agent_id, run_id=None):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _no_run)
+    red = await _submitted(
+        client,
+        db,
+        "late-green",
+        ci_reports=[{"validation_status": "fail", "checks": {"tests": "fail"}}],
+    )
+    ordered = await _submitted(client, db, "late-any", ci_reports=_PROJECT_HAS_CI)
+    assert len(recorder.calls) == 1, "заказ только у сдачи без отчёта"
+
+    for task_id, status in ((red, "pass"), (ordered, "pass"), (ordered, "fail")):
+        await accept_ci_run_report(
+            db,
+            task_id,
+            head_sha=_TIP,
+            ac_results={},
+            validation_status=status,
+            checks={"tests": status},
+        )
+        for _ in range(3):
+            await sweep_review_dispatches(db)
+    assert len(recorder.calls) == 1, "поздний отчёт CI заказа не ставит"
+    # Находки 64ac296015b7d20d и c609380e10b71078: заказ без CI, поздний
+    # красный отчёт — добор deep не покупается, и отказ назван добору одним
+    # событием, а не вторым «ревью не куплено».
+    before = len(recorder.calls)
+    for _ in range(2):
+        assert not await maybe_dispatch_review(db, ordered, force_profile=DEEP)
+    assert len(recorder.calls) == before, "добор на красном не покупается"
+    [topup] = await _events(db, "review_topup_withheld_red_ci")
+    assert topup["failed"] == ["tests", "validation"]
+    assert [c for c in await _card(db, ordered) if "Добор ревью не куплен" in c]
+    red_events = [e for e in await _events(db, "review_withheld_red_ci")]
+    assert len(red_events) == 1, "событие о красном — одно на сдачу"
+
+
+# --- #1432: круг ревью останавливает покупку deep ----------------------------
+#
+# #1405 прошла пять deep подряд (отчёты #635, #637, #640, #641, #642), каждый с
+# новыми находками, а круг показывал laps=1: у #640 исходы не названы, и
+# неназванный исход обрывал цепь. Порог круга только писал алерт — следующая
+# пересдача снова покупала deep.
+
+_CIRCLE_LAYERS = [
+    (
+        [
+            _confirmed("гонка на записи", "concurrency", 10),
+            _confirmed("код возврата", "error-handling", 12),
+            _confirmed("утечка дескриптора", "resource-leak", 14),
+        ],
+        [],
+    ),
+    (
+        [
+            _confirmed("мутация выжила", "test-adequacy", 20),
+            _confirmed("граница окна", "boundary", 22),
+        ],
+        [],
+    ),
+    ([_confirmed("дедуп по тексту", "idempotency", 30)], []),
+]
+_CIRCLE_STOP_REASON = "deep приостановлен до решения человека"
+
+
+async def _circle_resubmission(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    monkeypatch,
+    slug: str,
+    unreadable: bool = False,
+    **submitted: object,
+) -> tuple[int, _DispatchRecorder]:
+    """Сдача 4 после двух заходов круга (1→2, 2→3), дифф — процессная
+    поверхность: правило без круга дало бы deep. Возвращает задачу и
+    подставку провайдера, через которую прошли все заказы."""
+    recorder = _DispatchRecorder({"agent": {"id": f"bc-{slug}"}, "run": {"id": slug}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, slug, diff=_DIFF_506, **submitted)  # type: ignore[arg-type]
+    await _walk_the_circle(db, task_id, _CIRCLE_LAYERS)
+    sha = "d" * 40
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 4, submission_sha = ? WHERE id = ?",
+        (sha, task_id),
+    )
+    await repo.record_submission(
+        db, task_id=task_id, generation=4, sha=sha, base_branch="develop"
+    )
+    await db.commit()
+    if unreadable:
+        plugins.git_ops = _UnreadableGitOps(_TIP, ["docs/notes.md"])
+    await maybe_dispatch_review(db, task_id)
+    return task_id, recorder
+
+
+class _UnreadableGitOps(_PinnedGitOps):
+    async def branch_diff(self, repo, base, branch):
+        raise RuntimeError("git недоступен")
+
+
+async def _generation_reasons(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> list[str]:
+    rows = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE kind='review_dispatched' AND task_id=?",
+        (task_id,),
+    )
+    payloads = [json.loads(r[0]) for r in rows]
+    mine = [p for p in payloads if p.get("generation") == generation]
+    assert mine, payloads
+    return list(mine[-1]["profile_reasons"])
+
+
+async def _stop_alerts(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return [c for c in await _card(db, task_id) if "Круг ревью остановил deep" in c]
+
+
+async def _stop_events(db: aiosqlite.Connection, task_id: int) -> list[dict]:
+    return [
+        json.loads(dict(r)["payload"])
+        for r in await repo.list_events(
+            db, since=0, kinds=["review_circle_deep_stopped"], limit=50
+        )
+        if dict(r)["task_id"] == task_id
+    ]
+
+
+async def test_a_circle_at_the_stop_threshold_buys_lite_not_deep(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1432): два захода, порог остановки 2 — пересдача, которой
+    правило дало бы deep, уходит провайдеру lite; причина и отменённый повод
+    названы; в ленте один алерт с тремя исходами и способом снять."""
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_DEEP_STOP", "2")
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+
+    task_id, recorder = await _circle_resubmission(
+        client, db, monkeypatch, "circle-stop"
+    )
+
+    from hub.services.review_dispatch import announce_circle_deep_stop, review_circle
+
+    assert (await review_circle(db, task_id)).count == 2, "предпосылка: два захода"
+    rows = await _rows_of(db, task_id)
+    assert rows[0]["profile"] == "deep", "предпосылка: правило даёт этому диффу deep"
+    assert [(r["submission_generation"], r["profile"]) for r in rows[1:]] == [
+        (4, "lite")
+    ], rows
+    assert len(recorder.calls) == 2, "провайдеру ушёл ровно один заказ сдачи 4"
+
+    reasons = await _generation_reasons(db, task_id, 4)
+    assert f"круг: 2 захода, {_CIRCLE_STOP_REASON}" in reasons, reasons
+    cancelled = [r for r in reasons if r.startswith("отменён повод deep:")]
+    assert cancelled and all("процессная поверхность" in r for r in cancelled), reasons
+
+    [said] = await _stop_alerts(db, task_id)
+    for outcome in ("принять как есть", "отпустить", "продолжать"):
+        assert outcome in said, said
+    assert "machine_review_override=require" in said, "назван способ снять"
+    assert "Ревью не выключено" in said
+    assert [e["generation"] for e in await _stop_events(db, task_id)] == [4]
+
+    # Дедуп — по событию, а не по тексту карточки: запись стёрта, событие
+    # осталось — второй алерт на то же поколение не пишется.
+    await db.execute(
+        "DELETE FROM task_updates WHERE task_id=? AND content LIKE ?",
+        (task_id, "%Круг ревью остановил deep%"),
+    )
+    await db.commit()
+    await announce_circle_deep_stop(db, task_id, 4, 2, 2)
+    assert await _stop_alerts(db, task_id) == []
+    assert len(await _stop_events(db, task_id)) == 1
+
+    # Находка 3c1089ccae171db0: непрочитанный дифф — тоже deep по правилу, и
+    # остановка действует и на него.
+    blind, _ = await _circle_resubmission(
+        client, db, monkeypatch, "circle-stop-blind", unreadable=True
+    )
+    assert [r["profile"] for r in await _rows_of(db, blind)] == ["deep", "lite"]
+    assert "отменён повод deep: дифф сдачи прочитать не удалось" in (
+        await _generation_reasons(db, blind, 4)
+    )
+    assert len(await _stop_alerts(db, blind)) == 1
+
+
+async def test_unnamed_outcomes_do_not_reset_the_circle(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1432): исходы поколения не названы (как у отчёта #640 задачи
+    #1405) — цепь не рвётся, заход засчитан. Явный отказ по ЧАСТИ находок
+    цепь тоже не рвёт; явный отказ по ВСЕМ — рвёт."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-unn"}, "run": {"id": "r-unn"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_THRESHOLD", 3)
+    from hub.services.review_dispatch import review_circle
+
+    task_id = await _submitted(client, db, "circle-unnamed")
+    layer1, layer2, layer3 = (c for c, _ in _CIRCLE_LAYERS)
+    layer4 = [_confirmed("новый слой", "concurrency", 40)]
+    first = await _generation_with_findings(db, task_id, 1, confirmed=layer1)
+    await _author_closed_them(db, task_id, first, 1, confirmed=layer1, unresolved=[])
+    second = await _generation_with_findings(db, task_id, 2, confirmed=layer2)
+    # Поколение 2: исходы не названы вовсе (режим warn на сдаче).
+    third = await _generation_with_findings(db, task_id, 3, confirmed=layer3)
+
+    circle = await review_circle(db, task_id)
+    assert circle.count == 2, (
+        "неназванный исход — «неизвестно», а не «не закрыто»: цепь 1→2→3 цела",
+        circle.breakdown(),
+    )
+    assert circle.laps[-1].closed == 0, "закрытым правкой не названо ничего"
+    # Находка c3ee4a6426933f4d: алерт не утверждает правок, которых не было.
+    from hub.services.review_dispatch import announce_circle_deep_stop
+
+    assert await announce_circle_deep_stop(db, task_id, 3, 2, 2)
+    [said] = await _stop_alerts(db, task_id)
+    assert "заход 1 (сдача 2): закрыто 3, пришло новых 2" in said, said
+    assert "заход 2 (сдача 3): закрытий правкой не названо, пришло новых 1" in said
+    assert "закрывались" not in said
+
+    # Часть находок поколения 2 объявлена ложной, часть — нет: не отказ по всем.
+    await _author_closed_them(
+        db,
+        task_id,
+        second,
+        2,
+        confirmed=layer2[:1],
+        unresolved=[],
+        outcome_confirmed="false_positive",
+    )
+    assert (await review_circle(db, task_id)).count == 2, "отказ по части цепь не рвёт"
+    # Находка a5c6984b7a76cdfc: остальное отложено (deferred) — дефект признан
+    # настоящим, это не отказ; вместе с false_positive цепь по-прежнему цела.
+    await _author_closed_them(
+        db,
+        task_id,
+        second,
+        2,
+        confirmed=layer2[1:],
+        unresolved=[],
+        outcome_confirmed="deferred",
+    )
+    assert (await review_circle(db, task_id)).count == 2, "deferred цепь не рвёт"
+
+    # Все находки поколения 3 — явный отказ: цепь обрывается на 3→4.
+    await _author_closed_them(
+        db,
+        task_id,
+        third,
+        3,
+        confirmed=layer3,
+        unresolved=[],
+        outcome_confirmed="wont_fix",
+    )
+    await _generation_with_findings(db, task_id, 4, confirmed=layer4)
+    assert (await review_circle(db, task_id)).count == 0, (
+        "все исходы поколения — явный отказ: это не заход"
+    )
+
+
+async def test_the_ladder_does_not_buy_deep_past_a_stopped_circle(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1432): остановка стоит — добор лестницы (#879) после неполного
+    lite и переспрос другой моделью (#1243) deep не заказывают, причина
+    названа, алерт об остановке по-прежнему один."""
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_DEEP_STOP", "2")
+    task_id, recorder = await _circle_resubmission(
+        client, db, monkeypatch, "circle-ladder"
+    )
+    assert [r["profile"] for r in await _rows_of(db, task_id)] == ["deep", "lite"]
+    calls = len(recorder.calls)
+
+    await _machine_report(client, task_id, incomplete=True)
+
+    assert len(recorder.calls) == calls, "добор deep при остановке не куплен"
+    assert [r["profile"] for r in await _rows_of(db, task_id)] == ["deep", "lite"]
+    card = await _card(db, task_id)
+    assert any("добор не куплен" in c and _CIRCLE_STOP_REASON in c for c in card), card
+
+    assert not await maybe_dispatch_review(
+        db, task_id, force_profile=DEEP, force_model="gpt-5.3-codex"
+    )
+    assert len(recorder.calls) == calls, "вторая ось остановку не обходит"
+    assert any(
+        "переспрос другой моделью не куплен" in c and _CIRCLE_STOP_REASON in c
+        for c in await _card(db, task_id)
+    )
+    assert len(await _stop_alerts(db, task_id)) == 1
+    assert len(await _stop_events(db, task_id)) == 1
+
+
+async def test_human_request_security_and_zero_threshold_keep_deep(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4 (#1432): ручной запрос человека, заявленный security, порог 0
+    (конфиг или ключ проекта) и нечитаемый порог — deep как до задачи."""
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_DEEP_STOP", "2")
+    security = [{"kind": "security", "severity": "low", "description": "d"}]
+    cases = {
+        "human": await _circle_resubmission(
+            client, db, monkeypatch, "circle-human", override="require"
+        ),
+        "security": await _circle_resubmission(
+            client, db, monkeypatch, "circle-security", risks=security
+        ),
+        "project-zero": await _circle_resubmission(
+            client,
+            db,
+            monkeypatch,
+            "circle-project-zero",
+            policy={"verdict": "auto", "circle_deep_stop": 0},
+        ),
+        "project-unreadable": await _circle_resubmission(
+            client,
+            db,
+            monkeypatch,
+            "circle-project-bad",
+            policy={"verdict": "auto", "circle_deep_stop": "2"},
+        ),
+    }
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_DEEP_STOP", "0")
+    cases["zero"] = await _circle_resubmission(client, db, monkeypatch, "circle-zero")
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_DEEP_STOP", "два")
+    cases["unreadable"] = await _circle_resubmission(
+        client, db, monkeypatch, "circle-unreadable"
+    )
+
+    for name, (task_id, _) in cases.items():
+        rows = await _rows_of(db, task_id)
+        assert [(r["submission_generation"], r["profile"]) for r in rows] == [
+            (1, "deep"),
+            (4, "deep"),
+        ], (name, rows)
+        reasons = await _generation_reasons(db, task_id, 4)
+        assert not any(_CIRCLE_STOP_REASON in r for r in reasons), (name, reasons)
+        assert await _stop_alerts(db, task_id) == [], name
+
+    # Добор и вторая ось: ручной запрос и security остановкой не режутся.
+    from hub.services.review_dispatch import _forced_deep_past_circle
+
+    monkeypatch.setattr(config, "REVIEW_CIRCLE_DEEP_STOP", "2")
+    for name in ("human", "security"):
+        task = dict(await repo.get_task(db, cases[name][0]))
+        assert await _forced_deep_past_circle(db, task, DEEP, "") is False, name
+        assert not [c for c in await _card(db, task["id"]) if "не заказан" in c]
+
+    from hub.models import validated_gate_policy
+
+    assert validated_gate_policy({"circle_deep_stop": 3}) == {"circle_deep_stop": 3}
+    for bad in (-1, True, "2"):
+        with pytest.raises(ValueError, match="circle_deep_stop"):
+            validated_gate_policy({"circle_deep_stop": bad})

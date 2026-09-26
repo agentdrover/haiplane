@@ -340,6 +340,9 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # executor_launch.launch_mode_of и _observation_missing.
     "executor_launch",
     "executor_push_rights_task",
+    # #1432: число заходов круга, с которого deep приостановлен до решения
+    # человека. Не гейт. Читатель: review_dispatch.circle_deep_stop_of.
+    "circle_deep_stop",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -2453,6 +2456,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_executor_launch(v)
     _validate_count(v, "deep_daily_cap")
     _validate_count(v, "small_delta_lines")
+    _validate_count(v, "circle_deep_stop")
     return v
 
 
