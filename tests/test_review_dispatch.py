@@ -14172,3 +14172,116 @@ async def test_projects_without_ci_and_human_requests_are_ordered_as_before(
         override="require",
     )
     assert len(recorder.calls) == 3
+
+
+async def test_a_green_rerun_of_a_red_sha_orders_the_review(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # Находка a9afb5ea8b295634: красный → зелёный перепрогон того же sha.
+    from hub.services.ci_report import accept_ci_run_report
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-rerun"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+
+    async def _no_run(agent_id, run_id=None):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _no_run)
+    red = [{"validation_status": "fail", "checks": {"tests": "fail"}}]
+
+    # Приём зелёного отчёта ставит заказ.
+    task_id = await _submitted(client, db, "rerun-accept", ci_reports=red)
+    assert recorder.calls == []
+    await accept_ci_run_report(
+        db, task_id, head_sha=_TIP, ac_results={}, validation_status="pass"
+    )
+    assert len(recorder.calls) == 1
+    await sweep_review_dispatches(db)
+    assert len(recorder.calls) == 1, "свип второго заказа не покупает"
+
+    # Приём не довёл заказ (отчёт лёг мимо него) — свип подбирает сам.
+    swept = await _submitted(client, db, "rerun-sweep", ci_reports=red)
+    assert len(recorder.calls) == 1
+    await _ci_report(db, swept, validation_status="pass")
+    await db.commit()
+    await sweep_review_dispatches(db)
+    assert len(recorder.calls) == 2
+
+
+async def test_a_failed_create_keeps_the_deferred_order_for_the_sweep(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # Находка 51b3163a19adc1cf: отложенный заказ снимается только заказом.
+    from hub.services import review_ci_gate
+    from hub.services.ci_report import accept_ci_run_report
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-retry"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+
+    async def _no_run(agent_id, run_id=None):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _no_run)
+    monkeypatch.setattr(review_ci_gate, "ORDER_RETRY_PAUSE_MINUTES", 0)
+    task_id = await _submitted(client, db, "retry-order", ci_reports=_PROJECT_HAS_CI)
+
+    # Вызов не состоялся: настройки облака нет — заказа нет, строки нет.
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "")
+    await accept_ci_run_report(
+        db, task_id, head_sha=_TIP, ac_results={}, validation_status="pass"
+    )
+    assert recorder.calls == []
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "reviewer-token")
+    await sweep_review_dispatches(db)
+    assert len(recorder.calls) == 1, "отложенный заказ не потерян"
+
+    # Повторы ограничены: вызов, который не встаёт, не зовётся на каждом тике.
+    stuck = await _submitted(client, db, "stuck-order", ci_reports=_PROJECT_HAS_CI)
+    monkeypatch.setattr(config, "CURSOR_REVIEWER_HUB_TOKEN", "")
+    await _ci_report(db, stuck, validation_status="pass")
+    await db.commit()
+    for _ in range(6):
+        await sweep_review_dispatches(db)
+    card = await _card(db, stuck)
+    config_alerts = [c for c in card if "не хватает конфигурации" in c]
+    assert len(config_alerts) == review_ci_gate.ORDER_ATTEMPTS
+    assert len([c for c in card if "заказ ревью не поставлен" in c]) == 1
+    assert len(recorder.calls) == 1
+
+
+async def test_free_text_resembling_a_mark_does_not_silence_the_order(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # Находка c6073282c3ad0636: состояние заказа — не текст ленты.
+    from hub.services.ci_report import accept_ci_run_report
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-text"}, "run": {"id": "r"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "text-mark", ci_reports=_PROJECT_HAS_CI)
+    for text in (
+        "[CI зелёный, ревью заказывается: сдача 1]",
+        "[ревью ждёт CI, CI нет: сдача 1]",
+        "Событие «ревью ждёт CI, CI нет» (сдача 1) — цитирую ленту",
+    ):
+        await repo.add_task_update(db, task_id, "dev", "status", text)
+    await db.commit()
+    await accept_ci_run_report(
+        db, task_id, head_sha=_TIP, ac_results={}, validation_status="pass"
+    )
+    assert len(recorder.calls) == 1
+
+    # И чужая запись с текстом красной метки не глушит событие о красном.
+    red = await _submitted(client, db, "text-red", ci_reports=_PROJECT_HAS_CI)
+    await repo.add_task_update(
+        db, red, "dev", "status", "[ревью не куплено, CI красный: сдача 1]"
+    )
+    await db.commit()
+    await accept_ci_run_report(
+        db,
+        red,
+        head_sha=_TIP,
+        ac_results={},
+        validation_status="fail",
+        checks={"tests": "fail"},
+    )
+    assert len(await _events(db, "review_withheld_red_ci")) == 1

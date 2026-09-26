@@ -25,9 +25,20 @@
 - ``machine_review_override=require`` — ручной запрос человека: условие его
   не останавливает.
 
-Отчёт о ДРУГОМ коммите не считается отчётом о закреплённом. Каждое событие
-пишется один раз на сдачу — по метке с номером поколения в тексте, как
-NO_REVIEWER_MARK (#1216): поллер проходит по карточке снова и снова (#1330).
+Отчёт о ДРУГОМ коммите не считается отчётом о закреплённом.
+
+Состояние отложенного заказа хранится СТРУКТУРНО — в таблице events, с номером
+поколения в payload (находка c6073282c3ad0636), а не метками в тексте ленты:
+текст ленты пишут все, и чужая запись с похожими словами глушила бы покупку.
+events пишет только код хаба. Запись в карточке остаётся — для человека, но
+решение по ней не принимается. Каждое событие — один раз на сдачу: поллер
+проходит по задаче снова и снова (#1330).
+
+Отложенный заказ снимается только ЗАКАЗОМ — строкой review_dispatches или
+отчётом этой сдачи (находка 51b3163a19adc1cf). Вызов, который не встал
+(нет настройки, сбой подготовки), оставляет заказ в ожидании, и свип
+повторяет его — не чаще ORDER_RETRY_PAUSE_MINUTES и не больше ORDER_ATTEMPTS
+раз, после чего одно событие отдаёт решение человеку.
 """
 
 from __future__ import annotations
@@ -55,22 +66,24 @@ OVERDUE = "overdue"
 NO_CI = "no_ci"
 REQUESTED = "requested"
 
-#: Метки событий. Номер поколения внутри — дедуп в пределах сдачи; префиксы
-#: отдельно, потому что свип ищет их в SQL для всех задач разом.
-WAIT_PREFIX = "[ревью ждёт CI: сдача "
-RED_PREFIX = "[ревью не куплено, CI красный: сдача "
-MISSING_PREFIX = "[ревью ждёт CI, CI нет: сдача "
-GREEN_PREFIX = "[CI зелёный, ревью заказывается: сдача "
-
+WAIT_EVENT = "review_ci_wait"
 RED_EVENT = "review_withheld_red_ci"
 MISSING_EVENT = "review_ci_missing"
+GREEN_EVENT = "review_ci_green"
+ATTEMPT_EVENT = "review_ci_order_attempt"
+EXHAUSTED_EVENT = "review_ci_order_exhausted"
+#: Заказ сдачи отложен: ждал отчёта или стоял на красном.
+DEFERRED_EVENTS = (WAIT_EVENT, RED_EVENT)
+
+#: Потолок и пауза повторов отложенного заказа, который не встал (#1405).
+#: Образец — переспрос #1242: два повтора сверх первого, пауза 10 минут.
+ORDER_ATTEMPTS = 3
+ORDER_RETRY_PAUSE_MINUTES = 10
 
 #: Имя провала валидационных команд среди упавших проверок.
 VALIDATION_CHECK = "validation"
 
-
-def mark(prefix: str, generation: int) -> str:
-    return f"{prefix}{generation}]"
+_OF_GENERATION = "json_extract(payload, '$.generation') = ?"
 
 
 @dataclass(frozen=True)
@@ -161,30 +174,47 @@ async def ci_standing(
     return CiStanding(PENDING, sha)
 
 
-async def _marked(db: aiosqlite.Connection, task_id: int, text: str) -> bool:
-    rows = await fetchall(
-        db,
-        "SELECT 1 FROM task_updates WHERE task_id=? AND content LIKE ? LIMIT 1",
-        (task_id, f"%{text}%"),
+async def _events_of(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    kinds: tuple[str, ...],
+    within_minutes: int | None = None,
+) -> int:
+    """Сколько событий этих видов у сдачи — по полю поколения, не по тексту."""
+    marks = ", ".join("?" for _ in kinds)
+    sql = (
+        # Вставляются только плейсхолдеры и константа; значения — параметры.
+        f"SELECT COUNT(*) AS n FROM events WHERE task_id=? AND kind IN ({marks}) "  # nosec B608
+        f"AND {_OF_GENERATION}"
     )
-    return bool(rows)
+    params: list[Any] = [task_id, *kinds, generation]
+    if within_minutes is not None:
+        sql += " AND created_at > datetime('now', ?)"
+        params.append(f"-{within_minutes} minutes")
+    rows = await fetchall(db, sql, tuple(params))
+    return int(rows[0]["n"]) if rows else 0
 
 
 async def _say_once(
     db: aiosqlite.Connection,
     task_id: int,
-    tag: str,
-    kind: str,
-    text: str,
-    event: tuple[str, dict[str, Any]] | None = None,
+    generation: int,
+    event: tuple[str, dict[str, Any]],
+    update: tuple[str, str],
 ) -> None:
-    if await _marked(db, task_id, tag):
+    """Событие и запись в карточке — один раз на сдачу, по событию."""
+    kind, payload = event
+    if await _events_of(db, task_id, generation, (kind,)):
         return
-    await repo.add_task_update(db, task_id, "hub", kind, f"{tag} {text}")
-    if event is not None:
-        await repo.insert_event(
-            db, kind=event[0], task_id=task_id, actor="policy", payload=event[1]
-        )
+    await repo.add_task_update(db, task_id, "hub", update[0], update[1])
+    await repo.insert_event(
+        db,
+        kind=kind,
+        task_id=task_id,
+        actor="policy",
+        payload={"generation": generation, **payload},
+    )
     await db.commit()
 
 
@@ -197,24 +227,19 @@ async def review_may_be_bought(
     generation = int(task.get("submission_generation") or 0)
     sha12 = standing.sha[:12]
     if standing.verdict == RED:
-        names = ", ".join(standing.failed)
         await _say_once(
             db,
             task_id,
-            mark(RED_PREFIX, generation),
-            "alert",
-            f"Ревью не куплено: CI красный на закреплённом коммите {sha12} — "
-            f"упали: {names}. Сдача принята, но прогон ревью на ней не "
-            "покупается: исправьте и пересдайте — на зелёном CI ревью "
-            "закажется как обычно. Запросить ревью вопреки этому может "
-            "человек (machine_review_override=require) (#1405).",
+            generation,
+            (RED_EVENT, {"sha": standing.sha, "failed": list(standing.failed)}),
             (
-                RED_EVENT,
-                {
-                    "generation": generation,
-                    "sha": standing.sha,
-                    "failed": list(standing.failed),
-                },
+                "alert",
+                f"Ревью не куплено: CI красный на закреплённом коммите {sha12} "
+                f"(сдача {generation}) — упали: {', '.join(standing.failed)}. "
+                "Сдача принята, но прогон ревью на ней не покупается: "
+                "исправьте и пересдайте — на зелёном CI ревью закажется как "
+                "обычно. Запросить ревью вопреки этому может человек "
+                "(machine_review_override=require) (#1405).",
             ),
         )
         return False
@@ -222,14 +247,17 @@ async def review_may_be_bought(
         await _say_once(
             db,
             task_id,
-            mark(WAIT_PREFIX, generation),
-            "status",
-            f"Отчёта CI о закреплённом коммите {sha12} ещё нет, а CI у проекта "
-            "хаб видит: прогон ревью не покупается, пока CI не отчитается. "
-            "Зелёный отчёт закажет ревью сразу, красный — нет. Потолок "
-            f"ожидания {config.REVIEW_CI_WAIT_MINUTES} мин "
-            "(REVIEW_CI_WAIT_MINUTES): после него хаб назовёт это и закажет "
-            "ревью без CI (#1405).",
+            generation,
+            (WAIT_EVENT, {"sha": standing.sha}),
+            (
+                "status",
+                f"Событие «ревью ждёт CI» (сдача {generation}): отчёта о закреплённом "
+                f"коммите {sha12} ещё не пришло, а CI у проекта хаб видит — "
+                "прогон ревью не покупается, пока CI не отчитается. Зелёный "
+                "отчёт закажет ревью сразу, красный — нет. Потолок ожидания "
+                f"{config.REVIEW_CI_WAIT_MINUTES} мин (REVIEW_CI_WAIT_MINUTES): "
+                "после него хаб назовёт это и закажет ревью без CI (#1405).",
+            ),
         )
         return False
     if standing.verdict == OVERDUE:
@@ -237,56 +265,79 @@ async def review_may_be_bought(
         await _say_once(
             db,
             task_id,
-            mark(MISSING_PREFIX, generation),
-            "alert",
-            f"За {config.REVIEW_CI_WAIT_MINUTES} мин CI не дал отчёта о "
-            f"закреплённом коммите {sha12}: {reason}. Ревью заказывается без "
-            "CI, чтобы сдача не стояла без второго читателя; если так часто — "
-            "сломан путь отчёта CI (hub-ci-report) (#1405).",
+            generation,
             (
                 MISSING_EVENT,
                 {
-                    "generation": generation,
                     "sha": standing.sha,
                     "waited_minutes": config.REVIEW_CI_WAIT_MINUTES,
                     "reason": reason,
                 },
+            ),
+            (
+                "alert",
+                f"Событие «ревью ждёт CI, CI нет» (сдача {generation}): за "
+                f"{config.REVIEW_CI_WAIT_MINUTES} мин CI не дал отчёта о "
+                f"закреплённом коммите {sha12}: {reason}. Ревью заказывается "
+                "без CI, чтобы сдача не стояла без второго читателя; если так "
+                "часто — сломан путь отчёта CI (hub-ci-report) (#1405).",
             ),
         )
     elif standing.verdict == GREEN and await _deferred(db, task_id, generation):
         await _say_once(
             db,
             task_id,
-            mark(GREEN_PREFIX, generation),
-            "status",
-            f"CI отчитался о закреплённом коммите {sha12} "
-            f"(validation={standing.validation or 'не названа'}): упавших "
-            "проверок нет, отложенный заказ ревью ставится (#1405).",
+            generation,
+            (GREEN_EVENT, {"sha": standing.sha, "validation": standing.validation}),
+            (
+                "status",
+                f"CI отчитался о закреплённом коммите {sha12} (сдача "
+                f"{generation}, validation={standing.validation or 'не названа'}"
+                "): упавших проверок нет, отложенный заказ ревью ставится "
+                "(#1405).",
+            ),
         )
     return True
 
 
 async def _deferred(db: aiosqlite.Connection, task_id: int, generation: int) -> bool:
     """Заказ этой сдачи был отложен: ждал отчёта или стоял на красном."""
-    return await _marked(db, task_id, mark(WAIT_PREFIX, generation)) or (
-        await _marked(db, task_id, mark(RED_PREFIX, generation))
+    return bool(await _events_of(db, task_id, generation, DEFERRED_EVENTS))
+
+
+async def _ordered(db: aiosqlite.Connection, task_id: int, generation: int) -> bool:
+    """Заказ сдачи состоялся: строка заказа или отчёт этой сдачи.
+
+    Только это снимает отложенный заказ (находка 51b3163a19adc1cf). Событие
+    «CI зелёный» пишется ДО вызова провайдера и заказом не является.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM review_dispatches WHERE task_id=? "
+        "AND submission_generation=? LIMIT 1",
+        (task_id, generation),
     )
+    if rows:
+        return True
+    return bool(await repo.machine_reviews_of_generation(db, task_id, generation))
 
 
-async def _settled(db: aiosqlite.Connection, task_id: int, generation: int) -> bool:
-    """Отложенный заказ уже снят: зелёным отчётом или потолком ожидания."""
-    return await _marked(db, task_id, mark(GREEN_PREFIX, generation)) or (
-        await _marked(db, task_id, mark(MISSING_PREFIX, generation))
+async def _may_try_again(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> bool:
+    """Пауза между попытками. Потолок попыток держит выборка свипа; приём
+    нового отчёта CI — новое свидетельство и пробует сверх него."""
+    return not await _events_of(
+        db, task_id, generation, (ATTEMPT_EVENT,), ORDER_RETRY_PAUSE_MINUTES
     )
 
 
 async def order_after_ci_report(db: aiosqlite.Connection, task_id: int) -> bool:
-    """Поставить отложенный заказ, когда CI отчитался о закреплённом коммите.
+    """Поставить отложенный заказ, когда CI отчитался или вышел потолок.
 
-    Только для сдачи, заказ которой был отложен и ещё не снят: у остальных
-    ревью уже заказано при сдаче или не заказывается по своей причине, и
-    второй вход в диспетчер им ничего не даст. Двойной заказ при гонке сдачи
-    и приёма отчёта держит бронь #1399 внутри maybe_dispatch_review.
+    Только для сдачи, заказ которой был отложен и ещё не состоялся. Двойной
+    заказ при гонке сдачи и приёма отчёта держит бронь #1399 внутри
+    maybe_dispatch_review.
     """
     row = await repo.get_task(db, task_id)
     if row is None:
@@ -295,21 +346,64 @@ async def order_after_ci_report(db: aiosqlite.Connection, task_id: int) -> bool:
     generation = int(task.get("submission_generation") or 0)
     if task.get("status") != "review" or task.get("review_job_id") or generation <= 0:
         return False
-    if not await _deferred(db, task_id, generation) or await _settled(
+    if not await _deferred(db, task_id, generation) or await _ordered(
         db, task_id, generation
     ):
         return False
+    project = await repo.resolve_project_for_task(db, task_id)
+    if project is None:
+        return False
+    if (await ci_standing(db, task, project)).verdict in (RED, PENDING):
+        # Попыткой это не считается: заказывать нечего. Красный называется
+        # один раз — событием, которое проверяет сам review_may_be_bought.
+        await review_may_be_bought(db, task, project)
+        return False
+    if not await _may_try_again(db, task_id, generation):
+        return False
+    await repo.insert_event(
+        db,
+        kind=ATTEMPT_EVENT,
+        task_id=task_id,
+        actor="policy",
+        payload={"generation": generation},
+    )
+    await db.commit()
     from hub.services.review_dispatch import maybe_dispatch_review
 
-    return await maybe_dispatch_review(db, task_id)
+    if await maybe_dispatch_review(db, task_id):
+        return True
+    await _name_exhausted_order(db, task_id, generation)
+    return False
+
+
+async def _name_exhausted_order(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> None:
+    if await _ordered(db, task_id, generation):
+        return
+    if await _events_of(db, task_id, generation, (ATTEMPT_EVENT,)) < ORDER_ATTEMPTS:
+        return
+    await _say_once(
+        db,
+        task_id,
+        generation,
+        (EXHAUSTED_EVENT, {"attempts": ORDER_ATTEMPTS}),
+        (
+            "alert",
+            f"Отложенный до CI заказ ревью не поставлен (сдача {generation}): "
+            f"{ORDER_ATTEMPTS} попытки не дали заказа, причины — в записях "
+            "выше. Хаб больше не повторяет; решение за человеком (#1405).",
+        ),
+    )
 
 
 async def order_reviews_waiting_for_ci(db: aiosqlite.Connection) -> int:
     """Тик поллера: отложенные заказы, дождавшиеся отчёта или потолка.
 
-    Выбираются только сдачи с меткой ожидания и без снявшей её метки: сдача
-    на красном или уже заказанная сюда не попадает, и тик по ней ничего не
-    пишет. Отчёт, чей приём не довёл заказ до конца, тоже подбирается здесь.
+    Выбираются сдачи с событием отложенного заказа (ожидание ИЛИ красный —
+    зелёный перепрогон того же sha, находка a9afb5ea8b295634), без
+    состоявшегося заказа и с неисчерпанными попытками. Пауза между попытками
+    и красный отчёт отсеиваются в order_after_ci_report без записей.
     """
     rows = await fetchall(
         db,
@@ -317,22 +411,21 @@ async def order_reviews_waiting_for_ci(db: aiosqlite.Connection) -> int:
         "ON s.task_id = t.id AND s.generation = t.submission_generation "
         "WHERE t.status = 'review' AND t.review_job_id IS NULL "
         "AND t.submission_generation > 0 "
-        "AND EXISTS (SELECT 1 FROM task_updates u WHERE u.task_id = t.id "
-        "  AND u.content LIKE '%' || ? || t.submission_generation || ']%') "
-        "AND NOT EXISTS (SELECT 1 FROM task_updates u WHERE u.task_id = t.id "
-        "  AND (u.content LIKE '%' || ? || t.submission_generation || ']%' "
-        "    OR u.content LIKE '%' || ? || t.submission_generation || ']%' "
-        "    OR u.content LIKE '%' || ? || t.submission_generation || ']%')) "
+        "AND EXISTS (SELECT 1 FROM events e WHERE e.task_id = t.id "
+        "  AND e.kind IN (?, ?) "
+        "  AND json_extract(e.payload, '$.generation') = t.submission_generation) "
+        "AND (SELECT COUNT(*) FROM events e WHERE e.task_id = t.id AND e.kind = ? "
+        "  AND json_extract(e.payload, '$.generation') = t.submission_generation"
+        ") < ? "
         "AND NOT EXISTS (SELECT 1 FROM review_dispatches d WHERE d.task_id = t.id "
         "  AND d.submission_generation = t.submission_generation) "
         "AND (s.submitted_at <= datetime('now', ?) OR EXISTS ("
         "  SELECT 1 FROM ci_run_reports c WHERE c.task_id = t.id "
         "  AND c.head_sha = t.submission_sha))",
         (
-            WAIT_PREFIX,
-            RED_PREFIX,
-            GREEN_PREFIX,
-            MISSING_PREFIX,
+            *DEFERRED_EVENTS,
+            ATTEMPT_EVENT,
+            ORDER_ATTEMPTS,
             f"-{config.REVIEW_CI_WAIT_MINUTES} minutes",
         ),
     )

@@ -2283,6 +2283,13 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_executor_runs_cancel_last_at",
         "ALTER TABLE executor_runs ADD COLUMN cancel_last_at TEXT",
     ),
+    (
+        # #1405: состояние отложенного до CI заказа ревью живёт в events
+        # (задача, вид, поколение в payload), и свип поллера читает его на
+        # каждом тике — без индекса это полный проход по ленте событий.
+        "idx_events_task_kind",
+        "CREATE INDEX IF NOT EXISTS idx_events_task_kind ON events(task_id, kind)",
+    ),
 ]
 
 
