@@ -20,7 +20,6 @@ stamps with data instead of discipline.
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import json
 import logging
 import math
@@ -2141,10 +2140,10 @@ async def _policy_and_novelty_allow(
     # and no human.
     if not review_dispatch_enabled(gate_policy_of(project)):
         return False
-    # #1405: прогон покупается только на зелёном CI закреплённого коммита.
+    # #1405: прогон не покупается на красном CI закреплённого коммита.
     # Стоит ДО добора: лестница, вторая ось (#1243) и переспрос (#1242) идут
-    # сюда же и обойти условие не должны. Красный и «CI ещё идёт» — отказ,
-    # о котором карточке говорит сам review_may_be_bought.
+    # сюда же и обойти условие не должны. Отказ называет в карточке сам
+    # review_may_be_bought; отчёта нет — заказ идёт, как до задачи.
     if not await review_ci_gate.review_may_be_bought(db, task, project):
         return False
     if force_profile:
@@ -3039,17 +3038,6 @@ async def _cloud_config_missing(
     return False
 
 
-#: Бронь, взятая ЭТИМ вызовом (#1405, находка ревью сдачи 3). Отложенный
-#: заказ отличает по ней свой слепой исход от чужой брони: бронь без строки
-#: заказа после отказа значит «ответ потерян» только тогда, когда её брал сам
-#: вызывающий. Проигравший гонку видит бронь победителя — это не его дело.
-#: ContextVar, а не возврат maybe_dispatch_review: у той потолок сложности,
-#: а конкурентные пути (приём отчёта, свип, сдача) — разные asyncio-задачи.
-ORDER_CLAIMED_HERE: contextvars.ContextVar[tuple[int, int] | None] = (
-    contextvars.ContextVar("review_order_claimed_here", default=None)
-)
-
-
 async def _claim_the_order(
     db: aiosqlite.Connection,
     task_id: int,
@@ -3075,7 +3063,6 @@ async def _claim_the_order(
     if replaces_dispatch_id is not None or force_model:
         return True
     if await repo.claim_review_order(db, task_id, generation, profile):
-        ORDER_CLAIMED_HERE.set((task_id, generation))
         return True
     log.info(
         "review dispatch for task #%s gen %s (%s) skipped: already ordered",
@@ -4676,8 +4663,6 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     # #1242: переспрос — ДО разбора активных строк. Заказ, закрытый упавшим
     # на этом проходе, переспрашивается на следующем, а не в ту же минуту.
     await _ask_again_lost_reviews(db)
-    # #1405: отложенные до отчёта CI заказы — дождавшиеся отчёта или потолка.
-    await review_ci_gate.order_reviews_waiting_for_ci(db)
     for row in await repo.list_active_review_dispatches(db):
         dispatch = dict(row)
         task_id = dispatch["task_id"]

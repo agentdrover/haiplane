@@ -2290,13 +2290,6 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_events_kind_project "
         "ON events(kind, project_id, id)",
     ),
-    (
-        # #1405: состояние отложенного до CI заказа ревью живёт в events
-        # (задача, вид, поколение в payload), и свип поллера читает его на
-        # каждом тике — без индекса это полный проход по ленте событий.
-        "idx_events_task_kind",
-        "CREATE INDEX IF NOT EXISTS idx_events_task_kind ON events(task_id, kind)",
-    ),
 ]
 
 
