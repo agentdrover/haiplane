@@ -234,6 +234,11 @@ async def test_the_authors_claim_survives_the_dispatch_note(
         checks={"lint": "pass", "security": "pass", "tests": "fail"},
         reported_by="github-actions",
     )
+    # #1405: на красном CI ревью само не покупается; сюда его доводит ручной
+    # запрос человека — единственный путь, где заметка о вызове ложится
+    # поверх сдачи с красным набором.
+    await repo.update_task(db, task_id, machine_review_override="require")
+    await db.commit()
 
     await lifecycle.submit_for_review(
         db, task_id, TaskSubmitReview(model="claude-fable-5", summary=_GREEN_CLAIM)
