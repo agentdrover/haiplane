@@ -1768,16 +1768,28 @@ async def _attach_live_worktree_paths(rows: list[dict[str, Any]]) -> None:
 
 
 async def _release_block_lines() -> list[str]:
-    """«Релиз заблокирован с …» per open alert, from /api/release-blocks."""
+    """«Релиз заблокирован с …» per open alert, from /api/release-blocks.
+
+    A failed read is named, never skipped: an empty section reads as «аварий
+    нет», which is the very silence #1420 exists to end (#516; review
+    326e28d01b4c8d1b).
+    """
     from hub.services.release_alert import release_block_lines
 
+    unknown = "статус аварий релиза не получен: "
     try:
         data = await _api_get("/api/release-blocks")
-    except Exception:  # noqa: BLE001 - context must render without it
-        return []
-    if not isinstance(data, dict):
-        return []
-    return release_block_lines(list(data.get("release_blocks") or []))
+    except HubApiError as exc:
+        return [unknown + str(exc.payload.get("message") or exc)]
+    except Exception as exc:  # noqa: BLE001 - context must render without it
+        return [
+            unknown
+            + (f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
+        ]
+    blocks = data.get("release_blocks") if isinstance(data, dict) else None
+    if not isinstance(blocks, list):
+        return [unknown + "ответ без списка release_blocks"]
+    return release_block_lines(blocks)
 
 
 async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolResult:

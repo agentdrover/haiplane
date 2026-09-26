@@ -463,3 +463,32 @@ async def test_unreadable_since_is_named_not_zero(db):
     assert "0 мин" not in cleared[0]["summary"]
     cur = await db.execute("SELECT payload FROM events WHERE kind='release_unblocked'")
     assert json.loads((await cur.fetchone())[0])["minutes"] is None
+
+
+async def test_my_context_names_failed_release_blocks_fetch():
+    # 326e28d01b4c8d1b: сбой GET /api/release-blocks (сеть, 5xx, битый JSON)
+    # не выглядит как «аварий нет» — общий контекст так и говорит (#516:
+    # молчание ≠ «всё хорошо»).
+    from hub import mcp_server
+
+    failures = [
+        mcp_server.HubApiError({"message": "HTTP 502 Bad Gateway"}),
+        ValueError("Expecting value: line 1 column 1 (char 0)"),
+        "<html>not json</html>",
+        {"detail": "no release_blocks key"},
+    ]
+    for failure in failures:
+
+        async def _answer(path: str, *args, failure=failure, **kwargs):
+            if path == "/api/diagnostics/identity":
+                return {"username": "steward", "role": "agent", "principal_id": 1}
+            if path == "/api/release-blocks":
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+            return {"tasks": [], "next_cursor": None}
+
+        with patch.object(mcp_server, "_api_get", side_effect=_answer):
+            text = _text(await mcp_server.hub_my_context())
+        assert "статус аварий релиза не получен: " in text, (failure, text[:300])
+        assert "Релиз заблокирован" not in text
