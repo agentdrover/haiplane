@@ -195,6 +195,15 @@ EXECUTOR_CEILING_MARGIN_PCT = float(env_get("EXECUTOR_CEILING_MARGIN_PCT", "15")
 # идёт раз в 30 с). В F0 взяла шестая попытка после паузы.
 EXECUTOR_CANCEL_MAX_ATTEMPTS = int(env_get("EXECUTOR_CANCEL_MAX_ATTEMPTS", "10"))
 EXECUTOR_CANCEL_PAUSE_S = int(env_get("EXECUTOR_CANCEL_PAUSE_S", "60"))
+# #1412 (F2.4): модель облачного исполнителя. Пусто — запуск отказывает с
+# причиной: семейство обязано отличаться от ревьюера и стюарда (#758, #1008),
+# и угадывать его хаб не берётся.
+EXECUTOR_MODEL = env_get("EXECUTOR_MODEL", "")
+# Повтор создания агента при 429 и usage_limit_exceeded (F0, 22–24.09): сколько
+# попыток и пауза между ними. Запуск ручной — пауза держит HTTP-запрос
+# человека, поэтому короткая.
+EXECUTOR_LAUNCH_MAX_ATTEMPTS = int(env_get("EXECUTOR_LAUNCH_MAX_ATTEMPTS", "3"))
+EXECUTOR_LAUNCH_PAUSE_S = int(env_get("EXECUTOR_LAUNCH_PAUSE_S", "10"))
 #: Сколько ждать ВОЗМОЖНОСТИ стартовать — отдельно от того, сколько ждать
 #: суждения (#1181). Одно число на два вопроса делало ответ на второй
 #: зависимым от того, как долго не отвечали на первый: на первом прогоне
