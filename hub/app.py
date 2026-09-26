@@ -916,6 +916,82 @@ async def _refuse_unrunnable_review(db, before, fields: dict) -> None:
     )
 
 
+def _merged_gate_policy(
+    before: Any, sent: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, list[str]]]:
+    """Слить присланный кусок gate_policy с сохранённой политикой (#1427).
+
+    PATCH остаётся PATCH и внутри gate_policy, как у полей проекта (#338) и
+    у веб-формы (#886): присланный ключ заменяется, отсутствующий остаётся,
+    ``null`` у ключа удаляет его. Слияние одноуровневое: ``risk_map`` —
+    одно значение, присланная карта заменяет сохранённую целиком.
+
+    Полной замены нет намеренно. Всё, что она умеет, выражается слиянием:
+    ненужные ключи снимаются явным ``null``. А «забытый ключ = удалённый
+    ключ» — ровно та ловушка, которую эта задача закрывает; держать её
+    вторым режимом значит оставить её под флагом.
+
+    Итоговая политика проверяется ЦЕЛИКОМ, и замок #743 смотрит на неё же:
+    кусок может быть чистым, а результат — нет (делегат, лежавший в строке,
+    записался бы заново как одобренный).
+
+    Возвращает (итоговая политика, {"changed": [...], "removed": [...]}).
+    """
+    from hub.models import validated_gate_policy
+
+    stored = project_policy.gate_policy_of(before)
+    merged = {**stored, **{k: v for k, v in sent.items() if v is not None}}
+    for key, value in sent.items():
+        if value is None:
+            merged.pop(key, None)
+    try:
+        merged = validated_gate_policy(merged)
+    except ValueError as exc:
+        raise HTTPException(
+            422,
+            {
+                "error": "gate_policy_invalid",
+                "hint": f"итоговая политика после слияния не проходит проверку: {exc}",
+            },
+        ) from exc
+    # #743: the hub never weakens oversight over itself — the default
+    # project (the hub's own repo) refuses any DELEGATING value at the
+    # gate keys, from any token. The rule lives here rather than in the
+    # model because it needs to know WHICH project is being patched.
+    # #760 keeps the check on the two GATE keys by name: the policy now
+    # also carries a path map and a ceiling, and "any value equals auto"
+    # would quietly start meaning something else as keys are added.
+    #
+    # #1151: сравнение шло ровно со строкой "auto", и появление второго
+    # делегирующего значения сделало бы замок обходимым одним словом —
+    # verdict=steward на default включил бы на репозитории самого хаба
+    # ту автоматику, которую этот замок и запрещает. Теперь читается тот
+    # же перечень, что и у потребителей политики: новый делегат
+    # закрывается здесь в тот же момент, когда открывается там.
+    if before["slug"] == "default" and any(
+        merged.get(gate) in project_policy.DELEGATED_VERDICTS
+        for gate in ("dor", "verdict")
+    ):
+        raise HTTPException(
+            422,
+            {
+                "error": "default_project_gate_locked",
+                "hint": (
+                    "проект default (сам хаб) не принимает делегирование "
+                    "ни на одном гейте — ни автопилоту, ни стюарду; "
+                    "политика default всегда human"
+                ),
+            },
+        )
+    delta = {
+        "changed": sorted(
+            k for k in merged if k not in stored or stored[k] != merged[k]
+        ),
+        "removed": sorted(k for k in stored if k not in merged),
+    }
+    return merged, delta
+
+
 @app.patch("/api/projects/{project_id}", response_model=ProjectView)
 async def api_patch_project(
     project_id: int,
@@ -935,44 +1011,26 @@ async def api_patch_project(
         import json as _json
 
         fields["default_branch_policy"] = _json.dumps(fields["default_branch_policy"])
+    policy_delta: dict[str, list[str]] | None = None
     if "gate_policy" in fields and fields["gate_policy"] is not None:
         import json as _json
 
-        # #743: the hub never weakens oversight over itself — the default
-        # project (the hub's own repo) refuses any DELEGATING value at the
-        # gate keys, from any token. The rule lives here rather than in the
-        # model because it needs to know WHICH project is being patched.
-        # #760 keeps the check on the two GATE keys by name: the policy now
-        # also carries a path map and a ceiling, and "any value equals auto"
-        # would quietly start meaning something else as keys are added.
-        #
-        # #1151: сравнение шло ровно со строкой "auto", и появление второго
-        # делегирующего значения сделало бы замок обходимым одним словом —
-        # verdict=steward на default включил бы на репозитории самого хаба
-        # ту автоматику, которую этот замок и запрещает. Теперь читается тот
-        # же перечень, что и у потребителей политики: новый делегат
-        # закрывается здесь в тот же момент, когда открывается там.
-        if before["slug"] == "default" and any(
-            fields["gate_policy"].get(gate) in project_policy.DELEGATED_VERDICTS
-            for gate in ("dor", "verdict")
-        ):
-            raise HTTPException(
-                422,
-                {
-                    "error": "default_project_gate_locked",
-                    "hint": (
-                        "проект default (сам хаб) не принимает делегирование "
-                        "ни на одном гейте — ни автопилоту, ни стюарду; "
-                        "политика default всегда human"
-                    ),
-                },
-            )
-        fields["gate_policy"] = _json.dumps(fields["gate_policy"])
+        merged, policy_delta = _merged_gate_policy(before, fields["gate_policy"])
+        fields["gate_policy"] = _json.dumps(merged)
     await _refuse_unrunnable_review(db, before, fields)
     if "archived" in fields and fields["archived"] is not None:
         fields["archived"] = int(fields["archived"])
     if fields:
         await repo.update_project(db, project_id, **fields)
+        if policy_delta and (policy_delta["changed"] or policy_delta["removed"]):
+            # Аудит #1427: какие ключи политики изменены и какие удалены.
+            await repo.insert_event(
+                db,
+                kind="project_gate_policy_changed",
+                project_id=project_id,
+                actor="human",
+                payload={"slug": before["slug"], **policy_delta},
+            )
         if fields.get("status") == "active" and before["status"] != "active":
             # Events feed (#349): a pending proposal became a real project.
             await repo.insert_event(

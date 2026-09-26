@@ -2352,6 +2352,65 @@ class ProjectCreate(BaseModel):
         return _validated_forge(v)
 
 
+def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
+    """Проверить политику гейтов проекта целиком (#743, #760, #1427).
+
+    Один читатель на присланный кусок и на итоговую политику после слияния:
+    правило, добавленное сюда, действует на обоих путях сразу. Бросает
+    ``ValueError`` с человеческой причиной.
+    """
+    unknown = set(v) - set(GATE_POLICY_KEYS)
+    if unknown:
+        raise ValueError(
+            f"unknown gate_policy keys: {sorted(unknown)}; "
+            f"allowed: {', '.join(GATE_POLICY_KEYS)}"
+        )
+    # #1151: словарь значений гейта. До этой задачи он был {'human',
+    # 'auto'} буквально, и «verdict=steward» не принимался API вовсе —
+    # то есть рычаг, которым владелец должен переводить пилотный проект
+    # на стюарда, не существовал: политику можно было положить только
+    # прямо в базу, мимо всех проверок. Значения перечислены здесь и
+    # только здесь; делегирующие из них живут в project_policy, и оба
+    # перечня сверяются тестом.
+    from hub.services.project_policy import GATE_VALUES
+
+    bad = {
+        k: val
+        for k, val in v.items()
+        if k in ("dor", "verdict") and val not in GATE_VALUES
+    }
+    if bad:
+        raise ValueError(
+            f"gate_policy values must be one of {sorted(GATE_VALUES)}, got: {bad}"
+        )
+    if "steward_shadow" in v and not isinstance(v["steward_shadow"], bool):
+        # Читатель понимает только true (#835); запись отказывает громко,
+        # чтобы «"true"» строкой не выглядело включённым, ничего не включая.
+        raise ValueError(
+            "gate_policy steward_shadow must be true or false, "
+            f"got: {v['steward_shadow']!r}"
+        )
+    if "review" in v and v["review"] not in REVIEW_POLICY_VALUES:
+        raise ValueError(
+            "gate_policy review must be one of "
+            f"{', '.join(REVIEW_POLICY_VALUES)}, got: {v['review']!r}"
+        )
+    if "dor_max_class" in v:
+        ceiling = v["dor_max_class"]
+        if ceiling not in AUTO_APPROVE_CLASSES:
+            raise ValueError(
+                "gate_policy dor_max_class must be one of "
+                f"{', '.join(AUTO_APPROVE_CLASSES)}, got: {ceiling!r}; "
+                "R2 is not delegable until #585 opens it, R3+ never"
+            )
+    if "risk_map" in v:
+        v["risk_map"] = _validated_risk_map(v["risk_map"])
+    _validate_review_limit(v)
+    _validate_orchestrator_queue(v)
+    _validate_deep_daily_cap(v)
+    return v
+
+
 class ProjectPatch(BaseModel):
     """PATCH semantics: omitted fields stay unchanged (#338).
 
@@ -2387,6 +2446,15 @@ class ProjectPatch(BaseModel):
     @field_validator("gate_policy")
     @classmethod
     def _gate_policy_shape(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Проверить присланный КУСОК политики (#1427).
+
+        PATCH сливает gate_policy с сохранённой по ключам, и ``null`` у ключа
+        значит «удалить его». Поэтому здесь null проходит проверку формы как
+        удаление, а остальные значения проверяются тем же читателем, что и
+        итоговая политика, — ранний отказ называет ошибку в присланном ключе.
+        Итоговая политика после слияния проверяется целиком в app.py
+        (``validated_gate_policy``): кусок может быть чистым, а результат нет.
+        """
         if v is None:
             return v
         unknown = set(v) - set(GATE_POLICY_KEYS)
@@ -2395,50 +2463,10 @@ class ProjectPatch(BaseModel):
                 f"unknown gate_policy keys: {sorted(unknown)}; "
                 f"allowed: {', '.join(GATE_POLICY_KEYS)}"
             )
-        # #1151: словарь значений гейта. До этой задачи он был {'human',
-        # 'auto'} буквально, и «verdict=steward» не принимался API вовсе —
-        # то есть рычаг, которым владелец должен переводить пилотный проект
-        # на стюарда, не существовал: политику можно было положить только
-        # прямо в базу, мимо всех проверок. Значения перечислены здесь и
-        # только здесь; делегирующие из них живут в project_policy, и оба
-        # перечня сверяются тестом.
-        from hub.services.project_policy import GATE_VALUES
-
-        bad = {
-            k: val
-            for k, val in v.items()
-            if k in ("dor", "verdict") and val not in GATE_VALUES
-        }
-        if bad:
-            raise ValueError(
-                f"gate_policy values must be one of {sorted(GATE_VALUES)}, got: {bad}"
-            )
-        if "steward_shadow" in v and not isinstance(v["steward_shadow"], bool):
-            # Читатель понимает только true (#835); запись отказывает громко,
-            # чтобы «"true"» строкой не выглядело включённым, ничего не включая.
-            raise ValueError(
-                "gate_policy steward_shadow must be true or false, "
-                f"got: {v['steward_shadow']!r}"
-            )
-        if "review" in v and v["review"] not in REVIEW_POLICY_VALUES:
-            raise ValueError(
-                "gate_policy review must be one of "
-                f"{', '.join(REVIEW_POLICY_VALUES)}, got: {v['review']!r}"
-            )
-        if "dor_max_class" in v:
-            ceiling = v["dor_max_class"]
-            if ceiling not in AUTO_APPROVE_CLASSES:
-                raise ValueError(
-                    "gate_policy dor_max_class must be one of "
-                    f"{', '.join(AUTO_APPROVE_CLASSES)}, got: {ceiling!r}; "
-                    "R2 is not delegable until #585 opens it, R3+ never"
-                )
-        if "risk_map" in v:
-            v["risk_map"] = _validated_risk_map(v["risk_map"])
-        _validate_review_limit(v)
-        _validate_orchestrator_queue(v)
-        _validate_deep_daily_cap(v)
-        return v
+        sent = validated_gate_policy(
+            {k: val for k, val in v.items() if val is not None}
+        )
+        return {k: (None if v[k] is None else sent[k]) for k in v}
 
     @model_validator(mode="before")
     @classmethod
