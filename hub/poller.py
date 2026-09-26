@@ -1772,6 +1772,22 @@ async def _sweep_stale_worktrees(db) -> None:
         log.exception("worktree retention sweep failed")
 
 
+async def _sweep_parent_rollup(db) -> None:
+    """Закрыть фичи и эпики, все дети которых завершены (#1437).
+
+    Та же починка, что на подъёме приложения (repair_stale_parent_completions),
+    но каждым циклом. Путей к «ребёнок completed» много, и свёртку на каждом
+    может сорвать ошибка, которую изоляция задач поллера глотает без отката.
+    Раньше такой родитель ждал перезапуска хаба, а его зависимые — вместе с
+    ним. Правило #1043 (у родителя своя работа) починка соблюдает сама.
+    """
+    from hub.services.lifecycle import repair_stale_parent_completions
+
+    repaired = await repair_stale_parent_completions(db)
+    if repaired:
+        log.info("Poll: %d parent task(s) rolled up by the sweep", repaired)
+
+
 async def _sweep_sessions_retention(db) -> None:
     # Session registry retention (#771): same reasoning as the feed —
     # the registry answers "who is around now", and a session with no
@@ -2001,6 +2017,21 @@ async def _deliver_pair_task(db, task: dict) -> None:
         payload={"via": "poller_delivery"},
     )
     await db.commit()
+    # #1437: свёртка родителя, как на done-пути. Без неё фича, последнюю
+    # подзадачу которой доставил поллер, ждала перезапуска хаба
+    # (repair_stale_parent_completions), а её зависимые — вместе с ней.
+    # Отдельно от доставки и с откатом: изоляция задач поллера глотает
+    # исключение без отката, и чужой коммит зафиксировал бы полсвёртки
+    # (ревью #1428-го класса, находка сдачи 1). Не свернулось — свип
+    # parent_rollup закроет родителя следующим циклом.
+    from hub.services.lifecycle import maybe_rollup_parent
+
+    try:
+        await maybe_rollup_parent(db, task_id)
+        await db.commit()
+    except Exception:  # noqa: BLE001 - the parent_rollup sweep closes it
+        await db.rollback()
+        log.exception("Poll: parent rollup after #%d failed — sweep retries", task_id)
     log.info("Poll: task #%d delivered and completed without a done report", task_id)
 
 
@@ -2255,6 +2286,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("running_dispatch", _sweep_running_dispatch),
     Sweep("review", _sweep_review),
     Sweep("pair_delivery", _sweep_pair_delivery),
+    Sweep("parent_rollup", _sweep_parent_rollup),
     Sweep("ci_check", _sweep_ci_check),
     Sweep("stale_running", _sweep_stale_running),
     Sweep("stale_statuses", _sweep_stale_statuses),

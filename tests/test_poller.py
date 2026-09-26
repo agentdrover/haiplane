@@ -2685,6 +2685,10 @@ async def test_the_sweep_order_is_pinned(db):
         "running_dispatch",
         "review",
         "pair_delivery",
+        # #1437: свёртка родителей сразу за доставкой — фича, последнюю
+        # подзадачу которой этот проход доставил, закрывается в том же проходе,
+        # и очередь F1 (orchestrator_queue ниже) уже видит её зависимых.
+        "parent_rollup",
         "ci_check",
         "stale_running",
         "stale_statuses",
