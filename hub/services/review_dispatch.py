@@ -1023,15 +1023,17 @@ def pick_review_profile(
     if (task.get("machine_review_override") or "").strip() == "require":
         return DEEP, ["ревью запрошено человеком"]
 
-    # #820: the diff decides before the class does. A missing diff is not a
-    # harmless one — the same rule the ladder uses for "class not computed".
-    if diff is None:
-        return DEEP, ["дифф сдачи прочитать не удалось"]
     try:
         risks = json.loads(task.get("risks") or "[]")
     except ValueError:
         risks = []
-    profile, reasons = _profile_by_rule(task, diff, risks)
+    # #820: the diff decides before the class does. A missing diff is not a
+    # harmless one — the same rule the ladder uses for "class not computed".
+    # #1432: it is still a deep by rule, so the circle stop applies to it.
+    if diff is None:
+        profile, reasons = DEEP, ["дифф сдачи прочитать не удалось"]
+    else:
+        profile, reasons = _profile_by_rule(task, diff, risks)
     if profile != DEEP or _declares_security(risks):
         return profile, reasons
     cancelled = [f"отменён повод deep: {r}" for r in reasons]
@@ -1148,13 +1150,14 @@ async def announce_circle_deep_stop(
     )
     if already:
         return False
+    laps_text = "; ".join((await review_circle(db, task_id)).breakdown())
     await repo.add_task_update(
         db,
         task_id,
         "hub",
         "alert",
-        f"Круг ревью остановил deep: {_laps_phrase(laps)} подряд — находки "
-        f"закрывались, приходили новые (порог остановки {threshold}). До "
+        f"Круг ревью остановил deep: {_laps_phrase(laps)} подряд с новыми "
+        f"находками (порог остановки {threshold}): {laps_text}. До "
         "решения человека пересдачи этой задачи идут на lite, а лестница "
         "добора и переспрос другой моделью deep не докупают. Ревью не "
         "выключено: lite идёт на каждую сдачу. Исходов три: принять как есть, "
@@ -5484,9 +5487,14 @@ class ReviewCircle:
         """По строке на заход: «закрыто / пришло новых», в порядке заходов."""
         lines: list[str] = []
         for ordinal, lap in enumerate(self.laps, start=1):
+            # #1432: заход бывает и без названных закрытий (исходы не
+            # названы) — правки тогда не утверждаются.
+            closed = (
+                f"закрыто {lap.closed}" if lap.closed else "закрытий правкой не названо"
+            )
             line = (
                 f"заход {ordinal} (сдача {lap.generation}): "
-                f"закрыто {lap.closed}, пришло новых {lap.arrived}"
+                f"{closed}, пришло новых {lap.arrived}"
             )
             if lap.repeated_categories:
                 line += f"; повтор категории: {', '.join(lap.repeated_categories)}"
@@ -5540,7 +5548,9 @@ async def review_circle(db: aiosqlite.Connection, task_id: int) -> ReviewCircle:
     назвавший исходов, обнулял круг. ``closed`` захода по-прежнему считает
     только названные закрытия правкой. Условий ДВА, и каждое стоит против
     своей ошибки (текст ниже — редакция #1235, условие закрытия с #1432
-    читается как «не отказ по всем»):
+    читается как «не отказ по всем»). ``deferred``/``real_deferred`` цепь
+    не рвут: это признание, что дефект настоящий; ``not_judged`` — то же
+    «неизвестно», что и неназванный исход:
 
     * ЗАКРЫТИЕ находок поколения N правкой. Оно же закрывает и требование
       «находки в N были»: закрыть можно только то, что нашли, поэтому
@@ -5690,7 +5700,7 @@ async def name_the_circle(db: aiosqlite.Connection, task_id: int) -> bool:
         "alert",
         (
             f"Задача идёт по кругу {circle.count}-й раз: каждый заход "
-            f"закрывал находки и получал новые. "
+            f"приносил новые находки. "
             + "; ".join(circle.breakdown())
             + f".{category_line} Ревью НЕ выключено и пересдача не запрещена — "
             "находки настоящие, и молча перестать их искать было бы хуже "

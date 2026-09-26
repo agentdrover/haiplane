@@ -14246,6 +14246,7 @@ async def _circle_resubmission(
     db: aiosqlite.Connection,
     monkeypatch,
     slug: str,
+    unreadable: bool = False,
     **submitted: object,
 ) -> tuple[int, _DispatchRecorder]:
     """Сдача 4 после двух заходов круга (1→2, 2→3), дифф — процессная
@@ -14264,8 +14265,15 @@ async def _circle_resubmission(
         db, task_id=task_id, generation=4, sha=sha, base_branch="develop"
     )
     await db.commit()
+    if unreadable:
+        plugins.git_ops = _UnreadableGitOps(_TIP, ["docs/notes.md"])
     await maybe_dispatch_review(db, task_id)
     return task_id, recorder
+
+
+class _UnreadableGitOps(_PinnedGitOps):
+    async def branch_diff(self, repo, base, branch):
+        raise RuntimeError("git недоступен")
 
 
 async def _generation_reasons(
@@ -14341,6 +14349,17 @@ async def test_a_circle_at_the_stop_threshold_buys_lite_not_deep(
     assert await _stop_alerts(db, task_id) == []
     assert len(await _stop_events(db, task_id)) == 1
 
+    # Находка 3c1089ccae171db0: непрочитанный дифф — тоже deep по правилу, и
+    # остановка действует и на него.
+    blind, _ = await _circle_resubmission(
+        client, db, monkeypatch, "circle-stop-blind", unreadable=True
+    )
+    assert [r["profile"] for r in await _rows_of(db, blind)] == ["deep", "lite"]
+    assert "отменён повод deep: дифф сдачи прочитать не удалось" in (
+        await _generation_reasons(db, blind, 4)
+    )
+    assert len(await _stop_alerts(db, blind)) == 1
+
 
 async def test_unnamed_outcomes_do_not_reset_the_circle(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
@@ -14368,6 +14387,14 @@ async def test_unnamed_outcomes_do_not_reset_the_circle(
         circle.breakdown(),
     )
     assert circle.laps[-1].closed == 0, "закрытым правкой не названо ничего"
+    # Находка c3ee4a6426933f4d: алерт не утверждает правок, которых не было.
+    from hub.services.review_dispatch import announce_circle_deep_stop
+
+    assert await announce_circle_deep_stop(db, task_id, 3, 2, 2)
+    [said] = await _stop_alerts(db, task_id)
+    assert "заход 1 (сдача 2): закрыто 3, пришло новых 2" in said, said
+    assert "заход 2 (сдача 3): закрытий правкой не названо, пришло новых 1" in said
+    assert "закрывались" not in said
 
     # Часть находок поколения 2 объявлена ложной, часть — нет: не отказ по всем.
     await _author_closed_them(
@@ -14380,6 +14407,18 @@ async def test_unnamed_outcomes_do_not_reset_the_circle(
         outcome_confirmed="false_positive",
     )
     assert (await review_circle(db, task_id)).count == 2, "отказ по части цепь не рвёт"
+    # Находка a5c6984b7a76cdfc: остальное отложено (deferred) — дефект признан
+    # настоящим, это не отказ; вместе с false_positive цепь по-прежнему цела.
+    await _author_closed_them(
+        db,
+        task_id,
+        second,
+        2,
+        confirmed=layer2[1:],
+        unresolved=[],
+        outcome_confirmed="deferred",
+    )
+    assert (await review_circle(db, task_id)).count == 2, "deferred цепь не рвёт"
 
     # Все находки поколения 3 — явный отказ: цепь обрывается на 3→4.
     await _author_closed_them(
