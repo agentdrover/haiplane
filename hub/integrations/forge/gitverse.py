@@ -34,6 +34,7 @@ from hub.integrations.protocols import (
     CIProbeResult,
     CIRunRequestOutcome,
     CIRunRequestResult,
+    FOREIGN_PR_ONLY,
     MergeabilityOutcome,
 )
 
@@ -316,6 +317,50 @@ class GitVerseForge:
                 return int(pr["number"])
         return None
 
+    async def pr_between(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[int | None, str]:
+        """Открытый PR ``head`` → ``base`` из ЭТОГО репозитория (#1426).
+
+        Контракт тот же, что у GitHub: сбой чтения и PR из чужого репозитория
+        называются причиной, а не сводятся к «PR нет» (#516).
+        """
+        slug = self._repo(gh_repo)
+        if not slug:
+            return (None, "репозиторий не назван")
+        resp = await self._request(
+            "GET", f"/repos/{slug}/pulls", params={"state": "open"}
+        )
+        if not resp.ok or not isinstance(resp.data, list):
+            return (None, f"список PR {head} → {base} не прочитан")
+        foreign: list[str] = []
+        for pr in resp.data:
+            if not isinstance(pr, dict) or not isinstance(pr.get("number"), int):
+                continue
+            pr_base, pr_head = pr.get("base"), pr.get("head")
+            if not isinstance(pr_base, dict) or not isinstance(pr_head, dict):
+                continue
+            if (pr_base.get("ref"), pr_head.get("ref")) != (base, head):
+                continue
+            head_repo = pr_head.get("repo")
+            name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+            # Без head.repo голова не доказана своей — fail-closed, как у GitHub.
+            if not name or str(name).lower() != slug.lower():
+                foreign.append(f"#{pr['number']} ({name or '?'}:{head})")
+                continue
+            return (int(pr["number"]), "")
+        if foreign:
+            return (
+                None,
+                f"{FOREIGN_PR_ONLY}: {', '.join(foreign)}",
+            )
+        return (None, "")
+
     async def open_or_update_pr(
         self,
         base: str,
@@ -533,6 +578,7 @@ class GitVerseForge:
         delete_branch: bool = True,
         repo: str | None = None,
         gh_repo: str | None = None,
+        method: str = "squash",
     ) -> bool:
         """Форж слить не может — и говорит это, а не молчит (#1116).
 
@@ -1033,15 +1079,3 @@ class GitVerseForge:
                 subjects.append(subject)
         subjects.reverse()
         return subjects
-
-    async def merge_branches(
-        self,
-        into_branch: str,
-        from_branch: str,
-        message: str,
-        *,
-        repo: str | None = None,
-        gh_repo: str | None = None,
-    ) -> tuple[str, str]:
-        """Сводится в #1116: серверного мержа веток у GitVerse тоже нет."""
-        return ("unavailable", _MERGE_PENDING)

@@ -522,6 +522,19 @@ async def get_usage(agent_id: str, run_id: str | None = None) -> dict[str, Any] 
     return await _request("GET", path)
 
 
+async def cancel_run(
+    agent_id: str, run_id: str
+) -> tuple[dict[str, Any] | None, Refusal | None]:
+    """Одна попытка отмены прогона (#1411): ``(тело, отказ)``.
+
+    Это только просьба. В F0 отмена пять раз подряд получила 429
+    ``rate_limit_exceeded``; и 2xx не значит, что прогон встал. Исход
+    подтверждает перечтённый прогон (:func:`get_run`), а повторы и паузу
+    держит вызывающий.
+    """
+    return await _attempt("POST", f"/v1/agents/{agent_id}/runs/{run_id}/cancel")
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 

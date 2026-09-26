@@ -2254,6 +2254,35 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_executor_runs_cost_wait_since",
         "ALTER TABLE executor_runs ADD COLUMN cost_wait_since TEXT",
     ),
+    (
+        # #1411 (F2.3): потолки прогона, заданные при заказе, — хаб держит их
+        # сам, не промпт исполнителя. NULL у строк до миграции читается как
+        # умолчание из конфигурации.
+        "add_executor_runs_token_ceiling",
+        "ALTER TABLE executor_runs ADD COLUMN token_ceiling INTEGER",
+    ),
+    (
+        "add_executor_runs_cents_ceiling",
+        "ALTER TABLE executor_runs ADD COLUMN cents_ceiling REAL",
+    ),
+    (
+        # #1411: зачем хаб отменяет прогон (taken_down | over_ceiling) — этим
+        # исходом строка закроется, когда прогон прочитается CANCELLED.
+        # Пусто — хаб отмену не начинал.
+        "add_executor_runs_cancel_intent",
+        "ALTER TABLE executor_runs ADD COLUMN cancel_intent TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1411: попытки отмены и время последней — счёт до потолка попыток и
+        # пауза между ними переживают проход поллера и перезапуск.
+        "add_executor_runs_cancel_attempts",
+        "ALTER TABLE executor_runs "
+        "ADD COLUMN cancel_attempts INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "add_executor_runs_cancel_last_at",
+        "ALTER TABLE executor_runs ADD COLUMN cancel_last_at TEXT",
+    ),
 ]
 
 

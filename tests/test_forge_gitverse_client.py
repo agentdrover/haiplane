@@ -298,8 +298,6 @@ async def test_absent_capabilities_answer_honestly():
     assert outcome is MergeabilityOutcome.unavailable
     assert "#1116" in detail
 
-    state, why = await forge.merge_branches("develop", "main", "msg")
-    assert state == "unavailable" and "#1116" in why
     assert await forge.merge_pr(1, "subject") is False
 
     probe = await forge.check_pr_ci(1)
