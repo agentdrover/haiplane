@@ -4695,7 +4695,9 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
                     review_id=int(review["id"]),
                 )
             if isinstance(total, int) and total > 0:
-                mismatch = reported is None or (
+                # #1431: no tokens_spent is not a disagreement — the cloud
+                # reviewer never reports it; the bill is already stamped.
+                mismatch = reported is not None and (
                     abs(total - reported) / total > _USAGE_MISMATCH_SHARE
                 )
                 if mismatch:
