@@ -15,6 +15,12 @@ from typing import Any, Protocol, runtime_checkable
 import aiosqlite
 
 
+# Причина ``pr_between``, когда под базу+голову попали только PR из чужих
+# репозиториев (#1426). Это не сбой чтения: свой PR возврата создавать можно,
+# иначе любой форк с веткой ``main`` останавливает возврат.
+FOREIGN_PR_ONLY = "PR из чужого репозитория не принят за возврат"
+
+
 class CIProbeOutcome(str, Enum):
     """Every observable result of probing a PR's CI checks (#419).
 
@@ -358,7 +364,10 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> bool | None: ...
-    async def return_release_into_base(
+    # #1426: возврат релиза идёт PR-ом. Открытый PR ``head`` → ``base`` из
+    # этого же репозитория — ``(номер | None, причина)``; его открытие по паре
+    # база+голова; его мерж мерж-коммитом с сохранением головы.
+    async def open_pr_between(
         self,
         base: str,
         head: str,
@@ -366,7 +375,27 @@ class GitOpsPlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
-    ) -> tuple[str, str]: ...
+    ) -> tuple[int | None, str]: ...
+    async def open_return_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[int | None, str]: ...
+    async def merge_return_pr(
+        self,
+        pr_number: int,
+        subject: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[bool, str]: ...
     async def check_pr_mergeable(
         self,
         pr_number: int,
@@ -684,6 +713,17 @@ class ForgePlugin(Protocol):
     async def pr_for_branch(
         self, branch: str, *, repo: str | None = None, gh_repo: str | None = None
     ) -> int | None: ...
+    # #1426: открытый PR ``head`` → ``base`` только из ЭТОГО репозитория.
+    # ``(номер, "")`` | ``(None, "")`` | ``(None, причина)`` — сбой чтения и
+    # PR из форка называются, а не читаются как «PR нет» (#516).
+    async def pr_between(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[int | None, str]: ...
     async def open_or_update_pr(
         self,
         base: str,
@@ -723,6 +763,7 @@ class ForgePlugin(Protocol):
     async def pr_for_merge_commit(
         self, sha: str, *, repo: str | None = None, gh_repo: str | None = None
     ) -> dict[str, Any] | None: ...
+    # ``method``: "squash" для задач и релиза, "merge" для возврата (#1426).
     async def merge_pr(
         self,
         pr_number: int,
@@ -731,6 +772,7 @@ class ForgePlugin(Protocol):
         delete_branch: bool = True,
         repo: str | None = None,
         gh_repo: str | None = None,
+        method: str = "squash",
     ) -> bool: ...
     # Закрыть PR, ничего не вливая (#1116). Нужен там, где мерж сделан не
     # форжем: GitVerse не замечает мержа пушем и оставляет PR открытым
@@ -789,17 +831,6 @@ class ForgePlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
     ) -> list[str]: ...
-    # Слить ``from_branch`` в ``into_branch`` силами форжа.
-    # ``(returned <sha> | nothing | conflict | unavailable, detail)``.
-    async def merge_branches(
-        self,
-        into_branch: str,
-        from_branch: str,
-        message: str,
-        *,
-        repo: str | None = None,
-        gh_repo: str | None = None,
-    ) -> tuple[str, str]: ...
 
 
 @runtime_checkable

@@ -287,6 +287,23 @@ async def merge_ready_release(
     head = base_branch_of(project_row)
     if head == base:
         return False, ""
+    # #1426: the return PR of the previous release is judged first and on
+    # its own. Its red CI or conflict is named next to the release, never
+    # instead of it — the release PR is judged below either way.
+    back = await _merge_pending_return(db, project_row, head, base, ctx)
+    merged, reason = await _merge_release_pr(db, project_row, ctx, base, head)
+    return merged, "; ".join(part for part in (reason, back) if part)
+
+
+async def _merge_release_pr(
+    db: aiosqlite.Connection,
+    project_row: Any,
+    ctx: dict[str, Any],
+    base: str,
+    head: str,
+) -> tuple[bool, str]:
+    """Judge the open release PR ``head`` → ``base`` and merge it on green (#812)."""
+    forge = ctx.get("forge", "")
     try:
         pr_number = await plugins.git_ops.pr_for_branch(
             head,
@@ -348,8 +365,8 @@ async def merge_ready_release(
     note = await _keep_the_integration_branch(db, project_row, head, base, ctx)
     # After the stamp, never before: #950 marks every UNRELEASED merge as
     # carried by this release, and the return commit was not — it rides out
-    # with the next one. Recording it earlier would stamp it with a release
-    # that did not contain it.
+    # with the next one. Since #1426 only the return PR is opened here; its
+    # merge, and its record, come on a later cycle.
     back = await _return_the_release(db, project_row, head, base, ctx, pr_number)
     return True, f"релиз PR #{pr_number} смержен в {base}{note}{back}"
 
@@ -525,68 +542,166 @@ async def _return_the_release(
     ctx: dict[str, Any],
     pr_number: int,
 ) -> str:
-    """Give the release branch back to the branch it came from (#969).
+    """Open the PR that gives the release branch back to its source (#969, #1426).
 
     A squash release writes a new commit on the release branch that the
     integration branch does not contain, so the two drift apart by one commit
     per release — and nothing ever closed the gap. On 26.08.2026 five of them
     collided: release PR #83 stood conflicted in ``hub/db.py`` at green CI
-    with 13 tasks undelivered, and the same manual repair had already been
-    done twenty hours earlier (PR #36, then PR #85). Two identical hand
-    operations in a day are a missing conveyor step.
+    with 13 tasks undelivered.
+
+    Until #1426 the return was a direct branch merge (``POST /merges``). A
+    merge with no PR passes the ruleset's pull_request rule only by bypass,
+    and the bypass was the Write role's — every writer's, not only the hub's.
+    Now the return is a PR like any other delivery: opened here, the moment
+    the release lands, and merged by ``_merge_pending_return`` on a later
+    cycle once its CI is green. Nothing needs to bypass anything.
 
     Reported next to the release, never instead of it. The release happened —
     the code is in production — and a failure here is a separate named cause,
     because letting it read as a failed release would send a task whose code
     is already deployed back for fixes.
     """
+    slug = dict(project_row).get("slug") or "?"
+    title = f"chore: return {base} into {head} after the release"
+    body = (
+        f"Возврат {base} в {head} после релиза PR #{pr_number} (#969, #1426).\n\n"
+        "Хаб вольёт этот PR сам, мерж-коммитом, когда CI зелёный и PR "
+        "сливается. Squash здесь нельзя: коммит релиза должен стать предком "
+        f"{head}, иначе расхождение копится снова."
+    )
     try:
-        state, detail = await plugins.git_ops.return_release_into_base(
-            base,
+        return_pr, why = await plugins.git_ops.open_return_pr(
             head,
+            base,
+            title,
+            body,
             repo=ctx.get("repo"),
             gh_repo=ctx.get("gh_repo"),
             forge=ctx.get("forge", ""),
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure
-        log.warning("release: could not return %s into %s: %s", base, head, exc)
-        return f"; возврат {base} в {head} не выполнен: {exc}"
-
-    if state == "nothing":
-        # The common case once this works: the poller walks here every cycle,
-        # and a line per cycle is how a real signal gets muted (#534).
-        return ""
-    slug = dict(project_row).get("slug") or "?"
-    if state == "returned":
-        # Drift-guard judges by SHA: a commit on the base branch is expected
-        # only when the hub recorded producing it (#534). An unrecorded return
-        # would raise an alert about the hub's own merge on every release —
-        # trading a hand-made rule violation for an automated one.
-        try:
-            await repo.record_pipeline_merge(
-                db,
-                pr_number=pr_number,
-                merge_sha=detail,
-                project_id=int(dict(project_row)["id"]),
-            )
-        except Exception:  # noqa: BLE001 - bookkeeping must not fail a release
-            log.exception("release: return %s recorded nowhere", detail[:12])
+        log.warning("release: return PR %s → %s not opened: %s", base, head, exc)
+        return_pr, why = None, str(exc)
+    why = why or "форж отказал"
+    if not return_pr:
         await log_activity(
-            db,
-            "release",
-            f"{slug}: {base} возвращён в {head} после релиза",
-            f"merge {detail[:12]}; расхождение закрыто в тот же момент, "
-            "пока слияние тривиально",
+            db, "release", f"{slug}: PR возврата {base} в {head} не открыт", why
         )
-        return f"; {base} возвращён в {head} ({detail[:12]})"
-
-    summary = (
-        f"{slug}: возврат {base} в {head} не прошёл — конфликт"
-        if state == "conflict"
-        else f"{slug}: возврат {base} в {head} не проверен"
+        return f"; PR возврата {base} в {head} не открыт: {why}"
+    await log_activity(
+        db,
+        "release",
+        f"{slug}: открыт PR #{return_pr} возврата {base} в {head}",
+        "вольётся мерж-коммитом по зелёному CI следующим циклом поллера",
     )
-    await log_activity(db, "release", summary, detail)
-    return f"; возврат {base} в {head} не выполнен: {detail}"
+    return f"; возврат {base} в {head} — PR #{return_pr}, вольётся по зелёному CI"
+
+
+async def _merge_pending_return(
+    db: aiosqlite.Connection,
+    project_row: Any,
+    head: str,
+    base: str,
+    ctx: dict[str, Any],
+) -> str:
+    """Merge the open return PR ``base`` → ``head`` when it is ready (#1426).
+
+    Returns a reason to name, or "" — nothing pending, CI still running, or
+    merged. A merged return is news for the activity feed, not a reason: the
+    poller reads any non-empty reason of a cycle without a release as a
+    stall. Pending CI is silent for the same cause as everywhere here — the
+    poller walks this every cycle, and a line per cycle mutes the real
+    signal (#534).
+    """
+    repo_path, gh_repo = ctx.get("repo"), ctx.get("gh_repo")
+    forge = ctx.get("forge", "")
+    try:
+        return_pr, lookup = await plugins.git_ops.open_pr_between(
+            head, base, repo=repo_path, gh_repo=gh_repo, forge=forge
+        )
+        if not return_pr:
+            # #516: a failed lookup and a stranger's PR are causes, not "none".
+            return f"возврат {base} в {head}: {lookup}" if lookup else ""
+        waits = await _why_the_return_waits(return_pr, ctx)
+        if waits == "":
+            return ""
+        if waits:
+            return f"возврат {base} в {head} (PR #{return_pr}) не влит: {waits}"
+        merged, detail = await plugins.git_ops.merge_return_pr(
+            return_pr,
+            f"chore: return {base} into {head} after the release",
+            repo=repo_path,
+            gh_repo=gh_repo,
+            forge=forge,
+        )
+    except Exception as exc:  # noqa: BLE001 - a cause, not a failure
+        return f"возврат {base} в {head} не проведён: {exc}"
+    if not merged:
+        return (
+            f"возврат {base} в {head} (PR #{return_pr}) не влит: "
+            f"{detail or 'форж отказал'}"
+        )
+    await _record_the_return(db, project_row, head, base, return_pr, detail)
+    return ""
+
+
+async def _why_the_return_waits(return_pr: int, ctx: dict[str, Any]) -> str | None:
+    """None — merge it now; "" — wait in silence; text — the named cause."""
+    ci = await plugins.git_ops.check_pr_ci(
+        return_pr,
+        repo=ctx.get("repo"),
+        gh_repo=ctx.get("gh_repo"),
+        forge=ctx.get("forge", ""),
+    )
+    if ci.outcome == CIProbeOutcome.pending:
+        return ""
+    if ci.outcome != CIProbeOutcome.passed:
+        return f"ci_{ci.outcome.value} ({ci.reason})"
+    state, why = await plugins.git_ops.check_pr_mergeable(
+        return_pr,
+        repo=ctx.get("repo"),
+        gh_repo=ctx.get("gh_repo"),
+        forge=ctx.get("forge", ""),
+    )
+    if state != MergeabilityOutcome.mergeable:
+        return f"{state.value} ({why})"
+    return None
+
+
+async def _record_the_return(
+    db: aiosqlite.Connection,
+    project_row: Any,
+    head: str,
+    base: str,
+    return_pr: int,
+    merge_sha: str,
+) -> None:
+    """Write the return merge down as the hub's own (#534, #1343).
+
+    Drift-guard judges by SHA: a commit on the integration branch is expected
+    only when the hub recorded producing it. An unrecorded return would raise
+    an alert about the hub's own merge after every release. The row carries
+    the return PR's number and no task — the return belongs to no task.
+    """
+    slug = dict(project_row).get("slug") or "?"
+    try:
+        await repo.record_pipeline_merge(
+            db,
+            pr_number=return_pr,
+            merge_sha=merge_sha,
+            project_id=int(dict(project_row)["id"]),
+        )
+    except Exception:  # noqa: BLE001 - bookkeeping must not fail a release
+        log.exception("release: return PR #%s recorded nowhere", return_pr)
+    log.info("release: %s — %s returned into %s by PR #%s", slug, base, head, return_pr)
+    await log_activity(
+        db,
+        "release",
+        f"{slug}: {base} возвращён в {head} (PR #{return_pr})",
+        f"merge {merge_sha[:12] or 'коммит не назван'}; влит PR-ом по зелёному "
+        "CI, без обхода правил ветки",
+    )
 
 
 async def _keep_the_integration_branch(

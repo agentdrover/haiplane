@@ -52,12 +52,9 @@ def _git(*, ci: CIProbeOutcome = CIProbeOutcome.passed, existing_pr: int | None 
     # not compare". True here means what these tests assume: develop carries
     # work main does not.
     g.content_differs = AsyncMock(return_value=True)
-    # #969: the release ends by returning the release branch into the
-    # integration branch. A fake that leaves this question to the noop makes
-    # every case here read as "could not ask" — the same half-substituted
-    # harness that cost #968 seven tests. These tests are about other things,
-    # so the answer is the quiet one: there was nothing to return.
-    g.return_release_into_base = AsyncMock(return_value=("nothing", "уже содержит"))
+    # #969/#1426: the release ends by opening the return PR, and every cycle
+    # starts by looking for one. These tests are about other things, so no
+    # return PR is pending — the noop answers None, which is that answer.
     # #970: зелёный CI больше не разрешение мержить — релиз отдельно
     # спрашивает, сливается ли PR. Незаявленный метод ушёл бы в noop, и каждый
     # тест здесь молча читался бы как «не смог спросить у GitHub».

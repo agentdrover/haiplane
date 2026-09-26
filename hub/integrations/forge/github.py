@@ -25,6 +25,7 @@ from hub.integrations.protocols import (
     CIProbeResult,
     CIRunRequestOutcome,
     CIRunRequestResult,
+    FOREIGN_PR_ONLY,
     MergeabilityOutcome,
 )
 
@@ -125,6 +126,54 @@ class GitHubForge:
             except (json.JSONDecodeError, KeyError, IndexError):
                 pass
         return None
+
+    async def pr_between(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[int | None, str]:
+        """The open PR ``head`` → ``base`` from THIS repository (#1426).
+
+        ``(number, "")`` — found; ``(None, "")`` — there is none;
+        ``(None, reason)`` — the list could not be read, or only PRs from
+        other repositories matched. The last two are named, never collapsed
+        into "none" (#516): the caller would otherwise create a second PR
+        blindly, or stay silent while a stranger's PR sits there.
+
+        ``--head`` filters by branch NAME only: a fork's ``attacker:main``
+        passes it. Pull-request CI runs for forks too, so a green fork PR
+        would have been merged into develop as "the return". Only a PR whose
+        head lives in this repository — not cross-repository, and owned by
+        this repository's owner — is accepted.
+        """
+        slug = gh_repo or REPO_NAME
+        rc, out, err = await _gh(
+            "pr",
+            "list",
+            "--repo",
+            slug,
+            "--base",
+            base,
+            "--head",
+            head,
+            "--state",
+            "open",
+            "--json",
+            "number,isCrossRepository,headRepositoryOwner",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            said = (err or out or "").strip() or f"gh rc={rc}"
+            return (None, f"список PR {head} → {base} не прочитан: {said[:150]}")
+        try:
+            prs = json.loads(out or "[]")
+        except json.JSONDecodeError:
+            return (None, f"список PR {head} → {base} не разобран")
+        return _own_repo_pr(prs, slug, head)
 
     async def open_or_update_pr(
         self,
@@ -486,6 +535,7 @@ class GitHubForge:
         delete_branch: bool = True,
         repo: str | None = None,
         gh_repo: str | None = None,
+        method: str = "squash",
     ) -> bool:
         """Merge one PR; ``delete_branch`` says what happens to its head (#949).
 
@@ -496,14 +546,22 @@ class GitHubForge:
         delete_branch_on_merge=false proves it was us, not GitHub. The default
         stays True so the task path is untouched; the release path passes
         False, because a release must not remove the branch work lands on.
+
+        ``method`` is the merge strategy (#1426). Squash stays the default —
+        linear main was a deliberate choice (#946). The release RETURN is the
+        one PR merged with a merge commit: squashing main into develop would
+        write yet another new commit and leave the release commit outside
+        develop's history, which is exactly the drift #969 closes.
         """
+        if method not in ("squash", "merge"):
+            raise ValueError(f"unknown merge method: {method!r}")
         args = [
             "pr",
             "merge",
             str(pr_number),
             "--repo",
             gh_repo or REPO_NAME,
-            "--squash",
+            f"--{method}",
             "--admin",
         ]
         if delete_branch:
@@ -516,7 +574,7 @@ class GitHubForge:
             timeout=30,
         )
         if rc == 0:
-            log.info("Merged PR #%d (squash, admin)", pr_number)
+            log.info("Merged PR #%d (%s, admin)", pr_number, method)
             return True
         log.error("Failed to merge PR #%d: %s", pr_number, err)
         return False
@@ -1089,64 +1147,23 @@ class GitHubForge:
             return []
         return [line.strip() for line in reversed(out.splitlines()) if line.strip()]
 
-    async def merge_branches(
-        self,
-        into_branch: str,
-        from_branch: str,
-        message: str,
-        *,
-        repo: str | None = None,
-        gh_repo: str | None = None,
-    ) -> tuple[str, str]:
-        """Merge ``from_branch`` into ``into_branch`` server-side (#969).
 
-        ``(returned <sha> | nothing | conflict | unavailable, detail)``. Four
-        names rather than three, because a conflict and a git that could not
-        be asked need different hands: one is a merge somebody has to resolve,
-        the other is a question to ask again next cycle. Collapsing them is
-        how #725 gets repeated with new words.
-
-        Asks GitHub to do the merge rather than driving the workspace clone.
-        The clone is shared, may sit on someone else's branch with a dirty
-        tree, and carries an armed pre-push hook — three ways for a
-        bookkeeping merge to damage work in progress (#949 was one of them).
-        The merges endpoint has no such surface: it answers 201 with the new
-        commit, 204 when there is nothing to merge, 409 on a conflict.
-
-        The conflict detail names no files — those come from the clone, and
-        the clone is git_ops' side of the fence (#1113).
-        """
-        if not gh_repo and not REPO_NAME:
-            return ("unavailable", "не названо, в каком репозитории возвращать")
-        rc, out, err = await _gh(
-            "api",
-            "--method",
-            "POST",
-            f"repos/{gh_repo or REPO_NAME}/merges",
-            "-f",
-            f"base={into_branch}",
-            "-f",
-            f"head={from_branch}",
-            "-f",
-            f"commit_message={message}",
-            repo=repo,
-            check=False,
+def _own_repo_pr(prs: object, slug: str, head: str) -> tuple[int | None, str]:
+    """The first listed PR whose head is in ``slug`` itself (#1426)."""
+    if not isinstance(prs, list):
+        return (None, f"список PR с головой {head} не разобран")
+    owner = slug.split("/", 1)[0].lower()
+    foreign: list[str] = []
+    for pr in prs:
+        if not isinstance(pr, dict) or not isinstance(pr.get("number"), int):
+            continue
+        login = str((pr.get("headRepositoryOwner") or {}).get("login") or "")
+        if pr.get("isCrossRepository") is False and login.lower() == owner:
+            return (int(pr["number"]), "")
+        foreign.append(f"#{pr['number']} ({login or '?'}:{head})")
+    if foreign:
+        return (
+            None,
+            f"{FOREIGN_PR_ONLY}: {', '.join(foreign)}",
         )
-        if rc == 0:
-            # 204 — «уже содержит», и gh печатает пустоту. Это ответ, а не
-            # промах: возвращать нечего.
-            body = (out or "").strip()
-            if not body:
-                return ("nothing", f"{into_branch} уже содержит {from_branch}")
-            try:
-                sha = str(json.loads(body).get("sha") or "").strip()
-            except json.JSONDecodeError:
-                return ("unavailable", f"ответ GitHub не разобран: {body[:150]}")
-            if not sha:
-                return ("unavailable", "GitHub не назвал коммит возврата")
-            return ("returned", sha)
-
-        detail = (err or "").strip() or "gh молчит"
-        if "409" in detail or "conflict" in detail.lower():
-            return ("conflict", "")
-        return ("unavailable", detail[:200])
+    return (None, "")

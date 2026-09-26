@@ -349,7 +349,7 @@ class NoopGitOps:
         """
         return (MergeabilityOutcome.unavailable, "git integration is not configured")
 
-    async def return_release_into_base(
+    async def open_pr_between(
         self,
         base: str,
         head: str,
@@ -357,15 +357,33 @@ class NoopGitOps:
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
-    ) -> tuple[str, str]:
-        """No git here — "could not ask", never "nothing to return" (#969).
+    ) -> tuple[int | None, str]:
+        return (None, "")
 
-        The distinction is load-bearing the same way it is in
-        content_differs: "nothing" would let the divergence pile up in
-        silence, and a silent pipeline failure is found later than a noisy
-        one.
-        """
-        return ("unavailable", "git integration is not configured")
+    async def open_return_pr(
+        self,
+        base: str,
+        head: str,
+        title: str,
+        body: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[int | None, str]:
+        return (None, "git integration is not configured")
+
+    async def merge_return_pr(
+        self,
+        pr_number: int,
+        subject: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[bool, str]:
+        """No git here — "could not merge", with the reason (#1426, #725)."""
+        return (False, "git integration is not configured")
 
     async def commit_with_same_tree(
         self, repo: str, sha: str, branch: str
@@ -761,6 +779,16 @@ class NoopForge:
     ) -> int | None:
         return None
 
+    async def pr_between(
+        self,
+        base: str,
+        head: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[int | None, str]:
+        return (None, "форж не настроен")
+
     async def open_or_update_pr(
         self,
         base: str,
@@ -821,6 +849,7 @@ class NoopForge:
         delete_branch: bool = True,
         repo: str | None = None,
         gh_repo: str | None = None,
+        method: str = "squash",
     ) -> bool:
         return False
 
@@ -892,17 +921,6 @@ class NoopForge:
         gh_repo: str | None = None,
     ) -> list[str]:
         return []
-
-    async def merge_branches(
-        self,
-        into_branch: str,
-        from_branch: str,
-        message: str,
-        *,
-        repo: str | None = None,
-        gh_repo: str | None = None,
-    ) -> tuple[str, str]:
-        return ("unavailable", "форж не настроен")
 
 
 class NoopGitHub:
