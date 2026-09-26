@@ -252,3 +252,98 @@ async def test_a_human_delivery_with_an_unwritten_record_is_named_merged(
     assert reason.startswith(orchestration.GATE_RECORD_PENDING_PREFIX), reason
     assert not any("PR остался открытым" in n for n in notes), notes
     assert any("реестр — нет" in n and "PR #501 влит" in n for n in notes), notes
+
+
+# ---- #1430: done-flow не держит write-лок на время сети ----
+
+
+async def test_a_done_report_does_not_hold_the_write_lock_during_the_forge_merge(
+    db, db_dsn
+):
+    """AC-1: во время merge_pr соединение done-отчёта не в транзакции, и
+    второе соединение пишет без ожидания busy_timeout."""
+    from hub.models import TaskUpdateCreate
+
+    task_id = await _approved_pair_task(db)
+    conn = await db_module.connect(db_dsn)
+    other = await db_module.connect(db_dsn)
+    seen: list[tuple[bool, bool]] = []
+
+    async def _merge(*_a, **_kw) -> bool:
+        try:
+            await other.execute("BEGIN IMMEDIATE")
+            await other.rollback()
+            free = True
+        except sqlite3.OperationalError:
+            free = False
+        seen.append((conn.in_transaction, free))
+        return True
+
+    _git(AsyncMock(side_effect=_merge))
+    try:
+        await services.add_update(
+            conn, task_id, TaskUpdateCreate(agent="dev", kind="done", content="готово")
+        )
+        status = dict(await repo.get_task(conn, task_id))["status"]
+    finally:
+        await other.close()
+        await conn.close()
+
+    assert seen == [(False, True)], seen
+    assert status == "completed"
+    assert await _rows(db, task_id) == [{"pr_number": 501, "merge_sha": MERGE_SHA}]
+
+
+async def test_a_second_done_in_the_merge_window_delivers_once(db, db_dsn):
+    """AC-3: пока done-отчёт вливает PR уже вне транзакции, поллер проходит
+    по той же задаче — PR вливается один раз, строка одна, человека не зовут."""
+    from hub import poller
+    from hub.models import TaskUpdateCreate
+
+    task_id = await _approved_pair_task(db)
+    conn = await db_module.connect(db_dsn)
+    other = await db_module.connect(db_dsn)
+    sweeps: list[asyncio.Task] = []
+
+    async def _merge(*_a, **_kw) -> bool:
+        if not sweeps:
+            sweeps.append(asyncio.create_task(poller._sweep_pair_delivery(other)))
+            await asyncio.sleep(0.3)
+        return True
+
+    g = _git(AsyncMock(side_effect=_merge))
+    try:
+        await services.add_update(
+            conn, task_id, TaskUpdateCreate(agent="dev", kind="done", content="готово")
+        )
+        await asyncio.wait_for(asyncio.gather(*sweeps), 10)
+    finally:
+        await other.close()
+        await conn.close()
+
+    task = dict(await repo.get_task(db, task_id))
+    assert g.merge_pr.await_count == 1, "PR вливается один раз"
+    assert task["status"] == "completed", task["status"]
+    assert await _rows(db, task_id) == [{"pr_number": 501, "merge_sha": MERGE_SHA}]
+
+
+async def test_a_deferred_completion_leaves_an_already_delivered_task_alone(db):
+    """Поллер доставил задачу между коммитом done-flow и отложенным шагом:
+    шаг ничего не делает — ни второго мержа, ни второго task_completed."""
+    from hub import poller
+
+    task_id = await _approved_pair_task(db)
+    g = _git()
+    await poller._sweep_pair_delivery(db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+    await orchestration.run_deferred_completions(
+        db, [{"task_id": task_id, "exit_code": None, "result_text": None}]
+    )
+
+    completed = await db.execute_fetchall(
+        "SELECT id FROM events WHERE task_id = ? AND kind = 'task_completed'",
+        (task_id,),
+    )
+    assert g.merge_pr.await_count == 1, "второго мержа нет"
+    assert len(completed) == 1, "второго task_completed нет"
