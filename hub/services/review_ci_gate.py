@@ -41,6 +41,8 @@ from hub.services.ci_report import CHECK_FAIL
 from hub.services.validation_run import FAIL as VALIDATION_FAIL
 
 RED_EVENT = "review_withheld_red_ci"
+#: Красный отчёт пришёл после заказа: отказано добору, каскаду, переспросу.
+TOPUP_RED_EVENT = "review_topup_withheld_red_ci"
 NO_REPORT_EVENT = "review_ordered_without_ci"
 
 #: Имя провала валидационных команд среди упавших проверок.
@@ -99,15 +101,6 @@ async def review_may_be_bought(
         return True
     task_id = int(task["id"])
     generation = int(task.get("submission_generation") or 0)
-    if await fetchall(
-        db,
-        "SELECT 1 FROM review_dispatches WHERE task_id=? "
-        "AND submission_generation=? LIMIT 1",
-        (task_id, generation),
-    ):
-        # Решение по этой сдаче уже принято и прогон куплен: добор, каскад и
-        # переспрос не перечитывают поздний отчёт CI (находка 64ac296015b7d20d).
-        return True
     sha = (task.get("submission_sha") or "").strip()
     report = await repo.get_ci_run_report(db, task_id, sha)
     if report is None:
@@ -128,6 +121,29 @@ async def review_may_be_bought(
     failed = failed_checks(dict(report))
     if not failed:
         return True
+    # Красный отказывает любому входу, и добору тоже (c609380e10b71078). Если
+    # первый прогон уже куплен, отказано добору — и названо это так, отдельным
+    # событием, а не вторым «ревью не куплено» (64ac296015b7d20d).
+    if await fetchall(
+        db,
+        "SELECT 1 FROM review_dispatches WHERE task_id=? "
+        "AND submission_generation=? LIMIT 1",
+        (task_id, generation),
+    ):
+        await _say_once(
+            db,
+            task_id,
+            generation,
+            (TOPUP_RED_EVENT, {"sha": sha, "failed": failed}),
+            (
+                "alert",
+                f"Добор ревью не куплен: CI красный на закреплённом коммите "
+                f"{sha[:12]} (сдача {generation}) — упали: {', '.join(failed)}. "
+                "Первый прогон этой сдачи уже куплен; добор, вторая ось и "
+                "переспрос на красном не покупаются (#1405).",
+            ),
+        )
+        return False
     await _say_once(
         db,
         task_id,

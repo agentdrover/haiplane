@@ -14151,8 +14151,15 @@ async def test_a_late_ci_report_orders_nothing(
         for _ in range(3):
             await sweep_review_dispatches(db)
     assert len(recorder.calls) == 1, "поздний отчёт CI заказа не ставит"
-    # Находка 64ac296015b7d20d: решение по сдаче с заказом не принимается
-    # повторно — добор после позднего красного отчёта не пишет «не куплено».
-    await maybe_dispatch_review(db, ordered, force_profile=DEEP)
+    # Находки 64ac296015b7d20d и c609380e10b71078: заказ без CI, поздний
+    # красный отчёт — добор deep не покупается, и отказ назван добору одним
+    # событием, а не вторым «ревью не куплено».
+    before = len(recorder.calls)
+    for _ in range(2):
+        assert not await maybe_dispatch_review(db, ordered, force_profile=DEEP)
+    assert len(recorder.calls) == before, "добор на красном не покупается"
+    [topup] = await _events(db, "review_topup_withheld_red_ci")
+    assert topup["failed"] == ["tests", "validation"]
+    assert [c for c in await _card(db, ordered) if "Добор ревью не куплен" in c]
     red_events = [e for e in await _events(db, "review_withheld_red_ci")]
     assert len(red_events) == 1, "событие о красном — одно на сдачу"
