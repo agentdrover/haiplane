@@ -1911,6 +1911,16 @@ class ProdStateView(BaseModel):
     note: str = ""
 
 
+class ReleaseBlocksView(BaseModel):
+    """Open release alerts only (#1420) — the cheap read of hub_my_context.
+
+    The same rows as ``ProdStateView.release_blocks``, without the delivery
+    walk over completed tasks that the full snapshot costs.
+    """
+
+    release_blocks: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class TaskUpdateView(BaseModel):
     id: int
     task_id: int

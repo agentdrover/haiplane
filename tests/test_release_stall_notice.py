@@ -315,3 +315,151 @@ async def test_digest_page_shows_the_release_block(client, db):
     assert "Релиз был заблокирован" in page.text
     assert "checks_failed" in page.text
     assert "длилось 0 мин" in page.text
+
+
+# --- #1420, круг 2: находки lite-ревью #632 --------------------------------
+
+
+async def test_dashboard_prod_card_shows_open_release_block(client, db):
+    # e7b51055423a1451: карточка «Что в проде» на дашборде читает тот же
+    # снимок — открытая авария видна в ней первой строкой, снятая исчезает.
+    await _project(db)
+    await _sweep(db, False, RED)
+
+    page = (await client.get("/")).text
+    card = page[page.index('id="prod-state"') :]
+    assert "Релиз заблокирован" in card
+    assert "checks_failed" in card
+    assert card.index("Релиз заблокирован") < card.index("Успешных выкатов")
+
+    await _sweep(db, True, "релиз PR #484 смержен в main")
+    page = (await client.get("/")).text
+    assert "Релиз заблокирован" not in page[page.index('id="prod-state"') :]
+
+
+def _text(result) -> str:
+    from mcp.types import CallToolResult, TextContent
+
+    if isinstance(result, CallToolResult):
+        return "\n".join(b.text for b in result.content if isinstance(b, TextContent))
+    return str(result)
+
+
+async def test_my_context_carries_the_open_release_block(client, db):
+    # ca52883c1a7ac3a7: общий hub_my_context несёт строку «Релиз заблокирован
+    # с <время>: <причина>», пока авария открыта; источник — дешёвый
+    # /api/release-blocks по событиям, а не снимок прода.
+    from hub import mcp_server
+
+    await _project(db)
+    await _sweep(db, False, RED)
+
+    async def _via_rest(path: str, *args, **kwargs):
+        if path == "/api/release-blocks":
+            resp = await client.get(path)
+            assert resp.status_code == 200
+            return resp.json()
+        if path == "/api/diagnostics/identity":
+            return {"username": "steward", "role": "agent", "principal_id": 1}
+        return {"tasks": [], "next_cursor": None}
+
+    with patch.object(mcp_server, "_api_get", side_effect=_via_rest):
+        text = _text(await mcp_server.hub_my_context())
+    assert "Релиз заблокирован с" in text
+    assert "checks_failed" in text.split("Релиз заблокирован с", 1)[1]
+
+    await _sweep(db, True, "релиз PR #484 смержен в main")
+    with patch.object(mcp_server, "_api_get", side_effect=_via_rest):
+        text = _text(await mcp_server.hub_my_context())
+    assert "Релиз заблокирован" not in text
+
+
+async def test_release_blocks_query_is_indexed_by_kind(db):
+    # ca52883c1a7ac3a7: запрос открытых аварий идёт по индексу, а не сканом
+    # всей ленты событий.
+    from hub.services import release_alert as ra
+
+    cur = await db.execute(
+        "EXPLAIN QUERY PLAN " + ra.OPEN_BLOCKS_SQL, ra.open_blocks_args()
+    )
+    plan = " ".join(str(tuple(r)) for r in await cur.fetchall())
+    assert "idx_events_kind_project" in plan, plan
+
+
+async def test_red_ci_alert_names_the_run_and_failed_checks(db, monkeypatch):
+    # 7c1d20f701b32445: авария по красному CI несёт прогон и упавшие проверки,
+    # когда форж их отдал, — в payload события и в строке для стюарда.
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    from hub.integrations.registry import plugins
+    from hub.services.prod_state import format_prod_state, prod_state
+
+    url = "https://github.com/agentdrover/haiplane/actions/runs/36200000001"
+    logs = _AsyncMock(
+        return_value={"failed_checks": ["Ruff and pytest"], "run_url": url}
+    )
+    monkeypatch.setattr(plugins.git_ops, "get_ci_failure_logs", logs, raising=False)
+    await _project(db)
+    await _sweep(db, False, RED)
+
+    assert logs.await_args.args[0] == 484
+    block = (await prod_state(db))["release_blocks"][0]
+    assert block["ci"]["run_url"] == url
+    assert block["ci"]["failed_checks"] == ["Ruff and pytest"]
+    text = format_prod_state(await prod_state(db))
+    assert url in text and "Ruff and pytest" in text
+    alert = (await _feed(db, "release_blocked"))[0]
+    assert url in alert["detail"]
+
+
+async def test_red_ci_alert_says_when_forge_gave_nothing(db, monkeypatch):
+    # 7c1d20f701b32445: форж ничего не отдал — строка так и говорит.
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    from hub.integrations.registry import plugins
+    from hub.services.prod_state import format_prod_state, prod_state
+
+    monkeypatch.setattr(
+        plugins.git_ops,
+        "get_ci_failure_logs",
+        _AsyncMock(return_value={"failed_checks": [], "run_url": ""}),
+        raising=False,
+    )
+    await _project(db)
+    await _sweep(db, False, RED)
+
+    text = format_prod_state(await prod_state(db))
+    assert "прогон CI форж не назвал" in text
+    assert "упавшие проверки форж не назвал" in text
+
+
+async def test_unreadable_since_is_named_not_zero(db):
+    # baac9fd4eb694be8: нечитаемый штамп since — «время не прочитано», а не
+    # «0 мин»; при снятии — «длительность не прочитана».
+    import json
+
+    from hub.services.prod_state import format_prod_state, prod_state
+
+    row = await _project(db)
+    await repo.insert_event(
+        db,
+        kind="release_blocked",
+        project_id=dict(row)["id"],
+        actor="hub",
+        payload={"project": "default", "reason": RED, "since": "вчера вечером"},
+    )
+    await db.execute(
+        "UPDATE events SET created_at='не штамп' WHERE kind='release_blocked'"
+    )
+    await db.commit()
+
+    text = format_prod_state(await prod_state(db))
+    assert "время не прочитано" in text
+    assert "0 мин" not in text
+
+    await _sweep(db, True, "релиз PR #484 смержен в main")
+    cleared = await _feed(db, "release_unblocked")
+    assert "длительность не прочитана" in cleared[0]["summary"]
+    assert "0 мин" not in cleared[0]["summary"]
+    cur = await db.execute("SELECT payload FROM events WHERE kind='release_unblocked'")
+    assert json.loads((await cur.fetchone())[0])["minutes"] is None

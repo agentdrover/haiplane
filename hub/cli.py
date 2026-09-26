@@ -1058,6 +1058,19 @@ def cmd_whoami(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_release_blocks(args: argparse.Namespace) -> int:
+    """Open release alerts only (#1420) — the cheap read, no delivery walk."""
+    from hub.services.release_alert import release_block_lines
+
+    result = _api("GET", "/api/release-blocks")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    lines = release_block_lines(list(result.get("release_blocks") or []))
+    print("\n".join(lines) if lines else "Открытых аварий релиза нет")
+    return 0
+
+
 def cmd_prod_state(args: argparse.Namespace) -> int:
     """What production runs and which completed tasks are where (#499)."""
     from hub.services.prod_state import format_prod_state
@@ -2408,6 +2421,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_prod.add_argument("--json", action="store_true", help="Print raw JSON")
     p_prod.set_defaults(func=cmd_prod_state)
+
+    p_blocks = sub.add_parser(
+        "release-blocks", help="Open release alerts (red CI, conflict, refusal)"
+    )
+    p_blocks.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_blocks.set_defaults(func=cmd_release_blocks)
 
     p_next = sub.add_parser(
         "next-task", help="Which task the hub would start next, and why others wait"

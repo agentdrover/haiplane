@@ -1767,6 +1767,19 @@ async def _attach_live_worktree_paths(rows: list[dict[str, Any]]) -> None:
             row["worktree_path"] = path
 
 
+async def _release_block_lines() -> list[str]:
+    """«Релиз заблокирован с …» per open alert, from /api/release-blocks."""
+    from hub.services.release_alert import release_block_lines
+
+    try:
+        data = await _api_get("/api/release-blocks")
+    except Exception:  # noqa: BLE001 - context must render without it
+        return []
+    if not isinstance(data, dict):
+        return []
+    return release_block_lines(list(data.get("release_blocks") or []))
+
+
 async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolResult:
     """General Hub context for an agent with no active task (#454).
 
@@ -1806,6 +1819,12 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
 
     lines = ["## Hub Context (no task)"]
     lines.append(f"Instance: {instance['instance']} ({instance['base_url']})")
+    # #1420: an open release alert comes before identity and tasks — a red
+    # develop holds back everything merged, and this is what a session reads
+    # first. Best effort: an old hub without the route just has no line, and
+    # a caller the hub does not know cannot read it anyway.
+    if identity:
+        lines.extend(await _release_block_lines())
     if identity:
         lines.append(
             f"Identity: {username or 'anonymous'} "

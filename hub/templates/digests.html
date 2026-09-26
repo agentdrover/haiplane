@@ -33,7 +33,8 @@
         {% for b in d.data.release_blocks %}
         <li>{% if b.kind == 'release_blocked' %}<span class="badge badge-failed">заблокирован</span>
             {%- else %}<span class="badge badge-completed">снято{% if b.minutes is not none %}, длилось {{ b.minutes }} мин{% endif %}</span>{% endif %}
-            <span class="text-muted">{{ b.at }} UTC</span> {{ b.reason }}</li>
+            <span class="text-muted">{{ b.at }} UTC</span> {{ b.reason }}
+            {% if b.ci %}<div class="text-muted">{{ b.ci }}</div>{% endif %}</li>
         {% endfor %}
     </ul>
     {% endif %}

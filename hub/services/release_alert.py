@@ -27,7 +27,6 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
-from hub import repository as repo
 from hub.db import fetchall
 from hub.integrations.protocols import CIProbeOutcome, MergeabilityOutcome
 
@@ -86,13 +85,36 @@ def utc_stamp(moment: datetime | None = None) -> str:
     return (moment or datetime.now(UTC)).strftime(_TS)
 
 
-def minutes_since(stamp: str, now: datetime | None = None) -> int:
-    """Whole minutes from ``stamp`` (UTC, events format) to now; 0 if unreadable."""
+def minutes_since(stamp: str, now: datetime | None = None) -> int | None:
+    """Whole minutes from ``stamp`` (UTC, events format) to now.
+
+    None when the stamp cannot be read: «0 мин» would be a measurement of a
+    time nobody knows (#1420 review, baac9fd4eb694be8).
+    """
     try:
         start = datetime.strptime(stamp, _TS).replace(tzinfo=UTC)
     except (TypeError, ValueError):
-        return 0
+        return None
     return max(0, int(((now or datetime.now(UTC)) - start).total_seconds() // 60))
+
+
+def _payload_of(row: Any) -> dict[str, Any]:
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _block_of(row: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    since = str(payload.get("since") or row["created_at"] or "")
+    return {
+        "project": str(payload.get("project") or ""),
+        "reason": str(payload.get("reason") or ""),
+        "since": since,
+        "minutes": minutes_since(since),
+        "ci": payload.get("ci"),
+    }
 
 
 async def active_release_block(db: Any, project_id: int) -> dict[str, Any] | None:
@@ -100,43 +122,116 @@ async def active_release_block(db: Any, project_id: int) -> dict[str, Any] | Non
     rows = await fetchall(
         db,
         "SELECT kind, payload, created_at FROM events "
-        "WHERE project_id=? AND kind IN (?, ?) ORDER BY id DESC LIMIT 1",
-        (project_id, KIND_BLOCKED, KIND_UNBLOCKED),
+        "WHERE kind IN (?, ?) AND project_id=? ORDER BY id DESC LIMIT 1",
+        (KIND_BLOCKED, KIND_UNBLOCKED, project_id),
     )
     if not rows or rows[0]["kind"] != KIND_BLOCKED:
         return None
-    try:
-        payload = json.loads(rows[0]["payload"] or "{}")
-    except ValueError:
-        payload = {}
-    since = str(payload.get("since") or rows[0]["created_at"] or "")
-    return {
-        "project": str(payload.get("project") or ""),
-        "reason": str(payload.get("reason") or ""),
-        "since": since,
-        "minutes": minutes_since(since),
-    }
+    return _block_of(rows[0], _payload_of(rows[0]))
+
+
+# One query for the whole hub, answered from idx_events_kind_project: the
+# newest release event of each project, kept only if it opened a block. It is
+# read by every general hub_my_context, so it must not scan the event feed
+# (#1420 review, ca52883c1a7ac3a7).
+OPEN_BLOCKS_SQL = (
+    "SELECT e.kind, e.payload, e.created_at, p.slug FROM events e "
+    "LEFT JOIN projects p ON p.id = e.project_id "
+    "WHERE e.id IN (SELECT MAX(id) FROM events WHERE kind IN (?, ?) "
+    "GROUP BY project_id) AND e.kind = ? ORDER BY e.id"
+)
+
+
+def open_blocks_args() -> tuple[str, str, str]:
+    return (KIND_BLOCKED, KIND_UNBLOCKED, KIND_BLOCKED)
 
 
 async def active_release_blocks(db: Any) -> list[dict[str, Any]]:
     """Every open release alert on the hub — what the steward must see."""
     blocks = []
-    for project in await repo.list_projects(db):
-        row = dict(project)
-        block = await active_release_block(db, int(row["id"]))
-        if block is not None:
-            block["project"] = block["project"] or str(row.get("slug") or "")
-            blocks.append(block)
+    for row in await fetchall(db, OPEN_BLOCKS_SQL, open_blocks_args()):
+        block = _block_of(row, _payload_of(row))
+        block["project"] = block["project"] or str(row["slug"] or "")
+        blocks.append(block)
     return blocks
+
+
+def ci_evidence_text(ci: Any) -> str:
+    """The CI run and failed checks of a red-CI alert — or that there were none.
+
+    Empty for an alert that is not about CI (a conflict has no run). For a red
+    CI the forge's silence is said out loud: a line without the run reads as
+    "the hub did not look" (#1420 review, 7c1d20f701b32445).
+    """
+    if not isinstance(ci, dict):
+        return ""
+    url = str(ci.get("run_url") or "")
+    checks = [str(c) for c in ci.get("failed_checks") or [] if c]
+    return "; ".join(
+        (
+            f"прогон: {url}" if url else "прогон CI форж не назвал",
+            f"упали: {', '.join(checks)}"
+            if checks
+            else "упавшие проверки форж не назвал",
+        )
+    )
+
+
+def _held(minutes: Any) -> str:
+    return "время не прочитано" if minutes is None else f"{minutes} мин"
 
 
 def release_block_lines(blocks: list[dict[str, Any]]) -> list[str]:
     """One line per open alert, shared by every reader that prints them."""
-    return [
-        f"Релиз заблокирован с {b.get('since', '?')} UTC "
-        f"({b.get('project', '?')}, {b.get('minutes', 0)} мин): {b.get('reason', '')}"
-        for b in blocks
+    lines = []
+    for b in blocks:
+        evidence = ci_evidence_text(b.get("ci"))
+        lines.append(
+            f"Релиз заблокирован с {b.get('since') or '?'} UTC "
+            f"({b.get('project') or '?'}, {_held(b.get('minutes'))}): "
+            f"{b.get('reason', '')}" + (f" · {evidence}" if evidence else "")
+        )
+    return lines
+
+
+async def release_ci_evidence(project_row: Any, reason: str) -> dict[str, Any] | None:
+    """Run URL and failed checks for a red-CI alert; None if CI is not the cause.
+
+    The same forge call the task-CI fix path reads (``get_ci_failure_logs``).
+    Asked once per alert, never per cycle. A forge that answers nothing, or
+    fails, leaves empty fields — which ``ci_evidence_text`` names.
+    """
+    from hub.integrations.registry import plugins
+    from hub.services.project_policy import base_branch_of, forge_of, release_base_of
+
+    marker = f"ci_{CIProbeOutcome.failed.value} ("
+    part = next((p for p in _PART_SPLIT.split(reason or "") if marker in p), "")
+    if not part:
+        return None
+    evidence: dict[str, Any] = {"run_url": "", "failed_checks": []}
+    number = re.search(r"PR #(\d+)", part)
+    if number is None:
+        return evidence
+    project = dict(project_row)
+    # The release PR runs on the integration branch; the return PR on the base.
+    returning = part.lstrip().startswith("возврат")
+    branch = release_base_of(project_row) if returning else base_branch_of(project_row)
+    try:
+        details = await plugins.git_ops.get_ci_failure_logs(
+            int(number.group(1)),
+            branch,
+            2000,
+            repo=(project.get("workspace_path") or "").strip() or None,
+            gh_repo=(project.get("repo") or "").strip() or None,
+            forge=forge_of(project_row),
+        )
+    except Exception:  # noqa: BLE001 - evidence is optional, the alert is not
+        return evidence
+    evidence["run_url"] = str((details or {}).get("run_url") or "")
+    evidence["failed_checks"] = [
+        str(c) for c in (details or {}).get("failed_checks") or [] if c
     ]
+    return evidence
 
 
 async def release_block_history(
@@ -150,18 +245,14 @@ async def release_block_history(
         "ORDER BY id ASC",
         (project_id, KIND_BLOCKED, KIND_UNBLOCKED, start, end),
     )
-    history = []
-    for row in rows:
-        try:
-            payload = json.loads(row["payload"] or "{}")
-        except ValueError:
-            payload = {}
-        history.append(
-            {
-                "kind": row["kind"],
-                "at": row["created_at"],
-                "reason": str(payload.get("reason") or ""),
-                "minutes": payload.get("minutes"),
-            }
-        )
-    return history
+    return [
+        {
+            "kind": row["kind"],
+            "at": row["created_at"],
+            "reason": str(payload.get("reason") or ""),
+            "minutes": payload.get("minutes"),
+            "ci": ci_evidence_text(payload.get("ci")),
+        }
+        for row in rows
+        for payload in (_payload_of(row),)
+    ]

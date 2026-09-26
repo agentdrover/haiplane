@@ -2075,12 +2075,12 @@ async def _sweep_release_policy(db) -> None:
             if _release_notices.get(slug) != reason:
                 _release_notices[slug] = reason
                 log.warning("Poll: %s — %s", slug, reason)
-            await _note_release_stall(db, slug, reason, project_id)
+            await _note_release_stall(db, slug, reason, project_row)
     except Exception:
         log.exception("Poll: release policy sweep failed")
 
 
-async def _note_release_stall(db, slug: str, reason: str, project_id: int = 0) -> None:
+async def _note_release_stall(db, slug: str, reason: str, project_row) -> None:
     """Sort a release refusal into routine and alert, and write each once.
 
     #962 put a persistent refusal into the activity feed — on 26.08.2026 a
@@ -2093,6 +2093,7 @@ async def _note_release_stall(db, slug: str, reason: str, project_id: int = 0) -
     """
     from hub.services.release_alert import ALERT, PROBE, classify_release_reason
 
+    project_id = int(dict(project_row).get("id") or 0)
     prev_reason, streak, noted, first_seen = _release_stalls.get(
         slug, ("", 0, False, 0.0)
     )
@@ -2102,7 +2103,7 @@ async def _note_release_stall(db, slug: str, reason: str, project_id: int = 0) -
     _release_stalls[slug] = (reason, streak, noted, first_seen)
     severity = classify_release_reason(reason)
     if severity == ALERT or (severity == PROBE and streak >= RELEASE_STALL_CYCLES):
-        await _open_release_block(db, project_id, slug, reason)
+        await _open_release_block(db, project_row, slug, reason)
         return
     if severity == PROBE:
         return
@@ -2136,24 +2137,33 @@ async def _write_release_note(
         return False
 
 
-async def _open_release_block(db, project_id: int, slug: str, reason: str) -> None:
-    """Write the alert once per reason (#534); the open state lives in events."""
+async def _open_release_block(db, project_row, slug: str, reason: str) -> None:
+    """Write the alert once per reason (#534); the open state lives in events.
+
+    A red CI carries its run and failed checks, asked of the forge once here
+    rather than every cycle (#1420 review, 7c1d20f701b32445).
+    """
     from hub.services import release_alert as ra
 
+    project_id = int(dict(project_row).get("id") or 0)
     active = await ra.active_release_block(db, project_id)
     if active is not None and active["reason"] == reason:
         return
     since = active["since"] if active else ra.utc_stamp()
+    ci = await ra.release_ci_evidence(project_row, reason)
+    evidence = ra.ci_evidence_text(ci)
+    payload: dict[str, Any] = {"project": slug, "reason": reason, "since": since}
+    if ci is not None:
+        payload["ci"] = ci
     await _write_release_note(
         db,
         ra.KIND_BLOCKED,
         f"{slug}: авария — релиз стоит: {reason}",
-        f"Релиз заблокирован с {since} UTC. Политика повторяет сама, снять "
-        "причину — за человеком; снятие будет записано отдельно.",
-        {
-            "project_id": project_id,
-            "payload": {"project": slug, "reason": reason, "since": since},
-        },
+        f"Релиз заблокирован с {since} UTC."
+        + (f" {evidence}." if evidence else "")
+        + " Политика повторяет сама, снять причину — за человеком; снятие "
+        "будет записано отдельно.",
+        {"project_id": project_id, "payload": payload},
     )
 
 
@@ -2165,10 +2175,11 @@ async def _clear_release_block(db, project_id: int, slug: str, now: str) -> None
     if active is None:
         return
     minutes = active["minutes"]
+    held = "длительность не прочитана" if minutes is None else f"длилась {minutes} мин"
     await _write_release_note(
         db,
         ra.KIND_UNBLOCKED,
-        f"{slug}: релиз снова идёт — блокировка снята, длилась {minutes} мин",
+        f"{slug}: релиз снова идёт — блокировка снята, {held}",
         f"была: {active['reason']}; сейчас: {now or 'причины нет'}",
         {
             "project_id": project_id,
