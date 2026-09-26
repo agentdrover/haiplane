@@ -5538,19 +5538,70 @@ async def create_executor_run(
     agent_id: str,
     run_id: str,
     model: str,
+    token_ceiling: int | None = None,
+    cents_ceiling: float | None = None,
 ) -> int:
     """Записать прогон исполнителя при заказе (#1410). Коммит — за вызывающим.
 
     Токены и центы не пишутся: их называет только провайдер при опросе, а
     ноль на месте неизвестного выдал бы непрочитанный счёт за бесплатный.
+
+    ``submission_generation`` — поколение сдачи, которую этот прогон
+    делает: когда у задачи ляжет сдача этого поколения, хаб прогон снимает
+    (#1411). Потолки (#1411) фиксируются в строке при заказе; не названные —
+    берутся из конфигурации на момент заказа, чтобы правка настройки не
+    двигала потолок уже идущего прогона.
     """
     cur = await db.execute(
         "INSERT INTO executor_runs "
-        "(task_id, submission_generation, agent_id, run_id, model) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (task_id, submission_generation, agent_id, run_id, model),
+        "(task_id, submission_generation, agent_id, run_id, model, "
+        "token_ceiling, cents_ceiling) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            submission_generation,
+            agent_id,
+            run_id,
+            model,
+            config.EXECUTOR_TOKEN_CEILING if token_ceiling is None else token_ceiling,
+            config.EXECUTOR_CENTS_CEILING if cents_ceiling is None else cents_ceiling,
+        ),
     )
     return inserted_id(cur)
+
+
+async def record_executor_cancel_attempt(
+    db: aiosqlite.Connection, row_id: int, intent: str
+) -> int:
+    """Отметить попытку отмены ДО вызова провайдера (#1411) и закоммитить.
+
+    Запись до вызова — по образцу переспроса ревью (#1242): попытка видна в
+    счёте, даже если вызов не вернулся. Возвращает номер этой попытки.
+    """
+    await db.execute(
+        "UPDATE executor_runs SET cancel_intent=?, "
+        "cancel_attempts=cancel_attempts + 1, cancel_last_at=datetime('now') "
+        "WHERE id=?",
+        (intent, row_id),
+    )
+    await db.commit()
+    rows = await fetchall(
+        db, "SELECT cancel_attempts FROM executor_runs WHERE id=?", (row_id,)
+    )
+    return int(dict(rows[0])["cancel_attempts"]) if rows else 0
+
+
+async def executor_cancel_paused(
+    db: aiosqlite.Connection, row_id: int, pause_s: int
+) -> bool:
+    """True — с последней попытки отмены пауза ещё не вышла (#1411)."""
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM executor_runs WHERE id=? AND cancel_last_at IS NOT NULL "
+        "AND cancel_last_at > datetime('now', ?)",
+        (row_id, f"-{int(pause_s)} seconds"),
+    )
+    return bool(rows)
 
 
 async def get_executor_run(
