@@ -14097,6 +14097,24 @@ async def test_a_submission_without_ci_report_is_ordered_now_and_says_so(
     [event] = await _events(db, "review_ordered_without_ci")
     assert event["generation"] == 1 and event["sha"] == _TIP
 
+    # Зелёный отчёт на закреплённом sha (находка 30d8d47c25e52e26): один
+    # заказ, строка заказа, и ни события о красном, ни строки «без отчёта».
+    before = len(recorder.calls)
+    green = await _submitted(
+        client, db, "green-pinned", ci_reports=[{"validation_status": "pass"}]
+    )
+    assert len(recorder.calls) == before + 1
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM review_dispatches WHERE task_id=?", (green,)
+    )
+    assert len(rows) == 1
+    silent = await db.execute_fetchall(
+        "SELECT 1 FROM events WHERE task_id=? AND kind IN "
+        "('review_withheld_red_ci', 'review_ordered_without_ci')",
+        (green,),
+    )
+    assert silent == []
+
 
 async def test_a_late_ci_report_orders_nothing(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
@@ -14133,5 +14151,8 @@ async def test_a_late_ci_report_orders_nothing(
         for _ in range(3):
             await sweep_review_dispatches(db)
     assert len(recorder.calls) == 1, "поздний отчёт CI заказа не ставит"
+    # Находка 64ac296015b7d20d: решение по сдаче с заказом не принимается
+    # повторно — добор после позднего красного отчёта не пишет «не куплено».
+    await maybe_dispatch_review(db, ordered, force_profile=DEEP)
     red_events = [e for e in await _events(db, "review_withheld_red_ci")]
     assert len(red_events) == 1, "событие о красном — одно на сдачу"

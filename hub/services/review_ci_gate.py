@@ -99,6 +99,15 @@ async def review_may_be_bought(
         return True
     task_id = int(task["id"])
     generation = int(task.get("submission_generation") or 0)
+    if await fetchall(
+        db,
+        "SELECT 1 FROM review_dispatches WHERE task_id=? "
+        "AND submission_generation=? LIMIT 1",
+        (task_id, generation),
+    ):
+        # Решение по этой сдаче уже принято и прогон куплен: добор, каскад и
+        # переспрос не перечитывают поздний отчёт CI (находка 64ac296015b7d20d).
+        return True
     sha = (task.get("submission_sha") or "").strip()
     report = await repo.get_ci_run_report(db, task_id, sha)
     if report is None:
