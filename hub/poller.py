@@ -2000,6 +2000,12 @@ async def _deliver_pair_task(db, task: dict) -> None:
         actor="hub",
         payload={"via": "poller_delivery"},
     )
+    # #1437: свёртка родителя, как на done-пути. Без неё фича, последнюю
+    # подзадачу которой доставил поллер, ждала перезапуска хаба
+    # (repair_stale_parent_completions), а её зависимые — вместе с ней.
+    from hub.services.lifecycle import maybe_rollup_parent
+
+    await maybe_rollup_parent(db, task_id)
     await db.commit()
     log.info("Poll: task #%d delivered and completed without a done report", task_id)
 
