@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import json
+
 import aiosqlite
 import pytest
 from httpx import AsyncClient
@@ -17,6 +19,8 @@ from hub import config
 from hub import repository as repo
 from hub.config import TokenIdentity
 from hub.integrations import cursor_cloud
+from hub.services import admin as admin_svc
+from hub.services import executor_launch as el
 from hub.services.executor_dispatch import (
     OUTCOME_CANCELLED,
     OUTCOME_FINISHED,
@@ -676,3 +680,289 @@ async def test_ceilings_default_from_config_at_order_time(db, monkeypatch):
     row = await _row(db, await _run(db, task_id))
     assert row["token_ceiling"] == 1234
     assert row["cents_ceiling"] == pytest.approx(56.0)
+
+
+# ---- #1412 (F2.4): запуск исполнителя из очереди по политике проекта ----
+
+_AGENT_TOKEN = "agent-token-1412"  # pragma: allowlist secret
+_EXEC_MODEL = "claude-4.6-sonnet"
+
+
+def _launch_config(monkeypatch, *, model: str = _EXEC_MODEL) -> None:
+    monkeypatch.setattr(config, "EXECUTOR_MODEL", model)
+    monkeypatch.setattr(config, "CURSOR_REVIEW_MODEL", "")
+    monkeypatch.setattr(config, "STEWARD_MODEL", "gpt-5.3-codex")
+    monkeypatch.setattr(config, "EXECUTOR_LAUNCH_PAUSE_S", 0)
+    monkeypatch.setattr(config, "EXECUTOR_LAUNCH_MAX_ATTEMPTS", 3)
+
+
+async def _launch_project(
+    db: aiosqlite.Connection,
+    *,
+    mode: str = "manual",
+    forge: str = "github",
+    observed: bool = True,
+    slug: str = "exec-1412",
+) -> tuple[dict, int]:
+    """Проект с кандидатом в очереди F1 и (по умолчанию) наблюдением F2.1."""
+    from hub import services
+    from hub.models import TaskCreate
+
+    pid = await repo.create_project(db, slug=slug, name=slug)
+    witness = (await services.create_task(db, TaskCreate(title="F2.1"))).id
+    if observed:
+        await repo.insert_live_check(
+            db,
+            task_id=witness,
+            sha="",
+            outcome="done",
+            observation="push в develop/main отказан: GH013",
+        )
+    policy = {"executor_launch": mode, "executor_push_rights_task": witness}
+    await repo.update_project(
+        db,
+        pid,
+        gate_policy=json.dumps(policy),
+        forge=forge,
+        repo="agentdrover/haiplane",
+    )
+    tv = await services.create_task(db, TaskCreate(title="кандидат"))
+    await repo.update_task(
+        db,
+        tv.id,
+        project_id=pid,
+        affected_areas=json.dumps(["hub/x.py"]),
+        dor_passed=1,
+    )
+    await db.commit()
+    return dict(await repo.get_project(db, pid)), tv.id
+
+
+def _creator(monkeypatch, answers: list) -> list[dict]:
+    """``create_agent_attempt``, отвечающий по списку; записывает вызовы."""
+    calls: list[dict] = []
+
+    async def _create(**kw):
+        calls.append(kw)
+        answer = answers[min(len(calls), len(answers)) - 1]
+        if isinstance(answer, cursor_cloud.Refusal):
+            return None, answer
+        return answer, None
+
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _create)
+    return calls
+
+
+_CREATED = {"agent": {"id": "bc-exec-9", "latestRunId": "run-9"}, "run": {}}
+
+
+async def _human(db: aiosqlite.Connection) -> int:
+    human = await admin_svc.create_principal(
+        db, kind="human", username="owner1412", role_slug="operator"
+    )
+    return int(human["id"])
+
+
+async def test_no_run_outside_github_or_without_policy(db, monkeypatch):
+    """AC-1: политика off и проект вне GitHub — отказ с причиной, провайдер не зван."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    human_id = await _human(db)
+
+    off, _ = await _launch_project(db, mode="off", slug="exec-off")
+    result = await el.launch_executor(db, off, issuer_principal_id=human_id)
+    assert not result.launched and result.reason.startswith(el.REASON_OFF), result
+
+    gitverse, _ = await _launch_project(db, forge="gitverse", slug="exec-gv")
+    result = await el.launch_executor(db, gitverse, issuer_principal_id=human_id)
+    assert not result.launched and result.reason.startswith(el.REASON_NOT_GITHUB)
+
+    assert calls == [], "провайдер не зван"
+
+
+async def test_manual_launch_takes_the_queue_candidate(client, db, monkeypatch):
+    """AC-2: человек жмёт запуск — агент на кандидата очереди, другое семейство,
+    код implementer выписан на задачу, строка прогона записана; агенту — 403."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {_AGENT_TOKEN: TokenIdentity("bot", "agent")}
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human_id = await _human(db)
+    key = await admin_svc.create_api_key(db, human_id, name="laptop")
+    human = {"Authorization": f"Bearer {key['plaintext_key']}"}
+    project, task_id = await _launch_project(db)
+    url = f"/api/projects/{project['slug']}/executor-launch"
+
+    refused = await client.post(
+        url, headers={"Authorization": f"Bearer {_AGENT_TOKEN}"}
+    )
+    assert refused.status_code == 403
+    assert calls == []
+
+    resp = await client.post(url, headers=human)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["task_id"] == task_id
+
+    assert len(calls) == 1
+    order = calls[0]
+    assert order["model_id"] == _EXEC_MODEL
+    assert order["name"] == cursor_cloud.agent_marker("executor", task_id, 1, 1)
+    assert f"#{task_id}" in order["prompt_text"]
+    codes = await db.execute_fetchall(
+        "SELECT kind, bound_task_id, principal_id FROM chat_pair_codes"
+    )
+    assert [tuple(c) for c in codes] == [("implementer", task_id, human_id)]
+    rows = await repo.list_executor_runs(db, task_id)
+    row = dict(rows[0])
+    assert (row["agent_id"], row["run_id"], row["model"]) == (
+        "bc-exec-9",
+        "run-9",
+        _EXEC_MODEL,
+    )
+    assert row["submission_generation"] == 1
+    _no_key_in(row)
+
+
+async def test_the_executor_family_must_differ_from_reviewer_and_steward(
+    db, monkeypatch
+):
+    """AC-2: семейство исполнителя совпало со стюардом — отказ, провайдер не зван."""
+    _launch_config(monkeypatch, model="gpt-5.2")
+    calls = _creator(monkeypatch, [_CREATED])
+    project, _ = await _launch_project(db)
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert not result.launched and result.reason.startswith(el.REASON_FAMILY), result
+    assert calls == []
+
+
+async def test_agent_creation_retries_with_a_ceiling(db, monkeypatch):
+    """AC-3: 429 и usage_limit_exceeded — повтор до потолка; исчерпание названо."""
+    _launch_config(monkeypatch)
+    human_id = await _human(db)
+    rate = cursor_cloud.Refusal(status=429, code="rate_limit_exceeded")
+    limit = cursor_cloud.Refusal(status=400, code="usage_limit_exceeded")
+
+    calls = _creator(monkeypatch, [rate, limit, _CREATED])
+    project, task_id = await _launch_project(db, slug="exec-retry")
+    result = await el.launch_executor(db, project, issuer_principal_id=human_id)
+    assert result.launched, result
+    assert [c["name"] for c in calls] == [
+        cursor_cloud.agent_marker("executor", task_id, 1, n) for n in (1, 2, 3)
+    ]
+
+    calls = _creator(monkeypatch, [rate])
+    project, task_id = await _launch_project(db, slug="exec-exhausted")
+    result = await el.launch_executor(db, project, issuer_principal_id=human_id)
+    assert not result.launched
+    assert result.reason.startswith(el.REASON_CREATE_EXHAUSTED), result
+    assert len(calls) == 3
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+    ]
+    assert any("3" in a and "429" in a for a in alerts), alerts
+
+
+async def test_no_launch_without_the_push_rights_observation(db, monkeypatch):
+    """AC-4: наблюдения F2.1 нет — отказ «нет наблюдения прав токена»."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, _ = await _launch_project(db, observed=False)
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert not result.launched
+    assert result.reason.startswith(el.REASON_NO_OBSERVATION), result
+    assert calls == []
+
+
+async def test_a_cookie_launch_without_csrf_is_refused(client, db, monkeypatch):
+    """Запуск выписывает код от имени человека: cookie-сессия без валидного
+    CSRF (любая страница в интернете) не заказывает исполнителя (#961)."""
+    from hub.auth import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {_AGENT_TOKEN: TokenIdentity("bot", "agent")}
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human_id = await _human(db)
+    session = await admin_svc.create_browser_session(db, human_id)
+    project, _ = await _launch_project(db, slug="exec-csrf")
+    client.cookies.set(config.HUB_COOKIE_NAME, session)
+    client.cookies.set(CSRF_COOKIE_NAME, "csrf-value")
+
+    resp = await client.post(
+        f"/api/projects/{project['slug']}/executor-launch",
+        headers={CSRF_HEADER_NAME: "other-value"},
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert calls == []
+
+
+async def test_the_launch_button_shows_only_in_manual(client, db, monkeypatch):
+    """Кнопка на странице проектов — только у проекта в режиме manual."""
+    _launch_config(monkeypatch)
+    manual, _ = await _launch_project(db, slug="exec-btn-manual")
+    await _launch_project(db, mode="off", slug="exec-btn-off")
+
+    page = await client.get("/projects")
+
+    assert page.status_code == 200
+    assert f"/projects/{manual['slug']}/web-executor-launch" in page.text
+    assert "/projects/exec-btn-off/web-executor-launch" not in page.text
+
+
+async def test_a_candidate_with_a_live_run_is_not_launched_twice(db, monkeypatch):
+    """По задаче уже идёт прогон — второй не заказывается."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, task_id = await _launch_project(db, slug="exec-twice")
+    await repo.create_executor_run(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-live",
+        run_id="run-live",
+        model=_EXEC_MODEL,
+    )
+    await db.commit()
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert not result.launched
+    assert result.reason.startswith(el.REASON_ALREADY_RUNNING), result
+    assert calls == []
+
+
+async def test_a_refusal_that_is_not_a_limit_is_not_retried(db, monkeypatch):
+    """invalid_model — не лимит: одна попытка и честный отказ, без повтора."""
+    _launch_config(monkeypatch)
+    calls = _creator(
+        monkeypatch, [cursor_cloud.Refusal(status=400, code="invalid_model")]
+    )
+    project, _ = await _launch_project(db, slug="exec-invalid")
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert not result.launched
+    assert result.reason.startswith(el.REASON_CREATE_REFUSED), result
+    assert len(calls) == 1
+
+
+def test_the_policy_refuses_auto_until_the_dispatcher_issues_codes():
+    """auto не записывается: без выдачи кода диспетчером (F4) запускать некому."""
+    from hub.models import validated_gate_policy
+
+    assert validated_gate_policy({"executor_launch": "manual"})["executor_launch"]
+    with pytest.raises(ValueError, match="F4"):
+        validated_gate_policy({"executor_launch": "auto"})
+    with pytest.raises(ValueError, match="executor_push_rights_task"):
+        validated_gate_policy({"executor_push_rights_task": "1409"})

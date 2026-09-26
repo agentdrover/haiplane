@@ -335,6 +335,11 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #1416: порог маленькой пересдачи в строках авторской дельты. Не гейт и
     # ничего не делегирует. Читатель: review_dispatch.small_delta_lines_of.
     "small_delta_lines",
+    # #1412 (F2.4): запуск облачного исполнителя. Не гейт и ничего не
+    # делегирует: запуск нажимает человек. Читатели:
+    # executor_launch.launch_mode_of и _observation_missing.
+    "executor_launch",
+    "executor_push_rights_task",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -377,6 +382,29 @@ def _validate_review_limit(policy: dict[str, Any]) -> None:
             raise ValueError(
                 "gate_policy review_limit_mode must be one of "
                 f"{', '.join(REVIEW_LIMIT_MODES)}, got: {mode!r}"
+            )
+
+
+def _validate_executor_launch(policy: dict[str, Any]) -> None:
+    """Refuse a launch mode the reader would silently read as off (#1412).
+
+    ``auto`` is refused with its reason: without the dispatcher issuing the
+    implementer code (F4 #1368) there is nobody to launch on its own.
+    """
+    from hub.services.executor_launch import LAUNCH_MODES
+
+    if "executor_launch" in policy and policy["executor_launch"] not in LAUNCH_MODES:
+        raise ValueError(
+            "gate_policy executor_launch must be one of "
+            f"{', '.join(LAUNCH_MODES)}, got: {policy['executor_launch']!r}; "
+            "auto waits for the dispatcher-issued implementer code (F4 #1368)"
+        )
+    if "executor_push_rights_task" in policy:
+        witness = policy["executor_push_rights_task"]
+        if isinstance(witness, bool) or not isinstance(witness, int) or witness < 1:
+            raise ValueError(
+                "gate_policy executor_push_rights_task must be a task id, "
+                f"got: {witness!r}"
             )
 
 
@@ -2422,6 +2450,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
         v["risk_map"] = _validated_risk_map(v["risk_map"])
     _validate_review_limit(v)
     _validate_orchestrator_queue(v)
+    _validate_executor_launch(v)
     _validate_count(v, "deep_daily_cap")
     _validate_count(v, "small_delta_lines")
     return v
