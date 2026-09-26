@@ -1659,3 +1659,34 @@ async def test_a_transition_completion_rolls_up_the_parent(db):
 
     assert outcome == "completed", outcome
     assert dict(await repo.get_task(db, feature))["status"] == "completed"
+
+
+async def test_a_failed_rollup_is_closed_by_the_parent_rollup_sweep(db, monkeypatch):
+    """Находка ревью #1437: свёртка упала после completed ребёнка — ребёнок
+    доставлен и закоммичен, а родителя закрывает свип следующим циклом, без
+    перезапуска хаба."""
+    from hub import poller
+    from hub.services import lifecycle
+
+    _git(CIProbeOutcome.passed, merged=True)
+    feature, _, last = await _feature_with_children(db)
+
+    async def _boom(*_a, **_kw):
+        raise RuntimeError("rollup exploded")
+
+    monkeypatch.setattr(lifecycle, "maybe_rollup_parent", _boom)
+    await _drain_pair_delivery(db)
+    assert dict(await repo.get_task(db, last))["status"] == "completed"
+    assert dict(await repo.get_task(db, feature))["status"] == "open"
+    assert not db.in_transaction, "полсвёртки не висит на соединении"
+
+    monkeypatch.undo()
+    await poller._sweep_parent_rollup(db)
+
+    assert dict(await repo.get_task(db, feature))["status"] == "completed"
+
+
+async def test_the_parent_rollup_sweep_runs_every_tick():
+    from hub import poller
+
+    assert "parent_rollup" in [s.name for s in poller.SWEEPS]
