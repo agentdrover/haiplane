@@ -2283,6 +2283,13 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_executor_runs_cancel_last_at",
         "ALTER TABLE executor_runs ADD COLUMN cancel_last_at TEXT",
     ),
+    (
+        # #1420: открытые аварии релиза читаются каждым общим hub_my_context —
+        # последнее событие release_blocked/unblocked по проекту без скана ленты.
+        "idx_events_kind_project",
+        "CREATE INDEX IF NOT EXISTS idx_events_kind_project "
+        "ON events(kind, project_id, id)",
+    ),
 ]
 
 

@@ -1901,6 +1901,9 @@ class ProdStateView(BaseModel):
     failure #824 refused to ship.
     """
 
+    # #1420: open release alerts (project, reason, since, minutes) — empty
+    # while every release moves.
+    release_blocks: list[dict[str, Any]] = Field(default_factory=list)
     deployed: dict[str, str] = Field(default_factory=dict)
     in_prod: list[ProdStateEntry] = Field(default_factory=list)
     not_in_prod: list[ProdStateEntry] = Field(default_factory=list)
@@ -1908,6 +1911,16 @@ class ProdStateView(BaseModel):
     examined: int = 0
     window: int = 0
     note: str = ""
+
+
+class ReleaseBlocksView(BaseModel):
+    """Open release alerts only (#1420) — the cheap read of hub_my_context.
+
+    The same rows as ``ProdStateView.release_blocks``, without the delivery
+    walk over completed tasks that the full snapshot costs.
+    """
+
+    release_blocks: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class TaskUpdateView(BaseModel):
