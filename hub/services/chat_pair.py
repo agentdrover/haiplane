@@ -307,9 +307,10 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
             # claim и pair_start; сверка та же и до траты кода. Отказ — не
             # None: он возможен только с действительным кодом и называет
             # соседа, а не угадывание кода.
-            from hub.services.lifecycle import check_capture_areas
+            from hub.services.lifecycle import capture_areas
 
-            await check_capture_areas(db, int(bound_task_id), "open")
+            async with capture_areas(db, int(bound_task_id), "open"):
+                pass
         acting = await get_acting_agent(db)
         if acting is None:
             return None

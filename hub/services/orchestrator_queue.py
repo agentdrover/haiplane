@@ -27,7 +27,7 @@ F2 (#1365). До этой задачи порядок держала памят�
 бы «hubble/». Глоб «*» режет путь до себя и сравнивается как префикс.
 
 Правило пересечения (``area_conflict``) здесь одно на хаб: его же читает
-захват задачи — claim, pair_start и вход по коду (``capture_conflict``,
+захват задачи — claim, pair_start, start и вход по коду (``capture_hold``,
 #1433); отказ или запись в карточке — дело lifecycle, не этого модуля.
 
 Ни одна функция здесь не пишет в задачу. Единственная запись —
@@ -38,6 +38,8 @@ F2 (#1365). До этой задачи порядок держала памят�
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import aiosqlite
@@ -171,7 +173,7 @@ def area_conflict(
     """Почему области кандидата не свободны от начатых задач; ``None`` — свободны.
 
     ЕДИНСТВЕННОЕ правило пересечения хаба (#1433): его читают и очередь
-    (``_skip_reason``), и захват задачи (``capture_conflict``). Незнание с
+    (``_skip_reason``), и захват задачи (``capture_hold``). Незнание с
     любой стороны — не «не пересекается».
     """
     if not candidate["areas"]:
@@ -203,33 +205,82 @@ def area_conflict(
     return None
 
 
-async def capture_conflict(
-    db: aiosqlite.Connection, task_id: int
-) -> tuple[str, dict[str, Any] | None]:
-    """Режим ``claim_area_check`` проекта и пересечение захватываемой задачи (#1433).
+#: Брони захвата в полёте (#1433, находка ревью c2af5487): проект → задача →
+#: её области. Живут в памяти процесса — хаб однопроцессный, как у #421/#1398.
+#: Бронь закрывает окно между сверкой и записью перехода статуса: два
+#: одновременных захвата пересекающихся задач видят друг друга здесь, пока
+#: ни один ещё не стал начатым в базе.
+_CAPTURES: dict[int, dict[int, list[str]]] = {}
 
-    Читатель для захвата — то же правило (``area_conflict``) против тех же
-    начатых задач проекта (``STARTED_STATUSES``), что и у очереди. Сама
-    задача из начатых исключена: своя бронь (claimed перед pair_start) сама с
-    собой не пересекается. Задачи других проектов не сверяются — у них другой
-    репозиторий. При ``off`` ничего не читается: выключенная сверка не стоит
-    захвату ни одного запроса.
+
+def _areas_of(row: Any) -> list[str]:
+    return [p for p in deserialize_str_list(row["affected_areas"]) if p.strip()]
+
+
+@asynccontextmanager
+async def capture_hold(
+    db: aiosqlite.Connection, task_id: int
+) -> AsyncIterator[tuple[str, dict[str, Any] | None]]:
+    """Режим ``claim_area_check`` и пересечение захватываемой задачи (#1433).
+
+    Правило — ``area_conflict``, то же, что у очереди, против начатых задач
+    проекта (``STARTED_STATUSES``) и броней других захватов в полёте. Сама
+    задача исключена: своя бронь (claimed перед pair_start) сама с собой не
+    пересекается. Другие проекты не сверяются — у них другой репозиторий. При
+    ``off`` ничего не читается и не бронируется.
+
+    Порядок — бронь, потом база. Сверка с бронями и запись своей идут в
+    одном синхронном участке, без await: из двух одновременных захватов
+    второй видит бронь первого. Бронь снимается на выходе из блока — после
+    записи перехода, при отказе или исключении; к этому моменту переход уже в
+    базе, и чтение базы следующим захватом (оно идёт ПОСЛЕ его брони) его
+    увидит.
     """
     project = await repo.resolve_project_for_task(db, task_id)
-    if project is None:
-        return project_policy.CLAIM_AREA_OFF, None
-    mode = project_policy.claim_area_check_of(project_policy.gate_policy_of(project))
-    if mode == project_policy.CLAIM_AREA_OFF:
-        return mode, None
-    tasks = await _project_tasks(db, int(project["id"]))
-    candidate = next((t for t in tasks if int(t["id"]) == task_id), None)
-    if candidate is None:
-        # Не живая задача: захват откажет по статусу сам, сверять нечего.
-        return mode, None
-    active = [
-        t for t in tasks if t["status"] in STARTED_STATUSES and int(t["id"]) != task_id
-    ]
-    return mode, area_conflict(candidate, active)
+    mode = project_policy.CLAIM_AREA_OFF
+    if project is not None:
+        mode = project_policy.claim_area_check_of(
+            project_policy.gate_policy_of(project)
+        )
+    row = (
+        await repo.get_task(db, task_id)
+        if mode != project_policy.CLAIM_AREA_OFF
+        else None
+    )
+    if (
+        project is None
+        or row is None
+        or row["archived"]
+        or row["status"] not in {"open", *STARTED_STATUSES}
+    ):
+        # Выключено или задача не живая: захват откажет по статусу сам.
+        yield mode, None
+        return
+    project_id = int(project["id"])
+    candidate: dict[str, Any] = {"id": task_id, "areas": _areas_of(row)}
+    # --- синхронный участок: без await до записи брони ---
+    held = _CAPTURES.setdefault(project_id, {})
+    in_flight = [{"id": t, "areas": a} for t, a in held.items() if t != task_id]
+    conflict = area_conflict(candidate, in_flight)
+    mine = task_id not in held
+    if mine:
+        held[task_id] = list(candidate["areas"])
+    # --- конец синхронного участка ---
+    try:
+        if conflict is None:
+            tasks = await _project_tasks(db, project_id)
+            active = [
+                t
+                for t in tasks
+                if t["status"] in STARTED_STATUSES and int(t["id"]) != task_id
+            ]
+            conflict = area_conflict(candidate, active)
+        yield mode, conflict
+    finally:
+        if mine:
+            held.pop(task_id, None)
+            if not held:
+                _CAPTURES.pop(project_id, None)
 
 
 async def _skip_reason(

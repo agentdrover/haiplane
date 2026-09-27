@@ -637,3 +637,75 @@ async def test_mcp_claim_and_pair_start_name_the_overlap() -> None:
             message = json.loads(text)["message"]
             assert "claim_area_check=warn" in message, message
             assert "#5" in message and _A_PATH in message, message
+
+
+@pytest.mark.parametrize("entrance", ["claim", "pair_start"])
+async def test_concurrent_overlapping_captures_let_exactly_one_through(
+    db, entrance: str
+):
+    """Находка ревью c2af5487: два одновременных захвата пересекающихся open-
+    задач в require — проходит ровно один, второй отказан с именем соседа.
+
+    Окно между сверкой и записью перехода закрыто бронью: без неё оба
+    захвата читают базу, где начатых ещё нет, и проходят оба. Проверено на
+    claim и на pair_start; броней после захвата и отказа не остаётся.
+    """
+    import asyncio
+
+    project = await _project(db, "cac-race", {"claim_area_check": "require"})
+    pid = int(project["id"])
+    capture = _ENTRANCES[entrance]
+    first = await _task(db, pid, areas=["hub/race/"], title="x")
+    second = await _task(db, pid, areas=["hub/race/a.py"], title="y")
+
+    real_transition = repo.transition_status_if
+
+    async def slow_transition(*args, **kwargs):
+        # Окно #365 K4 шире, чем даёт планировщик сам: без него бронь,
+        # снятая ДО записи перехода, проходила бы тест по везению.
+        await asyncio.sleep(0.2)
+        return await real_transition(*args, **kwargs)
+
+    async def later(task_id: int):
+        # Второй приходит, когда сверка первого уже позади, а переход ещё
+        # не записан: ровно то окно, которое держит бронь.
+        await asyncio.sleep(0.05)
+        return await capture(db, task_id)
+
+    with patch.object(repo, "transition_status_if", slow_transition):
+        results = await asyncio.gather(
+            capture(db, first), later(second), return_exceptions=True
+        )
+
+    passed = [r for r in results if not isinstance(r, BaseException)]
+    refused = [r for r in results if isinstance(r, HTTPException)]
+    assert len(passed) == 1 and len(refused) == 1, [
+        getattr(r, "status", r) for r in results
+    ]
+    winner, loser = first, second
+    assert passed[0].id == winner
+    assert refused[0].status_code == 409, refused[0].detail
+    assert refused[0].detail["reason"] == "claim_area_overlap"
+    assert refused[0].detail["with_task_id"] == winner
+    assert await _status(db, loser) == "open"
+    assert oq._CAPTURES == {}, oq._CAPTURES
+
+
+async def test_start_task_checks_areas_too(db):
+    """Находка ревью 13906dae: start_task — четвёртый вход, та же сверка."""
+    from hub import services
+    from hub.models import TaskStart
+
+    project = await _project(db, "cac-start", {"claim_area_check": "require"})
+    pid = int(project["id"])
+    a = await _task(db, pid, status="running", areas=[_A_PATH])
+    b = await _task(db, pid, areas=[_B_PATH])
+
+    with pytest.raises(HTTPException) as caught:
+        await services.start_task(db, b, TaskStart(plan="p"))
+
+    assert caught.value.status_code == 409, caught.value.detail
+    assert caught.value.detail["reason"] == "claim_area_overlap"
+    assert caught.value.detail["with_task_id"] == a
+    assert await _status(db, b) == "open"
+    assert not await repo.has_plan_updates(db, b), "план записан до отказа"
