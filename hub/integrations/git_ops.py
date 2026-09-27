@@ -851,6 +851,40 @@ def _stack_probe_cache_put(
 # ---------------------------------------------------------------------------
 
 
+async def _push_tree_head(
+    repo: str, path: str, temp: str, target: str, lease: str | None = None
+) -> tuple[int, str]:
+    """Запушить HEAD одноразового дерева в ``target`` через временную ветку.
+
+    pre-push хук (.githooks/pre-push) читает ЛОКАЛЬНЫЙ ref строки пуша, и ни
+    «HEAD», ни голый sha в его списке нет, — а хаб вооружает хуком каждый клон
+    воркспейса сам (#532). Так резались восстановление релизной ветки (#949),
+    обновление ветки PR (#1419), автомерж базы (#1233) и мерж пушем (#1116):
+    27.09 на проде «Blocked push from branch 'HEAD'» (#1438).
+
+    Поэтому коммит кладётся во временную локальную ветку с именем по шаблону
+    хука (``temp``) и пушится полным refspec — хук видит обычную ветку, обхода
+    нет. Настоящую локальную ветку ``target`` не трогаем: её может держать
+    живое дерево исполнителя, и ``checkout -B`` переставил бы ref под ним
+    (e74f63e646dd4078). ``lease`` — ожидаемая вершина ``target`` на origin:
+    пуш пройдёт, только если ветка всё ещё там (``None`` — без аренды; пустая
+    строка — аренда «ветки нет», как у git). Временная ветка удаляется при
+    любом исходе.
+    """
+    rc, _, err = await _git("branch", "-f", temp, "HEAD", repo=path, check=False)
+    if rc != 0:
+        return rc, f"временная ветка {temp} не создана: {err}"
+    args = ["push"]
+    if lease is not None:
+        args.append(f"--force-with-lease=refs/heads/{target}:{lease.strip()}")
+    args += ["origin", f"refs/heads/{temp}:refs/heads/{target}"]
+    try:
+        rc, _, err = await _git(*args, repo=path, check=False, timeout=60)
+    finally:
+        await _git("branch", "-D", temp, repo=repo, check=False)
+    return rc, err
+
+
 def _push_refusal(rc: int, err: str) -> BranchUpdateOutcome:
     """Отказ пуша обновлённой ветки — чьи руки его лечат (#1419).
 
@@ -3320,32 +3354,11 @@ class GitOpsIntegration:
             )
             if rc != 0:
                 return (BranchUpdateOutcome.unavailable, f"коммит мержа: {err[:150]}")
-            # #949: pre-push хук читает ЛОКАЛЬНЫЙ ref строки пуша, и «HEAD» из
-            # одноразового дерева в его списке нет — в вооружённом клоне (#532)
-            # такой пуш режется всегда. Настоящую локальную ветку задачи тоже
-            # не трогаем: её может держать живое дерево исполнителя, и
-            # ``checkout -B`` переставил бы ref под ним (e74f63e646dd4078).
-            # Коммит слияния кладётся во временную ветку по шаблону хука и
-            # пушится в удалённую ветку задачи; временная убирается всегда.
+            # #949/#1438: пуш через временную ветку по шаблону хука, аренда на
+            # закреплённую голову; временная убирается всегда.
             _, merged, _ = await _git("rev-parse", "HEAD", repo=path, check=False)
             temp = f"task-{task_id}/gate-update-{(merged or '').strip()[:8]}"
-            rc, _, err = await _git(
-                "branch", "-f", temp, "HEAD", repo=path, check=False
-            )
-            if rc != 0:
-                return (BranchUpdateOutcome.unavailable, f"ветка {temp}: {err[:150]}")
-            try:
-                rc, _, err = await _git(
-                    "push",
-                    f"--force-with-lease=refs/heads/{branch}:{tip.strip()}",
-                    "origin",
-                    f"refs/heads/{temp}:refs/heads/{branch}",
-                    repo=path,
-                    check=False,
-                    timeout=60,
-                )
-            finally:
-                await _git("branch", "-D", temp, repo=repo, check=False)
+            rc, err = await _push_tree_head(repo, path, temp, branch, lease=tip)
             if rc != 0:
                 return (_push_refusal(rc, err), f"пуш ветки: {(err or '')[:150]}")
             return (BranchUpdateOutcome.updated, f"база {base} слита в {branch}")
@@ -3489,14 +3502,9 @@ class GitOpsIntegration:
             # нём, так что это обычный fast-forward; аренда закрывает окно между
             # пробой и пушем, где чужой коммит успел бы лечь под наш вердикт.
             # Пустой ``tip`` сюда не доходит: дерево на нём и строится.
-            rc, _, err = await _git(
-                "push",
-                f"--force-with-lease=refs/heads/{branch}:{tip.strip()}",
-                "origin",
-                f"HEAD:refs/heads/{branch}",
-                repo=path,
-                check=False,
-                timeout=60,
+            # #1438: не ``HEAD:refs/heads/…`` — его режет вооружённый хук.
+            rc, err = await _push_tree_head(
+                repo, path, f"task-{task_id}/gate-merge-{sha[:8]}", branch, lease=tip
             )
             if rc != 0:
                 return False, f"пуш слитой ветки не прошёл: {err[:150]}"
@@ -3885,8 +3893,12 @@ class GitOpsIntegration:
             if rc != 0 or not merged_sha:
                 return (False, "git не назвал коммит мержа")
 
-            rc, _, err = await _git(
-                "push", "origin", f"HEAD:refs/heads/{base}", repo=path, check=False
+            # #1438: не ``HEAD:refs/heads/<база>`` — его режет вооружённый хук.
+            rc, err = await _push_tree_head(
+                workspace,
+                path,
+                f"chore/gate-merge-pr{pr_number}-{merged_sha[:8]}",
+                base,
             )
             if rc != 0:
                 detail = (err or "").strip()
