@@ -223,6 +223,13 @@ def _prompt(
             f"Ветка задачи уже есть — {task.get('branch')}, база {base}; "
             "pair-start не зови: задача в needs_decision, сдаёшь прямо из него."
         )
+    elif (task.get("branch") or "").strip():
+        # #1447: круг починки — ветка со сданной работой уже есть, агент на ней
+        # и стартует; pair-start нужен для нового поколения и вернёт её же.
+        branch_line = (
+            f"Ветка задачи уже есть — {task.get('branch')}, база {base}; ты "
+            "стартуешь на ней. pair-start вернёт это же имя — продолжай на ней."
+        )
     else:
         branch_line = f"Ветка — каноническое имя из ответа pair-start, от базы {base}."
     return (
@@ -627,6 +634,8 @@ async def repair_executor(
         ready,
         extra=_findings_block(findings),
         note=f"Повторный прогон исполнителя по находкам (#1444), нажал {issuer}",
+        # #1447: как прогон слияния, ревьюер и стюард — на ветке задачи.
+        starting_ref=str(reserved[0].get("branch") or "").strip(),
     )
 
 

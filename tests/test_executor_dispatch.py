@@ -1904,3 +1904,38 @@ async def test_the_conflict_is_rechecked_under_the_reservation(db, monkeypatch):
         dict(x)["agent_id"] != "bc-exec-9"
         for x in await repo.list_executor_runs(db, task_id)
     )
+
+
+# ---- #1447 (F5.4): повторный прогон стартует на ветке задачи ----
+
+
+async def test_a_repair_run_starts_on_the_task_branch(db, monkeypatch):
+    """AC-1: у задачи на ревью ветка уже есть — повторный прогон стартует на
+    ней, как ревьюер и стюард, и промпт говорит продолжать на ней."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    _, task_id = await _task_with_findings(db, slug="exec-repair-branch")
+    await repo.update_task(db, task_id, branch=f"task-{task_id}/work")
+    await db.commit()
+
+    result = await el.repair_executor(
+        db, task_id, issuer_principal_id=await _human(db), issuer="o"
+    )
+
+    assert result.launched, result
+    assert calls[0]["starting_ref"] == f"task-{task_id}/work"
+    prompt = calls[0]["prompt_text"]
+    assert f"Ветка задачи уже есть — task-{task_id}/work" in prompt
+
+
+async def test_a_first_launch_still_starts_on_the_base(db, monkeypatch):
+    """AC-2: кандидат очереди без ветки — первый запуск стартует на базе."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, _ = await _launch_project(db, slug="exec-first-base")
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert result.launched, result
+    assert calls[0]["starting_ref"] == "develop"
+    assert "каноническое имя из ответа pair-start" in calls[0]["prompt_text"]
