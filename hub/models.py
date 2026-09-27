@@ -354,6 +354,9 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #1433: сверка областей при захвате задачи. Не гейт и ничего не
     # делегирует. Читатель: project_policy.claim_area_check_of.
     "claim_area_check",
+    # #1434: минут тишины, после которых поллер освобождает слот исполнителя.
+    # Не гейт и ничего не делегирует. Читатель: executor_slots.dead_minutes_of.
+    "slot_dead_minutes",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -469,6 +472,17 @@ def _validate_claim_area_check(policy: dict[str, Any]) -> None:
             "gate_policy claim_area_check must be one of "
             f"{', '.join(CLAIM_AREA_CHECK_MODES)}, "
             f"got: {policy['claim_area_check']!r}"
+        )
+
+
+def _validate_slot_dead_minutes(policy: dict[str, Any]) -> None:
+    """Порог смерти слота — целое >= 1 минуты или ничего (#1434)."""
+    if "slot_dead_minutes" not in policy:
+        return
+    value = policy["slot_dead_minutes"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            f"gate_policy slot_dead_minutes must be an integer >= 1, got: {value!r}"
         )
 
 
@@ -2539,6 +2553,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_orchestrator_queue(v)
     _validate_submission_contract(v)
     _validate_claim_area_check(v)
+    _validate_slot_dead_minutes(v)
     _validate_executor_launch(v)
     _validate_executor_task_ceilings(v)
     _validate_count(v, "deep_daily_cap")
@@ -3666,6 +3681,12 @@ class WhoamiView(BaseModel):
     app_version: str
 
 
+#: #1434: каналы исполнения. Правило «какую задачу в какой канал» здесь не
+#: кодируется — канал называет тот, кто выдаёт код.
+EXECUTOR_CHANNELS: tuple[str, ...] = ("cloud", "slot")
+_SLOT_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+
+
 class ChatPairStartRequest(BaseModel):
     """Optional body on POST /api/auth/chat-pair/start (#980).
 
@@ -3675,6 +3696,11 @@ class ChatPairStartRequest(BaseModel):
 
     kind: str = "intake"
     task_id: int | None = None
+    #: #1434: канал исполнения — ``cloud`` или ``slot``; пусто — не назван, и
+    #: код работает как до задачи. Только для implementer.
+    channel: str = ""
+    #: Имя слота (``slot-2``) — только при ``channel=slot`` и обязательно там.
+    slot: str = ""
 
     @field_validator("kind")
     @classmethod
@@ -3683,6 +3709,28 @@ class ChatPairStartRequest(BaseModel):
         if kind not in {"intake", "implementer"}:
             raise ValueError("kind must be intake or implementer")
         return kind
+
+    @model_validator(mode="after")
+    def _channel(self) -> ChatPairStartRequest:
+        self.channel = (self.channel or "").strip().lower()
+        self.slot = (self.slot or "").strip().lower()
+        if not self.channel and not self.slot:
+            return self
+        if self.kind != "implementer":
+            raise ValueError("channel and slot are for kind=implementer only")
+        if self.channel not in EXECUTOR_CHANNELS:
+            raise ValueError(
+                f"channel must be one of {', '.join(EXECUTOR_CHANNELS)}, "
+                f"got: {self.channel!r}"
+            )
+        if self.channel == "slot" and not _SLOT_NAME.fullmatch(self.slot):
+            raise ValueError(
+                "channel=slot needs slot: lowercase letters, digits and dashes, "
+                f"up to 32 chars, got: {self.slot!r}"
+            )
+        if self.channel == "cloud" and self.slot:
+            raise ValueError("channel=cloud takes no slot name")
+        return self
 
 
 class ChatPairStartView(BaseModel):

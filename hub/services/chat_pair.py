@@ -127,11 +127,16 @@ async def issue_code(
     kind: str = "intake",
     bound_task_id: int | None = None,
     bound_generation: int | None = None,
+    channel: str = "",
+    slot: str = "",
 ) -> tuple[str, int]:
     """Burn unused codes in this (principal, kind, bound_task_id) bucket, mint one.
 
     Intake and implementer do not kill each other: burn is scoped to the
     same kind (and, for implementer, the same bound task).
+
+    ``channel``/``slot`` (#1434) ride along with the code into its session and
+    land on the task card at capture; empty keeps today's behaviour.
     """
     kind = (kind or "intake").strip().lower() or "intake"
     if kind in config.CHAT_PAIR_TASK_BOUND_KINDS:
@@ -167,8 +172,8 @@ async def issue_code(
     await db.execute(
         "INSERT INTO chat_pair_codes "
         "(principal_id, kind, bound_task_id, bound_generation, code_hash, "
-        " expires_at) "
-        "VALUES (?, ?, ?, ?, ?, datetime('now', ?))",
+        " expires_at, channel, slot) "
+        "VALUES (?, ?, ?, ?, ?, datetime('now', ?), ?, ?)",
         (
             principal_id,
             kind,
@@ -176,6 +181,8 @@ async def issue_code(
             bound_generation,
             hash_pair_code(code),
             f"+{int(ttl)} seconds",
+            channel if kind == "implementer" else "",
+            slot if kind == "implementer" else "",
         ),
     )
     await db.commit()
@@ -217,6 +224,9 @@ async def issue_run_code(
         kind="implementer",
         bound_task_id=int(task_id),
         bound_generation=int(generation),
+        # #1434: диспетчер хаба запускает облачного исполнителя — канал
+        # известен по построению и ложится в карточку при захвате.
+        channel="cloud",
     )
     await admin_svc.write_audit(
         db,
@@ -274,7 +284,7 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
     rows = await fetchall(
         db,
         "SELECT c.id, c.principal_id, c.kind, c.bound_task_id, "
-        "c.bound_generation, p.username, p.status "
+        "c.bound_generation, c.channel, c.slot, p.username, p.status "
         "FROM chat_pair_codes c JOIN principals p ON p.id = c.principal_id "
         "WHERE c.code_hash = ? AND c.redeemed_at IS NULL "
         "AND c.expires_at > datetime('now')",
@@ -358,8 +368,8 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
     await db.execute(
         "INSERT INTO chat_pair_sessions "
         "(principal_id, acting_principal_id, kind, bound_task_id, "
-        " bound_generation, token_hash, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?))",
+        " bound_generation, token_hash, expires_at, channel, slot) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?)",
         (
             row["principal_id"],
             acting_id,
@@ -368,6 +378,8 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
             row.get("bound_generation"),
             hash_pair_code(token),
             f"+{int(ttl)} seconds",
+            row.get("channel") or "",
+            row.get("slot") or "",
         ),
     )
     await db.commit()

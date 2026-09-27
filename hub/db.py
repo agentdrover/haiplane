@@ -2290,6 +2290,49 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_events_kind_project "
         "ON events(kind, project_id, id)",
     ),
+    (
+        # #1434 (F7): канал (cloud | slot) и имя слота — атрибуты выдачи кода
+        # implementer. Пусто — канал не назван: код без канала работает как
+        # до задачи (облачный исполнитель, пилот SID).
+        "add_chat_pair_codes_channel",
+        "ALTER TABLE chat_pair_codes ADD COLUMN channel TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_chat_pair_codes_slot",
+        "ALTER TABLE chat_pair_codes ADD COLUMN slot TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_chat_pair_sessions_channel",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN channel TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_chat_pair_sessions_slot",
+        "ALTER TABLE chat_pair_sessions ADD COLUMN slot TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1434: захват задачи в названном канале. Строка живёт от захвата до
+        # released_at: outcome occupied -> freed (задача ушла из работы: сдача,
+        # возврат, отказ) или released_dead (поллер освободил слот без
+        # признаков жизни, reason называет, сколько минут тишины).
+        "create_executor_slots",
+        """CREATE TABLE IF NOT EXISTS executor_slots (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id      INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            channel      TEXT    NOT NULL,
+            slot         TEXT    NOT NULL DEFAULT '',
+            captured_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            released_at  TEXT,
+            outcome      TEXT    NOT NULL DEFAULT 'occupied',
+            reason       TEXT    NOT NULL DEFAULT ''
+        )""",
+    ),
+    (
+        # Одна живая строка на задачу: повторный захват (claim, затем
+        # pair-start той же сессией) — INSERT OR IGNORE, а не вторая строка.
+        "idx_executor_slots_active",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_executor_slots_active "
+        "ON executor_slots(task_id) WHERE released_at IS NULL",
+    ),
 ]
 
 
