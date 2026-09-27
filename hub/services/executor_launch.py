@@ -61,6 +61,7 @@ REASON_NO_MODEL = "модель исполнителя не задана"
 REASON_NO_CANDIDATE = "очередь не назвала задачу"
 REASON_NO_SKILL = "в библиотеке нет активного скилла дисциплины исполнителя"
 REASON_TASK_BUDGET = "бюджет исполнителя на задачу исчерпан"
+REASON_TASK_BUDGET_UNKNOWN = "бюджет исполнителя на задачу неизвестен"
 #: Скилл, который промпт вставляет целиком (#1441, F3).
 DISCIPLINE_SKILL = "executor-pair-discipline"
 REASON_ALREADY_RUNNING = "по задаче уже идёт прогон исполнителя"
@@ -287,8 +288,11 @@ async def _reserve(
         # #1443 (F5.1): суммарный бюджет задачи — под той же транзакцией, что
         # и бронь, чтобы два нажатия не прошли проверку оба.
         budget = await task_budget(db, task_id, project_policy.gate_policy_of(project))
-        if budget.exhausted:
-            reason = f"{REASON_TASK_BUDGET}: {budget.text()}"
+        if budget.exhausted or budget.unknown:
+            head = (
+                REASON_TASK_BUDGET if budget.exhausted else REASON_TASK_BUDGET_UNKNOWN
+            )
+            reason = f"{head}: {budget.text()}"
             await repo.add_task_update(
                 db,
                 task_id,

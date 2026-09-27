@@ -468,6 +468,9 @@ class TaskBudget:
     tokens_spent: int
     cents_ceiling: float
     token_ceiling: int
+    #: Прогоны с агентом, чья цена или токены не прочитаны (находка ревью
+    #: #1443): «неизвестно» — не ноль (#516, #549, #1410).
+    unpriced: int = 0
 
     @property
     def cents_left(self) -> float:
@@ -478,6 +481,11 @@ class TaskBudget:
         return max(0, self.token_ceiling - self.tokens_spent)
 
     @property
+    def unknown(self) -> bool:
+        """Сумма неизвестна: остаток не называется, заказ не делается."""
+        return self.unpriced > 0
+
+    @property
     def exhausted(self) -> bool:
         return (
             self.cents_spent >= self.cents_ceiling
@@ -485,11 +493,17 @@ class TaskBudget:
         )
 
     def text(self) -> str:
-        return (
+        known = (
             f"потрачено {_num(self.cents_spent)} ¢ из {_num(self.cents_ceiling)} ¢ "
             f"и {self.tokens_spent} токенов из {self.token_ceiling} "
             f"за {self.runs} прогон(ов)"
         )
+        if self.unknown:
+            return (
+                f"{known}; цена {self.unpriced} прогон(ов) не прочитана — "
+                "сумма не меньше названной, остаток неизвестен"
+            )
+        return known
 
 
 def _positive(value: Any, cast: type) -> Any:
@@ -505,9 +519,10 @@ async def task_budget(
     """Бюджет задачи: сумма ВСЕХ её прогонов против потолка (#1443).
 
     Одна функция на все заказы — первый запуск (#1412) и круг починки
-    (F5.2/F5.3): второй копии правила нет. Идущий прогон считается по
-    последним прочитанным цифрам строки; непрочитанная цена — ноль в сумме,
-    но строка всё равно считается прогоном.
+    (F5.2/F5.3): второй копии правила нет. Прочитанное складывается; прогон
+    с агентом, у которого цена или токены не прочитаны, — не ноль, а
+    неизвестность (``unpriced``): остаток тогда не называется, и заказ не
+    делается. Бронь без агента (заказ не состоялся) стоит ноль честно.
     """
     if policy is None:
         from hub.services.project_policy import gate_policy_for_task
@@ -522,6 +537,11 @@ async def task_budget(
         tokens_spent=sum(int(r["tokens"] or 0) for r in rows),
         cents_ceiling=cents_ceiling or float(config.EXECUTOR_TASK_CENTS_CEILING),
         token_ceiling=token_ceiling or int(config.EXECUTOR_TASK_TOKEN_CEILING),
+        unpriced=sum(
+            1
+            for r in rows
+            if r["agent_id"] and (r["cents"] is None or r["tokens"] is None)
+        ),
     )
 
 
@@ -561,6 +581,8 @@ async def executor_runs_view(
             "token_ceiling": budget.token_ceiling,
             "tokens_left": budget.tokens_left,
             "exhausted": budget.exhausted,
+            "unpriced": budget.unpriced,
+            "unknown": budget.unknown,
         },
     }
 

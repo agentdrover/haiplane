@@ -1377,3 +1377,57 @@ async def test_the_task_card_shows_the_budget_left(client, db, monkeypatch):
     assert page.status_code == 200
     assert "Бюджет задачи: 250.0 ¢ из 1000.0 ¢" in page.text
     assert "осталось 750.0 ¢" in page.text
+
+
+async def test_an_unread_price_is_not_counted_as_zero(client, db, monkeypatch):
+    """Находка ревью #1443: прогон с агентом без прочитанной цены — не ноль.
+    Остаток не называется, запуск отказан «бюджет неизвестен»; бронь без
+    агента (заказ не состоялся) стоит ноль честно."""
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(config, "EXECUTOR_TASK_CENTS_CEILING", 1000.0)
+    monkeypatch.setattr(config, "EXECUTOR_TASK_TOKEN_CEILING", 50_000_000)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, task_id = await _launch_project(db, slug="exec-unpriced")
+    silent = await repo.create_executor_run(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-silent",
+        run_id="run-silent",
+        model=_EXEC_MODEL,
+    )
+    await repo.update_executor_run(db, silent, outcome="finished", finish=True)
+    never = await repo.create_executor_run(
+        db,
+        task_id=task_id,
+        submission_generation=2,
+        agent_id="",
+        run_id="",
+        model=_EXEC_MODEL,
+    )
+    await repo.update_executor_run(db, never, outcome="failed", finish=True)
+    await db.commit()
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert not result.launched
+    assert result.reason.startswith(el.REASON_TASK_BUDGET_UNKNOWN), result
+    assert "цена 1 прогон" in result.reason, "бронь без агента неизвестной не считается"
+    assert calls == []
+    page = await client.get(f"/tasks/{task_id}")
+    assert "остаток неизвестен" in page.text
+    assert "осталось 1000.0 ¢" not in page.text
+
+
+async def test_the_task_card_shows_the_token_budget_too(client, db, monkeypatch):
+    """Находка ревью #1443 (low): потолок токенов сам закрывает заказ — его
+    цифры тоже в карточке."""
+    monkeypatch.setattr(config, "EXECUTOR_TASK_CENTS_CEILING", 1000.0)
+    monkeypatch.setattr(config, "EXECUTOR_TASK_TOKEN_CEILING", 10_000)
+    task_id = await _task(db)
+    await _spent_run(db, task_id, cents=10.0, tokens=4_000)
+
+    page = await client.get(f"/tasks/{task_id}")
+
+    text = " ".join(page.text.split())
+    assert "токенов 4000 из 10000, осталось 6000" in text
