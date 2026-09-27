@@ -708,6 +708,11 @@ async def _launch_project(
     from hub import services
     from hub.models import TaskCreate
 
+    from hub.db import seed_default_skills
+
+    # #1441: запуск без скилла дисциплины отказывает — скилл засеян, как на
+    # подъёме приложения.
+    await seed_default_skills(db)
     pid = await repo.create_project(db, slug=slug, name=slug)
     witness = (await services.create_task(db, TaskCreate(title="F2.1"))).id
     if observed:
@@ -1163,3 +1168,100 @@ async def test_the_poller_keeps_the_blind_loss_reason(db, monkeypatch):
     row = dict((await repo.list_executor_runs(db, task_id))[0])
     assert row["outcome"] == "running"
     assert row["reason"].startswith(el.REASON_ANSWER_BLIND), row["reason"]
+
+
+# ---- #1441 (F3): скилл дисциплины исполнителя в промпте, среда облака ----
+
+_SKILL = "executor-pair-discipline"
+
+
+async def test_the_order_prompt_redeems_first_and_carries_the_skill(db, monkeypatch):
+    """AC-1: обмен кода — первый шаг; текст активной версии скилла вставлен;
+    ключа Cursor и токенов хаба в промпте нет."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, _ = await _launch_project(db, slug="exec-skill")
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert result.launched, result
+    prompt = calls[0]["prompt_text"]
+    skill = dict(await repo.get_active_skill(db, _SKILL))
+    assert skill["content"].strip() in prompt, (
+        "активная версия скилла вставлена целиком"
+    )
+    redeem_at = prompt.index("/api/auth/chat-pair/redeem")
+    assert redeem_at < prompt.index(skill["content"].strip()[:40]), (
+        "обмен кода — до дисциплины и любой работы"
+    )
+    assert prompt.lstrip().startswith("ПЕРВЫЙ ШАГ") or redeem_at < 400
+    assert _FAKE_KEY not in prompt
+
+
+async def test_the_skill_carries_every_discipline_rule(db):
+    """AC-3: каждое правило дисциплины из спеки (docs/specs/
+    orchestrator-executor-environment.md) и постановки F3 есть в скилле."""
+    from hub.db import seed_default_skills
+
+    await seed_default_skills(db)
+    content = dict(await repo.get_active_skill(db, _SKILL))["content"]
+    rules = {
+        "обмен кода первым": "первым шагом",
+        "RED до кода": "RED",
+        "мутации без байткода": "PYTHONDONTWRITEBYTECODE=1",
+        "cmp после отката": "cmp",
+        "каждое место применения": "каждое место применения",
+        "имя упавшего теста": "имя упавшего теста",
+        "rc, а не хвост": "EXIT:$?",
+        "pytest кусками": "5 минут",
+        "пуш полным refspec": "refs/heads/${B}:refs/heads/${B}",
+        "CI нужного sha": "нужного sha",
+        "ровно одна сдача": "ровно одна сдача",
+        "проверка после ошибки транспорта": "ошибка транспорта",
+        "pair-start и submit подряд после rework": "подряд",
+        "без субагентов": "без субагентов",
+        "свой каталог временных файлов": "временных файлов",
+        "исходы находок прошлой сдачи": "исходы находок",
+        "завершить прогон после сдачи": "заверши прогон",
+    }
+    text = content.lower()
+    missing = [name for name, marker in rules.items() if marker.lower() not in text]
+    assert not missing, f"в скилле нет правил: {missing}"
+
+
+async def test_no_launch_without_the_discipline_skill(db, monkeypatch):
+    """AC-4: активной версии скилла нет — отказ с причиной, провайдер не зван."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, _ = await _launch_project(db, slug="exec-noskill")
+    await db.execute("UPDATE skills SET status='draft' WHERE name=?", (_SKILL,))
+    await db.commit()
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert not result.launched
+    assert result.reason.startswith(el.REASON_NO_SKILL), result
+    assert calls == []
+
+
+def test_the_cloud_environment_installs_uv_and_syncs():
+    """Среда облака (#1441): environment.json зовёт скрипт установки, скрипт
+    ставит uv при отсутствии и синхронизирует зависимости. Живое наблюдение
+    make check — AC-2, вручную."""
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    env = json.loads((root / ".cursor" / "environment.json").read_text())
+    assert env["install"] == "bash .cursor/install.sh"
+    script = (root / ".cursor" / "install.sh").read_text()
+    commands = [
+        line.strip()
+        for line in script.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert "set -euo pipefail" in commands
+    assert any("command -v uv" in line for line in commands)
+    assert "uv sync --frozen" in commands, (
+        "зависимости ставятся командой, а не комментарием"
+    )
