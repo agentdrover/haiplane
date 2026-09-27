@@ -64,6 +64,10 @@ REASON_NO_ACTING_AGENT = "нет агента chat-pair"
 REASON_CREATE_REFUSED = "провайдер отказал в создании агента"
 REASON_CREATE_EXHAUSTED = "создание агента не удалось за все попытки"
 REASON_ANSWER_LOST = "ответ на создание агента не дошёл"
+REASON_ANSWER_BLIND = (
+    "ответ на создание агента не дошёл, и спросить провайдера не удалось — "
+    "агент мог быть создан, бронь держится"
+)
 REASON_RESERVATION_ABANDONED = (
     "бронь запуска брошена: агент так и не был записан за отведённое время"
 )
@@ -232,6 +236,10 @@ async def _create(
             seen = await cursor_cloud.find_agent_by_name(marker)
             if seen.agent_id:
                 return seen.agent_id, seen.run_id, ""
+            if not seen.asked:
+                # #1439 AC-4: «не смогли спросить» — не «агента нет». Агент мог
+                # быть создан; бронь держится до срока брошенной (_candidate).
+                return "", "", f"{REASON_ANSWER_BLIND}: {refusal.detail}"
             return "", "", f"{REASON_ANSWER_LOST}: {refusal.detail}"
         last = _refusal_text(refusal)
         if not _should_retry(refusal):
@@ -276,8 +284,10 @@ async def _reserve(
             run_id="",
             model=model,
         )
-        code, _ttl = await chat_pair.issue_code(
-            db, issuer_principal_id, kind="implementer", bound_task_id=task_id
+        # #1439 (F4): код выписывает хаб от имени агента chat-pair на задачу
+        # и поколение прогона; нажавший человек — в аудите.
+        code, _ttl = await chat_pair.issue_run_code(
+            db, task_id, generation, issued_by_principal_id=issuer_principal_id
         )
     return task, generation, row_id, code
 
@@ -308,10 +318,14 @@ async def launch_executor(
     }
     agent_id, run_id, failed = await _create(task_id, generation, order)
     if failed:
-        # Бронь закрывается: следующий запуск не должен упереться в «уже идёт».
-        await repo.update_executor_run(
-            db, row_id, outcome=OUTCOME_FAILED, reason=failed, finish=True
-        )
+        if failed.startswith(REASON_ANSWER_BLIND):
+            # Бронь остаётся: второй запуск купил бы второго агента вслепую.
+            await repo.update_executor_run(db, row_id, reason=failed)
+        else:
+            # Бронь закрывается: следующий запуск не упрётся в «уже идёт».
+            await repo.update_executor_run(
+                db, row_id, outcome=OUTCOME_FAILED, reason=failed, finish=True
+            )
         await repo.add_task_update(
             db, task_id, "hub", "alert", f"Исполнитель НЕ запущен: {failed}."
         )

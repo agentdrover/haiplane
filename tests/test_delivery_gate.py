@@ -4791,3 +4791,225 @@ async def test_git_ops_update_by_push_leaves_a_live_worktree_branch_alone(
     assert _gv_git(live, "status", "--porcelain") == ""
     leftovers = _gv_git(work, "branch", "--list", "task-1/gate-update-*")
     assert leftovers == "", "временная ветка убрана"
+
+
+# ---- #1438: пуши гейта из одноразового дерева через вооружённый хук ----
+#
+# Класс #949/#1419. Хаб вооружает pre-push хуком каждый клон воркспейса сам
+# (#532), а хук читает ЛОКАЛЬНЫЙ ref строки пуша. ``HEAD:refs/heads/<ветка>``
+# из одноразового дерева даёт local ref «HEAD», которого в списке нет, — на
+# проде 27.09 так упал автомерж базы #1233 при доставке #1419. Тесты #1233
+# гоняли клоны без хука и дефекта не видели, поэтому здесь клон вооружён
+# НАСТОЯЩИМ хуком репозитория; обход хука не допускается.
+
+_HOOKS = Path(__file__).resolve().parent.parent / ".githooks"
+
+
+def _arm(repo) -> None:
+    _run_git("git", "config", "core.hooksPath", str(_HOOKS), cwd=repo)
+
+
+def _repo_behind_the_base(tmp_path):
+    """Клон, где ветка задачи отстала от develop без конфликта."""
+    import subprocess
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "develop", str(origin)], check=True
+    )
+    repo = tmp_path / "work"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    _run_git("git", "config", "user.email", "t@example.com", cwd=repo)
+    _run_git("git", "config", "user.name", "t", cwd=repo)
+    (repo / "common.py").write_text("X = 1\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-q", "-m", "common", cwd=repo)
+    _run_git("git", "push", "-q", "origin", "develop", cwd=repo)
+    _run_git("git", "checkout", "-q", "-b", "task-1438/probe", cwd=repo)
+    (repo / "branch.py").write_text("B = 1\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-q", "-m", "branch work", cwd=repo)
+    _run_git("git", "push", "-q", "origin", "task-1438/probe", cwd=repo)
+    _run_git("git", "checkout", "-q", "develop", cwd=repo)
+    (repo / "base.py").write_text("D = 1\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-q", "-m", "base moved", cwd=repo)
+    _run_git("git", "push", "-q", "origin", "develop", cwd=repo)
+    return repo
+
+
+async def test_base_automerge_push_passes_the_armed_pre_push_hook(tmp_path) -> None:
+    # AC-1 (#1438): автомерж базы (#1233) пушит слитую ветку через хук.
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    repo = _repo_behind_the_base(tmp_path)
+    _arm(repo)
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1438/probe")
+    base_tip = _tip(repo, "develop")
+    files, why = await ops.base_merge_conflicts(
+        str(repo), "develop", "task-1438/probe", 1438, pinned
+    )
+    assert files == {}, why
+
+    async def _green(_path):
+        return 0, "ok"
+
+    ok, sha = await ops.push_resolved_base_merge(
+        str(repo), "develop", "task-1438/probe", 1438, {}, _green, pinned, files
+    )
+
+    assert ok, sha
+    assert "Blocked push" not in sha
+    assert _tip(repo, "task-1438/probe") == sha, "на origin ровно слитый коммит"
+    assert (
+        _run_git_out(
+            "git", "merge-base", "origin/task-1438/probe", "origin/develop", cwd=repo
+        )
+        == base_tip
+    ), "база слита в ветку"
+    assert (
+        _run_git_out("git", "merge-base", "--is-ancestor", pinned, sha, cwd=repo) == ""
+    ), "закреплённый коммит — предок слитого"
+    leftovers = _run_git_out("git", "branch", "--list", "task-1438/gate-*", cwd=repo)
+    assert leftovers == "", "временная ветка убрана"
+
+
+async def test_base_automerge_push_keeps_the_lease_under_the_hook(tmp_path) -> None:
+    # AC-2 (#1438): ветка на origin уехала после пробы — аренда отказывает, и
+    # отказывает именно она, а не хук; чужой коммит цел.
+    import subprocess
+
+    from hub.integrations.git_ops import GitOpsIntegration
+
+    repo = _repo_behind_the_base(tmp_path)
+    _arm(repo)
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1438/probe")
+    other = tmp_path / "other"
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "-q",
+            "-b",
+            "task-1438/probe",
+            str(tmp_path / "origin.git"),
+            str(other),
+        ],
+        check=True,
+    )
+
+    async def _green_while_someone_pushes(_path):
+        # Окно между пробой и пушем: дерево уже построено на закреплении,
+        # а в ветку задачи ложится чужой коммит.
+        (other / "race.py").write_text("R = 1\n")
+        _run_git("git", "add", "-A", cwd=other)
+        _run_git(
+            "git",
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@e",
+            "commit",
+            "-qm",
+            "race",
+            cwd=other,
+        )
+        _run_git("git", "push", "-q", "origin", "task-1438/probe", cwd=other)
+        return 0, "ok"
+
+    ok, detail = await ops.push_resolved_base_merge(
+        str(repo),
+        "develop",
+        "task-1438/probe",
+        1438,
+        {},
+        _green_while_someone_pushes,
+        pinned,
+        {},
+    )
+
+    intruder = _run_git_out("git", "rev-parse", "HEAD", cwd=other)
+    assert not ok, "ветка уехала — пуш обязан отказать"
+    assert "Blocked push" not in detail, (
+        "отказать должна аренда, а не хук: иначе аренду тест не проверяет"
+    )
+    assert _tip(repo, "task-1438/probe") == intruder, "чужой коммит не перезаписан"
+    leftovers = _run_git_out("git", "branch", "--list", "task-1438/gate-*", cwd=repo)
+    assert leftovers == "", "временная ветка убрана и при отказе"
+
+
+async def test_base_automerge_push_leaves_a_live_worktree_branch_alone(
+    tmp_path,
+) -> None:
+    # #1438 по образцу e74f63e646dd4078: ветку задачи держит живое дерево
+    # исполнителя. Настоящий путь #1233 — с конфликтом и разрешением — пушит
+    # через хук и не трогает ни локальную ветку, ни чужое дерево.
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services import base_merge
+
+    repo = _repo_with_a_tail_conflict(tmp_path)
+    _arm(repo)
+    live = tmp_path / "live"
+    _run_git("git", "worktree", "add", "-q", str(live), "task-1233/probe", cwd=repo)
+    local_before = _run_git_out(
+        "git", "rev-parse", "refs/heads/task-1233/probe", cwd=repo
+    )
+    ops = GitOpsIntegration()
+    pinned = _tip(repo, "task-1233/probe")
+    files, why = await ops.base_merge_conflicts(
+        str(repo), "develop", "task-1233/probe", 1233, pinned
+    )
+    assert files, why
+    resolutions, _ = base_merge.plan_resolution(files)
+
+    async def _green(_path):
+        return 0, "ok"
+
+    ok, sha = await ops.push_resolved_base_merge(
+        str(repo),
+        "develop",
+        "task-1233/probe",
+        1233,
+        resolutions,
+        _green,
+        pinned,
+        files,
+    )
+
+    assert ok, sha
+    assert _tip(repo, "task-1233/probe") == sha, "удалённая ветка слита"
+    assert (
+        _run_git_out("git", "rev-parse", "refs/heads/task-1233/probe", cwd=repo)
+        == local_before
+    ), "локальная ветка живого дерева не сдвинута"
+    assert _run_git_out("git", "rev-parse", "HEAD", cwd=live) == local_before
+    assert _run_git_out("git", "status", "--porcelain", cwd=live) == ""
+    leftovers = _run_git_out("git", "branch", "--list", "task-1233/gate-*", cwd=repo)
+    assert leftovers == "", "временная ветка убрана"
+
+
+async def test_merge_by_push_passes_the_armed_pre_push_hook(request) -> None:
+    # #1438, второй найденный пуш: мерж PR локальным git (#1116, форжи без
+    # API-мержа) пушил ``HEAD:refs/heads/<база>`` — в вооружённом клоне он
+    # режется тем же хуком.
+    from hub.integrations.git_ops import GitOpsIntegration
+    from tests.test_forge_gitverse_delivery import _forge
+
+    bare, work = request.getfixturevalue("repo_pair")
+    _gv_git(work, "config", "core.hooksPath", str(_HOOKS))
+    _gv_git(work, "config", "haiplane.baseBranch", "main")
+    _gv_git(work, "config", "haiplane.releaseBranch", "release")
+    ops = GitOpsIntegration(forge=_forge())
+
+    ok, detail = await ops.merge_pr_by_push(
+        7, "feat(task): работа (#1)", repo=str(work)
+    )
+
+    assert ok, detail
+    assert "Blocked push" not in detail
+    assert _gv_git(bare, "rev-parse", "main") == detail, "мерж лёг в базу"
+    assert _gv_git(work, "branch", "--list", "chore/gate-merge-*") == "", (
+        "временная ветка убрана"
+    )
