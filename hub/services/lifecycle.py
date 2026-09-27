@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from datetime import UTC, datetime
+from collections.abc import AsyncIterator
 from typing import Any
 
 import contextlib
@@ -18,6 +19,7 @@ from fastapi import HTTPException, status
 from hub import commit_scope, config
 from hub import db as db_module
 from hub.actionable_errors import (
+    claim_area_conflict_detail,
     submission_contract_violated_detail,
     changes_requested_requires_content_detail,
     verdict_contradicts_its_text_detail,
@@ -1492,6 +1494,47 @@ async def refuse_opening_without_subject(
     )
 
 
+@contextlib.asynccontextmanager
+async def capture_areas(
+    db: aiosqlite.Connection, task_id: int, current_status: str
+) -> AsyncIterator[dict[str, Any] | None]:
+    """Сверка областей при захвате задачи — одна на четыре входа (#1433).
+
+    Через неё идут claim_task, pair_start_task, start_task и вход по
+    одноразовому коду implementer (chat_pair.redeem_code). Правило —
+    orchestrator_queue, второй копии нет. Переход статуса пишется ВНУТРИ
+    блока: бронь (``capture_hold``) держится до его записи, иначе два
+    одновременных захвата прошли бы оба (находка ревью c2af5487). Режим —
+    политика проекта ``claim_area_check``:
+
+    * off — ничего не читается и не пишется, захват как до #1433;
+    * warn — захват проходит, в карточке ОДНА запись с задачей-соседом и
+      путём (повторная встреча того же пересечения — claim, затем
+      pair_start — вторую не пишет); вызывающий получает пересечение;
+    * require — отказ структурной ошибкой до перехода статуса.
+    """
+    from hub.services.orchestrator_queue import capture_hold
+    from hub.services.project_policy import CLAIM_AREA_MARK, CLAIM_AREA_REQUIRE
+
+    async with capture_hold(db, task_id) as (mode, conflict):
+        if conflict is None:
+            yield None
+            return
+        if mode == CLAIM_AREA_REQUIRE:
+            raise HTTPException(
+                409,
+                detail=claim_area_conflict_detail(
+                    task_id=task_id, current_status=current_status, conflict=conflict
+                ),
+            )
+        text = f"{CLAIM_AREA_MARK} (claim_area_check={mode}): {conflict['detail']}."
+        updates = await repo.get_task_updates(db, task_id)
+        if not any(str(u["content"]) == text for u in updates):
+            await repo.add_task_update(db, task_id, "hub", "alert", text)
+            await db.commit()
+        yield {"mode": mode, **conflict}
+
+
 async def start_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1516,28 +1559,31 @@ async def start_task(
 
     body = body or TaskStart()
 
-    if body.plan:
-        await repo.add_task_update(
-            db,
-            task_id,
-            task.get("assigned_agent", ""),
-            "status",
-            f"Plan: {body.plan}",
-        )
+    # #1433 (находка ревью 13906dae): the fourth entrance into work — the
+    # same area check, held until dispatch has written the transition.
+    async with capture_areas(db, task_id, task["status"]):
+        if body.plan:
+            await repo.add_task_update(
+                db,
+                task_id,
+                task.get("assigned_agent", ""),
+                "status",
+                f"Plan: {body.plan}",
+            )
 
-    if not await repo.has_plan_updates(db, task_id):
-        raise HTTPException(
-            400,
-            "Plan required before starting a task. "
-            "Either pass 'plan' field in start request or create an update "
-            "with kind='status' and content starting with 'Plan:'.",
-        )
+        if not await repo.has_plan_updates(db, task_id):
+            raise HTTPException(
+                400,
+                "Plan required before starting a task. "
+                "Either pass 'plan' field in start request or create an update "
+                "with kind='status' and content starting with 'Plan:'.",
+            )
 
-    if body.runtime:
-        await repo.update_task(db, task_id, runtime=body.runtime.value)
-        task["runtime"] = body.runtime.value
+        if body.runtime:
+            await repo.update_task(db, task_id, runtime=body.runtime.value)
+            task["runtime"] = body.runtime.value
 
-    await dispatch_task(db, task_id, task)
+        await dispatch_task(db, task_id, task)
     await log_activity(
         db,
         "task_started",
@@ -1551,6 +1597,99 @@ async def start_task(
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+async def _pair_start_write(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    body: TaskPairStart | None,
+    *,
+    caller: str,
+    implementer_principal_id: int | None,
+    declared_session: str,
+    starting_status: str,
+) -> PairGitMode:
+    """Plan, branch and the transition to running, up to the commit (#1433).
+
+    Runs inside ``capture_areas``: the area hold lasts until this commit, so a
+    concurrent overlapping capture cannot slip through the seconds that branch
+    preparation takes (#365 K4).
+    """
+    body = body or TaskPairStart()
+
+    if body.plan:
+        await repo.add_task_update(
+            db,
+            task_id,
+            task.get("assigned_agent", ""),
+            "status",
+            f"Plan: {body.plan}",
+        )
+
+    if not await repo.has_plan_updates(db, task_id):
+        raise HTTPException(
+            400,
+            "Plan required before pair-start. "
+            "Either pass 'plan' field in pair-start request or create an update "
+            "with kind='status' and content starting with 'Plan:'.",
+        )
+
+    git_mode = body.git_mode
+    slug = (body.branch_slug or "").strip()
+    if git_mode == PairGitMode.remote:
+        # Record the canonical name only. The caller creates this branch in
+        # its own clone; the hub host must not checkout, clean, or worktree.
+        branch = canonical_task_branch(task_id, slug, task.get("title") or "")
+    else:
+        try:
+            branch = await prepare_pair_branch(db, task_id, task, branch_slug=slug)
+        except PairBranchConflictError as exc:
+            raise HTTPException(422, detail=exc.to_detail()) from exc
+    if branch:
+        task["branch"] = branch
+
+    assigned_agent = (body.assigned_agent or "").strip()
+    if not assigned_agent:
+        assigned_agent = (caller or "").strip() or task.get("assigned_agent", "")
+
+    update_fields: dict[str, Any] = {
+        "job_id": None,
+        "assigned_agent": assigned_agent,
+        "git_mode": git_mode.value,
+    }
+    if implementer_principal_id is not None:
+        update_fields["implementer_principal_id"] = implementer_principal_id
+    if branch:
+        update_fields["branch"] = branch
+    # #852: pair-start from `open` skips the claim entirely, which is how a
+    # task reached running with no session at all. Whoever starts it owns it,
+    # so the address is written here too — not only on the claim path.
+    if declared_session:
+        update_fields["claim_session_id"] = declared_session
+
+    # #365 K4: the status was written unconditionally, and everything between
+    # the check above and this line is a window — branch preparation talks to
+    # git and can take seconds. Another claim, a human decision or the poller
+    # could move the task meanwhile, and the last writer simply won. Transition
+    # from the status we actually read, so a lost race is reported instead of
+    # overwriting somebody else's move. expected_from is that status and not a
+    # literal: pair-start legitimately begins from `open` or from `claimed`.
+    if not await repo.transition_status_if(
+        db, task_id, expected_from=starting_status, new_status="running"
+    ):
+        raise HTTPException(
+            409,
+            f"Task #{task_id} left {starting_status!r} during pair-start; "
+            "retry from its current status",
+        )
+    await repo.update_task(db, task_id, **update_fields)
+    # The registry follows the task the same way it follows a claim (#771
+    # AC-3): silent when the session is unregistered.
+    if declared_session:
+        await note_session_task(db, declared_session, task_id)
+    await db.commit()
+    return git_mode
 
 
 async def pair_start_task(
@@ -1641,80 +1780,19 @@ async def pair_start_task(
     # that would leave both behind.
     await refuse_opening_without_subject(db, task_id, task)
     await refuse_opening_over_review_limit(db, task_id, task)
-
-    body = body or TaskPairStart()
-
-    if body.plan:
-        await repo.add_task_update(
+    # #1433: the same place for the same reason — refused before the plan and
+    # the branch are written; the hold lasts until the transition is committed.
+    async with capture_areas(db, task_id, starting_status) as area_check:
+        git_mode = await _pair_start_write(
             db,
             task_id,
-            task.get("assigned_agent", ""),
-            "status",
-            f"Plan: {body.plan}",
+            task,
+            body,
+            caller=caller,
+            implementer_principal_id=implementer_principal_id,
+            declared_session=declared_session,
+            starting_status=starting_status,
         )
-
-    if not await repo.has_plan_updates(db, task_id):
-        raise HTTPException(
-            400,
-            "Plan required before pair-start. "
-            "Either pass 'plan' field in pair-start request or create an update "
-            "with kind='status' and content starting with 'Plan:'.",
-        )
-
-    git_mode = body.git_mode
-    slug = (body.branch_slug or "").strip()
-    if git_mode == PairGitMode.remote:
-        # Record the canonical name only. The caller creates this branch in
-        # its own clone; the hub host must not checkout, clean, or worktree.
-        branch = canonical_task_branch(task_id, slug, task.get("title") or "")
-    else:
-        try:
-            branch = await prepare_pair_branch(db, task_id, task, branch_slug=slug)
-        except PairBranchConflictError as exc:
-            raise HTTPException(422, detail=exc.to_detail()) from exc
-    if branch:
-        task["branch"] = branch
-
-    assigned_agent = (body.assigned_agent or "").strip()
-    if not assigned_agent:
-        assigned_agent = (caller or "").strip() or task.get("assigned_agent", "")
-
-    update_fields: dict[str, Any] = {
-        "job_id": None,
-        "assigned_agent": assigned_agent,
-        "git_mode": git_mode.value,
-    }
-    if implementer_principal_id is not None:
-        update_fields["implementer_principal_id"] = implementer_principal_id
-    if branch:
-        update_fields["branch"] = branch
-    # #852: pair-start from `open` skips the claim entirely, which is how a
-    # task reached running with no session at all. Whoever starts it owns it,
-    # so the address is written here too — not only on the claim path.
-    if declared_session:
-        update_fields["claim_session_id"] = declared_session
-
-    # #365 K4: the status was written unconditionally, and everything between
-    # the check above and this line is a window — branch preparation talks to
-    # git and can take seconds. Another claim, a human decision or the poller
-    # could move the task meanwhile, and the last writer simply won. Transition
-    # from the status we actually read, so a lost race is reported instead of
-    # overwriting somebody else's move. expected_from is that status and not a
-    # literal: pair-start legitimately begins from `open` or from `claimed`.
-    if not await repo.transition_status_if(
-        db, task_id, expected_from=starting_status, new_status="running"
-    ):
-        raise HTTPException(
-            409,
-            f"Task #{task_id} left {starting_status!r} during pair-start; "
-            "retry from its current status",
-        )
-    await repo.update_task(db, task_id, **update_fields)
-    # The registry follows the task the same way it follows a claim (#771
-    # AC-3): silent when the session is unregistered.
-    if declared_session:
-        await note_session_task(db, declared_session, task_id)
-    await db.commit()
     await log_activity(
         db,
         "task_pair_started",
@@ -1739,6 +1817,7 @@ async def pair_start_task(
     from hub.services.statement_freshness import statement_freshness
 
     tv.statement_freshness = await statement_freshness(db, dict(row))  # type: ignore[arg-type]
+    tv.area_check = area_check
     return tv
 
 
@@ -3896,6 +3975,52 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
     return view
 
 
+async def _claim_write(
+    db: aiosqlite.Connection,
+    task_id: int,
+    body: TaskClaim,
+    implementer_principal_id: int | None,
+) -> TaskView | None:
+    """The claim's transition and fields, up to the commit (#1433).
+
+    Runs inside ``capture_areas``: the area hold lasts until this commit.
+    Returns the view when a concurrent claim of the same holder won the race.
+    """
+    if not await repo.transition_status_if(
+        db, task_id, expected_from="open", new_status="claimed"
+    ):
+        row = _existing_task(await repo.get_task(db, task_id), task_id)
+        task = dict(row)
+        if task["status"] == "claimed" and task.get("claimed_by") == body.agent:
+            updates = await repo.get_task_updates(db, task_id)
+            return row_to_task(row, updates=updates)
+        raise HTTPException(409, f"Task #{task_id} claim conflict")
+
+    session_note = f" session={body.session_id}" if body.session_id else ""
+    claim_fields: dict[str, Any] = {
+        "claimed_by": body.agent,
+        "claim_session_id": body.session_id or None,
+        "claimed_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "assigned_agent": body.agent,
+    }
+    if implementer_principal_id is not None:
+        claim_fields["implementer_principal_id"] = implementer_principal_id
+    await repo.update_task(db, task_id, **claim_fields)
+    # The registry follows the claim inside the same transaction (#771 AC-3):
+    # two places may not disagree about which task a session holds. Silent when
+    # the session is unregistered — the registry is optional.
+    await note_session_task(db, body.session_id, task_id)
+    await repo.add_task_update(
+        db,
+        task_id,
+        body.agent,
+        "status",
+        f"Claimed by {body.agent}{session_note}",
+    )
+    await db.commit()
+    return None
+
+
 async def claim_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -3948,38 +4073,14 @@ async def claim_task(
             f"can only claim open tasks, current status: {task['status']}",
         )
 
-    if not await repo.transition_status_if(
-        db, task_id, expected_from="open", new_status="claimed"
-    ):
-        row = _existing_task(await repo.get_task(db, task_id), task_id)
-        task = dict(row)
-        if task["status"] == "claimed" and task.get("claimed_by") == body.agent:
-            updates = await repo.get_task_updates(db, task_id)
-            return row_to_task(row, updates=updates)
-        raise HTTPException(409, f"Task #{task_id} claim conflict")
-
-    session_note = f" session={body.session_id}" if body.session_id else ""
-    claim_fields: dict[str, Any] = {
-        "claimed_by": body.agent,
-        "claim_session_id": body.session_id or None,
-        "claimed_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
-        "assigned_agent": body.agent,
-    }
-    if implementer_principal_id is not None:
-        claim_fields["implementer_principal_id"] = implementer_principal_id
-    await repo.update_task(db, task_id, **claim_fields)
-    # The registry follows the claim inside the same transaction (#771 AC-3):
-    # two places may not disagree about which task a session holds. Silent when
-    # the session is unregistered — the registry is optional.
-    await note_session_task(db, body.session_id, task_id)
-    await repo.add_task_update(
-        db,
-        task_id,
-        body.agent,
-        "status",
-        f"Claimed by {body.agent}{session_note}",
-    )
-    await db.commit()
+    # #1433: before the transition, and the hold lasts until its commit — a
+    # refusal leaves the task open, a concurrent overlapping claim sees ours.
+    async with capture_areas(db, task_id, task["status"]) as area_check:
+        won_by_same_holder = await _claim_write(
+            db, task_id, body, implementer_principal_id
+        )
+    if won_by_same_holder is not None:
+        return won_by_same_holder
     await log_activity(
         db,
         "task_claimed",
@@ -3989,7 +4090,9 @@ async def claim_task(
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
-    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    tv.area_check = area_check
+    return tv
 
 
 async def release_task(

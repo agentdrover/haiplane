@@ -13,11 +13,15 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, patch
 
+import pytest
+from fastapi import HTTPException
 from httpx import AsyncClient
 
 from hub import repository as repo
 from hub.db import fetchall
+from hub.services import chat_pair as cp
 from hub.services import orchestrator_queue as oq
+from hub.services import project_policy
 
 
 async def _project(db, slug: str, policy: dict) -> dict:
@@ -408,3 +412,300 @@ async def test_project_status_names_a_failed_queue_read() -> None:
     assert "очередь недоступна" in text
     assert out.structuredContent["orchestrator_queue"] == []
     assert "очередь недоступна" in out.structuredContent["orchestrator_queue_error"]
+
+
+# ---------------------------------------------------------------------------
+# #1433: захват задачи сверяет области тем же правилом, что и очередь
+# ---------------------------------------------------------------------------
+
+_A_PATH = "hub/services/review_dispatch.py"
+_B_PATH = "hub/services/"
+
+
+async def _claim(db, task_id: int):
+    from hub import services
+    from hub.models import TaskClaim
+
+    return await services.claim_task(db, task_id, TaskClaim(agent="exec-b"))
+
+
+async def _pair_start(db, task_id: int, agent: str = ""):
+    from hub import services
+    from hub.models import PairGitMode, TaskPairStart
+
+    return await services.pair_start_task(
+        db,
+        task_id,
+        TaskPairStart(plan="p", assigned_agent=agent, git_mode=PairGitMode.remote),
+    )
+
+
+async def _redeem(db, task_id: int):
+    acting = await cp.get_acting_agent(db)
+    assert acting is not None, "исполнитель по коду не заведён — тест бы лгал"
+    code, _ = await cp.issue_code(
+        db, int(acting["id"]), kind="implementer", bound_task_id=task_id
+    )
+    return await cp.redeem_code(db, code)
+
+
+_ENTRANCES = {"claim": _claim, "pair_start": _pair_start, "code": _redeem}
+
+
+async def _status(db, task_id: int) -> str:
+    return str(dict(await repo.get_task(db, task_id))["status"])
+
+
+async def _overlap_records(db, task_id: int) -> list[str]:
+    return [
+        str(u["content"])
+        for u in await repo.get_task_updates(db, task_id)
+        if str(u["content"]).startswith(project_policy.CLAIM_AREA_MARK)
+    ]
+
+
+async def test_claim_refuses_overlap_on_every_entrance(db):
+    """AC-1: require — claim, pair_start и вход по коду отказаны одинаково,
+    ошибка называет задачу A и путь, B остаётся open."""
+    project = await _project(db, "cac-require", {"claim_area_check": "require"})
+    pid = int(project["id"])
+    a = await _task(db, pid, status="running", areas=[_A_PATH])
+
+    for entrance, capture in _ENTRANCES.items():
+        b = await _task(db, pid, areas=[_B_PATH], title=f"b-{entrance}")
+        with pytest.raises(HTTPException) as caught:
+            await capture(db, b)
+        assert caught.value.status_code == 409, (entrance, caught.value.detail)
+        detail = caught.value.detail
+        assert isinstance(detail, dict), (entrance, detail)
+        assert detail["reason"] == "claim_area_overlap", (entrance, detail)
+        assert detail["with_task_id"] == a, (entrance, detail)
+        assert detail["path"] == _B_PATH, (entrance, detail)
+        assert detail["with_path"] == _A_PATH, (entrance, detail)
+        assert f"#{a}" in detail["hint"] and _A_PATH in detail["hint"], entrance
+        assert await _status(db, b) == "open", entrance
+        assert await _overlap_records(db, b) == [], entrance
+
+
+async def test_claim_warns_once_on_overlap(db):
+    """AC-2: warn — захват проходит, в карточке ровно одна запись с A и путём,
+    хотя проверка встретилась дважды (claim, затем pair_start)."""
+    project = await _project(db, "cac-warn", {"claim_area_check": "warn"})
+    pid = int(project["id"])
+    a = await _task(db, pid, status="running", areas=[_A_PATH])
+    b = await _task(db, pid, areas=[_B_PATH])
+
+    claimed = await _claim(db, b)
+    assert claimed.status == "claimed"
+    assert claimed.area_check is not None
+    assert claimed.area_check["with_task_id"] == a
+    started = await _pair_start(db, b, agent="exec-b")
+    assert started.status == "running"
+
+    records = await _overlap_records(db, b)
+    assert len(records) == 1, records
+    assert f"#{a}" in records[0] and _A_PATH in records[0] and _B_PATH in records[0]
+
+    # Вход по коду в warn тоже проходит и пишет ту же запись — одну.
+    coded = await _task(db, pid, areas=[_B_PATH], title="b-code")
+    assert await _redeem(db, coded) is not None
+    assert len(await _overlap_records(db, coded)) == 1
+
+
+async def test_claim_without_overlap_or_off_is_unchanged(db):
+    """AC-3: off при пересечении, require без пересечения и повторный
+    pair_start своей же задачи — захват как до #1433, записей нет."""
+    off = await _project(db, "cac-off", {})
+    off_id = int(off["id"])
+    await _task(db, off_id, status="running", areas=[_A_PATH])
+    for entrance, capture in _ENTRANCES.items():
+        b = await _task(db, off_id, areas=[_B_PATH], title=f"off-{entrance}")
+        result = await capture(db, b)
+        assert result is not None, entrance
+        assert await _overlap_records(db, b) == [], entrance
+        if entrance != "code":
+            assert result.area_check is None, entrance
+
+    strict = await _project(db, "cac-free", {"claim_area_check": "require"})
+    sid = int(strict["id"])
+    await _task(db, sid, status="running", areas=[_A_PATH])
+    for entrance, capture in _ENTRANCES.items():
+        free = await _task(
+            db, sid, areas=[f"docs/{entrance}.md"], title=f"free-{entrance}"
+        )
+        assert await capture(db, free) is not None, entrance
+        assert await _overlap_records(db, free) == [], entrance
+
+    # Своя задача в claimed — начатая, но сама с собой не пересекается.
+    own = await _task(db, sid, areas=["docs/own.md"], title="own")
+    assert (await _claim(db, own)).status == "claimed"
+    assert (await _pair_start(db, own, agent="exec-b")).status == "running"
+    assert await _overlap_records(db, own) == []
+
+
+async def test_claim_treats_undeclared_areas_as_unknown(db):
+    """AC-4: пустые области у B или у начатой A — «область не объявлена»."""
+    project = await _project(db, "cac-blind-b", {"claim_area_check": "require"})
+    pid = int(project["id"])
+    await _task(db, pid, status="running", areas=[_A_PATH])
+    blind_b = await _task(db, pid, areas=[])
+    with pytest.raises(HTTPException) as caught:
+        await _claim(db, blind_b)
+    assert caught.value.status_code == 409
+    assert caught.value.detail["reason"] == "claim_area_undeclared"
+    assert "не объявлена" in caught.value.detail["hint"]
+    assert await _status(db, blind_b) == "open"
+
+    other = await _project(db, "cac-blind-a", {"claim_area_check": "require"})
+    oid = int(other["id"])
+    blind_a = await _task(db, oid, status="running", areas=[])
+    b = await _task(db, oid, areas=[_B_PATH])
+    with pytest.raises(HTTPException) as caught:
+        await _pair_start(db, b)
+    assert caught.value.detail["reason"] == "claim_area_undeclared"
+    assert caught.value.detail["with_task_ids"] == [blind_a]
+    assert f"#{blind_a}" in caught.value.detail["hint"]
+    assert await _status(db, b) == "open"
+
+
+def test_claim_area_check_reads_off_by_default_and_warn_when_unreadable():
+    """Нет ключа — off; опечатка — warn: хотели проверку, отказ по опечатке нельзя."""
+    read = project_policy.claim_area_check_of
+    assert read({}) == project_policy.CLAIM_AREA_OFF
+    assert read({"claim_area_check": "require"}) == project_policy.CLAIM_AREA_REQUIRE
+    assert read({"claim_area_check": "requre"}) == project_policy.CLAIM_AREA_WARN
+    assert read({"claim_area_check": 1}) == project_policy.CLAIM_AREA_WARN
+
+
+_WARNED = {
+    "mode": "warn",
+    "reason": "area_overlap",
+    "detail": f"{_B_PATH} пересекается с {_A_PATH} задачи #5 в работе",
+    "path": _B_PATH,
+    "with_task_id": 5,
+    "with_path": _A_PATH,
+}
+
+
+def test_cli_claim_and_pair_start_name_the_overlap() -> None:
+    """Контракт #1433 в CLI: пересечение warn уходит в stderr строкой."""
+    import argparse
+    from io import StringIO
+    from unittest.mock import MagicMock
+
+    from hub import cli
+
+    view = {"id": 9, "status": "claimed", "area_check": _WARNED}
+    for cmd, ns in (
+        (cli.cmd_claim, argparse.Namespace(task_id=9, agent="a", session_id="s")),
+        (
+            cli.cmd_pair_start,
+            argparse.Namespace(
+                task_id=9,
+                plan="",
+                agent="",
+                branch_slug="",
+                session_id="",
+                git_mode="",
+            ),
+        ),
+    ):
+        err = StringIO()
+        with (
+            patch.object(cli, "_api", MagicMock(return_value=view)),
+            patch("sys.stdout", new=StringIO()),
+            patch("sys.stderr", new=err),
+        ):
+            assert cmd(ns) == 0
+        assert "#5" in err.getvalue() and _A_PATH in err.getvalue(), cmd
+
+
+async def test_mcp_claim_and_pair_start_name_the_overlap() -> None:
+    """Контракт #1433 в MCP: пересечение warn — строкой в ответе захвата."""
+    from hub import mcp_server
+
+    view = {"id": 9, "status": "claimed", "area_check": _WARNED}
+    with (
+        patch("hub.mcp_server._api_post", new=AsyncMock(return_value=view)),
+        patch("hub.mcp_server._read_task", new=AsyncMock(return_value=view)),
+    ):
+        for out in (
+            await mcp_server.hub_claim_task(9, "a", "s"),
+            await mcp_server.hub_pair_start(9),
+        ):
+            text = out if isinstance(out, str) else out.content[0].text
+            message = json.loads(text)["message"]
+            assert "claim_area_check=warn" in message, message
+            assert "#5" in message and _A_PATH in message, message
+
+
+@pytest.mark.parametrize("entrance", ["claim", "pair_start"])
+async def test_concurrent_overlapping_captures_let_exactly_one_through(
+    db, entrance: str
+):
+    """Находка ревью c2af5487: два одновременных захвата пересекающихся open-
+    задач в require — проходит ровно один, второй отказан с именем соседа.
+
+    Окно между сверкой и записью перехода закрыто бронью: без неё оба
+    захвата читают базу, где начатых ещё нет, и проходят оба. Проверено на
+    claim и на pair_start; броней после захвата и отказа не остаётся.
+    """
+    import asyncio
+
+    project = await _project(db, "cac-race", {"claim_area_check": "require"})
+    pid = int(project["id"])
+    capture = _ENTRANCES[entrance]
+    first = await _task(db, pid, areas=["hub/race/"], title="x")
+    second = await _task(db, pid, areas=["hub/race/a.py"], title="y")
+
+    real_transition = repo.transition_status_if
+
+    async def slow_transition(*args, **kwargs):
+        # Окно #365 K4 шире, чем даёт планировщик сам: без него бронь,
+        # снятая ДО записи перехода, проходила бы тест по везению.
+        await asyncio.sleep(0.2)
+        return await real_transition(*args, **kwargs)
+
+    async def later(task_id: int):
+        # Второй приходит, когда сверка первого уже позади, а переход ещё
+        # не записан: ровно то окно, которое держит бронь.
+        await asyncio.sleep(0.05)
+        return await capture(db, task_id)
+
+    with patch.object(repo, "transition_status_if", slow_transition):
+        results = await asyncio.gather(
+            capture(db, first), later(second), return_exceptions=True
+        )
+
+    passed = [r for r in results if not isinstance(r, BaseException)]
+    refused = [r for r in results if isinstance(r, HTTPException)]
+    assert len(passed) == 1 and len(refused) == 1, [
+        getattr(r, "status", r) for r in results
+    ]
+    winner, loser = first, second
+    assert passed[0].id == winner
+    assert refused[0].status_code == 409, refused[0].detail
+    assert refused[0].detail["reason"] == "claim_area_overlap"
+    assert refused[0].detail["with_task_id"] == winner
+    assert await _status(db, loser) == "open"
+    assert oq._CAPTURES == {}, oq._CAPTURES
+
+
+async def test_start_task_checks_areas_too(db):
+    """Находка ревью 13906dae: start_task — четвёртый вход, та же сверка."""
+    from hub import services
+    from hub.models import TaskStart
+
+    project = await _project(db, "cac-start", {"claim_area_check": "require"})
+    pid = int(project["id"])
+    a = await _task(db, pid, status="running", areas=[_A_PATH])
+    b = await _task(db, pid, areas=[_B_PATH])
+
+    with pytest.raises(HTTPException) as caught:
+        await services.start_task(db, b, TaskStart(plan="p"))
+
+    assert caught.value.status_code == 409, caught.value.detail
+    assert caught.value.detail["reason"] == "claim_area_overlap"
+    assert caught.value.detail["with_task_id"] == a
+    assert await _status(db, b) == "open"
+    assert not await repo.has_plan_updates(db, b), "план записан до отказа"

@@ -347,6 +347,21 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def _warn_area_check(result: Any) -> None:
+    """Warn-mode area overlap of a claim/pair-start, on stderr (#1433).
+
+    The JSON on stdout carries it as ``area_check``; the line is for the human
+    reading the terminal, who would not look for it inside the task view.
+    """
+    found = result.get("area_check") if isinstance(result, dict) else None
+    if isinstance(found, dict) and found.get("detail"):
+        print(
+            f"area overlap (claim_area_check={found.get('mode', 'warn')}): "
+            f"{found['detail']}",
+            file=sys.stderr,
+        )
+
+
 def cmd_pair_start(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {}
     if args.plan:
@@ -361,6 +376,7 @@ def cmd_pair_start(args: argparse.Namespace) -> int:
         body["git_mode"] = args.git_mode
     result = _api("POST", f"/api/tasks/{args.task_id}/pair-start", body)
     _print_json(result)
+    _warn_area_check(result)
     return 0
 
 
@@ -570,6 +586,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
     body = {"agent": args.agent, "session_id": args.session_id or ""}
     result = _api("POST", f"/api/tasks/{args.task_id}/claim", body)
     _print_json(result)
+    _warn_area_check(result)
     return 0
 
 
