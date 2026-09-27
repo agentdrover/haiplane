@@ -343,6 +343,10 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #1432: число заходов круга, с которого deep приостановлен до решения
     # человека. Не гейт. Читатель: review_dispatch.circle_deep_stop_of.
     "circle_deep_stop",
+    # #1436: контракт сдачи — model, summary и мутация на каждый AC с тестом.
+    # Не гейт и ничего не делегирует. Читатель:
+    # project_policy.submission_contract_of.
+    "submission_contract",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -409,6 +413,21 @@ def _validate_executor_launch(policy: dict[str, Any]) -> None:
                 "gate_policy executor_push_rights_task must be a task id, "
                 f"got: {witness!r}"
             )
+
+
+def _validate_submission_contract(policy: dict[str, Any]) -> None:
+    """Refuse a contract mode the reader would read as warn by accident (#1436)."""
+    from hub.services.project_policy import SUBMISSION_CONTRACT_MODES
+
+    if (
+        "submission_contract" in policy
+        and policy["submission_contract"] not in SUBMISSION_CONTRACT_MODES
+    ):
+        raise ValueError(
+            "gate_policy submission_contract must be one of "
+            f"{', '.join(SUBMISSION_CONTRACT_MODES)}, "
+            f"got: {policy['submission_contract']!r}"
+        )
 
 
 def _validate_orchestrator_queue(policy: dict[str, Any]) -> None:
@@ -726,6 +745,21 @@ class TaskPairStart(BaseModel):
     git_mode: PairGitMode = PairGitMode.hub
 
 
+class SubmissionMutation(BaseModel):
+    """Одна заявленная мутация сдачи (#1436): что сломали и какой тест упал.
+
+    Заявление, а не наблюдение: хаб мутаций не исполняет (это #1278). Поле
+    делает заявление проверяемым по форме — ``failed_test`` сверяется с
+    ``test_ref`` именно этого AC — и видимым судье. Пустые строки не режутся
+    здесь: при ``require`` отказ перечисляет ВСЕ нарушения разом, а ошибка
+    валидации тела назвала бы только первое.
+    """
+
+    ac: str = Field("", max_length=20)
+    mutation: str = Field("", max_length=500)
+    failed_test: str = Field("", max_length=500)
+
+
 class TaskSubmitReview(BaseModel):
     """Submit the current work of a pair task for review (#305)."""
 
@@ -753,6 +787,10 @@ class TaskSubmitReview(BaseModel):
     # found in the old". A separate endpoint would let the submission land
     # without the account, which is the silence being removed.
     finding_outcomes: list[FindingOutcomeItem] = Field(default_factory=list)
+    # #1436: мутация на каждый AC с verifiable_by=test — {ac, mutation,
+    # failed_test}. Обязательность — по политике проекта submission_contract;
+    # при off поле просто пишется в карточку, если прислано.
+    mutations: list[SubmissionMutation] = Field(default_factory=list, max_length=50)
 
 
 class ReviewFinding(BaseModel):
@@ -2453,6 +2491,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
         v["risk_map"] = _validated_risk_map(v["risk_map"])
     _validate_review_limit(v)
     _validate_orchestrator_queue(v)
+    _validate_submission_contract(v)
     _validate_executor_launch(v)
     _validate_count(v, "deep_daily_cap")
     _validate_count(v, "small_delta_lines")
