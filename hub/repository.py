@@ -3283,6 +3283,21 @@ def _blocker_entry(row: dict[str, Any]) -> dict[str, Any]:
     return {**row, "delivered": delivered, "reason": reason}
 
 
+async def children_as_blockers(
+    db: aiosqlite.Connection, parent_id: int
+) -> list[dict[str, Any]]:
+    """Дети контейнера в форме строки блокера (#1442): та же доставка по
+    pipeline_merges, что у ``_blocker_entry`` — второго правила нет."""
+    rows = await fetchall(
+        db,
+        "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
+        "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id) AS merges "
+        "FROM tasks t WHERE t.parent_id = ? AND t.archived = 0 ORDER BY t.id",
+        (parent_id,),
+    )
+    return [_blocker_entry(dict(r)) for r in rows]
+
+
 async def undelivered_blockers(
     db: aiosqlite.Connection, task_id: int
 ) -> list[dict[str, Any]]:
