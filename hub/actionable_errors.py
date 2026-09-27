@@ -795,6 +795,37 @@ def verdict_contradicts_its_text_detail(verdict: str, declared: str) -> dict[str
     )
 
 
+def submission_contract_violated_detail(
+    violations: list[str], *, mutations_format: str
+) -> dict[str, Any]:
+    """Сдача, нарушившая контракт проекта в режиме require (#1436).
+
+    Все нарушения разом, а не первое: исполнитель, получивший одно, чинит его
+    и приходит за следующим — ровно так три поля превращаются в три отказа.
+    Формат ``mutations`` назван в подсказке: облачный исполнитель ходит по REST
+    без MCP (#1384), и эта ошибка — всё, что он прочитает.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "submission_contract_violated",
+            "actor_hint": "agent",
+            "retry_by_same_caller": True,
+            "message": (
+                "submission contract (require) refused this submission: "
+                + "; ".join(violations)
+            ),
+            "violations": list(violations),
+            "hint": (
+                "Nothing was recorded: no generation, no review ordered, the "
+                "status did not change. Resubmit with a non-empty model and "
+                f"summary and {mutations_format}."
+            ),
+            "mutations_format": mutations_format,
+            "suggested_tool": "hub_submit_for_review",
+        }
+    )
+
+
 def changes_requested_requires_content_detail() -> dict[str, Any]:
     """A verdict that sends work back has to say what to redo (#1010).
 

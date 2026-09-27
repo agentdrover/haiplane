@@ -468,13 +468,43 @@ def _finding_outcomes_option(parser: argparse.ArgumentParser) -> None:
     )
 
 
+#: Отказ CLI на битом --mutations (#1436): до сети, как у --finding-outcomes.
+MUTATIONS_JSON_ERROR = "--mutations is not a JSON list"
+
+
+def _put_mutations(body: dict[str, Any], args: argparse.Namespace) -> bool:
+    """Положить мутации сдачи в тело; False — отказ уже напечатан (#1436).
+
+    Отказ, а не тихая сдача без них: при require хаб всё равно откажет, но
+    уже с «мутаций нет», и автор будет искать не ту ошибку.
+    """
+    raw = getattr(args, "mutations", "") or ""
+    if not raw.strip():
+        return True
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        print(f"{MUTATIONS_JSON_ERROR}: {exc}", file=sys.stderr)
+        return False
+    if not isinstance(parsed, list):
+        print(f"{MUTATIONS_JSON_ERROR}: got {type(parsed).__name__}", file=sys.stderr)
+        return False
+    body["mutations"] = parsed
+    return True
+
+
 def cmd_submit_review(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {}
     if args.agent:
         body["agent"] = args.agent
     if args.summary:
         body["summary"] = args.summary
+    model = getattr(args, "model", "") or ""
+    if model:
+        body["model"] = model
     if not _put_finding_outcomes(body, args):
+        return 2
+    if not _put_mutations(body, args):
         return 2
     result = _api("POST", f"/api/tasks/{args.task_id}/submit-review", body)
     _print_json(result)
@@ -1822,6 +1852,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_submit_review.add_argument("--agent", default="", help="Submitting agent name")
     p_submit_review.add_argument(
         "--summary", default="", help="Short note on what is being submitted"
+    )
+    p_submit_review.add_argument(
+        "--model",
+        default="",
+        help="Model that wrote this submission (#758); required by submission_contract",
+    )
+    p_submit_review.add_argument(
+        "--mutations",
+        default="",
+        help=(
+            "JSON list, one per AC with verifiable_by=test (#1436): "
+            '[{"ac": "AC-1", "mutation": "...", "failed_test": "<test_ref of AC-1>"}]'
+        ),
     )
     _finding_outcomes_option(p_submit_review)
     p_submit_review.set_defaults(func=cmd_submit_review)

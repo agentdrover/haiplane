@@ -18,6 +18,7 @@ from fastapi import HTTPException, status
 from hub import commit_scope, config
 from hub import db as db_module
 from hub.actionable_errors import (
+    submission_contract_violated_detail,
     changes_requested_requires_content_detail,
     verdict_contradicts_its_text_detail,
     verdict_repeats_previous_detail,
@@ -41,7 +42,7 @@ from hub.db import (
 )
 from hub.integrations.registry import plugins
 from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
-from hub.services import verdict_text
+from hub.services import submission_contract, verdict_text
 from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait
@@ -2034,6 +2035,9 @@ class SubmitContext:
     #: #1265 — та же вершина ветки пришла повторно из review: сдача не
     #: открывает новое поколение, и вызывающий получает ответ без перехода.
     same_sha_noop: bool = False
+    #: #1436: запись «Контракт сдачи нарушен» при warn; пусто — нарушений нет
+    #: или контракт выключен.
+    contract_alert: str = ""
 
 
 async def _step_task_is_submittable(state: SubmitContext) -> None:
@@ -2427,6 +2431,39 @@ async def _step_submit_rules(state: SubmitContext) -> None:
                 )
 
 
+async def _step_submission_contract(state: SubmitContext) -> None:
+    """Контракт сдачи проекта: model, summary, мутация на каждый AC (#1436).
+
+    Режим — из политики проекта, а не из config: включается на одном проекте
+    (раскатка через warn), остальные живут как жили. Стоит ДО сетевых шагов и
+    до перехода: отказ при require не создаёт поколения и не заказывает ревью.
+    """
+    from hub.services.project_policy import (
+        CONTRACT_OFF,
+        CONTRACT_REQUIRE,
+        gate_policy_for_task,
+        submission_contract_of,
+    )
+
+    mode = submission_contract_of(await gate_policy_for_task(state.db, state.task_id))
+    if mode == CONTRACT_OFF:
+        return
+    ac_rows = [
+        dict(r) for r in await repo.list_acceptance_criteria(state.db, state.task_id)
+    ]
+    found = submission_contract.violations(state.body, ac_rows)
+    if not found:
+        return
+    if mode == CONTRACT_REQUIRE:
+        raise HTTPException(
+            422,
+            detail=submission_contract_violated_detail(
+                found, mutations_format=submission_contract.MUTATIONS_FORMAT
+            ),
+        )
+    state.contract_alert = submission_contract.warning_text(found)
+
+
 async def _step_pin_submission_sha(state: SubmitContext) -> None:
     """Код, который будет судить ревьюер (#572)."""
     # #572: pin the code the reviewer will actually be judging. Resolved by
@@ -2567,6 +2604,10 @@ SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
 )
 
 SUBMIT_STEPS_AFTER_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
+    # #1436: режим читается из политики ПРОЕКТА внутри шага — общий policy()
+    # смотрит в config. Первым во второй половине: дешёвые чтения базы, отказ
+    # до сетевого диффа и тем более до перехода.
+    Step("submission_contract", _step_submission_contract),
     Step("resolve_diff", _step_resolve_diff, refuses=False),
     Step("surfaces", _step_surfaces, mode=policy("SDD_SURFACES")),
     Step("finding_outcomes", _step_finding_outcomes, mode=policy("FINDING_OUTCOME")),
@@ -2604,6 +2645,15 @@ HEADLESS_STEPS: tuple[Step[SubmitContext], ...] = (
             "headless-клиент ветку не сообщает: она принадлежит dispatch-job. "
             "Сравнивать отчёт не с чем, а проверка, которая всегда проходит, "
             "хуже отсутствующей — она выглядит гарантией"
+        ),
+    ),
+    Step(
+        "submission_contract",
+        _step_submission_contract,
+        inactive_reason=(
+            "headless сдаёт done-отчётом, у которого нет полей model и "
+            "mutations: контракт требовал бы того, что этот путь передать не "
+            "может, и отказ оставил бы задачу стоять без человека (#1436)"
         ),
     ),
     Step("resolve_diff", _step_resolve_diff, refuses=False),
@@ -2906,6 +2956,7 @@ def _submission_update_text(
         content += f" Модель исполнителя (декларация): {declared_model}."
     if summary:
         content += f" {summary}"
+    content += submission_contract.mutations_text(list(state.body.mutations))
     return agent, content
 
 
@@ -3025,6 +3076,12 @@ async def _write_submission_notices(
     if state.risk_alert:
         await repo.add_task_update(
             state.db, state.task_id, "hub", "alert", state.risk_alert
+        )
+    if state.contract_alert:
+        # #1436: ОДНА запись с перечнем, отдельно от отчёта проверок — её ищут
+        # по заголовку, и строка внутри чужого отчёта терялась бы.
+        await repo.add_task_update(
+            state.db, state.task_id, "hub", "alert", state.contract_alert
         )
 
 
