@@ -1939,3 +1939,20 @@ async def test_a_first_launch_still_starts_on_the_base(db, monkeypatch):
     assert result.launched, result
     assert calls[0]["starting_ref"] == "develop"
     assert "каноническое имя из ответа pair-start" in calls[0]["prompt_text"]
+
+
+async def test_a_queue_launch_of_a_task_with_a_branch_starts_on_it(db, monkeypatch):
+    """Находка ревью #1447 (medium): задача после сорванного круга остаётся open
+    с веткой и может уйти в дверь очереди — старт тоже на её ветке, и промпт
+    говорит правду."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, task_id = await _launch_project(db, slug="exec-queue-branch")
+    await repo.update_task(db, task_id, branch=f"task-{task_id}/work")
+    await db.commit()
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert result.launched, result
+    assert calls[0]["starting_ref"] == f"task-{task_id}/work"
+    assert f"Ветка задачи уже есть — task-{task_id}/work" in calls[0]["prompt_text"]

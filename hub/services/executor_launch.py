@@ -224,8 +224,9 @@ def _prompt(
             "pair-start не зови: задача в needs_decision, сдаёшь прямо из него."
         )
     elif (task.get("branch") or "").strip():
-        # #1447: круг починки — ветка со сданной работой уже есть, агент на ней
-        # и стартует; pair-start нужен для нового поколения и вернёт её же.
+        # #1447: ветка уже есть — _order стартует агента на ней (любая дверь:
+        # круг починки или очередь после сорванного круга); pair-start нужен
+        # для нового поколения и вернёт её же.
         branch_line = (
             f"Ветка задачи уже есть — {task.get('branch')}, база {base}; ты "
             "стартуешь на ней. pair-start вернёт это же имя — продолжай на ней."
@@ -390,13 +391,13 @@ async def _order(
     *,
     extra: str = "",
     note: str = "",
-    starting_ref: str = "",
 ) -> LaunchResult:
     """Заказать агента по брони и записать исход — один путь для всех заказов.
 
-    ``starting_ref`` — где агент стартует; пусто — база (ветку создаст
-    pair-start). Прогон слияния (#1445) стартует на ветке задачи, как ревьюер
-    и стюард: pair-start ему закрыт, а работа лежит только на ветке.
+    Где агент стартует — одно правило для всех дверей (#1445, #1447): у
+    задачи есть ветка — на ней, как ревьюер и стюард; нет — на базе (ветку
+    создаст pair-start). Строка ветки в ``_prompt`` читает то же поле, и
+    промпт не расходится с тем, где агент на самом деле стоит.
     """
     from hub.services.review_dispatch import instance_base_url
 
@@ -414,7 +415,7 @@ async def _order(
             extra = _findings_block(pending)
     order = {
         "repo_url": f"https://github.com/{project['repo']}",
-        "starting_ref": starting_ref or base,
+        "starting_ref": (task.get("branch") or "").strip() or base,
         "model_id": model,
         "prompt_text": _prompt(
             task,
@@ -634,8 +635,6 @@ async def repair_executor(
         ready,
         extra=_findings_block(findings),
         note=f"Повторный прогон исполнителя по находкам (#1444), нажал {issuer}",
-        # #1447: как прогон слияния, ревьюер и стюард — на ветке задачи.
-        starting_ref=str(reserved[0].get("branch") or "").strip(),
     )
 
 
@@ -760,5 +759,4 @@ async def merge_executor(
         ready,
         extra=_conflict_block(reserved[0], base, detail),
         note=f"Прогон «слей базу и пересдай» (#1445), нажал {issuer}",
-        starting_ref=str(reserved[0].get("branch") or "").strip(),
     )
