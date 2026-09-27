@@ -12,29 +12,37 @@ latency и размер ответов — на отдельной страни�
 
 {% set e = m.review_economy %}
 <h2 id="review-economy">Сводка ревью: что куплено и что дало</h2>
-<p class="muted">Цена — только счёт провайдера. Самоотчёт харнесса
+<p class="muted">Цена — только счёт провайдера: {{ e.runs.cost_source_note }}.
+Покрыто выгрузкой Cursor: <span data-metric="runs.export_billed_runs">{{ e.runs.export_billed_runs }}</span>
+прогонов, доля <span data-metric-share="runs.export_coverage_share">{{ e.runs.export_coverage_share if e.runs.export_coverage_share is not none else "нет прогонов" }}</span>;
+по API (нижняя граница): <span data-metric="runs.api_lower_bound_runs">{{ e.runs.api_lower_bound_runs }}</span>.
+Самоотчёт харнесса
 (<code>tokens_spent</code>) занижен в 12–62 раза и сюда не входит ни в одно
 число. Прогон без счёта — отдельная строка: он не бесплатный, и его цена
 неизвестна (#1406).</p>
 <table class="task-table">
     <thead><tr><th>Прогоны</th><th>Всего</th><th>Со счётом</th><th>Без счёта</th>
-        <th>Provider-токены</th><th>На прогон со счётом</th></tr></thead>
+        <th>Provider-токены</th><th>На прогон со счётом</th>
+        <th>По выгрузке</th><th>API — нижняя граница</th></tr></thead>
     <tbody>
         <tr><td><strong>Итого</strong></td>
             <td data-metric="runs.total">{{ e.runs.total }}</td>
             <td data-metric="runs.billed">{{ e.runs.billed }}</td>
             <td data-metric="runs.unbilled">{{ e.runs.unbilled }}</td>
             <td data-metric="runs.provider_tokens_total">{{ e.runs.provider_tokens_total }}</td>
-            <td>{{ e.runs.provider_tokens_per_billed_run if e.runs.provider_tokens_per_billed_run is not none else "нет счёта" }}</td></tr>
+            <td>{{ e.runs.provider_tokens_per_billed_run if e.runs.provider_tokens_per_billed_run is not none else "нет счёта" }}</td>
+            <td>{{ e.runs.export_billed_runs }}</td><td>{{ e.runs.api_lower_bound_runs }}</td></tr>
         {% for row in e.runs.by_profile %}
         <tr><td>профиль {{ row.profile }}</td><td>{{ row.runs }}</td><td>{{ row.billed_runs }}</td>
             <td>{{ row.unbilled_runs }}</td><td>{{ row.provider_tokens_total }}</td>
-            <td>{{ row.provider_tokens_per_run if row.provider_tokens_per_run is not none else "нет счёта" }}</td></tr>
+            <td>{{ row.provider_tokens_per_run if row.provider_tokens_per_run is not none else "нет счёта" }}</td>
+            <td>{{ row.export_billed_runs }}</td><td>{{ row.api_lower_bound_runs }}</td></tr>
         {% endfor %}
         {% for row in e.runs.by_kind %}
         <tr><td>{{ row.label }}</td><td>{{ row.runs }}</td><td>{{ row.billed_runs }}</td>
             <td>{{ row.unbilled_runs }}</td><td>{{ row.provider_tokens_total }}</td>
-            <td>{{ row.provider_tokens_per_run if row.provider_tokens_per_run is not none else "нет счёта" }}</td></tr>
+            <td>{{ row.provider_tokens_per_run if row.provider_tokens_per_run is not none else "нет счёта" }}</td>
+            <td>{{ row.export_billed_runs }}</td><td>{{ row.api_lower_bound_runs }}</td></tr>
         {% endfor %}
     </tbody>
 </table>

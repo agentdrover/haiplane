@@ -1041,15 +1041,16 @@ async def _review_dispatch_spend_metrics(
     rows = await fetchall(
         db,
         "SELECT "
+        # #1413: счёт — выгрузка Cursor, где она импортирована, иначе API.
         "COALESCE(SUM(CASE WHEN status = 'failed' "
-        "AND provider_tokens IS NOT NULL THEN provider_tokens ELSE 0 END), 0) "
+        "THEN COALESCE(billed_tokens, provider_tokens, 0) ELSE 0 END), 0) "
         "AS wasted_provider_tokens_total, "
         "COALESCE(SUM(CASE WHEN status = 'failed' "
-        "AND provider_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) "
-        "AS wasted_dispatches, "
+        "AND COALESCE(billed_tokens, provider_tokens) IS NOT NULL "
+        "THEN 1 ELSE 0 END), 0) AS wasted_dispatches, "
         "COALESCE(SUM(CASE WHEN status IN ('done', 'failed') "
-        "AND provider_tokens IS NULL THEN 1 ELSE 0 END), 0) "
-        "AS unknown_usage, "
+        "AND COALESCE(billed_tokens, provider_tokens) IS NULL "
+        "THEN 1 ELSE 0 END), 0) AS unknown_usage, "
         "COALESCE(SUM(CASE WHEN status IN ('done', 'failed') "
         "THEN 1 ELSE 0 END), 0) AS closed_dispatches "
         # #1242: a sync-refusal stub now outlives its call as the ask-again

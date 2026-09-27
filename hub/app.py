@@ -81,6 +81,7 @@ from hub.models import (
     TaskCreate,
     TaskProjectRef,
     MachineReviewSubmit,
+    CursorUsageImportRequest,
     MergeLedgerBackfillRequest,
     MachineReviewView,
     StewardJudgementSubmit,
@@ -3730,6 +3731,30 @@ async def api_admin_merge_ledger_backfill(
         )
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/admin/cursor-usage/import")
+async def api_admin_cursor_usage_import(
+    body: CursorUsageImportRequest,
+    request: Request,
+    _identity=Depends(require_admin),
+):
+    """Import the owner's Cursor usage export onto review orders (#1413).
+
+    Dry run unless ``apply`` is true. Admin only; no MCP tool — the export
+    exists only on the owner's machine and the import is the owner's action.
+    A malformed file is refused with 422 and a structured detail naming the
+    missing columns or bad lines; nothing is written.
+    """
+    from hub.services.cursor_usage_import import (
+        UsageImportRefused,
+        import_cursor_usage,
+    )
+
+    try:
+        return await import_cursor_usage(_db(request), body.csv, apply=body.apply)
+    except UsageImportRefused as exc:
+        raise HTTPException(422, exc.as_dict()) from exc
 
 
 @app.post("/api/admin/bootstrap")

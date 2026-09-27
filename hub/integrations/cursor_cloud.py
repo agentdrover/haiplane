@@ -544,7 +544,38 @@ async def get_run(agent_id: str, run_id: str) -> dict[str, Any] | None:
     return await _request("GET", f"/v1/agents/{agent_id}/runs/{run_id}")
 
 
+async def list_runs(agent_id: str, pages: int = 3) -> list[dict[str, Any]] | None:
+    """Все прогоны агента; ``None`` — список не прочитан (#1413).
+
+    Форма ответа ЖИВЬЁМ НЕ ПРОВЕРЕНА: разбирается та же, что наблюдалась у
+    списка агентов (``items`` + ``nextCursor``, 06.09.2026). Тело другой формы
+    — это «прочитать не смог», а не «прогонов нет»: пустой список здесь
+    обнулил бы счёт агента.
+    """
+    runs: list[dict[str, Any]] = []
+    cursor = ""
+    for _ in range(max(1, pages)):
+        path = f"/v1/agents/{agent_id}/runs?limit=50"
+        if cursor:
+            path += f"&cursor={cursor}"
+        page = await _request("GET", path)
+        items = (page or {}).get("items")
+        if not isinstance(items, list):
+            return None
+        runs.extend(item for item in items if isinstance(item, dict))
+        cursor = str((page or {}).get("nextCursor") or "")
+        if not cursor:
+            return runs
+    return None  # страниц больше потолка — список неполный, это не ответ
+
+
 async def get_usage(agent_id: str, run_id: str | None = None) -> dict[str, Any] | None:
+    """Ответ ``/usage``: с ``run_id`` — одного прогона, без — агента (#1413).
+
+    Счёт одного прогона сверен с выгрузкой Cursor до токена (lite, 25.09).
+    Что отдаёт путь без ``runId`` — агрегат по агенту или отказ — живьём не
+    проверено; вызывающий обязан пережить оба исхода.
+    """
     path = f"/v1/agents/{agent_id}/usage"
     if run_id:
         path += f"?runId={run_id}"
