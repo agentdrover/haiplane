@@ -219,6 +219,21 @@ async def test_cloud_channel_is_one_card_line(hub):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("capture", ["claim", "pair_start"])
+async def test_capture_takes_the_channel_of_the_capturing_session(hub, capture):
+    """Две живые сессии: A со slot-2, B без канала. Захват B — канал не назван."""
+    task_id = await _make_task(hub)
+    await _implementer(hub, task_id, channel="slot", slot="slot-2")
+    session_b = await _implementer(hub, task_id)
+    await (_claim if capture == "claim" else _pair_start)(hub, task_id, session_b)
+
+    assert not [u for u in await _card(hub, task_id) if "канал:" in u["content"]]
+    view = await _occupancy(hub)
+    assert view["slots"] == []
+    assert {r["task_id"]: r["label"] for r in view["tasks"]}[task_id] == "не назван"
+
+
+@pytest.mark.asyncio
 async def test_the_hub_dispatcher_code_names_the_cloud(hub):
     """Код, который выписывает диспетчер хаба (#1439), — канал cloud."""
     task_id = await _make_task(hub)
@@ -320,6 +335,10 @@ async def test_a_dead_slot_is_released_once_with_a_reason(hub, monkeypatch):
     assert view["slots"] == [], "освобождённый слот свободен"
     abandoned = {r["task_id"]: r for r in view["abandoned"]}
     assert abandoned[task_id]["slot"] == "slot-2"
+    assert abandoned[task_id]["channel"] == "slot"
+    assert task_id not in {r["task_id"] for r in view["tasks"]}, (
+        "брошенная задача — только в abandoned, не «не назван» в tasks"
+    )
     assert "нет признаков жизни" in abandoned[task_id]["reason"]
     events = await _rows(
         hub.db,

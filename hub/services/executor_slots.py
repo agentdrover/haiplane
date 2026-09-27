@@ -91,27 +91,29 @@ def format_occupancy(result: dict[str, Any]) -> list[str]:
 
 
 async def _capture_session(
-    db: aiosqlite.Connection, task_id: int
+    db: aiosqlite.Connection, task_id: int, token_hash: str
 ) -> dict[str, Any] | None:
-    """Живая сессия implementer на задаче с названным каналом, самая свежая."""
+    """Канал сессии, которая САМА захватывает задачу; соседняя не в счёт."""
     rows = await fetchall(
         db,
         "SELECT channel, slot FROM chat_pair_sessions "
-        "WHERE kind = 'implementer' AND bound_task_id = ? AND channel <> '' "
-        "AND revoked_at IS NULL AND expires_at > datetime('now') "
-        "ORDER BY id DESC LIMIT 1",
-        (int(task_id),),
+        "WHERE kind = 'implementer' AND bound_task_id = ? AND token_hash = ? "
+        "AND channel <> '' AND revoked_at IS NULL AND expires_at > datetime('now')",
+        (int(task_id), token_hash),
     )
     return dict(rows[0]) if rows else None
 
 
-async def record_capture(db: aiosqlite.Connection, task_id: int) -> str:
+async def record_capture(
+    db: aiosqlite.Connection, task_id: int, token_hash: str
+) -> str:
     """Записать канал захвата; вернуть строку канала или пусто.
 
+    ``token_hash`` — хэш токена вызывающей сессии: без него канал не назван.
     Одна живая строка на задачу держится уникальным индексом: claim, а за ним
     pair-start той же сессией — одна строка в карточке, не две.
     """
-    session = await _capture_session(db, task_id)
+    session = await _capture_session(db, task_id, token_hash)
     if session is None:
         return ""
     channel, slot = str(session["channel"]), str(session["slot"] or "")
@@ -183,10 +185,9 @@ async def occupancy(db: aiosqlite.Connection) -> dict[str, Any]:
         "WHERE t.status IN (?, ?) AND COALESCE(t.archived, 0) = 0 ORDER BY t.id",
         IN_WORK,
     )
-    tasks = [await _entry(db, dict(r)) for r in rows]
     dead = await fetchall(
         db,
-        "SELECT s.task_id, s.slot, s.released_at, s.reason, t.title, t.status "
+        "SELECT s.task_id, s.channel, s.slot, s.released_at, s.reason, t.title, t.status "
         "FROM executor_slots s JOIN tasks t ON t.id = s.task_id "
         "WHERE s.outcome = ? AND t.status IN (?, ?) AND NOT EXISTS ("
         "  SELECT 1 FROM executor_slots live "
@@ -194,6 +195,10 @@ async def occupancy(db: aiosqlite.Connection) -> dict[str, Any]:
         ") ORDER BY s.id",
         (OUTCOME_RELEASED_DEAD, *IN_WORK),
     )
+    # Брошенная задача — ровно в одном списке, под каналом и слотом, где
+    # умерла, а не в tasks как «не назван» (находка 894c49fc).
+    gone = {int(r["task_id"]) for r in dead}
+    tasks = [await _entry(db, dict(r)) for r in rows if int(r["task_id"]) not in gone]
     return {
         "slots": [t for t in tasks if t["channel"] == CHANNEL_SLOT],
         "tasks": tasks,

@@ -2682,9 +2682,14 @@ async def _record_slot_capture(request: Request, identity, task_id: int) -> None
     """
     if identity.auth_source != "chat_pair" or identity.chat_pair_kind != "implementer":
         return
+    # Канал — только вызывающей сессии, по хэшу её токена: соседняя живая
+    # сессия на той же задаче чужой канал не даёт (находка 1c10075c).
+    token = _extract_bearer(request) or ""
     from hub.services import executor_slots
 
-    await executor_slots.record_capture(_db(request), task_id)
+    await executor_slots.record_capture(
+        _db(request), task_id, chat_pair.hash_pair_code(token)
+    )
 
 
 @app.get("/api/executor-slots")
