@@ -59,6 +59,9 @@ REASON_NO_OBSERVATION = "нет наблюдения прав токена"
 REASON_FAMILY = "семейство модели исполнителя не отличается"
 REASON_NO_MODEL = "модель исполнителя не задана"
 REASON_NO_CANDIDATE = "очередь не назвала задачу"
+REASON_NO_SKILL = "в библиотеке нет активного скилла дисциплины исполнителя"
+#: Скилл, который промпт вставляет целиком (#1441, F3).
+DISCIPLINE_SKILL = "executor-pair-discipline"
 REASON_ALREADY_RUNNING = "по задаче уже идёт прогон исполнителя"
 REASON_NO_ACTING_AGENT = "нет агента chat-pair"
 REASON_CREATE_REFUSED = "провайдер отказал в создании агента"
@@ -189,18 +192,23 @@ async def _candidate(db: aiosqlite.Connection, project: Any) -> tuple[int | None
     return int(task_id), ""
 
 
-def _prompt(task: dict[str, Any], base: str, code: str, hub_url: str) -> str:
-    """Минимальный промпт F2.4; F3 (#1366) заменит его скиллом."""
+def _prompt(
+    task: dict[str, Any], base: str, code: str, hub_url: str, discipline: str
+) -> str:
+    """Промпт исполнителя: обмен кода — первым, дальше дисциплина (#1441, F3).
+
+    Скилл вставляется текстом активной версии из библиотеки, а не ссылкой:
+    сессии implementer маршрут скиллов не открыт, и версию, по которой шёл
+    прогон, видно в самом заказе.
+    """
     return (
-        f"Ты исполнитель задачи #{task['id']} хаба Haiplane: {task['title']}.\n"
-        f"ПЕРВЫМ шагом, до любой другой работы, обменяй одноразовый код "
-        f"implementer на сессию: POST {hub_url}/api/auth/chat-pair/redeem, "
-        f"код {code}. Он живёт {config.CHAT_PAIR_CODE_SECONDS} с.\n"
-        f"Дальше по HTTP хаба: claim и pair-start задачи #{task['id']}, работа в "
-        f"ветке с каноническим именем от базы {base}, одна сдача "
-        "submit-review. Дисциплину исполнителя возьми из скилла "
-        "executor-pair-discipline (GET /api/skills/executor-pair-discipline), "
-        "если он есть. После сдачи заверши прогон."
+        f"ПЕРВЫЙ ШАГ, до клона, установки и тестов: обменяй одноразовый код "
+        f"implementer на сессию — POST {hub_url}/api/auth/chat-pair/redeem, "
+        f"код {code}. Он живёт {config.CHAT_PAIR_CODE_SECONDS} с.\n\n"
+        f"Ты исполнитель задачи #{task['id']} хаба Haiplane: {task['title']}. "
+        f"Хаб — {hub_url}, по HTTP с сессией из обмена. Ветка — каноническое "
+        f"имя из ответа pair-start, от базы {base}.\n\n"
+        f"{discipline.strip()}\n"
     )
 
 
@@ -301,6 +309,11 @@ async def launch_executor(
     refusal = await _preflight(db, project)
     if refusal:
         return _refused(refusal)
+    skill = await repo.get_active_skill(db, DISCIPLINE_SKILL)
+    if skill is None:
+        # #1441: без дисциплины исполнитель не запускается — его ничто, кроме
+        # промпта и гейтов, не держит.
+        return _refused(f"{REASON_NO_SKILL} ({DISCIPLINE_SKILL})")
     if await chat_pair.get_acting_agent(db) is None:
         return _refused(f"{REASON_NO_ACTING_AGENT} (CHAT_PAIR_AGENT)")
     model = config.EXECUTOR_MODEL.strip()
@@ -314,7 +327,9 @@ async def launch_executor(
         "repo_url": f"https://github.com/{project['repo']}",
         "starting_ref": base,
         "model_id": model,
-        "prompt_text": _prompt(task, base, code, instance_base_url().rstrip("/")),
+        "prompt_text": _prompt(
+            task, base, code, instance_base_url().rstrip("/"), str(skill["content"])
+        ),
     }
     agent_id, run_id, failed = await _create(task_id, generation, order)
     if failed:
