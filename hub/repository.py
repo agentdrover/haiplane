@@ -2858,6 +2858,48 @@ async def get_review_dispatch_for_generation(
     return rows[0] if rows else None
 
 
+async def reopen_refused_order_for_report(
+    db: aiosqlite.Connection, task_id: int, generation: int, principal_id: int
+) -> aiosqlite.Row | None:
+    """Заказ, записанный отказом, к которому пришёл отчёт его ревьюера (#1408).
+
+    Прод 25.09: create ответил 404, заказ 429 лёг заглушкой (``failed``,
+    пустой ``agent_id``), а агент был создан и сдал отчёт 582. Такой отчёт —
+    доказательство, что заказ состоялся: заглушка ПОСЛЕДНЯЯ в поколении
+    (ни переспрос, ни вторая дверь её не заменили), облачная и того же
+    принципала снова становится ``active``, и свип находит агента по метке
+    и снимает счёт. Возвращает строку заказа или None.
+    """
+    rows = list(
+        await fetchall(
+            db,
+            "SELECT * FROM review_dispatches WHERE task_id=? "
+            "AND submission_generation=? AND status='failed' AND agent_id='' "
+            "AND channel='cloud' AND reviewer_principal_id=? "
+            "AND id = (SELECT MAX(id) FROM review_dispatches "
+            "WHERE task_id=? AND submission_generation=?)",
+            (task_id, generation, principal_id, task_id, generation),
+        )
+    )
+    if not rows:
+        return None
+    await db.execute(
+        "UPDATE review_dispatches SET status='active' WHERE id=?",
+        (int(rows[0]["id"]),),
+    )
+    return rows[0]
+
+
+async def set_review_dispatch_agent(
+    db: aiosqlite.Connection, dispatch_id: int, agent_id: str, run_id: str
+) -> None:
+    """Записать агента, найденного за заказом по метке после отчёта (#1408)."""
+    await db.execute(
+        "UPDATE review_dispatches SET agent_id=?, run_id=? WHERE id=?",
+        (agent_id, run_id, dispatch_id),
+    )
+
+
 async def record_submission(
     db: aiosqlite.Connection,
     *,
