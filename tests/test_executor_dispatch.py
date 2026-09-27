@@ -1142,3 +1142,24 @@ async def test_a_blind_answer_loss_keeps_the_launch_reservation(db, monkeypatch)
     assert [r["outcome"] for r in rows] == ["failed"], (
         "подтверждённая пустота снимает бронь"
     )
+
+
+async def test_the_poller_keeps_the_blind_loss_reason(db, monkeypatch):
+    """Находка ревью #1439: поллер не затирает причину слепой брони общим
+    «нечего опрашивать» — строка прогона говорит правду до срока брони."""
+    _launch_config(monkeypatch)
+    lost = cursor_cloud.Refusal(status=0, detail="ReadTimeout")
+
+    async def _blind(_name, pages=3):
+        return cursor_cloud.Reconciliation("", "", False)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _blind)
+    _creator(monkeypatch, [lost])
+    project, task_id = await _launch_project(db, slug="exec-blind-poll")
+    await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    await poll_executor_runs(db)
+
+    row = dict((await repo.list_executor_runs(db, task_id))[0])
+    assert row["outcome"] == "running"
+    assert row["reason"].startswith(el.REASON_ANSWER_BLIND), row["reason"]
