@@ -1124,6 +1124,47 @@ def _executor_launch_mode(project: Any) -> str:
     return launch_mode_of(project_policy.gate_policy_of(project))
 
 
+@router.post("/tasks/{task_id}/web-executor-merge")
+async def web_executor_merge(
+    task_id: int, request: Request, csrf_token: str = Form(default="")
+):
+    """Кнопка «слить базу и пересдать» (#1445): тот же сервис, что у REST."""
+    from hub.services.executor_launch import merge_executor
+
+    _require_human_web(request)
+    if not _check_web_csrf(request, csrf_token):
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error="Форма устарела. Обновите страницу и попробуйте снова.",
+            status_code=403,
+        )
+    identity = current_identity(request)
+    if identity.principal_id is None:
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error=(
+                "Код исполнителю выписывается от имени принципала хаба; вход по "
+                "env-токену для этого не подходит."
+            ),
+        )
+    result = await merge_executor(
+        _db(request),
+        task_id,
+        issuer_principal_id=int(identity.principal_id),
+        issuer=identity.username,
+    )
+    if not result.launched:
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error=f"Прогон слияния не заказан: {result.reason}",
+            status_code=409,
+        )
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
 @router.post("/tasks/{task_id}/web-executor-repair")
 async def web_executor_repair(
     task_id: int, request: Request, csrf_token: str = Form(default="")
@@ -2426,6 +2467,10 @@ async def _web_task_detail_page(
     from hub.services.executor_launch import repair_offered as _repair_offered
 
     repair_offered = bool(executor_runs) and await _repair_offered(db, dict(row))
+    # #1445: кнопка прогона слияния — только на конфликте с базой.
+    from hub.services.executor_launch import merge_offered as _merge_offered
+
+    merge_offered = bool(executor_runs) and await _merge_offered(db, dict(row))
 
     finding_touch: list[dict[str, Any]] = []
     if machine_review is not None and machine_review.findings_confirmed:
@@ -2577,6 +2622,7 @@ async def _web_task_detail_page(
             "steward_judgement": steward_judgement,
             "executor_runs": executor_runs,
             "repair_offered": repair_offered,
+            "merge_offered": merge_offered,
             "finding_touch": finding_touch,
             "mr_confirmed": mr_confirmed,
             "mr_undisposed": mr_undisposed,
