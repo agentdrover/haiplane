@@ -383,8 +383,14 @@ async def _order(
     *,
     extra: str = "",
     note: str = "",
+    starting_ref: str = "",
 ) -> LaunchResult:
-    """Заказать агента по брони и записать исход — один путь для всех заказов."""
+    """Заказать агента по брони и записать исход — один путь для всех заказов.
+
+    ``starting_ref`` — где агент стартует; пусто — база (ветку создаст
+    pair-start). Прогон слияния (#1445) стартует на ветке задачи, как ревьюер
+    и стюард: pair-start ему закрыт, а работа лежит только на ветке.
+    """
     from hub.services.review_dispatch import instance_base_url
 
     task, generation, row_id, code = reserved
@@ -401,7 +407,7 @@ async def _order(
             extra = _findings_block(pending)
     order = {
         "repo_url": f"https://github.com/{project['repo']}",
-        "starting_ref": base,
+        "starting_ref": starting_ref or base,
         "model_id": model,
         "prompt_text": _prompt(
             task,
@@ -718,14 +724,23 @@ async def merge_executor(
         await db.commit()
         return refusal
 
-    async def _this_task(
+    async def _still_in_conflict(
         db: aiosqlite.Connection, _project: Any
     ) -> tuple[int | None, str]:
+        # Находка ревью #1445 (medium): статус нарочно не трогается, поэтому
+        # допуск перечитывается под той же блокировкой, что и бронь, — задача,
+        # решённая человеком между проверкой и бронью, исполнителя не получает.
+        current = await repo.get_task(db, task_id)
+        if current is None or not await _base_conflict_detail(db, dict(current)):
+            status = dict(current)["status"] if current is not None else "нет"
+            return None, f"{REASON_NOT_BASE_CONFLICT}: статус {status}"
         live = await _live_run(db, task_id)
         return (None, live) if live else (task_id, "")
 
     model = config.EXECUTOR_MODEL.strip()
-    reserved = await _reserve(db, project, issuer_principal_id, model, _this_task)
+    reserved = await _reserve(
+        db, project, issuer_principal_id, model, _still_in_conflict
+    )
     if isinstance(reserved, LaunchResult):
         return reserved
     base = project_policy.base_branch_of(project)
@@ -736,4 +751,5 @@ async def merge_executor(
         ready,
         extra=_conflict_block(reserved[0], base, detail),
         note=f"Прогон «слей базу и пересдай» (#1445), нажал {issuer}",
+        starting_ref=str(reserved[0].get("branch") or "").strip(),
     )

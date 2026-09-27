@@ -1727,6 +1727,8 @@ async def test_a_base_conflict_orders_a_merge_run(db, monkeypatch):
     assert task["status"] == "needs_decision"
     assert len(calls) == 1
     assert calls[0]["name"] == cursor_cloud.agent_marker("executor", task_id, 2, 1)
+    # Находка ревью #1445 (high): агент стартует на ветке задачи, а не на базе.
+    assert calls[0]["starting_ref"] == f"task-{task_id}/work"
     prompt = calls[0]["prompt_text"]
     assert f"task-{task_id}/work" in prompt
     assert el.CONFLICT_DATA_OPEN in prompt and el.CONFLICT_DATA_CLOSE in prompt
@@ -1873,3 +1875,32 @@ async def test_a_conflict_event_does_not_outlive_the_status(db, monkeypatch):
     assert r.reason.startswith(el.REASON_NOT_BASE_CONFLICT), r
     assert not await el.merge_offered(db, dict(await repo.get_task(db, task_id)))
     assert calls == []
+
+
+async def test_the_conflict_is_rechecked_under_the_reservation(db, monkeypatch):
+    """Находка ревью #1445 (medium): допуск перепроверяется под бронью — задача,
+    ушедшая из конфликта между проверкой и бронью, исполнителя не получает."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    _, task_id = await _task_in_base_conflict(db, slug="exec-merge-race")
+    real_budget = el._budget_refusal
+
+    async def _decided_meanwhile(db, tid, policy):
+        # Человек решил задачу, пока нажатие шло к брони.
+        await repo.update_task(db, tid, status="open")
+        await db.commit()
+        return await real_budget(db, tid, policy)
+
+    monkeypatch.setattr(el, "_budget_refusal", _decided_meanwhile)
+
+    r = await el.merge_executor(
+        db, task_id, issuer_principal_id=await _human(db), issuer="o"
+    )
+
+    assert not r.launched
+    assert r.reason.startswith(el.REASON_NOT_BASE_CONFLICT), r
+    assert calls == []
+    assert await repo.list_executor_runs(db, task_id) and all(
+        dict(x)["agent_id"] != "bc-exec-9"
+        for x in await repo.list_executor_runs(db, task_id)
+    )
