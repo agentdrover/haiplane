@@ -1282,6 +1282,18 @@ def cmd_next_task(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_slots(args: argparse.Namespace) -> int:
+    """Занятость слотов и каналов исполнения (#1434)."""
+    from hub.services.executor_slots import format_occupancy
+
+    result = _api("GET", "/api/executor-slots")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print("\n".join(format_occupancy(result)))
+    return 0
+
+
 def cmd_undelivered(args: argparse.Namespace) -> int:
     """Completed tasks whose PR is neither merged nor closed (#897).
 
@@ -2496,6 +2508,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_next.add_argument("--json", action="store_true", help="Print raw JSON")
     p_next.set_defaults(func=cmd_next_task)
+
+    p_slots = sub.add_parser(
+        "slots", help="Executor channels and slots: which task, since when (#1434)"
+    )
+    p_slots.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_slots.set_defaults(func=cmd_slots)
 
     p_undelivered = sub.add_parser(
         "undelivered", help="Completed tasks whose PR is still open"

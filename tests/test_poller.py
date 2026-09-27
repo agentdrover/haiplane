@@ -2711,6 +2711,7 @@ async def test_the_sweep_order_is_pinned(db):
         # #1410: опрос прогонов исполнителя — рядом со слотами стюарда, та же
         # работа про жизненный цикл облачных прогонов.
         "executor_runs",
+        "executor_slots",
         "expired_claims",
         "machine_deadlines",
         "stale_arbiter",
