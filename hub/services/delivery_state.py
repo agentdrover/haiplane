@@ -505,6 +505,59 @@ async def merged_into_base(db: Any, task_row: dict[str, Any]) -> bool | None:
     return reached
 
 
+#: Задачи-контейнеры (#1442): своего PR и коммита у них нет, их работа
+#: доставляется детьми.
+CONTAINER_TYPES = frozenset({"feature", "epic"})
+CONTAINER_PATH = "container"
+
+
+async def _container_delivery(
+    db: Any, blocker: dict[str, Any], task: dict[str, Any]
+) -> dict[str, Any]:
+    """Фича или эпик доставлены, когда завершены и доставлены все их дети (#1442).
+
+    Раньше контейнер читался как обычная задача: pipeline_merges по его
+    собственному id пуст всегда, и фича-блокер навсегда оставалась «PR не
+    заявлен» — ложная тревога на старте и вечный пропуск в очереди F1.
+    Правило ребёнка — то же ``blocker_delivery``, рекурсивно (эпик → фича →
+    задача). Ребёнок, закрытый без доставки, держит контейнер и называется.
+    """
+    if task.get("status") != "completed":
+        return {
+            **blocker,
+            "delivered": False,
+            "delivery_path": CONTAINER_PATH,
+            "reason": f"{task.get('task_type')} ещё не завершена ({task.get('status')})",
+        }
+    stranded = []
+    for child in await repo.children_as_blockers(db, int(task["id"])):
+        if child.get("status") == "rejected":
+            # Правило свёртки (#742, случай #579): rejected — «работа не
+            # нужна», контейнер не держит; failed — «нужна, но не сделана» —
+            # держит и называется ниже (находка ревью #1442).
+            continue
+        answer = await blocker_delivery(db, child)
+        if not answer.get("delivered"):
+            stranded.append(answer)
+    if stranded:
+        named = "; ".join(
+            f"#{c['task_id']} «{c['title']}» — {c.get('reason') or 'не доставлена'}"
+            for c in stranded
+        )
+        return {
+            **blocker,
+            "delivered": False,
+            "delivery_path": CONTAINER_PATH,
+            "reason": f"не доставлены подзадачи: {named}",
+        }
+    return {
+        **blocker,
+        "delivered": True,
+        "delivery_path": CONTAINER_PATH,
+        "reason": "",
+    }
+
+
 async def blocker_delivery(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
     """Fill in ``delivered``/``reason`` for one blocker row (#885).
 
@@ -519,6 +572,8 @@ async def blocker_delivery(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
         return {**blocker, "delivery_path": "gate"}
     row = await repo.get_task(db, blocker["task_id"])
     task = dict(row) if row is not None else {}
+    if task.get("task_type") in CONTAINER_TYPES:
+        return await _container_delivery(db, blocker, task)
     reached, note = await merged_into_base_detail(db, task) if task else (None, "")
     # A blocker that never pinned a commit has nothing to look for, so the
     # second source staying silent is not news — saying "could not check"
