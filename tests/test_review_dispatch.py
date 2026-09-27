@@ -45,7 +45,9 @@ from hub.services.review_dispatch import (
     REVIEW_FILE_LINE_CAP,
     USAGE_FINAL,
     USAGE_OPEN,
+    USAGE_PARTIAL,
     USAGE_RECOUNTED,
+    USAGE_RESTAMP_CEILING_HOURS,
     USAGE_RESTAMP_EVERY_MINUTES,
     changed_paths,
     count_environment_refusals,
@@ -1542,6 +1544,68 @@ async def test_restamp_waits_while_any_run_of_the_agent_is_alive(
     row = await _any_dispatch_row(db, task_id)
     assert row["usage_scope"] == USAGE_OPEN
     assert row["provider_tokens"] == 1_500_000
+
+
+async def _restamp_pass(db) -> dict:
+    await db.execute(
+        "UPDATE review_dispatches SET usage_checked_at = datetime('now', '-1 day')"
+    )
+    await db.commit()
+    await sweep_review_dispatches(db)
+    rows = await db.execute_fetchall("SELECT * FROM review_dispatches")
+    return dict(rows[-1])
+
+
+async def test_unread_run_list_does_not_settle_on_own_finished_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка ce0ad2369052fb62: список прогонов не прочитан — «не знаю»."""
+    await _billed_task(client, db, monkeypatch, "spike-unread", "bc-unread")
+    _Provider(1_000_000, None).wire(monkeypatch)
+    await sweep_review_dispatches(db)
+
+    async def _own_finished(agent_id, run_id):
+        return {"id": run_id, "status": "FINISHED"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _own_finished)
+    row = await _restamp_pass(db)
+    assert row["usage_scope"] == USAGE_OPEN, "свой FINISHED — не итог агента"
+
+
+async def test_zero_bill_of_a_finished_agent_is_not_named(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка e72f1c6229457e81: ноль у отработавшего агента — не итог (#1026)."""
+    await _billed_task(client, db, monkeypatch, "spike-zero", "bc-zero")
+    provider = _Provider(1_000_000, [("r-1", "RUNNING", 1_000_000)])
+    provider.wire(monkeypatch)
+    await sweep_review_dispatches(db)
+    provider.aggregate, provider.runs = 0, [("r-1", "FINISHED", 0)]
+
+    row = await _restamp_pass(db)
+    assert (row["usage_scope"], row["provider_tokens"]) == (USAGE_OPEN, 1_000_000)
+
+
+async def test_expired_open_bill_is_marked_partial_and_named_once(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка b9ab3c630ced1ed6: окно вышло — число помечено нижней границей."""
+    task_id = await _billed_task(client, db, monkeypatch, "spike-late", "bc-late")
+    _Provider(1_000_000, [("r-1", "RUNNING", 1_000_000)]).wire(monkeypatch)
+    await sweep_review_dispatches(db)
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', ?)",
+        (f"-{USAGE_RESTAMP_CEILING_HOURS + 1} hours",),
+    )
+    await db.commit()
+
+    row = await _restamp_pass(db)
+    await _restamp_pass(db)
+
+    assert (row["usage_scope"], row["provider_tokens"]) == (USAGE_PARTIAL, 1_000_000)
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    named = [u for u in updates if "нижняя граница" in u["content"]]
+    assert len(named) == 1 and named[0]["kind"] == "alert"
 
 
 async def test_history_is_not_restamped_by_the_poller(

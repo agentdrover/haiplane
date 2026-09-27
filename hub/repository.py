@@ -3221,6 +3221,21 @@ async def mark_review_dispatch_usage(
     )
 
 
+async def list_review_dispatches_usage_expired(
+    db: aiosqlite.Connection, ceiling_hours: int
+) -> list[aiosqlite.Row]:
+    """Открытые счета (#1413), чьё окно переснятия вышло без итога."""
+    return list(
+        await fetchall(
+            db,
+            "SELECT * FROM review_dispatches WHERE usage_scope = 'agent_open' "
+            "AND status NOT IN ('active', 'second_door') "
+            "AND created_at < datetime('now', ?) ORDER BY id ASC",
+            (f"-{int(ceiling_hours)} hours",),
+        )
+    )
+
+
 async def list_review_dispatches_owing_usage(
     db: aiosqlite.Connection, every_minutes: int, ceiling_hours: int
 ) -> list[aiosqlite.Row]:

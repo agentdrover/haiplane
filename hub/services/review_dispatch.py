@@ -4744,6 +4744,7 @@ def _provider_token_total(usage: dict[str, Any] | None) -> int | None:
 USAGE_OPEN = "agent_open"  # счёт агента снят до его конца — свип переснимет
 USAGE_FINAL = "agent"  # итог по агенту после конца всех прогонов
 USAGE_RECOUNTED = "recounted"  # пересчитан командой владельца
+USAGE_PARTIAL = "agent_partial"  # окно вышло без итога: число — нижняя граница
 #: Как часто и сколько часов от заказа свип переснимает открытый счёт.
 USAGE_RESTAMP_EVERY_MINUTES = 10
 USAGE_RESTAMP_CEILING_HOURS = 24
@@ -4757,10 +4758,11 @@ async def _agent_usage_total(agent_id: str) -> int | None:
     — 1,83 млн против 13,58 млн). Что отдаёт ``/usage`` без runId, живьём не
     проверено, поэтому оба исхода рабочие: агрегат берётся как есть, отказ
     или молчание — сумма по списку прогонов. Хоть один прогон без ответа —
-    None: доля счёта под видом целого хуже пустоты.
+    None: доля счёта под видом целого хуже пустоты. Ноль у агента, который
+    отработал ревью, — тоже «не назван», а не бесплатный прогон (#1026).
     """
     total = _provider_token_total(await cursor_cloud.get_usage(agent_id))
-    if total is not None:
+    if total:
         return total
     runs = await cursor_cloud.list_runs(agent_id)
     if not runs:
@@ -4776,26 +4778,21 @@ async def _agent_usage_total(agent_id: str) -> int | None:
         if part is None:
             return None
         summed += part
-    return summed
+    return summed or None
 
 
 async def _agent_finished(dispatch: dict[str, Any]) -> bool | None:
     """Все прогоны агента кончились? None — не узнали (#1413).
 
-    Список прогонов главнее своего: deep дописывает прогоны под тем же
-    агентом. Без списка (или без статусов в нём) судит свой прогон.
+    Судит только список прогонов: deep дописывает прогоны под тем же
+    агентом, и свой FINISHED при непрочитанном списке закрепил бы недосчёт
+    как итог. Нет списка или статуса в нём — не знаем, переснятие ждёт.
     """
-    agent_id = dispatch["agent_id"]
-    runs = await cursor_cloud.list_runs(agent_id)
+    runs = await cursor_cloud.list_runs(dispatch["agent_id"])
     statuses = [str(r.get("status") or "").upper() for r in runs or []]
-    if statuses and all(statuses):
-        return all(s in _TERMINAL_RUN_STATUSES for s in statuses)
-    if not dispatch.get("run_id"):
+    if not statuses or not all(statuses):
         return None
-    run = await cursor_cloud.get_run(agent_id, dispatch["run_id"])
-    if run is None:
-        return None
-    return (run.get("status") or "").upper() in _TERMINAL_RUN_STATUSES
+    return all(s in _TERMINAL_RUN_STATUSES for s in statuses)
 
 
 async def _stamp_dispatch_usage(
@@ -4835,8 +4832,26 @@ async def _restamp_owed_usage(db: aiosqlite.Connection) -> None:
 
     Не узнали, кончился ли, или провайдер не назвал итог — строка остаётся
     открытой со старым числом и спрашивается снова через
-    USAGE_RESTAMP_EVERY_MINUTES; ноль или догадка не пишутся (#1026).
+    USAGE_RESTAMP_EVERY_MINUTES; ноль или догадка не пишутся (#1026). Окно
+    USAGE_RESTAMP_CEILING_HOURS вышло без итога — строка метится
+    agent_partial и называется в карточке один раз: число — нижняя граница.
     """
+    for row in await repo.list_review_dispatches_usage_expired(
+        db, USAGE_RESTAMP_CEILING_HOURS
+    ):
+        await repo.mark_review_dispatch_usage(db, row["id"], USAGE_PARTIAL)
+        await repo.add_task_update(
+            db,
+            int(row["task_id"]),
+            "hub",
+            "alert",
+            f"Счёт заказа ревью #{row['id']} не подтверждён за "
+            f"{USAGE_RESTAMP_CEILING_HOURS} ч: агент {row['agent_id']} не "
+            "кончился или провайдер не назвал итог. provider_tokens="
+            f"{row['provider_tokens']} — нижняя граница, не полный счёт "
+            f"(usage_scope={USAGE_PARTIAL}, #1413).",
+        )
+        await db.commit()
     for row in await repo.list_review_dispatches_owing_usage(
         db, USAGE_RESTAMP_EVERY_MINUTES, USAGE_RESTAMP_CEILING_HOURS
     ):
