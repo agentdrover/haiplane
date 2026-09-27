@@ -584,6 +584,8 @@ async def api_chat_pair_start(request: Request) -> ChatPairStartView:
         principal_id,
         kind=payload.kind,
         bound_task_id=bound_task_id,
+        channel=payload.channel,
+        slot=payload.slot,
     )
     await admin_svc.write_audit(
         _db(request),
@@ -2639,7 +2641,7 @@ async def api_pair_start_task(
     identity=Depends(current_identity),
 ):
     """Start pair mode: running without headless dispatch (human or agent)."""
-    return await services.pair_start_task(
+    view = await services.pair_start_task(
         _db(request),
         task_id,
         body,
@@ -2647,6 +2649,8 @@ async def api_pair_start_task(
         implementer_principal_id=(identity.principal_id if identity.is_agent else None),
         caller_is_agent=identity.is_agent,
     )
+    await _record_slot_capture(request, identity, task_id)
+    return view
 
 
 @app.post("/api/tasks/{task_id}/claim", response_model=TaskView)
@@ -2659,13 +2663,37 @@ async def api_claim_task(
     """Claim an open task for one Cursor agent/session."""
     if not body.agent.strip():
         body = TaskClaim(agent=identity.username, session_id=body.session_id)
-    return await services.claim_task(
+    view = await services.claim_task(
         _db(request),
         task_id,
         body,
         implementer_principal_id=(identity.principal_id if identity.is_agent else None),
         caller_is_agent=identity.is_agent,
     )
+    await _record_slot_capture(request, identity, task_id)
+    return view
+
+
+async def _record_slot_capture(request: Request, identity, task_id: int) -> None:
+    """Захват сессией implementer пишет её канал и слот в карточку (#1434).
+
+    Только сессия кода implementer: у остальных входов канала нет, и их захват
+    идёт как до задачи. Код без канала — тоже как до задачи.
+    """
+    if identity.auth_source != "chat_pair" or identity.chat_pair_kind != "implementer":
+        return
+    from hub.services import executor_slots
+
+    await executor_slots.record_capture(_db(request), task_id)
+
+
+@app.get("/api/executor-slots")
+async def api_executor_slots(request: Request) -> dict:
+    """Занятость каналов исполнения (#1434): слот, задача, с какого времени,
+    последний признак жизни; задачи в работе без канала — «не назван»."""
+    from hub.services import executor_slots
+
+    return await executor_slots.occupancy(_db(request))
 
 
 @app.post("/api/tasks/{task_id}/declare-wait", response_model=TaskView)
