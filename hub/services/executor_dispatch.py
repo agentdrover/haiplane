@@ -89,7 +89,11 @@ async def _ask(call: Any, *args: Any) -> dict[str, Any] | None:
 async def _poll_one(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
     agent_id, run_id = row["agent_id"], row["run_id"]
     if not agent_id or not run_id:
-        await repo.update_executor_run(db, row["id"], reason=REASON_NO_RUN_ID)
+        # #1439: у брони запуска без агента причина уже может быть названа
+        # (слепая потеря ответа: «агент мог быть создан») — её не затирать
+        # общим «нечего опрашивать».
+        if not row.get("reason"):
+            await repo.update_executor_run(db, row["id"], reason=REASON_NO_RUN_ID)
         return
     run = await _ask(cursor_cloud.get_run, agent_id, run_id)
     if run is None:
