@@ -3613,6 +3613,14 @@ class MergeLedgerBackfillRequest(BaseModel):
     apply: bool = False
 
 
+class CursorUsageImportRequest(BaseModel):
+    """Body of the Cursor usage export import (#1413): dry run unless ``apply``."""
+
+    # Потолок = MAX_CSV_CHARS сервиса: выгрузка за день около 200 КБ.
+    csv: str = Field(..., min_length=1, max_length=5_000_000)
+    apply: bool = False
+
+
 class AuditEntry(BaseModel):
     id: int
     actor_principal_id: int | None = None

@@ -43,6 +43,12 @@ from hub.services.review_dispatch import (
     _REVIEW_MODEL_PREFERENCES,
     _delivery_block,
     REVIEW_FILE_LINE_CAP,
+    USAGE_FINAL,
+    USAGE_OPEN,
+    USAGE_PARTIAL,
+    USAGE_RECOUNTED,
+    USAGE_RESTAMP_CEILING_HOURS,
+    USAGE_RESTAMP_EVERY_MINUTES,
     changed_paths,
     count_environment_refusals,
     diff_plan,
@@ -52,6 +58,7 @@ from hub.services.review_dispatch import (
     maybe_dispatch_review,
     pick_review_model,
     pick_review_profile,
+    recount_review_usage,
     rules_candidates,
     rules_char_cap,
     split_generated,
@@ -157,6 +164,13 @@ def _wire(monkeypatch, recorder: _DispatchRecorder) -> None:
         return None
 
     monkeypatch.setattr(cursor_cloud, "get_usage", _no_usage)
+
+    async def _no_runs(agent_id):
+        # #1413: счёт агента падает на сумму по его прогонам, когда /usage без
+        # runId молчит — список прогонов тоже не должен уходить в сеть.
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "list_runs", _no_runs)
 
     async def _no_catalog():
         # Умолчание params — подбор по каталогу (#1423), а ключ выше фальшивый:
@@ -1352,6 +1366,347 @@ async def test_provider_usage_is_stored_on_the_report(
     assert closed["provider_tokens"] == 6_013_569, (
         "the bill lives on the dispatch too — a failed run has no report row"
     )
+
+
+# --- Счёт агента целиком (#1413) -------------------------------------------
+# Deep-харнесс делает несколько прогонов под одним агентом, а провайдер
+# начисляет их все. Хаб брал usage одного прогона (?runId=) и записывал долю:
+# заказ 420 — 1 825 481 против 13 577 260 по выгрузке Cursor.
+
+
+class _Provider:
+    """Подставка провайдера для счёта: агрегат по агенту и его прогоны.
+
+    ``aggregate`` — ответ ``/usage`` без runId (None: провайдер отказал или
+    молчит); ``runs`` — список ``(run_id, status, tokens)`` (None: список
+    прогонов не прочитан; tokens None: ``/usage?runId=`` не ответил).
+    """
+
+    def __init__(self, aggregate, runs):
+        self.aggregate = aggregate
+        self.runs = runs
+
+    def wire(self, monkeypatch) -> None:
+        monkeypatch.setattr(cursor_cloud, "get_usage", self.usage)
+        monkeypatch.setattr(cursor_cloud, "list_runs", self.list_runs)
+        monkeypatch.setattr(cursor_cloud, "get_run", self.get_run)
+
+    @staticmethod
+    def _body(tokens):
+        return None if tokens is None else {"totalUsage": {"totalTokens": tokens}}
+
+    async def usage(self, agent_id, run_id=None):
+        if not run_id:
+            return self._body(self.aggregate)
+        for rid, _status, tokens in self.runs or []:
+            if rid == run_id:
+                return self._body(tokens)
+        return None
+
+    async def list_runs(self, agent_id):
+        if self.runs is None:
+            return None
+        return [{"id": rid, "status": status} for rid, status, _ in self.runs]
+
+    async def get_run(self, agent_id, run_id):
+        for rid, status, _tokens in self.runs or []:
+            if rid == run_id:
+                return {"id": rid, "status": status}
+        return None
+
+
+async def _billed_task(client, db, monkeypatch, slug: str, agent: str) -> int:
+    recorder = _DispatchRecorder({"agent": {"id": agent}, "run": {"id": "r-1"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, slug)
+    await _report_on(client, task_id)
+    return task_id
+
+
+@pytest.mark.parametrize("shape", ["aggregate", "refused_without_run_id"])
+async def test_provider_tokens_sum_every_run_of_the_agent(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, shape: str
+):
+    """AC-1 (#1413): два прогона агента по 2 млн → 4 млн.
+
+    Живая проба 27.09 подтвердила агрегат (/usage без runId → totalUsage и
+    runs[]); отказ с суммой по прогонам остаётся запасным путём и покрыт тоже.
+    """
+    task_id = await _billed_task(client, db, monkeypatch, f"spike-{shape}", "bc-deep")
+    runs = [("r-1", "FINISHED", 2_000_000), ("r-2", "FINISHED", 2_000_000)]
+    _Provider(4_000_000 if shape == "aggregate" else None, runs).wire(monkeypatch)
+
+    await sweep_review_dispatches(db)
+
+    row = await _any_dispatch_row(db, task_id)
+    assert row["status"] == "done"
+    assert row["provider_tokens"] == 4_000_000, "не счёт одного прогона r-1"
+    saved = dict(await repo.get_latest_machine_review(db, task_id))
+    assert saved["provider_tokens"] == 4_000_000
+
+
+@pytest.mark.parametrize("answered", [True, False])
+async def test_single_run_usage_unchanged_and_unknown_stays_null(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, answered: bool
+):
+    """AC-2 (#1413): lite с одним прогоном — как было; молчание — NULL.
+
+    Пара 412 из сверки 25.09: хаб 811 071 и Cursor 811 071.
+    """
+    task_id = await _billed_task(client, db, monkeypatch, "spike-lite", "bc-lite")
+    if answered:
+        _Provider(811_071, [("r-1", "FINISHED", 811_071)]).wire(monkeypatch)
+    else:
+        _Provider(None, None).wire(monkeypatch)
+
+    await sweep_review_dispatches(db)
+
+    row = await _any_dispatch_row(db, task_id)
+    assert row["status"] == "done"
+    if answered:
+        assert row["provider_tokens"] == 811_071
+    else:
+        assert row["provider_tokens"] is None, "не ноль и не старое значение"
+        saved = dict(await repo.get_latest_machine_review(db, task_id))
+        assert saved["provider_tokens"] is None
+
+
+async def test_provider_tokens_restamped_after_agent_finishes(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1413): счёт, снятый на живом агенте, переснимается после конца."""
+    task_id = await _billed_task(client, db, monkeypatch, "spike-restamp", "bc-live")
+    provider = _Provider(1_000_000, [("r-1", "RUNNING", 1_000_000)])
+    provider.wire(monkeypatch)
+
+    await sweep_review_dispatches(db)
+    row = await _any_dispatch_row(db, task_id)
+    assert row["status"] == "done"
+    assert row["provider_tokens"] == 1_000_000
+    assert row["usage_scope"] == USAGE_OPEN
+
+    # Агент дописал ещё два прогона и закончил.
+    provider.aggregate = 4_000_000
+    provider.runs = [
+        ("r-1", "FINISHED", 1_000_000),
+        ("r-2", "FINISHED", 2_500_000),
+        ("r-3", "FINISHED", 500_000),
+    ]
+    await sweep_review_dispatches(db)
+    held = await _any_dispatch_row(db, task_id)
+    assert held["provider_tokens"] == 1_000_000, (
+        f"опрос не чаще раза в {USAGE_RESTAMP_EVERY_MINUTES} мин"
+    )
+
+    await db.execute(
+        "UPDATE review_dispatches SET usage_checked_at = datetime('now', ?)",
+        (f"-{USAGE_RESTAMP_EVERY_MINUTES + 1} minutes",),
+    )
+    await db.commit()
+    await sweep_review_dispatches(db)
+
+    row = await _any_dispatch_row(db, task_id)
+    assert row["provider_tokens"] == 4_000_000
+    assert row["usage_scope"] == USAGE_FINAL
+    saved = dict(await repo.get_latest_machine_review(db, task_id))
+    assert saved["provider_tokens"] == 4_000_000
+
+    # Итог закреплён: следующий проход провайдера не спрашивает.
+    provider.aggregate = 9_999_999
+    await db.execute(
+        "UPDATE review_dispatches SET usage_checked_at = datetime('now', '-1 day')"
+    )
+    await db.commit()
+    await sweep_review_dispatches(db)
+    assert (await _any_dispatch_row(db, task_id))["provider_tokens"] == 4_000_000
+
+
+async def test_restamp_waits_while_any_run_of_the_agent_is_alive(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1413: свой прогон кончился, соседний идёт — счёт ещё не итог."""
+    task_id = await _billed_task(client, db, monkeypatch, "spike-alive", "bc-alive")
+    provider = _Provider(
+        1_500_000, [("r-1", "FINISHED", 1_000_000), ("r-2", "RUNNING", 500_000)]
+    )
+    provider.wire(monkeypatch)
+    await sweep_review_dispatches(db)
+    await db.execute(
+        "UPDATE review_dispatches SET usage_checked_at = datetime('now', '-1 day')"
+    )
+    await db.commit()
+    await sweep_review_dispatches(db)
+
+    row = await _any_dispatch_row(db, task_id)
+    assert row["usage_scope"] == USAGE_OPEN
+    assert row["provider_tokens"] == 1_500_000
+
+
+async def _restamp_pass(db) -> dict:
+    await db.execute(
+        "UPDATE review_dispatches SET usage_checked_at = datetime('now', '-1 day')"
+    )
+    await db.commit()
+    await sweep_review_dispatches(db)
+    rows = await db.execute_fetchall("SELECT * FROM review_dispatches")
+    return dict(rows[-1])
+
+
+async def test_unread_run_list_does_not_settle_on_own_finished_run(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка ce0ad2369052fb62: список прогонов не прочитан — «не знаю»."""
+    await _billed_task(client, db, monkeypatch, "spike-unread", "bc-unread")
+    _Provider(1_000_000, None).wire(monkeypatch)
+    await sweep_review_dispatches(db)
+
+    async def _own_finished(agent_id, run_id):
+        return {"id": run_id, "status": "FINISHED"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _own_finished)
+    row = await _restamp_pass(db)
+    assert row["usage_scope"] == USAGE_OPEN, "свой FINISHED — не итог агента"
+
+
+async def test_zero_bill_of_a_finished_agent_is_not_named(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка e72f1c6229457e81: ноль у отработавшего агента — не итог (#1026)."""
+    await _billed_task(client, db, monkeypatch, "spike-zero", "bc-zero")
+    provider = _Provider(1_000_000, [("r-1", "RUNNING", 1_000_000)])
+    provider.wire(monkeypatch)
+    await sweep_review_dispatches(db)
+    provider.aggregate, provider.runs = 0, [("r-1", "FINISHED", 0)]
+
+    row = await _restamp_pass(db)
+    assert (row["usage_scope"], row["provider_tokens"]) == (USAGE_OPEN, 1_000_000)
+
+
+async def test_expired_open_bill_is_marked_partial_and_named_once(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка b9ab3c630ced1ed6: окно вышло — число помечено нижней границей."""
+    task_id = await _billed_task(client, db, monkeypatch, "spike-late", "bc-late")
+    _Provider(1_000_000, [("r-1", "RUNNING", 1_000_000)]).wire(monkeypatch)
+    await sweep_review_dispatches(db)
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', ?)",
+        (f"-{USAGE_RESTAMP_CEILING_HOURS + 1} hours",),
+    )
+    await db.commit()
+
+    row = await _restamp_pass(db)
+    await _restamp_pass(db)
+
+    assert (row["usage_scope"], row["provider_tokens"]) == (USAGE_PARTIAL, 1_000_000)
+    updates = [dict(u) for u in await repo.get_task_updates(db, task_id)]
+    named = [u for u in updates if "нижняя граница" in u["content"]]
+    assert len(named) == 1 and named[0]["kind"] == "alert"
+
+
+async def test_history_is_not_restamped_by_the_poller(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1413: строки до задачи (usage_scope пусто) — только командой владельца."""
+    task_id = await _billed_task(client, db, monkeypatch, "spike-old", "bc-old")
+    _Provider(1_000_000, [("r-1", "FINISHED", 1_000_000)]).wire(monkeypatch)
+    await sweep_review_dispatches(db)
+    await db.execute(
+        "UPDATE review_dispatches SET usage_scope = '', "
+        "usage_checked_at = datetime('now', '-1 day')"
+    )
+    await db.commit()
+    _Provider(7_000_000, [("r-1", "FINISHED", 7_000_000)]).wire(monkeypatch)
+
+    await sweep_review_dispatches(db)
+
+    assert (await _any_dispatch_row(db, task_id))["provider_tokens"] == 1_000_000
+
+
+async def test_owner_recount_marks_rows_and_leaves_unknown_alone(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1413: пересчёт истории — выборочно, по команде, с пометкой строки."""
+    task_id = await _billed_task(client, db, monkeypatch, "spike-recount", "bc-420")
+    _Provider(1_825_481, [("r-1", "FINISHED", 1_825_481)]).wire(monkeypatch)
+    await sweep_review_dispatches(db)
+    await db.execute("UPDATE review_dispatches SET usage_scope = ''")
+    await db.commit()
+    dispatch_id = (await _any_dispatch_row(db, task_id))["id"]
+
+    _Provider(13_577_260, None).wire(monkeypatch)
+    dry = await recount_review_usage(db, dispatch_ids=[dispatch_id], apply=False)
+    assert [(r["id"], r["before"], r["after"]) for r in dry] == [
+        (dispatch_id, 1_825_481, 13_577_260)
+    ]
+    assert (await _any_dispatch_row(db, task_id))["provider_tokens"] == 1_825_481
+
+    done = await recount_review_usage(db, dispatch_ids=[dispatch_id], apply=True)
+    assert done[0]["applied"] is True
+    row = await _any_dispatch_row(db, task_id)
+    assert row["provider_tokens"] == 13_577_260
+    assert row["usage_scope"] == USAGE_RECOUNTED
+    saved = dict(await repo.get_latest_machine_review(db, task_id))
+    assert saved["provider_tokens"] == 13_577_260
+
+    # Агент уже удалён у провайдера: строку не трогаем, называем причину.
+    _Provider(None, None).wire(monkeypatch)
+    gone = await recount_review_usage(db, dispatch_ids=[dispatch_id], apply=True)
+    assert gone[0]["after"] is None and gone[0]["applied"] is False
+    assert (await _any_dispatch_row(db, task_id))["provider_tokens"] == 13_577_260
+
+
+def test_recount_script_refuses_without_selection_and_names_unknown(monkeypatch):
+    """#1413: скрипт владельца без выборки не бежит; молчание названо словами."""
+    import importlib.util
+
+    script = Path(__file__).resolve().parents[1] / "scripts/recount_review_usage.py"
+    spec = importlib.util.spec_from_file_location("recount_review_usage", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    monkeypatch.setattr("sys.argv", ["recount_review_usage.py"])
+    with pytest.raises(SystemExit):
+        module.main()
+    text = module._render(
+        [
+            {
+                "id": 7,
+                "task_id": 1,
+                "profile": "deep",
+                "agent_id": "bc-1",
+                "before": 10,
+                "after": None,
+                "applied": False,
+            },
+        ],
+        apply=True,
+    )
+    assert "не назван провайдером" in text and "[пропущен]" in text
+
+
+async def test_list_runs_reads_the_items_page(monkeypatch):
+    """#1413: список прогонов — форма ``items`` + ``nextCursor``, как у агентов."""
+    pages = {
+        "/v1/agents/bc-1/runs?limit=50": {
+            "items": [{"id": "r-1", "status": "FINISHED"}],
+            "nextCursor": "c2",
+        },
+        "/v1/agents/bc-1/runs?limit=50&cursor=c2": {
+            "items": [{"id": "r-2", "status": "RUNNING"}]
+        },
+    }
+
+    async def _request(method, path, json_body=None):
+        return pages.get(path)
+
+    monkeypatch.setattr(cursor_cloud, "_request", _request)
+    assert await cursor_cloud.list_runs("bc-1") == [
+        {"id": "r-1", "status": "FINISHED"},
+        {"id": "r-2", "status": "RUNNING"},
+    ]
+    pages["/v1/agents/bc-1/runs?limit=50"] = {"runs": []}
+    assert await cursor_cloud.list_runs("bc-1") is None, "чужая форма — не пусто"
 
 
 # --- Repository review rules in the prompt (#873) ---------------------------
@@ -14750,7 +15105,8 @@ async def test_report_after_failed_order_is_linked_and_billed(
     assert (await _review_row(db, review_id))["profile"] == profile
 
     async def _usage(agent_id, run_id=None):
-        assert (agent_id, run_id) == ("bc-1ddea9c5", "run-582"), (agent_id, run_id)
+        # #1413: счёт снимается с агента целиком, а не с прогона run-582.
+        assert (agent_id, run_id) == ("bc-1ddea9c5", None), (agent_id, run_id)
         return {"totalUsage": {"totalTokens": 3_467_426}}
 
     monkeypatch.setattr(cursor_cloud, "get_usage", _usage)

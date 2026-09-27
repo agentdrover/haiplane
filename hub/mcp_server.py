@@ -3423,7 +3423,9 @@ def _review_economy_lines(econ: dict[str, Any]) -> list[str]:
         f"Review economy: {runs.get('total', 0)} run(s), "
         f"{runs.get('billed', 0)} billed / {runs.get('unbilled', 0)} without a bill, "
         f"{runs.get('provider_tokens_total', 0)} provider tokens"
-        + (f"; by profile: {by_profile}" if by_profile else ""),
+        + (f"; by profile: {by_profile}" if by_profile else "")
+        + f"; Cursor export covers {runs.get('export_billed_runs', 0)} run(s), "
+        f"{runs.get('api_lower_bound_runs', 0)} priced by the API (lower bound)",
         f"Unresolved: {findings.get('unresolved_total', 0)} in "
         f"{findings.get('reports_with_unresolved', 0)}/"
         f"{findings.get('independent_reports', 0)} independent report(s)"

@@ -4740,17 +4740,189 @@ def _provider_token_total(usage: dict[str, Any] | None) -> int | None:
     return None
 
 
+#: Чем снят provider_tokens заказа (#1413), колонка ``usage_scope``.
+USAGE_OPEN = "agent_open"  # счёт агента снят до его конца — свип переснимет
+USAGE_FINAL = "agent"  # итог по агенту после конца всех прогонов
+USAGE_RECOUNTED = "recounted"  # пересчитан командой владельца
+USAGE_PARTIAL = "agent_partial"  # окно вышло без итога: число — нижняя граница
+#: Как часто и сколько часов от заказа свип переснимает открытый счёт.
+USAGE_RESTAMP_EVERY_MINUTES = 10
+USAGE_RESTAMP_CEILING_HOURS = 24
+
+
+async def _agent_usage_total(agent_id: str) -> int | None:
+    """Счёт агента ЦЕЛИКОМ; None — провайдер не назвал (#1026, #1413).
+
+    Провайдер начисляет все прогоны агента, а deep-харнесс делает их
+    несколько: счёт одного прогона (``?runId=``) записывал 13–43% (заказ 420
+    — 1,83 млн против 13,58 млн). Что отдаёт ``/usage`` без runId, живьём не
+    проверено, поэтому оба исхода рабочие: агрегат берётся как есть, отказ
+    или молчание — сумма по списку прогонов. Хоть один прогон без ответа —
+    None: доля счёта под видом целого хуже пустоты. Ноль у агента, который
+    отработал ревью, — тоже «не назван», а не бесплатный прогон (#1026).
+    """
+    total = _provider_token_total(await cursor_cloud.get_usage(agent_id))
+    if total:
+        return total
+    runs = await cursor_cloud.list_runs(agent_id)
+    if not runs:
+        return None
+    summed = 0
+    for run in runs:
+        run_id = str(run.get("id") or "").strip()
+        part = (
+            _provider_token_total(await cursor_cloud.get_usage(agent_id, run_id))
+            if run_id
+            else None
+        )
+        if part is None:
+            return None
+        summed += part
+    return summed or None
+
+
+async def _agent_finished(dispatch: dict[str, Any]) -> bool | None:
+    """Все прогоны агента кончились? None — не узнали (#1413).
+
+    Судит только список прогонов: deep дописывает прогоны под тем же
+    агентом, и свой FINISHED при непрочитанном списке закрепил бы недосчёт
+    как итог. Нет списка или статуса в нём — не знаем, переснятие ждёт.
+    """
+    runs = await cursor_cloud.list_runs(dispatch["agent_id"])
+    statuses = [str(r.get("status") or "").upper() for r in runs or []]
+    if not statuses or not all(statuses):
+        return None
+    return all(s in _TERMINAL_RUN_STATUSES for s in statuses)
+
+
 async def _stamp_dispatch_usage(
     db: aiosqlite.Connection, dispatch: dict[str, Any]
 ) -> int | None:
-    """Ask the provider what this run billed; leave NULL when unknown (#1026)."""
-    usage = await cursor_cloud.get_usage(
-        dispatch["agent_id"], dispatch["run_id"] or None
-    )
-    total = _provider_token_total(usage)
+    """Ask the provider what the whole agent billed; NULL when unknown (#1026).
+
+    Снятый здесь счёт открыт (#1413): агент может ещё идти, и свип
+    переснимет его после конца всех прогонов (``_restamp_owed_usage``).
+    """
+    total = await _agent_usage_total(dispatch["agent_id"])
     if total is not None:
         await repo.set_review_dispatch_provider_tokens(db, dispatch["id"], total)
+    await repo.mark_review_dispatch_usage(db, dispatch["id"], USAGE_OPEN)
     return total
+
+
+async def _write_bill(
+    db: aiosqlite.Connection, dispatch: dict[str, Any], total: int, scope: str
+) -> None:
+    """Счёт на заказ и на его отчёт (#828), с пометкой, чем он снят."""
+    await repo.set_review_dispatch_provider_tokens(db, dispatch["id"], total)
+    await repo.mark_review_dispatch_usage(db, dispatch["id"], scope)
+    task_id, generation = (
+        int(dispatch["task_id"]),
+        int(dispatch["submission_generation"]),
+    )
+    review = await _dispatch_report(db, task_id, generation, dispatch)
+    if review is not None:
+        await repo.set_machine_review_provider_tokens(
+            db, task_id, generation, total, review_id=int(review["id"])
+        )
+
+
+async def _restamp_owed_usage(db: aiosqlite.Connection) -> None:
+    """Переснять счёт, снятый на живом агенте, когда агент кончился (#1413).
+
+    Не узнали, кончился ли, или провайдер не назвал итог — строка остаётся
+    открытой со старым числом и спрашивается снова через
+    USAGE_RESTAMP_EVERY_MINUTES; ноль или догадка не пишутся (#1026). Окно
+    USAGE_RESTAMP_CEILING_HOURS вышло без итога — строка метится
+    agent_partial и называется в карточке один раз: число — нижняя граница.
+    """
+    for row in await repo.list_review_dispatches_usage_expired(
+        db, USAGE_RESTAMP_CEILING_HOURS
+    ):
+        await repo.mark_review_dispatch_usage(db, row["id"], USAGE_PARTIAL)
+        await repo.add_task_update(
+            db,
+            int(row["task_id"]),
+            "hub",
+            "alert",
+            f"Счёт заказа ревью #{row['id']} не подтверждён за "
+            f"{USAGE_RESTAMP_CEILING_HOURS} ч: агент {row['agent_id']} не "
+            "кончился или провайдер не назвал итог. provider_tokens="
+            f"{row['provider_tokens']} — нижняя граница, не полный счёт "
+            f"(usage_scope={USAGE_PARTIAL}, #1413).",
+        )
+        await db.commit()
+    for row in await repo.list_review_dispatches_owing_usage(
+        db, USAGE_RESTAMP_EVERY_MINUTES, USAGE_RESTAMP_CEILING_HOURS
+    ):
+        dispatch = dict(row)
+        total = (
+            await _agent_usage_total(dispatch["agent_id"])
+            if await _agent_finished(dispatch)
+            else None
+        )
+        if total is None:
+            await repo.mark_review_dispatch_usage(db, dispatch["id"], USAGE_OPEN)
+        else:
+            await _write_bill(db, dispatch, total, USAGE_FINAL)
+        await db.commit()
+
+
+async def recount_review_usage(
+    db: aiosqlite.Connection,
+    *,
+    dispatch_ids: list[int] | None = None,
+    since: str = "",
+    until: str = "",
+    apply: bool = False,
+) -> list[dict[str, Any]]:
+    """Пересчёт истории по счёту агента — ТОЛЬКО по команде владельца (#1413).
+
+    Выборка — названные заказы и/или окно ``created_at``; берутся облачные
+    заказы с агентом. Без ``apply`` ничего не пишется: строка показывает
+    «было / станет». Провайдер не назвал счёт (агент удалён, срок хранения
+    вышел) — строка не трогается, ``after`` None. Пересчитанная строка
+    помечается ``usage_scope='recounted'``.
+    """
+    clauses = ["agent_id <> ''", "channel = 'cloud'"]
+    params: list[Any] = []
+    if dispatch_ids:
+        marks = ",".join("?" for _ in dispatch_ids)
+        clauses.append(f"id IN ({marks})")
+        params.extend(int(i) for i in dispatch_ids)
+    if since:
+        clauses.append("created_at >= ?")
+        params.append(since)
+    if until:
+        clauses.append("created_at < ?")
+        params.append(until)
+    if len(clauses) == 2:
+        raise ValueError("пересчёт без выборки не делается: ids или since/until")
+    # Условия — константы этой функции, значения идут плейсхолдерами.
+    where = " AND ".join(clauses)
+    sql = f"SELECT * FROM review_dispatches WHERE {where} ORDER BY id ASC"  # nosec B608
+    rows = await fetchall(db, sql, tuple(params))
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        dispatch = dict(row)
+        after = await _agent_usage_total(dispatch["agent_id"])
+        applied = False
+        if apply and after is not None:
+            await _write_bill(db, dispatch, after, USAGE_RECOUNTED)
+            await db.commit()
+            applied = True
+        out.append(
+            {
+                "id": dispatch["id"],
+                "task_id": dispatch["task_id"],
+                "agent_id": dispatch["agent_id"],
+                "profile": dispatch.get("profile") or "",
+                "before": dispatch.get("provider_tokens"),
+                "after": after,
+                "applied": applied,
+            }
+        )
+    return out
 
 
 def parse_report_block(text: str | None) -> Any | None:
@@ -5056,6 +5228,7 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
             await db.commit()
             continue
         await _close_a_run_without_a_report(db, dispatch, run)
+    await _restamp_owed_usage(db)
 
 
 #: Сколько после приёма отчёта свип пробует найти агента заказа-отказа, пока
