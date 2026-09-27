@@ -3113,8 +3113,12 @@ async def _verify_unknown_create(
     # Потолок — по часам, а не по сумме пауз (находка 90c389b87f1a980c):
     # каждый запрос списка живёт до своего httpx-таймаута, и без дедлайна
     # сдача и бронь висели бы минутами. Вышел дедлайн — исход неизвестен.
+    # Паузы не съедают бюджет следующей проверки (находка 2130251c27040fb8):
+    # иначе последняя шла с таймаутом 0 и подтверждённая пустота становилась
+    # слепым исходом. Бюджет вызова — длина паузы; не влезает — проверок нет.
     clock = asyncio.get_running_loop().time
     deadline = clock() + UNKNOWN_CREATE_CEILING_SECONDS
+    budget = UNKNOWN_CREATE_PAUSE_SECONDS
     for check in range(1, checks + 1):
         try:
             seen = await asyncio.wait_for(
@@ -3123,10 +3127,10 @@ async def _verify_unknown_create(
         except TimeoutError:
             seen = cursor_cloud.Reconciliation("", "", False)
             break
-        if seen.agent_id or check == checks or clock() >= deadline:
+        if seen.agent_id or check == checks or deadline - clock() < budget:
             break
         await _verification_pause(
-            min(UNKNOWN_CREATE_PAUSE_SECONDS, max(0.0, deadline - clock()))
+            min(UNKNOWN_CREATE_PAUSE_SECONDS, max(0.0, deadline - clock() - budget))
         )
     log.info(
         "review dispatch for #%s: create outcome verified by %s after %s checks: %s",

@@ -14928,3 +14928,42 @@ async def test_report_after_failed_order_waits_out_a_listing_failure(
     assert [r["status"] for r in await _rows_of(db, task_id)] == ["done"]
     unbilled = [a for a in await _alerts_of(db, task_id) if "Счёт прогона" in a]
     assert len(unbilled) == 1 and "не вышло" in unbilled[0], unbilled
+
+
+async def test_create_404_last_check_keeps_its_budget_on_live_pauses(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 2130251c27040fb8: паузы не отнимают у последней проверки время.
+
+    Живые паузы в масштабе: шесть пауз по 0,0625 с ровно съедают потолок
+    0,375 с — как 6 × 5 с = 30 с на проде. Двоичные дроби намеренно: в float
+    0,3 // 0,05 = 5, и проверок стало бы шесть, а не семь, как на проде.
+    Список пуст и отвечает быстро — это подтверждённая пустота, а не слепота.
+    """
+    from hub.services import review_dispatch as rd
+
+    _wire(monkeypatch, _DispatchRecorder(None, refusal=_CREATED_BUT_404))
+    _no_local_path(monkeypatch)
+    monkeypatch.setattr(rd, "UNKNOWN_CREATE_CEILING_SECONDS", 0.375)
+    monkeypatch.setattr(rd, "UNKNOWN_CREATE_PAUSE_SECONDS", 0.0625)
+    calls: list[int] = []
+
+    async def _listing(limit=50, cursor=""):
+        # Быстрый, но настоящий сетевой ответ: он уступает цикл, и таймаут 0
+        # успевает его отменить — так ведёт себя httpx, а не синхронная заглушка.
+        calls.append(1)
+        await asyncio.sleep(0.001)
+        return {"items": [{"id": "bc-other", "name": "haiplane:review:t1:g1:a1"}]}
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+    started = asyncio.get_running_loop().time()
+    task_id = await _submitted(
+        client, db, "create-404-live-pauses", policy={"review": "dispatch"}
+    )
+    assert asyncio.get_running_loop().time() - started < 2.0
+    assert len(calls) > 1
+    rows = await _rows_of(db, task_id)
+    assert [(r["agent_id"], r["status"]) for r in rows] == [("", "failed")], rows
+    assert await _claims_of(db, task_id) == 0
+    refused = [a for a in await _alerts_of(db, task_id) if "НЕ вызвано" in a]
+    assert len(refused) == 1 and "сверка по метке заказа агента не нашла" in refused[0]
