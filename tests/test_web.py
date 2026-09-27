@@ -6595,6 +6595,8 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
         "small_delta_lines": 40,
         "executor_launch": "manual",
         "executor_push_rights_task": 1409,
+        "executor_task_cents_ceiling": 10500,
+        "executor_task_token_ceiling": 24000000,
         "circle_deep_stop": 2,
         "submission_contract": "warn",
         "claim_area_check": "warn",

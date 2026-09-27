@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import aiosqlite
@@ -452,6 +453,98 @@ async def sweep_executor_runs(db: aiosqlite.Connection) -> None:
     await poll_executor_runs(db)
 
 
+# ---- #1443 (F5.1): суммарный бюджет исполнителя на задачу ----
+
+TASK_CENTS_CEILING_KEY = "executor_task_cents_ceiling"
+TASK_TOKEN_CEILING_KEY = "executor_task_token_ceiling"  # nosec B105 - a policy key name, not a credential
+
+
+@dataclass
+class TaskBudget:
+    """Сколько задача уже потратила на исполнителя и сколько ей положено."""
+
+    runs: int
+    cents_spent: float
+    tokens_spent: int
+    cents_ceiling: float
+    token_ceiling: int
+    #: Прогоны с агентом, чья цена или токены не прочитаны (находка ревью
+    #: #1443): «неизвестно» — не ноль (#516, #549, #1410).
+    unpriced: int = 0
+
+    @property
+    def cents_left(self) -> float:
+        return round(max(0.0, self.cents_ceiling - self.cents_spent), 2)
+
+    @property
+    def tokens_left(self) -> int:
+        return max(0, self.token_ceiling - self.tokens_spent)
+
+    @property
+    def unknown(self) -> bool:
+        """Сумма неизвестна: остаток не называется, заказ не делается."""
+        return self.unpriced > 0
+
+    @property
+    def exhausted(self) -> bool:
+        return (
+            self.cents_spent >= self.cents_ceiling
+            or self.tokens_spent >= self.token_ceiling
+        )
+
+    def text(self) -> str:
+        known = (
+            f"потрачено {_num(self.cents_spent)} ¢ из {_num(self.cents_ceiling)} ¢ "
+            f"и {self.tokens_spent} токенов из {self.token_ceiling} "
+            f"за {self.runs} прогон(ов)"
+        )
+        if self.unknown:
+            return (
+                f"{known}; цена {self.unpriced} прогон(ов) не прочитана — "
+                "сумма не меньше названной, остаток неизвестен"
+            )
+        return known
+
+
+def _positive(value: Any, cast: type) -> Any:
+    """Потолок из политики, если он читаем и положителен; иначе ``None``."""
+    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+        return None
+    return cast(value)
+
+
+async def task_budget(
+    db: aiosqlite.Connection, task_id: int, policy: dict | None = None
+) -> TaskBudget:
+    """Бюджет задачи: сумма ВСЕХ её прогонов против потолка (#1443).
+
+    Одна функция на все заказы — первый запуск (#1412) и круг починки
+    (F5.2/F5.3): второй копии правила нет. Прочитанное складывается; прогон
+    с агентом, у которого цена или токены не прочитаны, — не ноль, а
+    неизвестность (``unpriced``): остаток тогда не называется, и заказ не
+    делается. Бронь без агента (заказ не состоялся) стоит ноль честно.
+    """
+    if policy is None:
+        from hub.services.project_policy import gate_policy_for_task
+
+        policy = await gate_policy_for_task(db, task_id)
+    rows = [dict(r) for r in await repo.list_executor_runs(db, task_id)]
+    cents_ceiling = _positive(policy.get(TASK_CENTS_CEILING_KEY), float)
+    token_ceiling = _positive(policy.get(TASK_TOKEN_CEILING_KEY), int)
+    return TaskBudget(
+        runs=len(rows),
+        cents_spent=round(sum(float(r["cents"] or 0) for r in rows), 2),
+        tokens_spent=sum(int(r["tokens"] or 0) for r in rows),
+        cents_ceiling=cents_ceiling or float(config.EXECUTOR_TASK_CENTS_CEILING),
+        token_ceiling=token_ceiling or int(config.EXECUTOR_TASK_TOKEN_CEILING),
+        unpriced=sum(
+            1
+            for r in rows
+            if r["agent_id"] and (r["cents"] is None or r["tokens"] is None)
+        ),
+    )
+
+
 async def executor_runs_view(
     db: aiosqlite.Connection, task_id: int
 ) -> dict[str, Any] | None:
@@ -473,11 +566,24 @@ async def executor_runs_view(
     if not runs:
         return None
     billed = [r["cents"] for r in runs if r["cents"] is not None]
+    budget = await task_budget(db, task_id)
     return {
         "runs": runs,
         "count": len(runs),
         "billed": len(billed),
         "cents_total": round(sum(billed), 2) if billed else None,
+        # #1443: бюджет задачи рядом с прогонами — сколько ещё можно купить.
+        "budget": {
+            "cents_spent": budget.cents_spent,
+            "cents_ceiling": budget.cents_ceiling,
+            "cents_left": budget.cents_left,
+            "tokens_spent": budget.tokens_spent,
+            "token_ceiling": budget.token_ceiling,
+            "tokens_left": budget.tokens_left,
+            "exhausted": budget.exhausted,
+            "unpriced": budget.unpriced,
+            "unknown": budget.unknown,
+        },
     }
 
 
