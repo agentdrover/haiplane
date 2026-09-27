@@ -3110,11 +3110,24 @@ async def _verify_unknown_create(
     """
     checks = int(UNKNOWN_CREATE_CEILING_SECONDS // UNKNOWN_CREATE_PAUSE_SECONDS) + 1
     seen = cursor_cloud.Reconciliation("", "", False)
+    # Потолок — по часам, а не по сумме пауз (находка 90c389b87f1a980c):
+    # каждый запрос списка живёт до своего httpx-таймаута, и без дедлайна
+    # сдача и бронь висели бы минутами. Вышел дедлайн — исход неизвестен.
+    clock = asyncio.get_running_loop().time
+    deadline = clock() + UNKNOWN_CREATE_CEILING_SECONDS
     for check in range(1, checks + 1):
-        seen = await cursor_cloud.find_agent_by_name(marker)
-        if seen.agent_id or check == checks:
+        try:
+            seen = await asyncio.wait_for(
+                cursor_cloud.find_agent_by_name(marker), max(0.0, deadline - clock())
+            )
+        except TimeoutError:
+            seen = cursor_cloud.Reconciliation("", "", False)
             break
-        await _verification_pause(UNKNOWN_CREATE_PAUSE_SECONDS)
+        if seen.agent_id or check == checks or clock() >= deadline:
+            break
+        await _verification_pause(
+            min(UNKNOWN_CREATE_PAUSE_SECONDS, max(0.0, deadline - clock()))
+        )
     log.info(
         "review dispatch for #%s: create outcome verified by %s after %s checks: %s",
         task_id,
@@ -3123,6 +3136,21 @@ async def _verify_unknown_create(
         seen.agent_id or ("absent" if seen.asked else "unknown"),
     )
     return seen, check
+
+
+async def _trace_cancelled_verification(db: aiosqlite.Connection, task_id: int) -> None:
+    """След слепого исхода, когда сверку оборвала отмена сдачи (#1408)."""
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        "Кросс-модельное ревью НЕ вызвано: исход создания неизвестен: "
+        "провайдер ответил на создание HTTP 404, а сверку по метке оборвала "
+        "отмена сдачи — бронь держится до своего срока (#1408). Вердикт "
+        "остаётся человеку.",
+    )
+    await db.commit()
 
 
 async def _attempt_ordinal(
@@ -3158,6 +3186,7 @@ async def _create_or_adopt(
     hub_mcp_url: str,
     reviewer_token: str,
     model_params: list[cursor_cloud.ModelParam] | None = None,
+    db: aiosqlite.Connection | None = None,
 ) -> _Started:
     """Создать ревьюера, а если ответ не дошёл — спросить, не создан ли он.
 
@@ -3206,7 +3235,14 @@ async def _create_or_adopt(
     if not agent_id and refusal is not None and refusal.leaves_create_unknown:
         # #1408: ответ дошёл, но агента не опровергает. Повтор create тут
         # запрещён — агент мог уже работать; только сверка по метке.
-        seen, verified = await _verify_unknown_create(marker, task_id)
+        try:
+            seen, verified = await _verify_unknown_create(marker, task_id)
+        except asyncio.CancelledError:
+            # Находка fb268a615c11e601: обрыв сдачи посреди сверки. Бронь
+            # живёт до TTL, и без следа никто не узнал бы почему.
+            if db is not None:
+                await asyncio.shield(_trace_cancelled_verification(db, task_id))
+            raise
         agent_id, run_id = seen.agent_id, seen.run_id
         adopted, blind = bool(seen.agent_id), not seen.asked
     while not agent_id and refusal is not None and refusal.is_transport:
@@ -3529,6 +3565,7 @@ async def maybe_dispatch_review(
         hub_mcp_url=f"{instance_base_url().rstrip('/')}/mcp",
         reviewer_token=reviewer_token,
         model_params=await cursor_cloud.review_params_for(model_id),
+        db=db,
     )
     agent_id, run_id = started.agent_id, started.run_id
     variant = await _name_the_dropped_params(db, task_id, model_id, started)
@@ -5017,6 +5054,11 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
         await _close_a_run_without_a_report(db, dispatch, run)
 
 
+#: Сколько после приёма отчёта свип пробует найти агента заказа-отказа, пока
+#: провайдер не отвечает на список (#1408); дальше счёт назван недоступным.
+REPORT_BILL_CEILING_MINUTES = 60
+
+
 async def _find_the_agent_behind(
     db: aiosqlite.Connection,
     dispatch: dict[str, Any],
@@ -5027,9 +5069,10 @@ async def _find_the_agent_behind(
     Такую строку открывает приём отчёта (``reopen_refused_order_for_report``).
     Метка восстанавливается номером строки в поколении — тем же счётом, каким
     ``_attempt_ordinal`` выдал её заказу. Нашли — агент и прогон записаны,
-    строка идёт обычным путём (счёт провайдера, done); True. Не нашли или не
-    смогли спросить — заказ закрыт отчётом, а счёт назван недоступным с
-    причиной один раз; False. Без отчёта (не сопоставился) строка возвращается
+    строка идёт обычным путём (счёт провайдера, done); True. Провайдер ответил
+    «нет» или сбой списка длится дольше REPORT_BILL_CEILING_MINUTES — заказ
+    закрыт отчётом, счёт назван недоступным с причиной один раз; до потолка
+    сбой оставляет строку active на следующий проход. Оба — False. Без отчёта (не сопоставился) строка возвращается
     в failed: ничего нового о ней не известно, и опрашивать прогон без агента
     нечем.
     """
@@ -5066,10 +5109,18 @@ async def _find_the_agent_behind(
             f"{marker}, заказ усыновлён и счёт снимается с провайдера (#1408).",
         )
         return True
+    # Находка 1e7563683681fb25: сбой списка — не ответ. Заказ ждёт следующего
+    # прохода, пока с приёма отчёта не вышел потолок REPORT_BILL_CEILING.
+    if not seen.asked and not await fetchall(
+        db,
+        "SELECT 1 FROM machine_reviews WHERE id=? AND created_at <= datetime('now', ?)",
+        (review["id"], f"-{REPORT_BILL_CEILING_MINUTES} minutes"),
+    ):
+        return False
     why = (
         "агента с меткой заказа у провайдера нет"
         if seen.asked
-        else "спросить провайдера по метке не вышло"
+        else f"спросить провайдера по метке не вышло за {REPORT_BILL_CEILING_MINUTES} мин"
     )
     await repo.add_task_update(
         db,

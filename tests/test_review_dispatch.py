@@ -14853,3 +14853,78 @@ async def test_reopened_order_without_its_report_returns_to_failed(
     rows = await _rows_of(db, task_id)
     assert [(r["agent_id"], r["status"]) for r in rows] == [("", "failed")], rows
     assert listing.calls == checks, "без отчёта по метке не сверяют"
+
+
+async def _hang(*args, **kwargs):
+    await asyncio.sleep(3600)
+
+
+async def test_create_404_verification_ceiling_is_wall_clock(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 90c389b87f1a980c: висящий список не растягивает потолок."""
+    from hub.services import review_dispatch as rd
+
+    _wire(monkeypatch, _DispatchRecorder(None, refusal=_CREATED_BUT_404))
+    _no_local_path(monkeypatch)
+    monkeypatch.setattr(rd, "UNKNOWN_CREATE_CEILING_SECONDS", 0.3)
+    monkeypatch.setattr(cursor_cloud, "list_agents", _hang)
+    started = asyncio.get_running_loop().time()
+    task_id = await asyncio.wait_for(
+        _submitted(client, db, "create-404-hang", policy={"review": "dispatch"}), 5
+    )
+    assert asyncio.get_running_loop().time() - started < 2.0
+    assert await _rows_of(db, task_id) == [] and await _claims_of(db, task_id) == 1
+    alerts = await _alerts_of(db, task_id)
+    assert any("исход создания неизвестен" in a for a in alerts), alerts
+
+
+async def test_create_404_cancelled_verification_leaves_a_trace(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка fb268a615c11e601: отмена сдачи посреди сверки видна в карточке."""
+    _wire(monkeypatch, _DispatchRecorder(None, refusal=_CREATED_BUT_404))
+    _no_local_path(monkeypatch)
+    asked = asyncio.Event()
+
+    async def _listing(limit=50, cursor=""):
+        asked.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+    submit = asyncio.create_task(
+        _submitted(client, db, "create-404-cancel", policy={"review": "dispatch"})
+    )
+    await asyncio.wait_for(asked.wait(), 5)
+    submit.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await submit
+    task_id = int((await db.execute_fetchall("SELECT MAX(id) FROM tasks"))[0][0])
+    alerts = await _alerts_of(db, task_id)
+    assert any("исход создания неизвестен" in a for a in alerts), alerts
+
+
+async def test_report_after_failed_order_waits_out_a_listing_failure(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Находка 1e7563683681fb25: сбой списка не закрывает счёт с первого раза."""
+    task_id, review_id, _ = await _failed_order_then_report(
+        client, db, monkeypatch, "late-report-list-down", []
+    )
+
+    async def _down(limit=50, cursor=""):
+        return None
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _down)
+    await sweep_review_dispatches(db)
+    assert [r["status"] for r in await _rows_of(db, task_id)] == ["active"]
+    assert not [a for a in await _alerts_of(db, task_id) if "Счёт прогона" in a]
+
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=datetime('now', '-2 hours') WHERE id=?",
+        (review_id,),
+    )
+    await sweep_review_dispatches(db)
+    assert [r["status"] for r in await _rows_of(db, task_id)] == ["done"]
+    unbilled = [a for a in await _alerts_of(db, task_id) if "Счёт прогона" in a]
+    assert len(unbilled) == 1 and "не вышло" in unbilled[0], unbilled
