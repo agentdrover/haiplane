@@ -531,6 +531,11 @@ async def _container_delivery(
         }
     stranded = []
     for child in await repo.children_as_blockers(db, int(task["id"])):
+        if child.get("status") == "rejected":
+            # Правило свёртки (#742, случай #579): rejected — «работа не
+            # нужна», контейнер не держит; failed — «нужна, но не сделана» —
+            # держит и называется ниже (находка ревью #1442).
+            continue
         answer = await blocker_delivery(db, child)
         if not answer.get("delivered"):
             stranded.append(answer)

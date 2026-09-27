@@ -786,3 +786,28 @@ async def test_an_open_feature_is_not_delivered_even_with_delivered_children(
     blockers = await lifecycle.warn_about_undelivered_blockers(db, waits)
 
     assert [b["task_id"] for b in blockers] == [feature]
+
+
+async def test_a_rejected_child_does_not_hold_a_delivered_feature(
+    db: aiosqlite.Connection,
+):
+    """Находка ревью #1442: отклонённый черновик-ребёнок («работа не нужна»,
+    правило свёртки #742/#579) фичу не держит; failed-ребёнок — держит."""
+    feature = await _container(db, "фича", "feature")
+    await _delivered_child(db, feature, 401)
+    discarded = await _task(db, "smoke draft")
+    await repo.update_task(db, discarded, parent_id=feature, status="rejected")
+    waits = await _task(db, "ждёт")
+    await repo.add_task_dependency(db, waits, feature)
+    await db.commit()
+
+    assert await lifecycle.warn_about_undelivered_blockers(db, waits) == []
+
+    broken = await _task(db, "не сделана")
+    await repo.update_task(db, broken, parent_id=feature, status="failed")
+    await db.commit()
+
+    blockers = await lifecycle.warn_about_undelivered_blockers(db, waits)
+    assert [b["task_id"] for b in blockers] == [feature]
+    assert f"#{broken}" in blockers[0]["reason"]
+    assert f"#{discarded}" not in blockers[0]["reason"]
