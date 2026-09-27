@@ -100,6 +100,56 @@ class CIRunRequestResult:
     details: str | None = None
 
 
+class BaseFreshnessState(str, Enum):
+    """Стоит ли голова PR на актуальной базе (#1419).
+
+    25.09.2026 гейт влил #1361 и через 57 с #1400: каждая зелёная на своей
+    базе, вместе — красный develop на 1 ч 43 мин. CI головы PR ничего не
+    говорит о базе, которая ушла вперёд после прогона, поэтому гейт спрашивает
+    об этом отдельно.
+
+    ``unknown`` — спросили, ответа нет: ждать, не мержить и не звать человека
+    (#951). ``unsupported`` — плагин не умеет спрашивать вовсе (заглушка без
+    форжа): это факт о плагине, а не о ветке, и гейт идёт как до #1419.
+    """
+
+    current = "current"  # база целиком в голове PR
+    behind = "behind"  # в базе есть коммиты, которых нет в голове
+    unknown = "unknown"  # спросить не удалось — ждать
+    unsupported = "unsupported"  # этот плагин не спрашивает вовсе
+
+
+@dataclass(frozen=True)
+class BaseFreshness:
+    """Ответ форжа об отставании головы PR от базы (#1419).
+
+    ``head_sha`` — голова, о которой ответ: ею же гейт арендует обновление
+    (expected_head_sha), чтобы не слить базу поверх чужого пуша.
+    """
+
+    state: BaseFreshnessState
+    head_sha: str = ""
+    behind_by: int | None = None
+    reason: str = ""
+
+
+class BranchUpdateOutcome(str, Enum):
+    """Чем кончилась просьба слить базу в ветку PR (#1419).
+
+    Разные исходы — разные руки. ``conflict`` и ``refused`` зовут человека с
+    причиной; ``head_moved`` и ``unavailable`` — повтор следующим циклом;
+    ``unsupported`` — у форжа нет такого вызова, и ветку обновляет git_ops
+    локальным мержем с пушем.
+    """
+
+    updated = "updated"
+    conflict = "conflict"  # база не сливается в ветку без человека
+    refused = "refused"  # форж отказал осмысленно: права, защита, валидация
+    head_moved = "head_moved"  # голова уже не та, что в аренде
+    unavailable = "unavailable"  # вызов не долетел — спросить снова
+    unsupported = "unsupported"  # у форжа нет такого вызова
+
+
 class StackProbeOutcome(str, Enum):
     """Every observable answer to "does this branch stand on that one" (#1186).
 
@@ -404,6 +454,25 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
     ) -> tuple[MergeabilityOutcome, str]: ...
+    # #1419: отстала ли голова PR от базы, и слить базу в ветку, если да.
+    async def pr_base_freshness(
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> BaseFreshness: ...
+    async def update_pr_branch(
+        self,
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        task_id: int = 0,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[BranchUpdateOutcome, str]: ...
     async def base_merge_conflicts(
         self, repo: str, base: str, branch: str, task_id: int, tip: str = ""
     ) -> tuple[dict[str, str] | None, str]: ...
@@ -755,6 +824,20 @@ class ForgePlugin(Protocol):
     async def pr_mergeability(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> tuple[MergeabilityOutcome, str]: ...
+    # #1419: отстала ли голова PR от базы. Только чтение.
+    async def pr_base_freshness(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> BaseFreshness: ...
+    # #1419: слить базу в ветку PR с арендой головы (expected_head_sha).
+    # Пишущий вызов; форж без такого вызова отвечает ``unsupported``.
+    async def update_pr_branch(
+        self,
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[BranchUpdateOutcome, str]: ...
     async def merge_commit_sha(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> str: ...
