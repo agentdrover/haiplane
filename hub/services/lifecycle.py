@@ -18,6 +18,7 @@ from fastapi import HTTPException, status
 from hub import commit_scope, config
 from hub import db as db_module
 from hub.actionable_errors import (
+    claim_area_conflict_detail,
     submission_contract_violated_detail,
     changes_requested_requires_content_detail,
     verdict_contradicts_its_text_detail,
@@ -1492,6 +1493,42 @@ async def refuse_opening_without_subject(
     )
 
 
+async def check_capture_areas(
+    db: aiosqlite.Connection, task_id: int, current_status: str
+) -> dict[str, Any] | None:
+    """Сверка областей при захвате задачи — одна на три входа (#1433).
+
+    Через неё идут claim_task, pair_start_task и вход по одноразовому коду
+    implementer (chat_pair.redeem_code). Правило — orchestrator_queue, второй
+    копии нет. Режим — политика проекта ``claim_area_check``:
+
+    * off — ничего не читается и не пишется, захват как до #1433;
+    * warn — захват проходит, в карточке ОДНА запись с задачей-соседом и
+      путём (повторная встреча того же пересечения — claim, затем
+      pair_start — вторую не пишет); вызывающий получает пересечение;
+    * require — отказ структурной ошибкой до перехода статуса.
+    """
+    from hub.services.orchestrator_queue import capture_conflict
+    from hub.services.project_policy import CLAIM_AREA_MARK, CLAIM_AREA_REQUIRE
+
+    mode, conflict = await capture_conflict(db, task_id)
+    if conflict is None:
+        return None
+    if mode == CLAIM_AREA_REQUIRE:
+        raise HTTPException(
+            409,
+            detail=claim_area_conflict_detail(
+                task_id=task_id, current_status=current_status, conflict=conflict
+            ),
+        )
+    text = f"{CLAIM_AREA_MARK} (claim_area_check={mode}): {conflict['detail']}."
+    updates = await repo.get_task_updates(db, task_id)
+    if not any(str(u["content"]) == text for u in updates):
+        await repo.add_task_update(db, task_id, "hub", "alert", text)
+        await db.commit()
+    return {"mode": mode, **conflict}
+
+
 async def start_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1641,6 +1678,9 @@ async def pair_start_task(
     # that would leave both behind.
     await refuse_opening_without_subject(db, task_id, task)
     await refuse_opening_over_review_limit(db, task_id, task)
+    # #1433: the same place for the same reason — refused before the plan and
+    # the branch are written.
+    area_check = await check_capture_areas(db, task_id, starting_status)
 
     body = body or TaskPairStart()
 
@@ -1739,6 +1779,7 @@ async def pair_start_task(
     from hub.services.statement_freshness import statement_freshness
 
     tv.statement_freshness = await statement_freshness(db, dict(row))  # type: ignore[arg-type]
+    tv.area_check = area_check
     return tv
 
 
@@ -3948,6 +3989,9 @@ async def claim_task(
             f"can only claim open tasks, current status: {task['status']}",
         )
 
+    # #1433: before the transition — a refusal leaves the task open.
+    area_check = await check_capture_areas(db, task_id, task["status"])
+
     if not await repo.transition_status_if(
         db, task_id, expected_from="open", new_status="claimed"
     ):
@@ -3989,7 +4033,9 @@ async def claim_task(
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
-    return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+    tv.area_check = area_check
+    return tv
 
 
 async def release_task(

@@ -6597,6 +6597,7 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
         "executor_push_rights_task": 1409,
         "circle_deep_stop": 2,
         "submission_contract": "warn",
+        "claim_area_check": "warn",
     }
     not_shown = set(GATE_POLICY_KEYS) - _FORM_GATE_POLICY_KEYS
     assert not_shown, "класс пуст — проверять нечего, тест бы лгал"

@@ -261,6 +261,11 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
     Unknown, already spent and expired are ONE answer on purpose: three
     distinguishable refusals would tell a caller enumerating codes which
     guesses were close.
+
+    The one exception is the capture check of #1433: a VALID implementer code
+    on an open task whose areas overlap started work under
+    ``claim_area_check=require`` raises the structured 409 naming the
+    neighbour, and the code stays unspent.
     """
     normalized = normalize_pair_code(raw_code)
     if len(normalized) != CODE_LENGTH:
@@ -297,6 +302,14 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
             dict(task_rows[0]), row.get("bound_generation")
         ):
             return None
+        if dict(task_rows[0]).get("status") == "open":
+            # #1433: код на open-задачу — вход в её захват, третий рядом с
+            # claim и pair_start; сверка та же и до траты кода. Отказ — не
+            # None: он возможен только с действительным кодом и называет
+            # соседа, а не угадывание кода.
+            from hub.services.lifecycle import check_capture_areas
+
+            await check_capture_areas(db, int(bound_task_id), "open")
         acting = await get_acting_agent(db)
         if acting is None:
             return None

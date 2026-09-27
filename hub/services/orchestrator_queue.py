@@ -26,6 +26,10 @@ F2 (#1365). До этой задачи порядок держала памят�
 мимо узкого «hub/poller.py» в работе (#1147); по голой строке «hub» задевал
 бы «hubble/». Глоб «*» режет путь до себя и сравнивается как префикс.
 
+Правило пересечения (``area_conflict``) здесь одно на хаб: его же читает
+захват задачи — claim, pair_start и вход по коду (``capture_conflict``,
+#1433); отказ или запись в карточке — дело lifecycle, не этого модуля.
+
 Ни одна функция здесь не пишет в задачу. Единственная запись —
 ``announce_once``: событие ``orchestrator_next_candidate`` в ленту проекта,
 и только при смене ответа.
@@ -161,6 +165,73 @@ def _first_overlap(
     return None
 
 
+def area_conflict(
+    candidate: dict[str, Any], active: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Почему области кандидата не свободны от начатых задач; ``None`` — свободны.
+
+    ЕДИНСТВЕННОЕ правило пересечения хаба (#1433): его читают и очередь
+    (``_skip_reason``), и захват задачи (``capture_conflict``). Незнание с
+    любой стороны — не «не пересекается».
+    """
+    if not candidate["areas"]:
+        return {
+            "reason": SKIP_UNDECLARED,
+            "detail": "область не объявлена: affected_areas пусты, "
+            "пересечение с работой в полёте не проверить",
+        }
+    blind = [t for t in active if not t["areas"]]
+    if blind:
+        # Незнание с той стороны — не «не пересекается» (находка ревью #1274):
+        # задача в работе без объявленных областей может править что угодно.
+        listed = ", ".join(f"#{t['id']}" for t in blind)
+        return {
+            "reason": SKIP_ACTIVE_UNDECLARED,
+            "detail": f"область задачи в работе не объявлена: {listed}",
+            "with_task_ids": [int(t["id"]) for t in blind],
+        }
+    hit = _first_overlap(candidate, active)
+    if hit is not None:
+        return {
+            "reason": SKIP_OVERLAP,
+            "detail": (
+                f"{hit['path']} пересекается с {hit['with_path']} "
+                f"задачи #{hit['with_task_id']} в работе"
+            ),
+            **hit,
+        }
+    return None
+
+
+async def capture_conflict(
+    db: aiosqlite.Connection, task_id: int
+) -> tuple[str, dict[str, Any] | None]:
+    """Режим ``claim_area_check`` проекта и пересечение захватываемой задачи (#1433).
+
+    Читатель для захвата — то же правило (``area_conflict``) против тех же
+    начатых задач проекта (``STARTED_STATUSES``), что и у очереди. Сама
+    задача из начатых исключена: своя бронь (claimed перед pair_start) сама с
+    собой не пересекается. Задачи других проектов не сверяются — у них другой
+    репозиторий. При ``off`` ничего не читается: выключенная сверка не стоит
+    захвату ни одного запроса.
+    """
+    project = await repo.resolve_project_for_task(db, task_id)
+    if project is None:
+        return project_policy.CLAIM_AREA_OFF, None
+    mode = project_policy.claim_area_check_of(project_policy.gate_policy_of(project))
+    if mode == project_policy.CLAIM_AREA_OFF:
+        return mode, None
+    tasks = await _project_tasks(db, int(project["id"]))
+    candidate = next((t for t in tasks if int(t["id"]) == task_id), None)
+    if candidate is None:
+        # Не живая задача: захват откажет по статусу сам, сверять нечего.
+        return mode, None
+    active = [
+        t for t in tasks if t["status"] in STARTED_STATUSES and int(t["id"]) != task_id
+    ]
+    return mode, area_conflict(candidate, active)
+
+
 async def _skip_reason(
     db: aiosqlite.Connection, candidate: dict[str, Any], active: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -175,35 +246,9 @@ async def _skip_reason(
             "detail": f"зависимость не доставлена: {listed}",
             "blockers": blockers,
         }
-    if not candidate["areas"]:
-        return {
-            "task_id": task_id,
-            "reason": SKIP_UNDECLARED,
-            "detail": "область не объявлена: affected_areas пусты, "
-            "пересечение с работой в полёте не проверить",
-        }
-    blind = [t for t in active if not t["areas"]]
-    if blind:
-        # Незнание с той стороны — не «не пересекается» (находка ревью #1274):
-        # задача в работе без объявленных областей может править что угодно.
-        listed = ", ".join(f"#{t['id']}" for t in blind)
-        return {
-            "task_id": task_id,
-            "reason": SKIP_ACTIVE_UNDECLARED,
-            "detail": f"область задачи в работе не объявлена: {listed}",
-            "with_task_ids": [int(t["id"]) for t in blind],
-        }
-    hit = _first_overlap(candidate, active)
-    if hit is not None:
-        return {
-            "task_id": task_id,
-            "reason": SKIP_OVERLAP,
-            "detail": (
-                f"{hit['path']} пересекается с {hit['with_path']} "
-                f"задачи #{hit['with_task_id']} в работе"
-            ),
-            **hit,
-        }
+    conflict = area_conflict(candidate, active)
+    if conflict is not None:
+        return {"task_id": task_id, **conflict}
     return None
 
 
