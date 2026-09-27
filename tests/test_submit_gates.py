@@ -111,6 +111,7 @@ EXPECTED_SUBMIT_ORDER = (
     "branch_matches",
     "pin_submission_sha",
     "same_sha_from_review_is_current",
+    "submission_contract",
     "resolve_diff",
     "surfaces",
     "finding_outcomes",
@@ -163,7 +164,14 @@ def test_the_network_walking_steps_come_last():
     assert names.index("pin_submission_sha") > max(
         names.index(n) for n in cheap_and_stable if n in names
     ), "пиннинг вершины ветки ходит в сеть и обязан идти после дешёвых отказов"
-    mutable_gates = ("surfaces", "finding_outcomes", "submit_rules")
+    # #1436: контракт сдачи — тоже по времени изменчивый гейт (политика
+    # проекта может включиться между оригиналом и повтором).
+    mutable_gates = (
+        "submission_contract",
+        "surfaces",
+        "finding_outcomes",
+        "submit_rules",
+    )
     assert names.index("pin_submission_sha") < min(
         names.index(n) for n in mutable_gates
     ), (
@@ -187,6 +195,7 @@ def test_the_network_walking_steps_come_last():
 EXPECTED_HEADLESS_ORDER = (
     "canonical_branch",
     "branch_matches",
+    "submission_contract",
     "resolve_diff",
     "surfaces",
     "finding_outcomes",
@@ -226,7 +235,9 @@ def test_the_two_pipelines_are_compared_by_their_lists():
     # #1155: finding_outcomes ушёл отсюда в активные — у отчёта о готовности
     # появилось поле исходов, и причина «ответить негде» перестала быть верной.
     # Матрица решений #1122 обновлена этой задачей, и сдача называет перемену.
-    assert inactive_here == {"branch_matches"}, (
+    # #1436: submission_contract объявлен и не выполняется — у done-отчёта
+    # нет полей model и mutations; причина записана в самом шаге.
+    assert inactive_here == {"branch_matches", "submission_contract"}, (
         "набор неактивных на headless изменился — обновите матрицу решений в "
         "#1122 и скажите об этом в сдаче, а не молча"
     )
