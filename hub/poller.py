@@ -1080,8 +1080,8 @@ async def _stale_task_tick(
         "hub",
         "alert",
         f"Task stale in {status} [рубеж {rung}]: тишина уже "
-        f"{_age_phrase(silence)} (последняя запись {last_at or 'неизвестна'}). "
-        f"{action}",
+        f"{_age_phrase(silence)} (последняя запись {last_at or 'неизвестна'})."
+        f"{await _slot_phrase(db, task_id)} {action}",
     )
     await db.commit()
     await log_activity(
@@ -1096,6 +1096,14 @@ async def _stale_task_tick(
         _age_phrase(silence),
         rung,
     )
+
+
+async def _slot_phrase(db, task_id: int) -> str:
+    """Stale-алерт называет слот, который держит задачу (#1434); не дублирует."""
+    from hub.services.executor_slots import active_slot_of
+
+    slot = await active_slot_of(db, task_id)
+    return f" Задачу держит слот {slot}." if slot else ""
 
 
 async def _sweep_stale_running(db) -> None:
@@ -1563,6 +1571,18 @@ async def _sweep_executor_runs(db) -> None:
         await sweep_executor_runs(db)
     except Exception:  # noqa: BLE001 - the sweep must not kill the loop
         log.exception("executor run sweep failed")
+
+
+async def _sweep_executor_slots(db) -> None:
+    # #1434 (F7): слот без сдачи и без признаков жизни дольше порога
+    # освобождается один раз с названной причиной; ушедшая из работы задача
+    # закрывает строку слота молча.
+    try:
+        from hub.services.executor_slots import sweep_executor_slots
+
+        await sweep_executor_slots(db)
+    except Exception:  # noqa: BLE001 - the sweep must not kill the loop
+        log.exception("executor slot sweep failed")
 
 
 async def _sweep_expired_claims(db) -> None:
@@ -2299,6 +2319,7 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("review_dispatches", _sweep_review_dispatches),
     Sweep("steward_runs", _sweep_steward_runs),
     Sweep("executor_runs", _sweep_executor_runs),
+    Sweep("executor_slots", _sweep_executor_slots),
     Sweep("expired_claims", _sweep_expired_claims),
     Sweep("machine_deadlines", _sweep_machine_deadlines),
     Sweep("stale_arbiter", _sweep_stale_arbiter),
