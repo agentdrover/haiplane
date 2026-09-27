@@ -826,6 +826,49 @@ def submission_contract_violated_detail(
     )
 
 
+def claim_area_conflict_detail(
+    *, task_id: int, current_status: str, conflict: dict[str, Any]
+) -> dict[str, Any]:
+    """Захват, отказанный сверкой областей в режиме require (#1433).
+
+    Причин две, и они названы разными ``reason``: пересечение с начатой
+    задачей (``claim_area_overlap`` — сосед и оба пути) и незнание
+    (``claim_area_undeclared`` — области не объявлены у захватываемой задачи
+    или у начатой). ``area_rule`` — причина из правила очереди как есть.
+    Статус задачи не менялся: отказ стоит до перехода.
+    """
+    from hub.services.orchestrator_queue import SKIP_OVERLAP
+
+    undeclared = conflict.get("reason") != SKIP_OVERLAP
+    detail = str(conflict.get("detail") or "")
+    fields: dict[str, Any] = {
+        k: conflict[k]
+        for k in ("path", "with_task_id", "with_path", "with_task_ids")
+        if k in conflict
+    }
+    return enrich_error_payload(
+        {
+            "reason": "claim_area_undeclared" if undeclared else "claim_area_overlap",
+            "actor_hint": "agent",
+            "retry_by_same_caller": False,
+            "current_status": current_status,
+            "task_id": task_id,
+            "area_rule": conflict.get("reason", ""),
+            "message": (
+                f"Task #{task_id} is not captured: claim_area_check=require "
+                f"refused it: {detail}"
+            ),
+            "hint": (
+                f"{detail}. The task stays {current_status}. Take another task, "
+                "wait until the named one leaves work, or declare "
+                "affected_areas precisely."
+            ),
+            **fields,
+            "suggested_tool": "hub_task_status",
+        }
+    )
+
+
 def changes_requested_requires_content_detail() -> dict[str, Any]:
     """A verdict that sends work back has to say what to redo (#1010).
 

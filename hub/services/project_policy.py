@@ -558,3 +558,34 @@ def submission_contract_of(policy: dict) -> str:
     if isinstance(value, str) and value in SUBMISSION_CONTRACT_MODES:
         return value
     return CONTRACT_WARN
+
+
+# Сверка областей при захвате задачи (#1433). Очередь #1274 пропускает
+# кандидата, чьи области пересекаются с начатой задачей, но она только
+# советует: claim, pair_start и вход по одноразовому коду брали задачу, не
+# сверяясь. ``warn`` — захват проходит, пересечение названо в карточке одной
+# записью; ``require`` — отказ с задачей-соседом и путём. Нет ключа — ``off``:
+# проект, который сверку не включал, захватывает как захватывал. Ключ есть, но
+# значение нечитаемое — ``warn``, по тому же правилу, что submission_contract:
+# сверку явно хотели, а отказывать по опечатке нельзя.
+CLAIM_AREA_CHECK_KEY = "claim_area_check"
+CLAIM_AREA_OFF = "off"
+CLAIM_AREA_WARN = "warn"
+CLAIM_AREA_REQUIRE = "require"
+CLAIM_AREA_CHECK_MODES: tuple[str, ...] = (
+    CLAIM_AREA_OFF,
+    CLAIM_AREA_WARN,
+    CLAIM_AREA_REQUIRE,
+)
+#: Начало записи в карточке при warn — по нему запись находят и не пишут дважды.
+CLAIM_AREA_MARK = "Пересечение областей при захвате"
+
+
+def claim_area_check_of(policy: dict) -> str:
+    """Режим сверки областей при захвате: нет ключа — off, нечитаемое — warn."""
+    if not isinstance(policy, dict) or CLAIM_AREA_CHECK_KEY not in policy:
+        return CLAIM_AREA_OFF
+    value = policy.get(CLAIM_AREA_CHECK_KEY)
+    if isinstance(value, str) and value in CLAIM_AREA_CHECK_MODES:
+        return value
+    return CLAIM_AREA_WARN
