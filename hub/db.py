@@ -2291,6 +2291,22 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ON events(kind, project_id, id)",
     ),
     (
+        # #1413: чем снят provider_tokens. '' — история до задачи (счёт
+        # ОДНОГО прогона, переснимается только командой владельца);
+        # agent_open — счёт агента, снятый до его конца, свип переснимет;
+        # agent — итог по агенту; recounted — пересчитан командой владельца.
+        "add_review_dispatches_usage_scope",
+        "ALTER TABLE review_dispatches ADD COLUMN usage_scope TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1413: когда провайдера спрашивали о счёте этого заказа последний
+        # раз — переснятие ходит не чаще раза в USAGE_RESTAMP_EVERY_MINUTES.
+        "add_review_dispatches_usage_checked_at",
+        "ALTER TABLE review_dispatches ADD COLUMN usage_checked_at TEXT",
+    ),
+    # Две строки #1413 стоят до блока #1434 намеренно: его тест требует свои
+    # миграции последними, а применение идёт по имени — порядок не важен.
+    (
         # #1434 (F7): канал (cloud | slot) и имя слота — атрибуты выдачи кода
         # implementer. Пусто — канал не назван: код без канала работает как
         # до задачи (облачный исполнитель, пилот SID).
