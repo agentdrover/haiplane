@@ -340,6 +340,10 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # executor_launch.launch_mode_of и _observation_missing.
     "executor_launch",
     "executor_push_rights_task",
+    # #1443 (F5.1): суммарный потолок исполнителя на задачу. Читатель:
+    # executor_dispatch.task_budget.
+    "executor_task_cents_ceiling",
+    "executor_task_token_ceiling",
     # #1432: число заходов круга, с которого deep приостановлен до решения
     # человека. Не гейт. Читатель: review_dispatch.circle_deep_stop_of.
     "circle_deep_stop",
@@ -393,6 +397,26 @@ def _validate_review_limit(policy: dict[str, Any]) -> None:
                 "gate_policy review_limit_mode must be one of "
                 f"{', '.join(REVIEW_LIMIT_MODES)}, got: {mode!r}"
             )
+
+
+def _validate_executor_task_ceilings(policy: dict[str, Any]) -> None:
+    """Refuse a task ceiling the budget reader would silently ignore (#1443)."""
+    cents = policy.get("executor_task_cents_ceiling")
+    if "executor_task_cents_ceiling" in policy and (
+        isinstance(cents, bool) or not isinstance(cents, int | float) or cents <= 0
+    ):
+        raise ValueError(
+            "gate_policy executor_task_cents_ceiling must be a positive number "
+            f"of cents, got: {cents!r}"
+        )
+    tokens = policy.get("executor_task_token_ceiling")
+    if "executor_task_token_ceiling" in policy and (
+        isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 1
+    ):
+        raise ValueError(
+            "gate_policy executor_task_token_ceiling must be an integer >= 1, "
+            f"got: {tokens!r}"
+        )
 
 
 def _validate_executor_launch(policy: dict[str, Any]) -> None:
@@ -2516,6 +2540,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_submission_contract(v)
     _validate_claim_area_check(v)
     _validate_executor_launch(v)
+    _validate_executor_task_ceilings(v)
     _validate_count(v, "deep_daily_cap")
     _validate_count(v, "small_delta_lines")
     _validate_count(v, "circle_deep_stop")

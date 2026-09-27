@@ -39,7 +39,7 @@ from hub import repository as repo
 from hub.integrations import cursor_cloud
 from hub.services import chat_pair, orchestrator_queue, project_policy
 from hub.db import write_transaction
-from hub.services.executor_dispatch import OUTCOME_FAILED, OUTCOME_RUNNING
+from hub.services.executor_dispatch import OUTCOME_FAILED, OUTCOME_RUNNING, task_budget
 from hub.services.model_family import same_family
 
 log = logging.getLogger(__name__)
@@ -60,6 +60,7 @@ REASON_FAMILY = "семейство модели исполнителя не о�
 REASON_NO_MODEL = "модель исполнителя не задана"
 REASON_NO_CANDIDATE = "очередь не назвала задачу"
 REASON_NO_SKILL = "в библиотеке нет активного скилла дисциплины исполнителя"
+REASON_TASK_BUDGET = "бюджет исполнителя на задачу исчерпан"
 #: Скилл, который промпт вставляет целиком (#1441, F3).
 DISCIPLINE_SKILL = "executor-pair-discipline"
 REASON_ALREADY_RUNNING = "по задаче уже идёт прогон исполнителя"
@@ -283,6 +284,21 @@ async def _reserve(
         if row is None:
             return _refused(f"{REASON_NO_CANDIDATE}: #{task_id} не найдена", task_id)
         task = dict(row)
+        # #1443 (F5.1): суммарный бюджет задачи — под той же транзакцией, что
+        # и бронь, чтобы два нажатия не прошли проверку оба.
+        budget = await task_budget(db, task_id, project_policy.gate_policy_of(project))
+        if budget.exhausted:
+            reason = f"{REASON_TASK_BUDGET}: {budget.text()}"
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                f"Исполнитель НЕ запущен: {reason}. Поднять потолок — политика "
+                "проекта executor_task_cents_ceiling / executor_task_token_ceiling; "
+                "решение за человеком.",
+            )
+            return _refused(reason, task_id)
         generation = int(task.get("submission_generation") or 0) + 1
         row_id = await repo.create_executor_run(
             db,

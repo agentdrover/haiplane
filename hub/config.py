@@ -210,6 +210,12 @@ EXECUTOR_MODEL = env_get("EXECUTOR_MODEL", "")
 # человека, поэтому короткая.
 EXECUTOR_LAUNCH_MAX_ATTEMPTS = int(env_get("EXECUTOR_LAUNCH_MAX_ATTEMPTS", "3"))
 EXECUTOR_LAUNCH_PAUSE_S = int(env_get("EXECUTOR_LAUNCH_PAUSE_S", "10"))
+# #1443 (F5.1): суммарный потолок исполнителя на задачу — сумма всех её
+# прогонов (круг починки даёт несколько). По умолчанию — три прогона по
+# потолку одного (EXECUTOR_CENTS_CEILING / EXECUTOR_TOKEN_CEILING). Политика
+# проекта (executor_task_cents_ceiling / executor_task_token_ceiling) важнее.
+EXECUTOR_TASK_CENTS_CEILING = float(env_get("EXECUTOR_TASK_CENTS_CEILING", "10500"))
+EXECUTOR_TASK_TOKEN_CEILING = int(env_get("EXECUTOR_TASK_TOKEN_CEILING", "24000000"))
 #: Сколько ждать ВОЗМОЖНОСТИ стартовать — отдельно от того, сколько ждать
 #: суждения (#1181). Одно число на два вопроса делало ответ на второй
 #: зависимым от того, как долго не отвечали на первый: на первом прогоне

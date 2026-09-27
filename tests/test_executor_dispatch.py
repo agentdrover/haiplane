@@ -1265,3 +1265,115 @@ def test_the_cloud_environment_installs_uv_and_syncs():
     assert "uv sync --frozen" in commands, (
         "зависимости ставятся командой, а не комментарием"
     )
+
+
+# ---- #1443 (F5.1): суммарный потолок стоимости исполнителя на задачу ----
+
+
+async def _spent_run(
+    db: aiosqlite.Connection, task_id: int, *, cents: float, tokens: int, n: int = 1
+) -> None:
+    """Завершённый прогон задачи с известной ценой."""
+    row = await repo.create_executor_run(
+        db,
+        task_id=task_id,
+        submission_generation=n,
+        agent_id=f"bc-old-{n}",
+        run_id=f"run-old-{n}",
+        model=_EXEC_MODEL,
+    )
+    await repo.update_executor_run(
+        db, row, tokens=tokens, cents=cents, outcome="finished", finish=True
+    )
+    await db.commit()
+
+
+async def test_the_task_budget_stops_a_new_run(db, monkeypatch):
+    """AC-1: сумма прогонов задачи дошла до потолка — новый заказ отказан, провайдер
+    не зван, в задаче alert с цифрами (потрачено, потолок, число прогонов)."""
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(config, "EXECUTOR_TASK_CENTS_CEILING", 500.0)
+    monkeypatch.setattr(config, "EXECUTOR_TASK_TOKEN_CEILING", 50_000_000)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, task_id = await _launch_project(db, slug="exec-budget")
+    await _spent_run(db, task_id, cents=300.0, tokens=1_000, n=1)
+    await _spent_run(db, task_id, cents=250.0, tokens=1_000, n=2)
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert not result.launched
+    assert result.reason.startswith(el.REASON_TASK_BUDGET), result
+    assert calls == []
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+    ]
+    assert any("550" in a and "500" in a and "2" in a for a in alerts), alerts
+
+
+async def test_the_task_budget_counts_tokens_too(db, monkeypatch):
+    """AC-1: потолок токенов задачи срабатывает так же, как потолок денег."""
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(config, "EXECUTOR_TASK_CENTS_CEILING", 100_000.0)
+    monkeypatch.setattr(config, "EXECUTOR_TASK_TOKEN_CEILING", 5_000)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, task_id = await _launch_project(db, slug="exec-budget-tok")
+    await _spent_run(db, task_id, cents=1.0, tokens=6_000)
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert result.reason.startswith(el.REASON_TASK_BUDGET), result
+    assert calls == []
+
+
+async def test_the_task_ceiling_comes_from_policy_then_config(db, monkeypatch):
+    """AC-2: потолок из политики проекта важнее конфигурации; нечитаемый ключ
+    политики запись отказывает."""
+    import json
+
+    from hub.models import validated_gate_policy
+
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(config, "EXECUTOR_TASK_CENTS_CEILING", 100.0)
+    monkeypatch.setattr(config, "EXECUTOR_TASK_TOKEN_CEILING", 50_000_000)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, task_id = await _launch_project(db, slug="exec-budget-policy")
+    policy = json.loads(project["gate_policy"])
+    policy["executor_task_cents_ceiling"] = 1000
+    await repo.update_project(db, project["id"], gate_policy=json.dumps(policy))
+    await db.commit()
+    project = dict(await repo.get_project(db, project["id"]))
+    await _spent_run(db, task_id, cents=500.0, tokens=1_000)
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert result.launched, result
+    assert len(calls) == 1
+    with pytest.raises(ValueError, match="executor_task_cents_ceiling"):
+        validated_gate_policy({"executor_task_cents_ceiling": "много"})
+    with pytest.raises(ValueError, match="executor_task_token_ceiling"):
+        validated_gate_policy({"executor_task_token_ceiling": 0})
+
+
+async def test_the_task_card_shows_the_budget_left(client, db, monkeypatch):
+    """AC-3: в карточке задачи рядом с прогонами — потрачено и остаток бюджета."""
+    from hub.services.executor_dispatch import executor_runs_view
+
+    monkeypatch.setattr(config, "EXECUTOR_TASK_CENTS_CEILING", 1000.0)
+    monkeypatch.setattr(config, "EXECUTOR_TASK_TOKEN_CEILING", 50_000_000)
+    task_id = await _task(db)
+    await _spent_run(db, task_id, cents=250.0, tokens=2_000)
+
+    view = await executor_runs_view(db, task_id)
+
+    budget = view["budget"]
+    assert (budget["cents_spent"], budget["cents_ceiling"], budget["cents_left"]) == (
+        250.0,
+        1000.0,
+        750.0,
+    )
+    page = await client.get(f"/tasks/{task_id}")
+    assert page.status_code == 200
+    assert "Бюджет задачи: 250.0 ¢ из 1000.0 ¢" in page.text
+    assert "осталось 750.0 ¢" in page.text
