@@ -694,3 +694,95 @@ async def test_all_readers_agree_on_delivery(
     assert rest == context
     assert rest["blocked_by"][0]["delivered"] is True
     assert still_blocking == [], "a delivered blocker must not warn at start"
+
+
+# ---- #1442: блокер-контейнер (фича, эпик) доставлен своими детьми ----
+
+
+async def _container(
+    db: aiosqlite.Connection, title: str, task_type: str, parent_id: int | None = None
+) -> int:
+    return await repo.create_task(
+        db,
+        title=title,
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="completed",
+        auto_review=False,
+        task_type=task_type,
+        parent_id=parent_id,
+        priority="medium",
+    )
+
+
+async def _delivered_child(db: aiosqlite.Connection, parent: int, pr: int) -> int:
+    child = await _task(db, f"child {pr}")
+    await repo.update_task(
+        db, child, parent_id=parent, status="completed", pr_number=pr
+    )
+    await _pipeline_merge(db, child, pr)
+    return child
+
+
+async def test_a_feature_whose_children_are_delivered_is_a_delivered_blocker(
+    db: aiosqlite.Connection,
+):
+    """AC-1: фича completed, все дети влиты гейтом — блокер доставлен: ни
+    тревоги при старте, ни пропуска в очереди F1. И вложенно: эпик → фича."""
+    from hub.services import orchestrator_queue
+
+    epic = await _container(db, "эпик", "epic")
+    feature = await _container(db, "фича", "feature", parent_id=epic)
+    await _delivered_child(db, feature, 101)
+    await _delivered_child(db, feature, 102)
+    on_feature = await _task(db, "ждёт фичу")
+    on_epic = await _task(db, "ждёт эпик")
+    await repo.add_task_dependency(db, on_feature, feature)
+    await repo.add_task_dependency(db, on_epic, epic)
+    await db.commit()
+
+    assert await lifecycle.warn_about_undelivered_blockers(db, on_feature) == []
+    assert await _alerts(db, on_feature) == []
+    assert await orchestrator_queue._undelivered_blockers(db, on_feature) == []
+    assert await orchestrator_queue._undelivered_blockers(db, on_epic) == []
+
+
+async def test_a_feature_with_an_undelivered_child_names_that_child(
+    db: aiosqlite.Connection,
+):
+    """AC-2: ребёнок закрыт без доставки — фича не доставлена, и причина
+    называет этого ребёнка, а не «PR не заявлен»."""
+    feature = await _container(db, "фича", "feature")
+    await _delivered_child(db, feature, 201)
+    stranded = await _task(db, "закрыт без доставки")
+    await repo.update_task(
+        db, stranded, parent_id=feature, status="completed", pr_number=202
+    )
+    waits = await _task(db, "ждёт")
+    await repo.add_task_dependency(db, waits, feature)
+    await db.commit()
+
+    blockers = await lifecycle.warn_about_undelivered_blockers(db, waits)
+
+    assert [b["task_id"] for b in blockers] == [feature]
+    assert f"#{stranded}" in blockers[0]["reason"], blockers[0]["reason"]
+    assert "PR не заявлен" not in blockers[0]["reason"]
+
+
+async def test_an_open_feature_is_not_delivered_even_with_delivered_children(
+    db: aiosqlite.Connection,
+):
+    """Фича не завершена — не доставлена, даже если уже влитые дети есть."""
+    feature = await _container(db, "фича", "feature")
+    await repo.update_task(db, feature, status="running")
+    await _delivered_child(db, feature, 301)
+    waits = await _task(db, "ждёт")
+    await repo.add_task_dependency(db, waits, feature)
+    await db.commit()
+
+    blockers = await lifecycle.warn_about_undelivered_blockers(db, waits)
+
+    assert [b["task_id"] for b in blockers] == [feature]
