@@ -790,6 +790,21 @@
             {% if executor_runs %}
             <section class="task-sidebar-card">
                 <div class="task-sidebar-title">Прогоны исполнителя</div>
+                {# #1443: бюджет задачи — сумма всех прогонов против потолка. #}
+                {% set budget = executor_runs.budget %}
+                <div class="task-action-note">
+                    {% if budget.unknown %}
+                    Бюджет задачи: не меньше {{ budget.cents_spent }} ¢ из {{ budget.cents_ceiling }} ¢
+                    и {{ budget.tokens_spent }} из {{ budget.token_ceiling }} токенов &mdash;
+                    цена {{ budget.unpriced }} прогон(ов) не прочитана, остаток неизвестен
+                    {% else %}
+                    Бюджет задачи: {{ budget.cents_spent }} ¢ из {{ budget.cents_ceiling }} ¢,
+                    осталось {{ budget.cents_left }} ¢;
+                    токенов {{ budget.tokens_spent }} из {{ budget.token_ceiling }},
+                    осталось {{ budget.tokens_left }}
+                    {% endif %}
+                    {% if budget.exhausted %}<span class="badge badge-self-approved">исчерпан</span>{% endif %}
+                </div>
                 <div class="task-action-note">
                     Прогонов: {{ executor_runs.count }}
                     {% if executor_runs.cents_total is not none %}
