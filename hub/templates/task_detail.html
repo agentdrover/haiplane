@@ -798,6 +798,14 @@
                             onclick="return confirm('Вернуть задачу #{{ task.id }} в работу и заказать повторный прогон исполнителя по находкам ревью? Это платный прогон.')">Повторный прогон исполнителя</button>
                 </form>
                 {% endif %}
+                {# #1445: доставка встала на конфликте с базой — прогон слияния. #}
+                {% if merge_offered %}
+                <form method="post" action="/tasks/{{ task.id }}/web-executor-merge" class="project-inline-form">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button class="btn btn-primary" type="submit"
+                            onclick="return confirm('Заказать исполнителя, который сольёт базу в ветку задачи #{{ task.id }} и пересдаст её? Это платный прогон.')">Слить базу и пересдать</button>
+                </form>
+                {% endif %}
                 {# #1443: бюджет задачи — сумма всех прогонов против потолка. #}
                 {% set budget = executor_runs.budget %}
                 <div class="task-action-note">
