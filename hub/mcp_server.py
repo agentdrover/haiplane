@@ -3201,6 +3201,18 @@ async def hub_submit_steward_judgement(
 
 
 @mcp.tool()
+async def hub_executor_slots() -> CallToolResult:
+    """Slots and channels: task, since, last sign of life (#1434)."""
+    from hub.services.executor_slots import format_occupancy
+
+    try:
+        data = await _api_get("/api/executor-slots")
+    except HubApiError as exc:
+        return _error_result(exc)
+    return structured_echo_result("\n".join(format_occupancy(data)), **data)
+
+
+@mcp.tool()
 async def hub_undelivered_completed() -> CallToolResult:
     """Completed tasks whose PR is neither merged nor closed (#897).
 
