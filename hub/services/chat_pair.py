@@ -187,6 +187,74 @@ async def issue_code(
 # ---------------------------------------------------------------------------
 
 
+async def issue_run_code(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    *,
+    issued_by_principal_id: int | None,
+) -> tuple[str, int]:
+    """Код implementer, который выписывает сам хаб на прогон исполнителя (#1439).
+
+    Выписывается от имени агента chat-pair — того принципала, которым сессия
+    implementer и так действует, — и привязан к задаче и к поколению сдачи,
+    которую делает прогон. Отдельной двери сюда нет: зовёт только запуск
+    исполнителя, поэтому «выписывает только код диспетчера» держится по
+    построению (F4 #1368). В аудит — кто нажал запуск, задача и поколение;
+    сам код не пишется никуда.
+
+    Нет агента chat-pair — ``LookupError``: вызывающий называет причину
+    отказа, а не выписывает код от чужого имени.
+    """
+    from hub.services import admin as admin_svc
+
+    acting = await get_acting_agent(db)
+    if acting is None:
+        raise LookupError("нет активного агента chat-pair (CHAT_PAIR_AGENT)")
+    code, ttl = await issue_code(
+        db,
+        int(acting["id"]),
+        kind="implementer",
+        bound_task_id=int(task_id),
+        bound_generation=int(generation),
+    )
+    await admin_svc.write_audit(
+        db,
+        actor_id=issued_by_principal_id,
+        action="implementer_code_dispatched",
+        target_type="task",
+        target_id=str(int(task_id)),
+        summary=(
+            f"implementer code issued by the hub dispatcher for task #{task_id}, "
+            f"generation {generation}, valid {ttl}s"
+        ),
+    )
+    return code, ttl
+
+
+#: Куда возвращают работу исполнителю (#1439): находки ревью, решение
+#: человека по конфликту с базой (#1362), живой pair-прогон. Не review (там
+#: отчёт ревьюера, а не работа), не claimed (чужая бронь), не финальные.
+IMPLEMENTER_RETURN_STATUSES = frozenset({"running", "fix_requested", "needs_decision"})
+
+
+def _implementer_may_redeem(task: dict[str, Any], pinned: Any) -> bool:
+    """Можно ли обменять код implementer на эту задачу сейчас (#980, #1439).
+
+    open — как раньше; если код выписал хаб (есть поколение), оно обязано
+    быть следующим: код «через одно» — не для этой сдачи. Не-open — только
+    код хаба на СЛЕДУЮЩЕЕ поколение возвращённой задачи: без поколения код
+    ручной выдачи нельзя потратить на задачу, ушедшую из open.
+    """
+    status = str(task.get("status") or "")
+    next_generation = int(task.get("submission_generation") or 0) + 1
+    if status == "open":
+        return pinned is None or int(pinned) == next_generation
+    if status not in IMPLEMENTER_RETURN_STATUSES or pinned is None:
+        return False
+    return int(pinned) == next_generation
+
+
 async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any] | None:
     """Exchange a code for a session. ``None`` for every way that can fail.
 
@@ -221,9 +289,13 @@ async def redeem_code(db: aiosqlite.Connection, raw_code: str) -> dict[str, Any]
         if bound_task_id is None:
             return None
         task_rows = await fetchall(
-            db, "SELECT status FROM tasks WHERE id = ?", (int(bound_task_id),)
+            db,
+            "SELECT status, submission_generation FROM tasks WHERE id = ?",
+            (int(bound_task_id),),
         )
-        if not task_rows or dict(task_rows[0]).get("status") != "open":
+        if not task_rows or not _implementer_may_redeem(
+            dict(task_rows[0]), row.get("bound_generation")
+        ):
             return None
         acting = await get_acting_agent(db)
         if acting is None:
