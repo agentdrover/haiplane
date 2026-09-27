@@ -27,6 +27,8 @@ from hub.integrations import forge as forge_registry
 from hub.integrations import proc
 from hub.integrations.forge.github import GitHubForge
 from hub.integrations.protocols import (
+    BaseFreshness,
+    BranchUpdateOutcome,
     CIProbeResult,
     CIRunRequestResult,
     FOREIGN_PR_ONLY,
@@ -847,6 +849,26 @@ def _stack_probe_cache_put(
 # ---------------------------------------------------------------------------
 # Plugin class
 # ---------------------------------------------------------------------------
+
+
+def _push_refusal(rc: int, err: str) -> BranchUpdateOutcome:
+    """Отказ пуша обновлённой ветки — чьи руки его лечат (#1419).
+
+    Как у пути API: аренда (голова уехала) — head_moved, повтор; таймаут и
+    сеть — unavailable, повтор; к человеку (refused) — только отказ прав или
+    защиты ветки на стороне сервера.
+    """
+    low = (err or "").lower()
+    if rc == _TIMEOUT_RC:
+        return BranchUpdateOutcome.unavailable
+    if any(w in low for w in ("permission", "denied", "protected", "declined", "403")):
+        return BranchUpdateOutcome.refused
+    if any(
+        w in low
+        for w in ("stale info", "[rejected]", "non-fast-forward", "fetch first")
+    ):
+        return BranchUpdateOutcome.head_moved
+    return BranchUpdateOutcome.unavailable
 
 
 class GitOpsIntegration:
@@ -3219,6 +3241,117 @@ class GitOpsIntegration:
                 # об этом нельзя: пустой словарь читается как «чисто».
                 return None, f"конфликтующий файл {rel} не прочитан: {exc}"
         return files, ""
+
+    async def pr_base_freshness(
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> BaseFreshness:
+        """Отстала ли голова PR от базы — вопрос форжу, роутинг как у всех (#1419)."""
+        return await self._forge_for(forge).pr_base_freshness(
+            pr_number, repo=repo, gh_repo=gh_repo
+        )
+
+    async def update_pr_branch(
+        self,
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        task_id: int = 0,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[BranchUpdateOutcome, str]:
+        """Слить базу в ветку PR с арендой головы (#1419).
+
+        Форж с вызовом (GitHub update-branch) делает это сам. Форж без него
+        отвечает ``unsupported``, и тогда база сливается здесь локальным git в
+        одноразовом дереве на ``expected_head_sha`` и пушится с арендой на неё
+        же — та же механика, что у автомержа #1233, без разрешения конфликтов:
+        конфликт здесь не разрешается, а называется.
+        """
+        adapter = self._forge_for(forge)
+        outcome, detail = await adapter.update_pr_branch(
+            pr_number, expected_head_sha, repo=repo, gh_repo=gh_repo
+        )
+        if outcome is BranchUpdateOutcome.conflict:
+            # Форж конфликт не расписывает по файлам — их называет клон (#970).
+            files = await self._conflicting_files_of_pr(
+                pr_number, repo=repo, gh_repo=gh_repo, forge=forge
+            )
+            return (outcome, ", ".join(files) if files else detail)
+        if outcome is not BranchUpdateOutcome.unsupported or not repo:
+            return (outcome, detail)
+        base, head = await adapter.pr_refs(pr_number, repo=repo, gh_repo=gh_repo)
+        if not base or not head:
+            return (
+                BranchUpdateOutcome.unavailable,
+                f"ветки PR #{pr_number} не прочитаны",
+            )
+        return await self._update_branch_by_push(
+            repo, base, head, task_id, expected_head_sha
+        )
+
+    async def _update_branch_by_push(
+        self, repo: str, base: str, branch: str, task_id: int, tip: str
+    ) -> tuple[BranchUpdateOutcome, str]:
+        """Слить ``origin/<base>`` в ветку на ``tip`` и запушить с арендой (#1419)."""
+        path, why = await self._prepare_base_merge_tree(
+            repo, base, branch, task_id, tip
+        )
+        if not path:
+            return (BranchUpdateOutcome.unavailable, why)
+        try:
+            files, why = await self._conflicting_texts(path)
+            if files is None:
+                return (BranchUpdateOutcome.unavailable, why)
+            if files:
+                return (BranchUpdateOutcome.conflict, ", ".join(sorted(files)))
+            rc, _, err = await _git(
+                "commit",
+                "-m",
+                f"chore(task-{task_id}): merge {base} into {branch}",
+                "--no-verify",
+                repo=path,
+                check=False,
+            )
+            if rc != 0:
+                return (BranchUpdateOutcome.unavailable, f"коммит мержа: {err[:150]}")
+            # #949: pre-push хук читает ЛОКАЛЬНЫЙ ref строки пуша, и «HEAD» из
+            # одноразового дерева в его списке нет — в вооружённом клоне (#532)
+            # такой пуш режется всегда. Настоящую локальную ветку задачи тоже
+            # не трогаем: её может держать живое дерево исполнителя, и
+            # ``checkout -B`` переставил бы ref под ним (e74f63e646dd4078).
+            # Коммит слияния кладётся во временную ветку по шаблону хука и
+            # пушится в удалённую ветку задачи; временная убирается всегда.
+            _, merged, _ = await _git("rev-parse", "HEAD", repo=path, check=False)
+            temp = f"task-{task_id}/gate-update-{(merged or '').strip()[:8]}"
+            rc, _, err = await _git(
+                "branch", "-f", temp, "HEAD", repo=path, check=False
+            )
+            if rc != 0:
+                return (BranchUpdateOutcome.unavailable, f"ветка {temp}: {err[:150]}")
+            try:
+                rc, _, err = await _git(
+                    "push",
+                    f"--force-with-lease=refs/heads/{branch}:{tip.strip()}",
+                    "origin",
+                    f"refs/heads/{temp}:refs/heads/{branch}",
+                    repo=path,
+                    check=False,
+                    timeout=60,
+                )
+            finally:
+                await _git("branch", "-D", temp, repo=repo, check=False)
+            if rc != 0:
+                return (_push_refusal(rc, err), f"пуш ветки: {(err or '')[:150]}")
+            return (BranchUpdateOutcome.updated, f"база {base} слита в {branch}")
+        finally:
+            await _git("merge", "--abort", repo=path, check=False)
+            await _git("worktree", "remove", "--force", path, repo=repo, check=False)
 
     async def base_merge_conflicts(
         self, repo: str, base: str, branch: str, task_id: int, tip: str = ""

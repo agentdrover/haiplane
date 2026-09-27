@@ -14,6 +14,9 @@ from typing import Any
 import aiosqlite
 
 from hub.integrations.protocols import (
+    BaseFreshness,
+    BaseFreshnessState,
+    BranchUpdateOutcome,
     CIProbeOutcome,
     CIProbeResult,
     CIRunRequestOutcome,
@@ -664,6 +667,35 @@ class NoopGitOps:
         # runs" is a different answer that would read as a green base (#929).
         return None
 
+    async def pr_base_freshness(
+        self,
+        pr_number: int,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> BaseFreshness:
+        """Заглушка не спрашивает форж вовсе (#1419): unsupported, не unknown.
+
+        unknown остановил бы гейт ожиданием, которое никогда не кончится, —
+        у заглушки нет форжа, который однажды ответит.
+        """
+        return BaseFreshness(
+            BaseFreshnessState.unsupported, reason="git integration is not configured"
+        )
+
+    async def update_pr_branch(
+        self,
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        task_id: int = 0,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> tuple[BranchUpdateOutcome, str]:
+        return (BranchUpdateOutcome.unsupported, "git integration is not configured")
+
     def merge_preserves_ancestry(self, forge: str = "") -> bool:
         """Заглушка не мержит — значит и родословную ничем не рвёт (#1214).
 
@@ -825,6 +857,22 @@ class NoopForge:
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
     ) -> tuple[str, str]:
         return ("", "")
+
+    async def pr_base_freshness(
+        self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
+    ) -> BaseFreshness:
+        # Не unknown: форжа нет, спрашивать некого — это факт о плагине (#1419).
+        return BaseFreshness(BaseFreshnessState.unsupported, reason="форж не настроен")
+
+    async def update_pr_branch(
+        self,
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+    ) -> tuple[BranchUpdateOutcome, str]:
+        return (BranchUpdateOutcome.unsupported, "форж не настроен")
 
     async def pr_mergeability(
         self, pr_number: int, *, repo: str | None = None, gh_repo: str | None = None
