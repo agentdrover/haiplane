@@ -325,7 +325,8 @@ async def _unbilled_report_buckets(
         "SELECT m.self_reviewed, "  # nosec B608 - module constant
         "SUM(CASE WHEN d.id IS NOT NULL THEN 1 ELSE 0 END) AS orders, "
         "SUM(CASE WHEN d.channel = 'local' THEN 1 ELSE 0 END) AS local_orders, "
-        "SUM(CASE WHEN d.channel != 'local' AND d.provider_tokens IS NULL "
+        "SUM(CASE WHEN d.channel != 'local' "
+        "AND COALESCE(d.billed_tokens, d.provider_tokens) IS NULL "
         "THEN 1 ELSE 0 END) AS unbilled_orders "
         "FROM machine_reviews m LEFT JOIN review_dispatches d "
         "ON d.task_id = m.task_id "
@@ -335,7 +336,10 @@ async def _unbilled_report_buckets(
         # #1361: у переноса счёта нет потому, что прогона не было, — это не
         # отчёт «без счёта». Столбец есть только у machine_reviews.
         f"AND {ORIGINAL_READ_SQL} "
-        "GROUP BY m.id",
+        # #1413: счёт по выгрузке на заказе сдачи — это счёт отчёта: импорт
+        # закрывает именно случай, когда API промолчал.
+        "GROUP BY m.id HAVING SUM(CASE WHEN d.billed_tokens IS NOT NULL "
+        "THEN 1 ELSE 0 END) = 0",
         (since,),
     )
     counts = dict.fromkeys(

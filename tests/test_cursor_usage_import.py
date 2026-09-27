@@ -238,3 +238,64 @@ def test_cli_import_is_dry_unless_apply_is_named(tmp_path, capsys):
     with patch.object(cli, "_api", api):
         args.func(args)
     assert api.call_args.args[2]["apply"] is True
+
+
+async def _report(db: aiosqlite.Connection, did: int) -> None:
+    row = await _row(db, did)
+    await repo.insert_machine_review(
+        db,
+        task_id=row["task_id"],
+        submission_generation=1,
+        harness_skill="multi-agent-review",
+        raw_count=0,
+        findings_confirmed="[]",
+        incomplete=False,
+        profile=row["profile"],
+    )
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 1 WHERE id = ?", (row["task_id"],)
+    )
+
+
+async def test_export_bill_counts_as_paid_wherever_a_bill_is_checked(
+    db: aiosqlite.Connection,
+):
+    """Находка 169548cc1e7fa359: API промолчал, выгрузка есть — счёт получен."""
+    silent = await _order(db, DEEP_AGENT, api=None)
+    await _report(db, silent)
+    # Сдача, где рядом с оплаченным по выгрузке заказом лежит неоплаченный:
+    # отчёт оплачен выгрузкой, в «счёт не получен» он не идёт.
+    mixed = await _order(db, LITE_AGENT, api=None)
+    await _report(db, mixed)
+    stray = await repo.create_review_dispatch(
+        db,
+        task_id=(await _row(db, mixed))["task_id"],
+        submission_generation=1,
+        agent_id="bc-test-stray-0005",
+        run_id="run",
+        model="grok-4.6",
+        profile="lite",
+        channel="cloud",
+    )
+    await repo.set_review_dispatch_status(db, stray, "done")
+    failed = await _order(db, "bc-test-failed-0006", api=None)
+    await repo.set_review_dispatch_status(db, failed, "failed")
+    await db.commit()
+    lines = [
+        *_deep_lines(0, 2),
+        _line(LITE_AGENT, 30, 300),
+        _line("bc-test-failed-0006", 31, 700),
+    ]
+    await import_cursor_usage(db, _export(*lines), apply=True)
+
+    metrics = await practice_metrics(db)
+    rec = metrics["review_economy"]["reconciliation"]
+    buckets = {b["bucket"]: b["count"] for b in rec["buckets"]}
+    assert buckets["dispatch_without_bill"] == 0
+    assert buckets["unexplained"] == 0
+    wasted = metrics["review_dispatches"]
+    assert (wasted["wasted_dispatches"], wasted["wasted_provider_tokens_total"]) == (
+        1,
+        700,
+    )
+    assert wasted["unknown_usage"] == 1, "только stray: ни API, ни выгрузки"
