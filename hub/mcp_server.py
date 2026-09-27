@@ -2142,7 +2142,7 @@ async def hub_submit_for_review(
 ) -> str:
     """AUTHOR step: hand your work to a review by someone else (#307).
 
-    Does NOT complete the task; the verdict is another actor's
+    It does NOT complete the task: a different actor writes the verdict
     (hub_get_review_brief, hub_submit_review). Bumps the generation, invalidating any earlier APPROVED; resubmitting
     the same commit from review keeps it (#1265).
 
