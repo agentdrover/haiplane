@@ -33,6 +33,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aiosqlite
+from fastapi import HTTPException
 
 from hub import config
 from hub import repository as repo
@@ -383,6 +384,14 @@ async def _order(
     task_id = int(task["id"])
     model = config.EXECUTOR_MODEL.strip()
     base = project_policy.base_branch_of(project)
+    if not extra:
+        # #1444 (находка ревью, high): задача, возвращённая кругом починки и
+        # оставшаяся open после сорванного заказа, может уйти в любую дверь —
+        # и первый запуск из очереди тоже. Находки сдачи тогда едут в заказ
+        # отсюда, а не только из кнопки повторного прогона.
+        pending = await _current_findings(db, task)
+        if pending:
+            extra = _findings_block(pending)
     order = {
         "repo_url": f"https://github.com/{project['repo']}",
         "starting_ref": base,
@@ -507,6 +516,21 @@ def _findings_block(findings: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+async def repair_offered(db: aiosqlite.Connection, task: dict[str, Any]) -> bool:
+    """Показывать ли кнопку повторного прогона (#1444): те же условия, что
+    допуск, кроме платных проверок (бюджет и прочее проверит нажатие)."""
+    from hub.services.lifecycle import RETURN_TO_WORK_STATUSES
+
+    if task.get("status") not in RETURN_TO_WORK_STATUSES | {"open"}:
+        return False
+    policy = await project_policy.gate_policy_for_task(db, int(task["id"]))
+    if launch_mode_of(policy) != LAUNCH_MANUAL:
+        return False
+    if not await repo.list_executor_runs(db, int(task["id"])):
+        return False
+    return bool(await _current_findings(db, task))
+
+
 async def repair_executor(
     db: aiosqlite.Connection,
     task_id: int,
@@ -531,10 +555,10 @@ async def repair_executor(
     ready = await _ready_to_order(db, project)
     if isinstance(ready, LaunchResult):
         return LaunchResult(False, ready.reason, task_id)
-    if task["status"] not in RETURN_TO_WORK_STATUSES:
+    if task["status"] not in RETURN_TO_WORK_STATUSES | {"open"}:
         return _refused(
-            f"{REASON_NOT_RETURNABLE}: статус {task['status']}, нужен review "
-            "или fix_requested",
+            f"{REASON_NOT_RETURNABLE}: статус {task['status']}, нужен review, "
+            "fix_requested или open после сорванного круга",
             task_id,
         )
     if not await repo.list_executor_runs(db, task_id):
@@ -550,17 +574,28 @@ async def repair_executor(
         await db.commit()
         return refusal
 
-    await return_to_work(
-        db,
-        task_id,
-        TaskReturnToWork(
-            reason=(
-                f"круг починки облачным исполнителем по находкам сдачи "
-                f"{task.get('submission_generation')} (#1444), нажал {issuer}"
+    if task["status"] != "open":
+        # open — задача уже возвращена прошлым нажатием, чей заказ сорвался:
+        # возвращать нечего, круг повторяется той же кнопкой.
+        try:
+            await return_to_work(
+                db,
+                task_id,
+                TaskReturnToWork(
+                    reason=(
+                        f"круг починки облачным исполнителем по находкам сдачи "
+                        f"{task.get('submission_generation')} (#1444), нажал {issuer}"
+                    ),
+                    # fix_requested всегда несёт job_id (#1356): человек выбрал
+                    # облачного исполнителя вместо текущего задания.
+                    abandon_active_job=True,
+                ),
+                actor=issuer,
             )
-        ),
-        actor=issuer,
-    )
+        except HTTPException as exc:
+            # Например, живое задание у fix_requested (#1356): отказ возврата —
+            # это причина для человека, а не сырой 409 мимо формы.
+            return _refused(f"{REASON_NOT_RETURNABLE}: {exc.detail}", task_id)
 
     async def _this_task(
         db: aiosqlite.Connection, _project: Any

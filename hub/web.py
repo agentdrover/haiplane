@@ -2422,6 +2422,10 @@ async def _web_task_detail_page(
     from hub.services.executor_dispatch import executor_runs_view
 
     executor_runs = await executor_runs_view(db, task_id)
+    # #1444: кнопка повторного прогона — только когда он вообще возможен.
+    from hub.services.executor_launch import repair_offered as _repair_offered
+
+    repair_offered = bool(executor_runs) and await _repair_offered(db, dict(row))
 
     finding_touch: list[dict[str, Any]] = []
     if machine_review is not None and machine_review.findings_confirmed:
@@ -2572,6 +2576,7 @@ async def _web_task_detail_page(
             "machine_review": machine_review,
             "steward_judgement": steward_judgement,
             "executor_runs": executor_runs,
+            "repair_offered": repair_offered,
             "finding_touch": finding_touch,
             "mr_confirmed": mr_confirmed,
             "mr_undisposed": mr_undisposed,

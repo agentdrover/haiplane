@@ -791,7 +791,7 @@
             <section class="task-sidebar-card">
                 <div class="task-sidebar-title">Прогоны исполнителя</div>
                 {# #1444: круг починки — повторный прогон по находкам ревью. #}
-                {% if task.status in ('review', 'fix_requested') %}
+                {% if repair_offered %}
                 <form method="post" action="/tasks/{{ task.id }}/web-executor-repair" class="project-inline-form">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <button class="btn btn-primary" type="submit"

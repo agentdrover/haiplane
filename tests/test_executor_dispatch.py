@@ -1595,3 +1595,77 @@ async def test_the_repair_button_shows_on_a_task_in_review(client, db, monkeypat
     page = await client.get(f"/tasks/{task_id}")
 
     assert f"/tasks/{task_id}/web-executor-repair" in page.text
+
+
+async def test_a_failed_repair_order_can_be_pressed_again(db, monkeypatch):
+    """Находка ревью #1444 (high): заказ сорвался уже после возврата в работу —
+    задача open, и круг повторяется той же кнопкой с находками; заказ из
+    очереди на ту же задачу тоже несёт находки, а не голый промпт."""
+    _launch_config(monkeypatch)
+    calls = _creator(
+        monkeypatch,
+        [cursor_cloud.Refusal(status=400, code="invalid_model"), _CREATED, _CREATED],
+    )
+    human = await _human(db)
+    project, task_id = await _task_with_findings(db, slug="exec-repair-again")
+
+    first = await el.repair_executor(db, task_id, issuer_principal_id=human, issuer="o")
+    assert not first.launched, first
+    assert dict(await repo.get_task(db, task_id))["status"] == "open"
+    assert await el.repair_offered(db, dict(await repo.get_task(db, task_id)))
+
+    again = await el.repair_executor(db, task_id, issuer_principal_id=human, issuer="o")
+    assert again.launched, again
+    assert el.FINDINGS_DATA_OPEN in calls[1]["prompt_text"]
+
+    for run in await repo.list_executor_runs(db, task_id):
+        await repo.update_executor_run(
+            db, int(dict(run)["id"]), tokens=0, cents=0.0, outcome="failed", finish=True
+        )
+    await db.commit()
+    queued = await el.launch_executor(db, project, issuer_principal_id=human)
+    assert queued.launched, queued
+    assert el.FINDINGS_DATA_OPEN in calls[2]["prompt_text"]
+
+
+async def test_a_repair_run_from_fix_requested_abandons_the_job(db, monkeypatch):
+    """Находка ревью #1444 (medium): fix_requested всегда несёт job_id —
+    нажатие человека бросает задание и заказывает круг, а не 409 мимо формы."""
+    from hub.services import lifecycle
+
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    _, task_id = await _task_with_findings(db, slug="exec-repair-fix")
+    await repo.update_task(db, task_id, status="fix_requested", job_id="job-7")
+    await db.commit()
+    monkeypatch.setattr(
+        lifecycle,
+        "_active_jobs_on_task",
+        lambda task: [("job_id", "job-7", "running")] if task.get("job_id") else [],
+    )
+
+    result = await el.repair_executor(
+        db, task_id, issuer_principal_id=await _human(db), issuer="o"
+    )
+
+    assert result.launched, result
+    assert len(calls) == 1
+    assert dict(await repo.get_task(db, task_id))["status"] == "open"
+
+
+async def test_the_repair_button_hides_when_no_run_is_possible(client, db, monkeypatch):
+    """Находка ревью #1444 (low): без находок или вне manual кнопки нет."""
+    import json as _json
+
+    _launch_config(monkeypatch)
+    _, clean = await _task_with_findings(db, slug="exec-btn-clean", findings=False)
+    project, off = await _task_with_findings(db, slug="exec-btn-off")
+    policy = _json.loads(project["gate_policy"])
+    policy["executor_launch"] = "off"
+    await repo.update_project(db, project["id"], gate_policy=_json.dumps(policy))
+    await db.commit()
+
+    for task_id in (clean, off):
+        page = await client.get(f"/tasks/{task_id}")
+        assert page.status_code == 200
+        assert f"/tasks/{task_id}/web-executor-repair" not in page.text
