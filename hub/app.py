@@ -1076,6 +1076,72 @@ async def api_list_digests(
     return out
 
 
+@app.post("/api/tasks/{task_id}/executor-merge")
+async def api_executor_merge(
+    task_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Прогон «слей базу и пересдай» (#1445, F5.3).
+
+    Те же двери, что у запуска #1412 и повторного прогона #1444: только
+    человек или админ, CSRF для cookie, принципал. Отказ — 409 с причиной.
+    """
+    from hub.services.executor_launch import merge_executor
+
+    _guard_chat_pair_enabled()
+    issuer = await _chat_pair_issuer(request)
+    result = await merge_executor(
+        _db(request),
+        task_id,
+        issuer_principal_id=int(issuer),
+        issuer=current_identity(request).username,
+    )
+    if not result.launched:
+        raise HTTPException(
+            409, detail={"reason": result.reason, "task_id": result.task_id}
+        )
+    return {
+        "task_id": result.task_id,
+        "agent_id": result.agent_id,
+        "run_id": result.run_id,
+        "row_id": result.row_id,
+    }
+
+
+@app.post("/api/tasks/{task_id}/executor-repair")
+async def api_executor_repair(
+    task_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Повторный прогон исполнителя по находкам ревью (#1444, F5.2).
+
+    Те же двери, что у запуска #1412: только человек или админ, CSRF для
+    cookie, принципал. Отказ — 409 с причиной, задача не тронута.
+    """
+    from hub.services.executor_launch import repair_executor
+
+    _guard_chat_pair_enabled()
+    issuer = await _chat_pair_issuer(request)
+    result = await repair_executor(
+        _db(request),
+        task_id,
+        issuer_principal_id=int(issuer),
+        issuer=current_identity(request).username,
+    )
+    if not result.launched:
+        raise HTTPException(
+            409, detail={"reason": result.reason, "task_id": result.task_id}
+        )
+    return {
+        "task_id": result.task_id,
+        "agent_id": result.agent_id,
+        "run_id": result.run_id,
+        "row_id": result.row_id,
+    }
+
+
 @app.post("/api/projects/{slug}/executor-launch")
 async def api_executor_launch(
     slug: str,
