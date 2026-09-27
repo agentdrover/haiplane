@@ -529,3 +529,32 @@ def wip_limit_of(policy: dict) -> int | None:
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         return None
     return limit
+
+
+# Контракт сдачи (#1436). SID-8 (#1383) и SID-9 (#1384) сданы облачным
+# исполнителем без модели, SID-9 ещё и без описания и без мутаций — промпт этого
+# не удержал. ``warn`` — сдача принята, нарушения названы в карточке одной
+# записью; ``require`` — отказ до записи поколения. Нет ключа — ``off``: проект,
+# который контракт не включал, живёт как жил. Ключ есть, но значение нечитаемое
+# (опечатка, значение из будущей версии) — ``warn``: контракт явно хотели, а
+# отказывать по опечатке в политике нельзя. Запись такое не пропускает
+# (models.validated_gate_policy); правило чтения — для положенного мимо API.
+SUBMISSION_CONTRACT_KEY = "submission_contract"
+CONTRACT_OFF = "off"
+CONTRACT_WARN = "warn"
+CONTRACT_REQUIRE = "require"
+SUBMISSION_CONTRACT_MODES: tuple[str, ...] = (
+    CONTRACT_OFF,
+    CONTRACT_WARN,
+    CONTRACT_REQUIRE,
+)
+
+
+def submission_contract_of(policy: dict) -> str:
+    """Режим контракта сдачи: нет ключа — off, нечитаемое значение — warn."""
+    if not isinstance(policy, dict) or SUBMISSION_CONTRACT_KEY not in policy:
+        return CONTRACT_OFF
+    value = policy.get(SUBMISSION_CONTRACT_KEY)
+    if isinstance(value, str) and value in SUBMISSION_CONTRACT_MODES:
+        return value
+    return CONTRACT_WARN
