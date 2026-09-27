@@ -3322,25 +3322,30 @@ class GitOpsIntegration:
                 return (BranchUpdateOutcome.unavailable, f"коммит мержа: {err[:150]}")
             # #949: pre-push хук читает ЛОКАЛЬНЫЙ ref строки пуша, и «HEAD» из
             # одноразового дерева в его списке нет — в вооружённом клоне (#532)
-            # такой пуш режется всегда. Пушится настоящая локальная ветка с
-            # именем задачи: хук видит refs/heads/<ветка>, как у любого пуша.
-            # Ветку, занятую другим рабочим деревом клона, не двигаем — это
-            # чужая рабочая копия, и отказ называется, а не обходится.
-            rc, _, err = await _git("checkout", "-B", branch, repo=path, check=False)
-            if rc != 0:
-                return (
-                    BranchUpdateOutcome.refused,
-                    f"локальная ветка {branch} не заведена: {(err or '')[:150]}",
-                )
+            # такой пуш режется всегда. Настоящую локальную ветку задачи тоже
+            # не трогаем: её может держать живое дерево исполнителя, и
+            # ``checkout -B`` переставил бы ref под ним (e74f63e646dd4078).
+            # Коммит слияния кладётся во временную ветку по шаблону хука и
+            # пушится в удалённую ветку задачи; временная убирается всегда.
+            _, merged, _ = await _git("rev-parse", "HEAD", repo=path, check=False)
+            temp = f"task-{task_id}/gate-update-{(merged or '').strip()[:8]}"
             rc, _, err = await _git(
-                "push",
-                f"--force-with-lease=refs/heads/{branch}:{tip.strip()}",
-                "origin",
-                f"refs/heads/{branch}:refs/heads/{branch}",
-                repo=path,
-                check=False,
-                timeout=60,
+                "branch", "-f", temp, "HEAD", repo=path, check=False
             )
+            if rc != 0:
+                return (BranchUpdateOutcome.unavailable, f"ветка {temp}: {err[:150]}")
+            try:
+                rc, _, err = await _git(
+                    "push",
+                    f"--force-with-lease=refs/heads/{branch}:{tip.strip()}",
+                    "origin",
+                    f"refs/heads/{temp}:refs/heads/{branch}",
+                    repo=path,
+                    check=False,
+                    timeout=60,
+                )
+            finally:
+                await _git("branch", "-D", temp, repo=repo, check=False)
             if rc != 0:
                 return (_push_refusal(rc, err), f"пуш ветки: {(err or '')[:150]}")
             return (BranchUpdateOutcome.updated, f"база {base} слита в {branch}")

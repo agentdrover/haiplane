@@ -4753,3 +4753,41 @@ async def test_git_ops_update_by_push_passes_the_armed_pre_push_hook(request) ->
     assert "Blocked push" not in detail
     assert _gv_git(bare, "merge-base", "task-1/x", "main") == base_tip
     assert _gv_git(bare, "rev-parse", "task-1/x") != head
+
+
+async def test_git_ops_update_by_push_leaves_a_live_worktree_branch_alone(
+    request, tmp_path
+) -> None:
+    # e74f63e646dd4078: ветку задачи держит другое рабочее дерево клона (живой
+    # pair-воркспейс). ``checkout -B`` в одноразовом дереве вернул бы 0 и
+    # переставил её ref под живым деревом. Обновление гейтом не трогает ни
+    # локальную ветку, ни чужое дерево; временная ветка убирается.
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.protocols import BranchUpdateOutcome
+
+    bare, work = request.getfixturevalue("repo_pair")
+    hooks = Path(__file__).resolve().parent.parent / ".githooks"
+    _gv_git(work, "config", "core.hooksPath", str(hooks))
+    live = tmp_path / "live"
+    _gv_git(work, "worktree", "add", "-q", str(live), "task-1/x")
+    forge = AsyncMock()
+    forge.update_pr_branch.return_value = (BranchUpdateOutcome.unsupported, "нет")
+    forge.pr_refs.return_value = ("main", "task-1/x")
+    ops = GitOpsIntegration(forge=forge)
+    (work / "later.txt").write_text("база ушла вперёд\n")
+    _gv_git(work, "add", "-A")
+    _gv_git(work, "commit", "-qm", "base moved")
+    _gv_git(work, "-c", "core.hooksPath=/dev/null", "push", "-q", "origin", "main")
+    head = _gv_git(bare, "rev-parse", "task-1/x")
+
+    outcome, detail = await ops.update_pr_branch(7, head, task_id=1, repo=str(work))
+
+    assert outcome is BranchUpdateOutcome.updated, detail
+    assert _gv_git(bare, "rev-parse", "task-1/x") != head, "удалённая ветка слита"
+    assert _gv_git(work, "rev-parse", "refs/heads/task-1/x") == head, (
+        "локальная ветка живого дерева не сдвинута"
+    )
+    assert _gv_git(live, "rev-parse", "HEAD") == head
+    assert _gv_git(live, "status", "--porcelain") == ""
+    leftovers = _gv_git(work, "branch", "--list", "task-1/gate-update-*")
+    assert leftovers == "", "временная ветка убрана"
