@@ -456,7 +456,7 @@ async def sweep_executor_runs(db: aiosqlite.Connection) -> None:
 # ---- #1443 (F5.1): суммарный бюджет исполнителя на задачу ----
 
 TASK_CENTS_CEILING_KEY = "executor_task_cents_ceiling"
-TASK_TOKEN_CEILING_KEY = "executor_task_token_ceiling"
+TASK_TOKEN_CEILING_KEY = "executor_task_token_ceiling"  # nosec B105 - a policy key name, not a credential
 
 
 @dataclass
