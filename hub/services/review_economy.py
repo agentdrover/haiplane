@@ -5,7 +5,9 @@
 
 Правила, за которые уже заплачено:
 
-* Цена — только ``review_dispatches.provider_tokens``, счёт провайдера.
+* Цена — счёт провайдера: ``review_dispatches.billed_tokens`` из выгрузки
+  Cursor, где она импортирована (#1413), иначе ``provider_tokens`` API
+  агента — нижняя граница (у deep API видит седьмую часть выгрузки).
   ``tokens_spent`` — самоотчёт харнесса, занижен в 12–62 раза; он не входит
   ни в одно число здесь (#828, #1026).
 * Прогон без счёта — своя строка. Не ноль (он не бесплатный) и не среднее
@@ -72,7 +74,8 @@ async def _runs(db: aiosqlite.Connection, since: str) -> list[dict[str, Any]]:
     rows = await fetchall(
         db,
         "SELECT d.id, d.task_id, d.submission_generation AS generation, "
-        "d.profile, d.provider_tokens AS bill, d.status, d.channel, "
+        "d.profile, COALESCE(d.billed_tokens, d.provider_tokens) AS bill, "
+        "d.billed_tokens IS NOT NULL AS from_export, d.status, d.channel, "
         "d.replaces_dispatch_id AS replaces, "
         "EXISTS (SELECT 1 FROM review_dispatches p WHERE p.task_id = d.task_id "
         "AND p.submission_generation = d.submission_generation "
@@ -113,10 +116,21 @@ def _run_kind(run: dict[str, Any], cascade_ids: set[int | None]) -> str:
     return "ladder" if run["has_earlier"] else "first"
 
 
+#: Что значит API-число рядом с выгрузкой (#1413).
+COST_SOURCE_NOTE = (
+    "цена — по выгрузке Cursor, где она импортирована; иначе API агента — "
+    "нижняя граница (заказ 420: API 1,95 млн, выгрузка 13,58 млн)"
+)
+
+
 def _bill_row(runs: list[dict[str, Any]]) -> dict[str, Any]:
     billed = [r for r in runs if r["bill"] is not None]
     tokens = sum(int(r["bill"]) for r in billed)
+    exported = sum(1 for r in billed if r.get("from_export"))
     return {
+        "export_billed_runs": exported,
+        "api_lower_bound_runs": len(billed) - exported,
+        "export_coverage_share": _share(exported, len(runs)),
         "runs": len(runs),
         "billed_runs": len(billed),
         "unbilled_runs": len(runs) - len(billed),
@@ -136,6 +150,10 @@ def _runs_section(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "unbilled": total["unbilled_runs"],
         "provider_tokens_total": total["provider_tokens_total"],
         "provider_tokens_per_billed_run": total["provider_tokens_per_run"],
+        "export_billed_runs": total["export_billed_runs"],
+        "api_lower_bound_runs": total["api_lower_bound_runs"],
+        "export_coverage_share": total["export_coverage_share"],
+        "cost_source_note": COST_SOURCE_NOTE,
         "by_profile": [
             {"profile": p, **_bill_row([r for r in runs if r["profile"] == p])}
             for p in profiles

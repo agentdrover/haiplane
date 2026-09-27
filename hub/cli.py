@@ -1210,6 +1210,30 @@ def cmd_merge_ledger_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cursor_usage_import(args: argparse.Namespace) -> int:
+    """Разнести выгрузку usage Cursor по заказам ревью (#1413).
+
+    По умолчанию сухой прогон: план по заказам и чужие строки числом. Пишет
+    только с ``--apply``. Только админский токен.
+    """
+    from hub.services.cursor_usage_import import MAX_CSV_CHARS, render_import
+
+    path = Path(args.file).expanduser()
+    if path.stat().st_size > MAX_CSV_CHARS * 4:
+        print(f"Файл больше потолка {MAX_CSV_CHARS} символов.", file=sys.stderr)
+        return 1
+    result = _api(
+        "POST",
+        "/api/admin/cursor-usage/import",
+        {"csv": path.read_text(encoding="utf-8"), "apply": bool(args.apply)},
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(render_import(result))
+    return 0
+
+
 def _review_queue_line(row: dict) -> str:
     findings = (
         "нет текущего отчёта"
@@ -2534,6 +2558,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ledger.add_argument("--json", action="store_true", help="Print raw JSON")
     p_ledger.set_defaults(func=cmd_merge_ledger_backfill)
+
+    p_usage = sub.add_parser(
+        "cursor-usage-import",
+        help="Выгрузка usage Cursor на заказы ревью (сухой прогон без --apply)",
+    )
+    p_usage.add_argument("file", help="CSV usage-events из кабинета Cursor")
+    p_usage.add_argument("--apply", action="store_true", help="Записать")
+    p_usage.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_usage.set_defaults(func=cmd_cursor_usage_import)
 
     p_review_queue = sub.add_parser(
         "review-queue",

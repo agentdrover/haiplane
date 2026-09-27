@@ -1427,17 +1427,13 @@ async def _billed_task(client, db, monkeypatch, slug: str, agent: str) -> int:
 async def test_provider_tokens_sum_every_run_of_the_agent(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch, shape: str
 ):
-    """AC-1 (#1413): три прогона агента 1,0 + 2,5 + 0,5 млн → 4 млн.
+    """AC-1 (#1413): два прогона агента по 2 млн → 4 млн.
 
-    Форма ответа /usage без runId живьём не подтверждена, поэтому покрыты
-    обе: агрегат по агенту и отказ, после которого хаб суммирует прогоны.
+    Живая проба 27.09 подтвердила агрегат (/usage без runId → totalUsage и
+    runs[]); отказ с суммой по прогонам остаётся запасным путём и покрыт тоже.
     """
     task_id = await _billed_task(client, db, monkeypatch, f"spike-{shape}", "bc-deep")
-    runs = [
-        ("r-1", "FINISHED", 1_000_000),
-        ("r-2", "FINISHED", 2_500_000),
-        ("r-3", "FINISHED", 500_000),
-    ]
+    runs = [("r-1", "FINISHED", 2_000_000), ("r-2", "FINISHED", 2_000_000)]
     _Provider(4_000_000 if shape == "aggregate" else None, runs).wire(monkeypatch)
 
     await sweep_review_dispatches(db)
