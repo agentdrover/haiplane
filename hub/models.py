@@ -347,6 +347,9 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # Не гейт и ничего не делегирует. Читатель:
     # project_policy.submission_contract_of.
     "submission_contract",
+    # #1433: сверка областей при захвате задачи. Не гейт и ничего не
+    # делегирует. Читатель: project_policy.claim_area_check_of.
+    "claim_area_check",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -427,6 +430,21 @@ def _validate_submission_contract(policy: dict[str, Any]) -> None:
             "gate_policy submission_contract must be one of "
             f"{', '.join(SUBMISSION_CONTRACT_MODES)}, "
             f"got: {policy['submission_contract']!r}"
+        )
+
+
+def _validate_claim_area_check(policy: dict[str, Any]) -> None:
+    """Refuse a capture-check mode the reader would read as warn by accident (#1433)."""
+    from hub.services.project_policy import CLAIM_AREA_CHECK_MODES
+
+    if (
+        "claim_area_check" in policy
+        and policy["claim_area_check"] not in CLAIM_AREA_CHECK_MODES
+    ):
+        raise ValueError(
+            "gate_policy claim_area_check must be one of "
+            f"{', '.join(CLAIM_AREA_CHECK_MODES)}, "
+            f"got: {policy['claim_area_check']!r}"
         )
 
 
@@ -2329,6 +2347,10 @@ class TaskView(BaseModel):
     # would be one more thing to go stale — which is the very defect this
     # addresses. Absent means "not computed on this path", not "fresh".
     statement_freshness: dict[str, Any] | None = None
+    # #1433: the area overlap this claim/pair-start went through in warn mode
+    # (path, with_task_id, with_path, detail). None means none was found or
+    # the check is off; in require the overlap is a refusal, not this field.
+    area_check: dict[str, Any] | None = None
     # #485: who blocks this task and whom it unblocks. None means no edges at
     # all, which is not the same as "edges, but empty".
     dependencies: "TaskDependencies | None" = None
@@ -2492,6 +2514,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_review_limit(v)
     _validate_orchestrator_queue(v)
     _validate_submission_contract(v)
+    _validate_claim_area_check(v)
     _validate_executor_launch(v)
     _validate_count(v, "deep_daily_cap")
     _validate_count(v, "small_delta_lines")

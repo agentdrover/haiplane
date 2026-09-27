@@ -2033,6 +2033,17 @@ async def hub_start_task(task_id: int, plan: str = "", runtime: str = "") -> str
     return _format_mutation_success(message, task, transition_from=prior_status)
 
 
+def _area_check_note(result: dict[str, Any] | None) -> str:
+    """Warn-mode area overlap of a claim/pair-start, as one line (#1433)."""
+    found = (result or {}).get("area_check")
+    if not isinstance(found, dict) or not found.get("detail"):
+        return ""
+    return (
+        f"\nArea overlap (claim_area_check={found.get('mode', 'warn')}): "
+        f"{found['detail']}. Recorded in the card; coordinate before editing."
+    )
+
+
 @mcp.tool()
 async def hub_pair_start(
     task_id: int,
@@ -2090,6 +2101,7 @@ async def hub_pair_start(
         f"Task #{task_id} pair-started (status: {status}, branch: {branch}, "
         f"agent: {agent_name}, {job_note})."
     )
+    message += _area_check_note(result)
     # Worktree isolation (#530): the mode/path live on the pair-start response
     # (not the DB re-read), so read them from `result` and tell the agent where
     # its isolated tree is — otherwise it would keep working in the shared clone.
@@ -2496,17 +2508,16 @@ async def hub_claim_task(
 ) -> str:
     """Claim an open task for one Cursor agent/session (409 if already claimed).
 
-    Remember the ``agent`` name you pass here: a later hub_pair_start must use
-    the same value as its ``assigned_agent`` (the name is how the holder is
-    matched), unless you pair-start under the same authenticated principal.
+    Reuse ``agent`` as hub_pair_start's ``assigned_agent`` (the holder is
+    matched by name) unless you pair-start as the same principal. Policy
+    claim_area_check (#1433) notes or refuses areas overlapping a started task.
 
     Args:
         task_id: The open task ID
-        agent: Agent name taking the claim; reuse it as assigned_agent in hub_pair_start
-        session_id: YOUR session id — REQUIRED for agents (#852), because the
-            agent name does not identify which session works the task. Register
-            it with hub_session_register and reuse it in hub_pair_start and
-            hub_release_task
+        agent: Agent name taking the claim
+        session_id: YOUR session id, REQUIRED for agents (#852): the agent
+            name does not identify the session. Register it with
+            hub_session_register; reuse it in hub_pair_start and hub_release_task
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -2521,6 +2532,7 @@ async def hub_claim_task(
     status = (task or result).get("status", "?")
     holder = (task or result).get("claimed_by") or agent
     message = f"Task #{task_id} claimed (status: {status}, claimed_by: {holder})."
+    message += _area_check_note(result)
     return await _task_mutation_response(
         task_id,
         message,
