@@ -14529,3 +14529,327 @@ async def test_human_request_security_and_zero_threshold_keep_deep(
     for bad in (-1, True, "2"):
         with pytest.raises(ValueError, match="circle_deep_stop"):
             validated_gate_policy({"circle_deep_stop": bad})
+
+
+# --- #1408: 404 на создание не доказывает, что агента нет ---------------------
+#
+# 25.09.2026, #1399 сдача 2: create ответил HTTP 404 agent_not_found, заказ 429
+# записан failed, а агент bc-1ddea9c5 создан (08:18:06, 3,47 млн токенов по
+# счёту Cursor) и через десять минут сдал отчёт 582. Переспрос #1242 уже звал
+# второго ревьюера и отменился лишь потому, что отчёт лёг на 7 секунд раньше.
+_CREATED_BUT_404 = cursor_cloud.Refusal(
+    status=404, code="agent_not_found", detail='{"error":{"code":"agent_not_found"}}'
+)
+
+
+def _no_real_pause(monkeypatch) -> list[float]:
+    """Паузы сверки не спят, а записываются: потолок проверяется суммой."""
+    from hub.services import review_dispatch as rd
+
+    pauses: list[float] = []
+
+    async def _pause(seconds: float) -> None:
+        pauses.append(seconds)
+
+    monkeypatch.setattr(rd, "_verification_pause", _pause)
+    return pauses
+
+
+def _still_running(monkeypatch) -> None:
+    async def _run(agent_id, run_id):
+        return {"status": "RUNNING"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _run)
+
+
+async def _claims_of(db: aiosqlite.Connection, task_id: int) -> int:
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) AS n FROM review_order_claims WHERE task_id=?", (task_id,)
+    )
+    return int(dict(rows[0])["n"])
+
+
+async def test_create_404_with_live_agent_adopts_the_order(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1408): 404 на создание, а агент с меткой заказа у провайдера есть.
+
+    Заказ усыновляет найденного агента (active, agent_id и run_id записаны),
+    алерта «ревью НЕ вызвано» нет, второго POST нет, и переспрос на следующих
+    проходах свипа не планируется — упавшей строки у сдачи нет.
+    """
+    provider = _DispatchRecorder(None, refusal=_CREATED_BUT_404)
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    _no_real_pause(monkeypatch)
+    _still_running(monkeypatch)
+
+    async def _listing(limit=50, cursor=""):
+        return {
+            "items": [
+                {
+                    "id": "bc-1ddea9c5",
+                    "name": provider.calls[0]["name"],
+                    "latestRunId": "run-582",
+                }
+            ],
+            "nextCursor": "",
+        }
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+    task_id = await _submitted(
+        client, db, "create-404-adopt", policy={"review": "dispatch"}
+    )
+
+    assert len(provider.calls) == 1, "второй POST — второй оплаченный агент"
+    rows = await _rows_of(db, task_id)
+    assert [(r["agent_id"], r["run_id"], r["status"]) for r in rows] == [
+        ("bc-1ddea9c5", "run-582", "active")
+    ], rows
+    alerts = await _alerts_of(db, task_id)
+    assert not [a for a in alerts if "НЕ вызвано" in a], alerts
+    notes = await _card(db, task_id)
+    assert any("HTTP 404" in n and "подобран по метке" in n for n in notes), notes
+
+    for _ in range(3):
+        await _age_dispatches(db)
+        await sweep_review_dispatches(db)
+    assert len(provider.calls) == 1, "переспрос по усыновлённому заказу не нужен"
+    assert not [a for a in await _alerts_of(db, task_id) if "Переспрос ревью" in a]
+
+
+async def test_create_404_without_agent_fails_after_verification(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1408): 404, и агента с меткой нет до самого потолка сверки.
+
+    До потолка второй агент не создаётся и бронь #1399 держится; после —
+    заказ failed с причиной, бронь снята, переспрос #1242 работает как раньше.
+    """
+    from hub.services.review_dispatch import (
+        UNKNOWN_CREATE_CEILING_SECONDS,
+    )
+
+    provider = _Sequence(
+        [
+            (None, _CREATED_BUT_404),
+            ({"agent": {"id": "bc-retry"}, "run": {"id": "run-retry"}}, None),
+        ]
+    )
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    pauses = _no_real_pause(monkeypatch)
+    _still_running(monkeypatch)
+    task_holder: dict[str, int] = {}
+    seen_during: list[tuple[int, int]] = []
+
+    async def _listing(limit=50, cursor=""):
+        # Агента нашей метки нет, но метка нашей формы в ответе есть:
+        # пустота подтверждена этим же ответом (find_agent_by_name).
+        task_id = task_holder.get("id")
+        claims = await _claims_of(db, task_id) if task_id else -1
+        seen_during.append((len(provider.calls), claims))
+        return {
+            "items": [{"id": "bc-other", "name": "haiplane:review:t1:g1:a1"}],
+            "nextCursor": "",
+        }
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+    real_claim = repo.claim_review_order
+
+    async def _claim(db_, task_id, generation, profile):
+        task_holder["id"] = task_id
+        return await real_claim(db_, task_id, generation, profile)
+
+    monkeypatch.setattr(repo, "claim_review_order", _claim)
+    task_id = await _submitted(
+        client, db, "create-404-absent", policy={"review": "dispatch"}
+    )
+
+    assert len(seen_during) > 1, "сверка повторяется, а не спрашивает один раз"
+    assert all(calls == 1 for calls, _ in seen_during), (
+        "до потолка сверки второй агент не создаётся"
+    )
+    assert all(claims == 1 for _, claims in seen_during), (
+        "бронь #1399 держится, пока исход не установлен"
+    )
+    assert sum(pauses) == UNKNOWN_CREATE_CEILING_SECONDS, pauses
+    rows = await _rows_of(db, task_id)
+    assert [(r["agent_id"], r["status"]) for r in rows] == [("", "failed")], rows
+    assert await _claims_of(db, task_id) == 0, "после потолка бронь снята"
+    refused = [a for a in await _alerts_of(db, task_id) if "НЕ вызвано" in a]
+    assert len(refused) == 1, refused
+    assert "HTTP 404" in refused[0] and "сверк" in refused[0], refused[0]
+
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+    assert len(provider.calls) == 2, "переспрос работает как раньше"
+    rows = await _rows_of(db, task_id)
+    assert rows[-1]["agent_id"] == "bc-retry" and rows[-1]["status"] == "active"
+
+
+async def _failed_order_then_report(
+    client, db, monkeypatch, slug: str, listing_items: list[dict]
+) -> tuple[int, int, str]:
+    """Сдача, чей заказ записан failed после 404, и отчёт ревьюера по ней."""
+    provider = _Sequence([(None, _CREATED_BUT_404)])
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    _no_real_pause(monkeypatch)
+    reviewer_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    phase = {"late": False}
+
+    async def _listing(limit=50, cursor=""):
+        items = [{"id": "bc-other", "name": "haiplane:review:t1:g1:a1"}]
+        if phase["late"]:
+            items = items + listing_items
+        marker = provider.calls[0]["name"]
+        return {
+            "items": [
+                {**i, "name": marker} if i.get("name") == "<marker>" else i
+                for i in items
+            ],
+            "nextCursor": "",
+        }
+
+    monkeypatch.setattr(cursor_cloud, "list_agents", _listing)
+    task_id = await _submitted(client, db, slug, policy={"review": "dispatch"})
+    rows = await _rows_of(db, task_id)
+    assert [(r["agent_id"], r["status"]) for r in rows] == [("", "failed")], rows
+    profile = rows[0]["profile"]
+    assert profile, "заглушка отказа помнит профиль, с которым шёл заказ"
+    phase["late"] = True
+    review_id = await _a_report_from(db, task_id, reviewer_pid, "cursor-cloud-reviewer")
+    return task_id, review_id, profile
+
+
+async def _review_row(db: aiosqlite.Connection, review_id: int) -> dict:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM machine_reviews WHERE id=?", (review_id,)
+    )
+    return dict(rows[0])
+
+
+async def test_report_after_failed_order_is_linked_and_billed(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1408): отчёт по сдаче, чей заказ записан failed, — ЕГО отчёт.
+
+    Прод 25.09: отчёт 582 лёг с пустым profile и provider_tokens NULL, а
+    оплаченный прогон 429 учитывался как отказ. Отчёт привязывается к заказу:
+    профиль заказа на отчёте, агент найден по метке, счёт снят с провайдера
+    и на заказе, и на отчёте; повторного заказа нет.
+    """
+    task_id, review_id, profile = await _failed_order_then_report(
+        client,
+        db,
+        monkeypatch,
+        "late-report-billed",
+        [{"id": "bc-1ddea9c5", "name": "<marker>", "latestRunId": "run-582"}],
+    )
+    assert (await _review_row(db, review_id))["profile"] == profile
+
+    async def _usage(agent_id, run_id=None):
+        assert (agent_id, run_id) == ("bc-1ddea9c5", "run-582"), (agent_id, run_id)
+        return {"totalUsage": {"totalTokens": 3_467_426}}
+
+    monkeypatch.setattr(cursor_cloud, "get_usage", _usage)
+    await sweep_review_dispatches(db)
+
+    rows = await _rows_of(db, task_id)
+    assert len(rows) == 1, "отчёт привязан к заказу, а не породил второй"
+    assert (rows[0]["agent_id"], rows[0]["run_id"], rows[0]["status"]) == (
+        "bc-1ddea9c5",
+        "run-582",
+        "done",
+    ), rows[0]
+    assert rows[0]["provider_tokens"] == 3_467_426
+    assert (await _review_row(db, review_id))["provider_tokens"] == 3_467_426
+    await _age_dispatches(db)
+    await sweep_review_dispatches(db)
+    assert not [a for a in await _alerts_of(db, task_id) if "Переспрос ревью" in a]
+
+
+async def test_report_after_failed_order_names_an_unavailable_bill(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1408), вторая ветвь: агента по метке не нашлось — счёт недоступен.
+
+    Отчёт всё равно привязан (профиль заказа, заказ закрыт done), а
+    provider_tokens остаётся NULL не молча: карточка называет заказ и причину.
+    """
+    task_id, review_id, profile = await _failed_order_then_report(
+        client, db, monkeypatch, "late-report-unbilled", []
+    )
+    await sweep_review_dispatches(db)
+
+    rows = await _rows_of(db, task_id)
+    assert [(r["agent_id"], r["status"]) for r in rows] == [("", "done")], rows
+    assert rows[0]["provider_tokens"] is None
+    review = await _review_row(db, review_id)
+    assert review["profile"] == profile and review["provider_tokens"] is None
+    unbilled = [a for a in await _alerts_of(db, task_id) if "Счёт прогона" in a]
+    assert len(unbilled) == 1, unbilled
+    assert f"#{rows[0]['id']}" in unbilled[0] and "недоступен" in unbilled[0]
+    await sweep_review_dispatches(db)
+    assert len([a for a in await _alerts_of(db, task_id) if "Счёт прогона" in a]) == 1
+
+
+async def test_create_404_blind_verification_goes_to_a_human(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1408, ограничение: сверка не смогла спросить до потолка — не отказ.
+
+    Исход создания неизвестен: failed-строки нет (переспрос купил бы второго
+    поверх, возможно, живого агента), второго POST нет, бронь #1399 остаётся
+    на свой срок, а карточка называет это человеку.
+    """
+    provider = _DispatchRecorder(None, refusal=_CREATED_BUT_404)
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    _no_real_pause(monkeypatch)
+
+    async def _cannot_ask(name, pages=3):
+        return cursor_cloud.Reconciliation("", "", False)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _cannot_ask)
+    task_id = await _submitted(
+        client, db, "create-404-blind", policy={"review": "dispatch"}
+    )
+
+    assert len(provider.calls) == 1
+    assert await _rows_of(db, task_id) == []
+    assert await _claims_of(db, task_id) == 1, "бронь держится до своего срока"
+    refused = [a for a in await _alerts_of(db, task_id) if "НЕ вызвано" in a]
+    assert len(refused) == 1 and "исход создания неизвестен" in refused[0], refused
+    assert "человек" in refused[0], refused[0]
+
+
+async def test_reopened_order_without_its_report_returns_to_failed(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1408: открытый заказ-отказ, отчёт к которому не сопоставился.
+
+    Без агента опрашивать прогон нечем, а без отчёта нового о заказе ничего
+    не известно: строка возвращается в failed, и переспрос #1242 видит её
+    снова, а не висит «активной» без агента навсегда.
+    """
+    provider = _Sequence([(None, _CREATED_BUT_404)])
+    _wire(monkeypatch, provider)
+    _no_local_path(monkeypatch)
+    _no_real_pause(monkeypatch)
+    reviewer_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    listing = _Listing([[{"id": "bc-other", "name": "haiplane:review:t1:g1:a1"}]])
+    monkeypatch.setattr(cursor_cloud, "list_agents", listing)
+    task_id = await _submitted(
+        client, db, "reopened-no-report", policy={"review": "dispatch"}
+    )
+    assert await repo.reopen_refused_order_for_report(db, task_id, 1, reviewer_pid)
+    await db.commit()
+    checks = listing.calls
+
+    await sweep_review_dispatches(db)
+
+    rows = await _rows_of(db, task_id)
+    assert [(r["agent_id"], r["status"]) for r in rows] == [("", "failed")], rows
+    assert listing.calls == checks, "без отчёта по метке не сверяют"

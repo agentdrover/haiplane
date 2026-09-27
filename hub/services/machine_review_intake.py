@@ -207,6 +207,11 @@ async def record_machine_review(
     # #750 showed to be worthless. No dispatch behind the report leaves the
     # profile empty, which reads as "unknown", not as "cheap".
     dispatch = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    if dispatch is None and principal_id is not None:
+        # #1408: заказ записан отказом, а его ревьюер отчитался — заказ был.
+        dispatch = await repo.reopen_refused_order_for_report(
+            db, task_id, generation, int(principal_id)
+        )
     profile = (dispatch["profile"] if dispatch is not None else "") or ""
     # #807 forced incomplete=true on a lite run whose SELF-REPORTED spend
     # reached the ceiling. Removed in #893: it never once fired, and could

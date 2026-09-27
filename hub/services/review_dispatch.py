@@ -2948,6 +2948,20 @@ async def _access_code(
 #: повторял одну и ту же неудачу семнадцать минут подряд.
 _LOST_ANSWER_ATTEMPTS = 2
 
+#: Потолок сверки после ответа на создание, который агента не опровергает
+#: (#1408, ``Refusal.leaves_create_unknown``). Сверка идёт внутри сдачи и всё
+#: это время держит бронь #1399, поэтому потолок короткий: на проде агент
+#: 25.09 был создан за две секунды ДО ответа 404, то есть виден уже первой
+#: проверкой. Не нашли за потолок — заказ failed, дальше переспрос #1242.
+UNKNOWN_CREATE_CEILING_SECONDS = 30.0
+#: Пауза между проверками сверки; проверок — потолок / пауза + 1.
+UNKNOWN_CREATE_PAUSE_SECONDS = 5.0
+
+
+async def _verification_pause(seconds: float) -> None:
+    """Пауза между проверками сверки (#1408) — отдельной точкой для тестов."""
+    await asyncio.sleep(seconds)
+
 
 class _Started(NamedTuple):
     """Чем кончилась попытка получить ревьюера (#1199)."""
@@ -2965,6 +2979,9 @@ class _Started(NamedTuple):
     #: голый заказ создал агента (см. ``_name_the_dropped_params``).
     refused_params: list[cursor_cloud.ModelParam] | None = None
     params_refusal: cursor_cloud.Refusal | None = None
+    #: Сколько раз сверяли по метке после ответа, не опровергающего агента
+    #: (#1408); 0 — такой сверки не было.
+    verified: int = 0
 
 
 #: Коды 400, при которых повтор без параметров не нужен: лимит счёта
@@ -3039,6 +3056,8 @@ def _lost_call_detail(started: _Started) -> str:
     сообщения: оно уводит.
     """
     refusal = started.refusal
+    if started.verified and refusal is not None:
+        return _unverified_create_detail(started, refusal)
     if started.blind:
         return (
             "ответ провайдера не дошёл, и СПРОСИТЬ его, создался ли агент, "
@@ -3056,6 +3075,54 @@ def _lost_call_detail(started: _Started) -> str:
             f", {refusal.code}" if refusal.code else ""
         )
     return "ответ провайдера не содержал идентификатора агента"
+
+
+def _unverified_create_detail(started: _Started, refusal: cursor_cloud.Refusal) -> str:
+    """Причина для ответа создания, который агента не опровергал (#1408).
+
+    Подтверждённая пустота начинается с «провайдер отказал» — тем же словом,
+    что и прямой отказ: для сводки недоступности (review_availability) это
+    отказ создания. Слепая сверка — нет: исход неизвестен, и решает человек.
+    """
+    code = f"HTTP {refusal.status}" + (f", {refusal.code}" if refusal.code else "")
+    window = f"{started.verified} проверок за {UNKNOWN_CREATE_CEILING_SECONDS:g} с"
+    if started.blind:
+        return (
+            f"исход создания неизвестен: провайдер ответил {code}, что агента "
+            f"не опровергает, а спросить, создан ли он, не вышло ({window}) — "
+            "подбирать вслепую нельзя, повторять тоже (#1408)"
+        )
+    return (
+        f"провайдер отказал: {code}, и сверка по метке заказа агента не нашла "
+        f"({window}, #1408)"
+    )
+
+
+async def _verify_unknown_create(
+    marker: str, task_id: int
+) -> tuple[cursor_cloud.Reconciliation, int]:
+    """Сверить по метке исход создания, который ответ не установил (#1408).
+
+    Только спрашивает: сверка агентов не создаёт. Кончается на первом
+    найденном агенте или на потолке; результат — последний ответ провайдера
+    и число проверок. Последний, а не любой: «не смогли спросить» в конце
+    окна оставляет исход неизвестным, даже если раньше список был пуст.
+    """
+    checks = int(UNKNOWN_CREATE_CEILING_SECONDS // UNKNOWN_CREATE_PAUSE_SECONDS) + 1
+    seen = cursor_cloud.Reconciliation("", "", False)
+    for check in range(1, checks + 1):
+        seen = await cursor_cloud.find_agent_by_name(marker)
+        if seen.agent_id or check == checks:
+            break
+        await _verification_pause(UNKNOWN_CREATE_PAUSE_SECONDS)
+    log.info(
+        "review dispatch for #%s: create outcome verified by %s after %s checks: %s",
+        task_id,
+        marker,
+        check,
+        seen.agent_id or ("absent" if seen.asked else "unknown"),
+    )
+    return seen, check
 
 
 async def _attempt_ordinal(
@@ -3135,6 +3202,13 @@ async def _create_or_adopt(
     if not agent_id and _params_were_refused(params, refusal):
         refused_params, params_refusal, params = params, refusal, []
         agent_id, run_id, refusal = await _attempt()
+    verified = 0
+    if not agent_id and refusal is not None and refusal.leaves_create_unknown:
+        # #1408: ответ дошёл, но агента не опровергает. Повтор create тут
+        # запрещён — агент мог уже работать; только сверка по метке.
+        seen, verified = await _verify_unknown_create(marker, task_id)
+        agent_id, run_id = seen.agent_id, seen.run_id
+        adopted, blind = bool(seen.agent_id), not seen.asked
     while not agent_id and refusal is not None and refusal.is_transport:
         seen = await cursor_cloud.find_agent_by_name(marker)
         if not seen.asked:
@@ -3173,6 +3247,7 @@ async def _create_or_adopt(
         params,
         refused_params,
         params_refusal,
+        verified,
     )
 
 
@@ -3557,13 +3632,7 @@ async def maybe_dispatch_review(
         + " (#875). "
         + "Отчёт придёт через "
         "hub_submit_machine_review от принципала cursor-cloud-reviewer "
-        "(#757, #807)."
-        + (
-            " Ответ на создание не дошёл, и агент подобран по метке заказа "
-            "(#1199): прогон был оплачен, второго не покупали."
-            if started.adopted
-            else ""
-        ),
+        "(#757, #807)." + _adoption_note(started),
     )
     await repo.insert_event(
         db,
@@ -3590,6 +3659,24 @@ async def maybe_dispatch_review(
         agent_id,
     )
     return True
+
+
+def _adoption_note(started: _Started) -> str:
+    """Хвост записи о заказе: как агент был подобран, если был (#1199, #1408)."""
+    if not started.adopted:
+        return ""
+    refusal = started.refusal
+    if refusal is not None and refusal.leaves_create_unknown:
+        return (
+            f" Провайдер ответил на создание HTTP {refusal.status}"
+            + (f" ({refusal.code})" if refusal.code else "")
+            + ", но агент с меткой заказа у него есть и подобран по метке "
+            "(#1408): прогон оплачен, второго не покупали."
+        )
+    return (
+        " Ответ на создание не дошёл, и агент подобран по метке заказа "
+        "(#1199): прогон был оплачен, второго не покупали."
+    )
 
 
 async def _owe_the_refused_call(
@@ -4866,6 +4953,10 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
         review = await _dispatch_report(
             db, task_id, dispatch["submission_generation"], dispatch
         )
+        if not dispatch.get("agent_id") and not await _find_the_agent_behind(
+            db, dispatch, review
+        ):
+            continue
         if review is not None:
             total = await _stamp_dispatch_usage(db, dispatch)
             reported = review.get("tokens_spent")
@@ -4924,6 +5015,75 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
             await db.commit()
             continue
         await _close_a_run_without_a_report(db, dispatch, run)
+
+
+async def _find_the_agent_behind(
+    db: aiosqlite.Connection,
+    dispatch: dict[str, Any],
+    review: dict[str, Any] | None,
+) -> bool:
+    """Заказ-отказ, к которому пришёл отчёт: найти агента по метке (#1408).
+
+    Такую строку открывает приём отчёта (``reopen_refused_order_for_report``).
+    Метка восстанавливается номером строки в поколении — тем же счётом, каким
+    ``_attempt_ordinal`` выдал её заказу. Нашли — агент и прогон записаны,
+    строка идёт обычным путём (счёт провайдера, done); True. Не нашли или не
+    смогли спросить — заказ закрыт отчётом, а счёт назван недоступным с
+    причиной один раз; False. Без отчёта (не сопоставился) строка возвращается
+    в failed: ничего нового о ней не известно, и опрашивать прогон без агента
+    нечем.
+    """
+    if review is None:
+        await repo.set_review_dispatch_status(db, dispatch["id"], "failed")
+        await db.commit()
+        return False
+    task_id, generation = (
+        int(dispatch["task_id"]),
+        int(dispatch["submission_generation"]),
+    )
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM review_dispatches WHERE task_id=? "
+        "AND submission_generation=? AND id<=?",
+        (task_id, generation, dispatch["id"]),
+    )
+    marker = cursor_cloud.agent_marker(
+        "review", task_id, generation, int(dict(rows[0])["n"])
+    )
+    seen = await cursor_cloud.find_agent_by_name(marker)
+    if seen.agent_id:
+        await repo.set_review_dispatch_agent(
+            db, dispatch["id"], seen.agent_id, seen.run_id
+        )
+        dispatch.update(agent_id=seen.agent_id, run_id=seen.run_id)
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            f"Заказ ревью #{dispatch['id']} был записан отказом, но его ревьюер "
+            f"сдал отчёт #{review['id']}: агент {seen.agent_id} найден по метке "
+            f"{marker}, заказ усыновлён и счёт снимается с провайдера (#1408).",
+        )
+        return True
+    why = (
+        "агента с меткой заказа у провайдера нет"
+        if seen.asked
+        else "спросить провайдера по метке не вышло"
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Счёт прогона по заказу #{dispatch['id']} недоступен: {why} ({marker}). "
+        f"Отчёт #{review['id']} привязан к заказу (профиль "
+        f"{dispatch.get('profile') or 'не записан'}), provider_tokens не "
+        "записан — цена прогона в учёт не попала (#1408).",
+    )
+    await repo.set_review_dispatch_status(db, dispatch["id"], "done")
+    await db.commit()
+    return False
 
 
 async def _close_a_run_without_a_report(
