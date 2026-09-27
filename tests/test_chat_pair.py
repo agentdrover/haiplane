@@ -1375,3 +1375,131 @@ async def test_reviewer_session_cannot_file_against_a_newer_submission(hub):
         headers=session,
     )
     assert filed.status_code == 403, filed.text
+
+
+# ---------------------------------------------------------------------------
+# #1439 (F4): код implementer выписывает хаб — на задачу и поколение прогона
+# ---------------------------------------------------------------------------
+
+
+async def _returned_task(
+    hub, generation: int = 1, status: str = "fix_requested"
+) -> int:
+    """Задача, которую вернули исполнителю: не open, прошлая сдача generation."""
+    from hub import repository as repo
+
+    task_id = await _make_task(hub, "возвращённая")
+    await repo.update_task(
+        hub.db, task_id, status=status, submission_generation=generation
+    )
+    await hub.db.commit()
+    return task_id
+
+
+@pytest.mark.asyncio
+async def test_a_returned_task_gets_a_code_for_the_next_generation(hub):
+    """AC-2: не-open задача, код на следующее поколение — обмен проходит,
+    сессия привязана к задаче и этому поколению."""
+    task_id = await _returned_task(hub, generation=1)
+    code, _ttl = await cp.issue_run_code(
+        hub.db, task_id, 2, issued_by_principal_id=hub.human_id
+    )
+    await hub.db.commit()
+
+    token = await _redeem(hub, code)
+
+    session = (
+        await _rows(
+            hub.db,
+            "SELECT kind, bound_task_id, bound_generation FROM chat_pair_sessions "
+            "WHERE token_hash = ?",
+            (cp.hash_pair_code(token),),
+        )
+    )[0]
+    assert (session["kind"], session["bound_task_id"], session["bound_generation"]) == (
+        "implementer",
+        task_id,
+        2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_implementer_code_is_bound_to_its_task_generation_and_single_use(hub):
+    """AC-3: повтор, сменившееся поколение, не-open без поколения, агентская
+    выдача — всё отказано."""
+    from hub import repository as repo
+
+    # Повторный обмен одного кода.
+    task_id = await _returned_task(hub, generation=1)
+    code, _ = await cp.issue_run_code(
+        hub.db, task_id, 2, issued_by_principal_id=hub.human_id
+    )
+    await hub.db.commit()
+    await _redeem(hub, code)
+    again = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip()
+    )
+    assert again.status_code == 401, again.text
+
+    # Поколение задачи ушло дальше, чем то, на которое выписан код.
+    moved = await _returned_task(hub, generation=1)
+    stale, _ = await cp.issue_run_code(
+        hub.db, moved, 2, issued_by_principal_id=hub.human_id
+    )
+    await repo.update_task(hub.db, moved, submission_generation=2)
+    await hub.db.commit()
+    resp = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": stale}, headers=_ip()
+    )
+    assert resp.status_code == 401, resp.text
+
+    # Не-open задача и код без привязки к поколению (ручная выдача старого вида).
+    unpinned_task = await _returned_task(hub, generation=1)
+    acting = await cp.get_acting_agent(hub.db)
+    unpinned, _ = await cp.issue_code(
+        hub.db, int(acting["id"]), kind="implementer", bound_task_id=unpinned_task
+    )
+    await hub.db.commit()
+    resp = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": unpinned}, headers=_ip()
+    )
+    assert resp.status_code == 401, resp.text
+
+    # Агентский токен не выписывает код implementer.
+    open_task = await _make_task(hub, "open")
+    by_agent = await hub.client.post(
+        "/api/auth/chat-pair/start",
+        json={"kind": "implementer", "task_id": open_task},
+        headers={**hub.agent_auth, **_ip()},
+    )
+    assert by_agent.status_code == 403, by_agent.text
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_code_on_an_open_task_must_name_the_next_generation(hub):
+    """Код хаба на open-задачу тоже сверяется с поколением: на «через одно»
+    поколение он не обменивается."""
+    task_id = await _make_task(hub, "open")
+    code, _ = await cp.issue_run_code(
+        hub.db, task_id, 5, issued_by_principal_id=hub.human_id
+    )
+    await hub.db.commit()
+    resp = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip()
+    )
+    assert resp.status_code == 401, resp.text
+
+
+@pytest.mark.asyncio
+async def test_a_task_in_review_does_not_take_an_implementer_code(hub):
+    """Задача в review — там идёт отчёт ревьюера, не работа исполнителя:
+    код хаба даже на следующее поколение не обменивается (#1439)."""
+    task_id = await _returned_task(hub, generation=1, status="review")
+    code, _ = await cp.issue_run_code(
+        hub.db, task_id, 2, issued_by_principal_id=hub.human_id
+    )
+    await hub.db.commit()
+    resp = await hub.client.post(
+        "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip()
+    )
+    assert resp.status_code == 401, resp.text

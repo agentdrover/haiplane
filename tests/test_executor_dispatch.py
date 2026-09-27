@@ -811,9 +811,14 @@ async def test_manual_launch_takes_the_queue_candidate(client, db, monkeypatch):
     assert order["name"] == cursor_cloud.agent_marker("executor", task_id, 1, 1)
     assert f"#{task_id}" in order["prompt_text"]
     codes = await db.execute_fetchall(
-        "SELECT kind, bound_task_id, principal_id FROM chat_pair_codes"
+        "SELECT kind, bound_task_id, bound_generation, principal_id FROM chat_pair_codes"
     )
-    assert [tuple(c) for c in codes] == [("implementer", task_id, human_id)]
+    from hub.services import chat_pair
+
+    cloud = await chat_pair.get_acting_agent(db)
+    assert [tuple(c) for c in codes] == [("implementer", task_id, 1, cloud["id"])], (
+        "#1439: код выписывает хаб от имени агента chat-pair на поколение прогона"
+    )
     rows = await repo.list_executor_runs(db, task_id)
     row = dict(rows[0])
     assert (row["agent_id"], row["run_id"], row["model"]) == (
@@ -1064,3 +1069,97 @@ async def test_an_abandoned_reservation_does_not_block_the_task_forever(
         "failed",
         el.REASON_RESERVATION_ABANDONED,
     )
+
+
+# ---- #1439 (F4): код выписывает хаб; бронь при слепой потере ответа ----
+
+
+async def test_the_dispatcher_issues_the_code_and_the_run_submits(db, monkeypatch):
+    """AC-1: запуск — код хаба на задачу и поколение, аудит с нажавшим и без
+    самого кода; код из промпта обменивается."""
+    import re
+
+    from hub.services import chat_pair
+
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, task_id = await _launch_project(db, slug="exec-f4")
+    human_id = await _human(db)
+
+    result = await el.launch_executor(db, project, issuer_principal_id=human_id)
+
+    assert result.launched, result
+    audit = [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT actor_principal_id, action, target_id, summary FROM admin_audit_log "
+            "WHERE action = 'implementer_code_dispatched'"
+        )
+    ]
+    assert len(audit) == 1, audit
+    assert (audit[0]["actor_principal_id"], audit[0]["target_id"]) == (
+        human_id,
+        str(task_id),
+    )
+    assert "generation 1" in audit[0]["summary"]
+    code = re.search(r"код ([A-Z0-9-]{8,})", calls[0]["prompt_text"]).group(1)
+    assert code not in audit[0]["summary"], "код не пишется в аудит"
+    session = await chat_pair.redeem_code(db, code)
+    assert session is not None and session["bound_task_id"] == task_id
+
+
+async def test_a_blind_answer_loss_keeps_the_launch_reservation(db, monkeypatch):
+    """AC-4: обрыв ответа, сверка не смогла спросить (asked=False) — бронь
+    держится, второй запуск отказан «уже идёт»; подтверждённая пустота
+    (asked=True) бронь снимает."""
+    _launch_config(monkeypatch)
+    lost = cursor_cloud.Refusal(status=0, detail="ReadTimeout")
+    human_id = await _human(db)
+
+    async def _blind(_name, pages=3):
+        return cursor_cloud.Reconciliation("", "", False)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _blind)
+    calls = _creator(monkeypatch, [lost])
+    project, task_id = await _launch_project(db, slug="exec-blind")
+    first = await el.launch_executor(db, project, issuer_principal_id=human_id)
+    assert not first.launched
+    rows = [dict(r) for r in await repo.list_executor_runs(db, task_id)]
+    assert [r["outcome"] for r in rows] == ["running"], "бронь не снята вслепую"
+    second = await el.launch_executor(db, project, issuer_principal_id=human_id)
+    assert second.reason.startswith(el.REASON_ALREADY_RUNNING), second
+    assert len(calls) == 1
+
+    async def _empty(_name, pages=3):
+        return cursor_cloud.Reconciliation("", "", True)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _empty)
+    _creator(monkeypatch, [lost])
+    project2, task2 = await _launch_project(db, slug="exec-empty")
+    refused = await el.launch_executor(db, project2, issuer_principal_id=human_id)
+    assert not refused.launched
+    rows = [dict(r) for r in await repo.list_executor_runs(db, task2)]
+    assert [r["outcome"] for r in rows] == ["failed"], (
+        "подтверждённая пустота снимает бронь"
+    )
+
+
+async def test_the_poller_keeps_the_blind_loss_reason(db, monkeypatch):
+    """Находка ревью #1439: поллер не затирает причину слепой брони общим
+    «нечего опрашивать» — строка прогона говорит правду до срока брони."""
+    _launch_config(monkeypatch)
+    lost = cursor_cloud.Refusal(status=0, detail="ReadTimeout")
+
+    async def _blind(_name, pages=3):
+        return cursor_cloud.Reconciliation("", "", False)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _blind)
+    _creator(monkeypatch, [lost])
+    project, task_id = await _launch_project(db, slug="exec-blind-poll")
+    await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    await poll_executor_runs(db)
+
+    row = dict((await repo.list_executor_runs(db, task_id))[0])
+    assert row["outcome"] == "running"
+    assert row["reason"].startswith(el.REASON_ANSWER_BLIND), row["reason"]
