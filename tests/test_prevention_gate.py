@@ -635,3 +635,49 @@ async def test_no_rules_no_section(client, db):
     other = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
     assert other["catalogue_rules"] == []
     assert "category_checks" not in await _brief_text(other)
+
+
+async def test_rule_area_is_where_the_class_was_met(client, db):
+    # The rule's area has three sources, each enough on its own: the areas of
+    # a task whose finding carried the class, the file the finding named, and
+    # the areas of the defect that named the rule. A rule no defect bought
+    # says so rather than leaving the link blank.
+    await _finding_in(db, ["hub/web.py"], "naming")
+    await repo.upsert_category_check(db, category="naming", check_ref="ruff N")
+    file_task = await _defect(db, found_in="unknown", status="completed")
+    await repo.insert_machine_review(
+        db,
+        task_id=file_task,
+        submission_generation=1,
+        harness_skill="multi-agent-review",
+        raw_count=1,
+        findings_confirmed=json.dumps(
+            [{"title": "t", "category": "styling", "file": "./hub/cli.py:12"}]
+        ),
+        incomplete=False,
+    )
+    await repo.upsert_category_check(db, category="styling", check_ref="ruff E")
+    await repo.upsert_category_check(db, category="locks", check_ref="t::locks")
+    await db.commit()
+    defect = await _defect(db)
+    await _with_areas(db, defect, ["hub/poller.py"])
+    closed = await _done(client, defect, {"kind": "rule", "ref": "locks"})
+    assert closed.status_code in (200, 201), closed.text
+
+    briefs: list[dict] = []
+
+    async def rules_for(areas: list[str]) -> dict[str, dict]:
+        task_id = await _defect(db, found_in="unknown", status="review")
+        await _with_areas(db, task_id, areas)
+        brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+        briefs.append(brief)
+        return {r["category"]: r for r in brief["catalogue_rules"]}
+
+    by_task_area = await rules_for(["hub/web.py"])
+    assert set(by_task_area) == {"naming"}
+    assert by_task_area["naming"]["source_defects"] == []
+    assert "no defect recorded" in await _brief_text(briefs[-1])
+    assert set(await rules_for(["hub/cli.py"])) == {"styling"}
+    assert set(await rules_for(["hub/poller.py"])) == {"locks"}
+    # A directory area holds the files under it.
+    assert set(await rules_for(["hub"])) == {"naming", "styling", "locks"}

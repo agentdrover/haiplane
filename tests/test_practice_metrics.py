@@ -1425,6 +1425,31 @@ async def test_repeat_before_rule_is_not_a_breach(db: aiosqlite.Connection):
     assert report["breached"] == []
 
 
+async def test_carried_over_copy_is_not_a_second_breach(db: aiosqlite.Connection):
+    # A report re-attached over a base-only merge (#1361) is the same finding,
+    # not another return of the class.
+    await _rule_set_up(db, "timeouts", _ts(48))
+    await _finding_at(db, "after", "timeouts", _ts(24))
+    [original] = await db.execute_fetchall("SELECT id FROM machine_reviews")
+    await repo.insert_machine_review(
+        db,
+        task_id=1,
+        submission_generation=2,
+        harness_skill="multi-agent-review",
+        raw_count=1,
+        findings_confirmed=json.dumps([{"title": "after", "category": "timeouts"}]),
+        incomplete=False,
+    )
+    await db.execute(
+        "UPDATE machine_reviews SET carried_from_review_id=? WHERE id != ?",
+        (original["id"], original["id"]),
+    )
+    await db.commit()
+
+    [row] = (await practice_metrics(db))["rule_breaches"]["breached"]
+    assert row["breaches"] == 1
+
+
 async def test_rule_date_migration_on_clean_and_populated_base():
     # #920 schema: a base with rules from before the column gets their set-up
     # date from the earliest record event, never later than recorded_at; a
