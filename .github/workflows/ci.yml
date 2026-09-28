@@ -380,6 +380,8 @@ jobs:
           ROLLOUT_OUTCOME: ${{ steps.rollout.outcome }}
           DEPLOYED_SHA: ${{ github.sha }}
           DEPLOYED_REF: ${{ github.ref_name }}
+          # Project slug for the release row (#1453); unset or empty -> default.
+          DEPLOYED_PROJECT: ${{ vars.HAIPLANE_HUB_PROJECT || 'default' }}
         run: |
           if [ -z "$HAIPLANE_HUB_URL" ] || [ -z "$HAIPLANE_HUB_CI_TOKEN" ]; then
             echo "::notice::Hub secrets absent — deploy not reported (fork or clone)"
@@ -394,7 +396,7 @@ jobs:
             -X POST "$HAIPLANE_HUB_URL/api/deploys" \
             -H "Authorization: Bearer $HAIPLANE_HUB_CI_TOKEN" \
             -H 'Content-Type: application/json' \
-            -d "{\"sha\":\"$DEPLOYED_SHA\",\"ref\":\"$DEPLOYED_REF\",\"status\":\"$STATUS\"}" \
+            -d "{\"sha\":\"$DEPLOYED_SHA\",\"ref\":\"$DEPLOYED_REF\",\"status\":\"$STATUS\",\"project\":\"$DEPLOYED_PROJECT\"}" \
           ) || code=000
           if [ "$code" != "200" ]; then
             echo "::warning::Hub did not record the deploy (HTTP $code): $(cat /tmp/deploy-callback.out)"
