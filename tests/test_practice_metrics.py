@@ -1329,6 +1329,158 @@ async def test_debt_blocks_nothing_and_says_so_when_empty(
         assert (await practice_metrics(fresh))["category_debt"] == []
 
 
+# --- A rule that did not hold (#920) ------------------------------------------
+#
+# A class closed by a named check (#878) should stop coming back. Whether it
+# did is only visible against the date the rule was set up: a finding of the
+# class AFTER that date is a breach, one BEFORE it is the history the rule was
+# written from.
+
+
+async def _finding_at(db, title: str, category: str, when: str) -> int:
+    task_id = await _task(db, title=title)
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        harness_skill="multi-agent-review",
+        raw_count=1,
+        findings_confirmed=json.dumps(
+            [{"title": title, "severity": "high", "category": category}]
+        ),
+        incomplete=False,
+    )
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=? WHERE task_id=?", (when, task_id)
+    )
+    return task_id
+
+
+async def _rule_set_up(db, category: str, when: str) -> None:
+    await services.record_category_check(
+        db, category=category, check_ref=f"tests/test_x.py::test_{category}"
+    )
+    await db.execute(
+        "UPDATE category_checks SET created_at=?, recorded_at=? WHERE category=?",
+        (when, when, category),
+    )
+    await db.commit()
+
+
+async def test_repeat_after_rule_is_reported(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # AC-3: the class came back after its check was named; the report shows the
+    # rule as breached, with the date it was set up.
+    rule_date = _ts(48)
+    await _finding_at(db, "before", "timeouts", _ts(72))
+    await _rule_set_up(db, "timeouts", rule_date)
+    after = await _finding_at(db, "after", "timeouts", _ts(24))
+    await db.commit()
+
+    report = (await practice_metrics(db))["rule_breaches"]
+    assert report["rules_total"] == 1
+    [row] = report["breached"]
+    assert row["category"] == "timeouts"
+    assert row["check_ref"] == "tests/test_x.py::test_timeouts"
+    assert row["rule_created_at"] == rule_date
+    assert row["breaches"] == 1
+    assert row["task_ids"] == [after]
+
+    # Re-recording a better check replaces the check, not the date the rule
+    # was set up: the class was already promised closed from the first one.
+    await services.record_category_check(
+        db, category="timeouts", check_ref="tests/test_y.py::test_better"
+    )
+    [again] = (await practice_metrics(db))["rule_breaches"]["breached"]
+    assert again["rule_created_at"] == rule_date
+    assert again["check_ref"] == "tests/test_y.py::test_better"
+
+    page = (await client.get("/metrics")).text
+    assert "test_better" in page and rule_date[:10] in page
+
+    from unittest.mock import AsyncMock, patch
+
+    from hub import mcp_server
+
+    data = await practice_metrics(db)
+    with patch.object(mcp_server, "_api_get", AsyncMock(return_value=data)):
+        result = await mcp_server.hub_practice_metrics()
+    text = result.content[0].text
+    assert "timeouts" in text and rule_date[:10] in text
+
+
+async def test_repeat_before_rule_is_not_a_breach(db: aiosqlite.Connection):
+    # AC-4: findings of the class from before the rule are what the rule was
+    # written from — counting them would call every new rule broken on day one.
+    await _finding_at(db, "one", "timeouts", _ts(96))
+    await _finding_at(db, "two", "timeouts", _ts(72))
+    await _rule_set_up(db, "timeouts", _ts(48))
+    # Another class after the date breaches nothing of this rule.
+    await _finding_at(db, "other", "naming", _ts(24))
+    await db.commit()
+
+    report = (await practice_metrics(db))["rule_breaches"]
+    assert report["rules_total"] == 1
+    assert report["breached"] == []
+
+
+async def test_rule_date_migration_on_clean_and_populated_base():
+    # #920 schema: a base with rules from before the column gets their set-up
+    # date from the earliest record event, never later than recorded_at; a
+    # second run changes nothing; a clean base just gets the column.
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.executescript(_SCHEMA)
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, "
+            "applied_at TEXT DEFAULT (datetime('now')))"
+        )
+        for name, sql in _MIGRATIONS:
+            if name == "add_category_checks_created_at":
+                break
+            try:
+                await conn.execute(sql)
+            except Exception:  # noqa: BLE001 - column already in _SCHEMA
+                pass
+            await conn.execute("INSERT INTO _migrations (name) VALUES (?)", (name,))
+        await conn.execute(
+            "INSERT INTO category_checks (category, check_ref, recorded_at) "
+            "VALUES ('timeouts', 'a', '2026-08-20 10:00:00'), "
+            "('naming', 'b', '2026-08-21 10:00:00')"
+        )
+        await conn.execute(
+            "INSERT INTO events (kind, payload, created_at) VALUES "
+            "('category_check_recorded', '{\"category\": \"timeouts\"}', "
+            "'2026-08-01 09:00:00'), "
+            "('category_check_recorded', 'not json', '2026-07-01 09:00:00')"
+        )
+        await conn.commit()
+        await _migrate(conn)
+        await _migrate(conn)
+        rows = {
+            r["category"]: r["created_at"]
+            for r in await conn.execute_fetchall(
+                "SELECT category, created_at FROM category_checks"
+            )
+        }
+        assert rows == {
+            "timeouts": "2026-08-01 09:00:00",
+            "naming": "2026-08-21 10:00:00",
+        }
+    finally:
+        await conn.close()
+
+    async with aiosqlite.connect(":memory:") as fresh:
+        fresh.row_factory = aiosqlite.Row
+        await fresh.executescript(_SCHEMA)
+        await _migrate(fresh)
+        await repo.upsert_category_check(fresh, category="x", check_ref="c")
+        [row] = await fresh.execute_fetchall("SELECT * FROM category_checks")
+        assert row["created_at"], "a new rule is dated on its first record"
+
+
 async def test_provider_cost_per_run_split_by_profile(db: aiosqlite.Connection):
     # AC-4 (#893): the number a profile decision rests on is what ONE run of
     # it bills. Measured, lite averaged 1.38M and deep 3.85M — a 2.8x gap,

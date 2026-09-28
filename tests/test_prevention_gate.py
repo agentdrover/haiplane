@@ -532,3 +532,106 @@ def test_cli_update_refuses_bad_prevention_json():
     with patch("hub.cli._api") as api:
         assert args.func(args) == 2
     api.assert_not_called()
+
+
+# --- #920: the rule reaches the review brief --------------------------------
+#
+# A rule recorded in category_checks and named by a closed defect is worth
+# something only when the next reviewer in the same area reads it. The rule
+# has no area column: its area is where its class was actually met — the
+# areas of the tasks whose confirmed findings carry the category, and of the
+# defect that named the rule — so a rule reaches a brief whose task touches
+# one of those areas, and nowhere else.
+
+_RULE_AREA = "hub/services/lifecycle.py"
+
+
+async def _with_areas(db, task_id: int, areas: list[str]) -> None:
+    await db.execute(
+        "UPDATE tasks SET affected_areas=? WHERE id=?", (json.dumps(areas), task_id)
+    )
+    await db.commit()
+
+
+async def _finding_in(db, areas: list[str], category: str) -> int:
+    """A task in ``areas`` whose confirmed review finding carries ``category``."""
+    task_id = await _defect(db, found_in="unknown", status="completed")
+    await _with_areas(db, task_id, areas)
+    await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        harness_skill="multi-agent-review",
+        raw_count=1,
+        findings_confirmed=json.dumps(
+            [{"title": "lock held", "severity": "high", "category": category}]
+        ),
+        incomplete=False,
+    )
+    await db.commit()
+    return task_id
+
+
+async def _brief_text(brief: dict) -> str:
+    from hub import mcp_server
+
+    with patch.object(mcp_server, "_api_get", AsyncMock(return_value=brief)):
+        result = await mcp_server.hub_get_review_brief(brief["task_id"])
+    return result.content[0].text
+
+
+async def test_rule_reaches_review_brief(client, db):
+    # AC-1: the class was met in this area, a prod defect was closed with it as
+    # its rule; the next brief in the area carries the rule, its check and the
+    # defect that bought it.
+    await _finding_in(db, [_RULE_AREA], "timeouts")
+    recorded = await client.post(
+        "/api/metrics/category-checks",
+        json={"category": "timeouts", "check_ref": "tests/test_poller.py::test_ttl"},
+    )
+    assert recorded.status_code == 200, recorded.text
+    defect = await _defect(db)
+    await _with_areas(db, defect, [_RULE_AREA])
+    closed = await _done(client, defect, {"kind": "rule", "ref": "timeouts"})
+    assert closed.status_code in (200, 201), closed.text
+
+    task_id = await _defect(db, found_in="unknown", status="review")
+    await _with_areas(db, task_id, [_RULE_AREA, "tests/test_poller.py"])
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief")
+    assert resp.status_code == 200, resp.text
+    brief = resp.json()
+
+    rules = brief["catalogue_rules"]
+    assert [r["category"] for r in rules] == ["timeouts"]
+    rule = rules[0]
+    assert rule["check_ref"] == "tests/test_poller.py::test_ttl"
+    assert [d["task_id"] for d in rule["source_defects"]] == [defect]
+    assert rule["matched_areas"] == [_RULE_AREA]
+    assert rule["created_at"], "the rule says since when it stands"
+
+    text = await _brief_text(brief)
+    assert "category_checks" in text
+    assert "tests/test_poller.py::test_ttl" in text
+    assert f"#{defect}" in text
+
+
+async def test_no_rules_no_section(client, db):
+    # AC-2: a catalogue with no rule for the task's area leaves no trace in the
+    # brief — no header over an empty list, which would read as "checked, the
+    # area is clean".
+    task_id = await _defect(db, found_in="unknown", status="review")
+    await _with_areas(db, task_id, ["hub/web.py"])
+
+    empty = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert empty["catalogue_rules"] == []
+    assert "category_checks" not in await _brief_text(empty)
+
+    # A rule elsewhere is still not a rule of this area.
+    await _finding_in(db, [_RULE_AREA], "timeouts")
+    await repo.upsert_category_check(
+        db, category="timeouts", check_ref="tests/test_poller.py::test_ttl"
+    )
+    await db.commit()
+    other = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert other["catalogue_rules"] == []
+    assert "category_checks" not in await _brief_text(other)

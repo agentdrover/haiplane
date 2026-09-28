@@ -2329,6 +2329,35 @@ def _brief_statement_lines(brief: dict[str, Any]) -> list[str]:
     return parts
 
 
+def _brief_rules_lines(brief: dict[str, Any]) -> list[str]:
+    """Catalogue rules of the task's area (#920); nothing at all when none.
+
+    No header over an empty list: "rules: none" would read as "the area was
+    checked and is clean", when it only means no rule was ever set up here.
+    """
+    rules = brief.get("catalogue_rules") or []
+    if not rules:
+        return []
+    parts = [
+        "\nRules from the catalogue (category_checks) for this area — "
+        "classes already paid for; check they did not come back:"
+    ]
+    for rule in rules:
+        defects = rule.get("source_defects") or []
+        source = (
+            ", ".join(f"#{d['task_id']} {d.get('title', '')}".rstrip() for d in defects)
+            if defects
+            else "no defect recorded (rule from the recurrence debt, #878)"
+        )
+        parts.append(
+            f"  - {rule['category']} → check: {rule['check_ref']} "
+            f"| since {str(rule.get('created_at') or '?')[:10]} "
+            f"| defect: {source} "
+            f"| area: {', '.join(rule.get('matched_areas') or [])}"
+        )
+    return parts
+
+
 def _brief_evidence_lines(brief: dict[str, Any]) -> list[str]:
     """Base-merge divergence (#1233) and the coverage verdict over the blocks.
 
@@ -2411,6 +2440,7 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
                 f"| Then: {ac.get('then', '')}"
             )
     parts.extend(_brief_statement_lines(brief))
+    parts.extend(_brief_rules_lines(brief))
     if brief.get("branch"):
         pr = f" | PR #{brief['pr_number']}" if brief.get("pr_number") else ""
         parts.append(f"\nBranch: {brief['branch']}{pr}")
@@ -3553,6 +3583,24 @@ def _change_failure_lines(data: dict) -> list[str]:
     ]
 
 
+def _rule_breach_lines(report: dict[str, Any]) -> list[str]:
+    """Catalogue rules whose class came back after they were set up (#920)."""
+    total = int(report.get("rules_total") or 0)
+    breached = report.get("breached") or []
+    if not total:
+        return []
+    if not breached:
+        return [f"Catalogue rules: {total}, none breached since set up"]
+    return [
+        f"Catalogue rules breached: {len(breached)} of {total} — "
+        + "; ".join(
+            f"{r['category']} (set up {str(r.get('rule_created_at') or '?')[:10]}, "
+            f"{r['breaches']} finding(s) after, check {r['check_ref']})"
+            for r in breached[:5]
+        )
+    ]
+
+
 @mcp.tool()
 async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
     """Practice metrics (#384): machine-review economics, harness-version
@@ -3647,6 +3695,7 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
     )
     lines.append(_defect_clocks_line(data.get("prod_defect_clocks") or {}))
     lines.extend(_change_failure_lines(data))
+    lines.extend(_rule_breach_lines(data.get("rule_breaches") or {}))
     recurring = [c for c in data.get("recurring_categories", []) if c.get("recurring")]
     if recurring:
         lines.append(
