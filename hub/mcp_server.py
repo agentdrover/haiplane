@@ -3524,6 +3524,29 @@ def _defect_clocks_line(clocks: dict) -> str:
     )
 
 
+def _cfr_part(row: dict) -> str:
+    counts = f"({row.get('failed_deploys', 0)}/{row.get('deploys', 0)} deploys)"
+    if row.get("small_sample"):
+        return f"{row.get('project')} small sample {counts}"
+    return f"{row.get('project')} {round((row.get('rate') or 0) * 100, 1)}% {counts}"
+
+
+def _change_failure_lines(data: dict) -> list[str]:
+    """#918: CFR with its denominator; measured and reconstructed escapes apart."""
+    cfr = data.get("change_failure_rate") or {}
+    parts = [_cfr_part(row) for row in cfr.get("by_project") or []]
+    esc = data.get("escaped_defects") or {}
+    rec = esc.get("reconstructed") or {}
+    return [
+        "Change failure rate: "
+        + ("; ".join(parts) if parts else "— (no successful deploys in window)")
+        + f"; {cfr.get('defects_without_release', 0)} prod defect(s) without release",
+        f"Escaped to prod (measured, found_in): {esc.get('escaped', 0)}; "
+        f"reconstructed by completed_at, {rec.get('label', '')}: "
+        f"{rec.get('escaped', 0)}",
+    ]
+
+
 @mcp.tool()
 async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
     """Practice metrics (#384): machine-review economics, harness-version
@@ -3617,6 +3640,7 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
         )
     )
     lines.append(_defect_clocks_line(data.get("prod_defect_clocks") or {}))
+    lines.extend(_change_failure_lines(data))
     recurring = [c for c in data.get("recurring_categories", []) if c.get("recurring")]
     if recurring:
         lines.append(

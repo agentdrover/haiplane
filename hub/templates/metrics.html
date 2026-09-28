@@ -121,12 +121,13 @@ latency и размер ответов — на отдельной страни�
 <p class="muted">Главная названная причина: {{ e.reconciliation.main_cause }}.</p>
 {% endif %}
 
-<h3>Эскейпы и непосчитанное (#528)</h3>
+<h3>Эскейпы и непосчитанное (#528, #918)</h3>
 <table class="task-table">
     <tbody>
-        <tr><td>Багов на закрытые фичи</td><td>{{ e.escapes.escaped }} из {{ e.escapes.bugs_in_window }}</td></tr>
-        <tr><td>Непосчитано: багов без фичи-предка</td><td>{{ e.escapes.uncounted.bugs_without_feature }}</td></tr>
-        <tr><td>Непосчитано: закрытых фич без отметки завершения</td><td>{{ e.escapes.uncounted.features_without_completion }}</td></tr>
+        <tr><td>Утечек в прод, измерено (found_in=prod)</td><td>{{ e.escapes.escaped }}</td></tr>
+        <tr><td>Реконструкция: багов без found_in на закрытые фичи</td><td>{{ e.escapes.reconstructed.escaped }} из {{ e.escapes.reconstructed.bugs_in_window }}</td></tr>
+        <tr><td>Реконструкция, непосчитано: багов без фичи-предка</td><td>{{ e.escapes.reconstructed.uncounted.bugs_without_feature }}</td></tr>
+        <tr><td>Реконструкция, непосчитано: закрытых фич без отметки завершения</td><td>{{ e.escapes.reconstructed.uncounted.features_without_completion }}</td></tr>
     </tbody>
 </table>
 
@@ -462,7 +463,7 @@ lite в среднем 1.38M, deep 3.85M. Столбец Tokens рядом — �
     </tbody>
 </table>
 
-<h2>Escaped defects: баги на уже закрытые фичи</h2>
+<h2>Escaped defects: утечки в прод</h2>
 <p class="muted">Recurring-категории показывают пойманное — находки, остановленные
 на гейте. Здесь обратная сторона: баг, заведённый уже после закрытия своей фичи,
 то есть дефект, который ревью пропустило. Признак считается только там, где обе
@@ -476,23 +477,34 @@ lite в среднем 1.38M, deep 3.85M. Столбец Tokens рядом — �
 ровно та подмена, которую убрали из cycle time (#810). Пока непосчитанного
 больше, чем посчитанного, итоговое число говорит не о качестве ревью, а о том,
 насколько заполнены поля.</p>
+<p class="muted">С #918 два числа, и они не складываются. «Измерено» — задачи
+с записанным found_in=prod, заведённые в окне: фича-предок и дата её закрытия для
+них не нужны. «Реконструкция» — прежний вывод по completed_at фичи-предка, и
+только для багов, у которых found_in не записан: баг с записанной стадией
+отвечает своей стадией, а не датами. Бэкфилла стадии для старых багов нет, так
+что реконструкция убывает сама, по мере того как окно уходит вперёд.</p>
+{% set ed = m.escaped_defects %}
+{% set rd = ed.reconstructed %}
 <table class="task-table">
     <thead><tr><th>Показатель</th><th>Значение</th></tr></thead>
     <tbody>
-        <tr><td>Утечек посчитано</td>
-            <td>{{ m.escaped_defects.escaped }}</td></tr>
-        <tr><td>Багов в окне</td>
-            <td>{{ m.escaped_defects.bugs_in_window }}</td></tr>
-        <tr><td>Багов без фичи-предка</td>
-            <td>{% if m.escaped_defects.bugs_without_feature %}{{ m.escaped_defects.bugs_without_feature }}{% else %}—{% endif %}</td></tr>
-        <tr><td>Закрытых фич без отметки завершения</td>
-            <td>{% if m.escaped_defects.features_without_completion %}{{ m.escaped_defects.features_without_completion }}{% else %}—{% endif %}</td></tr>
+        <tr><td>Утечек в прод, измерено <span class="muted">(found_in=prod)</span></td>
+            <td data-metric="escaped_defects.escaped">{{ ed.escaped }}</td></tr>
+        <tr><td>Реконструкция: утечек по completed_at
+            <span class="muted">({{ rd.label }}, баги без found_in)</span></td>
+            <td data-metric="escaped_defects.reconstructed.escaped">{{ rd.escaped }}</td></tr>
+        <tr><td>Реконструкция: багов без found_in в окне</td>
+            <td>{{ rd.bugs_in_window }}</td></tr>
+        <tr><td>Реконструкция: багов без фичи-предка</td>
+            <td>{% if rd.bugs_without_feature %}{{ rd.bugs_without_feature }}{% else %}—{% endif %}</td></tr>
+        <tr><td>Реконструкция: закрытых фич без отметки завершения</td>
+            <td>{% if rd.features_without_completion %}{{ rd.features_without_completion }}{% else %}—{% endif %}</td></tr>
     </tbody>
 </table>
 <table class="task-table">
-    <thead><tr><th>Фича-источник</th><th>Утечек</th></tr></thead>
+    <thead><tr><th>Фича-источник <span class="muted">(реконструкция)</span></th><th>Утечек</th></tr></thead>
     <tbody>
-        {% for f in m.escaped_defects.features %}
+        {% for f in rd.features %}
         <tr><td><a href="/tasks/{{ f.feature_id }}">#{{ f.feature_id }} {{ f.title }}</a></td>
             <td>{{ f.bugs }}</td></tr>
         {% else %}
@@ -517,6 +529,29 @@ lite в среднем 1.38M, deep 3.85M. Столбец Tokens рядом — �
             <td>{% if c.unmeasurable_total %}{{ c.unmeasurable_total }}:
                 {% for reason, n in c.unmeasurable.items() %}{{ reason }} {{ n }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}—{% endif %}</td>
             <td>{% if c.median_hours is not none %}{{ c.median_hours }}{% else %}<span class="muted">нет измеримых</span>{% endif %}</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h2>Change failure rate (#918)</h2>
+{% set cfr = m.change_failure_rate %}
+<p class="muted">Доля успешных выкатов окна, к которым привязан хотя бы один
+прод-дефект (found_in=prod с release_id на этот релиз). Знаменатель — число
+выкатов, он стоит рядом с долей. Выкаты без проекта относятся к проекту default
+(#915). Меньше {{ cfr.min_sample }} выкатов — малая выборка, доля не
+показывается. Прод-дефектов окна без привязки к релизу:
+{{ cfr.defects_without_release }} — они ни на один выкат не указывают и в долю не
+входят.</p>
+<table class="task-table">
+    <thead><tr><th>Проект</th><th>Выкатов</th><th>С прод-дефектом</th><th>CFR</th></tr></thead>
+    <tbody>
+        {% for r in cfr.by_project %}
+        <tr><td>{{ r.project }}</td>
+            <td data-metric="change_failure_rate.{{ r.project }}.deploys">{{ r.deploys }}</td>
+            <td>{{ r.failed_deploys }}</td>
+            <td>{% if r.small_sample %}<span class="muted">малая выборка</span>{% else %}{{ (r.rate * 100) | round(1) }}%{% endif %}</td></tr>
+        {% else %}
+        <tr><td colspan="4"><span class="muted">успешных выкатов в окне нет</span></td></tr>
         {% endfor %}
     </tbody>
 </table>
