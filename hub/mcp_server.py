@@ -1243,6 +1243,25 @@ async def hub_list_dependencies(task_id: int) -> CallToolResult:
     return structured_echo_result(_format_dependency_edges(edges), dependencies=edges)
 
 
+def _cause_suggestion_line(task: dict[str, Any]) -> str:
+    """The defect's release and culprit HYPOTHESIS, never read as caused_by (#917)."""
+    suggestion = task.get("cause_suggestion")
+    if task.get("release_id") is None or not suggestion:
+        return ""
+    head = f"Release: #{task['release_id']}; гипотеза о виновнике"
+    unmatched = int(suggestion.get("unmatched_rows") or 0)
+    tail = f"; вне состава {unmatched} несопоставимых мержей" if unmatched else ""
+    candidates = suggestion.get("candidates") or []
+    if not candidates:
+        return f"{head}: нет — {suggestion.get('reason', '')}{tail}"
+    names = ", ".join(
+        f"#{c['task_id']}{' (подтверждён)' if c.get('confirmed') else ''}"
+        f" [{'; '.join(c.get('overlap') or [])}]"
+        for c in candidates
+    )
+    return f"{head}: {names}{tail}"
+
+
 @mcp.tool()
 async def hub_task_status(task_id: int) -> HubTaskStatusResult:
     """Get detailed status of a specific task including updates and log tail.
@@ -1270,6 +1289,7 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
     if task.get("worktree_path"):
         parts.append(f"Worktree: {task['worktree_path']}")
     parts.extend(_dependency_lines(task))
+    parts.extend(filter(None, [_cause_suggestion_line(task)]))
     if task.get("description"):
         parts.append(f"\nDescription:\n{task['description']}")
     if task.get("technical_hints"):
@@ -4450,6 +4470,7 @@ PREPARE_HIDDEN: tuple[Hidden, ...] = (
     Hidden("caused_by_task_id", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("detected_at", "паспорт дефекта (#910), а не поле доводки"),
     Hidden("clear_caused_by", "флаг очистки паспорта дефекта, а не поле"),
+    Hidden("release_id", "паспорт дефекта (#917): релиз, а не поле доводки"),
     Hidden("live_probe", "объявление живого зонда (#1236) правят через refine"),
     # #1236 заплатил этими двумя за новый параметр постановки: схема каталога
     # стояла в пяти символах от потолка, а потолок двигается только вниз.
@@ -4736,7 +4757,6 @@ async def hub_refine_task(
     """PATCH a task's structured fields (Definition of Ready inputs).
 
     Only fields you pass are written; every list REPLACES the stored one.
-    Mirrors POST /api/tasks/{id}/refine.
 
     Args:
         task_id: Task to refine.
@@ -4771,7 +4791,7 @@ async def hub_refine_task(
         human_reviewer: Who accepts the result.
         acceptance_criteria: Full AC replacement (REST refine shape).
         risks: Full replacement (TaskRisk shape).
-        include_task: Echo the whole task back too; off by default.
+        include_task: Echo the whole task back.
     """
     # Один источник вместо двух списков. До #1068 поля были выписаны и в
     # сигнатуре, и здесь, а комментарий рядом называл цену расхождения:

@@ -2333,6 +2333,36 @@ _MIGRATIONS: list[tuple[str, str]] = [
     ),
     # Строки #1413 стоят до блока #1434 намеренно: его тест требует свои
     # миграции последними, а применение идёт по имени — порядок не важен.
+    # #917 стоит здесь по той же причине.
+    (
+        # #917 (F5): релиз, в котором проявился дефект. Ссылка на строку
+        # releases, а не sha: «что работало в проде» уже записано там (#495),
+        # и второй копии факта расходиться не с чем. NULL — «не указан», а не
+        # «ни в каком»; #915 заполняет её при заведении прод-дефекта.
+        "add_tasks_release_id",
+        "ALTER TABLE tasks ADD COLUMN release_id INTEGER REFERENCES releases(id)",
+    ),
+    (
+        "idx_tasks_release_id",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_release_id ON tasks(release_id)",
+    ),
+    (
+        # #917: предложенный машиной виновник — ГИПОТЕЗА, отдельно от
+        # tasks.caused_by_task_id, который ставит только явное подтверждение.
+        # Строка пишется один раз на тройку (дефект, кандидат, релиз) и не
+        # удаляется: доля подтверждённых предложений (outcome #917) считается
+        # по тому, что было предложено, а не по тому, что предлагается сейчас.
+        "create_defect_cause_suggestions",
+        """CREATE TABLE IF NOT EXISTS defect_cause_suggestions (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            defect_task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            candidate_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            release_id        INTEGER NOT NULL REFERENCES releases(id),
+            overlap           TEXT    NOT NULL DEFAULT '[]',
+            suggested_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (defect_task_id, candidate_task_id, release_id)
+        )""",
+    ),
     (
         # #1434 (F7): канал (cloud | slot) и имя слота — атрибуты выдачи кода
         # implementer. Пусто — канал не назван: код без канала работает как
@@ -2434,7 +2464,7 @@ def deserialize_risks(raw: str | None) -> list[dict[str, Any]]:
 # plain columns (#910). They travel through ``repo.set_defect_passport`` so the
 # causal link is resolved first; ``clear_caused_by`` is a verb, not a column.
 PASSPORT_REFINE_FIELDS = frozenset(
-    {"found_in", "caused_by_task_id", "detected_at", "clear_caused_by"}
+    {"found_in", "caused_by_task_id", "detected_at", "clear_caused_by", "release_id"}
 )
 
 # All list[str] columns serialized as JSON in TEXT.
@@ -2507,6 +2537,9 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     "caused_by_task_id",
     "detected_at",
     "resolved_at",
+    # #917: the release the defect showed up in — resolved against releases
+    # by ``repo.set_defect_passport`` before it lands, like caused_by above.
+    "release_id",
 )
 
 

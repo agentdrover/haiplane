@@ -78,6 +78,7 @@ STATEMENT_FIELDS: tuple[str, ...] = (
     "found_in",
     "caused_by_task_id",
     "detected_at",
+    "release_id",
     "scope_in",
     "scope_out",
     "affected_areas",

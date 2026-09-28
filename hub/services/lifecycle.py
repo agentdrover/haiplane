@@ -761,6 +761,12 @@ async def enrich_task_view(
         task_dict = dict(row)
         task_view.lifecycle_hint = compute_lifecycle_hint(task_dict)
         task_view.outcome_status = await outcome_status_for_task(db, task_dict)
+        # #917: single-task read only, and only for a defect with a release —
+        # lists must not pay for a join most tasks do not need (#485).
+        if task_dict.get("release_id") is not None:
+            from hub.services.defect_release import suggest_causes
+
+            task_view.cause_suggestion = await suggest_causes(db, task_view.id)
 
     # #1235: круг ревью читается ТОЙ ЖЕ функцией, которой его считают бриф и
     # сигнал. Второе выражение того же счёта здесь означало бы, что карточка

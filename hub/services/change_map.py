@@ -56,6 +56,20 @@ def _in_declared_areas(path: str, areas: list[str]) -> bool:
     return False
 
 
+def areas_overlap(first: str, second: str) -> bool:
+    """Do two declared areas share files — does either contain the other? (#917)
+
+    The same literal reading as ``_in_declared_areas``, applied both ways:
+    ``hub/templates`` and ``hub/templates/task_detail.html`` overlap, while
+    ``hub/web.py`` and ``hub/web_extra.py`` do not.
+    """
+    a = (first or "").strip().strip("/")
+    b = (second or "").strip().strip("/")
+    if not a or not b:
+        return False
+    return _in_declared_areas(a, [b]) or _in_declared_areas(b, [a])
+
+
 def _finding_paths(findings: list[Any]) -> set[str]:
     """Files a confirmed review finding points at (#808 carries file:line)."""
     paths: set[str] = set()

@@ -35,6 +35,9 @@ _MINE = {
 
 
 async def _default_project(db: aiosqlite.Connection) -> int:
+    await db.execute(
+        "INSERT OR IGNORE INTO projects (slug, name) VALUES ('default', 'default')"
+    )
     rows = await db.execute_fetchall("SELECT id FROM projects WHERE slug='default'")
     return int(rows[0]["id"])
 
@@ -307,9 +310,7 @@ async def test_suggestions_are_recorded_once(db):
 def test_cli_refine_builds_release_payload():
     from hub.cli import _build_refine_payload
 
-    assert _build_refine_payload(argparse.Namespace(release_id=7)) == {
-        "release_id": 7
-    }
+    assert _build_refine_payload(argparse.Namespace(release_id=7)) == {"release_id": 7}
 
 
 def test_cli_refine_parser_accepts_release_id():
@@ -388,7 +389,9 @@ async def test_migration_on_clean_and_filled_db_is_idempotent():
     clean = await _fresh(hub_db._MIGRATIONS)
     try:
         await hub_db._migrate(clean)
-        cols = {r["name"] for r in await clean.execute_fetchall("PRAGMA table_info(tasks)")}
+        cols = {
+            r["name"] for r in await clean.execute_fetchall("PRAGMA table_info(tasks)")
+        }
         assert "release_id" in cols
         tables = {
             r["name"]
@@ -408,7 +411,9 @@ async def test_migration_on_clean_and_filled_db_is_idempotent():
         )
         await filled.commit()
         await hub_db._migrate(filled)
-        await filled.execute("DELETE FROM _migrations WHERE name IN (?, ?, ?)", tuple(_MINE))
+        await filled.execute(
+            "DELETE FROM _migrations WHERE name IN (?, ?, ?)", tuple(_MINE)
+        )
         await hub_db._migrate(filled)
         rows = await filled.execute_fetchall("SELECT release_id FROM tasks")
         assert [r["release_id"] for r in rows] == [None]
