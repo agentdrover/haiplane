@@ -672,7 +672,9 @@ async def _bug(
 
 
 async def _escaped(db: aiosqlite.Connection, **kwargs) -> dict:
-    return (await practice_metrics(db, **kwargs))["escaped_defects"]
+    """The completed_at reconstruction (#528), kept since #918 as the second,
+    labelled number — the tests below are about how it is reconstructed."""
+    return (await practice_metrics(db, **kwargs))["escaped_defects"]["reconstructed"]
 
 
 async def test_bug_after_feature_close_is_escaped(db: aiosqlite.Connection):
@@ -836,6 +838,211 @@ async def test_page_says_nothing_measurable_instead_of_zero(
 
     page = (await client.get("/metrics")).text
     assert "нет измеримых утечек в этом окне" in page
+
+
+# --- Change failure rate and measured escapes (#918) ----------------------
+#
+# CFR = share of successful deploys in the window with at least one prod defect
+# bound to them through tasks.release_id (#917); the denominator travels with
+# the share. escaped_defects is measured from found_in='prod' (#909); the
+# completed_at walk stays as a separate, labelled reconstruction over bugs
+# whose found_in was never recorded.
+
+
+async def _deploy(
+    db: aiosqlite.Connection,
+    sha: str,
+    *,
+    project_id: int | None = None,
+    status: str = "success",
+    deployed: str = "-1 days",
+) -> int:
+    release_id = await repo.record_release(
+        db, deployed_sha=sha, project_id=project_id, status=status, source="ci"
+    )
+    await db.execute(
+        "UPDATE releases SET deployed_at=datetime('now', ?) WHERE id=?",
+        (deployed, release_id),
+    )
+    return release_id
+
+
+async def _defect(
+    db: aiosqlite.Connection,
+    *,
+    title: str,
+    found_in: str = "prod",
+    release_id: int | None = None,
+    parent_id: int | None = None,
+) -> int:
+    task_id = await _bug(db, title=title, parent_id=parent_id)
+    await db.execute(
+        "UPDATE tasks SET found_in=?, release_id=? WHERE id=?",
+        (found_in, release_id, task_id),
+    )
+    return task_id
+
+
+def _cfr_row(cfr: dict, project: str) -> dict:
+    rows = [r for r in cfr["by_project"] if r["project"] == project]
+    assert len(rows) == 1, cfr
+    return rows[0]
+
+
+async def test_change_failure_rate_and_restore_time(db: aiosqlite.Connection):
+    """AC-1: the share comes with its denominator, deploys without a project
+    belong to the default project (#915), and the defect that makes a deploy
+    failed is the same one whose restore clock is measured (#916)."""
+    spike = await repo.create_project(db, slug="spike", name="Spike")
+    releases = [await _deploy(db, f"{i:040x}") for i in range(1, 6)]
+    await _deploy(db, "a" * 40, deployed="-400 days")  # outside the window
+    await _deploy(db, "b" * 40, status="failed")  # never reached prod
+    other = await _deploy(db, "c" * 40, project_id=spike)
+
+    fixed = await _defect(db, title="broke the first", release_id=releases[0])
+    await _defect(db, title="broke it again", release_id=releases[0])
+    await _defect(db, title="broke the second", release_id=releases[1])
+    await _defect(
+        db, title="caught at review", found_in="review", release_id=releases[2]
+    )
+    await _defect(db, title="release unknown")
+    await _defect(db, title="spike broke", release_id=other)
+    await db.execute(
+        "UPDATE tasks SET detected_at=datetime('now', '-3 hours') WHERE id=?",
+        (fixed,),
+    )
+    await db.commit()
+    await repo.update_task(db, fixed, status="completed")
+    await db.commit()
+
+    metrics = await practice_metrics(db)
+    cfr = metrics["change_failure_rate"]
+    default = _cfr_row(cfr, "default")
+    assert default["deploys"] == 5, "only successful deploys of the window"
+    assert default["failed_deploys"] == 2, "two defects on one deploy count once"
+    assert default["rate"] == 0.4
+    assert default["small_sample"] is False
+    spike_row = _cfr_row(cfr, "spike")
+    assert (spike_row["deploys"], spike_row["failed_deploys"]) == (1, 1)
+    assert spike_row["small_sample"] is True, "fewer than min_sample deploys"
+    assert cfr["min_sample"] == 5
+    assert cfr["defects_without_release"] == 1, "counted apart, not dropped"
+
+    restore = metrics["prod_defect_clocks"]["time_to_restore"]
+    assert restore["measured"] == 1
+    assert 2.9 <= restore["median_hours"] <= 3.1
+
+
+async def test_escapes_counted_from_found_in(db: aiosqlite.Connection):
+    """AC-2: a prod defect without a feature ancestor is a measured escape,
+    not a bug lost in bugs_without_feature."""
+    await _defect(db, title="prod, under nothing")
+    await _defect(db, title="caught at review", found_in="review")
+    await _bug(db, title="old orphan, stage unknown", parent_id=None)
+    await db.commit()
+
+    escaped = (await practice_metrics(db))["escaped_defects"]
+    assert escaped["escaped"] == 1
+    assert escaped["source"] == "found_in"
+    reconstructed = escaped["reconstructed"]
+    assert reconstructed["bugs_in_window"] == 1, "only bugs without found_in"
+    assert reconstructed["bugs_without_feature"] == 1, "the unknown orphan only"
+
+
+async def test_reconstructed_escapes_labelled(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-3: the reconstructed number carries its label and sits apart from
+    the measured one — on the data, on the page and in the MCP text."""
+    feature_id = await _feature(db, title="closed feature", completed="-10 days")
+    await _bug(db, title="old bug, stage unknown", parent_id=feature_id)
+    await _defect(db, title="prod defect", parent_id=feature_id)
+    await db.commit()
+
+    escaped = (await practice_metrics(db))["escaped_defects"]
+    assert escaped["escaped"] == 1
+    assert escaped["reconstructed"]["escaped"] == 1
+    assert escaped["reconstructed"]["label"] == "реконструкция"
+
+    api = (await client.get("/api/metrics/practices")).json()["escaped_defects"]
+    assert (api["escaped"], api["reconstructed"]["escaped"]) == (1, 1)
+    assert api["reconstructed"]["label"] == "реконструкция"
+
+    econ = (await practice_metrics(db))["review_economy"]["escapes"]
+    assert econ["escaped"] == 1
+    assert econ["reconstructed"]["escaped"] == 1
+
+    page = (await client.get("/metrics")).text
+    assert 'data-metric="escaped_defects.escaped">1<' in page
+    assert 'data-metric="escaped_defects.reconstructed.escaped">1<' in page
+    assert "Утечек в прод, измерено" in page
+    assert "Реконструкция" in page
+
+
+async def test_mcp_practice_metrics_names_cfr_and_both_escapes():
+    from unittest.mock import AsyncMock, patch
+
+    from hub.mcp_server import hub_practice_metrics
+
+    data = {
+        "since_days": 90,
+        "change_failure_rate": {
+            "min_sample": 5,
+            "defects_without_release": 1,
+            "by_project": [
+                {
+                    "project": "default",
+                    "deploys": 5,
+                    "failed_deploys": 2,
+                    "rate": 0.4,
+                    "small_sample": False,
+                },
+                {
+                    "project": "spike",
+                    "deploys": 1,
+                    "failed_deploys": 1,
+                    "rate": 1.0,
+                    "small_sample": True,
+                },
+            ],
+        },
+        "escaped_defects": {
+            "escaped": 3,
+            "source": "found_in",
+            "reconstructed": {"label": "реконструкция", "escaped": 7},
+        },
+    }
+    with patch("hub.mcp_server._api_get", new_callable=AsyncMock) as get:
+        get.return_value = data
+        result = await hub_practice_metrics()
+    text = result.content[0].text
+    assert (
+        "Change failure rate: default 40.0% (2/5 deploys); "
+        "spike small sample (1/1 deploys); 1 prod defect(s) without release"
+    ) in text
+    assert "Escaped to prod (measured, found_in): 3; reconstructed" in text
+    assert "реконструкция: 7" in text
+
+
+def test_cli_change_failure_rate_prints_the_section(capsys):
+    import sys
+    from unittest.mock import patch
+
+    from hub import cli
+
+    cfr = {"min_sample": 5, "by_project": [], "defects_without_release": 0}
+    with (
+        patch.object(
+            sys, "argv", ["oc-hub", "change-failure-rate", "--since-days", "30"]
+        ),
+        patch.object(
+            cli, "_api", return_value={"since_days": 30, "change_failure_rate": cfr}
+        ) as api,
+    ):
+        rc = cli.main()
+    assert rc in (0, None)
+    assert api.call_args.args[:2] == ("GET", "/api/metrics/practices?since_days=30")
+    assert json.loads(capsys.readouterr().out) == cfr
 
 
 # --- What the findings turned out to be (#877, on #876's data) ---------------

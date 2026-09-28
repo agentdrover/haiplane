@@ -22,7 +22,11 @@ import aiosqlite
 from hub import brand, commit_scope, config
 from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
-from hub.services.defect_clocks import prod_defect_clocks
+from hub.services.defect_clocks import (
+    change_failure_rate,
+    measured_escapes,
+    prod_defect_clocks,
+)
 from hub.integrations import git_ops as git_ops_mod
 from hub.services.executor_dispatch import executor_run_metrics
 from hub.integrations.git_ops import (
@@ -941,7 +945,18 @@ async def practice_metrics(
         )
         profile_dicts.append(entry)
 
-    escaped = await _escaped_defect_metrics(db, since)
+    escaped = {
+        # #918: the headline is the recorded fact — found_in='prod' filed in
+        # the window. The completed_at walk (#528) stays beside it, restricted
+        # to bugs whose stage was never recorded and labelled as what it is,
+        # so the two numbers cannot be read as one.
+        "escaped": await measured_escapes(db, since),
+        "source": "found_in",
+        "reconstructed": {
+            "label": RECONSTRUCTED_ESCAPES_LABEL,
+            **await _escaped_defect_metrics(db, since),
+        },
+    }
 
     model_declarations = await _model_declaration_metrics(db, since)
     human_gates = await _human_gate_metrics(db, since)
@@ -979,6 +994,9 @@ async def practice_metrics(
         # #916: time-to-detect and time-to-restore of prod defects, from
         # recorded facts only; rows missing one are counted by reason.
         "prod_defect_clocks": await prod_defect_clocks(db, since),
+        # #918: share of successful deploys a prod defect points at, per
+        # project, with the deploy count beside the share.
+        "change_failure_rate": await change_failure_rate(db, since),
         "model_declarations": model_declarations,
         "human_gates": human_gates,
         # #1107: the shadow table lives BESIDE the other practice numbers,
@@ -1074,10 +1092,21 @@ async def _review_dispatch_spend_metrics(
     return dict(rows[0])
 
 
+# #918: the reconstruction reads only bugs whose stage was never recorded.
+_STAGE_UNRECORDED_SQL = "COALESCE(found_in, 'unknown') = 'unknown'"
+RECONSTRUCTED_ESCAPES_LABEL = "реконструкция"
+
+
 async def _escaped_defect_metrics(
     db: aiosqlite.Connection, since: str
 ) -> dict[str, Any]:
     """Bugs filed after their feature was closed — what review let through (#528).
+
+    Since #918 this is the RECONSTRUCTION, not the measurement: it only looks
+    at bugs whose ``found_in`` was never recorded (``unknown``). A bug with a
+    recorded stage is answered by that stage — ``prod`` is a measured escape,
+    anything else is not an escape — and walking its ancestry as well would
+    count one bug twice or contradict the record.
 
     Recurring categories count what the gate STOPPED. This counts what it
     missed, which is the only side of the ledger that can contradict a
@@ -1115,9 +1144,10 @@ async def _escaped_defect_metrics(
         # The ancestry walk stops at the first feature, so each bug contributes
         # its NEAREST feature and no other: a bug hanging under a task under a
         # feature is attributed to that feature, not to the epic above it.
-        "WITH RECURSIVE ancestry(bug_id, bug_created, node_id, depth) AS ("
+        "WITH RECURSIVE ancestry(bug_id, bug_created, node_id, depth) AS ("  # nosec B608 - constant SQL
         "  SELECT id, created_at, parent_id, 1 FROM tasks"
         "   WHERE work_type = 'bug' AND parent_id IS NOT NULL"
+        f"     AND {_STAGE_UNRECORDED_SQL}"
         "     AND created_at >= datetime('now', ?)"
         "  UNION ALL"
         "  SELECT a.bug_id, a.bug_created, t.parent_id, a.depth + 1"
@@ -1133,8 +1163,9 @@ async def _escaped_defect_metrics(
     )
     total_rows = await fetchall(
         db,
-        "SELECT COUNT(*) AS bugs FROM tasks "
-        "WHERE work_type = 'bug' AND created_at >= datetime('now', ?)",
+        "SELECT COUNT(*) AS bugs FROM tasks "  # nosec B608 - constant SQL
+        f"WHERE work_type = 'bug' AND {_STAGE_UNRECORDED_SQL} "
+        "AND created_at >= datetime('now', ?)",
         (since,),
     )
     bugs_in_window = total_rows[0]["bugs"] or 0
