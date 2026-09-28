@@ -745,6 +745,21 @@ async def api_create_task(body: TaskCreate, request: Request, response: Response
     return outcome.task
 
 
+@app.post("/api/prod-defects", response_model=models.ProdDefectFiled)
+async def api_file_prod_defect(body: models.ProdDefectCreate, request: Request):
+    """File a production defect in one call (#915): a draft that passes DoR.
+
+    The author kind comes from the token, never from the body (#360). The
+    draft waits for approval whoever files it — see ``services.prod_defect``.
+    """
+    from hub.services.prod_defect import file_prod_defect
+
+    source = (
+        TaskSource.human if current_identity(request).is_human else TaskSource.agent
+    )
+    return await file_prod_defect(_db(request), body, source=source)
+
+
 @app.post("/api/tasks/{parent_id}/subtasks", response_model=list[TaskView])
 async def api_create_subtasks_bulk(
     parent_id: int,
