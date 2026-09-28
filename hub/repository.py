@@ -3732,6 +3732,37 @@ class DefectPassportError(ValueError):
     """
 
 
+async def _release_link_problem(
+    db: aiosqlite.Connection, task_id: int, release_id: int
+) -> str:
+    """Why this release cannot be the one a defect showed up in, or "" (#917).
+
+    Three refusals, each a different lie the link would otherwise tell: a
+    release that is not recorded, a deploy that failed (it never ran in
+    production, so nothing could break there), and another project's release
+    (its membership is another project's work).
+    """
+    rows = await fetchall(
+        db, "SELECT project_id, status FROM releases WHERE id = ?", (release_id,)
+    )
+    if not rows:
+        return f"release #{release_id} not found"
+    release = dict(rows[0])
+    if release["status"] != RELEASE_SUCCESS:
+        return (
+            f"release #{release_id} has status {release['status']!r}: "
+            "only a successful deploy runs in production"
+        )
+    if release["project_id"] is not None:
+        project = await resolve_project_for_task(db, task_id)
+        if project is not None and int(project["id"]) != int(release["project_id"]):
+            return (
+                f"release #{release_id} belongs to project "
+                f"#{release['project_id']}, the task to project #{project['id']}"
+            )
+    return ""
+
+
 async def set_defect_passport(
     db: aiosqlite.Connection,
     task_id: int,
@@ -3741,6 +3772,7 @@ async def set_defect_passport(
     detected_at: str | None = None,
     resolved_at: str | None = None,
     clear_caused_by: bool = False,
+    release_id: int | None = None,
 ) -> dict[str, Any]:
     """Write the defect passport for one task and return the applied columns.
 
@@ -3774,6 +3806,12 @@ async def set_defect_passport(
         if problem:
             raise DefectPassportError(problem)
         updates["caused_by_task_id"] = caused_by_task_id
+
+    if release_id is not None:
+        problem = await _release_link_problem(db, task_id, release_id)
+        if problem:
+            raise DefectPassportError(problem)
+        updates["release_id"] = release_id
 
     if detected_at is not None:
         updates["detected_at"] = detected_at

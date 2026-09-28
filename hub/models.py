@@ -1788,6 +1788,9 @@ class TaskRefine(BaseModel):
     caused_by_task_id: int | None = Field(default=None, ge=1)
     detected_at: str | None = Field(default=None, max_length=32)
     clear_caused_by: bool = False
+    # #917: the release row the defect showed up in; resolved by
+    # ``repo.set_defect_passport`` (exists, succeeded, same project).
+    release_id: int | None = None
     scope_in: list[str] | None = Field(default=None, max_length=20)
     scope_out: list[str] | None = Field(default=None, max_length=20)
     affected_areas: list[str] | None = Field(default=None, max_length=20)
@@ -2236,6 +2239,35 @@ class DeployView(BaseModel):
     deployed_at: str = ""
 
 
+class DefectCauseCandidate(BaseModel):
+    """One task the release carried whose area overlaps the defect's (#917)."""
+
+    task_id: int
+    title: str = ""
+    # "defect_area ↔ candidate_area" pairs: the reason is the overlap itself,
+    # so a reader can check it instead of trusting a score.
+    overlap: list[str] = Field(default_factory=list)
+    # True when caused_by_task_id already names this task — the explicit
+    # confirmation, never set by the suggestion itself.
+    confirmed: bool = False
+
+
+class DefectCauseSuggestion(BaseModel):
+    """Culprit hypothesis for a defect linked to a release (#917).
+
+    ``reason`` is empty only when candidates exist: an empty list with no
+    reason would read as "nobody broke it", which the hub cannot know.
+    ``unmatched_rows`` counts project merges whose released_sha matches no
+    recorded deploy — left out of the membership, and named so.
+    """
+
+    release_id: int | None = None
+    release_sha: str = ""
+    candidates: list[DefectCauseCandidate] = Field(default_factory=list)
+    reason: str = ""
+    unmatched_rows: int = 0
+
+
 class TaskView(BaseModel):
     id: int
     title: str
@@ -2348,6 +2380,11 @@ class TaskView(BaseModel):
     caused_by_task_id: int | None = None
     detected_at: str | None = None
     resolved_at: str | None = None
+    # #917: the release the defect showed up in (None = not stated), and the
+    # culprit HYPOTHESIS computed from it. Kept apart from caused_by_task_id
+    # on purpose: a suggestion is never written into the fact column.
+    release_id: int | None = None
+    cause_suggestion: "DefectCauseSuggestion | None" = None
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
     affected_areas: list[str] = Field(default_factory=list)

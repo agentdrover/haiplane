@@ -775,6 +775,7 @@ _REFINE_SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
     ("found_in", "found_in"),
     ("caused_by", "caused_by_task_id"),
     ("detected_at", "detected_at"),
+    ("release_id", "release_id"),
 )
 _REFINE_LIST_FIELDS: tuple[tuple[str, str], ...] = (
     ("scope_in", "scope_in"),
@@ -2266,6 +2267,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="detected_at",
         default=None,
         help="Defect passport: when the defect was noticed",
+    )
+    p_refine.add_argument(
+        "--release-id",
+        dest="release_id",
+        type=int,
+        default=None,
+        help="Defect passport: release the defect showed up in (#917)",
     )
     p_refine.add_argument(
         "--clear-caused-by",
