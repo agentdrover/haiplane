@@ -15,6 +15,11 @@ apart as well.
 
 Window membership is decided by ``created_at`` — when the defect was filed —
 and is never used as a duration.
+
+The same set of rows — ``found_in = 'prod'`` filed in the window — is also the
+measured escape count (#918), and a prod defect bound to a release through
+``release_id`` is what makes that release a failed change (change failure
+rate). One definition of "prod defect" serves all three numbers.
 """
 
 from __future__ import annotations
@@ -25,6 +30,14 @@ from typing import Any
 import aiosqlite
 
 from hub.db import fetchall
+from hub.services.defect_release import project_scope
+
+# The one definition of "a prod defect of the window" (#916, #918).
+PROD_DEFECT_IN_WINDOW_SQL = "t.found_in = 'prod' AND t.created_at >= datetime('now', ?)"
+
+# Below this many deploys a share is noise: the page and the MCP text print
+# "small sample" instead of a percentage; the data still carries the rate.
+CFR_MIN_DEPLOYS = 5
 
 # Reasons a row stays out of a median. The keys are the contract: the page,
 # MCP and CLI print them as they are.
@@ -80,7 +93,7 @@ async def prod_defect_clocks(db: aiosqlite.Connection, since: str) -> dict[str, 
         "(julianday(t.resolved_at) - julianday(t.detected_at)) * 24.0 "
         "AS restore_hours "
         "FROM tasks t LEFT JOIN releases r ON r.id = t.release_id "
-        "WHERE t.found_in = 'prod' AND t.created_at >= datetime('now', ?)",
+        f"WHERE {PROD_DEFECT_IN_WINDOW_SQL}",  # nosec B608 - constant SQL
         (since,),
     )
     clocks: dict[str, tuple[list[float], dict[str, int]]] = {
@@ -102,4 +115,88 @@ async def prod_defect_clocks(db: aiosqlite.Connection, since: str) -> dict[str, 
     return {
         "defects": len(rows),
         **{name: _summary(*pair) for name, pair in clocks.items()},
+    }
+
+
+async def measured_escapes(db: aiosqlite.Connection, since: str) -> int:
+    """Prod defects filed in the window, read from ``found_in`` (#918).
+
+    Recorded, not derived: no feature ancestor and no completion stamp are
+    needed, so a prod defect hanging under an epic or under nothing is counted
+    here instead of disappearing into ``bugs_without_feature``.
+    """
+    rows = await fetchall(
+        db,
+        f"SELECT COUNT(*) AS n FROM tasks t WHERE {PROD_DEFECT_IN_WINDOW_SQL}",  # nosec B608 - constant SQL
+        (since,),
+    )
+    return int(rows[0]["n"] or 0) if rows else 0
+
+
+async def _project_key(
+    db: aiosqlite.Connection, project_id: int | None, cache: dict[Any, Any]
+) -> int | None:
+    """The project a release belongs to, by the #915 rule in ``project_scope``:
+    a project-less release is the default project's; a scope names its own
+    project last."""
+    if project_id not in cache:
+        cache[project_id] = (await project_scope(db, project_id))[-1]
+    return cache[project_id]
+
+
+def _cfr_row(slug: str, deploys: int, failed: int) -> dict[str, Any]:
+    return {
+        "project": slug,
+        "deploys": deploys,
+        "failed_deploys": failed,
+        "rate": round(failed / deploys, 3),
+        "small_sample": deploys < CFR_MIN_DEPLOYS,
+    }
+
+
+async def change_failure_rate(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+    """Share of successful deploys of the window that a prod defect points at.
+
+    Denominator: ``releases`` rows with status ``success`` whose
+    ``deployed_at`` falls in the window, per project. Numerator: those among
+    them with at least one ``found_in = 'prod'`` task whose ``release_id`` is
+    that release (#917) — two defects on one deploy make it failed once.
+    Prod defects of the window with no release bound cannot point at a deploy;
+    they are counted in ``defects_without_release``, never guessed.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT r.project_id, EXISTS (SELECT 1 FROM tasks t "
+        "WHERE t.release_id = r.id AND t.found_in = 'prod') AS failed "
+        "FROM releases r WHERE r.status = 'success' "
+        "AND r.deployed_at >= datetime('now', ?)",
+        (since,),
+    )
+    counts: dict[int | None, list[int]] = {}
+    cache: dict[Any, Any] = {}
+    for row in rows:
+        key = await _project_key(db, row["project_id"], cache)
+        bucket = counts.setdefault(key, [0, 0])
+        bucket[0] += 1
+        bucket[1] += 1 if row["failed"] else 0
+    slugs = {
+        int(r["id"]): str(r["slug"])
+        for r in await fetchall(db, "SELECT id, slug FROM projects")
+    }
+    unbound = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM tasks t "  # nosec B608 - constant SQL
+        f"WHERE {PROD_DEFECT_IN_WINDOW_SQL} AND t.release_id IS NULL",
+        (since,),
+    )
+    by_project = [
+        _cfr_row(
+            slugs.get(key, f"project-{key}") if key is not None else "default", *pair
+        )
+        for key, pair in counts.items()
+    ]
+    return {
+        "min_sample": CFR_MIN_DEPLOYS,
+        "by_project": sorted(by_project, key=lambda r: r["project"]),
+        "defects_without_release": int(unbound[0]["n"] or 0) if unbound else 0,
     }

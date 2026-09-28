@@ -421,6 +421,24 @@ def cmd_defect_clocks(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_change_failure_rate(args: argparse.Namespace) -> int:
+    """Change failure rate (#918): the change_failure_rate section."""
+    result = _api("GET", f"/api/metrics/practices?since_days={args.since_days}")
+    _print_json((result or {}).get("change_failure_rate", {}))
+    return 0
+
+
+def _add_change_failure_rate_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling."""
+    p_cfr = sub.add_parser(
+        "change-failure-rate",
+        help="Share of successful deploys with a prod defect bound to them, "
+        "per project, with the deploy count (#918)",
+    )
+    p_cfr.add_argument("--since-days", type=int, default=90)
+    p_cfr.set_defaults(func=cmd_change_failure_rate)
+
+
 def cmd_answer_outcome(args: argparse.Namespace) -> int:
     """Record one check of a completed task's outcome (#819)."""
     body = {
@@ -1895,6 +1913,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_clocks.add_argument("--since-days", type=int, default=90)
     p_clocks.set_defaults(func=cmd_defect_clocks)
+    _add_change_failure_rate_parser(sub)
 
     p_answer = sub.add_parser(
         "answer-outcome",

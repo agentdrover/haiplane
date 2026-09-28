@@ -473,15 +473,24 @@ async def _small_delta_section(db: aiosqlite.Connection, since: str) -> dict[str
 
 
 def _escapes_section(escaped: dict[str, Any]) -> dict[str, Any]:
-    """Эскейпы (#528) с корзинами непосчитанного рядом, не внутри."""
+    """Эскейпы: измеренные по found_in (#918) и реконструкция (#528) рядом.
+
+    Корзины непосчитанного относятся к реконструкции — у измеренного числа их
+    нет, поэтому они лежат внутри ``reconstructed``, а не рядом с ``escaped``.
+    """
+    rec = escaped.get("reconstructed") or {}
     return {
         "escaped": escaped.get("escaped", 0),
-        "bugs_in_window": escaped.get("bugs_in_window", 0),
-        "uncounted": {
-            "bugs_without_feature": escaped.get("bugs_without_feature", 0),
-            "features_without_completion": escaped.get(
-                "features_without_completion", 0
-            ),
+        "reconstructed": {
+            "label": rec.get("label", ""),
+            "escaped": rec.get("escaped", 0),
+            "bugs_in_window": rec.get("bugs_in_window", 0),
+            "uncounted": {
+                "bugs_without_feature": rec.get("bugs_without_feature", 0),
+                "features_without_completion": rec.get(
+                    "features_without_completion", 0
+                ),
+            },
         },
     }
 
