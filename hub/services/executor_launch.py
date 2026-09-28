@@ -203,6 +203,18 @@ async def _live_run(db: aiosqlite.Connection, task_id: int) -> str:
     return ""
 
 
+def _pushed_branch(task: dict[str, Any]) -> str:
+    """Ветка задачи, если она есть на форджe; пусто — стартовать на базе.
+
+    Имя ветки хаб пишет уже на pair-start, а запушена она может быть позже
+    или никогда: 28.09 прогон #1450 отменили по потолку до пуша, и заказ на
+    это имя стартовал бы на несуществующей ссылке (#1452). Сдача закрепляет
+    вершину запушенной ветки — поэтому признак «ветка есть» — сдача.
+    """
+    branch = (task.get("branch") or "").strip()
+    return branch if branch and (task.get("submission_sha") or "").strip() else ""
+
+
 def _prompt(
     task: dict[str, Any],
     base: str,
@@ -223,7 +235,7 @@ def _prompt(
             f"Ветка задачи уже есть — {task.get('branch')}, база {base}; "
             "pair-start не зови: задача в needs_decision, сдаёшь прямо из него."
         )
-    elif (task.get("branch") or "").strip():
+    elif _pushed_branch(task):
         # #1447: ветка уже есть — _order стартует агента на ней (любая дверь:
         # круг починки или очередь после сорванного круга); pair-start нужен
         # для нового поколения и вернёт её же.
@@ -394,10 +406,11 @@ async def _order(
 ) -> LaunchResult:
     """Заказать агента по брони и записать исход — один путь для всех заказов.
 
-    Где агент стартует — одно правило для всех дверей (#1445, #1447): у
-    задачи есть ветка — на ней, как ревьюер и стюард; нет — на базе (ветку
-    создаст pair-start). Строка ветки в ``_prompt`` читает то же поле, и
-    промпт не расходится с тем, где агент на самом деле стоит.
+    Где агент стартует — одно правило для всех дверей (#1445, #1447, #1452):
+    у задачи есть запушенная ветка (``_pushed_branch``: была сдача) — на ней,
+    как ревьюер и стюард; нет — на базе (ветку создаст pair-start). Строка
+    ветки в ``_prompt`` читает то же условие, и промпт не расходится с тем,
+    где агент на самом деле стоит.
     """
     from hub.services.review_dispatch import instance_base_url
 
@@ -415,7 +428,7 @@ async def _order(
             extra = _findings_block(pending)
     order = {
         "repo_url": f"https://github.com/{project['repo']}",
-        "starting_ref": (task.get("branch") or "").strip() or base,
+        "starting_ref": _pushed_branch(task) or base,
         "model_id": model,
         "prompt_text": _prompt(
             task,

@@ -1454,7 +1454,9 @@ async def _task_with_findings(
 ) -> tuple[dict, int]:
     """Задача на ревью после прогона исполнителя; у сдачи 1 — отчёт с находками."""
     project, task_id = await _launch_project(db, slug=slug)
-    await repo.update_task(db, task_id, status="review", submission_generation=1)
+    await repo.update_task(
+        db, task_id, status="review", submission_generation=1, submission_sha="a" * 40
+    )
     await _spent_run(db, task_id, cents=100.0, tokens=1_000)
     await db.execute(
         "INSERT INTO machine_reviews (task_id, submission_generation, harness_skill, "
@@ -1693,6 +1695,7 @@ async def _task_in_base_conflict(
         task_id,
         status="needs_decision",
         submission_generation=1,
+        submission_sha="b" * 40,
         branch=f"task-{task_id}/work",
     )
     await _spent_run(db, task_id, cents=100.0, tokens=1_000)
@@ -1948,7 +1951,10 @@ async def test_a_queue_launch_of_a_task_with_a_branch_starts_on_it(db, monkeypat
     _launch_config(monkeypatch)
     calls = _creator(monkeypatch, [_CREATED])
     project, task_id = await _launch_project(db, slug="exec-queue-branch")
-    await repo.update_task(db, task_id, branch=f"task-{task_id}/work")
+    # Сдача была (#1452): ветка на форджe есть.
+    await repo.update_task(
+        db, task_id, branch=f"task-{task_id}/work", submission_sha="c" * 40
+    )
     await db.commit()
 
     result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
@@ -1956,3 +1962,24 @@ async def test_a_queue_launch_of_a_task_with_a_branch_starts_on_it(db, monkeypat
     assert result.launched, result
     assert calls[0]["starting_ref"] == f"task-{task_id}/work"
     assert f"Ветка задачи уже есть — task-{task_id}/work" in calls[0]["prompt_text"]
+
+
+# ---- #1452: имя ветки из pair-start — ещё не ветка на GitHub ----
+
+
+async def test_a_branch_name_without_a_submission_starts_on_the_base(db, monkeypatch):
+    """AC-1: прогон отменили до пуша (#1450, 28.09) — имя ветки записано, сдачи
+    нет. Повторный заказ стартует на базе, промпт не говорит «ветка уже есть»."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, task_id = await _launch_project(db, slug="exec-branch-no-sha")
+    await repo.update_task(db, task_id, branch=f"task-{task_id}/work")
+    await db.commit()
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert result.launched, result
+    assert calls[0]["starting_ref"] == "develop"
+    prompt = calls[0]["prompt_text"]
+    assert "Ветка задачи уже есть" not in prompt
+    assert "каноническое имя из ответа pair-start" in prompt
