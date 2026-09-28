@@ -309,6 +309,19 @@ def cmd_propose(args: argparse.Namespace) -> int:
         "agent": args.agent or "",
         "rationale": args.rationale or "",
     }
+    if getattr(args, "defect_verify", None):
+        # #915: the same draft, filed as a prod defect with its passport.
+        body = {
+            "title": args.title,
+            "broken": args.description or "",
+            "verify": args.defect_verify,
+            "affected_areas": list(args.area or []),
+            "agent": args.agent or "",
+        }
+        if getattr(args, "parent", None) is not None:
+            body["parent_id"] = args.parent
+        _print_json(_api("POST", "/api/prod-defects", body))
+        return 0
     if getattr(args, "parent", None) is not None:
         body["parent_id"] = args.parent
     result = _api("POST", "/api/tasks", body)
@@ -1760,6 +1773,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_propose.add_argument("--agent", default="")
     p_propose.add_argument("--rationale", default="")
     p_propose.add_argument("--parent", type=int, default=None, help="Parent task ID")
+    p_propose.add_argument(
+        "--defect-verify", default=None, help="Prod defect: how to check the fix"
+    )
+    p_propose.add_argument("--area", action="append", help="Prod defect: where")
     p_propose.set_defaults(func=cmd_propose)
 
     # approve — approve a draft task

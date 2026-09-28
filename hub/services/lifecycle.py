@@ -819,8 +819,13 @@ async def create_task(
     body: TaskCreate,
     *,
     client_request_id: str | None = None,
+    force_draft: bool = False,
 ) -> CreateTaskOutcome:
-    """Create a new task, optionally dispatching it immediately."""
+    """Create a new task, optionally dispatching it immediately.
+
+    ``force_draft`` keeps the task a draft whoever files it (#915): a human
+    reporting a production defect is not a human approving its fix.
+    """
     idem_key = resolve_client_request_id(
         None, client_request_id or body.client_request_id
     )
@@ -856,6 +861,8 @@ async def create_task(
         project_id = project_row["id"]
 
     initial_status, normalized = normalize_task_create(body)
+    if force_draft:
+        initial_status = "draft"
     request_hash = hash_task_create_payload(normalized) if idem_key else None
     run_check, run_held = await _plan_created_run(db, normalized)
     if run_held:

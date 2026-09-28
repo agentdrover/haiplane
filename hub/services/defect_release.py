@@ -70,6 +70,43 @@ def _areas(raw: Any) -> list[str]:
     return [str(a).strip() for a in items if str(a or "").strip()]
 
 
+async def project_scope(
+    db: aiosqlite.Connection, project_id: int | None
+) -> list[int | None]:
+    """Project ids whose releases and merges are one history (#915).
+
+    The deploy callback in ci.yml reports no project, so every release row a
+    real installation holds is project-less, while the gate stamps merges with
+    the task's project — the default one for the hub itself. Project-less rows
+    therefore belong to the default project, and to no other: a project with
+    its own deploy reporting keeps its own history, and borrowing the
+    installation's deploys would bind its defects to someone else's release.
+    """
+    default = await repo.get_project_by_slug(db, "default")
+    default_id = int(default["id"]) if default is not None else None
+    if project_id is None or project_id == default_id:
+        return [None] if default_id is None else [None, default_id]
+    return [int(project_id)]
+
+
+def _scope_sql(scope: list[int | None]) -> str:
+    return " OR ".join("project_id IS ?" for _ in scope)
+
+
+async def latest_release_in_scope(
+    db: aiosqlite.Connection, project_id: int | None
+) -> dict[str, Any] | None:
+    """The newest successful deploy of this project's history, or None."""
+    scope = await project_scope(db, project_id)
+    rows = await fetchall(
+        db,
+        f"SELECT * FROM releases WHERE status = 'success' AND ({_scope_sql(scope)}) "  # nosec B608 - placeholders only
+        "ORDER BY id DESC LIMIT 1",
+        tuple(scope),
+    )
+    return dict(rows[0]) if rows else None
+
+
 async def release_membership(
     db: aiosqlite.Connection, release_id: int
 ) -> ReleaseMembership:
@@ -80,18 +117,22 @@ async def release_membership(
     if not rows:
         return ReleaseMembership(release_id=release_id)
     release = dict(rows[0])
-    project_id, wanted = release["project_id"], _sha(release["deployed_sha"])
+    wanted = _sha(release["deployed_sha"])
+    scope = await project_scope(db, release["project_id"])
+    where = _scope_sql(scope)
     deployed = {
         _sha(dict(r)["deployed_sha"])
         for r in await fetchall(
-            db, "SELECT deployed_sha FROM releases WHERE project_id IS ?", (project_id,)
+            db,
+            f"SELECT deployed_sha FROM releases WHERE {where}",  # nosec B608 - placeholders only
+            tuple(scope),
         )
     }
     merges = await fetchall(
         db,
-        "SELECT task_id, released_sha FROM pipeline_merges "
-        "WHERE project_id IS ? AND COALESCE(released_sha, '') != '' ORDER BY id",
-        (project_id,),
+        "SELECT task_id, released_sha FROM pipeline_merges "  # nosec B608 - placeholders only
+        f"WHERE ({where}) AND COALESCE(released_sha, '') != '' ORDER BY id",
+        tuple(scope),
     )
     task_ids: list[int] = []
     unmatched = 0

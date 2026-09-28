@@ -2239,6 +2239,37 @@ class DeployView(BaseModel):
     deployed_at: str = ""
 
 
+class ProdDefectCreate(BaseModel):
+    """A production defect filed in one call (#915): the minimum DoR.
+
+    What broke, how to check the fix and where — nothing the hub can fill
+    itself (stage, detection time, release, class of service) is asked for.
+    """
+
+    title: str = Field(..., min_length=1, max_length=500)
+    broken: str = Field(..., min_length=1, max_length=2000)
+    verify: str = Field(..., min_length=1, max_length=500)
+    affected_areas: list[str] = Field(..., min_length=1, max_length=20)
+    parent_id: int | None = None
+    agent: str = Field("", max_length=100)
+
+    @field_validator("affected_areas")
+    @classmethod
+    def _areas_are_named(cls, value: list[str]) -> list[str]:
+        areas = [a.strip() for a in value if a and a.strip()]
+        if not areas:
+            raise ValueError("affected_areas: name at least one path or module")
+        return areas
+
+
+class ProdDefectFiled(BaseModel):
+    """The filed draft, and the release it was bound to or why it was not."""
+
+    task: "TaskView"
+    release_id: int | None = None
+    release_reason: str = ""
+
+
 class DefectCauseCandidate(BaseModel):
     """One task the release carried whose area overlaps the defect's (#917)."""
 
@@ -4023,3 +4054,4 @@ ProposalView = TaskView
 ReviewReport.model_rebuild()
 ReviewBrief.model_rebuild()
 TaskView.model_rebuild()
+ProdDefectFiled.model_rebuild()
