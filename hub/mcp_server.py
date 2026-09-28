@@ -2196,10 +2196,8 @@ async def hub_submit_for_review(
             fixed|false_positive|wont_fix|deferred. Unresolved (author judges):
             real_fixed|real_deferred|not_a_defect|not_judged. All but a fix
             owe a note; one leaving the defect leaves a draft.
-        mutations: [{ac, mutation, failed_test}], one per test AC;
-            failed_test = its test_ref. submission_contract checks it (#1436).
-            Not evidence for bug_red_test: a bug needs each AC test failed
-            in the CI baseline (#913).
+        mutations: [{ac, mutation, failed_test}] per test AC (#1436); not
+            evidence for bug_red_test: CI baseline must fail it (#913).
         prevention: see hub_report_done (#919).
     """
     prior_task = await _read_task(task_id)

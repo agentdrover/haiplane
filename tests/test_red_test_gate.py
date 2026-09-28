@@ -424,6 +424,7 @@ def test_baseline_step_runs_branch_tests_on_merge_base(tmp_path, monkeypatch):
     step = next(s for s in steps if s.get("id") == "baseline")
     assert step["continue-on-error"] is True
     assert "task-" in step["if"]
+    assert "!cancelled()" in step["if"], "красный Test не стирает baseline"
     assert "scripts/red_test_baseline.py" in step["run"]
     reporter_step = next(s for s in steps if "hub-ci-report" in str(s.get("uses")))
     assert steps.index(step) < steps.index(reporter_step)

@@ -205,7 +205,9 @@ jobs:
       # the base is the PR base, develop for a manual run.
       - name: Red-test baseline on merge-base (data only)
         id: baseline
-        if: ${{ startsWith(github.head_ref || github.ref_name, 'task-') }}
+        # !cancelled(): the proof is about the base, not about this commit's
+        # own Test step — a red suite must not also erase the baseline.
+        if: ${{ !cancelled() && startsWith(github.head_ref || github.ref_name, 'task-') }}
         continue-on-error: true
         timeout-minutes: 10
         run: |
