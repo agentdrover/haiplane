@@ -894,7 +894,10 @@ async def test_change_failure_rate_and_restore_time(db: aiosqlite.Connection):
     belong to the default project (#915), and the defect that makes a deploy
     failed is the same one whose restore clock is measured (#916)."""
     spike = await repo.create_project(db, slug="spike", name="Spike")
-    releases = [await _deploy(db, f"{i:040x}") for i in range(1, 6)]
+    default_id = await repo.create_project(db, slug="default", name="Default")
+    releases = [await _deploy(db, f"{i:040x}") for i in range(1, 5)]
+    # Stamped with the default project: the same history as project-less rows.
+    releases.append(await _deploy(db, "d" * 40, project_id=default_id))
     await _deploy(db, "a" * 40, deployed="-400 days")  # outside the window
     await _deploy(db, "b" * 40, status="failed")  # never reached prod
     other = await _deploy(db, "c" * 40, project_id=spike)
@@ -957,26 +960,42 @@ async def test_reconstructed_escapes_labelled(
     feature_id = await _feature(db, title="closed feature", completed="-10 days")
     await _bug(db, title="old bug, stage unknown", parent_id=feature_id)
     await _defect(db, title="prod defect", parent_id=feature_id)
+    await _defect(db, title="prod defect, no feature")
     await db.commit()
 
     escaped = (await practice_metrics(db))["escaped_defects"]
-    assert escaped["escaped"] == 1
+    assert escaped["escaped"] == 2
     assert escaped["reconstructed"]["escaped"] == 1
     assert escaped["reconstructed"]["label"] == "реконструкция"
 
     api = (await client.get("/api/metrics/practices")).json()["escaped_defects"]
-    assert (api["escaped"], api["reconstructed"]["escaped"]) == (1, 1)
+    assert (api["escaped"], api["reconstructed"]["escaped"]) == (2, 1)
     assert api["reconstructed"]["label"] == "реконструкция"
 
     econ = (await practice_metrics(db))["review_economy"]["escapes"]
-    assert econ["escaped"] == 1
+    assert econ["escaped"] == 2
     assert econ["reconstructed"]["escaped"] == 1
 
     page = (await client.get("/metrics")).text
-    assert 'data-metric="escaped_defects.escaped">1<' in page
+    assert 'data-metric="escaped_defects.escaped">2<' in page
     assert 'data-metric="escaped_defects.reconstructed.escaped">1<' in page
     assert "Утечек в прод, измерено" in page
     assert "Реконструкция" in page
+
+
+async def test_metrics_page_shows_change_failure_rate(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """Under min_sample deploys the page prints the mark, not a share."""
+    release_id = await _deploy(db, "e" * 40)
+    await _defect(db, title="broke it", release_id=release_id)
+    await db.commit()
+
+    page = (await client.get("/metrics")).text
+    assert "Change failure rate" in page
+    assert 'data-metric="change_failure_rate.default.deploys">1<' in page
+    assert "малая выборка" in page
+    assert "100.0%" not in page
 
 
 async def test_mcp_practice_metrics_names_cfr_and_both_escapes():
