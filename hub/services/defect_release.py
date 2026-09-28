@@ -49,6 +49,7 @@ class ReleaseMembership:
     """Tasks a release carried by the matching rule, and what did not match."""
 
     release_id: int
+    deployed_sha: str = ""
     task_ids: list[int] = field(default_factory=list)
     # Project merges with a released_sha that matches NO recorded deploy.
     unmatched_rows: int = 0
@@ -101,7 +102,10 @@ async def release_membership(
         elif sha == wanted and merge["task_id"] and merge["task_id"] not in task_ids:
             task_ids.append(int(merge["task_id"]))
     return ReleaseMembership(
-        release_id=release_id, task_ids=task_ids, unmatched_rows=unmatched
+        release_id=release_id,
+        deployed_sha=wanted,
+        task_ids=task_ids,
+        unmatched_rows=unmatched,
     )
 
 
@@ -170,6 +174,7 @@ async def suggest_causes(
         missing = [REASON_NO_OVERLAP]
     return DefectCauseSuggestion(
         release_id=int(release_id),
+        release_sha=membership.deployed_sha,
         candidates=candidates,
         reason="; ".join(missing),
         unmatched_rows=membership.unmatched_rows,

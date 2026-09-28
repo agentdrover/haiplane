@@ -136,7 +136,7 @@
             {% endif %}
 
             {% set is_defect = task.work_type and task.work_type.value in ('bug', 'incident') %}
-            {% set has_passport = task.caused_by_task_id or task.detected_at or task.resolved_at or (task.found_in and task.found_in.value != 'unknown') %}
+            {% set has_passport = task.caused_by_task_id or task.release_id or task.detected_at or task.resolved_at or (task.found_in and task.found_in.value != 'unknown') %}
             {# In review an unfilled passport is one line below the statement card
                (#1207); a filled one stays a block, because it carries facts. #}
             {% if (is_defect or has_passport) and not (review_board and not has_passport) %}
@@ -161,6 +161,20 @@
                         <span class="u-text-muted">не установлено</span>
                         {% endif %}
                     </dd>
+                    {% if task.release_id %}
+                    {% set cs = task.cause_suggestion %}
+                    <dt>Релиз</dt>
+                    <dd data-defect-release="{{ task.release_id }}">#{{ task.release_id }}{% if cs and cs.release_sha %} <code>{{ cs.release_sha[:12] }}</code>{% endif %}</dd>
+                    <dt>Гипотеза о виновнике <span class="u-text-muted">(не подтверждено)</span></dt>
+                    <dd data-cause-suggestion>
+                        {% for c in (cs.candidates if cs else []) %}
+                        <div><a href="/tasks/{{ c.task_id }}">#{{ c.task_id }}</a> {{ c.title }}{% if c.confirmed %} — подтверждён{% endif %}: <span class="u-text-muted">{{ c.overlap | join('; ') }}</span></div>
+                        {% else %}
+                        <span class="u-text-muted">кандидатов нет: {{ cs.reason if cs else 'не посчитано' }}</span>
+                        {% endfor %}
+                        {% if cs and cs.unmatched_rows %}<div class="u-text-muted">вне состава: {{ cs.unmatched_rows }} несопоставимых мержей</div>{% endif %}
+                    </dd>
+                    {% endif %}
                     {% if task.detected_at %}
                     <dt>Обнаружен</dt>
                     <dd>{{ task.detected_at }}</dd>

@@ -425,3 +425,35 @@ async def test_migration_on_clean_and_filled_db_is_idempotent():
         assert [r["release_id"] for r in rows] == [None]
     finally:
         await filled.close()
+
+
+async def test_web_passport_shows_release_and_hypothesis(client, db):
+    """Finding a73039f3: the card shows the release and the hypothesis apart
+    from caused_by, and a release alone counts as a filled passport."""
+    world = await _released_world(db)
+    resp = await client.post(
+        f"/api/tasks/{world['defect']}/refine", json={"release_id": world["release"]}
+    )
+    assert resp.status_code == 200, resp.text
+
+    page = (await client.get(f"/tasks/{world['defect']}")).text
+
+    assert f'data-defect-release="{world["release"]}"' in page
+    assert SHA_A[:12] in page
+    hypothesis = page.split("data-cause-suggestion", 1)[1].split("</dd>", 1)[0]
+    assert f"/tasks/{world['web']}" in hypothesis
+    assert "hub/templates/task_detail.html ↔ hub/templates" in hypothesis
+    assert "не подтверждено" in page.split("data-cause-suggestion", 1)[0][-200:]
+    # caused_by stays the fact column: still empty.
+    assert "не установлено" in page
+
+    blind = await _task(db, "дефект без области", [])
+    await db.commit()
+    resp = await client.post(
+        f"/api/tasks/{blind}/refine", json={"release_id": world["release"]}
+    )
+    assert resp.status_code == 200, resp.text
+    page = (await client.get(f"/tasks/{blind}")).text
+    # Not a bug by work_type: only release_id makes the passport show at all.
+    assert "data-defect-passport" in page
+    assert f"кандидатов нет: {defect_release.REASON_NO_AREAS}" in page

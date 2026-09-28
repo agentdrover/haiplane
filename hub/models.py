@@ -2262,6 +2262,7 @@ class DefectCauseSuggestion(BaseModel):
     """
 
     release_id: int | None = None
+    release_sha: str = ""
     candidates: list[DefectCauseCandidate] = Field(default_factory=list)
     reason: str = ""
     unmatched_rows: int = 0
