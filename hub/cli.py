@@ -414,6 +414,13 @@ def cmd_review_economy(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_defect_clocks(args: argparse.Namespace) -> int:
+    """Prod defect clocks (#916): the prod_defect_clocks section."""
+    result = _api("GET", f"/api/metrics/practices?since_days={args.since_days}")
+    _print_json((result or {}).get("prod_defect_clocks", {}))
+    return 0
+
+
 def cmd_answer_outcome(args: argparse.Namespace) -> int:
     """Record one check of a completed task's outcome (#819)."""
     body = {
@@ -1854,6 +1861,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_economy.add_argument("--since-days", type=int, default=90)
     p_economy.set_defaults(func=cmd_review_economy)
+
+    p_clocks = sub.add_parser(
+        "defect-clocks",
+        help="Prod defect time-to-detect and time-to-restore medians, with "
+        "unmeasurable rows by reason (#916)",
+    )
+    p_clocks.add_argument("--since-days", type=int, default=90)
+    p_clocks.set_defaults(func=cmd_defect_clocks)
 
     p_answer = sub.add_parser(
         "answer-outcome",

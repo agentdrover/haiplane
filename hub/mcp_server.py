@@ -3500,6 +3500,30 @@ def _review_economy_lines(econ: dict[str, Any]) -> list[str]:
     ]
 
 
+def _defect_clock_part(name: str, clock: dict) -> str:
+    median = clock.get("median_hours")
+    reasons = ", ".join(
+        f"{k} {v}" for k, v in (clock.get("unmeasurable") or {}).items()
+    )
+    return (
+        f"{name} median "
+        + (f"{median}h" if median is not None else "—")
+        + f" over {clock.get('measured', 0)}, unmeasurable "
+        + f"{clock.get('unmeasurable_total', 0)}"
+        + (f" ({reasons})" if reasons else "")
+    )
+
+
+def _defect_clocks_line(clocks: dict) -> str:
+    """#916: both prod-defect clocks with the rows left out of each median."""
+    return (
+        f"Prod defects ({clocks.get('defects', 0)}): "
+        + _defect_clock_part("time-to-detect", clocks.get("time_to_detect") or {})
+        + "; "
+        + _defect_clock_part("time-to-restore", clocks.get("time_to_restore") or {})
+    )
+
+
 @mcp.tool()
 async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
     """Practice metrics (#384): machine-review economics, harness-version
@@ -3592,6 +3616,7 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
             else "—"
         )
     )
+    lines.append(_defect_clocks_line(data.get("prod_defect_clocks") or {}))
     recurring = [c for c in data.get("recurring_categories", []) if c.get("recurring")]
     if recurring:
         lines.append(
