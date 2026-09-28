@@ -17,8 +17,9 @@
 Отказ всегда называет причину и НЕ зовёт провайдера: вне GitHub (облако до
 GitVerse не достаёт), off, нет наблюдения F2.1 (токен прогона не должен
 пушить в develop и main — #1409), модель исполнителя одного семейства с
-ревьюером или стюардом (#758, #1008), очередь никого не назвала, по задаче
-уже идёт прогон.
+ревьюером или стюардом (#758, #1008), очередь никого не назвала, задача не
+лист (#1455: очередь, повторный прогон и слияние — одним правилом), по
+задаче уже идёт прогон.
 
 Промпт здесь минимальный: задача, база, код и указание обменять его первым
 шагом. Скилл и дисциплину исполнителя даёт F3 (#1366).
@@ -60,6 +61,8 @@ REASON_NO_OBSERVATION = "нет наблюдения прав токена"
 REASON_FAMILY = "семейство модели исполнителя не отличается"
 REASON_NO_MODEL = "модель исполнителя не задана"
 REASON_NO_CANDIDATE = "очередь не назвала задачу"
+#: #1455: двери, что берут задачу мимо очереди, держат то же правило листа.
+REASON_NOT_LEAF = "задача не лист — исполнитель её не получает"
 REASON_NO_SKILL = "в библиотеке нет активного скилла дисциплины исполнителя"
 REASON_TASK_BUDGET = "бюджет исполнителя на задачу исчерпан"
 REASON_TASK_BUDGET_UNKNOWN = "бюджет исполнителя на задачу неизвестен"
@@ -179,6 +182,16 @@ async def _candidate(db: aiosqlite.Connection, project: Any) -> tuple[int | None
     if live:
         return None, live
     return int(task_id), ""
+
+
+async def _not_leaf_refusal(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> LaunchResult | None:
+    """Отказ двери, что берёт задачу сама, если задача не лист (#1455)."""
+    why = await orchestrator_queue.not_leaf_reason(db, task)
+    if not why:
+        return None
+    return _refused(f"{REASON_NOT_LEAF}: #{task['id']} {why}", int(task["id"]))
 
 
 async def _live_run(db: aiosqlite.Connection, task_id: int) -> str:
@@ -601,6 +614,9 @@ async def repair_executor(
         )
     if not await repo.list_executor_runs(db, task_id):
         return _refused(REASON_NO_EXECUTOR_RUN, task_id)
+    not_leaf = await _not_leaf_refusal(db, task)
+    if not_leaf is not None:
+        return not_leaf
     live = await _live_run(db, task_id)
     if live:
         return _refused(live, task_id)
@@ -741,6 +757,9 @@ async def merge_executor(
         return _refused(f"{REASON_NOT_BASE_CONFLICT}: статус {task['status']}", task_id)
     if not await repo.list_executor_runs(db, task_id):
         return _refused(REASON_NO_EXECUTOR_RUN, task_id)
+    not_leaf = await _not_leaf_refusal(db, task)
+    if not_leaf is not None:
+        return not_leaf
     live = await _live_run(db, task_id)
     if live:
         return _refused(live, task_id)

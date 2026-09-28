@@ -489,17 +489,15 @@ def _guard_chat_pair_enabled() -> None:
         raise HTTPException(503, detail=chat_pair_auth_required_detail())
 
 
-async def _chat_pair_issuer(request: Request) -> int:
-    """The principal allowed to issue or revoke pairing codes.
+async def _human_door(request: Request, what: str) -> config.TokenIdentity:
+    """Человек по Bearer или cookie-сессия с верным CSRF — иначе 403 (#961).
 
-    Two ways in and no third: a human Bearer token, or a cookie session with a
-    valid CSRF token. Without the CSRF check any page on the internet could
-    make the operator's browser burn their live code.
+    Общая дверь выдачи кода и остановки прогона (#1455): без CSRF любая
+    страница в интернете могла бы нажать за оператора.
     """
     identity = current_identity(request)
     if not identity.is_human:
         raise HTTPException(403, detail=human_only_gate_detail())
-
     if _extract_bearer(request) is None:
         presented = request.headers.get(CSRF_HEADER_NAME)
         if presented is None and "form" in (request.headers.get("content-type") or ""):
@@ -510,10 +508,20 @@ async def _chat_pair_issuer(request: Request) -> int:
             raise HTTPException(
                 403,
                 detail=human_only_gate_detail(
-                    "cookie-authenticated pairing requires a valid CSRF token"
+                    f"cookie-authenticated {what} requires a valid CSRF token"
                 ),
             )
+    return identity
 
+
+async def _chat_pair_issuer(request: Request) -> int:
+    """The principal allowed to issue or revoke pairing codes.
+
+    Two ways in and no third: a human Bearer token, or a cookie session with a
+    valid CSRF token. Without the CSRF check any page on the internet could
+    make the operator's browser burn their live code.
+    """
+    identity = await _human_door(request, "pairing")
     if identity.principal_id is None:
         # An env-token identity has no principal to attribute the session to,
         # and a session without an owner could not be revoked by anyone.
@@ -1121,6 +1129,34 @@ async def api_executor_merge(
         "agent_id": result.agent_id,
         "run_id": result.run_id,
         "row_id": result.row_id,
+    }
+
+
+@app.post("/api/tasks/{task_id}/executor-stop")
+async def api_executor_stop(
+    task_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Остановить идущий прогон исполнителя задачи (#1455).
+
+    Только человек или админ, CSRF для cookie — те же двери, что у запуска.
+    Отмена — существующая, с повторами (#1411); ответ говорит, подтверждена
+    ли она уже (``confirmed``) или её держит поллер. Нет прогона — 409.
+    """
+    from hub.services.executor_dispatch import stop_executor_run
+
+    identity = await _human_door(request, "executor stop")
+    result = await stop_executor_run(_db(request), task_id, actor=identity.username)
+    if not result.accepted:
+        raise HTTPException(409, detail={"reason": result.reason, "task_id": task_id})
+    return {
+        "task_id": task_id,
+        "row_id": result.row_id,
+        "outcome": result.outcome,
+        "cancel_intent": result.cancel_intent,
+        "confirmed": result.confirmed,
+        "reason": result.reason,
     }
 
 
