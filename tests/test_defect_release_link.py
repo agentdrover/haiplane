@@ -377,8 +377,14 @@ async def _fresh(migrations) -> aiosqlite.Connection:
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys = ON")
     await conn.executescript(hub_db._SCHEMA)
-    with patch.object(hub_db, "_MIGRATIONS", migrations):
-        await hub_db._migrate(conn)
+    try:
+        with patch.object(hub_db, "_MIGRATIONS", migrations):
+            await hub_db._migrate(conn)
+    except BaseException:
+        # A migration that raises must not leave the aiosqlite worker thread
+        # alive: the test would fail and then hang the process at exit.
+        await conn.close()
+        raise
     return conn
 
 
