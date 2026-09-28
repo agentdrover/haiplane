@@ -405,6 +405,7 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
         "ORDER BY CASE task_type WHEN 'feature' THEN 0 ELSE 1 END, id ASC",
     )
     repaired = 0
+    noted = False
     for row in rows:
         parent_id = row["id"]
         parent_row = await repo.get_task(db, parent_id)
@@ -414,11 +415,15 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
         children = await db_module.get_children(db, parent_id)
         if not _children_allow_rollup(children):
             continue
-        if _parent_has_own_work(parent) or prevention_gate.prevention_gap(parent):
+        if _parent_has_own_work(parent):
+            continue
+        if prevention_gate.prevention_gap(parent):
+            await prevention_gate.note_rollup_held(db, parent_id)
+            noted = True
             continue
         await repo.update_task(db, parent_id, status="completed")
         repaired += 1
-    if repaired:
+    if repaired or noted:
         await db.commit()
         log.info("Repaired %d stale parent task(s) to completed", repaired)
     return repaired

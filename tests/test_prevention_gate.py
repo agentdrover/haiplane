@@ -190,11 +190,18 @@ async def test_parent_rollup_is_held(db):
 
 async def test_stale_parent_repair_is_held(db):
     from hub.services.lifecycle import repair_stale_parent_completions
+    from hub.services.prevention_gate import ROLLUP_HELD_NOTE
 
     parent = await _defect(db, status="running", task_type="feature")
     await _defect(db, found_in="unknown", status="completed", parent_id=parent)
     await repair_stale_parent_completions(db)
+    await repair_stale_parent_completions(db)
     assert (await _row(db, parent))["status"] == "running"
+    notes = await db.execute_fetchall(
+        "SELECT 1 FROM task_updates WHERE task_id=? AND content=?",
+        (parent, ROLLUP_HELD_NOTE),
+    )
+    assert len(notes) == 1
 
 
 @pytest.mark.parametrize("closed", ["completed", "failed", "rejected"])
@@ -222,6 +229,47 @@ async def test_poller_sweep_leaves_a_force_completed_defect_closed(db):
             await poller._deliver_pair_task(db, await _row(db, task_id))
     assert (await _row(db, task_id))["status"] == "completed"
     assert not await _events(db, task_id, "needs_decision")
+
+
+async def test_hold_does_not_reopen_a_close_that_raced_it(db):
+    """Review e04e9496c2bd7c28: closed between the read and the write."""
+    from hub.services import prevention_gate
+
+    task_id = await _defect(db, status="review")
+    real_get = repo.get_task
+
+    async def read_then_close(conn, tid):
+        row = await real_get(conn, tid)
+        await conn.execute("UPDATE tasks SET status='completed' WHERE id=?", (tid,))
+        return row
+
+    with patch.object(prevention_gate.repo, "get_task", read_then_close):
+        held = await prevention_gate.hold_completion(
+            db, task_id, via="poller_delivery", actor="hub"
+        )
+    await db.commit()
+    assert not held
+    assert (await _row(db, task_id))["status"] == "completed"
+    assert not await _events(db, task_id, "needs_decision")
+
+
+async def test_refusal_names_the_field_of_its_own_door(client, db):
+    """Review d1c616745c743d85: submit is not told to use the done report."""
+    done_id = await _defect(db)
+    done = (await _done(client, done_id)).text
+    assert "hub_report_done(prevention)" in done
+    assert "hub_submit_for_review" not in done
+
+    pair_id = await _pair_defect(db)
+    submit = (
+        await client.post(
+            f"/api/tasks/{pair_id}/submit-review",
+            json={"agent": "dev", "branch": "task-1/fix"},
+        )
+    ).text
+    assert "hub_submit_for_review(prevention)" in submit
+    assert "submit-review --prevention" in submit
+    assert "hub_report_done" not in submit
 
 
 async def test_held_rollup_says_so_once(db):

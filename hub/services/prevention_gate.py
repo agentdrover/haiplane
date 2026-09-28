@@ -57,7 +57,18 @@ def _options() -> str:
     return "; ".join(f"({i}) {o}" for i, o in enumerate(PREVENTION_OPTIONS, 1))
 
 
-def prevention_gap(task: dict[str, Any]) -> str:
+#: Named per door: on a pair task the done report bypasses the submission.
+DONE_DOOR = (
+    "Передайте его в prevention отчёта о готовности: hub_report_done(prevention), "
+    "POST /api/tasks/{id}/updates или oc-hub update --kind done --prevention."
+)
+SUBMIT_DOOR = (
+    "Передайте его в prevention сдачи: hub_submit_for_review(prevention), "
+    "POST /api/tasks/{id}/submit-review или oc-hub submit-review --prevention."
+)
+
+
+def prevention_gap(task: dict[str, Any], door: str = "") -> str:
     """Why this task may not complete yet, or "" when the gate does not apply."""
     if (task.get("found_in") or "") != "prod":
         return ""
@@ -65,14 +76,13 @@ def prevention_gap(task: dict[str, Any]) -> str:
         return ""
     return (
         "prevention_required: прод-дефект (found_in='prod') закрывается только "
-        f"с выводом — одним из трёх: {_options()}. Передайте его в prevention "
-        "отчёта о готовности (hub_report_done)."
-    )
+        f"с выводом — одним из трёх: {_options()}. {door}"
+    ).rstrip()
 
 
-def refuse_without_prevention(task: dict[str, Any]) -> None:
-    """Agent doors: refuse, naming the three options."""
-    gap = prevention_gap(task)
+def refuse_without_prevention(task: dict[str, Any], door: str = DONE_DOOR) -> None:
+    """Agent doors: refuse, naming the three options and this door's field."""
+    gap = prevention_gap(task, door)
     if gap:
         raise HTTPException(422, gap)
 
@@ -169,7 +179,7 @@ async def check_submission(
     recorded for a submission that never happened would read as answered.
     """
     if prevention is None:
-        refuse_without_prevention(task)
+        refuse_without_prevention(task, SUBMIT_DOOR)
         return None
     return await validate_prevention(db, prevention)
 
@@ -177,7 +187,7 @@ async def check_submission(
 ROLLUP_HELD_NOTE = (
     "Родитель — прод-дефект (found_in='prod') без вывода: роллап не закрыл "
     "его, хотя дети завершены. Закрытие ждёт собственного отчёта с выводом "
-    "(hub_report_done prevention=...) — регрессионный тест, правило из "
+    "(prevention в hub_report_done или hub_submit_for_review) — тест, правило из "
     "category_checks или принятый риск с причиной и сроком пересмотра."
 )
 
@@ -211,7 +221,12 @@ async def hold_completion(
     gap = prevention_gap(dict(row))
     if not gap:
         return False
-    await repo.update_task(db, task_id, status="needs_decision")
+    # Conditional, in one UPDATE: a close that landed between the read above
+    # and this write leaves the row as it is — "already closed", not an error.
+    if not await repo.transition_status_if(
+        db, task_id, expected_from=dict(row)["status"], new_status="needs_decision"
+    ):
+        return False
     await repo.add_task_update(
         db,
         task_id,
