@@ -2436,6 +2436,21 @@ async def create_task(
     return cur.lastrowid  # type: ignore[return-value]
 
 
+# #916: a production defect stops hurting when it is closed, so ``resolved_at``
+# is stamped on the way into ``completed`` — in the same primitives and by the
+# same rule as ``completed_at`` (#517), because several paths complete a task
+# and a stamp placed in one of them is a stamp the others forget. Only
+# ``found_in='prod'`` rows carry the clock (time-to-restore is downtime, which
+# a defect caught at review never caused), and a stamp already recorded is
+# kept: a reopened and re-closed defect keeps its first recovery. Two
+# placeholders, both bound to the new status.
+RESOLVED_AT_ON_COMPLETION_SQL = (
+    "resolved_at = CASE WHEN ? = 'completed' AND status != ? "
+    "AND found_in = 'prod' AND resolved_at IS NULL "
+    "THEN datetime('now') ELSE resolved_at END"
+)
+
+
 async def update_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -2470,6 +2485,9 @@ async def update_task(
             "THEN datetime('now') ELSE completed_at END"
         )
         values.extend([fields["status"], fields["status"]])
+        if "resolved_at" not in fields:
+            sets.append(RESOLVED_AT_ON_COMPLETION_SQL)
+            values.extend([fields["status"], fields["status"]])
     values.append(task_id)
     await db.execute(
         f"UPDATE tasks SET {', '.join(sets)} WHERE id=?",  # nosec B608
@@ -2602,14 +2620,24 @@ async def transition_status_if(
     409 Conflict instead of double-processing the task. Review I5.
     """
     cur = await db.execute(
-        "UPDATE tasks SET status=?, status_entered_at=datetime('now'), "
+        "UPDATE tasks SET status=?, status_entered_at=datetime('now'), "  # nosec B608 - module constant, values stay params
         "updated_at=datetime('now'), "
         # Same rule as update_task (#517): stamp the completion moment on the
         # way into `completed` and never on any other transition.
         "completed_at = CASE WHEN ? = 'completed' AND status != ? "
-        "THEN datetime('now') ELSE completed_at END "
+        "THEN datetime('now') ELSE completed_at END, "
+        # #916: and a prod defect's recovery moment, by the same rule.
+        f"{RESOLVED_AT_ON_COMPLETION_SQL} "
         "WHERE id=? AND status=?",
-        (new_status, new_status, new_status, task_id, expected_from),
+        (
+            new_status,
+            new_status,
+            new_status,
+            new_status,
+            new_status,
+            task_id,
+            expected_from,
+        ),
     )
     return (cur.rowcount or 0) > 0
 

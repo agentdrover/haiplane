@@ -22,6 +22,7 @@ import aiosqlite
 from hub import brand, commit_scope, config
 from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
+from hub.services.defect_clocks import prod_defect_clocks
 from hub.integrations import git_ops as git_ops_mod
 from hub.services.executor_dispatch import executor_run_metrics
 from hub.integrations.git_ops import (
@@ -975,6 +976,9 @@ async def practice_metrics(
         "category_debt": debt,
         "cycle_times": cycle_times,
         "escaped_defects": escaped,
+        # #916: time-to-detect and time-to-restore of prod defects, from
+        # recorded facts only; rows missing one are counted by reason.
+        "prod_defect_clocks": await prod_defect_clocks(db, since),
         "model_declarations": model_declarations,
         "human_gates": human_gates,
         # #1107: the shadow table lives BESIDE the other practice numbers,
