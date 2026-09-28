@@ -1931,7 +1931,11 @@ async def test_review_economy_is_the_same_on_every_surface(
     await _order(db, red, profile="deep", bill=None)
     await _economy_report(db, red, confirmed=2, unresolved=1, bill=1_000_000)
     other = await _task(db, title="outside")
-    await _order(db, other, profile="deep", bill=4_000_000)
+    exported = await _order(db, other, profile="deep", bill=4_000_000)
+    await db.execute(
+        "UPDATE review_dispatches SET billed_tokens = 9000000 WHERE id = ?",
+        (exported,),
+    )
     await _economy_report(db, other, unresolved=2, profile="deep")
     await db.commit()
 
@@ -1980,7 +1984,24 @@ async def test_review_economy_is_the_same_on_every_surface(
     }
     for bucket in econ["reconciliation"]["buckets"]:
         expected[f"reconciliation.{bucket['bucket']}"] = bucket["count"]
+    # #1413: источник цены и покрытие выгрузкой — те же, что в REST и MCP.
+    expected["runs.export_billed_runs"] = econ["runs"]["export_billed_runs"]
+    expected["runs.api_lower_bound_runs"] = econ["runs"]["api_lower_bound_runs"]
     assert {k: int(v) for k, v in shown.items() if k in expected} == expected
+    share = re.search(r'data-metric-share="runs.export_coverage_share">([^<]*)<', page)
+    assert share and share.group(1) == str(econ["runs"]["export_coverage_share"])
+    assert econ["runs"]["cost_source_note"] in page
+    assert (
+        f"Cursor export covers {econ['runs']['export_billed_runs']} run(s), "
+        f"{econ['runs']['api_lower_bound_runs']} priced by the API (lower bound)"
+    ) in text
+    assert (
+        econ["runs"]["export_billed_runs"],
+        econ["runs"]["api_lower_bound_runs"],
+    ) == (
+        1,
+        1,
+    )
     # Числа попарно различны, иначе подмена одного другим прошла бы молча.
     assert (econ["runs"]["billed"], econ["runs"]["unbilled"]) == (2, 1)
     assert econ["findings"]["unresolved_total"] == 3

@@ -3210,6 +3210,56 @@ async def set_review_dispatch_provider_tokens(
     )
 
 
+async def mark_review_dispatch_usage(
+    db: aiosqlite.Connection, dispatch_id: int, scope: str
+) -> None:
+    """Чем снят счёт заказа и когда провайдера спросили последний раз (#1413)."""
+    await db.execute(
+        "UPDATE review_dispatches SET usage_scope = ?, "
+        "usage_checked_at = datetime('now') WHERE id = ?",
+        (scope, dispatch_id),
+    )
+
+
+async def list_review_dispatches_usage_expired(
+    db: aiosqlite.Connection, ceiling_hours: int
+) -> list[aiosqlite.Row]:
+    """Открытые счета (#1413), чьё окно переснятия вышло без итога."""
+    return list(
+        await fetchall(
+            db,
+            "SELECT * FROM review_dispatches WHERE usage_scope = 'agent_open' "
+            "AND status NOT IN ('active', 'second_door') "
+            "AND created_at < datetime('now', ?) ORDER BY id ASC",
+            (f"-{int(ceiling_hours)} hours",),
+        )
+    )
+
+
+async def list_review_dispatches_owing_usage(
+    db: aiosqlite.Connection, every_minutes: int, ceiling_hours: int
+) -> list[aiosqlite.Row]:
+    """Закрытые заказы, чей счёт агента снят до его конца (#1413).
+
+    Только ``agent_open``: история (``''``) переснимается одной командой
+    владельца, не поллером. Не чаще раза в ``every_minutes`` на строку и не
+    дольше ``ceiling_hours`` от заказа — агент, висящий сутками, не должен
+    опрашиваться вечно.
+    """
+    return list(
+        await fetchall(
+            db,
+            "SELECT * FROM review_dispatches "
+            "WHERE usage_scope = 'agent_open' AND agent_id <> '' "
+            "AND status NOT IN ('active', 'second_door') "
+            "AND (usage_checked_at IS NULL "
+            "     OR usage_checked_at <= datetime('now', ?)) "
+            "AND created_at >= datetime('now', ?) ORDER BY id ASC",
+            (f"-{int(every_minutes)} minutes", f"-{int(ceiling_hours)} hours"),
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task dependencies (#483, epic #478)
 # ---------------------------------------------------------------------------

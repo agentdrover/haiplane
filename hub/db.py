@@ -2291,6 +2291,49 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ON events(kind, project_id, id)",
     ),
     (
+        # #1413: чем снят provider_tokens. '' — история до задачи (счёт
+        # ОДНОГО прогона, переснимается только командой владельца);
+        # agent_open — счёт агента, снятый до его конца, свип переснимет;
+        # agent — итог по агенту; recounted — пересчитан командой владельца.
+        "add_review_dispatches_usage_scope",
+        "ALTER TABLE review_dispatches ADD COLUMN usage_scope TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1413: когда провайдера спрашивали о счёте этого заказа последний
+        # раз — переснятие ходит не чаще раза в USAGE_RESTAMP_EVERY_MINUTES.
+        "add_review_dispatches_usage_checked_at",
+        "ALTER TABLE review_dispatches ADD COLUMN usage_checked_at TEXT",
+    ),
+    (
+        # #1413: полная цена заказа по выгрузке Cursor, которую приносит
+        # владелец. Рядом с provider_tokens (API агента — нижняя граница),
+        # не вместо него. NULL — выгрузка по агенту не импортировалась.
+        "add_review_dispatches_billed_tokens",
+        "ALTER TABLE review_dispatches ADD COLUMN billed_tokens INTEGER",
+    ),
+    (
+        "add_review_dispatches_billed_events",
+        "ALTER TABLE review_dispatches ADD COLUMN billed_events INTEGER",
+    ),
+    (
+        # #1413: события выгрузки Cursor, по одному на ключ (агент, время,
+        # токены, модель) — повторный и перекрывающийся импорт не удваивает.
+        # Хранятся только события заказов ревью хаба.
+        "create_cursor_usage_events",
+        """CREATE TABLE IF NOT EXISTS cursor_usage_events (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id     TEXT    NOT NULL,
+            event_date   TEXT    NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            model        TEXT    NOT NULL DEFAULT '',
+            dispatch_id  INTEGER,
+            imported_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (agent_id, event_date, total_tokens, model)
+        )""",
+    ),
+    # Строки #1413 стоят до блока #1434 намеренно: его тест требует свои
+    # миграции последними, а применение идёт по имени — порядок не важен.
+    (
         # #1434 (F7): канал (cloud | slot) и имя слота — атрибуты выдачи кода
         # implementer. Пусто — канал не назван: код без канала работает как
         # до задачи (облачный исполнитель, пилот SID).
