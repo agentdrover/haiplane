@@ -2177,17 +2177,17 @@ async def hub_submit_for_review(
 ) -> str:
     """AUTHOR step: hand your work to a review by someone else (#307).
 
-    Does NOT complete the task: another actor writes the verdict. Bumps the
-    generation, voiding an earlier APPROVED; the same commit resubmitted
-    from review keeps it (#1265).
+    It does NOT complete the task: a different actor writes the verdict
+    (hub_submit_review). Bumps the generation, voiding any APPROVED; the
+    same commit resubmitted from review keeps it (#1265).
 
     Args:
         task_id: The running pair task ID
         agent: Submitting agent (empty uses the task's assigned agent)
         summary: Short note on what is being submitted
-        branch: Your working branch; a mismatch with the canonical one is
-            refused. Omitted skips the check (#533).
-        model: The model that wrote this submission (#758), declared. Empty
+        branch: Your working branch; one unlike the canonical is refused.
+            Omitted skips the check (#533).
+        model: Model that wrote this submission (#758), declared; empty
             keeps the verdict with the human.
         accept_areas: Fold the areas the diff ACTUALLY touched into
             affected_areas (#890), visibly.
@@ -2198,7 +2198,7 @@ async def hub_submit_for_review(
             owe a note; one leaving the defect leaves a draft.
         mutations: [{ac, mutation, failed_test}], one per test AC;
             failed_test = its test_ref. submission_contract checks it (#1436).
-        prevention: as in hub_report_done (#919).
+        prevention: see hub_report_done (#919).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
