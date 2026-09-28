@@ -1345,6 +1345,32 @@ def cmd_next_task(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_executor_stop(args: argparse.Namespace) -> int:
+    """Остановить идущий прогон исполнителя задачи — человеку (#1455)."""
+    result = _api("POST", f"/api/tasks/{args.task_id}/executor-stop")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    if result.get("confirmed"):
+        print(f"#{args.task_id}: прогон остановлен, исход {result.get('outcome')}.")
+    else:
+        print(
+            f"#{args.task_id}: отмена начата ({result.get('cancel_intent')}); "
+            f"повторы держит хаб. {result.get('reason') or ''}".rstrip()
+        )
+    return 0
+
+
+def _add_executor_stop_parser(sub: Any) -> None:
+    """``oc-hub executor-stop`` (#1455); отдельно — build_parser на потолке."""
+    p_stop = sub.add_parser(
+        "executor-stop", help="Stop the task's running cloud executor run (human)"
+    )
+    p_stop.add_argument("task_id", type=int)
+    p_stop.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_stop.set_defaults(func=cmd_executor_stop)
+
+
 def cmd_slots(args: argparse.Namespace) -> int:
     """Занятость слотов и каналов исполнения (#1434)."""
     from hub.services.executor_slots import format_occupancy
@@ -2591,6 +2617,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_next.add_argument("--json", action="store_true", help="Print raw JSON")
     p_next.set_defaults(func=cmd_next_task)
+
+    _add_executor_stop_parser(sub)
 
     p_slots = sub.add_parser(
         "slots", help="Executor channels and slots: which task, since when (#1434)"

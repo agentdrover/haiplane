@@ -804,6 +804,14 @@
             {% if executor_runs %}
             <section class="task-sidebar-card">
                 <div class="task-sidebar-title">Прогоны исполнителя</div>
+                {# #1455: человек останавливает идущий прогон — та же отмена с повторами. #}
+                {% if executor_runs.stoppable %}
+                <form method="post" action="/tasks/{{ task.id }}/web-executor-stop" class="project-inline-form">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button class="btn btn-danger" type="submit"
+                            onclick="return confirm('Остановить идущий прогон исполнителя задачи #{{ task.id }}? Хаб отменит его у провайдера с повторами.')">Остановить прогон</button>
+                </form>
+                {% endif %}
                 {# #1444: круг починки — повторный прогон по находкам ревью. #}
                 {% if repair_offered %}
                 <form method="post" action="/tasks/{{ task.id }}/web-executor-repair" class="project-inline-form">

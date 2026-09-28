@@ -14,6 +14,10 @@
 взяла с шестой. Каждый проход делает не больше одной попытки после паузы, до
 потолка попыток; исход подтверждает только перечтённый прогон в CANCELLED.
 
+Человек может остановить прогон из хаба (#1455): та же отмена с повторами,
+исход ``cancelled_by_human``. Прогон, закрытый без сдачи (отмена, ошибка,
+потолок), снимает задачу из running на решение человеку.
+
 Чего модуль НЕ делает: не запускает исполнителя (F2.4).
 
 Молчание провайдера — названная причина, а не ноль и не завершение: строка
@@ -45,6 +49,18 @@ OUTCOME_FAILED = "failed"
 #: хаба, закрывается причиной отмены, а не голым ``cancelled``.
 OUTCOME_OVER_CEILING = "over_ceiling"
 OUTCOME_TAKEN_DOWN = "taken_down"
+#: #1455: остановка человеком из хаба — та же отмена с повторами.
+OUTCOME_CANCELLED_BY_HUMAN = "cancelled_by_human"
+
+#: Исходы, которыми прогон кончился без работы до конца (#1455): задача в
+#: running без сдачи его поколения уходит на решение. FINISHED без сдачи —
+#: другой случай (#1446), taken_down — сдача легла.
+STOPPED_OUTCOMES: tuple[str, ...] = (
+    OUTCOME_CANCELLED,
+    OUTCOME_FAILED,
+    OUTCOME_OVER_CEILING,
+    OUTCOME_CANCELLED_BY_HUMAN,
+)
 
 #: Статус прогона у провайдера → исход строки. Всё, чего здесь нет, —
 #: прогон ещё идёт.
@@ -75,6 +91,10 @@ REASON_CANCEL_EXHAUSTED = (
 
 EVENT_OVER_CEILING = "executor_run_over_ceiling"
 EVENT_CANCEL_EXHAUSTED = "executor_run_cancel_exhausted"
+#: #1455: причина needs_decision — прогон остановлен без сдачи.
+EVENT_RUN_STOPPED = "executor_run_stopped"
+
+REASON_NO_LIVE_RUN = "по задаче нет идущего прогона исполнителя"
 
 
 async def _ask(call: Any, *args: Any) -> dict[str, Any] | None:
@@ -149,6 +169,25 @@ async def _settle(
         outcome=outcome or OUTCOME_RUNNING,
         reason="",
         finish=outcome is not None,
+    )
+    if outcome is not None:
+        await _note_human_stop(db, row, outcome)
+
+
+async def _note_human_stop(
+    db: aiosqlite.Connection, row: dict[str, Any], outcome: str
+) -> None:
+    """Запись в карточке: остановку человека провайдер подтвердил (#1455)."""
+    if outcome != OUTCOME_CANCELLED_BY_HUMAN:
+        return
+    await repo.add_task_update(
+        db,
+        int(row["task_id"]),
+        "hub",
+        "status",
+        f"Прогон исполнителя {row['run_id']} (сдача {row['submission_generation']}) "
+        f"остановлен по просьбе человека: провайдер подтвердил CANCELLED, исход "
+        f"{OUTCOME_CANCELLED_BY_HUMAN} (#1455).",
     )
 
 
@@ -427,6 +466,9 @@ async def _wait_for_cost(
             reason=REASON_COST_NEVER_CAME.format(minutes=minutes),
             finish=True,
         )
+        row = await repo.get_executor_run(db, row_id)
+        if row is not None:
+            await _note_human_stop(db, dict(row), outcome)
         return
     await repo.update_executor_run(
         db, row_id, tokens=tokens, reason=REASON_COST_PENDING
@@ -449,8 +491,126 @@ async def poll_executor_runs(db: aiosqlite.Connection) -> int:
 
 
 async def sweep_executor_runs(db: aiosqlite.Connection) -> None:
-    """Проход поллера (#1410): опрос прогонов исполнителя."""
+    """Проход поллера (#1410): опрос прогонов исполнителя, затем задачи,
+    чей прогон остановлен без сдачи, — на решение (#1455)."""
     await poll_executor_runs(db)
+    await release_stopped_tasks(db)
+
+
+# ---- #1455: остановка прогона человеком и задача, что не висит ----
+
+
+async def release_stopped_tasks(db: aiosqlite.Connection) -> int:
+    """Задачи в running, чей последний прогон остановлен без сдачи, — в
+    needs_decision с причиной и исходом; сколько переведено.
+
+    Читается исход СТРОКИ, а не провайдер: строка, закрытая до выката
+    (28.09, #1375 — прогон cancelled внешне, задача осталась running за
+    исполнителем), подхватывается первым же проходом. Повтора нет: задача
+    уходит из running, и следующий проход её не видит.
+    """
+    rows = [
+        dict(r)
+        for r in await repo.stopped_executor_runs_of_running_tasks(db, STOPPED_OUTCOMES)
+    ]
+    for row in rows:
+        await _release_stopped(db, row)
+    if rows:
+        await db.commit()
+    return len(rows)
+
+
+async def _release_stopped(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
+    task_id = int(row["task_id"])
+    outcome = str(row["outcome"])
+    detail = (
+        f"прогон исполнителя {row['run_id'] or row['id']} (сдача "
+        f"{row['submission_generation']}) закончился исходом {outcome} без сдачи"
+    )
+    await repo.update_task(db, task_id, status="needs_decision")
+    await repo.insert_event(
+        db,
+        kind="needs_decision",
+        task_id=task_id,
+        actor="hub",
+        payload={
+            "reason": EVENT_RUN_STOPPED,
+            "outcome": outcome,
+            "executor_run_id": row["id"],
+            "detail": detail,
+        },
+    )
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "alert",
+        f"Задача снята из running на решение: {detail} (#1455). Исполнитель "
+        "её больше не делает; вернуть в работу, перезапустить или закрыть "
+        "решает человек.",
+    )
+
+
+@dataclass
+class StopResult:
+    """Ответ на просьбу человека остановить прогон (#1455)."""
+
+    accepted: bool
+    reason: str = ""
+    row_id: int | None = None
+    outcome: str = ""
+    cancel_intent: str = ""
+
+    @property
+    def confirmed(self) -> bool:
+        return self.outcome not in ("", OUTCOME_RUNNING)
+
+
+async def stop_executor_run(
+    db: aiosqlite.Connection, task_id: int, *, actor: str
+) -> StopResult:
+    """Человек останавливает идущий прогон задачи (#1455).
+
+    Своей отмены здесь нет: ставится ``cancel_intent`` и делается одна
+    попытка той же отменой с повторами (``_cancel_step``), что у потолка и
+    снятия по сдаче; дальше повторы после паузы держит поллер, а исход
+    ``cancelled_by_human`` подтверждает только перечтённый прогон в
+    CANCELLED. Отмена, которую хаб уже ведёт по своей причине, не
+    переписывается: её исход (например, over_ceiling) остаётся честнее.
+    """
+    live = [
+        dict(r)
+        for r in await repo.list_executor_runs(db, task_id)
+        if r["outcome"] == OUTCOME_RUNNING and r["agent_id"] and r["run_id"]
+    ]
+    if not live:
+        return StopResult(False, REASON_NO_LIVE_RUN)
+    row = live[-1]
+    if not row.get("cancel_intent"):
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            f"{actor} остановил прогон исполнителя {row['run_id']} (сдача "
+            f"{row['submission_generation']}): хаб отменяет его с повторами, "
+            f"исход {OUTCOME_CANCELLED_BY_HUMAN} — после подтверждения (#1455).",
+        )
+        # Счёт — до отмены, как у опроса: подтверждённый CANCELLED без цены
+        # остался бы ждать её до следующего прохода.
+        tokens, cents = cursor_cloud.usage_totals(
+            await _ask(cursor_cloud.get_usage, row["agent_id"], row["run_id"])
+        )
+        await _cancel_step(db, row, OUTCOME_CANCELLED_BY_HUMAN, tokens, cents)
+    await db.commit()
+    fresh = dict(await repo.get_executor_run(db, int(row["id"])) or row)
+    return StopResult(
+        True,
+        str(fresh.get("reason") or ""),
+        int(row["id"]),
+        str(fresh["outcome"]),
+        str(fresh.get("cancel_intent") or ""),
+    )
 
 
 # ---- #1443 (F5.1): суммарный бюджет исполнителя на задачу ----
@@ -560,6 +720,9 @@ async def executor_runs_view(
             "duration_ms": r["duration_ms"],
             "outcome": r["outcome"],
             "reason": r["reason"] or "",
+            "stoppable": bool(
+                r["outcome"] == OUTCOME_RUNNING and r["agent_id"] and r["run_id"]
+            ),
         }
         for r in await repo.list_executor_runs(db, task_id)
     ]
@@ -570,6 +733,8 @@ async def executor_runs_view(
     return {
         "runs": runs,
         "count": len(runs),
+        # #1455: кнопка остановки — пока у задачи есть идущий прогон.
+        "stoppable": any(r["stoppable"] for r in runs),
         "billed": len(billed),
         "cents_total": round(sum(billed), 2) if billed else None,
         # #1443: бюджет задачи рядом с прогонами — сколько ещё можно купить.
