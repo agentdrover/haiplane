@@ -1165,6 +1165,34 @@ async def web_executor_merge(
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)
 
 
+@router.post("/tasks/{task_id}/web-executor-stop")
+async def web_executor_stop(
+    task_id: int, request: Request, csrf_token: str = Form(default="")
+):
+    """Кнопка «остановить прогон» (#1455): тот же сервис, что у REST."""
+    from hub.services.executor_dispatch import stop_executor_run
+
+    _require_human_web(request)
+    if not _check_web_csrf(request, csrf_token):
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error="Форма устарела. Обновите страницу и попробуйте снова.",
+            status_code=403,
+        )
+    result = await stop_executor_run(
+        _db(request), task_id, actor=current_identity(request).username
+    )
+    if not result.accepted:
+        return await _web_task_detail_page(
+            request,
+            task_id,
+            implementer_error=f"Прогон не остановлен: {result.reason}",
+            status_code=409,
+        )
+    return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
+
 @router.post("/tasks/{task_id}/web-executor-repair")
 async def web_executor_repair(
     task_id: int, request: Request, csrf_token: str = Form(default="")

@@ -2012,3 +2012,274 @@ async def test_a_submission_without_a_pinned_sha_still_starts_on_its_branch(
     assert result.launched, result
     assert calls[0]["starting_ref"] == f"task-{task_id}/work"
     assert f"Ветка задачи уже есть — task-{task_id}/work" in calls[0]["prompt_text"]
+
+
+# ---- #1455: лист для исполнителя, остановка человеком, задача не висит ----
+
+
+async def test_repair_and_merge_runs_are_refused_on_a_task_with_open_children(
+    db, monkeypatch
+):
+    """Двери повторного прогона и слияния (#1444, #1445) выбирают задачу сами,
+    мимо очереди: у задачи с незавершённой подзадачей — отказ до возврата в
+    работу, провайдер не зван, статус не тронут (#1455)."""
+    from hub import services
+    from hub.models import TaskCreate
+
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    human = await _human(db)
+
+    _, repair_id = await _task_with_findings(db, slug="exec-leaf-repair")
+    _, merge_id = await _task_in_base_conflict(db, slug="exec-leaf-merge")
+    kids = {}
+    for parent in (repair_id, merge_id):
+        kid = (await services.create_task(db, TaskCreate(title="подзадача"))).id
+        await repo.update_task(db, kid, task_type="subtask", parent_id=parent)
+        kids[parent] = kid
+    await db.commit()
+
+    repair = await el.repair_executor(
+        db, repair_id, issuer_principal_id=human, issuer="owner1412"
+    )
+    assert not repair.launched
+    assert repair.reason.startswith(el.REASON_NOT_LEAF), repair
+    assert f"#{kids[repair_id]}" in repair.reason
+    assert dict(await repo.get_task(db, repair_id))["status"] == "review"
+
+    merge = await el.merge_executor(
+        db, merge_id, issuer_principal_id=human, issuer="owner1412"
+    )
+    assert not merge.launched
+    assert merge.reason.startswith(el.REASON_NOT_LEAF), merge
+    assert dict(await repo.get_task(db, merge_id))["status"] == "needs_decision"
+    assert calls == [], "провайдер не зван"
+
+
+async def test_human_can_stop_a_run_agent_cannot(client, db, monkeypatch):
+    """AC-2: человек останавливает идущий прогон через REST (и CLI) — отмена
+    идёт существующими повторами, после подтверждения исход cancelled_by_human
+    и запись в карточке; агентский токен и cookie без CSRF — 403."""
+    import argparse
+    from io import StringIO
+    from unittest.mock import MagicMock, patch
+
+    from hub import cli
+    from hub.auth import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+    from hub.services.executor_dispatch import OUTCOME_CANCELLED_BY_HUMAN
+
+    monkeypatch.setattr(config, "EXECUTOR_CANCEL_MAX_ATTEMPTS", 5)
+    monkeypatch.setattr(config, "EXECUTOR_CANCEL_PAUSE_S", 60)
+    monkeypatch.setattr(config, "EXECUTOR_TOKEN_CEILING", 50_000_000)
+    monkeypatch.setattr(config, "EXECUTOR_CENTS_CEILING", 100_000)
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            _AGENT_TOKEN: TokenIdentity("bot", "agent"),
+            "human-token": TokenIdentity("denis", "human", principal_id=1),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    task_id = await _task(db)
+    row_id = await _run(db, task_id, agent_id="bc-exec-7", run_id="run-7")
+    state = _cancelling_provider(monkeypatch, usage=_usage(5000, 2.0), refusals=1)
+    url = f"/api/tasks/{task_id}/executor-stop"
+
+    by_agent = await client.post(
+        url, headers={"Authorization": f"Bearer {_AGENT_TOKEN}"}
+    )
+    assert by_agent.status_code == 403
+    session = await admin_svc.create_browser_session(db, await _human(db))
+    client.cookies.set(config.HUB_COOKIE_NAME, session)
+    client.cookies.set(CSRF_COOKIE_NAME, "csrf-value")
+    no_csrf = await client.post(url, headers={CSRF_HEADER_NAME: "other"})
+    assert no_csrf.status_code == 403
+    client.cookies.clear()
+    assert state["cancel_calls"] == 0
+    assert (await _row(db, row_id))["cancel_intent"] == ""
+
+    # Первая просьба — 429: прогон не остановлен, но отмена начата и держится.
+    human = {"Authorization": "Bearer human-token"}
+    resp = await client.post(url, headers=human)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["row_id"] == row_id and body["confirmed"] is False, body
+    assert state["cancel_calls"] == 1
+    row = await _row(db, row_id)
+    assert row["outcome"] == OUTCOME_RUNNING
+    assert row["cancel_intent"] == OUTCOME_CANCELLED_BY_HUMAN
+
+    # Повтор — поллером после паузы, той же отменой, что у потолка.
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 1, "пауза не вышла"
+    await _pause_passed(db, row_id)
+    await poll_executor_runs(db)
+    assert state["cancel_calls"] == 2
+    row = await _row(db, row_id)
+    assert row["outcome"] == OUTCOME_CANCELLED_BY_HUMAN
+    assert row["finished_at"]
+    notes = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert any("denis" in n and "run-7" in n for n in notes), notes
+    assert any(OUTCOME_CANCELLED_BY_HUMAN in n and "подтверд" in n for n in notes)
+    _no_key_in(row)
+    # Сдачи нет — проход поллера снимает задачу из running на решение (AC-3).
+    from hub.services.executor_dispatch import sweep_executor_runs
+
+    await sweep_executor_runs(db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision"
+
+    # Прогона больше нет — остановить нечего: 409 с причиной.
+    again = await client.post(url, headers=human)
+    assert again.status_code == 409
+    assert state["cancel_calls"] == 2
+
+    mock_api = MagicMock(return_value={"task_id": task_id, "confirmed": True})
+    out = StringIO()
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=out):
+        rc = cli.cmd_executor_stop(argparse.Namespace(task_id=task_id, json=False))
+    assert rc == 0
+    mock_api.assert_called_once_with("POST", f"/api/tasks/{task_id}/executor-stop")
+
+
+async def test_stopped_run_without_submission_moves_task_to_decision(db, monkeypatch):
+    """AC-3: прогон задачи в running закрылся cancelled (в том числе внешне у
+    провайдера), failed или over_ceiling без сдачи своего поколения — задача
+    в needs_decision с причиной и исходом; при легшей сдаче — без изменений.
+
+    Строка, закрытая до выката (#1375: executor_runs cancelled, задача
+    running), подхватывается тем же проходом поллера — по исходу строки.
+    """
+    from hub.services.executor_dispatch import (
+        EVENT_RUN_STOPPED,
+        OUTCOME_CANCELLED_BY_HUMAN,
+        OUTCOME_FAILED,
+        sweep_executor_runs,
+    )
+
+    monkeypatch.setattr(config, "EXECUTOR_TOKEN_CEILING", 50_000_000)
+    monkeypatch.setattr(config, "EXECUTOR_CENTS_CEILING", 100_000)
+
+    # Внешняя отмена у провайдера: опрос читает CANCELLED.
+    external = await _task(db, "внешняя отмена")
+    ext_row = await _run(db, external, agent_id="bc-ext", run_id="run-ext")
+    # ERROR у провайдера — failed.
+    errored = await _task(db, "ошибка")
+    await _run(db, errored, agent_id="bc-err", run_id="run-err")
+    statuses = {"run-ext": "CANCELLED", "run-err": "ERROR"}
+
+    async def _get_run(agent_id: str, run_id: str):
+        return {"id": run_id, "status": statuses.get(run_id, "RUNNING")}
+
+    async def _get_usage(agent_id: str, run_id: str | None = None):
+        return _usage(1000, 1.0)
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _get_run)
+    monkeypatch.setattr(cursor_cloud, "get_usage", _get_usage)
+
+    # Закрыта до выката: строка уже cancelled / over_ceiling, задача running.
+    settled = await _task(db, "закрыта до выката")
+    settled_row = await _run(db, settled, agent_id="bc-old", run_id="run-old")
+    await repo.update_executor_run(
+        db, settled_row, cents=113.0, outcome=OUTCOME_CANCELLED, finish=True
+    )
+    ceiling = await _task(db, "потолок")
+    ceiling_row = await _run(db, ceiling, agent_id="bc-ceil", run_id="run-ceil")
+    await repo.update_executor_run(
+        db, ceiling_row, cents=5.0, outcome=OUTCOME_OVER_CEILING, finish=True
+    )
+    # Остановлен человеком (исход подтверждён), сдачи нет.
+    by_human = await _task(db, "остановил человек")
+    human_row = await _run(db, by_human, agent_id="bc-hum", run_id="run-hum")
+    await repo.update_executor_run(
+        db, human_row, cents=5.0, outcome=OUTCOME_CANCELLED_BY_HUMAN, finish=True
+    )
+    # Сдача своего поколения легла — задача не трогается.
+    delivered = await _task(db, "сдача легла")
+    delivered_row = await _run(db, delivered, agent_id="bc-del", run_id="run-del")
+    await repo.update_executor_run(
+        db, delivered_row, cents=5.0, outcome=OUTCOME_CANCELLED, finish=True
+    )
+    await repo.update_task(db, delivered, submission_generation=1)
+    # FINISHED без сдачи — не эта задача (#1446).
+    finished = await _task(db, "закончился")
+    finished_row = await _run(db, finished, agent_id="bc-fin", run_id="run-fin")
+    await repo.update_executor_run(
+        db, finished_row, cents=5.0, outcome=OUTCOME_FINISHED, finish=True
+    )
+    # Задачу после остановки уже взяли снова (вход в running позже конца
+    # прогона) — старый прогон её не выдёргивает.
+    retaken = await _task(db, "взята снова")
+    retaken_row = await _run(db, retaken, agent_id="bc-re", run_id="run-re")
+    await repo.update_executor_run(
+        db, retaken_row, cents=5.0, outcome=OUTCOME_CANCELLED, finish=True
+    )
+    await db.execute(
+        "UPDATE tasks SET status_entered_at=datetime('now', '+1 minute') WHERE id=?",
+        (retaken,),
+    )
+    # Старый прогон отменён, но идёт новый — судит последний прогон задачи.
+    relaunched = await _task(db, "новый прогон идёт")
+    old_row = await _run(db, relaunched, agent_id="bc-o", run_id="run-o")
+    await repo.update_executor_run(
+        db, old_row, cents=5.0, outcome=OUTCOME_CANCELLED, finish=True
+    )
+    await _run(db, relaunched, agent_id="bc-n", run_id="run-n", generation=2)
+    await db.commit()
+
+    await sweep_executor_runs(db)
+
+    assert (await _row(db, ext_row))["outcome"] == OUTCOME_CANCELLED
+    expected = {
+        external: OUTCOME_CANCELLED,
+        errored: OUTCOME_FAILED,
+        settled: OUTCOME_CANCELLED,
+        ceiling: OUTCOME_OVER_CEILING,
+        by_human: OUTCOME_CANCELLED_BY_HUMAN,
+    }
+    for task_id, outcome in expected.items():
+        task = dict(await repo.get_task(db, task_id))
+        assert task["status"] == "needs_decision", (task_id, task["status"])
+        events = await db.execute_fetchall(
+            "SELECT payload FROM events WHERE task_id=? AND kind='needs_decision'",
+            (task_id,),
+        )
+        payload = json.loads(dict(events[-1])["payload"])
+        assert payload["reason"] == EVENT_RUN_STOPPED, payload
+        assert payload["outcome"] == outcome, payload
+        assert any(outcome in a for a in await _alerts(db, task_id)), task_id
+    for task_id in (delivered, finished, retaken, relaunched):
+        assert dict(await repo.get_task(db, task_id))["status"] == "running", task_id
+
+    # Второй проход ничего не повторяет: задача уже не в running.
+    await sweep_executor_runs(db)
+    alerts = await _alerts(db, settled)
+    assert len(alerts) == 1, alerts
+
+
+async def test_the_stop_button_stops_a_live_run_from_the_card(client, db, monkeypatch):
+    """Кнопка «Остановить прогон» (#1455) — в карточке, пока прогон идёт; форма
+    с CSRF идёт в тот же сервис, без CSRF — 403 и провайдер не зван."""
+    from hub.auth import CSRF_COOKIE_NAME
+    from hub.services.executor_dispatch import OUTCOME_CANCELLED_BY_HUMAN
+
+    task_id = await _task(db)
+    row_id = await _run(db, task_id, agent_id="bc-exec-8", run_id="run-8")
+    state = _cancelling_provider(monkeypatch, usage=_usage(10, 0.1))
+    url = f"/tasks/{task_id}/web-executor-stop"
+
+    page = await client.get(f"/tasks/{task_id}")
+    assert url in page.text
+
+    client.cookies.set(CSRF_COOKIE_NAME, "csrf-value")
+    stale = await client.post(url, data={"csrf_token": "other"})
+    assert stale.status_code == 403
+    assert state["cancel_calls"] == 0
+
+    done = await client.post(url, data={"csrf_token": "csrf-value"})
+    assert done.status_code == 303, done.text
+    assert state["cancel_calls"] == 1
+    assert (await _row(db, row_id))["outcome"] == OUTCOME_CANCELLED_BY_HUMAN
+
+    page = await client.get(f"/tasks/{task_id}")
+    assert url not in page.text, "прогона нет — и кнопки нет"

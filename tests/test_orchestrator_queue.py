@@ -709,3 +709,74 @@ async def test_start_task_checks_areas_too(db):
     assert caught.value.detail["with_task_id"] == a
     assert await _status(db, b) == "open"
     assert not await repo.has_plan_updates(db, b), "план записан до отказа"
+
+
+# ---- #1455: очередь выдаёт только листовые задачи ----
+
+
+async def test_queue_never_hands_out_a_task_with_open_children(db, monkeypatch):
+    """AC-1: фича F (dor_passed, выше в очереди) с незавершённой подзадачей T —
+    F пропущена с названной причиной, выдана T; провайдер на F не вызван.
+
+    Инцидент 28.09 (#1455): кнопка запуска выдала облачному исполнителю фичу,
+    родителя шести подзадач, потому что очередь отсеивала только эпики. Здесь
+    же задача типа task с незавершённой (даже draft) подзадачей и эпик — тоже
+    не кандидаты, каждый с причиной.
+    """
+    from hub.integrations import cursor_cloud
+    from hub.services import executor_launch as el
+    from tests.test_executor_dispatch import (
+        _CREATED,
+        _creator,
+        _human,
+        _launch_config,
+        _launch_project,
+    )
+
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, stock = await _launch_project(db, slug="oq-leaf")
+    await repo.update_task(db, stock, dor_passed=0)
+    pid = int(project["id"])
+
+    feature = await _task(db, pid, areas=["hub/f.py"], priority="critical")
+    await repo.update_task(db, feature, task_type="feature")
+    child = await _task(db, pid, areas=["hub/t.py"], priority="low")
+    await repo.update_task(db, child, task_type="subtask", parent_id=feature)
+    parent = await _task(db, pid, areas=["hub/p.py"], priority="high")
+    kid = await _task(db, pid, status="draft", areas=["hub/k.py"], dor=False)
+    await repo.update_task(db, kid, task_type="subtask", parent_id=parent)
+    epic = await _task(db, pid, areas=["hub/e.py"], priority="critical")
+    await repo.update_task(db, epic, task_type="epic")
+    await db.commit()
+
+    answer = await oq.next_task(db, project)
+
+    assert answer["next_task_id"] == child, answer
+    feature_skip = _skip(answer, feature)
+    assert feature_skip["reason"] == oq.SKIP_NOT_LEAF
+    assert f"#{child}" in feature_skip["detail"]
+    parent_skip = _skip(answer, parent)
+    assert parent_skip["reason"] == oq.SKIP_NOT_LEAF
+    assert f"#{kid}" in parent_skip["detail"]
+    assert _skip(answer, epic)["reason"] == oq.SKIP_NOT_LEAF
+    assert f"#{feature}" in answer["summary"]
+
+    human = await _human(db)
+    result = await el.launch_executor(db, project, issuer_principal_id=human)
+    assert result.launched and result.task_id == child, result
+    assert [c["name"] for c in calls] == [
+        cursor_cloud.agent_marker("executor", child, 1, 1)
+    ]
+
+    # Подзадача закрыта: у фичи незавершённых детей нет, но фича — не лист
+    # для исполнителя; родитель-задача всё ещё держит draft-подзадачу.
+    await repo.update_task(db, child, status="completed")
+    await db.commit()
+    answer = await oq.next_task(db, project)
+    assert answer["next_task_id"] is None, answer
+    assert _skip(answer, feature)["reason"] == oq.SKIP_NOT_LEAF
+    result = await el.launch_executor(db, project, issuer_principal_id=human)
+    assert not result.launched
+    assert result.reason.startswith(el.REASON_NO_CANDIDATE), result
+    assert len(calls) == 1, "провайдер на фичу не вызван"

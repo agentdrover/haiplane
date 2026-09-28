@@ -5804,6 +5804,29 @@ async def list_executor_runs_in_outcome(
     )
 
 
+async def stopped_executor_runs_of_running_tasks(
+    db: aiosqlite.Connection, outcomes: tuple[str, ...]
+) -> list[aiosqlite.Row]:
+    """Последний прогон задачи в running, закрытый одним из ``outcomes`` (#1455).
+
+    Только прогон, закончившийся ПОСЛЕ входа задачи в running, и только без
+    сдачи его поколения: задачу, которую после остановки взяли снова или
+    уже сдали, старый прогон не трогает.
+    """
+    marks = ", ".join("?" for _ in outcomes)
+    return await fetchall(
+        db,
+        "SELECT r.* FROM executor_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE t.status = 'running' AND t.archived = 0 "
+        "AND r.id = (SELECT MAX(x.id) FROM executor_runs x WHERE x.task_id = t.id) "
+        f"AND r.outcome IN ({marks}) AND r.finished_at IS NOT NULL "  # nosec B608 - placeholders only, values are params
+        "AND r.finished_at >= COALESCE(t.status_entered_at, '') "
+        "AND COALESCE(t.submission_generation, 0) < r.submission_generation "
+        "ORDER BY r.id",
+        tuple(outcomes),
+    )
+
+
 async def update_executor_run(
     db: aiosqlite.Connection,
     row_id: int,
