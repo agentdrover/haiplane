@@ -607,6 +607,9 @@ def main() -> int:
             f"merge_base={str(baseline.get('merge_base'))[:12]}, "
             f"tests={len(baseline.get('tests') or {})}"
         )
+        for ac_id, nodeid in sorted(nodeid_by_ac.items()):
+            status = (baseline.get("tests") or {}).get(nodeid, "—")
+            log(f"  baseline {ac_id} {nodeid}: {status}")
     result = hub_request(f"{base}/api/tasks/{task_id}/ci-run-report", token, payload)
     if result is None:
         log("report not delivered — the hub will read this as unknown")

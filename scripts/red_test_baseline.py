@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess  # nosec B404 - git and pytest with fixed argv, in CI
 import sys
 import tempfile
@@ -138,10 +139,22 @@ def run_pytest(
         "junit_family=xunit1",
         *modules,
     ]
-    proc = subprocess.run(  # nosec B603 - fixed runner argv over our own files
-        argv, cwd=tree, env=env, capture_output=True, text=True, timeout=timeout
+    # Вывод не нужен (данные — junitxml) и копить его в памяти нельзя (#509).
+    # Своя группа процессов: таймаут убивает и внуков, а не только pytest.
+    proc = subprocess.Popen(  # nosec B603 - fixed runner argv over our own files
+        argv,
+        cwd=tree,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
-    return proc.returncode, junit
+    try:
+        return proc.wait(timeout=timeout), junit
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        raise
 
 
 def _counts(tests: dict[str, str]) -> dict[str, int]:
@@ -238,8 +251,6 @@ def main(argv: list[str] | None = None) -> int:
         f"collection_errors={sorted(report.get('collection_errors', {}))} "
         f"{report.get('reason', '')}"
     )
-    for nodeid, status in sorted(report.get("tests", {}).items()):
-        log(f"  {status:<7} {nodeid}")
     return 0
 
 

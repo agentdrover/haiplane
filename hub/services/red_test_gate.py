@@ -82,11 +82,15 @@ def validate_baseline(baseline: Mapping[str, Any]) -> None:
 
 
 def _combined(statuses: list[str]) -> str:
-    """Один статус на параметризованный тест: красный, только если все красные."""
-    for worst in (ERROR, PASSED, SKIPPED):
-        if worst in statuses:
-            return worst
-    return FAILED
+    """Один статус на параметризованный тест: красный, если упал хоть один.
+
+    Красный тест часто — новый кейс в существующем parametrize: на базе он
+    падает, соседние проходят, и это воспроизведение, а не «зелёный до фикса».
+    """
+    for status in (FAILED, ERROR, PASSED):
+        if status in statuses:
+            return status
+    return SKIPPED
 
 
 def baseline_status(baseline: Mapping[str, Any], test_ref: str) -> str:

@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess  # nosec B404 - the test drives git and the baseline script
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -578,3 +580,42 @@ def test_cli_submit_review_carries_no_evidence_of_its_own():
         assert cli.main() == 0
     _, _, body = api.call_args.args
     assert "baseline" not in body
+
+
+def test_parametrized_ref_is_red_when_any_variant_failed():
+    """Находка d74b853b: новый падающий кейс в parametrize — воспроизведение."""
+    ac = [{"ac_id": "AC-1", "verifiable_by": "test", "test_ref": _REF_1}]
+    mixed = _baseline({f"{_REF_1}[a]": "passed", f"{_REF_1}[new]": "failed"})
+    proofs, found = red_test_gate.evaluate(ac, mixed, head_sha=_TIP)
+    assert [p.ac_id for p in proofs] == ["AC-1"] and not found
+    green = _baseline({f"{_REF_1}[a]": "passed", f"{_REF_1}[b]": "passed"})
+    proofs, found = red_test_gate.evaluate(ac, green, head_sha=_TIP)
+    assert not proofs and "зелёный до фикса" in found[0]
+
+
+def test_baseline_timeout_kills_the_process_group(tmp_path):
+    """Находка 765b0253: таймаут убивает pytest вместе с внуками."""
+    spec = importlib.util.spec_from_file_location("red_test_baseline", _BASELINE_SCRIPT)
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    pids = tmp_path / "pids"
+    hang = tmp_path / "hang.py"
+    hang.write_text(
+        "import os, subprocess, sys, time\n"
+        "kid = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"open({str(pids)!r}, 'w').write(f'{{os.getpid()}} {{kid.pid}}')\n"
+        "time.sleep(60)\n"
+    )
+    report = script.build_baseline(
+        _bug_repo(tmp_path), "develop", runner=[sys.executable, str(hang)], timeout=3
+    )
+    assert report["state"] == "error" and "дольше 3" in report["reason"], report
+    for pid in map(int, pids.read_text().split()):
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f"процесс {pid} пережил таймаут")
