@@ -38,7 +38,9 @@ from fastapi import HTTPException
 
 from hub import repository as repo
 from hub.db import fetchall
-from hub.models import DefectPrevention
+from hub.models import FINAL_STATUSES, DefectPrevention
+
+_FINAL = frozenset(s.value for s in FINAL_STATUSES)
 
 CLOSED_WITHOUT_PREVENTION = "prod_defect_closed_without_prevention"
 
@@ -133,18 +135,63 @@ async def record_done_prevention(
             refuse_without_prevention(task)
         return
     record = await validate_prevention(db, prevention)
-    record["recorded_by"] = actor
-    record["recorded_at"] = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    await store_prevention(db, task["id"], record, actor=actor)
+
+
+async def store_prevention(
+    db: aiosqlite.Connection, task_id: int, record: dict[str, str], *, actor: str
+) -> None:
+    """Write a validated output next to the defect, with its event. No commit."""
+    stored = dict(record)
+    stored["recorded_by"] = actor
+    stored["recorded_at"] = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     await repo.update_task(
-        db, task["id"], defect_prevention=json.dumps(record, ensure_ascii=False)
+        db, task_id, defect_prevention=json.dumps(stored, ensure_ascii=False)
     )
     await repo.insert_event(
         db,
         kind="defect_prevention_recorded",
-        task_id=task["id"],
+        task_id=task_id,
         actor=actor,
-        payload=record,
+        payload=stored,
     )
+
+
+async def check_submission(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    prevention: DefectPrevention | None,
+) -> dict[str, str] | None:
+    """Pair-submission door: the validated output to store, or a refusal.
+
+    Validates only — the write waits for the transition, past every gate
+    that could still refuse, like the finding outcomes (#911): an output
+    recorded for a submission that never happened would read as answered.
+    """
+    if prevention is None:
+        refuse_without_prevention(task)
+        return None
+    return await validate_prevention(db, prevention)
+
+
+ROLLUP_HELD_NOTE = (
+    "Родитель — прод-дефект (found_in='prod') без вывода: роллап не закрыл "
+    "его, хотя дети завершены. Закрытие ждёт собственного отчёта с выводом "
+    "(hub_report_done prevention=...) — регрессионный тест, правило из "
+    "category_checks или принятый риск с причиной и сроком пересмотра."
+)
+
+
+async def note_rollup_held(db: aiosqlite.Connection, parent_id: int) -> None:
+    """Rollup skipped for a prod defect: said once, not on every child (#919)."""
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM task_updates WHERE task_id=? AND agent='hub' AND content=?",
+        (parent_id, ROLLUP_HELD_NOTE),
+    )
+    if rows:
+        return
+    await repo.add_task_update(db, parent_id, "hub", "status", ROLLUP_HELD_NOTE)
 
 
 async def hold_completion(
@@ -156,7 +203,12 @@ async def hold_completion(
     earlier in the same transaction. No commit: the caller owns it.
     """
     row = await repo.get_task(db, task_id)
-    gap = prevention_gap(dict(row)) if row else ""
+    if row is None or dict(row)["status"] in _FINAL:
+        # Only the way INTO completed is gated. A task already closed — by a
+        # human through the emergency exit, say — is not reopened by a sweep
+        # that happens to pass over it.
+        return False
+    gap = prevention_gap(dict(row))
     if not gap:
         return False
     await repo.update_task(db, task_id, status="needs_decision")

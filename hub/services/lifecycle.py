@@ -372,7 +372,9 @@ async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
         return
     if prevention_gate.prevention_gap(parent):
         # #919: a rollup cannot answer for a prod defect's output; the parent
-        # waits for its own report, like one with its own work above.
+        # waits for its own report, like one with its own work above — and,
+        # like it, says so instead of standing silently.
+        await prevention_gate.note_rollup_held(db, parent_id)
         return
 
     if not await repo.transition_status_if(
@@ -2099,6 +2101,8 @@ class SubmitContext:
     #: #1362: сдача пришла из needs_decision после конфликта с базой.
     resubmitted_after_base_conflict: bool = False
     replaced_sha: str = ""
+    #: #919: вывод прод-дефекта, проверенный шагом и записываемый переходом.
+    prevention_record: dict[str, str] | None = None
     canonical: str = ""
     reported: str = ""
     diff_paths: list[str] | None = None
@@ -2155,8 +2159,11 @@ async def _step_task_is_submittable(state: SubmitContext) -> None:
             f"can only submit running or under-review pair tasks for review, "
             f"current status: {state.task['status']}",
         )
-    # #919: the last word the agent has before the poller delivers.
-    prevention_gate.refuse_without_prevention(state.task)
+    # #919: the last word the agent has before the poller delivers — the
+    # output rides the submission itself and is written with the transition.
+    state.prevention_record = await prevention_gate.check_submission(
+        state.db, state.task, state.body.prevention
+    )
     # #1054: what this submission replaces, read before anything is written.
     state.resubmitted_from_review = state.task["status"] == "review"
     state.replaced_sha = (state.task.get("submission_sha") or "").strip()
@@ -2898,6 +2905,8 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         await _step_surfaces(state)
 
     async with write_transaction(db):
+        # #919: вывод прод-дефекта, присланный с повтором, не тонет молча.
+        await _store_submitted_prevention(state)
         # AC-5: то же место в транзакции, что и в _apply_submission — до
         # того, как решение о ревью уходит за пределы транзакции ниже.
         # Поколение, которому отвечают исходы, — ТЕКУЩЕЕ: здесь оно не растёт.
@@ -3217,6 +3226,18 @@ async def _warn_on_branch_stacking(
     return stacking
 
 
+async def _store_submitted_prevention(state: SubmitContext) -> None:
+    """#919: the prevention output checked by the pipeline, written in-tx."""
+    if state.prevention_record is None:
+        return
+    await prevention_gate.store_prevention(
+        state.db,
+        state.task_id,
+        state.prevention_record,
+        actor=(state.body.agent or state.task.get("assigned_agent") or "agent"),
+    )
+
+
 async def _apply_submission(state: SubmitContext) -> TaskView:
     """Сам переход: запись статуса, пиннинг сдачи и всё, что за ними (#1067).
 
@@ -3272,6 +3293,7 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
             state,
             reported_by=(body.agent or task.get("assigned_agent") or ""),
         )
+        await _store_submitted_prevention(state)
         generation = await repo.bump_submission_generation(db, task_id)
         # #758: the declared implementing model rides the submission the
         # same way the branch does — a report, not an observation, kept

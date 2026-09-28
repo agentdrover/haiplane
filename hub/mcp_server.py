@@ -2173,12 +2173,13 @@ async def hub_submit_for_review(
     accept_areas: bool = False,
     finding_outcomes: list[dict[str, Any]] | None = None,
     mutations: list[dict[str, Any]] | None = None,
+    prevention: dict[str, Any] | None = None,
 ) -> str:
     """AUTHOR step: hand your work to a review by someone else (#307).
 
-    It does NOT complete the task: a different actor writes the verdict
-    (hub_get_review_brief, hub_submit_review). Bumps the generation, invalidating any earlier APPROVED; resubmitting
-    the same commit from review keeps it (#1265).
+    Does NOT complete the task: another actor writes the verdict. Bumps the
+    generation, voiding an earlier APPROVED; the same commit resubmitted
+    from review keeps it (#1265).
 
     Args:
         task_id: The running pair task ID
@@ -2197,6 +2198,7 @@ async def hub_submit_for_review(
             owe a note; one leaving the defect leaves a draft.
         mutations: [{ac, mutation, failed_test}], one per test AC;
             failed_test = its test_ref. submission_contract checks it (#1436).
+        prevention: as in hub_report_done (#919).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -2216,6 +2218,8 @@ async def hub_submit_for_review(
         body["finding_outcomes"] = finding_outcomes
     if mutations:
         body["mutations"] = mutations
+    if prevention:
+        body["prevention"] = prevention
     try:
         task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
     except HubApiError as exc:

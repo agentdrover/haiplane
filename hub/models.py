@@ -816,6 +816,25 @@ class SubmissionMutation(BaseModel):
     failed_test: str = Field("", max_length=500)
 
 
+#: The three prevention outputs a closed prod defect may leave (#919).
+PreventionKind = Literal["regression_test", "rule", "accepted_risk"]
+
+
+class DefectPrevention(BaseModel):
+    """What a production defect leaves behind when it closes (#919).
+
+    Shape only. Which fields each kind needs — a test locator, a catalogued
+    category, a reason AND a revisit condition — is checked by
+    ``hub.services.prevention_gate``, so the refusal can name all three
+    options in one answer instead of a pydantic path.
+    """
+
+    kind: PreventionKind
+    ref: str = Field("", max_length=500)
+    reason: str = Field("", max_length=2000)
+    revisit: str = Field("", max_length=500)
+
+
 class TaskSubmitReview(BaseModel):
     """Submit the current work of a pair task for review (#305)."""
 
@@ -847,6 +866,9 @@ class TaskSubmitReview(BaseModel):
     # failed_test}. Обязательность — по политике проекта submission_contract;
     # при off поле просто пишется в карточку, если прислано.
     mutations: list[SubmissionMutation] = Field(default_factory=list, max_length=50)
+    # #919: the prevention output of a production defect. The pair author's
+    # last word before the poller delivers, so it rides the submission.
+    prevention: DefectPrevention | None = None
 
 
 class ReviewFinding(BaseModel):
@@ -1645,24 +1667,6 @@ class TaskReturnToWork(BaseModel):
 
 
 REPORT_KINDS = frozenset({"done", "status", "blocker"})
-
-#: The three prevention outputs a closed prod defect may leave (#919).
-PreventionKind = Literal["regression_test", "rule", "accepted_risk"]
-
-
-class DefectPrevention(BaseModel):
-    """What a production defect leaves behind when it closes (#919).
-
-    Shape only. Which fields each kind needs — a test locator, a catalogued
-    category, a reason AND a revisit condition — is checked by
-    ``hub.services.prevention_gate``, so the refusal can name all three
-    options in one answer instead of a pydantic path.
-    """
-
-    kind: PreventionKind
-    ref: str = Field("", max_length=500)
-    reason: str = Field("", max_length=2000)
-    revisit: str = Field("", max_length=500)
 
 
 class TaskUpdateCreate(BaseModel):

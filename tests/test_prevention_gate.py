@@ -197,6 +197,103 @@ async def test_stale_parent_repair_is_held(db):
     assert (await _row(db, parent))["status"] == "running"
 
 
+@pytest.mark.parametrize("closed", ["completed", "failed", "rejected"])
+async def test_hold_leaves_a_closed_defect_closed(db, closed):
+    """Only the way INTO completed is gated (review 9592c0fad3a4a46e)."""
+    from hub.services.prevention_gate import hold_completion
+
+    task_id = await _defect(db, status=closed)
+    assert not await hold_completion(db, task_id, via="poller_delivery", actor="hub")
+    await db.commit()
+    assert (await _row(db, task_id))["status"] == closed
+    assert not await _events(db, task_id, "needs_decision")
+
+
+async def test_poller_sweep_leaves_a_force_completed_defect_closed(db):
+    from hub import poller
+    from hub.models import TaskForceComplete
+    from hub.services.lifecycle import force_complete_task
+
+    task_id = await _defect(db, status="running")
+    await force_complete_task(db, task_id, TaskForceComplete(comment="stuck"))
+    stop = AsyncMock(side_effect=RuntimeError("past the gate"))
+    with patch("hub.services.resolve_delivery_pr", stop):
+        with pytest.raises(RuntimeError, match="past the gate"):
+            await poller._deliver_pair_task(db, await _row(db, task_id))
+    assert (await _row(db, task_id))["status"] == "completed"
+    assert not await _events(db, task_id, "needs_decision")
+
+
+async def test_held_rollup_says_so_once(db):
+    """Review daf11404103bda70: a skipped rollup leaves one line, not none."""
+    from hub.services.lifecycle import maybe_rollup_parent
+    from hub.services.prevention_gate import ROLLUP_HELD_NOTE
+
+    parent = await _defect(db, status="running", task_type="feature")
+    first = await _defect(db, found_in="unknown", status="completed", parent_id=parent)
+    second = await _defect(db, found_in="unknown", status="completed", parent_id=parent)
+    await maybe_rollup_parent(db, first)
+    await maybe_rollup_parent(db, second)
+    await db.commit()
+    notes = await db.execute_fetchall(
+        "SELECT 1 FROM task_updates WHERE task_id=? AND content=?",
+        (parent, ROLLUP_HELD_NOTE),
+    )
+    assert len(notes) == 1
+
+
+async def _pair_defect(db) -> int:
+    task_id = await _defect(db, status="running")
+    await db.execute(
+        "UPDATE tasks SET branch='task-1/fix', git_mode='remote', auto_review=1 "
+        "WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    return task_id
+
+
+async def test_pair_prod_defect_submits_with_its_prevention(client, db):
+    """The pair author's path: the output rides the submission (question 3)."""
+    task_id = await _pair_defect(db)
+    body = {"agent": "dev", "branch": "task-1/fix"}
+
+    refused = await client.post(f"/api/tasks/{task_id}/submit-review", json=body)
+    assert refused.status_code == 422 and "prevention_required" in refused.text
+
+    bad = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json=body | {"prevention": {"kind": "accepted_risk", "reason": "x"}},
+    )
+    assert bad.status_code == 422
+    assert (await _row(db, task_id))["defect_prevention"] is None
+
+    ok = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json=body | {"prevention": {"kind": "regression_test", "ref": "tests/t.py::t"}},
+    )
+    assert ok.status_code == 200, ok.text
+    row = await _row(db, task_id)
+    assert row["status"] == "review"
+    assert json.loads(row["defect_prevention"])["ref"] == "tests/t.py::t"
+    assert await _events(db, task_id, "defect_prevention_recorded")
+
+
+async def test_submission_refused_later_leaves_no_prevention(client, db):
+    """Written with the transition: a later gate's refusal records nothing."""
+    task_id = await _pair_defect(db)
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review",
+        json={
+            "agent": "dev",
+            "branch": "task-1/other",
+            "prevention": {"kind": "regression_test", "ref": "tests/t.py::t"},
+        },
+    )
+    assert resp.status_code >= 400
+    assert (await _row(db, task_id))["defect_prevention"] is None
+
+
 async def test_human_accept_closes_but_records_the_missing_output(db):
     from hub.models import TaskDecide
     from hub.services.lifecycle import decide_task
@@ -346,6 +443,36 @@ def test_cli_update_passes_prevention():
         assert args.func(args) == 0
     body = api.call_args.args[2]
     assert body["prevention"] == {"kind": "rule", "ref": "gate-semantics"}
+
+
+async def test_mcp_submit_for_review_passes_prevention():
+    from hub import mcp_server
+
+    post = AsyncMock(return_value={"id": 5, "status": "review"})
+    prevention = {"kind": "regression_test", "ref": "tests/t.py::t"}
+    with (
+        patch.object(mcp_server, "_api_post", post),
+        patch.object(mcp_server, "_read_task", AsyncMock(return_value=None)),
+    ):
+        await mcp_server.hub_submit_for_review(5, prevention=prevention)
+    assert post.await_args.args[1]["prevention"] == prevention
+
+
+def test_cli_submit_review_passes_prevention():
+    from hub.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "submit-review",
+            "5",
+            "--prevention",
+            '{"kind": "regression_test", "ref": "tests/t.py::t"}',
+        ]
+    )
+    with patch("hub.cli._api", return_value={"id": 5, "status": "review"}) as api:
+        args.func(args)
+    body = api.call_args.args[2]
+    assert body["prevention"]["kind"] == "regression_test"
 
 
 def test_cli_update_refuses_bad_prevention_json():
