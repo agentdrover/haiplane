@@ -1847,3 +1847,92 @@ async def test_a_second_observation_does_not_overwrite_the_first(
     assert len(matching) == 1, (
         f"повтор записал дублирующее событие delivery_observed: {len(matching)}"
     )
+
+
+# --- #930: the MCP reply to hub_decide_task says it too ----------------------
+
+
+async def _mcp_decide(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    task_id: int,
+    **kwargs: Any,
+) -> str:
+    """hub_decide_task over the real REST routes; returns the reply's message.
+
+    The tool is a REST client, so routing its two calls into the app is the
+    whole of the wiring: the alert it reads is the one #897 really writes.
+    """
+    import json
+
+    from hub import mcp_server
+
+    async def _get(path: str, **_: Any) -> Any:
+        return (await client.get(path)).json()
+
+    async def _post(path: str, body: Any = None, **_: Any) -> Any:
+        return (await client.post(path, json=body or {})).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _get)
+    monkeypatch.setattr(mcp_server, "_api_post", _post)
+    reply = await mcp_server.hub_decide_task(task_id, "accept", **kwargs)
+    return json.loads(reply)["message"]
+
+
+async def test_mcp_decide_reply_names_the_undelivered_pr(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-1 (#930): the person reading the MCP reply is the one deciding.
+
+    Before #930 the reply said "decision 'accept' applied (status: completed)"
+    and nothing else, while the card carried the alert with the PR number.
+    """
+    task_id = await _task_awaiting_decision(client, db, title="Open PR", pr=444)
+    _pr_states(monkeypatch, {444: "open"})
+
+    message = await _mcp_decide(client, monkeypatch, task_id)
+
+    assert "status: completed" in message
+    assert "PR #444" in message
+    assert "НЕ доставлен" in message
+    assert "Судьба PR не выбрана" in message
+
+    # The owner's choice, when made, is named in the reply as well.
+    other = await _task_awaiting_decision(client, db, title="Cancelled", pr=445)
+    _pr_states(monkeypatch, {445: "open"})
+
+    message = await _mcp_decide(client, monkeypatch, other, pr_disposition="abandon")
+
+    assert "PR #445" in message
+    assert "НЕ доставлен" in message
+    assert "работа отменена" in message
+
+
+async def test_mcp_decide_reply_is_quiet_when_nothing_is_undelivered(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-2 (#930): no PR, or a PR already delivered — the reply stays as it was.
+
+    A warning that fires in the ordinary case teaches the reader to skip it.
+    """
+    no_pr = (await client.post("/api/tasks", json={"title": "Spike"})).json()["id"]
+    await repo.update_task(db, no_pr, status="needs_decision")
+    await db.commit()
+    _pr_states(monkeypatch, {})
+
+    assert await _mcp_decide(client, monkeypatch, no_pr) == (
+        f"Task #{no_pr}: decision 'accept' applied (status: completed)."
+    )
+
+    delivered = await _task_awaiting_decision(client, db, title="Merged", pr=903)
+    await db.execute(
+        "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merge_sha) "
+        "VALUES (?, ?, ?, ?)",
+        (1, 903, delivered, "a" * 40),
+    )
+    await db.commit()
+    _pr_states(monkeypatch, {903: "merged"})
+
+    assert await _mcp_decide(client, monkeypatch, delivered) == (
+        f"Task #{delivered}: decision 'accept' applied (status: completed)."
+    )

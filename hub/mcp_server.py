@@ -2908,6 +2908,44 @@ async def hub_answer_question(task_id: int, answer: str, resume: bool = True) ->
 # ---------------------------------------------------------------------------
 
 
+#: Начало alert-а, который пишет delivery_state._acceptance_note (#897).
+_ACCEPTANCE_NOTE_HEAD = "Задача принята вручную"
+
+
+def _new_acceptance_alert(prior: dict[str, Any] | None, task: dict[str, Any]) -> str:
+    """The #897 alert this very call left on the task, or ``""``."""
+    prior_updates = (prior or {}).get("updates") or []
+    seen = max((int(u.get("id") or 0) for u in prior_updates), default=0)
+    for upd in task.get("updates") or []:
+        content = str(upd.get("content") or "")
+        if (
+            int(upd.get("id") or 0) > seen
+            and upd.get("kind") == "alert"
+            and content.startswith(_ACCEPTANCE_NOTE_HEAD)
+        ):
+            return content
+    return ""
+
+
+def _undelivered_pr_note(prior: dict[str, Any] | None, task: dict[str, Any]) -> str:
+    """#930: name the PR a completion left undelivered, in the reply itself.
+
+    Not a second computation: it repeats the alert note_completion_without_
+    delivery wrote during this call. A delivered task gets no alert, so the
+    reply stays as it was.
+    """
+    pr = task.get("pr_number")
+    alert = _new_acceptance_alert(prior, task) if pr else ""
+    if not alert:
+        return ""
+    head = (
+        "доставка кода НЕ подтверждена"
+        if "подтвердить не удалось" in alert
+        else "код НЕ доставлен"
+    )
+    return f" PR #{pr}: {head}. {alert}"
+
+
 @mcp.tool()
 async def hub_decide_task(
     task_id: int,
@@ -2944,6 +2982,7 @@ async def hub_decide_task(
         "pr_disposition": pr_disposition,
     }
     prior_status: str | None = None
+    prior_task: dict[str, Any] | None = None
     try:
         prior_task = await _api_get(f"/api/tasks/{task_id}")
         prior_status = prior_task.get("status")
@@ -2960,6 +2999,7 @@ async def hub_decide_task(
         suffix = " (decision recorded)"
     message = (
         f"Task #{task_id}: decision '{action}' applied (status: {status}).{suffix}"
+        f"{_undelivered_pr_note(prior_task, task)}"
     )
     return _format_mutation_success(message, task, transition_from=prior_status)
 
