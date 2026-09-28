@@ -501,6 +501,26 @@ lite в среднем 1.38M, deep 3.85M. Столбец Tokens рядом — �
     </tbody>
 </table>
 
+<h2>Часы прод-дефекта (#916)</h2>
+{% set dc = m.prod_defect_clocks %}
+<p class="muted">time-to-detect — от выката релиза, привязанного к дефекту
+(deployed_at), до detected_at; time-to-restore — от detected_at до resolved_at,
+который ставится при закрытии дефекта. Только записанные факты: строка без
+факта в медиану не входит и считается в своей причине, из updated_at часы не
+достраиваются. Прод-дефектов в окне: {{ dc.defects }}.</p>
+<table class="task-table">
+    <thead><tr><th>Часы</th><th>В медиане</th><th>Неизмеримые</th>
+        <th>Median, hours</th></tr></thead>
+    <tbody>
+        {% for label, c in [("time-to-detect", dc.time_to_detect), ("time-to-restore", dc.time_to_restore)] %}
+        <tr><td>{{ label }}</td><td>{{ c.measured }}</td>
+            <td>{% if c.unmeasurable_total %}{{ c.unmeasurable_total }}:
+                {% for reason, n in c.unmeasurable.items() %}{{ reason }} {{ n }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}—{% endif %}</td>
+            <td>{% if c.median_hours is not none %}{{ c.median_hours }}{% else %}<span class="muted">нет измеримых</span>{% endif %}</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+
 <h2>Cycle time (ready → completed), median</h2>
 <p class="muted">Считается только по completed_at. У задач, завершённых до того,
 как эта колонка начала заполняться, момента завершения нет вовсе — раньше он
