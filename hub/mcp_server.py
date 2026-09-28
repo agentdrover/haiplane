@@ -2933,6 +2933,36 @@ async def hub_decide_task(
 # ---------------------------------------------------------------------------
 
 
+async def _propose_prod_defect(
+    title: str,
+    broken: str,
+    verify: str,
+    areas: list[str] | None,
+    agent: str,
+    parent_id: int | None,
+) -> str:
+    """The prod-defect branch of hub_propose_task: POST /api/prod-defects."""
+    body: dict[str, Any] = {
+        "title": title,
+        "broken": broken,
+        "verify": verify,
+        "affected_areas": list(areas or []),
+        "agent": agent,
+    }
+    if parent_id is not None:
+        body["parent_id"] = parent_id
+    filed = await _api_post("/api/prod-defects", body)
+    release = (
+        f"release #{filed['release_id']}"
+        if filed.get("release_id") is not None
+        else filed.get("release_reason", "")
+    )
+    return format_echo_response(
+        f"Prod defect draft #{filed['task']['id']} (expedite, found_in=prod); "
+        f"{release}. Awaiting human approval."
+    )
+
+
 @mcp.tool()
 async def hub_propose_task(
     title: str,
@@ -2944,6 +2974,8 @@ async def hub_propose_task(
     human_reviewer: str = "",
     task_type: str = "task",
     project: str = "",
+    defect_verify: str = "",
+    affected_areas: list[str] | None = None,
 ) -> str:
     """Propose new work for human approval (used by agents). Creates a DRAFT.
 
@@ -2961,7 +2993,13 @@ async def hub_propose_task(
         human_reviewer: Person who will review and accept the result
         task_type: task (default), subtask, feature, or epic
         project: Project slug — only when proposing an epic (#346)
+        defect_verify: Prod defect (#915): how to check the fix; needs areas
+        affected_areas: Where it broke (prod defect)
     """
+    if defect_verify:
+        return await _propose_prod_defect(
+            title, description, defect_verify, affected_areas, agent, parent_id
+        )
     if task_type not in ("task", "subtask", "feature", "epic"):
         return format_echo_response(
             f"Invalid task_type {task_type!r}: use task, subtask, feature, or epic."
