@@ -110,6 +110,8 @@ BOOKKEEPING_FIELDS = frozenset(
         "caused_by_task_id",
         "detected_at",
         "clear_caused_by",
+        # #917: which release the defect showed up in — bookkeeping too.
+        "release_id",
     }
 )
 
@@ -154,7 +156,7 @@ def stamp_statement_date(payload: TaskRefine) -> TaskRefine:
 # while the reverse — a stale name here — is caught by the model_fields_set
 # intersection returning nothing.
 _PASSPORT_FIELDS = frozenset(
-    {"found_in", "caused_by_task_id", "detected_at", "clear_caused_by"}
+    {"found_in", "caused_by_task_id", "detected_at", "clear_caused_by", "release_id"}
 )
 
 
@@ -372,8 +374,16 @@ async def _apply_refine_writes(
             caused_by_task_id=payload.caused_by_task_id,
             detected_at=payload.detected_at,
             clear_caused_by=payload.clear_caused_by,
+            release_id=payload.release_id,
         )
         updated_columns.update(applied)
+
+    # #917: a culprit is proposed when the defect gets its release or its
+    # area changes — and recorded as a hypothesis, never as caused_by.
+    if {"release_id", "affected_areas"} & set(updated_columns):
+        from hub.services.defect_release import record_suggestions
+
+        await record_suggestions(db, task_id)
 
     if (
         old_row
