@@ -1953,7 +1953,11 @@ async def test_a_queue_launch_of_a_task_with_a_branch_starts_on_it(db, monkeypat
     project, task_id = await _launch_project(db, slug="exec-queue-branch")
     # Сдача была (#1452): ветка на форджe есть.
     await repo.update_task(
-        db, task_id, branch=f"task-{task_id}/work", submission_sha="c" * 40
+        db,
+        task_id,
+        branch=f"task-{task_id}/work",
+        submission_generation=1,
+        submission_sha="c" * 40,
     )
     await db.commit()
 
@@ -1983,3 +1987,28 @@ async def test_a_branch_name_without_a_submission_starts_on_the_base(db, monkeyp
     prompt = calls[0]["prompt_text"]
     assert "Ветка задачи уже есть" not in prompt
     assert "каноническое имя из ответа pair-start" in prompt
+
+
+async def test_a_submission_without_a_pinned_sha_still_starts_on_its_branch(
+    db, monkeypatch
+):
+    """Находка ревью #1452 (medium): сдача без пина sha (resolve_branch_tip не
+    ответил, вердикт на уехавшую вершину стёр пин) — ветка на форджe есть.
+    Признак сдачи — поколение, а не sha."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, task_id = await _launch_project(db, slug="exec-branch-no-pin")
+    await repo.update_task(
+        db,
+        task_id,
+        branch=f"task-{task_id}/work",
+        submission_generation=1,
+        submission_sha="",
+    )
+    await db.commit()
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert result.launched, result
+    assert calls[0]["starting_ref"] == f"task-{task_id}/work"
+    assert f"Ветка задачи уже есть — task-{task_id}/work" in calls[0]["prompt_text"]

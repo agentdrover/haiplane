@@ -210,9 +210,13 @@ def _pushed_branch(task: dict[str, Any]) -> str:
     или никогда: 28.09 прогон #1450 отменили по потолку до пуша, и заказ на
     это имя стартовал бы на несуществующей ссылке (#1452). Сдача закрепляет
     вершину запушенной ветки — поэтому признак «ветка есть» — сдача.
+
+    Сдача — по поколению, а не по sha (находка ревью #1452): хаб принимает
+    сдачу и без пина, когда вершину прочитать не удалось, а вердикт на
+    уехавшую вершину пин стирает (#1283) — ветка при этом на форджe есть.
     """
     branch = (task.get("branch") or "").strip()
-    return branch if branch and (task.get("submission_sha") or "").strip() else ""
+    return branch if branch and int(task.get("submission_generation") or 0) > 0 else ""
 
 
 def _prompt(
