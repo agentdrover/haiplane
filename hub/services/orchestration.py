@@ -22,6 +22,7 @@ import aiosqlite
 from hub import brand, commit_scope, config
 from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
+from hub.services.prevention_gate import hold_completion
 from hub.services.defect_clocks import (
     change_failure_rate,
     measured_escapes,
@@ -5260,6 +5261,15 @@ async def _complete_without_review(
         # but the reader is told which check did not run — an absent line
         # here would read as "there was nothing to deliver" (AC-4).
         await repo.add_task_update(db, task_id, "hub", "alert", pr_note)
+    # #919: before the merge, not after it — a prod defect without its
+    # prevention output is held, never delivered and completed silently.
+    if await hold_completion(
+        db,
+        task_id,
+        via="report_done",
+        actor=task.get("assigned_agent") or "agent",
+    ):
+        return "needs_decision"
     if task.get("pr_number") and not task.get("job_id"):
         if _running_deferred.get():
             # #1430: заметки выше (pr_note, «PR открыт хабом») не должны

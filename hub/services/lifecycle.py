@@ -44,7 +44,7 @@ from hub.db import (
 )
 from hub.integrations.registry import plugins
 from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
-from hub.services import submission_contract, verdict_text
+from hub.services import prevention_gate, submission_contract, verdict_text
 from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait
@@ -370,6 +370,12 @@ async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
     if _parent_has_own_work(parent):
         await _note_rollup_awaits_own_report(db, parent_id, parent)
         return
+    if prevention_gate.prevention_gap(parent):
+        # #919: a rollup cannot answer for a prod defect's output; the parent
+        # waits for its own report, like one with its own work above — and,
+        # like it, says so instead of standing silently.
+        await prevention_gate.note_rollup_held(db, parent_id)
+        return
 
     if not await repo.transition_status_if(
         db,
@@ -399,6 +405,7 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
         "ORDER BY CASE task_type WHEN 'feature' THEN 0 ELSE 1 END, id ASC",
     )
     repaired = 0
+    noted = False
     for row in rows:
         parent_id = row["id"]
         parent_row = await repo.get_task(db, parent_id)
@@ -410,9 +417,13 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
             continue
         if _parent_has_own_work(parent):
             continue
+        if prevention_gate.prevention_gap(parent):
+            await prevention_gate.note_rollup_held(db, parent_id)
+            noted = True
+            continue
         await repo.update_task(db, parent_id, status="completed")
         repaired += 1
-    if repaired:
+    if repaired or noted:
         await db.commit()
         log.info("Repaired %d stale parent task(s) to completed", repaired)
     return repaired
@@ -705,6 +716,9 @@ def row_to_task(
         created_at=d["created_at"],
         updated_at=d["updated_at"],
         archived=bool(d.get("archived", 0)),
+        defect_prevention=json.loads(d["defect_prevention"])
+        if d.get("defect_prevention")
+        else None,
         **structured_clean,
     )
 
@@ -2092,6 +2106,8 @@ class SubmitContext:
     #: #1362: сдача пришла из needs_decision после конфликта с базой.
     resubmitted_after_base_conflict: bool = False
     replaced_sha: str = ""
+    #: #919: вывод прод-дефекта, проверенный шагом и записываемый переходом.
+    prevention_record: dict[str, str] | None = None
     canonical: str = ""
     reported: str = ""
     diff_paths: list[str] | None = None
@@ -2148,6 +2164,11 @@ async def _step_task_is_submittable(state: SubmitContext) -> None:
             f"can only submit running or under-review pair tasks for review, "
             f"current status: {state.task['status']}",
         )
+    # #919: the last word the agent has before the poller delivers — the
+    # output rides the submission itself and is written with the transition.
+    state.prevention_record = await prevention_gate.check_submission(
+        state.db, state.task, state.body.prevention
+    )
     # #1054: what this submission replaces, read before anything is written.
     state.resubmitted_from_review = state.task["status"] == "review"
     state.replaced_sha = (state.task.get("submission_sha") or "").strip()
@@ -2889,6 +2910,8 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         await _step_surfaces(state)
 
     async with write_transaction(db):
+        # #919: вывод прод-дефекта, присланный с повтором, не тонет молча.
+        await _store_submitted_prevention(state)
         # AC-5: то же место в транзакции, что и в _apply_submission — до
         # того, как решение о ревью уходит за пределы транзакции ниже.
         # Поколение, которому отвечают исходы, — ТЕКУЩЕЕ: здесь оно не растёт.
@@ -3208,6 +3231,18 @@ async def _warn_on_branch_stacking(
     return stacking
 
 
+async def _store_submitted_prevention(state: SubmitContext) -> None:
+    """#919: the prevention output checked by the pipeline, written in-tx."""
+    if state.prevention_record is None:
+        return
+    await prevention_gate.store_prevention(
+        state.db,
+        state.task_id,
+        state.prevention_record,
+        actor=(state.body.agent or state.task.get("assigned_agent") or "agent"),
+    )
+
+
 async def _apply_submission(state: SubmitContext) -> TaskView:
     """Сам переход: запись статуса, пиннинг сдачи и всё, что за ними (#1067).
 
@@ -3263,6 +3298,7 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
             state,
             reported_by=(body.agent or task.get("assigned_agent") or ""),
         )
+        await _store_submitted_prevention(state)
         generation = await repo.bump_submission_generation(db, task_id)
         # #758: the declared implementing model rides the submission the
         # same way the branch does — a report, not an observation, kept
@@ -4628,6 +4664,9 @@ async def decide_task(
         if summary_text:
             update_content += f"\nDecision: {summary_text}"
         await repo.add_task_update(db, task_id, "human", "decision", update_content)
+        await prevention_gate.note_close_without_prevention(
+            db, task, via="decide_accept", actor="human"
+        )
         await repo.update_task(db, task_id, status="completed")
         await repo.insert_event(
             db,
@@ -4855,6 +4894,15 @@ async def add_update(
                 # identity, while the hub writing its own alerts has none by
                 # nature. Telling them apart is the point of the field.
                 author_kind="principal" if principal_id is not None else "anonymous",
+            )
+            # #919: inside the savepoint, before any route — a refused close
+            # of a prod defect takes its done row back with it.
+            await prevention_gate.record_done_prevention(
+                db,
+                task,
+                kind=body.kind,
+                prevention=body.prevention,
+                actor=body.agent or task.get("assigned_agent") or "agent",
             )
 
             if body.finding_outcomes:
@@ -5275,6 +5323,9 @@ async def force_complete_task(
     # Serialize against refinement _atomic savepoints on the shared connection.
     async with write_transaction(db):
         await repo.add_task_update(db, task_id, "human", "done", comment)
+        await prevention_gate.note_close_without_prevention(
+            db, task, via="force_complete", actor="human"
+        )
         await repo.update_task(db, task_id, **update_fields)
         await db.commit()
         await maybe_rollup_parent(db, task_id)
