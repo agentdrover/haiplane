@@ -2123,6 +2123,11 @@ async def test_human_can_stop_a_run_agent_cannot(client, db, monkeypatch):
     assert any("denis" in n and "run-7" in n for n in notes), notes
     assert any(OUTCOME_CANCELLED_BY_HUMAN in n and "подтверд" in n for n in notes)
     _no_key_in(row)
+    # Сдачи нет — проход поллера снимает задачу из running на решение (AC-3).
+    from hub.services.executor_dispatch import sweep_executor_runs
+
+    await sweep_executor_runs(db)
+    assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision"
 
     # Прогона больше нет — остановить нечего: 409 с причиной.
     again = await client.post(url, headers=human)
@@ -2147,6 +2152,7 @@ async def test_stopped_run_without_submission_moves_task_to_decision(db, monkeyp
     """
     from hub.services.executor_dispatch import (
         EVENT_RUN_STOPPED,
+        OUTCOME_CANCELLED_BY_HUMAN,
         OUTCOME_FAILED,
         sweep_executor_runs,
     )
@@ -2181,6 +2187,12 @@ async def test_stopped_run_without_submission_moves_task_to_decision(db, monkeyp
     ceiling_row = await _run(db, ceiling, agent_id="bc-ceil", run_id="run-ceil")
     await repo.update_executor_run(
         db, ceiling_row, cents=5.0, outcome=OUTCOME_OVER_CEILING, finish=True
+    )
+    # Остановлен человеком (исход подтверждён), сдачи нет.
+    by_human = await _task(db, "остановил человек")
+    human_row = await _run(db, by_human, agent_id="bc-hum", run_id="run-hum")
+    await repo.update_executor_run(
+        db, human_row, cents=5.0, outcome=OUTCOME_CANCELLED_BY_HUMAN, finish=True
     )
     # Сдача своего поколения легла — задача не трогается.
     delivered = await _task(db, "сдача легла")
@@ -2223,6 +2235,7 @@ async def test_stopped_run_without_submission_moves_task_to_decision(db, monkeyp
         errored: OUTCOME_FAILED,
         settled: OUTCOME_CANCELLED,
         ceiling: OUTCOME_OVER_CEILING,
+        by_human: OUTCOME_CANCELLED_BY_HUMAN,
     }
     for task_id, outcome in expected.items():
         task = dict(await repo.get_task(db, task_id))
