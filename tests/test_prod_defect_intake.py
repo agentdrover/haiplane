@@ -147,6 +147,8 @@ async def test_defect_draft_is_ready_and_waits_for_a_human(client, db):
     task = filed["task"]
 
     assert task["status"] == "draft"
+    # Authorship is recorded from the token (#360), and it is still a draft.
+    assert task["source"] == "human"
     assert task["dor_passed"] is True
     assert task["class_of_service"] == "expedite"
     assert task["work_type"] == "incident"
