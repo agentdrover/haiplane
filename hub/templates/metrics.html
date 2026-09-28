@@ -463,6 +463,30 @@ lite в среднем 1.38M, deep 3.85M. Столбец Tokens рядом — �
     </tbody>
 </table>
 
+{% if m.rule_breaches and m.rule_breaches.rules_total %}
+<h2>Пробитые правила каталога</h2>
+<p class="muted">Правило из category_checks, чей класс вернулся ПОСЛЕ даты
+заведения правила. Находки того же класса до этой даты — история, из которой
+правило выведено, и пробитием не считаются. Считается за всю жизнь правила, а
+не за окно: окно простило бы пробитие, дав ему устареть (#920).</p>
+<table class="task-table">
+    <thead><tr><th>Категория</th><th>Проверка</th><th>Заведено</th><th>Находок после</th><th>Задачи</th><th>Породивший дефект</th></tr></thead>
+    <tbody>
+        {% for r in m.rule_breaches.breached %}
+        <tr>
+            <td>{{ r.category }}</td><td><span class="badge">{{ r.check_ref }}</span></td>
+            <td>{{ r.rule_created_at }}</td><td>{{ r.breaches }}</td>
+            <td>{% for t in r.task_ids %}<a href="/tasks/{{ t }}">#{{ t }}</a> {% endfor %}</td>
+            <td>{% for d in r.source_defects %}<a href="/tasks/{{ d.task_id }}">#{{ d.task_id }}</a> {% else %}<span class="muted">не записан</span>{% endfor %}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="muted">Правил в каталоге: {{ m.rule_breaches.rules_total }};
+            ни одно не пробито после заведения.</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
 <h2>Escaped defects: утечки в прод</h2>
 <p class="muted">Recurring-категории показывают пойманное — находки, остановленные
 на гейте. Здесь обратная сторона: баг, заведённый уже после закрытия своей фичи,

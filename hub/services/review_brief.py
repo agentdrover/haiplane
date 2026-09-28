@@ -35,6 +35,7 @@ from hub.models import (
     ACTestResultView,
     BaseMergeState,
     CallSiteEntry,
+    CatalogueRuleView,
     CallSiteSection,
     OnlyTestsOutcomeView,
     CIRunReportState,
@@ -50,6 +51,7 @@ from hub.services import call_sites, review_evidence
 from hub.services.ac_tests import current_ac_test_results
 from hub.services.ci_report import ci_report_state
 from hub.services.review_availability import generation_review
+from hub.services.rule_catalogue import rules_for_areas
 from hub.services.statement_freshness import statement_freshness
 from hub.services.test_existence import (
     collect_test_nodeids,
@@ -554,6 +556,12 @@ async def build_review_brief(
     circle = await review_circle(db, int(task_row["id"]))
 
     return ReviewBrief(
+        # #920: the rules this area already paid for, from category_checks.
+        # An empty list renders no section at all — never a header over nothing.
+        catalogue_rules=[
+            CatalogueRuleView(**r)
+            for r in await rules_for_areas(db, list(task_view.affected_areas or []))
+        ],
         review_circle=ReviewCircleView(
             laps=circle.count,
             threshold=circle.threshold,

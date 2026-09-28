@@ -1339,6 +1339,34 @@ class ReviewCircleView(BaseModel):
     repeated_categories: list[str] = Field(default_factory=list)
 
 
+class RuleSourceDefect(BaseModel):
+    """The prod defect that named a catalogue rule on close (#919, #920)."""
+
+    task_id: int
+    title: str = ""
+
+
+class CatalogueRuleView(BaseModel):
+    """A category_checks rule whose area touches the task under review (#920).
+
+    The area is derived, not declared: where the class was met in confirmed
+    findings and in the defects that named the rule (see
+    ``hub.services.rule_catalogue``). ``source_defects`` is empty for a rule
+    recorded straight from the recurrence debt (#878) — no defect bought it.
+    """
+
+    category: str
+    check_ref: str
+    note: str = ""
+    #: When the rule was set up — not when its current check was recorded.
+    created_at: str = ""
+    #: The task's own areas that the rule's area touches.
+    matched_areas: list[str] = Field(default_factory=list)
+    source_defects: list[RuleSourceDefect] = Field(default_factory=list)
+    #: Tasks whose confirmed findings carried the class.
+    seen_in_tasks: list[int] = Field(default_factory=list)
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 
@@ -1417,6 +1445,9 @@ class ReviewBrief(BaseModel):
     # был разобран и закрыт по-настоящему, — иначе очередной отчёт читается
     # как первый.
     review_circle: ReviewCircleView = Field(default_factory=ReviewCircleView)
+    # #920: rules from category_checks whose area touches this task. Empty
+    # when none does — and then the rendered brief has no section for it.
+    catalogue_rules: list[CatalogueRuleView] = Field(default_factory=list)
     submission_generation: int = 0
     # #572: what code the submission pinned, where the branch stands now, and
     # whether they agree. sha_check is "match" | "diverged" | "unknown" —
