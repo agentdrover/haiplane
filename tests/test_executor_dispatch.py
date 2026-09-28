@@ -2206,6 +2206,13 @@ async def test_stopped_run_without_submission_moves_task_to_decision(db, monkeyp
         "UPDATE tasks SET status_entered_at=datetime('now', '+1 minute') WHERE id=?",
         (retaken,),
     )
+    # Старый прогон отменён, но идёт новый — судит последний прогон задачи.
+    relaunched = await _task(db, "новый прогон идёт")
+    old_row = await _run(db, relaunched, agent_id="bc-o", run_id="run-o")
+    await repo.update_executor_run(
+        db, old_row, cents=5.0, outcome=OUTCOME_CANCELLED, finish=True
+    )
+    await _run(db, relaunched, agent_id="bc-n", run_id="run-n", generation=2)
     await db.commit()
 
     await sweep_executor_runs(db)
@@ -2228,7 +2235,7 @@ async def test_stopped_run_without_submission_moves_task_to_decision(db, monkeyp
         assert payload["reason"] == EVENT_RUN_STOPPED, payload
         assert payload["outcome"] == outcome, payload
         assert any(outcome in a for a in await _alerts(db, task_id)), task_id
-    for task_id in (delivered, finished, retaken):
+    for task_id in (delivered, finished, retaken, relaunched):
         assert dict(await repo.get_task(db, task_id))["status"] == "running", task_id
 
     # Второй проход ничего не повторяет: задача уже не в running.
