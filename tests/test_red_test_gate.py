@@ -126,9 +126,25 @@ async def _report_baseline(
     body: dict[str, Any] = {"head_sha": _TIP, "ac_results": {}}
     if baseline is not None:
         body["baseline"] = baseline
-    resp = await client.post(f"/api/tasks/{task_id}/ci-run-report", json=body)
+    resp = await _post_as_ci(client, task_id, body)
     assert resp.status_code == 200, resp.text
     return resp.json()
+
+
+async def _post_as_ci(client: AsyncClient, task_id: int, body: dict[str, Any]):
+    """POST ci-run-report под токеном с tasks.ci_report — как ходит CI."""
+    from hub import config
+
+    tokens = config.parse_tokens("ci:ci-token:admin")
+    with (
+        patch.object(config, "HUB_TOKENS", tokens),
+        patch.object(config, "HUB_AUTH_DISABLED", False),
+    ):
+        return await client.post(
+            f"/api/tasks/{task_id}/ci-run-report",
+            json=body,
+            headers={"Authorization": "Bearer ci-token"},
+        )
 
 
 def _baseline(tests: dict[str, str], **extra: Any) -> dict[str, Any]:
@@ -455,9 +471,7 @@ def test_bug_red_test_policy_reads_off_warn_require():
         validated_gate_policy({BUG_RED_TEST_KEY: "strict"})
 
 
-async def test_warn_writes_one_record_and_off_changes_nothing(
-    client: AsyncClient, db
-):
+async def test_warn_writes_one_record_and_off_changes_nothing(client: AsyncClient, db):
     task_id = await _running_bug(db, "red-warn", "warn")
     await _report_baseline(client, task_id, _baseline({_REF_1: "failed"}))
     resp, dispatch = await _submit(client, task_id)
@@ -496,15 +510,15 @@ async def test_ci_report_keeps_baseline_and_refuses_unknown_status(
     assert json.loads(row["baseline"]) == baseline
     assert json.loads(row["mutations"]) == {}, "рядом с mutations, не вместо"
 
-    bad = await client.post(
-        f"/api/tasks/{task_id}/ci-run-report",
-        json={"head_sha": _TIP, "baseline": _baseline({_REF_1: "red"})},
+    bad = await _post_as_ci(
+        client, task_id, {"head_sha": _TIP, "baseline": _baseline({_REF_1: "red"})}
     )
     assert bad.status_code == 400, bad.text
     assert "baseline" in bad.text
-    huge = await client.post(
-        f"/api/tasks/{task_id}/ci-run-report",
-        json={"head_sha": _TIP, "baseline": {"state": "ran", "blob": "x" * 40_000}},
+    huge = await _post_as_ci(
+        client,
+        task_id,
+        {"head_sha": _TIP, "baseline": {"state": "ran", "blob": "x" * 40_000}},
     )
     assert huge.status_code == 400, huge.text
 

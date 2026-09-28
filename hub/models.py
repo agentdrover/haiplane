@@ -354,6 +354,9 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #1433: сверка областей при захвате задачи. Не гейт и ничего не
     # делегирует. Читатель: project_policy.claim_area_check_of.
     "claim_area_check",
+    # #913: гейт красного теста для work_type=bug. Не делегирует. Читатель:
+    # project_policy.bug_red_test_of.
+    "bug_red_test",
     # #1434: минут тишины, после которых поллер освобождает слот исполнителя.
     # Не гейт и ничего не делегирует. Читатель: executor_slots.dead_minutes_of.
     "slot_dead_minutes",
@@ -457,6 +460,17 @@ def _validate_submission_contract(policy: dict[str, Any]) -> None:
             "gate_policy submission_contract must be one of "
             f"{', '.join(SUBMISSION_CONTRACT_MODES)}, "
             f"got: {policy['submission_contract']!r}"
+        )
+
+
+def _validate_bug_red_test(policy: dict[str, Any]) -> None:
+    """Refuse a red-test gate mode the reader would read as warn by accident (#913)."""
+    from hub.services.project_policy import BUG_RED_TEST_MODES
+
+    if "bug_red_test" in policy and policy["bug_red_test"] not in BUG_RED_TEST_MODES:
+        raise ValueError(
+            "gate_policy bug_red_test must be one of "
+            f"{', '.join(BUG_RED_TEST_MODES)}, got: {policy['bug_red_test']!r}"
         )
 
 
@@ -2688,6 +2702,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_review_limit(v)
     _validate_orchestrator_queue(v)
     _validate_submission_contract(v)
+    _validate_bug_red_test(v)
     _validate_claim_area_check(v)
     _validate_slot_dead_minutes(v)
     _validate_executor_launch(v)
@@ -2945,6 +2960,10 @@ class CIRunReportSubmit(BaseModel):
     # ``checks`` would tell the reviewer the code is "known-broken" whenever a
     # weak test exists. Omitted ⇒ stored as {} and reported as not_reported.
     mutations: dict[str, Any] = Field(default_factory=dict)
+    # The branch's changed tests run over the merge-base code (#913): state,
+    # merge_base and {nodeid: failed|passed|error|skipped}. Evidence for the
+    # red-test gate on bugs. Omitted ⇒ stored as {} and read as "no baseline".
+    baseline: dict[str, Any] = Field(default_factory=dict)
     validation_status: str = Field("", max_length=20)
     validation_log: str = Field("", max_length=4000)
     reason: str = Field("", max_length=500)
@@ -2962,6 +2981,7 @@ class CIRunReportResult(BaseModel):
     ac_ignored: list[str] = Field(default_factory=list)
     validation_status: str = ""
     mutations_state: str = "not_reported"
+    baseline_state: str = "not_reported"
 
 
 class OutcomeVerdict(str, Enum):
