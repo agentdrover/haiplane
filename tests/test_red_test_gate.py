@@ -428,6 +428,13 @@ def test_baseline_step_runs_branch_tests_on_merge_base(tmp_path, monkeypatch):
     reporter_step = next(s for s in steps if "hub-ci-report" in str(s.get("uses")))
     assert steps.index(step) < steps.index(reporter_step)
     assert reporter_step["with"]["baseline-file"] in step["run"]
+    action = yaml.safe_load(
+        (_ROOT / ".github" / "actions" / "hub-ci-report" / "action.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    env = action["runs"]["steps"][0]["env"]
+    assert env["HAIPLANE_HUB_CI_BASELINE"] == "${{ inputs.baseline-file }}"
 
     reporter = _load_reporter()
     monkeypatch.setenv("HAIPLANE_HUB_URL", "https://hub.example")
