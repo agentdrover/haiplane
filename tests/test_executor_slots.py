@@ -480,7 +480,10 @@ async def _fresh(migrations) -> aiosqlite.Connection:
 @pytest.mark.asyncio
 async def test_migration_is_last_and_idempotent_on_clean_and_filled_db():
     names = [name for name, _ in hub_db._MIGRATIONS]
-    assert set(names[-len(_MINE) :]) == _MINE, "миграция #1434 — в конце списка"
+    # Была «в конце списка»; следующая миграция (#919) законно встала за ней,
+    # поэтому проверяется то, что важно: блок #1434 цельный и не разорван.
+    idx = sorted(names.index(name) for name in _MINE)
+    assert idx == list(range(idx[0], idx[0] + len(_MINE))), "блок #1434 цельный"
 
     clean = await _fresh(hub_db._MIGRATIONS)
     try:

@@ -27,6 +27,7 @@ import pytest
 from hub import repository as repo
 from hub.db import _MIGRATIONS, _SCHEMA, _migrate
 
+
 async def _defect(
     db: aiosqlite.Connection,
     *,
@@ -97,6 +98,8 @@ async def test_close_requires_test_rule_or_accepted_risk(client, db):
     assert stored["kind"] == "regression_test"
     assert stored["ref"] == "tests/test_x.py::test_y"
     assert await _events(db, task_id, "defect_prevention_recorded")
+    view = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert view["defect_prevention"]["kind"] == "regression_test"
 
 
 async def test_regression_test_needs_a_locator(client, db):
@@ -182,6 +185,15 @@ async def test_parent_rollup_is_held(db):
     child = await _defect(db, found_in="unknown", status="completed", parent_id=parent)
     await maybe_rollup_parent(db, child)
     await db.commit()
+    assert (await _row(db, parent))["status"] == "running"
+
+
+async def test_stale_parent_repair_is_held(db):
+    from hub.services.lifecycle import repair_stale_parent_completions
+
+    parent = await _defect(db, status="running", task_type="feature")
+    await _defect(db, found_in="unknown", status="completed", parent_id=parent)
+    await repair_stale_parent_completions(db)
     assert (await _row(db, parent))["status"] == "running"
 
 

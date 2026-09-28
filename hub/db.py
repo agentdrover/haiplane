@@ -2406,6 +2406,17 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_executor_slots_active "
         "ON executor_slots(task_id) WHERE released_at IS NULL",
     ),
+    (
+        # #919: what a closed production defect left behind — a regression
+        # test, a rule from category_checks (#878), or an accepted risk with a
+        # reason and a revisit condition. One JSON column next to the passport
+        # (#909) rather than a table: there is one answer per defect, and it
+        # travels with the task it answers. NULL = no answer recorded; old rows
+        # stay NULL — back-filling "accepted" would invent the very output the
+        # gate exists to require.
+        "add_defect_prevention_column",
+        "ALTER TABLE tasks ADD COLUMN defect_prevention TEXT",
+    ),
 ]
 
 

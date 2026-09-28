@@ -16,6 +16,7 @@ from fastapi import FastAPI
 
 from hub import config, lifecycle_matrix, services
 from hub import repository as repo
+from hub.services.prevention_gate import hold_completion
 from hub.db import connect as db_connect
 from hub.db import fetchall, log_activity
 from hub.integrations.git_ops import WorkspaceNotReadyError
@@ -1886,6 +1887,12 @@ async def _deliver_pair_task(db, task: dict) -> None:
     # sweep's candidate list the moment either one fires — and the transient
     # branch folds it into _note_pair_delivery_wait's own dedupe-and-commit
     # cycle instead of a second one.
+    # #919: a prod defect without its prevention output is held before the
+    # merge — the sweep would otherwise be the one door that never asks.
+    if await hold_completion(db, task_id, via="poller_delivery", actor="hub"):
+        _pair_delivery_waits.pop(task_id, None)
+        await db.commit()
+        return
     task, delivery_pr = await services.resolve_delivery_pr(db, task)
     pr_num = task.get("pr_number")
     if delivery_pr.unusable and delivery_pr.search_unanswered:

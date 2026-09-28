@@ -507,6 +507,22 @@ def _put_finding_outcomes(body: dict[str, Any], args: argparse.Namespace) -> boo
     return True
 
 
+def _done_report_options(parser: argparse.ArgumentParser) -> None:
+    """Keys a done report carries: finding outcomes (#1155), prevention (#919)."""
+    _finding_outcomes_option(parser)
+    parser.add_argument(
+        "--prevention",
+        default="",
+        help=(
+            "JSON prevention output of a prod defect (#919), with --kind done: "
+            '{"kind": "regression_test|rule|accepted_risk", "ref": "...", '
+            '"reason": "...", "revisit": "..."}. regression_test/rule need ref '
+            "(rule = category from category_checks); accepted_risk needs reason "
+            "and revisit."
+        ),
+    )
+
+
 def _finding_outcomes_option(parser: argparse.ArgumentParser) -> None:
     """Один и тот же ключ у сдачи и у отчёта о готовности (#911, #1155)."""
     parser.add_argument(
@@ -696,6 +712,14 @@ def cmd_update(args: argparse.Namespace) -> int:
     # узнал бы об этом только от гейта на следующей сдаче.
     if not _put_finding_outcomes(body, args):
         return 2
+    raw_prevention = (getattr(args, "prevention", "") or "").strip()
+    if raw_prevention:
+        # #919: refused before the request, like the outcomes above.
+        try:
+            body["prevention"] = json.loads(raw_prevention)
+        except ValueError as exc:
+            print(f"--prevention is not valid JSON: {exc}", file=sys.stderr)
+            return 2
     result = _api("POST", f"/api/tasks/{args.task_id}/updates", body)
     _print_json(result)
     return 0
@@ -2164,7 +2188,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["status", "report", "blocker", "done", "review", "arbitration"],
         help="Update type",
     )
-    _finding_outcomes_option(p_update)
+    _done_report_options(p_update)
     p_update.set_defaults(func=cmd_update)
 
     # updates — list updates

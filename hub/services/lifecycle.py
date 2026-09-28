@@ -44,7 +44,7 @@ from hub.db import (
 )
 from hub.integrations.registry import plugins
 from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
-from hub.services import submission_contract, verdict_text
+from hub.services import prevention_gate, submission_contract, verdict_text
 from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait
@@ -370,6 +370,10 @@ async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
     if _parent_has_own_work(parent):
         await _note_rollup_awaits_own_report(db, parent_id, parent)
         return
+    if prevention_gate.prevention_gap(parent):
+        # #919: a rollup cannot answer for a prod defect's output; the parent
+        # waits for its own report, like one with its own work above.
+        return
 
     if not await repo.transition_status_if(
         db,
@@ -408,7 +412,7 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
         children = await db_module.get_children(db, parent_id)
         if not _children_allow_rollup(children):
             continue
-        if _parent_has_own_work(parent):
+        if _parent_has_own_work(parent) or prevention_gate.prevention_gap(parent):
             continue
         await repo.update_task(db, parent_id, status="completed")
         repaired += 1
@@ -705,6 +709,9 @@ def row_to_task(
         created_at=d["created_at"],
         updated_at=d["updated_at"],
         archived=bool(d.get("archived", 0)),
+        defect_prevention=json.loads(d["defect_prevention"])
+        if d.get("defect_prevention")
+        else None,
         **structured_clean,
     )
 
@@ -2148,6 +2155,8 @@ async def _step_task_is_submittable(state: SubmitContext) -> None:
             f"can only submit running or under-review pair tasks for review, "
             f"current status: {state.task['status']}",
         )
+    # #919: the last word the agent has before the poller delivers.
+    prevention_gate.refuse_without_prevention(state.task)
     # #1054: what this submission replaces, read before anything is written.
     state.resubmitted_from_review = state.task["status"] == "review"
     state.replaced_sha = (state.task.get("submission_sha") or "").strip()
@@ -4628,6 +4637,9 @@ async def decide_task(
         if summary_text:
             update_content += f"\nDecision: {summary_text}"
         await repo.add_task_update(db, task_id, "human", "decision", update_content)
+        await prevention_gate.note_close_without_prevention(
+            db, task, via="decide_accept", actor="human"
+        )
         await repo.update_task(db, task_id, status="completed")
         await repo.insert_event(
             db,
@@ -4855,6 +4867,15 @@ async def add_update(
                 # identity, while the hub writing its own alerts has none by
                 # nature. Telling them apart is the point of the field.
                 author_kind="principal" if principal_id is not None else "anonymous",
+            )
+            # #919: inside the savepoint, before any route — a refused close
+            # of a prod defect takes its done row back with it.
+            await prevention_gate.record_done_prevention(
+                db,
+                task,
+                kind=body.kind,
+                prevention=body.prevention,
+                actor=body.agent or task.get("assigned_agent") or "agent",
             )
 
             if body.finding_outcomes:
@@ -5275,6 +5296,9 @@ async def force_complete_task(
     # Serialize against refinement _atomic savepoints on the shared connection.
     async with write_transaction(db):
         await repo.add_task_update(db, task_id, "human", "done", comment)
+        await prevention_gate.note_close_without_prevention(
+            db, task, via="force_complete", actor="human"
+        )
         await repo.update_task(db, task_id, **update_fields)
         await db.commit()
         await maybe_rollup_parent(db, task_id)

@@ -1646,6 +1646,24 @@ class TaskReturnToWork(BaseModel):
 
 REPORT_KINDS = frozenset({"done", "status", "blocker"})
 
+#: The three prevention outputs a closed prod defect may leave (#919).
+PreventionKind = Literal["regression_test", "rule", "accepted_risk"]
+
+
+class DefectPrevention(BaseModel):
+    """What a production defect leaves behind when it closes (#919).
+
+    Shape only. Which fields each kind needs — a test locator, a catalogued
+    category, a reason AND a revisit condition — is checked by
+    ``hub.services.prevention_gate``, so the refusal can name all three
+    options in one answer instead of a pydantic path.
+    """
+
+    kind: PreventionKind
+    ref: str = Field("", max_length=500)
+    reason: str = Field("", max_length=2000)
+    revisit: str = Field("", max_length=500)
+
 
 class TaskUpdateCreate(BaseModel):
     agent: str = Field("", max_length=100)
@@ -1658,6 +1676,18 @@ class TaskUpdateCreate(BaseModel):
     # Optional by construction: a done report without outcomes behaves exactly
     # as it did before, and the done report is the most-called tool there is.
     finding_outcomes: list[FindingOutcomeItem] = Field(default_factory=list)
+    # #919: the prevention output of a production defect. Optional on the
+    # wire; required by the gate only when the task is found_in='prod'.
+    prevention: DefectPrevention | None = None
+
+    @model_validator(mode="after")
+    def _only_a_done_report_carries_prevention(self) -> "TaskUpdateCreate":
+        if self.prevention is not None and self.kind != "done":
+            raise ValueError(
+                f"prevention is accepted only with kind='done', not "
+                f"'{self.kind}': it is the output of closing a defect"
+            )
+        return self
 
     @model_validator(mode="after")
     def _only_a_done_report_answers_findings(self) -> "TaskUpdateCreate":
@@ -2416,6 +2446,9 @@ class TaskView(BaseModel):
     # on purpose: a suggestion is never written into the fact column.
     release_id: int | None = None
     cause_suggestion: "DefectCauseSuggestion | None" = None
+    # #919: what the closed prod defect left behind (kind, ref / reason +
+    # revisit, recorded_by, recorded_at); None = nothing recorded.
+    defect_prevention: dict[str, str] | None = None
     scope_in: list[str] = Field(default_factory=list)
     scope_out: list[str] = Field(default_factory=list)
     affected_areas: list[str] = Field(default_factory=list)
