@@ -7,7 +7,12 @@ F2 (#1365). До этой задачи порядок держала памят�
 
 Кандидат — задача проекта, которая:
 
-* ``open``, не эпик, не в архиве, с ``dor_passed``;
+* ``open``, не в архиве, с ``dor_passed``;
+* ЛИСТ (#1455): тип task или subtask и ни одной незавершённой подзадачи.
+  Эпик, фича и задача с открытыми детьми — не кандидаты, а пропуск с
+  причиной: 28.09 кнопка запуска выдала облачному исполнителю фичу, родителя
+  шести подзадач, и он взялся делать их одной веткой мимо их карточек.
+  «Детей прочитать не удалось» — тоже не кандидат;
 * все её ``depends_on`` ДОСТАВЛЕНЫ. Читатель тот же, что у готовности и
   доказательств стюарда (``with_cached_delivery``, #484/#885/#1281): второй
   копии правила «доставлено» здесь нет. «Узнать не удалось» (``None``) —
@@ -46,7 +51,7 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall
-from hub.models import ACTIVE_STATUSES, QUEUED_STATUSES
+from hub.models import ACTIVE_STATUSES, FINAL_STATUSES, QUEUED_STATUSES
 from hub.services import project_policy
 from hub.services.delivery_state import with_cached_delivery
 
@@ -56,6 +61,10 @@ SKIP_DEPENDENCY = "dependency_undelivered"
 SKIP_UNDECLARED = "area_undeclared"
 SKIP_OVERLAP = "area_overlap"
 SKIP_ACTIVE_UNDECLARED = "active_area_undeclared"
+SKIP_NOT_LEAF = "not_a_leaf"
+
+#: Что исполнитель берёт в работу (#1455): только листовые типы.
+LEAF_TYPES: frozenset[str] = frozenset({"task", "subtask"})
 
 #: Что занимает WIP и с чем сверяются области — ВЫВЕДЕНО из hub/models.py,
 #: не перечислено руками (находка ревью #1274): живые статусы без очереди.
@@ -283,11 +292,50 @@ async def capture_hold(
                 _CAPTURES.pop(project_id, None)
 
 
+async def _open_children(db: aiosqlite.Connection, task_id: int) -> list[int]:
+    """Незавершённые подзадачи (не в архиве, не в финальном статусе)."""
+    finals = sorted(s.value for s in FINAL_STATUSES)
+    marks = ", ".join("?" for _ in finals)
+    rows = await fetchall(
+        db,
+        "SELECT id FROM tasks WHERE parent_id=? AND archived=0 "
+        f"AND status NOT IN ({marks}) ORDER BY id",  # nosec B608 - placeholders only, values are params
+        (task_id, *finals),
+    )
+    return [int(r["id"]) for r in rows]
+
+
+async def not_leaf_reason(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
+    """Почему задачу нельзя отдать исполнителю как одну работу; пусто — лист.
+
+    Одно правило на все двери выбора (#1455): очередь (а через неё запуск) и
+    повторный прогон и слияние, которые берут задачу сами. Незнание — не лист.
+    """
+    try:
+        children = await _open_children(db, int(task["id"]))
+    except aiosqlite.Error as exc:
+        return f"не лист: подзадачи прочитать не удалось ({type(exc).__name__})"
+    listed = ", ".join(f"#{c}" for c in children)
+    task_type = str(task.get("task_type") or "")
+    if task_type not in LEAF_TYPES:
+        tail = f", незавершённые подзадачи {listed}" if children else ""
+        return (
+            f"не лист: тип {task_type or 'неизвестен'} — исполнитель берёт "
+            f"только task или subtask{tail}"
+        )
+    if children:
+        return f"не лист: незавершённые подзадачи {listed}"
+    return ""
+
+
 async def _skip_reason(
     db: aiosqlite.Connection, candidate: dict[str, Any], active: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
     """Почему этот кандидат ждёт; ``None`` — не ждёт."""
     task_id = int(candidate["id"])
+    not_leaf = await not_leaf_reason(db, candidate)
+    if not_leaf:
+        return {"task_id": task_id, "reason": SKIP_NOT_LEAF, "detail": not_leaf}
     blockers = await _undelivered_blockers(db, task_id)
     if blockers:
         listed = ", ".join(f"#{b['task_id']}" for b in blockers)
@@ -315,7 +363,7 @@ def _summary(answer: dict[str, Any]) -> str:
     if answer["next_task_id"] is None:
         return f"Следующей нет: свободного кандидата в «{answer['project']}» нет.{tail}"
     return (
-        f"Следующей взял бы #{answer['next_task_id']}: open, DoR пройден, "
+        f"Следующей взял бы #{answer['next_task_id']}: open, лист, DoR пройден, "
         f"зависимости доставлены, области свободны.{tail}"
     )
 
@@ -330,7 +378,8 @@ async def next_task(db: aiosqlite.Connection, project: Any) -> dict[str, Any]:
         (
             t
             for t in tasks
-            if t["status"] == "open" and t["dor_passed"] and t["task_type"] != "epic"
+            # #1455: эпик и фича здесь есть — их пропуск назван (_skip_reason).
+            if t["status"] == "open" and t["dor_passed"]
         ),
         key=_sort_key,
     )
