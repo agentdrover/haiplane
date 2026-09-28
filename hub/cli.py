@@ -486,6 +486,19 @@ def cmd_approve_batch(args: argparse.Namespace) -> int:
 FINDING_OUTCOMES_JSON_ERROR = "--finding-outcomes is not valid JSON"
 
 
+def _put_prevention(body: dict[str, Any], args: argparse.Namespace) -> bool:
+    """#919: the prod-defect output, refused before the request when unparsable."""
+    raw = (getattr(args, "prevention", "") or "").strip()
+    if not raw:
+        return True
+    try:
+        body["prevention"] = json.loads(raw)
+    except ValueError as exc:
+        print(f"--prevention is not valid JSON: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
 def _put_finding_outcomes(body: dict[str, Any], args: argparse.Namespace) -> bool:
     """Положить исходы находок в тело запроса; False — отказ уже напечатан.
 
@@ -505,6 +518,22 @@ def _put_finding_outcomes(body: dict[str, Any], args: argparse.Namespace) -> boo
         print(f"{FINDING_OUTCOMES_JSON_ERROR}: {exc}", file=sys.stderr)
         return False
     return True
+
+
+def _done_report_options(parser: argparse.ArgumentParser) -> None:
+    """Keys a done report carries: finding outcomes (#1155), prevention (#919)."""
+    _finding_outcomes_option(parser)
+    parser.add_argument(
+        "--prevention",
+        default="",
+        help=(
+            "JSON prevention output of a prod defect (#919): "
+            '{"kind": "regression_test|rule|accepted_risk", "ref": "...", '
+            '"reason": "...", "revisit": "..."}. regression_test/rule need ref '
+            "(rule = category from category_checks); accepted_risk needs reason "
+            "and revisit."
+        ),
+    )
 
 
 def _finding_outcomes_option(parser: argparse.ArgumentParser) -> None:
@@ -556,7 +585,7 @@ def cmd_submit_review(args: argparse.Namespace) -> int:
     model = getattr(args, "model", "") or ""
     if model:
         body["model"] = model
-    if not _put_finding_outcomes(body, args):
+    if not (_put_finding_outcomes(body, args) and _put_prevention(body, args)):
         return 2
     if not _put_mutations(body, args):
         return 2
@@ -694,7 +723,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     # #1155: отказ ДО запроса. Отправить отчёт без исходов и вернуть 0 значило
     # бы записать в ленту готовность, потеряв ответ про находки, — и автор
     # узнал бы об этом только от гейта на следующей сдаче.
-    if not _put_finding_outcomes(body, args):
+    if not (_put_finding_outcomes(body, args) and _put_prevention(body, args)):
         return 2
     result = _api("POST", f"/api/tasks/{args.task_id}/updates", body)
     _print_json(result)
@@ -1997,7 +2026,7 @@ def build_parser() -> argparse.ArgumentParser:
             '[{"ac": "AC-1", "mutation": "...", "failed_test": "<test_ref of AC-1>"}]'
         ),
     )
-    _finding_outcomes_option(p_submit_review)
+    _done_report_options(p_submit_review)
     p_submit_review.set_defaults(func=cmd_submit_review)
 
     p_review_brief = sub.add_parser(
@@ -2164,7 +2193,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["status", "report", "blocker", "done", "review", "arbitration"],
         help="Update type",
     )
-    _finding_outcomes_option(p_update)
+    _done_report_options(p_update)
     p_update.set_defaults(func=cmd_update)
 
     # updates — list updates

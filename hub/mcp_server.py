@@ -1519,20 +1519,20 @@ async def hub_report_done(
     summary: str,
     agent: str = "",
     finding_outcomes: list[dict[str, Any]] | None = None,
+    prevention: dict[str, Any] | None = None,
 ) -> str:
     """Submit a done report and return the task's actual status after lifecycle handling.
 
-    AUTHOR step. Universal Review Gate (#306): this completes the task only
-    when the current submission already carries an APPROVED review by another
-    actor (or auto_review=false opted out). Otherwise it IS a submission — the
-    task routes to ``review`` or ``ci_check`` and the response names the next
-    action.
+    AUTHOR step (#306): completes only with a current APPROVED review by
+    another actor (or auto_review=false). Else it IS a submission: the
+    task goes to review or ci_check; the response says what is next.
 
     Args:
         task_id: The task ID to report on
         summary: What was changed and how it was validated
         agent: Name of the agent submitting the report
         finding_outcomes: same as hub_submit_for_review (#1155).
+        prevention: needed if found_in=prod (#919): {kind: regression_test|rule|accepted_risk, ref, reason, revisit}.
     """
     prior_status: str | None = None
     try:
@@ -1548,6 +1548,8 @@ async def hub_report_done(
         }
         if finding_outcomes:
             payload["finding_outcomes"] = finding_outcomes
+        if prevention:
+            payload["prevention"] = prevention
         result = await _api_post(f"/api/tasks/{task_id}/updates", payload)
         task = await _api_get(f"/api/tasks/{task_id}")
     except HubApiError as exc:
@@ -2171,20 +2173,21 @@ async def hub_submit_for_review(
     accept_areas: bool = False,
     finding_outcomes: list[dict[str, Any]] | None = None,
     mutations: list[dict[str, Any]] | None = None,
+    prevention: dict[str, Any] | None = None,
 ) -> str:
     """AUTHOR step: hand your work to a review by someone else (#307).
 
     It does NOT complete the task: a different actor writes the verdict
-    (hub_get_review_brief, hub_submit_review). Bumps the generation, invalidating any earlier APPROVED; resubmitting
-    the same commit from review keeps it (#1265).
+    (hub_submit_review). Bumps the generation, voiding any APPROVED; the
+    same commit resubmitted from review keeps it (#1265).
 
     Args:
         task_id: The running pair task ID
         agent: Submitting agent (empty uses the task's assigned agent)
         summary: Short note on what is being submitted
-        branch: Your working branch; a mismatch with the canonical one is
-            refused. Omitted skips the check (#533).
-        model: The model that wrote this submission (#758), declared. Empty
+        branch: Your working branch; one unlike the canonical is refused.
+            Omitted skips the check (#533).
+        model: Model that wrote this submission (#758), declared; empty
             keeps the verdict with the human.
         accept_areas: Fold the areas the diff ACTUALLY touched into
             affected_areas (#890), visibly.
@@ -2195,6 +2198,7 @@ async def hub_submit_for_review(
             owe a note; one leaving the defect leaves a draft.
         mutations: [{ac, mutation, failed_test}], one per test AC;
             failed_test = its test_ref. submission_contract checks it (#1436).
+        prevention: see hub_report_done (#919).
     """
     prior_task = await _read_task(task_id)
     prior_status = prior_task.get("status") if prior_task else None
@@ -2214,6 +2218,8 @@ async def hub_submit_for_review(
         body["finding_outcomes"] = finding_outcomes
     if mutations:
         body["mutations"] = mutations
+    if prevention:
+        body["prevention"] = prevention
     try:
         task = await _api_post(f"/api/tasks/{task_id}/submit-review", body or None)
     except HubApiError as exc:
