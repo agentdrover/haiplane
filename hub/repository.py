@@ -1885,10 +1885,15 @@ async def upsert_category_check(
 ) -> None:
     """Record the deterministic check that covers a finding category."""
     await db.execute(
-        "INSERT INTO category_checks (category, check_ref, note, recorded_by) "
-        "VALUES (?, ?, ?, ?) ON CONFLICT(category) DO UPDATE SET "
+        # ``created_at`` is the rule's birth (#920): set on the first record
+        # only. A re-record replaces the check and its stamp, not the date the
+        # class was promised closed from.
+        "INSERT INTO category_checks "
+        "(category, check_ref, note, recorded_by, created_at) "
+        "VALUES (?, ?, ?, ?, datetime('now')) ON CONFLICT(category) DO UPDATE SET "
         "check_ref=excluded.check_ref, note=excluded.note, "
-        "recorded_by=excluded.recorded_by, recorded_at=datetime('now')",
+        "recorded_by=excluded.recorded_by, recorded_at=datetime('now'), "
+        "created_at=COALESCE(category_checks.created_at, category_checks.recorded_at)",
         (category, check_ref, note, recorded_by),
     )
 

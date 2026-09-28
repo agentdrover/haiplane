@@ -562,6 +562,13 @@ async def build_category_debt(
     return debt
 
 
+async def _rule_breaches(db: aiosqlite.Connection) -> dict[str, Any]:
+    """The repeat report of catalogue rules (#920); see ``rule_catalogue``."""
+    from hub.services.rule_catalogue import rule_breaches
+
+    return await rule_breaches(db)
+
+
 async def record_category_check(
     db: aiosqlite.Connection,
     *,
@@ -990,6 +997,9 @@ async def practice_metrics(
         "by_reviewer_model": dispositions["by_model"],
         "recurring_categories": recurring,
         "category_debt": debt,
+        # #920: rules from category_checks whose class came back AFTER the
+        # rule was set up. Not windowed — a rule is judged over its life.
+        "rule_breaches": await _rule_breaches(db),
         "cycle_times": cycle_times,
         "escaped_defects": escaped,
         # #916: time-to-detect and time-to-restore of prod defects, from

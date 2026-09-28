@@ -2417,6 +2417,28 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_defect_prevention_column",
         "ALTER TABLE tasks ADD COLUMN defect_prevention TEXT",
     ),
+    (
+        # #920: when a rule was SET UP, apart from when its current check was
+        # recorded. ``recorded_at`` moves on every re-record — a better check
+        # replaces the claim (#878) — so a repeat report reading it would
+        # forgive every finding between the first check and the better one,
+        # and a rule could be made to look unbroken by re-recording it. The
+        # breach is counted from this date; the upsert never touches it.
+        "add_category_checks_created_at",
+        "ALTER TABLE category_checks ADD COLUMN created_at TEXT",
+    ),
+    (
+        # Old rows: the earliest ``category_check_recorded`` event for the
+        # category (#878 writes one on every record), else ``recorded_at``.
+        # Never later than ``recorded_at``: a rule cannot be younger than its
+        # current check. Only NULLs are filled, so a re-run changes nothing.
+        "backfill_category_checks_created_at",
+        "UPDATE category_checks SET created_at = MIN(recorded_at, COALESCE(("
+        "SELECT MIN(e.created_at) FROM events e "
+        "WHERE e.kind = 'category_check_recorded' AND CASE WHEN "
+        "json_valid(e.payload) THEN json_extract(e.payload, '$.category') END "
+        "= category_checks.category), recorded_at)) WHERE created_at IS NULL",
+    ),
 ]
 
 
