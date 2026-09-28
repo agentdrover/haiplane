@@ -457,3 +457,25 @@ async def test_web_passport_shows_release_and_hypothesis(client, db):
     # Not a bug by work_type: only release_id makes the passport show at all.
     assert "data-defect-passport" in page
     assert f"кандидатов нет: {defect_release.REASON_NO_AREAS}" in page
+
+
+async def test_projectless_release_carries_the_default_projects_merges(db):
+    """#915: ci.yml reports deploys without a project, the gate stamps merges
+    of the default project — on prod every release row is project-less, so a
+    strict ``project_id IS ?`` found no membership at all."""
+    pid = await _default_project(db)
+    cur = await db.execute(
+        "INSERT INTO projects (slug, name, status) VALUES ('other', 'other', 'active')"
+    )
+    other = int(cur.lastrowid or 0)
+    ours = await _task(db, "наш", ["hub/web.py"])
+    theirs = await _task(db, "чужой", ["hub/web.py"])
+    release = await _release(db, SHA_A, project_id=None)
+    await _merge(db, ours, 1, SHA_A, project_id=pid)
+    await _merge(db, theirs, 2, SHA_A, project_id=other)
+    await db.commit()
+
+    membership = await defect_release.release_membership(db, release)
+
+    assert membership.task_ids == [ours]
+    assert membership.unmatched_rows == 0
