@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Метрики — макет (#1486)</title>
+<!--
+  Статичный макет раздела метрик. Один файл, без сервера, без внешних зависимостей, без JS.
+  Спека: docs/specs/metrics-ux.md. Числа ВЫДУМАНЫ и нужны только для вида; имена полей — настоящие
+  (practice_metrics), они подписаны как «источник:» у каждого блока.
+  Переключатель «375 px» — чекбокс: сужает рамку страницы; раскладка реагирует на ширину
+  рамки (container queries), поэтому на настоящем телефоне она такая же.
+-->
+<style>
+:root{
+  --bg:#0c0e14;--surface:#171a24;--surface-2:#1e2130;--border:#2f3346;
+  --text:#e4e7f0;--text-2:#a0a5b8;--muted:#6b7084;
+  --accent:#a29bfe;--good:#00b894;--bad:#ff6b5b;--warn:#f39c12;--info:#5aa9f0;
+  --bad-dim:rgba(255,107,91,.12);--warn-dim:rgba(243,156,18,.12);--good-dim:rgba(0,184,148,.12);--info-dim:rgba(90,169,240,.12);
+  --radius:8px;--font:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;--mono:"SF Mono","JetBrains Mono",monospace;
+}
+*{box-sizing:border-box}
+html{background:var(--bg)}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 var(--font)}
+a{color:var(--accent)}
+a:focus-visible,summary:focus-visible,select:focus-visible,input:focus-visible,label:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+code{font-family:var(--mono);font-size:.92em;background:var(--surface-2);padding:0 4px;border-radius:4px}
+h1{font-size:20px;margin:0}h2{font-size:16px;margin:0 0 4px}h3{font-size:14px;margin:0 0 2px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.note{color:var(--text-2);font-size:13px}
+.src{color:var(--text-2);font:12px var(--mono);overflow-wrap:anywhere;min-width:0}
+.grid>*{min-width:0}
+
+/* ---- обвязка макета ---- */
+.mock-bar{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--border);padding:8px 16px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center}
+.mock-bar strong{margin-right:8px}
+.mock-bar a{margin-right:4px}
+#w375{position:absolute;opacity:0}
+.mock-bar label{cursor:pointer;border:1px solid var(--border);border-radius:100px;padding:2px 12px}
+#w375:checked ~ .mock-bar label[for=w375]{background:var(--accent);color:#0c0e14}
+.banner{margin:12px 16px;padding:8px 12px;border:1px dashed var(--warn);border-radius:var(--radius);color:var(--text);background:var(--warn-dim)}
+.stage{padding:0 16px 48px;display:flex;justify-content:center}
+.frame{container-type:inline-size;container-name:pg;width:100%;max-width:1100px}
+#w375:checked ~ .stage .frame{max-width:375px;border:1px solid var(--border);border-radius:16px;padding:0 0 8px;background:var(--bg)}
+.page{margin-bottom:56px}
+.page-tag{font:12px var(--mono);color:var(--text-2);margin:16px 0 8px;overflow-wrap:anywhere}
+
+/* ---- компоненты ---- */
+.hdr{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:baseline;justify-content:space-between;margin:8px 0 12px}
+.badge{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--border);border-radius:100px;padding:0 8px;font-size:12px;line-height:20px;color:var(--text)}
+.badge.bad{border-color:var(--bad);color:var(--bad);background:var(--bad-dim)}
+.badge.warn{border-color:var(--warn);color:var(--warn);background:var(--warn-dim)}
+.badge.good{border-color:var(--good);color:var(--good);background:var(--good-dim)}
+.badge.info{border-color:var(--info);color:var(--info);background:var(--info-dim)}
+.badge.na{border-style:dashed;color:var(--text-2)}
+
+.filters{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;display:flex;flex-wrap:wrap;gap:10px 16px;align-items:flex-end;margin-bottom:8px;position:sticky;top:44px;z-index:4}
+.filters .f{display:flex;flex-direction:column;gap:2px;font-size:12px;color:var(--text-2)}
+.filters select{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;min-height:36px;font:inherit}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.seg a{padding:6px 12px;min-height:36px;display:inline-flex;align-items:center;color:var(--text);text-decoration:none;border-right:1px solid var(--border)}
+.seg a:last-child{border-right:0}
+.seg a[aria-current=true]{background:var(--accent);color:#0c0e14;font-weight:600}
+.cmp{display:flex;align-items:center;gap:6px;min-height:36px;color:var(--text)}
+.cmp input{width:18px;height:18px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 12px;padding:0;list-style:none}
+.chips .badge{padding:2px 10px}
+.urlbox{font:12px var(--mono);color:var(--text-2);overflow-wrap:anywhere;margin:0 0 16px}
+
+.grid{display:grid;gap:12px}
+.kpis{grid-template-columns:repeat(3,1fr)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:12px}
+.kpi{display:flex;flex-direction:column;gap:4px;border-left:4px solid var(--border)}
+.kpi.bad{border-left-color:var(--bad)}.kpi.good{border-left-color:var(--good)}.kpi.warn{border-left-color:var(--warn)}
+.kpi .lbl{color:var(--text-2);font-size:13px}
+.kpi .val{font-size:28px;font-weight:700;line-height:1.1}
+.kpi .val small{font-size:13px;font-weight:400;color:var(--text-2)}
+.kpi .delta{font-size:13px}
+.kpi .caveat{font-size:12px;color:var(--text);background:var(--warn-dim);border-radius:4px;padding:2px 6px}
+.kpi .foot{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;font-size:12px;color:var(--text-2);margin-top:auto}
+.kpi svg{display:block}
+.up-bad,.dn-bad{color:var(--bad)}.up-good,.dn-good{color:var(--good)}
+
+.problems{list-style:none;margin:0;padding:0;display:grid;gap:8px}
+.problems li{display:grid;grid-template-columns:28px 1fr auto;gap:4px 12px;align-items:start;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px}
+.problems .rk{font:700 16px var(--mono);color:var(--text-2)}
+.problems .why{color:var(--text-2);font-size:13px;grid-column:2}
+.problems .go{grid-row:1;grid-column:3;white-space:nowrap}
+.problems li.tier1{border-left:4px solid var(--bad)}.problems li.tier2{border-left:4px solid var(--warn)}.problems li.tier3{border-left:4px solid var(--info)}
+
+section.blk{margin:28px 0}
+.blk-head{margin-bottom:8px}
+.charts{grid-template-columns:repeat(2,1fr)}
+.chart figcaption{margin:0 0 6px}
+.chart .q{font-weight:600}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;color:var(--text);margin:6px 0 0;padding:0;list-style:none}
+.legend i{display:inline-block;width:14px;height:0;border-top:3px solid;vertical-align:middle;margin-right:4px}
+.legend i.dash{border-top-style:dashed}
+.legend i.box{width:12px;height:12px;border:0;border-radius:2px;background:currentColor}
+
+.bars{display:grid;gap:6px;margin:0;padding:0;list-style:none}
+.bars li{display:grid;grid-template-columns:minmax(80px,30%) 1fr auto;gap:8px;align-items:center;font-size:13px}
+.bars .trk{height:14px;background:var(--surface-2);border-radius:3px;overflow:hidden;position:relative}
+.bars .fil{display:block;height:100%;background:var(--info);border-radius:3px}
+.bars .fil.hatch{background:repeating-linear-gradient(45deg,var(--warn) 0 4px,transparent 4px 8px);border:1px solid var(--warn)}
+.bars .fil.bad{background:var(--bad)}
+.bars .n{font-variant-numeric:tabular-nums;color:var(--text);white-space:nowrap}
+.bars .n span{color:var(--text-2)}
+
+.stack{display:flex;height:22px;border-radius:4px;overflow:hidden;border:1px solid var(--border)}
+.stack b{display:block;height:100%}
+
+details.how{margin-top:8px;border-top:1px solid var(--border);padding-top:6px}
+details.how summary{cursor:pointer;color:var(--accent);font-size:13px;min-height:28px}
+details.how p{color:var(--text-2);font-size:13px;margin:6px 0}
+.dup{margin-top:8px;font-size:13px}
+.dup summary{cursor:pointer;color:var(--accent);min-height:28px}
+
+table{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);vertical-align:top}
+th{color:var(--text-2);font-weight:600}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+
+.empty{border:1px dashed var(--border);border-radius:var(--radius);padding:14px;text-align:center;color:var(--text-2)}
+.empty b{display:block;color:var(--text);margin-bottom:2px}
+.caveat-box{border-left:4px solid var(--warn);background:var(--warn-dim);padding:8px 12px;border-radius:0 var(--radius) var(--radius) 0;font-size:13px}
+.states{grid-template-columns:repeat(2,1fr)}
+.anchor-nav a{margin-right:12px}
+
+/* ---- узкая рамка: и настоящий телефон, и переключатель 375 ---- */
+@container pg (max-width:760px){
+  .kpis{grid-template-columns:repeat(2,1fr)}
+  .charts,.states{grid-template-columns:1fr}
+  .filters{position:static}
+}
+@container pg (max-width:480px){
+  .kpis{grid-template-columns:1fr}
+  .kpi .val{font-size:24px}
+  .problems li{grid-template-columns:24px 1fr}
+  .problems .go{grid-row:auto;grid-column:2}
+  .bars li{grid-template-columns:1fr auto}
+  .bars .trk{grid-column:1 / -1;grid-row:2}
+  .filters .f,.filters .seg{width:100%}
+  .filters select{width:100%}
+  .seg a{flex:1;justify-content:center}
+  table.stack-sm thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+  table.stack-sm tr{display:block;border-bottom:1px solid var(--border);padding:6px 0}
+  table.stack-sm td{display:flex;justify-content:space-between;gap:12px;border:0;padding:2px 8px;text-align:right}
+  table.stack-sm td::before{content:attr(data-label);color:var(--text-2);text-align:left}
+  .hdr{flex-direction:column;align-items:flex-start}
+}
+@media (prefers-reduced-motion:no-preference){.fil{transition:width .2s}}
+</style>
+</head>
+<body>
+<input type="checkbox" id="w375" aria-label="Показать в рамке 375 px">
+<div class="mock-bar">
+  <strong>Макет метрик #1486</strong>
+  <span class="anchor-nav"><a href="#p1">1. /metrics</a><a href="#states">2. Состояния</a><a href="#p2">3. /metrics/agent-api</a></span>
+  <label for="w375">Вариант 375 px (вкл/выкл)</label>
+</div>
+<div class="banner"><strong>Макет, не данные.</strong> Числа выдуманы. Имена полей (<code>practice_metrics.*</code>) настоящие и подписаны у каждого блока. Спека: <code>docs/specs/metrics-ux.md</code>.</div>
+
+<div class="stage"><div class="frame">
+
+<!-- ================= СТРАНИЦА 1: /metrics ================= -->
+<article class="page" id="p1">
+<p class="page-tag">страница 1 · /metrics?project=default&amp;since_days=90&amp;model=all&amp;compare=prev</p>
+
+<header class="hdr">
+  <h1>Метрики практики</h1>
+  <a href="#p2">Agent API usage →</a>
+</header>
+
+<form class="filters" role="search" aria-label="Фильтры метрик" onsubmit="return false">
+  <div class="f"><span id="fp">Проект</span>
+    <select aria-labelledby="fp"><option>default</option><option>snip-portal</option><option>все проекты</option></select></div>
+  <div class="f"><span id="fw">Период</span>
+    <nav class="seg" aria-labelledby="fw"><a href="#p1">30 д</a><a href="#p1" aria-current="true">90 д</a><a href="#p1">180 д</a><a href="#p1">всё</a></nav></div>
+  <div class="f"><span id="fm">Модель-ревьюер</span>
+    <select aria-labelledby="fm"><option>все модели</option><option>gpt-5.3-codex</option><option>grok-4.6</option><option>composer-2</option></select></div>
+  <label class="cmp"><input type="checkbox" checked> Сравнить с предыдущими 90 д</label>
+</form>
+<ul class="chips" aria-label="Активные фильтры">
+  <li class="badge">проект: default</li><li class="badge">период: 90 д</li><li class="badge">сравнение: 90 д до этого</li>
+</ul>
+<p class="urlbox">Состояние живёт в URL: скопированная ссылка открывает ту же картину.</p>
+
+<!-- ---- Ответ: общая картина ---- -->
+<section class="blk" aria-labelledby="h-kpi">
+  <div class="blk-head"><h2 id="h-kpi">Общая картина: 90 дней против предыдущих 90</h2>
+  <p class="note">Ответ на «стало лучше или хуже». Шесть показателей, у каждого значение, статус, было, направление и объём выборки.</p></div>
+  <div class="grid kpis">
+
+    <div class="card kpi bad">
+      <span class="lbl">С первого раза (first-pass)</span>
+      <span class="val">61% <small>(28 из 46 задач)</small></span>
+      <span class="delta dn-bad">▼ хуже: было 74% (n=39), −13 п.п.</span>
+      <svg width="100%" height="28" viewBox="0 0 120 28" role="img" aria-label="Тренд first-pass по неделям: с 78% до 61%, падение последние 5 недель"><polyline fill="none" stroke="#5aa9f0" stroke-width="2" points="2,6 12,5 22,8 32,6 42,9 52,8 62,12 72,14 82,13 92,18 102,20 118,23"/><polyline fill="none" stroke="#a0a5b8" stroke-width="1.5" stroke-dasharray="3 3" points="2,9 30,8 60,10 90,9 118,10"/></svg>
+      <span class="foot"><span class="src">review_outcomes.first_pass_acceptance_rate</span><a href="#p1">28 строк →</a></span>
+    </div>
+
+    <div class="card kpi warn">
+      <span class="lbl">Precision ревью (доля настоящих находок)</span>
+      <span class="val">83% <small>(размечено 24)</small></span>
+      <span class="delta up-good">▲ лучше: было 71% (n=9), +12 п.п.</span>
+      <span class="caveat">Оговорка: размечено 24 находки из 61 confirmed. Остальные ждут суждения.</span>
+      <span class="foot"><span class="src">machine_reviews.dispositions.precision</span><a href="#p1">37 ждут →</a></span>
+    </div>
+
+    <div class="card kpi bad">
+      <span class="lbl">Цена настоящей находки, provider-токены</span>
+      <span class="val">2,4 млн <small>(по счёту провайдера)</small></span>
+      <span class="delta dn-bad">▲ дороже: было 1,9 млн, +26%</span>
+      <span class="caveat">Оговорка: без счёта 9 из 71 прогона; их цена неизвестна, это не ноль.</span>
+      <span class="foot"><span class="src">machine_reviews.provider_tokens_per_fixed</span><a href="#p1">9 строк →</a></span>
+    </div>
+
+    <div class="card kpi good">
+      <span class="lbl">Касаний человека на доставленную задачу</span>
+      <span class="val">1,3 <small>(58 / 44)</small></span>
+      <span class="delta up-good">▼ лучше: было 1,9, −0,6</span>
+      <svg width="100%" height="28" viewBox="0 0 120 28" role="img" aria-label="Тренд касаний человека: с 2,1 до 1,3, снижение"><polyline fill="none" stroke="#5aa9f0" stroke-width="2" points="2,6 20,8 40,10 60,13 80,17 100,20 118,22"/></svg>
+      <span class="foot"><span class="src">human_touches.touches_per_delivered</span><a href="#p1">44 задачи →</a></span>
+    </div>
+
+    <div class="card kpi warn">
+      <span class="lbl">Change failure rate, проект default</span>
+      <span class="val">— <small>малая выборка</small></span>
+      <span class="delta"><span class="badge na">сравнить не с чем</span></span>
+      <span class="caveat">Оговорка: 4 выката, порог 5; доля не показывается. Дефектов без привязки к релизу: 2.</span>
+      <span class="foot"><span class="src">change_failure_rate.by_project[].rate</span><a href="#p1">4 выката →</a></span>
+    </div>
+
+    <div class="card kpi">
+      <span class="lbl">Cycle time, feature, медиана</span>
+      <span class="val">18,5 ч <small>(в медиане 31)</small></span>
+      <span class="delta"><span class="badge info">≈ без изменений</span> было 17,9 ч, +3%</span>
+      <span class="caveat">Оговорка: без отметки завершения 12 задач — вне медианы.</span>
+      <span class="foot"><span class="src">cycle_times[work_type=feature].median_hours</span><a href="#p1">31 задача →</a></span>
+    </div>
+
+  </div>
+  <p class="note" style="margin-top:8px">Порог «≈ без изменений»: модуль изменения меньше 5% или меньше двух точек выборки. Стрелка рисуется только при n ≥ порога в обоих окнах; иначе «сравнить не с чем». Цвет стрелки — вторичен: направление написано словом («хуже», «лучше»).</p>
+</section>
+
+<!-- ---- Ответ: где плохо ---- -->
+<section class="blk" aria-labelledby="h-prob">
+  <div class="blk-head"><h2 id="h-prob">Проблемные места</h2>
+  <p class="note">Ответ на «где сейчас плохо». Порядок: сначала долг без проверки, затем пробитые правила, затем ухудшения против прошлого окна. Внутри группы — по размеру.</p></div>
+  <ol class="problems">
+    <li class="tier1"><span class="rk">1</span>
+      <div><h3><span class="badge bad">долг без проверки</span> Категория «missing-migration» — 7 задач, 11 находок</h3></div>
+      <a class="go" href="#p1">7 задач →</a>
+      <p class="why">Три и более разных задачи за окно, проверка не заведена: каждый прогон платит за повторное открытие. Источник: <code>category_debt[]</code>.</p></li>
+    <li class="tier1"><span class="rk">2</span>
+      <div><h3><span class="badge bad">долг без проверки</span> Категория «unsafe-default» — 4 задачи, 5 находок</h3></div>
+      <a class="go" href="#p1">4 задачи →</a>
+      <p class="why">Источник: <code>category_debt[]</code>, <code>covered=false</code>.</p></li>
+    <li class="tier2"><span class="rk">3</span>
+      <div><h3><span class="badge warn">правило пробито</span> check_ref «lint:B105» — 2 находки после заведения</h3></div>
+      <a class="go" href="#p1">2 задачи →</a>
+      <p class="why">Правило заведено 12.08, класс вернулся 3 и 19 сентября. Породивший дефект: #1443. Источник: <code>rule_breaches.breached[]</code>.</p></li>
+    <li class="tier2"><span class="rk">4</span>
+      <div><h3><span class="badge warn">ухудшилось</span> First-pass: 74% → 61%</h3></div>
+      <a class="go" href="#p1">18 возвратов →</a>
+      <p class="why">−13 п.п. при n=46 и n=39; выше порога выборки. Источник: <code>review_outcomes</code>.</p></li>
+    <li class="tier3"><span class="rk">5</span>
+      <div><h3><span class="badge info">пробел в данных</span> Расхождение отчётов и счёта провайдера: 6 прогонов</h3></div>
+      <a class="go" href="#p1">6 строк →</a>
+      <p class="why">Главная причина: «прогон без отчёта». Источник: <code>review_economy.reconciliation</code>.</p></li>
+  </ol>
+  <p class="note" style="margin-top:8px">Пусто, если нечего ранжировать: «Проблемных мест не найдено при выборке n=… — это не значит, что их нет» (см. Состояния).</p>
+</section>
+
+<!-- ---- Тренд ---- -->
+<section class="blk" aria-labelledby="h-trend">
+  <div class="blk-head"><h2 id="h-trend">Тренд</h2></div>
+  <div class="grid charts">
+    <figure class="card chart" style="margin:0" aria-labelledby="c1">
+      <figcaption><span class="q" id="c1">Держится ли first-pass, или падает?</span><br><span class="src">ряд: review_outcomes (по неделям, #1490) · линия + предыдущее окно</span></figcaption>
+      <svg viewBox="0 0 320 150" width="100%" role="img" aria-describedby="c1t">
+        <g stroke="#2f3346" stroke-width="1"><line x1="34" y1="20" x2="312" y2="20"/><line x1="34" y1="60" x2="312" y2="60"/><line x1="34" y1="100" x2="312" y2="100"/><line x1="34" y1="130" x2="312" y2="130"/></g>
+        <g fill="#a0a5b8" font-size="10"><text x="4" y="24">100%</text><text x="10" y="64">75%</text><text x="10" y="104">50%</text><text x="16" y="134">25%</text><text x="34" y="146">нед 1</text><text x="150" y="146">нед 7</text><text x="272" y="146">нед 13</text></g>
+        <polyline fill="none" stroke="#a0a5b8" stroke-width="2" stroke-dasharray="5 4" points="34,52 60,50 86,56 112,50 138,54 164,52 190,56 216,50 242,54 268,52 294,55 312,54"/>
+        <polyline fill="none" stroke="#5aa9f0" stroke-width="2.5" points="34,44 60,50 86,46 112,56 138,60 164,66 190,72 216,80 242,84 268,92 294,96 312,98"/>
+        <g fill="#5aa9f0"><circle cx="34" cy="44" r="3.5"/><circle cx="312" cy="98" r="3.5"/></g>
+        <text x="240" y="112" fill="#e4e7f0" font-size="11">61%</text>
+      </svg>
+      <ul class="legend"><li style="color:#5aa9f0"><i style="border-color:#5aa9f0"></i>эти 90 д</li><li style="color:#a0a5b8"><i class="dash" style="border-color:#a0a5b8"></i>предыдущие 90 д</li></ul>
+      <p class="sr" id="c1t">Линия first-pass по неделям падает с 78 процентов в первую неделю до 61 в тринадцатой. Предыдущее окно держится около 74 процентов.</p>
+      <p class="note" id="c1s">С 78% до 61% за 13 недель; предыдущее окно около 74%.</p>
+      <details class="dup"><summary>Таблица значений</summary>
+        <table><thead><tr><th>Неделя</th><th class="num">Эти 90 д</th><th class="num">Пред. 90 д</th></tr></thead>
+        <tbody><tr><td>1</td><td class="num">78%</td><td class="num">75%</td></tr><tr><td>7</td><td class="num">68%</td><td class="num">72%</td></tr><tr><td>13</td><td class="num">61%</td><td class="num">73%</td></tr></tbody></table></details>
+    </figure>
+
+    <figure class="card chart" style="margin:0" aria-labelledby="c2">
+      <figcaption><span class="q" id="c2">Чем кончаются ревью-находки?</span><br><span class="src">machine_reviews.raw_total / confirmed_total / rejected_total / findings_unaccounted</span></figcaption>
+      <div class="stack" role="img" aria-describedby="c2t">
+        <b style="width:52%;background:#00b894"></b><b style="width:18%;background:#5aa9f0"></b><b style="width:30%;background:repeating-linear-gradient(45deg,#f39c12 0 4px,transparent 4px 8px)"></b>
+      </div>
+      <ul class="legend"><li style="color:#00b894"><i class="box"></i>подтверждено 61 (52%)</li><li style="color:#5aa9f0"><i class="box"></i>отклонено 21 (18%)</li><li style="color:#f39c12"><i class="box"></i>не разобрано 35 (30%)</li></ul>
+      <p class="sr" id="c2t">Из 117 сырых находок подтверждено 61, отклонено 21, не разобрано 35.</p>
+      <p class="note">117 сырых находок. Штриховка — «не разобрано»: это отдельная доля, а не часть отсева.</p>
+      <details class="dup"><summary>Таблица значений</summary>
+        <table><tbody><tr><td>Подтверждено</td><td class="num">61</td></tr><tr><td>Отклонено</td><td class="num">21</td></tr><tr><td>Не разобрано</td><td class="num">35</td></tr><tr><td>Всего сырых</td><td class="num">117</td></tr></tbody></table></details>
+    </figure>
+  </div>
+</section>
+
+<!-- ---- Разбивки ---- -->
+<section class="blk" aria-labelledby="h-brk">
+  <div class="blk-head"><h2 id="h-brk">Разбивки</h2>
+  <p class="note">Ответ на «кто и что даёт результат». Размер выборки — рядом с долей, всегда.</p></div>
+  <div class="grid charts">
+
+    <figure class="card chart" style="margin:0" aria-labelledby="c3">
+      <figcaption><span class="q" id="c3">Какая модель-ревьюер находит настоящие дефекты?</span><br><span class="src">by_reviewer_model[].precision, .judged</span></figcaption>
+      <ul class="bars">
+        <li><span>gpt-5.3-codex</span><span class="trk"><span class="fil" style="width:88%"></span></span><span class="n">88% <span>n=17</span></span></li>
+        <li><span>grok-4.6</span><span class="trk"><span class="fil" style="width:70%"></span></span><span class="n">70% <span>n=10</span></span></li>
+        <li><span>composer-2</span><span class="trk"><span class="fil hatch" style="width:100%"></span></span><span class="n">100% <span>n=2 · мало</span></span></li>
+      </ul>
+      <p class="note">Штриховка и «мало» — выборка меньше порога; столбец не сравнивается с остальными.</p>
+      <details class="dup"><summary>Таблица значений</summary>
+        <table class="stack-sm"><thead><tr><th>Модель</th><th class="num">Размечено</th><th class="num">Precision</th><th class="num">Ложняков</th></tr></thead>
+        <tbody><tr><td data-label="Модель">gpt-5.3-codex</td><td class="num" data-label="Размечено">17</td><td class="num" data-label="Precision">88%</td><td class="num" data-label="Ложняков">2</td></tr>
+        <tr><td data-label="Модель">grok-4.6</td><td class="num" data-label="Размечено">10</td><td class="num" data-label="Precision">70%</td><td class="num" data-label="Ложняков">3</td></tr>
+        <tr><td data-label="Модель">composer-2</td><td class="num" data-label="Размечено">2</td><td class="num" data-label="Precision">100%</td><td class="num" data-label="Ложняков">0</td></tr></tbody></table></details>
+    </figure>
+
+    <figure class="card chart" style="margin:0" aria-labelledby="c4">
+      <figcaption><span class="q" id="c4">Чем профили отличаются по цене прогона?</span><br><span class="src">by_profile[].provider_tokens_per_run, .billed_runs</span></figcaption>
+      <ul class="bars">
+        <li><span>lite</span><span class="trk"><span class="fil" style="width:36%"></span></span><span class="n">1,38 млн <span>39 со счётом</span></span></li>
+        <li><span>deep</span><span class="trk"><span class="fil" style="width:100%"></span></span><span class="n">3,85 млн <span>11 со счётом</span></span></li>
+        <li><span>не заявлен</span><span class="trk"></span><span class="n"><span>нет счёта</span></span></li>
+      </ul>
+      <p class="note">Пустой трек у «не заявлен» — незнание, а не ноль.</p>
+      <details class="dup"><summary>Таблица значений</summary>
+        <table class="stack-sm"><thead><tr><th>Профиль</th><th class="num">Прогонов</th><th class="num">Счёт на прогон</th><th class="num">Precision</th></tr></thead>
+        <tbody><tr><td data-label="Профиль">lite</td><td class="num" data-label="Прогонов">52</td><td class="num" data-label="Счёт">1 380 000</td><td class="num" data-label="Precision">79%</td></tr>
+        <tr><td data-label="Профиль">deep</td><td class="num" data-label="Прогонов">14</td><td class="num" data-label="Счёт">3 850 000</td><td class="num" data-label="Precision">91%</td></tr>
+        <tr><td data-label="Профиль">не заявлен</td><td class="num" data-label="Прогонов">5</td><td class="num" data-label="Счёт">нет счёта</td><td class="num" data-label="Precision">не размечено</td></tr></tbody></table></details>
+    </figure>
+
+    <figure class="card chart" style="margin:0" aria-labelledby="c5">
+      <figcaption><span class="q" id="c5">Какая версия харнесса даёт больше подтверждённого?</span><br><span class="src">by_harness[].reviews, .confirmed_total, .no_data_reports</span></figcaption>
+      <ul class="bars">
+        <li><span>review-harness v8</span><span class="trk"><span class="fil" style="width:100%"></span></span><span class="n">41 <span>из 22 отч.</span></span></li>
+        <li><span>review-harness v7</span><span class="trk"><span class="fil" style="width:34%"></span></span><span class="n">14 <span>из 31 отч. · 9 без данных</span></span></li>
+      </ul>
+      <details class="dup"><summary>Таблица значений</summary>
+        <table class="stack-sm"><thead><tr><th>Харнесс</th><th class="num">Отчётов</th><th class="num">Без данных</th><th class="num">Confirmed</th></tr></thead>
+        <tbody><tr><td data-label="Харнесс">v8</td><td class="num" data-label="Отчётов">22</td><td class="num" data-label="Без данных">—</td><td class="num" data-label="Confirmed">41</td></tr>
+        <tr><td data-label="Харнесс">v7</td><td class="num" data-label="Отчётов">31</td><td class="num" data-label="Без данных">9</td><td class="num" data-label="Confirmed">14</td></tr></tbody></table></details>
+    </figure>
+
+    <figure class="card chart" style="margin:0" aria-labelledby="c6">
+      <figcaption><span class="q" id="c6">Какие категории находок повторяются?</span><br><span class="src">recurring_categories[].findings, .tasks, .recurring</span></figcaption>
+      <ul class="bars">
+        <li><span>missing-migration</span><span class="trk"><span class="fil bad" style="width:100%"></span></span><span class="n">11 <span>7 задач · нет проверки</span></span></li>
+        <li><span>unsafe-default</span><span class="trk"><span class="fil bad" style="width:45%"></span></span><span class="n">5 <span>4 задачи · нет проверки</span></span></li>
+        <li><span>hardcoded-secret</span><span class="trk"><span class="fil" style="width:36%"></span></span><span class="n">4 <span>3 задачи · lint:B105</span></span></li>
+      </ul>
+      <p class="note">Красный — долг без проверки; слово «нет проверки» стоит в подписи, цвет не единственный признак.</p>
+      <details class="dup"><summary>Таблица значений</summary>
+        <table class="stack-sm"><thead><tr><th>Категория</th><th class="num">Находок</th><th class="num">Задач</th><th>Проверка</th></tr></thead>
+        <tbody><tr><td data-label="Категория">missing-migration</td><td class="num" data-label="Находок">11</td><td class="num" data-label="Задач">7</td><td data-label="Проверка">не заведена</td></tr>
+        <tr><td data-label="Категория">unsafe-default</td><td class="num" data-label="Находок">5</td><td class="num" data-label="Задач">4</td><td data-label="Проверка">не заведена</td></tr>
+        <tr><td data-label="Категория">hardcoded-secret</td><td class="num" data-label="Находок">4</td><td class="num" data-label="Задач">3</td><td data-label="Проверка">lint:B105</td></tr></tbody></table></details>
+    </figure>
+  </div>
+</section>
+
+<!-- ---- Распределения и утечки ---- -->
+<section class="blk" aria-labelledby="h-dist">
+  <div class="blk-head"><h2 id="h-dist">Распределения и утечки</h2></div>
+  <div class="grid charts">
+
+    <figure class="card chart" style="margin:0" aria-labelledby="c7">
+      <figcaption><span class="q" id="c7">Сколько на деле занимает задача, а не в среднем?</span><br><span class="src">ряд cycle_times (по задачам, #1490); отдельно: no_completion_tasks, unmeasurable_tasks</span></figcaption>
+      <svg viewBox="0 0 320 150" width="100%" role="img" aria-describedby="c7t">
+        <g stroke="#2f3346"><line x1="20" y1="120" x2="312" y2="120"/></g>
+        <g fill="#5aa9f0"><rect x="26" y="64" width="38" height="56"/><rect x="72" y="28" width="38" height="92"/><rect x="118" y="48" width="38" height="72"/><rect x="164" y="84" width="38" height="36"/><rect x="210" y="102" width="38" height="18"/><rect x="256" y="112" width="38" height="8"/></g>
+        <g fill="#e4e7f0" font-size="10" text-anchor="middle"><text x="45" y="60">6</text><text x="91" y="24">10</text><text x="137" y="44">8</text><text x="183" y="80">4</text><text x="229" y="98">2</text><text x="275" y="108">1</text></g>
+        <g fill="#a0a5b8" font-size="9" text-anchor="middle"><text x="45" y="134">&lt;1 ч</text><text x="91" y="134">1–4 ч</text><text x="137" y="134">4–24 ч</text><text x="183" y="134">1–3 д</text><text x="229" y="134">3–7 д</text><text x="275" y="134">&gt;7 д</text></g>
+        <line x1="128" y1="20" x2="128" y2="120" stroke="#f39c12" stroke-width="2" stroke-dasharray="4 3"/><text x="132" y="18" fill="#f39c12" font-size="10">медиана 18,5 ч</text>
+      </svg>
+      <p class="sr" id="c7t">Распределение времени выполнения по 31 задаче: до часа 6, от одного до четырёх часов 10, от четырёх до суток 8, от одного до трёх дней 4, от трёх до семи дней 2, больше семи дней 1. Медиана 18,5 часа.</p>
+      <p class="note">31 в корзинах. <strong>Вне корзин:</strong> 12 без отметки завершения, 1 со стартом позже завершения.</p>
+      <details class="dup"><summary>Таблица значений</summary>
+        <table><tbody><tr><td>&lt;1 ч</td><td class="num">6</td></tr><tr><td>1–4 ч</td><td class="num">10</td></tr><tr><td>4–24 ч</td><td class="num">8</td></tr><tr><td>1–3 д</td><td class="num">4</td></tr><tr><td>3–7 д</td><td class="num">2</td></tr><tr><td>&gt;7 д</td><td class="num">1</td></tr><tr><td>без отметки завершения</td><td class="num">12</td></tr><tr><td>старт неизвестен</td><td class="num">1</td></tr></tbody></table></details>
+    </figure>
+
+    <figure class="card chart" style="margin:0" aria-labelledby="c8">
+      <figcaption><span class="q" id="c8">На какой стадии ловим дефекты?</span><br><span class="src">shift_left.by_stage[].defects, .unknown, .unknown_share</span></figcaption>
+      <ul class="bars">
+        <li><span>review</span><span class="trk"><span class="fil" style="width:100%"></span></span><span class="n">9 <span>32%</span></span></li>
+        <li><span>ci</span><span class="trk"><span class="fil" style="width:67%"></span></span><span class="n">6 <span>21%</span></span></li>
+        <li><span>test</span><span class="trk"><span class="fil" style="width:22%"></span></span><span class="n">2 <span>7%</span></span></li>
+        <li><span>staging</span><span class="trk"></span><span class="n">0 <span>0%</span></span></li>
+        <li><span>prod</span><span class="trk"><span class="fil bad" style="width:33%"></span></span><span class="n">3 <span>11%</span></span></li>
+        <li><span>неизвестно</span><span class="trk"><span class="fil hatch" style="width:89%"></span></span><span class="n">8 <span>29%</span></span></li>
+      </ul>
+      <p class="caveat-box" style="margin-top:6px">Стадия не записана у 8 из 28 дефектов (29%). Картина неполная, пока эта доля велика.</p>
+      <details class="dup"><summary>Таблица значений</summary>
+        <table><tbody><tr><td>review</td><td class="num">9</td></tr><tr><td>ci</td><td class="num">6</td></tr><tr><td>test</td><td class="num">2</td></tr><tr><td>staging</td><td class="num">0</td></tr><tr><td>prod</td><td class="num">3</td></tr><tr><td>неизвестно</td><td class="num">8</td></tr></tbody></table></details>
+    </figure>
+
+    <figure class="card chart" style="margin:0" aria-labelledby="c9">
+      <figcaption><span class="q" id="c9">Как быстро замечаем и чиним прод-дефект?</span><br><span class="src">prod_defect_clocks.time_to_detect / time_to_restore .median_hours, .measured, .unmeasurable</span></figcaption>
+      <ul class="bars">
+        <li><span>time-to-detect</span><span class="trk"><span class="fil" style="width:40%"></span></span><span class="n">6,2 ч <span>в медиане 2 из 3</span></span></li>
+        <li><span>time-to-restore</span><span class="trk"></span><span class="n"><span>нет измеримых</span></span></li>
+      </ul>
+      <p class="note">Неизмеримые (нет deployed_at или resolved_at) названы, в медиану не входят. Прод-дефектов в окне: 3.</p>
+    </figure>
+
+    <figure class="card chart" style="margin:0" aria-labelledby="c10">
+      <figcaption><span class="q" id="c10">Сколько платим и за что: прогоны со счётом и без?</span><br><span class="src">review_economy.runs.billed / unbilled / red_ci.runs / reconciliation.gap</span></figcaption>
+      <div class="stack" role="img" aria-describedby="c10t"><b style="width:87%;background:#5aa9f0"></b><b style="width:13%;background:repeating-linear-gradient(45deg,#f39c12 0 4px,transparent 4px 8px)"></b></div>
+      <ul class="legend"><li style="color:#5aa9f0"><i class="box"></i>со счётом 62 (87%)</li><li style="color:#f39c12"><i class="box"></i>без счёта 9 (13%)</li></ul>
+      <p class="sr" id="c10t">Из 71 прогона со счётом 62, без счёта 9.</p>
+      <p class="note">Покрыто выгрузкой Cursor: 48 прогонов (68%). Куплено на красном CI: 5 прогонов.</p>
+    </figure>
+  </div>
+</section>
+
+<!-- ---- Строки ---- -->
+<section class="blk" aria-labelledby="h-rows">
+  <div class="blk-head"><h2 id="h-rows">Строки: таблицы и пояснения</h2>
+  <p class="note">Прежние таблицы страницы. Каждая — с блоком «как считается» у своей строки; текст пояснений переносится дословно.</p></div>
+  <div class="card">
+    <h3>Пробитые правила каталога</h3>
+    <table class="stack-sm"><thead><tr><th>Категория</th><th>Проверка</th><th>Заведено</th><th class="num">После</th><th>Задачи</th></tr></thead>
+    <tbody><tr><td data-label="Категория">hardcoded-secret</td><td data-label="Проверка"><span class="badge">lint:B105</span></td><td data-label="Заведено">2026-08-12</td><td class="num" data-label="После">2</td><td data-label="Задачи"><a href="#p1">#1443</a> <a href="#p1">#1450</a></td></tr></tbody></table>
+    <details class="how"><summary>Как считается</summary><p>Правило из category_checks, чей класс вернулся после даты заведения правила. Находки того же класса до этой даты — история, из которой правило выведено, и пробитием не считаются. Считается за всю жизнь правила, а не за окно (#920).</p></details>
+  </div>
+  <div class="card" style="margin-top:12px">
+    <h3>Change failure rate</h3>
+    <table class="stack-sm"><thead><tr><th>Проект</th><th class="num">Выкатов</th><th class="num">С дефектом</th><th class="num">CFR</th></tr></thead>
+    <tbody><tr><td data-label="Проект">default</td><td class="num" data-label="Выкатов">4</td><td class="num" data-label="С дефектом">1</td><td class="num" data-label="CFR"><span class="badge na">малая выборка</span></td></tr></tbody></table>
+    <p class="caveat-box" style="margin-top:6px">Меньше 5 выкатов — доля не показывается. Прод-дефектов без привязки к релизу: 2.</p>
+    <details class="how"><summary>Как считается</summary><p>Доля успешных выкатов окна, к которым привязан хотя бы один прод-дефект (found_in=prod с release_id на этот релиз). Знаменатель — число выкатов, он стоит рядом с долей (#918).</p></details>
+  </div>
+  <p class="note" style="margin-top:8px">Остальные разделы (Machine reviews, Review dispatches, стюард, escaped defects, cycle time) — тем же образом: таблица + «как считается» + «строки-источники». Полный перечень — в спеке, раздел 6.</p>
+</section>
+</article>
+
+<!-- ================= СОСТОЯНИЯ ================= -->
+<article class="page" id="states">
+<p class="page-tag">состояния компонентов</p>
+<h2>Пустое состояние, оговорка, недостаточные данные</h2>
+<div class="grid states" style="margin-top:8px">
+  <div class="empty"><b>Нет данных за окно</b>Вердиктов ревью в окне нет. Это не ноль: считать не из чего.</div>
+  <div class="empty"><b>Сравнить не с чем</b>В предыдущем окне 2 наблюдения, нужно не меньше 10. Направление не рисуется.</div>
+  <div class="empty"><b>График не строится</b>Одна точка ряда. Показано значение 61% (n=1) и таблица; ось не рисуется.</div>
+  <div class="empty"><b>Проблемных мест не найдено</b>При выборке 46 задач и 61 находке. Это не значит, что их нет; список строится по порогам из спеки.</div>
+</div>
+<div class="caveat-box" style="margin-top:12px"><strong>Оговорка о неполных данных (компонент).</strong> Стоит рядом с числом и видна всегда, в том числе когда блок «как считается» свёрнут. Текст называет что именно не покрыто и сколько: «размечено 24 из 61».</div>
+<details class="how" style="margin-top:12px"><summary>Как считается (свёрнутый блок)</summary><p>Объяснение методики. Под кат уходит объяснение, а не сам факт неполноты.</p></details>
+<div class="grid states" style="margin-top:12px">
+  <div class="card"><h3>Фильтр без результатов</h3><p class="note">Проект «snip-portal», модель «grok-4.6», 30 д: прогонов нет. Показано пустое состояние на каждом блоке и кнопка «Сбросить фильтры».</p><p><a href="#p1">Сбросить фильтры</a></p></div>
+  <div class="card"><h3>Модель без данных провайдера</h3><p class="note">Цена находки для модели без счёта показывается как «нет счёта», а не как 0 и не как среднее по остальным.</p></div>
+</div>
+</article>
+
+<!-- ================= СТРАНИЦА 2: /metrics/agent-api ================= -->
+<article class="page" id="p2">
+<p class="page-tag">страница 2 · /metrics/agent-api?window_days=30</p>
+<header class="hdr">
+  <h1>Agent API usage</h1>
+  <a href="#p1">← Метрики практики</a>
+</header>
+<div class="filters" role="group" aria-label="Окно">
+  <div class="f"><span id="fw2">Окно</span>
+    <nav class="seg" aria-labelledby="fw2"><a href="#p2">14 д</a><a href="#p2" aria-current="true">30 д</a><a href="#p2">90 д</a></nav></div>
+  <label class="cmp"><input type="checkbox" checked> Сравнить с предыдущими 30 д</label>
+</div>
+<p class="note">Проекта и модели у этой страницы нет: телеметрия MCP пишется по вызывающему и инструменту. Хранение 90 дней, поэтому окон дольше нет.</p>
+
+<section class="blk" aria-labelledby="h-a1">
+  <div class="blk-head"><h2 id="h-a1">Общая картина</h2></div>
+  <div class="grid kpis">
+    <div class="card kpi"><span class="lbl">Вызовов</span><span class="val">12 480</span><span class="delta">▲ больше: было 9 900, +26%</span><span class="foot"><span class="src">totals.calls</span></span></div>
+    <div class="card kpi warn"><span class="lbl">Ошибки</span><span class="val">3,1% <small>(387)</small></span><span class="delta dn-bad">▲ хуже: было 2,2%, +0,9 п.п.</span><span class="foot"><span class="src">totals.error_rate</span><a href="#p2">387 →</a></span></div>
+    <div class="card kpi"><span class="lbl">Инструментов вызвано</span><span class="val">88 <small>из 112</small></span><span class="delta">≈ без изменений</span><span class="foot"><span class="src">totals.tools_used / published_tools</span><a href="#p2">24 не вызваны →</a></span></div>
+    <div class="card kpi bad"><span class="lbl">Видно модели, символов</span><span class="val">41 200</span><span class="delta">≈ без изменений</span><span class="caveat">Запас съеден на 84%: порог предупреждения 80%.</span><span class="foot"><span class="src">catalog.model_visible_chars</span></span></div>
+    <div class="card kpi"><span class="lbl">Уникальных вызывающих</span><span class="val">9</span><span class="delta"><span class="badge na">сравнить не с чем</span></span><span class="foot"><span class="src">totals.principals</span></span></div>
+    <div class="card kpi"><span class="lbl">Ответ в среднем, символов</span><span class="val">1 240</span><span class="delta">▼ лучше: было 1 390, −11%</span><span class="foot"><span class="src">totals.avg_response_chars</span></span></div>
+  </div>
+</section>
+
+<section class="blk" aria-labelledby="h-a2">
+  <div class="blk-head"><h2 id="h-a2">Где плохо</h2></div>
+  <ol class="problems">
+    <li class="tier1"><span class="rk">1</span><div><h3><span class="badge bad">потолок близко</span> Запас каталога съеден на 84%</h3></div><a class="go" href="#p2">2 метрики →</a><p class="why">Источник: <code>budget.headroom[].used_pct</code> ≥ порога предупреждения.</p></li>
+    <li class="tier2"><span class="rk">2</span><div><h3><span class="badge warn">ошибки</span> hub_submit_for_review — 14% ошибок, 21 вызов</h3></div><a class="go" href="#p2">21 строка →</a><p class="why">Причина: <code>sha_check_diverged</code>. Источник: <code>by_tool[].error_rate</code>, <code>top_errors[]</code>.</p></li>
+    <li class="tier3"><span class="rk">3</span><div><h3><span class="badge info">плата без пользы</span> 24 инструмента не вызывались за окно</h3></div><a class="go" href="#p2">список →</a><p class="why">Каждый берёт плату описанием с каждого агента. Источник: <code>unused_tools</code>.</p></li>
+  </ol>
+</section>
+
+<section class="blk" aria-labelledby="h-a3">
+  <div class="blk-head"><h2 id="h-a3">Разбивки</h2></div>
+  <div class="grid charts">
+    <figure class="card chart" style="margin:0" aria-labelledby="a1">
+      <figcaption><span class="q" id="a1">Какими инструментами пользуются и где они падают?</span><br><span class="src">by_tool[].calls, .error_rate</span></figcaption>
+      <ul class="bars">
+        <li><span>hub_task_status</span><span class="trk"><span class="fil" style="width:100%"></span></span><span class="n">3 120 <span>0,4% ошибок</span></span></li>
+        <li><span>hub_my_context</span><span class="trk"><span class="fil" style="width:64%"></span></span><span class="n">2 010 <span>0%</span></span></li>
+        <li><span>hub_submit_for_review</span><span class="trk"><span class="fil bad" style="width:21%"></span></span><span class="n">150 <span>14% ошибок</span></span></li>
+      </ul>
+      <details class="dup"><summary>Таблица значений</summary>
+        <table class="stack-sm"><thead><tr><th>Tool</th><th class="num">Вызовов</th><th class="num">Ошибки</th><th class="num">p50 / p95, мс</th></tr></thead>
+        <tbody><tr><td data-label="Tool">hub_task_status</td><td class="num" data-label="Вызовов">3 120</td><td class="num" data-label="Ошибки">13 (0,4%)</td><td class="num" data-label="p50 / p95">40 / 210</td></tr>
+        <tr><td data-label="Tool">hub_submit_for_review</td><td class="num" data-label="Вызовов">150</td><td class="num" data-label="Ошибки">21 (14%)</td><td class="num" data-label="p50 / p95">380 / 2 400</td></tr></tbody></table></details>
+    </figure>
+    <figure class="card chart" style="margin:0" aria-labelledby="a2">
+      <figcaption><span class="q" id="a2">Кто ходит через MCP?</span><br><span class="src">by_role[].calls, by_profile[].calls</span></figcaption>
+      <ul class="bars">
+        <li><span>agent</span><span class="trk"><span class="fil" style="width:100%"></span></span><span class="n">10 900</span></li>
+        <li><span>steward</span><span class="trk"><span class="fil" style="width:12%"></span></span><span class="n">1 300</span></li>
+        <li><span>reviewer</span><span class="trk"><span class="fil" style="width:3%"></span></span><span class="n">280</span></li>
+      </ul>
+    </figure>
+    <figure class="card chart" style="margin:0" aria-labelledby="a3">
+      <figcaption><span class="q" id="a3">Сколько места в потолке каталога осталось?</span><br><span class="src">budget.headroom[].used_pct, headroom_warn_pct</span></figcaption>
+      <ul class="bars">
+        <li><span>model_visible_chars</span><span class="trk"><span class="fil bad" style="width:84%"></span></span><span class="n">84% <span>порог 80%</span></span></li>
+        <li><span>catalog_chars</span><span class="trk"><span class="fil" style="width:52%"></span></span><span class="n">52% <span>порог 80%</span></span></li>
+        <li><span>schema_chars</span><span class="trk"></span><span class="n"><span>базы нет</span></span></li>
+      </ul>
+    </figure>
+    <figure class="card chart" style="margin:0" aria-labelledby="a4">
+      <figcaption><span class="q" id="a4">Почему вызовы падают?</span><br><span class="src">top_errors[].calls, .error_reason</span></figcaption>
+      <table class="stack-sm"><thead><tr><th>Tool</th><th>Причина</th><th class="num">Вызовов</th></tr></thead>
+      <tbody><tr><td data-label="Tool">hub_submit_for_review</td><td data-label="Причина">sha_check_diverged</td><td class="num" data-label="Вызовов">14</td></tr>
+      <tr><td data-label="Tool">hub_claim_task</td><td data-label="Причина">claim_without_session</td><td class="num" data-label="Вызовов">9</td></tr></tbody></table>
+    </figure>
+  </div>
+  <details class="how"><summary>Как считается: каталог, запас, роли</summary><p>Инструкция считается один раз. «Запас съеден» считается от запаса, а не от заполненности потолка. «Базы нет» значит, что в файле бюджета не записано measured, доля не выдумывается. Тексты переносятся дословно.</p></details>
+</section>
+</article>
+
+</div></div>
+</body>
+</html>
