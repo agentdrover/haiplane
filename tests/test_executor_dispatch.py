@@ -138,6 +138,8 @@ async def test_polling_records_tokens_cents_and_outcome(db, monkeypatch):
     assert row["outcome"] == OUTCOME_RUNNING
     assert row["finished_at"] is None
     assert row["duration_ms"] is None
+    # Сдача поколения прогона легла: FINISHED без сдачи — другой исход (#1446).
+    await _submitted(db, task_id, 1)
 
     # F0, шаг 0: FINISHED за 746 с, 1 332 835 токенов, 47.1 цента.
     _provider(
@@ -171,6 +173,8 @@ async def test_a_silent_provider_is_named_not_zeroed(db, monkeypatch):
         monkeypatch, run={"id": "run-1", "status": "RUNNING"}, usage=_usage(5000, 3.0)
     )
     await poll_executor_runs(db)
+    # Сдача поколения прогона легла: FINISHED без сдачи — другой исход (#1446).
+    await _submitted(db, task_id, 1)
 
     # /usage молчит, а /runs говорит FINISHED: цена не прочитана — прогон
     # не закрывается, прежние цифры не обнуляются.
@@ -233,6 +237,8 @@ async def test_cost_is_read_from_the_sdk_cost_object(db, monkeypatch):
     )
     task_id = await _task(db)
     row_id = await _run(db, task_id)
+    # Сдача поколения прогона легла: FINISHED без сдачи — другой исход (#1446).
+    await _submitted(db, task_id, 1)
     _provider(
         monkeypatch,
         run={"id": "run-1", "status": "FINISHED"},
@@ -248,6 +254,8 @@ async def test_a_finished_run_without_cost_waits_for_it(db, monkeypatch):
     monkeypatch.setattr(config, "EXECUTOR_COST_WAIT_MIN", 30)
     task_id = await _task(db)
     row_id = await _run(db, task_id)
+    # Сдача поколения прогона легла: FINISHED без сдачи — другой исход (#1446).
+    await _submitted(db, task_id, 1)
 
     # Прогон кончился, токены пришли, цена — ещё нет: не закрывать.
     _provider(
@@ -286,6 +294,8 @@ async def test_a_price_read_while_running_closes_the_run_at_once(db, monkeypatch
         monkeypatch, run={"id": "run-1", "status": "RUNNING"}, usage=_usage(1000, 1.5)
     )
     await poll_executor_runs(db)
+    # Сдача поколения прогона легла: FINISHED без сдачи — другой исход (#1446).
+    await _submitted(db, task_id, 1)
 
     _provider(
         monkeypatch,
@@ -305,6 +315,8 @@ async def test_cost_wait_has_a_ceiling_and_names_it(db, monkeypatch):
     monkeypatch.setattr(config, "EXECUTOR_COST_WAIT_MIN", 30)
     task_id = await _task(db)
     row_id = await _run(db, task_id)
+    # Сдача поколения прогона легла: FINISHED без сдачи — другой исход (#1446).
+    await _submitted(db, task_id, 1)
     _provider(
         monkeypatch,
         run={"id": "run-1", "status": "FINISHED"},
