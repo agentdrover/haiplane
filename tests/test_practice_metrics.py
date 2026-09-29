@@ -1083,17 +1083,18 @@ async def test_shift_left_distribution(client: AsyncClient, db: aiosqlite.Connec
     await _defect(db, title="caught by CI", found_in="ci")
     await _defect(db, title="escaped", found_in="prod")
     await _bug(db, title="stage never recorded", parent_id=None)
-    feature = await _task(db, title="a feature, stage unknown by default")
+    await _task(db, title="a feature, stage unknown by default")  # no defect
+    caught = await _task(db, title="a feature whose test run caught a defect")
+    await db.execute("UPDATE tasks SET found_in='test' WHERE id=?", (caught,))
     old = await _defect(db, title="outside the window", found_in="staging")
     await db.execute(
         "UPDATE tasks SET created_at=datetime('now', '-400 days') WHERE id=?", (old,)
     )
     await db.commit()
-    assert feature  # found_in='unknown' on a non-bug is no defect
 
     metrics = await practice_metrics(db)
     sl = metrics["shift_left"]
-    assert sl["defects"] == 5
+    assert sl["defects"] == 6, "bugs, plus any task with a recorded stage"
     assert [r["stage"] for r in sl["by_stage"]] == [
         "review",
         "ci",
@@ -1103,21 +1104,21 @@ async def test_shift_left_distribution(client: AsyncClient, db: aiosqlite.Connec
         "unknown",
     ]
     by = {r["stage"]: r for r in sl["by_stage"]}
-    assert (by["review"]["defects"], by["review"]["share"]) == (2, 0.4)
-    assert (by["ci"]["defects"], by["test"]["defects"]) == (1, 0)
+    assert (by["review"]["defects"], by["review"]["share"]) == (2, 0.333)
+    assert (by["ci"]["defects"], by["test"]["defects"]) == (1, 1)
     assert by["staging"]["defects"] == 0, "the window applies to created_at"
     assert by["prod"]["defects"] == metrics["escaped_defects"]["escaped"] == 1
-    assert sl["unknown"] == 1
-    assert sl["unknown_share"] == 0.2
-    assert sl["recorded"] == 4
+    assert (by["unknown"]["defects"], sl["unknown"]) == (1, 1)
+    assert sl["unknown_share"] == 0.167
+    assert sl["recorded"] == 5
 
     api = (await client.get("/api/metrics/practices")).json()["shift_left"]
-    assert api["unknown_share"] == 0.2
+    assert api["unknown_share"] == 0.167
 
     page = (await client.get("/metrics")).text
     assert "Shift-left" in page
     assert 'data-metric="shift_left.review.defects">2<' in page
-    assert 'data-metric="shift_left.unknown_share">20.0%<' in page
+    assert 'data-metric="shift_left.unknown_share">16.7%<' in page
 
 
 async def test_shift_left_empty_window_has_no_shares(db: aiosqlite.Connection):
