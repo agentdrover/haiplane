@@ -451,6 +451,31 @@ def _add_change_failure_rate_parser(sub: Any) -> None:
     p_cfr.set_defaults(func=cmd_change_failure_rate)
 
 
+def cmd_shift_left(args: argparse.Namespace) -> int:
+    """Shift-left (#914): the shift_left section — defects by found_in."""
+    result = _api("GET", f"/api/metrics/practices?since_days={args.since_days}")
+    _print_json((result or {}).get("shift_left", {}))
+    return 0
+
+
+def _add_shift_left_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling."""
+    p_sl = sub.add_parser(
+        "shift-left",
+        help="Defects of the window by the stage that caught them (found_in), "
+        "with the unknown share apart (#914)",
+    )
+    p_sl.add_argument("--since-days", type=int, default=90)
+    p_sl.set_defaults(func=cmd_shift_left)
+
+
+def _add_defect_metric_parsers(sub: Any) -> None:
+    """Defect metric sections (#918, #914): one call from build_parser, which
+    sits at its complexity ceiling."""
+    _add_change_failure_rate_parser(sub)
+    _add_shift_left_parser(sub)
+
+
 def cmd_answer_outcome(args: argparse.Namespace) -> int:
     """Record one check of a completed task's outcome (#819)."""
     body = {
@@ -1963,7 +1988,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_clocks.add_argument("--since-days", type=int, default=90)
     p_clocks.set_defaults(func=cmd_defect_clocks)
-    _add_change_failure_rate_parser(sub)
+    _add_defect_metric_parsers(sub)
 
     p_answer = sub.add_parser(
         "answer-outcome",
