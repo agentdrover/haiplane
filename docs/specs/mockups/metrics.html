@@ -178,9 +178,10 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   <div class="f"><span id="fw">Период</span>
     <nav class="seg" aria-labelledby="fw"><a href="#p1">30 д</a><a href="#p1" aria-current="true">90 д</a><a href="#p1">180 д</a><a href="#p1">всё</a></nav></div>
   <div class="f"><span id="fm">Модель-ревьюер</span>
-    <select aria-labelledby="fm"><option>все модели</option><option>gpt-5.3-codex</option><option>grok-4.6</option><option>composer-2</option></select></div>
+    <select aria-labelledby="fm" aria-describedby="model-note"><option>все модели</option><option>gpt-5.3-codex</option><option>grok-4.6</option><option>composer-2</option></select></div>
   <label class="cmp"><input type="checkbox" checked> Сравнить с предыдущими 90 д</label>
 </form>
+<p class="note" id="model-note" style="margin:0 0 8px">Модель влияет только на блоки про ревью. Cycle time, CFR и shift-left от неё не зависят и показаны по всему проекту.</p>
 <ul class="chips" aria-label="Активные фильтры">
   <li class="badge">проект: default</li><li class="badge">период: 90 д</li><li class="badge">сравнение: 90 д до этого</li>
 </ul>
@@ -202,16 +203,16 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 
     <div class="card kpi warn">
       <span class="lbl">Precision ревью (доля настоящих находок)</span>
-      <span class="val">83% <small>(размечено 24)</small></span>
-      <span class="delta up-good">▲ лучше: было 71% (n=9), +12 п.п.</span>
-      <span class="caveat">Оговорка: размечено 24 находки из 61 confirmed. Остальные ждут суждения.</span>
-      <span class="foot"><span class="src">machine_reviews.dispositions.precision</span><a href="#p1">37 ждут →</a></span>
+      <span class="val">79% <small>(размечено 48)</small></span>
+      <span class="delta up-good">▲ лучше: было 71% (n=14), +8 п.п.</span>
+      <span class="caveat">Оговорка: размечено 48 находок из 61 confirmed. Остальные 13 ждут суждения.</span>
+      <span class="foot"><span class="src">machine_reviews.dispositions.precision</span><a href="#p1">13 ждут →</a></span>
     </div>
 
     <div class="card kpi bad">
       <span class="lbl">Цена настоящей находки, provider-токены</span>
       <span class="val">2,4 млн <small>(по счёту провайдера)</small></span>
-      <span class="delta dn-bad">▲ дороже: было 1,9 млн, +26%</span>
+      <span class="delta dn-bad">▲ дороже: было 1,9 млн (n=58 со счётом), +26%</span>
       <span class="caveat">Оговорка: без счёта 9 из 71 прогона; их цена неизвестна, это не ноль.</span>
       <span class="foot"><span class="src">machine_reviews.provider_tokens_per_fixed</span><a href="#p1">9 строк →</a></span>
     </div>
@@ -219,23 +220,23 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="card kpi good">
       <span class="lbl">Касаний человека на доставленную задачу</span>
       <span class="val">1,3 <small>(58 / 44)</small></span>
-      <span class="delta up-good">▼ лучше: было 1,9, −0,6</span>
+      <span class="delta up-good">▼ лучше: было 1,9 (n=37 доставок), −0,6</span>
       <svg width="100%" height="28" viewBox="0 0 120 28" role="img" aria-label="Тренд касаний человека: с 2,1 до 1,3, снижение"><polyline fill="none" stroke="#5aa9f0" stroke-width="2" points="2,6 20,8 40,10 60,13 80,17 100,20 118,22"/></svg>
       <span class="foot"><span class="src">human_touches.touches_per_delivered</span><a href="#p1">44 задачи →</a></span>
     </div>
 
     <div class="card kpi warn">
       <span class="lbl">Change failure rate, проект default</span>
-      <span class="val">— <small>малая выборка</small></span>
+      <span class="val" style="font-size:18px">Недостаточно данных <small>(4 выката, нужно ≥ 5)</small></span>
       <span class="delta"><span class="badge na">сравнить не с чем</span></span>
-      <span class="caveat">Оговорка: 4 выката, порог 5; доля не показывается. Дефектов без привязки к релизу: 2.</span>
+      <span class="caveat">Оговорка: малая выборка, 4 выката при пороге 5; доля не показывается. Дефектов без привязки к релизу: 2.</span>
       <span class="foot"><span class="src">change_failure_rate.by_project[].rate</span><a href="#p1">4 выката →</a></span>
     </div>
 
     <div class="card kpi">
       <span class="lbl">Cycle time, feature, медиана</span>
       <span class="val">18,5 ч <small>(в медиане 31)</small></span>
-      <span class="delta"><span class="badge info">≈ без изменений</span> было 17,9 ч, +3%</span>
+      <span class="delta"><span class="badge info">≈ без изменений</span> было 17,9 ч (n=27), +3%</span>
       <span class="caveat">Оговорка: без отметки завершения 12 задач — вне медианы.</span>
       <span class="foot"><span class="src">cycle_times[work_type=feature].median_hours</span><a href="#p1">31 задача →</a></span>
     </div>
@@ -318,16 +319,16 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <figure class="card chart" style="margin:0" aria-labelledby="c3">
       <figcaption><span class="q" id="c3">Какая модель-ревьюер находит настоящие дефекты?</span><br><span class="src">by_reviewer_model[].precision, .judged</span></figcaption>
       <ul class="bars">
-        <li><span>gpt-5.3-codex</span><span class="trk"><span class="fil" style="width:88%"></span></span><span class="n">88% <span>n=17</span></span></li>
-        <li><span>grok-4.6</span><span class="trk"><span class="fil" style="width:70%"></span></span><span class="n">70% <span>n=10</span></span></li>
-        <li><span>composer-2</span><span class="trk"><span class="fil hatch" style="width:100%"></span></span><span class="n">100% <span>n=2 · мало</span></span></li>
+        <li><span>gpt-5.3-codex</span><span class="trk"><span class="fil" style="width:88%"></span></span><span class="n">88% <span>n=24</span></span></li>
+        <li><span>grok-4.6</span><span class="trk"><span class="fil" style="width:68%"></span></span><span class="n">68% <span>n=22</span></span></li>
+        <li><span>composer-2</span><span class="trk"><span class="fil hatch" style="width:100%"></span></span><span class="n">100% <span>n=2 · недостаточно данных</span></span></li>
       </ul>
-      <p class="note">Штриховка и «мало» — выборка меньше порога; столбец не сравнивается с остальными.</p>
+      <p class="note">Штриховка и «недостаточно данных» — выборка меньше порога 20 (MIN_JUDGED_PER_SLICE); столбец не сравнивается с остальными.</p>
       <details class="dup"><summary>Таблица значений</summary>
         <table class="stack-sm"><thead><tr><th>Модель</th><th class="num">Размечено</th><th class="num">Precision</th><th class="num">Ложняков</th></tr></thead>
-        <tbody><tr><td data-label="Модель">gpt-5.3-codex</td><td class="num" data-label="Размечено">17</td><td class="num" data-label="Precision">88%</td><td class="num" data-label="Ложняков">2</td></tr>
-        <tr><td data-label="Модель">grok-4.6</td><td class="num" data-label="Размечено">10</td><td class="num" data-label="Precision">70%</td><td class="num" data-label="Ложняков">3</td></tr>
-        <tr><td data-label="Модель">composer-2</td><td class="num" data-label="Размечено">2</td><td class="num" data-label="Precision">100%</td><td class="num" data-label="Ложняков">0</td></tr></tbody></table></details>
+        <tbody><tr><td data-label="Модель">gpt-5.3-codex</td><td class="num" data-label="Размечено">24</td><td class="num" data-label="Precision">88%</td><td class="num" data-label="Ложняков">3</td></tr>
+        <tr><td data-label="Модель">grok-4.6</td><td class="num" data-label="Размечено">22</td><td class="num" data-label="Precision">68%</td><td class="num" data-label="Ложняков">7</td></tr>
+        <tr><td data-label="Модель">composer-2</td><td class="num" data-label="Размечено">2</td><td class="num" data-label="Precision">недостаточно данных</td><td class="num" data-label="Ложняков">0</td></tr></tbody></table></details>
     </figure>
 
     <figure class="card chart" style="margin:0" aria-labelledby="c4">
@@ -353,7 +354,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       </ul>
       <details class="dup"><summary>Таблица значений</summary>
         <table class="stack-sm"><thead><tr><th>Харнесс</th><th class="num">Отчётов</th><th class="num">Без данных</th><th class="num">Confirmed</th></tr></thead>
-        <tbody><tr><td data-label="Харнесс">v8</td><td class="num" data-label="Отчётов">22</td><td class="num" data-label="Без данных">—</td><td class="num" data-label="Confirmed">41</td></tr>
+        <tbody><tr><td data-label="Харнесс">v8</td><td class="num" data-label="Отчётов">22</td><td class="num" data-label="Без данных">0</td><td class="num" data-label="Confirmed">41</td></tr>
         <tr><td data-label="Харнесс">v7</td><td class="num" data-label="Отчётов">31</td><td class="num" data-label="Без данных">9</td><td class="num" data-label="Confirmed">14</td></tr></tbody></table></details>
     </figure>
 
@@ -485,11 +486,11 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   <div class="blk-head"><h2 id="h-a1">Общая картина</h2></div>
   <div class="grid kpis">
     <div class="card kpi"><span class="lbl">Вызовов</span><span class="val">12 480</span><span class="delta">▲ больше: было 9 900, +26%</span><span class="foot"><span class="src">totals.calls</span></span></div>
-    <div class="card kpi warn"><span class="lbl">Ошибки</span><span class="val">3,1% <small>(387)</small></span><span class="delta dn-bad">▲ хуже: было 2,2%, +0,9 п.п.</span><span class="foot"><span class="src">totals.error_rate</span><a href="#p2">387 →</a></span></div>
+    <div class="card kpi warn"><span class="lbl">Ошибки</span><span class="val">3,1% <small>(387)</small></span><span class="delta dn-bad">▲ хуже: было 2,2% (9 900 вызовов), +0,9 п.п.</span><span class="foot"><span class="src">totals.error_rate</span><a href="#p2">387 →</a></span></div>
     <div class="card kpi"><span class="lbl">Инструментов вызвано</span><span class="val">88 <small>из 112</small></span><span class="delta">≈ без изменений</span><span class="foot"><span class="src">totals.tools_used / published_tools</span><a href="#p2">24 не вызваны →</a></span></div>
     <div class="card kpi bad"><span class="lbl">Видно модели, символов</span><span class="val">41 200</span><span class="delta">≈ без изменений</span><span class="caveat">Запас съеден на 84%: порог предупреждения 80%.</span><span class="foot"><span class="src">catalog.model_visible_chars</span></span></div>
     <div class="card kpi"><span class="lbl">Уникальных вызывающих</span><span class="val">9</span><span class="delta"><span class="badge na">сравнить не с чем</span></span><span class="foot"><span class="src">totals.principals</span></span></div>
-    <div class="card kpi"><span class="lbl">Ответ в среднем, символов</span><span class="val">1 240</span><span class="delta">▼ лучше: было 1 390, −11%</span><span class="foot"><span class="src">totals.avg_response_chars</span></span></div>
+    <div class="card kpi"><span class="lbl">Ответ в среднем, символов</span><span class="val">1 240</span><span class="delta">▼ лучше: было 1 390 (9 900 вызовов), −11%</span><span class="foot"><span class="src">totals.avg_response_chars</span></span></div>
   </div>
 </section>
 
