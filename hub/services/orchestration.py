@@ -25,6 +25,7 @@ from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
 from hub.services.prevention_gate import hold_completion
 from hub.services.defect_clocks import (
     change_failure_rate,
+    shift_left,
     measured_escapes,
     prod_defect_clocks,
 )
@@ -1008,6 +1009,9 @@ async def practice_metrics(
         # #918: share of successful deploys a prod defect points at, per
         # project, with the deploy count beside the share.
         "change_failure_rate": await change_failure_rate(db, since),
+        # #914: defects of the window by the stage that caught them, with
+        # the unknown share apart; the prod bucket is the measured escapes.
+        "shift_left": await shift_left(db, since),
         "model_declarations": model_declarations,
         "human_gates": human_gates,
         # #1107: the shadow table lives BESIDE the other practice numbers,

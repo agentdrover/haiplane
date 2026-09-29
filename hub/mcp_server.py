@@ -3623,6 +3623,20 @@ def _change_failure_lines(data: dict) -> list[str]:
     ]
 
 
+def _shift_left_lines(sl: dict[str, Any]) -> list[str]:
+    """#914: defects by found_in; unknown named apart with its share."""
+    if not sl:
+        return []
+    stages = [r for r in sl.get("by_stage") or [] if r.get("stage") != "unknown"]
+    share = sl.get("unknown_share")
+    return [
+        f"Shift-left (defects by found_in, {sl.get('defects', 0)}): "
+        + ", ".join(f"{r.get('stage')} {r.get('defects', 0)}" for r in stages)
+        + f"; unknown {sl.get('unknown', 0)} "
+        + (f"({round(share * 100, 1)}%)" if share is not None else "(no defects)")
+    ]
+
+
 def _rule_breach_lines(report: dict[str, Any]) -> list[str]:
     """Catalogue rules whose class came back after they were set up (#920)."""
     total = int(report.get("rules_total") or 0)
@@ -3735,6 +3749,7 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
     )
     lines.append(_defect_clocks_line(data.get("prod_defect_clocks") or {}))
     lines.extend(_change_failure_lines(data))
+    lines.extend(_shift_left_lines(data.get("shift_left") or {}))
     lines.extend(_rule_breach_lines(data.get("rule_breaches") or {}))
     recurring = [c for c in data.get("recurring_categories", []) if c.get("recurring")]
     if recurring:
@@ -4571,9 +4586,34 @@ def _prepare_quality_warnings(
     return warnings
 
 
+# #914: the order of work a bug brief hands over, and the AC shape that makes
+# that order checkable. The gate it names is #913 (hub/services/red_test_gate.py):
+# a test only counts as a reproduction when CI saw it FAIL on the merge-base code.
+# Saying so in the brief is the point — the gate refusing after the fact is the
+# expensive way to learn the rule. Other work types get no such lines.
+BUG_REPRODUCE_FIRST_LINES = (
+    "Порядок работы (дефект, #914):",
+    "1. Сначала воспроизведи: напиши падающий тест, который воспроизводит "
+    "дефект на текущем коде, и закоммить его до фикса.",
+    "2. Потом чини: меняй код, пока этот тест не станет зелёным; тест остаётся "
+    "регрессионным.",
+    "Гейт красного теста (#913): CI прогоняет изменённые в ветке тестовые файлы "
+    "поверх кода merge-base (baseline). Воспроизведением засчитывается только "
+    "failed (упал на assert); error — не доказано: тест упал по неверной "
+    "причине (импорт, фикстура, сборка); skipped и passed тоже не доказывают. "
+    "Слова и мутации в сдаче доказательством не считаются.",
+    "Тест должен стоять в test_ref AC, который он доказывает: гейт читает "
+    "test_ref, тест вне его ничего не доказывает.",
+    "Шаблон AC дефекта: Given состояние, в котором дефект проявляется; "
+    "When действие, на котором он проявляется; Then ожидаемое поведение; "
+    "verifiable_by=test; test_ref=tests/<file>.py::<test_name>.",
+)
+
+
 def _developer_handoff_text(
     task_id: int,
     *,
+    work_type: str | None = None,
     problem_statement: str | None,
     business_value: str | None,
     scope_in: list[str] | None,
@@ -4589,6 +4629,8 @@ def _developer_handoff_text(
         lines.append(f"Problem: {problem_statement}")
     if business_value:
         lines.append(f"Value: {business_value}")
+    if work_type == "bug":
+        lines.extend(BUG_REPRODUCE_FIRST_LINES)
     if scope_in:
         lines.append("Scope in:")
         lines.extend(f"- {item}" for item in scope_in)
@@ -4768,6 +4810,7 @@ async def hub_prepare_developer_task(
 
     handoff_text = _developer_handoff_text(
         task_id,
+        work_type=effective_work_type,
         problem_statement=problem_statement,
         business_value=business_value,
         scope_in=scope_in,

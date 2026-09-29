@@ -995,7 +995,10 @@ async def test_metrics_page_shows_change_failure_rate(
     assert "Change failure rate" in page
     assert 'data-metric="change_failure_rate.default.deploys">1<' in page
     assert "малая выборка" in page
-    assert "100.0%" not in page
+    # The CFR table only: the shift-left table above it (#914) rightly shows
+    # this one defect as 100% of the window's prod stage.
+    cfr_section = page.split("Change failure rate (#918)", 1)[1].split("<h2>", 1)[0]
+    assert "100.0%" not in cfr_section
 
 
 async def test_mcp_practice_metrics_names_cfr_and_both_escapes():

@@ -537,6 +537,29 @@ lite в среднем 1.38M, deep 3.85M. Столбец Tokens рядом — �
     </tbody>
 </table>
 
+<h2>Shift-left: где пойман дефект (#914)</h2>
+{% set sl = m.shift_left %}
+<p class="muted">Дефекты окна по стадии обнаружения (found_in, #909): баги и
+любые задачи с записанной стадией, по дате заведения. Стадии идут по цене
+промаха — чем правее, тем дороже. Строка prod совпадает с «Утечек в прод,
+измерено». unknown — стадия не записана; её доля показана отдельно, потому что
+распределение по одним заполненным строкам выглядит законченным, когда им не
+является. Всего дефектов в окне: {{ sl.defects }}, стадия записана у
+{{ sl.recorded }}.</p>
+<table class="task-table">
+    <thead><tr><th>Стадия</th><th>Дефектов</th><th>Доля</th></tr></thead>
+    <tbody>
+        {% for r in sl.by_stage %}
+        <tr><td>{{ r.stage }}</td>
+            <td data-metric="shift_left.{{ r.stage }}.defects">{{ r.defects }}</td>
+            <td>{% if r.share is not none %}{{ (r.share * 100) | round(1) }}%{% else %}—{% endif %}</td></tr>
+        {% endfor %}
+        <tr><td><strong>Доля unknown</strong> <span class="muted">(стадия не записана)</span></td>
+            <td>{{ sl.unknown }}</td>
+            <td data-metric="shift_left.unknown_share">{% if sl.unknown_share is not none %}{{ (sl.unknown_share * 100) | round(1) }}%{% else %}<span class="muted">дефектов в окне нет</span>{% endif %}</td></tr>
+    </tbody>
+</table>
+
 <h2>Часы прод-дефекта (#916)</h2>
 {% set dc = m.prod_defect_clocks %}
 <p class="muted">time-to-detect — от выката релиза, привязанного к дефекту
