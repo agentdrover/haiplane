@@ -6600,6 +6600,7 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
         "circle_deep_stop": 2,
         "submission_contract": "warn",
         "claim_area_check": "warn",
+        "bug_red_test": "warn",
         "slot_dead_minutes": 90,
     }
     not_shown = set(GATE_POLICY_KEYS) - _FORM_GATE_POLICY_KEYS

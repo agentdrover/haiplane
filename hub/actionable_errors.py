@@ -826,6 +826,35 @@ def submission_contract_violated_detail(
     )
 
 
+def bug_red_test_unproven_detail(
+    violations: list[str], *, head_sha: str, not_evidence: str
+) -> dict[str, Any]:
+    """Сдача бага без доказанного красного теста в режиме require (#913).
+
+    Причина по каждому AC разом: нет baseline, зелёный до фикса, упал по
+    неверной причине. Подсказка говорит, откуда берётся доказательство —
+    исполнитель без MCP читает только эту ошибку.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "bug_red_test_unproven",
+            "actor_hint": "agent",
+            "retry_by_same_caller": True,
+            "message": (
+                f"bug_red_test (require) refused this bug submission at "
+                f"{(head_sha or '')[:12] or '—'}: " + "; ".join(violations)
+            ),
+            "violations": list(violations),
+            "hint": (
+                "Nothing was recorded: no generation, no review ordered, the "
+                "status did not change. " + not_evidence + " Push the branch, "
+                "wait for CI to report the pinned commit, then resubmit."
+            ),
+            "suggested_tool": "hub_submit_for_review",
+        }
+    )
+
+
 def claim_area_conflict_detail(
     *, task_id: int, current_status: str, conflict: dict[str, Any]
 ) -> dict[str, Any]:

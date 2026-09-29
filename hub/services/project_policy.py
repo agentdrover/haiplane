@@ -589,3 +589,27 @@ def claim_area_check_of(policy: dict) -> str:
     if isinstance(value, str) and value in CLAIM_AREA_CHECK_MODES:
         return value
     return CLAIM_AREA_WARN
+
+
+# Гейт красного теста для багов (#913). Багфикс сдавался без доказательства,
+# что тест из AC падал до фикса: единственным следом были мутации сдачи
+# (#1436) — слова автора. Доказательство даёт только прогон CI поверх кода
+# merge-base (поле ``baseline`` отчёта о закреплённом коммите). ``warn`` —
+# сдача принята, недоказанное названо одной записью в карточке; ``require`` —
+# отказ до записи поколения. Нет ключа — ``off``. Нечитаемое значение —
+# ``warn``, по тому же правилу, что submission_contract.
+BUG_RED_TEST_KEY = "bug_red_test"
+RED_TEST_OFF = "off"
+RED_TEST_WARN = "warn"
+RED_TEST_REQUIRE = "require"
+BUG_RED_TEST_MODES: tuple[str, ...] = (RED_TEST_OFF, RED_TEST_WARN, RED_TEST_REQUIRE)
+
+
+def bug_red_test_of(policy: dict) -> str:
+    """Режим гейта красного теста: нет ключа — off, нечитаемое значение — warn."""
+    if not isinstance(policy, dict) or BUG_RED_TEST_KEY not in policy:
+        return RED_TEST_OFF
+    value = policy.get(BUG_RED_TEST_KEY)
+    if isinstance(value, str) and value in BUG_RED_TEST_MODES:
+        return value
+    return RED_TEST_WARN

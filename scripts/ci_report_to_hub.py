@@ -26,7 +26,11 @@ HAIPLANE_HUB_CI_RAN (#1081: the commands this job already executed, one
 time; absent ⇒ nothing is reused and every command runs as before),
 HAIPLANE_HUB_CI_MUTATIONS (#1270: path to the JSON written by
 scripts/mutation_changed.py — sent under its own ``mutations`` key; absent or
-unreadable ⇒ the key is not sent, and the log says why).
+unreadable ⇒ the key is not sent, and the log says why),
+HAIPLANE_HUB_CI_BASELINE (#913: path to the JSON written by
+scripts/red_test_baseline.py — the branch's changed tests run over the
+merge-base code, sent under its own ``baseline`` key; absent or unreadable ⇒
+the key is not sent, and the log says why).
 """
 
 from __future__ import annotations
@@ -485,6 +489,52 @@ def read_mutations(path: str) -> dict | None:
     return trim_mutations(report)
 
 
+# The hub refuses a baseline above 32 000 chars (#913). A changed test module
+# can hold hundreds of tests; the AC tests are always kept, the rest trimmed,
+# and the trimmed count is sent — a cut list must not read as "all of them".
+_BASELINE_TESTS_MAX = 200
+_BASELINE_ERRORS_MAX = 30
+
+
+def trim_baseline(report: dict, keep: set[str]) -> dict:
+    """Bound the per-test map; AC nodeids (and their variants) are never cut."""
+    tests = report.get("tests")
+    if not isinstance(tests, dict):
+        return report
+
+    def wanted(nodeid: str) -> bool:
+        return nodeid in keep or nodeid.split("[", 1)[0] in keep
+
+    kept = {k: v for k, v in tests.items() if wanted(k)}
+    for nodeid, status in tests.items():
+        if len(kept) >= _BASELINE_TESTS_MAX:
+            break
+        kept.setdefault(nodeid, status)
+    trimmed = dict(report, tests=kept)
+    if len(tests) > len(kept):
+        trimmed["tests_trimmed"] = len(tests) - len(kept)
+    errors = report.get("collection_errors")
+    if isinstance(errors, dict) and len(errors) > _BASELINE_ERRORS_MAX:
+        trimmed["collection_errors"] = dict(list(errors.items())[:_BASELINE_ERRORS_MAX])
+    return trimmed
+
+
+def read_baseline(path: str, keep: set[str]) -> dict | None:
+    """The baseline step's JSON, or None with the reason logged."""
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            report = json.load(handle)
+    except (OSError, ValueError) as exc:
+        log(f"baseline report {path} not sent: {exc}")
+        return None
+    if not isinstance(report, dict):
+        log(f"baseline report {path} not sent: expected an object")
+        return None
+    return trim_baseline(report, keep)
+
+
 def main() -> int:
     base = env_get("HUB_URL").rstrip("/")
     token = env_get("HUB_CI_TOKEN")
@@ -549,6 +599,17 @@ def main() -> int:
     if mutations is not None:
         payload["mutations"] = mutations
         log(f"mutation run reported: state={mutations.get('state')!r}")
+    baseline = read_baseline(env_get("HUB_CI_BASELINE"), set(nodeid_by_ac.values()))
+    if baseline is not None:
+        payload["baseline"] = baseline
+        log(
+            f"red-test baseline reported: state={baseline.get('state')!r}, "
+            f"merge_base={str(baseline.get('merge_base'))[:12]}, "
+            f"tests={len(baseline.get('tests') or {})}"
+        )
+        for ac_id, nodeid in sorted(nodeid_by_ac.items()):
+            status = (baseline.get("tests") or {}).get(nodeid, "—")
+            log(f"  baseline {ac_id} {nodeid}: {status}")
     result = hub_request(f"{base}/api/tasks/{task_id}/ci-run-report", token, payload)
     if result is None:
         log("report not delivered — the hub will read this as unknown")
@@ -556,7 +617,8 @@ def main() -> int:
     log(
         f"reported {len(ac_results)} AC result(s), validation={v_status}; "
         f"applied={result.get('applied')} ({result.get('reason')}); "
-        f"mutations={result.get('mutations_state', 'not accepted by this hub')}"
+        f"mutations={result.get('mutations_state', 'not accepted by this hub')}; "
+        f"baseline={result.get('baseline_state', 'not accepted by this hub')}"
     )
     return 0
 

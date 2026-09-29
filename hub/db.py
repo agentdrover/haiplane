@@ -2439,6 +2439,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "json_valid(e.payload) THEN json_extract(e.payload, '$.category') END "
         "= category_checks.category), recorded_at)) WHERE created_at IS NULL",
     ),
+    (
+        # Red-test baseline (#913): the branch's changed test files run over
+        # the merge-base code, a status per nodeid. Its own column next to
+        # ``mutations``: the red-test gate reads it at submission, and '{}' for
+        # every older report means "no baseline was reported" — the gate says
+        # "not proven", never "proven".
+        "add_ci_run_reports_baseline",
+        "ALTER TABLE ci_run_reports ADD COLUMN baseline TEXT NOT NULL DEFAULT '{}'",
+    ),
 ]
 
 

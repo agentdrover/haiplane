@@ -41,6 +41,7 @@ def _clean_prefixed_env(monkeypatch):
         "HUB_CI_PYTEST",
         "HUB_CI_CHECKS",
         "HUB_CI_MUTATIONS",
+        "HUB_CI_BASELINE",
     ):
         monkeypatch.delenv(f"HAIPLANE_{suffix}", raising=False)
 
@@ -698,3 +699,27 @@ def test_ci_workflow_runs_mutations_after_tests_and_cannot_fail_the_job():
     assert names.index("mutations") < steps.index(reporter)
     json_out = re.search(r"--json-out\s+(\S+)", mutation["run"]).group(1)
     assert reporter["with"]["mutations-file"] == json_out.strip("\"'")
+
+
+# ---- #913: the red-test baseline travels under its own key --------------------
+
+
+def test_a_long_baseline_keeps_the_ac_tests_and_says_so(script):
+    tests = {f"tests/test_big.py::test_{i}": "passed" for i in range(500)}
+    tests["tests/test_big.py::test_ac[1]"] = "failed"
+    tests["tests/test_big.py::test_ac[2]"] = "failed"
+    report = {"state": "ran", "merge_base": "m", "tests": tests}
+
+    trimmed = script.trim_baseline(report, {"tests/test_big.py::test_ac"})
+
+    assert len(json.dumps(trimmed)) < 30_000
+    assert trimmed["tests"]["tests/test_big.py::test_ac[1]"] == "failed"
+    assert trimmed["tests"]["tests/test_big.py::test_ac[2]"] == "failed"
+    assert trimmed["tests_trimmed"] == len(tests) - len(trimmed["tests"])
+    assert trimmed["tests_trimmed"] > 0
+
+
+def test_a_missing_baseline_report_is_not_sent(script, monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("HAIPLANE_HUB_CI_BASELINE", str(tmp_path / "absent.json"))
+    assert "baseline" not in _capture_payload(script, monkeypatch)
+    assert "absent.json" in capsys.readouterr().out

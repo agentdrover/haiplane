@@ -194,6 +194,27 @@ jobs:
             --budget-seconds 540 \
             --json-out mutation-report.json
 
+      # #913: the red-test gate for bugs needs proof that the AC test failed
+      # BEFORE the fix, and the hub accepts CI reports only about the pinned
+      # commit. So the proof travels in that same report: the branch's changed
+      # tests/** are laid over the merge-base code in a separate worktree and
+      # run with junitxml — failed (assert) / passed / error (collection,
+      # ImportError, fixture). A test failing on the base is DATA, not an
+      # error: the script always exits 0 and continue-on-error keeps a crash
+      # out of the delivery gate. task-* branches only (PR and manual runs);
+      # the base is the PR base, develop for a manual run.
+      - name: Red-test baseline on merge-base (data only)
+        id: baseline
+        # !cancelled(): the proof is about the base, not about this commit's
+        # own Test step — a red suite must not also erase the baseline.
+        if: ${{ !cancelled() && startsWith(github.head_ref || github.ref_name, 'task-') }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          uv run python scripts/red_test_baseline.py \
+            --base "origin/${{ github.base_ref || 'develop' }}" \
+            --json-out red-test-baseline.json
+
       # #546: the hub has no test runner by design, so the evidence for its two
       # SDD gates is produced here and reported back. Placed AFTER the main test
       # step and marked continue-on-error on purpose: the delivery gate
@@ -218,6 +239,8 @@ jobs:
           ac-runner: uv run pytest
           # #1270: its own key in the hub's report, not a `checks` entry.
           mutations-file: mutation-report.json
+          # #913: its own key too — evidence for the red-test gate on bugs.
+          baseline-file: red-test-baseline.json
           # A step that never ran reports its outcome as '' and is dropped by
           # the reporter — silence, not a pass (#875).
           checks: >-
