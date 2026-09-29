@@ -2321,17 +2321,25 @@ def _silent_provider(monkeypatch, statuses: dict, result: str = "work done") -> 
 
 
 def _forge(monkeypatch, tips: dict, ci: dict | None = None) -> None:
-    """Вершины веток и CI по sha — без сети."""
+    """Вершины веток и CI по sha — без сети. ``ci`` None — CI не прочитан;
+    исход ``in_progress`` — прогон CI ещё идёт."""
     from hub.integrations.registry import plugins
 
     async def _tip(db, task_id, branch):
         sha = tips.get(branch, "")
-        return sha, "" if sha else f"origin/{branch} did not resolve to a commit"
+        return sha, "" if sha else f"could not fetch {branch}: network down"
 
     async def _runs(branch, limit=20, repo=None, gh_repo=None, forge=""):
+        if ci is None:
+            return None
         return [
-            {"sha": sha, "status": "completed", "conclusion": c, "name": "CI"}
-            for sha, c in (ci or {}).items()
+            {
+                "sha": sha,
+                "status": "in_progress" if c == "in_progress" else "completed",
+                "conclusion": "" if c == "in_progress" else c,
+                "name": "CI",
+            }
+            for sha, c in ci.items()
         ]
 
     monkeypatch.setattr("hub.services.lifecycle.resolve_branch_tip", _tip)
@@ -2345,17 +2353,19 @@ async def _silent_task(
     slug: str,
     mode: str = "manual",
     tip: str = _SILENT_TIP,
-    ci: str = "success",
+    ci: str | None = "success",
+    branch: str | None = None,
 ) -> tuple[int, int, str]:
     """Задача в running за исполнителем, ветка запушена, прогон поколения 1."""
     _launch_config(monkeypatch)
     monkeypatch.setattr(config, "EXECUTOR_TOKEN_CEILING", 50_000_000)
     monkeypatch.setattr(config, "EXECUTOR_CENTS_CEILING", 100_000)
     _, task_id = await _launch_project(db, mode=mode, slug=slug)
-    branch = f"task-{task_id}/silent"
-    await repo.update_task(db, task_id, status="running", branch=branch)
+    branch = f"task-{task_id}/silent" if branch is None else branch
+    await repo.update_task(db, task_id, status="running", branch=branch or None)
     row_id = await _run(db, task_id, agent_id="bc-exec-1", run_id="run-1")
-    _forge(monkeypatch, {branch: tip, "develop": _BASE_TIP}, {tip: ci} if tip else {})
+    runs = None if ci is None else ({tip: ci} if tip else {})
+    _forge(monkeypatch, {branch: tip, "develop": _BASE_TIP}, runs)
     return task_id, row_id, branch
 
 
@@ -2516,7 +2526,10 @@ async def test_no_submit_only_run_without_push_or_on_red_ci(db, monkeypatch):
     calls = _creator(monkeypatch, [_CREATED])
     _silent_provider(monkeypatch, {"run-1": "FINISHED", "run-2": "FINISHED"})
 
-    unpushed, _, _ = await _silent_task(db, monkeypatch, slug="silent-nopush", tip="")
+    # Ветки у задачи нет: исполнитель так и не дошёл до pair-start и пуша.
+    unpushed, _, _ = await _silent_task(
+        db, monkeypatch, slug="silent-nopush", tip="", branch=""
+    )
     await sweep_executor_runs(db)
 
     # Круг починки: сдача 1 закреплена на tip, прогон сдачи 2 ничего не запушил.
@@ -2562,3 +2575,228 @@ async def test_silent_finish_alert_quotes_run_result_tail(db, monkeypatch):
     mute, _, _ = await _silent_task(db, monkeypatch, slug="silent-mute")
     await sweep_executor_runs(db)
     assert "итогового текста нет" in (await _silent_alerts(db, mute))[0]
+
+
+# ---- #1446, сдача 2: находки deep-ревью ----
+
+
+async def test_an_unread_tip_is_not_called_unpushed(db, monkeypatch):
+    """Находка d901bb71be6c8b89: вершину ветки прочитать не удалось — это
+    «не удалось проверить ветку: <причина>», а не «прогон не запушил работу»;
+    заказа нет, задача на решение с этой причиной."""
+    from hub.services.executor_dispatch import sweep_executor_runs
+
+    calls = _creator(monkeypatch, [_CREATED])
+    _silent_provider(monkeypatch, {"run-1": "FINISHED"})
+    task_id, _, branch = await _silent_task(
+        db, monkeypatch, slug="silent-unread", tip=""
+    )
+    await sweep_executor_runs(db)
+
+    assert calls == []
+    assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision"
+    detail = (await _decision_reasons(db, task_id))[-1]["detail"]
+    assert f"не удалось проверить ветку {branch}: could not fetch" in detail, detail
+    assert "не запушил" not in detail
+
+
+async def test_a_blind_submit_only_order_keeps_the_task_behind_its_reservation(
+    db, monkeypatch
+):
+    """Находка 332a0ba942f4ed7a: исход создания «только сдай» неизвестен —
+    бронь держится, задача остаётся в running с alert «исход неизвестен»;
+    брошенную бронь закрывает опрос, и задача уходит на решение (#1455)."""
+    from hub.services.executor_dispatch import sweep_executor_runs
+
+    async def _blind(_name, pages=3):
+        return cursor_cloud.Reconciliation("", "", False)
+
+    monkeypatch.setattr(cursor_cloud, "find_agent_by_name", _blind)
+    calls = _creator(
+        monkeypatch, [cursor_cloud.Refusal(status=0, detail="ReadTimeout")]
+    )
+    _silent_provider(monkeypatch, {"run-1": "FINISHED"})
+    task_id, _, _ = await _silent_task(db, monkeypatch, slug="silent-blind")
+
+    await sweep_executor_runs(db)
+    await sweep_executor_runs(db)
+
+    assert len(calls) == 1
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+    rows = [dict(r) for r in await repo.list_executor_runs(db, task_id)]
+    assert rows[-1]["outcome"] == "running" and rows[-1]["agent_id"] == ""
+    assert rows[-1]["reason"].startswith(el.REASON_ANSWER_BLIND)
+    assert any("исход создания" in a.lower() for a in await _alerts(db, task_id))
+
+    # Бронь пережила все попытки заказа — опрос её закрывает, задачу снимает #1455.
+    await db.execute(
+        "UPDATE executor_runs SET started_at=datetime('now', '-1 day') WHERE id=?",
+        (rows[-1]["id"],),
+    )
+    await db.commit()
+    await sweep_executor_runs(db)
+    assert (await _row(db, rows[-1]["id"]))["outcome"] == "failed"
+    assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision"
+    assert len(calls) == 1
+
+
+async def test_an_order_lost_after_the_commit_is_placed_on_the_next_pass(
+    db, monkeypatch
+):
+    """Находка 737de79771bf2918: решение «повтор» закоммичено, заказ оборван
+    (выкат, падение) — следующий проход заказывает, ровно один раз."""
+    from hub.services.executor_dispatch import sweep_executor_runs
+
+    calls = _creator(monkeypatch, [_CREATED])
+    _silent_provider(monkeypatch, {"run-1": "FINISHED"})
+    task_id, row_id, _ = await _silent_task(db, monkeypatch, slug="silent-crash")
+    real = el.submit_only_executor
+    crashes = {"left": 1}
+
+    async def _crash_once(*args, **kwargs):
+        if crashes["left"]:
+            crashes["left"] -= 1
+            raise RuntimeError("хаб упал между коммитом и заказом")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(el, "submit_only_executor", _crash_once)
+    with pytest.raises(RuntimeError):
+        await sweep_executor_runs(db)
+    assert calls == []
+    assert (await _silent_events(db, task_id))[-1]["decision"] == "retry"
+
+    for _ in range(3):
+        await sweep_executor_runs(db)
+    assert len(calls) == 1, "долг заказа доведён ровно один раз"
+    assert len(await _silent_alerts(db, task_id)) == 1
+    rows = [dict(r) for r in await repo.list_executor_runs(db, task_id)]
+    assert [r["id"] for r in rows][0] == row_id and rows[-1]["run_id"] == "run-9"
+
+
+async def test_the_alert_does_not_wait_for_the_price(db, monkeypatch):
+    """Неразрешённая b5f9f9b751dc50b7: FINISHED без сдачи, цена ещё не пришла —
+    alert сразу; заказ — только когда цена прочитана (бюджет известен). Цена
+    так и не пришла — бюджет неизвестен, задача к человеку, заказа нет."""
+    from hub.services.executor_dispatch import sweep_executor_runs
+
+    monkeypatch.setattr(config, "EXECUTOR_COST_WAIT_MIN", 30)
+    calls = _creator(monkeypatch, [_CREATED])
+    task_id, row_id, _ = await _silent_task(db, monkeypatch, slug="silent-price")
+
+    async def _get_run(agent_id: str, run_id: str):
+        return {"id": run_id, "status": "FINISHED", "result": "work done"}
+
+    usage = {"body": _sdk_usage(1000, None)}
+
+    async def _get_usage(agent_id: str, run_id: str | None = None):
+        return usage["body"]
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _get_run)
+    monkeypatch.setattr(cursor_cloud, "get_usage", _get_usage)
+
+    await sweep_executor_runs(db)
+    assert len(await _silent_alerts(db, task_id)) == 1, "alert — не дожидаясь цены"
+    assert "work done" in (await _silent_alerts(db, task_id))[0]
+    assert calls == []
+    assert (await _row(db, row_id))["outcome"] == OUTCOME_RUNNING
+    await sweep_executor_runs(db)
+    assert len(await _silent_alerts(db, task_id)) == 1
+
+    usage["body"] = _usage(1000, 10.0)
+    await sweep_executor_runs(db)
+    assert len(calls) == 1, "цена пришла — повтор заказан"
+    assert len(await _silent_alerts(db, task_id)) == 1
+
+    never, never_row, _ = await _silent_task(db, monkeypatch, slug="silent-noprice")
+    usage["body"] = _sdk_usage(1000, None)
+    await sweep_executor_runs(db)
+    await db.execute(
+        "UPDATE executor_runs SET cost_wait_since=datetime('now', '-31 minutes') "
+        "WHERE id=?",
+        (never_row,),
+    )
+    await db.commit()
+    await sweep_executor_runs(db)
+    assert len(calls) == 1
+    assert dict(await repo.get_task(db, never))["status"] == "needs_decision"
+    assert "бюджет" in (await _decision_reasons(db, never))[-1]["detail"]
+    assert len(await _silent_alerts(db, never)) == 1
+
+
+async def test_no_paid_order_until_the_tip_ci_is_green(db, monkeypatch):
+    """Неразрешённая 8b1d6f8e4bd9ea9f: CI вершины не прочитан, прогона нет или
+    он идёт — не «не красный»: заказа нет, хаб ждёт; зелёный — ровно один
+    заказ; не позеленел за срок — к человеку с причиной."""
+    from hub.services.executor_dispatch import sweep_executor_runs
+
+    monkeypatch.setattr(config, "EXECUTOR_SUBMIT_ONLY_CI_WAIT_MIN", 30)
+    calls = _creator(monkeypatch, [_CREATED])
+    _silent_provider(monkeypatch, {"run-1": "FINISHED"})
+    task_id, row_id, branch = await _silent_task(
+        db, monkeypatch, slug="silent-ci", ci=None
+    )
+    await sweep_executor_runs(db)
+    assert calls == []
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+    assert "CI не прочитан" in (await _silent_alerts(db, task_id))[0]
+
+    _forge(
+        monkeypatch,
+        {branch: _SILENT_TIP, "develop": _BASE_TIP},
+        {_SILENT_TIP: "in_progress"},
+    )
+    for _ in range(2):
+        await sweep_executor_runs(db)
+    _forge(monkeypatch, {branch: _SILENT_TIP, "develop": _BASE_TIP}, {})
+    await sweep_executor_runs(db)
+    assert calls == [], "идущий или отсутствующий CI — не заказ"
+    decisions = [e["decision"] for e in await _silent_events(db, task_id)]
+    assert decisions == ["wait_ci"], "ожидание не пишется на каждом тике"
+
+    _forge(
+        monkeypatch,
+        {branch: _SILENT_TIP, "develop": _BASE_TIP},
+        {_SILENT_TIP: "success"},
+    )
+    for _ in range(3):
+        await sweep_executor_runs(db)
+    assert len(calls) == 1, "зелёный CI — ровно один заказ"
+    assert len(await _silent_alerts(db, task_id)) == 1
+
+    # Не позеленел за срок — к человеку.
+    late, late_row, late_branch = await _silent_task(
+        db, monkeypatch, slug="silent-ci-late", ci="in_progress"
+    )
+    await sweep_executor_runs(db)
+    assert dict(await repo.get_task(db, late))["status"] == "running"
+    await db.execute(
+        "UPDATE executor_runs SET finished_at=datetime('now', '-31 minutes') WHERE id=?",
+        (late_row,),
+    )
+    await db.commit()
+    await sweep_executor_runs(db)
+    assert len(calls) == 1
+    assert dict(await repo.get_task(db, late))["status"] == "needs_decision"
+    assert (
+        "не стал зелёным за 30 мин" in (await _decision_reasons(db, late))[-1]["detail"]
+    )
+
+
+async def test_the_token_budget_alone_refuses_the_retry(db, monkeypatch):
+    """Пробел 31ea0554c4bb39dd: центов хватает, а токенов на задаче меньше
+    потолка «только сдай» — повтора нет, задача к человеку с причиной."""
+    from hub.services.executor_dispatch import sweep_executor_runs
+
+    calls = _creator(monkeypatch, [_CREATED])
+    _silent_provider(monkeypatch, {"run-1": "FINISHED"})
+    monkeypatch.setattr(
+        config,
+        "EXECUTOR_TASK_TOKEN_CEILING",
+        1000 + config.EXECUTOR_SUBMIT_ONLY_TOKEN_CEILING - 1,
+    )
+    task_id, _, _ = await _silent_task(db, monkeypatch, slug="silent-tokens")
+    await sweep_executor_runs(db)
+    assert calls == []
+    assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision"
+    detail = (await _decision_reasons(db, task_id))[-1]["detail"]
+    assert "бюджет" in detail and "токенов" in detail, detail

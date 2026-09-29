@@ -486,7 +486,9 @@ async def _order(
             db, task_id, "hub", "alert", f"Исполнитель НЕ запущен: {failed}."
         )
         await db.commit()
-        return _refused(failed, task_id)
+        # #1446: бронь названа и в отказе — слепой исход держит её RUNNING, и
+        # вызывающий не должен считать, что брони не было.
+        return LaunchResult(False, failed, task_id, row_id=row_id)
     await repo.set_executor_run_agent(db, row_id, agent_id=agent_id, run_id=run_id)
     await repo.add_task_update(
         db,
