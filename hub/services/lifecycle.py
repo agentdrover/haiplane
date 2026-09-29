@@ -21,6 +21,7 @@ from hub import db as db_module
 from hub.actionable_errors import (
     claim_area_conflict_detail,
     submission_contract_violated_detail,
+    bug_red_test_unproven_detail,
     changes_requested_requires_content_detail,
     verdict_contradicts_its_text_detail,
     verdict_repeats_previous_detail,
@@ -44,7 +45,12 @@ from hub.db import (
 )
 from hub.integrations.registry import plugins
 from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
-from hub.services import prevention_gate, submission_contract, verdict_text
+from hub.services import (
+    prevention_gate,
+    red_test_gate,
+    submission_contract,
+    verdict_text,
+)
 from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait
@@ -2146,6 +2152,10 @@ class SubmitContext:
     #: #1436: запись «Контракт сдачи нарушен» при warn; пусто — нарушений нет
     #: или контракт выключен.
     contract_alert: str = ""
+    #: #913: запись гейта красного теста — доказательство или (при warn)
+    #: недоказанное; пусто — гейт к сдаче не относится.
+    red_test_record: str = ""
+    red_test_kind: str = ""
 
 
 async def _step_task_is_submittable(state: SubmitContext) -> None:
@@ -2577,6 +2587,54 @@ async def _step_submission_contract(state: SubmitContext) -> None:
     state.contract_alert = submission_contract.warning_text(found)
 
 
+async def _step_bug_red_test(state: SubmitContext) -> None:
+    """Баг сдаётся с тестом, упавшим на коде базы по прогону CI (#913).
+
+    Режим — из политики проекта ``bug_red_test``. Доказательство — поле
+    ``baseline`` отчёта CI о коммите, который закрепил ``pin_submission_sha``;
+    мутации и summary сдачи сюда не передаются вовсе. Стоит до перехода: отказ
+    при require не создаёт поколения и не заказывает ревью (как #1436).
+    """
+    if (state.task.get("work_type") or "") != "bug":
+        return
+    from hub.services.project_policy import (
+        RED_TEST_OFF,
+        RED_TEST_REQUIRE,
+        bug_red_test_of,
+        gate_policy_for_task,
+    )
+
+    mode = bug_red_test_of(await gate_policy_for_task(state.db, state.task_id))
+    if mode == RED_TEST_OFF:
+        return
+    sha = state.submission_sha
+    report = await repo.get_ci_run_report(state.db, state.task_id, sha) if sha else None
+    baseline = (
+        red_test_gate.parse_baseline(dict(report).get("baseline"))
+        if report is not None
+        else None
+    )
+    ac_rows = [
+        dict(r) for r in await repo.list_acceptance_criteria(state.db, state.task_id)
+    ]
+    proofs, found = red_test_gate.evaluate(ac_rows, baseline, head_sha=sha)
+    if not found:
+        state.red_test_kind = "status"
+        state.red_test_record = red_test_gate.evidence_text(
+            proofs, baseline or {}, head_sha=sha
+        )
+        return
+    if mode == RED_TEST_REQUIRE:
+        raise HTTPException(
+            422,
+            detail=bug_red_test_unproven_detail(
+                found, head_sha=sha, not_evidence=red_test_gate.NOT_EVIDENCE
+            ),
+        )
+    state.red_test_kind = "alert"
+    state.red_test_record = red_test_gate.warning_text(found, proofs, baseline)
+
+
 async def _step_pin_submission_sha(state: SubmitContext) -> None:
     """Код, который будет судить ревьюер (#572)."""
     # #572: pin the code the reviewer will actually be judging. Resolved by
@@ -2721,6 +2779,8 @@ SUBMIT_STEPS_AFTER_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
     # смотрит в config. Первым во второй половине: дешёвые чтения базы, отказ
     # до сетевого диффа и тем более до перехода.
     Step("submission_contract", _step_submission_contract),
+    # #913: тоже политика проекта и тоже дешёвое чтение базы — отказ до диффа.
+    Step("bug_red_test", _step_bug_red_test),
     Step("resolve_diff", _step_resolve_diff, refuses=False),
     Step("surfaces", _step_surfaces, mode=policy("SDD_SURFACES")),
     Step("finding_outcomes", _step_finding_outcomes, mode=policy("FINDING_OUTCOME")),
@@ -2767,6 +2827,15 @@ HEADLESS_STEPS: tuple[Step[SubmitContext], ...] = (
             "headless сдаёт done-отчётом, у которого нет полей model и "
             "mutations: контракт требовал бы того, что этот путь передать не "
             "может, и отказ оставил бы задачу стоять без человека (#1436)"
+        ),
+    ),
+    Step(
+        "bug_red_test",
+        _step_bug_red_test,
+        inactive_reason=(
+            "headless закрепляет коммит последним шагом, после гейтов: отчёта "
+            "CI о нём ещё не с чем сверить, и гейт отвечал бы «нет baseline» "
+            "на каждый баг. Включение на этом пути — решение владельца (#913)"
         ),
     ),
     Step("resolve_diff", _step_resolve_diff, refuses=False),
@@ -3197,6 +3266,16 @@ async def _write_submission_notices(
         # по заголовку, и строка внутри чужого отчёта терялась бы.
         await repo.add_task_update(
             state.db, state.task_id, "hub", "alert", state.contract_alert
+        )
+    if state.red_test_record:
+        # #913: доказательство (или недоказанное при warn) — одной записью в
+        # карточке, со своим заголовком.
+        await repo.add_task_update(
+            state.db,
+            state.task_id,
+            "hub",
+            state.red_test_kind or "alert",
+            state.red_test_record,
         )
 
 

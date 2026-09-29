@@ -38,6 +38,10 @@ EXCEPTIONS: dict[str, str] = {
     "Mutations of changed functions (warning only)": (
         "только PR и warning-only: exit 0 всегда, серия дольше make check — #1270"
     ),
+    "Red-test baseline on merge-base (data only)": (
+        "данные для гейта красного теста (#913): только ветки task-*, exit 0 "
+        "всегда — падение теста на базе это доказательство, а не провал"
+    ),
     "Report AC tests and validation to Hub": "отчётность, не проверка",
     "Dependency vulnerability audit": (
         "advisory: continue-on-error, находки уезжают драфтами в хаб, красным не бывает"

@@ -107,8 +107,20 @@ def _print_http_error(code: int, body_text: str) -> None:
         if detail.get("hint"):
             print(f"  Hint: {detail['hint']}", file=sys.stderr)
         return
+    if isinstance(detail, dict) and detail.get("reason") == "bug_red_test_unproven":
+        _print_red_test_refusal(code, detail)
+        return
 
     print(f"HTTP {code}: {body_text}", file=sys.stderr)
+
+
+def _print_red_test_refusal(code: int, detail: dict[str, Any]) -> None:
+    """Отказ гейта красного теста (#913): причина по каждому AC строкой."""
+    print(f"HTTP {code}: {detail.get('message', '')}", file=sys.stderr)
+    for line in detail.get("violations") or []:
+        print(f"  - {line}", file=sys.stderr)
+    if detail.get("hint"):
+        print(f"  Hint: {detail['hint']}", file=sys.stderr)
 
 
 def _load_payload_file(path: str) -> dict[str, Any] | list[Any]:
@@ -550,6 +562,15 @@ def _finding_outcomes_option(parser: argparse.ArgumentParser) -> None:
         ),
     )
 
+
+#: Что гейт красного теста ждёт от сдачи бага (#913). У CLI нет флага, которым
+#: доказательство можно заявить: его приносит отчёт CI, а не автор.
+SUBMIT_REVIEW_EPILOG = (
+    "work_type=bug under project policy bug_red_test=warn|require (#913): every "
+    "AC test_ref must be 'failed' in the CI baseline of the pinned commit (the "
+    "branch's changed tests run over the merge-base code). --mutations and "
+    "--summary are not evidence."
+)
 
 #: Отказ CLI на битом --mutations (#1436): до сети, как у --finding-outcomes.
 MUTATIONS_JSON_ERROR = "--mutations is not a JSON list"
@@ -2007,6 +2028,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_submit_review = sub.add_parser(
         "submit-review",
         help="Submit a running pair task for client-driven review (status=review)",
+        epilog=SUBMIT_REVIEW_EPILOG,
     )
     p_submit_review.add_argument("task_id", type=int)
     p_submit_review.add_argument("--agent", default="", help="Submitting agent name")

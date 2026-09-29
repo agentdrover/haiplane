@@ -29,6 +29,7 @@ import logging
 from typing import Any
 
 from hub import repository as repo
+from hub.services import red_test_gate
 from hub.services.ac_tests import (
     FAIL as AC_FAIL,
     NOT_FOUND as AC_NOT_FOUND,
@@ -72,6 +73,9 @@ CHECK_OUTCOMES = frozenset({CHECK_PASS, CHECK_FAIL, CHECK_SKIPPED})
 # The mutation report (#1270) is stored verbatim; the reporter trims the survivor
 # list well below this, so hitting it means a reporter that forgot to.
 MUTATIONS_MAX_CHARS = 32_000
+# The red-test baseline (#913): the reporter keeps the AC tests and trims the
+# rest well below this, so hitting it means a reporter that forgot to.
+BASELINE_MAX_CHARS = 32_000
 
 
 def _pinned_sha(task: dict) -> str:
@@ -90,6 +94,7 @@ async def accept_ci_run_report(
     reported_by: str = "",
     checks: dict[str, str] | None = None,
     mutations: dict[str, Any] | None = None,
+    baseline: dict[str, Any] | None = None,
 ) -> dict:
     """Store a CI run report and stamp it if it covers the pinned commit.
 
@@ -132,6 +137,8 @@ async def accept_ci_run_report(
             f"mutations report is {len(mutations_json)} chars, the limit is "
             f"{MUTATIONS_MAX_CHARS}: trim the survivor list before sending"
         )
+
+    baseline_json = _checked_baseline(baseline)
 
     known = await test_ac_nodeids(db, task_id)
     accepted: dict[str, str] = {}
@@ -185,6 +192,7 @@ async def accept_ci_run_report(
             sort_keys=True,
         ),
         mutations=mutations_json,
+        baseline=baseline_json,
     )
 
     recorded: list[dict] = []
@@ -208,7 +216,25 @@ async def accept_ci_run_report(
         "ac_ignored": ignored,
         "validation_status": validation_status,
         "mutations_state": str((mutations or {}).get("state") or "not_reported"),
+        "baseline_state": str((baseline or {}).get("state") or "not_reported"),
     }
+
+
+def _checked_baseline(baseline: dict[str, Any] | None) -> str:
+    """The baseline (#913) as stored text, or ValueError for one we cannot read.
+
+    Stored verbatim next to ``mutations``; interpreted only by the red-test
+    gate at submission. Statuses are enumerated like AC statuses: a test the
+    hub cannot classify is refused, never guessed into "failed".
+    """
+    red_test_gate.validate_baseline(baseline or {})
+    text = json.dumps(baseline or {}, ensure_ascii=False, sort_keys=True)
+    if len(text) > BASELINE_MAX_CHARS:
+        raise ValueError(
+            f"baseline report is {len(text)} chars, the limit is "
+            f"{BASELINE_MAX_CHARS}: trim the non-AC tests before sending"
+        )
+    return text
 
 
 async def _stamp(

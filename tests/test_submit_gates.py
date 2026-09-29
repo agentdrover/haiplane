@@ -112,6 +112,7 @@ EXPECTED_SUBMIT_ORDER = (
     "pin_submission_sha",
     "same_sha_from_review_is_current",
     "submission_contract",
+    "bug_red_test",
     "resolve_diff",
     "surfaces",
     "finding_outcomes",
@@ -168,6 +169,7 @@ def test_the_network_walking_steps_come_last():
     # проекта может включиться между оригиналом и повтором).
     mutable_gates = (
         "submission_contract",
+        "bug_red_test",
         "surfaces",
         "finding_outcomes",
         "submit_rules",
@@ -196,6 +198,7 @@ EXPECTED_HEADLESS_ORDER = (
     "canonical_branch",
     "branch_matches",
     "submission_contract",
+    "bug_red_test",
     "resolve_diff",
     "surfaces",
     "finding_outcomes",
@@ -237,7 +240,9 @@ def test_the_two_pipelines_are_compared_by_their_lists():
     # Матрица решений #1122 обновлена этой задачей, и сдача называет перемену.
     # #1436: submission_contract объявлен и не выполняется — у done-отчёта
     # нет полей model и mutations; причина записана в самом шаге.
-    assert inactive_here == {"branch_matches", "submission_contract"}, (
+    # #913: bug_red_test объявлен и не выполняется — headless закрепляет
+    # коммит последним шагом, baseline о нём сверять не с чем.
+    assert inactive_here == {"branch_matches", "submission_contract", "bug_red_test"}, (
         "набор неактивных на headless изменился — обновите матрицу решений в "
         "#1122 и скажите об этом в сдаче, а не молча"
     )

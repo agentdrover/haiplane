@@ -63,6 +63,15 @@ inputs:
     required: false
     default: ""
 
+  baseline-file:
+    description: >-
+      Path to the JSON written by scripts/red_test_baseline.py (#913): the
+      branch's changed tests run over the merge-base code, a status per test.
+      Sent to the hub under its own key as evidence for the red-test gate on
+      bugs. Absent or unreadable ⇒ the key is not sent and the log says why.
+    required: false
+    default: ""
+
 runs:
   using: composite
   steps:
@@ -76,6 +85,7 @@ runs:
         HAIPLANE_HUB_CI_CHECKS: ${{ inputs.checks }}
         HAIPLANE_HUB_CI_RAN: ${{ inputs.ran-commands }}
         HAIPLANE_HUB_CI_MUTATIONS: ${{ inputs.mutations-file }}
+        HAIPLANE_HUB_CI_BASELINE: ${{ inputs.baseline-file }}
       run: |
         set -u
         # A repo-hosted action ships with its whole repository, so the reporter

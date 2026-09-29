@@ -1949,6 +1949,7 @@ async def upsert_ci_run_report(
     reported_by: str,
     checks: str = "{}",
     mutations: str = "{}",
+    baseline: str = "{}",
 ) -> None:
     """Store what a CI run reported for one commit (idempotent per commit).
 
@@ -1958,8 +1959,8 @@ async def upsert_ci_run_report(
     await db.execute(
         "INSERT INTO ci_run_reports (task_id, head_sha, ac_results, "
         "validation_status, validation_log, reason, reported_by, checks, "
-        "mutations, reported_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+        "mutations, baseline, reported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
         "ON CONFLICT(task_id, head_sha) DO UPDATE SET "
         "ac_results=excluded.ac_results, "
         "validation_status=excluded.validation_status, "
@@ -1967,6 +1968,7 @@ async def upsert_ci_run_report(
         "reason=excluded.reason, reported_by=excluded.reported_by, "
         "checks=excluded.checks, "
         "mutations=excluded.mutations, "
+        "baseline=excluded.baseline, "
         "reported_at=excluded.reported_at",
         (
             task_id,
@@ -1978,6 +1980,7 @@ async def upsert_ci_run_report(
             reported_by,
             checks,
             mutations,
+            baseline,
         ),
     )
 
