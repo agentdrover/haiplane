@@ -1871,6 +1871,61 @@ async def test_hub_prepare_developer_task_preserves_explicit_wip_tag(
     )
 
 
+@pytest.mark.parametrize(
+    ("passed_work_type", "stored_work_type"),
+    [("bug", "feature"), (None, "bug")],
+    ids=["work_type-argument", "work_type-on-task"],
+)
+async def test_bug_brief_requires_reproduce_first(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+    passed_work_type: str | None,
+    stored_work_type: str,
+) -> None:
+    """#914 AC-1: a bug brief orders the work — failing test first, fix second —
+    names the #913 gate and hands over the defect AC template. The work type is
+    the one the task will have after preparation: the argument when given, the
+    stored one otherwise."""
+    mock_api_get.return_value = {"id": 25, "risks": [], "work_type": stored_work_type}
+    kwargs: dict[str, Any] = {"problem_statement": "Crash on empty list."}
+    if passed_work_type:
+        kwargs["work_type"] = passed_work_type
+
+    msg = await hub_prepare_developer_task(task_id=25, mode="preview", **kwargs)
+
+    brief = json.loads(msg)["developer_handoff_text"]
+    reproduce = brief.index("Сначала воспроизведи")
+    fix = brief.index("Потом чини")
+    assert reproduce < fix, "the reproduce step comes before the fix"
+    assert "падающий тест" in brief
+    assert "#913" in brief and "merge-base" in brief
+    assert "засчитывается только failed" in brief
+    assert "error — не доказано" in brief
+    assert "test_ref" in brief
+    assert "Шаблон AC дефекта" in brief
+    assert "Given состояние, в котором дефект проявляется" in brief
+    assert "Then ожидаемое поведение" in brief
+    assert "verifiable_by=test" in brief
+    mock_api_post.assert_not_called()
+
+
+async def test_non_bug_brief_has_no_reproduce_step(
+    mock_api_post: AsyncMock,
+    mock_api_get: AsyncMock,
+) -> None:
+    """#914: every other work type gets the brief it had before."""
+    mock_api_get.return_value = {"id": 25, "risks": [], "work_type": "feature"}
+
+    msg = await hub_prepare_developer_task(
+        task_id=25, mode="preview", problem_statement="Add a report."
+    )
+
+    brief = json.loads(msg)["developer_handoff_text"]
+    assert "Сначала воспроизведи" not in brief
+    assert "Шаблон AC дефекта" not in brief
+    assert "#913" not in brief
+
+
 @pytest.mark.asyncio
 async def test_prepare_developer_task_defaults_validation_commands(
     mock_api_post: AsyncMock,

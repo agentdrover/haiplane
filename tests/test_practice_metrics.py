@@ -995,7 +995,10 @@ async def test_metrics_page_shows_change_failure_rate(
     assert "Change failure rate" in page
     assert 'data-metric="change_failure_rate.default.deploys">1<' in page
     assert "малая выборка" in page
-    assert "100.0%" not in page
+    # The CFR table only: the shift-left table above it (#914) rightly shows
+    # this one defect as 100% of the window's prod stage.
+    cfr_section = page.split("Change failure rate (#918)", 1)[1].split("<h2>", 1)[0]
+    assert "100.0%" not in cfr_section
 
 
 async def test_mcp_practice_metrics_names_cfr_and_both_escapes():
@@ -1062,6 +1065,119 @@ def test_cli_change_failure_rate_prints_the_section(capsys):
     assert rc in (0, None)
     assert api.call_args.args[:2] == ("GET", "/api/metrics/practices?since_days=30")
     assert json.loads(capsys.readouterr().out) == cfr
+
+
+# --- Shift-left: where defects were caught (#914) ---------------------------
+#
+# A defect is a bug, or any task with a recorded found_in. Every stage gets a
+# row, empty ones too; unknown is not folded into the others and has its own
+# share, because a distribution over "only the rows someone filled in" reads as
+# a finished picture when it is not.
+
+
+async def test_shift_left_distribution(client: AsyncClient, db: aiosqlite.Connection):
+    """#914 AC-2: the distribution by stage, with the unknown share apart —
+    in the data, on the page and in the API."""
+    await _defect(db, title="caught at review", found_in="review")
+    await _defect(db, title="caught at review again", found_in="review")
+    await _defect(db, title="caught by CI", found_in="ci")
+    await _defect(db, title="escaped", found_in="prod")
+    await _bug(db, title="stage never recorded", parent_id=None)
+    await _task(db, title="a feature, stage unknown by default")  # no defect
+    caught = await _task(db, title="a feature whose test run caught a defect")
+    await db.execute("UPDATE tasks SET found_in='test' WHERE id=?", (caught,))
+    old = await _defect(db, title="outside the window", found_in="staging")
+    await db.execute(
+        "UPDATE tasks SET created_at=datetime('now', '-400 days') WHERE id=?", (old,)
+    )
+    await db.commit()
+
+    metrics = await practice_metrics(db)
+    sl = metrics["shift_left"]
+    assert sl["defects"] == 6, "bugs, plus any task with a recorded stage"
+    assert [r["stage"] for r in sl["by_stage"]] == [
+        "review",
+        "ci",
+        "test",
+        "staging",
+        "prod",
+        "unknown",
+    ]
+    by = {r["stage"]: r for r in sl["by_stage"]}
+    assert (by["review"]["defects"], by["review"]["share"]) == (2, 0.333)
+    assert (by["ci"]["defects"], by["test"]["defects"]) == (1, 1)
+    assert by["staging"]["defects"] == 0, "the window applies to created_at"
+    assert by["prod"]["defects"] == metrics["escaped_defects"]["escaped"] == 1
+    assert (by["unknown"]["defects"], sl["unknown"]) == (1, 1)
+    assert sl["unknown_share"] == 0.167
+    assert sl["recorded"] == 5
+
+    api = (await client.get("/api/metrics/practices")).json()["shift_left"]
+    assert api["unknown_share"] == 0.167
+
+    page = (await client.get("/metrics")).text
+    assert "Shift-left" in page
+    assert 'data-metric="shift_left.review.defects">2<' in page
+    assert 'data-metric="shift_left.unknown_share">16.7%<' in page
+
+
+async def test_shift_left_empty_window_has_no_shares(db: aiosqlite.Connection):
+    """No defects is not "0% unknown": the share is None, not zero."""
+    sl = (await practice_metrics(db))["shift_left"]
+    assert sl["defects"] == 0
+    assert sl["unknown_share"] is None
+    assert all(r["share"] is None for r in sl["by_stage"])
+
+
+async def test_mcp_practice_metrics_names_shift_left():
+    from unittest.mock import AsyncMock, patch
+
+    from hub.mcp_server import hub_practice_metrics
+
+    data = {
+        "since_days": 90,
+        "shift_left": {
+            "defects": 5,
+            "recorded": 4,
+            "unknown": 1,
+            "unknown_share": 0.2,
+            "by_stage": [
+                {"stage": "review", "defects": 2, "share": 0.4},
+                {"stage": "ci", "defects": 1, "share": 0.2},
+                {"stage": "test", "defects": 0, "share": 0.0},
+                {"stage": "staging", "defects": 0, "share": 0.0},
+                {"stage": "prod", "defects": 1, "share": 0.2},
+                {"stage": "unknown", "defects": 1, "share": 0.2},
+            ],
+        },
+    }
+    with patch("hub.mcp_server._api_get", new_callable=AsyncMock) as get:
+        get.return_value = data
+        result = await hub_practice_metrics()
+    text = result.content[0].text
+    assert (
+        "Shift-left (defects by found_in, 5): review 2, ci 1, test 0, "
+        "staging 0, prod 1; unknown 1 (20.0%)"
+    ) in text
+
+
+def test_cli_shift_left_prints_the_section(capsys):
+    import sys
+    from unittest.mock import patch
+
+    from hub import cli
+
+    sl = {"defects": 0, "recorded": 0, "unknown": 0, "unknown_share": None}
+    with (
+        patch.object(sys, "argv", ["oc-hub", "shift-left", "--since-days", "30"]),
+        patch.object(
+            cli, "_api", return_value={"since_days": 30, "shift_left": sl}
+        ) as api,
+    ):
+        rc = cli.main()
+    assert rc in (0, None)
+    assert api.call_args.args[:2] == ("GET", "/api/metrics/practices?since_days=30")
+    assert json.loads(capsys.readouterr().out) == sl
 
 
 # --- What the findings turned out to be (#877, on #876's data) ---------------

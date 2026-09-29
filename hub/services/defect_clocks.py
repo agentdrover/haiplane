@@ -133,6 +133,58 @@ async def measured_escapes(db: aiosqlite.Connection, since: str) -> int:
     return int(rows[0]["n"] or 0) if rows else 0
 
 
+# #914: the stages in the order a miss gets dearer, unknown last and apart.
+SHIFT_LEFT_STAGES = ("review", "ci", "test", "staging", "prod", "unknown")
+
+# What counts as a defect for the shift-left slice: a bug, or any task whose
+# stage was recorded. The second half keeps the prod bucket equal to
+# ``measured_escapes`` — a prod defect filed under another work type is counted
+# in both, never in one only.
+DEFECT_IN_WINDOW_SQL = (
+    "(t.work_type = 'bug' OR COALESCE(t.found_in, 'unknown') != 'unknown') "
+    "AND t.created_at >= datetime('now', ?)"
+)
+
+
+def _share(part: int, whole: int) -> float | None:
+    return round(part / whole, 3) if whole else None
+
+
+async def shift_left(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+    """Defects filed in the window by the stage that caught them (#914).
+
+    Every stage gets a row, an empty one too: a missing ``staging`` row and a
+    zero in it read differently. ``unknown`` is a row like the others AND is
+    repeated as ``unknown`` / ``unknown_share``: a share of the recorded
+    stages alone would read as a finished picture while a third of the rows
+    say nothing. With no defects the shares are ``None``, not zero.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT COALESCE(t.found_in, 'unknown') AS stage, COUNT(*) AS n "
+        f"FROM tasks t WHERE {DEFECT_IN_WINDOW_SQL} "  # nosec B608 - constant SQL
+        "GROUP BY stage",
+        (since,),
+    )
+    counts = {str(r["stage"]): int(r["n"] or 0) for r in rows}
+    total = sum(counts.values())
+    unknown = counts.get("unknown", 0)
+    return {
+        "defects": total,
+        "recorded": total - unknown,
+        "unknown": unknown,
+        "unknown_share": _share(unknown, total),
+        "by_stage": [
+            {
+                "stage": stage,
+                "defects": counts.get(stage, 0),
+                "share": _share(counts.get(stage, 0), total),
+            }
+            for stage in SHIFT_LEFT_STAGES
+        ],
+    }
+
+
 async def _project_key(
     db: aiosqlite.Connection, project_id: int | None, cache: dict[Any, Any]
 ) -> int | None:
