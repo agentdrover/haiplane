@@ -2669,6 +2669,10 @@ async def test_an_order_lost_after_the_commit_is_placed_on_the_next_pass(
         await sweep_executor_runs(db)
     assert len(calls) == 1, "долг заказа доведён ровно один раз"
     assert len(await _silent_alerts(db, task_id)) == 1
+    # Заказанный повтор идёт — долга нет: ни второго заказа, ни отказа
+    # «уже идёт прогон», ни снятия задачи.
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+    assert not [a for a in await _alerts(db, task_id) if "не заказан" in a]
     rows = [dict(r) for r in await repo.list_executor_runs(db, task_id)]
     assert [r["id"] for r in rows][0] == row_id and rows[-1]["run_id"] == "run-9"
 
