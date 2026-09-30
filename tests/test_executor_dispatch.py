@@ -2804,3 +2804,408 @@ async def test_the_token_budget_alone_refuses_the_retry(db, monkeypatch):
     assert dict(await repo.get_task(db, task_id))["status"] == "needs_decision"
     detail = (await _decision_reasons(db, task_id))[-1]["detail"]
     assert "бюджет" in detail and "токенов" in detail, detail
+
+
+# ---- #1458: вопрос облачного исполнителя и продолжение после ответа ----
+
+_QUESTION = "Какую базу брать для слияния: develop или main?"
+_ANSWER = "Бери develop; main не трогай, релиз идёт отдельно."
+_ASKED_TIP = "a5c0000a5c0000a5c0000a5c0000a5c0000a5c00"
+_LATE_TIP = "1a7e0001a7e0001a7e0001a7e0001a7e0001a7e0"
+
+
+async def _ask_q(db: aiosqlite.Connection, task_id: int, text: str = _QUESTION):
+    from hub import services
+    from hub.models import TaskQuestion
+
+    return await services.ask_question(
+        db, task_id, TaskQuestion(question=text, agent="pda_claude")
+    )
+
+
+async def _answer_q(
+    db: aiosqlite.Connection, task_id: int, *, resume: bool = True, text: str = _ANSWER
+):
+    from hub import services
+    from hub.models import TaskAnswer
+
+    return await services.answer_question(
+        db, task_id, TaskAnswer(answer=text, resume=resume)
+    )
+
+
+async def _sweeps(db: aiosqlite.Connection, times: int = 4) -> None:
+    from hub.services.executor_dispatch import sweep_executor_runs
+
+    for _ in range(times):
+        await sweep_executor_runs(db)
+
+
+async def _status(db: aiosqlite.Connection, task_id: int) -> str:
+    return dict(await repo.get_task(db, task_id))["status"]
+
+
+async def test_question_pauses_live_run_and_keeps_needs_info(db, monkeypatch):
+    """AC-1: вопрос при живом прогоне — отмена с intent awaiting_answer (с
+    повтором после 429), строка закрыта исходом awaiting_answer, задача в
+    needs_info и не в needs_decision."""
+    task_id, row_id, _ = await _silent_task(db, monkeypatch, slug="q-pause")
+    state = _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0), refusals=1)
+
+    view = await _ask_q(db, task_id)
+
+    assert view.status == "needs_info"
+    row = await _row(db, row_id)
+    assert row["cancel_intent"] == "awaiting_answer"
+    assert row["outcome"] == OUTCOME_RUNNING, "429 — отмена ещё не подтверждена"
+    await _pause_passed(db, row_id)
+    await _sweeps(db)
+
+    row = await _row(db, row_id)
+    assert row["outcome"] == "awaiting_answer"
+    assert row["finished_at"] is not None
+    assert state["cancel_calls"] == 2
+    assert await _status(db, task_id) == "needs_info"
+    assert await _decision_reasons(db, task_id) == []
+
+
+async def test_a_local_question_does_not_touch_any_run(db, monkeypatch):
+    """Вопрос без строки прогона — поведение прежнее: ни отмены, ни
+    вмешательства в ответ."""
+    _launch_config(monkeypatch)
+    state = _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    task_id = await _task(db, "локальная пара")
+    await repo.update_task(db, task_id, branch="task-1/local")
+    await db.commit()
+
+    await _ask_q(db, task_id)
+    assert state["cancel_calls"] == 0
+    await _sweeps(db, 2)
+    assert await _status(db, task_id) == "needs_info"
+    view = await _answer_q(db, task_id)
+    assert view.status == "running"
+    assert await _decision_reasons(db, task_id) == []
+
+
+async def test_answer_orders_one_continuation_with_question_and_answer(db, monkeypatch):
+    """AC-2: ответ с resume после закрытого вопросом прогона — один заказ на
+    той же ветке, в заказе дословно вопрос, ответ и требование сверить
+    коммиты после вопроса; на многих тиках и после перезапуска — один."""
+    task_id, _, branch = await _silent_task(db, monkeypatch, slug="q-continue")
+    _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    calls = _creator(monkeypatch, [_CREATED])
+    await _ask_q(db, task_id)
+    await _sweeps(db, 2)
+    assert calls == [], "до ответа заказа нет"
+
+    await _answer_q(db, task_id)
+    await _sweeps(db, 5)
+
+    assert len(calls) == 1, "ровно один заказ на один ответ"
+    order = calls[0]
+    assert order["starting_ref"] == branch
+    prompt = order["prompt_text"]
+    assert _QUESTION in prompt and _ANSWER in prompt
+    assert "сверь коммиты" in prompt and "после" in prompt
+    rows = [dict(r) for r in await repo.list_executor_runs(db, task_id)]
+    assert [r["run_id"] for r in rows] == ["run-1", "run-9"]
+    assert rows[-1]["submission_generation"] == 1
+    assert await _status(db, task_id) == "running"
+    assert await _decision_reasons(db, task_id) == []
+    assert not [a for a in await _alerts(db, task_id) if "сделано до ответа" in a], (
+        "вершина не сдвинулась — коммитов после вопроса нет"
+    )
+
+
+async def test_a_run_finished_after_the_question_is_continued_too(db, monkeypatch):
+    """Прогон дошёл до FINISHED после вопроса (отмена не успела): #1446 только
+    называет это в alert (задачу не трогает, повтора «только сдай» нет), а
+    ответ заказывает продолжение."""
+    task_id, row_id, _ = await _silent_task(db, monkeypatch, slug="q-finished")
+    calls = _creator(monkeypatch, [_CREATED])
+    _silent_provider(monkeypatch, {"run-1": "RUNNING"})
+
+    async def _no_pause(db, task_id):
+        """Отмена хабом не встала на вопрос: прогон дошёл до конца сам."""
+
+    monkeypatch.setattr(
+        "hub.services.executor_dispatch.pause_run_on_question", _no_pause
+    )
+    await _ask_q(db, task_id)
+    assert (await _row(db, row_id))["cancel_intent"] == ""
+    _silent_provider(monkeypatch, {"run-1": "FINISHED"})
+    await _sweeps(db, 3)
+    assert calls == [], "прогон «только сдай» на вопросе не заказывается"
+    assert await _status(db, task_id) == "needs_info"
+
+    await _answer_q(db, task_id)
+    await _sweeps(db, 3)
+    assert len(calls) == 1
+    assert _QUESTION in calls[0]["prompt_text"]
+    assert await _status(db, task_id) == "running"
+
+
+async def test_the_answer_waits_for_the_previous_run_to_close(db, monkeypatch):
+    """Отмена ещё в повторах (429): два живых прогона на задачу недопустимы —
+    ответ ждёт закрытия строки, потом заказ ровно один."""
+    task_id, row_id, _ = await _silent_task(db, monkeypatch, slug="q-wait")
+    _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0), refusals=2)
+    calls = _creator(monkeypatch, [_CREATED])
+    await _ask_q(db, task_id)
+    await _answer_q(db, task_id)
+    assert calls == []
+    assert await _status(db, task_id) == "needs_info"
+
+    await _pause_passed(db, row_id)
+    await _sweeps(db, 1)
+    assert calls == [] and (await _row(db, row_id))["outcome"] == OUTCOME_RUNNING
+    await _pause_passed(db, row_id)
+    await _sweeps(db, 3)
+
+    assert (await _row(db, row_id))["outcome"] == "awaiting_answer"
+    assert len(calls) == 1
+    assert await _status(db, task_id) == "running"
+
+
+async def test_no_continuation_when_another_session_took_the_task(db, monkeypatch):
+    """Задачу взяла другая сессия (claim_session_id сменился) — заказа нет,
+    только alert."""
+    task_id, row_id, _ = await _silent_task(db, monkeypatch, slug="q-taken")
+    _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0), refusals=1)
+    calls = _creator(monkeypatch, [_CREATED])
+    await repo.update_task(db, task_id, claim_session_id="cloud-session")
+    await db.commit()
+    await _ask_q(db, task_id)
+    await _answer_q(db, task_id)
+    await repo.update_task(db, task_id, claim_session_id="local-session")
+    await db.commit()
+    await _pause_passed(db, row_id)
+    await _sweeps(db, 4)
+
+    assert calls == []
+    assert [a for a in await _alerts(db, task_id) if "другая сессия" in a]
+    assert await _status(db, task_id) == "needs_info"
+
+
+async def test_answer_without_continuation_goes_to_decision(db, monkeypatch):
+    """AC-3: launch off, потолок задачи и ответ без resume — продолжения нет,
+    задача в needs_decision с причиной «ответ записан, продолжить некому»."""
+    _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    calls = _creator(monkeypatch, [_CREATED])
+    reasons = {}
+
+    # launch off
+    task_off, _, _ = await _silent_task(db, monkeypatch, slug="q-off", mode="off")
+    await _ask_q(db, task_off)
+    await _answer_q(db, task_off)
+    await _sweeps(db, 3)
+    reasons["off"] = task_off
+
+    # потолок задачи: потрачено 10 ¢ при потолке 5 ¢
+    task_cap, _, _ = await _silent_task(db, monkeypatch, slug="q-cap")
+    project = await repo.resolve_project_for_task(db, task_cap)
+    policy = json.loads(dict(project)["gate_policy"])
+    policy["executor_task_cents_ceiling"] = 5
+    await repo.update_project(db, dict(project)["id"], gate_policy=json.dumps(policy))
+    await db.commit()
+    await _ask_q(db, task_cap)
+    await _answer_q(db, task_cap)
+    await _sweeps(db, 3)
+    reasons["cap"] = task_cap
+
+    # ответ без resume
+    task_no, _, _ = await _silent_task(db, monkeypatch, slug="q-noresume")
+    await _ask_q(db, task_no)
+    await _answer_q(db, task_no, resume=False)
+    await _sweeps(db, 3)
+    reasons["noresume"] = task_no
+
+    assert calls == []
+    for name, task_id in reasons.items():
+        assert await _status(db, task_id) == "needs_decision", name
+        entries = await _decision_reasons(db, task_id)
+        assert len(entries) == 1, (name, entries)
+        assert "ответ записан, продолжить некому" in entries[0]["detail"], name
+        assert [a for a in await _alerts(db, task_id) if "продолжить некому" in a]
+
+
+async def test_commits_after_question_are_named(db, monkeypatch):
+    """AC-4: коммит, запушенный между вопросом и ответом, назван в alert с sha
+    и словами «сделано до ответа»; коммит до вопроса не назван."""
+    from hub.integrations.registry import plugins
+
+    task_id, _, branch = await _silent_task(
+        db, monkeypatch, slug="q-commits", tip=_ASKED_TIP
+    )
+    project = await repo.resolve_project_for_task(db, task_id)
+    await repo.update_project(
+        db, dict(project)["id"], workspace_path="/tmp/haiplane-1458-clone"
+    )
+    await db.commit()
+    _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    calls = _creator(monkeypatch, [_CREATED])
+    await _ask_q(db, task_id)
+
+    _forge(
+        monkeypatch, {branch: _LATE_TIP, "develop": _BASE_TIP}, {_LATE_TIP: "success"}
+    )
+
+    async def _log(repo_path, base, limit):
+        return "\n".join(
+            [
+                f"{_LATE_TIP}\x1fпуш после вопроса\x1fagent",
+                f"{_ASKED_TIP}\x1fработа до вопроса\x1fagent",
+                f"{_BASE_TIP}\x1fbase\x1fagent",
+            ]
+        )
+
+    monkeypatch.setattr(plugins.git_ops, "first_parent_log", _log)
+    await _answer_q(db, task_id)
+
+    named = [a for a in await _alerts(db, task_id) if "сделано до ответа" in a]
+    assert len(named) == 1, named
+    assert _LATE_TIP in named[0] and _ASKED_TIP not in named[0]
+    assert _BASE_TIP not in named[0]
+    await _sweeps(db, 3)
+    assert len([a for a in await _alerts(db, task_id) if "сделано до ответа" in a]) == 1
+    assert len(calls) == 1, "продолжение заказано и после алерта"
+
+
+async def test_a_question_of_a_foreign_holder_does_not_stop_the_run(db, monkeypatch):
+    """Задачу держит локальная сессия, а не исполнитель хаба: её вопрос
+    прогон не отменяет."""
+    task_id, row_id, _ = await _silent_task(db, monkeypatch, slug="q-foreign")
+    state = _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    await repo.update_task(db, task_id, claimed_by="local_dev")
+    await db.commit()
+
+    await _ask_q(db, task_id)
+
+    assert state["cancel_calls"] == 0
+    assert (await _row(db, row_id))["outcome"] == OUTCOME_RUNNING
+
+
+async def test_an_awaiting_answer_run_does_not_release_a_running_task(db, monkeypatch):
+    """Строка с исходом awaiting_answer не в STOPPED_OUTCOMES: задача в running
+    за ней не уходит в needs_decision (release_stopped_tasks, #1455)."""
+    from hub.services.executor_dispatch import (
+        STOPPED_OUTCOMES,
+        release_stopped_tasks,
+    )
+
+    task_id, row_id, _ = await _silent_task(db, monkeypatch, slug="q-release")
+    await repo.update_executor_run(
+        db, row_id, outcome="awaiting_answer", reason="", finish=True
+    )
+    await db.commit()
+
+    assert "awaiting_answer" not in STOPPED_OUTCOMES
+    assert await release_stopped_tasks(db) == 0
+    assert await _status(db, task_id) == "running"
+
+
+async def test_an_ordered_continuation_is_not_ordered_twice(db, monkeypatch):
+    """Долг закрыт событием: задача снова в needs_info (перезапуск, гонка) —
+    второго заказа на тот же ответ нет."""
+    task_id, _, _ = await _silent_task(db, monkeypatch, slug="q-once")
+    _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    calls = _creator(monkeypatch, [_CREATED])
+    await _ask_q(db, task_id)
+    await _answer_q(db, task_id)
+    await _sweeps(db, 2)
+    assert len(calls) == 1
+
+    last = [dict(r) for r in await repo.list_executor_runs(db, task_id)][-1]
+    await repo.update_executor_run(
+        db, last["id"], outcome="failed", reason="", finish=True
+    )
+    await repo.update_task(db, task_id, status="needs_info")
+    await db.commit()
+    await _sweeps(db, 3)
+
+    assert len(calls) == 1
+
+
+async def test_a_stale_answer_is_not_continued(db, monkeypatch):
+    """Новый вопрос позже ответа делает запись «нужно продолжение» устаревшей:
+    продолжать прошлый ответ нельзя."""
+    task_id, row_id, _ = await _silent_task(db, monkeypatch, slug="q-stale")
+    _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    calls = _creator(monkeypatch, [_CREATED])
+    await _ask_q(db, task_id)
+    await repo.insert_event(
+        db,
+        kind="executor_continuation_wanted",
+        task_id=task_id,
+        actor="hub",
+        payload={"question_update_id": 0, "answer_update_id": 0},
+    )
+    await db.commit()
+
+    await _sweeps(db, 3)
+
+    assert calls == []
+    assert await _status(db, task_id) == "needs_info"
+
+
+async def test_commits_are_named_by_tip_when_the_log_cannot_be_read(db, monkeypatch):
+    """Рабочей копии проекта нет — alert называет вершину на ответе, а не
+    молчит и не выдумывает список."""
+    task_id, _, branch = await _silent_task(
+        db, monkeypatch, slug="q-tip", tip=_ASKED_TIP
+    )
+    _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    _creator(monkeypatch, [_CREATED])
+    await _ask_q(db, task_id)
+    _forge(
+        monkeypatch, {branch: _LATE_TIP, "develop": _BASE_TIP}, {_LATE_TIP: "success"}
+    )
+
+    await _answer_q(db, task_id)
+
+    named = [a for a in await _alerts(db, task_id) if "сделано до ответа" in a]
+    assert len(named) == 1 and _LATE_TIP in named[0]
+    assert "не прочитан" in named[0]
+
+
+async def test_a_local_holders_answer_keeps_the_old_resume(db, monkeypatch):
+    """Находка fc7a4b2bd547c510: задачу держит локальная сессия, облачный
+    прогон закончился после вопроса — ответ идёт прежним resume, хаб его не
+    перехватывает и продолжения не заказывает."""
+    task_id, _, _ = await _silent_task(db, monkeypatch, slug="q-local-answer")
+    calls = _creator(monkeypatch, [_CREATED])
+    await repo.update_task(db, task_id, claimed_by="local_dev")
+    _silent_provider(monkeypatch, {"run-1": "RUNNING"})
+    await _ask_q(db, task_id)
+    _silent_provider(monkeypatch, {"run-1": "FINISHED"})
+    await _sweeps(db, 2)
+
+    view = await _answer_q(db, task_id)
+    await _sweeps(db, 3)
+
+    assert view.status == "running", "прежний resume: pair-задача с веткой"
+    assert calls == []
+    assert await _decision_reasons(db, task_id) == []
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM events WHERE task_id=? AND kind='executor_continuation_wanted'",
+        (task_id,),
+    )
+    assert list(rows) == []
+
+
+async def test_an_unreadable_tip_is_named_not_silent(db, monkeypatch):
+    """Находка 2471279e860ca548: вершину на ответе прочитать не удалось —
+    alert с причиной; «коммитов нет» (вершина не сдвинулась) молчит."""
+    task_id, _, branch = await _silent_task(
+        db, monkeypatch, slug="q-unread", tip=_ASKED_TIP
+    )
+    _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    _creator(monkeypatch, [_CREATED])
+    await _ask_q(db, task_id)
+    _forge(monkeypatch, {"develop": _BASE_TIP}, {})
+
+    await _answer_q(db, task_id)
+
+    alerts = [a for a in await _alerts(db, task_id) if "не проверены" in a]
+    assert len(alerts) == 1, alerts
+    assert "network down" in alerts[0] and branch in alerts[0]

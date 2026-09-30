@@ -4327,6 +4327,11 @@ async def ask_question(
     await repo.add_task_update(db, task_id, body.agent, "question", body.question)
     await repo.update_task(db, task_id, status="needs_info")
     await db.commit()
+    # #1458: идущий прогон облачного исполнителя вопрос останавливает —
+    # иначе он пишет код против догадки, пока ответа нет.
+    from hub.services.executor_dispatch import pause_run_on_question
+
+    await pause_run_on_question(db, task_id)
     await log_activity(
         db,
         "task_question",
@@ -4376,6 +4381,21 @@ async def answer_question(
         payload={"resume": bool(body.resume)},
     )
     await db.commit()
+
+    from hub.services.executor_dispatch import answer_for_executor
+
+    if await answer_for_executor(db, task, resume=bool(body.resume)):
+        # #1458: вопрос облачного исполнителя — продолжение (или решение
+        # человеку) ведёт хаб; статус running без прогона здесь не ставится.
+        await log_activity(
+            db,
+            "task_answered",
+            f"Task #{task_id}: answered, executor continuation handled by the hub",
+            detail=mutation_activity_detail(),
+        )
+        row = await repo.get_task(db, task_id)
+        updates = await repo.get_task_updates(db, task_id)
+        return row_to_task(row, updates=updates)  # type: ignore[arg-type]
 
     if body.resume:
         if _is_pair_task(task):
