@@ -18,7 +18,12 @@
 исход ``cancelled_by_human``. Прогон, закрытый без сдачи (отмена, ошибка,
 потолок), снимает задачу из running на решение человеку.
 
-Чего модуль НЕ делает: не запускает исполнителя (F2.4).
+Прогон, закончившийся FINISHED без сдачи своего поколения (#1446), — исход
+``finished_without_submission``: в том же проходе alert с причиной и хвостом
+итогового текста, затем один повторный прогон «только сдай» (заказ — через
+executor_launch, F2.4) или решение человека. Третьего прогона нет.
+
+Первый запуск исполнителя модуль не делает (F2.4).
 
 Молчание провайдера — названная причина, а не ноль и не завершение: строка
 сохраняет прежние цифры и остаётся ``running``, пока цена не прочитана.
@@ -28,6 +33,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -51,6 +57,8 @@ OUTCOME_OVER_CEILING = "over_ceiling"
 OUTCOME_TAKEN_DOWN = "taken_down"
 #: #1455: остановка человеком из хаба — та же отмена с повторами.
 OUTCOME_CANCELLED_BY_HUMAN = "cancelled_by_human"
+#: #1446: провайдер сказал FINISHED, а сдачи поколения прогона нет.
+OUTCOME_FINISHED_WITHOUT_SUBMISSION = "finished_without_submission"
 
 #: Исходы, которыми прогон кончился без работы до конца (#1455): задача в
 #: running без сдачи его поколения уходит на решение. FINISHED без сдачи —
@@ -93,6 +101,9 @@ EVENT_OVER_CEILING = "executor_run_over_ceiling"
 EVENT_CANCEL_EXHAUSTED = "executor_run_cancel_exhausted"
 #: #1455: причина needs_decision — прогон остановлен без сдачи.
 EVENT_RUN_STOPPED = "executor_run_stopped"
+#: #1446: прогон FINISHED без сдачи своего поколения — событие и причина
+#: needs_decision, когда повтора «только сдай» не будет.
+EVENT_FINISHED_WITHOUT_SUBMISSION = "executor_run_finished_without_submission"
 
 REASON_NO_LIVE_RUN = "по задаче нет идущего прогона исполнителя"
 
@@ -113,6 +124,8 @@ async def _poll_one(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
         # #1439: у брони запуска без агента причина уже может быть названа
         # (слепая потеря ответа: «агент мог быть создан») — её не затирать
         # общим «нечего опрашивать».
+        if await _close_abandoned_reservation(db, row):
+            return
         if not row.get("reason"):
             await repo.update_executor_run(db, row["id"], reason=REASON_NO_RUN_ID)
         return
@@ -132,6 +145,29 @@ async def _poll_one(db: aiosqlite.Connection, row: dict[str, Any]) -> None:
         await repo.update_executor_run(db, row["id"], reason=REASON_USAGE_SILENT)
         return
     await _settle(db, row, run, tokens, cents)
+
+
+async def _close_abandoned_reservation(
+    db: aiosqlite.Connection, row: dict[str, Any]
+) -> bool:
+    """Бронь без агента, пережившая все попытки заказа, — failed (#1446).
+
+    Раньше её закрывал только следующий запуск (``_live_run``); слепой исход
+    заказа «только сдай» оставляет задачу за бронью, и без опроса она
+    висела бы в running вечно. Закрытую бронь снимает ``release_stopped_tasks``.
+    """
+    from hub.services import executor_launch as el
+
+    if row.get("agent_id") or not el._reservation_abandoned(row):
+        return False
+    await repo.update_executor_run(
+        db,
+        row["id"],
+        outcome=OUTCOME_FAILED,
+        reason=el.REASON_RESERVATION_ABANDONED,
+        finish=True,
+    )
+    return True
 
 
 def _outcome_of(row: dict[str, Any], run: dict[str, Any]) -> str | None:
@@ -155,23 +191,30 @@ async def _settle(
     cents: float | None,
 ) -> None:
     outcome = _outcome_of(row, run)
+    if outcome == OUTCOME_FINISHED and not await _submission_landed(db, row):
+        # #1446: закончился, не сдав своё поколение, — отдельный исход.
+        outcome = OUTCOME_FINISHED_WITHOUT_SUBMISSION
     # Ждать цену — только если её нет ни в ответе, ни в строке: цена,
     # прочитанная опросом во время RUNNING, известна, и конец без cost её не
     # отменяет (COALESCE в update_executor_run её сохранит).
     if outcome is not None and cents is None and row["cents"] is None:
-        await _wait_for_cost(db, row["id"], tokens, outcome)
-        return
-    await repo.update_executor_run(
-        db,
-        row["id"],
-        tokens=tokens,
-        cents=cents,
-        outcome=outcome or OUTCOME_RUNNING,
-        reason="",
-        finish=outcome is not None,
-    )
+        if outcome == OUTCOME_FINISHED_WITHOUT_SUBMISSION:
+            await _note_silent_pending_cost(db, row, run)
+        if not await _wait_for_cost(db, row["id"], tokens, outcome):
+            return
+    else:
+        await repo.update_executor_run(
+            db,
+            row["id"],
+            tokens=tokens,
+            cents=cents,
+            outcome=outcome or OUTCOME_RUNNING,
+            reason="",
+            finish=outcome is not None,
+        )
     if outcome is not None:
         await _note_human_stop(db, row, outcome)
+        await _note_silent_finish(db, row, run, outcome)
 
 
 async def _note_human_stop(
@@ -189,6 +232,450 @@ async def _note_human_stop(
         f"остановлен по просьбе человека: провайдер подтвердил CANCELLED, исход "
         f"{OUTCOME_CANCELLED_BY_HUMAN} (#1455).",
     )
+
+
+# ---- #1446: прогон FINISHED без сдачи своего поколения ----
+
+#: Сколько хвоста итогового текста прогона идёт в alert (AC-5).
+RESULT_TAIL_CHARS = 500
+#: Решение по тихому прогону: заказать «только сдай», ждать CI вершины,
+#: отдать человеку или только назвать (задачу уже ведёт кто-то другой).
+#: ``pending_cost`` — alert ушёл сразу, решение ждёт цену прогона.
+_RETRY, _WAIT_CI, _HUMAN, _NOTE = "retry", "wait_ci", "human", "note"
+_PENDING_COST = "pending_cost"
+#: Решения, после которых за строкой остаётся долг: заказ ещё не сделан.
+_DEBT_DECISIONS = (_RETRY, _WAIT_CI)
+
+#: Состояние CI вершины ветки.
+_CI_GREEN, _CI_RED, _CI_PENDING, _CI_UNKNOWN = "green", "red", "pending", "unknown"
+
+
+def _result_tail(run: dict[str, Any] | None) -> str:
+    """Хвост итогового текста прогона — поле ``result``, как у review_dispatch."""
+    text = str((run or {}).get("result") or "").strip()
+    return text[-RESULT_TAIL_CHARS:]
+
+
+async def _branch_tip(
+    db: aiosqlite.Connection, task_id: int, branch: str
+) -> tuple[str, str]:
+    """``(sha, причина)`` вершины, как её видит сам хаб; пустой sha —
+    вершину прочитать не удалось, и причина говорит почему."""
+    from hub.services import lifecycle
+
+    return await lifecycle.resolve_branch_tip(db, task_id, branch)
+
+
+def _ci_state_of(runs: list[dict[str, Any]] | None, tip: str) -> tuple[str, str]:
+    """Состояние CI вершины по прогонам ветки: зелёный — только все
+    прогоны вершины завершены успехом; «не прочитан» и «нет прогона» —
+    не зелёный (#1446, находка ревью: незнание не разрешает платный заказ)."""
+    from hub.services.red_base import _FAILED, _PASSED
+
+    if runs is None:
+        return _CI_UNKNOWN, "CI не прочитан"
+    on_tip = [r for r in runs if r.get("sha") == tip]
+    if not on_tip:
+        return _CI_PENDING, "на вершине нет прогона CI"
+    if any(r.get("conclusion") in _FAILED for r in on_tip):
+        return _CI_RED, "красный"
+    if all(
+        r.get("status") == "completed" and r.get("conclusion") in _PASSED
+        for r in on_tip
+    ):
+        return _CI_GREEN, "зелёный"
+    if all(r.get("status") == "completed" for r in on_tip):
+        return _CI_UNKNOWN, "исход CI не распознан"
+    return _CI_PENDING, "CI вершины ещё идёт"
+
+
+async def _tip_ci(
+    db: aiosqlite.Connection, task_id: int, branch: str, tip: str
+) -> tuple[str, str]:
+    """Состояние CI вершины ``(состояние, текст)``."""
+    from hub.integrations.registry import plugins
+    from hub.services.project_policy import forge_of
+
+    project = dict(await repo.resolve_project_for_task(db, task_id) or {})
+    runs = await plugins.git_ops.branch_ci_runs(
+        branch,
+        repo=(project.get("workspace_path") or "").strip() or None,
+        gh_repo=(project.get("repo") or "").strip() or None,
+        forge=forge_of(project) if project else "",
+    )
+    return _ci_state_of(runs, tip)
+
+
+async def _earlier_silent_runs(db: aiosqlite.Connection, row: dict[str, Any]) -> int:
+    """Сколько прогонов этого поколения уже закончились без сдачи до этого.
+
+    Счёт — по строкам, а не в памяти: повтор один на поколение и после
+    перезапуска хаба.
+    """
+    return sum(
+        1
+        for r in await repo.list_executor_runs(db, int(row["task_id"]))
+        if int(r["id"]) < int(row["id"])
+        and r["outcome"] == OUTCOME_FINISHED_WITHOUT_SUBMISSION
+        and int(r["submission_generation"] or 0)
+        == int(row["submission_generation"] or 0)
+    )
+
+
+async def _budget_short(db: aiosqlite.Connection, task_id: int) -> str:
+    """Причина, если бюджет задачи (#1443) не вмещает прогон «только сдай»."""
+    budget = await task_budget(db, task_id)
+    if budget.unknown or budget.exhausted:
+        return f"бюджет исполнителя на задачу не вмещает повтор: {budget.text()}"
+    if (
+        budget.cents_left < config.EXECUTOR_SUBMIT_ONLY_CENTS_CEILING
+        or budget.tokens_left < config.EXECUTOR_SUBMIT_ONLY_TOKEN_CEILING
+    ):
+        return (
+            f"бюджет исполнителя на задачу не вмещает повтор: {budget.text()}, "
+            f"а потолок прогона «только сдай» — "
+            f"{_num(config.EXECUTOR_SUBMIT_ONLY_CENTS_CEILING)} ¢ и "
+            f"{config.EXECUTOR_SUBMIT_ONLY_TOKEN_CEILING} токенов"
+        )
+    return ""
+
+
+async def _pushed_work(
+    db: aiosqlite.Connection, task: dict[str, Any], project: Any
+) -> tuple[str, str, str]:
+    """``(ветка, tip, причина)``: есть ли что сдавать. Пустая причина — есть.
+
+    «Не запушил» и «не удалось посмотреть» — разные причины (находка ревью
+    #1446): непрочитанная вершина не доказывает, что работы нет.
+    """
+    from hub.services.project_policy import base_branch_of
+
+    task_id = int(task["id"])
+    branch = str(task.get("branch") or "").strip()
+    if not branch:
+        return "", "", "прогон не запушил работу (у задачи нет ветки)"
+    tip, unread = await _branch_tip(db, task_id, branch)
+    if not tip:
+        return branch, "", f"не удалось проверить ветку {branch}: {unread}"
+    # Вершина прошлой сдачи или базы — ничего нового прогон не запушил.
+    base_tip, _ = await _branch_tip(db, task_id, base_branch_of(project))
+    if tip in {str(task.get("submission_sha") or ""), base_tip}:
+        return (
+            branch,
+            tip,
+            f"прогон не запушил работу (ветка {branch}, вершина {tip[:12]} не "
+            "сдвинулась)",
+        )
+    return branch, tip, ""
+
+
+def _ci_wait_over(row: dict[str, Any]) -> bool:
+    """Срок ожидания CI вершины от конца прогона истёк.
+
+    Строка без ``finished_at`` закрывается этим же проходом: прогон только
+    что кончился, срок не истёк.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    if not row.get("finished_at"):
+        return False
+    try:
+        ended = datetime.fromisoformat(str(row.get("finished_at") or "")).replace(
+            tzinfo=UTC
+        )
+    except ValueError:
+        return True
+    limit = timedelta(minutes=config.EXECUTOR_SUBMIT_ONLY_CI_WAIT_MIN)
+    return datetime.now(UTC) - ended > limit
+
+
+async def _ci_verdict(
+    db: aiosqlite.Connection, row: dict[str, Any], task_id: int, branch: str, tip: str
+) -> tuple[str, str]:
+    """``(решение, причина)`` по CI вершины; пустое решение — CI зелёный."""
+    state, text = await _tip_ci(db, task_id, branch, tip)
+    if state == _CI_GREEN:
+        return "", ""
+    if state == _CI_RED:
+        return _HUMAN, f"CI tip {tip[:12]} красный — сдача упрётся в него"
+    minutes = config.EXECUTOR_SUBMIT_ONLY_CI_WAIT_MIN
+    if _ci_wait_over(row):
+        return (
+            _HUMAN,
+            f"CI tip {tip[:12]} не стал зелёным за {minutes} мин ({text}) — "
+            "повтор «только сдай» не заказан",
+        )
+    return (
+        _WAIT_CI,
+        f"CI tip {tip[:12]} ещё не зелёный ({text}) — хаб ждёт до {minutes} мин "
+        "и закажет «только сдай» на зелёном",
+    )
+
+
+async def _silent_decision(
+    db: aiosqlite.Connection, row: dict[str, Any], task: dict[str, Any]
+) -> tuple[str, str, Any]:
+    """Что делать с прогоном без сдачи: ``(решение, причина, заказ)``."""
+    from hub.services import executor_launch as el
+    from hub.services.project_policy import gate_policy_for_task
+
+    task_id = int(task["id"])
+    held = await el.silent_retry_refusal(db, task)
+    if held:
+        return _NOTE, f"{held}; повтора нет", None
+    if await _earlier_silent_runs(db, row):
+        return (
+            _HUMAN,
+            "повторный прогон «только сдай» тоже закончился без сдачи — "
+            "третьего прогона нет, решение за человеком",
+            None,
+        )
+    project = await repo.resolve_project_for_task(db, task_id)
+    policy = await gate_policy_for_task(db, task_id)
+    if el.launch_mode_of(policy) != el.LAUNCH_MANUAL:
+        return _HUMAN, f"{el.REASON_OFF} — повтора «только сдай» нет", None
+    short = await _budget_short(db, task_id)
+    if short:
+        return _HUMAN, short, None
+    branch, tip, missing = await _pushed_work(db, task, project)
+    if missing:
+        return _HUMAN, missing, None
+    decision, why = await _ci_verdict(db, row, task_id, branch, tip)
+    if decision:
+        return decision, why, None
+    order = el.SubmitOnly(
+        run_id=str(row["run_id"]),
+        generation=int(row["submission_generation"] or 0),
+        branch=branch,
+        tip=tip,
+        ci="зелёный",
+    )
+    return (
+        _RETRY,
+        f"хаб заказывает один прогон «только сдай» на {branch} @ {tip[:12]}",
+        order,
+    )
+
+
+async def _silent_decisions(db: aiosqlite.Connection, row: dict[str, Any]) -> list[str]:
+    """Записанные решения по прогону, по порядку (события #1446)."""
+    row_id = int(row["id"])
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind=? AND task_id=? ORDER BY id",
+        (EVENT_FINISHED_WITHOUT_SUBMISSION, int(row["task_id"])),
+    )
+    out = []
+    for r in rows:
+        try:
+            payload = json.loads(dict(r)["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if int(payload.get("executor_run_id") or 0) == int(row_id):
+            out.append(str(payload.get("decision") or ""))
+    return out
+
+
+async def _record_decision(
+    db: aiosqlite.Connection, row: dict[str, Any], decision: str, why: str
+) -> None:
+    await repo.insert_event(
+        db,
+        kind=EVENT_FINISHED_WITHOUT_SUBMISSION,
+        task_id=int(row["task_id"]),
+        actor="hub",
+        payload={"executor_run_id": row["id"], "decision": decision, "detail": why},
+    )
+
+
+async def _alert_silent(
+    db: aiosqlite.Connection, row: dict[str, Any], run: dict[str, Any], why: str
+) -> None:
+    """Один alert на прогон: FINISHED без сдачи, причина и хвост итога."""
+    generation = row["submission_generation"]
+    tail = _result_tail(run)
+    await repo.add_task_update(
+        db,
+        int(row["task_id"]),
+        "hub",
+        "alert",
+        f"Прогон исполнителя {row['run_id']} (сдача {generation}) завершён без "
+        f"сдачи: провайдер отдал FINISHED, а сдачи {generation} у задачи нет. "
+        f"Решение хаба: {why} (#1446). Итоговый текст прогона: "
+        + (f"«{tail}»" if tail else "итогового текста нет")
+        + ".",
+    )
+
+
+async def _note_silent_pending_cost(
+    db: aiosqlite.Connection, row: dict[str, Any], run: dict[str, Any]
+) -> None:
+    """Цена ещё не пришла: alert — сразу, решение о повторе — после цены.
+
+    Без цены бюджет задачи неизвестен (#1443), и заказывать нельзя; но
+    человек узнаёт о тихом конце в первом же проходе (находка ревью #1446).
+    """
+    if await _silent_decisions(db, row):
+        return
+    why = "цена прогона ещё не пришла — о повторе «только сдай» хаб решит после неё"
+    await _alert_silent(db, row, run, why)
+    await _record_decision(db, row, _PENDING_COST, why)
+
+
+async def _note_silent_finish(
+    db: aiosqlite.Connection, row: dict[str, Any], run: dict[str, Any], outcome: str
+) -> None:
+    """Прогон FINISHED без сдачи: alert с причиной в том же проходе и одно из
+    решений — повтор «только сдай», ожидание CI, человек или только запись.
+
+    Зовётся один раз на закрытие строки. Решение пишется событием ДО заказа
+    и коммитится: заказ, оборванный после коммита, остаётся долгом, который
+    доводит ``settle_silent_debts`` (находка ревью #1446).
+    """
+    if outcome != OUTCOME_FINISHED_WITHOUT_SUBMISSION:
+        return
+    found = await repo.get_task(db, int(row["task_id"]))
+    if found is None:
+        return
+    decision, why, order = await _silent_decision(db, row, dict(found))
+    if await _silent_decisions(db, row):
+        # Alert уже ушёл, пока прогон ждал цену: решение — записью в ленте.
+        await repo.add_task_update(
+            db,
+            int(row["task_id"]),
+            "hub",
+            "status",
+            f"Решение хаба по прогону {row['run_id']} без сдачи: {why} (#1446).",
+        )
+    else:
+        await _alert_silent(db, row, run, why)
+    await _apply_decision(db, row, decision, why, order, _result_tail(run))
+
+
+async def _apply_decision(
+    db: aiosqlite.Connection,
+    row: dict[str, Any],
+    decision: str,
+    why: str,
+    order: Any,
+    tail: str,
+) -> None:
+    await _record_decision(db, row, decision, why)
+    task_id = int(row["task_id"])
+    if decision == _HUMAN:
+        await _silent_to_human(db, task_id, row, why)
+    await db.commit()
+    if decision == _RETRY:
+        order.result_tail = tail
+        await _order_submit_only(db, task_id, row, order)
+
+
+async def _silent_to_human(
+    db: aiosqlite.Connection, task_id: int, row: dict[str, Any], why: str
+) -> None:
+    """Задача с тихим прогоном — на решение человеку, с причиной (#1446)."""
+    task = await repo.get_task(db, task_id)
+    if task is None or dict(task).get("status") != "running":
+        return
+    await repo.update_task(db, task_id, status="needs_decision")
+    await repo.insert_event(
+        db,
+        kind="needs_decision",
+        task_id=task_id,
+        actor="hub",
+        payload={
+            "reason": EVENT_FINISHED_WITHOUT_SUBMISSION,
+            "outcome": OUTCOME_FINISHED_WITHOUT_SUBMISSION,
+            "executor_run_id": row["id"],
+            "detail": why,
+        },
+    )
+
+
+async def _order_submit_only(
+    db: aiosqlite.Connection, task_id: int, row: dict[str, Any], order: Any
+) -> None:
+    """Заказать повтор; отказ до брони — задача на решение с причиной.
+
+    Отказ ПОСЛЕ брони (провайдер не создал агента) закрывает бронь исходом
+    failed, и задачу снимает ``release_stopped_tasks`` (#1455) тем же
+    проходом. Слепой исход создания (находка ревью #1446): бронь держится —
+    агент мог быть создан и оплачен, — задача остаётся за ней; брошенную
+    бронь закрывает опрос (``_poll_one``), и тогда задачу снимает #1455.
+    """
+    from hub.services import executor_launch as el
+
+    result = await el.submit_only_executor(db, task_id, order)
+    if result.launched:
+        return
+    if result.row_id is not None:
+        if result.reason.startswith(el.REASON_ANSWER_BLIND):
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                "Исход создания прогона «только сдай» неизвестен: "
+                f"{result.reason}. Задача остаётся за бронью; если агент так и "
+                "не появится, бронь закроется как брошенная и задача уйдёт на "
+                "решение человеку (#1446).",
+            )
+            await db.commit()
+        return
+    why = f"повтор «только сдай» не заказан: {result.reason}"
+    await repo.add_task_update(db, task_id, "hub", "alert", f"Хаб: {why} (#1446).")
+    await _silent_to_human(db, task_id, row, why)
+    await db.commit()
+
+
+async def _silent_debt_rows(db: aiosqlite.Connection) -> list[dict[str, Any]]:
+    """Последний прогон задачи в running — закрыт без сдачи своего поколения."""
+    rows = await fetchall(
+        db,
+        "SELECT r.* FROM executor_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE t.status = 'running' AND t.archived = 0 AND r.outcome = ? "
+        "AND r.id = (SELECT MAX(x.id) FROM executor_runs x WHERE x.task_id = t.id) "
+        "AND COALESCE(t.submission_generation, 0) < r.submission_generation "
+        "ORDER BY r.id",
+        (OUTCOME_FINISHED_WITHOUT_SUBMISSION,),
+    )
+    return [dict(r) for r in rows]
+
+
+async def settle_silent_debts(db: aiosqlite.Connection) -> int:
+    """Довести записанное решение «повтор» или «ждать CI» до заказа (#1446).
+
+    Решение пишется и коммитится до заказа; обрыв после коммита (выкат,
+    падение) не должен потерять повтор, а закрытую строку опрос больше не
+    видит. Долг — прогон, чьё последнее решение ``retry`` или ``wait_ci``,
+    остаётся последним прогоном задачи в running: заказ не состоялся. Как
+    только заказ сделан, у задачи появляется строка новее — долга нет, и
+    второго заказа на поколение этот проход не делает. Возвращает число
+    заказов.
+    """
+    ordered = 0
+    for row in await _silent_debt_rows(db):
+        decisions = await _silent_decisions(db, row)
+        if not decisions or decisions[-1] not in _DEBT_DECISIONS:
+            continue
+        found = await repo.get_task(db, int(row["task_id"]))
+        if found is None:
+            continue
+        decision, why, order = await _silent_decision(db, row, dict(found))
+        if decision == decisions[-1] == _WAIT_CI:
+            continue
+        if decision != _RETRY or decisions[-1] != _RETRY:
+            await repo.add_task_update(
+                db,
+                int(row["task_id"]),
+                "hub",
+                "status",
+                f"Решение хаба по прогону {row['run_id']} без сдачи: {why} (#1446).",
+            )
+        run = await _ask(cursor_cloud.get_run, row["agent_id"], row["run_id"])
+        await _apply_decision(db, row, decision, why, order, _result_tail(run))
+        ordered += decision == _RETRY
+    return ordered
 
 
 # ---- #1411 (F2.3): держать прогон — отмена, потолок, снятие по сдаче ----
@@ -448,13 +935,14 @@ async def _name_exhausted_cancel(
 
 async def _wait_for_cost(
     db: aiosqlite.Connection, row_id: int, tokens: int | None, outcome: str
-) -> None:
+) -> bool:
     """Конец прогона без цены: ждать её, но не вечно (#1410).
 
     Cost у Cursor «eventually consistent» и сразу после конца может не
     прийти. Пока срок не вышел, строка остаётся running с причиной; по
     истечении закрывается исходом провайдера с названной причиной, а центы
     остаются неизвестными (прежнее прочитанное значение не обнуляется).
+    True — строка закрыта этим вызовом.
     """
     minutes = config.EXECUTOR_COST_WAIT_MIN
     if await repo.wait_for_executor_cost(db, row_id, minutes):
@@ -466,13 +954,11 @@ async def _wait_for_cost(
             reason=REASON_COST_NEVER_CAME.format(minutes=minutes),
             finish=True,
         )
-        row = await repo.get_executor_run(db, row_id)
-        if row is not None:
-            await _note_human_stop(db, dict(row), outcome)
-        return
+        return True
     await repo.update_executor_run(
         db, row_id, tokens=tokens, reason=REASON_COST_PENDING
     )
+    return False
 
 
 async def poll_executor_runs(db: aiosqlite.Connection) -> int:
@@ -494,6 +980,7 @@ async def sweep_executor_runs(db: aiosqlite.Connection) -> None:
     """Проход поллера (#1410): опрос прогонов исполнителя, затем задачи,
     чей прогон остановлен без сдачи, — на решение (#1455)."""
     await poll_executor_runs(db)
+    await settle_silent_debts(db)
     await release_stopped_tasks(db)
 
 
