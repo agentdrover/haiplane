@@ -164,7 +164,7 @@ section.blk:first-child{border-top:0}
 .attn--ok{border-left:1px solid var(--border)}
 .attn--bad{border-left-color:var(--signal)}
 .attn--info{border-left-color:var(--orange)}
-.attn h2,.attn h4{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-secondary);margin:0 0 4px;font-weight:600}
+.attn h2,.attn h3,.attn h4{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-secondary);margin:0 0 4px;font-weight:600}
 .epic{border-top:1px solid var(--border-subtle);padding:12px 0}
 .epic:first-of-type{border-top:0;padding-top:4px}
 .epic-head{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 12px;margin-bottom:8px}
@@ -234,10 +234,10 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 <input type="checkbox" id="w375" aria-label="Показать в рамке 375 px">
 <div class="mock-bar">
   <strong>Макет страницы проекта #1471</strong>
-  <span><a href="project-card.html">← Дашборд проектов</a> <a href="#s-states">Шапка в шести состояниях</a></span>
+  <span><a href="project-card.html">← Дашборд проектов</a> <a href="project-page-states.html">Варианты шапки (для вёрстки) →</a></span>
   <label class="tog" for="w375">Вариант 375 px (вкл/выкл)</label>
 </div>
-<div class="banner"><strong>Макет, не данные.</strong> Числа, названия задач и проектов выдуманы. Переключайте вкладки под шапкой. Цвет только у двух смыслов: акцент (оранжевый) у «требует вас, ваш шаг» и сигнал (красный) у ошибки. Пунктирные пометки <span class="ann">#1465</span> <span class="ann">#1464</span> <span class="ann">#1468</span> <span class="ann">#1457</span> показывают, какая задача наполняет блок; в готовой странице их нет. Шесть состояний шапки (норма, ждёт вас, ошибка workspace, ждёт активации, архив, пусто) показаны внизу: во всех есть «Требует вас», «Ждёт вас: N» и все вкладки.</div>
+<div class="banner"><strong>Макет, не данные.</strong> Числа, названия задач и проектов выдуманы. Переключайте вкладки под шапкой. Цвет только у двух смыслов: акцент (оранжевый) у «требует вас, ваш шаг» и сигнал (красный) у ошибки. Пунктирные пометки <span class="ann">#1465</span> <span class="ann">#1464</span> <span class="ann">#1468</span> <span class="ann">#1457</span> показывают, какая задача наполняет блок; в готовой странице их нет. На странице показан один проект. Варианты шапки в шести состояниях лежат в отдельном файле <a href="project-page-states.html">project-page-states.html</a> и на странице не показываются.</div>
 
 <div class="stage"><div class="frame">
 <div class="crumbs"><a href="project-card.html">Проекты</a> / default: Haiplane Hub</div>
@@ -389,41 +389,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 </div>
 <p class="project-note project-note--info" id="metrics-note"><b>Метрики →</b> это ссылка, не вкладка: она ведёт на <code>/metrics?project=default</code> (фильтр проекта, #1490).</p>
 
-<p class="page-tag" id="s-states">шапка страницы в шести состояниях (h2 → h3 → h4)</p>
-<h2>Состояния шапки</h2>
-<section class="project-cards gal" aria-label="Шесть состояний шапки страницы">
-<article class="project-card" aria-label="Шапка страницы в состоянии 1">
-<p class="src" style="margin:0 0 6px">состояние 1 · норма</p>
-<div class="epic-header"><h3 style="margin:0;font-size:14px">snip-portal</h3></div>
-<section class="attn attn--ok" aria-label="Требует вас"><h4>Требует вас</h4><p style="margin:0"><a class="chip chip--zero chip--link" href="project-page.html" aria-label="Ждёт вас 0 — проект snip-portal" data-target="/tasks?project=snip-portal&amp;state=awaiting"><span>Ждёт вас</span><b>0</b></a> Решений не требуется.</p></section>
-<div class="project-chips"><a class="chip " href="#" aria-label="В работе: 2 — проект snip-portal" data-target="/tasks?project=snip-portal&amp;state=inflight"><span>В работе</span><b>2</b></a><a class="chip " href="#" aria-label="На ревью: 1 — проект snip-portal" data-target="/tasks?project=snip-portal&amp;status=review"><span>На ревью</span><b>1</b></a><a class="chip " href="#" aria-label="5 ключей политики проекта отличаются от умолчаний" data-target="/projects/snip-portal?tab=policy"><span></span><b>5 ключей политики отличаются от умолчаний</b></a></div>
-<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 2">
-<p class="src" style="margin:0 0 6px">состояние 2 · ждёт вас</p>
-<div class="epic-header"><h3 style="margin:0;font-size:14px">default</h3><span class="badge badge-draft">ждёт вас: 7</span></div>
-<section class="attn " aria-label="Требует вас"><h4>Требует вас</h4><p style="margin:0 0 4px"><a class="chip chip--you chip--link" href="project-page.html" aria-label="Ждёт вас 7 — проект default" data-target="/tasks?project=default&amp;state=awaiting"><span>Ждёт вас</span><b>7</b></a> Верхние 3, полный список на вкладке «Путь и очередь»:</p><ol class="project-mini"><li><span class="t"><a href="#">#1375</a> SID: отчёты и команды CLI</span><span class="r"><b>needs_decision</b></span></li><li><span class="t"><a href="#">#1471</a> Дизайн карточки</span><span class="r"><b>приёмка макета</b></span></li><li><span class="t"><a href="#">#1466</a> Политика моделей</span><span class="r"><b>вердикт</b></span></li></ol></section>
-<div class="project-chips"><a class="chip " href="#" aria-label="В работе: 1 — проект default" data-target="/tasks?project=default&amp;state=inflight"><span>В работе</span><b>1</b></a><a class="chip " href="#" aria-label="На ревью: 2 — проект default" data-target="/tasks?project=default&amp;status=review"><span>На ревью</span><b>2</b></a><a class="chip " href="#" aria-label="7 ключей политики проекта отличаются от умолчаний" data-target="/projects/default?tab=policy"><span></span><b>7 ключей политики отличаются от умолчаний</b></a></div>
-<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 3">
-<p class="src" style="margin:0 0 6px">состояние 3 · ошибка workspace</p>
-<div class="epic-header"><h3 style="margin:0;font-size:14px">ssh-identity-doctor</h3><span class="badge badge-failed">workspace: ошибка</span></div>
-<section class="attn attn--bad" aria-label="Требует вас"><h4>Требует вас</h4><p style="margin:0 0 4px"><a class="chip chip--zero chip--link" href="project-page.html" aria-label="Ждёт вас 0 — проект ssh-identity-doctor" data-target="/tasks?project=ssh-identity-doctor&amp;state=awaiting"><span>Ждёт вас</span><b>0</b></a> по задачам. <span class="badge badge-failed">ошибка</span> Workspace не собран:</p><p class="project-note project-note--bad">git clone: Permission denied (publickey) для acme/ssh-identity-doctor</p><a class="btn btn-primary btn-sm" href="#">Проверить workspace</a></section>
-<div class="project-chips"><a class="chip chip--zero" href="#" aria-label="В работе: 0 — проект ssh-identity-doctor" data-target="/tasks?project=ssh-identity-doctor&amp;state=inflight"><span>В работе</span><b>0</b></a><a class="chip chip--zero" href="#" aria-label="На ревью: 0 — проект ssh-identity-doctor" data-target="/tasks?project=ssh-identity-doctor&amp;status=review"><span>На ревью</span><b>0</b></a><a class="chip " href="#" aria-label="3 ключа политики проекта отличаются от умолчаний" data-target="/projects/ssh-identity-doctor?tab=policy"><span></span><b>3 ключа политики отличаются от умолчаний</b></a></div>
-<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 4">
-<p class="src" style="margin:0 0 6px">состояние 4 · ждёт активации</p>
-<div class="epic-header"><h3 style="margin:0;font-size:14px">calc-kids</h3><span class="badge badge-draft">ждёт активации</span></div>
-<section class="attn attn--info" aria-label="Требует вас"><h4>Требует вас</h4><p style="margin:0 0 4px"><a class="chip chip--you chip--link" href="project-page.html" aria-label="Ждёт вас 1 — проект calc-kids" data-target="/tasks?project=calc-kids&amp;state=awaiting"><span>Ждёт вас</span><b>1</b></a> <span class="badge badge-draft">ждёт активации</span> Проект не активирован и не попал в git-маршрутизацию.</p><button class="btn btn-success btn-sm" type="button">Активировать</button></section>
-<div class="project-chips"><a class="chip chip--zero" href="#" aria-label="В работе: 0 — проект calc-kids" data-target="/tasks?project=calc-kids&amp;state=inflight"><span>В работе</span><b>0</b></a><a class="chip chip--zero" href="#" aria-label="На ревью: 0 — проект calc-kids" data-target="/tasks?project=calc-kids&amp;status=review"><span>На ревью</span><b>0</b></a><a class="chip chip--zero chip--link" href="project-page.html" aria-label="Политика всё по умолчанию — проект calc-kids" data-target="/projects/calc-kids?tab=policy"><span>Политика</span><b>всё по умолчанию</b></a></div>
-<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 5">
-<p class="src" style="margin:0 0 6px">состояние 5 · архив: «Требует вас» и вкладка «Политика» на месте</p>
-<div class="epic-header"><h3 style="margin:0;font-size:14px">legacy-bot</h3><span class="badge badge-muted">в архиве</span></div>
-<section class="attn attn--ok" aria-label="Требует вас"><h4>Требует вас</h4><p style="margin:0"><a class="chip chip--zero chip--link" href="project-page.html" aria-label="Ждёт вас 0 — проект legacy-bot" data-target="/tasks?project=legacy-bot&amp;state=awaiting"><span>Ждёт вас</span><b>0</b></a> Проект в архиве: решений и действий нет. Вернуть его можно на вкладке «Настройки».</p></section>
-<div class="project-chips"><a class="chip chip--zero" href="#" aria-label="В работе: 0 — проект legacy-bot" data-target="/tasks?project=legacy-bot&amp;state=inflight"><span>В работе</span><b>0</b></a><a class="chip chip--zero" href="#" aria-label="На ревью: 0 — проект legacy-bot" data-target="/tasks?project=legacy-bot&amp;status=review"><span>На ревью</span><b>0</b></a><a class="chip " href="#" aria-label="2 ключа политики проекта отличаются от умолчаний" data-target="/projects/legacy-bot?tab=policy"><span></span><b>2 ключа политики отличаются от умолчаний</b></a></div>
-<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 6">
-<p class="src" style="margin:0 0 6px">состояние 6 · пусто</p>
-<div class="epic-header"><h3 style="margin:0;font-size:14px">notes-sync</h3></div>
-<section class="attn attn--ok" aria-label="Требует вас"><h4>Требует вас</h4><p style="margin:0"><a class="chip chip--zero chip--link" href="project-page.html" aria-label="Ждёт вас 0 — проект notes-sync" data-target="/tasks?project=notes-sync&amp;state=awaiting"><span>Ждёт вас</span><b>0</b></a> Решений не требуется. Живой работы нет — все эпики проекта доделаны или их ещё не завели.</p></section>
-<div class="project-chips"><a class="chip chip--zero" href="#" aria-label="В работе: 0 — проект notes-sync" data-target="/tasks?project=notes-sync&amp;state=inflight"><span>В работе</span><b>0</b></a><a class="chip chip--zero" href="#" aria-label="На ревью: 0 — проект notes-sync" data-target="/tasks?project=notes-sync&amp;status=review"><span>На ревью</span><b>0</b></a><a class="chip chip--zero chip--link" href="project-page.html" aria-label="Политика всё по умолчанию — проект notes-sync" data-target="/projects/notes-sync?tab=policy"><span>Политика</span><b>всё по умолчанию</b></a></div>
-<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article>
-</section>
+
 </div></div>
 </body>
 </html>
