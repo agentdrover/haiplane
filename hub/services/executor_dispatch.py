@@ -1428,12 +1428,12 @@ async def settle_answer_debts(
     на ответ и при многих тиках, и после перезапуска хаба: его закрывает
     событие «решено», а долг видит только needs_info.
     """
-    where, args = ("AND e.task_id=?", (task_id,)) if task_id else ("", ())
     rows = await fetchall(
         db,
         "SELECT DISTINCT e.task_id FROM events e JOIN tasks t ON t.id=e.task_id "
-        f"WHERE e.kind=? AND t.status='needs_info' AND t.archived=0 {where}",
-        (EVENT_CONTINUATION_WANTED, *args),
+        "WHERE e.kind=? AND t.status='needs_info' AND t.archived=0 "
+        "AND (? IS NULL OR e.task_id=?)",
+        (EVENT_CONTINUATION_WANTED, task_id, task_id),
     )
     handled = 0
     for r in rows:
