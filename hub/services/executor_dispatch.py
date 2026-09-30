@@ -1254,6 +1254,8 @@ async def answer_for_executor(
     Зовётся после записи ответа. Задача без строки прогона и задача, чей
     последний прогон не связан с вопросом, — False: прежний путь ответа.
     """
+    if not await _executor_holds(db, task):
+        return False  # чужой держатель ведёт задачу сам: прежний путь resume
     task_id = int(task["id"])
     runs = [dict(r) for r in await repo.list_executor_runs(db, task_id)]
     question = await _last_update(db, task_id, "question")
@@ -1322,8 +1324,20 @@ async def _name_commits_after_question(
         return
     asked = await _asked_payload(db, int(task["id"]), str(question["created_at"]))
     asked_tip = str(asked.get("tip") or "")
-    tip = (await _branch_tip(db, int(task["id"]), branch))[0]
-    if not tip or tip == asked_tip:
+    tip, unread = await _branch_tip(db, int(task["id"]), branch)
+    if not tip:
+        # Пустая вершина — «не смогли посмотреть», а не «коммитов нет».
+        await repo.add_task_update(
+            db,
+            int(task["id"]),
+            "hub",
+            "alert",
+            f"Не удалось прочитать вершину ветки {branch} на ответе: {unread}. "
+            "Коммиты после вопроса не проверены — работа могла быть сделана до "
+            "ответа; продолжение обязано сверить ветку (#1458).",
+        )
+        return
+    if tip == asked_tip:
         return
     try:
         commits = await _branch_commits(db, task, branch, asked_tip)

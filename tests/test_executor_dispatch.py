@@ -3166,3 +3166,46 @@ async def test_commits_are_named_by_tip_when_the_log_cannot_be_read(db, monkeypa
     named = [a for a in await _alerts(db, task_id) if "сделано до ответа" in a]
     assert len(named) == 1 and _LATE_TIP in named[0]
     assert "не прочитан" in named[0]
+
+
+async def test_a_local_holders_answer_keeps_the_old_resume(db, monkeypatch):
+    """Находка fc7a4b2bd547c510: задачу держит локальная сессия, облачный
+    прогон закончился после вопроса — ответ идёт прежним resume, хаб его не
+    перехватывает и продолжения не заказывает."""
+    task_id, _, _ = await _silent_task(db, monkeypatch, slug="q-local-answer")
+    calls = _creator(monkeypatch, [_CREATED])
+    await repo.update_task(db, task_id, claimed_by="local_dev")
+    _silent_provider(monkeypatch, {"run-1": "RUNNING"})
+    await _ask_q(db, task_id)
+    _silent_provider(monkeypatch, {"run-1": "FINISHED"})
+    await _sweeps(db, 2)
+
+    view = await _answer_q(db, task_id)
+    await _sweeps(db, 3)
+
+    assert view.status == "running", "прежний resume: pair-задача с веткой"
+    assert calls == []
+    assert await _decision_reasons(db, task_id) == []
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM events WHERE task_id=? AND kind='executor_continuation_wanted'",
+        (task_id,),
+    )
+    assert list(rows) == []
+
+
+async def test_an_unreadable_tip_is_named_not_silent(db, monkeypatch):
+    """Находка 2471279e860ca548: вершину на ответе прочитать не удалось —
+    alert с причиной; «коммитов нет» (вершина не сдвинулась) молчит."""
+    task_id, _, branch = await _silent_task(
+        db, monkeypatch, slug="q-unread", tip=_ASKED_TIP
+    )
+    _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    _creator(monkeypatch, [_CREATED])
+    await _ask_q(db, task_id)
+    _forge(monkeypatch, {"develop": _BASE_TIP}, {})
+
+    await _answer_q(db, task_id)
+
+    alerts = [a for a in await _alerts(db, task_id) if "не проверены" in a]
+    assert len(alerts) == 1, alerts
+    assert "network down" in alerts[0] and branch in alerts[0]
