@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Дашборд проектов — макет (#1471)</title>
+<!--
+  Статичный макет дашборда /projects (уровень 1). Один файл, без сервера, без внешних зависимостей, без JS.
+  Спека: docs/specs/project-card-ux.md. Страница проекта /projects/{slug}: docs/specs/mockups/project-page.html.
+  Числа, названия задач и проектов ВЫДУМАНЫ. Имена полей настоящие и подписаны в спеке §5.
+  Раздел «СУЩЕСТВУЮЩИЕ» повторяет правила из hub/static/style.css под теми же именами; «НОВОЕ» вводит вёрстка (#1472).
+  Правило макета: в каждом состоянии присутствуют все пять блоков (Требует вас, Здоровье, Работа, Расход, Политика).
+-->
+<style>
+:root{
+  --bg:#0c0e14;--surface:#171a24;--surface-hover:#1e2130;--surface-active:#252838;
+  --border:#252838;--border-subtle:#1e2130;
+  --text:#e4e7f0;--text-secondary:#a0a5b8;--text-muted:#6b7084;
+  /* Два цвета сигнала, больше цветов в статусах нет (спека §7):
+     акцент = «требует вас / ваш шаг» (существующий токен --orange), сигнал = «ошибка, авария» (новый --signal). */
+  --orange:#f39c12;            /* 7,92:1 на --surface, существующий токен хаба */
+  --signal:#ff6b5b;            /* 6,21:1 на --surface; НОВЫЙ токен вместо --red #e74c3c (4,54:1) */
+  --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;--sp-6:24px;
+  --radius:8px;--radius-sm:6px;
+  --font:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;--mono:"SF Mono","JetBrains Mono",monospace;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{background:var(--bg)}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 var(--font)}
+/* Ссылки нейтральные: цвет текста и тонкое подчёркивание, а не ещё один цвет */
+a{color:var(--text);text-decoration:underline;text-decoration-color:var(--text-muted);text-underline-offset:3px}
+a:hover{text-decoration-color:var(--text)}
+a.chip,a.btn,.tabs a,.project-seg a,.epic-title{text-decoration:none}
+a:focus-visible,summary:focus-visible,select:focus-visible,input:focus-visible,button:focus-visible,label:focus-visible,textarea:focus-visible{outline:2px solid var(--text);outline-offset:2px}
+code{font-family:var(--mono);font-size:.92em;background:var(--surface-hover);padding:0 4px;border-radius:4px;overflow-wrap:anywhere}
+h1{font-size:20px;margin:0}h2{font-size:16px;margin:0 0 4px}h3{font-size:12px;margin:0}h4{font-size:13px;margin:0 0 4px}
+.u-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.muted{color:var(--text-secondary)}
+.small{font-size:12px}
+p{margin:0 0 6px}
+b{font-weight:600}
+
+/* ---------- обвязка макета (не часть страницы) ---------- */
+.mock-bar{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--border);padding:8px 16px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center}
+.mock-bar a{margin-right:4px}
+#w375{position:absolute;opacity:0}
+.mock-bar label.tog{cursor:pointer;border:1px solid var(--text-muted);border-radius:100px;padding:2px 12px;min-height:28px}
+#w375:checked ~ .mock-bar label[for=w375]{background:var(--text);color:var(--bg)}
+#w375:focus-visible ~ .mock-bar label[for=w375]{outline:2px solid var(--text);outline-offset:2px}
+.banner{margin:12px 16px;padding:8px 12px;border:1px dashed var(--text-muted);border-radius:var(--radius);color:var(--text-secondary)}
+.stage{padding:0 16px 48px;display:flex;justify-content:center}
+.frame{container-type:inline-size;container-name:pg;width:100%;max-width:1100px}
+#w375:checked ~ .stage .frame{max-width:375px;border:1px solid var(--border);border-radius:16px;padding:0 0 8px}
+.page-tag{font:12px var(--mono);color:var(--text-secondary);margin:28px 0 8px;overflow-wrap:anywhere}
+/* пометки «какая задача наполняет блок»: обвязка макета, в готовой странице их нет */
+.ann{font:12px var(--mono);color:var(--text-secondary);border:1px dashed var(--text-muted);border-radius:4px;padding:0 6px;white-space:normal;text-transform:none;letter-spacing:0;font-weight:400}
+.src{color:var(--text-secondary);font:12px var(--mono);overflow-wrap:anywhere;min-width:0}
+
+/* ---------- СУЩЕСТВУЮЩИЕ классы (имена как в hub/static/style.css), значения ИЗМЕНЕНЫ по спеке §7 ---------- */
+.page-header{margin:8px 0 12px}
+.page-title{display:flex;align-items:center;gap:8px}
+/* бейдж: без заливки, 1 px рамка; цвет только у двух смыслов */
+.badge{display:inline-flex;align-items:center;padding:1px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.3px;line-height:1.5;white-space:nowrap;background:transparent;color:var(--text-secondary)}
+.badge--xs{font-size:9px;padding:1px 5px;letter-spacing:.2px}
+.badge-draft,.badge-needs_decision-you{border-color:var(--orange);color:var(--orange)}   /* требует вас */
+.badge-failed,.badge-needs_decision{border-color:var(--signal);color:var(--signal)}      /* ошибка, авария */
+.badge-completed,.badge-running,.badge-review,.badge-muted{border-color:var(--border);color:var(--text-secondary)}  /* нейтральные */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:8px 20px;border-radius:var(--radius);font:600 13px/1.5 var(--font);border:1px solid var(--text-muted);cursor:pointer;white-space:nowrap;min-height:36px;background:transparent;color:var(--text)}
+.btn-primary{background:var(--surface-active);border-color:var(--border);color:var(--text)}   /* нейтральная */
+.btn-success{border-color:var(--orange);color:var(--orange)}                                 /* действие владельца: «Одобрить», «Активировать» */
+.btn-ghost{border-color:var(--border);color:var(--text-secondary)}
+.btn-ghost:hover,.btn-primary:hover{background:var(--surface-hover);color:var(--text)}
+.btn-sm{padding:4px 12px;font-size:12px}
+.btn-xs{padding:3px 12px;font-size:11px;border-radius:var(--radius-sm);min-height:32px}
+.btn[disabled]{cursor:not-allowed;color:var(--text-secondary);border:1px dashed var(--border);background:transparent}
+.topbar-stats{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
+.topbar-stat{display:inline-flex;align-items:center;gap:8px;padding:4px 10px;border-radius:var(--radius);background:transparent;border:1px solid var(--border);white-space:nowrap;min-height:32px;color:var(--text)}
+.topbar-stat-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;color:var(--text-secondary)}
+.topbar-stat-value{font-size:13px;font-weight:700;font-variant-numeric:tabular-nums;min-width:14px;text-align:center}
+.project-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:12px;margin-bottom:20px}
+.project-cards>*{min-width:0}
+.project-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:var(--sp-4)}
+.project-card--archived{background:transparent}
+.epic-header{display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap;min-width:0}
+.epic-title{font-size:14px;font-weight:600}
+.epic-children{display:flex;flex-direction:column;gap:4px;min-width:0}
+.epic-child-link{font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:8px;padding:4px 0;min-width:0;text-decoration:none}
+.epic-child-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.epic-empty{font-size:12px;color:var(--text-secondary);padding:4px 0}
+.project-admin-facts{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:8px 0;font-size:13px}
+.project-admin-facts dt{color:var(--text-secondary)}
+.project-admin-facts dd{margin:0;overflow-wrap:anywhere}
+.project-admin-note{display:block;color:var(--text-secondary);font-size:12px}
+.project-admin-actions{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+.project-archive-summary{cursor:pointer;display:flex;align-items:center;min-height:44px;font-size:14px;color:var(--text-secondary)}
+.task-action-label{display:block;font-size:12px;color:var(--text-secondary);margin:8px 0 2px}
+.task-action-control{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;min-height:36px;font:inherit}
+
+/* ---------- НОВОЕ (префикс project-) ---------- */
+.project-card-meta{margin:0 0 8px;font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere}
+.project-row{display:grid;grid-template-columns:132px minmax(0,1fr);gap:4px 12px;padding:8px 0;border-top:1px solid var(--border-subtle)}
+.project-row>h3{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--text-secondary);padding-top:6px}
+.project-row>div{min-width:0}
+.project-chips{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center}
+/* чип: нейтральный, 1 px. Цвет: chip--you (акцент, только если N > 0) и chip--bad (сигнал, только ошибка) */
+.chip{display:inline-flex;align-items:center;gap:6px;min-height:32px;padding:2px 10px;border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text);background:transparent;white-space:nowrap;max-width:100%}
+a.chip:hover{border-color:var(--text-muted);background:var(--surface-hover)}
+.chip b{font-variant-numeric:tabular-nums}
+.chip--long,.chip--bad,.chip--warn,.chip--ok{white-space:normal;flex-wrap:wrap;text-align:left}
+.chip--you{border-color:var(--orange);color:var(--orange)}.chip--you b{color:var(--orange)}
+.chip--bad,.chip--warn{border-color:var(--signal)}.chip--bad .w,.chip--warn .w{color:var(--signal);font-weight:700}
+.chip--ok .w,.chip--lock .w{color:var(--text-secondary);font-weight:400}
+.chip--zero{border-style:dashed}.chip--zero b{color:var(--text-secondary)}
+.chip--link{margin-right:2px}
+.project-mini{list-style:none;margin:6px 0 0;padding:0;display:grid;gap:4px;font-size:13px}
+.project-mini li{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 8px;align-items:baseline}
+.project-mini .t{min-width:0;overflow-wrap:anywhere}
+.project-mini .r{font-size:12px;color:var(--text-secondary)}
+.project-mini .r b{color:var(--text);font-weight:600}
+.project-more{font-size:12px;margin:4px 0 0}
+/* оговорка: тихая, без заливки; полоска 2 px только у ошибки */
+.project-note{border-left:1px solid var(--text-muted);padding:0 0 0 8px;font-size:12px;margin:6px 0;color:var(--text-secondary)}
+.project-note--bad{border-left:2px solid var(--signal);color:var(--text)}
+.project-note--info{border-left-color:var(--text-muted)}
+.project-seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.project-seg a{padding:6px 10px;min-height:36px;display:inline-flex;align-items:center;color:var(--text-secondary);border-right:1px solid var(--border)}
+.project-seg a:last-child{border-right:0}
+.project-seg a[aria-current=true]{background:var(--surface-active);color:var(--text);font-weight:600}
+.project-toolbar{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;margin:0 0 6px}
+.project-empty{border:1px dashed var(--border);border-radius:var(--radius);padding:10px;color:var(--text-secondary);font-size:13px}
+.project-empty b{color:var(--text)}
+.project-delta{font-size:12px;color:var(--text-secondary)}
+.project-search{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;margin:0 0 6px}
+.project-search input{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;min-height:36px;font:inherit;flex:1 1 140px;min-width:0}
+
+@container pg (max-width:760px){
+  .project-cards{grid-template-columns:minmax(0,1fr)}
+}
+@container pg (max-width:480px){
+  .project-row{grid-template-columns:1fr}
+  .project-row>h3{padding-top:0}
+  .project-mini li{grid-template-columns:1fr}
+  .chip,.topbar-stat{min-height:44px}
+  .btn,.btn-xs,.btn-sm{min-height:44px}
+  .project-seg{width:100%}.project-seg a{flex:1;justify-content:center;min-height:44px}
+  .project-search input{min-height:44px}
+  .project-admin-actions .btn{flex:1 1 100%}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+
+</style>
+</head>
+<body>
+<input type="checkbox" id="w375" aria-label="Показать в рамке 375 px">
+<div class="mock-bar">
+  <strong>Макет дашборда проектов #1471</strong>
+  <span><a href="#c-default">2. Ждёт вас</a> <a href="#c-calc">4. Ждёт активации</a> <a href="#c-ssh">3. Ошибка workspace</a> <a href="#c-snip">1. Норма</a> <a href="#c-notes">6. Пусто</a> <a href="#c-arch">5. Архив</a> <a href="#s-edge">Крайние случаи</a> <a href="project-page.html">Страница проекта →</a></span>
+  <label class="tog" for="w375">Вариант 375 px (вкл/выкл)</label>
+</div>
+<div class="banner"><strong>Макет, не данные.</strong> Числа, названия задач и проектов выдуманы. Цвет только у двух смыслов: акцент (оранжевый) у «требует вас» и сигнал (красный) у ошибки, остальное нейтральное. Порядок карточек: сначала «требует вас», затем ошибки, затем остальные по последней работе; архив свёрнут в конце. Клик по названию ведёт на страницу проекта (<code>/projects/{slug}</code>), в макете это ссылка на файл <a href="project-page.html">project-page.html</a>. Дельт на дашборде нет. Кнопок одобрения на дашборде нет: строки ведут на задачу и на страницу проекта, кнопки живут в очереди страницы (<span class="ann">#1465</span>).</div>
+
+<div class="stage"><div class="frame">
+
+<header class="page-header">
+  <h1 class="page-title">Проекты <span class="badge badge-muted">7</span></h1>
+  <p class="muted small">Порядок: сначала проекты, которые требуют вас, потом с ошибками, потом остальные по последней работе.</p>
+  <div class="project-toolbar">
+    <span id="per-l" class="muted small">Период</span>
+    <nav class="project-seg" aria-labelledby="per-l"><a href="#c-default">7 дн.</a><a href="#c-default" aria-current="true">30 дн.</a></nav>
+  </div>
+  <p class="project-note">Период меняет только «Доставлено» и «Расход». «Требует вас», «Здоровье», «В работе» и «На ревью» показывают состояние сейчас, а не за период.</p>
+</header>
+
+<section class="project-cards" aria-label="Живые проекты">
+
+<article class="project-card" aria-labelledby="t-default" id="c-default">
+  <p class="src" style="margin:0 0 6px">состояние 2 · ждёт вас · ярус 1 (требует вас)</p>
+  <div class="epic-header"><h2 style="margin:0"><a href="project-page.html" class="epic-title" id="t-default">default</a></h2><span class="badge badge-draft">ждёт вас: 7</span></div>
+  <p class="project-card-meta">default · github · agentdrover/haiplane · ветка develop</p>
+  <section class="project-row" aria-labelledby="r-default"><h3 id="r-default">Требует вас</h3><div><p class="project-attn-head" style="margin:0 0 4px"><a class="chip chip--you" href="project-page.html" data-target="/tasks?project=default&amp;state=awaiting" aria-label="Ждёт вашего решения: 7 — проект default"><span>Ждёт вас</span><b>7</b></a> Верхние 3 (порядок: needs_decision, приёмка, вердикт, одобрение):</p>
+<ol class="project-mini" aria-label="Три верхние задачи, ждущие решения, проект default">
+<li><span class="t"><a href="#">#1375</a> SID D: отчёты и команды CLI</span><span class="r"><b>needs_decision</b>: прогон остановлен</span></li>
+<li><span class="t"><a href="#">#1471</a> Дизайн карточки и страницы проекта</span><span class="r"><b>приёмка макета</b></span></li>
+<li><span class="t"><a href="#">#1466</a> Политика моделей проекта</span><span class="r"><b>вердикт</b> ревью</span></li></ol>
+<p class="project-more"><a href="project-page.html">Ещё 4 на странице проекта →</a></p></div></section>
+  <section class="project-row" aria-labelledby="h-default"><h3 id="h-default">Здоровье</h3><div><div class="project-chips"><a class="chip chip--warn chip--link" href="project-page.html" aria-label="релиз: авария 7511344, сегодня — проект default" data-target="/projects/default?tab=work"><span class="w">релиз: авария</span><span>7511344, сегодня</span></a></div><p class="muted small" style="margin:4px 0 0">Последний релиз в статусе failed. Workspace исправен, брошенных слотов нет.</p></div></section>
+  <section class="project-row" aria-labelledby="w-default"><h3 id="w-default">Работа</h3><div><div class="project-chips"><a class="chip " href="project-page.html" aria-label="В работе: 1 — проект default" data-target="/tasks?project=default&amp;state=inflight"><span>В работе</span><b>1</b></a><a class="chip " href="project-page.html" aria-label="На ревью: 2 — проект default" data-target="/tasks?project=default&amp;status=review"><span>На ревью</span><b>2</b></a><a class="chip " href="project-page.html" aria-label="Доставлено за 30 дн.: 23 — проект default, за период 30 дн." data-target="/tasks?project=default&amp;status=completed"><span>Доставлено за 30 дн.</span><b>23</b></a></div></div></section>
+  <section class="project-row" aria-labelledby="s-default"><h3 id="s-default">Расход</h3><div><p style="margin:0"><b>4 120 ¢</b> за 30 дн. · 14 прогонов, из них без счёта 2: их цена неизвестна, это не ноль</p></div></section>
+  <section class="project-row" aria-labelledby="p-default"><h3 id="p-default">Политика</h3><div><a class="chip chip--long chip--lock" href="project-page.html" data-target="?tab=policy" aria-label="7 ключей политики проекта default отличаются от умолчаний"><b>7</b> <span>ключей политики отличаются от умолчаний</span> <span class="w">замок #743</span></a></div></section>
+</article>
+<article class="project-card" aria-labelledby="t-calc" id="c-calc">
+  <p class="src" style="margin:0 0 6px">состояние 4 · ждёт активации · ярус 1 (требует вас)</p>
+  <div class="epic-header"><h2 style="margin:0"><a href="project-page.html" class="epic-title" id="t-calc">calc-kids</a></h2><span class="badge badge-draft">ждёт активации</span></div>
+  <p class="project-card-meta">calc-kids · github · acme/calc-kids · ветка develop</p>
+  <section class="project-row" aria-labelledby="r-calc"><h3 id="r-calc">Требует вас</h3><div><p style="margin:0 0 4px"><a class="chip chip--you" href="project-page.html" data-target="/tasks?project=calc-kids&amp;state=awaiting" aria-label="Ждёт вашего решения: 1 — проект calc-kids"><span>Ждёт вас</span><b>1</b></a></p>
+<ol class="project-mini"><li><span class="t">Проект создан, но не активирован: в git-маршрутизацию он не попал</span><span class="r"><b>активация</b></span></li></ol>
+<p class="project-more"><a href="project-page.html">Активировать на странице проекта →</a></p></div></section>
+  <section class="project-row" aria-labelledby="h-calc"><h3 id="h-calc">Здоровье</h3><div><a class="chip chip--ok chip--long chip--link" href="project-page.html" aria-label="замечаний нет — проект calc-kids" style="margin:0" data-target="/projects/calc-kids?tab=work"><span class="w">замечаний нет</span></a><span class="muted small"> Workspace исправен, последний релиз прошёл, брошенных слотов нет.</span></div></section>
+  <section class="project-row" aria-labelledby="w-calc"><h3 id="w-calc">Работа</h3><div><div class="project-chips"><a class="chip  chip--zero" href="project-page.html" aria-label="В работе: 0 — проект calc-kids" data-target="/tasks?project=calc-kids&amp;state=inflight"><span>В работе</span><b>0</b></a><a class="chip  chip--zero" href="project-page.html" aria-label="На ревью: 0 — проект calc-kids" data-target="/tasks?project=calc-kids&amp;status=review"><span>На ревью</span><b>0</b></a><a class="chip  chip--zero" href="project-page.html" aria-label="Доставлено за 30 дн.: 0 — проект calc-kids, за период 30 дн." data-target="/tasks?project=calc-kids&amp;status=completed"><span>Доставлено за 30 дн.</span><b>0</b></a></div></div></section>
+  <section class="project-row" aria-labelledby="s-calc"><h3 id="s-calc">Расход</h3><div><p style="margin:0"><b>0 ¢</b> за 30 дн. · 0 прогонов: до активации прогонов не будет</p></div></section>
+  <section class="project-row" aria-labelledby="p-calc"><h3 id="p-calc">Политика</h3><div><a class="chip chip--zero chip--long" href="project-page.html" aria-label="Политика проекта calc-kids: все ключи по умолчанию" data-target="/projects/calc-kids?tab=policy">политика: всё по умолчанию</a></div></section>
+</article>
+<article class="project-card" aria-labelledby="t-ssh" id="c-ssh">
+  <p class="src" style="margin:0 0 6px">состояние 3 · ошибка workspace · ярус 2 (ошибки)</p>
+  <div class="epic-header"><h2 style="margin:0"><a href="project-page.html" class="epic-title" id="t-ssh">ssh-identity-doctor</a></h2><span class="badge badge-failed">workspace: ошибка</span></div>
+  <p class="project-card-meta">ssh-identity-doctor · github · acme/ssh-identity-doctor · ветка main</p>
+  <section class="project-row" aria-labelledby="r-ssh"><h3 id="r-ssh">Требует вас</h3><div><p style="margin:0"><a class="chip chip--zero" href="project-page.html" data-target="/tasks?project=ssh-identity-doctor&amp;state=awaiting" aria-label="Ждёт вашего решения: 0 — проект ssh-identity-doctor"><span>Ждёт вас</span><b>0</b></a> Решений по задачам не требуется.</p></div></section>
+  <section class="project-row" aria-labelledby="h-ssh"><h3 id="h-ssh">Здоровье</h3><div><div class="project-chips"><a class="chip chip--bad chip--link" href="project-page.html" aria-label="workspace: ошибка — проект ssh-identity-doctor" data-target="/projects/ssh-identity-doctor?tab=work"><span class="w">workspace: ошибка</span></a></div><p class="project-note project-note--bad" style="margin-top:6px">git clone: Permission denied (publickey) для acme/ssh-identity-doctor</p><p class="muted small" style="margin:0">Причина из <code>provision_detail</code>; нет записи: «причина не записана». Исправляется на странице проекта: «Проверить workspace».</p></div></section>
+  <section class="project-row" aria-labelledby="w-ssh"><h3 id="w-ssh">Работа</h3><div><div class="project-chips"><a class="chip  chip--zero" href="project-page.html" aria-label="В работе: 0 — проект ssh-identity-doctor" data-target="/tasks?project=ssh-identity-doctor&amp;state=inflight"><span>В работе</span><b>0</b></a><a class="chip  chip--zero" href="project-page.html" aria-label="На ревью: 0 — проект ssh-identity-doctor" data-target="/tasks?project=ssh-identity-doctor&amp;status=review"><span>На ревью</span><b>0</b></a><a class="chip " href="project-page.html" aria-label="Доставлено за 30 дн.: 3 — проект ssh-identity-doctor, за период 30 дн." data-target="/tasks?project=ssh-identity-doctor&amp;status=completed"><span>Доставлено за 30 дн.</span><b>3</b></a></div></div></section>
+  <section class="project-row" aria-labelledby="s-ssh"><h3 id="s-ssh">Расход</h3><div><p style="margin:0"><b>0 ¢</b> за 30 дн. · 0 прогонов</p></div></section>
+  <section class="project-row" aria-labelledby="p-ssh"><h3 id="p-ssh">Политика</h3><div><a class="chip chip--long " href="project-page.html" data-target="?tab=policy" aria-label="3 ключа политики проекта ssh-identity-doctor отличаются от умолчаний"><b>3</b> <span>ключа политики отличаются от умолчаний</span></a></div></section>
+</article>
+<article class="project-card" aria-labelledby="t-snip" id="c-snip">
+  <p class="src" style="margin:0 0 6px">состояние 1 · норма · ярус 3 (остальные по последней работе)</p>
+  <div class="epic-header"><h2 style="margin:0"><a href="project-page.html" class="epic-title" id="t-snip">snip-portal</a></h2></div>
+  <p class="project-card-meta">snip-portal · github · agentdrover/snip-portal · ветка develop</p>
+  <section class="project-row" aria-labelledby="r-snip"><h3 id="r-snip">Требует вас</h3><div><p style="margin:0"><a class="chip chip--zero" href="project-page.html" data-target="/tasks?project=snip-portal&amp;state=awaiting" aria-label="Ждёт вашего решения: 0 — проект snip-portal"><span>Ждёт вас</span><b>0</b></a> Решений не требуется.</p></div></section>
+  <section class="project-row" aria-labelledby="h-snip"><h3 id="h-snip">Здоровье</h3><div><a class="chip chip--ok chip--long chip--link" href="project-page.html" aria-label="замечаний нет — проект snip-portal" style="margin:0" data-target="/projects/snip-portal?tab=work"><span class="w">замечаний нет</span></a><span class="muted small"> Workspace исправен, последний релиз прошёл, брошенных слотов нет.</span></div></section>
+  <section class="project-row" aria-labelledby="w-snip"><h3 id="w-snip">Работа</h3><div><div class="project-chips"><a class="chip " href="project-page.html" aria-label="В работе: 2 — проект snip-portal" data-target="/tasks?project=snip-portal&amp;state=inflight"><span>В работе</span><b>2</b></a><a class="chip " href="project-page.html" aria-label="На ревью: 1 — проект snip-portal" data-target="/tasks?project=snip-portal&amp;status=review"><span>На ревью</span><b>1</b></a><a class="chip " href="project-page.html" aria-label="Доставлено за 30 дн.: 9 — проект snip-portal, за период 30 дн." data-target="/tasks?project=snip-portal&amp;status=completed"><span>Доставлено за 30 дн.</span><b>9</b></a></div></div></section>
+  <section class="project-row" aria-labelledby="s-snip"><h3 id="s-snip">Расход</h3><div><p style="margin:0"><b>1 860 ¢</b> за 30 дн. · 12 прогонов, все со счётом</p></div></section>
+  <section class="project-row" aria-labelledby="p-snip"><h3 id="p-snip">Политика</h3><div><a class="chip chip--long " href="project-page.html" data-target="?tab=policy" aria-label="5 ключей политики проекта snip-portal отличаются от умолчаний"><b>5</b> <span>ключей политики отличаются от умолчаний</span></a></div></section>
+</article>
+<article class="project-card" aria-labelledby="t-notes" id="c-notes">
+  <p class="src" style="margin:0 0 6px">состояние 6 · пусто · ярус 3, последний по активности</p>
+  <div class="epic-header"><h2 style="margin:0"><a href="project-page.html" class="epic-title" id="t-notes">notes-sync</a></h2></div>
+  <p class="project-card-meta">notes-sync · github · acme/notes-sync · ветка develop</p>
+  <section class="project-row" aria-labelledby="r-notes"><h3 id="r-notes">Требует вас</h3><div><p style="margin:0"><a class="chip chip--zero" href="project-page.html" data-target="/tasks?project=notes-sync&amp;state=awaiting" aria-label="Ждёт вашего решения: 0 — проект notes-sync"><span>Ждёт вас</span><b>0</b></a> Решений не требуется.</p></div></section>
+  <section class="project-row" aria-labelledby="h-notes"><h3 id="h-notes">Здоровье</h3><div><a class="chip chip--ok chip--long chip--link" href="project-page.html" aria-label="замечаний нет — проект notes-sync" style="margin:0" data-target="/projects/notes-sync?tab=work"><span class="w">замечаний нет</span></a><span class="muted small"> Workspace исправен, последний релиз прошёл, брошенных слотов нет.</span></div></section>
+  <section class="project-row" aria-labelledby="w-notes"><h3 id="w-notes">Работа</h3><div><div class="project-chips"><a class="chip  chip--zero" href="project-page.html" aria-label="В работе: 0 — проект notes-sync" data-target="/tasks?project=notes-sync&amp;state=inflight"><span>В работе</span><b>0</b></a><a class="chip  chip--zero" href="project-page.html" aria-label="На ревью: 0 — проект notes-sync" data-target="/tasks?project=notes-sync&amp;status=review"><span>На ревью</span><b>0</b></a><a class="chip  chip--zero" href="project-page.html" aria-label="Доставлено за 30 дн.: 0 — проект notes-sync, за период 30 дн." data-target="/tasks?project=notes-sync&amp;status=completed"><span>Доставлено за 30 дн.</span><b>0</b></a></div><div class="epic-empty">Живой работы нет — все эпики проекта доделаны или их ещё не завели</div></div></section>
+  <section class="project-row" aria-labelledby="s-notes"><h3 id="s-notes">Расход</h3><div><p style="margin:0"><b>0 ¢</b> за 30 дн. · 0 прогонов: расхода нет</p></div></section>
+  <section class="project-row" aria-labelledby="p-notes"><h3 id="p-notes">Политика</h3><div><a class="chip chip--zero chip--long" href="project-page.html" aria-label="Политика проекта notes-sync: все ключи по умолчанию" data-target="/projects/notes-sync?tab=policy">политика: всё по умолчанию</a></div></section>
+</article>
+</section>
+
+<details class="project-archive" open>
+  <summary class="project-archive-summary">Архив (1)</summary>
+  <section class="project-cards" aria-label="Проекты в архиве">
+
+<article class="project-card project-card--archived" aria-labelledby="t-arch" id="c-arch">
+  <p class="src" style="margin:0 0 6px">состояние 5 · архив · свёрнутая группа под живыми проектами, все пять блоков на месте</p>
+  <div class="epic-header"><h2 style="margin:0"><a href="project-page.html" class="epic-title" id="t-arch">legacy-bot</a></h2><span class="badge badge-muted">в архиве</span></div>
+  <p class="project-card-meta">legacy-bot · github · acme/legacy-bot · ветка master</p>
+  <section class="project-row" aria-labelledby="r-arch"><h3 id="r-arch">Требует вас</h3><div><p style="margin:0"><a class="chip chip--zero" href="project-page.html" data-target="/tasks?project=legacy-bot&amp;state=awaiting" aria-label="Ждёт вашего решения: 0 — проект legacy-bot"><span>Ждёт вас</span><b>0</b></a> Проект в архиве: решений и действий нет.</p></div></section>
+  <section class="project-row" aria-labelledby="h-arch"><h3 id="h-arch">Здоровье</h3><div><a class="chip chip--ok chip--long chip--link" href="project-page.html" aria-label="замечаний нет — проект legacy-bot" style="margin:0" data-target="/projects/legacy-bot?tab=work"><span class="w">замечаний нет</span></a><span class="muted small"> Workspace исправен, последний релиз прошёл, брошенных слотов нет.</span></div></section>
+  <section class="project-row" aria-labelledby="w-arch"><h3 id="w-arch">Работа</h3><div><div class="project-chips"><a class="chip  chip--zero" href="project-page.html" aria-label="В работе: 0 — проект legacy-bot" data-target="/tasks?project=legacy-bot&amp;state=inflight"><span>В работе</span><b>0</b></a><a class="chip  chip--zero" href="project-page.html" aria-label="На ревью: 0 — проект legacy-bot" data-target="/tasks?project=legacy-bot&amp;status=review"><span>На ревью</span><b>0</b></a><a class="chip  chip--zero" href="project-page.html" aria-label="Доставлено за 30 дн.: 0 — проект legacy-bot, за период 30 дн." data-target="/tasks?project=legacy-bot&amp;status=completed"><span>Доставлено за 30 дн.</span><b>0</b></a></div></div></section>
+  <section class="project-row" aria-labelledby="s-arch"><h3 id="s-arch">Расход</h3><div><p style="margin:0"><b>0 ¢</b> за 30 дн. · 0 прогонов</p></div></section>
+  <section class="project-row" aria-labelledby="p-arch"><h3 id="p-arch">Политика</h3><div><a class="chip chip--long " href="project-page.html" data-target="?tab=policy" aria-label="2 ключа политики проекта legacy-bot отличаются от умолчаний"><b>2</b> <span>ключа политики отличаются от умолчаний</span></a></div></section>
+</article>
+  </section>
+</details>
+
+<p class="page-tag" id="s-edge">крайние случаи карточки (не отдельные состояния)</p>
+<section class="project-cards" aria-label="Крайние случаи">
+
+<article class="project-card" aria-labelledby="t-e1" id="c-e1">
+  <p class="src" style="margin:0 0 6px">крайний случай · брошенный слот и несколько замечаний · ярус 2</p>
+  <div class="epic-header"><h2 style="margin:0"><a href="project-page.html" class="epic-title" id="t-e1">export-svc</a></h2><span class="badge badge-failed">2 замечания</span></div>
+  <p class="project-card-meta">export-svc · github · acme/export-svc · ветка develop</p>
+  <section class="project-row" aria-labelledby="r-e1"><h3 id="r-e1">Требует вас</h3><div><p style="margin:0"><a class="chip chip--zero" href="project-page.html" data-target="/tasks?project=export-svc&amp;state=awaiting" aria-label="Ждёт вашего решения: 0 — проект export-svc"><span>Ждёт вас</span><b>0</b></a> Решений по задачам не требуется.</p></div></section>
+  <section class="project-row" aria-labelledby="h-e1"><h3 id="h-e1">Здоровье</h3><div><div class="project-chips"><a class="chip chip--bad chip--link" href="project-page.html" aria-label="слот брошен slot-3, #1455 — проект export-svc" data-target="/projects/export-svc?tab=work"><span class="w">слот брошен</span><span>slot-3, #1455</span></a><a class="chip chip--warn chip--link" href="project-page.html" aria-label="релиз: авария e91c0aa — проект export-svc" data-target="/projects/export-svc?tab=work"><span class="w">релиз: авария</span><span>e91c0aa</span></a></div><p class="muted small" style="margin:4px 0 0">Слот slot-3 освобождён: нет признаков жизни 60 мин. Задача остаётся в работе.</p></div></section>
+  <section class="project-row" aria-labelledby="w-e1"><h3 id="w-e1">Работа</h3><div><div class="project-chips"><a class="chip " href="project-page.html" aria-label="В работе: 1 — проект export-svc" data-target="/tasks?project=export-svc&amp;state=inflight"><span>В работе</span><b>1</b></a><a class="chip " href="project-page.html" aria-label="На ревью: 1 — проект export-svc" data-target="/tasks?project=export-svc&amp;status=review"><span>На ревью</span><b>1</b></a><a class="chip " href="project-page.html" aria-label="Доставлено за 30 дн.: 4 — проект export-svc, за период 30 дн." data-target="/tasks?project=export-svc&amp;status=completed"><span>Доставлено за 30 дн.</span><b>4</b></a></div></div></section>
+  <section class="project-row" aria-labelledby="s-e1"><h3 id="s-e1">Расход</h3><div><p style="margin:0"><b>цена неизвестна</b> за 30 дн. · 7 прогонов, счёта нет ни у одного: это не 0 ¢</p></div></section>
+  <section class="project-row" aria-labelledby="p-e1"><h3 id="p-e1">Политика</h3><div><a class="chip chip--long " href="project-page.html" data-target="?tab=policy" aria-label="1 ключ политики проекта export-svc отличается от умолчания"><b>1</b> <span>ключ политики отличается от умолчания</span></a></div></section>
+</article>
+<article class="project-card" aria-label="Крайний случай: много ждущих и порядок ярусов">
+  <h2>Ярусы порядка</h2>
+  <ol class="project-mini">
+    <li><span class="t">Ярус 1: проект ждёт вас (задачи или активация)</span><span class="r">default, calc-kids</span></li>
+    <li><span class="t">Ярус 2: нет решений, но есть ошибка (workspace, релиз, слот)</span><span class="r">ssh-identity-doctor, export-svc</span></li>
+    <li><span class="t">Ярус 3: остальные, по последней работе</span><span class="r">snip-portal, notes-sync</span></li>
+  </ol>
+  <p class="muted small">Внутри яруса: последняя работа новее выше, при равных по id. Проект без единой записи в ленте в конце яруса. Проект и с решениями, и с ошибкой стоит в ярусе 1, ошибка видна в «Здоровье» (так у default: релиз в аварии).</p>
+</article>
+</section>
+
+</div></div>
+</body>
+</html>
