@@ -3130,7 +3130,7 @@ async def test_a_stale_answer_is_not_continued(db, monkeypatch):
         kind="executor_continuation_wanted",
         task_id=task_id,
         actor="hub",
-        payload={"question_update_id": 1, "answer_update_id": 1},
+        payload={"question_update_id": 0, "answer_update_id": 0},
     )
     await db.commit()
 
