@@ -728,3 +728,45 @@ async def test_path_violation_is_recorded_on_auto_approval_too(
     assert body["status"] == "open"
     feed = [u["content"] for u in body["updates"] or []]
     assert any("tests/ghost/test_missing.py" in c for c in feed), feed
+
+
+async def test_auto_approval_never_reads_git_again_under_the_write_lock(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # #1456 (7333011cbb7923f5): запись о путях берётся из уже посчитанных
+    # проверок; второй evaluate_dor и git ls-tree под замком записи — нельзя.
+    from hub.integrations.registry import plugins
+    from hub.services import auto_approve
+
+    calls: list[str] = []
+    inside: list[int] = []
+
+    async def files_at_ref(repo_path, ref):
+        calls.append(ref)
+        return {"docs/notes.md"}
+
+    monkeypatch.setattr(plugins.git_ops, "files_at_ref", files_at_ref)
+    real = auto_approve.maybe_auto_approve
+
+    async def counted(*args, **kwargs):
+        before = len(calls)
+        result = await real(*args, **kwargs)
+        inside.append(len(calls) - before)
+        return result
+
+    monkeypatch.setattr(auto_approve, "maybe_auto_approve", counted)
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await repo.create_project(
+        db, slug="nogit", name="Nogit", workspace_path="/tmp/ws"
+    )
+    await repo.update_project(db, pid, gate_policy=json.dumps({"dor": "auto"}))
+    await db.commit()
+    task_id = await _draft_in_project(client, db, pid)
+    patch = _dor_patch(["docs/notes.md"])
+    patch["validation_commands"] = ["uv run pytest -q tests/ghost/test_missing.py"]
+    resp = await client.post(f"/api/tasks/{task_id}/refine", json=patch)
+    assert resp.status_code == 200, resp.text
+
+    assert (await client.get(f"/api/tasks/{task_id}")).json()["status"] == "open"
+    assert calls, "the readiness pass itself reads the tree"
+    assert inside == [0], f"git read inside maybe_auto_approve: {inside}"
