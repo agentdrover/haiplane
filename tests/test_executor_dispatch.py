@@ -2924,7 +2924,15 @@ async def test_a_run_finished_after_the_question_is_continued_too(db, monkeypatc
     task_id, row_id, _ = await _silent_task(db, monkeypatch, slug="q-finished")
     calls = _creator(monkeypatch, [_CREATED])
     _silent_provider(monkeypatch, {"run-1": "RUNNING"})
+
+    async def _no_pause(db, task_id):
+        """Отмена хабом не встала на вопрос: прогон дошёл до конца сам."""
+
+    monkeypatch.setattr(
+        "hub.services.executor_dispatch.pause_run_on_question", _no_pause
+    )
     await _ask_q(db, task_id)
+    assert (await _row(db, row_id))["cancel_intent"] == ""
     _silent_provider(monkeypatch, {"run-1": "FINISHED"})
     await _sweeps(db, 3)
     assert calls == [], "прогон «только сдай» на вопросе не заказывается"
