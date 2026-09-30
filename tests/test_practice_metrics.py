@@ -2744,6 +2744,18 @@ async def test_metrics_period_comparison_delta(db: aiosqlite.Connection):
     assert thin["delta"] is None and thin["direction"] is None
     assert thin["reason"] == "below_min_n"
 
+    # The floor holds for the previous window alone as well.
+    await db.execute("DELETE FROM events WHERE kind='review_verdict_recorded'")
+    await _verdict_pack(db, approved=10, changed=0, days_ago=5)
+    await _verdict_pack(db, approved=9, changed=0, days_ago=40)
+    await db.commit()
+    thin_prev = _indicator_row(
+        (await practice_metrics(db, since_days=30, compare=True))["comparison"],
+        "first_pass",
+    )
+    assert thin_prev["delta"] is None
+    assert thin_prev["reason"] == "below_min_n"
+
     # Under 5% relative change is "no change", not a move: 1.0 against 0.975.
     await db.execute("DELETE FROM events WHERE kind='review_verdict_recorded'")
     await _verdict_pack(db, approved=20, changed=0, days_ago=5)
