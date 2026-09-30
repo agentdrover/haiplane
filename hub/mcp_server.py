@@ -3700,13 +3700,8 @@ async def hub_practice_metrics(
     """Practice metrics (#384): review economics, cycle times, problem spots.
 
     Args:
-        since_days: Window in days (default 90); date_from/date_to replace it.
-        project: Project slug; empty is all projects.
-        model: REVIEWER model; "не заявлена" = reports with none recorded.
-        date_from: YYYY-MM-DD window start.
-        date_to: YYYY-MM-DD window end, inclusive.
-        compare: Add previous window, deltas and ranked problem spots.
-        series: Add key indicators per 7-day bucket.
+        model: Reviewer model ("не заявлена": none recorded).
+        compare: Add previous window, deltas, problem spots.
     """
     query: dict[str, Any] = {"since_days": since_days}
     for name, value in (

@@ -176,7 +176,7 @@ class Scope:
         """Условие «задача ``column`` принадлежит проекту»; пусто без проекта."""
         if self.project_task_ids is None:
             return "", []
-        clause = f"{column} IN (SELECT value FROM json_each(?))"
+        clause = f"{column} IN (SELECT value FROM json_each(?))"  # nosec B608 - column is a literal from the caller
         if self.project_is_default:
             clause = f"({clause} OR {column} IS NULL)"
         return clause, [self.project_task_ids]
@@ -257,7 +257,7 @@ async def project_task_ids(db: aiosqlite.Connection, slug: str) -> tuple[str, bo
     project_id = int(project["id"]) if project is not None else -1
     rows = await fetchall(
         db,
-        "WITH RECURSIVE r(id, pid) AS ("
+        "WITH RECURSIVE r(id, pid) AS ("  # nosec B608 - constant fragments
         " SELECT id, project_id FROM tasks WHERE parent_id IS NULL"
         " UNION ALL"
         " SELECT t.id, COALESCE(t.project_id, r.pid)"
