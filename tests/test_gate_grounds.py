@@ -236,3 +236,36 @@ async def test_the_repeat_is_shown_in_the_report_not_hidden(
     ], "метка только у повтора, не у соседней находки"
     by_uid = {f.finding_uid: f for f in report.machine_review.findings_confirmed}
     assert _uid(_DEFERRED) in by_uid, "uid по модели отчёта совпал с uid по сырому JSON"
+
+
+def test_the_replay_ladder_reads_the_same_repeats() -> None:
+    """``decide`` (реплей, без базы) берёт повторы из пакета: тот же предикат.
+
+    Пакет без ``deferred_repeats`` (исторический) остаётся строгим.
+    """
+    from types import SimpleNamespace
+
+    def stage(value: dict):
+        return grounds._report_stage(
+            SimpleNamespace(value=value),
+            grounds.PolicyInputs(),
+            grounds.GatePolicy(),
+            (),
+        )
+
+    base = {"confirmed": [_DEFERRED], "raw_count": 3}
+    blocked = stage(base)
+    assert blocked is not None and blocked.reason == "unclosed_finding"
+    excused = {
+        **base,
+        "deferred_repeats": {_uid(_DEFERRED): {"linked_task_id": 5, "title": "t"}},
+    }
+    assert stage(excused) is None
+
+
+async def test_a_task_deferring_to_itself_carries_nothing_away(
+    db: aiosqlite.Connection,
+) -> None:
+    task_id = await _bare_task(db)
+    await _defer(db, task_id, _DEFERRED, linked=task_id)
+    assert await grounds.deferred_repeats(db, task_id, [_DEFERRED]) == {}
