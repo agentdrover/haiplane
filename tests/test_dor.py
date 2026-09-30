@@ -520,10 +520,14 @@ async def _task_in_project(
     return task_id
 
 
-def _serve_tree(monkeypatch, tree):
+def _serve_tree(monkeypatch, tree, *, by_ref=None):
+    """git хаба отвечает деревом; ``by_ref`` различает origin/<base> и <base>."""
     from hub.integrations.registry import plugins
 
     async def files_at_ref(repo_path, ref):
+        if by_ref is not None:
+            found = by_ref.get(ref)
+            return None if found is None else set(found)
         return None if tree is None else set(tree)
 
     monkeypatch.setattr(plugins.git_ops, "files_at_ref", files_at_ref)
@@ -712,3 +716,156 @@ def test_statement_paths_policy_write_refuses_a_typo_and_flag_is_not_a_path():
         validated_gate_policy({"statement_paths": "strict"})
     assert statement_paths_of(None) == "warn"  # type: ignore[arg-type]
     assert statement_paths_in("tool -tests/a.py --out/b.json") == []
+
+
+_NOW_ABSENT = "tests/fixtures/home_basic/.ssh"
+
+
+def test_parametrized_locator_keeps_its_equals_sign_out_of_the_path():
+    # 7531fad453d1f46c: «=» внутри [..] не режет путь, файла нет — нарушение.
+    from hub.services.dor import statement_paths_in
+
+    assert statement_paths_in("tests/test_gone.py::test_x[mode=require]") == [
+        "tests/test_gone.py"
+    ]
+    assert statement_paths_in("pytest tests/test_gone.py::test_x[a=1]") == [
+        "tests/test_gone.py"
+    ]
+    assert statement_paths_in("tool --cfg=conf/a.toml FOO=conf/b.toml") == [
+        "conf/a.toml",
+        "conf/b.toml",
+    ]
+    flagged = _paths_check(
+        test_refs=[("AC-1", "tests/test_gone.py::test_x[mode=require]")]
+    )
+    assert [v.path for v in flagged.violations] == ["tests/test_gone.py"]
+
+
+def test_quoted_paths_are_unquoted_and_globs_and_vars_are_not_checked():
+    # 4bd475224fea928f
+    from hub.services.dor import statement_paths_in
+
+    assert statement_paths_in("tool --dir 'tests/with space/x.py'") == [
+        "tests/with space/x.py"
+    ]
+    assert statement_paths_in('tool "tests/q.py::t"') == ["tests/q.py"]
+    assert statement_paths_in("pytest tests/*.py $OUT/x.json tests/[ab].py") == []
+    clean = _paths_check(
+        validation_commands=["pytest tests/gone_*.py ${HOME}/x.py tests/[ab].py"]
+    )
+    assert clean.violations == ()
+
+
+def test_every_missing_path_is_named_not_only_the_first():
+    # 4af1b107574d2a05
+    result = _paths_check(
+        validation_commands=["tool --a tests/one/missing.py --b tests/two/missing.py"],
+        test_refs=[("AC-3", "tests/three/test_missing.py::t")],
+    )
+    assert [v.path for v in result.violations] == [
+        "tests/one/missing.py",
+        "tests/two/missing.py",
+        "tests/three/test_missing.py",
+    ]
+    _, item = _paths_item(result)
+    for path in (v.path for v in result.violations):
+        assert path in item.detail
+
+
+def test_areas_cover_paths_in_both_directions_like_the_queue_overlap():
+    # c208ec275249a129: каталог в областях покрывает файл, файл в областях —
+    # каталог, который он создаёт; соседний путь не покрыт.
+    def flagged(path, areas):
+        result = _paths_check(
+            validation_commands=[f"pytest {path}"], affected_areas=areas
+        )
+        return [v.path for v in result.violations]
+
+    assert flagged("tests/new_dir/test_a.py", ["tests/new_dir"]) == []
+    assert flagged("tests/new_dir/test_a.py", ["tests/new_dir/"]) == []
+    assert flagged("tests/newer/test_a.py", ["tests/newer/*"]) == []
+    assert flagged("tests/new_dir", ["tests/new_dir/test_a.py"]) == []
+    assert flagged("tests/other_dir/test_a.py", ["tests/new_dir"]) == [
+        "tests/other_dir/test_a.py"
+    ]
+    assert flagged("tests/new_dir_2/test_a.py", ["tests/new_dir"]) == [
+        "tests/new_dir_2/test_a.py"
+    ]
+
+
+async def test_path_present_on_base_is_clean_through_evaluate_dor(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # d58160b0aee5af86: путь ЕСТЬ в дереве — пункт чистый, в require не блокирует.
+    import json
+
+    _serve_tree(monkeypatch, _BASE_TREE)
+    task_id = await _task_in_project(db, "require")
+    await repo.update_task(
+        db,
+        task_id,
+        validation_commands=json.dumps(
+            [
+                "uv run pytest -q tests/test_dor.py",
+                "tool --dir tests/fixtures/home_basic",
+            ]
+        ),
+    )
+    await db.commit()
+    result = await evaluate_dor(db, task_id)
+    item = next(c for c in result.checks if c.key == "statement_paths_resolve")
+    assert item.passed is True, item.detail
+    assert result.missing_required == frozenset()
+
+
+async def test_file_only_in_origin_base_or_only_in_local_base_is_clean(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # a184406610432a1d: моку видно, какой ref спрошен. origin/<base> — первый,
+    # локальное имя — запасной.
+    import json
+
+    from hub import config
+
+    base = config.PAIR_BASE_BRANCH
+    task_id = await _task_in_project(db, "require")
+    await repo.update_task(
+        db,
+        task_id,
+        validation_commands=json.dumps(["pytest tests/only_upstream.py"]),
+    )
+    await db.commit()
+
+    async def verdict():
+        result = await evaluate_dor(db, task_id)
+        return next(c for c in result.checks if c.key == "statement_paths_resolve")
+
+    _serve_tree(
+        monkeypatch,
+        None,
+        by_ref={f"origin/{base}": {"tests/only_upstream.py"}, base: set()},
+    )
+    assert (await verdict()).passed is True
+
+    _serve_tree(
+        monkeypatch,
+        None,
+        by_ref={f"origin/{base}": None, base: {"tests/only_upstream.py"}},
+    )
+    assert (await verdict()).passed is True
+
+    _serve_tree(monkeypatch, None, by_ref={f"origin/{base}": set(), base: set()})
+    assert (await verdict()).passed is False
+
+
+async def test_project_without_clone_is_not_checked_and_does_not_block(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # ff69022154985965: пустой workspace_path — «не проверено: … клона нет».
+    _serve_tree(monkeypatch, _BASE_TREE)
+    task_id = await _task_in_project(db, "require", workspace="")
+    result = await evaluate_dor(db, task_id)
+    item = next(c for c in result.checks if c.key == "statement_paths_resolve")
+    assert item.passed is False
+    assert "не проверено" in item.detail and "клон" in item.detail
+    assert "statement_paths_resolve" not in result.missing_required

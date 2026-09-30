@@ -226,13 +226,24 @@ class StatementPathsResult:
     paths_total: int = 0
 
 
+_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
 def _path_candidate(token: str) -> str | None:
-    if "=" in token:
+    if token.startswith("-"):
+        # Only ``--opt=value`` carries a value; a bare flag is never a path.
+        if "=" not in token:
+            return None
         token = token.split("=", 1)[1]
-    token = token.split("::", 1)[0].strip()
+    elif _ENV_ASSIGN.match(token):
+        token = token.split("=", 1)[1]
+    # The path is what stands before ``::`` — a parametrized locator such as
+    # ``a.py::t[mode=require]`` keeps its ``=`` and ``[`` out of the path.
+    token = token.split("::", 1)[0].strip().strip("'\"")
     if not token or token.startswith(("-", "/", "~")) or "://" in token:
         return None
     if _SHELL_MAGIC & set(token) or ".." in token.split("/"):
+        # Glob and $VAR: not checkable statically — unknown, not a violation.
         return None
     while token.startswith("./"):
         token = token[2:]
@@ -473,6 +484,22 @@ def evaluate_from_data(
     )
 
 
+async def record_statement_paths(db, task_id: int, dor_checks) -> None:
+    """Нарушение путей постановки при одобрении — записью в карточку (#1456).
+
+    Зовётся из approve_task и из автоодобрения: в ``warn`` одобрение проходит, и
+    эта запись — единственный след. «Не проверено» не пишется: это не
+    нарушение, оно видно в таблице DoR.
+    """
+    for check in dor_checks:
+        if check.key == STATEMENT_PATHS_CHECK and check.detail.startswith(
+            STATEMENT_PATHS_MARK
+        ):
+            await repo.add_task_update(
+                db, task_id, "", "alert", f"Approve: {check.detail}"
+            )
+
+
 async def _base_tree(db, task_id: int) -> tuple[set[str] | None, str]:
     """Дерево базовой ветки проекта из локального клона и причина, если не прочитано.
 
@@ -562,6 +589,7 @@ __all__ = [
     "STATEMENT_PATHS_MARK",
     "StatementPathsResult",
     "check_statement_paths",
+    "record_statement_paths",
     "evaluate_dor",
     "evaluate_from_data",
     "statement_paths_in",

@@ -699,3 +699,32 @@ async def test_reading_a_card_never_opens_a_draft(
         "не двигает даже подходящий драфт"
     )
     assert await _approved_events(db) == [], "чтение не порождает task_approved"
+
+
+async def test_path_violation_is_recorded_on_auto_approval_too(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # #1456: warn пишет нарушение в карточку и тогда, когда одобряет автопилот,
+    # а не только через approve_task.
+    from hub.integrations.registry import plugins
+
+    async def files_at_ref(repo_path, ref):
+        return {"docs/notes.md"}
+
+    monkeypatch.setattr(plugins.git_ops, "files_at_ref", files_at_ref)
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await repo.create_project(
+        db, slug="paths", name="Paths", workspace_path="/tmp/ws"
+    )
+    await repo.update_project(db, pid, gate_policy=json.dumps({"dor": "auto"}))
+    await db.commit()
+    task_id = await _draft_in_project(client, db, pid)
+    patch = _dor_patch(["docs/notes.md"])
+    patch["validation_commands"] = ["uv run pytest -q tests/ghost/test_missing.py"]
+    resp = await client.post(f"/api/tasks/{task_id}/refine", json=patch)
+    assert resp.status_code == 200, resp.text
+    body = (await client.get(f"/api/tasks/{task_id}")).json()
+
+    assert body["status"] == "open"
+    feed = [u["content"] for u in body["updates"] or []]
+    assert any("tests/ghost/test_missing.py" in c for c in feed), feed

@@ -190,6 +190,10 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
     if not transitioned:
         return False
 
+    from hub.services.dor import evaluate_dor, record_statement_paths
+
+    await record_statement_paths(db, task_id, (await evaluate_dor(db, task_id)).checks)
+
     reasons = deserialize_str_list(row["risk_class_reasons"])
     await repo.add_task_update(
         db,
