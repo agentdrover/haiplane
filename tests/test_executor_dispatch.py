@@ -2912,6 +2912,9 @@ async def test_answer_orders_one_continuation_with_question_and_answer(db, monke
     assert rows[-1]["submission_generation"] == 1
     assert await _status(db, task_id) == "running"
     assert await _decision_reasons(db, task_id) == []
+    assert not [a for a in await _alerts(db, task_id) if "сделано до ответа" in a], (
+        "вершина не сдвинулась — коммитов после вопроса нет"
+    )
 
 
 async def test_a_run_finished_after_the_question_is_continued_too(db, monkeypatch):
@@ -3058,3 +3061,100 @@ async def test_commits_after_question_are_named(db, monkeypatch):
     await _sweeps(db, 3)
     assert len([a for a in await _alerts(db, task_id) if "сделано до ответа" in a]) == 1
     assert len(calls) == 1, "продолжение заказано и после алерта"
+
+
+async def test_a_question_of_a_foreign_holder_does_not_stop_the_run(db, monkeypatch):
+    """Задачу держит локальная сессия, а не исполнитель хаба: её вопрос
+    прогон не отменяет."""
+    task_id, row_id, _ = await _silent_task(db, monkeypatch, slug="q-foreign")
+    state = _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    await repo.update_task(db, task_id, claimed_by="local_dev")
+    await db.commit()
+
+    await _ask_q(db, task_id)
+
+    assert state["cancel_calls"] == 0
+    assert (await _row(db, row_id))["outcome"] == OUTCOME_RUNNING
+
+
+async def test_an_awaiting_answer_run_does_not_release_a_running_task(db, monkeypatch):
+    """Строка с исходом awaiting_answer не в STOPPED_OUTCOMES: задача в running
+    за ней не уходит в needs_decision (release_stopped_tasks, #1455)."""
+    from hub.services.executor_dispatch import (
+        STOPPED_OUTCOMES,
+        release_stopped_tasks,
+    )
+
+    task_id, row_id, _ = await _silent_task(db, monkeypatch, slug="q-release")
+    await repo.update_executor_run(
+        db, row_id, outcome="awaiting_answer", reason="", finish=True
+    )
+    await db.commit()
+
+    assert "awaiting_answer" not in STOPPED_OUTCOMES
+    assert await release_stopped_tasks(db) == 0
+    assert await _status(db, task_id) == "running"
+
+
+async def test_an_ordered_continuation_is_not_ordered_twice(db, monkeypatch):
+    """Долг закрыт событием: задача снова в needs_info (перезапуск, гонка) —
+    второго заказа на тот же ответ нет."""
+    task_id, _, _ = await _silent_task(db, monkeypatch, slug="q-once")
+    _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    calls = _creator(monkeypatch, [_CREATED])
+    await _ask_q(db, task_id)
+    await _answer_q(db, task_id)
+    await _sweeps(db, 2)
+    assert len(calls) == 1
+
+    last = [dict(r) for r in await repo.list_executor_runs(db, task_id)][-1]
+    await repo.update_executor_run(
+        db, last["id"], outcome="failed", reason="", finish=True
+    )
+    await repo.update_task(db, task_id, status="needs_info")
+    await db.commit()
+    await _sweeps(db, 3)
+
+    assert len(calls) == 1
+
+
+async def test_a_stale_answer_is_not_continued(db, monkeypatch):
+    """Новый вопрос позже ответа делает запись «нужно продолжение» устаревшей:
+    продолжать прошлый ответ нельзя."""
+    task_id, row_id, _ = await _silent_task(db, monkeypatch, slug="q-stale")
+    _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    calls = _creator(monkeypatch, [_CREATED])
+    await _ask_q(db, task_id)
+    await repo.insert_event(
+        db,
+        kind="executor_continuation_wanted",
+        task_id=task_id,
+        actor="hub",
+        payload={"question_update_id": 1, "answer_update_id": 1},
+    )
+    await db.commit()
+
+    await _sweeps(db, 3)
+
+    assert calls == []
+    assert await _status(db, task_id) == "needs_info"
+
+
+async def test_commits_are_named_by_tip_when_the_log_cannot_be_read(db, monkeypatch):
+    """Рабочей копии проекта нет — alert называет вершину на ответе, а не
+    молчит и не выдумывает список."""
+    task_id, _, branch = await _silent_task(
+        db, monkeypatch, slug="q-tip", tip=_ASKED_TIP
+    )
+    _cancelling_provider(monkeypatch, usage=_usage(1000, 10.0))
+    _creator(monkeypatch, [_CREATED])
+    await _ask_q(db, task_id)
+    _forge(
+        monkeypatch, {branch: _LATE_TIP, "develop": _BASE_TIP}, {_LATE_TIP: "success"}
+    )
+
+    await _answer_q(db, task_id)
+
+    named = [a for a in await _alerts(db, task_id) if "сделано до ответа" in a]
+    assert len(named) == 1 and _LATE_TIP in named[0]
+    assert "не прочитан" in named[0]
