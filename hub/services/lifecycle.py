@@ -1109,6 +1109,24 @@ async def create_subtasks_bulk(
     return views
 
 
+async def _record_statement_paths(db, task_id: int, readiness) -> None:
+    """Нарушение путей постановки при одобрении — записью в карточку (#1456).
+
+    В ``require`` нарушение отказывает раньше, сюда доходит только с force; в
+    ``warn`` одобрение проходит, и эта запись — единственный след. «Не
+    проверено» не пишется: это не нарушение, оно видно в таблице DoR.
+    """
+    from hub.services.dor import STATEMENT_PATHS_CHECK, STATEMENT_PATHS_MARK
+
+    for check in readiness.dor_checks:
+        if check.key == STATEMENT_PATHS_CHECK and check.detail.startswith(
+            STATEMENT_PATHS_MARK
+        ):
+            await repo.add_task_update(
+                db, task_id, "", "alert", f"Approve: {check.detail}"
+            )
+
+
 async def approve_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1195,6 +1213,8 @@ async def approve_task(
         if body.comment:
             force_message += f". Comment: {body.comment}"
         await repo.add_task_update(db, task_id, "", "alert", force_message)
+
+    await _record_statement_paths(db, task_id, readiness)
 
     if body.comment and dor_override_summary is None and not body.force:
         await repo.add_task_update(
