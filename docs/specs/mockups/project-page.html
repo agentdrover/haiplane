@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Страница проекта — макет (#1471)</title>
+<!--
+  Статичный макет страницы /projects/{slug} (уровень 2). Один файл, без сервера, без внешних зависимостей, без JS.
+  Вкладки: радио-кнопки и CSS. В настоящем шаблоне вкладки это обычные ссылки /projects/{slug}?tab=..., без JS.
+  Главная вкладка «Путь и очередь» повторяет эскиз, принятый владельцем: критический путь по эпикам и очередь с причинами.
+  Числа, названия задач и проектов ВЫДУМАНЫ. Дашборд: docs/specs/mockups/project-card.html. Спека: docs/specs/project-card-ux.md.
+-->
+<style>
+:root{
+  --bg:#0c0e14;--surface:#171a24;--surface-hover:#1e2130;--surface-active:#252838;
+  --border:#252838;--border-subtle:#1e2130;--border-focus:#6c5ce7;
+  --text:#e4e7f0;--text-secondary:#a0a5b8;--text-muted:#6b7084;
+  --accent:#6c5ce7;--accent-light:#a29bfe;--accent-dim:rgba(108,92,231,.12);
+  --green:#00b894;--green-dim:rgba(0,184,148,.10);
+  --red:#e74c3c;--red-dim:rgba(231,76,60,.10);
+  --orange:#f39c12;--orange-dim:rgba(243,156,18,.10);
+  --blue:#0984e3;--blue-dim:rgba(9,132,227,.10);
+  /* НОВОЕ (спека §12): текстовые оттенки; --red и --blue на своей заливке дают 4,13:1 и 4,0:1 */
+  --red-text:#ff6b5b;--blue-text:#5aa9f0;
+  --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;--sp-6:24px;
+  --radius:8px;--radius-sm:6px;
+  --font:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;--mono:"SF Mono","JetBrains Mono",monospace;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{background:var(--bg)}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 var(--font)}
+a{color:var(--accent-light);text-decoration:none}
+a:hover{text-decoration:underline}
+a:focus-visible,summary:focus-visible,select:focus-visible,input:focus-visible,button:focus-visible,label:focus-visible,textarea:focus-visible{outline:2px solid var(--accent-light);outline-offset:2px}
+code{font-family:var(--mono);font-size:.92em;background:var(--surface-hover);padding:0 4px;border-radius:4px;overflow-wrap:anywhere}
+h1{font-size:20px;margin:0}h2{font-size:16px;margin:0 0 4px}h3{font-size:12px;margin:0}h4{font-size:13px;margin:0 0 4px}
+.u-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.muted{color:var(--text-secondary)}
+.small{font-size:12px}
+p{margin:0 0 6px}
+
+/* ---------- обвязка макета (не часть страницы) ---------- */
+.mock-bar{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--border);padding:8px 16px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center}
+.mock-bar a{margin-right:4px}
+#w375{position:absolute;opacity:0}
+.mock-bar label.tog{cursor:pointer;border:1px solid var(--border);border-radius:100px;padding:2px 12px;min-height:28px}
+#w375:checked ~ .mock-bar label[for=w375]{background:var(--accent-light);color:#0c0e14}
+#w375:focus-visible ~ .mock-bar label[for=w375]{outline:2px solid var(--accent-light);outline-offset:2px}
+.banner{margin:12px 16px;padding:8px 12px;border:1px dashed var(--orange);border-radius:var(--radius);background:var(--orange-dim)}
+.stage{padding:0 16px 48px;display:flex;justify-content:center}
+.frame{container-type:inline-size;container-name:pg;width:100%;max-width:1100px}
+#w375:checked ~ .stage .frame{max-width:375px;border:1px solid var(--border);border-radius:16px;padding:0 0 8px}
+.page-tag{font:12px var(--mono);color:var(--text-secondary);margin:28px 0 8px;overflow-wrap:anywhere}
+.ann{font:12px var(--mono);color:var(--accent-light);border:1px dashed var(--accent-light);border-radius:4px;padding:0 6px;white-space:nowrap}
+.src{color:var(--text-secondary);font:12px var(--mono);overflow-wrap:anywhere;min-width:0}
+
+/* ---------- СУЩЕСТВУЮЩИЕ (имена как в hub/static/style.css) ---------- */
+.page-header{margin:8px 0 12px}
+.page-title{display:flex;align-items:center;gap:8px}
+.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:var(--radius-sm);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.3px;line-height:1.5;white-space:nowrap}
+.badge--xs{font-size:9px;padding:1px 5px;letter-spacing:.2px}
+.badge-draft{background:var(--orange-dim);color:var(--orange)}
+.badge-running{background:var(--blue-dim);color:var(--blue-text)}       /* ИЗМЕНЕНИЕ: было var(--blue) */
+.badge-completed{background:var(--green-dim);color:var(--green)}
+.badge-failed{background:var(--red-dim);color:var(--red-text)}          /* ИЗМЕНЕНИЕ: было var(--red) */
+.badge-needs_decision{background:var(--red-dim);color:var(--red-text)}  /* ИЗМЕНЕНИЕ */
+.badge-review{background:var(--accent-dim);color:var(--accent-light)}
+.badge-muted{background:var(--surface-hover);color:var(--text-secondary)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:8px 20px;border-radius:var(--radius);font:600 13px/1.5 var(--font);border:0;cursor:pointer;white-space:nowrap;min-height:36px}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-success{background:var(--green);color:#0c0e14}                     /* ИЗМЕНЕНИЕ: белый давал 2,54:1 */
+.btn-ghost{background:transparent;color:var(--text-secondary);border:1px solid var(--border)}
+.btn-ghost:hover{background:var(--surface-hover);color:var(--text)}
+.btn-sm{padding:4px 12px;font-size:12px}
+.btn-xs{padding:3px 12px;font-size:11px;border-radius:var(--radius-sm);min-height:32px}
+.btn[disabled]{cursor:not-allowed;background:var(--surface-hover);color:var(--text-secondary);border:1px dashed var(--border)}
+.topbar-stats{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
+.topbar-stat{display:inline-flex;align-items:center;gap:8px;padding:4px 10px;border-radius:var(--radius);background:var(--surface);border:1px solid var(--border);white-space:nowrap;min-height:32px;color:var(--text)}
+.topbar-stat:hover{background:var(--surface-hover);border-color:var(--accent);text-decoration:none}
+.topbar-stat-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;color:var(--text-secondary)} /* ИЗМЕНЕНИЕ: было --text-muted */
+.topbar-stat-value{font-size:13px;font-weight:700;font-variant-numeric:tabular-nums;min-width:14px;text-align:center}
+.topbar-stat--draft:not(.is-zero){border-color:var(--orange)}
+.topbar-stat--draft:not(.is-zero) .topbar-stat-value{color:var(--orange)}
+.topbar-stat.is-zero{background:transparent;border-style:dashed}       /* ИЗМЕНЕНИЕ: без opacity */
+.topbar-stat.is-zero .topbar-stat-value{color:var(--text-secondary)}
+.project-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:12px;margin-bottom:20px}
+.project-cards>*{min-width:0}
+.project-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:var(--sp-4)}
+.project-card:hover{border-color:var(--accent)}
+.project-card--archived{background:transparent}
+.epic-header{display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap;min-width:0}
+.epic-title{font-size:14px;font-weight:600}
+.epic-children{display:flex;flex-direction:column;gap:4px;min-width:0}
+.epic-child-link{font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:8px;padding:4px 0;min-width:0}
+.epic-child-link:hover{color:var(--text);text-decoration:none}
+.epic-child-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.epic-empty{font-size:12px;color:var(--text-secondary);padding:4px 0}
+.task-action-note{background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius);padding:12px;color:var(--text-secondary);font-size:12px;line-height:1.55;margin:0 0 12px}
+.task-action-note--warning{background:rgba(251,176,52,.12);border-color:var(--orange);color:var(--text)}
+.project-admin-facts{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:8px 0;font-size:13px}
+.project-admin-facts dt{color:var(--text-secondary)}
+.project-admin-facts dd{margin:0;overflow-wrap:anywhere}
+.project-admin-note{display:block;color:var(--text-secondary);font-size:12px}
+.project-admin-actions{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+.project-archive-summary{cursor:pointer;display:flex;align-items:center;min-height:44px;font-size:14px;color:var(--text-secondary)}
+.task-action-label{display:block;font-size:12px;color:var(--text-secondary);margin:8px 0 2px}
+.task-action-control{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;min-height:36px;font:inherit}
+
+/* ---------- НОВОЕ (префикс project-) ---------- */
+.project-card-meta{margin:0 0 8px;font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere}
+.project-row{display:grid;grid-template-columns:132px minmax(0,1fr);gap:4px 12px;padding:8px 0;border-top:1px solid var(--border)}
+.project-row>h3{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--text-secondary);padding-top:6px}
+.project-row>div{min-width:0}
+.project-chips{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center}
+.chip{display:inline-flex;align-items:center;gap:6px;min-height:32px;padding:2px 10px;border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text);background:var(--surface);white-space:nowrap}
+a.chip:hover{border-color:var(--accent);background:var(--surface-hover);text-decoration:none}
+.chip b{font-variant-numeric:tabular-nums}
+.chip--you{border-color:var(--orange)}.chip--you b{color:var(--orange)}
+.chip--bad{border-color:var(--red-text);background:var(--red-dim)}.chip--bad .w{color:var(--red-text);font-weight:700}
+.chip--warn{border-color:var(--orange);background:var(--orange-dim)}.chip--warn .w{color:var(--orange);font-weight:700}
+.chip--ok .w{color:var(--green);font-weight:700}
+.chip--lock{border-color:var(--red-text)}
+.chip--zero{border-style:dashed;background:transparent}.chip--zero b{color:var(--text-secondary)}
+.project-mini{list-style:none;margin:6px 0 0;padding:0;display:grid;gap:4px;font-size:13px}
+.project-mini li{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 8px;align-items:baseline}
+.project-mini .t{min-width:0;overflow-wrap:anywhere}
+.project-mini .r{font-size:12px;color:var(--text)}
+.project-mini .r b{color:var(--orange)}
+.project-more{font-size:12px;margin:4px 0 0}
+.project-note{border-left:4px solid var(--orange);background:rgba(243,156,18,.12);padding:4px 8px;border-radius:0 6px 6px 0;font-size:12px;margin:6px 0}
+.project-note--bad{border-left-color:var(--red-text);background:var(--red-dim)}
+.project-note--info{border-left-color:var(--blue-text);background:var(--blue-dim)}
+.project-seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.project-seg a{padding:6px 10px;min-height:36px;display:inline-flex;align-items:center;color:var(--text);border-right:1px solid var(--border)}
+.project-seg a:last-child{border-right:0}
+.project-seg a[aria-current=true]{background:var(--accent-light);color:#0c0e14;font-weight:600}
+.project-toolbar{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;margin:0 0 6px}
+.project-empty{border:1px dashed var(--border);border-radius:var(--radius);padding:10px;color:var(--text-secondary);font-size:13px}
+.project-empty b{color:var(--text)}
+.project-delta{font-size:12px;color:var(--text-secondary)}
+.project-search{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;margin:0 0 6px}
+.project-search input{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;min-height:36px;font:inherit;flex:1 1 140px;min-width:0}
+
+@container pg (max-width:760px){
+  .project-cards{grid-template-columns:minmax(0,1fr)}
+}
+@container pg (max-width:480px){
+  .project-row{grid-template-columns:1fr}
+  .project-row>h3{padding-top:0}
+  .project-mini li{grid-template-columns:1fr}
+  .chip,.topbar-stat{min-height:44px}
+  .btn,.btn-xs,.btn-sm{min-height:44px}
+  .project-seg{width:100%}.project-seg a{flex:1;justify-content:center;min-height:44px}
+  .project-search input{min-height:44px}
+  .project-admin-actions .btn{flex:1 1 100%}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+/* ---- страница проекта ---- */
+.crumbs{color:var(--text-secondary);font-size:13px;margin:8px 0 0}
+.tabradio{position:absolute;opacity:0;width:1px;height:1px}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);margin:12px 0 16px;overflow-x:auto}
+.tabs label,.tabs a{padding:8px 12px;font-size:14px;color:var(--text-secondary);white-space:nowrap;cursor:pointer;min-height:36px;display:inline-flex;align-items:center;border-bottom:2px solid transparent}
+.tabs a{color:var(--accent-light)}
+.panel{display:none}
+#tab-path:checked ~ .panels #p-path,#tab-work:checked ~ .panels #p-work,#tab-policy:checked ~ .panels #p-policy,#tab-models:checked ~ .panels #p-models,#tab-set:checked ~ .panels #p-set{display:block}
+#tab-path:checked ~ .tabs label[for=tab-path],#tab-work:checked ~ .tabs label[for=tab-work],#tab-policy:checked ~ .tabs label[for=tab-policy],#tab-models:checked ~ .tabs label[for=tab-models],#tab-set:checked ~ .tabs label[for=tab-set]{color:var(--text);border-bottom-color:var(--accent-light);font-weight:600}
+.tabradio:focus-visible ~ .tabs label{outline:1px dotted var(--accent-light)}
+section.blk{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:16px}
+.attn{border:1px solid var(--border);border-left:4px solid var(--orange);border-radius:var(--radius);background:var(--surface);padding:10px 12px;margin:0 0 12px}
+.attn--ok{border-left-color:var(--border)}
+.attn--bad{border-left-color:var(--red-text)}
+.attn--info{border-left-color:var(--blue-text)}
+.attn h2,.attn h4{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-secondary);margin:0 0 4px}
+.epic{border-top:1px solid var(--border);padding:12px 0}
+.epic:first-of-type{border-top:0;padding-top:4px}
+.epic-head{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 12px;margin-bottom:8px}
+.epic-head h3{font-size:14px;text-transform:none;letter-spacing:0;font-weight:600}
+.epic-meta{color:var(--text-secondary);font-size:13px}
+ol.path{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:8px 22px;counter-reset:st}
+.step{position:relative;border:1px solid var(--border);border-radius:8px;padding:6px 8px 6px 30px;min-width:150px;max-width:210px;flex:0 1 190px;font-size:13px;background:var(--surface)}
+.step::before{counter-increment:st;content:counter(st);position:absolute;left:8px;top:6px;font:700 12px var(--mono);color:var(--text-secondary)}
+.step:not(:last-child)::after{content:"→";position:absolute;right:-18px;top:50%;transform:translateY(-50%);color:var(--text-secondary)}
+.step b{display:block;font-size:12px;overflow-wrap:anywhere}
+.step .st{font-size:12px;display:block}
+.step .sz{font:11px var(--mono);color:var(--text-secondary)}
+.step .tag{display:block;font-size:12px;font-weight:700;color:var(--orange)}
+.s-done{background:var(--green-dim);border-color:transparent}.s-done .st{color:var(--green)}
+.s-run{background:var(--blue-dim);border-color:transparent}.s-run .st{color:var(--blue-text)}
+.s-ready{background:var(--accent-dim);border-color:transparent}.s-ready .st{color:var(--accent-light)}
+.s-wait .st{color:var(--text-secondary)}
+.s-you{background:var(--red-dim);border:2px solid var(--red-text)}.s-you .st{color:var(--red-text);font-weight:700}
+.s-ext{border-style:dashed}
+.bottleneck{outline:3px solid var(--orange);outline-offset:1px}
+.pnote{margin-top:8px;font-size:13px}
+.pnote .you{color:var(--red-text);font-weight:700}
+.pnote .bn{color:var(--orange);font-weight:700}
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--text);margin:10px 0 0;padding:0;list-style:none}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:4px;vertical-align:-2px;border:1px solid var(--border)}
+.group h3{font-size:14px;text-transform:none;letter-spacing:0;margin:14px 0 4px;display:flex;gap:8px;align-items:baseline}
+.count{font-size:12px;color:var(--text-secondary);font-weight:400}
+.qrow{display:grid;grid-template-columns:64px minmax(0,1fr) minmax(0,300px);gap:4px 10px;padding:7px 0;border-top:1px solid var(--border);font-size:13px}
+.qrow .id{color:var(--text-secondary);font-variant-numeric:tabular-nums}
+.qrow .why{font-size:13px;color:var(--text-secondary)}
+.qrow .why.you{color:var(--red-text);font-weight:700}
+.qrow .why.next{color:var(--accent-light);font-weight:700}
+.qrow .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
+.qrow.is-next{background:var(--accent-dim);border-radius:6px;padding-left:6px;padding-right:6px}
+details.more summary{cursor:pointer;color:var(--accent-light);font-size:13px;min-height:36px;display:flex;align-items:center}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);vertical-align:top}
+th{color:var(--text-secondary);font-weight:600}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+.src-pill{display:inline-block;border:1px solid var(--border);border-radius:100px;padding:0 8px;font-size:12px}
+.src-pill.proj{border-color:var(--accent-light);color:var(--accent-light)}
+.diff-old{color:var(--red-text);text-decoration:line-through}.diff-new{color:var(--green);font-weight:700}
+.hist{list-style:none;margin:0;padding:0;display:grid;gap:4px;font-size:13px}
+.hist li{border-top:1px solid var(--border);padding-top:4px}
+.gal .project-card{margin-bottom:12px}
+.dl-in{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:13px;margin:6px 0}
+.dl-in dt{color:var(--text-secondary)}.dl-in dd{margin:0}
+@container pg (max-width:760px){
+  .qrow{grid-template-columns:52px minmax(0,1fr)}
+  .qrow .why{grid-column:2}
+}
+@container pg (max-width:480px){
+  .tabs label,.tabs a{min-height:44px}
+  ol.path{flex-direction:column;gap:6px}
+  .step{max-width:none;flex:1 1 auto;min-width:0}
+  .step:not(:last-child)::after{content:"↓";right:auto;left:10px;top:auto;bottom:-16px;transform:none}
+  .step:not(:last-child){margin-bottom:10px}
+  table.stack-sm thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+  table.stack-sm tr{display:block;border-bottom:1px solid var(--border);padding:6px 0}
+  table.stack-sm td{display:flex;justify-content:space-between;gap:12px;border:0;padding:2px 4px;text-align:right}
+  table.stack-sm td::before{content:attr(data-label);color:var(--text-secondary);text-align:left;flex:0 0 40%}
+  details.more summary{min-height:44px}
+  .attn .btn{width:100%}
+}
+
+</style>
+</head>
+<body>
+<input type="checkbox" id="w375" aria-label="Показать в рамке 375 px">
+<div class="mock-bar">
+  <strong>Макет страницы проекта #1471</strong>
+  <span><a href="project-card.html">← Дашборд проектов</a> <a href="#s-states">Шапка в шести состояниях</a></span>
+  <label class="tog" for="w375">Вариант 375 px (вкл/выкл)</label>
+</div>
+<div class="banner"><strong>Макет, не данные.</strong> Числа, названия задач и проектов выдуманы. Переключайте вкладки под шапкой. Шесть состояний шапки (норма, ждёт вас, ошибка workspace, ждёт активации, архив, пусто) показаны внизу: во всех есть «Требует вас», «Ждёт вас: N» и все вкладки.</div>
+
+<div class="stage"><div class="frame">
+<div class="crumbs"><a href="project-card.html">Проекты</a> / default: Haiplane Hub</div>
+<div class="epic-header" style="margin-top:4px"><h1 id="pt" style="margin:0">default: Haiplane Hub</h1><span class="badge badge-draft">ждёт вас: 7</span></div>
+<p class="project-card-meta">default · github · agentdrover/haiplane · ветка develop</p>
+<section class="attn " aria-label="Требует вас"><h2>Требует вас</h2><p style="margin:0 0 4px"><b>Ждёт вас: 7.</b> Верхние 3, весь список ниже в «Очереди»:</p><ol class="project-mini"><li><span class="t"><a href="#">#1375</a> SID: отчёты и команды CLI</span><span class="r"><b>needs_decision</b>: прогон остановлен</span></li><li><span class="t"><a href="#">#1471</a> Дизайн карточки и страницы проекта</span><span class="r"><b>приёмка макета</b></span></li><li><span class="t"><a href="#">#1466</a> Политика моделей проекта</span><span class="r"><b>вердикт</b> ревью</span></li></ol></section>
+<div class="project-chips" style="margin-bottom:8px"><a class="chip " href="#" aria-label="В работе: 1"><span>В работе</span><b>1</b></a><a class="chip " href="#" aria-label="На ревью: 2"><span>На ревью</span><b>2</b></a><a class="chip " href="#" aria-label="Готово к старту: 5"><span>Готово к старту</span><b>5</b></a><span class="chip chip--warn"><span class="w">релиз: авария</span></span><a class="chip chip--lock" href="#" aria-label="7 ключей политики проекта default отличаются от умолчаний"><b>7</b><span>ключей политики отличаются от умолчаний</span></a></div>
+<input class="tabradio" type="radio" name="tab" id="tab-path" checked aria-label="Вкладка: Путь и очередь"><input class="tabradio" type="radio" name="tab" id="tab-work" aria-label="Вкладка: Работа"><input class="tabradio" type="radio" name="tab" id="tab-policy" aria-label="Вкладка: Политика"><input class="tabradio" type="radio" name="tab" id="tab-models" aria-label="Вкладка: Модели и расход"><input class="tabradio" type="radio" name="tab" id="tab-set" aria-label="Вкладка: Настройки">
+<nav class="tabs" aria-label="Разделы страницы проекта">
+  <label for="tab-path">Путь и очередь</label><label for="tab-work">Работа</label><label for="tab-policy">Политика</label><label for="tab-models">Модели и расход</label><label for="tab-set">Настройки</label>
+  <a href="#metrics-note" aria-label="Метрики проекта (откроется раздел метрик с фильтром проекта)">Метрики →</a>
+</nav>
+<div class="panels">
+<div class="panel" id="p-path" role="region" aria-label="Путь и очередь">
+<section class="blk" aria-labelledby="h-cp"><h2 id="h-cp">Критический путь</h2>
+<p class="muted small">Самая длинная цепочка незавершённых задач каждого открытого эпика по <code>depends_on</code>. Вес шага по размеру: XS=1, S=2, M=3, L=5. Считаются шаги, а не дни. Ваши шаги стоят прямо в цепочке. Узкое место: задача, которую ждёт больше всего других (прямо или через другие); при равенстве первая по порядку цепочки. Источник: <span class="src">tasks.depends_on, tasks.size, tasks.status</span></p>
+<div class="epic"><div class="epic-head"><h3>#1460 Карточка и страница проекта</h3><span class="epic-meta">6 шагов · вес 16 (шагов, не дней)</span></div>
+<ol class="path" aria-label="Цепочка эпика #1460 Карточка и страница проекта"><li class="step s-you bottleneck"><b>#1471 Дизайн: спека и макет</b><span class="st">ваш шаг: приёмка макета</span><span class="sz">M · 3</span><span class="tag">узкое место: ждут 5</span></li><li class="step s-wait"><b>#1472 Вёрстка дашборда</b><span class="st">ждёт #1471</span><span class="sz">M · 3</span></li><li class="step s-wait"><b>#1473 Контраст и 375 px</b><span class="st">ждёт #1472</span><span class="sz">S · 2</span></li><li class="step s-wait"><b>#1477 Строка задачи и кнопки</b><span class="st">ждёт #1473</span><span class="sz">M · 3</span></li><li class="step s-wait"><b>#1478 Поиск и порядок эпиков</b><span class="st">ждёт #1477</span><span class="sz">S · 2</span></li><li class="step s-wait"><b>#1476 Политика: форма правки</b><span class="st">ждёт #1478, #1475</span><span class="sz">M · 3</span></li></ol><p class="pnote"><span class="you">Сейчас держит ваш шаг:</span> приёмка макета #1471. <span class="bn">Узкое место:</span> #1471, её ждут 5 задач цепочки (считаются все, кто зависит прямо или через другие). Вес цепочки 3+3+2+3+2+3 = 16.</p></div><div class="epic"><div class="epic-head"><h3>#1462 Метрики: обзор и графики</h3><span class="epic-meta">5 шагов · вес 13 (шагов, не дней)</span></div>
+<ol class="path" aria-label="Цепочка эпика #1462 Метрики: обзор и графики"><li class="step s-ready bottleneck"><b>#1487 Общие компоненты</b><span class="st">готова к старту</span><span class="sz">M · 3</span><span class="tag">узкое место: ждут 4</span></li><li class="step s-wait"><b>#1488 Графики</b><span class="st">ждёт #1487</span><span class="sz">M · 3</span></li><li class="step s-wait"><b>#1493 Обзорный экран</b><span class="st">ждёт #1488, #1490</span><span class="sz">M · 3</span></li><li class="step s-wait"><b>#1489 agent-api</b><span class="st">ждёт #1493</span><span class="sz">S · 2</span></li><li class="step s-wait"><b>#1491 Фильтры в URL</b><span class="st">ждёт #1489, #1490</span><span class="sz">S · 2</span></li></ol><p class="pnote">Параллельная ветка вне цепочки: <b>#1490</b> сервис фильтров, готова к старту, её ждут #1493 и #1491 (2 задачи). Вес цепочки 3+3+3+2+2 = 13. Предшественник #1486 доставлен и в цепочку не входит.</p></div><div class="epic"><div class="epic-head"><h3>#1461 Выбор моделей по проекту</h3><span class="epic-meta">4 шага · вес 12 (шагов, не дней)</span></div>
+<ol class="path" aria-label="Цепочка эпика #1461 Выбор моделей по проекту"><li class="step s-you bottleneck"><b>#1466 Политика моделей: контракт</b><span class="st">ваш шаг: вердикт ревью</span><span class="sz">M · 3</span><span class="tag">узкое место: ждут 3</span></li><li class="step s-you"><b>#1479 Разрешение модели роли</b><span class="st">ваш шаг: одобрение черновика</span><span class="sz">M · 3</span></li><li class="step s-wait"><b>#1484 Блок «Модели»</b><span class="st">ждёт #1479</span><span class="sz">M · 3</span></li><li class="step s-wait"><b>#1485 Форма выбора моделей</b><span class="st">ждёт #1484</span><span class="sz">M · 3</span></li></ol><p class="pnote"><span class="you">Ваших шагов в цепочке: 2</span> (вердикт ревью, одобрение черновика). Вес 3+3+3+3 = 12.</p></div><div class="epic"><div class="epic-head"><h3>#1370 SID: отчёты и команды</h3><span class="epic-meta">2 шага · вес 4 (шагов, не дней)</span></div>
+<ol class="path" aria-label="Цепочка эпика #1370 SID: отчёты и команды"><li class="step s-you bottleneck"><b>#1375 Отчёты и команды CLI</b><span class="st">ваш шаг: needs_decision, прогон остановлен</span><span class="sz">S · 2</span><span class="tag">узкое место: ждёт 1</span></li><li class="step s-wait"><b>#1376 Команды в CLI</b><span class="st">ждёт #1375</span><span class="sz">S · 2</span></li></ol><p class="pnote">Узкое место при равенстве берётся первым по порядку цепочки.</p></div><div class="epic"><div class="epic-head"><h3>#1494 Практики работы с исполнителями</h3><span class="epic-meta">4 шага · вес 9 (шагов, не дней)</span></div>
+<ol class="path" aria-label="Цепочка эпика #1494 Практики работы с исполнителями"><li class="step s-run"><b>#1458 Вопрос исполнителя</b><span class="st">в работе · Sonnet · 25 мин</span><span class="sz">S · 2</span></li><li class="step s-wait"><b>#1503 Классы сбоев</b><span class="st">ждёт #1458</span><span class="sz">S · 2</span></li><li class="step s-wait s-ext bottleneck"><b>#1505 Handoff через хаб</b><span class="st">ждёт #1511 · проект notesforllm</span><span class="sz">M · 3</span><span class="tag">узкое место: ждёт 1</span></li><li class="step s-wait"><b>#1506 Handoff в заказе</b><span class="st">ждёт #1505</span><span class="sz">S · 2</span></li></ol><p class="pnote">Пунктир и метка «проект notesforllm» у зависимости из другого проекта. #1511 не запустится до сервера MS-A2, срок не называется: без надёжного cycle time (#525) он был бы ложной точностью. Вес 2+2+3+2 = 9.</p></div>
+<ul class="legend" aria-label="Обозначения статусов"><li><i style="background:var(--green-dim)"></i>доставлено (в цепочку не входит)</li><li><i style="background:var(--blue-dim)"></i>в работе</li><li><i style="background:var(--accent-dim)"></i>готово к старту</li><li><i></i>ждёт задачу</li><li><i style="border:2px solid var(--red-text);background:var(--red-dim)"></i>ваш шаг (одобрение, вердикт, needs_decision, приёмка)</li><li><i style="outline:2px solid var(--orange)"></i>узкое место</li><li><i style="border-style:dashed"></i>зависимость из другого проекта, с меткой проекта</li></ul>
+<p class="project-note">Пустые случаи: нет открытых эпиков: «Открытых эпиков нет, критического пути нет». Эпик без зависимостей: «Цепочка из одного шага». Цикл в <code>depends_on</code>: «Цикл зависимостей: #a → #b → #a. Путь эпика не считается» и ссылка на задачи цикла: молча резать цикл нельзя.</p>
+</section>
+<section class="blk" aria-labelledby="h-q"><h2 id="h-q">Очередь с причинами</h2>
+<p class="muted small">Все незавершённые задачи проекта в порядке <code>depends_on</code>. У каждой строки одна причина. Следующая по очереди выделена. Задача может стоять в «Ждёт вас» и одновременно считаться «на ревью» на дашборде: счётчики считают статусы, группы причины.</p>
+
+<div class="group"><h3>Ждёт вас <span class="count">7</span></h3>
+<div class="qrow"><span class="id">#1375</span><span>SID: отчёты и команды CLI<div class="acts"><a class="btn btn-ghost btn-xs" href="#">Решить</a></div></span><span class="why you">needs_decision: прогон остановлен</span></div>
+<div class="qrow"><span class="id">#1471</span><span>Дизайн карточки и страницы проекта<div class="acts"><a class="btn btn-ghost btn-xs" href="#">Открыть макет</a></div></span><span class="why you">приёмка макета</span></div>
+<div class="qrow"><span class="id">#1466</span><span>Политика моделей проекта<div class="acts"><a class="btn btn-ghost btn-xs" href="#">Открыть ревью</a></div></span><span class="why you">вердикт ревью</span></div>
+<div class="qrow"><span class="id">#1479</span><span>Разрешение модели роли<div class="acts"><button class="btn btn-success btn-xs" type="button" aria-label="Одобрить черновик #1479 проекта default">Одобрить</button><button class="btn btn-ghost btn-xs" type="button" aria-label="Отклонить черновик #1479 проекта default">Отклонить</button></div></span><span class="why you">одобрение черновика · размер M · готовность 97 · DoR пройден</span></div>
+<div class="qrow"><span class="id">#1480</span><span>Ключи ролей в gate_policy<div class="acts"><button class="btn btn-success btn-xs" type="button" aria-label="Одобрить черновик #1480 проекта default">Одобрить</button><button class="btn btn-ghost btn-xs" type="button" aria-label="Отклонить черновик #1480 проекта default">Отклонить</button></div></span><span class="why you">одобрение черновика · размер S · готовность 90 · DoR пройден</span></div>
+<div class="qrow"><span class="id">#1481</span><span>Список наблюдённых моделей<div class="acts"><button class="btn btn-success btn-xs" type="button" aria-label="Одобрить черновик #1481 проекта default">Одобрить</button><button class="btn btn-ghost btn-xs" type="button" aria-label="Отклонить черновик #1481 проекта default">Отклонить</button></div></span><span class="why you">одобрение черновика · размер S · готовность 88 · DoR пройден</span></div>
+<div class="qrow"><span class="id">#1483</span><span>Пороги дельты в метриках<div class="acts"><button class="btn btn-xs" type="button" disabled aria-label="Одобрить черновик #1483 проекта default: недоступно">Одобрить</button><button class="btn btn-ghost btn-xs" type="button" aria-label="Отклонить черновик #1483 проекта default">Отклонить</button></div></span><span class="why you">одобрение черновика · размер S · готовность 61 · DoR не пройден: нет критериев приёмки. Принудительного одобрения нет</span></div>
+</div>
+<div class="group"><h3>В работе <span class="count">2</span></h3>
+<div class="qrow"><span class="id">#1458</span><span>Вопрос облачного исполнителя</span><span class="why ">running · slot-2 · Sonnet · 25 мин, CI идёт</span></div>
+<div class="qrow"><span class="id">#1487</span><span>Общие компоненты метрик</span><span class="why ">на ревью: ждёт вердикта машины</span></div>
+</div>
+<div class="group"><h3>Готово к старту <span class="count">5</span></h3>
+<div class="qrow is-next"><span class="id">#1448</span><span>Отложенная находка возвращается как новая</span><span class="why next">следующая по очереди</span></div>
+<div class="qrow"><span class="id">#1456</span><span>Проверка исполнимости постановки</span><span class="why ">готова, после #1448</span></div>
+<div class="qrow"><span class="id">#1457</span><span>Действующая политика целиком</span><span class="why ">готова; держит #1474, #1475, #1476</span></div>
+<div class="qrow"><span class="id">#1490</span><span>Сервис фильтров метрик</span><span class="why ">готова; держит #1493, #1491</span></div>
+<div class="qrow"><span class="id">#1501</span><span>Входящие: действие и основание</span><span class="why ">готова</span></div>
+</div>
+<div class="group"><h3>Ждёт задачу <span class="count">14</span></h3>
+<div class="qrow"><span class="id">#1472</span><span>Вёрстка дашборда проекта</span><span class="why ">ждёт #1471 (ваш шаг)</span></div>
+<div class="qrow"><span class="id">#1474</span><span>Реестр ключей gate_policy</span><span class="why ">ждёт #1457</span></div>
+<div class="qrow"><span class="id">#1503</span><span>Классы сбоев исполнителя</span><span class="why ">ждёт #1458 (в работе)</span></div>
+<div class="qrow"><span class="id">#1505</span><span>Handoff по задаче через хаб</span><span class="why ">ждёт #1511 · проект notesforllm</span></div>
+<details class="more"><summary>Ещё 10</summary><p class="muted small">Полный список тех же строк; макет показывает первые 4.</p></details>
+</div>
+<div class="group"><h3>Отложено <span class="count">1</span></h3>
+<div class="qrow"><span class="id">#1403</span><span>Жребий deep для части lite-сдач</span><span class="why ">решение владельца: до сброса пула Cursor 13.10</span></div>
+</div>
+<details class="more"><summary>Доставлено за 30 дн.: 23</summary><p class="muted small">#1419, #1433, #1434, #1436, #1408, #1413, #917, #915, #916, #918, #919, #920 и ещё 11. Период тот же, что на дашборде.</p></details>
+
+<p class="muted small" style="margin-top:8px">Порядок и причины считает сервис, общий с «входящими» (#1501): один порядок по <code>depends_on</code>. Сроков нет.</p>
+</section></div><div class="panel" id="p-work" role="region" aria-label="Работа">
+<section class="blk" aria-labelledby="h-w1"><h2 id="h-w1">Счётчики и период</h2>
+<div class="project-toolbar"><span id="per2" class="muted small">Период</span><nav class="project-seg" aria-labelledby="per2"><a href="#">7 дн.</a><a href="#" aria-current="true">30 дн.</a><a href="#">90 дн.</a></nav></div>
+<p class="project-note">Период меняет только показатели «за период» ниже и расход. Состояние сейчас (ждёт вас 7, в работе 1, на ревью 2, очередь) от него не зависит и дельты не имеет.</p>
+<div class="project-chips"><span class="chip"><span>Ждёт вас</span><b>7</b></span><span class="chip"><span>В работе</span><b>1</b></span><span class="chip"><span>На ревью</span><b>2</b></span><span class="chip"><span>Готово к старту</span><b>5</b></span></div>
+<h3 style="margin:12px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-secondary)">За 30 дн. против предыдущих 30 дн.</h3>
+<table class="stack-sm"><thead><tr><th>Показатель</th><th class="num">Сейчас</th><th class="num">Было</th><th>Сравнение</th><th>n и источник</th></tr></thead><tbody>
+<tr><td data-label="Показатель">Доставлено задач</td><td class="num" data-label="Сейчас">23</td><td class="num" data-label="Было">19</td><td data-label="Сравнение">▲ больше, +21%</td><td data-label="n и источник">n=23 и n=19; <span class="src">tasks.completed_at</span></td></tr>
+<tr><td data-label="Показатель">Прогонов исполнителя</td><td class="num" data-label="Сейчас">14</td><td class="num" data-label="Было">6</td><td data-label="Сравнение">сравнить не с чем: в предыдущем окне 6, нужно не меньше 10</td><td data-label="n и источник">n=14 и n=6; <span class="src">executor_runs</span></td></tr>
+<tr><td data-label="Показатель">Прогонов ревью deep</td><td class="num" data-label="Сейчас">31</td><td class="num" data-label="Было">30</td><td data-label="Сравнение">≈ без изменений, +3% (меньше 5%)</td><td data-label="n и источник">n=31 и n=30; <span class="src">review_dispatch</span></td></tr>
+</tbody></table>
+<p class="muted small" style="margin-top:6px">Правила #1490: направление только при n не меньше 10 в обоих окнах (<code>MIN_COMPARE_N</code>), «без изменений» при |Δ| меньше 5%. Иначе слова «сравнить не с чем» с числами обоих окон. Стрелка сопровождается словом, цвета у неё нет: «больше» не значит «лучше».</p>
+</section>
+<section class="blk" aria-labelledby="h-w2"><h2 id="h-w2">Исполнители</h2>
+<ul class="hist"><li><code>slot-2</code> · <b>#1458</b> Вопрос облачного исполнителя · running с 25 мин · признак жизни 2 мин назад</li>
+<li><code>cloud</code> · <b>#1487</b> Общие компоненты метрик · claimed с 35 мин · признак жизни 35 мин назад</li>
+<li class="project-note project-note--bad" style="list-style:none"><b>Слот брошен:</b> #1455: slot-3 освобождён, нет признаков жизни 60 мин. Задача остаётся в работе.</li></ul>
+<p class="muted small">Слоты свободны: «Слоты свободны, задач в работе нет.» Источник: <span class="src">executor_slots</span>, порог <code>slot_dead_minutes</code>.</p></section>
+<section class="blk" aria-labelledby="h-w3"><h2 id="h-w3">Релизы</h2>
+<table class="stack-sm"><thead><tr><th>Статус</th><th>sha</th><th>Ветка</th><th>Источник</th><th>Когда</th></tr></thead><tbody>
+<tr><td data-label="Статус"><span class="badge badge-failed">failed</span> авария</td><td data-label="sha"><code>7511344</code></td><td data-label="Ветка">main</td><td data-label="Источник">ci</td><td data-label="Когда">сегодня</td></tr>
+<tr><td data-label="Статус"><span class="badge badge-completed">success</span></td><td data-label="sha"><code>72c04ea</code></td><td data-label="Ветка">main</td><td data-label="Источник">ci</td><td data-label="Когда">2 дня назад</td></tr>
+<tr><td data-label="Статус"><span class="badge badge-completed">success</span></td><td data-label="sha"><code>e226a2b</code></td><td data-label="Ветка">main</td><td data-label="Источник">ci</td><td data-label="Когда">5 дней назад</td></tr></tbody></table>
+<p class="muted small">Показаны последние 3 из 3 записей <span class="src">releases</span>. Нет строк: «Релизов не было».</p></section>
+<section class="blk" aria-labelledby="h-w4"><h2 id="h-w4">Эпики</h2>
+<form class="project-search" role="search" aria-label="Поиск по эпикам проекта default" onsubmit="return false"><label class="u-sr-only" for="q-w">Найти эпик</label><input id="q-w" type="search" placeholder="Найти эпик"><nav class="project-seg" aria-label="Порядок эпиков"><a href="#" aria-current="true">Свежие</a><a href="#">По готовности</a></nav></form>
+<p class="project-note">Поиск и порядок действуют только на этот список. Счётчики и очередь считают весь проект.</p>
+<div class="epic-children"><a href="#" class="epic-child-link"><span class="epic-child-title">#1460 Карточка и страница проекта</span><span class="badge badge-muted badge--xs">готово 0 из 3<span class="u-sr-only"> задач в эпике</span></span></a>
+<a href="#" class="epic-child-link"><span class="epic-child-title">#1462 Метрики: обзор и графики</span><span class="badge badge-muted badge--xs">готово 1 из 6<span class="u-sr-only"> задач в эпике</span></span></a>
+<a href="#" class="epic-child-link"><span class="epic-child-title">#1461 Выбор моделей по проекту</span><span class="badge badge-muted badge--xs">готово 0 из 2<span class="u-sr-only"> задач в эпике</span></span></a></div>
+<p class="muted small">Показано 3 из 12 живых эпиков. <a href="#">Ещё 9 →</a> · при запросе: «Показан 1 из 12 по запросу «метрик»», при нуле: «По запросу «квота» эпиков не найдено. Всего живых эпиков: 12».</p></section></div><div class="panel" id="p-policy" role="region" aria-label="Политика">
+<section class="blk" aria-labelledby="h-p1"><h2 id="h-p1">Действующая политика</h2>
+<p class="muted small">Каждый ключ со значением, источником и умолчанием (сводка #1457, реестр ключей #1474). Задано в проекте 8 ключей, из них 7 отличаются от умолчаний; <code>verdict</code>, заданный равным умолчанию, помечен, но в значок на дашборде («7 ключей отличаются от умолчаний») не входит. Известных ключей: 20. Последняя правка: 28.09 05:39, автор denis, ключ <code>verdict</code> (запись <code>project_gate_policy_changed</code>).</p>
+<table class="stack-sm"><thead><tr><th>Ключ</th><th>Значение</th><th>Источник</th><th>Умолчание</th><th>Что делает</th></tr></thead><tbody><tr><td data-label="Ключ"><code>dor</code></td><td data-label="Значение"><b>human</b> <span class="badge badge-needs_decision">заперт, замок #743</span></td><td data-label="Источник"><span class="src-pill">по умолчанию</span></td><td data-label="Умолчание">human</td><td data-label="Что делает">кто одобряет черновики (автоодобрение R0–R1 выключено)</td></tr><tr><td data-label="Ключ"><code>verdict</code></td><td data-label="Значение"><b>human</b> <span class="badge badge-needs_decision">заперт, замок #743</span></td><td data-label="Источник"><span class="src-pill proj">задано в проекте</span></td><td data-label="Умолчание">human</td><td data-label="Что делает">кто выносит вердикт ревью; задано в проекте, но совпадает с умолчанием</td></tr><tr><td data-label="Ключ"><code>review</code></td><td data-label="Значение"><b>dispatch</b></td><td data-label="Источник"><span class="src-pill proj">задано в проекте</span></td><td data-label="Умолчание">off</td><td data-label="Что делает">хаб сам зовёт кросс-модельного ревьюера на сдачу</td></tr><tr><td data-label="Ключ"><code>steward_shadow</code></td><td data-label="Значение"><b>включено</b></td><td data-label="Источник"><span class="src-pill proj">задано в проекте</span></td><td data-label="Умолчание">выключено</td><td data-label="Что делает">суждение стюарда пишется, применение запрещено</td></tr><tr><td data-label="Ключ"><code>release</code></td><td data-label="Значение"><b>auto</b></td><td data-label="Источник"><span class="src-pill proj">задано в проекте</span></td><td data-label="Умолчание">manual</td><td data-label="Что делает">релиз develop→main открывает и мержит хаб по зелёному CI</td></tr><tr><td data-label="Ключ"><code>deep_daily_cap</code></td><td data-label="Значение"><b>4</b></td><td data-label="Источник"><span class="src-pill proj">задано в проекте</span></td><td data-label="Умолчание">нет потолка</td><td data-label="Что делает">сколько deep-ревью в сутки</td></tr><tr><td data-label="Ключ"><code>review_limit</code></td><td data-label="Значение"><b>не задан</b></td><td data-label="Источник"><span class="src-pill">по умолчанию</span></td><td data-label="Умолчание">без лимита</td><td data-label="Что делает">лимит очереди review; режим enforce или warn</td></tr><tr><td data-label="Ключ"><code>submission_contract</code></td><td data-label="Значение"><b>require</b></td><td data-label="Источник"><span class="src-pill proj">задано в проекте</span></td><td data-label="Умолчание">off</td><td data-label="Что делает">сдача без контракта отклоняется</td></tr><tr><td data-label="Ключ"><code>claim_area_check</code></td><td data-label="Значение"><b>warn</b></td><td data-label="Источник"><span class="src-pill proj">задано в проекте</span></td><td data-label="Умолчание">off</td><td data-label="Что делает">пересечение областей при захвате называется в карточке</td></tr><tr><td data-label="Ключ"><code>bug_red_test</code></td><td data-label="Значение"><b>off</b></td><td data-label="Источник"><span class="src-pill">по умолчанию</span></td><td data-label="Умолчание">off</td><td data-label="Что делает">доказательство красного теста для багов</td></tr><tr><td data-label="Ключ"><code>executor_launch</code></td><td data-label="Значение"><b>manual</b></td><td data-label="Источник"><span class="src-pill proj">задано в проекте</span></td><td data-label="Умолчание">off</td><td data-label="Что делает">кнопка запуска облачного исполнителя</td></tr><tr><td data-label="Ключ"><code>executor_push_rights_task</code></td><td data-label="Значение"><b>не задан</b></td><td data-label="Источник"><span class="src-pill">по умолчанию</span></td><td data-label="Умолчание">не задан</td><td data-label="Что делает">задача-свидетель прав на пуш</td></tr><tr><td data-label="Ключ"><code>executor_task_cents_ceiling</code></td><td data-label="Значение"><b>10 500 ¢</b></td><td data-label="Источник"><span class="src-pill">по умолчанию</span></td><td data-label="Умолчание">10 500 ¢ (сервер)</td><td data-label="Что делает">потолок исполнителя на задачу</td></tr><tr><td data-label="Ключ"><code>executor_task_token_ceiling</code></td><td data-label="Значение"><b>24 000 000</b></td><td data-label="Источник"><span class="src-pill">по умолчанию</span></td><td data-label="Умолчание">24 000 000 (сервер)</td><td data-label="Что делает">потолок токенов исполнителя на задачу</td></tr><tr><td data-label="Ключ"><code>slot_dead_minutes</code></td><td data-label="Значение"><b>60</b></td><td data-label="Источник"><span class="src-pill">по умолчанию</span></td><td data-label="Умолчание">60 (сервер)</td><td data-label="Что делает">через сколько минут без признаков жизни слот освобождается</td></tr><tr><td data-label="Ключ"><code>wip_limit</code></td><td data-label="Значение"><b>не задан</b></td><td data-label="Источник"><span class="src-pill">по умолчанию</span></td><td data-label="Умолчание">нет лимита</td><td data-label="Что делает">сколько задач разом в running и review</td></tr><tr><td data-label="Ключ"><code>orchestrator_queue</code></td><td data-label="Значение"><b>off</b></td><td data-label="Источник"><span class="src-pill">по умолчанию</span></td><td data-label="Умолчание">off</td><td data-label="Что делает">режим теневой очереди исполнения</td></tr><tr><td data-label="Ключ"><code>ci_runner</code></td><td data-label="Значение"><b>не задан</b></td><td data-label="Источник"><span class="src-pill">по умолчанию</span></td><td data-label="Умолчание">пусто</td><td data-label="Что делает">как прогоняются приёмочные тесты в CI</td></tr><tr><td data-label="Ключ"><code>dor_max_class</code></td><td data-label="Значение"><b>не задан</b></td><td data-label="Источник"><span class="src-pill">по умолчанию</span></td><td data-label="Умолчание">не задан</td><td data-label="Что делает">потолок автоодобрения по классу риска</td></tr><tr><td data-label="Ключ"><code>risk_map</code></td><td data-label="Значение"><b>не задана</b></td><td data-label="Источник"><span class="src-pill">по умолчанию</span></td><td data-label="Умолчание">нет карты</td><td data-label="Что делает">карта путей для вывода класса риска</td></tr></tbody></table>
+<p class="muted small" style="margin-top:6px">Неизвестные ключи проекта: 1 (<code>dor_max_clas</code>): такой ключ ничего не делает. Нечитаемое значение показывается действующим: <code>submission_contract</code>=«requier» действует как <b>warn</b>.</p>
+</section>
+<section class="blk" aria-labelledby="h-p2"><h2 id="h-p2">Сервер и замки</h2>
+<dl class="dl-in"><dt>Режим стюарда</dt><dd>запрошен <b>act</b>, действует <b>shadow</b>: замеры тени не дают act (причины отказа перечислены в сводке)</dd><dt>Замок #743</dt><dd>делегирование вердикта запрещено: <code>verdict</code> всегда human</dd><dt>Модели сервера</dt><dd><code>EXECUTOR_MODEL</code>, <code>STEWARD_MODEL</code>, модель ревьюера: значения без ключей и токенов, у секретов только «настроен» или «нет»</dd></dl></section>
+<section class="blk" aria-labelledby="h-p3"><h2 id="h-p3">Правка политики</h2>
+<p class="muted small">Правка только для администратора. Остальным вместо кнопки стоит текст «Правка доступна администратору», таблица выше остаётся. Порядок: форма, дифф, сохранение, запись в историю. Ниже три шага подряд, как их видит администратор.</p>
+<h3 style="margin:8px 0 4px;font-size:12px;text-transform:uppercase;color:var(--text-secondary)">1. Форма (администратор)</h3>
+<form onsubmit="return false"><label class="task-action-label" for="f-cap">deep_daily_cap: целое не меньше 0; пусто = потолка нет</label><input id="f-cap" class="task-action-control" value="6">
+<label class="task-action-label" for="f-cac">claim_area_check: off, warn или require</label><select id="f-cac" class="task-action-control"><option>warn</option><option>require</option><option>off</option></select>
+<label class="task-action-label" for="f-ver">verdict</label><select id="f-ver" class="task-action-control" disabled aria-describedby="f-ver-why"><option>human</option></select><span id="f-ver-why" class="project-admin-note">Заперт: замок #743 на проекте default, хаб не ослабляет надзор над собой.</span>
+<p style="margin-top:8px"><button class="btn btn-primary" type="button">Показать изменения</button></p></form>
+<h3 style="margin:8px 0 4px;font-size:12px;text-transform:uppercase;color:var(--text-secondary)">2. Дифф перед сохранением</h3>
+<table class="stack-sm"><thead><tr><th>Ключ</th><th>Было</th><th>Стало</th><th>Источник после</th></tr></thead><tbody>
+<tr><td data-label="Ключ"><code>deep_daily_cap</code></td><td data-label="Было"><span class="diff-old">4</span></td><td data-label="Стало"><span class="diff-new">6</span></td><td data-label="Источник после">задано в проекте</td></tr>
+<tr><td data-label="Ключ"><code>claim_area_check</code></td><td data-label="Было"><span class="diff-old">warn</span></td><td data-label="Стало"><span class="diff-new">require</span></td><td data-label="Источник после">задано в проекте</td></tr></tbody></table>
+<p class="project-note">Ключ <code>claim_area_check</code>=require ужесточает: захват задач с пересечением областей будет отказывать. Замена значения ослабляющей стороны (verdict, dor, executor_launch) требует отдельного подтверждения словом.</p>
+<p><button class="btn btn-success" type="button">Сохранить 2 изменения</button> <button class="btn btn-ghost" type="button">Отмена</button></p>
+<p class="muted small">Отказ валидации называет ключ и допустимые значения и показывается у формы, форма остаётся открытой; политика не меняется.</p>
+<h3 style="margin:8px 0 4px;font-size:12px;text-transform:uppercase;color:var(--text-secondary)">3. История правок</h3>
+<ul class="hist" aria-label="История правок политики"><li>30.09 06:12 · admin · <code>deep_daily_cap</code>: 4 → 6</li><li>30.09 06:12 · admin · <code>claim_area_check</code>: warn → require</li><li>28.09 05:39 · denis · <code>verdict</code>: (не было) → human</li></ul>
+<p class="muted small">Источник истории: событие <code>project_gate_policy_changed</code> (автор, было, стало, время). Нет правок: «Политику не меняли».</p></section></div><div class="panel" id="p-models" role="region" aria-label="Модели и расход">
+<section class="blk" aria-labelledby="h-m1"><h2 id="h-m1">Модели</h2>
+<table class="stack-sm"><thead><tr><th>Роль</th><th>Модель</th><th>Источник</th><th>Корзина квоты</th></tr></thead><tbody>
+<tr><td data-label="Роль">Исполнитель</td><td data-label="Модель">composer-2.5</td><td data-label="Источник">env <code>EXECUTOR_MODEL</code></td><td data-label="Корзина квоты">Cursor Models · сверено 29.09</td></tr>
+<tr><td data-label="Роль">Ревьюер</td><td data-label="Модель">gpt-5.3-codex</td><td data-label="Источник">проект</td><td data-label="Корзина квоты">Other Models · сверено 29.09</td></tr>
+<tr><td data-label="Роль">Стюард</td><td data-label="Модель">gpt-5.3-codex</td><td data-label="Источник">env <code>STEWARD_MODEL</code></td><td data-label="Корзина квоты">Other Models · сверено 29.09</td></tr></tbody></table>
+<p class="project-note"><b>Предупреждение:</b> ревьюер и стюард одного семейства, если исполнитель тоже gpt: правило разнообразия семейств (#1466) не даёт сохранить такой выбор; причина показывается у формы, а не в подсказке.</p>
+<p class="project-empty">Модель grok-4.6 в выпадающем списке помечена «непроверено»: запускающимися она не наблюдалась и как готовая не предлагается. Корзина квоты: неизвестна, сверки нет.</p>
+<p class="muted small">Места под #1468 (блок), #1484 и #1485 (форма). Сохранение только для администратора, с дифф и записью в историю, как в «Политике».</p></section>
+<section class="blk" aria-labelledby="h-m2"><h2 id="h-m2">Расход за период</h2>
+<div class="project-toolbar"><span id="per3" class="muted small">Период</span><nav class="project-seg" aria-labelledby="per3"><a href="#">7 дн.</a><a href="#" aria-current="true">30 дн.</a></nav></div>
+<p class="project-note">Период меняет только этот блок. Дельта считается по правилам #1490: при n не меньше 10 в обоих окнах.</p>
+<table class="stack-sm"><thead><tr><th>Строка</th><th class="num">Значение</th><th>n и источник</th></tr></thead><tbody>
+<tr><td data-label="Строка">Deep-ревью за сутки</td><td class="num" data-label="Значение">3 из 4</td><td data-label="n и источник">прогонов за сутки 3; потолок <code>deep_daily_cap</code>=4, проект</td></tr>
+<tr><td data-label="Строка">Исполнитель за 30 дн.</td><td class="num" data-label="Значение">4 120 ¢</td><td data-label="n и источник">14 прогонов, со счётом 12; без счёта 2: их цена неизвестна, это не ноль; <span class="src">executor_runs</span></td></tr>
+<tr><td data-label="Строка">Потолок исполнителя на задачу</td><td class="num" data-label="Значение">10 500 ¢ · 24 000 000 ток.</td><td data-label="n и источник">умолчание сервера: ключи <code>executor_task_cents_ceiling</code> и <code>executor_task_token_ceiling</code> не заданы</td></tr>
+<tr><td data-label="Строка">Исполнитель, если счёта нет ни у одного прогона</td><td class="num" data-label="Значение">цена неизвестна</td><td data-label="n и источник">7 прогонов, счёта нет: это не 0 ¢</td></tr></tbody></table>
+<p class="muted small">Ручной запрос человека и риск security потолком deep не режутся, «5 из 4» допустимо и объясняется. Места под #1464 и #1476.</p></section></div><div class="panel" id="p-set" role="region" aria-label="Настройки">
+<section class="blk" aria-labelledby="h-s1"><h2 id="h-s1">Маршрутизация</h2>
+<dl class="project-admin-facts"><dt>slug</dt><dd>default</dd><dt>репозиторий</dt><dd>agentdrover/haiplane</dd><dt>форж</dt><dd>github</dd><dt>ветка</dt><dd>develop</dd>
+<dt>клон</dt><dd><span class="badge badge-completed">сходится: develop</span></dd><dt>workspace</dt><dd>/srv/workspaces/haiplane</dd></dl>
+<div class="project-admin-actions"><button class="btn btn-primary" type="button">Запустить исполнителя</button><button class="btn btn-primary" type="button">Проверить workspace</button><button class="btn btn-success" type="button" disabled>Активировать</button><button class="btn btn-ghost" type="button" disabled>В архив</button></div>
+<p class="muted small">«Активировать» доступна только в состоянии «ждёт активации»; «В архив» недоступна проекту default; «Вернуть из архива» у архивных. Условия показа те же, что в <code>projects.html</code>. У недоступных кнопок причина стоит текстом рядом.</p></section>
+<section class="blk" aria-labelledby="h-s2"><h2 id="h-s2">Изменить проект</h2>
+<form onsubmit="return false"><label class="task-action-label" for="s-n">Название</label><input id="s-n" class="task-action-control" value="Haiplane Hub">
+<label class="task-action-label" for="s-r">Репозиторий (владелец/имя)</label><input id="s-r" class="task-action-control" value="agentdrover/haiplane">
+<label class="task-action-label" for="s-w">Путь к workspace</label><input id="s-w" class="task-action-control" value="/srv/workspaces/haiplane">
+<label class="task-action-label" for="s-f">Форж</label><select id="s-f" class="task-action-control"><option>github</option><option>gitverse</option></select>
+<label class="task-action-label" for="s-b">Ветка по умолчанию</label><input id="s-b" class="task-action-control" value="develop">
+<label class="task-action-label" for="s-p">Политика веток (JSON; пусто = не менять)</label><textarea id="s-p" class="task-action-control" rows="2">{"release_base": "main"}</textarea>
+<p style="margin-top:8px"><button class="btn btn-primary" type="button">Сохранить</button></p></form>
+<p class="muted small">Подписи русские (были Name, Repo, Workspace path, Default branch, Branch policy): решение владельца, делается в вёрстке страницы. Поля и роуты <code>web-edit</code>, <code>web-archive</code>, <code>web-provision</code>, <code>web-activate</code> не меняются. Отказ формы печатается у формы, она остаётся открытой (#1188).</p></section></div>
+</div>
+<p class="project-note project-note--info" id="metrics-note"><b>Метрики →</b> это ссылка, не вкладка: она ведёт на <code>/metrics?project=default</code> (фильтр проекта, #1490).</p>
+
+<p class="page-tag" id="s-states">шапка страницы в шести состояниях (h2 → h3 → h4)</p>
+<h2>Состояния шапки</h2>
+<section class="project-cards gal" aria-label="Шесть состояний шапки страницы">
+<article class="project-card" aria-label="Шапка страницы в состоянии 1">
+<p class="src" style="margin:0 0 6px">состояние 1 · норма</p>
+<div class="epic-header"><h3 style="margin:0;font-size:14px">snip-portal</h3></div>
+<section class="attn attn--ok" aria-label="Требует вас"><h4>Требует вас</h4><p style="margin:0"><b>Ждёт вас: 0.</b> Решений не требуется.</p></section>
+<div class="project-chips"><a class="chip " href="#" aria-label="В работе: 2"><span>В работе</span><b>2</b></a><a class="chip " href="#" aria-label="На ревью: 1"><span>На ревью</span><b>1</b></a><a class="chip " href="#" aria-label="Политика: 5 отличаются от умолчаний"><span>Политика</span><b>5 отличаются от умолчаний</b></a></div>
+<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 2">
+<p class="src" style="margin:0 0 6px">состояние 2 · ждёт вас</p>
+<div class="epic-header"><h3 style="margin:0;font-size:14px">default</h3><span class="badge badge-draft">ждёт вас: 7</span></div>
+<section class="attn " aria-label="Требует вас"><h4>Требует вас</h4><p style="margin:0 0 4px"><b>Ждёт вас: 7.</b> Верхние 3, полный список на вкладке «Путь и очередь»:</p><ol class="project-mini"><li><span class="t"><a href="#">#1375</a> SID: отчёты и команды CLI</span><span class="r"><b>needs_decision</b></span></li><li><span class="t"><a href="#">#1471</a> Дизайн карточки</span><span class="r"><b>приёмка макета</b></span></li><li><span class="t"><a href="#">#1466</a> Политика моделей</span><span class="r"><b>вердикт</b></span></li></ol></section>
+<div class="project-chips"><a class="chip " href="#" aria-label="В работе: 1"><span>В работе</span><b>1</b></a><a class="chip " href="#" aria-label="На ревью: 2"><span>На ревью</span><b>2</b></a><a class="chip " href="#" aria-label="Политика: 7 отличаются от умолчаний"><span>Политика</span><b>7 отличаются от умолчаний</b></a></div>
+<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 3">
+<p class="src" style="margin:0 0 6px">состояние 3 · ошибка workspace</p>
+<div class="epic-header"><h3 style="margin:0;font-size:14px">ssh-identity-doctor</h3><span class="badge badge-failed">workspace: ошибка</span></div>
+<section class="attn attn--bad" aria-label="Требует вас"><h4>Требует вас</h4><p style="margin:0 0 4px"><b>Ждёт вас: 0</b> по задачам. <span class="badge badge-failed">ошибка</span> Workspace не собран:</p><p class="project-note project-note--bad">git clone: Permission denied (publickey) для acme/ssh-identity-doctor</p><a class="btn btn-primary btn-sm" href="#">Проверить workspace</a></section>
+<div class="project-chips"><a class="chip chip--zero" href="#" aria-label="В работе: 0"><span>В работе</span><b>0</b></a><a class="chip chip--zero" href="#" aria-label="На ревью: 0"><span>На ревью</span><b>0</b></a><a class="chip " href="#" aria-label="Политика: 3 отличаются от умолчаний"><span>Политика</span><b>3 отличаются от умолчаний</b></a></div>
+<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 4">
+<p class="src" style="margin:0 0 6px">состояние 4 · ждёт активации</p>
+<div class="epic-header"><h3 style="margin:0;font-size:14px">calc-kids</h3><span class="badge badge-draft">ждёт активации</span></div>
+<section class="attn attn--info" aria-label="Требует вас"><h4>Требует вас</h4><p style="margin:0 0 4px"><b>Ждёт вас: 1.</b> <span class="badge badge-draft">ждёт активации</span> Проект не активирован и не попал в git-маршрутизацию.</p><button class="btn btn-success btn-sm" type="button">Активировать</button></section>
+<div class="project-chips"><a class="chip chip--zero" href="#" aria-label="В работе: 0"><span>В работе</span><b>0</b></a><a class="chip chip--zero" href="#" aria-label="На ревью: 0"><span>На ревью</span><b>0</b></a><span class="chip chip--zero"><span>Политика</span><b>всё по умолчанию</b></span></div>
+<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 5">
+<p class="src" style="margin:0 0 6px">состояние 5 · архив: «Требует вас» и вкладка «Политика» на месте</p>
+<div class="epic-header"><h3 style="margin:0;font-size:14px">legacy-bot</h3><span class="badge badge-failed">в архиве</span></div>
+<section class="attn attn--ok" aria-label="Требует вас"><h4>Требует вас</h4><p style="margin:0"><b>Ждёт вас: 0.</b> Проект в архиве: решений и действий нет. Вернуть его можно на вкладке «Настройки».</p></section>
+<div class="project-chips"><a class="chip chip--zero" href="#" aria-label="В работе: 0"><span>В работе</span><b>0</b></a><a class="chip chip--zero" href="#" aria-label="На ревью: 0"><span>На ревью</span><b>0</b></a><a class="chip " href="#" aria-label="Политика: 2 отличаются от умолчаний"><span>Политика</span><b>2 отличаются от умолчаний</b></a></div>
+<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article><article class="project-card" aria-label="Шапка страницы в состоянии 6">
+<p class="src" style="margin:0 0 6px">состояние 6 · пусто</p>
+<div class="epic-header"><h3 style="margin:0;font-size:14px">notes-sync</h3></div>
+<section class="attn attn--ok" aria-label="Требует вас"><h4>Требует вас</h4><p style="margin:0"><b>Ждёт вас: 0.</b> Решений не требуется. Живой работы нет — все эпики проекта доделаны или их ещё не завели.</p></section>
+<div class="project-chips"><a class="chip chip--zero" href="#" aria-label="В работе: 0"><span>В работе</span><b>0</b></a><a class="chip chip--zero" href="#" aria-label="На ревью: 0"><span>На ревью</span><b>0</b></a><span class="chip chip--zero"><span>Политика</span><b>всё по умолчанию</b></span></div>
+<p class="muted small" style="margin:6px 0 0">Вкладки те же: Путь и очередь, Работа, Политика, Модели и расход, Настройки, Метрики →.</p></article>
+</section>
+</div></div>
+</body>
+</html>
