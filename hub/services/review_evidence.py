@@ -895,6 +895,30 @@ async def attach_observation_closures(db, view, task_row: dict[str, Any]) -> Non
     view.observation_closures = [closures[u] for u in uids if u in closures]
 
 
+async def attach_deferred_repeats(db, view) -> None:
+    """Mark confirmed findings that repeat one deferred to an undelivered task (#1448).
+
+    The predicate is gate_grounds.deferred_repeats — the one the autopilot and
+    the steward count by — so the card says "отложена до #N" exactly where the
+    gates stopped counting the finding. Only a CURRENT report: an older one
+    describes other code.
+    """
+    from hub.models import DeferredRepeatView
+    from hub.services.finding_identity import finding_uids
+    from hub.services.gate_grounds import deferred_repeats
+
+    if not getattr(view, "is_current", False) or not view.findings_confirmed:
+        view.deferred_repeats = []
+        return
+    findings = [f.model_dump(mode="json") for f in view.findings_confirmed]
+    repeats = await deferred_repeats(db, int(view.task_id), findings)
+    view.deferred_repeats = [
+        DeferredRepeatView(finding_uid=uid, **repeats[uid])
+        for uid in finding_uids(findings)
+        if uid in repeats
+    ]
+
+
 def undisposed_confirmed(machine_review) -> tuple[int, int]:
     """How many confirmed findings the report carries, and how many nobody judged.
 
@@ -1094,6 +1118,7 @@ async def report_view(
             )
         await attach_dispositions(db, machine_review)
         await attach_observation_closures(db, machine_review, task_row)
+        await attach_deferred_repeats(db, machine_review)
         state = "current" if machine_review.is_current else "stale"
 
     return ReviewReport(

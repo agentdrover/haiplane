@@ -268,8 +268,8 @@ def file_line_counts(diff: str) -> list[tuple[str, int]]:
 
 async def previous_findings(
     db: aiosqlite.Connection, task_id: int, generation: int
-) -> list[str]:
-    """What the previous submission's reviewers confirmed (#880).
+) -> tuple[list[str], list[str]]:
+    """What the previous submission's reviewers confirmed (#880), split by fate.
 
     Travels with the delta so the new run can check whether the fixes landed,
     instead of rediscovering the same defects from scratch — or, worse, not
@@ -277,11 +277,25 @@ async def previous_findings(
     Taken from the generation the delta starts at (#1400): a generation with
     no recorded report has no findings, and the ones that matter are those
     of the last review that did land.
+
+    Returns ``(open, deferred)`` (#1448). ``deferred`` are the findings the
+    author consciously moved to a named, not yet delivered task — the same
+    predicate the autopilot and the steward read (``deferred_repeats``). The
+    reviewer is told so: a deferred finding it cannot tell from an open one is
+    confirmed again on every generation.
     """
+    from hub.services.gate_grounds import deferred_repeats
+    from hub.services.finding_identity import finding_uids
+
     previous = await _last_read_submission(db, task_id, generation)
     if previous is None:
-        return []
-    titles: list[str] = []
+        return [], []
+    # Одно поколение может нести несколько отчётов (добор лестницы #879,
+    # вторая ось #1243). Находка, подтверждённая в двух из них, — одна находка:
+    # без дедупа по uid второй экземпляр получал ординал близнеца, то есть
+    # другой uid без исхода, и попадал в открытые рядом с отложенной (#1448).
+    # uid считается ВНУТРИ отчёта (близнецы одного отчёта остаются двумя).
+    by_uid: dict[str, dict[str, Any]] = {}
     for row in await repo.machine_reviews_of_generation(
         db, task_id, int(dict(previous).get("generation") or 0)
     ):
@@ -289,14 +303,30 @@ async def previous_findings(
             findings = json.loads(dict(row).get("findings_confirmed") or "[]")
         except ValueError:
             continue
-        for finding in findings if isinstance(findings, list) else []:
-            if not isinstance(finding, dict):
-                continue
-            title = str(finding.get("title") or "").strip()
-            where = str(finding.get("file") or "").strip()
-            if title:
-                titles.append(f"{where}: {title}" if where else title)
-    return titles
+        listed = [
+            f
+            for f in (findings if isinstance(findings, list) else [])
+            if isinstance(f, dict)
+        ]
+        for uid, finding in zip(finding_uids(listed), listed, strict=True):
+            by_uid.setdefault(uid, finding)
+    found = list(by_uid.values())
+    repeats = await deferred_repeats(db, task_id, found)
+    open_titles: list[str] = []
+    deferred_titles: list[str] = []
+    for uid, finding in zip(finding_uids(found), found, strict=True):
+        title = str(finding.get("title") or "").strip()
+        where = str(finding.get("file") or "").strip()
+        if not title:
+            continue
+        line = f"{where}: {title}" if where else title
+        if uid in repeats:
+            deferred_titles.append(
+                f"{line} (отложена до #{repeats[uid]['linked_task_id']})"
+            )
+        else:
+            open_titles.append(line)
+    return open_titles, deferred_titles
 
 
 @dataclass(frozen=True)
@@ -584,6 +614,7 @@ def diff_plan(
     delta_note: str = "",
     prior_findings: list[str] | None = None,
     base_paths: list[str] | None = None,
+    deferred_findings: list[str] | None = None,
 ) -> tuple[str, str]:
     """What the reviewer should read, and the note for the task update (#874).
 
@@ -646,6 +677,14 @@ def diff_plan(
             f"{listed}. Проверь, что правки их действительно закрыли — это "
             "первое, что надо посмотреть, и не считай их закрытыми по факту "
             "того, что файл изменился."
+        )
+    if deferred_findings:
+        lines.append(
+            "ИЗВЕСТНО И ОТЛОЖЕНО ОСОЗНАННО: "
+            f"{'; '.join(deferred_findings[:20])}. Автор вынес их в названную "
+            "задачу, и повторное подтверждение ничего не добавляет: "
+            "подтверждай такую находку снова, только если дефект изменился "
+            "или вырос; иначе назови её в отчёте известной."
         )
     if dropped:
         lines.append(
@@ -2856,7 +2895,7 @@ async def prepare_review_order(
             db, task, generation, profile_diff, subject, cloud
         )
     rules_block, rules_note = await collect_review_rules(db, task_id, diff)
-    prior = await previous_findings(db, task_id, generation)
+    prior, deferred = await previous_findings(db, task_id, generation)
     diff_block, diff_note = diff_plan(
         diff,
         base,
@@ -2865,6 +2904,7 @@ async def prepare_review_order(
         subject.note,
         prior,
         subject.base_paths,
+        deferred,
     )
     # #875: what the toolchain already proved on THIS commit. Built from the
     # task row the caller already read, so no extra query for the common case.
