@@ -136,7 +136,7 @@ async def deferred_repeats(
       по этой задаче, и последний исход — именно он;
     * у исхода есть ``linked_task_id``, и такая задача существует;
     * доставку связанной задачи читает тот же читатель, что у зависимостей
-      (``blocker_delivery_cached``), и его ответ — ровно «не доставлена»:
+      (``with_cached_delivery`` поверх строки блокера ``task_as_blocker``), и его ответ — ровно «не доставлена»:
       доставлена (отсрочка оказалась ложной) и «узнать не удалось» (незнание
       не оправдание) блокируют как раньше;
     * находка не security — отсрочка не может увести её от человека.
@@ -148,7 +148,7 @@ async def deferred_repeats(
         return {}
     from hub import repository as repo
     from hub.models import FindingOutcome
-    from hub.services.delivery_state import blocker_delivery_cached
+    from hub.services.delivery_state import with_cached_delivery
     from hub.services.finding_identity import finding_uids
     from hub.services.finding_outcome import KIND_CONFIRMED
 
@@ -164,9 +164,15 @@ async def deferred_repeats(
         if outcome.get("outcome") != FindingOutcome.deferred.value or not linked:
             continue
         linked = int(linked)
-        if linked == task_id or await repo.get_task(db, linked) is None:
+        if linked == task_id:
             continue
-        answer = await blocker_delivery_cached(db, {"task_id": linked})
+        # Та же строка блокера, что у зависимостей (#484/#485): с merges по
+        # pipeline_merges и pr_number. Голый {"task_id"} терял мерж гейта, и
+        # доставленная squash-ем задача читалась «не доставлена».
+        row_blocker = await repo.task_as_blocker(db, linked)
+        if row_blocker is None:
+            continue
+        (answer,) = await with_cached_delivery(db, [row_blocker])
         if answer.get("delivered") is not False:
             continue
         found[uid] = {

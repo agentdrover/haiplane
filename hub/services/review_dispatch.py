@@ -290,7 +290,12 @@ async def previous_findings(
     previous = await _last_read_submission(db, task_id, generation)
     if previous is None:
         return [], []
-    found: list[dict[str, Any]] = []
+    # Одно поколение может нести несколько отчётов (добор лестницы #879,
+    # вторая ось #1243). Находка, подтверждённая в двух из них, — одна находка:
+    # без дедупа по uid второй экземпляр получал ординал близнеца, то есть
+    # другой uid без исхода, и попадал в открытые рядом с отложенной (#1448).
+    # uid считается ВНУТРИ отчёта (близнецы одного отчёта остаются двумя).
+    by_uid: dict[str, dict[str, Any]] = {}
     for row in await repo.machine_reviews_of_generation(
         db, task_id, int(dict(previous).get("generation") or 0)
     ):
@@ -298,11 +303,14 @@ async def previous_findings(
             findings = json.loads(dict(row).get("findings_confirmed") or "[]")
         except ValueError:
             continue
-        found.extend(
+        listed = [
             f
             for f in (findings if isinstance(findings, list) else [])
             if isinstance(f, dict)
-        )
+        ]
+        for uid, finding in zip(finding_uids(listed), listed, strict=True):
+            by_uid.setdefault(uid, finding)
+    found = list(by_uid.values())
     repeats = await deferred_repeats(db, task_id, found)
     open_titles: list[str] = []
     deferred_titles: list[str] = []

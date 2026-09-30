@@ -269,3 +269,75 @@ async def test_a_task_deferring_to_itself_carries_nothing_away(
     task_id = await _bare_task(db)
     await _defer(db, task_id, _DEFERRED, linked=task_id)
     assert await grounds.deferred_repeats(db, task_id, [_DEFERRED]) == {}
+
+
+async def _with_pr(db: aiosqlite.Connection, task_id: int, pr: int) -> None:
+    await repo.update_task(db, task_id, pr_number=pr, submission_sha="d" * 40)
+    await db.commit()
+
+
+async def test_a_task_delivered_by_the_gate_makes_the_deferral_false(
+    db: aiosqlite.Connection,
+) -> None:
+    """#1448 (deep #740, 3044b282e670a75c): мерж гейта виден читателю доставки.
+
+    Связанная задача L смержена гейтом (запись в pipeline_merges), строки свипа
+    нет. Голый ``{"task_id": L}`` терял ``merges`` и ``pr_number``, и L читалась
+    «не доставлена» — отсрочка оправдывалась, хотя обещанное уже в базе. Здесь
+    доставленная L отсрочку НЕ оправдывает (повтор = отсрочка была ложной).
+    Пара: L с заявленным, но не смерженным PR оправдывает, иначе тест не отличает
+    правило от выключателя.
+    """
+    task_id = await _bare_task(db)
+    delivered = await _follow_up(db)
+    await _with_pr(db, delivered, 71)
+    await repo.record_pipeline_merge(
+        db, pr_number=71, merge_sha="e" * 40, task_id=delivered
+    )
+    await db.commit()
+    await _defer(db, task_id, _DEFERRED, linked=delivered)
+    assert await grounds.deferred_repeats(db, task_id, [_DEFERRED]) == {}, (
+        "задача доставлена гейтом: отсрочка ложная, находка блокирует"
+    )
+    # Блок стоит на ЗНАНИИ «доставлена», а не на незнании: без строки блокера
+    # (merges по pipeline_merges) читатель отвечал бы «неизвестно».
+    from hub.services.delivery_state import with_cached_delivery
+
+    row = await repo.task_as_blocker(db, delivered)
+    (answer,) = await with_cached_delivery(db, [row])
+    assert answer["delivered"] is True and answer["delivery_path"] == "gate"
+
+    open_task = await _bare_task(db)
+    pending = await _follow_up(db)
+    # PR заявлен, но не смержен и коммит не закреплён: честное «не доставлена».
+    await repo.update_task(db, pending, pr_number=72)
+    await db.commit()
+    await _defer(db, open_task, _DEFERRED, linked=pending)
+    assert set(await grounds.deferred_repeats(db, open_task, [_DEFERRED])) == {
+        _uid(_DEFERRED)
+    }
+
+
+async def test_an_unestablished_delivery_blocks_and_does_not_read_as_undelivered(
+    db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """Squash-конвейер: git доставку не устанавливает (None) — это «неизвестно».
+
+    Выбор: блок. Незнание не оправдание (конструкция задачи), и отказ идёт с
+    причиной читателя доставки, а не молчаливым «не доставлена».
+    """
+    from hub.services import delivery_state
+
+    async def _unanswerable(db, task_row):
+        return None, delivery_state.BASE_UNANSWERABLE_NOTE
+
+    monkeypatch.setattr(delivery_state, "merged_into_base_detail", _unanswerable)
+    task_id = await _bare_task(db)
+    linked = await _follow_up(db)
+    await _with_pr(db, linked, 73)
+    await _defer(db, task_id, _DEFERRED, linked=linked)
+
+    assert await grounds.deferred_repeats(db, task_id, [_DEFERRED]) == {}
+    row = await repo.task_as_blocker(db, linked)
+    (answer,) = await delivery_state.with_cached_delivery(db, [row])
+    assert answer["delivered"] is None and answer["reason"]
