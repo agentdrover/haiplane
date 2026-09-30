@@ -2648,6 +2648,8 @@ async def test_metrics_filter_by_project(db: aiosqlite.Connection):
     await db.execute("UPDATE tasks SET project_id=? WHERE id=?", (spike, escaped))
     await _verdict(db, d1, "approved")
     await _verdict(db, s1, "changes_requested")
+    await _deploy(db, "aaa111")
+    await _deploy(db, "bbb222", project_id=spike)
     await db.commit()
 
     everything = await practice_metrics(db)
@@ -2674,6 +2676,11 @@ async def test_metrics_filter_by_project(db: aiosqlite.Connection):
     assert only_default["review_outcomes"]["approved"] == 1
     assert everything["review_outcomes"]["verdicts"] == 2
     assert {g["project"] for g in only_spike["human_gates"]} <= {"spike"}
+    cfr = {
+        name: {r["project"] for r in m["change_failure_rate"]["by_project"]}
+        for name, m in (("all", everything), ("spike", only_spike))
+    }
+    assert cfr == {"all": {"default", "spike"}, "spike": {"spike"}}
     assert only_spike["scope"]["project"] == "spike"
 
 
@@ -3144,3 +3151,99 @@ async def test_mcp_practice_metrics_passes_the_slice_and_names_the_ranking():
     assert "Model filter does not apply to: cycle_times, shift_left" in text
     assert "insufficient data (no_current_data)" in text
     assert "Problem #1 [worsened]" in text
+
+
+async def test_metrics_slice_reaches_dispatches_executor_and_refusals(
+    db: aiosqlite.Connection,
+):
+    """#1490: the sections that live outside orchestration.py read the slice
+    too — review dispatches, the review-economy runs, executor runs and the
+    incomplete-report counters — and the reviewer model narrows only the
+    review ones."""
+    spike = await repo.create_project(db, slug="spike", name="Spike")
+    d = await _task(db, title="default")
+    s = await _task(db, title="spike", project_id=spike)
+    await _failed_dispatch(db, d, provider_tokens=100)
+    await _failed_dispatch(db, s, provider_tokens=40)
+    await db.execute(
+        "UPDATE review_dispatches SET model='kimi-k3' WHERE task_id=?", (s,)
+    )
+    for task_id in (d, s):
+        await repo.create_executor_run(
+            db,
+            task_id=task_id,
+            submission_generation=1,
+            agent_id="bc-x",
+            run_id="r",
+            model="composer",
+        )
+    await db.commit()
+
+    everything = await practice_metrics(db)
+    only_spike = await practice_metrics(db, project="spike")
+    assert everything["review_dispatches"]["wasted_provider_tokens_total"] == 140
+    assert only_spike["review_dispatches"]["wasted_provider_tokens_total"] == 40
+    assert only_spike["review_economy"]["runs"]["total"] == 1
+    assert everything["review_economy"]["runs"]["total"] == 2
+    assert everything["executor_runs"]["runs"] == 2
+    assert only_spike["executor_runs"]["runs"] == 1
+
+    kimi = await practice_metrics(db, model="kimi-k3")
+    assert kimi["review_dispatches"]["wasted_provider_tokens_total"] == 40
+    assert kimi["review_economy"]["runs"]["total"] == 1
+    assert kimi["executor_runs"] == everything["executor_runs"], "no reviewer model"
+
+    # Incomplete reports are counted per slice as well.
+    for task_id, model in ((d, "grok-4.6"), (s, "kimi-k3")):
+        await _report_at(db, task_id, model=model)
+    await db.execute("UPDATE machine_reviews SET incomplete=1")
+    await db.commit()
+    assert (await practice_metrics(db))["incomplete_reasons"]["incomplete_total"] == 2
+    by_project = await practice_metrics(db, project="spike")
+    assert by_project["incomplete_reasons"]["incomplete_total"] == 1
+    by_model = await practice_metrics(db, model="grok-4.6")
+    assert by_model["incomplete_reasons"]["incomplete_total"] == 1
+
+
+async def test_metrics_unjudged_queue_and_rules_follow_the_slice(
+    db: aiosqlite.Connection,
+):
+    """The unjudged-findings stock and the rule breaches carry no window, but
+    they still belong to a project and a reviewer model (#1490)."""
+    spike = await repo.create_project(db, slug="spike", name="Spike")
+    d = await _task(db, title="default")
+    s = await _task(db, title="spike", project_id=spike)
+    await _report_at(db, d, model="grok-4.6", confirmed=2)
+    await _report_at(db, s, model="kimi-k3", confirmed=1)
+    await db.commit()
+
+    def unjudged(m: dict) -> int:
+        return m["machine_reviews"]["dispositions"]["confirmed_unjudged"]
+
+    assert unjudged(await practice_metrics(db)) == 3
+    assert unjudged(await practice_metrics(db, project="spike")) == 1
+    assert unjudged(await practice_metrics(db, model="grok-4.6")) == 2
+    assert unjudged(await practice_metrics(db, project="spike", model="grok-4.6")) == 0
+
+    rule_date = _ts(72)
+    await _rule_set_up(db, "timeouts", rule_date)
+    for project_id, title, model in (
+        (None, "breach default", "grok-4.6"),
+        (spike, "breach spike", "kimi-k3"),
+    ):
+        task_id = await _finding_at(db, title, "timeouts", _ts(24))
+        if project_id is not None:
+            await db.execute(
+                "UPDATE tasks SET project_id=? WHERE id=?", (project_id, task_id)
+            )
+        await db.execute(
+            "UPDATE machine_reviews SET model=? WHERE task_id=?", (model, task_id)
+        )
+    await db.commit()
+
+    def breaches(m: dict) -> int:
+        return sum(r["breaches"] for r in m["rule_breaches"]["breached"])
+
+    assert breaches(await practice_metrics(db)) == 2
+    assert breaches(await practice_metrics(db, project="spike")) == 1
+    assert breaches(await practice_metrics(db, model="grok-4.6")) == 1
