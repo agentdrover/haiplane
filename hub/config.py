@@ -221,6 +221,22 @@ EXECUTOR_LAUNCH_PAUSE_S = int(env_get("EXECUTOR_LAUNCH_PAUSE_S", "10"))
 # проекта (executor_task_cents_ceiling / executor_task_token_ceiling) важнее.
 EXECUTOR_TASK_CENTS_CEILING = float(env_get("EXECUTOR_TASK_CENTS_CEILING", "10500"))
 EXECUTOR_TASK_TOKEN_CEILING = int(env_get("EXECUTOR_TASK_TOKEN_CEILING", "24000000"))
+# #1446: потолок повторного прогона «только сдай» — он не пишет код, а только
+# сдаёт запушенную работу, поэтому потолок заметно ниже обычного: прогон, что
+# начал переписывать код, упрётся в него, а не в бюджет задачи. Повтор
+# заказывается, только если на задаче остался запас не меньше этого потолка.
+EXECUTOR_SUBMIT_ONLY_CENTS_CEILING = float(
+    env_get("EXECUTOR_SUBMIT_ONLY_CENTS_CEILING", "300")
+)
+EXECUTOR_SUBMIT_ONLY_TOKEN_CEILING = int(
+    env_get("EXECUTOR_SUBMIT_ONLY_TOKEN_CEILING", "1500000")
+)
+# #1446: сколько минут после конца тихого прогона ждать зелёного CI на
+# вершине его ветки. «Не прочитан», «нет прогона» и «идёт» — не зелёный:
+# платный заказ «только сдай» на них не делается; по истечении — к человеку.
+EXECUTOR_SUBMIT_ONLY_CI_WAIT_MIN = int(
+    env_get("EXECUTOR_SUBMIT_ONLY_CI_WAIT_MIN", "30")
+)
 #: Сколько ждать ВОЗМОЖНОСТИ стартовать — отдельно от того, сколько ждать
 #: суждения (#1181). Одно число на два вопроса делало ответ на второй
 #: зависимым от того, как долго не отвечали на первый: на первом прогоне
