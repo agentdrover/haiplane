@@ -698,3 +698,17 @@ async def test_test_ref_of_a_stored_ac_is_checked_and_named_by_ac_id(
     item = next(c for c in result.checks if c.key == "statement_paths_resolve")
     assert "tests/test_gone.py" in item.detail and "test_ref AC-1" in item.detail
     assert "statement_paths_resolve" in result.missing_required
+
+
+def test_statement_paths_policy_write_refuses_a_typo_and_flag_is_not_a_path():
+    from hub.models import validated_gate_policy
+    from hub.services.dor import statement_paths_in
+    from hub.services.project_policy import statement_paths_of
+
+    assert validated_gate_policy({"statement_paths": "require"}) == {
+        "statement_paths": "require"
+    }
+    with pytest.raises(ValueError, match="statement_paths"):
+        validated_gate_policy({"statement_paths": "strict"})
+    assert statement_paths_of(None) == "warn"  # type: ignore[arg-type]
+    assert statement_paths_in("tool -tests/a.py --out/b.json") == []
