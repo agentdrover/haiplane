@@ -3367,6 +3367,19 @@ class FindingObservationClosure(BaseModel):
     hand: str = ""
 
 
+class DeferredRepeatView(BaseModel):
+    """A confirmed finding that repeats one deferred to a named task (#1448).
+
+    NOT a disposition and not a closure: the finding stays in the report and
+    the approval rules only stop counting it against the submission. Shown, so
+    that "does not block" is never the same as "hidden".
+    """
+
+    finding_uid: str
+    linked_task_id: int
+    title: str = ""
+
+
 class MachineReviewView(BaseModel):
     id: int
     task_id: int
@@ -3420,6 +3433,10 @@ class MachineReviewView(BaseModel):
     # a hand other than the author's (#1244). Computed when the report is read,
     # never stored on it: the report stays what it was.
     observation_closures: list[FindingObservationClosure] = Field(default_factory=list)
+    # Confirmed findings that repeat one the author deferred to a task that is
+    # not delivered yet (#1448). Computed on read by the same predicate the
+    # autopilot and the steward use; never stored on the report.
+    deferred_repeats: list[DeferredRepeatView] = Field(default_factory=list)
     # На какой ступени лестницы исходов стоит отчёт (#1234), и что об этой
     # ступени печатают. Поля, а не свойства: читатели — карточка, дайджест и
     # квитанция MCP, и последняя видит модель уже сериализованной в JSON, где

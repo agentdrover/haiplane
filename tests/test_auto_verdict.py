@@ -669,3 +669,84 @@ async def test_an_unresolved_finding_leaves_the_verdict_to_the_human(
     assert not await _events(db, "verdict_escalated", unresolved), (
         "unresolved is a silent refusal, not an escalation trigger"
     )
+
+
+_DEFERRED_FINDING = {
+    "locator": "none",
+    "title": "оркестратор не вызывается из CLI",
+    "severity": "low",
+    "category": "correctness",
+}
+
+
+async def _second_generation_with_deferral(
+    db: aiosqlite.Connection, task_id: int, finding: dict
+) -> int:
+    """Сдача на втором поколении; на первом та же находка отложена до задачи.
+
+    Возвращает задачу, куда отложено. Исход пишется так, как его пишет гейт
+    пересдачи: по задаче и finding_uid первого отчёта.
+    """
+    from hub.services.finding_identity import finding_uids
+
+    linked = await _node(db, title="сюда отложено", task_type="task", parent_id=None)
+    review_id = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        raw_count=2,
+        findings_confirmed=json.dumps([finding]),
+        incomplete=False,
+    )
+    await repo.upsert_finding_outcome(
+        db,
+        review_id=review_id,
+        task_id=task_id,
+        submission_generation=1,
+        finding_uid=finding_uids([finding])[0],
+        finding_index=0,
+        finding_title=finding["title"],
+        outcome="deferred",
+        note="делается отдельной задачей",
+        linked_task_id=linked,
+        reported_by="pda_claude",
+    )
+    await db.execute(
+        "UPDATE tasks SET submission_generation = 2 WHERE id = ?", (task_id,)
+    )
+    await db.commit()
+    return linked
+
+
+async def test_repeat_of_deferred_finding_does_not_block_autopilot(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    """#1448 AC-1: повтор отложенной находки не запирает чистую сдачу.
+
+    Живой случай: da70b3f7dfab0996 отложена до #1392, ревьюер подтверждал её
+    на каждом поколении, и владелец трижды одобрял руками. Пара: рядом та же
+    сдача, где отсрочки нет — она по-прежнему остаётся человеку, иначе
+    тест не отличал бы правило от выключателя.
+    """
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+
+    deferred = await _submitted_task(client, db, "spike-deferred", {"verdict": "auto"})
+    linked = await _second_generation_with_deferral(db, deferred, _DEFERRED_FINDING)
+    await _post_review(client, deferred, findings_confirmed=[_DEFERRED_FINDING])
+
+    body = (await client.get(f"/api/tasks/{deferred}")).json()
+    assert body["review_verdict"] == "approved", "повтор отложенной — не блокер"
+    verdicts = await _events(db, "review_verdict_recorded", deferred)
+    assert verdicts and verdicts[-1]["actor"] == "policy"
+    feed = [u["content"] for u in body["updates"] or []]
+    shown = [c for c in feed if "Автовердикт APPROVED" in c]
+    assert shown and f"отложена до #{linked}" in shown[0], (
+        f"повтор должен быть виден в карточке, а не скрыт: {shown}"
+    )
+    assert "повтор не блокирует" in shown[0]
+
+    fresh = await _submitted_task(client, db, "spike-not-deferred", {"verdict": "auto"})
+    await _post_review(client, fresh, findings_confirmed=[_DEFERRED_FINDING])
+    other = (await client.get(f"/api/tasks/{fresh}")).json()
+    assert other["status"] == "review"
+    assert other["review_verdict"] != "approved", "без отсрочки находка блокирует"

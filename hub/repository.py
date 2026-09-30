@@ -3411,6 +3411,26 @@ def _blocker_entry(row: dict[str, Any]) -> dict[str, Any]:
     return {**row, "delivered": delivered, "reason": reason}
 
 
+async def task_as_blocker(
+    db: aiosqlite.Connection, task_id: int
+) -> dict[str, Any] | None:
+    """Одна задача в форме строки блокера (#1448): та же, что даёт
+    ``list_task_dependencies`` (#485), с ``merges`` по pipeline_merges.
+
+    Читатели доставки (``blocker_delivery``) ждут именно эту строку, а не
+    голый id: без ``merges`` и ``pr_number`` мерж гейта не виден, и
+    доставленная задача читалась бы недоставленной. None — задачи нет.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT t.id AS task_id, t.title, t.status, t.pr_number, "
+        "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id) AS merges "
+        "FROM tasks t WHERE t.id = ?",
+        (task_id,),
+    )
+    return _blocker_entry(dict(rows[0])) if rows else None
+
+
 async def children_as_blockers(
     db: aiosqlite.Connection, parent_id: int
 ) -> list[dict[str, Any]]:

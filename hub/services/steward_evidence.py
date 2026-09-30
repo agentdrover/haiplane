@@ -212,10 +212,22 @@ async def _report_fact(
             f"последний отчёт покрывает генерацию {reported_generation}, "
             f"судится {generation}",
         )
-    return _report_present(review, generation)
+    # Повторы отложенных находок (#1448) считает тот же предикат, что у
+    # автопилота. Только живой путь: у исторического пакета (#1167) базы нет,
+    # и он честно остаётся строгим — незнание блокирует.
+    from hub.services.gate_grounds import deferred_repeats
+
+    repeats = await deferred_repeats(
+        db, task_id, _finding_dicts(review.get("findings_confirmed"))
+    )
+    return _report_present(review, generation, repeats)
 
 
-def _report_present(review: dict[str, Any], generation: int) -> EvidenceFact:
+def _report_present(
+    review: dict[str, Any],
+    generation: int,
+    deferred_repeats: dict[str, dict[str, Any]] | None = None,
+) -> EvidenceFact:
     """Один отчёт, разложенный в факт. Общий для живого и исторического пути.
 
     Вынесено ради одного: два места, раскладывающие один и тот же отчёт,
@@ -239,6 +251,9 @@ def _report_present(review: dict[str, Any], generation: int) -> EvidenceFact:
         incomplete=bool(review.get("incomplete")),
         tokens_spent=review.get("tokens_spent"),
         self_reviewed=bool(review.get("self_reviewed")),
+        # uid -> {linked_task_id, title}: confirmed-повторы, по которым отчёт
+        # уже дан исходом deferred (#1448). Пусто — правило не применялось.
+        deferred_repeats=deferred_repeats or {},
     )
 
 

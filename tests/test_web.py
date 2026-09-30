@@ -5604,6 +5604,55 @@ async def test_card_agrees_on_a_finding_an_observation_closed(client: AsyncClien
     assert page.count("судьба не названа") == 1
 
 
+async def test_card_names_a_repeat_of_a_deferred_finding(client: AsyncClient, db):
+    # #1448: «не блокирует» не значит «спрятано». Повтор находки, отложенной
+    # до недоставленной задачи, назван на строке самой находки; соседняя
+    # находка метки не получает.
+    from hub import repository as repo_module
+    from hub.services.finding_identity import finding_uids
+
+    task_id = await _web_task_in_review(client)
+    follow_up = await repo_module.create_task(
+        db,
+        title="сюда отложено",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="pda_claude",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    prior = await repo_module.insert_machine_review(
+        db, task_id=task_id, submission_generation=0, incomplete=False
+    )
+    await repo_module.upsert_finding_outcome(
+        db,
+        review_id=prior,
+        task_id=task_id,
+        submission_generation=0,
+        finding_uid=finding_uids(_TWO_FINDINGS)[0],
+        finding_index=0,
+        finding_title=_TWO_FINDINGS[0]["title"],
+        outcome="deferred",
+        note="",
+        linked_task_id=follow_up,
+        reported_by="pda_claude",
+    )
+    await db.commit()
+    await _machine_report(
+        client, task_id, findings_confirmed=_TWO_FINDINGS, raw_count=3
+    )
+
+    page = (await client.get(f"/tasks/{task_id}")).text
+
+    assert "отложена до" in page and f"#{follow_up}</a>, повтор не блокирует" in page
+    assert page.count("повтор не блокирует") == 1
+
+
 async def test_disposition_is_corrected_not_duplicated(client: AsyncClient, db):
     # A gate that changes its mind corrects the row instead of leaving two
     # contradictory ones for the metrics to average.

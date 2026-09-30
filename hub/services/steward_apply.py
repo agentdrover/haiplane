@@ -290,7 +290,14 @@ async def closure_refusals(
         name: [f for f in (value.get(name) or []) if isinstance(f, dict)]
         for name in grounds.ACCOUNTABLE_SECTIONS
     }
-    owed = _findings_owing_an_account(sections)
+    # Повтор находки, отложенной до недоставленной задачи, отчёта не требует
+    # (#1448): предикат тот же, что у автовердикта, и посчитан в пакете.
+    repeats = value.get("deferred_repeats") or {}
+    owed = [
+        entry
+        for entry in _findings_owing_an_account(sections)
+        if not (entry[0] == "confirmed" and entry[1] in repeats)
+    ]
     if not owed:
         return []
     confirmed = sections.get("confirmed") or []

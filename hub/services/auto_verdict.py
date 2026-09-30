@@ -190,6 +190,17 @@ def _finding_dicts(raw: str | None) -> list[dict]:
     return [f for f in value if isinstance(f, dict)]
 
 
+def _repeats_note(repeats: dict[str, dict]) -> str:
+    """Строка карточки про повторы отложенных: видны, а не спрятаны (#1448)."""
+    if not repeats:
+        return ""
+    named = "; ".join(
+        f"«{r['title'][:80]}» отложена до #{r['linked_task_id']}"
+        for r in repeats.values()
+    )
+    return f" — все повторы отложенных, повтор не блокирует: {named}"
+
+
 async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     """Issue APPROVED for the current submission when policy and facts allow.
 
@@ -266,8 +277,12 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     # same reason the loud five do: the steward has to refuse where this
     # refuses, and it did not — ``unresolved`` was invisible to it entirely.
     # Silent here and named there is fine; two different lists would not be.
+    # Повтор находки, осознанно отложенной до НЕдоставленной задачи, отчёта
+    # не требует (#1448): тот же предикат читает стюард, и он же показан в
+    # карточке. Security и прочие границы держит сам предикат.
+    repeats = await grounds.deferred_repeats(db, task_id, confirmed)
     if grounds.unattended_blockers(
-        confirmed, unresolved, bool(review.get("incomplete"))
+        confirmed, unresolved, bool(review.get("incomplete")), repeats
     ):
         return False
     raw_count = review.get("raw_count") or 0
@@ -415,7 +430,8 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
         (
             f"Автовердикт APPROVED политикой проекта {project['slug']} "
             f"(verdict=auto). Основания: machine-review #{review['id']} "
-            f"(gen {generation}, raw {review.get('raw_count')}, confirmed 0), "
+            f"(gen {generation}, raw {review.get('raw_count')}, "
+            f"confirmed {len(confirmed)}{_repeats_note(repeats)}), "
             f"CI {VALIDATION_PASS} на {pinned_sha[:12]}, вершина ветки на "
             "месте, дифф в заявленных областях, класс не вырос. "
             f"Разнородность моделей: код {implementer_model}, ревью "
