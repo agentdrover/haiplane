@@ -31,9 +31,17 @@ import aiosqlite
 
 from hub.db import fetchall
 from hub.services.defect_release import project_scope
+from hub.services.metrics_scope import Scope
 
-# The one definition of "a prod defect of the window" (#916, #918).
-PROD_DEFECT_IN_WINDOW_SQL = "t.found_in = 'prod' AND t.created_at >= datetime('now', ?)"
+# The one definition of "a prod defect of the window" (#916, #918): the stage
+# here, the window and the project from the scope (#1490).
+PROD_DEFECT_STAGE_SQL = "t.found_in = 'prod'"
+
+
+def _prod_defect_where(scope: Scope) -> tuple[str, list[Any]]:
+    cond, params = scope.where("t.created_at", task_column="t.id")
+    return f"{PROD_DEFECT_STAGE_SQL} AND {cond}", params
+
 
 # Below this many deploys a share is noise: the page and the MCP text print
 # "small sample" instead of a percentage; the data still carries the rate.
@@ -82,8 +90,9 @@ def _summary(values: list[float], unmeasurable: dict[str, int]) -> dict[str, Any
     }
 
 
-async def prod_defect_clocks(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+async def prod_defect_clocks(db: aiosqlite.Connection, scope: Scope) -> dict[str, Any]:
     """Medians of both clocks over prod defects filed in the window."""
+    where, params = _prod_defect_where(scope)
     rows = await fetchall(
         db,
         "SELECT t.status, t.detected_at, t.resolved_at, t.release_id, "
@@ -93,8 +102,8 @@ async def prod_defect_clocks(db: aiosqlite.Connection, since: str) -> dict[str, 
         "(julianday(t.resolved_at) - julianday(t.detected_at)) * 24.0 "
         "AS restore_hours "
         "FROM tasks t LEFT JOIN releases r ON r.id = t.release_id "
-        f"WHERE {PROD_DEFECT_IN_WINDOW_SQL}",  # nosec B608 - constant SQL
-        (since,),
+        f"WHERE {where}",  # nosec B608 - constant SQL
+        tuple(params),
     )
     clocks: dict[str, tuple[list[float], dict[str, int]]] = {
         "time_to_detect": ([], {}),
@@ -118,17 +127,18 @@ async def prod_defect_clocks(db: aiosqlite.Connection, since: str) -> dict[str, 
     }
 
 
-async def measured_escapes(db: aiosqlite.Connection, since: str) -> int:
+async def measured_escapes(db: aiosqlite.Connection, scope: Scope) -> int:
     """Prod defects filed in the window, read from ``found_in`` (#918).
 
     Recorded, not derived: no feature ancestor and no completion stamp are
     needed, so a prod defect hanging under an epic or under nothing is counted
     here instead of disappearing into ``bugs_without_feature``.
     """
+    where, params = _prod_defect_where(scope)
     rows = await fetchall(
         db,
-        f"SELECT COUNT(*) AS n FROM tasks t WHERE {PROD_DEFECT_IN_WINDOW_SQL}",  # nosec B608 - constant SQL
-        (since,),
+        f"SELECT COUNT(*) AS n FROM tasks t WHERE {where}",  # nosec B608 - constant SQL
+        tuple(params),
     )
     return int(rows[0]["n"] or 0) if rows else 0
 
@@ -140,9 +150,8 @@ SHIFT_LEFT_STAGES = ("review", "ci", "test", "staging", "prod", "unknown")
 # stage was recorded. The second half keeps the prod bucket equal to
 # ``measured_escapes`` — a prod defect filed under another work type is counted
 # in both, never in one only.
-DEFECT_IN_WINDOW_SQL = (
-    "(t.work_type = 'bug' OR COALESCE(t.found_in, 'unknown') != 'unknown') "
-    "AND t.created_at >= datetime('now', ?)"
+DEFECT_KIND_SQL = (
+    "(t.work_type = 'bug' OR COALESCE(t.found_in, 'unknown') != 'unknown')"
 )
 
 
@@ -150,7 +159,7 @@ def _share(part: int, whole: int) -> float | None:
     return round(part / whole, 3) if whole else None
 
 
-async def shift_left(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+async def shift_left(db: aiosqlite.Connection, scope: Scope) -> dict[str, Any]:
     """Defects filed in the window by the stage that caught them (#914).
 
     Every stage gets a row, an empty one too: a missing ``staging`` row and a
@@ -159,12 +168,13 @@ async def shift_left(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
     stages alone would read as a finished picture while a third of the rows
     say nothing. With no defects the shares are ``None``, not zero.
     """
+    cond, params = scope.where("t.created_at", task_column="t.id")
     rows = await fetchall(
         db,
         "SELECT COALESCE(t.found_in, 'unknown') AS stage, COUNT(*) AS n "
-        f"FROM tasks t WHERE {DEFECT_IN_WINDOW_SQL} "  # nosec B608 - constant SQL
+        f"FROM tasks t WHERE {DEFECT_KIND_SQL} AND {cond} "  # nosec B608 - constant SQL
         "GROUP BY stage",
-        (since,),
+        tuple(params),
     )
     counts = {str(r["stage"]): int(r["n"] or 0) for r in rows}
     total = sum(counts.values())
@@ -206,7 +216,7 @@ def _cfr_row(slug: str, deploys: int, failed: int) -> dict[str, Any]:
     }
 
 
-async def change_failure_rate(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+async def change_failure_rate(db: aiosqlite.Connection, scope: Scope) -> dict[str, Any]:
     """Share of successful deploys of the window that a prod defect points at.
 
     Denominator: ``releases`` rows with status ``success`` whose
@@ -216,13 +226,14 @@ async def change_failure_rate(db: aiosqlite.Connection, since: str) -> dict[str,
     Prod defects of the window with no release bound cannot point at a deploy;
     they are counted in ``defects_without_release``, never guessed.
     """
+    window, window_params = scope.window_sql("r.deployed_at")
     rows = await fetchall(
         db,
         "SELECT r.project_id, EXISTS (SELECT 1 FROM tasks t "
         "WHERE t.release_id = r.id AND t.found_in = 'prod') AS failed "
         "FROM releases r WHERE r.status = 'success' "
-        "AND r.deployed_at >= datetime('now', ?)",
-        (since,),
+        f"AND {window}",  # nosec B608 - constant SQL
+        tuple(window_params),
     )
     counts: dict[int | None, list[int]] = {}
     cache: dict[Any, Any] = {}
@@ -235,11 +246,12 @@ async def change_failure_rate(db: aiosqlite.Connection, since: str) -> dict[str,
         int(r["id"]): str(r["slug"])
         for r in await fetchall(db, "SELECT id, slug FROM projects")
     }
+    where, params = _prod_defect_where(scope)
     unbound = await fetchall(
         db,
         "SELECT COUNT(*) AS n FROM tasks t "  # nosec B608 - constant SQL
-        f"WHERE {PROD_DEFECT_IN_WINDOW_SQL} AND t.release_id IS NULL",
-        (since,),
+        f"WHERE {where} AND t.release_id IS NULL",
+        tuple(params),
     )
     by_project = [
         _cfr_row(
@@ -247,6 +259,9 @@ async def change_failure_rate(db: aiosqlite.Connection, since: str) -> dict[str,
         )
         for key, pair in counts.items()
     ]
+    # The project filter is the row's own name: a release is bound to a
+    # project by ``project_scope`` (#915), not by the task walk.
+    by_project = [row for row in by_project if scope.project_admits(row["project"])]
     return {
         "min_sample": CFR_MIN_DEPLOYS,
         "by_project": sorted(by_project, key=lambda r: r["project"]),

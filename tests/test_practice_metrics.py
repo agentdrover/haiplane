@@ -17,6 +17,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
+import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
@@ -2559,3 +2560,587 @@ async def test_review_economy_red_ci_rows_cover_every_run(
         + red_ci["runs_ci_skipped"]
         + red_ci["runs_without_ci_report"]
     ) == econ["runs"]["total"]
+
+
+# --- Slices: project, reviewer model, dates, previous period (#1490) ---------
+#
+# One scope object feeds every section (hub/services/metrics_scope.py). A
+# filter that narrowed only the sections somebody remembered would be the
+# mixed total this task exists to remove, so the tests read several sections
+# under one filter.
+
+LEGACY_KEYS = {
+    "since_days",
+    "machine_reviews",
+    "incomplete_reasons",
+    "review_model_cascade",
+    "review_dispatches",
+    "by_harness",
+    "by_profile",
+    "by_reviewer_model",
+    "recurring_categories",
+    "category_debt",
+    "rule_breaches",
+    "cycle_times",
+    "escaped_defects",
+    "prod_defect_clocks",
+    "change_failure_rate",
+    "shift_left",
+    "model_declarations",
+    "human_gates",
+    "steward_shadow",
+    "human_touches",
+    "review_outcomes",
+    "validation_run_lines",
+    "executor_runs",
+    "review_economy",
+}
+
+
+async def _completed(
+    db: aiosqlite.Connection,
+    title: str,
+    *,
+    project_id: int | None = None,
+    hours: float = 5.0,
+    completed_days_ago: float = 3.0,
+) -> int:
+    """A finished feature whose cycle time is exactly ``hours``."""
+    task_id = await _task(db, title=title, status="completed", project_id=project_id)
+    await db.execute(
+        "UPDATE tasks SET work_type='feature', ready_at=?, completed_at=? WHERE id=?",
+        (
+            _ts(completed_days_ago * 24.0 + hours),
+            _ts(completed_days_ago * 24.0),
+            task_id,
+        ),
+    )
+    return task_id
+
+
+async def _report_at(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    model: str = "",
+    days_ago: float = 1.0,
+    confirmed: int = 1,
+) -> None:
+    await _report(db, task_id, confirmed=confirmed)
+    await db.execute(
+        "UPDATE machine_reviews SET model=?, created_at=? WHERE task_id=?",
+        (model, _ts(days_ago * 24.0), task_id),
+    )
+
+
+async def test_metrics_filter_by_project(db: aiosqlite.Connection):
+    """AC-1 (#1490): every section counts only the project's tasks."""
+    spike = await repo.create_project(db, slug="spike", name="Spike")
+    d1 = await _task(db, title="default 1")
+    d2 = await _task(db, title="default 2")
+    s1 = await _task(db, title="spike 1", project_id=spike)
+    for tid in (d1, d2):
+        await _report_at(db, tid, confirmed=2)
+    await _report_at(db, s1, confirmed=1)
+    await _completed(db, "default feature", hours=10.0)
+    await _completed(db, "spike feature", project_id=spike, hours=4.0)
+    escaped = await _defect(db, title="spike prod defect", found_in="prod")
+    await db.execute("UPDATE tasks SET project_id=? WHERE id=?", (spike, escaped))
+    await _verdict(db, d1, "approved")
+    await _verdict(db, s1, "changes_requested")
+    await db.commit()
+
+    everything = await practice_metrics(db)
+    only_spike = await practice_metrics(db, project="spike")
+    only_default = await practice_metrics(db, project="default")
+
+    assert everything["machine_reviews"]["confirmed_total"] == 5
+    assert only_spike["machine_reviews"]["confirmed_total"] == 1
+    assert only_default["machine_reviews"]["confirmed_total"] == 4
+    assert only_spike["review_economy"]["reconciliation"]["reports"] == 1
+    assert only_spike["review_economy"]["findings"]["confirmed_total"] == 1
+    features = {
+        name: {r["work_type"]: r for r in m["cycle_times"]}["feature"]
+        for name, m in (("all", everything), ("spike", only_spike))
+    }
+    assert features["all"]["tasks"] == 2
+    assert features["spike"]["tasks"] == 1
+    assert features["spike"]["median_hours"] == 4.0
+    assert only_spike["shift_left"]["defects"] == 1
+    assert only_default["shift_left"]["defects"] == 0
+    assert only_spike["escaped_defects"]["escaped"] == 1
+    assert only_spike["review_outcomes"]["verdicts"] == 1
+    assert only_spike["review_outcomes"]["changes_requested"] == 1
+    assert only_default["review_outcomes"]["approved"] == 1
+    assert everything["review_outcomes"]["verdicts"] == 2
+    assert {g["project"] for g in only_spike["human_gates"]} <= {"spike"}
+    assert only_spike["scope"]["project"] == "spike"
+
+
+async def test_metrics_unknown_project_is_refused(db: aiosqlite.Connection):
+    with pytest.raises(ValueError, match="unknown project"):
+        await practice_metrics(db, project="no-such-project")
+
+
+async def _verdict_pack(
+    db: aiosqlite.Connection, *, approved: int, changed: int, days_ago: float
+) -> None:
+    for i in range(approved):
+        tid = await _task(db, title=f"ok {days_ago} {i}")
+        await _verdict(db, tid, "approved", days_ago=days_ago)
+    for i in range(changed):
+        tid = await _task(db, title=f"rework {days_ago} {i}")
+        await _verdict(db, tid, "changes_requested", days_ago=days_ago)
+
+
+def _indicator_row(comparison: dict, key: str) -> dict:
+    return {r["key"]: r for r in comparison["indicators"]}[key]
+
+
+async def test_metrics_period_comparison_delta(db: aiosqlite.Connection):
+    """AC-2 (#1490): current, previous and delta; no delta below the floor."""
+    # Window: the last 30 days; the previous one is days 30..60 back.
+    await _verdict_pack(db, approved=10, changed=0, days_ago=5)
+    await _verdict_pack(db, approved=5, changed=5, days_ago=40)
+    await db.commit()
+
+    cmp = (await practice_metrics(db, since_days=30, compare=True))["comparison"]
+    row = _indicator_row(cmp, "first_pass")
+    assert (row["current"], row["current_n"]) == (1.0, 10)
+    assert (row["previous"], row["previous_n"]) == (0.5, 10)
+    assert row["delta"] == 0.5
+    assert row["delta_rel"] == 1.0
+    assert (row["status"], row["direction"]) == ("compared", "better")
+    assert cmp["min_compare_n"] == 10
+    # Not a single number is invented for a key indicator without data.
+    cfr = _indicator_row(cmp, "change_failure_rate")
+    assert (cfr["current"], cfr["previous"], cfr["delta"]) == (None, None, None)
+    assert cfr["status"] == "insufficient_data"
+
+    # No previous data at all: the delta is not made up.
+    lonely = (await practice_metrics(db, since_days=8, compare=True))["comparison"]
+    lonely_row = _indicator_row(lonely, "first_pass")
+    assert lonely_row["previous"] is None
+    assert lonely_row["delta"] is None
+    assert lonely_row["reason"] == "no_previous_data"
+
+    # Nine in one window is below MIN_COMPARE_N: both values show, no delta.
+    await db.execute("DELETE FROM events WHERE kind='review_verdict_recorded'")
+    await _verdict_pack(db, approved=9, changed=0, days_ago=5)
+    await _verdict_pack(db, approved=10, changed=0, days_ago=40)
+    await db.commit()
+    thin = _indicator_row(
+        (await practice_metrics(db, since_days=30, compare=True))["comparison"],
+        "first_pass",
+    )
+    assert (thin["current"], thin["previous"]) == (1.0, 1.0)
+    assert thin["delta"] is None and thin["direction"] is None
+    assert thin["reason"] == "below_min_n"
+
+    # Under 5% relative change is "no change", not a move: 1.0 against 0.975.
+    await db.execute("DELETE FROM events WHERE kind='review_verdict_recorded'")
+    await _verdict_pack(db, approved=20, changed=0, days_ago=5)
+    await _verdict_pack(db, approved=39, changed=1, days_ago=40)
+    await db.commit()
+    flat = _indicator_row(
+        (await practice_metrics(db, since_days=30, compare=True))["comparison"],
+        "first_pass",
+    )
+    assert (flat["status"], flat["direction"]) == ("compared", "flat")
+    assert flat["delta_rel"] == 0.026
+
+
+async def test_metrics_period_comparison_uses_same_window_length(
+    db: aiosqlite.Connection,
+):
+    await _verdict_pack(db, approved=1, changed=0, days_ago=5)
+    result = await practice_metrics(
+        db, date_from="2026-01-11", date_to="2026-01-20", compare=True
+    )
+    previous = result["comparison"]["previous_window"]
+    assert previous["from"] == "2026-01-01 00:00:00"
+    assert previous["to"] == "2026-01-11 00:00:00"
+    assert previous["days"] == result["scope"]["days"] == 10
+
+
+async def test_metrics_filter_by_model_keeps_unknown_group(
+    db: aiosqlite.Connection,
+):
+    """AC-3 (#1490): the reviewer model filter keeps the «не заявлена» group
+    and leaves the model-blind blocks exactly as they were."""
+    t1 = await _task(db, title="grok")
+    t2 = await _task(db, title="kimi")
+    t3 = await _task(db, title="no model recorded")
+    await _judged(db, t1, ["fixed", "fixed"], model="grok-4.6")
+    await _judged(db, t2, ["fixed"], model="kimi-k3")
+    await _judged(db, t3, ["false_positive"], model="")
+    await _completed(db, "feature", hours=6.0)
+    await _defect(db, title="prod defect", found_in="prod")
+    await db.commit()
+
+    plain = await practice_metrics(db)
+    assert {m["model"] for m in plain["by_reviewer_model"]} == {
+        "grok-4.6",
+        "kimi-k3",
+        "не заявлена",
+    }
+    assert "scope" not in plain
+
+    unknown = await practice_metrics(db, model="не заявлена")
+    assert [m["model"] for m in unknown["by_reviewer_model"]] == ["не заявлена"]
+    assert unknown["machine_reviews"]["reviews"] == 1
+    assert unknown["machine_reviews"]["dispositions"]["false_positive"] == 1
+    assert unknown["review_economy"]["findings"]["confirmed_total"] == 1
+
+    grok = await practice_metrics(db, model="grok-4.6")
+    assert grok["machine_reviews"]["reviews"] == 1
+    assert grok["machine_reviews"]["confirmed_total"] == 2
+
+    for section in ("cycle_times", "change_failure_rate", "shift_left"):
+        assert grok[section] == plain[section], section
+        assert section in grok["scope"]["model_independent"]
+    assert grok["scope"]["model"] == "grok-4.6"
+    assert plain["machine_reviews"]["reviews"] == 3
+
+
+async def test_metrics_since_days_backward_compatible(db: aiosqlite.Connection):
+    """AC-4 (#1490): since_days alone answers as before — the same keys and
+    no slice, comparison, series or ranking added."""
+    t1 = await _task(db, title="reviewed")
+    await _judged(db, t1, ["fixed", "false_positive"])
+    await _completed(db, "feature")
+    await db.commit()
+
+    plain = await practice_metrics(db, since_days=30)
+    assert set(plain) == LEGACY_KEYS
+    assert plain["since_days"] == 30
+    assert plain["machine_reviews"]["reviews"] == 1
+    assert plain["machine_reviews"]["dispositions"]["judged"] == 2
+    assert plain == await practice_metrics(db, since_days=30, project=None)
+    # The default stays the one named constant.
+    assert (await practice_metrics(db))["since_days"] == 90
+
+
+async def test_metrics_series_empty_bucket_is_missing_not_zero(
+    db: aiosqlite.Connection,
+):
+    """AC-5 (#1490): a bucket without observations has no value, not 0; a
+    bucket with data equals the same window asked for directly."""
+    today = datetime.now(UTC).date()
+    start = today - timedelta(days=27)
+    await _verdict_pack(db, approved=2, changed=0, days_ago=26)  # bucket 1
+    await _verdict_pack(db, approved=1, changed=1, days_ago=1)  # bucket 4
+    await db.commit()
+
+    result = await practice_metrics(
+        db,
+        date_from=start.isoformat(),
+        date_to=today.isoformat(),
+        series=True,
+        series_days=7,
+    )
+    series = {i["key"]: i for i in result["series"]["indicators"]}["first_pass"]
+    points = series["points"]
+    assert len(points) == 4
+    assert [p["n"] for p in points] == [2, 0, 0, 2]
+    assert points[1]["value"] is None and points[2]["value"] is None
+    assert points[0]["value"] == 1.0 and points[3]["value"] == 0.5
+    # Every key indicator answers the same way for a bucket with no data.
+    for indicator in result["series"]["indicators"]:
+        assert all(p["value"] is None for p in indicator["points"][1:3])
+
+    # The same code: bucket 4 is the window of its own dates.
+    last = points[3]
+    direct = await practice_metrics(
+        db,
+        date_from=last["from"][:10],
+        date_to=(datetime.strptime(last["to"], "%Y-%m-%d %H:%M:%S") - timedelta(days=1))
+        .date()
+        .isoformat(),
+    )
+    assert direct["review_outcomes"]["first_pass_acceptance_rate"] == last["value"]
+    assert direct["review_outcomes"]["tasks"] == last["n"]
+
+
+async def test_metrics_problem_spots_ranked_worse_first(db: aiosqlite.Connection):
+    """AC-6 (#1490): the ranking follows the spec — unchecked debt first, then
+    the worsened indicator; an improved one is not listed at all; the order is
+    stable; with no previous window nothing is claimed to have worsened."""
+    # first-pass worsens 1.0 -> 0.5 (n=10 each): a problem.
+    await _verdict_pack(db, approved=10, changed=0, days_ago=40)
+    await _verdict_pack(db, approved=5, changed=5, days_ago=5)
+    # precision improves 0.5 -> 1.0 (n=10 each): not a problem, not listed.
+    old = await _task(db, title="old judged")
+    await _judged(db, old, ["fixed"] * 5 + ["false_positive"] * 5)
+    await db.execute(
+        "UPDATE machine_reviews SET created_at=? WHERE task_id=?", (_ts(40 * 24), old)
+    )
+    new = await _task(db, title="new judged")
+    await _judged(db, new, ["fixed"] * 10)
+    # A category seen in three tasks with no check: debt.
+    for i in range(3):
+        await _categorised(db, f"debt {i}", ["flaky-shape"])
+    await db.commit()
+
+    result = await practice_metrics(db, since_days=30, compare=True)
+    spots = result["problem_spots"]
+    kinds = [s["kind"] for s in spots]
+    assert kinds[0] == "debt_unchecked"
+    assert spots[0]["title"] == "flaky-shape"
+    assert "worsened" in kinds
+    assert kinds.index("debt_unchecked") < kinds.index("worsened")
+    titles = [s["title"] for s in spots]
+    assert "Precision ревью" not in titles
+    worse = [s for s in spots if s["kind"] == "worsened"]
+    assert [s["key"] for s in worse] == ["first_pass"]
+    assert [s["rank"] for s in spots] == list(range(1, len(spots) + 1))
+    assert result["problem_spots_more"] == 0
+
+    again = await practice_metrics(db, since_days=30, compare=True)
+    assert again["problem_spots"] == spots, "the order is deterministic"
+
+    # No previous window behind the current one: no worsening is claimed.
+    blank = await practice_metrics(db, since_days=1, compare=True)
+    assert "worsened" not in [s["kind"] for s in blank["problem_spots"]]
+    assert "debt_unchecked" in [s["kind"] for s in blank["problem_spots"]]
+
+
+def test_problem_spots_group_order_and_cap():
+    from hub.services.metrics_compare import MAX_SPOTS, rank_problem_spots
+
+    metrics = {
+        "category_debt": [
+            {"category": "b", "tasks": 3, "findings": 4, "covered": False},
+            {"category": "a", "tasks": 3, "findings": 4, "covered": False},
+            {"category": "done", "tasks": 9, "findings": 9, "covered": True},
+            {"category": "big", "tasks": 5, "findings": 1, "covered": False},
+        ],
+        "rule_breaches": {
+            "breached": [
+                {"category": "r1", "breaches": 1},
+                {"category": "r2", "breaches": 4},
+            ]
+        },
+        "review_economy": {"reconciliation": {"gap": 3}, "runs": {"unbilled": 7}},
+        "machine_reviews": {"dispositions": {"confirmed_unjudged": 0}},
+        "shift_left": {"unknown_share": 0.3, "unknown": 3, "defects": 10},
+    }
+    comparison = {
+        "indicators": [
+            {
+                "key": "touches_per_delivered",
+                "label": "t",
+                "status": "compared",
+                "direction": "worse",
+                "delta_rel": 0.2,
+                "source_field": "x",
+                "previous": 1,
+                "previous_n": 10,
+                "current": 1.2,
+                "current_n": 10,
+            },
+            {
+                "key": "first_pass",
+                "label": "f",
+                "status": "compared",
+                "direction": "worse",
+                "delta_rel": 0.09,  # under 10%: not a problem
+                "source_field": "x",
+                "previous": 1,
+                "previous_n": 10,
+                "current": 0.9,
+                "current_n": 10,
+            },
+        ]
+    }
+    spots, more = rank_problem_spots(metrics, comparison)
+    assert [(s["kind"], s["title"]) for s in spots[:3]] == [
+        ("debt_unchecked", "big"),
+        ("debt_unchecked", "a"),
+        ("debt_unchecked", "b"),
+    ]
+    assert [s["title"] for s in spots if s["kind"] == "rule_breached"] == ["r2", "r1"]
+    assert [s["title"] for s in spots if s["kind"] == "worsened"] == ["t"]
+    assert len(spots) == MAX_SPOTS
+    # 3 debt + 2 rules + 1 worsened + 3 gaps = 9 candidates; 7 are shown.
+    assert more == 2
+
+
+async def test_rest_practice_metrics_takes_the_slice(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1490: REST carries project, model, dates, compare and series."""
+    await repo.create_project(db, slug="spike", name="Spike")
+    tid = await _task(db, title="reviewed")
+    await _judged(db, tid, ["fixed"], model="grok-4.6")
+    await db.commit()
+
+    body = (
+        await client.get(
+            "/api/metrics/practices",
+            params={
+                "project": "default",
+                "model": "grok-4.6",
+                "since_days": 30,
+                "compare": "true",
+                "series": "true",
+                "series_days": 10,
+            },
+        )
+    ).json()
+    assert body["scope"]["project"] == "default"
+    assert body["scope"]["model"] == "grok-4.6"
+    assert body["machine_reviews"]["reviews"] == 1
+    assert "problem_spots" in body and "comparison" in body
+    assert body["series"]["bucket_days"] == 10
+
+    other = (
+        await client.get("/api/metrics/practices", params={"project": "spike"})
+    ).json()
+    assert other["machine_reviews"]["reviews"] == 0
+
+    dated = (
+        await client.get(
+            "/api/metrics/practices",
+            params={"date_from": "2020-01-01", "date_to": "2020-01-31"},
+        )
+    ).json()
+    assert dated["since_days"] == 31
+    assert dated["machine_reviews"]["reviews"] == 0
+
+    plain = (await client.get("/api/metrics/practices")).json()
+    assert set(plain) == LEGACY_KEYS
+
+
+async def test_rest_practice_metrics_refuses_bad_slice(client: AsyncClient):
+    missing = await client.get("/api/metrics/practices?project=nope")
+    assert missing.status_code == 400
+    assert "unknown project" in missing.json()["detail"]
+    bad_date = await client.get("/api/metrics/practices?date_from=01.02.2026")
+    assert bad_date.status_code == 400
+    backwards = await client.get(
+        "/api/metrics/practices?date_from=2026-02-02&date_to=2026-02-01"
+    )
+    assert backwards.status_code == 400
+
+
+def test_cli_practice_metrics_passes_the_slice(capsys):
+    import sys
+    from unittest.mock import patch
+
+    from hub import cli
+
+    argv = [
+        "oc-hub",
+        "practice-metrics",
+        "--since-days",
+        "30",
+        "--project",
+        "spike",
+        "--model",
+        "не заявлена",
+        "--date-from",
+        "2026-01-01",
+        "--compare",
+        "--series",
+        "--series-days",
+        "14",
+    ]
+    with (
+        patch.object(sys, "argv", argv),
+        patch.object(cli, "_api", return_value={"since_days": 30}) as api,
+    ):
+        rc = cli.main()
+    assert rc in (0, None)
+    method, url = api.call_args.args[:2]
+    assert method == "GET"
+    assert url.startswith("/api/metrics/practices?since_days=30")
+    for part in (
+        "project=spike",
+        "model=%D0%BD%D0%B5+%D0%B7%D0%B0%D1%8F%D0%B2%D0%BB%D0%B5%D0%BD%D0%B0",
+        "date_from=2026-01-01",
+        "compare=true",
+        "series=true",
+        "series_days=14",
+    ):
+        assert part in url, url
+    assert "date_to" not in url
+    assert json.loads(capsys.readouterr().out) == {"since_days": 30}
+
+    with (
+        patch.object(sys, "argv", ["oc-hub", "practice-metrics"]),
+        patch.object(cli, "_api", return_value={}) as plain,
+    ):
+        cli.main()
+    assert (
+        plain.call_args.args[1] == "/api/metrics/practices?since_days=90&series_days=7"
+    )
+
+
+async def test_mcp_practice_metrics_passes_the_slice_and_names_the_ranking():
+    from unittest.mock import AsyncMock, patch
+
+    from hub.mcp_server import hub_practice_metrics
+
+    data = {
+        "since_days": 30,
+        "scope": {
+            "project": "spike",
+            "model": "grok-4.6",
+            "from": "2026-01-01 00:00:00",
+            "to": None,
+            "days": 30,
+            "model_independent": ["cycle_times", "shift_left"],
+        },
+        "comparison": {
+            "indicators": [
+                {
+                    "label": "С первого раза (first-pass)",
+                    "current": 0.5,
+                    "current_n": 10,
+                    "previous": 1.0,
+                    "previous_n": 10,
+                    "delta": -0.5,
+                    "direction": "worse",
+                    "reason": "",
+                },
+                {
+                    "label": "Change failure rate",
+                    "current": None,
+                    "current_n": 0,
+                    "previous": None,
+                    "previous_n": 0,
+                    "delta": None,
+                    "direction": None,
+                    "reason": "no_current_data",
+                },
+            ]
+        },
+        "problem_spots": [
+            {
+                "rank": 1,
+                "kind": "worsened",
+                "title": "С первого раза (first-pass)",
+                "reason": "было 1.0 (n=10), стало 0.5 (n=10)",
+            }
+        ],
+    }
+    with patch("hub.mcp_server._api_get", new_callable=AsyncMock) as get:
+        get.return_value = data
+        result = await hub_practice_metrics(
+            project="spike", model="grok-4.6", compare=True, date_from="2026-01-01"
+        )
+    url = get.call_args.args[0]
+    for part in (
+        "project=spike",
+        "model=grok-4.6",
+        "date_from=2026-01-01",
+        "compare=true",
+    ):
+        assert part in url, url
+    assert "series" not in url
+    text = result.content[0].text
+    assert "Slice: project=spike, reviewer model=grok-4.6" in text
+    assert "Model filter does not apply to: cycle_times, shift_left" in text
+    assert "insufficient data (no_current_data)" in text
+    assert "Problem #1 [worsened]" in text

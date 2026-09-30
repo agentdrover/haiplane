@@ -3655,16 +3655,73 @@ def _rule_breach_lines(report: dict[str, Any]) -> list[str]:
     ]
 
 
+def _practice_slice_lines(data: dict[str, Any]) -> list[str]:
+    """Slice, comparison and problem spots of a filtered call (#1490)."""
+    scope = data.get("scope")
+    if not scope:
+        return []
+    lines = [
+        f"Slice: project={scope.get('project') or 'all'}, "
+        f"reviewer model={scope.get('model') or 'all'}, "
+        f"{scope.get('from')} .. {scope.get('to') or 'now'}"
+    ]
+    if scope.get("model_independent"):
+        lines.append(
+            "Model filter does not apply to: " + ", ".join(scope["model_independent"])
+        )
+    for row in (data.get("comparison") or {}).get("indicators", []):
+        delta = row.get("delta")
+        lines.append(
+            f"{row['label']}: {row['current']} (n={row['current_n']}) vs "
+            f"{row['previous']} (n={row['previous_n']}) — "
+            + (
+                f"{row['direction']}, delta {delta}"
+                if delta is not None
+                else f"insufficient data ({row['reason']})"
+            )
+        )
+    lines.extend(
+        f"Problem #{spot['rank']} [{spot['kind']}] {spot['title']}: {spot['reason']}"
+        for spot in data.get("problem_spots") or []
+    )
+    return lines
+
+
 @mcp.tool()
-async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
-    """Practice metrics (#384): machine-review economics, harness-version
-    comparison, recurring finding categories, task cycle times.
+async def hub_practice_metrics(
+    since_days: int = 90,
+    project: str = "",
+    model: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    compare: bool = False,
+    series: bool = False,
+) -> CallToolResult:
+    """Practice metrics (#384): review economics, cycle times, problem spots.
 
     Args:
-        since_days: Aggregation window in days (default 90).
+        since_days: Window in days (default 90); date_from/date_to replace it.
+        project: Project slug; empty is all projects.
+        model: REVIEWER model; "не заявлена" = reports with none recorded.
+        date_from: YYYY-MM-DD window start.
+        date_to: YYYY-MM-DD window end, inclusive.
+        compare: Add previous window, deltas and ranked problem spots.
+        series: Add key indicators per 7-day bucket.
     """
+    query: dict[str, Any] = {"since_days": since_days}
+    for name, value in (
+        ("project", project),
+        ("model", model),
+        ("date_from", date_from),
+        ("date_to", date_to),
+    ):
+        if value:
+            query[name] = value
+    for name, flag in (("compare", compare), ("series", series)):
+        if flag:
+            query[name] = "true"
     try:
-        data = await _api_get(f"/api/metrics/practices?since_days={since_days}")
+        data = await _api_get(f"/api/metrics/practices?{urllib.parse.urlencode(query)}")
     except HubApiError as exc:
         return _error_result(exc)
     mr = data.get("machine_reviews", {})
@@ -3751,6 +3808,7 @@ async def hub_practice_metrics(since_days: int = 90) -> CallToolResult:
     lines.extend(_change_failure_lines(data))
     lines.extend(_shift_left_lines(data.get("shift_left") or {}))
     lines.extend(_rule_breach_lines(data.get("rule_breaches") or {}))
+    lines.extend(_practice_slice_lines(data))
     recurring = [c for c in data.get("recurring_categories", []) if c.get("recurring")]
     if recurring:
         lines.append(
