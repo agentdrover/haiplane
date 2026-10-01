@@ -2305,6 +2305,13 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE review_dispatches ADD COLUMN usage_checked_at TEXT",
     ),
     (
+        # #1403: кто назначил профиль заказа — правило (rule) или жребий над
+        # lite правила риска (random). Старые строки — rule.
+        "add_review_dispatches_profile_assignment",
+        "ALTER TABLE review_dispatches "
+        "ADD COLUMN profile_assignment TEXT NOT NULL DEFAULT 'rule'",
+    ),
+    (
         # #1413: полная цена заказа по выгрузке Cursor, которую приносит
         # владелец. Рядом с provider_tokens (API агента — нижняя граница),
         # не вместо него. NULL — выгрузка по агенту не импортировалась.
