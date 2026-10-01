@@ -34,6 +34,7 @@ from typing import Any
 import aiosqlite
 
 from hub.db import fetchall
+from hub.services.metrics_scope import Scope
 
 #: A task ruled by nothing is the common case; the list stays short.
 _MAX_TASK_IDS = 10
@@ -166,17 +167,27 @@ async def rules_for_areas(
     return rules
 
 
-async def rule_breaches(db: aiosqlite.Connection) -> dict[str, Any]:
+async def rule_breaches(
+    db: aiosqlite.Connection, scope: Scope | None = None
+) -> dict[str, Any]:
     """Rules whose class came back after they were set up (#920).
 
     Not windowed: a rule is judged against its whole life since it was set up,
     and a window would forgive a breach by letting it age out. Carried-over
     report copies (#1361) are skipped — one finding is one breach, not one per
     base-only merge that re-attached the report.
+
+    ``scope`` (#1490) narrows by project and reviewer model only; the window
+    stays the rule's own life.
     """
     from hub.services.orchestration import ORIGINAL_READ_SQL
 
     catalogue = await _catalogue(db)
+    extra, extra_params = (
+        scope.stock_where(task_column="mr.task_id", model_column="mr.model")
+        if scope is not None
+        else ("1=1", [])
+    )
     rows = await fetchall(
         db,
         "SELECT cc.category AS category, mr.task_id AS task_id, "  # nosec B608 - constant fragment
@@ -185,7 +196,8 @@ async def rule_breaches(db: aiosqlite.Connection) -> dict[str, Any]:
         "JOIN category_checks cc "
         "ON cc.category = json_extract(f.value, '$.category') "
         "WHERE mr.created_at > COALESCE(cc.created_at, cc.recorded_at) "
-        f"AND mr.{ORIGINAL_READ_SQL} ORDER BY mr.created_at ASC",
+        f"AND mr.{ORIGINAL_READ_SQL} AND {extra} ORDER BY mr.created_at ASC",
+        tuple(extra_params),
     )
     hits: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:

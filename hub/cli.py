@@ -419,6 +419,54 @@ def cmd_outcome_debt(args: argparse.Namespace) -> int:
     return 0
 
 
+def _practice_query(args: argparse.Namespace) -> str:
+    """Query string of ``/api/metrics/practices`` from the slice flags (#1490)."""
+    params: dict[str, Any] = {"since_days": args.since_days}
+    for name in ("project", "model", "date_from", "date_to"):
+        value = getattr(args, name, None)
+        if value:
+            params[name] = value
+    for name in ("compare", "series"):
+        if getattr(args, name, False):
+            params[name] = "true"
+    if getattr(args, "series_days", None):
+        params["series_days"] = args.series_days
+    return urllib.parse.urlencode(params)
+
+
+def cmd_practice_metrics(args: argparse.Namespace) -> int:
+    """Practice metrics of a slice (#1490): project, reviewer model, dates,
+    previous-period comparison, series and ranked problem spots."""
+    _print_json(_api("GET", f"/api/metrics/practices?{_practice_query(args)}"))
+    return 0
+
+
+def _add_practice_metrics_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling."""
+    p = sub.add_parser(
+        "practice-metrics",
+        help="Practice metrics of a slice: project, reviewer model, date range, "
+        "previous-period comparison, series and problem spots (#1490)",
+    )
+    p.add_argument("--since-days", type=int, default=90)
+    p.add_argument("--project", default="", help="project slug")
+    p.add_argument(
+        "--model",
+        default="",
+        help="REVIEWER model; 'не заявлена' selects reports with none recorded",
+    )
+    p.add_argument("--date-from", default="", help="YYYY-MM-DD, replaces --since-days")
+    p.add_argument("--date-to", default="", help="YYYY-MM-DD, last day included")
+    p.add_argument(
+        "--compare",
+        action="store_true",
+        help="previous window of the same length, deltas and problem spots",
+    )
+    p.add_argument("--series", action="store_true", help="indicators per bucket")
+    p.add_argument("--series-days", type=int, default=7, help="bucket length")
+    p.set_defaults(func=cmd_practice_metrics)
+
+
 def cmd_review_economy(args: argparse.Namespace) -> int:
     """Owner's review summary (#1406): the review_economy section."""
     result = _api("GET", f"/api/metrics/practices?since_days={args.since_days}")
@@ -474,6 +522,7 @@ def _add_defect_metric_parsers(sub: Any) -> None:
     sits at its complexity ceiling."""
     _add_change_failure_rate_parser(sub)
     _add_shift_left_parser(sub)
+    _add_practice_metrics_parser(sub)
 
 
 def cmd_answer_outcome(args: argparse.Namespace) -> int:

@@ -46,6 +46,7 @@ from hub.models import (
     RiskClass,
 )
 from hub.services import call_sites, project_policy, review_ci_gate
+from hub.services.metrics_scope import Scope
 from hub.services.model_family import family
 from hub.services.orchestration import ORIGINAL_READ_SQL
 from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
@@ -1862,6 +1863,8 @@ def _ladder_cause_note(report: Mapping[str, Any] | None) -> str:
 async def count_environment_refusals(
     db: aiosqlite.Connection,
     since_days: int = ENVIRONMENT_REFUSAL_WINDOW_DAYS,
+    *,
+    scope: Scope | None = None,
 ) -> dict[str, Any]:
     """Сколько отчётов за окно неполны по отказу среды — с размером выборки.
 
@@ -1875,11 +1878,16 @@ async def count_environment_refusals(
     средой всё хорошо», хотя измерено ровно ничего. Такой случай называется
     словом «недобор» (#1153), а не нулём.
     """
+    # #1490: окно, проект и модель-ревьюер — из среза; без него прежнее окно.
+    scope = scope or Scope.relative(since_days)
+    since_days = scope.days
+    where, params = scope.where(
+        "created_at", task_column="task_id", model_column="model"
+    )
     rows = await fetchall(
         db,
-        "SELECT incomplete, incomplete_reason FROM machine_reviews "
-        "WHERE created_at >= datetime('now', ?)",
-        (f"-{int(since_days)} days",),
+        f"SELECT incomplete, incomplete_reason FROM machine_reviews WHERE {where}",  # nosec B608 - constant fragment
+        tuple(params),
     )
     reports_total = len(rows)
     incomplete_rows = [dict(row) for row in rows if row["incomplete"]]
@@ -2227,6 +2235,8 @@ async def _cascade_outcome(db: aiosqlite.Connection, event: dict[str, Any]) -> s
 async def count_model_cascade_outcomes(
     db: aiosqlite.Connection,
     since_days: int = ENVIRONMENT_REFUSAL_WINDOW_DAYS,
+    *,
+    scope: Scope | None = None,
 ) -> dict[str, Any]:
     """Исход второй оси: сколько попыток и сколько дали ПОЛНЫЙ отчёт (#1243).
 
@@ -2234,11 +2244,14 @@ async def count_model_cascade_outcomes(
     MODEL_CASCADE_MIN_SAMPLE попыток с отчётом; ниже — слово «недобор», а не
     число (#1153): «1 из 1» решения о выкате не выдерживает.
     """
+    # #1490: у события нет модели-ревьюера — окно и проект из среза.
+    scope = scope or Scope.relative(since_days)
+    since_days = scope.days
+    where, params = scope.where("created_at", task_column="task_id")
     rows = await fetchall(
         db,
-        "SELECT task_id, payload FROM events WHERE kind = ? "
-        "AND created_at >= datetime('now', ?) ORDER BY id",
-        (MODEL_CASCADE_EVENT, f"-{int(since_days)} days"),
+        f"SELECT task_id, payload FROM events WHERE kind = ? AND {where} ORDER BY id",  # nosec B608 - constant fragment
+        (MODEL_CASCADE_EVENT, *params),
     )
     outcomes = [await _cascade_outcome(db, dict(r)) for r in rows]
     attempts = len(outcomes)

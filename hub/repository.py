@@ -1661,11 +1661,21 @@ UNJUDGED_CATEGORY_SQL = (
 
 
 def _unjudged_where(
-    since: str | None, project_id: int | None, category: str | None = None
+    since: str | None,
+    project_id: int | None,
+    category: str | None = None,
+    extra: tuple[str, Sequence[Any]] | None = None,
 ) -> tuple[str, list[Any]]:
-    """The one place the queue's WHERE is assembled, for list and count alike."""
+    """The one place the queue's WHERE is assembled, for list and count alike.
+
+    ``extra`` is a condition already assembled by the metrics scope (#1490):
+    the project and reviewer model of a metrics slice, in terms of ``mr``.
+    """
     where = _UNJUDGED_FINDINGS_FROM
     params: list[Any] = []
+    if extra is not None and extra[0]:
+        where += f" AND {extra[0]}"
+        params.extend(extra[1])
     if since is not None:
         where += " AND mr.created_at >= datetime('now', ?)"
         params.append(since)
@@ -1755,6 +1765,7 @@ async def count_unjudged_findings(
     *,
     since: str | None = None,
     project_id: int | None = None,
+    extra: tuple[str, Sequence[Any]] | None = None,
 ) -> dict[str, int]:
     """How many findings wait, and across how many reports.
 
@@ -1763,7 +1774,7 @@ async def count_unjudged_findings(
     it are the same question, and answering it twice is how the two start
     disagreeing.
     """
-    where, params = _unjudged_where(since, project_id)
+    where, params = _unjudged_where(since, project_id, extra=extra)
     rows = await fetchall(
         db,
         "SELECT COUNT(*) AS findings, "  # nosec B608 - constant fragment
