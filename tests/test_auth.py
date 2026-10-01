@@ -1005,6 +1005,16 @@ def test_watcher_is_neither_agent_nor_human():
     )
     assert seeded.has_permission("tasks.read") is True
     assert seeded.has_permission("tasks.update") is False
+    # a stored permission set that names a human gate does not make it a human
+    loaded = TokenIdentity(
+        "w",
+        "watcher",
+        principal_id=7,
+        permissions=frozenset({"tasks.read", "tasks.human_gate", "tasks.update"}),
+    )
+    assert (loaded.is_human, loaded.is_agent) == (False, False)
+    assert loaded.has_permission("tasks.human_gate") is False
+    assert loaded.has_permission("tasks.update") is False
     # a plain agent / human are untouched
     assert TokenIdentity("a", "agent", principal_id=1).is_watcher is False
 
