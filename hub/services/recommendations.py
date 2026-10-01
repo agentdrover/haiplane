@@ -31,7 +31,13 @@ from hub.models import (
     Recommendation,
     RecommendationSeverity,
 )
-from hub.services.dor import DOR_ADVISORY_KEYS, DoREvaluation, evaluate_dor
+from hub.services.dor import (
+    DOR_ADVISORY_KEYS,
+    STATEMENT_PATHS_CHECK,
+    STATEMENT_PATHS_MARK,
+    DoREvaluation,
+    evaluate_dor,
+)
 from hub import repository as repo
 from hub.models import ReadinessReport
 from hub.services.readiness import (
@@ -154,6 +160,16 @@ CHECK_RECOMMENDATIONS: dict[str, dict[str, Any]] = {
             "(adapt / redesign), and why. Choosing 'adapt' is fine; choosing "
             "it without noticing is how an old process gets automated onto "
             "new technology."
+        ),
+        "minutes": 3,
+    },
+    "statement_paths_resolve": {
+        "field": "validation_commands",
+        "message": (
+            "A path in validation_commands or an AC test_ref is neither on "
+            "the base branch nor covered by affected_areas, so the executor "
+            "would meet a red check it cannot satisfy. Fix the path, or add "
+            "the file the task creates to affected_areas."
         ),
         "minutes": 3,
     },
@@ -833,10 +849,14 @@ def _recommendation_for(
         delta = 0
     else:
         delta = config.penalty_required if is_required else config.penalty_optional
+    message = template["message"]
+    if check.key == STATEMENT_PATHS_CHECK:
+        # The path is the point (#1456): name it, do not only describe the rule.
+        message = f"{message} {check.detail}"
     return Recommendation(
         field=template["field"],
         severity=severity,
-        message=template["message"],
+        message=message,
         expected_score_delta=delta,
         estimated_minutes=template["minutes"],
     )
@@ -860,6 +880,12 @@ def build_recommendations(
     recs: list[Recommendation] = []
     for check in dor.checks:
         if check.passed:
+            continue
+        if check.key == STATEMENT_PATHS_CHECK and not check.detail.startswith(
+            STATEMENT_PATHS_MARK
+        ):
+            # "Not checked" is the hub's gap, not the author's defect (#1456):
+            # it stays in the DoR table, with the reason, and asks nothing.
             continue
         if check.key in DOR_ADVISORY_KEYS and check.key not in dor.advisory:
             # This work type is not asked for Discovery — stay quiet (#331).

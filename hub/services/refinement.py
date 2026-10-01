@@ -650,7 +650,7 @@ async def _persist_readiness_and_revision(
     if report.dor_passed:
         from hub.services.auto_approve import maybe_auto_approve
 
-        await maybe_auto_approve(db, task_id)
+        await maybe_auto_approve(db, task_id, dor_checks=report.dor_checks)
 
 
 async def recalc_readiness_inline(

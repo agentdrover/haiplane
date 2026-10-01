@@ -357,6 +357,10 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #913: гейт красного теста для work_type=bug. Не делегирует. Читатель:
     # project_policy.bug_red_test_of.
     "bug_red_test",
+    # #1456: проверка путей постановки (validation_commands, test_ref) на
+    # существование. Не гейт, не делегирует. Читатель:
+    # project_policy.statement_paths_of.
+    "statement_paths",
     # #1434: минут тишины, после которых поллер освобождает слот исполнителя.
     # Не гейт и ничего не делегирует. Читатель: executor_slots.dead_minutes_of.
     "slot_dead_minutes",
@@ -471,6 +475,21 @@ def _validate_bug_red_test(policy: dict[str, Any]) -> None:
         raise ValueError(
             "gate_policy bug_red_test must be one of "
             f"{', '.join(BUG_RED_TEST_MODES)}, got: {policy['bug_red_test']!r}"
+        )
+
+
+def _validate_statement_paths(policy: dict[str, Any]) -> None:
+    """Refuse a path-check mode the reader would read as warn by accident (#1456)."""
+    from hub.services.project_policy import STATEMENT_PATHS_MODES
+
+    if (
+        "statement_paths" in policy
+        and policy["statement_paths"] not in STATEMENT_PATHS_MODES
+    ):
+        raise ValueError(
+            "gate_policy statement_paths must be one of "
+            f"{', '.join(STATEMENT_PATHS_MODES)}, "
+            f"got: {policy['statement_paths']!r}"
         )
 
 
@@ -2704,6 +2723,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_submission_contract(v)
     _validate_bug_red_test(v)
     _validate_claim_area_check(v)
+    _validate_statement_paths(v)
     _validate_slot_dead_minutes(v)
     _validate_executor_launch(v)
     _validate_executor_task_ceilings(v)

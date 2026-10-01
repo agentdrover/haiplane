@@ -30,7 +30,7 @@ import aiosqlite
 from hub import config
 from hub import repository as repo
 from hub.db import deserialize_str_list
-from hub.models import RiskClass
+from hub.models import DoRCheckItem, RiskClass
 from hub.services.project_policy import gate_policy_of
 
 log = logging.getLogger(__name__)
@@ -97,7 +97,12 @@ def _touches_ladder(areas: list[str]) -> list[str]:
     return ladder_hits(areas)
 
 
-async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
+async def maybe_auto_approve(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    dor_checks: list[DoRCheckItem] | None = None,
+) -> bool:
     """Approve a DoR-passed low-class draft when the switch allows (#584).
 
     CALLERS, ENUMERATED RATHER THAN CLAIMED (#1164). Two, and the list is
@@ -121,6 +126,12 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
     ``test_reading_a_card_never_opens_a_draft``, not by this paragraph:
     review #313 pointed out that moving the call one floor down left the
     whole suite green, and the measurement agreed (3475 passed).
+
+    ``dor_checks`` are the checks the caller ALREADY computed and gated on
+    (#1456). The statement-path record is written from them: this runs under
+    the caller's write lock, and a second ``evaluate_dor`` would read the git
+    tree there. A caller with no computed checks (the steward poller) passes
+    none, and the record is skipped rather than recomputed.
 
     Runs inside the caller's transaction; returns True when the draft was
     transitioned. Every refusal is silent by design: a draft that does not
@@ -189,6 +200,11 @@ async def maybe_auto_approve(db: aiosqlite.Connection, task_id: int) -> bool:
     )
     if not transitioned:
         return False
+
+    if dor_checks:
+        from hub.services.dor import record_statement_paths
+
+        await record_statement_paths(db, task_id, dor_checks)
 
     reasons = deserialize_str_list(row["risk_class_reasons"])
     await repo.add_task_update(
