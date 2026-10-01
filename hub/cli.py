@@ -1704,7 +1704,7 @@ def cmd_admin_agents_create(args: argparse.Namespace) -> int:
         "kind": "agent",
         "username": args.name,
         "display_name": getattr(args, "display_name", "") or args.name,
-        "role": "agent",
+        "role": getattr(args, "role", "") or "agent",
     }
     result = _api("POST", "/api/admin/principals", body)
     print(f"Agent '{args.name}' created (id={result.get('id')}).")
@@ -1822,6 +1822,20 @@ def cmd_readiness_tree(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
+
+
+def _add_agents_create_parser(agents_sub: Any) -> None:
+    """``admin agents create``; kept out of build_parser, which is over budget."""
+    p = agents_sub.add_parser("create", help="Create an AI agent identity")
+    p.add_argument("--name", required=True, help="Agent slug/username")
+    p.add_argument("--display-name", dest="display_name", default="")
+    p.add_argument(
+        "--role",
+        choices=["agent", "watcher"],
+        default="agent",
+        help="agent (default) or watcher: read-only, every write refused by the hub",
+    )
+    p.set_defaults(func=cmd_admin_agents_create)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2908,12 +2922,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_admin_agents = admin_sub.add_parser("agents", help="Manage AI agents")
     agents_sub = p_admin_agents.add_subparsers(dest="agents_command", required=True)
 
-    p_agents_create = agents_sub.add_parser(
-        "create", help="Create an AI agent identity"
-    )
-    p_agents_create.add_argument("--name", required=True, help="Agent slug/username")
-    p_agents_create.add_argument("--display-name", dest="display_name", default="")
-    p_agents_create.set_defaults(func=cmd_admin_agents_create)
+    _add_agents_create_parser(agents_sub)
 
     # admin keys
     p_admin_keys = admin_sub.add_parser("keys", help="Manage API keys")

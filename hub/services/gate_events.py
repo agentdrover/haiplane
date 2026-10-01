@@ -36,6 +36,7 @@ STEWARD_JUDGEMENT = "steward_judgement"
 STEWARD_APPLIED = "steward_applied"
 STEWARD_ESCALATED = "steward_escalated"
 STEWARD_ROUTE_REFUSED = "steward_route_refused"
+WATCHER_ROUTE_REFUSED = "watcher_route_refused"
 STEWARD_OVERRIDE_WINDOW_DAYS = 7
 
 
