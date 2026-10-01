@@ -51,6 +51,7 @@ from hub.integrations.protocols import (
 from hub.integrations.registry import plugins
 from hub.models import PairGitMode, TaskView
 from hub.services import base_merge, workflow_seed
+from hub.services.metrics_scope import Scope
 from hub.services.gate_events import (
     HUMAN_GATE_EVENT_KINDS,
     NON_HUMAN_GATE_ACTORS,
@@ -343,7 +344,9 @@ async def machine_review_gap(
 _REAL = ("fixed", "wont_fix")
 
 
-async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+async def _disposition_metrics(
+    db: aiosqlite.Connection, scope: Scope
+) -> dict[str, Any]:
     """Precision and resolution, overall and split by profile and model.
 
     The window is the REPORT's ``created_at``, never the disposition's: a
@@ -369,6 +372,9 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
             ),
         }
 
+    where, params = scope.where(
+        "mr.created_at", task_column="mr.task_id", model_column="mr.model"
+    )
     rows = await fetchall(
         db,
         "SELECT CASE WHEN mr.profile = '' THEN 'не заявлен' ELSE mr.profile END "
@@ -377,9 +383,9 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
         "d.disposition AS disposition, COUNT(*) AS n "
         "FROM finding_dispositions d "
         "JOIN machine_reviews mr ON mr.id = d.review_id "
-        "WHERE mr.created_at >= datetime('now', ?) "
+        f"WHERE {where} "
         "GROUP BY profile, model, d.disposition",
-        (since,),
+        tuple(params),
     )
     overall: dict[str, int] = {}
     by_profile: dict[str, dict[str, int]] = {}
@@ -431,10 +437,10 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
         "AND t.submission_generation = mr.submission_generation "
         "LEFT JOIN (SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
         "GROUP BY review_id) AS judged ON judged.review_id = mr.id "
-        f"WHERE mr.created_at >= datetime('now', ?) AND {REPORT_HAS_EVIDENCE_SQL} "
+        f"WHERE {where} AND {REPORT_HAS_EVIDENCE_SQL} "
         f"AND {ORIGINAL_READ_SQL} "
         "AND json_array_length(mr.findings_confirmed) > 0",
-        (since,),
+        tuple(params),
     )
     cov = dict(coverage_rows[0]) if coverage_rows else {}
     reports_counted = int(cov.get("reports_counted") or 0)
@@ -462,7 +468,10 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     # oldest items, and it would also split this number from the queue page it
     # links to, which shows everything. The page says "за всё время" next to it
     # so the reader is not told a windowed number by the header.
-    unjudged = await repo.count_unjudged_findings(db)
+    unjudged = await repo.count_unjudged_findings(
+        db,
+        extra=scope.stock_where(task_column="mr.task_id", model_column="mr.model"),
+    )
     result["confirmed_unjudged"] = unjudged["findings"]
     result["reports_with_unjudged"] = unjudged["reports"]
     result["by_profile"] = [
@@ -476,8 +485,15 @@ async def _disposition_metrics(db: aiosqlite.Connection, since: str) -> dict[str
 
 
 async def _tokens_per_fixed(
-    db: aiosqlite.Connection, since: str, column: str
+    db: aiosqlite.Connection, scope: Scope, column: str
 ) -> int | None:
+    """Tokens per FIXED finding over the slice, or None (see the stats twin)."""
+    return (await _tokens_per_fixed_stats(db, scope, column))[0]
+
+
+async def _tokens_per_fixed_stats(
+    db: aiosqlite.Connection, scope: Scope, column: str
+) -> tuple[int | None, int]:
     """Tokens per FIXED finding, or None when nothing supports the division.
 
     Numerator and denominator come from the same rows — the #516 rule that
@@ -487,19 +503,24 @@ async def _tokens_per_fixed(
     """
     if column not in ("tokens_spent", "provider_tokens"):  # pragma: no cover
         raise ValueError(f"unsupported token column: {column}")
+    where, params = scope.where(
+        "mr.created_at", task_column="mr.task_id", model_column="mr.model"
+    )
     rows = await fetchall(
         db,
         f"SELECT COALESCE(SUM(mr.{column}), 0) AS tokens, "  # nosec B608 - column is checked above against a literal allow-list
-        "COALESCE(SUM(fixed.n), 0) AS fixed FROM machine_reviews mr "
+        "COALESCE(SUM(fixed.n), 0) AS fixed, COUNT(*) AS reports "
+        "FROM machine_reviews mr "
         "JOIN (SELECT review_id, COUNT(*) AS n FROM finding_dispositions "
         "WHERE disposition = 'fixed' GROUP BY review_id) AS fixed "
         "ON fixed.review_id = mr.id "
-        f"WHERE mr.created_at >= datetime('now', ?) AND mr.{column} IS NOT NULL",
-        (since,),
+        f"WHERE {where} AND mr.{column} IS NOT NULL",
+        tuple(params),
     )
     row = dict(rows[0]) if rows else {}
     fixed = int(row.get("fixed") or 0)
-    return round(int(row.get("tokens") or 0) / fixed) if fixed else None
+    value = round(int(row.get("tokens") or 0) / fixed) if fixed else None
+    return value, int(row.get("reports") or 0)
 
 
 # How many DISTINCT tasks a finding category must appear in before it stops
@@ -510,7 +531,7 @@ RECURRENCE_DEBT_THRESHOLD = 3
 
 
 async def recurring_categories(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, since: str | Scope
 ) -> list[dict[str, Any]]:
     """Confirmed-finding categories in the window, with how far they spread.
 
@@ -519,15 +540,20 @@ async def recurring_categories(
     sprawling task say something about that task, three hits across three
     tasks say something about the repository.
     """
+    # A bare modifier ('-90 days') is still accepted: the digest passes one.
+    scope = Scope.from_modifier(since) if isinstance(since, str) else since
+    where, params = scope.where(
+        "mr.created_at", task_column="mr.task_id", model_column="mr.model"
+    )
     rows = await fetchall(
         db,
         "SELECT COALESCE(json_extract(f.value, '$.category'), '') AS category, "
         "COUNT(*) AS findings, COUNT(DISTINCT mr.task_id) AS tasks "
         "FROM machine_reviews mr, json_each(mr.findings_confirmed) f "  # nosec B608 - constant fragment
-        f"WHERE mr.created_at >= datetime('now', ?) AND {ORIGINAL_READ_SQL} "
+        f"WHERE {where} AND {ORIGINAL_READ_SQL} "
         "GROUP BY category HAVING category != '' "
         "ORDER BY findings DESC LIMIT 50",
-        (since,),
+        tuple(params),
     )
     return [dict(r) | {"recurring": r["tasks"] > 1} for r in rows]
 
@@ -563,11 +589,13 @@ async def build_category_debt(
     return debt
 
 
-async def _rule_breaches(db: aiosqlite.Connection) -> dict[str, Any]:
+async def _rule_breaches(
+    db: aiosqlite.Connection, scope: Scope | None = None
+) -> dict[str, Any]:
     """The repeat report of catalogue rules (#920); see ``rule_catalogue``."""
     from hub.services.rule_catalogue import rule_breaches
 
-    return await rule_breaches(db)
+    return await rule_breaches(db, scope)
 
 
 async def record_category_check(
@@ -651,24 +679,123 @@ async def _steward_shadow_metrics(db: aiosqlite.Connection) -> dict[str, Any]:
 PRACTICE_METRICS_DEFAULT_DAYS = 90
 
 
-async def _carried_over_count(db: aiosqlite.Connection, since: str) -> int:
+async def _carried_over_count(db: aiosqlite.Connection, scope: Scope) -> int:
     """Reports carried over a base-only merge in the window (#1361).
 
     Counted BESIDE the reads, never inside them: the saving stays visible
     without passing for a run.
     """
+    where, params = scope.where(
+        "created_at", task_column="task_id", model_column="model"
+    )
     rows = await fetchall(
         db,
         "SELECT COUNT(*) AS n FROM machine_reviews "  # nosec B608 - constant fragment
-        f"WHERE created_at >= datetime('now', ?) AND NOT ({ORIGINAL_READ_SQL})",
-        (since,),
+        f"WHERE {where} AND NOT ({ORIGINAL_READ_SQL})",
+        tuple(params),
     )
     return int(dict(rows[0])["n"] or 0) if rows else 0
 
 
-async def practice_metrics(
-    db: aiosqlite.Connection, *, since_days: int = PRACTICE_METRICS_DEFAULT_DAYS
-) -> dict[str, Any]:
+async def _cycle_times(db: aiosqlite.Connection, scope: Scope) -> list[dict[str, Any]]:
+    """Cycle time by work type over the slice (#517, #518, #810).
+
+    Moved out of ``practice_metrics`` unchanged so that the comparison and the
+    series (#1490) read the same computation as the aggregate.
+    """
+    import statistics
+
+    # `completed_at` is the only completion clock (#517). Until #810 a row
+    # without it was filled in from `updated_at`, and that fallback was
+    # defended as a small bias — 0–13.3h against durations of 280–340h. The
+    # comparison used the fallback rows as their own yardstick. Split by
+    # source on production data (21.08.2026, 518 completed tasks), the two are
+    # not the same quantity: measured rows have a median of 0.83h for bug and
+    # 1.70h for feature, while the rows filled in from `updated_at` sit at
+    # 254h and 550h. So the blended median tracked the share of filled-in rows
+    # — bug 35 of 81, feature 55 of 174, refactor 11 of 13 — and reported that
+    # bugs take eight times longer than features when measured bugs are in
+    # fact the fastest rows in the table.
+    #
+    # The other half of that argument — dropping them costs three quarters of
+    # the sample — expired as the window rolled forward: 46 measured bugs and
+    # 119 measured features now stand on their own.
+    #
+    # Rows without the stamp are counted, never estimated. Their membership in
+    # the window is decided by `updated_at` only because nothing else about
+    # them is dated: that is a "recent enough to mention" test, never a
+    # duration. Every row that HAS a completion is filtered and measured by
+    # the same `completed_at` — #518 fixed a version where numerator and
+    # window used different clocks, and that fix stays.
+    in_completed, p_completed = scope.where("completed_at", task_column="id")
+    in_updated, p_updated = scope.where("updated_at", task_column="id")
+    cycle_rows = await fetchall(
+        db,
+        "SELECT work_type, completed_at IS NULL AS no_completion, "
+        "(julianday(completed_at) - julianday(ready_at)) * 24.0 AS hours "
+        "FROM tasks WHERE status='completed' AND ready_at IS NOT NULL "
+        f"AND ({in_completed} "  # nosec B608 - constant fragment
+        f"OR (completed_at IS NULL AND {in_updated}))",
+        (*p_completed, *p_updated),
+    )
+    by_type: dict[str, list[float]] = {}
+    no_completion_by_type: dict[str, int] = {}
+    unmeasurable_by_type: dict[str, int] = {}
+    for r in cycle_rows:
+        wt = r["work_type"] or "feature"
+        if r["no_completion"]:
+            # Checked before the start test below, so a row missing BOTH stamps
+            # is counted once, here. The two exclusions overlap almost entirely
+            # in today's data: on production every row with a bulk-stamped
+            # ready_at also predates completed_at, so unmeasurable_tasks now
+            # reads 0 across the board and no_completion_tasks absorbs those
+            # rows (chore 16, feature 44, docs 5, refactor 1). That is a change
+            # of label, not of exclusion — the #518 test below still guards the
+            # case it was written for: a future row that has a completion but a
+            # start stamped after it.
+            no_completion_by_type[wt] = no_completion_by_type.get(wt, 0) + 1
+            continue
+        if r["hours"] is None:
+            continue
+        if r["hours"] <= 0:
+            # A non-positive duration is not a fast task, it is a task whose
+            # start is unknown (#518). On production every such row carries the
+            # same ready_at — a bulk stamp applied to tasks that were already
+            # finished — so ready_at records when someone backfilled the
+            # column, not when the work became ready. Counting these as zero
+            # dragged the feature median from 70h down to 4h.
+            #
+            # Only equality occurs in the data; negatives were checked for and
+            # there are none. The condition stays <= so a clock skew that does
+            # produce one is excluded rather than averaged in.
+            unmeasurable_by_type[wt] = unmeasurable_by_type.get(wt, 0) + 1
+            continue
+        by_type.setdefault(wt, []).append(r["hours"])
+    # Both exclusions are reported per row rather than folded into the median:
+    # a number that silently mixes measured with inferred values reads as fact.
+    # Same principle as n_excluded in #518 and findings_unaccounted in #519 —
+    # say what is not known instead of estimating it.
+    # A work type all of whose rows are excluded still gets a line: saying
+    # "5 tasks, no completion stamp, no median" is information, while omitting
+    # the row entirely reads as "no work of this type happened" (#518).
+    cycle_times = [
+        {
+            "work_type": wt,
+            "tasks": len(by_type.get(wt, [])),
+            "no_completion_tasks": no_completion_by_type.get(wt, 0),
+            "unmeasurable_tasks": unmeasurable_by_type.get(wt, 0),
+            "median_hours": (
+                round(statistics.median(by_type[wt]), 2) if by_type.get(wt) else None
+            ),
+        }
+        for wt in sorted(
+            set(by_type) | set(unmeasurable_by_type) | set(no_completion_by_type)
+        )
+    ]
+    return cycle_times
+
+
+async def _practice_sections(db: aiosqlite.Connection, scope: Scope) -> dict[str, Any]:
     """Practice economics (#384): machine-review costs, filtration rate,
     harness-version comparison, recurring finding categories, cycle times,
     escaped defects.
@@ -691,10 +818,14 @@ async def practice_metrics(
     ``review_dispatches`` is a sibling (#1026): the provider bill of runs
     that closed without a report. It is never folded into
     ``tokens_per_confirmed`` / ``provider_tokens_per_confirmed``.
-    """
-    import statistics
 
-    since = f"-{since_days} days"
+    Every section reads the same ``scope`` (#1490): the window, the project and
+    the reviewer model. The public entry point is :func:`practice_metrics`.
+    """
+    since_days = scope.days
+    where, params = scope.where(
+        "created_at", task_column="task_id", model_column="model"
+    )
 
     totals_rows = await fetchall(
         db,
@@ -737,12 +868,12 @@ async def practice_metrics(
         "COALESCE(SUM(CASE WHEN provider_tokens IS NOT NULL "
         "THEN json_array_length(findings_confirmed) ELSE 0 END), 0) "
         "AS confirmed_with_provider "
-        "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        f"FROM machine_reviews WHERE {where} "  # nosec B608 - constant fragment
         f"AND {ORIGINAL_READ_SQL}",
-        (since,),
+        tuple(params),
     )
     totals = dict(totals_rows[0])
-    totals["carried_over"] = await _carried_over_count(db, since)
+    totals["carried_over"] = await _carried_over_count(db, scope)
     confirmed = totals["confirmed_total"] or 0
     raw = totals["raw_total"] or 0
     # Cost per finding has to take its numerator and denominator from the same
@@ -809,10 +940,10 @@ async def practice_metrics(
         "SUM(CASE WHEN provider_tokens IS NOT NULL THEN 1 ELSE 0 END) "
         "AS billed_runs, "
         "SUM(CASE WHEN incomplete = 1 THEN 1 ELSE 0 END) AS incomplete_runs "
-        "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        f"FROM machine_reviews WHERE {where} "  # nosec B608 - constant fragment
         f"AND {ORIGINAL_READ_SQL} "
         "GROUP BY profile ORDER BY reviews DESC",
-        (since,),
+        tuple(params),
     )
 
     harness_rows = await fetchall(
@@ -824,114 +955,30 @@ async def practice_metrics(
         "COALESCE(SUM(raw_count), 0) AS raw_total, "
         "COALESCE(SUM(json_array_length(findings_confirmed)), 0) AS confirmed_total, "
         "COALESCE(SUM(tokens_spent), 0) AS tokens_total "
-        "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        f"FROM machine_reviews WHERE {where} "  # nosec B608 - constant fragment
         f"AND {ORIGINAL_READ_SQL} "
         "GROUP BY harness_skill, harness_version "
         "ORDER BY harness_skill, harness_version",
-        (since,),
+        tuple(params),
     )
 
-    recurring = await recurring_categories(db, since)
+    recurring = await recurring_categories(db, scope)
     # #878: the flywheel. A category the reviewer has found in enough DISTINCT
     # tasks is no longer a finding, it is a property of the codebase, and
     # paying a model to rediscover it every submission is the one cost here
     # that never has to be paid again.
     debt = await build_category_debt(db, recurring)
 
-    # `completed_at` is the only completion clock (#517). Until #810 a row
-    # without it was filled in from `updated_at`, and that fallback was
-    # defended as a small bias — 0–13.3h against durations of 280–340h. The
-    # comparison used the fallback rows as their own yardstick. Split by
-    # source on production data (21.08.2026, 518 completed tasks), the two are
-    # not the same quantity: measured rows have a median of 0.83h for bug and
-    # 1.70h for feature, while the rows filled in from `updated_at` sit at
-    # 254h and 550h. So the blended median tracked the share of filled-in rows
-    # — bug 35 of 81, feature 55 of 174, refactor 11 of 13 — and reported that
-    # bugs take eight times longer than features when measured bugs are in
-    # fact the fastest rows in the table.
-    #
-    # The other half of that argument — dropping them costs three quarters of
-    # the sample — expired as the window rolled forward: 46 measured bugs and
-    # 119 measured features now stand on their own.
-    #
-    # Rows without the stamp are counted, never estimated. Their membership in
-    # the window is decided by `updated_at` only because nothing else about
-    # them is dated: that is a "recent enough to mention" test, never a
-    # duration. Every row that HAS a completion is filtered and measured by
-    # the same `completed_at` — #518 fixed a version where numerator and
-    # window used different clocks, and that fix stays.
-    cycle_rows = await fetchall(
-        db,
-        "SELECT work_type, completed_at IS NULL AS no_completion, "
-        "(julianday(completed_at) - julianday(ready_at)) * 24.0 AS hours "
-        "FROM tasks WHERE status='completed' AND ready_at IS NOT NULL "
-        "AND (completed_at >= datetime('now', ?) "
-        "OR (completed_at IS NULL AND updated_at >= datetime('now', ?)))",
-        (since, since),
-    )
-    by_type: dict[str, list[float]] = {}
-    no_completion_by_type: dict[str, int] = {}
-    unmeasurable_by_type: dict[str, int] = {}
-    for r in cycle_rows:
-        wt = r["work_type"] or "feature"
-        if r["no_completion"]:
-            # Checked before the start test below, so a row missing BOTH stamps
-            # is counted once, here. The two exclusions overlap almost entirely
-            # in today's data: on production every row with a bulk-stamped
-            # ready_at also predates completed_at, so unmeasurable_tasks now
-            # reads 0 across the board and no_completion_tasks absorbs those
-            # rows (chore 16, feature 44, docs 5, refactor 1). That is a change
-            # of label, not of exclusion — the #518 test below still guards the
-            # case it was written for: a future row that has a completion but a
-            # start stamped after it.
-            no_completion_by_type[wt] = no_completion_by_type.get(wt, 0) + 1
-            continue
-        if r["hours"] is None:
-            continue
-        if r["hours"] <= 0:
-            # A non-positive duration is not a fast task, it is a task whose
-            # start is unknown (#518). On production every such row carries the
-            # same ready_at — a bulk stamp applied to tasks that were already
-            # finished — so ready_at records when someone backfilled the
-            # column, not when the work became ready. Counting these as zero
-            # dragged the feature median from 70h down to 4h.
-            #
-            # Only equality occurs in the data; negatives were checked for and
-            # there are none. The condition stays <= so a clock skew that does
-            # produce one is excluded rather than averaged in.
-            unmeasurable_by_type[wt] = unmeasurable_by_type.get(wt, 0) + 1
-            continue
-        by_type.setdefault(wt, []).append(r["hours"])
-    # Both exclusions are reported per row rather than folded into the median:
-    # a number that silently mixes measured with inferred values reads as fact.
-    # Same principle as n_excluded in #518 and findings_unaccounted in #519 —
-    # say what is not known instead of estimating it.
-    # A work type all of whose rows are excluded still gets a line: saying
-    # "5 tasks, no completion stamp, no median" is information, while omitting
-    # the row entirely reads as "no work of this type happened" (#518).
-    cycle_times = [
-        {
-            "work_type": wt,
-            "tasks": len(by_type.get(wt, [])),
-            "no_completion_tasks": no_completion_by_type.get(wt, 0),
-            "unmeasurable_tasks": unmeasurable_by_type.get(wt, 0),
-            "median_hours": (
-                round(statistics.median(by_type[wt]), 2) if by_type.get(wt) else None
-            ),
-        }
-        for wt in sorted(
-            set(by_type) | set(unmeasurable_by_type) | set(no_completion_by_type)
-        )
-    ]
+    cycle_times = await _cycle_times(db, scope)
 
     # #877: what the findings turned out to be. Attached to the profile rows
     # as well, because "lite found three things" and "lite found three things
     # and two of them were real" are different facts about the same run.
-    dispositions = await _disposition_metrics(db, since)
+    dispositions = await _disposition_metrics(db, scope)
     totals["dispositions"] = dispositions
-    totals["tokens_per_fixed"] = await _tokens_per_fixed(db, since, "tokens_spent")
+    totals["tokens_per_fixed"] = await _tokens_per_fixed(db, scope, "tokens_spent")
     totals["provider_tokens_per_fixed"] = await _tokens_per_fixed(
-        db, since, "provider_tokens"
+        db, scope, "provider_tokens"
     )
     by_profile_rates = {row["profile"]: row for row in dispositions["by_profile"]}
     profile_dicts = []
@@ -959,21 +1006,21 @@ async def practice_metrics(
         # the window. The completed_at walk (#528) stays beside it, restricted
         # to bugs whose stage was never recorded and labelled as what it is,
         # so the two numbers cannot be read as one.
-        "escaped": await measured_escapes(db, since),
+        "escaped": await measured_escapes(db, scope),
         "source": "found_in",
         "reconstructed": {
             "label": RECONSTRUCTED_ESCAPES_LABEL,
-            **await _escaped_defect_metrics(db, since),
+            **await _escaped_defect_metrics(db, scope),
         },
     }
 
-    model_declarations = await _model_declaration_metrics(db, since)
-    human_gates = await _human_gate_metrics(db, since)
+    model_declarations = await _model_declaration_metrics(db, scope)
+    human_gates = await _human_gate_metrics(db, scope)
     steward_shadow_metrics = await _steward_shadow_metrics(db)
-    human_touches = await _human_touch_metrics(db, since)
-    review_outcomes = await _review_outcome_metrics(db, since)
-    review_dispatches = await _review_dispatch_spend_metrics(db, since)
-    validation_run_lines = await _validation_run_line_metrics(db, since)
+    human_touches = await _human_touch_metrics(db, scope)
+    review_outcomes = await _review_outcome_metrics(db, scope)
+    review_dispatches = await _review_dispatch_spend_metrics(db, scope)
+    validation_run_lines = await _validation_run_line_metrics(db, scope)
     # #1238: повторяемость отказов среды. Считается тем же кодом, что решает,
     # является ли отдельный отчёт отказом среды, — двух ответов на один
     # вопрос здесь быть не должно. Окно берётся то же, что у остальных
@@ -983,10 +1030,10 @@ async def practice_metrics(
         count_model_cascade_outcomes,
     )
 
-    incomplete_reasons = await count_environment_refusals(db, since_days=since_days)
+    incomplete_reasons = await count_environment_refusals(db, scope=scope)
     # #1243: исход второй оси каскада — без него выкат был бы добавкой к
     # счёту, измеренной без пользы. Тот же приём и то же окно.
-    model_cascade = await count_model_cascade_outcomes(db, since_days=since_days)
+    model_cascade = await count_model_cascade_outcomes(db, scope=scope)
     return {
         "since_days": since_days,
         "machine_reviews": totals,
@@ -1000,18 +1047,18 @@ async def practice_metrics(
         "category_debt": debt,
         # #920: rules from category_checks whose class came back AFTER the
         # rule was set up. Not windowed — a rule is judged over its life.
-        "rule_breaches": await _rule_breaches(db),
+        "rule_breaches": await _rule_breaches(db, scope),
         "cycle_times": cycle_times,
         "escaped_defects": escaped,
         # #916: time-to-detect and time-to-restore of prod defects, from
         # recorded facts only; rows missing one are counted by reason.
-        "prod_defect_clocks": await prod_defect_clocks(db, since),
+        "prod_defect_clocks": await prod_defect_clocks(db, scope),
         # #918: share of successful deploys a prod defect points at, per
         # project, with the deploy count beside the share.
-        "change_failure_rate": await change_failure_rate(db, since),
+        "change_failure_rate": await change_failure_rate(db, scope),
         # #914: defects of the window by the stage that caught them, with
         # the unknown share apart; the prod bucket is the measured escapes.
-        "shift_left": await shift_left(db, since),
+        "shift_left": await shift_left(db, scope),
         "model_declarations": model_declarations,
         "human_gates": human_gates,
         # #1107: the shadow table lives BESIDE the other practice numbers,
@@ -1027,16 +1074,119 @@ async def practice_metrics(
         "validation_run_lines": validation_run_lines,
         # #1410: стоимость облачного исполнителя за окно — центы по счёту
         # провайдера (chargedCents) и число прогонов рядом с суммой.
-        "executor_runs": await executor_run_metrics(db, since),
+        "executor_runs": await executor_run_metrics(db, scope),
         # #1406: сводка ревью для владельца — один агрегат на все поверхности.
         "review_economy": await review_economy(
-            db, since_days=since_days, escaped=escaped
+            db, since_days=since_days, escaped=escaped, scope=scope
         ),
     }
 
 
+async def _indicator_sections(db: aiosqlite.Connection, scope: Scope) -> dict[str, Any]:
+    """The sections the key indicators (#1490) read, for one window.
+
+    Each one is the function ``practice_metrics`` calls for the aggregate, so a
+    bucket of a series or the previous window is computed by the same code as
+    the window itself — never by a parallel re-implementation.
+    """
+    return {
+        "review_outcomes": await _review_outcome_metrics(db, scope),
+        "dispositions": await _disposition_metrics(db, scope),
+        "provider_tokens_per_fixed": await _tokens_per_fixed_stats(
+            db, scope, "provider_tokens"
+        ),
+        "human_touches": await _human_touch_metrics(db, scope),
+        "change_failure_rate": await change_failure_rate(db, scope),
+        "cycle_times": await _cycle_times(db, scope),
+    }
+
+
+async def _window_extras(
+    db: aiosqlite.Connection,
+    scope: Scope,
+    result: dict[str, Any],
+    *,
+    compare: bool,
+    series: bool,
+    series_days: int,
+) -> None:
+    """Add ``comparison``, ``series`` and ``problem_spots`` to ``result`` (#1490)."""
+    from hub.services import metrics_compare as mc
+
+    comparison = None
+    if compare:
+        previous = scope.previous()
+        comparison = mc.build_comparison(
+            await _indicator_sections(db, scope),
+            await _indicator_sections(db, previous),
+            previous.describe(),
+        )
+        result["comparison"] = comparison
+        result["problem_spots"], result["problem_spots_more"] = mc.rank_problem_spots(
+            result, comparison
+        )
+    if series:
+        pieces, dropped = scope.bucket_plan(series_days)
+        buckets = [
+            (piece.describe(), await _indicator_sections(db, piece)) for piece in pieces
+        ]
+        result["series"] = mc.build_series(buckets, series_days, dropped)
+
+
+async def practice_metrics(
+    db: aiosqlite.Connection,
+    *,
+    since_days: int = PRACTICE_METRICS_DEFAULT_DAYS,
+    project: str | None = None,
+    model: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    compare: bool = False,
+    series: bool = False,
+    series_days: int = 7,
+) -> dict[str, Any]:
+    """Practice metrics of a slice: window, project and reviewer model (#1490).
+
+    Without the new parameters the answer is what it was: the last
+    ``since_days`` over every project, and no extra keys. ``date_from`` and
+    ``date_to`` (``YYYY-MM-DD``, the last day included) replace ``since_days``.
+    ``project`` is a slug, resolved the way the gates attribute work (#747).
+    ``model`` is the REVIEWER model, ``machine_reviews.model`` — the group with
+    none recorded is named ``не заявлена`` and is selected by that name; it
+    narrows only the review blocks, and ``scope.model_independent`` lists the
+    blocks it leaves alone (cycle time, CFR, shift-left and the rest).
+
+    ``compare`` adds the previous window of the same length, the delta per key
+    indicator and the ranked problem spots; ``series`` adds the indicators per
+    ``series_days`` bucket. An empty bucket is a missing value, never zero.
+
+    Raises ``ValueError`` for an unknown project or a malformed date.
+    """
+    from hub.services.metrics_scope import MODEL_INDEPENDENT, UNFILTERED, build_scope
+
+    scope = await build_scope(
+        db,
+        since_days=since_days,
+        project=project,
+        model=model,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    result = await _practice_sections(db, scope)
+    if not (project or model or date_from or date_to or compare or series):
+        return result
+    description = scope.describe()
+    description["model_independent"] = list(MODEL_INDEPENDENT) if scope.model else []
+    description["unfiltered"] = list(UNFILTERED)
+    result["scope"] = description
+    await _window_extras(
+        db, scope, result, compare=compare, series=series, series_days=series_days
+    )
+    return result
+
+
 async def _validation_run_line_metrics(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> dict[str, Any]:
     """Failed prepass with author's lines about runs, per submission (#1246).
 
@@ -1047,12 +1197,12 @@ async def _validation_run_line_metrics(
     """
     from hub.services import review_evidence
 
+    where, params = scope.where("updated_at", task_column="id")
     rows = await fetchall(
         db,
         "SELECT id, submission_sha FROM tasks "
-        "WHERE COALESCE(submission_sha, '') != '' "
-        "AND updated_at >= datetime('now', ?)",
-        (since,),
+        f"WHERE COALESCE(submission_sha, '') != '' AND {where}",  # nosec B608
+        tuple(params),
     )
     standings = []
     for row in rows:
@@ -1064,7 +1214,7 @@ async def _validation_run_line_metrics(
 
 
 async def _review_dispatch_spend_metrics(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> dict[str, Any]:
     """What dispatched runs billed, including those that never reported (#1026).
 
@@ -1075,6 +1225,9 @@ async def _review_dispatch_spend_metrics(
     the same rows). NULL is "never asked or the API did not answer"; 0 is a
     billed zero. Unknown rows are counted, never collapsed into the sum.
     """
+    where, params = scope.where(
+        "created_at", task_column="task_id", model_column="model"
+    )
     rows = await fetchall(
         db,
         "SELECT "
@@ -1093,9 +1246,9 @@ async def _review_dispatch_spend_metrics(
         # #1242: a sync-refusal stub now outlives its call as the ask-again
         # trace. It never ran and nothing was billed — it is not a closed
         # dispatch with unknown usage.
-        "FROM review_dispatches WHERE created_at >= datetime('now', ?) "
+        f"FROM review_dispatches WHERE {where} "  # nosec B608 - constant fragment
         "AND agent_id != ''",
-        (since,),
+        tuple(params),
     )
     if not rows:
         return {
@@ -1113,7 +1266,7 @@ RECONSTRUCTED_ESCAPES_LABEL = "реконструкция"
 
 
 async def _escaped_defect_metrics(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> dict[str, Any]:
     """Bugs filed after their feature was closed — what review let through (#528).
 
@@ -1154,6 +1307,9 @@ async def _escaped_defect_metrics(
     never to the feature's closure. #518 was a bug about a numerator and a
     window keeping different clocks; this one states its clock.
     """
+    # The project narrows the BUG (the thing the window dates), never the
+    # feature it is attributed to up the chain.
+    where, params = scope.where("created_at", task_column="id")
     rows = await fetchall(
         db,
         # The ancestry walk stops at the first feature, so each bug contributes
@@ -1163,7 +1319,7 @@ async def _escaped_defect_metrics(
         "  SELECT id, created_at, parent_id, 1 FROM tasks"
         "   WHERE work_type = 'bug' AND parent_id IS NOT NULL"
         f"     AND {_STAGE_UNRECORDED_SQL}"
-        "     AND created_at >= datetime('now', ?)"
+        f"     AND {where}"
         "  UNION ALL"
         "  SELECT a.bug_id, a.bug_created, t.parent_id, a.depth + 1"
         "    FROM ancestry a JOIN tasks t ON t.id = a.node_id"
@@ -1174,14 +1330,14 @@ async def _escaped_defect_metrics(
         "f.status AS feature_status, f.completed_at AS feature_completed "
         "FROM ancestry a "
         "JOIN tasks f ON f.id = a.node_id AND f.task_type = 'feature'",
-        (since,),
+        tuple(params),
     )
     total_rows = await fetchall(
         db,
         "SELECT COUNT(*) AS bugs FROM tasks "  # nosec B608 - constant SQL
         f"WHERE work_type = 'bug' AND {_STAGE_UNRECORDED_SQL} "
-        "AND created_at >= datetime('now', ?)",
-        (since,),
+        f"AND {where}",
+        tuple(params),
     )
     bugs_in_window = total_rows[0]["bugs"] or 0
 
@@ -1220,7 +1376,7 @@ async def _escaped_defect_metrics(
 
 
 async def _review_outcome_metrics(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> dict[str, Any]:
     """First-pass acceptance and changes-requested rate (#522).
 
@@ -1254,12 +1410,12 @@ async def _review_outcome_metrics(
     """
     import json as _json
 
+    where, params = scope.where("created_at", task_column="task_id")
     rows = await fetchall(
         db,
         "SELECT task_id, payload FROM events "
-        "WHERE kind = 'review_verdict_recorded' "
-        "AND created_at >= datetime('now', ?)",
-        (since,),
+        f"WHERE kind = 'review_verdict_recorded' AND {where}",  # nosec B608
+        tuple(params),
     )
 
     approved = 0
@@ -1345,7 +1501,7 @@ def _parse_hub_ts(raw: str | None) -> Any:
 
 
 async def _model_declaration_metrics(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> dict[str, Any]:
     """How often the diversity rule has anything to work with (#1008).
 
@@ -1365,12 +1521,15 @@ async def _model_declaration_metrics(
     """
     from hub.services.model_family import UNKNOWN, family
 
+    where, params = scope.where(
+        "mr.created_at", task_column="mr.task_id", model_column="mr.model"
+    )
     rows = await fetchall(
         db,
         "SELECT mr.model AS reviewer_model, t.submission_model AS implementer_model "
         "FROM machine_reviews mr JOIN tasks t ON t.id = mr.task_id "  # nosec B608 - constant fragment
-        f"WHERE mr.created_at >= datetime('now', ?) AND {ORIGINAL_READ_SQL}",
-        (since,),
+        f"WHERE {where} AND mr.{ORIGINAL_READ_SQL}",
+        tuple(params),
     )
 
     def _tally(values: list[Any]) -> dict[str, int]:
@@ -1402,7 +1561,9 @@ async def _model_declaration_metrics(
     }
 
 
-async def _human_touch_metrics(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+async def _human_touch_metrics(
+    db: aiosqlite.Connection, scope: Scope
+) -> dict[str, Any]:
     """Touches per delivered task (#1009, spec §13).
 
     Denominator is tasks the hub merged in the window (``pipeline_merges``).
@@ -1413,12 +1574,13 @@ async def _human_touch_metrics(db: aiosqlite.Connection, since: str) -> dict[str
     """
     kind_ph, kinds = sql_in(HUMAN_GATE_EVENT_KINDS)
     actor_ph, actors = sql_in(NON_HUMAN_GATE_ACTORS)
+    where, params = scope.where("merged_at", task_column="task_id")
     rows = await fetchall(
         db,
         "WITH delivered AS ("
         " SELECT DISTINCT task_id FROM pipeline_merges"
         " WHERE task_id IS NOT NULL"
-        " AND merged_at >= datetime('now', ?)"
+        f" AND {where}"
         ") SELECT"
         " (SELECT COUNT(*) FROM delivered) AS delivered_tasks,"
         " (SELECT COUNT(*) FROM events e"
@@ -1426,7 +1588,7 @@ async def _human_touch_metrics(db: aiosqlite.Connection, since: str) -> dict[str
         f" AND e.kind IN ({kind_ph})"
         f" AND e.actor NOT IN ({actor_ph})"
         ") AS touches",  # nosec B608 - placeholders from module constants
-        (since, *kinds, *actors),
+        (*params, *kinds, *actors),
     )
     delivered = int(rows[0]["delivered_tasks"] or 0)
     touches = int(rows[0]["touches"] or 0)
@@ -1438,7 +1600,7 @@ async def _human_touch_metrics(db: aiosqlite.Connection, since: str) -> dict[str
 
 
 async def _human_gate_metrics(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> list[dict[str, Any]]:
     """Override-rate and queue wait per HUMAN gate and project (#737).
 
@@ -1453,14 +1615,15 @@ async def _human_gate_metrics(
     import statistics
 
     kind_ph, kinds = sql_in(HUMAN_GATE_EVENT_KINDS)
+    window, window_params = scope.window_sql("e.created_at")
     event_rows = await fetchall(
         db,
         "SELECT e.kind, e.actor, e.payload, e.created_at, e.task_id, t.ready_at "
         "FROM events e "
         "LEFT JOIN tasks t ON t.id = e.task_id "
-        "WHERE e.created_at >= datetime('now', ?) AND e.kind IN "
-        f"({kind_ph}) ORDER BY e.created_at ASC",  # nosec B608 - closed vocabulary
-        (since, *kinds),
+        f"WHERE {window} AND e.kind IN "  # nosec B608 - closed vocabulary
+        f"({kind_ph}) ORDER BY e.created_at ASC",
+        (*window_params, *kinds),
     )
 
     # Project attribution (#747): project_id lives on epics only — children
@@ -1519,6 +1682,8 @@ async def _human_gate_metrics(
     for row in event_rows:
         actor = (row["actor"] or "").strip()
         project_slug = await project_slug_for(row["task_id"])
+        if not scope.project_admits(project_slug):
+            continue
         decided_at = _parse_hub_ts(row["created_at"])
         kind = row["kind"]
         if kind in {"task_approved", "task_rejected", "task_decided", "audit_result"}:
