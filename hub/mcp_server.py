@@ -1922,12 +1922,10 @@ async def hub_my_context(
     max_chars: int | None = None,
     mode: str = "full",
 ) -> CallToolResult:
-    """Get work context for an agent: hierarchy breadcrumb, siblings, progress, children.
+    """Work context for a task: breadcrumb, siblings, progress, children, project policy.
 
-    Call it before starting work on a task to understand its place in the project.
-    Omit ``task_id`` (or pass null) to get the general Hub context instead — the
-    Workflow reference plus your own active tasks and the connected instance — which
-    is what to read when you have no active task yet.
+    Read it before starting a task. Omit ``task_id`` for the general Hub context
+    (Workflow reference, your active tasks, the instance) when you have no task yet.
 
     ``mode=summary`` or ``max_chars`` caps the WHOLE response — text and
     structuredContent together — at 4000 chars by default, and names what did
@@ -1950,12 +1948,29 @@ async def hub_my_context(
     query = _tree_query_string(max_chars=max_chars, mode=mode)
     ctx = await _api_get(f"/api/tasks/{task_id}/context{query}")
     text = ctx.get("context_text", f"Context for task #{task_id} not available.")
+    text += await _policy_brief_text(ctx)
     return fit_echo_result(
         text,
         _context_char_budget(max_chars, mode),
         drop_order=_CONTEXT_DROP_ORDER,
         context=ctx,
     )
+
+
+async def _policy_brief_text(ctx: dict[str, Any]) -> str:
+    """Блок «политика проекта» для контекста задачи (#1457); best effort."""
+    from hub.services.effective_policy import format_policy_brief
+
+    slug = ((ctx.get("task") or {}).get("project") or {}).get("slug") or ""
+    if not slug:
+        return ""
+    try:
+        data = await _api_get(
+            f"/api/projects/{urllib.parse.quote(slug, safe='')}/effective-policy"
+        )
+    except HubApiError as exc:
+        return f"\n\nполитика проекта не прочитана: {exc}"
+    return "\n\n" + "\n".join(format_policy_brief(data))
 
 
 @mcp.tool()
@@ -3344,6 +3359,19 @@ async def hub_executor_slots() -> CallToolResult:
     except HubApiError as exc:
         return _error_result(exc)
     return structured_echo_result("\n".join(format_occupancy(data)), **data)
+
+
+@mcp.tool()
+async def hub_effective_policy(project: str) -> CallToolResult:
+    """Effective policy of a project: every gate key with value and source (#1457)."""
+    from hub.services.effective_policy import format_effective_policy
+
+    slug = urllib.parse.quote(project, safe="")
+    try:
+        data = await _api_get(f"/api/projects/{slug}/effective-policy")
+    except HubApiError as exc:
+        return _error_result(exc)
+    return structured_echo_result("\n".join(format_effective_policy(data)), **data)
 
 
 @mcp.tool()

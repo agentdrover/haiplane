@@ -79,6 +79,12 @@ LADDER_SURFACES: tuple[str, ...] = (
 _AUTO_BAND: dict[str, RiskClass] = {"r0": RiskClass.r0, "r1": RiskClass.r1}
 
 
+def project_ceiling_of(policy: dict) -> RiskClass | None:
+    """Потолок класса риска из ``dor_max_class`` проекта; ``None`` — не задан."""
+    raw = policy.get("dor_max_class") if isinstance(policy, dict) else None
+    return _AUTO_BAND.get(str(raw or "").lower())
+
+
 def ladder_hits(paths: list[str]) -> list[str]:
     """Какие из путей попадают в ladder-поверхности.
 
@@ -186,7 +192,7 @@ async def maybe_auto_approve(
     # for more than the env allows simply gets the env's answer, and the feed
     # line below says so, because "why did this not auto-approve" must be
     # answerable without reading two configs and a deployment.
-    project_ceiling = _AUTO_BAND.get(str(policy.get("dor_max_class") or "").lower())
+    project_ceiling = project_ceiling_of(policy)
     ceiling = global_ceiling
     if project_ceiling is not None and order.index(project_ceiling) < order.index(
         ceiling

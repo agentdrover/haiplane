@@ -2095,6 +2095,18 @@ async def list_events(
     )
 
 
+async def last_project_event(
+    db: aiosqlite.Connection, project_id: int, kind: str
+) -> aiosqlite.Row | None:
+    """The newest event of ``kind`` on a project, or ``None``."""
+    rows = await fetchall(
+        db,
+        "SELECT * FROM events WHERE project_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+        (project_id, kind),
+    )
+    return rows[0] if rows else None
+
+
 async def prune_events(db: aiosqlite.Connection, *, keep_days: int = 14) -> int:
     """Delete events older than ``keep_days``. Returns rows removed."""
     cur = await db.execute(
