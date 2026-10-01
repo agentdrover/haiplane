@@ -1677,7 +1677,7 @@ def cmd_admin_agents_create(args: argparse.Namespace) -> int:
         "kind": "agent",
         "username": args.name,
         "display_name": getattr(args, "display_name", "") or args.name,
-        "role": "agent",
+        "role": getattr(args, "role", "") or "agent",
     }
     result = _api("POST", "/api/admin/principals", body)
     print(f"Agent '{args.name}' created (id={result.get('id')}).")
@@ -2886,6 +2886,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_agents_create.add_argument("--name", required=True, help="Agent slug/username")
     p_agents_create.add_argument("--display-name", dest="display_name", default="")
+    p_agents_create.add_argument(
+        "--role",
+        choices=["agent", "watcher"],
+        default="agent",
+        help="agent (default) or watcher: read-only, every write refused by the hub",
+    )
     p_agents_create.set_defaults(func=cmd_admin_agents_create)
 
     # admin keys

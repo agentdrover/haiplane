@@ -34,6 +34,7 @@ from hub.actionable_errors import (
     human_only_gate_detail,
     permission_denied_detail,
     steward_gate_forbidden_detail,
+    watcher_gate_forbidden_detail,
     withdraw_agent_only_detail,
 )
 from hub.config import TokenIdentity
@@ -321,6 +322,48 @@ def steward_route_allowed(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Watcher route allowlist (#1556)
+# ---------------------------------------------------------------------------
+#
+# A watcher reads. The list is positive — method AND path shape — so a write
+# route added tomorrow is closed for it today, and routes that do not exist,
+# /admin*, web forms and every POST/PUT/PATCH/DELETE on /api are refused
+# before routing. /mcp is open as a transport only (JSON-RPC rides on POST):
+# what a tool may do is decided by the REST call it makes with the CALLER's
+# bearer, which lands back in this same check and is refused there.
+#
+# Shapes, not prefixes-by-accident: "/api/" needs the slash, so /apix is out.
+WATCHER_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
+    ("GET", "/api/*"),
+    ("HEAD", "/api/*"),
+    ("GET", "/mcp"),
+    ("POST", "/mcp"),
+    ("DELETE", "/mcp"),
+    ("GET", "/mcp/*"),
+    ("POST", "/mcp/*"),
+    ("DELETE", "/mcp/*"),
+)
+
+
+def _watcher_shape_matches(shape: str, path: str) -> bool:
+    if shape.endswith("/*"):
+        return path.startswith(shape[:-1]) and len(path) > len(shape) - 1
+    return path == shape
+
+
+def watcher_route_allowed(
+    method: str, path: str, identity: TokenIdentity | None = None
+) -> bool:
+    """Whether a watcher principal may reach ``(method, path)`` (#1556)."""
+    if identity is not None and not identity.is_watcher:
+        return False
+    return any(
+        method == allowed_method and _watcher_shape_matches(shape, path)
+        for allowed_method, shape in WATCHER_ALLOWLIST
+    )
+
+
 _PUBLIC_PREFIXES: Final[tuple[str, ...]] = ("/static/",)
 
 _PROTECTED_PREFIXES: Final[tuple[str, ...]] = ("/",)
@@ -508,6 +551,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 if _steward_refused(identity, request.method, path):
                     await _record_steward_refusal(request, request.method, path)
                     return _steward_forbidden(request.method, path)
+                if _watcher_refused(identity, request.method, path):
+                    await _record_watcher_refusal(request, identity, path)
+                    return _watcher_forbidden(request.method, path)
                 request.state.user = identity.username
                 request.state.identity = identity
                 return await call_next(request)
@@ -538,6 +584,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
             if _steward_refused(identity, request.method, path):
                 await _record_steward_refusal(request, request.method, path)
                 return _steward_forbidden(request.method, path)
+            if _watcher_refused(identity, request.method, path):
+                await _record_watcher_refusal(request, identity, path)
+                return _watcher_forbidden(request.method, path)
             request.state.user = identity.username
             request.state.identity = identity
             if path.startswith("/mcp"):
@@ -592,6 +641,10 @@ def _steward_refused(identity: TokenIdentity, method: str, path: str) -> bool:
     return identity.is_steward and not steward_route_allowed(method, path, identity)
 
 
+def _watcher_refused(identity: TokenIdentity, method: str, path: str) -> bool:
+    return identity.is_watcher and not watcher_route_allowed(method, path, identity)
+
+
 def _chat_pair_forbidden(method: str, path: str) -> Response:
     """403 with the same actionable payload the REST handlers raise (#961)."""
     return Response(
@@ -630,6 +683,45 @@ async def _record_steward_refusal(request: Request, method: str, path: str) -> N
         await db.commit()
     except Exception:  # noqa: BLE001 — the refusal stands regardless
         log.warning("steward refusal not recorded: %s %s", method, path)
+
+
+async def _record_watcher_refusal(
+    request: Request, identity: TokenIdentity, path: str
+) -> None:
+    """A refused write attempt by a read-only principal is an audit event (#1556).
+
+    Best effort, like the steward's: failing to record never turns the 403
+    into a 500. The identity is passed in because ``request.state.identity``
+    is not set yet at this point of the middleware.
+    """
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return
+    try:
+        from hub import repository as repo
+        from hub.services.gate_events import WATCHER_ROUTE_REFUSED
+
+        await repo.insert_event(
+            db,
+            kind=WATCHER_ROUTE_REFUSED,
+            actor=identity.username or "watcher",
+            payload={"method": request.method, "path": path},
+        )
+        await db.commit()
+    except Exception:  # noqa: BLE001 — the refusal stands regardless
+        log.warning("watcher refusal not recorded: %s %s", request.method, path)
+
+
+def _watcher_forbidden(method: str, path: str) -> Response:
+    """403 with the actionable payload: method and path named (#1556)."""
+    return Response(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content=json.dumps(
+            {"detail": watcher_gate_forbidden_detail(method, path)},
+            ensure_ascii=False,
+        ),
+        media_type="application/json",
+    )
 
 
 def _steward_forbidden(method: str, path: str) -> Response:

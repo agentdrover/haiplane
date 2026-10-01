@@ -274,6 +274,24 @@ def steward_gate_forbidden_detail(method: str, path: str) -> dict[str, Any]:
     )
 
 
+def watcher_gate_forbidden_detail(method: str, path: str) -> dict[str, Any]:
+    """A watcher token reached a route outside its read-only list (#1556)."""
+    return enrich_error_payload(
+        {
+            "reason": "watcher_gate_forbidden",
+            "actor_hint": "none",
+            "message": f"watcher principals may not call {method} {path}",
+            "hint": (
+                "The watcher role is read-only: GET and HEAD on /api/* and the "
+                "MCP transport at /mcp. Everything else is refused by default, "
+                "including routes that do not exist yet."
+            ),
+            "required_role": "watcher",
+            "suggested_tool": None,
+        }
+    )
+
+
 def chat_pair_agent_missing_detail() -> dict[str, Any]:
     """503 when implementer pairing has no acting principal (#980).
 

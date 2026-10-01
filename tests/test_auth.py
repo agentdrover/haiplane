@@ -17,6 +17,8 @@ Covers:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from hub import brand, config
@@ -865,3 +867,154 @@ def test_the_classification_names_the_permissions_from_the_incident():
     assert "tasks.human_gate" in ENFORCED_PERMISSIONS, (
         "it gates through is_human, one hop away — decorative would be wrong"
     )
+
+
+# ---------------------------------------------------------------------------
+# watcher: read-only role (#1556)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def watcher_hub(client, db, monkeypatch):
+    """Auth on; a human who makes a task and a DB principal with role watcher."""
+    from types import SimpleNamespace
+
+    from hub.services import admin as admin_svc
+
+    # Auth is on only when some token exists: an empty map means open mode.
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {"unused-env-token": TokenIdentity("env-x", "human")}
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human = await admin_svc.create_principal(
+        db, kind="human", username="alice-w", role_slug="operator"
+    )
+    human_key = await admin_svc.create_api_key(db, human["id"], name="laptop")
+    watcher = await admin_svc.create_principal(
+        db, kind="agent", username="grok-w", role_slug="watcher"
+    )
+    watcher_key = await admin_svc.create_api_key(db, watcher["id"], name="w")
+    return SimpleNamespace(
+        client=client,
+        db=db,
+        human={"Authorization": f"Bearer {human_key['plaintext_key']}"},
+        watcher={"Authorization": f"Bearer {watcher_key['plaintext_key']}"},
+        watcher_key=watcher_key["plaintext_key"],
+    )
+
+
+async def _task_state(hub, task_id: int) -> tuple:
+    rows = await hub.db.execute_fetchall(
+        "SELECT title, status, assigned_agent, claimed_by FROM tasks WHERE id = ?",
+        (task_id,),
+    )
+    n = await hub.db.execute_fetchall(
+        "SELECT COUNT(*) FROM task_updates WHERE task_id = ?", (task_id,)
+    )
+    return (tuple(rows[0]), n[0][0])
+
+
+@pytest.mark.asyncio
+async def test_watcher_reads_api_and_every_write_is_refused(watcher_hub):
+    """AC-1 (#1556): GET /api/* works; everything else, even unknown, is 403."""
+    hub = watcher_hub
+    created = await hub.client.post(
+        "/api/tasks", json={"title": "для сторожа"}, headers=hub.human
+    )
+    assert created.status_code in (200, 201), created.text
+    tid = created.json()["id"]
+    before = await _task_state(hub, tid)
+
+    for path in (f"/api/tasks/{tid}", "/api/metrics/practices"):
+        ok = await hub.client.get(path, headers=hub.watcher)
+        assert ok.status_code == 200, (path, ok.status_code, ok.text)
+    head = await hub.client.head(f"/api/tasks/{tid}", headers=hub.watcher)
+    assert head.status_code != 403
+
+    refused = [
+        ("POST", f"/api/tasks/{tid}/claim", {}),
+        ("PATCH", f"/api/tasks/{tid}", {"title": "взломано"}),
+        ("POST", f"/api/tasks/{tid}/updates", {"content": "x", "agent": "w"}),
+        ("POST", "/api/tasks", {"title": "новая"}),
+        ("DELETE", f"/api/tasks/{tid}", None),
+        ("PUT", f"/api/tasks/{tid}", {}),
+        ("GET", "/admin", None),
+        ("GET", "/admin/anything", None),
+        ("GET", "/api/no-such-route-write", None),
+        ("POST", "/api/no-such-route-write", {}),
+        ("POST", "/login", {}),
+    ]
+    for method, path, body in refused:
+        kwargs = {"headers": hub.watcher}
+        if body is not None:
+            kwargs["json"] = body
+        resp = await hub.client.request(method, path, **kwargs)
+        expect = 403
+        # An unknown GET under /api is allowed by the list and then 404s in routing;
+        # the list is by method+path shape, never by "does the route exist".
+        if (method, path) == ("GET", "/api/no-such-route-write"):
+            expect = 404
+        assert resp.status_code == expect, (method, path, resp.status_code, resp.text)
+        if expect == 403:
+            detail = resp.json()["detail"]
+            assert detail["reason"] == "watcher_gate_forbidden", detail
+            assert method in detail["message"] and path in detail["message"]
+
+    assert await _task_state(hub, tid) == before
+    events = await hub.db.execute_fetchall(
+        "SELECT actor, payload FROM events WHERE kind='watcher_route_refused'"
+    )
+    paths = {json.loads(r["payload"])["path"] for r in events}
+    assert f"/api/tasks/{tid}/claim" in paths and "/admin" in paths
+    assert {r["actor"] for r in events} == {"grok-w"}
+
+
+@pytest.mark.asyncio
+async def test_watcher_refused_on_public_looking_paths_too(watcher_hub):
+    """AC-1 (#1556): the _looks_public branch of the middleware refuses as well."""
+    hub = watcher_hub
+    for method, path in (("POST", "/login"), ("POST", "/api/admin/bootstrap")):
+        resp = await hub.client.request(method, path, headers=hub.watcher, json={})
+        assert resp.status_code == 403, (method, path, resp.status_code)
+
+
+def test_watcher_is_neither_agent_nor_human():
+    """AC-2 (#1556): is_watcher only; no 'not an agent = human' branch fires."""
+    ident = TokenIdentity("w", "watcher", principal_id=7)
+    assert ident.is_watcher is True
+    assert ident.is_agent is False
+    assert ident.is_human is False
+    assert ident.is_admin is False
+    assert ident.is_steward is False
+    for perm in (
+        "tasks.create",
+        "tasks.refine",
+        "tasks.update",
+        "tasks.agent_report",
+        "tasks.human_gate",
+        "tasks.decision",
+        "tasks.archive",
+        "tasks.delete",
+        "admin.read",
+        "admin.users.write",
+    ):
+        assert ident.has_permission(perm) is False, perm
+    # even when the DB role hands it a permission set
+    seeded = TokenIdentity(
+        "w", "watcher", principal_id=7, permissions=frozenset({"tasks.read"})
+    )
+    assert seeded.has_permission("tasks.read") is True
+    assert seeded.has_permission("tasks.update") is False
+    # a plain agent / human are untouched
+    assert TokenIdentity("a", "agent", principal_id=1).is_watcher is False
+
+
+@pytest.mark.asyncio
+async def test_db_watcher_principal_does_not_resolve_as_human(watcher_hub):
+    """AC-2 (#1556): without the role in the priority list it fell through to human."""
+    from hub.services import admin as admin_svc
+
+    ident = await admin_svc.resolve_api_key(watcher_hub.db, watcher_hub.watcher_key)
+    assert ident is not None
+    assert ident.role == "watcher"
+    assert (ident.is_watcher, ident.is_human, ident.is_agent) == (True, False, False)

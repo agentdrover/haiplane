@@ -175,14 +175,19 @@ def _hub_url() -> str:
 def _hub_token() -> str:
     from hub.config import env_get
 
-    env_tok = (env_get("HUB_TOKEN", "") or "").strip()
-    if env_tok:
-        return env_tok
-    # Streamable MCP mounted in the same process: reuse caller's Bearer (set by
-    # AuthMiddleware via hub.mcp_internal_auth) so tools work without HAIPLANE_HUB_TOKEN.
     from hub.mcp_internal_auth import bearer_context_get
 
-    return (bearer_context_get() or "").strip()
+    # Streamable MCP mounted in the same process: the REST call a tool makes
+    # carries the CALLER's Bearer (set by AuthMiddleware via
+    # hub.mcp_internal_auth). It goes first, never the service's env token
+    # (#1556): an env token ahead of it would let a read-only caller write
+    # under someone else's rights.
+    caller = (bearer_context_get() or "").strip()
+    if caller:
+        return caller
+    # Local stdio MCP has no inbound request, so no caller bearer: the env
+    # token is its only credential.
+    return (env_get("HUB_TOKEN", "") or "").strip()
 
 
 def _auth_headers() -> dict[str, str]:
@@ -1269,7 +1274,11 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
     Args:
         task_id: The task ID number
     """
-    await _api_post(f"/api/tasks/{task_id}/refresh")
+    # refresh syncs the task with its dispatch job — a state transition, not a
+    # read. A read-only caller (watcher, #1556) gets the stored state instead;
+    # opening that POST to it would be a hole in the role, not a convenience.
+    if identity_context_get()[1] != "watcher":
+        await _api_post(f"/api/tasks/{task_id}/refresh")
     task = await _api_get(f"/api/tasks/{task_id}")
     parts = [
         f"Task #{task['id']}: {task['title']}",
