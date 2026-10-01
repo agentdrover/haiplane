@@ -1196,6 +1196,10 @@ async def approve_task(
             force_message += f". Comment: {body.comment}"
         await repo.add_task_update(db, task_id, "", "alert", force_message)
 
+    from hub.services.dor import record_statement_paths
+
+    await record_statement_paths(db, task_id, readiness.dor_checks)
+
     if body.comment and dor_override_summary is None and not body.force:
         await repo.add_task_update(
             db, task_id, "", "status", f"Approved: {body.comment}"

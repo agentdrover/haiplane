@@ -613,3 +613,31 @@ def bug_red_test_of(policy: dict) -> str:
     if isinstance(value, str) and value in BUG_RED_TEST_MODES:
         return value
     return RED_TEST_WARN
+
+
+# Пути постановки (#1456). DoR проверял, что validation_commands есть, но не
+# что пути в них и в test_ref существуют на базе или создаются самой задачей:
+# #1392 ушла в работу с командой на несуществующий каталог, и исполнитель
+# залатал красную проверку подменой пути в продуктовом коде. ``warn`` —
+# одобрение проходит, нарушение названо в карточке; ``require`` — отказ с
+# путём. Нет ключа — ``warn``: проверка ничего не блокирует, а ложные
+# срабатывания видны сразу. Нечитаемое значение — тоже ``warn``.
+STATEMENT_PATHS_KEY = "statement_paths"
+STATEMENT_PATHS_OFF = "off"
+STATEMENT_PATHS_WARN = "warn"
+STATEMENT_PATHS_REQUIRE = "require"
+STATEMENT_PATHS_MODES: tuple[str, ...] = (
+    STATEMENT_PATHS_OFF,
+    STATEMENT_PATHS_WARN,
+    STATEMENT_PATHS_REQUIRE,
+)
+
+
+def statement_paths_of(policy: dict) -> str:
+    """Режим проверки путей постановки: нет ключа или нечитаемое — warn."""
+    if not isinstance(policy, dict):
+        return STATEMENT_PATHS_WARN
+    value = policy.get(STATEMENT_PATHS_KEY)
+    if isinstance(value, str) and value in STATEMENT_PATHS_MODES:
+        return value
+    return STATEMENT_PATHS_WARN
