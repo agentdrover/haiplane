@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
+from typing import Any
 
 import aiosqlite
 
@@ -112,7 +114,7 @@ def _within_proven_empty_ceiling(task: dict) -> bool:
 
 async def _reviewer_model(
     db: aiosqlite.Connection, task_id: int, generation: int, review: dict
-) -> str:
+) -> tuple[str, str]:
     """Which model actually reviewed — the hub's record beats the report (#1008).
 
     The two sides of the diversity rule are not equally knowable. The hub
@@ -123,8 +125,9 @@ async def _reviewer_model(
     That asymmetry is the point, not an oversight: a report is free to describe
     itself, and a self-description is exactly what the gate must not lean on
     when the hub has the real answer beside it. A disagreement is not silently
-    preferred either way — it is written into the task so the audit has the
-    two values, and the dispatched one is used.
+    preferred either way — the second element of the answer carries the alert
+    text the DECIDER writes into the task (the route only reads, #1440), and
+    the dispatched model is used.
     """
     claimed = (review.get("model") or "").strip()
     dispatch = await repo.get_review_dispatch_for_generation(db, task_id, generation)
@@ -133,21 +136,16 @@ async def _reviewer_model(
         # No dispatch behind this report: nothing more trustworthy exists, and
         # the declaration is all there is. It still has to be recognisable to
         # count as diversity — see same_family.
-        return claimed
+        return claimed, ""
+    alert = ""
     if claimed and claimed.casefold() != dispatched.casefold():
-        await repo.add_task_update(
-            db,
-            task_id,
-            "hub",
-            "alert",
+        alert = (
             f"Отчёт ревью называет модель «{claimed}», а хаб запускал "
             f"«{dispatched}». Для правила разнородности взята модель "
             "диспетчера: её хаб знает, а не со слов отчёта. Сигнал аудиту "
-            "(#1008).",
-            author_kind="hub",
+            "(#1008)."
         )
-        await db.commit()
-    return dispatched
+    return dispatched, alert
 
 
 async def _proven_empty_usage(
@@ -201,39 +199,143 @@ def _repeats_note(repeats: dict[str, dict]) -> str:
     return f" — все повторы отложенных, повтор не блокирует: {named}"
 
 
-async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
-    """Issue APPROVED for the current submission when policy and facts allow.
+# ---------------------------------------------------------------------------
+# Стойка автопилота: один вопрос «вынесет ли политика вердикт» (#1440)
+# ---------------------------------------------------------------------------
+#
+# Раньше ответ существовал только как последовательность проверок внутри
+# maybe_auto_verdict, и показать его, не повторив проверки, было нельзя —
+# а повтор разъезжается с решателем в сторону «автопилот сделает», то есть
+# в сторону лжи. Поэтому проверки живут здесь, в ``autopilot_stance``, и
+# читает их и решатель (он поверх ответа действует), и маршрут вердикта
+# (hub/services/verdict_route.py), который только показывает. Порядок
+# проверок — прежний, до слова: исход решателя не изменился.
+#
+# ``autopilot_stance`` ничего не пишет. Всё, что решатель писал по ходу
+# проверок (громкая эскалация, строка в ленту, сигнал аудиту о расхождении
+# моделей), стойка возвращает данными, а пишет maybe_auto_verdict.
 
-    Called after a machine-review report lands. Returns True when the
-    verdict was recorded. Silent refusals mean "the human gate stands,
-    exactly as today"; TRIGGERS are never silent — they write an alert and
-    a ``verdict_escalated`` event naming the reason.
-    """
+OUTCOME_APPROVE = "approve"
+OUTCOME_REFUSE = "refuse"
+OUTCOME_ESCALATE = "escalate"
+
+CODE_APPROVE = "clean_delegated"
+CODE_KILL_SWITCH = "kill_switch_off"
+CODE_NOT_IN_REVIEW = "not_in_review"
+CODE_REVIEW_RUNNING = "review_running"
+CODE_NO_SUBMISSION = "no_submission"
+CODE_PROJECT_UNRESOLVED = "project_unresolved"
+CODE_POLICY_UNREADABLE = "policy_unreadable"
+CODE_NOT_DELEGATED = "verdict_not_delegated"
+CODE_NO_REPORT = "no_report"
+CODE_REPORT_STALE = "report_stale"
+CODE_ESCALATION = "escalation"
+CODE_UNCLEAN = "unclean_report"
+CODE_NO_DATA = "no_data_report"
+CODE_ABOVE_CEILING = "above_proven_empty_ceiling"
+CODE_NO_PIN = "no_pinned_sha"
+CODE_CI_NOT_GREEN = "ci_not_green"
+CODE_TIP_MOVED = "branch_tip_moved"
+CODE_DIFF_UNREADABLE = "diff_unreadable"
+CODE_OUTSIDE_AREAS = "diff_outside_areas"
+CODE_CLASS_MISSING = "risk_class_missing"
+CODE_CLASS_RAISED = "risk_class_raised"
+CODE_MODEL_UNDECLARED = "model_undeclared"
+
+#: Наблюдения, которые стойка не делала, когда её спросили без сети.
+PENDING_BRANCH = "branch"
+PENDING_PROVIDER_USAGE = "provider_usage"
+
+
+@dataclass(frozen=True)
+class AutoStance:
+    """Что автопилот сделает с текущей сдачей — и почему."""
+
+    outcome: str
+    code: str
+    reason: str = ""
+    #: Строка в ленту, которую решатель пишет при тихом, но названном отказе.
+    feed_note: str = ""
+    #: Сигналы аудиту, найденные по пути; решатель пишет их при любом исходе.
+    audit_alerts: tuple[str, ...] = ()
+    #: Проверки, требующие сети (ветка, провайдер), которых не делали:
+    #: ответ верен «если они пройдут». Пусто там, где решатель.
+    pending: tuple[str, ...] = ()
+    facts: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class _Ctx:
+    task: dict
+    project: Any
+    generation: int
+    observe: bool
+    review: dict = field(default_factory=dict)
+    confirmed: list[dict] = field(default_factory=list)
+    unresolved: list[dict] = field(default_factory=list)
+    repeats: dict[str, dict] = field(default_factory=dict)
+    proven_usage: int | None = None
+    pinned_sha: str = ""
+    implementer_model: str = ""
+    reviewer_model: str = ""
+    audit: list[str] = field(default_factory=list)
+    pending: list[str] = field(default_factory=list)
+
+
+def _refuse_with(
+    code: str, reason: str, ctx: _Ctx | None = None, *, note: str = ""
+) -> AutoStance:
+    return AutoStance(
+        OUTCOME_REFUSE,
+        code,
+        reason,
+        feed_note=note,
+        audit_alerts=tuple(ctx.audit) if ctx else (),
+        pending=tuple(ctx.pending) if ctx else (),
+    )
+
+
+def _escalate_with(code: str, reason: str, ctx: _Ctx) -> AutoStance:
+    return AutoStance(
+        OUTCOME_ESCALATE,
+        code,
+        reason,
+        audit_alerts=tuple(ctx.audit),
+        pending=tuple(ctx.pending),
+    )
+
+
+async def _scope_stage(
+    db: aiosqlite.Connection, task_id: int, observe: bool
+) -> AutoStance | _Ctx:
+    """WHERE automation is allowed: the global switch and the project policy (#743)."""
     # Kill-switch: the same global lever as the DoR autopilot (#744) — off
     # (or any unknown value) restores today's behavior everywhere.
     mode = (config.AUTO_APPROVE_MAX_CLASS or "off").strip().lower()
     if mode not in {"r0", "r1"}:
-        return False
-
+        return _refuse_with(
+            CODE_KILL_SWITCH,
+            "автовердикт выключен на сервере (HAIPLANE_AUTO_APPROVE_MAX_CLASS)",
+        )
     row = await repo.get_task(db, task_id)
     if row is None:
-        return False
+        return _refuse_with(CODE_NOT_IN_REVIEW, "задачи нет")
     task = dict(row)
-    if task.get("status") != "review" or task.get("review_job_id"):
-        return False
+    if task.get("status") != "review":
+        return _refuse_with(CODE_NOT_IN_REVIEW, "задача не на ревью")
+    if task.get("review_job_id"):
+        return _refuse_with(CODE_REVIEW_RUNNING, "ревью этой сдачи ещё идёт")
     generation = task.get("submission_generation") or 0
     if generation == 0:
-        return False
-
-    # WHERE automation is allowed: the project's own policy, set by a human
-    # (#743). Every resolution failure refuses toward the human gate.
+        return _refuse_with(CODE_NO_SUBMISSION, "у задачи нет закреплённой сдачи")
+    # Every resolution failure refuses toward the human gate.
     project = await repo.resolve_project_for_task(db, task_id)
     if project is None:
-        return False
+        return _refuse_with(CODE_PROJECT_UNRESOLVED, "проект задачи не определён")
     try:
         policy = json.loads(project["gate_policy"] or "{}")
     except (ValueError, KeyError):
-        return False
+        return _refuse_with(CODE_POLICY_UNREADABLE, "политика проекта нечитаема")
     # #1151: делегирование, а не одна строка. Проект, отдавший вердикт
     # СТЮАРДУ, не забирал его у автопилота — он добавил второго судью на
     # грязный путь. Автовердикт по-прежнему закрывает чистые сдачи, иначе
@@ -242,35 +344,94 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     from hub.services.project_policy import verdict_is_delegated
 
     if not verdict_is_delegated(policy):
-        return False
+        return _refuse_with(CODE_NOT_DELEGATED, "вердикт проекта не делегирован")
+    return _Ctx(task=task, project=project, generation=generation, observe=observe)
 
-    review_row = await repo.get_latest_machine_review(db, task_id)
-    if review_row is None:
-        return False
-    review = dict(review_row)
-    if (review.get("submission_generation") or 0) != generation:
-        return False
 
+async def _loud_grounds(
+    db: aiosqlite.Connection, task_id: int, ctx: _Ctx
+) -> AutoStance | None:
+    """Escalation triggers: never silent.
+
+    Условия живут в hub/services/gate_grounds.py (#1147): те же пять
+    оснований обязан соблюдать стюард, когда применяет вердикт, и два
+    описания одного правила разъехались бы в сторону мягкого.
+    """
+    review = ctx.review
     confirmed = _finding_dicts(review.get("findings_confirmed"))
     rejected = _finding_dicts(review.get("findings_rejected"))
     unresolved = _finding_dicts(review.get("unresolved"))
-
-    # --- Escalation triggers: never silent -------------------------------
-    #
-    # Условия живут в hub/services/gate_grounds.py (#1147): те же пять
-    # оснований обязан соблюдать стюард, когда применяет вердикт, и два
-    # описания одного правила разъехались бы в сторону мягкого.
+    ctx.confirmed, ctx.unresolved = confirmed, unresolved
     for ground in (
         grounds.security_ground(confirmed, rejected, unresolved),
         grounds.token_budget_ground(
             review.get("tokens_spent"), config.REVIEW_TOKEN_BUDGET
         ),
-        await grounds.sibling_mismatch_ground(db, task_id, generation, review["id"]),
+        await grounds.sibling_mismatch_ground(
+            db, task_id, ctx.generation, review["id"]
+        ),
     ):
         if ground:
-            await _escalate(db, task_id, ground)
-            return False
+            return _escalate_with(CODE_ESCALATION, ground, ctx)
+    return None
 
+
+async def _empty_report_stage(
+    db: aiosqlite.Connection, task_id: int, ctx: _Ctx
+) -> AutoStance | None:
+    """``raw_count`` 0 is "no data" unless the provider's billing proves work (#769)."""
+    # "No candidates at all" is no data, not no findings (harness v7) —
+    # unless the provider's billing proves the reviewer worked (#769).
+    if not ctx.observe:
+        # Биллинг провайдера — сеть; без неё ответ «если докажется».
+        ctx.pending.append(PENDING_PROVIDER_USAGE)
+    else:
+        ctx.proven_usage = await _proven_empty_usage(
+            db, task_id, ctx.generation, ctx.review
+        )
+        if ctx.proven_usage is None:
+            return _refuse_with(
+                CODE_NO_DATA, "отчёт без единого кандидата — это «нет данных»", ctx
+            )
+    # Proven work is not proven capability (#835): an empty report may
+    # stand in for a review only where a miss costs no more than this
+    # reviewer is worth. Refused quietly — no trigger fired, the human
+    # gate simply stands — but the reason goes to the feed so the
+    # digest (#739) can show what the ceiling actually held back.
+    if not _within_proven_empty_ceiling(ctx.task):
+        ceiling = _proven_empty_ceiling()
+        note = (
+            "Автовердикт НЕ вынесен: пустое ревью выше потолка "
+            f"класса. Класс задачи: {ctx.task.get('risk_class') or 'не вычислен'}, "
+            f"потолок для пустого ревью: {ceiling.value if ceiling else 'путь закрыт'} "
+            f"(HAIPLANE_PROVEN_EMPTY_MAX_CLASS="
+            f"{config.PROVEN_EMPTY_MAX_CLASS!r}). "
+            f"Работа ревьюера доказана (usage={ctx.proven_usage}), способность — нет. "
+            "Вердикт остаётся человеку."
+        )
+        return _refuse_with(
+            CODE_ABOVE_CEILING,
+            "пустое ревью выше потолка класса: способность ревьюера не доказана",
+            ctx,
+            note=note,
+        )
+    return None
+
+
+async def _report_stage(
+    db: aiosqlite.Connection, task_id: int, ctx: _Ctx
+) -> AutoStance | None:
+    review_row = await repo.get_latest_machine_review(db, task_id)
+    if review_row is None:
+        return _refuse_with(CODE_NO_REPORT, "отчёта машинного ревью нет")
+    ctx.review = dict(review_row)
+    if (ctx.review.get("submission_generation") or 0) != ctx.generation:
+        return _refuse_with(
+            CODE_REPORT_STALE, "отчёт относится не к текущей сдаче", ctx
+        )
+    loud = await _loud_grounds(db, task_id, ctx)
+    if loud is not None:
+        return loud
     # --- Clean grounds: silent refusals, the human gate stands -----------
     #
     # Which sections owe an account lives in gate_grounds (#1170), for the
@@ -280,52 +441,49 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     # Повтор находки, осознанно отложенной до НЕдоставленной задачи, отчёта
     # не требует (#1448): тот же предикат читает стюард, и он же показан в
     # карточке. Security и прочие границы держит сам предикат.
-    repeats = await grounds.deferred_repeats(db, task_id, confirmed)
+    ctx.repeats = await grounds.deferred_repeats(db, task_id, ctx.confirmed)
     if grounds.unattended_blockers(
-        confirmed, unresolved, bool(review.get("incomplete")), repeats
+        ctx.confirmed,
+        ctx.unresolved,
+        bool(ctx.review.get("incomplete")),
+        ctx.repeats,
     ):
-        return False
-    raw_count = review.get("raw_count") or 0
-    proven_usage: int | None = None
-    if raw_count < 1:
-        # "No candidates at all" is no data, not no findings (harness v7) —
-        # unless the provider's billing proves the reviewer worked (#769).
-        proven_usage = await _proven_empty_usage(db, task_id, generation, review)
-        if proven_usage is None:
-            return False
-        # Proven work is not proven capability (#835): an empty report may
-        # stand in for a review only where a miss costs no more than this
-        # reviewer is worth. Refused quietly — no trigger fired, the human
-        # gate simply stands — but the reason goes to the feed so the
-        # digest (#739) can show what the ceiling actually held back.
-        if not _within_proven_empty_ceiling(task):
-            ceiling = _proven_empty_ceiling()
-            await repo.add_task_update(
-                db,
-                task_id,
-                "hub",
-                "status",
-                (
-                    "Автовердикт НЕ вынесен: пустое ревью выше потолка "
-                    f"класса. Класс задачи: {task.get('risk_class') or 'не вычислен'}, "
-                    f"потолок для пустого ревью: {ceiling.value if ceiling else 'путь закрыт'} "
-                    f"(HAIPLANE_PROVEN_EMPTY_MAX_CLASS="
-                    f"{config.PROVEN_EMPTY_MAX_CLASS!r}). "
-                    f"Работа ревьюера доказана (usage={proven_usage}), способность — нет. "
-                    "Вердикт остаётся человеку."
-                ),
-                author_kind="hub",
-            )
-            await db.commit()
-            return False
+        return _refuse_with(
+            CODE_UNCLEAN,
+            "в отчёте есть находки, нерешённое или он неполный",
+            ctx,
+        )
+    if (ctx.review.get("raw_count") or 0) < 1:
+        return await _empty_report_stage(db, task_id, ctx)
+    return None
 
-    pinned_sha = (task.get("submission_sha") or "").strip()
-    if not pinned_sha:
-        return False
-    ci = await repo.get_ci_run_report(db, task_id, pinned_sha)
+
+async def _observed_facts_stage(
+    db: aiosqlite.Connection, task_id: int, ctx: _Ctx
+) -> AutoStance | None:
+    """CI on the pinned sha, the tip where it was submitted, the diff in its areas."""
+    task = ctx.task
+    ctx.pinned_sha = (task.get("submission_sha") or "").strip()
+    if not ctx.pinned_sha:
+        return _refuse_with(CODE_NO_PIN, "коммит сдачи не закреплён", ctx)
+    ci = await repo.get_ci_run_report(db, task_id, ctx.pinned_sha)
     if ci is None or (ci["validation_status"] or "") != VALIDATION_PASS:
-        return False
+        return _refuse_with(
+            CODE_CI_NOT_GREEN, "CI на закреплённом коммите не зелёный", ctx
+        )
+    if not ctx.observe:
+        # Вершина и дифф — сеть. Класс риска от них не зависит и читается.
+        ctx.pending.append(PENDING_BRANCH)
+        if not (task.get("risk_class") or "").strip():
+            return _refuse_with(CODE_CLASS_MISSING, "класс риска не вычислен", ctx)
+        return None
+    return await _branch_stage(db, task_id, ctx)
 
+
+async def _branch_stage(
+    db: aiosqlite.Connection, task_id: int, ctx: _Ctx
+) -> AutoStance | None:
+    task = ctx.task
     # The tip must still stand where it was submitted — an auto-approval of
     # commits nobody reviewed is exactly the hole #572 closed for humans.
     from hub.services.lifecycle import (
@@ -337,22 +495,19 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     current_tip, _tip_reason = await resolve_branch_tip(
         db, task_id, task.get("branch") or ""
     )
-    if not current_tip or current_tip != pinned_sha:
-        return False
-
+    if not current_tip or current_tip != ctx.pinned_sha:
+        return _refuse_with(CODE_TIP_MOVED, "вершина ветки не там, где её сдали", ctx)
     # The actual diff: inside declared areas, and not raising the class —
     # recomputed here (#550/#583), never trusted from feed prose.
     diff_paths, diff_reason = await _resolve_branch_diff(db, task)
     if diff_paths is None:
-        return False
+        return _refuse_with(CODE_DIFF_UNREADABLE, "дифф ветки не прочитан", ctx)
     verdict_state, _undeclared, _detail = _surface_check(task, diff_paths, diff_reason)
     if verdict_state != "ok":
-        return False
+        return _refuse_with(CODE_OUTSIDE_AREAS, "дифф вышел за заявленные области", ctx)
     from hub.commit_scope import ROUTINE_PATHS
-    from hub.models import RiskClass
-    from hub.services.risk_class import derive_risk_class
-
     from hub.services.project_policy import risk_map_for_task
+    from hub.services.risk_class import derive_risk_class
 
     diff_class, _reasons = derive_risk_class(
         [p for p in diff_paths if p not in ROUTINE_PATHS],
@@ -360,25 +515,24 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     )
     stored_raw = (task.get("risk_class") or "").strip()
     if not stored_raw:
-        await repo.add_task_update(
-            db,
-            task_id,
-            "hub",
-            "status",
-            (
-                "Автовердикт НЕ вынесен: класс риска задачи не вычислен. "
-                "Без класса сверка радиуса сдачи невозможна, даже когда дифф "
-                "сам сигнала не дал. Вердикт остаётся человеку."
-            ),
-            author_kind="hub",
+        note = (
+            "Автовердикт НЕ вынесен: класс риска задачи не вычислен. "
+            "Без класса сверка радиуса сдачи невозможна, даже когда дифф "
+            "сам сигнала не дал. Вердикт остаётся человеку."
         )
-        await db.commit()
-        return False
+        return _refuse_with(
+            CODE_CLASS_MISSING, "класс риска не вычислен", ctx, note=note
+        )
     if diff_class is not None:
         order = list(RiskClass)
         if order.index(diff_class) > order.index(RiskClass(stored_raw)):
-            return False
+            return _refuse_with(CODE_CLASS_RAISED, "дифф поднял класс риска", ctx)
+    return None
 
+
+async def _independence_stage(
+    db: aiosqlite.Connection, task_id: int, ctx: _Ctx
+) -> AutoStance | None:
     # --- Reviewer independence (#728): not the author's own report --------
     #
     # The diversity rule below asks whether the reviewer's MODEL differs from
@@ -388,57 +542,138 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     # bypass the human path closed in #318. Escalated, not refused in silence:
     # this module keeps silence for absent data, and a self-review is a
     # positive fact about the report in hand.
-    self_reviewed = bool(review.get("self_reviewed"))
+    self_reviewed = bool(ctx.review.get("self_reviewed"))
     solo = config.REVIEW_SELF_APPROVE == "allow"
     self_ground = grounds.self_review_ground(self_reviewed, solo)
     if self_ground:
-        await _escalate(db, task_id, self_ground)
-        return False
+        return _escalate_with(CODE_ESCALATION, self_ground, ctx)
 
     # --- Model diversity (#758): no monoculture reviews -------------------
     from hub.services.model_family import same_family
 
-    implementer_model = (task.get("submission_model") or "").strip()
-    reviewer_model = await _reviewer_model(db, task_id, generation, review)
-    diversity = same_family(implementer_model, reviewer_model)
+    ctx.implementer_model = (ctx.task.get("submission_model") or "").strip()
+    ctx.reviewer_model, alert = await _reviewer_model(
+        db, task_id, ctx.generation, ctx.review
+    )
+    if alert:
+        ctx.audit.append(alert)
+    diversity = same_family(ctx.implementer_model, ctx.reviewer_model)
     if diversity is None:
         # Either declaration missing: absence of data is not diversity —
         # the human gate stands, silently (the raw_count=0 principle).
-        return False
-    mono_ground = grounds.monoculture_ground(implementer_model, reviewer_model)
+        return _refuse_with(
+            CODE_MODEL_UNDECLARED,
+            "модель исполнителя или ревьюера не объявлена: "
+            "отсутствие данных не есть разнообразие",
+            ctx,
+        )
+    mono_ground = grounds.monoculture_ground(ctx.implementer_model, ctx.reviewer_model)
     if mono_ground:
-        await _escalate(db, task_id, mono_ground)
-        return False
+        return _escalate_with(CODE_ESCALATION, mono_ground, ctx)
+    return None
 
-    # --- All grounds clean: the policy issues the verdict -----------------
+
+async def autopilot_stance(
+    db: aiosqlite.Connection, task_id: int, *, observe: bool = True
+) -> AutoStance:
+    """Вынесет ли политика вердикт текущей сдачи — читатель, не писатель (#1440).
+
+    ``observe=False`` не ходит в сеть (ветка, биллинг провайдера): такой
+    ответ называет эти проверки в ``pending`` и верен «если они пройдут».
+    Решатель всегда спрашивает с ``observe=True``.
+    """
+    scoped = await _scope_stage(db, task_id, observe)
+    if isinstance(scoped, AutoStance):
+        return scoped
+    ctx = scoped
+    for stage in (_report_stage, _observed_facts_stage, _independence_stage):
+        stopped = await stage(db, task_id, ctx)
+        if stopped is not None:
+            return stopped
+    return AutoStance(
+        OUTCOME_APPROVE,
+        CODE_APPROVE,
+        "чистая сдача, вердикт делегирован",
+        audit_alerts=tuple(ctx.audit),
+        pending=tuple(ctx.pending),
+        facts={
+            "project_slug": ctx.project["slug"],
+            "review_id": ctx.review["id"],
+            "generation": ctx.generation,
+            "raw_count": ctx.review.get("raw_count"),
+            "confirmed": len(ctx.confirmed),
+            "repeats_note": _repeats_note(ctx.repeats),
+            "pinned_sha": ctx.pinned_sha,
+            "implementer_model": ctx.implementer_model,
+            "reviewer_model": ctx.reviewer_model,
+            "proven_usage": ctx.proven_usage,
+            "self_reviewed": bool(ctx.review.get("self_reviewed")),
+        },
+    )
+
+
+async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
+    """Issue APPROVED for the current submission when policy and facts allow.
+
+    Called after a machine-review report lands. Returns True when the
+    verdict was recorded. Silent refusals mean "the human gate stands,
+    exactly as today"; TRIGGERS are never silent — they write an alert and
+    a ``verdict_escalated`` event naming the reason.
+
+    Что решать — отвечает ``autopilot_stance`` (его же читает маршрут
+    вердикта, #1440); здесь только то, что делают с ответом.
+    """
+    stance = await autopilot_stance(db, task_id)
+    for alert in stance.audit_alerts:
+        await repo.add_task_update(
+            db, task_id, "hub", "alert", alert, author_kind="hub"
+        )
+        await db.commit()
+    if stance.outcome == OUTCOME_ESCALATE:
+        await _escalate(db, task_id, stance.reason)
+        return False
+    if stance.outcome != OUTCOME_APPROVE:
+        if stance.feed_note:
+            await repo.add_task_update(
+                db, task_id, "hub", "status", stance.feed_note, author_kind="hub"
+            )
+            await db.commit()
+        return False
+    return await _approve(db, task_id, stance.facts)
+
+
+async def _approve(db: aiosqlite.Connection, task_id: int, facts: dict) -> bool:
+    """All grounds clean: the policy issues the verdict."""
     from hub.services.lifecycle import record_review_verdict
 
-    # Solo mode is the only way past the check above, and it does not make a
-    # self-review independent — it makes it permitted. The verdict is stored
-    # as self-approved so the audit trail says which of the two it was (#434).
+    # Solo mode is the only way past the independence check, and it does not
+    # make a self-review independent — it makes it permitted. The verdict is
+    # stored as self-approved so the audit trail says which of the two it was
+    # (#434).
     await record_review_verdict(
         db,
         task_id,
         TaskReviewVerdict(verdict=ReviewVerdict.approved, agent=_POLICY_ACTOR),
-        self_approved=self_reviewed,
+        self_approved=facts["self_reviewed"],
     )
+    proven = facts["proven_usage"]
     await repo.add_task_update(
         db,
         task_id,
         "hub",
         "status",
         (
-            f"Автовердикт APPROVED политикой проекта {project['slug']} "
-            f"(verdict=auto). Основания: machine-review #{review['id']} "
-            f"(gen {generation}, raw {review.get('raw_count')}, "
-            f"confirmed {len(confirmed)}{_repeats_note(repeats)}), "
-            f"CI {VALIDATION_PASS} на {pinned_sha[:12]}, вершина ветки на "
+            f"Автовердикт APPROVED политикой проекта {facts['project_slug']} "
+            f"(verdict=auto). Основания: machine-review #{facts['review_id']} "
+            f"(gen {facts['generation']}, raw {facts['raw_count']}, "
+            f"confirmed {facts['confirmed']}{facts['repeats_note']}), "
+            f"CI {VALIDATION_PASS} на {facts['pinned_sha'][:12]}, вершина ветки на "
             "месте, дифф в заявленных областях, класс не вырос. "
-            f"Разнородность моделей: код {implementer_model}, ревью "
-            f"{reviewer_model}."
+            f"Разнородность моделей: код {facts['implementer_model']}, ревью "
+            f"{facts['reviewer_model']}."
             + (
-                f" Пустота доказана: usage={proven_usage} (#769)."
-                if proven_usage is not None
+                f" Пустота доказана: usage={proven} (#769)."
+                if proven is not None
                 else ""
             )
         ),
@@ -448,7 +683,7 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     log.info(
         "auto-verdict APPROVED for task #%s gen %s (project %s)",
         task_id,
-        generation,
-        project["slug"],
+        facts["generation"],
+        facts["project_slug"],
     )
     return True
