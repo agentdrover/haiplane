@@ -2516,9 +2516,7 @@ async def test_admin_agents_create_with_watcher_role(client, db, monkeypatch):
     assert api.call_args.args[2]["kind"] == "agent"
     rc, api = _run_main(["admin", "agents", "create", "--name", "w2"], api_result={})
     assert rc == 0 and api.call_args.args[2]["role"] == "agent"
-    rc, _ = _run_main(
-        ["admin", "agents", "create", "--name", "w3", "--role", "admin"]
-    )
+    rc, _ = _run_main(["admin", "agents", "create", "--name", "w3", "--role", "admin"])
     assert rc != 0  # a role that is not agent/watcher is not offered here
 
     # Server side: the same body, sent by a human admin and by an agent.

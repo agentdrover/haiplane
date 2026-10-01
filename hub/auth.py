@@ -548,12 +548,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 identity = await _resolve_identity(request) or ANONYMOUS_IDENTITY
                 if _chat_pair_refused(identity, request.method, path):
                     return _chat_pair_forbidden(request.method, path)
-                if _steward_refused(identity, request.method, path):
-                    await _record_steward_refusal(request, request.method, path)
-                    return _steward_forbidden(request.method, path)
-                if _watcher_refused(identity, request.method, path):
-                    await _record_watcher_refusal(request, identity, path)
-                    return _watcher_forbidden(request.method, path)
+                if (blocked := await _role_gate(request, identity, path)) is not None:
+                    return blocked
                 request.state.user = identity.username
                 request.state.identity = identity
                 return await call_next(request)
@@ -581,12 +577,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
             # chat-pair session in the first place (#961).
             if _chat_pair_refused(identity, request.method, path):
                 return _chat_pair_forbidden(request.method, path)
-            if _steward_refused(identity, request.method, path):
-                await _record_steward_refusal(request, request.method, path)
-                return _steward_forbidden(request.method, path)
-            if _watcher_refused(identity, request.method, path):
-                await _record_watcher_refusal(request, identity, path)
-                return _watcher_forbidden(request.method, path)
+            if (blocked := await _role_gate(request, identity, path)) is not None:
+                return blocked
             request.state.user = identity.username
             request.state.identity = identity
             if path.startswith("/mcp"):
@@ -639,6 +631,24 @@ def _chat_pair_refused(identity: TokenIdentity, method: str, path: str) -> bool:
 
 def _steward_refused(identity: TokenIdentity, method: str, path: str) -> bool:
     return identity.is_steward and not steward_route_allowed(method, path, identity)
+
+
+async def _role_gate(
+    request: Request, identity: TokenIdentity, path: str
+) -> Response | None:
+    """Closed-list roles (steward #1021, watcher #1556): refuse before routing.
+
+    One place for both, so the two branches of ``dispatch`` cannot drift apart:
+    a role added to one branch and not the other is the failure that does not
+    announce itself.
+    """
+    if _steward_refused(identity, request.method, path):
+        await _record_steward_refusal(request, request.method, path)
+        return _steward_forbidden(request.method, path)
+    if _watcher_refused(identity, request.method, path):
+        await _record_watcher_refusal(request, identity, path)
+        return _watcher_forbidden(request.method, path)
+    return None
 
 
 def _watcher_refused(identity: TokenIdentity, method: str, path: str) -> bool:
