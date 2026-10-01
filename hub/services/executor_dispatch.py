@@ -1614,6 +1614,18 @@ def _positive(value: Any, cast: type) -> Any:
     return cast(value)
 
 
+def task_cents_ceiling_of(policy: dict) -> float:
+    """Потолок цены задачи: ключ проекта, иначе серверный (#1443)."""
+    own = _positive(policy.get(TASK_CENTS_CEILING_KEY), float)
+    return own or float(config.EXECUTOR_TASK_CENTS_CEILING)
+
+
+def task_token_ceiling_of(policy: dict) -> int:
+    """Потолок токенов задачи: ключ проекта, иначе серверный (#1443)."""
+    own = _positive(policy.get(TASK_TOKEN_CEILING_KEY), int)
+    return own or int(config.EXECUTOR_TASK_TOKEN_CEILING)
+
+
 async def task_budget(
     db: aiosqlite.Connection, task_id: int, policy: dict | None = None
 ) -> TaskBudget:
@@ -1630,14 +1642,12 @@ async def task_budget(
 
         policy = await gate_policy_for_task(db, task_id)
     rows = [dict(r) for r in await repo.list_executor_runs(db, task_id)]
-    cents_ceiling = _positive(policy.get(TASK_CENTS_CEILING_KEY), float)
-    token_ceiling = _positive(policy.get(TASK_TOKEN_CEILING_KEY), int)
     return TaskBudget(
         runs=len(rows),
         cents_spent=round(sum(float(r["cents"] or 0) for r in rows), 2),
         tokens_spent=sum(int(r["tokens"] or 0) for r in rows),
-        cents_ceiling=cents_ceiling or float(config.EXECUTOR_TASK_CENTS_CEILING),
-        token_ceiling=token_ceiling or int(config.EXECUTOR_TASK_TOKEN_CEILING),
+        cents_ceiling=task_cents_ceiling_of(policy),
+        token_ceiling=task_token_ceiling_of(policy),
         unpriced=sum(
             1
             for r in rows

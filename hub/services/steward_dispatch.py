@@ -506,7 +506,12 @@ def _policy_wants_steward(
     policy = gate_policy_of(project_row)
     if policy.get(gate) == "steward":
         return True
-    return shadow and gate == "verdict" and policy.get(STEWARD_SHADOW_KEY) is True
+    return shadow and gate == "verdict" and steward_shadow_of(policy)
+
+
+def steward_shadow_of(policy: Any) -> bool:
+    """Просит ли проект теневых суждений стюарда (#1268): только ``true`` JSON."""
+    return isinstance(policy, dict) and policy.get(STEWARD_SHADOW_KEY) is True
 
 
 def verdict_delegated_to_steward(project_row: Any | None) -> bool:
