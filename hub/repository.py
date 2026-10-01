@@ -2805,6 +2805,7 @@ async def create_review_dispatch(
     run_id: str,
     model: str,
     profile: str = "",
+    profile_assignment: str = "rule",
     reviewer_principal_id: int | None = None,
     channel: str = "cloud",
     replaces_dispatch_id: int | None = None,
@@ -2815,6 +2816,9 @@ async def create_review_dispatch(
 
     ``only_tests`` (#1254) — the symbols this order named to the reviewer;
     None when the call-site walk did not run for it.
+
+    ``profile_assignment`` (#1403) — who chose the profile: ``rule`` or the
+    ``random`` lot over rule-assigned lite.
 
     ``replaces_dispatch_id`` is set ONLY when this row is the second door's
     local replacement of an earlier failed order of the SAME rung — it marks
@@ -2827,9 +2831,9 @@ async def create_review_dispatch(
     cur = await db.execute(
         "INSERT INTO review_dispatches "
         "(task_id, submission_generation, agent_id, run_id, model, profile, "
-        "reviewer_principal_id, channel, replaces_dispatch_id, "
-        "second_door_reason, only_tests) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "profile_assignment, reviewer_principal_id, channel, "
+        "replaces_dispatch_id, second_door_reason, only_tests) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             submission_generation,
@@ -2837,6 +2841,7 @@ async def create_review_dispatch(
             run_id,
             model,
             profile,
+            profile_assignment,
             reviewer_principal_id,
             channel,
             replaces_dispatch_id,

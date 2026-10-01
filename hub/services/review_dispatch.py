@@ -20,6 +20,7 @@ stamps with data instead of discipline.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -1252,6 +1253,79 @@ async def _forced_deep_past_circle(
     )
     await db.commit()
     return True
+
+
+# Жребий deep (#1403). Правило профиля отправляет deep и lite на РАЗНЫЕ задачи,
+# поэтому разница их находок смешана с разницей задач. Часть сдач, которым
+# правило РИСКА дало lite, получает deep по жребию: на них оба профиля
+# сравнимы. Жребий не обходит экономию: круг (#1432) и суточный потолок
+# (#1414) режут его как правило, малая дельта (#1416) и документация в него
+# не попадают, а то, что правило отдало deep, остаётся deep.
+ASSIGNED_BY_RULE = "rule"
+ASSIGNED_BY_LOT = "random"
+#: Хвост причины lite, выданной правилом риска (``_profile_by_rule``).
+_RISK_LITE_TAIL = ", процессных поверхностей нет"
+
+
+def random_deep_share() -> float:
+    """Доля жребия из REVIEW_RANDOM_DEEP_SHARE в [0, 1]; нечитаемое — 0 (выкл.)."""
+    try:
+        share = float(str(config.REVIEW_RANDOM_DEEP_SHARE or "").strip() or 0)
+    except ValueError:
+        return 0.0
+    return 0.0 if math.isnan(share) else min(max(share, 0.0), 1.0)
+
+
+def lot_draw(task_id: int, generation: int) -> float:
+    """Бросок в [0, 1), одинаковый для одной пары (задача, поколение сдачи)."""
+    digest = hashlib.sha256(f"{task_id}:{generation}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64
+
+
+def _lite_by_risk_rule(profile: str, reasons: list[str]) -> bool:
+    """lite выдан именно правилом риска: не документация, не дельта, не круг."""
+    return (
+        profile == LITE
+        and len(reasons) == 1
+        and reasons[0].startswith("класс риска ")
+        and reasons[0].endswith(_RISK_LITE_TAIL)
+    )
+
+
+def _lot_won(task: dict[str, Any], generation: int, share: float) -> bool:
+    return lot_draw(int(task["id"]), generation) < share
+
+
+async def apply_random_deep_lot(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    generation: int,
+    profile: str,
+    reasons: list[str],
+    stop: tuple[int, int] | None,
+    cloud: bool,
+) -> tuple[str, list[str], str] | None:
+    """Жребий над lite правила риска; None — сдача в нём не участвует или не выиграла.
+
+    Иначе ``(профиль, причины, кто назначил)``: выигравшая сдача — deep с
+    ``random``; выигравшая, но остановленная кругом или потолком, — lite с
+    причиной «жребий выпал deep, но …».
+    """
+    share = random_deep_share()
+    if share <= 0 or not _lite_by_risk_rule(profile, reasons):
+        return None
+    if not _lot_won(task, generation, share):
+        return None
+    if stop is not None:
+        why = f"{circle_stop_reason(stop[0])} — lite"
+        return LITE, [f"жребий выпал deep, но {why}", *reasons], ASSIGNED_BY_RULE
+    if cloud:
+        cap = await deep_cap_exhausted(db, task, generation)
+        if cap is not None:
+            why = f"{DEEP_CAP_REASON_MARK} {cap} исчерпан — lite"
+            return LITE, [f"жребий выпал deep, но {why}", *reasons], ASSIGNED_BY_RULE
+    named = f"deep по жребию (доля {share * 100:g}%)"
+    return DEEP, [named, f"правило назначило lite: {reasons[0]}"], ASSIGNED_BY_LOT
 
 
 # Суточный потолок deep на проект (#1414). Правило выше решает, заслуживает
@@ -2781,6 +2855,9 @@ class ReviewOrder:
     #: никого; None — разбор не состоялся. Уезжает в строку заказа, и бриф
     #: судит итог ровно по этому набору.
     only_tests: tuple[str, ...] | None = None
+    #: #1403: кто назначил профиль — правило (``rule``) или жребий (``random``).
+    #: Уезжает в строку заказа рядом с профилем.
+    profile_assignment: str = "rule"
 
 
 async def _small_delta(
@@ -2826,11 +2903,12 @@ async def _chosen_profile(
     profile_diff: str | None,
     subject: DeltaSubject,
     cloud: bool,
-) -> tuple[str, list[str]]:
-    """Профиль заказа без force_profile: правило, круг (#1432), потолок (#1414).
+) -> tuple[str, list[str], str]:
+    """Профиль заказа без force_profile: правило, жребий (#1403), круг, потолок.
 
-    Круг — раньше потолка: сдача, пониженная кругом, места под потолком не
-    занимает.
+    Возвращает ``(профиль, причины, кто назначил)``. Круг (#1432) — раньше
+    потолка (#1414): сдача, пониженная кругом, места под потолком не занимает.
+    Жребий смотрит на результат правила и круга и сам проходит через оба.
     """
     task_id = int(task["id"])
     stop = await circle_deep_stop(db, task)
@@ -2842,11 +2920,16 @@ async def _chosen_profile(
     )
     if stop and reasons[:1] == [circle_stop_reason(stop[0])]:
         await announce_circle_deep_stop(db, task_id, generation, *stop)
+    lot = await apply_random_deep_lot(
+        db, task, generation, profile, reasons, stop, cloud
+    )
+    if lot is not None:
+        return lot
     if cloud:
         profile, reasons = await apply_deep_daily_cap(
             db, task, generation, profile, reasons
         )
-    return profile, reasons
+    return profile, reasons, ASSIGNED_BY_RULE
 
 
 async def prepare_review_order(
@@ -2903,8 +2986,9 @@ async def prepare_review_order(
             force_profile,
             ["профиль задан заказом: добор лестницы или его замена"],
         )
+        assignment = ASSIGNED_BY_RULE
     else:
-        profile, profile_reasons = await _chosen_profile(
+        profile, profile_reasons, assignment = await _chosen_profile(
             db, task, generation, profile_diff, subject, cloud
         )
     rules_block, rules_note = await collect_review_rules(db, task_id, diff)
@@ -2939,6 +3023,7 @@ async def prepare_review_order(
         model=model_id,
         profile=profile,
         reasons=profile_reasons,
+        profile_assignment=assignment,
         prompt=_review_prompt(
             task_id,
             branch,
@@ -3663,6 +3748,7 @@ async def maybe_dispatch_review(
             detail,
             model=model_id,
             profile=profile,
+            profile_assignment=order.profile_assignment,
             principal_id=expected_principal,
             replaces_dispatch_id=replaces_dispatch_id,
             only_tests=order.only_tests,
@@ -3696,6 +3782,7 @@ async def maybe_dispatch_review(
         run_id=run_id,
         model=model_id,
         profile=profile,
+        profile_assignment=order.profile_assignment,
         reviewer_principal_id=expected_principal,
         replaces_dispatch_id=replaces_dispatch_id,
         only_tests=order.only_tests,
@@ -3780,6 +3867,7 @@ async def _owe_the_refused_call(
     *,
     model: str,
     profile: str,
+    profile_assignment: str = ASSIGNED_BY_RULE,
     principal_id: int | None,
     replaces_dispatch_id: int | None,
     only_tests: tuple[str, ...] | None,
@@ -3818,6 +3906,7 @@ async def _owe_the_refused_call(
         run_id="",
         model=model,
         profile=profile,
+        profile_assignment=profile_assignment,
         reviewer_principal_id=principal_id,
         channel=CLOUD_CHANNEL,
         replaces_dispatch_id=replaces_dispatch_id,
@@ -4139,6 +4228,7 @@ async def dispatch_local_review(
         run_id=run_id,
         model=order.model,
         profile=order.profile,
+        profile_assignment=order.profile_assignment,
         reviewer_principal_id=principal_id,
         channel=LOCAL_CHANNEL,
         replaces_dispatch_id=(

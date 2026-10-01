@@ -9,6 +9,7 @@ import aiosqlite
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from hub import config
 from hub.db import (
     _SCHEMA,
     _migrate,
@@ -73,6 +74,15 @@ class MockGitOps(NoopGitOps):
 
     async def checkout(self, branch, repo=None):
         return True
+
+
+@pytest.fixture(autouse=True)
+def _no_random_deep_lot(monkeypatch):
+    """Жребий deep (#1403) выключен: тесты профилей не должны зависеть от хеша.
+
+    Сам жребий проверяют тесты, которые ставят долю явно.
+    """
+    monkeypatch.setattr(config, "REVIEW_RANDOM_DEEP_SHARE", "0", raising=False)
 
 
 @pytest.fixture(autouse=True)
