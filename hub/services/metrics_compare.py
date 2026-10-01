@@ -33,7 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from hub.services.metrics_scope import MIN_COMPARE_N
+from hub.services.metrics_scope import MAX_SERIES_BUCKETS, MIN_COMPARE_N
 
 FLAT_BELOW = 0.05
 WORSE_FROM = 0.10
@@ -237,9 +237,15 @@ def build_comparison(
 
 
 def build_series(
-    bucket_sections: list[tuple[dict[str, Any], dict[str, Any]]], bucket_days: int
+    bucket_sections: list[tuple[dict[str, Any], dict[str, Any]]],
+    bucket_days: int,
+    dropped: int = 0,
 ) -> dict[str, Any]:
-    """Ряды по интервалам: пустой интервал — ``value: None``, не ноль."""
+    """Ряды по интервалам: пустой интервал — ``value: None``, не ноль.
+
+    Если окно длиннее лимита интервалов, старые отброшены, и это названо:
+    ``truncated``, ``dropped_buckets`` и ``starts_at`` — фактическое начало.
+    """
     indicators = []
     for ind in INDICATORS:
         points = []
@@ -264,7 +270,14 @@ def build_series(
                 "points": points,
             }
         )
-    return {"bucket_days": bucket_days, "indicators": indicators}
+    return {
+        "bucket_days": bucket_days,
+        "truncated": dropped > 0,
+        "dropped_buckets": dropped,
+        "max_buckets": MAX_SERIES_BUCKETS,
+        "starts_at": bucket_sections[0][0]["from"] if bucket_sections else None,
+        "indicators": indicators,
+    }
 
 
 def _worsening(row: dict[str, Any]) -> tuple[bool, float]:

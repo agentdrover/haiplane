@@ -3696,6 +3696,7 @@ async def hub_practice_metrics(
     date_to: str = "",
     compare: bool = False,
     series: bool = False,
+    series_days: int = 7,
 ) -> CallToolResult:
     """Practice metrics (#384): review economics, cycle times, problem spots.
 
@@ -3715,6 +3716,8 @@ async def hub_practice_metrics(
     for name, flag in (("compare", compare), ("series", series)):
         if flag:
             query[name] = "true"
+    if series:
+        query["series_days"] = series_days
     try:
         data = await _api_get(f"/api/metrics/practices?{urllib.parse.urlencode(query)}")
     except HubApiError as exc:

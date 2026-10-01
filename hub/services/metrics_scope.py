@@ -36,6 +36,9 @@ import aiosqlite
 from hub import repository as repo
 from hub.db import fetchall
 
+#: Больше интервалов ряд не несёт: старые отбрасываются, и ответ это говорит.
+MAX_SERIES_BUCKETS = 104
+
 #: Группа отчётов, где модель не записана. Как в ``by_reviewer_model``.
 UNDECLARED_MODEL = "не заявлена"
 
@@ -127,12 +130,13 @@ class Scope:
 
     def _bounds(self) -> tuple[datetime, datetime]:
         start = datetime.strptime(self.start, _TS_FORMAT)
-        end = (
-            datetime.strptime(self.end, _TS_FORMAT)
-            if self.end
-            else datetime.now(UTC).replace(tzinfo=None)
-        )
-        return start, end
+        if self.end:
+            return start, datetime.strptime(self.end, _TS_FORMAT)
+        if self.window_days is not None:
+            # "Last N days" is exactly N days long: measuring it to a later
+            # "now" would add a sliver bucket to a series.
+            return start, start + timedelta(days=self.window_days)
+        return start, datetime.now(UTC).replace(tzinfo=None)
 
     def _length(self) -> timedelta:
         start, end = self._bounds()
@@ -150,11 +154,14 @@ class Scope:
         """То же окно, сдвинутое: проект и модель остаются."""
         return replace(self, start=_fmt(start), end=_fmt(end), window_days=None)
 
-    def buckets(self, bucket_days: int, limit: int = 104) -> list[Scope]:
+    def bucket_plan(
+        self, bucket_days: int, limit: int = MAX_SERIES_BUCKETS
+    ) -> tuple[list[Scope], int]:
         """Окно, нарезанное на интервалы по ``bucket_days`` от старого к новому.
 
         Последний интервал обрезан по правой границе окна. Интервалов не
-        больше ``limit``: берутся самые свежие.
+        больше ``limit``: берутся самые свежие, а число отброшенных старых
+        возвращается вторым значением — ряд не режется молча (#1490).
         """
         start, end = self._bounds()
         step = timedelta(days=max(1, int(bucket_days)))
@@ -163,7 +170,8 @@ class Scope:
         while cursor < end:
             out.append(self.slice(cursor, min(cursor + step, end)))
             cursor += step
-        return out[-limit:]
+        dropped = max(len(out) - limit, 0)
+        return out[dropped:], dropped
 
     # --- условия SQL --------------------------------------------------
 

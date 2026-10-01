@@ -3259,3 +3259,41 @@ async def test_metrics_unjudged_queue_and_rules_follow_the_slice(
     assert breaches(await practice_metrics(db)) == 2
     assert breaches(await practice_metrics(db, project="spike")) == 1
     assert breaches(await practice_metrics(db, model="grok-4.6")) == 1
+
+
+async def test_metrics_series_names_the_buckets_it_dropped(db: aiosqlite.Connection):
+    """A window wider than the bucket limit is cut loudly, never silently
+    (#1490): the answer says how many old buckets went and where it starts."""
+    await _verdict_pack(db, approved=1, changed=0, days_ago=2)
+    await db.commit()
+
+    wide = (
+        await practice_metrics(db, date_from="2015-01-01", series=True, series_days=7)
+    )["series"]
+    points = wide["indicators"][0]["points"]
+    assert wide["truncated"] is True
+    assert len(points) == wide["max_buckets"] == 104
+    assert wide["dropped_buckets"] > 0
+    assert wide["starts_at"] == points[0]["from"]
+    # The newest bucket is kept: the recent verdict is still there.
+    assert sum(p["n"] for p in points) == 1
+
+    narrow = (await practice_metrics(db, since_days=28, series=True))["series"]
+    assert narrow["truncated"] is False
+    assert narrow["dropped_buckets"] == 0
+    assert len(narrow["indicators"][0]["points"]) == 4
+    assert narrow["starts_at"] == narrow["indicators"][0]["points"][0]["from"]
+
+
+async def test_mcp_practice_metrics_passes_series_days():
+    from unittest.mock import AsyncMock, patch
+
+    from hub.mcp_server import hub_practice_metrics
+
+    with patch("hub.mcp_server._api_get", new_callable=AsyncMock) as get:
+        get.return_value = {"since_days": 90}
+        await hub_practice_metrics(series=True, series_days=14)
+        assert "series=true" in get.call_args.args[0]
+        assert "series_days=14" in get.call_args.args[0]
+        await hub_practice_metrics()
+        assert "series_days" not in get.call_args.args[0]

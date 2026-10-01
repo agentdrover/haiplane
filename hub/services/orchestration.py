@@ -1126,11 +1126,11 @@ async def _window_extras(
             result, comparison
         )
     if series:
+        pieces, dropped = scope.bucket_plan(series_days)
         buckets = [
-            (piece.describe(), await _indicator_sections(db, piece))
-            for piece in scope.buckets(series_days)
+            (piece.describe(), await _indicator_sections(db, piece)) for piece in pieces
         ]
-        result["series"] = mc.build_series(buckets, series_days)
+        result["series"] = mc.build_series(buckets, series_days, dropped)
 
 
 async def practice_metrics(
