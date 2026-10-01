@@ -668,6 +668,10 @@ STEWARD_PERMS: frozenset[str] = frozenset(
     }
 )
 
+# Watcher (#1556): read-only. One verb, and the real gate is the positive
+# method+path list in hub/auth.py, not this set.
+WATCHER_PERMS: frozenset[str] = frozenset({"tasks.read"})
+
 
 class TokenIdentity:
     """Authenticated identity resolved from a token or DB principal.
@@ -726,8 +730,12 @@ class TokenIdentity:
         return self.role == "steward"
 
     @property
+    def is_watcher(self) -> bool:
+        return self.role == "watcher"
+
+    @property
     def is_human(self) -> bool:
-        if self.is_steward:
+        if self.is_steward or self.is_watcher:
             return False
         if self.role in ("human", "admin", "super_admin"):
             return True
@@ -735,7 +743,7 @@ class TokenIdentity:
 
     @property
     def is_agent(self) -> bool:
-        if self.is_steward:
+        if self.is_steward or self.is_watcher:
             return False
         if self.role == "agent":
             return True
@@ -747,6 +755,12 @@ class TokenIdentity:
         if self.is_steward:
             held = self.permissions if self.permissions else STEWARD_PERMS
             return perm in held
+        if self.is_watcher:
+            # Never widened by a stored permission set: whatever a role row
+            # carries, a watcher holds no verb outside WATCHER_PERMS.
+            return perm in WATCHER_PERMS and (
+                not self.permissions or perm in self.permissions
+            )
         if self.permissions:
             return perm in self.permissions
         if self.role == "admin":

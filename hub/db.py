@@ -3310,6 +3310,14 @@ SYSTEM_ROLES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         "Read the evidence pack and write a judgement; cannot change task state",
         ("steward.evidence.read", "steward.judgement.write"),
     ),
+    (
+        # #1556: read-only. One verb; the route allowlist in hub/auth.py is
+        # the real gate (GET/HEAD on /api/* and /mcp), not this permission.
+        "watcher",
+        "Watcher",
+        "Только чтение: задачи, ревью, метрики, прод-состояние; не меняет ничего",
+        ("tasks.read",),
+    ),
 )
 
 

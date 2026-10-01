@@ -301,6 +301,7 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
         "admin",
         "security_admin",
         "steward",
+        "watcher",
         "operator",
         "developer",
         "reviewer_agent",
@@ -310,8 +311,8 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
         if priority in slugs:
             if priority in ("super_admin", "admin", "security_admin"):
                 return "admin"
-            if priority == "steward":
-                return "steward"
+            if priority in ("steward", "watcher"):
+                return priority
             if priority in ("operator", "developer", "viewer"):
                 return "human"
             return "agent"
