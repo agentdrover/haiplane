@@ -408,6 +408,18 @@ def review_dispatch_enabled(policy: dict) -> bool:
     return policy.get("review") == REVIEW_DISPATCH
 
 
+# Замок #743: проект default (сам хаб) не принимает делегирование ни на
+# одном из этих гейтов. Запись политики (hub/app.py) и сводка действующей
+# политики (#1457) читают ЭТИ два имени, а не каждый своё.
+GATE_LOCK_SLUG = "default"
+GATE_LOCK_GATES: tuple[str, ...] = ("dor", "verdict")
+
+
+def gate_lock_applies(slug: str) -> bool:
+    """Действует ли замок #743 на проект с этим slug."""
+    return slug == GATE_LOCK_SLUG
+
+
 # Recognised values of the `release` key (#812). Default is manual, and it is
 # the default on purpose: releasing takes what is in develop as a whole,
 # including other sessions' work, so turning it on is a decision about the
@@ -480,10 +492,16 @@ def review_limit_mode_of(policy: dict) -> str:
 CI_RUNNER_KEY = "ci_runner"
 
 
+def ci_runner_from(policy: dict) -> str:
+    """The CI test command out of an already-read policy; ``""`` when unsaid."""
+    if not isinstance(policy, dict):
+        return ""
+    return str(policy.get(CI_RUNNER_KEY) or "").strip()
+
+
 def ci_runner_of(project) -> str:
     """How this project's acceptance tests are run in CI; ``""`` when unsaid."""
-    policy = gate_policy_of(project)
-    return str(policy.get(CI_RUNNER_KEY) or "").strip()
+    return ci_runner_from(gate_policy_of(project))
 
 
 async def risk_map_for_task(
@@ -494,8 +512,12 @@ async def risk_map_for_task(
     None and ``{}`` mean the same thing to the derivation, but None is the
     honest word for "this project never described its paths".
     """
-    policy = await gate_policy_for_task(db, task_id)
-    raw = policy.get("risk_map")
+    return risk_map_of(await gate_policy_for_task(db, task_id))
+
+
+def risk_map_of(policy: dict) -> dict[str, str] | None:
+    """The path map of an already-read policy; ``None`` when it has none."""
+    raw = policy.get("risk_map") if isinstance(policy, dict) else None
     if not isinstance(raw, dict) or not raw:
         return None
     return {str(k): str(v) for k, v in raw.items()}

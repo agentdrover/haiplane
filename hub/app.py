@@ -995,9 +995,9 @@ def _merged_gate_policy(
     # ту автоматику, которую этот замок и запрещает. Теперь читается тот
     # же перечень, что и у потребителей политики: новый делегат
     # закрывается здесь в тот же момент, когда открывается там.
-    if before["slug"] == "default" and any(
+    if project_policy.gate_lock_applies(before["slug"]) and any(
         merged.get(gate) in project_policy.DELEGATED_VERDICTS
-        for gate in ("dor", "verdict")
+        for gate in project_policy.GATE_LOCK_GATES
     ):
         raise HTTPException(
             422,
@@ -1056,7 +1056,11 @@ async def api_patch_project(
                 kind="project_gate_policy_changed",
                 project_id=project_id,
                 actor="human",
-                payload={"slug": before["slug"], **policy_delta},
+                payload={
+                    "slug": before["slug"],
+                    **policy_delta,
+                    "by": getattr(_identity, "username", "") or "",
+                },
             )
         if fields.get("status") == "active" and before["status"] != "active":
             # Events feed (#349): a pending proposal became a real project.
@@ -1191,6 +1195,22 @@ async def api_executor_repair(
         "run_id": result.run_id,
         "row_id": result.row_id,
     }
+
+
+@app.get("/api/projects/{slug}/effective-policy")
+async def api_effective_policy(slug: str, request: Request) -> dict:
+    """Действующая политика проекта одной сводкой (#1457).
+
+    Каждый ключ gate_policy со значением, источником (project, default или
+    server) и умолчанием; запрошенный и эффективный режим стюарда с причинами
+    отказа act; настройки сервера без секретов; замки; последняя правка.
+    Читает тех же читателей, что решатели, и ничего не пишет.
+    """
+    from hub.services import effective_policy
+
+    db = _db(request)
+    project = _row_or_404(await repo.get_project_by_slug(db, slug), "project not found")
+    return await effective_policy.effective_policy(db, project)
 
 
 @app.post("/api/projects/{slug}/executor-launch")

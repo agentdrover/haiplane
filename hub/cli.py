@@ -517,9 +517,21 @@ def _add_shift_left_parser(sub: Any) -> None:
     p_sl.set_defaults(func=cmd_shift_left)
 
 
+def _add_effective_policy_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling (#1457)."""
+    p_policy = sub.add_parser(
+        "effective-policy",
+        help="Effective policy of a project: keys, sources, steward, locks (#1457)",
+    )
+    p_policy.add_argument("slug", help="Project slug")
+    p_policy.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_policy.set_defaults(func=cmd_effective_policy)
+
+
 def _add_defect_metric_parsers(sub: Any) -> None:
-    """Defect metric sections (#918, #914): one call from build_parser, which
-    sits at its complexity ceiling."""
+    """Defect metric sections (#918, #914) and the policy view (#1457): one call
+    from build_parser, which sits at its complexity ceiling."""
+    _add_effective_policy_parser(sub)
     _add_change_failure_rate_parser(sub)
     _add_shift_left_parser(sub)
     _add_practice_metrics_parser(sub)
@@ -1504,6 +1516,21 @@ def cmd_slots(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     print("\n".join(format_occupancy(result)))
+    return 0
+
+
+def cmd_effective_policy(args: argparse.Namespace) -> int:
+    """Действующая политика проекта: ключи, источники, стюард, замки (#1457)."""
+    from hub.services.effective_policy import format_effective_policy
+
+    result = _api(
+        "GET",
+        f"/api/projects/{urllib.parse.quote(args.slug, safe='')}/effective-policy",
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print("\n".join(format_effective_policy(result)))
     return 0
 
 

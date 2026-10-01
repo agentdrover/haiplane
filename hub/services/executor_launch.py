@@ -103,6 +103,14 @@ def launch_mode_of(policy: dict) -> str:
     return LAUNCH_OFF
 
 
+def push_rights_task_of(policy: dict) -> int | None:
+    """Задача наблюдения F2.1, названная в политике; ``None`` — не названа."""
+    witness = policy.get(PUSH_RIGHTS_TASK_KEY) if isinstance(policy, dict) else None
+    if isinstance(witness, bool) or not isinstance(witness, int):
+        return None
+    return witness
+
+
 def _refused(reason: str, task_id: int | None = None) -> LaunchResult:
     return LaunchResult(False, reason, task_id)
 
@@ -114,8 +122,8 @@ async def _observation_missing(db: aiosqlite.Connection, policy: dict) -> str:
     которую владелец назвал в политике. Политику правит только человек, так
     что снять это условие агент сам не может.
     """
-    witness = policy.get(PUSH_RIGHTS_TASK_KEY)
-    if isinstance(witness, bool) or not isinstance(witness, int):
+    witness = push_rights_task_of(policy)
+    if witness is None:
         return (
             f"{REASON_NO_OBSERVATION}: в политике проекта не названа задача "
             f"наблюдения ({PUSH_RIGHTS_TASK_KEY})"

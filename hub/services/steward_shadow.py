@@ -1239,11 +1239,38 @@ async def effective_mode(db: aiosqlite.Connection) -> str:
     if asked != "act":
         return asked
     refusals = await act_refusals(db)
-    if not refusals:
-        return "act"
-    codes = [code for code, _ in refusals]
-    await _announce_refusal_once(db, codes, refusals)
-    return "shadow"
+    granted = granted_mode(asked, refusals)
+    if granted != "act":
+        codes = [code for code, _ in refusals]
+        await _announce_refusal_once(db, codes, refusals)
+    return granted
+
+
+def granted_mode(asked: str, refusals: list[tuple[str, str]]) -> str:
+    """The mode a request is granted given the unmet criteria.
+
+    The one place the word ``act`` is handed out: ``effective_mode`` and the
+    read-only policy summary (#1457) both ask here, so the summary can say
+    what the contour does without writing a refusal into the feed.
+    """
+    if asked == "act" and refusals:
+        return "shadow"
+    return asked
+
+
+async def mode_report(db: aiosqlite.Connection) -> dict[str, Any]:
+    """Requested and effective mode with the unmet criteria — a pure read.
+
+    Same grant as ``effective_mode`` but without its refusal announcement:
+    the policy summary (#1457) is a GET and must leave no trace in the feed.
+    """
+    asked = configured_mode()
+    refusals = await act_refusals(db) if asked == "act" else []
+    return {
+        "requested": asked,
+        "effective": granted_mode(asked, refusals),
+        "act_refusals": [{"code": c, "detail": d} for c, d in refusals],
+    }
 
 
 async def _announce_refusal_once(
