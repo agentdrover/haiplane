@@ -2499,3 +2499,60 @@ def test_main_release_blocks(capsys) -> None:
     rc, _ = _run_main(["release-blocks"], api_result={"release_blocks": []})
     assert rc == 0
     assert "Открытых аварий релиза нет" in capsys.readouterr().out
+
+
+async def test_admin_agents_create_with_watcher_role(client, db, monkeypatch):
+    """AC-4 (#1556): --role watcher reaches the API; only a human admin can do it."""
+    from hub import config
+    from hub.services import admin as admin_svc
+
+    # CLI side: the flag names the role in the request body, default stays agent.
+    rc, api = _run_main(
+        ["admin", "agents", "create", "--name", "w1", "--role", "watcher"],
+        api_result={"id": 9},
+    )
+    assert rc == 0
+    assert api.call_args.args[2]["role"] == "watcher"
+    assert api.call_args.args[2]["kind"] == "agent"
+    rc, api = _run_main(["admin", "agents", "create", "--name", "w2"], api_result={})
+    assert rc == 0 and api.call_args.args[2]["role"] == "agent"
+    rc, _ = _run_main(["admin", "agents", "create", "--name", "w3", "--role", "admin"])
+    assert rc != 0  # a role that is not agent/watcher is not offered here
+
+    # Server side: the same body, sent by a human admin and by an agent.
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {"unused-env-token": config.TokenIdentity("x", "human")}
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    admin = await admin_svc.create_principal(
+        db, kind="human", username="boss", role_slug="super_admin"
+    )
+    admin_key = await admin_svc.create_api_key(db, admin["id"], name="k")
+    agent = await admin_svc.create_principal(
+        db, kind="agent", username="ordinary", role_slug="agent"
+    )
+    agent_key = await admin_svc.create_api_key(db, agent["id"], name="k")
+    body = {"kind": "agent", "username": "w1", "display_name": "w1", "role": "watcher"}
+
+    denied = await client.post(
+        "/api/admin/principals",
+        json=body,
+        headers={"Authorization": f"Bearer {agent_key['plaintext_key']}"},
+    )
+    assert denied.status_code == 403, denied.text
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM principals WHERE username = 'w1'"
+    )
+
+    made = await client.post(
+        "/api/admin/principals",
+        json=body,
+        headers={"Authorization": f"Bearer {admin_key['plaintext_key']}"},
+    )
+    assert made.status_code in (200, 201), made.text
+    assert made.json()["roles"] == ["watcher"]
+    role = await db.execute_fetchall(
+        "SELECT r.system, GROUP_CONCAT(rp.permission) AS perms FROM roles r "
+        "JOIN role_permissions rp ON rp.role_id = r.id WHERE r.slug = 'watcher'"
+    )
+    assert role[0]["system"] == 1 and role[0]["perms"] == "tasks.read"
