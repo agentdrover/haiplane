@@ -1523,10 +1523,38 @@ async def api_provision_project(
 async def api_practice_metrics(
     request: Request,
     since_days: int = Query(default=90, ge=1, le=3650),
+    project: str | None = Query(default=None, max_length=100),
+    model: str | None = Query(default=None, max_length=200),
+    date_from: str | None = Query(default=None, max_length=10),
+    date_to: str | None = Query(default=None, max_length=10),
+    compare: bool = False,
+    series: bool = False,
+    series_days: int = Query(default=7, ge=1, le=365),
 ):
     """Practice metrics (#384): review economics, harness versions,
-    recurring finding categories, cycle times."""
-    return await services.practice_metrics(_db(request), since_days=since_days)
+    recurring finding categories, cycle times.
+
+    ``project`` (slug), ``model`` (the REVIEWER model; ``не заявлена`` is the
+    group with none recorded), ``date_from``/``date_to`` (YYYY-MM-DD, the last
+    day included, replacing ``since_days``), ``compare`` (previous window of
+    the same length, deltas, ranked problem spots) and ``series`` (indicators
+    per ``series_days`` bucket) are optional (#1490); without them the answer
+    is unchanged.
+    """
+    try:
+        return await services.practice_metrics(
+            _db(request),
+            since_days=since_days,
+            project=project,
+            model=model,
+            date_from=date_from,
+            date_to=date_to,
+            compare=compare,
+            series=series,
+            series_days=series_days,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/metrics/mcp-usage")

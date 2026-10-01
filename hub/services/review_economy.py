@@ -30,6 +30,7 @@ from typing import Any
 import aiosqlite
 
 from hub.db import fetchall
+from hub.services.metrics_scope import Scope
 
 #: Ниже этой выборки доля печатается с пометкой «недобор» (#1153).
 MIN_SAMPLE = 20
@@ -67,10 +68,13 @@ def _sample(n: int) -> dict[str, Any]:
     return {"n": n, "undersampled": n < MIN_SAMPLE}
 
 
-async def _runs(db: aiosqlite.Connection, since: str) -> list[dict[str, Any]]:
+async def _runs(db: aiosqlite.Connection, scope: Scope) -> list[dict[str, Any]]:
     """Прогоны окна с типом заказа, каналом и счётом."""
     from hub.services.review_dispatch import MODEL_CASCADE_EVENT
 
+    where, params = scope.where(
+        "d.created_at", task_column="d.task_id", model_column="d.model"
+    )
     rows = await fetchall(
         db,
         "SELECT d.id, d.task_id, d.submission_generation AS generation, "
@@ -81,9 +85,9 @@ async def _runs(db: aiosqlite.Connection, since: str) -> list[dict[str, Any]]:
         "AND p.submission_generation = d.submission_generation "
         "AND p.agent_id != '' AND p.id < d.id) AS has_earlier "
         "FROM review_dispatches d "
-        "WHERE d.agent_id != '' AND d.created_at >= datetime('now', ?) "
+        f"WHERE d.agent_id != '' AND {where} "  # nosec B608 - constant fragment
         "ORDER BY d.id",
-        (since,),
+        tuple(params),
     )
     cascade_rows = await fetchall(
         db,
@@ -169,10 +173,13 @@ def _runs_section(runs: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-async def _findings_section(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+async def _findings_section(db: aiosqlite.Connection, scope: Scope) -> dict[str, Any]:
     """confirmed и unresolved — разными строками; самоотчёт — рядом."""
     from hub.services.orchestration import ORIGINAL_READ_SQL, REPORT_HAS_EVIDENCE_SQL
 
+    where, params = scope.where(
+        "created_at", task_column="task_id", model_column="model"
+    )
     rows = await fetchall(
         db,
         "SELECT CASE WHEN profile = '' THEN ? ELSE profile END AS profile, "
@@ -180,11 +187,11 @@ async def _findings_section(db: aiosqlite.Connection, since: str) -> dict[str, A
         f"{REPORT_HAS_EVIDENCE_SQL} AS has_evidence, "  # nosec B608 - module constant
         "json_array_length(findings_confirmed) AS confirmed, "
         "json_array_length(COALESCE(unresolved, '[]')) AS unresolved "
-        "FROM machine_reviews WHERE created_at >= datetime('now', ?) "
+        f"FROM machine_reviews WHERE {where} "
         # #1361: перенос — не отчёт и не чтение; его находки уже посчитаны
         # в исходном отчёте.
         f"AND {ORIGINAL_READ_SQL}",
-        (_UNDECLARED, since),
+        (_UNDECLARED, *params),
     )
     reports = [dict(r) for r in rows]
     own = [r for r in reports if r["self_reviewed"]]
@@ -315,11 +322,14 @@ async def _cohort_section(
 
 
 async def _unbilled_report_buckets(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> dict[str, int]:
     """Разложить отчёты без своего счёта по заказам их сдачи."""
     from hub.services.orchestration import ORIGINAL_READ_SQL
 
+    where, params = scope.where(
+        "m.created_at", task_column="m.task_id", model_column="m.model"
+    )
     rows = await fetchall(
         db,
         "SELECT m.self_reviewed, "  # nosec B608 - module constant
@@ -332,7 +342,7 @@ async def _unbilled_report_buckets(
         "ON d.task_id = m.task_id "
         "AND d.submission_generation = m.submission_generation "
         "AND d.agent_id != '' "
-        "WHERE m.created_at >= datetime('now', ?) AND m.provider_tokens IS NULL "
+        f"WHERE {where} AND m.provider_tokens IS NULL "
         # #1361: у переноса счёта нет потому, что прогона не было, — это не
         # отчёт «без счёта». Столбец есть только у machine_reviews.
         f"AND {ORIGINAL_READ_SQL} "
@@ -340,7 +350,7 @@ async def _unbilled_report_buckets(
         # закрывает именно случай, когда API промолчал.
         "GROUP BY m.id HAVING SUM(CASE WHEN d.billed_tokens IS NOT NULL "
         "THEN 1 ELSE 0 END) = 0",
-        (since,),
+        tuple(params),
     )
     counts = dict.fromkeys(
         ("self_reviewed", "no_dispatch", "local_door", "dispatch_without_bill"), 0
@@ -360,7 +370,7 @@ async def _unbilled_report_buckets(
 
 
 async def _reconciliation_section(
-    db: aiosqlite.Connection, since: str, runs: list[dict[str, Any]]
+    db: aiosqlite.Connection, scope: Scope, runs: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """Сверка числа отчётов с числом оплаченных прогонов.
 
@@ -370,16 +380,19 @@ async def _reconciliation_section(
     """
     from hub.services.orchestration import ORIGINAL_READ_SQL
 
+    where, params = scope.where(
+        "created_at", task_column="task_id", model_column="model"
+    )
     total = await fetchall(
         db,
         "SELECT COUNT(*) AS n FROM machine_reviews "  # nosec B608 - module constant
         # #1361: сверяются отчёты с прогонами; перенос прогоном не был.
-        f"WHERE created_at >= datetime('now', ?) AND {ORIGINAL_READ_SQL}",
-        (since,),
+        f"WHERE {where} AND {ORIGINAL_READ_SQL}",
+        tuple(params),
     )
     reports = int(total[0]["n"] or 0)
     paid = [r for r in runs if r["bill"] is not None]
-    counts: dict[str, int] = dict(await _unbilled_report_buckets(db, since))
+    counts: dict[str, int] = dict(await _unbilled_report_buckets(db, scope))
     counts["paid_without_report"] = -sum(1 for r in paid if r["status"] != "done")
     gap = reports - len(paid)
     counts["unexplained"] = gap - sum(counts.values())
@@ -399,14 +412,15 @@ async def _reconciliation_section(
 
 
 async def _dispatched_payloads(
-    db: aiosqlite.Connection, since: str
+    db: aiosqlite.Connection, scope: Scope
 ) -> list[tuple[tuple[Any, Any], dict[str, Any]]]:
     """Записи «ревью вызвано» окна: ключ сдачи (задача, поколение) и payload."""
+    where, params = scope.where("created_at", task_column="task_id")
     rows = await fetchall(
         db,
         "SELECT task_id, payload FROM events WHERE kind = 'review_dispatched' "
-        "AND created_at >= datetime('now', ?)",
-        (since,),
+        f"AND {where}",  # nosec B608 - constant fragment
+        tuple(params),
     )
     out: list[tuple[tuple[Any, Any], dict[str, Any]]] = []
     for row in rows:
@@ -424,7 +438,7 @@ def _names_reason(payload: dict[str, Any], mark: str) -> bool:
     return isinstance(reasons, list) and any(mark in str(r) for r in reasons)
 
 
-async def _deep_cap_section(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+async def _deep_cap_section(db: aiosqlite.Connection, scope: Scope) -> dict[str, Any]:
     """Сколько сдач окна суточный потолок deep увёл в lite (#1414).
 
     Считаются сдачи (задача, поколение) по записям «ревью вызвано»: та же
@@ -433,7 +447,7 @@ async def _deep_cap_section(db: aiosqlite.Connection, since: str) -> dict[str, A
     """
     from hub.services.review_dispatch import DEEP_CAP_REASON_MARK
 
-    payloads = await _dispatched_payloads(db, since)
+    payloads = await _dispatched_payloads(db, scope)
     dispatched = {key for key, _ in payloads}
     capped = {key for key, p in payloads if _names_reason(p, DEEP_CAP_REASON_MARK)}
     return {
@@ -449,7 +463,9 @@ def _is_resubmission(key: tuple[Any, Any]) -> bool:
     return isinstance(generation, int) and generation >= 2
 
 
-async def _small_delta_section(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+async def _small_delta_section(
+    db: aiosqlite.Connection, scope: Scope
+) -> dict[str, Any]:
     """Сколько пересдач окна правило маленькой дельты увело в lite (#1416).
 
     Доля — от вызванных пересдач (поколение ≥ 2): по ней подбирается порог,
@@ -457,7 +473,7 @@ async def _small_delta_section(db: aiosqlite.Connection, since: str) -> dict[str
     """
     from hub.services.review_dispatch import SMALL_DELTA_REASON_MARK
 
-    payloads = await _dispatched_payloads(db, since)
+    payloads = await _dispatched_payloads(db, scope)
     resubmitted = {key for key, _ in payloads if _is_resubmission(key)}
     small = {
         key
@@ -496,20 +512,29 @@ def _escapes_section(escaped: dict[str, Any]) -> dict[str, Any]:
 
 
 async def review_economy(
-    db: aiosqlite.Connection, *, since_days: int, escaped: dict[str, Any]
+    db: aiosqlite.Connection,
+    *,
+    since_days: int,
+    escaped: dict[str, Any],
+    scope: Scope | None = None,
 ) -> dict[str, Any]:
-    """Раздел ``review_economy`` в ``practice_metrics`` (#1406)."""
-    since = f"-{since_days} days"
-    runs = await _runs(db, since)
+    """Раздел ``review_economy`` в ``practice_metrics`` (#1406).
+
+    ``scope`` (#1490) — окно, проект и модель-ревьюер среза; без него окно
+    «последние ``since_days``», как раньше.
+    """
+    scope = scope or Scope.relative(since_days)
+    since_days = scope.days
+    runs = await _runs(db, scope)
     return {
         "since_days": since_days,
         "min_sample": MIN_SAMPLE,
         "runs": _runs_section(runs),
-        "findings": await _findings_section(db, since),
+        "findings": await _findings_section(db, scope),
         "red_ci": await _red_ci_section(db, runs),
         "profile_assignment": await _cohort_section(db, runs),
-        "reconciliation": await _reconciliation_section(db, since, runs),
-        "deep_cap": await _deep_cap_section(db, since),
-        "small_delta": await _small_delta_section(db, since),
+        "reconciliation": await _reconciliation_section(db, scope, runs),
+        "deep_cap": await _deep_cap_section(db, scope),
+        "small_delta": await _small_delta_section(db, scope),
         "escapes": _escapes_section(escaped),
     }

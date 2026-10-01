@@ -49,6 +49,7 @@ import aiosqlite
 from hub import config
 from hub import repository as repo
 from hub.db import fetchall
+from hub.services.metrics_scope import Scope
 from hub.integrations import cursor_cloud
 
 log = logging.getLogger(__name__)
@@ -1692,12 +1693,16 @@ async def executor_runs_view(
     }
 
 
-async def executor_run_metrics(db: aiosqlite.Connection, since: str) -> dict[str, Any]:
+async def executor_run_metrics(
+    db: aiosqlite.Connection, scope: Scope
+) -> dict[str, Any]:
     """Стоимость исполнителя за окно для practice_metrics (#1410).
 
-    ``since`` — модификатор SQLite (``-30 days``), как у соседних метрик.
-    Прогоны без прочитанной цены считаются рядом, а не нулём внутри суммы.
+    ``scope`` — окно и проект среза (#1490); модель-ревьюер на прогоны
+    исполнителя не влияет. Прогоны без прочитанной цены считаются рядом, а не
+    нулём внутри суммы.
     """
+    where, params = scope.where("started_at", task_column="task_id")
     rows = await fetchall(
         db,
         "SELECT COUNT(*) AS runs, "
@@ -1706,8 +1711,8 @@ async def executor_run_metrics(db: aiosqlite.Connection, since: str) -> dict[str
         "COALESCE(SUM(CASE WHEN cents IS NULL THEN 1 ELSE 0 END), 0) "
         "AS runs_without_cents, "
         "COALESCE(SUM(CASE WHEN outcome=? THEN 1 ELSE 0 END), 0) AS runs_running "
-        "FROM executor_runs WHERE started_at >= datetime('now', ?)",
-        (OUTCOME_RUNNING, since),
+        f"FROM executor_runs WHERE {where}",  # nosec B608 - constant fragment
+        (OUTCOME_RUNNING, *params),
     )
     out = dict(rows[0])
     out["cents_total"] = round(float(out["cents_total"]), 2)
