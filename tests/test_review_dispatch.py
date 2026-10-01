@@ -15464,3 +15464,182 @@ async def test_create_404_last_check_keeps_its_budget_on_live_pauses(
     assert await _claims_of(db, task_id) == 0
     refused = [a for a in await _alerts_of(db, task_id) if "НЕ вызвано" in a]
     assert len(refused) == 1 and "сверка по метке заказа агента не нашла" in refused[0]
+
+
+# --- #1403: часть lite-сдач получает deep по жребию ---------------------------
+
+
+def _lot_task(task_id: int, **over) -> dict:
+    """Задача, которой правило риска даёт lite: класс R1, рисков нет."""
+    return {"id": task_id, "risk_class": "R1", "risks": "[]", **over}
+
+
+async def _lot_profile(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    *,
+    cloud: bool = False,
+    diff: str | None = None,
+    **over,
+) -> tuple[str, list[str], str]:
+    from hub.services import review_dispatch as rd
+
+    return await rd._chosen_profile(
+        db,
+        _lot_task(task_id, **over),
+        generation,
+        _HARMLESS_DIFF if diff is None else diff,
+        rd.DeltaSubject(paths=[], base_paths=[], author_diff="", note=""),
+        cloud,
+    )
+
+
+async def test_a_share_of_lite_submissions_gets_deep_by_lot(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1403): доля 0.2, 1000 разных пар, которым правило дало lite, —
+    deep по жребию получают 15-25%, у каждой причина с долей и ``random``."""
+    monkeypatch.setattr(config, "REVIEW_RANDOM_DEEP_SHARE", "0.2", raising=False)
+
+    drawn = []
+    for i in range(1, 1001):
+        drawn.append(await _lot_profile(db, i, 1 + i % 3))
+
+    lot = [d for d in drawn if d[0] == "deep"]
+    assert 150 <= len(lot) <= 250, len(lot)
+    assert all(d[2] == "random" for d in lot)
+    assert all(d[0] == "lite" and d[2] == "rule" for d in drawn if d not in lot)
+    assert all(any("deep по жребию (доля 20%)" in r for r in d[1]) for d in lot)
+
+    # Строка заказа: доля 1 — каждая сдача с lite правила получает deep, и
+    # колонка пишется рядом с профилем.
+    monkeypatch.setattr(config, "REVIEW_RANDOM_DEEP_SHARE", "1", raising=False)
+    recorder = _DispatchRecorder({"agent": {"id": "bc-lot"}, "run": {"id": "r-lot"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(client, db, "lot-row")
+    row = await _any_dispatch_row(db, task_id)
+    assert (row["profile"], row["profile_assignment"]) == ("deep", "random")
+    assert "ЛЁГКОЕ ревью" not in recorder.calls[0]["prompt_text"]
+    events = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE kind='review_dispatched' AND task_id=?",
+        (task_id,),
+    )
+    reasons = json.loads(events[-1][0])["profile_reasons"]
+    assert any("deep по жребию (доля 100%)" in r for r in reasons), reasons
+
+
+async def test_the_lot_is_repeatable_for_the_same_submission(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-2 (#1403): одна пара (задача, поколение) — один профиль каждый раз."""
+    monkeypatch.setattr(config, "REVIEW_RANDOM_DEEP_SHARE", "0.5", raising=False)
+    for i in range(1, 60):
+        first = await _lot_profile(db, i, 2)
+        again = await _lot_profile(db, i, 2)
+        assert first == again, i
+    # Жребий зависит от поколения: пересдача бросает заново, а не копирует.
+    profiles = {(await _lot_profile(db, 7, g))[0] for g in range(1, 40)}
+    assert profiles == {"lite", "deep"}
+
+
+async def test_rule_deep_and_human_request_never_enter_the_lot(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1403): deep по правилу и ручной запрос — deep и ``rule`` при
+    любой доле, в том числе при нулевом жребии для всех остальных."""
+    for share in ("0", "0.2", "1"):
+        monkeypatch.setattr(config, "REVIEW_RANDOM_DEEP_SHARE", share, raising=False)
+        for i in range(1, 40):
+            by_rule = await _lot_profile(db, i, 1, risk_class="R4")
+            human = await _lot_profile(db, i, 1, machine_review_override="require")
+            assert by_rule[0] == "deep" and by_rule[2] == "rule", (share, i)
+            assert human[0] == "deep" and human[2] == "rule", (share, i)
+            assert not any("жребий" in r for r in by_rule[1] + human[1])
+
+
+async def test_zero_share_turns_the_lot_off(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-4 (#1403): доля 0 (и нечитаемая) — профили те же, что у
+    pick_review_profile, ни одной строки ``random``."""
+    for share in ("0", "", "много", "nan"):
+        monkeypatch.setattr(config, "REVIEW_RANDOM_DEEP_SHARE", share, raising=False)
+        for i in range(1, 120):
+            profile, reasons, assignment = await _lot_profile(db, i, 1)
+            assert (profile, reasons) == pick_review_profile(
+                _lot_task(i), _HARMLESS_DIFF
+            ), (share, i)
+            assert assignment == "rule"
+
+
+async def test_the_lot_stops_at_the_circle_and_names_it(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1403: остановка deep кругом (#1432) жребий режет — lite и причина."""
+    from hub.services import review_dispatch as rd
+
+    monkeypatch.setattr(config, "REVIEW_RANDOM_DEEP_SHARE", "1", raising=False)
+
+    async def _stood(db, task):
+        return (3, 2)
+
+    monkeypatch.setattr(rd, "circle_deep_stop", _stood)
+    profile, reasons, assignment = await _lot_profile(db, 5, 1)
+
+    assert (profile, assignment) == ("lite", "rule")
+    assert reasons[0] == (f"жребий выпал deep, но {rd.circle_stop_reason(3)} — lite"), (
+        reasons
+    )
+
+
+async def test_the_lot_counts_against_the_daily_cap_and_names_it(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1403: deep по жребию занимает место под суточным потолком (#1414);
+    когда места нет — lite, ``rule`` и причина «жребий выпал deep, но …»."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-lc"}, "run": {"id": "r-lc"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "")
+    monkeypatch.setattr(config, "REVIEW_RANDOM_DEEP_SHARE", "1", raising=False)
+    pid = await _cap_project(db, "lot-cap", {"deep_daily_cap": 1})
+
+    first = await _submitted_in(db, pid, diff=_HARMLESS_DIFF)
+    second = await _submitted_in(db, pid, diff=_HARMLESS_DIFF)
+
+    one = await _any_dispatch_row(db, first)
+    assert (one["profile"], one["profile_assignment"]) == ("deep", "random")
+    two = await _any_dispatch_row(db, second)
+    assert (two["profile"], two["profile_assignment"]) == ("lite", "rule")
+    events = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE kind='review_dispatched' AND task_id=?",
+        (second,),
+    )
+    reasons = json.loads(events[-1][0])["profile_reasons"]
+    assert reasons[0] == ("жребий выпал deep, но суточный потолок 1 исчерпан — lite"), (
+        reasons
+    )
+
+
+async def test_small_delta_and_docs_lite_do_not_enter_the_lot(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1403: lite малой дельты (#1416) и lite документации — не от правила
+    риска, в жребии не участвуют даже при доле 1."""
+    monkeypatch.setattr(config, "REVIEW_SMALL_DELTA_LINES", "80")
+    monkeypatch.setattr(config, "REVIEW_RANDOM_DEEP_SHARE", "1", raising=False)
+
+    profile, reasons = await _small_delta_profile(
+        client, db, monkeypatch, "lot-small-delta", 30
+    )
+    assert profile == "lite", reasons
+    assert any("маленькая пересдача" in r for r in reasons), reasons
+    row = await _any_dispatch_row(
+        db, int((await db.execute_fetchall("SELECT MAX(id) FROM tasks"))[0][0])
+    )
+    assert row["profile_assignment"] == "rule"
+    assert not any("жребий" in r for r in reasons)
+
+    docs = await _lot_profile(db, 9, 1, diff=_docs_diff("docs/a.md"))
+    assert docs[0] == "lite" and docs[2] == "rule"
+    assert not any("жребий" in r for r in docs[1])
