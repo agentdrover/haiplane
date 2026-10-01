@@ -3107,6 +3107,147 @@ async def test_previous_findings_travel_with_the_delta(
     assert "не считай их закрытыми по факту" in prompt
 
 
+async def test_reviewer_is_told_which_findings_are_deferred_and_to_what(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1448 AC-3: отложенная находка доезжает до ревьюера с задачей.
+
+    Без этого ревьюер не отличает осознанную отсрочку от открытой находки и
+    подтверждает её на каждом поколении. Парой идёт исправленная находка:
+    её по-прежнему надо проверить на фикс, и смешивать два списка нельзя.
+    """
+    from hub.services.finding_identity import finding_uids
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-d"}, "run": {"id": "r-d"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _second_generation(client, db, "spike-prior-deferred")
+    deferred = {
+        "title": "orchestrator not called from CLI",
+        "severity": "low",
+        "file": "hub/a.py",
+    }
+    fixed = {"title": "race on retry", "severity": "high", "file": "hub/b.py"}
+    follow_up = await repo.create_task(
+        db,
+        title="сюда отложено",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="pda_claude",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    review_id = await repo.insert_machine_review(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        harness_skill="lite-diff-review",
+        raw_count=2,
+        findings_confirmed=json.dumps([deferred, fixed]),
+        incomplete=False,
+    )
+    for finding, outcome, linked in (
+        (deferred, "deferred", follow_up),
+        (fixed, "fixed", None),
+    ):
+        await repo.upsert_finding_outcome(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            submission_generation=1,
+            finding_uid=finding_uids([finding])[0],
+            finding_index=0,
+            finding_title=finding["title"],
+            outcome=outcome,
+            note="",
+            linked_task_id=linked,
+            reported_by="pda_claude",
+        )
+    await db.commit()
+    plugins.git_ops = _AncestryGitOps(_TIP, ["docs/notes.md"], delta=_DELTA)
+
+    assert await maybe_dispatch_review(db, task_id)
+
+    prompt = recorder.calls[-1]["prompt_text"]
+    confirmed_line = next(
+        line for line in prompt.splitlines() if "БЫЛИ ПОДТВЕРЖДЕНЫ" in line
+    )
+    assert "hub/b.py: race on retry" in confirmed_line, "фикс проверяют как прежде"
+    assert "orchestrator not called from CLI" not in confirmed_line, (
+        "отложенная не должна читаться как находка, которую надо проверить на фикс"
+    )
+    deferred_line = next(
+        line for line in prompt.splitlines() if "orchestrator not called" in line
+    )
+    assert f"отложена до #{follow_up}" in deferred_line
+    assert "подтверждай" in deferred_line and "изменился" in deferred_line
+
+
+async def test_a_finding_confirmed_by_two_reports_of_one_generation_is_listed_once(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1448 (deep #740, ab7f32e95620d2b3): добор лестницы даёт два отчёта на поколение.
+
+    Одна и та же находка в обоих отчётах получала во втором ординал-близнеца,
+    то есть другой uid без исхода, и попадала в открытые рядом с отложенной.
+    Отложенная побеждает, дубля нет ни в одном из списков.
+    """
+    from hub.services.finding_identity import finding_uids
+    from hub.services.review_dispatch import previous_findings
+
+    task_id = await _second_generation(client, db, "spike-prior-two-reports")
+    deferred = {"title": "deferred once", "severity": "low", "file": "hub/a.py"}
+    other = {"title": "open once", "severity": "high", "file": "hub/b.py"}
+    follow_up = await repo.create_task(
+        db,
+        title="сюда отложено",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="pda_claude",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    first = 0
+    for findings in ([deferred, other], [deferred]):
+        rid = await repo.insert_machine_review(
+            db,
+            task_id=task_id,
+            submission_generation=1,
+            raw_count=2,
+            findings_confirmed=json.dumps(findings),
+            incomplete=False,
+        )
+        first = first or rid
+    await repo.upsert_finding_outcome(
+        db,
+        review_id=first,
+        task_id=task_id,
+        submission_generation=1,
+        finding_uid=finding_uids([deferred])[0],
+        finding_index=0,
+        finding_title=deferred["title"],
+        outcome="deferred",
+        note="",
+        linked_task_id=follow_up,
+        reported_by="pda_claude",
+    )
+    await db.commit()
+
+    open_titles, deferred_titles = await previous_findings(db, task_id, 2)
+
+    assert open_titles == ["hub/b.py: open once"]
+    assert deferred_titles == [f"hub/a.py: deferred once (отложена до #{follow_up})"]
+
+
 def test_instance_base_url_never_names_the_vendor_host(monkeypatch):
     """#1005: this hub answers with its own address, never with the authors'.
 

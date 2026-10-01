@@ -519,6 +519,12 @@
         {% for c in machine_review.observation_closures %}
         {% if observed.update({c.finding_uid: c}) %}{% endif %}
         {% endfor %}
+        {# #1448: повтор находки, отложенной до недоставленной задачи. Гейты
+           его не считают блокером, но и прятать его нельзя. #}
+        {% set deferred = {} %}
+        {% for r in machine_review.deferred_repeats %}
+        {% if deferred.update({r.finding_uid: r}) %}{% endif %}
+        {% endfor %}
         <details>
             <summary class="project-edit-summary">confirmed findings — {#
                 #}размечено {{ machine_review.dispositions|length }}{% if observed %}, закрыто наблюдением {{ observed|length }}{% endif %} из {{ machine_review.findings_confirmed|length }}</summary>
@@ -560,6 +566,10 @@
                             value="wont_fix"
                             {% if judged.get(loop.index0) and judged.get(loop.index0).disposition.value == 'wont_fix' %}checked{% endif %}>
                             неважно</label>
+                        {% set repeat = deferred.get(f.finding_uid) %}
+                        {% if repeat %}
+                        <span class="badge badge--xs">отложена до <a href="/tasks/{{ repeat.linked_task_id }}">#{{ repeat.linked_task_id }}</a>, повтор не блокирует</span>
+                        {% endif %}
                         {% set closure = observed.get(f.finding_uid) %}
                         {% if closure %}
                         <span class="badge badge--xs">закрыта наблюдением: живая проверка #{{ closure.live_check_id }}</span>
