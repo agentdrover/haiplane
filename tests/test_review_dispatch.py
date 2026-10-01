@@ -15,6 +15,7 @@ import re
 import shlex
 import stat
 import subprocess
+import sys
 import textwrap
 import uuid
 from pathlib import Path
@@ -15643,3 +15644,23 @@ async def test_small_delta_and_docs_lite_do_not_enter_the_lot(
     docs = await _lot_profile(db, 9, 1, diff=_docs_diff("docs/a.md"))
     assert docs[0] == "lite" and docs[2] == "rule"
     assert not any("жребий" in r for r in docs[1])
+
+
+def test_the_lot_is_off_by_default():
+    """#1403, решение владельца 01.10: умолчание доли — 0, жребий выкатывается
+    выключенным и включается env-переменной. Читается свежим процессом без
+    переменной: conftest глушит долю для всех остальных тестов."""
+    env = {k: v for k, v in os.environ.items() if k != "REVIEW_RANDOM_DEEP_SHARE"}
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from hub import config; from hub.services import review_dispatch as rd; "
+            "print(repr(config.REVIEW_RANDOM_DEEP_SHARE), rd.random_deep_share())",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    assert float(out.stdout.split()[-1]) == 0.0, out.stdout
