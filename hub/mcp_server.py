@@ -1968,8 +1968,8 @@ async def _policy_brief_text(ctx: dict[str, Any]) -> str:
         data = await _api_get(
             f"/api/projects/{urllib.parse.quote(slug, safe='')}/effective-policy"
         )
-    except HubApiError:
-        return ""
+    except HubApiError as exc:
+        return f"\n\nполитика проекта не прочитана: {exc}"
     return "\n\n" + "\n".join(format_policy_brief(data))
 
 

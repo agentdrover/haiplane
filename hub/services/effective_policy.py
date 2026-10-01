@@ -45,6 +45,18 @@ class PolicyEntry:
     #: Атрибут ``config``, из которого читатель берёт умолчание, когда ключа в
     #: проекте нет; тогда источник — сервер, а не умолчание кода.
     server_attr: str = ""
+    #: Если действующее значение выведено из СОСЕДНЕГО ключа, а не прочитано
+    #: из своего, возвращает «ключ=значение» этого соседа; иначе пусто.
+    derived_from: Callable[[dict], str] | None = None
+
+
+def _review_derived_from(policy: dict) -> str:
+    """review включается делегированным вердиктом, а не собственным ключом."""
+    if project_policy.review_dispatch_enabled(policy) and (
+        policy.get("review") != project_policy.REVIEW_DISPATCH
+    ):
+        return f"verdict={policy.get('verdict')}"
+    return ""
 
 
 def _ceiling_name(policy: dict) -> str | None:
@@ -68,6 +80,7 @@ REGISTRY: dict[str, PolicyEntry] = {
             else project_policy.REVIEW_OFF
         ),
         "project_policy.review_dispatch_enabled",
+        derived_from=_review_derived_from,
     ),
     "risk_map": PolicyEntry(project_policy.risk_map_of, "project_policy.risk_map_of"),
     "dor_max_class": PolicyEntry(_ceiling_name, "auto_approve.project_ceiling_of"),
@@ -181,7 +194,10 @@ def _server_backed(entry: PolicyEntry) -> bool:
 
 def _key_row(key: str, entry: PolicyEntry, policy: dict) -> dict[str, Any]:
     stored = key in policy
-    if stored:
+    derived = entry.derived_from(policy) if entry.derived_from else ""
+    if derived:
+        source = "derived"
+    elif stored:
         source = "project"
     else:
         source = "server" if _server_backed(entry) else "default"
@@ -194,6 +210,8 @@ def _key_row(key: str, entry: PolicyEntry, policy: dict) -> dict[str, Any]:
     }
     if stored:
         row["stored"] = policy[key]
+    if derived:
+        row["derived_from"] = derived
     return row
 
 
@@ -278,11 +296,27 @@ def _show(value: Any) -> str:
     return str(value)
 
 
+def _source_label(row: dict[str, Any]) -> str:
+    if row["source"] == "derived":
+        return f"derived from {row['derived_from']}"
+    return row["source"]
+
+
+def _stored_note(row: dict[str, Any]) -> str:
+    """Сохранённое значение рядом, если оно расходится с действующим."""
+    if "stored" in row and row["stored"] != row["value"]:
+        return f" (stored {_show(row['stored'])})"
+    return ""
+
+
 def format_effective_policy(data: dict[str, Any]) -> list[str]:
     """Строки сводки — общие для CLI и MCP, как у занятости слотов."""
     lines = [f"Effective policy of project {data['slug']}"]
     for row in data["keys"]:
-        lines.append(f"  {row['key']} = {_show(row['value'])} [{row['source']}]")
+        lines.append(
+            f"  {row['key']} = {_show(row['value'])} [{_source_label(row)}]"
+            + _stored_note(row)
+        )
     for key, value in (data.get("unknown_keys") or {}).items():
         lines.append(f"  {key} = {_show(value)} [unknown key]")
     steward = data["steward"]
@@ -322,8 +356,11 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
 
 def format_policy_brief(data: dict[str, Any]) -> list[str]:
     """Короткий блок для hub_my_context: только то, что отличается от умолчаний."""
-    shown = [r for r in data["keys"] if r["source"] == "project"]
-    parts = [f"{r['key']} = {_show(r['value'])} [project]" for r in shown]
+    shown = [r for r in data["keys"] if r["source"] in ("project", "derived")]
+    parts = [
+        f"{r['key']} = {_show(r['value'])} [{_source_label(r)}]" + _stored_note(r)
+        for r in shown
+    ]
     steward = data["steward"]
     lines = [
         f"Policy of project {data['slug']}: "

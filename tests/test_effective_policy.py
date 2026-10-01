@@ -255,3 +255,57 @@ async def test_a_policy_patch_shows_up_in_the_summary_with_time_and_author(
     assert change["at"]
     assert change["by"], "автор правки назван именем из identity"
     assert _by_key(data)["claim_area_check"]["value"] == "warn"
+
+
+async def test_review_derived_from_a_delegated_verdict_names_its_source(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    # Находка 5197fd78dd0e3efb: review=dispatch, выведенный из verdict=auto,
+    # не должен читаться как умолчание или как сохранённое значение проекта.
+    await _project(db, "derived-a", {"verdict": "auto"})
+    await _project(db, "derived-b", {"verdict": "auto", "review": "off"})
+    await _project(db, "derived-c", {"verdict": "auto", "review": "dispatch"})
+    await _project(db, "derived-d", {"verdict": "human"})
+    rows = {}
+    for slug in ("derived-a", "derived-b", "derived-c", "derived-d"):
+        data = (await client.get(f"/api/projects/{slug}/effective-policy")).json()
+        rows[slug] = (_by_key(data)["review"], data)
+    a, _ = rows["derived-a"]
+    assert (a["value"], a["source"], a["derived_from"]) == (
+        "dispatch",
+        "derived",
+        "verdict=auto",
+    )
+    assert a["default"] == "off"
+    b, data_b = rows["derived-b"]
+    assert (b["value"], b["source"], b["stored"]) == ("dispatch", "derived", "off")
+    assert b["derived_from"] == "verdict=auto"
+    text = "\n".join(effective_policy.format_effective_policy(data_b))
+    assert "review = dispatch [derived from verdict=auto] (stored off)" in text
+    c, _ = rows["derived-c"]
+    assert (c["source"], "derived_from" in c) == ("project", False)
+    d, _ = rows["derived-d"]
+    assert (d["value"], d["source"]) == ("off", "default")
+    # Других ключей с выводом из соседа нет: источник derived только у review.
+    for _slug, (_row, data) in rows.items():
+        derived = [r["key"] for r in data["keys"] if r["source"] == "derived"]
+        assert derived in ([], ["review"])
+
+
+async def test_my_context_names_an_unreadable_policy_instead_of_dropping_it(
+    monkeypatch,
+):
+    # Находка e17305020f78121a: ошибка чтения не должна убирать блок молча.
+    async def _fake_get(path: str, **_: object) -> object:
+        if path.startswith("/api/tasks/7/context"):
+            return {
+                "context_text": "Task #7",
+                "task": {"project": {"id": 2, "slug": "spike"}},
+            }
+        raise mcp_server.HubApiError({"message": "policy backend exploded"})
+
+    monkeypatch.setattr(mcp_server, "_api_get", _fake_get)
+    out = await mcp_server.hub_my_context(task_id=7)
+    text = _message(out)
+    assert "политика проекта не прочитана" in text
+    assert "policy backend exploded" in text
