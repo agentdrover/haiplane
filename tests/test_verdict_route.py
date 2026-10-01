@@ -293,3 +293,25 @@ async def test_hub_task_status_prints_the_route_line(monkeypatch) -> None:
 
     text = _mcp_text(await mcp_server.hub_task_status(7))
     assert _ROUTE["line"] in text
+
+
+async def test_condition_names_every_unchecked_ground(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # Пустой отчёт без сети: не проверены и биллинг провайдера, и ветка.
+    # Условие называет оба, а не первое найденное.
+    task_id = await _ready(
+        client,
+        db,
+        monkeypatch,
+        "route-twopending",
+        {"verdict": "auto"},
+        raw_count=0,
+        findings_rejected=[],
+    )
+    route = await verdict_route(db, task_id)
+    assert route.decider == "policy"
+    assert set(route.pending) == {"branch", "provider_usage"}
+    assert "вершина ветки" in route.condition
+    assert "провайдер" in route.condition
+    assert "провайдер" in (await _status(client, task_id))["verdict_route"]["line"]
