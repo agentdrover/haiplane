@@ -1248,6 +1248,12 @@ async def hub_list_dependencies(task_id: int) -> CallToolResult:
     return structured_echo_result(_format_dependency_edges(edges), dependencies=edges)
 
 
+def _verdict_route_line(task: dict[str, Any]) -> str:
+    """#1440: who will write the verdict — the line the hub computed, verbatim."""
+    route = task.get("verdict_route")
+    return str(route.get("line") or "") if isinstance(route, dict) else ""
+
+
 def _cause_suggestion_line(task: dict[str, Any]) -> str:
     """The defect's release and culprit HYPOTHESIS, never read as caused_by (#917)."""
     suggestion = task.get("cause_suggestion")
@@ -1299,6 +1305,7 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
         parts.append(f"Worktree: {task['worktree_path']}")
     parts.extend(_dependency_lines(task))
     parts.extend(filter(None, [_cause_suggestion_line(task)]))
+    parts.extend(filter(None, [_verdict_route_line(task)]))
     if task.get("description"):
         parts.append(f"\nDescription:\n{task['description']}")
     if task.get("technical_hints"):
@@ -1519,6 +1526,13 @@ async def _task_mutation_response(
     fallback_status: str | None = None,
 ) -> str:
     body = task or {"id": task_id, "status": fallback_status or "?"}
+    if body.get("status") == "review" and "verdict_route" not in body:
+        # #1440: a mutation answer is not the enriched view, and the verdict
+        # route lives only there — read it, so the envelope of a task waiting
+        # in review names who acts instead of guessing from the status.
+        fresh = await _read_task(task_id) or {}
+        if fresh.get("status") == "review":
+            body = {**body, "verdict_route": fresh.get("verdict_route")}
     return _format_mutation_success(message, body, transition_from=prior_status)
 
 

@@ -18,6 +18,11 @@ ActorHint = Literal["agent", "human", "ci", "none"]
 # Names of arguments the schema did not declare. Values never belong here (#1015).
 UNKNOWN_ARGUMENTS_KEY = "unknown_arguments"
 
+_DECIDER_POLICY = "policy"
+_DECIDER_STEWARD = "steward"
+_DECIDER_HUMAN = "human"
+_DECIDER_NONE = "none"
+
 MUTATION_ENVELOPE_FIELDS = (
     "instance",
     "base_url",
@@ -44,7 +49,15 @@ def compute_awaiting(status: str, task: dict[str, Any] | None = None) -> Awaitin
     return "none"
 
 
-def compute_actor_hint(awaiting: Awaiting, status: str) -> ActorHint:
+def compute_actor_hint(
+    awaiting: Awaiting, status: str, route: dict[str, Any] | None = None
+) -> ActorHint:
+    # #1440: a task in review is waiting for a verdict, and WHO writes it is
+    # the verdict route's answer (the deciders' own predicates), not a guess
+    # from the status: a human only when the verdict really is theirs.
+    routed = actor_hint_of(route) if status == "review" else None
+    if routed is not None:
+        return routed  # type: ignore[return-value]
     if awaiting == "ci":
         return "ci"
     if awaiting == "human_decision":
@@ -167,16 +180,23 @@ def build_mutation_envelope(
     """Build the stable mutation envelope fields for success or error payloads."""
     resolved_status = status or (task or {}).get("status") or "?"
     awaiting = compute_awaiting(resolved_status, task)
-    actor_hint = compute_actor_hint(awaiting, resolved_status)
+    route = (task or {}).get("verdict_route")
+    actor_hint = compute_actor_hint(awaiting, resolved_status, route)
     transition = build_transition(transition_from, transition_to)
     if transition is None and transition_from and resolved_status != transition_from:
         transition = build_transition(transition_from, resolved_status)
+
+    next_action = compute_next_action(resolved_status, awaiting, reason=reason)
+    # A refusal keeps its own reason-specific hint; the route speaks for a
+    # task that is simply waiting in review.
+    if resolved_status == "review" and reason is None:
+        next_action = next_action_of(route) or next_action
 
     return {
         "status": resolved_status,
         "awaiting": awaiting,
         "transition": transition,
-        "next_action": compute_next_action(resolved_status, awaiting, reason=reason),
+        "next_action": next_action,
         "actor_hint": actor_hint,
     }
 
@@ -337,3 +357,55 @@ def attach_unknown_arguments(result: Any, names: list[str]) -> Any:
     if isinstance(result, str):
         return _inject_unknown_into_text(result, names)
     return result
+
+
+# --- Маршрут вердикта (#1440): чистый показ, без БД ---------------------------
+#
+# Считает маршрут hub/services/verdict_route.py; здесь только слова, чтобы
+# конверт ответа не тянул сервисы (круг импорта).
+
+
+def route_line(route: dict[str, Any] | None) -> str:
+    """Строка «вердикт: …» — одна на все выходы."""
+    if not route or route.get("decider") == _DECIDER_NONE:
+        return ""
+    final = str(route.get("final") or route.get("decider") or "")
+    who = {
+        _DECIDER_POLICY: "автопилот (политика проекта)",
+        _DECIDER_STEWARD: "стюард",
+        _DECIDER_HUMAN: "человек",
+    }.get(final, final)
+    mode = f", режим {route['mode']}" if route.get("mode") else ""
+    if route.get("decider") != final:
+        who = f"{who} (судит {route['decider']}{mode})"
+    elif mode and final == _DECIDER_STEWARD:
+        who += mode
+    text = f"вердикт: {who} — {route.get('reason', '')}"
+    if route.get("condition"):
+        text += f"; условие: {route['condition']}"
+    return text
+
+
+def actor_hint_of(route: dict[str, Any] | None) -> str | None:
+    """Кому действовать по задаче в review: человеку — только если вердикт за ним."""
+    if not route or route.get("decider") == _DECIDER_NONE:
+        return None
+    return "human" if (route.get("final") == _DECIDER_HUMAN) else "none"
+
+
+def next_action_of(route: dict[str, Any] | None) -> str | None:
+    """Совет следующего шага из того же ответа, без команды вердикта лишнему."""
+    hint = actor_hint_of(route)
+    if hint is None or route is None:
+        return None
+    line = route_line(route)
+    if hint == "human":
+        return (
+            f"{line}. Вердикт запишет человек или независимый ревьюер "
+            "(hub_get_review_brief, hub_submit_review); после APPROVED "
+            "повторите отчёт о завершении."
+        )
+    return (
+        f"{line}. Команда вердикта не нужна: ждите записи вердикта и затем "
+        "повторите отчёт о завершении."
+    )
