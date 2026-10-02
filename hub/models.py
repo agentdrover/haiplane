@@ -1478,6 +1478,10 @@ class ReviewBrief(BaseModel):
     # был разобран и закрыт по-настоящему, — иначе очередной отчёт читается
     # как первый.
     review_circle: ReviewCircleView = Field(default_factory=ReviewCircleView)
+    # #1440: who will write the verdict for this submission and under what
+    # condition — the answer of services.verdict_route, not a copy of its rules.
+    # None means "not computed on this path" or "task not in review".
+    verdict_route: dict[str, Any] | None = None
     # #920: rules from category_checks whose area touches this task. Empty
     # when none does — and then the rendered brief has no section for it.
     catalogue_rules: list[CatalogueRuleView] = Field(default_factory=list)
@@ -2426,6 +2430,10 @@ class TaskView(BaseModel):
     # прячущий заодно и число, отнял бы единственный способ увидеть, что
     # выключили не то.
     review_circle: ReviewCircleView = Field(default_factory=ReviewCircleView)
+    # #1440: who will write the verdict for this submission and under what
+    # condition — the answer of services.verdict_route, not a copy of its rules.
+    # None means "not computed on this path" or "task not in review".
+    verdict_route: dict[str, Any] | None = None
     ci_fix_cycle: int = 0
     auto_review: bool = True
     review_job_id: str | None = None

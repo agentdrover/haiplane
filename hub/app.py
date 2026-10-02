@@ -1793,6 +1793,23 @@ async def api_get_task(task_id: int, request: Request):
     return await services.enrich_task_view(db, task_view)
 
 
+@app.get("/api/tasks/{task_id}/verdict-route")
+async def api_get_verdict_route(task_id: int, request: Request, observe: bool = False):
+    """Who will write the verdict for the current submission (#1440).
+
+    The same answer the task card, the review brief and ``hub_task_status``
+    carry. ``observe=true`` asks the deciders' own questions in full, including
+    the branch tip and diff over the network; the default does not touch it and
+    says so in ``condition``.
+    """
+    from hub.services.verdict_route import verdict_route
+
+    db = _db(request)
+    if not await repo.get_task(db, task_id):
+        raise HTTPException(404, "task not found")
+    return (await verdict_route(db, task_id, observe=observe)).as_dict()
+
+
 # --- Task dependencies (#486, epic #478) ------------------------------------
 #
 # The graph existed since #482 but only code inside the hub could write to it,
