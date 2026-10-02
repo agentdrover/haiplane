@@ -703,6 +703,7 @@ def cmd_submit_review(args: argparse.Namespace) -> int:
 
 def cmd_review_brief(args: argparse.Namespace) -> int:
     result = _api("GET", f"/api/tasks/{args.task_id}/review-brief")
+    _print_verdict_route(result)
     _print_json(result)
     return 0
 
@@ -791,9 +792,17 @@ def cmd_answer(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_verdict_route(result: Any) -> None:
+    """#1440: the verdict route as one stderr line; the JSON on stdout carries it whole."""
+    route = result.get("verdict_route") if isinstance(result, dict) else None
+    if isinstance(route, dict) and route.get("line"):
+        print(route["line"], file=sys.stderr)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     result = _api("GET", f"/api/tasks/{args.task_id}")
     _print_json(result)
+    _print_verdict_route(result)
     return 0
 
 

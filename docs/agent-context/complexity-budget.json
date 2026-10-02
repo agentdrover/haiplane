@@ -116,22 +116,6 @@
       "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
     },
     {
-      "path": "hub/services/auto_verdict.py",
-      "function": "maybe_auto_verdict",
-      "rule": "C901",
-      "measured": 29,
-      "max": 34,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/services/auto_verdict.py",
-      "function": "maybe_auto_verdict",
-      "rule": "PLR0915",
-      "measured": 79,
-      "max": 91,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
       "path": "hub/services/delivery_state.py",
       "function": "delivery_state",
       "rule": "C901",

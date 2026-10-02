@@ -769,6 +769,12 @@
                     <dt>Review</dt>
                     <dd>cycle {{ task.review_cycle }}/3 {% if task.review_job_id %}<code class="code-sm">{{ task.review_job_id[:16] }}...</code>{% endif %}</dd>
                     {% endif %}
+                    {# #1440: кто вынесет вердикт — строка маршрута, посчитанная
+                       хабом (services/verdict_route), без пересчёта в шаблоне. #}
+                    {% if task.verdict_route and task.verdict_route.line %}
+                    <dt>Вердикт</dt>
+                    <dd data-verdict-route="{{ task.verdict_route.decider }}">{{ task.verdict_route.line }}</dd>
+                    {% endif %}
                     {# #1235: заходы «закрыли находки — пришли новые». Стоят
                        ОТДЕЛЬНОЙ строкой от cycle: то другой счёт (возвраты
                        работы автору) и другой потолок, который задачу

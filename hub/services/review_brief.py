@@ -46,6 +46,7 @@ from hub.models import (
     ReviewCircleView,
     SelfReviewWarning,
     TaskProjectRef,
+    TaskStatus,
 )
 from hub.services import call_sites, review_evidence
 from hub.services.ac_tests import current_ac_test_results
@@ -296,6 +297,19 @@ async def _read_only_tests_back(
         OnlyTestsOutcomeView(symbol=o.symbol, outcome=o.outcome, call_path=o.call_path)
         for o in readout.outcomes
     ]
+
+
+async def _brief_verdict_route(db, task_view) -> dict | None:
+    """#1440: тот же маршрут, что в карточке, но с проверками по сети.
+
+    Бриф и так наблюдает вершину ветки, и ревьюеру нужен ответ решателя,
+    а не «если».
+    """
+    if task_view.status != TaskStatus.review:
+        return None
+    from hub.services.verdict_route import verdict_route
+
+    return (await verdict_route(db, task_view.id, observe=True)).as_dict()
 
 
 async def build_review_brief(
@@ -556,6 +570,7 @@ async def build_review_brief(
     circle = await review_circle(db, int(task_row["id"]))
 
     return ReviewBrief(
+        verdict_route=await _brief_verdict_route(db, task_view),
         # #920: the rules this area already paid for, from category_checks.
         # An empty list renders no section at all — never a header over nothing.
         catalogue_rules=[

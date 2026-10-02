@@ -53,7 +53,7 @@ from hub.services import (
 )
 from hub.services.project_policy import risk_map_for_task
 from hub.services.risk_class import derive_risk_class
-from hub.models import RiskClass, TaskDeclareWait
+from hub.models import RiskClass, TaskDeclareWait, TaskStatus
 from hub.mcp_envelope import enrich_error_payload
 from hub.services import finding_outcome
 from hub.services.ci_report import adopt_ci_run_report
@@ -811,7 +811,23 @@ async def enrich_task_view(
             id=project_row["id"], slug=project_row["slug"]
         )
 
+    task_view.verdict_route = await _verdict_route_of(db, task_view)
     return await apply_live_worktree(db, task_view)
+
+
+async def _verdict_route_of(
+    db: aiosqlite.Connection, task_view: TaskView
+) -> dict[str, Any] | None:
+    """#1440: who will write the verdict, for a task in review only.
+
+    Answered by ``verdict_route`` — the same stance the deciders read — and
+    without the network: a card and a status call must not fetch the branch.
+    """
+    if task_view.status != TaskStatus.review:
+        return None
+    from hub.services.verdict_route import verdict_route
+
+    return (await verdict_route(db, task_view.id)).as_dict()
 
 
 @dataclass(frozen=True)
