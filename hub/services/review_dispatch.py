@@ -47,6 +47,7 @@ from hub.models import (
     RiskClass,
 )
 from hub.services import call_sites, project_policy, review_ci_gate
+from hub.services.auto_approve import ladder_hits
 from hub.services.metrics_scope import Scope
 from hub.services.model_family import family
 from hub.services.orchestration import ORIGINAL_READ_SQL
@@ -1089,10 +1090,33 @@ def pick_review_profile(
     ]
 
 
+def ladder_surface_reasons(diff: str) -> list[str]:
+    """Пути контура надзора, которых касается дифф сдачи (#1559).
+
+    Список и правило совпадения — auto_approve.ladder_hits, второй копии нет.
+    Пути берутся из ТОГО ЖЕ диффа без сгенерированных файлов, что читает
+    process_surface_reasons, а не из заявленных affected_areas: заявка не
+    освобождает от надзора (#582).
+    """
+    kept, _ = split_generated(diff)
+    # Удалённый, переименованный и бинарный файл — тоже правка контура.
+    paths = [p for p in _diff_touched_paths(kept) if p is not None]
+    return [f"контур надзора — {path}" for path in ladder_hits(paths)]
+
+
 def _profile_by_rule(
     task: dict[str, Any], diff: str, risks: Any
 ) -> tuple[str, list[str]]:
-    """The rule after the human request: documents, surfaces, risk, class."""
+    """The rule after the human request: ladder, documents, surfaces, risk, class.
+
+    Контур надзора (#1559) стоит РАНЬШЕ документации: docs/agent-context и
+    docs/repository-rules.md — часть контура, и правка правил гейтов не
+    становится безобидной оттого, что написана прозой. Остальная документация
+    остаётся lite.
+    """
+    ladder = ladder_surface_reasons(diff)
+    if ladder:
+        return DEEP, ladder
     if is_docs_only_diff(diff) and not _declares_security(risks):
         return LITE, ["дифф только из документации"]
     surfaces = process_surface_reasons(diff)

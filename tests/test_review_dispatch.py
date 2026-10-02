@@ -15664,3 +15664,94 @@ def test_the_lot_is_off_by_default():
         check=True,
     )
     assert float(out.stdout.split()[-1]) == 0.0, out.stdout
+
+
+# --- Контур надзора покупает deep (#1559) ------------------------------------
+
+_LADDER_DIFF = (
+    "+++ b/hub/services/auto_verdict.py\n+def autopilot_stance() -> None:\n+    pass\n"
+)
+_R2 = {"risk_class": "R2", "risks": "[]"}
+
+
+def test_a_change_to_the_oversight_ladder_buys_deep():
+    """AC-1 (#1559): R2, процессных поверхностей нет, дифф правит auto_verdict.py
+    (живой случай #1440) — deep и причина называет путь контура."""
+    profile, reasons = pick_review_profile(_R2, _LADDER_DIFF)
+
+    assert profile == DEEP, reasons
+    assert reasons == ["контур надзора — hub/services/auto_verdict.py"], reasons
+    # Правило совпадения — auto_approve.ladder_hits: префикс каталога тоже.
+    prefix = "+++ b/docs/agent-context/system-map.md\n+строка\n"
+    assert pick_review_profile(_R2, prefix) == (
+        DEEP,
+        ["контур надзора — docs/agent-context/system-map.md"],
+    )
+    # Сгенерированный файл на пути контура контуром не считается.
+    generated = "+++ b/.github/uv.lock\n+x = 1\n" + _HARMLESS_DIFF
+    assert pick_review_profile(_R2, generated)[0] == LITE
+
+
+def test_ladder_deep_reads_the_diff_not_the_declared_areas():
+    """AC-2 (#1559): путь контура в affected_areas, но дифф его не тронул —
+    lite с прежней причиной; тронул — deep, что бы ни было заявлено."""
+    declared = {**_R2, "affected_areas": json.dumps(["hub/services/auto_verdict.py"])}
+
+    profile, reasons = pick_review_profile(declared, _HARMLESS_DIFF)
+    assert (profile, reasons) == (
+        LITE,
+        ["класс риска R2, процессных поверхностей нет"],
+    )
+    undeclared = {**_R2, "affected_areas": json.dumps(["app/notes.py"])}
+    assert pick_review_profile(undeclared, _LADDER_DIFF)[0] == DEEP
+    # Документация вне docs/agent-context остаётся lite.
+    assert pick_review_profile(_R2, _docs_diff("docs/notes.md"))[0] == LITE
+
+
+async def test_ladder_deep_respects_small_delta_and_daily_cap(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1559): малая дельта (#1416) и стоп круга (#1432) понижают deep
+    контура с названным поводом, жребий (#1403) его не видит, а суточный
+    потолок (#1414) второй такой сдаче места не даёт."""
+    from hub.services import review_dispatch as rd
+
+    profile, reasons = pick_review_profile(_R2, _LADDER_DIFF, small_delta=(10, 80))
+    assert profile == LITE
+    assert rd.SMALL_DELTA_REASON_MARK in reasons[0], reasons
+    assert reasons[1:] == [
+        "отменён повод deep: контур надзора — hub/services/auto_verdict.py"
+    ]
+    over = pick_review_profile(_R2, _LADDER_DIFF, small_delta=(200, 80))
+    assert over[0] == DEEP
+    stopped = pick_review_profile(_R2, _LADDER_DIFF, circle_stop=3)
+    assert stopped[0] == LITE and stopped[1][0] == rd.circle_stop_reason(3)
+    # Жребий: deep контура не lite правила риска.
+    assert not rd._lite_by_risk_rule(*pick_review_profile(_R2, _LADDER_DIFF))
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-lad"}, "run": {"id": "r-lad"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "")
+    pid = await _cap_project(db, "ladder-cap", {"deep_daily_cap": 1})
+    first = await _submitted_in(db, pid, diff=_LADDER_DIFF)
+    second = await _submitted_in(db, pid, diff=_LADDER_DIFF)
+
+    assert (await _any_dispatch_row(db, first))["profile"] == "deep"
+    assert (await _any_dispatch_row(db, second))["profile"] == "lite"
+    notes = await _dispatch_notes(db, second)
+    assert "контур надзора — hub/services/auto_verdict.py" in notes[0], notes
+    assert "суточный потолок 1 исчерпан — lite" in notes[0], notes
+
+
+def test_ladder_deep_sees_deleted_and_renamed_files():
+    """#1559: удаление и переименование пути контура — тоже правка контура."""
+    deleted = (
+        "diff --git a/hub/auth.py b/hub/auth.py\n"
+        "--- a/hub/auth.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-x = 1\n"
+    )
+    renamed = (
+        "diff --git a/hub/old.py b/hub/config.py\n"
+        "similarity index 100%\nrename from hub/old.py\nrename to hub/config.py\n"
+    )
+    assert pick_review_profile(_R2, deleted)[1] == ["контур надзора — hub/auth.py"]
+    assert pick_review_profile(_R2, renamed)[1] == ["контур надзора — hub/config.py"]
