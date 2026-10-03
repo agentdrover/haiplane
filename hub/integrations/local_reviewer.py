@@ -695,6 +695,28 @@ def is_configured() -> bool:
     return not not_ready()
 
 
+def model() -> str:
+    """Модель, которую запускает локальный CLI, или пустая строка (#1561).
+
+    Явная настройка главнее; иначе — аргумент ``--model``/``-m`` из
+    LOCAL_REVIEW_CMD. Возвращается только имя модели, не остальная командная
+    строка. Пусто — модель неизвестна, и называть её чужим именем нельзя.
+    """
+    explicit = (config.LOCAL_REVIEW_MODEL or "").strip()
+    if explicit:
+        return explicit
+    try:
+        parts = shlex.split(config.LOCAL_REVIEW_CMD)
+    except ValueError:
+        return ""
+    for index, part in enumerate(parts):
+        if part in ("--model", "-m") and index + 1 < len(parts):
+            return parts[index + 1].strip()
+        if part.startswith("--model="):
+            return part.partition("=")[2].strip()
+    return ""
+
+
 def argv() -> list[str]:
     """Полная командная строка: песочница, затем сам CLI."""
     return shlex.split(config.LOCAL_REVIEW_SANDBOX) + shlex.split(
