@@ -15680,15 +15680,9 @@ def test_a_change_to_the_oversight_ladder_buys_deep():
     profile, reasons = pick_review_profile(_R2, _LADDER_DIFF)
 
     assert profile == DEEP, reasons
-    assert reasons == ["контур надзора — hub/services/auto_verdict.py"], reasons
-    # Правило совпадения — auto_approve.ladder_hits: префикс каталога тоже.
-    prefix = "+++ b/docs/agent-context/system-map.md\n+строка\n"
-    assert pick_review_profile(_R2, prefix) == (
-        DEEP,
-        ["контур надзора — docs/agent-context/system-map.md"],
-    )
-    # Сгенерированный файл на пути контура контуром не считается.
-    generated = "+++ b/.github/uv.lock\n+x = 1\n" + _HARMLESS_DIFF
+    assert reasons == ["решатель одобрения — hub/services/auto_verdict.py"], reasons
+    # Сгенерированный файл на пути решателя решателем не считается.
+    generated = "+++ b/hub/auth.py.snap\n+x = 1\n" + _HARMLESS_DIFF
     assert pick_review_profile(_R2, generated)[0] == LITE
 
 
@@ -15720,7 +15714,7 @@ async def test_ladder_deep_respects_small_delta_and_daily_cap(
     assert profile == LITE
     assert rd.SMALL_DELTA_REASON_MARK in reasons[0], reasons
     assert reasons[1:] == [
-        "отменён повод deep: контур надзора — hub/services/auto_verdict.py"
+        "отменён повод deep: решатель одобрения — hub/services/auto_verdict.py"
     ]
     over = pick_review_profile(_R2, _LADDER_DIFF, small_delta=(200, 80))
     assert over[0] == DEEP
@@ -15739,7 +15733,7 @@ async def test_ladder_deep_respects_small_delta_and_daily_cap(
     assert (await _any_dispatch_row(db, first))["profile"] == "deep"
     assert (await _any_dispatch_row(db, second))["profile"] == "lite"
     notes = await _dispatch_notes(db, second)
-    assert "контур надзора — hub/services/auto_verdict.py" in notes[0], notes
+    assert "решатель одобрения — hub/services/auto_verdict.py" in notes[0], notes
     assert "суточный потолок 1 исчерпан — lite" in notes[0], notes
 
 
@@ -15750,11 +15744,13 @@ def test_ladder_deep_sees_deleted_and_renamed_files():
         "--- a/hub/auth.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-x = 1\n"
     )
     renamed = (
-        "diff --git a/hub/old.py b/hub/config.py\n"
-        "similarity index 100%\nrename from hub/old.py\nrename to hub/config.py\n"
+        "diff --git a/hub/old.py b/hub/services/steward_shadow.py\n"
+        "similarity index 100%\nrename from hub/old.py\nrename to hub/services/steward_shadow.py\n"
     )
-    assert pick_review_profile(_R2, deleted)[1] == ["контур надзора — hub/auth.py"]
-    assert pick_review_profile(_R2, renamed)[1] == ["контур надзора — hub/config.py"]
+    assert pick_review_profile(_R2, deleted)[1] == ["решатель одобрения — hub/auth.py"]
+    assert pick_review_profile(_R2, renamed)[1] == [
+        "решатель одобрения — hub/services/steward_shadow.py"
+    ]
 
 
 def test_a_generated_file_on_a_ladder_path_does_not_buy_deep():
@@ -15762,11 +15758,10 @@ def test_a_generated_file_on_a_ladder_path_does_not_buy_deep():
     «diff --git»/«---» сгенерированного файла остаются после split_generated;
     путь контура в них deep не покупает, а обычный файл контура рядом — да."""
     generated = (
-        "diff --git a/.github/snapshots/__snapshots__/a.snap "
-        "b/.github/snapshots/__snapshots__/a.snap\n"
+        "diff --git a/hub/auth.py.snap b/hub/auth.py.snap\n"
         "index 1111111..2222222 100644\n"
-        "--- a/.github/snapshots/__snapshots__/a.snap\n"
-        "+++ b/.github/snapshots/__snapshots__/a.snap\n"
+        "--- a/hub/auth.py.snap\n"
+        "+++ b/hub/auth.py.snap\n"
         "@@ -1 +1 @@\n-old\n+new\n"
     )
     plain = (
@@ -15781,4 +15776,48 @@ def test_a_generated_file_on_a_ladder_path_does_not_buy_deep():
     )
     assert pick_review_profile(_R2, generated + plain)[0] == LITE
     profile, reasons = pick_review_profile(_R2, generated + ladder)
-    assert (profile, reasons) == (DEEP, ["контур надзора — hub/auth.py"])
+    assert (profile, reasons) == (DEEP, ["решатель одобрения — hub/auth.py"])
+
+
+def test_only_approval_deciders_buy_deep_not_the_rest_of_the_ladder():
+    """#1559, решение владельца 03.10 (вариант Б): правка одного lifecycle.py,
+    config.py, project_policy.py, docs/agent-context, docs/repository-rules.md
+    или .github/ при R2 остаётся lite с прежней причиной."""
+    for path in (
+        "hub/services/lifecycle.py",
+        "hub/config.py",
+        "hub/services/project_policy.py",
+        "docs/agent-context/system-map.md",
+        "docs/repository-rules.md",
+        ".github/workflows/ci.yml",
+    ):
+        diff = f"+++ b/{path}\n+x = 1\n"
+        assert pick_review_profile(_R2, diff)[0] == LITE, path
+    code = "+++ b/hub/services/lifecycle.py\n+x = 1\n"
+    both = code + "+++ b/hub/services/steward_apply.py\n+x = 1\n"
+    assert pick_review_profile(_R2, both) == (
+        DEEP,
+        ["решатель одобрения — hub/services/steward_apply.py"],
+    )
+
+
+def test_approval_deciders_are_a_subset_of_the_ladder():
+    """#1559: каждая запись APPROVAL_DECIDERS — буквально элемент
+    LADDER_SURFACES; убрали элемент из контура — падает с его именем."""
+    from hub.services.auto_approve import (
+        APPROVAL_DECIDERS,
+        LADDER_SURFACES,
+        decider_hits,
+        ladder_hits,
+        surface_hits,
+    )
+
+    for entry in APPROVAL_DECIDERS:
+        assert entry in LADDER_SURFACES, f"{entry} не входит в LADDER_SURFACES"
+    assert len(set(APPROVAL_DECIDERS)) == len(APPROVAL_DECIDERS)
+    # Правило совпадения одно: точный путь или префикс, по любому списку.
+    paths = ["hub/services/lifecycle.py", "hub/auth.py", "docs/agent-context/a.md"]
+    assert ladder_hits(paths) == surface_hits(paths, LADDER_SURFACES) == sorted(paths)
+    assert decider_hits(paths) == surface_hits(paths, APPROVAL_DECIDERS)
+    assert decider_hits(paths) == ["hub/auth.py"]
+    assert surface_hits(["a/b/c.py"], ("a/b/",)) == ["a/b/c.py"]

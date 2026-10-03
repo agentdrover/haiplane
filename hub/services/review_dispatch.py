@@ -47,7 +47,7 @@ from hub.models import (
     RiskClass,
 )
 from hub.services import call_sites, project_policy, review_ci_gate
-from hub.services.auto_approve import ladder_hits
+from hub.services.auto_approve import decider_hits
 from hub.services.metrics_scope import Scope
 from hub.services.model_family import family
 from hub.services.orchestration import ORIGINAL_READ_SQL
@@ -1091,9 +1091,11 @@ def pick_review_profile(
 
 
 def ladder_surface_reasons(diff: str) -> list[str]:
-    """Пути контура надзора, которых касается дифф сдачи (#1559).
+    """Решатели одобрения, которых касается дифф сдачи (#1559).
 
-    Список и правило совпадения — auto_approve.ladder_hits, второй копии нет.
+    Список — auto_approve.APPROVAL_DECIDERS, подмножество LADDER_SURFACES
+    (решение владельца 03.10), правило совпадения — то же, что у ladder_hits;
+    второй копии нет.
     Пути берутся из ТОГО ЖЕ диффа, что читает process_surface_reasons,
     без сгенерированных файлов (is_generated), а не из заявленных
     affected_areas: заявка не освобождает от надзора (#582).
@@ -1106,7 +1108,7 @@ def ladder_surface_reasons(diff: str) -> list[str]:
     paths = [
         p for p in _diff_touched_paths(diff) if p is not None and not is_generated(p)
     ]
-    return [f"контур надзора — {path}" for path in ladder_hits(paths)]
+    return [f"решатель одобрения — {path}" for path in decider_hits(paths)]
 
 
 def _profile_by_rule(
@@ -1114,10 +1116,8 @@ def _profile_by_rule(
 ) -> tuple[str, list[str]]:
     """The rule after the human request: ladder, documents, surfaces, risk, class.
 
-    Контур надзора (#1559) стоит РАНЬШЕ документации: docs/agent-context и
-    docs/repository-rules.md — часть контура, и правка правил гейтов не
-    становится безобидной оттого, что написана прозой. Остальная документация
-    остаётся lite.
+    Решатели одобрения (#1559) стоят до документации; в их списке документации
+    нет, так что дифф только из документации остаётся lite.
     """
     ladder = ladder_surface_reasons(diff)
     if ladder:
