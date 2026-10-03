@@ -4112,8 +4112,6 @@ async def _local_first_order(
     if not await _claim_the_order(db, task_id, generation, force_profile, None, ""):
         return False
     try:
-        if await _forced_deep_over_cap(db, task, generation, force_profile, ""):
-            return False
         return await dispatch_local_review(
             db, task, forge, branch, generation, force_profile, local_first=True
         )
@@ -4133,6 +4131,40 @@ async def _local_first_order(
         await db.commit()
 
 
+#: ``run_status`` локальной строки «первым», оборванной остановкой хаба (#1561):
+#: долг облака, который отдаёт свип после старта; ``..._SETTLED`` — отдан.
+HUB_STOPPED_RUN_STATUS = "hub_stopped"
+HUB_STOPPED_SETTLED = "hub_stopped_settled"
+
+
+def _is_local_first(dispatch: dict[str, Any]) -> bool:
+    return (dispatch.get("second_door_reason") or "").startswith(LOCAL_FIRST_MARK)
+
+
+async def settle_stopped_local_first(db: aiosqlite.Connection) -> None:
+    """Отдать облако за local-first deep, оборванный остановкой хаба (#1561).
+
+    Строка уже ``failed`` и живой не считается, поэтому второго живого deep не
+    будет. Метка снимается ДО заказа: сбой после неё теряет заказ, но не
+    покупает два; сдача без ревью остаётся видимой по карточке и по
+    ``_cloud_after_local``, который сам проверяет свежесть сдачи.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT * FROM review_dispatches WHERE status='failed' AND channel=? "
+        "AND run_status=? ORDER BY id",
+        (LOCAL_CHANNEL, HUB_STOPPED_RUN_STATUS),
+    )
+    for row in rows:
+        dispatch = dict(row)
+        await db.execute(
+            "UPDATE review_dispatches SET run_status=? WHERE id=?",
+            (HUB_STOPPED_SETTLED, dispatch["id"]),
+        )
+        await db.commit()
+        await _cloud_after_local(db, dispatch, "локальный deep прерван остановкой хаба")
+
+
 async def _cloud_after_local(
     db: aiosqlite.Connection, dispatch: dict[str, Any], why: str
 ) -> None:
@@ -4142,10 +4174,10 @@ async def _cloud_after_local(
     заказывается ПОСЛЕ отказа, а не вместе с ним, и двух живых deep на сдачу
     не бывает. Узнаётся «первый» по метке в строке заказа, а не по политике
     проекта: политику успели поменять — а прогон уже был заказан иначе.
-    Профиль едет тем же, каким заказывали локальный, по той же причине, что в
-    #1252: понижать замену нельзя.
+    Профиль выбирается заново, как у обычного облачного заказа: потолок deep
+    #1414 расходует именно он, а не локальный прогон (решение владельца).
     """
-    if not (dispatch.get("second_door_reason") or "").startswith(LOCAL_FIRST_MARK):
+    if not _is_local_first(dispatch):
         return
     task_id = int(dispatch["task_id"])
     if not await _submission_still_live(
@@ -4166,12 +4198,11 @@ async def _cloud_after_local(
         "живого deep на этой сдаче не будет.",
     )
     await db.commit()
-    await maybe_dispatch_review(
-        db,
-        task_id,
-        force_profile=(dispatch.get("profile") or DEEP),
-        cloud_after_local=True,
-    )
+    # Профиль НЕ форсируется: облачный fallback — обычный облачный заказ и
+    # подчиняется суточному потолку deep (#1414): при исчерпанном он получает
+    # lite с названной причиной. Двойной заказ исключён бронью и тем, что
+    # локальная строка уже failed.
+    await maybe_dispatch_review(db, task_id, cloud_after_local=True)
 
 
 async def _task_dict(db: aiosqlite.Connection, task_id: int) -> dict[str, Any]:
@@ -4299,8 +4330,8 @@ async def dispatch_local_review(
     а не после отказа облака. Отказ тогда НЕ алерт «вердикт остаётся
     человеку», а ``_LocalFirstDeclined``: сдача не осталась без ревью, её
     возьмёт облако, и причину называет вызывающий. Профиль здесь решается по
-    правилам облачного заказа (суточный потолок deep, #1414, действует и для
-    локального), и не-deep отклоняется молча: lite остаётся в облаке.
+    правилам заказа без суточного потолка deep (#1414: решение владельца
+    03.10, потолок про деньги Cursor), и не-deep отклоняется молча: lite остаётся в облаке.
     """
     task_id = int(task["id"])
     reach = await review_reach(db, forge)
@@ -4345,7 +4376,7 @@ async def dispatch_local_review(
         generation=generation,
         force_profile=force_profile,
         principal_id=principal_id,
-        **_local_order_kwargs(local_first),
+        **_local_order_kwargs(),
     )
     if local_first:
         await _local_first_gate(db, task, order)
@@ -4463,18 +4494,19 @@ def _ceiling_text(spent: int, deep: bool = False) -> str:
     )
 
 
-def _local_order_kwargs(local_first: bool) -> dict[str, Any]:
+def _local_order_kwargs() -> dict[str, Any]:
     """Что заказ локального прогона добавляет к общей подготовке (#1561).
 
     Модель — настройка локального CLI, а не облачный выбор; не названа —
     ключа нет, и выбор прежний, как до задачи. Суточный потолок deep (#1414)
-    подчиняет себе только заказ «локальный первым».
+    локальный заказ НЕ расходует (решение владельца 03.10, вариант Б): он
+    ограничивает деньги Cursor, а у локального ревьюера своя подписка. Потолок
+    расходует облачный fallback после отказа локального — как любой облачный
+    deep.
     """
     kwargs: dict[str, Any] = {}
     if model := local_reviewer.model():
         kwargs["force_model"] = model
-    if local_first:
-        kwargs["cloud"] = True
     return kwargs
 
 
@@ -4722,6 +4754,14 @@ async def _close_cancelled_run(handle: _LocalRunHandle) -> None:
         await repo.set_review_dispatch_status(
             conn, handle.dispatch_id, "done" if review is not None else "failed"
         )
+        if review is None and _is_local_first(dict(rows[0])):
+            # #1561: облако после остановки хаба заказывает свип уже ПОСЛЕ
+            # старта — здесь, на закрытии, хаб выключается. Метка переживает
+            # рестарт и снимается, когда долг отдан.
+            await conn.execute(
+                "UPDATE review_dispatches SET run_status=? WHERE id=?",
+                (HUB_STOPPED_RUN_STATUS, handle.dispatch_id),
+            )
         await conn.commit()
     except Exception:  # noqa: BLE001 - остановка хаба не падает из-за уборки
         log.exception("could not close the cancelled local run #%s", handle.dispatch_id)
@@ -5570,6 +5610,7 @@ async def sweep_review_dispatches(db: aiosqlite.Connection) -> None:
     # #1242: переспрос — ДО разбора активных строк. Заказ, закрытый упавшим
     # на этом проходе, переспрашивается на следующем, а не в ту же минуту.
     await _ask_again_lost_reviews(db)
+    await settle_stopped_local_first(db)
     for row in await repo.list_active_review_dispatches(db):
         dispatch = dict(row)
         task_id = dispatch["task_id"]
