@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 
 import aiosqlite
+import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
@@ -407,6 +408,142 @@ async def test_repair_sweep_skips_parent_with_its_own_branch(db: aiosqlite.Conne
     parent = dict(await repo.get_task(db, feature_id))
     assert parent["status"] == "running"
     assert repaired == 0
+
+
+def _dispatch_returns_no_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Контейнер-фича не уходит в прогон: rework приводит её в open, не в fix_requested."""
+    from hub.integrations.registry import plugins
+
+    async def _no_job(*_a, **_k):
+        return {"error": "no executor"}
+
+    monkeypatch.setattr(plugins.dispatch, "submit_task", _no_job)
+
+
+async def _mis_issued_feature(
+    db: aiosqlite.Connection,
+    *,
+    pr_number: int | None = None,
+    run_outcome: str = "cancelled",
+) -> int:
+    """#1562: контейнер-фича, выданная облачному исполнителю по ошибке (#1375).
+
+    Все дети завершены; у фичи остались claimed_by, сессия и ветка от прогона,
+    который закончился без сдачи; человек должен решить, что с ней делать.
+    """
+    feature_id, _child_id = await _feature_with_completed_child(
+        db,
+        branch="task-1375/sid-d-otchety",
+        claimed_by="cloud",
+        parent_status="needs_decision",
+    )
+    await db.execute(
+        "UPDATE tasks SET claim_session_id=?, claimed_at=datetime('now'), "
+        "pr_number=?, git_mode='remote', implementer_principal_id=1 WHERE id=?",
+        ("bc-session", pr_number, feature_id),
+    )
+    run_id = await repo.create_executor_run(
+        db,
+        task_id=feature_id,
+        submission_generation=1,
+        agent_id="bc-agent",
+        run_id="run-1",
+        model="m",
+    )
+    await repo.update_executor_run(db, run_id, outcome=run_outcome, finish=True)
+    await db.commit()
+    return feature_id
+
+
+async def test_rollup_closes_feature_after_assignment_reset(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    _dispatch_returns_no_job(monkeypatch)
+    """AC-1 (#1562): возврат в open снимает остаток выдачи — и фича сворачивается."""
+    feature_id = await _mis_issued_feature(db)
+
+    resp = await client.post(
+        f"/api/tasks/{feature_id}/decide",
+        json={"action": "rework", "instructions": "Выдана по ошибке."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["status"] == "open"
+    assert not (parent["claimed_by"] or "").strip()
+    assert not (parent["claim_session_id"] or "").strip()
+    assert not parent["claimed_at"]
+    assert not (parent["branch"] or "").strip()
+    assert parent["git_mode"] == "hub"
+    assert parent["implementer_principal_id"] is None
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, feature_id)
+    )
+    assert "task-1375/sid-d-otchety" in feed and "cloud" in feed, (
+        "прежняя выдача названа в ленте: ветка и держатель не пропадают молча"
+    )
+
+    assert await repair_stale_parent_completions(db) == 1
+    assert dict(await repo.get_task(db, feature_id))["status"] == "completed"
+
+
+async def test_rework_keeps_the_assignment_of_real_work(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    _dispatch_returns_no_job(monkeypatch)
+    """AC-1 (#1562), граница: ветка с PR — настоящая работа, выдача остаётся."""
+    feature_id = await _mis_issued_feature(db, pr_number=77)
+
+    resp = await client.post(
+        f"/api/tasks/{feature_id}/decide",
+        json={"action": "rework", "instructions": "Доделать."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["claimed_by"] == "cloud"
+    assert parent["branch"] == "task-1375/sid-d-otchety"
+    assert await repair_stale_parent_completions(db) == 0
+
+
+async def test_rework_keeps_the_assignment_when_the_run_was_not_stopped(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    _dispatch_returns_no_job(monkeypatch)
+    """AC-1 (#1562), граница: прогон, кончившийся иначе, выдачу не сбрасывает."""
+    feature_id = await _mis_issued_feature(db, run_outcome="finished")
+
+    resp = await client.post(
+        f"/api/tasks/{feature_id}/decide",
+        json={"action": "rework", "instructions": "Доделать."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["claimed_by"] == "cloud"
+    assert parent["branch"] == "task-1375/sid-d-otchety"
+
+
+async def test_rework_keeps_the_assignment_when_the_run_submitted(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    """AC-1 (#1562), граница: у прогона есть сдача его поколения — это не «без сдачи»."""
+    _dispatch_returns_no_job(monkeypatch)
+    feature_id = await _mis_issued_feature(db)
+    await db.execute(
+        "UPDATE tasks SET submission_generation=1 WHERE id=?", (feature_id,)
+    )
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{feature_id}/decide",
+        json={"action": "rework", "instructions": "Доделать."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["claimed_by"] == "cloud"
+    assert parent["branch"] == "task-1375/sid-d-otchety"
 
 
 async def test_verdict_notes_review_in_flight(

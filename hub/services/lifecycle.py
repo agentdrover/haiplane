@@ -332,24 +332,88 @@ def _parent_has_own_work(parent: dict[str, Any]) -> bool:
 async def _note_rollup_awaits_own_report(
     db: aiosqlite.Connection, parent_id: int, parent: dict[str, Any]
 ) -> None:
-    """Write the skip to the task tape so the parent is not silently stuck."""
+    """Write the skip to the task tape so the parent is not silently stuck.
+
+    Said once per reason (#1562): the sweep passes over the same parent every
+    tick, and the same sentence on each pass would bury the tape. The text
+    carries branch and holder, so a changed reason is a new sentence.
+    """
     branch = (parent.get("branch") or "").strip() or "—"
     claimed = (parent.get("claimed_by") or "").strip() or "—"
-    await repo.add_task_update(
-        db,
-        parent_id,
-        "hub",
-        "status",
+    content = (
         "Родитель готов к сдаче и ждёт своего отчёта: роллап не закрыл "
         f"задачу, потому что у неё есть собственная работа "
-        f"(branch={branch}, claimed_by={claimed}).",
+        f"(branch={branch}, claimed_by={claimed})."
     )
+    already = await fetchall(
+        db,
+        "SELECT 1 FROM task_updates WHERE task_id=? AND agent='hub' AND content=?",
+        (parent_id, content),
+    )
+    if already:
+        return
+    await repo.add_task_update(db, parent_id, "hub", "status", content)
     await log_activity(
         db,
         "task_updated",
         f"Task #{parent_id} rollup skipped: parent has its own work, "
         "awaiting its own report",
     )
+
+
+async def reset_mis_issued_assignment(
+    db: aiosqlite.Connection, task_id: int, task: dict[str, Any]
+) -> bool:
+    """Снять остаток выдачи с задачи, возвращённой в open после сорванного прогона (#1562).
+
+    Прогон исполнителя кончился без сдачи (отмена, ошибка, потолок), PR у
+    задачи нет, человек вернул её в open: claimed_by, сессия, ветка и режим
+    git остались бы «собственной работой» для правила #1043 и держали бы
+    свёртку родителя навсегда (#1375). Ветка с PR — настоящая работа, её
+    выдача остаётся. Только поля карточки: ветка в git и каталог на диске
+    не трогаются, прежние значения уходят в ленту. Рабочего каталога в
+    карточке нет — он выводится из id задачи. Коммит — за вызывающим.
+    """
+    if task.get("pr_number"):
+        return False
+    from hub.services.executor_dispatch import STOPPED_OUTCOMES
+
+    runs = await repo.list_executor_runs(db, task_id)
+    if not runs:
+        return False
+    last = dict(runs[-1])
+    if last["outcome"] not in STOPPED_OUTCOMES or int(
+        last["submission_generation"] or 0
+    ) <= int(task.get("submission_generation") or 0):
+        return False
+    holder = (task.get("claimed_by") or "").strip()
+    session = (task.get("claim_session_id") or "").strip()
+    branch = (task.get("branch") or "").strip()
+    if not (holder or session or branch):
+        return False
+    await repo.update_task(
+        db,
+        task_id,
+        claimed_by=None,
+        claim_session_id=None,
+        claimed_at=None,
+        implementer_principal_id=None,
+        branch=None,
+        git_mode="hub",
+    )
+    await note_session_task(db, session, None)
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        "Выдача снята: прогон исполнителя закончился без сдачи "
+        f"({last['outcome']}), PR нет. Прежняя выдача: держатель "
+        f"{holder or '—'}, сессия {session or '—'}, ветка {branch or '—'}. "
+        "Ветка в git и каталог на диске не тронуты; без остатка выдачи "
+        "свёртка родителя может закрыть задачу, если все дети завершены.",
+    )
+    return True
 
 
 async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
@@ -422,6 +486,10 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
         if not _children_allow_rollup(children):
             continue
         if _parent_has_own_work(parent):
+            # #1562: the sweep says why it passes, once per reason — it used
+            # to skip in silence, and #1375 stood open for days.
+            await _note_rollup_awaits_own_report(db, parent_id, parent)
+            noted = True
             continue
         if prevention_gate.prevention_gap(parent):
             await prevention_gate.note_rollup_held(db, parent_id)
@@ -4873,6 +4941,7 @@ async def decide_task(
             await repo.update_task(db, task_id, status="fix_requested", job_id=job_id)
         else:
             await repo.update_task(db, task_id, status="open")
+            await reset_mis_issued_assignment(db, task_id, task)
         await db.commit()
         await log_activity(
             db,
