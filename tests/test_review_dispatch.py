@@ -15755,3 +15755,30 @@ def test_ladder_deep_sees_deleted_and_renamed_files():
     )
     assert pick_review_profile(_R2, deleted)[1] == ["контур надзора — hub/auth.py"]
     assert pick_review_profile(_R2, renamed)[1] == ["контур надзора — hub/config.py"]
+
+
+def test_a_generated_file_on_a_ladder_path_does_not_buy_deep():
+    """#1559, находка 8c9f7d15794f50a4: реальный формат git diff. Заголовки
+    «diff --git»/«---» сгенерированного файла остаются после split_generated;
+    путь контура в них deep не покупает, а обычный файл контура рядом — да."""
+    generated = (
+        "diff --git a/.github/snapshots/__snapshots__/a.snap "
+        "b/.github/snapshots/__snapshots__/a.snap\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/.github/snapshots/__snapshots__/a.snap\n"
+        "+++ b/.github/snapshots/__snapshots__/a.snap\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+    )
+    plain = (
+        "diff --git a/app/notes.py b/app/notes.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/app/notes.py\n+++ b/app/notes.py\n@@ -1 +1 @@\n-a = 1\n+a = 2\n"
+    )
+    ladder = (
+        "diff --git a/hub/auth.py b/hub/auth.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/hub/auth.py\n+++ b/hub/auth.py\n@@ -1 +1 @@\n-a = 1\n+a = 2\n"
+    )
+    assert pick_review_profile(_R2, generated + plain)[0] == LITE
+    profile, reasons = pick_review_profile(_R2, generated + ladder)
+    assert (profile, reasons) == (DEEP, ["контур надзора — hub/auth.py"])

@@ -1094,13 +1094,18 @@ def ladder_surface_reasons(diff: str) -> list[str]:
     """Пути контура надзора, которых касается дифф сдачи (#1559).
 
     Список и правило совпадения — auto_approve.ladder_hits, второй копии нет.
-    Пути берутся из ТОГО ЖЕ диффа без сгенерированных файлов, что читает
-    process_surface_reasons, а не из заявленных affected_areas: заявка не
-    освобождает от надзора (#582).
+    Пути берутся из ТОГО ЖЕ диффа, что читает process_surface_reasons,
+    без сгенерированных файлов (is_generated), а не из заявленных
+    affected_areas: заявка не освобождает от надзора (#582).
     """
-    kept, _ = split_generated(diff)
+    # split_generated отсекает файл с «+++», а заголовки «diff --git» и «---»
+    # оставляет в kept — путь сгенерированного файла отсюда и просочился бы.
+    # Поэтому пути читаются из всего диффа, а сгенерированные отбрасываются
+    # по имени, целиком (#1559, находка 8c9f7d15794f50a4).
     # Удалённый, переименованный и бинарный файл — тоже правка контура.
-    paths = [p for p in _diff_touched_paths(kept) if p is not None]
+    paths = [
+        p for p in _diff_touched_paths(diff) if p is not None and not is_generated(p)
+    ]
     return [f"контур надзора — {path}" for path in ladder_hits(paths)]
 
 
