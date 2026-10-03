@@ -71,6 +71,28 @@ LADDER_SURFACES: tuple[str, ...] = (
     "hub/services/project_policy.py",
 )
 
+# #1559, решение владельца 03.10 (вариант Б): выбор профиля ревью читает НЕ весь
+# контур, а его подмножество — решатели одобрения и доступа, код, который
+# одобряет или пускает без человека. lifecycle.py, config.py, project_policy.py,
+# docs/agent-context/, docs/repository-rules.md и .github/ остаются в
+# LADDER_SURFACES для автоодобрения, но deep не покупают: замер исполнителя —
+# 32 новых deep за 2 недели, в основном из-за них. Каждая запись обязана быть
+# буквально элементом LADDER_SURFACES (тест подмножества), список истины один.
+APPROVAL_DECIDERS: tuple[str, ...] = (
+    "hub/services/auto_verdict.py",
+    "hub/services/auto_approve.py",
+    "hub/services/steward_apply.py",
+    "hub/services/steward_applied.py",
+    "hub/services/steward_dispatch.py",
+    "hub/services/steward_evidence.py",
+    "hub/services/steward_judgement.py",
+    "hub/services/steward_shadow.py",
+    "hub/services/gate_grounds.py",
+    "hub/services/risk_class.py",
+    "hub/auth.py",
+    "hub/mcp_internal_auth.py",
+)
+
 # The classes the switch can name. R2 stays OUT: opening it is #585, and that
 # task is conditioned on a measured agreement between the agent reviewer and
 # the owner (#522/#527) — a condition set on 31.07.2026 and not yet met. The
@@ -94,9 +116,21 @@ def ladder_hits(paths: list[str]) -> list[str]:
     вердикта дифф есть, и верить декларации там значит пропускать задачу,
     объявившую «hub/services/» и поменявшую hub/auth.py (#1147).
     """
-    return sorted(
-        p for p in paths if any(p == s or p.startswith(s) for s in LADDER_SURFACES)
-    )
+    return surface_hits(paths, LADDER_SURFACES)
+
+
+def surface_hits(paths: list[str], surfaces: tuple[str, ...]) -> list[str]:
+    """Пути, совпавшие с поверхностью из списка: точный путь или префикс.
+
+    Единственное место правила совпадения; ``ladder_hits`` и
+    ``decider_hits`` отличаются только списком.
+    """
+    return sorted(p for p in paths if any(p == s or p.startswith(s) for s in surfaces))
+
+
+def decider_hits(paths: list[str]) -> list[str]:
+    """Какие из путей — решатели одобрения (``APPROVAL_DECIDERS``, #1559)."""
+    return surface_hits(paths, APPROVAL_DECIDERS)
 
 
 def _touches_ladder(areas: list[str]) -> list[str]:
