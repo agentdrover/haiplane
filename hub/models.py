@@ -364,6 +364,9 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #1434: минут тишины, после которых поллер освобождает слот исполнителя.
     # Не гейт и ничего не делегирует. Читатель: executor_slots.dead_minutes_of.
     "slot_dead_minutes",
+    # #1561: кто читает deep первым — cloud (по умолчанию) или local. Не гейт
+    # и ничего не делегирует. Читатель: project_policy.deep_reviewer_of.
+    "deep_reviewer",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -475,6 +478,17 @@ def _validate_bug_red_test(policy: dict[str, Any]) -> None:
         raise ValueError(
             "gate_policy bug_red_test must be one of "
             f"{', '.join(BUG_RED_TEST_MODES)}, got: {policy['bug_red_test']!r}"
+        )
+
+
+def _validate_deep_reviewer(policy: dict[str, Any]) -> None:
+    """Refuse a deep-reviewer value the reader would read as cloud by accident (#1561)."""
+    from hub.services.project_policy import DEEP_REVIEWERS
+
+    if "deep_reviewer" in policy and policy["deep_reviewer"] not in DEEP_REVIEWERS:
+        raise ValueError(
+            "gate_policy deep_reviewer must be one of "
+            f"{', '.join(DEEP_REVIEWERS)}, got: {policy['deep_reviewer']!r}"
         )
 
 
@@ -2732,6 +2746,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_bug_red_test(v)
     _validate_claim_area_check(v)
     _validate_statement_paths(v)
+    _validate_deep_reviewer(v)
     _validate_slot_dead_minutes(v)
     _validate_executor_launch(v)
     _validate_executor_task_ceilings(v)

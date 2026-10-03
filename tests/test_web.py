@@ -6652,6 +6652,7 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
         "bug_red_test": "warn",
         "statement_paths": "require",
         "slot_dead_minutes": 90,
+        "deep_reviewer": "local",
     }
     not_shown = set(GATE_POLICY_KEYS) - _FORM_GATE_POLICY_KEYS
     assert not_shown, "класс пуст — проверять нечего, тест бы лгал"

@@ -13207,10 +13207,14 @@ async def test_every_review_path_carries_the_only_tests_symbols(
         "maybe_top_up_incomplete",
         "_ask_again",
         "_ask_a_stronger_model",
+        # #1561: обратная вторая дверь — облако после отказа локального deep.
+        "_cloud_after_local",
     }
     assert _callers_of(tree, "dispatch_local_review") == {
         "maybe_dispatch_review",
         "open_second_door",
+        # #1561: deep по политике проекта идёт в локальный путь первым.
+        "_local_first_order",
     }
 
     # 1) облако
@@ -15821,3 +15825,381 @@ def test_approval_deciders_are_a_subset_of_the_ladder():
     assert decider_hits(paths) == surface_hits(paths, APPROVAL_DECIDERS)
     assert decider_hits(paths) == ["hub/auth.py"]
     assert surface_hits(["a/b/c.py"], ("a/b/",)) == ["a/b/c.py"]
+
+
+# ---------------------------------------------------------------------------
+# #1561: deep сначала в локальный путь — по ключу deep_reviewer проекта
+# ---------------------------------------------------------------------------
+
+_QWEN = "qwen3.8-max"
+_LOCAL_FIRST = {"review": "dispatch", "deep_reviewer": "local"}
+
+
+def _qwen_reviewer(monkeypatch, tmp_path, script: str | None = None) -> None:
+    """Локальный CLI, настроенный на qwen3.8-max, как на проде (--model в CMD)."""
+    import shlex
+
+    _stub_reviewer(monkeypatch, tmp_path, script or _reporting_stub())
+    monkeypatch.setattr(
+        config,
+        "LOCAL_REVIEW_CMD",
+        shlex.join(
+            ["-c", script or _reporting_stub(), "--model", _QWEN],
+        ),
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_MODEL", "")
+
+
+_SILENT_STUB = "import sys\nsys.stdin.read()\n"
+
+
+async def _all_dispatches(db: aiosqlite.Connection, task_id: int) -> list[dict]:
+    return [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM review_dispatches WHERE task_id=? ORDER BY id", (task_id,)
+        )
+    ]
+
+
+async def _card_text(db: aiosqlite.Connection, task_id: int) -> str:
+    return "\n".join(
+        dict(u)["content"] for u in await repo.get_task_updates(db, task_id)
+    )
+
+
+async def test_deep_goes_local_first_when_the_project_asks(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-1 (#1561): deep_reviewer=local — deep идёт в локальный путь, облако не
+    зовётся; на той же политике lite остаётся в облаке, как сейчас."""
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-lite"}, "run": {"id": "r-l"}})
+    _wire(monkeypatch, recorder)
+    reviewer_pid = await _local_principal(db, monkeypatch)
+    _qwen_reviewer(monkeypatch, tmp_path)
+
+    deep = await _submitted(client, db, "lf-deep", policy=_LOCAL_FIRST, diff=_DIFF_506)
+    await wait_for_local_runs()
+    await db.commit()
+
+    assert recorder.calls == [], "облако на deep не зовётся и не оплачивается"
+    rows = await _all_dispatches(db, deep)
+    assert [(r["channel"], r["profile"], r["status"]) for r in rows] == [
+        ("local", "deep", "done")
+    ], rows
+    assert rows[0]["reviewer_principal_id"] == reviewer_pid
+    reports = await repo.machine_reviews_of_generation(db, deep, 1)
+    assert len(reports) == 1 and dict(reports[0])["principal_id"] == reviewer_pid
+
+    lite = await _submitted(
+        client,
+        db,
+        "lf-lite",
+        policy=_LOCAL_FIRST,
+        diff=_docs_diff("docs/notes.md"),
+    )
+    await wait_for_local_runs()
+    assert len(recorder.calls) == 1, "lite остаётся в облаке"
+    lite_rows = await _all_dispatches(db, lite)
+    assert [(r["channel"], r["profile"]) for r in lite_rows] == [("cloud", "lite")]
+
+
+async def test_a_failed_local_deep_falls_back_to_the_cloud_and_says_why(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-2 (#1561): путь не готов или прогон кончился без отчёта — облако,
+    причина названа в карточке, двух оплаченных deep одновременно нет."""
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    # (a) локальный путь не настроен: отказ синхронный, облако — сразу.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-fb"}, "run": {"id": "r-fb"}})
+    _wire(monkeypatch, recorder)
+    _no_local_path(monkeypatch)
+    sync = await _submitted(
+        client, db, "lf-notready", policy=_LOCAL_FIRST, diff=_DIFF_506
+    )
+    await wait_for_local_runs()
+    assert len(recorder.calls) == 1
+    rows = await _all_dispatches(db, sync)
+    assert [(r["channel"], r["profile"], r["status"]) for r in rows] == [
+        ("cloud", "deep", "active")
+    ], rows
+    card = await _card_text(db, sync)
+    assert "LOCAL_REVIEW_CMD" in card, "причина отказа локального названа именем"
+    assert "deep_reviewer" in card, "и сказано, что облако заказано вместо локального"
+
+    # (b) прогон ушёл и кончился без отчёта: облако ПОСЛЕ него, не вместе.
+    recorder2 = _DispatchRecorder({"agent": {"id": "bc-fb2"}, "run": {"id": "r-f2"}})
+    _wire(monkeypatch, recorder2)
+    await _local_principal(db, monkeypatch)
+    _qwen_reviewer(monkeypatch, tmp_path, _SILENT_STUB)
+    async_ = await _submitted(
+        client, db, "lf-noreport", policy=_LOCAL_FIRST, diff=_DIFF_506
+    )
+    assert recorder2.calls == [], "пока локальный идёт, облако не заказывается"
+    await wait_for_local_runs()
+    await db.commit()
+    assert len(recorder2.calls) == 1, "прогон кончился без отчёта — облако"
+    rows = await _all_dispatches(db, async_)
+    assert [(r["channel"], r["profile"], r["status"]) for r in rows] == [
+        ("local", "deep", "failed"),
+        ("cloud", "deep", "active"),
+    ], rows
+    card = await _card_text(db, async_)
+    assert "без отчёта" in card and "облако" in card.lower(), card
+    paid = [r for r in rows if r["status"] == "active"]
+    assert len(paid) == 1, "на сдачу не бывает двух живых оплаченных deep"
+
+
+async def test_a_local_run_records_the_local_model_not_the_cloud_choice(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-3 (#1561): CLI настроен на qwen3.8-max, предпочтение облака — grok-4.6:
+    строка заказа, событие, карточка, отчёт и правило семейств говорят qwen."""
+    from hub.services import auto_verdict
+    from hub.services.model_family import family
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    assert pick_review_model("claude-fable-5") == "grok-4.6"
+    _wire(monkeypatch, _DispatchRecorder(None))
+    await _local_principal(db, monkeypatch)
+    _qwen_reviewer(monkeypatch, tmp_path)
+
+    task_id = await _submitted(
+        client, db, "lf-model", policy=_LOCAL_FIRST, diff=_DIFF_506
+    )
+    await wait_for_local_runs()
+    await db.commit()
+
+    row = (await _all_dispatches(db, task_id))[0]
+    assert row["model"] == _QWEN
+    assert family(row["model"]) == "alibaba"
+    events = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE kind='review_dispatched' AND task_id=?",
+        (task_id,),
+    )
+    assert [json.loads(e[0])["model"] for e in events] == [_QWEN]
+    card = await _card_text(db, task_id)
+    assert _QWEN in card
+    assert "grok-4.6" not in card, "модель облачного выбора нигде не записана"
+    report = dict((await repo.machine_reviews_of_generation(db, task_id, 1))[0])
+    assert report["model"] == _QWEN, (
+        "отчёт, восстановленный из вывода, называет модель локального CLI, "
+        "а не то, что прогон сказал о себе"
+    )
+    reviewer, _ = await auto_verdict._reviewer_model(db, task_id, 1, report)
+    assert reviewer == _QWEN
+
+    # Тот же честный учёт на второй двери: облако отказало, локальный ответил.
+    recorder = _DispatchRecorder(None, refusal=_LIMIT_REFUSAL)
+    _wire(monkeypatch, recorder)
+    door = await _submitted(
+        client, db, "lf-door", policy={"review": "dispatch"}, diff=_DIFF_506
+    )
+    await wait_for_local_runs()
+    local_rows = await _local_dispatches(db, door)
+    assert [r["model"] for r in local_rows] == [_QWEN]
+    door_card = await _card_text(db, door)
+    assert f"модель {_QWEN}" in door_card, door_card
+    assert "grok-4.6" not in door_card, door_card
+
+
+async def test_without_the_key_deep_stays_in_the_cloud(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-4 (#1561): ключа нет — облако первым, локальный только второй дверью;
+    сводка показывает deep_reviewer=cloud [default]."""
+    from hub.services import effective_policy
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-def"}, "run": {"id": "r-d"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _qwen_reviewer(monkeypatch, tmp_path)
+
+    task_id = await _submitted(
+        client, db, "lf-default", policy={"review": "dispatch"}, diff=_DIFF_506
+    )
+    await wait_for_local_runs()
+    assert len(recorder.calls) == 1, "облако первым, как сейчас"
+    rows = await _all_dispatches(db, task_id)
+    assert [(r["channel"], r["model"]) for r in rows] == [("cloud", "grok-4.6")]
+
+    project = await repo.resolve_project_for_task(db, task_id)
+    summary = await effective_policy.effective_policy(db, project)
+    row = next(k for k in summary["keys"] if k["key"] == "deep_reviewer")
+    assert (row["value"], row["source"]) == ("cloud", "default")
+    assert any(
+        "deep_reviewer" in line and "cloud" in line and "[default]" in line
+        for line in effective_policy.format_effective_policy(summary)
+    )
+
+
+async def _local_first_declined(
+    client, db, monkeypatch, tmp_path, slug: str, *, principal: bool = True, **setup
+) -> tuple[_DispatchRecorder, int]:
+    """Сдача deep по политике; ``setup`` ломает одно условие локального пути."""
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-dec"}, "run": {"id": "r-dec"}})
+    _wire(monkeypatch, recorder)
+    if principal:
+        await _local_principal(db, monkeypatch)
+    _qwen_reviewer(monkeypatch, tmp_path)
+    for name, value in setup.items():
+        monkeypatch.setattr(config, name, value)
+    task_id = await _submitted(client, db, slug, policy=_LOCAL_FIRST, diff=_DIFF_506)
+    await wait_for_local_runs()
+    await db.commit()
+    return recorder, task_id
+
+
+async def test_local_first_names_every_refusal_and_falls_to_the_cloud(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1561: модель не названа / семейство то же — облако, причина в карточке."""
+    recorder, no_model = await _local_first_declined(
+        client, db, monkeypatch, tmp_path, "lf-nomodel"
+    )
+    assert recorder.calls == []  # предпосылка: с моделью локальный идёт
+
+    import shlex
+
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_CMD", shlex.join(["-c", _reporting_stub()])
+    )
+    recorder = _DispatchRecorder({"agent": {"id": "bc-nm"}, "run": {"id": "r-nm"}})
+    _wire(monkeypatch, recorder)
+    unnamed = await _submitted(
+        client, db, "lf-nomodel2", policy=_LOCAL_FIRST, diff=_DIFF_506
+    )
+    assert len(recorder.calls) == 1
+    assert "модель локального CLI не названа" in await _card_text(db, unnamed)
+    assert [r["channel"] for r in await _all_dispatches(db, unnamed)] == ["cloud"]
+
+    monkeypatch.setattr(config, "LOCAL_REVIEW_MODEL", "claude-local-9")
+    recorder = _DispatchRecorder({"agent": {"id": "bc-fam"}, "run": {"id": "r-fam"}})
+    _wire(monkeypatch, recorder)
+    same = await _submitted(
+        client, db, "lf-family", policy=_LOCAL_FIRST, diff=_DIFF_506
+    )
+    assert len(recorder.calls) == 1
+    assert "правило разных семейств" in await _card_text(db, same)
+    assert [r["channel"] for r in await _all_dispatches(db, same)] == ["cloud"]
+
+
+async def test_the_deep_ceiling_is_named_and_does_not_cut_a_real_deep(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1561: 3,2 млн потраченного (средний deep grok) локальный deep не режут;
+    сверх LOCAL_REVIEW_DEEP_TOKEN_CEILING — облако с названным потолком."""
+    from hub.services import review_dispatch as rd
+
+    async def _spent(_db, _task_id):
+        return 3_200_000
+
+    monkeypatch.setattr(rd, "_tokens_already_spent", _spent)
+    assert config.LOCAL_REVIEW_TOKEN_CEILING < 3_200_000, "предпосылка #1152"
+    recorder, ran = await _local_first_declined(
+        client, db, monkeypatch, tmp_path, "lf-ceil-ok"
+    )
+    assert recorder.calls == []
+    assert [r["channel"] for r in await _all_dispatches(db, ran)] == ["local"]
+
+    async def _spent_much(_db, _task_id):
+        return 11_000_000
+
+    monkeypatch.setattr(rd, "_tokens_already_spent", _spent_much)
+    recorder, cut = await _local_first_declined(
+        client, db, monkeypatch, tmp_path, "lf-ceil-cut", principal=False
+    )
+    assert len(recorder.calls) == 1
+    assert "LOCAL_REVIEW_DEEP_TOKEN_CEILING" in await _card_text(db, cut)
+
+
+async def test_local_first_does_not_spend_the_daily_deep_cap_but_its_fallback_does(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1561, решение владельца 03.10 (вариант Б): локальный deep суточный
+    потолок #1414 не расходует; облачный fallback после отказа Qwen — как
+    обычный облачный deep: при исчерпанном потолке получает lite с причиной.
+    Повторный триггер на живой заказ второго не даёт."""
+    from hub.services.review_dispatch import maybe_dispatch_review, wait_for_local_runs
+
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "")
+    policy = {**_LOCAL_FIRST, "deep_daily_cap": 0}
+    recorder = _DispatchRecorder({"agent": {"id": "bc-cap1"}, "run": {"id": "r-c1"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    _qwen_reviewer(monkeypatch, tmp_path)
+    ran = await _submitted(client, db, "lf-cap", policy=policy, diff=_DIFF_506)
+    await wait_for_local_runs()
+    rows = await _all_dispatches(db, ran)
+    assert [(r["channel"], r["profile"]) for r in rows] == [("local", "deep")], rows
+    assert recorder.calls == []
+
+    twice = await _submitted(
+        client, db, "lf-twice", policy=_LOCAL_FIRST, diff=_DIFF_506
+    )
+    assert await maybe_dispatch_review(db, twice) is False, "заказ уже стоит"
+    await wait_for_local_runs()
+    assert len(await _all_dispatches(db, twice)) == 1
+
+    _qwen_reviewer(monkeypatch, tmp_path, _SILENT_STUB)
+    failed = await _submitted(client, db, "lf-cap-fb", policy=policy, diff=_DIFF_506)
+    await wait_for_local_runs()
+    await db.commit()
+    rows = await _all_dispatches(db, failed)
+    assert [(r["channel"], r["profile"], r["status"]) for r in rows] == [
+        ("local", "deep", "failed"),
+        ("cloud", "lite", "active"),
+    ], rows
+    assert "суточный потолок 0 исчерпан" in await _card_text(db, failed)
+
+
+async def test_a_local_first_deep_cut_by_a_hub_stop_gets_the_cloud_after_start(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1561, находка 6032bf684d44dd9f: остановка хаба посреди local-first deep
+    не оставляет сдачу без ревью — после старта свип заказывает облако один раз."""
+    import shlex
+    import sys
+
+    from hub.services.review_dispatch import (
+        cancel_local_runs,
+        sweep_review_dispatches,
+    )
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-stop"}, "run": {"id": "r-sp"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    slow = "import sys, time; sys.stdin.read(); time.sleep(30)"
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_SANDBOX", _sudo_sandbox(tmp_path, sys.executable)
+    )
+    monkeypatch.setattr(
+        config, "LOCAL_REVIEW_CMD", shlex.join(["-c", slow, "--model", _QWEN])
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", _scratch(tmp_path))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_MODEL", "")
+    task_id = await _submitted(
+        client, db, "lf-stop", policy=_LOCAL_FIRST, diff=_DIFF_506
+    )
+    await asyncio.sleep(0.5)
+    await cancel_local_runs()
+    await db.commit()
+    assert recorder.calls == [], "на остановке облако не заказывается"
+    assert [r["status"] for r in await _all_dispatches(db, task_id)] == ["failed"]
+
+    await sweep_review_dispatches(db)
+    await sweep_review_dispatches(db)
+    await db.commit()
+    assert len(recorder.calls) == 1, "после старта облако заказано ровно один раз"
+    rows = await _all_dispatches(db, task_id)
+    assert [(r["channel"], r["status"]) for r in rows] == [
+        ("local", "failed"),
+        ("cloud", "active"),
+    ], rows
+    assert (await _card_text(db, task_id)).count("прерван остановкой хаба") == 1
