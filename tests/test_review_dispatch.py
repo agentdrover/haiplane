@@ -15664,3 +15664,160 @@ def test_the_lot_is_off_by_default():
         check=True,
     )
     assert float(out.stdout.split()[-1]) == 0.0, out.stdout
+
+
+# --- Контур надзора покупает deep (#1559) ------------------------------------
+
+_LADDER_DIFF = (
+    "+++ b/hub/services/auto_verdict.py\n+def autopilot_stance() -> None:\n+    pass\n"
+)
+_R2 = {"risk_class": "R2", "risks": "[]"}
+
+
+def test_a_change_to_the_oversight_ladder_buys_deep():
+    """AC-1 (#1559): R2, процессных поверхностей нет, дифф правит auto_verdict.py
+    (живой случай #1440) — deep и причина называет путь контура."""
+    profile, reasons = pick_review_profile(_R2, _LADDER_DIFF)
+
+    assert profile == DEEP, reasons
+    assert reasons == ["решатель одобрения — hub/services/auto_verdict.py"], reasons
+    # Сгенерированный файл на пути решателя решателем не считается.
+    generated = "+++ b/hub/auth.py.snap\n+x = 1\n" + _HARMLESS_DIFF
+    assert pick_review_profile(_R2, generated)[0] == LITE
+
+
+def test_ladder_deep_reads_the_diff_not_the_declared_areas():
+    """AC-2 (#1559): путь контура в affected_areas, но дифф его не тронул —
+    lite с прежней причиной; тронул — deep, что бы ни было заявлено."""
+    declared = {**_R2, "affected_areas": json.dumps(["hub/services/auto_verdict.py"])}
+
+    profile, reasons = pick_review_profile(declared, _HARMLESS_DIFF)
+    assert (profile, reasons) == (
+        LITE,
+        ["класс риска R2, процессных поверхностей нет"],
+    )
+    undeclared = {**_R2, "affected_areas": json.dumps(["app/notes.py"])}
+    assert pick_review_profile(undeclared, _LADDER_DIFF)[0] == DEEP
+    # Документация вне docs/agent-context остаётся lite.
+    assert pick_review_profile(_R2, _docs_diff("docs/notes.md"))[0] == LITE
+
+
+async def test_ladder_deep_respects_small_delta_and_daily_cap(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1559): малая дельта (#1416) и стоп круга (#1432) понижают deep
+    контура с названным поводом, жребий (#1403) его не видит, а суточный
+    потолок (#1414) второй такой сдаче места не даёт."""
+    from hub.services import review_dispatch as rd
+
+    profile, reasons = pick_review_profile(_R2, _LADDER_DIFF, small_delta=(10, 80))
+    assert profile == LITE
+    assert rd.SMALL_DELTA_REASON_MARK in reasons[0], reasons
+    assert reasons[1:] == [
+        "отменён повод deep: решатель одобрения — hub/services/auto_verdict.py"
+    ]
+    over = pick_review_profile(_R2, _LADDER_DIFF, small_delta=(200, 80))
+    assert over[0] == DEEP
+    stopped = pick_review_profile(_R2, _LADDER_DIFF, circle_stop=3)
+    assert stopped[0] == LITE and stopped[1][0] == rd.circle_stop_reason(3)
+    # Жребий: deep контура не lite правила риска.
+    assert not rd._lite_by_risk_rule(*pick_review_profile(_R2, _LADDER_DIFF))
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-lad"}, "run": {"id": "r-lad"}})
+    _wire(monkeypatch, recorder)
+    monkeypatch.setattr(config, "REVIEW_DEEP_DAILY_CAP", "")
+    pid = await _cap_project(db, "ladder-cap", {"deep_daily_cap": 1})
+    first = await _submitted_in(db, pid, diff=_LADDER_DIFF)
+    second = await _submitted_in(db, pid, diff=_LADDER_DIFF)
+
+    assert (await _any_dispatch_row(db, first))["profile"] == "deep"
+    assert (await _any_dispatch_row(db, second))["profile"] == "lite"
+    notes = await _dispatch_notes(db, second)
+    assert "решатель одобрения — hub/services/auto_verdict.py" in notes[0], notes
+    assert "суточный потолок 1 исчерпан — lite" in notes[0], notes
+
+
+def test_ladder_deep_sees_deleted_and_renamed_files():
+    """#1559: удаление и переименование пути контура — тоже правка контура."""
+    deleted = (
+        "diff --git a/hub/auth.py b/hub/auth.py\n"
+        "--- a/hub/auth.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-x = 1\n"
+    )
+    renamed = (
+        "diff --git a/hub/old.py b/hub/services/steward_shadow.py\n"
+        "similarity index 100%\nrename from hub/old.py\nrename to hub/services/steward_shadow.py\n"
+    )
+    assert pick_review_profile(_R2, deleted)[1] == ["решатель одобрения — hub/auth.py"]
+    assert pick_review_profile(_R2, renamed)[1] == [
+        "решатель одобрения — hub/services/steward_shadow.py"
+    ]
+
+
+def test_a_generated_file_on_a_ladder_path_does_not_buy_deep():
+    """#1559, находка 8c9f7d15794f50a4: реальный формат git diff. Заголовки
+    «diff --git»/«---» сгенерированного файла остаются после split_generated;
+    путь контура в них deep не покупает, а обычный файл контура рядом — да."""
+    generated = (
+        "diff --git a/hub/auth.py.snap b/hub/auth.py.snap\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/hub/auth.py.snap\n"
+        "+++ b/hub/auth.py.snap\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+    )
+    plain = (
+        "diff --git a/app/notes.py b/app/notes.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/app/notes.py\n+++ b/app/notes.py\n@@ -1 +1 @@\n-a = 1\n+a = 2\n"
+    )
+    ladder = (
+        "diff --git a/hub/auth.py b/hub/auth.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/hub/auth.py\n+++ b/hub/auth.py\n@@ -1 +1 @@\n-a = 1\n+a = 2\n"
+    )
+    assert pick_review_profile(_R2, generated + plain)[0] == LITE
+    profile, reasons = pick_review_profile(_R2, generated + ladder)
+    assert (profile, reasons) == (DEEP, ["решатель одобрения — hub/auth.py"])
+
+
+def test_only_approval_deciders_buy_deep_not_the_rest_of_the_ladder():
+    """#1559, решение владельца 03.10 (вариант Б): правка одного lifecycle.py,
+    config.py, project_policy.py, docs/agent-context, docs/repository-rules.md
+    или .github/ при R2 остаётся lite с прежней причиной."""
+    for path in (
+        "hub/services/lifecycle.py",
+        "hub/config.py",
+        "hub/services/project_policy.py",
+        "docs/agent-context/system-map.md",
+        "docs/repository-rules.md",
+        ".github/workflows/ci.yml",
+    ):
+        diff = f"+++ b/{path}\n+x = 1\n"
+        assert pick_review_profile(_R2, diff)[0] == LITE, path
+    code = "+++ b/hub/services/lifecycle.py\n+x = 1\n"
+    both = code + "+++ b/hub/services/steward_apply.py\n+x = 1\n"
+    assert pick_review_profile(_R2, both) == (
+        DEEP,
+        ["решатель одобрения — hub/services/steward_apply.py"],
+    )
+
+
+def test_approval_deciders_are_a_subset_of_the_ladder():
+    """#1559: каждая запись APPROVAL_DECIDERS — буквально элемент
+    LADDER_SURFACES; убрали элемент из контура — падает с его именем."""
+    from hub.services.auto_approve import (
+        APPROVAL_DECIDERS,
+        LADDER_SURFACES,
+        decider_hits,
+        ladder_hits,
+        surface_hits,
+    )
+
+    for entry in APPROVAL_DECIDERS:
+        assert entry in LADDER_SURFACES, f"{entry} не входит в LADDER_SURFACES"
+    assert len(set(APPROVAL_DECIDERS)) == len(APPROVAL_DECIDERS)
+    # Правило совпадения одно: точный путь или префикс, по любому списку.
+    paths = ["hub/services/lifecycle.py", "hub/auth.py", "docs/agent-context/a.md"]
+    assert ladder_hits(paths) == surface_hits(paths, LADDER_SURFACES) == sorted(paths)
+    assert decider_hits(paths) == surface_hits(paths, APPROVAL_DECIDERS)
+    assert decider_hits(paths) == ["hub/auth.py"]
+    assert surface_hits(["a/b/c.py"], ("a/b/",)) == ["a/b/c.py"]

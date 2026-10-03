@@ -47,6 +47,7 @@ from hub.models import (
     RiskClass,
 )
 from hub.services import call_sites, project_policy, review_ci_gate
+from hub.services.auto_approve import decider_hits
 from hub.services.metrics_scope import Scope
 from hub.services.model_family import family
 from hub.services.orchestration import ORIGINAL_READ_SQL
@@ -1089,10 +1090,38 @@ def pick_review_profile(
     ]
 
 
+def ladder_surface_reasons(diff: str) -> list[str]:
+    """Решатели одобрения, которых касается дифф сдачи (#1559).
+
+    Список — auto_approve.APPROVAL_DECIDERS, подмножество LADDER_SURFACES
+    (решение владельца 03.10), правило совпадения — то же, что у ladder_hits;
+    второй копии нет.
+    Пути берутся из ТОГО ЖЕ диффа, что читает process_surface_reasons,
+    без сгенерированных файлов (is_generated), а не из заявленных
+    affected_areas: заявка не освобождает от надзора (#582).
+    """
+    # split_generated отсекает файл с «+++», а заголовки «diff --git» и «---»
+    # оставляет в kept — путь сгенерированного файла отсюда и просочился бы.
+    # Поэтому пути читаются из всего диффа, а сгенерированные отбрасываются
+    # по имени, целиком (#1559, находка 8c9f7d15794f50a4).
+    # Удалённый, переименованный и бинарный файл — тоже правка контура.
+    paths = [
+        p for p in _diff_touched_paths(diff) if p is not None and not is_generated(p)
+    ]
+    return [f"решатель одобрения — {path}" for path in decider_hits(paths)]
+
+
 def _profile_by_rule(
     task: dict[str, Any], diff: str, risks: Any
 ) -> tuple[str, list[str]]:
-    """The rule after the human request: documents, surfaces, risk, class."""
+    """The rule after the human request: ladder, documents, surfaces, risk, class.
+
+    Решатели одобрения (#1559) стоят до документации; в их списке документации
+    нет, так что дифф только из документации остаётся lite.
+    """
+    ladder = ladder_surface_reasons(diff)
+    if ladder:
+        return DEEP, ladder
     if is_docs_only_diff(diff) and not _declares_security(risks):
         return LITE, ["дифф только из документации"]
     surfaces = process_surface_reasons(diff)
