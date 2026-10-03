@@ -361,36 +361,59 @@ async def _note_rollup_awaits_own_report(
     )
 
 
-async def reset_mis_issued_assignment(
-    db: aiosqlite.Connection, task_id: int, task: dict[str, Any]
-) -> bool:
-    """Снять остаток выдачи с задачи, возвращённой в open после сорванного прогона (#1562).
+async def mis_issued_container_run(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Последний прогон, если выдача контейнера им — ошибочная и осталась (#1562).
 
-    Прогон исполнителя кончился без сдачи (отмена, ошибка, потолок), PR у
-    задачи нет, человек вернул её в open: claimed_by, сессия, ветка и режим
-    git остались бы «собственной работой» для правила #1043 и держали бы
-    свёртку родителя навсегда (#1375). Ветка с PR — настоящая работа, её
-    выдача остаётся. Только поля карточки: ветка в git и каталог на диске
-    не трогаются, прежние значения уходят в ленту. Рабочего каталога в
-    карточке нет — он выводится из id задачи. Коммит — за вызывающим.
+    Единый предикат для возврата в open и для свипа свёртки: контейнер
+    (feature/epic с детьми, как для #1043), PR нет, последний прогон
+    исполнителя остановлен без сдачи своего поколения, в карточке ещё лежит
+    выдача. Обычная задача под него не подпадает: её ветка — настоящая
+    работа, даже если прогон остановили.
     """
-    if task.get("pr_number"):
-        return False
+    if task.get("task_type") not in _ROLLUP_PARENT_TYPES or task.get("pr_number"):
+        return None
+    if not (
+        (task.get("claimed_by") or "").strip()
+        or (task.get("claim_session_id") or "").strip()
+        or (task.get("branch") or "").strip()
+    ):
+        return None
+    if not await db_module.get_children(db, task["id"]):
+        return None
     from hub.services.executor_dispatch import STOPPED_OUTCOMES
 
-    runs = await repo.list_executor_runs(db, task_id)
+    runs = await repo.list_executor_runs(db, task["id"])
     if not runs:
-        return False
+        return None
     last = dict(runs[-1])
     if last["outcome"] not in STOPPED_OUTCOMES or int(
         last["submission_generation"] or 0
     ) <= int(task.get("submission_generation") or 0):
+        return None
+    return last
+
+
+async def reset_mis_issued_assignment(
+    db: aiosqlite.Connection, task_id: int, task: dict[str, Any]
+) -> bool:
+    """Снять остаток ошибочной выдачи с контейнера, не дав ей держать свёртку (#1562).
+
+    Контейнер выдали исполнителю по ошибке (#1455), прогон кончился без
+    сдачи, а claimed_by, сессия, ветка и режим git остались бы «собственной
+    работой» для правила #1043 и держали бы свёртку навсегда (#1375). Решает
+    :func:`mis_issued_container_run`. Только поля карточки: ветка в git и
+    каталог на диске не трогаются, прежние значения уходят в ленту. Рабочего
+    каталога в карточке нет — он выводится из id задачи. Коммит — за
+    вызывающим.
+    """
+    last = await mis_issued_container_run(db, {**task, "id": task_id})
+    if last is None:
         return False
     holder = (task.get("claimed_by") or "").strip()
     session = (task.get("claim_session_id") or "").strip()
     branch = (task.get("branch") or "").strip()
-    if not (holder or session or branch):
-        return False
     await repo.update_task(
         db,
         task_id,
@@ -485,6 +508,12 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
         children = await db_module.get_children(db, parent_id)
         if not _children_allow_rollup(children):
             continue
+        if _parent_has_own_work(parent) and parent["status"] == "open":
+            # #1562: an open container still holding a stopped run's
+            # assignment (#1375) is released here, by the same predicate as the
+            # return to open, and rolled up in this very pass.
+            if await reset_mis_issued_assignment(db, parent_id, parent):
+                parent = dict(await repo.get_task(db, parent_id))  # type: ignore[arg-type]
         if _parent_has_own_work(parent):
             # #1562: the sweep says why it passes, once per reason — it used
             # to skip in silence, and #1375 stood open for days.
