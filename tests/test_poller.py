@@ -2030,6 +2030,7 @@ from hub.poller import (  # noqa: E402 - тесты дописаны после 
     _sweep_messages_retention,
     _sweep_review,
     _sweep_review_dispatches,
+    _sweep_parent_rollup,
     _sweep_sessions_retention,
 )
 
@@ -3566,3 +3567,66 @@ async def test_concurrent_poller_and_report_done_deliver_once_without_alert(
     assert not any(
         e["kind"] == "needs_decision" and e["task_id"] == tv.id for e in events
     ), "ни одного перехода в needs_decision"
+
+
+async def test_rollup_skip_note_once_per_sweep(db):
+    """AC-2 (#1562): свип называет причину отказа по #1043 — один раз, не на каждом проходе."""
+    feature_id = await repo.create_task(
+        db,
+        title="Feature with its own work",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="feature",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.create_task(
+        db,
+        title="Done child",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="completed",
+        auto_review=False,
+        task_type="task",
+        parent_id=feature_id,
+        priority="medium",
+    )
+    await repo.update_task(
+        db, feature_id, branch="task-1/own-work", claimed_by="pda_claude"
+    )
+    await repo.update_task(db, feature_id, pr_number=5)
+    await db.commit()
+
+    def _notes() -> list[str]:
+        return [c for c in feed if "ждёт своего отчёта" in c]
+
+    await _sweep_parent_rollup(db)
+    feed = [
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, feature_id)
+    ]
+    assert len(_notes()) == 1, "первый проход пишет причину отказа"
+    assert "branch=task-1/own-work" in _notes()[0] and "pda_claude" in _notes()[0]
+
+    await _sweep_parent_rollup(db)
+    await _sweep_parent_rollup(db)
+    feed = [
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, feature_id)
+    ]
+    assert len(_notes()) == 1, "следующие проходы не повторяют ту же причину"
+
+    await repo.update_task(db, feature_id, claimed_by="someone_else")
+    await db.commit()
+    await _sweep_parent_rollup(db)
+    feed = [
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, feature_id)
+    ]
+    assert len(_notes()) == 2, "изменившаяся причина пишется заново"
+    assert dict(await repo.get_task(db, feature_id))["status"] == "open"

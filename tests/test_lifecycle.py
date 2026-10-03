@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 
 import aiosqlite
+import pytest
 from httpx import AsyncClient
 
 from hub import repository as repo
@@ -407,6 +408,225 @@ async def test_repair_sweep_skips_parent_with_its_own_branch(db: aiosqlite.Conne
     parent = dict(await repo.get_task(db, feature_id))
     assert parent["status"] == "running"
     assert repaired == 0
+
+
+def _dispatch_returns_no_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Контейнер-фича не уходит в прогон: rework приводит её в open, не в fix_requested."""
+    from hub.integrations.registry import plugins
+
+    async def _no_job(*_a, **_k):
+        return {"error": "no executor"}
+
+    monkeypatch.setattr(plugins.dispatch, "submit_task", _no_job)
+
+
+async def _mis_issued_feature(
+    db: aiosqlite.Connection,
+    *,
+    pr_number: int | None = None,
+    run_outcome: str = "cancelled",
+    task_type: str = "feature",
+    with_child: bool = True,
+    status: str = "needs_decision",
+) -> int:
+    """#1562: контейнер-фича, выданная облачному исполнителю по ошибке (#1375).
+
+    Все дети завершены; у фичи остались claimed_by, сессия и ветка от прогона,
+    который закончился без сдачи; человек должен решить, что с ней делать.
+    """
+    feature_id, _child_id = await _feature_with_completed_child(
+        db,
+        branch="task-1375/sid-d-otchety",
+        claimed_by="cloud",
+        parent_status=status,
+    )
+    if task_type != "feature":
+        await db.execute(
+            "UPDATE tasks SET task_type=? WHERE id=?", (task_type, feature_id)
+        )
+    if not with_child:
+        await db.execute(
+            "UPDATE tasks SET parent_id=NULL WHERE parent_id=?", (feature_id,)
+        )
+    await db.execute(
+        "UPDATE tasks SET claim_session_id=?, claimed_at=datetime('now'), "
+        "pr_number=?, git_mode='remote', implementer_principal_id=1 WHERE id=?",
+        ("bc-session", pr_number, feature_id),
+    )
+    run_id = await repo.create_executor_run(
+        db,
+        task_id=feature_id,
+        submission_generation=1,
+        agent_id="bc-agent",
+        run_id="run-1",
+        model="m",
+    )
+    await repo.update_executor_run(db, run_id, outcome=run_outcome, finish=True)
+    await db.commit()
+    return feature_id
+
+
+async def test_rollup_closes_feature_after_assignment_reset(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    _dispatch_returns_no_job(monkeypatch)
+    """AC-1 (#1562): возврат в open снимает остаток выдачи — и фича сворачивается."""
+    feature_id = await _mis_issued_feature(db)
+
+    resp = await client.post(
+        f"/api/tasks/{feature_id}/decide",
+        json={"action": "rework", "instructions": "Выдана по ошибке."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["status"] == "open"
+    assert not (parent["claimed_by"] or "").strip()
+    assert not (parent["claim_session_id"] or "").strip()
+    assert not parent["claimed_at"]
+    assert not (parent["branch"] or "").strip()
+    assert parent["git_mode"] == "hub"
+    assert parent["implementer_principal_id"] is None
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, feature_id)
+    )
+    assert "task-1375/sid-d-otchety" in feed and "cloud" in feed, (
+        "прежняя выдача названа в ленте: ветка и держатель не пропадают молча"
+    )
+
+    assert await repair_stale_parent_completions(db) == 1
+    assert dict(await repo.get_task(db, feature_id))["status"] == "completed"
+
+
+async def test_rework_keeps_the_assignment_of_real_work(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    _dispatch_returns_no_job(monkeypatch)
+    """AC-1 (#1562), граница: ветка с PR — настоящая работа, выдача остаётся."""
+    feature_id = await _mis_issued_feature(db, pr_number=77)
+
+    resp = await client.post(
+        f"/api/tasks/{feature_id}/decide",
+        json={"action": "rework", "instructions": "Доделать."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["claimed_by"] == "cloud"
+    assert parent["branch"] == "task-1375/sid-d-otchety"
+    assert await repair_stale_parent_completions(db) == 0
+
+
+async def test_rework_keeps_the_assignment_when_the_run_was_not_stopped(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    _dispatch_returns_no_job(monkeypatch)
+    """AC-1 (#1562), граница: прогон, кончившийся иначе, выдачу не сбрасывает."""
+    feature_id = await _mis_issued_feature(db, run_outcome="finished")
+
+    resp = await client.post(
+        f"/api/tasks/{feature_id}/decide",
+        json={"action": "rework", "instructions": "Доделать."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["claimed_by"] == "cloud"
+    assert parent["branch"] == "task-1375/sid-d-otchety"
+
+
+async def test_rework_keeps_the_assignment_when_the_run_submitted(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    """AC-1 (#1562), граница: у прогона есть сдача его поколения — это не «без сдачи»."""
+    _dispatch_returns_no_job(monkeypatch)
+    feature_id = await _mis_issued_feature(db)
+    await db.execute(
+        "UPDATE tasks SET submission_generation=1 WHERE id=?", (feature_id,)
+    )
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{feature_id}/decide",
+        json={"action": "rework", "instructions": "Доделать."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["claimed_by"] == "cloud"
+    assert parent["branch"] == "task-1375/sid-d-otchety"
+
+
+async def test_rework_keeps_the_assignment_of_a_plain_task(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    """#1562, находка af2f98b0: у обычной задачи ветка — настоящая работа."""
+    _dispatch_returns_no_job(monkeypatch)
+    task_id = await _mis_issued_feature(db, task_type="task")
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/decide",
+        json={"action": "rework", "instructions": "Доделать."},
+    )
+    assert resp.status_code == 200, resp.text
+
+    task = dict(await repo.get_task(db, task_id))
+    assert task["claimed_by"] == "cloud"
+    assert task["branch"] == "task-1375/sid-d-otchety"
+
+
+async def test_rework_keeps_the_assignment_of_a_container_without_children(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    """#1562: фича без детей — не контейнер для свёртки, её выдача остаётся."""
+    _dispatch_returns_no_job(monkeypatch)
+    task_id = await _mis_issued_feature(db, with_child=False)
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/decide",
+        json={"action": "rework", "instructions": "Доделать."},
+    )
+    assert resp.status_code == 200, resp.text
+    assert dict(await repo.get_task(db, task_id))["claimed_by"] == "cloud"
+
+
+async def test_sweep_releases_and_rolls_up_an_open_feature_with_stale_assignment(
+    db: aiosqlite.Connection,
+):
+    """AC-1 (#1562), состояние #1375: фича уже open, выдача от остановленного прогона."""
+    feature_id = await _mis_issued_feature(db, status="open")
+
+    assert await repair_stale_parent_completions(db) == 1
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["status"] == "completed"
+    assert not (parent["claimed_by"] or "").strip()
+    assert not (parent["claim_session_id"] or "").strip()
+    assert not (parent["branch"] or "").strip()
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, feature_id)
+    )
+    assert "Выдача снята" in feed and "task-1375/sid-d-otchety" in feed
+
+
+async def test_sweep_keeps_stale_assignment_when_the_predicate_does_not_hold(
+    db: aiosqlite.Connection,
+):
+    """#1562: свип сбрасывает по тому же предикату, что и rework, не шире."""
+    for label, kwargs in {
+        "pr": {"pr_number": 77},
+        "run_not_stopped": {"run_outcome": "finished"},
+        "needs_decision": {"status": "needs_decision"},
+    }.items():
+        feature_id = await _mis_issued_feature(db, **{"status": "open", **kwargs})
+
+        assert await repair_stale_parent_completions(db) == 0, label
+
+        parent = dict(await repo.get_task(db, feature_id))
+        assert parent["claimed_by"] == "cloud", label
+        assert parent["branch"] == "task-1375/sid-d-otchety", label
+        await repo.update_task(db, feature_id, status="rejected")
+        await db.commit()
 
 
 async def test_verdict_notes_review_in_flight(
