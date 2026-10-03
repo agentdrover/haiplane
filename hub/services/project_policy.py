@@ -637,6 +637,24 @@ def bug_red_test_of(policy: dict) -> str:
     return RED_TEST_WARN
 
 
+# Кто читает deep первым (#1561). ``cloud`` — как всегда: облако первым,
+# локальный путь только второй дверью после наблюдённого отказа (#1252).
+# ``local`` — deep сначала в локальный путь, облако только после его отказа.
+# Нет ключа и нечитаемое значение — ``cloud``: опечатка не должна молча
+# уводить платное ревью с облака на хост хаба.
+DEEP_REVIEWER_KEY = "deep_reviewer"
+DEEP_REVIEWER_CLOUD = "cloud"
+DEEP_REVIEWER_LOCAL = "local"
+DEEP_REVIEWERS: tuple[str, ...] = (DEEP_REVIEWER_CLOUD, DEEP_REVIEWER_LOCAL)
+
+
+def deep_reviewer_of(policy: dict) -> str:
+    """Кто читает deep первым: нет ключа или нечитаемое значение — cloud."""
+    if isinstance(policy, dict) and policy.get(DEEP_REVIEWER_KEY) in DEEP_REVIEWERS:
+        return str(policy[DEEP_REVIEWER_KEY])
+    return DEEP_REVIEWER_CLOUD
+
+
 # Пути постановки (#1456). DoR проверял, что validation_commands есть, но не
 # что пути в них и в test_ref существуют на базе или создаются самой задачей:
 # #1392 ушла в работу с командой на несуществующий каталог, и исполнитель

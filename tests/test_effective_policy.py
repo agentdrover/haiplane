@@ -309,3 +309,19 @@ async def test_my_context_names_an_unreadable_policy_instead_of_dropping_it(
     text = _message(out)
     assert "политика проекта не прочитана" in text
     assert "policy backend exploded" in text
+
+
+def test_deep_reviewer_key_is_validated_and_defaults_to_cloud():
+    """#1561: ключ принимает cloud | local, нечитаемое не читается как local."""
+    import pytest
+
+    from hub.models import ProjectPatch
+
+    assert "deep_reviewer" in GATE_POLICY_KEYS
+    assert project_policy.deep_reviewer_of({}) == "cloud"
+    assert project_policy.deep_reviewer_of({"deep_reviewer": "local"}) == "local"
+    assert project_policy.deep_reviewer_of({"deep_reviewer": "LOCAL"}) == "cloud"
+    assert project_policy.deep_reviewer_of({"deep_reviewer": 1}) == "cloud"
+    ProjectPatch(gate_policy={"deep_reviewer": "local"})
+    with pytest.raises(ValueError, match="deep_reviewer"):
+        ProjectPatch(gate_policy={"deep_reviewer": "qwen"})

@@ -3641,6 +3641,7 @@ async def maybe_dispatch_review(
     force_profile: str = "",
     replaces_dispatch_id: int | None = None,
     force_model: str = "",
+    cloud_after_local: bool = False,
 ) -> bool:
     """Queue a cloud reviewer for a fresh submission when policy allows.
 
@@ -3658,6 +3659,10 @@ async def maybe_dispatch_review(
 
     ``force_model`` is set only by the second axis of the cascade (#1243):
     the same work, the same profile, a model chosen by pick_cascade_model.
+
+    ``cloud_after_local`` is set only by the reverse second door (#1561): the
+    local deep this project asked for first has failed, and the cloud is
+    ordered without trying the local path again.
     """
     row = await repo.get_task(db, task_id)
     if row is None:
@@ -3698,6 +3703,14 @@ async def maybe_dispatch_review(
         return await dispatch_local_review(
             db, task, forge, branch, generation, force_profile
         )
+
+    if not cloud_after_local:
+        first = await _local_first_order(
+            db, task, project, forge, branch, generation,
+            force_profile, force_model, replaces_dispatch_id,
+        )  # fmt: skip
+        if first is not None:
+            return first
 
     reviewer_token = (config.CURSOR_REVIEWER_HUB_TOKEN or "").strip()
     if await _cloud_config_missing(db, task_id, gh_repo, reviewer_token):
@@ -4063,6 +4076,113 @@ def local_path_refusal(missing: Sequence[str]) -> str:
     )
 
 
+async def _local_first_order(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    project: Any,
+    forge: str,
+    branch: str,
+    generation: int,
+    force_profile: str,
+    force_model: str,
+    replaces_dispatch_id: int | None,
+) -> bool | None:
+    """Deep проекта с deep_reviewer=local — в локальный путь ПЕРВЫМ (#1561).
+
+    None — не наш случай или локальный отказал до траты денег: вызывающий
+    заказывает облако, как и без ключа. True/False — сдача обработана здесь
+    (False — заказ уже стоит, второго не будет).
+
+    Бронь (#1399) берётся ДО подготовки и снимается на любом выходе: на
+    сдачу не бывает двух оплаченных deep, и параллельный триггер, пришедший
+    в окно подготовки, видит бронь, а не пустоту. Переспрос и вторая ось
+    (``replaces_dispatch_id``, ``force_model``) остаются облачными: они
+    повторяют ИМЕННО облачный заказ, а вторая ось просит другую модель, чего
+    локальный ревьюер не умеет. Lite остаётся в облаке.
+    """
+    if (
+        force_model
+        or replaces_dispatch_id is not None
+        or force_profile == LITE
+        or project_policy.deep_reviewer_of(gate_policy_of(project))
+        != project_policy.DEEP_REVIEWER_LOCAL
+    ):
+        return None
+    task_id = int(task["id"])
+    if not await _claim_the_order(db, task_id, generation, force_profile, None, ""):
+        return False
+    try:
+        if await _forced_deep_over_cap(db, task, generation, force_profile, ""):
+            return False
+        return await dispatch_local_review(
+            db, task, forge, branch, generation, force_profile, local_first=True
+        )
+    except _LocalFirstDeclined as declined:
+        if declined.reason:
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                f"Локальный deep ({LOCAL_FIRST_MARK}) не заказан: "
+                f"{declined.reason}. Облако заказывается вместо него (#1561).",
+            )
+        return None
+    finally:
+        await repo.release_review_order(db, task_id, generation, force_profile)
+        await db.commit()
+
+
+async def _cloud_after_local(
+    db: aiosqlite.Connection, dispatch: dict[str, Any], why: str
+) -> None:
+    """Вторая дверь в обратную сторону: локальный deep первым не дал отчёта (#1561).
+
+    Зовётся с места, где локальная строка уже закрыта ``failed``: облако
+    заказывается ПОСЛЕ отказа, а не вместе с ним, и двух живых deep на сдачу
+    не бывает. Узнаётся «первый» по метке в строке заказа, а не по политике
+    проекта: политику успели поменять — а прогон уже был заказан иначе.
+    Профиль едет тем же, каким заказывали локальный, по той же причине, что в
+    #1252: понижать замену нельзя.
+    """
+    if not (dispatch.get("second_door_reason") or "").startswith(LOCAL_FIRST_MARK):
+        return
+    task_id = int(dispatch["task_id"])
+    if not await _submission_still_live(
+        db,
+        await _task_dict(db, task_id),
+        await _task_branch(db, task_id),
+        int(dispatch["submission_generation"]),
+    ):
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        f"Локальный deep ({dispatch.get('model') or 'модель не названа'}) "
+        f"отчёта не дал: {why}. Облако заказывается вместо него "
+        f"({LOCAL_FIRST_MARK}, #1561); локальная строка закрыта, второго "
+        "живого deep на этой сдаче не будет.",
+    )
+    await db.commit()
+    await maybe_dispatch_review(
+        db,
+        task_id,
+        force_profile=(dispatch.get("profile") or DEEP),
+        cloud_after_local=True,
+    )
+
+
+async def _task_dict(db: aiosqlite.Connection, task_id: int) -> dict[str, Any]:
+    row = await repo.get_task(db, task_id)
+    return dict(row) if row is not None else {"id": task_id}
+
+
+async def _task_branch(db: aiosqlite.Connection, task_id: int) -> str:
+    return ((await _task_dict(db, task_id)).get("branch") or "").strip()
+
+
 async def open_second_door(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -4157,6 +4277,7 @@ async def dispatch_local_review(
     *,
     cloud_refusal: str = "",
     late_report_recheck: dict[str, Any] | None = None,
+    local_first: bool = False,
 ) -> bool:
     """Добыть ревью там, куда облако не дотягивается. True — прогон запущен.
 
@@ -4173,6 +4294,13 @@ async def dispatch_local_review(
     репозитория. Отчёт, доехавший за это время, ту раннюю проверку не видит
     вовсе. Здесь — ПОСЛЕДНЕЕ слово, ближе к вставке уже некуда: деньги тратит
     именно она.
+
+    ``local_first`` (#1561) — заказ идёт по ключу проекта deep_reviewer=local,
+    а не после отказа облака. Отказ тогда НЕ алерт «вердикт остаётся
+    человеку», а ``_LocalFirstDeclined``: сдача не осталась без ревью, её
+    возьмёт облако, и причину называет вызывающий. Профиль здесь решается по
+    правилам облачного заказа (суточный потолок deep, #1414, действует и для
+    локального), и не-deep отклоняется молча: lite остаётся в облаке.
     """
     task_id = int(task["id"])
     reach = await review_reach(db, forge)
@@ -4194,18 +4322,17 @@ async def dispatch_local_review(
             "не разрешается в принципала",
         )
         return await _refuse_local_review(
-            db, task_id, reach.reason or local_path_refusal(missing)
-        )
-    spent = await _tokens_already_spent(db, task_id)
-    if spent >= config.LOCAL_REVIEW_TOKEN_CEILING:
-        return await _refuse_local_review(
             db,
             task_id,
-            f"потолок стоимости исчерпан: на задачу уже потрачено {spent} "
-            f"токенов при потолке {config.LOCAL_REVIEW_TOKEN_CEILING} "
-            "(LOCAL_REVIEW_TOKEN_CEILING). Прогон не запущен — это НЕ "
-            "«прочитано и чисто» (#1152)",
+            reach.reason or local_path_refusal(missing),
+            declined=local_first,
         )
+    if not local_first:
+        # Для local_first тот же счёт идёт ПОСЛЕ профиля (_local_first_gate):
+        # lite в облако уходит и потолка локального пути не касается.
+        spent = await _tokens_already_spent(db, task_id)
+        if spent >= config.LOCAL_REVIEW_TOKEN_CEILING:
+            return await _refuse_local_review(db, task_id, _ceiling_text(spent))
     # #1180 + находка 7ed386a8: добор лестницы (#879) обязан доехать сюда
     # ТЕМ ЖЕ профилем, каким его заказали. Без проброса локальный путь снова
     # выбирал профиль сам и покупал второй однопроходный прогон вместо
@@ -4218,19 +4345,17 @@ async def dispatch_local_review(
         generation=generation,
         force_profile=force_profile,
         principal_id=principal_id,
+        **_local_order_kwargs(local_first),
     )
+    if local_first:
+        await _local_first_gate(db, task, order)
     # #1252: причина, по которой отчёт добывается ЗДЕСЬ, а не в облаке, —
     # разная в двух случаях, и обе называются. «Облако сюда не дотягивается»
     # — свойство форжа (#1180). «Облако отказало» — наблюдённый факт про
     # конкретную сдачу, и человеку нужен именно он: без него отчёт второго
     # поставщика читается как облачный. Считается ДО последнего слова — не
     # зависит от базы, и нужна и вставке (second_door_reason), и карточке.
-    why = (
-        f"облако отчёта НЕ дало — {cloud_refusal}; отчёт добывается ВТОРЫМ "
-        "поставщиком, локальным (#1252)"
-        if cloud_refusal
-        else f"форж «{forge}» облачному ревьюеру недоступен"
-    )
+    why = _local_order_why(forge, cloud_refusal, local_first, order.model)
     # ЕДИНСТВЕННОЕ последнее слово перед тратой денег (#1266). Рунг-проверка
     # в _second_door_after_run — только первая; prepare_review_order выше
     # сама по себе не быстрая (дифф, правила репозитория), а свежесть сдачи
@@ -4273,7 +4398,8 @@ async def dispatch_local_review(
         "status",
         f"Машинное ревью запущено ЛОКАЛЬНО: {why}, "
         f"прогон идёт на хосте хаба под песочницей (#1180). "
-        f"Профиль {order.profile}, прогон {run_id}. Правила репозитория: "
+        f"Профиль {order.profile}{_named_local_model(order.model)}, "
+        f"прогон {run_id}. Правила репозитория: "
         f"{order.rules_note} (#873). Предмет ревью: {order.diff_note} (#874). "
         "Отчёт придёт по контракту от принципала локального ревьюера — "
         "его независимость держит токен, а не машина (#728).",
@@ -4306,10 +4432,118 @@ async def dispatch_local_review(
     return True
 
 
+class _LocalFirstDeclined(Exception):
+    """Локальный deep по политике не состоялся; сдачу возьмёт облако (#1561).
+
+    ``reason`` пуст, когда отказ — не поломка (профиль не deep): тогда в
+    карточку не пишется ничего.
+    """
+
+    def __init__(self, reason: str = "") -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+#: Начало ``second_door_reason`` строки заказа, сделанного по политике:
+#: по нему отличают «локальный первым» от «локальный вторым» (#1252).
+LOCAL_FIRST_MARK = "deep_reviewer=local"
+
+
+def _ceiling_text(spent: int, deep: bool = False) -> str:
+    name = "LOCAL_REVIEW_DEEP_TOKEN_CEILING" if deep else "LOCAL_REVIEW_TOKEN_CEILING"
+    ceiling = (
+        config.LOCAL_REVIEW_DEEP_TOKEN_CEILING
+        if deep
+        else config.LOCAL_REVIEW_TOKEN_CEILING
+    )
+    return (
+        f"потолок стоимости исчерпан: на задачу уже потрачено {spent} "
+        f"токенов при потолке {ceiling} ({name}). Прогон не запущен — это НЕ "
+        "«прочитано и чисто» (#1152)"
+    )
+
+
+def _local_order_kwargs(local_first: bool) -> dict[str, Any]:
+    """Что заказ локального прогона добавляет к общей подготовке (#1561).
+
+    Модель — настройка локального CLI, а не облачный выбор; не названа —
+    ключа нет, и выбор прежний, как до задачи. Суточный потолок deep (#1414)
+    подчиняет себе только заказ «локальный первым».
+    """
+    kwargs: dict[str, Any] = {}
+    if model := local_reviewer.model():
+        kwargs["force_model"] = model
+    if local_first:
+        kwargs["cloud"] = True
+    return kwargs
+
+
+def _named_local_model(model: str) -> str:
+    """«, модель X» — только когда модель названа настройкой локального CLI."""
+    named = local_reviewer.model()
+    return f", модель {model}" if named and named == model else ""
+
+
+def _local_order_why(
+    forge: str, cloud_refusal: str, local_first: bool, model: str
+) -> str:
+    """Почему отчёт добывается локально: три разные причины, и все называются."""
+    if local_first:
+        return (
+            f"{LOCAL_FIRST_MARK}: deep этого проекта читает локальный ревьюер "
+            f"({model}) первым, облако — только после его отказа (#1561)"
+        )
+    if cloud_refusal:
+        return (
+            f"облако отчёта НЕ дало — {cloud_refusal}; отчёт добывается ВТОРЫМ "
+            "поставщиком, локальным (#1252)"
+        )
+    return f"форж «{forge}» облачному ревьюеру недоступен"
+
+
+async def _local_first_gate(
+    db: aiosqlite.Connection, task: dict[str, Any], order: ReviewOrder
+) -> None:
+    """Четыре отказа локального deep по политике, по порядку (#1561).
+
+    Профиль первым: lite в облаке, и ни семейство, ни потолок его не касаются.
+    Дальше — модель (без названной модели запись была бы ложью про автора),
+    правило разных семейств (#757: неизвестное семейство — тоже отказ) и
+    предзапусковой потолок deep. Потолок считает сумму уже потраченного на
+    задачу и идущий прогон не обрезает.
+    """
+    from hub.services.model_family import same_family
+
+    if order.profile != DEEP:
+        raise _LocalFirstDeclined()
+    model = local_reviewer.model()
+    if not model:
+        raise _LocalFirstDeclined(
+            "модель локального CLI не названа (LOCAL_REVIEW_MODEL или --model в "
+            "LOCAL_REVIEW_CMD): записать прогон чужой моделью нельзя"
+        )
+    implementer = (task.get("submission_model") or "").strip()
+    if same_family(implementer, model) is not False:
+        raise _LocalFirstDeclined(
+            f"локальная модель {model} того же семейства, что исполнитель "
+            f"({implementer or 'не заявлен'}), или семейство неизвестно: "
+            "правило разных семейств не выполнено (#757)"
+        )
+    spent = await _tokens_already_spent(db, int(task["id"]))
+    if spent >= config.LOCAL_REVIEW_DEEP_TOKEN_CEILING:
+        raise _LocalFirstDeclined(_ceiling_text(spent, deep=True))
+
+
 async def _refuse_local_review(
-    db: aiosqlite.Connection, task_id: int, reason: str
+    db: aiosqlite.Connection, task_id: int, reason: str, *, declined: bool = False
 ) -> bool:
-    """Один алерт с названной причиной, и ничего больше. Всегда False."""
+    """Один алерт с названной причиной, и ничего больше. Всегда False.
+
+    ``declined`` (#1561): заказ был «локальный первым», и отказ уходит
+    вызывающему исключением — облако ещё не пробовалось.
+    """
+    if declined:
+        raise _LocalFirstDeclined(reason)
     await repo.add_task_update(
         db,
         task_id,
@@ -4698,6 +4932,16 @@ async def _settle_local_run(
     await repo.add_task_update(db, task_id, "hub", "alert", _local_failure_reason(run))
     await repo.set_review_dispatch_status(db, dispatch_id, "failed")
     await db.commit()
+    await _cloud_after_local(db, dispatch, _local_failure_headline(run))
+
+
+def _local_failure_headline(run: local_reviewer.LocalRun | None) -> str:
+    """Короткое имя отказа локального прогона — для строки об облаке (#1561)."""
+    if run is None:
+        return "прогон не состоялся (ошибка запуска)"
+    if run.timed_out:
+        return f"таймаут {config.LOCAL_REVIEW_TIMEOUT_SEC} с"
+    return f"прогон кончился без отчёта (код возврата {run.rc})"
 
 
 def _local_failure_reason(run: local_reviewer.LocalRun | None) -> str:
@@ -5235,6 +5479,7 @@ async def _sweep_orphan_local(
     )
     await repo.set_review_dispatch_status(db, dispatch_id, "failed")
     await db.commit()
+    await _cloud_after_local(db, dispatch, "прогон потерян при перезапуске хаба")
 
 
 # Исходы записи отчёта из текста прогона (#1260). Три, а не True/False:
@@ -5275,6 +5520,11 @@ async def _store_report(
 
     from hub.services.machine_review_intake import record_machine_review
 
+    if dispatch.get("channel") == LOCAL_CHANNEL and local_reviewer.model():
+        # #1561: отчёт, восстановленный хабом из текста, называет модель
+        # локального CLI, а не то, что прогон сказал о себе: по ней считаются
+        # срез #1490 и правило семейств.
+        report = report.model_copy(update={"model": local_reviewer.model()})
     try:
         await record_machine_review(
             db,

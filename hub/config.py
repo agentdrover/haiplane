@@ -385,6 +385,20 @@ LOCAL_REVIEW_TIMEOUT_SEC = int(env_get("LOCAL_REVIEW_TIMEOUT_SEC", "1800"))
 # сумме уже потраченного на ЭТУ задачу: без него автозапуск обошёл бы механизм
 # экономии #1152 с другой стороны.
 LOCAL_REVIEW_TOKEN_CEILING = int(env_get("LOCAL_REVIEW_TOKEN_CEILING", "2000000"))
+# Потолок для deep, заказанного ПО ПОЛИТИКЕ проекта (deep_reviewer=local,
+# #1561). Прежний потолок выше считает сумму уже потраченного на задачу ДО
+# запуска и не прерывает идущий прогон; но один deep весит больше него
+# (у grok в среднем 3,2 млн токенов по API), и после первого же прогона
+# следующий заказ отказал бы. Эта сумма — тоже предзапусковая и тоже называется
+# в карточке при отказе; идущий прогон она не обрезает.
+LOCAL_REVIEW_DEEP_TOKEN_CEILING = int(
+    env_get("LOCAL_REVIEW_DEEP_TOKEN_CEILING", "10000000")
+)
+# Модель локального CLI, как её записывать в заказ и отчёт (#1561). Пусто —
+# разбирается --model из LOCAL_REVIEW_CMD. Значение попадает в
+# review_dispatches.model и в правило разных семейств, поэтому оно обязано
+# называть ту модель, которая на самом деле читает код, а не облачный выбор.
+LOCAL_REVIEW_MODEL = env_get("LOCAL_REVIEW_MODEL", "")
 # Review profiles (#807). The lite profile reviews the branch diff in one
 # pass; deep is the multi-agent harness.
 #
