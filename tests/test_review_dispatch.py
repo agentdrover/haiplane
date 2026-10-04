@@ -93,7 +93,7 @@ class _PinnedGitOps(NoopGitOps):
         # no such file, exactly as `git show base:path` behaves.
         self._rules = rules or {}
 
-    async def branch_diff(self, repo, base, branch):
+    async def branch_diff(self, repo, base, branch, context=0):
         if branch != self._tip and re.fullmatch(r"[0-9a-f]{40}", branch or ""):
             # #1361: a pinned commit other than the tip is ANOTHER submission,
             # and by default another author edit — every fixture here models
@@ -2443,7 +2443,7 @@ class _AncestryGitOps(_PinnedGitOps):
     async def is_ancestor(self, repo, ancestor, descendant):
         return self._ancestor
 
-    async def branch_diff(self, repo, base, branch):
+    async def branch_diff(self, repo, base, branch, context=0):
         # The delta call passes the previous SHA as `base`; anything else is
         # the ordinary branch diff.
         if base == _PREV_SHA:
@@ -2669,7 +2669,7 @@ class _ThreeGenerationsGitOps(_AncestryGitOps):
             return _GEN3_PART
         return None
 
-    async def branch_diff(self, repo, base, branch):
+    async def branch_diff(self, repo, base, branch, context=0):
         since = self._since(base)
         if since is not None:
             return since
@@ -4194,7 +4194,7 @@ class _ShaDiffGitOps(_PinnedGitOps):
         super().__init__(tip, ["docs/notes.md"], diffs[tip])
         self._diffs = diffs
 
-    async def branch_diff(self, repo, base, branch):
+    async def branch_diff(self, repo, base, branch, context=0):
         return self._diffs.get(branch, self._diffs[self._tip])
 
 
@@ -9071,7 +9071,7 @@ async def test_a_report_arriving_while_the_local_order_is_being_prepared_stops_i
     landed: list[int] = []
 
     async def _report_lands_during_prep(
-        db_conn, task, *, branch, generation, force_profile, principal_id
+        db_conn, task, *, branch, generation, force_profile, principal_id, **more
     ):
         # Отчёт доезжает ПОСЛЕ рунг-проверки в _second_door_after_run (она
         # уже прошла — отчёта тогда не было), но ДО вставки строки локального
@@ -9086,6 +9086,7 @@ async def test_a_report_arriving_while_the_local_order_is_being_prepared_stops_i
             generation=generation,
             force_profile=force_profile,
             principal_id=principal_id,
+            **more,
         )
 
     monkeypatch.setattr(
@@ -9285,7 +9286,7 @@ async def test_a_submission_moved_during_preparation_buys_no_local_run(
     moved: list[bool] = []
 
     async def _resubmit_during_prep(
-        db_conn, task, *, branch, generation, force_profile, principal_id
+        db_conn, task, *, branch, generation, force_profile, principal_id, **more
     ):
         if not moved:
             moved.append(True)
@@ -9303,6 +9304,7 @@ async def test_a_submission_moved_during_preparation_buys_no_local_run(
             generation=generation,
             force_profile=force_profile,
             principal_id=principal_id,
+            **more,
         )
 
     monkeypatch.setattr(
@@ -14858,7 +14860,7 @@ async def _circle_resubmission(
 
 
 class _UnreadableGitOps(_PinnedGitOps):
-    async def branch_diff(self, repo, base, branch):
+    async def branch_diff(self, repo, base, branch, context=0):
         raise RuntimeError("git недоступен")
 
 
@@ -16288,3 +16290,239 @@ async def test_a_local_first_deep_cut_by_a_hub_stop_gets_the_cloud_after_start(
         ("cloud", "active"),
     ], rows
     assert (await _card_text(db, task_id)).count("прерван остановкой хаба") == 1
+
+
+# --- #1582: локальный ревьюер читает дифф в промте, а не командой git diff ----
+
+
+def _file_diff(path: str, body: str) -> str:
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        f"--- a/{path}\n"
+        f"+++ b/{path}\n"
+        "@@ -1 +1 @@\n"
+        f"-OLD_{body}\n"
+        f"+NEW_{body}\n"
+    )
+
+
+_INLINE_DIFF = (
+    _file_diff("hub/alpha.py", "ALPHA")
+    + _file_diff("uv.lock", "LOCKED_NOISE")
+    + _file_diff("hub/beta.py", "BETA")
+)
+
+
+async def _local_prompt(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    monkeypatch,
+    tmp_path,
+    slug: str,
+    diff: str,
+    transport: str = "direct",
+) -> tuple[str, str, int]:
+    """Локальный заказ на GitVerse: ``(промт у шва, промт у ревьюера, task_id)``.
+
+    «У ревьюера» — то, что реально дошло до процесса: stdin при ``direct`` и
+    ``prompt.txt`` задания при ``runner`` (#1571).
+    """
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-x"}, "run": {"id": "r-x"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    seen: list[str] = []
+    real_run = local_reviewer.run_review
+
+    async def _watch(prompt, *, timeout=None, prompt_at_slot=None):
+        seen.append(prompt)
+        return await real_run(prompt, timeout=timeout, prompt_at_slot=prompt_at_slot)
+
+    monkeypatch.setattr(local_reviewer, "run_review", _watch)
+    stdin_file = tmp_path / "stdin.txt"
+    _stub_reviewer(
+        monkeypatch,
+        tmp_path,
+        f"import sys\nopen({str(stdin_file)!r}, 'w').write(sys.stdin.read())\n"
+        + _reporting_stub(),
+    )
+    if transport == "runner":
+        spool = tmp_path / "spool"
+        spool.mkdir()
+        (spool / "heartbeat").write_text("{}")
+        monkeypatch.setattr(config, "LOCAL_REVIEW_TRANSPORT", "runner")
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SPOOL_DIR", str(spool))
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "")
+        monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "")
+        monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", "")
+
+        async def _the_service(jobdir, limit, started):
+            stdin_file.write_text((Path(jobdir) / "prompt.txt").read_text())
+            return local_reviewer.LocalRun(
+                rc=1, output="", dropped=0, timed_out=False, duration_ms=1
+            )
+
+        monkeypatch.setattr(local_reviewer, "_await_result", _the_service)
+    task_id = await _submitted(
+        client,
+        db,
+        slug,
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+        diff=diff,
+    )
+    await wait_for_local_runs()
+    await db.commit()
+    assert recorder.calls == [], "облако на этом форже не зовут"
+    assert len(seen) == 1, "локальный прогон один"
+    return seen[0], stdin_file.read_text(), task_id
+
+
+@pytest.mark.parametrize("transport", ("direct", "runner"))
+async def test_a_local_review_prompt_carries_the_diff_inline(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    monkeypatch,
+    tmp_path,
+    transport: str,
+):
+    """AC-1: ревьюер без клона получает сам дифф, с закреплённого sha, без lock."""
+    asked: list[str] = []
+    real = _PinnedGitOps.branch_diff
+
+    async def _recording(self, repo_, base, branch, context=0):
+        asked.append(branch)
+        return await real(self, repo_, base, branch)
+
+    monkeypatch.setattr(_PinnedGitOps, "branch_diff", _recording)
+    prompt, stdin_text, task_id = await _local_prompt(
+        client, db, monkeypatch, tmp_path, "inline-diff", _INLINE_DIFF, transport
+    )
+    task = dict(await repo.get_task(db, task_id))
+    for text in (prompt, stdin_text):
+        assert "NEW_ALPHA" in text and "NEW_BETA" in text, (
+            "текст диффа обоих файлов лежит в промте"
+        )
+        assert "OLD_ALPHA" in text, "минусовые строки тоже: это дифф, а не список"
+        assert "LOCKED_NOISE" not in text, "сгенерированный файл не входит"
+        assert "uv.lock" in text, "но исключение названо — молча ничего не пропадает"
+        assert "КОМАНДОЙ ИЗ ПРЕДМЕТА" not in text, "и шаг порядка не шлёт к команде"
+        assert "git diff" not in text, (
+            "клона у ревьюера нет: велеть ему выполнить git diff значит "
+            "получить отчёт «смотреть было нечем»"
+        )
+    assert task["submission_sha"], "сдача закрепила sha"
+    assert task["submission_sha"] in asked, (
+        "дифф снят на закреплённом sha (#824), а не по имени ветки"
+    )
+
+
+async def test_an_oversized_local_diff_is_cut_by_file_and_named(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-2: сверх потолка файлы целиком до него, остальные названы поимённо."""
+    monkeypatch.setattr(config, "LOCAL_REVIEW_DIFF_CHAR_CEILING", 700)
+    huge = "\n".join(f"+HUGE_LINE_{n}" for n in range(200))
+    diff = (
+        _file_diff("hub/small_one.py", "SMALL_ONE")
+        + _file_diff("hub/huge.py", "HUGE")
+        + huge
+        + "\n"
+        + _file_diff("hub/small_two.py", "SMALL_TWO")
+    )
+    prompt, stdin_text, _ = await _local_prompt(
+        client, db, monkeypatch, tmp_path, "inline-cut", diff
+    )
+    for text in (prompt, stdin_text):
+        assert "NEW_SMALL_ONE" in text and "NEW_SMALL_TWO" in text, (
+            "файлы, что помещаются, включены целиком"
+        )
+        assert "HUGE_LINE_" not in text, "файл, что не вошёл, не режется посередине"
+        assert re.search(r"НЕ ВОШЛИ[^\n]*hub/huge\.py", text), (
+            "не вошедший файл назван поимённо, чтобы ревьюер поднял incomplete"
+        )
+        assert "incomplete=true" in text and "lost_dimensions" in text, (
+            "ревьюеру сказано, что делать с непокрытым"
+        )
+
+
+async def test_the_cloud_prompt_keeps_the_diff_command(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3: у облачного заказа на ту же сдачу всё как до задачи — команда."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-c"}, "run": {"id": "r-c"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _submitted(
+        client, db, "cloud-keeps", policy={"review": "dispatch"}, diff=_INLINE_DIFF
+    )
+    assert len(recorder.calls) == 1
+    prompt = recorder.calls[0]["prompt_text"]
+    task = dict(await repo.get_task(db, task_id))
+    assert re.search(
+        rf"git diff \S+\.\.\.{re.escape(task['branch'])} -- "
+        r"':\(exclude\)uv\.lock'",
+        prompt,
+    ), "команда диффа с исключением сгенерированного на месте"
+    assert "NEW_ALPHA" not in prompt and "OLD_ALPHA" not in prompt, (
+        "облаку дифф не инлайнится: у агента есть клон"
+    )
+
+
+_SQL_HUNK_DIFF = (
+    "diff --git a/db/q.sql b/db/q.sql\n"
+    "--- a/db/q.sql\n"
+    "+++ b/db/q.sql\n"
+    "@@ -1,3 +1,3 @@\n"
+    "--- OLD_SQL_COMMENT\n"
+    "+++ NEW_PLUS_PLUS_LINE\n"
+    "+AFTER_THE_LOOKALIKES\n" + _file_diff("hub/next.py", "NEXT")
+)
+
+
+def test_a_hunk_line_that_looks_like_a_file_header_does_not_split_the_file():
+    """Находка 523e42c1: «--- …»/«+++ …» в теле хунка — строки правки, не заголовок."""
+    from hub.services.review_dispatch import diff_file_sections
+
+    sections = diff_file_sections(_SQL_HUNK_DIFF)
+    assert [p for p, _ in sections] == ["db/q.sql", "hub/next.py"]
+    body = dict(sections)["db/q.sql"]
+    assert "OLD_SQL_COMMENT" in body and "NEW_PLUS_PLUS_LINE" in body
+    assert "AFTER_THE_LOOKALIKES" in body, "хвост правки не пропал"
+
+
+async def test_the_local_prompt_keeps_a_hunk_with_header_lookalikes(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    prompt, _, _ = await _local_prompt(
+        client, db, monkeypatch, tmp_path, "inline-lookalike", _SQL_HUNK_DIFF
+    )
+    assert "AFTER_THE_LOOKALIKES" in prompt and "NEW_PLUS_PLUS_LINE" in prompt
+
+
+async def test_the_local_diff_is_read_with_context_and_the_profile_without(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Без клона окружающий код ревьюеру взять негде: инлайн снимается с контекстом."""
+    asked: list[tuple[str, int]] = []
+    real = _PinnedGitOps.branch_diff
+
+    async def _with_context(self, repo_, base, branch, context=0):
+        asked.append((branch, context))
+        got = await real(self, repo_, base, branch)
+        if context:
+            got = got.replace(
+                "@@ -1 +1 @@\n", "@@ -1,3 +1,3 @@\n NEIGHBOUR_FUNCTION_LINE\n", 1
+            )
+        return got
+
+    monkeypatch.setattr(_PinnedGitOps, "branch_diff", _with_context)
+    prompt, _, task_id = await _local_prompt(
+        client, db, monkeypatch, tmp_path, "inline-context", _INLINE_DIFF
+    )
+    task = dict(await repo.get_task(db, task_id))
+    assert "NEIGHBOUR_FUNCTION_LINE" in prompt, "неизменённая строка рядом в промте"
+    assert (task["submission_sha"], config.LOCAL_REVIEW_DIFF_CONTEXT_LINES) in asked
+    assert config.LOCAL_REVIEW_DIFF_CONTEXT_LINES >= 10
+    assert any(ctx == 0 for _, ctx in asked), "расчёт профиля остался на -U0"
