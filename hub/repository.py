@@ -6079,6 +6079,19 @@ async def set_executor_run_agent(
     )
 
 
+async def set_executor_run_starting_ref(
+    db: aiosqlite.Connection, row_id: int, starting_ref: str
+) -> None:
+    """Записать ссылку, от которой заказан прогон (#1563). Коммит — за вызывающим.
+
+    Пишется ДО заказа провайдеру: слепой исход (ответ не пришёл) всё равно
+    оставляет в строке то, что хаб отправил.
+    """
+    await db.execute(
+        "UPDATE executor_runs SET starting_ref=? WHERE id=?", (starting_ref, row_id)
+    )
+
+
 async def wait_for_executor_cost(
     db: aiosqlite.Connection, row_id: int, minutes: int
 ) -> bool:

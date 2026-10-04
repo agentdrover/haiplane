@@ -464,11 +464,12 @@ async def _order(
         pending = await _current_findings(db, task)
         if pending:
             extra = _findings_block(pending)
+    starting_ref = on_branch or _pushed_branch(task) or base
     order = {
         "repo_url": f"https://github.com/{project['repo']}",
         # #1446: прогон «только сдай» называет ветку сам — она запушена, хотя
         # сдачи (признака _pushed_branch) у поколения ещё нет.
-        "starting_ref": on_branch or _pushed_branch(task) or base,
+        "starting_ref": starting_ref,
         "model_id": model,
         "prompt_text": _prompt(
             task,
@@ -480,6 +481,8 @@ async def _order(
             on_branch,
         ),
     }
+    # #1563: что хаб отправил провайдеру, остаётся в строке прогона.
+    await repo.set_executor_run_starting_ref(db, row_id, starting_ref)
     agent_id, run_id, failed = await _create(task_id, generation, order)
     if failed:
         if failed.startswith(REASON_ANSWER_BLIND):
@@ -504,7 +507,7 @@ async def _order(
         "hub",
         "status",
         f"{note or 'Исполнитель запущен хабом по нажатию человека (#1412)'}: агент "
-        f"{agent_id}, модель {model}, сдача {generation}, от базы {base}.",
+        f"{agent_id}, модель {model}, сдача {generation}, от {starting_ref}.",
     )
     await db.commit()
     return LaunchResult(True, "", task_id, agent_id, run_id, row_id)
