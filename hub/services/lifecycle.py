@@ -332,24 +332,113 @@ def _parent_has_own_work(parent: dict[str, Any]) -> bool:
 async def _note_rollup_awaits_own_report(
     db: aiosqlite.Connection, parent_id: int, parent: dict[str, Any]
 ) -> None:
-    """Write the skip to the task tape so the parent is not silently stuck."""
+    """Write the skip to the task tape so the parent is not silently stuck.
+
+    Said once per reason (#1562): the sweep passes over the same parent every
+    tick, and the same sentence on each pass would bury the tape. The text
+    carries branch and holder, so a changed reason is a new sentence.
+    """
     branch = (parent.get("branch") or "").strip() or "—"
     claimed = (parent.get("claimed_by") or "").strip() or "—"
-    await repo.add_task_update(
-        db,
-        parent_id,
-        "hub",
-        "status",
+    content = (
         "Родитель готов к сдаче и ждёт своего отчёта: роллап не закрыл "
         f"задачу, потому что у неё есть собственная работа "
-        f"(branch={branch}, claimed_by={claimed}).",
+        f"(branch={branch}, claimed_by={claimed})."
     )
+    already = await fetchall(
+        db,
+        "SELECT 1 FROM task_updates WHERE task_id=? AND agent='hub' AND content=?",
+        (parent_id, content),
+    )
+    if already:
+        return
+    await repo.add_task_update(db, parent_id, "hub", "status", content)
     await log_activity(
         db,
         "task_updated",
         f"Task #{parent_id} rollup skipped: parent has its own work, "
         "awaiting its own report",
     )
+
+
+async def mis_issued_container_run(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Последний прогон, если выдача контейнера им — ошибочная и осталась (#1562).
+
+    Единый предикат для возврата в open и для свипа свёртки: контейнер
+    (feature/epic с детьми, как для #1043), PR нет, последний прогон
+    исполнителя остановлен без сдачи своего поколения, в карточке ещё лежит
+    выдача (захват: claimed_by или сессия; одной ветки мало). Обычная задача
+    под него не подпадает: её ветка — настоящая работа, даже если прогон
+    остановили.
+    """
+    if task.get("task_type") not in _ROLLUP_PARENT_TYPES or task.get("pr_number"):
+        return None
+    # Признак ошибочной выдачи — висящий захват, а не ветка: release_task и
+    # return_to_work снимают захват и ветку оставляют намеренно (#1356).
+    if not (
+        (task.get("claimed_by") or "").strip()
+        or (task.get("claim_session_id") or "").strip()
+    ):
+        return None
+    if not await db_module.get_children(db, task["id"]):
+        return None
+    from hub.services.executor_dispatch import STOPPED_OUTCOMES
+
+    runs = await repo.list_executor_runs(db, task["id"])
+    if not runs:
+        return None
+    last = dict(runs[-1])
+    if last["outcome"] not in STOPPED_OUTCOMES or int(
+        last["submission_generation"] or 0
+    ) <= int(task.get("submission_generation") or 0):
+        return None
+    return last
+
+
+async def reset_mis_issued_assignment(
+    db: aiosqlite.Connection, task_id: int, task: dict[str, Any]
+) -> bool:
+    """Снять остаток ошибочной выдачи с контейнера, не дав ей держать свёртку (#1562).
+
+    Контейнер выдали исполнителю по ошибке (#1455), прогон кончился без
+    сдачи, а claimed_by, сессия, ветка и режим git остались бы «собственной
+    работой» для правила #1043 и держали бы свёртку навсегда (#1375). Решает
+    :func:`mis_issued_container_run`. Только поля карточки: ветка в git и
+    каталог на диске не трогаются, прежние значения уходят в ленту. Рабочего
+    каталога в карточке нет — он выводится из id задачи. Коммит — за
+    вызывающим.
+    """
+    last = await mis_issued_container_run(db, {**task, "id": task_id})
+    if last is None:
+        return False
+    holder = (task.get("claimed_by") or "").strip()
+    session = (task.get("claim_session_id") or "").strip()
+    branch = (task.get("branch") or "").strip()
+    await repo.update_task(
+        db,
+        task_id,
+        claimed_by=None,
+        claim_session_id=None,
+        claimed_at=None,
+        implementer_principal_id=None,
+        branch=None,
+        git_mode="hub",
+    )
+    await note_session_task(db, session, None)
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        "Выдача снята: прогон исполнителя закончился без сдачи "
+        f"({last['outcome']}), PR нет. Прежняя выдача: держатель "
+        f"{holder or '—'}, сессия {session or '—'}, ветка {branch or '—'}. "
+        "Ветка в git и каталог на диске не тронуты; без остатка выдачи "
+        "свёртка родителя может закрыть задачу, если все дети завершены.",
+    )
+    return True
 
 
 async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
@@ -421,7 +510,17 @@ async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
         children = await db_module.get_children(db, parent_id)
         if not _children_allow_rollup(children):
             continue
+        if _parent_has_own_work(parent) and parent["status"] == "open":
+            # #1562: an open container still holding a stopped run's
+            # assignment (#1375) is released here, by the same predicate as the
+            # return to open, and rolled up in this very pass.
+            if await reset_mis_issued_assignment(db, parent_id, parent):
+                parent = dict(await repo.get_task(db, parent_id))  # type: ignore[arg-type]
         if _parent_has_own_work(parent):
+            # #1562: the sweep says why it passes, once per reason — it used
+            # to skip in silence, and #1375 stood open for days.
+            await _note_rollup_awaits_own_report(db, parent_id, parent)
+            noted = True
             continue
         if prevention_gate.prevention_gap(parent):
             await prevention_gate.note_rollup_held(db, parent_id)
@@ -4873,6 +4972,7 @@ async def decide_task(
             await repo.update_task(db, task_id, status="fix_requested", job_id=job_id)
         else:
             await repo.update_task(db, task_id, status="open")
+            await reset_mis_issued_assignment(db, task_id, task)
         await db.commit()
         await log_activity(
             db,
