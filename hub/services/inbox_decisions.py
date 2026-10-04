@@ -207,14 +207,18 @@ def _entry(row: Any, action: str, grounds: str) -> dict[str, Any]:
 
 async def _fetch(
     db: aiosqlite.Connection, status: str, order_by: str, scoped: dict[str, Any]
-) -> tuple[list[Any], int]:
-    rows = await repo.list_tasks_by_status(
-        db, status, order_by=order_by, limit=DECISION_CAP, **scoped
+) -> list[Any]:
+    """ВСЕ строки статуса: размер ограничен самим статусом, а не окном.
+
+    Режет только показ, и после порядка и фильтра (#1501, раунд 2): окно до
+    топологии теряет родителя за краем, окно до фильтра вердикта вытесняет
+    человеческий вердикт делегированными. ``LIMIT -1`` в SQLite — без предела.
+    """
+    return list(
+        await repo.list_tasks_by_status(
+            db, status, order_by=order_by, limit=-1, **scoped
+        )
     )
-    total = len(rows)
-    if total >= DECISION_CAP:
-        total = await repo.count_tasks_by_status(db, status, **scoped)
-    return list(rows), total
 
 
 def _numbered(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -225,29 +229,43 @@ def _numbered(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return ordered
 
 
+def _cap(items: list[Any]) -> list[Any]:
+    return items[:DECISION_CAP]
+
+
 async def collect(db: aiosqlite.Connection, scoped: dict[str, Any]) -> dict[str, Any]:
     """Всё, что человек решает во входящих: строки, их порядок и честная обрезка."""
-    drafts, drafts_total = await _fetch(db, "draft", repo.DRAFT_QUEUE_ORDER_BY, scoped)
-    drafts, cycles = await order_drafts(db, drafts)
-    asked, asked_total = await _fetch(db, "needs_info", "id DESC", scoped)
-    decide, decide_total = await _fetch(db, "needs_decision", "id DESC", scoped)
-    reviewing, reviewing_total = await _fetch(db, "review", "id DESC", scoped)
-    reviewing_fetched = len(reviewing)
-    reviewing, verdicts = await _verdict_rows(db, reviewing)
+    drafts, cycles = await order_drafts(
+        db, await _fetch(db, "draft", repo.DRAFT_QUEUE_ORDER_BY, scoped)
+    )
+    asked = await _fetch(db, "needs_info", "id DESC", scoped)
+    decide = await _fetch(db, "needs_decision", "id DESC", scoped)
+    reviewing, verdicts = await _verdict_rows(
+        db, await _fetch(db, "review", "id DESC", scoped)
+    )
+    # Обрезка — последним шагом и по уже отфильтрованному: M считается после
+    # фильтра маршрута, делегированное в «из M» не входит.
+    totals = {
+        "черновики": len(drafts),
+        "вопросы": len(asked),
+        "решения": len(decide),
+        "ревью": len(reviewing),
+    }
+    drafts, asked, decide = _cap(drafts), _cap(asked), _cap(decide)
+    reviewing, verdicts = _cap(reviewing), _cap(verdicts)
+    shown = {
+        "черновики": len(drafts),
+        "вопросы": len(asked),
+        "решения": len(decide),
+        "ревью": len(reviewing),
+    }
     entries = [_entry(r, ACTION_APPROVE, _draft_grounds(r)) for r in drafts]
     entries += [_entry(r, ACTION_ANSWER, await _question_grounds(db, r)) for r in asked]
     entries += [_entry(r, ACTION_DECIDE, await _decide_grounds(db, r)) for r in decide]
-    # Ревью режется ДО фильтра маршрута, поэтому считается по выбранным, а не
-    # по оставшимся: отфильтрованное делегированное — не обрезка.
     cut = [
-        f"{label}: показано {shown} из {total}"
-        for label, shown, total in (
-            ("черновики", len(drafts), drafts_total),
-            ("вопросы", len(asked), asked_total),
-            ("решения", len(decide), decide_total),
-            ("ревью", reviewing_fetched, reviewing_total),
-        )
-        if shown < total
+        f"{label}: показано {shown[label]} из {total}"
+        for label, total in totals.items()
+        if shown[label] < total
     ]
     return {
         "drafts": drafts,

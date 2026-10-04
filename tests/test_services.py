@@ -6010,3 +6010,48 @@ async def test_inbox_does_not_offer_a_verdict_on_a_report_without_stated_complet
     assert row["task_id"] == task_id
     assert row["offer"] is False
     assert "отчёт не пришёл полным" in row["grounds"]
+
+
+async def test_inbox_parent_outside_the_cap_still_precedes_its_child(
+    db: aiosqlite.Connection, monkeypatch
+):
+    from hub.services import inbox_decisions
+
+    # Родитель с самым низким рангом #253 лежит за краем окна из 4 строк.
+    # Окно ДО топологии роняло его из рёбер и ставило ребёнка впереди.
+    parent = await _inbox_draft(db, "E low rank", task_type="epic", readiness=0)
+    child = await _inbox_draft(db, "B high rank", parent_id=parent, readiness=99)
+    for i in range(3):
+        await _inbox_draft(db, f"independent {i}", readiness=80)
+    monkeypatch.setattr(inbox_decisions, "DECISION_CAP", 4)
+
+    inbox = await services.get_inbox_data(db)
+    order = [r["task_id"] for r in _rows(inbox, "approve")]
+    assert child not in order or (
+        parent in order and order.index(parent) < order.index(child)
+    )
+    assert "показано 4 из 5" in inbox["decision_note"]
+
+
+async def test_inbox_human_verdict_survives_many_delegated_reviews(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    from hub import config
+    from hub.services import inbox_decisions
+    from tests.test_auto_verdict import _post_review, _submitted_task
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "off")
+    human = await _submitted_task(client, db, "inbox-cap-human", {"verdict": "human"})
+    await _post_review(client, human)
+    for i in range(3):
+        delegated = await _submitted_task(
+            client, db, f"inbox-cap-auto-{i}", {"verdict": "auto"}
+        )
+        await _post_review(client, delegated)
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    # Окно по id DESC взяло бы только свежие делегированные.
+    monkeypatch.setattr(inbox_decisions, "DECISION_CAP", 2)
+
+    inbox = await services.get_inbox_data(db)
+    assert [r["task_id"] for r in _rows(inbox, "verdict")] == [human]
+    assert inbox["decision_note"] == "", "M считается после фильтра маршрута"

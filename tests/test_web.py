@@ -7216,7 +7216,30 @@ async def test_inbox_partial_renders_action_and_grounds(client: AsyncClient, db)
     assert "Which branch?" in answer
     assert f"/tasks/{question}/web-answer" in answer
 
+    assert "All clear" not in page
     ruling = block(verdict)
     assert 'data-decision-action="verdict"' in ruling
     assert "0/0/1" in ruling and "CI зелёный" in ruling
     assert f'href="/tasks/{verdict}#review-verdict-form"' in ruling
+
+
+async def test_dashboard_inbox_total_counts_a_verdict_waiting_for_the_human(
+    client: AsyncClient, db
+):
+    from tests.test_auto_verdict import _post_review, _submitted_task
+
+    def total(page: str) -> int:
+        m = re.search(
+            r'topbar-stat-value">\s*(\d+)\s*<', page[page.index("topbar-stat--inbox") :]
+        )
+        assert m, "плашка Inbox не найдена"
+        return int(m.group(1))
+
+    before = total((await client.get("/")).text)
+    task_id = await _submitted_task(
+        client, db, "inbox-total-human", {"verdict": "human"}
+    )
+    await _post_review(client, task_id)
+    page = (await client.get("/")).text
+    assert total(page) == before + 1
+    assert "is-zero" not in page[page.index("topbar-stat--inbox") :][:120]

@@ -149,6 +149,30 @@ class _ScopedFilters(_PersonFilters):
     project_id: int | None
 
 
+def inbox_attention_total(data: dict[str, Any]) -> int:
+    """Сколько всего во входящих ждёт внимания — ОДИН счёт на плашку, секцию и шаблон.
+
+    Раньше web считал его своим перечнем, и строки, добавленные во входящие
+    (вердикт, #1501), в плашку не попадали: «Inbox 0» при ждущем вердикте.
+    """
+    unjudged = data.get("unjudged_findings") or {}
+    return (
+        len(data["drafts"])
+        + len(data["questions"])
+        + len(data["decisions"])
+        + len(data["review_tasks"])
+        + len(data["pending_reports"])
+        + len(data["ci_check_tasks"])
+        + len(data["fix_requested_tasks"])
+        + len(data["stale_tasks"])
+        # #1038: находки — счёт, а не статусный список.
+        + (1 if unjudged.get("findings") else 0)
+        # #897/#1198/#294: признанные расхождения вне счёта, одним определением
+        # (acknowledged_now) из репозитория.
+        + len([d for d in data["undelivered"] if not d.get("acknowledged_now")])
+    )
+
+
 async def get_inbox_data(
     db: aiosqlite.Connection,
     *,
@@ -262,7 +286,7 @@ async def get_inbox_data(
     # nothing led to it.
     unjudged = await repo.count_unjudged_findings(db, project_id=project_id)
 
-    return {
+    data: dict[str, Any] = {
         "undelivered": undelivered,
         "unjudged_findings": unjudged,
         "decision_queue": decisions["queue"],
@@ -289,6 +313,8 @@ async def get_inbox_data(
             project=project,
         ),
     }
+    data["inbox_attention_total"] = inbox_attention_total(data)
+    return data
 
 
 async def _enrich_epics(

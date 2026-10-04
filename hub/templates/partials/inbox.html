@@ -23,7 +23,7 @@
    Их три — этот, топбар на GET / и заголовок секции, — и правка, закрывшая
    два из трёх, оставила «All clear» невозможным навсегда (#294). #}
 {% set undelivered_unacked = undelivered | rejectattr("acknowledged_now") | list %}
-{% set total_inbox = drafts|length + questions|length + decisions|length + pending_reports|length + ci_check_tasks|length + fix_requested_tasks|length + review_tasks|length + stale_tasks|length + undelivered_unacked|length + (1 if unjudged_findings.findings else 0) %}
+{% set total_inbox = inbox_attention_total %}
 {% set filter_active = filter_mine or filter_human_owner or filter_claimed_by %}
 
 <div class="inbox-filter-bar">
