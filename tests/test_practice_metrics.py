@@ -3345,3 +3345,128 @@ async def test_mcp_practice_metrics_passes_series_days():
         assert "series_days=14" in get.call_args.args[0]
         await hub_practice_metrics()
         assert "series_days" not in get.call_args.args[0]
+
+
+# --- validation_run_lines counts every submission of the window (#1567) ----
+
+_SHA_ONE = "1f047c" + "b7a91f" + "1" * 28
+_SHA_TWO = "bf3de1" + "a0c2d4" + "2" * 28
+_SHA_THREE = "c0ffee" + "123456" + "3" * 28
+_RUN_CLAIM = " ruff check: rc=0; pytest: rc=0."
+
+
+async def _submission_row(
+    db: aiosqlite.Connection,
+    task_id: int,
+    number: int,
+    sha: str | None,
+    *,
+    hours_ago: float = 1,
+) -> None:
+    tip = f" Branch tip at submission: {sha[:12]}." if sha else ""
+    content = f"{repo.SUBMISSION_UPDATE_PREFIX}{number}).{tip}{_RUN_CLAIM}"
+    await db.execute(
+        "INSERT INTO task_updates (task_id, agent, kind, content, created_at) "
+        "VALUES (?, 'dev', 'status', ?, ?)",
+        (task_id, content, _ts(hours_ago)),
+    )
+
+
+async def _ci_report(
+    db: aiosqlite.Connection, task_id: int, sha: str, **checks
+) -> None:
+    from hub.services.ci_report import accept_ci_run_report
+
+    await accept_ci_run_report(
+        db,
+        task_id,
+        head_sha=sha,
+        ac_results={},
+        checks=checks,
+        reported_by="github-actions",
+    )
+
+
+async def _run_lines(db: aiosqlite.Connection, **scope) -> dict:
+    return (await practice_metrics(db, **scope))["validation_run_lines"]
+
+
+async def test_validation_run_lines_counts_every_submission(db: aiosqlite.Connection):
+    # #1168: submission 1 failed the prepass, submission 4 passed. The task
+    # pins only the last sha, yet the failed one is a submission of the window.
+    task_id = await _task(db, title="four submissions", status="review")
+    await _submission_row(db, task_id, 1, _SHA_ONE, hours_ago=5)
+    await _submission_row(db, task_id, 2, _SHA_TWO, hours_ago=1)
+    await repo.update_task(db, task_id, submission_sha=_SHA_TWO)
+    await _ci_report(db, task_id, _SHA_ONE, lint="pass", tests="fail")
+    await _ci_report(db, task_id, _SHA_TWO, lint="pass", tests="pass")
+    await db.commit()
+
+    runs = await _run_lines(db)
+
+    assert (runs["failed_with_run_lines"], runs["sample"], runs["not_run"]) == (1, 2, 0)
+
+
+async def test_validation_run_lines_late_report_counts(db: aiosqlite.Connection):
+    # The CI report arrives after the submission row (623 of 872 in prod): it
+    # is still the verdict of that submission, not a "not_run".
+    task_id = await _task(db, title="late report", status="review")
+    await _submission_row(db, task_id, 1, _SHA_ONE, hours_ago=3)
+    await _submission_row(db, task_id, 2, _SHA_TWO, hours_ago=2)
+    await repo.update_task(db, task_id, submission_sha=_SHA_TWO)
+    await db.commit()
+    before = await _run_lines(db)
+    assert (before["sample"], before["not_run"]) == (0, 2)
+
+    await _ci_report(db, task_id, _SHA_ONE, tests="fail")
+    await db.commit()
+
+    after = await _run_lines(db)
+    assert (after["failed_with_run_lines"], after["sample"], after["not_run"]) == (
+        1,
+        1,
+        1,
+    )
+
+
+async def test_validation_run_lines_window_and_project_slice(
+    db: aiosqlite.Connection,
+):
+    spike = await repo.create_project(db, slug="spike-runs", name="Spike Runs")
+    inside = await _task(db, title="in spike", status="review", project_id=spike)
+    outside = await _task(db, title="in default", status="review")
+    await _submission_row(db, inside, 1, _SHA_ONE, hours_ago=2)
+    await _submission_row(db, inside, 2, _SHA_TWO, hours_ago=24 * 200)
+    await _submission_row(db, outside, 1, _SHA_THREE, hours_ago=2)
+    await repo.update_task(db, inside, submission_sha=_SHA_ONE)
+    await repo.update_task(db, outside, submission_sha=_SHA_THREE)
+    await _ci_report(db, inside, _SHA_ONE, tests="fail")
+    await _ci_report(db, inside, _SHA_TWO, tests="fail")
+    await _ci_report(db, outside, _SHA_THREE, tests="pass")
+    await db.commit()
+
+    window = await _run_lines(db)
+    assert (window["failed_with_run_lines"], window["sample"]) == (1, 2)
+    wide = await _run_lines(db, since_days=400)
+    assert (wide["failed_with_run_lines"], wide["sample"]) == (2, 3)
+    only_spike = await _run_lines(db, project="spike-runs")
+    assert (only_spike["failed_with_run_lines"], only_spike["sample"]) == (1, 1)
+    only_default = await _run_lines(db, project="default")
+    assert (only_default["failed_with_run_lines"], only_default["sample"]) == (0, 1)
+
+
+async def test_validation_run_lines_unpinned_submission_is_not_run(
+    db: aiosqlite.Connection,
+):
+    # A row without a branch tip has no commit to read a report for, and the
+    # task's current pin is another submission's commit: it never stands in.
+    task_id = await _task(db, title="unpinned first", status="review")
+    await _submission_row(db, task_id, 1, None, hours_ago=3)
+    await _submission_row(db, task_id, 2, _SHA_TWO, hours_ago=1)
+    await repo.update_task(db, task_id, submission_sha=_SHA_TWO)
+    await _ci_report(db, task_id, _SHA_TWO, tests="fail")
+    await db.commit()
+
+    runs = await _run_lines(db)
+
+    assert (runs["failed_with_run_lines"], runs["sample"], runs["not_run"]) == (1, 1, 1)
