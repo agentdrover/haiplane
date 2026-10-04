@@ -482,7 +482,10 @@ async def _order(
         ),
     }
     # #1563: что хаб отправил провайдеру, остаётся в строке прогона.
-    await repo.set_executor_run_starting_ref(db, row_id, starting_ref)
+    # Коммит до сети: открытая запись держала бы write-лок на весь вызов
+    # провайдера (_CREATE_TIMEOUT), класс #1428.
+    async with write_transaction(db):
+        await repo.set_executor_run_starting_ref(db, row_id, starting_ref)
     agent_id, run_id, failed = await _create(task_id, generation, order)
     if failed:
         if failed.startswith(REASON_ANSWER_BLIND):

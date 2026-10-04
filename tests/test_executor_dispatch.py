@@ -3259,3 +3259,23 @@ async def test_a_first_launch_records_the_base_as_starting_ref(db, monkeypatch):
 
     assert result.launched, result
     assert (await _row(db, result.row_id))["starting_ref"] == "develop"
+
+
+async def test_starting_ref_is_committed_before_the_provider_call(db, monkeypatch):
+    """#1428: пока идёт сетевой заказ, запись starting_ref уже закоммичена и
+    write-лок не держится — иначе другой писатель ждал бы ответа Cursor."""
+    seen: dict = {}
+
+    async def _create(**kw):
+        seen["in_transaction"] = db.in_transaction
+        return _CREATED, None
+
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _create)
+    project, _ = await _launch_project(db, slug="exec-ref-lock")
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert result.launched, result
+    assert seen["in_transaction"] is False
+    assert (await _row(db, result.row_id))["starting_ref"] == "develop"
