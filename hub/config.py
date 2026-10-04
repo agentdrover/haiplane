@@ -399,6 +399,16 @@ LOCAL_REVIEW_DEEP_TOKEN_CEILING = int(
 # review_dispatches.model и в правило разных семейств, поэтому оно обязано
 # называть ту модель, которая на самом деле читает код, а не облачный выбор.
 LOCAL_REVIEW_MODEL = env_get("LOCAL_REVIEW_MODEL", "")
+# Транспорт запуска локального ревьюера (#1571). ``direct`` (умолчание) — хаб
+# сам запускает песочницу, как с #1180: годится хосту без изоляции службы.
+# ``runner`` — хаб ничего не запускает: кладёт задание в spool-каталог, а
+# запуск делает отдельная служба вне изоляции хаба (deploy/review-runner/).
+# Нужен там, где юнит хаба идёт с ProtectSystem=strict и NoNewPrivileges=yes:
+# sudo и запись вне ReadWritePaths ему запрещены, и ослаблять это нельзя.
+LOCAL_REVIEW_TRANSPORT = env_get("LOCAL_REVIEW_TRANSPORT", "direct")
+# Каталог очереди службы-исполнителя: обязан лежать в ReadWritePaths хаба и
+# быть доступен службе (2770, общая группа). Нужен только при ``runner``.
+LOCAL_REVIEW_SPOOL_DIR = env_get("LOCAL_REVIEW_SPOOL_DIR", "")
 # Review profiles (#807). The lite profile reviews the branch diff in one
 # pass; deep is the multi-agent harness.
 #
