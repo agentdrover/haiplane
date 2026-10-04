@@ -5220,3 +5220,25 @@ def test_stateless_transport_leaves_no_tool_without_its_session():
         if tool.context_kwarg is not None
     ]
     assert needs_session == []
+
+
+async def test_claim_and_pair_start_messages_carry_worktree_hint(
+    mock_api_post: AsyncMock, mock_api_get: AsyncMock
+) -> None:
+    """#1515: both responses name where the worktree goes."""
+    hint = "../.<имя вашего клона>-worktrees/task-41 — `hp-hub worktree 41`"
+    mock_api_post.return_value = {"status": "claimed", "worktree_hint": hint}
+    mock_api_get.side_effect = [
+        {"id": 41, "status": "open"},
+        {"id": 41, "status": "claimed", "claimed_by": "composer"},
+    ]
+    claim = json.loads(await hub_claim_task(41, "composer", session_id="s"))
+    assert f"Worktree: {hint}" in claim["message"]
+
+    mock_api_post.return_value = {"status": "running", "worktree_hint": hint}
+    mock_api_get.side_effect = [
+        {"id": 41, "status": "claimed"},
+        {"id": 41, "status": "running", "branch": "task-41/x"},
+    ]
+    pair = json.loads(await hub_pair_start(41, plan="Plan: x"))
+    assert f"Worktree: {hint}" in pair["message"]
