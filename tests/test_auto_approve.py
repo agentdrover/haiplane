@@ -16,7 +16,7 @@ from httpx import AsyncClient
 
 from hub import config
 from hub import repository as repo
-from hub.services import refinement
+from hub.services import auto_approve, refinement
 
 _DOR_READY = {
     "work_type": "feature",
@@ -770,3 +770,49 @@ async def test_auto_approval_never_reads_git_again_under_the_write_lock(
     assert (await client.get(f"/api/tasks/{task_id}")).json()["status"] == "open"
     assert calls, "the readiness pass itself reads the tree"
     assert inside == [0], f"git read inside maybe_auto_approve: {inside}"
+
+
+@pytest.mark.parametrize(
+    ("stored", "approves"),
+    [
+        ("auto", True),
+        ("human", False),
+        ("steward", False),
+        ("AUTO", False),
+        ("", False),
+        (1, False),
+        (["auto"], False),
+        (None, False),
+    ],
+)
+async def test_dor_autopilot_answers_as_the_raw_comparison_did(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, stored, approves
+) -> None:
+    # #1558 AC-3: the solver now reads dor through project_policy.gate_value_of;
+    # every value the write accepts, and garbage, answers as `== "auto"` did.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _project(db, "dor-table", {"dor": stored})
+    task_id = await _draft_in_project(client, db, pid)
+    body = await _refine_to_dor(client, task_id, ["docs/notes.md"])
+    assert body["status"] == ("open" if approves else "draft")
+
+
+async def test_auto_approve_decides_dor_with_the_summary_reader(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # #1558 AC-2: ONE reader answers for the gate and for the summary.
+    from hub.services import effective_policy, project_policy
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _project(db, "dor-one-reader", {"dor": "auto"})
+    project = await repo.get_project(db, pid)
+    summary = effective_policy.REGISTRY["dor"]
+    assert summary.read({"dor": "auto"}) == "auto"
+
+    # Replace the reader everywhere it is looked up: both sides follow it.
+    monkeypatch.setattr(project_policy, "gate_value_of", lambda p, g: "probe")
+    monkeypatch.setattr(auto_approve, "gate_value_of", project_policy.gate_value_of)
+    assert summary.read(project_policy.gate_policy_of(project)) == "probe"
+    task_id = await _draft_in_project(client, db, pid)
+    body = await _refine_to_dor(client, task_id, ["docs/notes.md"])
+    assert body["status"] == "draft", "the gate follows the same reader"
