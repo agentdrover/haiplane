@@ -760,6 +760,44 @@ async def latest_submission_text(db, task_id: int) -> str:
     return ""
 
 
+_TIP_RE = re.compile(r"Branch tip at submission: ([0-9a-f]{7,40})")
+
+
+def submission_tip(text: str) -> str:
+    """The commit prefix a submission row names, or "" when it pinned none.
+
+    The hub writes it itself in a fixed shape (``submit_for_review``), which
+    makes the row the one record of which commit each submission handed over
+    (#1567): the task keeps only the latest.
+    """
+    match = _TIP_RE.search(text or "")
+    return match.group(1) if match else ""
+
+
+async def submission_standing(db, task_id: int, text: str, pinned: str = ""):
+    """The validation standing of ONE submission row (#1567).
+
+    The commit is the one the row names; ``pinned`` stands in only for a row
+    that names none. The report is read when the metric is read, never when
+    the row was written: CI answers after the submission far more often than
+    before it. A prefix is widened to the full sha the report is keyed on.
+    """
+    sha = submission_tip(text) or pinned.strip()
+    if sha:
+        from hub.db import fetchall
+
+        rows = await fetchall(
+            db,
+            "SELECT head_sha FROM ci_run_reports WHERE task_id = ? "
+            "AND substr(head_sha, 1, ?) = ? ORDER BY reported_at DESC, id DESC",
+            (task_id, len(sha), sha),
+        )
+        if rows:
+            sha = rows[0]["head_sha"]
+    prepass = await prepass_state(db, {"id": task_id, "submission_sha": sha})
+    return validation_standing(prepass, text)
+
+
 def run_lines_tally(standings) -> dict[str, Any]:
     """Submissions with a failed prepass AND lines about runs, with the sample.
 

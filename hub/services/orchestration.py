@@ -1197,19 +1197,34 @@ async def _validation_run_line_metrics(
     """
     from hub.services import review_evidence
 
-    where, params = scope.where("updated_at", task_column="id")
+    where, params = scope.where("u.created_at", task_column="u.task_id")
+    # Every submission row of the window counts, not the task's latest: the
+    # failed prepass of an early submission stays visible when a later one
+    # passed (#1567). The latest row of a task may fall back to its pinned sha.
     rows = await fetchall(
         db,
-        "SELECT id, submission_sha FROM tasks "
-        f"WHERE COALESCE(submission_sha, '') != '' AND {where}",  # nosec B608
-        tuple(params),
+        "SELECT u.task_id, u.content, "
+        "u.id = (SELECT MAX(l.id) FROM task_updates l WHERE l.task_id = u.task_id "
+        "AND l.kind = 'status' AND l.content LIKE ?) AS is_latest, "
+        "COALESCE(t.submission_sha, '') AS pinned "
+        "FROM task_updates u JOIN tasks t ON t.id = u.task_id "
+        f"WHERE u.kind = 'status' AND u.content LIKE ? AND {where} "  # nosec B608
+        "ORDER BY u.id",
+        (
+            f"{repo.SUBMISSION_UPDATE_PREFIX}%",
+            f"{repo.SUBMISSION_UPDATE_PREFIX}%",
+            *params,
+        ),
     )
-    standings = []
-    for row in rows:
-        task = {"id": row["id"], "submission_sha": row["submission_sha"]}
-        prepass = await review_evidence.prepass_state(db, task)
-        text = await review_evidence.latest_submission_text(db, int(row["id"]))
-        standings.append(review_evidence.validation_standing(prepass, text))
+    standings = [
+        await review_evidence.submission_standing(
+            db,
+            int(row["task_id"]),
+            str(row["content"]),
+            row["pinned"] if row["is_latest"] else "",
+        )
+        for row in rows
+    ]
     return review_evidence.run_lines_tally(standings)
 
 
