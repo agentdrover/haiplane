@@ -208,8 +208,9 @@
                     {% set outcome_status_value = task.outcome_status.value %}
                     {% set outcome_status_labels = {
                         'no_hypothesis': 'Нет гипотезы',
-                        'not_due': 'Срок не наступил',
+                        'not_due': 'Окно наблюдения не вышло',
                         'unanswered': 'Срок наступил, ответа нет',
+                        'unknown': 'Релиз фикса неизвестен',
                         'confirmed': 'Подтверждена',
                         'refuted': 'Опровергнута',
                         'unmeasurable': 'Неизмерима',
