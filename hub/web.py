@@ -955,33 +955,9 @@ async def web_dashboard(
             if (e.get("id") if isinstance(e, dict) else getattr(e, "id", None))
             in allowed
         ]
-    inbox_total = (
-        len(inbox["drafts"])
-        + len(inbox["questions"])
-        + len(inbox["decisions"])
-        + len(inbox["pending_reports"])
-        + len(inbox["ci_check_tasks"])
-        + len(inbox["fix_requested_tasks"])
-        + len(inbox["stale_tasks"])
-        # #1038: находки живут не в статусном списке, а в своём счёте, и без
-        # этой строки верхняя плашка показывала бы «Inbox 0» при непустой
-        # секции ниже — ровно та невидимость, которую задача и убирает.
-        + (1 if inbox.get("unjudged_findings", {}).get("findings") else 0)
-        # #897: a completed task with an open PR belongs in the count the owner
-        # glances at. Left out of it, the section would be a thing you only see
-        # if you already scrolled to where you were not looking.
-        #
-        # #1198: acknowledged rows are excluded. They stay in the section — the
-        # record is never erased — but a discrepancy the owner has already
-        # judged legitimate must not keep pushing the badge up: a counter that
-        # never returns to zero is a counter nobody reads, which is the exact
-        # death this task exists to prevent.
-        # #294: «признано» спрашивается ОДНИМ определением из репозитория
-        # (acknowledged_now), а не своим здесь. Своё уже разъехалось с голосом:
-        # строка, признанная для другого факта, будила агентов и одновременно
-        # считалась нулём.
-        + len([d for d in inbox["undelivered"] if not d.get("acknowledged_now")])
-    )
+    # Один счёт на плашку, секцию и шаблон входящих — из данных get_inbox_data
+    # (services.dashboard.inbox_attention_total), не второй перечень здесь.
+    inbox_total = inbox["inbox_attention_total"]
     # Coordination panels (#775): who is around, and what the sessions are
     # saying to each other. Deliberately unfiltered by project — a session
     # belongs to an agent, not to a project, and a thread the owner cannot see

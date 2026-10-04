@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
@@ -62,6 +63,7 @@ SKIP_UNDECLARED = "area_undeclared"
 SKIP_OVERLAP = "area_overlap"
 SKIP_ACTIVE_UNDECLARED = "active_area_undeclared"
 SKIP_NOT_LEAF = "not_a_leaf"
+SKIP_DEFERRED = "deferred"
 
 #: Что исполнитель берёт в работу (#1455): только листовые типы.
 LEAF_TYPES: frozenset[str] = frozenset({"task", "subtask"})
@@ -80,6 +82,25 @@ STARTED_STATUSES: frozenset[str] = frozenset(
 )
 
 _PRIORITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def current_wait(task: dict[str, Any]) -> str:
+    """Объявленное и ещё действующее ожидание задачи (#957); пусто — нет.
+
+    Действующее — с названием и сроком в будущем: то же правило, что у списка
+    «застрявших» (``list_stale_by_status``), где просроченное ожидание уже не
+    молчание. Отложенную задачу очередь не берёт (#1527): оркестратор,
+    запускающий исполнителя (``executor_launch``), не должен стартовать то, что
+    владелец или агент сам отложил до события. Единственное правило и для
+    очереди, и для страницы пути.
+    """
+    what = str(task.get("waiting_for") or "").strip()
+    until = str(task.get("waiting_until") or "").strip()
+    if not what or not until:
+        return ""
+    if until < datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"):
+        return ""
+    return f"отложена: ждёт «{what}» до {until}"
 
 
 def _covers(outer: str, inner: str) -> bool:
@@ -127,6 +148,7 @@ async def _project_tasks(
     rows = await fetchall(
         db,
         "SELECT id, title, status, task_type, priority, position, dor_passed, "
+        "waiting_for, waiting_until, "
         f"affected_areas FROM tasks WHERE archived=0 AND status IN ({marks}) "  # nosec B608 - placeholders only, values are params
         "ORDER BY id",
         tuple(statuses),
@@ -329,14 +351,28 @@ async def not_leaf_reason(db: aiosqlite.Connection, task: dict[str, Any]) -> str
 
 
 async def _skip_reason(
-    db: aiosqlite.Connection, candidate: dict[str, Any], active: list[dict[str, Any]]
+    db: aiosqlite.Connection,
+    candidate: dict[str, Any],
+    active: list[dict[str, Any]],
+    known_blockers: dict[int, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any] | None:
-    """Почему этот кандидат ждёт; ``None`` — не ждёт."""
+    """Почему этот кандидат ждёт; ``None`` — не ждёт.
+
+    ``known_blockers`` — недоставленные зависимости, уже посчитанные одним
+    проходом по графу (#1527): тот же читатель доставки, без запроса на задачу.
+    """
     task_id = int(candidate["id"])
+    waiting = current_wait(candidate)
+    if waiting:
+        return {"task_id": task_id, "reason": SKIP_DEFERRED, "detail": waiting}
     not_leaf = await not_leaf_reason(db, candidate)
     if not_leaf:
         return {"task_id": task_id, "reason": SKIP_NOT_LEAF, "detail": not_leaf}
-    blockers = await _undelivered_blockers(db, task_id)
+    blockers = (
+        known_blockers.get(task_id, [])
+        if known_blockers is not None
+        else await _undelivered_blockers(db, task_id)
+    )
     if blockers:
         listed = ", ".join(f"#{b['task_id']}" for b in blockers)
         return {
@@ -368,8 +404,17 @@ def _summary(answer: dict[str, Any]) -> str:
     )
 
 
-async def next_task(db: aiosqlite.Connection, project: Any) -> dict[str, Any]:
-    """Ответ очереди для одного проекта. Ничего не пишет."""
+async def next_task(
+    db: aiosqlite.Connection,
+    project: Any,
+    *,
+    known_blockers: dict[int, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Ответ очереди для одного проекта. Ничего не пишет.
+
+    ``known_blockers`` (#1527): страница пути уже прочитала доставку всех
+    зависимостей графа; правило выбора остаётся этим, читатель не повторяется.
+    """
     policy = project_policy.gate_policy_of(project)
     limit = project_policy.wip_limit_of(policy)
     tasks = await _project_tasks(db, int(project["id"]))
@@ -398,7 +443,7 @@ async def next_task(db: aiosqlite.Connection, project: Any) -> dict[str, Any]:
     }
     if not answer["wip_full"]:
         for candidate in candidates:
-            skip = await _skip_reason(db, candidate, active)
+            skip = await _skip_reason(db, candidate, active, known_blockers)
             if skip is None:
                 answer["next_task_id"] = int(candidate["id"])
                 break

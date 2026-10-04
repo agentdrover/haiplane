@@ -1972,6 +1972,7 @@ async def hub_my_context(
     ctx = await _api_get(f"/api/tasks/{task_id}/context{query}")
     text = ctx.get("context_text", f"Context for task #{task_id} not available.")
     text += await _policy_brief_text(ctx)
+    text += await _path_brief_text(ctx)
     return fit_echo_result(
         text,
         _context_char_budget(max_chars, mode),
@@ -1994,6 +1995,23 @@ async def _policy_brief_text(ctx: dict[str, Any]) -> str:
     except HubApiError as exc:
         return f"\n\nполитика проекта не прочитана: {exc}"
     return "\n\n" + "\n".join(format_policy_brief(data))
+
+
+async def _path_brief_text(ctx: dict[str, Any]) -> str:
+    """Блок «что дальше» для контекста задачи (#1527); best effort.
+
+    Тот же расчёт, что у REST и CLI: следующая задача проекта и путь эпиков.
+    """
+    from hub.services.project_path import format_path_brief
+
+    slug = ((ctx.get("task") or {}).get("project") or {}).get("slug") or ""
+    if not slug:
+        return ""
+    try:
+        data = await _api_get(f"/api/projects/{urllib.parse.quote(slug, safe='')}/path")
+    except HubApiError as exc:
+        return f"\n\nпуть проекта не прочитан: {exc}"
+    return "\n\n" + "\n".join(format_path_brief(data))
 
 
 @mcp.tool()
@@ -3505,9 +3523,8 @@ async def hub_outcome_debt() -> CallToolResult:
     nobody has come back to, and the ones somebody has, with the last verdict
     and what was measured. Record an answer with hub_answer_outcome.
 
-    outcome_deadline is shown verbatim and never used for filtering - it is free
-    text holding event descriptions rather than dates, so nothing is hidden
-    behind a value that cannot be parsed.
+    Due = first deploy of the fix + 14 days (#1568): overdue / observing /
+    unknown (no recorded fix release). outcome_deadline stays free text.
     """
     try:
         data = await _api_get("/api/metrics/outcome-debt")
@@ -3529,13 +3546,18 @@ async def hub_outcome_debt() -> CallToolResult:
     else:
         lines = [
             f"{data.get('total', 0)} completed tasks stated an outcome nobody "
-            f"answered; {answered} have been answered:",
+            f"answered ({data.get('overdue_total', 0)} overdue, "
+            f"{data.get('observing_total', 0)} observing, "
+            f"{data.get('unknown_total', 0)} unknown); {answered} answered:",
             "",
         ]
     for item in items:
         waited = item.get("days_unanswered")
         waited_text = f"{waited}d unanswered" if waited is not None else "age unknown"
         lines.append(f"#{item['task_id']} {item['title']} — {waited_text}")
+        due_on = item.get("due_on")
+        status = item.get("outcome_status", "")
+        lines.append(f"    {status}" + (f", due {due_on}" if due_on else ""))
         lines.append(f"    metric: {item.get('outcome_metric') or '—'}")
         if item.get("outcome_deadline"):
             lines.append(f"    said by: {item['outcome_deadline']}")

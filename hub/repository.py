@@ -869,6 +869,40 @@ async def release_fact_for_task(
     return dict(rows[0]) if rows else None
 
 
+async def first_fix_deploy_at(
+    db: aiosqlite.Connection, task_id: int, *, with_descendants: bool = False
+) -> str | None:
+    """When the fix of this task first reached production, or None (#1568).
+
+    The fix is the release stamped on the task's LAST merge
+    (``pipeline_merges.released_sha``); its deploy is the earliest successful
+    ``releases`` row of that sha — a re-run of the deploy never moves it. The
+    sha is matched trimmed and lower-cased with no project_id: releases
+    reported before 28.09 carry ``project_id=NULL`` (the rule of
+    ``defect_release``). With ``with_descendants`` the latest such moment among
+    the task and everything below it is returned: an epic or feature is out
+    when its last child is. None means no recorded fix release — unknown.
+    """
+    tree = (
+        "WITH RECURSIVE tree(id) AS (SELECT ? UNION ALL "
+        "SELECT t.id FROM tasks t JOIN tree ON t.parent_id = tree.id) "
+        "SELECT id FROM tree"
+        if with_descendants
+        else "SELECT ? AS id"
+    )
+    rows = await fetchall(
+        db,
+        f"SELECT MAX(d) AS at FROM (SELECT (SELECT MIN(r.deployed_at) FROM releases r "  # nosec B608
+        "WHERE r.status = 'success' "
+        "AND LOWER(TRIM(r.deployed_sha)) = LOWER(TRIM(pm.released_sha))) AS d "
+        f"FROM ({tree}) AS tr "
+        "JOIN pipeline_merges pm ON pm.id = (SELECT MAX(p2.id) FROM pipeline_merges p2 "
+        "WHERE p2.task_id = tr.id AND TRIM(COALESCE(p2.released_sha, '')) != ''))",
+        (task_id,),
+    )
+    return str(rows[0]["at"]) if rows and rows[0]["at"] else None
+
+
 async def pipeline_merge_recorded(
     db: aiosqlite.Connection, task_id: int, pr_number: int
 ) -> bool:

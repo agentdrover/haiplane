@@ -780,3 +780,28 @@ async def test_queue_never_hands_out_a_task_with_open_children(db, monkeypatch):
     assert not result.launched
     assert result.reason.startswith(el.REASON_NO_CANDIDATE), result
     assert len(calls) == 1, "провайдер на фичу не вызван"
+
+
+async def test_a_deferred_task_is_skipped_until_the_wait_lapses(db):
+    """#1527: отложенную задачу (действующее ожидание #957) очередь не берёт —
+    ни показ, ни запуск исполнителя; просроченное ожидание задачу не держит."""
+    project = await _project(db, "oq-deferred", {"orchestrator_queue": "shadow"})
+    pid = int(project["id"])
+    deferred = await _task(db, pid, areas=["hub/d.py"], priority="critical")
+    free = await _task(db, pid, areas=["hub/f.py"], priority="low")
+    await db.execute(
+        "UPDATE tasks SET waiting_for='ответ', waiting_until='2999-01-01 00:00:00' "
+        "WHERE id=?",
+        (deferred,),
+    )
+    await db.commit()
+
+    answer = await oq.next_task(db, project)
+    assert answer["next_task_id"] == free, answer
+    assert _skip(answer, deferred)["reason"] == oq.SKIP_DEFERRED
+
+    await db.execute(
+        "UPDATE tasks SET waiting_until='2000-01-01 00:00:00' WHERE id=?", (deferred,)
+    )
+    await db.commit()
+    assert (await oq.next_task(db, project))["next_task_id"] == deferred
