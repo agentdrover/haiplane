@@ -2599,6 +2599,10 @@ class TaskView(BaseModel):
     # (path, with_task_id, with_path, detail). None means none was found or
     # the check is off; in require the overlap is a refusal, not this field.
     area_check: dict[str, Any] | None = None
+    # #1515: where this task's worktree goes, as a template relative to the
+    # caller's clone. Set on claim and pair-start only; the hub cannot know the
+    # clone's folder name, so the exact path comes from `hp-hub worktree`.
+    worktree_hint: str = ""
     # #485: who blocks this task and whom it unblocks. None means no edges at
     # all, which is not the same as "edges, but empty".
     dependencies: "TaskDependencies | None" = None

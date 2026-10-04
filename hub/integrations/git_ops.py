@@ -422,6 +422,167 @@ async def _worktree_registered(path: str, repo: str) -> bool:
     return False
 
 
+def worktree_hint(task_id: int) -> str:
+    """Where a task's worktree goes, as a template the caller can read (#1515).
+
+    The hub does not know the folder name of the caller's clone (the project
+    repo agentdrover/Spike_bo may live in a clone called spike_bo), so it can
+    name only the shape. The shape is cut from ``_worktree_path`` itself with a
+    placeholder clone name: there is no second formula to drift from it.
+    """
+    template = _worktree_path(task_id, "/<имя вашего клона>")
+    return (
+        f"..{template} — шаблон относительно основного клона; "
+        f"точный путь строит и создаёт `hp-hub worktree {task_id}`"
+    )
+
+
+def repo_slug(remote: str) -> str:
+    """``owner/name`` of a remote URL or a bare ``owner/name``, lower-cased (#1515).
+
+    Compares an origin (https, ssh or scp form) with the repo a project names.
+    Case is ignored: forges treat owner and name case-insensitively.
+    """
+    text = (remote or "").strip().rstrip("/")
+    text = text.removesuffix(".git")
+    text = text.replace(":", "/") if "://" not in text else text.split("://", 1)[1]
+    parts = [p for p in text.split("/") if p]
+    return "/".join(parts[-2:]).lower()
+
+
+async def clone_root(start: str) -> str:
+    """Main clone of the git checkout at ``start``; ``""`` when there is none.
+
+    Asked from inside a task worktree it still answers with the MAIN clone: the
+    #459 path is a sibling of the clone, never of another worktree (#1515).
+    """
+    if not os.path.isdir(start):
+        return ""
+    rc, out, _ = await _git(
+        "rev-parse", "--path-format=absolute", "--git-common-dir",
+        repo=start, check=False,
+    )  # fmt: skip
+    common = out.strip()
+    if rc != 0 or os.path.basename(common) != ".git":
+        return ""
+    return os.path.dirname(common)
+
+
+async def origin_url(clone: str) -> str:
+    """The clone's ``origin`` URL; ``""`` when it has none (#1515)."""
+    rc, out, _ = await _git("remote", "get-url", "origin", repo=clone, check=False)
+    return out.strip() if rc == 0 else ""
+
+
+class WorktreeRefused(Exception):
+    """A task worktree was not created or reused; nothing was touched (#1515)."""
+
+
+async def _fetch_for_worktree(
+    repo: str, branch: str, base: str, notes: list[str]
+) -> None:
+    """Best-effort fetch of the task branch and base before a new copy (#1515).
+
+    A failure is not a refusal, but it is named in ``notes``: the copy is then
+    cut from what the clone already has, which may be stale. Whether the task
+    branch exists on origin is asked with ``ls-remote --heads`` (rc 0 and empty
+    output: absent, as in ``_refresh_remote_ref``), never read from git's
+    stderr, which follows the user's locale. An absent branch is the normal
+    state of a task not yet pushed: no fetch and no note. The base is fetched
+    always, so a missing base is a real warning.
+    """
+    for name in (branch, base):
+        if name == branch:
+            rc, out, err = await _git(
+                "ls-remote", "--heads", "origin", f"refs/heads/{name}",
+                repo=repo, check=False, timeout=30,
+            )  # fmt: skip
+            if rc == 0 and not out.strip():
+                continue
+            if rc != 0:
+                notes.append(
+                    f"fetch origin {name} не удался (ls-remote: "
+                    f"{(err or '').strip()[:200] or rc}): "
+                    f"копия строится по тому, что уже есть в клоне"
+                )
+                continue
+        rc, _, err = await _git(
+            "fetch",
+            "origin",
+            f"+refs/heads/{name}:refs/remotes/origin/{name}",
+            repo=repo,
+            check=False,
+            timeout=30,
+        )
+        if rc != 0:
+            notes.append(
+                f"fetch origin {name} не удался ({(err or '').strip()[:200] or rc}): "
+                f"копия строится по тому, что уже есть в клоне"
+            )
+
+
+async def ensure_task_worktree(
+    task_id: int,
+    branch: str,
+    repo: str,
+    base: str,
+    notes: list[str] | None = None,
+) -> str:
+    """Create or reuse the task's worktree at the #459 path; return the path.
+
+    A new copy takes the task branch from, in order: the local branch, the
+    branch on origin (tracking it, so work already pushed is not lost), the
+    base. Fetch failures are appended to ``notes``.
+
+    Reuses a registered worktree of ``repo`` that is already on ``branch``.
+    Refuses — changing nothing — when the path holds anything else: another
+    branch (its dirty files are named), or a directory git does not know.
+    Never deletes and never switches a branch.
+    """
+    wt_path = _worktree_path(task_id, repo)
+    await _git("worktree", "prune", repo=repo, check=False)
+    if os.path.lexists(wt_path):
+        if not (await _worktree_registered(wt_path, repo) and os.path.isdir(wt_path)):
+            raise WorktreeRefused(
+                f"{wt_path} существует, но не копия клона {repo}; ничего не изменено"
+            )
+        _, cur, _ = await _git("branch", "--show-current", repo=wt_path, check=False)
+        cur = (cur or "").strip()
+        if cur == branch:
+            return wt_path
+        dirty, files = await _dirty_state(wt_path)
+        state = (
+            f"с незакоммиченными правками ({_name_dirty_files(files)})"
+            if dirty.strip()
+            else "без правок"
+        )
+        raise WorktreeRefused(
+            f"копия {wt_path} стоит на ветке {cur or '(detached)'!r} {state}, "
+            f"а ветка задачи — {branch!r}; ничего не изменено"
+        )
+    os.makedirs(os.path.dirname(wt_path), exist_ok=True)
+    await _fetch_for_worktree(repo, branch, base, notes if notes is not None else [])
+    args: tuple[str, ...]
+    rc, _, _ = await _git("rev-parse", "--verify", branch, repo=repo, check=False)
+    if rc == 0:
+        args = ("worktree", "add", wt_path, branch)
+    else:
+        remote = f"refs/remotes/origin/{branch}"
+        rc, _, _ = await _git("rev-parse", "--verify", remote, repo=repo, check=False)
+        if rc == 0:
+            args = ("worktree", "add", "-b", branch, wt_path, remote)
+        else:
+            rc, _, _ = await _git("rev-parse", "--verify", base, repo=repo, check=False)
+            start = base if rc == 0 else f"origin/{base}"
+            args = ("worktree", "add", "-b", branch, wt_path, start)
+    rc, _, err = await _git(*args, repo=repo, check=False)
+    if rc != 0:
+        raise WorktreeRefused(
+            f"git не создал копию {wt_path}: {(err or '').strip() or 'worktree add'}"
+        )
+    return wt_path
+
+
 async def _default_workspace_error() -> str | None:
     """Readable reason when the default-project workspace is unusable (#378).
 

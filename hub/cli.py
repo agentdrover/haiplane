@@ -2112,6 +2112,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_clocks.add_argument("--since-days", type=int, default=90)
     p_clocks.set_defaults(func=cmd_defect_clocks)
     _add_defect_metric_parsers(sub)
+    _add_worktree_parser(sub)
 
     p_answer = sub.add_parser(
         "answer-outcome",
@@ -3012,6 +3013,85 @@ def build_parser() -> argparse.ArgumentParser:
     p_tpl.set_defaults(func=cmd_template)
 
     return parser
+
+
+def _worktree_refusal(task: dict[str, Any], project: dict[str, Any], clone: str) -> str:
+    """Why ``clone`` is not the project's clone; ``""`` when it is (#1515)."""
+    import asyncio
+
+    from hub.integrations.git_ops import origin_url, repo_slug
+
+    want = repo_slug(str(project.get("repo") or ""))
+    if not want:
+        return (
+            f"у проекта задачи #{task.get('id')} не задан repo: сверить клон не с чем"
+        )
+    origin = asyncio.run(origin_url(clone))
+    if not origin:
+        return f"у клона {clone} нет remote origin: сверить с repo проекта нечем"
+    if repo_slug(origin) != want:
+        return (
+            f"origin клона {clone} — {repo_slug(origin)}, а repo проекта задачи "
+            f"#{task.get('id')} — {want}; это не тот клон"
+        )
+    return ""
+
+
+def cmd_worktree(args: argparse.Namespace) -> int:
+    """Create or reuse the task's worktree at the #459 path and print it (#1515)."""
+    import asyncio
+
+    from hub.integrations.git_ops import (
+        WorktreeRefused,
+        canonical_task_branch,
+        clone_root,
+        ensure_task_worktree,
+    )
+
+    clone = asyncio.run(clone_root(args.repo or "."))
+    if not clone:
+        print(f"{args.repo or '.'} не git-клон: нечего сверять", file=sys.stderr)
+        return 1
+    task = _api("GET", f"/api/tasks/{args.task_id}")
+    pid = (task.get("project") or {}).get("id")
+    projects = _api("GET", "/api/projects?include_archived=true") or []
+    project: dict[str, Any] = next((p for p in projects if p.get("id") == pid), {})
+    reason = _worktree_refusal(task, project, clone)
+    if reason:
+        print(f"отказ: {reason}", file=sys.stderr)
+        return 1
+    branch = task.get("branch") or canonical_task_branch(
+        args.task_id, "", task.get("title") or ""
+    )
+    notes: list[str] = []
+    try:
+        path = asyncio.run(
+            ensure_task_worktree(
+                args.task_id,
+                branch,
+                clone,
+                project.get("default_branch") or "develop",
+                notes,
+            )
+        )
+    except WorktreeRefused as exc:
+        print(f"отказ: {exc}", file=sys.stderr)
+        return 1
+    for note in notes:
+        print(f"предупреждение: {note}", file=sys.stderr)
+    print(path)
+    return 0
+
+
+def _add_worktree_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling (#1515)."""
+    p = sub.add_parser(
+        "worktree",
+        help="Create/reuse the task worktree at the hub's rule path and print it",
+    )
+    p.add_argument("task_id", type=int)
+    p.add_argument("--repo", default="", help="Clone path (default: current git clone)")
+    p.set_defaults(func=cmd_worktree)
 
 
 def main() -> int:
