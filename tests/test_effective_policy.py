@@ -23,7 +23,12 @@ from httpx import AsyncClient
 from hub import cli, config, mcp_server
 from hub import repository as repo
 from hub.models import GATE_POLICY_KEYS
-from hub.services import effective_policy, project_policy
+from hub.services import auto_approve, effective_policy, project_policy
+from tests.test_auto_approve import (
+    _draft_in_project,
+    _project as _auto_project,
+    _refine_to_dor,
+)
 
 SECRET = "SECRET-MARKER-1457-do-not-print"  # pragma: allowlist secret
 
@@ -590,3 +595,22 @@ def test_solvers_answer_as_the_raw_comparison_did(value):
     assert project_policy.verdict_is_delegated({"verdict": value}) is delegated
     assert project_policy.verdict_is_delegated({}) is False
     assert project_policy.verdict_is_delegated("junk") is False  # type: ignore[arg-type]
+
+
+async def test_auto_approve_decides_dor_with_the_summary_reader(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # #1558 AC-2: ONE reader answers for the gate and for the summary.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _auto_project(db, "dor-one-reader", {"dor": "auto"})
+    project = await repo.get_project(db, pid)
+    summary = effective_policy.REGISTRY["dor"]
+    assert summary.read({"dor": "auto"}) == "auto"
+
+    # Replace the reader everywhere it is looked up: both sides follow it.
+    monkeypatch.setattr(project_policy, "gate_value_of", lambda p, g: "probe")
+    monkeypatch.setattr(auto_approve, "gate_value_of", project_policy.gate_value_of)
+    assert summary.read(project_policy.gate_policy_of(project)) == "probe"
+    task_id = await _draft_in_project(client, db, pid)
+    body = await _refine_to_dor(client, task_id, ["docs/notes.md"])
+    assert body["status"] == "draft", "the gate follows the same reader"

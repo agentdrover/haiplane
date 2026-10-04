@@ -16,7 +16,7 @@ from httpx import AsyncClient
 
 from hub import config
 from hub import repository as repo
-from hub.services import auto_approve, refinement
+from hub.services import refinement
 
 _DOR_READY = {
     "work_type": "feature",
@@ -795,24 +795,3 @@ async def test_dor_autopilot_answers_as_the_raw_comparison_did(
     task_id = await _draft_in_project(client, db, pid)
     body = await _refine_to_dor(client, task_id, ["docs/notes.md"])
     assert body["status"] == ("open" if approves else "draft")
-
-
-async def test_auto_approve_decides_dor_with_the_summary_reader(
-    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
-) -> None:
-    # #1558 AC-2: ONE reader answers for the gate and for the summary.
-    from hub.services import effective_policy, project_policy
-
-    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
-    pid = await _project(db, "dor-one-reader", {"dor": "auto"})
-    project = await repo.get_project(db, pid)
-    summary = effective_policy.REGISTRY["dor"]
-    assert summary.read({"dor": "auto"}) == "auto"
-
-    # Replace the reader everywhere it is looked up: both sides follow it.
-    monkeypatch.setattr(project_policy, "gate_value_of", lambda p, g: "probe")
-    monkeypatch.setattr(auto_approve, "gate_value_of", project_policy.gate_value_of)
-    assert summary.read(project_policy.gate_policy_of(project)) == "probe"
-    task_id = await _draft_in_project(client, db, pid)
-    body = await _refine_to_dor(client, task_id, ["docs/notes.md"])
-    assert body["status"] == "draft", "the gate follows the same reader"
