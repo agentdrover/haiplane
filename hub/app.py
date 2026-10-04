@@ -1213,6 +1213,22 @@ async def api_effective_policy(slug: str, request: Request) -> dict:
     return await effective_policy.effective_policy(db, project)
 
 
+@app.get("/api/projects/{slug}/path")
+async def api_project_path(slug: str, request: Request, days: int = 30) -> dict:
+    """Критический путь по эпикам и очередь с причинами (#1527).
+
+    Один расчёт на страницу проекта, входящие и hub_my_context: путь по
+    depends_on с весом в шагах (не днях), узкое место, шаги человека, очередь
+    по группам и следующая задача по правилу очереди оркестратора. Ничего не
+    пишет.
+    """
+    from hub.services import project_path
+
+    db = _db(request)
+    project = _row_or_404(await repo.get_project_by_slug(db, slug), "project not found")
+    return await project_path.compute(db, project, days=max(1, min(days, 365)))
+
+
 @app.post("/api/projects/{slug}/executor-launch")
 async def api_executor_launch(
     slug: str,

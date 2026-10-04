@@ -528,10 +528,22 @@ def _add_effective_policy_parser(sub: Any) -> None:
     p_policy.set_defaults(func=cmd_effective_policy)
 
 
+def _add_path_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling (#1527)."""
+    p_path = sub.add_parser(
+        "path",
+        help="Critical path per epic and the queue with reasons (#1527)",
+    )
+    p_path.add_argument("slug", help="Project slug")
+    p_path.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_path.set_defaults(func=cmd_path)
+
+
 def _add_defect_metric_parsers(sub: Any) -> None:
     """Defect metric sections (#918, #914) and the policy view (#1457): one call
     from build_parser, which sits at its complexity ceiling."""
     _add_effective_policy_parser(sub)
+    _add_path_parser(sub)
     _add_change_failure_rate_parser(sub)
     _add_shift_left_parser(sub)
     _add_practice_metrics_parser(sub)
@@ -1525,6 +1537,18 @@ def cmd_slots(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     print("\n".join(format_occupancy(result)))
+    return 0
+
+
+def cmd_path(args: argparse.Namespace) -> int:
+    """Критический путь и очередь с причинами проекта (#1527)."""
+    from hub.services.project_path import format_path
+
+    result = _api("GET", f"/api/projects/{urllib.parse.quote(args.slug, safe='')}/path")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print("\n".join(format_path(result)))
     return 0
 
 
