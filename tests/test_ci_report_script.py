@@ -793,3 +793,49 @@ def test_all_present_nodeids_report_as_before(script, inner_suite):
         "one failing case fails the parametrized AC"
     )
     assert len(calls) == 1, "nothing missing: no extra pytest start"
+
+
+def test_a_missing_file_takes_only_its_own_ids_out(script, inner_suite, capsys):
+    """#1581 round 2: pytest names a missing FILE, not the ids inside it."""
+    passing = f"{inner_suite}::test_passes"
+    gone = ["no_such_dir/test_gone.py::test_x", "no_such_dir/test_gone.py::test_y"]
+
+    result = script.run_nodeids([gone[0], passing, gone[1]])
+
+    assert result == {passing: True}, (
+        "both ids of the absent file are not_found, the existing one is pass"
+    )
+    assert "test_gone.py" in capsys.readouterr().out
+
+
+def test_a_missing_file_and_a_missing_test_each_get_their_own_outcome(
+    script, inner_suite, capsys
+):
+    passing = f"{inner_suite}::test_passes"
+    failing = f"{inner_suite}::test_fails"
+    no_test = f"{inner_suite}::test_typo"
+    no_file = "no_such_dir/test_gone.py::test_x"
+
+    result = script.run_nodeids([no_file, passing, no_test, failing])
+
+    assert result == {passing: True, failing: False}
+    out = capsys.readouterr().out
+    assert "test_typo" in out and "test_gone.py" in out
+
+
+def test_a_pytest_failure_naming_nothing_is_not_retried(script, monkeypatch):
+    """No named missing id: behave as before, one run, no loop."""
+    calls = []
+
+    class Proc:
+        stdout = "collecting ... \nno tests ran\n"
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return Proc()
+
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", "python3 -m pytest")
+    monkeypatch.setattr(script.subprocess, "run", fake_run)
+    assert script.run_nodeids(["t.py::a", "t.py::b"]) == {}
+    assert len(calls) == 1

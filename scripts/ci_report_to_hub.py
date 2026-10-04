@@ -162,23 +162,34 @@ def ac_runner() -> list[str]:
 # pytest names an id it cannot resolve on its own line and then stops
 # collecting: "no tests ran", with the rest of the ids unrun.
 _NOT_FOUND_LINE = re.compile(
-    r"^ERROR: (?:file or directory not found|not found): (\S+)", re.MULTILINE
+    r"^ERROR: (file or directory not found|not found): (\S+)", re.MULTILINE
 )
+
+
+def _same_path(reported: str, wanted: str) -> bool:
+    """Equal, or one is the other with a directory prefix (pytest may print an
+    absolute path for a relative argument)."""
+    return reported == wanted or reported.endswith("/" + wanted)
 
 
 def _missing_nodeids(output: str, nodeids: list[str]) -> dict[str, str]:
     """{nodeid: reason} for the ids pytest said it could not find.
 
-    pytest echoes the id as given or with an absolute path in front, so a match
-    is the id itself or the id as a path suffix.
+    "not found: <id>" names one test id. "file or directory not found: <path>"
+    names a whole file (with or without a ``::test`` tail), so every id living
+    in that file is missing with it.
     """
     missing: dict[str, str] = {}
     for match in _NOT_FOUND_LINE.finditer(output):
-        reported = match.group(1)
+        kind, reported = match.groups()
+        reason = match.group(0).removeprefix("ERROR: ")
         for nodeid in nodeids:
-            if reported == nodeid or reported.endswith("/" + nodeid):
-                line = match.group(0)
-                missing[nodeid] = line.removeprefix("ERROR: ")
+            if kind == "not found":
+                hit = _same_path(reported, nodeid)
+            else:
+                hit = _same_path(reported.split("::", 1)[0], nodeid.split("::", 1)[0])
+            if hit:
+                missing[nodeid] = reason
     return missing
 
 
