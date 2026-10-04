@@ -353,6 +353,19 @@ async def _apply_refine_writes(
         # быть, а потому что реестр правят руками.
         validate_declared_probe(payload.live_probe)
 
+    # #1565: found_in='prod' on a feature, judged on the FINAL work_type (the
+    # one in this payload, else the stored one) BEFORE anything is written —
+    # a work_type=feature sent for a prod defect has no passport key to hang
+    # the check on later. One funnel for refine, refine-bulk, MCP and CLI.
+    problem = await repo.defect_stage_problem(
+        db,
+        task_id,
+        work_type=payload.work_type.value if payload.work_type is not None else None,
+        found_in=payload.found_in.value if payload.found_in is not None else None,
+    )
+    if problem:
+        raise repo.DefectPassportError(problem)
+
     # #616: both the single and the bulk flow funnel through here, so the
     # statement date is stamped in ONE place — verified by enumerating every
     # caller rather than by assuming this is the only one.

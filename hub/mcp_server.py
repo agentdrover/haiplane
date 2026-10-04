@@ -5130,9 +5130,9 @@ async def hub_refine_task(
         redesign_decision: adapt | redesign.
         redesign_rationale: Why that choice.
         agent_fit: deterministic | assistant | sdd_native | agentic.
-        found_in: Defect stage: unknown | review | ci | test | staging | prod.
-        caused_by_task_id: Task that introduced the defect.
-        technical_hints: Hints, references, approach.
+        found_in: Defect stage: unknown | review | ci | test | staging | prod (prod: not feature).
+        caused_by_task_id: Task that caused the defect.
+        technical_hints: Hints, approach.
         scope_in: In scope.
         scope_out: Out of scope.
         constraints: Hard limits.
