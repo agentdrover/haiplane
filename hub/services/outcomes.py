@@ -26,6 +26,7 @@ import aiosqlite
 
 from hub import repository
 from hub.models import OutcomeHypothesisStatus, OutcomeVerdict
+from hub.services import project_policy
 
 
 def _days_since(stamp: str | None) -> int | None:
@@ -136,27 +137,30 @@ async def resolve_outcome_status(
     db: aiosqlite.Connection,
     task: dict[str, Any],
     answers: list[dict[str, Any]],
-) -> tuple[OutcomeHypothesisStatus, str | None]:
+) -> tuple[OutcomeHypothesisStatus, str | None, bool]:
     """The one place a task's outcome status and due date are decided (#1568).
 
     The card, the review brief and the debt list all call this, so they cannot
-    disagree. Returns the status and ``due_on`` (an ISO date, or None).
+    disagree. Returns the status, ``due_on`` (an ISO date, or None) and
+    ``assumed``: True when the date counts from a merge the owner declared a
+    delivery (``merge_is_delivery``, #1572), not from a recorded deploy.
     """
-    fix_at: str | None = None
+    fix = repository.FixDeploy(None)
     if task.get("status") == "completed":
-        fix_at = await repository.first_fix_deploy_at(
+        fix = await repository.first_fix_deploy_at(
             db,
             int(task["id"]),
             with_descendants=str(task.get("task_type") or "") in _ROLLUP_TYPES,
+            delivery_projects=await project_policy.merge_is_delivery_projects(db),
         )
     status = derive_outcome_status(
         outcome_metric=str(task.get("outcome_metric") or ""),
         answers=answers,
-        fix_released_at=fix_at,
+        fix_released_at=fix.at,
         task_status=str(task.get("status") or ""),
     )
-    due = outcome_due_at(fix_at)
-    return status, due.date().isoformat() if due else None
+    due = outcome_due_at(fix.at)
+    return status, due.date().isoformat() if due else None, bool(due and fix.assumed)
 
 
 async def outcome_status_for_task(
@@ -167,7 +171,7 @@ async def outcome_status_for_task(
         _answer_view(row)
         for row in await repository.list_outcome_answers_for_task(db, int(task["id"]))
     ]
-    status, _ = await resolve_outcome_status(db, task, answers)
+    status, _, _ = await resolve_outcome_status(db, task, answers)
     return status
 
 
@@ -185,7 +189,7 @@ async def outcome_debt(db: aiosqlite.Connection) -> dict[str, Any]:
     for row in rows:
         finished = row["completed_at"] or row["updated_at"]
         task_answers = answers.get(row["id"], [])
-        status, due_on = await resolve_outcome_status(
+        status, due_on, assumed = await resolve_outcome_status(
             db, {**dict(row), "status": "completed"}, task_answers
         )
         entry = {
@@ -201,6 +205,7 @@ async def outcome_debt(db: aiosqlite.Connection) -> dict[str, Any]:
             "days_unanswered": _days_since(finished),
             "outcome_status": status.value,
             "due_on": due_on,
+            "due_assumed": assumed,
         }
         if not task_answers:
             items.append(entry)
@@ -241,7 +246,10 @@ async def outcome_debt(db: aiosqlite.Connection) -> dict[str, Any]:
             "unreleased merge, or a release the hub never saw) - a gap in "
             "the record, not a debt. The due date is a machine fact, not a "
             "parse of outcome_deadline: that is free text and is not used for "
-            "filtering, so nothing is hidden behind a value that cannot be parsed."
+            "filtering, so nothing is hidden behind a value that cannot be parsed. "
+            "`due_assumed`: the date counts from the merge, because the project "
+            "declared merge = delivery (gate_policy `merge_is_delivery`), not from "
+            "a recorded deploy."
         ),
     }
 
