@@ -484,10 +484,28 @@ async def _fetch_for_worktree(
     """Best-effort fetch of the task branch and base before a new copy (#1515).
 
     A failure is not a refusal, but it is named in ``notes``: the copy is then
-    cut from what the clone already has, which may be stale. A branch that is
-    simply absent on origin is the normal state of a task not yet pushed.
+    cut from what the clone already has, which may be stale. Whether the task
+    branch exists on origin is asked with ``ls-remote --heads`` (rc 0 and empty
+    output: absent, as in ``_refresh_remote_ref``), never read from git's
+    stderr, which follows the user's locale. An absent branch is the normal
+    state of a task not yet pushed: no fetch and no note. The base is fetched
+    always, so a missing base is a real warning.
     """
     for name in (branch, base):
+        if name == branch:
+            rc, out, err = await _git(
+                "ls-remote", "--heads", "origin", f"refs/heads/{name}",
+                repo=repo, check=False, timeout=30,
+            )  # fmt: skip
+            if rc == 0 and not out.strip():
+                continue
+            if rc != 0:
+                notes.append(
+                    f"fetch origin {name} не удался (ls-remote: "
+                    f"{(err or '').strip()[:200] or rc}): "
+                    f"копия строится по тому, что уже есть в клоне"
+                )
+                continue
         rc, _, err = await _git(
             "fetch",
             "origin",
@@ -496,7 +514,7 @@ async def _fetch_for_worktree(
             check=False,
             timeout=30,
         )
-        if rc != 0 and "couldn't find remote ref" not in (err or ""):
+        if rc != 0:
             notes.append(
                 f"fetch origin {name} не удался ({(err or '').strip()[:200] or rc}): "
                 f"копия строится по тому, что уже есть в клоне"

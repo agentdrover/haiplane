@@ -2760,5 +2760,52 @@ def test_worktree_command_names_a_failed_fetch_and_still_creates(
     )
     assert _run_worktree(clone) == 0
     captured = capsys.readouterr()
-    assert "предупреждение: fetch origin" in captured.err
+    assert f"предупреждение: fetch origin {branch} не удался" in captured.err
+    assert "предупреждение: fetch origin develop не удался" in captured.err
     assert _sh(Path(captured.out.strip()), "branch", "--show-current") == branch
+
+
+def _fetch_failing_git(monkeypatch, stderr: str) -> None:
+    """Make every ``git fetch`` of a worktree request fail with ``stderr``."""
+    from hub.integrations import git_ops
+
+    real = git_ops._git
+
+    async def fake(*args: str, **kw: Any):
+        if args and args[0] == "fetch":
+            return 128, "", stderr
+        return await real(*args, **kw)
+
+    monkeypatch.setattr(git_ops, "_git", fake)
+
+
+def test_worktree_absent_branch_gives_no_note_under_a_foreign_locale(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    # #1515: "branch absent on origin" is asked of ls-remote, not read from the
+    # text of git's stderr, which is localised. A fetch of the branch must not
+    # even be attempted: the only fetch that may fail here is the base's.
+    branch = _fake_hub(monkeypatch)
+    origin = _bare_origin(tmp_path, "agentdrover/Spike_bo")
+    clone = _clone(tmp_path, "spike_bo", origin)
+    _sh(clone, "push", "-q", "origin", "develop")
+    _fetch_failing_git(monkeypatch, "fatal: не удалось найти удалённую ссылку")
+    assert _run_worktree(clone) == 0
+    captured = capsys.readouterr()
+    assert f"fetch origin {branch}" not in captured.err
+    assert "предупреждение" in captured.err  # the base fetch failure only
+    assert "fetch origin develop" in captured.err
+
+
+def test_worktree_real_fetch_failure_of_an_existing_branch_is_named(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    branch = _fake_hub(monkeypatch)
+    origin = _bare_origin(tmp_path, "agentdrover/Spike_bo")
+    clone = _clone(tmp_path, "spike_bo", origin)
+    _sh(clone, "push", "-q", "origin", f"develop:refs/heads/{branch}")
+    _fetch_failing_git(monkeypatch, "fatal: boom")
+    assert _run_worktree(clone) == 0
+    assert f"предупреждение: fetch origin {branch} не удался" in (
+        capsys.readouterr().err
+    )
