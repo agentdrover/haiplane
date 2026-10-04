@@ -478,8 +478,43 @@ class WorktreeRefused(Exception):
     """A task worktree was not created or reused; nothing was touched (#1515)."""
 
 
-async def ensure_task_worktree(task_id: int, branch: str, repo: str, base: str) -> str:
+async def _fetch_for_worktree(
+    repo: str, branch: str, base: str, notes: list[str]
+) -> None:
+    """Best-effort fetch of the task branch and base before a new copy (#1515).
+
+    A failure is not a refusal, but it is named in ``notes``: the copy is then
+    cut from what the clone already has, which may be stale. A branch that is
+    simply absent on origin is the normal state of a task not yet pushed.
+    """
+    for name in (branch, base):
+        rc, _, err = await _git(
+            "fetch",
+            "origin",
+            f"+refs/heads/{name}:refs/remotes/origin/{name}",
+            repo=repo,
+            check=False,
+            timeout=30,
+        )
+        if rc != 0 and "couldn't find remote ref" not in (err or ""):
+            notes.append(
+                f"fetch origin {name} не удался ({(err or '').strip()[:200] or rc}): "
+                f"копия строится по тому, что уже есть в клоне"
+            )
+
+
+async def ensure_task_worktree(
+    task_id: int,
+    branch: str,
+    repo: str,
+    base: str,
+    notes: list[str] | None = None,
+) -> str:
     """Create or reuse the task's worktree at the #459 path; return the path.
+
+    A new copy takes the task branch from, in order: the local branch, the
+    branch on origin (tracking it, so work already pushed is not lost), the
+    base. Fetch failures are appended to ``notes``.
 
     Reuses a registered worktree of ``repo`` that is already on ``branch``.
     Refuses — changing nothing — when the path holds anything else: another
@@ -508,14 +543,20 @@ async def ensure_task_worktree(task_id: int, branch: str, repo: str, base: str) 
             f"а ветка задачи — {branch!r}; ничего не изменено"
         )
     os.makedirs(os.path.dirname(wt_path), exist_ok=True)
-    rc, _, _ = await _git("rev-parse", "--verify", branch, repo=repo, check=False)
+    await _fetch_for_worktree(repo, branch, base, notes if notes is not None else [])
     args: tuple[str, ...]
+    rc, _, _ = await _git("rev-parse", "--verify", branch, repo=repo, check=False)
     if rc == 0:
         args = ("worktree", "add", wt_path, branch)
     else:
-        rc, _, _ = await _git("rev-parse", "--verify", base, repo=repo, check=False)
-        start = base if rc == 0 else f"origin/{base}"
-        args = ("worktree", "add", "-b", branch, wt_path, start)
+        remote = f"refs/remotes/origin/{branch}"
+        rc, _, _ = await _git("rev-parse", "--verify", remote, repo=repo, check=False)
+        if rc == 0:
+            args = ("worktree", "add", "-b", branch, wt_path, remote)
+        else:
+            rc, _, _ = await _git("rev-parse", "--verify", base, repo=repo, check=False)
+            start = base if rc == 0 else f"origin/{base}"
+            args = ("worktree", "add", "-b", branch, wt_path, start)
     rc, _, err = await _git(*args, repo=repo, check=False)
     if rc != 0:
         raise WorktreeRefused(

@@ -2582,6 +2582,14 @@ def _clone(tmp_path: Path, name: str, origin: str) -> Path:
     return repo
 
 
+def _bare_origin(tmp_path: Path, slug: str) -> str:
+    """A local bare repo whose path ends in ``owner/name``: a no-network origin."""
+    path = tmp_path / "origins" / f"{slug}.git"
+    path.mkdir(parents=True)
+    _sh(path, "init", "-q", "--bare")
+    return str(path)
+
+
 def _fake_hub(monkeypatch, *, repo_name: str = "agentdrover/Spike_bo") -> str:
     branch = "task-1429/spike-thing"
 
@@ -2618,7 +2626,7 @@ def test_worktree_command_creates_then_reuses_rule_path(
     # AC-2 (#1515): the path is built from the ACTUAL clone folder (spike_bo),
     # created on the canonical branch, and reused on the second call.
     branch = _fake_hub(monkeypatch)
-    clone = _clone(tmp_path, "spike_bo", "https://github.com/agentdrover/Spike_bo.git")
+    clone = _clone(tmp_path, "spike_bo", _bare_origin(tmp_path, "agentdrover/Spike_bo"))
     expected = tmp_path / ".spike_bo-worktrees" / "task-1429"
 
     assert _run_worktree(clone) == 0
@@ -2705,8 +2713,52 @@ def test_worktree_command_from_inside_a_worktree_uses_the_main_clone(
 ) -> None:
     # #1515: asked from inside a copy, the rule path is still beside the clone.
     _fake_hub(monkeypatch)
-    clone = _clone(tmp_path, "spike_bo", "https://github.com/agentdrover/Spike_bo")
+    clone = _clone(tmp_path, "spike_bo", _bare_origin(tmp_path, "agentdrover/Spike_bo"))
     assert _run_worktree(clone) == 0
     path = capsys.readouterr().out.strip()
     assert _run_worktree(Path(path)) == 0
     assert capsys.readouterr().out.strip() == path
+
+
+def test_worktree_command_takes_the_task_branch_from_origin(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    # #1515: a task branch that exists only on origin is checked out with its
+    # commits (tracking it), not recreated empty from the base.
+    branch = _fake_hub(monkeypatch)
+    origin = _bare_origin(tmp_path, "agentdrover/Spike_bo")
+    clone = _clone(tmp_path, "spike_bo", origin)
+    _sh(clone, "push", "-q", "origin", "develop")
+    other = tmp_path / "other_clone"
+    _sh(tmp_path, "clone", "-q", origin, str(other))
+    _sh(other, "config", "user.email", "t@example.com")
+    _sh(other, "config", "user.name", "Test")
+    _sh(other, "checkout", "-q", "-b", branch)
+    (other / "work.txt").write_text("pushed work")
+    _sh(other, "add", ".")
+    _sh(other, "commit", "-q", "-m", "task work")
+    _sh(other, "push", "-q", "origin", branch)
+    pushed = _sh(other, "rev-parse", "HEAD")
+
+    assert _run_worktree(clone) == 0
+    wt = Path(capsys.readouterr().out.strip())
+    assert _sh(wt, "branch", "--show-current") == branch
+    assert _sh(wt, "rev-parse", "HEAD") == pushed
+    assert (wt / "work.txt").read_text() == "pushed work"
+    assert _sh(wt, "rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}") == (
+        f"origin/{branch}"
+    )
+
+
+def test_worktree_command_names_a_failed_fetch_and_still_creates(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    # #1515: a network failure is a warning, not a refusal.
+    branch = _fake_hub(monkeypatch)
+    clone = _clone(
+        tmp_path, "spike_bo", str(tmp_path / "gone" / "agentdrover" / "Spike_bo")
+    )
+    assert _run_worktree(clone) == 0
+    captured = capsys.readouterr()
+    assert "предупреждение: fetch origin" in captured.err
+    assert _sh(Path(captured.out.strip()), "branch", "--show-current") == branch

@@ -3063,15 +3063,22 @@ def cmd_worktree(args: argparse.Namespace) -> int:
     branch = task.get("branch") or canonical_task_branch(
         args.task_id, "", task.get("title") or ""
     )
+    notes: list[str] = []
     try:
         path = asyncio.run(
             ensure_task_worktree(
-                args.task_id, branch, clone, project.get("default_branch") or "develop"
+                args.task_id,
+                branch,
+                clone,
+                project.get("default_branch") or "develop",
+                notes,
             )
         )
     except WorktreeRefused as exc:
         print(f"отказ: {exc}", file=sys.stderr)
         return 1
+    for note in notes:
+        print(f"предупреждение: {note}", file=sys.stderr)
     print(path)
     return 0
 
