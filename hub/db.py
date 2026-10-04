@@ -2284,6 +2284,13 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE executor_runs ADD COLUMN cancel_last_at TEXT",
     ),
     (
+        # #1563: ссылка, от которой хаб заказал прогон (startingRef провайдера).
+        # NULL — у строк до миграции и у заказа, не дошедшего до записи: «не
+        # записано», а не «база».
+        "add_executor_runs_starting_ref",
+        "ALTER TABLE executor_runs ADD COLUMN starting_ref TEXT",
+    ),
+    (
         # #1420: открытые аварии релиза читаются каждым общим hub_my_context —
         # последнее событие release_blocked/unblocked по проекту без скана ленты.
         "idx_events_kind_project",
