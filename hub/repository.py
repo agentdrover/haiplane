@@ -3850,6 +3850,57 @@ class DefectPassportError(ValueError):
     """
 
 
+# #914 / #1565: work types that cannot carry ``found_in='prod'``. A feature is
+# not a defect: filed as one it lands in ``escaped``, the prod defect clocks and
+# the shift-left prod bucket, which then count work nobody broke. chore, spike,
+# refactor and the rest stay allowed — a CVE bump, a spike on a prod error and a
+# lock fix are real prod-found work.
+PROD_DEFECT_FORBIDDEN_WORK_TYPES = frozenset({"feature"})
+
+
+async def defect_stage_problem(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    work_type: str | None = None,
+    found_in: str | None = None,
+) -> str:
+    """Why the task cannot end up as ``found_in='prod'`` + a forbidden type, or "".
+
+    The ONE rule behind every entrance (refine, refine-bulk, MCP and CLI go
+    through REST refine; ``set_defect_passport`` is the direct writer). The
+    arguments are what the caller is about to write, ``None`` = not sent; the
+    stored value fills the gap, so a partial PATCH is judged on the FINAL pair.
+    A row that already breaks the rule is not refused for an unrelated edit —
+    only a call that sets one of the two fields is judged (#1565 leaves the
+    existing rows to a manual clean-up).
+    """
+    if work_type is None and found_in is None:
+        return ""
+    rows = await fetchall(
+        db, "SELECT work_type, found_in FROM tasks WHERE id = ?", (task_id,)
+    )
+    stored = dict(rows[0]) if rows else {}
+    final_type = work_type if work_type is not None else stored.get("work_type")
+    final_stage = found_in if found_in is not None else stored.get("found_in")
+    if final_stage != "prod" or final_type not in PROD_DEFECT_FORBIDDEN_WORK_TYPES:
+        return ""
+    from hub.models import WorkType
+
+    allowed = ", ".join(
+        t.value for t in WorkType if t.value not in PROD_DEFECT_FORBIDDEN_WORK_TYPES
+    )
+    if work_type is not None and found_in is None:
+        what = f"work_type={final_type} нельзя поставить задаче с found_in='prod'"
+    else:
+        what = f"found_in='prod' запрещён при work_type={final_type}"
+    return (
+        f"{what} (инвариант #914: фича не прод-дефект и портит escaped, "
+        f"prod_defect_clocks и shift_left). Допустимые work_type: {allowed}. "
+        "Если это дефект, поставь work_type=bug в том же вызове."
+    )
+
+
 async def _release_link_problem(
     db: aiosqlite.Connection, task_id: int, release_id: int
 ) -> str:
@@ -3916,6 +3967,11 @@ async def set_defect_passport(
             raise DefectPassportError(
                 f"unknown found_in {found_in!r}; allowed: {allowed}"
             ) from exc
+        stage_problem = await defect_stage_problem(
+            db, task_id, found_in=updates["found_in"]
+        )
+        if stage_problem:
+            raise DefectPassportError(stage_problem)
 
     if clear_caused_by:
         updates["caused_by_task_id"] = None
