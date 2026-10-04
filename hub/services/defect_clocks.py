@@ -148,8 +148,11 @@ SHIFT_LEFT_STAGES = ("review", "ci", "test", "staging", "prod", "unknown")
 
 # What counts as a defect for the shift-left slice: a bug, or any task whose
 # stage was recorded. The second half keeps the prod bucket equal to
-# ``measured_escapes`` — a prod defect filed under another work type is counted
-# in both, never in one only.
+# ``measured_escapes`` — a prod defect filed under another work type (chore,
+# spike, refactor, incident) is counted in both, never in one only. A FEATURE
+# cannot carry ``found_in='prod'`` any more (#1565, ``repo.defect_stage_problem``),
+# so the second half no longer pulls features into either number; rows filed
+# before the rule are the leftovers a manual clean-up removes.
 DEFECT_KIND_SQL = (
     "(t.work_type = 'bug' OR COALESCE(t.found_in, 'unknown') != 'unknown')"
 )

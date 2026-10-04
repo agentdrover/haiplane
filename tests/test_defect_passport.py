@@ -9,6 +9,8 @@ stored.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import aiosqlite
 import pytest
 
@@ -24,10 +26,13 @@ async def _table_columns(conn: aiosqlite.Connection, table: str) -> dict[str, di
     return {row["name"]: dict(row) for row in rows}
 
 
-async def _insert_task(conn: aiosqlite.Connection, title: str) -> int:
+async def _insert_task(
+    conn: aiosqlite.Connection, title: str, work_type: str = "feature"
+) -> int:
     cur = await conn.execute(
-        "INSERT INTO tasks (title, description, status) VALUES (?, '', 'open')",
-        (title,),
+        "INSERT INTO tasks (title, description, status, work_type) "
+        "VALUES (?, '', 'open', ?)",
+        (title, work_type),
     )
     return cur.lastrowid
 
@@ -140,7 +145,7 @@ async def test_new_task_starts_unknown(db):
 
 async def test_set_passport_writes_stage_and_cause(db):
     cause_id = await _insert_task(db, "изменение, которое сломало")
-    defect_id = await _insert_task(db, "дефект с прода")
+    defect_id = await _insert_task(db, "дефект с прода", "bug")
 
     applied = await set_defect_passport(
         db,
@@ -168,7 +173,7 @@ async def test_set_passport_writes_stage_and_cause(db):
 
 
 async def test_partial_write_leaves_the_rest_alone(db):
-    defect_id = await _insert_task(db, "дефект")
+    defect_id = await _insert_task(db, "дефект", "bug")
     await set_defect_passport(
         db, defect_id, found_in="ci", detected_at="2026-08-22 06:00:00"
     )
@@ -186,7 +191,7 @@ async def test_partial_write_leaves_the_rest_alone(db):
 
 
 async def test_invalid_found_in_is_refused(db):
-    defect_id = await _insert_task(db, "дефект")
+    defect_id = await _insert_task(db, "дефект", "bug")
 
     with pytest.raises(DefectPassportError) as exc:
         await set_defect_passport(db, defect_id, found_in="production")
@@ -201,7 +206,7 @@ async def test_invalid_found_in_is_refused(db):
 
 
 async def test_caused_by_must_resolve(db):
-    defect_id = await _insert_task(db, "дефект")
+    defect_id = await _insert_task(db, "дефект", "bug")
 
     with pytest.raises(DefectPassportError) as exc:
         await set_defect_passport(db, defect_id, caused_by_task_id=999_999)
@@ -220,7 +225,7 @@ async def test_stage_write_is_not_applied_when_cause_is_bad(db):
     caller passing both fields would get a stored stage and a refusal in the
     same call.
     """
-    defect_id = await _insert_task(db, "дефект")
+    defect_id = await _insert_task(db, "дефект", "bug")
 
     with pytest.raises(DefectPassportError):
         await set_defect_passport(
@@ -234,7 +239,7 @@ async def test_stage_write_is_not_applied_when_cause_is_bad(db):
 
 
 async def test_task_cannot_cause_itself(db):
-    defect_id = await _insert_task(db, "дефект")
+    defect_id = await _insert_task(db, "дефект", "bug")
 
     with pytest.raises(DefectPassportError):
         await set_defect_passport(db, defect_id, caused_by_task_id=defect_id)
@@ -242,7 +247,7 @@ async def test_task_cannot_cause_itself(db):
 
 async def test_clearing_the_cause_is_explicit(db):
     cause_id = await _insert_task(db, "изменение")
-    defect_id = await _insert_task(db, "дефект")
+    defect_id = await _insert_task(db, "дефект", "bug")
     await set_defect_passport(db, defect_id, caused_by_task_id=cause_id)
 
     # Omitting the field leaves the attribution untouched...
@@ -262,12 +267,12 @@ async def test_clearing_the_cause_is_explicit(db):
 
 
 async def test_empty_call_writes_nothing(db):
-    defect_id = await _insert_task(db, "дефект")
+    defect_id = await _insert_task(db, "дефект", "bug")
     assert await set_defect_passport(db, defect_id) == {}
 
 
 async def test_validate_caused_by_allows_none(db):
-    defect_id = await _insert_task(db, "дефект")
+    defect_id = await _insert_task(db, "дефект", "bug")
     assert await validate_caused_by(db, defect_id, None) is None
 
 
@@ -277,7 +282,7 @@ async def test_passport_is_visible_in_task_view(db):
     from hub.services import row_to_task
 
     cause_id = await _insert_task(db, "изменение")
-    defect_id = await _insert_task(db, "дефект")
+    defect_id = await _insert_task(db, "дефект", "bug")
     await set_defect_passport(
         db,
         defect_id,
@@ -462,3 +467,148 @@ def test_cli_clear_caused_by_is_a_verb():
         "clear_caused_by": True
     }
     assert _build_refine_payload(argparse.Namespace(clear_caused_by=False)) == {}
+
+
+# ---------------------------------------------------------------------------
+# found_in='prod' is not for features (#1565, invariant #914)
+# ---------------------------------------------------------------------------
+
+
+async def _stored(client, task_id: int) -> dict:
+    return (await client.get(f"/api/tasks/{task_id}")).json()
+
+
+async def test_found_in_prod_rejected_for_feature(client):
+    task_id = await _api_task(client, work_type="feature")
+
+    resp = await client.post(f"/api/tasks/{task_id}/refine", json={"found_in": "prod"})
+
+    assert resp.status_code == 422, resp.text
+    assert "work_type=bug" in resp.text and "#914" in resp.text
+    assert "chore" in resp.text and "spike" in resp.text and "refactor" in resp.text
+    assert (await _stored(client, task_id))["found_in"] == "unknown"
+
+
+async def test_found_in_prod_accepted_for_bug(client):
+    for work_type in ("bug", "chore", "spike", "refactor", "incident"):
+        task_id = await _api_task(client, work_type=work_type)
+        resp = await client.post(
+            f"/api/tasks/{task_id}/refine", json={"found_in": "prod"}
+        )
+        assert resp.status_code == 200, (work_type, resp.text)
+        assert resp.json()["found_in"] == "prod"
+
+
+async def test_found_in_prod_with_work_type_in_same_refine(client):
+    task_id = await _api_task(client, work_type="feature")
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={"work_type": "bug", "found_in": "prod"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["work_type"] == "bug" and body["found_in"] == "prod"
+    # The opposite pair in one call is judged on the final type too.
+    other = await _api_task(client, work_type="bug")
+    bad = await client.post(
+        f"/api/tasks/{other}/refine",
+        json={"work_type": "feature", "found_in": "prod"},
+    )
+    assert bad.status_code == 422, bad.text
+    assert (await _stored(client, other))["work_type"] == "bug"
+
+
+async def test_work_type_feature_rejected_for_prod_defect(client):
+    task_id = await _api_task(client, work_type="bug")
+    await client.post(f"/api/tasks/{task_id}/refine", json={"found_in": "prod"})
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={"work_type": "feature", "problem_statement": "не должно записаться"},
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "found_in='prod'" in resp.text
+    stored = await _stored(client, task_id)
+    assert stored["work_type"] == "bug"
+    assert stored["problem_statement"] == ""
+
+
+async def test_refine_bulk_rolls_back_on_rejected_item(client):
+    good = await _api_task(client, work_type="feature")
+    bad = await _api_task(client, work_type="feature")
+
+    resp = await client.post(
+        "/api/tasks/refine-bulk",
+        json={
+            "items": [
+                {"task_id": good, "work_type": "bug", "found_in": "prod"},
+                {"task_id": bad, "found_in": "prod"},
+            ]
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "work_type=bug" in resp.text
+    first = await _stored(client, good)
+    assert first["work_type"] == "feature" and first["found_in"] == "unknown"
+    assert (await _stored(client, bad))["found_in"] == "unknown"
+
+
+async def test_unrelated_refine_of_legacy_prod_feature_is_not_refused(client, db):
+    """Rows filed before the rule stay editable; only the two fields are judged."""
+    task_id = await _api_task(client, work_type="feature")
+    await db.execute("UPDATE tasks SET found_in='prod' WHERE id=?", (task_id,))
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/refine", json={"problem_statement": "уточнение"}
+    )
+
+    assert resp.status_code == 200, resp.text
+
+
+async def test_set_defect_passport_refuses_prod_for_feature(db):
+    feature_id = await _insert_task(db, "фича")
+    bug_id = await _insert_task(db, "баг", "bug")
+
+    with pytest.raises(DefectPassportError, match="#914"):
+        await set_defect_passport(db, feature_id, found_in="prod")
+    assert await set_defect_passport(db, bug_id, found_in="prod") == {
+        "found_in": "prod"
+    }
+
+
+async def test_mcp_refine_tools_surface_the_refusal(client):
+    """MCP hub_refine_task / hub_refine_tasks reach the same refine funnel."""
+    from hub import mcp_server
+
+    async def _via_asgi(path, body=None, **_kw):
+        resp = await client.post(path, json=body or {})
+        if resp.status_code >= 400:
+            raise mcp_server.HubApiError({"message": resp.text})
+        return resp.json()
+
+    task_id = await _api_task(client, work_type="feature")
+    with patch.object(mcp_server, "_api_post", _via_asgi):
+        with pytest.raises(mcp_server.HubApiError, match="work_type=bug"):
+            await mcp_server.hub_refine_task(task_id, found_in="prod")
+        with pytest.raises(mcp_server.HubApiError, match="work_type=bug"):
+            await mcp_server.hub_refine_tasks(
+                [{"task_id": task_id, "found_in": "prod"}]
+            )
+        await mcp_server.hub_refine_task(task_id, work_type="bug", found_in="prod")
+    assert (await _stored(client, task_id))["found_in"] == "prod"
+
+
+def test_cli_refine_sends_work_type_and_found_in_together():
+    """The CLI must forward both keys: the hub judges the final pair."""
+    import argparse
+
+    from hub.cli import _build_refine_payload
+
+    args = argparse.Namespace(work_type="bug", found_in="prod")
+
+    assert _build_refine_payload(args) == {"work_type": "bug", "found_in": "prod"}
