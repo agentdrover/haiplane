@@ -1,0 +1,33 @@
+# Служба-исполнитель локального ревьюера (#1571). Порядок установки и проба
+# попыткой — deploy/LOCAL-REVIEW.md, раздел «Служба-исполнитель».
+#
+# Идёт ВНЕ изоляции хаба: юнит хаба (ProtectSystem=strict, NoNewPrivileges=yes)
+# не может ни sudo, ни писать в каталог прогонов. Здесь NoNewPrivileges НЕТ
+# намеренно: с ним sudo отказывает («no new privileges flag is set»), и служба
+# бессмысленна. Остальной песочницы тоже нет: врапер и podman под sudo
+# унаследовали бы её и сломались. Защита службы — в её коде: команда берётся
+# только из конфига, задание несёт закрытый список полей (см. docstring
+# haiplane-review-runner.py).
+[Unit]
+Description=Haiplane review runner (launches the local reviewer for the hub)
+After=network.target
+
+[Service]
+Type=simple
+# Пользователь хаба (подставьте имя из User= юнита хаба): sudoers уже разрешает ему ровно `sudo -n -u
+# haiplane-reviewer /usr/local/bin/haiplane-review-run …`, новых прав не нужно.
+User=<пользователь хаба>
+Group=haiplane-review
+EnvironmentFile=/etc/haiplane-review-runner.env
+ExecStart=/usr/bin/python3 /usr/local/lib/haiplane-review-runner/haiplane-review-runner.py
+# Файлы очереди — группе (0660), не миру.
+UMask=0007
+Restart=on-failure
+RestartSec=5
+# Битый конфиг (rc 2) перезапуском не лечится.
+RestartPreventExitStatus=2
+# Служба снимает свой прогон по SIGTERM, ей нужно время (term_grace 10 с).
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

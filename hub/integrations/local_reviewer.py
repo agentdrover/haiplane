@@ -39,16 +39,25 @@ github.com — 201 (измерено 31.08.2026, #1119). Следствие на
   наследуются четыре переменные окружения, и каждая названа поимённо.
 * **Промт уходит в STDIN.** Аргументы процесса видны в ``ps`` любому
   пользователю хоста, а промт несёт одноразовый код доступа к хабу.
+* **Транспорт «runner» (#1571).** Юнит хаба на проде идёт с ProtectSystem=strict
+  и NoNewPrivileges=yes: ни каталог прогона вне его путей, ни sudo ему
+  недоступны, и ослаблять изоляцию владелец запретил. Поэтому при
+  ``LOCAL_REVIEW_TRANSPORT=runner`` хаб НИЧЕГО не запускает: кладёт задание в
+  spool-каталог, а запускает отдельная служба вне его изоляции
+  (deploy/review-runner/). Контракт ``LocalRun`` и вызывающие не меняются.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
+import json
 import logging
 import grp
 import os
 import pwd
+import secrets
 import shlex
 import shutil
 import stat
@@ -104,6 +113,11 @@ class LocalRun:
     duration_ms: int
 
 
+def transport() -> str:
+    """Выбранный транспорт запуска: ``direct`` (умолчание) или ``runner``."""
+    return (config.LOCAL_REVIEW_TRANSPORT or "direct").strip().lower()
+
+
 def not_ready() -> list[str]:
     """Имена настроек, без которых локального пути нет. Пустой список = есть.
 
@@ -111,6 +125,17 @@ def not_ready() -> list[str]:
     настройки, которое и так написано открытым текстом в hub/config.py. Ни
     значения, ни префикса, ни длины — длина это суженная догадка.
     """
+    mode = transport()
+    if mode == "runner":
+        return _runner_not_ready()
+    if mode != "direct":
+        return [
+            "LOCAL_REVIEW_TRANSPORT (допустимы direct и runner; значение не распознано)"
+        ]
+    return _direct_not_ready()
+
+
+def _direct_not_ready() -> list[str]:
     return (
         [
             name
@@ -797,9 +822,15 @@ async def run_review(
     имеет: вызывающий обязан вернуть хоть что-то — хуже промта с мёртвым
     кодом только отсутствие промта.
     """
+    _REFUSAL.set("")
     if not is_configured():
         return None
     limit = timeout if timeout is not None else config.LOCAL_REVIEW_TIMEOUT_SEC
+    if transport() == "runner":
+        async with _HOST_BUDGET:
+            if prompt_at_slot is not None:
+                prompt = await prompt_at_slot(prompt)
+            return await _run_via_runner(prompt, limit)
     # Каталог прогона заводится ПОД ЗАМКОМ, а не до него: ждущий своей
     # очереди прогон иначе держал бы чужой каталог в scratch всё время
     # ожидания, а хаб обещает заводить его на прогон и сносить после.
@@ -930,3 +961,240 @@ async def _collect(proc: Any) -> tuple[bytes, int]:
         dropped += max(0, len(chunk) - max(room, 0))
     await proc.wait()
     return b"".join(kept), dropped
+
+
+# ТРАНСПОРТ «RUNNER» (#1571).
+#
+# Хаб не запускает ничего: пишет задание в spool-каталог (он в ReadWritePaths
+# хаба) и ждёт result.json, который кладёт служба из deploy/review-runner/.
+# Выбран каталог, а не unix-сокет: каталог переживает рестарт любой из сторон
+# (задание не теряется вместе с соединением), права на него — те же 2770 с
+# общей группой, что у каталога прогонов, а у сокета в юните с
+# RestrictAddressFamilies и ProtectSystem=strict лишняя поверхность и своя
+# схема прав. Цена — опрос; при прогоне в минуты она ничтожна.
+#
+# Имена и формат делит с службой тест test_the_hub_and_the_runner_share_one_protocol.
+SPOOL_PROMPT = "prompt.txt"
+SPOOL_JOB = "job.json"
+SPOOL_CLAIMED = "claimed"
+SPOOL_CANCEL = "cancel"
+SPOOL_RESULT = "result.json"
+SPOOL_HEARTBEAT = "heartbeat"
+JOB_VERSION = 1
+# Закрытый список полей задания: команды и путей в нём нет по построению.
+JOB_FIELDS = ("version", "timeout_sec")
+
+# Heartbeat старше этого — служба считается мёртвой (она пишет раз в 5 с).
+RUNNER_HEARTBEAT_MAX_AGE_SEC = 30
+# Сколько ждать, пока служба ЗАБЕРЁТ задание. Живая служба берёт его за
+# секунды; дольше — она зависла или heartbeat шёл от чужого процесса.
+RUNNER_PICKUP_SEC = 60.0
+# После просьбы снять прогон — сколько ждать подтверждения службы.
+RUNNER_GRACE_SEC = 20.0
+RUNNER_POLL_SEC = 0.5
+
+# Причина последнего отказа транспорта. ContextVar, а не поле модуля: прогонов
+# в процессе несколько, а читает причину тот же task, что её записал.
+_REFUSAL: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "local_review_refusal", default=""
+)
+
+
+def refusal() -> str:
+    """Почему последний прогон ЭТОГО task не состоялся (транспорт runner), или ""."""
+    return _REFUSAL.get()
+
+
+def _runner_not_ready() -> list[str]:
+    missing = [
+        name
+        for name, value in (
+            (
+                "LOCAL_REVIEW_SPOOL_DIR (каталог очереди службы-исполнителя)",
+                config.LOCAL_REVIEW_SPOOL_DIR,
+            ),
+            (
+                "LOCAL_REVIEWER_HUB_TOKEN (токен принципала ревьюера)",
+                config.LOCAL_REVIEWER_HUB_TOKEN,
+            ),
+        )
+        if not (value or "").strip()
+    ]
+    return missing + runner_problem()
+
+
+def runner_problem() -> list[str]:
+    """Названная причина, если службы-исполнителя нет или она не отвечает.
+
+    Спрашивается у системы, а не у настроек: служба «настроена» и при этом
+    не запущена — именно такое состояние и надо назвать до заказа, а не после
+    получаса ожидания.
+    """
+    spool = (config.LOCAL_REVIEW_SPOOL_DIR or "").strip()
+    if not spool:
+        return []  # отсутствие настройки уже названо в not_ready()
+    if not os.path.isdir(spool):
+        return [
+            f"LOCAL_REVIEW_SPOOL_DIR: каталога {spool} нет. Создайте его "
+            "(режим 2770, группа haiplane-review) — см. deploy/LOCAL-REVIEW.md"
+        ]
+    if not os.access(spool, os.R_OK | os.W_OK | os.X_OK):
+        return [f"LOCAL_REVIEW_SPOOL_DIR: хаб не может писать в {spool}"]
+    try:
+        age = time.time() - os.stat(os.path.join(spool, SPOOL_HEARTBEAT)).st_mtime
+    except OSError:
+        return [
+            "служба-исполнитель не запущена: в каталоге очереди нет файла "
+            f"{SPOOL_HEARTBEAT}. Запустите haiplane-review-runner.service — "
+            "см. deploy/LOCAL-REVIEW.md"
+        ]
+    if age > RUNNER_HEARTBEAT_MAX_AGE_SEC:
+        return [
+            f"служба-исполнитель не отвечает: {SPOOL_HEARTBEAT} старше "
+            f"{int(age)} с (допустимо {RUNNER_HEARTBEAT_MAX_AGE_SEC})"
+        ]
+    return []
+
+
+def _submit_job(spool: str, prompt: str, limit: int) -> str:
+    """Положить задание в очередь. Возвращает каталог задания.
+
+    Порядок несущий: сначала промт, ПОТОМ job.json атомарным переименованием.
+    Служба берёт только каталоги с job.json, поэтому полупрописанное задание
+    она не увидит. Промт — 0660 с группой каталога: ни миру, ни в argv.
+    """
+    jobdir = os.path.join(spool, "job-" + secrets.token_hex(8))
+    os.mkdir(jobdir, 0o770)
+    try:
+        os.chmod(jobdir, 0o770)  # nosec B103 - группе, не миру
+        _write_spool_file(jobdir, SPOOL_PROMPT, prompt.encode())
+        job = {"version": JOB_VERSION, "timeout_sec": int(limit)}
+        _write_spool_file(jobdir, SPOOL_JOB, json.dumps(job).encode())
+    except OSError:
+        shutil.rmtree(jobdir, ignore_errors=True)
+        raise
+    return jobdir
+
+
+def _write_spool_file(jobdir: str, name: str, data: bytes) -> None:
+    tmp = os.path.join(jobdir, name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o660)
+    try:
+        os.fchmod(fd, 0o660)  # nosec B103 - группе хаба и службы, не миру
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.replace(tmp, os.path.join(jobdir, name))
+
+
+def _read_result(jobdir: str) -> dict[str, Any] | None:
+    try:
+        with open(os.path.join(jobdir, SPOOL_RESULT), "rb") as handle:
+            raw = handle.read(OUTPUT_CAP * 2 + 4096)
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {"status": "error", "reason": "result.json не разобран"}
+    return (
+        data
+        if isinstance(data, dict)
+        else {"status": "error", "reason": "result.json не объект"}
+    )
+
+
+def _result_to_run(result: dict[str, Any], started: float) -> LocalRun | None:
+    """Результат службы -> ``LocalRun``. Отказ службы -> ``None`` с причиной."""
+    if result.get("status") != "ok":
+        reason = str(result.get("reason") or "причина не названа")[:300]
+        _REFUSAL.set(f"служба-исполнитель отказала: {reason}")
+        return None
+    try:
+        return LocalRun(
+            rc=int(result["rc"]),
+            output=str(result.get("output", ""))[:OUTPUT_CAP],
+            dropped=int(result.get("dropped", 0)),
+            timed_out=bool(result.get("timed_out", False)),
+            duration_ms=int(result.get("duration_ms", 0)),
+        )
+    except (KeyError, TypeError, ValueError):
+        _REFUSAL.set("служба-исполнитель вернула result.json неверной формы")
+        return None
+
+
+def _cancel_job(jobdir: str, *, withdraw: bool) -> None:
+    """Попросить службу снять прогон. ``withdraw`` — хаб уходит и не вернётся.
+
+    Остановка хаба: служба должна и убить процесс, и убрать за хабом, а
+    промту с одноразовым кодом на диске делать нечего — поэтому задание
+    отзывается (job.json и prompt.txt удаляются). Ещё не взятое задание
+    уносится целиком: снимать там нечего.
+    """
+    if withdraw and not os.path.exists(os.path.join(jobdir, SPOOL_CLAIMED)):
+        shutil.rmtree(jobdir, ignore_errors=True)
+        return
+    with contextlib.suppress(OSError):
+        _write_spool_file(jobdir, SPOOL_CANCEL, b"")
+    if withdraw:
+        for name in (SPOOL_PROMPT, SPOOL_JOB):
+            with contextlib.suppress(OSError):
+                os.unlink(os.path.join(jobdir, name))
+
+
+async def _await_result(jobdir: str, limit: int, started: float) -> LocalRun | None:
+    pickup = started + min(RUNNER_PICKUP_SEC, limit)
+    deadline = started + limit
+    claimed = os.path.join(jobdir, SPOOL_CLAIMED)
+    while True:
+        result = _read_result(jobdir)
+        if result is not None:
+            return _result_to_run(result, started)
+        now = time.monotonic()
+        if now >= pickup and not os.path.exists(claimed):
+            _REFUSAL.set(
+                "служба-исполнитель не забрала задание за "
+                f"{int(min(RUNNER_PICKUP_SEC, limit))} с: heartbeat свежий, но "
+                "очередь не разбирается — служба зависла или это чужой процесс"
+            )
+            return None
+        if now >= deadline:
+            return await _time_out(jobdir, started)
+        await asyncio.sleep(RUNNER_POLL_SEC)
+
+
+async def _time_out(jobdir: str, started: float) -> LocalRun:
+    """Лимит истёк: хаб пишет снятие и ждёт подтверждения службы, но не вечно."""
+    _cancel_job(jobdir, withdraw=False)
+    end = time.monotonic() + RUNNER_GRACE_SEC
+    while time.monotonic() < end and _read_result(jobdir) is None:
+        await asyncio.sleep(RUNNER_POLL_SEC)
+    return LocalRun(
+        rc=TIMEOUT_RC,
+        output="",
+        dropped=0,
+        timed_out=True,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+
+
+async def _run_via_runner(prompt: str, limit: int) -> LocalRun | None:
+    """Прогон через службу-исполнитель. ``None`` — запуска не было."""
+    started = time.monotonic()
+    spool = config.LOCAL_REVIEW_SPOOL_DIR.strip()
+    try:
+        jobdir = _submit_job(spool, prompt, limit)
+    except OSError as exc:
+        log.warning("local reviewer: job not written under %s: %s", spool, exc)
+        _REFUSAL.set(f"задание не записано в очередь службы: {exc}")
+        return None
+    try:
+        return await _await_result(jobdir, limit, started)
+    except asyncio.CancelledError:
+        # Хаб останавливают: снять прогон через службу и не оставить промт.
+        _cancel_job(jobdir, withdraw=True)
+        jobdir = ""
+        raise
+    finally:
+        if jobdir:
+            shutil.rmtree(jobdir, ignore_errors=True)
