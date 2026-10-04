@@ -3176,3 +3176,73 @@ async def test_delta_without_base_says_it_could_not_ask(
     assert (
         await git_ops.delta_without_base(str(clone), "develop", "f" * 40, current)
     ) is None
+
+
+async def test_worktree_hint_is_a_clone_relative_template(client, db):
+    # AC-1 (#1515): claim and pair-start name the worktree as a template relative
+    # to the caller's clone. The hub does not know the clone folder (the project
+    # repo agentdrover/Spike_bo may live in a clone called spike_bo), so the repo
+    # name must not leak into the path.
+    from hub import repository as repo_module
+    from hub.integrations.git_ops import worktree_hint
+
+    pid = await repo_module.create_project(
+        db, slug="spike", name="Spike", repo_name="agentdrover/Spike_bo"
+    )
+    created = await client.post("/api/tasks", json={"title": "Spike worktree hint"})
+    task_id = created.json()["id"]
+    await repo_module.update_task(db, task_id, project_id=pid)
+    await db.commit()
+
+    expected_path = f"../.<имя вашего клона>-worktrees/task-{task_id}"
+    assert worktree_hint(task_id).startswith(expected_path)
+
+    claim = await client.post(
+        f"/api/tasks/{task_id}/claim", json={"agent": "a", "session_id": "s"}
+    )
+    assert claim.status_code == 200
+    pair = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={
+            "plan": "Plan: work in own clone",
+            "assigned_agent": "a",
+            "session_id": "s",
+            "git_mode": "remote",
+        },
+    )
+    assert pair.status_code == 200, pair.text
+    for hint in (claim.json()["worktree_hint"], pair.json()["worktree_hint"]):
+        assert expected_path in hint
+        assert f"hp-hub worktree {task_id}" in hint
+        assert "spike_bo" not in hint.lower()
+        assert "agentdrover" not in hint.lower()
+
+
+async def test_reclaim_by_same_holder_keeps_the_worktree_hint(client):
+    # #1515: the idempotent second claim answers with the hint as well.
+    created = await client.post("/api/tasks", json={"title": "Reclaim hint"})
+    task_id = created.json()["id"]
+    body = {"agent": "a", "session_id": "s"}
+    first = await client.post(f"/api/tasks/{task_id}/claim", json=body)
+    again = await client.post(f"/api/tasks/{task_id}/claim", json=body)
+    assert again.status_code == 200
+    assert again.json()["worktree_hint"] == first.json()["worktree_hint"] != ""
+
+
+async def test_claim_race_won_by_same_holder_keeps_the_worktree_hint(client):
+    # #1515: the branch where a concurrent claim of the same holder wins.
+    from hub.models import TaskView
+    from hub.services import lifecycle
+
+    created = await client.post("/api/tasks", json={"title": "Race hint"})
+    task_id = created.json()["id"]
+    view = TaskView(**(await client.get(f"/api/tasks/{task_id}")).json())
+    with patch.object(
+        lifecycle, "_claim_write", new=AsyncMock(return_value=view)
+    ) as race:
+        resp = await client.post(
+            f"/api/tasks/{task_id}/claim", json={"agent": "a", "session_id": "s"}
+        )
+    race.assert_awaited_once()
+    assert resp.status_code == 200
+    assert resp.json()["worktree_hint"].startswith("../.<имя вашего клона>-worktrees/")
