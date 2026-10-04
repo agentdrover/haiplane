@@ -2556,3 +2556,157 @@ async def test_admin_agents_create_with_watcher_role(client, db, monkeypatch):
         "JOIN role_permissions rp ON rp.role_id = r.id WHERE r.slug = 'watcher'"
     )
     assert role[0]["system"] == 1 and role[0]["perms"] == "tasks.read"
+
+
+# --- hp-hub worktree (#1515) -------------------------------------------------
+
+
+def _sh(cwd: Path, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _clone(tmp_path: Path, name: str, origin: str) -> Path:
+    repo = tmp_path / name
+    repo.mkdir()
+    _sh(repo, "init", "-q", "-b", "develop")
+    _sh(repo, "config", "user.email", "t@example.com")
+    _sh(repo, "config", "user.name", "Test")
+    (repo / "f.txt").write_text("x")
+    _sh(repo, "add", ".")
+    _sh(repo, "commit", "-q", "-m", "init")
+    _sh(repo, "remote", "add", "origin", origin)
+    return repo
+
+
+def _fake_hub(monkeypatch, *, repo_name: str = "agentdrover/Spike_bo") -> str:
+    branch = "task-1429/spike-thing"
+
+    def fake_api(method: str, path: str, body: Any = None, **kw: Any) -> Any:
+        if path == "/api/tasks/1429":
+            return {
+                "id": 1429,
+                "title": "Spike thing",
+                "branch": branch,
+                "project": {"id": 5, "slug": "spike"},
+            }
+        if path.startswith("/api/projects"):
+            return [
+                {
+                    "id": 5,
+                    "slug": "spike",
+                    "repo": repo_name,
+                    "default_branch": "develop",
+                }
+            ]
+        raise AssertionError(f"unexpected call {method} {path}")
+
+    monkeypatch.setattr(cli, "_api", fake_api)
+    return branch
+
+
+def _run_worktree(repo: Path) -> int:
+    return cli.cmd_worktree(argparse.Namespace(task_id=1429, repo=str(repo)))
+
+
+def test_worktree_command_creates_then_reuses_rule_path(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    # AC-2 (#1515): the path is built from the ACTUAL clone folder (spike_bo),
+    # created on the canonical branch, and reused on the second call.
+    branch = _fake_hub(monkeypatch)
+    clone = _clone(tmp_path, "spike_bo", "https://github.com/agentdrover/Spike_bo.git")
+    expected = tmp_path / ".spike_bo-worktrees" / "task-1429"
+
+    assert _run_worktree(clone) == 0
+    first = capsys.readouterr().out.strip()
+    assert first == str(expected)
+    assert _sh(expected, "branch", "--show-current") == branch
+
+    assert _run_worktree(clone) == 0
+    assert capsys.readouterr().out.strip() == first
+    assert _sh(expected, "branch", "--show-current") == branch
+
+
+def test_worktree_command_refuses_dirty_foreign_or_wrong_repo(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    # AC-3 (#1515): refusal names the reason and touches nothing.
+    branch = _fake_hub(monkeypatch)
+    clone = _clone(tmp_path, "spike_bo", "git@github.com:AgentDrover/spike_bo.git")
+    wt = tmp_path / ".spike_bo-worktrees" / "task-1429"
+    wt.parent.mkdir()
+
+    # foreign branch, clean: refused, branch unchanged
+    _sh(clone, "worktree", "add", "-q", "-b", "other/work", str(wt), "develop")
+    assert _run_worktree(clone) == 1
+    err = capsys.readouterr().err
+    assert "other/work" in err and branch in err
+    assert _sh(wt, "branch", "--show-current") == "other/work"
+
+    # foreign branch with uncommitted edits: refused, files intact
+    (wt / "f.txt").write_text("edited")
+    (wt / "new.txt").write_text("untracked")
+    assert _run_worktree(clone) == 1
+    err = capsys.readouterr().err
+    assert "f.txt" in err
+    assert _sh(wt, "branch", "--show-current") == "other/work"
+    assert (wt / "f.txt").read_text() == "edited"
+    assert (wt / "new.txt").read_text() == "untracked"
+
+    # origin that is not the project repo: refused, no copy created
+    other = _clone(tmp_path, "elsewhere", "https://github.com/someone/else.git")
+    assert _run_worktree(other) == 1
+    err = capsys.readouterr().err
+    assert "someone/else" in err and "agentdrover/spike_bo" in err.lower()
+    assert not (tmp_path / ".elsewhere-worktrees").exists()
+
+
+def test_worktree_command_refuses_unregistered_path_missing_repo_and_non_clone(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    # #1515: other refusals leave the disk as they found it.
+    _fake_hub(monkeypatch)
+    clone = _clone(tmp_path, "spike_bo", "https://github.com/agentdrover/Spike_bo")
+    squatter = tmp_path / ".spike_bo-worktrees" / "task-1429"
+    squatter.mkdir(parents=True)
+    (squatter / "mine.txt").write_text("keep")
+    assert _run_worktree(clone) == 1
+    assert "не копия клона" in capsys.readouterr().err
+    assert (squatter / "mine.txt").read_text() == "keep"
+
+    # project without a repo: nothing to compare the origin with
+    _fake_hub(monkeypatch, repo_name="")
+    assert _run_worktree(clone) == 1
+    assert "не задан repo" in capsys.readouterr().err
+
+    # clone without origin
+    _fake_hub(monkeypatch)
+    bare = _clone(tmp_path, "noorigin", "https://github.com/x/y")
+    _sh(bare, "remote", "remove", "origin")
+    assert _run_worktree(bare) == 1
+    assert "нет remote origin" in capsys.readouterr().err
+
+    # not a git clone at all
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert _run_worktree(plain) == 1
+    assert "не git-клон" in capsys.readouterr().err
+    assert _run_worktree(tmp_path / "missing") == 1
+    assert "не git-клон" in capsys.readouterr().err
+    assert not (tmp_path / ".noorigin-worktrees").exists()
+
+
+def test_worktree_command_from_inside_a_worktree_uses_the_main_clone(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    # #1515: asked from inside a copy, the rule path is still beside the clone.
+    _fake_hub(monkeypatch)
+    clone = _clone(tmp_path, "spike_bo", "https://github.com/agentdrover/Spike_bo")
+    assert _run_worktree(clone) == 0
+    path = capsys.readouterr().out.strip()
+    assert _run_worktree(Path(path)) == 0
+    assert capsys.readouterr().out.strip() == path

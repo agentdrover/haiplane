@@ -2122,6 +2122,12 @@ def _area_check_note(result: dict[str, Any] | None) -> str:
     )
 
 
+def _worktree_hint_note(result: dict[str, Any] | None) -> str:
+    """Where the task worktree goes, from claim/pair-start (#1515)."""
+    hint = (result or {}).get("worktree_hint")
+    return f"\nWorktree: {hint}" if hint else ""
+
+
 @mcp.tool()
 async def hub_pair_start(
     task_id: int,
@@ -2180,6 +2186,7 @@ async def hub_pair_start(
         f"agent: {agent_name}, {job_note})."
     )
     message += _area_check_note(result)
+    message += _worktree_hint_note(result)
     # Worktree isolation (#530): the mode/path live on the pair-start response
     # (not the DB re-read), so read them from `result` and tell the agent where
     # its isolated tree is — otherwise it would keep working in the shared clone.
@@ -2645,6 +2652,7 @@ async def hub_claim_task(
     holder = (task or result).get("claimed_by") or agent
     message = f"Task #{task_id} claimed (status: {status}, claimed_by: {holder})."
     message += _area_check_note(result)
+    message += _worktree_hint_note(result)
     return await _task_mutation_response(
         task_id,
         message,
