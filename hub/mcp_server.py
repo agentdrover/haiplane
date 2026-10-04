@@ -3524,7 +3524,8 @@ async def hub_outcome_debt() -> CallToolResult:
     and what was measured. Record an answer with hub_answer_outcome.
 
     Due = first deploy of the fix + 14 days (#1568): overdue / observing /
-    unknown (no recorded fix release). outcome_deadline stays free text.
+    unknown (no recorded fix release); due_assumed = counted from the merge
+    (project key merge_is_delivery, #1572). outcome_deadline stays free text.
     """
     try:
         data = await _api_get("/api/metrics/outcome-debt")
@@ -3557,7 +3558,10 @@ async def hub_outcome_debt() -> CallToolResult:
         lines.append(f"#{item['task_id']} {item['title']} — {waited_text}")
         due_on = item.get("due_on")
         status = item.get("outcome_status", "")
-        lines.append(f"    {status}" + (f", due {due_on}" if due_on else ""))
+        due_text = f", due {due_on}" if due_on else ""
+        if due_on and item.get("due_assumed"):
+            due_text += " (assumed: from merge)"
+        lines.append(f"    {status}{due_text}")
         lines.append(f"    metric: {item.get('outcome_metric') or '—'}")
         if item.get("outcome_deadline"):
             lines.append(f"    said by: {item['outcome_deadline']}")

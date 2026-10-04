@@ -655,6 +655,28 @@ def deep_reviewer_of(policy: dict) -> str:
     return DEEP_REVIEWER_CLOUD
 
 
+# «Мерж = доставка» (#1572). У проекта без релиз-PR (ветка работы совпадает с
+# релизной) released_sha не появляется, и срок исхода по его задачам не
+# вычислить. Выводить «мерж = доставка» из конфигурации веток нельзя: у
+# spike-bo свой CD, и ложная дата хуже пустой. Поэтому это явное решение
+# владельца. Нет ключа, false и нечитаемое значение — не доставка.
+MERGE_IS_DELIVERY_KEY = "merge_is_delivery"
+
+
+def merge_is_delivery_of(policy: dict) -> bool:
+    """Объявил ли владелец мерж доставкой: только литеральный ``true``."""
+    return isinstance(policy, dict) and policy.get(MERGE_IS_DELIVERY_KEY) is True
+
+
+async def merge_is_delivery_projects(db: aiosqlite.Connection) -> frozenset[int]:
+    """Проекты, объявившие мерж доставкой (#1572); читатель — тот же, что в сводке."""
+    return frozenset(
+        int(row["id"])
+        for row in await repo.list_projects(db, include_archived=True)
+        if merge_is_delivery_of(gate_policy_of(row))
+    )
+
+
 # Пути постановки (#1456). DoR проверял, что validation_commands есть, но не
 # что пути в них и в test_ref существуют на базе или создаются самой задачей:
 # #1392 ушла в работу с командой на несуществующий каталог, и исполнитель

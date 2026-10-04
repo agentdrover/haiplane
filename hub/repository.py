@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlencode
 
 import aiosqlite
@@ -869,9 +869,64 @@ async def release_fact_for_task(
     return dict(rows[0]) if rows else None
 
 
+class FixDeploy(NamedTuple):
+    """When a fix reached production and whether that moment is a guess (#1572)."""
+
+    at: str | None
+    assumed: bool = False
+
+
+_FIX_TREE_SQL = (
+    "WITH RECURSIVE tree(id) AS (SELECT ? UNION ALL "
+    "SELECT t.id FROM tasks t JOIN tree ON t.parent_id = tree.id) "
+    "SELECT id FROM tree"
+)
+
+
+async def _merge_is_delivery_fix(
+    db: aiosqlite.Connection, task_id: int, projects: frozenset[int]
+) -> FixDeploy:
+    """The fix moment of a task whose project declared merge = delivery (#1572).
+
+    Only a task with NO stamped merge comes here (the release-PR path owns the
+    rest). The project is the one of the task's LAST merge
+    (``pipeline_merges.project_id``), never ``tasks.project_id``. A project
+    with successful ``releases`` rows is dated by its first deploy at or after
+    the merge, and has no date until there is one; a project without any is
+    dated by the merge itself, marked assumed.
+    """
+    merges = await fetchall(
+        db,
+        "SELECT project_id, merged_at, TRIM(COALESCE(released_sha, '')) AS sha "
+        "FROM pipeline_merges WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    )
+    if not merges or any(row["sha"] for row in merges):
+        return FixDeploy(None)
+    last = merges[0]
+    project_id = last["project_id"]
+    if project_id is None or int(project_id) not in projects:
+        return FixDeploy(None)
+    deploys = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n, MIN(CASE WHEN datetime(deployed_at) >= datetime(?) "
+        "THEN deployed_at END) AS first_after FROM releases "
+        "WHERE status = 'success' AND project_id = ?",
+        (last["merged_at"], int(project_id)),
+    )
+    if not deploys[0]["n"]:
+        return FixDeploy(str(last["merged_at"]) if last["merged_at"] else None, True)
+    after = deploys[0]["first_after"]
+    return FixDeploy(str(after) if after else None)
+
+
 async def first_fix_deploy_at(
-    db: aiosqlite.Connection, task_id: int, *, with_descendants: bool = False
-) -> str | None:
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    with_descendants: bool = False,
+    delivery_projects: frozenset[int] | set[int] = frozenset(),
+) -> FixDeploy:
     """When the fix of this task first reached production, or None (#1568).
 
     The fix is the release stamped on the task's LAST merge
@@ -881,15 +936,15 @@ async def first_fix_deploy_at(
     reported before 28.09 carry ``project_id=NULL`` (the rule of
     ``defect_release``). With ``with_descendants`` the latest such moment among
     the task and everything below it is returned: an epic or feature is out
-    when its last child is. None means no recorded fix release — unknown.
+    when its last child is. ``at`` None means no recorded fix release — unknown.
+
+    ``delivery_projects`` are the projects whose owner declared merge = delivery
+    (``merge_is_delivery``, #1572): for a task of theirs without a stamped
+    merge the moment comes from ``_merge_is_delivery_fix`` and is ``assumed``
+    when it is the merge itself; one assumed task makes a rolled-up date
+    assumed. Empty (the default) is exactly the behaviour before the key.
     """
-    tree = (
-        "WITH RECURSIVE tree(id) AS (SELECT ? UNION ALL "
-        "SELECT t.id FROM tasks t JOIN tree ON t.parent_id = tree.id) "
-        "SELECT id FROM tree"
-        if with_descendants
-        else "SELECT ? AS id"
-    )
+    tree = _FIX_TREE_SQL if with_descendants else "SELECT ? AS id"
     rows = await fetchall(
         db,
         f"SELECT MAX(d) AS at FROM (SELECT (SELECT MIN(r.deployed_at) FROM releases r "  # nosec B608
@@ -900,7 +955,18 @@ async def first_fix_deploy_at(
         "WHERE p2.task_id = tr.id AND TRIM(COALESCE(p2.released_sha, '')) != ''))",
         (task_id,),
     )
-    return str(rows[0]["at"]) if rows and rows[0]["at"] else None
+    strict = str(rows[0]["at"]) if rows and rows[0]["at"] else None
+    if not delivery_projects:
+        return FixDeploy(strict)
+    projects = frozenset(delivery_projects)
+    ids = await fetchall(db, tree if with_descendants else "SELECT ?", (task_id,))
+    moments = [FixDeploy(strict)]
+    for row in ids:
+        moments.append(await _merge_is_delivery_fix(db, int(row[0]), projects))
+    dated = [m for m in moments if m.at]
+    if not dated:
+        return FixDeploy(None)
+    return FixDeploy(max(m.at for m in dated if m.at), any(m.assumed for m in dated))
 
 
 async def pipeline_merge_recorded(

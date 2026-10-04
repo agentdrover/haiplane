@@ -325,3 +325,38 @@ def test_deep_reviewer_key_is_validated_and_defaults_to_cloud():
     ProjectPatch(gate_policy={"deep_reviewer": "local"})
     with pytest.raises(ValueError, match="deep_reviewer"):
         ProjectPatch(gate_policy={"deep_reviewer": "qwen"})
+
+
+def test_summary_covers_merge_is_delivery():
+    """#1572: the key is accepted by the write, read by one reader, and summarised."""
+    import pytest
+
+    from hub.models import ProjectPatch
+
+    assert "merge_is_delivery" in GATE_POLICY_KEYS
+    assert "merge_is_delivery" in effective_policy.REGISTRY
+    assert effective_policy.unsummarised_keys() == []
+    assert project_policy.merge_is_delivery_of({}) is False
+    assert project_policy.merge_is_delivery_of({"merge_is_delivery": True}) is True
+    assert project_policy.merge_is_delivery_of({"merge_is_delivery": "true"}) is False
+    assert project_policy.merge_is_delivery_of({"merge_is_delivery": 1}) is False
+    ProjectPatch(gate_policy={"merge_is_delivery": True})
+    ProjectPatch(gate_policy={"merge_is_delivery": False})
+    with pytest.raises(ValueError, match="merge_is_delivery"):
+        ProjectPatch(gate_policy={"merge_is_delivery": "yes"})
+
+
+async def test_merge_is_delivery_is_shown_with_its_source(db: aiosqlite.Connection):
+    """The summary asks the same reader: stored true shows as true, from the project."""
+    pid = await _project(db, "local-app", {"merge_is_delivery": True})
+    other = await _project(db, "plain-app", {})
+
+    async def _row(project_id: int) -> dict:
+        project = await repo.get_project(db, project_id)
+        data = await effective_policy.effective_policy(db, project)
+        return _by_key(data)["merge_is_delivery"]
+
+    on, off = await _row(pid), await _row(other)
+
+    assert on["value"] is True and off["value"] is False
+    assert on["source"] != off["source"]

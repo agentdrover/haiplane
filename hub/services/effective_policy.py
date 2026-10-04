@@ -157,6 +157,9 @@ REGISTRY: dict[str, PolicyEntry] = {
     "deep_reviewer": PolicyEntry(
         project_policy.deep_reviewer_of, "project_policy.deep_reviewer_of"
     ),
+    "merge_is_delivery": PolicyEntry(
+        project_policy.merge_is_delivery_of, "project_policy.merge_is_delivery_of"
+    ),
     "slot_dead_minutes": PolicyEntry(
         executor_slots.dead_minutes_of,
         "executor_slots.dead_minutes_of",
