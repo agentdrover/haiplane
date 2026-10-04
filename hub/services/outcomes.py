@@ -19,7 +19,7 @@ defect class this module exists to expose.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aiosqlite
@@ -64,21 +64,21 @@ def _snapshot_matches(answer: dict[str, Any], outcome_metric: str) -> bool:
     return str(snap).strip() == outcome_metric.strip()
 
 
-def _deadline_reached(
-    completed_at: str | None, latest_release: dict[str, Any] | None
-) -> bool:
-    """True only when a successful release is known to have landed after the work finished.
+# Observation window after the fix reached production (#1568): the mode and the
+# median of the real ``outcome_deadline`` phrasings. A constant, not a column and
+# not a parse of that free text (#839).
+OUTCOME_WINDOW_DAYS = 14
 
-    No record is unknown, not overdue: collapsing those is the #839 failure.
-    ``outcome_deadline`` is never consulted — it is free text.
-    """
-    if not latest_release:
-        return False
-    finished = _parse_stamp(completed_at)
-    released = _parse_stamp(latest_release.get("deployed_at"))
-    if finished is None or released is None:
-        return False
-    return released >= finished
+# Task types whose release is the release of their descendants.
+_ROLLUP_TYPES = frozenset({"epic", "feature"})
+
+
+def outcome_due_at(fix_released_at: str | None) -> datetime | None:
+    """First deploy of the fix plus the window; None when there is no such deploy."""
+    released = _parse_stamp(fix_released_at)
+    if released is None:
+        return None
+    return released + timedelta(days=OUTCOME_WINDOW_DAYS)
 
 
 _VERDICT_TO_STATUS = {
@@ -92,11 +92,15 @@ def derive_outcome_status(
     *,
     outcome_metric: str,
     answers: list[dict[str, Any]],
-    completed_at: str | None,
-    latest_release: dict[str, Any] | None,
+    fix_released_at: str | None,
     task_status: str | None = None,
+    now: datetime | None = None,
 ) -> OutcomeHypothesisStatus:
-    """Assemble the hypothesis state from facts that already exist (#576)."""
+    """Assemble the hypothesis state from facts that already exist (#576).
+
+    ``fix_released_at`` is the first deploy of the task's fix (#1568). Without
+    one the deadline cannot be computed: unknown, not overdue (#839).
+    """
     if not str(outcome_metric or "").strip():
         return OutcomeHypothesisStatus.no_hypothesis
 
@@ -108,7 +112,10 @@ def derive_outcome_status(
         return OutcomeHypothesisStatus.revised
     if task_status and task_status != "completed":
         return OutcomeHypothesisStatus.not_due
-    if _deadline_reached(completed_at, latest_release):
+    due = outcome_due_at(fix_released_at)
+    if due is None:
+        return OutcomeHypothesisStatus.unknown
+    if due <= (now or datetime.now(UTC)):
         return OutcomeHypothesisStatus.unanswered
     return OutcomeHypothesisStatus.not_due
 
@@ -125,6 +132,33 @@ def _answer_view(row: aiosqlite.Row) -> dict[str, Any]:
     }
 
 
+async def resolve_outcome_status(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    answers: list[dict[str, Any]],
+) -> tuple[OutcomeHypothesisStatus, str | None]:
+    """The one place a task's outcome status and due date are decided (#1568).
+
+    The card, the review brief and the debt list all call this, so they cannot
+    disagree. Returns the status and ``due_on`` (an ISO date, or None).
+    """
+    fix_at: str | None = None
+    if task.get("status") == "completed":
+        fix_at = await repository.first_fix_deploy_at(
+            db,
+            int(task["id"]),
+            with_descendants=str(task.get("task_type") or "") in _ROLLUP_TYPES,
+        )
+    status = derive_outcome_status(
+        outcome_metric=str(task.get("outcome_metric") or ""),
+        answers=answers,
+        fix_released_at=fix_at,
+        task_status=str(task.get("status") or ""),
+    )
+    due = outcome_due_at(fix_at)
+    return status, due.date().isoformat() if due else None
+
+
 async def outcome_status_for_task(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> OutcomeHypothesisStatus:
@@ -133,17 +167,8 @@ async def outcome_status_for_task(
         _answer_view(row)
         for row in await repository.list_outcome_answers_for_task(db, int(task["id"]))
     ]
-    project = await repository.resolve_project_for_task(db, int(task["id"]))
-    release = None
-    if project is not None:
-        release = await repository.latest_successful_release(db, int(project["id"]))
-    return derive_outcome_status(
-        outcome_metric=str(task.get("outcome_metric") or ""),
-        answers=answers,
-        completed_at=task.get("completed_at") or task.get("updated_at"),
-        latest_release=release,
-        task_status=str(task.get("status") or ""),
-    )
+    status, _ = await resolve_outcome_status(db, task, answers)
+    return status
 
 
 async def outcome_debt(db: aiosqlite.Connection) -> dict[str, Any]:
@@ -155,24 +180,13 @@ async def outcome_debt(db: aiosqlite.Connection) -> dict[str, Any]:
     """
     rows = await repository.list_outcome_debt(db)
     answers = await _answers_by_task(db)
-    release_by_project: dict[int, dict[str, Any] | None] = {}
     items: list[dict[str, Any]] = []
     answered_items: list[dict[str, Any]] = []
     for row in rows:
         finished = row["completed_at"] or row["updated_at"]
         task_answers = answers.get(row["id"], [])
-        project = await repository.resolve_project_for_task(db, row["id"])
-        project_id = int(project["id"]) if project is not None else None
-        if project_id is not None and project_id not in release_by_project:
-            release_by_project[project_id] = await repository.latest_successful_release(
-                db, project_id
-            )
-        status = derive_outcome_status(
-            outcome_metric=str(row["outcome_metric"] or ""),
-            answers=task_answers,
-            completed_at=finished,
-            latest_release=release_by_project.get(project_id) if project_id else None,
-            task_status="completed",
+        status, due_on = await resolve_outcome_status(
+            db, {**dict(row), "status": "completed"}, task_answers
         )
         entry = {
             "task_id": row["id"],
@@ -186,6 +200,7 @@ async def outcome_debt(db: aiosqlite.Connection) -> dict[str, Any]:
             "completed_at": finished,
             "days_unanswered": _days_since(finished),
             "outcome_status": status.value,
+            "due_on": due_on,
         }
         if not task_answers:
             items.append(entry)
@@ -196,11 +211,13 @@ async def outcome_debt(db: aiosqlite.Connection) -> dict[str, Any]:
         entry["answers"] = len(task_answers)
         entry["latest_answer"] = task_answers[-1]
         answered_items.append(entry)
-    overdue = [
-        item
-        for item in items
-        if item["outcome_status"] == OutcomeHypothesisStatus.unanswered.value
-    ]
+
+    def _with(status: OutcomeHypothesisStatus) -> list[dict[str, Any]]:
+        return [i for i in items if i["outcome_status"] == status.value]
+
+    overdue = _with(OutcomeHypothesisStatus.unanswered)
+    observing = _with(OutcomeHypothesisStatus.not_due)
+    unknown = _with(OutcomeHypothesisStatus.unknown)
     return {
         "total": len(items),
         "answered_total": len(answered_items),
@@ -208,15 +225,23 @@ async def outcome_debt(db: aiosqlite.Connection) -> dict[str, Any]:
         "answered": answered_items,
         "overdue": overdue,
         "overdue_total": len(overdue),
+        "observing": observing,
+        "observing_total": len(observing),
+        "unknown": unknown,
+        "unknown_total": len(unknown),
+        "window_days": OUTCOME_WINDOW_DAYS,
         "note": (
             "Every task in `items` promised a number would move and was never "
             "asked whether it did. `answered` holds the ones somebody came back "
             "to, with the last verdict and what was measured - including "
             "not_moved and unmeasurable, which are answers too. "
-            "`overdue` is the subset whose last successful release landed after "
-            "completion — the machine due date, not a parse of outcome_deadline. "
-            "outcome_deadline is free text and is not used for filtering, so "
-            "nothing is hidden behind a value that cannot be parsed."
+            f"`overdue`: the fix first reached production {OUTCOME_WINDOW_DAYS} "
+            "days ago or more (`due_on` passed). `observing`: the window is "
+            "still open. `unknown`: no recorded release of the fix (no merge, "
+            "unreleased merge, or a release the hub never saw) - a gap in "
+            "the record, not a debt. The due date is a machine fact, not a "
+            "parse of outcome_deadline: that is free text and is not used for "
+            "filtering, so nothing is hidden behind a value that cannot be parsed."
         ),
     }
 
