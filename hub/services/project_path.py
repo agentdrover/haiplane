@@ -89,7 +89,7 @@ _WORK_REASONS = {
 
 _TASKS_SQL = (
     "SELECT t.id, t.title, t.status, t.task_type, t.size, t.parent_id, "
-    "t.project_id, t.archived, t.review_job_id, t.waiting_for, t.dor_passed, "
+    "t.project_id, t.archived, t.review_job_id, t.waiting_for, t.waiting_until, t.dor_passed, "
     "t.assigned_agent, t.priority, t.position, "
     "(SELECT COUNT(*) FROM pipeline_merges m WHERE m.task_id = t.id) AS merges "
     "FROM tasks t"
@@ -349,8 +349,9 @@ def _classify(
         who = str(task["assigned_agent"] or "")
         suffix = f": {who}" if who and status == "running" else ""
         return GROUP_WORK, _WORK_REASONS[status] + suffix
-    if task["waiting_for"]:
-        return GROUP_DEFERRED, f"отложено: ждёт «{task['waiting_for']}»"
+    waiting = oq.current_wait(task)
+    if waiting:
+        return GROUP_DEFERRED, waiting
     if blockers:
         return GROUP_BLOCKED, _blocked_reason(graph, blockers, slug)
     if not task["dor_passed"]:
@@ -362,6 +363,31 @@ def _state_word(task: dict[str, Any], group: str) -> str:
     if task["status"] in _FINAL:
         return "ждёт доставки"
     return _STATE_WORDS[group]
+
+
+async def _demote_non_leaves(
+    db: aiosqlite.Connection,
+    graph: Graph,
+    classes: dict[int, tuple[str, str]],
+) -> None:
+    """Не лист не стартуема: «ждёт подзадачи», а не «готово к старту».
+
+    Признак тот же, что у очереди (``orchestrator_queue.not_leaf_reason``,
+    #1455), второй копии нет; спрашивается только о тех, кто иначе был бы
+    готов, — это единицы запросов.
+    """
+    for node, (group, _) in list(classes.items()):
+        if group != GROUP_READY:
+            continue
+        why = await oq.not_leaf_reason(db, graph.tasks[node])
+        if not why:
+            continue
+        children = await oq._open_children(db, node)
+        listed = ", ".join(f"#{c}" for c in children)
+        classes[node] = (
+            GROUP_BLOCKED,
+            f"ждёт подзадачи {listed}" if children else why,
+        )
 
 
 # --- критический путь -------------------------------------------------------------
@@ -650,6 +676,7 @@ async def compute(
         n: _classify(graph, graph.tasks[n], reach.blockers.get(n, []), slug)
         for n in reach.nodes
     }
+    await _demote_non_leaves(db, graph, classes)
     ctx = _Calc(
         slug=slug,
         edges=edges,

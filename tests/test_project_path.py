@@ -42,6 +42,7 @@ async def _task(
     areas: list[str] | None = None,
     dor: bool = True,
     waiting_for: str = "",
+    waiting_until: str = "",
     review_job: bool = False,
     priority: str = "medium",
 ) -> int:
@@ -56,6 +57,7 @@ async def _task(
         "dor_passed": 1 if dor else 0,
         "size": size,
         "waiting_for": waiting_for,
+        "waiting_until": waiting_until,
         "priority": priority,
     }
     if parent is None:
@@ -67,6 +69,9 @@ async def _task(
         await db.execute("UPDATE tasks SET review_job_id=1 WHERE id=?", (tv.id,))
     await db.commit()
     return tv.id
+
+
+FUTURE = "2999-01-01 00:00:00"
 
 
 async def _epic(db: aiosqlite.Connection, pid: int, title: str = "epic") -> int:
@@ -187,9 +192,18 @@ async def test_queue_groups_reasons_and_cycles(db):
     ready1 = await _task(db, pid, "ready1", parent=epic)
     ready2 = await _task(db, pid, "ready2", parent=epic)
     blocked = await _task(db, pid, "blocked", parent=epic, priority="critical")
+    # Отложенная выше по priority: «следующей» ей не быть (#1527, находка ревью).
     deferred = await _task(
-        db, pid, "deferred", parent=epic, waiting_for="ответ вендора"
+        db,
+        pid,
+        "deferred",
+        parent=epic,
+        waiting_for="ответ вендора",
+        waiting_until=FUTURE,
+        priority="critical",
     )
+    parent = await _task(db, pid, "parent", parent=epic)
+    child = await _task(db, pid, "child", parent=parent, task_type="subtask")
     await _dep(db, blocked, working)
     await _dep(db, ready2, ready1)  # ready2 ждёт ready1, пока не доставлена
     c1 = await _task(db, pid, "c1", parent=epic)
@@ -212,6 +226,12 @@ async def test_queue_groups_reasons_and_cycles(db):
     assert rows[blocked]["group"] == "blocked"
     assert rows[ready2]["group"] == "blocked"
     assert rows[deferred]["group"] == "deferred"
+    # Родитель с открытой подзадачей не стартуем: ждёт её, в ready не считается.
+    assert rows[parent]["group"] == "blocked"
+    assert f"#{child}" in rows[parent]["reason"]
+    ready_group = next(g for g in data["queue"]["groups"] if g["key"] == "ready")
+    assert parent not in [r["task_id"] for r in ready_group["rows"]]
+    assert ready_group["count"] == len(ready_group["rows"])
     assert "ответ вендора" in rows[deferred]["reason"]
     assert f"#{working}" in rows[blocked]["reason"]
     assert all(
@@ -278,11 +298,24 @@ async def test_path_is_the_same_on_every_surface(
     first = await _task(db, pid, "first", parent=epic, size="M")
     second = await _task(db, pid, "second", parent=epic, size="S")
     await _dep(db, second, first)
+    # Отложенная open+DoR выше по priority не должна гасить «следующую».
+    await _task(
+        db,
+        pid,
+        "later",
+        parent=epic,
+        waiting_for="релиз",
+        waiting_until=FUTURE,
+        priority="critical",
+    )
 
     resp = await client.get("/api/projects/pp4/path")
     assert resp.status_code == 200
     rest = resp.json()
     assert rest["next"]["task_id"] == first
+    rows = _rows(rest)
+    assert rows[first]["is_next"] is True
+    assert sum(1 for r in rows.values() if r["is_next"]) == 1
     assert [s["task_id"] for s in rest["epics"][0]["chain"]] == [first, second]
     assert (await client.get("/api/projects/no-such/path")).status_code == 404
 
