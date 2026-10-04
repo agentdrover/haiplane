@@ -723,3 +723,73 @@ def test_a_missing_baseline_report_is_not_sent(script, monkeypatch, tmp_path, ca
     monkeypatch.setenv("HAIPLANE_HUB_CI_BASELINE", str(tmp_path / "absent.json"))
     assert "baseline" not in _capture_payload(script, monkeypatch)
     assert "absent.json" in capsys.readouterr().out
+
+
+_INNER_TESTS = """
+import pytest
+
+def test_passes():
+    assert True
+
+def test_fails():
+    assert False
+
+@pytest.mark.parametrize("n", [1, 2, 3])
+def test_param(n):
+    assert n != 2
+"""
+
+
+@pytest.fixture
+def inner_suite(script, monkeypatch, tmp_path):
+    """A real pytest run against a throwaway suite, through the real runner."""
+    import shlex
+    import sys
+
+    (tmp_path / "test_inner.py").write_text(_INNER_TESTS)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        "HAIPLANE_HUB_CI_PYTEST", f"{shlex.quote(sys.executable)} -m pytest"
+    )
+    return "test_inner.py"
+
+
+def test_a_missing_nodeid_does_not_hide_the_others(script, inner_suite, capsys):
+    """#1581 AC-1: one absent test_ref is not_found alone, never all of them."""
+    passing = f"{inner_suite}::test_passes"
+    failing = f"{inner_suite}::test_fails"
+    missing = f"{inner_suite}::test_typo_in_the_card"
+
+    result = script.run_nodeids([passing, missing, failing])
+
+    assert result == {passing: True, failing: False}, (
+        "the existing ids keep their real outcome; the absent one is not in "
+        "the result, which the caller reports as not_found"
+    )
+    assert "test_typo_in_the_card" in capsys.readouterr().out, (
+        "the reason for not_found is named in the log, with the id"
+    )
+
+
+def test_all_present_nodeids_report_as_before(script, inner_suite):
+    """#1581 AC-2: with nothing missing the outcome is what it was, in one run."""
+    passing = f"{inner_suite}::test_passes"
+    parametrized = f"{inner_suite}::test_param"
+
+    calls: list[list[str]] = []
+    real_run = script.subprocess.run
+
+    def counting_run(cmd, **kwargs):
+        calls.append(cmd)
+        return real_run(cmd, **kwargs)
+
+    script.subprocess.run = counting_run
+    try:
+        result = script.run_nodeids([passing, parametrized])
+    finally:
+        script.subprocess.run = real_run
+
+    assert result == {passing: True, parametrized: False}, (
+        "one failing case fails the parametrized AC"
+    )
+    assert len(calls) == 1, "nothing missing: no extra pytest start"

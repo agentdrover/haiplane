@@ -42,6 +42,7 @@ import shlex
 import shutil
 import subprocess  # nosec B404 - runs the task's own declared commands, in CI
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -158,31 +159,33 @@ def ac_runner() -> list[str]:
     return argv
 
 
-def run_nodeids(nodeids: list[str]) -> dict[str, bool]:
-    """Run the AC tests for ``nodeids`` and return {nodeid: passed} for what ran."""
-    if not nodeids:
-        return {}
-    runner = ac_runner()
-    if not runner:
-        return {}
-    cmd = [
-        *runner,
-        *nodeids,
-        "-v",
-        "--no-header",
-        "-p",
-        "no:cacheprovider",
-    ]
-    try:
-        proc = subprocess.run(  # nosec B603 - fixed argv, nodeids come from the hub
-            cmd, capture_output=True, text=True, timeout=_RUN_TIMEOUT, check=False
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log(f"pytest could not run ({exc}) — every AC stays not_found")
-        return {}
+# pytest names an id it cannot resolve on its own line and then stops
+# collecting: "no tests ran", with the rest of the ids unrun.
+_NOT_FOUND_LINE = re.compile(
+    r"^ERROR: (?:file or directory not found|not found): (\S+)", re.MULTILINE
+)
+
+
+def _missing_nodeids(output: str, nodeids: list[str]) -> dict[str, str]:
+    """{nodeid: reason} for the ids pytest said it could not find.
+
+    pytest echoes the id as given or with an absolute path in front, so a match
+    is the id itself or the id as a path suffix.
+    """
+    missing: dict[str, str] = {}
+    for match in _NOT_FOUND_LINE.finditer(output):
+        reported = match.group(1)
+        for nodeid in nodeids:
+            if reported == nodeid or reported.endswith("/" + nodeid):
+                line = match.group(0)
+                missing[nodeid] = line.removeprefix("ERROR: ")
+    return missing
+
+
+def _parse_outcomes(stdout: str, nodeids: list[str]) -> dict[str, bool]:
     out: dict[str, bool] = {}
     wanted = set(nodeids)
-    for raw in proc.stdout.splitlines():
+    for raw in stdout.splitlines():
         parts = raw.strip().split(None, 1)
         if len(parts) != 2:
             continue
@@ -199,6 +202,45 @@ def run_nodeids(nodeids: list[str]) -> dict[str, bool]:
         # Any failing parametrized case fails the AC.
         out[key] = out.get(key, True) and passed
     return out
+
+
+def run_nodeids(nodeids: list[str]) -> dict[str, bool]:
+    """Run the AC tests for ``nodeids`` and return {nodeid: passed} for what ran.
+
+    One pytest start for the ids. If pytest reports some of them as not found it
+    has stopped collecting, so those are set aside with the reason it gave (they
+    stay not_found) and only the rest are run again: a typo in one test_ref must
+    not hide the real outcome of the others (#1581). Nothing missing costs
+    nothing extra; each distinct missing batch costs one more start, all inside
+    one ``_RUN_TIMEOUT`` budget.
+    """
+    if not nodeids:
+        return {}
+    runner = ac_runner()
+    if not runner:
+        return {}
+    deadline = time.monotonic() + _RUN_TIMEOUT
+    pending = list(nodeids)
+    while pending:
+        cmd = [*runner, *pending, "-v", "--no-header", "-p", "no:cacheprovider"]
+        try:
+            proc = subprocess.run(  # nosec B603 - fixed argv, nodeids come from the hub
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=max(1.0, deadline - time.monotonic()),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log(f"pytest could not run ({exc}) — every AC stays not_found")
+            return {}
+        missing = _missing_nodeids(proc.stdout + "\n" + proc.stderr, pending)
+        if not missing:
+            return _parse_outcomes(proc.stdout, pending)
+        for nodeid, reason in sorted(missing.items()):
+            log(f"{nodeid} stays not_found: pytest says {reason}")
+        pending = [n for n in pending if n not in missing]
+    return {}
 
 
 # GitHub spells a step's result its own way; the hub's contract has three
