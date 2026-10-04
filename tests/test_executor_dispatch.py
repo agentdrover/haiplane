@@ -3209,3 +3209,73 @@ async def test_an_unreadable_tip_is_named_not_silent(db, monkeypatch):
     alerts = [a for a in await _alerts(db, task_id) if "не проверены" in a]
     assert len(alerts) == 1, alerts
     assert "network down" in alerts[0] and branch in alerts[0]
+
+
+# ---- #1563: хаб хранит starting_ref заказа ----
+
+
+async def _branch_launch(db, monkeypatch, slug: str):
+    """Заказ повторного прогона на задачу, у которой ветка уже запушена."""
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    _, task_id = await _task_with_findings(db, slug=slug)
+    await repo.update_task(db, task_id, branch=f"task-{task_id}/work")
+    await db.commit()
+    result = await el.repair_executor(
+        db, task_id, issuer_principal_id=await _human(db), issuer="o"
+    )
+    assert result.launched, result
+    return task_id, result, calls
+
+
+async def test_run_records_starting_ref(db, monkeypatch):
+    """AC-1: в executor_runs записан starting_ref, равный отправленному провайдеру."""
+    task_id, result, calls = await _branch_launch(db, monkeypatch, "exec-ref-rec")
+
+    row = await _row(db, result.row_id)
+    assert calls[0]["starting_ref"] == f"task-{task_id}/work"
+    assert row["starting_ref"] == calls[0]["starting_ref"]
+
+
+async def test_card_shows_recorded_starting_ref(db, monkeypatch):
+    """AC-2: карточка называет записанный starting_ref, а не безусловное «от базы»."""
+    task_id, result, _ = await _branch_launch(db, monkeypatch, "exec-ref-card")
+
+    row = await _row(db, result.row_id)
+    notes = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    launched = [n for n in notes if "Исполнитель запущен" in n or "агент " in n]
+    assert launched, notes
+    assert f"от {row['starting_ref']}" in launched[-1]
+    assert "от базы" not in launched[-1]
+
+
+async def test_a_first_launch_records_the_base_as_starting_ref(db, monkeypatch):
+    """Первый запуск без ветки: записана база, карточка называет её же."""
+    _launch_config(monkeypatch)
+    _creator(monkeypatch, [_CREATED])
+    project, task_id = await _launch_project(db, slug="exec-ref-base")
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert result.launched, result
+    assert (await _row(db, result.row_id))["starting_ref"] == "develop"
+
+
+async def test_starting_ref_is_committed_before_the_provider_call(db, monkeypatch):
+    """#1428: пока идёт сетевой заказ, запись starting_ref уже закоммичена и
+    write-лок не держится — иначе другой писатель ждал бы ответа Cursor."""
+    seen: dict = {}
+
+    async def _create(**kw):
+        seen["in_transaction"] = db.in_transaction
+        return _CREATED, None
+
+    _launch_config(monkeypatch)
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _create)
+    project, _ = await _launch_project(db, slug="exec-ref-lock")
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert result.launched, result
+    assert seen["in_transaction"] is False
+    assert (await _row(db, result.row_id))["starting_ref"] == "develop"

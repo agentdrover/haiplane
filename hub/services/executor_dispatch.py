@@ -1664,6 +1664,8 @@ async def executor_runs_view(
         {
             "generation": int(r["submission_generation"] or 0),
             "model": r["model"] or "",
+            # #1563: None — прогон до миграции или заказ без записи.
+            "starting_ref": r["starting_ref"],
             "tokens": r["tokens"],
             "cents": r["cents"],
             "started_at": r["started_at"],
