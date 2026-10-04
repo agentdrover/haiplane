@@ -770,3 +770,28 @@ async def test_auto_approval_never_reads_git_again_under_the_write_lock(
     assert (await client.get(f"/api/tasks/{task_id}")).json()["status"] == "open"
     assert calls, "the readiness pass itself reads the tree"
     assert inside == [0], f"git read inside maybe_auto_approve: {inside}"
+
+
+@pytest.mark.parametrize(
+    ("stored", "approves"),
+    [
+        ("auto", True),
+        ("human", False),
+        ("steward", False),
+        ("AUTO", False),
+        ("", False),
+        (1, False),
+        (["auto"], False),
+        (None, False),
+    ],
+)
+async def test_dor_autopilot_answers_as_the_raw_comparison_did(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, stored, approves
+) -> None:
+    # #1558 AC-3: the solver now reads dor through project_policy.gate_value_of;
+    # every value the write accepts, and garbage, answers as `== "auto"` did.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _project(db, "dor-table", {"dor": stored})
+    task_id = await _draft_in_project(client, db, pid)
+    body = await _refine_to_dor(client, task_id, ["docs/notes.md"])
+    assert body["status"] == ("open" if approves else "draft")
