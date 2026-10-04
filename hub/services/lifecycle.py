@@ -1844,6 +1844,13 @@ async def _pair_start_write(
     return git_mode
 
 
+def _worktree_hint(task_id: int) -> str:
+    """Worktree path template for the claim/pair-start response (#1515)."""
+    from hub.integrations.git_ops import worktree_hint
+
+    return worktree_hint(task_id)
+
+
 async def pair_start_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1970,6 +1977,7 @@ async def pair_start_task(
 
     tv.statement_freshness = await statement_freshness(db, dict(row))  # type: ignore[arg-type]
     tv.area_check = area_check
+    tv.worktree_hint = _worktree_hint(task_id)
     return tv
 
 
@@ -4307,7 +4315,9 @@ async def claim_task(
         ):
             row = await repo.get_task(db, task_id)
             updates = await repo.get_task_updates(db, task_id)
-            return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+            tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
+            tv.worktree_hint = _worktree_hint(task_id)
+            return tv
         holder = task.get("claimed_by") or "unknown"
         raise HTTPException(
             409,
@@ -4327,6 +4337,7 @@ async def claim_task(
             db, task_id, body, implementer_principal_id
         )
     if won_by_same_holder is not None:
+        won_by_same_holder.worktree_hint = _worktree_hint(task_id)
         return won_by_same_holder
     await log_activity(
         db,
@@ -4339,6 +4350,7 @@ async def claim_task(
     updates = await repo.get_task_updates(db, task_id)
     tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
     tv.area_check = area_check
+    tv.worktree_hint = _worktree_hint(task_id)
     return tv
 
 
