@@ -111,6 +111,11 @@ class LocalRun:
     dropped: int
     timed_out: bool
     duration_ms: int
+    # Транспорт runner (#1571): хаб никого не убивает, он ПРОСИТ службу снять
+    # прогон. ``None`` — снятия не было или оно прямое (direct: убивает сам
+    # хаб); ``True`` — служба ответила признаком снятия; ``False`` — просьба
+    # отправлена, подтверждения за срок ожидания нет.
+    cancel_confirmed: bool | None = None
 
 
 def transport() -> str:
@@ -824,6 +829,10 @@ async def run_review(
     """
     _REFUSAL.set("")
     if not is_configured():
+        if transport() == "runner":
+            # Причину уже назвал not_ready(); без этого карточка скажет «нет
+            # каталога, бинаря, прав» — фразу #1180 про другой транспорт.
+            _REFUSAL.set("; ".join(not_ready()))
         return None
     limit = timeout if timeout is not None else config.LOCAL_REVIEW_TIMEOUT_SEC
     if transport() == "runner":
@@ -1056,6 +1065,19 @@ def runner_problem() -> list[str]:
     return []
 
 
+def _heartbeat_age(spool: str) -> float | None:
+    try:
+        return time.time() - os.stat(os.path.join(spool, SPOOL_HEARTBEAT)).st_mtime
+    except OSError:
+        return None
+
+
+def _runner_silent(jobdir: str) -> bool:
+    """Служба взяла задание и замолчала: heartbeat старше порога готовности."""
+    age = _heartbeat_age(os.path.dirname(jobdir))
+    return age is None or age > RUNNER_HEARTBEAT_MAX_AGE_SEC
+
+
 def _submit_job(spool: str, prompt: str, limit: int) -> str:
     """Положить задание в очередь. Возвращает каталог задания.
 
@@ -1117,6 +1139,9 @@ def _result_to_run(result: dict[str, Any], started: float) -> LocalRun | None:
             dropped=int(result.get("dropped", 0)),
             timed_out=bool(result.get("timed_out", False)),
             duration_ms=int(result.get("duration_ms", 0)),
+            cancel_confirmed=(
+                True if result.get("cancelled") or result.get("timed_out") else None
+            ),
         )
     except (KeyError, TypeError, ValueError):
         _REFUSAL.set("служба-исполнитель вернула result.json неверной формы")
@@ -1160,6 +1185,15 @@ async def _await_result(jobdir: str, limit: int, started: float) -> LocalRun | N
             return None
         if now >= deadline:
             return await _time_out(jobdir, started)
+        if os.path.exists(claimed) and _runner_silent(jobdir):
+            # Упала после claim: перезапущенная служба этот каталог не
+            # прогонит, и без этой проверки хаб ждал бы весь лимит.
+            _cancel_job(jobdir, withdraw=False)
+            _REFUSAL.set(
+                "служба-исполнитель перестала отвечать во время прогона: "
+                f"{SPOOL_HEARTBEAT} старше {RUNNER_HEARTBEAT_MAX_AGE_SEC} с"
+            )
+            return None
         await asyncio.sleep(RUNNER_POLL_SEC)
 
 
@@ -1167,14 +1201,22 @@ async def _time_out(jobdir: str, started: float) -> LocalRun:
     """Лимит истёк: хаб пишет снятие и ждёт подтверждения службы, но не вечно."""
     _cancel_job(jobdir, withdraw=False)
     end = time.monotonic() + RUNNER_GRACE_SEC
-    while time.monotonic() < end and _read_result(jobdir) is None:
+    answer = _read_result(jobdir)
+    while answer is None and time.monotonic() < end:
         await asyncio.sleep(RUNNER_POLL_SEC)
+        answer = _read_result(jobdir)
+    confirmed = bool(
+        answer
+        and answer.get("status") == "ok"
+        and (answer.get("cancelled") or answer.get("timed_out"))
+    )
     return LocalRun(
         rc=TIMEOUT_RC,
         output="",
         dropped=0,
         timed_out=True,
         duration_ms=int((time.monotonic() - started) * 1000),
+        cancel_confirmed=confirmed,
     )
 
 

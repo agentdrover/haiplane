@@ -221,6 +221,16 @@ async def test_an_absent_runner_is_named_and_does_not_hang(spool, monkeypatch) -
     assert local_reviewer.not_ready(), "службы нет, готовность обязана это назвать"
     assert await local_reviewer.run_review("промт", timeout=30) is None
     assert time.monotonic() - started < 2
+    from hub.services.review_dispatch import _local_failure_reason
+
+    named = local_reviewer.refusal()
+    assert "служба-исполнитель не запущена" in named, (
+        "причину из not_ready() хаб обязан донести до карточки"
+    )
+    card = _local_failure_reason(None)
+    assert (
+        "служба-исполнитель не запущена" in card and "нет каталога, бинаря" not in card
+    )
 
     # Heartbeat есть, а задание никто не берёт: служба зависла или чужая.
     _beat(spool)
@@ -306,6 +316,7 @@ async def test_the_hub_writes_the_cancel_when_the_limit_passes(
                                     "output": "",
                                     "dropped": 0,
                                     "timed_out": False,
+                                    "cancelled": True,
                                     "duration_ms": 1,
                                     "reason": "",
                                 }
@@ -320,7 +331,116 @@ async def test_the_hub_writes_the_cancel_when_the_limit_passes(
         service.cancel()
     assert seen.get("cancel"), "хаб не написал снятие"
     assert run is not None and run.timed_out, "по лимиту хаба итог — таймаут"
+    assert run.cancel_confirmed is True, "служба ответила снятием — это подтверждение"
     assert _jobs(spool) == []
+
+
+async def test_the_card_names_whether_the_runner_confirmed_the_cancel(
+    spool, monkeypatch
+) -> None:
+    """Таймаут на runner: «подтверждено» и «не подтверждено» — два разных текста.
+
+    Хаб на этом транспорте никого не убивает, поэтому «процесс и вся его
+    группа убиты» про него — неправда (находка 89893c4bd8451eb0).
+    """
+    from hub.services.review_dispatch import (
+        _local_failure_reason,
+        _stopped_hub_reason,
+    )
+
+    monkeypatch.setattr(local_reviewer, "RUNNER_GRACE_SEC", 0.4)
+    _beat(spool)
+
+    async def claim_only() -> None:
+        while True:
+            for jobdir in _jobs(spool):
+                (jobdir / "claimed").write_text("")
+            await asyncio.sleep(0.01)
+
+    service = asyncio.create_task(claim_only())
+    try:
+        silent = await local_reviewer.run_review("промт", timeout=1)
+    finally:
+        service.cancel()
+    assert silent is not None and silent.timed_out
+    assert silent.cancel_confirmed is False
+    text = _local_failure_reason(silent)
+    assert "НЕ подтверждено" in text and "--timeout контейнера" in text, text
+    assert "убиты" not in text
+
+    answered = local_reviewer.LocalRun(124, "", 0, True, 1, cancel_confirmed=True)
+    ok_text = _local_failure_reason(answered)
+    assert "подтверждено" in ok_text and "НЕ подтверждено" not in ok_text, ok_text
+    assert "убиты" not in ok_text
+
+    direct = local_reviewer.LocalRun(124, "", 0, True, 1)
+    assert "процесс и вся его группа убиты" in _local_failure_reason(direct), (
+        "прямой транспорт убивает сам: прежний текст остаётся"
+    )
+
+    assert "отозвал задание" in _stopped_hub_reason()
+    assert "убит вместе с хабом" not in _stopped_hub_reason()
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TRANSPORT", "direct")
+    assert "убит вместе с хабом" in _stopped_hub_reason()
+
+
+async def test_a_runner_that_dies_after_the_claim_is_given_up_early(
+    spool, monkeypatch
+) -> None:
+    """Служба упала после claim: хаб не ждёт весь лимит, а называет причину."""
+    monkeypatch.setattr(local_reviewer, "RUNNER_HEARTBEAT_MAX_AGE_SEC", 2.0)
+    _beat(spool)
+
+    async def dying_service() -> None:
+        while True:
+            for jobdir in _jobs(spool):
+                if not (jobdir / "claimed").exists():
+                    (jobdir / "claimed").write_text("")
+                    _beat(spool, age=100.0)
+            await asyncio.sleep(0.01)
+
+    service = asyncio.create_task(dying_service())
+    started = time.monotonic()
+    try:
+        run = await local_reviewer.run_review("промт", timeout=60)
+    finally:
+        service.cancel()
+    assert run is None
+    assert time.monotonic() - started < 10, "хаб ждал службу, которой уже нет"
+    assert "перестала отвечать во время прогона" in local_reviewer.refusal()
+    assert _jobs(spool) == []
+
+
+def test_a_restarted_runner_closes_the_jobs_the_old_one_left(
+    spool, runner_mod, tmp_path
+) -> None:
+    """Осиротевший claimed-каталог закрывается result.json с названной причиной."""
+    cfg = _runner_cfg(runner_mod, tmp_path, spool, _fake_cli(tmp_path, "pass\n"))
+    orphan = _write_job(spool, "job-" + "3" * 16, {"version": 1, "timeout_sec": 5})
+    (orphan / "claimed").write_text("")
+    done = _write_job(spool, "job-" + "4" * 16, {"version": 1, "timeout_sec": 5})
+    (done / "claimed").write_text("")
+    (done / "result.json").write_text('{"status": "ok"}')
+    waiting = _write_job(spool, "job-" + "5" * 16, {"version": 1, "timeout_sec": 5})
+    assert runner_mod.recover_orphans(cfg) == 1
+    result = json.loads((orphan / "result.json").read_text())
+    assert result["status"] == "error" and "перезапущена" in result["reason"]
+    assert json.loads((done / "result.json").read_text()) == {"status": "ok"}
+    assert not (waiting / "result.json").exists(), "ждущее задание не трогаем"
+
+
+async def test_the_serving_runner_recovers_orphans_on_start(
+    spool, runner_mod, tmp_path
+) -> None:
+    cfg = _runner_cfg(runner_mod, tmp_path, spool, _fake_cli(tmp_path, "pass\n"))
+    orphan = _write_job(spool, "job-" + "6" * 16, {"version": 1, "timeout_sec": 5})
+    (orphan / "claimed").write_text("")
+    service = asyncio.create_task(runner_mod.serve(cfg))
+    try:
+        assert await _until(lambda: (orphan / "result.json").exists(), 3)
+    finally:
+        service.cancel()
+        await asyncio.gather(service, return_exceptions=True)
 
 
 # --------------------------------------------------------------------- AC-4
@@ -481,20 +601,32 @@ async def test_a_job_without_job_json_is_not_pending(
 
 
 async def test_the_runner_enforces_the_job_timeout_even_without_the_hub(
-    spool, runner_mod, tmp_path
+    spool, runner_mod, tmp_path, monkeypatch
 ) -> None:
     """Хаб упал и не пишет cancel: срок задания держит сама служба.
 
-    Процесс игнорирует SIGTERM, чтобы проверить и добивание группы.
+    Форма sudo смоделирована как есть: SIGTERM до потомка доходит (его
+    пересылает sudo), SIGKILL — нет (другой uid). Тест того же uid, где
+    SIGKILL работает, маскировал бы это (находка 654ca57c18089771).
     """
     marker = tmp_path / "outlived"
     argv = _fake_cli(
         tmp_path,
-        "import signal, time, pathlib\n"
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "import signal, sys, time, pathlib\n"
+        "signal.signal(signal.SIGTERM, lambda *a: sys.exit(143))\n"
         "time.sleep(3.0)\n"
         f"pathlib.Path({str(marker)!r}).write_text('x')\n",
     )
+    sent: list[int] = []
+    real = runner_mod._signal_group
+
+    def sudo_like(proc, sig):
+        sent.append(int(sig))
+        if sig == runner_mod.signal.SIGKILL:
+            return  # до потомка sudo не доходит
+        real(proc, sig)
+
+    monkeypatch.setattr(runner_mod, "_signal_group", sudo_like)
     cfg = _runner_cfg(runner_mod, tmp_path, spool, argv, term_grace=0.3)
     jobdir = _write_job(spool, "job-" + "d" * 16, {"version": 1, "timeout_sec": 1})
     started = time.monotonic()
@@ -502,8 +634,70 @@ async def test_the_runner_enforces_the_job_timeout_even_without_the_hub(
     assert time.monotonic() - started < 2.9
     result = json.loads((jobdir / "result.json").read_text())
     assert result["status"] == "ok" and result["timed_out"] is True, result
+    assert int(runner_mod.signal.SIGTERM) in sent, "SIGTERM не отправлен"
     await asyncio.sleep(3.0)
-    assert not marker.exists(), "процесс пережил срок и дописал файл"
+    assert not marker.exists(), "процесс пережил SIGTERM и дописал файл"
+
+
+async def test_the_runner_does_not_hang_when_nothing_can_kill_the_process(
+    spool, runner_mod, tmp_path, monkeypatch
+) -> None:
+    """Ни SIGTERM, ни SIGKILL не доходят: служба отвечает за ограниченное время.
+
+    Остаётся --timeout контейнера; служба не ждёт процесс вечно.
+    """
+    argv = _fake_cli(tmp_path, "import time\ntime.sleep(4.0)\n")
+    monkeypatch.setattr(runner_mod, "_signal_group", lambda proc, sig: None)
+    cfg = _runner_cfg(runner_mod, tmp_path, spool, argv, term_grace=0.3)
+    jobdir = _write_job(spool, "job-" + "7" * 16, {"version": 1, "timeout_sec": 1})
+    started = time.monotonic()
+    await runner_mod.run_pending(cfg)
+    assert time.monotonic() - started < 9
+    result = json.loads((jobdir / "result.json").read_text())
+    assert result["timed_out"] is True, result
+    await asyncio.sleep(3.2)  # пусть процесс доживёт сам, не мусорим
+
+
+def test_the_job_term_may_not_be_shorter_than_the_wrapper_timeout(
+    spool, runner_mod, tmp_path
+) -> None:
+    """Иначе хаб объявит снятие раньше, чем контейнер умрёт."""
+    job = json.dumps({"version": 1, "timeout_sec": 100}).encode()
+    assert runner_mod.parse_job(job, 1800, 100) == 100
+    with pytest.raises(runner_mod.JobRejected) as err:
+        runner_mod.parse_job(job, 1800, 101)
+    assert "--timeout" in str(err.value)
+    base = {
+        "HAIPLANE_REVIEW_RUNNER_SPOOL_DIR": "/s",
+        "HAIPLANE_REVIEW_RUNNER_SCRATCH_DIR": "/r",
+        "HAIPLANE_REVIEW_RUNNER_ARGV": "/usr/bin/sudo -n -u u /w",
+        "HAIPLANE_REVIEW_RUNNER_MAX_TIMEOUT_SEC": "600",
+    }
+    ok = runner_mod.load_config(
+        {**base, "HAIPLANE_REVIEW_RUNNER_WRAPPER_TIMEOUT_SEC": "600"}
+    )
+    assert ok.wrapper_timeout == 600
+    with pytest.raises(runner_mod.ConfigError):
+        runner_mod.load_config(
+            {**base, "HAIPLANE_REVIEW_RUNNER_WRAPPER_TIMEOUT_SEC": "601"}
+        )
+
+
+async def test_a_too_short_job_is_rejected_by_the_service(
+    spool, runner_mod, tmp_path
+) -> None:
+    ran = tmp_path / "ran"
+    argv = _fake_cli(
+        tmp_path, f"import pathlib\npathlib.Path({str(ran)!r}).write_text('x')\n"
+    )
+    cfg = _runner_cfg(runner_mod, tmp_path, spool, argv, wrapper_timeout=30)
+    jobdir = _write_job(
+        spool, "job-" + "9" * 15 + "a", {"version": 1, "timeout_sec": 5}
+    )
+    await runner_mod.run_pending(cfg)
+    result = json.loads((jobdir / "result.json").read_text())
+    assert result["status"] == "rejected" and "--timeout" in result["reason"]
+    assert not ran.exists()
 
 
 async def test_the_runner_runs_a_claimed_job_once_and_trims_the_output(

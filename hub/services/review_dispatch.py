@@ -4720,6 +4720,23 @@ async def cancel_local_runs() -> None:
         await _close_cancelled_run(handle)
 
 
+def _stopped_hub_reason() -> str:
+    """Текст о снятии при остановке хаба. На runner хаб никого не убивает."""
+    if local_reviewer.transport() == "runner":
+        return (
+            "Локальное машинное ревью снято при остановке хаба: хаб отозвал "
+            "задание и отправил снятие службе-исполнителю, подтверждения он "
+            "не дожидался (останавливается) — убирает прогон служба. Отчёта "
+            "нет. Это НЕ «ревью ничего не нашло» — вердикт остаётся человеку "
+            "(#1571)."
+        )
+    return (
+        "Локальное машинное ревью снято при остановке хаба: процесс "
+        "убит вместе с хабом, отчёта нет. Это НЕ «ревью ничего не "
+        "нашло» — вердикт остаётся человеку (#1180)."
+    )
+
+
 async def _close_cancelled_run(handle: _LocalRunHandle) -> None:
     """Отметить снятый при остановке прогон — по имени причины."""
     if not handle.db_path:
@@ -4747,9 +4764,7 @@ async def _close_cancelled_run(handle: _LocalRunHandle) -> None:
                 handle.task_id,
                 "hub",
                 "alert",
-                "Локальное машинное ревью снято при остановке хаба: процесс "
-                "убит вместе с хабом, отчёта нет. Это НЕ «ревью ничего не "
-                "нашло» — вердикт остаётся человеку (#1180).",
+                _stopped_hub_reason(),
             )
         await repo.set_review_dispatch_status(
             conn, handle.dispatch_id, "done" if review is not None else "failed"
@@ -4984,6 +4999,26 @@ def _local_failure_headline(run: local_reviewer.LocalRun | None) -> str:
     return f"прогон кончился без отчёта (код возврата {run.rc})"
 
 
+def _runner_timeout_reason(confirmed: bool) -> str:
+    """Таймаут на транспорте runner: хаб просит снять, а не убивает (#1571)."""
+    limit = config.LOCAL_REVIEW_TIMEOUT_SEC
+    if confirmed:
+        status = (
+            "Снятие отправлено службе-исполнителю и подтверждено: она "
+            "послала сигнал группе процесса"
+        )
+    else:
+        status = (
+            "Снятие отправлено службе-исполнителю, но НЕ подтверждено за "
+            f"{int(local_reviewer.RUNNER_GRACE_SEC)} с: жив ли прогон, "
+            "неизвестно, последний рубеж — собственный --timeout контейнера"
+        )
+    return (
+        f"Локальное машинное ревью снято по таймауту ({limit} с). {status}. "
+        "Отчёта нет. Вердикт остаётся человеку (#1571)."
+    )
+
+
 def _local_failure_reason(run: local_reviewer.LocalRun | None) -> str:
     """Почему прогона нет — по имени, а не «что-то пошло не так»."""
     if run is None:
@@ -5003,6 +5038,8 @@ def _local_failure_reason(run: local_reviewer.LocalRun | None) -> str:
             "этого прогона (детали в логе хаба). Это не «прочитано и чисто»: "
             "вердикт остаётся человеку (#1180)."
         )
+    if run.timed_out and run.cancel_confirmed is not None:
+        return _runner_timeout_reason(run.cancel_confirmed)
     if run.timed_out:
         return (
             f"Локальное машинное ревью снято по таймауту "

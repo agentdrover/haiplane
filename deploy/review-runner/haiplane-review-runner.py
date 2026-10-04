@@ -37,9 +37,16 @@
     <spool>/heartbeat                 служба жива (mtime обновляется)
 
 Снятие: файл cancel, исчезновение job.json (хаб остановлен и отозвал задание)
-или исчезновение самого каталога. Служба посылает группе процесса SIGTERM, а
-после grace — SIGKILL: SIGKILL от непривилегированного пользователя до sudo
-(root) не дойдёт, а SIGTERM sudo пересылает своему потомку.
+или исчезновение самого каталога. Служба посылает группе процесса SIGTERM —
+его sudo пересылает своему потомку — и ждёт grace. SIGKILL после этого
+отправляется, но на форме sudo он НЕ ДОХОДИТ: служба идёт от пользователя
+хаба, потомок sudo — от другого uid, а sudo SIGKILL не пересылает (его
+перехватить нельзя). Поэтому последний рубеж — НЕ служба, а собственный
+``--timeout`` контейнера во враппере; чтобы хаб не объявил снятие раньше, чем
+контейнер умрёт, срок задания обязан быть не меньше этого ``--timeout``
+(HAIPLANE_REVIEW_RUNNER_WRAPPER_TIMEOUT_SEC, проверка в parse_job).
+Результат снятия служба называет честно: ``cancelled`` / ``timed_out`` значат
+«сигнал отправлен», а не «процесс мёртв».
 """
 
 from __future__ import annotations
@@ -99,6 +106,7 @@ class Config:
     poll: float = 1.0
     heartbeat_every: float = 5.0
     term_grace: float = 10.0
+    wrapper_timeout: int = 0
     stale_sec: float = 3600.0
     output_cap: int = field(default=OUTPUT_CAP)
 
@@ -148,10 +156,29 @@ def load_config(env: Mapping[str, str]) -> Config:
         raise ConfigError("HAIPLANE_REVIEW_RUNNER_MAX_TIMEOUT_SEC не число") from exc
     if cap <= 0:
         raise ConfigError("HAIPLANE_REVIEW_RUNNER_MAX_TIMEOUT_SEC должен быть > 0")
-    return Config(spool=spool, argv=tuple(argv), scratch=scratch, max_timeout=cap)
+    raw = (env.get("HAIPLANE_REVIEW_RUNNER_WRAPPER_TIMEOUT_SEC") or "").strip()
+    try:
+        wrapper = int(raw) if raw else 0
+    except ValueError as exc:
+        raise ConfigError(
+            "HAIPLANE_REVIEW_RUNNER_WRAPPER_TIMEOUT_SEC не число"
+        ) from exc
+    if wrapper < 0 or wrapper > cap:
+        raise ConfigError(
+            "HAIPLANE_REVIEW_RUNNER_WRAPPER_TIMEOUT_SEC не может быть больше "
+            "HAIPLANE_REVIEW_RUNNER_MAX_TIMEOUT_SEC: потолок службы убил бы "
+            "прогон раньше, чем контейнер отсчитает свой --timeout"
+        )
+    return Config(
+        spool=spool,
+        argv=tuple(argv),
+        scratch=scratch,
+        max_timeout=cap,
+        wrapper_timeout=wrapper,
+    )
 
 
-def parse_job(raw: bytes, max_timeout: int) -> int:
+def parse_job(raw: bytes, max_timeout: int, wrapper_timeout: int = 0) -> int:
     """Срок прогона из задания, или JobRejected с причиной. Команды не читает."""
     try:
         data = json.loads(raw)
@@ -173,6 +200,13 @@ def parse_job(raw: bytes, max_timeout: int) -> int:
     timeout = data.get("timeout_sec")
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
         raise JobRejected("timeout_sec должен быть целым числом больше нуля")
+    if timeout < wrapper_timeout:
+        raise JobRejected(
+            f"срок задания {timeout} с меньше --timeout враппера "
+            f"({wrapper_timeout} с): хаб объявил бы снятие раньше, чем "
+            "контейнер умрёт. Выровняйте LOCAL_REVIEW_TIMEOUT_SEC хаба с "
+            "файлом timeout враппера"
+        )
     return min(timeout, max_timeout)
 
 
@@ -244,6 +278,7 @@ def _outcome(status: str, **over: object) -> dict[str, object]:
         "output": "",
         "dropped": 0,
         "timed_out": False,
+        "cancelled": False,
         "duration_ms": 0,
         "reason": "",
     }
@@ -303,7 +338,12 @@ def _signal_group(proc: asyncio.subprocess.Process, sig: int) -> None:
 
 
 async def _terminate(proc: asyncio.subprocess.Process, grace: float) -> None:
-    """SIGTERM группе (sudo перешлёт его потомку), после grace — SIGKILL."""
+    """SIGTERM группе (sudo перешлёт его потомку), после grace — SIGKILL.
+
+    SIGKILL здесь последняя попытка и ГАРАНТИИ НЕ ДАЁТ: на форме sudo потомок
+    идёт от другого uid, и сигнал до него не доходит. Последний рубеж там —
+    ``--timeout`` контейнера во враппере (см. docstring модуля).
+    """
     if proc.returncode is None:
         _signal_group(proc, signal.SIGTERM)
         with contextlib.suppress(asyncio.TimeoutError):
@@ -370,6 +410,7 @@ async def _run(
                 rc=(proc.returncode or 0) if done else TIMEOUT_RC,
                 output=sink.text() if done else "",
                 dropped=sink.dropped if done else 0,
+                cancelled=not done,
                 duration_ms=elapsed,
                 reason="" if done else "прогон снят по просьбе хаба",
             ),
@@ -383,7 +424,9 @@ async def _execute(cfg: Config, jobdir: str) -> tuple[dict[str, object], bool]:
     prompt_path = os.path.join(jobdir, SPOOL_PROMPT)
     try:
         timeout = parse_job(
-            _read_nofollow(os.path.join(jobdir, SPOOL_JOB), JOB_CAP), cfg.max_timeout
+            _read_nofollow(os.path.join(jobdir, SPOOL_JOB), JOB_CAP),
+            cfg.max_timeout,
+            cfg.wrapper_timeout,
         )
         prompt = _read_nofollow(prompt_path, PROMPT_CAP)
     except JobRejected as exc:
@@ -474,8 +517,35 @@ async def _heartbeat(cfg: Config) -> None:
         await asyncio.sleep(cfg.heartbeat_every)
 
 
+def recover_orphans(cfg: Config) -> int:
+    """Закрыть задания, взятые ПРОШЛЫМ процессом службы и брошенные на полпути.
+
+    Выбран вариант «закрыть с названной причиной», а не «подобрать и
+    перезапустить»: промт после чтения удалён, а повторный прогон одного и
+    того же задания тратит платное ревью дважды. Хаб, если ещё ждёт, получит
+    result.json с причиной сразу; если не ждёт — каталог уберёт sweep.
+    """
+    closed = 0
+    for entry in _job_dirs(cfg.spool):
+        claimed = os.path.join(entry.path, SPOOL_CLAIMED)
+        result = os.path.join(entry.path, SPOOL_RESULT)
+        if not os.path.exists(claimed) or os.path.exists(result):
+            continue
+        outcome = _outcome(
+            "error",
+            reason="служба-исполнитель была перезапущена во время прогона: "
+            "прогон потерян, повтор не делается",
+        )
+        with contextlib.suppress(OSError):
+            _write_atomic(entry.path, SPOOL_RESULT, json.dumps(outcome).encode())
+            closed += 1
+    return closed
+
+
 async def serve(cfg: Config) -> None:
     """Главный цикл: heartbeat, задания, уборка. Возвращается только отменой."""
+    with contextlib.suppress(OSError):
+        recover_orphans(cfg)
     beat = asyncio.create_task(_heartbeat(cfg))
     try:
         while True:
