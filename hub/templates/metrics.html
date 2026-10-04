@@ -378,7 +378,8 @@ lite в среднем 1.38M, deep 3.85M. Столбец Tokens рядом — �
 с отчётом: {{ m.review_model_cascade.reported }} ·
 полных: {{ m.review_model_cascade.complete }} ·
 неполных: {{ m.review_model_cascade.incomplete }} ·
-ждут отчёта: {{ m.review_model_cascade.pending }} за
+ждут отчёта: {{ m.review_model_cascade.pending }} ·
+заказ не удался: {{ m.review_model_cascade.failed }} за
 {{ m.review_model_cascade.since_days }} дн.</p>
 {% endif %}
 

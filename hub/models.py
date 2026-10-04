@@ -367,11 +367,30 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #1561: кто читает deep первым — cloud (по умолчанию) или local. Не гейт
     # и ничего не делегирует. Читатель: project_policy.deep_reviewer_of.
     "deep_reviewer",
+    # #1572: владелец объявляет «мерж = доставка» (у проекта нет релиз-PR и
+    # отдельного выката): срок исхода считается от даты мержа. Не гейт и
+    # ничего не делегирует. Читатель: project_policy.merge_is_delivery_of.
+    "merge_is_delivery",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
 _RISK_MAP_MAX_RULES = 100
 _RISK_MAP_MAX_PATTERN = 200
+
+
+def _validate_merge_is_delivery(policy: dict[str, Any]) -> None:
+    """``merge_is_delivery`` — только true или false (#1572).
+
+    Читатель понимает один ``True``; строка «true» выглядела бы включённой, ничего
+    не включая, поэтому запись отказывает громко.
+    """
+    if "merge_is_delivery" in policy and not isinstance(
+        policy["merge_is_delivery"], bool
+    ):
+        raise ValueError(
+            "gate_policy merge_is_delivery must be true or false, "
+            f"got: {policy['merge_is_delivery']!r}"
+        )
 
 
 def _validate_count(policy: dict[str, Any], key: str) -> None:
@@ -2757,6 +2776,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_count(v, "deep_daily_cap")
     _validate_count(v, "small_delta_lines")
     _validate_count(v, "circle_deep_stop")
+    _validate_merge_is_delivery(v)
     return v
 
 

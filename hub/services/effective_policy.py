@@ -66,12 +66,12 @@ def _ceiling_name(policy: dict) -> str | None:
 
 REGISTRY: dict[str, PolicyEntry] = {
     "dor": PolicyEntry(
-        lambda p: project_policy.gate_form_value(p, "dor"),
-        "project_policy.gate_form_value",
+        lambda p: project_policy.gate_value_of(p, "dor"),
+        "project_policy.gate_value_of",
     ),
     "verdict": PolicyEntry(
-        lambda p: project_policy.gate_form_value(p, "verdict"),
-        "project_policy.gate_form_value",
+        lambda p: project_policy.gate_value_of(p, "verdict"),
+        "project_policy.gate_value_of",
     ),
     "review": PolicyEntry(
         lambda p: (
@@ -156,6 +156,9 @@ REGISTRY: dict[str, PolicyEntry] = {
     ),
     "deep_reviewer": PolicyEntry(
         project_policy.deep_reviewer_of, "project_policy.deep_reviewer_of"
+    ),
+    "merge_is_delivery": PolicyEntry(
+        project_policy.merge_is_delivery_of, "project_policy.merge_is_delivery_of"
     ),
     "slot_dead_minutes": PolicyEntry(
         executor_slots.dead_minutes_of,
