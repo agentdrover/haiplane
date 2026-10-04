@@ -166,10 +166,15 @@ _NOT_FOUND_LINE = re.compile(
 )
 
 
-def _same_path(reported: str, wanted: str) -> bool:
-    """Equal, or one is the other with a directory prefix (pytest may print an
-    absolute path for a relative argument)."""
-    return reported == wanted or reported.endswith("/" + wanted)
+def _split_id(ident: str) -> tuple[str, str]:
+    """(absolute normalized file path, ``::`` tail) of a test id or path.
+
+    pytest may print an absolute path for a relative argument; both are brought
+    to one form, relative to the directory the tests are run from, and compared
+    for equality, never by suffix: ``nested/t.py`` is not ``t.py``.
+    """
+    path, sep, tail = ident.partition("::")
+    return os.path.abspath(path), sep + tail
 
 
 def _missing_nodeids(output: str, nodeids: list[str]) -> dict[str, str]:
@@ -180,15 +185,13 @@ def _missing_nodeids(output: str, nodeids: list[str]) -> dict[str, str]:
     in that file is missing with it.
     """
     missing: dict[str, str] = {}
+    split = {nodeid: _split_id(nodeid) for nodeid in nodeids}
     for match in _NOT_FOUND_LINE.finditer(output):
         kind, reported = match.groups()
         reason = match.group(0).removeprefix("ERROR: ")
-        for nodeid in nodeids:
-            if kind == "not found":
-                hit = _same_path(reported, nodeid)
-            else:
-                hit = _same_path(reported.split("::", 1)[0], nodeid.split("::", 1)[0])
-            if hit:
+        r_file, r_tail = _split_id(reported)
+        for nodeid, (n_file, n_tail) in split.items():
+            if r_file == n_file and (kind != "not found" or r_tail == n_tail):
                 missing[nodeid] = reason
     return missing
 

@@ -839,3 +839,28 @@ def test_a_pytest_failure_naming_nothing_is_not_retried(script, monkeypatch):
     monkeypatch.setattr(script.subprocess, "run", fake_run)
     assert script.run_nodeids(["t.py::a", "t.py::b"]) == {}
     assert len(calls) == 1
+
+
+def test_a_same_named_file_elsewhere_does_not_take_the_id_out(
+    script, inner_suite, tmp_path
+):
+    """#1581 round 3: nested/test_inner.py missing is not test_inner.py."""
+    passing = f"{inner_suite}::test_passes"
+    gone = f"nested/{inner_suite}::test_missing"
+
+    assert script.run_nodeids([gone, passing]) == {passing: True}
+
+
+def test_an_absolute_reported_path_still_matches_a_relative_id(
+    script, inner_suite, tmp_path
+):
+    """pytest prints '<abs>/test_inner.py::t' for a relative argument."""
+    passing = f"{inner_suite}::test_passes"
+    missing = f"{inner_suite}::test_typo"
+    absolute = f"ERROR: not found: {tmp_path / missing}\n(no match in any of [])\n"
+
+    assert script._missing_nodeids(absolute, [passing, missing]) == {
+        missing: f"not found: {tmp_path / missing}"
+    }
+    nested = f"ERROR: file or directory not found: {tmp_path / 'nested' / inner_suite}"
+    assert script._missing_nodeids(nested, [passing]) == {}
