@@ -723,3 +723,144 @@ def test_a_missing_baseline_report_is_not_sent(script, monkeypatch, tmp_path, ca
     monkeypatch.setenv("HAIPLANE_HUB_CI_BASELINE", str(tmp_path / "absent.json"))
     assert "baseline" not in _capture_payload(script, monkeypatch)
     assert "absent.json" in capsys.readouterr().out
+
+
+_INNER_TESTS = """
+import pytest
+
+def test_passes():
+    assert True
+
+def test_fails():
+    assert False
+
+@pytest.mark.parametrize("n", [1, 2, 3])
+def test_param(n):
+    assert n != 2
+"""
+
+
+@pytest.fixture
+def inner_suite(script, monkeypatch, tmp_path):
+    """A real pytest run against a throwaway suite, through the real runner."""
+    import shlex
+    import sys
+
+    (tmp_path / "test_inner.py").write_text(_INNER_TESTS)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        "HAIPLANE_HUB_CI_PYTEST", f"{shlex.quote(sys.executable)} -m pytest"
+    )
+    return "test_inner.py"
+
+
+def test_a_missing_nodeid_does_not_hide_the_others(script, inner_suite, capsys):
+    """#1581 AC-1: one absent test_ref is not_found alone, never all of them."""
+    passing = f"{inner_suite}::test_passes"
+    failing = f"{inner_suite}::test_fails"
+    missing = f"{inner_suite}::test_typo_in_the_card"
+
+    result = script.run_nodeids([passing, missing, failing])
+
+    assert result == {passing: True, failing: False}, (
+        "the existing ids keep their real outcome; the absent one is not in "
+        "the result, which the caller reports as not_found"
+    )
+    assert "test_typo_in_the_card" in capsys.readouterr().out, (
+        "the reason for not_found is named in the log, with the id"
+    )
+
+
+def test_all_present_nodeids_report_as_before(script, inner_suite):
+    """#1581 AC-2: with nothing missing the outcome is what it was, in one run."""
+    passing = f"{inner_suite}::test_passes"
+    parametrized = f"{inner_suite}::test_param"
+
+    calls: list[list[str]] = []
+    real_run = script.subprocess.run
+
+    def counting_run(cmd, **kwargs):
+        calls.append(cmd)
+        return real_run(cmd, **kwargs)
+
+    script.subprocess.run = counting_run
+    try:
+        result = script.run_nodeids([passing, parametrized])
+    finally:
+        script.subprocess.run = real_run
+
+    assert result == {passing: True, parametrized: False}, (
+        "one failing case fails the parametrized AC"
+    )
+    assert len(calls) == 1, "nothing missing: no extra pytest start"
+
+
+def test_a_missing_file_takes_only_its_own_ids_out(script, inner_suite, capsys):
+    """#1581 round 2: pytest names a missing FILE, not the ids inside it."""
+    passing = f"{inner_suite}::test_passes"
+    gone = ["no_such_dir/test_gone.py::test_x", "no_such_dir/test_gone.py::test_y"]
+
+    result = script.run_nodeids([gone[0], passing, gone[1]])
+
+    assert result == {passing: True}, (
+        "both ids of the absent file are not_found, the existing one is pass"
+    )
+    assert "test_gone.py" in capsys.readouterr().out
+
+
+def test_a_missing_file_and_a_missing_test_each_get_their_own_outcome(
+    script, inner_suite, capsys
+):
+    passing = f"{inner_suite}::test_passes"
+    failing = f"{inner_suite}::test_fails"
+    no_test = f"{inner_suite}::test_typo"
+    no_file = "no_such_dir/test_gone.py::test_x"
+
+    result = script.run_nodeids([no_file, passing, no_test, failing])
+
+    assert result == {passing: True, failing: False}
+    out = capsys.readouterr().out
+    assert "test_typo" in out and "test_gone.py" in out
+
+
+def test_a_pytest_failure_naming_nothing_is_not_retried(script, monkeypatch):
+    """No named missing id: behave as before, one run, no loop."""
+    calls = []
+
+    class Proc:
+        stdout = "collecting ... \nno tests ran\n"
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return Proc()
+
+    monkeypatch.setenv("HAIPLANE_HUB_CI_PYTEST", "python3 -m pytest")
+    monkeypatch.setattr(script.subprocess, "run", fake_run)
+    assert script.run_nodeids(["t.py::a", "t.py::b"]) == {}
+    assert len(calls) == 1
+
+
+def test_a_same_named_file_elsewhere_does_not_take_the_id_out(
+    script, inner_suite, tmp_path
+):
+    """#1581 round 3: nested/test_inner.py missing is not test_inner.py."""
+    passing = f"{inner_suite}::test_passes"
+    gone = f"nested/{inner_suite}::test_missing"
+
+    assert script.run_nodeids([gone, passing]) == {passing: True}
+
+
+def test_an_absolute_reported_path_still_matches_a_relative_id(
+    script, inner_suite, tmp_path
+):
+    """pytest prints '<abs>/test_inner.py::t' for a relative argument."""
+    passing = f"{inner_suite}::test_passes"
+    missing = f"{inner_suite}::test_typo"
+    absolute = f"ERROR: not found: {tmp_path / missing}\n(no match in any of [])\n"
+
+    assert script._missing_nodeids(absolute, [passing, missing]) == {
+        missing: f"not found: {tmp_path / missing}"
+    }
+    nested = f"ERROR: file or directory not found: {tmp_path / 'nested' / inner_suite}"
+    assert script._missing_nodeids(nested, [passing]) == {}
