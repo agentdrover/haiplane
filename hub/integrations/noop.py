@@ -240,7 +240,9 @@ class NoopGitOps:
         """No git here: "could not ask" is a reason, never "no such PR"."""
         raise RuntimeError("git не настроен — провайдера спросить нельзя")
 
-    async def branch_diff(self, repo: str, base: str, branch: str) -> str | None:
+    async def branch_diff(
+        self, repo: str, base: str, branch: str, context: int = 0
+    ) -> str | None:
         """No git here — the section must read this as "could not look" (#601)."""
         return None
 
