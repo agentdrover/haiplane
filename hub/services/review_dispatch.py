@@ -2168,6 +2168,9 @@ MODEL_CASCADE_EXHAUSTED_MARK = "[вторая ось ревью исчерпан
 #: Вид события, по которому считается исход второй оси.
 MODEL_CASCADE_EVENT = "review_model_cascade"
 
+#: Исход события, когда заказ второй модели не удался (#1566): прогона нет.
+MODEL_CASCADE_FAILED = "failed"
+
 #: Сколько вторых попыток С ОТЧЁТОМ нужно, чтобы печатать долю полных. Ниже —
 #: слово «недобор» (#1153). Пять — меньше месяца ожидаемого потока (около
 #: девяти в месяц по спайку #1168), и достаточно, чтобы «хотя бы половина»
@@ -2274,9 +2277,28 @@ async def _ask_a_stronger_model(
         f"{implementer or 'не заявлено'}). Модель взята из наблюдённых "
         "запусков, а не из каталога (#1237, #1243).",
     )
+    feed_mark = await _last_update_id(db, task_id)
     if not await maybe_dispatch_review(
         db, task_id, force_profile=DEEP, force_model=model
     ):
+        # #1566: отказ тоже попытка — иначе метрика молчит, пока механизм
+        # ломается. dispatch_id пуст: прогона нет, и читатели события
+        # (_runs, count_model_cascade_outcomes) обязаны это знать.
+        await repo.insert_event(
+            db,
+            kind=MODEL_CASCADE_EVENT,
+            task_id=task_id,
+            actor="policy",
+            payload={
+                "outcome": MODEL_CASCADE_FAILED,
+                "reason": await _refusal_reason_since(db, task_id, feed_mark),
+                "generation": generation,
+                "model": model,
+                "attempt": attempts + 1,
+                "dispatch_id": None,
+                "after_review_id": report.get("id"),
+            },
+        )
         await _alert(
             db,
             task_id,
@@ -2300,6 +2322,31 @@ async def _ask_a_stronger_model(
     )
     await db.commit()
     return True
+
+
+async def _last_update_id(db: aiosqlite.Connection, task_id: int) -> int:
+    rows = await fetchall(
+        db,
+        "SELECT COALESCE(MAX(id), 0) AS id FROM task_updates WHERE task_id = ?",
+        (task_id,),
+    )
+    return int(dict(rows[0])["id"])
+
+
+async def _refusal_reason_since(
+    db: aiosqlite.Connection, task_id: int, after_update_id: int
+) -> str:
+    """Текст отказа из алерта «Кросс-модельное ревью НЕ вызвано» после метки."""
+    from hub.services.review_availability import refusal_detail
+
+    rows = await fetchall(
+        db,
+        "SELECT content FROM task_updates WHERE task_id = ? AND id > ? "
+        "AND kind = 'alert' AND content LIKE 'Кросс-модельное ревью НЕ вызвано%' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, after_update_id),
+    )
+    return refusal_detail(str(dict(rows[0])["content"])) if rows else "unknown"
 
 
 async def _cascade_outcome(db: aiosqlite.Connection, event: dict[str, Any]) -> str:
@@ -2335,6 +2382,13 @@ async def _cascade_outcome(db: aiosqlite.Connection, event: dict[str, Any]) -> s
     return "incomplete" if later[0].get("incomplete") else "complete"
 
 
+def cascade_failed(payload: str | None) -> bool:
+    try:
+        return json.loads(payload or "{}").get("outcome") == MODEL_CASCADE_FAILED
+    except (ValueError, AttributeError):
+        return False
+
+
 async def count_model_cascade_outcomes(
     db: aiosqlite.Connection,
     since_days: int = ENVIRONMENT_REFUSAL_WINDOW_DAYS,
@@ -2356,8 +2410,16 @@ async def count_model_cascade_outcomes(
         f"SELECT task_id, payload FROM events WHERE kind = ? AND {where} ORDER BY id",  # nosec B608 - constant fragment
         (MODEL_CASCADE_EVENT, *params),
     )
-    outcomes = [await _cascade_outcome(db, dict(r)) for r in rows]
-    attempts = len(outcomes)
+    # #1566: неудавшаяся попытка не имеет прогона — отчёт поколения не её.
+    # Считаем до _cascade_outcome, иначе он возьмёт чужой следующий отчёт.
+    failed = 0
+    outcomes = []
+    for r in rows:
+        if cascade_failed(dict(r)["payload"]):
+            failed += 1
+            continue
+        outcomes.append(await _cascade_outcome(db, dict(r)))
+    attempts = len(outcomes) + failed
     complete = outcomes.count("complete")
     incomplete = outcomes.count("incomplete")
     reported = complete + incomplete
@@ -2366,7 +2428,7 @@ async def count_model_cascade_outcomes(
         share_note = (
             f"полных отчётов после переспроса другой моделью: {complete} из "
             f"{reported} с отчётом (попыток {attempts} за {since_days} дн., "
-            f"ждут отчёта {attempts - reported})"
+            f"ждут отчёта {len(outcomes) - reported}, не удалось заказать {failed})"
         )
     else:
         share_note = (
@@ -2378,7 +2440,8 @@ async def count_model_cascade_outcomes(
         "since_days": int(since_days),
         "attempts": attempts,
         "reported": reported,
-        "pending": attempts - reported,
+        "pending": len(outcomes) - reported,
+        "failed": failed,
         "complete": complete,
         "incomplete": incomplete,
         "min_sample": MODEL_CASCADE_MIN_SAMPLE,
