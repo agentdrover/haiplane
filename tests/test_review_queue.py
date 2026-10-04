@@ -41,7 +41,7 @@ class _Git(NoopGitOps):
     async def head_sha(self, repo: str, base: str) -> str:
         return self.tip
 
-    async def branch_diff(self, repo: str, base: str, branch: str):
+    async def branch_diff(self, repo: str, base: str, branch: str, context: int = 0):
         return "+++ b/x.py\n+line\n"
 
 

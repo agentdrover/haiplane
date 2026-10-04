@@ -269,6 +269,95 @@ def file_line_counts(diff: str) -> list[tuple[str, int]]:
     return sorted(counts.items(), key=lambda item: -item[1])
 
 
+def _section_header_path(line: str) -> str:
+    raw = line[4:].strip()
+    return raw[2:] if raw[:2] in ("a/", "b/") else raw
+
+
+def diff_file_sections(diff: str) -> list[tuple[str, str]]:
+    """``[(path, text of that file's part of the diff)]`` in diff order (#1582).
+
+    A file begins ONLY at a ``diff --git`` line, which git writes at the start
+    of every file and which a hunk body can never contain (its lines carry a
+    ``+``, ``-`` or space prefix). ``---``/``+++`` are read as headers only
+    between that line and the first ``@@``: inside a hunk a removed ``-- sql
+    comment`` reads as ``--- sql comment`` and an added ``++ x`` as ``+++ x``,
+    and taking them for a header used to swallow the rest of the edit.
+
+    Text before the first ``diff --git`` is a section of its own, with its
+    path from its ``+++`` header if it has one: dropping what cannot be
+    attributed would be the silent cut this function exists to prevent.
+    """
+    sections: list[tuple[str, str]] = []
+    path, in_header = "", True
+    buf: list[str] = []
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if buf:
+                sections.append((path, "".join(buf)))
+            path, in_header, buf = line.rstrip("\n").rsplit(" b/", 1)[-1], True, []
+        elif in_header and line.startswith("@@"):
+            in_header = False
+        elif in_header and line.startswith("+++ "):
+            named = _section_header_path(line)
+            path = path if named == "/dev/null" else named
+        elif in_header and line.startswith("--- ") and not path:
+            named = _section_header_path(line)
+            path = "" if named == "/dev/null" else named
+        buf.append(line)
+    if buf:
+        sections.append((path, "".join(buf)))
+    return sections
+
+
+def fit_file_sections(
+    sections: list[tuple[str, str]], ceiling: int
+) -> tuple[str, list[str]]:
+    """``(text, names of the files that did not fit)`` under ``ceiling`` chars.
+
+    Whole files only, in order: a file cut mid-hunk would be read as the whole
+    change, and the reviewer cannot tell a half from the thing (#1582). A file
+    that does not fit is skipped and the next one is tried, so one huge file
+    does not take the place of five small ones.
+    """
+    kept: list[str] = []
+    omitted: list[str] = []
+    used = 0
+    for path, text in sections:
+        if used + len(text) <= ceiling:
+            kept.append(text if text.endswith("\n") else text + "\n")
+            used += len(text)
+        else:
+            omitted.append(path or "(часть диффа без имени файла)")
+    return "".join(kept), omitted
+
+
+def _inline_diff_lines(
+    diff: str, dropped: list[str], delta_paths: list[str] | None, ceiling: int
+) -> tuple[list[str], list[str]]:
+    """Блок ``(lines, omitted)``: текст диффа для ревьюера без клона (#1582).
+
+    Выбор файлов — тот же, что у команды: без сгенерированных (``dropped``) и,
+    на пересдаче, только дельта. Остальное решает потолок.
+    """
+    sections = [
+        (path, text)
+        for path, text in diff_file_sections(diff)
+        if path not in dropped and (not delta_paths or path in delta_paths)
+    ]
+    text, omitted = fit_file_sections(sections, ceiling)
+    lines = []
+    if omitted:
+        lines.append(
+            f"НЕ ВОШЛИ В ПРОМТ (потолок {ceiling} символов, файлы режутся "
+            f"ЦЕЛИКОМ): {', '.join(omitted)}. Этих файлов у тебя нет и взять "
+            "их негде: назови их в lost_dimensions и сдай incomplete=true — "
+            "ноль находок по ним значит «не проверено», а не «чисто»."
+        )
+    lines.append("=== ДИФФ (приложен хабом) ===\n" + text + "=== КОНЕЦ ДИФФА ===")
+    return lines, omitted
+
+
 async def previous_findings(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> tuple[list[str], list[str]]:
@@ -618,6 +707,7 @@ def diff_plan(
     prior_findings: list[str] | None = None,
     base_paths: list[str] | None = None,
     deferred_findings: list[str] | None = None,
+    inline_ceiling: int | None = None,
 ) -> tuple[str, str]:
     """What the reviewer should read, and the note for the task update (#874).
 
@@ -637,7 +727,20 @@ def diff_plan(
     from the author (#1249). They are NAMED, not removed: a defect can exist
     only where two branches meet — #1238 was exactly that — and a reviewer who
     never learns the base moved cannot look for one.
+
+    ``inline_ceiling`` (#1582) is set only for a reviewer with no clone — the
+    local one (#1180). The block then carries the diff text itself instead of
+    the command, cut by whole files under that many characters, the cut files
+    named. The cloud block (None) is unchanged.
     """
+    if diff is None and inline_ceiling is not None:
+        return (
+            f"ПРЕДМЕТ РЕВЬЮ: дифф {base}...{branch}. Прочитать его хабу не "
+            "удалось, поэтому в промте его НЕТ, а клона у тебя тоже нет. Ничего "
+            "из диффа ты не видел: сдай incomplete=true и назови это в "
+            "lost_dimensions — отчёт «чисто» тут был бы выдумкой.",
+            "дифф не прочитан, в промт не приложен",
+        )
     if diff is None:
         return (
             f"ПРЕДМЕТ РЕВЬЮ: дифф {base}...{branch}. Прочитать его хабу не "
@@ -648,10 +751,17 @@ def diff_plan(
     kept, dropped = split_generated(diff)
     excludes = "".join(f" ':(exclude){path}'" for path in dropped)
     scope = "".join(f" '{path}'" for path in (delta_paths or []))
-    lines = [
-        f"ПРЕДМЕТ РЕВЬЮ — команда диффа (выполни ЕЁ, а не свою):\n"
-        f"  git diff {base}...{branch} --{excludes}{scope}"
-    ]
+    if inline_ceiling is None:
+        lines = [
+            f"ПРЕДМЕТ РЕВЬЮ — команда диффа (выполни ЕЁ, а не свою):\n"
+            f"  git diff {base}...{branch} --{excludes}{scope}"
+        ]
+    else:
+        lines = [
+            f"ПРЕДМЕТ РЕВЬЮ — дифф {base}...{branch} ПРИЛОЖЕН НИЖЕ. Клона у "
+            "тебя нет: команд git не выполняй и исходников на машине не ищи, "
+            "читай дифф из промта."
+        ]
     if delta_paths:
         lines.append(
             f"ОХВАТ: прочитана ДЕЛЬТА, а не весь дифф — {delta_note}. "
@@ -709,6 +819,13 @@ def diff_plan(
             "имеет права съесть бюджет, которого ждали остальные."
         )
     note_bits = []
+    if inline_ceiling is not None:
+        inline, omitted = _inline_diff_lines(diff, dropped, delta_paths, inline_ceiling)
+        lines.extend(inline)
+        note_bits.append(
+            "дифф приложен к промту"
+            + (f", не вошло файлов: {len(omitted)}" if omitted else "")
+        )
     if delta_note:
         note_bits.append(delta_note)
     if dropped:
@@ -1783,6 +1900,10 @@ def _delivery_block(task_id: int, code: str, base_url: str) -> str:
     )
 
 
+_READ_THE_DIFF_BY_COMMAND = "прочитай дифф КОМАНДОЙ ИЗ ПРЕДМЕТА РЕВЬЮ выше и только его"
+_READ_THE_DIFF_INLINE = "прочитай дифф, приложенный к предмету ревью выше (клона нет)"
+
+
 def _review_prompt(
     task_id: int,
     branch: str,
@@ -1794,6 +1915,7 @@ def _review_prompt(
     delivery_block: str = "",
     only_tests_block: str = "",
     needs_container: bool = False,
+    inline_diff: bool = False,
 ) -> str:
     common = (
         f"Ты — независимый код-ревьюер задачи #{task_id} хаба Haiplane "
@@ -1843,8 +1965,8 @@ def _review_prompt(
         return (
             common + "Это ЛЁГКОЕ ревью: ОДИН проход. Порядок: "
             f"1) hub_get_review_brief(task_id={task_id}) — предмет ревью; "
-            "2) прочитай дифф КОМАНДОЙ ИЗ ПРЕДМЕТА РЕВЬЮ выше и только его — "
-            "не исследуй репозиторий целиком, контекст берётся из диффа; "
+            f"2) {_READ_THE_DIFF_INLINE if inline_diff else _READ_THE_DIFF_BY_COMMAND}"
+            " — не исследуй репозиторий целиком, контекст берётся из диффа; "
             "3) один проход по изменённым файлам: ищи дефекты корректности, "
             "потерянные граничные случаи, несоответствие заявленным AC; "
             f"4) сдай hub_submit_machine_review(task_id={task_id}, "
@@ -1891,7 +2013,7 @@ async def _git_context(
 
 
 async def _submission_diff(
-    db: aiosqlite.Connection, task_id: int, branch: str
+    db: aiosqlite.Connection, task_id: int, branch: str, context: int = 0
 ) -> str | None:
     """The submitted branch diff, or None when it cannot be read (#820).
 
@@ -1904,6 +2026,10 @@ async def _submission_diff(
         return None
     workspace, base = ctx
     try:
+        if context:
+            return await plugins.git_ops.branch_diff(
+                workspace, base, branch, context=context
+            )
         return await plugins.git_ops.branch_diff(workspace, base, branch)
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
         log.warning("could not read the diff of task #%s: %s", task_id, exc)
@@ -3034,6 +3160,7 @@ async def prepare_review_order(
     principal_id: int | None,
     force_model: str = "",
     cloud: bool = False,
+    inline_diff: bool = False,
 ) -> ReviewOrder:
     """Собрать заказ: профиль по диффу, правила, предмет ревью, доступ.
 
@@ -3048,6 +3175,11 @@ async def prepare_review_order(
     ``cloud`` — заказ облачного канала: только он тратит квоту провайдера и
     только он подчиняется суточному потолку deep (#1414). Локальный
     ревьюер квоту Cursor не тратит — решение владельца 25.09.
+
+    ``inline_diff`` — заказ для ревьюера БЕЗ клона (локальный, #1180): вместо
+    команды ``git diff`` в предмет ревью кладётся сам дифф, снятый на
+    закреплённом sha сдачи (#824), с потолком ``LOCAL_REVIEW_DIFF_CHAR_CEILING``
+    (#1582). Профиль по-прежнему решается диффом ветки, как и у облака.
     """
     task_id = int(task["id"])
     model_id = force_model or pick_review_model(
@@ -3085,15 +3217,17 @@ async def prepare_review_order(
         )
     rules_block, rules_note = await collect_review_rules(db, task_id, diff)
     prior, deferred = await previous_findings(db, task_id, generation)
+    plan_diff, plan_branch = await _subject_diff(db, task, branch, diff, inline_diff)
     diff_block, diff_note = diff_plan(
-        diff,
+        plan_diff,
         base,
-        branch,
+        plan_branch,
         subject.paths,
         subject.note,
         prior,
         subject.base_paths,
         deferred,
+        config.LOCAL_REVIEW_DIFF_CHAR_CEILING if inline_diff else None,
     )
     # #875: what the toolchain already proved on THIS commit. Built from the
     # task row the caller already read, so no extra query for the common case.
@@ -3127,12 +3261,41 @@ async def prepare_review_order(
             _delivery_block(task_id, code, hub_base),
             call_sites.only_tests_block(only_tests),
             needs_container=task_needs_container(task),
+            inline_diff=inline_diff,
         ),
         rules_note=rules_note,
         diff_note=diff_note,
         prepass=prepass,
         access_code=code,
         only_tests=None if only_tests is None else tuple(s.symbol for s in only_tests),
+    )
+
+
+async def _subject_diff(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    branch: str,
+    branch_diff: str | None,
+    inline_diff: bool,
+) -> tuple[str | None, str]:
+    """``(дифф для предмета ревью, как назвать ветку)`` (#1582).
+
+    Облаку — дифф ветки, как и раньше. Ревьюеру без клона — дифф с контекстом
+    (``LOCAL_REVIEW_DIFF_CONTEXT_LINES``: у него нет клона, чтобы посмотреть
+    окружающий код; расчёт профиля остаётся на ``-U0``) на
+    ЗАКРЕПЛЁННОМ sha сдачи (#824): ветка могла уйти вперёд, пока заказ ждал, и
+    ревьюер прочёл бы не то, что сдано. Не прочитался закреплённый — это
+    ``None`` и честное «диффа нет», а не молчаливая подмена диффом ветки.
+    Закрепления нет вовсе (сдачи не было) — брать нечего, кроме ветки.
+    """
+    sha = (task.get("submission_sha") or "").strip()
+    if not inline_diff or not sha:
+        return branch_diff, branch
+    return (
+        await _submission_diff(
+            db, int(task["id"]), sha, config.LOCAL_REVIEW_DIFF_CONTEXT_LINES
+        ),
+        f"{branch}@{sha[:12]}",
     )
 
 
@@ -4567,7 +4730,8 @@ def _local_order_kwargs() -> dict[str, Any]:
     расходует облачный fallback после отказа локального — как любой облачный
     deep.
     """
-    kwargs: dict[str, Any] = {}
+    # #1582: клона у локального ревьюера нет (#1180) — дифф едет в промте.
+    kwargs: dict[str, Any] = {"inline_diff": True}
     if model := local_reviewer.model():
         kwargs["force_model"] = model
     return kwargs
