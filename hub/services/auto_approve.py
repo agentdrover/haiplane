@@ -31,7 +31,7 @@ from hub import config
 from hub import repository as repo
 from hub.db import deserialize_str_list
 from hub.models import DoRCheckItem, RiskClass
-from hub.services.project_policy import gate_policy_of
+from hub.services.project_policy import gate_policy_of, gate_value_of
 
 log = logging.getLogger(__name__)
 
@@ -217,7 +217,7 @@ async def maybe_auto_approve(
     if project is None:
         return False
     policy = gate_policy_of(project)
-    if policy.get("dor") != "auto":
+    if gate_value_of(policy, "dor") != "auto":
         return False
     project_slug = project["slug"]
 
