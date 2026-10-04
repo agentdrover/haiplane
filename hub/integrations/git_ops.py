@@ -1806,8 +1806,13 @@ class GitOpsIntegration:
         rc, out, _ = await _git("rev-parse", f"origin/{base}", repo=repo, check=False)
         return out.strip() if rc == 0 else ""
 
-    async def branch_diff(self, repo: str, base: str, branch: str) -> str | None:
-        """``git diff -U0 base...branch``, or None when it cannot be read (#601).
+    async def branch_diff(
+        self, repo: str, base: str, branch: str, context: int = 0
+    ) -> str | None:
+        """``git diff -U<context> base...branch``, or None when unreadable (#601).
+
+        ``context`` (#1582) is the unchanged lines around each change: 0 for
+        the hub's own measurements, more for a reviewer that has no clone.
 
         None rather than "" on failure: an empty diff and an unreadable one are
         different answers, and the section must be able to say which.
@@ -1847,7 +1852,7 @@ class GitOpsIntegration:
             return None
         rc, out, _ = await _git(
             "diff",
-            "-U0",
+            f"-U{max(0, int(context))}",
             f"{base_sha}...{branch_sha}",
             repo=repo,
             check=False,

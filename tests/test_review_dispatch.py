@@ -93,7 +93,7 @@ class _PinnedGitOps(NoopGitOps):
         # no such file, exactly as `git show base:path` behaves.
         self._rules = rules or {}
 
-    async def branch_diff(self, repo, base, branch):
+    async def branch_diff(self, repo, base, branch, context=0):
         if branch != self._tip and re.fullmatch(r"[0-9a-f]{40}", branch or ""):
             # #1361: a pinned commit other than the tip is ANOTHER submission,
             # and by default another author edit — every fixture here models
@@ -2443,7 +2443,7 @@ class _AncestryGitOps(_PinnedGitOps):
     async def is_ancestor(self, repo, ancestor, descendant):
         return self._ancestor
 
-    async def branch_diff(self, repo, base, branch):
+    async def branch_diff(self, repo, base, branch, context=0):
         # The delta call passes the previous SHA as `base`; anything else is
         # the ordinary branch diff.
         if base == _PREV_SHA:
@@ -2669,7 +2669,7 @@ class _ThreeGenerationsGitOps(_AncestryGitOps):
             return _GEN3_PART
         return None
 
-    async def branch_diff(self, repo, base, branch):
+    async def branch_diff(self, repo, base, branch, context=0):
         since = self._since(base)
         if since is not None:
             return since
@@ -4194,7 +4194,7 @@ class _ShaDiffGitOps(_PinnedGitOps):
         super().__init__(tip, ["docs/notes.md"], diffs[tip])
         self._diffs = diffs
 
-    async def branch_diff(self, repo, base, branch):
+    async def branch_diff(self, repo, base, branch, context=0):
         return self._diffs.get(branch, self._diffs[self._tip])
 
 
@@ -14860,7 +14860,7 @@ async def _circle_resubmission(
 
 
 class _UnreadableGitOps(_PinnedGitOps):
-    async def branch_diff(self, repo, base, branch):
+    async def branch_diff(self, repo, base, branch, context=0):
         raise RuntimeError("git недоступен")
 
 
@@ -16392,7 +16392,7 @@ async def test_a_local_review_prompt_carries_the_diff_inline(
     asked: list[str] = []
     real = _PinnedGitOps.branch_diff
 
-    async def _recording(self, repo_, base, branch):
+    async def _recording(self, repo_, base, branch, context=0):
         asked.append(branch)
         return await real(self, repo_, base, branch)
 
@@ -16468,3 +16468,61 @@ async def test_the_cloud_prompt_keeps_the_diff_command(
     assert "NEW_ALPHA" not in prompt and "OLD_ALPHA" not in prompt, (
         "облаку дифф не инлайнится: у агента есть клон"
     )
+
+
+_SQL_HUNK_DIFF = (
+    "diff --git a/db/q.sql b/db/q.sql\n"
+    "--- a/db/q.sql\n"
+    "+++ b/db/q.sql\n"
+    "@@ -1,3 +1,3 @@\n"
+    "--- OLD_SQL_COMMENT\n"
+    "+++ NEW_PLUS_PLUS_LINE\n"
+    "+AFTER_THE_LOOKALIKES\n" + _file_diff("hub/next.py", "NEXT")
+)
+
+
+def test_a_hunk_line_that_looks_like_a_file_header_does_not_split_the_file():
+    """Находка 523e42c1: «--- …»/«+++ …» в теле хунка — строки правки, не заголовок."""
+    from hub.services.review_dispatch import diff_file_sections
+
+    sections = diff_file_sections(_SQL_HUNK_DIFF)
+    assert [p for p, _ in sections] == ["db/q.sql", "hub/next.py"]
+    body = dict(sections)["db/q.sql"]
+    assert "OLD_SQL_COMMENT" in body and "NEW_PLUS_PLUS_LINE" in body
+    assert "AFTER_THE_LOOKALIKES" in body, "хвост правки не пропал"
+
+
+async def test_the_local_prompt_keeps_a_hunk_with_header_lookalikes(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    prompt, _, _ = await _local_prompt(
+        client, db, monkeypatch, tmp_path, "inline-lookalike", _SQL_HUNK_DIFF
+    )
+    assert "AFTER_THE_LOOKALIKES" in prompt and "NEW_PLUS_PLUS_LINE" in prompt
+
+
+async def test_the_local_diff_is_read_with_context_and_the_profile_without(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Без клона окружающий код ревьюеру взять негде: инлайн снимается с контекстом."""
+    asked: list[tuple[str, int]] = []
+    real = _PinnedGitOps.branch_diff
+
+    async def _with_context(self, repo_, base, branch, context=0):
+        asked.append((branch, context))
+        got = await real(self, repo_, base, branch)
+        if context:
+            got = got.replace(
+                "@@ -1 +1 @@\n", "@@ -1,3 +1,3 @@\n NEIGHBOUR_FUNCTION_LINE\n", 1
+            )
+        return got
+
+    monkeypatch.setattr(_PinnedGitOps, "branch_diff", _with_context)
+    prompt, _, task_id = await _local_prompt(
+        client, db, monkeypatch, tmp_path, "inline-context", _INLINE_DIFF
+    )
+    task = dict(await repo.get_task(db, task_id))
+    assert "NEIGHBOUR_FUNCTION_LINE" in prompt, "неизменённая строка рядом в промте"
+    assert (task["submission_sha"], config.LOCAL_REVIEW_DIFF_CONTEXT_LINES) in asked
+    assert config.LOCAL_REVIEW_DIFF_CONTEXT_LINES >= 10
+    assert any(ctx == 0 for _, ctx in asked), "расчёт профиля остался на -U0"

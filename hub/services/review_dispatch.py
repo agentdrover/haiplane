@@ -277,34 +277,33 @@ def _section_header_path(line: str) -> str:
 def diff_file_sections(diff: str) -> list[tuple[str, str]]:
     """``[(path, text of that file's part of the diff)]`` in diff order (#1582).
 
-    A file begins at ``diff --git`` or, for a diff without those lines, at a
-    ``---`` line that is followed by ``+++``: the PAIR, because a removed line
-    starting with ``-- `` also reads as ``--- `` in a zero-context diff. Text
-    before the first header is a section with an empty path: dropping what
-    cannot be attributed would be the silent cut this function exists to
-    prevent.
+    A file begins ONLY at a ``diff --git`` line, which git writes at the start
+    of every file and which a hunk body can never contain (its lines carry a
+    ``+``, ``-`` or space prefix). ``---``/``+++`` are read as headers only
+    between that line and the first ``@@``: inside a hunk a removed ``-- sql
+    comment`` reads as ``--- sql comment`` and an added ``++ x`` as ``+++ x``,
+    and taking them for a header used to swallow the rest of the edit.
+
+    Text before the first ``diff --git`` is a section of its own, with its
+    path from its ``+++`` header if it has one: dropping what cannot be
+    attributed would be the silent cut this function exists to prevent.
     """
-    lines = diff.splitlines(keepends=True)
     sections: list[tuple[str, str]] = []
-    path, seen_new = "", False
+    path, in_header = "", True
     buf: list[str] = []
-    for i, line in enumerate(lines):
-        nxt = lines[i + 1] if i + 1 < len(lines) else ""
-        starts = line.startswith("diff --git ") or (
-            seen_new and line.startswith("--- ") and nxt.startswith("+++ ")
-        )
-        if starts and buf:
-            sections.append((path, "".join(buf)))
-            path, seen_new, buf = "", False, []
+    for line in diff.splitlines(keepends=True):
         if line.startswith("diff --git "):
-            path = line.rstrip("\n").rsplit(" b/", 1)[-1]
-        elif line.startswith("--- ") and not path and nxt.startswith("+++ "):
-            named = _section_header_path(line)
-            path = "" if named == "/dev/null" else named
-        elif line.startswith("+++ ") and not seen_new:
-            seen_new = True
+            if buf:
+                sections.append((path, "".join(buf)))
+            path, in_header, buf = line.rstrip("\n").rsplit(" b/", 1)[-1], True, []
+        elif in_header and line.startswith("@@"):
+            in_header = False
+        elif in_header and line.startswith("+++ "):
             named = _section_header_path(line)
             path = path if named == "/dev/null" else named
+        elif in_header and line.startswith("--- ") and not path:
+            named = _section_header_path(line)
+            path = "" if named == "/dev/null" else named
         buf.append(line)
     if buf:
         sections.append((path, "".join(buf)))
@@ -2014,7 +2013,7 @@ async def _git_context(
 
 
 async def _submission_diff(
-    db: aiosqlite.Connection, task_id: int, branch: str
+    db: aiosqlite.Connection, task_id: int, branch: str, context: int = 0
 ) -> str | None:
     """The submitted branch diff, or None when it cannot be read (#820).
 
@@ -2027,6 +2026,10 @@ async def _submission_diff(
         return None
     workspace, base = ctx
     try:
+        if context:
+            return await plugins.git_ops.branch_diff(
+                workspace, base, branch, context=context
+            )
         return await plugins.git_ops.branch_diff(workspace, base, branch)
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
         log.warning("could not read the diff of task #%s: %s", task_id, exc)
@@ -3277,7 +3280,9 @@ async def _subject_diff(
 ) -> tuple[str | None, str]:
     """``(дифф для предмета ревью, как назвать ветку)`` (#1582).
 
-    Облаку — дифф ветки, как и раньше. Ревьюеру без клона — дифф на
+    Облаку — дифф ветки, как и раньше. Ревьюеру без клона — дифф с контекстом
+    (``LOCAL_REVIEW_DIFF_CONTEXT_LINES``: у него нет клона, чтобы посмотреть
+    окружающий код; расчёт профиля остаётся на ``-U0``) на
     ЗАКРЕПЛЁННОМ sha сдачи (#824): ветка могла уйти вперёд, пока заказ ждал, и
     ревьюер прочёл бы не то, что сдано. Не прочитался закреплённый — это
     ``None`` и честное «диффа нет», а не молчаливая подмена диффом ветки.
@@ -3287,7 +3292,9 @@ async def _subject_diff(
     if not inline_diff or not sha:
         return branch_diff, branch
     return (
-        await _submission_diff(db, int(task["id"]), sha),
+        await _submission_diff(
+            db, int(task["id"]), sha, config.LOCAL_REVIEW_DIFF_CONTEXT_LINES
+        ),
         f"{branch}@{sha[:12]}",
     )
 
