@@ -70,7 +70,7 @@ def _sample(n: int) -> dict[str, Any]:
 
 async def _runs(db: aiosqlite.Connection, scope: Scope) -> list[dict[str, Any]]:
     """Прогоны окна с типом заказа, каналом и счётом."""
-    from hub.services.review_dispatch import MODEL_CASCADE_EVENT
+    from hub.services.review_dispatch import MODEL_CASCADE_EVENT, cascade_failed
 
     where, params = scope.where(
         "d.created_at", task_column="d.task_id", model_column="d.model"
@@ -94,7 +94,13 @@ async def _runs(db: aiosqlite.Connection, scope: Scope) -> list[dict[str, Any]]:
         "SELECT payload FROM events WHERE kind = ?",
         (MODEL_CASCADE_EVENT,),
     )
-    cascade_ids = {_cascade_dispatch_id(r["payload"]) for r in cascade_rows}
+    # #1566: неудавшаяся попытка — не прогон; её событие не метит ничего.
+    cascade_ids = {
+        _cascade_dispatch_id(r["payload"])
+        for r in cascade_rows
+        if not cascade_failed(r["payload"])
+    }
+    cascade_ids.discard(None)
     runs = []
     for row in rows:
         run = dict(row)

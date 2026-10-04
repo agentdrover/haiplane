@@ -2241,6 +2241,91 @@ async def test_an_environment_refusal_is_not_asked_of_another_model(
     assert dead_end and ENVIRONMENT_REFUSAL_NOTE in dead_end[-1]
 
 
+class _SecondOrderRefused:
+    """Провайдер: первый заказ принят, дальше — 400 invalid_model (#1314)."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            return {"agent": {"id": "bc-f1"}, "run": {"id": "r-f1"}}, None
+        return None, _REAL_REFUSAL
+
+
+async def _refused_second_order(client, db, monkeypatch, slug: str) -> int:
+    provider = _SecondOrderRefused()
+    _wire(monkeypatch, _DispatchRecorder(None))
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", provider)
+    task_id = await _deep_submitted(client, db, slug)
+    await _machine_report(client, task_id, incomplete=True)
+    assert len(provider.calls) == 2, "вторая модель была заказана и отвергнута"
+    return task_id
+
+
+async def test_cascade_failed_order_recorded(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-1 (#1566): отказ провайдера на заказ второй модели пишет событие
+    review_model_cascade с outcome=failed, dispatch_id=null и текстом отказа."""
+    task_id = await _refused_second_order(client, db, monkeypatch, "spike-cascade-400")
+
+    rows = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE kind = 'review_model_cascade' "
+        "AND task_id = ?",
+        (task_id,),
+    )
+    assert len(list(rows)) == 1
+    payload = json.loads(dict(rows[0])["payload"])
+    assert payload["outcome"] == "failed"
+    assert payload["dispatch_id"] is None
+    assert "HTTP 400, invalid_model" in payload["reason"]
+    assert payload["attempt"] == 1 and payload["model"]
+    assert (
+        payload["generation"]
+        == (dict(await repo.get_task(db, task_id))["submission_generation"])
+    )
+
+
+async def test_review_economy_ignores_failed_cascade(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1566): неудавшаяся попытка не делает первый прогон сдачи
+    «cascade» — by_kind cascade runs=0, первый остаётся kind=first."""
+    from hub.services.orchestration import practice_metrics
+
+    task_id = await _refused_second_order(
+        client, db, monkeypatch, "spike-cascade-economy"
+    )
+    # Читатель не должен верить id в payload неудавшейся попытки: прогона у
+    # неё нет, а метить «cascade» первый прогон сдачи значило бы приписать ему
+    # чужую цену. Подсовываем id первого прогона — худший случай.
+    first_run = dict(
+        (
+            await db.execute_fetchall(
+                "SELECT MIN(id) AS id FROM review_dispatches "
+                "WHERE task_id = ? AND agent_id != ''",
+                (task_id,),
+            )
+        )[0]
+    )["id"]
+    await repo.insert_event(
+        db,
+        kind="review_model_cascade",
+        task_id=task_id,
+        actor="policy",
+        payload={"outcome": "failed", "dispatch_id": first_run, "attempt": 2},
+    )
+    await db.commit()
+
+    by_kind = (await practice_metrics(db))["review_economy"]["runs"]["by_kind"]
+    cascade = [r for r in by_kind if r["kind"] == "cascade"]
+    assert sum(r["runs"] for r in cascade) == 0
+    first = [r for r in by_kind if r["kind"] == "first"]
+    assert first and first[0]["runs"] == 1
+
+
 async def test_a_complete_report_is_not_asked_again(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):
