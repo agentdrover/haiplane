@@ -3052,6 +3052,8 @@ class OutcomeHypothesisStatus(str, Enum):
     no_hypothesis = "no_hypothesis"
     not_due = "not_due"
     unanswered = "unanswered"
+    # #1568: no recorded release of the task's fix, so no window to count from.
+    unknown = "unknown"
     confirmed = "confirmed"
     refuted = "refuted"
     unmeasurable = "unmeasurable"
