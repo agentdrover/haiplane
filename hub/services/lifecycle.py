@@ -369,15 +369,17 @@ async def mis_issued_container_run(
     Единый предикат для возврата в open и для свипа свёртки: контейнер
     (feature/epic с детьми, как для #1043), PR нет, последний прогон
     исполнителя остановлен без сдачи своего поколения, в карточке ещё лежит
-    выдача. Обычная задача под него не подпадает: её ветка — настоящая
-    работа, даже если прогон остановили.
+    выдача (захват: claimed_by или сессия; одной ветки мало). Обычная задача
+    под него не подпадает: её ветка — настоящая работа, даже если прогон
+    остановили.
     """
     if task.get("task_type") not in _ROLLUP_PARENT_TYPES or task.get("pr_number"):
         return None
+    # Признак ошибочной выдачи — висящий захват, а не ветка: release_task и
+    # return_to_work снимают захват и ветку оставляют намеренно (#1356).
     if not (
         (task.get("claimed_by") or "").strip()
         or (task.get("claim_session_id") or "").strip()
-        or (task.get("branch") or "").strip()
     ):
         return None
     if not await db_module.get_children(db, task["id"]):

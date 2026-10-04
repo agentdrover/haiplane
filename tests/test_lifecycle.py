@@ -428,6 +428,7 @@ async def _mis_issued_feature(
     task_type: str = "feature",
     with_child: bool = True,
     status: str = "needs_decision",
+    claimed: bool = True,
 ) -> int:
     """#1562: контейнер-фича, выданная облачному исполнителю по ошибке (#1375).
 
@@ -453,6 +454,11 @@ async def _mis_issued_feature(
         "pr_number=?, git_mode='remote', implementer_principal_id=1 WHERE id=?",
         ("bc-session", pr_number, feature_id),
     )
+    if not claimed:
+        await db.execute(
+            "UPDATE tasks SET claimed_by='', claim_session_id=NULL WHERE id=?",
+            (feature_id,),
+        )
     run_id = await repo.create_executor_run(
         db,
         task_id=feature_id,
@@ -627,6 +633,40 @@ async def test_sweep_keeps_stale_assignment_when_the_predicate_does_not_hold(
         assert parent["branch"] == "task-1375/sid-d-otchety", label
         await repo.update_task(db, feature_id, status="rejected")
         await db.commit()
+
+
+async def test_sweep_keeps_the_branch_of_a_container_released_on_purpose(
+    db: aiosqlite.Connection,
+):
+    """#1562, находка 06e7105b: release_task и return_to_work оставляют ветку намеренно.
+
+    Захвата нет, ветка есть, последний прогон остановлен: это не висящая
+    ошибочная выдача, свип ветку не стирает и контейнер остаётся «со своей
+    работой» (причина — в ленте).
+    """
+    feature_id = await _mis_issued_feature(db, status="open", claimed=False)
+
+    assert await repair_stale_parent_completions(db) == 0
+
+    parent = dict(await repo.get_task(db, feature_id))
+    assert parent["branch"] == "task-1375/sid-d-otchety"
+    assert parent["status"] == "open"
+    feed = " ".join(
+        dict(u)["content"] or "" for u in await repo.get_task_updates(db, feature_id)
+    )
+    assert "Выдача снята" not in feed
+
+
+async def test_sweep_resets_a_dangling_session_without_claimed_by(
+    db: aiosqlite.Connection,
+):
+    """#1562: висящий захват — это и claimed_by, и сессия; хватает одной сессии."""
+    feature_id = await _mis_issued_feature(db, status="open")
+    await db.execute("UPDATE tasks SET claimed_by='' WHERE id=?", (feature_id,))
+    await db.commit()
+
+    assert await repair_stale_parent_completions(db) == 1
+    assert dict(await repo.get_task(db, feature_id))["status"] == "completed"
 
 
 async def test_verdict_notes_review_in_flight(
