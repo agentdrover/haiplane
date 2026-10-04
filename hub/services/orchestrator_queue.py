@@ -329,14 +329,25 @@ async def not_leaf_reason(db: aiosqlite.Connection, task: dict[str, Any]) -> str
 
 
 async def _skip_reason(
-    db: aiosqlite.Connection, candidate: dict[str, Any], active: list[dict[str, Any]]
+    db: aiosqlite.Connection,
+    candidate: dict[str, Any],
+    active: list[dict[str, Any]],
+    known_blockers: dict[int, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any] | None:
-    """Почему этот кандидат ждёт; ``None`` — не ждёт."""
+    """Почему этот кандидат ждёт; ``None`` — не ждёт.
+
+    ``known_blockers`` — недоставленные зависимости, уже посчитанные одним
+    проходом по графу (#1527): тот же читатель доставки, без запроса на задачу.
+    """
     task_id = int(candidate["id"])
     not_leaf = await not_leaf_reason(db, candidate)
     if not_leaf:
         return {"task_id": task_id, "reason": SKIP_NOT_LEAF, "detail": not_leaf}
-    blockers = await _undelivered_blockers(db, task_id)
+    blockers = (
+        known_blockers.get(task_id, [])
+        if known_blockers is not None
+        else await _undelivered_blockers(db, task_id)
+    )
     if blockers:
         listed = ", ".join(f"#{b['task_id']}" for b in blockers)
         return {
@@ -368,8 +379,17 @@ def _summary(answer: dict[str, Any]) -> str:
     )
 
 
-async def next_task(db: aiosqlite.Connection, project: Any) -> dict[str, Any]:
-    """Ответ очереди для одного проекта. Ничего не пишет."""
+async def next_task(
+    db: aiosqlite.Connection,
+    project: Any,
+    *,
+    known_blockers: dict[int, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Ответ очереди для одного проекта. Ничего не пишет.
+
+    ``known_blockers`` (#1527): страница пути уже прочитала доставку всех
+    зависимостей графа; правило выбора остаётся этим, читатель не повторяется.
+    """
     policy = project_policy.gate_policy_of(project)
     limit = project_policy.wip_limit_of(policy)
     tasks = await _project_tasks(db, int(project["id"]))
@@ -398,7 +418,7 @@ async def next_task(db: aiosqlite.Connection, project: Any) -> dict[str, Any]:
     }
     if not answer["wip_full"]:
         for candidate in candidates:
-            skip = await _skip_reason(db, candidate, active)
+            skip = await _skip_reason(db, candidate, active, known_blockers)
             if skip is None:
                 answer["next_task_id"] = int(candidate["id"])
                 break
