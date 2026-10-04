@@ -2153,6 +2153,54 @@ async def _order(
     return did
 
 
+async def test_cascade_counts_failed_attempt(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-2 (#1566): успешная и неудавшаяся попытки каскада — attempts=2,
+    failed=1; неудачная не попадает ни в reported, ни в pending, даже когда
+    после неё в той же сдаче лёг чужой отчёт."""
+    from hub.services.review_dispatch import MODEL_CASCADE_EVENT
+
+    ok = await _task(db, title="cascade ok, waiting")
+    ordered = await _order(db, ok, profile="deep")
+    await repo.insert_event(
+        db,
+        kind=MODEL_CASCADE_EVENT,
+        task_id=ok,
+        actor="policy",
+        payload={"generation": 1, "dispatch_id": ordered, "attempt": 1},
+    )
+    bad = await _task(db, title="cascade refused")
+    await repo.insert_event(
+        db,
+        kind=MODEL_CASCADE_EVENT,
+        task_id=bad,
+        actor="policy",
+        payload={
+            "outcome": "failed",
+            "reason": "провайдер отказал: HTTP 400, invalid_model",
+            "generation": 1,
+            "model": "grok-4.6",
+            "attempt": 1,
+            "dispatch_id": None,
+            "after_review_id": 0,
+        },
+    )
+    await _economy_report(db, bad, confirmed=1)
+    await db.commit()
+
+    cascade = (await practice_metrics(db))["review_model_cascade"]
+
+    assert cascade["attempts"] == 2
+    assert cascade["failed"] == 1
+    assert cascade["reported"] == 0, "чужой отчёт не исход неудавшейся попытки"
+    assert cascade["pending"] == 1, "ждёт отчёта только успешный заказ"
+    assert cascade["complete"] == 0 and cascade["incomplete"] == 0
+
+    page = (await client.get("/metrics")).text
+    assert "заказ не удался: 1" in page
+
+
 async def _economy_report(
     db: aiosqlite.Connection,
     task_id: int,
