@@ -9,8 +9,11 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import re
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 import aiosqlite
@@ -20,7 +23,12 @@ from httpx import AsyncClient
 from hub import cli, config, mcp_server
 from hub import repository as repo
 from hub.models import GATE_POLICY_KEYS
-from hub.services import effective_policy, project_policy
+from hub.services import auto_approve, effective_policy, project_policy
+from tests.test_auto_approve import (
+    _draft_in_project,
+    _project as _auto_project,
+    _refine_to_dor,
+)
 
 SECRET = "SECRET-MARKER-1457-do-not-print"  # pragma: allowlist secret
 
@@ -360,3 +368,249 @@ async def test_merge_is_delivery_is_shown_with_its_source(db: aiosqlite.Connecti
 
     assert on["value"] is True and off["value"] is False
     assert on["source"] != off["source"]
+
+
+# --- #1558: решатель читает ключ политики тем же читателем, что и сводка -----
+
+_SERVICES_DIR = Path(__file__).resolve().parents[1] / "hub" / "services"
+
+#: Приёмник ``.get`` похож на политику: имя с «policy» или ``gate_policy_of(...)``.
+_POLICY_RECEIVER = re.compile(
+    r"^(\w*policy\w*|gate_policy_of\(.*\)|\(policy or \{\}\))$"
+)
+
+#: Прямые чтения вне читателя из REGISTRY. Каждая строка — своя причина; шаблона
+#: «весь файл» здесь нет, и решатель сюда не вписывается: тест ниже проверяет,
+#: что перечень не растёт молча (число строк и ключ закреплены).
+_DIRECT_READ_ALLOWLIST: dict[tuple[str, str, str], str] = {
+    (
+        "project_policy.py",
+        "_stored_gate_values",
+        "dor",
+    ): "внутренность читателей gate_value_of/gate_form_value: сырое значение по литералу на ключ, "
+    "его читает сверка ключей tests/test_branch_policy_validation.py",
+    (
+        "project_policy.py",
+        "_stored_gate_values",
+        "verdict",
+    ): "то же: сырое значение verdict внутри читателей",
+    (
+        "effective_policy.py",
+        "_review_derived_from",
+        "review",
+    ): "сама сводка: подпись «derived from» сравнивает сырой review, ничего не решает",
+    (
+        "effective_policy.py",
+        "_review_derived_from",
+        "verdict",
+    ): "сама сводка: называет сырой verdict в подписи «derived from»",
+    (
+        "steward_apply.py",
+        "policy_refusal",
+        "verdict",
+    ): "показ: текст отказа называет СОХРАНЁННОЕ значение, решение уже принято читателем "
+    "verdict_delegated_to_steward строкой выше",
+}
+
+
+def _declared_readers() -> set[tuple[str, str]]:
+    """Пары (файл, функция) из второго поля PolicyEntry: «модуль.функция»."""
+    pairs = set()
+    for entry in effective_policy.REGISTRY.values():
+        module, _, func = entry.reader.partition(".")
+        pairs.add((f"{module}.py", func))
+    return pairs
+
+
+def _string_constants() -> dict[str, str]:
+    """Имя -> строка для верхнеуровневых констант hub/services (``*_KEY``)."""
+    consts: dict[str, str] = {}
+    for path in _SERVICES_DIR.glob("*.py"):
+        for node in ast.parse(path.read_text()).body:
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        consts[target.id] = node.value.value
+    return consts
+
+
+def direct_policy_reads(
+    source: str, filename: str, keys: set[str], consts: dict[str, str]
+) -> list[tuple[str, int, str, str]]:
+    """(файл, строка, функция, ключ) для каждого ``policy.get(<ключ REGISTRY>)``.
+
+    Ключ — строка, имя константы или переменная: ``.get(gate)`` читает ЛЮБОЙ
+    ключ, и страж называет его «<dynamic>», а не пропускает.
+    """
+    found: list[tuple[str, int, str, str]] = []
+
+    def visit(node: ast.AST, func: str) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func = node.name
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and node.args
+            and _POLICY_RECEIVER.match(ast.unparse(node.func.value))
+        ):
+            arg = node.args[0]
+            key = None
+            if isinstance(arg, ast.Constant) and arg.value in keys:
+                key = arg.value
+            elif isinstance(arg, ast.Name):
+                value = consts.get(arg.id)
+                key = value if value in keys else (None if value else "<dynamic>")
+            elif isinstance(arg, ast.Attribute) and consts.get(arg.attr) in keys:
+                key = consts[arg.attr]
+            if key is not None:
+                found.append((filename, node.lineno, func, key))
+        for child in ast.iter_child_nodes(node):
+            visit(child, func)
+
+    visit(ast.parse(source), "<module>")
+    return found
+
+
+def _offenders(
+    sources: dict[str, str], allowed: set[tuple[str, str]] | None = None
+) -> list[str]:
+    keys = set(effective_policy.REGISTRY)
+    consts = _string_constants()
+    readers = _declared_readers() if allowed is None else allowed
+    out = []
+    for name, source in sorted(sources.items()):
+        for file, line, func, key in direct_policy_reads(source, name, keys, consts):
+            if (file, func) in readers or (file, func, key) in _DIRECT_READ_ALLOWLIST:
+                continue
+            out.append(f"{file}:{line} читает ключ {key} в {func}() мимо читателя")
+    return out
+
+
+def test_every_solver_reads_policy_through_the_summary_reader():
+    """AC-1 (#1558): прямое чтение ключа REGISTRY вне читателя роняет тест.
+
+    Падение называет файл:строку и ключ. Страж обходит ast, а не греп: ключ
+    может прийти константой ``*_KEY`` или переменной.
+    """
+    sources = {p.name: p.read_text() for p in _SERVICES_DIR.glob("*.py")}
+    assert _offenders(sources) == []
+
+    # Страж не немой: посторонний решатель в литерале и в константе назван.
+    planted = {
+        "fake.py": (
+            "def decide(policy):\n"
+            "    if policy.get('dor') != 'auto':\n"
+            "        return 1\n"
+            "    return policy.get(WIP_LIMIT_KEY)\n"
+        )
+    }
+    named = _offenders(planted)
+    assert any("fake.py:2" in m and "dor" in m for m in named), named
+    assert any("fake.py:4" in m and "wip_limit" in m for m in named), named
+
+    # Перечень исключений не прячет решатель: каждая запись существует в коде
+    # и несёт причину, а читателя-решателя среди них нет.
+    keys = set(effective_policy.REGISTRY)
+    consts = _string_constants()
+    live = {
+        (f, fn, k)
+        for name, src in sources.items()
+        for f, _line, fn, k in direct_policy_reads(src, name, keys, consts)
+    }
+    assert set(_DIRECT_READ_ALLOWLIST) <= live, "запись белого списка без чтения"
+    assert all(len(reason) > 20 for reason in _DIRECT_READ_ALLOWLIST.values())
+
+
+@pytest.mark.parametrize("gate", ["dor", "verdict"])
+@pytest.mark.parametrize("value", ["human", "auto", "steward", "", "AUTO", "stewrad"])
+def test_gate_value_reader_accepts_what_the_write_accepts(gate, value):
+    expected = value if value in {"human", "auto", "steward"} else "human"
+    assert project_policy.gate_value_of({gate: value}, gate) == expected
+
+
+def test_gate_value_reader_reads_garbage_as_human():
+    for policy in ({}, None, [], "auto", {"dor": None}, {"dor": 1}, {"dor": ["auto"]}):
+        assert project_policy.gate_value_of(policy, "dor") == "human"  # type: ignore[arg-type]
+    assert project_policy.gate_value_of({"dor": "auto"}, "nonsense") == "human"
+
+
+async def test_a_dor_delegated_to_the_steward_shows_in_the_summary(
+    db: aiosqlite.Connection,
+):
+    """Расхождение #1558: запись принимает dor=steward, диспетчер его исполняет.
+
+    Сводка читала форменного читателя и писала human, пока диспетчер DoR-стюарда
+    заказывал прогон. Теперь оба спрашивают gate_value_of.
+    """
+    from hub.services.steward_dispatch import _policy_wants_steward
+
+    pid = await _project(db, "dor-steward", {"dor": "steward"})
+    project = await repo.get_project(db, pid)
+    row = _by_key(await effective_policy.effective_policy(db, project))["dor"]
+
+    assert row["value"] == "steward"
+    assert row["reader"] == "project_policy.gate_value_of"
+    assert _policy_wants_steward(project, gate="dor") is True
+    assert _policy_wants_steward(project, gate="verdict") is False
+
+
+def test_summary_and_gate_readers_are_one_function(monkeypatch):
+    """Сводка и решатели зовут ОДНУ функцию: подмена одной сдвигает все."""
+    from hub.services import auto_approve, steward_dispatch
+
+    assert auto_approve.gate_value_of is project_policy.gate_value_of
+    assert steward_dispatch.gate_value_of is project_policy.gate_value_of
+    for gate in ("dor", "verdict"):
+        assert effective_policy.REGISTRY[gate].reader == "project_policy.gate_value_of"
+        seen = []
+        monkeypatch.setattr(
+            project_policy, "gate_value_of", lambda p, g: seen.append(g) or "probe"
+        )
+        assert effective_policy.REGISTRY[gate].read({}) == "probe"
+        assert seen == [gate]
+        monkeypatch.undo()
+    monkeypatch.setattr(project_policy, "gate_value_of", lambda p, g: "human")
+    assert project_policy.verdict_is_delegated({"verdict": "steward"}) is False
+
+
+@pytest.mark.parametrize(
+    "value", ["human", "auto", "steward", "AUTO", "stewrad", "", 1, None, ["steward"]]
+)
+def test_solvers_answer_as_the_raw_comparison_did(value):
+    """Таблица: переведённые решатели дают тот же ответ, что и сырое сравнение."""
+    from hub.services.steward_dispatch import _policy_wants_steward
+
+    for gate in ("dor", "verdict"):
+        policy = {gate: value}
+        project = {"gate_policy": json.dumps(policy)}
+        assert _policy_wants_steward(project, gate=gate, shadow=False) is (
+            value == "steward"
+        ), (gate, value)
+    delegated = isinstance(value, str) and value in {"auto", "steward"}
+    assert project_policy.verdict_is_delegated({"verdict": value}) is delegated
+    assert project_policy.verdict_is_delegated({}) is False
+    assert project_policy.verdict_is_delegated("junk") is False  # type: ignore[arg-type]
+
+
+async def test_auto_approve_decides_dor_with_the_summary_reader(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # #1558 AC-2: ONE reader answers for the gate and for the summary.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _auto_project(db, "dor-one-reader", {"dor": "auto"})
+    project = await repo.get_project(db, pid)
+    summary = effective_policy.REGISTRY["dor"]
+    assert summary.read({"dor": "auto"}) == "auto"
+
+    # Replace the reader everywhere it is looked up: both sides follow it.
+    monkeypatch.setattr(project_policy, "gate_value_of", lambda p, g: "probe")
+    monkeypatch.setattr(auto_approve, "gate_value_of", project_policy.gate_value_of)
+    assert summary.read(project_policy.gate_policy_of(project)) == "probe"
+    task_id = await _draft_in_project(client, db, pid)
+    body = await _refine_to_dor(client, task_id, ["docs/notes.md"])
+    assert body["status"] == "draft", "the gate follows the same reader"

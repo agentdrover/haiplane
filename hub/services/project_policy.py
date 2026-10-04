@@ -353,6 +353,24 @@ def gate_form_value(policy: dict, key: str) -> str:
     return GATE_HUMAN
 
 
+def gate_value_of(policy: dict, gate: str) -> str:
+    """Значение гейта, по которому РЕШАЮТ: сохранённое, если запись его приняла.
+
+    Единственный читатель ключей ``dor`` и ``verdict`` для решателей и для
+    сводки действующей политики (#1558). Принимается всё из ``GATE_VALUES``,
+    остальное — отсутствие ключа, мусор, не-строка — читается как ``human``
+    (#835). От ``gate_form_value`` он отличается одним: тот отвечает на вопрос
+    «что может выбрать форма» (``IMPLEMENTED_GATE_VALUES``) и потому не знает
+    ``dor=steward``, который запись принимает, а диспетчер DoR-стюарда
+    исполняет. Сводка, читавшая форменного читателя, показывала бы human там,
+    где решатель действует.
+    """
+    stored = _stored_gate_values(policy).get(gate) if isinstance(policy, dict) else None
+    if isinstance(stored, str) and stored in GATE_VALUES:
+        return stored
+    return GATE_HUMAN
+
+
 def gate_delegate_badge(policy: dict, key: str) -> GateChoice | None:
     """Делегирующее значение гейта для витрины — или None, если решает человек.
 
@@ -373,10 +391,7 @@ def verdict_is_delegated(policy: dict) -> bool:
     Нераспознанное значение сюда не попадает и попадать не должно: слово,
     которого никто не узнал, значит «человек», а не «кто-нибудь» (#835).
     """
-    if not isinstance(policy, dict):
-        return False
-    value = policy.get("verdict")
-    return isinstance(value, str) and value in DELEGATED_VERDICTS
+    return gate_value_of(policy, "verdict") in DELEGATED_VERDICTS
 
 
 def review_dispatch_enabled(policy: dict) -> bool:
