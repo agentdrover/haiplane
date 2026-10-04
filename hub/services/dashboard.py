@@ -22,6 +22,7 @@ from hub.models import (
     TaskProjectRef,
     TaskView,
 )
+from hub.services import inbox_decisions
 from hub.services.lifecycle import row_to_task
 from hub.services.project_policy import clone_branch_state
 
@@ -168,19 +169,12 @@ async def get_inbox_data(
         "mine": mine,
     }
     scoped: _ScopedFilters = {**person, "project_id": project_id}
-    draft_rows = await repo.list_tasks_by_status(
-        db,
-        "draft",
-        order_by=repo.DRAFT_QUEUE_ORDER_BY,
-        limit=20,
-        **scoped,
-    )
-    needs_info_rows = await repo.list_tasks_by_status(
-        db, "needs_info", limit=20, **scoped
-    )
-    needs_decision_rows = await repo.list_tasks_by_status(
-        db, "needs_decision", limit=20, **scoped
-    )
+    # #1501: решения человека — одним сборщиком: порядок по depends_on, действие
+    # и основание у каждой строки, обрезка названа («показано N из M»).
+    decisions = await inbox_decisions.collect(db, dict(scoped))
+    draft_rows = decisions["drafts"]
+    needs_info_rows = decisions["asked"]
+    needs_decision_rows = decisions["decide"]
     pending_report_rows = await repo.list_tasks_by_status(
         db,
         "pending_report",
@@ -271,6 +265,11 @@ async def get_inbox_data(
     return {
         "undelivered": undelivered,
         "unjudged_findings": unjudged,
+        "decision_queue": decisions["queue"],
+        "decision_by_task": {e["task_id"]: e for e in decisions["queue"]},
+        "decision_note": decisions["note"],
+        "decision_cycles": decisions["cycles"],
+        "review_tasks": [row_to_task(r) for r in decisions["reviewing"]],
         "drafts": [row_to_task(r) for r in draft_rows],
         "questions": questions,
         "decisions": [row_to_task(r) for r in needs_decision_rows],

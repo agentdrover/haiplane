@@ -271,14 +271,20 @@ def _topological(
     nodes: set[int],
     edges: dict[int, list[int]],
     tasks: dict[int, dict[str, Any]],
+    key: Any = None,
 ) -> list[int]:
-    """Зависимость раньше зависящей; при равенстве — priority, position, id."""
+    """Зависимость раньше зависящей; при равенстве — priority, position, id.
+
+    ``key`` (#1501) заменяет только равенство: входящие ранжируют черновики по
+    #253, а не по очереди оркестратора. Топология — та же.
+    """
+    rank = key or oq._sort_key
     waiting = {n: len(edges.get(n, ())) for n in nodes}
     dependents: dict[int, list[int]] = {}
     for node, deps in edges.items():
         for dep in deps:
             dependents.setdefault(dep, []).append(node)
-    heap = [(oq._sort_key(tasks[n]), n) for n, c in waiting.items() if c == 0]
+    heap = [(rank(tasks[n]), n) for n, c in waiting.items() if c == 0]
     heapq.heapify(heap)
     order: list[int] = []
     while heap:
@@ -287,8 +293,25 @@ def _topological(
         for nxt in dependents.get(node, []):
             waiting[nxt] -= 1
             if waiting[nxt] == 0:
-                heapq.heappush(heap, (oq._sort_key(tasks[nxt]), nxt))
+                heapq.heappush(heap, (rank(tasks[nxt]), nxt))
     return order
+
+
+def order_nodes(
+    nodes: set[int],
+    edges: dict[int, list[int]],
+    tasks: dict[int, dict[str, Any]],
+    *,
+    key: Any = None,
+) -> tuple[list[int], dict[int, list[int]], list[dict[str, Any]]]:
+    """Рассечь циклы и расставить узлы: ``(порядок, рёбра без разреза, циклы)``.
+
+    Единственный расчёт порядка по ``depends_on`` (#1527): им пользуются
+    ``compute`` и входящие (#1501). ``key`` — ранг внутри уровня.
+    """
+    cut, cycles = _break_cycles(edges)
+    acyclic = {n: [d for d in deps if (n, d) not in cut] for n, deps in edges.items()}
+    return _topological(nodes, acyclic, tasks, key), acyclic, cycles
 
 
 # --- причины и группы -----------------------------------------------------------
@@ -670,8 +693,7 @@ async def compute(
     graph = await _load_graph(db, project)
     reach = await _reach(db, graph)
     edges = {n: [b["task_id"] for b in bl] for n, bl in reach.blockers.items()}
-    cut, cycles = _break_cycles(edges)
-    edges = {n: [d for d in deps if (n, d) not in cut] for n, deps in edges.items()}
+    order, edges, cycles = order_nodes(reach.nodes, edges, graph.tasks)
     classes = {
         n: _classify(graph, graph.tasks[n], reach.blockers.get(n, []), slug)
         for n in reach.nodes
@@ -680,7 +702,7 @@ async def compute(
     ctx = _Calc(
         slug=slug,
         edges=edges,
-        order=_topological(reach.nodes, edges, graph.tasks),
+        order=order,
         classes=classes,
         cycles=cycles,
         reach=reach,

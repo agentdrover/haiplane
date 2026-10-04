@@ -7171,3 +7171,52 @@ async def test_web_return_to_work_rejects_agent_token(
     )
     assert resp.status_code == 403
     assert (await repo.get_task(db, task_id))["status"] == "review"
+
+
+async def test_inbox_partial_renders_action_and_grounds(client: AsyncClient, db):
+    from tests.test_auto_verdict import _post_review, _submitted_task
+
+    draft = await client.post(
+        "/api/tasks",
+        json={"title": "Inbox approve row", "source": "agent", "agent": "bot"},
+    )
+    draft_id = draft.json()["id"]
+    question = await repo.create_task(
+        db,
+        title="Inbox answer row",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="needs_info",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.add_task_update(db, question, "dev", "question", "Which branch?")
+    await db.commit()
+    verdict = await _submitted_task(client, db, "inbox-web-human", {"verdict": "human"})
+    await _post_review(client, verdict)
+
+    page = (await client.get("/partials/inbox")).text
+
+    def block(task_id: int) -> str:
+        start = page.index(f'id="inbox-task-{task_id}"')
+        return page[start : page.index("</article>", start)]
+
+    approve = block(draft_id)
+    assert 'data-decision-action="approve"' in approve
+    assert "inbox-decision-grounds" in approve and "readiness" in approve
+    assert f"/tasks/{draft_id}/web-approve" in approve
+
+    answer = block(question)
+    assert 'data-decision-action="answer"' in answer
+    assert "Which branch?" in answer
+    assert f"/tasks/{question}/web-answer" in answer
+
+    ruling = block(verdict)
+    assert 'data-decision-action="verdict"' in ruling
+    assert "0/0/1" in ruling and "CI зелёный" in ruling
+    assert f'href="/tasks/{verdict}#review-verdict-form"' in ruling

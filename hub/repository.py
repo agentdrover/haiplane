@@ -449,20 +449,16 @@ async def list_tasks_by_statuses(
     )
 
 
-async def list_tasks_by_status(
-    db: aiosqlite.Connection,
+def _status_filter(
     status: str,
     *,
-    order_by: str = "id DESC",
-    limit: int = 20,
-    include_archived: bool = False,
-    human_owner: str | None = None,
-    claimed_by: str | None = None,
-    mine: str | None = None,
-    project_id: int | None = None,
-) -> list[aiosqlite.Row]:
-    if order_by not in ALLOWED_TASKS_ORDER_BY:
-        raise ValueError(f"Unsupported order_by clause: {order_by!r}")
+    include_archived: bool,
+    human_owner: str | None,
+    claimed_by: str | None,
+    mine: str | None,
+    project_id: int | None,
+) -> tuple[str, list[Any]]:
+    """WHERE of the by-status lists — one definition for the rows and their count."""
     conditions = ["status=?"]
     params: list[Any] = [status]
     if not include_archived:
@@ -479,12 +475,63 @@ async def list_tasks_by_status(
         claimed_by=claimed_by,
         mine=mine,
     )
-    where = " AND ".join(conditions)
+    return " AND ".join(conditions), params
+
+
+async def list_tasks_by_status(
+    db: aiosqlite.Connection,
+    status: str,
+    *,
+    order_by: str = "id DESC",
+    limit: int = 20,
+    include_archived: bool = False,
+    human_owner: str | None = None,
+    claimed_by: str | None = None,
+    mine: str | None = None,
+    project_id: int | None = None,
+) -> list[aiosqlite.Row]:
+    if order_by not in ALLOWED_TASKS_ORDER_BY:
+        raise ValueError(f"Unsupported order_by clause: {order_by!r}")
+    where, params = _status_filter(
+        status,
+        include_archived=include_archived,
+        human_owner=human_owner,
+        claimed_by=claimed_by,
+        mine=mine,
+        project_id=project_id,
+    )
     return await fetchall(
         db,
         f"SELECT * FROM tasks WHERE {where} ORDER BY {order_by} LIMIT ?",  # nosec B608
         (*params, limit),
     )
+
+
+async def count_tasks_by_status(
+    db: aiosqlite.Connection,
+    status: str,
+    *,
+    include_archived: bool = False,
+    human_owner: str | None = None,
+    claimed_by: str | None = None,
+    mine: str | None = None,
+    project_id: int | None = None,
+) -> int:
+    """How many rows ``list_tasks_by_status`` would return without its LIMIT (#1501)."""
+    where, params = _status_filter(
+        status,
+        include_archived=include_archived,
+        human_owner=human_owner,
+        claimed_by=claimed_by,
+        mine=mine,
+        project_id=project_id,
+    )
+    rows = await fetchall(
+        db,
+        f"SELECT COUNT(*) AS n FROM tasks WHERE {where}",  # nosec B608
+        tuple(params),
+    )
+    return int(dict(rows[0])["n"]) if rows else 0
 
 
 async def list_unmerged_branch_tasks(

@@ -5849,3 +5849,164 @@ async def test_headless_gates_do_not_release_the_done_flow_savepoint(
     assert dict(await repo.get_task(db, task_id))["submission_generation"] == 0, (
         "бамп поколения принадлежит той же несостоявшейся сдаче"
     )
+
+
+# --- #1501: входящие — действие человека, основание, порядок -------------------
+
+
+async def _inbox_draft(
+    db: aiosqlite.Connection,
+    title: str,
+    *,
+    task_type: str = "task",
+    parent_id: int | None = None,
+    readiness: int = 80,
+    dor: bool = True,
+) -> int:
+    task_id = await repo.create_task(
+        db,
+        title=title,
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="bot",
+        rationale="",
+        status="draft",
+        auto_review=True,
+        task_type=task_type,
+        parent_id=parent_id,
+        priority="medium",
+    )
+    await repo.update_task(
+        db, task_id, readiness_score=readiness, dor_passed=1 if dor else 0
+    )
+    await db.commit()
+    return task_id
+
+
+def _rows(inbox: dict, action: str) -> list[dict]:
+    return [r for r in inbox["decision_queue"] if r["action"] == action]
+
+
+async def test_inbox_orders_approvals_by_parent_and_depends_on(
+    db: aiosqlite.Connection,
+):
+    # Созданы в порядке A, B, E — наоборот зависимостям.
+    a = await _inbox_draft(db, "A depends on B", readiness=95)
+    b_parent = await _inbox_draft(db, "E epic", task_type="epic", readiness=10)
+    b = await _inbox_draft(db, "B child of E", parent_id=b_parent, readiness=95)
+    await repo.add_task_dependency(db, a, b)
+    low = await _inbox_draft(db, "independent low", readiness=40)
+    high = await _inbox_draft(db, "independent high", readiness=90)
+    await db.commit()
+
+    inbox = await services.get_inbox_data(db)
+    order = [r["task_id"] for r in _rows(inbox, "approve")]
+    assert order.index(b_parent) < order.index(b) < order.index(a)
+    # Независимые — по ранжированию #253: больший readiness раньше.
+    assert order.index(high) < order.index(low)
+    # Порядок строк и порядок черновиков в данных — один и тот же.
+    assert [t.id for t in inbox["drafts"]] == order
+    numbers = [r["order"] for r in inbox["decision_queue"]]
+    assert numbers == sorted(numbers) and len(set(numbers)) == len(numbers)
+
+
+async def test_inbox_names_a_dependency_cycle_instead_of_looping(
+    db: aiosqlite.Connection,
+):
+    x = await _inbox_draft(db, "X")
+    y = await _inbox_draft(db, "Y")
+    await db.execute(
+        "INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)",
+        (x, y),
+    )
+    await db.execute(
+        "INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)",
+        (y, x),
+    )
+    await db.commit()
+    inbox = await services.get_inbox_data(db)
+    assert {r["task_id"] for r in _rows(inbox, "approve")} == {x, y}
+    assert inbox["decision_cycles"], "цикл должен быть назван"
+    assert f"#{x}" in inbox["decision_cycles"][0]["reason"]
+
+
+async def test_inbox_verdict_row_states_grounds_from_current_review(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    from hub import config
+    from tests.test_auto_verdict import _post_review, _submitted_task
+
+    # Отчёт кладётся при выключенном автовердикте, чтобы автопилот не вынес
+    # его раньше показа (приём из tests/test_verdict_route.py).
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "off")
+    rejected = [
+        {"title": f"candidate {i}", "category": "correctness", "reason": "no"}
+        for i in range(3)
+    ]
+    reported = await _submitted_task(client, db, "inbox-human-a", {"verdict": "human"})
+    await _post_review(client, reported, findings_rejected=rejected)
+    silent = await _submitted_task(client, db, "inbox-human-b", {"verdict": "human"})
+    delegated = await _submitted_task(client, db, "inbox-auto", {"verdict": "auto"})
+    await _post_review(client, delegated)
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    draft = await _inbox_draft(db, "draft after verdicts")
+
+    inbox = await services.get_inbox_data(db)
+    by_task = {r["task_id"]: r for r in _rows(inbox, "verdict")}
+    # Сданная работа — раньше черновика: вердикт держит её, одобрение нет.
+    approve = {r["task_id"]: r for r in _rows(inbox, "approve")}
+    assert by_task[reported]["order"] < approve[draft]["order"]
+
+    first = by_task[reported]
+    assert first["offer"] is True
+    assert "0/0/3" in first["grounds"]
+    assert "CI зелёный" in first["grounds"]
+
+    second = by_task[silent]
+    assert second["offer"] is False
+    assert "отчёт не пришёл" in second["grounds"]
+
+    assert delegated not in by_task, "делегированный вердикт — не очередь человека"
+    assert {t.id for t in inbox["review_tasks"]} == {reported, silent}
+
+
+async def test_inbox_decisions_never_truncate_silently(db: aiosqlite.Connection):
+    for i in range(25):
+        await _inbox_draft(db, f"draft {i}")
+    inbox = await services.get_inbox_data(db)
+    shown = len(_rows(inbox, "approve"))
+    assert shown == 25 or f"показано {shown} из 25" in inbox["decision_note"]
+    assert len(inbox["drafts"]) == shown
+
+
+async def test_inbox_decision_note_names_the_cut(db: aiosqlite.Connection, monkeypatch):
+    from hub.services import inbox_decisions
+
+    monkeypatch.setattr(inbox_decisions, "DECISION_CAP", 3)
+    for i in range(5):
+        await _inbox_draft(db, f"capped {i}")
+    inbox = await services.get_inbox_data(db)
+    assert len(_rows(inbox, "approve")) == 3
+    assert "показано 3 из 5" in inbox["decision_note"]
+
+
+async def test_inbox_does_not_offer_a_verdict_on_a_report_without_stated_completeness(
+    client, db: aiosqlite.Connection, monkeypatch
+):
+    from hub import config
+    from tests.test_auto_verdict import _post_review, _submitted_task
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "off")
+    task_id = await _submitted_task(client, db, "inbox-unstated", {"verdict": "human"})
+    await _post_review(client, task_id)
+    await db.execute(
+        "UPDATE machine_reviews SET incomplete=NULL WHERE task_id=?", (task_id,)
+    )
+    await db.commit()
+
+    inbox = await services.get_inbox_data(db)
+    (row,) = _rows(inbox, "verdict")
+    assert row["task_id"] == task_id
+    assert row["offer"] is False
+    assert "отчёт не пришёл полным" in row["grounds"]
