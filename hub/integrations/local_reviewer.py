@@ -1176,7 +1176,21 @@ async def _await_result(jobdir: str, limit: int, started: float) -> LocalRun | N
         if result is not None:
             return _result_to_run(result, started)
         now = time.monotonic()
-        if now >= pickup and not os.path.exists(claimed):
+        taken = os.path.exists(claimed)
+        if _runner_silent(jobdir):
+            # Heartbeat старше порога — и до claim, и после него. Без этого
+            # мёртвая служба до claim называлась бы «живой, но не разбирает»:
+            # порог взятия (60 с) больше порога heartbeat (30 с). После claim
+            # перезапущенная служба каталог не прогонит, и хаб ждал бы лимит.
+            _cancel_job(jobdir, withdraw=False)
+            where = "во время прогона" if taken else "до того, как взяла задание"
+            _REFUSAL.set(
+                f"служба-исполнитель перестала отвечать {where}: "
+                f"{SPOOL_HEARTBEAT} старше {RUNNER_HEARTBEAT_MAX_AGE_SEC} с"
+            )
+            return None
+        if now >= pickup and not taken:
+            # Сюда доходят только при СВЕЖЕМ heartbeat (проверка выше).
             _REFUSAL.set(
                 "служба-исполнитель не забрала задание за "
                 f"{int(min(RUNNER_PICKUP_SEC, limit))} с: heartbeat свежий, но "
@@ -1185,15 +1199,6 @@ async def _await_result(jobdir: str, limit: int, started: float) -> LocalRun | N
             return None
         if now >= deadline:
             return await _time_out(jobdir, started)
-        if os.path.exists(claimed) and _runner_silent(jobdir):
-            # Упала после claim: перезапущенная служба этот каталог не
-            # прогонит, и без этой проверки хаб ждал бы весь лимит.
-            _cancel_job(jobdir, withdraw=False)
-            _REFUSAL.set(
-                "служба-исполнитель перестала отвечать во время прогона: "
-                f"{SPOOL_HEARTBEAT} старше {RUNNER_HEARTBEAT_MAX_AGE_SEC} с"
-            )
-            return None
         await asyncio.sleep(RUNNER_POLL_SEC)
 
 

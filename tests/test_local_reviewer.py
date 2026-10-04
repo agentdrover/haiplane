@@ -841,3 +841,40 @@ async def test_withdrawing_the_job_stops_a_running_process(
     assert not jobdir.exists(), "отозванное задание не убрано"
     await asyncio.sleep(3.0)
     assert not marker.exists(), "процесс пережил отзыв задания"
+
+
+async def test_a_dead_runner_before_the_claim_is_not_called_alive(
+    spool, monkeypatch
+) -> None:
+    """Heartbeat устарел, задание не взято: причина — молчание, а не «свежий».
+
+    Порог взятия (60 с) больше порога heartbeat (30 с), и жёсткий текст
+    «heartbeat свежий» называл мёртвую службу живой (находка a718d2711448e87f).
+    """
+    from hub.services.review_dispatch import _local_failure_reason
+
+    monkeypatch.setattr(local_reviewer, "RUNNER_HEARTBEAT_MAX_AGE_SEC", 2.0)
+    monkeypatch.setattr(local_reviewer, "RUNNER_PICKUP_SEC", 30.0)
+    _beat(spool)
+    gone = time.time() - 100
+
+    async def goes_silent() -> None:
+        # Служба «жива» к заказу и умирает до того, как взяла задание.
+        while True:
+            if _jobs(spool):
+                os.utime(spool / "heartbeat", (gone, gone))
+            await asyncio.sleep(0.01)
+
+    service = asyncio.create_task(goes_silent())
+    started = time.monotonic()
+    try:
+        assert await local_reviewer.run_review("промт", timeout=60) is None
+    finally:
+        service.cancel()
+    assert time.monotonic() - started < 10, "хаб ждал порог взятия вместо heartbeat"
+    named = local_reviewer.refusal()
+    assert "перестала отвечать до того, как взяла задание" in named, named
+    assert "свежий" not in named
+    card = _local_failure_reason(None)
+    assert "перестала отвечать" in card and "свежий" not in card
+    assert _jobs(spool) == []
