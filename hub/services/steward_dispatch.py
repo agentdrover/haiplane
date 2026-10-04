@@ -52,7 +52,7 @@ from hub import config
 from hub import repository as repo
 from hub.db import fetchall, write_transaction
 from hub.services.gate_events import NON_HUMAN_GATE_ACTORS
-from hub.services.project_policy import gate_policy_of
+from hub.services.project_policy import gate_policy_of, gate_value_of
 
 log = logging.getLogger(__name__)
 
@@ -504,7 +504,7 @@ def _policy_wants_steward(
     if project_row is None:
         return False
     policy = gate_policy_of(project_row)
-    if policy.get(gate) == "steward":
+    if gate_value_of(policy, gate) == "steward":
         return True
     return shadow and gate == "verdict" and steward_shadow_of(policy)
 
