@@ -1758,6 +1758,13 @@ _MAIN_PATH_HTTP = (
 
 REPORT_BLOCK_INSTRUCTION = (
     "СДАЧА ОТЧЁТА — ДВА ПУТИ, ОБА ОБЯЗАТЕЛЬНЫ.\n"
+    # #1584: ранняя пустая сдача читалась хабом как окончательная.
+    "РОВНО ОДНА финальная сдача — через доступный путь, ПОСЛЕ прохода. "
+    "РАННЯЯ сдача запрещена: пробная, «проверить доступ», заглушка или "
+    "сдача до конца прохода — хаб принимает её за отчёт и закрывает по ней "
+    "заказ. Доступ проверяй чтением брифа, не сдачей. Честный окончательный "
+    "отчёт с raw_count=0 и признаками охвата (incomplete, lost_dimensions) "
+    "разрешён. Блок ниже повторяет ТОТ ЖЕ результат, он не вторая сдача.\n"
     "{main_path}"
     "2) НЕЗАВИСИМО от этого в САМОМ КОНЦЕ ответа повтори отчёт блоком:\n"
     f"```{REPORT_FENCE}\n"
@@ -1904,6 +1911,23 @@ _READ_THE_DIFF_BY_COMMAND = "прочитай дифф КОМАНДОЙ ИЗ П�
 _READ_THE_DIFF_INLINE = "прочитай дифф, приложенный к предмету ревью выше (клона нет)"
 
 
+def _brief_step(task_id: int, http: bool) -> str:
+    """Чтение брифа тем путём, который есть у рана (#1584)."""
+    if http:
+        return "прочитай бриф ревью по HTTP (review-brief из блока доступа)"
+    return f"hub_get_review_brief(task_id={task_id})"
+
+
+def _submit_step(task_id: int, http: bool, harness: str = "") -> str:
+    """Сдача отчёта тем путём, который есть у рана (#1584)."""
+    fields = f"harness_skill='{harness}', ..." if harness else "..."
+    if http:
+        return (
+            f"сдай отчёт по HTTP: POST /api/tasks/{task_id}/machine-review ({fields})"
+        )
+    return f"сдай hub_submit_machine_review(task_id={task_id}, {fields})"
+
+
 def _review_prompt(
     task_id: int,
     branch: str,
@@ -1964,13 +1988,13 @@ def _review_prompt(
         # the prompt asks for, in words the report can be checked against.
         return (
             common + "Это ЛЁГКОЕ ревью: ОДИН проход. Порядок: "
-            f"1) hub_get_review_brief(task_id={task_id}) — предмет ревью; "
+            f"1) {_brief_step(task_id, bool(delivery_block))} — предмет ревью; "
             f"2) {_READ_THE_DIFF_INLINE if inline_diff else _READ_THE_DIFF_BY_COMMAND}"
             " — не исследуй репозиторий целиком, контекст берётся из диффа; "
             "3) один проход по изменённым файлам: ищи дефекты корректности, "
             "потерянные граничные случаи, несоответствие заявленным AC; "
-            f"4) сдай hub_submit_machine_review(task_id={task_id}, "
-            "harness_skill='lite-diff-review', ...) с реальными raw_count, "
+            f"4) {_submit_step(task_id, bool(delivery_block), 'lite-diff-review')}"
+            " с реальными raw_count, "
             f"находками, tokens_spent и model='{model_id}'. "
             "ЧЕСТНОСТЬ ОХВАТА: если дифф прочитан не целиком — сдавай "
             "incomplete=true и перечисли непрочитанные файлы в "
@@ -1981,10 +2005,10 @@ def _review_prompt(
     return (
         common + "Порядок: "
         "1) hub_get_skill('multi-agent-review') и работай по нему; "
-        f"2) hub_get_review_brief(task_id={task_id}) — предмет ревью; "
+        f"2) {_brief_step(task_id, bool(delivery_block))} — предмет ревью; "
         "3) исполни фазы измерений и адъюдикации ЧЕСТНО — отчёт без "
         "исполнения запрещён скиллом v8 и виден серверу; "
-        f"4) сдай hub_submit_machine_review(task_id={task_id}, ...) с "
+        f"4) {_submit_step(task_id, bool(delivery_block))} с "
         f"реальными raw_count, находками, tokens_spent и model='{model_id}'. "
         "Вердикт НЕ выноси — он не твой."
     )
