@@ -43,6 +43,7 @@ from hub.models import (
     EvidenceCoverage,
     LiveCheckState,
     ReviewBrief,
+    ReviewerHarnessSkill,
     ReviewCircleView,
     SelfReviewWarning,
     TaskProjectRef,
@@ -310,6 +311,26 @@ async def _brief_verdict_route(db, task_view) -> dict | None:
     from hub.services.verdict_route import verdict_route
 
     return (await verdict_route(db, task_view.id, observe=True)).as_dict()
+
+
+HARNESS_SKILL_NAME = "multi-agent-review"
+
+
+async def reviewer_harness_skill(db) -> ReviewerHarnessSkill:
+    """The ACTIVE harness version as of this read (#1586).
+
+    A draft or the shipped seed text is not substituted: no active version is
+    a named gap the reviewer reports as incomplete, not a quiet fallback.
+    """
+    row = await repo.get_active_skill(db, HARNESS_SKILL_NAME)
+    if row is None:
+        return ReviewerHarnessSkill(
+            name=HARNESS_SKILL_NAME,
+            reason="нет активной версии скилла (draft и сид не подставляются)",
+        )
+    return ReviewerHarnessSkill(
+        name=HARNESS_SKILL_NAME, version=int(row["version"]), text=row["content"] or ""
+    )
 
 
 async def build_review_brief(
