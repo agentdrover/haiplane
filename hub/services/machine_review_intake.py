@@ -91,6 +91,62 @@ async def _alert_no_candidates(
     )
 
 
+async def _retract_no_candidates_alert(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    new_id: int,
+    raw_count: int,
+    principal_id: int | None,
+) -> None:
+    """Снять алерт «харнесс не запускался», когда тот же ревьюер сдал данные (#1584).
+
+    R — первая нулевая строка поколения, та самая, на которую
+    _alert_no_candidates писал алерт. Отзыв — только новая строка ленты: алерт
+    и строки machine_reviews не переписываются. Пишется, когда новая строка N
+    (её id — из текущего INSERT) несёт данные, R не перенесена и принадлежит
+    тому же принципалу, а между R и N у него нет другого неперенесённого
+    отчёта с данными: это и даёт однократность. Приём и отзыв идут в одной
+    write-транзакции (commit — позже в record_machine_review), поэтому
+    однократность держится и для конкурентных приёмов.
+    """
+    if raw_count <= 0 or principal_id is None:
+        return
+    zero = await fetchall(
+        db,
+        "SELECT id, principal_id, carried_from_review_id FROM machine_reviews "
+        "WHERE task_id=? AND submission_generation=? AND raw_count=0 "
+        "ORDER BY id LIMIT 1",
+        (task_id, generation),
+    )
+    if not zero:
+        return
+    first = zero[0]
+    if first["carried_from_review_id"] is not None:
+        return
+    if first["principal_id"] != principal_id or int(first["id"]) >= new_id:
+        return
+    between = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM machine_reviews "
+        "WHERE task_id=? AND submission_generation=? AND principal_id=? "
+        "AND raw_count>0 AND carried_from_review_id IS NULL "
+        "AND id>? AND id<?",
+        (task_id, generation, principal_id, first["id"], new_id),
+    )
+    if int(between[0]["n"]) != 0:
+        return
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        f"По поколению пришёл отчёт с данными #{new_id} от того же ревьюера; "
+        f"алерт по пустому #{first['id']} снят (#1584). Второй отчёт не "
+        "заменяет первый: обе строки приняты.",
+    )
+
+
 async def _alert_environment_refusal(
     db: aiosqlite.Connection, task_id: int, body: MachineReviewSubmit
 ) -> None:
@@ -248,7 +304,7 @@ async def record_machine_review(
         principal_id=principal_id,
         username=username,
     )
-    await repo.insert_machine_review(
+    new_review_id = await repo.insert_machine_review(
         db,
         task_id=task_id,
         submission_generation=generation,
@@ -322,6 +378,9 @@ async def record_machine_review(
         },
     )
     await _alert_no_candidates(db, task_id, body, raw_count, generation)
+    await _retract_no_candidates_alert(
+        db, task_id, generation, new_review_id, raw_count, principal_id
+    )
     await _alert_environment_refusal(db, task_id, body)
 
     # #1012/#1025: the hub may already have called a reviewer for this very
