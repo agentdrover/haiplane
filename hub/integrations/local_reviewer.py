@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import fcntl
 import json
 import logging
 import grp
@@ -840,7 +841,18 @@ async def run_review(
         return None
     limit = timeout if timeout is not None else config.LOCAL_REVIEW_TIMEOUT_SEC
     if transport() == "runner":
+        # #1588: свежий маркер выкладки — отказ СРАЗУ, до очереди на слот: ждать
+        # чужое ревью ради заказа, который всё равно не опубликуют, нельзя.
+        # Окончательное слово — под файловым замком при публикации задания.
+        if reason := drain_refusal():
+            _REFUSAL.set(reason)
+            return None
         async with _HOST_BUDGET:
+            if reason := drain_refusal():
+                # Маркер появился, пока заказ ждал слот: промт не готовим
+                # (код доступа ревьюера живёт ограниченно).
+                _REFUSAL.set(reason)
+                return None
             if prompt_at_slot is not None:
                 prompt = await prompt_at_slot(prompt)
             return await _run_via_runner(prompt, limit)
@@ -1005,6 +1017,135 @@ RUNNER_PICKUP_SEC = 60.0
 # После просьбы снять прогон — сколько ждать подтверждения службы.
 RUNNER_GRACE_SEC = 20.0
 RUNNER_POLL_SEC = 0.5
+
+# Выкладка хаба (#1588, deploy/review-drain.sh). Деплой ставит в spool маркер
+# и ждёт идущие прогоны; пока маркер свежий, НОВЫЙ локальный прогон не
+# стартует. Имена не совпадают с шаблоном задания службы (job-<16 hex>), так
+# что служба их не видит. Замок держится только на коротких операциях.
+SPOOL_DRAIN_MARKER = "draining"
+SPOOL_DRAIN_LOCK = ".drain.lock"
+# Маркер с «сроком» дальше этого — не маркер: деплой ставит TTL ~45 мин, а
+# битый или вечный файл не должен навсегда закрыть локальный путь.
+DRAIN_MARKER_MAX_AHEAD_SEC = 2 * 3600
+# Замок короткий; если он занят дольше, выкладка делает что-то не то, и
+# заказ уходит отказом (облако), а не ждёт.
+DRAIN_LOCK_WAIT_SEC = 5.0
+DRAIN_LOCK_POLL_SEC = 0.02
+DRAIN_REASON = (
+    "идёт выкладка хаба: новые локальные прогоны не стартуют, пока деплой "
+    "ждёт идущие (deploy/LOCAL-REVIEW.md, #1588)"
+)
+
+
+class DrainActive(Exception):
+    """Публикация задания запрещена: идёт выкладка (или её замок занят)."""
+
+    def __init__(self, reason: str = DRAIN_REASON) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _fresh_drain_marker(spool: str) -> str | None:
+    """Владелец СВЕЖЕГО маркера выкладки в spool, иначе ``None``.
+
+    Просроченный маркер игнорируется (и называется в логе): потерянный
+    владелец лечится сроком, а не чьей-то уборкой. Файл читается
+    без следования по ссылкам. Нечитаемый или битый маркер маркером не
+    считается: деплой пишет его атомарно, так что «битый» значит «чужой».
+    """
+    path = os.path.join(spool, SPOOL_DRAIN_MARKER)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        raw = os.read(fd, 4096).decode("utf-8", "replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    fields = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+    owner = fields.get("owner", "").strip()
+    try:
+        expires = int(fields.get("expires", "").strip())
+    except ValueError:
+        log.warning("drain marker %s ignored: no valid expires", path)
+        return None
+    now = time.time()
+    if expires <= now:
+        log.info("drain marker of %r expired %ds ago: ignored", owner, now - expires)
+        return None
+    if expires - now > DRAIN_MARKER_MAX_AHEAD_SEC:
+        log.warning("drain marker of %r ignored: expires too far ahead", owner)
+        return None
+    return owner or "?"
+
+
+def drain_refusal() -> str:
+    """Причина отказа новому локальному прогону из-за выкладки, или ``""``.
+
+    Только для транспорта runner: marker живёт в его spool. НЕ часть
+    ``not_ready()``: тот же вопрос читают настройка проекта (422) и UI, и
+    временная выкладка не должна менять конфигурационную достижимость.
+    """
+    if transport() != "runner":
+        return ""
+    spool = (config.LOCAL_REVIEW_SPOOL_DIR or "").strip()
+    if not spool:
+        return ""
+    owner = _fresh_drain_marker(spool)
+    return "" if owner is None else f"{DRAIN_REASON} [{owner}]"
+
+
+def _open_drain_lock(spool: str) -> int | None:
+    """Файловый замок выкладки. ``None`` — открыть нельзя (прав нет)."""
+    path = os.path.join(spool, SPOOL_DRAIN_LOCK)
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags, 0o660)
+    except OSError as exc:
+        log.warning("drain lock %s not opened (%s): publishing unguarded", path, exc)
+        return None
+    with contextlib.suppress(OSError):
+        os.fchmod(fd, 0o660)  # nosec B103 - группе хаба и деплоя, не миру
+    return fd
+
+
+def _take_drain_lock(fd: int) -> None:
+    end = time.monotonic() + DRAIN_LOCK_WAIT_SEC
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if time.monotonic() >= end:
+                raise DrainActive(
+                    f"замок выкладки {SPOOL_DRAIN_LOCK} занят дольше "
+                    f"{DRAIN_LOCK_WAIT_SEC:g} с"
+                ) from None
+            time.sleep(DRAIN_LOCK_POLL_SEC)
+
+
+def _submit_job_unless_draining(spool: str, prompt: str, limit: int) -> str:
+    """Проверка маркера И публикация задания под одним замком (#1588).
+
+    Деплой считает задания под тем же замком, поэтому «маркер свежий» и
+    «job.json появился» не могут разойтись: либо заказ опубликован до того,
+    как деплой посчитал задания (и деплой его дождётся), либо он видит маркер
+    и отказывает. Замок закрывается вместе с дескриптором.
+    """
+    fd = _open_drain_lock(spool)
+    try:
+        if fd is not None:
+            _take_drain_lock(fd)
+        owner = _fresh_drain_marker(spool)
+        if owner is not None:
+            raise DrainActive(f"{DRAIN_REASON} [{owner}]")
+        return _submit_job(spool, prompt, limit)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
 
 # Причина последнего отказа транспорта. ContextVar, а не поле модуля: прогонов
 # в процессе несколько, а читает причину тот же task, что её записал.
@@ -1234,7 +1375,14 @@ async def _run_via_runner(prompt: str, limit: int) -> LocalRun | None:
     started = time.monotonic()
     spool = config.LOCAL_REVIEW_SPOOL_DIR.strip()
     try:
-        jobdir = _submit_job(spool, prompt, limit)
+        # В потоке: замок и запись промта — блокирующие вызовы, event loop
+        # хаба занят и чужими запросами.
+        jobdir = await asyncio.to_thread(
+            _submit_job_unless_draining, spool, prompt, limit
+        )
+    except DrainActive as exc:
+        _REFUSAL.set(exc.reason)
+        return None
     except OSError as exc:
         log.warning("local reviewer: job not written under %s: %s", spool, exc)
         _REFUSAL.set(f"задание не записано в очередь службы: {exc}")

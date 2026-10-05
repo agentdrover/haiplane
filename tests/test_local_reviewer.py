@@ -878,3 +878,197 @@ async def test_a_dead_runner_before_the_claim_is_not_called_alive(
     card = _local_failure_reason(None)
     assert "перестала отвечать" in card and "свежий" not in card
     assert _jobs(spool) == []
+
+
+# ------------------------------------------------- выкладка хаба (#1588)
+
+
+def _drain_marker(spool: Path, ahead: int = 600, owner: str = "deploy-test") -> None:
+    (spool / "draining").write_text(
+        f"owner={owner}\nexpires={int(time.time()) + ahead}\n"
+    )
+
+
+def _answering_service(spool: Path, seen: list[str]) -> "asyncio.Task[None]":
+    """Служба-заглушка: берёт задание и отвечает result.json (как в AC-1)."""
+
+    async def _serve() -> None:
+        while True:
+            for jobdir in _jobs(spool):
+                if (jobdir / "job.json").exists() and jobdir.name not in seen:
+                    seen.append(jobdir.name)
+                    (jobdir / "claimed").write_text("")
+                    (jobdir / "result.json").write_text(
+                        json.dumps(
+                            {
+                                "status": "ok",
+                                "rc": 0,
+                                "output": "ок",
+                                "dropped": 0,
+                                "timed_out": False,
+                                "duration_ms": 1,
+                                "reason": "",
+                            }
+                        )
+                    )
+            await asyncio.sleep(0.01)
+
+    return asyncio.create_task(_serve())
+
+
+async def test_drain_marker_checked_with_publish_under_lock(spool, monkeypatch) -> None:
+    """AC-3: маркер проверяется ДО слота и под замком при публикации job.json.
+
+    Три гонки с управляемыми барьерами: (а) слот занят, маркер свежий — отказ
+    сразу и слот не освобождается; (б) маркер появился, пока заказ ждал слот;
+    (в) маркер появился во время подготовки промта. Идущий прогон при этом не
+    трогается, а просроченный маркер не мешает.
+    """
+    import fcntl
+
+    _beat(spool)
+    running = _write_job(
+        spool, "job-0123456789abcdef", {"version": 1, "timeout_sec": 5}
+    )
+    (running / "claimed").write_text("")
+    before = sorted(p.name for p in running.iterdir())
+
+    # Что хаб ПОПЫТАЛСЯ опубликовать: каталог задания хаб убирает за собой, так
+    # что по содержимому spool «опубликовано, а потом убрано» не отличить.
+    published: list[str] = []
+    real_submit = local_reviewer._submit_job
+
+    def _spy(spool_dir: str, prompt: str, limit: int) -> str:
+        published.append(prompt)
+        return real_submit(spool_dir, prompt, limit)
+
+    monkeypatch.setattr(local_reviewer, "_submit_job", _spy)
+
+    async def _order(**kw):
+        """Прогон И причина отказа — в одном контексте: причина лежит в ContextVar."""
+        run = await local_reviewer.run_review("п", timeout=5, **kw)
+        return run, local_reviewer.refusal()
+
+    # (а) слот занят чужим прогоном, маркер свежий: отказ сразу, не ждать слот.
+    await local_reviewer._HOST_BUDGET.acquire()
+    try:
+        _drain_marker(spool)
+        started = time.monotonic()
+        run, why = await asyncio.wait_for(_order(), 2)
+        assert run is None
+        assert time.monotonic() - started < 1.0, "заказ ждал слот вместо отказа"
+        assert local_reviewer.DRAIN_REASON in why
+        assert local_reviewer._HOST_BUDGET.locked(), "слот освобождён чужим отказом"
+    finally:
+        local_reviewer._HOST_BUDGET.release()
+    assert sorted(p.name for p in running.iterdir()) == before, (
+        "идущий прогон тронут: отказ новому заказу не отменяет его"
+    )
+    assert published == []
+    (spool / "draining").unlink()
+
+    # (б) маркер появился, пока заказ ждал слот: промт не готовится, job.json нет.
+    prepared: list[str] = []
+
+    async def _prompt(ready: str) -> str:
+        prepared.append(ready)
+        return ready
+
+    await local_reviewer._HOST_BUDGET.acquire()
+    waiting = asyncio.create_task(_order(prompt_at_slot=_prompt))
+    await asyncio.sleep(0.1)
+    assert not waiting.done(), "предпосылка: заказ ждёт слот"
+    _drain_marker(spool)
+    local_reviewer._HOST_BUDGET.release()
+    run, why = await asyncio.wait_for(waiting, 2)
+    assert run is None and local_reviewer.DRAIN_REASON in why
+    assert prepared == [], "промт с одноразовым кодом готовился под запретом"
+    assert published == []
+    (spool / "draining").unlink()
+
+    # (в) маркер появился во время подготовки промта: ловит только проверка
+    # при самой публикации.
+    async def _prompt_then_marker(ready: str) -> str:
+        _drain_marker(spool)
+        return ready
+
+    run, why = await _order(prompt_at_slot=_prompt_then_marker)
+    assert run is None and local_reviewer.DRAIN_REASON in why
+    assert published == [], "job.json опубликован под запретом"
+    (spool / "draining").unlink()
+
+    # (в') проверка и публикация — под ОДНИМ файловым замком: заказ дошёл до
+    # публикации, замок держит «деплой», маркер ставится под замком — заказ,
+    # получив замок, обязан его увидеть. Проверка ДО замка этого не поймает.
+    lock_fd = os.open(spool / ".drain.lock", os.O_RDWR | os.O_CREAT, 0o660)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        order = asyncio.create_task(_order())
+        await asyncio.sleep(0.2)
+        assert not order.done(), "публикация не должна идти мимо замка"
+        _drain_marker(spool)
+    finally:
+        os.close(lock_fd)
+    run, why = await asyncio.wait_for(order, 3)
+    assert run is None and local_reviewer.DRAIN_REASON in why, why
+    assert published == [], "маркер, поставленный под замком, не увидели"
+    (spool / "draining").unlink()
+
+    # Замок занят дольше, чем он вправе: отказ с названной причиной, не зависание.
+    monkeypatch.setattr(local_reviewer, "DRAIN_LOCK_WAIT_SEC", 0.2)
+    lock_fd = os.open(spool / ".drain.lock", os.O_RDWR)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        run, why = await asyncio.wait_for(_order(), 3)
+    finally:
+        os.close(lock_fd)
+    assert run is None and ".drain.lock" in why
+    assert published == []
+
+    # Просроченный маркер не мешает, а свой запрет ставят только свежие.
+    (running / "result.json").write_text("{}")
+    _drain_marker(spool, ahead=-5)
+    seen: list[str] = [running.name]  # старый прогон служба-заглушка не берёт
+    service = _answering_service(spool, seen)
+    try:
+        run, why = await _order()
+    finally:
+        service.cancel()
+    assert run is not None and run.output == "ок", why
+    assert len(published) == 1 and len(seen) == 2, "просроченный маркер остановил заказ"
+    assert (spool / "draining").exists(), "хаб чужой маркер не снимает"
+
+
+async def test_drain_marker_is_not_a_readiness_problem(spool) -> None:
+    """Запрет — только в пути запуска: not_ready() и runner_problem() не знают."""
+    _beat(spool)
+    assert local_reviewer.not_ready() == []
+    _drain_marker(spool)
+    assert local_reviewer.not_ready() == [], "готовность читают проект и UI"
+    assert local_reviewer.runner_problem() == []
+    assert local_reviewer.drain_refusal().startswith(local_reviewer.DRAIN_REASON)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "owner=x\n",  # нет срока
+        "owner=x\nexpires=abc\n",  # срок не число
+        "owner=x\nexpires=1\n",  # давно просрочен
+        "owner=x\nexpires=99999999999\n",  # «навечно»: не маркер
+    ],
+)
+async def test_a_broken_or_expired_marker_does_not_block(spool, body: str) -> None:
+    (spool / "draining").write_text(body)
+    assert local_reviewer.drain_refusal() == ""
+
+
+async def test_marker_is_ignored_for_the_direct_transport(spool, monkeypatch) -> None:
+    _drain_marker(spool)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TRANSPORT", "direct")
+    assert local_reviewer.drain_refusal() == ""
+
+
+def test_the_marker_and_the_lock_never_look_like_a_job(runner_mod) -> None:
+    for name in (local_reviewer.SPOOL_DRAIN_MARKER, local_reviewer.SPOOL_DRAIN_LOCK):
+        assert not runner_mod._JOB_NAME.match(name)

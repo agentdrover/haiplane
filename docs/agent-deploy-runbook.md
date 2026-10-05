@@ -140,6 +140,20 @@ uv run ruff check hub tests
 > ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo chmod 0755 /usr/local/sbin/<SERVICE>-remote-deploy.sh'
 > ```
 >
+> Закреплённая копия **обновляется при каждой правке** `deploy/remote-deploy.sh`,
+> а при #1588 он изменился (вызов `deploy/review-drain.sh` до rsync). Хэш,
+> который сверяет guard, считается с файла из коммита, который выкатывается:
+>
+> ```bash
+> sha256sum deploy/remote-deploy.sh   # ожидаемый sha256 закреплённой копии
+> ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sha256sum /usr/local/sbin/<SERVICE>-remote-deploy.sh'
+> ```
+>
+> Копию обновляет человек до выката (две команды `tee` и `chmod` выше), иначе
+> первый деплой после правки упадёт на sha256. Скрипт `deploy/review-drain.sh`
+> в закреплённую копию не входит: он приходит rsync-ом в staging вместе с
+> деревом и вызывается оттуда (см. `deploy/CD.md`, раздел про drain).
+>
 > Падение будет громким, а не тихим: job упадёт красным, а в логе будут оба
 > sha256 и эта же команда. Отказы guard пишет в syslog тегом
 > `<SERVICE>-ci-guard` (`journalctl -t <SERVICE>-ci-guard`).
@@ -173,6 +187,14 @@ sudo systemctl is-active <SERVICE>
 curl -sf -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/healthz
 REMOTE
 ```
+
+> **Ручной путь выше идёт прямо к restart и drain локальных ревью (#1588) не
+> вызывает: гарантия «деплой ждёт идущие прогоны» на него не распространяется.**
+> Чтобы выкатить с ожиданием, после rsync в staging запустите серверную часть
+> скриптом: `ssh <DEPLOY_USER>@<DEPLOY_HOST> 'bash -s' < deploy/remote-deploy.sh`
+> (он вызывает drain до rsync из staging). Перед ручным restart без drain
+> убедитесь, что локальный deep не идёт: в каталоге очереди нет `job-*` с
+> `job.json` или `claimed` без `result.json`.
 
 Критерии успеха:
 

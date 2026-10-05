@@ -12,7 +12,18 @@
 #   - service venv:    /opt/haiplane-hub/venv
 #   - runtime user:    haiplane
 #   - systemd unit:    haiplane-hub
-#   - the deploy SSH user has passwordless sudo for the commands below.
+#   - the deploy SSH user has passwordless sudo for the commands below, and for
+#     `sudo -n -u <runtime user> bash -s -- <drain command>` (see "Drain" below).
+#
+# Drain (#1588): before the rsync this script asks deploy/review-drain.sh to wait
+# for running LOCAL deep reviews (up to ONE budget, DRAIN_BUDGET_SECONDS, 1800 s)
+# and to keep new local orders out meanwhile. The marker that does this is kept
+# alive by a background renewer until the health check is over, and removed on
+# success, failure and signals (only our own). The drain never fails the deploy:
+# its outcome is one log line, `drain ok`, `drain timeout (...)` or
+# `drain degraded (...)`. The rsync, pip and restart times are NOT part of the
+# guarantee. The drain script is read from staging (the CI rsync has already put
+# it there) and run as the hub's unix user, because the spool belongs to it.
 set -euo pipefail
 
 STAGING="$HOME/haiplane-hub-src-staging"
@@ -36,9 +47,108 @@ if [ -z "$SERVICE_USER" ] || [ "$SERVICE_USER" = "root" ]; then
   exit 1
 fi
 
+# --- Drain of local deep reviews (#1588) -------------------------------------
+REVIEW_DRAIN_SCRIPT="${REVIEW_DRAIN_SCRIPT:-$STAGING/deploy/review-drain.sh}"
+DRAIN_BUDGET_SECONDS="${DRAIN_BUDGET_SECONDS:-1800}"
+DRAIN_OWNER="${DRAIN_OWNER:-deploy-$(date +%s)-$$}"
+# ONE budget for every wait of the drain, the lock included.
+DRAIN_DEADLINE="${DRAIN_DEADLINE:-$(($(date +%s) + DRAIN_BUDGET_SECONDS))}"
+DRAIN_ON=0
+DRAIN_CHILD=""
+RENEW_PID=""
+RENEW_LOG=""
+
+# The drain script as the hub's unix user. The script comes in on stdin and the
+# state in the environment: nothing is passed through argv except the command.
+drain_run() {
+  local envs=("DRAIN_OWNER=$DRAIN_OWNER" "DRAIN_DEADLINE=$DRAIN_DEADLINE" "DRAIN_BUDGET_SECONDS=$DRAIN_BUDGET_SECONDS")
+  local name
+  for name in DRAIN_TTL_SECONDS DRAIN_RENEW_SECONDS DRAIN_POLL_SECONDS \
+    DRAIN_PROGRESS_SECONDS DRAIN_MAX_HOLD_SECONDS HAIPLANE_LOCAL_REVIEW_SPOOL_DIR; do
+    if [ -n "${!name:-}" ]; then
+      envs+=("$name=${!name}")
+    fi
+  done
+  # The redirect is read by the DEPLOY user on purpose: staging is in its home,
+  # which the hub's unix user may not be able to read (SC2024 is the intent).
+  # shellcheck disable=SC2024
+  sudo -n -u "$SERVICE_USER" env "${envs[@]}" bash -s -- "$@" <"$REVIEW_DRAIN_SCRIPT"
+}
+
+# One drain command in the BACKGROUND and a `wait`: a signal reaches the trap
+# at once instead of after a foreground wait of up to the whole budget.
+drain_step() {
+  local rc=0
+  drain_run "$@" &
+  DRAIN_CHILD=$!
+  wait "$DRAIN_CHILD" || rc=$?
+  DRAIN_CHILD=""
+  if [ "$rc" -ne 0 ]; then
+    echo "drain degraded (команда '$1' не отработала, rc=$rc: sudo -u $SERVICE_USER bash недоступен или скрипт упал)"
+  fi
+  return 0
+}
+
+drain_cleanup() {
+  local code=$?
+  trap - EXIT
+  if [ -n "$DRAIN_CHILD" ]; then
+    kill "$DRAIN_CHILD" 2>/dev/null || true
+    wait "$DRAIN_CHILD" 2>/dev/null || true
+  fi
+  if [ -n "$RENEW_PID" ]; then
+    if ! kill -0 "$RENEW_PID" 2>/dev/null && [ ! -s "$RENEW_LOG" ]; then
+      echo "drain degraded (продление маркера оборвалось до конца выкладки: окно запрета не гарантировано)"
+    fi
+    kill "$RENEW_PID" 2>/dev/null || true
+    wait "$RENEW_PID" 2>/dev/null || true
+  fi
+  if [ -n "$RENEW_LOG" ] && [ -s "$RENEW_LOG" ]; then
+    cat "$RENEW_LOG"
+  fi
+  if [ "$DRAIN_ON" = 1 ]; then
+    drain_step release || true
+  fi
+  [ -z "$RENEW_LOG" ] || rm -f "$RENEW_LOG"
+  exit "$code"
+}
+
+trap drain_cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT HUP
+
+# The review spool is a server fact: it comes from the environment of this script
+# or, failing that, from the hub unit's own Environment (the drop-in that turns
+# the runner transport on). Only that ONE key is extracted; the rest of the
+# unit environment (tokens included) is never stored or printed.
+if [ -z "${HAIPLANE_LOCAL_REVIEW_SPOOL_DIR:-}" ]; then
+  HAIPLANE_LOCAL_REVIEW_SPOOL_DIR="$(systemctl show haiplane-hub -p Environment --value 2>/dev/null |
+    tr ' ' '\n' | sed -n 's/^HAIPLANE_LOCAL_REVIEW_SPOOL_DIR=//p' | head -n 1 || true)"
+fi
+export HAIPLANE_LOCAL_REVIEW_SPOOL_DIR
+
+if [ -z "$HAIPLANE_LOCAL_REVIEW_SPOOL_DIR" ]; then
+  echo "drain degraded (каталог очереди не задан: нет HAIPLANE_LOCAL_REVIEW_SPOOL_DIR ни в окружении, ни в юните haiplane-hub; локальный путь, видимо, не включён)"
+elif [ -r "$REVIEW_DRAIN_SCRIPT" ]; then
+  DRAIN_ON=1
+  RENEW_LOG="$(mktemp)"
+  # The renewer starts FIRST and keeps the marker fresh for the whole deploy
+  # (rsync, pip, restart, health): it is independent of the wait loop below.
+  drain_run renew-loop "$$" >"$RENEW_LOG" 2>&1 &
+  RENEW_PID=$!
+  drain_step acquire
+else
+  echo "drain degraded (скрипт $REVIEW_DRAIN_SCRIPT недоступен)"
+fi
+
 sudo rsync -a --delete "$STAGING/" "$DEST/"
 sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DEST"
 sudo -u "$SERVICE_USER" /opt/haiplane-hub/venv/bin/pip install -e "$DEST" -q
+if [ "$DRAIN_ON" = 1 ]; then
+  # Jobs that slipped in (an old hub ignores the marker) and the time pip took:
+  # the same single budget, what is left of it.
+  drain_step recheck
+fi
 sudo systemctl restart haiplane-hub
 
 # Readiness is polled, not slept for. The unit is Type=simple, so systemd calls

@@ -4731,6 +4731,13 @@ async def dispatch_local_review(
             reach.reason or local_path_refusal(missing),
             declined=local_first,
         )
+    if drain := local_reviewer.drain_refusal():
+        # #1588: идёт выкладка хаба — новый локальный прогон не стартует. Это
+        # отказ ПУТИ ЗАПУСКА, а не конфигурации: review_reach() его не знает и
+        # не должен знать (его читают настройка проекта и UI). Local-first
+        # уходит в облако с этой причиной в карточке; форж без облака и вторая
+        # дверь — вердикт человеку с ней же.
+        return await _refuse_local_review(db, task_id, drain, declined=local_first)
     if not local_first:
         # Для local_first тот же счёт идёт ПОСЛЕ профиля (_local_first_gate):
         # lite в облако уходит и потолка локального пути не касается.
@@ -5367,6 +5374,8 @@ async def _settle_local_run(
 def _local_failure_headline(run: local_reviewer.LocalRun | None) -> str:
     """Короткое имя отказа локального прогона — для строки об облаке (#1561)."""
     if run is None:
+        if local_reviewer.refusal().startswith(local_reviewer.DRAIN_REASON):
+            return "идёт выкладка хаба (#1588)"
         return "прогон не состоялся (ошибка запуска)"
     if run.timed_out:
         return f"таймаут {config.LOCAL_REVIEW_TIMEOUT_SEC} с"
