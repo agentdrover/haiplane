@@ -695,6 +695,28 @@ async def policy_refusal(
     )
 
 
+async def text_origin_refusals(
+    db: aiosqlite.Connection, task_id: int, generation: int | None
+) -> list[tuple[str, str]]:
+    """Отчёт, переписанный хабом из текста прогона, самостоятельного approve не даёт (#1587).
+
+    Тот же признак, что у автопилота и маршрута вердикта: если стюард всё же
+    начал суждение раньше, чем отчёт стал известен как текстовый, применять
+    его approve нельзя.
+    """
+    from hub import repository as repo
+    from hub.services.auto_verdict import text_origin_refusal
+
+    review = await repo.get_latest_machine_review(db, task_id)
+    if review is None:
+        return []
+    row = dict(review)
+    if generation is not None and (row.get("submission_generation") or 0) != generation:
+        return []
+    refusal = text_origin_refusal(row)
+    return [(REFUSED_PRECONDITION, refusal[1])] if refusal else []
+
+
 async def apply_refusals(
     db: aiosqlite.Connection, task_id: int, generation: int | None = None
 ) -> list[tuple[str, str]]:
@@ -719,6 +741,7 @@ async def apply_refusals(
     task = dict(row) if row is not None else {"id": task_id}
 
     out = [not_delegated] if not_delegated else []
+    out.extend(await text_origin_refusals(db, task_id, generation))
     out.extend(precondition_refusals(packet))
     self_authored = await self_authored_refusal(db, task_id)
     if self_authored:

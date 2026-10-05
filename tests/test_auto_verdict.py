@@ -750,3 +750,78 @@ async def test_repeat_of_deferred_finding_does_not_block_autopilot(
     other = (await client.get(f"/api/tasks/{fresh}")).json()
     assert other["status"] == "review"
     assert other["review_verdict"] != "approved", "без отсрочки находка блокирует"
+
+
+# --- #1587: a report the hub transcribed from a run's text is not a verdict ---
+#
+# Origin is a fact the hub writes into ``orchestrator`` (#1036, #1180). The
+# report is accepted and shown — only the unattended approval and the hand-over
+# to the steward are refused, with the reason named.
+
+
+async def _record_with_origin(
+    db: aiosqlite.Connection, task_id: int, origin: str
+) -> None:
+    from hub.models import MachineReviewSubmit
+    from hub.services import machine_review_intake
+
+    await machine_review_intake.record_machine_review(
+        db,
+        task_id,
+        MachineReviewSubmit(**_CLEAN_REVIEW),
+        principal_id=None,
+        username="hub",
+        origin=origin,
+    )
+
+
+async def test_text_recovered_report_never_auto_approves(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    from hub.services.machine_review_intake import (
+        ORIGIN_LOCAL_TEXT,
+        ORIGIN_MCP,
+        ORIGIN_RUN_TEXT,
+    )
+    from hub.services.verdict_route import verdict_route
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    for policy in ("auto", "steward"):
+        for origin in (ORIGIN_RUN_TEXT, ORIGIN_LOCAL_TEXT):
+            slug = f"spike-text-{policy}-{origin[:5]}"
+            task_id = await _submitted_task(client, db, slug, {"verdict": policy})
+            await _record_with_origin(db, task_id, origin)
+
+            body = (await client.get(f"/api/tasks/{task_id}")).json()
+            assert body["review_verdict"] is None, (
+                f"{policy}/{origin}: a text-recovered report must not approve"
+            )
+            assert body["status"] == "review", "the verdict stays with the human"
+            feed = " ".join(u["content"] for u in body["updates"] or [])
+            assert "Автовердикт НЕ вынесен" in feed and origin in feed, (
+                "the refusal names its reason in the feed"
+            )
+            row = await repo.get_latest_machine_review(db, task_id)
+            assert row is not None and row["orchestrator"].startswith(origin + ":"), (
+                "the report is accepted and visible, with its origin"
+            )
+            from hub.services import steward_apply
+
+            gate = await steward_apply.text_origin_refusals(db, task_id, None)
+            assert gate and origin in gate[0][1], (
+                "the steward's apply gate refuses a text-recovered approve"
+            )
+            route = await verdict_route(db, task_id, observe=True)
+            assert route.decider == "human", f"{policy}/{origin}: {route}"
+            assert route.code == "text_recovered_report", route
+            assert origin in route.reason
+
+    # Control (regression guard): the same clean report through the contract
+    # keeps today's behaviour in both policies.
+    for policy in ("auto", "steward"):
+        task_id = await _submitted_task(
+            client, db, f"spike-contract-{policy}", {"verdict": policy}
+        )
+        await _record_with_origin(db, task_id, ORIGIN_MCP)
+        body = (await client.get(f"/api/tasks/{task_id}")).json()
+        assert body["review_verdict"] == "approved", policy

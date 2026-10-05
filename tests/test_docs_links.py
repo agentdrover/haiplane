@@ -226,3 +226,39 @@ def test_operator_guide_matches_stateless_mcp():
         for line in doc.splitlines():
             if "Mcp-Session-Id" in line:
                 assert re.search(r"не (требу|нужен|передаёт|выда)", line), line
+
+
+def test_deep_lifecycle_contract_lists_the_scenarios():
+    """#1587: the deep-review behaviour contract exists and every row is marked."""
+    doc = REPO_ROOT / "docs" / "review-deep-lifecycle.md"
+    assert doc.is_file()
+    text = doc.read_text(encoding="utf-8")
+    marks = (
+        "реализовано этой задачей",
+        "существующее поведение сохранено",
+        "целевое, отдельная задача",
+    )
+    rows = {}
+    for line in text.splitlines():
+        m = re.match(r"^\|\s*(\d+[a-d]?)\s*\|", line)
+        if m:
+            rows[m.group(1)] = line
+    expected = [
+        "1", "1b", "1c", "1d", "2", "3", "4", "5", "6", "6b", "7",
+        "8a", "8b", "8c", "8d", "9", "10", "11", "12", "13",
+    ]  # fmt: skip
+    assert sorted(rows) == sorted(expected), "every scenario of the card has a row"
+    for number, line in rows.items():
+        assert sum(mark in line for mark in marks) == 1, f"row {number}: one mark"
+    for number in ("6", "7", "8d"):
+        assert "реализовано этой задачей" in rows[number], number
+    assert "бронь блокирует первичный двойной заказ" in rows["11"]
+    assert "гонок нет" not in text.replace("без утверждения «гонок нет»", "")
+
+    local = (REPO_ROOT / "deploy" / "LOCAL-REVIEW.md").read_text(encoding="utf-8")
+    assert (
+        "docs/review-deep-lifecycle.md" in local or "review-deep-lifecycle.md" in local
+    )
+    link = re.search(r"\]\(([^)]*review-deep-lifecycle\.md)\)", local)
+    assert link, "LOCAL-REVIEW.md links the document"
+    assert (REPO_ROOT / "deploy" / link.group(1)).resolve() == doc.resolve()

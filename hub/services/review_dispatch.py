@@ -2411,6 +2411,78 @@ async def _second_axis_blocked(
     return ""
 
 
+async def _channel_of_report_order(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    report: Mapping[str, Any],
+) -> str:
+    """Канал заказа, который ТОЧНО породил отчёт, или "" — если не определён (#1587).
+
+    Строже ``dispatch_for_report``, у которого для заказа без принципала
+    «его» отчётом служит последний отчёт поколения — один и тот же отчёт
+    подходит ко всем таким заказам, а берётся первый по id. После второй
+    двери (#1252) первым остаётся оплаченный облачный заказ без отчёта, и
+    неполный отчёт локальной замены приписывался ему: облако покупалось
+    ровно там, где D6 это запрещает. Здесь:
+
+    * сначала заказы с принципалом, совпавшим с принципалом ОТЧЁТА (токен, а
+      не слова отчёта), и со ступенью — ``_dispatch_report`` называет именно
+      этот отчёт; заказ без принципала при наличии такого не в счёт;
+    * при нескольких точных заказах разных каналов — не определён;
+    * принципала у отчёта или у всех заказов нет (открытый режим, история) —
+      заказы без принципала; их каналы должны совпадать, иначе не определён.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT * FROM review_dispatches WHERE task_id=? "
+        "AND submission_generation=? ORDER BY id",
+        (task_id, generation),
+    )
+    orders = [dict(r) for r in rows]
+    principal = report.get("principal_id")
+    channels: set[str] = set()
+    if principal is not None:
+        for order in orders:
+            if order.get("reviewer_principal_id") != principal:
+                continue
+            matched = await _dispatch_report(db, task_id, generation, order)
+            if matched is not None and matched.get("id") == report.get("id"):
+                channels.add(order.get("channel") or CLOUD_CHANNEL)
+        if channels:
+            return next(iter(channels)) if len(channels) == 1 else ""
+        if any(o.get("reviewer_principal_id") == principal for o in orders):
+            return ""  # заказ этого принципала есть, но отчёт ему не отвечает
+    unpinned = {
+        o.get("channel") or CLOUD_CHANNEL
+        for o in orders
+        if o.get("reviewer_principal_id") is None
+    }
+    return next(iter(unpinned)) if len(unpinned) == 1 else ""
+
+
+async def _no_cloud_after_local(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    report: Mapping[str, Any],
+) -> str:
+    """Почему отчёт не даёт права на облачный deep второй оси, или "" (#1587).
+
+    Канал берётся у заказа, который породил отчёт (``_channel_of_report_order``),
+    а не из токена текущего локального ревьюера: токен ротируется, и для
+    истории он ненадёжен. Заказ не определён однозначно — тоже отказ: купить
+    облако по отчёту неизвестного происхождения хуже, чем назвать причину
+    человеку.
+    """
+    channel = await _channel_of_report_order(db, task_id, generation, report)
+    if not channel:
+        return "заказ, породивший отчёт, не определён однозначно"
+    if channel == LOCAL_CHANNEL:
+        return "отчёт принадлежит заказу локального канала"
+    return ""
+
+
 async def _ask_a_stronger_model(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -2438,6 +2510,21 @@ async def _ask_a_stronger_model(
             f"агент НЕ покупается. Модели, читавшие эту сдачу: {read_by}. "
             "Ревью так и не состоялось полностью — решение за человеком "
             "(#1243)." + _ladder_cause_note(report),
+        )
+        return False
+    # #1587 (D6): неполный отчёт ЛОКАЛЬНОГО deep облачным deep не лечится —
+    # решает человек. Признак — канал заказа, который породил отчёт, а не
+    # токен ревьюера. Обе двери оси проходят через это место.
+    no_cloud = await _no_cloud_after_local(db, task_id, generation, report)
+    if no_cloud:
+        await _alert(
+            db,
+            task_id,
+            "Неполный отчёт профиля «deep»: облако не заказано, решает "
+            f"человек — {no_cloud}. Вторая ось переспрашивает другой "
+            "моделью только неполный ОБЛАЧНЫЙ отчёт: неполнота локального "
+            "deep не оплачивается облачным прогоном (#1587)."
+            + _ladder_cause_note(report),
         )
         return False
     implementer = (task.get("submission_model") or "").strip()

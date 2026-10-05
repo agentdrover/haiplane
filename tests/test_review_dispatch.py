@@ -2118,6 +2118,215 @@ async def test_a_deep_incomplete_report_is_asked_again_of_a_stronger_model(
     )
 
 
+_NO_CLOUD_WORDS = "облако не заказано, решает человек"
+
+
+async def test_incomplete_local_deep_does_not_buy_a_cloud_deep(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1587 (D6): неполный отчёт ЛОКАЛЬНОГО deep облачным deep не лечится.
+
+    Признак — канал заказа, который породил отчёт; обе двери оси (первая
+    попытка и уже записанные попытки), отчёт контрактный и восстановленный
+    из текста. Облачный отчёт идёт как раньше (защита от регресса), а
+    неоднозначное сопоставление — как локальный: не покупать и назвать.
+    """
+    from hub.models import MachineReviewSubmit
+    from hub.services import machine_review_intake as intake
+    from hub.services import review_dispatch
+
+    monkeypatch.setattr(config, "REVIEW_MODEL_CASCADE_MAX", 3)
+    body = {
+        "harness_skill": "multi-agent-review",
+        "agent_count": 1,
+        "tokens_spent": 12000,
+        "model": "grok-4.6",
+        "raw_count": 1,
+        "incomplete": True,
+        "lost_dimensions": ["hub/services/big.py"],
+        "agent": "cursor-cloud-reviewer",
+    }
+    n = 0
+
+    async def run_case(channel: str, attempts: int, text: bool, ambiguous=False):
+        nonlocal n
+        n += 1
+        recorder = _DispatchRecorder(
+            {"agent": {"id": f"bc-d6-{n}"}, "run": {"id": f"r-d6-{n}"}}
+        )
+        _wire(monkeypatch, recorder)
+        task_id = await _deep_submitted(client, db, f"spike-d6-{n}")
+        assert len(recorder.calls) == 1
+        await db.execute(
+            "UPDATE review_dispatches SET channel = ? WHERE task_id = ?",
+            (channel, task_id),
+        )
+        generation = (dict(await repo.get_task(db, task_id)))["submission_generation"]
+        for _ in range(attempts):
+            await repo.add_task_update(
+                db,
+                task_id,
+                "hub",
+                "alert",
+                review_dispatch.MODEL_CASCADE_MARK.format(generation=generation)
+                + " прежняя попытка",
+            )
+        await db.commit()
+        if ambiguous:
+            # Две строки без принципала разных каналов: отчёт подходит обеим.
+            await repo.create_review_dispatch(
+                db,
+                task_id=task_id,
+                submission_generation=generation,
+                agent_id="local:amb",
+                run_id="amb",
+                model="grok-4.6",
+                profile=DEEP,
+                channel="local",
+            )
+            await db.commit()
+        await intake.record_machine_review(
+            db,
+            task_id,
+            MachineReviewSubmit(**body),
+            principal_id=None,
+            username="hub",
+            origin=intake.ORIGIN_LOCAL_TEXT if text else intake.ORIGIN_MCP,
+        )
+        alerts = [
+            dict(u)["content"]
+            for u in await repo.get_task_updates(db, task_id)
+            if dict(u)["kind"] == "alert"
+        ]
+        return len(recorder.calls), alerts
+
+    for attempts in (0, 1):
+        for text in (False, True):
+            where = f"attempts={attempts} text={text}"
+            bought, alerts = await run_case("local", attempts, text)
+            assert bought == 1, f"local deep bought a cloud run: {where}"
+            named = [a for a in alerts if _NO_CLOUD_WORDS in a]
+            assert named and "неполн" in named[-1].lower(), where
+            assert len(named) == 1 and "#1587" in named[0], where
+
+            # Regression guard: a CLOUD report keeps the second axis.
+            bought, alerts = await run_case("cloud", attempts, text)
+            assert bought == 2, f"cloud incomplete deep lost its second axis: {where}"
+            assert not [a for a in alerts if _NO_CLOUD_WORDS in a], where
+
+    bought, alerts = await run_case("cloud", 0, False, ambiguous=True)
+    assert bought == 1, "an unmatched order must not buy the cloud"
+    assert [a for a in alerts if _NO_CLOUD_WORDS in a and "однозначно" in a]
+    await _second_door_shapes(client, db, monkeypatch, tmp_path)
+
+
+async def _incomplete_local_report(db, task_id: int, principal_id: int) -> None:
+    from hub.models import MachineReviewSubmit
+    from hub.services import machine_review_intake as intake
+
+    await intake.record_machine_review(
+        db,
+        task_id,
+        MachineReviewSubmit(
+            harness_skill="multi-agent-review",
+            agent_count=4,
+            tokens_spent=1_500_000,
+            model="grok-4.6",
+            raw_count=1,
+            incomplete=True,
+            lost_dimensions=["hub/services/big.py"],
+            agent="local-reviewer",
+        ),
+        principal_id=principal_id,
+        username="local-reviewer",
+        origin=intake.ORIGIN_MCP,
+    )
+
+
+async def _second_door_shapes(client, db, monkeypatch, tmp_path) -> None:
+    """Продовые формы: у поколения ДВЕ строки, и канал отчёта — не у первой/последней."""
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    monkeypatch.setattr(config, "REVIEW_MODEL_CASCADE_MAX", 3)
+    # 1. Реальный путь второй двери (#1252): облако без принципала кончилось без
+    # отчёта и осталось, локальная замена новее; её неполный отчёт — local.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-sd1"}, "run": {"id": "r-sd1"}})
+    _wire(monkeypatch, recorder)
+    local_pid = await _local_principal(db, monkeypatch)
+    incomplete = {**_LOCAL_REPORT, "incomplete": True, "lost_dimensions": ["a.py"]}
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub(incomplete))
+    task_id = await _submitted(
+        client,
+        db,
+        "spike-d6-second-door",
+        policy={"review": "dispatch"},
+        override="require",
+    )
+    assert len(recorder.calls) == 1
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await sweep_review_dispatches(db)
+    await wait_for_local_runs()
+    await db.commit()
+    rows = [
+        dict(r)
+        for r in await db.execute_fetchall(
+            "SELECT channel, profile, reviewer_principal_id FROM review_dispatches "
+            "WHERE task_id=? ORDER BY id",
+            (task_id,),
+        )
+    ]
+    assert [r["channel"] for r in rows] == ["cloud", "local"], rows
+    assert rows[0]["reviewer_principal_id"] is None and rows[1]["profile"] == DEEP
+    assert len(recorder.calls) == 1, (
+        "неполный отчёт локальной замены облако второй осью не купил"
+    )
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+    ]
+    assert [a for a in alerts if _NO_CLOUD_WORDS in a]
+
+    # 2. Старый local (с принципалом) и НОВЕЕ облачная строка без принципала:
+    # отчёт принадлежит local, а «последний заказ поколения» — облачный.
+    recorder = _DispatchRecorder({"agent": {"id": "bc-sd2"}, "run": {"id": "r-sd2"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _deep_submitted(client, db, "spike-d6-late-local")
+    generation = dict(await repo.get_task(db, task_id))["submission_generation"]
+    await db.execute(
+        "UPDATE review_dispatches SET channel='local', agent_id='local:x', "
+        "reviewer_principal_id=? WHERE task_id=?",
+        (local_pid, task_id),
+    )
+    await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=generation,
+        agent_id="bc-newer",
+        run_id="rn",
+        model="grok-4.6",
+        profile=DEEP,
+        channel="cloud",
+    )
+    await db.commit()
+    await _incomplete_local_report(db, task_id, local_pid)
+    assert len(recorder.calls) == 1, "late local report must not buy the cloud"
+    alerts = [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if dict(u)["kind"] == "alert"
+    ]
+    assert [a for a in alerts if _NO_CLOUD_WORDS in a]
+
+
 async def test_a_deep_top_up_that_stays_incomplete_goes_to_the_second_axis(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
 ):

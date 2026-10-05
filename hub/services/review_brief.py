@@ -27,6 +27,7 @@ import logging
 from typing import Any
 
 from hub import commit_scope, config
+from hub.db import fetchall
 from hub import repository as repo
 from hub.services.outcomes import outcome_status_for_task
 from hub.integrations.registry import plugins
@@ -38,6 +39,7 @@ from hub.models import (
     CatalogueRuleView,
     CallSiteSection,
     OnlyTestsOutcomeView,
+    ProfileDowngradeView,
     CIRunReportState,
     DiffBaseState,
     EvidenceCoverage,
@@ -298,6 +300,74 @@ async def _read_only_tests_back(
         OnlyTestsOutcomeView(symbol=o.symbol, outcome=o.outcome, call_path=o.call_path)
         for o in readout.outcomes
     ]
+
+
+def _is_deep_downgrade(reasons: list[str]) -> bool:
+    """Понижение именно потолком (#1414) или кругом (#1432): их слова — в причинах."""
+    from hub.services.review_dispatch import CIRCLE_STOP_REASON, DEEP_CAP_REASON_MARK
+
+    return any(CIRCLE_STOP_REASON in r or DEEP_CAP_REASON_MARK in r for r in reasons)
+
+
+async def _dispatch_of_the_brief(db, task_id: int, generation: int, mr_row):
+    """Заказ, о котором говорит бриф, и получен ли его отчёт (#1587).
+
+    С текущим отчётом — заказ, породивший ЕГО (``dispatch_for_report``): у
+    сдачи может быть несколько заказов, и последний не обязан быть тем. Без
+    отчёта — последний заказ поколения: вопрос ещё открыт.
+    """
+    from hub.services.review_dispatch import dispatch_for_report
+
+    if mr_row is not None and (mr_row["submission_generation"] or 0) == generation:
+        return await dispatch_for_report(db, task_id, generation, dict(mr_row)), True
+    latest = await repo.get_review_dispatch_for_generation(db, task_id, generation)
+    return (dict(latest) if latest is not None else None), False
+
+
+async def _dispatch_event_reasons(db, task_id: int, dispatch: dict) -> list[str] | None:
+    """Причины профиля из события ``review_dispatched`` этого заказа; None — события нет."""
+    agent_id = (dispatch.get("agent_id") or "").strip()
+    if not agent_id:
+        return None
+    rows = await fetchall(
+        db,
+        "SELECT payload FROM events WHERE kind = 'review_dispatched' "
+        "AND task_id = ? ORDER BY id DESC",
+        (task_id,),
+    )
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if payload.get("agent_id") == agent_id:
+            return [str(r) for r in payload.get("profile_reasons") or []]
+    return None
+
+
+async def profile_downgrade_of(
+    db, task_id: int, generation: int, mr_row
+) -> ProfileDowngradeView | None:
+    """Требовался deep, заказан lite — блок для брифа, или None (#1587)."""
+    if generation <= 0:
+        return None
+    dispatch, reported = await _dispatch_of_the_brief(db, task_id, generation, mr_row)
+    if dispatch is None or (dispatch.get("profile") or "") != "lite":
+        return None
+    reasons = await _dispatch_event_reasons(db, task_id, dispatch)
+    if not reasons or not _is_deep_downgrade(reasons):
+        return None
+    state = "отчёт получен" if reported else "заказан"
+    channel = dispatch.get("channel") or "cloud"
+    return ProfileDowngradeView(
+        reasons=reasons,
+        state=state,
+        channel=channel,
+        dispatch_id=int(dispatch["id"]),
+        headline=(
+            f"Требовался deep — {state} lite (канал {channel}): " + "; ".join(reasons)
+        ),
+    )
 
 
 async def _brief_verdict_route(db, task_view) -> dict | None:
@@ -591,6 +661,9 @@ async def build_review_brief(
     circle = await review_circle(db, int(task_row["id"]))
 
     return ReviewBrief(
+        profile_downgrade=await profile_downgrade_of(
+            db, task_id, task_view.submission_generation or 0, mr_row
+        ),
         verdict_route=await _brief_verdict_route(db, task_view),
         # #920: the rules this area already paid for, from category_checks.
         # An empty list renders no section at all — never a header over nothing.

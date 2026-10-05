@@ -46,7 +46,7 @@ import aiosqlite
 
 from hub import config
 from hub import repository as repo
-from hub.models import ReviewVerdict, RiskClass, TaskReviewVerdict
+from hub.models import ReviewVerdict, RiskClass, TaskReviewVerdict, text_origin_of
 from hub.services import gate_grounds as grounds
 from hub.services.ci_report import VALIDATION_PASS
 
@@ -241,6 +241,7 @@ CODE_OUTSIDE_AREAS = "diff_outside_areas"
 CODE_CLASS_MISSING = "risk_class_missing"
 CODE_CLASS_RAISED = "risk_class_raised"
 CODE_MODEL_UNDECLARED = "model_undeclared"
+CODE_TEXT_ORIGIN = "text_recovered_report"
 
 #: Наблюдения, которые стойка не делала, когда её спросили без сети.
 PENDING_BRANCH = "branch"
@@ -418,6 +419,24 @@ async def _empty_report_stage(
     return None
 
 
+def text_origin_refusal(review: dict) -> tuple[str, str] | None:
+    """``(код, причина)``, если отчёт переписан хабом из текста прогона (#1587).
+
+    Такой отчёт принят и виден человеку, но написан прогоном о самом себе —
+    слабее контрактного, который ревьюер сдал под своим токеном. Ни
+    автоодобрения, ни передачи вердикта стюарду он не даёт. Признак — точный
+    префикс ``orchestrator``, который контрактный приём подделать не даёт.
+    """
+    origin = text_origin_of(review.get("orchestrator"))
+    if not origin:
+        return None
+    return (
+        CODE_TEXT_ORIGIN,
+        f"отчёт восстановлен хабом из текста прогона (происхождение «{origin}»), "
+        "а не сдан ревьюером по контракту",
+    )
+
+
 async def _report_stage(
     db: aiosqlite.Connection, task_id: int, ctx: _Ctx
 ) -> AutoStance | None:
@@ -428,6 +447,18 @@ async def _report_stage(
     if (ctx.review.get("submission_generation") or 0) != ctx.generation:
         return _refuse_with(
             CODE_REPORT_STALE, "отчёт относится не к текущей сдаче", ctx
+        )
+    text_origin = text_origin_refusal(ctx.review)
+    if text_origin is not None:
+        return _refuse_with(
+            text_origin[0],
+            text_origin[1],
+            ctx,
+            note=(
+                "Автовердикт НЕ вынесен: "
+                + text_origin[1]
+                + ". Отчёт принят и виден, вердикт остаётся человеку (#1587)."
+            ),
         )
     loud = await _loud_grounds(db, task_id, ctx)
     if loud is not None:
