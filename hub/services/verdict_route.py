@@ -102,6 +102,24 @@ def _human(code: str, reason: str, mode: str = "") -> VerdictRoute:
     return VerdictRoute(DECIDER_HUMAN, DECIDER_HUMAN, mode, code, reason)
 
 
+async def _text_origin_refusal(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[str, str] | None:
+    """``(код, причина)``, если текущий отчёт восстановлен из текста прогона (#1587)."""
+    from hub import repository as repo
+    from hub.services.auto_verdict import text_origin_refusal
+
+    review = await repo.get_latest_machine_review(db, int(task["id"]))
+    if review is None:
+        return None
+    row = dict(review)
+    if (row.get("submission_generation") or 0) != int(
+        task.get("submission_generation") or 0
+    ):
+        return None
+    return text_origin_refusal(row)
+
+
 async def _steward_route(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -198,6 +216,12 @@ async def verdict_route(
         )
     project = await repo.resolve_project_for_task(db, task_id)
     if project is not None and steward_dispatch._policy_wants_steward(project):
+        # #1587: отчёт, переписанный хабом из текста прогона, стюарду не
+        # передаётся — автопилот до него не доходит (проект не auto), поэтому
+        # проверка здесь, а не в стойке.
+        text_origin = await _text_origin_refusal(db, task)
+        if text_origin is not None:
+            return _human(*text_origin)
         return await _steward_route(db, task, project, stance)
     if stance.code == auto_verdict.CODE_NOT_DELEGATED and (
         project is not None and project_policy.gate_lock_applies(project["slug"])

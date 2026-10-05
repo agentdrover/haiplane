@@ -2411,6 +2411,27 @@ async def _second_axis_blocked(
     return ""
 
 
+async def _no_cloud_after_local(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    report: Mapping[str, Any],
+) -> str:
+    """Почему отчёт не даёт права на облачный deep второй оси, или "" (#1587).
+
+    Канал берётся у заказа, который породил отчёт (``dispatch_for_report``),
+    а не из токена текущего локального ревьюера: токен ротируется, и для
+    истории он ненадёжен. Заказ не найден — тоже отказ: купить облако по
+    отчёту неизвестного происхождения хуже, чем назвать причину человеку.
+    """
+    dispatch = await dispatch_for_report(db, task_id, generation, dict(report))
+    if dispatch is None:
+        return "заказ, породивший отчёт, не определён однозначно"
+    if (dispatch.get("channel") or CLOUD_CHANNEL) == LOCAL_CHANNEL:
+        return "отчёт принадлежит заказу локального канала"
+    return ""
+
+
 async def _ask_a_stronger_model(
     db: aiosqlite.Connection,
     task: dict[str, Any],
@@ -2438,6 +2459,21 @@ async def _ask_a_stronger_model(
             f"агент НЕ покупается. Модели, читавшие эту сдачу: {read_by}. "
             "Ревью так и не состоялось полностью — решение за человеком "
             "(#1243)." + _ladder_cause_note(report),
+        )
+        return False
+    # #1587 (D6): неполный отчёт ЛОКАЛЬНОГО deep облачным deep не лечится —
+    # решает человек. Признак — канал заказа, который породил отчёт, а не
+    # токен ревьюера. Обе двери оси проходят через это место.
+    no_cloud = await _no_cloud_after_local(db, task_id, generation, report)
+    if no_cloud:
+        await _alert(
+            db,
+            task_id,
+            "Неполный отчёт профиля «deep»: облако не заказано, решает "
+            f"человек — {no_cloud}. Вторая ось переспрашивает другой "
+            "моделью только неполный ОБЛАЧНЫЙ отчёт: неполнота локального "
+            "deep не оплачивается облачным прогоном (#1587)."
+            + _ladder_cause_note(report),
         )
         return False
     implementer = (task.get("submission_model") or "").strip()

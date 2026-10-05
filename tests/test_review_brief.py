@@ -1252,3 +1252,108 @@ async def test_an_incomplete_or_evidence_free_report_is_no_review(
         answer = brief["current_generation_review"]
         assert answer["has_review"] is False
         assert answer["reason"] == reason
+
+
+# --- #1587: the brief names the profile the cap or the circle took away ----
+
+
+async def _brief_task_with_orders(db, orders: list[tuple]) -> int:
+    """Задача на ревью с заказами ``(channel, profile, reasons)`` в одном поколении."""
+    from hub import services
+    from hub.models import TaskCreate
+
+    tv = await services.create_task(db, TaskCreate(title="downgrade brief"))
+    await repo.add_task_update(db, tv.id, "dev", "status", "Plan: x")
+    await db.commit()
+    await services.pair_start_task(db, tv.id, caller="dev")
+    await services.submit_for_review(db, tv.id)
+    generation = dict(await repo.get_task(db, tv.id))["submission_generation"]
+    for i, (channel, profile, reasons) in enumerate(orders):
+        agent = f"local:r{i}" if channel == "local" else f"bc-{tv.id}-{i}"
+        await repo.create_review_dispatch(
+            db,
+            task_id=tv.id,
+            submission_generation=generation,
+            agent_id=agent,
+            run_id=f"r{i}",
+            model="grok-4.6",
+            profile=profile,
+            channel=channel,
+        )
+        await repo.insert_event(
+            db,
+            kind="review_dispatched",
+            task_id=tv.id,
+            actor="policy",
+            payload={
+                "agent_id": agent,
+                "generation": generation,
+                "profile": profile,
+                "profile_reasons": reasons,
+            },
+        )
+    await db.commit()
+    return tv.id
+
+
+_CAP = ["deep по правилу (риск), но суточный потолок 2 исчерпан — lite"]
+_CIRCLE = ["круг: 3 захода, deep приостановлен до решения человека"]
+
+
+async def test_brief_names_required_and_actual_review_profile(client: AsyncClient, db):
+    from hub.services.review_brief import build_review_brief
+
+    # Потолок #1414: требовался deep, заказан lite — до результата «заказан».
+    capped = await _brief_task_with_orders(db, [("cloud", "lite", _CAP)])
+    block = (await build_review_brief(db, capped)).profile_downgrade
+    assert block is not None
+    assert (block.required_profile, block.ordered_profile) == ("deep", "lite")
+    assert block.state == "заказан", "before a result the order is not 'done'"
+    assert block.reasons == _CAP and "потолок" in block.headline
+
+    # Круг и запасной облачный заказ после local-first: причина того заказа.
+    fallback = await _brief_task_with_orders(
+        db, [("local", "deep", ["правило"]), ("cloud", "lite", _CIRCLE)]
+    )
+    block = (await build_review_brief(db, fallback)).profile_downgrade
+    assert block is not None and block.channel == "cloud"
+    assert block.reasons == _CIRCLE, "the reasons are the LATEST order's own"
+
+    # Несколько заказов: бриф говорит о заказе, породившем ТЕКУЩИЙ отчёт.
+    multi = await _brief_task_with_orders(
+        db, [("cloud", "lite", _CAP), ("cloud", "deep", ["ревью запрошено"])]
+    )
+    assert (await build_review_brief(db, multi)).profile_downgrade is None, (
+        "the latest order is a plain deep: no downgrade block"
+    )
+    resp = await client.post(
+        f"/api/tasks/{multi}/machine-review",
+        json={
+            "harness_skill": "lite-diff-review",
+            "raw_count": 1,
+            "incomplete": False,
+            "agent": "reviewer",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    done = (await build_review_brief(db, multi)).profile_downgrade
+    assert done is not None and done.reasons == _CAP, (
+        "the order that produced the report is the one the brief speaks of"
+    )
+    assert done.state == "отчёт получен"
+
+    # Случай без понижения: lite по правилу, причина — не потолок и не круг.
+    plain = await _brief_task_with_orders(
+        db, [("cloud", "lite", ["класс риска r1, процессных поверхностей нет"])]
+    )
+    assert (await build_review_brief(db, plain)).profile_downgrade is None
+    deep_only = await _brief_task_with_orders(db, [("cloud", "deep", ["security"])])
+    assert (await build_review_brief(db, deep_only)).profile_downgrade is None
+
+    # После рестарта хаба: блок читается из событий и строки заказа, не из памяти.
+    again = await client.get(f"/api/tasks/{capped}/review-brief")
+    assert again.status_code == 200
+    assert again.json()["profile_downgrade"]["state"] == "заказан"
+    from hub.mcp_server import _profile_downgrade_line
+
+    assert "Требовался deep" in _profile_downgrade_line(again.json())
