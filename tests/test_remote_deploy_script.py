@@ -232,7 +232,7 @@ def test_the_drain_runs_as_the_hub_user_with_the_deploy_state(box) -> None:
     assert proc.returncode == 0, out
     text = DEPLOY.read_text()
     assert 'sudo -n -u "$SERVICE_USER" env' in text
-    assert "bash -s --" in text
+    assert 'bash -c "$(cat "$REVIEW_DRAIN_SCRIPT")" review-drain' in text
     assert text.index("drain_step acquire") < text.index("sudo rsync")
     assert text.index("drain_step recheck") < text.index("sudo systemctl restart")
 
@@ -268,3 +268,21 @@ def test_no_spool_anywhere_is_named_degraded_and_the_deploy_goes_on(box) -> None
     assert "deploy ok" in out
     assert box.event("rsync")["owner"] == "none"
     assert "sekret-token-value" not in out
+
+
+def test_a_killed_deploy_frees_its_marker_through_the_liveness_channel(box) -> None:
+    """SIGKILL: ни trap, ни cleanup не работают. Продлитель (другой uid, kill
+    ему недоступен) узнаёт о смерти деплоя по EOF трубы и снимает свой маркер."""
+    proc = box.start(PIP_DELAY="25")
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and not any(
+        x.startswith("pip-start") for x in box.lines()
+    ):
+        time.sleep(0.05)
+    assert box.marker_file().exists()
+    proc.send_signal(signal.SIGKILL)
+    proc.wait(timeout=10)
+    deadline = time.monotonic() + 8  # pip-шим ещё спит (25 с): fd канала ему не отданы
+    while time.monotonic() < deadline and box.marker_file().exists():
+        time.sleep(0.1)
+    assert not box.marker_file().exists(), "маркер убитого деплоя остался"

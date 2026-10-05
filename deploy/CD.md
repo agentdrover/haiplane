@@ -48,7 +48,7 @@ Environment `production`):
   `sudo -u haiplane ... pip`, `sudo systemctl restart haiplane-hub`,
   `sudo journalctl -u haiplane-hub`;
 - для drain локальных ревью (#1588, раздел ниже) — ещё и
-  `sudo -n -u <пользователь хаба> env … bash -s -- <команда>`; без этого
+  `sudo -n -u <пользователь хаба> env … bash -c "<текст скрипта>" review-drain <команда>`; без этого
   разрешения деплой идёт как раньше с исходом `drain degraded`;
 - ключ хранится только в секретах GitHub. В git его класть нельзя.
 
@@ -131,13 +131,14 @@ ssh "$DEPLOY_USER@$DEPLOY_HOST" '
 `remote-deploy.sh`):
 
 ```bash
-sudo -n -u "$SERVICE_USER" env DRAIN_OWNER=… DRAIN_DEADLINE=… bash -s -- acquire \
-    < "$STAGING/deploy/review-drain.sh"
+sudo -n -u "$SERVICE_USER" env DRAIN_OWNER=… DRAIN_DEADLINE=… \
+    bash -c "$(cat "$STAGING/deploy/review-drain.sh")" review-drain acquire
 ```
 
-То же для `recheck`, `renew-loop <pid>` и `release`. Скрипт приходит на stdin
+То же для `recheck`, `renew-loop` и `release` (скрипт передаётся текстом в
+`bash -c`, а stdin занят каналом живучести: fifo, EOF = деплой умер). Скрипт берётся
 из staging (CI rsync кладёт его туда до запуска `remote-deploy.sh`), так что
-читает его деплой-пользователь, а не пользователь хаба. Пользователя деплоя и
+читает его (`cat`) деплой-пользователь, а не пользователь хаба. Пользователя деплоя и
 его sudo проверяет и настраивает стюард на сервере до выката; код сервер не
 меняет. Нет разрешения, каталога или прав — исход `drain degraded` с причиной,
 деплой идёт как раньше. Каталог очереди `remote-deploy.sh` берёт из

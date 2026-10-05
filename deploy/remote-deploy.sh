@@ -13,7 +13,7 @@
 #   - runtime user:    haiplane
 #   - systemd unit:    haiplane-hub
 #   - the deploy SSH user has passwordless sudo for the commands below, and for
-#     `sudo -n -u <runtime user> bash -s -- <drain command>` (see "Drain" below).
+#     `sudo -n -u <runtime user> env … bash -c "<drain script text>" review-drain <command>` (see "Drain" below).
 #
 # Drain (#1588): before the rsync this script asks deploy/review-drain.sh to wait
 # for running LOCAL deep reviews (up to ONE budget, DRAIN_BUDGET_SECONDS, 1800 s)
@@ -57,31 +57,53 @@ DRAIN_ON=0
 DRAIN_CHILD=""
 RENEW_PID=""
 RENEW_LOG=""
+LIVE_DIR=""
 
-# The drain script as the hub's unix user. The script comes in on stdin and the
-# state in the environment: nothing is passed through argv except the command.
+# The drain script as the hub's unix user. The script text goes in as the
+# argument of `bash -c` (so stdin stays free for the liveness channel below) and
+# the state in the environment. The text is read by the DEPLOY user on purpose:
+# staging is in its home, which the hub's unix user may not be able to read.
+#
+# LIVENESS IS A CHANNEL, NOT A PID. This script runs as the deploy user and the
+# drain as the hub's user; kill(2) across them is EPERM (and the sudo process
+# itself is root's), which a `kill -0` check reads as "dead". So the long drain
+# commands get a fifo as stdin and this script holds its write end open (fd 7
+# for the renewer, fd 8 for the current step). Closing it - or dying, under any
+# uid - gives EOF, and the drain side stops and takes its own marker back.
 drain_run() {
   local envs=("DRAIN_OWNER=$DRAIN_OWNER" "DRAIN_DEADLINE=$DRAIN_DEADLINE" "DRAIN_BUDGET_SECONDS=$DRAIN_BUDGET_SECONDS")
   local name
   for name in DRAIN_TTL_SECONDS DRAIN_RENEW_SECONDS DRAIN_POLL_SECONDS \
-    DRAIN_PROGRESS_SECONDS DRAIN_MAX_HOLD_SECONDS HAIPLANE_LOCAL_REVIEW_SPOOL_DIR; do
+    DRAIN_PROGRESS_SECONDS DRAIN_MAX_HOLD_SECONDS DRAIN_STDIN_LIVENESS \
+    HAIPLANE_LOCAL_REVIEW_SPOOL_DIR; do
     if [ -n "${!name:-}" ]; then
       envs+=("$name=${!name}")
     fi
   done
-  # The redirect is read by the DEPLOY user on purpose: staging is in its home,
-  # which the hub's unix user may not be able to read (SC2024 is the intent).
-  # shellcheck disable=SC2024
-  sudo -n -u "$SERVICE_USER" env "${envs[@]}" bash -s -- "$@" <"$REVIEW_DRAIN_SCRIPT"
+  sudo -n -u "$SERVICE_USER" env "${envs[@]}" bash -c "$(cat "$REVIEW_DRAIN_SCRIPT")" review-drain "$@"
 }
 
 # One drain command in the BACKGROUND and a `wait`: a signal reaches the trap
-# at once instead of after a foreground wait of up to the whole budget.
+# at once instead of after a foreground wait of up to the whole budget. The
+# waiting commands carry the liveness channel; `release` is short and does not.
 drain_step() {
   local rc=0
-  drain_run "$@" &
-  DRAIN_CHILD=$!
-  wait "$DRAIN_CHILD" || rc=$?
+  case "$1" in
+    acquire | recheck)
+      mkfifo "$LIVE_DIR/step"
+      DRAIN_STDIN_LIVENESS=1 drain_run "$@" <"$LIVE_DIR/step" &
+      DRAIN_CHILD=$!
+      exec 8>"$LIVE_DIR/step"
+      wait "$DRAIN_CHILD" || rc=$?
+      exec 8>&-
+      rm -f "$LIVE_DIR/step"
+      ;;
+    *)
+      drain_run "$@" </dev/null &
+      DRAIN_CHILD=$!
+      wait "$DRAIN_CHILD" || rc=$?
+      ;;
+  esac
   DRAIN_CHILD=""
   if [ "$rc" -ne 0 ]; then
     echo "drain degraded (команда '$1' не отработала, rc=$rc: sudo -u $SERVICE_USER bash недоступен или скрипт упал)"
@@ -93,15 +115,16 @@ drain_cleanup() {
   local code=$?
   trap - EXIT
   if [ -n "$DRAIN_CHILD" ]; then
-    kill "$DRAIN_CHILD" 2>/dev/null || true
+    # EOF, not a signal: the child is the hub user's (and sudo is root's).
+    exec 8>&-
     wait "$DRAIN_CHILD" 2>/dev/null || true
   fi
   if [ -n "$RENEW_PID" ]; then
-    if ! kill -0 "$RENEW_PID" 2>/dev/null && [ ! -s "$RENEW_LOG" ]; then
+    exec 7>&-
+    wait "$RENEW_PID" 2>/dev/null || true
+    if ! grep -q 'stopped by parent EOF\|drain degraded' "$RENEW_LOG" 2>/dev/null; then
       echo "drain degraded (продление маркера оборвалось до конца выкладки: окно запрета не гарантировано)"
     fi
-    kill "$RENEW_PID" 2>/dev/null || true
-    wait "$RENEW_PID" 2>/dev/null || true
   fi
   if [ -n "$RENEW_LOG" ] && [ -s "$RENEW_LOG" ]; then
     cat "$RENEW_LOG"
@@ -110,6 +133,7 @@ drain_cleanup() {
     drain_step release || true
   fi
   [ -z "$RENEW_LOG" ] || rm -f "$RENEW_LOG"
+  [ -z "$LIVE_DIR" ] || rm -rf "$LIVE_DIR"
   exit "$code"
 }
 
@@ -132,24 +156,27 @@ if [ -z "$HAIPLANE_LOCAL_REVIEW_SPOOL_DIR" ]; then
 elif [ -r "$REVIEW_DRAIN_SCRIPT" ]; then
   DRAIN_ON=1
   RENEW_LOG="$(mktemp)"
+  LIVE_DIR="$(mktemp -d)"
+  mkfifo "$LIVE_DIR/renew"
   # The renewer starts FIRST and keeps the marker fresh for the whole deploy
   # (rsync, pip, restart, health): it is independent of the wait loop below.
-  drain_run renew-loop "$$" >"$RENEW_LOG" 2>&1 &
+  DRAIN_STDIN_LIVENESS=1 drain_run renew-loop >"$RENEW_LOG" 2>&1 <"$LIVE_DIR/renew" &
   RENEW_PID=$!
+  exec 7>"$LIVE_DIR/renew"
   drain_step acquire
 else
   echo "drain degraded (скрипт $REVIEW_DRAIN_SCRIPT недоступен)"
 fi
 
-sudo rsync -a --delete "$STAGING/" "$DEST/"
-sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DEST"
-sudo -u "$SERVICE_USER" /opt/haiplane-hub/venv/bin/pip install -e "$DEST" -q
+sudo rsync -a --delete "$STAGING/" "$DEST/" 7>&- 8>&-
+sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DEST" 7>&- 8>&-
+sudo -u "$SERVICE_USER" /opt/haiplane-hub/venv/bin/pip install -e "$DEST" -q 7>&- 8>&-
 if [ "$DRAIN_ON" = 1 ]; then
   # Jobs that slipped in (an old hub ignores the marker) and the time pip took:
   # the same single budget, what is left of it.
   drain_step recheck
 fi
-sudo systemctl restart haiplane-hub
+sudo systemctl restart haiplane-hub 7>&- 8>&-
 
 # Readiness is polled, not slept for. The unit is Type=simple, so systemd calls
 # it active the moment the process spawns — uvicorn may still be minutes away

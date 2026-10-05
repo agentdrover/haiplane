@@ -21,13 +21,20 @@
 # same lock, at the moment it publishes job.json. A hub start never removes the
 # marker; only the deploy that wrote it does (own owner id only).
 #
-# Commands (state comes from the environment, nothing is read from stdin):
+# Commands (state comes from the environment):
 #   acquire       set the marker, wait for unfinished jobs, print the outcome
 #   recheck       renew, then wait again for jobs within the REMAINING budget
-#   renew-loop P  renew the marker every DRAIN_RENEW_SECONDS until the parent
-#                 pid P is gone or the loop is stopped; prints "drain degraded
-#                 (...)" if the marker could not be kept alive
+#   renew-loop    renew the marker every DRAIN_RENEW_SECONDS until stopped;
+#                 prints "drain degraded (...)" if the marker could not be kept
+#                 alive
 #   release       remove the marker if it is ours
+#
+# Liveness of the deploy is a CHANNEL, never a pid or a signal. The deploy runs
+# as one unix user and this script as another (the hub's), so kill(2) across
+# them answers EPERM, which reads exactly like "process gone". With
+# DRAIN_STDIN_LIVENESS=1 the caller keeps stdin (a pipe/fifo) open; EOF on it,
+# which the death of the caller causes under ANY uid, makes acquire/recheck
+# stop (acquire takes its own marker back) and renew-loop remove its marker.
 #
 # Outcomes, one line each, always exit 0 (a drain must never fail a deploy):
 #   drain ok (...)          no unfinished job (or all finished in time)
@@ -259,6 +266,19 @@ wait_for_jobs() {
   done
 }
 
+# EOF on stdin = the deploy is gone. The signal goes to ourselves, so it never
+# crosses a uid boundary. An async child of a non-interactive bash gets
+# /dev/null for stdin, hence the explicit duplicate.
+start_liveness() {
+  [ "${DRAIN_STDIN_LIVENESS:-0}" = 1 ] || return 0
+  local self=$$ sig="$1"
+  exec 3<&0
+  (
+    cat <&3 >/dev/null 2>&1
+    kill "-$sig" "$self" 2>/dev/null
+  ) &
+}
+
 cmd_acquire() {
   local problem
   problem="$(spool_problem)"
@@ -272,6 +292,7 @@ cmd_acquire() {
   trap 'cleanup_acquire' EXIT
   trap 'exit 143' TERM
   trap 'exit 130' INT HUP
+  start_liveness TERM
   take_marker || return 0
   MARKER_SET=1
   emit "drain: маркер $MARKER поставлен (владелец $OWNER, срок $BUDGET с)"
@@ -289,6 +310,9 @@ cleanup_acquire() {
 
 cmd_recheck() {
   local problem rc
+  trap 'exit 143' TERM
+  trap 'exit 130' INT HUP
+  start_liveness TERM
   problem="$(spool_problem)"
   if [ -n "$problem" ]; then
     emit "drain degraded ($problem)"
@@ -307,19 +331,20 @@ cmd_recheck() {
 }
 
 cmd_renew_loop() {
-  local parent="${1:-}" started failed owned rc sleeper
+  local started failed owned rc sleeper
   started="$(now)"
   owned=0
   failed=0
   sleeper=""
   trap '[ -n "$sleeper" ] && kill "$sleeper" 2>/dev/null; exit 0' TERM INT HUP
+  # EOF on stdin: the deploy is gone, with or without its own cleanup. Do not
+  # leave a marker that no one is going to renew OR remove.
+  trap '[ -n "$sleeper" ] && kill "$sleeper" 2>/dev/null
+    emit "drain: renew-loop stopped by parent EOF"
+    locked "$CLEANUP_LOCK_WAIT" remove_own_marker >/dev/null 2>&1 || true
+    exit 0' USR1
+  start_liveness USR1
   while :; do
-    if [ -n "$parent" ] && ! kill -0 "$parent" 2>/dev/null; then
-      # The deploy died without running its own cleanup: do not leave a marker
-      # that no one is going to renew OR remove.
-      locked "$CLEANUP_LOCK_WAIT" remove_own_marker >/dev/null 2>&1 || true
-      exit 0
-    fi
     if [ $(($(now) - started)) -ge "$MAX_HOLD" ]; then
       if [ "$owned" = 1 ]; then
         emit "drain degraded (продление маркера остановлено: прошло ${MAX_HOLD} с, дальше маркер истечёт сам)"
@@ -370,10 +395,10 @@ main() {
   case "$cmd" in
     acquire) cmd_acquire ;;
     recheck) cmd_recheck ;;
-    renew-loop) cmd_renew_loop "$@" ;;
+    renew-loop) cmd_renew_loop ;;
     release) cmd_release ;;
     *)
-      echo "usage: review-drain.sh acquire|recheck|renew-loop <parent-pid>|release" >&2
+      echo "usage: review-drain.sh acquire|recheck|renew-loop|release" >&2
       return 2
       ;;
   esac

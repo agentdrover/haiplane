@@ -275,18 +275,35 @@ def test_a_signal_during_the_wait_removes_only_our_marker(spool, bin_dir) -> Non
     assert (spool / JOB / "job.json").exists(), "прогон продолжается"
 
 
+def _renewer(spool: Path, bin_dir: Path, *args: str, **over: str):
+    """Продлитель с каналом живучести: stdin — труба, EOF = деплой умер."""
+    return subprocess.Popen(
+        ["bash", str(SCRIPT), "renew-loop", *args],
+        env=_env(spool, bin_dir, DRAIN_STDIN_LIVENESS="1", **over),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def _parent_dies(proc) -> str:
+    """Родитель умер: его конец трубы закрылся. Возвращает вывод до выхода."""
+    proc.stdin.close()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        pytest.fail("EOF на stdin не остановил процесс")
+    return proc.stdout.read()
+
+
 def test_the_marker_is_renewed_beyond_its_ttl_independently(spool, bin_dir) -> None:
     """Продление живёт само по себе: acquire давно отработал, а маркер свеж."""
     over = {"DRAIN_TTL_SECONDS": "2", "DRAIN_RENEW_SECONDS": "0.4"}
     assert "drain ok" in _run(["acquire"], spool, bin_dir, **over).stdout
-    renewer = subprocess.Popen(
-        ["bash", str(SCRIPT), "renew-loop", str(os.getpid())],
-        env=_env(spool, bin_dir, **over),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        stdin=subprocess.DEVNULL,
-    )
+    renewer = _renewer(spool, bin_dir, **over)
     try:
         time.sleep(3.2)  # больше TTL: без продления маркер давно просрочен
         assert int(_marker(spool)["expires"]) > time.time()
@@ -297,39 +314,70 @@ def test_the_marker_is_renewed_beyond_its_ttl_independently(spool, bin_dir) -> N
     assert (spool / "draining").exists(), "остановка продления маркер не снимает"
 
 
-def test_the_renewer_never_takes_a_foreign_marker_and_exits_with_its_parent(
-    spool, bin_dir
-) -> None:
+def test_the_renewer_never_takes_a_foreign_marker(spool, bin_dir) -> None:
     before = _write_marker(spool, "deploy-other", 600)
-    renewer = subprocess.Popen(
-        ["bash", str(SCRIPT), "renew-loop", str(os.getpid())],
-        env=_env(spool, bin_dir, DRAIN_RENEW_SECONDS="0.2"),
-        stdout=subprocess.PIPE,
-        text=True,
-        stdin=subprocess.DEVNULL,
-    )
+    renewer = _renewer(spool, bin_dir, DRAIN_RENEW_SECONDS="0.2")
     time.sleep(0.8)
     assert (spool / "draining").read_bytes() == before
     renewer.terminate()
     renewer.communicate(timeout=10)
 
-    # Родитель умер без своей уборки — продлитель убирает свой маркер сам.
-    (spool / "draining").unlink()
-    parent = subprocess.Popen(["sleep", "30"])
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="под root kill -0 чужому uid проходит")
+def test_liveness_is_not_judged_by_kill_across_a_uid_boundary(spool, bin_dir) -> None:
+    """Деплой и продлитель живут под РАЗНЫМИ uid (прод: user1 и хаб).
+
+    kill(2) чужому uid даёт EPERM — и проверка «жив ли родитель» через
+    ``kill -0`` читает это как «умер» и снимает маркер в первую секунду. Здесь
+    «родитель» — pid 1 (жив, чужой uid, kill -0 даёт EPERM): продлитель с
+    живым каналом обязан держать маркер.
+    """
     assert "drain ok" in _run(["acquire"], spool, bin_dir).stdout
-    renewer = subprocess.Popen(
-        ["bash", str(SCRIPT), "renew-loop", str(parent.pid)],
-        env=_env(spool, bin_dir, DRAIN_RENEW_SECONDS="0.2"),
-        stdout=subprocess.PIPE,
-        text=True,
-        stdin=subprocess.DEVNULL,
-    )
+    probe = subprocess.run(["bash", "-c", "kill -0 1"], capture_output=True)
+    assert probe.returncode != 0, "предпосылка: kill -0 по pid 1 даёт EPERM"
+    renewer = _renewer(spool, bin_dir, "1", DRAIN_RENEW_SECONDS="0.2")
+    try:
+        time.sleep(1.5)
+        assert renewer.poll() is None, "продлитель вышел: EPERM прочтён как смерть"
+        assert (spool / "draining").exists(), "маркер снят на старте деплоя"
+    finally:
+        renewer.terminate()
+        renewer.communicate(timeout=10)
+
+
+def test_a_dead_parent_is_seen_as_eof_and_the_marker_is_taken_back(
+    spool, bin_dir
+) -> None:
+    assert "drain ok" in _run(["acquire"], spool, bin_dir).stdout
+    renewer = _renewer(spool, bin_dir, DRAIN_RENEW_SECONDS="0.2")
     time.sleep(0.5)
     assert (spool / "draining").exists()
-    parent.kill()
-    parent.wait()
-    renewer.communicate(timeout=10)
+    out = _parent_dies(renewer)
+    assert "stopped by parent EOF" in out, out
     assert not (spool / "draining").exists()
+    # Чужой маркер при этом остаётся как был.
+    before = _write_marker(spool, "deploy-other", 600)
+    other = _renewer(spool, bin_dir, DRAIN_RENEW_SECONDS="0.2")
+    _parent_dies(other)
+    assert (spool / "draining").read_bytes() == before
+
+
+def test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker(
+    spool, bin_dir
+) -> None:
+    _job(spool)
+    proc = subprocess.Popen(
+        ["bash", str(SCRIPT), "acquire"],
+        env=_env(spool, bin_dir, DRAIN_STDIN_LIVENESS="1", DRAIN_BUDGET_SECONDS="60"),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert _wait_for(lambda: (spool / "draining").exists())
+    _parent_dies(proc)
+    assert not (spool / "draining").exists(), "ждущий acquire пережил деплой"
+    assert (spool / JOB / "job.json").exists()
 
 
 def test_a_failed_renewal_is_named_degraded(spool, bin_dir) -> None:
@@ -339,14 +387,7 @@ def test_a_failed_renewal_is_named_degraded(spool, bin_dir) -> None:
         "DRAIN_RENEW_LOCK_WAIT": "0.5",
     }
     _run(["acquire"], spool, bin_dir, **over)
-    renewer = subprocess.Popen(
-        ["bash", str(SCRIPT), "renew-loop", str(os.getpid())],
-        env=_env(spool, bin_dir, **over),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        stdin=subprocess.DEVNULL,
-    )
+    renewer = _renewer(spool, bin_dir, **over)
     try:
         time.sleep(0.5)  # видел свой маркер хотя бы раз
         fd = os.open(spool / ".drain.lock", os.O_RDWR)
