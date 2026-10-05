@@ -366,7 +366,12 @@ jobs:
         env:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOYED_SHA: ${{ github.sha }}
         run: |
+          # #1590: the commit goes into the file name of the pre-deploy backup.
+          # .git is not in staging and the CI key's forced command takes no
+          # arguments or environment, so the sha travels as a file of the tree.
+          printf '%s\n' "$DEPLOYED_SHA" > .deploy-sha
           rsync -az --delete \
             -e "ssh -i $HOME/.ssh/id_deploy -o BatchMode=yes" \
             --exclude '.venv' \
@@ -385,9 +390,23 @@ jobs:
         run: |
           # Keepalive: на время ожидания (до 1800 с) в канале бывает тихо, и
           # промежуточный узел не должен счесть соединение мёртвым (#1588).
+          # #1590: the output is captured locally AND shown, the ssh exit code
+          # is kept, and the `backup:` line goes to the step output EVEN when
+          # the code is non-zero - a deploy that refused to restart because the
+          # backup failed is exactly the one whose verdict the hub must get.
+          # The original code is returned at the end.
+          log="${RUNNER_TEMP:-/tmp}/rollout.log"
+          set +e
           ssh -i "$HOME/.ssh/id_deploy" -o BatchMode=yes \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
-            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' < deploy/remote-deploy.sh
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' < deploy/remote-deploy.sh 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          line="$(grep '^backup: ' "$log" | tail -n 1 | tr -d '\r' || true)"
+          if [ -n "$line" ]; then
+            printf 'backup=%s\n' "${line#backup: }" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$rc"
 
       # #496: tell the Hub what is now running. Until this step existed the
       # Hub knew only when it MERGED something and read that as delivery — on
@@ -412,6 +431,8 @@ jobs:
           DEPLOYED_REF: ${{ github.ref_name }}
           # Project slug for the release row (#1453); unset or empty -> default.
           DEPLOYED_PROJECT: ${{ vars.HAIPLANE_HUB_PROJECT || 'default' }}
+          # #1590: verdict of the pre-deploy backup; empty = the log had none.
+          BACKUP_LINE: ${{ steps.rollout.outputs.backup }}
         run: |
           if [ -z "$HAIPLANE_HUB_URL" ] || [ -z "$HAIPLANE_HUB_CI_TOKEN" ]; then
             echo "::notice::Hub secrets absent — deploy not reported (fork or clone)"
@@ -422,11 +443,26 @@ jobs:
           else
             STATUS=failed
           fi
+          # The body is built by a serializer, not by string interpolation: the
+          # backup reason may carry quotes, and a broken body would lose the report.
+          body_file="$(mktemp)"
+          STATUS="$STATUS" python3 -c '
+          import json, os
+          body = {
+              "sha": os.environ["DEPLOYED_SHA"],
+              "ref": os.environ["DEPLOYED_REF"],
+              "status": os.environ["STATUS"],
+              "project": os.environ["DEPLOYED_PROJECT"],
+          }
+          if os.environ.get("BACKUP_LINE"):
+              body["backup"] = os.environ["BACKUP_LINE"][:500]
+          print(json.dumps(body))
+          ' > "$body_file"
           code=$(curl -sS -o /tmp/deploy-callback.out -w '%{http_code}' \
             -X POST "$HAIPLANE_HUB_URL/api/deploys" \
             -H "Authorization: Bearer $HAIPLANE_HUB_CI_TOKEN" \
             -H 'Content-Type: application/json' \
-            -d "{\"sha\":\"$DEPLOYED_SHA\",\"ref\":\"$DEPLOYED_REF\",\"status\":\"$STATUS\",\"project\":\"$DEPLOYED_PROJECT\"}" \
+            --data-binary @"$body_file" \
           ) || code=000
           if [ "$code" != "200" ]; then
             echo "::warning::Hub did not record the deploy (HTTP $code): $(cat /tmp/deploy-callback.out)"

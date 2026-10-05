@@ -141,7 +141,8 @@ uv run ruff check hub tests
 > ```
 >
 > Закреплённая копия **обновляется при каждой правке** `deploy/remote-deploy.sh`,
-> а при #1588 он изменился (вызов `deploy/review-drain.sh` до rsync). Хэш,
+> а при #1588 он изменился (вызов `deploy/review-drain.sh` до rsync), при #1590 —
+снова (снимок базы до rsync). Хэш,
 > который сверяет guard, считается с файла из коммита, который выкатывается:
 >
 > ```bash
@@ -202,6 +203,17 @@ REMOTE
 > (он вызывает drain до rsync из staging). Перед ручным restart без drain
 > убедитесь, что локальный deep не идёт: в каталоге очереди нет `job-*` с
 > `job.json` или `claimed` без `result.json`.
+>
+> **Проверенный снимок базы (#1590) этот ручной путь тоже не делает.** Он идёт
+> прямо к restart без снимка: миграция при старте может испортить базу без
+> точки отката. Выкатывайте серверной частью (`bash -s` из
+> `deploy/remote-deploy.sh`, он снимет `predeploy-*.db.gz` до rsync и не
+> перезапустит хаб, если снимок не удался) или снимите копию сами до restart:
+> `sudo -u <RUNTIME_USER> /opt/<SERVICE>/venv/bin/python -c "import sqlite3,sys;
+> s=sqlite3.connect('file:<DB>?mode=ro',uri=True); d=sqlite3.connect(sys.argv[1]);
+> s.backup(d); print(d.execute('PRAGMA integrity_check').fetchall()); d.close()"
+> <файл>` (результат `[('ok',)]`). Закреплённую копию `remote-deploy.sh` при #1590
+> обновляйте так же, как при #1588 (команды выше).
 
 Критерии успеха:
 

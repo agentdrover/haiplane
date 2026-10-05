@@ -2480,6 +2480,10 @@ class DeployCallback(BaseModel):
     ref: str = Field("", max_length=200)
     status: str = Field("success", pattern="^(success|failed)$")
     project: str = Field("", max_length=100)
+    # #1590: the one-line verdict of the pre-deploy database backup
+    # (``ok <file> ...`` / ``failed (<why>)`` / ``skipped (<why>)``). Empty is
+    # "the client did not say" - an old client - and never erases a known one.
+    backup: str = Field("", max_length=500)
 
 
 class DeployView(BaseModel):
@@ -2492,6 +2496,8 @@ class DeployView(BaseModel):
     status: str = "success"
     source: str = ""
     deployed_at: str = ""
+    # #1590: «неизвестно» — отчёт пришёл без итога бэкапа (старый клиент).
+    backup: str = "неизвестно"
 
 
 class ProdDefectCreate(BaseModel):

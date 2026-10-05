@@ -2593,6 +2593,7 @@ async def api_record_deploy(
         ref=body.ref,
         status=body.status,
         source=identity.username or "ci",
+        backup=body.backup,
     )
     # #883: bring the deployed commit into the workspace now, once per deploy,
     # instead of on every card render. Best-effort by contract: the rollout has
@@ -2609,6 +2610,7 @@ async def api_record_deploy(
     row = await repo.release_by_id(db, release_id)
     if row is None:  # pragma: no cover - the row was just written
         raise HTTPException(500, "release was written but could not be read back")
+    row["backup"] = row.get("backup") or "неизвестно"
     return DeployView(**row)
 
 

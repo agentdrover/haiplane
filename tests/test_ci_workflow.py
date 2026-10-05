@@ -13,7 +13,10 @@ keeps an unset or empty repository variable on ``default``.
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -34,15 +37,44 @@ def _callback_step() -> dict:
     raise AssertionError(f"no {CALLBACK_STEP!r} step in the deploy job")
 
 
+_CURL = """#!/usr/bin/env bash
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --data-binary) cp "${2#@}" "$CURL_BODY"; shift ;;
+    -o) printf '{}' >"$2"; shift ;;
+  esac
+  shift
+done
+printf 200
+"""
+
+
 def _posted_body(run: str, values: dict[str, str]) -> dict:
-    """The JSON the curl ``-d`` sends, with shell variables filled in."""
-    match = re.search(r'-d "((?:[^"\\]|\\.)*)"', run)
-    assert match, "the callback must post a JSON body with -d"
-    template = match.group(1).replace('\\"', '"')
-    for name, value in values.items():
-        template = template.replace(f"${name}", value)
-    assert "$" not in template, f"unfilled shell variable in body: {template}"
-    return json.loads(template)
+    """The JSON the step really POSTs: the step runs with a curl shim (#1590
+    moved the body to a serializer, so the text of the step is no longer a template)."""
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        (tmp / "bin").mkdir()
+        shim = tmp / "bin/curl"
+        shim.write_text(_CURL)
+        shim.chmod(0o755)
+        script = tmp / "step.sh"
+        script.write_text(run)
+        body = tmp / "body.json"
+        env = {
+            **os.environ,
+            **values,
+            "PATH": f"{tmp / 'bin'}{os.pathsep}{os.environ['PATH']}",
+            "HAIPLANE_HUB_URL": "http://hub.invalid",
+            "HAIPLANE_HUB_CI_TOKEN": "t",
+            "ROLLOUT_OUTCOME": "success",
+            "CURL_BODY": str(body),
+        }
+        done = subprocess.run(
+            ["bash", str(script)], env=env, capture_output=True, text=True, timeout=60
+        )
+        assert done.returncode == 0, done.stderr
+        return json.loads(body.read_text())
 
 
 def _render_project(expr: str, var_value: str | None) -> str:
