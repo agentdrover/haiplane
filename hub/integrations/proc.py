@@ -105,3 +105,33 @@ async def run(
     if check and rc != 0:
         log.warning("%s failed (rc=%d): %s", " ".join(cmd[:4]), rc, err)
     return rc, out, err
+
+
+async def run_bytes(
+    *cmd: str,
+    cwd: str | None = None,
+    timeout: int = 60,
+    max_bytes: int = 32 * 1024 * 1024,
+) -> tuple[int, bytes, str]:
+    """Как ``run``, но stdout остаётся СЫРЫМИ БАЙТАМИ (#1591).
+
+    ``run`` декодирует с ``errors="replace"`` и делает ``strip()``: для хэша
+    файла это двойная порча — не-UTF-8 байты становятся U+FFFD, а завершающий
+    перевод строки пропадает. Вывод длиннее ``max_bytes`` — отказ (rc=-2).
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=git_env(),
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (TimeoutError, asyncio.TimeoutError):
+        await kill_process_group(proc)
+        return TIMEOUT_RC, b"", f"timed out after {timeout}s: {' '.join(cmd[:4])}"
+    if len(stdout) > max_bytes:
+        return -2, b"", f"output longer than {max_bytes} bytes"
+    return proc.returncode or 0, stdout, stderr.decode(errors="replace").strip()

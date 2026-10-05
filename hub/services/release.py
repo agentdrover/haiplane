@@ -42,8 +42,10 @@ from hub.services.project_policy import (
     forge_of,
     gate_policy_of,
     release_auto_enabled,
+    release_artifacts_of,
     release_base_of,
 )
+from hub.services.release_artifacts import check_pairs
 
 log = logging.getLogger("hub")
 
@@ -313,6 +315,19 @@ async def _merge_release_pr(
         )
         if not pr_number:
             return await _open_release_for_tail(db, project_row, ctx, base, head)
+        # #1591: голова закрепляется ДО вопроса о CI — и CI, и сверка копий, и
+        # условный merge говорят об одном и том же коммите.
+        pairs = release_artifacts_of(gate_policy_of(project_row))
+        pinned = ""
+        if pairs:
+            pinned = await plugins.git_ops.pr_head_sha(
+                pr_number, repo=ctx["repo"], gh_repo=ctx["gh_repo"], forge=forge
+            )
+            if not pinned:
+                return False, (
+                    f"релизный PR #{pr_number}: голову PR выяснить не удалось, "
+                    "сверка серверных копий отложена"
+                )
         ci = await plugins.git_ops.check_pr_ci(
             pr_number,
             repo=ctx["repo"],
@@ -345,6 +360,15 @@ async def _merge_release_pr(
             return False, (
                 f"релизный PR #{pr_number} не смержен: {state.value} ({why})"
             )
+        if pairs:
+            stale = await check_pairs(pairs, ctx["repo"] or "", pinned)
+            if stale:
+                return False, f"релизный PR #{pr_number} не смержен: " + "; ".join(
+                    stale
+                )
+        # #1591: с объявленными копиями merge УСЛОВНЫЙ — именно на проверенную
+        # голову. Без них вызов прежний, байт в байт.
+        pin = {"expected_head_sha": pinned} if pinned else {}
         merged = await plugins.git_ops.merge_pr(
             pr_number,
             0,
@@ -356,11 +380,12 @@ async def _merge_release_pr(
             # act that removed develop on every auto-release of 24–25.08.
             delete_branch=False,
             forge=forge,
+            **pin,
         )
     except Exception as exc:  # noqa: BLE001 - a cause, not a failure
         return False, f"релиз не удалось провести: {exc}"
     if not merged:
-        return False, f"релизный PR #{pr_number} не смержен: GitHub отказал"
+        return False, await _refused_merge_reason(pr_number, pinned, ctx, forge)
     await _stamp_released_merges(db, project_row, pr_number, ctx)
     note = await _keep_the_integration_branch(db, project_row, head, base, ctx)
     # After the stamp, never before: #950 marks every UNRELEASED merge as
@@ -369,6 +394,31 @@ async def _merge_release_pr(
     # merge, and its record, come on a later cycle.
     back = await _return_the_release(db, project_row, head, base, ctx, pr_number)
     return True, f"релиз PR #{pr_number} смержен в {base}{note}{back}"
+
+
+async def _refused_merge_reason(
+    pr_number: int, pinned: str, ctx: dict[str, Any], forge: str
+) -> str:
+    """Почему merge не вышел; с закреплённой головой — не ушла ли она (#1591).
+
+    Условный merge отказывает и когда голова сменилась, и по любой другой
+    причине. Различаются они повторным чтением головы: сменилась — это не
+    отказ GitHub, а «проверка повторится» (проба: ждёт циклов, не аварийный
+    шум на каждый push в develop).
+    """
+    if pinned:
+        try:
+            now = await plugins.git_ops.pr_head_sha(
+                pr_number, repo=ctx["repo"], gh_repo=ctx["gh_repo"], forge=forge
+            )
+        except Exception:  # noqa: BLE001 - the plain refusal below still names it
+            now = ""
+        if now and now != pinned:
+            return (
+                f"релиз PR #{pr_number} не проведён: голова сменилась "
+                f"{pinned[:12]} → {now[:12]} после сверки, сверка повторится"
+            )
+    return f"релизный PR #{pr_number} не смержен: GitHub отказал"
 
 
 async def _open_release_for_tail(

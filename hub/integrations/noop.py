@@ -707,6 +707,15 @@ class NoopGitOps:
     ) -> tuple[BranchUpdateOutcome, str]:
         return (BranchUpdateOutcome.unsupported, "git integration is not configured")
 
+    async def pr_head_sha(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> str:
+        return ""
+
     def merge_preserves_ancestry(self, forge: str = "") -> bool:
         """Заглушка не мержит — значит и родословную ничем не рвёт (#1214).
 
@@ -728,6 +737,7 @@ class NoopGitOps:
         gh_repo: str | None = None,
         forge: str = "",
         delete_branch: bool = True,
+        expected_head_sha: str = "",
     ) -> bool:
         return False
 
@@ -740,6 +750,7 @@ class NoopGitOps:
         gh_repo: str | None = None,
         forge: str = "",
         delete_branch: bool = True,
+        expected_head_sha: str = "",
     ) -> tuple[bool, str]:
         """Согласован с ``merge_pr``, а не отвечает отдельно (#1116).
 
@@ -909,6 +920,7 @@ class NoopForge:
         repo: str | None = None,
         gh_repo: str | None = None,
         method: str = "squash",
+        expected_head_sha: str = "",
     ) -> bool:
         return False
 
