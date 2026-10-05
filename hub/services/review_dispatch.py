@@ -1775,7 +1775,7 @@ REPORT_BLOCK_INSTRUCTION = (
     '"findings_rejected": [{"title": "...", "category": "...", "reason": "..."}], '
     '"unresolved": [{"title": "...", "why": "..."}], '
     '"lost_dimensions": ["..."], "incomplete_reason": "environment|profile|", '
-    '"harness_skill": "...", '
+    '"harness_skill": "...", "harness_version": <число или null>, '
     '"tokens_spent": <число или null>, "model": "<твоя модель>"}\n'
     "```\n"
     "Правила блока: он ОДИН и он последний; incomplete обязателен и без "
@@ -1911,6 +1911,19 @@ _READ_THE_DIFF_BY_COMMAND = "прочитай дифф КОМАНДОЙ ИЗ П�
 _READ_THE_DIFF_INLINE = "прочитай дифф, приложенный к предмету ревью выше (клона нет)"
 
 
+_HARNESS_FROM_BRIEF = (
+    "харнесс — текст из поля harness_skill брифа (harness_skill.text), "
+    "работай строго по нему. Если harness_skill.text пуст — НЕ импровизируй "
+    "свой проход: сдай честный отчёт с incomplete=true и "
+    "lost_dimensions=['харнесс не выдан хабом'], причину возьми из "
+    "harness_skill.reason; "
+)
+_HARNESS_FROM_BRIEF_FIELDS = (
+    "harness_skill и harness_version — из harness_skill.name и "
+    "harness_skill.version брифа"
+)
+
+
 def _brief_step(task_id: int, http: bool) -> str:
     """Чтение брифа тем путём, который есть у рана (#1584)."""
     if http:
@@ -1918,9 +1931,18 @@ def _brief_step(task_id: int, http: bool) -> str:
     return f"hub_get_review_brief(task_id={task_id})"
 
 
-def _submit_step(task_id: int, http: bool, harness: str = "") -> str:
-    """Сдача отчёта тем путём, который есть у рана (#1584)."""
-    fields = f"harness_skill='{harness}', ..." if harness else "..."
+def _submit_step(
+    task_id: int, http: bool, harness: str = "", harness_fields: str = ""
+) -> str:
+    """Сдача отчёта тем путём, который есть у рана (#1584, #1586).
+
+    ``harness_fields`` — уже готовая фраза про harness_skill/harness_version
+    (deep на HTTP берёт их из брифа); ``harness`` — имя фиксированного харнесса.
+    """
+    if harness_fields:
+        fields = f"{harness_fields}, ..."
+    else:
+        fields = f"harness_skill='{harness}', ..." if harness else "..."
     if http:
         return (
             f"сдай отчёт по HTTP: POST /api/tasks/{task_id}/machine-review ({fields})"
@@ -2002,13 +2024,27 @@ def _review_prompt(
             "«не проверено», а не «чисто»; выдать одно за другое хуже, чем "
             "не найти ничего. Вердикт НЕ выноси — он не твой."
         )
+    http = bool(delivery_block)
+    if http:
+        # #1586: у HTTP-рана нет MCP, а его сессия видит только бриф и приём
+        # отчёта — харнесс приезжает в брифе, полем harness_skill.
+        return (
+            common + "Порядок: "
+            f"1) {_brief_step(task_id, http)} — предмет ревью и харнесс; "
+            f"2) {_HARNESS_FROM_BRIEF} "
+            "3) исполни фазы измерений и адъюдикации ЧЕСТНО — отчёт без "
+            "исполнения запрещён скиллом и виден серверу; "
+            f"4) {_submit_step(task_id, http, harness_fields=_HARNESS_FROM_BRIEF_FIELDS)} с "
+            f"реальными raw_count, находками, tokens_spent и model='{model_id}'. "
+            "Вердикт НЕ выноси — он не твой."
+        )
     return (
         common + "Порядок: "
         "1) hub_get_skill('multi-agent-review') и работай по нему; "
-        f"2) {_brief_step(task_id, bool(delivery_block))} — предмет ревью; "
+        f"2) {_brief_step(task_id, http)} — предмет ревью; "
         "3) исполни фазы измерений и адъюдикации ЧЕСТНО — отчёт без "
         "исполнения запрещён скиллом v8 и виден серверу; "
-        f"4) {_submit_step(task_id, bool(delivery_block))} с "
+        f"4) {_submit_step(task_id, http)} с "
         f"реальными raw_count, находками, tokens_spent и model='{model_id}'. "
         "Вердикт НЕ выноси — он не твой."
     )

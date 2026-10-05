@@ -1433,6 +1433,22 @@ class CatalogueRuleView(BaseModel):
     seen_in_tasks: list[int] = Field(default_factory=list)
 
 
+class ReviewerHarnessSkill(BaseModel):
+    """Active ``multi-agent-review`` text for a chat-pair reviewer session (#1586).
+
+    Not a field of ``ReviewBrief``: the key exists in the JSON ONLY for a
+    reviewer session (the route adds it), so the human card, an implementer,
+    MCP and CLI never carry ~12k characters they did not ask for. Empty
+    ``text`` with a ``reason`` means no ACTIVE version — a draft or the seed
+    is never substituted.
+    """
+
+    name: str
+    version: int | None = None
+    text: str = ""
+    reason: str = ""
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 

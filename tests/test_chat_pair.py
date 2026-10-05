@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from hub import config
+from hub import repository as repo
 from hub.auth import CSRF_COOKIE_NAME, CSRF_HEADER_NAME, login_limiter
 from hub.config import TokenIdentity
 from hub.services import admin as admin_svc
@@ -1271,6 +1272,9 @@ async def test_reviewer_session_reaches_two_routes_and_nothing_else(hub):
         ("GET", f"/api/tasks/{bound}"),
         ("GET", "/api/whoami"),
         ("POST", "/api/tasks"),
+        # #1586: харнесс ревьюер получает из брифа, а не третьим маршрутом.
+        ("GET", "/api/skills/multi-agent-review"),
+        ("GET", "/api/skills"),
     ):
         resp = await hub.client.request(method, path, json={}, headers=session)
         assert resp.status_code == 403, f"{method} {path} → {resp.status_code}"
@@ -1503,3 +1507,89 @@ async def test_a_task_in_review_does_not_take_an_implementer_code(hub):
         "/api/auth/chat-pair/redeem", json={"code": code}, headers=_ip()
     )
     assert resp.status_code == 401, resp.text
+
+
+# ---------------------------------------------------------------------------
+# #1586: харнесс multi-agent-review в брифе reviewer-сессии
+# ---------------------------------------------------------------------------
+
+
+async def _set_skill(hub, *, status: str, content: str) -> int:
+    _id, version = await repo.create_skill_version(
+        hub.db,
+        name="multi-agent-review",
+        content=content,
+        status=status,
+        created_by="test",
+    )
+    await hub.db.commit()
+    return version
+
+
+async def _wipe_skill(hub) -> None:
+    await hub.db.execute("DELETE FROM skills WHERE name='multi-agent-review'")
+    await hub.db.commit()
+
+
+@pytest.mark.asyncio
+async def test_reviewer_brief_carries_active_harness_skill(hub):
+    """AC-1 (#1586): у reviewer-сессии в брифе активный харнесс; у прочих ключа нет."""
+    task_id = await _in_review(hub, "харнесс в брифе")
+    await _wipe_skill(hub)
+    v1 = await _set_skill(hub, status="active", content="HARNESS-TEXT-V1")
+    session = await _reviewer_session(hub, task_id)
+
+    brief = await hub.client.get(f"/api/tasks/{task_id}/review-brief", headers=session)
+    assert brief.status_code == 200, brief.text
+    harness = brief.json()["harness_skill"]
+    assert harness["name"] == "multi-agent-review"
+    assert harness["version"] == v1
+    assert harness["text"] == "HARNESS-TEXT-V1"
+
+    # Активация новой версии: следующее чтение отдаёт новую.
+    await repo.activate_skill_version(
+        hub.db,
+        "multi-agent-review",
+        await _set_skill(hub, status="draft", content="HARNESS-TEXT-V2"),
+        activated_by="test",
+    )
+    await hub.db.commit()
+    again = await hub.client.get(f"/api/tasks/{task_id}/review-brief", headers=session)
+    assert again.json()["harness_skill"]["text"] == "HARNESS-TEXT-V2"
+
+    # Человек и implementer: КЛЮЧА нет вовсе (не null).
+    human = await hub.client.get(
+        f"/api/tasks/{task_id}/review-brief", headers=hub.human_auth
+    )
+    assert human.status_code == 200, human.text
+    assert "harness_skill" not in human.json()
+
+    open_task = await _make_task(hub, "для implementer")
+    implementer = await _implementer_session(hub, open_task)
+    own = await hub.client.get(
+        f"/api/tasks/{open_task}/review-brief", headers=implementer
+    )
+    assert own.status_code == 200, own.text
+    assert "harness_skill" not in own.json()
+    assert "HARNESS-TEXT" not in own.text and "HARNESS-TEXT" not in human.text
+
+
+@pytest.mark.asyncio
+async def test_reviewer_brief_without_active_harness_names_the_gap(hub):
+    """AC-4 (#1586): нет активной версии (и есть только draft) — 200, пусто, причина."""
+    task_id = await _in_review(hub, "без харнесса")
+    session = await _reviewer_session(hub, task_id)
+
+    for setup in ("none", "draft_only"):
+        await _wipe_skill(hub)
+        if setup == "draft_only":
+            await _set_skill(hub, status="draft", content="DRAFT-TEXT")
+        brief = await hub.client.get(
+            f"/api/tasks/{task_id}/review-brief", headers=session
+        )
+        assert brief.status_code == 200, brief.text
+        harness = brief.json()["harness_skill"]
+        assert harness["text"] == "", setup
+        assert harness["version"] is None, setup
+        assert harness["reason"], setup
+        assert "DRAFT-TEXT" not in brief.text, "draft не подставляется"

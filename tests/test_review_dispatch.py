@@ -16570,3 +16570,30 @@ def test_review_prompt_demands_a_single_final_submission(
     else:
         assert "hub_get_review_brief" in prompt
         assert "hub_submit_machine_review" in prompt
+
+
+# --- #1586: харнесс deep на HTTP-пути берётся из брифа ---
+
+
+def test_deep_http_prompt_takes_the_harness_from_the_brief() -> None:
+    """AC-3: HTTP deep не велит hub_get_skill, берёт харнесс из поля брифа и
+    несёт harness_skill/harness_version в оба способа сдачи; MCP-шаг цел."""
+    http = _matrix_prompt(DEEP, True)
+    assert "hub_get_skill" not in http
+    assert "harness_skill" in http and "harness_version" in http
+    assert "поля harness_skill брифа" in http, "источник — поле брифа"
+    assert "lost_dimensions" in http and "incomplete" in http
+    # Метаданные и в HTTP-шаге сдачи, и в финальном текстовом блоке.
+    step = http.rsplit("Порядок:", 1)[1]
+    assert "harness_skill.name" in step and "harness_skill.version" in step, (
+        "шаг сдачи по HTTP берёт имя и версию из брифа"
+    )
+    assert '"harness_version"' in http, "финальный текстовый блок"
+
+    mcp = _matrix_prompt(DEEP, False)
+    assert "hub_get_skill('multi-agent-review')" in mcp
+    assert "поля harness_skill брифа" not in mcp
+
+    # lite харнесса не требует и версию не выдумывает.
+    lite = _matrix_prompt(LITE, True)
+    assert "multi-agent-review" not in lite and "hub_get_skill" not in lite
