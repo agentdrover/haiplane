@@ -16526,3 +16526,47 @@ async def test_the_local_diff_is_read_with_context_and_the_profile_without(
     assert (task["submission_sha"], config.LOCAL_REVIEW_DIFF_CONTEXT_LINES) in asked
     assert config.LOCAL_REVIEW_DIFF_CONTEXT_LINES >= 10
     assert any(ctx == 0 for _, ctx in asked), "расчёт профиля остался на -U0"
+
+
+# --- #1584: одна финальная сдача, без ранней пробной ---
+
+
+def _matrix_prompt(profile: str, http: bool) -> str:
+    from hub.services.review_dispatch import _delivery_block, _review_prompt
+
+    delivery = _delivery_block(1584, "CODE123", "https://hub.example") if http else ""
+    return _review_prompt(
+        1584,
+        "task-1584/x",
+        "grok-4.6",
+        profile,
+        "RULES",
+        "DIFF",
+        "PREPASS",
+        delivery_block=delivery,
+    )
+
+
+@pytest.mark.parametrize("http", [False, True])
+@pytest.mark.parametrize("profile", [LITE, DEEP])
+def test_review_prompt_demands_a_single_final_submission(
+    profile: str, http: bool
+) -> None:
+    """AC-1: во всех клетках lite/deep x HTTP/MCP одна финальная сдача, запрет
+    ранней и пробной, честный raw_count=0 разрешён, текстовый блок на месте."""
+    from hub.services.review_dispatch import REPORT_FENCE
+
+    prompt = _matrix_prompt(profile, http)
+    assert "РОВНО ОДНА финальная сдача" in prompt
+    assert "РАННЯЯ" in prompt and "пробная" in prompt, "ранняя сдача запрещена"
+    assert "чтением брифа" in prompt, "доступ проверяется чтением, не сдачей"
+    assert "raw_count=0" in prompt and "разрешён" in prompt, "честный ноль разрешён"
+    assert f"```{REPORT_FENCE}" in prompt, "текстовый блок остаётся"
+    if http:
+        # Ни чтение брифа, ни сдача не велят MCP-вызов (скилл deep — вне задачи).
+        assert "hub_get_review_brief" not in prompt
+        assert "hub_submit_machine_review" not in prompt
+        assert "/review-brief" in prompt and "/machine-review" in prompt
+    else:
+        assert "hub_get_review_brief" in prompt
+        assert "hub_submit_machine_review" in prompt

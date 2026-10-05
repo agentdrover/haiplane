@@ -13,7 +13,12 @@ import json
 import pytest
 from httpx import AsyncClient
 
-from hub.models import FindingLocator, MachineFinding, MachineReviewView
+from hub.models import (
+    FindingLocator,
+    MachineFinding,
+    MachineReviewSubmit,
+    MachineReviewView,
+)
 from hub.services.finding_identity import finding_uid, finding_uids
 
 
@@ -415,3 +420,134 @@ def test_uid_survives_reordering():
 
 def test_locator_enum_names_all_three_answers():
     assert {m.value for m in FindingLocator} == {"lines", "file", "none"}
+
+
+# --- #1584: алерт «харнесс не запускался» отзывается честным отчётом ---
+
+_RETRACTED = "алерт по пустому"
+
+
+def _submit_body(raw_count: int) -> MachineReviewSubmit:
+    return MachineReviewSubmit(
+        raw_count=raw_count,
+        incomplete=False,
+        harness_skill="lite-diff-review",
+        agent="reviewer",
+    )
+
+
+async def _accept(db, task_id: int, raw_count: int, principal_id: int) -> None:
+    from hub.services.machine_review_intake import record_machine_review
+
+    await record_machine_review(
+        db,
+        task_id,
+        _submit_body(raw_count),
+        principal_id=principal_id,
+        username="reviewer",
+    )
+
+
+async def _feed(db, task_id: int) -> list[tuple[str, str]]:
+    rows = await db.execute_fetchall(
+        "SELECT kind, content FROM task_updates WHERE task_id=? ORDER BY id",
+        (task_id,),
+    )
+    return [(dict(r)["kind"], dict(r)["content"]) for r in rows]
+
+
+async def _review_ids(db, task_id: int) -> list[int]:
+    rows = await db.execute_fetchall(
+        "SELECT id FROM machine_reviews WHERE task_id=? ORDER BY id", (task_id,)
+    )
+    return [dict(r)["id"] for r in rows]
+
+
+def _retractions(feed: list[tuple[str, str]]) -> list[str]:
+    return [c for _, c in feed if _RETRACTED in c]
+
+
+async def test_no_candidates_alert_is_retracted_when_real_report_follows(
+    client: AsyncClient, db
+):
+    task_id = await _reviewable_task(client, db)
+    await _accept(db, task_id, 0, principal_id=11)
+    feed = await _feed(db, task_id)
+    assert any("харнесс не запускался" in c for k, c in feed if k == "alert")
+    assert _retractions(feed) == []
+
+    await _accept(db, task_id, 2, principal_id=11)
+    r_id, n_id = (await _review_ids(db, task_id))[:2]
+    lines = _retractions(await _feed(db, task_id))
+    assert len(lines) == 1
+    assert f"#{r_id}" in lines[0] and f"#{n_id}" in lines[0]
+    assert "пришёл отчёт с данными" in lines[0]
+
+    # Второй отчёт с данными от того же принципала отзыва не даёт.
+    await _accept(db, task_id, 3, principal_id=11)
+    assert len(_retractions(await _feed(db, task_id))) == 1
+    # Ничего не переписано: алерт на месте, строки приняты.
+    feed = await _feed(db, task_id)
+    assert any("харнесс не запускался" in c for k, c in feed if k == "alert")
+    assert len(await _review_ids(db, task_id)) == 3
+
+
+async def test_no_retraction_for_another_principal_or_without_alert(
+    client: AsyncClient, db
+):
+    from hub import repository as repo_module
+
+    # (а) нулевая от P, нулевая от Q, отчёт Q с данными.
+    t = await _reviewable_task(client, db)
+    await _accept(db, t, 0, principal_id=11)
+    await _accept(db, t, 0, principal_id=12)
+    await _accept(db, t, 2, principal_id=12)
+    assert _retractions(await _feed(db, t)) == []
+    assert len(await _review_ids(db, t)) == 3
+
+    # (б) поколение без нулевых строк.
+    t = await _reviewable_task(client, db)
+    await _accept(db, t, 2, principal_id=11)
+    assert _retractions(await _feed(db, t)) == []
+
+    # (в) перенесённая строка P с данными, затем отчёт P с данными.
+    t = await _reviewable_task(client, db)
+    gen = (dict(await repo_module.get_task(db, t)))["submission_generation"]
+    await repo_module.insert_machine_review(
+        db,
+        task_id=t,
+        submission_generation=gen,
+        raw_count=2,
+        principal_id=11,
+        carried_from_review_id=1,
+    )
+    await db.commit()
+    await _accept(db, t, 2, principal_id=11)
+    assert _retractions(await _feed(db, t)) == []
+
+    # (г) перенесённая нулевая R, затем отчёт P с данными.
+    t = await _reviewable_task(client, db)
+    gen = (dict(await repo_module.get_task(db, t)))["submission_generation"]
+    await repo_module.insert_machine_review(
+        db,
+        task_id=t,
+        submission_generation=gen,
+        raw_count=0,
+        principal_id=11,
+        carried_from_review_id=1,
+    )
+    await db.commit()
+    await _accept(db, t, 2, principal_id=11)
+    assert _retractions(await _feed(db, t)) == []
+
+    # (д) нулевая P по прежнему поколению, отчёт P с данными по новому.
+    t = await _reviewable_task(client, db)
+    await _accept(db, t, 0, principal_id=11)
+    await db.execute(
+        "UPDATE tasks SET submission_generation=submission_generation+1 WHERE id=?",
+        (t,),
+    )
+    await db.commit()
+    await _accept(db, t, 2, principal_id=11)
+    assert _retractions(await _feed(db, t)) == []
+    assert len(await _review_ids(db, t)) == 2
