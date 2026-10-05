@@ -21,7 +21,8 @@ from fastapi import (
     Response,
     status,
 )
-from fastapi.responses import PlainTextResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -172,7 +173,7 @@ from hub.services.ac_tests import run_ac_tests
 from hub.services.ci_report import accept_ci_run_report
 from hub.services.validation_run import run_validation_commands
 from hub.services.task_idempotency import resolve_client_request_id
-from hub.services.review_brief import build_review_brief
+from hub.services.review_brief import build_review_brief, reviewer_harness_skill
 from hub.services.tree_output import (
     TreeOutputOptions,
     apply_tree_limits,
@@ -2778,6 +2779,15 @@ async def api_review_brief(
     )
     if brief is None:
         raise HTTPException(404, "task not found")
+    # #1586: the harness text rides ONLY to a chat-pair reviewer session — the
+    # one reader with no MCP and no route to the skill library. Same two
+    # signs the allowlist reads; role, name or principal_id prove nothing.
+    # A Response is returned as-is, so the key is absent (not null) for
+    # everyone else and response_model never sees it.
+    if identity.auth_source == "chat_pair" and identity.chat_pair_kind == "reviewer":
+        payload = jsonable_encoder(brief)
+        payload["harness_skill"] = (await reviewer_harness_skill(db)).model_dump()
+        return JSONResponse(payload)
     return brief
 
 
