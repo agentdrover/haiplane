@@ -1357,3 +1357,206 @@ async def test_brief_names_required_and_actual_review_profile(client: AsyncClien
     from hub.mcp_server import _profile_downgrade_line
 
     assert "Требовался deep" in _profile_downgrade_line(again.json())
+
+
+# --- #1589: path_notices в ответе на сдачу, брифе и карточке вердикта --------
+
+
+def _commit_on(root, branch, name, text):
+    from tests.test_lifecycle import _real
+
+    _real(root, "checkout", "-q", branch)
+    (root / name).write_text((root / name).read_text() + text)
+    _real(root, "add", "-A")
+    _real(root, "commit", "-q", "-m", f"edit {name}")
+    _real(root, "checkout", "-q", "main")
+
+
+async def test_brief_and_verdict_card_show_path_notices(
+    db, client: AsyncClient, tmp_path, monkeypatch
+):
+    """#1589 AC-2: без ключа и с пустым списком — ничего; с правилами — ТЕКУЩЕЕ поколение."""
+    import json
+
+    from hub import mcp_server
+    from tests.test_lifecycle import (
+        _edit,
+        _notice_lines,
+        make_path_notices_git,
+        make_path_notices_workspace,
+        pair_task_with_branch,
+        path_notices_project,
+    )
+
+    workspace = make_path_notices_workspace(tmp_path)
+    git = make_path_notices_git(workspace)
+    monkeypatch.setattr(plugins, "git_ops", git)
+    evil = "<script>alert(1)</script> обновить копию"
+    rules = [{"pattern": "deploy/remote-deploy.sh", "text": evil}]
+
+    # Без ключа и с пустым списком: ни поля, ни строки, ни текста.
+    for slug, configured in (("pn-nokey", None), ("pn-empty", [])):
+        _, epic = await path_notices_project(
+            db, client, workspace, configured, slug=slug
+        )
+        task_id = await pair_task_with_branch(
+            db,
+            client,
+            epic,
+            workspace,
+            f"quiet {slug}",
+            lambda r: _edit(r, "deploy/remote-deploy.sh"),
+        )
+        resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["path_notices"] is None, slug
+        assert not _notice_lines(await repo.get_task_updates(db, task_id)), slug
+        brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+        assert brief["path_notices"] is None, slug
+        assert mcp_server._path_notices_text(brief["path_notices"]) == ""
+        page = (await client.get(f"/tasks/{task_id}")).text
+        assert "Пути диффа требуют ручных шагов" not in page, slug
+
+    # С правилами: пути задеты.
+    _, epic = await path_notices_project(db, client, workspace, rules, slug="pn-rules")
+    task_id = await pair_task_with_branch(
+        db,
+        client,
+        epic,
+        workspace,
+        "with rules",
+        lambda r: _edit(r, "deploy/remote-deploy.sh"),
+    )
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert brief["path_notices"]["state"] == "matched"
+    assert evil in brief["path_notices"]["text"]
+    assert evil in mcp_server._path_notices_text(brief["path_notices"])
+
+    async def fake_get(path):
+        return brief
+
+    monkeypatch.setattr(mcp_server, "_api_get", fake_get)
+    mcp_result = await mcp_server.hub_get_review_brief(task_id)
+    assert evil in mcp_result.content[0].text, "MCP-бриф называет предупреждение"
+
+    page = (await client.get(f"/tasks/{task_id}")).text
+    assert "Пути диффа требуют ручных шагов" in page
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page, "текст экранирован"
+    assert "<script>alert(1)</script>" not in page
+
+    # Правка политики ПОСЛЕ сдачи результат поколения не меняет.
+    project = await repo.resolve_project_for_task(db, task_id)
+    await repo.update_project(
+        db,
+        project["id"],
+        gate_policy=json.dumps(
+            {"path_notices": [{"pattern": "deploy/remote-deploy.sh", "text": "новый"}]}
+        ),
+    )
+    await db.commit()
+    brief2 = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert brief2["path_notices"]["text"] == brief["path_notices"]["text"]
+    # Даже полное снятие правил: результат поколения зафиксирован сдачей.
+    await repo.update_project(db, project["id"], gate_policy=json.dumps({}))
+    await db.commit()
+    brief2 = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert brief2["path_notices"]["text"] == brief["path_notices"]["text"]
+    await repo.update_project(
+        db, project["id"], gate_policy=json.dumps({"path_notices": rules})
+    )
+    await db.commit()
+
+    # Пересдача без совпадения: правку скрипта откатили, старое предупреждение
+    # прошлого поколения не показано ни в брифе, ни в карточке.
+    from tests.test_lifecycle import _real
+
+    branch = f"task-{task_id}/work"
+    _real(workspace, "checkout", "-q", branch)
+    _real(workspace, "checkout", "main", "--", "deploy/remote-deploy.sh")
+    _real(workspace, "commit", "-q", "-m", "revert script edit")
+    _real(workspace, "checkout", "-q", "main")
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["path_notices"]["state"] == "none"
+    assert len(_notice_lines(await repo.get_task_updates(db, task_id))) == 1, (
+        "новой строки нет: совпадений в этом поколении нет"
+    )
+    brief3 = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert (
+        brief3["path_notices"]["generation"] == brief["path_notices"]["generation"] + 1
+    )
+    assert mcp_server._path_notices_text(brief3["path_notices"]) == ""
+    old_page = (await client.get(f"/tasks/{task_id}")).text
+    assert "Пути диффа требуют ручных шагов" not in old_page
+    assert 'id="path-notices"' not in old_page, (
+        "блок карточки только у текущего поколения"
+    )
+
+    # Чистая ветка с пустым диффом: состояние none, ничего не показывается.
+    clean_id = await pair_task_with_branch(
+        db, client, epic, workspace, "empty diff", lambda r: None
+    )
+    await repo.update_project(
+        db,
+        project["id"],
+        gate_policy=json.dumps({"path_notices": rules}),
+    )
+    await db.commit()
+    resp = await client.post(f"/api/tasks/{clean_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["path_notices"]["state"] == "none"
+    assert not _notice_lines(await repo.get_task_updates(db, clean_id))
+    clean_brief = (await client.get(f"/api/tasks/{clean_id}/review-brief")).json()
+    assert mcp_server._path_notices_text(clean_brief["path_notices"]) == ""
+    assert (
+        "Пути диффа требуют ручных шагов"
+        not in (await client.get(f"/tasks/{clean_id}")).text
+    )
+
+    # Непрочитанный дифф: явное «проверка путей не выполнена», не тишина.
+    class _Blind(type(git)):
+        async def branch_touched_paths(self, *a, **kw):
+            return None
+
+    monkeypatch.setattr(plugins, "git_ops", _Blind())
+    blind_id = await pair_task_with_branch(
+        db,
+        client,
+        epic,
+        workspace,
+        "blind",
+        lambda r: _edit(r, "deploy/remote-deploy.sh"),
+    )
+    resp = await client.post(f"/api/tasks/{blind_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    block = resp.json()["path_notices"]
+    assert block["state"] == "unknown" and block["reason"]
+    assert "проверка путей не выполнена" in block["text"]
+    lines = _notice_lines(await repo.get_task_updates(db, blind_id))
+    assert len(lines) == 1 and "проверка путей не выполнена" in lines[0]
+    blind_page = (await client.get(f"/tasks/{blind_id}")).text
+    assert "проверка путей не выполнена" in blind_page
+
+    # Дифф сдачи не прочитан вовсе (branch_diff_paths вернул None): то же явное
+    # «не выполнена» с причиной диффа, а не тишина.
+    class _NoDiff(type(git)):
+        async def branch_diff_paths(self, *a, **kw):
+            return None
+
+    monkeypatch.setattr(plugins, "git_ops", _NoDiff())
+    nodiff_id = await pair_task_with_branch(
+        db,
+        client,
+        epic,
+        workspace,
+        "no diff",
+        lambda r: _edit(r, "deploy/remote-deploy.sh"),
+    )
+    resp = await client.post(f"/api/tasks/{nodiff_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    block = resp.json()["path_notices"]
+    assert block["state"] == "unknown"
+    assert "не удалось прочитать дифф ветки" in block["reason"]
+    assert len(_notice_lines(await repo.get_task_updates(db, nodiff_id))) == 1

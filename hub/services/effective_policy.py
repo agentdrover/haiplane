@@ -160,6 +160,9 @@ REGISTRY: dict[str, PolicyEntry] = {
     "merge_is_delivery": PolicyEntry(
         project_policy.merge_is_delivery_of, "project_policy.merge_is_delivery_of"
     ),
+    "path_notices": PolicyEntry(
+        project_policy.path_notices_of, "project_policy.path_notices_of"
+    ),
     "slot_dead_minutes": PolicyEntry(
         executor_slots.dead_minutes_of,
         "executor_slots.dead_minutes_of",
@@ -297,7 +300,7 @@ def _show(value: Any) -> str:
         return "-"
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, dict):
+    if isinstance(value, (dict, list)):
         return f"{len(value)} rule(s)"
     return str(value)
 

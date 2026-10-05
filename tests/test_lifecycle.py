@@ -1502,3 +1502,269 @@ async def test_other_needs_decision_causes_still_need_a_human(
         assert exc.status_code == 400
     else:
         raise AssertionError("событие прошлого захода открыло пересдачу")
+
+
+# --- #1589: предупреждения по путям диффа (path_notices) --------------------
+
+PATH_RULES = [
+    {
+        "pattern": "deploy/remote-deploy.sh",
+        "text": "обновить закреплённую копию на сервере (sha256)",
+    },
+    {"pattern": "deploy/review-runner/**", "text": "применить службу ревьюера"},
+    {"pattern": "deploy/**/*.service", "text": "подтвердить unit на сервере"},
+]
+
+
+def _real(repo_dir, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", *args], cwd=repo_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def make_path_notices_workspace(tmp_path):
+    """Настоящий репозиторий: база main с файлами из правил и вне них."""
+    root = tmp_path / "pn-repo"
+    root.mkdir()
+    _real(root, "init", "-q", "-b", "main")
+    _real(root, "config", "user.email", "t@example.com")
+    _real(root, "config", "user.name", "t")
+    files = {
+        "deploy/remote-deploy.sh": "echo deploy\n" * 30,
+        "deploy/review-runner/run.py": "print('run')\n" * 30,
+        "deploy/x.service": "[Unit]\nDescription=x\n" * 10,
+        "docs/other.md": "# other\n" * 30,
+        "app.py": "x = 1\n",
+    }
+    for name, body in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(body)
+    _real(root, "add", "-A")
+    _real(root, "commit", "-q", "-m", "base")
+    return root
+
+
+def make_path_notices_git(workspace):
+    """git_ops с НАСТОЯЩИМ чтением путей; остальное — инертный Noop."""
+    from hub.integrations.git_ops import GitOpsIntegration
+    from tests.conftest import MockGitOps
+
+    real = GitOpsIntegration()
+
+    class _PathGit(MockGitOps):
+        async def fetch_base(self, repo, base):
+            return (True, "")
+
+        async def head_sha(self, repo, base):
+            return _real(repo, "rev-parse", f"{base}^{{commit}}")
+
+        async def branch_diff_paths(self, branch, base_branch=None, repo=None):
+            return await real.branch_diff_paths(branch, base_branch, repo)
+
+        async def branch_touched_paths(
+            self, branch, base_branch=None, repo=None, head_sha=""
+        ):
+            return await real.branch_touched_paths(branch, base_branch, repo, head_sha)
+
+    return _PathGit()
+
+
+async def path_notices_project(db, client, workspace, rules, *, slug="pn"):
+    """Задача pair в проекте с workspace и правилами; ветка id задачи."""
+    import json as _json
+
+    from hub import repository as _repo
+
+    project_id = await _repo.create_project(
+        db,
+        slug=slug,
+        name=slug,
+        repo_name="",
+        workspace_path=str(workspace),
+        default_branch="main",
+    )
+    if rules is not None:
+        await _repo.update_project(
+            db, project_id, gate_policy=_json.dumps({"path_notices": rules})
+        )
+    epic = (
+        await client.post("/api/tasks", json={"title": "Epic", "task_type": "epic"})
+    ).json()["id"]
+    await _repo.update_task(db, epic, project_id=project_id)
+    await db.commit()
+    return project_id, epic
+
+
+async def pair_task_with_branch(db, client, epic, workspace, title, change):
+    """Задача pair-running; на её ветке настоящий коммит ``change(root)``."""
+    task_id = (
+        await client.post(
+            "/api/tasks",
+            json={"title": title, "task_type": "task", "parent_id": epic},
+        )
+    ).json()["id"]
+    for url, payload in (
+        (f"/api/tasks/{task_id}/claim", {"agent": "dev"}),
+        (
+            f"/api/tasks/{task_id}/updates",
+            {"agent": "dev", "kind": "status", "content": "Plan: go"},
+        ),
+        (f"/api/tasks/{task_id}/pair-start", {"assigned_agent": "dev"}),
+    ):
+        resp = await client.post(url, json=payload)
+        assert resp.status_code == 200, resp.text
+    branch = f"task-{task_id}/work"
+    _real(workspace, "checkout", "-q", "-B", branch, "main")
+    change(workspace)
+    _real(workspace, "add", "-A")
+    _real(workspace, "commit", "-q", "--allow-empty", "-m", title)
+    _real(workspace, "checkout", "-q", "main")
+    await repo.update_task(db, task_id, branch=branch)
+    await db.commit()
+    return task_id
+
+
+def _notice_lines(updates) -> list[str]:
+    from hub.services.path_notices import PATH_NOTICES_MARK
+
+    return [
+        dict(u)["content"] for u in updates if PATH_NOTICES_MARK in dict(u)["content"]
+    ]
+
+
+def _edit(root, name, text="changed\n"):
+    (root / name).write_text((root / name).read_text() + text)
+
+
+def _rename(old, new):
+    def change(root):
+        (root / new).parent.mkdir(parents=True, exist_ok=True)
+        _real(root, "mv", old, new)
+
+    return change
+
+
+def _delete(name):
+    def change(root):
+        _real(root, "rm", "-q", name)
+
+    return change
+
+
+PATH_CASES = [
+    # (заголовок, правка, путь, который обязан быть назван, текст правила)
+    (
+        "modify script",
+        lambda r: _edit(r, "deploy/remote-deploy.sh"),
+        "deploy/remote-deploy.sh",
+        "закреплённую копию",
+    ),
+    (
+        "rename out of a watched path",
+        _rename("deploy/remote-deploy.sh", "docs/moved.sh"),
+        "deploy/remote-deploy.sh",
+        "закреплённую копию",
+    ),
+    (
+        "rename into a watched path",
+        _rename("docs/other.md", "deploy/review-runner/other.md"),
+        "deploy/review-runner/other.md",
+        "службу ревьюера",
+    ),
+    (
+        "delete from runner",
+        _delete("deploy/review-runner/run.py"),
+        "deploy/review-runner/run.py",
+        "службу ревьюера",
+    ),
+    (
+        "modify service",
+        lambda r: _edit(r, "deploy/x.service", "# edit\n"),
+        "deploy/x.service",
+        "unit на сервере",
+    ),
+]
+
+
+async def test_submission_names_path_notices_for_touched_paths(
+    db: aiosqlite.Connection, client: AsyncClient, tmp_path, monkeypatch
+):
+    """#1589 AC-1: настоящий git; submit и done называют пути и тексты, строка одна.
+
+    Пять правок: изменение, rename из подходящего пути и в него, удаление,
+    unit. Повтор того же коммита второй строки ленты не пишет и отдаёт
+    сохранённый результат.
+    """
+    from hub.integrations.registry import plugins
+
+    workspace = make_path_notices_workspace(tmp_path)
+    monkeypatch.setattr(plugins, "git_ops", make_path_notices_git(workspace))
+    _, epic = await path_notices_project(db, client, workspace, PATH_RULES)
+
+    for index, (title, change, named, text) in enumerate(PATH_CASES):
+        task_id = await pair_task_with_branch(
+            db, client, epic, workspace, f"{title} {index}", change
+        )
+        resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+        assert resp.status_code == 200, resp.text
+        block = resp.json()["path_notices"]
+        assert block["state"] == "matched", (title, block)
+        assert named in block["text"] and text in block["text"], (title, block)
+        assert block["sha"] == _real(workspace, "rev-parse", f"task-{task_id}/work")
+        lines = _notice_lines(await repo.get_task_updates(db, task_id))
+        assert len(lines) == 1, (title, lines)
+        assert named in lines[0] and text in lines[0]
+
+        again = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+        assert again.status_code == 200, again.text
+        assert again.json()["path_notices"]["text"] == block["text"], title
+        after = _notice_lines(await repo.get_task_updates(db, task_id))
+        assert len(after) == 1, f"{title}: повтор того же SHA написал строку: {after}"
+
+    # Тот же набор через переход done: общий путь поллера и pair.
+    for index, (title, change, named, text) in enumerate(PATH_CASES[:2]):
+        task_id = await pair_task_with_branch(
+            db, client, epic, workspace, f"done {title} {index}", change
+        )
+        resp = await client.post(
+            f"/api/tasks/{task_id}/updates",
+            json={"agent": "dev", "kind": "done", "content": "готово"},
+        )
+        assert resp.status_code == 200, resp.text
+        warnings = resp.json()["warnings"]
+        assert any(named in w and text in w for w in warnings), (title, warnings)
+        lines = _notice_lines(await repo.get_task_updates(db, task_id))
+        assert len(lines) == 1, (title, lines)
+        assert named in lines[0] and text in lines[0]
+
+
+async def test_done_from_pending_report_also_names_path_notices(
+    db: aiosqlite.Connection, client: AsyncClient, tmp_path, monkeypatch
+):
+    """#1589: маршрут pending_report → review тоже сдача и не остаётся без пути."""
+    from hub.integrations.registry import plugins
+
+    workspace = make_path_notices_workspace(tmp_path)
+    monkeypatch.setattr(plugins, "git_ops", make_path_notices_git(workspace))
+    _, epic = await path_notices_project(db, client, workspace, PATH_RULES)
+    task_id = await pair_task_with_branch(
+        db,
+        client,
+        epic,
+        workspace,
+        "pending report",
+        lambda r: _edit(r, "deploy/remote-deploy.sh"),
+    )
+    await repo.update_task(db, task_id, status="pending_report")
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "done", "content": "готово"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert any("закреплённую копию" in w for w in resp.json()["warnings"])
+    lines = _notice_lines(await repo.get_task_updates(db, task_id))
+    assert len(lines) == 1 and "deploy/remote-deploy.sh" in lines[0]

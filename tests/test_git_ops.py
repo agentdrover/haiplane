@@ -1897,6 +1897,79 @@ async def test_branch_diff_paths_reads_non_ascii_and_reports_unknown(
     assert await git_ops.branch_diff_paths("no-such-branch", repo=str(repo)) is None
 
 
+async def test_submission_paths_include_renames_and_deletions(
+    git_ops: GitOpsIntegration, tmp_path
+) -> None:
+    """#1589 AC-4: real git; a rename names both ends, a deletion is listed.
+
+    ``--name-only`` shows only the new name of a rename (and no help for the
+    old one), so a file moved OUT of a watched path would read as untouched.
+    The surface check keeps its own source and must read as before.
+    """
+    repo = _seed_repo(tmp_path)
+    _run_git("git", "checkout", "-q", "-b", config.PAIR_BASE_BRANCH, cwd=repo)
+    (repo / "deploy").mkdir()
+    (repo / "deploy" / "remote-deploy.sh").write_text("echo deploy script\n" * 20)
+    (repo / "deploy" / "gone.conf").write_text("to be removed\n" * 20)
+    (repo / "deploy" / "keep.txt").write_text("unchanged\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "base", cwd=repo)
+
+    _run_git("git", "checkout", "-q", "-b", "task-1589/work", cwd=repo)
+    (repo / "docs").mkdir()
+    _run_git("git", "mv", "deploy/remote-deploy.sh", "docs/moved-deploy.sh", cwd=repo)
+    _run_git("git", "rm", "-q", "deploy/gone.conf", cwd=repo)
+    (repo / "docs" / "Новый.md").write_text("new\n")
+    _run_git("git", "add", "-A", cwd=repo)
+    _run_git("git", "commit", "-m", "work", cwd=repo)
+
+    got = await git_ops.branch_touched_paths("task-1589/work", repo=str(repo))
+
+    assert got is not None
+    paths, sha = got
+    assert set(paths) == {
+        "deploy/gone.conf",
+        "deploy/remote-deploy.sh",
+        "docs/Новый.md",
+        "docs/moved-deploy.sh",
+    }
+    assert len(paths) == 4
+    assert "deploy/keep.txt" not in paths
+    import subprocess
+
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert sha == head
+
+    # The surface check's source is untouched: new name only, as before.
+    old_source = await git_ops.branch_diff_paths("task-1589/work", repo=str(repo))
+    assert old_source is not None
+    assert set(old_source) == {
+        "deploy/gone.conf",
+        "docs/Новый.md",
+        "docs/moved-deploy.sh",
+    }
+    assert "deploy/remote-deploy.sh" not in old_source
+
+    # A pinned head is read as itself; an unknown branch is unknown, not [].
+    pinned = await git_ops.branch_touched_paths(
+        "task-1589/work", repo=str(repo), head_sha=sha
+    )
+    assert pinned is not None and pinned[1] == sha
+    assert await git_ops.branch_touched_paths("no-such", repo=str(repo)) is None
+    assert (
+        await git_ops.branch_touched_paths(
+            "task-1589/work", repo=str(repo), head_sha="0" * 40
+        )
+        is None
+    )
+
+
 # ---- CI probe fallback (#606): the eye GitHub's token picker put out ----
 
 

@@ -243,6 +243,17 @@
         </div>
         {% endif %}
 
+        {# #1589: предупреждения по путям диффа — ручные шаги вне CI. Текст
+           приходит из политики проекта и выводится ЭКРАНИРОВАННЫМ (данные, не
+           разметка); блок есть только при совпадении или непрочитанном диффе. #}
+        {% if evidence.path_notices and evidence.path_notices.state != 'none' %}
+        <div class="task-evidence-row" id="path-notices">
+            <span class="u-text-muted">Пути диффа требуют ручных шагов:</span>
+            <span class="badge badge--xs badge-{{ 'pending' if evidence.path_notices.state == 'unknown' else 'failed' }}">{{ evidence.path_notices.state }}</span>
+            <div class="u-pre-wrap">{{ evidence.path_notices.text }}</div>
+        </div>
+        {% endif %}
+
         {# #875: КАКИЕ проверки прошли, а не только «прогон был».
            Право сказать ревьюеру «этот класс покрыт» даёт только
            шаг, выполнившийся и прошедший на этом коммите. #}

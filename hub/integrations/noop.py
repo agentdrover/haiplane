@@ -583,6 +583,15 @@ class NoopGitOps:
     ) -> list[str] | None:
         return None
 
+    async def branch_touched_paths(
+        self,
+        branch: str,
+        base_branch: str | None = None,
+        repo: str | None = None,
+        head_sha: str = "",
+    ) -> tuple[list[str], str] | None:
+        return None
+
     async def auto_commit(
         self,
         task_id: int,
