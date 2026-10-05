@@ -51,7 +51,7 @@ from hub.models import (
     TaskProjectRef,
     TaskStatus,
 )
-from hub.services import call_sites, review_evidence
+from hub.services import call_sites, path_notices, review_evidence
 from hub.services.ac_tests import current_ac_test_results
 from hub.services.ci_report import ci_report_state
 from hub.services.review_availability import generation_review
@@ -726,6 +726,10 @@ async def build_review_brief(
         machine_review=machine_review,
         self_review_warning=self_review_warning,
         stacking_warning=stacking_warning,
+        # #1589: результат ТЕКУЩЕГО поколения; предыдущие не показываются.
+        path_notices=await path_notices.view_for_generation(
+            db, task_id, task_view.submission_generation or 0
+        ),
         review_in_flight=await review_evidence.inflight_view(db, task_row),
         current_generation_review=await generation_review(db, task_row),
     )

@@ -718,3 +718,27 @@ def statement_paths_of(policy: dict) -> str:
     if isinstance(value, str) and value in STATEMENT_PATHS_MODES:
         return value
     return STATEMENT_PATHS_WARN
+
+
+# Предупреждения по путям диффа (#1589). Список {pattern, text}: правка пути,
+# за которой должен последовать ручной шаг вне CI, видна при сдаче, в брифе и в
+# карточке вердикта. Нет ключа, не список, мусорные записи — пустой список:
+# нечитаемая политика ничего не добавляет к ответам. Запись уже проверена
+# моделью; здесь читатель терпит то, что могло попасть в базу мимо неё.
+PATH_NOTICES_KEY = "path_notices"
+
+
+def path_notices_of(policy: dict) -> list[dict[str, str]]:
+    """Правила path_notices уже прочитанной политики; ``[]``, когда их нет."""
+    raw = policy.get(PATH_NOTICES_KEY) if isinstance(policy, dict) else None
+    if not isinstance(raw, list):
+        return []
+    rules: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        pattern, text = item.get("pattern"), item.get("text")
+        if isinstance(pattern, str) and pattern.strip() and isinstance(text, str):
+            if text.strip():
+                rules.append({"pattern": pattern.strip(), "text": text.strip()})
+    return rules

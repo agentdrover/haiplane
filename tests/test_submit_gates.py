@@ -117,6 +117,7 @@ EXPECTED_SUBMIT_ORDER = (
     "surfaces",
     "finding_outcomes",
     "submit_rules",
+    "path_notices",
     "delivery_pr",
 )
 
@@ -204,6 +205,7 @@ EXPECTED_HEADLESS_ORDER = (
     "finding_outcomes",
     "submit_rules",
     "pin_submission_sha",
+    "path_notices",
     "delivery_pr",
 )
 

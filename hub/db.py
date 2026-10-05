@@ -2462,6 +2462,26 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_ci_run_reports_baseline",
         "ALTER TABLE ci_run_reports ADD COLUMN baseline TEXT NOT NULL DEFAULT '{}'",
     ),
+    (
+        # #1589: what the project's path_notices rules said about the paths of
+        # ONE submission generation. A table, not an event: events are pruned
+        # after 14 days and a verdict can wait longer, and ``submissions`` is
+        # written only by the pair path. UNIQUE(task_id, generation): the
+        # result is fixed at submission and never rewritten, so a policy edit
+        # afterwards cannot change what the reviewer is shown.
+        "create_path_notice_results",
+        """CREATE TABLE IF NOT EXISTS path_notice_results (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            generation INTEGER NOT NULL,
+            sha        TEXT    NOT NULL DEFAULT '',
+            state      TEXT    NOT NULL,
+            reason     TEXT    NOT NULL DEFAULT '',
+            notices    TEXT    NOT NULL DEFAULT '[]',
+            created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (task_id, generation)
+        )""",
+    ),
 ]
 
 

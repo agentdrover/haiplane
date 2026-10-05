@@ -2266,6 +2266,33 @@ async def test_hub_submit_for_review_forwards_lifecycle_hint(
     assert "открыть не удалось" in payload["message"]
 
 
+async def test_submit_text_names_path_notices_only_when_there_is_something_to_say(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """#1589: MCP-ответ на сдачу несёт matched/unknown и молчит при none и без ключа."""
+    mock_api_get.return_value = {"id": 42, "status": "running"}
+    base = {"id": 42, "status": "review", "submission_generation": 1}
+    shown = {
+        "generation": 1,
+        "state": "matched",
+        "text": "Предупреждение по путям диффа (path_notices): обновить копию",
+    }
+    for block, expect in (
+        (shown, True),
+        (
+            {**shown, "state": "unknown", "text": "проверка путей не выполнена: сеть"},
+            True,
+        ),
+        ({**shown, "state": "none", "text": "путей из правил в диффе нет"}, False),
+        (None, False),
+    ):
+        mock_api_post.return_value = {**base, "path_notices": block}
+        message = json.loads(await hub_submit_for_review(42))["message"]
+        assert (
+            "path_notices" in message or "проверка путей не выполнена" in message
+        ) is expect, block
+
+
 async def test_submit_answer_names_the_unchanged_generation(
     mock_api_get: AsyncMock, mock_api_post: AsyncMock
 ) -> None:

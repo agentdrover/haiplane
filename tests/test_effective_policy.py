@@ -614,3 +614,104 @@ async def test_auto_approve_decides_dor_with_the_summary_reader(
     task_id = await _draft_in_project(client, db, pid)
     body = await _refine_to_dor(client, task_id, ["docs/notes.md"])
     assert body["status"] == "draft", "the gate follows the same reader"
+
+
+# --- #1589: ключ path_notices ------------------------------------------------
+
+
+async def test_path_notices_policy_is_validated_and_summarised(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1589 AC-3: корректная запись видна в сводке с читателем; плохие — 422."""
+    pid = await repo.create_project(db, slug="pn-policy", name="pn-policy")
+    await db.commit()
+    url = f"/api/projects/{pid}"
+    good = [
+        {"pattern": "deploy/remote-deploy.sh", "text": "  обновить копию  "},
+        {"pattern": "deploy/**/*.service", "text": "подтвердить unit"},
+    ]
+
+    resp = await client.patch(url, json={"gate_policy": {"path_notices": good}})
+    assert resp.status_code == 200, resp.text
+    stored = resp.json()["gate_policy"]["path_notices"]
+    assert stored[0]["text"] == "обновить копию", "края текста срезаются"
+
+    summary = (await client.get("/api/projects/pn-policy/effective-policy")).json()
+    row = _by_key(summary)["path_notices"]
+    assert row["reader"] == "project_policy.path_notices_of"
+    assert row["source"] == "project"
+    assert [r["pattern"] for r in row["value"]] == [g["pattern"] for g in good]
+    assert row["default"] == []
+    assert "path_notices" not in summary["unknown_keys"]
+
+    bad = {
+        "empty text": [{"pattern": "a/**", "text": "   "}],
+        "empty pattern": [{"pattern": "", "text": "t"}],
+        "wrong type": "deploy/**",
+        "wrong item type": ["deploy/**"],
+        "missing text": [{"pattern": "a/**"}],
+        "extra key": [{"pattern": "a/**", "text": "t", "level": "high"}],
+        "non-string text": [{"pattern": "a/**", "text": 5}],
+        "too many rules": [{"pattern": f"d{i}/**", "text": "t"} for i in range(51)],
+        "long pattern": [{"pattern": "a" * 201, "text": "t"}],
+        "long text": [{"pattern": "a/**", "text": "т" * 501}],
+    }
+    for name, value in bad.items():
+        resp = await client.patch(url, json={"gate_policy": {"path_notices": value}})
+        assert resp.status_code == 422, (name, resp.status_code, resp.text)
+        assert "path_notices" in resp.text, (name, resp.text)
+    # Границы допустимы: ровно 50 правил, 200 символов шаблона, 500 текста.
+    edge = [{"pattern": f"d{i}/**", "text": "t"} for i in range(49)] + [
+        {"pattern": "a" * 200, "text": "т" * 500}
+    ]
+    resp = await client.patch(url, json={"gate_policy": {"path_notices": edge}})
+    assert resp.status_code == 200, resp.text
+    # Отказы ничего не испортили.
+    assert (
+        len(
+            project_policy.path_notices_of(
+                project_policy.gate_policy_of(await repo.get_project(db, pid))
+            )
+        )
+        == 50
+    )
+
+    # Пустой список допустим, PATCH null удаляет ключ штатно.
+    resp = await client.patch(url, json={"gate_policy": {"path_notices": []}})
+    assert resp.status_code == 200, resp.text
+    resp = await client.patch(url, json={"gate_policy": {"path_notices": None}})
+    assert resp.status_code == 200, resp.text
+    assert "path_notices" not in resp.json()["gate_policy"]
+    row = _by_key(
+        (await client.get("/api/projects/pn-policy/effective-policy")).json()
+    )["path_notices"]
+    assert row["source"] == "default" and row["value"] == []
+
+
+def test_path_notices_pattern_semantics():
+    """#1589: * не пересекает /, ** — любая глубина, включая ноль."""
+    from hub.services.path_notices import match_rules, path_matches
+
+    assert path_matches("deploy/**/*.service", "deploy/x.service")
+    assert path_matches("deploy/**/*.service", "deploy/a/b/x.service")
+    assert not path_matches("deploy/*.service", "deploy/a/x.service")
+    assert path_matches("deploy/*.service", "deploy/x.service")
+    assert path_matches("deploy/review-runner/**", "deploy/review-runner/a/b.py")
+    assert not path_matches("deploy/review-runner/**", "deploy/review-runnerX/a.py")
+    assert not path_matches("deploy/review-runner/**", "deploy/review-runner")
+    assert path_matches("**/x.py", "x.py") and path_matches("**/x.py", "a/b/x.py")
+    assert path_matches("deploy/remote-deploy.sh", "deploy/remote-deploy.sh")
+    assert not path_matches("deploy/remote-deploy.sh", "xdeploy/remote-deploy.sh")
+    assert not path_matches("deploy/remote-deploy.sh", "deploy/remote-deploy.sh.bak")
+    assert path_matches("a.b", "a.b") and not path_matches("a.b", "aXb")
+    assert path_matches("hub/db?.py", "hub/db1.py")
+    # Пересечения: все совпавшие, текст без дублей.
+    rules = [
+        {"pattern": "deploy/**", "text": "один"},
+        {"pattern": "deploy/*.sh", "text": "один"},
+        {"pattern": "deploy/x.sh", "text": "два"},
+    ]
+    got = match_rules(rules, ["deploy/x.sh", "docs/a.md"])
+    assert [n["text"] for n in got] == ["один", "два"]
+    assert got[0]["patterns"] == ["deploy/**", "deploy/*.sh"]
+    assert got[0]["paths"] == ["deploy/x.sh"]
