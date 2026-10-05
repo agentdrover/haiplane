@@ -24,6 +24,11 @@
 # `drain degraded (...)`. The rsync, pip and restart times are NOT part of the
 # guarantee. The drain script is read from staging (the CI rsync has already put
 # it there) and run as the hub's unix user, because the spool belongs to it.
+#
+# Backup (#1590): after the drain acquire and before the rsync a verified snapshot
+# of the hub database is taken (deploy/predeploy-backup.py, see "Verified database
+# backup" below). If it fails the script exits non-zero and the restart is never
+# called. DEPLOY_SKIP_BACKUP=1 (set on THIS side, by hand) is the explicit bypass.
 set -euo pipefail
 
 STAGING="$HOME/haiplane-hub-src-staging"
@@ -58,6 +63,7 @@ DRAIN_CHILD=""
 RENEW_PID=""
 RENEW_LOG=""
 LIVE_DIR=""
+BACKUP_LIVE=""
 
 # The drain script as the hub's unix user. The script text goes in as the
 # argument of `bash -c` (so stdin stays free for the liveness channel below) and
@@ -134,6 +140,7 @@ drain_cleanup() {
   fi
   [ -z "$RENEW_LOG" ] || rm -f "$RENEW_LOG"
   [ -z "$LIVE_DIR" ] || rm -rf "$LIVE_DIR"
+  [ -z "$BACKUP_LIVE" ] || rm -rf "$BACKUP_LIVE"
   exit "$code"
 }
 
@@ -167,6 +174,128 @@ elif [ -r "$REVIEW_DRAIN_SCRIPT" ]; then
 else
   echo "drain degraded (скрипт $REVIEW_DRAIN_SCRIPT недоступен)"
 fi
+
+# --- Verified database backup (#1590) -----------------------------------------
+# After the drain acquire and BEFORE the rsync: when it fails nothing is touched -
+# not the sources, not the environment, not the process. A failed backup means
+# the script exits non-zero here, the restart is never called, and the traps
+# above take our drain marker back. (The old version is NOT promised to stay as
+# it was: the promise is only "no restart".) What the hub writes between this
+# snapshot and the restart is not in it.
+#
+# The line `backup: ok <file> size=<bytes> integrity=ok seconds=<N>` /
+# `backup: failed (<reason>)` / `backup: skipped (<reason>)` is the step's only
+# verdict; CI forwards it to the hub with the deploy report.
+BACKUP_SCRIPT="${BACKUP_SCRIPT:-$STAGING/deploy/predeploy-backup.py}"
+BACKUP_PYTHON="${BACKUP_PYTHON:-/opt/haiplane-hub/venv/bin/python}"
+BACKUP_KEEP="${BACKUP_KEEP:-10}"
+BACKUP_TIMEOUT="${BACKUP_TIMEOUT:-300}"
+BACKUP_DIR="${BACKUP_DIR:-}"
+HUB_DB=""
+HUB_DB_WHY=""
+
+backup_fail() {
+  local reason
+  reason="$(printf '%s' "$1" | tr '\r\n' '  ')"
+  echo "backup: failed ($reason)"
+  exit 1
+}
+
+# Value of VAR from KEY=VALUE lines on stdin: the last one, outer quotes removed.
+env_value() {
+  sed -n "s/^$1=//p" | tail -n 1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+# The EFFECTIVE database path (HAIPLANE_HUB_DB), never a guess. First the
+# environment of the running hub process; with no process (or no way to read
+# it), the unit: Environment, then EnvironmentFiles (which override it).
+# Sets HUB_DB, or HUB_DB_WHY when the path cannot be established.
+resolve_hub_db() {
+  local pid environ line file soft content
+  pid="$(systemctl show haiplane-hub -p MainPID --value 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    if environ="$(sudo -n cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n')"; then
+      HUB_DB="$(printf '%s\n' "$environ" | env_value HAIPLANE_HUB_DB)"
+      [ -n "$HUB_DB" ] || HUB_DB_WHY="HAIPLANE_HUB_DB не задан в окружении процесса хаба (pid $pid)"
+      return 0
+    fi
+  fi
+  HUB_DB="$(systemctl show haiplane-hub -p Environment --value 2>/dev/null |
+    tr ' ' '\n' | env_value HAIPLANE_HUB_DB || true)"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    soft=0
+    case "$line" in *"(ignore_errors=yes)") soft=1 ;; esac
+    file="${line%% (ignore_errors=*}"
+    file="${file#-}"
+    if content="$(sudo -n cat "$file" 2>/dev/null)"; then
+      line="$(printf '%s\n' "$content" | env_value HAIPLANE_HUB_DB)"
+      [ -z "$line" ] || HUB_DB="$line"
+    elif [ "$soft" = 0 ]; then
+      HUB_DB=""
+      HUB_DB_WHY="EnvironmentFile $file юнита haiplane-hub не читается: путь базы не установлен"
+      return 0
+    fi
+  done < <(systemctl show haiplane-hub -p EnvironmentFiles --value 2>/dev/null || true)
+  [ -n "$HUB_DB" ] || HUB_DB_WHY="HAIPLANE_HUB_DB не найден ни в процессе хаба, ни в Environment/EnvironmentFiles юнита haiplane-hub"
+}
+
+backup_step() {
+  local rc=0 out sha err
+  if [ "${DEPLOY_SKIP_BACKUP:-}" = 1 ]; then
+    echo "backup: skipped (обход DEPLOY_SKIP_BACKUP=1)"
+    return 0
+  fi
+  resolve_hub_db
+  [ -n "$HUB_DB" ] || backup_fail "$HUB_DB_WHY"
+  [ -r "$BACKUP_SCRIPT" ] || backup_fail "скрипт снимка $BACKUP_SCRIPT недоступен"
+  # The sha comes from CI: the file the CI rsync put into staging (a forced
+  # command allows no arguments or environment); the variable wins when set.
+  sha="${DEPLOY_SHA:-}"
+  [ -n "$sha" ] || sha="$(head -c 64 "$STAGING/.deploy-sha" 2>/dev/null || true)"
+  if [[ "$sha" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+    sha="$(printf '%s' "${sha:0:7}" | tr 'A-F' 'a-f')"
+  else
+    sha="manual"
+  fi
+  BACKUP_LIVE="$(mktemp -d)"
+  mkfifo "$BACKUP_LIVE/live"
+  # Same shape as the drain: the hub user's process in the BACKGROUND with a
+  # liveness fifo as stdin (this script holds the write end as fd 8), so a
+  # signal reaches the trap at once and EOF makes the step clean up its files.
+  # fd 7 (the drain renewer) is closed for it.
+  # The redirections are ours on purpose (the deploy user's files, not the hub user's).
+  # shellcheck disable=SC2024
+  sudo -n -u "$SERVICE_USER" env \
+    "BACKUP_DB=$HUB_DB" "BACKUP_DIR=$BACKUP_DIR" "BACKUP_SHA=$sha" \
+    "BACKUP_KEEP=$BACKUP_KEEP" "BACKUP_TIMEOUT=$BACKUP_TIMEOUT" BACKUP_LIVENESS=1 \
+    bash -c 'exec "$0" -c "$1"' "$BACKUP_PYTHON" "$(cat "$BACKUP_SCRIPT")" \
+    <"$BACKUP_LIVE/live" >"$BACKUP_LIVE/out" 2>"$BACKUP_LIVE/err" 7>&- &
+  DRAIN_CHILD=$!
+  exec 8>"$BACKUP_LIVE/live"
+  wait "$DRAIN_CHILD" || rc=$?
+  exec 8>&-
+  DRAIN_CHILD=""
+  out="$(head -n 1 "$BACKUP_LIVE/out" 2>/dev/null || true)"
+  if [ "$rc" -eq 0 ]; then
+    case "$out" in
+      "ok "* | "skipped ("*)
+        echo "backup: $out"
+        return 0
+        ;;
+    esac
+  fi
+  case "$out" in
+    "failed ("*)
+      echo "backup: $out"
+      exit 1
+      ;;
+  esac
+  err="$(tail -c 300 "$BACKUP_LIVE/err" 2>/dev/null || true)"
+  backup_fail "шаг снимка не отработал, rc=$rc: $err"
+}
+
+backup_step
 
 sudo rsync -a --delete "$STAGING/" "$DEST/" 7>&- 8>&-
 sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DEST" 7>&- 8>&-

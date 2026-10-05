@@ -5881,6 +5881,7 @@ async def record_release(
     ref: str = "",
     status: str = RELEASE_SUCCESS,
     source: str = "",
+    backup: str = "",
 ) -> int:
     """Record one deploy attempt and return its id.
 
@@ -5888,8 +5889,13 @@ async def record_release(
     about the pipeline, and dropping it would make the failure look like it
     never happened. Readers ask for the last SUCCESSFUL release, so a failure
     never becomes the state of production.
+
+    ``backup`` (#1590) is the pre-deploy backup verdict. A repeat report of the
+    same (project, sha, status) updates it; a report WITHOUT it never erases
+    one that is already known.
     """
     sha, status = deployed_sha.strip(), status.strip()
+    backup = backup.strip()
     # #495: CI runs get re-run, and a re-run redelivers the same callback. A
     # second row for the same (project, sha, status) would say the commit was
     # deployed twice, turning the release history into noise — so the existing
@@ -5905,12 +5911,18 @@ async def record_release(
         )
     )
     if existing:
-        return int(dict(existing[0])["id"])
+        release_id = int(dict(existing[0])["id"])
+        if backup:
+            await db.execute(
+                "UPDATE releases SET backup = ? WHERE id = ?", (backup, release_id)
+            )
+            await db.commit()
+        return release_id
 
     cursor = await db.execute(
-        "INSERT INTO releases (project_id, deployed_sha, ref, status, source) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (project_id, sha, ref.strip(), status, source.strip()),
+        "INSERT INTO releases (project_id, deployed_sha, ref, status, source, backup) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (project_id, sha, ref.strip(), status, source.strip(), backup),
     )
     await db.commit()
     return int(cursor.lastrowid or 0)
