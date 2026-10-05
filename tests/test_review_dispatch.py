@@ -16806,3 +16806,156 @@ def test_deep_http_prompt_takes_the_harness_from_the_brief() -> None:
     # lite харнесса не требует и версию не выдумывает.
     lite = _matrix_prompt(LITE, True)
     assert "multi-agent-review" not in lite and "hub_get_skill" not in lite
+
+
+# ---------------------------------------------------------------------------
+# #1588: выкладка хаба — новые локальные прогоны не стартуют
+# ---------------------------------------------------------------------------
+
+
+def _runner_spool(monkeypatch, tmp_path) -> Path:
+    """Локальный путь по транспорту runner, готовый целиком: служба жива."""
+    spool = tmp_path / "drain-spool"
+    spool.mkdir(mode=0o770)
+    (spool / "heartbeat").write_text("{}")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TRANSPORT", "runner")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SPOOL_DIR", str(spool))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_MODEL", _QWEN)
+    return spool
+
+
+def _marker_body(ahead: int) -> bytes:
+    import time
+
+    return f"owner=deploy-1588\nexpires={int(time.time()) + ahead}\n".encode()
+
+
+async def test_local_first_falls_back_to_cloud_while_draining(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """AC-4 (#1588): во время выкладки local-first уходит в облако с причиной.
+
+    Локальный путь настроен целиком, принципал действителен, облако разрешено;
+    маркер выкладки свежий. Старт хаба маркер не снимает, правка проекта без
+    облака не получает 422 (запрет не живёт в review_reach), а просроченный
+    маркер заказу не мешает.
+    """
+    from fastapi import HTTPException
+
+    from hub.app import _refuse_unrunnable_review
+    from hub.services.review_dispatch import review_reach, wait_for_local_runs
+    from tests.test_diagnostics import _running_app
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-dr"}, "run": {"id": "r-dr"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    spool = _runner_spool(monkeypatch, tmp_path)
+    marker = spool / "draining"
+    fresh = _marker_body(900)
+    marker.write_bytes(fresh)
+
+    # Старт хаба (настоящий lifespan) маркер не снимает и не правит.
+    async with _running_app():
+        assert marker.read_bytes() == fresh, "старт хаба тронул маркер выкладки"
+        assert local_reviewer.drain_refusal(), "после старта запрет всё ещё действует"
+    assert marker.read_bytes() == fresh
+
+    # Достижимость не меняется: ни форма проекта, ни инвариант записи её не
+    # знают. Локальный путь на gitverse остаётся способом, а правка проекта —
+    # допустимой; на контроле без локального пути та же правка получает 422.
+    reach = await review_reach(db, "gitverse")
+    assert reach.runnable and not reach.local_missing, "выкладка не ломает готовность"
+    pid = await repo.create_project(
+        db, slug="drain-edit", name="D", repo_name="o/r", workspace_path="/tmp/ws"
+    )
+    await repo.update_project(
+        db, pid, gate_policy=json.dumps({"review": "dispatch", "verdict": "auto"})
+    )
+    await db.commit()
+    before = await repo.get_project(db, pid)
+    await _refuse_unrunnable_review(db, before, {"forge": "gitverse"})
+    await _refuse_unrunnable_review(
+        db, before, {"gate_policy": json.dumps({"review": "dispatch"})}
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TRANSPORT", "direct")
+    with pytest.raises(HTTPException) as refused:
+        await _refuse_unrunnable_review(db, before, {"forge": "gitverse"})
+    assert refused.value.status_code == 422, "контроль: без пути запись отказывает"
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TRANSPORT", "runner")
+
+    # local-first deep во время выкладки: облако, причина в карточке, локального
+    # заказа нет.
+    task_id = await _submitted(
+        client, db, "lf-drain", policy=_LOCAL_FIRST, diff=_DIFF_506
+    )
+    await wait_for_local_runs()
+    await db.commit()
+    assert len(recorder.calls) == 1, "облако заказано вместо локального"
+    rows = await _all_dispatches(db, task_id)
+    assert [(r["channel"], r["profile"], r["status"]) for r in rows] == [
+        ("cloud", "deep", "active")
+    ], rows
+    card = await _card_text(db, task_id)
+    assert "идёт выкладка" in card, card
+    assert "deep_reviewer" in card, "и сказано, что облако вместо локального"
+    assert [p for p in spool.iterdir() if p.name.startswith("job-")] == [], (
+        "ни одного задания службе"
+    )
+    assert marker.read_bytes() == fresh, "заказ чужой маркер не снял"
+
+    # Просроченный маркер заказу не мешает: local-first идёт локально.
+    marker.write_bytes(_marker_body(-30))
+
+    async def _the_service(jobdir, limit, started):
+        report = json.dumps(_LOCAL_REPORT, ensure_ascii=False)
+        return local_reviewer.LocalRun(
+            rc=0,
+            output=f"```haiplane-review\n{report}\n```",
+            dropped=0,
+            timed_out=False,
+            duration_ms=1,
+        )
+
+    monkeypatch.setattr(local_reviewer, "_await_result", _the_service)
+    recorder.calls.clear()
+    later = await _submitted(
+        client, db, "lf-expired", policy=_LOCAL_FIRST, diff=_DIFF_506
+    )
+    await wait_for_local_runs()
+    await db.commit()
+    assert recorder.calls == [], "просроченный маркер увёл заказ в облако"
+    assert [(r["channel"], r["profile"]) for r in await _all_dispatches(db, later)] == [
+        ("local", "deep")
+    ]
+
+
+async def test_no_cloud_forge_names_the_deploy_instead_of_a_verdict_less_silence(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1588: форж без облака во время выкладки — вердикт человеку с причиной."""
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-gv"}, "run": {"id": "r-gv"}})
+    _wire(monkeypatch, recorder)
+    await _local_principal(db, monkeypatch)
+    spool = _runner_spool(monkeypatch, tmp_path)
+    (spool / "draining").write_bytes(_marker_body(900))
+
+    task_id = await _submitted(
+        client,
+        db,
+        "gv-drain",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+        diff=_DIFF_506,
+    )
+    await wait_for_local_runs()
+    await db.commit()
+    assert recorder.calls == [], "на этом форже облако не зовут"
+    assert await _all_dispatches(db, task_id) == []
+    card = await _card_text(db, task_id)
+    assert "идёт выкладка" in card and "Вердикт остаётся человеку" in card, card

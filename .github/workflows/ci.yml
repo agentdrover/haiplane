@@ -339,6 +339,10 @@ jobs:
     # Only deploy real merges into main, never on pull_request runs.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment: production
+    # #1588: деплой ждёт идущие локальные deep-ревью до 1800 с (deploy/review-drain.sh),
+    # потом rsync, pip, restart и health. Без своего предела job жил бы до 6 часов
+    # GitHub по умолчанию; 45 мин = срок ожидания + запас на выкладку.
+    timeout-minutes: 45
     concurrency:
       group: deploy-production
       cancel-in-progress: false
@@ -379,7 +383,10 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
+          # Keepalive: на время ожидания (до 1800 с) в канале бывает тихо, и
+          # промежуточный узел не должен счесть соединение мёртвым (#1588).
           ssh -i "$HOME/.ssh/id_deploy" -o BatchMode=yes \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
             "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' < deploy/remote-deploy.sh
 
       # #496: tell the Hub what is now running. Until this step existed the
