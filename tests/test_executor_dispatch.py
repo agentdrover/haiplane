@@ -3279,3 +3279,176 @@ async def test_starting_ref_is_committed_before_the_provider_call(db, monkeypatc
     assert result.launched, result
     assert seen["in_transaction"] is False
     assert (await _row(db, result.row_id))["starting_ref"] == "develop"
+
+
+# ---- #1583: снятие брошенной брони не держит write-лок на вызове провайдера ----
+
+
+async def _abandon(db: aiosqlite.Connection, task_id: int) -> int:
+    """Бронь без агента, старше всех попыток заказа; закоммичена."""
+    stale = await repo.create_executor_run(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="",
+        run_id="",
+        model=_EXEC_MODEL,
+    )
+    await db.execute(
+        "UPDATE executor_runs SET started_at=datetime('now', '-2 hours') WHERE id=?",
+        (stale,),
+    )
+    await db.commit()
+    return stale
+
+
+def _watch_lock(monkeypatch, db, seen: dict) -> None:
+    async def _create(**kw):
+        seen["in_transaction"] = db.in_transaction
+        return _CREATED, None
+
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _create)
+
+
+async def _is_abandoned(db: aiosqlite.Connection, task_id: int, row_id: int) -> bool:
+    old = next(
+        dict(r)
+        for r in await repo.list_executor_runs(db, task_id)
+        if dict(r)["id"] == row_id
+    )
+    return (old["outcome"], old["reason"]) == (
+        "failed",
+        el.REASON_RESERVATION_ABANDONED,
+    )
+
+
+async def _door_launch(db, human):
+    project, task_id = await _launch_project(db, slug="exec-door-launch")
+    return task_id, lambda: el.launch_executor(db, project, issuer_principal_id=human)
+
+
+async def _door_repair(db, human):
+    _, task_id = await _task_with_findings(db, slug="exec-door-repair")
+    await repo.update_task(db, task_id, status="open")
+    return task_id, lambda: el.repair_executor(
+        db, task_id, issuer_principal_id=human, issuer="o"
+    )
+
+
+async def _door_merge(db, human):
+    _, task_id = await _task_in_base_conflict(db, slug="exec-door-merge")
+    return task_id, lambda: el.merge_executor(
+        db, task_id, issuer_principal_id=human, issuer="o"
+    )
+
+
+async def _door_submit_only(db, human):
+    _, task_id = await _launch_project(db, slug="exec-door-silent")
+    await repo.update_task(db, task_id, status="running", submission_generation=0)
+    order = el.SubmitOnly(
+        run_id="run-1",
+        generation=1,
+        branch=f"task-{task_id}/w",
+        tip="c" * 40,
+        ci="success",
+    )
+    return task_id, lambda: el.submit_only_executor(db, task_id, order)
+
+
+async def _door_continue(db, human):
+    _, task_id = await _launch_project(db, slug="exec-door-continue")
+    await repo.update_task(db, task_id, status="needs_info")
+    order = el.ContinueOrder(
+        run_id="run-1",
+        question="q",
+        answer="a",
+        question_at="",
+        branch="",
+        pushed=False,
+    )
+    return task_id, lambda: el.continue_executor(db, task_id, order)
+
+
+@pytest.mark.parametrize(
+    "door",
+    [_door_launch, _door_repair, _door_merge, _door_submit_only, _door_continue],
+)
+async def test_an_abandoned_reservation_does_not_hold_the_lock_over_the_order(
+    db, monkeypatch, door
+):
+    """Страж (#1583, класс #1428): на каждой из пяти дверей заказа, с брошенной
+    бронью задачи, во время вызова провайдера транзакции нет."""
+    seen: dict = {}
+    _launch_config(monkeypatch)
+    _watch_lock(monkeypatch, db, seen)
+    human = await _human(db)
+    task_id, run = await door(db, human)
+    stale = await _abandon(db, task_id)
+
+    result = await run()
+
+    assert result.launched, result
+    assert seen["in_transaction"] is False
+    assert await _is_abandoned(db, task_id, stale)
+
+
+async def test_live_run_commits_the_abandoned_reservation_itself(
+    db, db_dsn, monkeypatch
+):
+    """_live_run вне _reserve: после возврата транзакции нет, закрытие видно
+    другому соединению."""
+    _launch_config(monkeypatch)
+    _, task_id = await _launch_project(db, slug="exec-abandon-live")
+    stale = await _abandon(db, task_id)
+
+    assert await el._live_run(db, task_id) == ""
+
+    assert db.in_transaction is False
+    # Второе соединение: запись закоммичена, а не висит на первом.
+    async with aiosqlite.connect(db_dsn, uri=True) as other:
+        other.row_factory = aiosqlite.Row
+        row = await (
+            await other.execute(
+                "SELECT outcome, reason FROM executor_runs WHERE id=?", (stale,)
+            )
+        ).fetchone()
+    assert (row["outcome"], row["reason"]) == (
+        "failed",
+        el.REASON_RESERVATION_ABANDONED,
+    )
+
+
+async def test_two_presses_over_an_abandoned_reservation_pay_one_agent(
+    db, db_dsn, monkeypatch
+):
+    """Снятие брони внутри _reserve атомарно с бронью (#1583): два нажатия над
+    брошенной бронью — оплачен один исполнитель."""
+    import asyncio
+
+    from hub import db as db_module
+
+    _launch_config(monkeypatch)
+    calls: list[dict] = []
+
+    async def _slow_create(**kw):
+        calls.append(kw)
+        await asyncio.sleep(0.2)
+        return _CREATED, None
+
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", _slow_create)
+    project, task_id = await _launch_project(db, slug="exec-abandon-race")
+    human_id = await _human(db)
+    await _abandon(db, task_id)
+    first = await db_module.connect(db_dsn)
+    second = await db_module.connect(db_dsn)
+    try:
+        results = await asyncio.gather(
+            el.launch_executor(first, project, issuer_principal_id=human_id),
+            el.launch_executor(second, project, issuer_principal_id=human_id),
+        )
+    finally:
+        await first.close()
+        await second.close()
+
+    assert len(calls) == 1
+    assert sorted(r.launched for r in results) == [False, True], results

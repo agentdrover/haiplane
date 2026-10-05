@@ -212,13 +212,17 @@ async def _live_run(db: aiosqlite.Connection, task_id: int) -> str:
             # Бронь без агента старше всех попыток заказа: запрос, что её
             # положил, не дожил до ответа провайдера (выкат, падение). Иначе
             # задача навсегда читалась бы «уже идёт прогон».
-            await repo.update_executor_run(
-                db,
-                int(r["id"]),
-                outcome=OUTCOME_FAILED,
-                reason=REASON_RESERVATION_ABANDONED,
-                finish=True,
-            )
+            # #1583: своя транзакция — запись коммитится здесь, а не чужим
+            # коммитом дальше по пути. Внутри ``_reserve`` она вложенная и не
+            # коммитит: снятие брони остаётся атомарным с проверкой и бронью.
+            async with write_transaction(db):
+                await repo.update_executor_run(
+                    db,
+                    int(r["id"]),
+                    outcome=OUTCOME_FAILED,
+                    reason=REASON_RESERVATION_ABANDONED,
+                    finish=True,
+                )
             continue
         return f"{REASON_ALREADY_RUNNING} #{task_id} ({r['agent_id'] or 'бронь'})"
     return ""
