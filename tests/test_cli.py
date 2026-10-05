@@ -1065,6 +1065,20 @@ def test_cmd_submit_review() -> None:
     )
 
 
+def test_cmd_submit_review_prints_path_notices_as_returned() -> None:
+    """#1589: CLI печатает ответ хаба как есть — поле path_notices доходит."""
+    notices = {"generation": 1, "state": "matched", "text": "обновить копию"}
+    result = {"id": 42, "status": "review", "path_notices": notices}
+    out = StringIO()
+    args = argparse.Namespace(task_id=42, agent="dev", summary="")
+    with (
+        patch.object(cli, "_api", MagicMock(return_value=result)),
+        patch("sys.stdout", new=out),
+    ):
+        assert cli.cmd_submit_review(args) == 0
+    assert json.loads(out.getvalue())["path_notices"] == notices
+
+
 def test_cmd_review_brief() -> None:
     mock_api = MagicMock(return_value={"task_id": 42, "title": "T"})
     args = argparse.Namespace(task_id=42)

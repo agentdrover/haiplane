@@ -394,6 +394,13 @@ class GitOpsPlugin(Protocol):
         base_branch: str | None = None,
         repo: str | None = None,
     ) -> list[str] | None: ...
+    async def branch_touched_paths(
+        self,
+        branch: str,
+        base_branch: str | None = None,
+        repo: str | None = None,
+        head_sha: str = "",
+    ) -> tuple[list[str], str] | None: ...
     async def commit_exists(self, repo: str, sha: str) -> bool | None: ...
     async def commit_diff(
         self, repo: str, base: str, sha: str, *, context: int = 3

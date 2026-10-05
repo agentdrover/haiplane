@@ -2323,12 +2323,20 @@ async def hub_submit_for_review(
         )
     if task.get("lifecycle_hint"):
         message += f"\nLifecycle: {task['lifecycle_hint']}"
+    message += _path_notices_text(task.get("path_notices"))
     return await _task_mutation_response(
         task_id,
         message,
         prior_status=prior_status,
         task=task,
     )
+
+
+def _path_notices_text(block: dict[str, Any] | None) -> str:
+    """Предупреждения по путям диффа (#1589): только matched и unknown."""
+    if not block or block.get("state") == "none" or not block.get("text"):
+        return ""
+    return "\n" + str(block["text"])
 
 
 def _generation_review_line(brief: dict[str, Any]) -> str:
@@ -2531,6 +2539,9 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
     parts.extend(_brief_evidence_lines(brief))
     if brief.get("stacking_warning"):
         parts.append(f"\n{brief['stacking_warning']}")
+    notices_text = _path_notices_text(brief.get("path_notices"))
+    if notices_text:
+        parts.append(notices_text)
     if brief.get("latest_submission_summary"):
         parts.append(f"\nLatest submission:\n{brief['latest_submission_summary']}")
     latest_review = brief.get("latest_review")

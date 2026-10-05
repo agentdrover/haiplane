@@ -3094,6 +3094,42 @@ async def get_submission(
     return rows[0] if rows else None
 
 
+async def insert_path_notice_result(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    generation: int,
+    sha: str,
+    state: str,
+    reason: str,
+    notices: str,
+) -> bool:
+    """Record the path-notice result of one generation once (#1589).
+
+    Returns True when a row was written. A second write for the same
+    generation changes nothing: the result is fixed at submission.
+    """
+    cur = await db.execute(
+        "INSERT INTO path_notice_results "
+        "(task_id, generation, sha, state, reason, notices) "
+        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(task_id, generation) DO NOTHING",
+        (task_id, generation, sha, state, reason, notices),
+    )
+    return (cur.rowcount or 0) > 0
+
+
+async def get_path_notice_result(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> aiosqlite.Row | None:
+    """The stored path-notice result of this generation, or None (#1589)."""
+    rows = await fetchall(
+        db,
+        "SELECT * FROM path_notice_results WHERE task_id=? AND generation=?",
+        (task_id, generation),
+    )
+    return rows[0] if rows else None
+
+
 async def previous_submission(
     db: aiosqlite.Connection, task_id: int, generation: int
 ) -> aiosqlite.Row | None:

@@ -41,7 +41,7 @@ from hub.mcp_envelope import enrich_error_payload
 from hub.models import DEFAULT_FORGE
 
 from hub import git_policy
-from hub.commit_scope import parse_porcelain_paths
+from hub.commit_scope import parse_name_status_paths, parse_porcelain_paths
 
 log = logging.getLogger(__name__)
 
@@ -2675,6 +2675,57 @@ class GitOpsIntegration:
             )
             return None
         return [p for p in (out or "").split("\0") if p.strip()]
+
+    async def branch_touched_paths(
+        self,
+        branch: str,
+        base_branch: str | None = None,
+        repo: str | None = None,
+        head_sha: str = "",
+    ) -> tuple[list[str], str] | None:
+        """Every path the branch touches, BOTH ends of a rename (#1589).
+
+        A separate call from ``branch_diff_paths`` on purpose: that one feeds
+        the surface check and the risk recompute, which compare the NEW name
+        only, and must not change behaviour. This one answers a different
+        question — "which watched path did the change touch" — and a file
+        moved out of a watched directory touches it, as does a deletion.
+
+        Returns ``(paths, sha_read)`` or None when unknowable. ``sha_read`` is
+        the commit the paths were actually read for: ``head_sha`` when the
+        submission pinned one, else the branch tip resolved origin-first. No
+        fetch here: the caller has just run ``branch_diff_paths``, which does.
+        ``-M`` is explicit so the answer does not hang on ``diff.renames``;
+        ``-z`` for the same reason as everywhere else (#555).
+        """
+        repo = repo or _repo_root()
+        base = _resolve_base(base_branch)
+        if not (branch or "").strip():
+            return None
+        base_sha = await _resolve_ref_remote_first(base, repo)
+        if base_sha is None:
+            return None
+        head = (head_sha or "").strip() or await _resolve_ref_remote_first(branch, repo)
+        if not head:
+            return None
+        rc, out, err = await _git(
+            "diff",
+            "--name-status",
+            "-z",
+            "-M",
+            f"{base_sha}...{head}",
+            repo=repo,
+            check=False,
+        )
+        if rc != 0:
+            log.warning(
+                "branch_touched_paths: diff failed for %s...%s: %s",
+                base_sha,
+                head,
+                (err or "").strip(),
+            )
+            return None
+        return parse_name_status_paths(out or ""), head
 
     async def auto_commit(
         self,

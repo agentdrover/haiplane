@@ -47,6 +47,7 @@ from hub.integrations.registry import plugins
 from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
 from hub.services import (
     prevention_gate,
+    project_policy,
     red_test_gate,
     submission_contract,
     verdict_text,
@@ -2245,6 +2246,10 @@ class SubmitContext:
     reported: str = ""
     diff_paths: list[str] | None = None
     diff_reason: str = ""
+    #: #1589: исход шага path_notices; None — правил у проекта нет.
+    path_notices: Any = None
+    #: #1589: то, что записано на поколение, — для ответа на сдачу.
+    path_notices_view: Any = None
     risk_fields: dict[str, Any] = dc_field(default_factory=dict)
     risk_alert: str = ""
     risk_note: str = ""
@@ -2400,6 +2405,25 @@ async def _step_resolve_diff(state: SubmitContext) -> None:
         state.diff_paths,
         state.diff_reason,
         await risk_map_for_task(state.db, state.task_id),
+    )
+
+
+async def _step_path_notices(state: SubmitContext) -> None:
+    """Пути диффа против правил проекта path_notices (#1589).
+
+    Не отказывает и ничего не исполняет: исход кладётся в контекст, а запись
+    поколения и строку ленты делает общая запись заметок сдачи. Пути читаются
+    для ТОГО ЖЕ коммита, что закреплён сдачей. Без правил в политике шаг
+    ничего не читает.
+    """
+    from hub.services import path_notices
+
+    state.path_notices = await path_notices.compute(
+        state.db,
+        state.task,
+        submission_sha=state.submission_sha,
+        diff_paths=state.diff_paths,
+        diff_reason=state.diff_reason,
     )
 
 
@@ -2912,6 +2936,7 @@ SUBMIT_STEPS_AFTER_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
     Step("surfaces", _step_surfaces, mode=policy("SDD_SURFACES")),
     Step("finding_outcomes", _step_finding_outcomes, mode=policy("FINDING_OUTCOME")),
     Step("submit_rules", _step_submit_rules, mode=policy("SUBMIT_RULES")),
+    Step("path_notices", _step_path_notices, refuses=False),
     Step("delivery_pr", _step_delivery_pr, refuses=False),
 )
 
@@ -2979,6 +3004,9 @@ HEADLESS_STEPS: tuple[Step[SubmitContext], ...] = (
     ),
     Step("submit_rules", _step_submit_rules, mode=capped_at_warn("SUBMIT_RULES")),
     Step("pin_submission_sha", _step_pin_submission_sha, refuses=False),
+    # #1589: после закрепления коммита — пути читаются для него, а не для
+    # вершины, которая успела уйти вперёд.
+    Step("path_notices", _step_path_notices, refuses=False),
     Step("delivery_pr", _step_delivery_pr, refuses=False),
 )
 
@@ -3190,6 +3218,11 @@ async def _same_sha_noop_response(state: SubmitContext) -> TaskView:
         "открыто, ревью и вердикт остаются текущими как были (#1265)."
     )
     view.wait_baseline = wait_baseline_for(dict(row))
+    # #1589: повтор того же коммита возвращает СОХРАНЁННЫЙ результат поколения
+    # и не пишет второй строки ленты.
+    from hub.services import path_notices
+
+    view.path_notices = await path_notices.view_for_generation(db, task_id, generation)
     return view
 
 
@@ -3355,6 +3388,14 @@ async def _write_submission_notices(
     попасть в базу вместе, иначе лента расскажет о переходе, которого не
     было, или умолчит о состоявшемся.
     """
+    if state.path_notices is not None:
+        # #1589: ОДНА запись на поколение, в транзакции вызывающего — вместе с
+        # самой сдачей. Исход None (правил нет) не пишет ничего.
+        from hub.services import path_notices
+
+        state.path_notices_view = await path_notices.record(
+            state.db, state.task_id, state.path_notices
+        )
     report_lines = [
         ln for ln in ([state.surface_note, state.outcome_note] + state.rule_lines) if ln
     ]
@@ -3607,6 +3648,8 @@ async def _apply_submission(state: SubmitContext) -> TaskView:
     # A snapshot of the current values, never of the desired ones: a baseline
     # describing the future would be the same guess it replaces.
     view.wait_baseline = wait_baseline_for(dict(row))
+    # #1589: результат, записанный этой сдачей; None — правил у проекта нет.
+    view.path_notices = state.path_notices_view
 
     await _try_restore_pair_workspace(db, task_id)
     return view
@@ -5049,6 +5092,56 @@ async def _finish_deferred_done(
         await db.commit()
 
 
+async def _done_report_warnings(
+    db: aiosqlite.Connection, before: dict[str, Any], kind: str, undelivered: str
+) -> list[str]:
+    """Заметки к ответу на отчёт: недоставленное (#498) и пути диффа (#1589)."""
+    notes = [undelivered] if undelivered else []
+    if kind == "done":
+        notes.append(await _path_notice_warning(db, before))
+    return [note for note in notes if note]
+
+
+async def _path_notice_warning(db: aiosqlite.Connection, before: dict[str, Any]) -> str:
+    """Текст path_notices, если ЭТОТ done-отчёт открыл новое поколение (#1589)."""
+    from hub.services import path_notices
+
+    row = await repo.get_task(db, int(before["id"]))
+    if row is None:
+        return ""
+    generation = int(dict(row).get("submission_generation") or 0)
+    if generation <= int(before.get("submission_generation") or 0):
+        return ""
+    return path_notices.shown_text(
+        await path_notices.view_for_generation(db, int(before["id"]), generation)
+    )
+
+
+async def _record_path_notices_for_done(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> None:
+    """path_notices для done-маршрута, где конвейер гейтов не работает (#1589).
+
+    Дешёвое чтение политики первым: без правил git не трогается. Не коммитит.
+    """
+    from hub.services import path_notices
+
+    rules = project_policy.path_notices_of(
+        await project_policy.gate_policy_for_task(db, int(task["id"]))
+    )
+    if not rules:
+        return
+    paths, reason = await _resolve_branch_diff(db, task)
+    sha, _sha_reason = await resolve_branch_tip(
+        db, int(task["id"]), task.get("branch") or ""
+    )
+    outcome = await path_notices.compute(
+        db, task, submission_sha=sha, diff_paths=paths, diff_reason=reason
+    )
+    if outcome is not None:
+        await path_notices.record(db, int(task["id"]), outcome)
+
+
 async def add_update(
     db: aiosqlite.Connection,
     task_id: int,
@@ -5202,6 +5295,9 @@ async def add_update(
                         # path may not complete unreviewed work — the done
                         # report becomes a submission for client-driven review.
                         generation = await repo.bump_submission_generation(db, task_id)
+                        # #1589: и этот вход — сдача; без гейтов конвейера он
+                        # иначе остался бы без предупреждений по путям.
+                        await _record_path_notices_for_done(db, task)
                         await repo.update_task(
                             db, task_id, status="review", review_job_id=None
                         )
@@ -5335,8 +5431,7 @@ async def add_update(
 
     update_row = await repo.get_task_update_by_id(db, update_id)
     view = TaskUpdateView(**dict(update_row))  # type: ignore[arg-type]
-    if undelivered:
-        view.warnings = [undelivered]
+    view.warnings = await _done_report_warnings(db, task, body.kind, undelivered)
     return view
 
 

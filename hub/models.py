@@ -371,6 +371,10 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # отдельного выката): срок исхода считается от даты мержа. Не гейт и
     # ничего не делегирует. Читатель: project_policy.merge_is_delivery_of.
     "merge_is_delivery",
+    # #1589: предупреждения по путям диффа сдачи — список {pattern, text}. Не
+    # гейт, ничего не блокирует и не делегирует. Читатель:
+    # project_policy.path_notices_of.
+    "path_notices",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -391,6 +395,53 @@ def _validate_merge_is_delivery(policy: dict[str, Any]) -> None:
             "gate_policy merge_is_delivery must be true or false, "
             f"got: {policy['merge_is_delivery']!r}"
         )
+
+
+PATH_NOTICES_MAX_RULES = 50
+PATH_NOTICES_MAX_PATTERN = 200
+PATH_NOTICES_MAX_TEXT = 500
+
+
+def _validate_path_notices(policy: dict[str, Any]) -> None:
+    """``path_notices`` — список {pattern, text} в заданных пределах (#1589).
+
+    Пустой список допустим и значит «правил нет». Отказ громкий: правило,
+    выброшенное молча, читалось бы как «путь описан», когда не описан ничего.
+    Значения нормализуются (пробелы по краям срезаются) на месте.
+    """
+    if "path_notices" not in policy:
+        return
+    rules = policy["path_notices"]
+    if not isinstance(rules, list):
+        raise ValueError(
+            "gate_policy path_notices must be a list of {pattern, text}, "
+            f"got: {type(rules).__name__}"
+        )
+    if len(rules) > PATH_NOTICES_MAX_RULES:
+        raise ValueError(
+            f"gate_policy path_notices holds at most {PATH_NOTICES_MAX_RULES} "
+            f"rules, got {len(rules)}"
+        )
+    cleaned: list[dict[str, str]] = []
+    for index, rule in enumerate(rules):
+        where = f"gate_policy path_notices[{index}]"
+        if not isinstance(rule, dict) or set(rule) != {"pattern", "text"}:
+            raise ValueError(f"{where} must be an object with pattern and text")
+        pattern, text = rule["pattern"], rule["text"]
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ValueError(f"{where}.pattern must be a non-empty string")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"{where}.text must be a non-empty string")
+        if len(pattern.strip()) > PATH_NOTICES_MAX_PATTERN:
+            raise ValueError(
+                f"{where}.pattern is longer than {PATH_NOTICES_MAX_PATTERN} chars"
+            )
+        if len(text.strip()) > PATH_NOTICES_MAX_TEXT:
+            raise ValueError(
+                f"{where}.text is longer than {PATH_NOTICES_MAX_TEXT} chars"
+            )
+        cleaned.append({"pattern": pattern.strip(), "text": text.strip()})
+    policy["path_notices"] = cleaned
 
 
 def _validate_count(policy: dict[str, Any], key: str) -> None:
@@ -1468,6 +1519,34 @@ class ProfileDowngradeView(BaseModel):
     headline: str = ""
 
 
+class PathNoticeItem(BaseModel):
+    """One matched warning: the text, the rule patterns and the paths it hit (#1589)."""
+
+    text: str
+    patterns: list[str] = Field(default_factory=list)
+    paths: list[str] = Field(default_factory=list)
+    #: Paths beyond the stored cap, so a long list stays readable.
+    more_paths: int = 0
+
+
+class PathNoticesView(BaseModel):
+    """The path-notice result recorded for ONE submission generation (#1589).
+
+    ``state``: ``matched`` (notices non-empty), ``none`` (diff read, no rule
+    hit) or ``unknown`` (diff not read; ``reason`` says why). ``sha`` is the
+    commit the paths were read for. Present only when the project had a
+    non-empty rule list at submission.
+    """
+
+    generation: int
+    sha: str = ""
+    state: str
+    reason: str = ""
+    notices: list[PathNoticeItem] = Field(default_factory=list)
+    #: Plain-text rendering shared by the feed, the MCP text and the brief.
+    text: str = ""
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 
@@ -1584,6 +1663,9 @@ class ReviewBrief(BaseModel):
     # #438: advisory — non-empty when the branch carries commits of another
     # unmerged task branch (stacked branches). Never blocks the review.
     stacking_warning: str = ""
+    # #1589: manual server steps named by the project for the paths this
+    # generation touched. None = no rules configured at submission.
+    path_notices: PathNoticesView | None = None
 
 
 class TaskClaim(BaseModel):
@@ -2637,6 +2719,9 @@ class TaskView(BaseModel):
     # (path, with_task_id, with_path, detail). None means none was found or
     # the check is off; in require the overlap is a refusal, not this field.
     area_check: dict[str, Any] | None = None
+    # #1589: the path-notice result of THIS submission, set on submit responses
+    # only. None = no rules were configured, nothing to say.
+    path_notices: PathNoticesView | None = None
     # #1515: where this task's worktree goes, as a template relative to the
     # caller's clone. Set on claim and pair-start only; the hub cannot know the
     # clone's folder name, so the exact path comes from `hp-hub worktree`.
@@ -2815,6 +2900,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_count(v, "small_delta_lines")
     _validate_count(v, "circle_deep_stop")
     _validate_merge_is_delivery(v)
+    _validate_path_notices(v)
     return v
 
 
