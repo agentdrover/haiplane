@@ -24,7 +24,13 @@ from hub import db as db_module
 from hub import repository as repo
 from hub import services
 from hub.db import fetchall
-from hub.models import MachineReviewSubmit, MachineReviewView
+from hub.models import (
+    ORIGIN_LOCAL_TEXT,  # noqa: F401 - re-exported
+    ORIGIN_RUN_TEXT,  # noqa: F401 - re-exported
+    MachineReviewSubmit,
+    MachineReviewView,
+    claims_text_origin,
+)
 from hub.services.steward_corridor import outcome_label, report_outcome
 
 log = logging.getLogger("hub")
@@ -33,11 +39,11 @@ log = logging.getLogger("hub")
 # hub_submit_machine_review itself, authenticated as itself. Anything else is
 # the hub transcribing what a run left behind, and says so in the stored row.
 ORIGIN_MCP = "mcp"
-ORIGIN_RUN_TEXT = "cursor-cloud-result"
-# #1180: тот же вид факта — отчёт, переписанный хабом из текста прогона, — но
-# с локального ревьюера. Отдельная метка, а не общая с облачной: канал добычи
-# должен быть виден в данных, иначе метрики сложат два разных источника в один.
-ORIGIN_LOCAL_TEXT = "local-reviewer-result"
+# ORIGIN_RUN_TEXT and ORIGIN_LOCAL_TEXT live in hub.models (#1587): the verdict
+# side must read the same prefixes without importing this module.
+# #1180: ORIGIN_LOCAL_TEXT — тот же вид факта, но с локального ревьюера.
+# Отдельная метка, а не общая с облачной: канал добычи должен быть виден в
+# данных, иначе метрики сложат два разных источника в один.
 
 
 async def _alert_no_candidates(
@@ -188,6 +194,23 @@ async def _alert_environment_refusal(
     )
 
 
+def _refuse_claimed_text_origin(origin: str, body: MachineReviewSubmit) -> None:
+    """#1587: происхождение — факт хаба, а не слова отчёта.
+
+    Контрактный отчёт, чей orchestrator начинается с зарезервированного
+    префикса, выдавал бы себя за переписанный хабом (или сливался бы с ним в
+    метриках и автовердикте) — отказ, а не тихая очистка: автор должен увидеть
+    причину.
+    """
+    if origin == ORIGIN_MCP and claims_text_origin(body.orchestrator):
+        raise HTTPException(
+            422,
+            "orchestrator: префиксы cursor-cloud-result: и "
+            "local-reviewer-result: зарезервированы за хабом — они помечают "
+            "отчёт, переписанный из текста прогона; назовите оркестратор иначе",
+        )
+
+
 async def record_machine_review(
     db: aiosqlite.Connection,
     task_id: int,
@@ -241,6 +264,7 @@ async def record_machine_review(
     # Where each confirmed finding sits, before anything is stored (#1007):
     # a report that never placed its findings cannot be matched against a diff
     # later, and the gap is invisible once the report is in the ground.
+    _refuse_claimed_text_origin(origin, body)
     services.require_locator_decision(body.findings_confirmed)
     services.refuse_supplied_uid(body.findings_confirmed)
     # #1085: unresolved records carry the same derived id, so they are refused

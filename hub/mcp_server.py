@@ -2362,6 +2362,12 @@ def _review_circle_line(brief: dict[str, Any]) -> str:
     return line
 
 
+def _profile_downgrade_line(brief: dict[str, Any]) -> str:
+    """Строка о том, что deep понижен до lite потолком или кругом (#1587)."""
+    block = brief.get("profile_downgrade") or {}
+    return str(block.get("headline") or "")
+
+
 def _brief_statement_lines(brief: dict[str, Any]) -> list[str]:
     """Scope, checklist, validation commands, constraints and hints.
 
@@ -2488,7 +2494,11 @@ async def hub_get_review_brief(task_id: int) -> CallToolResult:
     )
     parts.extend(
         line
-        for line in (_generation_review_line(brief), _review_circle_line(brief))
+        for line in (
+            _generation_review_line(brief),
+            _review_circle_line(brief),
+            _profile_downgrade_line(brief),
+        )
         if line
     )
     if brief.get("description"):

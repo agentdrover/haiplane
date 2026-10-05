@@ -551,3 +551,41 @@ async def test_no_retraction_for_another_principal_or_without_alert(
     await _accept(db, t, 2, principal_id=11)
     assert _retractions(await _feed(db, t)) == []
     assert len(await _review_ids(db, t)) == 2
+
+
+# --- #1587: the contract cannot claim a text origin ------------------------
+
+
+async def test_contract_report_cannot_claim_a_text_origin(client: AsyncClient, db):
+    """Префиксы cursor-cloud-result: и local-reviewer-result: — метка хаба.
+
+    Контрактный приём отказывает (422) и не пишет строку: иначе сданный
+    ревьюером отчёт выдавал бы себя за переписанный хабом, и по префиксу
+    нельзя было бы отличить факт от заявления. Честное имя проходит и
+    остаётся контрактным (без префикса).
+    """
+    from hub import repository as repo_module
+
+    task_id = await _reviewable_task(client, db)
+    for claimed in (
+        "cursor-cloud-result:grok",
+        "local-reviewer-result:x",
+        "  Cursor-Cloud-Result:grok",
+    ):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/machine-review",
+            json={**_report([]), "orchestrator": claimed},
+        )
+        assert resp.status_code == 422, claimed
+        assert "зарезервированы" in resp.json()["detail"], claimed
+    assert await repo_module.get_latest_machine_review(db, task_id) is None, (
+        "a refused report leaves no row"
+    )
+
+    ok = await client.post(
+        f"/api/tasks/{task_id}/machine-review",
+        json={**_report([]), "orchestrator": "claude-code-workflow"},
+    )
+    assert ok.status_code == 200, ok.text
+    row = await repo_module.get_latest_machine_review(db, task_id)
+    assert row["orchestrator"] == "claude-code-workflow", "origin stays contractual"

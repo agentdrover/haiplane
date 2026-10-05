@@ -1449,6 +1449,25 @@ class ReviewerHarnessSkill(BaseModel):
     reason: str = ""
 
 
+class ProfileDowngradeView(BaseModel):
+    """Требовался deep, а заказан lite — и почему (#1587).
+
+    Источник — событие ``review_dispatched`` ИМЕННО этого заказа (профиль и
+    причины), а не лента и не пересчёт правила: лента показывает то же, но
+    бриф читает человек на гейте, и «lite» без причины читается как «дёшево
+    потому что просто». ``state`` — «заказан», пока отчёта этого заказа нет, и
+    «отчёт получен», когда он есть: заказанное не равно выполненному.
+    """
+
+    required_profile: str = "deep"
+    ordered_profile: str = "lite"
+    reasons: list[str] = Field(default_factory=list)
+    state: str = "заказан"
+    channel: str = ""
+    dispatch_id: int | None = None
+    headline: str = ""
+
+
 class ReviewBrief(BaseModel):
     """Everything a reviewer agent needs in one response (#308).
 
@@ -1527,6 +1546,9 @@ class ReviewBrief(BaseModel):
     # был разобран и закрыт по-настоящему, — иначе очередной отчёт читается
     # как первый.
     review_circle: ReviewCircleView = Field(default_factory=ReviewCircleView)
+    # #1587: требуемый и заказанный профиль, когда потолок или круг понизил
+    # deep до lite. None — понижения нет (блока нет вовсе).
+    profile_downgrade: ProfileDowngradeView | None = None
     # #1440: who will write the verdict for this submission and under what
     # condition — the answer of services.verdict_route, not a copy of its rules.
     # None means "not computed on this path" or "task not in review".
@@ -3185,6 +3207,37 @@ def normalise_incomplete_reason(value: Any) -> str:
         text[:40],
     )
     return INCOMPLETE_REASON_UNSTATED
+
+
+# Where a stored report came from (#1036, #1180, #1587). The two text origins
+# are the hub transcribing what a run wrote about itself; they are written into
+# the ``orchestrator`` column as a prefix, so the prefix IS the fact. The
+# contract path must never be able to claim one of them.
+ORIGIN_RUN_TEXT = "cursor-cloud-result"
+ORIGIN_LOCAL_TEXT = "local-reviewer-result"
+TEXT_ORIGINS = (ORIGIN_RUN_TEXT, ORIGIN_LOCAL_TEXT)
+
+
+def text_origin_of(orchestrator: str | None) -> str:
+    """The text origin a stored ``orchestrator`` carries, or "" for a contract report.
+
+    Exact prefixes: the hub writes ``<origin>:<claimed>`` and nothing else.
+    """
+    value = orchestrator or ""
+    for origin in TEXT_ORIGINS:
+        if value.startswith(origin + ":"):
+            return origin
+    return ""
+
+
+def claims_text_origin(orchestrator: str | None) -> bool:
+    """Whether a CALLER-supplied orchestrator tries to look like a text origin.
+
+    Looser than ``text_origin_of`` on purpose (case, leading blanks): it guards
+    the door, and a near miss at the door is still an attempt.
+    """
+    value = (orchestrator or "").strip().lower()
+    return any(value.startswith(origin + ":") for origin in TEXT_ORIGINS)
 
 
 class MachineReviewSubmit(BaseModel):
