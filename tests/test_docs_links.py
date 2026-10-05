@@ -218,6 +218,11 @@ def test_operator_guide_matches_stateless_mcp():
         "Добавьте `Mcp-Session-Id`",
     ):
         assert stale not in text, f"guide still requires a session id: {stale}"
-    for line in text.splitlines():
-        if "Mcp-Session-Id" in line:
-            assert re.search(r"не (требу|нужен|передаёт|выда)", line), line
+    onboarding = (REPO_ROOT / "docs" / "agent-onboarding.md").read_text(
+        encoding="utf-8"
+    )
+    assert "возвращает `Mcp-Session-Id`" not in onboarding
+    for doc in (text, onboarding):
+        for line in doc.splitlines():
+            if "Mcp-Session-Id" in line:
+                assert re.search(r"не (требу|нужен|передаёт|выда)", line), line

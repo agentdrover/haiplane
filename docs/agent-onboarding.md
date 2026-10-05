@@ -118,8 +118,9 @@ curl -sS \
 - На POST/GET к `/mcp` нужен заголовок `Accept: application/json, text/event-stream`.
   Без него часть клиентов получает 406. В hub есть middleware, который это
   чинит, но свой клиент лучше настроить корректно.
-- После `initialize` сервер возвращает `Mcp-Session-Id` — передавай его в
-  последующих запросах (`tools/list`, `tools/call`).
+- Хаб stateless (`stateless_http=True`): `Mcp-Session-Id` он не требует, каждый
+  POST самостоятелен, передавать заголовок в `tools/list` и `tools/call` не
+  нужно.
 - Конфигурация окружения локального hub — в `.env.local`
   (`HAIPLANE_HUB_URL`, `HAIPLANE_HUB_TOKEN`, `HAIPLANE_HUB_DB`, `HAIPLANE_HUB_TOKENS`).
 
