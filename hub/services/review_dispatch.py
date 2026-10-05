@@ -2411,6 +2411,56 @@ async def _second_axis_blocked(
     return ""
 
 
+async def _channel_of_report_order(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    report: Mapping[str, Any],
+) -> str:
+    """Канал заказа, который ТОЧНО породил отчёт, или "" — если не определён (#1587).
+
+    Строже ``dispatch_for_report``, у которого для заказа без принципала
+    «его» отчётом служит последний отчёт поколения — один и тот же отчёт
+    подходит ко всем таким заказам, а берётся первый по id. После второй
+    двери (#1252) первым остаётся оплаченный облачный заказ без отчёта, и
+    неполный отчёт локальной замены приписывался ему: облако покупалось
+    ровно там, где D6 это запрещает. Здесь:
+
+    * сначала заказы с принципалом, совпавшим с принципалом ОТЧЁТА (токен, а
+      не слова отчёта), и со ступенью — ``_dispatch_report`` называет именно
+      этот отчёт; заказ без принципала при наличии такого не в счёт;
+    * при нескольких точных заказах разных каналов — не определён;
+    * принципала у отчёта или у всех заказов нет (открытый режим, история) —
+      заказы без принципала; их каналы должны совпадать, иначе не определён.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT * FROM review_dispatches WHERE task_id=? "
+        "AND submission_generation=? ORDER BY id",
+        (task_id, generation),
+    )
+    orders = [dict(r) for r in rows]
+    principal = report.get("principal_id")
+    channels: set[str] = set()
+    if principal is not None:
+        for order in orders:
+            if order.get("reviewer_principal_id") != principal:
+                continue
+            matched = await _dispatch_report(db, task_id, generation, order)
+            if matched is not None and matched.get("id") == report.get("id"):
+                channels.add(order.get("channel") or CLOUD_CHANNEL)
+        if channels:
+            return next(iter(channels)) if len(channels) == 1 else ""
+        if any(o.get("reviewer_principal_id") == principal for o in orders):
+            return ""  # заказ этого принципала есть, но отчёт ему не отвечает
+    unpinned = {
+        o.get("channel") or CLOUD_CHANNEL
+        for o in orders
+        if o.get("reviewer_principal_id") is None
+    }
+    return next(iter(unpinned)) if len(unpinned) == 1 else ""
+
+
 async def _no_cloud_after_local(
     db: aiosqlite.Connection,
     task_id: int,
@@ -2419,15 +2469,16 @@ async def _no_cloud_after_local(
 ) -> str:
     """Почему отчёт не даёт права на облачный deep второй оси, или "" (#1587).
 
-    Канал берётся у заказа, который породил отчёт (``dispatch_for_report``),
+    Канал берётся у заказа, который породил отчёт (``_channel_of_report_order``),
     а не из токена текущего локального ревьюера: токен ротируется, и для
-    истории он ненадёжен. Заказ не найден — тоже отказ: купить облако по
-    отчёту неизвестного происхождения хуже, чем назвать причину человеку.
+    истории он ненадёжен. Заказ не определён однозначно — тоже отказ: купить
+    облако по отчёту неизвестного происхождения хуже, чем назвать причину
+    человеку.
     """
-    dispatch = await dispatch_for_report(db, task_id, generation, dict(report))
-    if dispatch is None:
+    channel = await _channel_of_report_order(db, task_id, generation, report)
+    if not channel:
         return "заказ, породивший отчёт, не определён однозначно"
-    if (dispatch.get("channel") or CLOUD_CHANNEL) == LOCAL_CHANNEL:
+    if channel == LOCAL_CHANNEL:
         return "отчёт принадлежит заказу локального канала"
     return ""
 
