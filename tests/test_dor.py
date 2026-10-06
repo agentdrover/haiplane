@@ -1021,41 +1021,92 @@ async def test_approve_records_workspace_missing_alert_once(
 
     from hub import config
     from hub.models import TaskApprove
+    from hub.services import recommendations
     from hub.services.auto_approve import maybe_auto_approve
-    from hub.services.dor import STATEMENT_PATHS_MARK, record_statement_paths
+    from hub.services.dor import STATEMENT_PATHS_MARK
     from hub.services.lifecycle import approve_task
     from hub.services.readiness import calculate_readiness
 
+    def paths_check(path: str) -> DoRCheckItem:
+        return DoRCheckItem(
+            key="statement_paths_resolve",
+            passed=False,
+            detail=f"{STATEMENT_PATHS_MARK}: {path} (AC-1)",
+        )
+
+    def approve_lines(updates, path: str) -> tuple[list[str], list[str]]:
+        approve = [
+            u["content"] for u in updates if u["content"].startswith("Approve: ")
+        ]
+        return (
+            [c for c in approve if path in c],
+            [c for c in approve if "workspace_missing" in c],
+        )
+
+    # Ручное одобрение: отчёт DoR несёт и нарушение путей.
+    real = recommendations.calculate_readiness_with_recommendations
+
+    async def with_paths_violation(db_, task_id_, *args, **kwargs):
+        report = await real(db_, task_id_, *args, **kwargs)
+        report.dor_checks.append(paths_check("tests/manual.py"))
+        return report
+
+    monkeypatch.setattr(
+        recommendations,
+        "calculate_readiness_with_recommendations",
+        with_paths_violation,
+    )
     manual = await _ws_task(db, project_id=await _ws_project(db, "bare-m", ""))
     before = (await calculate_readiness(db, manual)).score
     await approve_task(db, manual, TaskApprove())
-    alerts = _workspace_alerts(await repo.get_task_updates(db, manual))
-    assert len(alerts) == 1, alerts
-    assert alerts[0].startswith("Approve: ")
+    paths, workspace = approve_lines(
+        await repo.get_task_updates(db, manual), "tests/manual.py"
+    )
+    assert len(paths) == 1, paths
+    assert len(workspace) == 1, workspace
+    assert paths[0] != workspace[0], "две отдельные строки, не одна общая"
     assert (await repo.get_task(db, manual))["status"] == "open"
     assert (await calculate_readiness(db, manual)).score == before
+    monkeypatch.setattr(
+        recommendations, "calculate_readiness_with_recommendations", real
+    )
 
-    # Автоодобрение: проект с dor=auto, класс R0 под потолком.
+    # Автоодобрение: проект с dor=auto, класс R0 под потолком; отчёт передан.
     monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
     pid = await _ws_project(db, "bare-a", "")
     await repo.update_project(db, pid, gate_policy=json.dumps({"dor": "auto"}))
     auto = await _ws_task(db, project_id=pid)
     await repo.update_task(db, auto, dor_passed=1, risk_class="R0")
     await db.commit()
-    assert await maybe_auto_approve(db, auto) is True
-    alerts = _workspace_alerts(await repo.get_task_updates(db, auto))
-    assert len(alerts) == 1, alerts
-    assert alerts[0].startswith("Approve: ")
+    assert await maybe_auto_approve(db, auto, dor_checks=[paths_check("tests/auto.py")])
+    paths, workspace = approve_lines(
+        await repo.get_task_updates(db, auto), "tests/auto.py"
+    )
+    assert len(paths) == 1, paths
+    assert len(workspace) == 1, workspace
+    assert paths[0] != workspace[0]
 
-    # Алерт путей постановки остаётся отдельной строкой, ничего не заменяет.
-    paths_check = [
-        DoRCheckItem(
-            key="statement_paths_resolve",
-            passed=False,
-            detail=f"{STATEMENT_PATHS_MARK}: tests/x.py (AC-1)",
-        )
-    ]
-    await record_statement_paths(db, auto, paths_check)
-    feed = [u["content"] for u in await repo.get_task_updates(db, auto)]
-    assert len(_workspace_alerts(await repo.get_task_updates(db, auto))) == 1
-    assert [c for c in feed if "tests/x.py" in c]
+    # Автоодобрение без отчёта (путь стюарда): строка workspace всё равно одна.
+    steward = await _ws_task(db, project_id=pid)
+    await repo.update_task(db, steward, dor_passed=1, risk_class="R0")
+    await db.commit()
+    assert await maybe_auto_approve(db, steward)
+    _, workspace = approve_lines(
+        await repo.get_task_updates(db, steward), "tests/none.py"
+    )
+    assert len(workspace) == 1, workspace
+
+
+async def test_record_workspace_missing_does_not_commit_callers_transaction(
+    db: aiosqlite.Connection,
+):
+    # Помощник пишет внутри транзакции вызывающего и не коммитит её сам.
+    from hub.services.dor import record_workspace_missing
+
+    task_id = await _ws_task(db, project_id=await _ws_project(db, "bare-tx", ""))
+    await db.execute("BEGIN IMMEDIATE")
+    await record_workspace_missing(db, task_id)
+    assert db.in_transaction is True
+    assert _workspace_alerts(await repo.get_task_updates(db, task_id))
+    await db.rollback()
+    assert not _workspace_alerts(await repo.get_task_updates(db, task_id))
