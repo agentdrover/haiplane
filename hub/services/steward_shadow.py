@@ -48,6 +48,7 @@ from hub.services.steward_dispatch import (
     RUN_OPEN,
     close_run,
     configured_mode,
+    hold_start_for_review,
     steward_mode,
 )
 
@@ -789,6 +790,12 @@ async def start_run(db: aiosqlite.Connection, order: dict) -> bool:
         await close_run(db, order, RUN_REFUSED, "задача исчезла")
         return False
     task = dict(task_row)
+
+    # #1600: прежде всего остального — отчёт ревью положен и ещё может прийти?
+    # Повтор после undeclared_model, ошибки провайдера или нехватки
+    # конфигурации не должен покупать прогон, исход которого предрешён.
+    if await hold_start_for_review(db, order, task):
+        return False
 
     steward = (order.get("model") or config.STEWARD_MODEL or "").strip()
     implementer = (task.get("submission_model") or "").strip()
