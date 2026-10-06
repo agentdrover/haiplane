@@ -583,6 +583,10 @@ async def build_review_brief(
         head_sha=task_view.submission_sha or "",
     )
 
+    # #1606: mutations and baseline are NOT part of every run any more — a
+    # branch update skips them — so the brief says per block whether they
+    # arrived and from which run, and "не получено" otherwise.
+
     # #875: WHICH checks ran, not just whether a run was reported. "A run
     # exists" and "ruff found nothing" are different facts, and only the second
     # can buy the reviewer's silence on a class.
@@ -688,6 +692,9 @@ async def build_review_brief(
         locator_resolution=locator_resolution,
         ac_test_results=ac_test_results,
         ci_run_report=ci_run_report,
+        ci_evidence=await review_evidence.ci_evidence_state(
+            db, {"id": task_id, "submission_sha": task_view.submission_sha}
+        ),
         prepass=prepass,
         validation=validation,
         live_check=LiveCheckState(**live_check),

@@ -30,7 +30,14 @@ unreadable ⇒ the key is not sent, and the log says why),
 HAIPLANE_HUB_CI_BASELINE (#913: path to the JSON written by
 scripts/red_test_baseline.py — the branch's changed tests run over the
 merge-base code, sent under its own ``baseline`` key; absent or unreadable ⇒
-the key is not sent, and the log says why).
+the key is not sent, and the log says why),
+HAIPLANE_HUB_CI_MUTATIONS_OUTCOME / HAIPLANE_HUB_CI_BASELINE_OUTCOME (#1606: how
+the step that wrote the file ended. ``skipped`` ⇒ the step did not run and the
+key is NOT sent, so the hub keeps what it stored for this commit; any other
+value ⇒ it ran, and a missing or broken file is sent as an explicit
+``state=error`` with its cause; empty ⇒ not stated, the file alone decides),
+HAIPLANE_HUB_CI_EVENT_ACTION (#1606: the event's activity type, part of the
+provenance — run id, URL, event, time — written inside each evidence block).
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 TASK_BRANCH = re.compile(r"^task-(\d+)/")
 # A validation entry we are willing to hand to a shell. Task text mixes real
@@ -529,20 +537,91 @@ def trim_mutations(report: dict) -> dict:
     return trimmed
 
 
-def read_mutations(path: str) -> dict | None:
-    """The mutation step's JSON, or None with the reason logged."""
-    if not path:
-        return None
+def _read_report(path: str) -> tuple[dict | None, str]:
+    """A step's JSON file as (report, ""), or (None, the reason it is unusable)."""
     try:
         with open(path, encoding="utf-8") as handle:
             report = json.load(handle)
     except (OSError, ValueError) as exc:
-        log(f"mutation report {path} not sent: {exc}")
-        return None
+        return None, str(exc)
     if not isinstance(report, dict):
-        log(f"mutation report {path} not sent: expected an object")
+        return None, "expected an object"
+    return report, ""
+
+
+# The states each step's own script can write (scripts/mutation_changed.py,
+# scripts/red_test_baseline.py). A JSON object without one of them is not that
+# step's report, and provenance on it would make it look like evidence.
+_MUTATION_STATES = frozenset(
+    {"ran", "baseline_red", "no_changed_functions", "no_tests", "error"}
+)
+_BASELINE_STATES = frozenset({"ran", "no_tests", "error"})
+
+
+def provenance() -> dict:
+    """Which run produced an evidence block (#1606): kept INSIDE the block.
+
+    The hub shows it next to the evidence, and "run unknown" for a block that
+    predates it. No new column: the block is already free-form JSON.
+    """
+    server = os.environ.get("GITHUB_SERVER_URL") or "https://github.com"
+    repository = os.environ.get("GITHUB_REPOSITORY") or ""
+    run_id = os.environ.get("GITHUB_RUN_ID") or ""
+    event = os.environ.get("GITHUB_EVENT_NAME") or ""
+    action = env_get("HUB_CI_EVENT_ACTION")
+    return {
+        "run_id": run_id,
+        "run_url": (
+            f"{server}/{repository}/actions/runs/{run_id}"
+            if run_id and repository
+            else ""
+        ),
+        "event": f"{event}.{action}" if event and action else event,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def evidence_block(
+    label: str,
+    path: str,
+    outcome: str,
+    trim: Callable[[dict], dict],
+    states: frozenset[str],
+) -> dict | None:
+    """The block to send under an evidence key, or None for "send no key" (#1606).
+
+    Three cases, never collapsed: a step that did not run (``skipped``) sends
+    no key, because the hub reads an absent key as "keep what you stored"; a
+    step that ran but left no usable file sends ``state=error`` with the cause,
+    because a timeout is a fact the reader must see; a valid file is sent as
+    it is. An outcome the caller does not state falls back to the file alone,
+    which is how reporters written before this contract behave.
+    """
+    outcome = (outcome or "").strip().lower()
+    if not path:
         return None
-    return trim_mutations(report)
+    if outcome == "skipped":
+        log(f"{label} step did not run — no key sent; the hub keeps what it stored")
+        return None
+    report, why = _read_report(path)
+    if report is not None and report.get("state") not in states:
+        report, why = (
+            None,
+            f"state {report.get('state')!r} is not one of {sorted(states)}",
+        )
+    if report is None:
+        log(f"{label} report {path} not usable: {why}")
+        if not outcome:
+            return None
+        report = {
+            "state": "error",
+            "reason": (
+                f"the {label} step ended {outcome} without a readable report ({why})"
+            ),
+        }
+    else:
+        report = trim(report)
+    return {**report, "provenance": provenance()}
 
 
 # The hub refuses a baseline above 32 000 chars (#913). A changed test module
@@ -575,20 +654,36 @@ def trim_baseline(report: dict, keep: set[str]) -> dict:
     return trimmed
 
 
-def read_baseline(path: str, keep: set[str]) -> dict | None:
-    """The baseline step's JSON, or None with the reason logged."""
-    if not path:
-        return None
-    try:
-        with open(path, encoding="utf-8") as handle:
-            report = json.load(handle)
-    except (OSError, ValueError) as exc:
-        log(f"baseline report {path} not sent: {exc}")
-        return None
-    if not isinstance(report, dict):
-        log(f"baseline report {path} not sent: expected an object")
-        return None
-    return trim_baseline(report, keep)
+def attach_evidence(payload: dict, keep: set[str]) -> None:
+    """Add the mutations / baseline keys the run actually has to report."""
+    mutations = evidence_block(
+        "mutation",
+        env_get("HUB_CI_MUTATIONS"),
+        env_get("HUB_CI_MUTATIONS_OUTCOME"),
+        trim_mutations,
+        _MUTATION_STATES,
+    )
+    if mutations is not None:
+        payload["mutations"] = mutations
+        log(f"mutation run reported: state={mutations.get('state')!r}")
+    baseline = evidence_block(
+        "baseline",
+        env_get("HUB_CI_BASELINE"),
+        env_get("HUB_CI_BASELINE_OUTCOME"),
+        lambda report: trim_baseline(report, keep),
+        _BASELINE_STATES,
+    )
+    if baseline is not None:
+        payload["baseline"] = baseline
+        log(
+            f"red-test baseline reported: state={baseline.get('state')!r}, "
+            f"merge_base={str(baseline.get('merge_base'))[:12]}, "
+            f"tests={len(baseline.get('tests') or {})}"
+        )
+        for nodeid in sorted(keep):
+            log(
+                f"  baseline {nodeid}: {(baseline.get('tests') or {}).get(nodeid, '—')}"
+            )
 
 
 def main() -> int:
@@ -651,21 +746,7 @@ def main() -> int:
         "reported_by": "github-actions",
         "checks": checks,
     }
-    mutations = read_mutations(env_get("HUB_CI_MUTATIONS"))
-    if mutations is not None:
-        payload["mutations"] = mutations
-        log(f"mutation run reported: state={mutations.get('state')!r}")
-    baseline = read_baseline(env_get("HUB_CI_BASELINE"), set(nodeid_by_ac.values()))
-    if baseline is not None:
-        payload["baseline"] = baseline
-        log(
-            f"red-test baseline reported: state={baseline.get('state')!r}, "
-            f"merge_base={str(baseline.get('merge_base'))[:12]}, "
-            f"tests={len(baseline.get('tests') or {})}"
-        )
-        for ac_id, nodeid in sorted(nodeid_by_ac.items()):
-            status = (baseline.get("tests") or {}).get(nodeid, "—")
-            log(f"  baseline {ac_id} {nodeid}: {status}")
+    attach_evidence(payload, set(nodeid_by_ac.values()))
     result = hub_request(f"{base}/api/tasks/{task_id}/ci-run-report", token, payload)
     if result is None:
         log("report not delivered — the hub will read this as unknown")

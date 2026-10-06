@@ -131,14 +131,19 @@ async def accept_ci_run_report(
 
     # #1270: stored as evidence under its own key, never interpreted into a
     # gate. Bounded, because it is free text from CI landing in a table row.
-    mutations_json = json.dumps(mutations or {}, ensure_ascii=False, sort_keys=True)
-    if len(mutations_json) > MUTATIONS_MAX_CHARS:
-        raise ValueError(
-            f"mutations report is {len(mutations_json)} chars, the limit is "
-            f"{MUTATIONS_MAX_CHARS}: trim the survivor list before sending"
-        )
+    # #1606: ``None`` is "the report carried no such key" — the step did not
+    # run — and is NOT stored as {}: the repository keeps what is already
+    # there. A dict, even an empty one or a state=error, replaces.
+    mutations_json = None
+    if mutations is not None:
+        mutations_json = json.dumps(mutations, ensure_ascii=False, sort_keys=True)
+        if len(mutations_json) > MUTATIONS_MAX_CHARS:
+            raise ValueError(
+                f"mutations report is {len(mutations_json)} chars, the limit is "
+                f"{MUTATIONS_MAX_CHARS}: trim the survivor list before sending"
+            )
 
-    baseline_json = _checked_baseline(baseline)
+    baseline_json = None if baseline is None else _checked_baseline(baseline)
 
     known = await test_ac_nodeids(db, task_id)
     accepted: dict[str, str] = {}
@@ -207,6 +212,9 @@ async def accept_ci_run_report(
         )
     await db.commit()
 
+    # What the commit now holds, not what this report carried: a report without
+    # the keys leaves the stored blocks, and the answer must say so.
+    stored = dict(await repo.get_ci_run_report(db, task_id, head_sha) or {})
     return {
         "applied": applied,
         "reason": applied_reason,
@@ -215,9 +223,20 @@ async def accept_ci_run_report(
         "ac_recorded": recorded,
         "ac_ignored": ignored,
         "validation_status": validation_status,
-        "mutations_state": str((mutations or {}).get("state") or "not_reported"),
-        "baseline_state": str((baseline or {}).get("state") or "not_reported"),
+        "mutations_state": _stored_state(stored.get("mutations")),
+        "baseline_state": _stored_state(stored.get("baseline")),
     }
+
+
+def _stored_state(raw: str | None) -> str:
+    """``state`` of a stored evidence block, ``not_reported`` when it holds none."""
+    try:
+        block = json.loads(raw or "{}")
+    except ValueError:
+        return "not_reported"
+    if not isinstance(block, dict):
+        return "not_reported"
+    return str(block.get("state") or "not_reported")
 
 
 def _checked_baseline(baseline: dict[str, Any] | None) -> str:

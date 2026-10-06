@@ -1398,6 +1398,31 @@ class CIRunReportState(BaseModel):
     head_sha: str = ""
 
 
+class CIEvidenceBlock(BaseModel):
+    """One piece of CI evidence about the commit under review (#1606).
+
+    ``state`` is ``received`` or ``not_received`` — never a pass. A commit whose
+    CI run skipped the step (a branch update) has nothing here, and the reader
+    must see "not received", not an empty field that looks like a clean result.
+    ``result`` is the step's own state (ran, error, ...), ``run`` names the run
+    and event it came from, or says the run is unknown for a block stored
+    before provenance existed.
+    """
+
+    state: str = "not_received"
+    result: str = ""
+    run: str = ""
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    reason: str = "не получено: отчёт CI о закреплённом коммите не прислан"
+
+
+class CIEvidenceState(BaseModel):
+    """Mutation and red-test baseline evidence, each with its own provenance."""
+
+    mutations: CIEvidenceBlock = Field(default_factory=lambda: CIEvidenceBlock())
+    baseline: CIEvidenceBlock = Field(default_factory=lambda: CIEvidenceBlock())
+
+
 class PrepassState(BaseModel):
     """Which deterministic checks already ran on the code under review (#875).
 
@@ -1749,6 +1774,9 @@ class ReviewBrief(BaseModel):
     # only — current, or unknown with a reason. Absence of a report is not a
     # failing run, and must never be shown as one.
     ci_run_report: CIRunReportState = Field(default_factory=lambda: CIRunReportState())
+    # #1606: mutation and baseline evidence for this commit, each block with the
+    # run it came from; "не получено" when the CI run for it skipped the step.
+    ci_evidence: CIEvidenceState = Field(default_factory=lambda: CIEvidenceState())
     # #875: which deterministic checks already passed on this very commit. The
     # reviewer reads it to stop paying model prices for what a linter proved
     # minutes earlier; the human reads it beside the report.
@@ -3349,11 +3377,13 @@ class CIRunReportSubmit(BaseModel):
     # The mutation run over changed functions (#1270), kept under its own key:
     # a warning with named survivors, not a check outcome — putting it into
     # ``checks`` would tell the reviewer the code is "known-broken" whenever a
-    # weak test exists. Omitted ⇒ stored as {} and reported as not_reported.
+    # weak test exists. Omitted ⇒ the step did not run: what is stored for this
+    # commit is kept (#1606), and a commit with nothing stored reads as
+    # not_reported. Sent (even as {} or state=error) ⇒ replaces the stored block.
     mutations: dict[str, Any] = Field(default_factory=dict)
     # The branch's changed tests run over the merge-base code (#913): state,
     # merge_base and {nodeid: failed|passed|error|skipped}. Evidence for the
-    # red-test gate on bugs. Omitted ⇒ stored as {} and read as "no baseline".
+    # red-test gate on bugs. Omitted ⇒ kept as stored (#1606); sent ⇒ replaces.
     baseline: dict[str, Any] = Field(default_factory=dict)
     validation_status: str = Field("", max_length=20)
     validation_log: str = Field("", max_length=4000)

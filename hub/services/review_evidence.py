@@ -533,6 +533,78 @@ _CHECK_MEANING: dict[str, str] = {
 }
 
 
+# The states the CI step scripts write (mutation_changed.py, red_test_baseline.py).
+_EVIDENCE_STATES = {
+    "мутации": frozenset(
+        {"ran", "baseline_red", "no_changed_functions", "no_tests", "error"}
+    ),
+    "baseline": frozenset({"ran", "no_tests", "error"}),
+}
+
+
+def _evidence_block(label: str, raw: str | None, pinned: str):
+    """One stored evidence block as the brief reads it (#1606)."""
+    from hub.models import CIEvidenceBlock
+
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict) or not data:
+        return CIEvidenceBlock(
+            reason=(
+                f"не получено: {label} для коммита {pinned[:12]} CI не присылал "
+                "(шаг не запускался на обновлении ветки — это не результат)"
+            )
+        )
+    if data.get("state") not in _EVIDENCE_STATES[label]:
+        # Provenance alone does not make an object the step's report.
+        return CIEvidenceBlock(
+            reason=(
+                f"не получено: {label} для коммита {pinned[:12]} пришли в "
+                "нераспознанном виде (нет известного state) — результатом не считаются"
+            )
+        )
+    prov = data.get("provenance")
+    prov = prov if isinstance(prov, dict) and prov else {}
+    if prov:
+        run = (
+            f"прогон {prov.get('run_id') or '?'} "
+            f"({prov.get('event') or 'событие неизвестно'}), "
+            f"{prov.get('at') or 'время неизвестно'}"
+        )
+        if prov.get("run_url"):
+            run += f", {prov['run_url']}"
+    else:
+        run = "прогон неизвестен"
+    return CIEvidenceBlock(
+        state="received",
+        result=str(data.get("state") or ""),
+        run=run,
+        provenance=prov,
+        reason=str(data.get("reason") or ""),
+    )
+
+
+async def ci_evidence_state(db, task: dict):
+    """Mutation and baseline evidence stored for the pinned commit (#1606)."""
+    from hub import repository as repo_module
+    from hub.models import CIEvidenceBlock, CIEvidenceState
+
+    pinned = (task.get("submission_sha") or "").strip()
+    if not pinned:
+        why = "не получено: коммит сдачи не закреплён"
+        return CIEvidenceState(
+            mutations=CIEvidenceBlock(reason=why), baseline=CIEvidenceBlock(reason=why)
+        )
+    row = await repo_module.get_ci_run_report(db, int(task.get("id") or 0), pinned)
+    stored = dict(row) if row is not None else {}
+    return CIEvidenceState(
+        mutations=_evidence_block("мутации", stored.get("mutations"), pinned),
+        baseline=_evidence_block("baseline", stored.get("baseline"), pinned),
+    )
+
+
 async def prepass_state(db, task: dict):
     """Which deterministic checks passed on the commit under review (#875).
 
