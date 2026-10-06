@@ -221,6 +221,10 @@ class _Pair:
     task_id: int
     generation: int
     approved_at: str
+    #: id события «советник ответил» (events.id): монотонный порядок, общий с
+    #: событиями возврата. None — события нет (вычищено через 14 дней или
+    #: строки заведены мимо контракта): тогда порядок по секундам.
+    approval_event_id: int | None = None
 
 
 async def concur_pairs(db: aiosqlite.Connection) -> list[_Pair]:
@@ -236,14 +240,27 @@ async def concur_pairs(db: aiosqlite.Connection) -> list[_Pair]:
         "ORDER BY j.id",
         (CONTOUR_V2,),
     )
-    return [
-        _Pair(
-            int(dict(r)["task_id"]),
-            int(dict(r)["generation"]),
-            str(dict(r)["approved_at"] or ""),
+    pairs: list[_Pair] = []
+    for r in rows:
+        item = dict(r)
+        task_id, generation = int(item["task_id"]), int(item["generation"])
+        events = await fetchall(
+            db,
+            "SELECT MIN(id) AS id FROM events WHERE kind='steward_advisor_recorded' "
+            "AND task_id=? AND json_extract(payload, '$.generation')=? "
+            "AND json_extract(payload, '$.verdict')='concur'",
+            (task_id, generation),
         )
-        for r in rows
-    ]
+        event_id = dict(events[0]).get("id") if events else None
+        pairs.append(
+            _Pair(
+                task_id,
+                generation,
+                str(item["approved_at"] or ""),
+                int(event_id) if event_id is not None else None,
+            )
+        )
+    return pairs
 
 
 async def _human_returns(
@@ -286,7 +303,14 @@ async def _poll_pair(db: aiosqlite.Connection, pair: _Pair) -> list[FalseApprove
     """
     found: list[FalseApprove] = []
     for event_id, gen, at in await _human_returns(db, pair.task_id):
-        if gen >= pair.generation and at >= pair.approved_at:
+        # Порядок «возврат после одобрения» — по id событий, а не по секундам:
+        # возврат и concur в одну секунду различает только монотонный id.
+        after = (
+            event_id > pair.approval_event_id
+            if pair.approval_event_id is not None
+            else at >= pair.approved_at
+        )
+        if gen >= pair.generation and after:
             found.append(
                 FalseApprove(
                     pair.task_id,

@@ -4323,10 +4323,181 @@ async def test_a_reopening_and_a_second_completion_between_ticks_are_both_facts(
     rows = [r for r in await _rows(db) if r["source"] == "reopened"]
     assert len(rows) == 2
     assert len({r["ref"] for r in rows}) == 2
-    assert sorted(r["ref"][-19:] for r in rows) == [
-        "2026-09-01 10:00:00",
-        "2026-09-02 10:00:00",
+    assert sorted(r["ref"] for r in rows) == ["exit:1", "exit:2"]
+
+
+async def test_two_exits_with_identical_stamps_are_two_cases(db: aiosqlite.Connection):
+    """Два выхода из completed с одинаковым completed_at — две записи, номера по порядку.
+
+    Ref — порядковый номер выхода у задачи, а не часы: раньше два выхода в одну
+    миллисекунду при одной секундной метке завершения давали один ref, и
+    INSERT OR IGNORE глотал второй факт — после clear первого он был бы потерян.
+    """
+    from hub.services.steward_exit import clear_false_approval, current_false_approvals
+
+    project_id = await _project(db, "advisor-fa-same-stamps")
+    task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+
+    await _complete(db, task_id, "2026-09-01 10:00:00")
+    await repo.update_task(db, task_id, status="open")
+    await db.commit()
+    assert [r["ref"] for r in await _rows(db)] == ["exit:1"]
+    assert await clear_false_approval(db, task_id, "denis") == 1
+
+    await _complete(db, task_id, "2026-09-01 10:00:00")  # та же метка завершения
+    await repo.update_task(db, task_id, status="open")
+    await db.commit()
+
+    rows = await _rows(db)
+    assert [r["ref"] for r in rows] == ["exit:1", "exit:2"]
+    assert rows[0]["cleared_at"] is not None and rows[1]["cleared_at"] is None
+    assert [(f.source, f.ref) for f in await current_false_approvals(db)] == [
+        ("reopened", "exit:2")
     ]
+
+
+async def _pair_for(db: aiosqlite.Connection, task_id: int) -> None:
+    """Пара судья+советник для УЖЕ существующей задачи (после, а не вместе с ней)."""
+    judge_id = await repo.insert_steward_judgement(
+        db,
+        task_id=task_id,
+        generation=1,
+        kind="verdict",
+        submitted_verdict="approve",
+        verdict="approve",
+        confidence="high",
+        grounds="[]",
+        findings="[]",
+        closures="[]",
+        model="gpt-5.3-codex",
+        submitted_by="steward-bot",
+        principal_id=42,
+        packet_hash="pkt",
+        contour=2,
+    )
+    await repo.insert_steward_judgement(
+        db,
+        task_id=task_id,
+        generation=1,
+        kind="advisor",
+        submitted_verdict="concur",
+        verdict="concur",
+        confidence="high",
+        grounds="[]",
+        findings="[]",
+        closures="[]",
+        model="claude-sonnet-5",
+        submitted_by="steward-bot",
+        principal_id=42,
+        judged_id=judge_id,
+        packet_hash="pkt",
+        contour=2,
+    )
+    await db.commit()
+
+
+async def test_re_saving_an_old_defect_after_the_concur_is_not_a_fact(
+    db: aiosqlite.Connection,
+):
+    """Дефект с found_in=prod и причиной существовал ДО concur: пустое сохранение — не факт.
+
+    UPDATE-триггер срабатывает, только когда условие стало истинным ЭТИМ
+    апдейтом (OLD другой). Смена found_in на prod после concur — факт; смена
+    причины на задачу с парой — факт.
+    """
+    project_id = await _project(db, "advisor-fa-resave")
+    caused = await _new_task(db)
+    defect = await _new_task(db)
+    await db.execute(
+        "UPDATE tasks SET found_in='prod', caused_by_task_id=? WHERE id=?",
+        (caused, defect),
+    )
+    await db.commit()
+    await _pair_for(db, caused)  # concur — ПОСЛЕ дефекта
+    assert await _rows(db) == []
+
+    await db.execute("UPDATE tasks SET found_in=found_in WHERE id=?", (defect,))
+    await db.execute(
+        "UPDATE tasks SET found_in='prod', caused_by_task_id=caused_by_task_id "
+        "WHERE id=?",
+        (defect,),
+    )
+    await repo.update_task(db, defect, title="пересохранён")
+    await db.commit()
+    assert await _rows(db) == [], "пустое сохранение не создаёт факт"
+
+    fresh = await _new_task(db)  # настоящий момент: found_in стал prod после concur
+    await db.execute("UPDATE tasks SET caused_by_task_id=? WHERE id=?", (caused, fresh))
+    await db.commit()
+    assert await _rows(db) == [], "found_in ещё не prod"
+    await db.execute("UPDATE tasks SET found_in='prod' WHERE id=?", (fresh,))
+    await db.commit()
+    assert await _active(db) == [(caused, "prod_defect", str(fresh))]
+
+    other = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    await db.execute("UPDATE tasks SET caused_by_task_id=? WHERE id=?", (other, fresh))
+    await db.commit()
+    assert (other, "prod_defect", str(fresh)) in await _active(db), (
+        "смена причины на другую задачу с парой — новый факт"
+    )
+
+
+async def _same_second(db: aiosqlite.Connection, task_id: int) -> None:
+    await db.execute(
+        "UPDATE events SET created_at='2026-10-06 10:00:00' WHERE task_id=?", (task_id,)
+    )
+    await db.execute(
+        "UPDATE steward_judgements SET created_at='2026-10-06 10:00:00' "
+        "WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+
+
+async def test_the_poll_orders_a_return_and_a_concur_of_one_second_by_event_id(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Возврат до concur и concur до возврата в ОДНУ секунду различаются по id событий.
+
+    Простое «>» по секундам потеряло бы настоящий возврат той же секунды, «>=»
+    принимало бы прежний. Порядок — id события возврата против id события
+    ответа советника (общий монотонный счётчик ленты).
+    """
+    from hub.services.steward_exit import current_false_approvals
+    from tests.test_steward_advisor import (
+        _advise,
+        _advisor_run,
+        _judge,
+        _judge_run,
+    )
+
+    async def _case(slug: str, *, return_first: bool) -> int:
+        project_id = await _project(db, slug)
+        task_id = await _task(db, project_id)
+        await repo.update_task(db, task_id, review_job_id="")
+        await db.commit()
+        await _judge_run(db, task_id)
+        await _judge(db, task_id)
+        await _advisor_run(db, task_id)
+        if return_first:
+            await _human(db, task_id, "changes_requested")
+        await _advise(db, task_id)
+        if not return_first:
+            await _human(db, task_id, "changes_requested")
+        await _same_second(db, task_id)
+        return task_id
+
+    before = await _case("advisor-fa-order-before", return_first=True)
+    after = await _case("advisor-fa-order-after", return_first=False)
+    await _without_triggers(db)
+    # Триггеры снесены ПОСЛЕ записи: убираем их следы, оставляя на опрос.
+    await db.execute("DELETE FROM steward_false_approvals")
+    await db.commit()
+
+    flagged = {f.task_id for f in await current_false_approvals(db)}
+
+    assert before not in flagged, "возврат раньше concur — не ошибка пары"
+    assert after in flagged, "возврат после concur той же секунды — ошибка"
 
 
 async def test_every_exit_from_completed_is_a_reopening(db: aiosqlite.Connection):

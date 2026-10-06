@@ -2553,6 +2553,12 @@ _MIGRATIONS: list[tuple[str, str]] = [
     # транзакции, что и оно. Триггеры БД, а не вызовы в путях: путей записи
     # вердикта и выхода из completed много, триггер ловит и забытые.
     (
+        # Сколько раз задача выходила из completed (#1601): порядковый номер
+        # случая «переоткрытие», не зависящий от часов.
+        "add_tasks_completed_exit_seq",
+        "ALTER TABLE tasks ADD COLUMN completed_exit_seq INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
         # Человеческий возврат. Список акторов автоматики — как
         # gate_events.NON_HUMAN_GATE_ACTORS; расхождение ловит тест (новый
         # актор = новая миграция, пересоздающая триггер).
@@ -2575,17 +2581,20 @@ _MIGRATIONS: list[tuple[str, str]] = [
     ),
     (
         # Выход из completed любым путём (transition_status_if, update_task,
-        # прямой UPDATE). Ref — монотонная метка этого выхода вместе с
-        # завершением, из которого вышли: последующие переходы нового случая
-        # не создают, повторное завершение и новый выход — создают.
+        # прямой UPDATE). Ref — порядковый номер выхода из completed у этой
+        # задачи (счётчик completed_exit_seq, растёт в самом триггере), а не
+        # время: два выхода в одну миллисекунду с одинаковым completed_at —
+        # два разных случая. Последующие переходы нового случая не создают.
         "create_trigger_false_approve_reopened",
         """CREATE TRIGGER IF NOT EXISTS trg_false_approve_reopened
         AFTER UPDATE OF status ON tasks
         WHEN OLD.status = 'completed' AND NEW.status != 'completed'
         BEGIN
+            UPDATE tasks SET completed_exit_seq = completed_exit_seq + 1
+            WHERE id = NEW.id;
             INSERT OR IGNORE INTO steward_false_approvals
               (task_id, source, generation, detail, ref)
-            SELECT j.task_id, 'reopened', j.generation, 'задача вышла из completed в ' || NEW.status, 'exit:' || strftime('%Y-%m-%d %H:%M:%f', 'now') || ':' || COALESCE(OLD.completed_at, '')
+            SELECT j.task_id, 'reopened', j.generation, 'задача вышла из completed в ' || NEW.status, 'exit:' || (SELECT completed_exit_seq FROM tasks WHERE id = NEW.id)
             FROM steward_judgements a
             JOIN steward_judgements j ON j.id = a.judged_id
             WHERE a.kind = 'advisor' AND a.verdict = 'concur'
@@ -2614,6 +2623,8 @@ _MIGRATIONS: list[tuple[str, str]] = [
         """CREATE TRIGGER IF NOT EXISTS trg_false_approve_prod_defect_update
         AFTER UPDATE OF found_in, caused_by_task_id ON tasks
         WHEN NEW.found_in = 'prod' AND NEW.caused_by_task_id IS NOT NULL
+          AND (OLD.found_in IS NOT 'prod'
+               OR OLD.caused_by_task_id IS NOT NEW.caused_by_task_id)
         BEGIN
             INSERT OR IGNORE INTO steward_false_approvals
               (task_id, source, generation, detail, ref)
