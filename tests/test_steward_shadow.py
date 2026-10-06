@@ -4038,6 +4038,30 @@ async def test_false_approve_sources_are_sticky_and_global(
     assert await effective_mode(db) == "act"
 
 
+async def test_a_defect_created_already_marked_as_prod_is_a_fact_a_review_one_is_not(
+    db: aiosqlite.Connection,
+):
+    """Дефект, заведённый СРАЗУ с found_in и причиной (путь file_prod_defect): триггер вставки."""
+    project_id = await _project(db, "advisor-fa-insert")
+    task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+
+    await db.execute(
+        "INSERT INTO tasks (title, status, found_in, caused_by_task_id) "
+        "VALUES ('дефект review', 'open', 'review', ?)",
+        (task_id,),
+    )
+    await db.commit()
+    assert await _rows(db) == []
+
+    cursor = await db.execute(
+        "INSERT INTO tasks (title, status, found_in, caused_by_task_id) "
+        "VALUES ('дефект прод', 'open', 'prod', ?)",
+        (task_id,),
+    )
+    await db.commit()
+    assert await _active(db) == [(task_id, "prod_defect", str(cursor.lastrowid))]
+
+
 async def test_a_fact_has_no_window_a_defect_200_days_after_the_approval_counts(
     db: aiosqlite.Connection,
 ):
@@ -4253,6 +4277,9 @@ async def test_later_transitions_and_completion_make_no_new_reopening(
     task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
     await _complete(db, task_id, "2026-09-01 10:00:00")
     assert await _rows(db) == [], "завершение — не переоткрытие"
+    await repo.update_task(db, task_id, status="completed")
+    await db.commit()
+    assert await _rows(db) == [], "повторная запись того же статуса — не выход"
     await repo.update_task(db, task_id, status="open")
     await db.commit()
     assert await clear_false_approval(db, task_id, "denis") == 1

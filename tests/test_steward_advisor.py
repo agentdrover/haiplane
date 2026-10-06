@@ -1755,3 +1755,32 @@ async def test_the_advisor_state_ignores_a_judgement_of_the_old_contour(
     )
 
     assert (await advisor_state(db, task_id, 1)).state == STATE_NOT_APPLICABLE
+
+
+async def test_the_final_outcome_needs_the_same_stamp_not_just_the_same_state(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Метка всё ещё applying, но занята ДРУГИМ проходом (иное время) — исход не пишем."""
+    from hub.services import steward_applied
+
+    await _act(monkeypatch)
+    task_id = await _scenario(db, "advisor-final-stamp", "concur")
+
+    async def _neighbour_reclaims(db_, task, _generation, **_kw):
+        await db_.execute(
+            "UPDATE steward_judgements SET advisor_claimed_at='2099-01-01 00:00:00.000' "
+            "WHERE task_id=? AND kind='verdict'",
+            (task,),
+        )
+        await db_.commit()
+        return ("approved", "x")
+
+    monkeypatch.setattr(steward_applied, "apply_self_approval", _neighbour_reclaims)
+
+    assert await apply_advisor_outcomes(db) == 0
+
+    row = await _judge_row(db, task_id)
+    assert (row["advisor_outcome"], row["advisor_claimed_at"]) == (
+        "applying",
+        "2099-01-01 00:00:00.000",
+    )
