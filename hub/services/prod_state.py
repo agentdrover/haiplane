@@ -57,16 +57,35 @@ BUDGET_REASON = (
 )
 
 
-async def _answers(
-    db: Any, tasks: list[dict[str, Any]], release: Any, started: float
-) -> list[dict[str, Any] | None]:
-    """One answer per task, in task order; ``None`` where the budget ran out.
+async def _reap(*futures: asyncio.Future[Any]) -> None:
+    """Cancel and WAIT for every future — a repeated cancel does not cut it short.
+
+    The wait is the point: ``proc.run`` kills its git process group and reaps
+    the child on cancellation, and that cleanup must be finished when the
+    caller sees the cancellation, not left running behind it.
+    """
+    for fut in futures:
+        fut.cancel()
+    while True:
+        try:
+            await asyncio.gather(*futures, return_exceptions=True)
+            return
+        except asyncio.CancelledError:
+            continue
+
+
+async def _fill(
+    db: Any,
+    tasks: list[dict[str, Any]],
+    release: Any,
+    results: list[dict[str, Any] | None],
+) -> None:
+    """Write one answer per task into ``results``, in place, as they arrive.
 
     SQL first and in sequence (one aiosqlite connection), git second and side
-    by side. Cancelled checks take their git processes with them
-    (``proc.run`` kills the group on cancellation).
+    by side. The caller bounds the whole of it with ONE deadline, so a slow
+    preparation spends the same budget as a slow git call.
     """
-    results: list[dict[str, Any] | None] = [None] * len(tasks)
     pending_checks: list[tuple[int, _GitCheck]] = []
     for i, task in enumerate(tasks):
         prepared = await prepare_delivery(db, int(task["id"]), release=release)
@@ -77,25 +96,34 @@ async def _answers(
 
     gate = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    async def one(check: _GitCheck) -> dict[str, Any]:
+    async def one(i: int, check: _GitCheck) -> None:
         async with gate:
-            return await git_delivery_state(check)
+            results[i] = await git_delivery_state(check)
 
-    futures = {asyncio.ensure_future(one(check)): i for i, check in pending_checks}
-    if futures:
-        left = max(0.0, BUILD_BUDGET_SECONDS - (time.monotonic() - started))
-        try:
-            done, pending = await asyncio.wait(futures, timeout=left)
-        except BaseException:
-            for fut in futures:
-                fut.cancel()
-            raise
-        for fut in pending:
-            fut.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        for fut in done:
-            results[futures[fut]] = fut.result()
+    futures = [asyncio.ensure_future(one(i, check)) for i, check in pending_checks]
+    try:
+        await asyncio.gather(*futures)
+    except BaseException:
+        await _reap(*futures)
+        raise
+
+
+async def _answers(
+    db: Any, tasks: list[dict[str, Any]], release: Any, started: float
+) -> list[dict[str, Any] | None]:
+    """One answer per task, in task order; ``None`` where the budget ran out."""
+    results: list[dict[str, Any] | None] = [None] * len(tasks)
+    work = asyncio.ensure_future(_fill(db, tasks, release, results))
+    left = max(0.0, BUILD_BUDGET_SECONDS - (time.monotonic() - started))
+    try:
+        await asyncio.wait({work}, timeout=left)
+    except BaseException:
+        await _reap(work)
+        raise
+    if not work.done():
+        await _reap(work)
+    else:
+        work.result()
     return results
 
 

@@ -317,3 +317,135 @@ def test_prod_state_budget_is_below_client_timeout():
     budget = getattr(ps, "BUILD_BUDGET_SECONDS", None)
     assert budget is not None, "the snapshot has no build budget"
     assert budget < mcp_server._TIMEOUT_DEFAULT
+
+
+async def test_budget_covers_the_sql_phase_too(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1603 (Codex P2): медленная подготовка тратит тот же бюджет, что и git.
+    import time
+    from hub.services import prod_state as ps
+
+    budget = 0.05
+    monkeypatch.setattr(ps, "BUILD_BUDGET_SECONDS", budget, raising=False)
+    _wire_fake_git(monkeypatch, _FakeGit())
+    await _board(client, db, 4)
+    real_prepare = ps.prepare_delivery
+
+    async def slow(*args, **kwargs):
+        await asyncio.sleep(0.35)
+        return await real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(ps, "prepare_delivery", slow)
+
+    started = time.monotonic()
+    snapshot = await prod_state(db, limit=50)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < budget + 0.25, f"took {elapsed:.2f}s"
+    assert snapshot["examined"] == 0
+    assert len(snapshot["unknown"]) == 4
+    assert all(
+        "срок сборки снимка исчерпан" in e["reason"] for e in snapshot["unknown"]
+    )
+    assert snapshot["not_in_prod"] == [] and snapshot["in_prod"] == []
+    assert "Не проверено 4 из 4" in snapshot["note"]
+
+
+async def test_external_cancel_waits_for_child_cleanup(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1603 (Codex P2): к моменту CancelledError у родителя очистка всех
+    # дочерних проверок (в проде — kill и wait процесса в proc.run) завершена.
+    started = 0
+    cleaned = 0
+
+    class Slow(_FakeGit):
+        async def is_ancestor(self, repo_, ancestor, descendant):
+            nonlocal started, cleaned
+            started += 1
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.2)  # kill + wait the child
+                cleaned += 1
+                raise
+            return True
+
+    _wire_fake_git(monkeypatch, Slow())
+    await _board(client, db, 5)
+
+    task = asyncio.ensure_future(prod_state(db, limit=50))
+    for _ in range(100):
+        if started >= 5:
+            break
+        await asyncio.sleep(0.02)
+    assert started >= 5
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert cleaned == started, f"{started - cleaned} checks still cleaning up"
+
+
+async def test_unknown_is_not_cached(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1603: UNKNOWN при повторе спрашивает git заново.
+    class Unsure(_FakeGit):
+        async def is_ancestor(self, repo_, ancestor, descendant):
+            await self._wait()
+            return None
+
+    fake = Unsure()
+    _wire_fake_git(monkeypatch, fake)
+    await _board(client, db, 1)
+
+    first = await prod_state(db)
+    calls = fake.calls
+    second = await prod_state(db)
+
+    assert len(first["unknown"]) == len(second["unknown"]) == 1
+    assert fake.calls > calls, "UNKNOWN was served from the cache"
+
+
+async def test_in_prod_cache_is_capped_and_resets(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1603: кэш ограничен и сбрасывается целиком при переполнении.
+    from hub.services import delivery_state as ds
+
+    monkeypatch.setattr(ds, "_IN_PROD_CAP", 3)
+    _wire_fake_git(monkeypatch, _FakeGit())
+    await _board(client, db, 5)
+
+    snapshot = await prod_state(db)
+
+    assert len(snapshot["in_prod"]) == 5
+    assert 1 <= len(ds._in_prod_cache) <= 3
+
+
+async def test_cached_answer_carries_the_current_deploy_date(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # #1603 (Codex P2): тот же sha выкатили снова — дата в ответе новая.
+    from hub.services.delivery_state import delivery_state
+
+    _wire_fake_git(monkeypatch, _FakeGit())
+    ids = await _board(client, db, 1)
+    await db.execute(
+        "UPDATE releases SET deployed_at = ?", ("2026-01-01T00:00:00+00:00",)
+    )
+    await db.commit()
+    first = await delivery_state(db, ids[0])
+    assert "2026-01-01" in first["reason"]
+
+    await db.execute(
+        "UPDATE releases SET deployed_at = ?", ("2026-02-02T00:00:00+00:00",)
+    )
+    await db.commit()
+    second = await delivery_state(db, ids[0])
+
+    assert second["deployed_at"].startswith("2026-02-02")
+    assert "2026-02-02" in second["reason"] and "2026-01-01" not in second["reason"]

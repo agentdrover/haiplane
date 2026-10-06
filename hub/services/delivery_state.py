@@ -206,11 +206,30 @@ class _GitCheck:
 # The key carries everything the answer depends on, and the cache is read only
 # AFTER the project-applicability checks in ``prepare_delivery``.
 _IN_PROD_CAP = 512
-_in_prod_cache: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+# What is stored is the PROOF (the reason's text without the deploy date and
+# how the date is worded), never the answer: a sha deployed again keeps its
+# key, and the date of the earlier deploy must not outlive it.
+_in_prod_cache: dict[tuple[str, str, str, str], tuple[str, str]] = {}
 
 
 def _cache_key(check: _GitCheck) -> tuple[str, str, str, str]:
     return (check.workspace, check.base, check.merge_sha, check.deployed_sha)
+
+
+def _in_prod_reason(check: _GitCheck, text: str, style: str) -> str:
+    if not check.deployed_at:
+        return text
+    return text + (
+        f" от {check.deployed_at}" if style == "от" else f" (выкат {check.deployed_at})"
+    )
+
+
+def _in_prod(check: _GitCheck, text: str, style: str) -> dict[str, Any]:
+    """A definite IN_PROD answer; remembers the proof for the next snapshot."""
+    if len(_in_prod_cache) >= _IN_PROD_CAP:
+        _in_prod_cache.clear()
+    _in_prod_cache[_cache_key(check)] = (text, style)
+    return _answer(IN_PROD, _in_prod_reason(check, text, style), **check.known)
 
 
 async def delivery_state(
@@ -316,21 +335,15 @@ async def prepare_delivery(
 
 async def git_delivery_state(check: _GitCheck) -> dict[str, Any]:
     """The git half of the answer, cached when — and only when — it is IN_PROD."""
-    key = _cache_key(check)
-    cached = _in_prod_cache.get(key)
+    cached = _in_prod_cache.get(_cache_key(check))
     if cached is not None:
-        return {**cached}
-    answer = await _decide_with_git(check)
-    if answer.get("state") == IN_PROD:
-        if len(_in_prod_cache) >= _IN_PROD_CAP:
-            _in_prod_cache.clear()
-        _in_prod_cache[key] = {**answer}
-    return answer
+        return _answer(IN_PROD, _in_prod_reason(check, *cached), **check.known)
+    return await _decide_with_git(check)
 
 
 async def _decide_with_git(check: _GitCheck) -> dict[str, Any]:
     merge_sha, deployed_sha = check.merge_sha, check.deployed_sha
-    deployed_at, workspace = check.deployed_at, check.workspace
+    workspace = check.workspace
     known = check.known
     # #883: the objects have to be here before git can be asked about them.
     # The workspace tracks the base branch, so a commit deployed from another
@@ -370,11 +383,10 @@ async def _decide_with_git(check: _GitCheck) -> dict[str, Any]:
             **known,
         )
     if reachable:
-        return _answer(
-            IN_PROD,
-            f"мерж {merge_sha[:12]} входит в раскатанный {deployed_sha[:12]}"
-            + (f" от {deployed_at}" if deployed_at else ""),
-            **known,
+        return _in_prod(
+            check,
+            f"мерж {merge_sha[:12]} входит в раскатанный {deployed_sha[:12]}",
+            "от",
         )
 
     # Not an ancestor is not yet an answer (#946). A release merged by squash
@@ -403,13 +415,12 @@ async def _decide_with_git(check: _GitCheck) -> dict[str, Any]:
                 **known,
             )
         if carried:
-            return _answer(
-                IN_PROD,
+            return _in_prod(
+                check,
                 f"релиз собран squash-ом, поэтому {merge_sha[:12]} не предок "
                 f"{deployed_sha[:12]}; раскатано содержимое {base} на "
-                f"{twin[:12]}, и мерж в него входит"
-                + (f" (выкат {deployed_at})" if deployed_at else ""),
-                **known,
+                f"{twin[:12]}, и мерж в него входит",
+                "выкат",
             )
     # #950: ancestry is cut twice in this flow — the release squashes, and the
     # base branch can be recreated from the release branch afterwards. The
@@ -435,13 +446,12 @@ async def _decide_with_git(check: _GitCheck) -> dict[str, Any]:
                 **known,
             )
         if carried_out or release_sha == deployed_sha:
-            return _answer(
-                IN_PROD,
+            return _in_prod(
+                check,
                 f"родословная мержа {merge_sha[:12]} оборвана, но релиз "
                 f"PR #{release_pr} записал, что увёз его: {release_sha[:12]} "
-                f"входит в раскатанный {deployed_sha[:12]}"
-                + (f" (выкат {deployed_at})" if deployed_at else ""),
-                **known,
+                f"входит в раскатанный {deployed_sha[:12]}",
+                "выкат",
             )
         return _answer(
             NOT_IN_PROD,
