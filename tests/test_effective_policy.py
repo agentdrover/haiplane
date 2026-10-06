@@ -822,3 +822,65 @@ async def test_release_artifacts_policy_is_validated_and_confined(
         (await client.get("/api/projects/ra-policy/effective-policy")).json()
     )["release_artifacts"]
     assert row["source"] == "default" and row["value"] == []
+
+
+async def test_summary_shows_scheduled_change_and_its_executor(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, capsys
+):
+    """#1593: «2 → 4 с даты» рядом с ключом; исполненную правку делает актор schedule."""
+    from datetime import UTC, datetime, timedelta
+
+    from hub.services import policy_change
+
+    base = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    clock = {"now": base}
+    monkeypatch.setattr(policy_change, "utcnow", lambda: clock["now"])
+    await _project(db, "sched-sum", {"deep_daily_cap": 2})
+    at = base + timedelta(days=7)
+    for value in (4, 5):
+        resp = await client.post(
+            "/api/projects/sched-sum/policy-schedule",
+            json={
+                "at": (at + timedelta(hours=value)).isoformat(),
+                "patch": {"deep_daily_cap": value},
+            },
+        )
+        assert resp.status_code == 201, resp.text
+
+    before = (await client.get("/api/projects/sched-sum/effective-policy")).json()
+    cap = next(r for r in before["keys"] if r["key"] == "deep_daily_cap")
+    assert cap["value"] == 2
+    assert [p["value"] for p in cap["scheduled"]] == [4, 5], "цепочка по порядку"
+    text = "\n".join(effective_policy.format_effective_policy(before))
+    assert "→ 4 с 2026-10-13" in text and "отложенная правка #1" in text
+
+    # Чтение списка: CLI и MCP — только чтение, тот же текст.
+    listed = (await client.get("/api/projects/sched-sum/policy-schedule")).json()
+
+    async def _via_client(path: str, **_: object) -> object:
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _via_client)
+    out = await mcp_server.hub_policy_schedule("sched-sum")
+    assert "#1 pending" in _message(out) and "#2 pending" in _message(out)
+    with (
+        patch.object(sys, "argv", ["oc-hub", "policy-schedule", "sched-sum"]),
+        patch.object(cli, "_api", return_value=listed) as api,
+    ):
+        assert cli.main() in (0, None)
+    assert api.call_args.args[:2] == (
+        "GET",
+        "/api/projects/sched-sum/policy-schedule",
+    )
+    assert capsys.readouterr().out.strip() == _message(out).strip()
+
+    clock["now"] = at + timedelta(days=1)
+    await policy_change.run_due(db)
+    after = (await client.get("/api/projects/sched-sum/effective-policy")).json()
+    assert after["scheduled"] == []
+    change = after["last_change"]
+    assert change["actor"] == "schedule" and change["schedule_id"] == 2
+    assert change["changes"] == {"deep_daily_cap": {"was": 4, "now": 5}}
+    assert "executed from schedule #2" in "\n".join(
+        effective_policy.format_effective_policy(after)
+    )

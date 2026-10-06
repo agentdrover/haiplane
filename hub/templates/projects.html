@@ -198,6 +198,7 @@
             <details class="project-admin-edit" {% if project_error_id == c.project.id %}open{% endif %}>
                 <summary class="project-edit-summary">Изменить</summary>
                 <form method="post" action="/projects/{{ c.project.id }}/web-edit" class="task-action-stack project-form">
+                    <input type="hidden" name="policy_version" value="{{ policy_versions.get(c.project.id, '') }}">
                     <label class="task-action-label">Name</label>
                     <input name="name" class="task-action-control" value="{{ c.project.name }}">
                     <label class="task-action-label">Repo (owner/repo)</label>

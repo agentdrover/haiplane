@@ -1312,3 +1312,44 @@ async def test_pipeline_merges_rekey_is_all_or_nothing(monkeypatch):
         assert await _pipeline_merges_rows(conn) == _OLD_MERGE_ROWS
     finally:
         await conn.close()
+
+
+async def test_scheduled_policy_changes_table_fresh_and_migrated():
+    """#1593: таблица расписания есть на свежей схеме и доезжает миграцией."""
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "scheduled_policy_changes")
+        assert {
+            "id",
+            "project_id",
+            "at",
+            "patch",
+            "note",
+            "created_by",
+            "created_at",
+            "state",
+            "executed_at",
+            "result",
+        } <= set(cols)
+        await conn.execute("INSERT INTO projects (slug, name) VALUES ('p', 'P')")
+        await conn.execute(
+            "INSERT INTO scheduled_policy_changes (project_id, at, patch) "
+            "VALUES (1, '2026-10-13T00:00:00Z', '{}')"
+        )
+        row = (
+            await conn.execute_fetchall("SELECT state FROM scheduled_policy_changes")
+        )[0]
+        assert row["state"] == "pending"
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute("UPDATE scheduled_policy_changes SET state='bogus'")
+        # Путь миграции: база без записи о миграции получает таблицу при _migrate.
+        await conn.execute("DROP TABLE scheduled_policy_changes")
+        await conn.execute(
+            "DELETE FROM _migrations WHERE name IN "
+            "('create_scheduled_policy_changes', 'idx_scheduled_policy_changes_due')"
+        )
+        await conn.commit()
+        await _migrate(conn)
+        assert "state" in await _table_columns(conn, "scheduled_policy_changes")
+    finally:
+        await conn.close()
