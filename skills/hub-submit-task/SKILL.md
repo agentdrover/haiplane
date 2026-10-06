@@ -28,9 +28,11 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
   - `rule`: `ref` = категория, которая уже есть в `category_checks`; иначе 422
     `prevention_invalid` (запись категории - `POST /api/metrics/category-checks`);
   - `accepted_risk`: `reason` и `revisit` оба обязательны, `ref` не нужен.
-- Когда обязателен: у задачи `found_in='prod'` сдача без `prevention` получает
-  422 `prevention_required` (`prevention_gate.check_submission`,
-  `refuse_without_prevention`). Если `prevention` прислан, он проверяется всегда.
+- Когда обязателен: у задачи `found_in='prod'` сдача получает 422
+  `prevention_required`, только если вывода нет ни в payload, ни в уже
+  сохранённом `defect_prevention` задачи (`prevention_gate.prevention_gap`,
+  `check_submission`, `refuse_without_prevention`). Если `prevention` прислан, он
+  проверяется всегда.
 - Пример payload: `prevention={"kind": "regression_test", "ref": "tests/test_x.py::test_y"}`.
 - Оговорка: тексты отказов в `prevention_gate` до сих пор называют CLI `oc-hub`.
   Имя команды - `hp-hub` (правило 6).
@@ -65,14 +67,23 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
 ## 3. Ошибка транспорта не значит, что сдача не записана
 
 - Сначала `hub_task_status(task_id)`: поля `status`, `submission_generation`,
-  `submission_sha`, `latest_review`. Сдача записана, если статус `review` и
-  поколение выросло против того, что было до вызова.
+  `submission_sha`, `latest_review`. Рост поколения - признак новой сдачи:
+  успешный повтор того же sha поколение не растит (правило 2). Сдача записана,
+  если статус `review` и поколение выросло против того, что было до вызова.
 - Клиентский `hub_submit_for_review` сам читает задачу до вызова
   (`prior_status`, `prior_generation`) и по совпадению поколения узнаёт повтор
   того же sha (`was_unchanged_retry`); других ключей идемпотентности у сдачи нет.
-- Слепой повтор после «упавшего» вызова либо будет no-op (тот же sha из `review`,
-  правило 2), либо, если первый вызов не дошёл, станет первой сдачей. Тот и другой
-  исход читается по `hub_task_status`, не по тексту ошибки.
+- Слепой повтор после «упавшего» вызова даёт один из трёх исходов, и читается он
+  по `hub_task_status`, не по тексту ошибки:
+  1. первый вызов не дошёл: повтор станет первой сдачей;
+  2. первый записался, `submission_sha` не пуст: повтор того же sha из `review`
+     будет no-op (правило 2);
+  3. первый записался с пустым `submission_sha`: хаб не получил вершину ветки
+     (`resolve_branch_tip` вернул пустой sha и причину). No-op требует непустого
+     совпадающего sha (`_step_same_sha_from_review_is_current`), поэтому повтор
+     при том же коде откроет НОВОЕ поколение и купит ещё одно ревью. Если поле
+     `submission_sha` пусто, не повторяйте вслепую: сначала выясните, почему
+     вершина не получена (ветка не запушена, нет сети у хаба), и скажите об этом.
 - Источник правила - практика сессий (запись памяти о цене повтора); в коде
   подтверждено только наличие полей сверки и поведение повтора, описанное выше.
 
