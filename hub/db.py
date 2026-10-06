@@ -2540,6 +2540,35 @@ _MIGRATIONS: list[tuple[str, str]] = [
             UNIQUE (task_id, source)
         )""",
     ),
+    (
+        # #1593: отложенные правки политики проекта. Своя таблица, не ключ
+        # gate_policy: политика остаётся тем, что хаб ЧИТАЕТ, а расписание —
+        # тем, что хаб ИСПОЛНЯЕТ; ключ расписания внутри политики прошёл бы
+        # валидатор и замок как «политика», а исполнитель должен читать его
+        # другим кодом. ``at`` — UTC в одном формате (``%Y-%m-%dT%H:%M:%SZ``),
+        # поэтому порядок (at, id) — порядок строк. State меняет хаб
+        # (pending → applied|refused) или человек (pending → cancelled);
+        # исполненная запись больше не редактируется.
+        "create_scheduled_policy_changes",
+        """CREATE TABLE IF NOT EXISTS scheduled_policy_changes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER NOT NULL REFERENCES projects(id),
+            at          TEXT    NOT NULL,
+            patch       TEXT    NOT NULL,
+            note        TEXT    NOT NULL DEFAULT '',
+            created_by  TEXT    NOT NULL DEFAULT '',
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            state       TEXT    NOT NULL DEFAULT 'pending'
+                CHECK (state IN ('pending', 'applied', 'refused', 'cancelled')),
+            executed_at TEXT,
+            result      TEXT    NOT NULL DEFAULT '{}'
+        )""",
+    ),
+    (
+        "idx_scheduled_policy_changes_due",
+        "CREATE INDEX IF NOT EXISTS idx_scheduled_policy_changes_due "
+        "ON scheduled_policy_changes(state, at, id)",
+    ),
 ]
 
 

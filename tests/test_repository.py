@@ -714,3 +714,41 @@ async def test_claim_arbiter_dispatch_at_most_once(db: aiosqlite.Connection):
 
     # A newer submission generation is a fresh window.
     assert await repo.claim_arbiter_dispatch(db, task_id, 2) is True
+
+
+async def test_scheduled_policy_change_states_move_only_from_pending(db):
+    """#1593: исполненная и отменённая записи больше не редактируются."""
+    pid = await repo.create_project(db, slug="sched-repo", name="S")
+    first = await repo.insert_scheduled_policy_change(
+        db,
+        project_id=pid,
+        at="2026-10-13T00:00:00Z",
+        patch={"wip_limit": 2},
+        note="",
+        created_by="denis",
+    )
+    second = await repo.insert_scheduled_policy_change(
+        db,
+        project_id=pid,
+        at="2026-10-12T00:00:00Z",
+        patch={"wip_limit": 3},
+        note="",
+        created_by="denis",
+    )
+    await db.commit()
+    assert [r["id"] for r in await repo.list_scheduled_policy_changes(db, pid)] == [
+        second,
+        first,
+    ], "порядок исполнения — (at, id)"
+    assert await repo.settle_scheduled_policy_change(
+        db, first, state="applied", executed_at="2026-10-13T00:00:01Z", result={}
+    )
+    assert not await repo.settle_scheduled_policy_change(
+        db, first, state="refused", executed_at="x", result={}
+    ), "исполненная запись не переписывается"
+    assert not await repo.cancel_scheduled_policy_change(db, first, result={})
+    assert await repo.cancel_scheduled_policy_change(db, second, result={})
+    assert not await repo.settle_scheduled_policy_change(
+        db, second, state="applied", executed_at="x", result={}
+    ), "отменённая не исполняется"
+    assert await repo.count_pending_scheduled_policy_changes(db, pid) == 0

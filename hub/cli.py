@@ -534,6 +534,20 @@ def _add_effective_policy_parser(sub: Any) -> None:
     p_policy.set_defaults(func=cmd_effective_policy)
 
 
+def _add_policy_schedule_parser(sub: Any) -> None:
+    """Kept out of build_parser, which sits at its complexity ceiling (#1593)."""
+    p_sched = sub.add_parser(
+        "policy-schedule",
+        help="Scheduled policy changes of a project (read-only; humans plan) (#1593)",
+    )
+    p_sched.add_argument("slug", help="Project slug")
+    p_sched.add_argument(
+        "--state", choices=("pending", "applied", "refused", "cancelled")
+    )
+    p_sched.add_argument("--json", action="store_true", help="Print raw JSON")
+    p_sched.set_defaults(func=cmd_policy_schedule)
+
+
 def _add_path_parser(sub: Any) -> None:
     """Kept out of build_parser, which sits at its complexity ceiling (#1527)."""
     p_path = sub.add_parser(
@@ -549,6 +563,7 @@ def _add_defect_metric_parsers(sub: Any) -> None:
     """Defect metric sections (#918, #914) and the policy view (#1457): one call
     from build_parser, which sits at its complexity ceiling."""
     _add_effective_policy_parser(sub)
+    _add_policy_schedule_parser(sub)
     _add_path_parser(sub)
     _add_change_failure_rate_parser(sub)
     _add_shift_left_parser(sub)
@@ -1594,6 +1609,21 @@ def cmd_effective_policy(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     print("\n".join(format_effective_policy(result)))
+    return 0
+
+
+def cmd_policy_schedule(args: argparse.Namespace) -> int:
+    """Расписание правок политики проекта — только чтение (#1593)."""
+    from hub.services.policy_change import format_schedule
+
+    path = f"/api/projects/{urllib.parse.quote(args.slug, safe='')}/policy-schedule"
+    if args.state:
+        path += f"?state={args.state}"
+    result = _api("GET", path)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print("\n".join(format_schedule(args.slug, result)))
     return 0
 
 

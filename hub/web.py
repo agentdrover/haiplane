@@ -41,7 +41,7 @@ from hub.auth import (
 from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
 from hub.services import chat_pair as chat_pair_svc
-from hub.services import project_policy
+from hub.services import policy_change, project_policy
 from hub.services import steward_dispatch
 from hub.services.finding_evidence import evidence_for_findings, evidence_for_report
 from hub.services.finding_identity import finding_uids
@@ -1050,6 +1050,11 @@ async def web_projects(
             "csrf_token": csrf_token,
             "executor_launch_mode": _executor_launch_mode,
             "projects": [dict(r) for r in rows],
+            # #1593: версия политики, с которой составлена форма правки; её
+            # сверяет PATCH внутри write-транзакции.
+            "policy_versions": {
+                int(r["id"]): policy_change.policy_version(r) for r in rows
+            },
             "cards": cards,
             "project_error": project_error,
             "project_error_id": project_error_id,
@@ -1515,6 +1520,21 @@ async def web_edit_project(project_id: int, request: Request):
         return _projects_error_redirect(err, project_id)
     if gate_policy is not None:
         fields["gate_policy"] = gate_policy
+        # #1593: форма несёт политику ЦЕЛИКОМ — открытая до исполнения
+        # отложенной правки и отправленная после, она вернула бы старые
+        # значения. Версия, с которой форма составлена, едет в PATCH и
+        # сверяется под write-локом; без неё форма отказывает.
+        sent_version = str(form.get("policy_version") or "").strip()
+        if not sent_version:
+            # Старая страница (открыта до выката проверки) или самодельный
+            # запрос: без версии не узнать, не затрёт ли форма исполненную
+            # правку. Отказ, а не молчаливое «проверки нет».
+            return _projects_error_redirect(
+                "Форма политики без версии: обновите страницу и повторите правку. "
+                "НИЧЕГО не сохранено.",
+                project_id,
+            )
+        fields["policy_version"] = sent_version
     if not fields:
         return RedirectResponse("/projects", status_code=303)
     try:

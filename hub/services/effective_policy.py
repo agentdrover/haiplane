@@ -27,6 +27,7 @@ from hub.services import (
     executor_dispatch,
     executor_launch,
     executor_slots,
+    policy_change,
     project_policy,
     review_dispatch,
     steward_dispatch,
@@ -281,15 +282,67 @@ async def _last_change(
         "by": payload.get("by") or "",
         "changed": list(payload.get("changed") or []),
         "removed": list(payload.get("removed") or []),
+        # #1593: «было → стало» и id записи расписания, если правку исполнил хаб.
+        "changes": payload.get("changes") or {},
+        "schedule_id": payload.get("schedule_id"),
+        "late": bool(payload.get("late")),
     }
+
+
+def _scheduled_block(
+    policy: dict[str, Any], rows: list[Any]
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Ожидающие правки (#1593): список и разбивка по ключам реестра.
+
+    Значение «после» считает тот же читатель, что и сводка, на политике, к
+    которой правки применены по порядку (at, id): две правки одного ключа
+    показывают цепочку, а не две независимые подмены.
+    """
+    pending = [policy_change.view_row(r) for r in rows]
+    running = dict(policy)
+    by_key: dict[str, list[dict[str, Any]]] = {}
+    for item in pending:
+        for key, value in item["patch"].items():
+            if value is None:
+                running.pop(key, None)
+            else:
+                running[key] = value
+            entry = REGISTRY.get(key)
+            if entry is None:
+                continue
+            by_key.setdefault(key, []).append(
+                {
+                    "id": item["id"],
+                    "at": item["at"],
+                    "value": entry.read(running),
+                    "note": item["note"],
+                }
+            )
+    return pending, by_key
 
 
 async def effective_policy(db: aiosqlite.Connection, project: Any) -> dict[str, Any]:
     """Действующая политика проекта: ключи, сервер, стюард, замки, последняя правка."""
     policy = project_policy.gate_policy_of(project)
+    pending, by_key = _scheduled_block(
+        policy,
+        await repo.list_scheduled_policy_changes(
+            db, int(project["id"]), state="pending"
+        ),
+    )
+    keys = [_key_row(key, entry, policy) for key, entry in REGISTRY.items()]
+    for row in keys:
+        if row["key"] in by_key:
+            row["scheduled"] = by_key[row["key"]]
+    refused = await repo.list_scheduled_policy_changes(
+        db, int(project["id"]), state="refused"
+    )
     return {
         "slug": project["slug"],
-        "keys": [_key_row(key, entry, policy) for key, entry in REGISTRY.items()],
+        "policy_version": policy_change.policy_version(project),
+        "scheduled": pending,
+        "scheduled_refused": [policy_change.view_row(r) for r in refused[-3:]],
+        "keys": keys,
         "unknown_keys": {k: v for k, v in policy.items() if k not in REGISTRY},
         "steward": await _steward_block(db),
         "server": _server_block(),
@@ -329,6 +382,11 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
             f"  {row['key']} = {_show(row['value'])} [{_source_label(row)}]"
             + _stored_note(row)
         )
+        for plan in row.get("scheduled") or []:
+            lines.append(
+                f"    → {_show(plan['value'])} с {plan['at']} "
+                f"(отложенная правка #{plan['id']})"
+            )
     for key, value in (data.get("unknown_keys") or {}).items():
         lines.append(f"  {key} = {_show(value)} [unknown key]")
     steward = data["steward"]
@@ -374,8 +432,26 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
         who = change["by"] or change["actor"]
         touched = ", ".join([*change["changed"], *(f"-{k}" for k in change["removed"])])
         lines.append(f"Last change: {change['at']} by {who} ({touched or 'no keys'})")
+        if change.get("schedule_id") is not None:
+            lines.append(
+                f"  executed from schedule #{change['schedule_id']}"
+                + (" (late)" if change.get("late") else "")
+                + ": "
+                + (policy_change.render_changes(change["changes"]) or "no changes")
+            )
     else:
         lines.append("Last change: none recorded")
+    for item in data.get("scheduled") or []:
+        lines.append(
+            f"Scheduled #{item['id']} at {item['at']}: "
+            + json.dumps(item["patch"], ensure_ascii=False, sort_keys=True)
+            + (f" — {item['note']}" if item["note"] else "")
+        )
+    for item in data.get("scheduled_refused") or []:
+        lines.append(
+            f"Scheduled #{item['id']} REFUSED at {item['executed_at']}: "
+            f"{item['result'].get('reason', '')}"
+        )
     return lines
 
 

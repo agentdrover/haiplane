@@ -1139,6 +1139,129 @@ async def update_project(
     )
 
 
+# ---------------------------------------------------------------------------
+# Отложенные правки политики проекта (#1593)
+# ---------------------------------------------------------------------------
+
+
+async def insert_scheduled_policy_change(
+    db: aiosqlite.Connection,
+    *,
+    project_id: int,
+    at: str,
+    patch: dict[str, Any],
+    note: str,
+    created_by: str,
+) -> int:
+    """Новая запись всегда pending; id выдаёт база. Коммит — на вызывающем."""
+    cur = await db.execute(
+        "INSERT INTO scheduled_policy_changes "
+        "(project_id, at, patch, note, created_by) VALUES (?, ?, ?, ?, ?)",
+        (project_id, at, json.dumps(patch, ensure_ascii=False), note, created_by),
+    )
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+async def get_scheduled_policy_change(
+    db: aiosqlite.Connection, change_id: int
+) -> aiosqlite.Row | None:
+    rows = await fetchall(
+        db, "SELECT * FROM scheduled_policy_changes WHERE id=?", (change_id,)
+    )
+    return rows[0] if rows else None
+
+
+async def list_scheduled_policy_changes(
+    db: aiosqlite.Connection, project_id: int, *, state: str | None = None
+) -> list[aiosqlite.Row]:
+    """Записи проекта в порядке исполнения (at, id)."""
+    if state is None:
+        return await fetchall(
+            db,
+            "SELECT * FROM scheduled_policy_changes WHERE project_id=? ORDER BY at, id",
+            (project_id,),
+        )
+    return await fetchall(
+        db,
+        "SELECT * FROM scheduled_policy_changes WHERE project_id=? AND state=? "
+        "ORDER BY at, id",
+        (project_id, state),
+    )
+
+
+async def count_pending_scheduled_policy_changes(
+    db: aiosqlite.Connection, project_id: int
+) -> int:
+    rows = await fetchall(
+        db,
+        "SELECT COUNT(*) AS n FROM scheduled_policy_changes "
+        "WHERE project_id=? AND state='pending'",
+        (project_id,),
+    )
+    return int(rows[0]["n"])
+
+
+async def has_due_scheduled_policy_change(db: aiosqlite.Connection, now: str) -> bool:
+    """Дешёвая проверка БЕЗ write-лока: «есть ли что исполнять».
+
+    Только подсказка, чтобы пустой проход не брал write-лок на каждом тике.
+    Саму запись исполнитель читает заново, внутри транзакции.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM scheduled_policy_changes "
+        "WHERE state='pending' AND at<=? LIMIT 1",
+        (now,),
+    )
+    return bool(rows)
+
+
+async def next_due_scheduled_policy_change(
+    db: aiosqlite.Connection, now: str
+) -> aiosqlite.Row | None:
+    """Первая просроченная pending-запись в порядке (at, id).
+
+    Вызывать ТОЛЬКО внутри write_transaction: прочитанная раньше запись к
+    моменту записи может быть уже исполнена другим соединением.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT * FROM scheduled_policy_changes "
+        "WHERE state='pending' AND at<=? ORDER BY at, id LIMIT 1",
+        (now,),
+    )
+    return rows[0] if rows else None
+
+
+async def settle_scheduled_policy_change(
+    db: aiosqlite.Connection,
+    change_id: int,
+    *,
+    state: str,
+    executed_at: str,
+    result: dict[str, Any],
+) -> bool:
+    """pending → applied|refused. False, если запись уже не pending."""
+    cur = await db.execute(
+        "UPDATE scheduled_policy_changes SET state=?, executed_at=?, result=? "
+        "WHERE id=? AND state='pending'",
+        (state, executed_at, json.dumps(result, ensure_ascii=False), change_id),
+    )
+    return bool(cur.rowcount)
+
+
+async def cancel_scheduled_policy_change(
+    db: aiosqlite.Connection, change_id: int, *, result: dict[str, Any]
+) -> bool:
+    """pending → cancelled (человек). False, если запись уже не pending."""
+    cur = await db.execute(
+        "UPDATE scheduled_policy_changes SET state='cancelled', result=? "
+        "WHERE id=? AND state='pending'",
+        (json.dumps(result, ensure_ascii=False), change_id),
+    )
+    return bool(cur.rowcount)
+
+
 async def list_task_ids_for_project(
     db: aiosqlite.Connection, project_id: int
 ) -> set[int]:
