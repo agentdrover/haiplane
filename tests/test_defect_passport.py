@@ -97,6 +97,11 @@ async def test_migration_defaults_to_unknown():
             "add_resolved_at_column",
             "idx_tasks_found_in",
             "idx_tasks_caused_by",
+            # Триггеры #1601 читают NEW.found_in / NEW.caused_by_task_id и без
+            # этих колонок не создаются: они часть «схемы до паспорта» тем же
+            # правом, что индексы выше.
+            "create_trigger_false_approve_prod_defect_insert",
+            "create_trigger_false_approve_prod_defect_update",
         }
         assert passport <= {name for name, _ in _MIGRATIONS}, "renamed migration?"
         await conn.execute(

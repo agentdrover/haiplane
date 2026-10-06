@@ -256,6 +256,51 @@ def steward_judgement_exists_detail(
     )
 
 
+def steward_advisor_channel_detail(kind: str, session_kind: str) -> dict[str, Any]:
+    """403: a judgement of this kind came through the other steward channel (#1601).
+
+    The judge and the advisor walk the same two routes with different session
+    kinds; each may only write its own judgement, so the judge cannot answer
+    for its own critic (and the critic cannot judge for the judge).
+    """
+    return enrich_error_payload(
+        {
+            "reason": "steward_advisor_channel",
+            "actor_hint": "none",
+            "message": (
+                f"a {kind!r} judgement is not accepted from a "
+                f"{session_kind or 'plain'} steward session"
+            ),
+            "hint": (
+                "kind=advisor is written only by the advisor session the hub "
+                "ordered for the judge's approve; every other kind only by the "
+                "judge session. The channel is the session kind, not a field."
+            ),
+            "suggested_tool": None,
+        }
+    )
+
+
+def steward_advisor_not_ordered_detail(task_id: int, generation: int) -> dict[str, Any]:
+    """409: no open, started advisor order backs this advisor judgement (#1601)."""
+    return enrich_error_payload(
+        {
+            "reason": "steward_advisor_not_ordered",
+            "actor_hint": "none",
+            "message": (
+                f"no open advisor order for task #{task_id} generation "
+                f"{generation}, or the judge's approve it answers is missing"
+            ),
+            "hint": (
+                "The advisor answers one approve of the judge, under the order "
+                "the hub placed for it. A late answer after the order closed "
+                "(timeout, new submission) is refused, not stored."
+            ),
+            "suggested_tool": None,
+        }
+    )
+
+
 def steward_gate_forbidden_detail(method: str, path: str) -> dict[str, Any]:
     """A steward token reached a route outside its two-op allowlist (#1021)."""
     return enrich_error_payload(

@@ -482,7 +482,9 @@ async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity
                 else None
             ),
         )
-    if kind == "steward":
+    if kind in config.STEWARD_PAIR_KINDS:
+        # #1601: тот же допуск стюарда, но вид сессии сохраняется — по нему
+        # суждение судьи и суждение советника разведены.
         # #1120: the steward run authenticates the same way the reviewer does
         # since #1084 — Cursor drops mcpServers, so the header never arrives
         # and a one-time code in the prompt is the only channel that does.
@@ -496,7 +498,7 @@ async def resolve_session(db: aiosqlite.Connection, token: str) -> TokenIdentity
             principal_id=row["principal_id"],
             permissions=config.STEWARD_PERMS,
             auth_source="chat_pair",
-            chat_pair_kind="steward",
+            chat_pair_kind=kind,
             chat_pair_task_id=bound_id,
             chat_pair_generation=(
                 int(row["bound_generation"])

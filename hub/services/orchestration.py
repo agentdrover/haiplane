@@ -640,32 +640,42 @@ async def record_category_check(
 
 
 async def _steward_shadow_metrics(db: aiosqlite.Connection) -> dict[str, Any]:
-    """The 2x2 table and the act thresholds, for the practice metrics (#1107).
+    """Критерий выхода из тени v2 и таблица тени, для метрик практики (#1107, #1601).
 
     Read-only and total rather than windowed: the exit criteria are about the
     whole shadow phase, and a 90-day window would quietly reset the sample
     the decision rests on.
+
+    Верхний уровень — НОВЫЙ контур «судья + советник»: пары, согласие,
+    возражения, таймауты, ошибочные одобрения с номерами задач, процедурные
+    эскалации отдельно, доля по существу и ``act_refusals`` v2. Таблица 2x2
+    «стюард против человека» — другая метрика (справочная, она больше не
+    решает о выходе) и лежит под ключом ``human_table`` со своими счётчиками.
     """
+    from hub.services.steward_exit import contour_report
     from hub.services.steward_shadow import act_refusals, shadow_table
 
     table = await shadow_table(db)
     refusals = await act_refusals(db)
     return {
-        "both_approve": table.both_approve,
-        "steward_approve_human_changes": table.steward_approve_human_changes,
-        "steward_changes_human_approve": table.steward_changes_human_approve,
-        "both_changes": table.both_changes,
-        "escalated": table.escalated,
-        "unpaired": table.unpaired,
-        "false_approve": table.false_approve,
-        "human_changes": table.human_changes,
-        # None means "not measured", never 0.0 — the same distinction the
-        # packet draws between absent and negative (#762).
-        "escalation_share": table.escalation_share,
+        **await contour_report(db),
         "act_refusals": [
             {"reason": code, "detail": detail} for code, detail in refusals
         ],
         "act_ready": not refusals,
+        "human_table": {
+            "both_approve": table.both_approve,
+            "steward_approve_human_changes": table.steward_approve_human_changes,
+            "steward_changes_human_approve": table.steward_changes_human_approve,
+            "both_changes": table.both_changes,
+            "escalated": table.escalated,
+            "unpaired": table.unpaired,
+            "false_approve": table.false_approve,
+            "human_changes": table.human_changes,
+            # None means "not measured", never 0.0 — the same distinction the
+            # packet draws between absent and negative (#762).
+            "escalation_share": table.escalation_share,
+        },
     }
 
 

@@ -3364,17 +3364,16 @@ async def hub_submit_steward_judgement(
 ) -> CallToolResult:
     """Record a steward judgement. Does not transition the task (#1022).
 
-    ``verdict`` has no default (422, never a silent approve). ``kind`` is
-    verdict|dor|disposition. ``ground.source`` and ``escalate_reason`` are
-    closed sets with no ``unknown``. ``confidence=low`` stores as
-    escalate/low_confidence. At-most-once on (task_id, generation, kind).
-    Closures address findings by finding_uid.
+    ``verdict`` has no default (422, never a silent approve). ``ground.source``
+    and ``escalate_reason`` are closed sets with no ``unknown``.
+    ``confidence=low`` stores as escalate/low_confidence. At-most-once on
+    (task_id, generation, kind). Closures address findings by finding_uid.
 
     Args:
         task_id: Task being judged.
         generation: Submission generation being judged.
-        kind: verdict, dor, or disposition.
-        verdict: approve, changes_requested, or escalate.
+        kind: verdict|dor|disposition|advisor (critic).
+        verdict: approve|changes_requested|escalate; advisor: concur|object.
         grounds: [{source, detail?}].
         findings: Same shape as a human review verdict.
         closures: [{finding_uid, type}].
