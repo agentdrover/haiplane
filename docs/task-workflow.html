@@ -319,8 +319,8 @@
       </tr>
       <tr>
         <td><code>hub_task_status</code></td>
-        <td><code>task</code> — REST GET после refresh</td>
-        <td>многострочный статус (как раньше)</td>
+        <td>по умолчанию компактная карточка <code>task</code> (обязательные поля, окно <code>updates</code>, <code>updates_total</code>, <code>bounds</code>); при <code>full=true</code> — весь REST GET после refresh. Постановку целиком читают по <code>full=true</code></td>
+        <td>шапка, выдержки, окно из 10 новейших записей (<code>updates=N</code>, <code>-1</code> — вся лента), строки <code>[bounded]</code> с путём к полному. Лента усечена, а своей записи в окне нет — читай <code>updates=-1</code> ПЕРЕД повтором</td>
       </tr>
     </tbody>
   </table>

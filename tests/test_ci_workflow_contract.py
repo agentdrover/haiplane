@@ -201,3 +201,82 @@ def test_evidence_decision_survives_a_red_earlier_step() -> None:
         base="develop",
     )
     assert ran is True
+
+
+# ---- #1620: the deploy ships hashed exports of uv.lock ------------------------
+
+UV_VERSION = "0.12.18"
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _step(job: str, name: str) -> dict:
+    for step in _doc()["jobs"][job]["steps"]:
+        if step.get("name") == name:
+            return step
+    raise AssertionError(f"no step {name!r} in job {job!r}")
+
+
+def _uv_versions() -> dict[str, str]:
+    """The uv version each place pins: the two setup-uv steps and the Dockerfile."""
+    import re
+
+    found: dict[str, str] = {}
+    for job in ("test", "deploy"):
+        step = _step(job, "Install uv")
+        assert str(step["uses"]).startswith("astral-sh/setup-uv@")
+        found[f"ci:{job}"] = str(step.get("with", {}).get("version", ""))
+    docker = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    pins = set(re.findall(r"ghcr\.io/astral-sh/uv:(\d+\.\d+\.\d+)", docker))
+    assert len(pins) == 1, f"the Dockerfile must pin ONE uv version: {pins}"
+    found["Dockerfile"] = pins.pop()
+    return found
+
+
+def test_the_deploy_ships_hashed_lock_exports() -> None:
+    """AC-3 (#1620): deploy ставит закреплённый uv и Python 3.11, проверяет lock и
+    экспортирует два хешированных набора ДО rsync; needs и условие main не тронуты;
+    test-задание ставит ровно закоммиченный lock; версия uv одна во всех местах."""
+    doc = _doc()
+    deploy = doc["jobs"]["deploy"]
+    assert deploy["needs"] == "test"
+    assert (
+        deploy["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    )
+
+    # One uv version everywhere: a floating one rewrites uv.lock under us.
+    assert _uv_versions() == {
+        "ci:test": UV_VERSION,
+        "ci:deploy": UV_VERSION,
+        "Dockerfile": UV_VERSION,
+    }
+
+    names = [s.get("name") for s in deploy["steps"]]
+    python = _step("deploy", "Set up Python")
+    assert str(python["uses"]).startswith("actions/setup-python@")
+    assert str(python["with"]["python-version"]) == "3.11"
+
+    export = _step("deploy", "Export hashed dependency sets from uv.lock")
+    lines = [ln.strip() for ln in export["run"].splitlines() if ln.strip()]
+    assert lines[0] == "uv lock --check", "lock is checked before it is exported"
+    runtime = (
+        "uv export --frozen --no-dev --no-emit-project --format requirements-txt "
+        "--no-header -o requirements.runtime.txt"
+    )
+    build = (
+        "uv export --frozen --only-group build --no-emit-project --format "
+        "requirements-txt --no-header -o requirements.build.txt"
+    )
+    assert runtime in lines and build in lines, lines
+    assert "--no-hashes" not in export["run"], "the sets must stay hashed"
+
+    # Everything happens in the tree the NEXT step rsyncs to staging.
+    sync = names.index("Sync working tree to staging")
+    for name in ("Install uv", "Set up Python", export["name"]):
+        assert names.index(name) < sync, f"{name} must come before the rsync"
+    rsync = _step("deploy", "Sync working tree to staging")["run"]
+    for excluded in ("requirements.runtime.txt", "requirements.build.txt"):
+        assert f"--exclude '{excluded}'" not in rsync, "the exports must reach staging"
+
+    # The test job tests the committed lock, not a re-resolved one.
+    install = _step("test", "Install dependencies")
+    assert install["run"].strip() == "uv sync --locked --dev"

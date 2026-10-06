@@ -8,6 +8,7 @@ import re
 import time
 import urllib.parse
 from datetime import UTC, datetime
+from collections.abc import Callable
 from typing import Annotated, Any, Literal
 
 from pydantic import BeforeValidator
@@ -45,6 +46,7 @@ from hub.mcp_signature import Hidden, with_model_signature
 from hub.workflow_reference import build_mcp_instructions, lifecycle_map_lines
 from mcp.types import CallToolResult
 
+from hub.mcp_task_card import bounds_lines, build_compact_view
 from hub.mcp_structured import (
     HubCreateTaskResult,
     HubCreateTaskStructured,
@@ -319,7 +321,9 @@ _TRANSPORT_WRITE_CHECKS: tuple[tuple[re.Pattern[str], str | None, str], ...] = (
     (
         re.compile(r"^/api/tasks/(?P<task_id>\d+)(?:/|$)"),
         "hub_task_status",
-        "Читать состояние здесь: hub_task_status(task_id={task_id}).",
+        "Читать состояние здесь: hub_task_status(task_id={task_id}, updates=-1): "
+        "лента по умолчанию усечена, и записи, которой нет в окне, это "
+        "не доказывает — перед повтором прочитай updates=-1.",
     ),
     (
         re.compile(r"^/api/tasks(?:/|$)"),
@@ -1278,19 +1282,7 @@ def _cause_suggestion_line(task: dict[str, Any]) -> str:
     return f"{head}: {names}{tail}"
 
 
-@mcp.tool()
-async def hub_task_status(task_id: int) -> HubTaskStatusResult:
-    """Get detailed status of a specific task including updates and log tail.
-
-    Args:
-        task_id: The task ID number
-    """
-    # refresh syncs the task with its dispatch job — a state transition, not a
-    # read. A read-only caller (watcher, #1556) gets the stored state instead;
-    # opening that POST to it would be a hole in the role, not a convenience.
-    if identity_context_get()[1] != "watcher":
-        await _api_post(f"/api/tasks/{task_id}/refresh")
-    task = await _api_get(f"/api/tasks/{task_id}")
+def _status_header_lines(task: dict[str, Any]) -> list[str]:
     parts = [
         f"Task #{task['id']}: {task['title']}",
         f"Status: {task['status']}",
@@ -1311,10 +1303,35 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
     parts.extend(_dependency_lines(task))
     parts.extend(filter(None, [_cause_suggestion_line(task)]))
     parts.extend(filter(None, [_verdict_route_line(task)]))
-    if task.get("description"):
-        parts.append(f"\nDescription:\n{task['description']}")
-    if task.get("technical_hints"):
-        parts.append(f"\nTechnical hints:\n{task['technical_hints']}")
+    return parts
+
+
+def _status_review_lines(task: dict[str, Any]) -> list[str]:
+    latest_review = task.get("latest_review")
+    if not latest_review:
+        return []
+    freshness = latest_review_freshness(
+        bool(latest_review.get("is_current")),
+        bool(latest_review.get("closed_by_decision")),
+    )
+    solo = (
+        " [SELF-APPROVED: solo mode, not independent]"
+        if latest_review.get("self_approved")
+        else ""
+    )
+    lines = [
+        f"\nLatest review: {(latest_review.get('verdict') or '?').upper()} "
+        f"for submission #{latest_review.get('submission_generation', 0)} "
+        f"({freshness}){solo}"
+    ]
+    lines.extend(
+        _finding_line(finding) for finding in (latest_review.get("findings") or [])[:10]
+    )
+    return lines
+
+
+def _status_scope_lines(task: dict[str, Any]) -> list[str]:
+    parts: list[str] = []
     scope_in = task.get("scope_in") or []
     scope_out = task.get("scope_out") or []
     if scope_in or scope_out:
@@ -1326,50 +1343,147 @@ async def hub_task_status(task_id: int) -> HubTaskStatusResult:
     validation = task.get("validation_commands") or []
     if validation:
         parts.append("\nValidation commands:")
-        for cmd in validation:
-            parts.append(f"  - {cmd}")
-    if task.get("lifecycle_hint"):
-        parts.append(f"\nLifecycle: {task['lifecycle_hint']}")
-    latest_review = task.get("latest_review")
-    if latest_review:
-        freshness = latest_review_freshness(
-            bool(latest_review.get("is_current")),
-            bool(latest_review.get("closed_by_decision")),
-        )
-        solo = (
-            " [SELF-APPROVED: solo mode, not independent]"
-            if latest_review.get("self_approved")
-            else ""
-        )
-        parts.append(
-            f"\nLatest review: {(latest_review.get('verdict') or '?').upper()} "
-            f"for submission #{latest_review.get('submission_generation', 0)} "
-            f"({freshness}){solo}"
-        )
-        for finding in (latest_review.get("findings") or [])[:10]:
-            parts.append(_finding_line(finding))
+        parts.extend(f"  - {cmd}" for cmd in validation)
+    return parts
+
+
+def _status_ac_lines(task: dict[str, Any]) -> list[str]:
     acs = task.get("acceptance_criteria") or []
-    if acs:
-        parts.append("\nAcceptance criteria:")
-        for ac in acs:
-            parts.append(
-                f"  {ac.get('id', '?')} [{ac.get('verifiable_by', '?')}]\n"
-                f"    Given: {ac.get('given', '')}\n"
-                f"    When: {ac.get('when', '')}\n"
-                f"    Then: {ac.get('then', '')}"
-            )
-    if task.get("updates"):
+    if not acs:
+        return []
+    parts = ["\nAcceptance criteria:"]
+    for ac in acs:
+        parts.append(
+            f"  {ac.get('id', '?')} [{ac.get('verifiable_by', '?')}]\n"
+            f"    Given: {ac.get('given', '')}\n"
+            f"    When: {ac.get('when', '')}\n"
+            f"    Then: {ac.get('then', '')}"
+        )
+    return parts
+
+
+def _update_line(u: dict[str, Any]) -> str:
+    mark = f"#{u['id']} " if u.get("id") is not None else ""
+    return (
+        f"  {mark}[{u.get('created_at', '')}] ({u.get('kind', '')}) "
+        f"{u.get('agent', '')}: {u.get('content', '')}"
+    )
+
+
+def _full_update_line(u: dict[str, Any]) -> str:
+    """The feed line exactly as it was before #1613: no id."""
+    return f"  [{u['created_at']}] ({u['kind']}) {u.get('agent', '')}: {u['content']}"
+
+
+def _status_tail_lines(
+    updates: list[dict[str, Any]], line: Callable[[dict[str, Any]], str]
+) -> list[str]:
+    parts: list[str] = []
+    if updates:
         parts.append("\nUpdates:")
-        for u in task["updates"]:
-            parts.append(
-                f"  [{u['created_at']}] ({u['kind']}) {u.get('agent', '')}: {u['content']}"
-            )
-    if task.get("result_text"):
-        parts.append(f"\nResult:\n{task['result_text']}")
+        parts.extend(line(u) for u in updates)
+    return parts
+
+
+def _status_log_lines(task: dict[str, Any], result_text: str) -> list[str]:
+    parts: list[str] = []
+    if result_text:
+        parts.append(f"\nResult:\n{result_text}")
     if task.get("log_tail"):
         parts.append("\nLog tail:\n" + "\n".join(task["log_tail"][-20:]))
-    summary = "\n".join(parts)
-    return structured_tool_result(summary, HubTaskStatusStructured(task=task))
+    return parts
+
+
+def _full_status_text(task: dict[str, Any]) -> str:
+    parts = _status_header_lines(task)
+    if task.get("description"):
+        parts.append(f"\nDescription:\n{task['description']}")
+    if task.get("technical_hints"):
+        parts.append(f"\nTechnical hints:\n{task['technical_hints']}")
+    parts.extend(_status_scope_lines(task))
+    if task.get("lifecycle_hint"):
+        parts.append(f"\nLifecycle: {task['lifecycle_hint']}")
+    parts.extend(_status_review_lines(task))
+    parts.extend(_status_ac_lines(task))
+    parts.extend(_status_tail_lines(task.get("updates") or [], _full_update_line))
+    parts.extend(_status_log_lines(task, task.get("result_text") or ""))
+    return "\n".join(parts)
+
+
+def _compact_counts_lines(task: dict[str, Any]) -> list[str]:
+    """Scope, validation and criteria as counts; ids of the criteria only."""
+    counts = [
+        f"{name}: {len(task.get(name) or [])}"
+        for name in ("scope_in", "scope_out", "validation_commands")
+        if task.get(name)
+    ]
+    acs = task.get("acceptance_criteria") or []
+    parts = ["\nStatement: " + "; ".join(counts)] if counts else []
+    if acs:
+        ids = ", ".join(
+            f"{ac.get('id', '?')} [{ac.get('verifiable_by', '?')}]" for ac in acs
+        )
+        parts.append(f"Acceptance criteria ({len(acs)}): {ids}")
+    return parts
+
+
+def _compact_status_text(task: dict[str, Any], view: dict[str, Any]) -> str:
+    texts = view["texts"]
+    parts = _status_header_lines(task)
+    if task.get("work_type") or task.get("size"):
+        parts.append(
+            f"Work type: {task.get('work_type', '-')}, size: {task.get('size') or '-'}"
+        )
+    if "description" in texts:
+        parts.append(f"\nDescription:\n{texts['description']}")
+    if "technical_hints" in texts:
+        parts.append(f"\nTechnical hints:\n{texts['technical_hints']}")
+    parts.extend(_compact_counts_lines(task))
+    if task.get("lifecycle_hint"):
+        parts.append(f"\nLifecycle: {task['lifecycle_hint']}")
+    parts.extend(_status_review_lines(task))
+    parts.extend(_status_tail_lines(view["updates"], _update_line))
+    parts.extend(_status_log_lines(task, texts.get("result_text", "")))
+    parts.extend(["", *bounds_lines(view["bounds"])] if view["bounds"] else [])
+    return "\n".join(parts)
+
+
+@mcp.tool()
+async def hub_task_status(
+    task_id: int, updates: int = 10, full: bool = False
+) -> HubTaskStatusResult:
+    """Task status: compact card, newest updates, log tail.
+
+    Args:
+        task_id: The task ID number
+        updates: newest entries shown; -1 all, 0 none
+        full: whole task and feed
+    """
+    if updates < -1 and not full:
+        raise HubApiError(
+            {
+                "reason": "invalid_updates",
+                "message": f"updates={updates} is not valid: use -1 (whole feed), 0 (none) or a count.",
+                "hint": "hub_task_status(task_id, updates=-1) reads the whole feed; full=true the whole task.",
+            }
+        )
+    # refresh syncs the task with its dispatch job — a state transition, not a
+    # read. A read-only caller (watcher, #1556) gets the stored state instead;
+    # opening that POST to it would be a hole in the role, not a convenience.
+    if identity_context_get()[1] != "watcher":
+        await _api_post(f"/api/tasks/{task_id}/refresh")
+    task = await _api_get(f"/api/tasks/{task_id}")
+    if full:
+        return structured_tool_result(
+            _full_status_text(task), HubTaskStatusStructured(task=task)
+        )
+    view = build_compact_view(task, updates)
+    return structured_tool_result(
+        _compact_status_text(task, view), HubTaskStatusStructured(task=view["card"])
+    )
+
+
+_drop_generated_titles("hub_task_status", ("task_id", "updates", "full"))
 
 
 @mcp.tool()
