@@ -17001,6 +17001,49 @@ def _local_matrix_prompt(profile: str, http: bool, container: bool) -> str:
     )
 
 
+_DEMANDING_RULES = (
+    "ПРАВИЛА ПРОЕКТА: обязательно прочитай исходники вне диффа; запусти "
+    "`uv run pytest -q`; сделай `git fetch origin develop`; unknown запрещён."
+)
+
+
+def _realistic_local_prompt(profile: str, http: bool) -> str:
+    """Локальный промт с настоящими блоками: правила, prepass, only_tests."""
+    from hub.models import PrepassState
+    from hub.services import call_sites, review_evidence
+    from hub.services.review_dispatch import _delivery_block, _review_prompt
+
+    symbol = call_sites.SymbolReport(
+        symbol="registry_target",
+        defined_in="hub/alpha.py",
+        state=call_sites.ONLY_TESTS,
+    )
+    return _review_prompt(
+        1598,
+        "task-1598/x",
+        "qwen3.8-max",
+        profile,
+        _DEMANDING_RULES,
+        "ПРЕДМЕТ РЕВЬЮ — дифф ПРИЛОЖЕН НИЖЕ",
+        review_evidence.prepass_block(PrepassState(state="unknown", reason="нет")),
+        delivery_block=(
+            _delivery_block(1598, "CODE123", "https://hub.example") if http else ""
+        ),
+        only_tests_block=call_sites.only_tests_block([symbol]),
+        inline_diff=True,
+    )
+
+
+def _assert_capability_block_outranks_demands(prompt: str, where: str) -> None:
+    caps = prompt.index("ВОЗМОЖНОСТИ ЛОКАЛЬНОГО РЕВЬЮЕРА")
+    assert caps < prompt.index("обязательно прочитай исходники вне диффа"), where
+    assert caps < prompt.index("ПРОВЕРЬ ДОСТИЖИМОСТЬ"), where
+    assert "читать исходники вне диффа нельзя" in prompt, where
+    assert "«не установлено» допустимый исход" in prompt, where
+    assert "unresolved или lost_dimensions" in prompt, where
+    assert "не знаешь" in prompt, where
+
+
 async def test_a_local_review_prompt_states_its_real_capabilities():
     """AC-1 (#1598): во всех сборках локального промта есть блок возможностей.
 
@@ -17032,6 +17075,11 @@ async def test_a_local_review_prompt_states_its_real_capabilities():
         assert "кроме того, что запрещено блоком ВОЗМОЖНОСТЕЙ" in deep, (
             f"харнесс читается ПОД блоком, а не вместо него (http={http})"
         )
+    for profile in (LITE, DEEP):
+        for http in (False, True):
+            _assert_capability_block_outranks_demands(
+                _realistic_local_prompt(profile, http), f"{profile} http={http}"
+            )
     lite = _local_matrix_prompt(LITE, False, False)
     assert "доказательства тестов" in lite, "шаг брифа в lite называет доказательства"
 
@@ -17193,3 +17241,22 @@ async def test_a_cloud_order_from_prepare_review_order_has_no_local_block(
     prompt = recorder.calls[0]["prompt_text"]
     assert "ВОЗМОЖНОСТИ ЛОКАЛЬНОГО" not in prompt
     assert "uv run pytest" in prompt, "у облака с клоном блок попыток #1238 на месте"
+
+
+def test_a_local_only_tests_candidate_may_stay_unresolved():
+    """Ревью P2 (#1598): блок only_tests не требует двоичного исхода локально.
+
+    Вызов через реестр или getattr вне диффа статика не видит, а исходников у
+    ревьюера нет: исход — unresolved и lost_dimensions, а недостижимость по
+    одному статическому кандидату подтверждать нельзя. Облачный текст прежний
+    (его защищает test_the_cloud_review_prompt_is_unchanged).
+    """
+    for profile in (LITE, DEEP):
+        for http in (False, True):
+            prompt = _realistic_local_prompt(profile, http)
+            tail = prompt[prompt.index("ПРОВЕРЬ ДОСТИЖИМОСТЬ") :]
+            assert "ДЛЯ ЛОКАЛЬНОГО РЕВЬЮЕРА" in tail, (profile, http)
+            assert "unresolved" in tail and "lost_dimensions" in tail
+            assert "НЕДОСТИЖИМОСТЬ по одному статическому кандидату НЕ подтверждай" in (
+                tail.replace("\n", " ")
+            )
