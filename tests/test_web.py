@@ -6694,6 +6694,11 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
         "deep_reviewer": "local",
         "merge_is_delivery": True,
         "path_notices": [{"pattern": "deploy/**", "text": "ручной шаг"}],
+        "freeze": {
+            "until": None,
+            "allow_work_types": ["bug", "chore"],
+            "note": "до MS-A2",
+        },
         "release_artifacts": [
             {
                 "repo_path": "deploy/x.sh",
@@ -7291,3 +7296,25 @@ async def test_dashboard_inbox_total_counts_a_verdict_waiting_for_the_human(
     page = (await client.get("/")).text
     assert total(page) == before + 1
     assert "is-zero" not in page[page.index("topbar-stat--inbox") :][:120]
+
+
+async def test_web_create_takes_work_type_and_freeze_rationale(client: AsyncClient):
+    # #1594: форма даёт тип и обоснование; не-task больше не становится feature.
+    page = await client.get("/")
+    assert 'name="freeze_rationale"' in page.text
+    assert 'name="work_type"' in page.text
+    resp = await client.post(
+        "/tasks/create",
+        data={
+            "title": "Typed epic",
+            "task_type": "epic",
+            "work_type": "chore",
+            "freeze_rationale": "чистка долга",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    tasks = (await client.get("/api/tasks")).json()
+    epic = next(t for t in tasks if t["title"] == "Typed epic")
+    assert epic["work_type"] == "chore"
+    assert epic["freeze_rationale"] == "чистка долга"

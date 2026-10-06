@@ -52,7 +52,11 @@ from hub.services import (
     submission_contract,
     verdict_text,
 )
-from hub.services.project_policy import risk_map_for_task
+from hub.services.project_policy import (
+    FREEZE_REFUSED,
+    freeze_admission,
+    risk_map_for_task,
+)
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait, TaskStatus
 from hub.mcp_envelope import enrich_error_payload
@@ -950,6 +954,60 @@ async def _load_task_view(db: aiosqlite.Connection, task_id: int) -> TaskView:
     return row_to_task(row)  # type: ignore[arg-type]
 
 
+def _require_freeze_admission(
+    project: Any, work_type: Any, rationale: str, *, where: str = ""
+) -> None:
+    """Отказ 422, если заморозка проекта не пускает эту работу (#1594).
+
+    Тонкая обёртка над ``project_policy.freeze_admission``: проверка одна, а
+    здесь она лишь превращается в структурированный отказ. ``where`` называет
+    элемент пачки, чтобы смешанная пачка отказывала поимённо.
+    """
+    refusal = freeze_admission(project, work_type, rationale)
+    if refusal is None:
+        return
+    detail = refusal.detail()
+    if where:
+        detail["message"] = f"{where}: {refusal.text}"
+    raise HTTPException(422, detail=detail)
+
+
+async def _project_of_new_task(
+    db: aiosqlite.Connection, parent_id: int | None, bound: Any = None
+) -> Any:
+    """Проект, в который войдёт ещё не созданная задача (#1594).
+
+    Тем же наследованием, что и у существующей: эпик с ``project`` - в него,
+    иначе по родителю, иначе проект default (запасной путь
+    ``resolve_project_for_task``).
+    """
+    if bound is not None:
+        return bound
+    if parent_id is not None:
+        return await repo.resolve_project_for_task(db, parent_id)
+    return await repo.get_project_by_slug(db, "default")
+
+
+async def _epic_project_at_creation(db: aiosqlite.Connection, body: TaskCreate) -> Any:
+    """Строка проекта, к которому привязывается создаваемый эпик (#346); иначе None."""
+    if not body.project:
+        return None
+    if body.task_type != TaskType.epic:
+        raise HTTPException(
+            422, "project can only be set on epics; children inherit it"
+        )
+    project_row = await repo.get_project_by_slug(db, body.project)
+    if project_row is None:
+        raise HTTPException(422, f"unknown project slug: {body.project!r}")
+    if project_row["archived"] or project_row["status"] != "active":
+        raise HTTPException(
+            422,
+            f"project {body.project!r} is not active "
+            "(pending proposals and archived projects cannot take epics)",
+        )
+    return project_row
+
+
 async def create_task(
     db: aiosqlite.Connection,
     body: TaskCreate,
@@ -979,22 +1037,8 @@ async def create_task(
 
     # Bind an epic to a project at creation (#346). Only epics carry
     # project_id — children resolve it by walking up to the root epic.
-    project_id: int | None = None
-    if body.project:
-        if body.task_type != TaskType.epic:
-            raise HTTPException(
-                422, "project can only be set on epics; children inherit it"
-            )
-        project_row = await repo.get_project_by_slug(db, body.project)
-        if project_row is None:
-            raise HTTPException(422, f"unknown project slug: {body.project!r}")
-        if project_row["archived"] or project_row["status"] != "active":
-            raise HTTPException(
-                422,
-                f"project {body.project!r} is not active "
-                "(pending proposals and archived projects cannot take epics)",
-            )
-        project_id = project_row["id"]
+    bound_project = await _epic_project_at_creation(db, body)
+    project_id: int | None = bound_project["id"] if bound_project else None
 
     initial_status, normalized = normalize_task_create(body)
     if force_draft:
@@ -1021,6 +1065,18 @@ async def create_task(
                 await db.commit()
                 task = await _load_task_view(db, int(existing["task_id"]))
                 return CreateTaskOutcome(task=task, is_new=False)
+
+        # #1594: уже одобренная работа входит в проект только через допуск
+        # заморозки. После поиска по ключу: повтор успешного создания вернул
+        # бы существующую задачу выше, и заморозка к нему не применяется;
+        # проверяется только новая вставка. Черновик (в т.ч. от агента) не
+        # ограничивается.
+        if initial_status != "draft":
+            _require_freeze_admission(
+                await _project_of_new_task(db, normalized.parent_id, bound_project),
+                normalized.work_type,
+                normalized.freeze_rationale,
+            )
 
         # Structured-aware insert so all fields from TaskCreate (work_type,
         # scope_in/out, user_story, etc.) persist (#46). ``normalized`` carries
@@ -1155,6 +1211,16 @@ async def create_subtasks_bulk(
         initial_status = "draft"
     else:
         initial_status = "open"
+        # #1594: пачка открытой работы проверяется поштучно ДО записи: одна
+        # непрошедшая позиция отказывает всей пачке, и ничего не создано.
+        project = await _project_of_new_task(db, parent_id)
+        for index, item in enumerate(body.items):
+            _require_freeze_admission(
+                project,
+                item.work_type,
+                item.freeze_rationale,
+                where=f"items[{index}] {item.title!r}",
+            )
 
     auto_review = body.auto_review
     if body.task_type == TaskType.subtask:
@@ -1187,6 +1253,8 @@ async def create_subtasks_bulk(
                     agent=body.agent,
                     auto_review=auto_review,
                     run_immediately=False,
+                    work_type=item.work_type,
+                    freeze_rationale=item.freeze_rationale,
                 )
                 task_id = await repo.create_task_full(
                     db,
@@ -1250,6 +1318,16 @@ async def approve_task(
         )
 
     body = body or TaskApprove()
+
+    # --- Freeze admission (#1594) ------------------------------------------
+    # До DoR и до любой записи: отказ не оставляет следов, а force (который
+    # обходит только DoR) заморозку не обходит. Сюда сходятся REST, batch,
+    # web, CLI, MCP и compatibility-маршруты.
+    _require_freeze_admission(
+        await repo.resolve_project_for_task(db, task_id),
+        task.get("work_type"),
+        task.get("freeze_rationale") or "",
+    )
 
     # --- DoR gate -----------------------------------------------------------
     # Import locally to avoid a circular dependency (services.recommendations
@@ -1488,10 +1566,14 @@ async def batch_approve_tasks(
         except HTTPException as exc:
             reason = "approve_failed"
             detail = exc.detail
+            text = ""
             if isinstance(detail, dict):
                 reason = detail.get("reason") or detail.get("error") or reason
+                # #1594: у отказа заморозки есть текст со сроком и note.
+                if reason == FREEZE_REFUSED:
+                    text = str(detail.get("message") or "")
             result.skipped.append(
-                BatchApproveSkipped(task_id=task_id, reason=f"{reason}")
+                BatchApproveSkipped(task_id=task_id, reason=f"{reason}", detail=text)
             )
             continue
         result.approved.append(task_id)

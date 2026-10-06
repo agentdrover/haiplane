@@ -107,6 +107,9 @@ def _print_http_error(code: int, body_text: str) -> None:
         if detail.get("hint"):
             print(f"  Hint: {detail['hint']}", file=sys.stderr)
         return
+    if isinstance(detail, dict) and detail.get("error") == "freeze_refused":
+        print(f"HTTP {code}: {detail.get('message', '')}", file=sys.stderr)
+        return
     if isinstance(detail, dict) and detail.get("reason") == "bug_red_test_unproven":
         _print_red_test_refusal(code, detail)
         return
@@ -170,6 +173,33 @@ def _print_task_short(t: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+_WORK_TYPES = ("feature", "bug", "refactor", "chore", "docs", "spike", "incident")
+
+
+def _put_freeze_fields(body: dict[str, Any], args: argparse.Namespace) -> None:
+    """Тип работы и обоснование допуска при заморозке (#1594); не заданные не шлются."""
+    if getattr(args, "work_type", None):
+        body["work_type"] = args.work_type
+    if getattr(args, "freeze_rationale", None):
+        body["freeze_rationale"] = args.freeze_rationale
+
+
+def _add_freeze_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--work-type",
+        dest="work_type",
+        choices=_WORK_TYPES,
+        default=None,
+        help="Work type (default feature); a frozen project admits by type",
+    )
+    parser.add_argument(
+        "--freeze-rationale",
+        dest="freeze_rationale",
+        default="",
+        help="Why the work may enter a frozen project (required there)",
+    )
+
+
 def cmd_task(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {
         "title": args.title,
@@ -181,6 +211,7 @@ def cmd_task(args: argparse.Namespace) -> int:
         "task_type": getattr(args, "task_type", "task"),
         "priority": getattr(args, "priority", "medium"),
     }
+    _put_freeze_fields(body, args)
     if getattr(args, "parent", None) is not None:
         body["parent_id"] = args.parent
     if getattr(args, "owner", None):
@@ -208,6 +239,7 @@ def _cmd_create_typed(task_type: str) -> Any:
             "priority": getattr(args, "priority", "medium"),
             "source": "human",
         }
+        _put_freeze_fields(body, args)
         if getattr(args, "parent", None) is not None:
             body["parent_id"] = args.parent
         if getattr(args, "owner", None):
@@ -971,6 +1003,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 _REFINE_SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
     ("title", "title"),
     ("work_type", "work_type"),
+    ("freeze_rationale", "freeze_rationale"),
     ("class_of_service", "class_of_service"),
     ("size", "size"),
     ("wip_tag", "wip_tag"),
@@ -1901,6 +1934,33 @@ def _add_agents_create_parser(agents_sub: Any) -> None:
     p.set_defaults(func=cmd_admin_agents_create)
 
 
+def _add_subtasks_bulk_parser(sub: Any) -> None:
+    p_subtasks_bulk = sub.add_parser(
+        "subtasks-bulk",
+        help="Create multiple child tasks under a parent atomically",
+    )
+    p_subtasks_bulk.add_argument("parent_id", type=int)
+    p_subtasks_bulk.add_argument(
+        "--from-file",
+        required=True,
+        help="JSON/YAML with items: [{title, description?, priority?, "
+        "work_type?, freeze_rationale?}, ...]",
+    )
+    p_subtasks_bulk.add_argument(
+        "--task-type",
+        dest="task_type",
+        choices=["task", "subtask"],
+        default=None,
+    )
+    p_subtasks_bulk.add_argument(
+        "--source",
+        choices=["agent", "human"],
+        default=None,
+    )
+    p_subtasks_bulk.add_argument("--agent", default="")
+    p_subtasks_bulk.set_defaults(func=cmd_subtasks_bulk)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hp-hub", description="CLI for Haiplane Hub")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1932,6 +1992,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Idempotency key for safe retries (maps to X-Client-Request-Id)",
     )
+    _add_freeze_args(p_task)
     p_task.set_defaults(func=cmd_task, task_type="task")
 
     # epic — create an epic
@@ -1946,6 +2007,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_epic.add_argument(
         "--project", default=None, help="Project slug to attach the epic to"
     )
+    _add_freeze_args(p_epic)
     p_epic.set_defaults(func=_cmd_create_typed("epic"))
 
     # feature — create a feature under an epic
@@ -1958,6 +2020,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_feature.add_argument("--owner", default="", help="Human owner")
     p_feature.add_argument("--reviewer", default="", help="Human reviewer")
+    _add_freeze_args(p_feature)
     p_feature.set_defaults(func=_cmd_create_typed("feature"))
 
     # subtask — create a subtask under a task
@@ -1970,31 +2033,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_subtask.add_argument("--owner", default="", help="Human owner")
     p_subtask.add_argument("--reviewer", default="", help="Human reviewer")
+    _add_freeze_args(p_subtask)
     p_subtask.set_defaults(func=_cmd_create_typed("subtask"))
 
-    p_subtasks_bulk = sub.add_parser(
-        "subtasks-bulk",
-        help="Create multiple child tasks under a parent atomically",
-    )
-    p_subtasks_bulk.add_argument("parent_id", type=int)
-    p_subtasks_bulk.add_argument(
-        "--from-file",
-        required=True,
-        help="JSON/YAML with items: [{title, description?, priority?}, ...]",
-    )
-    p_subtasks_bulk.add_argument(
-        "--task-type",
-        dest="task_type",
-        choices=["task", "subtask"],
-        default=None,
-    )
-    p_subtasks_bulk.add_argument(
-        "--source",
-        choices=["agent", "human"],
-        default=None,
-    )
-    p_subtasks_bulk.add_argument("--agent", default="")
-    p_subtasks_bulk.set_defaults(func=cmd_subtasks_bulk)
+    _add_subtasks_bulk_parser(sub)
 
     # tree — show hierarchy tree
     p_tree = sub.add_parser("tree", help="Show hierarchy tree for a task/epic/feature")
@@ -2546,6 +2588,12 @@ def build_parser() -> argparse.ArgumentParser:
             "incident",
         ],
         default=None,
+    )
+    p_refine.add_argument(
+        "--freeze-rationale",
+        dest="freeze_rationale",
+        default=None,
+        help="Why the work may enter a frozen project (#1594); '' clears",
     )
     p_refine.add_argument(
         "--cos",

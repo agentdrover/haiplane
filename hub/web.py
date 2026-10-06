@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 import aiosqlite
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 
@@ -42,6 +42,7 @@ from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
 from hub.services import chat_pair as chat_pair_svc
 from hub.services import policy_change, project_policy
+from hub.services.project_policy import FREEZE_REFUSED
 from hub.services import steward_dispatch
 from hub.services.finding_evidence import evidence_for_findings, evidence_for_report
 from hub.services.finding_identity import finding_uids
@@ -715,6 +716,41 @@ def _htmx_dor_failed_fragment(task_id: int, detail: dict[str, Any]) -> HTMLRespo
         f"</div>"
     )
     return HTMLResponse(fragment, status_code=200)
+
+
+async def _freeze_message(request: Request, task_id: int, approve_error: str) -> str:
+    """Текст отказа заморозки для карточки; считается заново, а не берётся из URL."""
+    if approve_error != FREEZE_REFUSED:
+        return ""
+    db = _db(request)
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        return ""
+    refusal = project_policy.freeze_admission(
+        await repo.resolve_project_for_task(db, task_id),
+        row["work_type"],
+        row["freeze_rationale"] or "",
+    )
+    return refusal.text if refusal is not None else ""
+
+
+def _freeze_refused_response(
+    request: Request, task_id: int, detail: dict[str, Any]
+) -> Response:
+    """Отказ допуска заморозки (#1594): причина текстом, состояние не менялось."""
+    message = str(detail.get("message") or "Заморозка проекта не допускает работу.")
+    if _is_htmx(request):
+        fragment = (
+            f'<div class="dor-gate-warning" id="freeze-warn-{task_id}">'
+            f'<span class="badge badge-failed">Заморозка проекта</span>'
+            f"<p>{html.escape(message)}</p>"
+            f'<a class="btn btn-secondary btn-xs" href="/tasks/{task_id}">'
+            f"Открыть задачу</a></div>"
+        )
+        return HTMLResponse(fragment, status_code=200)
+    return RedirectResponse(
+        f"/tasks/{task_id}?approve_error=freeze_refused", status_code=303
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2662,6 +2698,7 @@ async def _web_task_detail_page(
             "dispatch_available": _dispatch_available(),
             "dispatch_configured": _dispatch_configured(),
             "approve_error": approve_error,
+            "approve_message": await _freeze_message(request, task_id, approve_error),
             "review_error": review_error,
             "csrf_token": csrf_token,
             "implementer_code": implementer_code,
@@ -2821,6 +2858,7 @@ async def web_create_task(
     parent_id: int | None = Form(None),
     priority: str = Form("medium"),
     work_type: str = Form("feature"),
+    freeze_rationale: str = Form(""),
     user_story: str = Form(""),
     problem_statement: str = Form(""),
     scope_in: str = Form(""),
@@ -2854,11 +2892,11 @@ async def web_create_task(
         run_immediately=run_immediately,
         task_type=_enum_from_form(TaskType, task_type, "task_type"),
         parent_id=parent_id,
-        work_type=(
-            _enum_from_form(WorkType, work_type, "work_type")
-            if task_type == "task"
-            else WorkType.feature
-        ),
+        # #1594: тип берётся из формы для любого вида работы. Раньше не-task
+        # принудительно становился feature, и при заморозке проекта нельзя было
+        # завести ни эпик ошибки, ни фичу-качество с честным типом.
+        work_type=_enum_from_form(WorkType, work_type, "work_type"),
+        freeze_rationale=freeze_rationale,
         priority=priority,
         user_story=user_story,
         problem_statement=problem_statement,
@@ -2902,6 +2940,14 @@ async def web_approve_task(
         # Проверка и её следствие должны стоять рядом: isinstance, спрятанный
         # в булев флаг, не сужает тип на строках ниже — и dict там держался на
         # честном слове автора.
+        if (
+            exc.status_code == 422
+            and isinstance(detail, dict)
+            and detail.get("error") == FREEZE_REFUSED
+        ):
+            # #1594: заморозка проекта объясняется человеку на месте, а не
+            # голым JSON-ответом 422.
+            return _freeze_refused_response(request, task_id, detail)
         if (
             exc.status_code != 422
             or not isinstance(detail, dict)

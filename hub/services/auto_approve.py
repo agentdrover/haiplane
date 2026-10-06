@@ -31,7 +31,11 @@ from hub import config
 from hub import repository as repo
 from hub.db import deserialize_str_list
 from hub.models import DoRCheckItem, RiskClass
-from hub.services.project_policy import gate_policy_of, gate_value_of
+from hub.services.project_policy import (
+    freeze_admission,
+    gate_policy_of,
+    gate_value_of,
+)
 
 log = logging.getLogger(__name__)
 
@@ -137,6 +141,26 @@ def _touches_ladder(areas: list[str]) -> list[str]:
     return ladder_hits(areas)
 
 
+_FREEZE_NOTE_PREFIX = "Автоодобрение отклонено заморозкой проекта (dor=auto): "
+
+
+async def _note_freeze_refusal(
+    db: aiosqlite.Connection, task_id: int, reason: str
+) -> None:
+    """Строка ленты об отказе заморозки; не повторяется, пока причина та же.
+
+    Функция зовётся при каждой записи готовности, и тот же отказ на каждый
+    вызов засорил бы карточку одинаковыми строками.
+    """
+    content = _FREEZE_NOTE_PREFIX + reason
+    for update in reversed(await repo.get_task_updates(db, task_id)):
+        if str(update["content"]).startswith(_FREEZE_NOTE_PREFIX):
+            if update["content"] == content:
+                return
+            break
+    await repo.add_task_update(db, task_id, "hub", "status", content, author_kind="hub")
+
+
 async def maybe_auto_approve(
     db: aiosqlite.Connection,
     task_id: int,
@@ -175,7 +199,10 @@ async def maybe_auto_approve(
 
     Runs inside the caller's transaction; returns True when the draft was
     transitioned. Every refusal is silent by design: a draft that does not
-    qualify simply keeps waiting for the human, exactly as today.
+    qualify simply keeps waiting for the human, exactly as today. The one
+    refusal that is NOT silent is the project freeze (#1594): a draft that
+    qualified in every other way and was stopped by the freeze gets a feed
+    line with the reason.
     """
     mode = (config.AUTO_APPROVE_MAX_CLASS or "off").strip().lower()
     global_ceiling = _AUTO_BAND.get(mode)
@@ -233,6 +260,14 @@ async def maybe_auto_approve(
     ):
         ceiling = project_ceiling
     if order.index(risk) > order.index(ceiling):
+        return False
+
+    # #1594: заморозка проекта - тот же допуск, что у ручного одобрения, и
+    # автоодобрение ему подчиняется. Молча остаться черновиком было бы
+    # ошибкой наблюдаемости: «почему не автоодобрено» отвечает строка ленты.
+    refusal = freeze_admission(project, row["work_type"], row["freeze_rationale"] or "")
+    if refusal is not None:
+        await _note_freeze_refusal(db, task_id, refusal.text)
         return False
 
     transitioned = await repo.transition_status_if(

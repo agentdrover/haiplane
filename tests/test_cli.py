@@ -2823,3 +2823,40 @@ def test_worktree_real_fetch_failure_of_an_existing_branch_is_named(
     assert f"предупреждение: fetch origin {branch} не удался" in (
         capsys.readouterr().err
     )
+
+
+def test_create_commands_carry_work_type_and_freeze_rationale(capsys) -> None:
+    # #1594: тип работы и обоснование допуска доходят до запроса из task и из
+    # типизированных команд; не заданные в тело не попадают (прежнее поведение).
+    parser = cli.build_parser()
+    for argv, task_type in (
+        (["task", "--title", "t"], "task"),
+        (["epic", "--title", "t"], "epic"),
+        (["feature", "--title", "t", "--parent", "3"], "feature"),
+        (["subtask", "--title", "t", "--parent", "3"], "subtask"),
+    ):
+        plain = MagicMock(return_value={"id": 1})
+        with patch.object(cli, "_api", plain), patch("sys.stdout", new=StringIO()):
+            args = parser.parse_args(argv)
+            assert args.func(args) == 0
+        body = plain.call_args.args[2]
+        assert "work_type" not in body and "freeze_rationale" not in body, task_type
+
+        framed = MagicMock(return_value={"id": 1})
+        with patch.object(cli, "_api", framed), patch("sys.stdout", new=StringIO()):
+            args = parser.parse_args(
+                [*argv, "--work-type", "bug", "--freeze-rationale", "сбой в проде"]
+            )
+            assert args.func(args) == 0
+        body = framed.call_args.args[2]
+        assert body["work_type"] == "bug", task_type
+        assert body["freeze_rationale"] == "сбой в проде", task_type
+
+    refine = parser.parse_args(["refine", "9", "--freeze-rationale", "why"])
+    assert cli._build_refine_payload(refine)["freeze_rationale"] == "why"
+
+
+def test_freeze_refusal_is_printed_as_text(capsys) -> None:
+    detail = {"error": "freeze_refused", "message": "Заморозка проекта до снятия"}
+    cli._print_http_error(422, json.dumps({"detail": detail}))
+    assert "HTTP 422: Заморозка проекта до снятия" in capsys.readouterr().err
