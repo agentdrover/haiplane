@@ -2277,3 +2277,64 @@ async def test_a_start_deferred_for_the_review_keeps_its_slot_alive(
         (await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],)))[0]
     )
     assert row["status"] == RUN_OPEN
+
+
+async def test_a_cloud_review_whose_ask_again_is_spent_is_terminal(
+    db: aiosqlite.Connection,
+):
+    """#1600: переспрос #1242 исчерпан — ждать нечего; назначен — ещё ждём.
+
+    Решение «переспрос ещё будет» берётся из того же правила, что у самого
+    переспроса (ask_again_exhausted): потолок выбран, либо прошлая попытка не
+    оставила заказа. Облачный упавший заказ с неизрасходованным переспросом —
+    ожидание (проверяется в AC-3), здесь — две формы исчерпания.
+    """
+    from hub.services.review_dispatch import (
+        ASK_AGAIN_MARK,
+        REVIEW_ASK_AGAIN_MAX,
+    )
+
+    _, spent = await _due_task(db, "ask-again-spent")
+    first = await _dispatch(db, spent, status="failed", channel="cloud")
+    for _ in range(REVIEW_ASK_AGAIN_MAX):
+        await db.execute(
+            "INSERT INTO review_dispatches (task_id, submission_generation, "
+            "agent_id, model, status, channel, replaces_dispatch_id) "
+            "VALUES (?, 1, 'rev-agent', 'gpt-5.2', 'failed', 'cloud', ?)",
+            (spent, first),
+        )
+        await repo.add_task_update(
+            db, spent, "hub", "alert", ASK_AGAIN_MARK.format(generation=1) + " повтор"
+        )
+    # Вторая форма: попытка записана, а заказа за ней нет (слепой исход #1199).
+    _, blind = await _due_task(db, "ask-again-blind")
+    await _dispatch(db, blind, status="failed", channel="cloud")
+    await repo.add_task_update(
+        db, blind, "hub", "alert", ASK_AGAIN_MARK.format(generation=1) + " повтор"
+    )
+    await db.commit()
+
+    assert await order_due_runs(db) == 2
+
+    for task_id in (spent, blind):
+        assert await open_run(db, task_id, 1) is not None
+    assert await _events(db, EVENT_DEFERRED) == []
+
+
+async def test_a_review_the_project_does_not_ask_for_is_not_waited_for(
+    db: aiosqlite.Connection,
+):
+    """#1600: «ревью не положено» решает и при живой строке заказа.
+
+    Политика могла смениться, пока заказ шёл: ждать отчёта, который проект
+    больше не просит, — значит держать суждение ни за что.
+    """
+    project_id = await _project_with_policy(
+        db, "not-asked-live-row", {"verdict": "human", "steward_shadow": True}
+    )
+    task_id = await _submitted_task(db, project_id)
+    await _on_a_branch(db, task_id)
+    await _dispatch(db, task_id, status="active")
+
+    assert await order_due_runs(db) == 1
+    assert await _events(db, EVENT_DEFERRED) == []
