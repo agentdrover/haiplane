@@ -2226,7 +2226,18 @@ async def test_a_scratch_that_lets_the_reviewer_rename_the_workdir_gets_no_snaps
         unpacker.prepare_workdir(
             str(work), str(tar), unpacker.Limits(), os.getgid(), os.getuid() + 1
         )
-    assert review_snapshot.lay_out_direct(str(work), b"x", str(work_parent), None)
+    assert "пользователь ревьюера" in review_snapshot.lay_out_direct(
+        str(work), b"x", str(work_parent), None
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SNAPSHOT_UNPACKER", str(_UNPACK_FILE))
+    monkeypatch.setattr(review_snapshot, "TRUSTED_UID", os.getuid())
+    from hub.integrations.protocols import SnapshotArchive  # noqa: F401
+
+    (tmp_path / "r2").mkdir()
+    snap = await _archive(*_make_repo(tmp_path / "r2"))
+    assert "sticky" in review_snapshot.lay_out_direct(
+        str(work), snap.data, str(work_parent), os.getuid() + 1
+    ), "direct: scratch без sticky-бита должен отказать так же, как служба"
 
 
 def test_the_runner_unit_runs_python_in_isolated_mode() -> None:
@@ -2356,6 +2367,9 @@ async def test_cancelling_the_hub_during_publication_leaves_no_job(
     asyncio.get_running_loop().call_later(0.3, gate.set)
     with pytest.raises(asyncio.CancelledError):
         await task
+    # поток, не остановленный отменой, дописывает задание ПОСЛЕ неё: судить надо
+    # по состоянию, когда он уже закончил
+    await asyncio.sleep(1.0)
     assert _jobs(spool) == [] or all(
         not (j / "job.json").exists() or (j / "cancel").exists() for j in _jobs(spool)
     ), "отменённый заказ остался опубликованным и не отозван"
