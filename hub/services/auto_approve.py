@@ -276,10 +276,11 @@ async def maybe_auto_approve(
     if not transitioned:
         return False
 
-    if dor_checks:
-        from hub.services.dor import record_statement_paths
+    from hub.services.dor import record_statement_paths, record_workspace_missing
 
+    if dor_checks:
         await record_statement_paths(db, task_id, dor_checks)
+    await record_workspace_missing(db, task_id)
 
     reasons = deserialize_str_list(row["risk_class_reasons"])
     await repo.add_task_update(

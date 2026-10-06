@@ -1422,9 +1422,10 @@ async def _open_draft_under_lock(
                 force_message += f". Comment: {body.comment}"
             await repo.add_task_update(db, task_id, "", "alert", force_message)
 
-        from hub.services.dor import record_statement_paths
+        from hub.services.dor import record_statement_paths, record_workspace_missing
 
         await record_statement_paths(db, task_id, readiness.dor_checks)
+        await record_workspace_missing(db, task_id)
 
         if body.comment and dor_override_summary is None and not body.force:
             await repo.add_task_update(
