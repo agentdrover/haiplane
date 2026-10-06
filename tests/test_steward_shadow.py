@@ -4178,8 +4178,8 @@ async def test_the_window_is_bounded_on_both_sides_and_anchored_to_the_delivery(
         return task_id
 
     inside = await _case(delivered_days_ago=40, defect_days_ago=20)  # +20 дн.
-    edge = await _case(delivered_days_ago=40, defect_days_ago=10)  # +30 дн.
-    after = await _case(delivered_days_ago=40, defect_days_ago=5)  # +35 дн.
+    edge = await _case(delivered_days_ago=40, defect_days_ago=11)  # +29 дн.
+    after = await _case(delivered_days_ago=40, defect_days_ago=9)  # +31 дн.
     before = await _case(delivered_days_ago=10, defect_days_ago=20)  # до доставки
     undelivered = await _case(delivered_days_ago=None, defect_days_ago=1)
 
