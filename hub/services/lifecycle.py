@@ -3782,6 +3782,9 @@ class VerdictContext:
     # #1601: поколение, о котором судили. Если задано, запись вердикта
     # условна В SQL: поколение живо и вердикта на него нет.
     expected_generation: int | None = None
+    # #1601: метка применения стюарда (id суждения, время занятия): запись
+    # вердикта условна по ней в той же транзакции.
+    claim: tuple[int, str] | None = None
 
     body_text: str = ""
     pinned_sha: str = ""
@@ -4032,6 +4035,7 @@ async def record_review_verdict(
     self_approved: bool = False,
     principal_id: int | None = None,
     expected_generation: int | None = None,
+    claim: tuple[int, str] | None = None,
 ) -> TaskView:
     """Record an explicit review verdict for the current submission (#305).
 
@@ -4078,6 +4082,7 @@ async def record_review_verdict(
         self_approved=self_approved,
         principal_id=principal_id,
         expected_generation=expected_generation,
+        claim=claim,
     )
     await run_steps(state, VERDICT_STEPS)
 
@@ -4176,6 +4181,7 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
     self_approved = state.self_approved
     principal_id = state.principal_id
     expected_generation = state.expected_generation
+    claim = state.claim
 
     # Контракт между конвейером и записью вердикта.
     pinned_sha = state.pinned_sha
@@ -4196,6 +4202,7 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
             findings_json=findings_json,
             self_approved=self_approved,
             expected_generation=expected_generation,
+            claim=claim,
         )
         if not written:
             # #1601: пока считали (пакет, согласие), сдачу пересдали или вердикт

@@ -1010,7 +1010,7 @@ async def test_a_process_that_died_mid_apply_is_not_retried(
     task_id = await _scenario(db, "advisor-died", "concur")
     calls = 0
 
-    async def _die(_db, _task_id, _generation):
+    async def _die(_db, _task_id, _generation, **_kw):
         nonlocal calls
         calls += 1
         raise _Died
@@ -1049,7 +1049,7 @@ async def test_the_claim_is_atomic_against_a_neighbour_that_took_it_first(
         await db_.commit()
         return await real_state(db_, task, generation)
 
-    async def _spy(_db, task, _generation):
+    async def _spy(_db, task, _generation, **_kw):
         applied.append(task)
         return None
 
@@ -1096,7 +1096,7 @@ async def test_the_claim_is_taken_before_the_apply(
     task_id = await _scenario(db, "advisor-claim", "concur")
     calls = 0
 
-    async def _boom(_db, _task_id, _generation):
+    async def _boom(_db, _task_id, _generation, **_kw):
         nonlocal calls
         calls += 1
         raise RuntimeError("упало в середине")
@@ -1524,7 +1524,7 @@ async def test_an_interrupted_apply_goes_to_the_human_aloud_exactly_once(
     task_id = await _interrupted(db, monkeypatch, "advisor-stuck", 61)
     calls: list[int] = []
 
-    async def _spy(_db, task, _generation):
+    async def _spy(_db, task, _generation, **_kw):
         calls.append(task)
         return None
 
@@ -1581,7 +1581,7 @@ async def test_a_claim_stamps_its_time(db: aiosqlite.Connection, monkeypatch):
     await _scenario(db, "advisor-stamp-claim", "concur")
     seen: list[str] = []
 
-    async def _look(db_, task, _generation):
+    async def _look(db_, task, _generation, **_kw):
         row = await _judge_row(db_, task)
         seen.append(str(row["advisor_claimed_at"]))
         return None
@@ -1618,3 +1618,140 @@ async def test_a_neighbour_that_moved_the_claim_first_leaves_no_second_alert(
     await apply_advisor_outcomes(db)
 
     assert await _alerts(db, task_id) == []
+
+
+# ---------------------------------------------------------------------------
+# Круг 3: метка применения держит и исход, и вердикт
+# ---------------------------------------------------------------------------
+
+
+async def test_a_late_live_pass_after_the_escalation_writes_no_verdict(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Перекрытие: метку перевели в escalated, поздний живой проход вердикта не пишет.
+
+    Пока живой проход идёт, другой (прерванное применение) переводит метку в
+    escalated и пишет ОДИН alert. Поздний проход доходит до записи вердикта —
+    условной по метке, — получает 0 строк, вердикта нет, исход остаётся
+    escalated, а строки «Одобрено стюардом без человека» в карточке не будет.
+    """
+    from hub.services import steward_apply, steward_applied
+    from hub.services import steward_advisor
+
+    await _act(monkeypatch)
+    task_id = await _scenario(db, "advisor-overlap", "concur")
+
+    async def _no_refusals(_db, _task_id, _generation=None):
+        return []
+
+    async def _converged_during_overlap(db_, task, generation):
+        from tests.test_steward_applied import _decide
+
+        await db_.execute(
+            "UPDATE steward_judgements SET advisor_claimed_at="
+            "datetime('now', '-90 minutes') WHERE task_id=? AND kind='verdict'",
+            (task,),
+        )
+        await db_.commit()
+        assert await steward_advisor._escalate_interrupted(db_) == 1
+        return _decide()
+
+    monkeypatch.setattr(steward_apply, "apply_refusals", _no_refusals)
+    monkeypatch.setattr(steward_applied, "self_approval_for", _converged_during_overlap)
+
+    await apply_advisor_outcomes(db)
+    await apply_advisor_outcomes(db)
+
+    assert await _no_verdict(db, task_id)
+    assert (await _judge_row(db, task_id))["advisor_outcome"] == "escalated"
+    assert len(await _alerts(db, task_id)) == 1
+    lines = [dict(u)["content"] for u in await repo.get_task_updates(db, task_id)]
+    assert not [c for c in lines if "Одобрено стюардом без человека" in c]
+
+
+async def test_the_verdict_write_is_conditional_on_the_claim(db: aiosqlite.Connection):
+    """Сама запись вердикта условна по метке: чужая метка и снятая метка — 0 строк."""
+    task_id = await _in_review(db, "advisor-claim-sql")
+    await _pair_on_packet(db, task_id)
+    judge = await _judge_row(db, task_id)
+    await db.execute(
+        "UPDATE steward_judgements SET advisor_outcome='applying', "
+        "advisor_claimed_at='2026-10-06 10:00:00.123' WHERE id=?",
+        (judge["id"],),
+    )
+    await db.commit()
+
+    assert (
+        await repo.record_review_verdict(
+            db, task_id, "approved", expected_generation=1, claim=(judge["id"], "other")
+        )
+        is False
+    )
+    await db.execute(
+        "UPDATE steward_judgements SET advisor_outcome='escalated' WHERE id=?",
+        (judge["id"],),
+    )
+    assert (
+        await repo.record_review_verdict(
+            db,
+            task_id,
+            "approved",
+            expected_generation=1,
+            claim=(judge["id"], "2026-10-06 10:00:00.123"),
+        )
+        is False
+    ), "метка уже не applying"
+    await db.execute(
+        "UPDATE steward_judgements SET advisor_outcome='applying' WHERE id=?",
+        (judge["id"],),
+    )
+    assert (
+        await repo.record_review_verdict(
+            db,
+            task_id,
+            "approved",
+            expected_generation=1,
+            claim=(judge["id"], "2026-10-06 10:00:00.123"),
+        )
+        is True
+    )
+
+
+async def test_the_final_outcome_does_not_overwrite_a_foreign_one(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Исход пишется только если метка всё ещё эта: чужой исход не затирается."""
+    from hub.services import steward_applied
+
+    await _act(monkeypatch)
+    task_id = await _scenario(db, "advisor-final-conditional", "concur")
+
+    async def _neighbour_decides(db_, task, _generation, **_kw):
+        await db_.execute(
+            "UPDATE steward_judgements SET advisor_outcome='escalated' "
+            "WHERE task_id=? AND kind='verdict'",
+            (task,),
+        )
+        await db_.commit()
+        return ("approved", "x")
+
+    monkeypatch.setattr(steward_applied, "apply_self_approval", _neighbour_decides)
+
+    assert await apply_advisor_outcomes(db) == 0
+
+    assert (await _judge_row(db, task_id))["advisor_outcome"] == "escalated"
+
+
+async def test_the_advisor_state_ignores_a_judgement_of_the_old_contour(
+    db: aiosqlite.Connection,
+):
+    """Суждение старого контура (до выката) советника не имеет: состояние — не применимо."""
+    from hub.services.steward_advisor import STATE_NOT_APPLICABLE
+    from tests.test_steward_shadow import _v2_row
+
+    project_id = await _project(db, "advisor-state-old-contour")
+    task_id = await _v2_row(
+        db, project_id, verdict="approve", advisor="concur", contour=1
+    )
+
+    assert (await advisor_state(db, task_id, 1)).state == STATE_NOT_APPLICABLE

@@ -1109,7 +1109,7 @@ async def test_a_recorded_approve_applies_nothing_and_the_poller_reaches_the_rul
     asked: list[int] = []
     real = steward_applied.apply_self_approval
 
-    async def _spy(_db, task_id: int, generation: int):
+    async def _spy(_db, task_id: int, generation: int, **_kw):
         asked.append(task_id)
         return await real(_db, task_id, generation)
 
@@ -1153,7 +1153,7 @@ async def test_only_a_verdict_approve_reaches_the_rule(
     _grant_act(monkeypatch)
     asked: list[tuple[int, int]] = []
 
-    async def _spy(_db, task_id: int, generation: int):
+    async def _spy(_db, task_id: int, generation: int, **_kw):
         asked.append((task_id, generation))
         return None
 

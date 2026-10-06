@@ -11,9 +11,11 @@
     approve судьи, на который пришёл ответ советника (concur или object).
     Нужно не меньше :data:`ACT_MIN_PAIRS`;
 ``false_approve``
-    пара СОГЛАСИЛАСЬ (concur), а потом по задаче случилось одно из трёх:
-    человеческий возврат на этом или более позднем поколении, переоткрытие
-    или прод-дефект. Нужно ноль, и найденное не пропадает — см. ниже;
+    пара СОГЛАСИЛАСЬ (concur), а потом по задаче случился ЛЮБОЙ из трёх
+    фактов — в любой момент после одобрения, без окна и без якоря доставки:
+    человеческий ``changes_requested`` на этом или более позднем поколении,
+    выход задачи из ``completed`` (переоткрытие), прод-дефект
+    ``found_in='prod'`` с ``caused_by_task_id`` на неё. Нужно ноль;
 доля ``substantive``
     эскалации судьи по существу плюс возражения советника, делённые на все
     суждения нового контура без процедурных. Нужно от 5 до 50%.
@@ -27,11 +29,18 @@
 после выката. Старые одиночные суждения (``contour=1``) не зачитываются, и
 этим же отсечены суждения, у которых советника быть не могло.
 
-ЛИПКОСТЬ. Ошибочное одобрение пишется в таблицу ``steward_false_approvals`` и
-остаётся там, пока человек явно его не снимет. Таблица, а не событие: события
-чистятся через 14 дней, а окно проверки — 30 дней после доставки. Снятие
-исключает задачу из проверки целиком: человек рассудил её, и повторное
-обнаружение того же факта не должно отменять его решение.
+ЗАПИСЬ В МОМЕНТ СОБЫТИЯ. Факт пишется в таблицу ``steward_false_approvals``
+В ТОЙ ЖЕ ТРАНЗАКЦИИ, что само событие, если у задачи есть пара с concur:
+триггеры БД на событие человеческого возврата, на выход статуса из
+``completed`` и на prod-дефект с ``caused_by_task_id`` (триггер, а не вызов в
+каждом из путей: путей выхода из completed и записи вердикта много, а триггер
+ловит и те, о которых никто не вспомнил). События чистятся через 14 дней, а
+переоткрытие вообще не оставляет события — поэтому читать историю нельзя, и
+читается только таблица. Опрос по тику (``record_false_approvals``) —
+страховка для возврата и дефекта, не основной путь.
+
+ЛИПКОСТЬ. Запись остаётся, пока человек явно её не снимет. Снимается КОНКРЕТНЫЙ
+случай (задача, источник, ref), а не задача: новый случай — новая запись.
 
 Глобальность. ``effective_mode`` читает одну выборку на хаб, поэтому ошибка на
 проекте A возвращает в тень и проект B — по построению, а не по фильтру.
@@ -45,7 +54,6 @@ from typing import Any
 
 import aiosqlite
 
-from hub import repository as repo
 from hub.db import fetchall
 from hub.services.gate_events import NON_HUMAN_GATE_ACTORS, sql_in
 
@@ -60,14 +68,6 @@ ACT_ESCALATION_CEILING = 0.50
 PROCEDURAL_ESCALATE_REASONS: frozenset[str] = frozenset(
     {"no_current_report", "report_incomplete"}
 )
-
-#: Окно проверки пары после доставки, дней.
-FALSE_APPROVE_WINDOW_DAYS = 30
-#: Пары старше этого возраста (от ответа советника) на тике не читаются: окно
-#: 30 дней плюс запас на лаг доставки (60 дней). Доставка позже запаса уже
-#: не отслеживается — это граница контроля, а не поиск вечно. Записанные
-#: (закреплённые) ошибки читаются из таблицы независимо от возраста.
-PAIR_READ_HORIZON_DAYS = FALSE_APPROVE_WINDOW_DAYS + 60
 
 SOURCE_HUMAN_CHANGES = "human_changes_requested"
 SOURCE_REOPENED = "reopened"
@@ -201,12 +201,12 @@ async def contour_counts(
 
 @dataclass(frozen=True)
 class FalseApprove:
-    """Одно найденное ошибочное одобрение: задача, источник, случай и подробность.
+    """Одно ошибочное одобрение: задача, источник, случай и подробность.
 
-    ``ref`` называет КОНКРЕТНЫЙ случай: id события возврата, id дефекта, метка
-    времени переоткрытия. Липкость и снятие работают по (задача, источник,
-    случай), а не по задаче: снятый случай не возвращается, а новый случай той
-    же задачи — новая запись.
+    ``ref`` называет КОНКРЕТНЫЙ случай: id события возврата, id дефекта,
+    монотонная метка выхода из ``completed``. Липкость и снятие работают по
+    (задача, источник, случай), а не по задаче: снятый случай не возвращается,
+    а новый случай той же задачи — новая запись.
     """
 
     task_id: int
@@ -233,9 +233,8 @@ async def concur_pairs(db: aiosqlite.Connection) -> list[_Pair]:
         "AND a.task_id=j.task_id AND a.generation=j.generation "
         "AND a.judged_id=j.id "
         "WHERE j.kind='verdict' AND j.verdict='approve' AND j.contour=? "
-        "AND a.created_at >= datetime('now', ?) "
         "ORDER BY j.id",
-        (CONTOUR_V2, f"-{PAIR_READ_HORIZON_DAYS} days"),
+        (CONTOUR_V2,),
     )
     return [
         _Pair(
@@ -245,54 +244,6 @@ async def concur_pairs(db: aiosqlite.Connection) -> list[_Pair]:
         )
         for r in rows
     ]
-
-
-async def _norm(db: aiosqlite.Connection, stamp: str) -> str:
-    """Метка в формате sqlite (``YYYY-MM-DD HH:MM:SS``): релизы пишут ISO."""
-    if not stamp:
-        return ""
-    rows = await fetchall(db, "SELECT datetime(?) AS at", (stamp,))
-    return str(dict(rows[0]).get("at") or "") if rows else ""
-
-
-async def _delivered_at(
-    db: aiosqlite.Connection, pair: _Pair, projects: frozenset[int]
-) -> str:
-    """Когда ЭТО одобрение доставлено — по учёту доставки самого хаба.
-
-    Своего читателя нет. Доставка до прода — это ``repository.first_fix_deploy_at``
-    (первый успешный выкат релиза, в который попал последний мерж задачи; для
-    проектов с ``merge_is_delivery`` — по правилам #1572), тот же ответ, что
-    читают исходы (#1568). Если выката нет, а работа доставлена мимо гейта
-    (``delivery_discrepancies``: state=delivered, ``delivery_path`` из словаря
-    delivery_state), якорь — момент, когда свип это подтвердил. Мерж без выката
-    доставкой не считается. Момент раньше ответа пары — доставка прошлого
-    одобрения, не этого. Пусто — доставки не зафиксировано.
-    """
-    fix = await repo.first_fix_deploy_at(db, pair.task_id, delivery_projects=projects)
-    at = await _norm(db, fix.at or "")
-    if at and at >= pair.approved_at:
-        return at
-    stored = await repo.get_delivery_discrepancy(db, pair.task_id) or {}
-    if str(stored.get("state") or "") == "delivered":
-        seen = await _norm(db, str(stored.get("checked_at") or ""))
-        if seen and seen >= pair.approved_at:
-            return seen
-    return ""
-
-
-async def _plus_window(db: aiosqlite.Connection, stamp: str) -> str:
-    rows = await fetchall(
-        db,
-        "SELECT datetime(?, ?) AS at",
-        (stamp, f"+{FALSE_APPROVE_WINDOW_DAYS} days"),
-    )
-    return str(dict(rows[0]).get("at") or "")
-
-
-def _in(stamp: str, low: str, high: str) -> bool:
-    """Обе границы включительно; пустая метка в окно не входит."""
-    return bool(stamp) and low <= stamp <= high
 
 
 async def _human_returns(
@@ -325,86 +276,44 @@ async def _human_returns(
     return out
 
 
-async def _detect_for_pair(
-    db: aiosqlite.Connection, pair: _Pair, projects: frozenset[int]
-) -> list[FalseApprove]:
-    """Ошибочные одобрения одной пары по трём источникам, в обе границы окна.
+async def _poll_pair(db: aiosqlite.Connection, pair: _Pair) -> list[FalseApprove]:
+    """Страховка: возвраты и прод-дефекты, которых триггер мог не поймать.
 
-    Якорь окна — доставка этого одобрения, а если её нет — само одобрение.
-    Возврат человеком считается от момента одобрения (он случается ДО
-    доставки: возвращённое не доставляется); переоткрытие и прод-дефект —
-    только от доставки, поэтому без зафиксированной доставки их нет.
+    Без окна и без якоря доставки: любой факт ПОСЛЕ одобрения пары. Те же ref,
+    что у триггеров, поэтому запись по триггеру и находка опроса — один случай.
+    Переоткрытие опросом не находится (оно не оставляет следа) — только
+    триггером выхода из completed.
     """
-    task_id, generation = pair.task_id, pair.generation
-    delivered = await _delivered_at(db, pair, projects)
-    anchor = delivered or pair.approved_at
-    high = await _plus_window(db, anchor)
     found: list[FalseApprove] = []
-
-    for event_id, gen, at in await _human_returns(db, task_id):
-        if gen >= generation and _in(at, pair.approved_at, high):
+    for event_id, gen, at in await _human_returns(db, pair.task_id):
+        if gen >= pair.generation and at >= pair.approved_at:
             found.append(
                 FalseApprove(
-                    task_id,
+                    pair.task_id,
                     SOURCE_HUMAN_CHANGES,
-                    generation,
+                    pair.generation,
                     f"человек вернул поколение {gen} (пара одобрила поколение "
-                    f"{generation}), событие #{event_id}",
+                    f"{pair.generation}), событие #{event_id}",
                     ref=str(event_id),
                 )
             )
-
-    if not delivered:
-        return found
-
-    rows = await fetchall(
-        db,
-        "SELECT status, completed_at, status_entered_at FROM tasks WHERE id=?",
-        (task_id,),
-    )
-    task = dict(rows[0]) if rows else {}
-    reopened_at = str(task.get("status_entered_at") or "")
-    completed_at = str(task.get("completed_at") or "")
-    if (
-        completed_at
-        and completed_at >= delivered
-        and task.get("status") != "completed"
-        and _in(reopened_at, completed_at, high)
-    ):
-        found.append(
-            FalseApprove(
-                task_id,
-                SOURCE_REOPENED,
-                generation,
-                f"задача доставлена ({delivered}), завершена ({completed_at}) и "
-                f"снова в статусе {task.get('status')} с {reopened_at}",
-                # Ref — то завершение, из которого задачу вернули (его метка),
-                # а не время последнего перехода: оно меняется любым переходом
-                # (claimed, running...), и снятый случай возвращался бы.
-                # Новое настоящее переоткрытие = новое завершение = новый ref.
-                ref=completed_at,
-            )
-        )
-
     defects = await fetchall(
         db,
-        "SELECT id, COALESCE(detected_at, created_at) AS at FROM tasks "
-        "WHERE found_in='prod' AND caused_by_task_id=? ORDER BY id",
-        (task_id,),
+        "SELECT id FROM tasks WHERE found_in='prod' AND caused_by_task_id=? "
+        "AND COALESCE(detected_at, created_at) >= ? ORDER BY id",
+        (pair.task_id, pair.approved_at),
     )
     for d in defects:
-        item = dict(d)
-        if _in(str(item.get("at") or ""), delivered, high):
-            found.append(
-                FalseApprove(
-                    task_id,
-                    SOURCE_PROD_DEFECT,
-                    generation,
-                    "прод-дефект found_in=prod, caused_by_task_id на неё: "
-                    f"#{item['id']}",
-                    ref=str(item["id"]),
-                )
+        defect_id = int(dict(d)["id"])
+        found.append(
+            FalseApprove(
+                pair.task_id,
+                SOURCE_PROD_DEFECT,
+                pair.generation,
+                f"прод-дефект found_in=prod, caused_by_task_id на неё: #{defect_id}",
+                ref=str(defect_id),
             )
+        )
     return found
 
 
@@ -419,25 +328,22 @@ async def _recorded_keys(db: aiosqlite.Connection) -> set[tuple[int, str, str]]:
 
 
 async def detect_false_approvals(db: aiosqlite.Connection) -> list[FalseApprove]:
-    """Что находится по данным СЕЙЧАС и ещё не записано (ни активным, ни снятым).
+    """Страховочный опрос: факты, найденные по данным и ещё не записанные.
 
-    Только чтение. Случай, уже внесённый в таблицу, в находки не попадает:
-    активный лежит в таблице, а снятый человеком не возвращается.
+    Только чтение. Случай, уже внесённый в таблицу (активный или снятый
+    человеком), в находки не попадает.
     """
-    from hub.services.project_policy import merge_is_delivery_projects
-
     known = await _recorded_keys(db)
-    projects = await merge_is_delivery_projects(db)
     out: list[FalseApprove] = []
     for pair in await concur_pairs(db):
-        for item in await _detect_for_pair(db, pair, projects):
+        for item in await _poll_pair(db, pair):
             if (item.task_id, item.source, item.ref) not in known:
                 out.append(item)
     return out
 
 
 async def sticky_false_approvals(db: aiosqlite.Connection) -> list[FalseApprove]:
-    """Записанные и не снятые человеком."""
+    """Записанные и не снятые человеком — ОСНОВНОЙ источник отказа."""
     rows = await fetchall(
         db,
         "SELECT task_id, source, generation, detail, ref FROM steward_false_approvals "
@@ -456,16 +362,14 @@ async def sticky_false_approvals(db: aiosqlite.Connection) -> list[FalseApprove]
 
 
 async def current_false_approvals(db: aiosqlite.Connection) -> list[FalseApprove]:
-    """Активные записи плюс найденное сейчас и ещё не закреплённое."""
+    """Активные записи плюс то, что опрос нашёл и ещё не закрепил."""
     return [*await sticky_false_approvals(db), *await detect_false_approvals(db)]
 
 
 async def record_false_approvals(db: aiosqlite.Connection) -> int:
-    """Закрепить найденное: с этого момента оно не зависит от данных.
+    """Закрепить найденное опросом. Зовётся тиком поллера и при запросе act.
 
-    Зовётся КАЖДЫЙ тик поллера и при запросе act — независимо от режима: в
-    тени события возврата чистятся через 14 дней (``prune_events``), и основание
-    нельзя оставлять на запрос act. Возвращает число новых записей;
+    Основной путь записи — триггеры в момент события; это страховка.
     ``INSERT OR IGNORE`` по (задача, источник, случай) повторов не плодит.
     """
     added = 0
@@ -485,7 +389,7 @@ async def clear_false_approval(
 ) -> int:
     """Явное решение человека: снять АКТИВНЫЕ ошибочные одобрения задачи.
 
-    Снимаются конкретные случаи, которые есть сейчас (найденные, но не
+    Снимаются конкретные случаи, которые есть сейчас (найденные опросом, но не
     закреплённые, закрепляются и тут же снимаются). Нечего снимать — 0, и
     никакого запаса на будущее: новый случай той же задачи станет новой
     активной записью. Возвращает число снятых случаев.

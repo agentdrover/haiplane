@@ -2789,6 +2789,7 @@ async def record_review_verdict(
     findings_json: str = "[]",
     self_approved: bool = False,
     expected_generation: int | None = None,
+    claim: tuple[int, str] | None = None,
 ) -> bool:
     """Persist a review verdict bound to the CURRENT submission generation.
 
@@ -2816,6 +2817,15 @@ async def record_review_verdict(
             "AND review_verdict_generation=submission_generation)"
         )
         params.append(expected_generation)
+    if claim is not None:
+        # #1601: применение стюарда пишет вердикт, только пока ЕГО метка цела —
+        # суждение всё ещё applying с тем же временем занятия. Переведённое в
+        # escalated (прерванное) применение вердикта не пишет.
+        guard += (
+            " AND EXISTS (SELECT 1 FROM steward_judgements sj WHERE sj.id=? "
+            "AND sj.advisor_outcome='applying' AND sj.advisor_claimed_at=?)"
+        )
+        params.extend([claim[0], claim[1]])
     cursor = await db.execute(
         "UPDATE tasks SET review_verdict=?, "  # nosec B608 - guard is a constant
         "review_verdict_generation=submission_generation, "

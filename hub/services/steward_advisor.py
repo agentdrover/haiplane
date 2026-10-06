@@ -464,8 +464,14 @@ async def advisor_state(
     ответ, привязанный к другой строке, ничего не значит.
     """
     judge_row = await repo.get_steward_judgement(db, task_id, generation, "verdict")
-    if judge_row is None or dict(judge_row).get("verdict") != "approve":
-        return AdvisorState(STATE_NOT_APPLICABLE, reason="approve судьи нет")
+    if (
+        judge_row is None
+        or dict(judge_row).get("verdict") != "approve"
+        or int(dict(judge_row).get("contour") or 1) != 2
+    ):
+        return AdvisorState(
+            STATE_NOT_APPLICABLE, reason="approve судьи нового контура нет"
+        )
     judge = dict(judge_row)
     advisor_row = await repo.get_steward_judgement(
         db, task_id, generation, KIND_ADVISOR
@@ -638,6 +644,12 @@ async def advisor_refusal(
 # ---------------------------------------------------------------------------
 
 
+async def _stamp_now(db: aiosqlite.Connection) -> str:
+    """Метка этого прохода: время с долями секунды — равенство метки отличает проходы."""
+    rows = await fetchall(db, "SELECT strftime('%Y-%m-%d %H:%M:%f', 'now') AS at")
+    return str(dict(rows[0])["at"])
+
+
 async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
     """Применение, занявшее метку и не записавшее исхода, — к человеку, вслух.
 
@@ -716,17 +728,19 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
         state = await advisor_state(db, task_id, generation)
         if state.state in (STATE_NOT_ORDERED, STATE_PENDING, STATE_NOT_APPLICABLE):
             continue
+        stamp = await _stamp_now(db)
         cursor = await db.execute(
             "UPDATE steward_judgements SET advisor_outcome=?, "
-            "advisor_claimed_at=datetime('now') "
+            "advisor_claimed_at=? "
             "WHERE id=? AND advisor_outcome=''",
-            (_OUTCOME_CLAIMED, item["id"]),
+            (_OUTCOME_CLAIMED, stamp, item["id"]),
         )
         await db.commit()
         if cursor.rowcount != 1:
             continue
+        claim = (int(item["id"]), stamp)
         try:
-            result = await apply_self_approval(db, task_id, generation)
+            result = await apply_self_approval(db, task_id, generation, claim=claim)
         except Exception as exc:  # noqa: BLE001 — исход записывается в любом случае
             log.warning("advisor outcome not applied for #%s: %s", task_id, exc)
             outcome = OUTCOME_FAILED
@@ -741,10 +755,15 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
                     if result[0] == ESCALATED_TO_HUMAN
                     else OUTCOME_SKIPPED
                 )
-        await db.execute(
-            "UPDATE steward_judgements SET advisor_outcome=? WHERE id=?",
-            (outcome, item["id"]),
+        # Финальная запись исхода условна ТОЙ ЖЕ меткой: если применение уже
+        # переведено в escalated (прервано и названо вслух), чужой исход не
+        # перезаписывается.
+        final = await db.execute(
+            "UPDATE steward_judgements SET advisor_outcome=? "
+            "WHERE id=? AND advisor_outcome=? AND advisor_claimed_at=?",
+            (outcome, item["id"], _OUTCOME_CLAIMED, stamp),
         )
         await db.commit()
-        applied += 1
+        if final.rowcount == 1:
+            applied += 1
     return applied

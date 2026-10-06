@@ -894,3 +894,31 @@ async def test_a_judge_session_over_http_cannot_file_the_advisor_judgement(
     assert as_judge.json()["detail"]["reason"] == "steward_advisor_channel"
     assert as_advisor.status_code == 403, as_advisor.text
     assert as_advisor.json()["detail"]["reason"] == "steward_advisor_channel"
+
+
+async def test_the_judgement_response_carries_the_contour(
+    db: aiosqlite.Connection, client, monkeypatch
+):
+    """Ответ API о суждении называет контур выборки (2 — после выката #1601)."""
+    from hub.services.steward_dispatch import order_run
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    await _steward_principal(db, monkeypatch)
+    task_id = await _task(db, generation=1)
+    await order_run(db, task_id, 1)
+    token = await _live_session(db, monkeypatch, task_id, 1)
+
+    filed = await client.post(
+        f"/api/tasks/{task_id}/steward-judgement",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "generation": 1,
+            "kind": "verdict",
+            "verdict": "approve",
+            "confidence": "high",
+            "grounds": [{"source": "ci_pinned_sha"}],
+        },
+    )
+
+    assert filed.status_code == 200, filed.text
+    assert filed.json()["contour"] == 2

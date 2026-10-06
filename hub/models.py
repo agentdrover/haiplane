@@ -4481,6 +4481,8 @@ class StewardJudgementView(BaseModel):
     #: хеш пакета, по которому ответил (ставит хаб, а не советник).
     judged_id: int | None = None
     packet_hash: str = ""
+    #: Контур выборки: 2 — после выката #1601, 1 — прежние одиночные суждения.
+    contour: int = 1
     tokens_spent: int | None = None
     # Почему tokens_spent пуст (#1328): pending | provider_no_answer | no_run;
     # '' — число есть. Ноль и «неизвестно» не смешиваются.

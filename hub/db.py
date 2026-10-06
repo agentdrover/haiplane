@@ -2549,6 +2549,82 @@ _MIGRATIONS: list[tuple[str, str]] = [
             UNIQUE (task_id, source, ref)
         )""",
     ),
+    # --- #1601: факт ошибочного одобрения пишется В МОМЕНТ события, в той же
+    # транзакции, что и оно. Триггеры БД, а не вызовы в путях: путей записи
+    # вердикта и выхода из completed много, триггер ловит и забытые.
+    (
+        # Человеческий возврат. Список акторов автоматики — как
+        # gate_events.NON_HUMAN_GATE_ACTORS; расхождение ловит тест (новый
+        # актор = новая миграция, пересоздающая триггер).
+        "create_trigger_false_approve_human_return",
+        """CREATE TRIGGER IF NOT EXISTS trg_false_approve_human_return
+        AFTER INSERT ON events
+        WHEN NEW.kind = 'review_verdict_recorded' AND NEW.task_id IS NOT NULL
+          AND NEW.actor NOT IN ('hub', 'policy', 'steward')
+          AND json_extract(NEW.payload, '$.verdict') = 'changes_requested'
+        BEGIN
+            INSERT OR IGNORE INTO steward_false_approvals
+              (task_id, source, generation, detail, ref)
+            SELECT j.task_id, 'human_changes_requested', j.generation, 'человек вернул поколение ' || COALESCE(json_extract(NEW.payload, '$.submission_generation'), 0) || ' (пара одобрила поколение ' || j.generation || '), событие #' || NEW.id, CAST(NEW.id AS TEXT)
+            FROM steward_judgements a
+            JOIN steward_judgements j ON j.id = a.judged_id
+            WHERE a.kind = 'advisor' AND a.verdict = 'concur'
+              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2
+              AND a.task_id = NEW.task_id AND j.generation <= COALESCE(json_extract(NEW.payload, '$.submission_generation'), 0);
+        END""",
+    ),
+    (
+        # Выход из completed любым путём (transition_status_if, update_task,
+        # прямой UPDATE). Ref — монотонная метка этого выхода вместе с
+        # завершением, из которого вышли: последующие переходы нового случая
+        # не создают, повторное завершение и новый выход — создают.
+        "create_trigger_false_approve_reopened",
+        """CREATE TRIGGER IF NOT EXISTS trg_false_approve_reopened
+        AFTER UPDATE OF status ON tasks
+        WHEN OLD.status = 'completed' AND NEW.status != 'completed'
+        BEGIN
+            INSERT OR IGNORE INTO steward_false_approvals
+              (task_id, source, generation, detail, ref)
+            SELECT j.task_id, 'reopened', j.generation, 'задача вышла из completed в ' || NEW.status, 'exit:' || strftime('%Y-%m-%d %H:%M:%f', 'now') || ':' || COALESCE(OLD.completed_at, '')
+            FROM steward_judgements a
+            JOIN steward_judgements j ON j.id = a.judged_id
+            WHERE a.kind = 'advisor' AND a.verdict = 'concur'
+              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2
+              AND a.task_id = NEW.id;
+        END""",
+    ),
+    (
+        "create_trigger_false_approve_prod_defect_insert",
+        """CREATE TRIGGER IF NOT EXISTS trg_false_approve_prod_defect_insert
+        AFTER INSERT ON tasks
+        WHEN NEW.found_in = 'prod' AND NEW.caused_by_task_id IS NOT NULL
+        BEGIN
+            INSERT OR IGNORE INTO steward_false_approvals
+              (task_id, source, generation, detail, ref)
+            SELECT j.task_id, 'prod_defect', j.generation, 'прод-дефект found_in=prod, caused_by_task_id на неё: #' || NEW.id, CAST(NEW.id AS TEXT)
+            FROM steward_judgements a
+            JOIN steward_judgements j ON j.id = a.judged_id
+            WHERE a.kind = 'advisor' AND a.verdict = 'concur'
+              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2
+              AND a.task_id = NEW.caused_by_task_id;
+        END""",
+    ),
+    (
+        "create_trigger_false_approve_prod_defect_update",
+        """CREATE TRIGGER IF NOT EXISTS trg_false_approve_prod_defect_update
+        AFTER UPDATE OF found_in, caused_by_task_id ON tasks
+        WHEN NEW.found_in = 'prod' AND NEW.caused_by_task_id IS NOT NULL
+        BEGIN
+            INSERT OR IGNORE INTO steward_false_approvals
+              (task_id, source, generation, detail, ref)
+            SELECT j.task_id, 'prod_defect', j.generation, 'прод-дефект found_in=prod, caused_by_task_id на неё: #' || NEW.id, CAST(NEW.id AS TEXT)
+            FROM steward_judgements a
+            JOIN steward_judgements j ON j.id = a.judged_id
+            WHERE a.kind = 'advisor' AND a.verdict = 'concur'
+              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2
+              AND a.task_id = NEW.caused_by_task_id;
+        END""",
+    ),
     (
         # #1593: отложенные правки политики проекта. Своя таблица, не ключ
         # gate_policy: политика остаётся тем, что хаб ЧИТАЕТ, а расписание —

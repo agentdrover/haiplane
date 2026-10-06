@@ -157,6 +157,11 @@ from hub.hub_instance import hub_base_url
 from hub.services import admin as admin_svc
 from hub.services import chat_pair
 from hub.services import policy_change, project_policy
+from hub.services.steward_evidence import (
+    KIND_ADVISOR,
+    KIND_VERDICT,
+    stamp_served_packet,
+)
 from hub.services.review_dispatch import cancel_local_runs
 from hub.services.mcp_telemetry import set_telemetry_sink, usage_report
 from hub.mcp_server import mcp as mcp_server
@@ -2632,12 +2637,6 @@ async def api_steward_evidence(
     )
     # #1601: дверь открывает заказ ТОГО вида, которому принадлежит сессия:
     # судья читает под заказом вердикта, советник — под заказом советника.
-    from hub.services.steward_evidence import (
-        KIND_ADVISOR,
-        KIND_VERDICT,
-        stamp_served_packet,
-    )
-
     run_kind = (
         KIND_ADVISOR
         if getattr(identity, "chat_pair_kind", None) == "steward_advisor"
