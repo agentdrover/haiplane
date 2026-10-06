@@ -2528,3 +2528,32 @@ async def test_an_unreadable_submission_time_does_not_restart_the_wait(
 
     for event in await _events(db, EVENT_ORDERED):
         assert "ждали отчёт" in json.loads(event["payload"])["why"]
+
+
+async def test_the_last_ask_again_being_prepared_is_pending_too(
+    db: aiosqlite.Connection,
+):
+    """#1600 круг 2, п. 1: и ПОСЛЕДНИЙ переспрос в подготовке — ещё ожидание.
+
+    Метка попытки лежит на потолке (две из двух), а заказ второй попытки ещё
+    не создан: попыток записано больше, чем заказов. Потолок попыток не
+    означает, что переспрос окончательно отказан.
+    """
+    from hub.services.review_dispatch import ASK_AGAIN_MARK
+
+    _, task_id = await _due_task(db, "last-ask-again-preparing")
+    first = await _dispatch(db, task_id, status="failed", channel="cloud")
+    await db.execute(
+        "INSERT INTO review_dispatches (task_id, submission_generation, "
+        "agent_id, model, status, channel, replaces_dispatch_id) "
+        "VALUES (?, 1, 'rev-agent', 'gpt-5.2', 'failed', 'cloud', ?)",
+        (task_id, first),
+    )
+    for _ in range(2):
+        await repo.add_task_update(
+            db, task_id, "hub", "alert", ASK_AGAIN_MARK.format(generation=1) + " ещё"
+        )
+    await db.commit()
+
+    assert await order_due_runs(db) == 0
+    assert len(await _events(db, EVENT_DEFERRED)) == 1
