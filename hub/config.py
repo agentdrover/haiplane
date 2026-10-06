@@ -36,6 +36,18 @@ N4L_SPACE_ID = env_get("N4L_SPACE", "")
 
 GH_BIN = os.environ.get("GH_BIN", "gh")
 
+# #1591: каталоги сервера, внутри которых хаб вправе сверять хэш файла из
+# gate_policy.release_artifacts. Серверная настройка, не политика проекта:
+# политику пишет PATCH, а список того, что хаб вообще может открыть, держит
+# владелец хоста. Через запятую; пустое значение — значение по умолчанию.
+RELEASE_ARTIFACT_DIRS: tuple[str, ...] = tuple(
+    part.strip()
+    for part in env_get(
+        "RELEASE_ARTIFACT_DIRS", "/usr/local/sbin,/usr/local/lib,/usr/local/bin"
+    ).split(",")
+    if part.strip()
+)
+
 # GitVerse как второй форж (#1115, эпик #1112). Токен обязателен даже для
 # ПУБЛИЧНЫХ репозиториев — анонимного режима у API нет, проверено живым
 # запросом: без заголовка авторизации он отвечает 401.

@@ -655,6 +655,7 @@ class GitVerseForge:
         repo: str | None = None,
         gh_repo: str | None = None,
         method: str = "squash",
+        expected_head_sha: str = "",
     ) -> bool:
         """Форж слить не может — и говорит это, а не молчит (#1116).
 

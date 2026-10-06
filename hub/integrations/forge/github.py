@@ -638,6 +638,7 @@ class GitHubForge:
         repo: str | None = None,
         gh_repo: str | None = None,
         method: str = "squash",
+        expected_head_sha: str = "",
     ) -> bool:
         """Merge one PR; ``delete_branch`` says what happens to its head (#949).
 
@@ -648,6 +649,11 @@ class GitHubForge:
         delete_branch_on_merge=false proves it was us, not GitHub. The default
         stays True so the task path is untouched; the release path passes
         False, because a release must not remove the branch work lands on.
+
+        ``expected_head_sha`` (#1591): ``--match-head-commit`` — GitHub отказывает,
+        если голова PR уже не этот коммит. Релиз проверяет серверные копии на
+        закреплённой голове и сливает ровно её; новый push между проверкой и
+        merge не сливается непроверенным.
 
         ``method`` is the merge strategy (#1426). Squash stays the default —
         linear main was a deliberate choice (#946). The release RETURN is the
@@ -668,6 +674,8 @@ class GitHubForge:
         ]
         if delete_branch:
             args.append("--delete-branch")
+        if expected_head_sha:
+            args += ["--match-head-commit", expected_head_sha]
         args += ["--subject", subject]
         rc, _, err = await _gh(
             *args,

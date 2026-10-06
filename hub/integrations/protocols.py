@@ -680,6 +680,7 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
         delete_branch: bool = True,
+        expected_head_sha: str = "",
     ) -> bool: ...
     # То же, но с ПРИЧИНОЙ отказа (#1116, по ревью). Булевого ответа не
     # хватает: «слить не смогли» и «слили, но подтвердить не удалось» ведут к
@@ -695,7 +696,16 @@ class GitOpsPlugin(Protocol):
         gh_repo: str | None = None,
         forge: str = "",
         delete_branch: bool = True,
+        expected_head_sha: str = "",
     ) -> tuple[bool, str]: ...
+    # #1591: голова PR на форже, чтобы закрепить проверку релиза и merge.
+    async def pr_head_sha(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> str: ...
     async def delete_branch(
         self,
         branch: str,
@@ -865,6 +875,7 @@ class ForgePlugin(Protocol):
         repo: str | None = None,
         gh_repo: str | None = None,
         method: str = "squash",
+        expected_head_sha: str = "",
     ) -> bool: ...
     # Закрыть PR, ничего не вливая (#1116). Нужен там, где мерж сделан не
     # форжем: GitVerse не замечает мержа пушем и оставляет PR открытым

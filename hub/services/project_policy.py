@@ -742,3 +742,37 @@ def path_notices_of(policy: dict) -> list[dict[str, str]]:
             if text.strip():
                 rules.append({"pattern": pattern.strip(), "text": text.strip()})
     return rules
+
+
+# #1591: пары «файл репо на голове релиза → серверная копия». Читатель терпит
+# то, что могло попасть в базу мимо модели: мусорная запись пропускается, а
+# запись с путём вне каталогов ХОСТА остаётся в списке — её отвергнет чтение
+# (release_artifacts.server_sha256), и причина будет названа, а не молчалива.
+RELEASE_ARTIFACTS_KEY = "release_artifacts"
+
+
+def release_artifacts_of(policy: dict) -> list[dict[str, str]]:
+    """Пары release_artifacts уже прочитанной политики; ``[]``, когда их нет."""
+    raw = policy.get(RELEASE_ARTIFACTS_KEY) if isinstance(policy, dict) else None
+    if not isinstance(raw, list):
+        return []
+    pairs: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        repo_path, server_path = item.get("repo_path"), item.get("server_path")
+        hint = item.get("update_hint")
+        if (
+            isinstance(repo_path, str)
+            and repo_path.strip()
+            and isinstance(server_path, str)
+            and server_path.strip()
+        ):
+            pairs.append(
+                {
+                    "repo_path": repo_path.strip(),
+                    "server_path": server_path.strip(),
+                    "update_hint": hint.strip() if isinstance(hint, str) else "",
+                }
+            )
+    return pairs
