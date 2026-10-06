@@ -70,6 +70,10 @@ KIND_VERDICT = "verdict"
 # спрашивать kind: генерация 1 у вердикта и генерация 1 у DoR описывают
 # РАЗНЫЕ вещи, и слот одного не смеет закрывать слот другого.
 KIND_DOR = "dor"
+# Третий вид заказа (#1601): советник-критик отвечает на approve судьи. Считает
+# те же ПОКОЛЕНИЯ СДАЧИ, что и вердикт, и стоит на том же уникальном индексе
+# (task_id, generation, kind) — своя строка, не слот судьи.
+KIND_ADVISOR = "advisor"
 
 RUN_OPEN = "open"
 RUN_JUDGED = "judged"
@@ -269,8 +273,15 @@ async def order_run(
     generation: int,
     kind: str = KIND_VERDICT,
     why: str = "",
+    *,
+    model: str = "",
+    deadline_min: int | None = None,
 ) -> dict[str, Any] | None:
     """Place one order, or refuse with a named reason.
+
+    ``model`` и ``deadline_min`` (#1601) — заказ советника называет СВОЮ
+    модель (выбранную по семействам) и свой срок ответа; у судьи оба берутся
+    из настроек, как прежде.
 
     ``why`` (#1600) — на каком основании заказ идёт без готового отчёта ревью
     (окончательный исход или «ждали отчёт N мин»); пишется в запись заказа.
@@ -316,6 +327,7 @@ async def order_run(
         )
         return None
 
+    ordered_model = (model or config.STEWARD_MODEL or "").strip()
     # The order and its uniqueness are one statement: a check-then-insert
     # would be exactly the race the index exists to lose.
     try:
@@ -329,11 +341,12 @@ async def order_run(
                 generation,
                 kind,
                 RUN_OPEN,
-                config.STEWARD_MODEL,
+                ordered_model,
                 project_id,
                 # Пока заказ не начат, срок отмеряет ожидание ВОЗМОЖНОСТИ, а не
                 # работу судьи. Рабочее окно поставит захват слота (#1181).
-                f"+{config.STEWARD_START_DEADLINE_MIN} minutes",
+                # У советника срок один на старт и работу (#1601).
+                f"+{deadline_min if deadline_min is not None else config.STEWARD_START_DEADLINE_MIN} minutes",
             ),
         )
     except aiosqlite.IntegrityError:
@@ -357,7 +370,7 @@ async def order_run(
             "run_id": run_id,
             "generation": generation,
             "kind": kind,
-            "model": config.STEWARD_MODEL,
+            "model": ordered_model,
             "mode": steward_mode(),
             **({"why": why} if why else {}),
         },
@@ -1008,7 +1021,9 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
         # бы никогда, а после первой же сдачи закрылся бы разом и не по делу.
         kind = str(run.get("kind") or KIND_VERDICT)
         moved_on = (
-            "submission_generation" if kind == KIND_VERDICT else "statement_generation"
+            "submission_generation"
+            if kind in (KIND_VERDICT, KIND_ADVISOR)
+            else "statement_generation"
         )
         current_generation = int(task.get(moved_on) or 0)
         if task and current_generation > int(run["generation"]):
@@ -1019,7 +1034,7 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
                 (
                     f"работа пересдана: генерация {current_generation} вместо "
                     f"{run['generation']} — этот прогон судил другой код"
-                    if kind == KIND_VERDICT
+                    if kind in (KIND_VERDICT, KIND_ADVISOR)
                     else f"постановку правили: ревизия {current_generation} "
                     f"вместо {run['generation']} — этот прогон читал другой текст"
                 ),
@@ -1102,7 +1117,7 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
         verdict_generation = task.get("review_verdict_generation")
         if (
             task
-            and kind == KIND_VERDICT
+            and kind in (KIND_VERDICT, KIND_ADVISOR)
             and verdict_generation == run["generation"]
             and not run_has_started(run)
         ):
@@ -1289,14 +1304,32 @@ async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
     same pass may have just recorded closing runs above, but touches no run
     and no order — it only ever writes an alert, never a mode.
     """
+    from hub.services.steward_advisor import (
+        apply_advisor_outcomes,
+        order_due_advisors,
+    )
     from hub.services.steward_judgement import stamp_judgement_usage
     from hub.services.steward_shadow import check_escalation_corridor, start_due_runs
 
     await close_finished_runs(db)
+    # #1601: ошибочные одобрения пары закрепляются КАЖДЫЙ тик и в любом режиме —
+    # события возврата чистятся через 14 дней, а запрос act может прийти позже.
+    # Best effort: сбой закрепления не должен ронять проход поллера.
+    try:
+        from hub.services.steward_exit import record_false_approvals
+
+        await record_false_approvals(db)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("false approvals not recorded: %s", exc)
     # Цена суждений, закрытых раньше (#1328): только чтение у провайдера, ни
     # одного заказа — поэтому место в проходе ей безразлично.
     await stamp_judgement_usage(db)
     await order_due_runs(db)
     await order_due_dor_runs(db)
+    # #1601: советник заказывается ПОСЛЕ approve судьи — поэтому после
+    # судейского заказа и до старта: заказанный в этом проходе стартует сразу.
+    await order_due_advisors(db)
     await start_due_runs(db)
+    # Применение approve судьи — только после ответа советника и только в act.
+    await apply_advisor_outcomes(db)
     await check_escalation_corridor(db)

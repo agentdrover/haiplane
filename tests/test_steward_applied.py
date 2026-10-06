@@ -72,6 +72,34 @@ async def _judge(
     )
 
 
+async def _concur(
+    db: aiosqlite.Connection, monkeypatch, task_id: int, generation: int = 1
+) -> None:
+    """Советник согласился с approve судьи на том же пакете (#1601).
+
+    approve вердиктом становится только так; помощник проходит НАСТОЯЩИЙ
+    контракт: заказ советника, его ответ, привязка и хеш пакета.
+    """
+    from hub.services.steward_dispatch import configured_mode
+    from tests.test_steward_shadow import (
+        _advise,
+        _advisor_run,
+        _same_packet,
+    )
+
+    if configured_mode() == "off":
+        monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    await db.execute(
+        "UPDATE steward_judgements SET packet_hash='pkt' "
+        "WHERE task_id=? AND generation=? AND kind='verdict'",
+        (task_id, generation),
+    )
+    await db.commit()
+    await _advisor_run(db, task_id, packet="pkt", generation=generation)
+    await _advise(db, task_id, verdict="concur", generation=generation)
+    _same_packet(monkeypatch, "pkt")
+
+
 async def _client_task(db: aiosqlite.Connection, project_id: int, **fields) -> int:
     """Задача клиентского пути: в review и БЕЗ review_job_id."""
     task_id = await _task(db, project_id)
@@ -192,6 +220,7 @@ async def test_human_verdict_wins_race(db: aiosqlite.Connection, monkeypatch):
     # Стюард уже применил: второе применение — тот же отказ, то же поле.
     second = await _client_task(db, project_id)
     await _judge(db, second, verdict="approve")
+    await _concur(db, monkeypatch, second)
     assert (await apply_judgement(db, second, 1))[0] == APPLIED
     with pytest.raises(HTTPException) as twice:
         await apply_judgement(db, second, 1)
@@ -212,6 +241,7 @@ async def test_an_approve_is_recorded_as_a_verdict_by_the_steward(
     project_id = await _project(db, "applied-trail")
     task_id = await _client_task(db, project_id)
     await _judge(db, task_id, verdict="approve")
+    await _concur(db, monkeypatch, task_id)
 
     assert (await apply_judgement(db, task_id, 1))[0] == APPLIED
 
@@ -681,6 +711,7 @@ async def test_a_self_issued_approval_is_visible_and_sampled(
     project_id = await _project(db, "self-approval-visible")
     task_id = await _client_task(db, project_id)
     await _judge(db, task_id, verdict="approve")
+    await _concur(db, monkeypatch, task_id)
     decision = _decide()
     assert decision.allowed
 
@@ -1042,6 +1073,9 @@ async def test_the_gatekeeper_is_asked_before_the_eight_signals(
     project_id = await _project(db, "live-path-gatekeeper")
     task_id = await _client_task(db, project_id)
     await _judge(db, task_id, verdict="approve")
+    # Советник согласен (#1601): вопрос про второе мнение закрыт, и отказ,
+    # который остаётся, — привратника, а не отсутствие согласия.
+    await _concur(db, monkeypatch, task_id)
 
     outcome, detail = await apply_self_approval(db, task_id, 1)
 
@@ -1055,27 +1089,47 @@ async def test_the_gatekeeper_is_asked_before_the_eight_signals(
     assert not (task.get("review_verdict") or "")
 
 
-async def test_a_recorded_approve_reaches_the_live_rule(
+async def test_a_recorded_approve_applies_nothing_and_the_poller_reaches_the_rule(
     db: aiosqlite.Connection, monkeypatch
 ):
-    """Запись approve-суждения ДОХОДИТ до правила — не только из теста.
+    """Запись approve САМА ничего не применяет; до правила его доводит поллер.
 
     Первая сдача #1231 оставила правило без вызывающих в ``hub/``, и
     собственный анализатор хаба (#601) сказал про оба входа ``only_tests``.
-    Этот тест и есть тот вызывающий: проверяется не возвращённое значение
-    правила, а СЛЕД его работы в карточке после настоящей записи суждения
-    контрактом #1022.
+    Теперь вызывающий — шаг поллера после ответа советника (#1601), и этот
+    тест проверяет оба конца: запись суждения правила НЕ зовёт, а ответ
+    советника доводит approve до правила — след виден в карточке.
     """
+    from hub.services import steward_applied
+    from hub.services.steward_advisor import apply_advisor_outcomes
+
     monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
     monkeypatch.setattr(config, "STEWARD_MODE", "act")
     _grant_act(monkeypatch)
+    asked: list[int] = []
+    real = steward_applied.apply_self_approval
+
+    async def _spy(_db, task_id: int, generation: int, **_kw):
+        asked.append(task_id)
+        return await real(_db, task_id, generation)
+
+    monkeypatch.setattr(steward_applied, "apply_self_approval", _spy)
     project_id = await _project(db, "live-path-reached")
     task_id = await _client_task(db, project_id)
 
     await _judge(db, task_id, verdict="approve")
 
+    assert asked == [], "запись суждения правила не зовёт ни в одном пути"
+    assert await _steward_lines(db, task_id) == []
+    assert not (dict(await repo.get_task(db, task_id)).get("review_verdict") or "")
+
+    assert await apply_advisor_outcomes(db) == 0, "советник ещё не ответил"
+    await _concur(db, monkeypatch, task_id)
+    assert await apply_advisor_outcomes(db) == 1
+
+    assert asked == [task_id]
     assert await _steward_lines(db, task_id), (
-        "правило обязано быть вызвано записью суждения: механизм без "
+        "правило обязано быть вызвано после ответа советника: механизм без "
         "вызывающего не меняет ни одного исхода"
     )
 
@@ -1088,16 +1142,18 @@ async def test_only_a_verdict_approve_reaches_the_rule(
     ``changes_requested`` и ``escalate`` самостоятельного одобрения не
     порождают по определению, а драфт решает свой привратник (#1159, scope_out
     #1231). Спрашивать «сошлись ли свидетельства» там, где судья уже сказал
-    «нет», значило бы завести второй ответ на решённый вопрос.
+    «нет», значило бы завести второй ответ на решённый вопрос. Советник на них
+    тоже не заказывается — это держит тест диспетчера.
     """
     from hub.services import steward_applied
+    from hub.services.steward_advisor import apply_advisor_outcomes
 
     monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
     monkeypatch.setattr(config, "STEWARD_MODE", "act")
     _grant_act(monkeypatch)
     asked: list[tuple[int, int]] = []
 
-    async def _spy(_db, task_id: int, generation: int):
+    async def _spy(_db, task_id: int, generation: int, **_kw):
         asked.append((task_id, generation))
         return None
 
@@ -1106,28 +1162,31 @@ async def test_only_a_verdict_approve_reaches_the_rule(
 
     refused = await _client_task(db, project_id)
     await _judge(db, refused, verdict="changes_requested")
-    assert asked == [], "правку судья уже запросил — правило здесь не спрашивают"
-
     escalated = await _client_task(db, project_id)
     await _judge(db, escalated, verdict="escalate")
-    assert asked == [], "эскалация и есть отказ судить — применять нечего"
+    await apply_advisor_outcomes(db)
+    assert asked == [], "правку и эскалацию судья уже решил — правило не спрашивают"
 
     approved = await _client_task(db, project_id)
     await _judge(db, approved, verdict="approve")
-    assert asked == [(approved, 1)], "approve обязан дойти до правила"
+    await _concur(db, monkeypatch, approved)
+    await apply_advisor_outcomes(db)
+    assert asked == [(approved, 1)], "approve с ответом советника обязан дойти"
 
 
 async def test_a_converged_submission_applies_without_a_human_on_the_live_path(
     db: aiosqlite.Connection, monkeypatch
 ):
-    """Все три замка открыты и свидетельства сошлись — вердикт уезжает сам.
+    """Все замки открыты, свидетельства сошлись, советник согласен — вердикт уезжает сам.
 
     Свидетельства подставляются готовым решением, а НЕ выдуманным вердиктом:
     что именно считается сошедшимся набором, проверяют тесты AC-1..AC-3 выше,
     а здесь проверяется, что открытый контур доводит их ответ до настоящей
-    записи вердикта — того же поля, в которое пишет человек.
+    записи вердикта — того же поля, в которое пишет человек. И что до ответа
+    советника вердикта нет, а после — он ровно один.
     """
     from hub.services import steward_apply, steward_applied
+    from hub.services.steward_advisor import apply_advisor_outcomes
 
     monkeypatch.setattr(config, "MAX_REVIEW_CYCLES", 3)
     monkeypatch.setattr(config, "STEWARD_MODE", "act")
@@ -1145,6 +1204,12 @@ async def test_a_converged_submission_applies_without_a_human_on_the_live_path(
     task_id = await _client_task(db, project_id)
 
     await _judge(db, task_id, verdict="approve")
+    assert not (dict(await repo.get_task(db, task_id)).get("review_verdict") or ""), (
+        "сразу после записи судьи вердикта нет"
+    )
+
+    await _concur(db, monkeypatch, task_id)
+    assert await apply_advisor_outcomes(db) == 1
 
     task = dict(await repo.get_task(db, task_id))
     assert (task.get("review_verdict") or "") == ReviewVerdict.approved.value, (
@@ -1152,6 +1217,9 @@ async def test_a_converged_submission_applies_without_a_human_on_the_live_path(
     )
     lines = await _steward_lines(db, task_id)
     assert lines and "Одобрено стюардом без человека" in lines[0]
+
+    assert await apply_advisor_outcomes(db) == 0, "второй проход ничего не применяет"
+    assert len(await _steward_lines(db, task_id)) == len(lines)
 
 
 async def test_an_unverified_deployment_is_not_a_live_check(db: aiosqlite.Connection):
@@ -1241,6 +1309,7 @@ async def test_a_self_approval_is_named_apart_on_the_digest_page(
     project_id = await _project(db, "self-approval-page")
     task_id = await _client_task(db, project_id)
     await _judge(db, task_id, verdict="approve")
+    await _concur(db, monkeypatch, task_id)
     outcome, _ = await approve_without_a_human(db, task_id, 1, _decide())
     assert outcome == APPLIED
 
@@ -1278,6 +1347,7 @@ async def test_a_day_with_only_a_self_approval_still_gets_a_digest(
     project_id = await _project(db, "self-approval-alone")
     task_id = await _client_task(db, project_id)
     await _judge(db, task_id, verdict="approve")
+    await _concur(db, monkeypatch, task_id)
     await db.execute(
         "UPDATE events SET created_at = datetime('now', '-3 days') "
         "WHERE kind = ? AND task_id = ?",

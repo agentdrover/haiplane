@@ -4467,8 +4467,18 @@ class IdentityDiagnosticsView(BaseModel):
 
 # Closed vocabularies for steward judgements (#1022). `unknown` is absent on
 # purpose: a catch-all would reopen the dictionary (#549 on a different axis).
-STEWARD_JUDGEMENT_KINDS: tuple[str, ...] = ("verdict", "dor", "disposition")
+STEWARD_JUDGEMENT_KINDS: tuple[str, ...] = (
+    "verdict",
+    "dor",
+    "disposition",
+    # #1601: суждение советника-критика о approve судьи. Своя строка в той же
+    # таблице: тройка (задача, поколение, kind) уже даёт at-most-once.
+    "advisor",
+)
 STEWARD_VERDICTS: tuple[str, ...] = ("approve", "changes_requested", "escalate")
+#: Ответы советника (#1601). Отдельный словарь, а не расширение STEWARD_VERDICTS:
+#: «concur» судьи не бывает, а «approve» советника не отличить от одобрения.
+STEWARD_ADVISOR_VERDICTS: tuple[str, ...] = ("concur", "object")
 STEWARD_CONFIDENCE: tuple[str, ...] = ("high", "medium", "low")
 STEWARD_GROUND_SOURCES: tuple[str, ...] = (
     "ci_pinned_sha",
@@ -4562,6 +4572,14 @@ class StewardJudgementSubmit(BaseModel):
     duration_ms: int | None = Field(default=None, ge=0)
 
 
+class StewardFalseApproveClear(BaseModel):
+    """Явное решение человека: снять ошибочное одобрение пары с задачи (#1601)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    note: str = Field("", max_length=1000)
+
+
 class StewardJudgementView(BaseModel):
     """Stored judgement as the writer reads it back. Not an applied transition."""
 
@@ -4577,6 +4595,12 @@ class StewardJudgementView(BaseModel):
     findings: list[dict[str, Any]] = Field(default_factory=list)
     closures: list[StewardClosure] = Field(default_factory=list)
     model: str = ""
+    #: Для kind=advisor (#1601): id суждения судьи, на которое он отвечает, и
+    #: хеш пакета, по которому ответил (ставит хаб, а не советник).
+    judged_id: int | None = None
+    packet_hash: str = ""
+    #: Контур выборки: 2 — после выката #1601, 1 — прежние одиночные суждения.
+    contour: int = 1
     tokens_spent: int | None = None
     # Почему tokens_spent пуст (#1328): pending | provider_no_answer | no_run;
     # '' — число есть. Ноль и «неизвестно» не смешиваются.

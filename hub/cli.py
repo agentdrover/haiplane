@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import Any
 
 from hub import config
-from hub.models import DEFAULT_FORGE, FORGES
+from hub.models import (
+    DEFAULT_FORGE,
+    FORGES,
+    STEWARD_ADVISOR_VERDICTS,
+    STEWARD_JUDGEMENT_KINDS,
+    STEWARD_VERDICTS,
+)
 
 HUB_URL = config.env_get("HUB_URL", "http://127.0.0.1:8080") or "http://127.0.0.1:8080"
 HUB_TOKEN = config.env_get("HUB_TOKEN", "") or ""
@@ -814,6 +820,30 @@ def cmd_steward_judgement(args: argparse.Namespace) -> int:
     result = _api("POST", f"/api/tasks/{args.task_id}/steward-judgement", body)
     _print_json(result)
     return 0
+
+
+def cmd_steward_false_approve_clear(args: argparse.Namespace) -> int:
+    """Human-only: lift a sticky false approve of the steward pair (#1601)."""
+    body = {"note": args.note}
+    result = _api(
+        "POST", f"/api/tasks/{args.task_id}/steward-false-approve/clear", body
+    )
+    _print_json(result)
+    return 0
+
+
+def _add_false_approve_parser(sub: Any) -> None:
+    """Подкоманда снятия ошибочного одобрения — вынесена: build_parser на пределе."""
+    p = sub.add_parser(
+        "steward-false-approve-clear",
+        help=(
+            "Human-only: lift the sticky false approve of the steward pair from a "
+            "task (the only way it is lifted, #1601)"
+        ),
+    )
+    p.add_argument("task_id", type=int)
+    p.add_argument("--note", default="", help="Why the case is closed")
+    p.set_defaults(func=cmd_steward_false_approve_clear)
 
 
 def cmd_claim(args: argparse.Namespace) -> int:
@@ -2318,12 +2348,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_steward_judgement.add_argument("task_id", type=int)
     p_steward_judgement.add_argument("--generation", type=int, required=True)
     p_steward_judgement.add_argument(
-        "--kind", required=True, choices=["verdict", "dor", "disposition"]
+        "--kind", required=True, choices=list(STEWARD_JUDGEMENT_KINDS)
     )
     p_steward_judgement.add_argument(
         "--verdict",
         required=True,
-        choices=["approve", "changes_requested", "escalate"],
+        choices=[*STEWARD_VERDICTS, *STEWARD_ADVISOR_VERDICTS],
     )
     p_steward_judgement.add_argument(
         "--confidence", default="", choices=["", "high", "medium", "low"]
@@ -2341,6 +2371,7 @@ def build_parser() -> argparse.ArgumentParser:
         help='JSON list of closures: [{"finding_uid":"...","type":"fixed"}]',
     )
     p_steward_judgement.set_defaults(func=cmd_steward_judgement)
+    _add_false_approve_parser(sub)
 
     p_claim = sub.add_parser("claim", help="Claim an open task for one agent/session")
     p_claim.add_argument("task_id", type=int)

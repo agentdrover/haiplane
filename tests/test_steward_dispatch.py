@@ -2773,3 +2773,459 @@ async def test_the_last_ask_again_being_prepared_is_pending_too(
 
     assert await order_due_runs(db) == 0
     assert len(await _events(db, EVENT_DEFERRED)) == 1
+
+
+# ---------------------------------------------------------------------------
+# #1601 — советник-критик: заказ, семейство, срок
+# ---------------------------------------------------------------------------
+
+
+async def _approved_by_the_judge(
+    db: aiosqlite.Connection,
+    slug: str,
+    *,
+    judge_model: str,
+    verdict: str = "approve",
+    implementer: str = "claude-opus-5",
+    reviewer: str = "grok-4.6",
+) -> int:
+    """Судья вынес суждение. ``judge_model`` — модель, на которой прогон ЗАПУЩЕН."""
+    from tests.test_steward_shadow import _judge, _judge_run
+
+    project_id = await _project(db, slug, steward=True)
+    task_id = await _submitted_task(db, project_id)
+    await repo.update_task(db, task_id, submission_model=implementer)
+    await _dispatch(db, task_id, status="done", channel="local", model=reviewer)
+    await _judge_run(db, task_id, model=judge_model)
+    await _judge(db, task_id, verdict=verdict)
+    return task_id
+
+
+async def _advisor_rows(db: aiosqlite.Connection, task_id: int) -> list[dict]:
+    rows = await fetchall(
+        db,
+        "SELECT * FROM steward_runs WHERE task_id=? AND kind='advisor'",
+        (task_id,),
+    )
+    return [dict(r) for r in rows]
+
+
+async def test_advisor_ordered_once_by_actual_judge_family(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1601 AC-1: советник заказан ровно один раз и отличен от ФАКТИЧЕСКОГО судьи.
+
+    Судья по настройке gpt-5.3-codex, но запущен на composer-2.5 (замена
+    #1182): семейство судьи для советника — то, на чём прогон реально идёт.
+    Первым кандидатом стоит composer-2.5, и отклонить его может только чтение
+    фактической модели; настройка STEWARD_MODEL его бы пропустила. Исполнитель
+    claude, ревьюер grok — их семейства закрыты тоже. На changes_requested и
+    escalate судьи советник не заказывается вовсе.
+    """
+    from hub.services.model_family import family
+    from hub.services.steward_advisor import order_due_advisors
+
+    monkeypatch.setattr(config, "STEWARD_MODEL", "gpt-5.3-codex")
+    # gemini стоит ПЕРЕД gpt: выбранный советник не равен ни настройке судьи, ни
+    # своему «умолчанию», и заказ обязан нести именно выбор по семействам.
+    monkeypatch.setattr(
+        config,
+        "STEWARD_ADVISOR_MODELS",
+        (
+            "composer-2.5",
+            "claude-sonnet-5",
+            "grok-4.5",
+            "gemini-3.1-pro",
+            "gpt-5.3-codex",
+        ),
+    )
+    approved = await _approved_by_the_judge(
+        db, "advisor-order", judge_model="composer-2.5"
+    )
+    returned = await _approved_by_the_judge(
+        db,
+        "advisor-order-changes",
+        judge_model="composer-2.5",
+        verdict="changes_requested",
+    )
+    escalated = await _approved_by_the_judge(
+        db, "advisor-order-escalate", judge_model="composer-2.5", verdict="escalate"
+    )
+
+    # Несколько тиков поллера подряд: заказ один, строка одна.
+    for _ in range(4):
+        await order_due_advisors(db)
+
+    rows = await _advisor_rows(db, approved)
+    assert len(rows) == 1, "ровно один заказ советника на approve"
+    order = rows[0]
+    assert order["status"] == RUN_OPEN
+    assert order["generation"] == 1
+    taken = family(order["model"])
+    assert taken not in {"anthropic", "xai", "cursor"}, (
+        f"советник {order['model']} из семейства {taken}: исполнитель claude, "
+        "ревьюер grok, судья composer"
+    )
+    assert order["model"] == "gemini-3.1-pro"
+    assert order["model"] != config.STEWARD_MODEL
+    assert order["model"] in config.SUBSCRIPTION_LAUNCHABLE_MODELS
+    ordered_events = [
+        json.loads(e["payload"])
+        for e in await _events(db, EVENT_ORDERED)
+        if e["task_id"] == approved
+        and json.loads(e["payload"]).get("kind") == "advisor"
+    ]
+    assert len(ordered_events) == 1
+    assert ordered_events[0]["model"] == "gemini-3.1-pro"
+
+    assert await _advisor_rows(db, returned) == [], "на возврат судьи советник не нужен"
+    assert await _advisor_rows(db, escalated) == [], "на эскалацию судьи — тоже"
+    # Повторные тики не пишут отказов «уже заказан»: заказ не пытаются разместить
+    # второй раз, а не размещают и получают отказ уникального индекса.
+    assert [
+        e for e in await _events(db, EVENT_REFUSED) if e["task_id"] == approved
+    ] == []
+
+
+async def test_the_advisor_family_follows_the_model_the_judge_actually_ran_on(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Зеркало AC-1: судья запущен на gpt — советник не openai, хотя composer свободен.
+
+    Если бы читалась настройка, а не прогон, тест выше и этот не могли бы
+    пройти оба: выбор модели решает ТО, на чём судья идёт сейчас.
+    """
+    from hub.services.model_family import family
+    from hub.services.steward_advisor import order_due_advisors
+
+    monkeypatch.setattr(config, "STEWARD_MODEL", "composer-2.5")
+    monkeypatch.setattr(
+        config, "STEWARD_ADVISOR_MODELS", ("gpt-5.3-codex", "composer-2.5")
+    )
+    task_id = await _approved_by_the_judge(
+        db, "advisor-mirror", judge_model="gpt-5.3-codex"
+    )
+
+    await order_due_advisors(db)
+
+    (order,) = await _advisor_rows(db, task_id)
+    assert family(order["model"]) == "cursor", order["model"]
+
+
+async def test_no_advisor_family_is_an_escalation_not_a_same_family_advisor(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Нет подходящей семьи — отказ с причиной, а не советник того же семейства.
+
+    Кандидаты исчерпаны: каждый из семейства исполнителя, ревьюера или судьи.
+    Заказа нет, строка refused называет причину, состояние — refused, и
+    согласия, из которого мог бы получиться вердикт, не будет.
+    """
+    from hub.services.steward_advisor import (
+        REFUSED_NO_ADVISOR_FAMILY,
+        STATE_REFUSED,
+        advisor_state,
+        order_due_advisors,
+    )
+
+    monkeypatch.setattr(
+        config,
+        "STEWARD_ADVISOR_MODELS",
+        ("claude-sonnet-5", "grok-4.5", "composer-2.5"),
+    )
+    task_id = await _approved_by_the_judge(
+        db, "advisor-no-family", judge_model="composer-2.5"
+    )
+
+    for _ in range(3):
+        assert await order_due_advisors(db) == 0
+
+    (row,) = await _advisor_rows(db, task_id)
+    assert row["status"] == RUN_REFUSED
+    assert "советника выбрать нельзя" in row["closed_reason"]
+    refused = [
+        json.loads(e["payload"])
+        for e in await _events(db, EVENT_REFUSED)
+        if e["task_id"] == task_id
+    ]
+    assert [r["reason"] for r in refused if r.get("kind") == "advisor"] == [
+        REFUSED_NO_ADVISOR_FAMILY
+    ]
+    assert (await advisor_state(db, task_id, 1)).state == STATE_REFUSED
+
+
+@pytest.mark.parametrize(
+    ("candidate", "judge", "code"),
+    [
+        ("grok-4.5", "composer-2.5", "same_family_as_reviewer"),
+        ("claude-sonnet-5", "composer-2.5", "same_family_as_implementer"),
+        ("composer-2.5", "composer-2.5", "same_family_as_judge"),
+        ("gpt-5.3-codex", "", "undeclared_model"),
+        ("gpt-5.3-codex", "my-model-42", "undeclared_model"),
+        ("not-a-launchable-model", "composer-2.5", "advisor_not_launchable"),
+        ("", "composer-2.5", "undeclared_model"),
+    ],
+)
+def test_every_side_of_the_advisor_family_gate_refuses_on_its_own(
+    candidate: str, judge: str, code: str
+):
+    """Каждая сторона гейта семейств отказывает САМА, а не вместе с остальными.
+
+    Исполнитель claude, ревьюер grok; судья задан параметром. Незнакомое или
+    пустое имя любой стороны — отказ: отсутствие данных не есть разнообразие.
+    """
+    from hub.services.steward_advisor import advisor_family_refusal
+
+    refusal = advisor_family_refusal(candidate, "claude-opus-5", "grok-4.6", judge)
+
+    assert refusal is not None and refusal[0] == code, refusal
+
+
+def test_a_clean_candidate_passes_the_advisor_family_gate():
+    from hub.services.steward_advisor import advisor_family_refusal
+
+    assert (
+        advisor_family_refusal(
+            "gpt-5.3-codex", "claude-opus-5", "grok-4.6", "composer-2.5"
+        )
+        is None
+    )
+
+
+async def test_an_advisor_order_carries_its_own_wait_and_costs_the_cap(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Срок ответа — STEWARD_ADVISOR_WAIT_MAX от заказа; квота одна на всех.
+
+    Заказ советника — оплаченный прогон, и общий суточный потолок его считает:
+    потолок существует, чтобы ограничить купленное, а не только судей.
+    """
+    from hub.services.steward_advisor import order_due_advisors
+
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_WAIT_MAX", 45)
+    task_id = await _approved_by_the_judge(
+        db, "advisor-wait", judge_model="composer-2.5"
+    )
+    project_id = dict(await repo.get_task(db, task_id))["project_id"]
+    before = await runs_today(db, project_id)
+
+    await order_due_advisors(db)
+
+    (order,) = await _advisor_rows(db, task_id)
+    minutes = await fetchall(
+        db,
+        "SELECT CAST(ROUND((julianday(deadline_at) - julianday(created_at)) "
+        "* 1440) AS INTEGER) AS m FROM steward_runs WHERE id=?",
+        (order["id"],),
+    )
+    assert dict(minutes[0])["m"] == 45, (
+        "срок ответа — настройка, а не окно старта судьи"
+    )
+    assert await runs_today(db, project_id) == before + 1
+
+
+async def test_an_exhausted_daily_cap_defers_the_advisor_without_burning_the_generation(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Потолок исчерпан — советник отложен, а не закрыт: завтра он получит заказ."""
+    from hub.services.steward_advisor import order_due_advisors
+
+    task_id = await _approved_by_the_judge(
+        db, "advisor-cap", judge_model="composer-2.5"
+    )
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 1)
+
+    assert await order_due_advisors(db) == 0
+    assert await _advisor_rows(db, task_id) == []
+
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 20)
+    assert await order_due_advisors(db) == 1
+
+
+async def test_the_advisor_is_ordered_only_where_the_project_asks_for_the_steward(
+    db: aiosqlite.Connection,
+):
+    """Проект не просил стюарда — советник не заказывается (деньги, а не порядок)."""
+    from hub.services.steward_advisor import order_due_advisors
+
+    task_id = await _approved_by_the_judge(
+        db, "advisor-policy", judge_model="composer-2.5"
+    )
+    project = dict(await repo.get_task(db, task_id))["project_id"]
+    await db.execute("UPDATE projects SET gate_policy='{}' WHERE id=?", (project,))
+    await db.commit()
+
+    assert await order_due_advisors(db) == 0
+    assert await _advisor_rows(db, task_id) == []
+
+
+async def test_the_advisor_is_not_ordered_with_the_contour_off(
+    db: aiosqlite.Connection, monkeypatch
+):
+    from hub.services.steward_advisor import order_due_advisors
+
+    task_id = await _approved_by_the_judge(
+        db, "advisor-off", judge_model="composer-2.5"
+    )
+    monkeypatch.setattr(config, "STEWARD_MODE", "off")
+
+    assert await order_due_advisors(db) == 0
+    assert await _advisor_rows(db, task_id) == []
+
+
+async def test_with_the_contour_off_nothing_is_ordered_nor_refused(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Контур выключен — ни заказа, ни строки отказа, ни события «steward_off».
+
+    Даже там, где семейство подобрать нельзя: закрывать генерацию отказом,
+    когда диспетчер закрыт, значило бы запереть слот навсегда по выключенному
+    рубильнику.
+    """
+    from hub.services.steward_advisor import order_due_advisors
+
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_MODELS", ("claude-sonnet-5",))
+    task_id = await _approved_by_the_judge(
+        db, "advisor-off-nofamily", judge_model="composer-2.5"
+    )
+    monkeypatch.setattr(config, "STEWARD_MODE", "off")
+
+    assert await order_due_advisors(db) == 0
+
+    assert await _advisor_rows(db, task_id) == []
+    assert [
+        e for e in await _events(db, EVENT_REFUSED) if e["task_id"] == task_id
+    ] == []
+
+
+async def test_an_old_contour_approve_is_not_given_an_advisor(
+    db: aiosqlite.Connection,
+):
+    """Суждение до выката (contour=1) советника не получает: пары из него не будет."""
+    from hub.services.steward_advisor import order_due_advisors
+
+    task_id = await _approved_by_the_judge(
+        db, "advisor-old", judge_model="composer-2.5"
+    )
+    await db.execute(
+        "UPDATE steward_judgements SET contour=1 WHERE task_id=?", (task_id,)
+    )
+    await db.commit()
+
+    assert await order_due_advisors(db) == 0
+
+
+async def test_a_superseded_generation_gets_no_advisor(db: aiosqlite.Connection):
+    """Сдачу пересдали — approve о прежнем коде советника не покупает."""
+    from hub.services.steward_advisor import order_due_advisors
+
+    task_id = await _approved_by_the_judge(
+        db, "advisor-stale", judge_model="composer-2.5"
+    )
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+
+    assert await order_due_advisors(db) == 0
+
+
+async def test_the_poller_sweep_orders_and_applies_advisors(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Проход поллера зовёт и заказ советника, и применение — оба, в этом порядке.
+
+    Без этой связи оба механизма живут, но не исполняются ни на одном тике.
+    """
+    from hub.services import steward_advisor, steward_dispatch, steward_judgement
+    from hub.services import steward_shadow
+
+    calls: list[str] = []
+
+    def _spy(name: str):
+        async def _call(_db):
+            calls.append(name)
+            return 0
+
+        return _call
+
+    monkeypatch.setattr(steward_advisor, "order_due_advisors", _spy("order"))
+    monkeypatch.setattr(steward_advisor, "apply_advisor_outcomes", _spy("apply"))
+    monkeypatch.setattr(steward_judgement, "stamp_judgement_usage", _spy("usage"))
+    monkeypatch.setattr(steward_shadow, "start_due_runs", _spy("start"))
+    monkeypatch.setattr(steward_shadow, "check_escalation_corridor", _spy("corridor"))
+
+    await steward_dispatch.sweep_steward_runs(db)
+
+    assert "order" in calls and "apply" in calls
+    assert calls.index("order") < calls.index("start") < calls.index("apply"), (
+        "заказали, запустили, и только потом применяем ответ"
+    )
+
+
+async def test_an_unanswered_advisor_order_closes_as_timeout_and_the_state_says_so(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """timeout: заказ начат и не ответил до срока — закрывается как timeout.
+
+    Начатый и не начатый заказ закрываются по-разному (#1181), но для советника
+    оба — «ответа нет», и состояние называет это одним словом.
+    """
+    from hub.services.steward_advisor import (
+        STATE_PENDING,
+        STATE_TIMEOUT,
+        advisor_state,
+    )
+    from tests.test_steward_shadow import _advisor_run
+
+    task_id = await _approved_by_the_judge(
+        db, "advisor-timeout", judge_model="composer-2.5"
+    )
+    order = await _advisor_run(db, task_id, model="gpt-5.3-codex")
+    assert (await advisor_state(db, task_id, 1)).state == STATE_PENDING
+
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now', '-1 minutes') WHERE id=?",
+        (order["id"],),
+    )
+    await db.commit()
+    assert await close_finished_runs(db) == 1
+
+    (row,) = await _advisor_rows(db, task_id)
+    assert row["status"] == RUN_TIMEOUT
+    assert (await advisor_state(db, task_id, 1)).state == STATE_TIMEOUT
+
+    # Не начатый заказ: «не стартовал» для советника — тоже timeout.
+    other = await _approved_by_the_judge(
+        db, "advisor-never", judge_model="composer-2.5"
+    )
+    from hub.services.steward_dispatch import KIND_ADVISOR
+
+    never = await order_run(
+        db, other, 1, KIND_ADVISOR, model="gpt-5.3-codex", deadline_min=60
+    )
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now', '-1 minutes') WHERE id=?",
+        (never["id"],),
+    )
+    await db.commit()
+    await close_finished_runs(db)
+    assert (await _advisor_rows(db, other))[0]["status"] == RUN_NEVER_STARTED
+    assert (await advisor_state(db, other, 1)).state == STATE_TIMEOUT
+
+
+async def test_a_resubmission_supersedes_the_advisor_order(
+    db: aiosqlite.Connection,
+):
+    """Пересдали, пока советник читал, — его заказ закрыт: он судил другой код."""
+    from tests.test_steward_shadow import _advisor_run
+
+    task_id = await _approved_by_the_judge(
+        db, "advisor-superseded", judge_model="composer-2.5"
+    )
+    await _advisor_run(db, task_id, model="gpt-5.3-codex")
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+
+    await close_finished_runs(db)
+
+    (row,) = await _advisor_rows(db, task_id)
+    assert row["status"] == RUN_SUPERSEDED
