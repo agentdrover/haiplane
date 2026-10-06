@@ -65,7 +65,16 @@ _PART_SPLIT = re.compile(r";\s+(?=возврат )")
 _RANK = {ROUTINE: 0, PROBE: 1, ALERT: 2}
 
 
+# #1591: причина сверки серверных копий называет путь и команду, а человек
+# вправе писать в update_hint что угодно — в том числе слова проб. Поэтому
+# причина артефакта узнаётся по своему началу и проверяется ПЕРВОЙ: это
+# определённое «нет», а не «не смогли посмотреть», и ждать ей нечего.
+_ARTIFACT_MARKER = "серверная копия "
+
+
 def _classify_part(part: str) -> str:
+    if _ARTIFACT_MARKER in part:
+        return ALERT
     if any(marker in part for marker in _ROUTINE_MARKERS):
         return ROUTINE
     if any(marker in part for marker in _PROBE_MARKERS):

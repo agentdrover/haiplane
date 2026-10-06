@@ -6655,6 +6655,13 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
         "deep_reviewer": "local",
         "merge_is_delivery": True,
         "path_notices": [{"pattern": "deploy/**", "text": "ручной шаг"}],
+        "release_artifacts": [
+            {
+                "repo_path": "deploy/x.sh",
+                "server_path": "/usr/local/sbin/x.sh",
+                "update_hint": "обновить копию",
+            }
+        ],
     }
     not_shown = set(GATE_POLICY_KEYS) - _FORM_GATE_POLICY_KEYS
     assert not_shown, "класс пуст — проверять нечего, тест бы лгал"

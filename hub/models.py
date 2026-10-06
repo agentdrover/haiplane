@@ -375,6 +375,10 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # гейт, ничего не блокирует и не делегирует. Читатель:
     # project_policy.path_notices_of.
     "path_notices",
+    # #1591: пары «файл репо на голове релиза → серверная копия» — релиз не
+    # сливается, пока копия расходится. Не гейт ревью и ничего не делегирует.
+    # Читатель: project_policy.release_artifacts_of.
+    "release_artifacts",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -442,6 +446,63 @@ def _validate_path_notices(policy: dict[str, Any]) -> None:
             )
         cleaned.append({"pattern": pattern.strip(), "text": text.strip()})
     policy["path_notices"] = cleaned
+
+
+RELEASE_ARTIFACTS_MAX = 20
+RELEASE_ARTIFACT_HINT_MAX = 500
+
+
+def _validate_release_artifacts(policy: dict[str, Any]) -> None:
+    """``release_artifacts`` — список {repo_path, server_path, update_hint} (#1591).
+
+    Только «точные копии». ``server_path`` проверяется по ТЕКУЩЕМУ списку
+    каталогов хоста (``HAIPLANE_RELEASE_ARTIFACT_DIRS``); при чтении проверка
+    повторяется — запись могла лечь до смены списка. Пустой список допустим.
+    """
+    if "release_artifacts" not in policy:
+        return
+    from hub import config
+    from hub.release_artifact_paths import repo_path_problem, server_path_problem
+
+    pairs = policy["release_artifacts"]
+    if not isinstance(pairs, list):
+        raise ValueError(
+            "gate_policy release_artifacts must be a list of "
+            f"{{repo_path, server_path, update_hint}}, got: {type(pairs).__name__}"
+        )
+    if len(pairs) > RELEASE_ARTIFACTS_MAX:
+        raise ValueError(
+            f"gate_policy release_artifacts holds at most {RELEASE_ARTIFACTS_MAX} "
+            f"pairs, got {len(pairs)}"
+        )
+    cleaned: list[dict[str, str]] = []
+    for index, pair in enumerate(pairs):
+        where = f"gate_policy release_artifacts[{index}]"
+        keys = {"repo_path", "server_path", "update_hint"}
+        if not isinstance(pair, dict) or set(pair) != keys:
+            raise ValueError(
+                f"{where} must be an object with repo_path, server_path, update_hint"
+            )
+        problem = repo_path_problem(pair["repo_path"]) or server_path_problem(
+            pair["server_path"], tuple(config.RELEASE_ARTIFACT_DIRS)
+        )
+        if problem:
+            raise ValueError(f"{where}: {problem}")
+        hint = pair["update_hint"]
+        if not isinstance(hint, str) or not hint.strip():
+            raise ValueError(f"{where}.update_hint must be a non-empty string")
+        if len(hint.strip()) > RELEASE_ARTIFACT_HINT_MAX:
+            raise ValueError(
+                f"{where}.update_hint is longer than {RELEASE_ARTIFACT_HINT_MAX} chars"
+            )
+        cleaned.append(
+            {
+                "repo_path": pair["repo_path"],
+                "server_path": pair["server_path"],
+                "update_hint": hint.strip(),
+            }
+        )
+    policy["release_artifacts"] = cleaned
 
 
 def _validate_count(policy: dict[str, Any], key: str) -> None:
@@ -2907,6 +2968,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_count(v, "circle_deep_stop")
     _validate_merge_is_delivery(v)
     _validate_path_notices(v)
+    _validate_release_artifacts(v)
     return v
 
 

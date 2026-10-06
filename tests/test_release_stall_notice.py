@@ -492,3 +492,101 @@ async def test_my_context_names_failed_release_blocks_fetch():
             text = _text(await mcp_server.hub_my_context())
         assert "статус аварий релиза не получен: " in text, (failure, text[:300])
         assert "Релиз заблокирован" not in text
+
+
+# ---- #1591: artifact check reasons are named and immediate ----
+
+
+async def test_release_artifact_check_names_unreadable_and_missing(
+    db, tmp_path, monkeypatch
+):
+    """#1591 AC-2: missing/unreadable -> immediate stable alert, no merge; the rest as before."""
+    from tests.test_release_policy import (
+        BLOB,
+        _artifact_project,
+        _events,
+        _git,
+        artifact_policy,
+        artifact_repo,
+    )
+    from hub import config
+    from hub.services.release import merge_ready_release
+
+    srv = tmp_path / "srv"
+    srv.mkdir()
+    monkeypatch.setattr(config, "RELEASE_ARTIFACT_DIRS", (str(srv),))
+    workspace, head = artifact_repo(tmp_path)
+    g = _git(existing_pr=40)
+    g.pr_head_sha = AsyncMock(return_value=head)
+    target = srv / "tool.sh"
+    await _artifact_project(db, workspace, artifact_policy(target))
+    project_id = 1
+
+    # Missing file on the server: the first cycle already alerts, no merge.
+    await poller._sweep_release_policy(db)
+    alerts = await _events(db, "release_blocked")
+    assert len(alerts) == 1
+    assert (
+        "серверная копия" in alerts[0]["summary"]
+        and str(target) in alerts[0]["summary"]
+    )
+    g.merge_pr.assert_not_awaited()
+    first_reason = alerts[0]["summary"]
+
+    # A restart (module state gone) with the alert open writes nothing twice.
+    poller._release_notices.clear()
+    poller._release_stalls.clear()
+    await poller._sweep_release_policy(db)
+    await poller._sweep_release_policy(db)
+    assert len(await _events(db, "release_blocked")) == 1
+
+    # Unreadable (a directory in place of the file): still an alert, not a probe.
+    target.mkdir()
+    await poller._sweep_release_policy(db)
+    assert len(await _events(db, "release_blocked")) == 2
+    g.merge_pr.assert_not_awaited()
+    from hub.services.release_alert import ALERT, classify_release_reason
+
+    reasons = [
+        a["summary"].split("релиз стоит: ", 1)[1]
+        for a in await _events(db, "release_blocked")
+    ]
+    assert first_reason != reasons[-1]
+    assert all(classify_release_reason(r) == ALERT for r in reasons)
+    target.rmdir()
+
+    # No file in the repo at the pinned head: the pair cannot be compared.
+    (srv / "tool.sh").write_bytes(BLOB)
+    await repo.update_project(
+        db,
+        project_id,
+        gate_policy=artifact_policy(srv / "tool.sh").replace(
+            "deploy/tool.sh", "deploy/gone.sh"
+        ),
+    )
+    await db.commit()
+    await poller._sweep_release_policy(db)
+    assert "deploy/gone.sh" in (await _events(db, "release_blocked"))[-1]["summary"]
+    g.merge_pr.assert_not_awaited()
+
+    # Matching pair merges; no key and an empty list behave as before.
+    await repo.update_project(
+        db, project_id, gate_policy=artifact_policy(srv / "tool.sh")
+    )
+    await db.commit()
+    merged, _ = await merge_ready_release(db, await repo.get_project(db, project_id))
+    assert merged is True
+    for policy in (
+        '{"release": "auto"}',
+        '{"release": "auto", "release_artifacts": []}',
+    ):
+        g.merge_pr.reset_mock()
+        g.pr_head_sha.reset_mock()
+        await repo.update_project(db, project_id, gate_policy=policy)
+        await db.commit()
+        merged, _ = await merge_ready_release(
+            db, await repo.get_project(db, project_id)
+        )
+        assert merged is True
+        assert "expected_head_sha" not in g.merge_pr.await_args.kwargs
+        g.pr_head_sha.assert_not_awaited()

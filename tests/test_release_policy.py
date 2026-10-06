@@ -540,3 +540,181 @@ async def test_release_note_goes_only_to_undelivered_tasks(
     assert len(fresh_notes) == 1, fresh_notes
     assert f"#{fresh}" in fresh_notes[0]
     assert f"#{leftover}" not in fresh_notes[0]
+
+
+# ---- #1591: server copies of deploy artifacts are checked before the merge ----
+
+BLOB = b"#!/bin/sh\nexit 0\n\xff\xfe tail\n"  # trailing newline and non-UTF-8 bytes
+
+
+def _run_git(repo_dir, *args: str) -> str:
+    import subprocess
+
+    done = subprocess.run(
+        ["git", "-C", str(repo_dir), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+            "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+            "HOME": str(repo_dir),
+        },
+    )
+    return done.stdout.strip()
+
+
+def artifact_repo(tmp_path, blob: bytes = BLOB) -> tuple[str, str]:
+    """A real repository: HEAD carries ``blob`` at deploy/tool.sh, the working
+    copy then drifts away from it. Returns (path, head sha)."""
+    work = tmp_path / "clone"
+    (work / "deploy").mkdir(parents=True)
+    _run_git(work, "init", "-q", "-b", "develop")
+    (work / "deploy" / "tool.sh").write_bytes(blob)
+    _run_git(work, "add", "-A")
+    _run_git(work, "commit", "-q", "-m", "release head")
+    head = _run_git(work, "rev-parse", "HEAD")
+    # The working copy is NOT the head: hashing it would answer the wrong thing.
+    (work / "deploy" / "tool.sh").write_bytes(b"working copy drift\n")
+    return str(work), head
+
+
+def artifact_policy(server_file, hint: str = "install -m 0755 deploy/tool.sh X") -> str:
+    return json.dumps(
+        {
+            "release": "auto",
+            "release_artifacts": [
+                {
+                    "repo_path": "deploy/tool.sh",
+                    "server_path": str(server_file),
+                    "update_hint": hint,
+                }
+            ],
+        }
+    )
+
+
+async def _artifact_project(db, workspace: str, policy: str) -> int:
+    pid = await repo.create_project(db, slug="shipper", name="Shipper")
+    await repo.update_project(db, pid, gate_policy=policy, workspace_path=workspace)
+    await db.commit()
+    return pid
+
+
+async def _events(db, kind: str) -> list[dict]:
+    cur = await db.execute(
+        "SELECT kind, summary, detail FROM activity_log WHERE kind = ? ORDER BY id",
+        (kind,),
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+@pytest.fixture
+def server_dir(tmp_path, monkeypatch):
+    from hub import config
+
+    srv = tmp_path / "srv"
+    srv.mkdir()
+    monkeypatch.setattr(config, "RELEASE_ARTIFACT_DIRS", (str(srv),))
+    return srv
+
+
+@pytest.fixture(autouse=False)
+def fresh_sweep_state():
+    poller._release_notices.clear()
+    poller._release_stalls.clear()
+    yield
+    poller._release_notices.clear()
+    poller._release_stalls.clear()
+
+
+async def test_release_waits_for_stale_server_artifact(
+    db, tmp_path, server_dir, fresh_sweep_state
+):
+    """#1591 AC-1: stale server copy -> no merge, one alert; fresh -> merge on the head."""
+    workspace, head = artifact_repo(tmp_path)
+    g = _git(existing_pr=777)
+    g.pr_head_sha = AsyncMock(return_value=head)
+    target = server_dir / "tool.sh"
+    await _artifact_project(db, workspace, artifact_policy(target))
+
+    # Only the trailing newline differs: a text hash with strip() calls it equal.
+    target.write_bytes(BLOB.rstrip(b"\n"))
+    await poller._sweep_release_policy(db)
+    await poller._sweep_release_policy(db)
+
+    g.merge_pr.assert_not_awaited()
+    alerts = await _events(db, "release_blocked")
+    assert len(alerts) == 1, "один алерт сразу, не по одному на проход"
+    text = alerts[0]["summary"]
+    assert str(target) in text and "deploy/tool.sh" in text
+    assert head[:12] in text and "устарела" in text
+    assert "install -m 0755 deploy/tool.sh X" in text
+    import hashlib
+
+    assert hashlib.sha256(BLOB).hexdigest()[:12] in text, "хэш по сырым байтам"
+
+    # The copy is brought up to date: the next pass merges exactly that head.
+    target.write_bytes(BLOB)
+    await poller._sweep_release_policy(db)
+
+    assert g.merge_pr.await_count == 1
+    assert g.merge_pr.await_args.args[0] == 777
+    assert g.merge_pr.await_args.kwargs["expected_head_sha"] == head
+    assert len(await _events(db, "release_unblocked")) == 1, "алерт снят"
+    assert len(await _events(db, "release_blocked")) == 1
+
+    # Non-UTF-8 bytes: the lossy-decoded copy is not the file.
+    from hub.services import release_artifacts as ra
+
+    target.write_bytes(BLOB.decode("utf-8", errors="replace").encode())
+    pairs = [
+        {
+            "repo_path": "deploy/tool.sh",
+            "server_path": str(target),
+            "update_hint": "h",
+        }
+    ]
+    assert await ra.check_pairs(pairs, workspace, head), "не-UTF-8 байты различимы"
+
+
+async def test_a_push_between_check_and_merge_does_not_merge(
+    db, tmp_path, server_dir, fresh_sweep_state
+):
+    """#1591 AC-1: the merge is conditional on the checked head; a moved head is rechecked."""
+    workspace, head = artifact_repo(tmp_path)
+    g = _git(existing_pr=777)
+    heads = [head]
+    g.pr_head_sha = AsyncMock(side_effect=lambda *a, **k: heads[-1])
+
+    async def refuse_after_push(*args, **kwargs):
+        heads.append("f" * 40)  # someone pushed to develop meanwhile
+        return False  # gh pr merge --match-head-commit refuses
+
+    g.merge_pr = AsyncMock(side_effect=refuse_after_push)
+    target = server_dir / "tool.sh"
+    target.write_bytes(BLOB)
+    await _artifact_project(db, workspace, artifact_policy(target))
+
+    from hub.services.release import merge_ready_release
+
+    merged, reason = await merge_ready_release(db, await repo.get_project(db, 1))
+    assert merged is False
+    assert g.merge_pr.await_args.kwargs["expected_head_sha"] == head
+    assert "голова" in reason and "GitHub отказал" not in reason
+
+
+async def test_no_artifacts_key_keeps_the_old_merge(db, fresh_sweep_state):
+    """#1591 regression guard: without the key the merge call is the old one."""
+    g = _git(existing_pr=777)
+    g.pr_head_sha = AsyncMock(return_value="a" * 40)
+    pid = await _release_project(db, "auto")
+    from hub.services.release import merge_ready_release
+
+    merged, _ = await merge_ready_release(db, await repo.get_project(db, pid))
+    assert merged is True
+    assert "expected_head_sha" not in g.merge_pr.await_args.kwargs
+    g.pr_head_sha.assert_not_awaited()

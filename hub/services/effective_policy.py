@@ -163,6 +163,9 @@ REGISTRY: dict[str, PolicyEntry] = {
     "path_notices": PolicyEntry(
         project_policy.path_notices_of, "project_policy.path_notices_of"
     ),
+    "release_artifacts": PolicyEntry(
+        project_policy.release_artifacts_of, "project_policy.release_artifacts_of"
+    ),
     "slot_dead_minutes": PolicyEntry(
         executor_slots.dead_minutes_of,
         "executor_slots.dead_minutes_of",
