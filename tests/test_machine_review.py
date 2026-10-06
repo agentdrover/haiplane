@@ -589,3 +589,68 @@ async def test_contract_report_cannot_claim_a_text_origin(client: AsyncClient, d
     assert ok.status_code == 200, ok.text
     row = await repo_module.get_latest_machine_review(db, task_id)
     assert row["orchestrator"] == "claude-code-workflow", "origin stays contractual"
+
+
+# --- #1598: правило отказа среды #1238 не знает канала ---------------------
+
+
+async def test_local_environment_refusal_handling_is_unchanged(client: AsyncClient, db):
+    """AC-4 (#1598): регрессионная защита, зелёная и до, и после задачи.
+
+    Локальный отчёт с заявленным ``incomplete_reason=environment`` (бриф
+    недоступен) получает прежнее: алерт на карточке, примечание лестницы и
+    место в счётчике. Локальный отчёт, что просто не запускал тесты и
+    environment не заявил, отказом среды хабом не считается.
+    """
+    from hub import repository as repo_module
+    from hub.services.review_dispatch import (
+        ENVIRONMENT_REFUSAL_NOTE,
+        _ladder_cause_note,
+        count_environment_refusals,
+        is_environment_refusal,
+    )
+
+    refused_id = await _reviewable_task(client, db)
+    refusal = {
+        "raw_count": 0,
+        "incomplete": True,
+        "incomplete_reason": "environment",
+        "harness_skill": "multi-agent-review",
+        "findings_confirmed": [],
+        "findings_rejected": [],
+        "unresolved": [],
+        "lost_dimensions": ["бриф ревью по HTTP недоступен: код доступа не принят"],
+        "agent": "local-reviewer",
+        "model": "qwen3.8-max",
+    }
+    resp = await client.post(f"/api/tasks/{refused_id}/machine-review", json=refusal)
+    assert resp.status_code == 200, resp.text
+    stored = dict(await repo_module.get_latest_machine_review(db, refused_id))
+    assert is_environment_refusal(stored) is True
+    assert ENVIRONMENT_REFUSAL_NOTE in _ladder_cause_note(stored)
+    updates = [dict(u) for u in await repo_module.get_task_updates(db, refused_id)]
+    alerts = [u["content"] for u in updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
+    assert len(alerts) == 1, alerts
+    assert "бриф ревью по HTTP недоступен" in alerts[0]
+    assert "второй прогон" in alerts[0], "запрет бесполезного повтора назван"
+
+    silent_id = await _reviewable_task(client, db)
+    silent = dict(refusal)
+    silent.pop("incomplete_reason")
+    silent["lost_dimensions"] = [
+        "тесты не запускались: у локального ревьюера нет pytest"
+    ]
+    resp = await client.post(f"/api/tasks/{silent_id}/machine-review", json=silent)
+    assert resp.status_code == 200, resp.text
+    silent_stored = dict(await repo_module.get_latest_machine_review(db, silent_id))
+    assert silent_stored["incomplete_reason"] == ""
+    assert is_environment_refusal(silent_stored) is False
+    assert _ladder_cause_note(silent_stored) == ""
+    silent_updates = [
+        dict(u) for u in await repo_module.get_task_updates(db, silent_id)
+    ]
+    assert not [u for u in silent_updates if "ОТКАЗУ СРЕДЫ" in u["content"]]
+
+    stats = await count_environment_refusals(db, since_days=30)
+    assert stats["environment_refusals"] == 1
+    assert stats["reason_unstated"] == 1

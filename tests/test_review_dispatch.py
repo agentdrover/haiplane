@@ -16960,3 +16960,304 @@ async def test_no_cloud_forge_names_the_deploy_instead_of_a_verdict_less_silence
     assert await _all_dispatches(db, task_id) == []
     card = await _card_text(db, task_id)
     assert "идёт выкладка" in card and "Вердикт остаётся человеку" in card, card
+
+
+# --- #1598: локальный промт называет реальные возможности ревьюера ----------
+
+_CLOUD_PROMPT_FIXTURES = Path(__file__).parent / "fixtures" / "cloud_review_prompt"
+
+# Команды, которые общий промт и харнесс велят исполнить, а у локального
+# ревьюера исполнять нечем (#1180). Строки — именно предписания, а не слова.
+_LOCAL_FORBIDDEN_ORDERS = (
+    "uv run pytest",
+    "python -m pytest",
+    "pip install",
+    "git fetch",
+    "apt-get",
+    "docker.io",
+    "dockerd",
+    "СНАЧАЛА ПОПРОБУЙ",
+    "запускать проверки",
+    "Поставить во временную машину",
+    "Чтение кода вместо прогона тестов прогоном не называется",
+    "нет чем запустить проверки",
+)
+
+
+def _local_matrix_prompt(profile: str, http: bool, container: bool) -> str:
+    from hub.services.review_dispatch import _delivery_block, _review_prompt
+
+    delivery = _delivery_block(1598, "CODE123", "https://hub.example") if http else ""
+    return _review_prompt(
+        1598,
+        "task-1598/x",
+        "qwen3.8-max",
+        profile,
+        "RULES",
+        "DIFF",
+        "PREPASS",
+        delivery_block=delivery,
+        needs_container=container,
+        inline_diff=True,
+    )
+
+
+_DEMANDING_RULES = (
+    "ПРАВИЛА ПРОЕКТА: обязательно прочитай исходники вне диффа; запусти "
+    "`uv run pytest -q`; сделай `git fetch origin develop`; unknown запрещён."
+)
+
+
+def _realistic_local_prompt(profile: str, http: bool) -> str:
+    """Локальный промт с настоящими блоками: правила, prepass, only_tests."""
+    from hub.models import PrepassState
+    from hub.services import call_sites, review_evidence
+    from hub.services.review_dispatch import _delivery_block, _review_prompt
+
+    symbol = call_sites.SymbolReport(
+        symbol="registry_target",
+        defined_in="hub/alpha.py",
+        state=call_sites.ONLY_TESTS,
+    )
+    return _review_prompt(
+        1598,
+        "task-1598/x",
+        "qwen3.8-max",
+        profile,
+        _DEMANDING_RULES,
+        "ПРЕДМЕТ РЕВЬЮ — дифф ПРИЛОЖЕН НИЖЕ",
+        review_evidence.prepass_block(PrepassState(state="unknown", reason="нет")),
+        delivery_block=(
+            _delivery_block(1598, "CODE123", "https://hub.example") if http else ""
+        ),
+        only_tests_block=call_sites.only_tests_block([symbol]),
+        inline_diff=True,
+    )
+
+
+def _assert_capability_block_outranks_demands(prompt: str, where: str) -> None:
+    caps = prompt.index("ВОЗМОЖНОСТИ ЛОКАЛЬНОГО РЕВЬЮЕРА")
+    assert caps < prompt.index("обязательно прочитай исходники вне диффа"), where
+    assert caps < prompt.index("ПРОВЕРЬ ДОСТИЖИМОСТЬ"), where
+    assert "читать исходники вне диффа нельзя" in prompt, where
+    assert "«не установлено» допустимый исход" in prompt, where
+    assert "unresolved или lost_dimensions" in prompt, where
+    assert "не знаешь" in prompt, where
+
+
+async def test_a_local_review_prompt_states_its_real_capabilities():
+    """AC-1 (#1598): во всех сборках локального промта есть блок возможностей.
+
+    Сборки: lite и deep (харнесс из брифа, чей текст велит pytest, git fetch,
+    установку и Docker), HTTP и stdout, с контейнерной задачей и без. Блок
+    стоит ДО правил и сильнее их и харнесса; предписаний недоступного нет.
+    """
+    for profile in (LITE, DEEP):
+        for http in (False, True):
+            for container in (False, True):
+                where = f"{profile} http={http} container={container}"
+                prompt = _local_matrix_prompt(profile, http, container)
+                assert "ВОЗМОЖНОСТИ ЛОКАЛЬНОГО РЕВЬЮЕРА" in prompt, where
+                assert "СИЛЬНЕЕ" in prompt and "харнесс" in prompt, where
+                assert prompt.index("ВОЗМОЖНОСТИ ЛОКАЛЬНОГО") < prompt.index("RULES"), (
+                    f"блок раньше общих правил: {where}"
+                )
+                for fact in ("исходников", "git", "тесты", "Docker"):
+                    assert fact in prompt.split("RULES")[0], f"{fact}: {where}"
+                for order in _LOCAL_FORBIDDEN_ORDERS:
+                    assert order not in prompt, f"{order!r} остался в {where}"
+                assert "prepass" in prompt and "ci_run_report" in prompt, where
+                assert "доказательств" in prompt, where
+                # Настоящий отказ среды (#1238) остаётся названным путём.
+                assert 'incomplete_reason="environment"' in prompt, where
+                assert "бриф" in prompt.split("RULES")[0], where
+    for http in (False, True):
+        deep = _local_matrix_prompt(DEEP, http, False)
+        assert "кроме того, что запрещено блоком ВОЗМОЖНОСТЕЙ" in deep, (
+            f"харнесс читается ПОД блоком, а не вместо него (http={http})"
+        )
+    for profile in (LITE, DEEP):
+        for http in (False, True):
+            _assert_capability_block_outranks_demands(
+                _realistic_local_prompt(profile, http), f"{profile} http={http}"
+            )
+    lite = _local_matrix_prompt(LITE, False, False)
+    assert "доказательства тестов" in lite, "шаг брифа в lite называет доказательства"
+
+
+@pytest.mark.parametrize("transport", ("direct", "runner"))
+async def test_a_local_review_reaches_the_reviewer_with_the_capability_block(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    monkeypatch,
+    tmp_path,
+    transport: str,
+):
+    """AC-1 (#1598), сквозной: блок доезжает до процесса обоими транспортами."""
+    prompt, stdin_text, _ = await _local_prompt(
+        client, db, monkeypatch, tmp_path, f"caps-{transport}", _INLINE_DIFF, transport
+    )
+    for text in (prompt, stdin_text):
+        assert "ВОЗМОЖНОСТИ ЛОКАЛЬНОГО РЕВЬЮЕРА" in text
+        assert "uv run pytest" not in text
+
+
+async def test_a_local_review_prompt_names_ci_evidence_by_real_fields():
+    """AC-2 (#1598): состояния доказательств названы по ПОЛЯМ брифа.
+
+    Имена из промта сверяются с настоящими моделями, чтобы промт не ссылался
+    на поле, которого в брифе нет. ``current`` не выдан за pass, мутации и
+    слова автора — непроверенные заявления, unknown — это lost_dimension.
+    """
+    from hub.models import (
+        ACTestResultView,
+        CIRunReportState,
+        PrepassState,
+        ReviewBrief,
+    )
+
+    for name in ("passed", "failed", "skipped", "state", "reason"):
+        assert name in PrepassState.model_fields, name
+    assert "state" in CIRunReportState.model_fields
+    assert "is_current" in ACTestResultView.model_fields
+    for name in ("prepass", "ci_run_report", "ac_test_results"):
+        assert name in ReviewBrief.model_fields, name
+
+    prompt = _local_matrix_prompt(LITE, False, False)
+    head = prompt.split("RULES")[0]
+    for field in (
+        "prepass.passed",
+        "prepass.failed",
+        "prepass.skipped",
+        "prepass.state",
+        "prepass.reason",
+        "ci_run_report.state",
+        "ac_test_results",
+        "is_current",
+    ):
+        assert field in head, f"поле {field} не названо"
+    assert re.search(r"ci_run_report\.state=current[^\n]*НЕ pass", head), (
+        "current — это наличие отчёта на sha, а не прохождение"
+    )
+    assert re.search(r"prepass\.state=unknown[^\n]*lost_dimensions", head)
+    assert re.search(r"prepass\.state=unknown[^\n]*НЕ environment", head), (
+        "нет доказательств — потерянное измерение с названием, не отказ среды"
+    )
+    assert re.search(r"[Мм]утации[^\n]*СЛОВО АВТОРА", head), (
+        "мутации автора — заявления, хаб их не исполнял"
+    )
+    assert "ac_test_results" in head and "поколени" in head, (
+        "ac_test_results — свидетельство текущего поколения, своего sha в нём нет"
+    )
+
+
+async def test_a_local_prompt_shows_every_prepass_state_beside_the_block():
+    """AC-2 (#1598): passed, failed, skipped, unknown — каждое видно ревьюеру.
+
+    Блок брифа (``prepass_block``) едет в промт, и локальный блок не стирает
+    его: оба стоят рядом, и ни одно состояние не вырождается в «чисто».
+    """
+    from hub.models import PrepassState
+    from hub.services import review_evidence
+    from hub.services.review_dispatch import _review_prompt
+
+    cases = {
+        "passed": PrepassState(state="covered", passed=["lint", "tests"]),
+        "failed": PrepassState(state="failed", failed=["tests"], reason="упали: tests"),
+        "skipped": PrepassState(state="covered", passed=["lint"], skipped=["audit"]),
+        "unknown": PrepassState(state="unknown", reason="CI не присылал отчёт"),
+    }
+    seen = {}
+    for label, state in cases.items():
+        prompt = _review_prompt(
+            1598,
+            "task-1598/x",
+            "qwen3.8-max",
+            LITE,
+            "RULES",
+            "DIFF",
+            review_evidence.prepass_block(state),
+            inline_diff=True,
+        )
+        assert "ВОЗМОЖНОСТИ ЛОКАЛЬНОГО РЕВЬЮЕРА" in prompt, label
+        seen[label] = prompt
+    assert "ПРОШЁЛ: lint (" in seen["passed"] and "tests (" in seen["passed"]
+    assert "проверки УПАЛИ: tests" in seen["failed"]
+    assert "Пропущены (ничего не доказывают): audit" in seen["skipped"]
+    assert "данных нет — CI не присылал отчёт" in seen["unknown"]
+
+
+def test_the_cloud_review_prompt_is_unchanged() -> None:
+    """AC-3 (#1598): облачный промт байт в байт совпадает с эталоном до задачи.
+
+    Эталоны сняты с develop до правки (tests/fixtures/cloud_review_prompt):
+    lite и deep, MCP и HTTP, с контейнерной задачей и без. Регрессионная
+    защита: зелёная и до, и после.
+    """
+    from hub.services.review_dispatch import _delivery_block, _review_prompt
+
+    for profile in (LITE, DEEP):
+        for http in (False, True):
+            for container in (False, True):
+                delivery = (
+                    _delivery_block(1598, "CODE123", "https://hub.example")
+                    if http
+                    else ""
+                )
+                got = _review_prompt(
+                    1598,
+                    "task-1598/x",
+                    "grok-4.6",
+                    profile,
+                    "RULES",
+                    "DIFF",
+                    "PREPASS",
+                    delivery_block=delivery,
+                    only_tests_block="ONLY_TESTS\n",
+                    needs_container=container,
+                )
+                name = (
+                    f"{profile}_{'http' if http else 'mcp'}_"
+                    f"{'container' if container else 'plain'}"
+                )
+                expected = (_CLOUD_PROMPT_FIXTURES / f"{name}.txt").read_text(
+                    encoding="utf-8"
+                )
+                assert got == expected, name
+                assert "ВОЗМОЖНОСТИ ЛОКАЛЬНОГО" not in got, (
+                    f"блок локального пути не течёт в облако: {name}"
+                )
+
+
+async def test_a_cloud_order_from_prepare_review_order_has_no_local_block(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """AC-3 (#1598), сквозной: заказ облака собирается без блока возможностей."""
+    recorder = _DispatchRecorder({"agent": {"id": "bc-c8"}, "run": {"id": "r-c8"}})
+    _wire(monkeypatch, recorder)
+    await _submitted(
+        client, db, "cloud-no-caps", policy={"review": "dispatch"}, diff=_INLINE_DIFF
+    )
+    assert len(recorder.calls) == 1
+    prompt = recorder.calls[0]["prompt_text"]
+    assert "ВОЗМОЖНОСТИ ЛОКАЛЬНОГО" not in prompt
+    assert "uv run pytest" in prompt, "у облака с клоном блок попыток #1238 на месте"
+
+
+def test_a_local_only_tests_candidate_may_stay_unresolved():
+    """Ревью P2 (#1598): блок only_tests не требует двоичного исхода локально.
+
+    Вызов через реестр или getattr вне диффа статика не видит, а исходников у
+    ревьюера нет: исход — unresolved и lost_dimensions, а недостижимость по
+    одному статическому кандидату подтверждать нельзя. Облачный текст прежний
+    (его защищает test_the_cloud_review_prompt_is_unchanged).
+    """
+    for profile in (LITE, DEEP):
+        for http in (False, True):
+            prompt = _realistic_local_prompt(profile, http)
+            tail = prompt[prompt.index("ПРОВЕРЬ ДОСТИЖИМОСТЬ") :]
+            assert "ДЛЯ ЛОКАЛЬНОГО РЕВЬЮЕРА" in tail, (profile, http)
+            assert "unresolved" in tail and "lost_dimensions" in tail
+            assert "НЕДОСТИЖИМОСТЬ по одному статическому кандидату НЕ подтверждай" in (
+                tail.replace("\n", " ")
+            )
