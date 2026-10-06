@@ -293,18 +293,27 @@ cmd_acquire() {
   trap 'exit 143' TERM
   trap 'exit 130' INT HUP
   start_liveness TERM
-  take_marker || return 0
+  # Raised BEFORE the write: a TERM that lands between the rename and the next
+  # statement must still find the flag. An ordinary refusal lowers it again.
   MARKER_SET=1
+  take_marker || {
+    MARKER_SET=0
+    return 0
+  }
   emit "drain: маркер $MARKER поставлен (владелец $OWNER, срок $BUDGET с)"
   wait_for_jobs acquire
   KEEP_MARKER=1
 }
 
 cleanup_acquire() {
-  # Nothing to take back unless the marker was written, and a kept one is the
-  # deploy's to release.
+  # Nothing to take back unless the marker may have been written, and a kept
+  # one is the deploy's to release.
   [ "${MARKER_SET:-0}" = 1 ] || return 0
   [ "${KEEP_MARKER:-0}" = 1 ] && return 0
+  # The flag goes up before the write, so there may be nothing of ours yet (a
+  # stop during the lock wait or behind a foreign marker): leave without waiting
+  # for the lock. The final owner check stays under the lock.
+  [ "$(marker_field owner || true)" = "$OWNER" ] || return 0
   locked "$CLEANUP_LOCK_WAIT" remove_own_marker >/dev/null 2>&1 || true
 }
 
