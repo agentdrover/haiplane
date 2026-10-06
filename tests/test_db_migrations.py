@@ -1353,3 +1353,20 @@ async def test_scheduled_policy_changes_table_fresh_and_migrated():
         assert "state" in await _table_columns(conn, "scheduled_policy_changes")
     finally:
         await conn.close()
+
+
+async def test_freeze_rationale_column_present_and_empty_for_old_rows():
+    """#1594: обоснование допуска при заморозке; у старых строк оно пустое."""
+    conn = await _make_db()
+    try:
+        cols = await _table_columns(conn, "tasks")
+        assert "freeze_rationale" in cols
+        assert cols["freeze_rationale"]["notnull"] == 1
+        await conn.execute(
+            "INSERT INTO tasks (title, description, runtime) VALUES ('t', '', 'auto')"
+        )
+        row = await conn.execute_fetchall("SELECT freeze_rationale FROM tasks")
+        assert row[0]["freeze_rationale"] == ""
+        await _migrate(conn)  # повторный проход миграций ничего не ломает
+    finally:
+        await conn.close()

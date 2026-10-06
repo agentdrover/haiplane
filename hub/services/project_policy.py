@@ -14,13 +14,15 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import NamedTuple
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, NamedTuple
 
 import aiosqlite
 
 from hub import config, git_policy
 from hub import repository as repo
-from hub.models import DEFAULT_FORGE, FORGES
+from hub.models import DEFAULT_FORGE, FORGES, parse_freeze_until, validated_freeze
 
 log = logging.getLogger(__name__)
 
@@ -825,3 +827,174 @@ def release_artifacts_of(policy: dict) -> list[dict[str, str]]:
                 }
             )
     return pairs
+
+
+# Заморозка проекта (#1594). Ключ ``freeze`` — {until, allow_work_types, note}:
+# пока она действует, ЛЮБОЙ допуск новой работы в проект (одобрение черновика,
+# автоодобрение, создание сразу открытой задачи) требует разрешённого типа и
+# непустого обоснования. Черновики создаются как раньше. Один читатель
+# (``freeze_of``) и одна проверка (``freeze_admission``): у каждой двери нет
+# своей копии правила, иначе копии начнут расходиться.
+FREEZE_KEY = "freeze"
+FREEZE_REFUSED = "freeze_refused"
+
+
+@dataclass(frozen=True)
+class Freeze:
+    """Прочитанная заморозка: срок (UTC; ``None`` - до снятия), типы, примечание."""
+
+    until: datetime | None
+    allow_work_types: tuple[str, ...]
+    note: str
+    #: Запись нечитаема: заморозка действует и не пускает ничего. Нечитаемая
+    #: политика не должна читаться как разрешение.
+    unreadable: bool = False
+
+    def active_at(self, now: datetime) -> bool:
+        """Заморозка действует строго до ``until``: при ``now == until`` уже нет."""
+        return self.until is None or now < self.until
+
+    def until_text(self) -> str:
+        return self.until.isoformat() if self.until is not None else ""
+
+    def as_view(self, now: datetime) -> dict[str, Any]:
+        return {
+            "until": self.until_text() or None,
+            "allow_work_types": list(self.allow_work_types),
+            "note": self.note,
+            "active": self.active_at(now),
+        }
+
+
+def stored_policy_or_none(project: Any) -> dict | None:
+    """Сохранённая политика проекта; ``None`` - запись есть, но нечитаема.
+
+    Отличает «политики нет» (пустое значение - ``{}``) от «не смогли
+    прочитать» (битый JSON, не объект). ``gate_policy_of`` сворачивает оба
+    случая в ``{}``, и для читателей, чей пустой ответ значит «ничего не
+    делегировано», это верно. Допуск заморозки читает иначе: ``{}`` там -
+    «ограничений нет», и нечитаемая политика открывала бы доступ (#1594).
+    """
+    try:
+        raw = project["gate_policy"]
+    except (KeyError, IndexError):
+        return {}
+    except TypeError:
+        return None
+    try:
+        policy = json.loads(raw or "{}")
+    except (ValueError, TypeError):
+        return None
+    return policy if isinstance(policy, dict) else None
+
+
+def freeze_of(policy: dict) -> Freeze | None:
+    """Заморозка уже прочитанной политики; ``None``, когда ключа нет."""
+    if not isinstance(policy, dict) or FREEZE_KEY not in policy:
+        return None
+    # Ключ ЕСТЬ: значение null, не объект или битое - сохранённая заморозка,
+    # которую не разобрали, и допуск закрыт. «Снять» значит УДАЛИТЬ ключ
+    # (PATCH {"freeze": null} его удаляет и null не сохраняет).
+    raw = policy[FREEZE_KEY]
+    try:
+        canon = validated_freeze(raw)
+        return Freeze(
+            parse_freeze_until(canon["until"]),
+            tuple(canon["allow_work_types"]),
+            canon["note"],
+        )
+    except (ValueError, TypeError):
+        return Freeze(None, (), "", unreadable=True)
+
+
+def freeze_view_of(policy: dict) -> dict[str, Any] | None:
+    """Заморозка для сводки: срок, типы, примечание и «действует ли сейчас»."""
+    freeze = freeze_of(policy)
+    return freeze.as_view(datetime.now(UTC)) if freeze is not None else None
+
+
+def freeze_show(view: Any) -> str:
+    """Читаемый вид заморозки для сводки политики, а не «N rule(s)»."""
+    if not isinstance(view, dict):
+        return "-"
+    until = view.get("until")
+    span = f"до {until}" if until else "до снятия"
+    state = "действует" if view.get("active") else "не действует"
+    types = ", ".join(view.get("allow_work_types") or []) or "ничего"
+    note = f"; {view['note']}" if view.get("note") else ""
+    return f"{span} ({state}); разрешены: {types}{note}"
+
+
+@dataclass(frozen=True)
+class FreezeRefusal:
+    """Отказ допуска: код недостающего условия и текст для человека."""
+
+    missing: str  # "work_type" | "freeze_rationale" | "policy"
+    text: str
+    until: str
+    allow_work_types: tuple[str, ...]
+    note: str
+
+    def detail(self) -> dict[str, Any]:
+        """Структурированный отказ для HTTPException (422)."""
+        return {
+            "error": FREEZE_REFUSED,
+            "reason": FREEZE_REFUSED,
+            "message": self.text,
+            "missing": self.missing,
+            "until": self.until or None,
+            "allow_work_types": list(self.allow_work_types),
+            "note": self.note,
+        }
+
+
+def freeze_admission(
+    project: Any,
+    work_type: str,
+    rationale: str,
+    *,
+    now: datetime | None = None,
+) -> FreezeRefusal | None:
+    """Пускает ли заморозка проекта новую работу; ``None`` - пускает (#1594).
+
+    ЕДИНСТВЕННАЯ проверка допуска: её зовут все двери одобрения и создания
+    открытой работы. Тип должен входить в ``allow_work_types`` И обоснование —
+    быть непустым после strip. Не действующая (``now >= until``) или отсутствующая
+    заморозка пускает всё; проект без строки (``None``) тоже.
+    """
+    if project is None:
+        return None
+    policy = stored_policy_or_none(project)
+    if policy is None:
+        # Решение заморозки (не остальных читателей): политику не прочитали -
+        # допуск закрыт, а не открыт.
+        return FreezeRefusal(
+            "policy",
+            "Политика проекта нечитаема (gate_policy не разобран): допуск "
+            "закрыт, пока запись не исправлена.",
+            "",
+            (),
+            "",
+        )
+    freeze = freeze_of(policy)
+    if freeze is None or not freeze.active_at(now or datetime.now(UTC)):
+        return None
+    wtype = str(getattr(work_type, "value", work_type) or "").strip()
+    span = f"до {freeze.until_text()}" if freeze.until else "до снятия"
+    tail = f" Примечание: {freeze.note}" if freeze.note else ""
+    allowed = ", ".join(freeze.allow_work_types) or "ничего"
+    if freeze.unreadable:
+        missing, why = "work_type", "запись freeze нечитаема, допуск закрыт"
+    elif wtype not in freeze.allow_work_types:
+        missing, why = "work_type", f"тип работы {wtype or '-'} не разрешён"
+    elif not (rationale or "").strip():
+        missing, why = "freeze_rationale", "нет обоснования freeze_rationale"
+    else:
+        return None
+    return FreezeRefusal(
+        missing,
+        f"Заморозка проекта {span}: {why}; разрешены: {allowed}.{tail}",
+        freeze.until_text(),
+        freeze.allow_work_types,
+        freeze.note,
+    )

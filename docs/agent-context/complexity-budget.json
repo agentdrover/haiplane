@@ -157,14 +157,6 @@
     },
     {
       "path": "hub/services/lifecycle.py",
-      "function": "approve_task",
-      "rule": "C901",
-      "measured": 16,
-      "max": 19,
-      "removed_by": "unclaimed — долг без задачи: эпик #1064 эту функцию не трогает"
-    },
-    {
-      "path": "hub/services/lifecycle.py",
       "function": "create_task",
       "rule": "C901",
       "measured": 18,

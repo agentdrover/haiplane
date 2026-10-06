@@ -93,6 +93,9 @@ BOOKKEEPING_FIELDS = frozenset(
     {
         "project",
         "work_type",
+        # #1594: обоснование допуска при заморозке - учёт допуска, не то, что
+        # задача утверждает; правка не должна пере-штамповывать постановку.
+        "freeze_rationale",
         "class_of_service",
         "size",
         "wip_tag",
