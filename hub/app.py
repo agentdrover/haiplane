@@ -85,6 +85,7 @@ from hub.models import (
     CursorUsageImportRequest,
     MergeLedgerBackfillRequest,
     MachineReviewView,
+    StewardFalseApproveClear,
     StewardJudgementSubmit,
     StewardJudgementView,
     CategoryCheckSubmit,
@@ -2695,8 +2696,21 @@ async def api_steward_evidence(
     asked = services.steward_pinned_generation(
         identity, dict(row) if row is not None else {"id": task_id}, generation
     )
+    # #1601: дверь открывает заказ ТОГО вида, которому принадлежит сессия:
+    # судья читает под заказом вердикта, советник — под заказом советника.
+    from hub.services.steward_evidence import (
+        KIND_ADVISOR,
+        KIND_VERDICT,
+        stamp_served_packet,
+    )
+
+    run_kind = (
+        KIND_ADVISOR
+        if getattr(identity, "chat_pair_kind", None) == "steward_advisor"
+        else KIND_VERDICT
+    )
     if identity.is_steward and not await services.steward_open_run_exists(
-        db, task_id, asked
+        db, task_id, asked, run_kind
     ):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -2707,6 +2721,8 @@ async def api_steward_evidence(
     packet = await services.build_evidence_packet(db, task_id, asked)
     if packet is None:
         raise HTTPException(404, "task not found")
+    if identity.is_steward:
+        await stamp_served_packet(db, task_id, asked, run_kind, packet)
     return services.steward_packet_payload(packet)
 
 
@@ -2733,10 +2749,35 @@ async def api_steward_judgement(
         identity,
         expected_generation=(
             identity.chat_pair_generation
-            if getattr(identity, "chat_pair_kind", None) == "steward"
+            if getattr(identity, "chat_pair_kind", None) in config.STEWARD_PAIR_KINDS
             else None
         ),
     )
+
+
+@app.post("/api/tasks/{task_id}/steward-false-approve/clear")
+async def api_steward_false_approve_clear(
+    task_id: int,
+    request: Request,
+    body: StewardFalseApproveClear | None = None,
+    identity=Depends(require_human_or_admin),
+):
+    """Human decision: lift a sticky false approve of the steward pair (#1601).
+
+    The mark that sent the steward back to the shadow stays until a human
+    removes it HERE — no data change lifts it, and no agent may. Human or
+    admin only; the steward allowlist (#1021) does not reach this route. No
+    MCP tool on purpose: the catalog is at its budget and the decision belongs
+    to a human (same as return-to-work, #1356).
+    """
+    from hub.services.steward_exit import clear_false_approval
+
+    if await repo.get_task(_db(request), task_id) is None:
+        raise HTTPException(404, "task not found")
+    cleared = await clear_false_approval(
+        _db(request), task_id, identity.username, (body.note if body else "")
+    )
+    return {"task_id": task_id, "cleared": cleared, "by": identity.username}
 
 
 @app.get("/api/tasks/{task_id}/review-brief", response_model=ReviewBrief)

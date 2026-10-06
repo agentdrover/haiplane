@@ -1446,15 +1446,22 @@ async def insert_steward_judgement(
     submitted_by: str = "",
     principal_id: int | None = None,
     tokens_unknown_reason: str = "",
+    judged_id: int | None = None,
+    packet_hash: str = "",
+    contour: int = 2,
 ) -> int | None:
-    """Insert one judgement. None when the (task, generation, kind) slot is taken."""
+    """Insert one judgement. None when the (task, generation, kind) slot is taken.
+
+    ``contour`` 2 — суждение нового контура (#1601); строки до выката остались
+    с 1 по умолчанию колонки и в выборку критерия выхода не входят.
+    """
     try:
         cur = await db.execute(
             "INSERT INTO steward_judgements (task_id, generation, kind, "
             "submitted_verdict, verdict, confidence, escalate_reason, grounds, "
             "findings, closures, model, tokens_spent, duration_ms, submitted_by, "
-            "principal_id, tokens_unknown_reason) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "principal_id, tokens_unknown_reason, judged_id, packet_hash, contour) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 generation,
@@ -1472,6 +1479,9 @@ async def insert_steward_judgement(
                 submitted_by,
                 principal_id,
                 tokens_unknown_reason,
+                judged_id,
+                packet_hash,
+                contour,
             ),
         )
     except aiosqlite.IntegrityError:

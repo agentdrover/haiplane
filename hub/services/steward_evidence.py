@@ -873,8 +873,17 @@ RUN_OPEN = "open"
 KIND_VERDICT = "verdict"
 
 
+#: Заказ советника-критика (#1601) — отдельный вид заказа. Дверь к пакету он
+#: открывает ТОЛЬКО сессии советника, а заказ судьи — только сессии судьи:
+#: чужой вид заказа расширил бы вход ровно на этот путь.
+KIND_ADVISOR = "advisor"
+
+
 async def open_run_exists(
-    db: aiosqlite.Connection, task_id: int, generation: int
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    kind: str = KIND_VERDICT,
 ) -> bool:
     """Is there an OPEN steward run ordered for this generation (#1073)?
 
@@ -902,9 +911,92 @@ async def open_run_exists(
         db,
         "SELECT 1 FROM steward_runs "
         "WHERE task_id=? AND generation=? AND kind=? AND status=? LIMIT 1",
-        (task_id, generation, KIND_VERDICT, RUN_OPEN),
+        (task_id, generation, kind, RUN_OPEN),
     )
     return bool(open_runs)
+
+
+# ---------------------------------------------------------------------------
+# Хеш пакета (#1601)
+# ---------------------------------------------------------------------------
+#
+# Согласие советника записано про ПАКЕТ, который он прочёл, а не про сдачу
+# вообще. Пакет живой: CI дозавершается, ветка двигается, отчёт ревью
+# перезаписывается. Хеш — отпечаток того, по чему решают, и approve применим
+# только пока отпечаток, снятый при выдаче пакета судье и советнику, равен
+# сегодняшнему.
+#
+# Состав — пять фактов, по которым привратник применения отказывает
+# (steward_apply.PRECONDITION_FACTS), плюс чужие тексты, которые читает судья.
+# Остальные факты (локаторы AC, база, зависимости) описывают окружение, а не
+# сдаваемый код, и меняются сами по себе: включи их — и согласие умирало бы от
+# движения базы. Из значений выброшены поля, которые дописываются задним
+# числом без смены сути (токены отчёта).
+PACKET_HASH_SOURCES: tuple[str, ...] = (
+    "machine_review_report",
+    "ci_pinned_sha",
+    "branch_tip",
+    "diff_vs_areas",
+    "risk_class",
+)
+_PACKET_HASH_VOLATILE_KEYS = frozenset({"tokens_spent"})
+
+
+def packet_hash(packet: EvidencePacket) -> str:
+    """Отпечаток пакета: тот же пакет — тот же хеш, иной по сути — иной."""
+    import hashlib
+
+    facts: dict[str, Any] = {}
+    for source in PACKET_HASH_SOURCES:
+        fact = packet.facts.get(source)
+        if fact is None:
+            facts[source] = None
+            continue
+        facts[source] = {
+            "state": fact.state,
+            "reason": fact.reason,
+            "value": {
+                k: v
+                for k, v in (fact.value or {}).items()
+                if k not in _PACKET_HASH_VOLATILE_KEYS
+            },
+        }
+    body = {
+        "generation": packet.generation,
+        "facts": facts,
+        "quotes": [[q.source, q.author, q.text] for q in packet.quotes],
+    }
+    blob = json.dumps(body, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+async def current_packet_hash(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> str:
+    """Хеш сегодняшнего пакета этой сдачи; пусто, если задачи нет."""
+    packet = await build_evidence_packet(db, task_id, generation)
+    return packet_hash(packet) if packet is not None else ""
+
+
+async def stamp_served_packet(
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    kind: str,
+    packet: EvidencePacket,
+) -> None:
+    """Запомнить на открытом заказе, какой пакет отдан прогону (хеш).
+
+    Пишет хаб в момент выдачи, а не прогон словами: «я читал пакет X» —
+    утверждение прогона о себе, а выданный пакет — факт хаба. Последняя выдача
+    затирает прежнюю: решает то, что прогон видел в конце.
+    """
+    await db.execute(
+        "UPDATE steward_runs SET packet_hash=? "
+        "WHERE task_id=? AND generation=? AND kind=? AND status=?",
+        (packet_hash(packet), task_id, generation, kind, RUN_OPEN),
+    )
+    await db.commit()
 
 
 def packet_payload(packet: EvidencePacket) -> dict[str, Any]:
@@ -993,7 +1085,7 @@ def pinned_generation(identity: Any, task: dict[str, Any], asked: int | None) ->
 
     pin = (
         getattr(identity, "chat_pair_generation", None)
-        if getattr(identity, "chat_pair_kind", None) == "steward"
+        if getattr(identity, "chat_pair_kind", None) in config.STEWARD_PAIR_KINDS
         else None
     )
     current = int(task.get("submission_generation") or 0)

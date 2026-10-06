@@ -171,6 +171,21 @@ async def apply_judgement(
     verdict = str(dict(judgement).get("verdict") or "")
 
     if verdict == "approve":
+        # #1601: approve судьи вердиктом становится только при согласии
+        # советника на том же пакете. Проверка живёт ЗДЕСЬ, у самой записи
+        # вердикта, а не только у вызывающих: любой путь к ней проходит мимо
+        # одного и того же вопроса.
+        from hub.services.steward_advisor import advisor_refusal
+
+        refusal = await advisor_refusal(db, task_id, generation)
+        if refusal is not None:
+            raise HTTPException(
+                409,
+                detail=(
+                    f"approve судьи не применяется без согласия советника "
+                    f"({refusal[0]}): {refusal[1]}"
+                ),
+            )
         await _record(db, task_id, ReviewVerdict.approved, generation)
         return APPLIED, f"approve применён к сдаче {generation}"
 
@@ -907,6 +922,22 @@ async def apply_self_approval(
     if not _policy_wants_steward(project, gate="verdict"):
         return None
 
+    # #1601: approve судьи без согласия советника (ответа нет, возражение,
+    # таймаут, смена пакета) к человеку — с доводами обеих сторон. Спрашивается
+    # ДО привратника и своим отказом: это не недостача свидетельств, а отсутствие
+    # второго мнения, и досдать тут нечего.
+    from hub.services.steward_advisor import advisor_refusal
+
+    advisor = await advisor_refusal(db, task_id, generation)
+    if advisor is not None:
+        await _hand_to_the_human_named(
+            db,
+            task_id,
+            f"{advisor[0]}: {advisor[1]}",
+            who="Второго мнения нет: approve судьи без согласия советника",
+        )
+        return ESCALATED_TO_HUMAN, "советник не согласен — " + advisor[1]
+
     from hub.services.steward_apply import apply_refusals
 
     refusals = await apply_refusals(db, task_id, generation)
@@ -925,7 +956,10 @@ async def apply_self_approval(
 
 
 async def _hand_to_the_human_named(
-    db: aiosqlite.Connection, task_id: int, reason: str
+    db: aiosqlite.Connection,
+    task_id: int,
+    reason: str,
+    who: str = "Привратник применения возражает",
 ) -> None:
     """Отказ привратника — в карточку своими словами, а не словами правила.
 
@@ -939,8 +973,7 @@ async def _hand_to_the_human_named(
         task_id,
         _STEWARD_ACTOR,
         "status",
-        "Самостоятельного одобрения не будет — решает человек. "
-        "Привратник применения возражает: " + reason + ".",
+        f"Самостоятельного одобрения не будет — решает человек. {who}: " + reason + ".",
         author_kind="hub",
     )
     await db.commit()

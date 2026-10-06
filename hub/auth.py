@@ -271,6 +271,8 @@ _ALLOW_BY_KIND: Final[dict[str, tuple[tuple[str, re.Pattern[str]], ...]]] = {
     # descriptions of one boundary drift, and the one that drifts wider wins
     # silently.
     "steward": _STEWARD_ALLOWED,
+    # #1601: советник-критик — те же две операции, другой вид сессии.
+    "steward_advisor": _STEWARD_ALLOWED,
 }
 
 

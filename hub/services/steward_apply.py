@@ -28,7 +28,9 @@ ladder
 вопрос, и расходиться они начнут молча.
 
 Новых кодов эскалации не заводится: словарь #1022 закрыт, и всё, что здесь
-нужно, в нём уже есть.
+нужно, в нём уже есть. Исключение одно и не про суждение судьи: отказ
+применения без согласия советника (#1601, ``advisor_not_concurred``) — код
+привратника, а не причина эскалации судьи.
 """
 
 from __future__ import annotations
@@ -751,4 +753,11 @@ async def apply_refusals(
     ladder = ladder_refusal(packet)
     if ladder:
         out.append(ladder)
+    # #1601: approve судьи применяется только при согласии советника на ТОМ
+    # ЖЕ пакете. Спрашивается готовым пакетом — второй сборки рядом нет.
+    from hub.services.steward_advisor import advisor_refusal
+
+    advisor = await advisor_refusal(db, task_id, packet.generation, packet)
+    if advisor:
+        out.append(advisor)
     return out

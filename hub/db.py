@@ -2488,6 +2488,58 @@ _MIGRATIONS: list[tuple[str, str]] = [
             UNIQUE (task_id, generation)
         )""",
     ),
+    # --- #1601: советник-критик стюарда и критерий выхода из тени v2. -------
+    (
+        # Для kind=advisor: id суждения судьи, на которое отвечает советник.
+        # Привязку ставит хаб по заказу, а не советник словами.
+        "add_steward_judgements_judged_id",
+        "ALTER TABLE steward_judgements ADD COLUMN judged_id INTEGER",
+    ),
+    (
+        # Хеш пакета фактов (steward_evidence.packet_hash), который прочёл
+        # прогон: хаб снимает его при выдаче пакета и переносит в суждение.
+        # Пусто — пакета под этот прогон не отдавали, и согласие не засчитывается.
+        "add_steward_judgements_packet_hash",
+        "ALTER TABLE steward_judgements ADD COLUMN packet_hash TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
+    (
+        # Контур выборки: 1 — суждения до выката #1601 (одиночные, без
+        # советника), 2 — новый контур. Старые строки остаются 1 по умолчанию
+        # колонки; критерий выхода v2 их не зачитывает.
+        "add_steward_judgements_contour",
+        "ALTER TABLE steward_judgements ADD COLUMN contour INTEGER NOT NULL DEFAULT 1",
+    ),
+    (
+        # Исход применения approve судьи (поллер): '' — ещё не применялся;
+        # approved | escalated | moot. Ставится условным UPDATE: так применение
+        # случается ровно один раз и переживает перезапуск хаба.
+        "add_steward_judgements_advisor_outcome",
+        "ALTER TABLE steward_judgements ADD COLUMN advisor_outcome TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
+    (
+        "add_steward_runs_packet_hash",
+        "ALTER TABLE steward_runs ADD COLUMN packet_hash TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # Липкое ошибочное одобрение пары (#1601). Таблица, а не событие:
+        # события чистятся через 14 дней, а окно проверки — 30 дней после
+        # доставки. Строка живёт, пока человек явно не снимет её (cleared_*).
+        "create_steward_false_approvals",
+        """CREATE TABLE IF NOT EXISTS steward_false_approvals (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id     INTEGER NOT NULL,
+            source      TEXT    NOT NULL,
+            generation  INTEGER NOT NULL DEFAULT 0,
+            detail      TEXT    NOT NULL DEFAULT '',
+            detected_at TEXT    NOT NULL DEFAULT (datetime('now')),
+            cleared_by  TEXT,
+            cleared_at  TEXT,
+            clear_note  TEXT    NOT NULL DEFAULT '',
+            UNIQUE (task_id, source)
+        )""",
+    ),
 ]
 
 
