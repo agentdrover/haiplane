@@ -42,6 +42,9 @@ def _clean_prefixed_env(monkeypatch):
         "HUB_CI_CHECKS",
         "HUB_CI_MUTATIONS",
         "HUB_CI_BASELINE",
+        "HUB_CI_MUTATIONS_OUTCOME",
+        "HUB_CI_BASELINE_OUTCOME",
+        "HUB_CI_EVENT_ACTION",
     ):
         monkeypatch.delenv(f"HAIPLANE_{suffix}", raising=False)
 
@@ -646,7 +649,11 @@ def test_the_mutation_report_is_sent_under_its_own_key(script, monkeypatch, tmp_
 
     payload = _capture_payload(script, monkeypatch)
 
-    assert payload["mutations"] == report
+    sent = dict(payload["mutations"])
+    assert sent.pop("provenance") is not None, (
+        "#1606: the run is named inside the block"
+    )
+    assert sent == report
     assert "mutation" not in payload["checks"], "a warning is not a check outcome"
 
 
@@ -690,7 +697,7 @@ def test_ci_workflow_runs_mutations_after_tests_and_cannot_fail_the_job():
     mutation = next(s for s in steps if s.get("id") == "mutations")
 
     assert mutation["continue-on-error"] is True
-    assert "pull_request" in mutation["if"]
+    assert "steps.evidence.outputs.run" in mutation["if"], "#1606: decided by event"
     assert "timeout-minutes" in mutation
     assert "scripts/mutation_changed.py" in mutation["run"]
     assert names.index("mutations") > names.index("tests")
@@ -864,3 +871,79 @@ def test_an_absolute_reported_path_still_matches_a_relative_id(
     }
     nested = f"ERROR: file or directory not found: {tmp_path / 'nested' / inner_suite}"
     assert script._missing_nodeids(nested, [passing]) == {}
+
+
+# ---- #1606: skipped / failed / present are three different payloads ----------
+
+
+def _provenance_env(monkeypatch):
+    monkeypatch.setenv("GITHUB_RUN_ID", "4242")
+    monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.example")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "org/repo")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("HAIPLANE_HUB_CI_EVENT_ACTION", "opened")
+
+
+def test_evidence_keys_distinguish_skipped_failed_and_present(
+    script, monkeypatch, tmp_path
+):
+    """AC-3: a step that did not run sends no key; one that ran says what happened."""
+    _provenance_env(monkeypatch)
+    valid = tmp_path / "ok.json"
+    valid.write_text(json.dumps({"state": "ran", "survivors": []}))
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json")
+    absent = tmp_path / "absent.json"
+
+    def run(kind: str, outcome: str, path) -> dict:
+        monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}", str(path))
+        monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME", outcome)
+        return _capture_payload(script, monkeypatch)
+
+    for kind, key in (("MUTATIONS", "mutations"), ("BASELINE", "baseline")):
+        # skipped: the key is absent — not {} and not an error.
+        assert key not in run(kind, "skipped", absent)
+        assert key not in run(kind, "skipped", valid), "a skipped step sends nothing"
+
+        # ran, but no file (timeout before the write): an explicit error.
+        timed_out = run(kind, "cancelled", absent)[key]
+        assert timed_out["state"] == "error"
+        assert timed_out["reason"], "the cause must be named"
+        assert "provenance" in timed_out
+
+        # ran, file is broken: an explicit error too.
+        garbage = run(kind, "failure", broken)[key]
+        assert garbage["state"] == "error" and garbage["reason"]
+
+        # ran, file is valid: the data, plus where it came from.
+        good = run(kind, "success", valid)[key]
+        assert good["state"] == "ran"
+        assert good["provenance"]["run_id"] == "4242"
+        assert good["provenance"]["run_url"] == (
+            "https://github.example/org/repo/actions/runs/4242"
+        )
+        assert good["provenance"]["event"] == "pull_request.opened"
+        assert good["provenance"]["at"], "a time must be stated"
+        monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}")
+        monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME")
+
+
+def test_an_executed_step_with_foreign_content_is_an_error_not_evidence(
+    script, monkeypatch, tmp_path
+):
+    """#1606: `{}` or a foreign object is not a mutation/baseline report."""
+    _provenance_env(monkeypatch)
+    for kind, key in (("MUTATIONS", "mutations"), ("BASELINE", "baseline")):
+        for content in ({}, {"unexpected": "x"}, {"state": "banana"}):
+            path = tmp_path / f"{key}.json"
+            path.write_text(json.dumps(content))
+            monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}", str(path))
+            monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME", "success")
+            block = _capture_payload(script, monkeypatch)[key]
+            assert block["state"] == "error", (key, content)
+            assert block["reason"] and "unexpected" not in block
+            assert block["provenance"]["run_id"] == "4242"
+        # Without a stated outcome (an old caller) foreign content sends nothing.
+        monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME")
+        assert key not in _capture_payload(script, monkeypatch)
+        monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}")

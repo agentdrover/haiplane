@@ -72,6 +72,32 @@ inputs:
     required: false
     default: ""
 
+  mutations-outcome:
+    description: >-
+      Outcome of the step that wrote mutations-file (#1606): success | failure |
+      cancelled | skipped. `skipped` ⇒ the step did not run and the hub is sent
+      no mutations key, so a report never erases evidence stored earlier for
+      the same commit. Any other value means the step ran: a missing or broken
+      file is then sent as an explicit error with its cause. Empty ⇒ the
+      caller does not say, and the file alone decides (a missing file sends
+      nothing).
+    required: false
+    default: ""
+
+  baseline-outcome:
+    description: >-
+      The same as mutations-outcome, for the step that wrote baseline-file.
+    required: false
+    default: ""
+
+  event-action:
+    description: >-
+      The activity type of the triggering event (opened, synchronize, ...), or
+      empty. Recorded with the run id and URL as provenance inside each
+      evidence block, so the hub can name the run an evidence came from.
+    required: false
+    default: ""
+
 runs:
   using: composite
   steps:
@@ -86,6 +112,9 @@ runs:
         HAIPLANE_HUB_CI_RAN: ${{ inputs.ran-commands }}
         HAIPLANE_HUB_CI_MUTATIONS: ${{ inputs.mutations-file }}
         HAIPLANE_HUB_CI_BASELINE: ${{ inputs.baseline-file }}
+        HAIPLANE_HUB_CI_MUTATIONS_OUTCOME: ${{ inputs.mutations-outcome }}
+        HAIPLANE_HUB_CI_BASELINE_OUTCOME: ${{ inputs.baseline-outcome }}
+        HAIPLANE_HUB_CI_EVENT_ACTION: ${{ inputs.event-action }}
       run: |
         set -u
         # A repo-hosted action ships with its whole repository, so the reporter

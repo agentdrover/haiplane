@@ -2588,6 +2588,7 @@ async def api_ci_run_report(
             f"stale report: sent for submission #{body.submission_generation}, "
             f"current is #{current_generation}",
         )
+    sent = body.model_fields_set
     try:
         result = await accept_ci_run_report(
             db,
@@ -2599,8 +2600,12 @@ async def api_ci_run_report(
             reason=body.reason,
             reported_by=body.reported_by or identity.username,
             checks=body.checks,
-            mutations=body.mutations,
-            baseline=body.baseline,
+            # #1606: a key the reporter did not send is NOT an empty object —
+            # the step behind it did not run, and what the hub already stored
+            # for this commit must survive. The model's defaults hide the
+            # difference; model_fields_set keeps it.
+            mutations=body.mutations if "mutations" in sent else None,
+            baseline=body.baseline if "baseline" in sent else None,
         )
     except LookupError:
         raise HTTPException(404, "task not found") from None

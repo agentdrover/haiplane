@@ -216,11 +216,13 @@ async def test_bug_without_failing_baseline_is_refused(client: AsyncClient, db):
     assert violations[0].startswith("AC-1") and "зелёный до фикса" in violations[0]
     await _assert_nothing_recorded(db, task_id, feed_before, dispatch)
 
-    # Отчёт без поля baseline (старый репортёр) — тоже «нет baseline».
+    # #1606: отчёт без ключа baseline (прогон synchronize) сохранённое не
+    # стирает — отказ прежний, и он по-прежнему называет красный-до-фикса AC-1.
     await _report_baseline(client, task_id, None)
     resp, _ = await _submit(client, task_id)
     assert resp.status_code == 422, resp.text
-    assert all("нет baseline" in v for v in _detail(resp)["violations"])
+    violations = _detail(resp)["violations"]
+    assert len(violations) == 1 and violations[0].startswith("AC-1"), violations
 
 
 # --------------------------------------------------------------------------
@@ -425,7 +427,8 @@ def test_baseline_step_runs_branch_tests_on_merge_base(tmp_path, monkeypatch):
     steps = [s for job in doc["jobs"].values() for s in job.get("steps") or []]
     step = next(s for s in steps if s.get("id") == "baseline")
     assert step["continue-on-error"] is True
-    assert "task-" in step["if"]
+    # #1606: «только task-*» теперь решает шаг evidence (см. contract-тест).
+    assert "steps.evidence.outputs.run" in step["if"]
     assert "!cancelled()" in step["if"], "красный Test не стирает baseline"
     assert "scripts/red_test_baseline.py" in step["run"]
     reporter_step = next(s for s in steps if "hub-ci-report" in str(s.get("uses")))
@@ -619,3 +622,110 @@ def test_baseline_timeout_kills_the_process_group(tmp_path):
             time.sleep(0.1)
         else:
             pytest.fail(f"процесс {pid} пережил таймаут")
+
+
+# --------------------------------------------------------------------------
+# #1606 AC-5: baseline нужен до любой сдачи; treedup не зависит от мутаций
+# --------------------------------------------------------------------------
+
+
+async def test_bug_require_needs_a_baseline_before_any_submission(
+    client: AsyncClient, db, tmp_path
+):
+    """Регрессионная защита: пропуск baseline на synchronize не ослабляет гейт."""
+    task_id = await _running_bug(db, "red-first", "require")
+    feed_before = len(await _feed(db, task_id))
+
+    # Первая сдача при заранее открытом PR: baseline никто не присылал.
+    resp, dispatch = await _submit(client, task_id)
+    assert resp.status_code == 422, resp.text
+    assert _detail(resp)["reason"] == _UNPROVEN
+    await _assert_nothing_recorded(db, task_id, feed_before, dispatch)
+
+    # Прогон synchronize шлёт отчёт без ключа baseline: доказательством он не стал.
+    await _report_baseline(client, task_id, None)
+    resp, dispatch = await _submit(client, task_id)
+    assert resp.status_code == 422, resp.text
+    assert all("нет baseline" in v for v in _detail(resp)["violations"])
+    await _assert_nothing_recorded(db, task_id, feed_before, dispatch)
+
+    # Ручной прогон (dispatch) до сдачи присылает baseline; последующий отчёт
+    # без ключа его не стирает, и сдача проходит.
+    await _report_baseline(
+        client, task_id, _baseline({_REF_1: "failed", _REF_2: "failed"})
+    )
+    await _report_baseline(client, task_id, None)
+    resp, _ = await _submit(client, task_id)
+    assert resp.status_code == 200, resp.text
+
+    _treedup_reuses_a_pr_run_whose_mutations_were_skipped(tmp_path)
+
+
+def _treedup_reuses_a_pr_run_whose_mutations_were_skipped(tmp_path: Path) -> None:
+    """Поведение treedup: успешный PR-прогон переиспользуется, Test в нём был.
+
+    Шаг из ci.yml выполняется как есть против временного репозитория и
+    поддельного ``gh``. Что мутации в PR-прогоне пропущены, на решение не
+    влияет: красный Test краснит workflow, а в список успешных прогонов
+    попадают только зелёные.
+    """
+    import yaml
+
+    doc = yaml.safe_load((_ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = {s.get("id"): s for s in doc["jobs"]["test"]["steps"] if s.get("id")}
+    treedup, test = steps["treedup"], steps["tests"]
+    assert "continue-on-error" not in test, "красный Test обязан краснить прогон"
+    assert test["if"] == "${{ steps.treedup.outputs.skip != 'true' }}"
+    assert treedup["if"] == "${{ github.event_name == 'push' }}"
+
+    work = tmp_path / "repo"
+    work.mkdir()
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+
+    def git(*args: str) -> str:
+        return subprocess.run(  # nosec B603 B607
+            ["git", *args],
+            cwd=work,
+            env=git_env,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-b", "develop")
+    (work / "f.txt").write_text("same tree\n")
+    git("add", ".")
+    git("commit", "-m", "pr head")
+    pr_head = git("rev-parse", "HEAD")
+    git(
+        "commit", "--amend", "-m", "squash merge, same tree"
+    )  # другой sha, то же дерево
+    assert git("rev-parse", "HEAD") != pr_head
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!/bin/sh\necho '{pr_head} https://example/runs/1'\n")
+    gh.chmod(0o755)
+    out = tmp_path / "out"
+    out.write_text("")
+    done = subprocess.run(  # nosec B603 B607
+        ["bash", "-c", treedup["run"].replace("${{ github.repository }}", "o/r")],
+        cwd=work,
+        env={
+            **git_env,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "GITHUB_OUTPUT": str(out),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "skip=true" in out.read_text()
+    assert "pytest skipped" in done.stdout

@@ -35,8 +35,12 @@ EXCEPTIONS: dict[str, str] = {
         "оптимизация прогона, не проверка — #1077"
     ),
     "Surface parity (warning only)": ("только PR и warning-only: exit 0 всегда"),
+    "Decide whether mutations and baseline are worth their minutes": (
+        "решение по событию GitHub, не проверка — #1606"
+    ),
     "Mutations of changed functions (warning only)": (
-        "только PR и warning-only: exit 0 всегда, серия дольше make check — #1270"
+        "ручной прогон и открытие PR task-ветки, warning-only: exit 0 всегда, "
+        "серия дольше make check — #1270, #1606"
     ),
     "Red-test baseline on merge-base (data only)": (
         "данные для гейта красного теста (#913): только ветки task-*, exit 0 "
