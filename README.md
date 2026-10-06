@@ -125,9 +125,11 @@ missing session) — в
 - `hub_claim_task`, `hub_pair_start`, `hub_task_update`, `hub_ask_question`
 - `hub_submit_for_review`, `hub_submit_review`, `hub_report_done`
 
-Человеческие гейты (`hub_approve_task`, `hub_reject_task`, `hub_start_task`,
-`hub_decide_task`, `hub_force_complete_task`) требуют человеческого токена —
-агент не может провести себя через них сам, в этом и смысл.
+Человеческие гейты (approve, reject, start, decide, force-complete, answer)
+требуют человеческого токена: агентскому токену их нет в `tools/list`, а вызов
+отказывается — человек идёт через UI, `oc-hub` или REST
+(`POST /api/tasks/{id}/approve|reject|start|decide|force-complete|answer`).
+Агент не может провести себя через них сам, в этом и смысл.
 
 ## Конфигурация
 

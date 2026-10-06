@@ -462,8 +462,8 @@ async def _hand_to_the_human(
             f"Стюард просит правок по постановке второй раз, а ревизия "
             f"осталась прежней ({generation}): текст с прошлого возврата не "
             "менялся, и то же замечание третий раз ничего не добавит. "
-            f"Дальше решает человек — hub_approve_task одобрит драфт как "
-            "есть, hub_reject_task отклонит. Замечания "
+            f"Дальше решает человек — REST POST /api/tasks/<id>/approve одобрит драфт как "
+            "есть, REST POST /api/tasks/<id>/reject отклонит. Замечания "
             f"({len(remarks)}):\n{listed}"
         ),
         author_kind="hub",

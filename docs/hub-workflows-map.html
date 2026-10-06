@@ -180,7 +180,7 @@
 <table>
   <thead><tr><th>Актор</th><th>Кто это</th><th>Чем ходит</th><th>Что может только он</th></tr></thead>
   <tbody>
-    <tr><td><span class="badge b-human">human</span></td><td>владелец / техлид</td><td>Web UI, CLI, REST с human-токеном</td><td><code>hub_approve_task</code>, <code>hub_reject_task</code>, <code>hub_decide_task</code>, <code>hub_force_complete_task</code>, <code>hub_answer_question</code>, <code>hub_start_task</code></td></tr>
+    <tr><td><span class="badge b-human">human</span></td><td>владелец / техлид</td><td>Web UI, CLI, REST с human-токеном</td><td><code>POST /api/tasks/{id}/approve</code>, <code>POST /api/tasks/{id}/reject</code>, <code>POST /api/tasks/{id}/decide</code>, <code>POST /api/tasks/{id}/force-complete</code>, <code>POST /api/tasks/{id}/answer</code>, <code>POST /api/tasks/{id}/start</code></td></tr>
     <tr><td><span class="badge b-agent">agent</span></td><td>исполнитель / ревьюер / аналитик</td><td>MCP, REST с agent-токеном</td><td>claim, pair_start, updates, submit-for-review, submit_review, report_done</td></tr>
     <tr><td><span class="badge b-machine">hub</span></td><td>поллер и сервисный слой</td><td>внутренние вызовы</td><td>дедлайны, эскалации, мержи, релизы, ретеншен</td></tr>
     <tr><td><span class="badge b-ci">ci</span></td><td>GitHub Actions</td><td>REST: <code>/api/tasks/{id}/ci-run-report</code>, <code>/api/deploys</code></td><td>отчёт о прогоне и о деплое</td></tr>
@@ -246,10 +246,10 @@
 <table>
   <thead><tr><th>Из</th><th>В</th><th>Инструмент</th><th>Актор</th><th>Гейт</th></tr></thead>
   <tbody>
-    <tr><td>draft</td><td>open</td><td><code>hub_approve_task</code></td><td><span class="badge b-human">human</span></td><td>DoR</td></tr>
-    <tr><td>draft</td><td>rejected</td><td><code>hub_reject_task</code></td><td><span class="badge b-human">human</span></td><td>—</td></tr>
+    <tr><td>draft</td><td>open</td><td><code>POST /api/tasks/{id}/approve</code></td><td><span class="badge b-human">human</span></td><td>DoR</td></tr>
+    <tr><td>draft</td><td>rejected</td><td><code>POST /api/tasks/{id}/reject</code></td><td><span class="badge b-human">human</span></td><td>—</td></tr>
     <tr><td>open</td><td>claimed</td><td><code>hub_claim_task</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
-    <tr><td>open</td><td>running</td><td><code>hub_start_task</code></td><td><span class="badge b-human">human</span></td><td>план обязателен</td></tr>
+    <tr><td>open</td><td>running</td><td><code>POST /api/tasks/{id}/start</code></td><td><span class="badge b-human">human</span></td><td>план обязателен</td></tr>
     <tr><td>open</td><td>running</td><td><code>hub_pair_start</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
     <tr><td>claimed</td><td>running</td><td><code>hub_pair_start</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
     <tr><td>claimed</td><td>open</td><td><code>hub_release_task</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
@@ -262,13 +262,13 @@
     <tr><td>running</td><td>ci_check</td><td><code>hub_report_done</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
     <tr><td>running</td><td>needs_decision</td><td><code>hub_report_done</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
     <tr><td>running</td><td>needs_info</td><td><code>hub_ask_question</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
-    <tr><td>needs_info</td><td>open</td><td><code>hub_answer_question</code></td><td><span class="badge b-human">human</span></td><td>—</td></tr>
+    <tr><td>needs_info</td><td>open</td><td><code>POST /api/tasks/{id}/answer</code></td><td><span class="badge b-human">human</span></td><td>—</td></tr>
     <tr><td>running</td><td>pending_report</td><td><code>hub_report_done</code></td><td><span class="badge b-agent">agent</span></td><td>—</td></tr>
     <tr><td>pending_report</td><td>review</td><td><code>hub_report_done</code></td><td><span class="badge b-agent">agent</span></td><td>review</td></tr>
     <tr><td>pending_report</td><td>completed</td><td><code>hub_report_done</code></td><td><span class="badge b-agent">agent</span></td><td>review</td></tr>
     <tr><td>ci_check</td><td>review</td><td><code>ci_poller</code></td><td><span class="badge b-ci">ci</span></td><td>CI</td></tr>
-    <tr><td>needs_decision</td><td>completed</td><td><code>hub_decide_task</code></td><td><span class="badge b-human">human</span></td><td>decision</td></tr>
-    <tr><td>needs_decision</td><td>fix_requested</td><td><code>hub_decide_task</code></td><td><span class="badge b-human">human</span></td><td>decision</td></tr>
+    <tr><td>needs_decision</td><td>completed</td><td><code>POST /api/tasks/{id}/decide</code></td><td><span class="badge b-human">human</span></td><td>decision</td></tr>
+    <tr><td>needs_decision</td><td>fix_requested</td><td><code>POST /api/tasks/{id}/decide</code></td><td><span class="badge b-human">human</span></td><td>decision</td></tr>
   </tbody>
 </table>
 
@@ -366,7 +366,7 @@
 <h2 id="w2">W2 · Path A — headless dispatch</h2>
 
 <div class="flow">
-  <span class="node h">hub_start_task(plan)</span><span class="arr">→</span>
+  <span class="node h">POST /api/tasks/{id}/start(plan)</span><span class="arr">→</span>
   <span class="node m">dispatch job</span><span class="arr">→</span>
   <span class="node a">running:headless</span><span class="arr">→</span>
   <span class="node m">poller sync</span><span class="arr">→</span>
@@ -375,7 +375,7 @@
 
 <h4>Шаги</h4>
 <ol class="tight">
-  <li><strong>Гейт плана.</strong> <code>hub_start_task</code> требует план — в теле вызова или отдельным update с <code>Plan:</code>. Инструмент human-only.</li>
+  <li><strong>Гейт плана.</strong> <code>POST /api/tasks/{id}/start</code> требует план — в теле вызова или отдельным update с <code>Plan:</code>. Инструмент human-only.</li>
   <li><code>dispatch_task</code> создаёт ветку <code>task-&lt;id&gt;/&lt;slug&gt;</code> через git-ops плагин и запускает джоб; в задаче появляется <code>job_id</code> и <code>assigned_agent</code>. Неготовый воркспейс → <code>dispatch_workspace_not_ready</code>.</li>
   <li>Поллер каждые 30 с читает статус джоба (<code>_sweep_running_dispatch</code>).</li>
 </ol>
@@ -656,15 +656,15 @@
 
 <h4>Выходы</h4>
 <ul class="tight">
-  <li><code>hub_decide_task action=accept</code> → <code>completed</code> (осознанный обход гейта, пишется решение; опционально сохраняется в notes и попадает в <code>hub_list_decisions</code>).</li>
-  <li><code>hub_decide_task action=rework</code> → <code>fix_requested</code>.</li>
-  <li><code>hub_force_complete_task</code> — аудируемый оверрайд для <code>task</code>/<code>subtask</code>: разрешён из любого нетерминального статуса, если за <code>job_id</code>/<code>review_job_id</code> не стоит <em>активный</em> джоб (иначе 409; пропавшие/терминальные джобы аудируются и допускаются). Непустой комментарий обязателен для всех активных состояний кроме <code>pending_report</code>/<code>claimed</code>. Терминальные задачи и epic/feature с незавершёнными потомками отклоняются.</li>
+  <li><code>POST /api/tasks/{id}/decide action=accept</code> → <code>completed</code> (осознанный обход гейта, пишется решение; опционально сохраняется в notes и попадает в <code>hub_list_decisions</code>).</li>
+  <li><code>POST /api/tasks/{id}/decide action=rework</code> → <code>fix_requested</code>.</li>
+  <li><code>POST /api/tasks/{id}/force-complete</code> — аудируемый оверрайд для <code>task</code>/<code>subtask</code>: разрешён из любого нетерминального статуса, если за <code>job_id</code>/<code>review_job_id</code> не стоит <em>активный</em> джоб (иначе 409; пропавшие/терминальные джобы аудируются и допускаются). Непустой комментарий обязателен для всех активных состояний кроме <code>pending_report</code>/<code>claimed</code>. Терминальные задачи и epic/feature с незавершёнными потомками отклоняются.</li>
 </ul>
 
 <h2 id="w10">W10 · Вопросы, сообщения, сессии, события</h2>
 
 <h4>Вопрос агента</h4>
-<p><code>hub_ask_question</code> (<code>running → needs_info</code>) → человек отвечает <code>hub_answer_question</code> (human-token) → <code>needs_info → open</code>. Инструмент ответа human-only; stale-alert через 480 мин, но <strong>автоперехода нет</strong> — вопрос ждёт человека сколько угодно.</p>
+<p><code>hub_ask_question</code> (<code>running → needs_info</code>) → человек отвечает <code>POST /api/tasks/{id}/answer</code> (human-token) → <code>needs_info → open</code>. Инструмент ответа human-only; stale-alert через 480 мин, но <strong>автоперехода нет</strong> — вопрос ждёт человека сколько угодно.</p>
 
 <h4>Реестр сессий и почта между агентами</h4>
 <ul class="tight">
@@ -972,7 +972,7 @@
 
 <div class="gap" id="g11">
 <h4><span class="gap-id">G11</span> Два пути в <code>running</code> с разной строгостью <span class="badge b-p3">P3</span></h4>
-<p class="obs"><code>hub_start_task</code> — human-only и требует план. <code>hub_pair_start</code> — агентский и плана в теле не требует (план ожидается update-ом).</p>
+<p class="obs"><code>POST /api/tasks/{id}/start</code> — human-only и требует план. <code>hub_pair_start</code> — агентский и плана в теле не требует (план ожидается update-ом).</p>
 <dl class="rr">
   <dt class="risk">Риск</dt>
   <dd>Гейт стоит на инструменте, а не на переходе. Агент выбирает <code>pair_start</code> — не в обход правила, а потому что это его штатный путь, — и требование плана просто не встречается на дороге.</dd>

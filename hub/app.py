@@ -148,6 +148,7 @@ from hub.mcp_envelope import enrich_error_payload
 from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
 from hub.mcp_catalog import (
     catalog_snapshot,
+    view_summary,
     check_budget,
     load_baseline,
     load_budget,
@@ -1551,7 +1552,9 @@ async def api_mcp_usage(
     answers a 365-day question from a 120-day table would look complete and be
     wrong.
     """
-    catalog = await catalog_snapshot() if include_catalog else None
+    # Usage looks at the FULL catalog: a hidden tool nobody called is still a
+    # tool, and unused_tools must see it (#1624).
+    catalog = await catalog_snapshot("full") if include_catalog else None
     return await usage_report(_db(request), window_days=window_days, catalog=catalog)
 
 
@@ -1562,13 +1565,24 @@ async def api_mcp_catalog(request: Request):
     The same check CI runs, served live so the cost of the surface is visible
     without reading a workflow log.
     """
-    snapshot = await catalog_snapshot()
+    snapshot = await catalog_snapshot("agent")
     # measured is what makes the answer say how much of the declared headroom
     # is gone, not merely how much room is left (#832). Without it the API
     # reported nulls while CI printed real percentages — the same check
     # answering differently depending on where you looked at it.
     result = check_budget(snapshot, load_budget(), load_baseline(), load_measured())
-    return {**result, "tools_list": snapshot["tools_list"]}
+    # The budget and the top-level numbers are the AGENT view (what every agent
+    # turn pays). The human view is beside it, not mixed in (#1624).
+    full = await catalog_snapshot("full")
+    return {
+        **result,
+        "tools_list": snapshot["tools_list"],
+        "view": "agent",
+        "views": {
+            "agent": view_summary(snapshot),
+            "full": view_summary(full),
+        },
+    }
 
 
 @app.post("/api/metrics/category-checks")

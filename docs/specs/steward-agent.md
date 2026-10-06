@@ -126,7 +126,7 @@ sha; сдвинулся tip; диф вышел за заявленные обл�
    CI на pinned sha,             read-only на репозиторий, дедлайн прогона)
    diff vs areas, risk,                │
    AC + локаторы, red-base)            ▼
-        │                        hub_submit_steward_judgement(...)
+        │                        POST /api/tasks/{id}/steward-judgement (curl)
         │                        — только структурированный вердикт
         ▼                              │
   hub (детерминированный код): проверка жёстких предусловий
@@ -164,9 +164,9 @@ sha; сдвинулся tip; диф вышел за заявленные обл�
 
 ## 5. Контракт суждения
 
-`hub_submit_steward_judgement(task_id, generation, kind, verdict, grounds,
+`POST /api/tasks/{task_id}/steward-judgement` (тело: generation, kind, verdict, grounds,
 findings, closures, escalate_reason, confidence, model, tokens_spent,
-duration_ms)`
+duration_ms; MCP-инструмент удалён в #1624 — стюард в `/mcp` не допускается)
 
 - `kind`: `verdict` | `dor` | `disposition`. **`audit` в контракте нет**:
   выборочный аудит остаётся человеческим (§8), иначе стюард проверял бы
@@ -489,7 +489,7 @@ policy.values()`. До первого `act` нужно: расширить фи�
 **Эпик #994.** Стюард гейтов: суждение на грязном пути, человек как аудитор.
 
 - **F1 #995. Принципал и контракт.** Роль `steward`, закрытый allowlist,
-  `hub_submit_steward_judgement`, коды эскалаций, at-most-once, события,
+  `POST /api/tasks/{id}/steward-judgement`, коды эскалаций, at-most-once, события,
   исключение из human_gates + своя строка метрики. *(без единого
   автоматического действия — только запись)*
 - **F2 #996. Сбор доказательств.** Один сервис, собирающий пакет §4 из

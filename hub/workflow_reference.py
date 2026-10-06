@@ -145,6 +145,31 @@ HUMAN_ONLY_TOOLS: tuple[str, ...] = (
     "hub_start_task",
 )
 
+# Tools an agent token never sees in tools/list and cannot call (#1624): the six
+# human lifecycle gates. The REST routes stay the last defence (403); hiding is
+# for the context an agent pays on every turn. hub_create_project is human-only
+# too but deliberately not here — out of scope of #1624.
+AGENT_HIDDEN_TOOLS: frozenset[str] = frozenset(HUMAN_ONLY_TOOLS)
+
+# Where a human does what the hidden tool did. Agent-facing text names this
+# route, never the tool: the agent cannot call the tool, a person can open the
+# route (UI task card, `oc-hub`, or curl with a human token).
+HUMAN_ROUTES: dict[str, str] = {
+    "hub_approve_task": "POST /api/tasks/{id}/approve",
+    "hub_reject_task": "POST /api/tasks/{id}/reject",
+    "hub_decide_task": "POST /api/tasks/{id}/decide",
+    "hub_force_complete_task": "POST /api/tasks/{id}/force-complete",
+    "hub_answer_question": "POST /api/tasks/{id}/answer",
+    "hub_start_task": "POST /api/tasks/{id}/start",
+}
+
+
+def human_route(tool: str, task_id: int | str | None = None) -> str:
+    """The REST route of a human gate, with ``{id}`` filled when known."""
+    route = HUMAN_ROUTES[tool]
+    return route.replace("{id}", str(task_id)) if task_id is not None else route
+
+
 AGENT_COMPLETION_TOOL = "hub_report_done"
 
 LIFECYCLE_MAP_HEADER = "## Workflow reference"
@@ -220,11 +245,11 @@ def lifecycle_map_lines() -> list[str]:
         LIFECYCLE_MAP_HEADER,
         f"Hierarchy: {hierarchy_rules_prose()}.",
         (
-            "Gates: DoR at draft (hub_approve_task, human); "
+            "Gates: DoR at draft (human: POST /api/tasks/{id}/approve); "
             "CI at ci_check (poller); "
             "Review — Universal Review Gate: no completed without a current "
             "APPROVED review (auto_review=false is the explicit opt-out); "
-            "Decision at needs_decision (hub_decide_task, human)."
+            "Decision at needs_decision (human: POST /api/tasks/{id}/decide)."
         ),
         # Two actors, not one chain (#988). The gate line above used to read
         # "hub_submit_for_review → hub_get_review_brief → hub_submit_review",
@@ -245,15 +270,19 @@ def lifecycle_map_lines() -> list[str]:
             "refused."
         ),
         f"Agent completion: {AGENT_COMPLETION_TOOL} only (hub_task_update kind=done = deprecated alias).",
-        f"Human-only: {', '.join(HUMAN_ONLY_TOOLS)}.",
+        "Human gates are not in your tool list: a person acts through the hub "
+        "UI, oc-hub or the REST route named below; ask for it, do not retry.",
         "Transitions:",
     ]
     for transition in LIFECYCLE_TRANSITIONS:
         gate = transition.get("gate")
         gate_suffix = f" [{gate}]" if gate else ""
+        tool = str(transition["tool"])
+        # A human step is written as its route: the agent cannot call the tool.
+        actor = "human" if tool in AGENT_HIDDEN_TOOLS else str(transition["actor"])
+        via = HUMAN_ROUTES.get(tool, tool)
         lines.append(
-            f"  {transition['from']}→{transition['to']}: "
-            f"{transition['tool']} ({transition['actor']}){gate_suffix}"
+            f"  {transition['from']}→{transition['to']}: {via} ({actor}){gate_suffix}"
         )
     return lines
 
@@ -282,11 +311,12 @@ def build_mcp_instructions() -> str:
     """Full MCP server instructions including workflow discoverability."""
     return (
         "MCP server for Haiplane Hub — project state, tasks, proposals, decisions. "
-        "Agent canonical task completion: hub_report_done only (not hub_decide_task, "
-        "hub_force_complete_task, or hub_approve_task). hub_task_update kind=done is "
+        "Agent canonical task completion: hub_report_done only. "
+        "hub_task_update kind=done is "
         "a deprecated alias of hub_report_done with the same response contract. "
-        "Human-only tools: hub_decide_task, hub_approve_task, hub_reject_task, "
-        "hub_force_complete_task, hub_answer_question (human token), hub_start_task. "
+        "Human gates (approve, reject, decide, force-complete, answer, start) "
+        "are not tools here: a person uses the UI, oc-hub or "
+        "REST POST /api/tasks/{id}/<gate>. "
         "Lifecycle mutation tools return JSON with message plus envelope fields: status, "
         "awaiting (none|human_decision|ci|review), transition {from,to}|null, next_action, "
         "actor_hint (agent|human|ci|none). Every response also includes instance "

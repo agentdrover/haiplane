@@ -213,7 +213,7 @@ async def test_the_loop_has_a_ceiling(db: aiosqlite.Connection):
     ceiling = await _events(db, task_id, EVENT_CEILING)
     assert ceiling == [{"generation": generation, "reason": "statement_unchanged"}]
     last = (await _alerts(db, task_id))[-1]
-    assert "hub_approve_task" in last and "hub_reject_task" in last, (
+    assert "/approve" in last and "/reject" in last, (
         "человеку называются решения, которые у него есть"
     )
     for remark in TWO_REMARKS:
