@@ -4143,6 +4143,91 @@ async def test_no_fact_without_a_pair_that_concurred(db: aiosqlite.Connection):
     assert await _rows(db) == []
 
 
+async def _trigger_facts_for(
+    db: aiosqlite.Connection, task_id: int, other: int
+) -> None:
+    """Все четыре пути факта для задачи ``task_id``; ``other`` — чужая задача с парой."""
+    await _human(db, task_id, "changes_requested")
+    await _complete(db, task_id, "2026-09-01 10:00:00")
+    await repo.update_task(db, task_id, status="open")
+    await db.execute(
+        "INSERT INTO tasks (title, status, found_in, caused_by_task_id) "
+        "VALUES ('дефект вставкой', 'open', 'prod', ?)",
+        (task_id,),
+    )
+    defect = await _prod_defect(db, task_id)
+    assert defect
+    await db.commit()
+
+
+async def test_a_judgement_that_is_not_an_approve_of_the_new_contour_gives_no_fact(
+    db: aiosqlite.Connection,
+):
+    """Строки советника есть, но судья не approve или контур старый — пары нет, фактов нет.
+
+    По всем путям, включая вставку дефекта сразу с found_in и причиной.
+    """
+    project_id = await _project(db, "advisor-fa-not-a-pair")
+    not_approve = await _v2_row(
+        db, project_id, verdict="changes_requested", advisor="concur"
+    )
+    old_contour = await _v2_row(
+        db, project_id, verdict="approve", advisor="concur", contour=1
+    )
+    other = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    for task in (not_approve, old_contour):
+        await _trigger_facts_for(db, task, other)
+
+    assert await _rows(db) == []
+
+
+async def test_a_pair_of_another_task_gives_no_fact_to_this_one(
+    db: aiosqlite.Connection,
+):
+    """Пара есть у чужой задачи; факт по задаче без пары не пишется ни одним путём."""
+    project_id = await _project(db, "advisor-fa-other-task")
+    paired = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    bare = await _new_task(db)
+    await db.execute("UPDATE tasks SET project_id=? WHERE id=?", (project_id, bare))
+    await db.commit()
+
+    await _trigger_facts_for(db, bare, paired)
+
+    assert [r for r in await _rows(db) if r["task_id"] == bare] == []
+
+
+async def test_an_event_of_another_kind_is_not_a_return(db: aiosqlite.Connection):
+    """Только review_verdict_recorded: чужое событие с тем же словом в теле не возврат."""
+    project_id = await _project(db, "advisor-fa-kind")
+    task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    await repo.insert_event(
+        db,
+        kind="task_decided",
+        task_id=task_id,
+        actor="denis",
+        payload={"verdict": "changes_requested", "submission_generation": 1},
+    )
+    await db.commit()
+
+    assert await _rows(db) == []
+
+
+async def test_the_poll_ignores_a_return_of_an_earlier_generation_after_the_approval(
+    db: aiosqlite.Connection,
+):
+    """Опрос: возврат поколения 1 ПОСЛЕ одобрения поколения 2 пару не обвиняет."""
+    from hub.services.steward_exit import current_false_approvals
+
+    project_id = await _project(db, "advisor-fa-poll-earlier")
+    task_id = await _v2_row(
+        db, project_id, verdict="approve", advisor="concur", generation=2
+    )
+    await _without_triggers(db)
+    await _human(db, task_id, "changes_requested", generation=1)
+
+    assert await current_false_approvals(db) == []
+
+
 async def test_a_human_return_of_an_earlier_generation_is_not_the_pairs_error(
     db: aiosqlite.Connection,
 ):
