@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import select
 import shutil
 import signal
 import stat
@@ -137,6 +138,45 @@ def _wait_for(predicate, limit: float = 5.0) -> bool:
             return True
         time.sleep(0.02)
     return False
+
+
+def _await_output(proc, needle: str, limit: float = 10.0) -> str:
+    """Ждать строку в выводе процесса, не блокируясь: событие, а не sleep.
+
+    Читает ``proc.stdout`` через ``select`` и ``os.read`` — без буфера обёртки,
+    поэтому пустой вывод не вешает тест. Вернёт всё прочитанное; нет строки за
+    ``limit`` — пустая строка в ответе провалит assert вызывающего.
+    """
+    fd = proc.stdout.fileno()
+    seen = ""
+    end = time.monotonic() + limit
+    while needle not in seen and time.monotonic() < end:
+        ready, _, _ = select.select([fd], [], [], 0.1)
+        if not ready:
+            continue
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        seen += chunk.decode(errors="replace")
+    return seen
+
+
+def _close_stdin(proc) -> None:
+    """Закрыть stdin (EOF) так, чтобы ``communicate`` после этого работал."""
+    proc.stdin.close()
+    proc.stdin = None
+
+
+def _sleep_log(bin_dir: Path, log: Path) -> None:
+    """Заглушка sleep: пишет строку в ``log`` и спит по-настоящему.
+
+    Строка = «процесс дошёл до ожидания»: событие для теста вместо sleep.
+    """
+    shim = bin_dir / "sleep"
+    shim.write_text(
+        f'#!/bin/sh\necho "$$" >>{log}\nexec {shutil.which("sleep")} "$@"\n'
+    )
+    shim.chmod(0o755)
 
 
 def _write_marker(spool: Path, owner: str, ahead: int) -> bytes:
@@ -264,11 +304,114 @@ def test_no_active_jobs_or_no_spool_is_immediate(spool, bin_dir, tmp_path) -> No
 # ------------------------------------------------------------- extra guards
 
 
+def test_a_signal_right_after_the_marker_write_takes_it_back(
+    spool, bin_dir, tmp_path
+) -> None:
+    """AC-1 (#1595): TERM сразу после rename маркера не оставляет маркер.
+
+    Шим ``mv`` — окно гонки, без sleep: настоящий mv, затем TERM основному
+    процессу acquire (его PID тест присылает через FIFO) и сразу выход. Шим не
+    ждёт acquire: он держит замок через fd 9, а acquire ждёт подстановку.
+    Stdin acquire открыт до выхода процесса: EOF после TERM послал бы второй TERM и
+    оборвал бы уборку первого — это другая причина, не та, что проверяется.
+    """
+    job = _job(spool)
+    job_bytes = b'{"keep": "me"}'
+    (job / "job.json").write_bytes(job_bytes)
+    fifo = tmp_path / "pid.fifo"
+    os.mkfifo(fifo)
+    sent = tmp_path / "term-sent"
+    shim = bin_dir / "mv"
+    shim.write_text(
+        f'#!/bin/sh\n{shutil.which("mv")} "$@" || exit $?\n'
+        f'read -r pid <"{fifo}"\nkill -TERM "$pid"\n: >"{sent}"\n'
+    )
+    shim.chmod(0o755)
+    proc = subprocess.Popen(
+        ["bash", str(SCRIPT), "acquire"],
+        env=_env(spool, bin_dir, DRAIN_STDIN_LIVENESS="1", DRAIN_BUDGET_SECONDS="60"),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    # O_RDWR: запись не блокируется, пока шим ещё не открыл FIFO на чтение.
+    wfd = os.open(fifo, os.O_RDWR)
+    try:
+        os.write(wfd, f"{proc.pid}\n".encode())
+        confirmed = _wait_for(sent.exists, limit=15)
+        try:
+            # TERM подтверждён концом процесса; stdin всё это время открыт, иначе
+            # EOF пошлёт второй TERM и оборвёт уборку первого.
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        _close_stdin(proc)
+        out, _ = proc.communicate(timeout=15)
+    finally:
+        os.close(wfd)
+    assert confirmed, "шим не дошёл до отправки TERM"
+    assert proc.returncode == 143, (proc.returncode, out)
+    assert not (spool / "draining").exists(), "TERM в окне записи оставил маркер"
+    assert (job / "job.json").read_bytes() == job_bytes
+
+
+def test_an_early_stop_never_removes_a_foreign_marker(spool, bin_dir, tmp_path) -> None:
+    """AC-2 (#1595): (а) чужой маркер цел при TERM/EOF; (б) degraded без ожидания."""
+    log = tmp_path / "sleeps"
+    _sleep_log(bin_dir, log)
+    # (а) acquire ждёт чужой свежий маркер (poll-sleep = «ждёт»), его останавливают.
+    for stop in ("TERM", "EOF"):
+        log.write_text("")
+        before = _write_marker(spool, "deploy-other", 600)
+        proc = subprocess.Popen(
+            ["bash", str(SCRIPT), "acquire"],
+            env=_env(
+                spool, bin_dir, DRAIN_STDIN_LIVENESS="1", DRAIN_BUDGET_SECONDS="60"
+            ),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            assert _wait_for(lambda: log.read_text() != "", limit=15), "не ждёт"
+            if stop == "TERM":
+                proc.send_signal(signal.SIGTERM)
+            else:
+                _close_stdin(proc)
+            proc.communicate(timeout=15)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        assert (spool / "draining").read_bytes() == before, f"{stop}: чужой снят"
+        (spool / "draining").unlink()
+    # (б) замок занят дольше срока, свой прежний маркер стоит: degraded за срок,
+    # без ожидания CLEANUP_LOCK_WAIT, прежний маркер на месте.
+    own = _write_marker(spool, "deploy-test", 600)
+    fd = os.open(spool / ".drain.lock", os.O_RDWR | os.O_CREAT, 0o660)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        started = time.monotonic()
+        try:
+            done = _run(["acquire"], spool, bin_dir, timeout=15)
+        except subprocess.TimeoutExpired:
+            pytest.fail("cleanup ждёт замок: degraded-путь набрал лишнее ожидание")
+        elapsed = time.monotonic() - started
+    finally:
+        os.close(fd)
+    assert "drain degraded" in done.stdout and "замок" in done.stdout, done.stdout
+    assert elapsed < 2 + 3, f"замок занят, а срок превышен: {elapsed:.1f} с"
+    assert (spool / "draining").read_bytes() == own
+
+
 def test_a_signal_during_the_wait_removes_only_our_marker(spool, bin_dir) -> None:
     _job(spool)
     proc = _popen(["acquire"], spool, bin_dir, DRAIN_BUDGET_SECONDS="30")
-    assert _wait_for(lambda: (spool / "draining").exists())
-    time.sleep(0.3)
+    assert "маркер" in _await_output(proc, "поставлен"), "acquire не дошёл до ожидания"
+    assert (spool / "draining").exists()
     proc.send_signal(signal.SIGTERM)
     proc.communicate(timeout=10)
     assert not (spool / "draining").exists(), "убитый деплой оставил маркер"
@@ -300,13 +443,27 @@ def _parent_dies(proc) -> str:
 
 
 def test_the_marker_is_renewed_beyond_its_ttl_independently(spool, bin_dir) -> None:
-    """Продление живёт само по себе: acquire давно отработал, а маркер свеж."""
-    over = {"DRAIN_TTL_SECONDS": "2", "DRAIN_RENEW_SECONDS": "0.4"}
+    """Продление живёт само по себе: acquire давно отработал, а маркер свеж.
+
+    Числа заданы явно: TTL 4 с, раунд 0.5 с, ждём рост expires до 15 с, а
+    свежесть проверяем через 2 с после исходного срока (BEYOND). ``now()`` —
+    целые секунды, поэтому у живого продлителя запас в момент проверки не меньше
+    TTL - 1 (усечение) - 0.5 (возраст раунда) = 2.5 с: одна задержка раунда в
+    1-2 с его не роняет. Продлитель, умерший сразу после первого роста (expires
+    = исходный + 1 с), к проверке уже просрочен.
+    """
+    ttl, renew, growth, beyond = 4, 0.5, 15.0, 2
+    over = {"DRAIN_TTL_SECONDS": str(ttl), "DRAIN_RENEW_SECONDS": str(renew)}
     assert "drain ok" in _run(["acquire"], spool, bin_dir, **over).stdout
+    first = int(_marker(spool)["expires"])
     renewer = _renewer(spool, bin_dir, **over)
     try:
-        time.sleep(3.2)  # больше TTL: без продления маркер давно просрочен
-        assert int(_marker(spool)["expires"]) > time.time()
+        assert _wait_for(
+            lambda: int(_marker(spool)["expires"]) > first, limit=growth
+        ), "продлитель не продлил маркер"
+        # Исходный срок давно позади: без продления маркер уже просрочен.
+        assert _wait_for(lambda: time.time() > first + beyond, limit=ttl + growth)
+        assert int(_marker(spool)["expires"]) > time.time(), "маркер просрочен"
     finally:
         renewer.terminate()
         out, _ = renewer.communicate(timeout=10)
@@ -349,8 +506,11 @@ def test_a_dead_parent_is_seen_as_eof_and_the_marker_is_taken_back(
     spool, bin_dir
 ) -> None:
     assert "drain ok" in _run(["acquire"], spool, bin_dir).stdout
+    log = bin_dir.parent / "sleeps"
+    _sleep_log(bin_dir, log)
     renewer = _renewer(spool, bin_dir, DRAIN_RENEW_SECONDS="0.2")
-    time.sleep(0.5)
+    # Раунд продления сделан (продлитель дошёл до своего sleep) — тогда EOF.
+    assert _wait_for(lambda: log.exists() and log.read_text() != "", limit=15)
     assert (spool / "draining").exists()
     out = _parent_dies(renewer)
     assert "stopped by parent EOF" in out, out
@@ -381,6 +541,8 @@ def test_a_dead_parent_stops_a_waiting_acquire_and_frees_its_marker(
 
 
 def test_a_failed_renewal_is_named_degraded(spool, bin_dir) -> None:
+    log = bin_dir.parent / "sleeps"
+    _sleep_log(bin_dir, log)
     over = {
         "DRAIN_TTL_SECONDS": "2",
         "DRAIN_RENEW_SECONDS": "0.3",
@@ -389,17 +551,18 @@ def test_a_failed_renewal_is_named_degraded(spool, bin_dir) -> None:
     _run(["acquire"], spool, bin_dir, **over)
     renewer = _renewer(spool, bin_dir, **over)
     try:
-        time.sleep(0.5)  # видел свой маркер хотя бы раз
+        # Первое продление удалось: продлитель дошёл до sleep с маркером «своим».
+        assert _wait_for(lambda: log.exists() and log.read_text() != "", limit=15)
         fd = os.open(spool / ".drain.lock", os.O_RDWR)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            time.sleep(2.5)  # замок заняли — продлить нельзя
+            fcntl.flock(fd, fcntl.LOCK_EX)  # замок заняли — продлить нельзя
+            seen = _await_output(renewer, "не продлён", limit=15)
         finally:
             os.close(fd)
     finally:
         renewer.terminate()
         out, _ = renewer.communicate(timeout=10)
-    assert "drain degraded" in out and "не продлён" in out, out
+    assert "drain degraded" in seen + out and "не продлён" in seen + out, seen + out
 
 
 def test_release_removes_only_our_marker_and_recheck_uses_the_one_budget(
