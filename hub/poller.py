@@ -2252,6 +2252,25 @@ async def _clear_release_block(db, project_id: int, slug: str, now: str) -> None
     )
 
 
+async def _sweep_policy_schedule(db) -> None:
+    """Исполнить просроченные отложенные правки политики проекта (#1593).
+
+    Первым в тике: правка, назначенная на этот момент, должна действовать уже
+    для решений этого же прохода. Вся работа — в policy_change.run_due: запись
+    читается под write-локом, применяется общим с PATCH путём, итог
+    фиксируется в той же транзакции.
+    """
+    from hub.services import policy_change
+
+    for outcome in await policy_change.run_due(db):
+        log.info(
+            "Poll: scheduled policy change #%s — %s%s",
+            outcome["id"],
+            outcome["outcome"],
+            " (late)" if outcome.get("late") else "",
+        )
+
+
 async def _sweep_messages_retention(db) -> None:
     # Message retention (#773): the channel is for coordinating work in
     # flight, and the tasks themselves keep the record of what was done.
@@ -2310,6 +2329,7 @@ class Sweep:
 # place by nobody moving a line; here it is declared, and pinned by
 # test_the_sweep_order_is_pinned.
 SWEEPS: tuple[Sweep, ...] = (
+    Sweep("policy_schedule", _sweep_policy_schedule),
     Sweep("running_dispatch", _sweep_running_dispatch),
     Sweep("review", _sweep_review),
     Sweep("pair_delivery", _sweep_pair_delivery),

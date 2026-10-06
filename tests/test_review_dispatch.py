@@ -16843,9 +16843,10 @@ async def test_local_first_falls_back_to_cloud_while_draining(
     облака не получает 422 (запрет не живёт в review_reach), а просроченный
     маркер заказу не мешает.
     """
-    from fastapi import HTTPException
-
-    from hub.app import _refuse_unrunnable_review
+    from hub.services.policy_change import PolicyRefused
+    from hub.services.policy_change import (
+        refuse_unrunnable_review as _refuse_unrunnable_review,
+    )
     from hub.services.review_dispatch import review_reach, wait_for_local_runs
     from tests.test_diagnostics import _running_app
 
@@ -16881,9 +16882,9 @@ async def test_local_first_falls_back_to_cloud_while_draining(
         db, before, {"gate_policy": json.dumps({"review": "dispatch"})}
     )
     monkeypatch.setattr(config, "LOCAL_REVIEW_TRANSPORT", "direct")
-    with pytest.raises(HTTPException) as refused:
+    with pytest.raises(PolicyRefused) as refused:
         await _refuse_unrunnable_review(db, before, {"forge": "gitverse"})
-    assert refused.value.status_code == 422, "контроль: без пути запись отказывает"
+    assert refused.value.status == 422, "контроль: без пути запись отказывает"
     monkeypatch.setattr(config, "LOCAL_REVIEW_TRANSPORT", "runner")
 
     # local-first deep во время выкладки: облако, причина в карточке, локального
