@@ -116,19 +116,32 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
    `git ls-remote origin <ветка>` и сверка sha с `git rev-parse HEAD`. Хаб
    читает `origin/<ветка>`, и сдача закрепляет именно то, что там лежит
    (`resolve_branch_tip`).
-3. CI на этом sha. Workflow `.github/workflows/ci.yml` запускается на
-   `pull_request`, на push в `main`/`develop` и вручную (`workflow_dispatch`);
-   пуш ветки задачи без PR прогона не создаёт, поэтому до сдачи прогона CI может
-   не быть. До сдачи опирайтесь на локальные проверки (пункт 5). Прогон CI
-   смотрите после открытия PR, по нужному sha, не по «последнему»: хаб
-   подхватывает отчёт прогона для закреплённого коммита
-   (`adopt_ci_run_report`).
+3. CI на этом sha до сдачи. Хаб не ждёт CI (#1405, `review_ci_gate`,
+   `docs/agent-context/invariants.md`): ревью заказывается сразу при сдаче по
+   отчёту CI о закреплённом sha, который есть в этот момент. Нет отчёта: заказ
+   идёт без него, в ленте событие `review_ordered_without_ci`, а поздний отчёт
+   ревью не перезаказывает. Красный отчёт: ревью не покупается, событие
+   `review_withheld_red_ci`. Поэтому:
+   - запустите CI на ветке: `gh workflow run ci.yml --ref <ветка>`. Триггер
+     `workflow_dispatch`; пуш ветки без PR прогона не создаёт (`ci.yml` слушает
+     `pull_request`, push в `main`/`develop` и `workflow_dispatch`);
+   - дождитесь конца прогона на нужном sha: `gh run list`, `gh run watch`, сверка
+     `headSha` с `git rev-parse HEAD`;
+   - красный прогон: не сдавайте, сначала чините и пушьте заново;
+   - только потом `hub_submit_for_review`. Сдача подхватит сохранённый отчёт для
+     закреплённого коммита (`lifecycle`, `ci_report.adopt_ci_run_report`), в
+     ленте будет «CI run report adopted for this commit»;
+   - до закрепления sha бриф показывает `ci_run_report` = `unknown`: это
+     нормально, итог прогона смотрите в GitHub.
+   Источник: событие `review_ordered_without_ci` и случай #1602 06.10 (по
+   ленте #1602: ревью заказано в 14:48, отчёт CI в 14:58).
 4. На ядре хаба (lifecycle, схема, DoR, интеграции) сначала критик Codex, правка
    P1/P2 одним кругом, затем одна сдача. Источник: правило владельца от 06.10
    (постановка #1612); это правило процесса, кодом хаба оно не проверяется. Запуск:
    `codex exec` в режиме read-only со stdin, закрытым `< /dev/null`.
 5. Локальные проверки до сдачи: `make lint types budget security` и `uv run pytest -q`
-   смотрите по коду возврата, не по хвосту вывода.
+   смотрите по коду возврата, не по хвосту вывода. Они не заменяют CI из
+   пункта 3.
 
 ## 6. CLI называется `hp-hub`
 
