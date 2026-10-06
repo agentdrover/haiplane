@@ -178,51 +178,68 @@ uv run ruff check hub tests
 > процесса: для службы ревьюера после замены файла нужен перезапуск службы.
 > Подробности и пример значения: `deploy/CD.md`, раздел про серверные копии.
 
-Запускать из корня локального репозитория:
+Ручной путь идёт тем же скриптом, что и авто-деплой, — самостоятельной
+последовательности `pip install -e` и restart здесь больше нет (#1620): она не
+знала про drain (#1588), снимок базы (#1590) и ставила зависимости с
+разрешением версий, мимо `uv.lock`. Локальный этап — **один скрипт под
+`set -euo pipefail`**, а не набор команд для копирования: ошибка
+`uv lock --check` или любого экспорта обрывает его ДО rsync и до серверной
+части (в интерактивном shell отдельные команды шли бы дальше и отправили бы
+экспорт по неактуальному lock). Нужны `uv` версии из `.github/workflows/ci.yml`
+(сейчас 0.12.18), Python 3.11 и `DEPLOY_USER`, `DEPLOY_HOST` в окружении
+(`STAGING_DIR`, `SSH_OPTS` — по необходимости). Из корня репозитория **на
+коммите, который выкатывается**:
 
 ```bash
-rsync -az --delete \
-  --exclude '.venv' \
-  --exclude '__pycache__' \
-  --exclude '.pytest_cache' \
-  --exclude '*.pyc' \
-  --exclude '.git' \
-  <LOCAL_REPO>/ \
-  <DEPLOY_USER>@<DEPLOY_HOST>:<STAGING_DIR>/
-
-ssh <DEPLOY_USER>@<DEPLOY_HOST> 'bash -s' <<'REMOTE'
-set -euo pipefail
-STAGING="<STAGING_DIR>"
-DEST=/opt/<SERVICE>/src
-
-sudo rsync -a --delete "$STAGING/" "$DEST/"
-sudo chown -R <RUNTIME_USER>:<RUNTIME_USER> "$DEST"
-sudo -u <RUNTIME_USER> /opt/<SERVICE>/venv/bin/pip install -e "$DEST" -q
-sudo systemctl restart <SERVICE>
-sleep 2
-sudo systemctl is-active <SERVICE>
-curl -sf -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/healthz
-REMOTE
+scripts/manual_deploy.sh
 ```
 
-> **Ручной путь выше идёт прямо к restart и drain локальных ревью (#1588) не
-> вызывает: гарантия «деплой ждёт идущие прогоны» на него не распространяется.**
-> Чтобы выкатить с ожиданием, после rsync в staging запустите серверную часть
-> скриптом: `ssh <DEPLOY_USER>@<DEPLOY_HOST> 'bash -s' < deploy/remote-deploy.sh`
-> (он вызывает drain до rsync из staging). Перед ручным restart без drain
-> убедитесь, что локальный deep не идёт: в каталоге очереди нет `job-*` с
-> `job.json` или `claimed` без `result.json`.
+Скрипт делает ровно то же, что job `deploy`: `uv lock --check`, два
+хешированных экспорта, сборка дерева staging с `.deploy-sha`, rsync и
+`ssh ... 'bash -s' < deploy/remote-deploy.sh`.
+
+**Откат на коммит до #1620.** У такого коммита нет группы `build` в `uv.lock`
+(`uv export --only-group build` падает: «Group build is not defined»), а его
+собственный `remote-deploy.sh` ставил бы зависимости с разрешением версий. Поэтому
+старый коммит выкатывается ТЕКУЩИМ скриптом и ТЕКУЩИМ build-набором:
+
+```bash
+# из актуального чекаута (канонические скрипты и build-набор берутся отсюда)
+uv export --frozen --only-group build --no-emit-project --format requirements-txt --no-header -o /tmp/requirements.build.txt
+git worktree add /tmp/rollback-tree <старый-коммит>      # отдельный каталог
+scripts/manual_deploy.sh --build-set /tmp/requirements.build.txt /tmp/rollback-tree
+```
+
+Runtime-набор скрипт экспортирует из lock старого коммита; hatchling и editables
+с хешами берутся из переданного файла (совместимый набор из текущего lock);
+`remote-deploy.sh`, `review-drain.sh` и `predeploy-backup.py` в staging заменяются
+каноническими, поэтому drain, снимок базы и установка без разрешения зависимостей
+сохраняются. Без `--build-set` для такого дерева скрипт отказывает до rsync.
+Для коммитов после #1620 флаг не нужен.
+
+Порядок на сервере: проверка `requirements.runtime.txt`, `requirements.build.txt`
+и `uv.lock` в staging (нет файла — отказ до любых изменений) → drain → снимок
+базы → rsync → `pip install --require-hashes --only-binary=:all: --no-deps`
+обоих наборов → `pip install --no-deps --no-build-isolation -e` приложения →
+повторная проверка drain → restart → health. Строка `deps: N пакетов (runtime
+M, build K) по экспортам sha256 … из uv.lock sha256 …` в логе говорит, что
+именно поставлено.
+
+> **Контракт отказа (#1620).** Любой отказ установки (хеш не сошёлся, нет
+> колеса под Python/платформу сервера, приложение не собралось) происходит до
+> restart: работающий процесс остаётся прежним. pip не транзакционен, поэтому
+> исходники в `/opt/<SERVICE>/src` и venv **могут быть изменены частично**;
+> автоматического отката нет. Откат — прогон этого же пути для предыдущего
+> коммита тем же `scripts/manual_deploy.sh` (для коммита до #1620 — с
+> `--build-set`, см. выше): он возьмёт экспорт из ЕГО `uv.lock` и поставит ЕГО
+> runtime-набор. Пакеты, которые уже стоят в venv и не входят в
+> набор, не удаляются. Обхода нет: переменной, возвращающей `pip install -e` с
+> разрешением зависимостей, не существует, а неверные хеши не обходятся.
 >
-> **Проверенный снимок базы (#1590) этот ручной путь тоже не делает.** Он идёт
-> прямо к restart без снимка: миграция при старте может испортить базу без
-> точки отката. Выкатывайте серверной частью (`bash -s` из
-> `deploy/remote-deploy.sh`, он снимет `predeploy-*.db.gz` до rsync и не
-> перезапустит хаб, если снимок не удался) или снимите копию сами до restart:
-> `sudo -u <RUNTIME_USER> /opt/<SERVICE>/venv/bin/python -c "import sqlite3,sys;
-> s=sqlite3.connect('file:<DB>?mode=ro',uri=True); d=sqlite3.connect(sys.argv[1]);
-> s.backup(d); print(d.execute('PRAGMA integrity_check').fetchall()); d.close()"
-> <файл>` (результат `[('ok',)]`). Закреплённую копию `remote-deploy.sh` при #1590
-> обновляйте так же, как при #1588 (команды выше).
+> Перед ручным restart без этого скрипта убедитесь, что локальный deep не идёт:
+> в каталоге очереди нет `job-*` с `job.json` или `claimed` без `result.json`.
+> Снимок базы (#1590) скрипт делает сам; закреплённую копию `remote-deploy.sh`
+> обновляйте так же, как при #1588 (команды выше): при #1620 он изменился снова.
 
 Критерии успеха:
 
