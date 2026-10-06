@@ -93,6 +93,29 @@ async def _say_once(
     await db.commit()
 
 
+async def _pinned_ci(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[Any, list[str]]:
+    """Отчёт CI о закреплённом коммите и названия упавших проверок. Только чтение."""
+    sha = (task.get("submission_sha") or "").strip()
+    report = await repo.get_ci_run_report(db, int(task["id"]), sha)
+    return report, ([] if report is None else failed_checks(dict(report)))
+
+
+async def ci_forbids_review(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> list[str]:
+    """Упавшие проверки, из-за которых ревью не купят; пусто — купят.
+
+    То же решение, что у ``review_may_be_bought``, но БЕЗ записей в ленту
+    (#1600): им пользуется читатель ожидания судьи стюарда, а читатель не
+    пишет. Записывает отказ только диспетчер.
+    """
+    if (task.get("machine_review_override") or "").strip() == "require":
+        return []
+    return (await _pinned_ci(db, task))[1]
+
+
 async def review_may_be_bought(
     db: aiosqlite.Connection, task: dict[str, Any], project: Any
 ) -> bool:
@@ -102,7 +125,7 @@ async def review_may_be_bought(
     task_id = int(task["id"])
     generation = int(task.get("submission_generation") or 0)
     sha = (task.get("submission_sha") or "").strip()
-    report = await repo.get_ci_run_report(db, task_id, sha)
+    report, failed = await _pinned_ci(db, task)
     if report is None:
         await _say_once(
             db,
@@ -118,7 +141,6 @@ async def review_may_be_bought(
             ),
         )
         return True
-    failed = failed_checks(dict(report))
     if not failed:
         return True
     # Красный отказывает любому входу, и добору тоже (c609380e10b71078). Если
