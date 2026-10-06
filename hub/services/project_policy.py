@@ -841,9 +841,12 @@ def stored_policy_or_none(project: Any) -> dict | None:
 
 def freeze_of(policy: dict) -> Freeze | None:
     """Заморозка уже прочитанной политики; ``None``, когда ключа нет."""
-    raw = policy.get(FREEZE_KEY) if isinstance(policy, dict) else None
-    if raw is None:
+    if not isinstance(policy, dict) or FREEZE_KEY not in policy:
         return None
+    # Ключ ЕСТЬ: значение null, не объект или битое - сохранённая заморозка,
+    # которую не разобрали, и допуск закрыт. «Снять» значит УДАЛИТЬ ключ
+    # (PATCH {"freeze": null} его удаляет и null не сохраняет).
+    raw = policy[FREEZE_KEY]
     try:
         canon = validated_freeze(raw)
         return Freeze(

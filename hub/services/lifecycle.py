@@ -1049,11 +1049,12 @@ async def create_task(
     if run_held:
         initial_status = "open"
 
+    owns_tx = not db.in_transaction
     try:
         # #1594: write-лок берётся ДО чтения политики проекта. Допуск заморозки
         # и вставка - одна транзакция: правка политики между ними иначе
         # пропускала бы работу, запрещённую уже действующей заморозкой.
-        if not db.in_transaction:
+        if owns_tx:
             await db.execute("BEGIN IMMEDIATE")
         if idem_key:
             existing = await repo.get_task_idempotency_key(db, idem_key)
@@ -1115,7 +1116,8 @@ async def create_task(
 
         await db.commit()
     except HTTPException:
-        await db.rollback()
+        if owns_tx:
+            await db.rollback()
         raise
     except aiosqlite.IntegrityError:
         await db.rollback()
@@ -1309,12 +1311,31 @@ async def create_subtasks_bulk(
     return views
 
 
+@contextlib.asynccontextmanager
+async def _local_rollback(db: aiosqlite.Connection) -> AsyncIterator[None]:
+    """Откат только своей работы внутри чужой транзакции (SAVEPOINT).
+
+    Владелец транзакции - вызывающий: мы её не коммитим и не откатываем целиком,
+    а при отказе возвращаем лишь то, что записали сами (#1594).
+    """
+    await db.execute("SAVEPOINT approve_local")
+    try:
+        yield
+    except BaseException:
+        await db.execute("ROLLBACK TO SAVEPOINT approve_local")
+        await db.execute("RELEASE SAVEPOINT approve_local")
+        raise
+    else:
+        await db.execute("RELEASE SAVEPOINT approve_local")
+
+
 async def _open_draft_under_lock(
     db: aiosqlite.Connection,
     task_id: int,
     task: dict[str, Any],
     body: TaskApprove,
     readiness: Any,
+    caller_owns_tx: bool = False,
 ) -> str | None:
     """Допуск заморозки, DoR-override и переход draft -> open одной транзакцией.
 
@@ -1325,7 +1346,8 @@ async def _open_draft_under_lock(
     запрещённую работу. Отказ откатывает всё, включая запись override.
     Возвращает сводку DoR-override (или None).
     """
-    async with write_transaction(db):
+    scope = _local_rollback(db) if caller_owns_tx else write_transaction(db)
+    async with scope:
         fresh = await repo.get_task(db, task_id)
         if fresh is None or fresh["status"] != "draft":
             raise HTTPException(409, "task is no longer draft (concurrent approve?)")
@@ -1435,6 +1457,8 @@ async def approve_task(
     ``alert`` updates and tagged in the activity log so the audit trail
     stays intact.
     """
+    # Транзакцию, уже открытую вызывающим, не коммитим и не начинаем заново.
+    caller_owns_tx = db.in_transaction
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -1466,10 +1490,10 @@ async def approve_task(
     )
 
     readiness = await calculate_readiness_with_recommendations(db, task_id)
-    if db.in_transaction:
+    if db.in_transaction and not caller_owns_tx:
         await db.commit()
     dor_override_summary = await _open_draft_under_lock(
-        db, task_id, task, body, readiness
+        db, task_id, task, body, readiness, caller_owns_tx
     )
 
     # #1264: the approval stands; only the run waits for the review queue.

@@ -1518,3 +1518,147 @@ async def test_bulk_policy_read_happens_while_the_write_lock_is_held(
     assert seen["held"], "политика читается под write-локом, а не до него"
     await asyncio.gather(*_RACERS)
     _RACERS.clear()
+
+
+# --- #1594, круг 3: сохранённое null и чужая транзакция ----------------------
+
+
+async def test_stored_null_freeze_closes_admission_and_patch_null_removes_it(
+    client: AsyncClient, db
+):
+    from hub import repository as repo
+    from tests.test_auto_approve import _project
+
+    default = await _project(db, "default", {})
+    pid = await _project(db, "null-freeze", {})
+    parent = (
+        await client.get(
+            f"/api/tasks/{await _ready_draft(client, db, pid, work_type='bug', rationale='x')}"
+        )
+    ).json()["parent_id"]
+    feature = await _ready_draft(client, db, pid, work_type="feature", rationale="")
+    for value in ('{"freeze": null}', '{"freeze": "off"}', '{"freeze": []}'):
+        await repo.update_project(db, pid, gate_policy=value)
+        await repo.update_project(db, default, gate_policy=value)
+        await db.commit()
+        approve = await client.post(f"/api/tasks/{feature}/approve")
+        assert approve.status_code == 422, (value, approve.text)
+        assert approve.json()["detail"]["error"] == "freeze_refused"
+        create = await client.post(
+            "/api/tasks", json={"title": "t", "task_type": "task", "parent_id": parent}
+        )
+        assert create.status_code == 422, (value, create.text)
+        bulk = await client.post(
+            f"/api/tasks/{parent}/subtasks",
+            json={"task_type": "task", "source": "human", "items": [{"title": "b"}]},
+        )
+        assert bulk.status_code == 422, (value, bulk.text)
+        assert await _status(client, feature) == "draft"
+
+    # законное снятие УДАЛЯЕТ ключ, и допуск как без заморозки
+    await repo.update_project(db, pid, gate_policy=json.dumps({"freeze": FREEZE}))
+    await db.commit()
+    assert (await client.post(f"/api/tasks/{feature}/approve")).status_code == 422
+    removed = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"freeze": None}}
+    )
+    assert removed.status_code == 200, removed.text
+    stored = json.loads((await repo.get_project(db, pid))["gate_policy"])
+    assert "freeze" not in stored
+    assert (await client.post(f"/api/tasks/{feature}/approve")).status_code == 200
+
+
+async def _project_name(db, pid: int) -> str:
+    rows = await db.execute_fetchall("SELECT name FROM projects WHERE id=?", (pid,))
+    return rows[0][0]
+
+
+async def test_approval_leaves_the_callers_transaction_to_the_caller(
+    client: AsyncClient, db
+):
+    # Отказ approve не коммитит чужую транзакцию: rollback вызывающего
+    # отменяет его правку; успех оставляет коммит вызывающему.
+    from fastapi import HTTPException
+
+    from hub.services import lifecycle
+    from tests.test_auto_approve import _project
+
+    pid = await _project(db, "caller-tx", {})
+    unready = await _ready_draft(
+        client, db, pid, work_type="feature", rationale="", ready=False
+    )
+    good = await _ready_draft(client, db, pid, work_type="bug", rationale="сбой")
+
+    await db.execute("BEGIN IMMEDIATE")
+    await db.execute("UPDATE projects SET name='changed' WHERE id=?", (pid,))
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.approve_task(db, unready)
+    assert refused.value.status_code == 422
+    assert db.in_transaction, "отказ не закрыл транзакцию вызывающего"
+    await db.rollback()
+    assert await _project_name(db, pid) == "Caller-Tx"
+    assert await _status(client, unready) == "draft"
+
+    await db.execute("BEGIN IMMEDIATE")
+    await db.execute("UPDATE projects SET name='kept' WHERE id=?", (pid,))
+    approved = await lifecycle.approve_task(db, good)
+    assert approved.status.value == "open"
+    await db.commit()
+    assert await _project_name(db, pid) == "kept"
+    assert await _status(client, good) == "open"
+
+
+async def test_frozen_refusals_leave_the_callers_transaction_alone(
+    client: AsyncClient, db
+):
+    from fastapi import HTTPException
+
+    from hub.models import TaskCreate
+    from hub.services import lifecycle
+    from tests.test_auto_approve import _project
+
+    pid = await _project(db, "caller-freeze", {"freeze": FREEZE})
+    feature = await _ready_draft(client, db, pid, work_type="feature", rationale="x")
+    parent = (await client.get(f"/api/tasks/{feature}")).json()["parent_id"]
+    await db.execute("BEGIN IMMEDIATE")
+    await db.execute("UPDATE projects SET name='changed' WHERE id=?", (pid,))
+    with pytest.raises(HTTPException):
+        await lifecycle.approve_task(db, feature)
+    with pytest.raises(HTTPException):
+        await lifecycle.create_task(
+            db, TaskCreate(title="t", task_type="task", parent_id=parent)
+        )
+    assert db.in_transaction
+    await db.rollback()
+    assert await _project_name(db, pid) == "Caller-Freeze"
+
+
+async def test_failed_approval_undoes_only_its_own_writes_in_the_callers_transaction(
+    client: AsyncClient, db, monkeypatch
+):
+    from fastapi import HTTPException
+
+    from hub import repository as repo
+    from hub.models import TaskApprove
+    from hub.services import lifecycle
+    from tests.test_auto_approve import _project
+
+    pid = await _project(db, "caller-savepoint", {})
+    unready = await _ready_draft(
+        client, db, pid, work_type="bug", rationale="x", ready=False
+    )
+
+    async def fail_transition(*_a, **_k):
+        raise HTTPException(409, "task is no longer draft (concurrent approve?)")
+
+    monkeypatch.setattr(repo, "transition_status_if", fail_transition)
+    await db.execute("BEGIN IMMEDIATE")
+    await db.execute("UPDATE projects SET name='mine' WHERE id=?", (pid,))
+    with pytest.raises(HTTPException):
+        # force пишет запись override до перехода; отказ перехода её возвращает
+        await lifecycle.approve_task(db, unready, TaskApprove(force=True))
+    assert db.in_transaction
+    assert await _project_name(db, pid) == "mine", "правка вызывающего на месте"
+    notes = await repo.get_task_updates(db, unready)
+    assert not [n for n in notes if "override" in n["content"]]
+    await db.rollback()
