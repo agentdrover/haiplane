@@ -97,7 +97,11 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
 1. Коммит сделан, дерево чистое. Хук `.githooks/pre-push` отказывает в пуше с
    грязным деревом и из ветки с именем вне `task-*/*`, `fix/*`, `chore/*`,
    `docs/*`, `ci/*`, `dependabot/*`.
-2. Пуш полным refspec: `git push origin HEAD:refs/heads/<task-N/slug>`; затем
+2. Пуш полным refspec из ветки с каноническим именем:
+   `git push origin "refs/heads/${B}:refs/heads/${B}"`, где `B` - имя ветки
+   задачи. Форма `HEAD:refs/heads/...` хук отвергает: он читает локальную ссылку
+   `HEAD`, а не имя ветки (проверено пушем: «Blocked push from branch 'HEAD'»).
+   Затем
    `git ls-remote origin <ветка>` и сверка sha с `git rev-parse HEAD`. Хаб
    читает `origin/<ветка>`, и сдача закрепляет именно то, что там лежит
    (`resolve_branch_tip`).
