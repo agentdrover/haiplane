@@ -15,7 +15,6 @@ import asyncio
 import logging
 import os
 from collections.abc import Collection
-from pathlib import Path
 from typing import Any
 
 from hub.config import WORKSPACE_REPO_LINK
@@ -49,11 +48,16 @@ HUB_GIT_EMAIL = "hub@haiplane.local"
 
 
 def git_env() -> dict[str, str]:
-    """Build env dict with SSH key for GitHub push."""
+    """Build the env every hub git call runs in."""
     env = os.environ.copy()
-    ssh_key = Path.home() / ".ssh" / "id_ed25519"
-    if ssh_key.exists():
-        env["GIT_SSH_COMMAND"] = f"ssh -i {ssh_key} -o StrictHostKeyChecking=accept-new"
+    # #1625: no `-i`. An explicit identity is offered FIRST, before whatever
+    # ~/.ssh/config says for the host, and GitHub accepts it as the deploy key of
+    # one repository and answers "not found" for every other private one, so the
+    # second project's key never got tried. ssh already offers ~/.ssh/id_ed25519
+    # by default; a project that needs its own key gets a `Host` alias with
+    # `IdentityFile` + `IdentitiesOnly yes` (docs/agent-deploy-runbook.md).
+    # setdefault: a deployment that declares its own transport keeps it.
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o StrictHostKeyChecking=accept-new")
     # #377: anonymous https against a private repo must fail fast, not hang
     # waiting for credentials on a headless server.
     env["GIT_TERMINAL_PROMPT"] = "0"
