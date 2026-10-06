@@ -8,6 +8,7 @@ import re
 import time
 import urllib.parse
 from datetime import UTC, datetime
+from collections.abc import Callable
 from typing import Annotated, Any, Literal
 
 from pydantic import BeforeValidator
@@ -1120,7 +1121,6 @@ def _drop_generated_titles(tool_name: str, fields: tuple[str, ...]) -> None:
 
 
 _drop_generated_titles("hub_list_tasks", ("limit", "after_id", "mode"))
-_drop_generated_titles("hub_task_status", ("task_id", "updates", "full"))
 
 
 def _dependency_lines(task: dict[str, Any]) -> list[str]:
@@ -1370,13 +1370,18 @@ def _update_line(u: dict[str, Any]) -> str:
     )
 
 
+def _full_update_line(u: dict[str, Any]) -> str:
+    """The feed line exactly as it was before #1613: no id."""
+    return f"  [{u['created_at']}] ({u['kind']}) {u.get('agent', '')}: {u['content']}"
+
+
 def _status_tail_lines(
-    task: dict[str, Any], updates: list[dict[str, Any]]
+    updates: list[dict[str, Any]], line: Callable[[dict[str, Any]], str]
 ) -> list[str]:
     parts: list[str] = []
     if updates:
         parts.append("\nUpdates:")
-        parts.extend(_update_line(u) for u in updates)
+        parts.extend(line(u) for u in updates)
     return parts
 
 
@@ -1400,7 +1405,7 @@ def _full_status_text(task: dict[str, Any]) -> str:
         parts.append(f"\nLifecycle: {task['lifecycle_hint']}")
     parts.extend(_status_review_lines(task))
     parts.extend(_status_ac_lines(task))
-    parts.extend(_status_tail_lines(task, task.get("updates") or []))
+    parts.extend(_status_tail_lines(task.get("updates") or [], _full_update_line))
     parts.extend(_status_log_lines(task, task.get("result_text") or ""))
     return "\n".join(parts)
 
@@ -1437,7 +1442,7 @@ def _compact_status_text(task: dict[str, Any], view: dict[str, Any]) -> str:
     if task.get("lifecycle_hint"):
         parts.append(f"\nLifecycle: {task['lifecycle_hint']}")
     parts.extend(_status_review_lines(task))
-    parts.extend(_status_tail_lines(task, view["updates"]))
+    parts.extend(_status_tail_lines(view["updates"], _update_line))
     parts.extend(_status_log_lines(task, texts.get("result_text", "")))
     parts.extend(["", *bounds_lines(view["bounds"])] if view["bounds"] else [])
     return "\n".join(parts)
@@ -1454,7 +1459,7 @@ async def hub_task_status(
         updates: newest entries shown; -1 all, 0 none
         full: whole task and feed
     """
-    if updates < -1:
+    if updates < -1 and not full:
         raise HubApiError(
             {
                 "reason": "invalid_updates",
@@ -1476,6 +1481,9 @@ async def hub_task_status(
     return structured_tool_result(
         _compact_status_text(task, view), HubTaskStatusStructured(task=view["card"])
     )
+
+
+_drop_generated_titles("hub_task_status", ("task_id", "updates", "full"))
 
 
 @mcp.tool()

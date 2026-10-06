@@ -5544,3 +5544,140 @@ async def test_the_compact_task_card_keeps_the_required_fields(
 
     called = await srv.mcp.call_tool("hub_task_status", {"task_id": 1613})
     assert isinstance(called, (CallToolResult, tuple, list, dict))
+
+
+def _golden_task() -> dict[str, Any]:
+    """Fixture whose full=true text was captured from develop (74d48f5)."""
+    return {
+        "id": 321,
+        "title": "Golden",
+        "status": "review",
+        "source": "agent",
+        "runtime": "auto",
+        "assigned_agent": "tester",
+        "job_id": None,
+        "exit_code": None,
+        "auto_review": True,
+        "review_cycle": 1,
+        "created_at": "2026-01-01T00:00:00Z",
+        "description": "Describe it.",
+        "technical_hints": "Look here.",
+        "scope_in": ["a", "b"],
+        "scope_out": ["c"],
+        "validation_commands": ["uv run pytest -q"],
+        "lifecycle_hint": "waiting for ci",
+        "latest_review": {
+            "verdict": "changes_requested",
+            "submission_generation": 2,
+            "is_current": True,
+            "findings": [{"id": 1, "severity": "high", "message": "Fix"}],
+        },
+        "acceptance_criteria": [
+            {
+                "id": "AC-1",
+                "verifiable_by": "test",
+                "given": "g",
+                "when": "w",
+                "then": "t",
+            }
+        ],
+        "updates": [
+            {
+                "id": 7,
+                "created_at": "2026-01-02T00:00:00Z",
+                "kind": "status",
+                "agent": "a1",
+                "content": "one",
+            },
+            {
+                "id": 8,
+                "created_at": "2026-01-03T00:00:00Z",
+                "kind": "report",
+                "agent": "",
+                "content": "two",
+            },
+        ],
+        "result_text": "Done.",
+        "log_tail": ["l1", "l2"],
+    }
+
+
+_GOLDEN_FULL_TEXT = "Task #321: Golden\nStatus: review\nSource: agent\nRuntime: auto\nAgent: tester\nJob ID: None\nExit code: None\nReview: enabled, cycle 1\nCreated: 2026-01-01T00:00:00Z\n\nDescription:\nDescribe it.\n\nTechnical hints:\nLook here.\n\nScope:\n  In: a; b\n  Out: c\n\nValidation commands:\n  - uv run pytest -q\n\nLifecycle: waiting for ci\n\nLatest review: CHANGES_REQUESTED for submission #2 (current)\n  1. [high] Fix\n\nAcceptance criteria:\n  AC-1 [test]\n    Given: g\n    When: w\n    Then: t\n\nUpdates:\n  [2026-01-02T00:00:00Z] (status) a1: one\n  [2026-01-03T00:00:00Z] (report) : two\n\nResult:\nDone.\n\nLog tail:\nl1\nl2"
+
+
+async def test_full_text_is_the_text_develop_produced(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """#1613: full=true keeps the pre-change text byte for byte (reference
+    captured from develop 74d48f5, not produced by the code under test) —
+    including the id-less feed line — and checks no updates bound at all."""
+    mock_api_get.return_value = _golden_task()
+    for kwargs in ({"full": True}, {"full": True, "updates": -2}):
+        out = await hub_task_status(321, **kwargs)
+        assert json.loads(_mcp_text(out))["message"] == _GOLDEN_FULL_TEXT
+        assert _mcp_structured(out)["task"] == _golden_task()
+    with pytest.raises(HubApiError):
+        await hub_task_status(321, updates=-2)
+
+
+async def test_the_text_says_when_findings_are_cut_at_ten(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    task = _golden_task()
+    task["latest_review"]["findings"] = [
+        {"id": i, "severity": "low", "message": f"finding-{i}"} for i in range(1, 51)
+    ]
+    mock_api_get.return_value = task
+    out = await hub_task_status(321)
+    text = _mcp_text(out)
+    assert "finding-10" in text and "finding-11" not in text
+    assert "[bounded] latest_review.findings 10/50 items — full: full=true" in text
+    # The card keeps the whole latest_review (equal to REST), so it states no cut.
+    card = _mcp_structured(out)["task"]
+    assert len(card["latest_review"]["findings"]) == 50
+    assert all(b["field"] != "latest_review.findings" for b in card["bounds"])
+
+
+async def test_bounds_count_what_was_cut_in_one_stated_unit(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    task = _golden_task()
+    task["description"] = "x" * 1490 + " " * 40 + "tail" * 10  # blank run at the cut
+    task["updates"][1]["content"] = "L" * 2000
+    mock_api_get.return_value = task
+    out = await hub_task_status(321)
+    text = json.loads(_mcp_text(out))["message"]
+    card = _mcp_structured(out)["task"]
+
+    # (a) the cut entry is counted in characters of THAT entry
+    entry = next(b for b in card["bounds"] if b["field"] == "updates[#8].content")
+    assert (entry["unit"], entry["shown"], entry["total"]) == ("chars", 800, 2000)
+    assert "[bounded] updates[#8].content 800/2000 chars" in text
+    assert not any(b["field"] == "updates.content" for b in card["bounds"])
+
+    # (b) text and card state their own cuts: the card has no description at all
+    desc_text = "[bounded] description 1500/1570 chars"
+    assert desc_text in text
+    in_card = next(b for b in card["bounds"] if b["field"] == "description")
+    assert (in_card["shown"], in_card["total"]) == (0, 1570)
+    assert "description" not in card
+    # a short field is absent from the card too — and named
+    hints = next(b for b in card["bounds"] if b["field"] == "technical_hints")
+    assert (hints["shown"], hints["total"]) == (0, len("Look here."))
+    assert "technical_hints" not in text.split("[bounded]", 1)[1]
+
+    # (c) the declared omission is the real one: 1570-1500, the blank run kept
+    excerpt_line = next(
+        line for line in text.splitlines() if line.startswith("x" * 100)
+    )
+    assert excerpt_line.endswith("… [+70 chars]")
+    assert excerpt_line[: -len("… [+70 chars]")] == task["description"][:1500]
+
+
+def test_the_published_schema_has_no_generated_titles() -> None:
+    from hub import mcp_server as srv
+
+    tool = srv.mcp._tool_manager.get_tool("hub_task_status")
+    assert tool is not None
+    assert "title" not in tool.parameters
+    assert all("title" not in p for p in tool.parameters["properties"].values())

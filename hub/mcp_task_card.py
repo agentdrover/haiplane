@@ -48,6 +48,9 @@ CARD_FIELDS: tuple[str, ...] = (
     "updated_at",
 )
 
+# Findings the text half lists (the card carries all of them).
+TEXT_FINDINGS_LIMIT = 10
+
 # Lists that the default view reduces to a count.
 _COUNTED_LISTS: tuple[str, ...] = ("scope_in", "scope_out", "validation_commands")
 
@@ -56,7 +59,8 @@ def excerpt(text: str, limit: int) -> tuple[str, int]:
     """First ``limit`` characters of ``text`` and the number left out."""
     if len(text) <= limit:
         return text, 0
-    return text[:limit].rstrip() + f"… [+{len(text) - limit} chars]", len(text) - limit
+    omitted = len(text) - limit
+    return text[:limit] + f"… [+{omitted} chars]", omitted
 
 
 def window_updates(updates: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
@@ -82,6 +86,7 @@ def _compact_update(update: dict[str, Any]) -> tuple[dict[str, Any], int]:
 def _updates_bound(task_id: int, shown: int, total: int) -> dict[str, Any]:
     return {
         "field": "updates",
+        "unit": "entries",
         "shown": shown,
         "total": total,
         "read_more": (
@@ -96,12 +101,21 @@ def _updates_bound(task_id: int, shown: int, total: int) -> dict[str, Any]:
     }
 
 
-def _excerpt_bound(field: str, kept: int, total: int) -> dict[str, Any]:
-    return {"field": field, "shown": kept, "total": total, "read_more": "full=true"}
+def _bound(
+    field: str, shown: int, total: int, unit: str, read_more: str = "full=true"
+) -> dict[str, Any]:
+    """One statement of what is left out, always in one stated unit."""
+    return {
+        "field": field,
+        "unit": unit,
+        "shown": shown,
+        "total": total,
+        "read_more": read_more,
+    }
 
 
 def _text_fields(task: dict[str, Any]) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    """Excerpts of the long text fields and a bound for each one cut."""
+    """Excerpts of the long text fields and a bound for each one actually cut."""
     shown: dict[str, str] = {}
     bounds: list[dict[str, Any]] = []
     for name in ("description", "technical_hints", "result_text"):
@@ -111,53 +125,79 @@ def _text_fields(task: dict[str, Any]) -> tuple[dict[str, str], list[dict[str, A
         cut, omitted = excerpt(value, FIELD_EXCERPT_CHARS)
         shown[name] = cut
         if omitted:
-            bounds.append(_excerpt_bound(name, FIELD_EXCERPT_CHARS, len(value)))
+            bounds.append(_bound(name, FIELD_EXCERPT_CHARS, len(value), "chars"))
     return shown, bounds
 
 
-def _counted_bounds(task: dict[str, Any]) -> list[dict[str, Any]]:
+def _absent_from_card(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """Fields the card does not carry at all — named, even when short."""
     bounds = []
+    for name in ("description", "technical_hints", "result_text"):
+        value = str(task.get(name) or "")
+        if value:
+            bounds.append(_bound(name, 0, len(value), "chars"))
     for name in _COUNTED_LISTS:
         total = len(task.get(name) or [])
         if total:
-            bounds.append(_excerpt_bound(name, 0, total))
+            bounds.append(_bound(name, 0, total, "items"))
     criteria = len(task.get("acceptance_criteria") or [])
     if criteria:
         bounds.append(
-            _excerpt_bound("acceptance_criteria.given_when_then", 0, criteria)
+            _bound("acceptance_criteria.given_when_then", 0, criteria, "items")
         )
+    return bounds
+
+
+def _text_counted(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """What the text half reduces to counts: scope, validation, criteria."""
+    return [b for b in _absent_from_card(task) if b["unit"] == "items"]
+
+
+def _findings_bound(task: dict[str, Any]) -> list[dict[str, Any]]:
+    review = task.get("latest_review") or {}
+    total = len(review.get("findings") or [])
+    if total <= TEXT_FINDINGS_LIMIT:
+        return []
+    return [_bound("latest_review.findings", TEXT_FINDINGS_LIMIT, total, "items")]
+
+
+def _window_bounds(
+    task_id: int, window: list[dict[str, Any]], total: int
+) -> list[dict[str, Any]]:
+    """Bounds shared by both halves: the feed window and each cut entry."""
+    bounds: list[dict[str, Any]] = []
+    if len(window) < total:
+        bounds.append(_updates_bound(task_id, len(window), total))
+    for update in window:
+        length = len(str(update.get("content") or ""))
+        if length > UPDATE_EXCERPT_CHARS:
+            bounds.append(
+                _bound(
+                    f"updates[#{update.get('id', '?')}].content",
+                    UPDATE_EXCERPT_CHARS,
+                    length,
+                    "chars",
+                )
+            )
     return bounds
 
 
 def build_compact_view(task: dict[str, Any], count: int) -> dict[str, Any]:
     """Everything the default view shows, as plain data for both halves.
 
-    Returns ``card`` (the structuredContent task), ``texts`` (field excerpts),
-    ``updates`` (the compact window), and ``bounds`` (what was left out).
+    Returns ``card`` (the structuredContent task, with its own ``bounds``),
+    ``texts`` (field excerpts), ``updates`` (the compact window) and
+    ``bounds`` (what the TEXT half left out). The two halves cut different
+    things — the card carries no description at all, the text carries all
+    findings only up to ten — so each states its own cuts, not the other's.
     """
     task_id = int(task.get("id") or 0)
     all_updates = task.get("updates") or []
     window = window_updates(all_updates, count)
-    compact_updates: list[dict[str, Any]] = []
-    cut_entries = 0
-    for update in window:
-        compact, omitted = _compact_update(update)
-        compact_updates.append(compact)
-        cut_entries += 1 if omitted else 0
-    texts, bounds = _text_fields(task)
-    if len(window) < len(all_updates):
-        bounds.insert(0, _updates_bound(task_id, len(window), len(all_updates)))
-    if cut_entries:
-        bounds.append(
-            {
-                "field": "updates.content",
-                "shown": UPDATE_EXCERPT_CHARS,
-                "total": cut_entries,
-                "read_more": "full=true",
-                "note": f"{cut_entries} entries cut to {UPDATE_EXCERPT_CHARS} chars",
-            }
-        )
-    bounds.extend(_counted_bounds(task))
+    compact_updates = [_compact_update(update)[0] for update in window]
+    shared = _window_bounds(task_id, window, len(all_updates))
+    texts, text_cuts = _text_fields(task)
+    text_bounds = [*shared, *text_cuts, *_text_counted(task), *_findings_bound(task)]
     card = {name: task[name] for name in CARD_FIELDS if name in task}
     card["acceptance_criteria_ids"] = [
         ac.get("id") for ac in task.get("acceptance_criteria") or []
@@ -165,12 +205,12 @@ def build_compact_view(task: dict[str, Any], count: int) -> dict[str, Any]:
     card["updates"] = compact_updates
     card["updates_total"] = len(all_updates)
     card["compact"] = True
-    card["bounds"] = bounds
+    card["bounds"] = [*shared, *_absent_from_card(task)]
     return {
         "card": card,
         "texts": texts,
         "updates": compact_updates,
-        "bounds": bounds,
+        "bounds": text_bounds,
     }
 
 
@@ -180,6 +220,7 @@ def bounds_lines(bounds: list[dict[str, Any]]) -> list[str]:
     for bound in bounds:
         line = (
             f"[bounded] {bound['field']} {bound['shown']}/{bound['total']}"
+            f" {bound['unit']}"
             f" — full: {bound['read_more']}"
         )
         if bound.get("note"):
