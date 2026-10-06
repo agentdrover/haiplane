@@ -587,7 +587,7 @@ def _validate_done_report(task: dict[str, Any]) -> None:
             detail=_done_report_error(
                 task,
                 reason="awaiting_ci_conveyor",
-                hint="Task is in ci_check; wait for poller or use hub_decide_task / human gate.",
+                hint="Task is in ci_check; wait for poller or use REST POST /api/tasks/<id>/decide / human gate.",
                 required_status="ci_check",
             ),
         )
@@ -597,7 +597,7 @@ def _validate_done_report(task: dict[str, Any]) -> None:
             detail=_done_report_error(
                 task,
                 reason="human_decision_required",
-                hint="Task awaits hub_decide_task or human Decision Gate.",
+                hint="Task awaits REST POST /api/tasks/<id>/decide or human Decision Gate.",
                 required_status="needs_decision",
             ),
         )
@@ -606,7 +606,7 @@ def _validate_done_report(task: dict[str, Any]) -> None:
         detail=_done_report_error(
             task,
             reason="invalid_status_for_done",
-            hint="Start work via hub_pair_start or hub_start_task before reporting done.",
+            hint="Start work via hub_pair_start (claim first) before reporting done.",
             required_status="running",
         ),
     )
@@ -2511,7 +2511,7 @@ async def _require_base_conflict_entry(state: SubmitContext) -> None:
         f"current status: needs_decision ({cause}{': ' + detail if detail else ''}). "
         "From needs_decision the author resubmits only after merge_failed on a "
         "conflict with the base branch; this cause is a human decision "
-        "(hub_decide_task).",
+        "(REST POST /api/tasks/<id>/decide).",
     )
 
 
@@ -5608,7 +5608,7 @@ async def add_update(
                             # through the decision, not around it.
                             f"Отчёт о готовности не пошёл в доставку: после "
                             f"последней сдачи записан блокер — {note}. Решение "
-                            "за человеком (hub_decide_task): rework вернёт "
+                            "за человеком (REST POST /api/tasks/<id>/decide): rework вернёт "
                             "задачу в running — снимите препятствие и "
                             "пересдайте done; accept завершит без доставки.",
                         )

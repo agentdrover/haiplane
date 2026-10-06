@@ -11,7 +11,7 @@ decisions, and completion reports.
 - Before starting work on a task, call `hub_my_context(task_id)`.
 - If the task is not ready, do not write code. Refine scope, acceptance
   criteria, validation commands, or risks, then check `hub_get_readiness`.
-- Before implementation or dispatch, record `Plan:` through `hub_start_task`
+- Before implementation or dispatch, record `Plan:` through `hub_pair_start`
   with a `plan` argument or `hub_task_update(..., kind="status")`.
 - Ask requirement questions through `hub_ask_question`.
 - Record blockers through `hub_task_update(..., kind="blocker")`.
@@ -28,5 +28,5 @@ decisions, and completion reports.
   review changes requested.
 - Work only in your task's branch (`task-<id>/...`). Do not commit, push, or
   rebase another task's branch without an explicit human decision.
-- Use `hub_approve_task(..., force=true)` and `hub_force_complete_task` only as
-  explicit human gates.
+- Force approval and force-complete are human gates (REST, not in your tool
+  list); never try to take them yourself.

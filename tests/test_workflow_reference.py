@@ -9,6 +9,7 @@ from httpx import AsyncClient
 
 from hub.models import HIERARCHY_RULES, TaskType
 from hub.workflow_reference import (
+    AGENT_HIDDEN_TOOLS,
     AGENT_COMPLETION_TOOL,
     LIFECYCLE_MAP_HEADER,
     LIFECYCLE_TRANSITIONS,
@@ -106,8 +107,11 @@ def test_instructions_point_at_the_map_instead_of_copying_it() -> None:
 
     # Still there: what only the instruction can say.
     assert "hub_report_done" in text
-    assert "Human-only tools:" in text
-    assert "hub_approve_task" in text and "hub_decide_task" in text
+    # #1624: the human gates are named by their route, never by a tool the
+    # agent cannot see.
+    assert "Human gates" in text and "POST /api/tasks/{id}/<gate>" in text
+    for tool in AGENT_HIDDEN_TOOLS:
+        assert tool not in text, tool
     assert "hub_my_context(mode=full)" in text
     assert "Workflow reference" in text
 

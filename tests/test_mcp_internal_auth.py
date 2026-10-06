@@ -198,3 +198,234 @@ async def test_watcher_reads_a_compact_task_status(watcher_mcp_hub):
         "SELECT 1 FROM events WHERE kind = 'watcher_route_refused'"
     )
     assert refusals == []
+
+
+# ---------------------------------------------------------------------------
+# #1624: the agent catalog has no human-only tools
+# ---------------------------------------------------------------------------
+
+_HUMAN_ONLY = (
+    "hub_approve_task",
+    "hub_reject_task",
+    "hub_decide_task",
+    "hub_force_complete_task",
+    "hub_answer_question",
+    "hub_start_task",
+)
+_REMOVED = (
+    "hub_approve_proposal",
+    "hub_reject_proposal",
+    "hub_submit_steward_judgement",
+)
+_TOKENS_1624 = {
+    "agent": ("t-agent", "agent", 7001, frozenset()),
+    "watcher_gate": (
+        "t-watcher",
+        "watcher",
+        7002,
+        frozenset({"tasks.read", "tasks.human_gate"}),
+    ),
+    "human": ("t-human", "human", 7003, frozenset()),
+    "admin": ("t-admin", "admin", 7004, frozenset()),
+    "super_admin": ("t-super", "super_admin", 7005, frozenset()),
+    "custom_gate": (
+        "t-custom",
+        "agent",
+        7006,
+        frozenset({"tasks.read", "tasks.human_gate"}),
+    ),
+}
+
+
+@pytest.fixture
+async def catalog_hub(client, db, monkeypatch):
+    """Real app, auth on, one env token per identity under test."""
+    import httpx
+    from httpx import ASGITransport
+
+    from hub import config
+    from hub.app import app
+    from hub.services import mcp_telemetry
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            tok: config.TokenIdentity(name, role, principal_id=pid, permissions=perms)
+            for tok, (name, role, pid, perms) in (
+                (v[0], v) for v in _TOKENS_1624.values()
+            )
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.delenv("HAIPLANE_HUB_TOKEN", raising=False)
+
+    seen: list[str] = []
+    real_client = httpx.AsyncClient
+
+    class _Counting(ASGITransport):
+        async def handle_async_request(self, request):  # type: ignore[override]
+            seen.append(f"{request.method} {request.url.path}")
+            return await super().handle_async_request(request)
+
+    def _in_process(*args, **kwargs):
+        kwargs["transport"] = _Counting(app=app)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _in_process)
+    mcp_telemetry.set_telemetry_sink(db)
+    try:
+        from types import SimpleNamespace
+
+        yield SimpleNamespace(client=client, db=db, rest_calls=seen, config=config)
+    finally:
+        mcp_telemetry.set_telemetry_sink(None)
+
+
+async def _tools_list(client, token: str | None) -> set[str]:
+    from tests.test_mcp_server import _MCP_HEADERS, _rpc_result
+
+    headers = dict(_MCP_HEADERS)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    resp = await client.post(
+        "/mcp",
+        headers=headers,
+        json={"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
+    )
+    return {t["name"] for t in _rpc_result(resp)["tools"]}
+
+
+async def test_tools_list_hides_human_only_tools_from_non_humans(catalog_hub):
+    """AC-1 (#1624): who sees what comes from the PROTECTED identity, per call."""
+    from tests.test_mcp_server import _hub_process
+
+    hub = catalog_hub
+    hidden = set(_HUMAN_ONLY) | set(_REMOVED)
+    async with _hub_process():
+        for key in ("agent", "watcher_gate"):
+            names = await _tools_list(hub.client, _TOKENS_1624[key][0])
+            assert names, key
+            assert not (names & hidden), (key, sorted(names & hidden))
+        for key in ("human", "admin", "super_admin", "custom_gate"):
+            names = await _tools_list(hub.client, _TOKENS_1624[key][0])
+            assert set(_HUMAN_ONLY) <= names, (key, set(_HUMAN_ONLY) - names)
+            assert not (names & set(_REMOVED)), key
+        # interleaving: nothing leaks from one caller to the next
+        order = ["human", "agent", "human", "watcher_gate", "admin", "agent"]
+        for key in order:
+            names = await _tools_list(hub.client, _TOKENS_1624[key][0])
+            sees = set(_HUMAN_ONLY) <= names
+            assert sees == (key in ("human", "admin")), key
+        # concurrent human / agent requests
+        import asyncio
+
+        results = await asyncio.gather(
+            *[
+                _tools_list(hub.client, _TOKENS_1624[k][0])
+                for k in ("human", "agent", "super_admin", "watcher_gate") * 3
+            ]
+        )
+        for k, names in zip(
+            ("human", "agent", "super_admin", "watcher_gate") * 3, results
+        ):
+            assert (set(_HUMAN_ONLY) <= names) == (k in ("human", "super_admin")), k
+
+    # open mode: no identity, agent view
+    hub.config.HUB_AUTH_DISABLED = True
+    async with _hub_process():
+        names = await _tools_list(hub.client, None)
+    assert not (names & set(_HUMAN_ONLY)), sorted(names & set(_HUMAN_ONLY))
+
+    # stdio: no inbound request at all, agent view
+    from hub.mcp_server import mcp
+
+    stdio_names = {t.name for t in await mcp.list_tools()}
+    assert not (stdio_names & hidden)
+    assert "hub_pair_start" in stdio_names
+
+
+async def test_a_hidden_tool_call_from_an_agent_is_refused_with_the_human_path(
+    catalog_hub,
+):
+    """AC-2 (#1624): the refusal is inside the measured path, nothing runs."""
+    import json
+
+    from tests.test_mcp_server import _call_tool, _hub_process, _rpc_result
+
+    hub = catalog_hub
+    created = await hub.client.post(
+        "/api/tasks",
+        json={"title": "gate probe"},
+        headers={"Authorization": f"Bearer {_TOKENS_1624['human'][0]}"},
+    )
+    tid = created.json()["id"]
+    before = (
+        await hub.db.execute_fetchall("SELECT status FROM tasks WHERE id = ?", (tid,))
+    )[0]["status"]
+    route_markers = {
+        "hub_approve_task": "/approve",
+        "hub_reject_task": "/reject",
+        "hub_decide_task": "/decide",
+        "hub_force_complete_task": "/force-complete",
+        "hub_answer_question": "/answer",
+        "hub_start_task": "/start",
+    }
+    good_args = {"task_id": tid, "answer": "x", "comment": "x", "decision": "accept"}
+    agent = _TOKENS_1624["agent"][0]
+    async with _hub_process():
+        # (c) a human fills the schema cache first
+        assert set(_HUMAN_ONLY) <= await _tools_list(
+            hub.client, _TOKENS_1624["human"][0]
+        )
+        for tool in _HUMAN_ONLY:
+            for args in (good_args, {"bogus": 1}):
+                hub.rest_calls.clear()
+                await hub.db.execute("DELETE FROM mcp_call_events")
+                await hub.db.commit()
+                result = _rpc_result(await _call_tool(hub.client, agent, tool, args))
+                assert result["isError"] is True, (tool, result)
+                text = "".join(p.get("text", "") for p in result["content"])
+                body = json.loads(text)
+                assert body["reason"] == "human_only_gate", (tool, body)
+                assert body["actor_hint"] == "human", (tool, body)
+                assert route_markers[tool] in body["next_action"], (tool, body)
+                assert "/api/tasks/" in body["next_action"], (tool, body)
+                assert not [
+                    c for c in hub.rest_calls if c.startswith("POST /api/tasks")
+                ], (
+                    tool,
+                    hub.rest_calls,
+                )
+                rows = await hub.db.execute_fetchall(
+                    "SELECT tool, status, principal_role FROM mcp_call_events"
+                )
+                assert [(r["tool"], r["status"]) for r in rows] == [(tool, "error")], (
+                    tool,
+                    [dict(r) for r in rows],
+                )
+    after = (
+        await hub.db.execute_fetchall("SELECT status FROM tasks WHERE id = ?", (tid,))
+    )[0]["status"]
+    assert after == before
+    # the human still gets through the same funnel (not refused by the gate)
+    async with _hub_process():
+        ok = _rpc_result(
+            await _call_tool(
+                hub.client,
+                _TOKENS_1624["human"][0],
+                "hub_reject_task",
+                {"task_id": tid},
+            )
+        )
+        assert "human_only_gate" not in "".join(
+            p.get("text", "") for p in ok["content"]
+        )
+    # REST regression: the same call by an agent token is 403
+    for path in ("approve", "reject", "start"):
+        resp = await hub.client.post(
+            f"/api/tasks/{tid}/{path}",
+            json={},
+            headers={"Authorization": f"Bearer {agent}"},
+        )
+        assert resp.status_code == 403, (path, resp.status_code)

@@ -1473,7 +1473,7 @@ async def test_other_needs_decision_causes_still_need_a_human(
             assert exc.status_code == 400, label
             text = str(exc.detail)
             assert "can only submit running or under-review" in text, label
-            assert "hub_decide_task" in text, f"{label}: отказ называет решение"
+            assert "/decide" in text, f"{label}: отказ называет решение"
             if payloads:
                 assert payloads[-1]["reason"] in text, f"{label}: причина названа"
         else:

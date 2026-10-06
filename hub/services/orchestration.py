@@ -2030,7 +2030,7 @@ async def dispatch_task(
             "blocker",
             f"{error} Обычная причина — незакоммиченные изменения в общем "
             f"рабочем каталоге. Закоммитьте или спрячьте их и решите через "
-            f"hub_decide_task.",
+            f"REST POST /api/tasks/<id>/decide.",
         )
         await repo.insert_event(
             db,
@@ -5346,7 +5346,7 @@ async def _deliver_completed_pair_task(
                 else ""
             )
             + " Решение за человеком "
-            "(hub_decide_task): rework вернёт задачу в running — "
+            "(REST POST /api/tasks/<id>/decide): rework вернёт задачу в running — "
             "устраните причину и пересдайте done; accept завершит "
             "задачу БЕЗ доставки PR."
             + base_conflict_resubmit_hint(
@@ -5450,7 +5450,7 @@ async def _complete_without_review(
                     # #952: names only actions needs_decision accepts.
                     f"Done report NOT completed: ветка {branch} меняет "
                     f"{len(diff or [])} файл(ов), а {create_reason}. "
-                    "Решение за человеком (hub_decide_task): rework "
+                    "Решение за человеком (REST POST /api/tasks/<id>/decide): rework "
                     "вернёт задачу в running — откройте PR руками или "
                     "почините доступ к GitHub и пересдайте done; accept "
                     "завершит задачу БЕЗ доставки ветки.",
@@ -5627,7 +5627,7 @@ async def _route_after_done(
             f"Не удалось перейти на ветку {branch!r} в {git_repo} — "
             "git-хвост done-конвейера (commit, squash, push, PR) не "
             "выполнялся, чтобы не тронуть чужую ветку. Проверьте состояние "
-            "рабочего каталога и решите через hub_decide_task.",
+            "рабочего каталога и решите через REST POST /api/tasks/<id>/decide.",
         )
         await repo.insert_event(
             db,
@@ -5691,7 +5691,7 @@ async def _route_after_done(
                     "hub",
                     "blocker",
                     f"{error} Объявленная область: {', '.join(areas)}. "
-                    "Решите через hub_decide_task: расширить область, "
+                    "Решите через REST POST /api/tasks/<id>/decide: расширить область, "
                     "убрать чужие правки или закоммитить как есть.",
                 )
                 await repo.insert_event(
@@ -5747,7 +5747,7 @@ async def _route_after_done(
             "hub",
             "blocker",
             f"{exc} — git-хвост done-конвейера остановлен, чтобы не "
-            f"переписать историю чужой ветки. Решите через hub_decide_task.",
+            f"переписать историю чужой ветки. Решите через REST POST /api/tasks/<id>/decide.",
         )
         await repo.insert_event(
             db,
@@ -6063,7 +6063,7 @@ async def transition_after_agent_done(
             "alert",
             f"Review cycle limit reached ({task.get('review_cycle', 0)}/"
             f"{config.MAX_REVIEW_CYCLES}) without APPROVED review. "
-            "Human decision required (hub_decide_task).",
+            "Human decision required (REST POST /api/tasks/<id>/decide).",
         )
         await repo.insert_event(
             db,
@@ -6210,7 +6210,7 @@ async def dispatch_review(
             "hub",
             "alert",
             f"Reviewer dispatch failed: {result.get('error', 'no job_id')}. "
-            "Universal Review Gate: manual decision required (hub_decide_task).",
+            "Universal Review Gate: manual decision required (REST POST /api/tasks/<id>/decide).",
         )
     await db.commit()
 

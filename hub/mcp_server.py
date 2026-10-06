@@ -20,7 +20,7 @@ from pydantic import Field
 
 from hub import brand, config
 from hub.actionable_errors import normalize_api_error_detail
-from hub.mcp_internal_auth import identity_context_get
+from hub.mcp_internal_auth import identity_context_get, identity_is_human
 from hub.services.mcp_telemetry import record_call
 from hub.services.tree_output import (
     TreeOutputOptions,
@@ -43,7 +43,12 @@ from hub.models import (
     latest_review_freshness,
 )
 from hub.mcp_signature import Hidden, with_model_signature
-from hub.workflow_reference import build_mcp_instructions, lifecycle_map_lines
+from hub.workflow_reference import (
+    AGENT_HIDDEN_TOOLS,
+    HUMAN_ROUTES,
+    build_mcp_instructions,
+    lifecycle_map_lines,
+)
 from mcp.types import CallToolResult
 
 from hub.mcp_task_card import bounds_lines, build_compact_view
@@ -115,6 +120,23 @@ class InstrumentedFastMCP(FastMCP):
                 names.add(field_info.alias)
         return names
 
+    async def list_tools_for(self, view: Literal["agent", "full"]) -> list[Any]:
+        """``tools/list`` as one view sees it (#1624).
+
+        ``agent`` drops the human-only lifecycle gates; ``full`` is everything
+        registered. Built from a fresh list: the tool manager is shared by all
+        callers and its tools are never touched here.
+        """
+        tools = await super().list_tools()
+        if view == "full":
+            return list(tools)
+        return [tool for tool in tools if tool.name not in AGENT_HIDDEN_TOOLS]
+
+    async def list_tools(self) -> list[Any]:
+        # Decided on EVERY call from the protected identity of this request.
+        # The SDK's own cache holds schemas only, never who may see them.
+        return await self.list_tools_for("full" if identity_is_human() else "agent")
+
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         principal_id, role = identity_context_get()
         started = time.perf_counter()
@@ -125,6 +147,11 @@ class InstrumentedFastMCP(FastMCP):
             else []
         )
         try:
+            # Hidden is also refused. Inside the try so the refusal is measured
+            # like any other failed call (one record), and before the tool
+            # runs so no REST request or mutation happens (#1624).
+            if name in AGENT_HIDDEN_TOOLS and not identity_is_human():
+                raise ToolError(_human_only_refusal(name, arguments))
             result = await super().call_tool(name, arguments)
         except Exception as exc:
             await record_call(
@@ -198,6 +225,27 @@ def _auth_headers() -> dict[str, str]:
     if token:
         return {"Authorization": f"Bearer {token}"}
     return {}
+
+
+def _human_only_refusal(name: str, arguments: dict[str, Any]) -> str:
+    """JSON envelope for an agent that calls a human gate it was never shown."""
+    task_id = arguments.get("task_id") if isinstance(arguments, dict) else None
+    route = HUMAN_ROUTES[name].replace(
+        "{id}", str(task_id) if isinstance(task_id, int) else "{id}"
+    )
+    payload = enrich_error_payload(
+        {
+            "reason": "human_only_gate",
+            "message": "This tool is a human gate and is not available to this token.",
+            "hint": "A person acts on this: hub UI task card, oc-hub, or REST.",
+            "actor_hint": "human",
+            "next_action": (
+                f"Ask the human owner to run {route} with a human token; "
+                "do not retry this call."
+            ),
+        }
+    )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 class HubApiError(Exception):
@@ -2296,8 +2344,8 @@ async def hub_pair_start(
 ) -> str:
     """Start pair mode: move an open task to running without headless dispatch.
 
-    Use this when a human works with a local agent, instead of hub_start_task
-    (which dispatches). In worktree mode the response names your task's
+    The agent's way to begin work: claim, then pair-start (no headless dispatch).
+    In worktree mode the response names your task's
     isolated worktree — work THERE, not in the shared clone.
 
     Args:
@@ -3505,77 +3553,6 @@ async def hub_submit_machine_review(
 
 
 @mcp.tool()
-async def hub_submit_steward_judgement(
-    task_id: int,
-    generation: int,
-    kind: str,
-    verdict: str,
-    grounds: list[dict[str, Any]] | None = None,
-    findings: list[dict[str, Any]] | None = None,
-    closures: list[dict[str, Any]] | None = None,
-    escalate_reason: str = "",
-    confidence: str = "",
-    model: str = "",
-    tokens_spent: int | None = None,
-    duration_ms: int | None = None,
-) -> CallToolResult:
-    """Record a steward judgement. Does not transition the task (#1022).
-
-    ``verdict`` has no default (422, never a silent approve). ``ground.source``
-    and ``escalate_reason`` are closed sets with no ``unknown``.
-    ``confidence=low`` stores as escalate/low_confidence. At-most-once on
-    (task_id, generation, kind). Closures address findings by finding_uid.
-
-    Args:
-        task_id: Task being judged.
-        generation: Submission generation being judged.
-        kind: verdict|dor|disposition|advisor (critic).
-        verdict: approve|changes_requested|escalate; advisor: concur|object.
-        grounds: [{source, detail?}].
-        findings: Same shape as a human review verdict.
-        closures: [{finding_uid, type}].
-        escalate_reason: Required when verdict is escalate.
-        confidence: high, medium, or low.
-        model: Model that produced the judgement.
-        tokens_spent: Tokens spent producing it.
-        duration_ms: Duration.
-    """
-    body: dict[str, Any] = {
-        "generation": generation,
-        "kind": kind,
-        "verdict": verdict,
-        "grounds": grounds or [],
-        "findings": findings or [],
-        "closures": closures or [],
-        "model": model,
-    }
-    if escalate_reason:
-        body["escalate_reason"] = escalate_reason
-    if confidence:
-        body["confidence"] = confidence
-    if tokens_spent is not None:
-        body["tokens_spent"] = tokens_spent
-    if duration_ms is not None:
-        body["duration_ms"] = duration_ms
-    try:
-        result = await _api_post(f"/api/tasks/{task_id}/steward-judgement", body)
-    except HubApiError as exc:
-        return _error_result(exc)
-    return structured_echo_result(
-        f"Steward judgement for task #{task_id} recorded "
-        f"(generation {result.get('generation')}, kind {result.get('kind')}): "
-        f"{result.get('verdict')}"
-        + (
-            f" ({result.get('escalate_reason')})"
-            if result.get("escalate_reason")
-            else ""
-        )
-        + ". Not applied — recording only.",
-        steward_judgement=result,
-    )
-
-
-@mcp.tool()
 async def hub_executor_slots() -> CallToolResult:
     """Slots and channels: task, since, last sign of life (#1434)."""
     from hub.services.executor_slots import format_occupancy
@@ -4634,7 +4611,7 @@ async def hub_list_proposals(status: str = "draft") -> CallToolResult:
     return structured_echo_result("\n".join(lines), proposals=agent_tasks)
 
 
-# Deprecated aliases (ADR-0002 Stage 1: warning + telemetry, #325)
+# Deprecated alias hub_task_update kind=done (ADR-0002 Stage 1: warning + telemetry, #325)
 async def _mark_deprecated(tool: str, replacement: str, result: str) -> str:
     """Count the alias call and stamp the response with a migration hint."""
     try:
@@ -4651,20 +4628,6 @@ async def _mark_deprecated(tool: str, replacement: str, result: str) -> str:
     payload["deprecated"] = True
     payload["next_action"] = f"Deprecated alias: use {replacement} instead."
     return json.dumps(payload, ensure_ascii=False)
-
-
-@mcp.tool()
-async def hub_approve_proposal(proposal_id: int, comment: str = "") -> str:
-    """Deprecated: use hub_approve_task instead. Approves and dispatches."""
-    result = await hub_approve_task(proposal_id, comment=comment, run=True)
-    return await _mark_deprecated("hub_approve_proposal", "hub_approve_task", result)
-
-
-@mcp.tool()
-async def hub_reject_proposal(proposal_id: int, comment: str = "") -> str:
-    """Deprecated: use hub_reject_task instead."""
-    result = await hub_reject_task(proposal_id, comment=comment)
-    return await _mark_deprecated("hub_reject_proposal", "hub_reject_task", result)
 
 
 # ---------------------------------------------------------------------------
