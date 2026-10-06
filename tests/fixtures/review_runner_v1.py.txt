@@ -24,27 +24,13 @@
   НЕТ намеренно: с ним sudo не работает, и вся причина существования службы
   пропала бы.
 
-Снимок исходников (#1599). Задание version=2 несёт ``src.tar``. Его проверяет
-и распаковывает отдельный файл ``snapshot_unpack.py``, установленный РЯДОМ со
-службой в каталог root (хаб на запись не пишет): служба грузит его по явному
-пути и отказывается, если файл или каталог доступны на запись не root-у.
-Враждебный tar отвергается до запуска модели; ``src`` и ``home`` раскладываются
-в рабочем каталоге прогона (``<workdir>/src`` только для чтения). Проверка
-установки без hub: ``haiplane-review-runner.py --check-install``.
-
-Только стандартная библиотека: служба ставится на хост двумя файлами (сама и
-``snapshot_unpack.py``), без пакета hub.
+Только стандартная библиотека: служба ставится на хост одним файлом.
 
 Протокол (хаб и служба держат одни имена; тест сверяет их):
 
     <spool>/job-<16 hex>/prompt.txt   промт (0660, удаляется службой сразу)
-    <spool>/job-<16 hex>/src.tar      снимок исходников (#1599), только при
-                                      version=2; пишется ДО job.json
-    <spool>/job-<16 hex>/job.json     {"version": 1|2, "timeout_sec": N}; пишется
-                                      ПОСЛЕДНИМ и атомарно — это и есть «готово».
-                                      version=2 — задание со снимком; старая
-                                      служба принимает только version=1 и
-                                      отклоняет его ДО запуска модели
+    <spool>/job-<16 hex>/job.json     {"version": 1, "timeout_sec": N}; пишется
+                                      ПОСЛЕДНИМ и атомарно — это и есть «готово»
     <job>/claimed                     служба взяла задание
     <job>/cancel                      хаб просит снять прогон (таймаут)
     <job>/result.json                 итог; пишется атомарно
@@ -70,7 +56,6 @@ import contextlib
 import json
 import logging
 import os
-import pwd
 import re
 import shlex
 import shutil
@@ -79,7 +64,6 @@ import stat
 import sys
 import tempfile
 import time
-import types
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -89,13 +73,8 @@ SPOOL_CLAIMED = "claimed"
 SPOOL_CANCEL = "cancel"
 SPOOL_RESULT = "result.json"
 SPOOL_HEARTBEAT = "heartbeat"
-SPOOL_SNAPSHOT = "src.tar"
-UNPACKER_FILE = "snapshot_unpack.py"
 
 JOB_VERSION = 1
-# Версия задания со снимком исходников (#1599): старая служба знает только 1.
-JOB_VERSION_SNAPSHOT = 2
-JOB_VERSIONS = (JOB_VERSION, JOB_VERSION_SNAPSHOT)
 # Закрытый список: ни команды, ни путей, ни окружения задание нести не может.
 JOB_FIELDS = ("version", "timeout_sec")
 
@@ -130,17 +109,6 @@ class Config:
     wrapper_timeout: int = 0
     stale_sec: float = 3600.0
     output_cap: int = field(default=OUTPUT_CAP)
-    # Снимок исходников (#1599). Потолки распаковки; распаковщик — файл рядом
-    # со службой, если путь не задан. Доверенный владелец распаковщика — root
-    # и из окружения не настраивается: хаб не должен иметь способа его сменить.
-    snapshot_max_bytes: int = 64 * 1024 * 1024
-    snapshot_max_entries: int = 50_000
-    snapshot_max_depth: int = 32
-    snapshot_unpacker: str = ""
-    unpacker_trusted_uid: int = 0
-    # Пользователь ревьюера из argv (sudo -n -u <имя>): нужен, чтобы убедиться,
-    # что каталог прогонов не принадлежит ему (иначе sticky-бит не защищает).
-    reviewer_user: str = ""
 
 
 def _argv_problem(argv: list[str]) -> str:
@@ -207,39 +175,11 @@ def load_config(env: Mapping[str, str]) -> Config:
         scratch=scratch,
         max_timeout=cap,
         wrapper_timeout=wrapper,
-        reviewer_user=argv[3],
-        snapshot_max_bytes=_positive(
-            env, "HAIPLANE_REVIEW_RUNNER_SNAPSHOT_MAX_BYTES", 64 * 1024 * 1024
-        ),
-        snapshot_max_entries=_positive(
-            env, "HAIPLANE_REVIEW_RUNNER_SNAPSHOT_MAX_ENTRIES", 50_000
-        ),
-        snapshot_max_depth=_positive(
-            env, "HAIPLANE_REVIEW_RUNNER_SNAPSHOT_MAX_DEPTH", 32
-        ),
     )
-
-
-def _positive(env: Mapping[str, str], name: str, default: int) -> int:
-    raw = (env.get(name) or "").strip()
-    try:
-        value = int(raw) if raw else default
-    except ValueError as exc:
-        raise ConfigError(f"{name} не число") from exc
-    if value <= 0:
-        raise ConfigError(f"{name} должен быть > 0")
-    return value
 
 
 def parse_job(raw: bytes, max_timeout: int, wrapper_timeout: int = 0) -> int:
     """Срок прогона из задания, или JobRejected с причиной. Команды не читает."""
-    return parse_job_ex(raw, max_timeout, wrapper_timeout)[0]
-
-
-def parse_job_ex(
-    raw: bytes, max_timeout: int, wrapper_timeout: int = 0
-) -> tuple[int, int]:
-    """``(срок, версия)`` задания, или JobRejected. Команды не читает."""
     try:
         data = json.loads(raw)
     except ValueError as exc:
@@ -255,13 +195,8 @@ def parse_job_ex(
             + ", ".join(JOB_FIELDS)
             + ", а команду службы задаёт её конфиг"
         )
-    version = data.get("version")
-    if isinstance(version, bool) or version not in JOB_VERSIONS:
-        raise JobRejected(
-            "версия задания не поддерживается (нужна "
-            + " или ".join(str(v) for v in JOB_VERSIONS)
-            + ")"
-        )
+    if data.get("version") != JOB_VERSION:
+        raise JobRejected(f"версия задания не поддерживается (нужна {JOB_VERSION})")
     timeout = data.get("timeout_sec")
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
         raise JobRejected("timeout_sec должен быть целым числом больше нуля")
@@ -272,7 +207,7 @@ def parse_job_ex(
             "контейнер умрёт. Выровняйте LOCAL_REVIEW_TIMEOUT_SEC хаба с "
             "файлом timeout враппера"
         )
-    return min(timeout, max_timeout), int(version)
+    return min(timeout, max_timeout)
 
 
 class _TooBig(Exception):
@@ -328,120 +263,12 @@ def _cancelled(jobdir: str) -> bool:
     return _withdrawn(jobdir) or os.path.exists(os.path.join(jobdir, SPOOL_CANCEL))
 
 
-def _clean_env(workdir: str, home: str = "") -> dict[str, str]:
+def _clean_env(workdir: str) -> dict[str, str]:
     env = {name: os.environ[name] for name in _ENV_PASSTHROUGH if name in os.environ}
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
-    # Со снимком рабочий каталог закрыт на запись (в нём нельзя подменить src),
-    # поэтому писать ревьюеру разрешено только в его ``home`` внутри.
-    env["HOME"] = home or workdir
-    env["TMPDIR"] = home or workdir
+    env["HOME"] = workdir
+    env["TMPDIR"] = workdir
     return env
-
-
-def default_unpacker_path() -> str:
-    """Распаковщик — файл рядом со службой (ни cwd, ни spool, ни sys.path)."""
-    here = os.path.dirname(os.path.realpath(__file__))
-    return os.path.join(here, UNPACKER_FILE)
-
-
-def read_trusted_source(path: str, trusted_uid: int) -> tuple[bytes, str]:
-    """Прочитать файл распаковщика ТЕМ ЖЕ проходом, что и проверка: ``(байты, причина)``.
-
-    Раньше проверялась цепочка после ``realpath``, а загрузка шла по исходному
-    пути: ссылка-алиас в пути переключалась между проверкой и загрузкой
-    (находка Codex, TOCTOU). Теперь путь абсолютный и без ссылок: каждый
-    каталог открывается от корня ``O_NOFOLLOW|O_DIRECTORY`` от дескриптора
-    предка, владелец и режим судятся по ``fstat`` ЭТОГО дескриптора, файл
-    открывается так же и читается из него. Исполняется прочитанное, а не путь
-    повторно. Любая ссылка в пути — отказ. Доверяем только владельцу
-    ``trusted_uid`` (root): хаб и служба — один пользователь, и «владеет
-    служба» ничего не защищает; каталог с записью группе или всем допустим
-    только с sticky-битом (/tmp).
-    """
-    if not os.path.isabs(path) or any(
-        p in ("", ".", "..") for p in path.split("/")[1:]
-    ):
-        return (
-            b"",
-            f"распаковщик {path}: нужен абсолютный путь без «.», «..» и пустых компонентов",
-        )
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
-    parts = [p for p in path.split("/") if p]
-    fds: list[int] = []
-    try:
-        current = os.open("/", flags | os.O_DIRECTORY)
-        fds.append(current)
-        walked = ""
-        for name in parts[:-1]:
-            walked += "/" + name
-            try:
-                current = os.open(name, flags | os.O_DIRECTORY, dir_fd=current)
-            except OSError as exc:
-                return (
-                    b"",
-                    f"каталог {walked} в пути распаковщика не открыт без следования по ссылке: {exc.strerror}",
-                )
-            fds.append(current)
-            dinfo = os.fstat(current)
-            if dinfo.st_uid not in (0, trusted_uid):
-                return (
-                    b"",
-                    (
-                        f"каталог {walked} над распаковщиком принадлежит uid "
-                        f"{dinfo.st_uid}, а должен принадлежать root (uid {trusted_uid})"
-                    ),
-                )
-            if dinfo.st_mode & 0o022 and not dinfo.st_mode & stat.S_ISVTX:
-                return b"", f"каталог {walked} над распаковщиком доступен на запись"
-        try:
-            fd = os.open(parts[-1], flags | os.O_NONBLOCK, dir_fd=current)
-        except FileNotFoundError:
-            return b"", f"распаковщик {path} не найден"
-        except OSError as exc:
-            return b"", f"распаковщик {path} не обычный файл (ссылка?): {exc.strerror}"
-        fds.append(fd)
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            return b"", f"распаковщик {path} не обычный файл (ссылка?)"
-        if info.st_uid != trusted_uid:
-            return b"", (
-                f"распаковщик {path} принадлежит uid {info.st_uid}, а должен "
-                f"принадлежать root (uid {trusted_uid}): иначе хаб, работающий "
-                "под тем же пользователем, мог бы его заменить"
-            )
-        if info.st_mode & 0o022:
-            return b"", f"распаковщик {path} доступен на запись группе или всем"
-        if info.st_size > 1 << 20:
-            return b"", f"распаковщик {path} подозрительно велик"
-        chunks = []
-        while chunk := os.read(fd, 1 << 16):
-            chunks.append(chunk)
-        return b"".join(chunks), ""
-    except OSError as exc:
-        return b"", f"распаковщик {path} не прочитан: {exc.strerror}"
-    finally:
-        for fd in fds:
-            os.close(fd)
-
-
-def unpacker_problem(path: str, trusted_uid: int) -> str:
-    """Почему этому файлу нельзя доверить проверку чужого tar, или ``""``."""
-    return read_trusted_source(path, trusted_uid)[1]
-
-
-def load_unpacker(path: str, trusted_uid: int = 0):  # noqa: ANN201 - модуль по пути
-    """Загрузить распаковщик ПО ЯВНОМУ ПУТИ: исполняется то, что проверено."""
-    source, problem = read_trusted_source(path, trusted_uid)
-    if problem:
-        raise ConfigError(problem)
-    module = types.ModuleType("haiplane_snapshot_unpack")
-    module.__file__ = path
-    sys.modules["haiplane_snapshot_unpack"] = module
-    try:
-        exec(compile(source, path, "exec"), module.__dict__)  # noqa: S102 - проверенный root-овый код
-    except Exception as exc:  # noqa: BLE001 - любой отказ загрузки — отказ снимку
-        raise ConfigError(f"распаковщик {path} не загружен: {exc}") from exc
-    return module
 
 
 def _outcome(status: str, **over: object) -> dict[str, object]:
@@ -541,72 +368,23 @@ async def _watch(
             return "timeout"
 
 
-def _lay_out_snapshot(cfg: Config, unpacker, workdir: str, snapshot: str) -> str:  # noqa: ANN001
-    """Разложить снимок в ``workdir``. Непустая строка — причина отказа."""
-    limits = unpacker.Limits(
-        max_bytes=cfg.snapshot_max_bytes,
-        max_entries=cfg.snapshot_max_entries,
-        max_depth=cfg.snapshot_max_depth,
-    )
-    try:
-        reviewer_uid = pwd.getpwnam(cfg.reviewer_user).pw_uid
-    except (KeyError, ValueError):
-        return (
-            "снимок отвергнут: пользователь ревьюера "
-            f"«{cfg.reviewer_user}» не разрешается в системе, проверить каталог "
-            "прогонов нельзя"
-        )
-    try:
-        gid = os.stat(cfg.scratch).st_gid
-        unpacker.prepare_workdir(workdir, snapshot, limits, gid, reviewer_uid)
-    except unpacker.SnapshotRefused as exc:
-        return f"снимок отвергнут: {exc.reason}"
-    except OSError as exc:
-        return f"снимок отвергнут: распаковка не удалась: {exc.strerror or exc}"
-    return ""
-
-
-def _remove_workdir(workdir: str, unpacker) -> None:  # noqa: ANN001
-    """Снять каталог прогона; со снимком — без следования ссылкам, с правами."""
-    if unpacker is not None and unpacker.remove_tree(workdir):
-        return
-    if unpacker is not None:
-        log.warning("workdir %s removed with leftovers", workdir)
-    shutil.rmtree(workdir, ignore_errors=True)
-
-
 async def _run(
-    cfg: Config,
-    jobdir: str,
-    prompt: bytes,
-    timeout: int,
-    snapshot: str | None = None,
-    unpacker=None,  # noqa: ANN001
+    cfg: Config, jobdir: str, prompt: bytes, timeout: int
 ) -> tuple[dict[str, object], bool]:
     """Прогнать команду службы. Второе значение — «хаб отозвал, убрать за ним»."""
     started = time.monotonic()
     workdir = tempfile.mkdtemp(prefix="haiplane-review-", dir=cfg.scratch)
     proc: asyncio.subprocess.Process | None = None
     try:
-        home = workdir
-        if snapshot is not None:
-            # Приватный workdir (0700) до конца проверки; после неё он закрыт на
-            # запись, а писать ревьюеру можно только в ``home`` внутри.
-            refusal = _lay_out_snapshot(cfg, unpacker, workdir, snapshot)
-            _unlink(snapshot)
-            if refusal:
-                return _outcome("rejected", reason=refusal), False
-            home = os.path.join(workdir, "home")
-        else:
-            # Работает в каталоге чужой пользователь (ревьюер): доступ группе.
-            os.chmod(workdir, 0o770)  # nosec B103 - группе, не миру
+        # Работает в каталоге чужой пользователь (ревьюер): доступ группе.
+        os.chmod(workdir, 0o770)  # nosec B103 - группе, не миру
         proc = await asyncio.create_subprocess_exec(
             *cfg.argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=workdir,
-            env=_clean_env(workdir, home if snapshot is not None else ""),
+            env=_clean_env(workdir),
             start_new_session=True,
         )
         sink = _Sink(cfg.output_cap)
@@ -639,25 +417,13 @@ async def _run(
             verdict == "cancelled" and _withdrawn(jobdir),
         )
     finally:
-        _remove_workdir(workdir, unpacker if snapshot is not None else None)
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 async def _execute(cfg: Config, jobdir: str) -> tuple[dict[str, object], bool]:
-    snapshot_path = os.path.join(jobdir, SPOOL_SNAPSHOT)
-    try:
-        return await _execute_inner(cfg, jobdir, snapshot_path)
-    finally:
-        # На ЛЮБОМ исходе, включая ранние отказы (версия, JSON, промт): архив
-        # хаба в задании не остаётся (находка Codex).
-        _unlink(snapshot_path)
-
-
-async def _execute_inner(
-    cfg: Config, jobdir: str, snapshot_path: str
-) -> tuple[dict[str, object], bool]:
     prompt_path = os.path.join(jobdir, SPOOL_PROMPT)
     try:
-        timeout, version = parse_job_ex(
+        timeout = parse_job(
             _read_nofollow(os.path.join(jobdir, SPOOL_JOB), JOB_CAP),
             cfg.max_timeout,
             cfg.wrapper_timeout,
@@ -673,42 +439,11 @@ async def _execute_inner(
         # Промт с одноразовым кодом живёт на диске только до чтения.
         _unlink(prompt_path)
     try:
-        return await _execute_job(cfg, jobdir, prompt, timeout, version, snapshot_path)
+        return await _run(cfg, jobdir, prompt, timeout)
     except OSError as exc:
         return _outcome(
             "error", reason=f"команда службы не запустилась: {exc}"[:300]
         ), False
-
-
-async def _execute_job(
-    cfg: Config,
-    jobdir: str,
-    prompt: bytes,
-    timeout: int,
-    version: int,
-    snapshot_path: str,
-) -> tuple[dict[str, object], bool]:
-    """Прогон после разбора задания: версия 1 — как раньше, 2 — со снимком."""
-    has_tar = os.path.lexists(snapshot_path)
-    if version == JOB_VERSION:
-        if has_tar:
-            return _outcome(
-                "rejected",
-                reason=f"в задании version=1 лежит {SPOOL_SNAPSHOT}: снимок "
-                "возможен только в version=2",
-            ), False
-        return await _run(cfg, jobdir, prompt, timeout)
-    if not has_tar:
-        return _outcome(
-            "rejected", reason=f"version=2 требует {SPOOL_SNAPSHOT}, его нет"
-        ), False
-    try:
-        unpacker = load_unpacker(
-            cfg.snapshot_unpacker or default_unpacker_path(), cfg.unpacker_trusted_uid
-        )
-    except ConfigError as exc:
-        return _outcome("rejected", reason=f"снимок принять нечем: {exc}"[:300]), False
-    return await _run(cfg, jobdir, prompt, timeout, snapshot_path, unpacker)
 
 
 async def process_job(cfg: Config, name: str) -> None:
@@ -824,38 +559,7 @@ async def serve(cfg: Config) -> None:
         beat.cancel()
 
 
-def check_install(argv: list[str]) -> int:
-    """Проверка установки: распаковщик грузится по пути и hub не нужен.
-
-    Печатает JSON и возвращает 0, либо причину в stderr и 3. Ни конфиг, ни
-    spool не читаются: проверяется только то, что установлено ФАЙЛАМИ.
-    """
-    trusted = 0
-    if "--trusted-uid" in argv:
-        trusted = int(argv[argv.index("--trusted-uid") + 1])
-    path = default_unpacker_path()
-    try:
-        module = load_unpacker(path, trusted)
-    except ConfigError as exc:
-        print(f"haiplane-review-runner: {exc}", file=sys.stderr)
-        return 3
-    print(
-        json.dumps(
-            {
-                "unpacker": path,
-                "hub_imported": any(
-                    name == "hub" or name.startswith("hub.") for name in sys.modules
-                ),
-                "limits": module.Limits().max_bytes,
-            }
-        )
-    )
-    return 0
-
-
 def main() -> int:
-    if "--check-install" in sys.argv[1:]:
-        return check_install(sys.argv[1:])
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     try:
         cfg = load_config(os.environ)

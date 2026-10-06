@@ -20,11 +20,13 @@ stamps with data instead of discipline.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import logging
 import math
 import re
+import secrets
 import uuid
 from collections.abc import Mapping
 from collections.abc import Sequence
@@ -39,6 +41,8 @@ from hub import config
 from hub import repository as repo
 from hub.integrations import cursor_cloud
 from hub.integrations import local_reviewer
+from hub.integrations import review_snapshot
+from hub.integrations.protocols import SnapshotArchive
 from hub.integrations import forge as forge_urls
 from hub.integrations.registry import plugins
 from hub.models import (
@@ -708,6 +712,7 @@ def diff_plan(
     base_paths: list[str] | None = None,
     deferred_findings: list[str] | None = None,
     inline_ceiling: int | None = None,
+    snapshot_ok: bool = False,
 ) -> tuple[str, str]:
     """What the reviewer should read, and the note for the task update (#874).
 
@@ -732,6 +737,9 @@ def diff_plan(
     local one (#1180). The block then carries the diff text itself instead of
     the command, cut by whole files under that many characters, the cut files
     named. The cloud block (None) is unchanged.
+
+    ``snapshot_ok`` (#1599) — у ревьюера есть снимок исходников на sha сдачи:
+    «исходников на машине не ищи» тогда неверно, и фраза называет снимок.
     """
     if diff is None and inline_ceiling is not None:
         return (
@@ -758,9 +766,15 @@ def diff_plan(
         ]
     else:
         lines = [
-            f"ПРЕДМЕТ РЕВЬЮ — дифф {base}...{branch} ПРИЛОЖЕН НИЖЕ. Клона у "
-            "тебя нет: команд git не выполняй и исходников на машине не ищи, "
-            "читай дифф из промта."
+            f"ПРЕДМЕТ РЕВЬЮ — дифф {base}...{branch} ПРИЛОЖЕН НИЖЕ. "
+            + (
+                "Рабочего клона у тебя нет: команд git не выполняй, дифф читай "
+                "из промта, а код вокруг него — в снимке исходников (блок "
+                "СНИМОК ИСХОДНИКОВ выше)."
+                if snapshot_ok
+                else "Клона у тебя нет: команд git не выполняй и исходников на "
+                "машине не ищи, читай дифф из промта."
+            )
         ]
     if delta_paths:
         lines.append(
@@ -1909,6 +1923,10 @@ def _delivery_block(task_id: int, code: str, base_url: str) -> str:
 
 _READ_THE_DIFF_BY_COMMAND = "прочитай дифф КОМАНДОЙ ИЗ ПРЕДМЕТА РЕВЬЮ выше и только его"
 _READ_THE_DIFF_INLINE = "прочитай дифф, приложенный к предмету ревью выше (клона нет)"
+_READ_THE_DIFF_INLINE_SNAPSHOT = (
+    "прочитай дифф, приложенный к предмету ревью выше (рабочего клона нет; "
+    "код вокруг диффа — в снимке исходников только для чтения)"
+)
 
 
 _HARNESS_FROM_BRIEF_HEAD = (
@@ -2002,6 +2020,76 @@ _LOCAL_ONLY_TESTS_NOTE = (
 )
 
 
+# #1599. Снимок исходников: что промт говорит о нём по состоянию. Базовый блок
+# возможностей (#1598) остаётся для состояния absent без изменений; при ok две
+# его фразы про «исходников нет» заменяются, потому что иначе промт спорил бы
+# сам с собой. Запрет git, тестов, установки и Docker сохраняется во всех
+# состояниях.
+_CAP_NO_SOURCES = "исходников репозитория (есть дифф в этом промте и бриф), "
+_CAP_SOURCES_IN_SNAPSHOT = (
+    "рабочего клона репозитория (дифф — в этом промте, исходники на коммите "
+    "сдачи — только в снимке ниже), "
+)
+_CAP_NO_OUTSIDE_READING = "домысливать и читать исходники вне диффа нельзя."
+_CAP_OUTSIDE_FROM_SNAPSHOT = (
+    "домысливать нельзя; код вне диффа ищи в снимке исходников (блок ниже), "
+    "только читая его."
+)
+
+
+def local_capabilities_block(snapshot: SnapshotArchive | None) -> str:
+    """Блок возможностей локального ревьюера с поправкой на снимок (#1599)."""
+    block = LOCAL_CAPABILITIES_BLOCK
+    if snapshot is None or snapshot.state != "ok":
+        return block
+    return block.replace(_CAP_NO_SOURCES, _CAP_SOURCES_IN_SNAPSHOT, 1).replace(
+        _CAP_NO_OUTSIDE_READING, _CAP_OUTSIDE_FROM_SNAPSHOT, 1
+    )
+
+
+def snapshot_block(snapshot: SnapshotArchive | None) -> str:
+    """Что ревьюеру сказано о снимке: путь и состояние, как они есть на деле."""
+    if snapshot is None:
+        return ""
+    if snapshot.state == "ok":
+        left_out = f" Из снимка исключено: {snapshot.note}." if snapshot.note else ""
+        return (
+            "СНИМОК ИСХОДНИКОВ (только чтение): файлы репозитория на "
+            f"закреплённом коммите сдачи {snapshot.sha[:12]} лежат в каталоге "
+            f"{snapshot.placeholder or review_snapshot.PATH_PLACEHOLDER} — путь именно такой, снимок смонтирован "
+            "и проверен хабом. Читай его для контекста вокруг диффа: открывай "
+            "файлы и ищи символы (ls, cat, grep), чтобы убедиться, есть ли метод, "
+            "класс или вызов вне диффа, ДО того как заявлять «символа нет». "
+            "Снимок только для чтения: не записывай в него и не переименовывай; "
+            "запрет блока ВОЗМОЖНОСТЕЙ на git, тесты, линтеры, установку и "
+            "Docker остаётся в силе. Это одноразовая копия файлов, а не рабочий "
+            "клон гейта: в ней нет .git и символьных ссылок, действует "
+            f"export-ignore git archive.{left_out} Если по этому пути каталога "
+            "нет — это сбой доставки снимка, а не отказ среды: сдай "
+            "incomplete=true, назови это в lost_dimensions и суди по диффу.\n\n"
+        )
+    if snapshot.state == "empty":
+        return (
+            "СНИМОК ИСХОДНИКОВ: дерево на закреплённом коммите "
+            f"{snapshot.sha[:12]} пусто — читать в нём нечего. Это не сбой "
+            "монтирования: файлов в репозитории на этом коммите нет.\n\n"
+        )
+    return (
+        "СНИМОК ИСХОДНИКОВ: не собран — "
+        f"{snapshot.reason or 'причина не названа'}. Исходников вне диффа у тебя "
+        "нет: режим прежний (дифф и бриф), чего из них не установить — "
+        "называй в unresolved или lost_dimensions.\n\n"
+    )
+
+
+def _read_the_diff(inline_diff: bool, snapshot: SnapshotArchive | None) -> str:
+    if not inline_diff:
+        return _READ_THE_DIFF_BY_COMMAND
+    if snapshot is not None and snapshot.state == "ok":
+        return _READ_THE_DIFF_INLINE_SNAPSHOT
+    return _READ_THE_DIFF_INLINE
+
+
 def _brief_step(task_id: int, http: bool) -> str:
     """Чтение брифа тем путём, который есть у рана (#1584)."""
     if http:
@@ -2069,6 +2157,7 @@ def _review_prompt(
     only_tests_block: str = "",
     needs_container: bool = False,
     inline_diff: bool = False,
+    snapshot: SnapshotArchive | None = None,
 ) -> str:
     if inline_diff:
         # #1598: у локального ревьюера нет ни клона, ни права запускать — общее
@@ -2076,7 +2165,9 @@ def _review_prompt(
         opening = (
             f"Ты — независимый код-ревьюер задачи #{task_id} хаба Haiplane "
             f"(ветка {branch}). Строгие правила: НИЧЕГО не коммить, не пушить "
-            "и не менять — только читать дифф и бриф.\n\n" + LOCAL_CAPABILITIES_BLOCK
+            "и не менять — только читать дифф и бриф.\n\n"
+            + local_capabilities_block(snapshot)
+            + snapshot_block(snapshot)
         )
         attempts = ""
     else:
@@ -2134,7 +2225,7 @@ def _review_prompt(
             common + "Это ЛЁГКОЕ ревью: ОДИН проход. Порядок: "
             f"1) {brief_step(task_id, bool(delivery_block))}"
             f"{'' if inline_diff else ' — предмет ревью'}; "
-            f"2) {_READ_THE_DIFF_INLINE if inline_diff else _READ_THE_DIFF_BY_COMMAND}"
+            f"2) {_read_the_diff(inline_diff, snapshot)}"
             " — не исследуй репозиторий целиком, контекст берётся из диффа; "
             "3) один проход по изменённым файлам: ищи дефекты корректности, "
             "потерянные граничные случаи, несоответствие заявленным AC; "
@@ -3416,6 +3507,10 @@ class ReviewOrder:
     #: #1403: кто назначил профиль — правило (``rule``) или жребий (``random``).
     #: Уезжает в строку заказа рядом с профилем.
     profile_assignment: str = "rule"
+    #: #1599: снимок исходников на sha сдачи для локального ревьюера. ``None`` —
+    #: настройка выключена или заказ облачный; иначе состояние названо в
+    #: промте и в карточке, а байты уезжают в прогон.
+    snapshot: SnapshotArchive | None = None
 
 
 async def _small_delta(
@@ -3558,6 +3653,7 @@ async def prepare_review_order(
     rules_block, rules_note = await collect_review_rules(db, task_id, diff)
     prior, deferred = await previous_findings(db, task_id, generation)
     plan_diff, plan_branch = await _subject_diff(db, task, branch, diff, inline_diff)
+    snapshot = await _order_snapshot(task, ctx, branch) if inline_diff else None
     diff_block, diff_note = diff_plan(
         plan_diff,
         base,
@@ -3568,6 +3664,7 @@ async def prepare_review_order(
         subject.base_paths,
         deferred,
         config.LOCAL_REVIEW_DIFF_CHAR_CEILING if inline_diff else None,
+        snapshot_ok=snapshot is not None and snapshot.state == "ok",
     )
     # #875: what the toolchain already proved on THIS commit. Built from the
     # task row the caller already read, so no extra query for the common case.
@@ -3602,13 +3699,70 @@ async def prepare_review_order(
             call_sites.only_tests_block(only_tests),
             needs_container=task_needs_container(task),
             inline_diff=inline_diff,
+            snapshot=snapshot,
         ),
         rules_note=rules_note,
         diff_note=diff_note,
         prepass=prepass,
         access_code=code,
         only_tests=None if only_tests is None else tuple(s.symbol for s in only_tests),
+        snapshot=snapshot,
     )
+
+
+async def _order_snapshot(
+    task: dict[str, Any], ctx: tuple[str, str] | None, branch: str
+) -> SnapshotArchive | None:
+    """Снимок исходников локального заказа на ЗАКРЕПЛЁННОМ sha, или ``None`` (#1599).
+
+    ``None`` — настройка выключена: заказ ровно прежний. Иначе всегда
+    ``SnapshotArchive`` с состоянием: причина отсутствия называется, а не
+    теряется, и промт говорит о снимке то, что есть на деле. Снимок берётся из
+    клона ХАБА (не из рабочего клона гейта) и не источник его данных.
+    """
+    if not review_snapshot.wanted():
+        return None
+    sha = (task.get("submission_sha") or "").strip()
+    if reason := review_snapshot.blocker(local_reviewer.transport()):
+        return SnapshotArchive(sha=sha, data=None, reason=reason)
+    if not sha:
+        return SnapshotArchive(
+            sha="", data=None, reason="у сдачи нет закреплённого sha"
+        )
+    if ctx is None:
+        return SnapshotArchive(
+            sha=sha, data=None, reason="клон проекта на хабе не читается"
+        )
+    try:
+        taken = await plugins.git_ops.snapshot_archive(
+            ctx[0], sha, config.LOCAL_REVIEW_SNAPSHOT_MAX_BYTES, branch
+        )
+        if taken.state != "ok":
+            return taken
+        # Маркер пути у каждого заказа свой: буквальный плейсхолдер в диффе —
+        # данные ревьюера, и общая замена испортила бы их.
+        return dataclasses.replace(
+            taken, placeholder=f"@@SNAPSHOT_DIR:{secrets.token_hex(6)}@@"
+        )
+    except Exception as exc:  # noqa: BLE001 - degradation is the contract
+        log.warning("could not take the snapshot of task #%s: %s", task.get("id"), exc)
+        return SnapshotArchive(
+            sha=sha, data=None, reason=f"снимок не снят: {exc}"[:200]
+        )
+
+
+def snapshot_note(snapshot: SnapshotArchive | None) -> str:
+    """Строка о снимке для карточки задачи; пусто, если снимка не заказывали."""
+    if snapshot is None:
+        return ""
+    if snapshot.state == "ok":
+        size = len(snapshot.data or b"") // 1024
+        left_out = f"; исключено: {snapshot.note}" if snapshot.note else ""
+        return (
+            f"Снимок исходников на {snapshot.sha[:12]} ({size} КБ) выдан "
+            f"ревьюеру только для чтения{left_out} (#1599). "
+        )
+    return f"Снимок исходников не выдан: {snapshot.reason} (#1599). "
 
 
 async def _subject_diff(
@@ -5005,6 +5159,7 @@ async def dispatch_local_review(
         f"Профиль {order.profile}{_named_local_model(order.model)}, "
         f"прогон {run_id}. Правила репозитория: "
         f"{order.rules_note} (#873). Предмет ревью: {order.diff_note} (#874). "
+        f"{snapshot_note(order.snapshot)}"
         "Отчёт придёт по контракту от принципала локального ревьюера — "
         "его независимость держит токен, а не машина (#728).",
     )
@@ -5032,6 +5187,7 @@ async def dispatch_local_review(
         order.prompt,
         order.access_code,
         principal_id,
+        order.snapshot,
     )
     return True
 
@@ -5230,6 +5386,7 @@ async def _start_local_run(
     prompt: str,
     access_code: str = "",
     principal_id: int | None = None,
+    snapshot: SnapshotArchive | None = None,
 ) -> None:
     """Запустить прогон фоном и вернуть управление сдаче.
 
@@ -5250,6 +5407,7 @@ async def _start_local_run(
             prompt=prompt,
             access_code=access_code,
             principal_id=principal_id,
+            snapshot=snapshot,
         )
     )
     _LOCAL_RUNS[dispatch_id] = _LocalRunHandle(
@@ -5473,7 +5631,11 @@ async def _supervise_local_run(
     prompt: str,
     access_code: str = "",
     principal_id: int | None = None,
+    snapshot: SnapshotArchive | None = None,
 ) -> None:
+    # Снимок едет аргументом только когда он есть: прогон без снимка зовётся
+    # ровно так же, как до #1599.
+    extra: dict[str, Any] = {} if snapshot is None else {"snapshot": snapshot}
     run = await local_reviewer.run_review(
         prompt,
         prompt_at_slot=lambda ready: _prompt_at_slot(
@@ -5485,6 +5647,7 @@ async def _supervise_local_run(
             generation=generation,
             principal_id=principal_id,
         ),
+        **extra,
     )
     conn = None
     try:

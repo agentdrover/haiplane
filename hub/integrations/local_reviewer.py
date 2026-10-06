@@ -29,14 +29,23 @@ github.com — 201 (измерено 31.08.2026, #1119). Следствие на
 * **Песочница обязательна.** Пустая ``LOCAL_REVIEW_SANDBOX`` означает «пути
   нет», а не «запускай как есть»: настройка, о которой только заявлено,
   защитой не является, а хост несёт secrets.env, ключ Cursor и deploy key.
-* **Клона ревьюеру не даётся вовсе.** Постановка предлагала одноразовый клон;
+* **Рабочего клона ревьюеру не даётся вовсе, а исходники — одноразовым
+  снимком только для чтения (#1599).** Постановка #1180 предлагала клон;
   чтение кода показало, что можно сильнее. Дифф уезжает ревьюеру инлайном в
   промте (#1582): хаб снимает его на закреплённом sha сдачи из СВОЕГО клона, без
   сгенерированных файлов, и режет по файлам целиком под потолком
   ``LOCAL_REVIEW_DIFF_CHAR_CEILING`` (150000 символов), называя невошедшие в
-  промте — команды ``git diff`` ему не даётся, она без клона бессмысленна. Предмет
-  ревью он читает по HTTP через ``review-brief``, который
-  берёт данные из клона ХАБА и к форжу не ходит (проверено вызовом на
+  промте. Один дифф оставлял ревьюера слепым к коду вокруг (05.10, #1591:
+  подтверждённая high-находка «метода нет» о методе вне диффа). Поэтому при
+  ``LOCAL_REVIEW_SNAPSHOT=1`` хаб снимает ``git archive`` на ТОМ ЖЕ закреплённом
+  sha — не рабочий клон гейта, а tar без ссылок, — а проверенную раскладку
+  делает защищённый распаковщик (deploy/review-runner/snapshot_unpack.py,
+  недоступный хабу на запись): ``<workdir>/src`` только для чтения, а писать
+  ревьюер может лишь в ``<workdir>/home``. Изоляция #1180 этим не ослаблена:
+  клон гейта и его .git ревьюеру по-прежнему недоступны, снимок не источник
+  данных гейта и удаляется вместе с каталогом прогона. Команды ``git`` ему не
+  даётся, как и прежде. Предмет ревью он читает по HTTP через ``review-brief``,
+  который берёт данные из клона ХАБА и к форжу не ходит (проверено вызовом на
   GitVerse-задаче #1138). То, чего процессу не дали, испортить нельзя.
 * **Окружение собирается белым списком.** ``os.environ.copy()`` унёс бы в
   чужой процесс ключ Cursor, токены хаба и путь к рабочему клону. Здесь
@@ -73,6 +82,8 @@ from collections.abc import Awaitable, Callable
 from typing import Any, NamedTuple
 
 from hub import config
+from hub.integrations import review_snapshot
+from hub.integrations.protocols import SnapshotArchive
 from hub.process_kill import kill_process_group
 
 log = logging.getLogger(__name__)
@@ -759,11 +770,13 @@ def argv() -> list[str]:
     )
 
 
-def _clean_env(workdir: str) -> dict[str, str]:
+def _clean_env(workdir: str, home: str = "") -> dict[str, str]:
     env = {name: os.environ[name] for name in _ENV_PASSTHROUGH if name in os.environ}
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
-    env["HOME"] = workdir
-    env["TMPDIR"] = workdir
+    # Со снимком рабочий каталог закрыт на запись (src не подменить), писать
+    # ревьюеру можно только в ``home`` внутри него.
+    env["HOME"] = home or workdir
+    env["TMPDIR"] = home or workdir
     return env
 
 
@@ -797,6 +810,7 @@ async def run_review(
     *,
     timeout: int | None = None,
     prompt_at_slot: Callable[[str], Awaitable[str]] | None = None,
+    snapshot: SnapshotArchive | None = None,
 ) -> LocalRun | None:
     """Прогнать ревьюера над готовым промтом. ``None`` — запуска не было.
 
@@ -831,8 +845,15 @@ async def run_review(
     Возвращённый промт заменяет исходный целиком. Ошибаться он права не
     имеет: вызывающий обязан вернуть хоть что-то — хуже промта с мёртвым
     кодом только отсутствие промта.
+
+    ``snapshot`` (#1599) — снимок исходников, снятый хабом ДО прогона (здесь
+    хаб подпроцессов не запускает). Берётся в дело, только если настройка
+    включена и состояние ``ok``; иначе прогон идёт как раньше. Промт несёт
+    ``review_snapshot.PATH_PLACEHOLDER``, и подставляется в него фактический путь:
+    ``/work/src`` при runner, ``<workdir>/src`` при direct.
     """
     _REFUSAL.set("")
+    data = _snapshot_bytes(snapshot)
     if not is_configured():
         if transport() == "runner":
             # Причину уже назвал not_ready(); без этого карточка скажет «нет
@@ -855,7 +876,12 @@ async def run_review(
                 return None
             if prompt_at_slot is not None:
                 prompt = await prompt_at_slot(prompt)
-            return await _run_via_runner(prompt, limit)
+            prompt = review_snapshot.resolve_path(
+                prompt,
+                snapshot.placeholder if snapshot is not None else "",
+                review_snapshot.RUNNER_PATH if data else "",
+            )
+            return await _run_via_runner(prompt, limit, data)
     # Каталог прогона заводится ПОД ЗАМКОМ, а не до него: ждущий своей
     # очереди прогон иначе держал бы чужой каталог в scratch всё время
     # ожидания, а хаб обещает заводить его на прогон и сносить после.
@@ -877,12 +903,35 @@ async def run_review(
             # 0770, а не 0777: доступ даётся ГРУППЕ, общей у хаба и ревьюера,
             # — setgid на родителе (2770) проставляет её сам. Права «всем»
             # открыли бы промт с одноразовым кодом любому пользователю хоста.
-            os.chmod(workdir, 0o770)  # nosec B103 - права даны ГРУППЕ, не миру
+            if not data:
+                # Со снимком каталог остаётся приватным (0700) до конца
+                # проверки и закрывается на запись распаковщиком (#1599).
+                os.chmod(workdir, 0o770)  # nosec B103 - права даны ГРУППЕ, не миру
         except OSError as exc:
             log.warning("local reviewer: no scratch dir under %s: %s", base, exc)
             return None
         started = time.monotonic()
         try:
+            home = ""
+            if data:
+                reason = await asyncio.to_thread(
+                    review_snapshot.lay_out_direct,
+                    workdir,
+                    data,
+                    base,
+                    _reviewer_uid(),
+                )
+                if reason:
+                    _REFUSAL.set(reason)
+                    return None
+                home = os.path.join(workdir, "home")
+            prompt = review_snapshot.resolve_path(
+                prompt,
+                snapshot.placeholder if snapshot is not None else "",
+                review_snapshot.reviewer_visible_path(workdir) if data else "",
+            )
+            if home:
+                return await _spawn(prompt, workdir, limit, started, home)
             return await _spawn(prompt, workdir, limit, started)
         except (OSError, ValueError) as exc:
             # Нет бинаря, нет прав, пустая команда. Возврат None, а не исключение:
@@ -891,10 +940,26 @@ async def run_review(
             log.warning("local reviewer could not start: %s", exc)
             return None
         finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+            review_snapshot.remove_workdir(workdir, bool(data))
 
 
-async def _spawn(prompt: str, workdir: str, limit: int, started: float) -> LocalRun:
+def _reviewer_uid() -> int | None:
+    """uid ревьюера из песочницы или ``None`` (не разрешился — снимок не выдаётся)."""
+    tool, user = _named_sandbox_user()
+    entry = _resolve_user(user, tool) if user else None
+    return None if entry is None else int(entry.pw_uid)
+
+
+def _snapshot_bytes(snapshot: SnapshotArchive | None) -> bytes | None:
+    """Байты снимка, годные к прогону, или ``None`` (настройка выключена и т.п.)."""
+    if snapshot is None or snapshot.data is None or not review_snapshot.wanted():
+        return None
+    return snapshot.data
+
+
+async def _spawn(
+    prompt: str, workdir: str, limit: int, started: float, home: str = ""
+) -> LocalRun:
     proc = await asyncio.create_subprocess_exec(
         *argv(),
         stdin=asyncio.subprocess.PIPE,
@@ -904,7 +969,7 @@ async def _spawn(prompt: str, workdir: str, limit: int, started: float) -> Local
         # некому — обе стороны идут в одну ленту.
         stderr=asyncio.subprocess.STDOUT,
         cwd=workdir,
-        env=_clean_env(workdir),
+        env=_clean_env(workdir, home),
         # Своя сессия процесса — обязательное условие kill_process_group:
         # без неё группа у ребёнка общая с хабом, и убийство группы убило бы
         # сам хаб (#544).
@@ -1005,7 +1070,11 @@ SPOOL_CLAIMED = "claimed"
 SPOOL_CANCEL = "cancel"
 SPOOL_RESULT = "result.json"
 SPOOL_HEARTBEAT = "heartbeat"
+SPOOL_SNAPSHOT = review_snapshot.SPOOL_SNAPSHOT
 JOB_VERSION = 1
+# Задание со снимком исходников (#1599): старая служба знает только 1 и
+# отклоняет это задание ДО запуска модели.
+JOB_VERSION_SNAPSHOT = review_snapshot.JOB_VERSION_SNAPSHOT
 # Закрытый список полей задания: команды и путей в нём нет по построению.
 JOB_FIELDS = ("version", "timeout_sec")
 
@@ -1126,25 +1195,55 @@ def _take_drain_lock(fd: int) -> None:
             time.sleep(DRAIN_LOCK_POLL_SEC)
 
 
-def _submit_job_unless_draining(spool: str, prompt: str, limit: int) -> str:
+def _submit_job_unless_draining(
+    spool: str, prompt: str, limit: int, snapshot: bytes | None = None
+) -> str:
     """Проверка маркера И публикация задания под одним замком (#1588).
 
     Деплой считает задания под тем же замком, поэтому «маркер свежий» и
     «job.json появился» не могут разойтись: либо заказ опубликован до того,
     как деплой посчитал задания (и деплой его дождётся), либо он видит маркер
     и отказывает. Замок закрывается вместе с дескриптором.
+
+    Снимок (#1599) пишется ДО замка: это десятки мегабайт, а замок обязан
+    держаться только на коротких операциях (deploy/review-drain.sh). Каталог
+    без job.json служба не видит, поэтому «src.tar лежит, а задания нет» —
+    безопасное состояние; при отказе каталог убирается.
     """
-    fd = _open_drain_lock(spool)
+    staged = _stage_snapshot(spool, snapshot) if snapshot is not None else ""
+    fd = None
     try:
+        fd = _open_drain_lock(spool)
         if fd is not None:
             _take_drain_lock(fd)
         owner = _fresh_drain_marker(spool)
         if owner is not None:
             raise DrainActive(f"{DRAIN_REASON} [{owner}]")
+        if staged:
+            return _submit_job(
+                spool, prompt, limit, jobdir=staged, version=JOB_VERSION_SNAPSHOT
+            )
         return _submit_job(spool, prompt, limit)
+    except BaseException:
+        if staged:
+            shutil.rmtree(staged, ignore_errors=True)
+        raise
     finally:
         if fd is not None:
             os.close(fd)
+
+
+def _stage_snapshot(spool: str, snapshot: bytes) -> str:
+    """Каталог задания с одним ``src.tar``; ``job.json`` ещё нет."""
+    jobdir = os.path.join(spool, "job-" + secrets.token_hex(8))
+    os.mkdir(jobdir, 0o770)
+    try:
+        os.chmod(jobdir, 0o770)  # nosec B103 - группе, не миру
+        _write_spool_file(jobdir, SPOOL_SNAPSHOT, snapshot)
+    except OSError:
+        shutil.rmtree(jobdir, ignore_errors=True)
+        raise
+    return jobdir
 
 
 # Причина последнего отказа транспорта. ContextVar, а не поле модуля: прогонов
@@ -1223,19 +1322,28 @@ def _runner_silent(jobdir: str) -> bool:
     return age is None or age > RUNNER_HEARTBEAT_MAX_AGE_SEC
 
 
-def _submit_job(spool: str, prompt: str, limit: int) -> str:
+def _submit_job(
+    spool: str,
+    prompt: str,
+    limit: int,
+    *,
+    jobdir: str = "",
+    version: int = JOB_VERSION,
+) -> str:
     """Положить задание в очередь. Возвращает каталог задания.
 
-    Порядок несущий: сначала промт, ПОТОМ job.json атомарным переименованием.
-    Служба берёт только каталоги с job.json, поэтому полупрописанное задание
-    она не увидит. Промт — 0660 с группой каталога: ни миру, ни в argv.
+    Порядок несущий: сначала промт (и снимок), ПОТОМ job.json атомарным
+    переименованием. Служба берёт только каталоги с job.json, поэтому
+    полупрописанное задание она не увидит. Промт — 0660 с группой каталога:
+    ни миру, ни в argv. ``jobdir`` — каталог, где снимок уже лежит (#1599).
     """
-    jobdir = os.path.join(spool, "job-" + secrets.token_hex(8))
-    os.mkdir(jobdir, 0o770)
+    if not jobdir:
+        jobdir = os.path.join(spool, "job-" + secrets.token_hex(8))
+        os.mkdir(jobdir, 0o770)
     try:
         os.chmod(jobdir, 0o770)  # nosec B103 - группе, не миру
         _write_spool_file(jobdir, SPOOL_PROMPT, prompt.encode())
-        job = {"version": JOB_VERSION, "timeout_sec": int(limit)}
+        job = {"version": version, "timeout_sec": int(limit)}
         _write_spool_file(jobdir, SPOOL_JOB, json.dumps(job).encode())
     except OSError:
         shutil.rmtree(jobdir, ignore_errors=True)
@@ -1248,7 +1356,9 @@ def _write_spool_file(jobdir: str, name: str, data: bytes) -> None:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o660)
     try:
         os.fchmod(fd, 0o660)  # nosec B103 - группе хаба и службы, не миру
-        os.write(fd, data)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
     finally:
         os.close(fd)
     os.replace(tmp, os.path.join(jobdir, name))
@@ -1307,7 +1417,7 @@ def _cancel_job(jobdir: str, *, withdraw: bool) -> None:
     with contextlib.suppress(OSError):
         _write_spool_file(jobdir, SPOOL_CANCEL, b"")
     if withdraw:
-        for name in (SPOOL_PROMPT, SPOOL_JOB):
+        for name in (SPOOL_PROMPT, SPOOL_JOB, SPOOL_SNAPSHOT):
             with contextlib.suppress(OSError):
                 os.unlink(os.path.join(jobdir, name))
 
@@ -1370,16 +1480,28 @@ async def _time_out(jobdir: str, started: float) -> LocalRun:
     )
 
 
-async def _run_via_runner(prompt: str, limit: int) -> LocalRun | None:
+async def _run_via_runner(
+    prompt: str, limit: int, snapshot: bytes | None = None
+) -> LocalRun | None:
     """Прогон через службу-исполнитель. ``None`` — запуска не было."""
     started = time.monotonic()
     spool = config.LOCAL_REVIEW_SPOOL_DIR.strip()
+    publishing = asyncio.ensure_future(
+        asyncio.to_thread(_submit_job_unless_draining, spool, prompt, limit, snapshot)
+    )
     try:
         # В потоке: замок и запись промта — блокирующие вызовы, event loop
-        # хаба занят и чужими запросами.
-        jobdir = await asyncio.to_thread(
-            _submit_job_unless_draining, spool, prompt, limit
-        )
+        # хаба занят и чужими запросами. shield: отмена await не останавливает
+        # поток, и он всё равно опубликует задание — поэтому при отмене ждём
+        # его и сами отзываем то, что он успел опубликовать (находка Codex).
+        jobdir = await asyncio.shield(publishing)
+    except asyncio.CancelledError:
+        published = ""
+        with contextlib.suppress(DrainActive, OSError, asyncio.CancelledError):
+            published = await publishing
+        if published:
+            _cancel_job(published, withdraw=True)
+        raise
     except DrainActive as exc:
         _REFUSAL.set(exc.reason)
         return None
@@ -1388,7 +1510,10 @@ async def _run_via_runner(prompt: str, limit: int) -> LocalRun | None:
         _REFUSAL.set(f"задание не записано в очередь службы: {exc}")
         return None
     try:
-        return await _await_result(jobdir, limit, started)
+        run = await _await_result(jobdir, limit, started)
+        if run is None and snapshot is not None:
+            _REFUSAL.set(_old_runner_hint(refusal()))
+        return run
     except asyncio.CancelledError:
         # Хаб останавливают: снять прогон через службу и не оставить промт.
         _cancel_job(jobdir, withdraw=True)
@@ -1397,3 +1522,19 @@ async def _run_via_runner(prompt: str, limit: int) -> LocalRun | None:
     finally:
         if jobdir:
             shutil.rmtree(jobdir, ignore_errors=True)
+
+
+def _old_runner_hint(reason: str) -> str:
+    """Старая служба не знает version=2: назвать это, а не отдать голый отказ.
+
+    Хаб не повторяет прогон без снимка молча: ревьюер, которому обещали
+    исходники, судил бы вслепую, а карточка говорила бы обратное.
+    """
+    if "версия задания не поддерживается" not in reason:
+        return reason
+    return (
+        f"{reason}. Служба-исполнитель на хосте старая и снимка исходников не "
+        "знает: установите snapshot_unpack.py и новую службу (порядок — "
+        "deploy/LOCAL-REVIEW.md, «Выкат снимка») либо выключите "
+        "LOCAL_REVIEW_SNAPSHOT"
+    )

@@ -8,6 +8,12 @@
 # унаследовали бы её и сломались. Защита службы — в её коде: команда берётся
 # только из конфига, задание несёт закрытый список полей (см. docstring
 # haiplane-review-runner.py).
+#
+# Снимок исходников (#1599): рядом со скриптом службы, в том же root-овом
+# каталоге, должен лежать snapshot_unpack.py (0644 root:root). Служба грузит его
+# по явному пути и отказывается, если файл или каталог над ним доступен на запись
+# не root. Задание version=2 без него отклоняется до запуска модели. Проверка
+# установки: ExecStart-скрипт с --check-install (deploy/LOCAL-REVIEW.md).
 [Unit]
 Description=Haiplane review runner (launches the local reviewer for the hub)
 After=network.target
@@ -19,7 +25,10 @@ Type=simple
 User=<пользователь хаба>
 Group=haiplane-review
 EnvironmentFile=/etc/haiplane-review-runner.env
-ExecStart=/usr/bin/python3 /usr/local/lib/haiplane-review-runner/haiplane-review-runner.py
+# -I: без user site, PYTHONPATH, .pth/usercustomize и cwd в пути импорта. Служба
+# работает от пользователя хаба, и без -I его usercustomize.py исполнился бы ДО
+# проверки распаковщика.
+ExecStart=/usr/bin/python3 -I /usr/local/lib/haiplane-review-runner/haiplane-review-runner.py
 # Файлы очереди — группе (0660), не миру.
 UMask=0007
 Restart=on-failure
