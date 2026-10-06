@@ -50,6 +50,8 @@ class PolicyEntry:
     #: Если действующее значение выведено из СОСЕДНЕГО ключа, а не прочитано
     #: из своего, возвращает «ключ=значение» этого соседа; иначе пусто.
     derived_from: Callable[[dict], str] | None = None
+    #: Читаемый вид значения, когда общий «N rule(s)» ничего не говорит (#1594).
+    show: Callable[[Any], str] | None = None
 
 
 def _review_derived_from(policy: dict) -> str:
@@ -168,6 +170,11 @@ REGISTRY: dict[str, PolicyEntry] = {
     "release_artifacts": PolicyEntry(
         project_policy.release_artifacts_of, "project_policy.release_artifacts_of"
     ),
+    "freeze": PolicyEntry(
+        project_policy.freeze_view_of,
+        "project_policy.freeze_of",
+        show=project_policy.freeze_show,
+    ),
     "slot_dead_minutes": PolicyEntry(
         executor_slots.dead_minutes_of,
         "executor_slots.dead_minutes_of",
@@ -226,6 +233,8 @@ def _key_row(key: str, entry: PolicyEntry, policy: dict) -> dict[str, Any]:
         row["stored"] = policy[key]
     if derived:
         row["derived_from"] = derived
+    if entry.show is not None:
+        row["shown"] = entry.show(row["value"])
     return row
 
 
@@ -359,11 +368,13 @@ def _scheduled_block(
             entry = REGISTRY.get(key)
             if entry is None:
                 continue
+            planned = entry.read(running)
             by_key.setdefault(key, []).append(
                 {
                     "id": item["id"],
                     "at": item["at"],
-                    "value": entry.read(running),
+                    "value": planned,
+                    "shown": entry.show(planned) if entry.show else None,
                     "note": item["note"],
                 }
             )
@@ -417,8 +428,15 @@ def _source_label(row: dict[str, Any]) -> str:
     return row["source"]
 
 
+def _row_value(row: dict[str, Any]) -> str:
+    """Значение ключа для человека: свой вид ключа, иначе общий."""
+    return row["shown"] if "shown" in row else _show(row["value"])
+
+
 def _stored_note(row: dict[str, Any]) -> str:
     """Сохранённое значение рядом, если оно расходится с действующим."""
+    if "shown" in row:
+        return ""
     if "stored" in row and row["stored"] != row["value"]:
         return f" (stored {_show(row['stored'])})"
     return ""
@@ -429,12 +447,12 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
     lines = [f"Effective policy of project {data['slug']}"]
     for row in data["keys"]:
         lines.append(
-            f"  {row['key']} = {_show(row['value'])} [{_source_label(row)}]"
+            f"  {row['key']} = {_row_value(row)} [{_source_label(row)}]"
             + _stored_note(row)
         )
         for plan in row.get("scheduled") or []:
             lines.append(
-                f"    → {_show(plan['value'])} с {plan['at']} "
+                f"    → {plan.get('shown') or _show(plan['value'])} с {plan['at']} "
                 f"(отложенная правка #{plan['id']})"
             )
     for key, value in (data.get("unknown_keys") or {}).items():
@@ -524,7 +542,7 @@ def format_policy_brief(data: dict[str, Any]) -> list[str]:
     """Короткий блок для hub_my_context: только то, что отличается от умолчаний."""
     shown = [r for r in data["keys"] if r["source"] in ("project", "derived")]
     parts = [
-        f"{r['key']} = {_show(r['value'])} [{_source_label(r)}]" + _stored_note(r)
+        f"{r['key']} = {_row_value(r)} [{_source_label(r)}]" + _stored_note(r)
         for r in shown
     ]
     steward = data["steward"]

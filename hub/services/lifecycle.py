@@ -52,7 +52,11 @@ from hub.services import (
     submission_contract,
     verdict_text,
 )
-from hub.services.project_policy import risk_map_for_task
+from hub.services.project_policy import (
+    FREEZE_REFUSED,
+    freeze_admission,
+    risk_map_for_task,
+)
 from hub.services.risk_class import derive_risk_class
 from hub.models import RiskClass, TaskDeclareWait, TaskStatus
 from hub.mcp_envelope import enrich_error_payload
@@ -950,6 +954,84 @@ async def _load_task_view(db: aiosqlite.Connection, task_id: int) -> TaskView:
     return row_to_task(row)  # type: ignore[arg-type]
 
 
+def _require_freeze_admission(
+    project: Any, work_type: Any, rationale: str, *, where: str = ""
+) -> None:
+    """Отказ 422, если заморозка проекта не пускает эту работу (#1594).
+
+    Тонкая обёртка над ``project_policy.freeze_admission``: проверка одна, а
+    здесь она лишь превращается в структурированный отказ. ``where`` называет
+    элемент пачки, чтобы смешанная пачка отказывала поимённо.
+    """
+    refusal = freeze_admission(project, work_type, rationale)
+    if refusal is None:
+        return
+    detail = refusal.detail()
+    if where:
+        detail["message"] = f"{where}: {refusal.text}"
+    raise HTTPException(422, detail=detail)
+
+
+async def _project_of_new_task(
+    db: aiosqlite.Connection, parent_id: int | None, bound: Any = None
+) -> Any:
+    """Проект, в который войдёт ещё не созданная задача (#1594).
+
+    Тем же наследованием, что и у существующей: эпик с ``project`` - в него,
+    иначе по родителю, иначе проект default (запасной путь
+    ``resolve_project_for_task``).
+    """
+    if bound is not None:
+        # Строка, прочитанная до write-лока, могла устареть: перечитывается.
+        return await repo.get_project(db, int(bound["id"]))
+    if parent_id is not None:
+        return await repo.resolve_project_for_task(db, parent_id)
+    return await repo.get_project_by_slug(db, "default")
+
+
+async def _epic_project_at_creation(db: aiosqlite.Connection, body: TaskCreate) -> Any:
+    """Строка проекта, к которому привязывается создаваемый эпик (#346); иначе None."""
+    if not body.project:
+        return None
+    if body.task_type != TaskType.epic:
+        raise HTTPException(
+            422, "project can only be set on epics; children inherit it"
+        )
+    project_row = await repo.get_project_by_slug(db, body.project)
+    if project_row is None:
+        raise HTTPException(422, f"unknown project slug: {body.project!r}")
+    if project_row["archived"] or project_row["status"] != "active":
+        raise HTTPException(
+            422,
+            f"project {body.project!r} is not active "
+            "(pending proposals and archived projects cannot take epics)",
+        )
+    return project_row
+
+
+async def _replay_after_conflict(
+    db: aiosqlite.Connection, idem_key: str | None, request_hash: str | None
+) -> CreateTaskOutcome:
+    """Гонка за ключ идемпотентности: вернуть победителя или 409 (прежняя логика).
+
+    Без ключа или без записи по нему исходная IntegrityError пробрасывается.
+    """
+    if not idem_key:
+        raise
+    existing = await repo.get_task_idempotency_key(db, idem_key)
+    if not existing:
+        raise
+    if existing["request_hash"] != request_hash:
+        record = IdempotencyRecord(
+            client_request_id=idem_key,
+            task_id=int(existing["task_id"]),
+            request_hash=existing["request_hash"],
+        )
+        raise HTTPException(409, idempotency_conflict_detail(record)) from None
+    task = await _load_task_view(db, int(existing["task_id"]))
+    return CreateTaskOutcome(task=task, is_new=False)
+
+
 async def create_task(
     db: aiosqlite.Connection,
     body: TaskCreate,
@@ -979,22 +1061,8 @@ async def create_task(
 
     # Bind an epic to a project at creation (#346). Only epics carry
     # project_id — children resolve it by walking up to the root epic.
-    project_id: int | None = None
-    if body.project:
-        if body.task_type != TaskType.epic:
-            raise HTTPException(
-                422, "project can only be set on epics; children inherit it"
-            )
-        project_row = await repo.get_project_by_slug(db, body.project)
-        if project_row is None:
-            raise HTTPException(422, f"unknown project slug: {body.project!r}")
-        if project_row["archived"] or project_row["status"] != "active":
-            raise HTTPException(
-                422,
-                f"project {body.project!r} is not active "
-                "(pending proposals and archived projects cannot take epics)",
-            )
-        project_id = project_row["id"]
+    bound_project = await _epic_project_at_creation(db, body)
+    project_id: int | None = bound_project["id"] if bound_project else None
 
     initial_status, normalized = normalize_task_create(body)
     if force_draft:
@@ -1004,7 +1072,13 @@ async def create_task(
     if run_held:
         initial_status = "open"
 
+    owns_tx = not db.in_transaction
     try:
+        # #1594: write-лок берётся ДО чтения политики проекта. Допуск заморозки
+        # и вставка - одна транзакция: правка политики между ними иначе
+        # пропускала бы работу, запрещённую уже действующей заморозкой.
+        if owns_tx:
+            await db.execute("BEGIN IMMEDIATE")
         if idem_key:
             existing = await repo.get_task_idempotency_key(db, idem_key)
             if existing:
@@ -1021,6 +1095,18 @@ async def create_task(
                 await db.commit()
                 task = await _load_task_view(db, int(existing["task_id"]))
                 return CreateTaskOutcome(task=task, is_new=False)
+
+        # #1594: уже одобренная работа входит в проект только через допуск
+        # заморозки. После поиска по ключу: повтор успешного создания вернул
+        # бы существующую задачу выше, и заморозка к нему не применяется;
+        # проверяется только новая вставка. Черновик (в т.ч. от агента) не
+        # ограничивается.
+        if initial_status != "draft":
+            _require_freeze_admission(
+                await _project_of_new_task(db, normalized.parent_id, bound_project),
+                normalized.work_type,
+                normalized.freeze_rationale,
+            )
 
         # Structured-aware insert so all fields from TaskCreate (work_type,
         # scope_in/out, user_story, etc.) persist (#46). ``normalized`` carries
@@ -1053,27 +1139,18 @@ async def create_task(
 
         await db.commit()
     except HTTPException:
-        await db.rollback()
+        if owns_tx:
+            await db.rollback()
         raise
     except aiosqlite.IntegrityError:
         await db.rollback()
-        if not idem_key:
-            raise
-        existing = await repo.get_task_idempotency_key(db, idem_key)
-        if not existing:
-            raise
-        if existing["request_hash"] != request_hash:
-            record = IdempotencyRecord(
-                client_request_id=idem_key,
-                task_id=int(existing["task_id"]),
-                request_hash=existing["request_hash"],
-            )
-            raise HTTPException(
-                409,
-                idempotency_conflict_detail(record),
-            ) from None
-        task = await _load_task_view(db, int(existing["task_id"]))
-        return CreateTaskOutcome(task=task, is_new=False)
+        return await _replay_after_conflict(db, idem_key, request_hash)
+    except BaseException:
+        # Любое иное исключение (ValueError, OperationalError, отмена) не должно
+        # оставлять BEGIN IMMEDIATE открытым и write-лок занятым (#1594).
+        if owns_tx and db.in_transaction:
+            await db.rollback()
+        raise
 
     result: dict[str, Any] = {}
     if _wants_run(normalized):
@@ -1125,6 +1202,24 @@ async def _run_created_task(
     return await dispatch_task(db, task_id, dict(row))  # type: ignore[arg-type]
 
 
+async def _require_bulk_admission(
+    db: aiosqlite.Connection, parent_id: int, items: list[Any]
+) -> None:
+    """Допуск пачки открытой работы поштучно, под write-локом (#1594).
+
+    Политика читается уже под локом; одна непрошедшая позиция отказывает всей
+    пачке, и ничего не создано.
+    """
+    project = await _project_of_new_task(db, parent_id)
+    for index, item in enumerate(items):
+        _require_freeze_admission(
+            project,
+            item.work_type,
+            item.freeze_rationale,
+            where=f"items[{index}] {item.title!r}",
+        )
+
+
 async def create_subtasks_bulk(
     db: aiosqlite.Connection,
     parent_id: int,
@@ -1174,6 +1269,8 @@ async def create_subtasks_bulk(
 
     created_ids: list[int] = []
     async with write_transaction(db):
+        if initial_status != "draft":
+            await _require_bulk_admission(db, parent_id, body.items)
         await db.execute("SAVEPOINT bulk_child_tasks")
         try:
             for idx, item in enumerate(body.items):
@@ -1187,6 +1284,8 @@ async def create_subtasks_bulk(
                     agent=body.agent,
                     auto_review=auto_review,
                     run_immediately=False,
+                    work_type=item.work_type,
+                    freeze_rationale=item.freeze_rationale,
                 )
                 task_id = await repo.create_task_full(
                     db,
@@ -1225,6 +1324,138 @@ async def create_subtasks_bulk(
     return views
 
 
+@contextlib.asynccontextmanager
+async def _local_rollback(db: aiosqlite.Connection) -> AsyncIterator[None]:
+    """Откат только своей работы внутри чужой транзакции (SAVEPOINT).
+
+    Владелец транзакции - вызывающий: мы её не коммитим и не откатываем целиком,
+    а при отказе возвращаем лишь то, что записали сами (#1594).
+    """
+    await db.execute("SAVEPOINT approve_local")
+    try:
+        yield
+    except BaseException:
+        await db.execute("ROLLBACK TO SAVEPOINT approve_local")
+        await db.execute("RELEASE SAVEPOINT approve_local")
+        raise
+    else:
+        await db.execute("RELEASE SAVEPOINT approve_local")
+
+
+async def _open_draft_under_lock(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    body: TaskApprove,
+    readiness: Any,
+    caller_owns_tx: bool = False,
+) -> str | None:
+    """Допуск заморозки, DoR-override и переход draft -> open одной транзакцией.
+
+    ``BEGIN IMMEDIATE`` берётся ДО чтения: проект, политика, work_type и
+    обоснование перечитываются под write-локом, и решение заморозки принимается
+    по ним, а не по тому, что было прочитано до расчёта DoR (#1594). Конкурентный
+    refine или правка политики между проверкой и переходом иначе открыли бы
+    запрещённую работу. Отказ откатывает всё, включая запись override.
+    Возвращает сводку DoR-override (или None).
+    """
+    scope = _local_rollback(db) if caller_owns_tx else write_transaction(db)
+    async with scope:
+        fresh = await repo.get_task(db, task_id)
+        if fresh is None or fresh["status"] != "draft":
+            raise HTTPException(409, "task is no longer draft (concurrent approve?)")
+        task.update(dict(fresh))
+        _require_freeze_admission(
+            await repo.resolve_project_for_task(db, task_id),
+            fresh["work_type"],
+            fresh["freeze_rationale"] or "",
+        )
+        dor_override_summary: str | None = None
+        if not readiness.dor_passed:
+            # Use the report's required-only list. Filtering dor_checks ourselves
+            # would mistakenly include checks that failed but aren't required
+            # for this work_type (review I1).
+            missing = readiness.missing_required
+            if not body.force:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "dor_failed",
+                        "task_id": task_id,
+                        "score": readiness.score,
+                        "missing_required": missing,
+                        # Dump the whole Recommendation instead of re-typing a
+                        # subset of its fields (#1172). The hand-built dict here
+                        # silently dropped ``defect_code``, so the one refusal a
+                        # caller actually receives carried human prose and no
+                        # vocabulary code — exactly the thing the closed
+                        # vocabulary exists to prevent. model_dump also means the
+                        # next field added to Recommendation reaches this payload
+                        # without anyone remembering to widen it.
+                        "recommendations": [
+                            r.model_dump() for r in readiness.recommendations
+                        ],
+                        "hint": "pass force=true to override the DoR gate",
+                    },
+                )
+            dor_override_summary = ", ".join(missing) or "<unknown>"
+            log.warning(
+                "DoR override on approve for task #%s (missing: %s)",
+                task_id,
+                dor_override_summary,
+            )
+            override_message = (
+                f"Approve override: DoR failed (missing: {dor_override_summary}); "
+                f"approved with force=true"
+            )
+            if body.comment:
+                override_message += f". Comment: {body.comment}"
+            await repo.add_task_update(db, task_id, "", "alert", override_message)
+        elif body.force:
+            # DoR passed but the caller still set force=true. Record the
+            # explicit human override so post-mortems can spot "we forced
+            # this even though we didn't strictly need to" — review I7.
+            force_message = (
+                "Approve override: force=true requested (DoR was already passing)"
+            )
+            if body.comment:
+                force_message += f". Comment: {body.comment}"
+            await repo.add_task_update(db, task_id, "", "alert", force_message)
+
+        from hub.services.dor import record_statement_paths
+
+        await record_statement_paths(db, task_id, readiness.dor_checks)
+
+        if body.comment and dor_override_summary is None and not body.force:
+            await repo.add_task_update(
+                db, task_id, "", "status", f"Approved: {body.comment}"
+            )
+
+        if body.runtime:
+            await repo.update_task(db, task_id, runtime=body.runtime.value)
+            task["runtime"] = body.runtime.value
+
+        # Atomic conditional transition: a concurrent second approve will see
+        # ``rowcount == 0`` and get a 409 instead of being silently double-
+        # processed. Even though aiosqlite serializes a shared connection
+        # today, this guards us when someone moves to a per-request connection
+        # or a pool. Review I5.
+        transitioned = await repo.transition_status_if(
+            db, task_id, expected_from="draft", new_status="open"
+        )
+        if transitioned:
+            await repo.insert_event(
+                db,
+                kind="task_approved",
+                task_id=task_id,
+                actor="human",
+                payload={"run": bool(body.run), "force": bool(body.force)},
+            )
+        if not transitioned:
+            raise HTTPException(409, "task is no longer draft (concurrent approve?)")
+    return dor_override_summary
+
+
 async def approve_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1239,6 +1470,8 @@ async def approve_task(
     ``alert`` updates and tagged in the activity log so the audit trail
     stays intact.
     """
+    # Транзакцию, уже открытую вызывающим, не коммитим и не начинаем заново.
+    caller_owns_tx = db.in_transaction
     row = await repo.get_task(db, task_id)
     if not row:
         raise HTTPException(404, "task not found")
@@ -1251,6 +1484,16 @@ async def approve_task(
 
     body = body or TaskApprove()
 
+    # --- Freeze admission (#1594) ------------------------------------------
+    # До DoR и до любой записи: отказ не оставляет следов, а force (который
+    # обходит только DoR) заморозку не обходит. Сюда сходятся REST, batch,
+    # web, CLI, MCP и compatibility-маршруты.
+    _require_freeze_admission(
+        await repo.resolve_project_for_task(db, task_id),
+        task.get("work_type"),
+        task.get("freeze_rationale") or "",
+    )
+
     # --- DoR gate -----------------------------------------------------------
     # Import locally to avoid a circular dependency (services.recommendations
     # imports from .readiness which imports from .dor; lifecycle is called
@@ -1260,90 +1503,11 @@ async def approve_task(
     )
 
     readiness = await calculate_readiness_with_recommendations(db, task_id)
-    dor_override_summary: str | None = None
-    if not readiness.dor_passed:
-        # Use the report's required-only list. Filtering dor_checks ourselves
-        # would mistakenly include checks that failed but aren't required
-        # for this work_type (review I1).
-        missing = readiness.missing_required
-        if not body.force:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "dor_failed",
-                    "task_id": task_id,
-                    "score": readiness.score,
-                    "missing_required": missing,
-                    # Dump the whole Recommendation instead of re-typing a
-                    # subset of its fields (#1172). The hand-built dict here
-                    # silently dropped ``defect_code``, so the one refusal a
-                    # caller actually receives carried human prose and no
-                    # vocabulary code — exactly the thing the closed
-                    # vocabulary exists to prevent. model_dump also means the
-                    # next field added to Recommendation reaches this payload
-                    # without anyone remembering to widen it.
-                    "recommendations": [
-                        r.model_dump() for r in readiness.recommendations
-                    ],
-                    "hint": "pass force=true to override the DoR gate",
-                },
-            )
-        dor_override_summary = ", ".join(missing) or "<unknown>"
-        log.warning(
-            "DoR override on approve for task #%s (missing: %s)",
-            task_id,
-            dor_override_summary,
-        )
-        override_message = (
-            f"Approve override: DoR failed (missing: {dor_override_summary}); "
-            f"approved with force=true"
-        )
-        if body.comment:
-            override_message += f". Comment: {body.comment}"
-        await repo.add_task_update(db, task_id, "", "alert", override_message)
-    elif body.force:
-        # DoR passed but the caller still set force=true. Record the
-        # explicit human override so post-mortems can spot "we forced
-        # this even though we didn't strictly need to" — review I7.
-        force_message = (
-            "Approve override: force=true requested (DoR was already passing)"
-        )
-        if body.comment:
-            force_message += f". Comment: {body.comment}"
-        await repo.add_task_update(db, task_id, "", "alert", force_message)
-
-    from hub.services.dor import record_statement_paths
-
-    await record_statement_paths(db, task_id, readiness.dor_checks)
-
-    if body.comment and dor_override_summary is None and not body.force:
-        await repo.add_task_update(
-            db, task_id, "", "status", f"Approved: {body.comment}"
-        )
-
-    if body.runtime:
-        await repo.update_task(db, task_id, runtime=body.runtime.value)
-        task["runtime"] = body.runtime.value
-
-    # Atomic conditional transition: a concurrent second approve will see
-    # ``rowcount == 0`` and get a 409 instead of being silently double-
-    # processed. Even though aiosqlite serializes a shared connection
-    # today, this guards us when someone moves to a per-request connection
-    # or a pool. Review I5.
-    transitioned = await repo.transition_status_if(
-        db, task_id, expected_from="draft", new_status="open"
+    if db.in_transaction and not caller_owns_tx:
+        await db.commit()
+    dor_override_summary = await _open_draft_under_lock(
+        db, task_id, task, body, readiness, caller_owns_tx
     )
-    if transitioned:
-        await repo.insert_event(
-            db,
-            kind="task_approved",
-            task_id=task_id,
-            actor="human",
-            payload={"run": bool(body.run), "force": bool(body.force)},
-        )
-    await db.commit()
-    if not transitioned:
-        raise HTTPException(409, "task is no longer draft (concurrent approve?)")
 
     # #1264: the approval stands; only the run waits for the review queue.
     run_held = bool(body.run) and not await run_allowed_by_review_limit(
@@ -1488,10 +1652,14 @@ async def batch_approve_tasks(
         except HTTPException as exc:
             reason = "approve_failed"
             detail = exc.detail
+            text = ""
             if isinstance(detail, dict):
                 reason = detail.get("reason") or detail.get("error") or reason
+                # #1594: у отказа заморозки есть текст со сроком и note.
+                if reason == FREEZE_REFUSED:
+                    text = str(detail.get("message") or "")
             result.skipped.append(
-                BatchApproveSkipped(task_id=task_id, reason=f"{reason}")
+                BatchApproveSkipped(task_id=task_id, reason=f"{reason}", detail=text)
             )
             continue
         result.approved.append(task_id)

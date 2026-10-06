@@ -406,9 +406,36 @@ def test_the_statement_fields_match_what_refine_can_write():
         # бы покупать прогон за перестановку людей
         "human_owner",
         "human_reviewer",
+        # почему работа допущена при заморозке проекта (#1594): учёт допуска,
+        # не содержание постановки. Правка обоснования не меняет ни слова,
+        # которое читает стюард, и новая ревизия за неё была бы покупкой прогона
+        "freeze_rationale",
     }
 
     assert writable - not_the_statement == set(STATEMENT_FIELDS), (
         "refine умеет писать поле, которого нет в отпечатке постановки — "
         "правка по нему пройдёт мимо счётчика ревизий"
     )
+
+
+async def test_editing_the_freeze_rationale_is_not_a_statement_revision(
+    db: aiosqlite.Connection,
+):
+    """#1594: обоснование допуска при заморозке - учёт, а не постановка.
+
+    Классификация одна и согласована: refine не штампует дату постановки, а
+    отпечаток не считает поле, поэтому правка не покупает ревизию и новый
+    прогон стюарда. Контроль: правка настоящего поля постановки её двигает.
+    """
+    task_id = await _draft(db)
+    await refine_task(db, task_id, TaskRefine(problem_statement="что сломано"))
+    before = await _generation(db, task_id)
+    stamp = dict(await repo.get_task(db, task_id))["prepared_at"]
+
+    await refine_task(db, task_id, TaskRefine(freeze_rationale="сбой в проде"))
+    assert await _generation(db, task_id) == before
+    assert dict(await repo.get_task(db, task_id))["prepared_at"] == stamp
+    assert "freeze_rationale" not in STATEMENT_FIELDS
+
+    await refine_task(db, task_id, TaskRefine(business_value="зачем"))
+    assert await _generation(db, task_id) == before + 1

@@ -179,6 +179,14 @@
                             </div>
                         </div>
 
+                        <!-- Freeze rationale (#1594): required when the project is frozen -->
+                        <div class="nt-row">
+                            <div class="nt-field nt-field--full">
+                                <label class="nt-label" for="nt-freeze">Freeze rationale</label>
+                                <input type="text" id="nt-freeze" name="freeze_rationale" maxlength="1000" placeholder="Why this work is allowed while the project is frozen (empty if no freeze)">
+                            </div>
+                        </div>
+
                         <!-- Description -->
                         <div class="nt-row">
                             <div class="nt-field nt-field--full">
@@ -358,12 +366,10 @@ function toggleRefine() {
         var checked = document.querySelector('input[name="task_type"]:checked');
         if (!checked) return;
         var v = checked.value;
-        var wt = document.getElementById('nt-worktype-wrap');
         var pp = document.getElementById('nt-parent-wrap');
         var rt = document.getElementById('nt-runtime-wrap');
         var run = document.getElementById('nt-run-now');
-        // work_type only meaningful for plain Task
-        wt.style.display = (v === 'task') ? '' : 'none';
+        // work_type applies to every kind of work (#1594): a freeze admits by type
         // Epic has no parent
         pp.style.display = (v === 'epic') ? 'none' : '';
         // Epic / Feature don't run on agents directly

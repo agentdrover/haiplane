@@ -101,6 +101,12 @@
                     <div class="u-pre-wrap">{{ task.rationale }}</div>
                 </div>
                 {% endif %}
+                {% if task.freeze_rationale %}
+                <div class="task-rationale">
+                    <span>Freeze rationale</span>
+                    <div class="u-pre-wrap">{{ task.freeze_rationale }}</div>
+                </div>
+                {% endif %}
             {% endcall %}
 
             {% if not review_board %}
@@ -585,6 +591,13 @@
 
                 {% if task.status.value == 'draft' %}
                 <div class="task-action-state">Approval Required</div>
+                {% if approve_error == 'freeze_refused' %}
+                <div class="task-action-note task-action-note--warning">
+                    <strong>Заморозка проекта не допускает эту работу.</strong>
+                    {% if approve_message %}<div>{{ approve_message }}</div>{% endif %}
+                    <div>Исправьте тип работы или заполните freeze_rationale и повторите одобрение.</div>
+                </div>
+                {% endif %}
                 {% if approve_error == 'dor_failed' %}
                 <div class="task-action-note task-action-note--warning">
                     <strong>Задача не готова к одобрению (DoR не пройден).</strong>
