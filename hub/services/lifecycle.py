@@ -1009,6 +1009,29 @@ async def _epic_project_at_creation(db: aiosqlite.Connection, body: TaskCreate) 
     return project_row
 
 
+async def _replay_after_conflict(
+    db: aiosqlite.Connection, idem_key: str | None, request_hash: str | None
+) -> CreateTaskOutcome:
+    """Гонка за ключ идемпотентности: вернуть победителя или 409 (прежняя логика).
+
+    Без ключа или без записи по нему исходная IntegrityError пробрасывается.
+    """
+    if not idem_key:
+        raise
+    existing = await repo.get_task_idempotency_key(db, idem_key)
+    if not existing:
+        raise
+    if existing["request_hash"] != request_hash:
+        record = IdempotencyRecord(
+            client_request_id=idem_key,
+            task_id=int(existing["task_id"]),
+            request_hash=existing["request_hash"],
+        )
+        raise HTTPException(409, idempotency_conflict_detail(record)) from None
+    task = await _load_task_view(db, int(existing["task_id"]))
+    return CreateTaskOutcome(task=task, is_new=False)
+
+
 async def create_task(
     db: aiosqlite.Connection,
     body: TaskCreate,
@@ -1121,23 +1144,13 @@ async def create_task(
         raise
     except aiosqlite.IntegrityError:
         await db.rollback()
-        if not idem_key:
-            raise
-        existing = await repo.get_task_idempotency_key(db, idem_key)
-        if not existing:
-            raise
-        if existing["request_hash"] != request_hash:
-            record = IdempotencyRecord(
-                client_request_id=idem_key,
-                task_id=int(existing["task_id"]),
-                request_hash=existing["request_hash"],
-            )
-            raise HTTPException(
-                409,
-                idempotency_conflict_detail(record),
-            ) from None
-        task = await _load_task_view(db, int(existing["task_id"]))
-        return CreateTaskOutcome(task=task, is_new=False)
+        return await _replay_after_conflict(db, idem_key, request_hash)
+    except BaseException:
+        # Любое иное исключение (ValueError, OperationalError, отмена) не должно
+        # оставлять BEGIN IMMEDIATE открытым и write-лок занятым (#1594).
+        if owns_tx and db.in_transaction:
+            await db.rollback()
+        raise
 
     result: dict[str, Any] = {}
     if _wants_run(normalized):

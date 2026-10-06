@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import urllib.parse
@@ -2020,10 +2021,22 @@ async def _policy_brief_for_slug(slug: str) -> str:
             f"/api/projects/{urllib.parse.quote(slug, safe='')}/effective-policy"
         )
     except HubApiError as exc:
+        logging.getLogger(__name__).warning(
+            "policy brief of project %s not read: %s: %s",
+            slug,
+            type(exc).__name__,
+            exc,
+        )
         return f"\n\nполитика проекта не прочитана: {exc}"
     try:
         return "\n\n" + "\n".join(format_policy_brief(data))
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError) as exc:
+        logging.getLogger(__name__).warning(
+            "policy brief of project %s not parsed: %s: %s",
+            slug,
+            type(exc).__name__,
+            exc,
+        )
         return "\n\nполитика проекта не прочитана: ответ хаба не разобран"
 
 

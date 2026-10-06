@@ -997,3 +997,17 @@ async def test_freeze_policy_is_validated_and_visible_to_agents(
     data = (await client.get("/api/projects/frozen-view/effective-policy")).json()
     assert _by_key(data)["freeze"]["source"] == "default"
     assert _by_key(data)["freeze"]["value"] is None
+
+
+async def test_unparsable_policy_brief_is_logged_and_still_answers(monkeypatch, caplog):
+    # #1594: ответ агенту прежний, но причина больше не пропадает молча.
+    import logging
+
+    async def _junk(path: str, **_: object) -> object:
+        return {"tasks": []}
+
+    monkeypatch.setattr(mcp_server, "_api_get", _junk)
+    with caplog.at_level(logging.WARNING, logger="hub.mcp_server"):
+        text = await mcp_server._policy_brief_for_slug("spike")
+    assert "не прочитана" in text
+    assert any("KeyError" in r.getMessage() for r in caplog.records)

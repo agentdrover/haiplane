@@ -61,7 +61,6 @@ STATEMENT_FIELDS: tuple[str, ...] = (
     "title",
     "description",
     "work_type",
-    "freeze_rationale",
     "class_of_service",
     "size",
     "wip_tag",

@@ -1662,3 +1662,78 @@ async def test_failed_approval_undoes_only_its_own_writes_in_the_callers_transac
     notes = await repo.get_task_updates(db, unready)
     assert not [n for n in notes if "override" in n["content"]]
     await db.rollback()
+
+
+async def test_unexpected_error_after_begin_releases_the_write_lock(
+    client: AsyncClient, db, db_dsn, monkeypatch
+):
+    """#1594: любое исключение после BEGIN IMMEDIATE снимает транзакцию и лок."""
+    from hub import repository as repo
+    from hub.db import connect
+    from hub.models import TaskApprove, TaskCreate
+    from hub.services import lifecycle
+    from tests.test_auto_approve import _project
+
+    pid = await _project(db, "boom", {})
+    good = await _ready_draft(client, db, pid, work_type="bug", rationale="сбой")
+    parent = (await client.get(f"/api/tasks/{good}")).json()["parent_id"]
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("после BEGIN")
+
+    async def writer_gets_through() -> bool:
+        other = await connect(db_dsn)
+        try:
+            await other.execute("PRAGMA busy_timeout = 300")
+            await other.execute("UPDATE projects SET name='other' WHERE id=?", (pid,))
+            await other.commit()
+            return True
+        except Exception:  # noqa: BLE001 - занятый лок и есть предмет проверки
+            return False
+        finally:
+            await other.close()
+
+    monkeypatch.setattr(repo, "create_task_full", boom)
+    with pytest.raises(RuntimeError):
+        await lifecycle.create_task(
+            db, TaskCreate(title="t", task_type="task", parent_id=parent)
+        )
+    assert not db.in_transaction
+    assert await writer_gets_through()
+    monkeypatch.undo()
+
+    monkeypatch.setattr(repo, "transition_status_if", boom)
+    with pytest.raises(RuntimeError):
+        await lifecycle.approve_task(db, good, TaskApprove())
+    assert not db.in_transaction
+    assert await writer_gets_through()
+    monkeypatch.undo()
+
+    monkeypatch.setattr(repo, "replace_acceptance_criteria", boom)
+    from hub.models import BulkChildTasksCreate
+
+    with pytest.raises(RuntimeError):
+        await lifecycle.create_subtasks_bulk(
+            db,
+            parent,
+            BulkChildTasksCreate(
+                task_type="task",
+                source="human",
+                items=[
+                    {
+                        "title": "b",
+                        "acceptance_criteria": [
+                            {
+                                "id": "AC-1",
+                                "given": "g",
+                                "when": "w",
+                                "then": "t",
+                                "verifiable_by": "manual",
+                            }
+                        ],
+                    }
+                ],
+            ),
+        )
+    assert not db.in_transaction
+    assert await writer_gets_through()
