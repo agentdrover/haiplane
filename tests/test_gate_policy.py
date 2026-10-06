@@ -377,8 +377,12 @@ async def test_default_project_lock_covers_every_delegating_value(client: AsyncC
 
     pid = await _create_project(client, "default")
 
+    from hub.services.project_policy import GATE_LOCK_ALLOWED_PAIRS
+
     for gate in ("dor", "verdict"):
         for value in sorted(DELEGATED_VERDICTS):
+            if (gate, value) in GATE_LOCK_ALLOWED_PAIRS:
+                continue  # #1602: единственное исключение, решение владельца
             resp = await client.patch(
                 f"/api/projects/{pid}", json={"gate_policy": {gate: value}}
             )

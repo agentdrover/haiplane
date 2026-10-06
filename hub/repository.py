@@ -1127,9 +1127,38 @@ async def list_projects(
     )
 
 
+class GateLockViolation(ValueError):
+    """Запись политики, которую замок #743 не пропускает (#1602)."""
+
+    def __init__(self, slug: str, violations: list[str]) -> None:
+        super().__init__(
+            f"замок #743: политика проекта {slug} не может содержать "
+            f"{', '.join(violations)}"
+        )
+        self.violations = violations
+
+
 async def update_project(
     db: aiosqlite.Connection, project_id: int, **fields: Any
 ) -> None:
+    # #1602: замок #743 стоит и на самой записи, а не только в слиянии
+    # PATCH: прямой вызов с gate_policy не должен класть на default политику,
+    # которую API отказал бы принять. Нечитаемое значение пропускается как
+    # раньше — проверку формата делает слой модели.
+    if fields.get("gate_policy") is not None:
+        from hub.services import project_policy
+
+        row = await get_project(db, project_id)
+        raw = fields["gate_policy"]
+        if row is not None and project_policy.gate_lock_applies(row["slug"]):
+            try:
+                policy = json.loads(raw) if isinstance(raw, str) else raw
+            except ValueError:
+                policy = None
+            if isinstance(policy, dict):
+                violations = project_policy.gate_lock_violations(row["slug"], policy)
+                if violations:
+                    raise GateLockViolation(row["slug"], violations)
     sets = [f"{k}=?" for k in fields]
     sets.append("updated_at=datetime('now')")
     values = [*fields.values(), project_id]
@@ -2340,7 +2369,29 @@ async def last_project_event(
     return rows[0] if rows else None
 
 
-async def prune_events(db: aiosqlite.Connection, *, keep_days: int = 14) -> int:
+async def list_project_events(
+    db: aiosqlite.Connection, project_id: int, kind: str, limit: int = 50
+) -> list[aiosqlite.Row]:
+    """The newest events of ``kind`` on a project, newest first."""
+    return list(
+        await fetchall(
+            db,
+            "SELECT * FROM events WHERE project_id=? AND kind=? "
+            "ORDER BY id DESC LIMIT ?",
+            (project_id, kind, limit),
+        )
+    )
+
+
+#: Сколько дней живёт лента событий (#349). Читатели, которым нужно окно
+#: длиннее, считают по ленте неправду, поэтому окно счётчиков по событиям
+#: берётся отсюда, а не придумывается рядом.
+EVENTS_RETENTION_DAYS = 14
+
+
+async def prune_events(
+    db: aiosqlite.Connection, *, keep_days: int = EVENTS_RETENTION_DAYS
+) -> int:
     """Delete events older than ``keep_days``. Returns rows removed."""
     cur = await db.execute(
         "DELETE FROM events WHERE created_at < datetime('now', ?)",

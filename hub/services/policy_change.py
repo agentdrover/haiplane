@@ -169,18 +169,22 @@ def merged_gate_policy(
     # токена и ни по какому расписанию. Правило здесь, а не в модели, потому
     # что ему нужно знать, КАКОЙ проект правят. #760/#1151: проверка по именам
     # двух гейтов и по общему перечню делегатов.
-    if project_policy.gate_lock_applies(before["slug"]) and any(
-        merged.get(gate) in project_policy.DELEGATED_VERDICTS
-        for gate in project_policy.GATE_LOCK_GATES
-    ):
+    # #1602: исключение — явный список пар, сейчас одна: verdict=steward.
+    violations = project_policy.gate_lock_violations(before["slug"], merged)
+    if violations:
+        allowed = project_policy.gate_lock_allowed_pairs()
         raise PolicyRefused(
             422,
             {
                 "error": "default_project_gate_locked",
+                "violations": violations,
+                "allowed": allowed,
                 "hint": (
-                    "проект default (сам хаб) не принимает делегирование "
-                    "ни на одном гейте — ни автопилоту, ни стюарду; "
-                    "политика default всегда human"
+                    "замок #743: проект default (сам хаб) не принимает "
+                    f"{', '.join(violations)}; разрешено только "
+                    f"{', '.join(allowed)} "
+                    f"({project_policy.GATE_LOCK_OWNER_DECISION}); "
+                    "остальное на default — human; правка не записана"
                 ),
             },
         )

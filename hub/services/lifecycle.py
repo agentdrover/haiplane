@@ -3931,6 +3931,10 @@ async def _previous_verdict_update(db: Any, task_id: int) -> dict | None:
     return verdicts[-1] if verdicts else None
 
 
+#: Метка события вердикта, записанного применением стюарда (#1602).
+STEWARD_APPLIED_SOURCE = "steward_applied"
+
+
 @dataclass
 class VerdictContext:
     """Что шаги вердикта читают и производят до его записи (#1067).
@@ -3953,6 +3957,12 @@ class VerdictContext:
     # #1601: метка применения стюарда (id суждения, время занятия): запись
     # вердикта условна по ней в той же транзакции.
     claim: tuple[int, str] | None = None
+    # #1602: вызов пришёл от агентского токена (REST/CLI/MCP). Внутренние
+    # записи — стюард, автопилот — этот флаг не ставят.
+    agent_caller: bool = False
+    # #1602: вердикт записан применением стюарда. Метка ставится САМИМ
+    # применением, а не телом запроса, поэтому подделать её именем агента нельзя.
+    applied_by_steward: bool = False
 
     body_text: str = ""
     pinned_sha: str = ""
@@ -3969,6 +3979,38 @@ async def _vstep_has_a_submission(state: VerdictContext) -> None:
         raise HTTPException(
             400,
             "no submission to review yet: the task has never been submitted for review",
+        )
+
+
+async def _vstep_default_approval_is_the_stewards(state: VerdictContext) -> None:
+    """На default при verdict=steward approved агента не пишется (#1602).
+
+    Замок #743 снят для пары (verdict, steward): вердикт на хабе ставит
+    стюард после согласия советника или человек. Независимый агент, зовущий
+    review-verdict (REST, CLI, MCP hub_submit_review), обходил бы и судью, и
+    советника. changes_requested остаётся доступным: он возвращает работу, а
+    не открывает доставку. При verdict=human правило не действует — там
+    approved независимого ревьюера и есть штатный путь.
+    """
+    if not state.agent_caller or state.body.verdict.value != "approved":
+        return
+    from hub.services import project_policy, steward_dispatch
+
+    project = await repo.resolve_project_for_task(state.db, state.task_id)
+    if project is None or not project_policy.gate_lock_applies(project["slug"]):
+        return
+    if steward_dispatch._policy_wants_steward(project, "verdict", shadow=False):
+        raise HTTPException(
+            409,
+            detail={
+                "error": "default_verdict_reserved_for_steward",
+                "hint": (
+                    "замок #743: на проекте default при verdict=steward "
+                    "approved пишет только стюард (судья и согласие советника) "
+                    "или человек; агентский approved отклонён. "
+                    "changes_requested доступен."
+                ),
+            },
         )
 
 
@@ -4176,6 +4218,7 @@ async def _vstep_auto_draft_out_of_scope(state: VerdictContext) -> None:
 # который уже случился, значит платить за него временем.
 VERDICT_STEPS: tuple[Step[VerdictContext], ...] = (
     Step("has_a_submission", _vstep_has_a_submission),
+    Step("default_approval_is_the_stewards", _vstep_default_approval_is_the_stewards),
     Step("changes_requested_has_content", _vstep_changes_requested_has_content),
     Step("verdict_matches_its_text", _vstep_verdict_matches_its_text),
     Step("verdict_is_not_a_repeat", _vstep_verdict_is_not_a_repeat),
@@ -4204,6 +4247,8 @@ async def record_review_verdict(
     principal_id: int | None = None,
     expected_generation: int | None = None,
     claim: tuple[int, str] | None = None,
+    agent_caller: bool = False,
+    applied_by_steward: bool = False,
 ) -> TaskView:
     """Record an explicit review verdict for the current submission (#305).
 
@@ -4251,6 +4296,8 @@ async def record_review_verdict(
         principal_id=principal_id,
         expected_generation=expected_generation,
         claim=claim,
+        agent_caller=agent_caller,
+        applied_by_steward=applied_by_steward,
     )
     await run_steps(state, VERDICT_STEPS)
 
@@ -4331,6 +4378,17 @@ def _verdict_update_text(state: VerdictContext) -> tuple[str, str]:
     if state.body.comments.strip():
         content += f"\n{state.body.comments.strip()}"
     return agent, content
+
+
+def _verdict_event_payload(state: VerdictContext, self_approved: bool) -> dict:
+    payload: dict[str, Any] = {
+        "verdict": state.body.verdict.value,
+        "submission_generation": state.task.get("submission_generation") or 0,
+        "self_approved": self_approved,
+    }
+    if state.applied_by_steward:
+        payload["source"] = STEWARD_APPLIED_SOURCE
+    return payload
 
 
 async def _apply_verdict(state: VerdictContext) -> TaskView:
@@ -4428,11 +4486,7 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
             kind="review_verdict_recorded",
             task_id=task_id,
             actor=agent,
-            payload={
-                "verdict": body.verdict.value,
-                "submission_generation": task.get("submission_generation") or 0,
-                "self_approved": self_approved,
-            },
+            payload=_verdict_event_payload(state, self_approved),
         )
         await db.commit()
         await log_activity(
