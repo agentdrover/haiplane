@@ -377,3 +377,17 @@ def squash_release(tmp_path: Path) -> dict[str, str]:
         "released": released,
         "after_release": after_release,
     }
+
+
+@pytest.fixture(autouse=True)
+def _clean_in_prod_cache():
+    """#1603: the process-wide IN_PROD cache must not leak between tests."""
+    from hub.services import delivery_state as ds
+
+    cache = getattr(ds, "_in_prod_cache", None)
+    if cache is not None:
+        cache.clear()
+    yield
+    cache = getattr(ds, "_in_prod_cache", None)
+    if cache is not None:
+        cache.clear()

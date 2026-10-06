@@ -12,6 +12,8 @@ presented as the whole board is the failure #824 refused to ship.
 
 from __future__ import annotations
 
+import asyncio
+from unittest.mock import AsyncMock
 
 import aiosqlite
 from httpx import AsyncClient
@@ -140,3 +142,170 @@ async def test_window_is_stated_not_implied(
     assert snapshot["examined"] == 2
     assert "окно 2" in snapshot["note"]
     assert "старше окна" in snapshot["note"]
+
+
+# ---- #1603: снимок укладывается в срок клиента -------------------------------
+
+
+class _FakeGit:
+    """Подставной git_ops: задержка, счётчик одновременных вызовов, счёт вызовов."""
+
+    def __init__(self, delay: float = 0.0, ancestor: bool = True):
+        self.delay = delay
+        self.ancestor = ancestor
+        self.active = 0
+        self.peak = 0
+        self.calls = 0
+
+    async def _wait(self) -> None:
+        self.calls += 1
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            await asyncio.sleep(self.delay)
+        finally:
+            self.active -= 1
+
+    async def commit_exists(self, repo, sha):
+        return True
+
+    async def is_ancestor(self, repo, ancestor, descendant):
+        await self._wait()
+        return self.ancestor
+
+    async def commit_with_same_tree(self, repo, sha, branch):
+        return ""
+
+
+def _wire_fake_git(monkeypatch, fake: _FakeGit, ctx: dict | None = None) -> dict:
+    from hub import app as hub_app
+
+    context = dict(ctx if ctx is not None else {"repo": "/ws/one", "base_branch": "main"})
+    monkeypatch.setattr(
+        hub_app.services, "project_git_context", AsyncMock(side_effect=lambda *_: dict(context))
+    )
+    for name in ("commit_exists", "is_ancestor", "commit_with_same_tree"):
+        monkeypatch.setattr(plugins.git_ops, name, getattr(fake, name), raising=False)
+    return context
+
+
+async def _board(client, db, count: int) -> list[int]:
+    ids = []
+    for i in range(count):
+        ids.append(await _completed(client, db, f"{i + 1:040x}"))
+    await repo.record_release(db, deployed_sha="f" * 40, ref="main", source="ci")
+    return ids
+
+
+async def test_prod_state_checks_tasks_with_bounded_parallelism(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-1 (#1603): git-проверки идут ограниченно-параллельно, релиз читается
+    # один раз, порядок бакетов — порядок списка завершённых задач.
+    from hub.services import prod_state as ps
+
+    fake = _FakeGit(delay=0.02)
+    _wire_fake_git(monkeypatch, fake)
+    ids = await _board(client, db, 50)
+    reads = 0
+    real_latest = repo.latest_successful_release
+
+    async def counting(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return await real_latest(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "latest_successful_release", counting)
+
+    snapshot = await prod_state(db, limit=50)
+
+    ceiling = getattr(ps, "MAX_CONCURRENCY", 8)
+    assert fake.peak > 1, "checks ran one by one"
+    assert fake.peak <= ceiling
+    listed = [int(r["id"]) for r in await repo.list_tasks_by_status(db, "completed", limit=50)]
+    assert [e["task_id"] for e in snapshot["in_prod"]] == listed
+    assert sorted(listed) == sorted(ids)
+    assert reads == 1, f"latest_successful_release read {reads} times"
+
+
+async def test_in_prod_answer_is_cached_per_full_key_only(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-2 (#1603): IN_PROD кэшируется по (workspace, base_branch, merge_sha,
+    # deployed_sha); NOT_IN_PROD и UNKNOWN каждый раз проверяются заново.
+    fake = _FakeGit()
+    ctx = _wire_fake_git(monkeypatch, fake)
+    await _board(client, db, 1)
+
+    await prod_state(db)
+    first = fake.calls
+    assert first > 0
+    await prod_state(db)
+    assert fake.calls == first, "a definite IN_PROD answer was asked of git again"
+
+    # другой base_branch — другой ключ
+    ctx["base_branch"] = "develop"
+    await prod_state(db)
+    assert fake.calls > first
+    after_base = fake.calls
+
+    # новый deployed_sha — другой ключ
+    await repo.record_release(db, deployed_sha="e" * 40, ref="main", source="ci")
+    await prod_state(db)
+    assert fake.calls > after_base
+    after_release = fake.calls
+
+    # чужой gh_repo — применимость проверена заново, кэш не отвечает
+    from hub import config
+
+    monkeypatch.setattr(config, "REPO_NAME", "agentdrover/haiplane")
+    ctx["gh_repo"] = "agentdrover/other"
+    snapshot = await prod_state(db)
+    assert fake.calls == after_release
+    assert snapshot["in_prod"] == [] and len(snapshot["unknown"]) == 1
+
+    # NOT_IN_PROD не кэшируется
+    del ctx["gh_repo"]
+    fake.ancestor = False
+    ctx["base_branch"] = "other-base"
+    await prod_state(db)
+    not_in = fake.calls
+    snapshot = await prod_state(db)
+    assert len(snapshot["not_in_prod"]) == 1
+    assert fake.calls > not_in, "NOT_IN_PROD was served from the cache"
+
+
+async def test_prod_state_budget_moves_unchecked_tasks_to_unknown(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    # AC-3 (#1603): бюджет исчерпан — непроверенное в unknown, не в not_in_prod.
+    import time
+    from hub.services import prod_state as ps
+
+    budget = 0.4
+    monkeypatch.setattr(ps, "BUILD_BUDGET_SECONDS", budget, raising=False)
+    fake = _FakeGit(delay=0.3)
+    _wire_fake_git(monkeypatch, fake)
+    await _board(client, db, 12)
+
+    started = time.monotonic()
+    snapshot = await prod_state(db, limit=50)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < budget + 1.0, f"snapshot took {elapsed:.1f}s"
+    unchecked = [e for e in snapshot["unknown"] if "срок сборки снимка исчерпан" in e["reason"]]
+    assert unchecked, "nothing was left unchecked"
+    assert snapshot["not_in_prod"] == []
+    assert snapshot["examined"] == 12 - len(unchecked)
+    assert str(len(unchecked)) in snapshot["note"]
+    assert len(snapshot["in_prod"]) == snapshot["examined"]
+
+
+def test_prod_state_budget_is_below_client_timeout():
+    # AC-5 (#1603): сервер отвечает раньше, чем клиент оборвёт ожидание.
+    from hub import mcp_server
+    from hub.services import prod_state as ps
+
+    budget = getattr(ps, "BUILD_BUDGET_SECONDS", None)
+    assert budget is not None, "the snapshot has no build budget"
+    assert budget < mcp_server._TIMEOUT_DEFAULT
