@@ -926,3 +926,24 @@ def test_evidence_keys_distinguish_skipped_failed_and_present(
         assert good["provenance"]["at"], "a time must be stated"
         monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}")
         monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME")
+
+
+def test_an_executed_step_with_foreign_content_is_an_error_not_evidence(
+    script, monkeypatch, tmp_path
+):
+    """#1606: `{}` or a foreign object is not a mutation/baseline report."""
+    _provenance_env(monkeypatch)
+    for kind, key in (("MUTATIONS", "mutations"), ("BASELINE", "baseline")):
+        for content in ({}, {"unexpected": "x"}, {"state": "banana"}):
+            path = tmp_path / f"{key}.json"
+            path.write_text(json.dumps(content))
+            monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}", str(path))
+            monkeypatch.setenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME", "success")
+            block = _capture_payload(script, monkeypatch)[key]
+            assert block["state"] == "error", (key, content)
+            assert block["reason"] and "unexpected" not in block
+            assert block["provenance"]["run_id"] == "4242"
+        # Without a stated outcome (an old caller) foreign content sends nothing.
+        monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}_OUTCOME")
+        assert key not in _capture_payload(script, monkeypatch)
+        monkeypatch.delenv(f"HAIPLANE_HUB_CI_{kind}")

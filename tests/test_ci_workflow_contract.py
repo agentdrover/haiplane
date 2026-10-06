@@ -185,3 +185,19 @@ def test_mutations_and_baseline_skip_branch_sync_and_non_task_prs(tmp_path) -> N
     # What must NOT change: the deploy dependency and the tree-dedup scope.
     assert _doc()["jobs"]["deploy"]["needs"] == "test"
     assert steps["treedup"]["if"] == "${{ github.event_name == 'push' }}"
+
+
+def test_evidence_decision_survives_a_red_earlier_step() -> None:
+    """#1606: a red Test must not skip `evidence` and, through it, the baseline."""
+    steps = _steps()
+    assert steps["evidence"]["if"] == "${{ !cancelled() }}"
+    assert "!cancelled()" in steps["baseline"]["if"]
+    # With the earlier step red, the decision step still runs and says yes.
+    ran, _log = _decide(
+        Path(__import__("tempfile").mkdtemp()),
+        event="pull_request",
+        action="opened",
+        head="task-9/x",
+        base="develop",
+    )
+    assert ran is True

@@ -184,6 +184,9 @@ jobs:
       # подстановкой в тело: имя ветки приходит снаружи.
       - name: Decide whether mutations and baseline are worth their minutes
         id: evidence
+        # !cancelled(): a red Test or an earlier check must not skip this step
+        # and with it the baseline, whose own condition already says !cancelled().
+        if: ${{ !cancelled() }}
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action }}

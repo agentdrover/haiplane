@@ -1630,3 +1630,42 @@ async def test_missing_mutation_evidence_reads_as_not_received(
     # An old block, stored before provenance existed, does not invent one.
     assert both["baseline"]["state"] == "received"
     assert "прогон неизвестен" in both["baseline"]["run"]
+
+
+async def test_brief_rejects_foreign_evidence_and_keeps_error_reasons(
+    db, client: AsyncClient, workspace
+):
+    """#1606: provenance alone is not evidence; an error block shows its cause."""
+    task_id = await _project_with(db, client, workspace, "main")
+    plugins.git_ops = _RealRefs()
+    await repo.update_task(db, task_id, submission_sha="a" * 40)
+    await db.commit()
+    prov = {"run_id": "9", "event": "workflow_dispatch", "at": "t", "run_url": ""}
+
+    async def evidence() -> dict:
+        brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+        return brief["ci_evidence"]
+
+    for foreign in ({"provenance": prov}, {"unexpected": "x", "provenance": prov}):
+        await _store_report(db, task_id, mutations=foreign, baseline=foreign)
+        both = await evidence()
+        for key in ("mutations", "baseline"):
+            assert both[key]["state"] == "not_received", (key, foreign)
+            assert both[key]["result"] == ""
+            assert both[key]["reason"]
+
+    error = {"state": "error", "reason": "timeout после 540 с", "provenance": prov}
+    await _store_report(db, task_id, mutations=error, baseline=error)
+    both = await evidence()
+    for key in ("mutations", "baseline"):
+        assert both[key]["state"] == "received"
+        assert both[key]["result"] == "error"
+        assert "timeout после 540 с" in both[key]["reason"]
+        assert "9" in both[key]["run"]
+
+    # An old valid block without provenance stays acceptable.
+    old = {"state": "ran", "survivors": []}
+    await _store_report(db, task_id, mutations=old, baseline={"state": "ran"})
+    both = await evidence()
+    assert both["mutations"]["state"] == "received"
+    assert "прогон неизвестен" in both["mutations"]["run"]

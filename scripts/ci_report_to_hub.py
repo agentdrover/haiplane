@@ -549,6 +549,15 @@ def _read_report(path: str) -> tuple[dict | None, str]:
     return report, ""
 
 
+# The states each step's own script can write (scripts/mutation_changed.py,
+# scripts/red_test_baseline.py). A JSON object without one of them is not that
+# step's report, and provenance on it would make it look like evidence.
+_MUTATION_STATES = frozenset(
+    {"ran", "baseline_red", "no_changed_functions", "no_tests", "error"}
+)
+_BASELINE_STATES = frozenset({"ran", "no_tests", "error"})
+
+
 def provenance() -> dict:
     """Which run produced an evidence block (#1606): kept INSIDE the block.
 
@@ -573,7 +582,11 @@ def provenance() -> dict:
 
 
 def evidence_block(
-    label: str, path: str, outcome: str, trim: Callable[[dict], dict]
+    label: str,
+    path: str,
+    outcome: str,
+    trim: Callable[[dict], dict],
+    states: frozenset[str],
 ) -> dict | None:
     """The block to send under an evidence key, or None for "send no key" (#1606).
 
@@ -591,6 +604,11 @@ def evidence_block(
         log(f"{label} step did not run — no key sent; the hub keeps what it stored")
         return None
     report, why = _read_report(path)
+    if report is not None and report.get("state") not in states:
+        report, why = (
+            None,
+            f"state {report.get('state')!r} is not one of {sorted(states)}",
+        )
     if report is None:
         log(f"{label} report {path} not usable: {why}")
         if not outcome:
@@ -643,6 +661,7 @@ def attach_evidence(payload: dict, keep: set[str]) -> None:
         env_get("HUB_CI_MUTATIONS"),
         env_get("HUB_CI_MUTATIONS_OUTCOME"),
         trim_mutations,
+        _MUTATION_STATES,
     )
     if mutations is not None:
         payload["mutations"] = mutations
@@ -652,6 +671,7 @@ def attach_evidence(payload: dict, keep: set[str]) -> None:
         env_get("HUB_CI_BASELINE"),
         env_get("HUB_CI_BASELINE_OUTCOME"),
         lambda report: trim_baseline(report, keep),
+        _BASELINE_STATES,
     )
     if baseline is not None:
         payload["baseline"] = baseline

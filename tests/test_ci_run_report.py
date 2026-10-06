@@ -485,3 +485,37 @@ def test_default_env_token_roles_cannot_report_a_run():
 
     assert "tasks.ci_report" not in _AGENT_DEFAULT_PERMS
     assert "tasks.ci_report" not in _HUMAN_DEFAULT_PERMS
+
+
+async def test_upsert_stores_empty_blocks_for_a_new_row_and_flags_per_key(db):
+    """#1606: direct INSERT/ON CONFLICT semantics of the repository."""
+    task_id = await _task(db, generation=1, sha="sha-pinned")
+    common = dict(
+        task_id=task_id,
+        head_sha="sha-pinned",
+        ac_results="{}",
+        validation_status="pass",
+        validation_log="",
+        reason="",
+        reported_by="ci",
+    )
+    await repo.upsert_ci_run_report(db, **common)  # new row, no keys
+    row = dict(await repo.get_ci_run_report(db, task_id, "sha-pinned"))
+    assert row["mutations"] == "{}" and row["baseline"] == "{}"
+
+    await repo.upsert_ci_run_report(db, **common, mutations='{"a": 1}')
+    await repo.upsert_ci_run_report(db, **common, baseline='{"b": 2}')
+    row = dict(await repo.get_ci_run_report(db, task_id, "sha-pinned"))
+    assert row["mutations"] == '{"a": 1}', "only the key sent changes"
+    assert row["baseline"] == '{"b": 2}'
+    await repo.upsert_ci_run_report(db, **common, mutations="{}", baseline='{"c": 3}')
+    row = dict(await repo.get_ci_run_report(db, task_id, "sha-pinned"))
+    assert row["mutations"] == "{}" and row["baseline"] == '{"c": 3}'
+
+    # A brand-new row given explicit text stores exactly that text.
+    other = await _task(db, generation=1, sha="sha-pinned")
+    await repo.upsert_ci_run_report(
+        db, **{**common, "task_id": other}, mutations='{"m": 1}', baseline='{"n": 2}'
+    )
+    row = dict(await repo.get_ci_run_report(db, other, "sha-pinned"))
+    assert row["mutations"] == '{"m": 1}' and row["baseline"] == '{"n": 2}'

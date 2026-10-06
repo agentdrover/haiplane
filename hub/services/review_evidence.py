@@ -533,6 +533,15 @@ _CHECK_MEANING: dict[str, str] = {
 }
 
 
+# The states the CI step scripts write (mutation_changed.py, red_test_baseline.py).
+_EVIDENCE_STATES = {
+    "мутации": frozenset(
+        {"ran", "baseline_red", "no_changed_functions", "no_tests", "error"}
+    ),
+    "baseline": frozenset({"ran", "no_tests", "error"}),
+}
+
+
 def _evidence_block(label: str, raw: str | None, pinned: str):
     """One stored evidence block as the brief reads it (#1606)."""
     from hub.models import CIEvidenceBlock
@@ -546,6 +555,14 @@ def _evidence_block(label: str, raw: str | None, pinned: str):
             reason=(
                 f"не получено: {label} для коммита {pinned[:12]} CI не присылал "
                 "(шаг не запускался на обновлении ветки — это не результат)"
+            )
+        )
+    if data.get("state") not in _EVIDENCE_STATES[label]:
+        # Provenance alone does not make an object the step's report.
+        return CIEvidenceBlock(
+            reason=(
+                f"не получено: {label} для коммита {pinned[:12]} пришли в "
+                "нераспознанном виде (нет известного state) — результатом не считаются"
             )
         )
     prov = data.get("provenance")
@@ -565,7 +582,7 @@ def _evidence_block(label: str, raw: str | None, pinned: str):
         result=str(data.get("state") or ""),
         run=run,
         provenance=prov,
-        reason="",
+        reason=str(data.get("reason") or ""),
     )
 
 
