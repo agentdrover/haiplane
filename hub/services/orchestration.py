@@ -652,13 +652,26 @@ async def _steward_shadow_metrics(db: aiosqlite.Connection) -> dict[str, Any]:
     «стюард против человека» — другая метрика (справочная, она больше не
     решает о выходе) и лежит под ключом ``human_table`` со своими счётчиками.
     """
-    from hub.services.steward_exit import contour_report
+    from hub.services.steward_exit import (
+        STEWARD_VERDICT_WINDOW_DAYS,
+        actual_steward_verdicts,
+        contour_report,
+    )
     from hub.services.steward_shadow import act_refusals, shadow_table
 
     table = await shadow_table(db)
     refusals = await act_refusals(db)
+    by_project = await actual_steward_verdicts(db)
     return {
         **await contour_report(db),
+        # #1602: ФАКТИЧЕСКИЕ вердикты стюарда (review_verdict_recorded,
+        # actor=steward), а не суждения: тень и DoR сюда не входят. Окно —
+        # срок жизни ленты событий, а не окно практики.
+        "actual_verdicts": {
+            "window_days": STEWARD_VERDICT_WINDOW_DAYS,
+            "total": sum(by_project.values()),
+            "by_project": dict(sorted(by_project.items())),
+        },
         "act_refusals": [
             {"reason": code, "detail": detail} for code, detail in refusals
         ],
