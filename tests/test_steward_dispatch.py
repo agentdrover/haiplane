@@ -2387,6 +2387,12 @@ async def test_an_overdue_slot_at_the_ceiling_gets_a_start_attempt(
         assert provider.await_count == 1, "потолок вышел — попытка старта разрешена"
         row = await _run_row(db, run["id"])
         assert row["status"] == RUN_OPEN, "слот закрыт на достигнутом потолке"
+        fresh = await fetchall(
+            db,
+            "SELECT 1 FROM steward_runs WHERE id=? AND deadline_at > datetime('now')",
+            (run["id"],),
+        )
+        assert list(fresh), "новое окно старта не выдано: дедлайн остался в прошлом"
         renewed = await _events(db, "steward_run_window_renewed")
         assert len(renewed) == 1
         assert "ждали отчёт" in json.loads(renewed[0]["payload"])["because"]
