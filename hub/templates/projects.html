@@ -277,7 +277,7 @@
                     </select>
                     {% if c.project.slug == 'default' %}
                     <label class="task-action-label">Автопилот гейтов</label>
-                    <span class="badge badge-needs_decision" title="Хаб не ослабляет надзор над собой (#743)">заперт: всегда human</span>
+                    <span class="badge badge-needs_decision" title="Хаб не ослабляет надзор над собой (#743). Из делегирования разрешено только verdict=steward (решение владельца от 06.10.2026); автопилот на default вердикт не ставит">заперт: всегда human{% if c.project.gate_policy.get('verdict') == 'steward' %}, кроме verdict=steward{% endif %}</span>
                     {% else %}
                     {# #1163: варианты берутся из поключевого перечня
                        РЕАЛИЗОВАННЫХ значений, а не перечисляются здесь вторым

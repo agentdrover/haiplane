@@ -242,6 +242,8 @@ CODE_CLASS_MISSING = "risk_class_missing"
 CODE_CLASS_RAISED = "risk_class_raised"
 CODE_MODEL_UNDECLARED = "model_undeclared"
 CODE_TEXT_ORIGIN = "text_recovered_report"
+#: #1602: на default автопилот вердикта не ставит никогда (замок #743).
+CODE_DEFAULT_LOCKED = "default_project_autopilot_locked"
 
 #: Наблюдения, которые стойка не делала, когда её спросили без сети.
 PENDING_BRANCH = "branch"
@@ -342,10 +344,20 @@ async def _scope_stage(
     # грязный путь. Автовердикт по-прежнему закрывает чистые сдачи, иначе
     # перевод проекта на стюарда тихо вернул бы человеку всё, что раньше
     # проходило само, и заметно это стало бы по очереди, а не по отказу.
-    from hub.services.project_policy import verdict_is_delegated
+    from hub.services.project_policy import gate_lock_applies, verdict_is_delegated
 
     if not verdict_is_delegated(policy):
         return _refuse_with(CODE_NOT_DELEGATED, "вердикт проекта не делегирован")
+    # #1602: замок #743 пропускает на default verdict=steward, а steward стоит
+    # в том же перечне делегатов, что и auto. Без этой проверки автопилот
+    # одобрял бы чистые сдачи хаба без судьи и советника. Вердикт на default
+    # ставит только стюард (путь #1601), на любом значении политики.
+    if gate_lock_applies(project["slug"]):
+        return _refuse_with(
+            CODE_DEFAULT_LOCKED,
+            "замок #743: на проекте default автопилот вердикт не ставит; "
+            "вердикт ставит стюард или человек",
+        )
     return _Ctx(task=task, project=project, generation=generation, observe=observe)
 
 

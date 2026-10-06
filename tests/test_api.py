@@ -4230,3 +4230,180 @@ async def test_refusal_names_the_version_mismatch(client: AsyncClient, monkeypat
     assert detail["hint"].index("Pass your session id") < detail["hint"].index(
         "IF YOUR TOOL SCHEMA"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1602: замок #743 на default снимается ровно для пары (verdict, steward)
+# ---------------------------------------------------------------------------
+
+
+def _lock_tokens(monkeypatch) -> tuple[dict, dict]:
+    from hub import config
+    from hub.config import TokenIdentity
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-token": TokenIdentity("bot", "agent"),
+            "human-token": TokenIdentity("denis", "human"),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    return (
+        {"headers": {"Authorization": "Bearer human-token"}},
+        {"headers": {"Authorization": "Bearer agent-token"}},
+    )
+
+
+async def _stored_policy(client: AsyncClient, human: dict, pid: int) -> dict:
+    listed = (await client.get("/api/projects", **human)).json()
+    return next(p for p in listed if p["id"] == pid)["gate_policy"]
+
+
+async def test_default_project_lock_allows_only_verdict_steward_pair(
+    client: AsyncClient, monkeypatch
+):
+    """#1602 AC-1: на default разрешена ровно пара verdict=steward."""
+    human, agent = _lock_tokens(monkeypatch)
+    resp = await client.post(
+        "/api/projects", json={"slug": "default", "name": "Default"}, **human
+    )
+    assert resp.status_code == 200, resp.text
+    pid = resp.json()["id"]
+    url = f"/api/projects/{pid}"
+
+    # Агентский токен политику не меняет — как и раньше, даже разрешённую пару.
+    denied = await client.patch(
+        url, json={"gate_policy": {"verdict": "steward"}}, **agent
+    )
+    assert denied.status_code == 403, denied.text
+    assert await _stored_policy(client, human, pid) == {}
+
+    # Разрешённая пара принята человеком.
+    ok = await client.patch(url, json={"gate_policy": {"verdict": "steward"}}, **human)
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["gate_policy"]["verdict"] == "steward"
+
+    def refused(resp, pairs: list[str]) -> None:
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "default_project_gate_locked"
+        assert detail["violations"] == pairs
+        assert "#743" in detail["hint"]
+        for pair in pairs:
+            assert pair in detail["hint"]
+
+    refused(
+        await client.patch(url, json={"gate_policy": {"verdict": "auto"}}, **human),
+        ["verdict=auto"],
+    )
+    refused(
+        await client.patch(url, json={"gate_policy": {"dor": "steward"}}, **human),
+        ["dor=steward"],
+    )
+    refused(
+        await client.patch(url, json={"gate_policy": {"dor": "auto"}}, **human),
+        ["dor=auto"],
+    )
+    refused(
+        await client.patch(
+            url, json={"gate_policy": {"dor": "auto", "verdict": "auto"}}, **human
+        ),
+        ["dor=auto", "verdict=auto"],
+    )
+
+    # Смешанный PATCH: разрешённая половина тоже не записана (атомарность).
+    reset = await client.patch(url, json={"gate_policy": {"verdict": "human"}}, **human)
+    assert reset.status_code == 200, reset.text
+    mixed = await client.patch(
+        url,
+        json={"gate_policy": {"verdict": "steward", "dor": "steward"}},
+        **human,
+    )
+    refused(mixed, ["dor=steward"])
+    stored = await _stored_policy(client, human, pid)
+    assert stored.get("verdict") == "human" and "dor" not in stored, stored
+
+
+async def test_scheduled_change_obeys_the_same_pair_lock(
+    client: AsyncClient, db, monkeypatch
+):
+    """#1602: отложенная правка (#1593) идёт через то же слияние и тот же замок."""
+    from datetime import UTC, datetime, timedelta
+
+    from hub.services import policy_change
+
+    human, _ = _lock_tokens(monkeypatch)
+    base = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(policy_change, "utcnow", lambda: base)
+    resp = await client.post(
+        "/api/projects", json={"slug": "default", "name": "Default"}, **human
+    )
+    pid = resp.json()["id"]
+    at = (base + timedelta(days=1)).isoformat()
+    url = "/api/projects/default/policy-schedule"
+
+    allowed = await client.post(
+        url, json={"at": at, "patch": {"verdict": "steward"}}, **human
+    )
+    assert allowed.status_code == 201, allowed.text
+    for patch in ({"verdict": "auto"}, {"dor": "steward"}):
+        locked = await client.post(url, json={"at": at, "patch": patch}, **human)
+        assert locked.status_code == 422, locked.text
+        assert locked.json()["detail"]["error"] == "default_project_gate_locked"
+
+    # Исполнение: запись, положенная мимо API, исполнением отказана, а не применена.
+    for patch in ({"dor": "steward"}, {"verdict": "auto"}):
+        await repo.insert_scheduled_policy_change(
+            db,
+            project_id=pid,
+            at=policy_change.stamp(base + timedelta(hours=1)),
+            patch=patch,
+            note="",
+            created_by="test",
+        )
+    await db.commit()
+    out = await policy_change.run_due(db, now=base + timedelta(days=2))
+    refused = [o for o in out if o["outcome"] == "refused"]
+    assert len(refused) == 2, out
+    assert all(o["error"] == "default_project_gate_locked" for o in refused)
+    stored = await _stored_policy(client, human, pid)
+    assert stored.get("verdict") == "steward" and "dor" not in stored, stored
+
+
+async def test_autopilot_never_applies_verdict_on_default_with_steward(
+    client: AsyncClient, db, monkeypatch
+):
+    """#1602 AC-2: steward входит в DELEGATED_VERDICTS, но на default автопилот молчит."""
+    from hub import config
+    from hub.services import auto_verdict
+    from hub.services.verdict_route import verdict_route
+    from tests.test_auto_verdict import _events, _post_review, _submitted_task
+
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    locked = await _submitted_task(client, db, "default", {"verdict": "steward"})
+    other = await _submitted_task(client, db, "spike-other", {"verdict": "steward"})
+
+    stance = await auto_verdict.autopilot_stance(db, locked)
+    assert stance.outcome == auto_verdict.OUTCOME_REFUSE
+    assert stance.code == "default_project_autopilot_locked"
+    assert "#743" in stance.reason
+
+    # Приход чистого отчёта (путь приёма), прямой вызов и повторный проход.
+    await _post_review(client, locked)
+    assert await auto_verdict.maybe_auto_verdict(db, locked) is False
+    assert await auto_verdict.maybe_auto_verdict(db, locked) is False
+    body = (await client.get(f"/api/tasks/{locked}")).json()
+    assert body["review_verdict"] is None and body["status"] == "review"
+    assert await _events(db, "review_verdict_recorded", locked) == []
+    # Маршрут вердикта не называет автопилота решателем.
+    route = await verdict_route(db, locked, observe=True)
+    assert route.decider != "policy"
+
+    # Другой проект с verdict=steward — автопилот как раньше.
+    await _post_review(client, other)
+    body = (await client.get(f"/api/tasks/{other}")).json()
+    assert body["review_verdict"] == "approved"
+    verdicts = await _events(db, "review_verdict_recorded", other)
+    assert verdicts and verdicts[-1]["actor"] == "policy"

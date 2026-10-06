@@ -31,6 +31,7 @@ from hub.services import (
     project_policy,
     review_dispatch,
     steward_dispatch,
+    steward_exit,
     steward_shadow,
 )
 
@@ -249,19 +250,67 @@ def _server_block() -> dict[str, Any]:
     }
 
 
-def _locks_block(slug: str) -> list[dict[str, Any]]:
+async def _key_changed_at(
+    db: aiosqlite.Connection, project_id: int, key: str
+) -> str | None:
+    """Время последней правки ключа: по ленте правок политики, новейшая первой.
+
+    Лента событий живёт ограниченно (``EVENTS_RETENTION_DAYS``): старше — None,
+    то есть «записи нет», а не «правки не было».
+    """
+    for row in await repo.list_project_events(db, project_id, POLICY_CHANGED_EVENT):
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        touched = [*(payload.get("changed") or []), *(payload.get("removed") or [])]
+        if key in touched:
+            return row["created_at"]
+    return None
+
+
+async def _locks_block(
+    db: aiosqlite.Connection, project: Any, policy: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Замок #743: разрешённые и запрещённые пары, решение владельца отдельно
+    от того, что на проекте стоит на деле и с какого времени (#1602)."""
+    slug = project["slug"]
+    allowed = project_policy.gate_lock_allowed_pairs()
     return [
         {
             "id": "#743",
             "applies": project_policy.gate_lock_applies(slug),
             "gates": list(project_policy.GATE_LOCK_GATES),
-            "refused_values": sorted(project_policy.DELEGATED_VERDICTS),
+            "allowed": allowed,
+            "allowed_note": {
+                pair: project_policy.GATE_LOCK_OWNER_DECISION for pair in allowed
+            },
+            "refused": project_policy.gate_lock_refused_pairs(),
+            "actual": {
+                gate: project_policy.gate_value_of(policy, gate)
+                for gate in project_policy.GATE_LOCK_GATES
+            }
+            | {
+                "changed_at": await _key_changed_at(db, int(project["id"]), "verdict"),
+            },
             "meaning": (
-                "проект default (сам хаб) не принимает делегирование ни на "
-                "одном из этих гейтов; политика default всегда human"
+                "проект default (сам хаб) не принимает делегирование на "
+                "этих гейтах, кроме разрешённых пар; автопилот на default "
+                "вердикт не ставит никогда"
             ),
         }
     ]
+
+
+async def _steward_verdicts_block(
+    db: aiosqlite.Connection, slug: str
+) -> dict[str, Any]:
+    """Фактические вердикты стюарда на проекте (#1602); теневые не считаются."""
+    window = steward_exit.STEWARD_VERDICT_WINDOW_DAYS
+    counts = await steward_exit.actual_steward_verdicts(db, window)
+    return {"count": counts.get(slug, 0), "window_days": window}
 
 
 async def _last_change(
@@ -346,7 +395,8 @@ async def effective_policy(db: aiosqlite.Connection, project: Any) -> dict[str, 
         "unknown_keys": {k: v for k, v in policy.items() if k not in REGISTRY},
         "steward": await _steward_block(db),
         "server": _server_block(),
-        "locks": _locks_block(project["slug"]),
+        "locks": await _locks_block(db, project, policy),
+        "steward_verdicts": await _steward_verdicts_block(db, project["slug"]),
         "last_change": await _last_change(db, project["id"]),
     }
 
@@ -425,8 +475,23 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
         state = "applies" if lock["applies"] else "does not apply"
         lines.append(
             f"Lock {lock['id']}: {state} (gates {', '.join(lock['gates'])}; "
-            f"refuses {', '.join(lock['refused_values'])})"
+            f"allows {', '.join(lock['allowed'])}; "
+            f"refuses {', '.join(lock['refused'])})"
         )
+        if lock["applies"]:
+            for pair, note in lock["allowed_note"].items():
+                lines.append(f"  {pair} allowed: {note}")
+            actual = lock["actual"]
+            lines.append(
+                "  actual: "
+                + ", ".join(f"{g}={actual[g]}" for g in lock["gates"])
+                + f"; verdict changed at {actual['changed_at'] or 'not recorded'}"
+            )
+    verdicts = data["steward_verdicts"]
+    lines.append(
+        f"Steward verdicts: {verdicts['count']} in {verdicts['window_days']} days "
+        "(recorded verdicts only; shadow and DoR judgements are not counted)"
+    )
     change = data.get("last_change")
     if change:
         who = change["by"] or change["actor"]

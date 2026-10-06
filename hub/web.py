@@ -1447,10 +1447,16 @@ async def _gate_policy_from_form(
     gate_policy: dict[str, Any] = {
         key: value for key, value in kept.items() if key not in _FORM_GATE_POLICY_KEYS
     }
-    gate_policy["dor"] = str(form.get("gate_policy_dor") or "").strip() or "human"
-    gate_policy["verdict"] = (
-        str(form.get("gate_policy_verdict") or "").strip() or "human"
-    )
+    # #1602: у default форма этих двух полей не показывает (стоит значок замка),
+    # и «поля нет» там значит «не трогать», а не «human»: иначе любое сохранение
+    # формы сбрасывало бы разрешённое verdict=steward. Где поле есть, пустое
+    # по-прежнему human.
+    for gate in project_policy.GATE_LOCK_GATES:
+        field = f"gate_policy_{gate}"
+        if field not in form and gate in kept:
+            gate_policy[gate] = kept[gate]
+        else:
+            gate_policy[gate] = str(form.get(field) or "").strip() or "human"
     # #805: the review key is offered to EVERY project, including default
     # — dispatching a reviewer takes no human out of any gate, so the
     # #743 lock (which is about 'auto' on dor/verdict) does not apply.

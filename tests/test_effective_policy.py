@@ -884,3 +884,117 @@ async def test_summary_shows_scheduled_change_and_its_executor(
     assert "executed from schedule #2" in "\n".join(
         effective_policy.format_effective_policy(after)
     )
+
+
+async def test_summary_names_partial_lock_and_counts_actual_steward_verdicts(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, capsys
+):
+    """#1602 AC-4: замок частичный, фактическое отдельно, считаются ТОЛЬКО вердикты."""
+    pid = await _project(db, "default", {"verdict": "human"})
+    resp = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"verdict": "steward"}}
+    )
+    assert resp.status_code == 200, resp.text
+    spike = await _project(db, "spike", {})
+
+    async def task(project_id: int | None) -> int:
+        task_id = await repo.create_task(
+            db,
+            title="t",
+            description="",
+            runtime="auto",
+            source="human",
+            assigned_agent="",
+            rationale="",
+            status="review",
+            auto_review=False,
+            task_type="task",
+            parent_id=None,
+            priority="medium",
+        )
+        if project_id is not None:
+            await repo.update_task(db, task_id, project_id=project_id)
+        return task_id
+
+    async def event(kind: str, task_id: int, actor: str, **payload) -> int:
+        return await repo.insert_event(
+            db, kind=kind, task_id=task_id, actor=actor, payload=payload
+        )
+
+    first, second, shadow = await task(None), await task(None), await task(None)
+    foreign = await task(spike)
+    for task_id, gen in ((first, 1), (second, 2)):
+        await event(
+            "review_verdict_recorded",
+            task_id,
+            "steward",
+            verdict="approved",
+            submission_generation=gen,
+        )
+    # Повтор того же поколения — одно поколение, один вердикт.
+    await event(
+        "review_verdict_recorded",
+        first,
+        "steward",
+        verdict="approved",
+        submission_generation=1,
+    )
+    # Человеческий вердикт и вердикт стюарда на чужом проекте не считаются.
+    await event(
+        "review_verdict_recorded",
+        shadow,
+        "denis",
+        verdict="approved",
+        submission_generation=1,
+    )
+    await event(
+        "review_verdict_recorded",
+        foreign,
+        "steward",
+        verdict="approved",
+        submission_generation=1,
+    )
+    # Теневые суждения (5) и DoR-суждение (1): steward_applied вердиктом не является.
+    for _ in range(5):
+        await event("steward_applied", shadow, "steward", verdict="approve")
+    await event("steward_applied", shadow, "steward", gate="dor")
+    # Вердикт стюарда за окном.
+    old = await event(
+        "review_verdict_recorded",
+        shadow,
+        "steward",
+        verdict="approved",
+        submission_generation=9,
+    )
+    await db.execute(
+        "UPDATE events SET created_at=datetime('now','-200 days') WHERE id=?", (old,)
+    )
+    await db.commit()
+
+    data = (await client.get("/api/projects/default/effective-policy")).json()
+    lock = {item["id"]: item for item in data["locks"]}["#743"]
+    assert lock["applies"] is True
+    assert lock["allowed"] == ["verdict=steward"]
+    assert lock["allowed_note"]["verdict=steward"] == "решение владельца от 06.10.2026"
+    assert set(lock["refused"]) == {"dor=auto", "dor=steward", "verdict=auto"}
+    # Фактическое значение и время правки — отдельно от решения владельца.
+    assert lock["actual"]["verdict"] == "steward"
+    assert lock["actual"]["changed_at"]
+    assert data["steward_verdicts"]["count"] == 2
+    assert data["steward_verdicts"]["window_days"] == 14
+
+    other = (await client.get("/api/projects/spike/effective-policy")).json()
+    assert other["steward_verdicts"]["count"] == 1
+    assert {i["id"]: i for i in other["locks"]}["#743"]["applies"] is False
+
+    # Та же цифра в practice_metrics.
+    from hub.services import orchestration
+
+    metrics = await orchestration._steward_shadow_metrics(db)
+    assert metrics["actual_verdicts"]["by_project"] == {"default": 2, "spike": 1}
+    assert metrics["actual_verdicts"]["total"] == 3
+    assert metrics["actual_verdicts"]["window_days"] == 14
+
+    text = "\n".join(effective_policy.format_effective_policy(data))
+    assert "verdict=steward" in text and "06.10.2026" in text
+    assert "Steward verdicts: 2" in text
