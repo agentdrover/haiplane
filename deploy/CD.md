@@ -243,7 +243,7 @@ envelope ответа:
 
 Ключ политики проекта `gate_policy.release_artifacts` — список пар
 `{repo_path, server_path, update_hint}`. Только точные копии: файлы-шаблоны
-(unit, env, drop-in, sudoers) законно отличаются от репо и сюда не входят.
+(unit, env, drop-in, sudoers, обёртка `deploy/review-runner/haiplane-review-run`) законно отличаются от репо и сюда не входят. `snapshot_unpack.py` — именно точная копия: это защищённый код проверки чужого tar (#1599).
 Пример для прода:
 
 ```json
@@ -253,7 +253,10 @@ envelope ответа:
    "update_hint": "ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo tee /usr/local/sbin/<SERVICE>-remote-deploy.sh >/dev/null' < deploy/remote-deploy.sh && ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo chmod 0755 /usr/local/sbin/<SERVICE>-remote-deploy.sh'"},
   {"repo_path": "deploy/review-runner/haiplane-review-runner.py",
    "server_path": "/usr/local/lib/haiplane-review-runner/haiplane-review-runner.py",
-   "update_hint": "установить файл по deploy/LOCAL-REVIEW.md и ПЕРЕЗАПУСТИТЬ службу: sudo systemctl restart haiplane-review-runner"}
+   "update_hint": "установить файл по deploy/LOCAL-REVIEW.md и ПЕРЕЗАПУСТИТЬ службу: sudo systemctl restart haiplane-review-runner"},
+  {"repo_path": "deploy/review-runner/snapshot_unpack.py",
+   "server_path": "/usr/local/lib/haiplane-review-runner/snapshot_unpack.py",
+   "update_hint": "установить root-овым файлом (0644 root:root) в тот же каталог, что и служба, по deploy/LOCAL-REVIEW.md «Выкат снимка»; проверка: python3 -I /usr/local/lib/haiplane-review-runner/haiplane-review-runner.py --check-install"}
 ]}}
 ```
 
@@ -344,6 +347,43 @@ CI остаётся финальной защитой: проверка её н�
 ничего не обходит. Мерж проходит, когда требования ruleset выполнены (ноль
 одобрений и зелёный «Ruff and pytest»), а гейт и так мержит только на зелёном
 CI.
+
+## Мутации и baseline в CI: по событию, а не на каждом обновлении ветки (#1606)
+
+Шаги «Mutations of changed functions» (~9,5 мин) и «Red-test baseline» (~2–3
+мин) совещательные: гейт доставки их исход не читает. Раньше они шли на каждом
+`pull_request`, и каждое обновление ветки гейтом (подтянул базу) или автором
+стоило 13–22 мин. Теперь решение принимает шаг `evidence` в `ci.yml` по событию
+GitHub, без обращения к хабу:
+
+| Событие | Мутации и baseline |
+|---|---|
+| `workflow_dispatch` task-ветки (ручной прогон исполнителя до сдачи; прогон от гейта #1197 тоже) | считаются, база — `origin/<base_ref>` либо `origin/develop` |
+| `pull_request` `opened` / `reopened` task-ветки | считаются |
+| `pull_request` `synchronize` | пропущены, причина — одной строкой в логе |
+| не-task PR: `develop`→`main`, `main`→`develop`, `dependabot/*`, прочие не `task-*`; `push` | пропущены, причина — строкой в логе |
+
+Test, AC и validation идут на каждом событии как раньше. `deploy`
+(`needs: test`), Compose и `treedup` не менялись: `treedup` может
+переиспользовать успешный PR-прогон с пропущенными мутациями, потому что `Test`
+в нём выполнен, а красный `Test` не даёт успешный workflow.
+
+Как это доходит до хаба. Репортёр получает исходы шагов. Шаг не запускался
+(`skipped`) — ключа `mutations`/`baseline` в отчёте нет, и хаб оставляет то, что
+уже сохранил для этого sha (REST различает «ключ не прислан» и «прислан»,
+замена идёт атомарно внутри `ON CONFLICT`). Шаг шёл, но валидного файла нет
+(timeout, битый JSON) — блок `state=error` с причиной, он заменяет сохранённое.
+Каждый присланный блок несёт `provenance` (`run_id`, `run_url`, `event`, `at`);
+бриф показывает его рядом с блоком, а блок без него — «прогон неизвестен».
+
+Контракт пересдачи. Новая голова уже открытого PR (в том числе первая сдача при
+заранее открытом PR) получает мутации и baseline, только если исполнитель
+запустил `workflow_dispatch` до сдачи: `gh workflow run ci.yml --ref <ветка>`.
+Иначе бриф пишет «не получено» — это не pass. Баг-задача с
+`bug_red_test=require` без baseline получает прежний отказ 422, поэтому для неё
+ручной прогон до первой сдачи обязателен всегда. Если пересдачи начнут массово
+приходить без мутаций, вернуть мутации на `synchronize` task-веток либо требовать
+dispatch-отчёт при сдаче (условие пересмотра задачи #1606).
 
 ## Git-доступ workspace (провижининг проектов, #347/#348)
 

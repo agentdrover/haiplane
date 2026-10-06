@@ -63,6 +63,33 @@ class MergeabilityOutcome(str, Enum):
 
 
 @dataclass(frozen=True)
+class SnapshotArchive:
+    """Снимок исходников на закреплённом sha для локального ревьюера (#1599).
+
+    Три состояния, и ни одно не молчит. ``ok`` — ``data`` это несжатый tar с
+    обычными файлами и каталогами; ``empty`` — дерево на sha пусто, читать
+    нечего, и это НЕ сбой монтирования; ``absent`` — снимка нет, ``reason``
+    называет почему (нет sha, потолок, git не ответил). ``note`` — что git
+    archive и хаб исключили из ok-снимка (ссылки, слишком длинные пути).
+    """
+
+    sha: str
+    data: bytes | None
+    reason: str = ""
+    note: str = ""
+    empty: bool = False
+    #: Маркер пути в промте, вставленный заказом (у каждого заказа свой): по нему
+    #: транспорт подставляет фактический путь, не трогая чужие вхождения (#1599).
+    placeholder: str = ""
+
+    @property
+    def state(self) -> str:
+        if self.data is not None:
+            return "ok"
+        return "empty" if self.empty else "absent"
+
+
+@dataclass(frozen=True)
 class CIProbeResult:
     """A CI probe outcome plus a stable, machine-usable reason (#419)."""
 
@@ -500,6 +527,9 @@ class GitOpsPlugin(Protocol):
     async def fetch_commit(
         self, repo: str, sha: str, ref: str = "", *, timeout: int = 20
     ) -> tuple[bool, str]: ...
+    async def snapshot_archive(
+        self, repo: str, sha: str, max_bytes: int, ref: str = ""
+    ) -> SnapshotArchive: ...
     async def auto_commit(
         self,
         task_id: int,

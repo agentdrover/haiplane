@@ -3319,3 +3319,275 @@ async def test_claim_race_won_by_same_holder_keeps_the_worktree_hint(client):
     race.assert_awaited_once()
     assert resp.status_code == 200
     assert resp.json()["worktree_hint"].startswith("../.<имя вашего клона>-worktrees/")
+
+
+# ---------------------------------------------------------------- снимок (#1599)
+
+
+def _snap_git(repo: Path, *args: str) -> str:
+    done = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+    return done.stdout.strip()
+
+
+def _tar_members(data: bytes) -> dict[str, tuple[bytes, str]]:
+    import io
+    import tarfile
+
+    found: dict[str, tuple[bytes, str]] = {}
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar:
+        for member in tar:
+            body = tar.extractfile(member).read() if member.isreg() else b""
+            found[member.name.rstrip("/")] = (
+                body,
+                "dir" if member.isdir() else "file" if member.isreg() else "other",
+            )
+    return found
+
+
+async def test_the_snapshot_archive_is_bounded_while_reading(
+    git_ops: GitOpsIntegration, tmp_path: Path
+) -> None:
+    """AC-4: архив читается порциями с потолком; бинарные байты сохранены.
+
+    Потолок проверен на ЧТЕНИИ, а не после него: ребёнок, который пишет без
+    конца, останавливается на потолке, его процесс убит и дождан, а память
+    не растёт сверх потолка. Прежний ``run_bytes`` собирал бы весь вывод
+    ``communicate()`` и мерил его потом.
+    """
+    import sys
+    import time
+    import tracemalloc
+
+    from hub.integrations import proc
+
+    # --- стадия 1: потоковый хелпер на заведомо бесконечном выводе.
+    pid_file = tmp_path / "child.pid"
+    done_file = tmp_path / "child.done"
+    flood = (
+        "import os, sys\n"
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        "chunk = b'z' * (1 << 20)\n"
+        "for _ in range(4000):\n"
+        "    sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()\n"
+        f"open({str(done_file)!r}, 'w').write('x')\n"
+    )
+    tracemalloc.start()
+    started = time.monotonic()
+    rc, out, err = await proc.run_capped(
+        sys.executable, "-c", flood, max_bytes=1 << 20, timeout=30
+    )
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert rc == -2, (rc, err)
+    assert len(out) == 0 and "longer than" in err, (
+        "превышение потолка — отказ без вывода"
+    )
+    assert peak < 6 * (1 << 20), f"память выросла до {peak}: вывод копился целиком"
+    assert time.monotonic() - started < 10, "чтение не остановилось на потолке"
+    child = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("процесс, превысивший потолок, остался жить")
+    assert not done_file.exists(), "процесс дописал вывод до конца: его не остановили"
+
+    # stderr тоже ограничен: поток в stderr — отказ, а не рост памяти.
+    noisy = (
+        "import sys\n"
+        "while True:\n"
+        "    sys.stderr.write('e' * 100000); sys.stderr.flush()\n"
+    )
+    rc, out, err = await proc.run_capped(
+        sys.executable, "-c", noisy, max_bytes=1 << 20, max_stderr=50_000, timeout=30
+    )
+    assert rc == -3 and len(err) <= 50_000 + 200, (rc, len(err))
+
+    # Нормальный вывод — сырые байты как есть, без decode и strip.
+    payload = b"\xff\xfe\x00 tail\n\n"
+    rc, out, err = await proc.run_capped(
+        sys.executable,
+        "-c",
+        f"import sys; sys.stdout.buffer.write({payload!r})",
+        max_bytes=1024,
+    )
+    assert (rc, out) == (0, payload), "вывод искажён: завершающие переводы строк"
+
+    # --- стадия 2: настоящий git archive.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _snap_git(repo, "init", "-q", "-b", "main")
+    blob = b"\xff\xfe\xfd binary \x00 tail\n\n\n"
+    (repo / "binary.dat").write_bytes(blob)
+    (repo / "src").mkdir()
+    (repo / "src" / "module.py").write_text("VALUE = 1\n")
+    (repo / "target.txt").write_text("target\n")
+    (repo / "link").symlink_to("target.txt")
+    (repo / "ignored.txt").write_text("export-ignored\n")
+    (repo / ".gitattributes").write_text("ignored.txt export-ignore\n")
+    (repo / "big.bin").write_bytes(os.urandom(300_000))
+    _snap_git(repo, "add", "-A")
+    _snap_git(repo, "commit", "-qm", "c")
+    sha = _snap_git(repo, "rev-parse", "HEAD")
+    sub = _snap_git(repo, "rev-parse", "HEAD")
+    _snap_git(repo, "update-index", "--add", "--cacheinfo", f"160000,{sub},vendor")
+    _snap_git(repo, "commit", "-qm", "with a submodule entry")
+    sha = _snap_git(repo, "rev-parse", "HEAD")
+
+    ok = await git_ops.snapshot_archive(str(repo), sha, 8 * 1024 * 1024)
+    assert ok.data is not None and ok.state == "ok", ok
+    members = _tar_members(ok.data)
+    assert members["binary.dat"][0] == blob, "бинарные байты снимка не равны blob"
+    assert (
+        members["binary.dat"][0]
+        == subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "blob", f"{sha}:binary.dat"],
+            capture_output=True,
+            check=True,
+        ).stdout
+    )
+    assert members["src/module.py"][0] == b"VALUE = 1\n"
+    assert "link" not in members, "символьная ссылка не должна быть в снимке"
+    assert "ignored.txt" not in members, "export-ignore — политика git archive"
+    assert members.get("vendor", (b"", "dir"))[1] == "dir", (
+        "submodule не раскрывается: в снимке максимум пустой каталог"
+    )
+    assert "ссыл" in ok.note, "что исключено из снимка, называется"
+
+    # Потолок меньше архива: снимка нет, причина названа, процесс дождан.
+    small = await git_ops.snapshot_archive(str(repo), sha, 100_000)
+    assert small.data is None and small.state == "absent", small
+    assert "100000" in small.reason, small.reason
+    # Неизвестный sha: снимка нет, причина названа.
+    missing = await git_ops.snapshot_archive(str(repo), "0" * 40, 1 << 20)
+    assert missing.data is None and missing.reason, missing
+    # Пустое дерево — не «сбой монтирования», а отдельное состояние.
+    _snap_git(repo, "checkout", "-q", "--orphan", "empty")
+    _snap_git(repo, "rm", "-rfq", ".")
+    _snap_git(repo, "commit", "-qm", "empty", "--allow-empty")
+    empty = await git_ops.snapshot_archive(
+        str(repo), _snap_git(repo, "rev-parse", "HEAD"), 1 << 20
+    )
+    assert empty.data is None and empty.state == "empty", empty
+
+
+async def test_the_snapshot_fetches_a_missing_commit_and_noop_names_its_absence(
+    git_ops: GitOpsIntegration, tmp_path: Path
+) -> None:
+    """Объект sha доставляется при необходимости; без git снимка нет и это названо."""
+    from hub.integrations.noop import NoopGitOps
+
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _snap_git(origin, "init", "-q", "-b", "main")
+    (origin / "a.txt").write_text("a\n")
+    _snap_git(origin, "add", "-A")
+    _snap_git(origin, "commit", "-qm", "a")
+    clone = tmp_path / "clone"
+    _snap_git(tmp_path, "clone", "-q", str(origin), str(clone))
+    _snap_git(origin, "checkout", "-q", "-b", "task-1/x")
+    (origin / "later.txt").write_text("later\n")
+    _snap_git(origin, "add", "-A")
+    _snap_git(origin, "commit", "-qm", "later")
+    sha = _snap_git(origin, "rev-parse", "HEAD")
+    assert await git_ops.commit_exists(str(clone), sha) is False, "предпосылка"
+
+    snap = await git_ops.snapshot_archive(str(clone), sha, 1 << 20, "task-1/x")
+    assert snap.state == "ok" and snap.data, snap
+    assert _tar_members(snap.data)["later.txt"][0] == b"later\n"
+
+    lost = await git_ops.snapshot_archive(str(clone), "f" * 40, 1 << 20, "no-such")
+    assert lost.state == "absent" and "не найден" in lost.reason, lost
+
+    nothing = await NoopGitOps().snapshot_archive("/x", "a" * 40, 100)
+    assert nothing.state == "absent" and nothing.reason and nothing.data is None
+
+
+async def test_a_cancelled_capped_read_takes_the_child_with_it(tmp_path: Path) -> None:
+    """Отмена чтения снимает процесс (группу), а не оставляет его без читателя."""
+    import asyncio
+    import sys
+    import time
+
+    from hub.integrations import proc
+
+    pid_file = tmp_path / "child.pid"
+    script = (
+        "import os, time\n"
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        "time.sleep(60)\n"
+    )
+    task = asyncio.create_task(
+        proc.run_capped(sys.executable, "-c", script, max_bytes=1024, timeout=120)
+    )
+    deadline = time.monotonic() + 10
+    while not pid_file.exists() and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    assert pid_file.exists(), "предпосылка: процесс стартовал"
+    child = int(pid_file.read_text())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("процесс пережил отмену чтения")
+
+
+async def test_a_snapshot_with_nothing_left_is_not_called_an_empty_tree(
+    git_ops: GitOpsIntegration, tmp_path: Path
+) -> None:
+    """«Всё отфильтровано» и «дерево пусто» — разные состояния (находка Codex)."""
+    only_link = tmp_path / "only_link"
+    only_link.mkdir()
+    _snap_git(only_link, "init", "-q", "-b", "main")
+    (only_link / "link").symlink_to("nowhere")
+    _snap_git(only_link, "add", "-A")
+    _snap_git(only_link, "commit", "-qm", "link only")
+    snap = await git_ops.snapshot_archive(
+        str(only_link), _snap_git(only_link, "rev-parse", "HEAD"), 1 << 20
+    )
+    assert snap.state == "absent" and not snap.empty, snap
+    assert "исключено 1 ссылок" in snap.reason, snap.reason
+
+    ignored = tmp_path / "ignored"
+    ignored.mkdir()
+    _snap_git(ignored, "init", "-q", "-b", "main")
+    (ignored / "a.txt").write_text("a\n")
+    (ignored / ".gitattributes").write_text("* export-ignore\n")
+    _snap_git(ignored, "add", "-A")
+    _snap_git(ignored, "commit", "-qm", "all ignored")
+    snap = await git_ops.snapshot_archive(
+        str(ignored), _snap_git(ignored, "rev-parse", "HEAD"), 1 << 20
+    )
+    assert snap.state == "absent" and not snap.empty, snap
+    assert "export-ignore" in snap.reason, snap.reason
+
+    blank = tmp_path / "blank"
+    blank.mkdir()
+    _snap_git(blank, "init", "-q", "-b", "main")
+    _snap_git(blank, "commit", "-qm", "empty", "--allow-empty")
+    snap = await git_ops.snapshot_archive(
+        str(blank), _snap_git(blank, "rev-parse", "HEAD"), 1 << 20
+    )
+    assert snap.state == "empty", snap

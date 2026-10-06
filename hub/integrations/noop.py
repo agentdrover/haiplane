@@ -22,6 +22,7 @@ from hub.integrations.protocols import (
     CIRunRequestOutcome,
     CIRunRequestResult,
     MergeabilityOutcome,
+    SnapshotArchive,
     StackProbeResult,
     stacking_probe_batch_from_probe,
     stacking_probe_from_predicate,
@@ -406,6 +407,14 @@ class NoopGitOps:
     ) -> tuple[bool, str]:
         """No git here — nothing is fetched, and the caller must say so (#883)."""
         return (False, "git integration is not configured")
+
+    async def snapshot_archive(
+        self, repo: str, sha: str, max_bytes: int, ref: str = ""
+    ) -> SnapshotArchive:
+        """No git here — there is no snapshot, and the reason says so (#1599)."""
+        return SnapshotArchive(
+            sha=sha, data=None, reason="git integration is not configured"
+        )
 
     async def fetch_base(self, repo: str, base: str) -> tuple[bool, str]:
         """No git here — the drift check must read this as "cannot check",
