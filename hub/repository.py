@@ -2221,13 +2221,21 @@ async def upsert_ci_run_report(
     reason: str,
     reported_by: str,
     checks: str = "{}",
-    mutations: str = "{}",
-    baseline: str = "{}",
+    mutations: str | None = None,
+    baseline: str | None = None,
 ) -> None:
     """Store what a CI run reported for one commit (idempotent per commit).
 
     Re-running CI on the same commit updates the row rather than adding a
     second opinion — the same rule the merge ledger follows (#605).
+
+    ``mutations`` / ``baseline`` of ``None`` mean "the report carried no such
+    key" (#1606): the step did not run, so a block stored earlier for this
+    commit stays. The decision is made inside ON CONFLICT, in the same
+    statement that writes — a read before the write would let two reports for
+    one commit pass each other and erase the evidence they meant to keep. Text
+    (including ``"{}"``) replaces: a step that ran and found nothing, or ended
+    in error, is a fact, not an absence.
     """
     await db.execute(
         "INSERT INTO ci_run_reports (task_id, head_sha, ac_results, "
@@ -2240,8 +2248,10 @@ async def upsert_ci_run_report(
         "validation_log=excluded.validation_log, "
         "reason=excluded.reason, reported_by=excluded.reported_by, "
         "checks=excluded.checks, "
-        "mutations=excluded.mutations, "
-        "baseline=excluded.baseline, "
+        "mutations=CASE WHEN ? THEN ci_run_reports.mutations "
+        "ELSE excluded.mutations END, "
+        "baseline=CASE WHEN ? THEN ci_run_reports.baseline "
+        "ELSE excluded.baseline END, "
         "reported_at=excluded.reported_at",
         (
             task_id,
@@ -2252,8 +2262,10 @@ async def upsert_ci_run_report(
             reason,
             reported_by,
             checks,
-            mutations,
-            baseline,
+            "{}" if mutations is None else mutations,
+            "{}" if baseline is None else baseline,
+            1 if mutations is None else 0,
+            1 if baseline is None else 0,
         ),
     )
 

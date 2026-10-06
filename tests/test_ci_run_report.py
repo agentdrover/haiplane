@@ -209,6 +209,110 @@ async def test_an_oversized_mutation_report_is_refused(db):
         )
 
 
+# ---- #1606: a report without the evidence keys does not erase the stored ones ----
+
+
+_PROV_1 = {
+    "run_id": "111",
+    "run_url": "https://github.example/runs/111",
+    "event": "workflow_dispatch",
+    "at": "2026-10-06T10:00:00Z",
+}
+_FULL_MUTATIONS = {"state": "ran", "survivors": [], "provenance": _PROV_1}
+_FULL_BASELINE = {
+    "state": "ran",
+    "merge_base": "base-sha",
+    "tests": {"tests/test_x.py::test_a": "failed"},
+    "provenance": _PROV_1,
+}
+
+
+async def _post_report(client: AsyncClient, ci, task_id: int, **keys):
+    body = {
+        "head_sha": "sha-pinned",
+        "ac_results": {"AC-1": "pass"},
+        "validation_status": "pass",
+        **keys,
+    }
+    resp = await client.post(
+        f"/api/tasks/{task_id}/ci-run-report", json=body, headers=ci
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def _stored_evidence(db, task_id: int) -> tuple[dict, dict, dict]:
+    import json
+
+    row = dict(await repo.get_ci_run_report(db, task_id, "sha-pinned"))
+    return (
+        json.loads(row["mutations"]),
+        json.loads(row["baseline"]),
+        json.loads(row["checks"]),
+    )
+
+
+async def test_a_report_without_evidence_keys_keeps_the_stored_evidence(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-2: absent key = the step did not run; present key (even {}) replaces."""
+    ci = _ci_token_headers(monkeypatch)
+    task_id = await _task(db, generation=1, sha="sha-pinned")
+
+    await _post_report(
+        client,
+        ci,
+        task_id,
+        checks={"lint": "pass"},
+        mutations=_FULL_MUTATIONS,
+        baseline=_FULL_BASELINE,
+    )
+
+    # A synchronize-style report: no mutations, no baseline, newer checks.
+    out = await _post_report(client, ci, task_id, checks={"lint": "fail"})
+    mutations, baseline, checks = await _stored_evidence(db, task_id)
+    assert mutations == _FULL_MUTATIONS, "an absent key must not erase the evidence"
+    assert baseline == _FULL_BASELINE
+    assert mutations["provenance"] == _PROV_1, "provenance travels with its block"
+    assert checks == {"lint": "fail"}, "checks are always the latest report's"
+    assert out["mutations_state"] == "ran" and out["baseline_state"] == "ran"
+
+    # A present error replaces — the failure must be visible, not hidden.
+    error = {"state": "error", "reason": "timeout", "provenance": _PROV_1}
+    await _post_report(client, ci, task_id, mutations=error)
+    mutations, baseline, _ = await _stored_evidence(db, task_id)
+    assert mutations == error
+    assert baseline == _FULL_BASELINE, "the other key is still untouched"
+
+    # A present empty object replaces too.
+    await _post_report(client, ci, task_id, mutations={}, baseline={})
+    mutations, baseline, _ = await _stored_evidence(db, task_id)
+    assert mutations == {} and baseline == {}
+
+
+async def test_both_report_orders_leave_the_same_evidence(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-2: synchronize-then-opened and opened-then-synchronize agree."""
+    ci = _ci_token_headers(monkeypatch)
+    first = await _task(db, generation=1, sha="sha-pinned")
+    await _post_report(client, ci, first, checks={"lint": "pass"})
+    await _post_report(
+        client, ci, first, mutations=_FULL_MUTATIONS, baseline=_FULL_BASELINE
+    )
+
+    second = await _task(db, generation=1, sha="sha-pinned")
+    await _post_report(
+        client, ci, second, mutations=_FULL_MUTATIONS, baseline=_FULL_BASELINE
+    )
+    await _post_report(client, ci, second, checks={"lint": "pass"})
+
+    one = await _stored_evidence(db, first)
+    two = await _stored_evidence(db, second)
+    assert one[0] == two[0] == _FULL_MUTATIONS
+    assert one[1] == two[1] == _FULL_BASELINE
+
+
 # ---- the order that actually happens in production ----
 
 

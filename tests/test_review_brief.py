@@ -1560,3 +1560,73 @@ async def test_brief_and_verdict_card_show_path_notices(
     assert block["state"] == "unknown"
     assert "не удалось прочитать дифф ветки" in block["reason"]
     assert len(_notice_lines(await repo.get_task_updates(db, nodiff_id))) == 1
+
+
+# ---- #1606: mutation / baseline evidence in the brief ------------------------
+
+
+async def _store_report(db, task_id: int, *, mutations: dict, baseline: dict):
+    import json
+
+    await repo.upsert_ci_run_report(
+        db,
+        task_id=task_id,
+        head_sha="a" * 40,
+        ac_results="{}",
+        validation_status="pass",
+        validation_log="",
+        reason="",
+        reported_by="ci",
+        checks="{}",
+        mutations=json.dumps(mutations),
+        baseline=json.dumps(baseline),
+    )
+    await db.commit()
+
+
+async def test_missing_mutation_evidence_reads_as_not_received(
+    db, client: AsyncClient, workspace
+):
+    """AC-4: absence is "не получено", a block names its run, an old one says unknown."""
+    task_id = await _project_with(db, client, workspace, "main")
+    plugins.git_ops = _RealRefs()
+    await repo.update_task(db, task_id, submission_sha="a" * 40)
+    await db.commit()
+
+    async def evidence() -> dict:
+        brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+        return brief["ci_evidence"]
+
+    # No report for the pinned commit: neither block is a pass.
+    both = await evidence()
+    for key in ("mutations", "baseline"):
+        assert both[key]["state"] == "not_received", both
+        assert "не получено" in both[key]["reason"]
+
+    # A report that carries no evidence keys (a synchronize run) is the same.
+    await _store_report(db, task_id, mutations={}, baseline={})
+    both = await evidence()
+    assert both["mutations"]["state"] == "not_received"
+    assert both["baseline"]["state"] == "not_received"
+
+    # A block with provenance names the run and the event.
+    provenance = {
+        "run_id": "777",
+        "run_url": "https://github.example/runs/777",
+        "event": "pull_request.opened",
+        "at": "2026-10-06T10:00:00Z",
+    }
+    await _store_report(
+        db,
+        task_id,
+        mutations={"state": "ran", "survivors": [], "provenance": provenance},
+        baseline={"state": "ran", "tests": {}},
+    )
+    both = await evidence()
+    assert both["mutations"]["state"] == "received"
+    assert both["mutations"]["result"] == "ran"
+    assert "777" in both["mutations"]["run"]
+    assert "pull_request.opened" in both["mutations"]["run"]
+    # An old block, stored before provenance existed, does not invent one.
+    assert both["baseline"]["state"] == "received"
+    assert "прогон неизвестен" in both["baseline"]["run"]
