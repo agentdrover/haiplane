@@ -607,14 +607,6 @@ async def advisor_refusal(
             "судья и советник читали разные пакеты — согласие не о том, что "
             f"одобрено ({sides})",
         )
-    task_row = await repo.get_task(db, task_id)
-    live = int(dict(task_row).get("submission_generation") or 0) if task_row else 0
-    if live != generation:
-        return (
-            REFUSED_ADVISOR,
-            f"поколение {generation} не текущее (живое {live}): согласие о коде, "
-            "которого на ветке уже нет",
-        )
     now = (
         packet_hash(packet)
         if packet is not None
@@ -625,6 +617,18 @@ async def advisor_refusal(
             REFUSED_ADVISOR,
             "пакет фактов изменился после ответа советника: согласие относится "
             f"к прежнему пакету ({sides})",
+        )
+    # Поколение читается ПОСЛЕ пересчёта пакета: пересчёт асинхронный, и пока
+    # он шёл, сдачу могли пересдать. Это чтение — не защита записи (её держит
+    # условный UPDATE вердикта), а способ не называть согласие действующим,
+    # когда оно уже о чужом коде.
+    task_row = await repo.get_task(db, task_id)
+    live = int(dict(task_row).get("submission_generation") or 0) if task_row else 0
+    if live != generation:
+        return (
+            REFUSED_ADVISOR,
+            f"поколение {generation} не текущее (живое {live}): согласие о коде, "
+            "которого на ветке уже нет",
         )
     return None
 

@@ -3779,6 +3779,9 @@ class VerdictContext:
     # Флаги вызова, а не производное шагов: приходят из ручки и нужны записи.
     self_approved: bool = False
     principal_id: int | None = None
+    # #1601: поколение, о котором судили. Если задано, запись вердикта
+    # условна В SQL: поколение живо и вердикта на него нет.
+    expected_generation: int | None = None
 
     body_text: str = ""
     pinned_sha: str = ""
@@ -4028,6 +4031,7 @@ async def record_review_verdict(
     *,
     self_approved: bool = False,
     principal_id: int | None = None,
+    expected_generation: int | None = None,
 ) -> TaskView:
     """Record an explicit review verdict for the current submission (#305).
 
@@ -4073,6 +4077,7 @@ async def record_review_verdict(
         body=body,
         self_approved=self_approved,
         principal_id=principal_id,
+        expected_generation=expected_generation,
     )
     await run_steps(state, VERDICT_STEPS)
 
@@ -4170,6 +4175,7 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
     body = state.body
     self_approved = state.self_approved
     principal_id = state.principal_id
+    expected_generation = state.expected_generation
 
     # Контракт между конвейером и записью вердикта.
     pinned_sha = state.pinned_sha
@@ -4183,13 +4189,23 @@ async def _apply_verdict(state: VerdictContext) -> TaskView:
             [f.model_dump(exclude_none=True) for f in body.findings],
             ensure_ascii=False,
         )
-        await repo.record_review_verdict(
+        written = await repo.record_review_verdict(
             db,
             task_id,
             body.verdict.value,
             findings_json=findings_json,
             self_approved=self_approved,
+            expected_generation=expected_generation,
         )
+        if not written:
+            # #1601: пока считали (пакет, согласие), сдачу пересдали или вердикт
+            # на неё уже поставил человек. Запись не состоялась ни на какое
+            # поколение; транзакция откатывается целиком.
+            raise HTTPException(
+                409,
+                f"вердикт о сдаче {expected_generation} не записан: поколение "
+                "уже другое или вердикт на него уже стоит",
+            )
         agent, content = _verdict_update_text(state)
         # The verdict is authored by a principal — the endpoint already
         # resolved one to check reviewer independence. Without this it would

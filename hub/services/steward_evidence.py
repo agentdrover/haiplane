@@ -940,6 +940,30 @@ PACKET_HASH_SOURCES: tuple[str, ...] = (
     "risk_class",
 )
 _PACKET_HASH_VOLATILE_KEYS = frozenset({"tokens_spent"})
+#: Поля брифа, которые читает судья и которые определяют, ЧТО он одобряет:
+#: постановка и условия приёмки. Изменение любого — другой пакет. Остальные
+#: поля брифа (результаты тестов, CI, статус, диф-команда, маршрут вердикта)
+#: либо уже входят факты выше, либо меняются сами и согласие убивали бы зря.
+#: Перечень явный: поле, не названное здесь, хеш не двигает.
+PACKET_HASH_BRIEF_FIELDS: tuple[str, ...] = (
+    "title",
+    "description",
+    "acceptance_criteria",
+    "scope_in",
+    "scope_out",
+    "out_of_scope_for_review",
+    "review_checklist",
+    "validation_commands",
+    "constraints",
+    "technical_hints",
+    "outcome_metric",
+    "outcome_indicator",
+    "outcome_deadline",
+    "outcome_revisit_condition",
+    "redesign_decision",
+    "redesign_rationale",
+    "agent_fit",
+)
 
 
 def packet_hash(packet: EvidencePacket) -> str:
@@ -961,8 +985,14 @@ def packet_hash(packet: EvidencePacket) -> str:
                 if k not in _PACKET_HASH_VOLATILE_KEYS
             },
         }
+    brief = packet.brief.model_dump(mode="json") if packet.brief else None
     body = {
         "generation": packet.generation,
+        "brief": (
+            {k: brief.get(k) for k in PACKET_HASH_BRIEF_FIELDS}
+            if brief is not None
+            else None
+        ),
         "facts": facts,
         "quotes": [[q.source, q.author, q.text] for q in packet.quotes],
     }

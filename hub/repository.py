@@ -2788,8 +2788,13 @@ async def record_review_verdict(
     verdict: str,
     findings_json: str = "[]",
     self_approved: bool = False,
-) -> None:
+    expected_generation: int | None = None,
+) -> bool:
     """Persist a review verdict bound to the CURRENT submission generation.
+
+    ``expected_generation`` (#1601): запись условна В SQL — только если живое
+    поколение равно названному И на него ещё нет вердикта. Возвращает, была
+    ли запись; без ожидания поведение прежнее (всегда True).
 
     The binding is done in SQL (``review_verdict_generation = submission_generation``)
     so the verdict can never be attached to a generation the caller read
@@ -2803,15 +2808,24 @@ async def record_review_verdict(
     (#1286): a window closed by a human decision belonged to the PREVIOUS
     verdict, and a new verdict opens its own.
     """
-    await db.execute(
-        "UPDATE tasks SET review_verdict=?, "
+    guard = ""
+    params: list[Any] = [verdict, findings_json, 1 if self_approved else 0, task_id]
+    if expected_generation is not None:
+        guard = (
+            " AND submission_generation=? AND NOT (COALESCE(review_verdict,'')!='' "
+            "AND review_verdict_generation=submission_generation)"
+        )
+        params.append(expected_generation)
+    cursor = await db.execute(
+        "UPDATE tasks SET review_verdict=?, "  # nosec B608 - guard is a constant
         "review_verdict_generation=submission_generation, "
         "review_findings=?, "
         "review_self_approved=?, "
         "review_verdict_closed_generation=NULL, "
-        "updated_at=datetime('now') WHERE id=?",
-        (verdict, findings_json, 1 if self_approved else 0, task_id),
+        "updated_at=datetime('now') WHERE id=?" + guard,
+        tuple(params),
     )
+    return (cursor.rowcount or 0) > 0
 
 
 async def close_review_verdict_window(

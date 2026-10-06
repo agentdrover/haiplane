@@ -195,19 +195,34 @@ async def contour_counts(
 
 @dataclass(frozen=True)
 class FalseApprove:
-    """Одно найденное ошибочное одобрение: задача, источник и подробность."""
+    """Одно найденное ошибочное одобрение: задача, источник, случай и подробность.
+
+    ``ref`` называет КОНКРЕТНЫЙ случай: id события возврата, id дефекта, метка
+    времени переоткрытия. Липкость и снятие работают по (задача, источник,
+    случай), а не по задаче: снятый случай не возвращается, а новый случай той
+    же задачи — новая запись.
+    """
 
     task_id: int
     source: str
     generation: int
     detail: str
+    ref: str = ""
 
 
-async def concur_pairs(db: aiosqlite.Connection) -> list[tuple[int, int]]:
-    """(задача, поколение) пар, которые СОГЛАСИЛИСЬ: approve судьи + concur."""
+@dataclass(frozen=True)
+class _Pair:
+    task_id: int
+    generation: int
+    approved_at: str
+
+
+async def concur_pairs(db: aiosqlite.Connection) -> list[_Pair]:
+    """Пары, которые СОГЛАСИЛИСЬ: approve судьи + concur; с временем одобрения."""
     rows = await fetchall(
         db,
-        "SELECT j.task_id, j.generation FROM steward_judgements j "
+        "SELECT j.task_id, j.generation, a.created_at AS approved_at "
+        "FROM steward_judgements j "
         "JOIN steward_judgements a ON a.kind='advisor' AND a.verdict='concur' "
         "AND a.task_id=j.task_id AND a.generation=j.generation "
         "AND a.judged_id=j.id "
@@ -215,25 +230,64 @@ async def concur_pairs(db: aiosqlite.Connection) -> list[tuple[int, int]]:
         "ORDER BY j.id",
         (CONTOUR_V2,),
     )
-    return [(int(dict(r)["task_id"]), int(dict(r)["generation"])) for r in rows]
+    return [
+        _Pair(
+            int(dict(r)["task_id"]),
+            int(dict(r)["generation"]),
+            str(dict(r)["approved_at"] or ""),
+        )
+        for r in rows
+    ]
 
 
-async def _human_returns(db: aiosqlite.Connection, task_id: int) -> dict[int, str]:
-    """Последний человеческий вердикт по каждому поколению → время события.
+async def _delivered_at(db: aiosqlite.Connection, pair: _Pair) -> str:
+    """Когда ЭТО одобрение доставлено: первый мерж гейта после ответа пары.
 
-    Только ``changes_requested`` в итоге: человек, вернувший и затем
-    одобривший то же поколение, ошибки пары не доказал. Акторы автоматики
-    (policy, steward, hub) исключены тем же списком, что у таблицы тени.
+    Источник — реестр мержей гейта (``pipeline_merges``), а не ``completed_at``:
+    второе — завершение задачи, и оно перезаписывается повторным завершением.
+    Пусто — доставки не зафиксировано.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT MIN(merged_at) AS at FROM pipeline_merges "
+        "WHERE task_id=? AND merged_at >= ?",
+        (pair.task_id, pair.approved_at),
+    )
+    return str(dict(rows[0]).get("at") or "") if rows else ""
+
+
+async def _plus_window(db: aiosqlite.Connection, stamp: str) -> str:
+    rows = await fetchall(
+        db,
+        "SELECT datetime(?, ?) AS at",
+        (stamp, f"+{FALSE_APPROVE_WINDOW_DAYS} days"),
+    )
+    return str(dict(rows[0]).get("at") or "")
+
+
+def _in(stamp: str, low: str, high: str) -> bool:
+    """Обе границы включительно; пустая метка в окно не входит."""
+    return bool(stamp) and low <= stamp <= high
+
+
+async def _human_returns(
+    db: aiosqlite.Connection, task_id: int
+) -> list[tuple[int, int, str]]:
+    """ВСЕ человеческие возвраты задачи: (id события, поколение, время).
+
+    Каждый возврат — факт; последующий approved его не отменяет (отменяет
+    только явное снятие человеком). Акторы автоматики исключены тем же
+    списком, что у таблицы тени.
     """
     placeholders, actors = sql_in(NON_HUMAN_GATE_ACTORS)
     rows = await fetchall(
         db,
-        "SELECT payload, created_at FROM events "  # nosec B608 - placeholders from module constants
+        "SELECT id, payload, created_at FROM events "  # nosec B608 - placeholders from module constants
         "WHERE kind='review_verdict_recorded' AND task_id=? "
         f"AND actor NOT IN ({placeholders}) ORDER BY id ASC",
         (task_id, *actors),
     )
-    last: dict[int, tuple[str, str]] = {}
+    out: list[tuple[int, int, str]] = []
     for row in rows:
         item = dict(row)
         try:
@@ -241,60 +295,63 @@ async def _human_returns(db: aiosqlite.Connection, task_id: int) -> dict[int, st
         except ValueError:
             continue
         generation = int(payload.get("submission_generation") or 0)
-        verdict = str(payload.get("verdict") or "").strip()
-        if generation and verdict in ("approved", "changes_requested"):
-            last[generation] = (verdict, str(item.get("created_at") or ""))
-    return {g: at for g, (v, at) in last.items() if v == "changes_requested"}
+        if generation and payload.get("verdict") == "changes_requested":
+            out.append((int(item["id"]), generation, str(item.get("created_at") or "")))
+    return out
 
 
-async def _within(db: aiosqlite.Connection, stamp: str, horizon: str | None) -> bool:
-    """Событие не позже горизонта (доставка + окно); без горизонта — всегда."""
-    if horizon is None or not stamp:
-        return True
-    rows = await fetchall(db, "SELECT ? <= ? AS ok", (stamp, horizon))
-    return bool(dict(rows[0]).get("ok")) if rows else True
+async def _detect_for_pair(db: aiosqlite.Connection, pair: _Pair) -> list[FalseApprove]:
+    """Ошибочные одобрения одной пары по трём источникам, в обе границы окна.
 
-
-async def _detect_for_pair(
-    db: aiosqlite.Connection, task_id: int, generation: int
-) -> list[FalseApprove]:
-    row = await fetchall(
-        db,
-        "SELECT status, completed_at, status_entered_at, "
-        "datetime(completed_at, ?) AS horizon FROM tasks WHERE id=?",
-        (f"+{FALSE_APPROVE_WINDOW_DAYS} days", task_id),
-    )
-    if not row:
-        return []
-    task = dict(row[0])
-    horizon = task.get("horizon") or None
+    Якорь окна — доставка этого одобрения, а если её нет — само одобрение.
+    Возврат человеком считается от момента одобрения (он случается ДО
+    доставки: возвращённое не доставляется); переоткрытие и прод-дефект —
+    только от доставки, поэтому без зафиксированной доставки их нет.
+    """
+    task_id, generation = pair.task_id, pair.generation
+    delivered = await _delivered_at(db, pair)
+    anchor = delivered or pair.approved_at
+    high = await _plus_window(db, anchor)
     found: list[FalseApprove] = []
 
-    for gen, at in sorted((await _human_returns(db, task_id)).items()):
-        if gen >= generation and await _within(db, at, horizon):
+    for event_id, gen, at in await _human_returns(db, task_id):
+        if gen >= generation and _in(at, pair.approved_at, high):
             found.append(
                 FalseApprove(
                     task_id,
                     SOURCE_HUMAN_CHANGES,
                     generation,
-                    f"человек вернул поколение {gen} (пара одобрила "
-                    f"поколение {generation})",
+                    f"человек вернул поколение {gen} (пара одобрила поколение "
+                    f"{generation}), событие #{event_id}",
+                    ref=str(event_id),
                 )
             )
-            break
 
+    if not delivered:
+        return found
+
+    rows = await fetchall(
+        db,
+        "SELECT status, completed_at, status_entered_at FROM tasks WHERE id=?",
+        (task_id,),
+    )
+    task = dict(rows[0]) if rows else {}
+    reopened_at = str(task.get("status_entered_at") or "")
+    completed_at = str(task.get("completed_at") or "")
     if (
-        task.get("completed_at")
+        completed_at
+        and completed_at >= delivered
         and task.get("status") != "completed"
-        and await _within(db, str(task.get("status_entered_at") or ""), horizon)
+        and _in(reopened_at, completed_at, high)
     ):
         found.append(
             FalseApprove(
                 task_id,
                 SOURCE_REOPENED,
                 generation,
-                f"задача доставлена ({task['completed_at']}) и снова в статусе "
-                f"{task.get('status')}",
+                f"задача доставлена ({delivered}), завершена ({completed_at}) и "
+                f"снова в статусе {task.get('status')} с {reopened_at}",
+                ref=reopened_at,
             )
         )
 
@@ -304,41 +361,44 @@ async def _detect_for_pair(
         "WHERE found_in='prod' AND caused_by_task_id=? ORDER BY id",
         (task_id,),
     )
-    ids = [
-        int(dict(d)["id"])
-        for d in defects
-        if await _within(db, str(dict(d).get("at") or ""), horizon)
-    ]
-    if ids:
-        found.append(
-            FalseApprove(
-                task_id,
-                SOURCE_PROD_DEFECT,
-                generation,
-                "прод-дефект found_in=prod, caused_by_task_id на неё: "
-                + ", ".join(f"#{i}" for i in ids),
+    for d in defects:
+        item = dict(d)
+        if _in(str(item.get("at") or ""), delivered, high):
+            found.append(
+                FalseApprove(
+                    task_id,
+                    SOURCE_PROD_DEFECT,
+                    generation,
+                    "прод-дефект found_in=prod, caused_by_task_id на неё: "
+                    f"#{item['id']}",
+                    ref=str(item["id"]),
+                )
             )
-        )
     return found
 
 
-async def _cleared_tasks(db: aiosqlite.Connection) -> set[int]:
+async def _recorded_keys(db: aiosqlite.Connection) -> set[tuple[int, str, str]]:
     rows = await fetchall(
-        db,
-        "SELECT DISTINCT task_id FROM steward_false_approvals "
-        "WHERE cleared_at IS NOT NULL",
+        db, "SELECT task_id, source, ref FROM steward_false_approvals"
     )
-    return {int(dict(r)["task_id"]) for r in rows}
+    return {
+        (int(dict(r)["task_id"]), str(dict(r)["source"]), str(dict(r)["ref"]))
+        for r in rows
+    }
 
 
 async def detect_false_approvals(db: aiosqlite.Connection) -> list[FalseApprove]:
-    """Что находится по данным СЕЙЧАС. Только чтение; снятые человеком — вне."""
-    cleared = await _cleared_tasks(db)
+    """Что находится по данным СЕЙЧАС и ещё не записано (ни активным, ни снятым).
+
+    Только чтение. Случай, уже внесённый в таблицу, в находки не попадает:
+    активный лежит в таблице, а снятый человеком не возвращается.
+    """
+    known = await _recorded_keys(db)
     out: list[FalseApprove] = []
-    for task_id, generation in await concur_pairs(db):
-        if task_id in cleared:
-            continue
-        out.extend(await _detect_for_pair(db, task_id, generation))
+    for pair in await concur_pairs(db):
+        for item in await _detect_for_pair(db, pair):
+            if (item.task_id, item.source, item.ref) not in known:
+                out.append(item)
     return out
 
 
@@ -346,7 +406,7 @@ async def sticky_false_approvals(db: aiosqlite.Connection) -> list[FalseApprove]
     """Записанные и не снятые человеком."""
     rows = await fetchall(
         db,
-        "SELECT task_id, source, generation, detail FROM steward_false_approvals "
+        "SELECT task_id, source, generation, detail, ref FROM steward_false_approvals "
         "WHERE cleared_at IS NULL ORDER BY id",
     )
     return [
@@ -355,35 +415,31 @@ async def sticky_false_approvals(db: aiosqlite.Connection) -> list[FalseApprove]
             str(dict(r)["source"]),
             int(dict(r)["generation"]),
             str(dict(r)["detail"]),
+            str(dict(r)["ref"]),
         )
         for r in rows
     ]
 
 
 async def current_false_approvals(db: aiosqlite.Connection) -> list[FalseApprove]:
-    """Липкие плюс найденные сейчас, без повторов по (задача, источник)."""
-    seen: set[tuple[int, str]] = set()
-    out: list[FalseApprove] = []
-    for item in [*await sticky_false_approvals(db), *await detect_false_approvals(db)]:
-        key = (item.task_id, item.source)
-        if key not in seen:
-            seen.add(key)
-            out.append(item)
-    return out
+    """Активные записи плюс найденное сейчас и ещё не закреплённое."""
+    return [*await sticky_false_approvals(db), *await detect_false_approvals(db)]
 
 
 async def record_false_approvals(db: aiosqlite.Connection) -> int:
     """Закрепить найденное: с этого момента оно не зависит от данных.
 
-    Возвращает число новых записей. ``INSERT OR IGNORE`` по (задача, источник):
-    повторное обнаружение не плодит строк и не сбрасывает дату первого.
+    Зовётся КАЖДЫЙ тик поллера и при запросе act — независимо от режима: в
+    тени события возврата чистятся через 14 дней (``prune_events``), и основание
+    нельзя оставлять на запрос act. Возвращает число новых записей;
+    ``INSERT OR IGNORE`` по (задача, источник, случай) повторов не плодит.
     """
     added = 0
     for item in await detect_false_approvals(db):
         cursor = await db.execute(
             "INSERT OR IGNORE INTO steward_false_approvals "
-            "(task_id, source, generation, detail) VALUES (?, ?, ?, ?)",
-            (item.task_id, item.source, item.generation, item.detail),
+            "(task_id, source, generation, detail, ref) VALUES (?, ?, ?, ?, ?)",
+            (item.task_id, item.source, item.generation, item.detail, item.ref),
         )
         added += cursor.rowcount or 0
     await db.commit()
@@ -393,11 +449,12 @@ async def record_false_approvals(db: aiosqlite.Connection) -> int:
 async def clear_false_approval(
     db: aiosqlite.Connection, task_id: int, human: str, note: str = ""
 ) -> int:
-    """Явное событие человека: снять ошибочное одобрение с задачи.
+    """Явное решение человека: снять АКТИВНЫЕ ошибочные одобрения задачи.
 
-    Если строк по задаче ещё нет (найдено «сейчас», но не закреплено), они
-    закрепляются и тут же снимаются: иначе следующее обнаружение вернуло бы
-    отказ, который человек уже рассудил. Возвращает число снятых строк.
+    Снимаются конкретные случаи, которые есть сейчас (найденные, но не
+    закреплённые, закрепляются и тут же снимаются). Нечего снимать — 0, и
+    никакого запаса на будущее: новый случай той же задачи станет новой
+    активной записью. Возвращает число снятых случаев.
     """
     await record_false_approvals(db)
     cursor = await db.execute(
@@ -405,18 +462,8 @@ async def clear_false_approval(
         "clear_note=? WHERE task_id=? AND cleared_at IS NULL",
         (human, note, task_id),
     )
-    cleared = cursor.rowcount or 0
-    if not cleared:
-        # Нечего снимать — но решение человека всё равно фиксируется, чтобы
-        # будущее обнаружение по этой задаче не вернуло отказ.
-        await db.execute(
-            "INSERT OR IGNORE INTO steward_false_approvals "
-            "(task_id, source, generation, detail, cleared_by, cleared_at, "
-            "clear_note) VALUES (?, 'human_cleared', 0, ?, ?, datetime('now'), ?)",
-            (task_id, "снято человеком до обнаружения", human, note),
-        )
     await db.commit()
-    return cleared
+    return cursor.rowcount or 0
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +555,12 @@ async def contour_report(db: aiosqlite.Connection) -> dict[str, Any]:
         "min_pairs": ACT_MIN_PAIRS,
         "false_approve": len({f.task_id for f in false_approves}),
         "false_approve_tasks": [
-            {"task_id": f.task_id, "source": f.source, "detail": f.detail}
+            {
+                "task_id": f.task_id,
+                "source": f.source,
+                "ref": f.ref,
+                "detail": f.detail,
+            }
             for f in false_approves
         ],
     }

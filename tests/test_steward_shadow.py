@@ -3861,20 +3861,91 @@ async def _clean_act_sample(db: aiosqlite.Connection, project_id: int) -> None:
 
 
 async def _human(
-    db: aiosqlite.Connection, task_id: int, verdict: str, generation: int = 1
-) -> None:
-    await repo.insert_event(
+    db: aiosqlite.Connection,
+    task_id: int,
+    verdict: str,
+    generation: int = 1,
+    *,
+    days_ago: int = 0,
+) -> int:
+    """Человеческий вердикт; ``days_ago`` сдвигает время события. Возвращает id."""
+    event_id = await repo.insert_event(
         db,
         kind="review_verdict_recorded",
         task_id=task_id,
         actor="denis",
         payload={"verdict": verdict, "submission_generation": generation},
     )
+    if days_ago:
+        await db.execute(
+            "UPDATE events SET created_at=datetime('now', ?) WHERE id=?",
+            (f"-{days_ago} days", event_id),
+        )
     await db.commit()
+    return int(event_id or 0)
+
+
+async def _age_pair(db: aiosqlite.Connection, task_id: int, days: int) -> None:
+    """Пара ответила ``days`` дней назад (оба суждения)."""
+    await db.execute(
+        "UPDATE steward_judgements SET created_at=datetime('now', ?) WHERE task_id=?",
+        (f"-{days} days", task_id),
+    )
+    await db.commit()
+
+
+_PR = [9000]
+
+
+async def _deliver(db: aiosqlite.Connection, task_id: int, days_ago: int) -> None:
+    """Мерж гейта записан ``days_ago`` дней назад — зафиксированная доставка."""
+    _PR[0] += 1
+    await db.execute(
+        "INSERT INTO pipeline_merges (project_id, pr_number, task_id, merged_at) "
+        "VALUES (1, ?, ?, datetime('now', ?))",
+        (_PR[0], task_id, f"-{days_ago} days"),
+    )
+    await db.commit()
+
+
+async def _prod_defect(
+    db: aiosqlite.Connection,
+    caused_by: int,
+    *,
+    found_in: str = "prod",
+    days_ago: int = 0,
+) -> int:
+    defect = await repo.create_task(
+        db,
+        title="дефект",
+        description="",
+        runtime="auto",
+        source="agent",
+        assigned_agent="pda_claude",
+        rationale="",
+        status="open",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await db.execute(
+        "UPDATE tasks SET found_in=?, caused_by_task_id=?, "
+        "detected_at=datetime('now', ?) WHERE id=?",
+        (found_in, caused_by, f"-{days_ago} days", defect),
+    )
+    await db.commit()
+    return defect
 
 
 def _refusal_text(refusals) -> str:
     return " ".join(detail for code, detail in refusals if code == "false_approve")
+
+
+async def _active(db: aiosqlite.Connection) -> list[tuple[int, str, str]]:
+    from hub.services.steward_exit import sticky_false_approvals
+
+    return [(f.task_id, f.source, f.ref) for f in await sticky_false_approvals(db)]
 
 
 async def test_false_approve_sources_are_sticky_and_global(
@@ -3904,6 +3975,9 @@ async def test_false_approve_sources_are_sticky_and_global(
     task_b = await _v2_row(db, project_a, verdict="approve", advisor="concur")
     task_c = await _v2_row(db, project_a, verdict="approve", advisor="concur")
     task_d = await _v2_row(db, project_a, verdict="approve", advisor="concur")
+    for task in (task_b, task_c, task_d):
+        await _age_pair(db, task, 5)
+        await _deliver(db, task, 4)
     assert await effective_mode(db) == "act", "до ошибок пары чистые"
 
     # (а) человеческий возврат на более позднем поколении.
@@ -3915,77 +3989,35 @@ async def test_false_approve_sources_are_sticky_and_global(
     assert report["contour"]["false_approve"] == 1
     assert report["contour"]["false_approve_tasks"][0]["task_id"] == task_a
 
-    # Липкость: данные исчезли и человек «передумал» — отказ стоит.
+    # Липкость: данные исчезли, человек «передумал» — отказ стоит.
     await db.execute("DELETE FROM events WHERE kind='review_verdict_recorded'")
     await db.commit()
     await _human(db, task_a, "approved", generation=2)
     assert await effective_mode(db) == "shadow"
     assert f"#{task_a}" in _refusal_text(await act_refusals(db))
 
-    # (б) переоткрытие: задача была доставлена и снова в работе.
+    # (б) переоткрытие: доставлена, завершена и снова в работе.
     await db.execute(
-        "UPDATE tasks SET completed_at=datetime('now','-3 days'), status='running', "
+        "UPDATE tasks SET status='running', completed_at=datetime('now','-3 days'), "
         "status_entered_at=datetime('now','-1 days') WHERE id=?",
         (task_b,),
     )
     await db.commit()
-    assert await effective_mode(db) == "shadow"
     text = _refusal_text(await act_refusals(db))
     assert f"#{task_b}" in text and "reopened" in text
 
     # (в) прод-дефект с caused_by_task_id.
-    await db.execute(
-        "UPDATE tasks SET status='completed', completed_at=datetime('now','-3 days') "
-        "WHERE id=?",
-        (task_c,),
-    )
-    defect = await repo.create_task(
-        db,
-        title="прод упал",
-        description="",
-        runtime="auto",
-        source="agent",
-        assigned_agent="pda_claude",
-        rationale="",
-        status="open",
-        auto_review=True,
-        task_type="task",
-        parent_id=None,
-        priority="medium",
-    )
-    await db.execute(
-        "UPDATE tasks SET found_in='prod', caused_by_task_id=? WHERE id=?",
-        (task_c, defect),
-    )
+    await db.execute("UPDATE tasks SET status='completed' WHERE id=?", (task_c,))
+    defect = await _prod_defect(db, task_c, days_ago=1)
     await db.commit()
-    assert await effective_mode(db) == "shadow"
     text = _refusal_text(await act_refusals(db))
     assert f"#{task_c}" in text and "prod_defect" in text and f"#{defect}" in text
 
     # Дефект, найденный на ревью, ошибочным одобрением не считается.
-    review_defect = await repo.create_task(
-        db,
-        title="нашли на ревью",
-        description="",
-        runtime="auto",
-        source="agent",
-        assigned_agent="pda_claude",
-        rationale="",
-        status="open",
-        auto_review=True,
-        task_type="task",
-        parent_id=None,
-        priority="medium",
-    )
-    await db.execute(
-        "UPDATE tasks SET found_in='review', caused_by_task_id=? WHERE id=?",
-        (task_d, review_defect),
-    )
-    await db.commit()
+    await _prod_defect(db, task_d, found_in="review", days_ago=1)
     assert f"#{task_d}" not in _refusal_text(await act_refusals(db))
 
-    # Глобальность: тот же отказ виден при просьбе act «для проекта B» — режим
-    # один на хаб, и выдан он не будет, пока ошибка не снята.
+    # Глобальность: режим один на хаб; чужой проект ошибку не гасит.
     report = await mode_report(db)
     assert report["requested"] == "act" and report["effective"] == "shadow"
     assert {t["task_id"] for t in report["contour"]["false_approve_tasks"]} == {
@@ -3994,17 +4026,14 @@ async def test_false_approve_sources_are_sticky_and_global(
         task_c,
     }
     await _clean_act_sample(db, project_b)
-    assert await effective_mode(db) == "shadow", "чужой проект ошибку не гасит"
+    assert await effective_mode(db) == "shadow"
 
-    # Снимает только явное решение человека — и только по названной задаче.
+    # Снимает только явное решение человека — по названной задаче.
     assert await clear_false_approval(db, task_a, "denis", "разобрано") == 1
     assert await effective_mode(db) == "shadow", "b и c ещё стоят"
     await clear_false_approval(db, task_b, "denis")
     await clear_false_approval(db, task_c, "denis")
     assert await act_refusals(db) == []
-    assert await effective_mode(db) == "act"
-    # Данные b и c по-прежнему показывают переоткрытие и дефект, но решённое
-    # человеком заново отказом не становится.
     assert await effective_mode(db) == "act"
 
 
@@ -4062,17 +4091,31 @@ async def test_a_human_return_of_an_earlier_generation_is_not_the_pairs_error(
     assert await current_false_approvals(db) == []
 
 
-async def test_a_return_the_human_took_back_is_not_a_false_approve(
+async def test_a_return_stays_a_false_approve_after_a_later_approve(
     db: aiosqlite.Connection,
 ):
-    """Человек вернул и тут же одобрил то же поколение: итог — approve."""
-    from hub.services.steward_exit import current_false_approvals
+    """Возврат — факт: последующий approved человека его НЕ снимает (только clear).
+
+    Прежняя версия читала лишь последний вердикт поколения, и «вернул, потом
+    одобрил» стирало ошибку без решения человека. Теперь учитывается сам
+    возврат и он закрепляется при обнаружении.
+    """
+    from hub.services.steward_exit import (
+        clear_false_approval,
+        current_false_approvals,
+        record_false_approvals,
+    )
 
     project_id = await _project(db, "advisor-fa-retaken")
     task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
     await _human(db, task_id, "changes_requested")
     await _human(db, task_id, "approved")
 
+    assert [f.task_id for f in await current_false_approvals(db)] == [task_id]
+    await record_false_approvals(db)
+    await _human(db, task_id, "approved")
+    assert [f.task_id for f in await current_false_approvals(db)] == [task_id]
+    assert await clear_false_approval(db, task_id, "denis") == 1
     assert await current_false_approvals(db) == []
 
 
@@ -4094,51 +4137,94 @@ async def test_an_automatic_verdict_is_not_a_human_return(db: aiosqlite.Connecti
     assert await current_false_approvals(db) == []
 
 
-async def test_the_thirty_day_window_after_delivery(db: aiosqlite.Connection):
-    """В течение 30 дней после доставки — считается; позже — нет.
+async def test_a_human_return_before_the_pair_answered_is_not_counted(
+    db: aiosqlite.Connection,
+):
+    """Нижняя граница окна — момент одобрения: прежний возврат пару не обвиняет."""
+    from hub.services.steward_exit import current_false_approvals
 
-    Окно меряется от доставки задачи (completed_at): прод-дефект через 10 дней
-    после неё — ошибка пары, через 40 — уже нет.
+    project_id = await _project(db, "advisor-fa-before")
+    task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    await _human(db, task_id, "changes_requested", days_ago=2)
+    await _age_pair(db, task_id, 0)
+    await db.execute(
+        "UPDATE steward_judgements SET created_at=datetime('now') WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+
+    assert await current_false_approvals(db) == []
+
+
+async def test_the_window_is_bounded_on_both_sides_and_anchored_to_the_delivery(
+    db: aiosqlite.Connection,
+):
+    """Окно: [доставка, доставка+30 дней] для дефекта и переоткрытия; обе границы.
+
+    Доставка берётся из реестра мержей гейта, а НЕ из ``completed_at``. Без
+    зафиксированной доставки дефект и переоткрытие не считаются вовсе; дефект
+    ДО доставки и позже окна — тоже.
     """
     from hub.services.steward_exit import current_false_approvals
 
     project_id = await _project(db, "advisor-fa-window")
 
-    async def _defect_after(days: int) -> int:
+    async def _case(*, delivered_days_ago: int | None, defect_days_ago: int) -> int:
         task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
-        await db.execute(
-            "UPDATE tasks SET status='completed', "
-            "completed_at=datetime('now', '-50 days') WHERE id=?",
-            (task_id,),
-        )
-        defect = await repo.create_task(
-            db,
-            title="прод",
-            description="",
-            runtime="auto",
-            source="agent",
-            assigned_agent="pda_claude",
-            rationale="",
-            status="open",
-            auto_review=True,
-            task_type="task",
-            parent_id=None,
-            priority="medium",
-        )
-        await db.execute(
-            "UPDATE tasks SET found_in='prod', caused_by_task_id=?, "
-            "detected_at=datetime('now', ?) WHERE id=?",
-            (task_id, f"-{50 - days} days", defect),
-        )
-        await db.commit()
+        await _age_pair(db, task_id, 60)
+        if delivered_days_ago is not None:
+            await _deliver(db, task_id, delivered_days_ago)
+        await _prod_defect(db, task_id, days_ago=defect_days_ago)
         return task_id
 
-    inside = await _defect_after(10)
-    outside = await _defect_after(40)
+    inside = await _case(delivered_days_ago=40, defect_days_ago=20)  # +20 дн.
+    edge = await _case(delivered_days_ago=40, defect_days_ago=10)  # +30 дн.
+    after = await _case(delivered_days_ago=40, defect_days_ago=5)  # +35 дн.
+    before = await _case(delivered_days_ago=10, defect_days_ago=20)  # до доставки
+    undelivered = await _case(delivered_days_ago=None, defect_days_ago=1)
 
     flagged = {f.task_id for f in await current_false_approvals(db)}
-    assert inside in flagged
-    assert outside not in flagged
+    assert inside in flagged and edge in flagged
+    assert after not in flagged, "позже окна"
+    assert before not in flagged, "дефект раньше доставки"
+    assert undelivered not in flagged, "доставки не зафиксировано"
+
+
+async def test_a_second_completion_does_not_move_the_window(db: aiosqlite.Connection):
+    """Повторное завершение задачи не двигает окно: якорь — мерж, а не completed_at."""
+    from hub.services.steward_exit import current_false_approvals
+
+    project_id = await _project(db, "advisor-fa-recomplete")
+    task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    await _age_pair(db, task_id, 60)
+    await _deliver(db, task_id, 50)
+    await _prod_defect(db, task_id, days_ago=1)  # +49 дней: вне окна
+    # Повторное завершение «сегодня» сделало бы дефект «свежим» по completed_at.
+    await db.execute(
+        "UPDATE tasks SET status='completed', completed_at=datetime('now') WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+
+    assert await current_false_approvals(db) == []
+
+
+async def test_a_reopening_needs_a_recorded_delivery(db: aiosqlite.Connection):
+    from hub.services.steward_exit import current_false_approvals
+
+    project_id = await _project(db, "advisor-fa-reopen-nodelivery")
+    task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    await db.execute(
+        "UPDATE tasks SET status='running', completed_at=datetime('now','-3 days'), "
+        "status_entered_at=datetime('now','-1 days') WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    assert await current_false_approvals(db) == [], "доставки нет — переоткрытия нет"
+
+    await _age_pair(db, task_id, 5)
+    await _deliver(db, task_id, 4)
+    assert [f.source for f in await current_false_approvals(db)] == ["reopened"]
 
 
 async def test_a_human_return_after_the_window_is_not_counted(
@@ -4148,34 +4234,104 @@ async def test_a_human_return_after_the_window_is_not_counted(
 
     project_id = await _project(db, "advisor-fa-window-human")
     task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
-    await db.execute(
-        "UPDATE tasks SET status='completed', completed_at=datetime('now','-60 days') "
-        "WHERE id=?",
-        (task_id,),
-    )
-    await _human(db, task_id, "changes_requested")  # событие — сегодня
-    await db.commit()
+    await _age_pair(db, task_id, 60)
+    await _deliver(db, task_id, 50)
+    await _human(db, task_id, "changes_requested")  # сегодня: +50 дней
 
     assert await current_false_approvals(db) == []
 
 
-async def test_clearing_before_detection_still_closes_the_task(
+async def test_clearing_closes_the_case_not_the_task(db: aiosqlite.Connection):
+    """Снятие закрывает КОНКРЕТНЫЙ случай; новый случай той же задачи — новая запись.
+
+    Прежний вариант исключал задачу целиком: после clear любой следующий
+    прод-дефект той же задачи оставался невидимым.
+    """
+    from hub.services.steward_exit import (
+        clear_false_approval,
+        current_false_approvals,
+        record_false_approvals,
+    )
+
+    project_id = await _project(db, "advisor-fa-case")
+    task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    await _age_pair(db, task_id, 5)
+    await _deliver(db, task_id, 4)
+    event = await _human(db, task_id, "changes_requested")
+    await record_false_approvals(db)
+
+    assert await clear_false_approval(db, task_id, "denis", "возврат разобран") == 1
+    assert await current_false_approvals(db) == [], "снятый случай не возвращается"
+    await record_false_approvals(db)
+    assert await current_false_approvals(db) == []
+
+    defect = await _prod_defect(db, task_id, days_ago=1)
+    now = await current_false_approvals(db)
+    assert [(f.source, f.ref) for f in now] == [("prod_defect", str(defect))]
+    assert event != defect
+    await record_false_approvals(db)
+    assert await _active(db) == [(task_id, "prod_defect", str(defect))]
+
+
+async def test_clearing_without_an_active_case_buys_no_immunity(
     db: aiosqlite.Connection,
 ):
-    """Решение человека фиксируется, даже если ошибку ещё не закрепили."""
+    """Clear без активной записи — 0 и никакого запаса на будущее."""
     from hub.services.steward_exit import clear_false_approval, current_false_approvals
 
-    project_id = await _project(db, "advisor-fa-preclear")
+    project_id = await _project(db, "advisor-fa-no-immunity")
+    task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+
+    assert await clear_false_approval(db, task_id, "denis", "на всякий случай") == 0
+
+    await _human(db, task_id, "changes_requested")
+    assert [f.task_id for f in await current_false_approvals(db)] == [task_id]
+
+
+async def test_a_human_return_found_in_shadow_survives_the_event_retention(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Тень → возврат → prune_events → запрос act → отказ false_approve.
+
+    Возврат закрепляется тиком поллера (``sweep_steward_runs``) в ЛЮБОМ
+    режиме, а не только при запросе act; к моменту, когда act запросят,
+    события возврата уже могут быть вычищены через 14 дней.
+    """
+    from hub.services.steward_dispatch import sweep_steward_runs
+    from hub.services.steward_shadow import act_refusals, effective_mode
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    project_id = await _project(db, "advisor-fa-retention")
+    await _clean_act_sample(db, project_id)
     task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
     await _human(db, task_id, "changes_requested")
 
-    assert await clear_false_approval(db, task_id, "denis", "рассмотрено") == 1
+    await sweep_steward_runs(db)
+    assert await _active(db) == [
+        (task_id, "human_changes_requested", (await _active(db))[0][2])
+    ]
 
-    assert await current_false_approvals(db) == []
+    await db.execute(
+        "UPDATE events SET created_at=datetime('now','-20 days') WHERE task_id=?",
+        (task_id,),
+    )
+    await db.commit()
+    assert await repo.prune_events(db, keep_days=14) >= 1
+    await db.commit()
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM events WHERE kind='review_verdict_recorded' AND task_id=?",
+        (task_id,),
+    )
+    assert list(rows) == [], "основание в events исчезло"
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "act")
+    assert "false_approve" in {code for code, _ in await act_refusals(db)}
+    assert await effective_mode(db) == "shadow"
 
 
 async def test_the_pure_report_does_not_write_a_sticky_row(db: aiosqlite.Connection):
-    """Сводка (GET) ничего не закрепляет: закрепляет только effective_mode/поллер."""
+    """Сводка (GET) ничего не закрепляет: закрепляют поллер и effective_mode."""
     from hub.services.steward_shadow import mode_report
 
     project_id = await _project(db, "advisor-fa-pure")

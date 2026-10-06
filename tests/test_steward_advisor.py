@@ -1171,6 +1171,10 @@ async def test_only_a_human_lifts_a_false_approve(
     done = await client.post(
         url, json={"note": "разобрано"}, headers={"Authorization": "Bearer human-token"}
     )
+    again = await client.post(
+        url, json={}, headers={"Authorization": "Bearer human-token"}
+    )
+    assert again.status_code == 404, "снимать нечего — отказ, а не запас на будущее"
     assert done.status_code == 200, done.text
     assert done.json() == {"task_id": task_id, "cleared": 1, "by": "denis"}
     assert await current_false_approvals(db) == []
@@ -1222,11 +1226,12 @@ async def test_the_policy_summary_shows_the_pair_counters_with_task_numbers(
 
 
 async def test_a_concur_about_a_superseded_generation_is_not_consent(
-    db: aiosqlite.Connection,
+    db: aiosqlite.Connection, monkeypatch
 ):
     """Поколение ушло — согласие о прежнем коде не применяется (само по себе)."""
     task_id = await _in_review(db, "advisor-superseded-consent")
     await _pair_on_packet(db, task_id)
+    _same_packet(monkeypatch, "pkt")
     await repo.update_task(db, task_id, submission_generation=2)
     await db.commit()
 
@@ -1250,3 +1255,225 @@ async def test_the_consent_is_asked_with_the_prebuilt_packet_when_given(
     moved = await build_evidence_packet(db, task_id, 1)
     refusal = await advisor_refusal(db, task_id, 1, moved)
     assert refusal is not None and "изменился" in refusal[1]
+
+
+# ---------------------------------------------------------------------------
+# Круг Codex до сдачи
+# ---------------------------------------------------------------------------
+
+
+async def _bump_generation(db: aiosqlite.Connection, task_id: int) -> None:
+    await repo.update_task(db, task_id, submission_generation=2)
+    await db.commit()
+
+
+def _during_recompute(monkeypatch, action) -> None:
+    """Подменить пересчёт пакета так, чтобы ``action`` случился ВНУТРИ него.
+
+    Пересчёт асинхронный, и всё, что происходит в этом окне, — реальная гонка:
+    согласие уже прочитано, вердикт ещё не записан.
+    """
+    from hub.services import steward_evidence
+
+    async def _recompute(_db, task_id, _generation):
+        await action(task_id)
+        return "pkt"
+
+    monkeypatch.setattr(steward_evidence, "current_packet_hash", _recompute)
+
+
+async def test_a_resubmission_during_the_recompute_gets_no_verdict_on_the_new_code(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Пересдача, пришедшая пока пересчитывали пакет, не получает вердикт.
+
+    Раньше поколение проверялось до асинхронного пересчёта, а запись вердикта
+    привязывала его к ТЕКУЩЕМУ поколению: apply_judgement(generation=1)
+    возвращал applied, и задача получала approved с
+    review_verdict_generation=2 — одобрение кода, о котором пара не судила.
+    """
+    from hub.services.steward_applied import apply_judgement
+
+    task_id = await _in_review(db, "advisor-race-generation")
+    await _pair_on_packet(db, task_id)
+
+    async def _resubmit(task):
+        await _bump_generation(db, task)
+
+    _during_recompute(monkeypatch, _resubmit)
+
+    with pytest.raises(HTTPException) as refused:
+        await apply_judgement(db, task_id, 1)
+
+    assert refused.value.status_code == 409
+    task = dict(await repo.get_task(db, task_id))
+    assert not (task.get("review_verdict") or ""), "вердикта нет ни на каком поколении"
+    assert task["review_verdict_generation"] in (None, 0)
+    assert task["submission_generation"] == 2
+
+
+async def test_a_resubmission_during_the_recompute_stops_the_poller_too(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Тот же переход поколения на пути поллера: ни вердикта, ни исхода «approved».
+
+    Прежний тест гонки двух поллеров имитировал занятую метку на одном
+    соединении и перехода поколения не касался.
+    """
+    await _act(monkeypatch)
+    await _patched_converged(monkeypatch)
+    task_id = await _scenario(db, "advisor-race-poller", "concur")
+
+    async def _resubmit(task):
+        await _bump_generation(db, task)
+
+    _during_recompute(monkeypatch, _resubmit)
+
+    await apply_advisor_outcomes(db)
+
+    task = dict(await repo.get_task(db, task_id))
+    assert not (task.get("review_verdict") or "")
+    assert (await _judge_row(db, task_id))["advisor_outcome"] != "approved"
+
+
+async def test_a_human_verdict_that_lands_during_the_recompute_is_not_overwritten(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Человек поставил вердикт, пока считали пакет, — стюард его не затирает.
+
+    Условие «вердикта на это поколение ещё нет» стоит в самом UPDATE.
+    """
+    from hub.models import ReviewVerdict, TaskReviewVerdict
+    from hub.services.lifecycle import record_review_verdict
+    from hub.services.steward_applied import apply_judgement
+
+    task_id = await _in_review(db, "advisor-race-human")
+    await _pair_on_packet(db, task_id)
+
+    async def _human_decides(task):
+        await record_review_verdict(
+            db,
+            task,
+            TaskReviewVerdict(
+                agent="denis",
+                verdict=ReviewVerdict.changes_requested,
+                comments="верну",
+            ),
+        )
+
+    _during_recompute(monkeypatch, _human_decides)
+
+    with pytest.raises(HTTPException) as refused:
+        await apply_judgement(db, task_id, 1)
+
+    assert refused.value.status_code == 409
+    task = dict(await repo.get_task(db, task_id))
+    assert task["review_verdict"] == "changes_requested", "решение человека цело"
+    verdicts = [
+        e
+        for e in await _events(db, "review_verdict_recorded")
+        if e["task_id"] == task_id
+    ]
+    assert [e["actor"] for e in verdicts] == ["denis"]
+
+
+async def test_the_verdict_write_is_conditional_in_sql(db: aiosqlite.Connection):
+    """Сама запись вердикта отказывает, когда поколение другое или вердикт стоит."""
+    task_id = await _in_review(db, "advisor-sql-guard")
+    assert (
+        await repo.record_review_verdict(db, task_id, "approved", expected_generation=2)
+        is False
+    )
+    assert (
+        await repo.record_review_verdict(db, task_id, "approved", expected_generation=1)
+        is True
+    )
+    assert (
+        await repo.record_review_verdict(db, task_id, "approved", expected_generation=1)
+        is False
+    )
+    assert await repo.record_review_verdict(db, task_id, "approved") is True, (
+        "без ожидания поведение прежнее — человек пишет поверх"
+    )
+
+
+async def _consented_on_real_hash(db: aiosqlite.Connection, slug: str) -> int:
+    task_id = await _in_review(db, slug)
+    await _green(db, task_id)
+    h = await _real_packet_hash(db, task_id)
+    await _pair_on_packet(db, task_id, packet=h)
+    assert await advisor_refusal(db, task_id, 1) is None, "предусловие: согласие есть"
+    return task_id
+
+
+async def test_a_new_acceptance_criterion_voids_the_consent(db: aiosqlite.Connection):
+    """Новый AC после concur — другой пакет: хеш брифа входит в хеш пакета."""
+    from hub.models import AcceptanceCriterion
+
+    task_id = await _consented_on_real_hash(db, "advisor-hash-ac")
+
+    await repo.add_acceptance_criterion(
+        db,
+        task_id,
+        AcceptanceCriterion(
+            id="AC-9", given="g", when="w", then="t", verifiable_by="manual"
+        ),
+    )
+    await db.commit()
+
+    refusal = await advisor_refusal(db, task_id, 1)
+    assert refusal is not None and "изменился" in refusal[1]
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["scope_in", "scope_out", "constraints", "validation_commands", "review_checklist"],
+)
+async def test_a_changed_statement_field_voids_the_consent(
+    db: aiosqlite.Connection, field: str
+):
+    """scope, constraints и прочие входы судьи: правка после concur — согласие недействительно."""
+    task_id = await _consented_on_real_hash(db, f"advisor-hash-{field}")
+
+    await repo.update_task(db, task_id, **{field: json.dumps(["новое условие"])})
+    await db.commit()
+
+    refusal = await advisor_refusal(db, task_id, 1)
+    assert refusal is not None and "изменился" in refusal[1], field
+
+
+async def test_the_description_and_the_hypothesis_void_the_consent(
+    db: aiosqlite.Connection,
+):
+    task_id = await _consented_on_real_hash(db, "advisor-hash-text")
+    await repo.update_task(db, task_id, technical_hints="другая подсказка")
+    await db.commit()
+    assert await advisor_refusal(db, task_id, 1) is not None
+
+    again = await _consented_on_real_hash(db, "advisor-hash-text-2")
+    await repo.update_task(db, again, outcome_metric="другая метрика")
+    await db.commit()
+    assert await advisor_refusal(db, again, 1) is not None
+
+
+async def test_a_volatile_brief_field_does_not_void_the_consent(
+    db: aiosqlite.Connection,
+):
+    """Поля, которые двигаются сами (обновлено, цикл ревью), согласие не убивают."""
+    task_id = await _consented_on_real_hash(db, "advisor-hash-stable")
+
+    await repo.update_task(db, task_id, priority="high")
+    await repo.add_task_update(db, task_id, "denis", "status", "просто строка")
+    await db.commit()
+
+    assert await advisor_refusal(db, task_id, 1) is None
+
+
+def test_the_hashed_brief_fields_are_all_real_brief_fields():
+    """Перечень полей брифа в хеше — реальные поля ReviewBrief (опечатка = дыра)."""
+    from hub.models import ReviewBrief
+    from hub.services.steward_evidence import PACKET_HASH_BRIEF_FIELDS
+
+    assert set(PACKET_HASH_BRIEF_FIELDS) <= set(ReviewBrief.model_fields)
+    for required in ("acceptance_criteria", "scope_in", "scope_out", "constraints"):
+        assert required in PACKET_HASH_BRIEF_FIELDS

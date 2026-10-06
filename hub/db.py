@@ -2526,6 +2526,8 @@ _MIGRATIONS: list[tuple[str, str]] = [
         # Липкое ошибочное одобрение пары (#1601). Таблица, а не событие:
         # события чистятся через 14 дней, а окно проверки — 30 дней после
         # доставки. Строка живёт, пока человек явно не снимет её (cleared_*).
+        # Ключ — КОНКРЕТНЫЙ случай (задача, источник, ref): снятие закрывает
+        # случай, а не задачу, новый случай — новая строка.
         "create_steward_false_approvals",
         """CREATE TABLE IF NOT EXISTS steward_false_approvals (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2533,11 +2535,12 @@ _MIGRATIONS: list[tuple[str, str]] = [
             source      TEXT    NOT NULL,
             generation  INTEGER NOT NULL DEFAULT 0,
             detail      TEXT    NOT NULL DEFAULT '',
+            ref         TEXT    NOT NULL DEFAULT '',
             detected_at TEXT    NOT NULL DEFAULT (datetime('now')),
             cleared_by  TEXT,
             cleared_at  TEXT,
             clear_note  TEXT    NOT NULL DEFAULT '',
-            UNIQUE (task_id, source)
+            UNIQUE (task_id, source, ref)
         )""",
     ),
     (

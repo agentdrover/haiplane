@@ -2711,6 +2711,8 @@ async def api_steward_false_approve_clear(
     cleared = await clear_false_approval(
         _db(request), task_id, identity.username, (body.note if body else "")
     )
+    if not cleared:
+        raise HTTPException(404, "no active false approve on this task")
     return {"task_id": task_id, "cleared": cleared, "by": identity.username}
 
 

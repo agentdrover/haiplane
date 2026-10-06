@@ -1312,6 +1312,15 @@ async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
     from hub.services.steward_shadow import check_escalation_corridor, start_due_runs
 
     await close_finished_runs(db)
+    # #1601: ошибочные одобрения пары закрепляются КАЖДЫЙ тик и в любом режиме —
+    # события возврата чистятся через 14 дней, а запрос act может прийти позже.
+    # Best effort: сбой закрепления не должен ронять проход поллера.
+    try:
+        from hub.services.steward_exit import record_false_approvals
+
+        await record_false_approvals(db)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("false approvals not recorded: %s", exc)
     # Цена суждений, закрытых раньше (#1328): только чтение у провайдера, ни
     # одного заказа — поэтому место в проходе ей безразлично.
     await stamp_judgement_usage(db)
