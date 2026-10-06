@@ -819,6 +819,41 @@ async def test_stopping_the_hub_leaves_no_prompt_even_if_the_runner_never_read_i
         service.cancel()
 
 
+async def test_stopping_the_hub_leaves_no_snapshot_if_the_runner_never_unpacked_it(
+    spool, monkeypatch, tmp_path
+) -> None:
+    """Служба взяла задание, но снимок не распаковала: хаб уходит — src.tar убран."""
+    _snapshot_config(monkeypatch)
+    repo, sha = _make_repo(tmp_path)
+    snapshot = await _archive(repo, sha)
+    _beat(spool)
+
+    async def slow_service() -> None:
+        while True:
+            for jobdir in _jobs(spool):
+                if (jobdir / "job.json").exists():
+                    (jobdir / "claimed").write_text("")
+            await asyncio.sleep(0.01)
+
+    service = asyncio.create_task(slow_service())
+    try:
+        task = asyncio.create_task(
+            local_reviewer.run_review("КОД", timeout=30, snapshot=snapshot)
+        )
+        assert await _until(
+            lambda: any((j / "claimed").exists() for j in _jobs(spool)), 3
+        )
+        jobdir = _jobs(spool)[0]
+        assert (jobdir / "src.tar").exists(), "предпосылка: снимок лежит в задании"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not (jobdir / "src.tar").exists(), "src.tar остался после остановки хаба"
+        assert not (jobdir / "prompt.txt").exists()
+    finally:
+        service.cancel()
+
+
 async def test_a_claimed_job_is_not_run_twice(spool, runner_mod, tmp_path) -> None:
     runs = tmp_path / "runs"
     argv = _fake_cli(
@@ -1559,6 +1594,7 @@ async def test_a_hostile_snapshot_is_refused_before_the_run(
     for jobdir in (lone, mixed):
         result = json.loads((jobdir / "result.json").read_text())
         assert result["status"] == "rejected" and "src.tar" in result["reason"], result
+    assert not (mixed / "src.tar").exists(), "src.tar отвергнутого задания остался"
     assert not ran.exists()
 
 
@@ -1878,6 +1914,9 @@ def test_the_snapshot_modes_keep_the_reviewer_uid_out_of_write(tmp_path) -> None
     tar.write_bytes(_GOOD)
     gid = os.getgid()
     unpacker.prepare_workdir(str(work), str(tar), unpacker.Limits(), gid)
+    assert sorted(p.name for p in work.iterdir()) == ["home", "src"], (
+        "в рабочем каталоге остались лишние файлы (приватная копия архива?)"
+    )
     assert stat.S_IMODE(work.stat().st_mode) == 0o550, "родитель src закрыт на запись"
     for path in (work / "src", work / "src" / "d"):
         assert stat.S_IMODE(path.stat().st_mode) == 0o550, path
