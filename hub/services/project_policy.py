@@ -430,9 +430,58 @@ GATE_LOCK_SLUG = "default"
 GATE_LOCK_GATES: tuple[str, ...] = ("dor", "verdict")
 
 
+#: Пары (гейт, значение), которые замок #743 на default пропускает. Явный
+#: список, а не «все делегаты, кроме auto»: слово, появившееся в
+#: DELEGATED_VERDICTS, на default закрыто по умолчанию (#1151) и открывается
+#: только строкой здесь. Решение владельца от 06.10.2026 (#1602): вердикт на
+#: default может держать стюард. Автопилот при этом на default не работает
+#: никогда — см. auto_verdict._scope_stage.
+GATE_LOCK_ALLOWED_PAIRS: frozenset[tuple[str, str]] = frozenset(
+    {("verdict", "steward")}
+)
+GATE_LOCK_OWNER_DECISION = "решение владельца от 06.10.2026"
+
+
 def gate_lock_applies(slug: str) -> bool:
     """Действует ли замок #743 на проект с этим slug."""
     return slug == GATE_LOCK_SLUG
+
+
+def gate_pair_name(gate: str, value: str) -> str:
+    """Пара в виде, в котором её видит человек: ``verdict=auto``."""
+    return f"{gate}={value}"
+
+
+def gate_lock_violations(slug: str, policy: dict) -> list[str]:
+    """Пары ``gate=value`` итоговой политики, которые замок #743 не пропускает.
+
+    Пусто — замок не действует на проект или все гейты либо у человека, либо
+    в разрешённых парах. Читается итоговая политика целиком (после слияния).
+    """
+    if not gate_lock_applies(slug):
+        return []
+    found = []
+    for gate in GATE_LOCK_GATES:
+        value = gate_value_of(policy, gate)
+        if value == GATE_HUMAN:
+            continue
+        if (gate, value) not in GATE_LOCK_ALLOWED_PAIRS:
+            found.append(gate_pair_name(gate, value))
+    return found
+
+
+def gate_lock_refused_pairs() -> list[str]:
+    """Все пары, которые замок сегодня запрещает: делегаты на замкнутых гейтах."""
+    return sorted(
+        gate_pair_name(gate, value)
+        for gate in GATE_LOCK_GATES
+        for value in DELEGATED_VERDICTS
+        if (gate, value) not in GATE_LOCK_ALLOWED_PAIRS
+    )
+
+
+def gate_lock_allowed_pairs() -> list[str]:
+    return sorted(gate_pair_name(g, v) for g, v in GATE_LOCK_ALLOWED_PAIRS)
 
 
 # Recognised values of the `release` key (#812). Default is manual, and it is

@@ -300,6 +300,7 @@ async def _record(
         # только пока на него нет вердикта — условие стоит в самой записи.
         expected_generation=generation,
         claim=claim,
+        applied_by_steward=True,
     )
 
 
