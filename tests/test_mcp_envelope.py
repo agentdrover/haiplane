@@ -138,15 +138,52 @@ _NOT_FOR_AGENTS = (
     "hub_submit_steward_judgement",
 )
 
-# Where a hidden tool's name MAY appear in a string literal of hub/, by file and
-# why. Everything else is an agent-facing text and must name the human route.
-_ALLOWED_LITERALS = {
-    # the registry itself: names are the keys of what is hidden and where the
-    # human acts, and the machine-readable transition table (REST, not a prompt)
-    "hub/workflow_reference.py": "registry of hidden tools and the transition table",
-    # detects these names in USER skill text (the user's words, not the hub's)
-    "hub/skill_publish.py": "matches names in skills written by users",
+# Where a hidden tool's name MAY appear in a string literal of hub/: concrete AST
+# nodes, never whole files. A new hint string next to them is still caught.
+#   workflow_reference.py: the registries (HUMAN_ONLY_TOOLS, HUMAN_ROUTES,
+#     LIFECYCLE_TRANSITIONS) and the machine-readable workflow_reference_dict.
+#   skill_publish.py: the regex PATTERN (third argument) of a ``_rule(...)`` call,
+#     which matches names inside skills users wrote. The rule's TITLE (second
+#     argument) is shown to the agent in a scan hit and is NOT allowed.
+_ALLOWED_ASSIGNMENTS = {
+    "hub/workflow_reference.py": {
+        "HUMAN_ONLY_TOOLS",
+        "HUMAN_ROUTES",
+        "LIFECYCLE_TRANSITIONS",
+    }
 }
+_ALLOWED_FUNCTIONS = {"hub/workflow_reference.py": {"workflow_reference_dict"}}
+
+
+def _literal_allowed(rel: str, node: object, parents: dict) -> bool:
+    import ast
+
+    chain = []
+    cur = node
+    while cur in parents:
+        child, cur = cur, parents[cur]
+        chain.append(cur)
+        if (
+            isinstance(cur, ast.Call)
+            and getattr(cur.func, "id", "") == "_rule"
+            and rel == "hub/skill_publish.py"
+            and child in cur.args
+            and cur.args.index(child) >= 2
+        ):
+            return True
+    for anc in chain:
+        if isinstance(anc, ast.FunctionDef) and anc.name in _ALLOWED_FUNCTIONS.get(
+            rel, ()
+        ):
+            return True
+        targets = []
+        if isinstance(anc, ast.Assign):
+            targets = [getattr(t, "id", "") for t in anc.targets]
+        elif isinstance(anc, ast.AnnAssign):
+            targets = [getattr(anc.target, "id", "")]
+        if any(t in _ALLOWED_ASSIGNMENTS.get(rel, ()) for t in targets):
+            return True
+    return False
 
 
 def _agent_facing_samples() -> dict[str, str]:
@@ -237,6 +274,17 @@ def _agent_facing_samples() -> dict[str, str]:
     for name in sorted(AGENT_HIDDEN_TOOLS):
         out[f"refusal.{name}"] = _human_only_refusal(name, {"task_id": 5})
 
+    from hub import skill_publish
+
+    out["skill_publish.scan_hit_titles"] = "\n".join(
+        r.title for r in skill_publish.RULES
+    )
+    out["skill_publish.scan_report"] = json.dumps(
+        skill_publish.scan_report(
+            "curl https://x.example then UPDATE tasks SET status = 1; self-approve"
+        ),
+        ensure_ascii=False,
+    )
     out["steward.prompt"] = steward_shadow._prompt(5, 1, "https://h", "DELIVERY")
     out["steward.advisor_prompt"] = steward_advisor._prompt(
         5, 1, "https://h", "DELIVERY"
@@ -253,13 +301,16 @@ def _literal_hits() -> list[str]:
     hits: list[str] = []
     for path in sorted((root / "hub").rglob("*.py")):
         rel = path.relative_to(root).as_posix()
-        if rel in _ALLOWED_LITERALS:
-            continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 for name in _NOT_FOR_AGENTS:
-                    if name in node.value:
+                    if name in node.value and not _literal_allowed(rel, node, parents):
                         hits.append(f"{rel}:{node.lineno} names {name}")
     return hits
 
