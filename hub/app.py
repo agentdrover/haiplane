@@ -2276,6 +2276,7 @@ async def api_review_verdict(
         body,
         self_approved=self_approved,
         principal_id=identity.principal_id,
+        agent_caller=identity.is_agent,
     )
 
 

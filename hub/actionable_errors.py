@@ -1075,6 +1075,25 @@ def normalize_api_error_detail(detail: Any, *, status_code: int) -> dict[str, An
         ):
             return hierarchy_error_detail(detail)
 
+    # #1602: структурированный отказ с кодом ``error`` (замок #743:
+    # default_project_gate_locked, violations, allowed) не теряет свои поля.
+    # Раньше он превращался в безымянный validation_error со строкой-словарём.
+    if isinstance(detail, dict) and detail.get("error"):
+        reason, actor = _reason_for_status(status_code)
+        hint = str(detail.get("hint") or detail["error"])
+        payload = {
+            "reason": reason,
+            "message": hint,
+            "hint": hint,
+            "actor_hint": actor,
+            "suggested_tool": None,
+            "status_code": status_code,
+        }
+        for key in ("error", "violations", "allowed"):
+            if key in detail:
+                payload[key] = detail[key]
+        return enrich_error_payload(payload)
+
     msg = str(detail)
     if status_code == 403:
         return enrich_error_payload(

@@ -40,10 +40,11 @@ async def test_default_accepts_shadow_participation_but_not_delegation(
     listed = {p["slug"]: p for p in (await client.get("/api/projects")).json()}
     assert listed["default"]["gate_policy"]["steward_shadow"] is True
 
-    for gate in ("verdict", "dor"):
+    # #1602: verdict=steward на default разрешён, dor=steward и verdict=auto — нет.
+    for patch in ({"dor": "steward"}, {"verdict": "auto"}):
         resp = await client.patch(
             f"/api/projects/{pid}",
-            json={"gate_policy": {**shadow, gate: "steward"}},
+            json={"gate_policy": {**shadow, **patch}},
         )
         assert resp.status_code == 422, resp.text
         assert resp.json()["detail"]["error"] == "default_project_gate_locked"
@@ -139,8 +140,11 @@ async def test_patch_lock_checks_run_on_merged_policy(client: AsyncClient, db):
     PATCH записал бы запрещённую политику заново, как одобренную.
     """
     pid = await _create_project(client, "default")
-    stored = {**_DEFAULT_POLICY, "verdict": "steward"}
-    await repo.update_project(db, pid, gate_policy=json.dumps(stored))
+    stored = {**_DEFAULT_POLICY, "dor": "steward"}
+    # Мимо repo.update_project: у записи теперь свой замок (#1602).
+    await db.execute(
+        "UPDATE projects SET gate_policy=? WHERE id=?", (json.dumps(stored), pid)
+    )
     await db.commit()
 
     resp = await client.patch(
@@ -156,7 +160,62 @@ async def test_patch_lock_checks_run_on_merged_policy(client: AsyncClient, db):
     # Тот же PATCH, снимающий делегата, проходит: итоговая политика чиста.
     resp = await client.patch(
         f"/api/projects/{pid}",
-        json={"gate_policy": {"deep_daily_cap": 4, "verdict": None}},
+        json={"gate_policy": {"deep_daily_cap": 4, "dor": None}},
     )
     assert resp.status_code == 200, resp.text
-    assert "verdict" not in resp.json()["gate_policy"]
+    assert "dor" not in resp.json()["gate_policy"]
+
+
+async def test_new_delegated_value_stays_locked_on_default(
+    client: AsyncClient, monkeypatch
+):
+    """#1602 AC-3: новое делегирующее значение закрыто на default по умолчанию.
+
+    Исключение — явный список пар, а не «всё, кроме auto»: слово, добавленное
+    в перечень делегатов, не получает на default ни одного гейта.
+    """
+    from hub.services import project_policy
+
+    delegated = project_policy.DELEGATED_VERDICTS | {"co-pilot"}
+    monkeypatch.setattr(project_policy, "DELEGATED_VERDICTS", delegated)
+    monkeypatch.setattr(project_policy, "GATE_VALUES", frozenset({"human"}) | delegated)
+    pid = await _create_project(client, "default")
+
+    for gate in ("verdict", "dor"):
+        resp = await client.patch(
+            f"/api/projects/{pid}", json={"gate_policy": {gate: "co-pilot"}}
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "default_project_gate_locked", detail
+        assert detail["violations"] == [f"{gate}=co-pilot"]
+
+    # Единственная разрешённая пара по-прежнему принимается.
+    resp = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"verdict": "steward"}}
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def test_repository_write_refuses_a_locked_policy_on_default(
+    client: AsyncClient, db
+):
+    """#1602: замок стоит и на самой записи repo.update_project."""
+    import pytest
+
+    pid = await _create_project(client, "default")
+    other = await _create_project(client, "spike-direct")
+    for bad in ({"dor": "steward"}, {"verdict": "auto"}):
+        with pytest.raises(repo.GateLockViolation) as info:
+            await repo.update_project(db, pid, gate_policy=json.dumps(bad))
+        assert info.value.violations == [f"{k}={v}" for k, v in bad.items()]
+    row = await repo.get_project(db, pid)
+    assert json.loads(row["gate_policy"] or "{}") == {}
+
+    # Разрешённая пара и чужой проект проходят.
+    await repo.update_project(db, pid, gate_policy=json.dumps({"verdict": "steward"}))
+    await repo.update_project(db, other, gate_policy=json.dumps({"dor": "auto"}))
+    await db.commit()
+    assert json.loads((await repo.get_project(db, pid))["gate_policy"]) == {
+        "verdict": "steward"
+    }

@@ -54,6 +54,7 @@ from typing import Any
 
 import aiosqlite
 
+from hub import repository as repo
 from hub.db import fetchall
 from hub.services.gate_events import NON_HUMAN_GATE_ACTORS, sql_in
 
@@ -491,6 +492,58 @@ async def act_refusals_v2(db: aiosqlite.Connection) -> list[tuple[str, str]]:
             )
         )
     return out
+
+
+#: Окно счётчика фактических вердиктов стюарда. Лента событий чистится через
+#: EVENTS_RETENTION_DAYS, и окно длиннее показывало бы то, чего уже нет, под
+#: видом нуля: «0 за 90 дней» при данных за 14 — неправда в безопасную сторону.
+STEWARD_VERDICT_WINDOW_DAYS = repo.EVENTS_RETENTION_DAYS
+
+
+async def actual_steward_verdicts(
+    db: aiosqlite.Connection, since_days: int = STEWARD_VERDICT_WINDOW_DAYS
+) -> dict[str, int]:
+    """Фактические вердикты стюарда по проектам: ``{slug: число}`` (#1602).
+
+    Считается ОДНО событие: ``review_verdict_recorded`` с actor=steward И
+    меткой ``source=steward_applied`` в payload — вердикт, который записало
+    применение стюарда (``steward_applied.py``). Имя актора приходит из тела
+    запроса и подделывается; метку ставит только само применение, поэтому
+    ``{"agent": "steward"}`` через review-verdict счёт не увеличивает.
+    Событие ``steward_applied`` сюда не годится: оно пишется на любое
+    неэскалированное суждение, тень и DoR тоже. Один вердикт на поколение
+    сдачи: повтор той же пары (задача, поколение) считается один раз.
+    Проект задачи — по цепочке до эпика, как у решателя.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT task_id, payload FROM events "
+        "WHERE kind='review_verdict_recorded' AND actor='steward' "
+        "AND json_extract(payload, '$.source') = 'steward_applied' "
+        "AND task_id IS NOT NULL AND created_at >= datetime('now', ?)",
+        (f"-{int(since_days)} days",),
+    )
+    seen: set[tuple[int, Any]] = set()
+    slugs: dict[int, str] = {}
+    counts: dict[str, int] = {}
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except ValueError:
+            payload = {}
+        generation = (
+            payload.get("submission_generation") if isinstance(payload, dict) else None
+        )
+        key = (int(row["task_id"]), generation)
+        if key in seen:
+            continue
+        seen.add(key)
+        task_id = int(row["task_id"])
+        if task_id not in slugs:
+            project = await repo.resolve_project_for_task(db, task_id)
+            slugs[task_id] = project["slug"] if project is not None else "default"
+        counts[slugs[task_id]] = counts.get(slugs[task_id], 0) + 1
+    return counts
 
 
 async def contour_report(db: aiosqlite.Connection) -> dict[str, Any]:
