@@ -24,6 +24,8 @@ description: Use when implementing or modifying code in the standalone Haiplane 
    - `hub/cli.py`
    - `hub/mcp_server.py`
 4. Add or update tests in the same change.
+5. Before `hub_submit_for_review`, read `skills/hub-submit-task/`; after it,
+   read the review report by `skills/hub-review-report-reading/`.
 
 ## Validation
 
