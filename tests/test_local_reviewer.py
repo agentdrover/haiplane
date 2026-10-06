@@ -97,6 +97,8 @@ def _fake_cli(tmp_path: Path, body: str) -> tuple[str, ...]:
 def _runner_cfg(runner_mod, tmp_path: Path, spool: Path, argv, **over):
     scratch = tmp_path / "scratch"
     scratch.mkdir(exist_ok=True)
+    # Каталог прогонов, каким его требует снимок (#1599): sticky + setgid.
+    os.chmod(scratch, 0o3770)
     values = dict(
         spool=str(spool),
         argv=tuple(argv),
@@ -107,6 +109,7 @@ def _runner_cfg(runner_mod, tmp_path: Path, spool: Path, argv, **over):
         term_grace=1.0,
         stale_sec=3600.0,
     )
+    values.setdefault("reviewer_user", "nobody")
     values.update(over)
     return runner_mod.Config(**values)
 
@@ -1269,6 +1272,11 @@ async def test_the_reviewer_reads_a_read_only_snapshot_at_the_submission_sha(
     repo, sha = _make_repo(tmp_path)
     snapshot = await _archive(repo, sha)
     assert snapshot.data is not None and snapshot.sha == sha, snapshot
+    import dataclasses
+
+    snapshot = dataclasses.replace(
+        snapshot, placeholder=review_snapshot.PATH_PLACEHOLDER
+    )
     prompt = f"Снимок: {review_snapshot.PATH_PLACEHOLDER}\n"
 
     # ---- runner
@@ -1342,13 +1350,17 @@ async def test_the_reviewer_reads_a_read_only_snapshot_at_the_submission_sha(
     # ---- direct без контейнера: путь — <workdir>/src, тот же распаковщик
     scratch = tmp_path / "direct-scratch"
     scratch.mkdir()
-    os.chmod(scratch, 0o2770)
+    os.chmod(scratch, 0o3770)
     import pwd
 
     me = pwd.getpwuid(os.getuid()).pw_name
     sudo = tmp_path / "sudo"
     sudo.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')
     sudo.chmod(0o755)
+    # Ревьюер в тесте — тот же пользователь, что владелец scratch; настоящего
+    # второго uid нет, поэтому для проверки владельца ему назначен чужой uid
+    # (сама проверка владельца проверена отдельно ниже).
+    monkeypatch.setattr(local_reviewer, "_reviewer_uid", lambda: os.getuid() + 1)
     monkeypatch.setattr(config, "LOCAL_REVIEW_TRANSPORT", "direct")
     monkeypatch.setattr(
         config, "LOCAL_REVIEW_SANDBOX", f"{sudo} -n -u {me} {sys.executable}"
@@ -2137,3 +2149,338 @@ def test_the_snapshot_group_is_set_explicitly_not_inherited(tmp_path) -> None:
     for path in [work, *work.rglob("*")]:
         assert path.lstat().st_gid == others[0], f"группа не задана: {path}"
     assert unpacker.remove_tree(str(work))
+
+
+# ------------------------------------------- круг Codex: находки P1-1…P2-9 (#1599)
+
+
+def _snapshot_jobdir(spool: Path, name: str, blob: bytes | None, **job) -> Path:
+    jobdir = _write_job(spool, name, {"version": 2, "timeout_sec": 5, **job})
+    if blob is not None:
+        (jobdir / "src.tar").write_bytes(blob)
+    return jobdir
+
+
+async def test_a_scratch_that_lets_the_reviewer_rename_the_workdir_gets_no_snapshot(
+    spool, runner_mod, tmp_path, monkeypatch
+) -> None:
+    """P1-1: без sticky-бита или с владельцем-ревьюером снимок не выдаётся.
+
+    Режим 0550 рабочего каталога не запрещает переименовать ЕГО САМ через
+    родителя; запрещает sticky-бит на родителе, владелец которого — не ревьюер.
+    Реальный mv от второго uid проверяет ручная проба владельца.
+    """
+    ran = tmp_path / "model_ran"
+    argv = _fake_cli(
+        tmp_path, f"import pathlib\npathlib.Path({str(ran)!r}).write_text('x')\n"
+    )
+
+    def cfg_for(**over):
+        return _runner_cfg(
+            runner_mod,
+            tmp_path,
+            spool,
+            argv,
+            unpacker_trusted_uid=os.getuid(),
+            snapshot_unpacker=str(_UNPACK_FILE),
+            **over,
+        )
+
+    scratch = tmp_path / "scratch"
+    cases = [
+        ("no_sticky", 0o2770, "nobody", "sticky"),
+        (
+            "reviewer_owns",
+            0o3770,
+            os.environ.get("USER") or __import__("pwd").getpwuid(os.getuid()).pw_name,
+            "самому ревьюеру",
+        ),
+        ("unknown_reviewer", 0o3770, "no-such-user-1599", "не разрешается"),
+    ]
+    for index, (case, mode, reviewer, fragment) in enumerate(cases):
+        cfg = cfg_for(reviewer_user=reviewer)
+        os.chmod(scratch, mode)
+        jobdir = _snapshot_jobdir(spool, f"job-{index:016x}", _GOOD)
+        await runner_mod.run_pending(cfg)
+        result = json.loads((jobdir / "result.json").read_text())
+        assert result["status"] == "rejected", (case, result)
+        assert fragment in result["reason"], (case, result["reason"])
+        assert not ran.exists(), f"{case}: модель запущена"
+        assert list(scratch.iterdir()) == [], f"{case}: workdir остался"
+    # а с sticky и чужим владельцем снимок принимается
+    os.chmod(scratch, 0o3770)
+    ok = _snapshot_jobdir(spool, "job-" + "a" * 16, _GOOD)
+    await runner_mod.run_pending(cfg_for(reviewer_user="nobody"))
+    assert json.loads((ok / "result.json").read_text())["status"] == "ok"
+
+    # то же правило у direct (hub): без sticky распаковка отказывает
+    unpacker = _load_unpacker()
+    work_parent = tmp_path / "wp"
+    work_parent.mkdir()
+    work = work_parent / "w"
+    work.mkdir(mode=0o700)
+    tar = tmp_path / "s.tar"
+    tar.write_bytes(_GOOD)
+    os.chmod(work_parent, 0o2770)
+    with pytest.raises(unpacker.SnapshotRefused, match="sticky"):
+        unpacker.prepare_workdir(
+            str(work), str(tar), unpacker.Limits(), os.getgid(), os.getuid() + 1
+        )
+    assert review_snapshot.lay_out_direct(str(work), b"x", str(work_parent), None)
+
+
+def test_the_runner_unit_runs_python_in_isolated_mode() -> None:
+    """P1-2: ExecStart с -I: user site, PYTHONPATH и cwd не участвуют в импортах."""
+    unit = (_ROOT / "deploy/review-runner/haiplane-review-runner.service").read_text()
+    exec_lines = [ln for ln in unit.splitlines() if ln.startswith("ExecStart=")]
+    assert len(exec_lines) == 1
+    words = exec_lines[0].split()
+    assert words[0].endswith("python3") and words[1] == "-I", exec_lines[0]
+    doc = _DOC.read_text()
+    assert "--check-install" in doc and "python3 -I" in doc
+
+
+def test_the_unpacker_path_is_read_without_following_links_and_executed_as_read(
+    runner_mod, tmp_path, monkeypatch
+) -> None:
+    """P1-3: ссылка в пути — отказ; исполняется прочитанное, а не путь повторно."""
+    me = os.getuid()
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "snapshot_unpack.py").write_bytes(_UNPACK_FILE.read_bytes())
+    os.chmod(real / "snapshot_unpack.py", 0o644)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real)
+    for problem in (
+        lambda path: runner_mod.unpacker_problem(str(path), me),
+        lambda path: review_snapshot.unpacker_problem(str(path), me),
+    ):
+        assert problem(real / "snapshot_unpack.py") == ""
+        assert "ссылк" in problem(alias / "snapshot_unpack.py"), (
+            "ссылка-алиас в пути: проверка видела бы только цель, загрузка — алиас"
+        )
+        assert "абсолютный" in problem(Path("rel/snapshot_unpack.py"))
+        assert "абсолютный" in problem(real / ".." / "real" / "snapshot_unpack.py")
+
+    # загружается ровно то, что прочитано при проверке
+    bait = tmp_path / "bait.py"
+    bait.write_text("MARK = 2\n")
+    os.chmod(bait, 0o644)
+    monkeypatch.setattr(
+        runner_mod, "read_trusted_source", lambda path, uid: (b"MARK = 1\n", "")
+    )
+    assert runner_mod.load_unpacker(str(bait), me).MARK == 1
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SNAPSHOT_UNPACKER", str(bait))
+    monkeypatch.setattr(review_snapshot, "TRUSTED_UID", me)
+    monkeypatch.setattr(
+        review_snapshot, "read_trusted_source", lambda path, uid: (b"MARK = 1\n", "")
+    )
+    assert review_snapshot.load_unpacker().MARK == 1
+
+
+async def test_a_fifo_instead_of_the_snapshot_does_not_hang_the_service(
+    spool, runner_mod, tmp_path
+) -> None:
+    """P2-4: FIFO без писателя — отказ за секунды, служба не встаёт."""
+    import threading
+
+    ran = tmp_path / "ran"
+    cfg = _runner_cfg(
+        runner_mod,
+        tmp_path,
+        spool,
+        _fake_cli(
+            tmp_path, f"import pathlib\npathlib.Path({str(ran)!r}).write_text('x')\n"
+        ),
+        unpacker_trusted_uid=os.getuid(),
+        snapshot_unpacker=str(_UNPACK_FILE),
+    )
+    jobdir = _snapshot_jobdir(spool, "job-" + "b" * 16, None)
+    os.mkfifo(jobdir / "src.tar")
+    # run_pending синхронно распаковывает: зависание не прервать из event loop,
+    # поэтому он идёт в своём демоне-потоке, и тест ждёт его с лимитом.
+    runner_thread = threading.Thread(
+        target=lambda: asyncio.run(runner_mod.run_pending(cfg)), daemon=True
+    )
+    runner_thread.start()
+    runner_thread.join(15)
+    assert not runner_thread.is_alive(), "служба повисла на FIFO вместо src.tar"
+    result = json.loads((jobdir / "result.json").read_text())
+    assert result["status"] == "rejected" and "обычный файл" in result["reason"], result
+    assert not ran.exists()
+
+    unpacker = _load_unpacker()
+    work = tmp_path / "w"
+    work.mkdir(mode=0o700)
+    fifo = tmp_path / "f.tar"
+    os.mkfifo(fifo)
+    outcome: list[str] = []
+
+    def attempt() -> None:
+        try:
+            unpacker.prepare_workdir(str(work), str(fifo), unpacker.Limits(), None)
+        except unpacker.SnapshotRefused as exc:
+            outcome.append(exc.reason)
+
+    thread = threading.Thread(target=attempt, daemon=True)
+    thread.start()
+    thread.join(10)
+    assert not thread.is_alive(), "open() на FIFO повис"
+    assert outcome and "обычный файл" in outcome[0]
+
+
+async def test_cancelling_the_hub_during_publication_leaves_no_job(
+    spool, monkeypatch, tmp_path
+) -> None:
+    """P2-5: поток публикации не уходит в обход отмены; job.json не остаётся."""
+    import threading
+
+    _snapshot_config(monkeypatch)
+    repo, sha = _make_repo(tmp_path)
+    snapshot = await _archive(repo, sha)
+    _beat(spool)
+    gate = threading.Event()
+    real = local_reviewer._write_spool_file
+
+    def _slow(jobdir: str, name: str, data: bytes) -> None:
+        if name == "prompt.txt":
+            gate.wait(10)
+        real(jobdir, name, data)
+
+    monkeypatch.setattr(local_reviewer, "_write_spool_file", _slow)
+    task = asyncio.create_task(
+        local_reviewer.run_review("КОД", timeout=30, snapshot=snapshot)
+    )
+    assert await _until(lambda: any((j / "src.tar").exists() for j in _jobs(spool)), 3)
+    task.cancel()
+    asyncio.get_running_loop().call_later(0.3, gate.set)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert _jobs(spool) == [] or all(
+        not (j / "job.json").exists() or (j / "cancel").exists() for j in _jobs(spool)
+    ), "отменённый заказ остался опубликованным и не отозван"
+    assert all(not (j / "prompt.txt").exists() for j in _jobs(spool))
+
+
+async def test_an_early_refusal_of_the_runner_still_removes_the_snapshot_archive(
+    spool, runner_mod, tmp_path
+) -> None:
+    """P2-6: версия, JSON, промт — на каждом раннем отказе src.tar удалён."""
+    cfg = _runner_cfg(
+        runner_mod,
+        tmp_path,
+        spool,
+        _fake_cli(tmp_path, "pass\n"),
+        unpacker_trusted_uid=os.getuid(),
+        snapshot_unpacker=str(_UNPACK_FILE),
+    )
+    bad_version = _snapshot_jobdir(spool, "job-" + "c" * 16, _GOOD)
+    (bad_version / "job.json").write_text(json.dumps({"version": 99, "timeout_sec": 5}))
+    broken = _snapshot_jobdir(spool, "job-" + "d" * 16, _GOOD)
+    (broken / "job.json").write_text("{not json")
+    no_prompt = _snapshot_jobdir(spool, "job-" + "e" * 16, _GOOD)
+    (no_prompt / "prompt.txt").unlink()
+    (no_prompt / "prompt.txt").symlink_to(tmp_path / "elsewhere")
+    await runner_mod.run_pending(cfg)
+    for name, jobdir in (
+        ("version", bad_version),
+        ("json", broken),
+        ("prompt", no_prompt),
+    ):
+        result = json.loads((jobdir / "result.json").read_text())
+        assert result["status"] in ("rejected", "error"), (name, result)
+        assert not (jobdir / "src.tar").exists(), f"{name}: src.tar остался"
+
+
+async def test_direct_with_a_container_wrapper_names_the_reviewer_visible_path(
+    spool, tmp_path, monkeypatch
+) -> None:
+    """P2-7: direct + контейнерная обёртка: путь в промте — настройка, а не хостовый."""
+    import pwd
+
+    _snapshot_config(monkeypatch)
+    repo, sha = _make_repo(tmp_path)
+    import dataclasses
+
+    snapshot = dataclasses.replace(
+        await _archive(repo, sha), placeholder=review_snapshot.PATH_PLACEHOLDER
+    )
+    scratch = tmp_path / "direct-scratch"
+    scratch.mkdir()
+    os.chmod(scratch, 0o3770)
+    me = pwd.getpwuid(os.getuid()).pw_name
+    sudo = tmp_path / "sudo"
+    sudo.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')
+    sudo.chmod(0o755)
+    # «Обёртка»: видит то же, что настоящая: снимок по /work/src (здесь — cwd/src).
+    wrapper = tmp_path / "haiplane-review-run"
+    wrapper.write_text(f'#!/bin/sh\nexec {sys.executable} -c "$@"\n')
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(local_reviewer, "_reviewer_uid", lambda: os.getuid() + 1)
+    monkeypatch.setattr(review_snapshot, "TRUSTED_UID", os.getuid())
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TRANSPORT", "direct")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", f"{sudo} -n -u {me} {wrapper}")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", shlex.join([_READER]))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", str(scratch))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SNAPSHOT_UNPACKER", str(_UNPACK_FILE))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SNAPSHOT_PATH", "")
+    why = review_snapshot.blocker("direct")
+    assert "LOCAL_REVIEW_SNAPSHOT_PATH" in why and "/work/src" in why, (
+        "контейнерная обёртка без явного пути: хостовый путь был бы ложью"
+    )
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SNAPSHOT_PATH", "/work/src")
+    assert review_snapshot.blocker("direct") == ""
+    run = await local_reviewer.run_review(
+        f"Снимок: {review_snapshot.PATH_PLACEHOLDER}\n", timeout=20, snapshot=snapshot
+    )
+    assert run is not None and run.rc == 0, (run, local_reviewer.refusal())
+    seen = _parse_reader(run.output)
+    assert seen["path"] == "/work/src", "в промте путь глазами ревьюера, не хостовый"
+    assert seen["text"] == "SECRET_SYMBOL = 42\n", "снимок при этом распакован"
+
+
+async def test_the_prompt_is_untouched_when_snapshot_is_off_and_literals_survive(
+    spool, monkeypatch, tmp_path
+) -> None:
+    """P2-8: плейсхолдер в диффе — данные; выключенная настройка не меняет промт."""
+    literal = "дифф: +x = '@@SNAPSHOT_DIR@@'\n"
+    _beat(spool)
+    writes = _spy_spool_writes(monkeypatch)
+
+    async def one(snapshot):
+        async def _service() -> None:
+            while True:
+                for jobdir in _jobs(spool):
+                    if (jobdir / "job.json").exists():
+                        (jobdir / "claimed").write_text("")
+                        (jobdir / "result.json").write_text(
+                            json.dumps({"status": "ok", "rc": 0, "output": ""})
+                        )
+                await asyncio.sleep(0.01)
+
+        service = asyncio.create_task(_service())
+        try:
+            writes.clear()
+            return await local_reviewer.run_review(
+                literal, timeout=10, snapshot=snapshot
+            )
+        finally:
+            service.cancel()
+
+    # настройка выключена, снимка нет: промт байт в байт
+    _snapshot_config(monkeypatch, enabled=False)
+    await one(None)
+    assert dict(writes)["prompt.txt"].decode() == literal
+    # включена, снимок заказан со своим маркером: чужой литерал цел, маркер заменён
+    _snapshot_config(monkeypatch)
+    repo, sha = _make_repo(tmp_path)
+    import dataclasses
+
+    snap = dataclasses.replace(
+        await _archive(repo, sha), placeholder="@@SNAPSHOT_DIR:abc123@@"
+    )
+    await one(
+        dataclasses.replace(snap, data=None)
+    )  # absent: маркер заменяется, литерал цел
+    sent = dict(writes)["prompt.txt"].decode()
+    assert "'@@SNAPSHOT_DIR@@'" in sent, "буквальный плейсхолдер в диффе испорчен"

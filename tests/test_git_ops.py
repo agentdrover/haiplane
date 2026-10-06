@@ -3552,3 +3552,42 @@ async def test_a_cancelled_capped_read_takes_the_child_with_it(tmp_path: Path) -
             return
         await asyncio.sleep(0.05)
     raise AssertionError("процесс пережил отмену чтения")
+
+
+async def test_a_snapshot_with_nothing_left_is_not_called_an_empty_tree(
+    git_ops: GitOpsIntegration, tmp_path: Path
+) -> None:
+    """«Всё отфильтровано» и «дерево пусто» — разные состояния (находка Codex)."""
+    only_link = tmp_path / "only_link"
+    only_link.mkdir()
+    _snap_git(only_link, "init", "-q", "-b", "main")
+    (only_link / "link").symlink_to("nowhere")
+    _snap_git(only_link, "add", "-A")
+    _snap_git(only_link, "commit", "-qm", "link only")
+    snap = await git_ops.snapshot_archive(
+        str(only_link), _snap_git(only_link, "rev-parse", "HEAD"), 1 << 20
+    )
+    assert snap.state == "absent" and not snap.empty, snap
+    assert "исключено 1 ссылок" in snap.reason, snap.reason
+
+    ignored = tmp_path / "ignored"
+    ignored.mkdir()
+    _snap_git(ignored, "init", "-q", "-b", "main")
+    (ignored / "a.txt").write_text("a\n")
+    (ignored / ".gitattributes").write_text("* export-ignore\n")
+    _snap_git(ignored, "add", "-A")
+    _snap_git(ignored, "commit", "-qm", "all ignored")
+    snap = await git_ops.snapshot_archive(
+        str(ignored), _snap_git(ignored, "rev-parse", "HEAD"), 1 << 20
+    )
+    assert snap.state == "absent" and not snap.empty, snap
+    assert "export-ignore" in snap.reason, snap.reason
+
+    blank = tmp_path / "blank"
+    blank.mkdir()
+    _snap_git(blank, "init", "-q", "-b", "main")
+    _snap_git(blank, "commit", "-qm", "empty", "--allow-empty")
+    snap = await git_ops.snapshot_archive(
+        str(blank), _snap_git(blank, "rev-parse", "HEAD"), 1 << 20
+    )
+    assert snap.state == "empty", snap

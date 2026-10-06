@@ -20,11 +20,13 @@ stamps with data instead of discipline.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import logging
 import math
 import re
+import secrets
 import uuid
 from collections.abc import Mapping
 from collections.abc import Sequence
@@ -2054,7 +2056,7 @@ def snapshot_block(snapshot: SnapshotArchive | None) -> str:
         return (
             "СНИМОК ИСХОДНИКОВ (только чтение): файлы репозитория на "
             f"закреплённом коммите сдачи {snapshot.sha[:12]} лежат в каталоге "
-            f"{review_snapshot.PATH_PLACEHOLDER} — путь именно такой, снимок смонтирован "
+            f"{snapshot.placeholder or review_snapshot.PATH_PLACEHOLDER} — путь именно такой, снимок смонтирован "
             "и проверен хабом. Читай его для контекста вокруг диффа: открывай "
             "файлы и ищи символы (ls, cat, grep), чтобы убедиться, есть ли метод, "
             "класс или вызов вне диффа, ДО того как заявлять «символа нет». "
@@ -3732,8 +3734,15 @@ async def _order_snapshot(
             sha=sha, data=None, reason="клон проекта на хабе не читается"
         )
     try:
-        return await plugins.git_ops.snapshot_archive(
+        taken = await plugins.git_ops.snapshot_archive(
             ctx[0], sha, config.LOCAL_REVIEW_SNAPSHOT_MAX_BYTES, branch
+        )
+        if taken.state != "ok":
+            return taken
+        # Маркер пути у каждого заказа свой: буквальный плейсхолдер в диффе —
+        # данные ревьюера, и общая замена испортила бы их.
+        return dataclasses.replace(
+            taken, placeholder=f"@@SNAPSHOT_DIR:{secrets.token_hex(6)}@@"
         )
     except Exception as exc:  # noqa: BLE001 - degradation is the contract
         log.warning("could not take the snapshot of task #%s: %s", task.get("id"), exc)

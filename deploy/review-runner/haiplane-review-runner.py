@@ -67,10 +67,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import importlib.util
 import json
 import logging
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -79,6 +79,7 @@ import stat
 import sys
 import tempfile
 import time
+import types
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -137,6 +138,9 @@ class Config:
     snapshot_max_depth: int = 32
     snapshot_unpacker: str = ""
     unpacker_trusted_uid: int = 0
+    # Пользователь ревьюера из argv (sudo -n -u <имя>): нужен, чтобы убедиться,
+    # что каталог прогонов не принадлежит ему (иначе sticky-бит не защищает).
+    reviewer_user: str = ""
 
 
 def _argv_problem(argv: list[str]) -> str:
@@ -203,6 +207,7 @@ def load_config(env: Mapping[str, str]) -> Config:
         scratch=scratch,
         max_timeout=cap,
         wrapper_timeout=wrapper,
+        reviewer_user=argv[3],
         snapshot_max_bytes=_positive(
             env, "HAIPLANE_REVIEW_RUNNER_SNAPSHOT_MAX_BYTES", 64 * 1024 * 1024
         ),
@@ -339,57 +344,101 @@ def default_unpacker_path() -> str:
     return os.path.join(here, UNPACKER_FILE)
 
 
-def unpacker_problem(path: str, trusted_uid: int) -> str:
-    """Почему этому файлу нельзя доверить проверку чужого tar, или ``""``.
+def read_trusted_source(path: str, trusted_uid: int) -> tuple[bytes, str]:
+    """Прочитать файл распаковщика ТЕМ ЖЕ проходом, что и проверка: ``(байты, причина)``.
 
-    Хаб — тот же unix-пользователь, что и служба, поэтому «файл принадлежит
-    службе» ничего не защищает: хаб, владеющий файлом или каталогом над ним,
-    подменил бы проверку. Доверяем только root-овой установке: файл — обычный
-    (не ссылка), владелец ``trusted_uid``, на запись никому, кроме владельца;
-    то же для каждого каталога выше (sticky-каталог вроде /tmp допустим: в
-    нём чужую запись не заменить).
+    Раньше проверялась цепочка после ``realpath``, а загрузка шла по исходному
+    пути: ссылка-алиас в пути переключалась между проверкой и загрузкой
+    (находка Codex, TOCTOU). Теперь путь абсолютный и без ссылок: каждый
+    каталог открывается от корня ``O_NOFOLLOW|O_DIRECTORY`` от дескриптора
+    предка, владелец и режим судятся по ``fstat`` ЭТОГО дескриптора, файл
+    открывается так же и читается из него. Исполняется прочитанное, а не путь
+    повторно. Любая ссылка в пути — отказ. Доверяем только владельцу
+    ``trusted_uid`` (root): хаб и служба — один пользователь, и «владеет
+    служба» ничего не защищает; каталог с записью группе или всем допустим
+    только с sticky-битом (/tmp).
     """
-    try:
-        info = os.lstat(path)
-    except OSError as exc:
-        return f"распаковщик {path} не найден: {exc.strerror}"
-    if not stat.S_ISREG(info.st_mode):
-        return f"распаковщик {path} не обычный файл (ссылка?)"
-    if info.st_uid != trusted_uid:
+    if not os.path.isabs(path) or any(
+        p in ("", ".", "..") for p in path.split("/")[1:]
+    ):
         return (
-            f"распаковщик {path} принадлежит uid {info.st_uid}, а должен "
-            f"принадлежать root (uid {trusted_uid}): иначе хаб, работающий под "
-            "тем же пользователем, мог бы его заменить"
+            b"",
+            f"распаковщик {path}: нужен абсолютный путь без «.», «..» и пустых компонентов",
         )
-    if info.st_mode & 0o022:
-        return f"распаковщик {path} доступен на запись группе или всем"
-    directory = os.path.dirname(os.path.realpath(path))
-    while True:
-        dinfo = os.lstat(directory)
-        if dinfo.st_uid not in (0, trusted_uid):
-            return (
-                f"каталог {directory} над распаковщиком принадлежит uid {dinfo.st_uid}"
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parts = [p for p in path.split("/") if p]
+    fds: list[int] = []
+    try:
+        current = os.open("/", flags | os.O_DIRECTORY)
+        fds.append(current)
+        walked = ""
+        for name in parts[:-1]:
+            walked += "/" + name
+            try:
+                current = os.open(name, flags | os.O_DIRECTORY, dir_fd=current)
+            except OSError as exc:
+                return (
+                    b"",
+                    f"каталог {walked} в пути распаковщика не открыт без следования по ссылке: {exc.strerror}",
+                )
+            fds.append(current)
+            dinfo = os.fstat(current)
+            if dinfo.st_uid not in (0, trusted_uid):
+                return (
+                    b"",
+                    (
+                        f"каталог {walked} над распаковщиком принадлежит uid "
+                        f"{dinfo.st_uid}, а должен принадлежать root (uid {trusted_uid})"
+                    ),
+                )
+            if dinfo.st_mode & 0o022 and not dinfo.st_mode & stat.S_ISVTX:
+                return b"", f"каталог {walked} над распаковщиком доступен на запись"
+        try:
+            fd = os.open(parts[-1], flags | os.O_NONBLOCK, dir_fd=current)
+        except FileNotFoundError:
+            return b"", f"распаковщик {path} не найден"
+        except OSError as exc:
+            return b"", f"распаковщик {path} не обычный файл (ссылка?): {exc.strerror}"
+        fds.append(fd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return b"", f"распаковщик {path} не обычный файл (ссылка?)"
+        if info.st_uid != trusted_uid:
+            return b"", (
+                f"распаковщик {path} принадлежит uid {info.st_uid}, а должен "
+                f"принадлежать root (uid {trusted_uid}): иначе хаб, работающий "
+                "под тем же пользователем, мог бы его заменить"
             )
-        if dinfo.st_mode & 0o022 and not dinfo.st_mode & stat.S_ISVTX:
-            return f"каталог {directory} над распаковщиком доступен на запись"
-        parent = os.path.dirname(directory)
-        if parent == directory:
-            return ""
-        directory = parent
+        if info.st_mode & 0o022:
+            return b"", f"распаковщик {path} доступен на запись группе или всем"
+        if info.st_size > 1 << 20:
+            return b"", f"распаковщик {path} подозрительно велик"
+        chunks = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+        return b"".join(chunks), ""
+    except OSError as exc:
+        return b"", f"распаковщик {path} не прочитан: {exc.strerror}"
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def unpacker_problem(path: str, trusted_uid: int) -> str:
+    """Почему этому файлу нельзя доверить проверку чужого tar, или ``""``."""
+    return read_trusted_source(path, trusted_uid)[1]
 
 
 def load_unpacker(path: str, trusted_uid: int = 0):  # noqa: ANN201 - модуль по пути
-    """Загрузить распаковщик ПО ЯВНОМУ ПУТИ после проверки; иначе ConfigError."""
-    problem = unpacker_problem(path, trusted_uid)
+    """Загрузить распаковщик ПО ЯВНОМУ ПУТИ: исполняется то, что проверено."""
+    source, problem = read_trusted_source(path, trusted_uid)
     if problem:
         raise ConfigError(problem)
-    spec = importlib.util.spec_from_file_location("haiplane_snapshot_unpack", path)
-    if spec is None or spec.loader is None:
-        raise ConfigError(f"распаковщик {path} не загружается")
-    module = importlib.util.module_from_spec(spec)
+    module = types.ModuleType("haiplane_snapshot_unpack")
+    module.__file__ = path
     sys.modules["haiplane_snapshot_unpack"] = module
     try:
-        spec.loader.exec_module(module)
+        exec(compile(source, path, "exec"), module.__dict__)  # noqa: S102 - проверенный root-овый код
     except Exception as exc:  # noqa: BLE001 - любой отказ загрузки — отказ снимку
         raise ConfigError(f"распаковщик {path} не загружен: {exc}") from exc
     return module
@@ -500,8 +549,16 @@ def _lay_out_snapshot(cfg: Config, unpacker, workdir: str, snapshot: str) -> str
         max_depth=cfg.snapshot_max_depth,
     )
     try:
+        reviewer_uid = pwd.getpwnam(cfg.reviewer_user).pw_uid
+    except (KeyError, ValueError):
+        return (
+            "снимок отвергнут: пользователь ревьюера "
+            f"«{cfg.reviewer_user}» не разрешается в системе, проверить каталог "
+            "прогонов нельзя"
+        )
+    try:
         gid = os.stat(cfg.scratch).st_gid
-        unpacker.prepare_workdir(workdir, snapshot, limits, gid)
+        unpacker.prepare_workdir(workdir, snapshot, limits, gid, reviewer_uid)
     except unpacker.SnapshotRefused as exc:
         return f"снимок отвергнут: {exc.reason}"
     except OSError as exc:
@@ -586,8 +643,19 @@ async def _run(
 
 
 async def _execute(cfg: Config, jobdir: str) -> tuple[dict[str, object], bool]:
-    prompt_path = os.path.join(jobdir, SPOOL_PROMPT)
     snapshot_path = os.path.join(jobdir, SPOOL_SNAPSHOT)
+    try:
+        return await _execute_inner(cfg, jobdir, snapshot_path)
+    finally:
+        # На ЛЮБОМ исходе, включая ранние отказы (версия, JSON, промт): архив
+        # хаба в задании не остаётся (находка Codex).
+        _unlink(snapshot_path)
+
+
+async def _execute_inner(
+    cfg: Config, jobdir: str, snapshot_path: str
+) -> tuple[dict[str, object], bool]:
+    prompt_path = os.path.join(jobdir, SPOOL_PROMPT)
     try:
         timeout, version = parse_job_ex(
             _read_nofollow(os.path.join(jobdir, SPOOL_JOB), JOB_CAP),
@@ -610,8 +678,6 @@ async def _execute(cfg: Config, jobdir: str) -> tuple[dict[str, object], bool]:
         return _outcome(
             "error", reason=f"команда службы не запустилась: {exc}"[:300]
         ), False
-    finally:
-        _unlink(snapshot_path)
 
 
 async def _execute_job(

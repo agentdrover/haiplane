@@ -17338,7 +17338,6 @@ async def test_the_local_prompt_names_the_snapshot_state_and_the_path(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
 ):
     """Состояние снимка в промте — то, что хаб передал прогону; три состояния."""
-    from hub.integrations import review_snapshot
     from hub.integrations.protocols import SnapshotArchive
     from hub.services.review_dispatch import LOCAL_CAPABILITIES_BLOCK
 
@@ -17357,8 +17356,9 @@ async def test_the_local_prompt_names_the_snapshot_state_and_the_path(
     assert taken[0][2] == 12345, "потолок берётся из настройки хаба"
     assert kwargs["snapshot"].state == "ok" and kwargs["snapshot"].data == b"TAR"
     assert "СНИМОК ИСХОДНИКОВ (только чтение)" in prompt
-    assert review_snapshot.PATH_PLACEHOLDER in prompt, (
-        "путь подставляет транспорт, не заказ"
+    marker = kwargs["snapshot"].placeholder
+    assert marker.startswith("@@SNAPSHOT_DIR:") and marker in prompt, (
+        "путь подставляет транспорт по маркеру ЗАКАЗА, а не по общему литералу"
     )
     assert sha[:12] in prompt and "исключено 2 ссылок" in prompt
     assert "рабочего клона репозитория" in prompt, (
@@ -17383,7 +17383,7 @@ async def test_the_local_prompt_names_the_snapshot_state_and_the_path(
     )
     assert "СНИМОК ИСХОДНИКОВ: не собран — архив больше потолка 12345 байт" in prompt
     assert LOCAL_CAPABILITIES_BLOCK in prompt, "блок возможностей этапа 1 не тронут"
-    assert review_snapshot.PATH_PLACEHOLDER not in prompt
+    assert "@@SNAPSHOT_DIR" not in prompt
     assert kwargs["snapshot"].state == "absent"
 
     # ---- empty: отдельное состояние, не «не смонтирован».
@@ -17394,7 +17394,7 @@ async def test_the_local_prompt_names_the_snapshot_state_and_the_path(
         client, db, monkeypatch, tmp_path / "empty", "snap-empty", empty
     )
     assert "пусто — читать в нём нечего" in prompt and "не сбой монтирования" in prompt
-    assert review_snapshot.PATH_PLACEHOLDER not in prompt
+    assert "@@SNAPSHOT_DIR" not in prompt
 
     # ---- транспорт не может дать снимок (direct без защищённого распаковщика):
     #      архив не снимается, причина названа, режим этапа 1.

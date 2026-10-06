@@ -418,7 +418,10 @@ def _finalize(dir_fd: int, gid: int | None) -> None:
 def _copy_private(tar_path: str, top_fd: int, limits: Limits) -> int:
     """Копия src.tar в приватный файл; ``-> размер``. Ссылка и не-файл — отказ."""
     try:
-        src = os.open(tar_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        # O_NONBLOCK: FIFO без писателя иначе вешает open() навсегда, до fstat.
+        src = os.open(
+            tar_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        )
     except OSError as exc:
         raise SnapshotRefused(
             f"src.tar не открыт без следования по ссылке ({exc.strerror}): "
@@ -500,8 +503,44 @@ def _unpack_into(
     }
 
 
+def scratch_problem(scratch: str, reviewer_uid: int) -> str:
+    """Почему каталог прогонов не защищает ``<workdir>`` от подмены, или ``""``.
+
+    Режим 0550 рабочего каталога не запрещает переименовать ЕГО САМ через
+    родителя: ревьюер состоит в группе каталога прогонов и может
+    ``mv "$W" "$W.saved"``, а потом подложить свой ``$W/src`` до запуска
+    враппера (находка Codex). Закрывает это sticky-бит на родителе (в нём
+    переименовать и удалить чужую запись может только её владелец или
+    владелец каталога) при условии, что владелец каталога — НЕ сам ревьюер.
+    Без обоих условий снимок не выдаётся.
+    """
+    try:
+        info = os.lstat(scratch)
+    except OSError as exc:
+        return f"каталог прогонов {scratch} не прочитан: {exc.strerror}"
+    if not stat.S_ISDIR(info.st_mode):
+        return f"каталог прогонов {scratch} не каталог"
+    if not info.st_mode & stat.S_ISVTX:
+        return (
+            f"на каталоге прогонов {scratch} нет sticky-бита (нужен режим 3770): "
+            "ревьюер, состоящий в группе, мог бы переименовать рабочий каталог "
+            "и подложить свой src"
+        )
+    if info.st_uid == reviewer_uid:
+        return (
+            f"каталог прогонов {scratch} принадлежит самому ревьюеру (uid "
+            f"{reviewer_uid}): владелец каталога вправе переименовать любую "
+            "запись в нём, sticky-бит его не ограничивает"
+        )
+    return ""
+
+
 def prepare_workdir(
-    workdir: str, tar_path: str, limits: Limits, gid: int | None = None
+    workdir: str,
+    tar_path: str,
+    limits: Limits,
+    gid: int | None = None,
+    reviewer_uid: int | None = None,
 ) -> dict[str, int]:
     """Проверить ``tar_path`` и разложить его как ``<workdir>/src`` (+ ``home``).
 
@@ -511,6 +550,10 @@ def prepare_workdir(
     рабочий каталог остаётся пустым (частичная распаковка убрана) и
     поднимается ``SnapshotRefused``.
     """
+    if reviewer_uid is not None:
+        problem = scratch_problem(os.path.dirname(workdir.rstrip("/")), reviewer_uid)
+        if problem:
+            raise SnapshotRefused(problem)
     top = _open_dir(workdir)
     try:
         _require_private_top(top)

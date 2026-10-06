@@ -474,6 +474,10 @@ LOCAL_REVIEW_SNAPSHOT_MAX_BYTES = int(
 # отсюда, после проверки; из клона и spool — никогда. Пусто — снимка при direct
 # нет, причина названа. При runner не читается: распаковывает служба.
 LOCAL_REVIEW_SNAPSHOT_UNPACKER = env_get("LOCAL_REVIEW_SNAPSHOT_UNPACKER", "")
+# Только для direct: путь снимка ГЛАЗАМИ ревьюера. Пусто — <workdir>/src
+# (ревьюер на файловой системе хоста). Контейнерная обёртка монтирует снимок
+# в /work/src: тогда здесь /work/src, иначе промт обещал бы недоступный путь.
+LOCAL_REVIEW_SNAPSHOT_PATH = env_get("LOCAL_REVIEW_SNAPSHOT_PATH", "")
 # Review profiles (#807). The lite profile reviews the branch diff in one
 # pass; deep is the multi-agent harness.
 #

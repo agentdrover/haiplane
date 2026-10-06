@@ -2480,14 +2480,52 @@ class GitOpsIntegration:
                 sha=sha, data=None, reason=f"архив не разобран: {exc}"[:300]
             )
         if count == 0:
+            return await self._nothing_to_snapshot(repo, sha, note)
+        return SnapshotArchive(sha=sha, data=data, note=note)
+
+    async def _nothing_to_snapshot(
+        self, repo: str, sha: str, note: str
+    ) -> SnapshotArchive:
+        """В снимке нет ни одного файла: ПУСТОЕ ДЕРЕВО или «всё исключено».
+
+        Это разные факты, и ревьюеру нельзя говорить первое, когда верно второе
+        (находка Codex): коммит из одной символьной ссылки или дерево целиком
+        под ``export-ignore`` не пусты, а отфильтрованы.
+        """
+        if note:
             return SnapshotArchive(
                 sha=sha,
                 data=None,
-                empty=True,
                 note=note,
-                reason="дерево на закреплённом sha пусто",
+                reason=f"в снимке не осталось файлов: {note}",
             )
-        return SnapshotArchive(sha=sha, data=data, note=note)
+        rc, listed, _ = await proc.run_capped(
+            "git",
+            "-C",
+            repo,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            sha,
+            cwd=repo,
+            timeout=30,
+            max_bytes=1 << 20,
+        )
+        if rc == 0 and listed:
+            return SnapshotArchive(
+                sha=sha,
+                data=None,
+                reason="в дереве коммита есть файлы, но git archive исключил их "
+                "все (export-ignore): снимок пуст не потому, что пусто дерево",
+            )
+        if rc != 0:
+            return SnapshotArchive(
+                sha=sha, data=None, reason="дерево коммита не прочитано (ls-tree)"
+            )
+        return SnapshotArchive(
+            sha=sha, data=None, empty=True, reason="дерево на закреплённом sha пусто"
+        )
 
     async def first_parent_log(self, repo: str, base: str, limit: int) -> str | None:
         """Commits on the base's own line, newest first, or None on failure.

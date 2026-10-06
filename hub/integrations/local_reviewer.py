@@ -877,7 +877,9 @@ async def run_review(
             if prompt_at_slot is not None:
                 prompt = await prompt_at_slot(prompt)
             prompt = review_snapshot.resolve_path(
-                prompt, review_snapshot.RUNNER_PATH if data else ""
+                prompt,
+                snapshot.placeholder if snapshot is not None else "",
+                review_snapshot.RUNNER_PATH if data else "",
             )
             return await _run_via_runner(prompt, limit, data)
     # Каталог прогона заводится ПОД ЗАМКОМ, а не до него: ждущий своей
@@ -913,14 +915,20 @@ async def run_review(
             home = ""
             if data:
                 reason = await asyncio.to_thread(
-                    review_snapshot.lay_out_direct, workdir, data, base
+                    review_snapshot.lay_out_direct,
+                    workdir,
+                    data,
+                    base,
+                    _reviewer_uid(),
                 )
                 if reason:
                     _REFUSAL.set(reason)
                     return None
                 home = os.path.join(workdir, "home")
             prompt = review_snapshot.resolve_path(
-                prompt, os.path.join(workdir, "src") if data else ""
+                prompt,
+                snapshot.placeholder if snapshot is not None else "",
+                review_snapshot.reviewer_visible_path(workdir) if data else "",
             )
             if home:
                 return await _spawn(prompt, workdir, limit, started, home)
@@ -933,6 +941,13 @@ async def run_review(
             return None
         finally:
             review_snapshot.remove_workdir(workdir, bool(data))
+
+
+def _reviewer_uid() -> int | None:
+    """uid ревьюера из песочницы или ``None`` (не разрешился — снимок не выдаётся)."""
+    tool, user = _named_sandbox_user()
+    entry = _resolve_user(user, tool) if user else None
+    return None if entry is None else int(entry.pw_uid)
 
 
 def _snapshot_bytes(snapshot: SnapshotArchive | None) -> bytes | None:
@@ -1471,12 +1486,22 @@ async def _run_via_runner(
     """Прогон через службу-исполнитель. ``None`` — запуска не было."""
     started = time.monotonic()
     spool = config.LOCAL_REVIEW_SPOOL_DIR.strip()
+    publishing = asyncio.ensure_future(
+        asyncio.to_thread(_submit_job_unless_draining, spool, prompt, limit, snapshot)
+    )
     try:
         # В потоке: замок и запись промта — блокирующие вызовы, event loop
-        # хаба занят и чужими запросами.
-        jobdir = await asyncio.to_thread(
-            _submit_job_unless_draining, spool, prompt, limit, snapshot
-        )
+        # хаба занят и чужими запросами. shield: отмена await не останавливает
+        # поток, и он всё равно опубликует задание — поэтому при отмене ждём
+        # его и сами отзываем то, что он успел опубликовать (находка Codex).
+        jobdir = await asyncio.shield(publishing)
+    except asyncio.CancelledError:
+        published = ""
+        with contextlib.suppress(DrainActive, OSError, asyncio.CancelledError):
+            published = await publishing
+        if published:
+            _cancel_job(published, withdraw=True)
+        raise
     except DrainActive as exc:
         _REFUSAL.set(exc.reason)
         return None

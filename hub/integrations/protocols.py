@@ -78,6 +78,9 @@ class SnapshotArchive:
     reason: str = ""
     note: str = ""
     empty: bool = False
+    #: Маркер пути в промте, вставленный заказом (у каждого заказа свой): по нему
+    #: транспорт подставляет фактический путь, не трогая чужие вхождения (#1599).
+    placeholder: str = ""
 
     @property
     def state(self) -> str:

@@ -12,11 +12,11 @@
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import stat
 import sys
 import tempfile
+import types
 from typing import Any
 
 from hub import config
@@ -50,38 +50,89 @@ def wanted() -> bool:
     return bool(config.LOCAL_REVIEW_SNAPSHOT)
 
 
-def unpacker_problem(path: str, trusted_uid: int) -> str:
-    """Почему файлу нельзя доверить проверку чужого tar, или ``""``.
+def read_trusted_source(path: str, trusted_uid: int) -> tuple[bytes, str]:
+    """Прочитать файл распаковщика ТЕМ ЖЕ проходом, что и проверка: ``(байты, причина)``.
 
-    То же правило, что у службы: хаб — обычный пользователь, и файл или каталог
-    под его записью подменили бы проверку целиком.
+    Раньше проверялась цепочка после ``realpath``, а загрузка шла по исходному
+    пути: ссылка-алиас в пути переключалась между проверкой и загрузкой
+    (находка Codex, TOCTOU). Теперь путь абсолютный и без ссылок: каждый
+    каталог открывается от корня ``O_NOFOLLOW|O_DIRECTORY`` от дескриптора
+    предка, владелец и режим судятся по ``fstat`` ЭТОГО дескриптора, файл
+    открывается так же и читается из него. Исполняется прочитанное, а не путь
+    повторно. Любая ссылка в пути — отказ. Доверяем только владельцу
+    ``trusted_uid`` (root): хаб и служба — один пользователь, и «владеет
+    служба» ничего не защищает; каталог с записью группе или всем допустим
+    только с sticky-битом (/tmp).
     """
-    try:
-        info = os.lstat(path)
-    except OSError as exc:
-        return f"распаковщик {path} не найден: {exc.strerror}"
-    if not stat.S_ISREG(info.st_mode):
-        return f"распаковщик {path} не обычный файл"
-    if info.st_uid != trusted_uid:
+    if not os.path.isabs(path) or any(
+        p in ("", ".", "..") for p in path.split("/")[1:]
+    ):
         return (
-            f"распаковщик {path} принадлежит uid {info.st_uid}, а должен "
-            f"принадлежать root (uid {trusted_uid})"
+            b"",
+            f"распаковщик {path}: нужен абсолютный путь без «.», «..» и пустых компонентов",
         )
-    if info.st_mode & 0o022:
-        return f"распаковщик {path} доступен на запись группе или всем"
-    directory = os.path.dirname(os.path.realpath(path))
-    while True:
-        dinfo = os.lstat(directory)
-        if dinfo.st_uid not in (0, trusted_uid):
-            return (
-                f"каталог {directory} над распаковщиком принадлежит uid {dinfo.st_uid}"
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parts = [p for p in path.split("/") if p]
+    fds: list[int] = []
+    try:
+        current = os.open("/", flags | os.O_DIRECTORY)
+        fds.append(current)
+        walked = ""
+        for name in parts[:-1]:
+            walked += "/" + name
+            try:
+                current = os.open(name, flags | os.O_DIRECTORY, dir_fd=current)
+            except OSError as exc:
+                return (
+                    b"",
+                    f"каталог {walked} в пути распаковщика не открыт без следования по ссылке: {exc.strerror}",
+                )
+            fds.append(current)
+            dinfo = os.fstat(current)
+            if dinfo.st_uid not in (0, trusted_uid):
+                return (
+                    b"",
+                    (
+                        f"каталог {walked} над распаковщиком принадлежит uid "
+                        f"{dinfo.st_uid}, а должен принадлежать root (uid {trusted_uid})"
+                    ),
+                )
+            if dinfo.st_mode & 0o022 and not dinfo.st_mode & stat.S_ISVTX:
+                return b"", f"каталог {walked} над распаковщиком доступен на запись"
+        try:
+            fd = os.open(parts[-1], flags | os.O_NONBLOCK, dir_fd=current)
+        except FileNotFoundError:
+            return b"", f"распаковщик {path} не найден"
+        except OSError as exc:
+            return b"", f"распаковщик {path} не обычный файл (ссылка?): {exc.strerror}"
+        fds.append(fd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return b"", f"распаковщик {path} не обычный файл (ссылка?)"
+        if info.st_uid != trusted_uid:
+            return b"", (
+                f"распаковщик {path} принадлежит uid {info.st_uid}, а должен "
+                f"принадлежать root (uid {trusted_uid}): иначе хаб, работающий "
+                "под тем же пользователем, мог бы его заменить"
             )
-        if dinfo.st_mode & 0o022 and not dinfo.st_mode & stat.S_ISVTX:
-            return f"каталог {directory} над распаковщиком доступен на запись"
-        parent = os.path.dirname(directory)
-        if parent == directory:
-            return ""
-        directory = parent
+        if info.st_mode & 0o022:
+            return b"", f"распаковщик {path} доступен на запись группе или всем"
+        if info.st_size > 1 << 20:
+            return b"", f"распаковщик {path} подозрительно велик"
+        chunks = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+        return b"".join(chunks), ""
+    except OSError as exc:
+        return b"", f"распаковщик {path} не прочитан: {exc.strerror}"
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def unpacker_problem(path: str, trusted_uid: int) -> str:
+    """Почему этому файлу нельзя доверить проверку чужого tar, или ``""``."""
+    return read_trusted_source(path, trusted_uid)[1]
 
 
 def load_unpacker() -> Any:
@@ -92,16 +143,14 @@ def load_unpacker() -> Any:
             "LOCAL_REVIEW_SNAPSHOT_UNPACKER не задан: при direct снимок "
             "распаковывает только защищённый модуль"
         )
-    problem = unpacker_problem(path, TRUSTED_UID)
+    source, problem = read_trusted_source(path, TRUSTED_UID)
     if problem:
         raise SnapshotUnavailable(problem)
-    spec = importlib.util.spec_from_file_location("haiplane_snapshot_unpack", path)
-    if spec is None or spec.loader is None:
-        raise SnapshotUnavailable(f"распаковщик {path} не загружается")
-    module = importlib.util.module_from_spec(spec)
+    module = types.ModuleType("haiplane_snapshot_unpack")
+    module.__file__ = path
     sys.modules["haiplane_snapshot_unpack"] = module
     try:
-        spec.loader.exec_module(module)
+        exec(compile(source, path, "exec"), module.__dict__)  # noqa: S102  # nosec B102 - проверенный root-овый код
     except Exception as exc:  # noqa: BLE001 - любая неудача загрузки = нет снимка
         raise SnapshotUnavailable(f"распаковщик {path} не загружен: {exc}") from exc
     return module
@@ -114,6 +163,16 @@ def blocker(transport: str) -> str:
     службы: это узнаётся ответом службы (старая отклоняет version=2).
     """
     if transport == "direct":
+        if (
+            _is_container_wrapper()
+            and not (config.LOCAL_REVIEW_SNAPSHOT_PATH or "").strip()
+        ):
+            return (
+                "песочница direct — контейнерная обёртка haiplane-review-run: она "
+                "монтирует снимок в /work/src, а промту без явной настройки "
+                "достался бы хостовый путь. Задайте LOCAL_REVIEW_SNAPSHOT_PATH="
+                f"{RUNNER_PATH}"
+            )
         try:
             load_unpacker()
         except SnapshotUnavailable as exc:
@@ -121,13 +180,31 @@ def blocker(transport: str) -> str:
     return ""
 
 
-def lay_out_direct(workdir: str, data: bytes, scratch: str) -> str:
+def _is_container_wrapper() -> bool:
+    """Последний токен песочницы — обёртка репозитория (контейнерный запуск)."""
+    import shlex
+
+    try:
+        parts = shlex.split(config.LOCAL_REVIEW_SANDBOX or "")
+    except ValueError:
+        return False
+    return bool(parts) and os.path.basename(parts[-1]) == "haiplane-review-run"
+
+
+def lay_out_direct(
+    workdir: str, data: bytes, scratch: str, reviewer_uid: int | None
+) -> str:
     """Разложить снимок в ``workdir`` защищённым распаковщиком; ``""`` — готово.
 
     Непустая строка — отказ распаковщика (враждебный tar) или невозможность
     его загрузить: модель тогда не запускается. Архив пишется ВНЕ рабочего
     каталога (он закрывается на запись) и удаляется сразу.
     """
+    if reviewer_uid is None:
+        return (
+            "снимок отвергнут: пользователь ревьюера из песочницы не разрешился, "
+            "проверить каталог прогонов нельзя"
+        )
     try:
         unpacker = load_unpacker()
     except SnapshotUnavailable as exc:
@@ -138,7 +215,7 @@ def lay_out_direct(workdir: str, data: bytes, scratch: str) -> str:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
         gid = os.stat(scratch).st_gid
-        unpacker.prepare_workdir(workdir, tar_path, limits, gid)
+        unpacker.prepare_workdir(workdir, tar_path, limits, gid, reviewer_uid)
     except unpacker.SnapshotRefused as exc:
         return f"снимок отвергнут: {exc.reason}"
     except OSError as exc:
@@ -164,6 +241,26 @@ def remove_workdir(workdir: str, with_snapshot: bool) -> None:
     shutil.rmtree(workdir, ignore_errors=True)
 
 
-def resolve_path(prompt: str, path: str) -> str:
-    """Подставить в промт фактический путь снимка (или «нет снимка»)."""
-    return prompt.replace(PATH_PLACEHOLDER, path or NO_SNAPSHOT_PATH)
+def resolve_path(prompt: str, marker: str, path: str) -> str:
+    """Подставить фактический путь снимка в ТОТ маркер, что вставил заказ.
+
+    Маркер у каждого заказа свой (случайный): буквальный ``@@SNAPSHOT_DIR@@`` в
+    диффе — это данные ревьюера, и глобальная замена испортила бы их (находка
+    Codex). Нет маркера (снимка не заказывали) — промт возвращается как есть,
+    байт в байт.
+    """
+    if not marker:
+        return prompt
+    return prompt.replace(marker, path or NO_SNAPSHOT_PATH)
+
+
+def reviewer_visible_path(workdir: str) -> str:
+    """Путь снимка глазами ревьюера при direct.
+
+    По умолчанию — ``<workdir>/src`` (ревьюер работает на файловой системе
+    хоста). Если песочница — контейнерный враппер, он монтирует снимок в другое
+    место, и оператор называет это явно настройкой
+    ``LOCAL_REVIEW_SNAPSHOT_PATH`` (для обёртки репозитория — ``/work/src``).
+    """
+    named = (config.LOCAL_REVIEW_SNAPSHOT_PATH or "").strip()
+    return named or os.path.join(workdir, "src")
