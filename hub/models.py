@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
@@ -2974,6 +2975,26 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     return v
 
 
+def validated_gate_policy_patch(v: dict[str, Any]) -> dict[str, Any]:
+    """Проверить присланный КУСОК gate_policy (#1427, #1593).
+
+    PATCH сливает gate_policy с сохранённой по ключам, и ``null`` у ключа
+    значит «удалить его». Поэтому здесь null проходит проверку формы как
+    удаление, а остальные значения проверяются тем же читателем, что и
+    итоговая политика, — ранний отказ называет ошибку в присланном ключе.
+    Итоговая политика после слияния проверяется целиком
+    (``validated_gate_policy``): кусок может быть чистым, а результат нет.
+    """
+    unknown = set(v) - set(GATE_POLICY_KEYS)
+    if unknown:
+        raise ValueError(
+            f"unknown gate_policy keys: {sorted(unknown)}; "
+            f"allowed: {', '.join(GATE_POLICY_KEYS)}"
+        )
+    sent = validated_gate_policy({k: val for k, val in v.items() if val is not None})
+    return {k: (None if v[k] is None else sent[k]) for k in v}
+
+
 class ProjectPatch(BaseModel):
     """PATCH semantics: omitted fields stay unchanged (#338).
 
@@ -2995,6 +3016,11 @@ class ProjectPatch(BaseModel):
     gate_policy: dict[str, Any] | None = None
     archived: bool | None = None
     status: str | None = Field(default=None, pattern="^(pending|active)$")
+    # Версия политики, с которой правка была составлена (#1593). Не поле
+    # проекта: сверяется внутри write-транзакции и в базу не пишется. Не
+    # прислали — проверки нет (API-клиент, меняющий один ключ, слияние и так
+    # не затирает); веб-форма шлёт её всегда, потому что несёт политику целиком.
+    policy_version: str | None = Field(default=None, max_length=64)
 
     @field_validator("default_branch_policy")
     @classmethod
@@ -3011,25 +3037,11 @@ class ProjectPatch(BaseModel):
     def _gate_policy_shape(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
         """Проверить присланный КУСОК политики (#1427).
 
-        PATCH сливает gate_policy с сохранённой по ключам, и ``null`` у ключа
-        значит «удалить его». Поэтому здесь null проходит проверку формы как
-        удаление, а остальные значения проверяются тем же читателем, что и
-        итоговая политика, — ранний отказ называет ошибку в присланном ключе.
-        Итоговая политика после слияния проверяется целиком в app.py
-        (``validated_gate_policy``): кусок может быть чистым, а результат нет.
+        Тот же читатель проверяет кусок отложенной правки (#1593):
+        ``validated_gate_policy_patch``. Итоговая политика после слияния
+        проверяется целиком в hub/services/policy_change.py.
         """
-        if v is None:
-            return v
-        unknown = set(v) - set(GATE_POLICY_KEYS)
-        if unknown:
-            raise ValueError(
-                f"unknown gate_policy keys: {sorted(unknown)}; "
-                f"allowed: {', '.join(GATE_POLICY_KEYS)}"
-            )
-        sent = validated_gate_policy(
-            {k: val for k, val in v.items() if val is not None}
-        )
-        return {k: (None if v[k] is None else sent[k]) for k in v}
+        return None if v is None else validated_gate_policy_patch(v)
 
     @model_validator(mode="before")
     @classmethod
@@ -3892,6 +3904,36 @@ class CloneBranchState(BaseModel):
     # shade of ``diverged`` (which is about the clone protecting the WRONG
     # branch) and least of all of ``match``: nothing can be delivered into a
     # branch that is gone.
+
+
+class PolicyScheduleCreate(BaseModel):
+    """Отложенная правка политики проекта (#1593): когда и какой кусок."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    at: datetime
+    patch: dict[str, Any] = Field(min_length=1)
+    note: str = Field(default="", max_length=500)
+
+    @field_validator("patch")
+    @classmethod
+    def _patch_shape(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return validated_gate_policy_patch(v)
+
+
+class PolicyScheduleView(BaseModel):
+    """Запись расписания как её видит человек и агент (только чтение)."""
+
+    id: int
+    project_id: int
+    at: str
+    patch: dict[str, Any] = Field(default_factory=dict)
+    note: str = ""
+    created_by: str = ""
+    created_at: str = ""
+    state: str
+    executed_at: str | None = None
+    result: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProjectView(BaseModel):

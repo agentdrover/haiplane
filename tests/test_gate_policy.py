@@ -823,3 +823,277 @@ async def test_a_held_create_run_is_never_running_not_even_between_commits(
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "open"
     assert statuses == ["insert:open"], statuses
+
+
+# ---------------------------------------------------------------------------
+# #1593: отложенные правки политики — создание, права, устаревшая форма
+# ---------------------------------------------------------------------------
+
+
+def _fake_reach(state: dict):
+    """Подмена читателя достижимости ревью: состояние переключает сам тест."""
+    from hub.services.review_dispatch import ReviewReach
+
+    async def reach(_db, _forge):
+        if state["runnable"]:
+            return ReviewReach(("local",), "", ())
+        return ReviewReach((), "локальная конфигурация снята", ("нет принципала",))
+
+    return reach
+
+
+async def test_policy_schedule_creation_is_validated_and_human_only(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-3 (#1593): создание принято/отказано с причиной; после исполнения
+    записи PATCH, форма и PATCH только forge не откатывают и не обходят её."""
+    from datetime import UTC, datetime, timedelta
+
+    from hub import repository as repo
+    from hub.services import policy_change, review_dispatch
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-token": TokenIdentity("bot", "agent"),
+            "human-token": TokenIdentity("denis", "human"),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    human = {"headers": {"Authorization": "Bearer human-token"}}
+    agent = {"headers": {"Authorization": "Bearer agent-token"}}
+    base = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    clock = {"now": base}
+    monkeypatch.setattr(policy_change, "utcnow", lambda: clock["now"])
+    reach = {"runnable": True}
+    monkeypatch.setattr(review_dispatch, "review_reach", _fake_reach(reach))
+
+    pid = await _create_project(client, "sched-ok", **human)
+    default_pid = await _create_project(client, "default", **human)
+    at = (base + timedelta(days=7)).isoformat()
+    url = "/api/projects/sched-ok/policy-schedule"
+
+    # Корректная запись принята, видна в списке и в сводке действующей политики.
+    ok = await client.post(
+        url,
+        json={"at": at, "patch": {"deep_daily_cap": 4}, "note": "вернуть"},
+        **human,
+    )
+    assert ok.status_code == 201, ok.text
+    first_id = ok.json()["id"]
+    assert ok.json()["state"] == "pending"
+    listed = (await client.get(url, **human)).json()
+    assert [r["id"] for r in listed] == [first_id]
+    summary = (
+        await client.get("/api/projects/sched-ok/effective-policy", **human)
+    ).json()
+    cap = next(r for r in summary["keys"] if r["key"] == "deep_daily_cap")
+    assert cap["scheduled"][0]["value"] == 4
+    assert cap["scheduled"][0]["id"] == first_id
+
+    # Остальное — конкретный отказ с причиной, а не 404.
+    past = await client.post(
+        url,
+        json={
+            "at": (base - timedelta(hours=1)).isoformat(),
+            "patch": {"deep_daily_cap": 1},
+        },
+        **human,
+    )
+    assert past.status_code == 422
+    assert past.json()["detail"]["error"] == "schedule_at_in_past"
+
+    locked = await client.post(
+        "/api/projects/default/policy-schedule",
+        json={"at": at, "patch": {"verdict": "auto"}},
+        **human,
+    )
+    assert locked.status_code == 422, locked.text
+    assert locked.json()["detail"]["error"] == "default_project_gate_locked"
+    assert default_pid
+
+    invalid = await client.post(url, json={"at": at, "patch": {"dor": "yolo"}}, **human)
+    assert invalid.status_code == 422
+    assert "dor" in invalid.text
+
+    reach["runnable"] = False
+    unrunnable = await client.post(
+        url, json={"at": at, "patch": {"review": "dispatch"}}, **human
+    )
+    assert unrunnable.status_code == 422, unrunnable.text
+    assert unrunnable.json()["detail"]["error"] == "review_unrunnable_here"
+    reach["runnable"] = True
+
+    monkeypatch.setattr(policy_change, "MAX_PENDING_PER_PROJECT", 1)
+    over = await client.post(url, json={"at": at, "patch": {"wip_limit": 2}}, **human)
+    assert over.status_code == 422
+    assert over.json()["detail"]["error"] == "schedule_limit_reached"
+    monkeypatch.setattr(policy_change, "MAX_PENDING_PER_PROJECT", 50)
+
+    # Агент не создаёт и не отменяет: 403 с причиной human-only.
+    by_agent = await client.post(
+        url, json={"at": at, "patch": {"wip_limit": 2}}, **agent
+    )
+    assert by_agent.status_code == 403
+    cancel_by_agent = await client.post(f"{url}/{first_id}/cancel", **agent)
+    assert cancel_by_agent.status_code == 403
+    assert (await client.get(url, **agent)).status_code == 200, "чтение открыто"
+    assert len(await repo.list_scheduled_policy_changes(db, pid)) == 1
+
+    # --- после исполнения записи ---
+    await repo.update_project(
+        db, pid, gate_policy=json.dumps({"deep_daily_cap": 2, "review": "dispatch"})
+    )
+    await db.commit()
+    version_before = policy_change.policy_version(await repo.get_project(db, pid))
+    clock["now"] = base + timedelta(days=7, minutes=1)
+    outcomes = await policy_change.run_due(db)
+    assert [o["outcome"] for o in outcomes] == ["applied"]
+    stored = json.loads((await repo.get_project(db, pid))["gate_policy"])
+    assert stored["deep_daily_cap"] == 4
+
+    # PATCH ДРУГОГО ключа не возвращает старое значение.
+    other = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"wip_limit": 3}}, **human
+    )
+    assert other.status_code == 200, other.text
+    assert other.json()["gate_policy"]["deep_daily_cap"] == 4
+
+    # Явный PATCH того же ключа применяется.
+    same = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"deep_daily_cap": 9}}, **human
+    )
+    assert same.json()["gate_policy"]["deep_daily_cap"] == 9
+
+    # Устаревшая форма (открыта до исполнения) отказывает по версии политики.
+    stale_form = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={
+            "policy_version": version_before,
+            "gate_policy_dor": "human",
+            "gate_policy_verdict": "human",
+            "gate_policy_review": "dispatch",
+        },
+        follow_redirects=False,
+        **human,
+    )
+    assert stale_form.status_code == 303
+    from urllib.parse import unquote
+
+    assert "политика проекта изменилась" in unquote(stale_form.headers["location"])
+    assert (
+        json.loads((await repo.get_project(db, pid))["gate_policy"])["deep_daily_cap"]
+        == 9
+    )
+
+    # Свежая форма проходит — проверка версии не ломает честную правку.
+    fresh_version = policy_change.policy_version(await repo.get_project(db, pid))
+    fresh_form = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={
+            "policy_version": fresh_version,
+            "gate_policy_dor": "human",
+            "gate_policy_verdict": "human",
+            "gate_policy_review": "dispatch",
+        },
+        follow_redirects=False,
+        **human,
+    )
+    assert "project_error" not in fresh_form.headers["location"], fresh_form.headers
+
+    # PATCH только forge, делающий сохранённый review=dispatch неисполнимым,
+    # по-прежнему отказывает (защита от регресса общего пути).
+    reach["runnable"] = False
+    forge_only = await client.patch(
+        f"/api/projects/{pid}", json={"forge": "gitverse"}, **human
+    )
+    assert forge_only.status_code == 422, forge_only.text
+    assert forge_only.json()["detail"]["error"] == "review_unrunnable_here"
+
+
+async def test_manual_patch_and_scheduled_execution_do_not_clobber_each_other(
+    client: AsyncClient, db, db_dsn, monkeypatch
+):
+    """#1593: PATCH читает и пишет политику под тем же write-локом, что поллер.
+
+    Поллер пытается исполнить запись В ТОТ МОМЕНТ, когда PATCH уже прочитал
+    политику. Если чтение стоит до транзакции, PATCH запишет слияние от
+    устаревшей политики и вернёт deep_daily_cap=2 поверх исполненной правки.
+    """
+    import asyncio
+    from datetime import UTC, datetime, timedelta
+
+    from hub import repository as repo
+    from hub.db import connect
+    from hub.services import policy_change
+
+    base = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    clock = {"now": base}
+    monkeypatch.setattr(policy_change, "utcnow", lambda: clock["now"])
+    pid = await _create_project(client, "sched-race")
+    await repo.update_project(db, pid, gate_policy=json.dumps({"deep_daily_cap": 2}))
+    await db.commit()
+    created = await client.post(
+        "/api/projects/sched-race/policy-schedule",
+        json={
+            "at": (base + timedelta(hours=1)).isoformat(),
+            "patch": {"deep_daily_cap": 4},
+        },
+    )
+    assert created.status_code == 201, created.text
+    clock["now"] = base + timedelta(hours=2)
+
+    poller_conn = await connect(db_dsn)
+    real_get = repo.get_project
+    armed = {"on": True}
+    racers: list[asyncio.Task] = []
+
+    async def get_then_race(conn, project_id):
+        row = await real_get(conn, project_id)
+        if armed["on"]:
+            armed["on"] = False
+            racers.append(asyncio.create_task(policy_change.run_due(poller_conn)))
+            await asyncio.wait(racers, timeout=0.5)
+        return row
+
+    monkeypatch.setattr(repo, "get_project", get_then_race)
+    try:
+        resp = await client.patch(
+            f"/api/projects/{pid}", json={"gate_policy": {"wip_limit": 3}}
+        )
+        assert resp.status_code == 200, resp.text
+        await asyncio.gather(*racers)
+    finally:
+        await poller_conn.close()
+    monkeypatch.setattr(repo, "get_project", real_get)
+    stored = json.loads((await repo.get_project(db, pid))["gate_policy"])
+    assert stored == {"deep_daily_cap": 4, "wip_limit": 3}, (
+        "ручная правка и исполненное расписание не затирают друг друга"
+    )
+
+
+async def test_web_form_without_policy_version_is_refused(client: AsyncClient, db):
+    """#1593: форма политики без версии (старая страница) ничего не сохраняет."""
+    from urllib.parse import unquote
+
+    from hub import repository as repo
+
+    pid = await _create_project(client, "sched-noversion")
+    await repo.update_project(db, pid, gate_policy=json.dumps({"review_limit": 4}))
+    await db.commit()
+    for extra in ({}, {"policy_version": ""}):
+        resp = await client.post(
+            f"/projects/{pid}/web-edit",
+            data={"gate_policy_dor": "human", "gate_policy_verdict": "human", **extra},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        assert "обновите страницу" in unquote(resp.headers["location"]), extra
+        stored = json.loads((await repo.get_project(db, pid))["gate_policy"])
+        assert stored == {"review_limit": 4}, "ничего не сохранено"
+    # Форма без полей политики (только имя) версии не требует.
+    ok = await client.post(
+        f"/projects/{pid}/web-edit", data={"name": "Renamed"}, follow_redirects=False
+    )
+    assert "project_error" not in ok.headers["location"]

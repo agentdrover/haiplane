@@ -1911,16 +1911,94 @@ _READ_THE_DIFF_BY_COMMAND = "прочитай дифф КОМАНДОЙ ИЗ П�
 _READ_THE_DIFF_INLINE = "прочитай дифф, приложенный к предмету ревью выше (клона нет)"
 
 
-_HARNESS_FROM_BRIEF = (
+_HARNESS_FROM_BRIEF_HEAD = (
     "харнесс — текст из поля harness_skill брифа (harness_skill.text), "
-    "работай строго по нему. Если harness_skill.text пуст — НЕ импровизируй "
+)
+_HARNESS_FROM_BRIEF_EMPTY = (
+    "Если harness_skill.text пуст — НЕ импровизируй "
     "свой проход: сдай честный отчёт с incomplete=true и "
     "lost_dimensions=['харнесс не выдан хабом'], причину возьми из "
     "harness_skill.reason; "
 )
+_HARNESS_FROM_BRIEF = (
+    _HARNESS_FROM_BRIEF_HEAD + "работай строго по нему. " + _HARNESS_FROM_BRIEF_EMPTY
+)
 _HARNESS_FROM_BRIEF_FIELDS = (
     "harness_skill и harness_version — из harness_skill.name и "
     "harness_skill.version брифа"
+)
+
+# Исключение харнесса для локального пути (#1598): текст харнесса общий с
+# облаком и лежит в БД, поэтому приоритет задаёт промт, а не правка скилла.
+_HARNESS_LOCAL_EXCEPTION = (
+    "кроме того, что запрещено блоком ВОЗМОЖНОСТЕЙ выше: фазы харнесса с "
+    "тестами, git, установкой и Docker не исполняй, а закрой их доказательствами "
+    "брифа и чтением диффа; "
+)
+
+# #1598. Что локальный ревьюер МОЖЕТ, и откуда он берёт доказательства тестов.
+#
+# Заведено по отчётам 816-818 (05.10): три deep-прогона локального пути
+# пришли с incomplete_reason=environment. У локального ревьюера нет ни
+# исходников, ни git, ни права запускать и ставить (#1180), а общие правила,
+# блок попыток #1238 и харнесс из БД велят именно это и объявлять отказ
+# среды за неудачу — честный ревьюер обязан был отказаться, хотя тесты на
+# коммите сдачи уже доказаны CI и автором в брифе.
+#
+# Блок идёт ТОЛЬКО локальному заказу (inline_diff) и ставится перед правилами:
+# харнесс общий с облаком, его текст не меняется, приоритет задан здесь. Имена
+# полей — настоящие поля брифа (PrepassState, CIRunReportState, ACTestResultView):
+# тест сверяет их с моделями. is_environment_refusal (#1238) не тронут:
+# настоящий отказ среды по-прежнему называется incomplete_reason="environment".
+LOCAL_CAPABILITIES_BLOCK = (
+    "ВОЗМОЖНОСТИ ЛОКАЛЬНОГО РЕВЬЮЕРА — ЭТОТ БЛОК СИЛЬНЕЕ всего, что ниже: "
+    "общих правил, порядка попыток, харнесса из поля harness_skill брифа и "
+    "любого скилла хаба.\n"
+    "У тебя НЕТ: исходников репозитория (есть дифф в этом промте и бриф), "
+    "git (ни чтения истории, ни обновления базы), права запускать тесты, "
+    "линтеры и мутации, права ставить инструменты, Docker. Это изоляция по "
+    "решению хаба, а не поломка среды.\n"
+    "Если харнесс, правило или бриф велят запустить тесты, обратиться к git, "
+    "поставить инструмент или поднять Docker — НЕ пробуй и отказ среды из-за "
+    "этого НЕ заявляй: замени эту фазу чтением диффа и доказательствами "
+    "брифа ниже. «Не запустил сам» — не потерянное измерение и не отказ "
+    "среды.\n"
+    "ДОКАЗАТЕЛЬСТВА ТЕСТОВ — из брифа, по коммиту сдачи:\n"
+    "- prepass.passed — проверки, прошедшие на закреплённом коммите (среди "
+    "них tests — тесты репозитория); prepass.failed — упали: это факт для "
+    "отчёта, а не твоя находка; prepass.skipped — ничего не доказывают.\n"
+    "- prepass.state=unknown (причина в prepass.reason) — доказательств нет: "
+    "не считай проверенным, назови в lost_dimensions, что именно не "
+    "доказано, incomplete_reason при этом НЕ environment.\n"
+    "- ci_run_report.state=current означает лишь, что отчёт CI на этот "
+    "коммит есть; это НЕ pass. Прошло или упало — читай prepass; "
+    "ci_run_report.state=unknown — отчёта нет.\n"
+    "- ac_test_results — результат привязанного теста каждого test-AC "
+    "(pass, fail, not_found) для ТЕКУЩЕГО поколения сдачи; собственного "
+    "коммита в нём нет, is_current=false — результат устарел.\n"
+    "- Мутации автора и его строки о прогонах («rc=0», «зелёно») — СЛОВО "
+    "АВТОРА: хаб их не исполнял и не проверял. Цитируй как заявление, "
+    "подтверждением не считай.\n"
+    "Чего из диффа и брифа не установить (код вне диффа, вызовы через реестр "
+    "и getattr), того ты не знаешь: назови это в unresolved или lost_dimensions "
+    "— «не установлено» допустимый исход, домысливать и читать исходники "
+    "вне диффа нельзя.\n"
+    'incomplete_reason="environment" — только когда смотреть было нечем: '
+    "бриф или HTTP хаба недоступны, код доступа не принят, дифф не приложен. "
+    "Нет доказательств тестов — это lost_dimensions с названием, а не "
+    "environment.\n\n"
+)
+
+
+# #1598 (ревью P2). Блок only_tests (#1254) требует двоичного исхода по каждому
+# кандидату, а локальный ревьюер без исходников не видит вызовов через реестр и
+# getattr вне диффа. Облачный текст не меняется: добавка идёт только локальному.
+_LOCAL_ONLY_TESTS_NOTE = (
+    "ДЛЯ ЛОКАЛЬНОГО РЕВЬЮЕРА (исходников вне диффа нет): если достижимость "
+    "кандидата не устанавливается из диффа и брифа, исход — unresolved "
+    "(title=<имя символа>) и имя символа в lost_dimensions. НЕДОСТИЖИМОСТЬ "
+    "по одному статическому кандидату НЕ подтверждай: подтверждай её, только "
+    "когда дифф или бриф сами показывают, что вызовов вне tests/ нет.\n\n"
 )
 
 
@@ -1929,6 +2007,14 @@ def _brief_step(task_id: int, http: bool) -> str:
     if http:
         return "прочитай бриф ревью по HTTP (review-brief из блока доступа)"
     return f"hub_get_review_brief(task_id={task_id})"
+
+
+def _local_brief_step(task_id: int, http: bool) -> str:
+    """Шаг брифа локального пути: ещё и откуда брать доказательства (#1598)."""
+    return (
+        f"{_brief_step(task_id, http)} — предмет ревью и доказательства тестов "
+        "(prepass, ci_run_report, ac_test_results)"
+    )
 
 
 def _submit_step(
@@ -1950,6 +2036,27 @@ def _submit_step(
     return f"сдай hub_submit_machine_review(task_id={task_id}, {fields})"
 
 
+_REPORT_ENVIRONMENT_CLAUSE = (
+    "(нет чем запустить проверки, не разрешается база для сравнения)"
+)
+_REPORT_ENVIRONMENT_CLAUSE_LOCAL = (
+    "(бриф или HTTP хаба недоступны, дифф не приложен; тесты, которых ты "
+    "не запускал сам, сюда не относятся — см. блок ВОЗМОЖНОСТЕЙ)"
+)
+
+
+def _report_instruction(http: bool, local: bool) -> str:
+    """Текст блока отчёта; локальному пути «environment» — без запуска проверок (#1598)."""
+    text = REPORT_BLOCK_INSTRUCTION.replace(
+        "{main_path}", _MAIN_PATH_HTTP if http else _MAIN_PATH_MCP
+    )
+    if local:
+        text = text.replace(
+            _REPORT_ENVIRONMENT_CLAUSE, _REPORT_ENVIRONMENT_CLAUSE_LOCAL
+        )
+    return text
+
+
 def _review_prompt(
     task_id: int,
     branch: str,
@@ -1963,17 +2070,34 @@ def _review_prompt(
     needs_container: bool = False,
     inline_diff: bool = False,
 ) -> str:
+    if inline_diff:
+        # #1598: у локального ревьюера нет ни клона, ни права запускать — общее
+        # «запускать проверки» и блок попыток #1238 ему велели бы невозможное.
+        opening = (
+            f"Ты — независимый код-ревьюер задачи #{task_id} хаба Haiplane "
+            f"(ветка {branch}). Строгие правила: НИЧЕГО не коммить, не пушить "
+            "и не менять — только читать дифф и бриф.\n\n" + LOCAL_CAPABILITIES_BLOCK
+        )
+        attempts = ""
+    else:
+        opening = (
+            f"Ты — независимый код-ревьюер задачи #{task_id} хаба Haiplane "
+            f"(ветка {branch}). Строгие правила: НИЧЕГО не коммить, не пушить и "
+            "не менять в файлах репозитория — только читать код и запускать "
+            # #1357: «не менять» читалось как запрет трогать машину, хотя блок
+            # попыток #1238 и так велит ставить pytest. Граница — репозиторий.
+            "проверки. Поставить во временную машину недостающий инструмент — "
+            "не правка репозитория, а часть проверки.\n\n"
+        )
+        attempts = environment_attempt_block(needs_container)
+    brief_step = _local_brief_step if inline_diff else _brief_step
+    if inline_diff and only_tests_block:
+        only_tests_block += _LOCAL_ONLY_TESTS_NOTE
     common = (
-        f"Ты — независимый код-ревьюер задачи #{task_id} хаба Haiplane "
-        f"(ветка {branch}). Строгие правила: НИЧЕГО не коммить, не пушить и "
-        "не менять в файлах репозитория — только читать код и запускать "
-        # #1357: «не менять» читалось как запрет трогать машину, хотя блок
-        # попыток #1238 и так велит ставить pytest. Граница — репозиторий.
-        "проверки. Поставить во временную машину недостающий инструмент — "
-        "не правка репозитория, а часть проверки.\n\n"
+        opening
         # The rules travel with BOTH profiles: the expensive harness has no
         # more knowledge of this repository's history than the cheap pass.
-        f"{rules_block}\n\n"
+        + f"{rules_block}\n\n"
         # So does the diff plan (#874): the deep harness reads the same branch
         # and has the same reason not to spend its passes on lock files.
         f"{diff_block}\n\n"
@@ -1986,7 +2110,7 @@ def _review_prompt(
         # #1238: and the order of attempts before "the environment refused".
         # Both profiles get it: the deep harness lost the test dimension on
         # exactly the same missing tool as a cheap one would.
-        + environment_attempt_block(needs_container)
+        + attempts
         # #1036: the report has to survive a run with no MCP. Since 22.08 the
         # hub's MCP stopped reaching cloud runs at all — the reviewer works,
         # finishes, and its findings die in the final text nobody parses. So
@@ -1995,9 +2119,7 @@ def _review_prompt(
         + f"{delivery_block}"
         # .replace, не .format: сам шаблон несёт JSON отчёта в фигурных
         # скобках, и форматирование прочитало бы "raw_count" как поле.
-        + REPORT_BLOCK_INSTRUCTION.replace(
-            "{main_path}", _MAIN_PATH_HTTP if delivery_block else _MAIN_PATH_MCP
-        )
+        + _report_instruction(bool(delivery_block), inline_diff)
         + "\n\n"
     )
     if profile == LITE:
@@ -2010,7 +2132,8 @@ def _review_prompt(
         # the prompt asks for, in words the report can be checked against.
         return (
             common + "Это ЛЁГКОЕ ревью: ОДИН проход. Порядок: "
-            f"1) {_brief_step(task_id, bool(delivery_block))} — предмет ревью; "
+            f"1) {brief_step(task_id, bool(delivery_block))}"
+            f"{'' if inline_diff else ' — предмет ревью'}; "
             f"2) {_READ_THE_DIFF_INLINE if inline_diff else _READ_THE_DIFF_BY_COMMAND}"
             " — не исследуй репозиторий целиком, контекст берётся из диффа; "
             "3) один проход по изменённым файлам: ищи дефекты корректности, "
@@ -2025,13 +2148,25 @@ def _review_prompt(
             "не найти ничего. Вердикт НЕ выноси — он не твой."
         )
     http = bool(delivery_block)
+    # #1598: харнесс общий с облаком и требует тестов и git; локальному пути
+    # он читается под блоком возможностей, а не вместо него.
+    harness_from_brief = (
+        _HARNESS_FROM_BRIEF_HEAD
+        + "работай по нему, "
+        + _HARNESS_LOCAL_EXCEPTION.rstrip("; ")
+        + ". "
+        + _HARNESS_FROM_BRIEF_EMPTY
+        if inline_diff
+        else _HARNESS_FROM_BRIEF
+    )
     if http:
         # #1586: у HTTP-рана нет MCP, а его сессия видит только бриф и приём
         # отчёта — харнесс приезжает в брифе, полем harness_skill.
         return (
             common + "Порядок: "
-            f"1) {_brief_step(task_id, http)} — предмет ревью и харнесс; "
-            f"2) {_HARNESS_FROM_BRIEF} "
+            f"1) {brief_step(task_id, http)}"
+            f"{' и харнесс' if inline_diff else ' — предмет ревью и харнесс'}; "
+            f"2) {harness_from_brief} "
             "3) исполни фазы измерений и адъюдикации ЧЕСТНО — отчёт без "
             "исполнения запрещён скиллом и виден серверу; "
             f"4) {_submit_step(task_id, http, harness_fields=_HARNESS_FROM_BRIEF_FIELDS)} с "
@@ -2040,8 +2175,9 @@ def _review_prompt(
         )
     return (
         common + "Порядок: "
-        "1) hub_get_skill('multi-agent-review') и работай по нему; "
-        f"2) {_brief_step(task_id, http)} — предмет ревью; "
+        "1) hub_get_skill('multi-agent-review') и работай по нему"
+        f"{', ' + _HARNESS_LOCAL_EXCEPTION.rstrip('; ') if inline_diff else ''}; "
+        f"2) {brief_step(task_id, http)}{'' if inline_diff else ' — предмет ревью'}; "
         "3) исполни фазы измерений и адъюдикации ЧЕСТНО — отчёт без "
         "исполнения запрещён скиллом v8 и виден серверу; "
         f"4) {_submit_step(task_id, http)} с "
