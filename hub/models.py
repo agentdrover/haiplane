@@ -811,7 +811,9 @@ class BulkChildTaskItem(BaseModel):
     # DoR without a follow-up refine round-trip. Forward refs are resolved by
     # ``BulkChildTaskItem.model_rebuild()`` after AcceptanceCriterion/TaskRisk.
     acceptance_criteria: list["AcceptanceCriterion"] | None = None
-    risks: list["TaskRisk"] | None = None
+    # #1592: the same cap TaskRefine applies; a longer list used to pass here and
+    # fail with a bare ValidationError after the first rows were written.
+    risks: list["TaskRisk"] | None = Field(default=None, max_length=MAX_RISKS)
 
 
 class BulkChildTasksCreate(BaseModel):
