@@ -930,6 +930,7 @@ async def test_summary_names_partial_lock_and_counts_actual_steward_verdicts(
             "steward",
             verdict="approved",
             submission_generation=gen,
+            source="steward_applied",
         )
     # Повтор того же поколения — одно поколение, один вердикт.
     await event(
@@ -938,6 +939,15 @@ async def test_summary_names_partial_lock_and_counts_actual_steward_verdicts(
         "steward",
         verdict="approved",
         submission_generation=1,
+        source="steward_applied",
+    )
+    # #1602: имя steward в теле запроса — не вердикт стюарда: метки применения нет.
+    await event(
+        "review_verdict_recorded",
+        shadow,
+        "steward",
+        verdict="approved",
+        submission_generation=3,
     )
     # Человеческий вердикт и вердикт стюарда на чужом проекте не считаются.
     await event(
@@ -953,6 +963,7 @@ async def test_summary_names_partial_lock_and_counts_actual_steward_verdicts(
         "steward",
         verdict="approved",
         submission_generation=1,
+        source="steward_applied",
     )
     # Теневые суждения (5) и DoR-суждение (1): steward_applied вердиктом не является.
     for _ in range(5):
@@ -965,6 +976,7 @@ async def test_summary_names_partial_lock_and_counts_actual_steward_verdicts(
         "steward",
         verdict="approved",
         submission_generation=9,
+        source="steward_applied",
     )
     await db.execute(
         "UPDATE events SET created_at=datetime('now','-200 days') WHERE id=?", (old,)

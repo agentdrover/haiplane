@@ -141,7 +141,10 @@ async def test_patch_lock_checks_run_on_merged_policy(client: AsyncClient, db):
     """
     pid = await _create_project(client, "default")
     stored = {**_DEFAULT_POLICY, "dor": "steward"}
-    await repo.update_project(db, pid, gate_policy=json.dumps(stored))
+    # Мимо repo.update_project: у записи теперь свой замок (#1602).
+    await db.execute(
+        "UPDATE projects SET gate_policy=? WHERE id=?", (json.dumps(stored), pid)
+    )
     await db.commit()
 
     resp = await client.patch(
@@ -192,3 +195,27 @@ async def test_new_delegated_value_stays_locked_on_default(
         f"/api/projects/{pid}", json={"gate_policy": {"verdict": "steward"}}
     )
     assert resp.status_code == 200, resp.text
+
+
+async def test_repository_write_refuses_a_locked_policy_on_default(
+    client: AsyncClient, db
+):
+    """#1602: замок стоит и на самой записи repo.update_project."""
+    import pytest
+
+    pid = await _create_project(client, "default")
+    other = await _create_project(client, "spike-direct")
+    for bad in ({"dor": "steward"}, {"verdict": "auto"}):
+        with pytest.raises(repo.GateLockViolation) as info:
+            await repo.update_project(db, pid, gate_policy=json.dumps(bad))
+        assert info.value.violations == [f"{k}={v}" for k, v in bad.items()]
+    row = await repo.get_project(db, pid)
+    assert json.loads(row["gate_policy"] or "{}") == {}
+
+    # Разрешённая пара и чужой проект проходят.
+    await repo.update_project(db, pid, gate_policy=json.dumps({"verdict": "steward"}))
+    await repo.update_project(db, other, gate_policy=json.dumps({"dor": "auto"}))
+    await db.commit()
+    assert json.loads((await repo.get_project(db, pid))["gate_policy"]) == {
+        "verdict": "steward"
+    }

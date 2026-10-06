@@ -4636,6 +4636,30 @@ async def test_project_form_on_default_keeps_the_allowed_steward_verdict(
     assert "кроме verdict=steward" in page
 
 
+async def test_project_form_exception_is_confined_to_default(client: AsyncClient):
+    # #1602 P3: у другого проекта отсутствующее поле формы по-прежнему human.
+    resp = await client.post(
+        "/api/projects", json={"slug": "spike-other", "name": "Other"}
+    )
+    pid = resp.json()["id"]
+    resp = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"verdict": "steward"}}
+    )
+    assert resp.status_code == 200, resp.text
+    version = (await client.get("/api/projects/spike-other/effective-policy")).json()[
+        "policy_version"
+    ]
+    resp = await client.post(
+        f"/projects/{pid}/web-edit",
+        data={"gate_policy_review": "off", "policy_version": version},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    listed = (await client.get("/api/projects")).json()
+    row = next(p for p in listed if p["id"] == pid)
+    assert row["gate_policy"].get("verdict") == "human", row["gate_policy"]
+
+
 async def test_project_form_reverts_policy_to_human(client: AsyncClient):
     # AC-3 (#753): rolling the autopilot back is the same single click.
     resp = await client.post(

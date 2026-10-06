@@ -1127,9 +1127,38 @@ async def list_projects(
     )
 
 
+class GateLockViolation(ValueError):
+    """Запись политики, которую замок #743 не пропускает (#1602)."""
+
+    def __init__(self, slug: str, violations: list[str]) -> None:
+        super().__init__(
+            f"замок #743: политика проекта {slug} не может содержать "
+            f"{', '.join(violations)}"
+        )
+        self.violations = violations
+
+
 async def update_project(
     db: aiosqlite.Connection, project_id: int, **fields: Any
 ) -> None:
+    # #1602: замок #743 стоит и на самой записи, а не только в слиянии
+    # PATCH: прямой вызов с gate_policy не должен класть на default политику,
+    # которую API отказал бы принять. Нечитаемое значение пропускается как
+    # раньше — проверку формата делает слой модели.
+    if fields.get("gate_policy") is not None:
+        from hub.services import project_policy
+
+        row = await get_project(db, project_id)
+        raw = fields["gate_policy"]
+        if row is not None and project_policy.gate_lock_applies(row["slug"]):
+            try:
+                policy = json.loads(raw) if isinstance(raw, str) else raw
+            except ValueError:
+                policy = None
+            if isinstance(policy, dict):
+                violations = project_policy.gate_lock_violations(row["slug"], policy)
+                if violations:
+                    raise GateLockViolation(row["slug"], violations)
     sets = [f"{k}=?" for k in fields]
     sets.append("updated_at=datetime('now')")
     values = [*fields.values(), project_id]

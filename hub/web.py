@@ -1451,9 +1451,12 @@ async def _gate_policy_from_form(
     # и «поля нет» там значит «не трогать», а не «human»: иначе любое сохранение
     # формы сбрасывало бы разрешённое verdict=steward. Где поле есть, пустое
     # по-прежнему human.
+    default_project = bool(
+        stored is not None and project_policy.gate_lock_applies(stored["slug"])
+    )
     for gate in project_policy.GATE_LOCK_GATES:
         field = f"gate_policy_{gate}"
-        if field not in form and gate in kept:
+        if default_project and field not in form and gate in kept:
             gate_policy[gate] = kept[gate]
         else:
             gate_policy[gate] = str(form.get(field) or "").strip() or "human"
@@ -3317,6 +3320,7 @@ async def web_review_verdict(
             body,
             self_approved=self_approved,
             principal_id=identity.principal_id,
+            agent_caller=identity.is_agent,
         )
     except HTTPException as exc:
         if exc.status_code != 422:

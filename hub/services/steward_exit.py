@@ -505,8 +505,11 @@ async def actual_steward_verdicts(
 ) -> dict[str, int]:
     """Фактические вердикты стюарда по проектам: ``{slug: число}`` (#1602).
 
-    Считается ОДНО событие: ``review_verdict_recorded`` с actor=steward — тот
-    самый вердикт, который стюард записал на задачу (``steward_applied.py``).
+    Считается ОДНО событие: ``review_verdict_recorded`` с actor=steward И
+    меткой ``source=steward_applied`` в payload — вердикт, который записало
+    применение стюарда (``steward_applied.py``). Имя актора приходит из тела
+    запроса и подделывается; метку ставит только само применение, поэтому
+    ``{"agent": "steward"}`` через review-verdict счёт не увеличивает.
     Событие ``steward_applied`` сюда не годится: оно пишется на любое
     неэскалированное суждение, тень и DoR тоже. Один вердикт на поколение
     сдачи: повтор той же пары (задача, поколение) считается один раз.
@@ -516,6 +519,7 @@ async def actual_steward_verdicts(
         db,
         "SELECT task_id, payload FROM events "
         "WHERE kind='review_verdict_recorded' AND actor='steward' "
+        "AND json_extract(payload, '$.source') = 'steward_applied' "
         "AND task_id IS NOT NULL AND created_at >= datetime('now', ?)",
         (f"-{int(since_days)} days",),
     )
