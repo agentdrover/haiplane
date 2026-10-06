@@ -45,6 +45,7 @@ from typing import Any
 
 import aiosqlite
 
+from hub import repository as repo
 from hub.db import fetchall
 from hub.services.gate_events import NON_HUMAN_GATE_ACTORS, sql_in
 
@@ -62,6 +63,11 @@ PROCEDURAL_ESCALATE_REASONS: frozenset[str] = frozenset(
 
 #: Окно проверки пары после доставки, дней.
 FALSE_APPROVE_WINDOW_DAYS = 30
+#: Пары старше этого возраста (от ответа советника) на тике не читаются: окно
+#: 30 дней плюс запас на лаг доставки (60 дней). Доставка позже запаса уже
+#: не отслеживается — это граница контроля, а не поиск вечно. Записанные
+#: (закреплённые) ошибки читаются из таблицы независимо от возраста.
+PAIR_READ_HORIZON_DAYS = FALSE_APPROVE_WINDOW_DAYS + 60
 
 SOURCE_HUMAN_CHANGES = "human_changes_requested"
 SOURCE_REOPENED = "reopened"
@@ -227,8 +233,9 @@ async def concur_pairs(db: aiosqlite.Connection) -> list[_Pair]:
         "AND a.task_id=j.task_id AND a.generation=j.generation "
         "AND a.judged_id=j.id "
         "WHERE j.kind='verdict' AND j.verdict='approve' AND j.contour=? "
+        "AND a.created_at >= datetime('now', ?) "
         "ORDER BY j.id",
-        (CONTOUR_V2,),
+        (CONTOUR_V2, f"-{PAIR_READ_HORIZON_DAYS} days"),
     )
     return [
         _Pair(
@@ -240,20 +247,38 @@ async def concur_pairs(db: aiosqlite.Connection) -> list[_Pair]:
     ]
 
 
-async def _delivered_at(db: aiosqlite.Connection, pair: _Pair) -> str:
-    """Когда ЭТО одобрение доставлено: первый мерж гейта после ответа пары.
-
-    Источник — реестр мержей гейта (``pipeline_merges``), а не ``completed_at``:
-    второе — завершение задачи, и оно перезаписывается повторным завершением.
-    Пусто — доставки не зафиксировано.
-    """
-    rows = await fetchall(
-        db,
-        "SELECT MIN(merged_at) AS at FROM pipeline_merges "
-        "WHERE task_id=? AND merged_at >= ?",
-        (pair.task_id, pair.approved_at),
-    )
+async def _norm(db: aiosqlite.Connection, stamp: str) -> str:
+    """Метка в формате sqlite (``YYYY-MM-DD HH:MM:SS``): релизы пишут ISO."""
+    if not stamp:
+        return ""
+    rows = await fetchall(db, "SELECT datetime(?) AS at", (stamp,))
     return str(dict(rows[0]).get("at") or "") if rows else ""
+
+
+async def _delivered_at(
+    db: aiosqlite.Connection, pair: _Pair, projects: frozenset[int]
+) -> str:
+    """Когда ЭТО одобрение доставлено — по учёту доставки самого хаба.
+
+    Своего читателя нет. Доставка до прода — это ``repository.first_fix_deploy_at``
+    (первый успешный выкат релиза, в который попал последний мерж задачи; для
+    проектов с ``merge_is_delivery`` — по правилам #1572), тот же ответ, что
+    читают исходы (#1568). Если выката нет, а работа доставлена мимо гейта
+    (``delivery_discrepancies``: state=delivered, ``delivery_path`` из словаря
+    delivery_state), якорь — момент, когда свип это подтвердил. Мерж без выката
+    доставкой не считается. Момент раньше ответа пары — доставка прошлого
+    одобрения, не этого. Пусто — доставки не зафиксировано.
+    """
+    fix = await repo.first_fix_deploy_at(db, pair.task_id, delivery_projects=projects)
+    at = await _norm(db, fix.at or "")
+    if at and at >= pair.approved_at:
+        return at
+    stored = await repo.get_delivery_discrepancy(db, pair.task_id) or {}
+    if str(stored.get("state") or "") == "delivered":
+        seen = await _norm(db, str(stored.get("checked_at") or ""))
+        if seen and seen >= pair.approved_at:
+            return seen
+    return ""
 
 
 async def _plus_window(db: aiosqlite.Connection, stamp: str) -> str:
@@ -300,7 +325,9 @@ async def _human_returns(
     return out
 
 
-async def _detect_for_pair(db: aiosqlite.Connection, pair: _Pair) -> list[FalseApprove]:
+async def _detect_for_pair(
+    db: aiosqlite.Connection, pair: _Pair, projects: frozenset[int]
+) -> list[FalseApprove]:
     """Ошибочные одобрения одной пары по трём источникам, в обе границы окна.
 
     Якорь окна — доставка этого одобрения, а если её нет — само одобрение.
@@ -309,7 +336,7 @@ async def _detect_for_pair(db: aiosqlite.Connection, pair: _Pair) -> list[FalseA
     только от доставки, поэтому без зафиксированной доставки их нет.
     """
     task_id, generation = pair.task_id, pair.generation
-    delivered = await _delivered_at(db, pair)
+    delivered = await _delivered_at(db, pair, projects)
     anchor = delivered or pair.approved_at
     high = await _plus_window(db, anchor)
     found: list[FalseApprove] = []
@@ -351,7 +378,11 @@ async def _detect_for_pair(db: aiosqlite.Connection, pair: _Pair) -> list[FalseA
                 generation,
                 f"задача доставлена ({delivered}), завершена ({completed_at}) и "
                 f"снова в статусе {task.get('status')} с {reopened_at}",
-                ref=reopened_at,
+                # Ref — то завершение, из которого задачу вернули (его метка),
+                # а не время последнего перехода: оно меняется любым переходом
+                # (claimed, running...), и снятый случай возвращался бы.
+                # Новое настоящее переоткрытие = новое завершение = новый ref.
+                ref=completed_at,
             )
         )
 
@@ -393,10 +424,13 @@ async def detect_false_approvals(db: aiosqlite.Connection) -> list[FalseApprove]
     Только чтение. Случай, уже внесённый в таблицу, в находки не попадает:
     активный лежит в таблице, а снятый человеком не возвращается.
     """
+    from hub.services.project_policy import merge_is_delivery_projects
+
     known = await _recorded_keys(db)
+    projects = await merge_is_delivery_projects(db)
     out: list[FalseApprove] = []
     for pair in await concur_pairs(db):
-        for item in await _detect_for_pair(db, pair):
+        for item in await _detect_for_pair(db, pair, projects):
             if (item.task_id, item.source, item.ref) not in known:
                 out.append(item)
     return out

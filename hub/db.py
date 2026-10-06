@@ -2519,6 +2519,12 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "NOT NULL DEFAULT ''",
     ),
     (
+        # Когда применение заняло метку (advisor_outcome='applying'): по ней
+        # прервавшееся применение отличают от идущего (#1601).
+        "add_steward_judgements_advisor_claimed_at",
+        "ALTER TABLE steward_judgements ADD COLUMN advisor_claimed_at TEXT",
+    ),
+    (
         "add_steward_runs_packet_hash",
         "ALTER TABLE steward_runs ADD COLUMN packet_hash TEXT NOT NULL DEFAULT ''",
     ),

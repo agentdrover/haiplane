@@ -1482,3 +1482,110 @@ def test_the_hashed_brief_fields_are_all_real_brief_fields():
     assert set(PACKET_HASH_BRIEF_FIELDS) <= set(ReviewBrief.model_fields)
     for required in ("acceptance_criteria", "scope_in", "scope_out", "constraints"):
         assert required in PACKET_HASH_BRIEF_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# Применение, прервавшееся после занятия метки
+# ---------------------------------------------------------------------------
+
+
+async def _interrupted(
+    db: aiosqlite.Connection, monkeypatch, slug: str, minutes_ago: int
+) -> int:
+    """Применение заняло метку и умерло: advisor_outcome='applying' давно."""
+    task_id = await _scenario(db, slug, "concur")
+    await db.execute(
+        "UPDATE steward_judgements SET advisor_outcome='applying', "
+        "advisor_claimed_at=datetime('now', ?) WHERE task_id=? AND kind='verdict'",
+        (f"-{minutes_ago} minutes", task_id),
+    )
+    await db.commit()
+    return task_id
+
+
+async def _alerts(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    return [
+        dict(u)["content"]
+        for u in await repo.get_task_updates(db, task_id)
+        if "Применение советника прервано" in dict(u)["content"]
+    ]
+
+
+async def test_an_interrupted_apply_goes_to_the_human_aloud_exactly_once(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """applying дольше срока — исход escalated и ОДИН alert; повторного применения нет."""
+    from hub.services import steward_applied
+
+    await _act(monkeypatch)
+    await _patched_converged(monkeypatch)
+    task_id = await _interrupted(db, monkeypatch, "advisor-stuck", 61)
+    calls: list[int] = []
+
+    async def _spy(_db, task, _generation):
+        calls.append(task)
+        return None
+
+    monkeypatch.setattr(steward_applied, "apply_self_approval", _spy)
+
+    await apply_advisor_outcomes(db)
+    await apply_advisor_outcomes(db)
+
+    assert (await _judge_row(db, task_id))["advisor_outcome"] == "escalated"
+    alerts = await _alerts(db, task_id)
+    assert len(alerts) == 1 and "решение за человеком" in alerts[0]
+    assert calls == [], "повторного применения нет"
+    assert await _no_verdict(db, task_id)
+
+
+async def test_a_recent_claim_is_left_alone(db: aiosqlite.Connection, monkeypatch):
+    """Применение ещё может идти — метку моложе срока не трогаем."""
+    await _act(monkeypatch)
+    task_id = await _interrupted(db, monkeypatch, "advisor-stuck-young", 5)
+
+    await apply_advisor_outcomes(db)
+
+    assert (await _judge_row(db, task_id))["advisor_outcome"] == "applying"
+    assert await _alerts(db, task_id) == []
+
+
+async def test_an_interrupted_apply_is_named_even_in_the_shadow(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Метка осталась от прошлого act — говорим вслух и в тени."""
+    task_id = await _interrupted(db, monkeypatch, "advisor-stuck-shadow", 90)
+
+    await apply_advisor_outcomes(db)
+
+    assert len(await _alerts(db, task_id)) == 1
+
+
+async def test_the_wait_for_an_interrupted_apply_is_the_advisor_wait(
+    db: aiosqlite.Connection, monkeypatch
+):
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_WAIT_MAX", 10)
+    task_id = await _interrupted(db, monkeypatch, "advisor-stuck-wait", 11)
+
+    await apply_advisor_outcomes(db)
+
+    assert len(await _alerts(db, task_id)) == 1
+
+
+async def test_a_claim_stamps_its_time(db: aiosqlite.Connection, monkeypatch):
+    """Занятие метки пишет время: по нему прерванное отличают от идущего."""
+    from hub.services import steward_applied
+
+    await _act(monkeypatch)
+    await _scenario(db, "advisor-stamp-claim", "concur")
+    seen: list[str] = []
+
+    async def _look(db_, task, _generation):
+        row = await _judge_row(db_, task)
+        seen.append(str(row["advisor_claimed_at"]))
+        return None
+
+    monkeypatch.setattr(steward_applied, "apply_self_approval", _look)
+
+    await apply_advisor_outcomes(db)
+
+    assert seen and seen[0] not in ("", "None")

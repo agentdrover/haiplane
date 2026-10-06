@@ -638,6 +638,49 @@ async def advisor_refusal(
 # ---------------------------------------------------------------------------
 
 
+async def _escalate_interrupted(db: aiosqlite.Connection) -> int:
+    """Применение, занявшее метку и не записавшее исхода, — к человеку, вслух.
+
+    Крах между занятием метки и записью исхода оставлял ``applying``
+    навсегда, а выборка поллера (``advisor_outcome=''``) такую строку молча
+    пропускает. По замыслу задача идёт к человеку, но не молча: строка,
+    державшая метку дольше STEWARD_ADVISOR_WAIT_MAX минут, получает исход
+    ``escalated`` и ОДНУ запись в ленте задачи. Повторного применения нет.
+    Условный UPDATE по ``applying`` делает перевод и запись ровно одним разом.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT id, task_id, generation FROM steward_judgements "
+        "WHERE kind='verdict' AND advisor_outcome=? "
+        "AND advisor_claimed_at <= datetime('now', ?)",
+        (_OUTCOME_CLAIMED, f"-{config.STEWARD_ADVISOR_WAIT_MAX} minutes"),
+    )
+    moved = 0
+    for row in rows:
+        item = dict(row)
+        cursor = await db.execute(
+            "UPDATE steward_judgements SET advisor_outcome=? "
+            "WHERE id=? AND advisor_outcome=?",
+            (OUTCOME_ESCALATED, item["id"], _OUTCOME_CLAIMED),
+        )
+        if cursor.rowcount != 1:
+            continue
+        await repo.add_task_update(
+            db,
+            int(item["task_id"]),
+            "hub",
+            "alert",
+            "Применение советника прервано, решение за человеком: approve судьи "
+            f"сдачи {item['generation']} занял метку применения и не записал "
+            "исхода (хаб перезапущен или упал между шагами). Повторно оно не "
+            "применяется.",
+            author_kind="hub",
+        )
+        moved += 1
+    await db.commit()
+    return moved
+
+
 async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
     """Применить approve судьи там, где советник уже ответил (или не ответит).
 
@@ -651,6 +694,9 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
     from hub.services.steward_applied import apply_self_approval
     from hub.services.steward_shadow import effective_mode
 
+    # Прервавшееся применение называется вслух в ЛЮБОМ режиме: метка осталась
+    # от прошлого act, и молчать о ней нельзя.
+    await _escalate_interrupted(db)
     if await effective_mode(db) != "act":
         return 0
     rows = await fetchall(
@@ -671,7 +717,8 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
         if state.state in (STATE_NOT_ORDERED, STATE_PENDING, STATE_NOT_APPLICABLE):
             continue
         cursor = await db.execute(
-            "UPDATE steward_judgements SET advisor_outcome=? "
+            "UPDATE steward_judgements SET advisor_outcome=?, "
+            "advisor_claimed_at=datetime('now') "
             "WHERE id=? AND advisor_outcome=''",
             (_OUTCOME_CLAIMED, item["id"]),
         )
