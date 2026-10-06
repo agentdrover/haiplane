@@ -17138,38 +17138,46 @@ async def test_a_local_prompt_shows_every_prepass_state_beside_the_block():
     assert "данных нет — CI не присылал отчёт" in seen["unknown"]
 
 
-@pytest.mark.parametrize("profile", [LITE, DEEP])
-@pytest.mark.parametrize("http", [False, True])
-@pytest.mark.parametrize("container", [False, True])
-def test_the_cloud_review_prompt_is_unchanged(
-    profile: str, http: bool, container: bool
-) -> None:
+def test_the_cloud_review_prompt_is_unchanged() -> None:
     """AC-3 (#1598): облачный промт байт в байт совпадает с эталоном до задачи.
 
-    Эталоны сняты с develop до правки (tests/fixtures/cloud_review_prompt).
-    Регрессионная защита: зелёная и до, и после.
+    Эталоны сняты с develop до правки (tests/fixtures/cloud_review_prompt):
+    lite и deep, MCP и HTTP, с контейнерной задачей и без. Регрессионная
+    защита: зелёная и до, и после.
     """
     from hub.services.review_dispatch import _delivery_block, _review_prompt
 
-    delivery = _delivery_block(1598, "CODE123", "https://hub.example") if http else ""
-    got = _review_prompt(
-        1598,
-        "task-1598/x",
-        "grok-4.6",
-        profile,
-        "RULES",
-        "DIFF",
-        "PREPASS",
-        delivery_block=delivery,
-        only_tests_block="ONLY_TESTS\n",
-        needs_container=container,
-    )
-    name = (
-        f"{profile}_{'http' if http else 'mcp'}_{'container' if container else 'plain'}"
-    )
-    expected = (_CLOUD_PROMPT_FIXTURES / f"{name}.txt").read_text(encoding="utf-8")
-    assert got == expected
-    assert "ВОЗМОЖНОСТИ ЛОКАЛЬНОГО" not in got, "блок локального пути не течёт в облако"
+    for profile in (LITE, DEEP):
+        for http in (False, True):
+            for container in (False, True):
+                delivery = (
+                    _delivery_block(1598, "CODE123", "https://hub.example")
+                    if http
+                    else ""
+                )
+                got = _review_prompt(
+                    1598,
+                    "task-1598/x",
+                    "grok-4.6",
+                    profile,
+                    "RULES",
+                    "DIFF",
+                    "PREPASS",
+                    delivery_block=delivery,
+                    only_tests_block="ONLY_TESTS\n",
+                    needs_container=container,
+                )
+                name = (
+                    f"{profile}_{'http' if http else 'mcp'}_"
+                    f"{'container' if container else 'plain'}"
+                )
+                expected = (_CLOUD_PROMPT_FIXTURES / f"{name}.txt").read_text(
+                    encoding="utf-8"
+                )
+                assert got == expected, name
+                assert "ВОЗМОЖНОСТИ ЛОКАЛЬНОГО" not in got, (
+                    f"блок локального пути не течёт в облако: {name}"
+                )
 
 
 async def test_a_cloud_order_from_prepare_review_order_has_no_local_block(
