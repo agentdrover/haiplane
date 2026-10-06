@@ -113,6 +113,13 @@ def _fake_api(tasks: list[dict[str, Any]], ctx: dict[str, Any] | None = None):
         calls.append(path)
         if path.startswith("/api/diagnostics/identity"):
             return _identity()
+        if path.endswith("/effective-policy"):
+            # #1594: общий контекст показывает политику default.
+            return {
+                "slug": "default",
+                "keys": [],
+                "steward": {"requested": "off", "effective": "off"},
+            }
         if path.startswith("/api/tasks?"):
             query = parse_qs(urlparse(path).query)
             if query.get("mode", ["full"])[0] == "summary":

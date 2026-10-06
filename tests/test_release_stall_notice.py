@@ -361,6 +361,12 @@ async def test_my_context_carries_the_open_release_block(client, db):
             return resp.json()
         if path == "/api/diagnostics/identity":
             return {"username": "steward", "role": "agent", "principal_id": 1}
+        if path.endswith("/effective-policy"):
+            return {
+                "slug": "default",
+                "keys": [],
+                "steward": {"requested": "off", "effective": "off"},
+            }
         return {"tasks": [], "next_cursor": None}
 
     with patch.object(mcp_server, "_api_get", side_effect=_via_rest):

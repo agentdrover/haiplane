@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import UTC, date, datetime, time
 from enum import Enum
 from typing import Any, Literal
 
@@ -380,6 +380,11 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # сливается, пока копия расходится. Не гейт ревью и ничего не делегирует.
     # Читатель: project_policy.release_artifacts_of.
     "release_artifacts",
+    # #1594: заморозка проекта — допуск новой работы только для разрешённых
+    # типов и с обоснованием. Не гейт и ничего не делегирует: человека не
+    # заменяет, а ограничивает и его, и автоодобрение. Читатель:
+    # project_policy.freeze_of; единственная проверка: freeze_admission.
+    "freeze",
 )
 # Bounds, so a policy stays something a human reads and argues with rather
 # than a place to hide a thousand rules.
@@ -447,6 +452,105 @@ def _validate_path_notices(policy: dict[str, Any]) -> None:
             )
         cleaned.append({"pattern": pattern.strip(), "text": text.strip()})
     policy["path_notices"] = cleaned
+
+
+FREEZE_NOTE_MAX = 500
+FREEZE_FIELDS = ("until", "allow_work_types", "note")
+
+
+def parse_freeze_until(raw: Any) -> datetime | None:
+    """``freeze.until`` -> момент в UTC; ``None`` - «до снятия» (#1594).
+
+    Принимается timestamp ISO 8601 С ЧАСОВЫМ ПОЯСОМ либо дата без времени
+    (00:00 UTC этого дня). Время без пояса отказывается: «до 18:00» без пояса
+    читается по-разному у владельца и у сервера, а заморозка - не то место, где
+    это можно угадывать.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(
+            "gate_policy freeze.until must be an ISO 8601 timestamp with a "
+            f"time zone, a date, or null, got: {raw!r}"
+        )
+    text = raw.strip()
+    try:
+        if len(text) == 10:
+            return datetime.combine(date.fromisoformat(text), time(), tzinfo=UTC)
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(
+            "gate_policy freeze.until must be an ISO 8601 timestamp with a "
+            f"time zone (e.g. 2026-10-26T00:00:00+00:00) or a date, got: {raw!r}"
+        ) from None
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError(
+            "gate_policy freeze.until has no time zone; write "
+            f"2026-10-26T00:00:00+00:00 or a bare date, got: {raw!r}"
+        )
+    return moment.astimezone(UTC)
+
+
+def validated_freeze(raw: Any) -> dict[str, Any]:
+    """Привести ``gate_policy.freeze`` к каноническому виду или отказать (#1594).
+
+    Канон: ``{until: UTC-ISO | None, allow_work_types: [str], note: str}``.
+    Прошедший ``until`` допустим - он значит «не действует»; неизвестный тип
+    работы и лишний ключ отказываются: тип, выброшенный молча, читался бы как
+    «разрешён всем», а ключ-опечатка - как «заморозки с ограничением нет».
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "gate_policy freeze must be an object {until, allow_work_types, note}, "
+            f"got: {type(raw).__name__}"
+        )
+    extra = set(raw) - set(FREEZE_FIELDS)
+    if extra:
+        raise ValueError(
+            f"gate_policy freeze has unknown keys: {sorted(extra)}; "
+            f"allowed: {', '.join(FREEZE_FIELDS)}"
+        )
+    types = raw.get("allow_work_types")
+    if not isinstance(types, list):
+        raise ValueError(
+            "gate_policy freeze.allow_work_types must be a list of work types "
+            f"({', '.join(w.value for w in WorkType)}); an empty list admits nothing"
+        )
+    known = {w.value for w in WorkType}
+    allowed: list[str] = []
+    for item in types:
+        if not isinstance(item, str):
+            raise ValueError(
+                "gate_policy freeze.allow_work_types must hold work type names "
+                f"(strings), got: {item!r}"
+            )
+        name = item.strip()
+        if name not in known:
+            raise ValueError(
+                f"gate_policy freeze.allow_work_types has unknown work type "
+                f"{item!r}; allowed: {', '.join(sorted(known))}"
+            )
+        if name not in allowed:
+            allowed.append(name)
+    note = raw.get("note", "")
+    if not isinstance(note, str):
+        raise ValueError("gate_policy freeze.note must be a string")
+    note = note.strip()
+    if len(note) > FREEZE_NOTE_MAX:
+        raise ValueError(
+            f"gate_policy freeze.note is longer than {FREEZE_NOTE_MAX} chars"
+        )
+    until = parse_freeze_until(raw.get("until"))
+    return {
+        "until": until.isoformat() if until is not None else None,
+        "allow_work_types": allowed,
+        "note": note,
+    }
+
+
+def _validate_freeze(policy: dict[str, Any]) -> None:
+    if "freeze" in policy:
+        policy["freeze"] = validated_freeze(policy["freeze"])
 
 
 RELEASE_ARTIFACTS_MAX = 20
@@ -823,6 +927,9 @@ class TaskCreate(BaseModel):
     source: TaskSource = TaskSource.human
     agent: str = Field("", max_length=100)
     rationale: str = Field("", max_length=5000)
+    # #1594: почему эта работа допустима при заморозке проекта. Не то же, что
+    # rationale (общая необходимость): пустое после strip = обоснования нет.
+    freeze_rationale: str = Field("", max_length=1000)
     human_owner: str = Field("", max_length=100)
     human_reviewer: str = Field("", max_length=100)
     run_immediately: bool = False
@@ -876,6 +983,10 @@ class BulkChildTaskItem(BaseModel):
     # #1592: the same cap TaskRefine applies; a longer list used to pass here and
     # fail with a bare ValidationError after the first rows were written.
     risks: list["TaskRisk"] | None = Field(default=None, max_length=MAX_RISKS)
+    # #1594: тип работы и обоснование допуска ребёнка. Раньше тип терялся и
+    # ребёнок становился feature; при заморозке проекта этого мало.
+    work_type: WorkType = WorkType.feature
+    freeze_rationale: str = Field("", max_length=1000)
 
 
 class BulkChildTasksCreate(BaseModel):
@@ -925,6 +1036,9 @@ class BatchApprove(BaseModel):
 class BatchApproveSkipped(BaseModel):
     task_id: int
     reason: str
+    # #1594: текст причины отказа (заморозка со сроком и note), когда у кода
+    # причины он есть; пусто - код говорит сам за себя.
+    detail: str = ""
 
 
 class BatchApproveResult(BaseModel):
@@ -2109,6 +2223,8 @@ class TaskRefine(BaseModel):
     # string is a legal value, so min_length is deliberately absent.
     description: str | None = Field(default=None, max_length=10000)
     work_type: WorkType | None = None
+    # #1594: обоснование допуска при заморозке проекта; пустая строка очищает.
+    freeze_rationale: str | None = Field(default=None, max_length=1000)
     class_of_service: ClassOfService | None = None
     size: TaskSize | None = None
     wip_tag: WipTag | None = None
@@ -2665,6 +2781,7 @@ class TaskView(BaseModel):
     source: TaskSource = TaskSource.human
     assigned_agent: str = ""
     rationale: str = ""
+    freeze_rationale: str = ""
     human_owner: str = ""
     human_reviewer: str = ""
     job_id: str | None = None
@@ -3000,6 +3117,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_merge_is_delivery(v)
     _validate_path_notices(v)
     _validate_release_artifacts(v)
+    _validate_freeze(v)
     return v
 
 

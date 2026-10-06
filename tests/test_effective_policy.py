@@ -886,6 +886,133 @@ async def test_summary_shows_scheduled_change_and_its_executor(
     )
 
 
+async def _patch_policy(client: AsyncClient, pid: int, policy: dict):
+    return await client.patch(f"/api/projects/{pid}", json={"gate_policy": policy})
+
+
+async def test_freeze_policy_is_validated_and_visible_to_agents(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, capsys
+):
+    # AC-3 (#1594): запись проверяется тем же валидатором, сводка и контекст
+    # агента показывают срок и разрешённые типы, снятие убирает ключ.
+    pid = await _project(db, "frozen-view", {})
+    good = {
+        "until": "2026-10-26T00:00:00+00:00",
+        "allow_work_types": ["bug", "chore"],
+        "note": "до MS-A2",
+    }
+    ok = await _patch_policy(client, pid, {"freeze": good})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["gate_policy"]["freeze"] == good
+
+    # дата без времени — 00:00 UTC этого дня, смещение приводится к UTC
+    day = await _patch_policy(
+        client, pid, {"freeze": {"until": "2026-10-26", "allow_work_types": []}}
+    )
+    assert day.status_code == 200, day.text
+    assert day.json()["gate_policy"]["freeze"]["until"] == "2026-10-26T00:00:00+00:00"
+    shifted = await _patch_policy(
+        client,
+        pid,
+        {"freeze": {"until": "2026-10-26T03:00:00+03:00", "allow_work_types": ["bug"]}},
+    )
+    assert (
+        shifted.json()["gate_policy"]["freeze"]["until"] == "2026-10-26T00:00:00+00:00"
+    )
+
+    refusals = {
+        "unknown work type": {"allow_work_types": ["bug", "magic"]},
+        "garbled date": {"until": "когда-нибудь", "allow_work_types": ["bug"]},
+        "time without zone": {"until": "2026-10-26T12:00:00", "allow_work_types": []},
+        "no list": {"until": None},
+        "types not a list": {"allow_work_types": "bug"},
+        "stray key": {"allow_work_types": ["bug"], "types": ["bug"]},
+        "note not text": {"allow_work_types": [], "note": 5},
+    }
+    stored_before = (await repo.get_project(db, pid))["gate_policy"]
+    for label, freeze in refusals.items():
+        resp = await _patch_policy(client, pid, {"freeze": freeze})
+        assert resp.status_code == 422, f"{label}: {resp.text}"
+        assert "freeze" in resp.text, label
+    unknown = await _patch_policy(
+        client, pid, {"freeze": {"allow_work_types": ["magic"]}}
+    )
+    assert "magic" in unknown.text, "неизвестный тип назван в причине"
+    assert (await repo.get_project(db, pid))["gate_policy"] == stored_before
+
+    # прошедший срок — запись валидна и значит «не действует»
+    past = {"until": "2020-01-01", "allow_work_types": ["bug"], "note": ""}
+    assert (await _patch_policy(client, pid, {"freeze": past})).status_code == 200
+    data = (await client.get("/api/projects/frozen-view/effective-policy")).json()
+    row = _by_key(data)["freeze"]
+    assert row["value"]["active"] is False and row["source"] == "project"
+    assert "не действует" in row["shown"]
+    # действующая заморозка: срок и типы читаются словами, а не «N rule(s)»
+    await _patch_policy(client, pid, {"freeze": dict(good, until=None)})
+    data = (await client.get("/api/projects/frozen-view/effective-policy")).json()
+    row = _by_key(data)["freeze"]
+    assert row["value"] == {
+        "until": None,
+        "allow_work_types": ["bug", "chore"],
+        "note": "до MS-A2",
+        "active": True,
+    }
+    lines = "\n".join(effective_policy.format_effective_policy(data))
+    assert "freeze = до снятия (действует); разрешены: bug, chore; до MS-A2" in lines
+    assert "rule(s)" not in lines.split("freeze =")[1].splitlines()[0]
+
+    # контекст агента: по слагу, с наследованием из задачи и по default
+    async def _fake_get(path: str, **_: object) -> object:
+        resp = await client.get(path)
+        if resp.status_code >= 400:
+            raise mcp_server.HubApiError(
+                mcp_server._parse_api_error(resp, resp.status_code)
+            )
+        return resp.json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _fake_get)
+    named = _message(await mcp_server.hub_my_context(project="frozen-view"))
+    assert "Policy of project frozen-view" in named
+    assert "freeze = до снятия (действует); разрешены: bug, chore" in named
+
+    default_id = await _project(db, "default", {})
+    assert (
+        await _patch_policy(
+            client, default_id, {"freeze": {"allow_work_types": ["docs"]}}
+        )
+    ).status_code == 200
+    fallback = _message(await mcp_server.hub_my_context())
+    assert "Policy of project default" in fallback
+    assert "разрешены: docs" in fallback, "без project — политика default"
+
+    both = await mcp_server.hub_my_context(task_id=7, project="frozen-view")
+    assert "mutually exclusive" in _message(both)
+    missing = _message(await mcp_server.hub_my_context(project="no-such-project"))
+    assert "не прочитана" in missing
+
+    # снятие убирает ключ
+    gone = await _patch_policy(client, pid, {"freeze": None})
+    assert gone.status_code == 200, gone.text
+    assert "freeze" not in gone.json()["gate_policy"]
+    data = (await client.get("/api/projects/frozen-view/effective-policy")).json()
+    assert _by_key(data)["freeze"]["source"] == "default"
+    assert _by_key(data)["freeze"]["value"] is None
+
+
+async def test_unparsable_policy_brief_is_logged_and_still_answers(monkeypatch, caplog):
+    # #1594: ответ агенту прежний, но причина больше не пропадает молча.
+    import logging
+
+    async def _junk(path: str, **_: object) -> object:
+        return {"tasks": []}
+
+    monkeypatch.setattr(mcp_server, "_api_get", _junk)
+    with caplog.at_level(logging.WARNING, logger="hub.mcp_server"):
+        text = await mcp_server._policy_brief_for_slug("spike")
+    assert "не прочитана" in text
+    assert any("KeyError" in r.getMessage() for r in caplog.records)
+
+
 async def test_summary_names_partial_lock_and_counts_actual_steward_verdicts(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch, capsys
 ):

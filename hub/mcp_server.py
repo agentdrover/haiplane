@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import urllib.parse
@@ -932,13 +933,14 @@ async def hub_create_task(
     human_owner: str = "",
     human_reviewer: str = "",
     client_request_id: str = "",
+    work_type: str = "feature",
+    freeze_rationale: str = "",
 ) -> HubCreateTaskResult:
     """Create a new task, epic, feature, or subtask. HUMAN-ONLY (#360).
 
     Creates work that is already approved, so an agent token gets 403
     ``agent_create_forbidden`` — use ``hub_propose_task`` instead, which drafts
-    for human approval. Enforced by the API, not here, so it also holds for a
-    token calling POST /api/tasks directly.
+    for human approval. Enforced by the API, so it holds for POST /api/tasks too.
 
     Args:
         title: Short title (required)
@@ -951,6 +953,8 @@ async def hub_create_task(
         human_owner: Who is accountable for this task
         human_reviewer: Who accepts the result
         client_request_id: Optional idempotency key; safe to retry on timeout
+        work_type: feature, bug, refactor, chore, docs, spike, incident
+        freeze_rationale: Why it may enter a frozen project
     """
     body: dict[str, Any] = {
         "title": title,
@@ -962,6 +966,8 @@ async def hub_create_task(
         "run_immediately": run_immediately,
         "human_owner": human_owner,
         "human_reviewer": human_reviewer,
+        "work_type": work_type,
+        "freeze_rationale": freeze_rationale,
     }
     if parent_id is not None:
         body["parent_id"] = parent_id
@@ -992,12 +998,11 @@ async def hub_create_subtasks(
 
     Args:
         parent_id: Parent task ID (must match hierarchy rules for task_type).
-        items: List of dicts with title, optional description, priority, and
-            optional acceptance_criteria (list of Given/When/Then dicts) and
+        items: List of dicts with title, optional description, priority,
+            work_type, freeze_rationale, and optional acceptance_criteria (list of Given/When/Then dicts) and
             risks (list of risk dicts) so a child is born closer to DoR.
         task_type: task or subtask (default subtask).
-        source: agent (draft) or human (open). ``human`` is human-only (#360):
-            an agent token asking for it gets 403 agent_create_forbidden.
+        source: agent (draft) or human (open; human-only, #360).
         agent: Assigned agent name when source is agent.
     """
     if not items:
@@ -1837,7 +1842,9 @@ async def _release_block_lines() -> list[str]:
     return release_block_lines(blocks)
 
 
-async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolResult:
+async def _general_hub_context(
+    *, max_chars: int | None, mode: str, project: str = ""
+) -> CallToolResult:
     """General Hub context for an agent with no active task (#454).
 
     Combines the connected instance, the caller's identity, their active
@@ -1921,6 +1928,12 @@ async def _general_hub_context(*, max_chars: int | None, mode: str) -> CallToolR
             "Note: could not tell headless review from a client-driven one "
             "(the review lookup failed) — rows in review are listed as Waiting."
         )
+    # #1594: политика проекта видна ДО создания задачи - заморозка решает, какую
+    # работу и с каким обоснованием в проект пустят. Без project - default.
+    if identity:
+        policy_text = await _policy_brief_for_slug(project.strip() or "default")
+        if policy_text:
+            lines.append(policy_text.strip())
     lines.append("")
     lines.extend(lifecycle_map_lines())
 
@@ -1944,29 +1957,39 @@ async def hub_my_context(
     task_id: int | None = None,
     max_chars: int | None = None,
     mode: str = "full",
+    project: str = "",
 ) -> CallToolResult:
     """Work context for a task: breadcrumb, siblings, progress, children, project policy.
 
     Read it before starting a task. Omit ``task_id`` for the general Hub context
     (Workflow reference, your active tasks, the instance) when you have no task yet.
 
-    ``mode=summary`` or ``max_chars`` caps the WHOLE response — text and
-    structuredContent together — at 4000 chars by default, and names what did
-    not fit in ``bounds``. Without either, the full context is returned.
+    ``mode=summary`` or ``max_chars`` caps the WHOLE response (text and
+    structuredContent) at 4000 chars by default; ``bounds`` names what did not
+    fit. Without either, the full context is returned.
 
     Args:
         task_id: The task ID to get context for. Omit for general Hub context.
         max_chars: Cap on the whole response, in characters
         mode: ``full`` (default) or ``summary``; ``brief`` is an alias of
             ``summary``, anything else is rejected with the allowed set.
+        project: Project slug for the policy shown without task_id.
     """
     try:
         mode = _normalize_context_mode(mode)
     except ValueError as exc:
         return structured_echo_result(str(exc), error="invalid_mode")
 
+    if task_id is not None and project.strip():
+        return structured_echo_result(
+            "task_id and project are mutually exclusive: a task's project is "
+            "inherited from its epic; pass one of them.",
+            error="invalid_arguments",
+        )
     if task_id is None:
-        return await _general_hub_context(max_chars=max_chars, mode=mode)
+        return await _general_hub_context(
+            max_chars=max_chars, mode=mode, project=project
+        )
 
     query = _tree_query_string(max_chars=max_chars, mode=mode)
     ctx = await _api_get(f"/api/tasks/{task_id}/context{query}")
@@ -1983,9 +2006,14 @@ async def hub_my_context(
 
 async def _policy_brief_text(ctx: dict[str, Any]) -> str:
     """Блок «политика проекта» для контекста задачи (#1457); best effort."""
+    slug = ((ctx.get("task") or {}).get("project") or {}).get("slug") or ""
+    return await _policy_brief_for_slug(slug)
+
+
+async def _policy_brief_for_slug(slug: str) -> str:
+    """Тот же блок по слагу проекта: для задачи и для контекста без задачи."""
     from hub.services.effective_policy import format_policy_brief
 
-    slug = ((ctx.get("task") or {}).get("project") or {}).get("slug") or ""
     if not slug:
         return ""
     try:
@@ -1993,8 +2021,23 @@ async def _policy_brief_text(ctx: dict[str, Any]) -> str:
             f"/api/projects/{urllib.parse.quote(slug, safe='')}/effective-policy"
         )
     except HubApiError as exc:
+        logging.getLogger(__name__).warning(
+            "policy brief of project %s not read: %s: %s",
+            slug,
+            type(exc).__name__,
+            exc,
+        )
         return f"\n\nполитика проекта не прочитана: {exc}"
-    return "\n\n" + "\n".join(format_policy_brief(data))
+    try:
+        return "\n\n" + "\n".join(format_policy_brief(data))
+    except (KeyError, TypeError, ValueError) as exc:
+        logging.getLogger(__name__).warning(
+            "policy brief of project %s not parsed: %s: %s",
+            slug,
+            type(exc).__name__,
+            exc,
+        )
+        return "\n\nполитика проекта не прочитана: ответ хаба не разобран"
 
 
 async def _path_brief_text(ctx: dict[str, Any]) -> str:
@@ -5162,21 +5205,21 @@ async def hub_refine_task(
     Args:
         task_id: Task to refine.
         title: New title (1–500 chars).
-        description: New statement text (≤10000); "" clears it.
-        work_type: feature | bug | refactor | chore | docs | spike | incident
-        class_of_service: standard | expedite | fixed_date | intangible
-        size: XS | S | M | L | XL
-        wip_tag: feature_work | bugfix | tech_debt | support
-        due_date: ISO date, for fixed_date COS.
+        description: Statement text; "" clears it.
+        work_type: Kind of work (a frozen project admits by type).
+        class_of_service: Kanban class of service.
+        size: T-shirt size.
+        wip_tag: WIP bucket.
+        due_date: ISO date (fixed_date).
         user_story: "As a <role>, I want <X> so that <Y>".
         problem_statement: What's broken and why.
-        outcome_metric: Which number moves, from what to what (3d -> 1d).
-        outcome_indicator: Leading signal, before the metric moves.
+        outcome_metric: Which number moves (3d -> 1d).
+        outcome_indicator: Leading signal.
         outcome_deadline: When the outcome is checked.
         outcome_revisit_condition: What reopens this decision.
         redesign_decision: adapt | redesign.
         redesign_rationale: Why that choice.
-        agent_fit: deterministic | assistant | sdd_native | agentic.
+        agent_fit: How well an agent fits.
         found_in: Defect stage: unknown | review | ci | test | staging | prod (prod: not feature).
         caused_by_task_id: Task that caused the defect.
         technical_hints: Hints, approach.
@@ -5185,13 +5228,14 @@ async def hub_refine_task(
         constraints: Hard limits.
         affected_areas: Modules/paths impacted.
         validation_commands: Commands proving it works.
-        live_probe: Read-only probe the hub runs after delivery; a registry name.
+        live_probe: Read-only probe run after delivery; a registry name.
         out_of_scope_for_review: What the reviewer ignores.
         review_checklist: What the reviewer verifies.
         human_owner: Who is accountable.
         human_reviewer: Who accepts the result.
-        acceptance_criteria: Full AC replacement (REST refine shape).
-        risks: Full replacement (TaskRisk shape).
+        freeze_rationale: Why it may enter a frozen project.
+        acceptance_criteria: Full AC replacement.
+        risks: Full replacement.
         include_task: Echo the whole task back.
     """
     # Один источник вместо двух списков. До #1068 поля были выписаны и в

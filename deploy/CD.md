@@ -243,7 +243,7 @@ envelope ответа:
 
 Ключ политики проекта `gate_policy.release_artifacts` — список пар
 `{repo_path, server_path, update_hint}`. Только точные копии: файлы-шаблоны
-(unit, env, drop-in, sudoers) законно отличаются от репо и сюда не входят.
+(unit, env, drop-in, sudoers, обёртка `deploy/review-runner/haiplane-review-run`) законно отличаются от репо и сюда не входят. `snapshot_unpack.py` — именно точная копия: это защищённый код проверки чужого tar (#1599).
 Пример для прода:
 
 ```json
@@ -253,7 +253,10 @@ envelope ответа:
    "update_hint": "ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo tee /usr/local/sbin/<SERVICE>-remote-deploy.sh >/dev/null' < deploy/remote-deploy.sh && ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo chmod 0755 /usr/local/sbin/<SERVICE>-remote-deploy.sh'"},
   {"repo_path": "deploy/review-runner/haiplane-review-runner.py",
    "server_path": "/usr/local/lib/haiplane-review-runner/haiplane-review-runner.py",
-   "update_hint": "установить файл по deploy/LOCAL-REVIEW.md и ПЕРЕЗАПУСТИТЬ службу: sudo systemctl restart haiplane-review-runner"}
+   "update_hint": "установить файл по deploy/LOCAL-REVIEW.md и ПЕРЕЗАПУСТИТЬ службу: sudo systemctl restart haiplane-review-runner"},
+  {"repo_path": "deploy/review-runner/snapshot_unpack.py",
+   "server_path": "/usr/local/lib/haiplane-review-runner/snapshot_unpack.py",
+   "update_hint": "установить root-овым файлом (0644 root:root) в тот же каталог, что и служба, по deploy/LOCAL-REVIEW.md «Выкат снимка»; проверка: python3 -I /usr/local/lib/haiplane-review-runner/haiplane-review-runner.py --check-install"}
 ]}}
 ```
 

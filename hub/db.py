@@ -2665,6 +2665,13 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_scheduled_policy_changes_due "
         "ON scheduled_policy_changes(state, at, id)",
     ),
+    (
+        # #1594: обоснование допуска работы при заморозке проекта. Отдельно от
+        # ``rationale`` (общая необходимость задачи): пустое после strip значит
+        # «обоснования нет», и заморозка такую работу не пускает.
+        "add_tasks_freeze_rationale",
+        "ALTER TABLE tasks ADD COLUMN freeze_rationale TEXT NOT NULL DEFAULT ''",
+    ),
 ]
 
 
@@ -2764,6 +2771,8 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     # #1236: имя объявленного живого зонда. Часть постановки: она говорит, что
     # именно наблюдать после доставки.
     "live_probe",
+    # #1594: обоснование допуска при заморозке проекта; чтение и запись.
+    "freeze_rationale",
     "risks",
     "prepared_by",
     "prepared_at",

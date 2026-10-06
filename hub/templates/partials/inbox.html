@@ -87,7 +87,7 @@
            said about the other two, is its own lie. The reasons already existed
            in BatchApproveResult; the old handler threw the result away. #}
         <div class="inbox-batch-skipped">Пропущено: {{ batch_result.skipped|length }}.
-            {% for s in batch_result.skipped %}<span class="badge badge-failed">#{{ s.task_id }}: {{ s.reason }}</span> {% endfor %}
+            {% for s in batch_result.skipped %}<span class="badge badge-failed">#{{ s.task_id }}: {{ s.reason }}{% if s.detail %} — {{ s.detail }}{% endif %}</span> {% endfor %}
         </div>
         {% endif %}
     </div>
