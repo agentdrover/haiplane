@@ -181,30 +181,41 @@ uv run ruff check hub tests
 Ручной путь идёт тем же скриптом, что и авто-деплой, — самостоятельной
 последовательности `pip install -e` и restart здесь больше нет (#1620): она не
 знала про drain (#1588), снимок базы (#1590) и ставила зависимости с
-разрешением версий, мимо `uv.lock`. Запускать из корня локального репозитория
-**на коммите, который выкатывается** (нужен `uv` версии из
-`.github/workflows/ci.yml`, сейчас 0.12.18, и Python 3.11):
+разрешением версий, мимо `uv.lock`. Локальный этап — **один скрипт под
+`set -euo pipefail`**, а не набор команд для копирования: ошибка
+`uv lock --check` или любого экспорта обрывает его ДО rsync и до серверной
+части (в интерактивном shell отдельные команды шли бы дальше и отправили бы
+экспорт по неактуальному lock). Нужны `uv` версии из `.github/workflows/ci.yml`
+(сейчас 0.12.18), Python 3.11 и `DEPLOY_USER`, `DEPLOY_HOST` в окружении
+(`STAGING_DIR`, `SSH_OPTS` — по необходимости). Из корня репозитория **на
+коммите, который выкатывается**:
 
 ```bash
-# 1. Экспорты из uv.lock того же коммита: ровно то, что делает job deploy.
-uv lock --check
-uv export --frozen --no-dev --no-emit-project --format requirements-txt --no-header -o requirements.runtime.txt
-uv export --frozen --only-group build --no-emit-project --format requirements-txt --no-header -o requirements.build.txt
-git rev-parse HEAD > .deploy-sha
-
-# 2. Дерево с экспортами в staging.
-rsync -az --delete \
-  --exclude '.venv' \
-  --exclude '__pycache__' \
-  --exclude '.pytest_cache' \
-  --exclude '*.pyc' \
-  --exclude '.git' \
-  <LOCAL_REPO>/ \
-  <DEPLOY_USER>@<DEPLOY_HOST>:<STAGING_DIR>/
-
-# 3. Серверная часть — канонический скрипт.
-ssh <DEPLOY_USER>@<DEPLOY_HOST> 'bash -s' < deploy/remote-deploy.sh
+scripts/manual_deploy.sh
 ```
+
+Скрипт делает ровно то же, что job `deploy`: `uv lock --check`, два
+хешированных экспорта, сборка дерева staging с `.deploy-sha`, rsync и
+`ssh ... 'bash -s' < deploy/remote-deploy.sh`.
+
+**Откат на коммит до #1620.** У такого коммита нет группы `build` в `uv.lock`
+(`uv export --only-group build` падает: «Group build is not defined»), а его
+собственный `remote-deploy.sh` ставил бы зависимости с разрешением версий. Поэтому
+старый коммит выкатывается ТЕКУЩИМ скриптом и ТЕКУЩИМ build-набором:
+
+```bash
+# из актуального чекаута (канонические скрипты и build-набор берутся отсюда)
+uv export --frozen --only-group build --no-emit-project --format requirements-txt --no-header -o /tmp/requirements.build.txt
+git worktree add /tmp/rollback-tree <старый-коммит>      # отдельный каталог
+scripts/manual_deploy.sh --build-set /tmp/requirements.build.txt /tmp/rollback-tree
+```
+
+Runtime-набор скрипт экспортирует из lock старого коммита; hatchling и editables
+с хешами берутся из переданного файла (совместимый набор из текущего lock);
+`remote-deploy.sh`, `review-drain.sh` и `predeploy-backup.py` в staging заменяются
+каноническими, поэтому drain, снимок базы и установка без разрешения зависимостей
+сохраняются. Без `--build-set` для такого дерева скрипт отказывает до rsync.
+Для коммитов после #1620 флаг не нужен.
 
 Порядок на сервере: проверка `requirements.runtime.txt`, `requirements.build.txt`
 и `uv.lock` в staging (нет файла — отказ до любых изменений) → drain → снимок
@@ -219,8 +230,9 @@ M, build K) по экспортам sha256 … из uv.lock sha256 …` в ло�
 > restart: работающий процесс остаётся прежним. pip не транзакционен, поэтому
 > исходники в `/opt/<SERVICE>/src` и venv **могут быть изменены частично**;
 > автоматического отката нет. Откат — прогон этого же пути для предыдущего
-> коммита: экспорты из ЕГО `uv.lock`, rsync, `bash -s < deploy/remote-deploy.sh`
-> (скрипт поставит ЕГО наборы). Пакеты, которые уже стоят в venv и не входят в
+> коммита тем же `scripts/manual_deploy.sh` (для коммита до #1620 — с
+> `--build-set`, см. выше): он возьмёт экспорт из ЕГО `uv.lock` и поставит ЕГО
+> runtime-набор. Пакеты, которые уже стоят в venv и не входят в
 > набор, не удаляются. Обхода нет: переменной, возвращающей `pip install -e` с
 > разрешением зависимостей, не существует, а неверные хеши не обходятся.
 >
