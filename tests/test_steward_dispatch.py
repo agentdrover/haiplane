@@ -2826,10 +2826,18 @@ async def test_advisor_ordered_once_by_actual_judge_family(
     from hub.services.steward_advisor import order_due_advisors
 
     monkeypatch.setattr(config, "STEWARD_MODEL", "gpt-5.3-codex")
+    # gemini стоит ПЕРЕД gpt: выбранный советник не равен ни настройке судьи, ни
+    # своему «умолчанию», и заказ обязан нести именно выбор по семействам.
     monkeypatch.setattr(
         config,
         "STEWARD_ADVISOR_MODELS",
-        ("composer-2.5", "claude-sonnet-5", "grok-4.5", "gpt-5.3-codex"),
+        (
+            "composer-2.5",
+            "claude-sonnet-5",
+            "grok-4.5",
+            "gemini-3.1-pro",
+            "gpt-5.3-codex",
+        ),
     )
     approved = await _approved_by_the_judge(
         db, "advisor-order", judge_model="composer-2.5"
@@ -2858,7 +2866,8 @@ async def test_advisor_ordered_once_by_actual_judge_family(
         f"советник {order['model']} из семейства {taken}: исполнитель claude, "
         "ревьюер grok, судья composer"
     )
-    assert order["model"] == "gpt-5.3-codex"
+    assert order["model"] == "gemini-3.1-pro"
+    assert order["model"] != config.STEWARD_MODEL
     assert order["model"] in config.SUBSCRIPTION_LAUNCHABLE_MODELS
     ordered_events = [
         json.loads(e["payload"])
@@ -2867,7 +2876,7 @@ async def test_advisor_ordered_once_by_actual_judge_family(
         and json.loads(e["payload"]).get("kind") == "advisor"
     ]
     assert len(ordered_events) == 1
-    assert ordered_events[0]["model"] == "gpt-5.3-codex"
+    assert ordered_events[0]["model"] == "gemini-3.1-pro"
 
     assert await _advisor_rows(db, returned) == [], "на возврат судьи советник не нужен"
     assert await _advisor_rows(db, escalated) == [], "на эскалацию судьи — тоже"
@@ -3062,6 +3071,31 @@ async def test_the_advisor_is_not_ordered_with_the_contour_off(
 
     assert await order_due_advisors(db) == 0
     assert await _advisor_rows(db, task_id) == []
+
+
+async def test_with_the_contour_off_nothing_is_ordered_nor_refused(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Контур выключен — ни заказа, ни строки отказа, ни события «steward_off».
+
+    Даже там, где семейство подобрать нельзя: закрывать генерацию отказом,
+    когда диспетчер закрыт, значило бы запереть слот навсегда по выключенному
+    рубильнику.
+    """
+    from hub.services.steward_advisor import order_due_advisors
+
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_MODELS", ("claude-sonnet-5",))
+    task_id = await _approved_by_the_judge(
+        db, "advisor-off-nofamily", judge_model="composer-2.5"
+    )
+    monkeypatch.setattr(config, "STEWARD_MODE", "off")
+
+    assert await order_due_advisors(db) == 0
+
+    assert await _advisor_rows(db, task_id) == []
+    assert [
+        e for e in await _events(db, EVENT_REFUSED) if e["task_id"] == task_id
+    ] == []
 
 
 async def test_an_old_contour_approve_is_not_given_an_advisor(

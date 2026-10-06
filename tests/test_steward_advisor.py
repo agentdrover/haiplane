@@ -61,6 +61,7 @@ from tests.test_steward_shadow import (
     _pair_on_packet,
     _project,
     _runs,
+    _same_packet,
     _task,
 )
 
@@ -405,6 +406,27 @@ async def test_the_four_states_of_the_advisor(db: aiosqlite.Connection):
     assert (await advisor_state(db, timed_out, 1)).state == STATE_TIMEOUT
 
 
+async def test_an_empty_hash_is_never_consent_even_if_the_packet_hashes_to_nothing(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Пустой хеш судьи и советника — не «они читали одно и то же».
+
+    Пусто значит «пакет прогону не выдавали». Если бы сегодняшний пакет тоже
+    дал пустое, три пустоты сошлись бы в согласие — поэтому пустое проверяется
+    само по себе, раньше сравнения.
+    """
+    task_id = await _in_review(db, "advisor-empty-hash")
+    await _judge_run(db, task_id, packet="")
+    await _judge(db, task_id)
+    await _advisor_run(db, task_id, packet="")
+    await _advise(db, task_id)
+    _same_packet(monkeypatch, "")
+
+    refusal = await advisor_refusal(db, task_id, 1)
+
+    assert refusal is not None and "не привязано к пакету" in refusal[1]
+
+
 async def test_an_answer_not_bound_to_this_approve_is_not_received(
     db: aiosqlite.Connection,
 ):
@@ -550,6 +572,52 @@ async def test_an_order_with_nothing_to_answer_is_closed_not_started(
     assert run["status"] == "refused"
 
 
+async def test_an_order_without_a_judge_approve_is_not_started(
+    db: aiosqlite.Connection, delivery_kinds
+):
+    """Заказ советника при суждении судьи «вернуть» не стартует: отвечать не на что."""
+    task_id, order = await _ordered_advisor(db, "advisor-no-approve")
+    await db.execute(
+        "UPDATE steward_judgements SET verdict='changes_requested' "
+        "WHERE task_id=? AND kind='verdict'",
+        (task_id,),
+    )
+    await db.commit()
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
+    ) as started:
+        assert await sh.start_due_runs(db) == 0
+
+    assert started.await_count == 0
+    run = [r for r in await _runs(db, task_id) if r["kind"] == KIND_ADVISOR][0]
+    assert run["status"] == "refused"
+
+
+async def test_a_stale_order_cannot_buy_a_second_advisor_run(
+    db: aiosqlite.Connection, delivery_kinds
+):
+    """Два тика с одним и тем же прочитанным заказом — провайдер зовётся один раз.
+
+    Захват слота — условный UPDATE по пустому ``agent_id``: тик, прочитавший
+    заказ до захвата соседа, захватить его второй раз не может. Здесь «второй
+    тик» — повторный вызов старта с устаревшей копией строки заказа.
+    """
+    from hub.services.steward_advisor import start_advisor_run
+
+    task_id, order = await _ordered_advisor(db, "advisor-race")
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
+    ) as started:
+        assert await start_advisor_run(db, dict(order)) is True
+        assert await start_advisor_run(db, dict(order)) is False
+
+    assert started.await_count == 1
+
+
 async def test_a_missing_configuration_keeps_the_advisor_order_open(
     db: aiosqlite.Connection, delivery_kinds, monkeypatch
 ):
@@ -576,8 +644,10 @@ async def test_a_provider_that_does_not_answer_keeps_the_order_for_the_next_tick
     with patch(
         "hub.integrations.cursor_cloud.create_agent_attempt",
         new=AsyncMock(return_value=(None, cursor_cloud.Refusal(detail="обрыв"))),
-    ):
+    ) as started:
         assert await sh.start_due_runs(db) == 0
+
+    assert started.await_count == 1, "обрыв связи не повод менять советника"
 
     run = [r for r in await _runs(db, task_id) if r["kind"] == KIND_ADVISOR][0]
     assert run["status"] == RUN_OPEN and run["agent_id"] == ""
@@ -920,6 +990,96 @@ async def test_a_human_verdict_that_came_first_is_left_alone(
         if e["task_id"] == task_id
     ]
     assert [e["actor"] for e in events] == ["denis"]
+
+
+async def test_a_process_that_died_mid_apply_is_not_retried(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Процесс умер между занятием метки и записью исхода — повторного применения нет.
+
+    Метка остаётся ``applying``: задача идёт человеческим маршрутом, а не
+    получает второй вердикт стюарда после рестарта. ``BaseException`` — потому
+    что отмена и смерть процесса ``except Exception`` не ловит.
+    """
+    from hub.services import steward_applied
+
+    class _Died(BaseException):
+        pass
+
+    await _act(monkeypatch)
+    task_id = await _scenario(db, "advisor-died", "concur")
+    calls = 0
+
+    async def _die(_db, _task_id, _generation):
+        nonlocal calls
+        calls += 1
+        raise _Died
+
+    monkeypatch.setattr(steward_applied, "apply_self_approval", _die)
+    with pytest.raises(_Died):
+        await apply_advisor_outcomes(db)
+    assert (await _judge_row(db, task_id))["advisor_outcome"] == "applying"
+
+    assert await apply_advisor_outcomes(db) == 0, "после рестарта повтора нет"
+    assert calls == 1
+    assert await _no_verdict(db, task_id)
+
+
+async def test_the_claim_is_atomic_against_a_neighbour_that_took_it_first(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Сосед занял метку между чтением строк и нашим занятием — мы не применяем.
+
+    Условие ``advisor_outcome=''`` стоит в самом UPDATE, а не только в выборке:
+    выборка устаревает к следующей строке кода.
+    """
+    from hub.services import steward_advisor, steward_applied
+
+    await _act(monkeypatch)
+    await _scenario(db, "advisor-claim-race", "concur")
+    real_state = steward_advisor.advisor_state
+    applied: list[int] = []
+
+    async def _neighbour_wins(db_, task, generation):
+        await db_.execute(
+            "UPDATE steward_judgements SET advisor_outcome='approved' "
+            "WHERE task_id=? AND kind='verdict'",
+            (task,),
+        )
+        await db_.commit()
+        return await real_state(db_, task, generation)
+
+    async def _spy(_db, task, _generation):
+        applied.append(task)
+        return None
+
+    monkeypatch.setattr(steward_advisor, "advisor_state", _neighbour_wins)
+    monkeypatch.setattr(steward_applied, "apply_self_approval", _spy)
+
+    assert await apply_advisor_outcomes(db) == 0
+
+    assert applied == [], "метку занял сосед — применять нам нельзя"
+
+
+async def test_a_verdict_already_on_the_row_keeps_the_poller_away(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Вердикт на это поколение уже стоит, а задача ещё в review — не применять.
+
+    Статус не всегда успевает уйти из review, и «человек старше» держится на
+    самом вердикте, а не на статусе: выборка шага применения его читает.
+    """
+    await _act(monkeypatch)
+    await _patched_converged(monkeypatch)
+    task_id = await _scenario(db, "advisor-verdict-on-row", "concur")
+    await repo.update_task(
+        db, task_id, review_verdict="changes_requested", review_verdict_generation=1
+    )
+    await db.commit()
+
+    assert await apply_advisor_outcomes(db) == 0
+
+    assert (await _judge_row(db, task_id))["advisor_outcome"] == ""
 
 
 async def test_the_claim_is_taken_before_the_apply(
