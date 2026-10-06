@@ -1132,7 +1132,15 @@ async def _generation_submitted_at(
     )
     if not rows:
         return None
-    return _parse_dispatch_created(str(dict(rows[0]).get("submitted_at") or ""))
+    text = str(dict(rows[0]).get("submitted_at") or "").strip()[:19]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    # Пустая или нечитаемая отметка — «неизвестно», а не «сейчас»: иначе
+    # ожидание начиналось бы заново на каждом тике и потолок не достигался.
+    return None
 
 
 async def _pending_or_terminal_after_orders(
@@ -1154,7 +1162,16 @@ async def _pending_or_terminal_after_orders(
         last = dict(rows[0])
         status = str(last.get("status") or "")
         if status == "failed" and await dispatcher.ask_again_scheduled(db, last):
-            return ReviewWait(WAIT_PENDING, "", "заказ ревью упал, переспрос назначен")
+            # Переспрос идёт тем же путём, что и первый заказ, и те же тихие
+            # отказы остановят и его: красный CI, прочитанный код, несходимость.
+            refusal = await dispatcher.dispatch_refusal(
+                db, task, project, read_only=True
+            )
+            if refusal:
+                return _wait_terminal(refusal, f"переспрос ревью не купят: {refusal}")
+            return ReviewWait(
+                WAIT_PENDING, "", "заказ ревью упал, переспрос назначен или готовится"
+            )
         if status == "failed":
             return _wait_terminal(
                 TERMINAL_FAILED_NO_RETRY,
@@ -1173,7 +1190,7 @@ async def _pending_or_terminal_after_orders(
             TERMINAL_NOT_DISPATCHABLE,
             "у сдачи нет ветки или закреплённого коммита — ревью не закажут",
         )
-    refusal = await dispatcher.dispatch_refusal(db, task, project)
+    refusal = await dispatcher.dispatch_refusal(db, task, project, read_only=True)
     if refusal:
         return _wait_terminal(
             refusal, f"диспетчер ревью отказал без строки заказа: {refusal}"

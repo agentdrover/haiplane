@@ -756,12 +756,38 @@ async def hold_start_for_review(
     if not gate.blocker:
         return False
     await _defer(db, int(order["task_id"]), int(order["generation"]), gate.blocker)
+    await _push_start_deadline(db, int(order["id"]))
+    return True
+
+
+async def _push_start_deadline(db: aiosqlite.Connection, run_id: int) -> None:
+    """Сдвинуть окно ожидания старта у открытого заказа, не взявшего слот."""
     await db.execute(
         "UPDATE steward_runs SET deadline_at=datetime('now', ?) "
         "WHERE id=? AND agent_id='' AND status=?",
-        (f"+{config.STEWARD_START_DEADLINE_MIN} minutes", order["id"], RUN_OPEN),
+        (f"+{config.STEWARD_START_DEADLINE_MIN} minutes", run_id, RUN_OPEN),
     )
     await db.commit()
+
+
+async def _waits_for_review(
+    db: aiosqlite.Connection, run: dict[str, Any], task: dict[str, Any]
+) -> bool:
+    """Просроченный неначатый слот ждёт отчёта ревью — и закрывать его рано (#1600).
+
+    Закрытие неначатого слота — never_started, и оно запирает поколение
+    навсегда (UNIQUE по заказу). Пока отчёт положен и ещё может прийти, а
+    потолок STEWARD_REVIEW_WAIT_MAX не вышел, слот живёт: окно сдвигается тем
+    же приёмом, что у отсрочки старта. Спрашивается ДО закрытия, потому что
+    sweep закрывает раньше, чем стартует, и поллер, простоявший дольше окна,
+    иначе терял бы сдачу ещё до того, как страж старта её увидел.
+    """
+    if not task or run.get("kind", KIND_VERDICT) != KIND_VERDICT:
+        return False
+    gate = await review_wait_gate(db, task)
+    if not gate.blocker:
+        return False
+    await _push_start_deadline(db, int(run["id"]))
     return True
 
 
@@ -1028,6 +1054,12 @@ async def close_finished_runs(db: aiosqlite.Connection) -> int:
             "SELECT 1 FROM steward_runs WHERE id=? AND deadline_at <= datetime('now')",
             (run["id"],),
         )
+        if (
+            overdue
+            and not run_has_started(run)
+            and await _waits_for_review(db, run, task)
+        ):
+            continue
         if overdue:
             # Два исхода, а не один. Прогон, который работал и не ответил, и
             # заказ, который не начался вовсе, — разные события, и запись

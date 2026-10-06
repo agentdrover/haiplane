@@ -2772,6 +2772,8 @@ async def dispatch_refusal(
     project: Any,
     force_profile: str = "",
     force_model: str = "",
+    *,
+    read_only: bool = False,
 ) -> str:
     """Какой тихий отказ диспетчера стоит перед заказом, или "" если его нет.
 
@@ -2783,8 +2785,12 @@ async def dispatch_refusal(
 
     Одно определение на двух читателей: диспетчер (maybe_dispatch_review) и
     судья стюарда. Копия условий у второго разошлась бы в сторону «ждать».
-    Побочные записи у вызова те же, что у диспетчера, и каждая однократна
-    (_say_once, метки): ранний вызов их не удваивает.
+    ``read_only=True`` — для читателя ожидания судьи стюарда (#1600): те же
+    три условия, но без записей в ленту, без события несходимости и без
+    переноса отчёта (``ci_forbids_review``, ``_convergence_stopped``,
+    ``_carry_source``). Пишет и переносит только сам диспетчер. Перенос
+    отчёта, который диспетчер ещё сделает, для читателя не отказ: отчёт
+    вот-вот появится, и судья подождёт его.
 
     Расходятся входы на доборе: политику он спрашивает (выключенный контур
     выключен и для лестницы), а проверку новизны — нет, потому что она
@@ -2800,7 +2806,10 @@ async def dispatch_refusal(
     # Стоит ДО добора: лестница, вторая ось (#1243) и переспрос (#1242) идут
     # сюда же и обойти условие не должны. Отказ называет в карточке сам
     # review_may_be_bought; отчёта нет — заказ идёт, как до задачи.
-    if not await review_ci_gate.review_may_be_bought(db, task, project):
+    if read_only:
+        if await review_ci_gate.ci_forbids_review(db, task):
+            return REFUSAL_RED_CI
+    elif not await review_ci_gate.review_may_be_bought(db, task, project):
         return REFUSAL_RED_CI
     if force_profile:
         # Добор лестницы #879 проверку новизны не проходит и не должен: её
@@ -2814,14 +2823,21 @@ async def dispatch_refusal(
         # называет себя сам, поэтому для _name_the_missing_reviewer он тихий.
         stopped = await _forced_deep_past_circle(db, task, force_profile, force_model)
         return REFUSAL_FORCED_DEEP if stopped else ""
-    if await _this_code_was_already_read(db, task):
+    if read_only:
+        if await _report_already_covers_this_sha(db, task):
+            return REFUSAL_CODE_ALREADY_READ
+    elif await _this_code_was_already_read(db, task):
         return REFUSAL_CODE_ALREADY_READ
     # #1255: третий тихий отказ той же природы — новое чтение уже не купит
     # ничего нового, потому что находки перестали убывать. Стоит ПОСЛЕ
     # проверки новизны: повтор того же кода — её вопрос, а здесь код менялся.
     # Добор выше сюда не доходит намеренно: он дочитывает УЖЕ оплаченное
     # поколение, а не покупает следующее.
-    return REFUSAL_NOT_CONVERGING if await findings_stopped_converging(db, task) else ""
+    if read_only:
+        stopped = (await _convergence_stopped(db, task))[0]
+    else:
+        stopped = await findings_stopped_converging(db, task)
+    return REFUSAL_NOT_CONVERGING if stopped else ""
 
 
 async def _policy_and_novelty_allow(
@@ -3086,6 +3102,38 @@ async def _latest_full_report(
     return dict(rows[0]) if rows else None
 
 
+async def _carry_source(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[dict[str, Any], str] | None:
+    """Отчёт, который можно перенести на эту пересдачу, и основание. Только чтение.
+
+    Отдельно от записи (#1600): читатель ожидания судьи стюарда спрашивает
+    «перенесёт ли диспетчер», но не переносит сам.
+    """
+    from hub.services.orchestration import (
+        base_merge_kept_the_verdict,
+        report_has_evidence,
+    )
+
+    pinned = (task.get("submission_sha") or "").strip()
+    generation = int(task.get("submission_generation") or 0)
+    source = await _latest_full_report(db, int(task["id"]), generation)
+    if (
+        not pinned
+        or source is None
+        or bool(source.get("incomplete"))
+        or not report_has_evidence(source)
+        or not (source.get("sha") or "").strip()
+    ):
+        return None
+    same, why = await base_merge_kept_the_verdict(
+        db, task, source["sha"].strip(), pinned
+    )
+    if not same:
+        return None
+    return source, why
+
+
 async def _carry_the_report_over(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> bool:
@@ -3108,27 +3156,11 @@ async def _carry_the_report_over(
     Копия нужна, а не одна запись в ленте: гейт и стюард спрашивают отчёт
     ТЕКУЩЕГО поколения и без него встали бы на «machine-review устарел».
     """
-    from hub.services.orchestration import (
-        base_merge_kept_the_verdict,
-        report_has_evidence,
-    )
-
-    pinned = (task.get("submission_sha") or "").strip()
+    found = await _carry_source(db, task)
+    if found is None:
+        return False
+    source, why = found
     generation = int(task.get("submission_generation") or 0)
-    source = await _latest_full_report(db, int(task["id"]), generation)
-    if (
-        not pinned
-        or source is None
-        or bool(source.get("incomplete"))
-        or not report_has_evidence(source)
-        or not (source.get("sha") or "").strip()
-    ):
-        return False
-    same, why = await base_merge_kept_the_verdict(
-        db, task, source["sha"].strip(), pinned
-    )
-    if not same:
-        return False
     root = int(source.get("carried_from_review_id") or source["id"])
     carried = await repo.insert_machine_review(
         db,
@@ -6536,8 +6568,8 @@ ASK_AGAIN_EXHAUSTED_MARK = "[переспрос ревью исчерпан: с�
 def ask_again_exhausted(asked: int, retried: int) -> bool:
     """Переспрос кончился: потолок, или прошлая попытка не оставила заказа.
 
-    Одно правило на двоих (#1600): переспрос решает им, ставить ли ещё один,
-    а судья стюарда — ждать ли ещё того, что переспрос принесёт.
+    Решает, ставить ли ещё один. Судья стюарда (#1600) читает то же состояние
+    через ``ask_again_scheduled``, но различает «готовится» и «отказан».
     """
     return asked >= REVIEW_ASK_AGAIN_MAX or asked > retried
 
@@ -6546,7 +6578,16 @@ async def ask_again_scheduled(db: aiosqlite.Connection, failed: dict[str, Any]) 
     """Придёт ли ещё переспрос по этому упавшему заказу (#1242, #1600).
 
     Кандидат переспроса — последний заказ поколения, облачный и упавший
-    (``_ask_again_lost_reviews``); отчёта поколения нет; потолок не выбран.
+    (``_ask_again_lost_reviews``); отчёта поколения нет. Три исхода:
+
+    * назван исчерпанным (``ASK_AGAIN_EXHAUSTED_MARK``) — окончательно нет;
+    * попытка записана, а заказа за ней ещё нет (``asked > retried``) —
+      переспрос ГОТОВИТСЯ: ``_ask_again`` пишет метку и коммитит её ДО
+      подготовки заказа, и в этом окне попытка не окончательно отказана.
+      Окончательный отказ назовёт следующий проход — меткой исчерпания. Ждущий
+      здесь ограничен потолком судьи, не вечен;
+    * иначе — пока не выбран потолок попыток.
+
     Пауза до переспроса сюда не входит: переспрос, который случится через
     десять минут, — всё ещё назначенный.
     """
@@ -6556,11 +6597,15 @@ async def ask_again_scheduled(db: aiosqlite.Connection, failed: dict[str, Any]) 
     generation = int(failed["submission_generation"])
     if await repo.machine_reviews_of_generation(db, task_id, generation):
         return False
+    if await _count_marked_alerts(
+        db, task_id, ASK_AGAIN_EXHAUSTED_MARK.format(generation=generation)
+    ):
+        return False
     asked = await _count_marked_alerts(
         db, task_id, ASK_AGAIN_MARK.format(generation=generation)
     )
     retried = await _count_retry_orders(db, task_id, generation)
-    return not ask_again_exhausted(asked, retried)
+    return asked > retried or asked < REVIEW_ASK_AGAIN_MAX
 
 
 async def _ask_again_lost_reviews(db: aiosqlite.Connection) -> None:
@@ -7312,6 +7357,24 @@ def _non_convergence_answered(task: dict[str, Any], asked: tuple[int, int]) -> b
     )
 
 
+async def _convergence_stopped(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> tuple[bool, FindingTrajectory | None]:
+    """(остановлен ли прогон, траектория, если условие сработало ЗДЕСЬ). Чтение.
+
+    Траектория не None только когда вопрос ещё не задавался и условие
+    сработало на этой сдаче: ровно тогда писать вопрос в карточку должен
+    диспетчер. Читатель ожидания судьи (#1600) берёт только первый элемент.
+    """
+    task_id = int(task["id"])
+    asked = await _non_convergence_asked(db, task_id)
+    if asked is not None:
+        return not _non_convergence_answered(task, asked), None
+    generation = int(task.get("submission_generation") or 0)
+    trajectory = await finding_trajectory(db, task_id, generation)
+    return trajectory.fires_now(), trajectory
+
+
 async def findings_stopped_converging(
     db: aiosqlite.Connection, task: dict[str, Any]
 ) -> bool:
@@ -7323,13 +7386,12 @@ async def findings_stopped_converging(
     круги продолжаются, это решение человека, а не хаба.
     """
     task_id = int(task["id"])
-    asked = await _non_convergence_asked(db, task_id)
-    if asked is not None:
-        return not _non_convergence_answered(task, asked)
-    generation = int(task.get("submission_generation") or 0)
-    trajectory = await finding_trajectory(db, task_id, generation)
-    if not trajectory.fires_now():
+    stopped, trajectory = await _convergence_stopped(db, task)
+    if trajectory is None:
+        return stopped
+    if not stopped:
         return False
+    generation = int(task.get("submission_generation") or 0)
     mark = NON_CONVERGENCE_MARK.format(
         generation=generation, statement=int(task.get("statement_generation") or 0)
     )

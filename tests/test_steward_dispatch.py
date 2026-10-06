@@ -2193,24 +2193,26 @@ async def test_each_other_terminal_review_outcome_orders_a_run(
     """
     from hub.services import review_dispatch as dispatcher
 
-    async def _yes(_db, _task):
-        return True
-
     _, read = await _due_task(db, "terminal-already-read")
     _, converge = await _due_task(db, "terminal-converging")
     project_id = await _project(db, "terminal-no-branch", steward=True)
     no_branch = await _submitted_task(db, project_id)
 
-    async def _only(target):
+    def _only(target):
+        # Читатель ожидания спрашивает read-only версии тех же предикатов.
         async def _read(_db, task):
             return task["id"] == target
 
         return _read
 
-    monkeypatch.setattr(dispatcher, "_this_code_was_already_read", await _only(read))
-    monkeypatch.setattr(
-        dispatcher, "findings_stopped_converging", await _only(converge)
-    )
+    def _converging(target):
+        async def _stopped(_db, task):
+            return task["id"] == target, None
+
+        return _stopped
+
+    monkeypatch.setattr(dispatcher, "_report_already_covers_this_sha", _only(read))
+    monkeypatch.setattr(dispatcher, "_convergence_stopped", _converging(converge))
 
     assert await order_due_runs(db) == 3
     reasons = {}
@@ -2252,31 +2254,81 @@ async def test_the_wait_ceiling_counts_from_the_first_deferral_without_a_submiss
 async def test_a_start_deferred_for_the_review_keeps_its_slot_alive(
     db: aiosqlite.Connection, monkeypatch
 ):
-    """#1600: отсрочка старта сдвигает окно ожидания слота.
+    """#1600 круг 2, п. 2: просроченный слот переживает НАСТОЯЩИЙ проход поллера.
 
-    Окно ожидания возможности стартовать — 30 минут, потолок ожидания отчёта
-    — 120. Без сдвига слот закрылся бы never_started посреди ожидания и
-    запер поколение навсегда: по отчёту стартовать было бы уже нечему.
+    sweep_steward_runs сначала закрывает просроченные слоты и только потом
+    стартует. Поллер, простоявший дольше окна ожидания старта (30 минут),
+    закрыл бы заказ never_started раньше, чем страж старта его увидел, и
+    после отчёта заказывать было бы уже нечего — поколение заперто. Тест
+    идёт через sweep_steward_runs в его порядке вызовов, а не зовёт старт
+    сам перед закрытием.
     """
-    from hub.services import steward_shadow as sh
+    from unittest.mock import AsyncMock, patch
+
+    from hub.services.steward_dispatch import sweep_steward_runs
 
     _start_env(monkeypatch)
     task_id, run = await _start_ready_order(db, "start-deferral-deadline")
     await db.execute("DELETE FROM review_dispatches WHERE task_id=?", (task_id,))
     await _dispatch(db, task_id, status="active", channel="cloud", model="grok-4.6")
     await db.execute(
-        "UPDATE steward_runs SET deadline_at=datetime('now', '-1 minutes') WHERE id=?",
+        "UPDATE steward_runs SET deadline_at=datetime('now', '-45 minutes') WHERE id=?",
+        (run["id"],),
+    )
+    await db.commit()
+    created = {"agent": {"id": "agent-1"}, "run": {"id": "run-1"}}
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(created, None)),
+    ) as provider:
+        await sweep_steward_runs(db)
+        row = dict(
+            (await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],)))[
+                0
+            ]
+        )
+        assert row["status"] == RUN_OPEN, row["closed_reason"]
+        assert row["agent_id"] == ""
+        assert provider.await_count == 0
+
+        await _report(db, task_id)
+        await sweep_steward_runs(db)
+
+    assert provider.await_count == 1, "после отчёта тот же заказ обязан стартовать"
+    row = dict(
+        (await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],)))[0]
+    )
+    assert row["agent_id"] == "agent-1"
+
+
+async def test_a_overdue_slot_is_still_closed_when_the_review_wait_is_over(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1600 круг 2: продление слота ограничено потолком, а не вечное."""
+    _start_env(monkeypatch)
+    monkeypatch.setattr(config, "STEWARD_REVIEW_WAIT_MAX", 0)
+    task_id, run = await _start_ready_order(db, "overdue-after-ceiling")
+    await db.execute("DELETE FROM review_dispatches WHERE task_id=?", (task_id,))
+    await _dispatch(db, task_id, status="active", channel="cloud", model="grok-4.6")
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now', '-45 minutes') WHERE id=?",
         (run["id"],),
     )
     await db.commit()
 
-    assert await sh.start_due_runs(db) == 0
-    assert await close_finished_runs(db) == 0
+    from unittest.mock import AsyncMock, patch
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(None, None)),
+    ):
+        await close_finished_runs(db)
 
     row = dict(
         (await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],)))[0]
     )
-    assert row["status"] == RUN_OPEN
+    assert row["status"] == RUN_NEVER_STARTED
 
 
 async def test_a_cloud_review_whose_ask_again_is_spent_is_terminal(
@@ -2290,6 +2342,7 @@ async def test_a_cloud_review_whose_ask_again_is_spent_is_terminal(
     ожидание (проверяется в AC-3), здесь — две формы исчерпания.
     """
     from hub.services.review_dispatch import (
+        ASK_AGAIN_EXHAUSTED_MARK,
         ASK_AGAIN_MARK,
         REVIEW_ASK_AGAIN_MAX,
     )
@@ -2306,11 +2359,16 @@ async def test_a_cloud_review_whose_ask_again_is_spent_is_terminal(
         await repo.add_task_update(
             db, spent, "hub", "alert", ASK_AGAIN_MARK.format(generation=1) + " повтор"
         )
-    # Вторая форма: попытка записана, а заказа за ней нет (слепой исход #1199).
+    # Вторая форма: попытка записана, заказа за ней нет (слепой исход #1199),
+    # и следующий проход назвал переспрос исчерпанным. Пока не назвал —
+    # попытка может ещё готовиться, и это ожидание (отдельный тест).
     _, blind = await _due_task(db, "ask-again-blind")
     await _dispatch(db, blind, status="failed", channel="cloud")
     await repo.add_task_update(
         db, blind, "hub", "alert", ASK_AGAIN_MARK.format(generation=1) + " повтор"
+    )
+    await repo.add_task_update(
+        db, blind, "hub", "alert", ASK_AGAIN_EXHAUSTED_MARK.format(generation=1)
     )
     await db.commit()
 
@@ -2338,3 +2396,135 @@ async def test_a_review_the_project_does_not_ask_for_is_not_waited_for(
 
     assert await order_due_runs(db) == 1
     assert await _events(db, EVENT_DEFERRED) == []
+
+
+async def _counts(db: aiosqlite.Connection) -> tuple[int, int, int]:
+    out = []
+    for table in ("events", "task_updates", "machine_reviews"):
+        rows = await fetchall(db, f"SELECT COUNT(*) AS n FROM {table}")  # nosec B608
+        out.append(int(dict(rows[0])["n"]))
+    return out[0], out[1], out[2]
+
+
+async def test_the_wait_reader_does_not_write(db: aiosqlite.Connection, monkeypatch):
+    """#1600 круг 2, п. 3: review_wait_view только читает.
+
+    Диспетчер ревью пишет события и алерты (отчёт CI не пришёл, красный CI,
+    несходимость находок) и переносит отчёты. Читатель, зовущий те же
+    предикаты, не вправе делать это раньше диспетчера: перенос из читателя
+    рождал две копии одного отчёта в поколении.
+    """
+    from hub.services import review_dispatch as dispatcher
+    from hub.services.review_evidence import review_wait_view
+
+    async def _never(*_a, **_k):
+        raise AssertionError("читатель позвал записывающий путь диспетчера")
+
+    monkeypatch.setattr(dispatcher, "_carry_the_report_over", _never)
+    monkeypatch.setattr(dispatcher, "_this_code_was_already_read", _never)
+    monkeypatch.setattr(dispatcher, "findings_stopped_converging", _never)
+    monkeypatch.setattr(dispatcher.review_ci_gate, "review_may_be_bought", _never)
+
+    _, no_ci = await _due_task(db, "reader-no-ci")  # отчёта CI нет
+    _, red = await _due_task(db, "reader-red")
+    await _ci_red(db, red)
+    _, converge = await _due_task(db, "reader-converge")
+    monkeypatch.setattr(dispatcher, "_fires_at_last", lambda *_a, **_k: True)
+
+    before = await _counts(db)
+    for task_id in (no_ci, red, converge):
+        task = dict(await repo.get_task(db, task_id))
+        await review_wait_view(db, task)
+    assert await _counts(db) == before, "читатель ожидания изменил базу"
+
+
+async def test_a_cloud_review_being_asked_again_is_pending_not_terminal(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1600 круг 2, п. 1: переспрос, который готовится, ещё не отказан.
+
+    _ask_again коммитит метку попытки и только потом готовит заказ; в этом
+    окне попыток записано больше, чем заказов. Читатель обязан видеть
+    «готовится» (ожидание, ограниченное потолком), а не «переспроса не будет».
+    Окончательный отказ называет следующий проход меткой исчерпания — после
+    неё заказ идёт.
+    """
+    from hub.services import review_dispatch as dispatcher
+
+    _, task_id = await _due_task(db, "ask-again-preparing")
+    await _dispatch(db, task_id, status="failed", channel="cloud")
+    seen: dict[str, object] = {}
+
+    async def _preparing(conn, tid, **_k):
+        # Здесь метка попытки уже закоммичена, заказа ещё нет.
+        seen["ordered"] = await order_due_runs(conn)
+        seen["deferred"] = len(await _events(conn, EVENT_DEFERRED))
+        return True
+
+    monkeypatch.setattr(dispatcher, "maybe_dispatch_review", _preparing)
+    failed = dict(
+        (
+            await fetchall(
+                db, "SELECT * FROM review_dispatches WHERE task_id=?", (task_id,)
+            )
+        )[0]
+    )
+
+    await dispatcher._ask_again(db, failed)
+
+    assert seen == {"ordered": 0, "deferred": 1}, "судья стартовал посреди переспроса"
+    assert await open_run(db, task_id, 1) is None
+
+    # Попытка не дала заказа: следующий проход называет переспрос исчерпанным.
+    await dispatcher._ask_again(db, failed)
+    assert await order_due_runs(db) == 1
+    payload = json.loads((await _events(db, EVENT_ORDERED))[0]["payload"])
+    assert "failed_without_ask_again" in payload["why"]
+
+
+async def test_a_failed_cloud_review_with_budget_left_but_a_red_ci_is_terminal(
+    db: aiosqlite.Connection,
+):
+    """#1600 круг 2, п. 4: назначенный переспрос не скрывает отказ диспетчера.
+
+    Переспрос идёт тем же путём, что первый заказ, и красный CI его остановит:
+    ждать нечего, судья заказывается с названной причиной.
+    """
+    _, task_id = await _due_task(db, "failed-budget-red-ci")
+    await _dispatch(db, task_id, status="failed", channel="cloud")
+    await _ci_red(db, task_id)
+
+    assert await order_due_runs(db) == 1
+
+    payload = json.loads((await _events(db, EVENT_ORDERED))[0]["payload"])
+    assert "red_ci" in payload["why"]
+    assert await _events(db, EVENT_DEFERRED) == []
+
+
+async def test_an_unreadable_submission_time_does_not_restart_the_wait(
+    db: aiosqlite.Connection,
+):
+    """#1600 круг 2, п. 5: пустая или нечитаемая отметка сдачи — не «сейчас».
+
+    Иначе начало ожидания сдвигалось бы на каждый тик, и потолок был
+    недостижим — вечная отсрочка. Работает запасной отсчёт от первой отсрочки.
+    """
+    for number, stamp in enumerate(("", "не дата")):
+        _, task_id = await _due_task(db, f"unreadable-stamp-{number}")
+        await db.execute(
+            "INSERT INTO submissions (task_id, generation, sha, submitted_at) "
+            "VALUES (?, 1, ?, ?)",
+            (task_id, "a" * 40, stamp),
+        )
+        await db.commit()
+    assert await order_due_runs(db) == 0
+    await db.execute(
+        "UPDATE events SET created_at=datetime('now', '-130 minutes') WHERE kind=?",
+        (EVENT_DEFERRED,),
+    )
+    await db.commit()
+
+    assert await order_due_runs(db) == 2
+
+    for event in await _events(db, EVENT_ORDERED):
+        assert "ждали отчёт" in json.loads(event["payload"])["why"]
