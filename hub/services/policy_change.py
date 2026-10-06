@@ -264,7 +264,12 @@ async def apply_project_fields(
     await refuse_unrunnable_review(db, before, fields)
     if fields:
         await repo.update_project(db, int(before["id"]), **fields)
-    if delta and (delta["changed"] or delta["removed"]):
+    changed = bool(delta and (delta["changed"] or delta["removed"]))
+    # Исполнение расписания видно в событиях ВСЕГДА: запись, значение которой
+    # человек успел поставить руками, всё равно стала applied, и без события
+    # это исполнение исчезало бы из ленты и из last_change. Ручной PATCH без
+    # изменений, как и раньше, событий не пишет.
+    if delta is not None and (changed or schedule):
         payload: dict[str, Any] = {
             "slug": before["slug"],
             **delta,
@@ -272,6 +277,8 @@ async def apply_project_fields(
             "by": by,
             "actor": actor,
         }
+        if not changed:
+            payload["unchanged"] = True
         if schedule:
             payload.update(schedule)
         await repo.insert_event(

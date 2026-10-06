@@ -3861,3 +3861,57 @@ async def test_poll_tick_executes_due_scheduled_change_in_at_id_order(
     assert [json.loads(e["payload"])["schedule_id"] for e in events] == [1, 2]
     states = [r["state"] for r in await repo.list_scheduled_policy_changes(db, pid)]
     assert states == ["applied", "applied", "pending"]
+
+
+async def test_scheduled_change_equal_to_current_value_leaves_an_event(
+    client, db, monkeypatch
+):
+    """#1593: запланировано 4, человек поставил 4 раньше — исполнение видно в событиях."""
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from hub.services import policy_change
+
+    base = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    clock = _policy_clock(monkeypatch, base)
+    pid = await _scheduled_project(db, "sched-same", {"deep_daily_cap": 2})
+    resp = await client.post(
+        "/api/projects/sched-same/policy-schedule",
+        json={
+            "at": (base + timedelta(hours=1)).isoformat(),
+            "patch": {"deep_daily_cap": 4},
+        },
+    )
+    assert resp.status_code == 201
+    manual = await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"deep_daily_cap": 4}}
+    )
+    assert manual.status_code == 200
+    clock["now"] = base + timedelta(hours=2)
+    outcomes = await policy_change.run_due(db)
+    assert [o["outcome"] for o in outcomes] == ["applied"]
+    last = (
+        await fetchall(
+            db,
+            "SELECT * FROM events WHERE kind='project_gate_policy_changed' "
+            "ORDER BY id DESC LIMIT 1",
+        )
+    )[0]
+    payload = json.loads(last["payload"])
+    assert last["actor"] == "schedule" and payload["schedule_id"] == 1
+    assert payload["changes"] == {} and payload["unchanged"] is True
+    # Ручной PATCH без изменений событий по-прежнему не пишет.
+    before = len(
+        await fetchall(
+            db, "SELECT id FROM events WHERE kind='project_gate_policy_changed'"
+        )
+    )
+    await client.patch(
+        f"/api/projects/{pid}", json={"gate_policy": {"deep_daily_cap": 4}}
+    )
+    after = len(
+        await fetchall(
+            db, "SELECT id FROM events WHERE kind='project_gate_policy_changed'"
+        )
+    )
+    assert before == after

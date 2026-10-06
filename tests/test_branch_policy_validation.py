@@ -47,6 +47,44 @@ BAD_POLICY = {TYPO: "main"}
 POLICY_READER = Path(__file__).resolve().parents[1] / "hub/services/project_policy.py"
 
 
+@pytest.fixture(autouse=True)
+def _form_carries_policy_version(request):
+    """Настоящая страница всегда несёт скрытое policy_version (#1593).
+
+    Тесты формы политики шлют то, что отправил бы браузер: текущую версию.
+    Явно переданное (в том числе пустое) значение не трогается — отказ без
+    версии проверяет test_web_form_without_policy_version_is_refused.
+    """
+    if "client" not in request.fixturenames or "db" not in request.fixturenames:
+        yield
+        return
+    client = request.getfixturevalue("client")
+    db = request.getfixturevalue("db")
+    original = client.post
+
+    async def post(url, *args, **kwargs):
+        data = kwargs.get("data")
+        if (
+            isinstance(data, dict)
+            and str(url).endswith("/web-edit")
+            and "policy_version" not in data
+            and any(str(k).startswith("gate_policy_") for k in data)
+        ):
+            from hub.services import policy_change
+
+            await db.commit()
+            row = await repo.get_project(db, int(str(url).split("/")[2]))
+            kwargs["data"] = {
+                **data,
+                "policy_version": policy_change.policy_version(row),
+            }
+        return await original(url, *args, **kwargs)
+
+    client.post = post
+    yield
+    client.post = original
+
+
 async def _project(db, slug: str) -> int:
     pid = await repo.create_project(db, slug=slug, name=slug.title())
     await db.commit()

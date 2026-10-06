@@ -1071,3 +1071,29 @@ async def test_manual_patch_and_scheduled_execution_do_not_clobber_each_other(
     assert stored == {"deep_daily_cap": 4, "wip_limit": 3}, (
         "ручная правка и исполненное расписание не затирают друг друга"
     )
+
+
+async def test_web_form_without_policy_version_is_refused(client: AsyncClient, db):
+    """#1593: форма политики без версии (старая страница) ничего не сохраняет."""
+    from urllib.parse import unquote
+
+    from hub import repository as repo
+
+    pid = await _create_project(client, "sched-noversion")
+    await repo.update_project(db, pid, gate_policy=json.dumps({"review_limit": 4}))
+    await db.commit()
+    for extra in ({}, {"policy_version": ""}):
+        resp = await client.post(
+            f"/projects/{pid}/web-edit",
+            data={"gate_policy_dor": "human", "gate_policy_verdict": "human", **extra},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        assert "обновите страницу" in unquote(resp.headers["location"]), extra
+        stored = json.loads((await repo.get_project(db, pid))["gate_policy"])
+        assert stored == {"review_limit": 4}, "ничего не сохранено"
+    # Форма без полей политики (только имя) версии не требует.
+    ok = await client.post(
+        f"/projects/{pid}/web-edit", data={"name": "Renamed"}, follow_redirects=False
+    )
+    assert "project_error" not in ok.headers["location"]

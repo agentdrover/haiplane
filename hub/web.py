@@ -1523,10 +1523,18 @@ async def web_edit_project(project_id: int, request: Request):
         # #1593: форма несёт политику ЦЕЛИКОМ — открытая до исполнения
         # отложенной правки и отправленная после, она вернула бы старые
         # значения. Версия, с которой форма составлена, едет в PATCH и
-        # сверяется под write-локом; без неё (старый клиент) проверки нет.
+        # сверяется под write-локом; без неё форма отказывает.
         sent_version = str(form.get("policy_version") or "").strip()
-        if sent_version:
-            fields["policy_version"] = sent_version
+        if not sent_version:
+            # Старая страница (открыта до выката проверки) или самодельный
+            # запрос: без версии не узнать, не затрёт ли форма исполненную
+            # правку. Отказ, а не молчаливое «проверки нет».
+            return _projects_error_redirect(
+                "Форма политики без версии: обновите страницу и повторите правку. "
+                "НИЧЕГО не сохранено.",
+                project_id,
+            )
+        fields["policy_version"] = sent_version
     if not fields:
         return RedirectResponse("/projects", status_code=303)
     try:
