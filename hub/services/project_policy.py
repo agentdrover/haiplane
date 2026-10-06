@@ -817,6 +817,28 @@ class Freeze:
         }
 
 
+def stored_policy_or_none(project: Any) -> dict | None:
+    """Сохранённая политика проекта; ``None`` - запись есть, но нечитаема.
+
+    Отличает «политики нет» (пустое значение - ``{}``) от «не смогли
+    прочитать» (битый JSON, не объект). ``gate_policy_of`` сворачивает оба
+    случая в ``{}``, и для читателей, чей пустой ответ значит «ничего не
+    делегировано», это верно. Допуск заморозки читает иначе: ``{}`` там -
+    «ограничений нет», и нечитаемая политика открывала бы доступ (#1594).
+    """
+    try:
+        raw = project["gate_policy"]
+    except (KeyError, IndexError):
+        return {}
+    except TypeError:
+        return None
+    try:
+        policy = json.loads(raw or "{}")
+    except (ValueError, TypeError):
+        return None
+    return policy if isinstance(policy, dict) else None
+
+
 def freeze_of(policy: dict) -> Freeze | None:
     """Заморозка уже прочитанной политики; ``None``, когда ключа нет."""
     raw = policy.get(FREEZE_KEY) if isinstance(policy, dict) else None
@@ -829,7 +851,7 @@ def freeze_of(policy: dict) -> Freeze | None:
             tuple(canon["allow_work_types"]),
             canon["note"],
         )
-    except ValueError:
+    except (ValueError, TypeError):
         return Freeze(None, (), "", unreadable=True)
 
 
@@ -855,7 +877,7 @@ def freeze_show(view: Any) -> str:
 class FreezeRefusal:
     """Отказ допуска: код недостающего условия и текст для человека."""
 
-    missing: str  # "work_type" | "freeze_rationale"
+    missing: str  # "work_type" | "freeze_rationale" | "policy"
     text: str
     until: str
     allow_work_types: tuple[str, ...]
@@ -890,7 +912,19 @@ def freeze_admission(
     """
     if project is None:
         return None
-    freeze = freeze_of(gate_policy_of(project))
+    policy = stored_policy_or_none(project)
+    if policy is None:
+        # Решение заморозки (не остальных читателей): политику не прочитали -
+        # допуск закрыт, а не открыт.
+        return FreezeRefusal(
+            "policy",
+            "Политика проекта нечитаема (gate_policy не разобран): допуск "
+            "закрыт, пока запись не исправлена.",
+            "",
+            (),
+            "",
+        )
+    freeze = freeze_of(policy)
     if freeze is None or not freeze.active_at(now or datetime.now(UTC)):
         return None
     wtype = str(getattr(work_type, "value", work_type) or "").strip()

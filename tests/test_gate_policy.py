@@ -8,8 +8,10 @@ does not weaken oversight over itself.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
+import pytest
 from httpx import AsyncClient
 
 from hub import config
@@ -1270,3 +1272,249 @@ async def test_freeze_rationale_is_stored_and_refined(client: AsyncClient):
         f"/api/tasks/{tid}/refine", json={"freeze_rationale": ""}
     )
     assert cleared.json()["freeze_rationale"] == ""
+
+
+# --- #1594, круг 2: нечитаемая политика, типы, атомарность -------------------
+
+
+@pytest.mark.parametrize("raw", ["{broken", "[]", '"frozen"', "42", "null"])
+async def test_unreadable_policy_closes_admission_instead_of_opening_it(
+    client: AsyncClient, db, raw
+):
+    # Нечитаемая запись - не «заморозки нет». Решение только для допуска:
+    # остальные читатели политики по-прежнему читают её как пустую.
+    from hub import repository as repo
+    from tests.test_auto_approve import _project
+
+    default = await _project(db, "default", {})
+    await repo.update_project(db, default, gate_policy=raw)
+    pid = await _project(db, "broken-policy", {})
+    draft = await _ready_draft(client, db, pid, work_type="bug", rationale="сбой")
+    await repo.update_project(db, pid, gate_policy=raw)
+    await db.commit()
+
+    top = await client.post(
+        "/api/tasks",
+        json={"title": "t", "work_type": "bug", "freeze_rationale": "сбой"},
+    )
+    assert top.status_code == 422, top.text
+    assert top.json()["detail"]["error"] == "freeze_refused"
+    approve = await client.post(f"/api/tasks/{draft}/approve")
+    assert approve.status_code == 422, approve.text
+    assert approve.json()["detail"]["missing"] == "policy"
+    assert await _status(client, draft) == "draft"
+    # пустая политика («» и {}) - это «политики нет», допуск открыт
+    from hub.services.project_policy import freeze_admission
+
+    for fine in ("", "{}"):
+        assert freeze_admission({"gate_policy": fine}, "feature", "") is None
+
+
+@pytest.mark.parametrize("bad", [[{}], [[]], [1], [None], ["bug", {}]])
+async def test_malformed_work_type_element_is_422_and_reads_fail_closed(
+    client: AsyncClient, db, bad
+):
+    from hub.services.project_policy import freeze_admission
+
+    pid = await _create_project(client, "bad-types")
+    resp = await client.patch(
+        f"/api/projects/{pid}",
+        json={"gate_policy": {"freeze": {"allow_work_types": bad}}},
+    )
+    assert resp.status_code == 422, resp.text
+    # запись, попавшая в базу мимо валидатора, читателя не роняет и не открывает
+    stored = {"gate_policy": json.dumps({"freeze": {"allow_work_types": bad}})}
+    refusal = freeze_admission(stored, "bug", "сбой")
+    assert refusal is not None
+
+
+async def _second_connection_racer(db_dsn, sql: str, args: tuple):
+    """Писатель на втором соединении; блокируется, пока чужой write-лок держится."""
+    from hub.db import connect
+
+    conn = await connect(db_dsn)
+
+    async def _write():
+        try:
+            await conn.execute(sql, args)
+            await conn.commit()
+        finally:
+            await conn.close()
+
+    return asyncio.create_task(_write())
+
+
+async def _lock_is_held_meanwhile(db_dsn, sql: str, args: tuple) -> bool:
+    """Запустить писателя и сказать, не смог ли он пробиться: True - лок держат."""
+    racer = await _second_connection_racer(db_dsn, sql, args)
+    await asyncio.wait([racer], timeout=0.5)
+    held = not racer.done()
+    _RACERS.append(racer)
+    return held
+
+
+_RACERS: list = []
+
+
+async def test_approval_decides_freeze_under_the_write_lock(
+    client: AsyncClient, db, db_dsn, monkeypatch
+):
+    # #1594: конкурентный refine между расчётом DoR и переходом не должен
+    # превращать разрешённый bug в открытую feature без обоснования.
+    from hub import repository as repo
+    from hub.services import recommendations
+    from tests.test_auto_approve import _project
+
+    pid = await _project(db, "frozen-race", {"freeze": FREEZE})
+    tid = await _ready_draft(client, db, pid, work_type="bug", rationale="сбой")
+    real = recommendations.calculate_readiness_with_recommendations
+
+    async def calc_then_refine(conn, task_id):
+        report = await real(conn, task_id)
+        resp = await client.post(
+            f"/api/tasks/{task_id}/refine",
+            json={"work_type": "feature", "freeze_rationale": ""},
+        )
+        assert resp.status_code == 200, resp.text
+        return report
+
+    monkeypatch.setattr(
+        recommendations, "calculate_readiness_with_recommendations", calc_then_refine
+    )
+    resp = await client.post(f"/api/tasks/{tid}/approve")
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"] == "freeze_refused"
+    assert await _status(client, tid) == "draft"
+
+    # и в момент перехода write-лок уже держат: писатель не пробивается
+    monkeypatch.undo()
+    await client.post(
+        f"/api/tasks/{tid}/refine",
+        json={"work_type": "bug", "freeze_rationale": "сбой"},
+    )
+    seen: dict = {}
+    real_transition = repo.transition_status_if
+
+    async def transition(conn, task_id, **kw):
+        seen["held"] = await _lock_is_held_meanwhile(
+            db_dsn, "UPDATE tasks SET freeze_rationale='' WHERE id=?", (task_id,)
+        )
+        return await real_transition(conn, task_id, **kw)
+
+    monkeypatch.setattr(repo, "transition_status_if", transition)
+    ok = await client.post(f"/api/tasks/{tid}/approve")
+    assert ok.status_code == 200, ok.text
+    assert seen["held"], "между проверкой и переходом write-лок должен держаться"
+    await asyncio.gather(*_RACERS)
+    _RACERS.clear()
+
+
+async def test_creation_checks_freeze_under_the_write_lock(
+    client: AsyncClient, db, db_dsn, monkeypatch
+):
+    from hub import repository as repo
+    from tests.test_auto_approve import _project
+
+    pid = await _project(db, "frozen-create", {})
+    tid = await _ready_draft(client, db, pid, work_type="bug", rationale="сбой")
+    parent = (await client.get(f"/api/tasks/{tid}")).json()["parent_id"]
+    seen: dict = {}
+    real_insert = repo.create_task_full
+
+    async def insert(conn, payload, **kw):
+        seen["held"] = await _lock_is_held_meanwhile(
+            db_dsn,
+            "UPDATE projects SET gate_policy=? WHERE id=?",
+            (json.dumps({"freeze": FREEZE}), pid),
+        )
+        return await real_insert(conn, payload, **kw)
+
+    monkeypatch.setattr(repo, "create_task_full", insert)
+    resp = await client.post(
+        "/api/tasks", json={"title": "t", "task_type": "task", "parent_id": parent}
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["held"], "проверка допуска и вставка - одна транзакция"
+    await asyncio.gather(*_RACERS)
+    _RACERS.clear()
+
+
+async def test_bulk_reads_the_policy_after_taking_the_write_lock(
+    client: AsyncClient, db, db_dsn, monkeypatch
+):
+    from hub.services import lifecycle
+    from tests.test_auto_approve import _project
+
+    pid = await _project(db, "frozen-bulk", {})
+    tid = await _ready_draft(client, db, pid, work_type="bug", rationale="сбой")
+    parent = (await client.get(f"/api/tasks/{tid}")).json()["parent_id"]
+    real_guard = lifecycle._guard_ac_locator
+
+    def guard_then_freeze(acs):
+        import sqlite3
+
+        raw = sqlite3.connect(db_dsn)
+        raw.execute(
+            "UPDATE projects SET gate_policy=? WHERE id=?",
+            (json.dumps({"freeze": FREEZE}), pid),
+        )
+        raw.commit()
+        raw.close()
+        return real_guard(acs)
+
+    monkeypatch.setattr(lifecycle, "_guard_ac_locator", guard_then_freeze)
+    resp = await client.post(
+        f"/api/tasks/{parent}/subtasks",
+        json={
+            "task_type": "task",
+            "source": "human",
+            "items": [
+                {
+                    "title": "feature",
+                    "acceptance_criteria": [
+                        {
+                            "id": "AC-1",
+                            "given": "g",
+                            "when": "w",
+                            "then": "t",
+                            "verifiable_by": "manual",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"] == "freeze_refused"
+
+
+async def test_bulk_policy_read_happens_while_the_write_lock_is_held(
+    client: AsyncClient, db, db_dsn, monkeypatch
+):
+    from hub.services import lifecycle
+    from tests.test_auto_approve import _project
+
+    pid = await _project(db, "frozen-bulk-lock", {})
+    tid = await _ready_draft(client, db, pid, work_type="bug", rationale="сбой")
+    parent = (await client.get(f"/api/tasks/{tid}")).json()["parent_id"]
+    real = lifecycle._project_of_new_task
+    seen: dict = {}
+
+    async def read_then_race(conn, parent_id, bound=None):
+        row = await real(conn, parent_id, bound)
+        seen["held"] = await _lock_is_held_meanwhile(
+            db_dsn,
+            "UPDATE projects SET gate_policy=? WHERE id=?",
+            (json.dumps({"freeze": FREEZE}), pid),
+        )
+        return row
+
+    monkeypatch.setattr(lifecycle, "_project_of_new_task", read_then_race)
+    resp = await client.post(
+        f"/api/tasks/{parent}/subtasks",
+        json={"task_type": "task", "source": "human", "items": [{"title": "t"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["held"], "политика читается под write-локом, а не до него"
+    await asyncio.gather(*_RACERS)
+    _RACERS.clear()

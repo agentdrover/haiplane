@@ -519,7 +519,12 @@ def validated_freeze(raw: Any) -> dict[str, Any]:
     known = {w.value for w in WorkType}
     allowed: list[str] = []
     for item in types:
-        name = item.strip() if isinstance(item, str) else item
+        if not isinstance(item, str):
+            raise ValueError(
+                "gate_policy freeze.allow_work_types must hold work type names "
+                f"(strings), got: {item!r}"
+            )
+        name = item.strip()
         if name not in known:
             raise ValueError(
                 f"gate_policy freeze.allow_work_types has unknown work type "
