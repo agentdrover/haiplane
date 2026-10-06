@@ -33,12 +33,10 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
   сохранённом `defect_prevention` задачи (`prevention_gate.prevention_gap`,
   `check_submission`, `refuse_without_prevention`). Если `prevention` прислан, он
   проверяется всегда.
-- Пример payload: `prevention={"kind": "regression_test", "ref": "tests/test_x.py::test_y"}`.
 - Оговорка: тексты отказов в `prevention_gate` до сих пор называют CLI `oc-hub`.
   Имя команды - `hp-hub` (правило 6).
-- Инцидент не привязан: отказ 422 по `ref`/`test_ref` в ленте #1600 не найден
-  (запись 10676, отказы по форме payload в ленту не пишутся). Правило держится
-  на коде, не на инциденте.
+- Инцидент не привязан: 422 по `ref`/`test_ref` в ленте #1600 не найден (запись
+  10676). Правило держится на коде.
 
 ## 2. Комментарий, повтор того же sha и новый sha - три разные вещи
 
@@ -59,8 +57,7 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
 - sha закрепляет хаб, не клиент: `lifecycle.resolve_branch_tip` читает
   `origin/<branch>` на момент сдачи. Пуш после сдачи ничего не меняет, пока нет
   пересдачи.
-- Пересдача без изменений ничего не даёт; пересдача ради каждой находки по
-  отдельности покупает ревью каждый раз. Собирайте правки в один коммит.
+- Каждая пересдача с новым sha покупает ревью: собирайте правки в один коммит.
 - Журнал #1600 (запись 10676): три сдачи, три разных sha (97788de, f0d96ad,
   03999db), все три - новые поколения; повторов того же sha не было.
 
@@ -84,8 +81,8 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
      при том же коде откроет НОВОЕ поколение и купит ещё одно ревью. Если поле
      `submission_sha` пусто, не повторяйте вслепую: сначала выясните, почему
      вершина не получена (ветка не запушена, нет сети у хаба), и скажите об этом.
-- Источник правила - практика сессий (запись памяти о цене повтора); в коде
-  подтверждено только наличие полей сверки и поведение повтора, описанное выше.
+- Источник правила - практика сессий; кодом подтверждены только поля сверки и
+  поведение повтора выше.
 
 ## 4. `mutations` - список `{ac, mutation, failed_test}`
 
@@ -111,9 +108,8 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
 2. Пуш полным refspec из ветки с каноническим именем:
    `git push origin "refs/heads/${B}:refs/heads/${B}"`, где `B` - имя ветки
    задачи. Форма `HEAD:refs/heads/...` хук отвергает: он читает локальную ссылку
-   `HEAD`, а не имя ветки (проверено пушем: «Blocked push from branch 'HEAD'»).
-   Затем
-   `git ls-remote origin <ветка>` и сверка sha с `git rev-parse HEAD`. Хаб
+   `HEAD`, а не имя ветки.
+   Затем `git ls-remote origin <ветка>` и сверка sha с `git rev-parse HEAD`. Хаб
    читает `origin/<ветка>`, и сдача закрепляет именно то, что там лежит
    (`resolve_branch_tip`).
 3. CI на этом sha до сдачи. Хаб не ждёт CI (#1405, `review_ci_gate`,
@@ -122,17 +118,26 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
    идёт без него, в ленте событие `review_ordered_without_ci`, а поздний отчёт
    ревью не перезаказывает. Красный отчёт: ревью не покупается, событие
    `review_withheld_red_ci`. Поэтому:
+   - привяжите всё к sha, который будет закреплён: `SHA=$(git rev-parse HEAD)`;
    - запустите CI на ветке: `gh workflow run ci.yml --ref <ветка>`. Триггер
      `workflow_dispatch`; пуш ветки без PR прогона не создаёт (`ci.yml` слушает
      `pull_request`, push в `main`/`develop` и `workflow_dispatch`);
-   - дождитесь конца прогона на нужном sha: `gh run list`, `gh run watch`, сверка
-     `headSha` с `git rev-parse HEAD`;
-   - красный прогон: не сдавайте, сначала чините и пушьте заново;
-   - только потом `hub_submit_for_review`. Сдача подхватит сохранённый отчёт для
+   - найдите id прогона именно на этот sha, повторяя каждые ~10 с, пока вывод
+     пуст: `gh run list --workflow ci.yml --branch <ветка> --commit "$SHA" --event workflow_dispatch --limit 1 --json databaseId,headSha,status -q '.[0]'`.
+     Без `--commit` и `--workflow` первой строкой может оказаться чужой прогон
+     (например, push в `develop`), а `headSha` в таблице по умолчанию нет, он
+     есть только в `--json`;
+   - дождитесь конца: `gh run watch <databaseId> --exit-status`. Без id в
+     неинтерактивной сессии команда сразу выходит с кодом 1 («run ID required
+     when not running interactively»); код 0 значит success;
+   - код не 0 (красный прогон): не сдавайте. Чините, коммитьте, пушьте и снова
+     делайте dispatch на НОВЫЙ sha: пуш прогона не создаёт. Сдавать можно только
+     после кода 0 на sha, который будет закреплён;
+   - потом `hub_submit_for_review`. Сдача подхватит сохранённый отчёт для
      закреплённого коммита (`lifecycle`, `ci_report.adopt_ci_run_report`), в
      ленте будет «CI run report adopted for this commit»;
    - до закрепления sha бриф показывает `ci_run_report` = `unknown`: это
-     нормально, итог прогона смотрите в GitHub.
+     нормально, итог прогона смотрите командами выше.
    Источник: событие `review_ordered_without_ci` и случай #1602 06.10 (по
    ленте #1602: ревью заказано в 14:48, отчёт CI в 14:58).
 4. На ядре хаба (lifecycle, схема, DoR, интеграции) сначала критик Codex, правка
@@ -140,13 +145,10 @@ description: Use before hub_submit_for_review on a Haiplane Hub pair task - payl
    (постановка #1612); это правило процесса, кодом хаба оно не проверяется. Запуск:
    `codex exec` в режиме read-only со stdin, закрытым `< /dev/null`.
 5. Локальные проверки до сдачи: `make lint types budget security` и `uv run pytest -q`
-   смотрите по коду возврата, не по хвосту вывода. Они не заменяют CI из
-   пункта 3.
+   смотрите по коду возврата, не по хвосту вывода.
 
 ## 6. CLI называется `hp-hub`
 
 - `pyproject.toml`, `[project.scripts]`: `hp-hub = "hub.cli:main"`. Скрипта
   `oc-hub` в этой базе нет. Сдача из командной строки: `hp-hub submit-review <id>`
   с `--prevention '<json>'` (`hub.cli.cmd_submit_review`).
-- Часть текстов отказов хаба и старых заметок ещё говорит `oc-hub`: читайте это
-  как `hp-hub`.
