@@ -4477,7 +4477,10 @@ async def test_a_pair_with_a_closed_window_is_not_read_on_the_tick(
     fresh = await _v2_row(db, project_id, verdict="approve", advisor="concur")
     await _human(db, old, "changes_requested")
     await record_false_approvals(db)  # закреплено, пока пара была свежей
-    await _age_pair(db, old, PAIR_READ_HORIZON_DAYS + 10)
+    await _age_pair(db, old, 95)
+    assert PAIR_READ_HORIZON_DAYS == 90, "30 дней окна + 60 запаса"
+    inside = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    await _age_pair(db, inside, 85)
 
     read: list[int] = []
     real = steward_exit._detect_for_pair
@@ -4490,8 +4493,84 @@ async def test_a_pair_with_a_closed_window_is_not_read_on_the_tick(
 
     found = await current_false_approvals(db)
 
-    assert read == [fresh], "пара с закрытым окном не читается"
+    assert sorted(read) == sorted([fresh, inside]), "пара с закрытым окном не читается"
     assert [f.task_id for f in found] == [old], "закреплённая остаётся в отказах"
+
+
+async def test_an_old_deploy_is_not_the_delivery_of_a_new_approval(
+    db: aiosqlite.Connection,
+):
+    """Выкат ДО ответа пары — доставка прошлого одобрения; нового одобрения ещё нет в проде."""
+    from hub.services.steward_exit import current_false_approvals
+
+    project_id = await _project(db, "advisor-fa-old-deploy")
+    task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    await _deliver(db, task_id, 20)  # старый выкат
+    await _age_pair(db, task_id, 3)  # новое одобрение, ещё не выкачено
+    await _prod_defect(db, task_id, days_ago=1)
+
+    assert await current_false_approvals(db) == []
+
+
+async def test_release_stamps_in_iso_form_are_compared_as_times(
+    db: aiosqlite.Connection,
+):
+    """Релиз пишет метку ISO («…T…Z»); сравнивается время, а не строка.
+
+    Выкат за два часа ДО ответа пары в тот же день строкой «больше» (T > пробел),
+    временем — раньше: доставкой этого одобрения он быть не может.
+    """
+    from hub.services.steward_exit import current_false_approvals
+
+    project_id = await _project(db, "advisor-fa-iso")
+    early = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    late = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    await db.execute("UPDATE steward_judgements SET created_at='2026-09-01 12:00:00'")
+    for task, sha, stamp in (
+        (early, "iso-early", "2026-09-01T10:00:00Z"),
+        (late, "iso-late", "2026-09-01T14:00:00Z"),
+    ):
+        await db.execute(
+            "INSERT INTO pipeline_merges (project_id, pr_number, task_id, "
+            "released_sha) VALUES (1, ?, ?, ?)",
+            (9500 + task, task, sha),
+        )
+        await db.execute(
+            "INSERT INTO releases (project_id, deployed_sha, status, deployed_at) "
+            "VALUES (1, ?, 'success', ?)",
+            (sha, stamp),
+        )
+        await db.execute("UPDATE tasks SET found_in=found_in WHERE id=?", (task,))
+    await db.commit()
+    for task in (early, late):
+        defect = await _prod_defect(db, task, days_ago=0)
+        await db.execute(
+            "UPDATE tasks SET detected_at='2026-09-02 09:00:00' WHERE id=?", (defect,)
+        )
+    await db.commit()
+
+    flagged = {f.task_id for f in await current_false_approvals(db)}
+    assert flagged == {late}
+
+
+async def test_a_completion_before_the_delivery_is_not_a_reopening_of_it(
+    db: aiosqlite.Connection,
+):
+    """Завершение раньше доставки — не то завершение, из которого вернули доставленное."""
+    from hub.services.steward_exit import current_false_approvals
+
+    project_id = await _project(db, "advisor-fa-reopen-early")
+    task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    await _age_pair(db, task_id, 12)
+    await _deliver(db, task_id, 4)
+    await db.execute(
+        "UPDATE tasks SET status='open', completed_at=datetime('now','-10 days'), "
+        "status_entered_at=datetime('now','-1 days') WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+
+    assert await current_false_approvals(db) == []
 
 
 async def test_a_human_return_after_the_window_is_not_counted(

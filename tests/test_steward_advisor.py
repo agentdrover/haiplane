@@ -1504,10 +1504,12 @@ async def _interrupted(
 
 
 async def _alerts(db: aiosqlite.Connection, task_id: int) -> list[str]:
+    """Строки ленты о прерванном применении — только kind=alert."""
     return [
         dict(u)["content"]
         for u in await repo.get_task_updates(db, task_id)
         if "Применение советника прервано" in dict(u)["content"]
+        and dict(u)["kind"] == "alert"
     ]
 
 
@@ -1589,3 +1591,30 @@ async def test_a_claim_stamps_its_time(db: aiosqlite.Connection, monkeypatch):
     await apply_advisor_outcomes(db)
 
     assert seen and seen[0] not in ("", "None")
+
+
+async def test_a_neighbour_that_moved_the_claim_first_leaves_no_second_alert(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Строки выбраны, но сосед уже перевёл метку — перевод и alert не дублируются."""
+    from hub.services import steward_advisor
+
+    task_id = await _interrupted(db, monkeypatch, "advisor-stuck-race", 61)
+    real = steward_advisor.fetchall
+
+    async def _stale(db_, sql, params=()):
+        rows = await real(db_, sql, params)
+        if "advisor_claimed_at <=" in sql:
+            await db_.execute(
+                "UPDATE steward_judgements SET advisor_outcome='escalated' "
+                "WHERE task_id=? AND kind='verdict'",
+                (task_id,),
+            )
+            await db_.commit()
+        return rows
+
+    monkeypatch.setattr(steward_advisor, "fetchall", _stale)
+
+    await apply_advisor_outcomes(db)
+
+    assert await _alerts(db, task_id) == []
