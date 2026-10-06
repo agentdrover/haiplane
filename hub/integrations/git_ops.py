@@ -3905,6 +3905,18 @@ class GitOpsIntegration:
             sha, repo=repo, gh_repo=gh_repo
         )
 
+    async def pr_head_sha(
+        self,
+        pr_number: int,
+        repo: str | None = None,
+        gh_repo: str | None = None,
+        forge: str = "",
+    ) -> str:
+        """Голова PR на форже; пусто, когда спросить не удалось (#1591)."""
+        return await self._forge_for(forge).pr_head_sha(
+            pr_number, repo=repo, gh_repo=gh_repo
+        )
+
     def merge_preserves_ancestry(self, forge: str = "") -> bool:
         """Останется ли сдаточный коммит предком базовой ветки после доставки.
 
@@ -3929,8 +3941,12 @@ class GitOpsIntegration:
         gh_repo: str | None = None,
         forge: str = "",
         delete_branch: bool = True,
+        expected_head_sha: str = "",
     ) -> bool:
         """Merge one PR; ``delete_branch`` says what happens to its head (#949).
+
+        ``expected_head_sha`` (#1591) делает merge УСЛОВНЫМ: форж сливает только
+        если голова PR всё ещё этот коммит. Пусто — как раньше.
 
         Ветвится по ОБЪЯВЛЕННОЙ способности форжа, а не по попытке (#1116).
         GitHub сливает сам одним вызовом. У GitVerse такого вызова нет вовсе,
@@ -3951,6 +3967,7 @@ class GitOpsIntegration:
             gh_repo=gh_repo,
             forge=forge,
             delete_branch=delete_branch,
+            expected_head_sha=expected_head_sha,
         )
         return ok
 
@@ -3963,6 +3980,7 @@ class GitOpsIntegration:
         gh_repo: str | None = None,
         forge: str = "",
         delete_branch: bool = True,
+        expected_head_sha: str = "",
     ) -> tuple[bool, str]:
         """Слить PR и НАЗВАТЬ причину, если не вышло (#1116, по ревью).
 
@@ -3981,10 +3999,16 @@ class GitOpsIntegration:
                 delete_branch=delete_branch,
                 repo=repo,
                 gh_repo=gh_repo,
+                expected_head_sha=expected_head_sha,
             )
             return (ok, "")
         ok, detail = await self.merge_pr_by_push(
-            pr_number, subject, repo=repo, gh_repo=gh_repo, forge=forge
+            pr_number,
+            subject,
+            repo=repo,
+            gh_repo=gh_repo,
+            forge=forge,
+            expected_head_sha=expected_head_sha,
         )
         if not ok:
             log.error("merge by push failed for PR #%d: %s", pr_number, detail)
@@ -3998,6 +4022,7 @@ class GitOpsIntegration:
         repo: str | None = None,
         gh_repo: str | None = None,
         forge: str = "",
+        expected_head_sha: str = "",
     ) -> tuple[bool, str]:
         """Слить PR локальным git и ДОКАЗАТЬ доставку базовой веткой (#1116).
 
@@ -4040,6 +4065,16 @@ class GitOpsIntegration:
         )
         if rc != 0:
             return (False, f"не удалось получить ветки из origin: {err[:150]}")
+        if expected_head_sha:
+            _, fetched, _ = await _git(
+                "rev-parse", f"refs/remotes/origin/{head}", repo=workspace, check=False
+            )
+            if (fetched or "").strip() != expected_head_sha:
+                return (
+                    False,
+                    f"голова {head} ушла с {expected_head_sha[:12]} (#1591): "
+                    "мерж отменён, сверка повторится",
+                )
 
         # Имя включает клон, а не только номер PR: два проекта на одном
         # форже легко имеют PR №1 каждый, и общий путь свёл бы их мержи в

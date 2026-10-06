@@ -234,6 +234,59 @@ envelope ответа:
 `auto_review=false`; human overrides (`hub_decide_task` accept,
 `hub_force_complete_task`) работают и аудируются.
 
+## Серверные копии артефактов сверяются до слияния релиза (#1591)
+
+Обёртка CI запускает только закреплённую копию `deploy/remote-deploy.sh`, а
+служба ревьюера ставится руками (`deploy/LOCAL-REVIEW.md`). Забытая копия
+раньше проявлялась красным деплоем после слияния. Теперь авторелиз проверяет
+её до слияния.
+
+Ключ политики проекта `gate_policy.release_artifacts` — список пар
+`{repo_path, server_path, update_hint}`. Только точные копии: файлы-шаблоны
+(unit, env, drop-in, sudoers) законно отличаются от репо и сюда не входят.
+Пример для прода:
+
+```json
+{"gate_policy": {"release_artifacts": [
+  {"repo_path": "deploy/remote-deploy.sh",
+   "server_path": "/usr/local/sbin/<SERVICE>-remote-deploy.sh",
+   "update_hint": "ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo tee /usr/local/sbin/<SERVICE>-remote-deploy.sh >/dev/null' < deploy/remote-deploy.sh && ssh <DEPLOY_USER>@<DEPLOY_HOST> 'sudo chmod 0755 /usr/local/sbin/<SERVICE>-remote-deploy.sh'"},
+  {"repo_path": "deploy/review-runner/haiplane-review-runner.py",
+   "server_path": "/usr/local/lib/haiplane-review-runner/haiplane-review-runner.py",
+   "update_hint": "установить файл по deploy/LOCAL-REVIEW.md и ПЕРЕЗАПУСТИТЬ службу: sudo systemctl restart haiplane-review-runner"}
+]}}
+```
+
+Удаление ключа — `{"gate_policy":{"release_artifacts":null}}`. Без ключа и с
+пустым списком релиз идёт как раньше.
+
+Как это работает:
+
+- Перед слиянием хаб берёт закреплённую голову релизного PR, считает sha256
+  файла `repo_path` на этой голове (по сырым байтам blob, не по рабочей копии
+  клона) и sha256 файла `server_path`. Хаб читает только хэш и содержимое никуда
+  не пишет.
+- Читать можно только файлы внутри каталогов из серверной настройки
+  `HAIPLANE_RELEASE_ARTIFACT_DIRS` (через запятую; по умолчанию
+  `/usr/local/sbin,/usr/local/lib,/usr/local/bin`). Путь абсолютный, без `..`,
+  внутри каталога по границам компонентов; symlink в пути и в самом файле,
+  не обычный файл — отказ. Проверка повторяется при каждом чтении, поэтому
+  сохранённая политика не обходит смену списка.
+- Расхождение, отсутствие или нечитаемость файла: релиз не сливается, причина
+  начинается словами «серверная копия <путь> ...» и несёт короткие sha и
+  `update_hint`. Это алерт `release_blocked` сразу, один до смены состояния
+  (виден в карточке «Что в проде» и в ленте). После обновления копии следующий
+  проход сливает сам, и алерт снимается.
+- Слияние условное: GitHub получает `--match-head-commit` с проверенной головой.
+  Новый push в develop между проверкой и слиянием не сливается непроверенным:
+  проверка повторится на следующем проходе.
+
+Что проверка НЕ доказывает: совпал файл на диске в момент чтения, а не версия
+работающего процесса. Служба, файл которой заменён без перезапуска, продолжает
+исполнять старый код, поэтому `update_hint` службы включает перезапуск. Обёртка
+CI остаётся финальной защитой: проверка её не заменяет и «0 отказов деплоя» не
+гарантирует.
+
 ## Возврат main в develop после релиза — PR-ом, без обхода правил (#1426)
 
 Релиз develop → main вливается squash-ом, и после него в main лежит коммит,

@@ -715,3 +715,110 @@ def test_path_notices_pattern_semantics():
     assert [n["text"] for n in got] == ["один", "два"]
     assert got[0]["patterns"] == ["deploy/**", "deploy/*.sh"]
     assert got[0]["paths"] == ["deploy/x.sh"]
+
+
+# --- #1591: ключ release_artifacts -------------------------------------------
+
+
+async def test_release_artifacts_policy_is_validated_and_confined(
+    client: AsyncClient, db: aiosqlite.Connection, tmp_path, monkeypatch
+):
+    """#1591 AC-3: корректная запись видна; плохие — 422; symlink и чужие пути не читаются."""
+    import os
+
+    from hub.services import release_artifacts as ra
+
+    srv = tmp_path / "srv"
+    srv.mkdir()
+    outside = tmp_path / "outside.env"
+    outside.write_text("SECRET=1\n")
+    monkeypatch.setattr(config, "RELEASE_ARTIFACT_DIRS", ("/usr/local/sbin", str(srv)))
+    pid = await repo.create_project(db, slug="ra-policy", name="ra-policy")
+    await db.commit()
+    url = f"/api/projects/{pid}"
+
+    def entry(server_path: str, repo_path: str = "deploy/x.sh") -> list[dict]:
+        return [
+            {
+                "repo_path": repo_path,
+                "server_path": server_path,
+                "update_hint": "обновить",
+            }
+        ]
+
+    good = entry("/usr/local/sbin/svc-remote-deploy.sh")
+    resp = await client.patch(url, json={"gate_policy": {"release_artifacts": good}})
+    assert resp.status_code == 200, resp.text
+    summary = (await client.get("/api/projects/ra-policy/effective-policy")).json()
+    row = _by_key(summary)["release_artifacts"]
+    assert row["reader"] == "project_policy.release_artifacts_of"
+    assert row["source"] == "project" and row["value"] == good
+    assert row["default"] == []
+    assert "release_artifacts" not in summary["unknown_keys"]
+
+    bad = {
+        "relative": entry("usr/local/sbin/x"),
+        "dotdot": entry("/usr/local/sbin/../../etc/passwd"),
+        "outside": entry("/etc/hub-conf/secrets.env"),
+        "prefix without boundary": entry("/usr/local/sbinX/x.sh"),
+        "the directory itself": entry("/usr/local/sbin"),
+        "absolute repo path": entry("/usr/local/sbin/x", "/deploy/x.sh"),
+        "repo path with ..": entry("/usr/local/sbin/x", "../x.sh"),
+        "no hint": [{"repo_path": "a", "server_path": "/usr/local/sbin/x"}],
+        "not a list": "x",
+    }
+    for name, value in bad.items():
+        resp = await client.patch(
+            url, json={"gate_policy": {"release_artifacts": value}}
+        )
+        assert resp.status_code == 422, (name, resp.status_code, resp.text)
+        assert "release_artifacts" in resp.text, (name, resp.text)
+
+    # Stored policy, allowlist changed afterwards: reading is confined anyway,
+    # and a file outside the allowlist is never opened.
+    opened: list[str] = []
+    real_open = os.open
+
+    def spy(path, *args, **kwargs):
+        opened.append(str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", spy)
+    digest, why = ra.server_sha256("/etc/hub-conf/secrets.env", ra.allowed_dirs())
+    assert digest is None and why
+    digest, why = ra.server_sha256(str(outside), ra.allowed_dirs())
+    assert digest is None and why
+    assert not any("secrets.env" in p or "outside.env" in p for p in opened)
+
+    # A symlink inside the allowed directory to a file outside it is refused,
+    # and so is a symlinked directory in the path; a regular file is read.
+    link = srv / "link.sh"
+    link.symlink_to(outside)
+    digest, why = ra.server_sha256(str(link), ra.allowed_dirs())
+    assert digest is None and "symlink" in why
+    assert not any("outside.env" in p for p in opened)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "f.sh").write_text("x")
+    (srv / "dirlink").symlink_to(elsewhere)
+    digest, why = ra.server_sha256(str(srv / "dirlink" / "f.sh"), ra.allowed_dirs())
+    assert digest is None and "symlink" in why
+    regular = srv / "ok.sh"
+    regular.write_bytes(b"abc\n")
+    digest, why = ra.server_sha256(str(regular), ra.allowed_dirs())
+    import hashlib
+
+    assert digest == hashlib.sha256(b"abc\n").hexdigest() and why == ""
+    # Not a regular file.
+    fifo_dir = srv / "d"
+    fifo_dir.mkdir()
+    digest, why = ra.server_sha256(str(fifo_dir), ra.allowed_dirs())
+    assert digest is None and why
+
+    resp = await client.patch(url, json={"gate_policy": {"release_artifacts": None}})
+    assert resp.status_code == 200, resp.text
+    assert "release_artifacts" not in resp.json()["gate_policy"]
+    row = _by_key(
+        (await client.get("/api/projects/ra-policy/effective-policy")).json()
+    )["release_artifacts"]
+    assert row["source"] == "default" and row["value"] == []
