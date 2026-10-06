@@ -327,7 +327,23 @@ Universal Review Gate требует независимого ревьюера: 
 | `hub_create_task` | `task` (полный REST-ответ) | «Task #N created …» |
 | `hub_refine_task` | `task_id`, `fields_set`, `acceptance_criteria_count`, `risks_count`, `readiness_score`, `dor_passed`, `task` | какие поля применены + счётчики/readiness |
 | `hub_refine_tasks` | `results[]` (по задаче: `fields_set`, счётчики, `readiness_score`, `dor_passed`) | «Refined N task(s) …» |
-| `hub_task_status` | `task` (REST GET после refresh) | многострочный статус |
+| `hub_task_status` | по умолчанию — компактная карточка `task` (см. ниже); при `full=true` — весь REST GET после refresh | статус: шапка, выдержки, окно ленты, строки `[bounded]` |
+
+`hub_task_status` по умолчанию компактен (#1613): окно из 10 новейших записей
+ленты (`updates=N`; `-1` — вся лента, `0` — без ленты, `< -1` — отказ),
+выдержки `description`, `technical_hints`, `result_text` по 1500 знаков, счётчики
+scope/validation и id критериев приёмки без Given/When/Then. Карточка в
+`structuredContent.task` несёт обязательные поля: `id`, `title`, `status`,
+`work_type`, `size`, `submission_generation`, `submission_sha`, `branch`,
+`pr_number`, `review_verdict`, `review_approved_current`, `latest_review`,
+`dependencies`, `acceptance_criteria_ids`, `updates` (окно), `updates_total`,
+`bounds`. Всё, что опущено, названо в `bounds` и строками `[bounded]` в тексте:
+что именно, `shown/total` и путь к полному (`full=true`, `updates=-1`,
+`GET /api/tasks/{id}/updates`). **Чтобы прочитать постановку целиком
+(Given/When/Then, scope, validation) — `full=true`.** **После обрыва записи, если
+лента усечена, а твоей записи в окне нет, читай `updates=-1` ПЕРЕД повтором.**
+`full=true` отдаёт прежний объект REST без изменений; `updates` при нём
+игнорируется.
 
 Для надёжной автоматизации проверяй `structuredContent`, а не парси текст.
 Остальные инструменты пока возвращают только текст (это нормально).
@@ -343,7 +359,7 @@ Universal Review Gate требует независимого ревьюера: 
   `human_owner`, `claimed_by`, `mine`, `include_archived`)
 - `hub_task_status` — детальный статус задачи *(structuredContent)*: описание,
   `technical_hints`, scope, `validation_commands`, acceptance-criteria и
-  `lifecycle_hint` (ожидание ci_check и т.п.) — одним вызовом для ревью ТЗ
+  `lifecycle_hint` (ожидание ci_check и т.п.) — одним вызовом для ревью ТЗ — полностью по `full=true`
 - `hub_task_tree` — дерево подзадач
 - `hub_my_context` — контекст для старта работы
 - `hub_get_readiness` — Definition of Ready / рекомендации (одна задача)

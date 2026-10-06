@@ -160,3 +160,41 @@ async def test_watcher_mcp_write_refused_even_with_env_hub_token(watcher_mcp_hub
     )
     # the refused inner REST call carried the WATCHER's bearer, not the env one
     assert [r["actor"] for r in refusals] == ["grok-m"], refusals
+
+
+async def test_watcher_reads_a_compact_task_status(watcher_mcp_hub):
+    """AC-4 (#1613): a watcher gets the compact answer and never POSTs /refresh."""
+    from tests.test_mcp_server import _call_tool, _hub_process, _rpc_result
+
+    hub = watcher_mcp_hub
+    created = await hub.client.post(
+        "/api/tasks", json={"title": "компактно"}, headers=hub.human
+    )
+    tid = created.json()["id"]
+    for i in range(13):
+        posted = await hub.client.post(
+            f"/api/tasks/{tid}/updates",
+            json={"content": f"запись-{i}", "agent": "h", "kind": "status"},
+            headers=hub.human,
+        )
+        assert posted.status_code in (200, 201), posted.text
+
+    async with _hub_process():
+        read = await _call_tool(
+            hub.client, hub.watcher_token, "hub_task_status", {"task_id": tid}
+        )
+    result = _rpc_result(read)
+    assert result.get("isError") is not True, result
+    card = result["structuredContent"]["task"]
+    assert card["compact"] is True
+    assert card["updates_total"] >= 13
+    assert len(card["updates"]) == 10
+    text = "".join(p.get("text", "") for p in result["content"])
+    assert "[bounded] updates 10/" in text and "updates=-1" in text
+    assert "запись-12" in text
+    assert not any(u["content"] == "запись-0" for u in card["updates"])
+    # A POST /refresh under the watcher bearer would leave a refusal event.
+    refusals = await hub.db.execute_fetchall(
+        "SELECT 1 FROM events WHERE kind = 'watcher_route_refused'"
+    )
+    assert refusals == []

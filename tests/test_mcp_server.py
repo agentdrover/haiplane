@@ -987,7 +987,9 @@ async def test_hub_task_status_structured_content_matches_rest(
         "log_tail": [],
     }
     mock_api_get.return_value = rest_task
-    out = await hub_task_status(42)
+    # #1613: the whole REST object is what full=true returns; the default
+    # view is a card (AC-3), so equality holds only here.
+    out = await hub_task_status(42, full=True)
     structured = _mcp_structured(out)
     assert structured is not None
     assert structured["schema_version"] == MCP_STRUCTURED_SCHEMA_VERSION
@@ -4578,7 +4580,7 @@ async def test_a_task_write_names_the_task_id_it_already_knows(
 
     payload = srv.enrich_error_payload(exc.value.payload)
     assert payload["suggested_tool"] == "hub_task_status"
-    assert "hub_task_status(task_id=1250)" in payload["message"]
+    assert "hub_task_status(task_id=1250, updates=-1)" in payload["message"]
 
 
 def _write_routes_in_module() -> dict[str, str]:
@@ -5325,3 +5327,357 @@ async def test_claim_and_pair_start_messages_carry_worktree_hint(
     ]
     pair = json.loads(await hub_pair_start(41, plan="Plan: x"))
     assert f"Worktree: {hint}" in pair["message"]
+
+
+def _big_task(updates: int = 40, **extra: Any) -> dict[str, Any]:
+    """AC-1 fixture: long description/hints/result, 5 AC, a long feed."""
+    task: dict[str, Any] = {
+        "id": 1613,
+        "title": "Big card",
+        "status": "running",
+        "task_type": "task",
+        "work_type": "chore",
+        "size": "M",
+        "source": "agent",
+        "runtime": "auto",
+        "assigned_agent": "tester",
+        "job_id": None,
+        "exit_code": None,
+        "auto_review": True,
+        "review_cycle": 0,
+        "submission_generation": 2,
+        "submission_sha": "abc123",
+        "branch": "task-1613/x",
+        "pr_number": 77,
+        "review_verdict": "approved",
+        "review_approved_current": True,
+        "latest_review": {
+            "verdict": "approved",
+            "submission_generation": 2,
+            "is_current": True,
+            "findings": [],
+        },
+        "dependencies": {"blocked_by": [], "blocks": []},
+        "created_at": "2026-01-01T00:00:00Z",
+        "description": "D" * 6000,
+        "technical_hints": "H" * 3000,
+        "scope_in": ["in one", "in two"],
+        "scope_out": ["out one"],
+        "validation_commands": ["uv run pytest -q"],
+        "acceptance_criteria": [
+            {
+                "id": f"AC-{i}",
+                "given": "g" * 80,
+                "when": "w" * 80,
+                "then": "t" * 80,
+                "verifiable_by": "test",
+            }
+            for i in range(1, 6)
+        ],
+        "updates": [
+            {
+                "id": 1000 + i,
+                "task_id": 1613,
+                "created_at": f"2026-01-02T00:{i:02d}:00Z",
+                "kind": "status",
+                "agent": "a1",
+                "content": f"entry-{i} " + "u" * 290,
+            }
+            for i in range(updates)
+        ],
+        "result_text": "R" * 2000,
+        "log_tail": ["line1"],
+    }
+    task.update(extra)
+    return task
+
+
+def _shown_entries(text: str) -> list[int]:
+    return [int(m) for m in re.findall(r"entry-(\d+) ", text)]
+
+
+async def test_hub_task_status_is_compact_by_default_and_full_on_request(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """AC-1 (#1613): compact default in both halves, bounds, full=true intact."""
+    from hub.services.mcp_telemetry import measure_response
+
+    rest = _big_task()
+    mock_api_get.return_value = rest
+    full = await hub_task_status(1613, full=True)
+    default = await hub_task_status(1613)
+
+    # Same measure, same fixture: the default costs at most a third.
+    assert measure_response(default) * 3 <= measure_response(full)
+    # full=true: the REST object byte for byte, whole feed, updates ignored.
+    assert _mcp_structured(full)["task"] == rest
+    for n in (0, -1, 10):
+        again = await hub_task_status(1613, full=True, updates=n)
+        assert _mcp_structured(again)["task"] == rest
+        assert _mcp_text(again) == _mcp_text(full)
+    assert len(_shown_entries(_mcp_text(full))) == 40
+
+    text, card = _mcp_text(default), _mcp_structured(default)["task"]
+    # Both halves are compact: no 6000-char description, no Given/When/Then.
+    assert "D" * 2000 not in text
+    assert "Given:" not in text
+    assert "description" not in card and "acceptance_criteria" not in card
+    assert len(card["updates"]) == 10 and card["updates_total"] == 40
+    assert _shown_entries(text) == list(range(30, 40))
+    # Bounds in both halves: what, shown/total, and the way to the rest.
+    assert "[bounded] updates 10/40" in text
+    assert "updates=-1" in text and "full=true" in text
+    assert "GET /api/tasks/1613/updates" in text
+    bound = next(b for b in card["bounds"] if b["field"] == "updates")
+    assert (bound["shown"], bound["total"]) == (10, 40)
+    assert "updates=-1" in bound["read_more"] and "full=true" in bound["read_more"]
+    assert "/api/tasks/1613/updates" in bound["read_more"]
+    fields = {b["field"] for b in card["bounds"]}
+    assert {"description", "technical_hints", "result_text"} <= fields
+    assert "[bounded] description 1500/6000" in text
+
+    none = await hub_task_status(1613, updates=0)
+    assert _shown_entries(_mcp_text(none)) == []
+    assert _mcp_structured(none)["task"]["updates"] == []
+    assert _mcp_structured(none)["task"]["updates_total"] == 40
+    assert "[bounded] updates 0/40" in _mcp_text(none)
+
+    whole = await hub_task_status(1613, updates=-1)
+    assert _shown_entries(_mcp_text(whole)) == list(range(40))
+    assert len(_mcp_structured(whole)["task"]["updates"]) == 40
+    assert "[bounded] updates" not in _mcp_text(whole)
+    assert "D" * 2000 not in _mcp_text(whole)
+
+    with pytest.raises(HubApiError) as exc:
+        await hub_task_status(1613, updates=-2)
+    assert exc.value.payload["reason"] == "invalid_updates"
+    assert "-1" in exc.value.payload["message"]
+
+
+async def test_a_write_pushed_out_of_the_window_is_found_with_the_full_feed(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """AC-2 (#1613): a write 12 entries back is not in the window — and the
+    answer says to read updates=-1 before repeating it."""
+    task = _big_task(updates=0)
+    mine = {
+        "id": 5000,
+        "created_at": "2026-01-02T00:00:00Z",
+        "kind": "report",
+        "agent": "me",
+        "content": "MY-SUBMISSION-REPORT",
+    }
+    later = [
+        {
+            "id": 5001 + i,
+            "created_at": f"2026-01-02T01:{i:02d}:00Z",
+            "kind": "status",
+            "agent": "other",
+            "content": f"later-{i}",
+        }
+        for i in range(12)
+    ]
+    task["updates"] = [mine, *later]
+    mock_api_get.return_value = task
+
+    default = await hub_task_status(1613)
+    text = _mcp_text(default)
+    assert "MY-SUBMISSION-REPORT" not in text
+    assert "[bounded] updates 10/13" in text
+    assert "BEFORE repeating a write" in text and "updates=-1" in text
+    card = _mcp_structured(default)["task"]
+    assert all(u["id"] != 5000 for u in card["updates"])
+    note = next(b for b in card["bounds"] if b["field"] == "updates")["note"]
+    assert "updates=-1" in note
+
+    whole = await hub_task_status(1613, updates=-1)
+    assert "#5000" in _mcp_text(whole) and "MY-SUBMISSION-REPORT" in _mcp_text(whole)
+    assert any(
+        u["id"] == 5000 and u["content"] == "MY-SUBMISSION-REPORT"
+        for u in _mcp_structured(whole)["task"]["updates"]
+    )
+
+    # The other variant: no such write at all — absent from the full feed too.
+    task["updates"] = later
+    absent = await hub_task_status(1613, updates=-1)
+    assert "MY-SUBMISSION-REPORT" not in _mcp_text(absent)
+    assert all(u["id"] != 5000 for u in _mcp_structured(absent)["task"]["updates"])
+
+
+def test_the_transport_hint_sends_a_truncated_feed_check_to_the_full_feed() -> None:
+    """AC-2 (#1613): the hint a swallowed task write carries names updates=-1."""
+    from hub import mcp_server as srv
+
+    pattern, tool, advice = next(
+        row for row in srv._TRANSPORT_WRITE_CHECKS if row[1] == "hub_task_status"
+    )
+    assert pattern.match("/api/tasks/1250/updates")
+    assert "updates=-1" in advice and "{task_id}" in advice
+
+
+async def test_the_compact_task_card_keeps_the_required_fields(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """AC-3 (#1613): every required card field is present and equals REST."""
+    rest = _big_task()
+    mock_api_get.return_value = rest
+    out = await hub_task_status(1613)
+    card = _mcp_structured(out)["task"]
+    required = (
+        "id title status work_type size submission_generation submission_sha "
+        "branch pr_number review_verdict review_approved_current latest_review "
+        "dependencies"
+    ).split()
+    for name in required:
+        assert name in card, name
+        assert card[name] == rest[name], name
+    assert card["acceptance_criteria_ids"] == [f"AC-{i}" for i in range(1, 6)]
+    assert card["updates_total"] == len(rest["updates"])
+    assert card["updates"] == [
+        {key: u[key] for key in ("id", "created_at", "kind", "agent", "content")}
+        for u in rest["updates"][-10:]
+    ]
+    assert isinstance(card["bounds"], list) and card["bounds"]
+    # Through the real FastMCP path: the SDK validates structuredContent
+    # against the published outputSchema (task: dict) on the server.
+    from hub import mcp_server as srv
+
+    called = await srv.mcp.call_tool("hub_task_status", {"task_id": 1613})
+    assert isinstance(called, (CallToolResult, tuple, list, dict))
+
+
+def _golden_task() -> dict[str, Any]:
+    """Fixture whose full=true text was captured from develop (74d48f5)."""
+    return {
+        "id": 321,
+        "title": "Golden",
+        "status": "review",
+        "source": "agent",
+        "runtime": "auto",
+        "assigned_agent": "tester",
+        "job_id": None,
+        "exit_code": None,
+        "auto_review": True,
+        "review_cycle": 1,
+        "created_at": "2026-01-01T00:00:00Z",
+        "description": "Describe it.",
+        "technical_hints": "Look here.",
+        "scope_in": ["a", "b"],
+        "scope_out": ["c"],
+        "validation_commands": ["uv run pytest -q"],
+        "lifecycle_hint": "waiting for ci",
+        "latest_review": {
+            "verdict": "changes_requested",
+            "submission_generation": 2,
+            "is_current": True,
+            "findings": [{"id": 1, "severity": "high", "message": "Fix"}],
+        },
+        "acceptance_criteria": [
+            {
+                "id": "AC-1",
+                "verifiable_by": "test",
+                "given": "g",
+                "when": "w",
+                "then": "t",
+            }
+        ],
+        "updates": [
+            {
+                "id": 7,
+                "created_at": "2026-01-02T00:00:00Z",
+                "kind": "status",
+                "agent": "a1",
+                "content": "one",
+            },
+            {
+                "id": 8,
+                "created_at": "2026-01-03T00:00:00Z",
+                "kind": "report",
+                "agent": "",
+                "content": "two",
+            },
+        ],
+        "result_text": "Done.",
+        "log_tail": ["l1", "l2"],
+    }
+
+
+_GOLDEN_FULL_TEXT = "Task #321: Golden\nStatus: review\nSource: agent\nRuntime: auto\nAgent: tester\nJob ID: None\nExit code: None\nReview: enabled, cycle 1\nCreated: 2026-01-01T00:00:00Z\n\nDescription:\nDescribe it.\n\nTechnical hints:\nLook here.\n\nScope:\n  In: a; b\n  Out: c\n\nValidation commands:\n  - uv run pytest -q\n\nLifecycle: waiting for ci\n\nLatest review: CHANGES_REQUESTED for submission #2 (current)\n  1. [high] Fix\n\nAcceptance criteria:\n  AC-1 [test]\n    Given: g\n    When: w\n    Then: t\n\nUpdates:\n  [2026-01-02T00:00:00Z] (status) a1: one\n  [2026-01-03T00:00:00Z] (report) : two\n\nResult:\nDone.\n\nLog tail:\nl1\nl2"
+
+
+async def test_full_text_is_the_text_develop_produced(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    """#1613: full=true keeps the pre-change text byte for byte (reference
+    captured from develop 74d48f5, not produced by the code under test) —
+    including the id-less feed line — and checks no updates bound at all."""
+    mock_api_get.return_value = _golden_task()
+    for kwargs in ({"full": True}, {"full": True, "updates": -2}):
+        out = await hub_task_status(321, **kwargs)
+        assert json.loads(_mcp_text(out))["message"] == _GOLDEN_FULL_TEXT
+        assert _mcp_structured(out)["task"] == _golden_task()
+    with pytest.raises(HubApiError):
+        await hub_task_status(321, updates=-2)
+
+
+async def test_the_text_says_when_findings_are_cut_at_ten(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    task = _golden_task()
+    task["latest_review"]["findings"] = [
+        {"id": i, "severity": "low", "message": f"finding-{i}"} for i in range(1, 51)
+    ]
+    mock_api_get.return_value = task
+    out = await hub_task_status(321)
+    text = _mcp_text(out)
+    assert "finding-10" in text and "finding-11" not in text
+    assert "[bounded] latest_review.findings 10/50 items — full: full=true" in text
+    # The card keeps the whole latest_review (equal to REST), so it states no cut.
+    card = _mcp_structured(out)["task"]
+    assert len(card["latest_review"]["findings"]) == 50
+    assert all(b["field"] != "latest_review.findings" for b in card["bounds"])
+
+
+async def test_bounds_count_what_was_cut_in_one_stated_unit(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock
+) -> None:
+    task = _golden_task()
+    task["description"] = "x" * 1490 + " " * 40 + "tail" * 10  # blank run at the cut
+    task["updates"][1]["content"] = "L" * 2000
+    mock_api_get.return_value = task
+    out = await hub_task_status(321)
+    text = json.loads(_mcp_text(out))["message"]
+    card = _mcp_structured(out)["task"]
+
+    # (a) the cut entry is counted in characters of THAT entry
+    entry = next(b for b in card["bounds"] if b["field"] == "updates[#8].content")
+    assert (entry["unit"], entry["shown"], entry["total"]) == ("chars", 800, 2000)
+    assert "[bounded] updates[#8].content 800/2000 chars" in text
+    assert not any(b["field"] == "updates.content" for b in card["bounds"])
+
+    # (b) text and card state their own cuts: the card has no description at all
+    desc_text = "[bounded] description 1500/1570 chars"
+    assert desc_text in text
+    in_card = next(b for b in card["bounds"] if b["field"] == "description")
+    assert (in_card["shown"], in_card["total"]) == (0, 1570)
+    assert "description" not in card
+    # a short field is absent from the card too — and named
+    hints = next(b for b in card["bounds"] if b["field"] == "technical_hints")
+    assert (hints["shown"], hints["total"]) == (0, len("Look here."))
+    assert "technical_hints" not in text.split("[bounded]", 1)[1]
+
+    # (c) the declared omission is the real one: 1570-1500, the blank run kept
+    excerpt_line = next(
+        line for line in text.splitlines() if line.startswith("x" * 100)
+    )
+    assert excerpt_line.endswith("… [+70 chars]")
+    assert excerpt_line[: -len("… [+70 chars]")] == task["description"][:1500]
+
+
+def test_the_published_schema_has_no_generated_titles() -> None:
+    from hub import mcp_server as srv
+
+    tool = srv.mcp._tool_manager.get_tool("hub_task_status")
+    assert tool is not None
+    assert "title" not in tool.parameters
+    assert all("title" not in p for p in tool.parameters["properties"].values())
