@@ -17261,3 +17261,187 @@ def test_a_local_only_tests_candidate_may_stay_unresolved():
             assert "НЕДОСТИЖИМОСТЬ по одному статическому кандидату НЕ подтверждай" in (
                 tail.replace("\n", " ")
             )
+
+
+# ================================================== снимок исходников (#1599)
+
+
+async def _snapshot_order(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    monkeypatch,
+    tmp_path,
+    slug: str,
+    archive,
+    *,
+    enabled: bool = True,
+    transport: str = "runner",
+    first: bool = False,
+    blocker: str = "",
+):
+    """Локальный заказ со снимком: ``(промт, kwargs запуска, вызовы архива, task_id)``.
+
+    Запуск ревьюера подменён: тест судит то, ЧТО хаб передал прогону (промт и
+    снимок), а не само чтение — оно проверено в test_local_reviewer.
+    """
+    from hub.integrations.protocols import SnapshotArchive  # noqa: F401
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-x"}, "run": {"id": "r-x"}})
+    _wire(monkeypatch, recorder)
+    if first:
+        # Принципал заводится один раз на базу; токен держится до конца теста.
+        await _local_principal(db, monkeypatch)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SNAPSHOT", enabled, raising=False)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SNAPSHOT_MAX_BYTES", 12345, raising=False)
+    monkeypatch.setattr(config, "LOCAL_REVIEW_TRANSPORT", transport)
+    monkeypatch.setattr(local_reviewer.review_snapshot, "blocker", lambda _t: blocker)
+    spool = tmp_path / "spool"
+    spool.mkdir(parents=True)
+    (spool / "heartbeat").write_text("{}")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SPOOL_DIR", str(spool))
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SANDBOX", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_CMD", "")
+    monkeypatch.setattr(config, "LOCAL_REVIEW_SCRATCH_DIR", "")
+
+    taken: list[tuple] = []
+
+    async def _take(self, repo, sha, max_bytes, ref=""):
+        taken.append((repo, sha, max_bytes, ref))
+        return archive(sha)
+
+    monkeypatch.setattr(NoopGitOps, "snapshot_archive", _take, raising=False)
+    seen: list[tuple[str, dict]] = []
+
+    async def _run(prompt, **kwargs):
+        seen.append((prompt, kwargs))
+        return local_reviewer.LocalRun(
+            rc=1, output="", dropped=0, timed_out=False, duration_ms=1
+        )
+
+    monkeypatch.setattr(local_reviewer, "run_review", _run)
+    task_id = await _submitted(
+        client,
+        db,
+        slug,
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    await wait_for_local_runs()
+    await db.commit()
+    assert len(seen) == 1, "локальный прогон один"
+    return seen[0][0], seen[0][1], taken, task_id
+
+
+async def test_the_local_prompt_names_the_snapshot_state_and_the_path(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """Состояние снимка в промте — то, что хаб передал прогону; три состояния."""
+    from hub.integrations import review_snapshot
+    from hub.integrations.protocols import SnapshotArchive
+    from hub.services.review_dispatch import LOCAL_CAPABILITIES_BLOCK
+
+    # ---- ok: путь-токен, имя состояния, поправка блока возможностей, архив на sha.
+    ok = lambda sha: SnapshotArchive(  # noqa: E731
+        sha=sha, data=b"TAR", note="исключено 2 ссылок"
+    )
+    prompt, kwargs, taken, task_id = await _snapshot_order(
+        client, db, monkeypatch, tmp_path / "ok", "snap-ok", ok, first=True
+    )
+    row = dict(
+        (await db.execute_fetchall("SELECT * FROM tasks WHERE id=?", (task_id,)))[0]
+    )
+    sha = row["submission_sha"]
+    assert sha and taken[0][1] == sha, "архив снимается на ЗАКРЕПЛЁННОМ sha сдачи"
+    assert taken[0][2] == 12345, "потолок берётся из настройки хаба"
+    assert kwargs["snapshot"].state == "ok" and kwargs["snapshot"].data == b"TAR"
+    assert "СНИМОК ИСХОДНИКОВ (только чтение)" in prompt
+    assert review_snapshot.PATH_PLACEHOLDER in prompt, (
+        "путь подставляет транспорт, не заказ"
+    )
+    assert sha[:12] in prompt and "исключено 2 ссылок" in prompt
+    assert "рабочего клона репозитория" in prompt, (
+        "блок возможностей поправлен: «исходников нет» при снимке было бы ложью"
+    )
+    assert "исходников репозитория (есть дифф в этом промте и бриф)" not in prompt
+    assert "git" in prompt and "Docker" in prompt, "запрет git/тестов/Docker сохранён"
+    assert "(рабочего клона нет; код вокруг диффа" in prompt
+    assert "код вокруг него — в снимке исходников" in prompt, (
+        "фраза предмета ревью «исходников на машине не ищи» при снимке неверна"
+    )
+    assert "Снимок исходников на" in "\n".join(
+        str(u["content"]) for u in await _updates(db, task_id)
+    ), "карточка называет снимок"
+
+    # ---- absent: режим этапа 1 без изменений, причина названа.
+    absent = lambda sha: SnapshotArchive(  # noqa: E731
+        sha=sha, data=None, reason="архив больше потолка 12345 байт"
+    )
+    prompt, kwargs, _, task_id = await _snapshot_order(
+        client, db, monkeypatch, tmp_path / "absent", "snap-absent", absent
+    )
+    assert "СНИМОК ИСХОДНИКОВ: не собран — архив больше потолка 12345 байт" in prompt
+    assert LOCAL_CAPABILITIES_BLOCK in prompt, "блок возможностей этапа 1 не тронут"
+    assert review_snapshot.PATH_PLACEHOLDER not in prompt
+    assert kwargs["snapshot"].state == "absent"
+
+    # ---- empty: отдельное состояние, не «не смонтирован».
+    empty = lambda sha: SnapshotArchive(  # noqa: E731
+        sha=sha, data=None, empty=True, reason="дерево пусто"
+    )
+    prompt, kwargs, _, _ = await _snapshot_order(
+        client, db, monkeypatch, tmp_path / "empty", "snap-empty", empty
+    )
+    assert "пусто — читать в нём нечего" in prompt and "не сбой монтирования" in prompt
+    assert review_snapshot.PATH_PLACEHOLDER not in prompt
+
+    # ---- транспорт не может дать снимок (direct без защищённого распаковщика):
+    #      архив не снимается, причина названа, режим этапа 1.
+    prompt, kwargs, taken, _ = await _snapshot_order(
+        client,
+        db,
+        monkeypatch,
+        tmp_path / "blocked",
+        "snap-blocked",
+        ok,
+        blocker="распаковщик не защищён: тест",
+    )
+    assert taken == [], "архив снят, хотя транспорт принять его не может"
+    assert "не собран — распаковщик не защищён: тест" in prompt
+    assert kwargs["snapshot"].state == "absent"
+
+    # ---- настройка выключена: заказ ровно прежний, архив не снимался.
+    prompt, kwargs, taken, _ = await _snapshot_order(
+        client, db, monkeypatch, tmp_path / "off", "snap-off", ok, enabled=False
+    )
+    assert taken == [], "архив снят при выключенной настройке"
+    assert "snapshot" not in kwargs, "прогон без снимка зовётся как до задачи"
+    assert "СНИМОК ИСХОДНИКОВ" not in prompt and LOCAL_CAPABILITIES_BLOCK in prompt
+    assert "исходников на машине не ищи" in prompt, "без снимка фраза прежняя"
+
+
+async def _updates(db: aiosqlite.Connection, task_id: int) -> list[dict]:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM task_updates WHERE task_id=? ORDER BY id", (task_id,)
+    )
+    return [dict(r) for r in rows]
+
+
+def test_the_snapshot_edits_of_the_capability_block_really_apply() -> None:
+    """Обе замены блока возможностей находят свой текст: иначе поправка молчит."""
+    from hub.integrations.protocols import SnapshotArchive
+    from hub.services import review_dispatch as rd
+
+    assert rd._CAP_NO_SOURCES in rd.LOCAL_CAPABILITIES_BLOCK
+    assert rd._CAP_NO_OUTSIDE_READING in rd.LOCAL_CAPABILITIES_BLOCK
+    changed = rd.local_capabilities_block(SnapshotArchive(sha="a" * 40, data=b"x"))
+    assert changed != rd.LOCAL_CAPABILITIES_BLOCK
+    assert rd._CAP_NO_SOURCES not in changed
+    assert rd._CAP_NO_OUTSIDE_READING not in changed
+    for state in (
+        SnapshotArchive(sha="a" * 40, data=None, reason="x"),
+        SnapshotArchive(sha="a" * 40, data=None, empty=True),
+        None,
+    ):
+        assert rd.local_capabilities_block(state) == rd.LOCAL_CAPABILITIES_BLOCK

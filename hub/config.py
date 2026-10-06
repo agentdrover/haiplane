@@ -456,6 +456,24 @@ LOCAL_REVIEW_TRANSPORT = env_get("LOCAL_REVIEW_TRANSPORT", "direct")
 # Каталог очереди службы-исполнителя: обязан лежать в ReadWritePaths хаба и
 # быть доступен службе (2770, общая группа). Нужен только при ``runner``.
 LOCAL_REVIEW_SPOOL_DIR = env_get("LOCAL_REVIEW_SPOOL_DIR", "")
+# Снимок исходников для локального ревьюера (#1599). ВЫКЛЮЧЕН по умолчанию и
+# включается ТОЛЬКО после установки защищённого распаковщика, новой службы и
+# новой обёртки (порядок — deploy/LOCAL-REVIEW.md): задание со снимком идёт
+# форматом version=2, который старая служба отклоняет, а хаб не может знать,
+# что на хосте уже стоит. Выключено — хаб шлёт version=1 без снимка, как до
+# задачи, и ревьюер судит по диффу.
+LOCAL_REVIEW_SNAPSHOT = env_get("LOCAL_REVIEW_SNAPSHOT", "0") == "1"
+# Потолок размера архива git archive на закреплённом sha: чтение останавливается
+# на нём и процесс убивается. Служба держит свой потолок
+# (HAIPLANE_REVIEW_RUNNER_SNAPSHOT_MAX_BYTES), не меньший этого.
+LOCAL_REVIEW_SNAPSHOT_MAX_BYTES = int(
+    env_get("LOCAL_REVIEW_SNAPSHOT_MAX_BYTES", str(64 * 1024 * 1024))
+)
+# Только для транспорта direct: путь к защищённому snapshot_unpack.py (файл и
+# каталоги над ним — root, на запись никому). Хаб грузит распаковщик ТОЛЬКО
+# отсюда, после проверки; из клона и spool — никогда. Пусто — снимка при direct
+# нет, причина названа. При runner не читается: распаковывает служба.
+LOCAL_REVIEW_SNAPSHOT_UNPACKER = env_get("LOCAL_REVIEW_SNAPSHOT_UNPACKER", "")
 # Review profiles (#807). The lite profile reviews the branch diff in one
 # pass; deep is the multi-agent harness.
 #

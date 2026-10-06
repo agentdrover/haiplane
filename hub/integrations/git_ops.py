@@ -10,10 +10,13 @@ one in.
 
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
 import os
 import re
 import socket
+import tarfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -34,6 +37,7 @@ from hub.integrations.protocols import (
     FOREIGN_PR_ONLY,
     ForgePlugin,
     MergeabilityOutcome,
+    SnapshotArchive,
     StackProbeOutcome,
     StackProbeResult,
 )
@@ -715,6 +719,58 @@ def _conv_commit_type(title: str) -> str:
     if any(k in t for k in ("ci", "cd", "pipeline", "deploy")):
         return "ci"
     return "feat"
+
+
+#: Тип записи tar, которую снимок несёт: обычные файлы и каталоги (#1599).
+_SNAPSHOT_KEPT = (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE)
+
+
+def _snapshot_is_empty(raw: bytes) -> bool:
+    """``git archive`` пустого дерева — один pax_global_header без записей."""
+    return raw.startswith(b"pax_global_header") and not raw[1024:].strip(b"\x00")
+
+
+def _snapshot_repack(raw: bytes) -> tuple[bytes, str, int]:
+    """Перепаковать ``git archive`` в канонический tar снимка: ``(tar, note, n)``.
+
+    Политика, названная явно (#1599). Защищённый распаковщик принимает только
+    обычные файлы и каталоги в ustar без PAX-переопределений, поэтому хаб
+    сам убирает то, что распаковщик отверг бы целиком: символьные ссылки
+    (их цель вне снимка, ревьюеру они не нужны — отброшены и посчитаны) и
+    записи, чьё имя не умещается в ustar. Submodule git archive отдаёт
+    пустым каталогом, он не раскрывается. ``export-ignore`` и
+    ``export-subst`` — как у ``git archive``: действует то, что записано в
+    дереве на sha. Режимы, uid/gid, время не переносятся — это не данные.
+    """
+    if _snapshot_is_empty(raw):
+        return b"", "", 0
+    out = io.BytesIO()
+    dropped: dict[str, int] = {}
+    count = 0
+    with (
+        tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as source,
+        tarfile.open(fileobj=out, mode="w", format=tarfile.USTAR_FORMAT) as target,
+    ):
+        for member in source:
+            if member.type not in _SNAPSHOT_KEPT:
+                kind = "ссылок" if member.issym() or member.islnk() else "прочих"
+                dropped[kind] = dropped.get(kind, 0) + 1
+                continue
+            entry = tarfile.TarInfo(member.name)
+            entry.type = tarfile.DIRTYPE if member.isdir() else tarfile.REGTYPE
+            entry.mode = 0o755 if member.isdir() else 0o644
+            entry.size = 0 if member.isdir() else member.size
+            try:
+                if member.isdir():
+                    target.addfile(entry)
+                else:
+                    target.addfile(entry, source.extractfile(member))
+            except ValueError:
+                dropped["длинных путей"] = dropped.get("длинных путей", 0) + 1
+                continue
+            count += 1
+    note = ", ".join(f"исключено {n} {kind}" for kind, n in sorted(dropped.items()))
+    return out.getvalue(), note, count
 
 
 async def _git(*args: str, repo: str | None = None, **kw) -> tuple[int, str, str]:
@@ -2371,6 +2427,67 @@ class GitOpsIntegration:
                 return (True, "")
             return (False, (err_ref or err or "").strip())
         return (False, (err or "").strip())
+
+    async def snapshot_archive(
+        self, repo: str, sha: str, max_bytes: int, ref: str = ""
+    ) -> SnapshotArchive:
+        """Снимок дерева на закреплённом ``sha`` для ревьюера без клона (#1599).
+
+        ``git archive --format=tar <sha>``, прочитанный ПОТОКОМ с потолком
+        (``proc.run_capped``): превышение останавливает и убивает процесс, а не
+        копит вывод. Вывод — сырые байты, без decode и strip. Объект ``sha``
+        при необходимости доставляется (``commit_exists`` → ``fetch_commit``).
+        Ни одна ветка не бросает: отсутствие снимка — это ``SnapshotArchive``
+        с названной причиной, и вызывающий не принимает его за «чисто».
+        Политика содержимого — в ``_snapshot_repack``.
+        """
+        if not sha or not repo:
+            return SnapshotArchive(sha=sha, data=None, reason="нет sha или клона")
+        exists = await self.commit_exists(repo, sha)
+        if exists is None:
+            return SnapshotArchive(sha=sha, data=None, reason="клон не читается")
+        if not exists:
+            fetched, why = await self.fetch_commit(repo, sha, ref)
+            if not fetched:
+                return SnapshotArchive(
+                    sha=sha,
+                    data=None,
+                    reason=f"коммит {sha[:12]} не найден в клоне хаба и не "
+                    f"доставлен: {why or 'причина не названа'}"[:300],
+                )
+        rc, raw, err = await proc.run_capped(
+            "git",
+            "-C",
+            repo,
+            "archive",
+            "--format=tar",
+            sha,
+            cwd=repo,
+            timeout=120,
+            max_bytes=max_bytes,
+        )
+        if rc != 0:
+            reason = (
+                f"архив больше потолка {max_bytes} байт"
+                if rc == -2
+                else f"git archive не удался (rc={rc}): {err}"
+            )
+            return SnapshotArchive(sha=sha, data=None, reason=reason[:300])
+        try:
+            data, note, count = await asyncio.to_thread(_snapshot_repack, raw)
+        except (tarfile.TarError, OSError, ValueError) as exc:
+            return SnapshotArchive(
+                sha=sha, data=None, reason=f"архив не разобран: {exc}"[:300]
+            )
+        if count == 0:
+            return SnapshotArchive(
+                sha=sha,
+                data=None,
+                empty=True,
+                note=note,
+                reason="дерево на закреплённом sha пусто",
+            )
+        return SnapshotArchive(sha=sha, data=data, note=note)
 
     async def first_parent_log(self, repo: str, base: str, limit: int) -> str | None:
         """Commits on the base's own line, newest first, or None on failure.
