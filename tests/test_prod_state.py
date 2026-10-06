@@ -180,9 +180,13 @@ class _FakeGit:
 def _wire_fake_git(monkeypatch, fake: _FakeGit, ctx: dict | None = None) -> dict:
     from hub import app as hub_app
 
-    context = dict(ctx if ctx is not None else {"repo": "/ws/one", "base_branch": "main"})
+    context = dict(
+        ctx if ctx is not None else {"repo": "/ws/one", "base_branch": "main"}
+    )
     monkeypatch.setattr(
-        hub_app.services, "project_git_context", AsyncMock(side_effect=lambda *_: dict(context))
+        hub_app.services,
+        "project_git_context",
+        AsyncMock(side_effect=lambda *_: dict(context)),
     )
     for name in ("commit_exists", "is_ancestor", "commit_with_same_tree"):
         monkeypatch.setattr(plugins.git_ops, name, getattr(fake, name), raising=False)
@@ -222,7 +226,9 @@ async def test_prod_state_checks_tasks_with_bounded_parallelism(
     ceiling = getattr(ps, "MAX_CONCURRENCY", 8)
     assert fake.peak > 1, "checks ran one by one"
     assert fake.peak <= ceiling
-    listed = [int(r["id"]) for r in await repo.list_tasks_by_status(db, "completed", limit=50)]
+    listed = [
+        int(r["id"]) for r in await repo.list_tasks_by_status(db, "completed", limit=50)
+    ]
     assert [e["task_id"] for e in snapshot["in_prod"]] == listed
     assert sorted(listed) == sorted(ids)
     assert reads == 1, f"latest_successful_release read {reads} times"
@@ -293,7 +299,9 @@ async def test_prod_state_budget_moves_unchecked_tasks_to_unknown(
     elapsed = time.monotonic() - started
 
     assert elapsed < budget + 1.0, f"snapshot took {elapsed:.1f}s"
-    unchecked = [e for e in snapshot["unknown"] if "срок сборки снимка исчерпан" in e["reason"]]
+    unchecked = [
+        e for e in snapshot["unknown"] if "срок сборки снимка исчерпан" in e["reason"]
+    ]
     assert unchecked, "nothing was left unchecked"
     assert snapshot["not_in_prod"] == []
     assert snapshot["examined"] == 12 - len(unchecked)
