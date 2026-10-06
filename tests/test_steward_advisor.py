@@ -1450,6 +1450,11 @@ async def test_the_description_and_the_hypothesis_void_the_consent(
     await db.commit()
     assert await advisor_refusal(db, task_id, 1) is not None
 
+    third = await _consented_on_real_hash(db, "advisor-hash-description")
+    await repo.update_task(db, third, description="переписанное описание")
+    await db.commit()
+    assert await advisor_refusal(db, third, 1) is not None
+
     again = await _consented_on_real_hash(db, "advisor-hash-text-2")
     await repo.update_task(db, again, outcome_metric="другая метрика")
     await db.commit()
@@ -1462,7 +1467,7 @@ async def test_a_volatile_brief_field_does_not_void_the_consent(
     """Поля, которые двигаются сами (обновлено, цикл ревью), согласие не убивают."""
     task_id = await _consented_on_real_hash(db, "advisor-hash-stable")
 
-    await repo.update_task(db, task_id, priority="high")
+    await repo.update_task(db, task_id, priority="high", review_cycle=2)
     await repo.add_task_update(db, task_id, "denis", "status", "просто строка")
     await db.commit()
 

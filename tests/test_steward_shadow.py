@@ -4273,6 +4273,67 @@ async def test_clearing_closes_the_case_not_the_task(db: aiosqlite.Connection):
     assert await _active(db) == [(task_id, "prod_defect", str(defect))]
 
 
+async def test_a_second_return_after_a_clear_is_a_new_active_case(
+    db: aiosqlite.Connection,
+):
+    """Тот же источник, новый случай: второй возврат после снятия первого — новая запись."""
+    from hub.services.steward_exit import clear_false_approval, current_false_approvals
+
+    project_id = await _project(db, "advisor-fa-second-return")
+    task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    first = await _human(db, task_id, "changes_requested")
+    assert await clear_false_approval(db, task_id, "denis") == 1
+    second = await _human(db, task_id, "changes_requested")
+
+    found = await current_false_approvals(db)
+
+    assert [(f.source, f.ref) for f in found] == [
+        ("human_changes_requested", str(second))
+    ]
+    assert first != second
+
+
+async def test_clearing_a_case_found_but_not_yet_recorded_closes_it(
+    db: aiosqlite.Connection,
+):
+    """Найденный, но ещё не закреплённый случай снимается и не возвращается."""
+    from hub.services.steward_exit import (
+        clear_false_approval,
+        current_false_approvals,
+        record_false_approvals,
+    )
+
+    project_id = await _project(db, "advisor-fa-clear-unrecorded")
+    task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    await _human(db, task_id, "changes_requested")
+    assert await _active(db) == [], "ещё не закреплено"
+
+    assert await clear_false_approval(db, task_id, "denis") == 1
+
+    await record_false_approvals(db)
+    assert await current_false_approvals(db) == []
+
+
+async def test_an_earlier_merge_does_not_become_the_anchor_of_a_later_approval(
+    db: aiosqlite.Connection,
+):
+    """Мерж РАНЬШЕ ответа пары — доставка прошлого одобрения, а не этого.
+
+    Якорь — первый мерж после одобрения: иначе дефект этого одобрения считался
+    бы от чужой, давней доставки и выпадал из окна.
+    """
+    from hub.services.steward_exit import current_false_approvals
+
+    project_id = await _project(db, "advisor-fa-anchor")
+    task_id = await _v2_row(db, project_id, verdict="approve", advisor="concur")
+    await _age_pair(db, task_id, 5)
+    await _deliver(db, task_id, 50)  # доставка прошлого поколения
+    await _deliver(db, task_id, 4)  # доставка ЭТОГО одобрения
+    await _prod_defect(db, task_id, days_ago=1)
+
+    assert [f.source for f in await current_false_approvals(db)] == ["prod_defect"]
+
+
 async def test_clearing_without_an_active_case_buys_no_immunity(
     db: aiosqlite.Connection,
 ):
