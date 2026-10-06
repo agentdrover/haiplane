@@ -1768,3 +1768,98 @@ async def test_done_from_pending_report_also_names_path_notices(
     assert any("закреплённую копию" in w for w in resp.json()["warnings"])
     lines = _notice_lines(await repo.get_task_updates(db, task_id))
     assert len(lines) == 1 and "deploy/remote-deploy.sh" in lines[0]
+
+
+# ---------------------------------------------------------------------------
+# #1592: accept_areas на широкой задаче не роняет сдачу 500
+# ---------------------------------------------------------------------------
+
+
+async def test_accept_areas_beyond_twenty_paths_does_not_500(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1592 AC-1: 20 заявленных путей + 8 незаявленных — через настоящий вход.
+
+    Прод 05.10 (#1589): слияние давало 28 записей при лимите 20 у ввода refine,
+    pydantic ValidationError не ловился, и сдача отвечала голым 500.
+    """
+    from hub import config
+    from hub.commit_scope import SCOPE_GROWTH_MARKER
+    from hub.db import deserialize_str_list
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+
+    monkeypatch.setattr(config, "SDD_SURFACES", "warn")
+    declared = [f"hub/declared_{i}.py" for i in range(20)]
+    extra = [f"hub/extra_{i}.py" for i in range(8)]
+
+    class _Diff(NoopGitOps):
+        async def branch_diff_paths(self, branch, base_branch=None, repo=None):
+            return declared + extra
+
+    monkeypatch.setattr(plugins, "git_ops", _Diff())
+    task_id = (await client.post("/api/tasks", json={"title": "Wide"})).json()["id"]
+    resp = await client.post(
+        f"/api/tasks/{task_id}/refine", json={"affected_areas": declared}
+    )
+    assert resp.status_code == 200, resp.text
+    await client.post(
+        f"/api/tasks/{task_id}/updates",
+        json={"agent": "dev", "kind": "status", "content": "Plan: wide work"},
+    )
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start", json={"assigned_agent": "dev"}
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/submit-review", json={"accept_areas": True}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "review"
+    stored = deserialize_str_list(
+        dict(await repo.get_task(db, task_id))["affected_areas"]
+    )
+    assert stored == declared + extra, "принятый объём сохранён целиком"
+    updates = await repo.get_task_updates(db, task_id)
+    growth = [u["content"] for u in updates if SCOPE_GROWTH_MARKER in u["content"]]
+    assert len(growth) == 1 and "+8" in growth[0], growth
+
+    # Следующая сдача с теми же путями о них не предупреждает: объём принят.
+    before = len(updates)
+    resp = await client.post(f"/api/tasks/{task_id}/submit-review", json={})
+    assert resp.status_code == 200, resp.text
+    later = [u["content"] for u in (await repo.get_task_updates(db, task_id))[before:]]
+    assert not any("Вне объявленной области" in c for c in later), later
+    assert not any(SCOPE_GROWTH_MARKER in c for c in later), later
+
+    # Лимит 20 остаётся для refine от агента: хаб обошёл его только для
+    # собственной записи принятого объёма.
+    resp = await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={"affected_areas": [f"x{i}.py" for i in range(21)]},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+async def test_bulk_children_with_too_many_risks_refuse_before_writes(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1592 scope_in п.2: lifecycle ~1199 строит TaskRefine(risks=...) из ввода.
+
+    Больше MAX_RISKS рисков в элементе пачки давало ValidationError уже после
+    записи первых строк; теперь отказ 422 на входе, до записей.
+    """
+    parent = (await client.post("/api/tasks", json={"title": "Epic parent"})).json()
+    risk = {
+        "kind": "large_scope",
+        "severity": "low",
+        "description": "r",
+        "mitigation": "m",
+    }
+    resp = await client.post(
+        f"/api/tasks/{parent['id']}/subtasks",
+        json={"items": [{"title": "child", "risks": [risk] * 51}]},
+    )
+    assert resp.status_code == 422, resp.text

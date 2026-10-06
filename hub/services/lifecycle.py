@@ -3352,7 +3352,15 @@ async def _record_accepted_scope(
         return
     declared = deserialize_str_list(task.get("affected_areas"))
     merged = list(declared) + [p for p in accepted_paths if p not in declared]
-    await repo.update_task_structured(db, task_id, TaskRefine(affected_areas=merged))
+    # #1592: NOT TaskRefine(affected_areas=...). Its max_length=20 is the limit
+    # on what an AGENT may send through refine; the accepted scope is a fact
+    # about the diff, and on a wide task declared+accepted passes 20 (28 on
+    # #1589 on 05.10 -> ValidationError -> bare 500). The hub's own write
+    # bypasses the input model; every reader takes the column as is. We are in
+    # the caller's transaction, so a failure here leaves the submission whole.
+    await repo.update_task(
+        db, task_id, affected_areas=db_module.serialize_str_list(merged)
+    )
     shown = ", ".join(accepted_paths[:10])
     more = f" и ещё {len(accepted_paths) - 10}" if len(accepted_paths) > 10 else ""
     # A separate, visible event on purpose. Without it affected_areas would
