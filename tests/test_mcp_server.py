@@ -3094,16 +3094,18 @@ async def test_hub_my_context_without_task_id(mock_api_get: AsyncMock) -> None:
     # AC-1 (#454): no task_id → general Hub context, no validation error.
     # #987 changed what the list means: it names live work, not holder history,
     # so this fixture now carries a running row beside the completed one.
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        {
-            "tasks": [
-                {"id": 451, "title": "Pair workspace", "status": "completed"},
-                {"id": 452, "title": "Live one", "status": "running"},
-            ],
-            "next_cursor": None,
-        },
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            {
+                "tasks": [
+                    {"id": 451, "title": "Pair workspace", "status": "completed"},
+                    {"id": 452, "title": "Live one", "status": "running"},
+                ],
+                "next_cursor": None,
+            },
+        ]
+    )
     out = await hub_my_context()
     text = _mcp_text(out)
     assert "Hub Context (no task)" in text
@@ -3261,15 +3263,17 @@ async def test_hub_my_context_task_includes_worktree_from_context(
 
 async def test_hub_my_context_shows_workspace_mode(mock_api_get: AsyncMock) -> None:
     # AC-3 (#530): general context reports the active workspace mode.
-    mock_api_get.side_effect = [
-        {
-            "username": "cursor",
-            "role": "agent",
-            "principal_id": 7,
-            "workspace_mode": "worktree",
-        },
-        [],
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {
+                "username": "cursor",
+                "role": "agent",
+                "principal_id": 7,
+                "workspace_mode": "worktree",
+            },
+            [],
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "Workspace mode: worktree" in text
     assert mock_api_get.await_args_list[0].args[0] == "/api/diagnostics/identity"
@@ -3534,23 +3538,51 @@ def test_mcp_initialize_server_name_is_haiplane_hub():
 # 151 completed rows against two live ones, and 48 of the newest 50 final.
 
 
+_POLICY_ANSWER = {
+    "slug": "default",
+    "keys": [],
+    "steward": {"requested": "off", "effective": "off"},
+}
+
+
+def _with_policy(responses: list[Any]) -> Any:
+    """Ответы по порядку; чтение политики проекта (#1594) идёт отдельным путём.
+
+    Общий контекст теперь читает политику default, и этот вызов не должен
+    занимать место в очереди ответов, написанной до него.
+    """
+    queue = list(responses)
+
+    async def _answer(path: str, *_a: Any, **_k: Any) -> Any:
+        if "/effective-policy" in path:
+            return _POLICY_ANSWER
+        item = queue.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    return _answer
+
+
 def _page(rows: list[dict], cursor: int | None = None) -> dict:
     return {"tasks": rows, "next_cursor": cursor}
 
 
 async def test_my_context_drops_completed_claimed(mock_api_get: AsyncMock) -> None:
     """AC-1: digest and structured my_tasks name the running task, not the done one."""
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page(
-            [
-                {"id": 900, "title": "Done long ago", "status": "completed"},
-                {"id": 901, "title": "Live work", "status": "running"},
-                {"id": 902, "title": "Abandoned", "status": "failed"},
-                {"id": 903, "title": "Turned down", "status": "rejected"},
-            ]
-        ),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page(
+                [
+                    {"id": 900, "title": "Done long ago", "status": "completed"},
+                    {"id": 901, "title": "Live work", "status": "running"},
+                    {"id": 902, "title": "Abandoned", "status": "failed"},
+                    {"id": 903, "title": "Turned down", "status": "rejected"},
+                ]
+            ),
+        ]
+    )
     out = await hub_my_context()
     text = _mcp_text(out)
     assert "#901" in text
@@ -3572,13 +3604,15 @@ async def test_my_context_waiting_is_client_driven_review(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-2: a review nobody automated is waiting on a human, not on me."""
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page([{"id": 910, "title": "Submitted", "status": "review"}]),
-        # The compact card cannot carry review_job_id, so the exclusion is
-        # resolved with one status-filtered call.
-        [{"id": 910, "status": "review", "review_job_id": None}],
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page([{"id": 910, "title": "Submitted", "status": "review"}]),
+            # The compact card cannot carry review_job_id, so the exclusion is
+            # resolved with one status-filtered call.
+            [{"id": 910, "status": "review", "review_job_id": None}],
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     waiting = next(
         ln for ln in text.split("\\n") if ln.startswith("Waiting on a human")
@@ -3591,11 +3625,13 @@ async def test_my_context_headless_review_is_in_flight(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-3: a review the poller owns is still the agent's turn."""
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page([{"id": 911, "title": "Headless", "status": "review"}]),
-        [{"id": 911, "status": "review", "review_job_id": "job-7"}],
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page([{"id": 911, "title": "Headless", "status": "review"}]),
+            [{"id": 911, "status": "review", "review_job_id": "job-7"}],
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     in_flight = next(ln for ln in text.split("\\n") if ln.startswith("In flight"))
     assert "#911" in in_flight
@@ -3610,17 +3646,19 @@ async def test_my_context_pages_past_a_window_of_final_rows(
     The live shape on prod: the newest page is all final, and the running task
     sits below it. One page plus a filter would answer "none".
     """
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page(
-            [
-                {"id": 800 + i, "title": f"old {i}", "status": "completed"}
-                for i in range(50)
-            ],
-            cursor=800,
-        ),
-        _page([{"id": 700, "title": "Still running", "status": "running"}]),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page(
+                [
+                    {"id": 800 + i, "title": f"old {i}", "status": "completed"}
+                    for i in range(50)
+                ],
+                cursor=800,
+            ),
+            _page([{"id": 700, "title": "Still running", "status": "running"}]),
+        ]
+    )
     out = await hub_my_context()
     text = _mcp_text(out)
     assert "#700" in text
@@ -3640,19 +3678,21 @@ async def test_my_context_says_when_the_walk_stopped_short(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-6: a bounded walk that hits its cap says so instead of implying it saw all."""
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        *[
-            _page(
-                [
-                    {"id": 5000 + p * 50 + i, "title": "old", "status": "completed"}
-                    for i in range(50)
-                ],
-                cursor=5000 + p * 50,
-            )
-            for p in range(5)
-        ],
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            *[
+                _page(
+                    [
+                        {"id": 5000 + p * 50 + i, "title": "old", "status": "completed"}
+                        for i in range(50)
+                    ],
+                    cursor=5000 + p * 50,
+                )
+                for p in range(5)
+            ],
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "none live" in text
     assert "claimed rows" in text, "the cap must be visible, not silent"
@@ -3670,10 +3710,12 @@ async def test_my_context_never_fetches_full_cards_it_drops(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-7: the uncapped mode=full call must not pay ~10 KB a row to discard it."""
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page([{"id": 920, "title": "Live", "status": "running"}]),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page([{"id": 920, "title": "Live", "status": "running"}]),
+        ]
+    )
     await hub_my_context()  # no max_chars, mode=full — the expensive path
     claimed_call = mock_api_get.await_args_list[1].args[0]
     assert "claimed_by=cursor" in claimed_call
@@ -3684,10 +3726,12 @@ async def test_my_context_no_live_work_points_at_the_history(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-4's other half: completed work is not lost, it is one call away."""
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page([{"id": 930, "title": "Done", "status": "completed"}]),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page([{"id": 930, "title": "Done", "status": "completed"}]),
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "none live" in text
     assert "hub_list_tasks" in text and "claimed_by" in text
@@ -3700,15 +3744,17 @@ async def test_my_context_summary_keeps_in_flight_ids(mock_api_get: AsyncMock) -
     my_tasks may shrink under the cap as it did before (#834) — but a digest
     that cannot name the work it exists to name would be pointless.
     """
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page(
-            [
-                {"id": 940, "title": "Live one", "status": "running"},
-                {"id": 941, "title": "Old", "status": "completed"},
-            ]
-        ),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page(
+                [
+                    {"id": 940, "title": "Live one", "status": "running"},
+                    {"id": 941, "title": "Old", "status": "completed"},
+                ]
+            ),
+        ]
+    )
     text = _mcp_text(await hub_my_context(mode="summary"))
     assert "#940" in text
     assert "#941" not in text
@@ -3722,11 +3768,13 @@ async def test_my_context_names_an_unreadable_page_instead_of_saying_none(
     Page one is all history and points at more; page two fails. "None live" on
     its own would state as fact something the hub never got to look at.
     """
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page([{"id": 600, "title": "old", "status": "completed"}], cursor=600),
-        HubApiError({"message": "boom"}),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page([{"id": 600, "title": "old", "status": "completed"}], cursor=600),
+            HubApiError({"message": "boom"}),
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "none live" in text
     assert "could be read" in text or "could not be read" in text
@@ -3740,11 +3788,13 @@ async def test_my_context_says_when_review_bucketing_is_a_guess(
     Falling back to Waiting is the safer default, and it is still a guess: an
     agent that idles on a review the poller owns is waiting for nobody.
     """
-    mock_api_get.side_effect = [
-        {"username": "cursor", "role": "agent", "principal_id": 7},
-        _page([{"id": 610, "title": "Submitted", "status": "review"}]),
-        HubApiError({"message": "boom"}),
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {"username": "cursor", "role": "agent", "principal_id": 7},
+            _page([{"id": 610, "title": "Submitted", "status": "review"}]),
+            HubApiError({"message": "boom"}),
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "#610" in text
     assert "could not tell headless review" in text
@@ -3754,16 +3804,18 @@ async def test_my_context_digest_names_live_worktree(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-3 (#989): general digest lists the path next to an in-flight row."""
-    mock_api_get.side_effect = [
-        {
-            "username": "cursor",
-            "role": "agent",
-            "principal_id": 7,
-            "workspace_mode": "worktree",
-        },
-        _page([{"id": 452, "title": "Live one", "status": "running"}]),
-        {"id": 452, "worktree_path": "/srv/.ws-worktrees/task-452"},
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {
+                "username": "cursor",
+                "role": "agent",
+                "principal_id": 7,
+                "workspace_mode": "worktree",
+            },
+            _page([{"id": 452, "title": "Live one", "status": "running"}]),
+            {"id": 452, "worktree_path": "/srv/.ws-worktrees/task-452"},
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "In flight" in text
     assert "#452" in text
@@ -3774,16 +3826,18 @@ async def test_my_context_digest_does_not_invent_worktree_for_claimed_only(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-4 (#989): claimed without a live tree does not invent a directory."""
-    mock_api_get.side_effect = [
-        {
-            "username": "cursor",
-            "role": "agent",
-            "principal_id": 7,
-            "workspace_mode": "worktree",
-        },
-        _page([{"id": 10, "title": "Claimed only", "status": "claimed"}]),
-        {"id": 10, "worktree_path": ""},
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {
+                "username": "cursor",
+                "role": "agent",
+                "principal_id": 7,
+                "workspace_mode": "worktree",
+            },
+            _page([{"id": 10, "title": "Claimed only", "status": "claimed"}]),
+            {"id": 10, "worktree_path": ""},
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "#10" in text
     assert "worktrees" not in text
@@ -3794,17 +3848,19 @@ async def test_my_context_digest_does_not_name_removed_review_worktree(
     mock_api_get: AsyncMock,
 ) -> None:
     """AC-7 (#989): a review row must not name the directory submit removed."""
-    mock_api_get.side_effect = [
-        {
-            "username": "cursor",
-            "role": "agent",
-            "principal_id": 7,
-            "workspace_mode": "worktree",
-        },
-        _page([{"id": 910, "title": "Submitted", "status": "review"}]),
-        [{"id": 910, "status": "review", "review_job_id": None}],
-        {"id": 910, "worktree_path": ""},
-    ]
+    mock_api_get.side_effect = _with_policy(
+        [
+            {
+                "username": "cursor",
+                "role": "agent",
+                "principal_id": 7,
+                "workspace_mode": "worktree",
+            },
+            _page([{"id": 910, "title": "Submitted", "status": "review"}]),
+            [{"id": 910, "status": "review", "review_job_id": None}],
+            {"id": 910, "worktree_path": ""},
+        ]
+    )
     text = _mcp_text(await hub_my_context())
     assert "#910" in text
     assert "task-910" not in text

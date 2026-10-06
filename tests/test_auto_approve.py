@@ -795,3 +795,195 @@ async def test_dor_autopilot_answers_as_the_raw_comparison_did(
     task_id = await _draft_in_project(client, db, pid)
     body = await _refine_to_dor(client, task_id, ["docs/notes.md"])
     assert body["status"] == ("open" if approves else "draft")
+
+
+# --- Заморозка проекта (#1594): автоодобрение и создание открытой работы -----
+
+_FREEZE = {"until": None, "allow_work_types": ["bug"], "note": "до MS-A2"}
+
+
+async def _task_count(db: aiosqlite.Connection) -> int:
+    rows = await db.execute_fetchall("SELECT COUNT(*) FROM tasks")
+    return int(rows[0][0])
+
+
+async def _refine_work(
+    client: AsyncClient, task_id: int, *, work_type: str, rationale: str
+) -> dict:
+    payload = dict(
+        _dor_patch(["docs/notes.md"]), work_type=work_type, freeze_rationale=rationale
+    )
+    resp = await client.post(f"/api/tasks/{task_id}/refine", json=payload)
+    assert resp.status_code == 200, resp.text
+    return (await client.get(f"/api/tasks/{task_id}")).json()
+
+
+async def test_freeze_blocks_auto_approval_and_open_creation(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+) -> None:
+    # AC-2 (#1594): автоодобрение и создание сразу открытой работы подчиняются
+    # заморозке; отказ наблюдаем, состояние не меняется.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _project(db, "frozen-auto", {"dor": "auto", "freeze": _FREEZE})
+
+    # --- воронка refine (dor=auto): feature не пускают, причина в ленте
+    task_id = await _draft_in_project(client, db, pid)
+    body = await _refine_work(client, task_id, work_type="feature", rationale="надо")
+    assert body["dor_passed"] is True and body["risk_class"] == "R0"
+    assert body["status"] == "draft", "заморозка сильнее автоодобрения"
+    feed = [u["content"] for u in body["updates"] or []]
+    refusals = [c for c in feed if "заморозк" in c and "Автоодобрение" in c]
+    assert len(refusals) == 1 and "MS-A2" in refusals[0]
+    assert "feature" in refusals[0] and "до снятия" in refusals[0]
+    assert not await _approved_events(db)
+    # тот же отказ при новом проходе готовности не плодит одинаковых строк
+    again = await _refine_work(client, task_id, work_type="feature", rationale="надо")
+    feed = [u["content"] for u in again["updates"] or []]
+    assert len([c for c in feed if "Автоодобрение отклонено" in c]) == 1
+
+    # разрешённый тип с обоснованием автоодобрение проходит; без — нет
+    bug = await _draft_in_project(client, db, pid)
+    unjustified = await _refine_work(client, bug, work_type="bug", rationale="  ")
+    assert unjustified["status"] == "draft"
+    justified = await _refine_work(client, bug, work_type="bug", rationale="сбой")
+    assert justified["status"] == "open"
+
+    # --- создание сразу открытой работы: REST, subtasks, MCP
+    feature_id = (await client.get(f"/api/tasks/{task_id}")).json()["parent_id"]
+    before = await _task_count(db)
+    refused = await client.post(
+        "/api/tasks",
+        json={"title": "открытая", "task_type": "task", "parent_id": feature_id},
+    )
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"]["error"] == "freeze_refused"
+    assert "до снятия" in refused.json()["detail"]["message"]
+    mixed = await client.post(
+        f"/api/tasks/{feature_id}/subtasks",
+        json={
+            "task_type": "task",
+            "source": "human",
+            "items": [
+                {"title": "ok", "work_type": "bug", "freeze_rationale": "сбой"},
+                {"title": "плохой", "work_type": "feature", "freeze_rationale": "x"},
+            ],
+        },
+    )
+    assert mixed.status_code == 422, mixed.text
+    assert "items[1]" in mixed.json()["detail"]["message"]
+    mcp_refused = await _mcp_create(
+        client, monkeypatch, title="mcp", parent_id=feature_id
+    )
+    assert "freeze_refused" in mcp_refused
+    assert await _task_count(db) == before, "ни одной задачи, в том числе из пачки"
+
+    # те же вызовы с разрешённым типом и обоснованием проходят
+    rest = await client.post(
+        "/api/tasks",
+        json={
+            "title": "ошибка",
+            "task_type": "task",
+            "parent_id": feature_id,
+            "work_type": "bug",
+            "freeze_rationale": "сбой на проде",
+        },
+    )
+    assert rest.status_code == 200, rest.text
+    assert rest.json()["freeze_rationale"] == "сбой на проде"
+    bulk = await client.post(
+        f"/api/tasks/{feature_id}/subtasks",
+        json={
+            "task_type": "task",
+            "source": "human",
+            "items": [
+                {"title": "b1", "work_type": "bug", "freeze_rationale": "сбой"},
+                {"title": "b2", "work_type": "bug", "freeze_rationale": "сбой 2"},
+            ],
+        },
+    )
+    assert bulk.status_code == 200, bulk.text
+    assert [t["work_type"] for t in bulk.json()] == ["bug", "bug"], "тип не теряется"
+    assert [t["freeze_rationale"] for t in bulk.json()] == ["сбой", "сбой 2"]
+    out = await _mcp_create(
+        client,
+        monkeypatch,
+        title="mcp-ok",
+        parent_id=feature_id,
+        work_type="bug",
+        freeze_rationale="сбой",
+    )
+    assert "created" in out
+
+
+async def _mcp_create(client: AsyncClient, monkeypatch, **kwargs) -> str:
+    """hub_create_task поверх тестового клиента: ответ или структурный отказ."""
+    from hub import mcp_server
+
+    async def _post(path, body=None, *, extra_headers=None):
+        resp = await client.post(path, json=body or {}, headers=extra_headers)
+        if resp.status_code >= 400:
+            raise mcp_server.HubApiError(
+                mcp_server._parse_api_error(resp, resp.status_code)
+            )
+        return resp.json()
+
+    monkeypatch.setattr(mcp_server, "_api_post", _post)
+    try:
+        result = await mcp_server.hub_create_task(**kwargs)
+    except mcp_server.HubApiError as exc:
+        return exc.as_json()
+    return json.dumps(result.structuredContent or {}, ensure_ascii=False) + str(
+        result.content[0].text
+    )
+
+
+async def test_freeze_does_not_block_an_idempotent_replay(
+    client: AsyncClient, db: aiosqlite.Connection
+) -> None:
+    # #1594: повтор create с тем же ключом возвращает ранее созданную задачу;
+    # заморозка, объявленная позже, проверяет только новую вставку.
+    pid = await _project(db, "frozen-replay", {})
+    task_id = await _draft_in_project(client, db, pid)
+    feature_id = (await client.get(f"/api/tasks/{task_id}")).json()["parent_id"]
+    body = {"title": "once", "task_type": "task", "parent_id": feature_id}
+    first = await client.post("/api/tasks", json=dict(body, client_request_id="k-1594"))
+    assert first.status_code == 201, first.text
+    await repo.update_project(db, pid, gate_policy=json.dumps({"freeze": _FREEZE}))
+    await db.commit()
+    replay = await client.post(
+        "/api/tasks", json=dict(body, client_request_id="k-1594")
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+    fresh = await client.post(
+        "/api/tasks", json=dict(body, client_request_id="k-1594-new")
+    )
+    assert fresh.status_code == 422, "новая вставка заморозку проходит"
+
+
+async def test_freeze_applies_through_default_fallback_and_epic_binding(
+    client: AsyncClient, db: aiosqlite.Connection
+) -> None:
+    # #1594: у задачи без родителя проект — default; эпик, привязанный при
+    # создании, входит в названный проект. Обе двери проверяют ИХ заморозку.
+    await _project(db, "default", {"freeze": _FREEZE})
+    await _project(db, "named", {"freeze": _FREEZE})
+    await _project(db, "free", {})
+
+    top = await client.post("/api/tasks", json={"title": "без родителя"})
+    assert top.status_code == 422, top.text
+    assert top.json()["detail"]["error"] == "freeze_refused"
+    ok_top = await client.post(
+        "/api/tasks",
+        json={"title": "ошибка", "work_type": "bug", "freeze_rationale": "сбой"},
+    )
+    assert ok_top.status_code == 200, ok_top.text
+
+    epic = await client.post(
+        "/api/tasks", json={"title": "e", "task_type": "epic", "project": "named"}
+    )
+    assert epic.status_code == 422, "эпик в замороженный проект — по его политике"
+    free_epic = await client.post(
+        "/api/tasks", json={"title": "e", "task_type": "epic", "project": "free"}
+    )
+    assert free_epic.status_code == 200, "проект без заморозки не затронут default"

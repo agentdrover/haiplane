@@ -63,6 +63,11 @@ def normalize_task_create(body: TaskCreate) -> tuple[str, TaskCreate]:
 def hash_task_create_payload(body: TaskCreate) -> str:
     """Stable hash of the create payload (excluding the idempotency key itself)."""
     payload = body.model_dump(mode="json", exclude={"client_request_id"})
+    # #1594: поле появилось позже хешей, уже лежащих в базе. Пустое значение
+    # (умолчание) хеш не меняет, иначе повтор запроса, созданного до
+    # обновления, получил бы 409; непустое - изменение запроса.
+    if not payload.get("freeze_rationale"):
+        payload.pop("freeze_rationale", None)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
