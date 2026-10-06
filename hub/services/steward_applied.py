@@ -141,7 +141,11 @@ class SelfApproval:
 
 
 async def apply_judgement(
-    db: aiosqlite.Connection, task_id: int, generation: int
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    *,
+    claim: tuple[int, str] | None = None,
 ) -> tuple[str, str]:
     """Применить суждение стюарда этой генерации. Возвращает (исход, деталь).
 
@@ -149,6 +153,10 @@ async def apply_judgement(
     approve, ``returned_to_running`` для возврата на клиентском пути,
     ``needs_decision`` когда бюджет исчерпан. Три разных слова, потому что
     человеку, читающему фид, нужно знать, где теперь его задача.
+
+    ``claim`` (#1601) — (id суждения судьи, метка занятия) от шага поллера: запись
+    approve условна ПО МЕТКЕ в той же транзакции — если применение уже переведено
+    в escalated (прервано и названо вслух), вердикта не будет.
 
     Ничего не проверяет из того, что проверил привратник: право применять
     — вопрос #1147 и #1148, и дублировать его здесь значило бы завести
@@ -171,7 +179,22 @@ async def apply_judgement(
     verdict = str(dict(judgement).get("verdict") or "")
 
     if verdict == "approve":
-        await _record(db, task_id, ReviewVerdict.approved, generation)
+        # #1601: approve судьи вердиктом становится только при согласии
+        # советника на том же пакете. Проверка живёт ЗДЕСЬ, у самой записи
+        # вердикта, а не только у вызывающих: любой путь к ней проходит мимо
+        # одного и того же вопроса.
+        from hub.services.steward_advisor import advisor_refusal
+
+        refusal = await advisor_refusal(db, task_id, generation)
+        if refusal is not None:
+            raise HTTPException(
+                409,
+                detail=(
+                    f"approve судьи не применяется без согласия советника "
+                    f"({refusal[0]}): {refusal[1]}"
+                ),
+            )
+        await _record(db, task_id, ReviewVerdict.approved, generation, claim=claim)
         return APPLIED, f"approve применён к сдаче {generation}"
 
     if verdict != "changes_requested":
@@ -253,6 +276,8 @@ async def _record(
     task_id: int,
     verdict: ReviewVerdict,
     generation: int,
+    *,
+    claim: tuple[int, str] | None = None,
 ) -> None:
     """Записать вердикт ТЕМ ЖЕ путём, которым его пишет человек.
 
@@ -271,6 +296,10 @@ async def _record(
             verdict=verdict,
             comments=f"Применено стюардом по суждению генерации {generation}.",
         ),
+        # #1601: вердикт пишется ТОЛЬКО на то поколение, о котором судили, и
+        # только пока на него нет вердикта — условие стоит в самой записи.
+        expected_generation=generation,
+        claim=claim,
     )
 
 
@@ -776,6 +805,8 @@ async def approve_without_a_human(
     task_id: int,
     generation: int,
     decision: SelfApproval,
+    *,
+    claim: tuple[int, str] | None = None,
 ) -> tuple[str, str]:
     """Вынести APPROVED без человека — или увезти задачу к нему с причиной.
 
@@ -796,7 +827,7 @@ async def approve_without_a_human(
             "самостоятельного одобрения нет — " + decision.reason
         )
 
-    outcome, detail = await apply_judgement(db, task_id, generation)
+    outcome, detail = await apply_judgement(db, task_id, generation, claim=claim)
     if outcome != APPLIED:
         # Свидетельства сошлись, а суждение стюарда просило правок — и тогда
         # ``apply_judgement`` вернул работу автору. Дописать сюда «одобрено
@@ -888,7 +919,11 @@ async def _hand_to_the_human_because(
 
 
 async def apply_self_approval(
-    db: aiosqlite.Connection, task_id: int, generation: int
+    db: aiosqlite.Connection,
+    task_id: int,
+    generation: int,
+    *,
+    claim: tuple[int, str] | None = None,
 ) -> tuple[str, str] | None:
     """Применить правило к записанному approve-суждению. ``None`` — не применялось.
 
@@ -907,6 +942,22 @@ async def apply_self_approval(
     if not _policy_wants_steward(project, gate="verdict"):
         return None
 
+    # #1601: approve судьи без согласия советника (ответа нет, возражение,
+    # таймаут, смена пакета) к человеку — с доводами обеих сторон. Спрашивается
+    # ДО привратника и своим отказом: это не недостача свидетельств, а отсутствие
+    # второго мнения, и досдать тут нечего.
+    from hub.services.steward_advisor import advisor_refusal
+
+    advisor = await advisor_refusal(db, task_id, generation)
+    if advisor is not None:
+        await _hand_to_the_human_named(
+            db,
+            task_id,
+            f"{advisor[0]}: {advisor[1]}",
+            who="Второго мнения нет: approve судьи без согласия советника",
+        )
+        return ESCALATED_TO_HUMAN, "советник не согласен — " + advisor[1]
+
     from hub.services.steward_apply import apply_refusals
 
     refusals = await apply_refusals(db, task_id, generation)
@@ -921,11 +972,14 @@ async def apply_self_approval(
         )
 
     decision = await self_approval_for(db, task_id, generation)
-    return await approve_without_a_human(db, task_id, generation, decision)
+    return await approve_without_a_human(db, task_id, generation, decision, claim=claim)
 
 
 async def _hand_to_the_human_named(
-    db: aiosqlite.Connection, task_id: int, reason: str
+    db: aiosqlite.Connection,
+    task_id: int,
+    reason: str,
+    who: str = "Привратник применения возражает",
 ) -> None:
     """Отказ привратника — в карточку своими словами, а не словами правила.
 
@@ -939,8 +993,7 @@ async def _hand_to_the_human_named(
         task_id,
         _STEWARD_ACTOR,
         "status",
-        "Самостоятельного одобрения не будет — решает человек. "
-        "Привратник применения возражает: " + reason + ".",
+        f"Самостоятельного одобрения не будет — решает человек. {who}: " + reason + ".",
         author_kind="hub",
     )
     await db.commit()

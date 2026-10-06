@@ -9,6 +9,8 @@ from fastapi import HTTPException
 
 from hub import repository as repo
 from hub.actionable_errors import (
+    steward_advisor_channel_detail,
+    steward_advisor_not_ordered_detail,
     steward_closed_vocabulary_detail,
     steward_escalate_reason_required_detail,
     steward_judgement_exists_detail,
@@ -18,6 +20,7 @@ from hub.actionable_errors import (
 from hub.config import TokenIdentity
 from hub.db import fetchall
 from hub.models import (
+    STEWARD_ADVISOR_VERDICTS,
     STEWARD_CLOSURE_TYPES,
     STEWARD_CONFIDENCE,
     STEWARD_ESCALATE_REASONS,
@@ -57,6 +60,63 @@ def _require_member(field: str, got: str, allowed: tuple[str, ...]) -> None:
         )
 
 
+#: Вид заказа и событие советника (#1601). Событие своё, чтобы ответ критика не
+#: считался судейским суждением в дайджесте и в приписывании отмен.
+KIND_ADVISOR = "advisor"
+EVENT_ADVISOR_RECORDED = "steward_advisor_recorded"
+
+
+def _require_channel(identity: TokenIdentity, is_advisor: bool, kind: str) -> None:
+    """Суждение советника — только из сессии советника, остальные — не из неё.
+
+    Вид сессии, а не поле тела: судья, которому в пакете подсунули текст
+    «ответь и за критика», располагает тем же токеном и теми же двумя
+    операциями, и поле ``kind`` он написал бы сам. Сессию советника судья не
+    получает — код для неё выписывает хаб под заказ советника.
+    """
+    session = str(getattr(identity, "chat_pair_kind", "") or "")
+    is_advisor_session = session == "steward_advisor"
+    if is_advisor != is_advisor_session:
+        raise HTTPException(
+            403,
+            detail=steward_advisor_channel_detail(kind, session),
+        )
+
+
+async def _require_advisor_order(db, task_id: int, generation: int) -> tuple[dict, int]:
+    """Открытый начатый заказ советника и approve судьи, на который он отвечает.
+
+    Ответ без заказа не пишется: поздний (после таймаута или пересдачи) ответ
+    не должен превратиться в согласие, которого никто не ждал. Привязка
+    (``judged_id``) берётся из строки судьи, а не из слов советника.
+    """
+    from hub.services.steward_dispatch import open_run, run_has_started
+
+    order = await open_run(db, task_id, generation, KIND_ADVISOR)
+    judge = await repo.get_steward_judgement(db, task_id, generation, "verdict")
+    if (
+        order is None
+        or not run_has_started(order)
+        or judge is None
+        or dict(judge).get("verdict") != "approve"
+    ):
+        raise HTTPException(
+            409, detail=steward_advisor_not_ordered_detail(task_id, generation)
+        )
+    return order, int(dict(judge)["id"])
+
+
+async def _served_packet_hash(db, task_id: int, generation: int, kind: str) -> str:
+    """Хеш пакета, выданного прогону этого вида — по строке заказа, любого статуса."""
+    rows = await fetchall(
+        db,
+        "SELECT packet_hash FROM steward_runs WHERE task_id=? AND generation=? "
+        "AND kind=?",
+        (task_id, generation, kind),
+    )
+    return str(dict(rows[0]).get("packet_hash") or "") if rows else ""
+
+
 def _downgrade_reason(verdict: str, confidence: str, grounds: list) -> str:
     """Why a verdict is stored as an escalation, or "" when it stands.
 
@@ -74,6 +134,75 @@ def _downgrade_reason(verdict: str, confidence: str, grounds: list) -> str:
     if not confidence:
         return "no_confidence"
     return ""
+
+
+def _effective_verdict(
+    body: StewardJudgementSubmit, submitted_verdict: str, confidence: str
+) -> tuple[str, str]:
+    """Вердикт, как он будет ХРАНИТЬСЯ, и причина — по правилам словаря #1022.
+
+    Судья: низкая уверенность или отсутствие оснований превращают approve и
+    возврат в эскалацию (#1327). Советник (#1601): согласие без основания или
+    с низкой уверенностью — штамп, и хранится как возражение с названной
+    причиной; возражение остаётся возражением.
+    """
+    escalate_reason = (body.escalate_reason or "").strip()
+    downgrade = _downgrade_reason(submitted_verdict, confidence, body.grounds)
+    if body.kind == KIND_ADVISOR:
+        object_ = submitted_verdict == "object" or bool(downgrade)
+        return ("object" if object_ else "concur"), downgrade
+    if downgrade:
+        return "escalate", downgrade
+    if submitted_verdict == "escalate":
+        if not escalate_reason:
+            raise HTTPException(
+                422,
+                detail=steward_escalate_reason_required_detail(
+                    STEWARD_ESCALATE_REASONS
+                ),
+            )
+        _require_member("escalate_reason", escalate_reason, STEWARD_ESCALATE_REASONS)
+        return submitted_verdict, escalate_reason
+    if escalate_reason:
+        _require_member("escalate_reason", escalate_reason, STEWARD_ESCALATE_REASONS)
+    return submitted_verdict, escalate_reason
+
+
+async def _emit_events(
+    db,
+    task_id: int,
+    body: StewardJudgementSubmit,
+    effective_verdict: str,
+    judged_id: int | None,
+) -> None:
+    """События записи суждения: судейские — как прежде, советника — свои.
+
+    Ответ советника — не суждение о сдаче: события судьи (и их счёт в
+    дайджесте и в приписывании отмен человеком) он не множит.
+    """
+    payload = {
+        "kind": body.kind,
+        "verdict": effective_verdict,
+        "generation": body.generation,
+    }
+    if body.kind == KIND_ADVISOR:
+        await repo.insert_event(
+            db,
+            kind=EVENT_ADVISOR_RECORDED,
+            task_id=task_id,
+            actor="steward",
+            payload={**payload, "judged_id": judged_id},
+        )
+        return
+    await repo.insert_event(
+        db, kind=STEWARD_JUDGEMENT, task_id=task_id, actor="steward", payload=payload
+    )
+    follow_up = (
+        STEWARD_ESCALATED if effective_verdict == "escalate" else STEWARD_APPLIED
+    )
+    await repo.insert_event(
+        db, kind=follow_up, task_id=task_id, actor="steward", payload=payload
+    )
 
 
 async def record_steward_judgement(
@@ -109,7 +238,15 @@ async def record_steward_judgement(
             detail=steward_verdict_required_detail(),
         )
     _require_member("kind", body.kind, STEWARD_JUDGEMENT_KINDS)
-    _require_member("verdict", submitted_verdict, STEWARD_VERDICTS)
+    is_advisor = body.kind == KIND_ADVISOR
+    # #1601: канал решает, чьё это суждение. Судья не отвечает за своего
+    # критика, а критик не судит за судью — по виду СЕССИИ, а не по полю тела.
+    _require_channel(identity, is_advisor, body.kind)
+    _require_member(
+        "verdict",
+        submitted_verdict,
+        STEWARD_ADVISOR_VERDICTS if is_advisor else STEWARD_VERDICTS,
+    )
     confidence = (body.confidence or "").strip()
     if confidence:
         _require_member("confidence", confidence, STEWARD_CONFIDENCE)
@@ -118,31 +255,12 @@ async def record_steward_judgement(
     for closure in body.closures:
         _require_member("closure.type", closure.type, STEWARD_CLOSURE_TYPES)
 
-    escalate_reason = (body.escalate_reason or "").strip()
-    downgrade = _downgrade_reason(submitted_verdict, confidence, body.grounds)
-    if downgrade:
-        effective_verdict = "escalate"
-        effective_reason = downgrade
-    else:
-        effective_verdict = submitted_verdict
-        if effective_verdict == "escalate":
-            if not escalate_reason:
-                raise HTTPException(
-                    422,
-                    detail=steward_escalate_reason_required_detail(
-                        STEWARD_ESCALATE_REASONS
-                    ),
-                )
-            _require_member(
-                "escalate_reason", escalate_reason, STEWARD_ESCALATE_REASONS
-            )
-            effective_reason = escalate_reason
-        else:
-            if escalate_reason:
-                _require_member(
-                    "escalate_reason", escalate_reason, STEWARD_ESCALATE_REASONS
-                )
-            effective_reason = escalate_reason
+    effective_verdict, effective_reason = _effective_verdict(
+        body, submitted_verdict, confidence
+    )
+    judged_id: int | None = None
+    if is_advisor:
+        _order, judged_id = await _require_advisor_order(db, task_id, body.generation)
 
     if body.closures:
         await _refuse_unknown_closure_uids(db, task_id, body.generation, body.closures)
@@ -150,6 +268,9 @@ async def record_steward_judgement(
     model, duration_ms, tokens_reason = await _cost_of_the_run(
         db, task_id, body.generation, body.kind, body.model
     )
+    # Хеш пакета ставит хаб — тот, что он выдал ЭТОМУ прогону, а не тот, что
+    # прогон назвал. Нет выдачи — пусто, и согласие по такому хешу не пройдёт.
+    packet_hash = await _served_packet_hash(db, task_id, body.generation, body.kind)
     inserted = await repo.insert_steward_judgement(
         db,
         task_id=task_id,
@@ -170,6 +291,8 @@ async def record_steward_judgement(
         submitted_by=identity.username[:100],
         principal_id=identity.principal_id,
         tokens_unknown_reason=tokens_reason,
+        judged_id=judged_id,
+        packet_hash=packet_hash,
     )
     if inserted is None:
         raise HTTPException(
@@ -185,33 +308,11 @@ async def record_steward_judgement(
         principal_id=identity.principal_id,
         author_kind="steward",
     )
-    payload = {
-        "kind": body.kind,
-        "verdict": effective_verdict,
-        "generation": body.generation,
-    }
-    await repo.insert_event(
-        db,
-        kind=STEWARD_JUDGEMENT,
-        task_id=task_id,
-        actor="steward",
-        payload=payload,
-    )
-    follow_up = (
-        STEWARD_ESCALATED if effective_verdict == "escalate" else STEWARD_APPLIED
-    )
-    await repo.insert_event(
-        db,
-        kind=follow_up,
-        task_id=task_id,
-        actor="steward",
-        payload=payload,
-    )
+    await _emit_events(db, task_id, body, effective_verdict, judged_id)
     await _close_the_order(db, task_id, body.generation, body.kind)
+    # Запись суждения судьи САМА вердикта не ставит ни в одном пути (#1601):
+    # approve применяется поллером после ответа советника, а не отсюда.
     await db.commit()
-    await _self_approve_if_everything_converged(
-        db, task_id, body.generation, body.kind, effective_verdict
-    )
     saved = await repo.get_steward_judgement_by_id(db, inserted)
     if saved is None:
         raise RuntimeError(
@@ -324,45 +425,6 @@ async def stamp_judgement_usage(db) -> int:
     if stamped:
         await db.commit()
     return stamped
-
-
-async def _self_approve_if_everything_converged(
-    db, task_id: int, generation: int, kind: str, verdict: str
-) -> None:
-    """Записанный approve может уехать без человека — если всё сошлось (#1231).
-
-    ТОЛЬКО ``kind=verdict`` и ТОЛЬКО ``approve``. Про драфт здесь решать
-    нечего — у DoR свой привратник (#1159), он в scope_out #1231. А
-    ``changes_requested`` и ``escalate`` самостоятельного одобрения не
-    порождают по определению, и звать правило на них значило бы спрашивать
-    «сошлись ли свидетельства» там, где судья уже сказал «нет».
-
-    Вызов стоит здесь, а не в проходе поллера, ради at-most-once: запись
-    суждения случается ровно один раз на тройку (задача, поколение, kind) —
-    повтор отбивает 409 контракта #1022. Поллер писал бы строку в карточку
-    каждые тридцать секунд, пока задача стоит в review.
-
-    Best effort ТЕМ ЖЕ договором, что и закрытие заказа выше: суждение уже
-    записано и стоит независимо от того, чем кончилось применение. Но
-    молчать про отказ нельзя — проглоченное исключение здесь неотличимо от
-    «правило посмотрело и не одобрило», а это разные вещи: во втором случае
-    задача ждёт человека осознанно, в первом — по недосмотру.
-    """
-    from hub.services.steward_dispatch import KIND_VERDICT
-
-    if kind != KIND_VERDICT or verdict != "approve":
-        return
-    try:
-        from hub.services.steward_applied import apply_self_approval
-
-        await apply_self_approval(db, task_id, generation)
-    except Exception as exc:  # noqa: BLE001 — суждение стоит в любом случае
-        log.warning(
-            "self-approval not applied for task #%s gen %s: %s",
-            task_id,
-            generation,
-            exc,
-        )
 
 
 async def _refuse_unknown_closure_uids(

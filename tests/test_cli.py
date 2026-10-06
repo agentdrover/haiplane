@@ -2823,3 +2823,37 @@ def test_worktree_real_fetch_failure_of_an_existing_branch_is_named(
     assert f"предупреждение: fetch origin {branch} не удался" in (
         capsys.readouterr().err
     )
+
+
+def test_cmd_steward_false_approve_clear() -> None:
+    """Снятие ошибочного одобрения пары (#1601): один вызов REST, тело с заметкой."""
+    mock_api = MagicMock(return_value={"task_id": 42, "cleared": 1})
+    args = argparse.Namespace(task_id=42, note="разобрано")
+    with patch.object(cli, "_api", mock_api), patch("sys.stdout", new=StringIO()):
+        rc = cli.cmd_steward_false_approve_clear(args)
+    assert rc == 0
+    mock_api.assert_called_once_with(
+        "POST",
+        "/api/tasks/42/steward-false-approve/clear",
+        {"note": "разобрано"},
+    )
+
+
+def test_the_parser_knows_the_advisor_kind_and_its_verdicts() -> None:
+    """CLI принимает kind=advisor и ответы concur/object — тот же словарь, что у хаба."""
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "steward-judgement",
+            "7",
+            "--generation",
+            "1",
+            "--kind",
+            "advisor",
+            "--verdict",
+            "concur",
+        ]
+    )
+    assert (args.kind, args.verdict) == ("advisor", "concur")
+    args = parser.parse_args(["steward-false-approve-clear", "7", "--note", "ok"])
+    assert args.func is cli.cmd_steward_false_approve_clear and args.note == "ok"

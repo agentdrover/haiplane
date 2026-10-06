@@ -260,6 +260,10 @@ STEWARD_START_DEADLINE_MIN = int(env_get("STEWARD_START_DEADLINE_MIN", "30"))
 #: N мин»: вечной отсрочки нет, а эскалация по no_current_report после такого
 #: ожидания уже законна — ревью действительно не пришло.
 STEWARD_REVIEW_WAIT_MAX = int(env_get("STEWARD_REVIEW_WAIT_MAX", "120"))
+#: Сколько минут от заказа советник-критик (#1601) может отвечать, прежде чем
+#: ответ считается не пришедшим (timeout) и approve судьи уходит к человеку.
+#: Срок один на старт и работу: окно не продлевается запуском.
+STEWARD_ADVISOR_WAIT_MAX = int(env_get("STEWARD_ADVISOR_WAIT_MAX", "60"))
 #: Имена, ЗАПУСК которых наблюдён у провайдера попыткой создания (#1237).
 #: Список сегодня не сужает ничего — в нём все проверенные имена, — и стоит
 #: он не ради сужения, а ради связи выбора судьи со СПОСОБОМ проверки: имя
@@ -335,6 +339,18 @@ STEWARD_MODEL_FALLBACKS = tuple(
     for m in env_get("STEWARD_MODEL_FALLBACKS", "composer-2.5,gemini-3.1-pro").split(
         ","
     )
+    if m.strip()
+)
+# Кандидаты в советники-критики (#1601), порядок — предпочтение. Берётся
+# первый, что наблюдался запускающимся (SUBSCRIPTION_LAUNCHABLE_MODELS) и
+# отличается СЕМЕЙСТВОМ от исполнителя, ревьюера и фактической модели судьи.
+# Имя вне наблюдённых запусков пропускается, а не покупается (#1237).
+STEWARD_ADVISOR_MODELS = tuple(
+    m.strip()
+    for m in env_get(
+        "STEWARD_ADVISOR_MODELS",
+        "gpt-5.3-codex,gemini-3.1-pro,claude-sonnet-5,grok-4.6,composer-2.5",
+    ).split(",")
     if m.strip()
 )
 # The hub token the steward run authenticates with (#1105). Same shape as
@@ -709,8 +725,12 @@ CHAT_PAIR_REVIEWER_PERMS: frozenset[str] = frozenset({"tasks.read"})
 # is not the bound one — a judge let loose on a neighbouring task would be
 # judging evidence nobody ordered for it.
 CHAT_PAIR_TASK_BOUND_KINDS: frozenset[str] = frozenset(
-    {"implementer", "reviewer", "steward"}
+    {"implementer", "reviewer", "steward", "steward_advisor"}
 )
+#: Виды сессии, чья личность — принципал стюарда (#1021). Советник-критик
+#: (#1601) ходит той же дорогой и по тем же двум операциям, но судья не может
+#: сдать суждение советника, а советник — суждение судьи: вид сессии решает.
+STEWARD_PAIR_KINDS: frozenset[str] = frozenset({"steward", "steward_advisor"})
 
 # Steward (#1021): closed list of two operations, not a cut-down CHAT_PAIR_PERMS.
 # Those four include create/refine/update and would let the steward write the

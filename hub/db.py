@@ -2488,6 +2488,154 @@ _MIGRATIONS: list[tuple[str, str]] = [
             UNIQUE (task_id, generation)
         )""",
     ),
+    # --- #1601: советник-критик стюарда и критерий выхода из тени v2. -------
+    (
+        # Для kind=advisor: id суждения судьи, на которое отвечает советник.
+        # Привязку ставит хаб по заказу, а не советник словами.
+        "add_steward_judgements_judged_id",
+        "ALTER TABLE steward_judgements ADD COLUMN judged_id INTEGER",
+    ),
+    (
+        # Хеш пакета фактов (steward_evidence.packet_hash), который прочёл
+        # прогон: хаб снимает его при выдаче пакета и переносит в суждение.
+        # Пусто — пакета под этот прогон не отдавали, и согласие не засчитывается.
+        "add_steward_judgements_packet_hash",
+        "ALTER TABLE steward_judgements ADD COLUMN packet_hash TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
+    (
+        # Контур выборки: 1 — суждения до выката #1601 (одиночные, без
+        # советника), 2 — новый контур. Старые строки остаются 1 по умолчанию
+        # колонки; критерий выхода v2 их не зачитывает.
+        "add_steward_judgements_contour",
+        "ALTER TABLE steward_judgements ADD COLUMN contour INTEGER NOT NULL DEFAULT 1",
+    ),
+    (
+        # Исход применения approve судьи (поллер): '' — ещё не применялся;
+        # approved | escalated | moot. Ставится условным UPDATE: так применение
+        # случается ровно один раз и переживает перезапуск хаба.
+        "add_steward_judgements_advisor_outcome",
+        "ALTER TABLE steward_judgements ADD COLUMN advisor_outcome TEXT "
+        "NOT NULL DEFAULT ''",
+    ),
+    (
+        # Когда применение заняло метку (advisor_outcome='applying'): по ней
+        # прервавшееся применение отличают от идущего (#1601).
+        "add_steward_judgements_advisor_claimed_at",
+        "ALTER TABLE steward_judgements ADD COLUMN advisor_claimed_at TEXT",
+    ),
+    (
+        "add_steward_runs_packet_hash",
+        "ALTER TABLE steward_runs ADD COLUMN packet_hash TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # Липкое ошибочное одобрение пары (#1601). Таблица, а не событие:
+        # события чистятся через 14 дней, а окно проверки — 30 дней после
+        # доставки. Строка живёт, пока человек явно не снимет её (cleared_*).
+        # Ключ — КОНКРЕТНЫЙ случай (задача, источник, ref): снятие закрывает
+        # случай, а не задачу, новый случай — новая строка.
+        "create_steward_false_approvals",
+        """CREATE TABLE IF NOT EXISTS steward_false_approvals (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id     INTEGER NOT NULL,
+            source      TEXT    NOT NULL,
+            generation  INTEGER NOT NULL DEFAULT 0,
+            detail      TEXT    NOT NULL DEFAULT '',
+            ref         TEXT    NOT NULL DEFAULT '',
+            detected_at TEXT    NOT NULL DEFAULT (datetime('now')),
+            cleared_by  TEXT,
+            cleared_at  TEXT,
+            clear_note  TEXT    NOT NULL DEFAULT '',
+            UNIQUE (task_id, source, ref)
+        )""",
+    ),
+    # --- #1601: факт ошибочного одобрения пишется В МОМЕНТ события, в той же
+    # транзакции, что и оно. Триггеры БД, а не вызовы в путях: путей записи
+    # вердикта и выхода из completed много, триггер ловит и забытые.
+    (
+        # Сколько раз задача выходила из completed (#1601): порядковый номер
+        # случая «переоткрытие», не зависящий от часов.
+        "add_tasks_completed_exit_seq",
+        "ALTER TABLE tasks ADD COLUMN completed_exit_seq INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        # Человеческий возврат. Список акторов автоматики — как
+        # gate_events.NON_HUMAN_GATE_ACTORS; расхождение ловит тест (новый
+        # актор = новая миграция, пересоздающая триггер).
+        "create_trigger_false_approve_human_return",
+        """CREATE TRIGGER IF NOT EXISTS trg_false_approve_human_return
+        AFTER INSERT ON events
+        WHEN NEW.kind = 'review_verdict_recorded' AND NEW.task_id IS NOT NULL
+          AND NEW.actor NOT IN ('hub', 'policy', 'steward')
+          AND json_extract(NEW.payload, '$.verdict') = 'changes_requested'
+        BEGIN
+            INSERT OR IGNORE INTO steward_false_approvals
+              (task_id, source, generation, detail, ref)
+            SELECT j.task_id, 'human_changes_requested', j.generation, 'человек вернул поколение ' || COALESCE(json_extract(NEW.payload, '$.submission_generation'), 0) || ' (пара одобрила поколение ' || j.generation || '), событие #' || NEW.id, CAST(NEW.id AS TEXT)
+            FROM steward_judgements a
+            JOIN steward_judgements j ON j.id = a.judged_id
+            WHERE a.kind = 'advisor' AND a.verdict = 'concur'
+              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2
+              AND a.task_id = NEW.task_id AND j.generation <= COALESCE(json_extract(NEW.payload, '$.submission_generation'), 0);
+        END""",
+    ),
+    (
+        # Выход из completed любым путём (transition_status_if, update_task,
+        # прямой UPDATE). Ref — порядковый номер выхода из completed у этой
+        # задачи (счётчик completed_exit_seq, растёт в самом триггере), а не
+        # время: два выхода в одну миллисекунду с одинаковым completed_at —
+        # два разных случая. Последующие переходы нового случая не создают.
+        "create_trigger_false_approve_reopened",
+        """CREATE TRIGGER IF NOT EXISTS trg_false_approve_reopened
+        AFTER UPDATE OF status ON tasks
+        WHEN OLD.status = 'completed' AND NEW.status != 'completed'
+        BEGIN
+            UPDATE tasks SET completed_exit_seq = completed_exit_seq + 1
+            WHERE id = NEW.id;
+            INSERT OR IGNORE INTO steward_false_approvals
+              (task_id, source, generation, detail, ref)
+            SELECT j.task_id, 'reopened', j.generation, 'задача вышла из completed в ' || NEW.status, 'exit:' || (SELECT completed_exit_seq FROM tasks WHERE id = NEW.id)
+            FROM steward_judgements a
+            JOIN steward_judgements j ON j.id = a.judged_id
+            WHERE a.kind = 'advisor' AND a.verdict = 'concur'
+              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2
+              AND a.task_id = NEW.id;
+        END""",
+    ),
+    (
+        "create_trigger_false_approve_prod_defect_insert",
+        """CREATE TRIGGER IF NOT EXISTS trg_false_approve_prod_defect_insert
+        AFTER INSERT ON tasks
+        WHEN NEW.found_in = 'prod' AND NEW.caused_by_task_id IS NOT NULL
+        BEGIN
+            INSERT OR IGNORE INTO steward_false_approvals
+              (task_id, source, generation, detail, ref)
+            SELECT j.task_id, 'prod_defect', j.generation, 'прод-дефект found_in=prod, caused_by_task_id на неё: #' || NEW.id, CAST(NEW.id AS TEXT)
+            FROM steward_judgements a
+            JOIN steward_judgements j ON j.id = a.judged_id
+            WHERE a.kind = 'advisor' AND a.verdict = 'concur'
+              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2
+              AND a.task_id = NEW.caused_by_task_id;
+        END""",
+    ),
+    (
+        "create_trigger_false_approve_prod_defect_update",
+        """CREATE TRIGGER IF NOT EXISTS trg_false_approve_prod_defect_update
+        AFTER UPDATE OF found_in, caused_by_task_id ON tasks
+        WHEN NEW.found_in = 'prod' AND NEW.caused_by_task_id IS NOT NULL
+          AND (OLD.found_in IS NOT 'prod'
+               OR OLD.caused_by_task_id IS NOT NEW.caused_by_task_id)
+        BEGIN
+            INSERT OR IGNORE INTO steward_false_approvals
+              (task_id, source, generation, detail, ref)
+            SELECT j.task_id, 'prod_defect', j.generation, 'прод-дефект found_in=prod, caused_by_task_id на неё: #' || NEW.id, CAST(NEW.id AS TEXT)
+            FROM steward_judgements a
+            JOIN steward_judgements j ON j.id = a.judged_id
+            WHERE a.kind = 'advisor' AND a.verdict = 'concur'
+              AND j.kind = 'verdict' AND j.verdict = 'approve' AND j.contour = 2
+              AND a.task_id = NEW.caused_by_task_id;
+        END""",
+    ),
     (
         # #1593: отложенные правки политики проекта. Своя таблица, не ключ
         # gate_policy: политика остаётся тем, что хаб ЧИТАЕТ, а расписание —

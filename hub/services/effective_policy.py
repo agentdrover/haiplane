@@ -395,6 +395,19 @@ def format_effective_policy(data: dict[str, Any]) -> list[str]:
     )
     for refusal in steward["act_refusals"]:
         lines.append(f"  act refused: {refusal['code']} — {refusal['detail']}")
+    contour = steward.get("contour")
+    if contour:
+        # #1601: счётчики пары судья+советник — те же, что в practice_metrics.
+        lines.append(
+            f"  pairs {contour['pairs']} (concur {contour['concur']}, object "
+            f"{contour['object']}, timeout {contour['timeout']}), false_approve "
+            f"{contour['false_approve']}"
+            + "".join(
+                f" #{item['task_id']} [{item['source']}]"
+                for item in contour["false_approve_tasks"]
+            )
+            + f", procedural escalations {contour['procedural_escalations']}"
+        )
     server = data["server"]
     reviewer = server["reviewer_model"]
     lines.append(
