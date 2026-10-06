@@ -51,6 +51,18 @@ _DELIVERY = "код доступа: ABC-123"
 
 
 @pytest.fixture
+def review_wait_elapsed(monkeypatch):
+    """Страж ожидания отчёта (#1600) пропускает: потолок ожидания вышел.
+
+    Эти тесты про ВНУТРЕННИЙ страж старта — ожидание ревьюера (#1185) и отказ
+    по декларациям, — а не про окно «ревью положено, но не заказано». Без
+    этого страж #1600 отвечал бы раньше них (ждать отчёта), и они проверяли
+    бы не то, что заявлено. Поведение стража — в test_steward_dispatch.
+    """
+    monkeypatch.setattr(config, "STEWARD_REVIEW_WAIT_MAX", 0)
+
+
+@pytest.fixture
 def with_identity(monkeypatch):
     """Канал доставки идентичности стал настоящим в #1120.
 
@@ -203,7 +215,9 @@ async def test_three_family_rule_refuses_run(db: aiosqlite.Connection, monkeypat
     )
 
 
-async def test_missing_declaration_is_not_diversity(db: aiosqlite.Connection):
+async def test_missing_declaration_is_not_diversity(
+    db: aiosqlite.Connection, review_wait_elapsed
+):
     """#1105 AC-3: отсутствующая или неопознанная декларация — отказ.
 
     Дыра #1008 в другом месте: незнакомая строка сравнивалась с известной
@@ -1193,7 +1207,7 @@ async def test_a_reviewer_not_yet_dispatched_is_waited_for(
 
 
 async def test_a_dispatch_landing_mid_decision_does_not_burn_the_slot(
-    db: aiosqlite.Connection, with_identity
+    db: aiosqlite.Connection, with_identity, review_wait_elapsed
 ):
     """Находка ревью №254: строка диспетча ложится МЕЖДУ чтениями.
 
@@ -1213,11 +1227,16 @@ async def test_a_dispatch_landing_mid_decision_does_not_burn_the_slot(
 
     original = repo.resolve_project_for_task
     landed = False
+    calls = 0
 
     async def _resolve_and_land(conn, tid):
-        nonlocal landed
+        nonlocal landed, calls
         project = await original(conn, tid)
-        if not landed:
+        calls += 1
+        # Первое чтение проекта — страж ожидания отчёта (#1600), он стоит
+        # впереди; строка ложится на второе — то самое, что решает судьбу
+        # снимка модели внутри start_run.
+        if calls == 2 and not landed:
             landed = True
             await conn.execute(
                 "INSERT INTO review_dispatches "
@@ -1308,7 +1327,7 @@ async def test_an_unrecognised_reviewer_still_closes_the_slot(
 
 
 async def test_waiting_for_a_reviewer_still_ends(
-    db: aiosqlite.Connection, with_identity
+    db: aiosqlite.Connection, with_identity, review_wait_elapsed
 ):
     """#1185 AC-3: ожидание ограничено дедлайном слота, вечных нет.
 
@@ -1357,7 +1376,7 @@ async def _tick_waiting(db: aiosqlite.Connection, times: int) -> None:
 
 
 async def test_a_waiting_refusal_is_recorded_once_not_every_tick(
-    db: aiosqlite.Connection, with_identity, monkeypatch
+    db: aiosqlite.Connection, with_identity, monkeypatch, review_wait_elapsed
 ):
     """#1290 AC-1: одно ожидание — одна запись, а не одна на проход.
 
@@ -1443,7 +1462,7 @@ async def test_waiting_still_ends_when_the_reviewer_arrives(
 
 
 async def test_a_slot_that_waited_for_a_reviewer_says_so_when_it_closes(
-    db: aiosqlite.Connection, with_identity, monkeypatch
+    db: aiosqlite.Connection, with_identity, monkeypatch, review_wait_elapsed
 ):
     """#1290 AC-3: закрытие по дедлайну называет именно это ожидание.
 

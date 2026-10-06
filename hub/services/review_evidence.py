@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -1009,6 +1010,11 @@ def _parse_dispatch_created(raw: str) -> datetime:
     return datetime.now(UTC)
 
 
+def parse_stamp(raw: str) -> datetime:
+    """Метка времени хаба (UTC, секунды) как datetime; нечитаемая — «сейчас»."""
+    return _parse_dispatch_created(raw)
+
+
 #: Долг второй двери: прогон ревью кончился без отчёта, строка нарочно
 #: оставлена открытой, пока долг не отдан (#1252, ``review_dispatch.
 #: SECOND_DOOR_OWED``). Имя повторено здесь строкой, а не импортировано:
@@ -1076,6 +1082,147 @@ async def inflight_view(
         grace_until=grace.strftime("%Y-%m-%d %H:%M"),
         headline=headline,
     )
+
+
+#: Исходы читателя ожидания ревью (#1600). ``pending`` — ревью положено и ещё
+#: может прийти; всё остальное — окончательно, и ждать нечего.
+WAIT_PENDING = "pending"
+WAIT_TERMINAL = "terminal"
+#: Причины terminal, которые называет САМ читатель; отказы диспетчера без
+#: строки приходят словами review_dispatch.REFUSAL_*.
+TERMINAL_REPORT_READY = "report_ready"
+TERMINAL_NOT_REQUESTED = "review_not_requested"
+TERMINAL_NOT_DISPATCHABLE = "not_dispatchable"
+TERMINAL_FAILED_NO_RETRY = "failed_without_ask_again"
+TERMINAL_FINISHED_NO_REPORT = "finished_without_report"
+
+
+@dataclass(frozen=True)
+class ReviewWait:
+    """Где стоит ревью текущей сдачи для того, кому нужен его отчёт.
+
+    ``state`` — pending или terminal; ``reason`` — почему (для terminal код
+    исхода, для pending — пусто); ``detail`` — фраза для ленты;
+    ``since`` — момент сдачи, от которого меряется ожидание (None — неизвестен).
+    """
+
+    state: str
+    reason: str
+    detail: str
+    since: datetime | None = None
+
+    @property
+    def pending(self) -> bool:
+        return self.state == WAIT_PENDING
+
+
+def _wait_terminal(reason: str, detail: str) -> ReviewWait:
+    return ReviewWait(WAIT_TERMINAL, reason, detail)
+
+
+async def _generation_submitted_at(
+    db, task_id: int, generation: int
+) -> datetime | None:
+    from hub.db import fetchall
+
+    rows = await fetchall(
+        db,
+        "SELECT submitted_at FROM submissions WHERE task_id=? AND generation=?",
+        (task_id, generation),
+    )
+    if not rows:
+        return None
+    return _parse_dispatch_created(str(dict(rows[0]).get("submitted_at") or ""))
+
+
+async def _pending_or_terminal_after_orders(
+    db, task: dict[str, Any], project: Any
+) -> ReviewWait:
+    """Что сказать, когда отчёта нет, ревью положено и активного заказа нет."""
+    from hub.db import fetchall
+    from hub.services import review_dispatch as dispatcher
+
+    task_id = int(task["id"])
+    generation = int(task.get("submission_generation") or 0)
+    rows = await fetchall(
+        db,
+        "SELECT * FROM review_dispatches WHERE task_id=? "
+        "AND submission_generation=? ORDER BY id DESC LIMIT 1",
+        (task_id, generation),
+    )
+    if rows:
+        last = dict(rows[0])
+        status = str(last.get("status") or "")
+        if status == "failed" and await dispatcher.ask_again_scheduled(db, last):
+            return ReviewWait(WAIT_PENDING, "", "заказ ревью упал, переспрос назначен")
+        if status == "failed":
+            return _wait_terminal(
+                TERMINAL_FAILED_NO_RETRY,
+                "ревью упало и переспроса не будет (потолок или не облачный заказ)",
+            )
+        if status == "done":
+            return _wait_terminal(
+                TERMINAL_FINISHED_NO_REPORT,
+                "заказ ревью закрыт (done) без отчёта этой сдачи",
+            )
+        # Незнакомый статус — не «кончилось»: незнание не есть конец (#762).
+        return ReviewWait(WAIT_PENDING, "", f"заказ ревью в статусе {status!r}")
+    branch = (task.get("branch") or "").strip()
+    if not branch or not (task.get("submission_sha") or "").strip():
+        return _wait_terminal(
+            TERMINAL_NOT_DISPATCHABLE,
+            "у сдачи нет ветки или закреплённого коммита — ревью не закажут",
+        )
+    refusal = await dispatcher.dispatch_refusal(db, task, project)
+    if refusal:
+        return _wait_terminal(
+            refusal, f"диспетчер ревью отказал без строки заказа: {refusal}"
+        )
+    return ReviewWait(WAIT_PENDING, "", "ревью положено, но ещё не заказано")
+
+
+async def review_wait_view(db, task_row: dict[str, Any]) -> ReviewWait:
+    """Единый читатель ожидания отчёта ревью для сдачи (#1600).
+
+    Один ответ на вопрос «есть ли смысл ждать отчёт этой сдачи»: ``pending``
+    — ревью положено и ещё может прийти, ``terminal`` с причиной — не придёт
+    или не нужно. ``inflight_view`` отвечал None и на «ещё не заказано», и на
+    «окончательно кончилось»; различать их приходится здесь, а не вторым
+    читателем рядом.
+
+    Терминальность решают предикаты review_dispatch, а не копия условий:
+    ``review_dispatch_enabled`` (положено ли), ``dispatch_refusal`` (отказы
+    без строки) и ``ask_again_scheduled`` (переспрос #1242). Отчёт
+    спрашивается первым и решает в пользу прогона: он мог лечь раньше, чем
+    свип закрыл строку.
+    """
+    task_id = int(task_row["id"])
+    # Строка задачи читается целиком: поллер стюарда выбирает только id и
+    # поколение, а предикатам диспетчера нужны ветка, коммит и политика.
+    full = await repo_module.get_task(db, task_id)
+    task = dict(full) if full is not None else dict(task_row)
+    generation = int(task.get("submission_generation") or 0)
+    since = await _generation_submitted_at(db, task_id, generation)
+    if await repo_module.machine_reviews_of_generation(db, task_id, generation):
+        wait = _wait_terminal(TERMINAL_REPORT_READY, "отчёт этой сдачи есть")
+    else:
+        wait = await _wait_without_report(db, task)
+    return ReviewWait(wait.state, wait.reason, wait.detail, since)
+
+
+async def _wait_without_report(db, task: dict[str, Any]) -> ReviewWait:
+    from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
+
+    task_id = int(task["id"])
+    project = await repo_module.resolve_project_for_task(db, task_id)
+    if project is None or not review_dispatch_enabled(gate_policy_of(project)):
+        return _wait_terminal(
+            TERMINAL_NOT_REQUESTED, "проект не просит ревью этой сдачи"
+        )
+    view = await inflight_view(db, task, include_owed=True)
+    if view is not None:
+        return ReviewWait(WAIT_PENDING, "", view.headline)
+    return await _pending_or_terminal_after_orders(db, task, project)
 
 
 async def inflight_verdict_note(

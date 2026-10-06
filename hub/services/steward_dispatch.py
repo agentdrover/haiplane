@@ -44,6 +44,8 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
@@ -266,8 +268,12 @@ async def order_run(
     task_id: int,
     generation: int,
     kind: str = KIND_VERDICT,
+    why: str = "",
 ) -> dict[str, Any] | None:
     """Place one order, or refuse with a named reason.
+
+    ``why`` (#1600) — на каком основании заказ идёт без готового отчёта ревью
+    (окончательный исход или «ждали отчёт N мин»); пишется в запись заказа.
 
     Returns the order on success and None on every refusal — the caller has
     nothing to do either way, because a refusal is not a failure: it is the
@@ -353,6 +359,7 @@ async def order_run(
             "kind": kind,
             "model": config.STEWARD_MODEL,
             "mode": steward_mode(),
+            **({"why": why} if why else {}),
         },
     )
     await db.commit()
@@ -604,8 +611,44 @@ async def _nothing_new_since(
     )
 
 
-async def _review_still_running(db: aiosqlite.Connection, task: dict[str, Any]) -> str:
-    """Почему заказывать рано, или "" если пора.
+@dataclass(frozen=True)
+class ReviewGate:
+    """Ответ стража ожидания отчёта: ждать (``blocker``) или заказывать.
+
+    ``because`` — что назвать в ленте, когда заказ идёт НЕ на готовом отчёте:
+    окончательный исход ревью или «ждали отчёт N мин». Пусто — отчёт есть.
+    """
+
+    blocker: str = ""
+    because: str = ""
+
+
+def _waited_minutes(since: datetime | None, deferred_at: str) -> int:
+    """Сколько минут прошло от сдачи; нет сдачи в учёте — от первой отсрочки."""
+    from hub.services.review_evidence import parse_stamp
+
+    start = since or (parse_stamp(deferred_at) if deferred_at else None)
+    if start is None:
+        return 0
+    return max(0, int((datetime.now(UTC) - start).total_seconds() // 60))
+
+
+async def _first_deferral_stamp(
+    db: aiosqlite.Connection, task_id: int, generation: int
+) -> str:
+    rows = await fetchall(
+        db,
+        "SELECT created_at FROM events WHERE task_id=? AND kind=? "
+        "AND json_extract(payload, '$.generation')=? ORDER BY id LIMIT 1",
+        (task_id, EVENT_DEFERRED, generation),
+    )
+    return str(dict(rows[0]).get("created_at") or "") if rows else ""
+
+
+async def review_wait_gate(
+    db: aiosqlite.Connection, task: dict[str, Any]
+) -> ReviewGate:
+    """Почему судью рано заказывать или стартовать, а если пора — на каком основании.
 
     Наблюдено 22.09.2026, первый день тени на default: из восьми суждений
     три — эскалации no_current_report, и две из них (#1283, #1286)
@@ -615,47 +658,42 @@ async def _review_still_running(db: aiosqlite.Connection, task: dict[str, Any]) 
     прогона предрешён до его начала — а стоит он денег и суточной квоты, и
     портит измерение: доля эскалаций и есть порог выхода стюарда из тени.
 
-    Приём тот же, что steward_shadow применяет к неназванной модели
-    ревьюера: «пока неизвестно» не то же самое, что «неизвестно никогда».
-    Разница с тамошним ожиданием одна и она в цене: там ждёт УЖЕ
-    РАЗМЕЩЁННЫЙ заказ, здесь заказ ещё не размещён — и не размещается,
-    поэтому ожидание не стоит ни прогона, ни квоты.
+    #1600: страж #1289 видел только идущий заказ и пропускал окно «ревью
+    положено, но ещё не заказано» — 81 из 106 эскалаций остались
+    no_current_report. Теперь ответ даёт ОДИН читатель ожидания,
+    ``review_evidence.review_wait_view``: pending (положено и ещё может
+    прийти) или terminal с причиной. Терминальность — предикаты диспетчера
+    ревью, а не копия их условий; здесь она только читается.
 
-    Про ход ревью спрашивается ОДИН читатель — ``inflight_view``, тот
-    самый, чей ответ бриф показывает как ``review_in_flight``. Второй
-    читатель того же факта разошёлся бы с первым, и разошёлся бы в сторону
-    «заказывать»: экономия всегда тише осторожности.
-
-    Спрашивается он ШИРОКО (``include_owed``). Находка bec6db75314abd83:
-    узкий ответ говорит «ревью нет» на долге второй двери — строке, чей
-    прогон ревью кончился без отчёта и которую свип ещё не разобрал
-    (#1252). Отчёта этой сдачи в том окне нет ровно так же, как при живом
-    прогоне, и купленный там прогон стюарда эскалировал бы по
-    no_current_report, не начав судить. Постановка #1289 так активный заказ
-    и определяет: ``active`` ИЛИ ``second_door``. Вечной отсрочки это не
-    даёт: долг кончается либо второй дверью (новый заказ, ``active``), либо
-    ``failed``, а по ``failed`` прогон покупается.
-
-    Отчёт спрашивается вторым и решает в пользу прогона: ревью может
-    сдать отчёт раньше, чем свип переведёт свою строку в done, и ждать
-    того, что уже пришло, значило бы задерживать суждение ради
-    аккуратности учёта. Полное отсутствие ревью (#1241) сюда не попадает
-    вовсе: ждать нечего, прогон покупается, и эскалация по нему законна.
+    Пока pending, заказ ждёт — но не вечно: больше STEWARD_REVIEW_WAIT_MAX
+    минут от сдачи — и прогон покупается с причиной «ждали отчёт N мин».
+    Ожидание не стоит ни прогона, ни квоты. Тот же вопрос задаёт КАЖДАЯ
+    попытка старта (steward_shadow.start_run): заказ мог быть размещён, пока
+    отчёт был не нужен, а повтор после отказа происходит позже.
     """
-    from hub.services.review_evidence import inflight_view
+    from hub.services.review_evidence import review_wait_view
 
-    view = await inflight_view(db, task, include_owed=True)
-    if view is None:
-        return ""
-    task_id = int(task["id"])
-    generation = int(task.get("submission_generation") or 0)
-    if await repo.machine_reviews_of_generation(db, task_id, generation):
-        return ""
-    return (
-        f"ревью этой сдачи ещё не кончено ({view.headline}) — прогон "
-        "прочитал бы отсутствие отчёта и эскалировал по no_current_report, "
-        "не начав судить; заказ ждёт отчёта"
-    )
+    wait = await review_wait_view(db, task)
+    if wait.pending:
+        task_id = int(task["id"])
+        generation = int(task.get("submission_generation") or 0)
+        stamp = (
+            "" if wait.since else await _first_deferral_stamp(db, task_id, generation)
+        )
+        waited = _waited_minutes(wait.since, stamp)
+        if waited < config.STEWARD_REVIEW_WAIT_MAX:
+            return ReviewGate(
+                blocker=f"ревью этой сдачи ещё не кончено ({wait.detail}) — прогон "
+                "прочитал бы отсутствие отчёта и эскалировал по no_current_report, "
+                "не начав судить; заказ ждёт отчёта"
+            )
+        return ReviewGate(
+            because=f"ждали отчёт {waited} мин (потолок "
+            f"{config.STEWARD_REVIEW_WAIT_MAX}): {wait.detail}"
+        )
+    if wait.reason == "report_ready":
+        return ReviewGate()
+    return ReviewGate(because=f"ревью окончательно: {wait.reason} — {wait.detail}")
 
 
 async def _defer(
@@ -695,6 +733,38 @@ async def _defer(
     await db.commit()
 
 
+async def hold_start_for_review(
+    db: aiosqlite.Connection, order: dict[str, Any], task: dict[str, Any]
+) -> bool:
+    """Страж КАЖДОЙ попытки старта судьи: True — стартовать рано (#1600).
+
+    Заказ мог быть размещён, пока отчёт был не нужен или ещё не положен, а
+    повтор после undeclared_model, ошибки провайдера или нехватки
+    конфигурации приходит позже — и состояние ревью к тому времени другое.
+    Поэтому вопрос задаётся заново на каждой попытке, ДО захвата слота и
+    обращения к провайдеру, тем же читателем, что при заказе.
+
+    Отсрочка пишется один раз на поколение (_defer). Окно ожидания слота
+    сдвигается: ждёт ревью, а не исполнитель, и закрыть слот
+    never_started посреди ожидания значило бы запереть генерацию навсегда
+    (UNIQUE по заказу). Потолок STEWARD_REVIEW_WAIT_MAX остаётся — по его
+    исходу страж отвечает «пора».
+    """
+    if order.get("kind", KIND_VERDICT) != KIND_VERDICT:
+        return False
+    gate = await review_wait_gate(db, task)
+    if not gate.blocker:
+        return False
+    await _defer(db, int(order["task_id"]), int(order["generation"]), gate.blocker)
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now', ?) "
+        "WHERE id=? AND agent_id='' AND status=?",
+        (f"+{config.STEWARD_START_DEADLINE_MIN} minutes", order["id"], RUN_OPEN),
+    )
+    await db.commit()
+    return True
+
+
 async def order_due_runs(db: aiosqlite.Connection) -> int:
     """Order a run for every submission that is waiting for one."""
     if not dispatcher_enabled():
@@ -719,9 +789,9 @@ async def order_due_runs(db: aiosqlite.Connection) -> int:
         # Шестой страж (#1289), и единственный, который НЕ решает генерацию:
         # пока ревью этой сдачи идёт, судить нечего, и прогон кончился бы
         # эскалацией «нет отчёта», предрешённой до его начала.
-        waiting = await _review_still_running(db, task)
-        if waiting:
-            await _defer(db, task_id, generation, waiting)
+        gate = await review_wait_gate(db, task)
+        if gate.blocker:
+            await _defer(db, task_id, generation, gate.blocker)
             continue
         # Пятый страж, и единственный, который экономит деньги: отказ ДО
         # заказа стоит ноль, отказ после — полный прогон (#1150).
@@ -729,7 +799,7 @@ async def order_due_runs(db: aiosqlite.Connection) -> int:
         if stale:
             await _close_generation_as_refused(db, task_id, generation, stale)
             continue
-        if await order_run(db, task_id, generation) is not None:
+        if await order_run(db, task_id, generation, why=gate.because) is not None:
             ordered += 1
     return ordered
 
