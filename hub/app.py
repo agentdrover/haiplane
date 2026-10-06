@@ -92,6 +92,7 @@ from hub.models import (
     FindingDispositionsSubmit,
     OutcomeAnswerSubmit,
     ProjectCreate,
+    PolicyScheduleCreate,
     ProjectPatch,
     ProjectView,
     SkillCreate,
@@ -154,7 +155,7 @@ from hub.mcp_catalog import (
 from hub.hub_instance import hub_base_url
 from hub.services import admin as admin_svc
 from hub.services import chat_pair
-from hub.services import project_policy
+from hub.services import policy_change, project_policy
 from hub.services.review_dispatch import cancel_local_runs
 from hub.services.mcp_telemetry import set_telemetry_sink, usage_report
 from hub.mcp_server import mcp as mcp_server
@@ -884,142 +885,6 @@ async def api_list_projects(
     return [await _project_view(r) for r in rows]
 
 
-async def _refuse_unrunnable_review(db, before, fields: dict) -> None:
-    """Не хранить как исполнимую политику, исполнить которую нельзя (#1119).
-
-    ``review=dispatch`` там, где ревью НЕЧЕМ добыть, — не «попробуем», а
-    гарантированный отказ на КАЖДОЙ сдаче. Отказать на записи дешевле: тут
-    есть кому прочитать причину.
-
-    #1188: «нечем» перестало означать «не тот форж». До #1180 других способов
-    не было, и проверка форжа была этим вопросом целиком; после — локальный
-    ревьюер работает на любом форже, и инвариант, оставшийся на старом
-    признаке, отказывал В ЗАПИСИ политике, которую хаб уже умел ИСПОЛНЯТЬ.
-    Включить ревью на GitVerse-проекте было нельзя ни через UI, ни через API.
-    Поэтому вопрос задаётся общему читателю (review_dispatch.review_reach) —
-    тому же, которого спрашивают диспетчер и форма проекта.
-
-    Инвариант, а не проверка поля, — и в этом была ошибка первой редакции
-    (найдено ревью, отчёт #201). Она стояла внутри ветки ``gate_policy`` и
-    поэтому смотрела только на патч политики. PATCH, который менял ОДИН
-    ``forge``, проходил мимо: проект с ``review=dispatch`` на GitHub
-    переключался на GitVerse и сохранял политику, которую больше нельзя
-    исполнить. Запрещённое состояние достижимо двумя дорогами, и закрывать
-    надо обе — поэтому оба значения берутся ПОСЛЕ патча, каждое из патча,
-    если оно там есть, иначе из строки.
-    """
-    import json as _json
-
-    from hub.services.review_dispatch import review_reach
-
-    if "forge" not in fields and "gate_policy" not in fields:
-        return
-    if "gate_policy" in fields and fields["gate_policy"] is not None:
-        review_after = str(
-            _json.loads(fields["gate_policy"]).get("review") or ""
-        ).strip()
-    else:
-        review_after = str(
-            project_policy.gate_policy_of(before).get("review") or ""
-        ).strip()
-    forge_after = str(fields.get("forge") or project_policy.forge_of(before)).strip()
-    if review_after != "dispatch":
-        return
-    reach = await review_reach(db, forge_after)
-    if reach.runnable:
-        return
-    raise HTTPException(
-        422,
-        {
-            # Имя кода сменилось вместе со смыслом (#1188): «форж не тот» было
-            # ЕДИНСТВЕННОЙ причиной, пока способ добычи был один. Оставить
-            # старое имя значило бы назвать отказ по недостающей конфигурации
-            # проблемой форжа — то есть отправить человека чинить не то.
-            "error": "review_unrunnable_here",
-            "hint": (
-                reach.reason + ". Пока способа нет, поле review принимает только off; "
-                "вердикт в любом случае остаётся за человеком"
-            ),
-        },
-    )
-
-
-def _merged_gate_policy(
-    before: Any, sent: dict[str, Any]
-) -> tuple[dict[str, Any], dict[str, list[str]]]:
-    """Слить присланный кусок gate_policy с сохранённой политикой (#1427).
-
-    PATCH остаётся PATCH и внутри gate_policy, как у полей проекта (#338) и
-    у веб-формы (#886): присланный ключ заменяется, отсутствующий остаётся,
-    ``null`` у ключа удаляет его. Слияние одноуровневое: ``risk_map`` —
-    одно значение, присланная карта заменяет сохранённую целиком.
-
-    Полной замены нет намеренно. Всё, что она умеет, выражается слиянием:
-    ненужные ключи снимаются явным ``null``. А «забытый ключ = удалённый
-    ключ» — ровно та ловушка, которую эта задача закрывает; держать её
-    вторым режимом значит оставить её под флагом.
-
-    Итоговая политика проверяется ЦЕЛИКОМ, и замок #743 смотрит на неё же:
-    кусок может быть чистым, а результат — нет (делегат, лежавший в строке,
-    записался бы заново как одобренный).
-
-    Возвращает (итоговая политика, {"changed": [...], "removed": [...]}).
-    """
-    from hub.models import validated_gate_policy
-
-    stored = project_policy.gate_policy_of(before)
-    merged = {**stored, **{k: v for k, v in sent.items() if v is not None}}
-    for key, value in sent.items():
-        if value is None:
-            merged.pop(key, None)
-    try:
-        merged = validated_gate_policy(merged)
-    except ValueError as exc:
-        raise HTTPException(
-            422,
-            {
-                "error": "gate_policy_invalid",
-                "hint": f"итоговая политика после слияния не проходит проверку: {exc}",
-            },
-        ) from exc
-    # #743: the hub never weakens oversight over itself — the default
-    # project (the hub's own repo) refuses any DELEGATING value at the
-    # gate keys, from any token. The rule lives here rather than in the
-    # model because it needs to know WHICH project is being patched.
-    # #760 keeps the check on the two GATE keys by name: the policy now
-    # also carries a path map and a ceiling, and "any value equals auto"
-    # would quietly start meaning something else as keys are added.
-    #
-    # #1151: сравнение шло ровно со строкой "auto", и появление второго
-    # делегирующего значения сделало бы замок обходимым одним словом —
-    # verdict=steward на default включил бы на репозитории самого хаба
-    # ту автоматику, которую этот замок и запрещает. Теперь читается тот
-    # же перечень, что и у потребителей политики: новый делегат
-    # закрывается здесь в тот же момент, когда открывается там.
-    if project_policy.gate_lock_applies(before["slug"]) and any(
-        merged.get(gate) in project_policy.DELEGATED_VERDICTS
-        for gate in project_policy.GATE_LOCK_GATES
-    ):
-        raise HTTPException(
-            422,
-            {
-                "error": "default_project_gate_locked",
-                "hint": (
-                    "проект default (сам хаб) не принимает делегирование "
-                    "ни на одном гейте — ни автопилоту, ни стюарду; "
-                    "политика default всегда human"
-                ),
-            },
-        )
-    delta = {
-        "changed": sorted(
-            k for k in merged if k not in stored or stored[k] != merged[k]
-        ),
-        "removed": sorted(k for k in stored if k not in merged),
-    }
-    return merged, delta
-
-
 @app.patch("/api/projects/{project_id}", response_model=ProjectView)
 async def api_patch_project(
     project_id: int,
@@ -1028,9 +893,6 @@ async def api_patch_project(
     _identity=Depends(require_human_or_admin),
 ):
     db = _db(request)
-    before = await repo.get_project(db, project_id)
-    if before is None:
-        raise HTTPException(404, "project not found")
     fields = body.model_dump(exclude_unset=True)
     if (
         "default_branch_policy" in fields
@@ -1039,40 +901,36 @@ async def api_patch_project(
         import json as _json
 
         fields["default_branch_policy"] = _json.dumps(fields["default_branch_policy"])
-    policy_delta: dict[str, list[str]] | None = None
-    if "gate_policy" in fields and fields["gate_policy"] is not None:
-        import json as _json
-
-        merged, policy_delta = _merged_gate_policy(before, fields["gate_policy"])
-        fields["gate_policy"] = _json.dumps(merged)
-    await _refuse_unrunnable_review(db, before, fields)
     if "archived" in fields and fields["archived"] is not None:
         fields["archived"] = int(fields["archived"])
-    if fields:
-        await repo.update_project(db, project_id, **fields)
-        if policy_delta and (policy_delta["changed"] or policy_delta["removed"]):
-            # Аудит #1427: какие ключи политики изменены и какие удалены.
-            await repo.insert_event(
+    # #1593: политика читается и пишется в ОДНОЙ write-транзакции — ту же,
+    # в которой поллер исполняет отложенную правку, поэтому ни одна из двух
+    # не затирает другую. Слияние, замок #743 и проверка исполнимости review —
+    # общий путь hub/services/policy_change.py, а не копия для расписания.
+    try:
+        async with write_transaction(db):
+            before = await repo.get_project(db, project_id)
+            if before is None:
+                raise HTTPException(404, "project not found")
+            await policy_change.apply_project_fields(
                 db,
-                kind="project_gate_policy_changed",
-                project_id=project_id,
+                before,
+                fields,
                 actor="human",
-                payload={
-                    "slug": before["slug"],
-                    **policy_delta,
-                    "by": getattr(_identity, "username", "") or "",
-                },
+                by=getattr(_identity, "username", "") or "",
             )
-        if fields.get("status") == "active" and before["status"] != "active":
-            # Events feed (#349): a pending proposal became a real project.
-            await repo.insert_event(
-                db,
-                kind="project_activated",
-                project_id=project_id,
-                actor="human",
-                payload={"slug": before["slug"]},
-            )
-        await db.commit()
+            if fields.get("status") == "active" and before["status"] != "active":
+                # Events feed (#349): a pending proposal became a real project.
+                await repo.insert_event(
+                    db,
+                    kind="project_activated",
+                    project_id=project_id,
+                    actor="human",
+                    payload={"slug": before["slug"]},
+                )
+    except policy_change.PolicyRefused as refusal:
+        raise HTTPException(refusal.status, refusal.detail) from refusal
+    fields.pop("policy_version", None)
     row = _row_or_404(await repo.get_project(db, project_id), "project not found")
     # #887: the branch keys reach the clone in the same operation that changed
     # them. Before this, the hook kept protecting the previous branch until the
@@ -1212,6 +1070,82 @@ async def api_effective_policy(slug: str, request: Request) -> dict:
     db = _db(request)
     project = _row_or_404(await repo.get_project_by_slug(db, slug), "project not found")
     return await effective_policy.effective_policy(db, project)
+
+
+async def _project_by_slug_or_404(request: Request, slug: str):
+    return _row_or_404(
+        await repo.get_project_by_slug(_db(request), slug), "project not found"
+    )
+
+
+@app.post("/api/projects/{slug}/policy-schedule", status_code=201)
+async def api_create_policy_schedule(
+    slug: str,
+    body: PolicyScheduleCreate,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+) -> dict:
+    """Запланировать правку политики проекта на момент ``at`` (#1593).
+
+    Только человек — тот же уровень прав, что у PATCH проекта. Кусок
+    проверяется сейчас на слиянии с ТЕКУЩЕЙ политикой (замок #743,
+    исполнимость review); в срок хаб исполнит его тем же общим путём, что и
+    PATCH, и запишет «было → стало». Агенты расписание не создают.
+    """
+    project = await _project_by_slug_or_404(request, slug)
+    db = _db(request)
+    try:
+        change_id = await policy_change.create_scheduled_change(
+            db,
+            project,
+            at=body.at,
+            patch=body.patch,
+            note=body.note,
+            created_by=getattr(_identity, "username", "") or "",
+        )
+    except policy_change.PolicyRefused as refusal:
+        raise HTTPException(refusal.status, refusal.detail) from refusal
+    row = await repo.get_scheduled_policy_change(db, change_id)
+    return policy_change.view_row(row)
+
+
+@app.get("/api/projects/{slug}/policy-schedule")
+async def api_list_policy_schedule(
+    slug: str,
+    request: Request,
+    state: str | None = Query(
+        default=None, pattern="^(pending|applied|refused|cancelled)$"
+    ),
+) -> list[dict]:
+    """Записи расписания проекта в порядке исполнения; только чтение (#1593)."""
+    project = await _project_by_slug_or_404(request, slug)
+    rows = await repo.list_scheduled_policy_changes(
+        _db(request), int(project["id"]), state=state
+    )
+    return [policy_change.view_row(r) for r in rows]
+
+
+@app.post("/api/projects/{slug}/policy-schedule/{change_id}/cancel")
+async def api_cancel_policy_schedule(
+    slug: str,
+    change_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+) -> dict:
+    """Отменить ожидающую запись расписания; исполненную — нельзя (#1593)."""
+    project = await _project_by_slug_or_404(request, slug)
+    db = _db(request)
+    try:
+        await policy_change.cancel_scheduled_change(
+            db,
+            project,
+            change_id,
+            by=getattr(_identity, "username", "") or "",
+        )
+    except policy_change.PolicyRefused as refusal:
+        raise HTTPException(refusal.status, refusal.detail) from refusal
+    row = await repo.get_scheduled_policy_change(db, change_id)
+    return policy_change.view_row(row)
 
 
 @app.get("/api/projects/{slug}/path")

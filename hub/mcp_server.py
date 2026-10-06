@@ -3433,7 +3433,7 @@ async def hub_executor_slots() -> CallToolResult:
 
 @mcp.tool()
 async def hub_effective_policy(project: str) -> CallToolResult:
-    """Effective policy of a project: every gate key with value and source (#1457)."""
+    """Effective policy of a project: gate keys, values, sources."""
     from hub.services.effective_policy import format_effective_policy
 
     slug = urllib.parse.quote(project, safe="")
@@ -3442,6 +3442,21 @@ async def hub_effective_policy(project: str) -> CallToolResult:
     except HubApiError as exc:
         return _error_result(exc)
     return structured_echo_result("\n".join(format_effective_policy(data)), **data)
+
+
+@mcp.tool()
+async def hub_policy_schedule(project: str) -> CallToolResult:
+    """Scheduled policy changes of a project (read)."""
+    from hub.services.policy_change import format_schedule
+
+    slug = urllib.parse.quote(project, safe="")
+    try:
+        data = await _api_get(f"/api/projects/{slug}/policy-schedule")
+    except HubApiError as exc:
+        return _error_result(exc)
+    return structured_echo_result(
+        "\n".join(format_schedule(project, data)), entries=data
+    )
 
 
 @mcp.tool()
