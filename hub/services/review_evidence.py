@@ -1010,9 +1010,19 @@ def _parse_dispatch_created(raw: str) -> datetime:
     return datetime.now(UTC)
 
 
-def parse_stamp(raw: str) -> datetime:
-    """Метка времени хаба (UTC, секунды) как datetime; нечитаемая — «сейчас»."""
-    return _parse_dispatch_created(raw)
+def parse_stamp(raw: str) -> datetime | None:
+    """Метка времени хаба (UTC, секунды) как datetime; пустая или нечитаемая — None.
+
+    «Неизвестно» не равно «сейчас» (#762): читатель, превращавший нечитаемую
+    метку в текущий момент, начинал отсчёт заново на каждом тике.
+    """
+    text = (raw or "").strip()[:19]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    return None
 
 
 #: Долг второй двери: прогон ревью кончился без отчёта, строка нарочно
@@ -1132,15 +1142,9 @@ async def _generation_submitted_at(
     )
     if not rows:
         return None
-    text = str(dict(rows[0]).get("submitted_at") or "").strip()[:19]
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(text, fmt).replace(tzinfo=UTC)
-        except ValueError:
-            continue
     # Пустая или нечитаемая отметка — «неизвестно», а не «сейчас»: иначе
     # ожидание начиналось бы заново на каждом тике и потолок не достигался.
-    return None
+    return parse_stamp(str(dict(rows[0]).get("submitted_at") or ""))
 
 
 async def _pending_or_terminal_after_orders(

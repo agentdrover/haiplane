@@ -2302,33 +2302,123 @@ async def test_a_start_deferred_for_the_review_keeps_its_slot_alive(
     assert row["agent_id"] == "agent-1"
 
 
-async def test_a_overdue_slot_is_still_closed_when_the_review_wait_is_over(
-    db: aiosqlite.Connection, monkeypatch
-):
-    """#1600 круг 2: продление слота ограничено потолком, а не вечное."""
+async def _overdue_waiting_slot(
+    db: aiosqlite.Connection, monkeypatch, slug: str, *, deferred: bool = True
+) -> tuple[int, dict]:
+    """Слот, просроченный на 45 минут, пока ревью его сдачи ещё не кончено."""
+    from hub.services.steward_dispatch import _defer
+
     _start_env(monkeypatch)
-    monkeypatch.setattr(config, "STEWARD_REVIEW_WAIT_MAX", 0)
-    task_id, run = await _start_ready_order(db, "overdue-after-ceiling")
+    task_id, run = await _start_ready_order(db, slug)
     await db.execute("DELETE FROM review_dispatches WHERE task_id=?", (task_id,))
     await _dispatch(db, task_id, status="active", channel="cloud", model="grok-4.6")
+    if deferred:
+        await _defer(db, task_id, 1, "ревью ещё не кончено")
     await db.execute(
         "UPDATE steward_runs SET deadline_at=datetime('now', '-45 minutes') WHERE id=?",
         (run["id"],),
     )
     await db.commit()
+    return task_id, run
 
+
+async def _run_row(db: aiosqlite.Connection, run_id: int) -> dict:
+    rows = await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run_id,))
+    return dict(rows[0])
+
+
+_CREATED_AGENT = {"agent": {"id": "agent-1"}, "run": {"id": "run-1"}}
+
+
+async def test_an_overdue_slot_whose_report_arrived_first_still_starts(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1600 круг 3, п. A1: отчёт пришёл ДО первого восстановленного прохода.
+
+    Поллер простоял дольше окна старта, отчёт лёг, пока он стоял. Проверка
+    видит отчёт, ждать нечего — и прежний код закрывал слот never_started, а
+    UNIQUE запирал поколение: старт не случался никогда. Переход «ждал
+    ревью -> готов» даёт слоту новое окно, и тот же проход его запускает.
+    """
     from unittest.mock import AsyncMock, patch
+
+    from hub.services.steward_dispatch import sweep_steward_runs
+
+    task_id, run = await _overdue_waiting_slot(db, monkeypatch, "report-first")
+    await _report(db, task_id)
+
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED_AGENT, None)),
+    ) as provider:
+        await sweep_steward_runs(db)
+
+    assert provider.await_count == 1
+    row = await _run_row(db, run["id"])
+    assert row["status"] == RUN_OPEN, row["closed_reason"]
+    assert row["agent_id"] == "agent-1"
+    renewed = await _events(db, "steward_run_window_renewed")
+    assert len(renewed) == 1
+    assert "отчёт" in json.loads(renewed[0]["payload"])["because"]
+
+
+async def test_an_overdue_slot_at_the_ceiling_gets_a_start_attempt(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1600 круг 3, п. A2: потолок ожидания разрешает ПОПЫТКУ старта.
+
+    Прежний тест закреплял never_started на достигнутом потолке — а это
+    запирало поколение ровно тогда, когда прогон наконец разрешён. Слот
+    получает новое окно с названной причиной и стартует; закрыться
+    never_started он может только если не стартовал и в новом окне.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from hub.services.steward_dispatch import sweep_steward_runs
+
+    monkeypatch.setattr(config, "STEWARD_REVIEW_WAIT_MAX", 0)
+    task_id, run = await _overdue_waiting_slot(db, monkeypatch, "ceiling-window")
 
     with patch(
         "hub.integrations.cursor_cloud.create_agent_attempt",
         new=AsyncMock(return_value=(None, None)),
-    ):
+    ) as provider:
+        await sweep_steward_runs(db)
+        assert provider.await_count == 1, "потолок вышел — попытка старта разрешена"
+        row = await _run_row(db, run["id"])
+        assert row["status"] == RUN_OPEN, "слот закрыт на достигнутом потолке"
+        renewed = await _events(db, "steward_run_window_renewed")
+        assert len(renewed) == 1
+        assert "ждали отчёт" in json.loads(renewed[0]["payload"])["because"]
+
+        # Новое окно кончилось, а старт так и не случился: теперь — never_started,
+        # и второго продления нет.
+        await db.execute(
+            "UPDATE steward_runs SET deadline_at=datetime('now', '-1 minutes') "
+            "WHERE id=?",
+            (run["id"],),
+        )
+        await db.commit()
         await close_finished_runs(db)
 
-    row = dict(
-        (await fetchall(db, "SELECT * FROM steward_runs WHERE id=?", (run["id"],)))[0]
-    )
+    row = await _run_row(db, run["id"])
     assert row["status"] == RUN_NEVER_STARTED
+    assert len(await _events(db, "steward_run_window_renewed")) == 1
+
+
+async def test_an_overdue_slot_that_never_waited_for_the_review_is_still_closed(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1600 круг 3: новое окно — только слоту, который ревью действительно ждал."""
+    task_id, run = await _overdue_waiting_slot(
+        db, monkeypatch, "never-waited", deferred=False
+    )
+    await _report(db, task_id)
+
+    await close_finished_runs(db)
+
+    assert (await _run_row(db, run["id"]))["status"] == RUN_NEVER_STARTED
+    assert await _events(db, "steward_run_window_renewed") == []
 
 
 async def test_a_cloud_review_whose_ask_again_is_spent_is_terminal(
@@ -2398,12 +2488,58 @@ async def test_a_review_the_project_does_not_ask_for_is_not_waited_for(
     assert await _events(db, EVENT_DEFERRED) == []
 
 
-async def _counts(db: aiosqlite.Connection) -> tuple[int, int, int]:
-    out = []
-    for table in ("events", "task_updates", "machine_reviews"):
-        rows = await fetchall(db, f"SELECT COUNT(*) AS n FROM {table}")  # nosec B608
-        out.append(int(dict(rows[0])["n"]))
-    return out[0], out[1], out[2]
+_SNAPSHOT_TABLES = (
+    "events",
+    "task_updates",
+    "machine_reviews",
+    "review_dispatches",
+    "steward_runs",
+    "tasks",
+    "submissions",
+    "ci_run_reports",
+)
+
+
+async def _snapshot(db: aiosqlite.Connection) -> dict[str, list[dict]]:
+    """Содержимое строк, а не только их число: UPDATE существующей строки тоже запись."""
+    out = {}
+    for table in _SNAPSHOT_TABLES:
+        rows = await fetchall(db, f"SELECT * FROM {table} ORDER BY id")  # nosec B608
+        out[table] = [dict(r) for r in rows]
+    return out
+
+
+async def _carriable_source(
+    db: aiosqlite.Connection, task_id: int, monkeypatch, *, same_edit: bool = True
+) -> None:
+    """Прошлые три сдачи по две открытые находки; текущая — только слияние базы.
+
+    Диспетчер перенёс бы отчёт последней из них на эту пересдачу (#1361).
+    """
+    from hub.services import orchestration
+
+    async def _kept(_db, _task, _pinned, _tip):
+        return same_edit, "правка та же"
+
+    monkeypatch.setattr(orchestration, "base_merge_kept_the_verdict", _kept)
+    await repo.update_task(db, task_id, submission_generation=4)
+    for generation in (1, 2, 3):
+        await db.execute(
+            "INSERT INTO submissions (task_id, generation, sha, submitted_at) "
+            "VALUES (?, ?, ?, datetime('now', '-300 minutes'))",
+            (task_id, generation, str(generation) * 40),
+        )
+        findings = [
+            {"finding_uid": f"uid-{generation}-{n}", "title": f"находка {n}"}
+            for n in (1, 2)
+        ]
+        await db.execute(
+            "INSERT INTO machine_reviews (task_id, submission_generation, model, "
+            "submitted_by, raw_count, findings_confirmed, incomplete) "
+            "VALUES (?, ?, 'gpt-5.2', 'rev-agent', 2, ?, 0)",
+            (task_id, generation, json.dumps(findings)),
+        )
+    await db.commit()
 
 
 async def test_the_wait_reader_does_not_write(db: aiosqlite.Connection, monkeypatch):
@@ -2412,7 +2548,9 @@ async def test_the_wait_reader_does_not_write(db: aiosqlite.Connection, monkeypa
     Диспетчер ревью пишет события и алерты (отчёт CI не пришёл, красный CI,
     несходимость находок) и переносит отчёты. Читатель, зовущий те же
     предикаты, не вправе делать это раньше диспетчера: перенос из читателя
-    рождал две копии одного отчёта в поколении.
+    рождал две копии одного отчёта в поколении. Круг 3: сравнивается
+    СОДЕРЖИМОЕ строк всех затронутых таблиц, чтобы поймать и UPDATE, и
+    состояние на переносимом отчёте.
     """
     from hub.services import review_dispatch as dispatcher
     from hub.services.review_evidence import review_wait_view
@@ -2429,13 +2567,85 @@ async def test_the_wait_reader_does_not_write(db: aiosqlite.Connection, monkeypa
     _, red = await _due_task(db, "reader-red")
     await _ci_red(db, red)
     _, converge = await _due_task(db, "reader-converge")
+    _, carry = await _due_task(db, "reader-carry")
+    await _carriable_source(db, carry, monkeypatch)
     monkeypatch.setattr(dispatcher, "_fires_at_last", lambda *_a, **_k: True)
 
-    before = await _counts(db)
-    for task_id in (no_ci, red, converge):
+    before = await _snapshot(db)
+    states = {}
+    for name, task_id in (
+        ("no_ci", no_ci),
+        ("red", red),
+        ("converge", converge),
+        ("carry", carry),
+    ):
         task = dict(await repo.get_task(db, task_id))
-        await review_wait_view(db, task)
-    assert await _counts(db) == before, "читатель ожидания изменил базу"
+        states[name] = await review_wait_view(db, task)
+    assert await _snapshot(db) == before, "читатель ожидания изменил базу"
+    assert states["red"].reason == "red_ci"
+    assert states["converge"].reason == "findings_not_converging"
+    assert states["carry"].pending, "переносимый отчёт — не отказ, а скорый отчёт"
+
+
+async def test_a_carriable_report_beats_the_convergence_stop(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """#1600 круг 3, п. B: перенос отчёта идёт РАНЬШЕ проверки несходимости.
+
+    Диспетчер сначала переносит отчёт прошлой сдачи (правка та же, слита база)
+    и лишь потом спрашивает, сходятся ли находки. Читатель, смотревший их в
+    обратном порядке, объявлял terminal и заказывал судью без отчёта, который
+    диспетчер вот-вот положил бы.
+    """
+    from hub.services import review_dispatch as dispatcher
+    from hub.services.review_evidence import review_wait_view
+
+    _, task_id = await _due_task(db, "carry-and-converge")
+    await _carriable_source(db, task_id, monkeypatch, same_edit=False)
+    task = dict(await repo.get_task(db, task_id))
+    # Без переноса те же три поколения по две находки — настоящая несходимость.
+    assert (await review_wait_view(db, task)).reason == "findings_not_converging"
+
+    await _carriable_source_flip(monkeypatch, True)
+    assert (await review_wait_view(db, task)).pending
+    assert await order_due_runs(db) == 0
+    assert len(await _events(db, EVENT_DEFERRED)) == 1
+
+    # Диспетчер переносит — и у поколения появляется отчёт, судья заказывается.
+    assert await dispatcher._carry_the_report_over(db, task) is True
+    assert (await review_wait_view(db, task)).reason == "report_ready"
+    assert await order_due_runs(db) == 1
+
+
+async def _carriable_source_flip(monkeypatch, same_edit: bool) -> None:
+    from hub.services import orchestration
+
+    async def _kept(_db, _task, _pinned, _tip):
+        return same_edit, "правка та же"
+
+    monkeypatch.setattr(orchestration, "base_merge_kept_the_verdict", _kept)
+
+
+async def test_an_unreadable_deferral_stamp_counts_as_the_ceiling(
+    db: aiosqlite.Connection,
+):
+    """#1600 круг 3, п. C: нечитаемая метка отсрочки — «неизвестно», не «сейчас».
+
+    Нет строки сдачи в учёте, метка первой отсрочки нечитаема. Отсчёт «от
+    сейчас» начинался бы заново на каждом тике — вечная отсрочка. Потолок
+    считается достигнутым, причина названа.
+    """
+    _, task_id = await _due_task(db, "unreadable-deferral")
+    assert await order_due_runs(db) == 0
+    await db.execute(
+        "UPDATE events SET created_at='не дата' WHERE kind=?", (EVENT_DEFERRED,)
+    )
+    await db.commit()
+
+    assert await order_due_runs(db) == 1
+
+    payload = json.loads((await _events(db, EVENT_ORDERED))[0]["payload"])
+    assert "метка отсрочки нечитаема" in payload["why"]
 
 
 async def test_a_cloud_review_being_asked_again_is_pending_not_terminal(

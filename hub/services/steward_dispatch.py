@@ -623,14 +623,23 @@ class ReviewGate:
     because: str = ""
 
 
-def _waited_minutes(since: datetime | None, deferred_at: str) -> int:
-    """Сколько минут прошло от сдачи; нет сдачи в учёте — от первой отсрочки."""
+def _waited_minutes(since: datetime | None, deferred_at: str) -> tuple[int, bool]:
+    """(минут от сдачи, метка нечитаема). Нет сдачи в учёте — от первой отсрочки.
+
+    Нечитаемая метка отсрочки — «неизвестно», а не «сейчас» (#1600): отсчёт
+    «от сейчас» начинался бы заново на каждом тике, и потолок был бы
+    недостижим. Вызывающий читает второй элемент как «потолок достигнут».
+    """
     from hub.services.review_evidence import parse_stamp
 
-    start = since or (parse_stamp(deferred_at) if deferred_at else None)
+    start = since
+    if start is None and deferred_at:
+        start = parse_stamp(deferred_at)
+        if start is None:
+            return 0, True
     if start is None:
-        return 0
-    return max(0, int((datetime.now(UTC) - start).total_seconds() // 60))
+        return 0, False
+    return max(0, int((datetime.now(UTC) - start).total_seconds() // 60)), False
 
 
 async def _first_deferral_stamp(
@@ -680,7 +689,13 @@ async def review_wait_gate(
         stamp = (
             "" if wait.since else await _first_deferral_stamp(db, task_id, generation)
         )
-        waited = _waited_minutes(wait.since, stamp)
+        waited, unreadable = _waited_minutes(wait.since, stamp)
+        if unreadable:
+            return ReviewGate(
+                because="метка отсрочки нечитаема: сколько ждали, неизвестно, "
+                f"потолок {config.STEWARD_REVIEW_WAIT_MAX} мин считаем "
+                f"достигнутым: {wait.detail}"
+            )
         if waited < config.STEWARD_REVIEW_WAIT_MAX:
             return ReviewGate(
                 blocker=f"ревью этой сдачи ещё не кончено ({wait.detail}) — прогон "
@@ -770,25 +785,75 @@ async def _push_start_deadline(db: aiosqlite.Connection, run_id: int) -> None:
     await db.commit()
 
 
+EVENT_WINDOW_RENEWED = "steward_run_window_renewed"
+
+
+async def _waited_for_review(db: aiosqlite.Connection, run: dict[str, Any]) -> bool:
+    """Слот этой сдачи уже откладывался из-за ревью (есть запись об отсрочке)."""
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM events WHERE task_id=? AND kind=? "
+        "AND json_extract(payload, '$.generation')=? LIMIT 1",
+        (run["task_id"], EVENT_DEFERRED, run["generation"]),
+    )
+    return bool(rows)
+
+
+async def _renew_once(
+    db: aiosqlite.Connection, run: dict[str, Any], because: str
+) -> bool:
+    """Дать слоту новое окно старта — один раз, с записью причины."""
+    rows = await fetchall(
+        db,
+        "SELECT 1 FROM events WHERE task_id=? AND kind=? "
+        "AND json_extract(payload, '$.run_id')=? LIMIT 1",
+        (run["task_id"], EVENT_WINDOW_RENEWED, run["id"]),
+    )
+    if rows:
+        return False
+    await repo.insert_event(
+        db,
+        kind=EVENT_WINDOW_RENEWED,
+        task_id=int(run["task_id"]),
+        actor="hub",
+        payload={
+            "run_id": run["id"],
+            "generation": run["generation"],
+            "kind": KIND_VERDICT,
+            "because": because,
+        },
+    )
+    await _push_start_deadline(db, int(run["id"]))
+    return True
+
+
 async def _waits_for_review(
     db: aiosqlite.Connection, run: dict[str, Any], task: dict[str, Any]
 ) -> bool:
-    """Просроченный неначатый слот ждёт отчёта ревью — и закрывать его рано (#1600).
+    """Просроченный неначатый слот ждал ревью — и закрывать его рано (#1600).
 
     Закрытие неначатого слота — never_started, и оно запирает поколение
-    навсегда (UNIQUE по заказу). Пока отчёт положен и ещё может прийти, а
-    потолок STEWARD_REVIEW_WAIT_MAX не вышел, слот живёт: окно сдвигается тем
-    же приёмом, что у отсрочки старта. Спрашивается ДО закрытия, потому что
-    sweep закрывает раньше, чем стартует, и поллер, простоявший дольше окна,
-    иначе терял бы сдачу ещё до того, как страж старта её увидел.
+    навсегда (UNIQUE по заказу). Спрашивается ДО закрытия: sweep закрывает
+    раньше, чем стартует, и поллер, простоявший дольше окна, терял бы сдачу
+    ещё до стража старта. Два случая, и оба оставляют слот живым:
+
+    * отчёт ещё ждут — окно сдвигается, как при отсрочке старта;
+    * ждать закончили (отчёт пришёл, ревью кончилось окончательно или вышел
+      потолок) — слот получает НОВОЕ окно старта, один раз, с записью
+      причины. Потолок разрешает ПОПЫТКУ старта, а не закрывает слот.
+
+    never_started остаётся только слоту, который ревью не ждал, или тому,
+    кто не стартовал и в новом окне.
     """
     if not task or run.get("kind", KIND_VERDICT) != KIND_VERDICT:
         return False
     gate = await review_wait_gate(db, task)
-    if not gate.blocker:
+    if gate.blocker:
+        await _push_start_deadline(db, int(run["id"]))
+        return True
+    if not await _waited_for_review(db, run):
         return False
-    await _push_start_deadline(db, int(run["id"]))
-    return True
+    return await _renew_once(db, run, gate.because or "отчёт ревью получен")
 
 
 async def order_due_runs(db: aiosqlite.Connection) -> int:

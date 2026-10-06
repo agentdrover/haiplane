@@ -2826,6 +2826,11 @@ async def dispatch_refusal(
     if read_only:
         if await _report_already_covers_this_sha(db, task):
             return REFUSAL_CODE_ALREADY_READ
+        # Диспетчер сначала ПЕРЕНОСИТ отчёт (#1361) и лишь потом спрашивает
+        # несходимость: переносимый отчёт — это отчёт, который вот-вот
+        # появится, а не отказ. Читатель только смотрит, перенесёт ли он.
+        if await _carry_source(db, task) is not None:
+            return ""
     elif await _this_code_was_already_read(db, task):
         return REFUSAL_CODE_ALREADY_READ
     # #1255: третий тихий отказ той же природы — новое чтение уже не купит
