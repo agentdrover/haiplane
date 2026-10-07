@@ -300,6 +300,14 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
     key that lives in a CI secret (#1639). Without a listed role the principal
     kind decides: ``human`` stays human, everything else is an agent.
     """
+    # Role -> legacy role (first match in the order below wins):
+    #   super_admin, admin, security_admin -> admin
+    #   steward, watcher                   -> steward / watcher
+    #   operator, developer, viewer        -> human
+    #   reviewer_agent, agent, ci_runner   -> agent
+    # ci_runner sits above viewer on purpose: a CI key that also holds a viewer
+    # role must stay a machine. No match: kind=human -> human, any other kind
+    # (service, agent) or a missing principal -> agent, never human (#1639).
     slugs = await _get_principal_role_slugs(db, principal_id)
     for priority in (
         "super_admin",
