@@ -11,9 +11,11 @@
 
 from __future__ import annotations
 
+import ast
 import fcntl
 import os
 import select
+import shlex
 import shutil
 import signal
 import stat
@@ -378,7 +380,10 @@ def test_an_early_stop_never_removes_a_foreign_marker(spool, bin_dir, tmp_path) 
         try:
             assert _wait_for(lambda: log.read_text() != "", limit=15), "не ждёт"
             if stop == "TERM":
+                # Только TERM: ждём выхода ДО communicate, который закрыл бы
+                # stdin и добавил к TERM второй сигнал (EOF).
                 proc.send_signal(signal.SIGTERM)
+                proc.wait(timeout=15)
             else:
                 _close_stdin(proc)
             proc.communicate(timeout=15)
@@ -430,6 +435,35 @@ def _renewer(spool: Path, bin_dir: Path, *args: str, **over: str):
     )
 
 
+def _stop_renewer(proc, *, after_term=None) -> str:
+    """Остановить продлитель через TERM и вернуть его вывод.
+
+    Порядок: terminate -> wait -> communicate. ``communicate`` закрывает stdin, а
+    EOF на stdin будит ``cat`` из start_liveness, тот шлёт процессу USR1.
+    Пока bash ждёт foreground-потомка, ловушки отложены и идут по возрастанию
+    номера сигнала (Linux: USR1=10 < TERM=15): ловушка USR1 снимет маркер раньше
+    TERM. Поэтому stdin закрывается только после выхода процесса, а остановка
+    не зависит от того, где продлитель был в момент TERM.
+
+    ``after_term`` вызывается сразу после отправки TERM (до ожидания): точка
+    для барьера регрессии AC-1. Процесс не вышел за 10 с - убить и провалить тест.
+    """
+    proc.terminate()
+    if after_term is not None:
+        after_term()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.communicate(timeout=5)  # потомок мог держать stdout
+        except subprocess.TimeoutExpired:
+            pass
+        pytest.fail("продлитель не вышел за 10 с после TERM")
+    out, _ = proc.communicate(timeout=10)
+    return out
+
+
 def _parent_dies(proc) -> str:
     """Родитель умер: его конец трубы закрылся. Возвращает вывод до выхода."""
     proc.stdin.close()
@@ -465,8 +499,7 @@ def test_the_marker_is_renewed_beyond_its_ttl_independently(spool, bin_dir) -> N
         assert _wait_for(lambda: time.time() > first + beyond, limit=ttl + growth)
         assert int(_marker(spool)["expires"]) > time.time(), "маркер просрочен"
     finally:
-        renewer.terminate()
-        out, _ = renewer.communicate(timeout=10)
+        out = _stop_renewer(renewer)
     assert "drain degraded" not in out
     assert (spool / "draining").exists(), "остановка продления маркер не снимает"
 
@@ -476,8 +509,7 @@ def test_the_renewer_never_takes_a_foreign_marker(spool, bin_dir) -> None:
     renewer = _renewer(spool, bin_dir, DRAIN_RENEW_SECONDS="0.2")
     time.sleep(0.8)
     assert (spool / "draining").read_bytes() == before
-    renewer.terminate()
-    renewer.communicate(timeout=10)
+    _stop_renewer(renewer)
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="под root kill -0 чужому uid проходит")
@@ -498,8 +530,7 @@ def test_liveness_is_not_judged_by_kill_across_a_uid_boundary(spool, bin_dir) ->
         assert renewer.poll() is None, "продлитель вышел: EPERM прочтён как смерть"
         assert (spool / "draining").exists(), "маркер снят на старте деплоя"
     finally:
-        renewer.terminate()
-        renewer.communicate(timeout=10)
+        _stop_renewer(renewer)
 
 
 def test_a_dead_parent_is_seen_as_eof_and_the_marker_is_taken_back(
@@ -560,9 +591,264 @@ def test_a_failed_renewal_is_named_degraded(spool, bin_dir) -> None:
         finally:
             os.close(fd)
     finally:
-        renewer.terminate()
-        out, _ = renewer.communicate(timeout=10)
+        out = _stop_renewer(renewer)
     assert "drain degraded" in seen + out and "не продлён" in seen + out, seen + out
+
+
+class _Barrier:
+    """Барьер для foreground-потомка продлителя: подменённый flock держит его.
+
+    Событие вместо sleep: flock-заглушка пишет в fifo ``entered`` и блокируется на
+    чтении fifo ``go``; тест ждёт ``entered`` через select с таймаутом и
+    отпускает потомка записью в ``go``. Обе fifo открыты O_RDWR: на Linux это
+    не блокирует и не даёт ложного EOF. Заглушка ``cat`` пишет pid своей
+    подоболочки (она пошлёт USR1 после EOF), чтобы тест увидел конец отправки.
+    """
+
+    def __init__(self, bin_dir: Path, tmp_path: Path) -> None:
+        self.armed = tmp_path / "barrier.armed"
+        self.catpid = tmp_path / "barrier.catpid"
+        entered, go = tmp_path / "barrier.entered", tmp_path / "barrier.go"
+        os.mkfifo(entered)
+        os.mkfifo(go)
+        self._entered = os.open(entered, os.O_RDWR | os.O_NONBLOCK)
+        self._go = os.open(go, os.O_RDWR | os.O_NONBLOCK)
+        real = bin_dir / "flock-real"
+        old = bin_dir / "flock"
+        if old.exists():  # питоновская заглушка: переносим, делегируем ей
+            old.rename(real)
+            delegate = str(real)
+        else:
+            delegate = shutil.which("flock") or ""
+        assert delegate, "нет flock: нечего подменять"
+        flock = bin_dir / "flock"
+        flock.write_text(
+            "#!/bin/bash\n"
+            f"if [ -e {shlex.quote(str(self.armed))} ] "
+            f"&& rm {shlex.quote(str(self.armed))} 2>/dev/null; then\n"
+            f"  echo held >{shlex.quote(str(entered))}\n"
+            f"  read -r _ <{shlex.quote(str(go))}\n"
+            "fi\n"
+            f'exec {shlex.quote(delegate)} "$@"\n'
+        )
+        flock.chmod(0o755)
+        cat = bin_dir / "cat"
+        cat.write_text(
+            "#!/bin/bash\n"
+            "if [ $# -eq 0 ]; then\n"
+            f'  echo "$PPID" >{shlex.quote(str(self.catpid))}.tmp\n'
+            f"  mv {shlex.quote(str(self.catpid))}.tmp {shlex.quote(str(self.catpid))}\n"
+            "fi\n"
+            f'exec {shlex.quote(shutil.which("cat") or "cat")} "$@"\n'
+        )
+        cat.chmod(0o755)
+
+    def arm(self) -> None:
+        self.armed.write_text("")
+
+    def wait_held(self, limit: float = 15.0) -> None:
+        """Потомок вошёл в flock-заглушку и стоит на барьере, иначе fail."""
+        ready, _, _ = select.select([self._entered], [], [], limit)
+        if not ready:
+            pytest.fail("барьер: потомок продлителя не дошёл до flock")
+        os.read(self._entered, 16)
+        if not _wait_for(self.catpid.exists, limit=limit):
+            pytest.fail("барьер: заглушка cat не запустилась")
+
+    def release(self) -> None:
+        os.write(self._go, b"go\n")
+
+    def catpid_exit_fd(self) -> int:
+        """pidfd подоболочки cat: читается, когда она вышла (USR1 отправлен)."""
+        return os.pidfd_open(int(self.catpid.read_text()))
+
+    def close(self) -> None:
+        os.close(self._entered)
+        os.close(self._go)
+
+
+def _reap(proc, barrier: _Barrier) -> None:
+    """Уборка на любом пути: барьер отпустить ДО сбора вывода, ожидание с таймаутом.
+
+    Потомок на барьере держит stdout; kill + communicate без отпускания повисли
+    бы навсегда.
+    """
+    barrier.release()
+    if proc.poll() is None:
+        proc.kill()
+    try:
+        proc.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        pytest.fail("уборка: процесс продлителя не завершился за 10 с")
+
+
+def _stop_renewer_unsafely_for_ac1(proc, barrier: _Barrier) -> str:
+    """Старый порядок остановки (TERM, затем EOF) - ТОЛЬКО для регрессии AC-1.
+
+    Фиксирует механизм флаки: stdin закрыт, пока потомок держит барьер; USR1
+    успел уйти, и после отпускания ловушка USR1 (меньший номер) идёт раньше TERM.
+    """
+    exited = barrier.catpid_exit_fd()
+    try:
+        proc.terminate()
+        proc.stdin.close()
+        proc.stdin = None
+        ready, _, _ = select.select([exited], [], [], 15)
+        if not ready:
+            pytest.fail("барьер: USR1 не был отправлен после EOF")
+    finally:
+        os.close(exited)
+    barrier.release()
+    out, _ = proc.communicate(timeout=10)
+    return out
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="порядок отложенных ловушек USR1 < TERM только на Linux (на macOS USR1=30)",
+)
+def test_term_then_eof_on_a_held_renewer_drops_the_marker_but_the_helper_keeps_it(
+    spool, bin_dir, tmp_path
+) -> None:
+    """Регрессия #1627. Фиксирует механизм флаки и проверяет, что помощник его обходит.
+
+    Продлитель стоит в foreground-потомке (flock на барьере), ловушки отложены.
+    Старый порядок: TERM, затем закрытие stdin; USR1 успевает уйти, пока потомок
+    держит барьер, и после отпускания ловушка USR1 (меньший номер) снимает маркер.
+    Помощник ``_stop_renewer`` stdin не закрывает до выхода: идёт TERM-ловушка.
+    Порядок вызовов помощника проверяет test_the_stop_helper_orders_its_calls.
+    """
+    assert signal.SIGUSR1 < signal.SIGTERM, "предпосылка: USR1 раньше TERM"
+    assert "drain ok" in _run(["acquire"], spool, bin_dir).stdout
+    barrier = _Barrier(bin_dir, tmp_path)
+    try:
+        barrier.arm()
+        renewer = _renewer(spool, bin_dir)
+        try:
+            barrier.wait_held()
+            out = _stop_renewer_unsafely_for_ac1(renewer, barrier)
+        finally:
+            _reap(renewer, barrier)
+        assert "stopped by parent EOF" in out, out
+        assert not (spool / "draining").exists(), "механизм: USR1 снял маркер"
+
+        barrier.catpid.unlink()
+        assert "drain ok" in _run(["acquire"], spool, bin_dir).stdout
+        barrier.arm()
+        renewer = _renewer(spool, bin_dir)
+        try:
+            barrier.wait_held()
+            out = _stop_renewer(renewer, after_term=barrier.release)
+        finally:
+            _reap(renewer, barrier)
+        assert renewer.returncode == 0
+        assert "stopped by parent EOF" not in out, out
+        assert (spool / "draining").exists(), "остановка через помощник сняла маркер"
+    finally:
+        barrier.close()
+
+
+class _FakeProc:
+    """Процесс-двойник: пишет порядок вызовов помощника остановки."""
+
+    def __init__(self, hang: bool = False) -> None:
+        self.calls: list[str] = []
+        self.hang = hang
+
+    def terminate(self) -> None:
+        self.calls.append("terminate")
+
+    def wait(self, timeout=None) -> int:
+        self.calls.append("wait")
+        if self.hang:
+            raise subprocess.TimeoutExpired("fake", timeout)
+        return 0
+
+    def communicate(self, timeout=None):
+        self.calls.append("communicate")
+        return "out", None
+
+    def kill(self) -> None:
+        self.calls.append("kill")
+
+
+def test_the_stop_helper_orders_its_calls() -> None:
+    """``_stop_renewer``: terminate -> wait -> communicate; зависший процесс убит."""
+    fake = _FakeProc()
+    assert _stop_renewer(fake) == "out"
+    assert fake.calls == ["terminate", "wait", "communicate"]
+    hung = _FakeProc(hang=True)
+    with pytest.raises(pytest.fail.Exception):
+        _stop_renewer(hung)
+    assert hung.calls[:3] == ["terminate", "wait", "kill"]
+    assert "communicate" in hung.calls and hung.calls[-1] != "terminate"
+
+
+_STOP_HELPER = "_stop_renewer"
+_UNSAFE_HELPER = "_stop_renewer_unsafely_for_ac1"
+
+
+def _terminate_counts(tree: ast.AST) -> dict[str, int]:
+    """Число ``.terminate()`` в каждой функции файла (вне функций - ``<module>``)."""
+    counts: dict[str, int] = {}
+
+    def walk(node: ast.AST, owner: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            name = child.name if isinstance(child, ast.FunctionDef) else owner
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "terminate"
+            ):
+                counts[owner] = counts.get(owner, 0) + 1
+            walk(child, name)
+
+    walk(tree, "<module>")
+    return counts
+
+
+def _unconditional_calls(body: list[ast.stmt]) -> list[tuple[str, str]]:
+    """(получатель, метод) вызовов, исполняемых всегда: тело функции и ``try``.
+
+    Ветки ``if``/циклы/обработчики исключений не считаются: ``if False: p.wait()``
+    безусловным не является.
+    """
+    found: list[tuple[str, str]] = []
+    for stmt in body:
+        if isinstance(stmt, ast.Try):
+            found += _unconditional_calls(stmt.body)
+        elif isinstance(stmt, ast.Expr | ast.Assign):
+            for node in ast.walk(stmt.value):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    found.append((ast.unparse(node.func.value), node.func.attr))
+    return found
+
+
+def test_every_renewer_stop_waits_before_closing_stdin() -> None:
+    """Страж (#1627): ``terminate()`` - только в двух помощниках, по одному разу.
+
+    В ``_stop_renewer`` terminate, wait и communicate - безусловные вызовы одного
+    получателя в этом порядке.
+    """
+    tree = ast.parse(Path(__file__).read_text())
+    counts = _terminate_counts(tree)
+    assert counts == {_STOP_HELPER: 1, _UNSAFE_HELPER: 1}, (
+        f"terminate() мимо помощников или не по одному разу: {counts}; communicate "
+        "закроет stdin раньше выхода и вернёт гонку TERM/USR1"
+    )
+    helper = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == _STOP_HELPER
+    )
+    calls = _unconditional_calls(helper.body)
+    recv = {
+        m: [r for r, a in calls if a == m] for m in ("terminate", "wait", "communicate")
+    }
+    assert all(len(v) == 1 for v in recv.values()), f"нужен ровно один вызов: {recv}"
+    assert recv["terminate"] == recv["wait"] == recv["communicate"], recv
+    order = [a for _, a in calls if a in recv]
+    assert order == ["terminate", "wait", "communicate"], order
 
 
 def test_release_removes_only_our_marker_and_recheck_uses_the_one_budget(
