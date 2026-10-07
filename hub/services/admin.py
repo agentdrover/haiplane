@@ -294,7 +294,12 @@ async def get_principal_permissions(
 
 
 async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str:
-    """Return the highest-privilege legacy role name for backward compat."""
+    """Return the highest-privilege legacy role name for backward compat.
+
+    ``ci_runner`` is listed explicitly and maps to ``agent``: it is a machine
+    key that lives in a CI secret (#1639). Without a listed role the principal
+    kind decides: ``human`` stays human, everything else is an agent.
+    """
     slugs = await _get_principal_role_slugs(db, principal_id)
     for priority in (
         "super_admin",
@@ -306,6 +311,7 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
         "developer",
         "reviewer_agent",
         "agent",
+        "ci_runner",
         "viewer",
     ):
         if priority in slugs:
@@ -316,7 +322,16 @@ async def get_effective_role(db: aiosqlite.Connection, principal_id: int) -> str
             if priority in ("operator", "developer", "viewer"):
                 return "human"
             return "agent"
-    return "human"
+    # No listed role matched. The principal's kind decides, and only a person
+    # may fall back to "human" (#1639): "human" opens every human gate, so a
+    # machine key (or a principal that does not exist) must never get it by
+    # default.
+    rows = await fetchall(
+        db, "SELECT kind FROM principals WHERE id = ?", (principal_id,)
+    )
+    if rows and rows[0][0] == "human":
+        return "human"
+    return "agent"
 
 
 # ---------------------------------------------------------------------------
