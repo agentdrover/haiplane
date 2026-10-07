@@ -1795,6 +1795,7 @@ async def test_a_successful_nested_approval_leaves_the_commit_to_the_caller(
     # AC-6 (#1610): успешный approve внутри транзакции вызывающего не
     # коммитит её, в том числе записью activity.
     from hub import repository as repo
+    from hub.models import TaskApprove
     from hub.services import lifecycle
     from tests.test_auto_approve import _project
 
@@ -1816,3 +1817,19 @@ async def test_a_successful_nested_approval_leaves_the_commit_to_the_caller(
         "SELECT COUNT(*) FROM activity_log WHERE kind='task_approved'"
     )
     assert rows[0][0] == 0, "запись activity откатилась вместе с вызывающим"
+
+    # run=True внутри чужой транзакции: запуск коммитит сам - отказ до записей,
+    # после rollback вызывающего всё откатано (P1 #1610)
+    await db.execute("BEGIN IMMEDIATE")
+    await db.execute("UPDATE projects SET name='changed' WHERE id=?", (pid,))
+    with pytest.raises(ValueError):
+        await lifecycle.approve_task(db, tid, TaskApprove(force=True, run=True))
+    assert db.in_transaction
+    await db.rollback()
+    assert await _project_name(db, pid) == "Nested-Ok"
+    assert await _status(client, tid) == "draft"
+    assert len(await repo.get_task_updates(db, tid)) == before
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM activity_log WHERE kind='task_approved'"
+    )
+    assert rows[0][0] == 0

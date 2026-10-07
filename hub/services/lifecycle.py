@@ -1559,6 +1559,13 @@ async def approve_task(
         )
 
     body = body or TaskApprove()
+    if caller_owns_tx and body.run:
+        # Запуск (review_limit, dispatch_task) коммитит сам; внутри чужой
+        # транзакции это закоммитило бы её. Ошибка вызывающего, до любой записи.
+        raise ValueError(
+            "approve_task(run=True) нельзя внутри транзакции вызывающего: "
+            "запуск коммитит; одобрите без run и запустите после своего commit"
+        )
 
     # --- Freeze admission (#1594) ------------------------------------------
     # До DoR и до любой записи: отказ не оставляет следов, а force (который

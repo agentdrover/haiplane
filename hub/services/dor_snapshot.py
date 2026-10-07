@@ -25,6 +25,7 @@ from typing import Any
 import aiosqlite
 
 from hub import repository as repo
+from hub.db import fetchall
 
 #: Поля задачи, из которых считаются DoR, оценка и рекомендации одобрения.
 #: Снимок содержит ТОЛЬКО их: чтение любого другого поля в расчёте - KeyError,
@@ -107,33 +108,58 @@ class DorSnapshot:
         return str(self.project["workspace_path"] or "").strip()
 
 
-@contextlib.asynccontextmanager
-async def _one_read_transaction(db: aiosqlite.Connection) -> AsyncIterator[None]:
-    """Все чтения снимка - из одного состояния БД.
+async def _main_db_file(db: aiosqlite.Connection) -> str:
+    """Файл основной базы соединения; пусто для базы в памяти."""
+    rows = await fetchall(db, "PRAGMA database_list")
+    for row in rows:
+        if row[1] == "main":
+            return str(row[2] or "")
+    return ""
 
-    Своя read-транзакция открывается и закрывается здесь; внутри чужой (или
-    под write-локом) чтения и так согласованы, и мы её не трогаем.
+
+@contextlib.asynccontextmanager
+async def _reader(db: aiosqlite.Connection) -> AsyncIterator[aiosqlite.Connection]:
+    """Соединение, с которого читается снимок: все чтения из одного состояния БД.
+
+    Самостоятельный снимок читается на ОТДЕЛЬНОМ коротком соединении к тому же
+    файлу, в своей read-транзакции (WAL: читатель не блокирует писателя). Так
+    снимок не трогает транзакционное состояние соединения вызывающего: другая
+    корутина на нём может одновременно писать, и ни наш BEGIN, ни наш rollback
+    её не заденут (#1610).
+
+    Внутри чужой транзакции (или под write-локом) читаем на самом соединении:
+    состояние там и так согласовано. База в памяти недоступна второму
+    соединению; для неё читаем на соединении вызывающего без собственной
+    транзакции - согласованность тогда держит сверка отпечатка под локом
+    (расхождённый снимок не совпадёт и уйдёт в повтор).
     """
-    if db.in_transaction:
-        yield
+    path = "" if db.in_transaction else await _main_db_file(db)
+    if not path:
+        yield db
         return
-    await db.execute("BEGIN")
+    conn = await aiosqlite.connect(path)
     try:
-        yield
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA busy_timeout = 5000")
+        await conn.execute("BEGIN")
+        try:
+            yield conn
+        finally:
+            await conn.rollback()
     finally:
-        await db.rollback()
+        await conn.close()
 
 
 async def load_dor_snapshot(db: aiosqlite.Connection, task_id: int) -> DorSnapshot:
     """Снять входы DoR из БД; без git и без файловой системы."""
     from hub.services.project_policy import gate_policy_of, statement_paths_of
 
-    async with _one_read_transaction(db):
-        row = await repo.get_task(db, task_id)
+    async with _reader(db) as conn:
+        row = await repo.get_task(conn, task_id)
         if row is None:
             raise ValueError(f"task {task_id} not found")
-        ac_rows = await repo.list_acceptance_criteria(db, task_id)
-        project_row, source_id = await repo.resolve_project_with_source(db, task_id)
+        ac_rows = await repo.list_acceptance_criteria(conn, task_id)
+        project_row, source_id = await repo.resolve_project_with_source(conn, task_id)
 
     task = {name: row[name] for name in TASK_FIELDS}
     acs = tuple({name: (dict(ac).get(name)) for name in AC_FIELDS} for ac in ac_rows)

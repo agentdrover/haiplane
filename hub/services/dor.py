@@ -562,10 +562,17 @@ async def workspace_gap_for(db, task_id: int) -> WorkspaceGap | None:
     пустой путь у default остаётся «без workspace», даже если git_ops упадёт
     на запасной путь из окружения.
     """
-    from hub.services.dor_snapshot import load_dor_snapshot
-
+    project, source_id = await repo.resolve_project_with_source(db, task_id)
+    if project is None:
+        return None
     return workspace_gap_from_project(
-        (await load_dor_snapshot(db, task_id)).project, task_id
+        {
+            "id": project["id"],
+            "slug": project["slug"],
+            "workspace_path": project["workspace_path"],
+            "source_id": source_id,
+        },
+        task_id,
     )
 
 

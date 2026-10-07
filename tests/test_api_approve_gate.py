@@ -480,6 +480,13 @@ async def test_the_override_names_the_dor_the_decision_was_made_on(
     assert "has_user_story" not in alerts[0], "ложного missing не бывает"
 
 
+class _NoSql:
+    """Вместо соединения: падает на любом обращении (execute и прочее)."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"расчёт по снимку полез в БД: {name}")
+
+
 async def test_the_dor_fingerprint_covers_every_dor_input(client: AsyncClient, db):
     # AC-3: каждое поле, которое читает approve-расчёт, входит в отпечаток
     # либо явно исключено с причиной. Новое поле в DoR без отпечатка роняет
@@ -524,8 +531,9 @@ async def test_the_dor_fingerprint_covers_every_dor_input(client: AsyncClient, d
             acs=tuple(Recording(a, seen_ac) for a in snap.acs),
             project=Recording(snap.project, seen_project),
         )
+        # расчёт идёт ТОЛЬКО по снимку: любой SQL на соединении - отказ
         await recommendations.calculate_readiness_with_recommendations(
-            db, tid, snapshot=spy
+            _NoSql(), tid, snapshot=spy
         )
     assert seen_task and seen_ac and seen_project, "страж что-то прочитал"
     assert seen_task <= set(TASK_FIELDS), seen_task - set(TASK_FIELDS)
@@ -596,3 +604,46 @@ async def test_batch_names_a_changed_statement_per_item(
     assert skipped["reason"] == "statement_changed_during_approval"
     assert skipped["detail"].strip(), "текст причины приезжает в detail"
     assert await _status_of(client, racy) == "draft"
+
+
+async def test_concurrent_snapshots_on_one_connection_do_not_collide(
+    client: AsyncClient, db
+):
+    # P2 (а): два снимка параллельно на одном соединении - без
+    # "cannot start a transaction within a transaction".
+    import asyncio
+
+    from hub.services.dor_snapshot import load_dor_snapshot
+
+    task = await _create_draft_task(client)
+    await _make_dor_ready(client, task["id"])
+    snaps = await asyncio.gather(*(load_dor_snapshot(db, task["id"]) for _ in range(4)))
+    assert len({s.fingerprint() for s in snaps}) == 1
+
+
+async def test_a_snapshot_does_not_touch_a_write_made_meanwhile_on_the_connection(
+    client: AsyncClient, db, monkeypatch
+):
+    # P2 (б): пока снимок читается, другая корутина пишет на том же
+    # соединении; rollback снимка её запись не стирает.
+    from hub import repository as repo
+    from hub.services.dor_snapshot import load_dor_snapshot
+
+    task = await _create_draft_task(client)
+    await _make_dor_ready(client, task["id"])
+    real = repo.list_acceptance_criteria
+
+    async def write_then_read(conn, task_id):
+        await db.execute(
+            "INSERT INTO activity_log (kind, summary) VALUES ('probe', 'meanwhile')"
+        )
+        return await real(conn, task_id)
+
+    monkeypatch.setattr(repo, "list_acceptance_criteria", write_then_read)
+    await load_dor_snapshot(db, task["id"])
+    assert db.in_transaction, "чужая транзакция жива"
+    await db.commit()
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM activity_log WHERE kind='probe'"
+    )
+    assert rows[0][0] == 1
