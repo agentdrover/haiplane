@@ -292,6 +292,10 @@ def _after_each_calc(monkeypatch, action, *, times: int | None = None) -> list[i
     return calls
 
 
+async def _noop(_task_id: int) -> None:
+    return None
+
+
 async def _alerts(client: AsyncClient, task_id: int) -> list[str]:
     updates = await client.get(f"/api/tasks/{task_id}/updates")
     return [u["content"] for u in updates.json() if u["kind"] == "alert"]
@@ -349,15 +353,17 @@ async def test_a_refine_while_inputs_load_cannot_pass_a_stale_dor(
         return await real(conn, task_id)
 
     monkeypatch.setattr(repo, "list_acceptance_criteria", drop_then_read)
+    calls = _after_each_calc(monkeypatch, _noop)
     resp = await client.post(f"/api/tasks/{tid}/approve", json={})
     assert resp.status_code == 422, resp.text
+    assert len(calls) == 2, "расчёт шёл по согласованному снимку и был повторён"
     assert "has_acceptance_criteria" in resp.json()["detail"]["missing_required"]
     assert await _status_of(client, tid) == "draft"
     assert not await _alerts(client, tid)
 
 
 async def test_three_changed_snapshots_in_a_row_refuse_with_409(
-    client: AsyncClient, db_dsn, monkeypatch
+    client: AsyncClient, db, db_dsn, monkeypatch
 ):
     # AC-1: всего три попытки, затем 409 с причиной и без записей.
     task = await _create_draft_task(client)
@@ -380,8 +386,11 @@ async def test_three_changed_snapshots_in_a_row_refuse_with_409(
     assert len(calls) == 3
     assert await _status_of(client, tid) == "draft"
     assert not await _alerts(client, tid), "отказ не оставляет override"
-    events = await client.get("/api/events")
-    assert "task_approved" not in {e["kind"] for e in events.json()}
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM events WHERE kind='task_approved' AND task_id=?",
+        (tid,),
+    )
+    assert rows[0][0] == 0, "перехода нет"
 
 
 async def test_a_second_attempt_with_a_matching_snapshot_approves(

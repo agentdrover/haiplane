@@ -34,6 +34,7 @@ from hub.actionable_errors import (
     withdraw_own_draft_error_detail,
 )
 from hub import repository as repo
+from hub.services.dor_snapshot import DorSnapshot, load_dor_snapshot
 from hub.services.sessions import note_session_task
 from hub.hub_instance import mutation_activity_detail
 from hub.db import (
@@ -1342,12 +1343,38 @@ async def _local_rollback(db: aiosqlite.Connection) -> AsyncIterator[None]:
         await db.execute("RELEASE SAVEPOINT approve_local")
 
 
+#: Всего попыток одобрения при меняющейся постановке (#1610): первая и два повтора.
+APPROVAL_SNAPSHOT_ATTEMPTS = 3
+#: Код отказа, когда постановка менялась во время одобрения (#1610).
+STATEMENT_CHANGED = "statement_changed_during_approval"
+
+
+class _StatementMoved(Exception):
+    """Снимок входов DoR под локом не совпал с тем, по которому считали DoR."""
+
+
+def _statement_changed_error(task_id: int, attempts: int) -> HTTPException:
+    tries = "без повтора" if attempts == 1 else f"за {attempts} попытки"
+    return HTTPException(
+        409,
+        detail={
+            "error": STATEMENT_CHANGED,
+            "task_id": task_id,
+            "message": (
+                f"постановка менялась во время одобрения ({tries}): DoR устарел; "
+                "повторите одобрение"
+            ),
+        },
+    )
+
+
 async def _open_draft_under_lock(
     db: aiosqlite.Connection,
     task_id: int,
     task: dict[str, Any],
     body: TaskApprove,
     readiness: Any,
+    snapshot: DorSnapshot,
     caller_owns_tx: bool = False,
 ) -> str | None:
     """Допуск заморозки, DoR-override и переход draft -> open одной транзакцией.
@@ -1357,6 +1384,11 @@ async def _open_draft_under_lock(
     по ним, а не по тому, что было прочитано до расчёта DoR (#1594). Конкурентный
     refine или правка политики между проверкой и переходом иначе открыли бы
     запрещённую работу. Отказ откатывает всё, включая запись override.
+
+    Тем же способом сверяется DoR (#1610): снимок входов перечитывается под
+    локом (только БД: git под write-локом запрещён, #1456) и сравнивается по
+    отпечатку со снимком, из которого посчитан ``readiness``. Расхождение -
+    ``_StatementMoved`` до любой записи.
     Возвращает сводку DoR-override (или None).
     """
     scope = _local_rollback(db) if caller_owns_tx else write_transaction(db)
@@ -1364,6 +1396,10 @@ async def _open_draft_under_lock(
         fresh = await repo.get_task(db, task_id)
         if fresh is None or fresh["status"] != "draft":
             raise HTTPException(409, "task is no longer draft (concurrent approve?)")
+        if (
+            await load_dor_snapshot(db, task_id)
+        ).fingerprint() != snapshot.fingerprint():
+            raise _StatementMoved
         task.update(dict(fresh))
         _require_freeze_admission(
             await repo.resolve_project_for_task(db, task_id),
@@ -1457,6 +1493,45 @@ async def _open_draft_under_lock(
     return dor_override_summary
 
 
+async def _approve_on_current_dor(
+    db: aiosqlite.Connection,
+    task_id: int,
+    task: dict[str, Any],
+    body: TaskApprove,
+    caller_owns_tx: bool,
+) -> str | None:
+    """DoR и отпечаток из одного снимка; под локом снимок сверяется (#1610).
+
+    Расчёт (включая git) идёт ВНЕ write-лока. Не совпал снимок под локом -
+    лок отпущен, снимок и DoR пересчитываются заново; всего
+    ``APPROVAL_SNAPSHOT_ATTEMPTS`` попыток, затем 409. Внутри транзакции
+    вызывающего (``caller_owns_tx``) расчёт уже идёт под его локом, повторять
+    нечем: сразу 409, откат только своей работы.
+    """
+    # Import locally to avoid a circular dependency (services.recommendations
+    # imports from .readiness which imports from .dor; lifecycle is called
+    # from many modules and should stay lightweight at import time).
+    from hub.services.recommendations import (
+        calculate_readiness_with_recommendations,
+    )
+
+    attempts = 1 if caller_owns_tx else APPROVAL_SNAPSHOT_ATTEMPTS
+    for _ in range(attempts):
+        snapshot = await load_dor_snapshot(db, task_id)
+        readiness = await calculate_readiness_with_recommendations(
+            db, task_id, snapshot=snapshot
+        )
+        if db.in_transaction and not caller_owns_tx:
+            await db.commit()
+        try:
+            return await _open_draft_under_lock(
+                db, task_id, task, body, readiness, snapshot, caller_owns_tx
+            )
+        except _StatementMoved:
+            continue
+    raise _statement_changed_error(task_id, attempts)
+
+
 async def approve_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -1496,18 +1571,8 @@ async def approve_task(
     )
 
     # --- DoR gate -----------------------------------------------------------
-    # Import locally to avoid a circular dependency (services.recommendations
-    # imports from .readiness which imports from .dor; lifecycle is called
-    # from many modules and should stay lightweight at import time).
-    from hub.services.recommendations import (
-        calculate_readiness_with_recommendations,
-    )
-
-    readiness = await calculate_readiness_with_recommendations(db, task_id)
-    if db.in_transaction and not caller_owns_tx:
-        await db.commit()
-    dor_override_summary = await _open_draft_under_lock(
-        db, task_id, task, body, readiness, caller_owns_tx
+    dor_override_summary = await _approve_on_current_dor(
+        db, task_id, task, body, caller_owns_tx
     )
 
     # #1264: the approval stands; only the run waits for the review queue.
@@ -1532,9 +1597,12 @@ async def approve_task(
         "task_approved",
         f"Task #{task_id} approved{activity_suffix}",
         detail=mutation_activity_detail(),
+        commit=not caller_owns_tx,
     )
 
-    await _warn_on_dead_locators(db, task_id, task.get("task_type"))
+    await _warn_on_dead_locators(
+        db, task_id, task.get("task_type"), commit=not caller_owns_tx
+    )
 
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
@@ -1551,7 +1619,11 @@ _LOCATOR_WARNED_TYPES = frozenset({"epic", "feature"})
 
 
 async def _warn_on_dead_locators(
-    db: aiosqlite.Connection, task_id: int, task_type: str | None
+    db: aiosqlite.Connection,
+    task_id: int,
+    task_type: str | None,
+    *,
+    commit: bool = True,
 ) -> None:
     """Name AC whose test does not exist, once, at approval (#1032).
 
@@ -1588,7 +1660,8 @@ async def _warn_on_dead_locators(
         "не быть. Но пока локатор не разрешается, критерий проверить нечем, и "
         "узнать об этом иначе можно только вручную (#1032).",
     )
-    await db.commit()
+    if commit:
+        await db.commit()
 
 
 async def batch_approve_tasks(
@@ -1657,7 +1730,7 @@ async def batch_approve_tasks(
             if isinstance(detail, dict):
                 reason = detail.get("reason") or detail.get("error") or reason
                 # #1594: у отказа заморозки есть текст со сроком и note.
-                if reason == FREEZE_REFUSED:
+                if reason in (FREEZE_REFUSED, STATEMENT_CHANGED):
                     text = str(detail.get("message") or "")
             result.skipped.append(
                 BatchApproveSkipped(task_id=task_id, reason=f"{reason}", detail=text)

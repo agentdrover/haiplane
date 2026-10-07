@@ -15,12 +15,17 @@ from __future__ import annotations
 import logging
 import re
 import shlex
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from hub import config, repository as repo
 from hub.db import deserialize_str_list
 from hub.models import DoRCheckItem, WorkType
 from hub.services.orchestrator_queue import overlap
+
+if TYPE_CHECKING:
+    from hub.services.dor_snapshot import DorSnapshot
 
 log = logging.getLogger("hub.services.dor")
 
@@ -529,17 +534,17 @@ async def record_statement_paths(db, task_id: int, dor_checks) -> None:
             )
 
 
-async def workspace_gap_for(db, task_id: int) -> WorkspaceGap | None:
-    """Проект без workspace_path для задачи или ``None`` (#1604).
+def workspace_gap_from_project(
+    project: Mapping[str, Any], task_id: int
+) -> WorkspaceGap | None:
+    """Проект без workspace_path по уже снятым данным проекта (#1604, #1610).
 
-    Проект определяет тот же разбор, что у project_git_context
-    (``resolve_project_with_source``), и смотрится значение ПРОЕКТА, не env:
-    пустой путь у default остаётся «без workspace», даже если git_ops упадёт
-    на запасной путь из окружения. Нет проекта вовсе - не утверждаем ничего.
+    ``project`` - поля снимка (``PROJECT_FIELDS``): ``source_id`` - узел, давший
+    проект, ``None`` - запасной default. Нет проекта вовсе - не утверждаем ничего.
     """
-    project, source_id = await repo.resolve_project_with_source(db, task_id)
-    if project is None or (project["workspace_path"] or "").strip():
+    if project["id"] is None or (project["workspace_path"] or "").strip():
         return None
+    source_id = project["source_id"]
     if source_id is None:
         source = "резервный проект default"
     elif source_id == task_id:
@@ -547,6 +552,21 @@ async def workspace_gap_for(db, task_id: int) -> WorkspaceGap | None:
     else:
         source = f"унаследован от эпика #{source_id}"
     return WorkspaceGap(slug=str(project["slug"]), source=source)
+
+
+async def workspace_gap_for(db, task_id: int) -> WorkspaceGap | None:
+    """Проект без workspace_path для задачи или ``None`` (#1604).
+
+    Проект определяет тот же разбор, что у project_git_context
+    (``resolve_project_with_source``), и смотрится значение ПРОЕКТА, не env:
+    пустой путь у default остаётся «без workspace», даже если git_ops упадёт
+    на запасной путь из окружения.
+    """
+    from hub.services.dor_snapshot import load_dor_snapshot
+
+    return workspace_gap_from_project(
+        (await load_dor_snapshot(db, task_id)).project, task_id
+    )
 
 
 async def record_workspace_missing(db, task_id: int) -> None:
@@ -568,67 +588,78 @@ async def record_workspace_missing(db, task_id: int) -> None:
         )
 
 
-async def _base_tree(db, task_id: int) -> tuple[set[str] | None, str]:
+async def _base_tree(
+    workspace_path: str, default_branch: str
+) -> tuple[set[str] | None, str]:
     """Дерево базовой ветки проекта из локального клона и причина, если не прочитано.
 
     Без сети: ``origin/<base>``, затем локальное имя — как у проверки предмета
     (#1232). Любой сбой читается как «не прочитано», не как пустое дерево.
+    Вход - поля снимка проекта, не БД: это внешнее наблюдение (git), и оно
+    вне отпечатка (#1610).
     """
-    from hub.services.orchestration import project_git_context
     from hub.services.readiness import _tree_at
 
+    repo_path = workspace_path.strip()
+    base = default_branch.strip() or config.PAIR_BASE_BRANCH
+    if not repo_path:
+        return None, "у проекта не задан workspace_path — клона нет"
     try:
-        ctx = await project_git_context(db, task_id)
-        repo_path = str(ctx.get("repo") or "").strip()
-        base = str(ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
-        if not repo_path:
-            return None, "у проекта не задан workspace_path — клона нет"
         found = await _tree_at(repo_path, (f"origin/{base}", base))
     except Exception:  # noqa: BLE001 - DoR must assemble regardless
-        log.warning("statement path base read failed for task #%s", task_id)
+        log.warning("statement path base read failed in %s", repo_path)
         return None, "базовую ветку прочитать не удалось"
     if found is None:
         return None, f"базовую ветку {base} в клоне {repo_path} прочитать не удалось"
     return found[1], ""
 
 
-async def _statement_paths_for(db, task_id: int, row, acs) -> StatementPathsResult:
-    from hub.services.project_policy import gate_policy_for_task, statement_paths_of
+def _statement_paths_for(snapshot: DorSnapshot) -> StatementPathsResult:
+    return _statement_paths_with(snapshot, set(), "")
 
-    mode = statement_paths_of(await gate_policy_for_task(db, task_id))
-    commands = deserialize_str_list(row["validation_commands"])
-    areas = deserialize_str_list(row["affected_areas"])
-    test_refs = [(str(a["ac_id"]), str(a["test_ref"])) for a in acs if a["test_ref"]]
 
-    def run(tree: set[str] | None, reason: str = "") -> StatementPathsResult:
-        return check_statement_paths(
-            validation_commands=commands,
-            test_refs=test_refs,
-            affected_areas=areas,
-            tree=tree,
-            mode=mode,
-            unread_reason=reason,
-        )
+def _statement_paths_with(
+    snapshot: DorSnapshot, tree: set[str] | None, reason: str
+) -> StatementPathsResult:
+    acs = snapshot.acs
+    return check_statement_paths(
+        validation_commands=deserialize_str_list(snapshot.task["validation_commands"]),
+        test_refs=[(str(a["ac_id"]), str(a["test_ref"])) for a in acs if a["test_ref"]],
+        affected_areas=deserialize_str_list(snapshot.task["affected_areas"]),
+        tree=tree,
+        mode=snapshot.project["statement_paths"] or "warn",
+        unread_reason=reason,
+    )
 
+
+async def _statement_paths_checked(snapshot: DorSnapshot) -> StatementPathsResult:
     # Без путей в постановке (или при off) git не нужен вовсе.
-    first = run(set())
+    first = _statement_paths_for(snapshot)
     if first.mode == "off" or first.paths_total == 0:
         return first
-    tree, reason = await _base_tree(db, task_id)
-    return run(tree, reason)
+    tree, reason = await _base_tree(
+        snapshot.workspace_path, str(snapshot.project["default_branch"] or "")
+    )
+    return _statement_paths_with(snapshot, tree, reason)
 
 
-async def evaluate_dor(db, task_id: int) -> DoREvaluation:
-    """Load task data + ACs from the repository and evaluate DoR."""
-    row = await repo.get_task(db, task_id)
-    if row is None:
-        raise ValueError(f"task {task_id} not found")
-    acs = await repo.list_acceptance_criteria(db, task_id)
+async def evaluate_dor(
+    db, task_id: int, snapshot: DorSnapshot | None = None
+) -> DoREvaluation:
+    """Evaluate DoR from one DB snapshot of the task (#1610).
 
-    # The structured columns are guaranteed to exist after migration #46
-    # for tasks-table. With strict migrations (review I2) it's safer to
-    # let a KeyError propagate than to silently return None and hide a
-    # missing-column bug behind a "task is empty" diagnostic.
+    Без ``snapshot`` снимок берётся здесь; одобрение передаёт свой, чтобы DoR и
+    отпечаток считались из одних и тех же данных.
+    """
+    from hub.services.dor_snapshot import load_dor_snapshot
+
+    if snapshot is None:
+        snapshot = await load_dor_snapshot(db, task_id)
+    row = snapshot.task
+
+    # Снимок содержит только отпечатываемые поля: чтение чужого - KeyError, а не
+    # тихо устаревший DoR (guard #1610). With strict migrations (review I2) it
+    # is safer to fail loudly than to hide a missing column.
     return evaluate_from_data(
         work_type=row["work_type"],
         user_story=row["user_story"],
@@ -638,13 +669,13 @@ async def evaluate_dor(db, task_id: int) -> DoREvaluation:
         validation_count=len(deserialize_str_list(row["validation_commands"])),
         size=row["size"],
         wip_tag=row["wip_tag"],
-        ac_count=len(acs),
+        ac_count=len(snapshot.acs),
         affected_areas_count=len(deserialize_str_list(row["affected_areas"])),
         outcome_metric=row["outcome_metric"],
         redesign_decision=row["redesign_decision"],
         agent_fit=row["agent_fit"],
-        statement_paths=await _statement_paths_for(db, task_id, row, acs),
-        workspace_gap=await workspace_gap_for(db, task_id),
+        statement_paths=await _statement_paths_checked(snapshot),
+        workspace_gap=workspace_gap_from_project(snapshot.project, task_id),
     )
 
 
@@ -660,6 +691,7 @@ __all__ = [
     "WorkspaceGap",
     "record_workspace_missing",
     "workspace_gap_for",
+    "workspace_gap_from_project",
     "StatementPathsResult",
     "check_statement_paths",
     "record_statement_paths",
