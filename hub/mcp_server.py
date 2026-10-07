@@ -1823,7 +1823,6 @@ _CONTEXT_DROP_ORDER = (
     "context.context_text",
     "context.siblings",
     "context.children",
-    "context.working_rules",
     "context.task",
     "context.parent_goal",
     "context.readiness",
@@ -2159,16 +2158,40 @@ async def hub_my_context(
     text = ctx.get("context_text", f"Context for task #{task_id} not available.")
     text += await _policy_brief_text(ctx)
     text += await _path_brief_text(ctx)
+    extra: dict[str, Any] = {}
+    rules = ctx.get("working_rules")
+    if rules and rules.get("mode") == "summary":
+        # #1630: сводка правил живёт отдельным полем вне "context": его нет
+        # в _CONTEXT_DROP_ORDER, она мала и остаётся в обоих представлениях.
+        from hub.models import WorkingRules
+        from hub.services import working_rules as wr_service
+
+        try:
+            extra["working_rules_summary"] = wr_service.compact_summary(
+                WorkingRules.model_validate(rules)
+            )
+            ctx = {k: v for k, v in ctx.items() if k != "working_rules"}
+        except ValueError:
+            pass
     return fit_echo_result(
         text,
         _context_char_budget(max_chars, mode),
         drop_order=_CONTEXT_DROP_ORDER,
         context=ctx,
+        **extra,
     )
 
 
 async def _policy_brief_text(ctx: dict[str, Any]) -> str:
     """Блок «политика проекта» для контекста задачи (#1457); best effort."""
+    layer = (ctx.get("working_rules") or {}).get("project_policy")
+    if layer is not None:
+        # #1630: политика уже пришла в блоке — второй запрос не нужен, а
+        # сессии implementer маршрут /effective-policy закрыт.
+        # В mode=full она уже есть в разделе context_text.
+        text = layer.get("text") or ""
+        in_summary = (ctx.get("working_rules") or {}).get("mode") == "summary"
+        return f"\n\n{text}" if text and in_summary else ""
     slug = ((ctx.get("task") or {}).get("project") or {}).get("slug") or ""
     return await _policy_brief_for_slug(slug)
 

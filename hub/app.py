@@ -2190,13 +2190,17 @@ async def api_task_context(
     working_rules = await working_rules_service.build_working_rules(
         db, task_id, summary=mode == "summary"
     )
-    lines.append("")
-    lines.append(
-        working_rules_service.render_working_rules(
-            working_rules,
-            full_pointer=f'hub_my_context(task_id={task_id}, mode="full")',
-        )
+    rules_text = working_rules_service.render_working_rules(
+        working_rules,
+        full_pointer=f'hub_my_context(task_id={task_id}, mode="full")',
     )
+    if mode == "summary":
+        # Сводка стоит в начале: потолок режет хвост, и место под правила
+        # занято до сокращения остального контекста.
+        lines.insert(2, rules_text)
+    else:
+        lines.append("")
+        lines.append(rules_text)
     if mode == "full":
         lines.append("")
         lines.extend(lifecycle_map_lines())

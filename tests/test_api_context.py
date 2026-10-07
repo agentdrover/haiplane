@@ -464,3 +464,29 @@ async def test_repository_rules_are_marked_as_data(client, db, tmp_path):
     assert "\n### Навык хаба" not in inside
     # Раздел идёт после фиксированной preamble.
     assert text.index(wr.PREAMBLE) < text.index(wr.MARK_BEGIN)
+
+
+async def test_summary_context_keeps_rules_under_a_big_statement(client):
+    """AC-5 (#1630): problem_statement, business_value и user_story на 3500 знаков при потолке 1500 не вытесняют сводку правил
+    из summary — она стоит в начале и потолок режет хвост."""
+    created = await client.post("/api/tasks", json={"title": "big"})
+    assert created.status_code in (200, 201), created.text
+    task_id = created.json()["id"]
+    refined = await client.post(
+        f"/api/tasks/{task_id}/refine",
+        json={
+            "problem_statement": "п" * 2000,
+            "business_value": "б" * 500,
+            "user_story": "у" * 1000,
+        },
+    )
+    assert refined.status_code == 200, refined.text
+
+    ctx = (
+        await client.get(f"/api/tasks/{task_id}/context?mode=summary&max_chars=1500")
+    ).json()
+
+    assert len(ctx["context_text"]) <= 1600
+    assert "Правила работы (сводка)" in ctx["context_text"]
+    assert ctx["working_rules"]["mode"] == "summary"
+    assert ctx["working_rules"]["repository_rules"]["content"] == ""

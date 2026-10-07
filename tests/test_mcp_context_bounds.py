@@ -322,7 +322,6 @@ async def test_working_rules_respect_context_bounds() -> None:
     summary = full.model_copy(deep=True)
     summary.mode = "summary"
     summary.hub_skill.content = ""
-    summary.project_policy.text = ""
     summary.repository_rules.content = ""
 
     # pair_start: навык до 6000, политика, файл до 4000, пометка и указатель.
@@ -356,16 +355,27 @@ async def test_working_rules_respect_context_bounds() -> None:
     summary_text = wr.render_working_rules(
         summary, full_pointer='hub_my_context(task_id=1630, mode="full")'
     )
-    assert "present" in summary_text and "20000" in summary_text
+    assert "present" in summary_text and f"{len(body.encode())} байт" in summary_text
     assert "правило-00000" not in summary_text
+    # Большой problem_statement съедает общий бюджет — сводка правил остаётся
+    # и в text, и в structuredContent (место занято до сокращения остального).
     ctx = _heavy_context()
-    ctx["context_text"] += "\n" + summary_text
+    ctx["context_text"] = summary_text + "\n" + _filler(5000)
+    ctx["task"]["problem_statement"] = _filler(5000)
     ctx["working_rules"] = summary.model_dump()
     with patch(
         "hub.mcp_server._api_get", new=AsyncMock(side_effect=_fake_api([], ctx=ctx))
     ):
         out = await hub_my_context(834, mode="summary")
     assert _size(out) <= SUMMARY_LIMIT, _size(out)
+    assert "Правила работы (сводка)" in _text(out)
+    assert sum(1 for b in out.content if isinstance(b, TextContent)) >= 1
+    compact = (out.structuredContent or {}).get("working_rules_summary")
+    assert compact, "сводка правил выброшена из structuredContent"
+    assert compact["hub_skill"]["version"] == 3
+    assert compact["repository_rules"]["state"] == "present"
+    assert compact["repository_rules"]["sha"] == "a" * 12
+    assert compact["repository_rules"]["trust"] == "repository_data"
 
     # full: блок отдаётся целиком.
     ctx_full = _heavy_context()

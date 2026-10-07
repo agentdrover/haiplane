@@ -3654,7 +3654,15 @@ async def test_base_file_reader_distinguishes_states(tmp_path, git_ops, db):
         repo, "develop", ".hub/AGENT_RULES.md", limit_chars=100
     )
     assert big["state"] == "present" and big["truncated"] is True
-    assert len(big["content"]) == 100 and big["size"] == 501 and big["chars"] == 501
+    assert len(big["content"]) == 100 and big["size"] == 501
+
+    # Файл больше 1 МиБ: present + truncated + size, а не unreadable (читается префикс).
+    huge_repo = make_rules_repo(
+        tmp_path / "huge", {".hub/AGENT_RULES.md": "y" * (1024 * 1024 + 1)}
+    )
+    huge = await git_ops.read_file_at_ref(huge_repo, "develop", ".hub/AGENT_RULES.md")
+    assert huge["state"] == "present" and huge["truncated"] is True
+    assert huge["size"] == 1024 * 1024 + 1 and len(huge["content"]) == 30000
 
     # Проект без workspace_path: общий reader говорит unreadable, а не падает.
     from hub.services.working_rules import AGENT_RULES_FILE, read_agent_rules

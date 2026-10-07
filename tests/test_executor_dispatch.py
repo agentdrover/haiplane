@@ -3507,3 +3507,45 @@ async def test_implementer_gets_working_rules_without_extra_routes(
         assert block["project_policy"]["state"] == "available"
         assert block["repository_rules"]["state"] == "present"
     assert "неактивен" in ctx["context_text"]
+
+
+async def test_implementer_mcp_makes_no_extra_policy_or_skill_requests(
+    client, db, tmp_path
+):
+    """AC-4 (#1630): настоящая implementer-сессия через MCP — запросов к
+    /effective-policy и /api/skills нет, строки «политика не прочитана» нет."""
+    from unittest.mock import patch
+
+    from hub.integrations.registry import plugins
+    from hub.mcp_server import hub_my_context, hub_pair_start
+    from tests.working_rules_support import (
+        RULES_PATH,
+        ReadingGitOps,
+        RestBackedMcp,
+        make_rules_repo,
+        task_in_project,
+    )
+
+    ws = make_rules_repo(tmp_path / "ws", {RULES_PATH: "правила репо\n"})
+    plugins.git_ops = ReadingGitOps()
+    task_id = await task_in_project(client, db, ws, slug="wr-mcp")
+    rest = RestBackedMcp(client, task_id)
+
+    with (
+        patch("hub.mcp_server._api_get", new=rest.get),
+        patch("hub.mcp_server._api_post", new=rest.post),
+    ):
+        started = await hub_pair_start(
+            task_id, plan="Plan: x", session_id="s", git_mode="remote"
+        )
+        outs = [
+            await hub_my_context(task_id, mode="summary"),
+            await hub_my_context(task_id, mode="full"),
+        ]
+
+    assert "Правила работы" in started and "правила репо" in started
+    assert rest.forbidden_calls() == [], rest.calls
+    for out in outs:
+        text = "".join(b.text for b in out.content)
+        assert "политика проекта не прочитана" not in text
+        assert "Policy of project wr-mcp" in text or "полит" in text

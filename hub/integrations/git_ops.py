@@ -57,8 +57,45 @@ NOOP_FORGE = "noop"
 
 _TIMEOUT_RC = proc.TIMEOUT_RC
 
-#: Потолок чтения blob целиком (#1630): больше — файл не читается, а не режется.
-_BASE_FILE_HARD_BYTES = 1024 * 1024
+
+#: Прочитанные present-файлы по (клон, sha коммита, путь, потолок): sha
+#: неизменяем, поэтому запись не стареет; missing/unreadable не кэшируются.
+_BASE_FILE_CACHE: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+
+
+def _unreadable_file(ref: str, path: str, reason: str) -> dict[str, Any]:
+    return {
+        "state": "unreadable",
+        "path": path,
+        "ref": ref,
+        "sha": "",
+        "content": "",
+        "truncated": False,
+        "size": 0,
+        "chars": 0,
+        "reason": reason,
+    }
+
+
+async def _blob_prefix(repo: str, obj: str, nbytes: int) -> tuple[int, bytes, str]:
+    """Первые ``nbytes`` байт blob; остальное git не отдаёт (#1630).
+
+    ``head -c`` закрывает канал, git получает SIGPIPE: память ограничена
+    префиксом при файле любого размера. Недобор против известного размера
+    вызывающий читает как ошибку чтения.
+    """
+    return await proc.run_bytes(
+        "sh",
+        "-c",
+        'git -C "$1" cat-file blob "$2" | head -c "$3"',
+        "sh",
+        repo,
+        obj,
+        str(nbytes),
+        cwd=repo,
+        timeout=30,
+        max_bytes=nbytes + 1,
+    )
 
 
 #: Причина, когда git отказал, но словами, которых мы не знаем (#1118, AC-3).
@@ -2154,6 +2191,17 @@ class GitOpsIntegration:
     async def read_file_at_ref(
         self, repo: str, ref: str, path: str, *, limit_chars: int = 30000
     ) -> dict[str, Any]:
+        """Общий дедлайн на чтение (45 с); просрочка — unreadable, а не зависание."""
+        try:
+            return await asyncio.wait_for(
+                self._read_file_at_ref(repo, ref, path, limit_chars), timeout=45
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            return _unreadable_file(ref, path, "чтение не уложилось в 45 с")
+
+    async def _read_file_at_ref(
+        self, repo: str, ref: str, path: str, limit_chars: int
+    ) -> dict[str, Any]:
         """Файл на ``ref`` с честным состоянием: present | missing | unreadable (#1630).
 
         ``file_at_ref`` схлопывает «файла нет» и «не смогли прочитать» в None —
@@ -2184,6 +2232,9 @@ class GitOpsIntegration:
             out["reason"] = f"ref {ref!r} не прочитан: {err[:120] or f'rc={rc}'}"
             return out
         out["sha"] = sha.strip()
+        key = (repo, out["sha"], path, limit_chars)
+        if key in _BASE_FILE_CACHE:
+            return dict(_BASE_FILE_CACHE[key])
         rc, tree, err = await _git(
             "ls-tree", "-z", out["sha"], "--", path, repo=repo, check=False, timeout=30
         )
@@ -2208,30 +2259,22 @@ class GitOpsIntegration:
             return out
         size = int(size_text.strip())
         out["size"] = size
-        if size > _BASE_FILE_HARD_BYTES:
-            out["reason"] = (
-                f"{path} больше {_BASE_FILE_HARD_BYTES} байт ({size}) — не читается"
-            )
-            return out
-        rc, body, err = await proc.run_bytes(
-            "git",
-            "-C",
-            repo,
-            "cat-file",
-            "blob",
-            obj,
-            cwd=repo,
-            timeout=30,
-            max_bytes=_BASE_FILE_HARD_BYTES,
-        )
-        if rc != 0:
+        # Префикс blob, а не весь: память ограничена потолком, файл любого
+        # размера даёт present + truncated + size (AC-2).
+        want = min(size, limit_chars * 4 + 8)
+        rc, body, err = await _blob_prefix(repo, obj, want) if want else (0, b"", "")
+        if rc != 0 or len(body) < want:
             out["reason"] = f"содержимое {path} не прочитано: {err[:120] or f'rc={rc}'}"
             return out
         text = body.decode("utf-8", errors="replace")
+        whole = len(body) >= size
         out["state"] = "present"
-        out["chars"] = len(text)
-        out["truncated"] = len(text) > limit_chars
+        out["chars"] = len(text) if whole else 0
+        out["truncated"] = (not whole) or len(text) > limit_chars
         out["content"] = text[:limit_chars]
+        if len(_BASE_FILE_CACHE) >= 64:
+            _BASE_FILE_CACHE.pop(next(iter(_BASE_FILE_CACHE)))
+        _BASE_FILE_CACHE[key] = dict(out)
         return out
 
     async def files_at_ref(self, repo: str, ref: str) -> set[str] | None:

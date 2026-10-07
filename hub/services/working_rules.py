@@ -191,7 +191,6 @@ async def build_working_rules(
     if summary:
         block.mode = "summary"
         block.hub_skill.content = ""
-        block.project_policy.text = ""
         block.repository_rules.content = ""
     return block
 
@@ -200,6 +199,58 @@ def _cut(text: str, cap: int | None) -> tuple[str, bool]:
     if cap is None or len(text) <= cap:
         return text, False
     return text[:cap], True
+
+
+def summary_lines(wr: WorkingRules, full_pointer: str = "") -> list[str]:
+    """Компактная сводка: слой, состояние, размер, версия навыка, sha файла."""
+    rep, skill = wr.repository_rules, wr.hub_skill
+    repo_part = f"{rep.path}: {rep.state}"
+    if rep.state == "present":
+        repo_part += f", {rep.size} байт"
+        if rep.sha:
+            repo_part += f", sha {rep.sha[:12]}"
+        if rep.truncated:
+            repo_part += ", усечён"
+    elif rep.reason:
+        repo_part += f" — {_one_line(rep.reason, 100)}"
+    skill_part = (
+        f"{skill.name} v{skill.version} ({skill.chars} знаков)"
+        if skill.state == "active"
+        else f"{skill.name}: неактивен"
+    )
+    return [
+        "## Правила работы (сводка)",
+        f"Навык: {skill_part}; политика: {wr.project_policy.state} "
+        f"({wr.project_policy.chars} знаков); репозиторий (trust={rep.trust}): "
+        f"{repo_part}.",
+        f"Тексты слоёв — {full_pointer or 'mode=full'}.",
+    ]
+
+
+def compact_summary(wr: WorkingRules) -> dict[str, Any]:
+    """Та же сводка для structuredContent MCP: мала и не отбрасывается."""
+    rep, skill = wr.repository_rules, wr.hub_skill
+    return {
+        "mode": "summary",
+        "hub_skill": {
+            "name": skill.name,
+            "state": skill.state,
+            "version": skill.version,
+            "chars": skill.chars,
+        },
+        "project_policy": {
+            "state": wr.project_policy.state,
+            "chars": wr.project_policy.chars,
+        },
+        "repository_rules": {
+            "trust": rep.trust,
+            "state": rep.state,
+            "path": rep.path,
+            "sha": rep.sha[:12],
+            "size": rep.size,
+            "truncated": rep.truncated,
+        },
+    }
 
 
 def render_working_rules(
@@ -218,22 +269,7 @@ def render_working_rules(
     rep = wr.repository_rules
     skill = wr.hub_skill
     if wr.mode == "summary":
-        repo_part = f"{rep.path}: {rep.state}, {rep.chars} знаков"
-        if rep.truncated:
-            repo_part += f" (усечено, файл {rep.size} байт)"
-        if rep.reason:
-            repo_part += f" — {_one_line(rep.reason, 100)}"
-        skill_part = (
-            f"{skill.name} v{skill.version} ({skill.chars} знаков)"
-            if skill.state == "active"
-            else f"{skill.name}: неактивен"
-        )
-        return (
-            "## Правила работы\n"
-            f"Навык: {skill_part}; политика: {wr.project_policy.state} "
-            f"({wr.project_policy.chars} знаков); репозиторий: {repo_part}.\n"
-            f"Тексты — {full_pointer or 'mode=full'}."
-        )
+        return "\n".join(summary_lines(wr, full_pointer))
 
     lines = ["## Правила работы", wr.preamble, ""]
     if skill.state == "active":
@@ -265,8 +301,9 @@ def render_working_rules(
         lines.append(MARK_END)
         if rep.truncated or cut:
             shown = len(body)
+            total = f"{rep.chars} знаков" if rep.chars else f"файл {rep.size} байт"
             lines.append(
-                f"[усечено: показано {shown} из {rep.chars} знаков"
+                f"[усечено: показано {shown} из {total}"
                 + (f"; целиком — {full_pointer}" if cut and full_pointer else "")
                 + "]"
             )
