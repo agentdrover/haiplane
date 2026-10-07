@@ -2785,6 +2785,55 @@ class DefectCauseSuggestion(BaseModel):
     unmatched_rows: int = 0
 
 
+class WorkingRulesSkill(BaseModel):
+    """Слой 1 «Правил работы» (#1630): навык хаба. Доверенный текст."""
+
+    name: str
+    state: str = "inactive"  # active | inactive
+    version: int | None = None
+    content: str = ""
+    chars: int = 0
+
+
+class WorkingRulesPolicy(BaseModel):
+    """Слой 2: политика проекта, как её даёт format_policy_brief. Доверенный."""
+
+    state: str = "unavailable"  # available | unavailable
+    text: str = ""
+    chars: int = 0
+
+
+class WorkingRulesRepository(BaseModel):
+    """Слой 3: .hub/AGENT_RULES.md базовой ветки. ДАННЫЕ, не указания хаба."""
+
+    trust: str = "repository_data"
+    state: str = "unreadable"  # present | missing | unreadable
+    path: str = ""
+    ref: str = ""
+    sha: str = ""
+    content: str = ""
+    truncated: bool = False
+    size: int = 0
+    chars: int = 0
+    reason: str = ""
+
+
+class WorkingRules(BaseModel):
+    """Блок «Правила работы» исполнителю (#1630).
+
+    Три слоя лежат отдельными объектами и в один текст не склеиваются:
+    два доверенных (навык, политика) и слой репозитория с trust=repository_data.
+    ``preamble`` — фиксированный доверенный текст границы доверия.
+    ``mode=summary`` — тексты слоёв опущены, остаются состояния и размеры.
+    """
+
+    mode: str = "full"  # full | summary
+    preamble: str
+    hub_skill: WorkingRulesSkill
+    project_policy: WorkingRulesPolicy
+    repository_rules: WorkingRulesRepository
+
+
 class TaskView(BaseModel):
     id: int
     title: str
@@ -2958,6 +3007,9 @@ class TaskView(BaseModel):
     # caller's clone. Set on claim and pair-start only; the hub cannot know the
     # clone's folder name, so the exact path comes from `hp-hub worktree`.
     worktree_hint: str = ""
+    # #1630: «Правила работы» исполнителю — навык хаба, политика проекта и
+    # правила репозитория тремя отдельными слоями. Set on pair-start only.
+    working_rules: WorkingRules | None = None
     # #485: who blocks this task and whom it unblocks. None means no edges at
     # all, which is not the same as "edges, but empty".
     dependencies: "TaskDependencies | None" = None
@@ -3041,6 +3093,8 @@ class TaskContextView(BaseModel):
     task: TaskView | None = None
     readiness: ContextReadinessSummary | None = None
     parent_goal: ContextParentGoal | None = None
+    # #1630: тот же блок, что в pair-start; в mode=summary — без текстов слоёв.
+    working_rules: WorkingRules | None = None
 
 
 class ProjectCreate(BaseModel):

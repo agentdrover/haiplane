@@ -3452,3 +3452,58 @@ async def test_two_presses_over_an_abandoned_reservation_pay_one_agent(
 
     assert len(calls) == 1
     assert sorted(r.launched for r in results) == [False, True], results
+
+
+# ---- #1630: «Правила работы» исполнителю облака без лишних маршрутов ----
+
+
+async def test_implementer_gets_working_rules_without_extra_routes(
+    client, db, tmp_path
+):
+    """AC-4: навык неактивен — state=inactive без отказа; implementer получает
+    тот же блок через pair-start и /context, а /api/skills и /effective-policy
+    ему закрыты (блок считается на сервере)."""
+    from hub.auth import chat_pair_route_allowed
+    from hub.integrations.registry import plugins
+    from tests.working_rules_support import (
+        RULES_PATH,
+        ReadingGitOps,
+        make_rules_repo,
+        task_in_project,
+    )
+
+    ws = make_rules_repo(tmp_path / "ws", {RULES_PATH: "правила репо\n"})
+    plugins.git_ops = ReadingGitOps()
+    await db.execute("UPDATE skills SET status='draft' WHERE name=?", (_SKILL,))
+    await db.commit()
+    assert await repo.get_active_skill(db, _SKILL) is None
+    task_id = await task_in_project(client, db, ws, slug="wr-impl")
+
+    session = TokenIdentity(
+        "cloud",
+        "agent",
+        chat_pair_kind="implementer",
+        chat_pair_task_id=task_id,
+        chat_pair_generation=1,
+    )
+    assert chat_pair_route_allowed("POST", f"/api/tasks/{task_id}/pair-start", session)
+    assert chat_pair_route_allowed("GET", f"/api/tasks/{task_id}/context", session)
+    assert not chat_pair_route_allowed("GET", "/api/skills", session)
+    assert not chat_pair_route_allowed(
+        "GET", "/api/skills/executor-pair-discipline", session
+    )
+    assert not chat_pair_route_allowed(
+        "GET", "/api/projects/wr-impl/effective-policy", session
+    )
+
+    started = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: x", "assigned_agent": "cloud", "git_mode": "remote"},
+    )
+    assert started.status_code == 200, started.text
+    ctx = (await client.get(f"/api/tasks/{task_id}/context")).json()
+    for block in (started.json()["working_rules"], ctx["working_rules"]):
+        assert block["hub_skill"]["state"] == "inactive"
+        assert block["project_policy"]["state"] == "available"
+        assert block["repository_rules"]["state"] == "present"
+    assert "неактивен" in ctx["context_text"]

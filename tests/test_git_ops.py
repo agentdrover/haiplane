@@ -3621,3 +3621,94 @@ def test_git_env_keeps_deployment_ssh_command(monkeypatch, tmp_path):
     monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -F /etc/hub/ssh_config")
 
     assert proc.git_env()["GIT_SSH_COMMAND"] == "ssh -F /etc/hub/ssh_config"
+
+
+# --- общий reader файлов базовой ветки (#1630) ---
+
+
+async def test_base_file_reader_distinguishes_states(tmp_path, git_ops, db):
+    """AC-2: missing, пустой present, unreadable (ref, клон, нет workspace),
+    усечение с размером; pair_start успешен во всех случаях."""
+    from tests.working_rules_support import make_rules_repo
+
+    repo = make_rules_repo(
+        tmp_path / "ws",
+        {".hub/EMPTY.md": "", ".hub/AGENT_RULES.md": "x" * 500 + "\n"},
+    )
+
+    missing = await git_ops.read_file_at_ref(repo, "develop", ".hub/NOPE.md")
+    assert missing["state"] == "missing" and missing["sha"] and missing["content"] == ""
+
+    empty = await git_ops.read_file_at_ref(repo, "develop", ".hub/EMPTY.md")
+    assert (empty["state"], empty["content"], empty["size"]) == ("present", "", 0)
+
+    bad_ref = await git_ops.read_file_at_ref(repo, "no-such-branch", ".hub/EMPTY.md")
+    assert bad_ref["state"] == "unreadable" and "no-such-branch" in bad_ref["reason"]
+
+    not_a_clone = await git_ops.read_file_at_ref(
+        str(tmp_path), "develop", ".hub/EMPTY.md"
+    )
+    assert not_a_clone["state"] == "unreadable" and not_a_clone["reason"]
+
+    big = await git_ops.read_file_at_ref(
+        repo, "develop", ".hub/AGENT_RULES.md", limit_chars=100
+    )
+    assert big["state"] == "present" and big["truncated"] is True
+    assert len(big["content"]) == 100 and big["size"] == 501 and big["chars"] == 501
+
+    # Проект без workspace_path: общий reader говорит unreadable, а не падает.
+    from hub.services.working_rules import AGENT_RULES_FILE, read_agent_rules
+
+    task_row = await db.execute_insert(
+        "INSERT INTO tasks (title, description, status, runtime) "
+        "VALUES ('t', '', 'open', 'auto')"
+    )
+    out = await read_agent_rules(db, task_row[0])
+    assert out["state"] == "unreadable" and "workspace_path" in out["reason"]
+    assert out["path"] == AGENT_RULES_FILE
+
+
+@pytest.mark.parametrize("case", ["missing", "empty", "badref", "no_workspace", "big"])
+async def test_pair_start_survives_every_reader_state(client, db, tmp_path, case):
+    """AC-2: pair_start успешен при любом состоянии чтения файла правил."""
+    from hub.integrations.registry import plugins
+    from tests.working_rules_support import (
+        ReadingGitOps,
+        make_rules_repo,
+        task_in_project,
+    )
+
+    files = {
+        "missing": {},
+        "empty": {".hub/AGENT_RULES.md": ""},
+        "badref": {".hub/AGENT_RULES.md": "a"},
+        "no_workspace": {},
+        "big": {".hub/AGENT_RULES.md": "z" * 40000},
+    }[case]
+    path = make_rules_repo(tmp_path / "ws", files)
+    plugins.git_ops = ReadingGitOps()
+    task_id = await task_in_project(
+        client,
+        db,
+        "" if case == "no_workspace" else path,
+        branch="ghost" if case == "badref" else "develop",
+    )
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: x", "assigned_agent": "a", "git_mode": "remote"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    rules = resp.json()["working_rules"]["repository_rules"]
+    expected = {
+        "missing": "missing",
+        "empty": "present",
+        "badref": "unreadable",
+        "no_workspace": "unreadable",
+        "big": "present",
+    }[case]
+    assert rules["state"] == expected, rules
+    assert rules["trust"] == "repository_data"
+    if case == "big":
+        assert rules["truncated"] is True and rules["size"] == 40000

@@ -278,3 +278,104 @@ async def test_bounded_call_asks_the_api_for_compact_cards(
 
     task_calls = [c for c in fake.calls if c.startswith("/api/tasks?")]  # type: ignore[attr-defined]
     assert task_calls and all("mode=summary" in c for c in task_calls)
+
+
+async def test_working_rules_respect_context_bounds() -> None:
+    """AC-5 (#1630): файл на 20000 знаков. pair_start показывает навык,
+    политику и до 4000 знаков файла с пометкой усечения и указателем на
+    mode=full; summary не больше 4000 в text и structuredContent вместе;
+    mode=full отдаёт весь блок."""
+    from hub.models import (
+        WorkingRules,
+        WorkingRulesPolicy,
+        WorkingRulesRepository,
+        WorkingRulesSkill,
+    )
+    from hub.services import working_rules as wr
+
+    body = "".join(f"правило-{i:05d}\n" for i in range(2000))[:20000]
+    full = WorkingRules(
+        preamble=wr.PREAMBLE,
+        hub_skill=WorkingRulesSkill(
+            name=wr.DISCIPLINE_SKILL,
+            state="active",
+            version=3,
+            content="НАВЫК-ДИСЦИПЛИНЫ " + _filler(7000),
+            chars=7017,
+        ),
+        project_policy=WorkingRulesPolicy(
+            state="available",
+            text="Policy of project p: all keys at defaults",
+            chars=40,
+        ),
+        repository_rules=WorkingRulesRepository(
+            state="present",
+            path=wr.AGENT_RULES_FILE,
+            ref="develop",
+            sha="a" * 40,
+            content=body,
+            size=len(body.encode()),
+            chars=len(body),
+        ),
+    )
+    last_line = body.splitlines()[-2]
+    summary = full.model_copy(deep=True)
+    summary.mode = "summary"
+    summary.hub_skill.content = ""
+    summary.project_policy.text = ""
+    summary.repository_rules.content = ""
+
+    # pair_start: навык до 6000, политика, файл до 4000, пометка и указатель.
+    result = {
+        "id": 1630,
+        "status": "running",
+        "branch": "task-1630/x",
+        "working_rules": full.model_dump(),
+    }
+    with (
+        patch("hub.mcp_server._api_post", new=AsyncMock(return_value=result)),
+        patch(
+            "hub.mcp_server._read_task",
+            new=AsyncMock(return_value={"id": 1630, "status": "running"}),
+        ),
+    ):
+        from hub.mcp_server import hub_pair_start
+
+        started = await hub_pair_start(1630, session_id="s")
+    raw = started if isinstance(started, str) else _text(started)
+    text = json.loads(raw)["message"]
+    assert "НАВЫК-ДИСЦИПЛИНЫ" in text
+    assert "Policy of project p" in text
+    assert "правило-00000" in text and last_line not in text
+    assert "показано 4000 из 20000 знаков" in text
+    assert 'hub_my_context(task_id=1630, mode="full")' in text
+    assert "показано 6000 из 7017 знаков" in text
+    assert text.count(wr.MARK_BEGIN) == 1 and text.count(wr.MARK_END) == 1
+
+    # summary: заголовки, состояния, размеры — и целиком в пределах 4000.
+    summary_text = wr.render_working_rules(
+        summary, full_pointer='hub_my_context(task_id=1630, mode="full")'
+    )
+    assert "present" in summary_text and "20000" in summary_text
+    assert "правило-00000" not in summary_text
+    ctx = _heavy_context()
+    ctx["context_text"] += "\n" + summary_text
+    ctx["working_rules"] = summary.model_dump()
+    with patch(
+        "hub.mcp_server._api_get", new=AsyncMock(side_effect=_fake_api([], ctx=ctx))
+    ):
+        out = await hub_my_context(834, mode="summary")
+    assert _size(out) <= SUMMARY_LIMIT, _size(out)
+
+    # full: блок отдаётся целиком.
+    ctx_full = _heavy_context()
+    ctx_full["context_text"] += "\n" + wr.render_working_rules(full)
+    ctx_full["working_rules"] = full.model_dump()
+    with patch(
+        "hub.mcp_server._api_get",
+        new=AsyncMock(side_effect=_fake_api([], ctx=ctx_full)),
+    ):
+        out = await hub_my_context(834, mode="full")
+    sc = out.structuredContent["context"]["working_rules"]
+    assert sc["repository_rules"]["content"] == body
+    assert last_line in _text(out)

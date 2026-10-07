@@ -1823,6 +1823,7 @@ _CONTEXT_DROP_ORDER = (
     "context.context_text",
     "context.siblings",
     "context.children",
+    "context.working_rules",
     "context.task",
     "context.parent_goal",
     "context.readiness",
@@ -2333,6 +2334,31 @@ def _worktree_hint_note(result: dict[str, Any] | None) -> str:
     return f"\nWorktree: {hint}" if hint else ""
 
 
+def _working_rules_note(task_id: int, result: dict[str, Any] | None) -> str:
+    """«Правила работы» из ответа pair-start, в пределах потолков (#1630).
+
+    Навык — до 6000 знаков, файл репозитория — до 4000 с пометкой усечения и
+    указателем на hub_my_context(mode="full"). Слой репозитория остаётся
+    данными: маркеры и экранирование — в render_working_rules.
+    """
+    raw = (result or {}).get("working_rules")
+    if not raw:
+        return ""
+    from hub.models import WorkingRules
+    from hub.services import working_rules as wr_service
+
+    try:
+        block = WorkingRules.model_validate(raw)
+    except ValueError:
+        return ""
+    return "\n\n" + wr_service.render_working_rules(
+        block,
+        skill_cap=wr_service.MCP_SKILL_CAP,
+        repo_cap=wr_service.MCP_REPO_CAP,
+        full_pointer=f'hub_my_context(task_id={task_id}, mode="full")',
+    )
+
+
 @mcp.tool()
 async def hub_pair_start(
     task_id: int,
@@ -2422,6 +2448,7 @@ async def hub_pair_start(
             "name locally — submit_for_review compares what you report against "
             "it and refuses a mismatch."
         )
+    message += _working_rules_note(task_id, result)
     return await _task_mutation_response(
         task_id,
         message,
