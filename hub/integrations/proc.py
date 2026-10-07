@@ -144,6 +144,11 @@ async def run_bytes(
     except (TimeoutError, asyncio.TimeoutError):
         await kill_process_group(proc)
         return TIMEOUT_RC, b"", f"timed out after {timeout}s: {' '.join(cmd[:4])}"
+    except asyncio.CancelledError:
+        # Как в run (#1603): отмена обрывает чтение, а не процесс. Группа
+        # убивается целиком (конвейер sh -c "git | head" тоже), отмена идёт дальше.
+        await kill_process_group(proc)
+        raise
     if len(stdout) > max_bytes:
         return -2, b"", f"output longer than {max_bytes} bytes"
     return proc.returncode or 0, stdout, stderr.decode(errors="replace").strip()

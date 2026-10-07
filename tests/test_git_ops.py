@@ -3720,3 +3720,34 @@ async def test_pair_start_survives_every_reader_state(client, db, tmp_path, case
     assert rules["trust"] == "repository_data"
     if case == "big":
         assert rules["truncated"] is True and rules["size"] == 40000
+
+
+async def test_run_bytes_cancel_kills_the_pipeline():
+    """#1630 (ревью): отмена во время чтения убивает группу процессов — конвейер
+    не переживает вызвавшую его задачу; отмена пробрасывается."""
+    import asyncio
+
+    from hub.integrations import proc
+
+    marker = "sleep 31.337"
+    task = asyncio.create_task(
+        proc.run_bytes("sh", "-c", f"{marker} | cat", timeout=60)
+    )
+    await asyncio.sleep(0.5)
+    alive = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True)
+    assert alive.stdout.strip(), "конвейер должен жить до отмены"
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    gone = subprocess.run(
+        ["ps", "-axo", "pid=,stat=,command="], capture_output=True, text=True
+    )
+    live = []
+    for line in gone.stdout.splitlines():
+        parts = line.split(None, 2)
+        # Зомби (Z) — уже убит и ждёт, пока init его подберёт.
+        if len(parts) == 3 and marker in parts[2] and not parts[1].startswith("Z"):
+            live.append(line)
+    assert live == [], live

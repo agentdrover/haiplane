@@ -2789,10 +2789,11 @@ class WorkingRulesSkill(BaseModel):
     """Слой 1 «Правил работы» (#1630): навык хаба. Доверенный текст."""
 
     name: str
-    state: str = "inactive"  # active | inactive
+    state: str = "inactive"  # active | inactive | unreadable
     version: int | None = None
     content: str = ""
     chars: int = 0
+    reason: str = ""  # при unreadable: тип ошибки чтения, без секретов
 
 
 class WorkingRulesPolicy(BaseModel):

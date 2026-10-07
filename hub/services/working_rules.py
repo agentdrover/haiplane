@@ -139,8 +139,13 @@ async def _skill_layer(db: aiosqlite.Connection) -> WorkingRulesSkill:
     try:
         row = await repo.get_active_skill(db, DISCIPLINE_SKILL)
     except Exception as exc:  # noqa: BLE001
+        # Сбой хаба — не «навык не выдан»: исполнитель должен их различать.
         log.warning("skill %s not read: %s", DISCIPLINE_SKILL, exc)
-        row = None
+        return WorkingRulesSkill(
+            name=DISCIPLINE_SKILL,
+            state="unreadable",
+            reason=f"ошибка чтения: {type(exc).__name__}",
+        )
     if row is None:
         return WorkingRulesSkill(name=DISCIPLINE_SKILL, state="inactive")
     content = str(row["content"] or "")
@@ -201,6 +206,12 @@ def _cut(text: str, cap: int | None) -> tuple[str, bool]:
     return text[:cap], True
 
 
+def _skill_missing_note(skill: WorkingRulesSkill) -> str:
+    if skill.state == "unreadable":
+        return f"{skill.name}: навык не прочитан: {_one_line(skill.reason, 100)}"
+    return f"{skill.name}: неактивен"
+
+
 def summary_lines(wr: WorkingRules, full_pointer: str = "") -> list[str]:
     """Компактная сводка: слой, состояние, размер, версия навыка, sha файла."""
     rep, skill = wr.repository_rules, wr.hub_skill
@@ -216,7 +227,7 @@ def summary_lines(wr: WorkingRules, full_pointer: str = "") -> list[str]:
     skill_part = (
         f"{skill.name} v{skill.version} ({skill.chars} знаков)"
         if skill.state == "active"
-        else f"{skill.name}: неактивен"
+        else _skill_missing_note(skill)
     )
     return [
         "## Правила работы (сводка)",
@@ -282,7 +293,9 @@ def render_working_rules(
                 f"целиком — {full_pointer}]"
             )
     else:
-        lines.append(f"### Навык хаба {skill.name}: неактивен (state=inactive)")
+        lines.append(
+            f"### Навык хаба {_skill_missing_note(skill)} (state={skill.state})"
+        )
     lines.append("")
     lines.append("### Политика проекта (доверенный слой)")
     lines.append(

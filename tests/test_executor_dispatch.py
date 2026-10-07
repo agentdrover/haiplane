@@ -3549,3 +3549,30 @@ async def test_implementer_mcp_makes_no_extra_policy_or_skill_requests(
         text = "".join(b.text for b in out.content)
         assert "политика проекта не прочитана" not in text
         assert "Policy of project wr-mcp" in text or "полит" in text
+
+
+async def test_skill_read_failure_is_unreadable_not_inactive(
+    client, db, tmp_path, monkeypatch
+):
+    """#1630 (ревью): сбой чтения навыка — state=unreadable с причиной, а не
+    inactive; inactive только когда активной версии нет. pair_start отвечает 200."""
+    from hub import repository as repo_mod
+    from tests.working_rules_support import task_in_project
+
+    async def _boom(_db, _name):
+        raise RuntimeError("secret-dsn-should-not-leak")
+
+    monkeypatch.setattr(repo_mod, "get_active_skill", _boom)
+    task_id = await task_in_project(client, db, "", slug="wr-skillerr")
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: x", "assigned_agent": "a", "git_mode": "remote"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    skill = resp.json()["working_rules"]["hub_skill"]
+    assert skill["state"] == "unreadable"
+    assert "RuntimeError" in skill["reason"] and "secret" not in skill["reason"]
+    ctx = (await client.get(f"/api/tasks/{task_id}/context")).json()
+    assert "навык не прочитан" in ctx["context_text"]
