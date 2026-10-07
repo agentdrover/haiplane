@@ -24,22 +24,114 @@ Two rules inherited from the facts underneath:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any
 
 from hub import repository as repo
-from hub.services.delivery_state import IN_PROD, NOT_IN_PROD, delivery_state
+from hub.services.delivery_state import (
+    IN_PROD,
+    NOT_IN_PROD,
+    _GitCheck,
+    git_delivery_state,
+    prepare_delivery,
+)
 
 log = logging.getLogger("hub")
 
 DEFAULT_WINDOW = 50
 MAX_WINDOW = 200
 
+# #1603: the snapshot used to walk up to 50 tasks one by one, git on each, and
+# answered after the MCP client had already given up (12 of 24 calls in 14
+# days). The git questions are independent, so they run side by side — but the
+# host is 2 CPU, so the ceiling is small. The budget is strictly below the
+# client's wait (``mcp_server._TIMEOUT_DEFAULT``, guarded by a test): whatever
+# did not finish is reported as unknown BY NAME, never as not_in_prod.
+MAX_CONCURRENCY = 8
+BUILD_BUDGET_SECONDS = 10.0
+BUDGET_REASON = (
+    "срок сборки снимка исчерпан — задача не проверена. "
+    "Это не «не раскатано»: повторите запрос"
+)
+
+
+async def _reap(*futures: asyncio.Future[Any]) -> None:
+    """Cancel and WAIT for every future — a repeated cancel does not cut it short.
+
+    The wait is the point: ``proc.run`` kills its git process group and reaps
+    the child on cancellation, and that cleanup must be finished when the
+    caller sees the cancellation, not left running behind it.
+    """
+    for fut in futures:
+        fut.cancel()
+    while True:
+        try:
+            await asyncio.gather(*futures, return_exceptions=True)
+            return
+        except asyncio.CancelledError:
+            continue
+
+
+async def _fill(
+    db: Any,
+    tasks: list[dict[str, Any]],
+    release: Any,
+    results: list[dict[str, Any] | None],
+) -> None:
+    """Write one answer per task into ``results``, in place, as they arrive.
+
+    SQL first and in sequence (one aiosqlite connection), git second and side
+    by side. The caller bounds the whole of it with ONE deadline, so a slow
+    preparation spends the same budget as a slow git call.
+    """
+    pending_checks: list[tuple[int, _GitCheck]] = []
+    for i, task in enumerate(tasks):
+        prepared = await prepare_delivery(db, int(task["id"]), release=release)
+        if isinstance(prepared, dict):
+            results[i] = prepared
+        else:
+            pending_checks.append((i, prepared))
+
+    gate = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    async def one(i: int, check: _GitCheck) -> None:
+        async with gate:
+            results[i] = await git_delivery_state(check)
+
+    futures = [asyncio.ensure_future(one(i, check)) for i, check in pending_checks]
+    try:
+        await asyncio.gather(*futures)
+    except BaseException:
+        await _reap(*futures)
+        raise
+
+
+async def _answers(
+    db: Any, tasks: list[dict[str, Any]], release: Any, started: float
+) -> list[dict[str, Any] | None]:
+    """One answer per task, in task order; ``None`` where the budget ran out."""
+    results: list[dict[str, Any] | None] = [None] * len(tasks)
+    work = asyncio.ensure_future(_fill(db, tasks, release, results))
+    left = max(0.0, BUILD_BUDGET_SECONDS - (time.monotonic() - started))
+    try:
+        await asyncio.wait({work}, timeout=left)
+    except BaseException:
+        await _reap(work)
+        raise
+    if not work.done():
+        await _reap(work)
+    else:
+        work.result()
+    return results
+
 
 async def prod_state(db: Any, *, limit: int = DEFAULT_WINDOW) -> dict[str, Any]:
     """A snapshot of production: what is deployed and which tasks are where."""
     window = max(1, min(int(limit or DEFAULT_WINDOW), MAX_WINDOW))
 
+    started = time.monotonic()
     release = await repo.latest_successful_release(db)
     deployed = {
         "sha": str(release.get("deployed_sha") or "") if release else "",
@@ -56,8 +148,11 @@ async def prod_state(db: Any, *, limit: int = DEFAULT_WINDOW) -> dict[str, Any]:
         NOT_IN_PROD: [],
         "unknown": [],
     }
-    for task in tasks:
-        answer = await delivery_state(db, int(task["id"]))
+    unchecked = 0
+    for task, answer in zip(tasks, await _answers(db, tasks, release, started)):
+        if answer is None:
+            unchecked += 1
+            answer = {"state": "unknown", "reason": BUDGET_REASON}
         entry = {
             "task_id": int(task["id"]),
             "title": task.get("title") or "",
@@ -72,10 +167,16 @@ async def prod_state(db: Any, *, limit: int = DEFAULT_WINDOW) -> dict[str, Any]:
 
     # The bound is part of the answer, not a footnote. "50 tasks examined" and
     # "the whole board" are different claims, and only one of them is true.
+    checked = len(tasks) - unchecked
     note = (
-        f"рассмотрены последние {len(tasks)} завершённых задач "
+        f"рассмотрены последние {checked} завершённых задач "
         f"(окно {window}); задачи старше окна в снимок не попали"
     )
+    if unchecked:
+        note += (
+            f". Не проверено {unchecked} из {len(tasks)}: срок сборки снимка "
+            "исчерпан, они лежат в «неизвестно»"
+        )
     if not release:
         note += (
             ". Успешных выкатов не записано — хаб не знает, что раскатано. "
@@ -93,7 +194,7 @@ async def prod_state(db: Any, *, limit: int = DEFAULT_WINDOW) -> dict[str, Any]:
         "in_prod": buckets[IN_PROD],
         "not_in_prod": buckets[NOT_IN_PROD],
         "unknown": buckets["unknown"],
-        "examined": len(tasks),
+        "examined": checked,
         "window": window,
         "note": note,
     }
