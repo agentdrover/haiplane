@@ -347,7 +347,7 @@ async def test_stale_claimed_and_needs_info_alerted(mock_sleep, db):
     info_alerts = await _stale_alerts(db, info_id)
     assert len(info_alerts) == 1
     assert "needs_info" in info_alerts[0]
-    assert "hub_answer_question" in info_alerts[0]
+    assert "/answer" in info_alerts[0]
 
 
 @patch("hub.poller.asyncio.sleep", new_callable=_sleep_once)
@@ -385,7 +385,7 @@ async def test_stale_machine_dead_ends_alerted(db):
         alerts = await _stale_alerts(db, tid)
         assert len(alerts) == 1, status
         assert f"stale in {status}" in alerts[0]
-        assert "hub_force_complete_task" in alerts[0]
+        assert "/force-complete" in alerts[0]
         assert dict(await repo.get_task(db, tid))["status"] == status
 
     await _run_poll_once(db)
@@ -2561,7 +2561,7 @@ async def test_human_owned_reminder_ladder(db):
     events = await _events_for(db, task_id, "human_queue_reminder")
     assert len(events) == 1
     payload = str(events[0]["payload"])
-    assert "hub_decide_task" in payload  # the action, not just the age
+    assert "/decide" in payload  # the action, not just the age
     row = dict(await repo.get_task(db, task_id))
     assert row["status"] == "needs_decision"  # volume only: nothing moved
 

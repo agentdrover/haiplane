@@ -2061,8 +2061,13 @@ async def web_agent_api_metrics(
     )
     from hub.services.mcp_telemetry import usage_report
 
-    snapshot = await catalog_snapshot()
-    data = await usage_report(_db(request), window_days=window_days, catalog=snapshot)
+    # Usage reads the FULL catalog (unused_tools sees hidden tools too); the
+    # budget below measures the AGENT view (#1624).
+    full_snapshot = await catalog_snapshot("full")
+    snapshot = await catalog_snapshot("agent")
+    data = await usage_report(
+        _db(request), window_days=window_days, catalog=full_snapshot
+    )
     # The same check CI runs, rendered where a human actually looks (#832).
     # Headroom bought the mergeability of the budget file; it stays honest
     # only while somebody can watch it shrink.

@@ -99,9 +99,9 @@ flowchart TD
 2. Analyst agent уточняет задачу через `hub_refine_task`, `hub_add_acceptance_criterion`, `hub_add_risk`.
 3. Человек смотрит `hub_get_readiness` или readiness в UI.
 4. Если DoR проходит, человек утверждает задачу.
-5. Перед стартом должен быть план: `hub_start_task(..., plan="...")` или отдельный update с `Plan:`.
+5. Перед стартом должен быть план: `hub_pair_start(..., plan="...")` или отдельный update с `Plan:`.
 6. Developer agent берет контекст через `hub_my_context`, работает в workspace repo и пишет updates.
-7. Если агенту не хватает данных, он вызывает `hub_ask_question`; человек отвечает через UI или `hub_answer_question`.
+7. Если агенту не хватает данных, он вызывает `hub_ask_question`; человек отвечает через UI, `oc-hub` или `POST /api/tasks/{id}/answer`.
 8. Агент отправляет `hub_report_done` с тем, что изменено и как проверено.
 9. Хаб прогоняет CI/review/fix cycles. Человек вмешивается только при `needs_info`, `needs_decision`, stale, failed или force-complete.
 
@@ -150,15 +150,15 @@ flowchart TD
 - `hub_add_acceptance_criterion` / `hub_replace_acceptance_criteria` - критерии приемки;
 - `hub_add_risk` - фиксация рисков;
 - `hub_get_readiness` - проверка DoR;
-- `hub_approve_task` / `hub_reject_task` - человеческий gate;
-- `hub_start_task` - headless dispatch (path A) только после плана;
+- approve / reject (`POST /api/tasks/{id}/approve`, `/reject`) - человеческий gate;
+- headless dispatch (path A) - тоже шаг человека (`POST /api/tasks/{id}/start`), только после плана;
 - `hub_pair_start` - pair mode (path B): `running` без `oc-dev-dispatch`, см. [Pair mode: git policy](#pair-mode-git-policy);
 - `hub_task_update`, `hub_ask_question`, `hub_report_done` - отчетность агента;
-- `hub_decide_task` - человеческое решение после арбитража.
+- `POST /api/tasks/{id}/decide` - человеческое решение после арбитража.
 
 Агентам не стоит обходить хаб, если действие влияет на состояние задачи. Код можно менять в workspace repo, но намерение, вопросы, блокеры, done report и решения должны возвращаться в хаб.
 
-Force approve доступен единым контрактом через MCP (`hub_approve_task(..., force=True)`), REST API (`POST /api/tasks/{id}/approve` с `force: true`), CLI (`oc-hub approve --force`) и Web UI (форма `web-approve` с `force=true`). Любой force approve является audited human override: он оставляет alert-update в задаче и запись в activity log, что обеспечивает трассируемость причин обхода DoR.
+Force approve доступен человеку единым контрактом через REST API (`POST /api/tasks/{id}/approve` с `force: true`), CLI (`oc-hub approve --force`) и Web UI (форма `web-approve` с `force=true`). Любой force approve является audited human override: он оставляет alert-update в задаче и запись в activity log, что обеспечивает трассируемость причин обхода DoR.
 
 ## Definition of Ready как главный входной gate
 
@@ -217,7 +217,7 @@ APPROVED. Правило применяется в общем service-слое (
 
 Явный опт-аут — `auto_review=false` (по умолчанию у subtask): такие задачи
 завершаются без ревью, и это решение человека на этапе создания/одобрения.
-Human-переопределения (`hub_decide_task` accept, `hub_force_complete_task`)
+Human-переопределения (`/decide` accept, `/force-complete`)
 обходят гейт сознательно и остаются в audit trail.
 
 ### Как запускается ревьюер в разных клиентах
@@ -273,7 +273,7 @@ Path B — человек + Cursor-агент без headless dispatch (`hub_pai
 
 1. DoR пройден, задача `open`.
 2. Есть update с `Plan:` (или plan в теле `hub_pair_start`).
-3. **`hub_pair_start(task_id, ...)`** — не `hub_start_task` (последний всегда вызывает `oc-dev-dispatch`).
+3. **`hub_pair_start(task_id, ...)`** — не headless-старт человека `/start` (он всегда вызывает `oc-dev-dispatch`).
 4. Статус → `running`, `job_id` пустой, в задаче записаны `branch` и `assigned_agent`.
 
 ### Checklist: human + agent (local clone)
@@ -324,7 +324,7 @@ Path B — человек + Cursor-агент без headless dispatch (`hub_pai
 
 - `hub_pair_start` — старт без dispatch (`git_mode=remote` пропускает git на хосте хаба);
 - `hub_my_context`, `hub_task_update`, `hub_report_done` — работа и отчёт;
-- `hub_start_task` — только path A (headless).
+- headless-старт (path A) — шаг человека, в MCP агента его нет.
 
 ## Режимы работы команды
 
@@ -377,7 +377,7 @@ Git-политика path B (локальный clone vs server workspace, push/
 1. Перед работой вызвать `hub_my_context(task_id)`.
 2. Если задача не готова, не писать код, а предложить refine/AC/risk.
 3. Перед dispatch или началом работы оставить `Plan:`.
-   - Path A (headless): `hub_start_task(..., plan="...")`.
+   - Path A (headless): человек, `POST /api/tasks/{id}/start` с планом.
    - Path B (pair в Cursor): `hub_pair_start(...)` после Plan; git checklist — [Pair mode: git policy](#pair-mode-git-policy).
 4. Все блокеры фиксировать через `hub_task_update(..., kind="blocker")` или `hub_ask_question`.
 5. В done report указывать changed files, behavior change и validation commands.
@@ -400,7 +400,7 @@ Git-политика path B (локальный clone vs server workspace, push/
 2. **Role prompts**: расширить `agents/*.md` конкретными правилами использования MCP tools.
 3. **Ownership field**: если команда растет, добавить явного human owner/reviewer у задачи.
 4. **Review checklist field**: отделить acceptance criteria от reviewer-specific checklist.
-5. **MCP force approve parity**: добавить параметр `force` в `hub_approve_task`, чтобы Cursor не уступал CLI/Web в контролируемых override-сценариях.
+5. **MCP force approve parity**: (снято #1624: approve — шаг человека, в MCP агента его нет; force approve остаётся в REST/CLI/Web).
 6. **Concurrent risk handling**: заменить read-modify-write в `hub_add_risk` отдельным API endpoint, если агенты часто добавляют риски параллельно.
 7. ~~**Workspace safety policy**~~: формализовано в [workspace-safety-policy.md](workspace-safety-policy.md); ссылки из workflow и Cursor rules добавлены.
 8. **Decision capture flow**: сделать сохранение решений из `needs_decision` более явной частью UI/MCP.

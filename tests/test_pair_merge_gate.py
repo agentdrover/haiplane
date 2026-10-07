@@ -690,9 +690,7 @@ async def test_the_terminal_refusal_hint_names_reachable_actions_only(db):
     assert "report done again" not in alert["content"], (
         "подсказка не должна предлагать вызов, который этот статус отвергает"
     )
-    assert "hub_decide_task" in alert["content"], (
-        "подсказка обязана назвать доступное действие"
-    )
+    assert "/decide" in alert["content"], "подсказка обязана назвать доступное действие"
     assert "rework" in alert["content"] and "accept" in alert["content"], (
         "оба исхода решения названы — читатель выбирает осознанно"
     )
@@ -928,7 +926,7 @@ async def test_confirmed_commits_without_a_creatable_pr_block_completion(db, ref
         if u["kind"] == "alert" and "NOT completed" in (u["content"] or "")
     )
     assert task["branch"] in alert, "отказ называет ветку, которую не смог доставить"
-    assert "hub_decide_task" in alert, "подсказка ведёт через доступное действие (#952)"
+    assert "/decide" in alert, "подсказка ведёт через доступное действие (#952)"
 
 
 @pytest.mark.parametrize("diff", [None, []], ids=["could_not_look", "empty_diff"])

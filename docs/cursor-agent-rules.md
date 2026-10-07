@@ -18,7 +18,7 @@ draft proposal, unresolved branch/PR/CI conflicts move the task to
    `hub_add_acceptance_criterion`, `hub_replace_acceptance_criteria`, or
    `hub_add_risk` to improve the draft, then check `hub_get_readiness`.
 3. Before dispatch or implementation, record a plan. Use
-   `hub_start_task(..., plan="...")` or `hub_task_update(..., kind="status",
+   `hub_pair_start(..., plan="...")` or `hub_task_update(..., kind="status",
    content="Plan: ...")`.
 4. Ask questions through `hub_ask_question`. Do not rely on chat-only questions
    for missing requirements.
@@ -35,15 +35,21 @@ draft proposal, unresolved branch/PR/CI conflicts move the task to
 7. New work discovered outside the task scope must be a draft proposal through
    `hub_propose_task`. Do not silently expand the current task.
 8. Do not close or force-complete a task when there is failed CI, an unresolved
-   blocker, or requested review changes. Use `hub_decide_task` or a human gate.
+   blocker, or requested review changes. Stop and hand the decision to a human
+   (`POST /api/tasks/{id}/decide`).
 
 ## Human Gates
 
-- Approval uses `hub_approve_task`; `force=true` is for explicit human
-  overrides and is audited by the API.
+The six human gates are not in an agent token's tool list (#1624); a human
+uses the UI, `oc-hub` or REST:
+
+- Approval and rejection: `POST /api/tasks/{id}/approve`, `/reject`;
+  `force=true` is for explicit human overrides and is audited by the API.
+- Headless start and answers to questions: `POST /api/tasks/{id}/start`,
+  `/answer`.
 - Weak or missing reports in `pending_report` are accepted only by a human via
-  `hub_force_complete_task`.
-- Human decisions after arbitration use `hub_decide_task`.
+  `POST /api/tasks/{id}/force-complete`.
+- Human decisions after arbitration: `POST /api/tasks/{id}/decide`.
 
 ## Minimum MCP Tools
 
@@ -56,14 +62,11 @@ draft proposal, unresolved branch/PR/CI conflicts move the task to
 - `hub_replace_acceptance_criteria`
 - `hub_add_risk`
 - `hub_get_readiness`
-- `hub_approve_task`
-- `hub_reject_task`
-- `hub_start_task`
+- `hub_claim_task`
+- `hub_pair_start`
 - `hub_task_update`
 - `hub_ask_question`
 - `hub_submit_for_review`
 - `hub_get_review_brief`
 - `hub_submit_review`
 - `hub_report_done`
-- `hub_force_complete_task`
-- `hub_decide_task`

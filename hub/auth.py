@@ -589,7 +589,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 # resolved, rather than re-resolved inside the MCP layer —
                 # two places deciding who the caller is eventually disagree.
                 identity_ctx = identity_context_set(
-                    identity.principal_id, identity.role
+                    identity.principal_id, identity.role, identity.is_human
                 )
             return await call_next(request)
         finally:

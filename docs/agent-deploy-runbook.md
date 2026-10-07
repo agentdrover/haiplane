@@ -335,7 +335,7 @@ HAIPLANE_HUB_REPO=<REPO_SLUG>
 
 | Переменная | Назначение |
 |------------|------------|
-| `HAIPLANE_WORKSPACE_REPO` | Корень git, где git ops plugin выполняет `create_branch` / `checkout` при `hub_start_task` и **`hub_pair_start`** |
+| `HAIPLANE_WORKSPACE_REPO` | Корень git, где git ops plugin выполняет `create_branch` / `checkout` при headless-старте (`/start`) и **`hub_pair_start`** |
 | `HAIPLANE_HUB_REPO` | Имя GitHub-репозитория для PR/CI интеграций (metadata) |
 | `HAIPLANE_WORKTREE_PER_TASK` | `1` включает изоляцию pair-задач через `git worktree` (#459): каждая задача получает своё дерево `.<repo>-worktrees/task-<id>`, основной клон остаётся на base. По умолчанию выкл — поведение как раньше. Требует git ≥ 2.15 и место под несколько деревьев. Подробнее: [workspace-safety-policy.md](workspace-safety-policy.md#worktree-per-task-opt-in-459) |
 
