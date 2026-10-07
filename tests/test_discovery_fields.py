@@ -226,7 +226,9 @@ def test_discovery_is_asked_of_features_not_of_chores():
     fields = {r.field for r in build_recommendations(chore)}
     assert not fields & {"outcome_metric", "redesign_decision", "agent_fit"}
     # ...while the checks themselves stay visible in the DoR table.
-    assert DOR_ADVISORY_KEYS <= {c.key for c in chore.checks}
+    # workspace_missing (#1604) is the one advisory key that is conditional:
+    # it appears only for a project without a clone, so it is not always here.
+    assert DOR_ADVISORY_KEYS - {"workspace_missing"} <= {c.key for c in chore.checks}
 
 
 async def test_unset_enum_reads_as_unset_not_as_a_value(db: aiosqlite.Connection):
