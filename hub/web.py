@@ -41,7 +41,7 @@ from hub.auth import (
 from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
 from hub.services import chat_pair as chat_pair_svc
-from hub.services import policy_change, project_policy
+from hub.services import effective_policy, policy_change, project_policy
 from hub.services.project_policy import FREEZE_REFUSED
 from hub.services import steward_dispatch
 from hub.services.finding_evidence import evidence_for_findings, evidence_for_report
@@ -1076,6 +1076,18 @@ async def web_projects(
     # epics and three numbers, computed server-side.
     cards = await services.get_project_cards(_db(request))
     reach = await _review_reach_by_project(_db(request), rows)
+    # #1638: действующее значение и источник четырёх настроек стоимости ревью —
+    # из той же сводки, что /api/projects/{slug}/effective-policy, без пересчёта.
+    review_cost = {
+        int(r["id"]): {
+            row["key"]: row
+            for row in (await effective_policy.effective_policy(_db(request), r))[
+                "keys"
+            ]
+            if row["key"] in _REVIEW_COST_KEYS
+        }
+        for r in rows
+    }
     # #1412: кнопка запуска исполнителя выписывает код implementer от имени
     # человека — форма несёт CSRF, как и выдача кода руками (#961, #990).
     csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
@@ -1113,6 +1125,7 @@ async def web_projects(
             # оси. Причина едет рядом, потому что молча убранный пункт
             # ничем не лучше пункта, который отказывает.
             "review_reach": reach,
+            "review_cost": review_cost,
             # Same number in the second consumer, from the same function: a
             # project holds epics, so orphan tasks belong to no project either.
             "orphan_live": await repo.count_live_orphan_tasks(_db(request)),
@@ -1331,6 +1344,12 @@ _SHADOW_FIELD = f"gate_policy_{steward_dispatch.STEWARD_SHADOW_KEY}"
 _REVIEW_LIMIT_FIELD = f"gate_policy_{project_policy.REVIEW_LIMIT_KEY}"
 _REVIEW_LIMIT_MODE_FIELD = f"gate_policy_{project_policy.REVIEW_LIMIT_MODE_KEY}"
 
+#: Четыре настройки стоимости ревью в форме проекта (#1638): ключ политики →
+#: «число или строка». Как и лимит очереди, они принадлежат форме, только когда
+#: поле пришло в запросе; в _FORM_GATE_POLICY_KEYS их нет намеренно.
+_REVIEW_COST_COUNT_KEYS = ("deep_daily_cap", "small_delta_lines", "circle_deep_stop")
+_REVIEW_COST_KEYS = ("deep_reviewer", *_REVIEW_COST_COUNT_KEYS)
+
 
 # Отказ, привязанный к проекту, показывается У ЕГО КАРТОЧКИ (#1188). Общая
 # нота внизу страницы остаётся для отказов, у которых проекта нет, — форма
@@ -1433,7 +1452,32 @@ _GATE_POLICY_FORM_FIELDS = (
     "gate_policy_risk_map",
     _SHADOW_FIELD,
     _REVIEW_LIMIT_FIELD,
+    *(f"gate_policy_{key}" for key in _REVIEW_COST_KEYS),
 )
+
+
+def _review_cost_from_form(form: Any, policy: dict[str, Any]) -> None:
+    """deep_reviewer, deep_daily_cap, small_delta_lines, circle_deep_stop (#1638).
+
+    По образцу лимита очереди: нет поля — сохранённое остаётся; поле пусто —
+    ключ снимается (наследование серверной настройки); число, включая 0, —
+    числом. Всё прочее кладётся как пришло: отказывает общий валидатор.
+    """
+    for key in _REVIEW_COST_KEYS:
+        field = f"gate_policy_{key}"
+        if field not in form:
+            continue
+        policy.pop(key, None)
+        raw = str(form.get(field) or "").strip()
+        if not raw:
+            continue
+        if key in _REVIEW_COST_COUNT_KEYS:
+            try:
+                policy[key] = int(raw)
+                continue
+            except ValueError:
+                pass
+        policy[key] = raw
 
 
 def _review_limit_from_form(form: Any, policy: dict[str, Any]) -> None:
@@ -1536,6 +1580,7 @@ async def _gate_policy_from_form(
     if risk_map is not None:
         gate_policy["risk_map"] = risk_map
     _review_limit_from_form(form, gate_policy)
+    _review_cost_from_form(form, gate_policy)
     # #1427: PATCH сливает политику по ключам, и снятая формой ручка ушла бы
     # из запроса, но осталась бы в базе. Форма собирает ИТОГОВУЮ политику,
     # поэтому всё, что было сохранено и в неё не попало, снимается явно — null.

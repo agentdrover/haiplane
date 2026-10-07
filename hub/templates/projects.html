@@ -17,6 +17,11 @@
     </p>
 </header>
 
+{# #1638: действующее значение настройки и его источник — из effective_policy. #}
+{% macro cost_now(cost, key, none_text) %}
+{% set row = cost.get(key) %}
+{% if row %}<span class="muted small review-cost-now" data-key="{{ key }}">действует: {% if row.value is none %}{{ none_text }}{% else %}{{ row.value }}{% endif %} ({{ row.source }})</span>{% endif %}
+{% endmacro %}
 {% macro project_card(c) %}
     <article class="project-card{% if c.project.archived %} project-card--archived{% endif %}">
         <div class="epic-header">
@@ -275,6 +280,32 @@
                         <option value="enforce" {% if c.project.gate_policy.get('review_limit_mode') != 'warn' %}selected{% endif %}>enforce — сверх лимита новую работу не начинать</option>
                         <option value="warn" {% if c.project.gate_policy.get('review_limit_mode') == 'warn' %}selected{% endif %}>warn — предупреждать, но не останавливать</option>
                     </select>
+                    {# #1638: четыре настройки стоимости ревью. Значение и источник
+                       приходят из effective_policy (review_cost), здесь не
+                       пересчитываются. Пустое поле снимает ключ проекта —
+                       наследуется серверная настройка. Ноль у каждого поля
+                       значит своё, и подпись говорит, что именно. #}
+                    {% set cost = review_cost.get(c.project.id, {}) %}
+                    {% set stored_policy = c.project.gate_policy %}
+                    <label class="task-action-label">Кто читает deep первым</label>
+                    <select name="gate_policy_deep_reviewer" class="task-action-control">
+                        <option value="" {% if stored_policy.get('deep_reviewer') is none %}selected{% endif %}>наследовать: cloud</option>
+                        <option value="cloud" {% if stored_policy.get('deep_reviewer') == 'cloud' %}selected{% endif %}>cloud</option>
+                        <option value="local" {% if stored_policy.get('deep_reviewer') == 'local' %}selected{% endif %}>local — локальный deep первым, при отказе облако</option>
+                    </select>
+                    {{ cost_now(cost, 'deep_reviewer', 'cloud') }}
+                    <label class="task-action-label">Потолок deep в сутки (пусто = наследовать)</label>
+                    <input type="number" min="0" step="1" name="gate_policy_deep_daily_cap" class="task-action-control" value="{{ stored_policy.get('deep_daily_cap') if stored_policy.get('deep_daily_cap') is not none else '' }}">
+                    {{ cost_now(cost, 'deep_daily_cap', 'без потолка') }}
+                    <span class="muted small">0 — обычный deep уходит в lite</span>
+                    <label class="task-action-label">Порог маленькой пересдачи, строк (пусто = наследовать)</label>
+                    <input type="number" min="0" step="1" name="gate_policy_small_delta_lines" class="task-action-control" value="{{ stored_policy.get('small_delta_lines') if stored_policy.get('small_delta_lines') is not none else '' }}">
+                    {{ cost_now(cost, 'small_delta_lines', 'правило выключено') }}
+                    <span class="muted small">0 — правило удешевления выключено, расходы на ревью могут вырасти</span>
+                    <label class="task-action-label">Остановка deep по заходам круга (пусто = наследовать)</label>
+                    <input type="number" min="0" step="1" name="gate_policy_circle_deep_stop" class="task-action-control" value="{{ stored_policy.get('circle_deep_stop') if stored_policy.get('circle_deep_stop') is not none else '' }}">
+                    {{ cost_now(cost, 'circle_deep_stop', 'правило выключено') }}
+                    <span class="muted small">0 — правило удешевления выключено, расходы на ревью могут вырасти</span>
                     {% if c.project.slug == 'default' %}
                     <label class="task-action-label">Автопилот гейтов</label>
                     <span class="badge badge-needs_decision" title="Хаб не ослабляет надзор над собой (#743). Из делегирования разрешено только verdict=steward (решение владельца от 06.10.2026); автопилот на default вердикт не ставит">заперт: всегда human{% if c.project.gate_policy.get('verdict') == 'steward' %}, кроме verdict=steward{% endif %}</span>
