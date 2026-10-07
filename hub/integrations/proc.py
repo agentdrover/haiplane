@@ -105,6 +105,12 @@ async def run(
         detail = f"timed out after {timeout}s: {' '.join(cmd[:4])}"
         log.error("_run: %s", detail)
         return TIMEOUT_RC, "", detail
+    except asyncio.CancelledError:
+        # #1603: отмена (бюджет снимка, обрыв запроса) обрывает чтение, а не
+        # процесс — тот же приём, что у таймаута: убить группу целиком и
+        # пробросить отмену дальше, иначе git переживает вызвавшую его задачу.
+        await kill_process_group(proc)
+        raise
     rc = proc.returncode or 0
     out = stdout.decode(errors="replace").strip()
     err = stderr.decode(errors="replace").strip()

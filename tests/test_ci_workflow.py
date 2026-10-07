@@ -118,3 +118,83 @@ def test_deploy_callback_names_the_project():
     # rejected slug (404) must stay visible as a warning.
     assert step.get("continue-on-error") is True
     assert "::warning::Hub did not record the deploy (HTTP $code)" in step["run"]
+
+
+# ---- #1620: the lock exports are complete and really install ------------------
+
+
+def _run(argv: list[str], cwd: Path, env: dict[str, str] | None = None) -> str:
+    done = subprocess.run(
+        argv,
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert done.returncode == 0, f"{argv}\n{done.stdout}\n{done.stderr}"
+    return done.stdout
+
+
+def test_the_lock_exports_install_into_a_clean_python311(tmp_path) -> None:
+    """AC-4 (#1620): the deploy job's OWN export step runs on a copy of the lock;
+    both sets install into a clean Python 3.11 exactly as the server does it
+    (hashes, wheels only, no resolution), then the app, then it imports. A build
+    set missing what the editable hook needs, a wheel-less pin or a duplicate pin
+    between the two sets fails HERE, in CI, and not on the server."""
+    import shutil
+
+    uv = shutil.which("uv")
+    assert uv, "uv is required to run the repository tests"
+    root = WORKFLOW.parents[2]
+    export_step = next(
+        s
+        for s in yaml.safe_load(WORKFLOW.read_text())["jobs"]["deploy"]["steps"]
+        if s.get("name") == "Export hashed dependency sets from uv.lock"
+    )
+    work = tmp_path / "tree"
+    work.mkdir()
+    for name in ("pyproject.toml", "uv.lock"):
+        shutil.copy(root / name, work / name)
+    _run(["bash", "-eo", "pipefail", "-c", export_step["run"]], work)
+    runtime, build = work / "requirements.runtime.txt", work / "requirements.build.txt"
+    assert "--hash=sha256:" in runtime.read_text()
+    assert "hatchling==" in build.read_text()
+    assert "editables==" in build.read_text(), "the editable hook needs editables"
+    assert "hatchling==" not in runtime.read_text()
+
+    venv = tmp_path / "venv"
+    _run([uv, "venv", "--python", "3.11", "--seed", str(venv)], work)
+    python = venv / "bin" / "python"
+    assert (
+        _run(
+            [str(python), "-c", "import sys; print(sys.version_info[:2])"], work
+        ).strip()
+        == "(3, 11)"
+    )
+    pip = [str(python), "-m", "pip", "install", "--disable-pip-version-check", "-q"]
+    _run(
+        [
+            *pip,
+            "--require-hashes",
+            "--only-binary=:all:",
+            "--no-deps",
+            "-r",
+            str(build),
+            "-r",
+            str(runtime),
+        ],
+        work,
+    )
+    _run([*pip, "--no-deps", "--no-build-isolation", "-e", str(root)], work)
+    # From a directory that is not the repo, so the checkout is not on sys.path.
+    out = _run(
+        [
+            str(python),
+            "-c",
+            "import hub, hub.app, hub.mcp_server, hub.cli; print(hub.__file__)",
+        ],
+        work,
+    )
+    assert out.strip() == str(root / "hub" / "__init__.py"), out
+    _run([str(python), "-m", "pip", "check"], work)

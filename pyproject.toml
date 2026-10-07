@@ -46,6 +46,10 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [dependency-groups]
+build = [
+    "editables>=0.6",
+    "hatchling>=1.32.4",
+]
 dev = [
     "bandit>=1.9.4",
     "cosmic-ray>=8.7,<9",

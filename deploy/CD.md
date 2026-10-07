@@ -18,10 +18,17 @@ Workflow: `.github/workflows/ci.yml`, job `deploy`.
    - событие — это `push` в `main` (на `pull_request` деплой не запускается).
 3. Шаги деплоя:
    - кладёт приватный SSH-ключ из секрета в раннер;
+   - ставит `uv` закреплённой версии (та же, что в job `test` и Dockerfile) и
+     Python 3.11, проверяет `uv lock --check` и экспортирует из `uv.lock` два
+     хешированных набора в дерево: `requirements.runtime.txt` (без dev) и
+     `requirements.build.txt` (группа `build`: hatchling и editables) (#1620);
    - `rsync` рабочего дерева в `~/haiplane-hub-src-staging` на сервере;
    - `ssh ... 'bash -s' < deploy/remote-deploy.sh` — промоут staging в
-     `/opt/haiplane-hub/src`, `pip install -e`, `systemctl restart haiplane-hub`,
-     проверка `systemctl is-active` и `GET /healthz`.
+     `/opt/haiplane-hub/src`, установка наборов по lock
+     (`pip install --require-hashes --only-binary=:all: --no-deps`), затем
+     приложения (`pip install --no-deps --no-build-isolation -e`),
+     `systemctl restart haiplane-hub`, проверка `systemctl is-active` и
+     `GET /healthz`.
 
 `concurrency.group: deploy-production` гарантирует, что два деплоя не пойдут
 параллельно. Деплой привязан к GitHub Environment `production` — на него можно
@@ -110,6 +117,39 @@ ssh "$DEPLOY_USER@$DEPLOY_HOST" '
 вопросу имеет смысл, если время до первого 200 начнёт расти — тогда бюджет перестанет
 быть страховкой и станет маскировкой.
 
+## Зависимости прода строго по uv.lock (#1620)
+
+Прод ставит ровно версии из `uv.lock`, которые тестировал CI (Docker ставит их
+же через `uv sync --frozen`). Раньше `pip install -e` разрешал транзитивные
+версии заново, и прод расходился с lock (pyjwt 2.12.1 против 2.13.0).
+
+- **Версия uv одна** в `ci.yml` (test и deploy) и в `Dockerfile`: 0.12.18. uv
+  ≥ 0.10 вычищает из lock колёса недостижимых платформ, а 0.7 понижает
+  `revision`, поэтому плавающая версия переписала бы lock; тест
+  `test_the_deploy_ships_hashed_lock_exports` держит равенство. Поднимать
+  версию надо везде сразу и перегенерировать lock этой же версией.
+- **Наборы:** `requirements.runtime.txt` (`uv export --frozen --no-dev
+  --no-emit-project`) и `requirements.build.txt` (`--only-group build`). Build —
+  то, что нужно editable-установке приложения без изоляции сборки: hatchling,
+  его зависимости и editables. Добавлять в группу `build` — через
+  `uv add --group build`; в runtime-набор те же имена попасть не должны
+  (pip отвергнет дубликат; это ловит `test_the_lock_exports_install_into_a_clean_python311`).
+- **Сервер** (`deploy/remote-deploy.sh`): до любых действий проверяет оба файла
+  и `uv.lock` в staging; после rsync ставит оба набора одной командой с
+  `--require-hashes --only-binary=:all: --no-deps` (нет колеса под Python 3.11
+  сервера или хеш не сошёлся — громкий отказ), затем приложение с `--no-deps
+  --no-build-isolation`. В лог идёт строка `deps: N пакетов (runtime M, build
+  K) по экспортам sha256 … из uv.lock sha256 …`.
+- **Отказ — до restart**, прежний процесс продолжает работать. pip не
+  транзакционен: исходники и venv могут быть изменены частично, автоматического
+  отката нет; восстановление — деплой предыдущего коммита тем же путём (`scripts/manual_deploy.sh`, для коммитов до #1620 с `--build-set`)
+  (docs/agent-deploy-runbook.md). Лишние пакеты в venv не удаляются; pip и
+  инструменты сборки venv в наборы не входят. Отдельный venv с атомарным
+  переключением — вне этой задачи.
+- **Закреплённая копия** `remote-deploy.sh` на сервере обновляется владельцем до
+  выката (раздел про серверные копии ниже): без этого релиз встанет на
+  `release_artifacts` (#1591).
+
 ## Drain локальных ревью перед рестартом (#1588)
 
 Перед rsync `deploy/remote-deploy.sh` вызывает `deploy/review-drain.sh`:
@@ -121,7 +161,7 @@ ssh "$DEPLOY_USER@$DEPLOY_HOST" '
 [LOCAL-REVIEW.md](LOCAL-REVIEW.md#выкладка-хаба-деплой-ждёт-идущие-прогоны-1588).
 
 Порядок в `remote-deploy.sh`: запуск продления маркера → `acquire` (ожидание)
-→ rsync → chown → pip → `recheck` (остаток того же срока) → restart → health →
+→ rsync → chown → pip (наборы lock, затем приложение) → `recheck` (остаток того же срока) → restart → health →
 снятие своего маркера (на успехе, ошибке и сигнале). В логе деплоя ровно
 нужные строки: `drain ok`, `drain timeout (…)` или `drain degraded (…)`;
 деплой от них не падает. Срок один на все ожидания, включая получение замка;

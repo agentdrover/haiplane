@@ -7,6 +7,7 @@ from hub import repository as repo
 from hub.db import deserialize_str_list
 from hub.services.risk_class import derive_risk_class
 from hub.models import (
+    DoRCheckItem,
     ACVerifiableBy,
     AcceptanceCriterion,
     ClassOfService,
@@ -869,3 +870,243 @@ async def test_project_without_clone_is_not_checked_and_does_not_block(
     assert item.passed is False
     assert "не проверено" in item.detail and "клон" in item.detail
     assert "statement_paths_resolve" not in result.missing_required
+
+
+# --- workspace_missing: проект без workspace_path (#1604) ---
+
+_WS_CONSEQUENCES = (
+    "sha сдачи не закрепляется",
+    "автозаказ машинного ревью не идёт",
+    "проверки предмета и путей постановки не применяются",
+)
+
+
+async def _ws_project(db: aiosqlite.Connection, slug: str, workspace: str) -> int:
+    pid = await repo.create_project(
+        db, slug=slug, name=slug.title(), workspace_path=workspace
+    )
+    await db.commit()
+    return pid
+
+
+async def _ws_task(
+    db: aiosqlite.Connection,
+    *,
+    project_id: int | None = None,
+    parent_id: int | None = None,
+    task_type: str = "task",
+) -> int:
+    task_id = await _make_task(
+        db,
+        work_type=WorkType.chore,
+        validation_commands=["uv run pytest -q"],
+        affected_areas=["docs/notes.md"],
+        scope_in=["a"],
+        size=TaskSize.S,
+    )
+    fields: dict = {}
+    if project_id is not None:
+        fields["project_id"] = project_id
+    if parent_id is not None:
+        fields["parent_id"] = parent_id
+    if fields:
+        await repo.update_task(db, task_id, **fields)
+        await db.commit()
+    return task_id
+
+
+async def _ws_epic(db: aiosqlite.Connection, project_id: int) -> int:
+    epic = await repo.create_task(
+        db,
+        title="epic",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="",
+        rationale="",
+        status="open",
+        auto_review=False,
+        task_type="epic",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, epic, project_id=project_id)
+    await db.commit()
+    return epic
+
+
+async def _ws_default(db: aiosqlite.Connection, workspace: str) -> None:
+    from hub.db import seed_default_project
+
+    await seed_default_project(db)
+    default = await repo.get_project_by_slug(db, "default")
+    await repo.update_project(db, default["id"], workspace_path=workspace)
+    await db.commit()
+
+
+async def _ws_check(db: aiosqlite.Connection, task_id: int):
+    result = await evaluate_dor(db, task_id)
+    by_key = {c.key: c for c in result.checks}
+    return result, by_key.get("workspace_missing")
+
+
+async def test_workspace_missing_is_advisory_and_names_consequences(
+    db: aiosqlite.Connection,
+):
+    from hub.services.readiness import calculate_readiness
+
+    bare = await _ws_task(db, project_id=await _ws_project(db, "bare", ""))
+    cloned = await _ws_task(db, project_id=await _ws_project(db, "cloned", "/tmp/ws"))
+
+    result, item = await _ws_check(db, bare)
+    assert item is not None, "проект без workspace_path должен быть назван в DoR"
+    assert item.passed is False
+    assert "workspace_missing" in result.advisory
+    assert "workspace_missing" not in result.missing_required
+    assert result.passed is True
+    assert "bare" in item.detail and "свой" in item.detail
+    for consequence in _WS_CONSEQUENCES:
+        assert consequence in item.detail
+
+    bare_report = await calculate_readiness(db, bare)
+    cloned_report = await calculate_readiness(db, cloned)
+    assert bare_report.score == cloned_report.score
+    assert bare_report.dor_passed is True
+
+
+async def test_workspace_missing_names_project_source(db: aiosqlite.Connection):
+    epic = await _ws_epic(db, await _ws_project(db, "inherited", ""))
+    child = await _ws_task(db, parent_id=epic)
+    _, item = await _ws_check(db, child)
+    assert item is not None
+    assert "inherited" in item.detail
+    assert f"унаследован от эпика #{epic}" in item.detail
+
+    await _ws_default(db, "")
+    orphan = await _ws_task(db)
+    _, fallback = await _ws_check(db, orphan)
+    assert fallback is not None
+    assert "default" in fallback.detail
+    assert "резервный проект default" in fallback.detail
+
+
+async def test_workspace_present_gives_no_workspace_advice(db: aiosqlite.Connection):
+    from hub.models import TaskApprove
+    from hub.services.lifecycle import approve_task
+
+    own = await _ws_task(db, project_id=await _ws_project(db, "own-ws", "/tmp/ws"))
+    await _ws_default(db, "/tmp/default-ws")
+    fallback = await _ws_task(db)
+
+    for task_id in (own, fallback):
+        _, item = await _ws_check(db, task_id)
+        assert item is None
+        await approve_task(db, task_id, TaskApprove())
+        feed = [u["content"] for u in await repo.get_task_updates(db, task_id)]
+        assert not [c for c in feed if "workspace_missing" in c]
+
+
+def _workspace_alerts(updates) -> list[str]:
+    return [
+        u["content"]
+        for u in updates
+        if u["kind"] == "alert" and "workspace_missing" in u["content"]
+    ]
+
+
+async def test_approve_records_workspace_missing_alert_once(
+    db: aiosqlite.Connection, monkeypatch
+):
+    import json
+
+    from hub import config
+    from hub.models import TaskApprove
+    from hub.services import recommendations
+    from hub.services.auto_approve import maybe_auto_approve
+    from hub.services.dor import STATEMENT_PATHS_MARK
+    from hub.services.lifecycle import approve_task
+    from hub.services.readiness import calculate_readiness
+
+    def paths_check(path: str) -> DoRCheckItem:
+        return DoRCheckItem(
+            key="statement_paths_resolve",
+            passed=False,
+            detail=f"{STATEMENT_PATHS_MARK}: {path} (AC-1)",
+        )
+
+    def approve_lines(updates, path: str) -> tuple[list[str], list[str]]:
+        approve = [
+            u["content"] for u in updates if u["content"].startswith("Approve: ")
+        ]
+        return (
+            [c for c in approve if path in c],
+            [c for c in approve if "workspace_missing" in c],
+        )
+
+    # Ручное одобрение: отчёт DoR несёт и нарушение путей.
+    real = recommendations.calculate_readiness_with_recommendations
+
+    async def with_paths_violation(db_, task_id_, *args, **kwargs):
+        report = await real(db_, task_id_, *args, **kwargs)
+        report.dor_checks.append(paths_check("tests/manual.py"))
+        return report
+
+    monkeypatch.setattr(
+        recommendations,
+        "calculate_readiness_with_recommendations",
+        with_paths_violation,
+    )
+    manual = await _ws_task(db, project_id=await _ws_project(db, "bare-m", ""))
+    before = (await calculate_readiness(db, manual)).score
+    await approve_task(db, manual, TaskApprove())
+    paths, workspace = approve_lines(
+        await repo.get_task_updates(db, manual), "tests/manual.py"
+    )
+    assert len(paths) == 1, paths
+    assert len(workspace) == 1, workspace
+    assert paths[0] != workspace[0], "две отдельные строки, не одна общая"
+    assert (await repo.get_task(db, manual))["status"] == "open"
+    assert (await calculate_readiness(db, manual)).score == before
+    monkeypatch.setattr(
+        recommendations, "calculate_readiness_with_recommendations", real
+    )
+
+    # Автоодобрение: проект с dor=auto, класс R0 под потолком; отчёт передан.
+    monkeypatch.setattr(config, "AUTO_APPROVE_MAX_CLASS", "r1")
+    pid = await _ws_project(db, "bare-a", "")
+    await repo.update_project(db, pid, gate_policy=json.dumps({"dor": "auto"}))
+    auto = await _ws_task(db, project_id=pid)
+    await repo.update_task(db, auto, dor_passed=1, risk_class="R0")
+    await db.commit()
+    assert await maybe_auto_approve(db, auto, dor_checks=[paths_check("tests/auto.py")])
+    paths, workspace = approve_lines(
+        await repo.get_task_updates(db, auto), "tests/auto.py"
+    )
+    assert len(paths) == 1, paths
+    assert len(workspace) == 1, workspace
+    assert paths[0] != workspace[0]
+
+    # Автоодобрение без отчёта (путь стюарда): строка workspace всё равно одна.
+    steward = await _ws_task(db, project_id=pid)
+    await repo.update_task(db, steward, dor_passed=1, risk_class="R0")
+    await db.commit()
+    assert await maybe_auto_approve(db, steward)
+    _, workspace = approve_lines(
+        await repo.get_task_updates(db, steward), "tests/none.py"
+    )
+    assert len(workspace) == 1, workspace
+
+
+async def test_record_workspace_missing_does_not_commit_callers_transaction(
+    db: aiosqlite.Connection,
+):
+    # Помощник пишет внутри транзакции вызывающего и не коммитит её сам.
+    from hub.services.dor import record_workspace_missing
+
+    task_id = await _ws_task(db, project_id=await _ws_project(db, "bare-tx", ""))
+    await db.execute("BEGIN IMMEDIATE")
+    await record_workspace_missing(db, task_id)
+    assert db.in_transaction is True
+    assert _workspace_alerts(await repo.get_task_updates(db, task_id))
+    await db.rollback()
+    assert not _workspace_alerts(await repo.get_task_updates(db, task_id))

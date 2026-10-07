@@ -61,10 +61,22 @@ case "$1" in
     esac
     ;;
   /opt/haiplane-hub/venv/bin/pip)
+    # Полный argv каждого вызова (#1620): порядок и флаги проверяет тест. Вызов
+    # с --require-hashes — установка наборов из lock, второй — приложение.
+    echo "pip-argv ${*:2}" >>"$EVENTS"
+    deps=0
+    case "$*" in *--require-hashes*) deps=1 ;; esac
     snap pip-start
-    sleep "${PIP_DELAY:-0}"
+    [ "$deps" = 1 ] && sleep "${PIP_DELAY:-0}"
     snap pip-end
-    [ "${PIP_FAIL:-0}" = 1 ] && exit 1
+    if [ "$deps" = 1 ] && [ "${PIP_FAIL:-0}" = 1 ]; then
+      echo "ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE" >&2
+      exit 1
+    fi
+    if [ "$deps" = 0 ] && [ "${PIP_FAIL_APP:-0}" = 1 ]; then
+      echo "ERROR: could not build editable" >&2
+      exit 1
+    fi
     ;;
   systemctl) snap "restart" ;;
   journalctl) ;;
@@ -101,6 +113,11 @@ printf 200
 """
 
 
+_HASH = "--hash=sha256:" + "ab" * 32
+_RUNTIME_EXPORT = f"fastapi==0.1.0 \\\n    {_HASH}\nhttpx==0.2.0 \\\n    {_HASH}\n"
+_BUILD_EXPORT = f"hatchling==1.0.0 \\\n    {_HASH}\neditables==0.6 \\\n    {_HASH}\n"
+
+
 class Sandbox:
     def __init__(self, tmp_path: Path) -> None:
         self.home = tmp_path / "home"
@@ -115,6 +132,14 @@ class Sandbox:
         self.events.write_text("")
         self.tmp = tmp_path
         (staging / "predeploy-backup.py").write_text(BACKUP.read_text())
+        # Экспорты из uv.lock, которые кладёт CI (#1620): без них деплой не идёт.
+        self.staging = self.home / "haiplane-hub-src-staging"
+        self.runtime_export = self.staging / "requirements.runtime.txt"
+        self.build_export = self.staging / "requirements.build.txt"
+        self.lock = self.staging / "uv.lock"
+        self.runtime_export.write_text(_RUNTIME_EXPORT)
+        self.build_export.write_text(_BUILD_EXPORT)
+        self.lock.write_text("version = 1\nrevision = 3\n")
         # Настоящая база в WAL с ОТКРЫТЫМ соединением: закоммиченные строки лежат
         # в -wal и в основной файл ещё не перенесены.
         self.db = tmp_path / "hubdata" / "hub.db"
@@ -550,3 +575,108 @@ def test_the_database_path_comes_from_the_unit_when_no_process_runs(
     out, _ = proc.communicate(timeout=60)
     assert proc.returncode == 0, out
     assert "backup: ok " in out and len(_predeploy(box)) == 1
+
+
+# ---- #1620: dependencies come from the lock exports, wheels only, by hash -----
+
+
+def _pip_calls(box) -> list[list[str]]:
+    return [line.split()[1:] for line in box.lines() if line.startswith("pip-argv ")]
+
+
+def _sha(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_deploy_installs_dependencies_strictly_from_the_lock(box) -> None:
+    """AC-1 (#1620): backup -> rsync -> pip по хешам -> pip приложения -> recheck
+    -> restart; колёса, хеши, --no-deps; строка deps с sha256 экспортов и lock."""
+    proc = box.start()
+    out, _ = proc.communicate(timeout=60)
+    assert proc.returncode == 0, out
+    calls = _pip_calls(box)
+    assert len(calls) == 2, calls
+    deps, app = calls
+    # Наборы: build и runtime одной командой, строго по хешам, только колёса.
+    assert deps[0] == "install"
+    for flag in ("--require-hashes", "--only-binary=:all:", "--no-deps"):
+        assert flag in deps, (flag, deps)
+    files = [deps[i + 1] for i, a in enumerate(deps) if a == "-r"]
+    assert [Path(f).name for f in files] == [
+        "requirements.build.txt",
+        "requirements.runtime.txt",
+    ], deps
+    # Приложение: без разрешения зависимостей и без изолированной сборки.
+    assert app[0] == "install"
+    assert "--no-deps" in app and "--no-build-isolation" in app, app
+    assert "-e" in app and app[app.index("-e") + 1] == "/opt/haiplane-hub/src", app
+    assert "-r" not in app
+
+    # Порядок: бэкап (в снимке rsync уже есть копия) -> rsync -> pip -> restart.
+    heads = [x.split()[0] for x in box.lines() if not x.startswith("health")]
+    assert heads.index("rsync") < heads.index("pip-argv"), heads
+    assert heads.index("pip-argv") < heads.index("restart"), heads
+    assert box.event("rsync")["backups"] == "1", "rsync раньше бэкапа"
+    assert (
+        out.index("backup: ok")
+        < out.index("перед restart")
+        < out.index("service=active")
+    )
+    assert out.index("deps: ") < out.index("перед restart"), "recheck раньше установки"
+
+    line = next(x for x in out.splitlines() if x.startswith("deps: "))
+    assert "4 пакетов (runtime 2, build 2)" in line, line
+    assert f"runtime={_sha(box.runtime_export)}" in line, line
+    assert f"build={_sha(box.build_export)}" in line, line
+    assert f"uv.lock sha256 {_sha(box.lock)}" in line, line
+
+
+def test_a_missing_or_broken_lock_export_stops_before_restart(box) -> None:
+    """AC-2 (#1620): нет экспорта -> отказ ДО rsync; хеш не сошёлся или приложение
+    не встало -> отказ до restart с причиной; везде restart не вызван, маркер
+    снят, pip с разрешением зависимостей не вызывался."""
+
+    def failed(env: dict[str, str] | None = None) -> str:
+        box.events.write_text("")
+        proc = box.start(**(env or {}))
+        out, _ = proc.communicate(timeout=60)
+        assert proc.returncode != 0, out
+        assert "deploy ok" not in out
+        assert not [x for x in box.lines() if x.startswith("restart")], box.lines()
+        assert not box.marker_file().exists(), "отказ оставил маркер"
+        for call in _pip_calls(box):
+            assert "--no-deps" in call, f"разрешение зависимостей: {call}"
+        return out
+
+    # (а) нет любого из двух экспортов (и нет lock) - до любых изменений.
+    for victim in (box.runtime_export, box.build_export, box.lock):
+        saved = victim.read_text()
+        victim.unlink()
+        out = failed()
+        assert victim.name in out, out
+        assert not [x for x in box.lines() if x.startswith("rsync")], box.lines()
+        assert _pip_calls(box) == [], "pip вызван при отказе предпроверки"
+        assert "backup:" not in out, "предпроверка должна идти до любых действий"
+        victim.write_text(saved)
+    # Пустой и нехешированный экспорт - тот же отказ.
+    for body in ("", "fastapi==0.1.0\n"):
+        box.runtime_export.write_text(body)
+        out = failed()
+        assert "requirements.runtime.txt" in out, out
+        assert not [x for x in box.lines() if x.startswith("rsync")], box.lines()
+    box.runtime_export.write_text(_RUNTIME_EXPORT)
+
+    # (б) pip падает на хеше: приложение не ставится, причина в логе.
+    out = failed({"PIP_FAIL": "1"})
+    assert "DO NOT MATCH THE HASHES" in out, out
+    assert "deps: failed" in out and "restart not called" in out, out
+    assert len(_pip_calls(box)) == 1, "приложение поставлено после отказа хеша"
+    assert "пакетов (runtime" not in out
+
+    # (в) падает установка приложения.
+    out = failed({"PIP_FAIL_APP": "1"})
+    assert "could not build editable" in out, out
+    assert "deps: failed" in out and "restart not called" in out, out
+    assert "пакетов (runtime" not in out

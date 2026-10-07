@@ -29,6 +29,23 @@
 # of the hub database is taken (deploy/predeploy-backup.py, see "Verified database
 # backup" below). If it fails the script exits non-zero and the restart is never
 # called. DEPLOY_SKIP_BACKUP=1 (set on THIS side, by hand) is the explicit bypass.
+#
+# Dependencies (#1620): the venv gets EXACTLY the versions pinned in uv.lock. CI
+# exports two hashed sets from the lock into the tree it rsyncs to staging:
+# requirements.runtime.txt (runtime) and requirements.build.txt (what the
+# editable install of the app needs: hatchling and its hook). This script checks
+# BOTH files (and uv.lock, for the log line) in staging BEFORE it touches
+# anything, then after the rsync installs them with
+# `pip install --require-hashes --only-binary=:all: --no-deps -r build -r runtime`
+# (wheels only, every hash checked, no resolution) and the app itself with
+# `pip install --no-deps --no-build-isolation -e` (no resolution, no index).
+# There is no bypass: no variable falls back to the old `pip install -e`.
+# FAILURE CONTRACT: any refusal comes BEFORE the restart, so the old process keeps
+# running. pip is not transactional: a failed install may leave the sources and
+# the venv partly changed, and there is NO automatic rollback. The manual
+# recovery (docs/agent-deploy-runbook.md) is to deploy the previous commit
+# through THIS script, with ITS exports. Extra packages already in the venv are
+# kept (nothing is uninstalled); pip, setuptools and wheel are not in the sets.
 set -euo pipefail
 
 STAGING="$HOME/haiplane-hub-src-staging"
@@ -42,6 +59,39 @@ if [ ! -d "$STAGING" ]; then
   echo "staging directory $STAGING is missing; rsync step did not run" >&2
   exit 1
 fi
+
+# --- Dependency sets from the lock (#1620): the check comes BEFORE any change --
+# Nothing below this point (drain, backup, rsync, pip, restart) runs when the
+# files CI exports are missing, empty or not hashed: a refusal here changes
+# nothing, neither the sources nor the venv nor the process.
+RUNTIME_EXPORT="$STAGING/requirements.runtime.txt"
+BUILD_EXPORT="$STAGING/requirements.build.txt"
+LOCK_FILE="$STAGING/uv.lock"
+
+deps_refuse() {
+  echo "deps: failed ($1); nothing was changed, restart not called" >&2
+  exit 1
+}
+
+for f in "$BUILD_EXPORT" "$RUNTIME_EXPORT" "$LOCK_FILE"; do
+  [ -r "$f" ] && [ -s "$f" ] || deps_refuse "${f##*/} missing, unreadable or empty in staging: the CI step that exports it from uv.lock did not run"
+done
+for f in "$BUILD_EXPORT" "$RUNTIME_EXPORT"; do
+  grep -q -- '--hash=sha256:' "$f" || deps_refuse "${f##*/} carries no sha256 hashes: not an export of uv.lock"
+done
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+# Package count of an export: the lines that pin `name==version`.
+count_pins() {
+  grep -cE '^[A-Za-z0-9][A-Za-z0-9._-]*==' "$1" || true
+}
 
 # The runtime user's NAME is a server fact, not this script's business: it is
 # read from the owner of the live service tree, so the script keeps working
@@ -299,7 +349,22 @@ backup_step
 
 sudo rsync -a --delete "$STAGING/" "$DEST/" 7>&- 8>&-
 sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DEST" 7>&- 8>&-
-sudo -u "$SERVICE_USER" /opt/haiplane-hub/venv/bin/pip install -e "$DEST" -q 7>&- 8>&-
+# #1620: sets from the lock (wheels only, hashes, no resolution), then the app
+# alone. fd 7/8 are closed for pip as for every long child: a pip that outlives
+# this script must not hold the drain liveness channels open.
+VENV_PIP=/opt/haiplane-hub/venv/bin/pip
+if ! sudo -u "$SERVICE_USER" "$VENV_PIP" install --require-hashes --only-binary=:all: --no-deps \
+  -r "$DEST/requirements.build.txt" -r "$DEST/requirements.runtime.txt" -q 7>&- 8>&-; then
+  echo "deps: failed (pip did not install the lock sets: a hash mismatch or no wheel for this Python/platform); restart not called; the sources and the venv may be partly changed, no automatic rollback" >&2
+  exit 1
+fi
+if ! sudo -u "$SERVICE_USER" "$VENV_PIP" install --no-deps --no-build-isolation -e "$DEST" -q 7>&- 8>&-; then
+  echo "deps: failed (the app did not install after the lock sets did); restart not called; the venv may be partly changed, no automatic rollback" >&2
+  exit 1
+fi
+runtime_pins="$(count_pins "$RUNTIME_EXPORT")"
+build_pins="$(count_pins "$BUILD_EXPORT")"
+echo "deps: $((runtime_pins + build_pins)) пакетов (runtime $runtime_pins, build $build_pins) по экспортам sha256 runtime=$(sha256_of "$RUNTIME_EXPORT") build=$(sha256_of "$BUILD_EXPORT") из uv.lock sha256 $(sha256_of "$LOCK_FILE")"
 if [ "$DRAIN_ON" = 1 ]; then
   # Jobs that slipped in (an old hub ignores the marker) and the time pip took:
   # the same single budget, what is left of it.

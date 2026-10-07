@@ -44,9 +44,14 @@ jobs:
           # merge-base needs history that a depth-1 checkout does not have.
           fetch-depth: 0
 
+      # #1620: ONE uv version in CI test, CI deploy and the Dockerfile. uv >= 0.10
+      # prunes wheels of platforms the lock does not target, and uv 0.7 lowers the
+      # lock revision, so a floating version would rewrite uv.lock under us. The
+      # same string is asserted equal everywhere by tests/test_ci_workflow_contract.py.
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
+          version: "0.12.18"
           enable-cache: true
 
       - name: Set up Python
@@ -55,7 +60,8 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: uv sync --dev
+        # #1620: --locked: the committed uv.lock is what is tested, a stale lock fails.
+        run: uv sync --locked --dev
 
       # #1077: замерено на релизе 30.08.2026 — один и тот же прогон матрицы
       # выполнился 5 раз подряд (PR → develop → релизный PR → main →
@@ -395,6 +401,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # #1620: prod installs exactly what uv.lock pins. The sets are exported
+      # here, from the commit being deployed, into the tree that the next step
+      # rsyncs to staging; remote-deploy.sh checks both files before it changes
+      # anything and installs them wheels-only with --require-hashes. uv is the
+      # same pinned version as in the test job and the Dockerfile; Python 3.11 is
+      # the version of prod. --no-emit-project: the app is installed by the
+      # server itself, with --no-deps. Without --no-dev the dev group would ship.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.18"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Export hashed dependency sets from uv.lock
+        run: |
+          uv lock --check
+          uv export --frozen --no-dev --no-emit-project --format requirements-txt --no-header -o requirements.runtime.txt
+          uv export --frozen --only-group build --no-emit-project --format requirements-txt --no-header -o requirements.build.txt
+          echo "runtime: $(grep -cE '^[A-Za-z0-9][A-Za-z0-9._-]*==' requirements.runtime.txt) packages, build: $(grep -cE '^[A-Za-z0-9][A-Za-z0-9._-]*==' requirements.build.txt) packages"
 
       - name: Configure SSH
         env:
