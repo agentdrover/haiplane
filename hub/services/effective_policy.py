@@ -381,6 +381,17 @@ def _scheduled_block(
     return pending, by_key
 
 
+def key_rows(project: Any) -> list[dict[str, Any]]:
+    """Строки ключей реестра для проекта: значение, источник, умолчание (#1638).
+
+    Единственный расчёт строк; без обращений к базе. Им пользуются и сводка
+    ``effective_policy``, и форма проекта, которой нужны только ключи без
+    расписания, истории и стюарда.
+    """
+    policy = project_policy.gate_policy_of(project)
+    return [_key_row(key, entry, policy) for key, entry in REGISTRY.items()]
+
+
 async def effective_policy(db: aiosqlite.Connection, project: Any) -> dict[str, Any]:
     """Действующая политика проекта: ключи, сервер, стюард, замки, последняя правка."""
     policy = project_policy.gate_policy_of(project)
@@ -390,7 +401,7 @@ async def effective_policy(db: aiosqlite.Connection, project: Any) -> dict[str, 
             db, int(project["id"]), state="pending"
         ),
     )
-    keys = [_key_row(key, entry, policy) for key, entry in REGISTRY.items()]
+    keys = key_rows(project)
     for row in keys:
         if row["key"] in by_key:
             row["scheduled"] = by_key[row["key"]]

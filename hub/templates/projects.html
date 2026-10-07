@@ -19,8 +19,9 @@
 
 {# #1638: действующее значение настройки и его источник — из effective_policy. #}
 {% macro cost_now(cost, key, none_text) %}
-{% set row = cost.get(key) %}
-{% if row %}<span class="muted small review-cost-now" data-key="{{ key }}">действует: {% if row.value is none %}{{ none_text }}{% else %}{{ row.value }}{% endif %} ({{ row.source }})</span>{% endif %}
+{% if cost is none %}<span class="muted small review-cost-now" data-key="{{ key }}">действующее значение не рассчитано</span>
+{% else %}{% set row = cost.get(key) %}
+{% if row %}<span class="muted small review-cost-now" data-key="{{ key }}">действует: {% if row.value is none %}{{ none_text }}{% else %}{{ row.value }}{% endif %} ({{ row.source }})</span>{% endif %}{% endif %}
 {% endmacro %}
 {% macro project_card(c) %}
     <article class="project-card{% if c.project.archived %} project-card--archived{% endif %}">
@@ -285,7 +286,7 @@
                        пересчитываются. Пустое поле снимает ключ проекта —
                        наследуется серверная настройка. Ноль у каждого поля
                        значит своё, и подпись говорит, что именно. #}
-                    {% set cost = review_cost.get(c.project.id, {}) %}
+                    {% set cost = review_cost.get(c.project.id) %}
                     {% set stored_policy = c.project.gate_policy %}
                     <label class="task-action-label">Кто читает deep первым</label>
                     <select name="gate_policy_deep_reviewer" class="task-action-control">

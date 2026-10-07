@@ -1077,17 +1077,20 @@ async def web_projects(
     cards = await services.get_project_cards(_db(request))
     reach = await _review_reach_by_project(_db(request), rows)
     # #1638: действующее значение и источник четырёх настроек стоимости ревью —
-    # из той же сводки, что /api/projects/{slug}/effective-policy, без пересчёта.
-    review_cost = {
-        int(r["id"]): {
-            row["key"]: row
-            for row in (await effective_policy.effective_policy(_db(request), r))[
-                "keys"
-            ]
-            if row["key"] in _REVIEW_COST_KEYS
-        }
-        for r in rows
-    }
+    # из того же расчёта строк ключей, что и /api/projects/{slug}/effective-policy
+    # (effective_policy.key_rows), без сводки целиком и без обращений к базе.
+    # Отказ расчёта одного проекта не роняет страницу: None — «не рассчитано».
+    review_cost: dict[int, dict[str, Any] | None] = {}
+    for r in rows:
+        try:
+            review_cost[int(r["id"])] = {
+                row["key"]: row
+                for row in effective_policy.key_rows(r)
+                if row["key"] in _REVIEW_COST_KEYS
+            }
+        except Exception:
+            log.exception("review cost settings failed for project %s", r["id"])
+            review_cost[int(r["id"])] = None
     # #1412: кнопка запуска исполнителя выписывает код implementer от имени
     # человека — форма несёт CSRF, как и выдача кода руками (#961, #990).
     csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()

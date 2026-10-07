@@ -6922,6 +6922,38 @@ async def test_project_form_shows_review_cost_settings_with_effective_values(
     assert re.search(r'<option value="local"\s+selected', block)
 
 
+async def test_projects_page_isolates_review_cost_failure_and_skips_full_summary(
+    client: AsyncClient, monkeypatch
+):
+    """P2 Codex: сбой одного проекта не роняет /projects; сводка целиком не считается."""
+    from hub.services import effective_policy
+
+    await _project_with_policy(client, "cost-ok-a", dict(_COST_KEYS_STORED))
+    boom = await _project_with_policy(client, "cost-boom", {})
+    ok_b = await _project_with_policy(client, "cost-ok-b", {})
+
+    calls = {"full": 0}
+    real = effective_policy.key_rows
+
+    def flaky(project):
+        if project["slug"] == "cost-boom":
+            raise RuntimeError("boom")
+        return real(project)
+
+    async def no_full(*args, **kwargs):
+        calls["full"] += 1
+        raise AssertionError("форма не должна считать сводку целиком")
+
+    monkeypatch.setattr(effective_policy, "key_rows", flaky)
+    monkeypatch.setattr(effective_policy, "effective_policy", no_full)
+    resp = await client.get("/projects")
+    assert resp.status_code == 200
+    assert calls["full"] == 0
+    page = resp.text
+    assert "действующее значение не рассчитано" in _cost_form_block(page, boom)
+    assert "(default)" in _now_text(_cost_form_block(page, ok_b), "deep_reviewer")
+
+
 async def test_project_form_saves_review_cost_settings(client: AsyncClient):
     """AC-2: четыре значения с правильным типом, 0 не удалён, чужие ключи целы."""
     other = {"ci_runner": "make test", "wip_limit": 2, "executor_launch": "manual"}
