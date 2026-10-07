@@ -388,6 +388,12 @@ async def test_operator_can_human_gate_but_not_admin(db):
         ("service", ["ci_runner", "operator"], "human"),
         ("service", ["ci_runner", "admin"], "admin"),
         ("agent", ["ci_runner", "agent"], "agent"),
+        # ci_runner is listed on its own and ranks ABOVE viewer: a viewer role
+        # next to it must not turn the CI key into a human
+        ("service", ["ci_runner", "viewer"], "agent"),
+        ("human", ["ci_runner", "viewer"], "agent"),
+        # the kind does not rescue a CI role: a human-kind ci_runner is a machine
+        ("human", ["ci_runner"], "agent"),
     ],
 )
 async def test_effective_role_never_falls_back_to_human_for_machines(
@@ -415,3 +421,32 @@ async def test_effective_role_for_a_role_outside_the_list_and_a_missing_principa
     assert await admin_svc.get_effective_role(db, person["id"]) == "human"
     # a principal that does not exist is never granted the human gates
     assert await admin_svc.get_effective_role(db, 987654) != "human"
+
+
+@pytest.mark.parametrize(
+    ("kind", "roles"),
+    [
+        ("service", ["ci_runner"]),
+        ("human", ["ci_runner"]),
+        ("service", ["ci_runner", "viewer"]),
+        ("human", ["ci_runner", "viewer"]),
+    ],
+)
+async def test_ci_runner_resolves_to_an_agent_identity_in_both_db_resolvers(
+    db, kind, roles
+):
+    """The identity the hub builds (key AND session), not just the role string."""
+    p = await admin_svc.create_principal(
+        db, kind=kind, username=f"r-{kind}-{'-'.join(roles)}"
+    )
+    await admin_svc.set_principal_roles(db, p["id"], roles)
+    key = await admin_svc.create_api_key(db, p["id"], name="k")
+    session = await admin_svc.create_browser_session(db, p["id"])
+    for ident in (
+        await admin_svc.resolve_api_key(db, key["plaintext_key"]),
+        await admin_svc.resolve_browser_session(db, session),
+    ):
+        assert ident is not None
+        assert ident.role == "agent"
+        assert ident.is_agent is True
+        assert ident.is_human is False

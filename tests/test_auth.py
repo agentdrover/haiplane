@@ -1078,13 +1078,36 @@ def _fill_path(path: str) -> str:
     return re.sub(r"\{[^}:]+(:path)?\}", "1", path)
 
 
+# Every table a human-gate operation could write to: tasks and their feed,
+# criteria, dependencies, projects and the scheduled policy, skills, delivery
+# and dispositions, executor state, pairing, messages. No table is skipped when
+# it is missing: a renamed table must fail this test, not drop out of it.
+_GATE_TABLES = (
+    "tasks",
+    "task_updates",
+    "acceptance_criteria",
+    "task_dependencies",
+    "projects",
+    "scheduled_policy_changes",
+    "skills",
+    "releases",
+    "ci_run_reports",
+    "finding_dispositions",
+    "outcome_answers",
+    "live_checks",
+    "steward_false_approvals",
+    "executor_runs",
+    "executor_slots",
+    "chat_pair_codes",
+    "chat_pair_sessions",
+    "agent_messages",
+)
+
+
 async def _business_state(db) -> str:
     out = {}
-    for table in ("tasks", "projects", "skills", "task_updates", "task_decisions"):
-        try:
-            rows = await db.execute_fetchall(f"SELECT * FROM {table} ORDER BY 1")
-        except Exception:  # noqa: BLE001 — table absent in this schema
-            continue
+    for table in _GATE_TABLES:
+        rows = await db.execute_fetchall(f"SELECT * FROM {table} ORDER BY 1")
         out[table] = [tuple(r) for r in rows]
     return json.dumps(out, default=str, sort_keys=True)
 
@@ -1104,6 +1127,12 @@ async def test_ci_runner_key_is_refused_by_every_human_route(ci_runner_hub):
         "/api/tasks", json={"title": "gate probe"}, headers=hub.human
     )
     assert created.status_code in (200, 201), created.text
+    # Slug "1" and id 1 are what the path filler puts into every route, so the
+    # routes act on real rows and a leaked call WOULD change something.
+    proj = await hub.client.post(
+        "/api/projects", json={"slug": "1", "name": "One"}, headers=hub.human
+    )
+    assert proj.status_code == 200, proj.text
     before = await _business_state(hub.db)
     routes = _human_gate_routes()
     assert routes
@@ -1119,8 +1148,56 @@ async def test_ci_runner_key_is_refused_by_every_human_route(ci_runner_hub):
         refused = resp.status_code == 403 and "human_only_gate" in resp.text
         if not refused:
             leaked.append((method, path, resp.status_code, resp.text[:120]))
+        # After EVERY request, not once at the end: a leak that a later route
+        # undoes (or that a later failure hides) must still be seen.
+        if await _business_state(hub.db) != before:
+            leaked.append((method, path, resp.status_code, "state changed"))
+            before = await _business_state(hub.db)
     assert not leaked, leaked
-    assert await _business_state(hub.db) == before
     who = await hub.client.get("/api/whoami", headers=hub.ci)
     assert who.status_code == 200, who.text
     assert who.json()["role"] == "agent", who.json()
+
+
+async def test_ci_runner_browser_session_is_not_human(ci_runner_hub):
+    """AC-1 (#1639): the cookie door (resolve_browser_session) gives no human either."""
+    hub = ci_runner_hub
+    task = await hub.client.post(
+        "/api/tasks", json={"title": "cookie probe"}, headers=hub.human
+    )
+    tid = task.json()["id"]
+    who = await hub.client.get("/api/whoami", headers=hub.ci_cookie)
+    assert who.status_code == 200, who.text
+    assert who.json()["auth_source"] == "db_session", who.json()
+    assert who.json()["role"] == "agent", who.json()
+
+    from hub.services import admin as admin_svc
+
+    token = hub.ci_cookie["Cookie"].split("=", 1)[1]
+    identity = await admin_svc.resolve_browser_session(hub.db, token)
+    assert identity is not None
+    assert identity.is_human is False and identity.is_agent is True
+
+    before = await _business_state(hub.db)
+    rest = await hub.client.post(
+        f"/api/tasks/{tid}/approve", json={}, headers=hub.ci_cookie
+    )
+    assert rest.status_code == 403, rest.text
+    web = await hub.client.get("/chat-pair", headers=hub.ci_cookie)
+    assert web.status_code == 403, web.status_code
+    assert await _business_state(hub.db) == before
+
+
+async def test_ci_runner_may_withdraw_its_own_draft(ci_runner_hub):
+    """Accepted consequence (#1639): ci_runner is an agent, so /withdraw is open."""
+    hub = ci_runner_hub
+    made = await hub.client.post(
+        "/api/tasks",
+        json={"title": "ci draft", "source": "agent", "agent": "ci-1639"},
+        headers=hub.ci,
+    )
+    assert made.status_code in (200, 201), made.text
+    tid = made.json()["id"]
+    resp = await hub.client.post(f"/api/tasks/{tid}/withdraw", headers=hub.ci)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["archived"] is True

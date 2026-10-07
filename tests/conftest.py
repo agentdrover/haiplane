@@ -422,10 +422,15 @@ async def ci_runner_hub(client, db, monkeypatch):
         db, kind="service", username="ci-1639", role_slug="ci_runner"
     )
     ci_key = await admin_svc.create_api_key(db, ci["id"], name="ci")
+    ci_session = await admin_svc.create_browser_session(db, ci["id"])
     await db.commit()
     return SimpleNamespace(
         client=client,
         db=db,
+        # A real browser session of the CI principal: the cookie door resolves
+        # through resolve_browser_session, a second DB resolver that Bearer
+        # tests never touch.
+        ci_cookie={"Cookie": f"{config.HUB_COOKIE_NAME}={ci_session}"},
         human_principal=human,
         ci_principal=ci,
         human={"Authorization": f"Bearer {human_key['plaintext_key']}"},
