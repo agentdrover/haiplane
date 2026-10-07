@@ -23,7 +23,6 @@ from hub.mcp_server import (
     hub_approve_task,
     hub_ask_question,
     hub_answer_question,
-    hub_approve_proposal,
     hub_claim_task,
     hub_create_task,
     hub_create_subtasks,
@@ -797,7 +796,7 @@ async def test_hub_report_done_needs_decision_error_envelope(
     assert payload["status"] == "needs_decision"
     assert payload["awaiting"] == "human_decision"
     assert payload["actor_hint"] == "human"
-    assert "hub_decide_task" in payload["next_action"]
+    assert "/decide" in payload["next_action"]
 
 
 # ---------------------------------------------------------------------------
@@ -2811,28 +2810,6 @@ async def test_hub_list_projects_names_the_forge(mock_api_get: AsyncMock) -> Non
     assert "@gitlab" not in text
 
 
-async def test_deprecated_alias_marks_and_counts(
-    mock_api_get: AsyncMock, mock_api_post: AsyncMock
-) -> None:
-    # AC-1 (#325): alias response carries deprecated + replacement, and the
-    # call is counted through the telemetry endpoint.
-    mock_api_get.side_effect = [
-        {"id": 5, "status": "draft"},  # prior read inside hub_approve_task
-        {"id": 5, "status": "open"},  # refreshed task
-    ]
-    mock_api_post.side_effect = [
-        {"id": 5, "status": "open"},  # approve call
-        {"ok": True},  # telemetry
-    ]
-    out = await hub_approve_proposal(5)
-    payload = json.loads(out)
-    assert payload["deprecated"] is True
-    assert "hub_approve_task" in payload["next_action"]
-    telemetry_call = mock_api_post.await_args_list[-1]
-    assert telemetry_call.args[0] == "/api/telemetry/deprecated-tool"
-    assert telemetry_call.args[1]["tool"] == "hub_approve_proposal"
-
-
 async def test_task_update_done_alias_marked_deprecated(
     mock_api_get: AsyncMock, mock_api_post: AsyncMock
 ) -> None:
@@ -3004,35 +2981,6 @@ async def test_hub_submit_machine_review_names_the_report_outcome(
     }
     out = await hub_submit_machine_review(42, raw_count=4, incomplete=False)
     assert "Исход отчёта" not in out.content[0].text
-
-
-async def test_hub_submit_steward_judgement(mock_api_post: AsyncMock) -> None:
-    from hub.mcp_server import hub_submit_steward_judgement
-
-    mock_api_post.return_value = {
-        "id": 1,
-        "task_id": 42,
-        "generation": 1,
-        "kind": "verdict",
-        "verdict": "escalate",
-        "escalate_reason": "low_confidence",
-        "submitted_verdict": "approve",
-    }
-    out = await hub_submit_steward_judgement(
-        42,
-        generation=1,
-        kind="verdict",
-        verdict="approve",
-        confidence="low",
-        grounds=[{"source": "ci_pinned_sha"}],
-    )
-    structured = _mcp_structured(out)
-    assert structured["steward_judgement"]["verdict"] == "escalate"
-    path, body = mock_api_post.await_args.args
-    assert path == "/api/tasks/42/steward-judgement"
-    assert body["verdict"] == "approve"
-    assert body["confidence"] == "low"
-    assert "tokens_spent" not in body
 
 
 async def test_hub_practice_metrics(mock_api_get: AsyncMock) -> None:

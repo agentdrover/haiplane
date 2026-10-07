@@ -323,7 +323,8 @@ async def _finish_arbiter(db, task: dict, job: dict, job_status: str) -> None:
         "hub",
         "alert",
         "Arbiter phase finished — human decision required "
-        "(hub_decide_task)." + (f"\n\nArbiter summary:\n{summary}" if summary else ""),
+        "(REST POST /api/tasks/<id>/decide)."
+        + (f"\n\nArbiter summary:\n{summary}" if summary else ""),
     )
     await db.commit()
     log.info(
@@ -353,7 +354,7 @@ async def _escalate_failed_review_job(db, task: dict, job: dict) -> None:
         "alert",
         f"Review job failed (exit={job.get('exit_code')}) "
         "without a verdict. Universal Review Gate: manual "
-        "decision required (hub_decide_task).",
+        "decision required (REST POST /api/tasks/<id>/decide).",
     )
     await db.commit()
     log.info(
@@ -437,7 +438,7 @@ async def _defer_scanned_approval(db, task: dict, scanned) -> None:
         f"Источник: {scanned.source}.\n"
         f"Строка, принятая за вердикт: «{quoted}»\n"
         "Если это действительно вердикт — вынесите его через ревью "
-        "(hub_submit_review) или примите решение вручную (hub_decide_task).",
+        "(hub_submit_review) или примите решение вручную (REST POST /api/tasks/<id>/decide).",
     )
     await repo.update_task(db, task["id"], status="needs_decision")
     await repo.insert_event(
@@ -569,7 +570,7 @@ async def _deliver_approved_review(db, task: dict) -> None:
                     "blocker",
                     f"Доставка остановлена: PR #{pr_num} — {stacked}. "
                     "Ожидание здесь ничего не решит, поэтому задача передана "
-                    "человеку (hub_decide_task).",
+                    "человеку (REST POST /api/tasks/<id>/decide).",
                 )
                 await repo.update_task(db, task["id"], status="needs_decision")
                 await repo.insert_event(
@@ -651,7 +652,7 @@ async def _deliver_approved_review(db, task: dict) -> None:
             f"Ревью одобрено, но PR #{pr_num} не влит "
             f"({reason}). Задача не может считаться "
             "выполненной, пока работа не в базовой ветке. "
-            "Решите через hub_decide_task.",
+            "Решите через REST POST /api/tasks/<id>/decide.",
         )
         await repo.update_task(db, task["id"], status="needs_decision")
         await repo.insert_event(
@@ -1148,27 +1149,27 @@ async def _sweep_stale_statuses(db) -> None:
             "needs_info",
             config.STALE_NEEDS_INFO_MINUTES,
             False,
-            "Question awaits a human hub_answer_question.",
+            "Question awaits a human answer (REST POST /api/tasks/<id>/answer).",
         ),
         (
             "ci_check",
             config.STALE_CI_CHECK_MINUTES,
             False,
             "CI conveyor stalled: inspect the PR/CI or recover with "
-            "hub_force_complete_task.",
+            "REST POST /api/tasks/<id>/force-complete.",
         ),
         (
             "fix_requested",
             config.STALE_FIX_REQUESTED_MINUTES,
             False,
             "Fix dispatch stalled: inspect the job or recover with "
-            "hub_force_complete_task.",
+            "REST POST /api/tasks/<id>/force-complete.",
         ),
         (
             "pending_report",
             config.STALE_PENDING_REPORT_MINUTES,
             False,
-            "Awaiting agent hub_report_done, or recover with hub_force_complete_task.",
+            "Awaiting agent hub_report_done, or recover with REST POST /api/tasks/<id>/force-complete.",
         ),
     )
     for status_name, threshold, null_review_job, action in stale_specs:
@@ -1398,9 +1399,9 @@ async def _clear_reviewer_unavailable(db, observed) -> bool:
 # not tell a person what to do with the task — and "someone should look at
 # this" is what the single lifetime alert already said, to no effect.
 _HUMAN_QUEUE_ACTIONS: dict[str, str] = {
-    "draft": "черновик ждёт одобрения или отклонения (hub_approve_task / hub_reject_task)",
-    "needs_info": "агент ждёт ответа на вопрос (hub_answer_question)",
-    "needs_decision": "задача ждёт решения человека (hub_decide_task)",
+    "draft": "черновик ждёт одобрения или отклонения (REST POST /api/tasks/<id>/approve или /reject)",
+    "needs_info": "агент ждёт ответа на вопрос (REST POST /api/tasks/<id>/answer)",
+    "needs_decision": "задача ждёт решения человека (REST POST /api/tasks/<id>/decide)",
     "review:client": "сдача ждёт вердикта ревьюера (hub_submit_review)",
 }
 
@@ -1990,7 +1991,7 @@ async def _deliver_pair_task(db, task: dict) -> None:
             "alert",
             f"Ревью одобрено, но PR #{pr_num} не доставлен — {detail}. "
             "Задача не может считаться выполненной, пока работа не в базовой "
-            "ветке. Решение за человеком (hub_decide_task)."
+            "ветке. Решение за человеком (REST POST /api/tasks/<id>/decide)."
             + services.base_conflict_resubmit_hint(reason, detail),
         )
         await repo.insert_event(

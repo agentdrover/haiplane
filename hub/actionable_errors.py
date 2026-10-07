@@ -34,14 +34,17 @@ _PERMISSION_HINTS: dict[str, dict[str, str | None]] = {
     },
     "tasks.decision": {
         "required_role": "human",
-        "suggested_tool": "hub_decide_task",
-        "hint": "Decision Gate requires hub_decide_task with a human or admin token.",
+        "suggested_tool": None,
+        "hint": (
+            "Decision Gate is a human step: POST /api/tasks/<id>/decide with a "
+            "human or admin token (hub UI or oc-hub)."
+        ),
     },
 }
 
 _DONE_SUGGESTED_TOOLS: dict[str, str | None] = {
     "pair_start_required": "hub_pair_start",
-    "human_decision_required": "hub_decide_task",
+    "human_decision_required": None,
     "awaiting_ci_conveyor": "hub_task_status",
     "task_already_terminal": "hub_task_status",
     "invalid_status_for_done": "hub_pair_start",
@@ -175,7 +178,7 @@ def steward_verdict_required_detail() -> dict[str, Any]:
                 "Send verdict as approve, changes_requested or escalate. "
                 "Omitting it must not become an approve."
             ),
-            "suggested_tool": "hub_submit_steward_judgement",
+            "suggested_tool": None,
         }
     )
 
@@ -197,7 +200,7 @@ def steward_closed_vocabulary_detail(
                 f"{field} must be one of: {', '.join(allowed_list)}. "
                 "There is no unknown bucket — a new code is a spec change."
             ),
-            "suggested_tool": "hub_submit_steward_judgement",
+            "suggested_tool": None,
         }
     )
 
@@ -214,7 +217,7 @@ def steward_escalate_reason_required_detail(
             "allowed": allowed_list,
             "message": "escalate_reason is required when verdict is escalate",
             "hint": f"Send escalate_reason as one of: {', '.join(allowed_list)}.",
-            "suggested_tool": "hub_submit_steward_judgement",
+            "suggested_tool": None,
         }
     )
 
@@ -230,7 +233,7 @@ def steward_unknown_finding_uid_detail(uid: str) -> dict[str, Any]:
                 "Closures address confirmed findings of this submission by "
                 "finding_uid. A uid the hub cannot see cannot close a finding."
             ),
-            "suggested_tool": "hub_submit_steward_judgement",
+            "suggested_tool": None,
         }
     )
 
@@ -251,7 +254,7 @@ def steward_judgement_exists_detail(
                 "A second judgement of the same triple is refused, not stacked. "
                 "A new submission generation opens a new slot."
             ),
-            "suggested_tool": "hub_submit_steward_judgement",
+            "suggested_tool": None,
         }
     )
 

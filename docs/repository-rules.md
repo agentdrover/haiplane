@@ -217,7 +217,7 @@ uv run pytest -q
   `hub_get_review_brief` → `hub_submit_review`). Done report без актуального
   одобрения не завершает задачу, а отправляет её в `review`. Исключения:
   `auto_review=false` (явный опт-аут при создании) и audited human overrides
-  (`hub_decide_task` accept, `hub_force_complete_task`). Merge в `main`
+  (`/decide` accept, `/force-complete`). Merge в `main`
   остаётся релизом — гейт дополняет, а не заменяет PR/CI-процесс.
 
 ## Pull request / review checklist

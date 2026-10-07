@@ -384,7 +384,7 @@ curl -fsS -H "Authorization: Bearer $TOKEN" "$HUB/api/whoami" | jq .
 | <a id="deploy-window-mcp-disconnect"></a>**MCP хаба отключён / failed после старта сессии в окно релиза** | — | Деплой после мержа в `main` перезапускает единственный экземпляр хаба; MCP и REST — одно приложение и недоступны до конца старта. Клиент, чей запуск пришёлся на рестарт, может остаться отключённым и не подключиться сам | По порядку: 1) дождитесь `200` на `$HUB/healthz` (он показывает живость процесса, не исправность MCP); 2) для Claude Code попросите пользователя переподключить сервер командой `/mcp`, для Cursor — Reload Window (см. раздел 4); 3) пока MCP недоступен, работайте через REST с уже доступным токеном (имя переменной, например `HAIPLANE_HUB_TOKEN`; сам токен в чат не пишите). Не считайте хаб сломанным, пока `/healthz` отвечает 200. Наблюдение, не гарантия: 04.10 в логах деплоя первый успешный `healthz` пришёл через ~4 с после возврата `restart` |
 | **404 на `/mcp/mcp`** | 404 | Устаревший путь | Используйте **`/mcp`** |
 | Connection refused | — | Hub не слушает / неверный туннель | `curl /healthz` на loopback; для prod — SSH `-L 8080:127.0.0.1:8080` (см. [`docs/agent-onboarding.md`](agent-onboarding.md)) |
-| 403 human_only_gate в MCP | 403 | Agent-токен на human-only tool | Используйте human/admin токен или попросите человека (`hub_force_complete_task`, `hub_decide_task`, …) |
+| human_only_gate в MCP | isError | Agent-токен вызвал скрытый human-only инструмент | Агентскому токену эти инструменты не показаны (#1624): человек выполняет шаг через UI, `oc-hub` или REST (`/api/tasks/{id}/approve`, `/decide`, `/force-complete`, …) |
 
 ### 401 — подробнее
 

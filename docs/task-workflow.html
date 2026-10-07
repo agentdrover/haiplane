@@ -155,7 +155,7 @@
     <tbody>
       <tr>
         <td><strong>A — headless</strong></td>
-        <td><code>hub_start_task</code></td>
+        <td><code>POST /api/tasks/{id}/start</code></td>
         <td><code>oc-dev-dispatch</code> на сервере</td>
         <td>есть</td>
       </tr>
@@ -205,7 +205,7 @@
   <ol class="checklist">
     <li>После approve задача в <code>open</code>, <code>job_id</code> пустой.</li>
     <li><code>hub_ask_question(task_id, question=...)</code> → <code>needs_info</code> (не 400).</li>
-    <li>Человек: <code>hub_answer_question</code> — <code>resume=true</code> без dispatch <span class="badge ok">#40 ✓</span>.</li>
+    <li>Человек: <code>POST /api/tasks/{id}/answer</code> — <code>resume=true</code> без dispatch <span class="badge ok">#40 ✓</span>.</li>
     <li>Далее <code>hub_pair_start</code> или работа по обновлённому scope.</li>
   </ol>
   <p>На headless <code>running</code> с <code>job_id</code> поведение <code>hub_ask_question</code> без изменений.</p>
@@ -214,7 +214,7 @@
   <p>Gap <strong>#40</strong> <span class="badge ok">закрыт</span>: после <code>needs_info</code> pair-задача не уходит в <code>oc-dev-dispatch</code>.</p>
   <ol class="checklist">
     <li>Pair = пустой <code>job_id</code> (до или после <code>hub_pair_start</code>).</li>
-    <li><code>hub_answer_question(..., resume=true)</code> → <code>open</code> (до pair-start) или <code>running</code> (если есть <code>branch</code>), без <code>job_id</code>.</li>
+    <li><code>POST /api/tasks/{id}/answer(..., resume=true)</code> → <code>open</code> (до pair-start) или <code>running</code> (если есть <code>branch</code>), без <code>job_id</code>.</li>
     <li><code>resume=false</code> → только answer update, статус <code>open</code>.</li>
     <li>Headless с <code>job_id</code>: <code>resume=true</code> по-прежнему re-dispatch.</li>
   </ol>

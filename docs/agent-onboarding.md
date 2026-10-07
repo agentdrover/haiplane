@@ -35,16 +35,16 @@
 stateDiagram-v2
     [*] --> draft: agent create
     [*] --> open: human create
-    draft --> open: hub_approve_task
-    draft --> rejected: hub_reject_task
+    draft --> open: human approve (REST /approve)
+    draft --> rejected: human reject (REST /reject)
     open --> claimed: hub_claim_task
-    open --> running: hub_pair_start / hub_start_task
+    open --> running: hub_pair_start
     claimed --> open: hub_release_task
     claimed --> running: hub_pair_start (holder)
-    claimed --> completed: hub_report_done / hub_force_complete
+    claimed --> completed: hub_report_done / human force-complete (REST)
     running --> needs_info: hub_ask_question
-    needs_info --> open: hub_answer_question (pair, pre-start)
-    needs_info --> running: hub_answer_question (pair, post-start)
+    needs_info --> open: human answer (REST /answer, pair, pre-start)
+    needs_info --> running: human answer (REST /answer, pair, post-start)
     running --> ci_check: hub_report_done (auto_review + branch)
     running --> completed: hub_report_done (no review / no branch)
     running --> needs_decision: hub_report_done + blocker
@@ -53,8 +53,8 @@ stateDiagram-v2
     ci_check --> needs_decision: CI/review stall (poller)
     review --> completed: accept
     review --> fix_requested: rework
-    needs_decision --> completed: hub_decide_task accept
-    needs_decision --> fix_requested: hub_decide_task rework
+    needs_decision --> completed: human decide accept (REST /decide)
+    needs_decision --> fix_requested: human decide rework (REST /decide)
     completed --> [*]
     failed --> [*]
     rejected --> [*]
@@ -148,7 +148,7 @@ curl -sS \
    > возвращает мягкое (non-blocking, severity `low`) предупреждение по «тонким»
    > AC, но оно не влияет на score/`dor_passed`. Финальная оценка качества —
    > всё равно на ревьюере. Пиши содержательные Given/When/Then.
-3. **План.** Зафиксируй план: `hub_start_task(..., plan="...")` или
+3. **План.** Зафиксируй план: `hub_pair_start(..., plan="...")` или
    `hub_task_update(..., kind="status", content="Plan: ...")`.
 4. **Вопросы — только через `hub_ask_question`.** Не полагайся на вопросы в чате.
 5. **Блокеры — `hub_task_update(..., kind="blocker")`.** Если нужен ответ
@@ -158,7 +158,7 @@ curl -sS \
 7. **Вне scope — только draft-предложение** через `hub_propose_task`.
    Не расширяй задачу молча.
 8. **Не закрывай задачу** при падающем CI, неразрешённом блокере или запрошенных
-   правках ревью. Используй `hub_decide_task` или человеческий гейт.
+   правках ревью. Остановись и передай решение человеку (`POST /api/tasks/{id}/decide`).
 
 > **Resubmit-цикл:** `review` → `changes_requested` → `running` → правки в
 > **той же ветке** → `hub_submit_for_review` → повторное ревью. Ревью видит
@@ -185,11 +185,11 @@ curl -sS \
 
 | Путь | Старт | Кто пишет код | `job_id` |
 |---|---|---|---|
-| **A — headless** | `hub_start_task` | `oc-dev-dispatch` на сервере | есть |
+| **A — headless** | человек: `POST /api/tasks/{id}/start` | `oc-dev-dispatch` на сервере | есть |
 | **B — pair (Cursor)** | `hub_pair_start` | человек + агент в Cursor | нет |
 
-Если ты — агент в Cursor рядом с человеком, это **почти всегда путь B**.
-`hub_start_task` запускает headless dispatch — не вызывай его для pair-работы.
+Если ты — агент в Cursor рядом с человеком, это **всегда путь B**. Путь A
+запускает человек; инструмента для него у агента нет.
 
 Подробности pair path B: `docs/task-workflow.html` и
 `docs/software-development-workflow.md#pair-mode-git-policy`.
@@ -226,11 +226,17 @@ curl -sS \
 
 ## 7. Человеческие гейты (human gates)
 
-- **Approve:** `hub_approve_task`. `force=true` — только явный человеческий
-  override, аудируется API.
+Шесть человеческих гейтов не показаны агентскому токену в `tools/list` и
+отказываются в `call_tool` (`reason=human_only_gate`, #1624). Человек идёт
+через UI, `oc-hub` или REST с человеческим токеном:
+
+- **Approve / reject:** `POST /api/tasks/{id}/approve`, `/reject`. `force=true` —
+  только явный человеческий override, аудируется API.
+- **Старт headless (путь A):** `POST /api/tasks/{id}/start`.
+- **Ответ на вопрос:** `POST /api/tasks/{id}/answer`.
 - **Слабый/отсутствующий отчёт** в `pending_report` принимает только человек —
-  `hub_force_complete_task`.
-- **Решение после арбитража:** `hub_decide_task`.
+  `POST /api/tasks/{id}/force-complete`.
+- **Решение после арбитража:** `POST /api/tasks/{id}/decide`.
 
 Агент не имитирует человеческий гейт и не «дожимает» статус сам.
 
@@ -385,30 +391,29 @@ scope/validation и id критериев приёмки без Given/When/Then.
   > поэтому параллельные add/upsert не дают спорадических 500.
 - `hub_add_risk`
 
-**Ошибки MCP (human gates):** `hub_force_complete_task` и `hub_decide_task` при
-403 отдают JSON `{reason: human_only_gate, hint, required_status}` без URL
-`127.0.0.1`. `hub_report_done` из недопустимого статуса — JSON с `reason` и
+**Ошибки MCP (human gates):** вызов скрытого человеческого гейта агентским
+токеном отдаёт JSON `{reason: human_only_gate, actor_hint: human, next_action}`
+с REST-маршрутом для человека, REST не вызывается. `hub_report_done` из недопустимого статуса — JSON с `reason` и
 подсказкой (`pair_start_required` → вызови `hub_pair_start`).
 
 **Жизненный цикл**
-- `hub_approve_task` / `hub_reject_task`
-- `hub_start_task` (path A, headless) / `hub_pair_start` (path B, pair)
+- `hub_pair_start` (path B, pair); approve/reject/start — шаги человека (REST)
 - `hub_claim_task` / `hub_release_task` — захват/освобождение сессией.
   > `claim` — это **резервирование**, а не старт работы. Чтобы довести задачу до
   > завершения, веди её через `hub_pair_start` (ставит `running`). Но если задача
   > всё же в `claimed`, `hub_report_done` теперь не теряется: отчёт уводит её в
   > `completed` (или `ci_check` при `auto_review`/`needs_decision` при блокере) и
-  > снимает claim. Прямой человеческий выход — `hub_force_complete_task`.
+  > снимает claim. Прямой человеческий выход — `POST /api/tasks/{id}/force-complete`.
 - `hub_task_update` — статус/блокер/отчёт
-- `hub_ask_question` / `hub_answer_question`
+- `hub_ask_question` (ответ даёт человек: `POST /api/tasks/{id}/answer`)
 - `hub_report_done`
-- `hub_force_complete_task` — human-only audited override; completes any
+- Force-complete (`POST /api/tasks/{id}/force-complete`, только человек) — audited override; completes any
   non-terminal ``task``/``subtask`` when no active dispatch job backs
   ``job_id`` or ``review_job_id`` (409 if active). Missing/terminal jobs are
   audited. Non-empty comment required for active lifecycle states except
   ``pending_report``/``claimed``. Rejects terminal tasks and epic/feature
   rows with incomplete descendants. See ``docs/agent-context/invariants.md``.
-- `hub_decide_task` (решение после арбитража)
+- решение после арбитража — человек: `POST /api/tasks/{id}/decide`
 - `hub_archive_task` / `hub_unarchive_task` / `hub_delete_task`
 
 **Координация сессий (#770)**
@@ -423,14 +428,14 @@ scope/validation и id критериев приёмки без Given/When/Then.
   отметки «прочитано» — один и тот же канал читают несколько потребителей.
 
 **Предложения / решения / диспетч**
-- `hub_list_proposals` / `hub_approve_proposal` / `hub_reject_proposal`
+- `hub_list_proposals` (одобряет и отклоняет человек: `/api/tasks/{id}/approve`, `/reject`)
 - `hub_list_decisions`
 - `hub_dispatch_jobs`
 - `hub_prepare_developer_task`
 
 **Минимальный набор для большинства сценариев:** `hub_my_context`,
-`hub_get_readiness`, `hub_refine_task`, `hub_approve_task`, `hub_pair_start`
-(или `hub_start_task`), `hub_task_update`, `hub_ask_question`, `hub_report_done`.
+`hub_get_readiness`, `hub_refine_task`, `hub_claim_task`, `hub_pair_start`,
+`hub_task_update`, `hub_ask_question`, `hub_report_done`.
 
 ---
 
@@ -555,7 +560,7 @@ CI на PR гоняет также `pip-audit`, `bandit` и secret-scan — сл
 4. `hub_my_context(task_id)` или `hub_project_status` для контекста.
 5. Убедиться, что задача готова (`hub_get_readiness`), иначе — refine.
 6. Зафиксировать план (`hub_task_update kind="status"`).
-7. Чистый worktree → `hub_pair_start` (path B) или `hub_start_task` (path A).
+7. Чистый worktree → `hub_claim_task`, затем `hub_pair_start` (path B).
 8. Работа в ветке `task-<id>/<slug>`, PR в `develop`.
 9. `hub_report_done` с реальной валидацией; проверить фактический статус.
 10. Не печатать секреты; не мержить в `main` без проверки.

@@ -261,7 +261,7 @@ async def test_the_blocker_hold_hint_routes_through_the_decision(
         for u in updates
         if u["kind"] == "alert" and "не пошёл в доставку" in (u["content"] or "")
     )
-    assert "hub_decide_task" in alert["content"]
+    assert "/decide" in alert["content"]
     assert "rework" in alert["content"]
     assert "отчитайтесь снова либо" not in alert["content"], (
         "старая формулировка предлагала недоступное действие как равный вариант"

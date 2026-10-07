@@ -82,15 +82,15 @@ def compute_next_action(
 ) -> str:
     """Short agent-facing hint for the next step."""
     if reason == "human_decision_required":
-        return "Task awaits human Decision Gate — call hub_decide_task with a human/admin token."
+        return "Task awaits the human Decision Gate: a person acts via POST /api/tasks/<id>/decide (hub UI or oc-hub)."
     if reason == "pair_start_required":
         return "Call hub_pair_start (or hub_claim_task then pair-start) before hub_report_done."
     if reason == "awaiting_ci_conveyor":
-        return "Wait for CI poller or use hub_decide_task / human gate when stuck."
+        return "Wait for the CI poller; if it is stuck, ask a human (POST /api/tasks/<id>/decide)."
     if reason == "task_already_terminal":
         return "Task is finished; no further done report is needed."
     if reason == "invalid_status_for_done":
-        return "Start work via hub_pair_start or hub_start_task before reporting done."
+        return "Start work via hub_pair_start before reporting done."
     if reason == "permission_denied":
         return "Retry with a human or admin token, or use suggested_tool if provided."
     if reason == "human_only_gate":
@@ -128,13 +128,13 @@ def compute_next_action(
         return "Fix task_type/parent_id per hint, then retry hub_create_task or hub_propose_task."
 
     if awaiting == "human_decision" and status == "needs_decision":
-        return "Call hub_decide_task (human/admin token) to accept or rework."
+        return "Waiting for a human to accept or rework: POST /api/tasks/<id>/decide (hub UI or oc-hub)."
     if awaiting == "human_decision" and status == "pending_report":
         return (
             "Await human review or use hub_report_done after approval path completes."
         )
     if awaiting == "human_decision" and status == "needs_info":
-        return "Await hub_answer_question from a human."
+        return "Await a human answer: POST /api/tasks/<id>/answer (hub UI or oc-hub)."
     if awaiting == "ci":
         return "Wait for CI conveyor; poller advances to review when checks pass."
     if awaiting == "review":
@@ -148,7 +148,7 @@ def compute_next_action(
     if status in ("failed", "rejected"):
         return "Task is terminal; inspect updates or open a follow-up task."
     if status == "open":
-        return "Call hub_pair_start or hub_start_task to begin work."
+        return "Call hub_claim_task, then hub_pair_start to begin work."
     if status == "claimed":
         return (
             "Call hub_pair_start to begin pair work or hub_release_task to drop claim."
@@ -156,7 +156,7 @@ def compute_next_action(
     if status == "running":
         return "Continue implementation; call hub_report_done when validation passes."
     if status == "draft":
-        return "Refine task and await hub_approve_task from a human."
+        return "Refine the task and await human approval: POST /api/tasks/<id>/approve (hub UI or oc-hub)."
     return "Inspect hub_my_context or hub_task_status for current gates."
 
 
@@ -230,6 +230,10 @@ def enrich_error_payload(payload: dict[str, Any]) -> dict[str, Any]:
         status=status,
         reason=reason,
     )
+    # A refusal that carries its own next step (the route for a human gate,
+    # #1624) keeps it: only a reason-keyed default is generic.
+    if payload.get("next_action"):
+        envelope["next_action"] = payload["next_action"]
     # The call changed nothing, so it never reports a transition.
     envelope["transition"] = None
     # ``awaiting`` is NOT forced: it describes the task's gate, not this call.

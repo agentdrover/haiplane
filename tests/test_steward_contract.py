@@ -1,4 +1,4 @@
-"""Контракт hub_submit_steward_judgement: закрытые словари и at-most-once (#1022).
+"""Контракт POST /api/tasks/{id}/steward-judgement: закрытые словари и at-most-once (#1022).
 
 Спека: docs/specs/steward-agent.md §5, §6.1, §7. Только запись — без
 транзишена. События аудита пишет #1023; применение суждения — F4.

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -168,8 +169,87 @@ async def ensure_commit_available(
     return fetched
 
 
-async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
-    """Whether this task's merge is part of what production is running."""
+_UNSET: Any = object()
+
+
+@dataclass(frozen=True)
+class _GitCheck:
+    """Everything the git phase needs, read from the database beforehand (#1603).
+
+    The connection is one aiosqlite handle: SQL must not run from many tasks at
+    once, git may. So all reads happen first, in ``prepare_delivery``, and the
+    checks that remain touch git only — those are what a snapshot can fan out.
+    """
+
+    task_id: int
+    merge_sha: str
+    deployed_sha: str
+    deployed_at: str
+    ref: str
+    workspace: str
+    base: str
+    fact: dict[str, Any] | None
+
+    @property
+    def known(self) -> dict[str, str]:
+        return {
+            "merge_sha": self.merge_sha,
+            "deployed_sha": self.deployed_sha,
+            "deployed_at": self.deployed_at,
+        }
+
+
+# #1603: a DEFINITE "in production" never turns back: the merge is in the
+# history of a commit that was deployed, and history is append-only for the
+# same key. NOT_IN_PROD (a release may land any minute) and UNKNOWN (git may
+# answer next time) are never stored — the module docstring's rule stands.
+# The key carries everything the answer depends on, and the cache is read only
+# AFTER the project-applicability checks in ``prepare_delivery``.
+_IN_PROD_CAP = 512
+# What is stored is the PROOF (the reason's text without the deploy date and
+# how the date is worded), never the answer: a sha deployed again keeps its
+# key, and the date of the earlier deploy must not outlive it.
+_in_prod_cache: dict[tuple[str, str, str, str], tuple[str, str]] = {}
+
+
+def _cache_key(check: _GitCheck) -> tuple[str, str, str, str]:
+    return (check.workspace, check.base, check.merge_sha, check.deployed_sha)
+
+
+def _in_prod_reason(check: _GitCheck, text: str, style: str) -> str:
+    if not check.deployed_at:
+        return text
+    return text + (
+        f" от {check.deployed_at}" if style == "от" else f" (выкат {check.deployed_at})"
+    )
+
+
+def _in_prod(check: _GitCheck, text: str, style: str) -> dict[str, Any]:
+    """A definite IN_PROD answer; remembers the proof for the next snapshot."""
+    if len(_in_prod_cache) >= _IN_PROD_CAP:
+        _in_prod_cache.clear()
+    _in_prod_cache[_cache_key(check)] = (text, style)
+    return _answer(IN_PROD, _in_prod_reason(check, text, style), **check.known)
+
+
+async def delivery_state(
+    db: Any, task_id: int, *, release: Any = _UNSET
+) -> dict[str, Any]:
+    """Whether this task's merge is part of what production is running.
+
+    ``release`` lets a caller that answers for many tasks read the release once
+    (``None`` means "none recorded"); the answer does not depend on who read it.
+    """
+    prepared = await prepare_delivery(db, task_id, release=release)
+    if isinstance(prepared, dict):
+        return prepared
+    return await git_delivery_state(prepared)
+
+
+async def prepare_delivery(
+    db: Any, task_id: int, *, release: Any = _UNSET
+) -> dict[str, Any] | _GitCheck:
+    """Every SQL-backed step of the answer; a final answer, or the git work left."""
     from hub import services
 
     merge_sha = await repo.merge_sha_for_task(db, task_id)
@@ -180,7 +260,8 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
             "Это не значит, что работа не доехала: значит, что факта мержа у хаба нет",
         )
 
-    release = await repo.latest_successful_release(db)
+    if release is _UNSET:
+        release = await repo.latest_successful_release(db)
     if release is None:
         return _answer(
             UNKNOWN,
@@ -239,6 +320,31 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
             **known,
         )
 
+    base = (ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
+    return _GitCheck(
+        task_id=task_id,
+        merge_sha=merge_sha,
+        deployed_sha=deployed_sha,
+        deployed_at=deployed_at,
+        ref=str(release.get("ref") or ""),
+        workspace=str(workspace),
+        base=base,
+        fact=await repo.release_fact_for_task(db, task_id),
+    )
+
+
+async def git_delivery_state(check: _GitCheck) -> dict[str, Any]:
+    """The git half of the answer, cached when — and only when — it is IN_PROD."""
+    cached = _in_prod_cache.get(_cache_key(check))
+    if cached is not None:
+        return _answer(IN_PROD, _in_prod_reason(check, *cached), **check.known)
+    return await _decide_with_git(check)
+
+
+async def _decide_with_git(check: _GitCheck) -> dict[str, Any]:
+    merge_sha, deployed_sha = check.merge_sha, check.deployed_sha
+    workspace = check.workspace
+    known = check.known
     # #883: the objects have to be here before git can be asked about them.
     # The workspace tracks the base branch, so a commit deployed from another
     # ref is simply absent — and that absence was answering "could not check"
@@ -255,7 +361,7 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
                 **known,
             )
         fetched, fetch_error = await plugins.git_ops.fetch_commit(
-            workspace, deployed_sha, str(release.get("ref") or "")
+            workspace, deployed_sha, str(check.ref)
         )
         if not fetched:
             _record_fetch_miss(workspace, deployed_sha)
@@ -277,11 +383,10 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
             **known,
         )
     if reachable:
-        return _answer(
-            IN_PROD,
-            f"мерж {merge_sha[:12]} входит в раскатанный {deployed_sha[:12]}"
-            + (f" от {deployed_at}" if deployed_at else ""),
-            **known,
+        return _in_prod(
+            check,
+            f"мерж {merge_sha[:12]} входит в раскатанный {deployed_sha[:12]}",
+            "от",
         )
 
     # Not an ancestor is not yet an answer (#946). A release merged by squash
@@ -290,7 +395,7 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
     # running. Ask git the question that survives a squash: which state of the
     # base branch holds exactly what is deployed, and does the merge belong to
     # it. Observed on prod 24.08.2026 on the first policy-made release (#927).
-    base = (ctx.get("base_branch") or "").strip() or config.PAIR_BASE_BRANCH
+    base = check.base
     twin = await _release_twin(workspace, deployed_sha, base)
     if twin is None:
         return _answer(
@@ -310,13 +415,12 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
                 **known,
             )
         if carried:
-            return _answer(
-                IN_PROD,
+            return _in_prod(
+                check,
                 f"релиз собран squash-ом, поэтому {merge_sha[:12]} не предок "
                 f"{deployed_sha[:12]}; раскатано содержимое {base} на "
-                f"{twin[:12]}, и мерж в него входит"
-                + (f" (выкат {deployed_at})" if deployed_at else ""),
-                **known,
+                f"{twin[:12]}, и мерж в него входит",
+                "выкат",
             )
     # #950: ancestry is cut twice in this flow — the release squashes, and the
     # base branch can be recreated from the release branch afterwards. The
@@ -326,7 +430,7 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
     # exact refusal #949's live check hit, update #3496). The release itself
     # recorded which merges it carried; that stamp lives on the RELEASE
     # branch's own line, which nothing rewrites.
-    fact = await repo.release_fact_for_task(db, task_id)
+    fact = check.fact
     if fact and str(fact.get("released_sha") or ""):
         release_sha = str(fact["released_sha"])
         release_pr = fact.get("released_pr")
@@ -342,13 +446,12 @@ async def delivery_state(db: Any, task_id: int) -> dict[str, Any]:
                 **known,
             )
         if carried_out or release_sha == deployed_sha:
-            return _answer(
-                IN_PROD,
+            return _in_prod(
+                check,
                 f"родословная мержа {merge_sha[:12]} оборвана, но релиз "
                 f"PR #{release_pr} записал, что увёз его: {release_sha[:12]} "
-                f"входит в раскатанный {deployed_sha[:12]}"
-                + (f" (выкат {deployed_at})" if deployed_at else ""),
-                **known,
+                f"входит в раскатанный {deployed_sha[:12]}",
+                "выкат",
             )
         return _answer(
             NOT_IN_PROD,
