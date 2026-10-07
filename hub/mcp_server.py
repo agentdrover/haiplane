@@ -3690,69 +3690,112 @@ async def hub_undelivered_completed() -> CallToolResult:
     return structured_echo_result("\n".join(lines), delivery_discrepancies=data)
 
 
-@mcp.tool()
-async def hub_outcome_debt() -> CallToolResult:
-    """Outcome promises and the answers to them (#766, #819).
+def _outcome_debt_row_lines(item: dict[str, Any]) -> list[str]:
+    """One row of the outcome-debt page: an open promise or an answered one."""
+    if "latest_answer" in item:
+        latest = item.get("latest_answer") or {}
+        return [
+            f"#{item['task_id']} {item['title']} — {latest.get('verdict', '?')}"
+            f" ({item.get('answers', 0)} check(s), last by "
+            f"{latest.get('answered_by') or 'unknown'})",
+            f"    measured: {latest.get('measured_value') or '—'}",
+        ]
+    waited = item.get("days_unanswered")
+    waited_text = f"{waited}d unanswered" if waited is not None else "age unknown"
+    due_on = item.get("due_on")
+    due_text = f", due {due_on}" if due_on else ""
+    if due_on and item.get("due_assumed"):
+        due_text += " (assumed: from merge)"
+    lines = [
+        f"#{item['task_id']} {item['title']} — {waited_text}",
+        f"    {item.get('outcome_status', '')}{due_text}",
+        f"    metric: {item.get('outcome_metric') or '—'}",
+    ]
+    if item.get("outcome_deadline"):
+        lines.append(f"    said by: {item['outcome_deadline']}")
+    if item.get("outcome_revisit_condition"):
+        lines.append(f"    revisit if: {item['outcome_revisit_condition']}")
+    return lines
 
-    DoR refuses a task without an outcome_metric, and for a long time nothing
-    ever read one back: a task counted as successful when its gates passed, not
-    when the number moved. This read makes both sides visible - the tasks
-    nobody has come back to, and the ones somebody has, with the last verdict
-    and what was measured. Record an answer with hub_answer_outcome.
 
-    Due = first deploy of the fix + 14 days (#1568): overdue / observing /
-    unknown (no recorded fix release); due_assumed = counted from the merge
-    (project key merge_is_delivery, #1572). outcome_deadline stays free text.
-    """
-    try:
-        data = await _api_get("/api/metrics/outcome-debt")
-    except HubApiError as exc:
-        return _error_result(exc)
-    items = data.get("items", [])
+_OUTCOME_DEBT_HINT = (
+    "Остальное: выберите status=overdue|observing|unknown|answered и листайте "
+    "offset; полный JSON — REST GET /api/metrics/outcome-debt без параметров "
+    "или CLI hp-hub outcome-debt без флагов."
+)
+
+
+def _outcome_debt_lines(data: dict[str, Any]) -> list[str]:
+    """Text of one outcome-debt page (#1605). "No debt" only when ``total`` is 0:
+    an empty page says nothing about the other statuses."""
     answered = data.get("answered_total", 0)
-    # Both numbers in the header: the unanswered count alone can only grow, so
-    # on its own it says more about the age of the backlog than about whether
-    # anyone checks (#819). The answered rows are printed in both branches —
-    # hiding them exactly when the debt is clean would make the evidence of
-    # checking disappear at the moment it is most worth seeing.
-    if not items:
+    if not data.get("total", 0):
         lines = [
             "No outcome debt: every completed task with a stated metric has "
             f"an answer ({answered} answered).",
-            "",
         ]
     else:
         lines = [
             f"{data.get('total', 0)} completed tasks stated an outcome nobody "
             f"answered ({data.get('overdue_total', 0)} overdue, "
             f"{data.get('observing_total', 0)} observing, "
-            f"{data.get('unknown_total', 0)} unknown); {answered} answered:",
-            "",
+            f"{data.get('unknown_total', 0)} unknown); {answered} answered.",
         ]
-    for item in items:
-        waited = item.get("days_unanswered")
-        waited_text = f"{waited}d unanswered" if waited is not None else "age unknown"
-        lines.append(f"#{item['task_id']} {item['title']} — {waited_text}")
-        due_on = item.get("due_on")
-        status = item.get("outcome_status", "")
-        due_text = f", due {due_on}" if due_on else ""
-        if due_on and item.get("due_assumed"):
-            due_text += " (assumed: from merge)"
-        lines.append(f"    {status}{due_text}")
-        lines.append(f"    metric: {item.get('outcome_metric') or '—'}")
-        if item.get("outcome_deadline"):
-            lines.append(f"    said by: {item['outcome_deadline']}")
-        if item.get("outcome_revisit_condition"):
-            lines.append(f"    revisit if: {item['outcome_revisit_condition']}")
-    for item in data.get("answered", []):
-        latest = item.get("latest_answer") or {}
-        lines.append(
-            f"#{item['task_id']} {item['title']} — {latest.get('verdict', '?')}"
-            f" ({item.get('answers', 0)} check(s), last by "
-            f"{latest.get('answered_by') or 'unknown'})"
+    rows = data.get("rows")
+    if rows is not None:
+        shown = (
+            f"показано {len(rows)} из {data.get('total_in_status', 0)} "
+            f"({data.get('status')})"
         )
-        lines.append(f"    measured: {latest.get('measured_value') or '—'}")
-    return structured_echo_result("\n".join(lines), outcome_debt=data)
+        next_offset = data.get("next_offset")
+        if next_offset is not None:
+            lines.append(f"{shown}; следующая страница offset={next_offset}.")
+        elif not rows and data.get("total_in_status", 0):
+            lines.append(
+                f"{shown}: offset={data.get('offset')} за концом списка, "
+                "начните с offset=0."
+            )
+        else:
+            lines.append(f"{shown}; это последняя страница.")
+    else:
+        lines.append("Только счётчики, строк нет.")
+    if data.get("total", 0):
+        lines.append(_OUTCOME_DEBT_HINT)
+    lines.append("")
+    for item in rows or []:
+        lines.extend(_outcome_debt_row_lines(item))
+    return lines
+
+
+@mcp.tool()
+async def hub_outcome_debt(
+    status: Literal["overdue", "observing", "unknown", "answered"] = "overdue",
+    limit: int = 20,
+    offset: int = 0,
+    only_counts: bool = False,
+) -> CallToolResult:
+    """Outcome promises and the answers to them (#766, #819).
+
+    Completed tasks whose stated outcome nobody answered, plus answered ones
+    with the last verdict. Record an answer with hub_answer_outcome. Due =
+    first deploy of the fix + 14 days (#1568); due_assumed = counted from the
+    merge (#1572); outcome_deadline stays free text.
+
+    Returns counters plus ONE page (#1605): status overdue by default, limit
+    1-200, offset to page on; only_counts drops the rows. Not the full list.
+    """
+    params: dict[str, Any] = {"status": status, "limit": limit, "offset": offset}
+    if only_counts:
+        params["only_counts"] = "true"
+    try:
+        data = await _api_get(
+            f"/api/metrics/outcome-debt?{urllib.parse.urlencode(params)}"
+        )
+    except HubApiError as exc:
+        return _error_result(exc)
+    return structured_echo_result(
+        "\n".join(_outcome_debt_lines(data)), outcome_debt=data
+    )
 
 
 @mcp.tool()

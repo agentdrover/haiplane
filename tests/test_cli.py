@@ -2894,3 +2894,34 @@ def test_the_parser_knows_the_advisor_kind_and_its_verdicts() -> None:
     assert (args.kind, args.verdict) == ("advisor", "concur")
     args = parser.parse_args(["steward-false-approve-clear", "7", "--note", "ok"])
     assert args.func is cli.cmd_steward_false_approve_clear and args.note == "ok"
+
+
+def test_outcome_debt_passes_page_flags() -> None:
+    """AC-6. Flags become query parameters; no flags, no query."""
+    rc, api = _run_main(["outcome-debt"], api_result={})
+    assert rc == 0
+    assert api.call_args.args[:2] == ("GET", "/api/metrics/outcome-debt")
+
+    rc, api = _run_main(
+        [
+            "outcome-debt",
+            "--status",
+            "overdue",
+            "--limit",
+            "5",
+            "--offset",
+            "10",
+            "--only-counts",
+        ],
+        api_result={},
+    )
+    assert rc == 0
+    path = api.call_args.args[1]
+    base, _, query = path.partition("?")
+    assert base == "/api/metrics/outcome-debt"
+    assert sorted(query.split("&")) == [
+        "limit=5",
+        "offset=10",
+        "only_counts=true",
+        "status=overdue",
+    ]
