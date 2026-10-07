@@ -6,7 +6,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import aiosqlite
 import uvicorn
@@ -1612,15 +1612,33 @@ async def api_record_category_check(
 
 
 @app.get("/api/metrics/outcome-debt")
-async def api_outcome_debt(request: Request):
+async def api_outcome_debt(
+    request: Request,
+    status: Literal["overdue", "observing", "unknown", "answered"] | None = Query(
+        default=None
+    ),
+    limit: int | None = Query(default=None, ge=1, le=200),
+    offset: int | None = Query(default=None, ge=0),
+    only_counts: bool = Query(default=False),
+):
     """Outcome promises and the answers to them (#766, #819).
 
     ``items`` are the tasks nobody has come back to; ``answered`` are the ones
     somebody has, with the last verdict and what was measured. Both counts are
     reported: a list that could only grow measured the age of the backlog, not
     the habit of checking.
+
+    Without parameters the full payload (#1605); with ``status``/``limit``/
+    ``offset`` one page of one status plus the counters, with ``only_counts``
+    the counters alone.
     """
-    return await services.outcome_debt(_db(request))
+    return await services.outcome_debt(
+        _db(request),
+        status=status,
+        limit=limit,
+        offset=offset,
+        only_counts=only_counts,
+    )
 
 
 @app.post("/api/tasks/{task_id}/finding-dispositions")

@@ -4602,3 +4602,33 @@ async def test_web_review_form_with_an_agent_identity_is_guarded_too(
     assert ok.status_code in (200, 303), ok.text
     body = (await client.get(f"/api/tasks/{task_id}", **human)).json()
     assert body["review_verdict"] == "approved"
+
+
+async def test_outcome_debt_endpoint_pages_one_status(client: AsyncClient, db):
+    """AC-2 (REST). A page of one status, full counters, 422 outside 1..200."""
+    from tests.test_outcomes import seed_debt
+
+    await seed_debt(db, overdue=45, observing=2, unknown=1, answered=1)
+    full = (await client.get("/api/metrics/outcome-debt")).json()
+
+    resp = await client.get(
+        "/api/metrics/outcome-debt?status=overdue&limit=20&offset=20"
+    )
+    body = resp.json()
+    last = (
+        await client.get("/api/metrics/outcome-debt?status=overdue&limit=20&offset=40")
+    ).json()
+
+    assert resp.status_code == 200
+    assert body["rows"] == full["overdue"][20:40]
+    assert (body["total_in_status"], body["next_offset"]) == (45, 40)
+    assert body["overdue_total"] == 45 and body["answered_total"] == 1
+    for key in ("items", "overdue", "observing", "unknown", "answered"):
+        assert key not in body
+    assert last["next_offset"] is None
+    for query in ("limit=0", "limit=201", "offset=-1", "status=nope"):
+        assert (
+            await client.get(f"/api/metrics/outcome-debt?{query}")
+        ).status_code == 422
+    counts = (await client.get("/api/metrics/outcome-debt?only_counts=true")).json()
+    assert "rows" not in counts and counts["total"] == 48
