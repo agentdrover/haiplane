@@ -409,6 +409,7 @@ async def test_derive_maps_verdicts_and_ignores_deadline_text():
 async def test_mcp_and_cli_show_the_three_buckets(db: aiosqlite.Connection):
     """MCP text names overdue/observing/unknown counts and the due date; the CLI
     prints the REST payload as is, so the new fields reach it unchanged."""
+    import argparse
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from hub import cli, mcp_server
@@ -417,8 +418,9 @@ async def test_mcp_and_cli_show_the_three_buckets(db: aiosqlite.Connection):
     await _fix_release(db, fresh, days_ago=1, sha="8" * 40)
     await _completed_task(db, title="No fix", metric="a number")
     payload = await outcome_debt(db)
+    page = await outcome_debt(db, status="observing")
 
-    with patch.object(mcp_server, "_api_get", AsyncMock(return_value=payload)):
+    with patch.object(mcp_server, "_api_get", AsyncMock(return_value=page)):
         tool = mcp_server.hub_outcome_debt
         result = await (tool.fn() if hasattr(tool, "fn") else tool())
     text = "\n".join(b.text for b in result.content if hasattr(b, "text"))
@@ -428,7 +430,7 @@ async def test_mcp_and_cli_show_the_three_buckets(db: aiosqlite.Connection):
 
         buf = io.StringIO()
         with redirect_stdout(buf):
-            cli.cmd_outcome_debt(MagicMock())
+            cli.cmd_outcome_debt(argparse.Namespace())
 
     assert "0 overdue, 1 observing, 1 unknown" in text
     assert f"due {payload['observing'][0]['due_on']}" in text
@@ -605,7 +607,7 @@ async def test_mcp_outcome_debt_says_when_the_date_is_assumed(
     pid = await _delivery_project(db, "mcp-app", {"merge_is_delivery": True})
     assumed = await _completed_task(db, title="Assumed", metric="a number")
     await _merge(db, assumed, pid, days_ago=2)
-    payload = await outcome_debt(db)
+    payload = await outcome_debt(db, status="observing")
 
     with patch.object(mcp_server, "_api_get", AsyncMock(return_value=payload)):
         tool = mcp_server.hub_outcome_debt
