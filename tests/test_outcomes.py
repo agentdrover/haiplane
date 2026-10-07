@@ -195,20 +195,123 @@ async def seed_debt(
     await db.commit()
 
 
+_FROZEN = "2026-01-01 00:00:00"
+_FULL_NOTE = (
+    "Every task in `items` promised a number would move and was never "
+    "asked whether it did. `answered` holds the ones somebody came back "
+    "to, with the last verdict and what was measured - including "
+    "not_moved and unmeasurable, which are answers too. "
+    "`overdue`: the fix first reached production 14 "
+    "days ago or more (`due_on` passed). `observing`: the window is "
+    "still open. `unknown`: no recorded release of the fix (no merge, "
+    "unreleased merge, or a release the hub never saw) - a gap in "
+    "the record, not a debt. The due date is a machine fact, not a "
+    "parse of outcome_deadline: that is free text and is not used for "
+    "filtering, so nothing is hidden behind a value that cannot be parsed. "
+    "`due_assumed`: the date counts from the merge, because the project "
+    "declared merge = delivery (gate_policy `merge_is_delivery`), not from "
+    "a recorded deploy."
+)
+
+
+async def _frozen_debt_base(db: aiosqlite.Connection) -> dict:
+    """One task per state with every clock pinned, and the payload the full
+    response must equal (#1605 AC-1): before the paging change, verbatim."""
+    from datetime import UTC, datetime, timedelta
+
+    await seed_debt(db, overdue=1, observing=1, unknown=1, answered=1)
+    await db.execute("UPDATE tasks SET completed_at=?", (_FROZEN,))
+    await db.execute("UPDATE outcome_answers SET answered_at=?", (_FROZEN,))
+    await db.execute(
+        "UPDATE releases SET deployed_at=? WHERE deployed_sha=?",
+        (_FROZEN, f"{1:040x}"),
+    )
+    await db.commit()
+    observing_at = datetime.fromisoformat(
+        (
+            await (
+                await db.execute(
+                    "SELECT deployed_at FROM releases WHERE deployed_sha=?",
+                    (f"{2:040x}",),
+                )
+            ).fetchone()
+        )[0].replace(" ", "T")
+    )
+    waited = (datetime.now(UTC) - datetime(2026, 1, 1, tzinfo=UTC)).days
+
+    def row(task_id: int, kind: str, status: str, due: str | None) -> dict:
+        return {
+            "task_id": task_id,
+            "title": f"{kind} {task_id}",
+            "task_type": "feature",
+            "outcome_metric": "a number",
+            "outcome_indicator": "",
+            "outcome_deadline": "",
+            "outcome_revisit_condition": "",
+            "completed_at": _FROZEN,
+            "days_unanswered": waited,
+            "outcome_status": status,
+            "due_on": due,
+            "due_assumed": False,
+        }
+
+    overdue = row(1, "overdue", "unanswered", "2026-01-15")
+    observing = row(
+        2,
+        "observing",
+        "not_due",
+        (observing_at + timedelta(days=14)).date().isoformat(),
+    )
+    unknown = row(3, "unknown", "unknown", None)
+    answered = row(4, "answered", "confirmed", None) | {
+        "answers": 1,
+        "latest_answer": {
+            "id": 1,
+            "verdict": "moved",
+            "measured_value": "0 -> 5",
+            "note": "",
+            "answered_by": "",
+            "answered_at": _FROZEN,
+            "hypothesis_snapshot": None,
+        },
+    }
+    return {
+        "total": 3,
+        "answered_total": 1,
+        "items": [overdue, observing, unknown],
+        "answered": [answered],
+        "overdue": [overdue],
+        "overdue_total": 1,
+        "observing": [observing],
+        "observing_total": 1,
+        "unknown": [unknown],
+        "unknown_total": 1,
+        "window_days": 14,
+        "note": _FULL_NOTE,
+    }
+
+
 async def test_outcome_debt_without_params_keeps_full_contract(
     db: aiosqlite.Connection,
 ):
-    """AC-1. No parameters: the full payload, every list and counter in place."""
-    await seed_debt(db, overdue=3, observing=2, unknown=2, answered=1)
+    """AC-1. No parameters: the whole payload equals the pre-paging one, key by
+    key, row by row, note included."""
+    expected = await _frozen_debt_base(db)
 
-    result = await outcome_debt(db)
+    assert await outcome_debt(db) == expected
+    assert list((await outcome_debt(db))) == list(expected)
 
-    assert _FULL_KEYS <= set(result) and _COUNT_KEYS <= set(result)
-    assert (len(result["overdue"]), len(result["observing"])) == (3, 2)
-    assert (len(result["unknown"]), len(result["answered"])) == (2, 1)
-    assert len(result["items"]) == 7 == result["total"]
-    assert result["answered_total"] == 1
-    assert "rows" not in result
+
+async def test_outcome_debt_rest_without_params_equals_full_payload(
+    db: aiosqlite.Connection, client
+):
+    """AC-1 (REST). The serialized answer without parameters is that payload."""
+    expected = await _frozen_debt_base(db)
+
+    resp = await client.get("/api/metrics/outcome-debt")
+
+    assert resp.status_code == 200
+    assert resp.json() == expected
 
 
 async def test_outcome_debt_only_counts_has_no_rows(db: aiosqlite.Connection):

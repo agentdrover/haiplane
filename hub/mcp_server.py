@@ -3718,6 +3718,13 @@ def _outcome_debt_row_lines(item: dict[str, Any]) -> list[str]:
     return lines
 
 
+_OUTCOME_DEBT_HINT = (
+    "Остальное: выберите status=overdue|observing|unknown|answered и листайте "
+    "offset; полный JSON — REST GET /api/metrics/outcome-debt без параметров "
+    "или CLI hp-hub outcome-debt без флагов."
+)
+
+
 def _outcome_debt_lines(data: dict[str, Any]) -> list[str]:
     """Text of one outcome-debt page (#1605). "No debt" only when ``total`` is 0:
     an empty page says nothing about the other statuses."""
@@ -3734,22 +3741,28 @@ def _outcome_debt_lines(data: dict[str, Any]) -> list[str]:
             f"{data.get('observing_total', 0)} observing, "
             f"{data.get('unknown_total', 0)} unknown); {answered} answered.",
         ]
-    if "rows" not in data:
-        lines.append("Counts only: pass status=overdue|observing|unknown|answered.")
-        return lines
-    rows = data["rows"]
-    shown = f"показано {len(rows)} из {data.get('total_in_status', 0)} ({data.get('status')})"
-    next_offset = data.get("next_offset")
-    if next_offset is None:
-        lines.append(f"{shown}; это последняя страница.")
-    else:
-        lines.append(
-            f"{shown}; следующая страница offset={next_offset}. "
-            "Все строки: листайте offset (limit до 200) или hp-hub outcome-debt "
-            "без флагов."
+    rows = data.get("rows")
+    if rows is not None:
+        shown = (
+            f"показано {len(rows)} из {data.get('total_in_status', 0)} "
+            f"({data.get('status')})"
         )
+        next_offset = data.get("next_offset")
+        if next_offset is not None:
+            lines.append(f"{shown}; следующая страница offset={next_offset}.")
+        elif not rows and data.get("total_in_status", 0):
+            lines.append(
+                f"{shown}: offset={data.get('offset')} за концом списка, "
+                "начните с offset=0."
+            )
+        else:
+            lines.append(f"{shown}; это последняя страница.")
+    else:
+        lines.append("Только счётчики, строк нет.")
+    if data.get("total", 0):
+        lines.append(_OUTCOME_DEBT_HINT)
     lines.append("")
-    for item in rows:
+    for item in rows or []:
         lines.extend(_outcome_debt_row_lines(item))
     return lines
 

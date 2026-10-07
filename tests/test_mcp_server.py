@@ -5699,3 +5699,41 @@ async def test_hub_outcome_debt_never_says_no_debt_from_an_empty_page(db) -> Non
     with patch.object(mcp_server, "_api_get", AsyncMock(return_value=empty)):
         result = await mcp_server.hub_outcome_debt()
     assert no_debt in result.content[0].text
+
+
+_OUTCOME_DEBT_HOW_TO_GET_ALL = (
+    "REST GET /api/metrics/outcome-debt без параметров",
+    "CLI hp-hub outcome-debt без флагов",
+    "status=overdue|observing|unknown|answered",
+)
+
+
+async def test_hub_outcome_debt_always_says_how_to_get_the_rest(db) -> None:
+    """AC-4 review P2. The way to the other statuses and the full JSON is in
+    every answer with debt: last page, offset past the end, counters only."""
+    from tests.test_outcomes import seed_debt
+
+    await seed_debt(db, overdue=2, observing=2, unknown=1)
+
+    _, last_page = await _outcome_debt_tool(db, [])
+    _, past_end = await _outcome_debt_tool(db, [], offset=200)
+    _, counts = await _outcome_debt_tool(db, [], only_counts=True)
+
+    assert "показано 2 из 2" in last_page and "последняя страница" in last_page
+    assert "offset=200 за концом списка, начните с offset=0" in past_end
+    assert "показано 0 из 2" in past_end
+    for text in (last_page, past_end, counts):
+        for phrase in _OUTCOME_DEBT_HOW_TO_GET_ALL:
+            assert phrase in text
+
+
+async def test_hub_outcome_debt_no_hint_when_there_is_no_debt(db) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from hub import mcp_server
+
+    empty = {"total": 0, "answered_total": 0, "rows": [], "next_offset": None}
+    with patch.object(mcp_server, "_api_get", AsyncMock(return_value=empty)):
+        result = await mcp_server.hub_outcome_debt()
+
+    assert "REST GET" not in result.content[0].text
