@@ -3317,13 +3317,21 @@ async def build_tree(
 
 
 async def log_activity(
-    db: aiosqlite.Connection, kind: str, summary: str, detail: str | None = None
+    db: aiosqlite.Connection,
+    kind: str,
+    summary: str,
+    detail: str | None = None,
+    *,
+    commit: bool = True,
 ) -> None:
+    """Запись в activity_log. ``commit=False`` - внутри чужой транзакции (#1610):
+    владелец транзакции коммитит или откатывает запись сам."""
     await db.execute(
         "INSERT INTO activity_log (kind, summary, detail) VALUES (?, ?, ?)",
         (kind, summary, detail),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
 
 
 # ---------------------------------------------------------------------------

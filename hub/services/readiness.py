@@ -35,6 +35,7 @@ from hub.models import (
     TaskRisk,
 )
 from hub.services.dor import DOR_ADVISORY_KEYS, DoREvaluation, evaluate_dor
+from hub.services.dor_snapshot import load_dor_snapshot
 
 log = logging.getLogger("hub.services.readiness")
 
@@ -209,11 +210,11 @@ async def calculate_readiness(
     ReadinessReport. Recommendations are left empty here — the
     Recommendations engine (#38) populates them.
     """
-    dor = await evaluate_dor(db, task_id)
-    row = await repo.get_task(db, task_id)
-    # 'risks' is a guaranteed column post-migrations (review I10).
-    risks_raw = row["risks"] if row is not None else None
-    risks = parse_risks_from_row(risks_raw)
+    snapshot = await load_dor_snapshot(db, task_id)
+    dor = await evaluate_dor(db, task_id, snapshot)
+    # 'risks' is a guaranteed column post-migrations (review I10); DoR and risks
+    # come from one snapshot (#1610).
+    risks = parse_risks_from_row(snapshot.task["risks"])
 
     score, components = calculate_score_from_data(dor=dor, risks=risks, config=config)
     # NB: ``dor_passed`` and ``score`` are independent signals.
