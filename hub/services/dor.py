@@ -46,6 +46,10 @@ DOR_CHECK_KEYS: tuple[str, ...] = (
     "statement_paths_resolve",
 )
 
+#: #1604: проект задачи без workspace_path. Не входит в DOR_CHECK_KEYS: пункт
+#: появляется в отчёте только когда клона нет, у проекта с клоном его нет совсем.
+WORKSPACE_MISSING_CHECK = "workspace_missing"
+
 # Checks that are visible but free. They appear in the DoR table and earn a
 # recommendation, but cost nothing in the readiness score.
 #
@@ -64,6 +68,7 @@ DOR_ADVISORY_KEYS: frozenset[str] = frozenset(
         # #1456: free in the score like the Discovery checks, but asked of
         # EVERY work type — see DoREvaluation.advisory users in evaluate.
         "statement_paths_resolve",
+        WORKSPACE_MISSING_CHECK,
     }
 )
 
@@ -357,6 +362,27 @@ def _statement_paths_item(result: StatementPathsResult | None) -> DoRCheckItem:
     )
 
 
+@dataclass(frozen=True)
+class WorkspaceGap:
+    """Проект задачи без workspace_path: кто он и откуда взялся (#1604)."""
+
+    slug: str
+    source: str
+
+
+def _workspace_missing_item(gap: WorkspaceGap) -> DoRCheckItem:
+    return DoRCheckItem(
+        key=WORKSPACE_MISSING_CHECK,
+        passed=False,
+        detail=(
+            f"{WORKSPACE_MISSING_CHECK}: у проекта {gap.slug} ({gap.source}) не "
+            "задан workspace_path — sha сдачи не закрепляется; автозаказ "
+            "машинного ревью не идёт; проверки предмета и путей постановки "
+            "не применяются"
+        ),
+    )
+
+
 def evaluate_from_data(
     *,
     work_type: str | None,
@@ -373,6 +399,7 @@ def evaluate_from_data(
     redesign_decision: str | None = None,
     agent_fit: str | None = None,
     statement_paths: StatementPathsResult | None = None,
+    workspace_gap: WorkspaceGap | None = None,
 ) -> DoREvaluation:
     """Pure, side-effect-free DoR evaluation from explicit data.
 
@@ -462,6 +489,8 @@ def evaluate_from_data(
 
     # Stable order — always DOR_CHECK_KEYS — for deterministic UI rendering.
     checks = [checks_by_key[k] for k in DOR_CHECK_KEYS]
+    if workspace_gap is not None:
+        checks.append(_workspace_missing_item(workspace_gap))
     required = _required_for(work_type)
     if (
         statement_paths
@@ -471,8 +500,8 @@ def evaluate_from_data(
         # Отказывает только найденное нарушение: «не проверено» не блокирует.
         required = required | {STATEMENT_PATHS_CHECK}
     missing = frozenset(c.key for c in checks if c.key in required and not c.passed)
-    advisory = frozenset({STATEMENT_PATHS_CHECK}) | (
-        DOR_ADVISORY_KEYS - {STATEMENT_PATHS_CHECK}
+    advisory = frozenset({STATEMENT_PATHS_CHECK, WORKSPACE_MISSING_CHECK}) | (
+        DOR_ADVISORY_KEYS - {STATEMENT_PATHS_CHECK, WORKSPACE_MISSING_CHECK}
         if (work_type or WorkType.feature.value) in DOR_ADVISORY_WORK_TYPES
         else frozenset()
     )
@@ -498,6 +527,45 @@ async def record_statement_paths(db, task_id: int, dor_checks) -> None:
             await repo.add_task_update(
                 db, task_id, "", "alert", f"Approve: {check.detail}"
             )
+
+
+async def workspace_gap_for(db, task_id: int) -> WorkspaceGap | None:
+    """Проект без workspace_path для задачи или ``None`` (#1604).
+
+    Проект определяет тот же разбор, что у project_git_context
+    (``resolve_project_with_source``), и смотрится значение ПРОЕКТА, не env:
+    пустой путь у default остаётся «без workspace», даже если git_ops упадёт
+    на запасной путь из окружения. Нет проекта вовсе - не утверждаем ничего.
+    """
+    project, source_id = await repo.resolve_project_with_source(db, task_id)
+    if project is None or (project["workspace_path"] or "").strip():
+        return None
+    if source_id is None:
+        source = "резервный проект default"
+    elif source_id == task_id:
+        source = "свой"
+    else:
+        source = f"унаследован от эпика #{source_id}"
+    return WorkspaceGap(slug=str(project["slug"]), source=source)
+
+
+async def record_workspace_missing(db, task_id: int) -> None:
+    """Проект без workspace при одобрении - одной строкой в ленту (#1604).
+
+    Рядом с record_statement_paths, из тех же двух мест (approve_task и
+    автоодобрение). Читает проект сама, а не из отчёта DoR: автоодобрение из
+    стюарда не получает ``dor_checks``, и строка не должна зависеть от того,
+    кто вызвал. Не блокирует и не заменяет другие alert одобрения.
+    """
+    gap = await workspace_gap_for(db, task_id)
+    if gap is not None:
+        await repo.add_task_update(
+            db,
+            task_id,
+            "",
+            "alert",
+            f"Approve: {_workspace_missing_item(gap).detail}",
+        )
 
 
 async def _base_tree(db, task_id: int) -> tuple[set[str] | None, str]:
@@ -576,6 +644,7 @@ async def evaluate_dor(db, task_id: int) -> DoREvaluation:
         redesign_decision=row["redesign_decision"],
         agent_fit=row["agent_fit"],
         statement_paths=await _statement_paths_for(db, task_id, row, acs),
+        workspace_gap=await workspace_gap_for(db, task_id),
     )
 
 
@@ -587,6 +656,10 @@ __all__ = [
     "DoREvaluation",
     "STATEMENT_PATHS_CHECK",
     "STATEMENT_PATHS_MARK",
+    "WORKSPACE_MISSING_CHECK",
+    "WorkspaceGap",
+    "record_workspace_missing",
+    "workspace_gap_for",
     "StatementPathsResult",
     "check_statement_paths",
     "record_statement_paths",

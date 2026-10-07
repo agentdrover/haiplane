@@ -1310,14 +1310,16 @@ async def list_task_ids_for_project(
     return {r["id"] for r in rows}
 
 
-async def resolve_project_for_task(
+async def resolve_project_with_source(
     db: aiosqlite.Connection, task_id: int
-) -> aiosqlite.Row | None:
-    """Resolve a task's project by walking up to its root epic (#335).
+) -> tuple[aiosqlite.Row | None, int | None]:
+    """The task's project and the node that supplied it (#335, #1604).
 
-    Projects live on epics only; descendants inherit. Tasks outside any
-    epic (or epics without an assignment) fall back to the seeded
-    'default' project so legacy behavior never breaks.
+    Projects live on epics only; descendants inherit. The second value is the
+    id of the task row that carries the assignment (the task itself, or an
+    ancestor), or ``None`` when the 'default' project is the fallback: the
+    task sits outside any epic, the epic has no assignment, or the assigned
+    project is still a pending proposal (#345) and must not affect routing.
     """
     current_id: int | None = task_id
     for _ in range(20):  # hierarchy depth guard
@@ -1333,12 +1335,23 @@ async def resolve_project_for_task(
         row = rows[0]
         if row["project_id"] is not None:
             project = await get_project(db, row["project_id"])
-            # A pending proposal (#345) must not affect routing yet.
             if project is not None and project["status"] != "active":
-                return await get_project_by_slug(db, "default")
-            return project
+                return await get_project_by_slug(db, "default"), None
+            return project, int(row["id"])
         current_id = row["parent_id"]
-    return await get_project_by_slug(db, "default")
+    return await get_project_by_slug(db, "default"), None
+
+
+async def resolve_project_for_task(
+    db: aiosqlite.Connection, task_id: int
+) -> aiosqlite.Row | None:
+    """Resolve a task's project by walking up to its root epic (#335).
+
+    Projects live on epics only; descendants inherit. Tasks outside any
+    epic (or epics without an assignment) fall back to the seeded
+    'default' project so legacy behavior never breaks.
+    """
+    return (await resolve_project_with_source(db, task_id))[0]
 
 
 # --- skills library (#380) --------------------------------------------------

@@ -3591,3 +3591,33 @@ async def test_a_snapshot_with_nothing_left_is_not_called_an_empty_tree(
         str(blank), _snap_git(blank, "rev-parse", "HEAD"), 1 << 20
     )
     assert snap.state == "empty", snap
+
+
+def test_git_env_does_not_force_ssh_identity(monkeypatch, tmp_path):
+    # #1625 AC-1: a forced `-i` outranks the `Host` alias in ~/.ssh/config, so
+    # GitHub sees the first project's deploy key on every private repo.
+    from hub.integrations import proc
+
+    ssh_dir = tmp_path / ".ssh"
+    ssh_dir.mkdir()
+    (ssh_dir / "id_ed25519").write_text("not a real key")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+
+    cmd = proc.git_env()["GIT_SSH_COMMAND"]
+
+    assert "StrictHostKeyChecking=accept-new" in cmd
+    assert " -i " not in f" {cmd} "
+
+
+def test_git_env_keeps_deployment_ssh_command(monkeypatch, tmp_path):
+    # #1625 AC-2: a deployment that declares its own transport keeps it.
+    from hub.integrations import proc
+
+    ssh_dir = tmp_path / ".ssh"
+    ssh_dir.mkdir()
+    (ssh_dir / "id_ed25519").write_text("not a real key")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -F /etc/hub/ssh_config")
+
+    assert proc.git_env()["GIT_SSH_COMMAND"] == "ssh -F /etc/hub/ssh_config"
