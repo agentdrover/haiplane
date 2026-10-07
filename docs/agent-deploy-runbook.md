@@ -394,6 +394,23 @@ pair-ветки от **устаревшего** develop.
 4. Убедиться, что `origin` использует ssh, а не https:
    `sudo -u <RUNTIME_USER> git -C /var/lib/<SERVICE>/workspaces/_default remote set-url origin git@github.com:<REPO_SLUG>.git`
 
+5. Второй и следующие приватные репозитории (#1625): GitHub принимает один
+   deploy key только в одном репозитории, поэтому каждому нужен свой ключ и свой
+   `Host`-алиас с `IdentitiesOnly yes`. Хаб не навязывает ключ через `-i`:
+   без алиаса ssh идёт ключом `~/.ssh/id_ed25519` по умолчанию.
+
+   ```
+   Host github-<проект>
+     HostName github.com
+     User git
+     IdentityFile /home/<RUNTIME_USER>/.ssh/id_<проект>
+     IdentitiesOnly yes
+   ```
+
+   Поле `repo` проекта остаётся `owner/repo`; адрес с алиасом подставляет git:
+   `git config --global url.git@github-<проект>:<owner>/<repo>.insteadOf git@github.com:<owner>/<repo>`.
+   Подмена работает по префиксу, поэтому репозиторий `<repo>-2` попадёт под неё же.
+
 **Проверка (AC-1):**
 
 ```sh
