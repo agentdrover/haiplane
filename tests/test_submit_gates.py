@@ -113,6 +113,7 @@ EXPECTED_SUBMIT_ORDER = (
     "same_sha_from_review_is_current",
     "submission_contract",
     "bug_red_test",
+    "ci_before_submit",
     "resolve_diff",
     "surfaces",
     "finding_outcomes",
@@ -172,6 +173,7 @@ def test_the_network_walking_steps_come_last():
     mutable_gates = (
         "submission_contract",
         "bug_red_test",
+        "ci_before_submit",
         "surfaces",
         "finding_outcomes",
         "submit_rules",
@@ -201,6 +203,7 @@ EXPECTED_HEADLESS_ORDER = (
     "branch_matches",
     "submission_contract",
     "bug_red_test",
+    "ci_before_submit",
     "resolve_diff",
     "surfaces",
     "finding_outcomes",
@@ -245,7 +248,12 @@ def test_the_two_pipelines_are_compared_by_their_lists():
     # нет полей model и mutations; причина записана в самом шаге.
     # #913: bug_red_test объявлен и не выполняется — headless закрепляет
     # коммит последним шагом, baseline о нём сверять не с чем.
-    assert inactive_here == {"branch_matches", "submission_contract", "bug_red_test"}, (
+    assert inactive_here == {
+        "branch_matches",
+        "submission_contract",
+        "bug_red_test",
+        "ci_before_submit",
+    }, (
         "набор неактивных на headless изменился — обновите матрицу решений в "
         "#1122 и скажите об этом в сдаче, а не молча"
     )
@@ -1131,3 +1139,138 @@ async def test_same_sha_from_fix_requested_is_untouched(db: aiosqlite.Connection
         "пересдача того же sha из fix_requested не должна помечаться дублем "
         "ревью — правило действует только из статуса review, #1265 scope_out"
     )
+
+
+# --------------------------------------------------------------------------
+# ci_before_submit (#1629): явная сдача требует доказанного зелёного CI
+# --------------------------------------------------------------------------
+
+
+async def _ci_task(db, slug: str, mode: str | None) -> int:
+    from tests.test_red_test_gate import _running_bug
+
+    task_id = await _running_bug(db, slug, None, work_type="feature")
+    if mode is not None:
+        project_id = dict(await repo.resolve_project_for_task(db, task_id))["id"]
+        await repo.update_project(
+            db, project_id, gate_policy=json.dumps({"ci_before_submit": mode})
+        )
+        await db.commit()
+    return task_id
+
+
+async def _ci_report(client, task_id: int, **body):
+    from tests.test_red_test_gate import _TIP, _post_as_ci
+
+    resp = await _post_as_ci(
+        client, task_id, {"head_sha": _TIP, "ac_results": {}, **body}
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def _nothing_recorded(db, task_id: int, feed_before: int, dispatch) -> None:
+    from tests.test_red_test_gate import _assert_nothing_recorded
+
+    await _assert_nothing_recorded(db, task_id, feed_before, dispatch)
+
+
+async def test_ci_before_submit_require_refuses_without_report(client, db):
+    """AC-1: require без отчёта о закреплённом sha — 422, ничего не записано."""
+    from tests.test_red_test_gate import _TIP, _detail, _feed, _submit
+
+    task_id = await _ci_task(db, "cbs-none", "require")
+    feed_before = len(await _feed(db, task_id))
+    resp, dispatch = await _submit(client, task_id)
+    assert resp.status_code == 422, resp.text
+    detail = _detail(resp)
+    assert detail["reason"] == "ci_before_submit_unproven"
+    assert detail["cause"] == "no_report"
+    assert detail["sha"] == _TIP
+    assert "решает" in detail["hint"] and "владелец" in detail["hint"]
+    await _nothing_recorded(db, task_id, feed_before, dispatch)
+    assert not any(
+        "CI до сдачи" in (u["content"] or "") for u in await _feed(db, task_id)
+    )
+
+
+async def test_ci_before_submit_requires_proven_green(client, db):
+    """AC-2: красная проверка, не-pass валидация, not_found AC — отказ; зелёный — сдача."""
+    from tests.test_red_test_gate import _REF_1, _detail, _feed, _submit
+
+    task_id = await _ci_task(db, "cbs-green", "require")
+    ref_ok = {"ac_results": {"AC-1": "pass", "AC-2": "pass"}}
+
+    await _ci_report(
+        client,
+        task_id,
+        validation_status="pass",
+        checks={"lint": "fail", "t": "pass"},
+        **ref_ok,
+    )
+    feed_before = len(await _feed(db, task_id))
+    resp, dispatch = await _submit(client, task_id)
+    assert resp.status_code == 422, resp.text
+    detail = _detail(resp)
+    assert detail["cause"] == "red"
+    assert any("lint" in v for v in detail["violations"]), detail
+    await _nothing_recorded(db, task_id, feed_before, dispatch)
+
+    await _ci_report(
+        client, task_id, validation_status="skipped", checks={"lint": "pass"}, **ref_ok
+    )
+    resp, dispatch = await _submit(client, task_id)
+    assert resp.status_code == 422, resp.text
+    detail = _detail(resp)
+    assert detail["cause"] == "validation_not_pass"
+    assert "skipped" in " ".join(detail["violations"])
+    await _nothing_recorded(db, task_id, feed_before, dispatch)
+
+    await _ci_report(
+        client,
+        task_id,
+        validation_status="pass",
+        checks={"lint": "pass"},
+        ac_results={"AC-1": "not_found", "AC-2": "pass"},
+    )
+    resp, dispatch = await _submit(client, task_id)
+    assert resp.status_code == 422, resp.text
+    detail = _detail(resp)
+    assert detail["cause"] == "red"
+    assert any("AC-1" in v for v in detail["violations"]), detail
+    assert _REF_1  # nodeid AC-1 известен хабу — иначе отчёт его бы проигнорировал
+    await _nothing_recorded(db, task_id, feed_before, dispatch)
+
+    await _ci_report(
+        client, task_id, validation_status="pass", checks={"lint": "pass"}, **ref_ok
+    )
+    resp, dispatch = await _submit(client, task_id)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["submission_generation"] == 1
+    dispatch.assert_awaited_once()
+
+
+async def test_ci_before_submit_warn_and_off(client, db):
+    """AC-3: warn — принято и ровно один alert; off и без ключа — тишина."""
+    from tests.test_red_test_gate import _feed, _submit
+
+    marker = "CI до сдачи не доказан"
+    warn_id = await _ci_task(db, "cbs-warn", "warn")
+    resp, _ = await _submit(client, warn_id)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["submission_generation"] == 1
+    alerts = [u for u in await _feed(db, warn_id) if marker in (u["content"] or "")]
+    assert len(alerts) == 1 and alerts[0]["kind"] == "alert", alerts
+    assert "режим warn" in alerts[0]["content"]
+
+    # Повтор того же sha из review: поколение то же, второго alert нет.
+    resp, _ = await _submit(client, warn_id)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["submission_generation"] == 1
+    again = [u for u in await _feed(db, warn_id) if marker in (u["content"] or "")]
+    assert len(again) == 1
+
+    for slug, mode in (("cbs-off", "off"), ("cbs-nokey", None)):
+        task_id = await _ci_task(db, slug, mode)
+        resp, _ = await _submit(client, task_id)
+        assert resp.status_code == 200, resp.text
+        assert not any(marker in (u["content"] or "") for u in await _feed(db, task_id))

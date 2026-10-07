@@ -921,6 +921,41 @@ def bug_red_test_unproven_detail(
     )
 
 
+def ci_before_submit_unproven_detail(
+    violations: list[str], *, head_sha: str, cause: str
+) -> dict[str, Any]:
+    """Явная сдача без доказанного зелёного CI в режиме require (#1629).
+
+    Причина в ``cause``: no_report | red | validation_not_pass | malformed.
+    Подсказка не обещает, что push сам запускает CI: у проекта может не быть
+    ни отчётчика CI, ни validation_commands — тогда доказательство недоступно,
+    и это решение владельца, а не повод повторять сдачу.
+    """
+    return enrich_error_payload(
+        {
+            "reason": "ci_before_submit_unproven",
+            "actor_hint": "agent",
+            "retry_by_same_caller": True,
+            "sha": head_sha,
+            "cause": cause,
+            "message": (
+                f"ci_before_submit (require) refused this submission at "
+                f"{(head_sha or '')[:12] or '—'} ({cause}): " + "; ".join(violations)
+            ),
+            "violations": list(violations),
+            "hint": (
+                "Nothing was recorded: no generation, no review ordered, the "
+                f"status did not change. Дождитесь отчёта CI о {head_sha or 'закреплённом коммите'} "
+                "со статусом validation pass и без красных проверок, затем "
+                "повторите сдачу. Если у проекта нет отчётчика CI или "
+                "validation_commands, доказательство недоступно: решает "
+                "владелец (ci_before_submit=warn или off)."
+            ),
+            "suggested_tool": "hub_submit_for_review",
+        }
+    )
+
+
 def claim_area_conflict_detail(
     *, task_id: int, current_status: str, conflict: dict[str, Any]
 ) -> dict[str, Any]:

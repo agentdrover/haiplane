@@ -22,6 +22,7 @@ from hub.actionable_errors import (
     claim_area_conflict_detail,
     submission_contract_violated_detail,
     bug_red_test_unproven_detail,
+    ci_before_submit_unproven_detail,
     changes_requested_requires_content_detail,
     verdict_contradicts_its_text_detail,
     verdict_repeats_previous_detail,
@@ -49,6 +50,7 @@ from hub.services.gate_pipeline import Step, capped_at_warn, policy, run_steps
 from hub.services import (
     prevention_gate,
     project_policy,
+    ci_green_proof,
     red_test_gate,
     submission_contract,
     verdict_text,
@@ -2537,6 +2539,8 @@ class SubmitContext:
     #: недоказанное; пусто — гейт к сдаче не относится.
     red_test_record: str = ""
     red_test_kind: str = ""
+    #: #1629: запись «CI до сдачи не доказан» при warn; пусто — доказан или off.
+    ci_before_alert: str = ""
 
 
 async def _step_task_is_submittable(state: SubmitContext) -> None:
@@ -3035,6 +3039,43 @@ async def _step_bug_red_test(state: SubmitContext) -> None:
     state.red_test_record = red_test_gate.warning_text(found, proofs, baseline)
 
 
+async def _step_ci_before_submit(state: SubmitContext) -> None:
+    """Явная сдача требует доказанного зелёного CI о закреплённом sha (#1629).
+
+    Режим — из политики проекта ``ci_before_submit``. Предикат —
+    ``ci_green_proof.proof_gap`` над отчётом о коммите, который закрепил
+    ``pin_submission_sha``; ``failed_checks`` (#1405) не трогается. Стоит до
+    перехода: отказ при require не создаёт поколения, записи и заказа ревью.
+    Только pair-путь: на headless отказ запрещён решением #1122.
+    """
+    from hub.services.project_policy import (
+        RED_TEST_OFF,
+        RED_TEST_REQUIRE,
+        ci_before_submit_of,
+        gate_policy_for_task,
+    )
+
+    mode = ci_before_submit_of(await gate_policy_for_task(state.db, state.task_id))
+    if mode == RED_TEST_OFF:
+        return
+    sha = state.submission_sha
+    report = await repo.get_ci_run_report(state.db, state.task_id, sha) if sha else None
+    ac_rows = [
+        dict(r) for r in await repo.list_acceptance_criteria(state.db, state.task_id)
+    ]
+    gap = ci_green_proof.proof_gap(dict(report) if report else None, ac_rows, sha)
+    if gap is None:
+        return
+    if mode == RED_TEST_REQUIRE:
+        raise HTTPException(
+            422,
+            detail=ci_before_submit_unproven_detail(
+                gap.violations, head_sha=sha, cause=gap.cause
+            ),
+        )
+    state.ci_before_alert = ci_green_proof.warning_text(sha, gap)
+
+
 async def _step_pin_submission_sha(state: SubmitContext) -> None:
     """Код, который будет судить ревьюер (#572)."""
     # #572: pin the code the reviewer will actually be judging. Resolved by
@@ -3181,6 +3222,8 @@ SUBMIT_STEPS_AFTER_SAME_SHA_CHECK: tuple[Step[SubmitContext], ...] = (
     Step("submission_contract", _step_submission_contract),
     # #913: тоже политика проекта и тоже дешёвое чтение базы — отказ до диффа.
     Step("bug_red_test", _step_bug_red_test),
+    # #1629: тоже политика проекта и чтение базы — отказ до диффа и записей.
+    Step("ci_before_submit", _step_ci_before_submit),
     Step("resolve_diff", _step_resolve_diff, refuses=False),
     Step("surfaces", _step_surfaces, mode=policy("SDD_SURFACES")),
     Step("finding_outcomes", _step_finding_outcomes, mode=policy("FINDING_OUTCOME")),
@@ -3237,6 +3280,14 @@ HEADLESS_STEPS: tuple[Step[SubmitContext], ...] = (
             "headless закрепляет коммит последним шагом, после гейтов: отчёта "
             "CI о нём ещё не с чем сверить, и гейт отвечал бы «нет baseline» "
             "на каждый баг. Включение на этом пути — решение владельца (#913)"
+        ),
+    ),
+    Step(
+        "ci_before_submit",
+        _step_ci_before_submit,
+        inactive_reason=(
+            "done/headless: отказ запрещён решением #1122, а коммит "
+            "закрепляется последним шагом — отчёта CI о нём ещё нет (#1629)"
         ),
     ),
     Step("resolve_diff", _step_resolve_diff, refuses=False),
@@ -3691,6 +3742,12 @@ async def _write_submission_notices(
         # по заголовку, и строка внутри чужого отчёта терялась бы.
         await repo.add_task_update(
             state.db, state.task_id, "hub", "alert", state.contract_alert
+        )
+    if state.ci_before_alert:
+        # #1629: ОДНА запись на принятое поколение; повтор того же sha из
+        # review уходит в no-op до шага и второй не пишет.
+        await repo.add_task_update(
+            state.db, state.task_id, "hub", "alert", state.ci_before_alert
         )
     if state.red_test_record:
         # #913: доказательство (или недоказанное при warn) — одной записью в
