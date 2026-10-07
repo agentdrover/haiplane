@@ -1274,3 +1274,71 @@ async def test_ci_before_submit_warn_and_off(client, db):
         resp, _ = await _submit(client, task_id)
         assert resp.status_code == 200, resp.text
         assert not any(marker in (u["content"] or "") for u in await _feed(db, task_id))
+
+
+async def test_ci_before_submit_missing_ac_result_is_not_proof(client, db):
+    """Codex P2: пустой и частичный ac_results не доказывают зелёный."""
+    from tests.test_red_test_gate import _detail, _feed, _submit
+
+    task_id = await _ci_task(db, "cbs-missing", "require")
+    feed_before = len(await _feed(db, task_id))
+    for results, missing in (({}, {"AC-1", "AC-2"}), ({"AC-1": "pass"}, {"AC-2"})):
+        await _ci_report(
+            client,
+            task_id,
+            validation_status="pass",
+            checks={"lint": "pass"},
+            ac_results=results,
+        )
+        resp, dispatch = await _submit(client, task_id)
+        assert resp.status_code == 422, resp.text
+        detail = _detail(resp)
+        assert detail["cause"] == "red"
+        named = {v.split(" ", 2)[1] for v in detail["violations"]}
+        assert named == missing, detail
+        await _nothing_recorded(db, task_id, feed_before, dispatch)
+        assert not any(
+            "CI до сдачи" in (u["content"] or "") for u in await _feed(db, task_id)
+        )
+
+
+def test_ci_green_proof_predicate_reads_damaged_fields_as_malformed():
+    """Codex P3: повреждённое поле — не «зелёный», а malformed."""
+    from hub.services import ci_green_proof as proof
+
+    rows = [{"ac_id": "AC-1", "verifiable_by": "test", "test_ref": "tests/t.py::t"}]
+    good = {
+        "checks": '{"lint": "pass"}',
+        "ac_results": '{"AC-1": "pass"}',
+        "validation_status": "pass",
+    }
+    assert proof.proof_gap(good, rows, "s" * 40) is None
+    damaged = [
+        {"checks": ""},
+        {"checks": None},
+        {"checks": "[]"},
+        {"checks": "не json"},
+        {"checks": '{"lint": "green"}'},
+        {"checks": '{"lint": {"x": 1}}'},
+        {"ac_results": ""},
+        {"ac_results": '{"AC-1": "ok"}'},
+        {"ac_results": '{"AC-1": {"s": "pass"}}'},
+    ]
+    for patch_ in damaged:
+        gap = proof.proof_gap({**good, **patch_}, rows, "s" * 40)
+        assert gap is not None and gap.cause == proof.MALFORMED, patch_
+    # AC без валидного локатора репортёр не оценивает — отсутствие не мешает.
+    unlocated = [{"ac_id": "AC-9", "verifiable_by": "test", "test_ref": "нет"}]
+    assert proof.proof_gap({**good, "ac_results": "{}"}, unlocated, "s" * 40) is None
+    missing = proof.proof_gap({**good, "ac_results": "{}"}, rows, "s" * 40)
+    assert missing is not None and missing.cause == proof.RED
+
+
+async def test_ci_before_submit_does_not_run_on_the_headless_path(db):
+    """#1122: на done/headless шаг не вызывается и require не отказывает."""
+    task_id = await _ci_task(db, "cbs-headless", "require")
+    task = dict(await repo.get_task(db, task_id))
+    state = await lifecycle.run_headless_submit_gates(db, task)
+    assert state.ci_before_alert == ""
+    step = next(s for s in lifecycle.HEADLESS_STEPS if s.name == "ci_before_submit")
+    assert not step.active

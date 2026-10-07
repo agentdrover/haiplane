@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from hub.services.ac_tests import FAIL as AC_FAIL, NOT_FOUND as AC_NOT_FOUND
-from hub.services.ci_report import CHECK_FAIL
+from hub.services.ci_report import AC_STATUSES, CHECK_FAIL, CHECK_OUTCOMES
+from hub.services.test_locator import parse_test_locator
 from hub.services.validation_run import PASS as VALIDATION_PASS
 
 NO_REPORT = "no_report"
@@ -37,23 +38,48 @@ class Gap:
     violations: list[str] = field(default_factory=list)
 
 
-def _parsed(raw: Any) -> dict[str, Any] | None:
-    try:
-        value = json.loads(raw or "{}")
-    except (TypeError, ValueError):
+def _parsed(raw: Any, allowed: frozenset[str]) -> dict[str, str] | None:
+    """Объект {имя: статус} из словаря репортёра; иначе None.
+
+    Пусто или None — повреждённое поле: колонка по умолчанию хранит ``{}``, и
+    пустая строка значит, что запись не прошла через репортёра. Значение вне
+    словаря (в т.ч. вложенный объект) тоже повреждение, а не «зелёное».
+    """
+    if not isinstance(raw, str) or not raw.strip():
         return None
-    return value if isinstance(value, dict) else None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    if any(not isinstance(v, str) or v.strip() not in allowed for v in value.values()):
+        return None
+    return {str(k): v.strip() for k, v in value.items()}
 
 
 def _red_acs(
-    ac_rows: Iterable[Mapping[str, Any]], ac_results: Mapping[str, Any]
+    ac_rows: Iterable[Mapping[str, Any]], ac_results: Mapping[str, str]
 ) -> list[str]:
-    return [
-        f"{row['ac_id']} ({ac_results[str(row['ac_id'])]})"
-        for row in ac_rows
-        if str(row["verifiable_by"] or "") == "test"
-        and ac_results.get(str(row["ac_id"])) in (AC_FAIL, AC_NOT_FOUND)
-    ]
+    """Тестовые AC с локатором: красные или без результата вовсе.
+
+    Репортёр пишет результат для КАЖДОГО тестового AC с локатором (pass, fail
+    или not_found), поэтому отсутствие результата — недоказанность: AC могли
+    добавить после отчёта о том же sha.
+    """
+    out = []
+    for row in ac_rows:
+        ac_id = str(row["ac_id"])
+        if str(row["verifiable_by"] or "") != "test":
+            continue
+        if parse_test_locator(str(row["test_ref"] or "")) is None:
+            continue
+        status = ac_results.get(ac_id)
+        if status is None:
+            out.append(f"{ac_id} (нет результата в отчёте)")
+        elif status in (AC_FAIL, AC_NOT_FOUND):
+            out.append(f"{ac_id} ({status})")
+    return out
 
 
 def proof_gap(
@@ -62,10 +88,15 @@ def proof_gap(
     """None — зелёный о ``sha`` доказан; иначе Gap с причиной."""
     if report is None or not sha:
         return Gap(NO_REPORT, [f"отчёта CI о коммите {sha[:12] or '—'} нет"])
-    checks = _parsed(report.get("checks"))
-    ac_results = _parsed(report.get("ac_results"))
+    checks = _parsed(report.get("checks"), CHECK_OUTCOMES)
+    ac_results = _parsed(report.get("ac_results"), AC_STATUSES)
     if checks is None or ac_results is None:
-        return Gap(MALFORMED, ["checks или ac_results отчёта не читаются как объект"])
+        return Gap(
+            MALFORMED,
+            [
+                "checks или ac_results отчёта повреждены: не объект или статус вне словаря"
+            ],
+        )
     red = [f"проверка {k}" for k, v in sorted(checks.items()) if v == CHECK_FAIL]
     red += [f"AC {item}" for item in _red_acs(ac_rows, ac_results)]
     if red:
