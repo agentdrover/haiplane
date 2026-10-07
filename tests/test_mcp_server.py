@@ -5629,3 +5629,73 @@ def test_the_published_schema_has_no_generated_titles() -> None:
     assert tool is not None
     assert "title" not in tool.parameters
     assert all("title" not in p for p in tool.parameters["properties"].values())
+
+
+async def _outcome_debt_tool(db, seen: list[str], **kwargs):
+    """Run hub_outcome_debt against the real service behind a recording stub."""
+    from urllib.parse import parse_qs, urlsplit
+    from unittest.mock import AsyncMock, patch
+
+    from hub import mcp_server
+    from hub.services.outcomes import outcome_debt
+
+    async def fake_get(path: str, **_: object):
+        seen.append(path)
+        q = {k: v[0] for k, v in parse_qs(urlsplit(path).query).items()}
+        return await outcome_debt(
+            db,
+            status=q.get("status"),
+            limit=int(q["limit"]) if "limit" in q else None,
+            offset=int(q["offset"]) if "offset" in q else None,
+            only_counts=q.get("only_counts") == "true",
+        )
+
+    with patch.object(mcp_server, "_api_get", AsyncMock(side_effect=fake_get)):
+        result = await mcp_server.hub_outcome_debt(**kwargs)
+    text = "\n".join(b.text for b in result.content if hasattr(b, "text"))
+    return result, text
+
+
+async def test_hub_outcome_debt_defaults_to_counts_and_first_page(db) -> None:
+    """AC-4. No arguments: overdue, 20 rows, counters; text and structured
+    content carry the page only and name "показано 20 из 60" plus the next offset."""
+    from tests.test_outcomes import seed_debt
+
+    await seed_debt(db, overdue=60, observing=2, unknown=1, answered=1)
+    seen: list[str] = []
+
+    result, text = await _outcome_debt_tool(db, seen)
+
+    data = result.structuredContent["outcome_debt"]
+    assert "status=overdue" in seen[0] and "limit=20" in seen[0]
+    assert len(data["rows"]) == 20 and data["total_in_status"] == 60
+    assert data["overdue_total"] == 60 and data["observing_total"] == 2
+    for key in ("items", "overdue", "observing", "unknown", "answered"):
+        assert key not in data
+    assert "показано 20 из 60" in text and "offset=20" in text
+    assert text.count("metric:") == 20, "text rows are bounded by the page"
+
+
+async def test_hub_outcome_debt_never_says_no_debt_from_an_empty_page(db) -> None:
+    """AC-5. "No outcome debt" only when total is zero, never from an empty page."""
+    from tests.test_outcomes import seed_debt
+
+    await seed_debt(db, observing=2, unknown=1)
+    no_debt = "No outcome debt"
+
+    _, counts = await _outcome_debt_tool(db, [], only_counts=True)
+    _, answered = await _outcome_debt_tool(db, [], status="answered")
+    _, no_overdue = await _outcome_debt_tool(db, [])
+
+    for text in (counts, answered, no_overdue):
+        assert no_debt not in text
+        assert "0 overdue, 2 observing, 1 unknown" in text
+    assert "показано 0 из 0" in no_overdue
+
+    from hub import mcp_server  # empty hub: total is zero, the claim is true
+    from unittest.mock import AsyncMock, patch
+
+    empty = {"total": 0, "answered_total": 3, "rows": [], "next_offset": None}
+    with patch.object(mcp_server, "_api_get", AsyncMock(return_value=empty)):
+        result = await mcp_server.hub_outcome_debt()
+    assert no_debt in result.content[0].text

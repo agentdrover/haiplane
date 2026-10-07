@@ -175,13 +175,74 @@ async def outcome_status_for_task(
     return status
 
 
-async def outcome_debt(db: aiosqlite.Connection) -> dict[str, Any]:
+DEBT_STATUSES = ("overdue", "observing", "unknown", "answered")
+DEBT_DEFAULT_LIMIT = 20
+DEBT_MAX_LIMIT = 200
+_DEBT_COUNT_KEYS = (
+    "total",
+    "answered_total",
+    "overdue_total",
+    "observing_total",
+    "unknown_total",
+    "window_days",
+)
+
+
+def _debt_page(
+    full: dict[str, Any], *, status: str, limit: int, offset: int
+) -> dict[str, Any]:
+    """Counters plus one page of one status; the full lists are not carried (#1605)."""
+    rows = full[status]
+    page = rows[offset : offset + limit]
+    end = offset + len(page)
+    return {
+        **{key: full[key] for key in _DEBT_COUNT_KEYS},
+        "status": status,
+        "rows": page,
+        "total_in_status": len(rows),
+        "offset": offset,
+        "limit": limit,
+        "next_offset": end if end < len(rows) else None,
+    }
+
+
+async def outcome_debt(
+    db: aiosqlite.Connection,
+    *,
+    status: str | None = None,
+    limit: int | None = None,
+    offset: int | None = None,
+    only_counts: bool = False,
+) -> dict[str, Any]:
     """Completed tasks whose stated outcome has never been answered.
 
     ``outcome_deadline`` is returned verbatim and never parsed: it is free text
     holding event descriptions rather than dates, so it is something a human
     reads, not something this list filters on.
+
+    No parameters: the full payload, as before. Any parameter (#1605): counters
+    only (``only_counts``) or counters plus one page of one status, ``overdue``
+    unless ``status`` says otherwise; the full lists are not carried.
     """
+    full = await _full_outcome_debt(db)
+    if status is None and limit is None and offset is None and not only_counts:
+        return full
+    if status is not None and status not in DEBT_STATUSES:
+        raise ValueError(f"status must be one of {', '.join(DEBT_STATUSES)}")
+    page_limit = DEBT_DEFAULT_LIMIT if limit is None else limit
+    page_offset = 0 if offset is None else offset
+    if not 1 <= page_limit <= DEBT_MAX_LIMIT:
+        raise ValueError(f"limit must be between 1 and {DEBT_MAX_LIMIT}")
+    if page_offset < 0:
+        raise ValueError("offset must not be negative")
+    if only_counts:
+        return {key: full[key] for key in _DEBT_COUNT_KEYS}
+    return _debt_page(
+        full, status=status or "overdue", limit=page_limit, offset=page_offset
+    )
+
+
+async def _full_outcome_debt(db: aiosqlite.Connection) -> dict[str, Any]:
     rows = await repository.list_outcome_debt(db)
     answers = await _answers_by_task(db)
     items: list[dict[str, Any]] = []

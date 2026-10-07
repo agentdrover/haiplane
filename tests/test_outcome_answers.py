@@ -180,13 +180,18 @@ async def test_rest_cli_and_mcp_report_the_same_answers(
     task_id = await _completed_with_metric(db, "Three surfaces")
     await _answer(client, task_id, verdict="unmeasurable", measured_value="нечем")
     payload = await _debt(client)
+    answered_page = (
+        await client.get("/api/metrics/outcome-debt?status=answered")
+    ).json()
 
     with patch.object(cli, "_api", MagicMock(return_value=payload)):
         cli.cmd_outcome_debt(argparse.Namespace())
     cli_output = capsys.readouterr().out
 
-    with patch.object(mcp_server, "_api_get", AsyncMock(return_value=payload)):
-        mcp_result = await _call_mcp(mcp_server.hub_outcome_debt)
+    # The MCP default is one page of overdue; the answered rows are a status
+    # of their own (#1605), so the tool is asked for them.
+    with patch.object(mcp_server, "_api_get", AsyncMock(return_value=answered_page)):
+        mcp_result = await mcp_server.hub_outcome_debt(status="answered")
     mcp_text = "\n".join(
         block.text for block in mcp_result.content if hasattr(block, "text")
     )
@@ -194,7 +199,7 @@ async def test_rest_cli_and_mcp_report_the_same_answers(
     assert payload["answered"][0]["latest_answer"]["verdict"] == "unmeasurable"
     assert "unmeasurable" in cli_output and "нечем" in cli_output
     assert "unmeasurable" in mcp_text and "нечем" in mcp_text
-    assert mcp_result.structuredContent["outcome_debt"] == payload
+    assert mcp_result.structuredContent["outcome_debt"] == answered_page
 
 
 async def test_migration_adds_the_table_without_touching_tasks(

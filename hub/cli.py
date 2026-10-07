@@ -452,7 +452,16 @@ def cmd_projects_list(args: argparse.Namespace) -> int:
 
 def cmd_outcome_debt(args: argparse.Namespace) -> int:
     """Outcome promises and the answers to them (#766, #819)."""
-    result = _api("GET", "/api/metrics/outcome-debt")
+    params: dict[str, Any] = {}
+    if getattr(args, "status", None):
+        params["status"] = args.status
+    for name in ("limit", "offset"):
+        if getattr(args, name, None) is not None:
+            params[name] = getattr(args, name)
+    if getattr(args, "only_counts", False):
+        params["only_counts"] = "true"
+    query = f"?{urllib.parse.urlencode(params)}" if params else ""
+    result = _api("GET", f"/api/metrics/outcome-debt{query}")
     _print_json(result)
     return 0
 
@@ -1991,6 +2000,29 @@ def _add_subtasks_bulk_parser(sub: Any) -> None:
     p_subtasks_bulk.set_defaults(func=cmd_subtasks_bulk)
 
 
+def _add_outcome_debt_parser(sub: Any) -> None:
+    """``outcome-debt`` and its page flags (#1605)."""
+    p_outcomes = sub.add_parser(
+        "outcome-debt",
+        help="Outcome promises and the answers to them (#766, #819)",
+    )
+    p_outcomes.add_argument(
+        "--status",
+        choices=["overdue", "observing", "unknown", "answered"],
+        default=None,
+        help="One status page instead of the full payload (#1605)",
+    )
+    p_outcomes.add_argument("--limit", type=int, default=None, help="Page size 1-200")
+    p_outcomes.add_argument("--offset", type=int, default=None, help="Page start")
+    p_outcomes.add_argument(
+        "--only-counts",
+        dest="only_counts",
+        action="store_true",
+        help="Counters only, no rows",
+    )
+    p_outcomes.set_defaults(func=cmd_outcome_debt)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hp-hub", description="CLI for Haiplane Hub")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2192,11 +2224,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_pair_start.set_defaults(func=cmd_pair_start)
 
-    p_outcomes = sub.add_parser(
-        "outcome-debt",
-        help="Outcome promises and the answers to them (#766, #819)",
-    )
-    p_outcomes.set_defaults(func=cmd_outcome_debt)
+    _add_outcome_debt_parser(sub)
 
     p_economy = sub.add_parser(
         "review-economy",

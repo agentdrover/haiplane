@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import aiosqlite
+import pytest
 
 from hub import repository as repo
 from hub.services.outcomes import outcome_debt
+from tests.test_outcome_status import _completed_task, _fix_release
 
 
 async def _task(
@@ -146,3 +148,124 @@ async def test_outcome_debt_marks_assumed_due(db: aiosqlite.Connection):
 
     assert item["due_on"] == (datetime.now(UTC) + timedelta(days=11)).date().isoformat()
     assert item["due_assumed"] is True
+
+
+_FULL_KEYS = {"items", "answered", "overdue", "observing", "unknown"}
+_COUNT_KEYS = {
+    "total",
+    "answered_total",
+    "overdue_total",
+    "observing_total",
+    "unknown_total",
+    "window_days",
+}
+
+
+async def seed_debt(
+    db: aiosqlite.Connection,
+    *,
+    overdue: int = 0,
+    observing: int = 0,
+    unknown: int = 0,
+    answered: int = 0,
+) -> None:
+    """Completed tasks in each debt state (#1605): a fix released 20 days ago is
+    overdue, 3 days ago observing, never released unknown."""
+    n = 0
+
+    async def _one(kind: str, days_ago: float | None) -> int:
+        nonlocal n
+        n += 1
+        task_id = await _completed_task(db, title=f"{kind} {n}", metric="a number")
+        if days_ago is not None:
+            await _fix_release(db, task_id, days_ago=days_ago, sha=f"{n:040x}")
+        return task_id
+
+    for _ in range(overdue):
+        await _one("overdue", 20)
+    for _ in range(observing):
+        await _one("observing", 3)
+    for _ in range(unknown):
+        await _one("unknown", None)
+    for _ in range(answered):
+        task_id = await _one("answered", None)
+        await repo.record_outcome_answer(
+            db, task_id=task_id, verdict="moved", measured_value="0 -> 5"
+        )
+    await db.commit()
+
+
+async def test_outcome_debt_without_params_keeps_full_contract(
+    db: aiosqlite.Connection,
+):
+    """AC-1. No parameters: the full payload, every list and counter in place."""
+    await seed_debt(db, overdue=3, observing=2, unknown=2, answered=1)
+
+    result = await outcome_debt(db)
+
+    assert _FULL_KEYS <= set(result) and _COUNT_KEYS <= set(result)
+    assert (len(result["overdue"]), len(result["observing"])) == (3, 2)
+    assert (len(result["unknown"]), len(result["answered"])) == (2, 1)
+    assert len(result["items"]) == 7 == result["total"]
+    assert result["answered_total"] == 1
+    assert "rows" not in result
+
+
+async def test_outcome_debt_only_counts_has_no_rows(db: aiosqlite.Connection):
+    """AC-3. only_counts: counters and window_days, no rows and no lists."""
+    await seed_debt(db, overdue=3, observing=1, unknown=1, answered=1)
+
+    result = await outcome_debt(db, only_counts=True)
+
+    assert set(result) == _COUNT_KEYS
+    assert result["overdue_total"] == 3 and result["total"] == 5
+
+
+async def test_outcome_debt_pages_one_status_in_full_order(
+    db: aiosqlite.Connection,
+):
+    """AC-2 (service). A page is a slice of the full list; counters stay full."""
+    await seed_debt(db, overdue=45, observing=2, unknown=1, answered=1)
+    full = await outcome_debt(db)
+
+    first = await outcome_debt(db, status="overdue", limit=20)
+    second = await outcome_debt(db, status="overdue", limit=20, offset=20)
+    last = await outcome_debt(db, status="overdue", limit=20, offset=40)
+
+    assert first["rows"] == full["overdue"][:20] and first["next_offset"] == 20
+    assert second["rows"] == full["overdue"][20:40]
+    assert (second["total_in_status"], second["next_offset"]) == (45, 40)
+    assert len(last["rows"]) == 5 and last["next_offset"] is None
+    assert second["overdue_total"] == 45 and second["observing_total"] == 2
+    assert not _FULL_KEYS & set(second)
+
+
+async def test_outcome_debt_filters_each_status(db: aiosqlite.Connection):
+    await seed_debt(db, overdue=2, observing=3, unknown=1, answered=4)
+
+    sizes = {
+        status: (await outcome_debt(db, status=status))["total_in_status"]
+        for status in ("overdue", "observing", "unknown", "answered")
+    }
+    answered = await outcome_debt(db, status="answered")
+
+    assert sizes == {"overdue": 2, "observing": 3, "unknown": 1, "answered": 4}
+    assert all("latest_answer" in row for row in answered["rows"])
+
+
+async def test_outcome_debt_limit_alone_pages_overdue(db: aiosqlite.Connection):
+    await seed_debt(db, overdue=3, observing=3)
+
+    result = await outcome_debt(db, limit=2)
+
+    assert result["status"] == "overdue" and len(result["rows"]) == 2
+    assert result["limit"] == 2 and result["offset"] == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"limit": 0}, {"limit": 201}, {"offset": -1}, {"status": "nope"}],
+)
+async def test_outcome_debt_rejects_bad_paging(db: aiosqlite.Connection, kwargs: dict):
+    with pytest.raises(ValueError):
+        await outcome_debt(db, **kwargs)
