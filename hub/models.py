@@ -358,6 +358,9 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #913: гейт красного теста для work_type=bug. Не делегирует. Читатель:
     # project_policy.bug_red_test_of.
     "bug_red_test",
+    # #1629: гейт «CI до сдачи» (off|warn|require). Не делегирует. Читатель:
+    # project_policy.ci_before_submit_of.
+    "ci_before_submit",
     # #1456: проверка путей постановки (validation_commands, test_ref) на
     # существование. Не гейт, не делегирует. Читатель:
     # project_policy.statement_paths_of.
@@ -714,6 +717,20 @@ def _validate_bug_red_test(policy: dict[str, Any]) -> None:
         raise ValueError(
             "gate_policy bug_red_test must be one of "
             f"{', '.join(BUG_RED_TEST_MODES)}, got: {policy['bug_red_test']!r}"
+        )
+
+
+def _validate_ci_before_submit(policy: dict[str, Any]) -> None:
+    """Refuse a CI-before-submit mode the reader would read as warn by accident (#1629)."""
+    from hub.services.project_policy import CI_BEFORE_SUBMIT_MODES
+
+    if (
+        "ci_before_submit" in policy
+        and policy["ci_before_submit"] not in CI_BEFORE_SUBMIT_MODES
+    ):
+        raise ValueError(
+            "gate_policy ci_before_submit must be one of "
+            f"{', '.join(CI_BEFORE_SUBMIT_MODES)}, got: {policy['ci_before_submit']!r}"
         )
 
 
@@ -3105,6 +3122,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_orchestrator_queue(v)
     _validate_submission_contract(v)
     _validate_bug_red_test(v)
+    _validate_ci_before_submit(v)
     _validate_claim_area_check(v)
     _validate_statement_paths(v)
     _validate_deep_reviewer(v)

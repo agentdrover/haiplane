@@ -703,6 +703,28 @@ def bug_red_test_of(policy: dict) -> str:
     return RED_TEST_WARN
 
 
+# Гейт «CI до сдачи» (#1629): явная сдача без доказанного зелёного отчёта CI о
+# закреплённом коммите. ``warn`` — сдача принята, недоказанное названо одной
+# записью; ``require`` — отказ до записи поколения. Нет ключа — ``off``.
+# Нечитаемое значение — ``warn``, по тому же правилу, что bug_red_test.
+CI_BEFORE_SUBMIT_KEY = "ci_before_submit"
+CI_BEFORE_SUBMIT_MODES: tuple[str, ...] = (
+    RED_TEST_OFF,
+    RED_TEST_WARN,
+    RED_TEST_REQUIRE,
+)
+
+
+def ci_before_submit_of(policy: dict) -> str:
+    """Режим гейта CI до сдачи: нет ключа — off, нечитаемое значение — warn."""
+    if not isinstance(policy, dict) or CI_BEFORE_SUBMIT_KEY not in policy:
+        return RED_TEST_OFF
+    value = policy.get(CI_BEFORE_SUBMIT_KEY)
+    if isinstance(value, str) and value in CI_BEFORE_SUBMIT_MODES:
+        return value
+    return RED_TEST_WARN
+
+
 # Кто читает deep первым (#1561). ``cloud`` — как всегда: облако первым,
 # локальный путь только второй дверью после наблюдённого отказа (#1252).
 # ``local`` — deep сначала в локальный путь, облако только после его отказа.
