@@ -1373,8 +1373,8 @@ async def test_approval_decides_freeze_under_the_write_lock(
     tid = await _ready_draft(client, db, pid, work_type="bug", rationale="сбой")
     real = recommendations.calculate_readiness_with_recommendations
 
-    async def calc_then_refine(conn, task_id):
-        report = await real(conn, task_id)
+    async def calc_then_refine(conn, task_id, **kw):
+        report = await real(conn, task_id, **kw)
         resp = await client.post(
             f"/api/tasks/{task_id}/refine",
             json={"work_type": "feature", "freeze_rationale": ""},
@@ -1741,3 +1741,95 @@ async def test_unexpected_error_after_begin_releases_the_write_lock(
         )
     assert not db.in_transaction
     assert await writer_gets_through()
+
+
+async def test_a_nested_approval_refuses_a_changed_snapshot_without_retry(
+    client: AsyncClient, db, monkeypatch
+):
+    # AC-4 (#1610): внутри транзакции вызывающего расхождение снимка - 409 без
+    # повтора; откатывается только работа approve (SAVEPOINT), чужие правки
+    # вызывающего целы и коммитятся им.
+    from fastapi import HTTPException
+
+    from hub import repository as repo
+    from hub.models import TaskApprove
+    from hub.services import lifecycle, recommendations
+    from tests.test_auto_approve import _project
+
+    pid = await _project(db, "nested-race", {})
+    tid = await _ready_draft(client, db, pid, work_type="bug", rationale="сбой")
+    real = recommendations.calculate_readiness_with_recommendations
+    calls: list[int] = []
+
+    async def calc_then_change(conn, task_id, **kw):
+        report = await real(conn, task_id, **kw)
+        calls.append(task_id)
+        # то же соединение: транзакция вызывающего видит свою правку
+        await conn.execute(
+            "UPDATE tasks SET business_value='changed' WHERE id=?", (task_id,)
+        )
+        return report
+
+    monkeypatch.setattr(
+        recommendations, "calculate_readiness_with_recommendations", calc_then_change
+    )
+    await db.execute("BEGIN IMMEDIATE")
+    await db.execute("UPDATE projects SET name='mine' WHERE id=?", (pid,))
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.approve_task(db, tid, TaskApprove(force=True))
+    assert refused.value.status_code == 409
+    assert refused.value.detail["error"] == "statement_changed_during_approval"
+    assert len(calls) == 1, "внутри чужой транзакции повтора нет"
+    assert db.in_transaction, "транзакция вызывающего цела"
+    assert await _project_name(db, pid) == "mine"
+    notes = await repo.get_task_updates(db, tid)
+    assert not [n for n in notes if n["kind"] == "alert"]
+    await db.commit()
+    assert await _project_name(db, pid) == "mine"
+    assert await _status(client, tid) == "draft"
+
+
+async def test_a_successful_nested_approval_leaves_the_commit_to_the_caller(
+    client: AsyncClient, db
+):
+    # AC-6 (#1610): успешный approve внутри транзакции вызывающего не
+    # коммитит её, в том числе записью activity.
+    from hub import repository as repo
+    from hub.models import TaskApprove
+    from hub.services import lifecycle
+    from tests.test_auto_approve import _project
+
+    pid = await _project(db, "nested-ok", {})
+    tid = await _ready_draft(client, db, pid, work_type="bug", rationale="сбой")
+    before = len(await repo.get_task_updates(db, tid))
+
+    await db.execute("BEGIN IMMEDIATE")
+    await db.execute("UPDATE projects SET name='changed' WHERE id=?", (pid,))
+    approved = await lifecycle.approve_task(db, tid)
+    assert approved.status.value == "open"
+    assert db.in_transaction, "approve не закоммитил чужую транзакцию"
+    await db.rollback()
+
+    assert await _project_name(db, pid) == "Nested-Ok"
+    assert await _status(client, tid) == "draft"
+    assert len(await repo.get_task_updates(db, tid)) == before
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM activity_log WHERE kind='task_approved'"
+    )
+    assert rows[0][0] == 0, "запись activity откатилась вместе с вызывающим"
+
+    # run=True внутри чужой транзакции: запуск коммитит сам - отказ до записей,
+    # после rollback вызывающего всё откатано (P1 #1610)
+    await db.execute("BEGIN IMMEDIATE")
+    await db.execute("UPDATE projects SET name='changed' WHERE id=?", (pid,))
+    with pytest.raises(ValueError):
+        await lifecycle.approve_task(db, tid, TaskApprove(force=True, run=True))
+    assert db.in_transaction
+    await db.rollback()
+    assert await _project_name(db, pid) == "Nested-Ok"
+    assert await _status(client, tid) == "draft"
+    assert len(await repo.get_task_updates(db, tid)) == before
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM activity_log WHERE kind='task_approved'"
+    )
+    assert rows[0][0] == 0
