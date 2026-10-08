@@ -1593,3 +1593,78 @@ async def test_reviewer_brief_without_active_harness_names_the_gap(hub):
         assert harness["version"] is None, setup
         assert harness["reason"], setup
         assert "DRAFT-TEXT" not in brief.text, "draft не подставляется"
+
+
+# ---------------------------------------------------------------------------
+# #1643 hub_my_context у implementer: блок «что дальше» приходит из /context
+# ---------------------------------------------------------------------------
+
+
+def _session_api_get(hub, session: dict[str, str], calls: list[str]):
+    """_api_get как у облачного исполнителя: реальные запросы с его токеном."""
+    from hub.mcp_server import HubApiError
+
+    async def _get(path: str, **_: object):
+        calls.append(path)
+        resp = await hub.client.get(path, headers=session)
+        if resp.status_code >= 400:
+            raise HubApiError({"message": f"HTTP {resp.status_code}", **resp.json()})
+        return resp.json()
+
+    return _get
+
+
+async def _epic_with_queue(hub) -> tuple[int, int, int, int]:
+    """Эпик проекта: цепочка first → second и своя задача сессии (mine).
+
+    mine ниже по priority, поэтому «следующая» — first. Читать контекст mine
+    нельзя заменять чтением first: get_readiness пересчитывает DoR прочитанной
+    задачи, а у задач-заглушек он проставлен руками.
+    """
+    from tests.test_project_path import _dep, _epic, _project, _task
+
+    pid = await _project(hub.db, "cp1643")
+    epic = await _epic(hub.db, pid)
+    first = await _task(hub.db, pid, "first", parent=epic, size="M")
+    second = await _task(hub.db, pid, "second", parent=epic, size="S")
+    await _dep(hub.db, second, first)
+    mine = await _task(hub.db, pid, "mine", parent=epic, size="XS", priority="low")
+    return epic, first, second, mine
+
+
+@pytest.mark.asyncio
+async def test_implementer_context_has_the_path_block_without_calling_path(
+    hub, monkeypatch
+):
+    """AC-1 (#1643): implementer получает следующую задачу и критический путь
+    в hub_my_context(mode=full); к закрытому /path запросов нет, строки
+    «не прочитан» нет."""
+    from hub import mcp_server
+
+    _epic_id, first, second, mine = await _epic_with_queue(hub)
+    session = await _implementer_session(hub, mine)
+    calls: list[str] = []
+    monkeypatch.setattr(mcp_server, "_api_get", _session_api_get(hub, session, calls))
+
+    out = await mcp_server.hub_my_context(task_id=mine, mode="full")
+    text = json.loads(out.content[0].text)["message"]
+
+    assert f"Next task: #{first}" in text
+    assert f"#{first} → #{second}" in text
+    assert "не прочитан" not in text
+    assert not [c for c in calls if "/path" in c], calls
+
+
+@pytest.mark.asyncio
+async def test_implementer_still_cannot_read_path_or_foreign_context(hub):
+    """AC-2 (#1643): allowlist не расширен — прямой /path и /context чужой
+    задачи по-прежнему 403."""
+    _epic_id, first, second, mine = await _epic_with_queue(hub)
+    session = await _implementer_session(hub, mine)
+
+    path = await hub.client.get("/api/projects/cp1643/path", headers=session)
+    assert path.status_code == 403, path.text
+    foreign = await hub.client.get(f"/api/tasks/{second}/context", headers=session)
+    assert foreign.status_code == 403, foreign.text
+    own = await hub.client.get(f"/api/tasks/{mine}/context", headers=session)
+    assert own.status_code == 200, own.text
