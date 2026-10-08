@@ -391,3 +391,50 @@ def _clean_in_prod_cache():
     cache = getattr(ds, "_in_prod_cache", None)
     if cache is not None:
         cache.clear()
+
+
+@pytest.fixture
+async def ci_runner_hub(client, db, monkeypatch):
+    """Closed auth mode with REAL DB principals (#1639).
+
+    ``ci``: kind=service, one role ``ci_runner``, a DB API key. ``human``: an
+    operator with a key. Open mode and substituted identities replace the
+    caller, which is exactly what hid this defect: the identity must come out
+    of ``admin.get_effective_role`` through the DB resolver.
+    """
+    from types import SimpleNamespace
+
+    from hub.services import admin as admin_svc
+
+    # Auth is on only when some token exists: an empty map means open mode.
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {"unused-env-token": config.TokenIdentity("env-x", "agent")},
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.delenv("HAIPLANE_HUB_TOKEN", raising=False)
+    human = await admin_svc.create_principal(
+        db, kind="human", username="alice-1639", role_slug="operator"
+    )
+    human_key = await admin_svc.create_api_key(db, human["id"], name="laptop")
+    ci = await admin_svc.create_principal(
+        db, kind="service", username="ci-1639", role_slug="ci_runner"
+    )
+    ci_key = await admin_svc.create_api_key(db, ci["id"], name="ci")
+    ci_session = await admin_svc.create_browser_session(db, ci["id"])
+    await db.commit()
+    return SimpleNamespace(
+        client=client,
+        db=db,
+        # A real browser session of the CI principal: the cookie door resolves
+        # through resolve_browser_session, a second DB resolver that Bearer
+        # tests never touch.
+        ci_cookie={"Cookie": f"{config.HUB_COOKIE_NAME}={ci_session}"},
+        human_principal=human,
+        ci_principal=ci,
+        human={"Authorization": f"Bearer {human_key['plaintext_key']}"},
+        ci={"Authorization": f"Bearer {ci_key['plaintext_key']}"},
+        ci_token=ci_key["plaintext_key"],
+        human_token=human_key["plaintext_key"],
+    )
