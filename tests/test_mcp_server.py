@@ -5737,3 +5737,44 @@ async def test_hub_outcome_debt_no_hint_when_there_is_no_debt(db) -> None:
         result = await mcp_server.hub_outcome_debt()
 
     assert "REST GET" not in result.content[0].text
+
+
+async def test_submit_for_review_shows_ci_before_submit_refusal(
+    mock_api_get: AsyncMock, mock_api_post: AsyncMock, capsys
+) -> None:
+    """AC-5 (#1629): MCP и CLI показывают причину и подсказку отказа."""
+    from hub import cli
+    from hub.actionable_errors import ci_before_submit_unproven_detail
+
+    detail = ci_before_submit_unproven_detail(
+        ["отчёта CI о коммите abc нет"], head_sha="abc", cause="no_report"
+    )
+    mock_api_get.return_value = {"id": 42, "status": "running"}
+    mock_api_post.side_effect = HubApiError(detail)
+    out = json.loads(await hub_submit_for_review(42, model="m", summary="s"))
+    assert out["reason"] == "ci_before_submit_unproven"
+    assert out["cause"] == "no_report"
+    assert out["hint"]
+
+    import io
+    import sys
+    import urllib.error
+    from unittest.mock import MagicMock
+
+    boom = urllib.error.HTTPError(
+        "http://hub/api/tasks/42/submit-review",
+        422,
+        "Unprocessable",
+        MagicMock(),
+        io.BytesIO(json.dumps({"detail": detail}).encode()),
+    )
+    with (
+        patch.object(sys, "argv", ["oc-hub", "submit-review", "42"]),
+        patch("urllib.request.urlopen", side_effect=boom),
+        pytest.raises(SystemExit) as exit_info,
+    ):
+        cli.main()
+    assert exit_info.value.code not in (0, None)
+    err = capsys.readouterr().err
+    assert "reason: ci_before_submit_unproven" in err
+    assert "Дождитесь отчёта CI" in err

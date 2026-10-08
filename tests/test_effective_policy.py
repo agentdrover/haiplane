@@ -1137,3 +1137,34 @@ async def test_summary_names_partial_lock_and_counts_actual_steward_verdicts(
     text = "\n".join(effective_policy.format_effective_policy(data))
     assert "verdict=steward" in text and "06.10.2026" in text
     assert "Steward verdicts: 2" in text
+
+
+async def test_ci_before_submit_is_registered_and_validated(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-4 (#1629): три режима приняты и видны в сводке, чужое значение — 422."""
+    from hub.services import lifecycle
+
+    pid = await _project(db, "cbs-policy", {})
+    for mode in ("require", "warn", "off"):
+        ok = await _patch_policy(client, pid, {"ci_before_submit": mode})
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["gate_policy"]["ci_before_submit"] == mode
+        row = _by_key(
+            (await client.get("/api/projects/cbs-policy/effective-policy")).json()
+        )["ci_before_submit"]
+        assert row["value"] == mode and row["source"] == "project"
+        assert row["reader"] == "project_policy.ci_before_submit_of"
+    bad = await _patch_policy(client, pid, {"ci_before_submit": "maybe"})
+    assert bad.status_code == 422, bad.text
+
+    step = next(s for s in lifecycle.HEADLESS_STEPS if s.name == "ci_before_submit")
+    assert not step.active and "#1122" in step.inactive_reason
+
+
+def test_ci_before_submit_reader_modes():
+    from hub.services.project_policy import ci_before_submit_of
+
+    assert ci_before_submit_of({}) == "off"
+    assert ci_before_submit_of({"ci_before_submit": "require"}) == "require"
+    assert ci_before_submit_of({"ci_before_submit": "requier"}) == "warn"

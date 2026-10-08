@@ -119,6 +119,9 @@ def _print_http_error(code: int, body_text: str) -> None:
     if isinstance(detail, dict) and detail.get("reason") == "bug_red_test_unproven":
         _print_red_test_refusal(code, detail)
         return
+    if isinstance(detail, dict) and detail.get("reason") == "ci_before_submit_unproven":
+        _print_ci_before_submit_refusal(code, detail)
+        return
 
     print(f"HTTP {code}: {body_text}", file=sys.stderr)
 
@@ -126,6 +129,20 @@ def _print_http_error(code: int, body_text: str) -> None:
 def _print_red_test_refusal(code: int, detail: dict[str, Any]) -> None:
     """Отказ гейта красного теста (#913): причина по каждому AC строкой."""
     print(f"HTTP {code}: {detail.get('message', '')}", file=sys.stderr)
+    for line in detail.get("violations") or []:
+        print(f"  - {line}", file=sys.stderr)
+    if detail.get("hint"):
+        print(f"  Hint: {detail['hint']}", file=sys.stderr)
+
+
+def _print_ci_before_submit_refusal(code: int, detail: dict[str, Any]) -> None:
+    """Отказ гейта «CI до сдачи» (#1629): причина, перечень и что делать."""
+    print(f"HTTP {code}: {detail.get('message', '')}", file=sys.stderr)
+    print(
+        f"  reason: {detail.get('reason')} (cause: {detail.get('cause')}, "
+        f"sha: {detail.get('sha')})",
+        file=sys.stderr,
+    )
     for line in detail.get("violations") or []:
         print(f"  - {line}", file=sys.stderr)
     if detail.get("hint"):

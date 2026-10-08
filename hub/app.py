@@ -2183,6 +2183,24 @@ async def api_task_context(
     )
     if missing_required:
         lines.append(f"  Missing required: {', '.join(missing_required)}")
+    # #1630: «Правила работы» — тот же блок, что в pair-start. Чтение файла
+    # правил ничего не пишет; в summary тексты слоёв опущены.
+    from hub.services import working_rules as working_rules_service
+
+    working_rules = await working_rules_service.build_working_rules(
+        db, task_id, summary=mode == "summary"
+    )
+    rules_text = working_rules_service.render_working_rules(
+        working_rules,
+        full_pointer=f'hub_my_context(task_id={task_id}, mode="full")',
+    )
+    if mode == "summary":
+        # Сводка стоит в начале: потолок режет хвост, и место под правила
+        # занято до сокращения остального контекста.
+        lines.insert(2, rules_text)
+    else:
+        lines.append("")
+        lines.append(rules_text)
     if mode == "full":
         lines.append("")
         lines.extend(lifecycle_map_lines())
@@ -2205,6 +2223,7 @@ async def api_task_context(
         "task": task_view,
         "readiness": readiness_summary,
         "parent_goal": parent_goal,
+        "working_rules": working_rules,
     }
 
 

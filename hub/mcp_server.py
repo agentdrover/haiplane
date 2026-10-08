@@ -2158,16 +2158,40 @@ async def hub_my_context(
     text = ctx.get("context_text", f"Context for task #{task_id} not available.")
     text += await _policy_brief_text(ctx)
     text += await _path_brief_text(ctx)
+    extra: dict[str, Any] = {}
+    rules = ctx.get("working_rules")
+    if rules and rules.get("mode") == "summary":
+        # #1630: сводка правил живёт отдельным полем вне "context": его нет
+        # в _CONTEXT_DROP_ORDER, она мала и остаётся в обоих представлениях.
+        from hub.models import WorkingRules
+        from hub.services import working_rules as wr_service
+
+        try:
+            extra["working_rules_summary"] = wr_service.compact_summary(
+                WorkingRules.model_validate(rules)
+            )
+            ctx = {k: v for k, v in ctx.items() if k != "working_rules"}
+        except ValueError:
+            pass
     return fit_echo_result(
         text,
         _context_char_budget(max_chars, mode),
         drop_order=_CONTEXT_DROP_ORDER,
         context=ctx,
+        **extra,
     )
 
 
 async def _policy_brief_text(ctx: dict[str, Any]) -> str:
     """Блок «политика проекта» для контекста задачи (#1457); best effort."""
+    layer = (ctx.get("working_rules") or {}).get("project_policy")
+    if layer is not None:
+        # #1630: политика уже пришла в блоке — второй запрос не нужен, а
+        # сессии implementer маршрут /effective-policy закрыт.
+        # В mode=full она уже есть в разделе context_text.
+        text = layer.get("text") or ""
+        in_summary = (ctx.get("working_rules") or {}).get("mode") == "summary"
+        return f"\n\n{text}" if text and in_summary else ""
     slug = ((ctx.get("task") or {}).get("project") or {}).get("slug") or ""
     return await _policy_brief_for_slug(slug)
 
@@ -2333,6 +2357,31 @@ def _worktree_hint_note(result: dict[str, Any] | None) -> str:
     return f"\nWorktree: {hint}" if hint else ""
 
 
+def _working_rules_note(task_id: int, result: dict[str, Any] | None) -> str:
+    """«Правила работы» из ответа pair-start, в пределах потолков (#1630).
+
+    Навык — до 6000 знаков, файл репозитория — до 4000 с пометкой усечения и
+    указателем на hub_my_context(mode="full"). Слой репозитория остаётся
+    данными: маркеры и экранирование — в render_working_rules.
+    """
+    raw = (result or {}).get("working_rules")
+    if not raw:
+        return ""
+    from hub.models import WorkingRules
+    from hub.services import working_rules as wr_service
+
+    try:
+        block = WorkingRules.model_validate(raw)
+    except ValueError:
+        return ""
+    return "\n\n" + wr_service.render_working_rules(
+        block,
+        skill_cap=wr_service.MCP_SKILL_CAP,
+        repo_cap=wr_service.MCP_REPO_CAP,
+        full_pointer=f'hub_my_context(task_id={task_id}, mode="full")',
+    )
+
+
 @mcp.tool()
 async def hub_pair_start(
     task_id: int,
@@ -2422,6 +2471,7 @@ async def hub_pair_start(
             "name locally — submit_for_review compares what you report against "
             "it and refuses a mismatch."
         )
+    message += _working_rules_note(task_id, result)
     return await _task_mutation_response(
         task_id,
         message,
