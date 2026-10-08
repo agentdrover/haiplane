@@ -58,6 +58,46 @@ NOOP_FORGE = "noop"
 _TIMEOUT_RC = proc.TIMEOUT_RC
 
 
+#: Прочитанные present-файлы по (клон, sha коммита, путь, потолок): sha
+#: неизменяем, поэтому запись не стареет; missing/unreadable не кэшируются.
+_BASE_FILE_CACHE: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+
+
+def _unreadable_file(ref: str, path: str, reason: str) -> dict[str, Any]:
+    return {
+        "state": "unreadable",
+        "path": path,
+        "ref": ref,
+        "sha": "",
+        "content": "",
+        "truncated": False,
+        "size": 0,
+        "chars": 0,
+        "reason": reason,
+    }
+
+
+async def _blob_prefix(repo: str, obj: str, nbytes: int) -> tuple[int, bytes, str]:
+    """Первые ``nbytes`` байт blob; остальное git не отдаёт (#1630).
+
+    ``head -c`` закрывает канал, git получает SIGPIPE: память ограничена
+    префиксом при файле любого размера. Недобор против известного размера
+    вызывающий читает как ошибку чтения.
+    """
+    return await proc.run_bytes(
+        "sh",
+        "-c",
+        'git -C "$1" cat-file blob "$2" | head -c "$3"',
+        "sh",
+        repo,
+        obj,
+        str(nbytes),
+        cwd=repo,
+        timeout=30,
+        max_bytes=nbytes + 1,
+    )
+
+
 #: Причина, когда git отказал, но словами, которых мы не знаем (#1118, AC-3).
 #: Не «неизвестная ошибка»: отказ ЕСТЬ и его текст сохранён рядом — неизвестно
 #: только имя, под которым его учитывать.
@@ -2147,6 +2187,95 @@ class GitOpsIntegration:
         """
         rc, out, _ = await _git("show", f"{ref}:{path}", repo=repo, check=False)
         return out if rc == 0 else None
+
+    async def read_file_at_ref(
+        self, repo: str, ref: str, path: str, *, limit_chars: int = 30000
+    ) -> dict[str, Any]:
+        """Общий дедлайн на чтение (45 с); просрочка — unreadable, а не зависание."""
+        try:
+            return await asyncio.wait_for(
+                self._read_file_at_ref(repo, ref, path, limit_chars), timeout=45
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            return _unreadable_file(ref, path, "чтение не уложилось в 45 с")
+
+    async def _read_file_at_ref(
+        self, repo: str, ref: str, path: str, limit_chars: int
+    ) -> dict[str, Any]:
+        """Файл на ``ref`` с честным состоянием: present | missing | unreadable (#1630).
+
+        ``file_at_ref`` схлопывает «файла нет» и «не смогли прочитать» в None —
+        для правил рецензента это нарочно. Здесь различие и есть ответ: пустой
+        файл это present с пустым content, отсутствие — missing, ошибка ref или
+        клона — unreadable с причиной. Читается blob по объекту, не ``strip()``.
+        """
+        out: dict[str, Any] = {
+            "state": "unreadable",
+            "path": path,
+            "ref": ref,
+            "sha": "",
+            "content": "",
+            "truncated": False,
+            "size": 0,
+            "chars": 0,
+            "reason": "",
+        }
+        rc, sha, err = await _git(
+            "rev-parse",
+            "--verify",
+            f"{ref}^{{commit}}",
+            repo=repo,
+            check=False,
+            timeout=30,
+        )
+        if rc != 0:
+            out["reason"] = f"ref {ref!r} не прочитан: {err[:120] or f'rc={rc}'}"
+            return out
+        out["sha"] = sha.strip()
+        key = (repo, out["sha"], path, limit_chars)
+        if key in _BASE_FILE_CACHE:
+            return dict(_BASE_FILE_CACHE[key])
+        rc, tree, err = await _git(
+            "ls-tree", "-z", out["sha"], "--", path, repo=repo, check=False, timeout=30
+        )
+        if rc != 0:
+            out["reason"] = f"дерево {ref!r} не прочитано: {err[:120] or f'rc={rc}'}"
+            return out
+        entry = tree.split("\0", 1)[0]
+        meta, _, name = entry.partition("\t")
+        fields = meta.split()
+        if not entry or name != path or len(fields) != 3:
+            out["state"] = "missing"
+            return out
+        mode, kind, obj = fields
+        if kind != "blob" or mode not in ("100644", "100755"):
+            out["reason"] = f"{path} не обычный файл (mode {mode})"
+            return out
+        rc, size_text, err = await _git(
+            "cat-file", "-s", obj, repo=repo, check=False, timeout=30
+        )
+        if rc != 0 or not size_text.strip().isdigit():
+            out["reason"] = f"размер {path} не прочитан: {err[:120] or f'rc={rc}'}"
+            return out
+        size = int(size_text.strip())
+        out["size"] = size
+        # Префикс blob, а не весь: память ограничена потолком, файл любого
+        # размера даёт present + truncated + size (AC-2).
+        want = min(size, limit_chars * 4 + 8)
+        rc, body, err = await _blob_prefix(repo, obj, want) if want else (0, b"", "")
+        if rc != 0 or len(body) < want:
+            out["reason"] = f"содержимое {path} не прочитано: {err[:120] or f'rc={rc}'}"
+            return out
+        text = body.decode("utf-8", errors="replace")
+        whole = len(body) >= size
+        out["state"] = "present"
+        out["chars"] = len(text) if whole else 0
+        out["truncated"] = (not whole) or len(text) > limit_chars
+        out["content"] = text[:limit_chars]
+        if len(_BASE_FILE_CACHE) >= 64:
+            _BASE_FILE_CACHE.pop(next(iter(_BASE_FILE_CACHE)))
+        _BASE_FILE_CACHE[key] = dict(out)
+        return out
 
     async def files_at_ref(self, repo: str, ref: str) -> set[str] | None:
         """Every path in the tree of ``ref``; ``None`` when it could not be read.

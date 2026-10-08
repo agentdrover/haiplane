@@ -3452,3 +3452,127 @@ async def test_two_presses_over_an_abandoned_reservation_pay_one_agent(
 
     assert len(calls) == 1
     assert sorted(r.launched for r in results) == [False, True], results
+
+
+# ---- #1630: «Правила работы» исполнителю облака без лишних маршрутов ----
+
+
+async def test_implementer_gets_working_rules_without_extra_routes(
+    client, db, tmp_path
+):
+    """AC-4: навык неактивен — state=inactive без отказа; implementer получает
+    тот же блок через pair-start и /context, а /api/skills и /effective-policy
+    ему закрыты (блок считается на сервере)."""
+    from hub.auth import chat_pair_route_allowed
+    from hub.integrations.registry import plugins
+    from tests.working_rules_support import (
+        RULES_PATH,
+        ReadingGitOps,
+        make_rules_repo,
+        task_in_project,
+    )
+
+    ws = make_rules_repo(tmp_path / "ws", {RULES_PATH: "правила репо\n"})
+    plugins.git_ops = ReadingGitOps()
+    await db.execute("UPDATE skills SET status='draft' WHERE name=?", (_SKILL,))
+    await db.commit()
+    assert await repo.get_active_skill(db, _SKILL) is None
+    task_id = await task_in_project(client, db, ws, slug="wr-impl")
+
+    session = TokenIdentity(
+        "cloud",
+        "agent",
+        chat_pair_kind="implementer",
+        chat_pair_task_id=task_id,
+        chat_pair_generation=1,
+    )
+    assert chat_pair_route_allowed("POST", f"/api/tasks/{task_id}/pair-start", session)
+    assert chat_pair_route_allowed("GET", f"/api/tasks/{task_id}/context", session)
+    assert not chat_pair_route_allowed("GET", "/api/skills", session)
+    assert not chat_pair_route_allowed(
+        "GET", "/api/skills/executor-pair-discipline", session
+    )
+    assert not chat_pair_route_allowed(
+        "GET", "/api/projects/wr-impl/effective-policy", session
+    )
+
+    started = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: x", "assigned_agent": "cloud", "git_mode": "remote"},
+    )
+    assert started.status_code == 200, started.text
+    ctx = (await client.get(f"/api/tasks/{task_id}/context")).json()
+    for block in (started.json()["working_rules"], ctx["working_rules"]):
+        assert block["hub_skill"]["state"] == "inactive"
+        assert block["project_policy"]["state"] == "available"
+        assert block["repository_rules"]["state"] == "present"
+    assert "неактивен" in ctx["context_text"]
+
+
+async def test_implementer_mcp_makes_no_extra_policy_or_skill_requests(
+    client, db, tmp_path
+):
+    """AC-4 (#1630): настоящая implementer-сессия через MCP — запросов к
+    /effective-policy и /api/skills нет, строки «политика не прочитана» нет."""
+    from unittest.mock import patch
+
+    from hub.integrations.registry import plugins
+    from hub.mcp_server import hub_my_context, hub_pair_start
+    from tests.working_rules_support import (
+        RULES_PATH,
+        ReadingGitOps,
+        RestBackedMcp,
+        make_rules_repo,
+        task_in_project,
+    )
+
+    ws = make_rules_repo(tmp_path / "ws", {RULES_PATH: "правила репо\n"})
+    plugins.git_ops = ReadingGitOps()
+    task_id = await task_in_project(client, db, ws, slug="wr-mcp")
+    rest = RestBackedMcp(client, task_id)
+
+    with (
+        patch("hub.mcp_server._api_get", new=rest.get),
+        patch("hub.mcp_server._api_post", new=rest.post),
+    ):
+        started = await hub_pair_start(
+            task_id, plan="Plan: x", session_id="s", git_mode="remote"
+        )
+        outs = [
+            await hub_my_context(task_id, mode="summary"),
+            await hub_my_context(task_id, mode="full"),
+        ]
+
+    assert "Правила работы" in started and "правила репо" in started
+    assert rest.forbidden_calls() == [], rest.calls
+    for out in outs:
+        text = "".join(b.text for b in out.content)
+        assert "политика проекта не прочитана" not in text
+        assert "Policy of project wr-mcp" in text or "полит" in text
+
+
+async def test_skill_read_failure_is_unreadable_not_inactive(
+    client, db, tmp_path, monkeypatch
+):
+    """#1630 (ревью): сбой чтения навыка — state=unreadable с причиной, а не
+    inactive; inactive только когда активной версии нет. pair_start отвечает 200."""
+    from hub import repository as repo_mod
+    from tests.working_rules_support import task_in_project
+
+    async def _boom(_db, _name):
+        raise RuntimeError("secret-dsn-should-not-leak")
+
+    monkeypatch.setattr(repo_mod, "get_active_skill", _boom)
+    task_id = await task_in_project(client, db, "", slug="wr-skillerr")
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: x", "assigned_agent": "a", "git_mode": "remote"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    skill = resp.json()["working_rules"]["hub_skill"]
+    assert skill["state"] == "unreadable"
+    assert "RuntimeError" in skill["reason"] and "secret" not in skill["reason"]
+    ctx = (await client.get(f"/api/tasks/{task_id}/context")).json()
+    assert "навык не прочитан" in ctx["context_text"]

@@ -2193,6 +2193,12 @@ async def pair_start_task(
     await refuse_opening_over_review_limit(db, task_id, task)
     # #1433: the same place for the same reason — refused before the plan and
     # the branch are written; the hold lasts until the transition is committed.
+    # #1630: файл правил репозитория читается ЗДЕСЬ — после проверок допуска и
+    # до capture_areas: git не зовётся под write-локом и в транзакции (#1456).
+    # Ошибка чтения — данные (unreadable), а не отказ pair_start.
+    from hub.services import working_rules
+
+    agent_rules = await working_rules.read_agent_rules(db, task_id)
     async with capture_areas(db, task_id, starting_status) as area_check:
         git_mode = await _pair_start_write(
             db,
@@ -2230,6 +2236,7 @@ async def pair_start_task(
     tv.statement_freshness = await statement_freshness(db, dict(row))  # type: ignore[arg-type]
     tv.area_check = area_check
     tv.worktree_hint = _worktree_hint(task_id)
+    tv.working_rules = await working_rules.build_working_rules(db, task_id, agent_rules)
     return tv
 
 
