@@ -2194,6 +2194,11 @@ async def api_task_context(
         working_rules,
         full_pointer=f'hub_my_context(task_id={task_id}, mode="full")',
     )
+    from hub.services import project_path as project_path_service
+
+    path_brief = await project_path_service.task_path_brief(
+        db, project_row, breadcrumb, summary=mode == "summary"
+    )
     if mode == "summary":
         # Сводка стоит в начале: потолок режет хвост, и место под правила
         # занято до сокращения остального контекста.
@@ -2224,6 +2229,7 @@ async def api_task_context(
         "readiness": readiness_summary,
         "parent_goal": parent_goal,
         "working_rules": working_rules,
+        "path_brief": path_brief,
     }
 
 

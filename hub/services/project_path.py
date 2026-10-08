@@ -41,6 +41,7 @@
 from __future__ import annotations
 
 import heapq
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -788,3 +789,49 @@ def format_path_brief(data: dict[str, Any], *, limit: int = 5) -> list[str]:
         lines.append(f"…и ещё эпиков: {len(data['epics']) - limit}")
     lines.append(f"Full view: oc-hub path {data['project']}")
     return lines
+
+
+# --- блок для контекста задачи (#1643) ------------------------------------------
+
+BRIEF_EPICS_FULL = 3
+BRIEF_EPICS_SUMMARY = 1
+
+
+async def task_path_brief(
+    db: aiosqlite.Connection,
+    project: Any,
+    breadcrumb: list[dict[str, Any]],
+    *,
+    summary: bool,
+) -> dict[str, Any]:
+    """Компактный блок «что дальше» для сессии одной задачи.
+
+    Тот же расчёт и тот же текст, что у /path и CLI (``compute`` и
+    ``format_path_brief``); сужены только эпики: сначала эпики предков задачи,
+    затем остальные, всего не больше ``BRIEF_EPICS_*``. Ничего не пишет.
+    """
+    if project is None:
+        return {
+            "status": "no_project",
+            "lines": ["Путь проекта: у задачи нет проекта — блока «что дальше» нет"],
+        }
+    slug = str(project["slug"])
+    try:
+        data = await compute(db, project)
+        own = {int(n["id"]) for n in breadcrumb}
+        epics = sorted(data["epics"], key=lambda e: e["epic_id"] not in own)
+        limit = BRIEF_EPICS_SUMMARY if summary else BRIEF_EPICS_FULL
+        lines = format_path_brief({**data, "epics": epics}, limit=limit)
+    except Exception as exc:  # noqa: BLE001 - блок необязателен, контекст важнее
+        logging.getLogger(__name__).warning(
+            "path brief of project %s not computed: %s: %s",
+            slug,
+            type(exc).__name__,
+            exc,
+        )
+        return {
+            "status": "unavailable",
+            "project": slug,
+            "lines": [f"Путь проекта не посчитан: {type(exc).__name__}"],
+        }
+    return {"status": "ok", "project": slug, "lines": lines}

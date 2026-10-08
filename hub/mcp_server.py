@@ -2157,7 +2157,15 @@ async def hub_my_context(
     ctx = await _api_get(f"/api/tasks/{task_id}/context{query}")
     text = ctx.get("context_text", f"Context for task #{task_id} not available.")
     text += await _policy_brief_text(ctx)
-    text += await _path_brief_text(ctx)
+    path_block = await _path_brief_text(ctx)
+    if mode == "summary":
+        # #1643: потолок режет хвост, поэтому короткий блок стоит в начале —
+        # как сводка правил; в full он остаётся в конце.
+        text = path_block.lstrip("\n") + "\n\n" + text if path_block else text
+    else:
+        text += path_block
+    # Блок уже в тексте: во втором представлении он не нужен.
+    ctx = {k: v for k, v in ctx.items() if k != "path_brief"}
     extra: dict[str, Any] = {}
     rules = ctx.get("working_rules")
     if rules and rules.get("mode") == "summary":
@@ -2230,9 +2238,14 @@ async def _path_brief_text(ctx: dict[str, Any]) -> str:
     """Блок «что дальше» для контекста задачи (#1527); best effort.
 
     Тот же расчёт, что у REST и CLI: следующая задача проекта и путь эпиков.
+    Сервер кладёт готовый блок в /context (#1643): сессии исполнителя /path
+    закрыт. В /path идём только за ответом без блока (хаб старее).
     """
     from hub.services.project_path import format_path_brief
 
+    brief = ctx.get("path_brief")
+    if isinstance(brief, dict) and brief.get("lines"):
+        return "\n\n" + "\n".join(str(line) for line in brief["lines"])
     slug = ((ctx.get("task") or {}).get("project") or {}).get("slug") or ""
     if not slug:
         return ""

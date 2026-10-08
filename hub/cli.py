@@ -365,6 +365,11 @@ def cmd_context(args: argparse.Namespace) -> int:
     query = f"?{urllib.parse.urlencode(params)}" if params else ""
     result = _api("GET", f"/api/tasks/{args.task_id}/context{query}")
     print(result.get("context_text", ""))
+    # #1643: блок «что дальше» приходит из /context, как в hub_my_context.
+    brief = result.get("path_brief") or {}
+    if brief.get("lines"):
+        print()
+        print("\n".join(brief["lines"]))
     return 0
 
 

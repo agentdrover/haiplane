@@ -351,3 +351,55 @@ async def test_path_is_the_same_on_every_surface(
     assert json.loads(capsys.readouterr().out) == rest
     # Строка «что дальше» одна на все поверхности.
     assert project_path.format_path_brief(rest)[0] in text
+
+
+async def test_path_block_is_shown_once_for_a_regular_agent(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, capsys
+):
+    """AC-3 (#1643): обычный агент видит блок «что дальше» ровно один раз, с тем
+    же смыслом, что у /path; /path и CLI path не изменились, а запроса к /path
+    ради блока нет."""
+    pid = await _project(db, "pp43")
+    epic = await _epic(db, pid)
+    first = await _task(db, pid, "first", parent=epic, size="M")
+    second = await _task(db, pid, "second", parent=epic, size="S")
+    await _dep(db, second, first)
+    # get_readiness пересчитывает DoR прочитанной задачи, поэтому читаем не
+    # first, а свою задачу ниже по priority: «следующая» остаётся first.
+    mine = await _task(db, pid, "mine", parent=epic, size="XS", priority="low")
+    rest = (await client.get("/api/projects/pp43/path")).json()
+    calls: list[str] = []
+
+    async def _via_client(path: str, **_: object) -> object:
+        calls.append(path)
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _via_client)
+    out = await mcp_server.hub_my_context(task_id=mine, mode="full")
+    text = json.loads(out.content[0].text)["message"]
+    assert text.count("Next task:") == 1
+    assert text.count(f"#{first} → #{second}") == 1
+    assert project_path.format_path_brief(rest)[0] in text
+    assert not [c for c in calls if "/path" in c], calls
+    # Второе представление блока не тащит: он один и в тексте.
+    assert "path_brief" not in json.dumps(out.structuredContent, ensure_ascii=False)
+
+    # CLI context: тот же блок один раз из того же поля /context.
+    ctx_json = (await client.get(f"/api/tasks/{mine}/context")).json()
+    assert ctx_json["path_brief"]["status"] == "ok"
+    with (
+        patch.object(sys, "argv", ["oc-hub", "context", str(mine)]),
+        patch.object(cli, "_api", return_value=ctx_json),
+    ):
+        cli.main()
+    printed = capsys.readouterr().out
+    assert printed.count("Next task:") == 1
+    assert f"#{first} → #{second}" in printed
+
+    # oc-hub path и REST /path — без изменений.
+    with (
+        patch.object(sys, "argv", ["oc-hub", "path", "pp43", "--json"]),
+        patch.object(cli, "_api", return_value=rest),
+    ):
+        cli.main()
+    assert json.loads(capsys.readouterr().out) == rest

@@ -3071,6 +3071,19 @@ class ContextParentGoal(BaseModel):
     business_value: str = ""
 
 
+class PathBrief(BaseModel):
+    """#1643: блок «что дальше» в контексте задачи, посчитанный на сервере.
+
+    Сессия исполнителя не читает ``/api/projects/{slug}/path``, поэтому блок
+    приходит вместе с контекстом. ``status``: ``ok``; ``no_project`` — у задачи
+    нет проекта; ``unavailable`` — расчёт не удался (это «неизвестно», не «нет»).
+    """
+
+    status: str
+    project: str = ""
+    lines: list[str] = Field(default_factory=list)
+
+
 class TaskContextView(BaseModel):
     """Response for GET /api/tasks/{task_id}/context.
 
@@ -3096,6 +3109,9 @@ class TaskContextView(BaseModel):
     parent_goal: ContextParentGoal | None = None
     # #1630: тот же блок, что в pair-start; в mode=summary — без текстов слоёв.
     working_rules: WorkingRules | None = None
+    # #1643: следующая задача и критический путь проекта задачи. None — сервер
+    # блока не считает (старый хаб): клиент идёт в /path сам.
+    path_brief: PathBrief | None = None
 
 
 class ProjectCreate(BaseModel):
