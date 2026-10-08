@@ -27,7 +27,7 @@ from hub.services import project_policy, working_rules
 from hub.services.effective_policy import effective_policy, format_policy_brief
 from hub.workflow_reference import HUMAN_ONLY_TOOLS, HUMAN_ROUTES
 
-MCP_SERVER_NAME = "openclaw-hub"
+MCP_SERVER_NAME = "haiplane-hub"
 TOKEN_PLACEHOLDER = "<ТОКЕН АГЕНТА>"  # nosec B105 - плейсхолдер, не секрет
 REVIEW_RULES_FILE = ".hub/REVIEW_RULES.md"
 CI_LINE = "push → зелёный CI на sha → сдача"
