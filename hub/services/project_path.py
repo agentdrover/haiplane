@@ -713,7 +713,7 @@ async def compute(
 
 
 HIDDEN_STEP = "(вне вашей сессии)"
-HIDDEN_NEXT = "вне вашей сессии (название и номер скрыты)"
+HIDDEN_NEXT = "нет готовой или вне вашей сессии"
 
 
 def _chain_text(chain: list[dict[str, Any]]) -> str:
@@ -765,8 +765,13 @@ def format_path(data: dict[str, Any]) -> list[str]:
 def format_path_brief(data: dict[str, Any], *, limit: int = 5) -> list[str]:
     """Блок «что дальше» для hub_my_context: следующая задача и пути эпиков."""
     nxt = data["next"]
-    if nxt.get("hidden"):
-        first = f"Next task: {HIDDEN_NEXT}"
+    if nxt.get("scoped"):
+        # Узкая сессия: только своя задача по номеру и названию, иначе пометка.
+        first = (
+            f"Next task: #{nxt['task_id']} {nxt['title']}"
+            if nxt["task_id"] is not None
+            else f"Next task: {HIDDEN_NEXT}"
+        )
     elif nxt["task_id"] is not None:
         first = f"Next task: #{nxt['task_id']} {nxt['title']} — {nxt['reason']}"
     else:
@@ -803,21 +808,33 @@ def scope_to_visible(
     задача, шаги пути и эпики вне видимости заменяются обезличенной пометкой, а
     чужие проекты не называются вовсе. Эпики берутся только из предков.
     """
-    nxt = dict(data["next"])
-    if nxt["task_id"] is not None and nxt["task_id"] not in visible:
-        nxt = {"task_id": None, "title": "", "reason": "", "hidden": True}
+    # Белый список полей: свободный текст (reason, note, summary) наружу не идёт —
+    # в нём перечислены пропущенные кандидаты, их номера и причины.
+    task_id = data["next"]["task_id"]
+    shown = task_id is not None and task_id in visible
+    nxt = {
+        "task_id": task_id if shown else None,
+        "title": data["next"]["title"] if shown else "",
+        "scoped": True,
+    }
     epics = []
     for epic in data["epics"]:
         if epic["epic_id"] not in breadcrumb_ids:
             continue
         chain = [
-            step
+            {"task_id": step["task_id"], "foreign": False, "project": ""}
             if step["task_id"] in visible
             else {"task_id": None, "foreign": False, "project": "", "hidden": True}
             for step in epic["chain"]
         ]
-        epics.append({**epic, "chain": chain})
-    return {**data, "next": nxt, "epics": epics}
+        epics.append(
+            {
+                "epic_id": epic["epic_id"],
+                "weight_text": epic["weight_text"],
+                "chain": chain,
+            }
+        )
+    return {"project": data["project"], "next": nxt, "epics": epics}
 
 
 async def task_path_brief(

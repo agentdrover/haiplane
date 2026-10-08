@@ -1713,3 +1713,46 @@ async def test_implementer_path_block_names_nothing_outside_the_session(
     assert "tajnyj-proekt" not in text and "tajnyj-proekt" not in structured
     for hidden_id in (foreign_next, foreign_epic, foreign_dep, other_epic):
         assert not re.search(rf"#{hidden_id}\b", text), hidden_id
+
+
+@pytest.mark.asyncio
+async def test_implementer_block_without_ready_task_carries_no_skip_reasons(
+    hub, monkeypatch
+):
+    """#1643 (ревью): очередь без готовой задачи, пропущены чужие кандидаты.
+    Свободный reason очереди перечисляет их номера и причины; implementer
+    получает только обезличенную пометку, ни в тексте, ни в structuredContent."""
+    import re
+
+    from hub import mcp_server
+    from tests.test_project_path import _dep, _epic, _project, _task
+
+    pid = await _project(hub.db, "cp-noready")
+    mine_epic = await _epic(hub.db, pid)
+    mine = await _task(hub.db, pid, "mine", parent=mine_epic, size="XS")
+    foreign_epic = await _epic(hub.db, pid, "chuzhoj-epik")
+    blocker = await _task(
+        hub.db, pid, "blokirujushhaja", parent=foreign_epic, size="S", dor=False
+    )
+    skipped = await _task(hub.db, pid, "propushhennaja", parent=foreign_epic, size="S")
+    await _dep(hub.db, skipped, blocker)
+    await _dep(hub.db, mine, blocker)
+
+    # Без фильтра reason называет чужие номера — иначе тест ничего не доказывает.
+    plain = await hub.client.get(
+        "/api/projects/cp-noready/path", headers=hub.human_auth
+    )
+    assert plain.json()["next"]["task_id"] is None
+    assert f"#{skipped}" in plain.json()["next"]["reason"]
+
+    session = await _implementer_session(hub, mine)
+    monkeypatch.setattr(mcp_server, "_api_get", _session_api_get(hub, session, []))
+    out = await mcp_server.hub_my_context(task_id=mine, mode="full")
+    text = json.loads(out.content[0].text)["message"]
+    structured = json.dumps(out.structuredContent, ensure_ascii=False)
+
+    assert "Next task: нет готовой или вне вашей сессии" in text
+    for hidden_id in (skipped, blocker, foreign_epic):
+        assert not re.search(rf"#{hidden_id}\b", text), hidden_id
+        assert not re.search(rf"#{hidden_id}\b", structured), hidden_id
+    assert "propushhennaja" not in text + structured
