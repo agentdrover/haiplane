@@ -1668,3 +1668,48 @@ async def test_implementer_still_cannot_read_path_or_foreign_context(hub):
     assert foreign.status_code == 403, foreign.text
     own = await hub.client.get(f"/api/tasks/{mine}/context", headers=session)
     assert own.status_code == 200, own.text
+
+
+@pytest.mark.asyncio
+async def test_implementer_path_block_names_nothing_outside_the_session(
+    hub, monkeypatch
+):
+    """#1643 P1: блок implementer не называет чужие задачи, эпики и проекты:
+    ни названий, ни номеров, ни slug; вместо них обезличенная пометка."""
+    import re
+
+    from hub import mcp_server
+    from tests.test_project_path import _dep, _epic, _project, _task
+
+    _epic_id, first, second, mine = await _epic_with_queue(hub)
+    pid = await _project(hub.db, "cp1643")
+    other_pid = await _project(hub.db, "tajnyj-proekt")
+    # Следующая задача проекта — из другого эпика, который сессии не виден.
+    foreign_epic = await _epic(hub.db, pid, "tajnyj-epik")
+    foreign_next = await _task(
+        hub.db, pid, "tajnoe-imya", parent=foreign_epic, size="S", priority="critical"
+    )
+    # Цепочка собственного эпика идёт через зависимость из чужого проекта.
+    other_epic = await _epic(hub.db, other_pid, "epik-chuzhogo")
+    foreign_dep = await _task(
+        hub.db, other_pid, "chuzhaya-zavisimost", parent=other_epic
+    )
+    await _dep(hub.db, first, foreign_dep)
+
+    session = await _implementer_session(hub, mine)
+    monkeypatch.setattr(mcp_server, "_api_get", _session_api_get(hub, session, []))
+    out = await mcp_server.hub_my_context(task_id=mine, mode="full")
+    text = json.loads(out.content[0].text)["message"]
+    structured = json.dumps(out.structuredContent, ensure_ascii=False)
+
+    assert "вне вашей сессии" in text
+    for secret in (
+        "tajnoe-imya",
+        "tajnyj-epik",
+        "chuzhaya-zavisimost",
+        "epik-chuzhogo",
+    ):
+        assert secret not in text and secret not in structured, secret
+    assert "tajnyj-proekt" not in text and "tajnyj-proekt" not in structured
+    for hidden_id in (foreign_next, foreign_epic, foreign_dep, other_epic):
+        assert not re.search(rf"#{hidden_id}\b", text), hidden_id

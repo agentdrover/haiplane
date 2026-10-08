@@ -2244,8 +2244,15 @@ async def _path_brief_text(ctx: dict[str, Any]) -> str:
     from hub.services.project_path import format_path_brief
 
     brief = ctx.get("path_brief")
-    if isinstance(brief, dict) and brief.get("lines"):
-        return "\n\n" + "\n".join(str(line) for line in brief["lines"])
+    if isinstance(brief, dict):
+        # Блок есть — в /path не идём, даже если строк нет: implementer он
+        # закрыт, а «нет строк» не значит «хаб старее».
+        lines = [str(line) for line in brief.get("lines") or []]
+        if lines:
+            return "\n\n" + "\n".join(lines)
+        if brief.get("status") == "no_project":
+            return "\n\nПуть проекта: у задачи нет проекта — блока «что дальше» нет"
+        return "\n\nПуть проекта: сервер блок не передал (неизвестно)"
     slug = ((ctx.get("task") or {}).get("project") or {}).get("slug") or ""
     if not slug:
         return ""

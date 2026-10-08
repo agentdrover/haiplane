@@ -40,6 +40,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import heapq
 import logging
 from dataclasses import dataclass, field
@@ -119,24 +120,7 @@ class Reach:
 # --- чтение графа -------------------------------------------------------------
 
 
-def _resolver(projects: list[Any]) -> Any:
-    by_id = {int(p["id"]): p for p in projects}
-    default = next((p for p in projects if p["slug"] == "default"), None)
-
-    def project_of(tasks: dict[int, dict[str, Any]], task_id: int) -> Any:
-        """Как ``resolve_project_for_task`` (#335), но по графу в памяти."""
-        current: int | None = task_id
-        for _ in range(20):
-            row = tasks.get(current) if current is not None else None
-            if row is None:
-                break
-            if row["project_id"] is not None:
-                found = by_id.get(int(row["project_id"]))
-                return found if found and found["status"] == "active" else default
-            current = row["parent_id"]
-        return default
-
-    return project_of
+_resolver = oq.project_resolver
 
 
 async def _load_graph(db: aiosqlite.Connection, project: Any) -> Graph:
@@ -728,9 +712,16 @@ async def compute(
 # --- текст: один на CLI и MCP ----------------------------------------------------
 
 
+HIDDEN_STEP = "(вне вашей сессии)"
+HIDDEN_NEXT = "вне вашей сессии (название и номер скрыты)"
+
+
 def _chain_text(chain: list[dict[str, Any]]) -> str:
     parts = []
     for step in chain:
+        if step.get("hidden"):
+            parts.append(HIDDEN_STEP)
+            continue
         tag = f" (проект {step['project']})" if step["foreign"] else ""
         parts.append(f"#{step['task_id']}{tag}")
     return " → ".join(parts)
@@ -774,7 +765,9 @@ def format_path(data: dict[str, Any]) -> list[str]:
 def format_path_brief(data: dict[str, Any], *, limit: int = 5) -> list[str]:
     """Блок «что дальше» для hub_my_context: следующая задача и пути эпиков."""
     nxt = data["next"]
-    if nxt["task_id"] is not None:
+    if nxt.get("hidden"):
+        first = f"Next task: {HIDDEN_NEXT}"
+    elif nxt["task_id"] is not None:
         first = f"Next task: #{nxt['task_id']} {nxt['title']} — {nxt['reason']}"
     else:
         first = f"Next task: none — {nxt['reason']}"
@@ -795,6 +788,36 @@ def format_path_brief(data: dict[str, Any], *, limit: int = 5) -> list[str]:
 
 BRIEF_EPICS_FULL = 3
 BRIEF_EPICS_SUMMARY = 1
+# Потолок на расчёт блока: асинхронные чтения прерываются, чисто синхронный
+# кусок (порядок узлов) — нет, поэтому главное средство — малое число запросов.
+BRIEF_TIMEOUT_S = 3.0
+
+
+def scope_to_visible(
+    data: dict[str, Any], visible: set[int], breadcrumb_ids: set[int]
+) -> dict[str, Any]:
+    """Оставить в проекции только то, что вызывающая сессия и так видит (#1643).
+
+    Сессия implementer привязана к одной задаче: ей видны эта задача, её
+    предки, соседи и дети. Остальное исключается ДО форматирования: следующая
+    задача, шаги пути и эпики вне видимости заменяются обезличенной пометкой, а
+    чужие проекты не называются вовсе. Эпики берутся только из предков.
+    """
+    nxt = dict(data["next"])
+    if nxt["task_id"] is not None and nxt["task_id"] not in visible:
+        nxt = {"task_id": None, "title": "", "reason": "", "hidden": True}
+    epics = []
+    for epic in data["epics"]:
+        if epic["epic_id"] not in breadcrumb_ids:
+            continue
+        chain = [
+            step
+            if step["task_id"] in visible
+            else {"task_id": None, "foreign": False, "project": "", "hidden": True}
+            for step in epic["chain"]
+        ]
+        epics.append({**epic, "chain": chain})
+    return {**data, "next": nxt, "epics": epics}
 
 
 async def task_path_brief(
@@ -803,12 +826,14 @@ async def task_path_brief(
     breadcrumb: list[dict[str, Any]],
     *,
     summary: bool,
+    visible: set[int] | None = None,
 ) -> dict[str, Any]:
     """Компактный блок «что дальше» для сессии одной задачи.
 
     Тот же расчёт и тот же текст, что у /path и CLI (``compute`` и
     ``format_path_brief``); сужены только эпики: сначала эпики предков задачи,
-    затем остальные, всего не больше ``BRIEF_EPICS_*``. Ничего не пишет.
+    затем остальные, всего не больше ``BRIEF_EPICS_*``. ``visible`` — границы
+    видимости узкой сессии (implementer): None — полное чтение. Ничего не пишет.
     """
     if project is None:
         return {
@@ -817,8 +842,10 @@ async def task_path_brief(
         }
     slug = str(project["slug"])
     try:
-        data = await compute(db, project)
+        data = await asyncio.wait_for(compute(db, project), BRIEF_TIMEOUT_S)
         own = {int(n["id"]) for n in breadcrumb}
+        if visible is not None:
+            data = scope_to_visible(data, visible, own)
         epics = sorted(data["epics"], key=lambda e: e["epic_id"] not in own)
         limit = BRIEF_EPICS_SUMMARY if summary else BRIEF_EPICS_FULL
         lines = format_path_brief({**data, "epics": epics}, limit=limit)
