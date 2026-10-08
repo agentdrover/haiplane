@@ -257,6 +257,22 @@ class NoopGitOps:
         """No git here — there is no rules file to read (#873)."""
         return None
 
+    async def read_file_at_ref(
+        self, repo: str, ref: str, path: str, *, limit_chars: int = 30000
+    ) -> dict[str, Any]:
+        """No git here — "could not look", never "the file is absent" (#1630)."""
+        return {
+            "state": "unreadable",
+            "path": path,
+            "ref": ref,
+            "sha": "",
+            "content": "",
+            "truncated": False,
+            "size": 0,
+            "chars": 0,
+            "reason": "git не настроен",
+        }
+
     async def files_at_ref(self, repo: str, ref: str) -> set[str] | None:
         """No git here — "could not look", never "the submission lacks it" (#764)."""
         return None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import subprocess
 import pytest
 from httpx import AsyncClient
 
@@ -4632,3 +4633,61 @@ async def test_outcome_debt_endpoint_pages_one_status(client: AsyncClient, db):
         ).status_code == 422
     counts = (await client.get("/api/metrics/outcome-debt?only_counts=true")).json()
     assert "rows" not in counts and counts["total"] == 48
+
+
+# --- #1630: блок «Правила работы» в ответе pair-start ---
+
+
+async def test_pair_start_returns_working_rules_layers(client, db, tmp_path):
+    """AC-1: три слоя отдельными объектами и фиксированная preamble."""
+    from hub import repository as repo_mod
+    from hub.integrations.registry import plugins
+    from hub.services import working_rules as wr
+    from tests.working_rules_support import (
+        RULES_PATH,
+        ReadingGitOps,
+        make_rules_repo,
+        task_in_project,
+    )
+
+    rules_text = "Правило 1: пиши тесты первыми.\n"
+    ws = make_rules_repo(tmp_path / "ws", {RULES_PATH: rules_text})
+    plugins.git_ops = ReadingGitOps()
+    _, version = await repo_mod.create_skill_version(
+        db, name=wr.DISCIPLINE_SKILL, content="ДИСЦИПЛИНА ИСПОЛНИТЕЛЯ v-test"
+    )
+    await repo_mod.activate_skill_version(
+        db, wr.DISCIPLINE_SKILL, version, activated_by="test"
+    )
+    await db.commit()
+    task_id = await task_in_project(client, db, ws, slug="wr-layers")
+    expected_sha = subprocess.run(
+        ["git", "-C", ws, "rev-parse", "develop"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    resp = await client.post(
+        f"/api/tasks/{task_id}/pair-start",
+        json={"plan": "Plan: x", "assigned_agent": "a", "git_mode": "remote"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    block = resp.json()["working_rules"]
+    assert block["preamble"] == wr.PREAMBLE
+    skill = block["hub_skill"]
+    assert skill["name"] == wr.DISCIPLINE_SKILL and skill["state"] == "active"
+    assert skill["version"] == version
+    assert skill["content"] == "ДИСЦИПЛИНА ИСПОЛНИТЕЛЯ v-test"
+    policy = block["project_policy"]
+    assert policy["state"] == "available"
+    assert "Policy of project wr-layers" in policy["text"]
+    repo_layer = block["repository_rules"]
+    assert repo_layer["state"] == "present"
+    assert repo_layer["path"] == RULES_PATH
+    assert repo_layer["sha"] == expected_sha
+    assert repo_layer["trust"] == "repository_data"
+    assert repo_layer["content"] == rules_text
+    # Слои не склеены: текст репозитория не попал в доверенные объекты.
+    assert "Правило 1" not in skill["content"] + policy["text"] + block["preamble"]
