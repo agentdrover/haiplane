@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 
 from hub import config
@@ -96,13 +99,21 @@ def test_server_builds():
     упала уже на регистрации — SDK запрещает CallToolResult в Union, и сервер
     просто не собирался. Зелёный mypy тут ничего не гарантирует.
     """
-    import importlib
-
-    import hub.mcp_server as mcp_server
-
-    importlib.reload(mcp_server)
-    tools = mcp_server.mcp._tool_manager.list_tools()
-    assert tools, "сервер должен зарегистрировать хотя бы один инструмент"
+    # Сборка проверяется в дочернем процессе со свежим импортом: reload в
+    # текущем процессе подменял бы HubApiError и mcp для остальных тестов (#1642).
+    code = (
+        "import hub.mcp_server as m; "
+        "tools = m.mcp._tool_manager.list_tools(); "
+        "assert tools, 'no tools registered'"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_build_check_leaves_the_imported_module_objects_intact():
