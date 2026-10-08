@@ -2841,6 +2841,7 @@ class BootstrapMcpConfig(BaseModel):
     server_name: str
     transport: str
     url: str
+    url_note: str = ""
     authorization: str
 
 

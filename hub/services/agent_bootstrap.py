@@ -10,7 +10,9 @@ bearer, ни cookie), ``auth`` и ``config`` не сериализуются, ``
 
 from __future__ import annotations
 
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiosqlite
 
@@ -24,7 +26,7 @@ from hub.models import (
     BootstrapSkill,
 )
 from hub.services import project_policy, working_rules
-from hub.services.effective_policy import effective_policy, format_policy_brief
+from hub.services.effective_policy import effective_policy
 from hub.workflow_reference import HUMAN_ONLY_TOOLS, HUMAN_ROUTES
 
 MCP_SERVER_NAME = "haiplane-hub"
@@ -38,9 +40,73 @@ _FIRST_CALLS = (
     'hub_session_register(session_id="<id вашей сессии>") — до claim',
     'hub_list_tasks(project="{slug}") — задачи проекта',
     "hub_my_context(task_id=<id задачи>) — контекст выбранной задачи",
-    'hub_claim_task(task_id=<id>, session_id="<тот же id>")',
-    'hub_pair_start(task_id=<id>, session_id="<тот же id>", git_mode="remote")',
+    'hub_claim_task(task_id=<id>, agent="<имя из hub_whoami>", session_id="<тот же id>")'
+    " — agent обязателен",
+    'hub_pair_start(task_id=<id>, assigned_agent="<то же имя, что в claim>", '
+    'session_id="<тот же id>", git_mode="remote") — assigned_agent должен '
+    "совпасть с держателем claim",
 )
+
+
+#: Ключи политики со свободным текстом или структурой (команды, пути, заметки):
+#: наружу идёт только факт «настроен / не настроен», содержимое не публикуется.
+_FREE_TEXT_KEYS = frozenset(
+    {"ci_runner", "path_notices", "release_artifacts", "freeze", "risk_map"}
+)
+_TOKEN = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
+URL_WITHHELD_NOTE = (
+    "URL хаба не опубликован: он содержит учётные данные, параметры или "
+    "нестандартную схему. Возьмите URL у владельца."
+)
+
+
+def _safe_hub_url(raw: str) -> str:
+    """URL хаба для публикации или пустая строка; исходная строка не возвращается."""
+    try:
+        parts = urlsplit(raw)
+        _ = parts.port  # неверный порт бросает ValueError
+    except ValueError:
+        return ""
+    bad = (
+        parts.scheme not in ("http", "https")
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or "@" in parts.netloc
+        or parts.query
+        or parts.fragment
+        or ";" in parts.path
+    )
+    if bad:
+        return ""
+    return raw.rstrip("/")
+
+
+def _safe_value(row: dict[str, Any]) -> str:
+    value = row.get("value")
+    if row["key"] in _FREE_TEXT_KEYS:
+        return "настроен" if value else "не настроен"
+    if isinstance(value, bool) or value is None:
+        return "-" if value is None else ("true" if value else "false")
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str) and _TOKEN.match(value):
+        return value
+    return "задан (значение не публикуется)"
+
+
+def safe_policy_brief(data: dict[str, Any]) -> list[str]:
+    """Brief политики для пакета: только безопасные значения (не format_policy_brief)."""
+    shown = [r for r in data["keys"] if r["source"] in ("project", "derived")]
+    parts = [f"{r['key']} = {_safe_value(r)} [{r['source']}]" for r in shown]
+    steward = data["steward"]
+    mode = [str(steward.get(k, "")) for k in ("requested", "effective")]
+    mode = [m if _TOKEN.match(m) else "?" for m in mode]
+    return [
+        f"Policy of project {data['slug']}: "
+        + ("; ".join(parts) if parts else "all keys at defaults"),
+        f"Steward: requested {mode[0]}, effective {mode[1]}",
+    ]
 
 
 def _submit_order(ci_mode: str) -> list[str]:
@@ -50,7 +116,12 @@ def _submit_order(ci_mode: str) -> list[str]:
     ]
     if ci_mode in (project_policy.RED_TEST_WARN, project_policy.RED_TEST_REQUIRE):
         steps.append(CI_LINE)
-    steps.append("hub_submit_for_review — один раз; после APPROVED хаб вливает сам")
+    steps.append(
+        "hub_submit_for_review — одна сдача на коммит; после changes_requested "
+        "исправить, запушить и сдать новый sha; при ошибке транспорта сначала "
+        "hub_task_status, повтор — только если записи нет; после APPROVED хаб "
+        "вливает сам"
+    )
     return steps
 
 
@@ -91,8 +162,9 @@ def render_agent_bootstrap(b: AgentBootstrap) -> str:
     lines = [
         f"# Стартовый пакет проекта {b.project_slug} ({b.project_name})",
         "",
-        f"Задачами управляет Haiplane Hub ({b.mcp.url.removesuffix('/mcp')}). "
-        f"Токен агента выдаёт владелец; в этом тексте его нет и быть не должно.",
+        "Задачами управляет Haiplane Hub"
+        + (f" ({b.mcp.url.removesuffix('/mcp')})" if b.mcp.url else "")
+        + ". Токен агента выдаёт владелец; в этом тексте его нет и быть не должно.",
         "",
         "## 1. Конфиг MCP",
         "```json",
@@ -100,12 +172,13 @@ def render_agent_bootstrap(b: AgentBootstrap) -> str:
         '  "mcpServers": {',
         f'    "{b.mcp.server_name}": {{',
         f'      "type": "{b.mcp.transport}",',
-        f'      "url": "{b.mcp.url}",',
+        f'      "url": "{b.mcp.url or "<URL ХАБА>"}",',
         f'      "headers": {{"Authorization": "{b.mcp.authorization}"}}',
         "    }",
         "  }",
         "}",
         "```",
+        *([b.mcp.url_note] if b.mcp.url_note else []),
         f"Вместо {TOKEN_PLACEHOLDER} подставьте токен локально; в чат и в логи его не печатайте.",
         "",
         "## 2. Первые вызовы",
@@ -137,6 +210,7 @@ async def build_agent_bootstrap(
 ) -> AgentBootstrap:
     """Собрать пакет проекта из разрешённых источников; ничего не пишет."""
     slug = str(project["slug"])
+    hub_url = _safe_hub_url(hub_base_url())
     ci_mode = project_policy.ci_before_submit_of(project_policy.gate_policy_of(project))
     bootstrap = AgentBootstrap(
         project_slug=slug,
@@ -148,12 +222,13 @@ async def build_agent_bootstrap(
         mcp=BootstrapMcpConfig(
             server_name=MCP_SERVER_NAME,
             transport="streamable-http",
-            url=f"{hub_base_url()}/mcp",
+            url=f"{hub_url}/mcp" if hub_url else "",
+            url_note="" if hub_url else URL_WITHHELD_NOTE,
             authorization=f"Bearer {TOKEN_PLACEHOLDER}",
         ),
         first_calls=[c.format(slug=slug) if "{slug}" in c else c for c in _FIRST_CALLS],
         skills=await _active_skills(db),
-        policy_brief=format_policy_brief(await effective_policy(db, project)),
+        policy_brief=safe_policy_brief(await effective_policy(db, project)),
         rules_files=[
             await _rules_file(project, working_rules.AGENT_RULES_FILE),
             await _rules_file(project, REVIEW_RULES_FILE),
