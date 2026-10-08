@@ -103,3 +103,17 @@ def test_server_builds():
     importlib.reload(mcp_server)
     tools = mcp_server.mcp._tool_manager.list_tools()
     assert tools, "сервер должен зарегистрировать хотя бы один инструмент"
+
+
+def test_build_check_leaves_the_imported_module_objects_intact():
+    """#1642: проверка сборки не подменяет объекты модуля в текущем процессе.
+
+    importlib.reload пересоздаёт HubApiError и mcp в том же объекте модуля, а
+    потребители (tests/test_mcp_server.py, hub.app) держат прежние ссылки.
+    """
+    import hub.mcp_server as mcp_server
+
+    before = (mcp_server.HubApiError, mcp_server.mcp, mcp_server.hub_health)
+    test_server_builds()
+    after = (mcp_server.HubApiError, mcp_server.mcp, mcp_server.hub_health)
+    assert all(b is a for b, a in zip(before, after, strict=True))
