@@ -358,6 +358,9 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #913: гейт красного теста для work_type=bug. Не делегирует. Читатель:
     # project_policy.bug_red_test_of.
     "bug_red_test",
+    # #1629: гейт «CI до сдачи» (off|warn|require). Не делегирует. Читатель:
+    # project_policy.ci_before_submit_of.
+    "ci_before_submit",
     # #1456: проверка путей постановки (validation_commands, test_ref) на
     # существование. Не гейт, не делегирует. Читатель:
     # project_policy.statement_paths_of.
@@ -714,6 +717,20 @@ def _validate_bug_red_test(policy: dict[str, Any]) -> None:
         raise ValueError(
             "gate_policy bug_red_test must be one of "
             f"{', '.join(BUG_RED_TEST_MODES)}, got: {policy['bug_red_test']!r}"
+        )
+
+
+def _validate_ci_before_submit(policy: dict[str, Any]) -> None:
+    """Refuse a CI-before-submit mode the reader would read as warn by accident (#1629)."""
+    from hub.services.project_policy import CI_BEFORE_SUBMIT_MODES
+
+    if (
+        "ci_before_submit" in policy
+        and policy["ci_before_submit"] not in CI_BEFORE_SUBMIT_MODES
+    ):
+        raise ValueError(
+            "gate_policy ci_before_submit must be one of "
+            f"{', '.join(CI_BEFORE_SUBMIT_MODES)}, got: {policy['ci_before_submit']!r}"
         )
 
 
@@ -2768,6 +2785,56 @@ class DefectCauseSuggestion(BaseModel):
     unmatched_rows: int = 0
 
 
+class WorkingRulesSkill(BaseModel):
+    """Слой 1 «Правил работы» (#1630): навык хаба. Доверенный текст."""
+
+    name: str
+    state: str = "inactive"  # active | inactive | unreadable
+    version: int | None = None
+    content: str = ""
+    chars: int = 0
+    reason: str = ""  # при unreadable: тип ошибки чтения, без секретов
+
+
+class WorkingRulesPolicy(BaseModel):
+    """Слой 2: политика проекта, как её даёт format_policy_brief. Доверенный."""
+
+    state: str = "unavailable"  # available | unavailable
+    text: str = ""
+    chars: int = 0
+
+
+class WorkingRulesRepository(BaseModel):
+    """Слой 3: .hub/AGENT_RULES.md базовой ветки. ДАННЫЕ, не указания хаба."""
+
+    trust: str = "repository_data"
+    state: str = "unreadable"  # present | missing | unreadable
+    path: str = ""
+    ref: str = ""
+    sha: str = ""
+    content: str = ""
+    truncated: bool = False
+    size: int = 0
+    chars: int = 0
+    reason: str = ""
+
+
+class WorkingRules(BaseModel):
+    """Блок «Правила работы» исполнителю (#1630).
+
+    Три слоя лежат отдельными объектами и в один текст не склеиваются:
+    два доверенных (навык, политика) и слой репозитория с trust=repository_data.
+    ``preamble`` — фиксированный доверенный текст границы доверия.
+    ``mode=summary`` — тексты слоёв опущены, остаются состояния и размеры.
+    """
+
+    mode: str = "full"  # full | summary
+    preamble: str
+    hub_skill: WorkingRulesSkill
+    project_policy: WorkingRulesPolicy
+    repository_rules: WorkingRulesRepository
+
+
 class TaskView(BaseModel):
     id: int
     title: str
@@ -2941,6 +3008,9 @@ class TaskView(BaseModel):
     # caller's clone. Set on claim and pair-start only; the hub cannot know the
     # clone's folder name, so the exact path comes from `hp-hub worktree`.
     worktree_hint: str = ""
+    # #1630: «Правила работы» исполнителю — навык хаба, политика проекта и
+    # правила репозитория тремя отдельными слоями. Set on pair-start only.
+    working_rules: WorkingRules | None = None
     # #485: who blocks this task and whom it unblocks. None means no edges at
     # all, which is not the same as "edges, but empty".
     dependencies: "TaskDependencies | None" = None
@@ -3024,6 +3094,8 @@ class TaskContextView(BaseModel):
     task: TaskView | None = None
     readiness: ContextReadinessSummary | None = None
     parent_goal: ContextParentGoal | None = None
+    # #1630: тот же блок, что в pair-start; в mode=summary — без текстов слоёв.
+    working_rules: WorkingRules | None = None
 
 
 class ProjectCreate(BaseModel):
@@ -3105,6 +3177,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_orchestrator_queue(v)
     _validate_submission_contract(v)
     _validate_bug_red_test(v)
+    _validate_ci_before_submit(v)
     _validate_claim_area_check(v)
     _validate_statement_paths(v)
     _validate_deep_reviewer(v)

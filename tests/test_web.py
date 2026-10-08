@@ -6742,6 +6742,7 @@ async def test_saving_the_project_form_keeps_unknown_policy_keys(
         "submission_contract": "warn",
         "claim_area_check": "warn",
         "bug_red_test": "warn",
+        "ci_before_submit": "warn",
         "statement_paths": "require",
         "slot_dead_minutes": 90,
         "merge_is_delivery": True,

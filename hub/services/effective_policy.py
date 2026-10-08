@@ -155,6 +155,9 @@ REGISTRY: dict[str, PolicyEntry] = {
     "bug_red_test": PolicyEntry(
         project_policy.bug_red_test_of, "project_policy.bug_red_test_of"
     ),
+    "ci_before_submit": PolicyEntry(
+        project_policy.ci_before_submit_of, "project_policy.ci_before_submit_of"
+    ),
     "statement_paths": PolicyEntry(
         project_policy.statement_paths_of, "project_policy.statement_paths_of"
     ),
