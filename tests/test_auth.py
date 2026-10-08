@@ -1028,3 +1028,176 @@ async def test_db_watcher_principal_does_not_resolve_as_human(watcher_hub):
     assert ident is not None
     assert ident.role == "watcher"
     assert (ident.is_watcher, ident.is_human, ident.is_agent) == (True, False, False)
+
+
+# ---------------------------------------------------------------------------
+# ci_runner is a machine, not a human (#1639)
+# ---------------------------------------------------------------------------
+
+
+def _human_gate_routes() -> list[tuple[str, str]]:
+    """Every (method, path) guarded by ``require_human_or_admin``, from the app.
+
+    Two shapes carry the guard: ``Depends(require_human_or_admin)`` (found by
+    walking each route's dependant tree) and a direct call inside the handler
+    (found in the handler source). Derived, not listed by hand: a gate added
+    next month is covered without anyone remembering to extend a list.
+    """
+    import inspect
+
+    from fastapi.routing import APIRoute
+
+    from hub.app import app
+    from hub.auth import require_human_or_admin
+
+    def _depends_on_gate(dependant) -> bool:
+        return any(
+            sub.call is require_human_or_admin or _depends_on_gate(sub)
+            for sub in dependant.dependencies
+        )
+
+    found: set[tuple[str, str]] = set()
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        guarded = _depends_on_gate(route.dependant)
+        if not guarded:
+            try:
+                guarded = "require_human_or_admin(" in inspect.getsource(route.endpoint)
+            except (OSError, TypeError):
+                guarded = False
+        if guarded:
+            for method in route.methods - {"HEAD", "OPTIONS"}:
+                found.add((method, route.path))
+    return sorted(found)
+
+
+def _fill_path(path: str) -> str:
+    import re
+
+    return re.sub(r"\{[^}:]+(:path)?\}", "1", path)
+
+
+# Every table a human-gate operation could write to: tasks and their feed,
+# criteria, dependencies, projects and the scheduled policy, skills, delivery
+# and dispositions, executor state, pairing, messages. No table is skipped when
+# it is missing: a renamed table must fail this test, not drop out of it.
+_GATE_TABLES = (
+    "tasks",
+    "task_updates",
+    "acceptance_criteria",
+    "task_dependencies",
+    "projects",
+    "scheduled_policy_changes",
+    "skills",
+    "releases",
+    "ci_run_reports",
+    "finding_dispositions",
+    "outcome_answers",
+    "live_checks",
+    "steward_false_approvals",
+    "executor_runs",
+    "executor_slots",
+    "chat_pair_codes",
+    "chat_pair_sessions",
+    "agent_messages",
+)
+
+
+async def _business_state(db) -> str:
+    out = {}
+    for table in _GATE_TABLES:
+        rows = await db.execute_fetchall(f"SELECT * FROM {table} ORDER BY 1")
+        out[table] = [tuple(r) for r in rows]
+    return json.dumps(out, default=str, sort_keys=True)
+
+
+def test_the_human_gate_route_list_is_derived_and_not_trivial():
+    routes = _human_gate_routes()
+    paths = {p for _m, p in routes}
+    assert len(routes) >= 25, routes
+    for needle in ("/approve", "/reject", "/decide", "/force-complete", "/start"):
+        assert any(p.endswith(needle) for p in paths), needle
+
+
+async def test_ci_runner_key_is_refused_by_every_human_route(ci_runner_hub):
+    """AC-1 (#1639): a REAL ci_runner DB key, closed mode, every human gate."""
+    hub = ci_runner_hub
+    created = await hub.client.post(
+        "/api/tasks", json={"title": "gate probe"}, headers=hub.human
+    )
+    assert created.status_code in (200, 201), created.text
+    # Slug "1" and id 1 are what the path filler puts into every route, so the
+    # routes act on real rows and a leaked call WOULD change something.
+    proj = await hub.client.post(
+        "/api/projects", json={"slug": "1", "name": "One"}, headers=hub.human
+    )
+    assert proj.status_code == 200, proj.text
+    before = await _business_state(hub.db)
+    routes = _human_gate_routes()
+    assert routes
+    leaked: list[tuple[str, str, int, str]] = []
+    for method, path in routes:
+        resp = await hub.client.request(
+            method,
+            _fill_path(path),
+            headers=hub.ci,
+            json={},
+            follow_redirects=False,
+        )
+        refused = resp.status_code == 403 and "human_only_gate" in resp.text
+        if not refused:
+            leaked.append((method, path, resp.status_code, resp.text[:120]))
+        # After EVERY request, not once at the end: a leak that a later route
+        # undoes (or that a later failure hides) must still be seen.
+        if await _business_state(hub.db) != before:
+            leaked.append((method, path, resp.status_code, "state changed"))
+            before = await _business_state(hub.db)
+    assert not leaked, leaked
+    who = await hub.client.get("/api/whoami", headers=hub.ci)
+    assert who.status_code == 200, who.text
+    assert who.json()["role"] == "agent", who.json()
+
+
+async def test_ci_runner_browser_session_is_not_human(ci_runner_hub):
+    """AC-1 (#1639): the cookie door (resolve_browser_session) gives no human either."""
+    hub = ci_runner_hub
+    task = await hub.client.post(
+        "/api/tasks", json={"title": "cookie probe"}, headers=hub.human
+    )
+    tid = task.json()["id"]
+    who = await hub.client.get("/api/whoami", headers=hub.ci_cookie)
+    assert who.status_code == 200, who.text
+    assert who.json()["auth_source"] == "db_session", who.json()
+    assert who.json()["role"] == "agent", who.json()
+
+    from hub.services import admin as admin_svc
+
+    token = hub.ci_cookie["Cookie"].split("=", 1)[1]
+    identity = await admin_svc.resolve_browser_session(hub.db, token)
+    assert identity is not None
+    assert identity.is_human is False and identity.is_agent is True
+
+    before = await _business_state(hub.db)
+    rest = await hub.client.post(
+        f"/api/tasks/{tid}/approve", json={}, headers=hub.ci_cookie
+    )
+    assert rest.status_code == 403, rest.text
+    web = await hub.client.get("/chat-pair", headers=hub.ci_cookie)
+    assert web.status_code == 403, web.status_code
+    assert await _business_state(hub.db) == before
+
+
+async def test_ci_runner_may_withdraw_its_own_draft(ci_runner_hub):
+    """Accepted consequence (#1639): ci_runner is an agent, so /withdraw is open."""
+    hub = ci_runner_hub
+    made = await hub.client.post(
+        "/api/tasks",
+        json={"title": "ci draft", "source": "agent", "agent": "ci-1639"},
+        headers=hub.ci,
+    )
+    assert made.status_code in (200, 201), made.text
+    tid = made.json()["id"]
+    resp = await hub.client.post(f"/api/tasks/{tid}/withdraw", headers=hub.ci)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["archived"] is True
