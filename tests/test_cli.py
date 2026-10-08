@@ -2925,3 +2925,24 @@ def test_outcome_debt_passes_page_flags() -> None:
         "only_counts=true",
         "status=overdue",
     ]
+
+
+def test_projects_bootstrap_prints_server_text(capsys) -> None:
+    """AC-5: без флага — text сервера как есть; --json — JSON; нет проекта — rc≠0."""
+    payload = {
+        "project_slug": "demo",
+        "text": "# Стартовый пакет demo\n\nстрока  с  пробелами",
+    }
+
+    rc, api = _run_main(["projects", "bootstrap", "demo"], api_result=payload)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert api.call_args.args == ("GET", "/api/projects/demo/agent-bootstrap")
+    assert out == payload["text"] + "\n"
+
+    rc, _ = _run_main(["projects", "bootstrap", "demo", "--json"], api_result=payload)
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == payload
+
+    rc, _ = _run_main(["projects", "bootstrap", "nope"], api_side_effect=SystemExit(1))
+    assert rc == 1

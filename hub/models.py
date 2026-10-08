@@ -2835,6 +2835,49 @@ class WorkingRules(BaseModel):
     repository_rules: WorkingRulesRepository
 
 
+class BootstrapMcpConfig(BaseModel):
+    """Раздел 1 стартового пакета: подключение MCP. Токен — только плейсхолдер."""
+
+    server_name: str
+    transport: str
+    url: str
+    authorization: str
+
+
+class BootstrapSkill(BaseModel):
+    name: str
+    version: int
+
+
+class BootstrapRulesFile(BaseModel):
+    """Файл правил базовой ветки: только состояние. Причина чтения не отдаётся."""
+
+    path: str
+    state: str  # present | missing | unreadable
+
+
+class AgentBootstrap(BaseModel):
+    """Стартовый пакет проекта (#1631): первое сообщение агенту без credentials.
+
+    Строится только из разрешённых полей; ``text`` — единый серверный рендер
+    тех же данных, CLI печатает его как есть. workspace_path не входит.
+    """
+
+    project_slug: str
+    project_name: str
+    repo: str = ""
+    base_branch: str = ""
+    mcp: BootstrapMcpConfig
+    first_calls: list[str]
+    skills: list[BootstrapSkill]
+    policy_brief: list[str]
+    rules_files: list[BootstrapRulesFile]
+    ci_before_submit: str
+    submit_order: list[str]
+    human_only: list[str]
+    text: str
+
+
 class TaskView(BaseModel):
     id: int
     title: str
