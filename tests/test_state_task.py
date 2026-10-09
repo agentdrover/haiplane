@@ -955,3 +955,26 @@ async def test_the_queue_hands_a_state_task_to_people_but_not_to_the_executor(
     for_executor = await oq.next_task(db, project, exclude_state=True)
     assert for_executor["next_task_id"] == commit_id
     assert state_id not in [c["task_id"] for c in for_executor["candidates"]]
+
+
+async def test_the_statement_stays_editable_while_running_before_the_first_submission(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """Заморозка — после СДАЧИ: пока поколения нет, правка в running допустима."""
+    task_id = await make_state_task(db)
+    assert (await pair_start(client, task_id)).status_code == 200
+    refined = await client.post(
+        f"/api/tasks/{task_id}/refine", json={"rollback": "уточнённый"}
+    )
+    assert refined.status_code == 200, refined.text
+    added = await client.post(
+        f"/api/tasks/{task_id}/acceptance_criteria",
+        json={
+            "id": "AC-3",
+            "given": "g",
+            "when": "w",
+            "then": "t",
+            "verifiable_by": "manual",
+        },
+    )
+    assert added.status_code == 201, added.text

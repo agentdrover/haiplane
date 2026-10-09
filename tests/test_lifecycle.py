@@ -1912,6 +1912,9 @@ async def test_state_pair_start_has_no_git_and_submit_takes_evidence_without_ci(
         assert view["status"] == "running"
         stored = dict(await repo.get_task(db, task_id))
         assert not stored["branch"], stored["branch"]
+        assert stored["git_mode"] == "remote", (
+            "state записывается как remote в любом режиме: хост хаба в git не ходит"
+        )
         if isinstance(git, GitSpy):
             assert git.calls == [], f"git-вызовы на pair-start: {git.calls}"
 

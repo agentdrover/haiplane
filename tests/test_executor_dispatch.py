@@ -3673,3 +3673,32 @@ async def test_state_tasks_refuse_headless_and_cloud_executor_doors(
         assert await counts() == totals_before, (label, "бронь/код/строка прогона")
         assert dict(await repo.get_task(db, task_id))["status"] == status_before, label
     assert calls == [], "провайдер зван ради state-задачи"
+
+
+async def test_a_state_candidate_at_the_head_of_the_queue_does_not_block_the_executor(
+    db, monkeypatch
+):
+    """Очередь отдаёт исполнителю первую НЕ-state задачу, а не упирается в state."""
+    from hub import services
+    from hub.models import TaskCreate, TaskRefine
+
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    project, commit_id = await _launch_project(db, slug="exec-state-head")
+    head = (await services.create_task(db, TaskCreate(title="state во главе"))).id
+    await repo.update_task(
+        db,
+        head,
+        project_id=int(project["id"]),
+        priority="critical",
+        dor_passed=1,
+    )
+    await repo.update_task_structured(
+        db, head, TaskRefine(result_kind="state", rollback="откат")
+    )
+    await db.commit()
+
+    result = await el.launch_executor(db, project, issuer_principal_id=await _human(db))
+
+    assert result.launched and result.task_id == commit_id, result
+    assert len(calls) == 1
