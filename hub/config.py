@@ -840,6 +840,20 @@ class TokenIdentity:
         return self.role == "watcher"
 
     @property
+    def is_scoped_ci(self) -> bool:
+        """A CI key bound to projects (#1644): confined to the CI routes.
+
+        Damaged scopes count as bound: a key whose binding cannot be read is
+        refused, never widened. Keys without any scope (legacy) are not
+        confined here; they are flagged by the CI entrances instead.
+        """
+        bound = bool(self.scopes) or self.scopes_damaged
+        return bound and (
+            "tasks.ci_report" in self.permissions
+            or "deploys.record" in self.permissions
+        )
+
+    @property
     def is_human(self) -> bool:
         if self.is_steward or self.is_watcher:
             return False

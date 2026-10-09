@@ -20,12 +20,15 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from hub.db import write_transaction
+
 log = logging.getLogger(__name__)
 
 EVENT_UNSCOPED_KEY = "ci_key_unscoped"
 REASON_REPORT = "ci_report_out_of_scope"
 REASON_DEPLOY = "ci_deploy_out_of_scope"
 REASON_DAMAGED = "ci_key_scope_damaged"
+REASON_INACTIVE = "ci_key_scope_project_inactive"
 
 
 class CIScopeRefused(Exception):
@@ -49,6 +52,7 @@ async def enforce_ci_project_scope(
         )
     scopes = getattr(identity, "scopes", None)
     if scopes:
+        await _require_active_projects(db, scopes)
         if project_slug is None:
             raise CIScopeRefused(
                 out_reason,
@@ -62,6 +66,20 @@ async def enforce_ci_project_scope(
             )
         return
     await _flag_unscoped_key(db, identity)
+
+
+async def _require_active_projects(db: Any, scopes: tuple[str, ...]) -> None:
+    """Every project of the scope must exist and be active, or the key stops."""
+    for slug in scopes:
+        rows = await db.execute_fetchall(
+            "SELECT status FROM projects WHERE slug = ?", (slug,)
+        )
+        if not rows or rows[0][0] != "active":
+            raise CIScopeRefused(
+                REASON_INACTIVE,
+                f"проект {slug!r} из scope ключа не найден или не активен: "
+                "ключ остановлен до выпуска нового.",
+            )
 
 
 async def _flag_unscoped_key(db: Any, identity: Any) -> None:
@@ -78,21 +96,23 @@ async def _flag_unscoped_key(db: Any, identity: Any) -> None:
         # One statement: the existence check and the insert cannot interleave
         # with a parallel callback; the dedup survives a restart (it is in the
         # table, not in memory).
-        await db.execute(
-            "INSERT INTO events (kind, actor, payload) "
-            "SELECT ?, ?, ? WHERE NOT EXISTS ("
-            "SELECT 1 FROM events WHERE kind = ? "
-            "AND json_extract(payload, '$.api_key_id') = ? "
-            "AND json_extract(payload, '$.day') = ?)",
-            (
-                EVENT_UNSCOPED_KEY,
-                identity.username,
-                payload,
-                EVENT_UNSCOPED_KEY,
-                int(key_id),
-                day,
-            ),
-        )
-        await db.commit()
+        # Inside the caller's write transaction when there is one (no early
+        # commit); on its own otherwise.
+        async with write_transaction(db):
+            await db.execute(
+                "INSERT INTO events (kind, actor, payload) "
+                "SELECT ?, ?, ? WHERE NOT EXISTS ("
+                "SELECT 1 FROM events WHERE kind = ? "
+                "AND json_extract(payload, '$.api_key_id') = ? "
+                "AND json_extract(payload, '$.day') = ?)",
+                (
+                    EVENT_UNSCOPED_KEY,
+                    identity.username,
+                    payload,
+                    EVENT_UNSCOPED_KEY,
+                    int(key_id),
+                    day,
+                ),
+            )
     except Exception:  # noqa: BLE001 - a missed flag must not stop CI
         log.warning("could not record the unscoped CI key event", exc_info=True)

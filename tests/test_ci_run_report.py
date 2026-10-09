@@ -812,7 +812,12 @@ async def test_a_scope_project_that_is_not_active_stops_the_key(
     assert resp.json()["detail"]["reason"] == "ci_key_scope_project_inactive"
     dep = await hub.client.post(
         "/api/deploys",
-        json={"sha": "x1", "ref": "main", "status": "success", "project": "audit-in"},
+        json={
+            "sha": "deploysha1",
+            "ref": "main",
+            "status": "success",
+            "project": "audit-in",
+        },
         headers=scoped,
     )
     assert dep.status_code == 403, dep.text

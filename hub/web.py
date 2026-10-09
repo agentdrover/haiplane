@@ -3964,7 +3964,12 @@ async def web_admin_reset_password(principal_id: int, request: Request):
         return await _render_users_page(
             request, flash_msg="User not found", flash_level="error"
         )
-    await admin_svc.set_password(db, principal_id, new_password)
+    try:
+        await admin_svc.set_password(db, principal_id, new_password)
+    except admin_svc.ServicePasswordError as exc:
+        return await _render_users_page(
+            request, flash_msg=str(exc), flash_level="error"
+        )
     await admin_svc.write_audit(
         db,
         actor_id=actor_id,
@@ -4243,7 +4248,11 @@ async def web_admin_create_key(
             projects=[project] if project.strip() else None,
         )
     except admin_svc.ApiKeyScopeError as exc:
-        return await _render_keys_page(request, flash_msg=str(exc), flash_level="error")
+        refused = await _render_keys_page(
+            request, flash_msg=str(exc), flash_level="error"
+        )
+        refused.status_code = 422
+        return refused
     await admin_svc.write_audit(
         db,
         actor_id=actor_id,

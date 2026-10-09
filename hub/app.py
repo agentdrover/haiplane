@@ -2641,26 +2641,8 @@ async def api_record_deploy(
     return DeployView(**row)
 
 
-@app.post("/api/tasks/{task_id}/ci-run-report", response_model=CIRunReportResult)
-async def api_ci_run_report(
-    task_id: int,
-    body: CIRunReportSubmit,
-    request: Request,
-    identity=Depends(require_permission("tasks.ci_report")),
-):
-    """Accept the run evidence CI produced for one commit (#546).
-
-    Execution lives in CI; the hub checks and keeps the result. The report counts
-    only for the commit the hub pinned at submission (#572) — a report for any
-    other commit is stored as evidence for that commit and explicitly not
-    applied, so it can never open a gate for code nobody ran. A stale generation
-    stated by the reporter is refused outright.
-
-    The permission is deliberately narrow (``tasks.ci_report``, held only by the
-    ci_runner role): this token lives in a CI secret and must not be able to move
-    a task or write a verdict.
-    """
-    db = _db(request)
+async def _accept_ci_report_checked(db, identity, task_id: int, body) -> dict:
+    """Guard and store one CI report; the caller holds the write transaction."""
     row = await repo.get_task(db, task_id)
     if row is None:
         raise HTTPException(404, "task not found")
@@ -2708,6 +2690,34 @@ async def api_ci_run_report(
         raise HTTPException(404, "task not found") from None
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
+    return result
+
+
+@app.post("/api/tasks/{task_id}/ci-run-report", response_model=CIRunReportResult)
+async def api_ci_run_report(
+    task_id: int,
+    body: CIRunReportSubmit,
+    request: Request,
+    identity=Depends(require_permission("tasks.ci_report")),
+):
+    """Accept the run evidence CI produced for one commit (#546).
+
+    Execution lives in CI; the hub checks and keeps the result. The report counts
+    only for the commit the hub pinned at submission (#572) — a report for any
+    other commit is stored as evidence for that commit and explicitly not
+    applied, so it can never open a gate for code nobody ran. A stale generation
+    stated by the reporter is refused outright.
+
+    The permission is deliberately narrow (``tasks.ci_report``, held only by the
+    ci_runner role): this token lives in a CI secret and must not be able to move
+    a task or write a verdict.
+    """
+    db = _db(request)
+    # #1644: the project of the task, the key's scope, the generation and the
+    # UPSERT are read and written under ONE write transaction. Without it the
+    # epic's project could change between the guard and the write.
+    async with write_transaction(db):
+        result = await _accept_ci_report_checked(db, identity, task_id, body)
     return CIRunReportResult(**result)
 
 
@@ -3854,7 +3864,12 @@ async def api_admin_create_key(
     from hub.services import admin as admin_svc
 
     identity = _identity
-    body = ApiKeyCreate(**(await request.json()))
+    try:
+        body = ApiKeyCreate(**(await request.json()))
+    except ValidationError as exc:
+        import json as _json
+
+        raise HTTPException(422, detail=_json.loads(exc.json())) from None
     try:
         key_data = await admin_svc.create_api_key(
             _db(request),
@@ -3911,7 +3926,10 @@ async def api_admin_set_password(
 
     identity = _identity
     body = PasswordSetPayload(**(await request.json()))
-    await admin_svc.set_password(_db(request), principal_id, body.password)
+    try:
+        await admin_svc.set_password(_db(request), principal_id, body.password)
+    except admin_svc.ServicePasswordError as exc:
+        raise HTTPException(422, str(exc)) from None
     await admin_svc.write_audit(
         _db(request),
         actor_id=identity.principal_id,

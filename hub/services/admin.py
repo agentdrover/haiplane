@@ -421,8 +421,10 @@ def parse_key_scopes(raw: Any) -> tuple[tuple[str, ...], bool]:
     that is not a JSON list of ``"project:<slug>"`` strings is damaged: the
     caller refuses such a key instead of treating it as unrestricted.
     """
+    # Only a well-formed JSON list is a binding; NULL, "" and the rest are
+    # damage, not "no restriction".
     try:
-        data = json.loads(raw if raw not in (None, "") else "[]")
+        data = json.loads(raw)
     except (TypeError, ValueError):
         return (), True
     if not isinstance(data, list):
@@ -443,7 +445,11 @@ async def _scope_entries(
     db: aiosqlite.Connection, projects: list[str] | None
 ) -> list[str]:
     entries: list[str] = []
-    for slug in dict.fromkeys(s.strip() for s in projects or [] if s and s.strip()):
+    cleaned = [(s or "").strip() for s in projects or []]
+    if any(not s for s in cleaned):
+        # A blank slug would otherwise issue a key with no binding at all.
+        raise ApiKeyScopeError("project slug must not be blank")
+    for slug in dict.fromkeys(cleaned):
         rows = await fetchall(db, "SELECT status FROM projects WHERE slug = ?", (slug,))
         if not rows or dict(rows[0]).get("status") != "active":
             raise ApiKeyScopeError(f"project {slug!r} not found or not active")
@@ -643,6 +649,8 @@ async def resolve_browser_session(
     row = dict(rows[0])
     if row["status"] != "active":
         return None
+    if row["kind"] == "service":
+        return None  # #1644: a CI principal has no browser door
     try:
         exp = datetime.fromisoformat(row["expires_at"])
         if exp.tzinfo is None:
@@ -716,7 +724,8 @@ async def authenticate_password(
     """Verify username + password. Returns principal_id on success, None on failure."""
     rows = await fetchall(
         db,
-        "SELECT p.id, p.status, pc.password_hash, pc.failed_attempts, pc.locked_until "
+        "SELECT p.id, p.status, p.kind, pc.password_hash, pc.failed_attempts, "
+        "pc.locked_until "
         "FROM principals p "
         "JOIN password_credentials pc ON p.id = pc.principal_id "
         "WHERE p.username = ?",
@@ -725,7 +734,7 @@ async def authenticate_password(
     if not rows:
         return None
     row = dict(rows[0])
-    if row["status"] != "active":
+    if row["status"] != "active" or row["kind"] == "service":
         return None
     if row.get("locked_until"):
         try:
@@ -767,9 +776,21 @@ async def authenticate_password(
     return row["id"]
 
 
+class ServicePasswordError(ValueError):
+    """A service principal (CI) has no password and no browser login (#1644)."""
+
+
 async def set_password(
     db: aiosqlite.Connection, principal_id: int, password: str
 ) -> None:
+    kind_rows = await fetchall(
+        db, "SELECT kind FROM principals WHERE id = ?", (principal_id,)
+    )
+    if kind_rows and dict(kind_rows[0])["kind"] == "service":
+        raise ServicePasswordError(
+            "service principals authenticate with API keys only; "
+            "a password would open a browser session"
+        )
     pw_hash = hash_password(password)
     existing = await fetchall(
         db,

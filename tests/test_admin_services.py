@@ -442,9 +442,16 @@ async def test_ci_runner_resolves_to_an_agent_identity_in_both_db_resolvers(
     await admin_svc.set_principal_roles(db, p["id"], roles)
     key = await admin_svc.create_api_key(db, p["id"], name="k")
     session = await admin_svc.create_browser_session(db, p["id"])
+    cookie = await admin_svc.resolve_browser_session(db, session)
+    if kind == "service":
+        # #1644: a CI (service) principal has no browser door at all.
+        assert cookie is None
+        cookie_idents = []
+    else:
+        cookie_idents = [cookie]
     for ident in (
         await admin_svc.resolve_api_key(db, key["plaintext_key"]),
-        await admin_svc.resolve_browser_session(db, session),
+        *cookie_idents,
     ):
         assert ident is not None
         assert ident.role == "agent"
