@@ -611,3 +611,22 @@ async def test_the_group_is_signalled_before_the_leader_is_waited_for():
         process_kill.os.killpg = real
 
     assert events[0] == "killpg" and events[-1] == "wait", events
+
+
+async def test_killing_a_group_whose_output_was_never_drained_still_finishes():
+    # Python 3.11 only wakes wait() when the pipes are closed; a child blocked
+    # on a full pipe that nobody reads never closes it (found in CI on 3.11).
+    import hub.process_kill as process_kill
+
+    proc = await asyncio.create_subprocess_exec(
+        "python3",
+        "-c",
+        "import sys, time; sys.stdout.write('x' * 3000000); time.sleep(60)",
+        stdout=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    await asyncio.sleep(0.3)
+    await asyncio.wait_for(
+        process_kill.kill_process_group(proc, pgid=proc.pid), timeout=10
+    )
+    assert proc.returncode is not None

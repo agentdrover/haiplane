@@ -17,6 +17,7 @@ subprocess timeout (#363), and importing it from there would be a cycle.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -68,5 +69,13 @@ async def kill_process_group(proc: Any, *, pgid: int | None = None) -> None:
     # and signalling an already-dead process is a no-op.
     with contextlib.suppress(ProcessLookupError, OSError):
         proc.kill()
-    with contextlib.suppress(ProcessLookupError, OSError):
-        await proc.wait()
+    # Python 3.11 wakes ``wait()`` only once the pipes are closed, and a pipe
+    # whose reader stopped early (output over a cap) never reaches EOF: closing
+    # the transport first is what lets the reap finish. The wait is bounded too,
+    # so a stuck reap cannot hold a caller's own deadline hostage.
+    transport = getattr(proc, "_transport", None)
+    if transport is not None:
+        with contextlib.suppress(Exception):
+            transport.close()
+    with contextlib.suppress(ProcessLookupError, OSError, TimeoutError):
+        await asyncio.wait_for(proc.wait(), timeout=5)
