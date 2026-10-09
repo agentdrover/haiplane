@@ -392,6 +392,10 @@ async def test_executor_discipline_seed_teaches_resubmission_and_waits_as_draft(
         "an unconditional single-submission rule contradicts the resubmission rule"
     )
     assert "hub-submit-task" in text
+    # The draft must be the whole active text with the fix on top, not a
+    # shorter version a person would lose sections by activating.
+    assert "## Вопрос — это стоп" in text
+    assert "## Правила пилота" in text
     assert "#1054" in text and "#1265" in text
 
     # The spec teaches the same rules to people who write the order; it is the
