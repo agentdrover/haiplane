@@ -2567,19 +2567,13 @@ async def api_deliver_delivery_discrepancy(
         ) from exc
 
 
-async def _enforce_ci_scope(
-    db, identity, project_slug, *, entrance: str, project_status: str = "active"
-) -> None:
+async def _enforce_ci_scope(db, identity, project_slug, *, entrance: str) -> None:
     """403 when the key may not speak for this project (#1644)."""
     from hub.services import ci_scope
 
     try:
         await ci_scope.enforce_ci_project_scope(
-            db,
-            identity,
-            project_slug,
-            entrance=entrance,
-            project_status=project_status,
+            db, identity, project_slug, entrance=entrance
         )
     except ci_scope.CIScopeRefused as exc:
         raise HTTPException(
@@ -2654,6 +2648,8 @@ async def _accept_ci_report_checked(db, identity, task_id: int, body) -> dict:
         raise HTTPException(404, "task not found")
     # #1644: the project check comes before the stale check and before every
     # write — a report from a key of another project changes nothing.
+    # Authorization reads the REAL binding: routing would send an inactive
+    # project to default, and a "default" key must not inherit that.
     project_row = await repo.resolve_bound_project(db, task_id)
     bound = dict(project_row) if project_row is not None else None
     await _enforce_ci_scope(
@@ -2661,7 +2657,6 @@ async def _accept_ci_report_checked(db, identity, task_id: int, body) -> dict:
         identity,
         str(bound["slug"]) if bound else "default",
         entrance="ci_report",
-        project_status=str(bound["status"]) if bound else "active",
     )
     current_generation = dict(row).get("submission_generation") or 0
     if (
