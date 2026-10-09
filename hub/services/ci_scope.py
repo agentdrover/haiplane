@@ -20,7 +20,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from hub.db import write_transaction
+from hub.db import fetchall, write_transaction
 
 log = logging.getLogger(__name__)
 
@@ -71,9 +71,7 @@ async def enforce_ci_project_scope(
 async def _require_active_projects(db: Any, scopes: tuple[str, ...]) -> None:
     """Every project of the scope must exist and be active, or the key stops."""
     for slug in scopes:
-        rows = await db.execute_fetchall(
-            "SELECT status FROM projects WHERE slug = ?", (slug,)
-        )
+        rows = await fetchall(db, "SELECT status FROM projects WHERE slug = ?", (slug,))
         if not rows or rows[0][0] != "active":
             raise CIScopeRefused(
                 REASON_INACTIVE,
