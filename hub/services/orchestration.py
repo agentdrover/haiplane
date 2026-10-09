@@ -2256,6 +2256,8 @@ async def restore_pair_workspace_base(
     row = await repo.get_task(db, task_id)
     if row and (dict(row).get("git_mode") or "hub") == "remote":
         return
+    if row and automation_not_applicable(row):
+        return  # #1647: у задачи-состояния нет worktree и рабочей копии
     ctx = await project_git_context(db, task_id)
     local_kw, _ = _split_git_kwargs(ctx)
     if worktree_per_task_enabled():
@@ -2281,8 +2283,8 @@ async def switch_pair_workspace_to_task(
     """
     row = await repo.get_task(db, task_id)
     task = dict(row) if row else {}
-    if (task.get("git_mode") or "hub") == "remote":
-        return
+    if (task.get("git_mode") or "hub") == "remote" or automation_not_applicable(task):
+        return  # #1647: state не переключает рабочую копию
     branch = (task.get("branch") or "").strip()
     if not branch:
         return

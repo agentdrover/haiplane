@@ -26,6 +26,7 @@ from hub.services.result_kind import (
 )
 from tests.state_support import (
     MARKER,
+    ROLLBACK,
     auth,
     drive_to_review,
     evidence_for,
@@ -1119,3 +1120,285 @@ async def test_the_repair_door_does_not_return_a_state_task_to_work(
     assert await fingerprint(db, task_id) == before, "статус и лента прежние"
     assert dict(await repo.get_task(db, task_id))["status"] == "review"
     assert calls == []
+
+
+# --- круг Codex по 54fb235 ---------------------------------------------------
+
+
+async def test_evidence_never_leaks_through_validation_errors(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """P1: ни MCP (диспетчер FastMCP), ни REST не возвращают evidence в ошибке схемы."""
+    from hub import mcp_server
+
+    secret = "ghp_" + "a1B2c3D4e5F6" * 3  # pragma: allowlist secret
+    task_id = await make_state_task(db)
+    assert (await pair_start(client, task_id)).status_code == 200
+    before = await fingerprint(db, task_id)
+
+    async def post(path, body=None, **_):
+        resp = await client.post(path, json=body or {})
+        if resp.status_code >= 400:
+            raise mcp_server.HubApiError(
+                mcp_server._parse_api_error(resp, resp.status_code)
+            )
+        return resp.json()
+
+    async def get(path, **_):
+        return (await client.get(path)).json()
+
+    real_post, real_get = mcp_server._api_post, mcp_server._api_get
+    mcp_server._api_post, mcp_server._api_get = post, get
+    try:
+        for bad in (secret, [secret], [{"ac_id": ["x", secret]}], {"k": secret}):
+            try:
+                out = await mcp_server.mcp.call_tool(
+                    "hub_submit_for_review", {"task_id": task_id, "evidence": bad}
+                )
+                text = repr(out)
+            except Exception as exc:  # noqa: BLE001 - ToolError и ему подобные
+                text = f"{type(exc).__name__}: {exc}"
+            assert secret not in text, text
+    finally:
+        mcp_server._api_post, mcp_server._api_get = real_post, real_get
+
+    for body in ([{"evidence": secret}], secret, [secret], {"evidence": {"x": secret}}):
+        resp = await client.post(f"/api/tasks/{task_id}/submit-review", json=body)
+        assert resp.status_code == 422, resp.text
+        assert secret not in resp.text, resp.text
+    assert await fingerprint(db, task_id) == before
+
+
+async def test_a_failure_after_the_parent_rollup_rolls_the_whole_completion_back(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """P2-1: свёртка feature/epic идёт в транзакции вызывающего, не фиксируя её."""
+    from hub.services import lifecycle
+
+    headers = auth(monkeypatch)
+    pid = await make_project(db, "st-rollup")
+    task_id = await make_state_task(db, project_id=pid)
+    await drive_to_review(client, db, task_id, headers=headers["impl"])
+    feature = dict(await repo.get_task(db, task_id))["parent_id"]
+    epic = dict(await repo.get_task(db, feature))["parent_id"]
+    real = lifecycle.maybe_rollup_parent
+
+    async def rollup_then_fail(*args, **kwargs):
+        await real(*args, **kwargs)
+        assert dict(await repo.get_task(db, feature))["status"] != "x"
+        raise RuntimeError("сбой после свёртки")
+
+    monkeypatch.setattr(lifecycle, "maybe_rollup_parent", rollup_then_fail)
+    with pytest.raises(RuntimeError):
+        await client.post(
+            f"/api/tasks/{task_id}/review-verdict",
+            json={"verdict": "approved", "expected_generation": 1},
+            headers=headers["human"],
+        )
+    for found in (task_id, feature, epic):
+        row = dict(await repo.get_task(db, found))
+        assert row["status"] in ("review", "open"), (found, row["status"])
+    task = dict(await repo.get_task(db, task_id))
+    assert task["status"] == "review" and not task["review_verdict"]
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM events WHERE task_id=? AND kind='task_completed'", (task_id,)
+    )
+
+
+async def _changes_requested(client: AsyncClient, task_id: int) -> None:
+    resp = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "comments": "AC-2 уточнить",
+            "expected_generation": 1,
+        },
+    )
+    assert resp.status_code == 200 and resp.json()["status"] == "running", resp.text
+
+
+async def test_a_question_does_not_unfreeze_the_statement(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """P2-2: заморозку снимает явный возврат, а не смена статуса."""
+    task_id = await make_state_task(db)
+    await drive_to_review(client, db, task_id)
+    await _changes_requested(client, task_id)
+    asked = await client.post(
+        f"/api/tasks/{task_id}/question", json={"agent": "dev", "question": "как быть?"}
+    )
+    assert asked.status_code == 200 and asked.json()["status"] == "needs_info", (
+        asked.text
+    )
+    before = await fingerprint(db, task_id)
+    new_ac = {
+        "id": "AC-3",
+        "given": "g",
+        "when": "w",
+        "then": "t",
+        "verifiable_by": "manual",
+    }
+    for call in (
+        client.post(f"/api/tasks/{task_id}/refine", json={"rollback": "иной"}),
+        client.post(f"/api/tasks/{task_id}/acceptance_criteria", json=new_ac),
+        client.put(
+            f"/api/tasks/{task_id}/acceptance_criteria/AC-1",
+            json=dict(new_ac, id="AC-1"),
+        ),
+        client.delete(f"/api/tasks/{task_id}/acceptance_criteria/AC-2"),
+    ):
+        resp = await call
+        assert resp.status_code == 409 and "возврат в работу" in resp.text, resp.text
+    assert await fingerprint(db, task_id) == before
+    assert dict(await repo.get_task(db, task_id))["rollback"] == ROLLBACK
+
+
+async def test_the_full_cycle_changes_requested_return_edit_resubmit(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """P2-3: человек возвращает state из running и из needs_info; правка; сдача №2."""
+    from tests.state_support import ROLLBACK as OLD
+
+    for how in ("running", "needs_info", "open"):
+        task_id = await make_state_task(db, title=f"цикл {how}")
+        await drive_to_review(client, db, task_id)
+        await _changes_requested(client, task_id)
+        if how == "needs_info":
+            await client.post(
+                f"/api/tasks/{task_id}/question", json={"agent": "dev", "question": "q"}
+            )
+        if how == "open":
+            await db.execute("UPDATE tasks SET status='open' WHERE id=?", (task_id,))
+            await db.commit()
+        assert (
+            await client.post(f"/api/tasks/{task_id}/refine", json={"rollback": "x"})
+        ).status_code == 409, how
+        returned = await client.post(
+            f"/api/tasks/{task_id}/return-to-work", json={"reason": "уточняем AC"}
+        )
+        assert returned.status_code == 200 and returned.json()["status"] == "open", (
+            how,
+            returned.text,
+        )
+        edited = await client.post(
+            f"/api/tasks/{task_id}/refine", json={"rollback": OLD + " (уточнён)"}
+        )
+        assert edited.status_code == 200, (how, edited.text)
+        added = await client.post(
+            f"/api/tasks/{task_id}/acceptance_criteria",
+            json={
+                "id": "AC-3",
+                "given": "g",
+                "when": "w",
+                "then": "t",
+                "verifiable_by": "manual",
+            },
+        )
+        assert added.status_code == 201, (how, added.text)
+        assert (await pair_start(client, task_id)).status_code == 200
+        sent = await submit(client, task_id, evidence_for(("AC-1", "AC-2", "AC-3")))
+        assert sent.status_code == 200 and sent.json()["submission_generation"] == 2, (
+            sent.text
+        )
+        assert sorted({r["generation"] for r in await evidence_rows(db, task_id)}) == [
+            1,
+            2,
+        ]
+        # сдача №2 замораживает постановку снова
+        again = await client.post(
+            f"/api/tasks/{task_id}/refine", json={"rollback": "ещё"}
+        )
+        assert again.status_code == 409, (how, again.text)
+
+    commit_id = await make_state_task(db, result_kind="commit")
+    await db.execute("UPDATE tasks SET status='running' WHERE id=?", (commit_id,))
+    await db.commit()
+    refused = await client.post(
+        f"/api/tasks/{commit_id}/return-to-work", json={"reason": "x"}
+    )
+    assert refused.status_code == 400, "commit-задача: прежний перечень статусов"
+
+
+async def test_the_state_parent_check_is_repeated_under_the_insert_lock(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """P2-4: между первой проверкой и вставкой родитель стал state — ребёнка нет."""
+    from hub.services import lifecycle
+
+    real = lifecycle._refuse_state_parent
+
+    def flip_after_first_check(parent_id):
+        calls = {"n": 0}
+
+        async def wrapper(db_, pid):
+            await real(db_, pid)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                await db_.execute(
+                    "UPDATE tasks SET result_kind='state' WHERE id=?", (parent_id,)
+                )
+                await db_.commit()
+
+        return wrapper
+
+    for label in ("single", "bulk"):
+        parent = (
+            await client.post(
+                "/api/tasks", json={"title": f"родитель {label}", "source": "agent"}
+            )
+        ).json()["id"]
+        monkeypatch.setattr(
+            lifecycle, "_refuse_state_parent", flip_after_first_check(parent)
+        )
+        if label == "single":
+            resp = await client.post(
+                "/api/tasks",
+                json={"title": "ребёнок", "task_type": "subtask", "parent_id": parent},
+            )
+        else:
+            resp = await client.post(
+                f"/api/tasks/{parent}/subtasks",
+                json={
+                    "items": [{"title": "ребёнок"}],
+                    "task_type": "subtask",
+                    "source": "agent",
+                },
+            )
+        assert resp.status_code == 422, (label, resp.text)
+        kids = await db.execute_fetchall(
+            "SELECT 1 FROM tasks WHERE parent_id=?", (parent,)
+        )
+        assert not kids, (label, "ребёнок появился у state-задачи")
+
+
+async def test_claim_and_release_never_touch_git_for_a_state_task(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """P2-5: claim -> release без pair-start: ноль обращений к git; commit — как раньше."""
+    from hub.integrations.registry import plugins
+    from tests.state_support import GitSpy
+
+    spy = GitSpy()
+    plugins.git_ops = spy
+    task_id = await make_state_task(db)
+    claimed = await client.post(
+        f"/api/tasks/{task_id}/claim", json={"agent": "dev", "session_id": "s-claim"}
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert dict(await repo.get_task(db, task_id))["git_mode"] == "remote"
+    released = await client.post(
+        f"/api/tasks/{task_id}/release", json={"agent": "dev", "reason": "передумал"}
+    )
+    assert released.status_code == 200, released.text
+    assert spy.calls == [], f"git у state-задачи: {spy.calls}"
+
+    # cleanup-хелперы сами отказывают, даже если git_mode остался hub
+    from hub.services import lifecycle, orchestration
+
+    await db.execute("UPDATE tasks SET git_mode='hub' WHERE id=?", (task_id,))
+    await db.commit()
+    await lifecycle._try_restore_pair_workspace(db, task_id)
+    await lifecycle._try_switch_pair_workspace_to_task(db, task_id)
+    await orchestration.restore_pair_workspace_base(db, task_id)
+    await orchestration.switch_pair_workspace_to_task(db, task_id)
+    assert spy.calls == [], f"git у state-задачи: {spy.calls}"

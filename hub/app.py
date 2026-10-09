@@ -22,6 +22,8 @@ from fastapi import (
     status,
 )
 from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -2346,6 +2348,27 @@ async def api_task_context(
         "working_rules": working_rules,
         "path_brief": path_brief,
     }
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError):
+    """422 тела запроса. Для сдачи значения запроса в ответ не попадают (#1647).
+
+    Внешнее тело сдачи state-задачи несёт evidence, а в observed может лежать
+    секрет: стандартный ответ pydantic возвращает ``input`` целиком. Для этого
+    маршрута остаются место и вид ошибки; остальные маршруты — как были.
+    """
+    if request.url.path.endswith("/submit-review"):
+        errors = [
+            {
+                "loc": list(e.get("loc", ())),
+                "type": e.get("type", ""),
+                "msg": e.get("msg", ""),
+            }
+            for e in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": errors})
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.post("/api/tasks/{task_id}/submit-review", response_model=TaskView)

@@ -227,8 +227,8 @@ async def _try_restore_pair_workspace(
 ) -> None:
     """Best-effort workspace restore; must not break lifecycle transitions (#451)."""
     row = await repo.get_task(db, task_id)
-    if _git_mode_is_remote(row):
-        return
+    if _git_mode_is_remote(row) or is_state(row):
+        return  # #1647: у задачи-состояния рабочей копии нет ни в каком режиме
     try:
         await restore_pair_workspace_base(db, task_id)
     except Exception as exc:
@@ -262,7 +262,7 @@ async def _try_switch_pair_workspace_to_task(
 ) -> None:
     """Best-effort workspace switch to the task branch for rework (#457)."""
     row = await repo.get_task(db, task_id)
-    if _git_mode_is_remote(row):
+    if _git_mode_is_remote(row) or is_state(row):
         return
     try:
         await switch_pair_workspace_to_task(db, task_id)
@@ -450,8 +450,14 @@ async def reset_mis_issued_assignment(
     return True
 
 
-async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
-    """Auto-complete feature/epic when every direct child is terminal (#742)."""
+async def maybe_rollup_parent(
+    db: aiosqlite.Connection, child_id: int, *, commit: bool = True
+) -> None:
+    """Auto-complete feature/epic when every direct child is terminal (#742).
+
+    ``commit=False`` (#1647) — внутри транзакции вызывающего: свёртка не
+    фиксирует её раньше времени, владелец коммитит или откатывает всё сам.
+    """
     row = await repo.get_task(db, child_id)
     if not row:
         return
@@ -489,15 +495,16 @@ async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
     ):
         refreshed = await repo.get_task(db, parent_id)
         if refreshed and dict(refreshed)["status"] == "completed":
-            await maybe_rollup_parent(db, parent_id)
+            await maybe_rollup_parent(db, parent_id, commit=commit)
         return
 
     await log_activity(
         db,
         "task_completed",
         f"Task #{parent_id} auto-completed: all children done",
+        commit=commit,
     )
-    await maybe_rollup_parent(db, parent_id)
+    await maybe_rollup_parent(db, parent_id, commit=commit)
 
 
 async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
@@ -1094,6 +1101,11 @@ async def create_task(
         # пропускала бы работу, запрещённую уже действующей заморозкой.
         if owns_tx:
             await db.execute("BEGIN IMMEDIATE")
+        # #1647: тот же вопрос ещё раз — под замком, которым защищена вставка:
+        # конкурентный refine мог перевести листовой draft в state после первой
+        # проверки. Refine читает детей под своей транзакцией, значит из двух
+        # операций выигрывает одна.
+        await _refuse_state_parent(db, body.parent_id)
         if idem_key:
             existing = await repo.get_task_idempotency_key(db, idem_key)
             if existing:
@@ -1298,6 +1310,7 @@ async def create_subtasks_bulk(
 
     created_ids: list[int] = []
     async with write_transaction(db):
+        await _refuse_state_parent(db, parent_id)  # #1647: под замком вставки
         if initial_status != "draft":
             await _require_bulk_admission(db, parent_id, body.items)
         await db.execute("SAVEPOINT bulk_child_tasks")
@@ -4784,6 +4797,10 @@ async def _claim_write(
         "claimed_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
         "assigned_agent": body.agent,
     }
+    if is_state(await repo.get_task(db, task_id)):
+        # #1647: git_mode=remote уже на claim — release/cleanup до pair-start не
+        # идут в git хоста хаба.
+        claim_fields["git_mode"] = PairGitMode.remote.value
     if implementer_principal_id is not None:
         claim_fields["implementer_principal_id"] = implementer_principal_id
     await repo.update_task(db, task_id, **claim_fields)
@@ -5310,7 +5327,14 @@ async def return_to_work(
         raise HTTPException(404, "task not found")
     task = dict(row)
     from_status = task["status"]
-    if from_status not in RETURN_TO_WORK_STATUSES:
+    state_task = is_state(task)
+    # #1647: задачу-состояние возвращают и из running после отказного вердикта,
+    # и из needs_info, и из open (ушла по реестру сессий): без этой двери
+    # замороженную постановку нельзя было бы править.
+    allowed = RETURN_TO_WORK_STATUSES | (
+        {"running", "needs_info", "open"} if state_task else frozenset()
+    )
+    if from_status not in allowed:
         raise HTTPException(
             400,
             "can only return review or fix_requested tasks to work, "
@@ -5341,6 +5365,12 @@ async def return_to_work(
         # open task would keep it out of the pair delivery sweep later.
         job_id=None,
         review_job_id=None,
+        # #1647: явный возврат размораживает постановку на этом поколении.
+        **(
+            {"unfrozen_generation": int(task.get("submission_generation") or 0)}
+            if state_task
+            else {}
+        ),
     )
     await note_session_task(db, task.get("claim_session_id") or "", None)
     await repo.add_task_update(

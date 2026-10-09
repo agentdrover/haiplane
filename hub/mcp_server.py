@@ -2548,7 +2548,7 @@ async def hub_submit_for_review(
     finding_outcomes: list[dict[str, Any]] | None = None,
     mutations: list[dict[str, Any]] | None = None,
     prevention: dict[str, Any] | None = None,
-    evidence: list[dict[str, Any]] | None = None,
+    evidence: Any = None,
 ) -> str:
     """AUTHOR step: hand your work to a review by someone else (#307).
 

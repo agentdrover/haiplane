@@ -2701,6 +2701,15 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ALTER TABLE tasks ADD COLUMN rollback TEXT NOT NULL DEFAULT ''",
     ),
     (
+        # #1647: поколение, на котором человек явно вернул state-задачу в работу
+        # (return-to-work, rework). Постановка state-задачи заморожена, пока
+        # поколение сдачи не равно этому числу; новая сдача поднимает поколение
+        # и замораживает её снова. Признак возврата, а не статуса: вопрос
+        # агента (needs_info) заморозку не снимает.
+        "add_tasks_unfrozen_generation",
+        "ALTER TABLE tasks ADD COLUMN unfrozen_generation INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
         # #1647: снимок AC, rollback и result_kind на момент сдачи state-задачи
         # (JSON). Доказательства относятся к снимку, а не к тому, что AC
         # скажут потом. Пусто у сдач commit-задач.

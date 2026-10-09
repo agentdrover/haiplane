@@ -124,20 +124,20 @@ def _frozen_refusal(task: dict[str, Any], what: str) -> HTTPException:
 # Заморозка постановки
 # ---------------------------------------------------------------------------
 
-#: Статусы, в которых постановка state-задачи после сдачи заморожена. open,
-#: draft и needs_info — до работы, их правят свободно (в том числе после
-#: return-to-work: он возвращает задачу в open).
-_FROZEN_STATUSES = frozenset(
-    {"running", "review", "needs_decision", "fix_requested", "ci_check", "completed"}
-)
-
 
 def statement_is_frozen(task: dict[str, Any]) -> bool:
-    """Постановка state-задачи заморожена: сдача была и задача вернулась не в open."""
+    """Постановка state-задачи заморожена: сдача была, явного возврата на ней нет.
+
+    Признак — ``tasks.unfrozen_generation``: поколение, на котором человек
+    вернул задачу в работу (return-to-work, rework). Статус не значим: вопрос
+    агента (needs_info) или уход в open по реестру сессий заморозку не снимают.
+    Новая сдача поднимает поколение, и постановка замерзает снова.
+    """
+    generation = int(task.get("submission_generation") or 0)
     return (
         is_state(task)
-        and int(task.get("submission_generation") or 0) > 0
-        and task.get("status") in _FROZEN_STATUSES
+        and generation > 0
+        and int(task.get("unfrozen_generation") or 0) != generation
     )
 
 
@@ -614,7 +614,7 @@ async def record_state_verdict(
                 payload={"via": "state_approved", "generation": generation},
             )
             await note_session_task(db, fresh.get("claim_session_id") or "", None)
-            await lc.maybe_rollup_parent(db, task_id)
+            await lc.maybe_rollup_parent(db, task_id, commit=False)
         await db.commit()
     await log_activity(
         db,
@@ -649,6 +649,9 @@ async def rework_without_dispatch(db: aiosqlite.Connection, task_id: int) -> Non
         db,
         task_id,
         status="open",
+        unfrozen_generation=int(dict(row).get("submission_generation") or 0)
+        if row is not None
+        else 0,
         job_id=None,
         review_job_id=None,
         claimed_by=None,
