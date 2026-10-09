@@ -519,3 +519,60 @@ async def test_upsert_stores_empty_blocks_for_a_new_row_and_flags_per_key(db):
     )
     row = dict(await repo.get_ci_run_report(db, other, "sha-pinned"))
     assert row["mutations"] == '{"m": 1}' and row["baseline"] == '{"n": 2}'
+
+
+async def test_ci_runner_db_key_reports_and_is_not_human(ci_runner_hub):
+    """AC-3 (#1639): the CI key still reports, and judges like any other agent."""
+    from tests.test_auto_verdict import _submitted_task
+
+    hub = ci_runner_hub
+    db = hub.db
+
+    # Regression: the one job of this key still works.
+    task_id = await _task(db, generation=1, sha="sha-pinned")
+    report = await _post_report(hub.client, hub.ci, task_id)
+    assert report["applied"] is True
+
+    # A foreign task on default whose verdict belongs to the steward: an agent's
+    # approved is refused, changes_requested stays open (the agent's own rule).
+    # The setup helper talks to the API without a token: lend it the human's,
+    # then take it back so every assertion below runs as the CI key.
+    hub.client.headers.update(hub.human)
+    try:
+        foreign = await _submitted_task(
+            hub.client, db, "default", {"verdict": "steward"}
+        )
+        own = await _submitted_task(hub.client, db, "ci-own", {"verdict": "human"})
+    finally:
+        hub.client.headers.pop("Authorization", None)
+    url = f"/api/tasks/{foreign}/review-verdict"
+    refused = await hub.client.post(
+        url, json={"verdict": "approved", "agent": "ci"}, headers=hub.ci
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["error"] == "default_verdict_reserved_for_steward"
+    task = (await hub.client.get(f"/api/tasks/{foreign}", headers=hub.human)).json()
+    assert task["review_verdict"] is None and task["status"] == "review"
+    back = await hub.client.post(
+        url,
+        json={"verdict": "changes_requested", "comments": "fix it", "agent": "ci"},
+        headers=hub.ci,
+    )
+    assert back.status_code == 200, back.text
+
+    # The task this principal implemented cannot be reviewed by it.
+    await db.execute(
+        "UPDATE tasks SET assigned_agent = ?, implementer_principal_id = ? "
+        "WHERE id = ?",
+        (hub.ci_principal["username"], hub.ci_principal["id"], own),
+    )
+    await db.commit()
+    self_review = await hub.client.post(
+        f"/api/tasks/{own}/review-verdict",
+        json={"verdict": "approved", "agent": "someone-else"},
+        headers=hub.ci,
+    )
+    assert self_review.status_code == 403, self_review.text
+    assert self_review.json()["detail"]["reason"] == "self_review_forbidden"
+    task = (await hub.client.get(f"/api/tasks/{own}", headers=hub.human)).json()
+    assert task["review_verdict"] is None and task["status"] == "review"

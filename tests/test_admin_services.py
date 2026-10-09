@@ -355,3 +355,98 @@ async def test_operator_can_human_gate_but_not_admin(db):
     assert identity is not None
     assert identity.has_permission("tasks.human_gate")
     assert not identity.has_permission("admin.users.write")
+
+
+# ---------------------------------------------------------------------------
+# get_effective_role never falls back to "human" for a machine (#1639)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kind", "roles", "expected"),
+    [
+        # the 11 seed roles, one at a time (machine principal: service)
+        ("service", ["super_admin"], "admin"),
+        ("service", ["admin"], "admin"),
+        ("service", ["security_admin"], "admin"),
+        ("service", ["operator"], "human"),
+        ("service", ["developer"], "human"),
+        ("service", ["viewer"], "human"),
+        ("service", ["agent"], "agent"),
+        ("service", ["reviewer_agent"], "agent"),
+        ("service", ["steward"], "steward"),
+        ("service", ["watcher"], "watcher"),
+        ("service", ["ci_runner"], "agent"),
+        # the same role does not change with the principal kind
+        ("agent", ["ci_runner"], "agent"),
+        ("human", ["operator"], "human"),
+        # no role at all: the kind decides, and a machine is never a human
+        ("human", [], "human"),
+        ("service", [], "agent"),
+        ("agent", [], "agent"),
+        # mixed roles: the highest listed one still wins
+        ("service", ["ci_runner", "operator"], "human"),
+        ("service", ["ci_runner", "admin"], "admin"),
+        ("agent", ["ci_runner", "agent"], "agent"),
+        # ci_runner is listed on its own and ranks ABOVE viewer: a viewer role
+        # next to it must not turn the CI key into a human
+        ("service", ["ci_runner", "viewer"], "agent"),
+        ("human", ["ci_runner", "viewer"], "agent"),
+        # the kind does not rescue a CI role: a human-kind ci_runner is a machine
+        ("human", ["ci_runner"], "agent"),
+    ],
+)
+async def test_effective_role_never_falls_back_to_human_for_machines(
+    db, kind, roles, expected
+):
+    p = await admin_svc.create_principal(
+        db, kind=kind, username=f"p-{kind}-{'-'.join(roles) or 'none'}"
+    )
+    if roles:
+        await admin_svc.set_principal_roles(db, p["id"], roles)
+    assert await admin_svc.get_effective_role(db, p["id"]) == expected
+
+
+async def test_effective_role_for_a_role_outside_the_list_and_a_missing_principal(db):
+    await db.execute(
+        "INSERT INTO roles (slug, name, description, system) "
+        "VALUES ('auditor_x', 'Auditor', '', 0)"
+    )
+    await db.commit()
+    machine = await admin_svc.create_principal(db, kind="service", username="svc-x")
+    await admin_svc.set_principal_roles(db, machine["id"], ["auditor_x"])
+    assert await admin_svc.get_effective_role(db, machine["id"]) == "agent"
+    person = await admin_svc.create_principal(db, kind="human", username="per-x")
+    await admin_svc.set_principal_roles(db, person["id"], ["auditor_x"])
+    assert await admin_svc.get_effective_role(db, person["id"]) == "human"
+    # a principal that does not exist is never granted the human gates
+    assert await admin_svc.get_effective_role(db, 987654) != "human"
+
+
+@pytest.mark.parametrize(
+    ("kind", "roles"),
+    [
+        ("service", ["ci_runner"]),
+        ("human", ["ci_runner"]),
+        ("service", ["ci_runner", "viewer"]),
+        ("human", ["ci_runner", "viewer"]),
+    ],
+)
+async def test_ci_runner_resolves_to_an_agent_identity_in_both_db_resolvers(
+    db, kind, roles
+):
+    """The identity the hub builds (key AND session), not just the role string."""
+    p = await admin_svc.create_principal(
+        db, kind=kind, username=f"r-{kind}-{'-'.join(roles)}"
+    )
+    await admin_svc.set_principal_roles(db, p["id"], roles)
+    key = await admin_svc.create_api_key(db, p["id"], name="k")
+    session = await admin_svc.create_browser_session(db, p["id"])
+    for ident in (
+        await admin_svc.resolve_api_key(db, key["plaintext_key"]),
+        await admin_svc.resolve_browser_session(db, session),
+    ):
+        assert ident is not None
+        assert ident.role == "agent"
+        assert ident.is_agent is True
+        assert ident.is_human is False
