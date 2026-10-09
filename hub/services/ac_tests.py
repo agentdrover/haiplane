@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import tempfile
 from typing import Any, Awaitable, Callable
@@ -67,22 +68,31 @@ def _run_env(home: str) -> dict[str, str]:
 _LINE_CAP = 64 * 1024
 
 
+# ``<nodeid> <OUTCOME> [ NN%]``: the outcome is the LAST token of the line, so
+# the nodeid is everything before it, spaces and outcome words inside a
+# parameter id included ("t.py::test_p[case PASSED] FAILED [100%]" is a FAILED
+# test_p[case PASSED]). The pattern is anchored at the end and has no nested
+# quantifiers.
+_OUTCOME_LINE = re.compile(
+    r"^(?P<nodeid>\S.*?) (?P<outcome>PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)"
+    r"(?: +\[ *\d+%\])? *$"
+)
+
+
 def _apply_line(raw: bytes, wanted: set[str], results: dict[str, bool]) -> None:
-    parts = raw.decode(errors="replace").strip().split(None, 1)
-    if len(parts) != 2:
+    line = raw.decode(errors="replace").rstrip()
+    match = _OUTCOME_LINE.match(line)
+    if match is None:
         return
-    reported, rest = parts
-    # pytest -v prints the nodeid first, then the outcome. Match the EXACT
-    # nodeid (or its parametrized base) — substring matching let
-    # "…::test_a" absorb the verdict of "…::test_a_extra", and the last
-    # matching line silently overwrote earlier ones, so a passing AC could
-    # be recorded as failed or vice versa (#507).
+    reported, outcome = match["nodeid"], match["outcome"]
+    # Match the EXACT nodeid (or its parametrized base) — substring matching
+    # let "…::test_a" absorb the verdict of "…::test_a_extra" (#507).
     key = reported if reported in wanted else reported.split("[", 1)[0]
     if key not in wanted:
         return
-    if "PASSED" in rest:
+    if outcome == "PASSED":
         passed = True
-    elif "FAILED" in rest or "ERROR" in rest:
+    elif outcome in ("FAILED", "ERROR"):
         passed = False
     else:
         return
@@ -135,7 +145,9 @@ async def default_test_runner(
     run-ac-tests (#1646). The child gets the allowlisted environment, its own
     session — the timeout and a cancelled request kill the whole group (by the
     group id saved at spawn, so a launcher that already exited does not hide
-    its children), and results are read as a stream (#1650). Incomplete output
+    its children; after a NORMAL exit the saved number is not used, because
+    once the group is empty it may belong to someone else), and results are
+    read as a stream (#1650). Incomplete output
     yields no positive result.
     """
     if not nodeids or not repo_path:
@@ -173,9 +185,6 @@ async def default_test_runner(
     except asyncio.CancelledError:
         await kill_process_group(proc, pgid=pgid)
         raise
-    else:
-        # The leader is done; whatever it left running in the group goes too.
-        await kill_process_group(proc, pgid=pgid)
     finally:
         shutil.rmtree(home, ignore_errors=True)
     if incomplete:

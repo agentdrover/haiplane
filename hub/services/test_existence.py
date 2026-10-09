@@ -1,34 +1,60 @@
 """Static existence check for AC test locators (#506).
 
 Complements #505: given a verifiable_by=test AC with a valid pytest locator,
-check whether that test is written, by READING the file as of a git ref — no
-checkout, no import, no process. A task branch is whatever an agent pushed, so
-collecting its tests (``pytest --collect-only`` imports conftest.py and every
-plugin) would run that agent's code on the hub host with the hub's environment;
-#1650 removed that path. The result (resolvable / missing / unknown) makes a
-broken AC↔test binding a visible defect in the review brief instead of a silent
-hole. Best-effort: when the ref or the file cannot be read, or the file's
-shape is one a static reader cannot judge, the status is ``unknown``, never a
-false ``missing``.
+check whether that test is written, by READING the file as of one git commit —
+no checkout, no import, no pytest. A task branch is whatever an agent pushed,
+so collecting its tests (``pytest --collect-only`` imports conftest.py and
+every plugin) would run that agent's code on the hub host with the hub's
+environment; #1650 removed that path.
+
+The files are hostile input too, so the analysis itself does not run in the hub
+process: the texts are read through git within a byte budget and handed to
+``hub.services.locator_worker`` in a separate interpreter with hard CPU and
+memory limits and a wall-clock deadline. A worker that overruns, crashes or
+answers garbage makes every locator of the request ``unknown`` — never
+``missing``. The result (resolvable / missing / unknown) makes a broken AC↔test
+binding a visible defect in the review brief instead of a silent hole.
 """
 
 from __future__ import annotations
 
-import ast
 import asyncio
+import contextlib
+import json
 import logging
-import re
+import shutil
+import sys
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from hub.process_kill import kill_process_group
+from hub.services import locator_worker
+from hub.services.locator_worker import (
+    BY_SOURCE,
+    MISSING,
+    NO_RESOLVER,
+    OVER_BUDGET,
+    PARAM_NOT_CHECKED,
+    RESOLVABLE,
+    UNKNOWN,
+    UNPARSEABLE,
+)
 from hub.services.test_locator import PYTEST, parse_test_locator, runner_of
 
 log = logging.getLogger("hub")
 
-RESOLVABLE = "resolvable"
-MISSING = "missing"
-UNKNOWN = "unknown"
-UNPARSEABLE = "unparseable"
+__all__ = [
+    "BY_SOURCE",
+    "MISSING",
+    "NO_RESOLVER",
+    "OVER_BUDGET",
+    "PARAM_NOT_CHECKED",
+    "RESOLVABLE",
+    "UNKNOWN",
+    "UNPARSEABLE",
+]
 
 # The whole status vocabulary of this calculation, named once so a reader of
 # the answer can check it decomposed ALL of it and not just the statuses it
@@ -37,14 +63,6 @@ UNPARSEABLE = "unparseable"
 # default silently turns a new "could not look" into an accusation.
 LOCATOR_STATUSES: tuple[str, ...] = (RESOLVABLE, MISSING, UNKNOWN, UNPARSEABLE)
 
-# How a locator was resolved: by reading the file, which proves a definition is
-# WRITTEN there, not that pytest would run it.
-BY_SOURCE = "test found in the file, read without running it"
-# Why an answer could not be given. Never merged into BY_SOURCE's silence:
-# "this runner is not one I can look into" is a fact about the hub, and a
-# reader who cannot tell it from "the test is not there" is being accused
-# on the hub's behalf (#1203).
-NO_RESOLVER = "no way to look inside a {runner} test file"
 # ``missing`` answers two different questions and the reason is the only thing
 # that tells them apart. NO_VALID_LOCATOR means nothing resolvable was NAMED —
 # the hub never got as far as looking. Any other ``missing`` reason names the
@@ -53,7 +71,6 @@ NO_RESOLVER = "no way to look inside a {runner} test file"
 # second accuses an author of a missing test they never claimed to have
 # written (#1158).
 NO_VALID_LOCATOR = "no valid test locator in test_ref"
-PARAM_NOT_CHECKED = "параметр не проверен"
 
 
 def _verifiable_by(ac: Any) -> str:
@@ -61,305 +78,6 @@ def _verifiable_by(ac: Any) -> str:
     # Обещали str, а при отсутствующем поле отдавали None: сравнение с "test"
     # молча давало False, а .lower() у вызывающего дал бы AttributeError.
     return str(getattr(vb, "value", vb) or "")
-
-
-def _wanted_name(nodeid: str) -> str:
-    """A vitest test's own name: everything after the FIRST ``::``, verbatim.
-
-    A name may legitimately contain ``::`` or square brackets, and pytest's
-    trimming would quietly hunt for a different test (#1203).
-    """
-    return nodeid.split("::", 1)[1] if "::" in nodeid else nodeid
-
-
-# --- pytest: the full definition path, read from the syntax tree -------------
-#
-# ``Class::method`` is resolved along the path the nodeid names — module, then
-# class, then member — and never by hunting for the last segment anywhere in
-# the file: ``MissingClass::test_x`` must not be satisfied by a function called
-# test_x in some other class. "Found" and "absent" are both claims, and each is
-# made only for what the tree PROVES:
-#
-# * a name bound once, unconditionally, by a def/class is a definition; bound
-#   twice, under an if/try/with, by an assignment or an import, or reachable
-#   through a star import, it is opaque — which binding wins is decided by
-#   running the module;
-# * a class is clean only if nothing can rewrite its members: no metaclass, no
-#   decorator but pytest.mark.*, and every base is a clean class written in
-#   this same file;
-# * a function is a test only with no decorator but pytest.mark.* (and
-#   staticmethod/classmethod); anything else may replace or hide it.
-#
-# The tree is hostile input, so the walk is bounded: inheritance and nesting
-# beyond ``_MAX_DEPTH`` are opaque, and the callers catch what the parser or
-# ``ast.unparse`` can still raise.
-
-_FOUND, _ABSENT, _OPAQUE = "found", "absent", "opaque"
-_MAX_DEPTH = 40
-_SAFE_PLAIN_DECORATORS = {"staticmethod", "classmethod"}
-
-
-@dataclass
-class _Binding:
-    kind: str  # "def" | "class" | "other"
-    node: ast.AST | None
-    conditional: bool
-
-
-@dataclass
-class _Scope:
-    """The names a module or class body binds, every binding kept."""
-
-    names: dict[str, list[_Binding]] = field(default_factory=dict)
-    star: bool = False
-
-    def add(self, name: str, kind: str, node: ast.AST | None, conditional: bool):
-        self.names.setdefault(name, []).append(_Binding(kind, node, conditional))
-
-
-def _blocks(node: ast.stmt):
-    """The nested statement lists of a compound statement that open no scope."""
-    if isinstance(node, ast.If | ast.For | ast.AsyncFor | ast.While):
-        yield node.body
-        yield node.orelse
-    elif isinstance(node, ast.With | ast.AsyncWith):
-        yield node.body
-    elif isinstance(node, ast.Try | ast.TryStar):
-        yield node.body
-        for handler in node.handlers:
-            yield handler.body
-        yield node.orelse
-        yield node.finalbody
-    elif isinstance(node, ast.Match):
-        for case in node.cases:
-            yield case.body
-
-
-def _targets(node: ast.stmt) -> list[ast.expr]:
-    if isinstance(node, ast.Assign):
-        return list(node.targets)
-    if isinstance(node, ast.AnnAssign | ast.AugAssign):
-        return [node.target]
-    if isinstance(node, ast.For | ast.AsyncFor):
-        return [node.target]
-    return []
-
-
-def _scope_of(body: list[ast.stmt]) -> _Scope:
-    scope = _Scope()
-    stack: list[tuple[list[ast.stmt], bool]] = [(body, False)]
-    while stack:
-        stmts, conditional = stack.pop()
-        for node in stmts:
-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                scope.add(node.name, "def", node, conditional)
-            elif isinstance(node, ast.ClassDef):
-                scope.add(node.name, "class", node, conditional)
-            elif isinstance(node, ast.Import | ast.ImportFrom):
-                for alias in node.names:
-                    if alias.name == "*":
-                        scope.star = True
-                    else:
-                        name = (alias.asname or alias.name).split(".")[0]
-                        scope.add(name, "other", node, conditional)
-            for target in _targets(node):
-                for sub in ast.walk(target):
-                    if isinstance(sub, ast.Name):
-                        scope.add(sub.id, "other", node, conditional)
-            for block in _blocks(node):
-                stack.append((block, True))
-    return scope
-
-
-def _decorator_parts(dec: ast.expr) -> list[str]:
-    node = dec.func if isinstance(dec, ast.Call) else dec
-    parts: list[str] = []
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
-    if isinstance(node, ast.Name):
-        parts.append(node.id)
-    return parts
-
-
-def _is_mark(dec: ast.expr) -> bool:
-    """``@pytest.mark.x`` / ``@pytest.mark.x(...)``: metadata, not a rewrite."""
-    return _decorator_parts(dec)[-2:] == ["mark", "pytest"]
-
-
-def _function_issue(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
-    for dec in fn.decorator_list:
-        parts = _decorator_parts(dec)
-        if parts[:1] == ["fixture"]:
-            return f"{fn.name} is a pytest fixture, which is not a test"
-        if _is_mark(dec) or (len(parts) == 1 and parts[0] in _SAFE_PLAIN_DECORATORS):
-            continue
-        return (
-            f"{fn.name} carries the decorator @{ast.unparse(dec)}, which can "
-            "replace or hide the test"
-        )
-    return ""
-
-
-def _class_issue(
-    cls: ast.ClassDef, module: _Scope, depth: int = 0, trail: tuple[str, ...] = ()
-) -> str:
-    """Why this class cannot be trusted to hold only what its body says; ``""`` if clean."""
-    if depth > _MAX_DEPTH:
-        return f"{cls.name} sits under more than {_MAX_DEPTH} levels of inheritance"
-    if cls.keywords:
-        return f"{cls.name} has a metaclass or class keywords"
-    for dec in cls.decorator_list:
-        if not _is_mark(dec):
-            return (
-                f"{cls.name} carries the decorator @{ast.unparse(dec)}, which can "
-                "rewrite its members"
-            )
-    if "__test__" in _scope_of(cls.body).names:
-        return f"{cls.name} sets __test__, which can hide any test from pytest"
-    for base in cls.bases:
-        if isinstance(base, ast.Name) and base.id == "object":
-            continue
-        local = _local_class(base, module)
-        if local is None:
-            return (
-                f"{cls.name} inherits {ast.unparse(base)}, which is not a class "
-                "written once in this file"
-            )
-        if local.name in trail or local is cls:
-            return f"{cls.name} has a cyclic base {local.name}"
-        issue = _class_issue(local, module, depth + 1, (*trail, cls.name))
-        if issue:
-            return issue
-    return ""
-
-
-def _local_class(base: ast.expr, module: _Scope) -> ast.ClassDef | None:
-    if not isinstance(base, ast.Name):
-        return None
-    bindings = module.names.get(base.id, [])
-    if (
-        len(bindings) == 1
-        and bindings[0].kind == "class"
-        and not bindings[0].conditional
-    ):
-        node = bindings[0].node
-        return node if isinstance(node, ast.ClassDef) else None
-    return None
-
-
-def _lookup(scope: _Scope, name: str, owner: str) -> tuple[str, Any]:
-    """``(_FOUND, node)`` | ``(_ABSENT, why)`` | ``(_OPAQUE, why)`` in one body."""
-    bindings = scope.names.get(name, [])
-    if not bindings:
-        if scope.star:
-            return _OPAQUE, f"{owner} has a star import that may bring {name} in"
-        return _ABSENT, f"{owner} defines no {name}"
-    if len(bindings) == 1 and bindings[0].kind in ("def", "class"):
-        if bindings[0].conditional:
-            return _OPAQUE, f"{name} in {owner} is defined only under a condition"
-        return _FOUND, bindings[0].node
-    return _OPAQUE, (
-        f"{name} is bound {len(bindings)} time(s) in {owner}, by an assignment, "
-        "an import or a repeated definition, so which binding wins is not static"
-    )
-
-
-def _member(
-    container: ast.Module | ast.ClassDef,
-    name: str,
-    module: _Scope,
-    depth: int = 0,
-    trail: tuple[str, ...] = (),
-) -> tuple[str, Any]:
-    scope = _scope_of(container.body)
-    owner = "the module" if isinstance(container, ast.Module) else container.name
-    if "__test__" in scope.names:
-        return _OPAQUE, f"{owner} sets __test__, which can hide any test from pytest"
-    verdict, detail = _lookup(scope, name, owner)
-    if verdict != _ABSENT or isinstance(container, ast.Module):
-        return verdict, detail
-    if depth > _MAX_DEPTH:
-        return (
-            _OPAQUE,
-            f"{owner} sits under more than {_MAX_DEPTH} levels of inheritance",
-        )
-    issue = _class_issue(container, module) if depth == 0 else ""
-    if issue:
-        return _OPAQUE, f"{issue}, so the absence of {name} is not established"
-    for base in container.bases:
-        if isinstance(base, ast.Name) and base.id == "object":
-            continue
-        local = _local_class(base, module)
-        if local is None or local.name in trail or local is container:
-            return _OPAQUE, (
-                f"{container.name} inherits {ast.unparse(base)}, which is not a "
-                f"class written once in this file, so the absence of {name} is "
-                "not established"
-            )
-        verdict, detail = _member(
-            local, name, module, depth + 1, (*trail, container.name)
-        )
-        if verdict != _ABSENT:
-            return verdict, detail
-    return _ABSENT, f"{container.name} defines no {name}"
-
-
-def _pytest_path(nodeid: str) -> tuple[list[str], bool]:
-    """``(segments, has_param)`` of a pytest nodeid without its file part."""
-    rest = nodeid.split("::", 1)[1] if "::" in nodeid else ""
-    head, bracket, _ = rest.partition("[")
-    return [seg for seg in head.split("::") if seg], bool(bracket)
-
-
-def _resolve_pytest_path(tree: ast.Module, segments: list[str]) -> tuple[str, Any]:
-    module = _scope_of(tree.body)
-    container: ast.Module | ast.ClassDef = tree
-    for index, segment in enumerate(segments):
-        verdict, detail = _member(container, segment, module)
-        if verdict != _FOUND:
-            return verdict, detail
-        if isinstance(container, ast.ClassDef):
-            issue = _class_issue(container, module)
-            if issue:
-                return _OPAQUE, issue
-        if index == len(segments) - 1:
-            if isinstance(detail, ast.ClassDef):
-                issue = _class_issue(detail, module)
-            else:
-                issue = _function_issue(detail)
-            return (_OPAQUE, issue) if issue else (_FOUND, detail)
-        if not isinstance(detail, ast.ClassDef):
-            return _ABSENT, f"{segment} is a function, so it has no members"
-        container = detail
-    return _ABSENT, "the locator names no test"
-
-
-def _resolve_python_source(
-    text: str, rel: str, nodeid: str, *, config_issue: str = ""
-) -> tuple[str, str]:
-    try:
-        tree = ast.parse(text, filename=rel)
-    except (SyntaxError, ValueError) as exc:
-        # Distinct from missing on purpose: "I could not read this" and "the
-        # test is not there" are different facts, and a blanket unknown for
-        # both is what taught reviewers to skip this block.
-        return UNPARSEABLE, f"could not parse {rel}: {type(exc).__name__}"
-    except (RecursionError, MemoryError) as exc:
-        return UNKNOWN, f"{rel} is too deeply nested to read: {type(exc).__name__}"
-    segments, has_param = _pytest_path(nodeid)
-    try:
-        verdict, detail = _resolve_pytest_path(tree, segments)
-    except (RecursionError, MemoryError) as exc:
-        return UNKNOWN, f"{rel} is too deeply nested to read: {type(exc).__name__}"
-    if verdict == _OPAQUE:
-        return UNKNOWN, f"{rel}: {detail}"
-    if verdict == _ABSENT:
-        return MISSING, f"{rel}: {detail}"
-    if config_issue:
-        return UNKNOWN, f"{rel}: {config_issue}"
-    suffix = f" ({PARAM_NOT_CHECKED})" if has_param else ""
-    return RESOLVABLE, f"{BY_SOURCE}: {rel}:{detail.lineno}{suffix}"
 
 
 def locator_files(acs: Any) -> list[str]:
@@ -380,83 +98,20 @@ def resolve_locator_absent_file(nodeid: str) -> tuple[str, str]:
     return MISSING, f"the submission contains no file {rel}"
 
 
-# A vitest test declaration: it("name"), test('name'), it.only(`name`) and
-# the table forms, where an argument list sits between the token and the name:
-# it.each([1, 2])("name"). That optional group allows one level of nesting, so
-# a table of objects or a call inside it does not hide the name behind it.
+# --- the analysis, in process: for unit tests and callers that hold small text --
 #
-# The quote style is captured and back-referenced, so the OTHER two quote
-# characters are ordinary text inside a name — which they are, in real suites.
-_VITEST_DECL = re.compile(
-    r"""\b(?:it|test)(?:\.\w+)*\s*"""
-    r"""(?:\((?:[^()]|\([^()]*\))*\)\s*)?"""
-    r"""\(\s*(?P<q>['"`])(?P<name>(?:\\.|(?!(?P=q)).)*)(?P=q)""",
-    re.DOTALL,
-)
+# Production goes through ``resolve_locators_at_ref`` (and so through the
+# worker process). These helpers run the same analysis in the calling process
+# under the same operation budget, which is only appropriate for text the
+# caller wrote itself.
 
 
-def _unescape(raw: str) -> str:
-    return re.sub(r"\\(.)", r"\1", raw)
-
-
-def _declares_vitest_test(text: str, name: str) -> int | None:
-    """Line where a vitest test called ``name`` is declared, or ``None``.
-
-    The counterpart of :func:`_resolve_python_source`, and deliberately no stronger: it
-    answers existence by reading the file, exactly what ``BY_SOURCE`` claims.
-    Nesting inside describe blocks needs no handling — the locator names the
-    test's own name, which is the string this call takes.
-    """
-    for m in _VITEST_DECL.finditer(text):
-        if _unescape(m.group("name")) == name:
-            return text.count("\n", 0, m.start()) + 1
-    return None
-
-
-# Where a test declaration BEGINS, without any claim to read its name. The
-# gap between this count and the names actually extracted is the reader's own
-# blind spot, and it is the only thing that separates "the test is not here"
-# from "I could not read how this file declares its tests" (#1203).
-_VITEST_DECL_START = re.compile(r"\b(?:it|test)(?:\.\w+)*\s*[(`]")
-
-
-def _resolve_vitest_source(
-    text: str, rel: str, nodeid: str, *, config_issue: str = ""
-) -> tuple[str, str]:
-    """Existence by reading, and a refusal that never poses as an absence.
-
-    ``ast`` makes "not found" trustworthy for Python: a real parser saw the
-    whole file. Here the reader is a regular expression, and a form it cannot
-    follow — a tagged template, a table built by a call, a name held in a
-    variable — looks exactly like a test that was never written. Reporting
-    that as ``missing`` is the false accusation this whole change exists to
-    remove, so the reader counts what it could not follow and says so.
-    """
-    name = _wanted_name(nodeid)
-    line = _declares_vitest_test(text, name)
-    if line is not None:
-        return RESOLVABLE, f"{BY_SOURCE}: {rel}:{line}"
-    started = len(_VITEST_DECL_START.findall(text))
-    named = sum(1 for _ in _VITEST_DECL.finditer(text))
-    if started > named:
-        # Erring towards unknown on a false start inside a string or comment
-        # is the safe direction: it withholds an answer instead of inventing
-        # one against the author.
-        return UNKNOWN, (
-            f"{rel} declares {started - named} test(s) in a form this reader "
-            f"cannot follow, so the absence of {name} is not established"
-        )
-    return MISSING, f"{rel} defines no test named {name}"
-
-
-# One resolver per runner the locator registry accepts. The pairing is not
-# decoration: a shape accepted upstream with no entry here is exactly the
-# state where the hub reports a real test as absent, so the two registries are
-# checked against each other by test (#1203).
-SOURCE_RESOLVERS = {
-    PYTEST: _resolve_python_source,
-    "vitest": _resolve_vitest_source,
-}
+def _analyse_here(request: dict[str, Any]) -> dict[str, list[str]] | None:
+    try:
+        return locator_worker.analyse(request)["results"]
+    except Exception:  # noqa: BLE001 - nothing may escape as an accusation
+        log.warning("in-process locator analysis failed", exc_info=True)
+        return None
 
 
 def resolve_locator_in_source(
@@ -464,24 +119,85 @@ def resolve_locator_in_source(
 ) -> tuple[str, str]:
     """``(status, reason)`` from the file's own text — no imports, no runner (#764).
 
-    ``text`` is the file as of the ref the caller resolved; ``None`` means it
-    could not be read (``unread`` says why), which is ``unknown`` and never
+    ``text`` is the file as of the commit the caller resolved; ``None`` means
+    it could not be read (``unread`` says why), which is ``unknown`` and never
     ``missing``. ``config_issue`` is a reason pytest's collection options make
-    a positive answer unreliable.
-
-    Reading is per runner (#1203). It used to parse every file with ``ast``,
-    so a TypeScript test came back ``unparseable`` — true in the letter and
-    useless in fact, because the file parses perfectly well for the tool that
-    owns it.
+    a positive answer unreliable. Reading is per runner (#1203).
     """
     rel = nodeid.split("::", 1)[0]
     if text is None:
         return UNKNOWN, unread or f"could not read {rel} at the resolved ref"
-    runner = runner_of(nodeid)
-    resolver = SOURCE_RESOLVERS.get(runner)
-    if resolver is None:
-        return UNKNOWN, NO_RESOLVER.format(runner=runner or "unknown")
-    return resolver(text, rel, nodeid, config_issue=config_issue)
+    request = {
+        "files": {rel: text},
+        "config_issue": config_issue,
+        "locators": [{"key": "0", "nodeid": nodeid, "runner": runner_of(nodeid)}],
+    }
+    results = _analyse_here(request)
+    if results is None:
+        return UNKNOWN, OVER_BUDGET
+    status, reason = results["0"]
+    return status, reason
+
+
+# One resolver per runner the locator registry accepts. The pairing is not
+# decoration: a shape accepted upstream with no entry here is exactly the
+# state where the hub reports a real test as absent, so the two registries are
+# checked against each other by test (#1203).
+SOURCE_RESOLVERS = {
+    PYTEST: resolve_locator_in_source,
+    "vitest": resolve_locator_in_source,
+}
+
+
+def _plan(
+    acs: Any,
+    sources: dict[str, str | None],
+    absent_files: set[str],
+    unread: dict[str, str],
+) -> tuple[list[dict], list[dict]]:
+    """Rows for every test-AC, and the locators that still need the analysis."""
+    rows: list[dict] = []
+    todo: list[dict] = []
+    for ac in acs:
+        if _verifiable_by(ac) != "test":
+            continue
+        locator = getattr(ac, "test_ref", None)
+        parsed = parse_test_locator(locator)
+        row = {
+            "ac_id": getattr(ac, "id", "?"),
+            "locator": locator,
+            "status": UNKNOWN,
+            "reason": "",
+        }
+        if parsed is None:
+            row["status"], row["reason"] = MISSING, NO_VALID_LOCATOR
+        elif parsed[0] in absent_files:
+            row["status"], row["reason"] = resolve_locator_absent_file(parsed[1])
+        elif sources.get(parsed[0]) is None:
+            rel = parsed[0]
+            row["reason"] = (
+                unread.get(rel) or f"could not read {rel} at the resolved ref"
+            )
+        else:
+            row["key"] = str(len(todo))
+            todo.append(
+                {"key": row["key"], "nodeid": parsed[1], "runner": runner_of(parsed[1])}
+            )
+        rows.append(row)
+    return rows, todo
+
+
+def _finish(
+    rows: list[dict], results: dict[str, list[str]] | None, ref_label: str
+) -> list[dict]:
+    for row in rows:
+        key = row.pop("key", None)
+        if key is not None:
+            status, reason = (results or {}).get(key) or (UNKNOWN, OVER_BUDGET)
+            row["status"], row["reason"] = status, reason
+        if ref_label and parse_test_locator(row["locator"]) is not None:
+            row["reason"] = f"{row['reason']} [ref: {ref_label}]"
+    return rows
 
 
 def resolve_ac_locators(
@@ -493,71 +209,150 @@ def resolve_ac_locators(
     pytest_config_issue: str = "",
     unread: dict[str, str] | None = None,
 ) -> list[dict]:
-    """Resolution status for each verifiable_by=test AC (#506, #764, #1650).
+    """Resolution status for each verifiable_by=test AC, in process (#506, #764).
 
     ``sources`` is the text of each file named by a locator, as of one resolved
-    ref, read with git and parsed without importing anything. A file the caller
-    could not read maps to ``None`` (``unread`` says why) and stays ``unknown``,
-    because "could not check" must never be reported as "checked and clean".
-    ``absent_files`` are the files the ref demonstrably does not contain.
-    Non-test AC are skipped — they need no test. ``ref_label`` is appended to
-    every reason so a reader knows WHICH code the answer is about.
+    commit. A file the caller could not read maps to ``None`` (``unread`` says
+    why) and stays ``unknown``, because "could not check" must never be
+    reported as "checked and clean". ``absent_files`` are the files the commit
+    demonstrably does not contain. Non-test AC are skipped. ``ref_label`` is
+    appended to every reason so a reader knows WHICH code the answer is about.
     """
-    resolutions: list[dict] = []
-    for ac in acs:
-        if _verifiable_by(ac) != "test":
-            continue
-        locator = getattr(ac, "test_ref", None)
-        parsed = parse_test_locator(locator)
-        if parsed is None:
-            status, reason = MISSING, NO_VALID_LOCATOR
-        elif parsed[0] in (absent_files or set()):
-            status, reason = resolve_locator_absent_file(parsed[1])
-        else:
-            status, reason = resolve_locator_in_source(
-                (sources or {}).get(parsed[0]),
-                parsed[1],
-                config_issue=(
-                    pytest_config_issue if runner_of(parsed[1]) == PYTEST else ""
-                ),
-                unread=(unread or {}).get(parsed[0], ""),
-            )
-        if ref_label and parsed is not None:
-            reason = f"{reason} [ref: {ref_label}]"
-        resolutions.append(
-            {
-                "ac_id": getattr(ac, "id", "?"),
-                "locator": locator,
-                "status": status,
-                "reason": reason,
-            }
+    sources = sources or {}
+    rows, todo = _plan(acs, sources, absent_files or set(), unread or {})
+    results = None
+    if todo:
+        files = {
+            p: sources[p]
+            for p in (t["nodeid"].split("::", 1)[0] for t in todo)
+            if sources.get(p) is not None
+        }
+        results = _analyse_here(
+            {"files": files, "config_issue": pytest_config_issue, "locators": todo}
         )
-    return resolutions
+    return _finish(rows, results, ref_label)
 
 
-# --- reading the files: one commit sha, through git only -----------------------
-#
-# The files are hostile input: the reader asks for a size before a byte is
-# kept, refuses what is over the limits, and the callers parse off the event
-# loop. A separate process with rlimits was considered and not taken: the
-# parser's memory is bounded by the file size cap, its recursion by the
-# interpreter's guards (turned into ``unknown`` here), and a process boundary
-# would buy a kill switch for CPU only, at the price of a second interpreter
-# per brief read.
+# --- the worker process ----------------------------------------------------------
 
 MAX_FILE_BYTES = 256 * 1024
 MAX_TOTAL_BYTES = 1024 * 1024
-_DEFAULT_PYTHON_OPTIONS = {
-    "python_files": ["test_*.py", "*_test.py"],
-    "python_classes": ["Test"],
-    "python_functions": ["test"],
-}
-# (file, section) pairs pytest reads its ini-options from.
-_INI_SECTIONS = (
-    ("pytest.ini", "pytest"),
-    ("tox.ini", "pytest"),
-    ("setup.cfg", "tool:pytest"),
-)
+MAX_PATH_DEPTH = 12
+_WORKER_WALL_SECONDS = 8
+_WORKER_CPU_SECONDS = 5
+_WORKER_ADDRESS_SPACE = 512 * 1024 * 1024
+_WORKER_MAX_OUTPUT = 1024 * 1024
+_WORKER_FILE = Path(locator_worker.__file__).resolve()
+
+# Runs inside the child before the worker: hard limits first, then the worker
+# file itself as a script. The ``hub`` package is deliberately NOT imported —
+# ``hub.services`` loads the whole hub and would eat the CPU budget before the
+# first byte is read. RLIMIT_AS cannot always be lowered (macOS refuses), which
+# is why the wall clock and the CPU limit are separate layers.
+_BOOTSTRAP = """
+import resource, runpy, sys
+for name, value in (
+    ("RLIMIT_CPU", {cpu}),
+    ("RLIMIT_AS", {address_space}),
+    ("RLIMIT_CORE", 0),
+):
+    try:
+        resource.setrlimit(getattr(resource, name), (value, value))
+    except (ValueError, OSError):
+        pass
+runpy.run_path(sys.argv[1], run_name="__main__")
+""".format(cpu=_WORKER_CPU_SECONDS, address_space=_WORKER_ADDRESS_SPACE)
+
+
+async def _exchange(proc: Any, payload: bytes) -> bytes:
+    """Feed the request, read the answer up to a cap, reap the worker."""
+
+    async def feed() -> None:
+        try:
+            proc.stdin.write(payload)
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                proc.stdin.close()
+
+    feeder = asyncio.create_task(feed())
+    try:
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = await proc.stdout.read(65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > _WORKER_MAX_OUTPUT:
+                raise ValueError("worker output over the cap")
+            chunks.append(chunk)
+        await proc.wait()
+        return b"".join(chunks)
+    finally:
+        feeder.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await feeder
+
+
+async def analyse_in_worker(request: dict[str, Any]) -> dict[str, list[str]] | None:
+    """Run ``request`` through the locator worker; ``None`` on any failure.
+
+    Own interpreter (``-I -B``: no site customisation, no bytecode), an empty
+    temporary directory as cwd (never the task's repository), a minimal
+    environment, CPU and address-space limits, and a wall-clock deadline after
+    which the whole process group is killed. A crash, a timeout, a non-zero
+    exit or an answer that is not the expected JSON all give ``None`` — the
+    caller turns that into ``unknown`` for every locator of the request.
+    """
+    payload = json.dumps(request).encode()
+    workdir = tempfile.mkdtemp(prefix="hub-locator-")
+    proc = None
+    pgid = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            _BOOTSTRAP,
+            str(_WORKER_FILE),
+            cwd=workdir,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+            start_new_session=True,
+        )
+        pgid = proc.pid
+        out = await asyncio.wait_for(
+            _exchange(proc, payload), timeout=_WORKER_WALL_SECONDS
+        )
+    except (OSError, TimeoutError, asyncio.TimeoutError, ValueError):
+        await kill_process_group(proc, pgid=pgid)
+        log.warning("locator worker did not finish within its budget")
+        return None
+    except asyncio.CancelledError:
+        await kill_process_group(proc, pgid=pgid)
+        raise
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    if proc.returncode != 0:
+        log.warning("locator worker exited with %s", proc.returncode)
+        return None
+    try:
+        results = json.loads(out)["results"]
+        if not isinstance(results, dict):
+            raise TypeError
+        return {str(k): [str(v[0]), str(v[1])] for k, v in results.items()}
+    except (ValueError, KeyError, TypeError, IndexError):
+        log.warning("locator worker answered something that is not its JSON")
+        return None
+
+
+# --- reading the files: one commit sha, through git only, within a byte budget --
 
 
 @dataclass
@@ -567,8 +362,10 @@ class LocatorEvidence:
     ``ref_label`` names the commit and where it came from (``submission_sha``,
     the task branch, the project base); empty when nothing could be resolved,
     in which case every source is ``None`` and ``why`` says why. ``unread``
-    names the reason per file that could not be used, and ``pytest_config_issue``
-    is a reason a positive pytest answer cannot be given.
+    names the reason per file that could not be used. ``aux`` holds the pytest
+    configuration and conftest files around the locator files (``None`` = not
+    collected), and ``pytest_config_issue`` is a fixed reason a positive pytest
+    answer cannot be given.
     """
 
     sources: dict[str, str | None] = field(default_factory=dict)
@@ -577,6 +374,7 @@ class LocatorEvidence:
     why: str = ""
     pytest_config_issue: str = ""
     unread: dict[str, str] = field(default_factory=dict)
+    aux: dict[str, dict] | None = None
 
 
 async def _commit_of(git: Any, repo: str, name: str) -> str:
@@ -585,10 +383,11 @@ async def _commit_of(git: Any, repo: str, name: str) -> str:
     if sha:
         return sha
     state, detail = await git.resolve_ref(name, repo)
-    return detail if state == "resolved" and _SHA.fullmatch(detail or "") else ""
+    return detail if state == "resolved" and _is_sha(detail) else ""
 
 
-_SHA = re.compile(r"[0-9a-f]{40}")
+def _is_sha(value: str) -> bool:
+    return len(value or "") == 40 and all(c in "0123456789abcdef" for c in value)
 
 
 async def _pick_ref(
@@ -618,73 +417,77 @@ async def _pick_ref(
     return "", "", "no submission_sha, branch or base to read from"
 
 
-async def _read_one(git: Any, repo: str, sha: str, path: str) -> dict[str, Any]:
-    try:
-        return await git.read_file_at_ref(repo, sha, path, limit_chars=MAX_FILE_BYTES)
-    except Exception:  # noqa: BLE001 - one unreadable file is one unknown
-        log.warning("locator source read failed: %s", path)
-        return {"state": "unreadable", "reason": "the read raised"}
+class _Reader:
+    """Reads files at one commit and keeps count of the bytes it was allowed."""
 
+    def __init__(self, git: Any, repo: str, sha: str):
+        self.git, self.repo, self.sha = git, repo, sha
+        self.spent = 0
 
-def _toml_options(text: str) -> dict[str, Any]:
-    import tomllib
-
-    data = tomllib.loads(text)
-    return dict(data.get("tool", {}).get("pytest", {}).get("ini_options", {}) or {})
-
-
-def _ini_options(text: str, section: str) -> dict[str, Any]:
-    import configparser
-
-    parser = configparser.ConfigParser(interpolation=None, strict=False)
-    parser.read_string(text)
-    return dict(parser[section]) if parser.has_section(section) else {}
-
-
-def _as_list(value: Any) -> list[str]:
-    if isinstance(value, list | tuple):
-        return [str(v) for v in value]
-    return str(value).split()
-
-
-def _python_options_issue(options: dict[str, Any], where: str) -> str:
-    for key, default in _DEFAULT_PYTHON_OPTIONS.items():
-        if key in options and sorted(_as_list(options[key])) != sorted(default):
-            return f"{where} sets {key}, so pytest's own collection rules differ"
-    if any(k in str(options.get("addopts", "")) for k in _DEFAULT_PYTHON_OPTIONS):
-        return f"{where} passes python_* options through addopts"
-    return ""
-
-
-async def _pytest_config_issue(git: Any, repo: str, sha: str) -> str:
-    """Why pytest's collection options cannot be trusted at ``sha``; ``""`` if they can.
-
-    Read as DATA: tomllib for pyproject.toml, configparser for the ini files.
-    "no config" and "config I could not read" are different answers — the
-    second is an issue, because an unreadable file may well set python_*.
-    """
-    for name in ("pyproject.toml", *(n for n, _ in _INI_SECTIONS)):
-        info = await _read_one(git, repo, sha, name)
-        state = info.get("state")
-        if state == "missing":
-            continue
-        if state != "present" or info.get("truncated"):
-            return f"{name} could not be read, so pytest's python_* options are unknown"
-        text = info.get("content", "")
+    async def _call(self, path: str, limit_chars: int) -> dict[str, Any]:
         try:
-            if name == "pyproject.toml":
-                options = _toml_options(text)
-            else:
-                section = dict(_INI_SECTIONS)[name]
-                options = _ini_options(text, section)
-        except Exception:  # noqa: BLE001 - any parse failure is "unreadable"
-            return (
-                f"{name} could not be parsed, so pytest's python_* options are unknown"
+            return await self.git.read_file_at_ref(
+                self.repo, self.sha, path, limit_chars=limit_chars
             )
-        issue = _python_options_issue(options, name)
-        if issue:
-            return issue
-    return ""
+        except Exception:  # noqa: BLE001 - one unreadable file is one unknown
+            log.warning("locator source read failed: %s", path)
+            return {"state": "unreadable"}
+
+    async def read(self, path: str) -> tuple[str, str, str]:
+        """``(state, text, why)``; state is present | missing | unreadable | toobig.
+
+        The size is learned BEFORE the content is taken (a zero-length probe
+        reads a few bytes at most), so a file over the per-file limit or over
+        what is left of the request is never read at all.
+        """
+        probe = await self._call(path, 0)
+        state = probe.get("state")
+        if state == "missing":
+            return "missing", "", ""
+        if state != "present":
+            return "unreadable", "", f"could not read {path}"
+        size = int(probe.get("size") or 0)
+        if size > MAX_FILE_BYTES:
+            return (
+                "toobig",
+                "",
+                (
+                    f"{path} is {size} bytes, over the {MAX_FILE_BYTES} byte limit "
+                    "for static reading"
+                ),
+            )
+        if self.spent + size > MAX_TOTAL_BYTES:
+            return (
+                "toobig",
+                "",
+                (
+                    f"{path} would take this request past the {MAX_TOTAL_BYTES} byte "
+                    "limit for static reading"
+                ),
+            )
+        if not size:
+            return "present", "", ""
+        info = await self._call(path, size)
+        if info.get("state") != "present" or info.get("truncated"):
+            return "unreadable", "", f"could not read {path}"
+        self.spent += size
+        return "present", info.get("content", ""), ""
+
+
+def _aux_paths(files: list[str]) -> list[str] | None:
+    """Config and conftest candidates in every directory above the pytest files."""
+    paths: list[str] = []
+    for path in files:
+        if runner_of(path) != PYTEST:
+            continue
+        if path.count("/") > MAX_PATH_DEPTH:
+            return None
+        for directory in locator_worker.ancestors(path):
+            for name in (*locator_worker.CONFIG_NAMES, "conftest.py"):
+                full = f"{directory}/{name}" if directory else name
+                if full not in paths:
+                    paths.append(full)
+    return paths
 
 
 async def read_locator_evidence(
@@ -700,8 +503,10 @@ async def read_locator_evidence(
 
     Everything goes through git by commit sha: no checkout, no import, no
     environment handed over. Failure is ``unknown`` for the file, never
-    ``missing``; a file over ``MAX_FILE_BYTES`` or past ``MAX_TOTAL_BYTES`` for
-    the request is ``unknown`` too, and is never parsed.
+    ``missing``. Every file's size is learned before its content is read, and a
+    file over ``MAX_FILE_BYTES`` — or past what is left of ``MAX_TOTAL_BYTES``
+    for the whole request, configuration files included — is ``unknown`` and
+    is not read.
     """
     if not files:
         return LocatorEvidence()
@@ -713,31 +518,27 @@ async def read_locator_evidence(
     )
     if not sha:
         return LocatorEvidence(unread, why=why)
+    reader = _Reader(git, repo, sha)
     evidence = LocatorEvidence(dict(unread), ref_label=label)
-    spent = 0
     for path in files:
-        info = await _read_one(git, repo, sha, path)
-        state = info.get("state")
-        size = int(info.get("size") or 0)
+        state, text, reason = await reader.read(path)
         if state == "missing":
             evidence.absent.add(path)
-        elif state != "present":
-            evidence.unread[path] = f"could not read {path} at {label}"
-        elif size > MAX_FILE_BYTES or info.get("truncated"):
-            evidence.unread[path] = (
-                f"{path} is {size} bytes, over the {MAX_FILE_BYTES} byte limit "
-                "for static reading"
-            )
-        elif spent + size > MAX_TOTAL_BYTES:
-            evidence.unread[path] = (
-                f"{path} would take this request past the {MAX_TOTAL_BYTES} byte "
-                "limit for static reading"
-            )
+        elif state == "present":
+            evidence.sources[path] = text
         else:
-            spent += size
-            evidence.sources[path] = info.get("content", "")
-    if any(runner_of(p) == PYTEST for p in files if p not in evidence.absent):
-        evidence.pytest_config_issue = await _pytest_config_issue(git, repo, sha)
+            evidence.unread[path] = reason
+    aux_paths = _aux_paths([p for p in files if p not in evidence.absent])
+    if aux_paths is None:
+        evidence.pytest_config_issue = (
+            f"a locator path is deeper than {MAX_PATH_DEPTH} directories, so the "
+            "pytest configuration around it was not looked at"
+        )
+        return evidence
+    evidence.aux = {}
+    for full in aux_paths:
+        state, text, _ = await reader.read(full)
+        evidence.aux[full] = {"state": state, "text": text}
     return evidence
 
 
@@ -750,10 +551,11 @@ async def resolve_locators_at_ref(
     branch: str = "",
     base: str = "",
 ) -> list[dict]:
-    """Resolve every test-AC locator of ``acs``: read at one commit, then parse.
+    """Resolve every test-AC locator of ``acs``: read at one commit, analyse in the worker.
 
-    The single door for callers (review brief, epic approve): reading goes
-    through git, parsing runs off the event loop.
+    The single door for callers (review brief, epic approve). Reading goes
+    through git within the byte budget; the analysis runs in the bounded worker
+    process, so a hostile file can cost it its budget and nothing else.
     """
     evidence = await read_locator_evidence(
         git,
@@ -763,12 +565,16 @@ async def resolve_locators_at_ref(
         branch=branch,
         base=base,
     )
-    return await asyncio.to_thread(
-        resolve_ac_locators,
-        acs,
-        evidence.sources,
-        evidence.absent,
-        ref_label=evidence.ref_label,
-        pytest_config_issue=evidence.pytest_config_issue,
-        unread=evidence.unread,
-    )
+    rows, todo = _plan(acs, evidence.sources, evidence.absent, evidence.unread)
+    results = None
+    if todo:
+        wanted = {t["nodeid"].split("::", 1)[0] for t in todo}
+        request: dict[str, Any] = {
+            "files": {p: evidence.sources[p] for p in wanted},
+            "config_issue": evidence.pytest_config_issue,
+            "locators": todo,
+        }
+        if evidence.aux is not None:
+            request["aux"] = evidence.aux
+        results = await analyse_in_worker(request)
+    return _finish(rows, results, evidence.ref_label)

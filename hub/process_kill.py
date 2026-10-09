@@ -37,6 +37,13 @@ async def kill_process_group(proc: Any, *, pgid: int | None = None) -> None:
     looked up through the live leader — and a launcher that has already exited
     leaves its children running in a group nobody can find any more (#1650).
     With it, the group is signalled whatever state the leader is in.
+
+    Residual window: a group id is the pid of its leader, and the number can be
+    handed to an unrelated process once the group is EMPTY. While any member
+    lives the number is reserved; if the leader was already reaped and every
+    member died before this call, ``killpg`` could in theory hit a new group
+    that got the same number. Callers therefore use ``pgid`` only on the
+    timeout and cancel paths, promptly, and never after a normal exit.
     """
     if proc is None or (proc.returncode is not None and pgid is None):
         return

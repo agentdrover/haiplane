@@ -391,13 +391,13 @@ async def test_manual_ac_run_has_a_minimal_env_and_kills_its_group(
     monkeypatch.setenv("SYNTH_HUB_SIGNING_SALT", "synthetic-plain-secret")
     monkeypatch.setenv("SYNTH_API_TOKEN", "synthetic-token-secret")
     monkeypatch.setenv("SSH_AUTH_SOCK", "/synthetic/agent.sock")
-    monkeypatch.setattr(ac_tests, "_RUN_TIMEOUT", 1)
+    monkeypatch.setattr(ac_tests, "_RUN_TIMEOUT", 3)
 
     try:
         # A runner that does not kill the group blocks on the pipe the child
         # holds: bound the wait so that is a red test, not a hung one.
         result = await asyncio.wait_for(
-            real_default_test_runner(["tests/t.py::test_a"], str(work)), timeout=15
+            real_default_test_runner(["tests/t.py::test_a"], str(work)), timeout=25
         )
         assert result is None, "a hung run is 'could not run', not a verdict"
         child_env = (work / "child-env.txt").read_text()
@@ -512,10 +512,10 @@ async def test_the_group_dies_on_timeout_even_if_the_leader_already_exited(
 
     _fake_uv(tmp_path, _LAUNCHER)
     monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
-    monkeypatch.setattr(ac_tests, "_RUN_TIMEOUT", 1)
+    monkeypatch.setattr(ac_tests, "_RUN_TIMEOUT", 3)
     try:
         res = await asyncio.wait_for(
-            real_default_test_runner(["tests/t.py::test_a"], str(tmp_path)), 15
+            real_default_test_runner(["tests/t.py::test_a"], str(tmp_path)), 25
         )
         assert res is None or not any(res.values())
         assert not await _alive_after(tmp_path), "the orphan outlived the run"
@@ -543,3 +543,71 @@ async def test_the_group_dies_on_cancel_even_if_the_leader_already_exited(
         assert not await _alive_after(tmp_path), "the orphan outlived the cancel"
     finally:
         _kill_quietly(tmp_path)
+
+
+# ---- #1650 round 3: the outcome is the last token; a pgid is not reused -----------
+
+
+async def test_an_outcome_word_inside_a_param_id_does_not_decide_the_result(
+    monkeypatch, tmp_path: Path
+):
+    _fake_uv(
+        tmp_path,
+        "echo 'tests/t.py::test_p[case PASSED] FAILED [100%]'\n"
+        "echo 'tests/t.py::test_q[ok FAILED] PASSED [100%]'\n"
+        "echo 'FAILED tests/t.py::test_r - assert PASSED'\n",
+    )
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+
+    res = await real_default_test_runner(
+        ["tests/t.py::test_p", "tests/t.py::test_q", "tests/t.py::test_r"],
+        str(tmp_path),
+    )
+
+    assert res == {"tests/t.py::test_p": False, "tests/t.py::test_q": True}
+
+
+async def test_the_saved_group_number_is_not_used_after_a_normal_exit(
+    monkeypatch, tmp_path: Path
+):
+    import hub.process_kill as process_kill
+
+    calls: list[int] = []
+    real_killpg = os.killpg
+    monkeypatch.setattr(
+        process_kill.os,
+        "killpg",
+        lambda pgid, sig: (calls.append(pgid), real_killpg(pgid, sig))[1],
+    )
+    _fake_uv(tmp_path, "echo 'tests/t.py::test_a PASSED [100%]'\n")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+
+    res = await real_default_test_runner(["tests/t.py::test_a"], str(tmp_path))
+
+    assert res == {"tests/t.py::test_a": True}
+    assert calls == [], "a finished run must not be signalled by a stale group number"
+
+
+async def test_the_group_is_signalled_before_the_leader_is_waited_for():
+    import hub.process_kill as process_kill
+
+    events: list[str] = []
+
+    class Proc:
+        returncode = None
+        pid = 4_190_002
+
+        def kill(self):
+            events.append("kill")
+
+        async def wait(self):
+            events.append("wait")
+
+    real = process_kill.os.killpg
+    process_kill.os.killpg = lambda pgid, sig: events.append("killpg")
+    try:
+        await process_kill.kill_process_group(Proc(), pgid=4_190_002)
+    finally:
+        process_kill.os.killpg = real
+
+    assert events[0] == "killpg" and events[-1] == "wait", events

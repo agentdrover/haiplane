@@ -233,7 +233,7 @@ async def test_a_config_that_cannot_be_read_at_all_is_not_taken_for_no_config():
 
 
 class _AstWithParse:
-    """The ``ast`` module as the reader sees it, with only ``parse`` replaced.
+    """The ``ast`` module as the worker code sees it, with only ``parse`` replaced.
 
     Patching ``ast.parse`` itself would also break pytest's own reporting.
     """
@@ -247,21 +247,113 @@ class _AstWithParse:
         return getattr(ast, name)
 
 
-async def test_parser_exhaustion_is_unknown_whatever_raised_it(monkeypatch):
-    from hub.services import test_existence
+def test_parser_exhaustion_is_unknown_whatever_raised_it(monkeypatch):
+    # In process on purpose: the patch has to reach the analysis code.
+    from hub.services import locator_worker
+    from hub.services.test_existence import resolve_ac_locators
 
+    ac = [_ac("test_a")]
     source = {_PATH: "def test_a():\n    pass\n"}
     for exc in (RecursionError, MemoryError):
 
         def boom(*_a, _exc=exc, **_k):
             raise _exc()
 
-        monkeypatch.setattr(test_existence, "ast", _AstWithParse(boom))
-        res = await _status(source, "test_a")
+        monkeypatch.setattr(locator_worker, "ast", _AstWithParse(boom))
+        res = resolve_ac_locators(ac, source)[0]
         assert res["status"] == UNKNOWN, (exc, res)
         monkeypatch.undo()
 
-        monkeypatch.setattr(test_existence, "_resolve_pytest_path", boom)
-        res = await _status(source, "test_a")
+        monkeypatch.setattr(locator_worker._PyFile, "resolve", boom)
+        res = resolve_ac_locators(ac, source)[0]
         assert res["status"] == UNKNOWN, (exc, res)
         monkeypatch.undo()
+
+
+# ---- round 3: any other binding of the name, and hooks that change a class ----------
+
+
+async def test_any_other_binding_of_the_name_makes_it_unknown():
+    forms = {
+        "del": "def test_a():\n    pass\n\ndel test_a\n",
+        "walrus": "def test_a():\n    pass\n\nif (test_a := 1):\n    pass\n",
+        "with as": "def test_a():\n    pass\n\nwith open('f') as test_a:\n    pass\n",
+        "for target": "def test_a():\n    pass\n\nfor test_a in range(3):\n    pass\n",
+        "except as": (
+            "def test_a():\n    pass\n\ntry:\n    pass\nexcept E as test_a:\n    pass\n"
+        ),
+        "match capture": (
+            "def test_a():\n    pass\n\nmatch 1:\n    case test_a:\n        pass\n"
+        ),
+        "global in a function": (
+            "def test_a():\n    pass\n\n\ndef rebinder():\n    global test_a\n"
+            "    test_a = 1\n"
+        ),
+        "star import": "from helpers import *\n\n\ndef test_a():\n    pass\n",
+    }
+    for name, source in forms.items():
+        res = await _status({_PATH: source}, "test_a")
+        assert res["status"] == UNKNOWN, (name, res)
+
+
+async def test_class_creation_hooks_in_the_chain_make_it_unknown():
+    hooks = {
+        "__init_subclass__": (
+            "class Base:\n    def __init_subclass__(cls, **kw):\n        pass\n\n\n"
+            "class TestX(Base):\n    pass\n"
+        ),
+        "__class_getitem__": (
+            "class Base:\n    def __class_getitem__(cls, item):\n        return cls\n\n\n"
+            "class TestX(Base):\n    pass\n"
+        ),
+        "own hook": ("class TestX:\n    def __init_subclass__(cls):\n        pass\n"),
+    }
+    for name, source in hooks.items():
+        res = await _status({_PATH: source}, "TestX::test_x")
+        assert res["status"] == UNKNOWN, (name, res)
+
+
+# ---- round 3: pytest's configuration in ANY directory above the file ----------------
+
+
+async def _in_dirs(extra: dict[str, str | bytes], unreadable: set[str] | None = None):
+    files = {_PATH: "def test_a():\n    pass\n", **extra}
+    git = FakeGit(files)
+    git.unreadable = unreadable or set()
+    return await _status(files, "test_a", git)
+
+
+async def test_a_nested_pytest_config_or_collection_hook_makes_it_unknown():
+    cases = {
+        "nested ini": {"tests/pytest.ini": "[pytest]\npython_functions = check_*\n"},
+        "nested toml": {
+            "tests/pyproject.toml": "[tool.pytest.ini_options]\npython_classes = 'Check'\n"
+        },
+        "nested conftest hook": {
+            "tests/conftest.py": "def pytest_collection_modifyitems(items):\n    pass\n"
+        },
+        "root conftest hook": {
+            "conftest.py": "def pytest_generate_tests(metafunc):\n    pass\n"
+        },
+        "makeitem hook": {
+            "tests/conftest.py": "def pytest_pycollect_makeitem(collector, name, obj):\n    pass\n"
+        },
+    }
+    for name, extra in cases.items():
+        res = await _in_dirs(extra)
+        assert res["status"] == UNKNOWN, (name, res)
+
+
+async def test_a_benign_conftest_and_config_leave_the_answer_alone():
+    res = await _in_dirs(
+        {
+            "tests/conftest.py": "import pytest\n\n\n@pytest.fixture\ndef thing():\n    pass\n",
+            "tests/pytest.ini": "[pytest]\naddopts = -q\n",
+        }
+    )
+    assert res["status"] == RESOLVABLE, res
+
+
+async def test_an_unreadable_conftest_above_the_file_is_unknown():
+    res = await _in_dirs({"tests/conftest.py": "x = 1\n"}, {"tests/conftest.py"})
+    assert res["status"] == UNKNOWN, res

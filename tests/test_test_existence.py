@@ -216,10 +216,6 @@ def test_unreadable_declaration_form_is_unknown_not_missing():
     # первой сдаче — до правки каждый отвечал `missing` про существующий тест.
     forms = [
         ('it.each`\n  $a | $b\n`("adds $a and $b", () => {});', "adds $a and $b"),
-        (
-            'it.each(items.map(x => foo(x)))("maps then names", () => {});',
-            "maps then names",
-        ),
         ('const n = "still toggles";\nit(n, () => {});', "still toggles"),
     ]
     for src, name in forms:
@@ -228,6 +224,14 @@ def test_unreadable_declaration_form_is_unknown_not_missing():
         # И причина обязана назвать, ЧТО именно помешало: "не смог прочитать
         # эту форму" — ответ, а "теста нет" на том же месте было обвинением.
         assert "cannot follow" in reason, (name, reason)
+
+
+def test_a_nested_each_table_is_followed_by_the_scanner():
+    # The old regular expression gave up on a call inside the table and said
+    # unknown; the scanner balances the parentheses and finds the name.
+    src = 'it.each(items.map(x => foo(x)))("maps then names", () => {});'
+    status, _ = resolve_locator_in_source(src, "a/b.test.ts::maps then names")
+    assert status == RESOLVABLE
 
 
 def test_missing_survives_where_it_is_honest():

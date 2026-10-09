@@ -128,11 +128,15 @@ class _Module:
                     self.imports[alias.asname or alias.name] = (node.module, alias.name)
 
 
-def _callee(node: ast.Call) -> str:
+def _callee(node: ast.Call, module: _Module | None = None) -> str:
+    """The name a call goes by, with ``from m import f as g`` resolved to ``f``."""
     func = node.func
     if isinstance(func, ast.Attribute):
         return func.attr
     if isinstance(func, ast.Name):
+        if module is not None and func.id in module.imports:
+            original = module.imports[func.id][1]
+            return original or func.id
         return func.id
     return ""
 
@@ -214,7 +218,11 @@ class _Resolver:
 
 
 def _functions(tree: ast.Module):
-    """``(qualname, body)`` for every function and method, then the module level."""
+    """``(qualname, node)`` for every function and method, wherever it is defined.
+
+    Definitions inside ``if``/``try``/``with``/``for``/``match`` count: a
+    function is not exempt from the guard because it is conditional.
+    """
 
     def walk(body, prefix):
         for node in body:
@@ -223,8 +231,24 @@ def _functions(tree: ast.Module):
                 yield from walk(node.body, f"{prefix}{node.name}.")
             elif isinstance(node, ast.ClassDef):
                 yield from walk(node.body, f"{prefix}{node.name}.")
+            else:
+                for field_name in ("body", "orelse", "finalbody", "handlers", "cases"):
+                    block = getattr(node, field_name, None)
+                    if isinstance(block, list):
+                        yield from walk(block, prefix)
 
     yield from walk(tree.body, "")
+
+
+def _statements_outside_functions(tree: ast.Module):
+    """Every node that runs at import time (module level and class bodies)."""
+    stack: list[ast.AST] = list(tree.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            continue
+        yield node
+        stack.extend(ast.iter_child_nodes(node))
 
 
 def _calls_outside_functions(tree: ast.Module):
@@ -239,14 +263,33 @@ def _calls_outside_functions(tree: ast.Module):
         stack.extend(ast.iter_child_nodes(node))
 
 
+def _imports_pytest(node: ast.AST) -> bool:
+    """Whether ``node`` brings the pytest package in (statically or by name)."""
+    if isinstance(node, ast.Import):
+        return any(a.name.split(".")[0] in ("pytest", "_pytest") for a in node.names)
+    if isinstance(node, ast.ImportFrom):
+        return (node.module or "").split(".")[0] in ("pytest", "_pytest")
+    if isinstance(node, ast.Call) and _callee(node) in (
+        "import_module",
+        "__import__",
+        "run_module",
+    ):
+        return any(
+            isinstance(a, ast.Constant) and a.value in ("pytest", "_pytest")
+            for a in node.args
+        )
+    return False
+
+
 def _spawn_names(trees: dict[str, ast.Module]) -> set[str]:
     """The base spawn primitives plus hub functions that call one (two rounds)."""
     names = set(_SPAWN)
     for _ in range(2):
         for tree in trees.values():
+            module = _Module("", tree)
             for qual, fn in _functions(tree):
                 if any(
-                    isinstance(n, ast.Call) and _callee(n) in names
+                    isinstance(n, ast.Call) and _callee(n, module) in names
                     for n in ast.walk(fn)
                 ):
                     names.add(qual.rsplit(".", 1)[-1])
@@ -277,15 +320,15 @@ def scan(sources: dict[str, str]) -> set[str]:
         for qual, fn in _functions(tree):
             if any(
                 isinstance(n, ast.Call)
-                and _callee(n) in spawners
+                and _callee(n, module) in spawners
                 and check(n, module, fn.body)
                 for n in ast.walk(fn)
-            ):
+            ) or any(_imports_pytest(n) for n in ast.walk(fn)):
                 offenders.add(f"{path}::{qual}")
         if any(
-            _callee(c) in spawners and check(c, module, [])
+            _callee(c, module) in spawners and check(c, module, [])
             for c in _calls_outside_functions(tree)
-        ):
+        ) or any(_imports_pytest(n) for n in _statements_outside_functions(tree)):
             offenders.add(f"{path}::<module>")
     return offenders
 
@@ -434,6 +477,54 @@ _ROUND2 = {
         )
     },
 }
+
+
+_ROUND3 = {
+    "aliased callable": {
+        "hub/m.py": (
+            "from subprocess import run as launch\n"
+            "def f():\n    launch(['uv', 'run', 'pytest'])\n"
+        )
+    },
+    "aliased asyncio primitive": {
+        "hub/m.py": (
+            "from asyncio import create_subprocess_exec as spawn\n"
+            "async def f():\n    await spawn('pytest')\n"
+        )
+    },
+    "pytest.main": {
+        "hub/m.py": "import pytest\ndef f():\n    return pytest.main(['-q'])\n"
+    },
+    "pytest main imported": {
+        "hub/m.py": "from pytest import main\ndef f():\n    return main(['-q'])\n"
+    },
+    "pytest import alone": {
+        "hub/m.py": "def f():\n    import pytest\n    return pytest\n"
+    },
+    "import by name": {
+        "hub/m.py": (
+            "import importlib\ndef f():\n    return importlib.import_module('pytest')\n"
+        )
+    },
+    "function inside if": {
+        "hub/m.py": (
+            "import subprocess\n"
+            "if True:\n    def f():\n        subprocess.run(['pytest'])\n"
+        )
+    },
+    "method inside try": {
+        "hub/m.py": (
+            "import subprocess\n"
+            "try:\n    class K:\n        def go(self):\n"
+            "            subprocess.run(['pytest'])\nexcept ImportError:\n    pass\n"
+        )
+    },
+}
+
+
+def test_the_guard_follows_aliases_pytest_main_and_conditional_definitions():
+    for name, sources in _ROUND3.items():
+        assert scan(sources), f"the guard missed: {name}"
 
 
 def test_the_guard_follows_constants_imports_and_module_level_code():

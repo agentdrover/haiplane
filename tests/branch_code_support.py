@@ -155,6 +155,8 @@ class FakeGit:
         self.trees = {self.tip: files, **(trees or {})}
         self.refs = {"origin/task-42/work": self.tip, **(refs or {})}
         self.refs_read: list[str] = []
+        self.bytes_served = 0
+        self.unreadable: set[str] = set()
         self.reads = 0
         self.moves: dict[int, tuple[str, str]] = {}
 
@@ -209,6 +211,9 @@ class FakeGit:
         if path not in tree:
             out["state"] = "missing"
             return out
+        if path in self.unreadable:
+            out["reason"] = "io error"
+            return out
         raw = tree[path]
         data = raw if isinstance(raw, bytes) else raw.encode()
         text = data.decode(errors="replace")
@@ -219,4 +224,5 @@ class FakeGit:
             truncated=len(text) > limit_chars,
             content=text[:limit_chars],
         )
+        self.bytes_served += len(out["content"].encode())
         return out
