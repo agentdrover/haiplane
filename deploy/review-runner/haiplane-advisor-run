@@ -1,0 +1,78 @@
+#!/bin/sh
+set -eu
+# ВТОРАЯ обёртка (#1649): советник стюарда на GLM. Принадлежит root:root, 0755;
+# хаб и агент её не пишут. От вызывающего не принимается НИЧЕГО: ни аргументов
+# (argv CLI зашит ниже), ни окружения (sudo его сбрасывает), ни ключей. Ключ
+# ревью (model.env) в контейнер не передаётся: он получает ТОЛЬКО advisor.env.
+if [ "$#" -ne 0 ]; then
+    echo "haiplane-advisor-run: аргументы не принимаются, argv CLI закреплён обёрткой" >&2
+    exit 64
+fi
+RUID=$(id -u)
+export XDG_RUNTIME_DIR="/run/user/$RUID"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$RUID/bus"
+export HOME=/var/lib/haiplane-review
+# Каталог настроек закреплён литералом, а не берётся из окружения. Тот же
+# каталог читает служба-исполнитель (advisor-model, advisor-timeout): источник
+# один, настроить его иначе нельзя.
+CONF=/etc/haiplane-review
+# Единственный допустимый владелец advisor.env — root.
+ENV_UID=0
+# Образ — тот же файл, что у враппера ревью (qwen-code лежит в образе
+# песочницы). Модель и срок — файлы ЭТОЙ обёртки; те же файлы читает служба и
+# объявляет в heartbeat, поэтому объявленное хабу и запущенное не расходятся.
+# Нет файла — отказ (set -e), а не запуск с умолчанием.
+IMAGE=$(cat "$CONF/image")
+MODEL=$(cat "$CONF/advisor-model")
+TIMEOUT=$(cat "$CONF/advisor-timeout")
+case $TIMEOUT in
+    '' | 0 | *[!0-9]*) echo "advisor-timeout: нужно целое число секунд больше нуля" >&2; exit 65 ;;
+esac
+case $MODEL in
+    '' | *[!A-Za-z0-9._/-]*) echo "advisor-model: имя модели недопустимо" >&2; exit 65 ;;
+esac
+# advisor.env — ключ z.ai: обычный файл (не ссылка), владелец root, записи
+# группе и миру нет, миру недоступен, и это НЕ тот же файл, что model.env (иначе
+# контейнер советника получил бы ключ ревью).
+file_facts() {
+    stat -c '%u %a %d:%i' "$1" 2>/dev/null || stat -f '%u %Lp %d:%i' "$1"
+}
+ENVF="$CONF/advisor.env"
+if [ ! -f "$ENVF" ] || [ -L "$ENVF" ]; then
+    echo "advisor.env: нужен обычный файл, не ссылка" >&2
+    exit 66
+fi
+set -- $(file_facts "$ENVF")
+E_UID=$1
+E_MODE=$2
+E_INO=$3
+[ "$E_UID" = "$ENV_UID" ] || { echo "advisor.env: владелец не root" >&2; exit 66; }
+while [ "${#E_MODE}" -lt 3 ]; do E_MODE=0$E_MODE; done
+E_MODE=${E_MODE#"${E_MODE%???}"}
+E_GROUP=${E_MODE#?}
+E_GROUP=${E_GROUP%?}
+E_WORLD=${E_MODE#??}
+case $E_GROUP in
+    2 | 3 | 6 | 7) echo "advisor.env: запись группе запрещена" >&2; exit 66 ;;
+esac
+[ "$E_WORLD" = 0 ] || { echo "advisor.env: доступ всем запрещён" >&2; exit 66; }
+if [ -e "$CONF/model.env" ]; then
+    set -- $(file_facts "$CONF/model.env")
+    if [ "$3" = "$E_INO" ]; then
+        echo "advisor.env и model.env — один файл: ключ ревью в advisor не передаётся" >&2
+        exit 66
+    fi
+fi
+# Без монтирований хоста, сокетов и домашнего каталога. Контейнер получает
+# --env-file только с ключом z.ai. --timeout — последний рубеж: хаб и служба
+# снимают прогон просьбой, а контейнер доживает ровно до него.
+# qwen-code: промт читает из stdin; режим yolo разрешает tool calls (redeem,
+# GET evidence, POST judgement) без запроса, потому что вся изоляция — здесь.
+exec /usr/bin/podman run --rm -i \
+     --replace --name haiplane-advisor \
+     --cgroup-manager=systemd \
+     --timeout="$TIMEOUT" \
+     --memory=1500m --cpus=1.5 --pids-limit=512 \
+     --cap-drop=all --security-opt=no-new-privileges \
+     --env-file="$CONF/advisor.env" \
+     "$IMAGE" qwen --model "$MODEL" --approval-mode yolo --output-format text

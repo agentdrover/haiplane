@@ -132,6 +132,9 @@ class LocalRun:
     # хаб); ``True`` — служба ответила признаком снятия; ``False`` — просьба
     # отправлена, подтверждения за срок ожидания нет.
     cancel_confirmed: bool | None = None
+    # Прогон снят по просьбе хаба (#1649: закрытие строки советника), а не по
+    # сроку. Отличие несущее: ``timed_out`` обвиняет прогон, ``cancelled`` — нет.
+    cancelled: bool = False
 
 
 def transport() -> str:
@@ -1077,6 +1080,14 @@ JOB_VERSION = 1
 JOB_VERSION_SNAPSHOT = review_snapshot.JOB_VERSION_SNAPSHOT
 # Закрытый список полей задания: команды и путей в нём нет по построению.
 JOB_FIELDS = ("version", "timeout_sec")
+# Профиль advisor (#1649): задание version=3 с закрытым полем profile. Старые
+# службы (v1, v2) его отклоняют до запуска модели; src.tar в нём запрещён.
+JOB_VERSION_ADVISOR = 3
+PROFILE_ADVISOR = "advisor"
+JOB_FIELDS_ADVISOR = ("version", "timeout_sec", "profile", "model")
+# Блок возможностей в heartbeat службы (JSON): версии заданий, профили,
+# закреплённая модель советника и сроки.
+CAPABILITIES_KEY = "capabilities"
 
 # Heartbeat старше этого — служба считается мёртвой (она пишет раз в 5 с).
 RUNNER_HEARTBEAT_MAX_AGE_SEC = 30
@@ -1104,6 +1115,10 @@ DRAIN_REASON = (
     "идёт выкладка хаба: новые локальные прогоны не стартуют, пока деплой "
     "ждёт идущие (deploy/LOCAL-REVIEW.md, #1588)"
 )
+
+
+class PublishAborted(Exception):
+    """Публикацию отменили, пока она ждала замок: задание не записывается (#1649)."""
 
 
 class DrainActive(Exception):
@@ -1196,9 +1211,21 @@ def _take_drain_lock(fd: int) -> None:
 
 
 def _submit_job_unless_draining(
-    spool: str, prompt: str, limit: int, snapshot: bytes | None = None
+    spool: str,
+    prompt: str,
+    limit: int,
+    snapshot: bytes | None = None,
+    *,
+    profile: str = "",
+    name: str = "",
+    model: str = "",
+    abort: Callable[[], bool] | None = None,
 ) -> str:
     """Проверка маркера И публикация задания под одним замком (#1588).
+
+    ``abort`` (#1649) — просьба снять заказ: спрашивается под замком, ПОСЛЕ
+    маркера и ДО записи ``job.json``. Заказ, закрытый, пока поток ждал замок, не
+    публикуется: ``PublishAborted``.
 
     Деплой считает задания под тем же замком, поэтому «маркер свежий» и
     «job.json появился» не могут разойтись: либо заказ опубликован до того,
@@ -1222,6 +1249,14 @@ def _submit_job_unless_draining(
         if staged:
             return _submit_job(
                 spool, prompt, limit, jobdir=staged, version=JOB_VERSION_SNAPSHOT
+            )
+        # Профиль и имя едут, только когда заданы: задание ревью зовётся ровно
+        # так же, как до #1649.
+        if abort is not None and abort():
+            raise PublishAborted()
+        if profile:
+            return _submit_job(
+                spool, prompt, limit, profile=profile, name=name, model=model
             )
         return _submit_job(spool, prompt, limit)
     except BaseException:
@@ -1329,6 +1364,9 @@ def _submit_job(
     *,
     jobdir: str = "",
     version: int = JOB_VERSION,
+    profile: str = "",
+    name: str = "",
+    model: str = "",
 ) -> str:
     """Положить задание в очередь. Возвращает каталог задания.
 
@@ -1338,12 +1376,22 @@ def _submit_job(
     ни миру, ни в argv. ``jobdir`` — каталог, где снимок уже лежит (#1599).
     """
     if not jobdir:
-        jobdir = os.path.join(spool, "job-" + secrets.token_hex(8))
+        # ``name`` задаёт вызывающий советника (#1649): имя задания и есть id
+        # прогона в ``steward_runs.agent_id`` (local:<hex>), и его надо знать
+        # ДО публикации, чтобы строка заказа и каталог задания не расходились.
+        jobdir = os.path.join(spool, name or "job-" + secrets.token_hex(8))
         os.mkdir(jobdir, 0o770)
     try:
         os.chmod(jobdir, 0o770)  # nosec B103 - группе, не миру
         _write_spool_file(jobdir, SPOOL_PROMPT, prompt.encode())
-        job = {"version": version, "timeout_sec": int(limit)}
+        job: dict[str, Any] = {"version": version, "timeout_sec": int(limit)}
+        if profile:
+            job = {
+                "version": JOB_VERSION_ADVISOR,
+                "timeout_sec": int(limit),
+                "profile": profile,
+                "model": model,
+            }
         _write_spool_file(jobdir, SPOOL_JOB, json.dumps(job).encode())
     except OSError:
         shutil.rmtree(jobdir, ignore_errors=True)
@@ -1397,6 +1445,7 @@ def _result_to_run(result: dict[str, Any], started: float) -> LocalRun | None:
             cancel_confirmed=(
                 True if result.get("cancelled") or result.get("timed_out") else None
             ),
+            cancelled=bool(result.get("cancelled", False)),
         )
     except (KeyError, TypeError, ValueError):
         _REFUSAL.set("служба-исполнитель вернула result.json неверной формы")
@@ -1422,7 +1471,12 @@ def _cancel_job(jobdir: str, *, withdraw: bool) -> None:
                 os.unlink(os.path.join(jobdir, name))
 
 
-async def _await_result(jobdir: str, limit: int, started: float) -> LocalRun | None:
+async def _await_result(
+    jobdir: str,
+    limit: int,
+    started: float,
+    cancel: asyncio.Event | None = None,
+) -> LocalRun | None:
     pickup = started + min(RUNNER_PICKUP_SEC, limit)
     deadline = started + limit
     claimed = os.path.join(jobdir, SPOOL_CLAIMED)
@@ -1430,6 +1484,9 @@ async def _await_result(jobdir: str, limit: int, started: float) -> LocalRun | N
         result = _read_result(jobdir)
         if result is not None:
             return _result_to_run(result, started)
+        if cancel is not None and cancel.is_set():
+            # Просьба хаба снять прогон (#1649): закрытие строки советника.
+            return await _time_out(jobdir, started, cancelled=True)
         now = time.monotonic()
         taken = os.path.exists(claimed)
         if _runner_silent(jobdir):
@@ -1457,8 +1514,10 @@ async def _await_result(jobdir: str, limit: int, started: float) -> LocalRun | N
         await asyncio.sleep(RUNNER_POLL_SEC)
 
 
-async def _time_out(jobdir: str, started: float) -> LocalRun:
-    """Лимит истёк: хаб пишет снятие и ждёт подтверждения службы, но не вечно."""
+async def _time_out(
+    jobdir: str, started: float, *, cancelled: bool = False
+) -> LocalRun:
+    """Лимит истёк (или хаб просит снять): пишет снятие и ждёт подтверждения службы, но не вечно."""
     _cancel_job(jobdir, withdraw=False)
     end = time.monotonic() + RUNNER_GRACE_SEC
     answer = _read_result(jobdir)
@@ -1474,9 +1533,10 @@ async def _time_out(jobdir: str, started: float) -> LocalRun:
         rc=TIMEOUT_RC,
         output="",
         dropped=0,
-        timed_out=True,
+        timed_out=not cancelled,
         duration_ms=int((time.monotonic() - started) * 1000),
         cancel_confirmed=confirmed,
+        cancelled=cancelled,
     )
 
 
@@ -1537,4 +1597,240 @@ def _old_runner_hint(reason: str) -> str:
         "знает: установите snapshot_unpack.py и новую службу (порядок — "
         "deploy/LOCAL-REVIEW.md, «Выкат снимка») либо выключите "
         "LOCAL_REVIEW_SNAPSHOT"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ПРОФИЛЬ ADVISOR (#1649): локальный советник стюарда на GLM
+# ---------------------------------------------------------------------------
+#
+# Тот же транспорт и та же служба, но ДРУГОЕ задание: version=3 с закрытым
+# полем profile=advisor. Команду, образ, ключ z.ai, модель и срок хаб не
+# задаёт и не может задать: их держит служба и её root-овый враперов. Хаб лишь
+# проверяет по heartbeat, что служба ЭТО объявила, и ждёт результата.
+
+
+@dataclass(frozen=True)
+class RunnerCapabilities:
+    """Что служба объявила в heartbeat: версии, профили, модель советника, сроки."""
+
+    job_versions: tuple[int, ...] = ()
+    profiles: tuple[str, ...] = ()
+    advisor_model: str = ""
+    advisor_timeout_sec: int = 0
+    review_timeout_sec: int = 0
+    max_timeout_sec: int = 0
+    problem: str = ""
+
+
+def parse_capabilities(raw: bytes | str) -> RunnerCapabilities | None:
+    """Возможности из тела heartbeat, или ``None`` (старая служба, мусор, нет блока).
+
+    Отсутствие блока — это «служба старая», а не «возможностей нет»: старая
+    служба пишет ``{"pid", "time"}`` и профиль advisor не знает.
+    """
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    block = data.get(CAPABILITIES_KEY) if isinstance(data, dict) else None
+    if not isinstance(block, dict):
+        return None
+    try:
+        timeouts = block.get("timeouts") or {}
+        return RunnerCapabilities(
+            job_versions=tuple(int(v) for v in block.get("job_versions") or ()),
+            profiles=tuple(str(p) for p in block.get("profiles") or ()),
+            advisor_model=str(block.get("advisor_model") or ""),
+            advisor_timeout_sec=int(timeouts.get("advisor_sec") or 0),
+            review_timeout_sec=int(timeouts.get("review_sec") or 0),
+            max_timeout_sec=int(timeouts.get("max_sec") or 0),
+            problem=str(block.get("advisor_problem") or ""),
+        )
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def runner_capabilities() -> RunnerCapabilities | None:
+    """Возможности службы по её heartbeat в spool; ``None`` — не прочитать."""
+    spool = (config.LOCAL_REVIEW_SPOOL_DIR or "").strip()
+    if not spool:
+        return None
+    try:
+        fd = os.open(
+            os.path.join(spool, SPOOL_HEARTBEAT),
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError:
+        return None
+    try:
+        raw = os.read(fd, 16384)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return parse_capabilities(raw)
+
+
+PATH_NOT_LAUNCHABLE = "not_launchable"
+PATH_MODEL_MISMATCH = "model_mismatch"
+
+
+def advisor_path_problem(model: str) -> tuple[str, str] | None:
+    """Готов ли локальный путь советника на ЭТОЙ модели: ``(вид, текст)`` или ``None``.
+
+    Вид один из двух: ``not_launchable`` (транспорт, служба, профиль,
+    возможности, heartbeat) и ``model_mismatch`` (служба закрепила другую
+    модель). Автоматической подмены модели нет: самодекларация модели в
+    суждении — не доказательство, доказательство — heartbeat службы.
+    ``not_ready()`` НЕ спрашивается: он требует токен ревьюера, которого
+    советнику не нужно.
+    """
+    if transport() != "runner":
+        return (
+            PATH_NOT_LAUNCHABLE,
+            "локальный советник идёт только через службу-исполнитель "
+            "(LOCAL_REVIEW_TRANSPORT=runner)",
+        )
+    if not (config.LOCAL_REVIEW_SPOOL_DIR or "").strip():
+        return (PATH_NOT_LAUNCHABLE, "LOCAL_REVIEW_SPOOL_DIR не задан")
+    problems = runner_problem()
+    if problems:
+        return (PATH_NOT_LAUNCHABLE, "; ".join(problems))
+    caps = runner_capabilities()
+    if (
+        caps is None
+        or PROFILE_ADVISOR not in caps.profiles
+        or JOB_VERSION_ADVISOR not in caps.job_versions
+        or caps.advisor_timeout_sec <= 0
+    ):
+        why = (
+            "служба не объявила возможности в heartbeat (старая служба)"
+            if caps is None
+            else caps.problem or "профиль advisor службой не объявлен"
+        )
+        return (PATH_NOT_LAUNCHABLE, f"профиль advisor недоступен: {why}")
+    if caps.advisor_model != (model or "").strip():
+        return (
+            PATH_MODEL_MISMATCH,
+            f"служба держит advisor на модели {caps.advisor_model!r}, а хаб "
+            f"настроен на {model!r}; автоподмены модели нет",
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class AdvisorJobResult:
+    """Итог задания советника: опубликовано ли, остановил ли дренаж, что вернула служба."""
+
+    published: bool
+    drained: bool
+    run: LocalRun | None
+    reason: str = ""
+    #: Заказ сняли, пока публикация ждала замок: задание не опубликовано.
+    aborted: bool = False
+
+
+async def run_advisor_job(
+    prompt: str,
+    *,
+    name: str,
+    limit: int,
+    cancel: asyncio.Event,
+    model: str,
+) -> AdvisorJobResult:
+    """Опубликовать задание советника под замком выкладки и дождаться результата.
+
+    Публикация и проверка маркера — под одним замком (#1588), как у ревью.
+    ``cancel`` — просьба хаба снять прогон: служба получает файл cancel и
+    отвечает, хаб ждёт подтверждения ограниченное время. «Отменено» не есть
+    доказанная остановка контейнера: последняя защита — ``--timeout`` врапера.
+    """
+    started = time.monotonic()
+    spool = config.LOCAL_REVIEW_SPOOL_DIR.strip()
+    publishing = asyncio.ensure_future(
+        asyncio.to_thread(
+            _submit_job_unless_draining,
+            spool,
+            prompt,
+            limit,
+            None,
+            profile=PROFILE_ADVISOR,
+            name=name,
+            model=model,
+            abort=cancel.is_set,
+        )
+    )
+    try:
+        jobdir = await asyncio.shield(publishing)
+    except asyncio.CancelledError:
+        published = ""
+        with contextlib.suppress(
+            DrainActive, PublishAborted, OSError, asyncio.CancelledError
+        ):
+            published = await publishing
+        if published:
+            _cancel_job(published, withdraw=True)
+        raise
+    except PublishAborted:
+        return AdvisorJobResult(
+            False, False, None, "заказ снят до публикации задания", aborted=True
+        )
+    except DrainActive as exc:
+        return AdvisorJobResult(False, True, None, exc.reason)
+    except OSError as exc:
+        log.warning("advisor job not written under %s: %s", spool, exc)
+        return AdvisorJobResult(
+            False, False, None, f"задание не записано в очередь службы: {exc}"
+        )
+    try:
+        run = await _await_result(jobdir, limit, started, cancel)
+        return AdvisorJobResult(True, False, run, "" if run else refusal())
+    except asyncio.CancelledError:
+        # Хаб останавливают: снять прогон через службу и не оставить промт.
+        _cancel_job(jobdir, withdraw=True)
+        jobdir = ""
+        raise
+    finally:
+        if jobdir:
+            shutil.rmtree(jobdir, ignore_errors=True)
+
+
+def withdraw_job_by_name(name: str) -> bool:
+    """Отозвать задание по имени каталога (после аварии хаба); ``True`` — каталог был.
+
+    Только имя по строгому шаблону ``job-<16 hex>``: id прогона приходит из
+    базы, и пустить его в путь без проверки значило бы дать записи в базе
+    власть над файловой системой.
+    """
+    import re
+
+    spool = (config.LOCAL_REVIEW_SPOOL_DIR or "").strip()
+    if not spool or not re.fullmatch(r"job-[0-9a-f]{16}", name or ""):
+        return False
+    jobdir = os.path.join(spool, name)
+    if not os.path.isdir(jobdir) or os.path.islink(jobdir):
+        return False
+    _cancel_job(jobdir, withdraw=True)
+    return True
+
+
+def job_needs_withdrawal(name: str) -> bool:
+    """Задание с таким именем ещё в очереди и не отозвано (есть ``job.json`` или промт).
+
+    «Долг отмены» закрытой строки советника (#1649): строка закрыта, а хаб упал,
+    не успев попросить службу снять прогон. Отозванное задание (файлов нет)
+    долгом не считается.
+    """
+    import re
+
+    spool = (config.LOCAL_REVIEW_SPOOL_DIR or "").strip()
+    if not spool or not re.fullmatch(r"job-[0-9a-f]{16}", name or ""):
+        return False
+    jobdir = os.path.join(spool, name)
+    if not os.path.isdir(jobdir) or os.path.islink(jobdir):
+        return False
+    return any(
+        os.path.lexists(os.path.join(jobdir, part))
+        for part in (SPOOL_JOB, SPOOL_PROMPT)
     )

@@ -46,6 +46,7 @@ from hub import config
 from hub import repository as repo
 from hub.db import fetchall
 from hub.integrations import cursor_cloud
+from hub.services import steward_advisor_local as local_advisor
 from hub.services.model_family import same_family
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
@@ -131,10 +132,14 @@ def advisor_family_refusal(
     name = (candidate or "").strip()
     if not name:
         return (REFUSED_UNDECLARED_MODEL, "модель советника не названа")
-    if name not in config.SUBSCRIPTION_LAUNCHABLE_MODELS:
+    if (
+        name not in config.SUBSCRIPTION_LAUNCHABLE_MODELS
+        and not local_advisor.is_local_model(name)
+    ):
         return (
             REFUSED_ADVISOR_NOT_LAUNCHABLE,
-            f"{name} не наблюдалась запускающейся (SUBSCRIPTION_LAUNCHABLE_MODELS)",
+            f"{name} не наблюдалась запускающейся (SUBSCRIPTION_LAUNCHABLE_MODELS) "
+            "и не названа локальной моделью (STEWARD_ADVISOR_LOCAL_MODEL)",
         )
     for other, code, label in (
         (implementer, REFUSED_SAME_FAMILY_IMPLEMENTER, "исполнителя"),
@@ -157,11 +162,24 @@ def advisor_family_refusal(
 
 
 def pick_advisor_model(
-    tried: list[str], implementer: str, reviewer: str, judge: str
+    tried: list[str],
+    implementer: str,
+    reviewer: str,
+    judge: str,
+    *,
+    local_ready: bool = False,
 ) -> str:
-    """Первый кандидат, которого пропускает гейт семейств. Пусто — годного нет."""
-    for candidate in config.STEWARD_ADVISOR_MODELS:
+    """Первый кандидат, которого пропускает гейт семейств. Пусто — годного нет.
+
+    Локальная модель (#1649) берётся, только когда её путь готов
+    (``local_ready``): подмены на облачную и обратно нет. Замена после отказа
+    провайдера облака зовёт без ``local_ready`` — GLM облачным агентом Cursor
+    не запускается.
+    """
+    for candidate in local_advisor.candidates():
         if candidate in tried:
+            continue
+        if local_advisor.is_local_model(candidate) and not local_ready:
             continue
         if advisor_family_refusal(candidate, implementer, reviewer, judge) is None:
             return candidate
@@ -212,7 +230,31 @@ async def _order_one(db: aiosqlite.Connection, task_id: int, generation: int) ->
     implementer = (dict(task_row).get("submission_model") or "").strip()
     reviewer = await reviewer_model(db, task_id, generation)
     judge = await judge_model_of(db, task_id, generation)
-    model = pick_advisor_model([], implementer, reviewer, judge)
+    local_blocker = (
+        await local_advisor.path_problem(db)
+        if config.STEWARD_ADVISOR_LOCAL_MODEL
+        else None
+    )
+    model = pick_advisor_model(
+        [], implementer, reviewer, judge, local_ready=local_blocker is None
+    )
+    if not model and local_blocker is not None:
+        local = config.STEWARD_ADVISOR_LOCAL_MODEL
+        if advisor_family_refusal(local, implementer, reviewer, judge) is None:
+            # Облачного кандидата нет, а локальный годен по семействам и не
+            # запускается из-за пути: называем ЭТО, а не агрегат «нет семейства».
+            code, text = local_blocker
+            await _close_generation_as_refused(
+                db,
+                task_id,
+                generation,
+                f"{code}: советник {local} (локальный путь) запустить нельзя: {text}; "
+                "облачного кандидата нет — approve судьи уходит к человеку без "
+                "второго мнения",
+                kind=KIND_ADVISOR,
+                reason=code,
+            )
+            return False
     if not model:
         await _close_generation_as_refused(
             db,
@@ -330,6 +372,11 @@ async def start_advisor_run(db: aiosqlite.Connection, order: dict) -> bool:
         )
         await close_run(db, order, RUN_REFUSED, f"{code}: {detail}")
         return False
+
+    if local_advisor.is_local_model(candidate):
+        # GLM запускается не облаком Cursor, а профилем advisor службы ревью:
+        # захват, перепроверки, код и задание — в supervisor (#1649).
+        return await local_advisor.start_local_advisor(db, order)
 
     project = await repo.resolve_project_for_task(db, task_id)
     gh_repo = (dict(project).get("repo") or "").strip() if project else ""
