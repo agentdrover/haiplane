@@ -3079,8 +3079,12 @@ async def test_hub_my_context_without_task_id_anonymous(
     text = _mcp_text(out)
     assert "Hub Context (no task)" in text
     assert "Workflow reference" in text
-    # No username → no task lookup, only the diagnostics probe (#530).
-    mock_api_get.assert_awaited_once_with("/api/diagnostics/identity")
+    # No username → no task lookup, only the diagnostics probe (#530) and the
+    # public /health read for the egress alert (#1645).
+    assert [c.args[0] for c in mock_api_get.await_args_list] == [
+        "/api/diagnostics/identity",
+        "/health",
+    ]
 
 
 async def test_hub_my_context_brief_alias(mock_api_get: AsyncMock) -> None:

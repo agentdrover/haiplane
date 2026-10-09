@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -2004,6 +2005,25 @@ async def _release_block_lines() -> list[str]:
     return release_block_lines(blocks)
 
 
+_EGRESS_READ_SECONDS = 2.0
+
+
+async def _egress_lines() -> list[str]:
+    """«GitHub недоступен с сервера N мин…» from the public /health, or none."""
+    from hub.services.egress_watch import egress_lines
+
+    unread = ["Состояние связи сервера с GitHub не прочитано"]
+    try:
+        # Short wait: a hub that cannot answer /health in 2 s must not hold
+        # the whole context for the client's full timeout.
+        data = await asyncio.wait_for(_api_get("/health"), timeout=_EGRESS_READ_SECONDS)
+    except Exception:  # noqa: BLE001 - context must render without it
+        return unread
+    egress = data.get("egress") if isinstance(data, dict) else None
+    # A hub that predates the field has nothing to say; that is not a failure.
+    return egress_lines(egress) if isinstance(egress, dict) else []
+
+
 async def _general_hub_context(
     *, max_chars: int | None, mode: str, project: str = ""
 ) -> CallToolResult:
@@ -2045,6 +2065,10 @@ async def _general_hub_context(
 
     lines = ["## Hub Context (no task)"]
     lines.append(f"Instance: {instance['instance']} ({instance['base_url']})")
+    # #1645: the server cannot reach GitHub — the first thing after the
+    # instance, whoever the caller is: /health is public, so no identity is
+    # needed, and a failed read just leaves no line (never a false "fine").
+    lines.extend(await _egress_lines())
     # #1420: an open release alert comes before identity and tasks — a red
     # develop holds back everything merged, and this is what a session reads
     # first. Best effort: an old hub without the route just has no line, and
@@ -2109,6 +2133,10 @@ async def _general_hub_context(
         "\n".join(lines),
         budget,
         shrink="my_tasks",
+        # #1645: under a tight cap the prose must keep its head (title,
+        # instance, the egress alert), so the structured identity — which the
+        # prose already restates in the Identity line — goes before the text is cut.
+        drop_order=("identity",),
         identity=identity,
         my_tasks=my_tasks,
     )
@@ -5768,6 +5796,14 @@ def _format_whoami(data: dict[str, Any]) -> str:
 
 
 def _format_health(data: dict[str, Any]) -> str:
+    from hub.services.egress_watch import egress_lines
+
+    egress = data.get("egress")
+    egress_part = (
+        [f"Egress: {egress.get('state', 'unknown')}", *egress_lines(egress)]
+        if isinstance(egress, dict)
+        else []
+    )
     return "\n".join(
         [
             f"Status: {data['status']}",
@@ -5777,6 +5813,7 @@ def _format_health(data: dict[str, Any]) -> str:
             f"Auth disabled: {data['auth_disabled']}",
             f"Env tokens configured: {data['env_tokens_configured']}",
             f"Vast enabled: {data['vast_enabled']}",
+            *egress_part,
         ]
     )
 
