@@ -20,11 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import shutil
 import sys
 import tempfile
+import weakref
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -238,6 +241,9 @@ def resolve_ac_locators(
 MAX_FILE_BYTES = 256 * 1024
 MAX_TOTAL_BYTES = 1024 * 1024
 MAX_PATH_DEPTH = 12
+MAX_READS = 60
+_READ_DEADLINE_SECONDS = 30
+_CACHE_SIZE = 128
 _WORKER_WALL_SECONDS = 8
 _WORKER_CPU_SECONDS = 5
 _WORKER_ADDRESS_SPACE = 512 * 1024 * 1024
@@ -297,8 +303,23 @@ async def _exchange(proc: Any, payload: bytes) -> bytes:
             await feeder
 
 
+MAX_WORKERS = 2
+_slots: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _worker_slots() -> asyncio.Semaphore:
+    """At most ``MAX_WORKERS`` analysis processes at once, per event loop."""
+    loop = asyncio.get_running_loop()
+    if loop not in _slots:
+        _slots[loop] = asyncio.Semaphore(MAX_WORKERS)
+    return _slots[loop]
+
+
 async def analyse_in_worker(request: dict[str, Any]) -> dict[str, list[str]] | None:
     """Run ``request`` through the locator worker; ``None`` on any failure.
+
+    At most ``MAX_WORKERS`` run at a time: a burst of briefs queues here instead
+    of forking a process per request.
 
     Own interpreter (``-I -B``: no site customisation, no bytecode), an empty
     temporary directory as cwd (never the task's repository), a minimal
@@ -307,6 +328,11 @@ async def analyse_in_worker(request: dict[str, Any]) -> dict[str, list[str]] | N
     exit or an answer that is not the expected JSON all give ``None`` — the
     caller turns that into ``unknown`` for every locator of the request.
     """
+    async with _worker_slots():
+        return await _run_worker(request)
+
+
+async def _run_worker(request: dict[str, Any]) -> dict[str, list[str]] | None:
     payload = json.dumps(request).encode()
     workdir = tempfile.mkdtemp(prefix="hub-locator-")
     proc = None
@@ -423,6 +449,7 @@ class _Reader:
     def __init__(self, git: Any, repo: str, sha: str):
         self.git, self.repo, self.sha = git, repo, sha
         self.spent = 0
+        self.reads = 0
 
     async def _call(self, path: str, limit_chars: int) -> dict[str, Any]:
         try:
@@ -440,6 +467,16 @@ class _Reader:
         reads a few bytes at most), so a file over the per-file limit or over
         what is left of the request is never read at all.
         """
+        if self.reads >= MAX_READS:
+            return (
+                "toobig",
+                "",
+                (
+                    f"{path} was not read: this request already used its {MAX_READS} "
+                    "file reads"
+                ),
+            )
+        self.reads += 1
         probe = await self._call(path, 0)
         state = probe.get("state")
         if state == "missing":
@@ -498,33 +535,54 @@ async def read_locator_evidence(
     submission_sha: str = "",
     branch: str = "",
     base: str = "",
+    picked: tuple[str, str] | None = None,
 ) -> LocatorEvidence:
     """Read the locator files at one commit, never running anything (#1650).
 
     Everything goes through git by commit sha: no checkout, no import, no
-    environment handed over. Failure is ``unknown`` for the file, never
-    ``missing``. Every file's size is learned before its content is read, and a
-    file over ``MAX_FILE_BYTES`` — or past what is left of ``MAX_TOTAL_BYTES``
-    for the whole request, configuration files included — is ``unknown`` and
-    is not read.
+    environment handed over. The tree is listed ONCE; which files exist, and
+    which pytest configuration and conftest.py files stand above the locator
+    files, is read off that list, and only files that exist are read. Failure
+    is ``unknown`` for the file, never ``missing``. Every file's size is learned
+    before its content is read, a file over ``MAX_FILE_BYTES`` — or past what is
+    left of ``MAX_TOTAL_BYTES`` or ``MAX_READS`` for the whole request — is
+    ``unknown`` and is not read.
     """
     if not files:
         return LocatorEvidence()
     unread = dict.fromkeys(files)
     if not repo:
         return LocatorEvidence(unread, why="project has no workspace")
-    sha, label, why = await _pick_ref(
-        git, repo, (submission_sha or "").strip(), (branch or "").strip(), base or ""
-    )
+    if picked is None:
+        sha, label, why = await _pick_ref(
+            git,
+            repo,
+            (submission_sha or "").strip(),
+            (branch or "").strip(),
+            base or "",
+        )
+    else:
+        (sha, label), why = picked, ""
     if not sha:
         return LocatorEvidence(unread, why=why)
-    reader = _Reader(git, repo, sha)
     evidence = LocatorEvidence(dict(unread), ref_label=label)
+    try:
+        tree = await git.files_at_ref(repo, sha)
+    except Exception:  # noqa: BLE001 - a failed listing is "could not look"
+        log.warning("locator tree listing failed at %s", label)
+        tree = None
+    if tree is None:
+        reason = f"could not list the tree of {label}"
+        evidence.unread = dict.fromkeys(files, reason)
+        evidence.pytest_config_issue = reason
+        return evidence
+    reader = _Reader(git, repo, sha)
     for path in files:
-        state, text, reason = await reader.read(path)
-        if state == "missing":
+        if path not in tree:
             evidence.absent.add(path)
-        elif state == "present":
+            continue
+        state, text, reason = await reader.read(path)
+        if state == "present":
             evidence.sources[path] = text
         else:
             evidence.unread[path] = reason
@@ -537,9 +595,73 @@ async def read_locator_evidence(
         return evidence
     evidence.aux = {}
     for full in aux_paths:
+        if full not in tree:
+            evidence.aux[full] = {"state": "missing", "text": ""}
+            continue
         state, text, _ = await reader.read(full)
         evidence.aux[full] = {"state": state, "text": text}
     return evidence
+
+
+# Answers are a function of the commit, the locators and the analyser, so they
+# are kept (bounded) and identical concurrent requests share one computation.
+_cache: OrderedDict[tuple, list[dict]] = OrderedDict()
+_inflight: dict[tuple, asyncio.Task] = {}
+
+
+def clear_locator_cache() -> None:
+    """Forget cached answers (tests; a commit sha never changes its content)."""
+    _cache.clear()
+    _inflight.clear()
+
+
+async def _compute(
+    git: Any,
+    repo: str | None,
+    acs: Any,
+    files: list[str],
+    *,
+    submission_sha: str,
+    branch: str,
+    base: str,
+    picked: tuple[str, str] | None,
+) -> tuple[list[dict], bool]:
+    """``(rows, cacheable)``: a failure of the worker or the deadline is not cached."""
+    try:
+        evidence = await asyncio.wait_for(
+            read_locator_evidence(
+                git,
+                repo,
+                files,
+                submission_sha=submission_sha,
+                branch=branch,
+                base=base,
+                picked=picked,
+            ),
+            timeout=_READ_DEADLINE_SECONDS,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        log.warning("reading locator files passed its deadline")
+        evidence = LocatorEvidence(
+            dict.fromkeys(files),
+            unread=dict.fromkeys(files, OVER_BUDGET),
+            pytest_config_issue=OVER_BUDGET,
+        )
+        rows, _ = _plan(acs, evidence.sources, evidence.absent, evidence.unread)
+        return _finish(rows, None, ""), False
+    rows, todo = _plan(acs, evidence.sources, evidence.absent, evidence.unread)
+    results = None
+    if todo:
+        wanted = {t["nodeid"].split("::", 1)[0] for t in todo}
+        request: dict[str, Any] = {
+            "files": {p: evidence.sources[p] for p in wanted},
+            "config_issue": evidence.pytest_config_issue,
+            "locators": todo,
+        }
+        if evidence.aux is not None:
+            request["aux"] = evidence.aux
+        results = await analyse_in_worker(request)
+    return _finish(rows, results, evidence.ref_label), not todo or results is not None
 
 
 async def resolve_locators_at_ref(
@@ -554,27 +676,46 @@ async def resolve_locators_at_ref(
     """Resolve every test-AC locator of ``acs``: read at one commit, analyse in the worker.
 
     The single door for callers (review brief, epic approve). Reading goes
-    through git within the byte budget; the analysis runs in the bounded worker
-    process, so a hostile file can cost it its budget and nothing else.
+    through git within the byte and read budgets; the analysis runs in the
+    bounded worker process, so a hostile file can cost it its budget and
+    nothing else. The commit is resolved first so the answer can be cached by
+    (repo, commit, locators, analyser version) and so identical concurrent
+    requests are one computation.
     """
-    evidence = await read_locator_evidence(
-        git,
-        repo,
-        locator_files(acs),
-        submission_sha=submission_sha,
-        branch=branch,
-        base=base,
+    files = locator_files(acs)
+    kw = {"submission_sha": submission_sha, "branch": branch, "base": base}
+    picked = None
+    if files and repo:
+        sha, label, _ = await _pick_ref(
+            git, repo, submission_sha.strip(), branch.strip(), base or ""
+        )
+        picked = (sha, label) if sha else None
+    if picked is None:
+        rows, _ = await _compute(git, repo, acs, files, picked=None, **kw)
+        return rows
+    wanted = tuple(
+        (getattr(ac, "id", "?"), getattr(ac, "test_ref", None))
+        for ac in acs
+        if _verifiable_by(ac) == "test"
     )
-    rows, todo = _plan(acs, evidence.sources, evidence.absent, evidence.unread)
-    results = None
-    if todo:
-        wanted = {t["nodeid"].split("::", 1)[0] for t in todo}
-        request: dict[str, Any] = {
-            "files": {p: evidence.sources[p] for p in wanted},
-            "config_issue": evidence.pytest_config_issue,
-            "locators": todo,
-        }
-        if evidence.aux is not None:
-            request["aux"] = evidence.aux
-        results = await analyse_in_worker(request)
-    return _finish(rows, results, evidence.ref_label)
+    key = (repo, picked, wanted, locator_worker.VERSION)
+    if key in _cache:
+        _cache.move_to_end(key)
+        return copy.deepcopy(_cache[key])
+    loop = asyncio.get_running_loop()
+    flight = (key, id(loop))
+    task = _inflight.get(flight)
+    if task is None:
+
+        async def run() -> list[dict]:
+            rows, cacheable = await _compute(git, repo, acs, files, picked=picked, **kw)
+            if cacheable:
+                _cache[key] = copy.deepcopy(rows)
+                while len(_cache) > _CACHE_SIZE:
+                    _cache.popitem(last=False)
+            return rows
+
+        task = loop.create_task(run())
+        _inflight[flight] = task
+        task.add_done_callback(lambda _t: _inflight.pop(flight, None))
+    return copy.deepcopy(await asyncio.shield(task))

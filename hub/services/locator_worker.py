@@ -35,6 +35,7 @@ OVER_BUDGET = "анализ превысил бюджет"
 NO_RESOLVER = "no way to look inside a {runner} test file"
 
 OPS_LIMIT = 1_500_000
+VERSION = "3"  # part of every cache key: bump when answers can change
 _MAX_DEPTH = 40
 _MAX_REASON = 400
 _SAFE_PLAIN_DECORATORS = {"staticmethod", "classmethod"}
@@ -459,10 +460,13 @@ def resolve_python(
         return UNKNOWN, f"{rel} is too deeply nested to read: {type(exc).__name__}"
     if verdict == _OPAQUE:
         return UNKNOWN, _short(f"{rel}: {detail}")
+    if config_issue:
+        # Whatever makes pytest's collection unpredictable (options, hooks, a
+        # plugin, an unreadable configuration) can ADD a test as well as hide
+        # one, so it comes before any claim about absence.
+        return UNKNOWN, _short(f"{rel}: {config_issue}")
     if verdict == _ABSENT:
         return MISSING, _short(f"{rel}: {detail}")
-    if config_issue:
-        return UNKNOWN, _short(f"{rel}: {config_issue}")
     suffix = f" ({PARAM_NOT_CHECKED})" if has_param else ""
     return RESOLVABLE, f"{BY_SOURCE}: {rel}:{detail.lineno}{suffix}"
 
@@ -484,10 +488,16 @@ _SCAN_LIMIT = 2000
 _QUOTES = "'\"`"
 
 
+class _Unfollowable(Exception):
+    """The scan limit was reached: the declaration cannot be followed."""
+
+
 def _skip_ws(text: str, i: int, budget: Budget) -> int:
     n = len(text)
     start = i
-    while i < n and text[i].isspace() and i - start < _SCAN_LIMIT:
+    while i < n and text[i].isspace():
+        if i - start >= _SCAN_LIMIT:
+            raise _Unfollowable
         i += 1
     budget.spend(i - start + 1)
     return i
@@ -533,6 +543,16 @@ def _unescape(raw: str) -> str:
 
 
 def _declared_name(text: str, head_end: int, budget: Budget) -> tuple[bool, str | None]:
+    """See ``_follow_declaration``; a scan that hits its limit is unfollowable."""
+    try:
+        return _follow_declaration(text, head_end, budget)
+    except _Unfollowable:
+        return True, None
+
+
+def _follow_declaration(
+    text: str, head_end: int, budget: Budget
+) -> tuple[bool, str | None]:
     """``(started, name)`` for a declaration whose head ends at ``head_end``.
 
     ``started`` says a declaration BEGINS here (an opening paren or backtick),
@@ -646,6 +666,18 @@ def _config_file_issue(name: str, path: str, text: str) -> str:
     return _options_issue(options, path)
 
 
+def _conftest_names(node: ast.AST) -> list[str]:
+    """Names a node defines or brings in, for the hook check."""
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+        return [node.name]
+    if isinstance(node, ast.Assign | ast.AnnAssign):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        return [t.id for t in targets if isinstance(t, ast.Name)]
+    if isinstance(node, ast.Import | ast.ImportFrom):
+        return [n for a in node.names for n in (a.name, a.asname or a.name)]
+    return []
+
+
 def _conftest_issue(path: str, text: str, budget: Budget) -> str:
     try:
         tree = ast.parse(text, filename=path)
@@ -653,16 +685,18 @@ def _conftest_issue(path: str, text: str, budget: Budget) -> str:
         return f"{path} could not be parsed, so its collection hooks are unknown"
     for node in ast.walk(tree):
         budget.spend()
-        names = []
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            names = [node.name]
-        elif isinstance(node, ast.Assign | ast.AnnAssign):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            names = [t.id for t in targets if isinstance(t, ast.Name)]
+        names = _conftest_names(node)
         if any(n.startswith(_COLLECT_HOOKS) for n in names):
             return (
-                f"{path} defines a pytest collection hook, which can add or hide tests"
+                f"{path} defines or imports a pytest collection hook, which can "
+                "add or hide tests"
             )
+        if any(n == "pytest_plugins" or n.startswith("pytest_") for n in names) and (
+            isinstance(node, ast.Import | ast.ImportFrom) or "pytest_plugins" in names
+        ):
+            return f"{path} loads pytest plugins or hooks it does not define"
+        if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+            return f"{path} has a star import, which can bring in any hook"
     return ""
 
 
@@ -671,7 +705,12 @@ def ancestors(path: str) -> list[str]:
     return ["/".join(parts[:i]) for i in range(len(parts), -1, -1)]
 
 
-def config_issue_for(path: str, aux: dict[str, dict], budget: Budget) -> str:
+def config_issue_for(
+    path: str,
+    aux: dict[str, dict],
+    budget: Budget,
+    memo: dict[str, str] | None = None,
+) -> str:
     """Why pytest's collection at ``path`` cannot be trusted; ``""`` if it can.
 
     Looks at pytest's configuration files and conftest.py in EVERY directory
@@ -688,11 +727,16 @@ def config_issue_for(path: str, aux: dict[str, dict], budget: Budget) -> str:
                 continue
             if state != "present":
                 return f"{full} could not be read, so pytest's collection rules are unknown"
-            text = (info or {}).get("text") or ""
-            if name == "conftest.py":
-                issue = _conftest_issue(full, text, budget)
+            if memo is not None and full in memo:
+                issue = memo[full]
             else:
-                issue = _config_file_issue(name, full, text)
+                text = (info or {}).get("text") or ""
+                if name == "conftest.py":
+                    issue = _conftest_issue(full, text, budget)
+                else:
+                    issue = _config_file_issue(name, full, text)
+                if memo is not None:
+                    memo[full] = issue
             if issue:
                 return issue
     return ""
@@ -715,6 +759,7 @@ def analyse(request: dict[str, Any], budget: Budget | None = None) -> dict[str, 
     fixed_issue = str(request.get("config_issue") or "")
     parsed: dict[str, Any] = {}
     issues: dict[str, str] = {}
+    aux_memo: dict[str, str] = {}
     results: dict[str, list[str]] = {}
     exhausted = False
     for item in request.get("locators") or []:
@@ -729,7 +774,9 @@ def analyse(request: dict[str, Any], budget: Budget | None = None) -> dict[str, 
                     parsed[rel] = parse_python(files[rel], rel, budget)
                 if rel not in issues:
                     issues[rel] = fixed_issue or (
-                        config_issue_for(rel, aux, budget) if aux is not None else ""
+                        config_issue_for(rel, aux, budget, aux_memo)
+                        if aux is not None
+                        else ""
                     )
                 status, reason = resolve_python(parsed[rel], rel, nodeid, issues[rel])
             elif runner == "vitest":

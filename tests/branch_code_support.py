@@ -156,6 +156,7 @@ class FakeGit:
         self.refs = {"origin/task-42/work": self.tip, **(refs or {})}
         self.refs_read: list[str] = []
         self.bytes_served = 0
+        self.calls = 0
         self.unreadable: set[str] = set()
         self.reads = 0
         self.moves: dict[int, tuple[str, str]] = {}
@@ -173,17 +174,21 @@ class FakeGit:
         return self.trees.get(sha) if sha else None
 
     async def head_sha(self, repo: str, base: str) -> str:
+        self.calls += 1
         return self.refs.get(f"origin/{base}", "")
 
     async def resolve_ref(self, name: str, repo: str) -> tuple[str, str]:
+        self.calls += 1
         sha = self._sha(name) or self._sha(f"origin/{name}")
         return ("resolved", sha) if sha else ("missing", name)
 
     async def files_at_ref(self, repo: str, ref: str):
+        self.calls += 1
         tree = self._tree(ref)
         return None if tree is None else set(tree)
 
     async def file_at_ref(self, repo: str, ref: str, path: str):
+        self.calls += 1
         tree = self._tree(ref)
         if tree is None or path not in tree:
             return None
@@ -193,6 +198,7 @@ class FakeGit:
     async def read_file_at_ref(
         self, repo: str, ref: str, path: str, *, limit_chars: int = 30000
     ) -> dict:
+        self.calls += 1
         tree = self._tree(ref)
         out = {
             "state": "unreadable",

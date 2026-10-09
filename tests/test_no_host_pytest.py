@@ -103,22 +103,22 @@ def _is_pytest_command(text: str, depth: int = 0) -> bool:
 
 
 class _Module:
-    """What one hub module binds at its top level, for resolving names."""
+    """What one hub module binds, for resolving names.
+
+    Imports are collected from the WHOLE module — inside functions and inside
+    ``if``/``try`` blocks too — because an alias is no less an alias for being
+    written where it is used. The alias map is per module, not per scope, which
+    errs towards flagging, never towards missing. Assignments are the module's
+    own (top level and its compound blocks, not function bodies).
+    """
 
     def __init__(self, name: str, tree: ast.Module):
         self.name = name
         self.tree = tree
         self.assigns: dict[str, list[ast.expr]] = {}
         self.imports: dict[str, tuple[str, str]] = {}  # local -> (module, name|"")
-        for node in tree.body:
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        self.assigns.setdefault(target.id, []).append(node.value)
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                if isinstance(node.target, ast.Name):
-                    self.assigns.setdefault(node.target.id, []).append(node.value)
-            elif isinstance(node, ast.Import):
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
                 for alias in node.names:
                     local = alias.asname or alias.name.split(".")[0]
                     target = alias.name if alias.asname else alias.name.split(".")[0]
@@ -126,6 +126,14 @@ class _Module:
             elif isinstance(node, ast.ImportFrom) and node.module:
                 for alias in node.names:
                     self.imports[alias.asname or alias.name] = (node.module, alias.name)
+        for node in _statements_outside_functions(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self.assigns.setdefault(target.id, []).append(node.value)
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                if isinstance(node.target, ast.Name):
+                    self.assigns.setdefault(node.target.id, []).append(node.value)
 
 
 def _callee(node: ast.Call, module: _Module | None = None) -> str:
@@ -510,6 +518,25 @@ _ROUND3 = {
         "hub/m.py": (
             "import subprocess\n"
             "if True:\n    def f():\n        subprocess.run(['pytest'])\n"
+        )
+    },
+    "alias imported inside a function": {
+        "hub/m.py": (
+            "def f():\n    from subprocess import run as launch\n"
+            "    launch(['pytest'])\n"
+        )
+    },
+    "alias imported in a module-level if": {
+        "hub/m.py": (
+            "import sys\nif sys.platform:\n"
+            "    from subprocess import run as launch\n"
+            "def f():\n    launch(['pytest'])\n"
+        )
+    },
+    "constant assigned in a module-level if": {
+        "hub/m.py": (
+            "import subprocess, sys\nif sys.platform:\n    CMD = 'uv run pytest'\n"
+            "def f():\n    subprocess.run(CMD, shell=True)\n"
         )
     },
     "method inside try": {

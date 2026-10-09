@@ -460,3 +460,13 @@ def scoped_ci_key(ci_runner_hub):
         return {"Authorization": f"Bearer {key['plaintext_key']}"}
 
     return make
+
+
+@pytest.fixture(autouse=True)
+def _forget_locator_answers():
+    """A sha names the same content in real life, but test fakes reuse one."""
+    from hub.services.test_existence import clear_locator_cache
+
+    clear_locator_cache()
+    yield
+    clear_locator_cache()

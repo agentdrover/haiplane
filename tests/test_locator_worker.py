@@ -33,7 +33,11 @@ def _ac(node: str, file: str = _PATH, ac_id: str = "AC-1") -> SimpleNamespace:
     return SimpleNamespace(id=ac_id, verifiable_by="test", test_ref=f"{file}::{node}")
 
 
-async def _resolve(files: dict, acs: list, git: FakeGit | None = None) -> list[dict]:
+async def _resolve(
+    files: dict, acs: list, git: FakeGit | None = None, fresh: bool = True
+) -> list[dict]:
+    if fresh:  # one fake sha names different files from test to test
+        test_existence.clear_locator_cache()
     git = git or FakeGit(files)
     return await asyncio.wait_for(
         resolve_locators_at_ref(git, "/repo", acs, branch="task-42/work", base="main"),
@@ -181,3 +185,166 @@ async def test_many_locators_on_one_big_file_parse_it_once():
     res = await _resolve(files, acs)
     assert time.monotonic() - started < 8
     assert all(r["status"] == RESOLVABLE for r in res), res
+
+
+# ---- round 4: the cost of a request is bounded -----------------------------------------
+
+
+async def test_deep_paths_cost_a_bounded_number_of_git_calls():
+    deep = "/".join(f"d{i}" for i in range(12))
+    files = {f"{deep}/t{i}.py": "def test_a():\n    pass\n" for i in range(50)}
+    git = FakeGit(files)
+    acs = [_ac("test_a", f"{deep}/t{i}.py", f"AC-{i}") for i in range(50)]
+
+    res = await _resolve(files, acs, git)
+
+    assert all(r["status"] == RESOLVABLE for r in res), res[:2]
+    # one tree listing, two calls (size, content) per existing file, a few refs
+    assert git.calls <= 2 * 50 + 10, git.calls
+
+
+async def test_the_number_of_file_reads_per_request_is_capped():
+    files = {f"tests/t{i}.py": "def test_a():\n    pass\n" for i in range(100)}
+    git = FakeGit(files)
+    acs = [_ac("test_a", f"tests/t{i}.py", f"AC-{i}") for i in range(100)]
+
+    res = await _resolve(files, acs, git)
+
+    assert git.calls <= 2 * test_existence.MAX_READS + 10, git.calls
+    assert any(r["status"] == UNKNOWN and "file reads" in r["reason"] for r in res)
+    assert all(r["status"] != MISSING for r in res)
+
+
+def _logging_worker(tmp_path: Path, log: Path, seconds: float) -> Path:
+    return _script(
+        tmp_path,
+        "import json, sys, time\n"
+        f"log = {str(log)!r}\n"
+        "open(log, 'a').write('start %f\\n' % time.time())\n"
+        "sys.stdin.read()\n"
+        f"time.sleep({seconds})\n"
+        "open(log, 'a').write('end %f\\n' % time.time())\n"
+        "print(json.dumps({'results': {'0': ['resolvable', 'ok']}}))\n",
+    )
+
+
+async def test_only_a_few_workers_run_at_once(monkeypatch, tmp_path: Path):
+    log = tmp_path / "events"
+    monkeypatch.setattr(
+        test_existence, "_WORKER_FILE", _logging_worker(tmp_path, log, 0.6)
+    )
+
+    async def one(i: int):
+        files = {_PATH: f"def test_{i}():\n    pass\n"}
+        return await _resolve(files, [_ac(f"test_{i}")])
+
+    await asyncio.gather(*(one(i) for i in range(6)))
+
+    events = sorted(
+        (float(line.split()[1]), 1 if line.startswith("start") else -1)
+        for line in log.read_text().splitlines()
+    )
+    running = peak = 0
+    for _, delta in events:
+        running += delta
+        peak = max(peak, running)
+    assert len(events) == 12
+    assert peak <= test_existence.MAX_WORKERS, peak
+
+
+async def test_a_repeated_request_is_answered_from_the_cache(monkeypatch):
+    runs = []
+    real = test_existence.analyse_in_worker
+
+    async def counting(request):
+        runs.append(1)
+        return await real(request)
+
+    monkeypatch.setattr(test_existence, "analyse_in_worker", counting)
+    files = {_PATH: "def test_a():\n    pass\n"}
+    git = FakeGit(files)
+    first = await _resolve(files, [_ac("test_a")], git)
+    calls_after_first = git.calls
+    second = await _resolve(files, [_ac("test_a")], git, fresh=False)
+
+    assert first == second
+    assert len(runs) == 1
+    assert git.calls - calls_after_first <= 2  # only the ref is resolved again
+
+
+async def test_identical_concurrent_requests_share_one_computation(monkeypatch):
+    runs = []
+    real = test_existence.analyse_in_worker
+
+    async def counting(request):
+        runs.append(1)
+        await asyncio.sleep(0.3)
+        return await real(request)
+
+    monkeypatch.setattr(test_existence, "analyse_in_worker", counting)
+    files = {_PATH: "def test_a():\n    pass\n"}
+
+    results = await asyncio.gather(
+        *(
+            _resolve(files, [_ac("test_a")], FakeGit(files), fresh=False)
+            for _ in range(5)
+        )
+    )
+
+    assert len(runs) == 1
+    assert all(r == results[0] for r in results)
+
+
+async def test_a_failed_worker_is_not_cached(monkeypatch, tmp_path: Path):
+    files = {_PATH: "def test_a():\n    pass\n"}
+    git = FakeGit(files)
+    good = test_existence._WORKER_FILE
+    monkeypatch.setattr(
+        test_existence, "_WORKER_FILE", _script(tmp_path, "import sys\nsys.exit(3)\n")
+    )
+    failed = await _resolve(files, [_ac("test_a")], git)
+    assert failed[0]["status"] == UNKNOWN
+    monkeypatch.setattr(test_existence, "_WORKER_FILE", good)
+
+    again = await _resolve(files, [_ac("test_a")], git, fresh=False)
+
+    assert again[0]["status"] == RESOLVABLE, again
+
+
+def test_a_shared_conftest_is_parsed_once_per_request(monkeypatch):
+    from hub.services import locator_worker
+
+    calls = []
+    real = locator_worker._conftest_issue
+
+    def counting(path, text, budget):
+        calls.append(path)
+        return real(path, text, budget)
+
+    monkeypatch.setattr(locator_worker, "_conftest_issue", counting)
+    conftest = "x = 1\n" * 38000  # ~230 KB
+    request = {
+        "files": {f"tests/t{i}.py": "def test_a():\n    pass\n" for i in range(20)},
+        "aux": {
+            (f"{d}/{n}" if d else n): {"state": "missing", "text": ""}
+            for d in ("tests", "")
+            for n in (*locator_worker.CONFIG_NAMES, "conftest.py")
+        },
+        "locators": [
+            {"key": str(i), "nodeid": f"tests/t{i}.py::test_a", "runner": "pytest"}
+            for i in range(20)
+        ],
+    }
+    request["aux"]["tests/conftest.py"] = {"state": "present", "text": conftest}
+    out = locator_worker.analyse(request)["results"]
+    assert all(v[0] == RESOLVABLE for v in out.values()), out
+    assert calls == ["tests/conftest.py"]
+
+
+async def test_twenty_files_under_one_big_conftest_are_all_resolvable():
+    conftest = "x = 1\n" * 38000
+    files = {f"tests/t{i}.py": "def test_a():\n    pass\n" for i in range(20)}
+    files["tests/conftest.py"] = conftest
+    acs = [_ac("test_a", f"tests/t{i}.py", f"AC-{i}") for i in range(20)]
+    res = await _resolve(files, acs)
+    assert all(r["status"] == RESOLVABLE for r in res), res[:2]

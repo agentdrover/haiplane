@@ -15,6 +15,7 @@ from hub.services.test_existence import (
     RESOLVABLE,
     UNKNOWN,
     UNPARSEABLE,
+    clear_locator_cache,
     resolve_locators_at_ref,
 )
 from tests.branch_code_support import FakeGit
@@ -27,6 +28,7 @@ def _ac(node: str, file: str = _PATH) -> SimpleNamespace:
 
 
 async def _status(files: dict, node: str, git: FakeGit | None = None) -> dict:
+    clear_locator_cache()  # one fake sha names different files from call to call
     git = git or FakeGit(files)
     res = await resolve_locators_at_ref(
         git, "/repo", [_ac(node)], branch="task-42/work", base="main"
@@ -357,3 +359,66 @@ async def test_a_benign_conftest_and_config_leave_the_answer_alone():
 async def test_an_unreadable_conftest_above_the_file_is_unknown():
     res = await _in_dirs({"tests/conftest.py": "x = 1\n"}, {"tests/conftest.py"})
     assert res["status"] == UNKNOWN, res
+
+
+# ---- round 4: uncertainty about collection comes BEFORE any claim of absence ---------
+
+
+async def test_an_absent_name_is_unknown_when_collection_can_add_tests():
+    # test_generated is not written anywhere, and a conftest.py hook may well
+    # create it: absence cannot be claimed.
+    generated = {
+        "tests/conftest.py": "def pytest_collectstart(collector):\n    pass\n",
+    }
+    res = await _in_dirs_for("test_generated", generated)
+    assert res["status"] == UNKNOWN, res
+    broken = {"pyproject.toml": "[tool.pytest.ini_options\npython_functions = ["}
+    res = await _in_dirs_for("test_generated", broken)
+    assert res["status"] == UNKNOWN, res
+    res = await _in_dirs_for("test_generated", {})
+    assert res["status"] == MISSING, res  # and without doubt it is still missing
+
+
+async def _in_dirs_for(node: str, extra: dict[str, str]):
+    files = {_PATH: "def test_a():\n    pass\n", **extra}
+    return await _status(files, node, FakeGit(files))
+
+
+async def test_imported_hooks_and_plugins_in_a_conftest_make_it_unknown():
+    cases = {
+        "imported hook": "from helpers import pytest_collection_modifyitems\n",
+        "aliased hook": "from helpers import pytest_collection_modifyitems as hook\n",
+        "plugin list": "pytest_plugins = ['helpers.plugin']\n",
+        "plugin import": "from helpers import pytest_something\n",
+        "star import": "from helpers import *\n",
+    }
+    for name, conftest in cases.items():
+        res = await _in_dirs_for("test_a", {"tests/conftest.py": conftest})
+        assert res["status"] == UNKNOWN, (name, res)
+        res = await _in_dirs_for("test_gone", {"tests/conftest.py": conftest})
+        assert res["status"] == UNKNOWN, (name, res)
+
+
+async def test_a_vitest_declaration_past_the_scan_limit_is_unknown_not_missing():
+    for text in (
+        "test" + " " * 2100 + "('late name', () => {});\n",
+        "it(" + " " * 2100 + "'late name', () => {});\n",
+        "it('" + "x" * 2100 + "', () => {});\n",
+    ):
+        res = await _vitest(text)
+        assert res["status"] == UNKNOWN, (text[:20], res)
+
+
+async def _vitest(text: str) -> dict:
+    clear_locator_cache()
+    files = {"web/a.test.ts": text}
+    git = FakeGit(files)
+    return (
+        await resolve_locators_at_ref(
+            git,
+            "/repo",
+            [_ac("another name", "web/a.test.ts")],
+            branch="task-42/work",
+            base="main",
+        )
+    )[0]
