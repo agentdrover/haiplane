@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
@@ -25,8 +27,9 @@ from hub import config
 from hub import repository as repo
 from hub.config import TokenIdentity
 from hub.db import fetchall
-from hub.integrations import cursor_cloud
+from hub.integrations import cursor_cloud, local_reviewer
 from hub.models import StewardJudgementSubmit
+from hub.services import chat_pair
 from hub.services import steward_shadow as sh
 from hub.services.steward_advisor import (
     REFUSED_ADVISOR,
@@ -48,6 +51,9 @@ from hub.services.steward_dispatch import (
 )
 from hub.services.steward_evidence import build_evidence_packet, packet_hash
 from hub.services.steward_judgement import record_steward_judgement
+from tests.local_advisor_support import GLM as _GLM
+from tests.local_advisor_support import beat_caps as _beat_caps
+from tests.local_advisor_support import capabilities as _capabilities
 from tests.test_steward_apply import _green
 from tests.test_steward_shadow import (
     _CREATED,
@@ -1784,3 +1790,396 @@ async def test_the_final_outcome_needs_the_same_stamp_not_just_the_same_state(
         "applying",
         "2099-01-01 00:00:00.000",
     )
+
+
+# ---------------------------------------------------------------------------
+# Локальный советник на GLM через службу ревью (#1649)
+# ---------------------------------------------------------------------------
+#
+# Подставная служба, heartbeat с возможностями и фикстуры local_spool,
+# local_identity, local_service лежат в tests/local_advisor_support.py (их
+# делят четыре файла тестов; регистрирует conftest).
+
+
+async def _local_events(db: aiosqlite.Connection, task_id: int) -> list[dict]:
+    rows = await fetchall(
+        db, "SELECT kind, payload FROM events WHERE task_id=? ORDER BY id", (task_id,)
+    )
+    return [{**json.loads(r["payload"] or "{}"), "event": r["kind"]} for r in rows]
+
+
+async def _advisor_row(db: aiosqlite.Connection, task_id: int) -> dict:
+    return [r for r in await _runs(db, task_id) if r["kind"] == KIND_ADVISOR][0]
+
+
+def _cursor_never_called():
+    return patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(side_effect=AssertionError("Cursor для local: не зовётся")),
+    )
+
+
+async def test_a_local_glm_advisor_is_launchable_only_when_its_path_is_ready(
+    db: aiosqlite.Connection, local_spool, local_identity, monkeypatch
+):
+    """#1649 AC-2: заказ советника glm-5.1 идёт, только когда готов весь путь.
+
+    Судья composer, ревьюер grok, исполнитель claude: облачного кандидата нет.
+    Отказ при неготовом пути называет причину в строке заказа и в событии:
+    незапускаемый транспорт, несовпадение модели, нет принципала — и это не
+    ``undeclared_model``.
+    """
+    # 1. Путь готов: советник glm-5.1 заказан.
+    ready_task, _ = await _ordered_advisor(db, "local-ready")
+    row = await _advisor_row(db, ready_task)
+    assert row["model"] == _GLM and row["status"] == RUN_OPEN
+
+    async def _refused(slug: str) -> tuple[dict, dict]:
+        project_id = await _project(db, slug)
+        task_id = await _task(
+            db, project_id, implementer="claude-opus-5", reviewer="grok-4.6"
+        )
+        await _judge_run(db, task_id, model="composer-2.5")
+        await _judge(db, task_id)
+        assert await order_due_advisors(db) == 0
+        row = await _advisor_row(db, task_id)
+        assert row["status"] == "refused", row
+        events = [
+            e
+            for e in await _local_events(db, task_id)
+            if e["event"] == "steward_run_refused"
+        ]
+        assert events, "отказ назван и в ленте событий"
+        return row, events[-1]
+
+    # 2. Старая служба: heartbeat без возможностей.
+    _beat_caps(local_spool, None)
+    old, event = await _refused("local-old-service")
+    assert "advisor_not_launchable" in old["closed_reason"]
+    assert event["reason"] == "advisor_not_launchable"
+    assert "undeclared_model" not in old["closed_reason"]
+
+    # 3. Служба объявила другую модель.
+    _beat_caps(local_spool, _capabilities(advisor_model="glm-4.7"))
+    other, event = await _refused("local-other-model")
+    assert event["reason"] == "local_advisor_model_mismatch"
+    assert "glm-4.7" in other["closed_reason"] and _GLM in other["closed_reason"]
+
+    # 4. Профиль advisor службой не объявлен.
+    _beat_caps(local_spool, _capabilities(profiles=["review"]))
+    _, event = await _refused("local-no-profile")
+    assert event["reason"] == "advisor_not_launchable"
+
+    # 5. Heartbeat просрочен.
+    _beat_caps(local_spool, _capabilities(), age=120)
+    stale, event = await _refused("local-stale-heartbeat")
+    assert event["reason"] == "advisor_not_launchable"
+    assert "heartbeat" in stale["closed_reason"]
+
+    # 5b. Срок контейнера службой не объявлен: публиковать задание нельзя.
+    _beat_caps(local_spool, _capabilities(timeouts={"max_sec": 1800}))
+    _, event = await _refused("local-no-timeout")
+    assert event["reason"] == "advisor_not_launchable"
+
+    # 6. STEWARD_HUB_TOKEN не разрешается в принципала.
+    _beat_caps(local_spool, _capabilities())
+
+    async def _nobody(_db):
+        return None
+
+    monkeypatch.setattr(sh, "steward_principal_id", _nobody)
+    _, event = await _refused("local-no-principal")
+    assert event["reason"] == "no_identity_channel"
+
+
+async def test_the_local_advisor_start_mints_the_code_only_for_the_claim_winner_at_slot_time(
+    db: aiosqlite.Connection, local_spool, local_identity, local_service, monkeypatch
+):
+    """#1649 AC-3: код и задание — у победителя захвата и в момент слота.
+
+    Четыре случая: два конкурентных старта; заказ закрыт, пока ждал слот;
+    выпуск кода падает; нормальный старт (started_at и agent_id local: — после
+    слота, Cursor не зовётся, поллер не ждёт supervisor).
+    """
+    from hub.services.steward_advisor import start_advisor_run
+    from hub.services.steward_advisor_local import wait_for_local_advisors
+
+    svc = local_service()
+    with _cursor_never_called() as cursor_attempt:
+        # --- 1. конкурентные старты одного заказа
+        task_id, order = await _ordered_advisor(db, "local-race")
+        assert order["model"] == _GLM
+
+        async def _judge_now():
+            await _advise(db, task_id)
+
+        svc.judge = _judge_now
+        results = await asyncio.gather(
+            start_advisor_run(db, dict(order)), start_advisor_run(db, dict(order))
+        )
+        assert sorted(results) == [False, True], "победитель один"
+        await wait_for_local_advisors()
+        assert len(local_identity) == 1, "код выписал один победитель"
+        assert local_identity[0][1:] == ("steward_advisor", task_id, 1)
+        assert svc.jobs == [{"version": 3, "timeout_sec": 900, "profile": "advisor"}]
+        assert "ABCD-2345" in svc.prompts[0] and "steward-evidence" in svc.prompts[0]
+        row = await _advisor_row(db, task_id)
+        assert row["agent_id"].startswith("local:") and row["started_at"]
+        assert row["model"] == _GLM
+        assert row["status"] == "judged", "ответ советника закрыл заказ"
+        svc.judge = None  # дальше «CLI» молчит: ответ сдавать больше не от кого
+
+        # --- 2. заказ закрыт, пока ждал слот: ни кода, ни задания
+        task2, order2 = await _ordered_advisor(db, "local-closed-in-queue")
+        minted, published = len(local_identity), len(svc.jobs)
+        async with local_reviewer._HOST_BUDGET:
+            started = await asyncio.wait_for(start_advisor_run(db, dict(order2)), 2)
+            assert started is True, "поллер не ждёт очередь и CLI"
+            await asyncio.sleep(0.1)
+            waiting = await _advisor_row(db, task2)
+            assert waiting["agent_id"].startswith("pending:"), waiting
+            assert not waiting["started_at"], "started_at — только после слота"
+            assert len(local_identity) == minted, "код до слота не выписан"
+            await repo.update_task(db, task2, submission_generation=2)
+            await db.commit()
+            await close_finished_runs(db)
+        await wait_for_local_advisors()
+        closed = await _advisor_row(db, task2)
+        assert closed["status"] == "superseded" and not closed["started_at"]
+        assert len(local_identity) == minted and len(svc.jobs) == published
+
+        # --- 2b. заказ закрыт ДРУГИМ путём (мимо close_run, значит без просьбы
+        #         об отмене), пока ждал слот: последняя проверка после очереди
+        #         сама видит закрытую строку и ничего не выпускает.
+        task2b, order2b = await _ordered_advisor(db, "local-closed-silently")
+        minted, published = len(local_identity), len(svc.jobs)
+        async with local_reviewer._HOST_BUDGET:
+            assert await start_advisor_run(db, dict(order2b)) is True
+            await asyncio.sleep(0.05)
+            await db.execute(
+                "UPDATE steward_runs SET status='superseded', closed_reason='x' "
+                "WHERE id=?",
+                (order2b["id"],),
+            )
+            await db.commit()
+        await wait_for_local_advisors()
+        assert len(local_identity) == minted and len(svc.jobs) == published
+
+        # --- 2c. поколение сменилось (UPDATE мимо close_finished_runs): заказ
+        #         формально открыт, но отвечать не на что — ни кода, ни задания.
+        task2c, order2c = await _ordered_advisor(db, "local-generation-moved")
+        async with local_reviewer._HOST_BUDGET:
+            assert await start_advisor_run(db, dict(order2c)) is True
+            await asyncio.sleep(0.05)
+            await repo.update_task(db, task2c, submission_generation=2)
+            await db.commit()
+        await wait_for_local_advisors()
+        moved = await _advisor_row(db, task2c)
+        assert moved["status"] == "refused" and not moved["started_at"], moved
+        assert len(local_identity) == minted and len(svc.jobs) == published
+
+        # --- 2d. заказ закрыт ровно между последней проверкой и записью старта:
+        #         условный UPDATE (rowcount) не даёт стартовать — ни кода, ни задания.
+        task2d, order2d = await _ordered_advisor(db, "local-lost-at-start")
+        from hub.services import steward_advisor_local as local_mod
+
+        real_remaining = local_mod._remaining_sec
+
+        async def _close_after_last_check(db_, run_id):
+            left = await real_remaining(db_, run_id)
+            await db_.execute(
+                "UPDATE steward_runs SET status='superseded', closed_reason='x' "
+                "WHERE id=?",
+                (run_id,),
+            )
+            await db_.commit()
+            return left
+
+        monkeypatch.setattr(local_mod, "_remaining_sec", _close_after_last_check)
+        minted, published = len(local_identity), len(svc.jobs)
+        assert await start_advisor_run(db, dict(order2d)) is True
+        await wait_for_local_advisors()
+        monkeypatch.setattr(local_mod, "_remaining_sec", real_remaining)
+        lost = await _advisor_row(db, task2d)
+        assert lost["status"] == "superseded" and not lost["started_at"], lost
+        assert lost["agent_id"].startswith("pending:"), "local: не записан"
+        assert len(local_identity) == minted and len(svc.jobs) == published
+
+        # --- 3. выпуск кода падает: запуск остановлен, задание не опубликовано
+        task3, order3 = await _ordered_advisor(db, "local-mint-fails")
+
+        async def _boom(*_a, **_k):
+            raise RuntimeError("выписка недоступна")
+
+        monkeypatch.setattr(chat_pair, "issue_code", _boom)
+        assert await start_advisor_run(db, dict(order3)) is True
+        await wait_for_local_advisors()
+        failed = await _advisor_row(db, task3)
+        assert failed["status"] != RUN_OPEN, failed
+        assert "no_identity_channel" in failed["closed_reason"]
+        assert len(svc.jobs) == published, "задание не опубликовано"
+        assert not [p for p in svc.prompts if "выписка" in p]
+
+    assert cursor_attempt.await_count == 0
+
+
+async def test_a_local_advisor_answer_counts_only_from_its_session(
+    db: aiosqlite.Connection, local_spool, local_identity, local_service
+):
+    """#1649 AC-8: засчитывается ответ из сессии steward_advisor, а не текст прогона.
+
+    Первый заказ: «CLI» сдаёт concur контрактом — суждение привязано к
+    суждению судьи, поколению, хешу пакета и модели ПРОГОНА; токены сразу
+    неизвестны по названной причине, свип Cursor не зовёт. Второй заказ: в
+    выводе прогона лежит блок concur, а сессии не было — ответа нет.
+    """
+    from hub.services.steward_advisor import start_advisor_run
+    from hub.services.steward_advisor_local import wait_for_local_advisors
+    from hub.services.steward_judgement import stamp_judgement_usage
+
+    svc = local_service()
+    task_id, order = await _ordered_advisor(db, "local-answer")
+
+    async def _door_then_answer():
+        # Выдачу пакета двери ставит хаб на открытый заказ; здесь — её след.
+        await db.execute(
+            "UPDATE steward_runs SET packet_hash='pkt' WHERE id=?", (order["id"],)
+        )
+        await db.commit()
+        await _advise(db, task_id)
+
+    svc.judge = _door_then_answer
+    with _cursor_never_called():
+        assert await start_advisor_run(db, dict(order)) is True
+        await wait_for_local_advisors()
+    judge = await _judge_row(db, task_id)
+    answer = await _judge_row(db, task_id, "advisor")
+    assert answer is not None and answer["verdict"] == "concur"
+    assert answer["judged_id"] == judge["id"] and answer["generation"] == 1
+    assert answer["packet_hash"] == "pkt"
+    assert answer["model"] == _GLM, "модель прогона, а не слова советника"
+    assert answer["tokens_spent"] is None
+    assert answer["tokens_unknown_reason"] == "local_no_provider_usage"
+    assert (await advisor_state(db, task_id, 1)).state == STATE_RECEIVED
+
+    asked: list[str] = []
+
+    async def _spy(agent_id, *_a, **_k):
+        asked.append(str(agent_id))
+        return None
+
+    with (
+        patch("hub.integrations.cursor_cloud.get_run", new=_spy),
+        patch("hub.integrations.cursor_cloud.get_usage", new=_spy),
+    ):
+        await stamp_judgement_usage(db)
+    assert not [a for a in asked if a.startswith("local:")], (
+        "свип спросил Cursor про локальный прогон"
+    )
+    # Даже если у локального суждения вдруг стоит «pending» (запись прошлой
+    # редакции), свип по нему Cursor не спрашивает.
+    await db.execute(
+        "UPDATE steward_judgements SET tokens_unknown_reason='pending' "
+        "WHERE task_id=? AND kind='advisor'",
+        (task_id,),
+    )
+    await db.commit()
+    asked.clear()
+    with (
+        patch("hub.integrations.cursor_cloud.get_run", new=_spy),
+        patch("hub.integrations.cursor_cloud.get_usage", new=_spy),
+    ):
+        await stamp_judgement_usage(db)
+    assert not [a for a in asked if a.startswith("local:")], "спросили про local:"
+    await db.execute(
+        "UPDATE steward_judgements SET tokens_unknown_reason='local_no_provider_usage' "
+        "WHERE task_id=? AND kind='advisor'",
+        (task_id,),
+    )
+    await db.commit()
+    again = await _judge_row(db, task_id, "advisor")
+    assert again["tokens_unknown_reason"] == "local_no_provider_usage"
+
+    # --- блок concur только в stdout: сессии нет — ответ не засчитан
+    task2, order2 = await _ordered_advisor(db, "local-stdout-only")
+    svc.judge = None
+    svc.output = '```json\n{"kind": "advisor", "verdict": "concur"}\n```\nconcur'
+    with _cursor_never_called():
+        assert await start_advisor_run(db, dict(order2)) is True
+        await wait_for_local_advisors()
+    assert await _judge_row(db, task2, "advisor") is None
+    assert (await advisor_state(db, task2, 1)).state != STATE_RECEIVED
+    assert (await advisor_refusal(db, task2, 1)) is not None, "согласия нет"
+    row = await _advisor_row(db, task2)
+    assert row["status"] != RUN_OPEN
+    assert "local_cli_no_judgement" in row["closed_reason"]
+
+
+async def test_the_cloud_advisor_path_is_unchanged_by_the_local_channel(
+    db: aiosqlite.Connection, local_spool, local_identity, local_service, monkeypatch
+):
+    """#1649 AC-10: при включённом локальном канале облачный выбор и отказы прежние.
+
+    Облачный кандидат первым в списке: заказан он, прогон идёт через Cursor,
+    задание в spool не пишется. Локальная модель без облачного кандидата не
+    маскирует прежний агрегированный отказ, пока её путь не готов.
+    """
+    svc = local_service()
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_MODELS", ("gpt-5.3-codex",))
+    monkeypatch.setattr(config, "CURSOR_API_KEY", "cursor-key")
+
+    async def _delivery(_db, _task_id, _generation, _base_url, kind="steward"):
+        return _DELIVERY
+
+    monkeypatch.setattr(sh, "identity_delivery", _delivery)
+    task_id, order = await _ordered_advisor(db, "cloud-first")
+    assert order["model"] == "gpt-5.3-codex", "облачный выбор не изменился"
+    with patch(
+        "hub.integrations.cursor_cloud.create_agent_attempt",
+        new=AsyncMock(return_value=(_CREATED, None)),
+    ) as started:
+        assert await sh.start_due_runs(db) == 1
+    assert started.await_count == 1
+    row = await _advisor_row(db, task_id)
+    assert row["agent_id"] == "agent-1" and row["model"] == "gpt-5.3-codex"
+    assert svc.jobs == [] and not list(local_spool.glob("job-*"))
+
+    # Облачного кандидата нет. Локальная модель названа, путь не готов: отказ
+    # называет причину локального пути. Локальной модели нет — прежний
+    # агрегированный отказ no_advisor_family, слово в слово.
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_MODELS", ())
+    _beat_caps(local_spool, None)
+    project_id = await _project(db, "cloud-none-local-named")
+    named = await _task(
+        db, project_id, implementer="claude-opus-5", reviewer="grok-4.6"
+    )
+    await _judge_run(db, named, model="composer-2.5")
+    await _judge(db, named)
+    assert await order_due_advisors(db) == 0
+    refusal = [
+        e
+        for e in await _local_events(db, named)
+        if e["event"] == "steward_run_refused" and e.get("kind") == KIND_ADVISOR
+    ]
+    assert refusal and refusal[-1]["reason"] == "advisor_not_launchable", refusal
+
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_LOCAL_MODEL", "")
+    project_id = await _project(db, "cloud-none")
+    other = await _task(
+        db, project_id, implementer="claude-opus-5", reviewer="grok-4.6"
+    )
+    await _judge_run(db, other, model="composer-2.5")
+    await _judge(db, other)
+    assert await order_due_advisors(db) == 0
+    refusal = [
+        e
+        for e in await _local_events(db, other)
+        if e["event"] == "steward_run_refused" and e.get("kind") == KIND_ADVISOR
+    ]
+    assert refusal and refusal[-1]["reason"] == "no_advisor_family", refusal
+    # Протокол ревью v1 не тронут: задание ревью несёт ровно прежние поля.
+    jobdir = local_reviewer._submit_job(str(local_spool), "промт", 60)
+    assert json.loads(Path(jobdir, "job.json").read_text()) == {
+        "version": 1,
+        "timeout_sec": 60,
+    }

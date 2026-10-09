@@ -32,19 +32,6 @@
 в рабочем каталоге прогона (``<workdir>/src`` только для чтения). Проверка
 установки без hub: ``haiplane-review-runner.py --check-install``.
 
-Профиль advisor (#1649). Задание version=3 с ``profile="advisor"`` запускает
-ВТОРУЮ команду службы (HAIPLANE_REVIEW_RUNNER_ARGV_ADVISOR) — врапер
-``haiplane-advisor-run`` со своими образом, ключом z.ai, сроком и закреплённым
-argv CLI. Профиль — закрытое перечисление, а не путь и не команда: v3 несёт
-ровно ``version``, ``timeout_sec``, ``profile``, снимок ``src.tar`` в нём
-запрещён, v1/v2 поля ``profile`` не знают. МОДЕЛЬ и СРОК советника служба берёт
-из тех же root-овых файлов, что читает врапер (``advisor-model``,
-``advisor-timeout`` в HAIPLANE_REVIEW_RUNNER_ADVISOR_CONF_DIR), поэтому
-объявленное в heartbeat не может разойтись с тем, что запустит врапер.
-Heartbeat служба пишет JSON с блоком ``capabilities``: версии заданий,
-профили, закреплённая модель советника и сроки; хаб сверяет его до выпуска
-кода доступа советнику.
-
 Только стандартная библиотека: служба ставится на хост двумя файлами (сама и
 ``snapshot_unpack.py``), без пакета hub.
 
@@ -57,9 +44,7 @@ Heartbeat служба пишет JSON с блоком ``capabilities``: вер�
                                       ПОСЛЕДНИМ и атомарно — это и есть «готово».
                                       version=2 — задание со снимком; старая
                                       служба принимает только version=1 и
-                                      отклоняет его ДО запуска модели.
-                                      version=3 — {"version": 3, "timeout_sec": N,
-                                      "profile": "advisor"} (#1649), без src.tar
+                                      отклоняет его ДО запуска модели
     <job>/claimed                     служба взяла задание
     <job>/cancel                      хаб просит снять прогон (таймаут)
     <job>/result.json                 итог; пишется атомарно
@@ -110,23 +95,9 @@ UNPACKER_FILE = "snapshot_unpack.py"
 JOB_VERSION = 1
 # Версия задания со снимком исходников (#1599): старая служба знает только 1.
 JOB_VERSION_SNAPSHOT = 2
-# Версия задания профиля advisor (#1649): только советник, без снимка. Старые
-# службы (v1, v2) её не знают и отклоняют ДО запуска модели.
-JOB_VERSION_ADVISOR = 3
-JOB_VERSIONS = (JOB_VERSION, JOB_VERSION_SNAPSHOT, JOB_VERSION_ADVISOR)
+JOB_VERSIONS = (JOB_VERSION, JOB_VERSION_SNAPSHOT)
 # Закрытый список: ни команды, ни путей, ни окружения задание нести не может.
 JOB_FIELDS = ("version", "timeout_sec")
-# У v3 к ним добавляется закрытое перечисление профиля.
-JOB_FIELDS_ADVISOR = ("version", "timeout_sec", "profile")
-PROFILE_ADVISOR = "advisor"
-PROFILE_REVIEW = "review"
-# Файлы доверенной конфигурации врапера advisor (root:root, без записи группе и
-# миру): их читает и врапер, и служба — единственный источник модели и срока.
-ADVISOR_MODEL_FILE = "advisor-model"
-ADVISOR_TIMEOUT_FILE = "advisor-timeout"
-DEFAULT_ADVISOR_CONF = "/etc/haiplane-review"
-CAPABILITIES_PROTOCOL = 1
-_MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$")
 
 OUTPUT_CAP = 200_000
 PROMPT_CAP = 4 * 1024 * 1024
@@ -170,29 +141,6 @@ class Config:
     # Пользователь ревьюера из argv (sudo -n -u <имя>): нужен, чтобы убедиться,
     # что каталог прогонов не принадлежит ему (иначе sticky-бит не защищает).
     reviewer_user: str = ""
-    # Профиль advisor (#1649). Пустой advisor_argv — профиля нет, v3 отвергается.
-    advisor_argv: tuple[str, ...] = ()
-    advisor_conf: str = ""
-    # Доверенный владелец файлов advisor-model/advisor-timeout — root; из
-    # окружения не настраивается (как unpacker_trusted_uid).
-    conf_trusted_uid: int = 0
-
-
-def _advisor_argv_problem(argv: list[str]) -> str:
-    """Форма advisor строже: ровно ``sudo -n -u <не root> /абсолютный/путь``.
-
-    Аргументов после врапера нет вовсе: argv CLI закреплён внутри врапера, а
-    sudoers разрешает путь только с пустым списком аргументов.
-    """
-    problem = _argv_problem(argv)
-    if problem:
-        return problem
-    if len(argv) != 5:
-        return (
-            "после пути к враперу advisor аргументов быть не должно: argv CLI "
-            "закреплён внутри врапера"
-        )
-    return ""
 
 
 def _argv_problem(argv: list[str]) -> str:
@@ -253,28 +201,6 @@ def load_config(env: Mapping[str, str]) -> Config:
             "HAIPLANE_REVIEW_RUNNER_MAX_TIMEOUT_SEC: потолок службы убил бы "
             "прогон раньше, чем контейнер отсчитает свой --timeout"
         )
-    try:
-        advisor = shlex.split(
-            (env.get("HAIPLANE_REVIEW_RUNNER_ARGV_ADVISOR") or "").strip()
-        )
-    except ValueError as exc:
-        raise ConfigError(
-            f"HAIPLANE_REVIEW_RUNNER_ARGV_ADVISOR не разобран: {exc}"
-        ) from exc
-    if advisor:
-        problem = _advisor_argv_problem(advisor)
-        if problem:
-            raise ConfigError(f"HAIPLANE_REVIEW_RUNNER_ARGV_ADVISOR: {problem}")
-        if advisor[3] != argv[3]:
-            raise ConfigError(
-                "HAIPLANE_REVIEW_RUNNER_ARGV_ADVISOR: пользователь врапера advisor "
-                "должен совпадать с пользователем ревью (отдельные uid — вне MVP)"
-            )
-    conf_dir = (env.get("HAIPLANE_REVIEW_RUNNER_ADVISOR_CONF_DIR") or "").strip()
-    if conf_dir and not os.path.isabs(conf_dir):
-        raise ConfigError(
-            "HAIPLANE_REVIEW_RUNNER_ADVISOR_CONF_DIR должен быть абсолютным"
-        )
     return Config(
         spool=spool,
         argv=tuple(argv),
@@ -282,8 +208,6 @@ def load_config(env: Mapping[str, str]) -> Config:
         max_timeout=cap,
         wrapper_timeout=wrapper,
         reviewer_user=argv[3],
-        advisor_argv=tuple(advisor),
-        advisor_conf=conf_dir or DEFAULT_ADVISOR_CONF,
         snapshot_max_bytes=_positive(
             env, "HAIPLANE_REVIEW_RUNNER_SNAPSHOT_MAX_BYTES", 64 * 1024 * 1024
         ),
@@ -313,34 +237,22 @@ def parse_job(raw: bytes, max_timeout: int, wrapper_timeout: int = 0) -> int:
 
 
 def parse_job_ex(
-    raw: bytes,
-    max_timeout: int,
-    wrapper_timeout: int = 0,
-    advisor_timeout: int = 0,
+    raw: bytes, max_timeout: int, wrapper_timeout: int = 0
 ) -> tuple[int, int]:
-    """``(срок, версия)`` задания, или JobRejected. Команды не читает.
-
-    ``wrapper_timeout`` — ``--timeout`` врапера ревью, ``advisor_timeout`` —
-    врапера advisor (#1649): срок задания не может быть короче того, что у
-    контейнера, иначе хаб объявил бы снятие раньше, чем контейнер умрёт.
-    """
+    """``(срок, версия)`` задания, или JobRejected. Команды не читает."""
     try:
         data = json.loads(raw)
     except ValueError as exc:
         raise JobRejected("job.json не разобран как JSON") from exc
     if not isinstance(data, dict):
         raise JobRejected("job.json должен быть объектом")
-    advisor_job = data.get("version") == JOB_VERSION_ADVISOR and not isinstance(
-        data.get("version"), bool
-    )
-    allowed = JOB_FIELDS_ADVISOR if advisor_job else JOB_FIELDS
-    extra = sorted(str(key) for key in set(data) - set(allowed))
+    extra = sorted(str(key) for key in set(data) - set(JOB_FIELDS))
     if extra:
         raise JobRejected(
             "в задании неизвестные поля: "
             + ", ".join(extra)[:200]
             + "; задание несёт только "
-            + ", ".join(allowed)
+            + ", ".join(JOB_FIELDS)
             + ", а команду службы задаёт её конфиг"
         )
     version = data.get("version")
@@ -350,123 +262,17 @@ def parse_job_ex(
             + " или ".join(str(v) for v in JOB_VERSIONS)
             + ")"
         )
-    if version == JOB_VERSION_ADVISOR and data.get("profile") != PROFILE_ADVISOR:
-        raise JobRejected(
-            "версия задания 3 принимается только с profile=advisor (поле profile "
-            f"— закрытое перечисление, получено {data.get('profile')!r})"
-        )
     timeout = data.get("timeout_sec")
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
         raise JobRejected("timeout_sec должен быть целым числом больше нуля")
-    floor = advisor_timeout if version == JOB_VERSION_ADVISOR else wrapper_timeout
-    if timeout < floor:
+    if timeout < wrapper_timeout:
         raise JobRejected(
             f"срок задания {timeout} с меньше --timeout враппера "
-            f"({floor} с): хаб объявил бы снятие раньше, чем "
+            f"({wrapper_timeout} с): хаб объявил бы снятие раньше, чем "
             "контейнер умрёт. Выровняйте LOCAL_REVIEW_TIMEOUT_SEC хаба с "
             "файлом timeout враппера"
         )
     return min(timeout, max_timeout), int(version)
-
-
-def _trusted_conf_problem(path: str, trusted_uid: int, *, directory: bool) -> str:
-    """Каталог или файл конфигурации advisor принадлежит доверенному и не пишется чужими."""
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    if directory:
-        flags |= os.O_DIRECTORY
-    try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        return f"{path}: не открыт без следования по ссылке ({exc.strerror})"
-    try:
-        info = os.fstat(fd)
-    finally:
-        os.close(fd)
-    if (
-        stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
-    ) is False:
-        return f"{path}: не {'каталог' if directory else 'обычный файл'}"
-    if info.st_uid != trusted_uid:
-        return (
-            f"{path} принадлежит uid {info.st_uid}, а должен принадлежать "
-            f"uid {trusted_uid} (root): иначе хаб мог бы подменить модель или срок"
-        )
-    if info.st_mode & 0o022:
-        return f"{path} доступен на запись группе или всем"
-    return ""
-
-
-def advisor_settings(cfg: Config) -> tuple[str, int, str]:
-    """``(модель, срок враппера, причина)`` профиля advisor; причина пуста — профиль годен.
-
-    Модель и срок читаются из ТЕХ ЖЕ root-овых файлов, что и враппер
-    ``haiplane-advisor-run``: расхождение между объявленным и запущенным
-    невозможно по построению.
-    """
-    if not cfg.advisor_argv:
-        return (
-            "",
-            0,
-            "профиль advisor не настроен (HAIPLANE_REVIEW_RUNNER_ARGV_ADVISOR пуст)",
-        )
-    conf = cfg.advisor_conf or DEFAULT_ADVISOR_CONF
-    problem = _trusted_conf_problem(conf, cfg.conf_trusted_uid, directory=True)
-    if problem:
-        return "", 0, problem
-    values: dict[str, str] = {}
-    for name in (ADVISOR_MODEL_FILE, ADVISOR_TIMEOUT_FILE):
-        path = os.path.join(conf, name)
-        problem = _trusted_conf_problem(path, cfg.conf_trusted_uid, directory=False)
-        if problem:
-            return "", 0, problem
-        try:
-            values[name] = _read_nofollow(path, 256).decode("utf-8", "replace").strip()
-        except (OSError, _TooBig) as exc:
-            return "", 0, f"{path} не прочитан: {exc}"
-    model = values[ADVISOR_MODEL_FILE]
-    if not _MODEL_NAME.match(model):
-        return "", 0, f"{ADVISOR_MODEL_FILE}: имя модели недопустимо"
-    raw = values[ADVISOR_TIMEOUT_FILE]
-    if not raw.isdigit() or int(raw) <= 0:
-        return "", 0, f"{ADVISOR_TIMEOUT_FILE}: нужно целое число секунд больше нуля"
-    timeout = int(raw)
-    if timeout > cfg.max_timeout:
-        return (
-            "",
-            0,
-            (
-                f"{ADVISOR_TIMEOUT_FILE} ({timeout} с) больше потолка службы "
-                f"({cfg.max_timeout} с): потолок убил бы прогон раньше контейнера"
-            ),
-        )
-    return model, timeout, ""
-
-
-def capabilities(cfg: Config) -> dict[str, object]:
-    """Что служба умеет, — для хаба (блок ``capabilities`` в heartbeat, #1649)."""
-    model, timeout, problem = advisor_settings(cfg)
-    ready = not problem
-    caps: dict[str, object] = {
-        "protocol": CAPABILITIES_PROTOCOL,
-        "job_versions": [v for v in JOB_VERSIONS if v != JOB_VERSION_ADVISOR or ready],
-        "profiles": [PROFILE_REVIEW] + ([PROFILE_ADVISOR] if ready else []),
-        "advisor_model": model,
-        "timeouts": {
-            "max_sec": cfg.max_timeout,
-            "review_sec": cfg.wrapper_timeout,
-            "advisor_sec": timeout,
-        },
-    }
-    if cfg.advisor_argv and problem:
-        caps["advisor_problem"] = problem[:300]
-    return caps
-
-
-def heartbeat_payload(cfg: Config) -> bytes:
-    """Тело heartbeat: жизнь (pid, время) и возможности. mtime файла — признак жизни."""
-    return json.dumps(
-        {"pid": os.getpid(), "time": time.time(), "capabilities": capabilities(cfg)}
-    ).encode()
 
 
 class _TooBig(Exception):
@@ -776,12 +582,8 @@ async def _run(
     timeout: int,
     snapshot: str | None = None,
     unpacker=None,  # noqa: ANN001
-    argv: tuple[str, ...] | None = None,
 ) -> tuple[dict[str, object], bool]:
-    """Прогнать команду службы. Второе значение — «хаб отозвал, убрать за ним».
-
-    ``argv`` — команда профиля (advisor, #1649); без него — команда ревью.
-    """
+    """Прогнать команду службы. Второе значение — «хаб отозвал, убрать за ним»."""
     started = time.monotonic()
     workdir = tempfile.mkdtemp(prefix="haiplane-review-", dir=cfg.scratch)
     proc: asyncio.subprocess.Process | None = None
@@ -799,7 +601,7 @@ async def _run(
             # Работает в каталоге чужой пользователь (ревьюер): доступ группе.
             os.chmod(workdir, 0o770)  # nosec B103 - группе, не миру
         proc = await asyncio.create_subprocess_exec(
-            *(argv or cfg.argv),
+            *cfg.argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -859,7 +661,6 @@ async def _execute_inner(
             _read_nofollow(os.path.join(jobdir, SPOOL_JOB), JOB_CAP),
             cfg.max_timeout,
             cfg.wrapper_timeout,
-            advisor_settings(cfg)[1],
         )
         prompt = _read_nofollow(prompt_path, PROMPT_CAP)
     except JobRejected as exc:
@@ -889,19 +690,6 @@ async def _execute_job(
 ) -> tuple[dict[str, object], bool]:
     """Прогон после разбора задания: версия 1 — как раньше, 2 — со снимком."""
     has_tar = os.path.lexists(snapshot_path)
-    if version == JOB_VERSION_ADVISOR:
-        if has_tar:
-            return _outcome(
-                "rejected",
-                reason=f"в задании advisor лежит {SPOOL_SNAPSHOT}: у профиля advisor "
-                "снимка исходников нет",
-            ), False
-        _model, _timeout, problem = advisor_settings(cfg)
-        if problem:
-            return _outcome(
-                "rejected", reason=f"профиль advisor недоступен: {problem}"[:300]
-            ), False
-        return await _run(cfg, jobdir, prompt, timeout, argv=cfg.advisor_argv)
     if version == JOB_VERSION:
         if has_tar:
             return _outcome(
@@ -986,11 +774,7 @@ def _sweep(cfg: Config) -> None:
 
 async def _heartbeat(cfg: Config) -> None:
     while True:
-        try:
-            payload = heartbeat_payload(cfg)
-        except Exception as exc:  # noqa: BLE001 - жизнь важнее возможностей
-            log.warning("capabilities not computed: %s", exc)
-            payload = json.dumps({"pid": os.getpid(), "time": time.time()}).encode()
+        payload = json.dumps({"pid": os.getpid(), "time": time.time()}).encode()
         try:
             _write_atomic(cfg.spool, SPOOL_HEARTBEAT, payload)
         except OSError as exc:

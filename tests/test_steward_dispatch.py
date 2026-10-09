@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import aiosqlite
@@ -3229,3 +3230,160 @@ async def test_a_resubmission_supersedes_the_advisor_order(
 
     (row,) = await _advisor_rows(db, task_id)
     assert row["status"] == RUN_SUPERSEDED
+
+
+async def test_a_local_advisor_run_is_withdrawn_and_closed_on_every_exit(
+    db: aiosqlite.Connection, local_spool, local_identity, local_service
+):
+    """#1649 AC-6: каждый выход локального прогона отзывает задание и закрывает строку.
+
+    Окно истекло; пересдача вытеснила; хаб останавливают; хаб упал и поднялся;
+    после слота остаток окна меньше срока обёртки; CLI вышел с rc≠0 уже после
+    принятого суждения.
+    """
+    from hub.services import steward_shadow as sh
+    from hub.services.steward_advisor import order_due_advisors, start_advisor_run
+    from hub.services.steward_advisor_local import (
+        cancel_local_advisors,
+        recover_local_advisor_runs,
+        wait_for_local_advisors,
+    )
+
+    from tests.local_advisor_support import GLM as _GLM
+    from tests.test_steward_advisor import (
+        _advise,
+        _advisor_row,
+        _judge_row,
+        _local_events,
+        _ordered_advisor,
+    )
+    from tests.test_steward_shadow import _judge, _judge_run, _project, _task
+
+    svc = local_service(hold=True)
+
+    async def _running(slug: str) -> tuple[int, dict]:
+        task_id, order = await _ordered_advisor(db, slug)
+        assert await start_advisor_run(db, dict(order)) is True
+        for _ in range(200):
+            if svc.prompts and (await _advisor_row(db, task_id))["started_at"]:
+                break
+            await asyncio.sleep(0.02)
+        row = await _advisor_row(db, task_id)
+        assert row["agent_id"].startswith("local:"), row
+        return task_id, row
+
+    # --- 1. окно истекло: запрошена отмена, строка timeout
+    before = len(svc.prompts)
+    task_id, row = await _running("local-window")
+    assert len(svc.prompts) == before + 1
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now','-1 minutes') WHERE id=?",
+        (row["id"],),
+    )
+    await db.commit()
+    await close_finished_runs(db)
+    await asyncio.wait_for(wait_for_local_advisors(), 15)
+    closed = await _advisor_row(db, task_id)
+    assert closed["status"] == "timeout"
+    cancels = [
+        e
+        for e in await _local_events(db, task_id)
+        if e["event"] == "steward_local_advisor_cancel"
+    ]
+    assert cancels, "запрос отмены записан"
+    cancel = cancels[-1]
+    assert cancel["cancel_confirmed"] is True and cancel["reason"], cancel
+    assert len(svc.cancelled) == 1, "служба получила отмену"
+
+    # --- 2. пересдача вытеснила
+    task2, row2 = await _running("local-superseded")
+    await repo.update_task(db, task2, submission_generation=2)
+    await db.commit()
+    await close_finished_runs(db)
+    await asyncio.wait_for(wait_for_local_advisors(), 15)
+    assert (await _advisor_row(db, task2))["status"] == "superseded"
+    assert len(svc.cancelled) == 2
+
+    # --- 3. хаб останавливают: задание отозвано, строка закрыта с причиной
+    task3, row3 = await _running("local-hub-stop")
+    jobdir = local_spool / ("job-" + row3["agent_id"].removeprefix("local:"))
+    assert jobdir.exists()
+    await asyncio.wait_for(cancel_local_advisors(), 15)
+    stopped = await _advisor_row(db, task3)
+    assert stopped["status"] != RUN_OPEN
+    assert "остановк" in stopped["closed_reason"], stopped["closed_reason"]
+    assert not (jobdir / "job.json").exists() and not (jobdir / "prompt.txt").exists()
+
+    # --- 4. хаб упал и поднялся: супервизора нет, строка и задание остались
+    project_id = await _project(db, "local-crash")
+    task4 = await _task(db, project_id)
+    await _judge_run(db, task4, model="composer-2.5")
+    await _judge(db, task4)
+    assert await order_due_advisors(db) == 1
+    order4 = await _advisor_row(db, task4)
+    hexid = "c" * 16
+    orphan = local_spool / f"job-{hexid}"
+    orphan.mkdir(mode=0o770)
+    (orphan / "job.json").write_text("{}")
+    (orphan / "claimed").write_text("")
+    await db.execute(
+        "UPDATE steward_runs SET agent_id=?, model=?, "
+        "started_at=strftime('%Y-%m-%d %H:%M:%f','now') WHERE id=?",
+        (f"local:{hexid}", _GLM, order4["id"]),
+    )
+    await db.commit()
+    assert await recover_local_advisor_runs(db) == 1
+    revived = await _advisor_row(db, task4)
+    assert revived["status"] != RUN_OPEN and revived["closed_reason"]
+    assert not (orphan / "job.json").exists(), "задание отозвано"
+    assert (orphan / "cancel").exists() or not orphan.exists()
+    assert await order_due_advisors(db) == 0, "повторный заказ не покупается"
+    assert await sh.start_due_runs(db) == 0
+    assert await recover_local_advisor_runs(db) == 0
+
+    # --- 4b. сирота ещё и просрочен: его закроет дедлайн (не восстановление),
+    #         и задание всё равно отзывается — закрытие строки идёт через close_run.
+    task4b, order4b = await _ordered_advisor(db, "local-crash-overdue")
+    orphan_b = local_spool / ("job-" + "d" * 16)
+    orphan_b.mkdir(mode=0o770)
+    (orphan_b / "job.json").write_text("{}")
+    (orphan_b / "claimed").write_text("")
+    await db.execute(
+        "UPDATE steward_runs SET agent_id=?, model=?, "
+        "started_at=strftime('%Y-%m-%d %H:%M:%f','now'), "
+        "deadline_at=datetime('now','-1 minutes') WHERE id=?",
+        ("local:" + "d" * 16, _GLM, order4b["id"]),
+    )
+    await db.commit()
+    assert await close_finished_runs(db) >= 1
+    assert (await _advisor_row(db, task4b))["status"] == "timeout"
+    assert not (orphan_b / "job.json").exists(), "задание сироты не отозвано"
+
+    # --- 5. остаток окна меньше срока обёртки: never_started, без публикации
+    task5, order5 = await _ordered_advisor(db, "local-short-window")
+    await db.execute(
+        "UPDATE steward_runs SET deadline_at=datetime('now','+5 minutes') WHERE id=?",
+        (order5["id"],),
+    )
+    await db.commit()
+    published, minted = len(svc.prompts), len(local_identity)
+    assert await start_advisor_run(db, dict(order5)) is True
+    await asyncio.wait_for(wait_for_local_advisors(), 15)
+    short = await _advisor_row(db, task5)
+    assert short["status"] == "never_started", short
+    assert "остат" in short["closed_reason"]
+    assert len(svc.prompts) == published and len(local_identity) == minted
+
+    # --- 6. rc≠0 после принятого суждения: суждение не перезаписано
+    task6, order6 = await _ordered_advisor(db, "local-late-failure")
+
+    async def _judge6():
+        await _advise(db, task6)
+
+    svc.judge, svc.rc, svc.hold = _judge6, 3, False
+    assert await start_advisor_run(db, dict(order6)) is True
+    await asyncio.wait_for(wait_for_local_advisors(), 15)
+    judged = await _advisor_row(db, task6)
+    assert judged["status"] == "judged", judged
+    answer = await _judge_row(db, task6, "advisor")
+    assert answer is not None and answer["verdict"] == "concur"

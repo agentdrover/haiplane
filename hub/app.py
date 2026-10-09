@@ -308,6 +308,14 @@ async def lifespan(app: FastAPI):
         await recover_dead_process_claims(app.state.db)
     except Exception:
         log.exception("steward claim recovery failed at startup")
+    # #1649: локальные прогоны советника, оставленные умершим хабом: задание
+    # отозвать, строку закрыть с причиной, повторный запуск не покупать.
+    try:
+        from hub.services.steward_advisor_local import recover_local_advisor_runs
+
+        await recover_local_advisor_runs(app.state.db)
+    except Exception:
+        log.exception("local advisor recovery failed at startup")
 
     poll_task = start_poller(app)
 
@@ -355,6 +363,14 @@ async def lifespan(app: FastAPI):
         # он доработает, попробует сдать отчёт по прогону, за которым больше
         # некому смотреть, и всё это время будет жечь процессор.
         await cancel_local_runs()
+        # #1649: то же для локальных советников стюарда — задание отзывается,
+        # строка закрывается с причиной, подтверждения хаб не ждёт.
+        try:
+            from hub.services.steward_advisor_local import cancel_local_advisors
+
+            await cancel_local_advisors()
+        except Exception:
+            log.exception("local advisors not cancelled on stop")
         set_telemetry_sink(None)
         await app.state.db.close()
 

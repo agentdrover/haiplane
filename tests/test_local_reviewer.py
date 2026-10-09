@@ -533,7 +533,12 @@ def test_the_hub_and_the_runner_share_one_protocol(runner_mod) -> None:
     assert runner_mod.JOB_VERSIONS == (
         local_reviewer.JOB_VERSION,
         local_reviewer.JOB_VERSION_SNAPSHOT,
+        local_reviewer.JOB_VERSION_ADVISOR,
     ), "служба принимает ровно версии, которые умеет слать хаб"
+    assert local_reviewer.JOB_VERSION_ADVISOR == runner_mod.JOB_VERSION_ADVISOR == 3
+    assert local_reviewer.PROFILE_ADVISOR == runner_mod.PROFILE_ADVISOR
+    assert set(local_reviewer.JOB_FIELDS_ADVISOR) == set(runner_mod.JOB_FIELDS_ADVISOR)
+    assert local_reviewer.CAPABILITIES_KEY == "capabilities"
     assert (
         config.LOCAL_REVIEW_SNAPSHOT_MAX_BYTES
         <= runner_mod.Config.__dataclass_fields__["snapshot_max_bytes"].default
@@ -2124,13 +2129,19 @@ def test_the_doc_fixes_the_snapshot_rollout_order_and_the_manual_probe() -> None
 
 
 def test_the_runner_accepts_only_the_known_job_versions(runner_mod) -> None:
-    for version in (0, 3, "2", None, True, 2.5):
+    # Версия 3 (#1649) известна, но только с profile=advisor: без профиля она
+    # такой же отказ «версия задания», как и неизвестные версии.
+    for version in (0, 3, 4, "2", None, True, 2.5):
         job = json.dumps({"version": version, "timeout_sec": 5}).encode()
         with pytest.raises(runner_mod.JobRejected, match="версия задания"):
             runner_mod.parse_job_ex(job, 60)
     for version in (1, 2):
         job = json.dumps({"version": version, "timeout_sec": 5}).encode()
         assert runner_mod.parse_job_ex(job, 60) == (5, version)
+    advisor = json.dumps(
+        {"version": 3, "timeout_sec": 5, "profile": "advisor"}
+    ).encode()
+    assert runner_mod.parse_job_ex(advisor, 60) == (5, 3)
 
 
 def test_the_snapshot_group_is_set_explicitly_not_inherited(tmp_path) -> None:
@@ -2498,3 +2509,333 @@ async def test_the_prompt_is_untouched_when_snapshot_is_off_and_literals_survive
     )  # absent: маркер заменяется, литерал цел
     sent = dict(writes)["prompt.txt"].decode()
     assert "'@@SNAPSHOT_DIR@@'" in sent, "буквальный плейсхолдер в диффе испорчен"
+
+
+# ---------------------------------------------------------------- #1649: advisor
+
+_OLD_RUNNER_V2 = _ROOT / "tests/fixtures/review_runner_v2.py.txt"
+
+
+def _load_frozen(path: Path, name: str):
+    from importlib.machinery import SourceFileLoader
+
+    loader = SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+def _advisor_conf(tmp_path: Path, model: str = "glm-5.1", timeout: int = 5) -> Path:
+    """Доверенная конфигурация обёртки advisor: те же файлы, что читает обёртка."""
+    conf = tmp_path / "conf"
+    conf.mkdir(exist_ok=True)
+    (conf / "advisor-model").write_text(model + "\n")
+    (conf / "advisor-timeout").write_text(f"{timeout}\n")
+    os.chmod(conf, 0o755)
+    for name in ("advisor-model", "advisor-timeout"):
+        os.chmod(conf / name, 0o644)
+    return conf
+
+
+async def test_the_runner_runs_advisor_jobs_only_as_v3_with_its_own_command(
+    spool, runner_mod, tmp_path
+) -> None:
+    """#1649 AC-4: профиль advisor — только задание v3, своя команда и свой срок.
+
+    v3 profile=advisor запускает argv советника из конфига службы. Отказ ДО
+    запуска модели: v3 с src.tar, v3 с profile=review или без profile, v3 с
+    лишним полем, срок короче advisor-timeout, v1/v2 с полем profile. Служба,
+    у которой advisor не настроен, и ЗАМОРОЖЕННЫЕ старые службы (v1 и v2)
+    v3 отклоняют, ничего не запуская. Heartbeat несёт версии, профили,
+    закреплённую модель и сроки.
+    """
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    (tmp_path / "r").mkdir()
+    (tmp_path / "a").mkdir()
+    review = _fake_cli(
+        tmp_path / "r",
+        f"import pathlib\npathlib.Path({str(rec / 'review')!r}).write_text('x')\n",
+    )
+    advisor = _fake_cli(
+        tmp_path / "a",
+        "import json, pathlib\n"
+        f"pathlib.Path({str(rec / 'advisor')!r}).write_text("
+        "json.dumps({'argv': sys.argv, 'stdin': prompt}))\n",
+    )
+    conf = _advisor_conf(tmp_path)
+    cfg = _runner_cfg(
+        runner_mod,
+        tmp_path,
+        spool,
+        review,
+        advisor_argv=advisor,
+        advisor_conf=str(conf),
+        conf_trusted_uid=os.getuid(),
+    )
+
+    def _result(jobdir: Path) -> dict:
+        return json.loads((jobdir / "result.json").read_text())
+
+    # --- v3 advisor: запущен argv советника, промт в stdin, review не тронут
+    ok = _write_job(
+        spool,
+        "job-" + "1" * 16,
+        {"version": 3, "timeout_sec": 5, "profile": "advisor"},
+        "ПРОМТ-СОВЕТНИКА",
+    )
+    await runner_mod.run_pending(cfg)
+    assert _result(ok)["status"] == "ok", _result(ok)
+    ran = json.loads((rec / "advisor").read_text())
+    assert ran["stdin"] == "ПРОМТ-СОВЕТНИКА" and ran["argv"][1:] == []
+    assert not (rec / "review").exists(), "команда ревью для advisor не годится"
+    (rec / "advisor").unlink()
+
+    # --- недопустимые сочетания: отказ до запуска модели
+    bad = {
+        "v3-src": ({"version": 3, "timeout_sec": 5, "profile": "advisor"}, "src.tar"),
+        "v3-review": ({"version": 3, "timeout_sec": 5, "profile": "review"}, "profile"),
+        "v3-none": ({"version": 3, "timeout_sec": 5}, "profile"),
+        "v3-extra": (
+            {"version": 3, "timeout_sec": 5, "profile": "advisor", "command": "id"},
+            "command",
+        ),
+        "v3-short": ({"version": 3, "timeout_sec": 3, "profile": "advisor"}, "срок"),
+        "v1-profile": (
+            {"version": 1, "timeout_sec": 5, "profile": "advisor"},
+            "profile",
+        ),
+        "v2-profile": (
+            {"version": 2, "timeout_sec": 5, "profile": "advisor"},
+            "profile",
+        ),
+    }
+    for index, (label, (job, needle)) in enumerate(bad.items()):
+        jobdir = _write_job(spool, f"job-{index:016x}", job)
+        if label == "v3-src":
+            (jobdir / "src.tar").write_bytes(b"x")
+        await runner_mod.run_pending(cfg)
+        result = _result(jobdir)
+        assert result["status"] == "rejected", (label, result)
+        assert needle in result["reason"], (label, result)
+        assert not (jobdir / "src.tar").exists(), label
+    assert not (rec / "advisor").exists() and not (rec / "review").exists()
+
+    # --- служба без advisor: v3 отвергнут, а heartbeat говорит «только review»
+    plain = _runner_cfg(runner_mod, tmp_path, spool, review)
+    jobdir = _write_job(
+        spool,
+        "job-" + "9" * 16,
+        {"version": 3, "timeout_sec": 5, "profile": "advisor"},
+    )
+    await runner_mod.run_pending(plain)
+    assert _result(jobdir)["status"] == "rejected"
+    assert not (rec / "advisor").exists()
+    caps = local_reviewer.parse_capabilities(runner_mod.heartbeat_payload(plain))
+    assert caps is not None and caps.profiles == ("review",)
+    assert caps.advisor_model == "" and caps.job_versions == (1, 2)
+
+    # --- heartbeat новой службы: версии, профили, модель, сроки
+    caps = local_reviewer.parse_capabilities(runner_mod.heartbeat_payload(cfg))
+    assert caps is not None
+    assert caps.job_versions == (1, 2, 3) and caps.profiles == ("review", "advisor")
+    assert caps.advisor_model == "glm-5.1" and caps.advisor_timeout_sec == 5
+    assert caps.max_timeout_sec == 60
+
+    # --- доверенная конфигурация: чужой владелец и запись группе/миру снимают профиль
+    def _profiles(over_cfg) -> tuple[str, ...]:
+        parsed = local_reviewer.parse_capabilities(
+            runner_mod.heartbeat_payload(over_cfg)
+        )
+        assert parsed is not None
+        return parsed.profiles
+
+    stranger = _runner_cfg(
+        runner_mod,
+        tmp_path,
+        spool,
+        review,
+        advisor_argv=advisor,
+        advisor_conf=str(conf),
+        conf_trusted_uid=os.getuid() + 1,
+    )
+    assert _profiles(stranger) == ("review",), "файлы не root-а: профиль не объявлен"
+    os.chmod(conf / "advisor-model", 0o664)
+    assert _profiles(cfg) == ("review",), "модель доступна на запись группе"
+    os.chmod(conf / "advisor-model", 0o644)
+    os.chmod(conf, 0o775)
+    assert _profiles(cfg) == ("review",), "каталог доступен на запись группе"
+    os.chmod(conf, 0o755)
+    (conf / "advisor-timeout").write_text("много\n")
+    assert _profiles(cfg) == ("review",), "срок не число"
+    (conf / "advisor-timeout").write_text("5000\n")
+    assert _profiles(cfg) == ("review",), "срок больше потолка службы"
+    (conf / "advisor-timeout").write_text("5\n")
+    (conf / "advisor-model").write_text("glm; id\n")
+    assert _profiles(cfg) == ("review",), "недопустимое имя модели"
+    (conf / "advisor-model").write_text("glm-5.1\n")
+    assert _profiles(cfg) == ("review", "advisor")
+    problem_caps = local_reviewer.parse_capabilities(
+        runner_mod.heartbeat_payload(stranger)
+    )
+    assert problem_caps is not None and problem_caps.problem, "причина названа"
+
+    # --- замороженные службы v1 и v2 отклоняют v3 до запуска модели
+    marker = tmp_path / "old_ran"
+    for label, path in (("v1", _OLD_RUNNER), ("v2", _OLD_RUNNER_V2)):
+        old = _load_frozen(path, f"haiplane_review_runner_frozen_{label}")
+        old_cfg = old.Config(
+            spool=str(spool),
+            argv=_fake_cli(
+                tmp_path,
+                f"import pathlib\npathlib.Path({str(marker)!r}).write_text('x')\n",
+            ),
+            scratch=str(tmp_path / "scratch"),
+            max_timeout=60,
+            poll=0.02,
+            heartbeat_every=0.05,
+        )
+        (tmp_path / "scratch").mkdir(exist_ok=True)
+        jobdir = _write_job(
+            spool,
+            "job-" + ("a" if label == "v1" else "b") * 16,
+            {"version": 3, "timeout_sec": 5, "profile": "advisor"},
+        )
+        await old.run_pending(old_cfg)
+        assert _result(jobdir)["status"] == "rejected", label
+        assert not marker.exists(), f"старая служба {label} запустила модель"
+
+
+_ADVISOR_WRAPPER = _ROOT / "deploy/review-runner/haiplane-advisor-run"
+_SUDOERS_ADVISOR = (
+    'haiplane ALL=(haiplane-reviewer) NOPASSWD: /usr/local/bin/haiplane-advisor-run ""'
+)
+
+
+def _run_advisor_wrapper(
+    tmp_path: Path, args: tuple[str, ...] = (), **conf: str | None
+):
+    """Запуск шаблона второй обёртки с подменённым podman и своим каталогом настроек."""
+    import subprocess
+    import uuid
+
+    confdir = tmp_path / "conf"
+    confdir.mkdir(parents=True, exist_ok=True)
+    files = {
+        "image": "localhost/haiplane-reviewer:2\n",
+        "advisor-model": "glm-5.1\n",
+        "advisor-timeout": "900\n",
+        "advisor.env": "OPENAI_API_KEY=z\nOPENAI_BASE_URL=https://api.z.ai/api/coding/paas/v4\n",
+        "model.env": "CURSOR_API_KEY=review-key\n",
+    }
+    files.update({k: v for k, v in conf.items()})
+    for name, value in files.items():
+        if value is None:
+            continue
+        (confdir / name).write_text(value)
+    stub = tmp_path / "podman"
+    stub.write_text(
+        "#!/usr/bin/env python3\nimport os, shlex, sys\n"
+        "open(os.environ['ARGV_LOG'], 'a').write(shlex.join(sys.argv[1:]) + '\\n')\n"
+    )
+    stub.chmod(0o755)
+    text = _ADVISOR_WRAPPER.read_text()
+    assert text.count("CONF=/etc/haiplane-review") == 1, "CONF закреплён один раз"
+    script = tmp_path / "haiplane-advisor-run"
+    script.write_text(
+        text.replace("/usr/bin/podman", str(stub)).replace(
+            "CONF=/etc/haiplane-review", f"CONF={confdir}"
+        )
+    )
+    script.chmod(0o755)
+    log = tmp_path / f"argv-{uuid.uuid4().hex}.log"
+    done = subprocess.run(
+        [str(script), *args],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "ARGV_LOG": str(log)},
+    )
+    return done, shlex.split(log.read_text()) if log.exists() else [], confdir
+
+
+def test_the_advisor_wrapper_pins_its_image_env_file_timeout_and_cli(tmp_path) -> None:
+    """#1649 AC-5: вторая обёртка — своё всё, argv CLI зашит, от вызывающего ничего.
+
+    Шаблон побайтно равен скелету в документе, sudoers закрепляет путь и запрет
+    аргументов; podman подменён и записывает, с чем его позвали.
+    """
+    import textwrap
+
+    doc = _DOC.read_text()
+    blocks = [
+        b
+        for b in re.findall(r"```bash\n(.*?)```", doc, re.S)
+        if "podman run" in b and "haiplane-advisor" in b
+    ]
+    assert len(blocks) == 1, "скелет второй обёртки в документе один"
+    assert _ADVISOR_WRAPPER.read_text() == textwrap.dedent(blocks[0]), (
+        "шаблон разошёлся со скелетом: правьте скелет и перегенерируйте файл"
+    )
+    assert os.access(_ADVISOR_WRAPPER, os.X_OK), "шаблон не исполняемый"
+    assert _SUDOERS_ADVISOR in doc, "точное правило sudoers в документе"
+    assert "visudo -cf" in doc and "haiplane-advisor" in doc
+    assert "NOPASSWD: /usr/local/bin/haiplane-review-run" in doc, "правило ревью цело"
+
+    done, argv, conf = _run_advisor_wrapper(tmp_path / "ok")
+    assert done.returncode == 0, done.stderr
+    assert argv[:2] == ["run", "--rm"] and "-i" in argv
+    assert f"--env-file={conf}/advisor.env" in argv
+    assert "model.env" not in " ".join(argv), "ключ ревью в advisor не уходит"
+    assert "--timeout=900" in argv, "срок — из advisor-timeout"
+    assert argv[argv.index("--name") + 1] == "haiplane-advisor"
+    assert "--replace" in argv and "--pids-limit=512" in argv
+    assert any(a.startswith("--memory=") for a in argv)
+    assert any(a.startswith("--cpus=") for a in argv)
+    joined = " ".join(argv)
+    for forbidden in (
+        "-v ",
+        "--volume",
+        "--mount",
+        "--privileged",
+        "--network=host",
+        "--pid=",
+        "podman.sock",
+        "docker.sock",
+        "/home",
+    ):
+        assert forbidden not in joined + " ", f"в запуске {forbidden!r}"
+    image = argv.index("localhost/haiplane-reviewer:2")
+    assert argv[image + 1 :] == [
+        "qwen",
+        "--model",
+        "glm-5.1",
+        "--approval-mode",
+        "yolo",
+        "--output-format",
+        "text",
+    ], "argv CLI закреплён обёрткой"
+
+    # Аргументы вызывающего (хаб/агент) в CLI не проходят и обёртку не запускают.
+    done, argv, _ = _run_advisor_wrapper(
+        tmp_path / "args", args=("--model", "evil", "sh", "-c", "id")
+    )
+    assert done.returncode == 64 and argv == [], (done.returncode, argv)
+
+    # Нет advisor-timeout, нет advisor-model, нет advisor.env или мусор — отказ, не запуск.
+    for broken in (
+        {"advisor-timeout": None},
+        {"advisor-timeout": "0\n"},
+        {"advisor-timeout": "много\n"},
+        {"advisor-model": None},
+        {"advisor-model": "glm; id\n"},
+        {"advisor.env": None},
+    ):
+        done, argv, _ = _run_advisor_wrapper(
+            tmp_path / f"b{abs(hash(str(broken)))}", **broken
+        )
+        assert done.returncode != 0 and argv == [], (broken, done.returncode, argv)

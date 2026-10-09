@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+# ВТОРАЯ обёртка (#1649): советник стюарда на GLM. Принадлежит root:root, 0755;
+# хаб и агент её не пишут. От вызывающего не принимается НИЧЕГО: ни аргументов
+# (argv CLI зашит ниже), ни окружения (sudo его сбрасывает), ни ключей. Ключ
+# ревью (model.env) в контейнер не передаётся: он получает ТОЛЬКО advisor.env.
+if [ "$#" -ne 0 ]; then
+    echo "haiplane-advisor-run: аргументы не принимаются, argv CLI закреплён обёрткой" >&2
+    exit 64
+fi
+RUID=$(id -u)
+export XDG_RUNTIME_DIR="/run/user/$RUID"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$RUID/bus"
+export HOME=/var/lib/haiplane-review
+# Каталог настроек закреплён литералом, а не берётся из окружения.
+CONF=/etc/haiplane-review
+# Образ — тот же файл, что у враппера ревью (qwen-code лежит в образе
+# песочницы). Модель и срок — файлы ЭТОЙ обёртки; те же файлы читает служба и
+# объявляет в heartbeat, поэтому объявленное хабу и запущенное не расходятся.
+# Нет файла — отказ (set -e), а не запуск с умолчанием.
+IMAGE=$(cat "$CONF/image")
+MODEL=$(cat "$CONF/advisor-model")
+TIMEOUT=$(cat "$CONF/advisor-timeout")
+case $TIMEOUT in
+    '' | 0 | *[!0-9]*) echo "advisor-timeout: нужно целое число секунд больше нуля" >&2; exit 65 ;;
+esac
+case $MODEL in
+    '' | *[!A-Za-z0-9._/-]*) echo "advisor-model: имя модели недопустимо" >&2; exit 65 ;;
+esac
+[ -r "$CONF/advisor.env" ] || { echo "нет $CONF/advisor.env" >&2; exit 66; }
+# Без монтирований хоста, сокетов и домашнего каталога. Контейнер получает
+# --env-file только с ключом z.ai. --timeout — последний рубеж: хаб и служба
+# снимают прогон просьбой, а контейнер доживает ровно до него.
+# qwen-code: промт читает из stdin; режим yolo разрешает tool calls (redeem,
+# GET evidence, POST judgement) без запроса, потому что вся изоляция — здесь.
+exec /usr/bin/podman run --rm -i \
+     --replace --name haiplane-advisor \
+     --cgroup-manager=systemd \
+     --timeout="$TIMEOUT" \
+     --memory=1500m --cpus=1.5 --pids-limit=512 \
+     --cap-drop=all --security-opt=no-new-privileges \
+     --env-file="$CONF/advisor.env" \
+     "$IMAGE" qwen --model "$MODEL" --approval-mode yolo --output-format text
