@@ -576,3 +576,165 @@ async def test_ci_runner_db_key_reports_and_is_not_human(ci_runner_hub):
     assert self_review.json()["detail"]["reason"] == "self_review_forbidden"
     task = (await hub.client.get(f"/api/tasks/{own}", headers=hub.human)).json()
     assert task["review_verdict"] is None and task["status"] == "review"
+
+
+# ---- #1644: the CI key is bound to a project ----
+
+
+async def _project_task(db, slug: str) -> int:
+    """A task with AC-1 inside a fresh project ``slug``, pinned to sha-pinned."""
+    pid = await repo.create_project(db, slug=slug, name=slug, workspace_path="/tmp/ws")
+    epic = await repo.create_task(
+        db,
+        title="epic",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="epic",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.update_task(db, epic, project_id=pid)
+    task_id = await _task(db, generation=1, sha="sha-pinned")
+    await repo.update_task(db, task_id, parent_id=epic)
+    await db.commit()
+    return task_id
+
+
+async def _snapshot(db, task_id: int) -> tuple:
+    rows = [
+        tuple(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM ci_run_reports WHERE task_id = ? ORDER BY id", (task_id,)
+        )
+    ]
+    ac = [
+        tuple(r)
+        for r in await db.execute_fetchall(
+            "SELECT * FROM acceptance_criteria WHERE task_id = ? ORDER BY id",
+            (task_id,),
+        )
+    ]
+    task = tuple(
+        (await db.execute_fetchall("SELECT * FROM tasks WHERE id = ?", (task_id,)))[0]
+    )
+    return rows, ac, task
+
+
+async def _key_events(db) -> list[dict]:
+    import json as _json
+
+    rows = await db.execute_fetchall(
+        "SELECT payload FROM events WHERE kind = 'ci_key_unscoped'"
+    )
+    return [_json.loads(r[0]) for r in rows]
+
+
+async def test_scoped_ci_key_cannot_report_for_another_project(
+    ci_runner_hub, scoped_ci_key
+):
+    """AC-1 (#1644): a key bound to audit-in cannot speak for a default task."""
+    hub = ci_runner_hub
+    db = hub.db
+    mine = await _project_task(db, "audit-in")
+    foreign = await _task(db, generation=1, sha="sha-pinned")
+    first = await _post_report(hub.client, hub.ci, foreign)
+    assert first["applied"] is True
+    before = await _snapshot(db, foreign)
+
+    scoped = await scoped_ci_key('["project:audit-in"]')
+    ok = await _post_report(hub.client, scoped, mine)
+    assert ok["applied"] is True
+
+    refused = await hub.client.post(
+        f"/api/tasks/{foreign}/ci-run-report",
+        json={
+            "head_sha": "sha-pinned",
+            "ac_results": {"AC-1": "fail"},
+            "validation_status": "fail",
+            "validation_log": "forged",
+        },
+        headers=scoped,
+    )
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"]["reason"] == "ci_report_out_of_scope"
+    assert await _snapshot(db, foreign) == before, "a refused report writes nothing"
+
+
+async def test_unscoped_key_is_flagged_once_and_damaged_scope_fails_closed(
+    ci_runner_hub, scoped_ci_key
+):
+    """AC-3 (#1644): legacy works and is flagged once a day; damage fails closed."""
+    hub = ci_runner_hub
+    db = hub.db
+    task_id = await _task(db, generation=1, sha="sha-pinned")
+    await _post_report(hub.client, hub.ci, task_id)
+    await _post_report(hub.client, hub.ci, task_id)
+    deploy = await hub.client.post(
+        "/api/deploys",
+        json={"sha": "legacy-deploy", "ref": "main", "status": "success"},
+        headers=hub.ci,
+    )
+    assert deploy.status_code == 200, deploy.text
+    events = await _key_events(db)
+    assert len(events) == 1, events
+    assert events[0]["api_key_id"] is not None
+
+    for raw in ("{not json", '["nonsense"]', '"project:default"', "null"):
+        damaged = await scoped_ci_key(raw, name=f"damaged-{len(raw)}")
+        report = await hub.client.post(
+            f"/api/tasks/{task_id}/ci-run-report",
+            json={"head_sha": "sha-pinned", "ac_results": {"AC-1": "pass"}},
+            headers=damaged,
+        )
+        assert report.status_code == 403, (raw, report.text)
+        dep = await hub.client.post(
+            "/api/deploys",
+            json={
+                "sha": "damaged-deploy",
+                "ref": "main",
+                "status": "success",
+                "project": "default",
+            },
+            headers=damaged,
+        )
+        assert dep.status_code == 403, (raw, dep.text)
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM releases WHERE deployed_sha = 'damaged-deploy'"
+    )
+    assert list(rows) == []
+
+
+async def test_reported_by_comes_from_the_key_not_the_body(ci_runner_hub):
+    """AC-4 (#1644): the reporter name is the principal, whatever the body says."""
+    hub = ci_runner_hub
+    task_id = await _task(hub.db, generation=1, sha="sha-pinned")
+    await _post_report(hub.client, hub.ci, task_id, reported_by="mallory")
+    row = dict(await repo.get_ci_run_report(hub.db, task_id, "sha-pinned"))
+    assert row["reported_by"] == hub.ci_principal["username"]
+
+
+async def test_the_real_reporter_payload_still_passes_for_an_unscoped_key(
+    ci_runner_hub,
+):
+    """#1644: scripts/ci_report_to_hub.py payload shape keeps working (require)."""
+    hub = ci_runner_hub
+    task_id = await _task(hub.db, generation=1, sha="sha-pinned")
+    payload = {
+        "head_sha": "sha-pinned",
+        "ac_results": {"AC-1": "pass"},
+        "validation_status": "pass",
+        "validation_log": "ok",
+        "reason": "",
+        "reported_by": "github-actions",
+        "checks": {"ruff": "pass", "mypy": "skipped"},
+    }
+    resp = await hub.client.post(
+        f"/api/tasks/{task_id}/ci-run-report", json=payload, headers=hub.ci
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["applied"] is True
