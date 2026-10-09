@@ -1081,8 +1081,8 @@ z.ai; ZCode CLI; **отдельные uid для файлов ключей** (о
 
 ### Протокол: задание v3
 
-`job.json` = `{"version": 3, "timeout_sec": N, "profile": "advisor"}`, ровно эти
-три поля. `profile` — закрытое перечисление, не путь и не команда. Служба
+`job.json` = `{"version": 3, "timeout_sec": N, "profile": "advisor", "model": "glm-5.1"}`,
+ровно эти четыре поля. `profile` — закрытое перечисление, не путь и не команда. Служба
 отвергает **до запуска модели**: v3 без `profile` или с `profile=review`; v3 с
 лишним полем; v3 со `src.tar` (снимка у советника нет и не монтируется); срок
 короче `advisor-timeout`; v1 и v2 с полем `profile`. Старые службы (v1 и
@@ -1102,9 +1102,22 @@ z.ai; ZCode CLI; **отдельные uid для файлов ключей** (о
 ```
 
 Модель и срок службе **не настраиваются отдельно**: она читает те же файлы
-`/etc/haiplane-review/advisor-model` и `advisor-timeout`, что и врапер
-(владелец root, без записи группе и миру, иначе профиль не объявляется), —
-объявленное и запущенное разойтись не могут. Нет блока (старая служба), нет
+`/etc/haiplane-review/advisor-model` и `advisor-timeout`, что и врапер, из
+ФИКСИРОВАННОГО каталога (настройки каталога нет, иначе служба и врапер читали
+бы разные файлы). Цепочка каталогов открывается по компонентам с `O_NOFOLLOW`,
+владелец и режим судятся по `fstat` того же дескриптора, из которого читается
+содержимое (как загрузчик распаковщика, #1599); не root, запись группе или
+миру, ссылка в пути — профиль не объявляется. `advisor.env` проверяется так
+же по метаданным (обычный файл, не ссылка, root, без записи группе и без
+доступа миру) и не может быть тем же файлом, что `model.env`; то же делает
+врапер перед запуском.
+
+**Heartbeat — подсказка, а не доказательство.** Spool пишет хаб тем же uid, что
+служба, и подделать `advisor_model` в heartbeat он может. Поэтому привязка
+модели к запуску — в самом задании: v3 несёт закрытое поле `model`, служба
+сверяет его с `advisor-model` из защищённого источника **до** запуска и при
+несовпадении отказывает (`model задания … не совпадает с advisor-model`).
+Врапер запускает ту же модель из того же файла. Нет блока (старая служба), нет
 профиля, просрочен heartbeat, модель не та — **именованный отказ** в строке
 заказа и событии: `advisor_not_launchable` (транспорт, служба, профиль,
 heartbeat), `local_advisor_model_mismatch`, `no_identity_channel`. Ни один из
@@ -1130,8 +1143,12 @@ RUID=$(id -u)
 export XDG_RUNTIME_DIR="/run/user/$RUID"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$RUID/bus"
 export HOME=/var/lib/haiplane-review
-# Каталог настроек закреплён литералом, а не берётся из окружения.
+# Каталог настроек закреплён литералом, а не берётся из окружения. Тот же
+# каталог читает служба-исполнитель (advisor-model, advisor-timeout): источник
+# один, настроить его иначе нельзя.
 CONF=/etc/haiplane-review
+# Единственный допустимый владелец advisor.env — root.
+ENV_UID=0
 # Образ — тот же файл, что у враппера ревью (qwen-code лежит в образе
 # песочницы). Модель и срок — файлы ЭТОЙ обёртки; те же файлы читает служба и
 # объявляет в heartbeat, поэтому объявленное хабу и запущенное не расходятся.
@@ -1145,7 +1162,38 @@ esac
 case $MODEL in
     '' | *[!A-Za-z0-9._/-]*) echo "advisor-model: имя модели недопустимо" >&2; exit 65 ;;
 esac
-[ -r "$CONF/advisor.env" ] || { echo "нет $CONF/advisor.env" >&2; exit 66; }
+# advisor.env — ключ z.ai: обычный файл (не ссылка), владелец root, записи
+# группе и миру нет, миру недоступен, и это НЕ тот же файл, что model.env (иначе
+# контейнер советника получил бы ключ ревью).
+file_facts() {
+    stat -c '%u %a %d:%i' "$1" 2>/dev/null || stat -f '%u %Lp %d:%i' "$1"
+}
+ENVF="$CONF/advisor.env"
+if [ ! -f "$ENVF" ] || [ -L "$ENVF" ]; then
+    echo "advisor.env: нужен обычный файл, не ссылка" >&2
+    exit 66
+fi
+set -- $(file_facts "$ENVF")
+E_UID=$1
+E_MODE=$2
+E_INO=$3
+[ "$E_UID" = "$ENV_UID" ] || { echo "advisor.env: владелец не root" >&2; exit 66; }
+while [ "${#E_MODE}" -lt 3 ]; do E_MODE=0$E_MODE; done
+E_MODE=${E_MODE#"${E_MODE%???}"}
+E_GROUP=${E_MODE#?}
+E_GROUP=${E_GROUP%?}
+E_WORLD=${E_MODE#??}
+case $E_GROUP in
+    2 | 3 | 6 | 7) echo "advisor.env: запись группе запрещена" >&2; exit 66 ;;
+esac
+[ "$E_WORLD" = 0 ] || { echo "advisor.env: доступ всем запрещён" >&2; exit 66; }
+if [ -e "$CONF/model.env" ]; then
+    set -- $(file_facts "$CONF/model.env")
+    if [ "$3" = "$E_INO" ]; then
+        echo "advisor.env и model.env — один файл: ключ ревью в advisor не передаётся" >&2
+        exit 66
+    fi
+fi
 # Без монтирований хоста, сокетов и домашнего каталога. Контейнер получает
 # --env-file только с ключом z.ai. --timeout — последний рубеж: хаб и служба
 # снимают прогон просьбой, а контейнер доживает ровно до него.
@@ -1228,7 +1276,6 @@ haiplane ALL=(haiplane-reviewer) NOPASSWD: /usr/local/bin/haiplane-advisor-run "
 | Настройка | Смысл |
 |-----------|-------|
 | `HAIPLANE_REVIEW_RUNNER_ARGV_ADVISOR` | единственная команда профиля: ровно `sudo -n -u <тот же пользователь, что у ревью> /usr/local/bin/haiplane-advisor-run`, без аргументов. Пусто — профиля нет, v3 отвергается |
-| `HAIPLANE_REVIEW_RUNNER_ADVISOR_CONF_DIR` | каталог файлов `advisor-model` и `advisor-timeout` (умолчание `/etc/haiplane-review`) |
 
 Хаб (drop-in юнита): `HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL=glm-5.1`,
 `HAIPLANE_STEWARD_ADVISOR_MODELS` (порядок), `HAIPLANE_STEWARD_HUB_TOKEN`

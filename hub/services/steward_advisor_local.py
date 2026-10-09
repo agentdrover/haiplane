@@ -175,6 +175,18 @@ class _Handle:
 _HANDLES: dict[int, _Handle] = {}
 
 
+def _forget_handle(handle: _Handle) -> None:
+    """Убрать из реестра СВОЙ handle, а не любой с тем же id заказа.
+
+    После возврата заказа в очередь (дренаж) следующий тик заводит нового
+    supervisor под тем же ``run_id``, пока старый ещё завершается: безусловный
+    ``pop`` стёр бы регистрацию живого нового, и восстановление сочло бы его
+    сиротой (#1649, находка Codex).
+    """
+    if _HANDLES.get(handle.run_id) is handle:
+        del _HANDLES[handle.run_id]
+
+
 async def wait_for_local_advisors() -> None:
     """Дождаться supervisor этого процесса — их естественного конца. Для тестов."""
     while _HANDLES:
@@ -193,9 +205,11 @@ def request_cancel(run_id: int, reason: str) -> bool:
     if handle.task is asyncio.current_task():
         return False
     handle.reason = handle.reason or reason
-    if handle.phase == "running":
-        handle.cancel.set()
-    else:
+    # Событие ставится ВСЕГДА: публикация в потоке спрашивает его под замком
+    # выкладки перед записью job.json (заказ, закрытый за время ожидания замка,
+    # не публикуется).
+    handle.cancel.set()
+    if handle.phase != "running":
         # Задание ещё не опубликовано (очередь, проверка, выпуск кода):
         # снимать нечего, прерывается сама задача.
         handle.task.cancel()
@@ -278,10 +292,10 @@ async def start_local_advisor(db: aiosqlite.Connection, order: dict[str, Any]) -
     handle.task = task
     _HANDLES[handle.run_id] = handle
 
-    def _forget(_task: asyncio.Task[None], rid: int = handle.run_id) -> None:
-        _HANDLES.pop(rid, None)
+    def _done(_task: asyncio.Task[None], own: _Handle = handle) -> None:
+        _forget_handle(own)
 
-    task.add_done_callback(_forget)
+    task.add_done_callback(_done)
     return True
 
 
@@ -486,7 +500,14 @@ async def _recheck_at_slot(
 async def _mark_started(
     db: aiosqlite.Connection, handle: _Handle, claim: str, limit: int, left: int
 ) -> bool:
-    """``started_at``, ``agent_id='local:<id>'`` и модель — после слота, до кода. Проверяет rowcount."""
+    """``started_at``, ``agent_id='local:<id>'`` и модель — после слота, до кода.
+
+    Переход к запуску — ОДИН условный UPDATE: строка открыта и захват наш,
+    сдача всё ещё в review на ТОМ ЖЕ поколении, approve судьи на месте, а
+    дедлайн не раньше «сейчас + срок контейнера». Проверка поколения раньше
+    UPDATE оставляла окно: пересдача между ними, и код выпускался бы под
+    старую сдачу (#1649, находка Codex). ``rowcount`` решает.
+    """
     from hub.services import steward_shadow as shadow
 
     handle.job = secrets.token_hex(8)
@@ -494,11 +515,27 @@ async def _mark_started(
     cursor = await db.execute(
         "UPDATE steward_runs SET agent_id=?, model=?, "
         "started_at=strftime('%Y-%m-%d %H:%M:%f', 'now') "
-        "WHERE id=? AND agent_id=? AND status=?",
-        (agent_id, handle.model, handle.run_id, claim, RUN_OPEN),
+        "WHERE id=? AND agent_id=? AND status=? "
+        "AND deadline_at >= datetime('now', ?) "
+        "AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = steward_runs.task_id "
+        "AND t.status = 'review' "
+        "AND t.submission_generation = steward_runs.generation) "
+        "AND EXISTS (SELECT 1 FROM steward_judgements j "
+        "WHERE j.task_id = steward_runs.task_id "
+        "AND j.generation = steward_runs.generation "
+        "AND j.kind = 'verdict' AND j.verdict = 'approve')",
+        (
+            agent_id,
+            handle.model,
+            handle.run_id,
+            claim,
+            RUN_OPEN,
+            f"+{int(limit) + WINDOW_MARGIN_SEC} seconds",
+        ),
     )
     if cursor.rowcount != 1:
         await db.commit()
+        await _start_lost(db, handle, claim, limit)
         return False  # проиграли: ни кода, ни задания
     await repo.insert_event(
         db,
@@ -517,6 +554,65 @@ async def _mark_started(
         },
     )
     await db.commit()
+    return True
+
+
+async def _start_lost(
+    db: aiosqlite.Connection, handle: _Handle, claim: str, limit: int
+) -> None:
+    """Условный старт не прошёл: назвать, почему, если строка всё ещё наша и открыта."""
+    row = await _row(db, handle.run_id)
+    if row is None or row.get("status") != RUN_OPEN or row.get("agent_id") != claim:
+        return  # закрыта или захват снят — причина уже записана тем, кто закрыл
+    stale = await _nothing_to_answer(db, handle)
+    if stale:
+        await _finish(db, handle, RUN_REFUSED, OUTCOME_NOTHING_TO_ANSWER, stale)
+        return
+    left = await _remaining_sec(db, handle.run_id)
+    await _finish(
+        db,
+        handle,
+        RUN_NEVER_STARTED,
+        OUTCOME_WINDOW_SHORT,
+        f"остаток окна советника {max(left, 0)} с меньше срока контейнера "
+        f"{limit} с к моменту старта: задание не опубликовано, код не выписан",
+        remaining_sec=left,
+        container_timeout_sec=limit,
+    )
+
+
+async def _recheck_before_publish(
+    db: aiosqlite.Connection, handle: _Handle, limit: int
+) -> bool:
+    """Последняя проверка перед публикацией, уже ПОСЛЕ выпуска кода.
+
+    Между стартом и публикацией лежит выпуск кода (await): сдача могла уйти,
+    окно — сжаться. Дедлайн проверяется с запасом на срок контейнера.
+    """
+    row = await _row(db, handle.run_id)
+    if (
+        row is None
+        or row.get("status") != RUN_OPEN
+        or row.get("agent_id") != LOCAL_PREFIX + handle.job
+    ):
+        return False  # закрыта другим путём — просьба о снятии уже отправлена
+    stale = await _nothing_to_answer(db, handle)
+    if stale:
+        await _finish(db, handle, RUN_REFUSED, OUTCOME_NOTHING_TO_ANSWER, stale)
+        return False
+    left = await _remaining_sec(db, handle.run_id)
+    if left < limit + WINDOW_MARGIN_SEC:
+        await _finish(
+            db,
+            handle,
+            RUN_NEVER_STARTED,
+            OUTCOME_WINDOW_SHORT,
+            f"остаток окна советника {max(left, 0)} с меньше срока контейнера "
+            f"{limit} с перед публикацией: задание не опубликовано",
+            remaining_sec=left,
+            container_timeout_sec=limit,
+        )
+        return False
     return True
 
 
@@ -553,9 +649,15 @@ async def _run(db: aiosqlite.Connection, handle: _Handle) -> None:
             hub_base,
             shadow.delivery_block(handle.task_id, code, hub_base),
         )
+        if not await _recheck_before_publish(db, handle, limit):
+            return
         handle.phase = "running"
         result = await local_reviewer.run_advisor_job(
-            prompt, name="job-" + handle.job, limit=limit, cancel=handle.cancel
+            prompt,
+            name="job-" + handle.job,
+            limit=limit,
+            cancel=handle.cancel,
+            model=handle.model,
         )
         await _settle(db, handle, result, code, LOCAL_PREFIX + handle.job)
 
@@ -587,6 +689,21 @@ async def _settle(
         db, handle.task_id, handle.generation, "advisor"
     )
     run = result.run
+    if result.aborted:
+        await repo.insert_event(
+            db,
+            kind=EVENT_LOCAL_CANCEL,
+            task_id=handle.task_id,
+            actor="hub",
+            payload={
+                "run_id": handle.run_id,
+                "reason": handle.reason or "cancelled",
+                "published": False,
+                "cancel_confirmed": None,
+            },
+        )
+        await db.commit()
+        return
     if result.drained:
         # Выкладка поставила маркер между проверкой и публикацией: ничего не
         # опубликовано. Это не ошибка готовности — заказ ждёт следующего тика.
@@ -774,4 +891,51 @@ async def recover_local_advisor_runs(db: aiosqlite.Connection) -> int:
             )
             await db.commit()
             recovered += 1
-    return recovered
+    return recovered + await _recover_cancel_debt(db)
+
+
+#: Закрытые строки не старше этого читаются на «долг отмены» (сутки с запасом).
+CANCEL_DEBT_WINDOW = "-2 days"
+
+
+async def _recover_cancel_debt(db: aiosqlite.Connection) -> int:
+    """Закрытая строка ``local:``, за которой осталось неотозванное задание.
+
+    Закрытие строки коммитится РАНЬШЕ просьбы о снятии (``on_run_closed``):
+    авария между ними оставляла задание живым, а восстановление смотрело
+    только на открытые строки. Признак долга — сама очередь: задание строки
+    всё ещё лежит с ``job.json`` или промтом. Его отзыв идемпотентен, а
+    отозванное долгом не считается, поэтому проход повторов не плодит.
+    """
+    rows = await fetchall(
+        db,
+        "SELECT * FROM steward_runs WHERE kind=? AND status != ? "
+        "AND agent_id LIKE ? AND closed_at >= datetime('now', ?)",
+        (KIND_ADVISOR, RUN_OPEN, f"{LOCAL_PREFIX}%", CANCEL_DEBT_WINDOW),
+    )
+    withdrawn = 0
+    for raw in rows:
+        run = dict(raw)
+        handle = _HANDLES.get(int(run["id"]))
+        if handle is not None and handle.task is not None and not handle.task.done():
+            continue  # живой supervisor сам снимет и подтвердит
+        name = "job-" + str(run["agent_id"])[len(LOCAL_PREFIX) :]
+        if not local_reviewer.job_needs_withdrawal(name):
+            continue
+        local_reviewer.withdraw_job_by_name(name)
+        await repo.insert_event(
+            db,
+            kind=EVENT_LOCAL_CANCEL,
+            task_id=int(run["task_id"]),
+            actor="hub",
+            payload={
+                "run_id": run["id"],
+                "reason": "cancel_debt_recovered: строка закрыта, а задание "
+                "осталось (авария между закрытием и просьбой о снятии)",
+                "published": True,
+                "cancel_confirmed": None,
+            },
+        )
+        await db.commit()
+        withdrawn += 1
+    return withdrawn

@@ -39,11 +39,14 @@ argv CLI. Профиль — закрытое перечисление, а не 
 ровно ``version``, ``timeout_sec``, ``profile``, снимок ``src.tar`` в нём
 запрещён, v1/v2 поля ``profile`` не знают. МОДЕЛЬ и СРОК советника служба берёт
 из тех же root-овых файлов, что читает врапер (``advisor-model``,
-``advisor-timeout`` в HAIPLANE_REVIEW_RUNNER_ADVISOR_CONF_DIR), поэтому
+``advisor-timeout`` в ФИКСИРОВАННОМ каталоге /etc/haiplane-review: он не
+настраивается, иначе служба и врапер читали бы разные файлы), поэтому
 объявленное в heartbeat не может разойтись с тем, что запустит врапер.
 Heartbeat служба пишет JSON с блоком ``capabilities``: версии заданий,
-профили, закреплённая модель советника и сроки; хаб сверяет его до выпуска
-кода доступа советнику.
+профили, закреплённая модель советника и сроки. Это ПОДСКАЗКА готовности, а
+не доказательство: spool пишет хаб, тем же uid. Доказательство — поле
+``model`` задания v3: служба сверяет его с ``advisor-model`` из защищённого
+источника ДО запуска, и отказывает при несовпадении.
 
 Только стандартная библиотека: служба ставится на хост двумя файлами (сама и
 ``snapshot_unpack.py``), без пакета hub.
@@ -117,13 +120,15 @@ JOB_VERSIONS = (JOB_VERSION, JOB_VERSION_SNAPSHOT, JOB_VERSION_ADVISOR)
 # Закрытый список: ни команды, ни путей, ни окружения задание нести не может.
 JOB_FIELDS = ("version", "timeout_sec")
 # У v3 к ним добавляется закрытое перечисление профиля.
-JOB_FIELDS_ADVISOR = ("version", "timeout_sec", "profile")
+JOB_FIELDS_ADVISOR = ("version", "timeout_sec", "profile", "model")
 PROFILE_ADVISOR = "advisor"
 PROFILE_REVIEW = "review"
 # Файлы доверенной конфигурации врапера advisor (root:root, без записи группе и
 # миру): их читает и врапер, и служба — единственный источник модели и срока.
 ADVISOR_MODEL_FILE = "advisor-model"
 ADVISOR_TIMEOUT_FILE = "advisor-timeout"
+ADVISOR_ENV_FILE = "advisor.env"
+REVIEW_ENV_FILE = "model.env"
 DEFAULT_ADVISOR_CONF = "/etc/haiplane-review"
 CAPABILITIES_PROTOCOL = 1
 _MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$")
@@ -270,11 +275,6 @@ def load_config(env: Mapping[str, str]) -> Config:
                 "HAIPLANE_REVIEW_RUNNER_ARGV_ADVISOR: пользователь врапера advisor "
                 "должен совпадать с пользователем ревью (отдельные uid — вне MVP)"
             )
-    conf_dir = (env.get("HAIPLANE_REVIEW_RUNNER_ADVISOR_CONF_DIR") or "").strip()
-    if conf_dir and not os.path.isabs(conf_dir):
-        raise ConfigError(
-            "HAIPLANE_REVIEW_RUNNER_ADVISOR_CONF_DIR должен быть абсолютным"
-        )
     return Config(
         spool=spool,
         argv=tuple(argv),
@@ -283,7 +283,6 @@ def load_config(env: Mapping[str, str]) -> Config:
         wrapper_timeout=wrapper,
         reviewer_user=argv[3],
         advisor_argv=tuple(advisor),
-        advisor_conf=conf_dir or DEFAULT_ADVISOR_CONF,
         snapshot_max_bytes=_positive(
             env, "HAIPLANE_REVIEW_RUNNER_SNAPSHOT_MAX_BYTES", 64 * 1024 * 1024
         ),
@@ -317,6 +316,7 @@ def parse_job_ex(
     max_timeout: int,
     wrapper_timeout: int = 0,
     advisor_timeout: int = 0,
+    advisor_model: str = "",
 ) -> tuple[int, int]:
     """``(срок, версия)`` задания, или JobRejected. Команды не читает.
 
@@ -355,6 +355,17 @@ def parse_job_ex(
             "версия задания 3 принимается только с profile=advisor (поле profile "
             f"— закрытое перечисление, получено {data.get('profile')!r})"
         )
+    if version == JOB_VERSION_ADVISOR:
+        asked = data.get("model")
+        if not isinstance(asked, str) or not _MODEL_NAME.match(asked):
+            raise JobRejected(
+                "задание advisor обязано назвать model (имя модели, не путь)"
+            )
+        if advisor_model and asked != advisor_model:
+            raise JobRejected(
+                f"model задания ({asked}) не совпадает с advisor-model службы "
+                f"({advisor_model}): подмены модели нет, запуск отказан до модели"
+            )
     timeout = data.get("timeout_sec")
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
         raise JobRejected("timeout_sec должен быть целым числом больше нуля")
@@ -369,39 +380,147 @@ def parse_job_ex(
     return min(timeout, max_timeout), int(version)
 
 
-def _trusted_conf_problem(path: str, trusted_uid: int, *, directory: bool) -> str:
-    """Каталог или файл конфигурации advisor принадлежит доверенному и не пишется чужими."""
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    if directory:
-        flags |= os.O_DIRECTORY
-    try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        return f"{path}: не открыт без следования по ссылке ({exc.strerror})"
-    try:
-        info = os.fstat(fd)
-    finally:
-        os.close(fd)
-    if (
-        stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
-    ) is False:
-        return f"{path}: не {'каталог' if directory else 'обычный файл'}"
-    if info.st_uid != trusted_uid:
+def _open_chain(path: str, trusted_uid: int) -> tuple[list[int], int, str, str]:
+    """Цепочка каталогов до родителя файла: ``(fds, fd родителя, имя, причина)``.
+
+    Каждый каталог открывается от корня ``O_NOFOLLOW|O_DIRECTORY`` от
+    дескриптора предка и судится по ``fstat`` ЭТОГО дескриптора (владелец —
+    root или доверенный, запись группе и миру — только с sticky-битом). Ссылка
+    в любом компоненте — отказ. Вызывающий закрывает ``fds``. Как загрузчик
+    распаковщика (#1599): проверка и чтение идут одним проходом.
+    """
+    if not os.path.isabs(path) or any(
+        p in ("", ".", "..") for p in path.split("/")[1:]
+    ):
         return (
-            f"{path} принадлежит uid {info.st_uid}, а должен принадлежать "
-            f"uid {trusted_uid} (root): иначе хаб мог бы подменить модель или срок"
+            [],
+            -1,
+            "",
+            f"{path}: нужен абсолютный путь без «.», «..» и пустых компонентов",
         )
-    if info.st_mode & 0o022:
-        return f"{path} доступен на запись группе или всем"
-    return ""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_DIRECTORY
+    parts = [p for p in path.split("/") if p]
+    fds: list[int] = []
+    try:
+        current = os.open("/", flags)
+        fds.append(current)
+        walked = ""
+        for name in parts[:-1]:
+            walked += "/" + name
+            try:
+                current = os.open(name, flags, dir_fd=current)
+            except OSError as exc:
+                return (
+                    fds,
+                    -1,
+                    "",
+                    (
+                        f"каталог {walked} не открыт без следования по ссылке: {exc.strerror}"
+                    ),
+                )
+            fds.append(current)
+            dinfo = os.fstat(current)
+            if dinfo.st_uid not in (0, trusted_uid):
+                return (
+                    fds,
+                    -1,
+                    "",
+                    (
+                        f"каталог {walked} принадлежит uid {dinfo.st_uid}, а должен "
+                        f"принадлежать root (uid {trusted_uid})"
+                    ),
+                )
+            if dinfo.st_mode & 0o022 and not dinfo.st_mode & stat.S_ISVTX:
+                return (
+                    fds,
+                    -1,
+                    "",
+                    f"каталог {walked} доступен на запись группе или всем",
+                )
+        return fds, current, parts[-1], ""
+    except OSError as exc:
+        return fds, -1, "", f"{path} не открыт: {exc.strerror}"
+
+
+def _trusted_read(path: str, trusted_uid: int, cap: int = 256) -> tuple[str, str]:
+    """Текст файла конфигурации: ``(текст, причина)``; проверка и чтение — из ОДНОГО дескриптора."""
+    fds, parent, name, problem = _open_chain(path, trusted_uid)
+    try:
+        if problem:
+            return "", problem
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                dir_fd=parent,
+            )
+        except OSError as exc:
+            return "", f"{path}: не открыт без следования по ссылке ({exc.strerror})"
+        fds.append(fd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return "", f"{path}: не обычный файл"
+        if info.st_uid != trusted_uid:
+            return "", (
+                f"{path} принадлежит uid {info.st_uid}, а должен принадлежать "
+                f"uid {trusted_uid} (root): иначе хаб мог бы подменить модель или срок"
+            )
+        if info.st_mode & 0o022:
+            return "", f"{path} доступен на запись группе или всем"
+        data = os.read(fd, cap + 1)
+        if len(data) > cap:
+            return "", f"{path} больше {cap} байт"
+        return data.decode("utf-8", "replace").strip(), ""
+    except OSError as exc:
+        return "", f"{path} не прочитан: {exc.strerror}"
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def _secret_file_facts(
+    path: str, trusted_uid: int
+) -> tuple[tuple[int, int] | None, str]:
+    """Метаданные файла ключа БЕЗ чтения содержимого: ``((dev, ino), причина)``.
+
+    Файл ключа читает только контейнер; службе (пользователь хаба) читать его
+    незачем, поэтому судим по ``lstat`` от дескриптора родителя: обычный файл
+    (не ссылка), владелец доверенный, записи группе и миру нет, миру недоступен.
+    """
+    fds, parent, name, problem = _open_chain(path, trusted_uid)
+    try:
+        if problem:
+            return None, problem
+        try:
+            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except OSError as exc:
+            return None, f"{path}: {exc.strerror}"
+        if not stat.S_ISREG(info.st_mode):
+            return None, f"{path}: нужен обычный файл, не ссылка"
+        if info.st_uid != trusted_uid:
+            return (
+                None,
+                f"{path} принадлежит uid {info.st_uid}, а должен uid {trusted_uid}",
+            )
+        if info.st_mode & 0o022:
+            return None, f"{path} доступен на запись группе или всем"
+        if info.st_mode & 0o007:
+            return None, f"{path} доступен всем: ключ не должен быть читаем миру"
+        return (info.st_dev, info.st_ino), ""
+    finally:
+        for fd in fds:
+            os.close(fd)
 
 
 def advisor_settings(cfg: Config) -> tuple[str, int, str]:
     """``(модель, срок враппера, причина)`` профиля advisor; причина пуста — профиль годен.
 
-    Модель и срок читаются из ТЕХ ЖЕ root-овых файлов, что и враппер
-    ``haiplane-advisor-run``: расхождение между объявленным и запущенным
-    невозможно по построению.
+    Модель и срок читаются из ТЕХ ЖЕ root-овых файлов фиксированного каталога,
+    что и враппер ``haiplane-advisor-run``. Цепочка каталогов открывается по
+    компонентам с ``O_NOFOLLOW`` и читается из проверенного дескриптора.
+    Файл ключа ``advisor.env`` проверяется по метаданным и не может быть тем
+    же файлом, что ``model.env`` (иначе контейнер советника получил бы ключ
+    ревью).
     """
     if not cfg.advisor_argv:
         return (
@@ -410,19 +529,29 @@ def advisor_settings(cfg: Config) -> tuple[str, int, str]:
             "профиль advisor не настроен (HAIPLANE_REVIEW_RUNNER_ARGV_ADVISOR пуст)",
         )
     conf = cfg.advisor_conf or DEFAULT_ADVISOR_CONF
-    problem = _trusted_conf_problem(conf, cfg.conf_trusted_uid, directory=True)
-    if problem:
-        return "", 0, problem
     values: dict[str, str] = {}
     for name in (ADVISOR_MODEL_FILE, ADVISOR_TIMEOUT_FILE):
-        path = os.path.join(conf, name)
-        problem = _trusted_conf_problem(path, cfg.conf_trusted_uid, directory=False)
+        text, problem = _trusted_read(os.path.join(conf, name), cfg.conf_trusted_uid)
         if problem:
             return "", 0, problem
-        try:
-            values[name] = _read_nofollow(path, 256).decode("utf-8", "replace").strip()
-        except (OSError, _TooBig) as exc:
-            return "", 0, f"{path} не прочитан: {exc}"
+        values[name] = text
+    env_facts, problem = _secret_file_facts(
+        os.path.join(conf, ADVISOR_ENV_FILE), cfg.conf_trusted_uid
+    )
+    if problem:
+        return "", 0, problem
+    review_facts, review_problem = _secret_file_facts(
+        os.path.join(conf, REVIEW_ENV_FILE), cfg.conf_trusted_uid
+    )
+    if not review_problem and review_facts == env_facts:
+        return (
+            "",
+            0,
+            (
+                f"{ADVISOR_ENV_FILE} и {REVIEW_ENV_FILE} — один и тот же файл: ключ "
+                "ревью не должен попадать в контейнер советника"
+            ),
+        )
     model = values[ADVISOR_MODEL_FILE]
     if not _MODEL_NAME.match(model):
         return "", 0, f"{ADVISOR_MODEL_FILE}: имя модели недопустимо"
@@ -855,11 +984,13 @@ async def _execute_inner(
 ) -> tuple[dict[str, object], bool]:
     prompt_path = os.path.join(jobdir, SPOOL_PROMPT)
     try:
+        a_model, a_timeout, _a_problem = advisor_settings(cfg)
         timeout, version = parse_job_ex(
             _read_nofollow(os.path.join(jobdir, SPOOL_JOB), JOB_CAP),
             cfg.max_timeout,
             cfg.wrapper_timeout,
-            advisor_settings(cfg)[1],
+            a_timeout,
+            a_model,
         )
         prompt = _read_nofollow(prompt_path, PROMPT_CAP)
     except JobRejected as exc:

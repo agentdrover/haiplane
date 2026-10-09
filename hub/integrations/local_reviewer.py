@@ -1084,7 +1084,7 @@ JOB_FIELDS = ("version", "timeout_sec")
 # службы (v1, v2) его отклоняют до запуска модели; src.tar в нём запрещён.
 JOB_VERSION_ADVISOR = 3
 PROFILE_ADVISOR = "advisor"
-JOB_FIELDS_ADVISOR = ("version", "timeout_sec", "profile")
+JOB_FIELDS_ADVISOR = ("version", "timeout_sec", "profile", "model")
 # Блок возможностей в heartbeat службы (JSON): версии заданий, профили,
 # закреплённая модель советника и сроки.
 CAPABILITIES_KEY = "capabilities"
@@ -1115,6 +1115,10 @@ DRAIN_REASON = (
     "идёт выкладка хаба: новые локальные прогоны не стартуют, пока деплой "
     "ждёт идущие (deploy/LOCAL-REVIEW.md, #1588)"
 )
+
+
+class PublishAborted(Exception):
+    """Публикацию отменили, пока она ждала замок: задание не записывается (#1649)."""
 
 
 class DrainActive(Exception):
@@ -1214,8 +1218,14 @@ def _submit_job_unless_draining(
     *,
     profile: str = "",
     name: str = "",
+    model: str = "",
+    abort: Callable[[], bool] | None = None,
 ) -> str:
     """Проверка маркера И публикация задания под одним замком (#1588).
+
+    ``abort`` (#1649) — просьба снять заказ: спрашивается под замком, ПОСЛЕ
+    маркера и ДО записи ``job.json``. Заказ, закрытый, пока поток ждал замок, не
+    публикуется: ``PublishAborted``.
 
     Деплой считает задания под тем же замком, поэтому «маркер свежий» и
     «job.json появился» не могут разойтись: либо заказ опубликован до того,
@@ -1242,8 +1252,12 @@ def _submit_job_unless_draining(
             )
         # Профиль и имя едут, только когда заданы: задание ревью зовётся ровно
         # так же, как до #1649.
+        if abort is not None and abort():
+            raise PublishAborted()
         if profile:
-            return _submit_job(spool, prompt, limit, profile=profile, name=name)
+            return _submit_job(
+                spool, prompt, limit, profile=profile, name=name, model=model
+            )
         return _submit_job(spool, prompt, limit)
     except BaseException:
         if staged:
@@ -1352,6 +1366,7 @@ def _submit_job(
     version: int = JOB_VERSION,
     profile: str = "",
     name: str = "",
+    model: str = "",
 ) -> str:
     """Положить задание в очередь. Возвращает каталог задания.
 
@@ -1375,6 +1390,7 @@ def _submit_job(
                 "version": JOB_VERSION_ADVISOR,
                 "timeout_sec": int(limit),
                 "profile": profile,
+                "model": model,
             }
         _write_spool_file(jobdir, SPOOL_JOB, json.dumps(job).encode())
     except OSError:
@@ -1711,6 +1727,8 @@ class AdvisorJobResult:
     drained: bool
     run: LocalRun | None
     reason: str = ""
+    #: Заказ сняли, пока публикация ждала замок: задание не опубликовано.
+    aborted: bool = False
 
 
 async def run_advisor_job(
@@ -1719,6 +1737,7 @@ async def run_advisor_job(
     name: str,
     limit: int,
     cancel: asyncio.Event,
+    model: str,
 ) -> AdvisorJobResult:
     """Опубликовать задание советника под замком выкладки и дождаться результата.
 
@@ -1738,17 +1757,25 @@ async def run_advisor_job(
             None,
             profile=PROFILE_ADVISOR,
             name=name,
+            model=model,
+            abort=cancel.is_set,
         )
     )
     try:
         jobdir = await asyncio.shield(publishing)
     except asyncio.CancelledError:
         published = ""
-        with contextlib.suppress(DrainActive, OSError, asyncio.CancelledError):
+        with contextlib.suppress(
+            DrainActive, PublishAborted, OSError, asyncio.CancelledError
+        ):
             published = await publishing
         if published:
             _cancel_job(published, withdraw=True)
         raise
+    except PublishAborted:
+        return AdvisorJobResult(
+            False, False, None, "заказ снят до публикации задания", aborted=True
+        )
     except DrainActive as exc:
         return AdvisorJobResult(False, True, None, exc.reason)
     except OSError as exc:
@@ -1786,3 +1813,24 @@ def withdraw_job_by_name(name: str) -> bool:
         return False
     _cancel_job(jobdir, withdraw=True)
     return True
+
+
+def job_needs_withdrawal(name: str) -> bool:
+    """Задание с таким именем ещё в очереди и не отозвано (есть ``job.json`` или промт).
+
+    «Долг отмены» закрытой строки советника (#1649): строка закрыта, а хаб упал,
+    не успев попросить службу снять прогон. Отозванное задание (файлов нет)
+    долгом не считается.
+    """
+    import re
+
+    spool = (config.LOCAL_REVIEW_SPOOL_DIR or "").strip()
+    if not spool or not re.fullmatch(r"job-[0-9a-f]{16}", name or ""):
+        return False
+    jobdir = os.path.join(spool, name)
+    if not os.path.isdir(jobdir) or os.path.islink(jobdir):
+        return False
+    return any(
+        os.path.lexists(os.path.join(jobdir, part))
+        for part in (SPOOL_JOB, SPOOL_PROMPT)
+    )

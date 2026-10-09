@@ -3387,3 +3387,62 @@ async def test_a_local_advisor_run_is_withdrawn_and_closed_on_every_exit(
     assert judged["status"] == "judged", judged
     answer = await _judge_row(db, task6, "advisor")
     assert answer is not None and answer["verdict"] == "concur"
+
+
+async def test_a_closed_row_with_a_live_job_is_withdrawn_after_a_crash(
+    db: aiosqlite.Connection, local_spool, local_identity
+):
+    """#1649 (Codex P2-4): закрытие строки коммитится раньше просьбы о снятии.
+
+    Авария между ними оставляла задание живым: восстановление смотрело только
+    на открытые строки. Теперь закрытая недавно строка local: с неотозванным
+    заданием — долг отмены; отозванное, давнее и чужое долгом не считаются.
+    """
+    from hub.services.steward_advisor_local import recover_local_advisor_runs
+    from tests.local_advisor_support import GLM as _GLM
+    from tests.test_steward_advisor import _advisor_row, _ordered_advisor
+
+    async def _crashed(
+        slug: str, status: str, hexid: str, age: str = "+0 days"
+    ) -> tuple:
+        task_id, order = await _ordered_advisor(db, slug)
+        jobdir = local_spool / f"job-{hexid * 16}"
+        jobdir.mkdir(mode=0o770)
+        (jobdir / "job.json").write_text("{}")
+        (jobdir / "prompt.txt").write_text("p")
+        (jobdir / "claimed").write_text("")
+        await db.execute(
+            "UPDATE steward_runs SET agent_id=?, model=?, status=?, closed_reason='x', "
+            "started_at=datetime('now'), closed_at=datetime('now', ?) WHERE id=?",
+            (f"local:{hexid * 16}", _GLM, status, age, order["id"]),
+        )
+        await db.commit()
+        return task_id, jobdir
+
+    for status, hexid in (("judged", "a"), ("timeout", "b"), ("superseded", "c")):
+        task_id, jobdir = await _crashed(f"debt-{status}", status, hexid)
+        assert (await _advisor_row(db, task_id))["status"] == status
+        assert await recover_local_advisor_runs(db) == 1, status
+        assert not (jobdir / "job.json").exists(), "долг отмены не погашен"
+        assert not (jobdir / "prompt.txt").exists()
+        assert (jobdir / "cancel").exists()
+        assert await recover_local_advisor_runs(db) == 0, (
+            "погашенный долг не повторяется"
+        )
+    events = [
+        e
+        for e in await _local_events_all(db)
+        if e["event"] == "steward_local_advisor_cancel"
+        and "cancel_debt_recovered" in str(e.get("reason"))
+    ]
+    assert len(events) == 3
+
+    # давняя строка (вне окна) и строка без задания долгом не считаются
+    _task, old_dir = await _crashed("debt-old", "timeout", "d", age="-5 days")
+    assert await recover_local_advisor_runs(db) == 0
+    assert (old_dir / "job.json").exists()
+
+
+async def _local_events_all(db: aiosqlite.Connection) -> list[dict]:
+    rows = await fetchall(db, "SELECT kind, payload FROM events ORDER BY id")
+    return [{**json.loads(r["payload"] or "{}"), "event": r["kind"]} for r in rows]

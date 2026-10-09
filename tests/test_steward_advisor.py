@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -1921,7 +1922,9 @@ async def test_the_local_advisor_start_mints_the_code_only_for_the_claim_winner_
         await wait_for_local_advisors()
         assert len(local_identity) == 1, "код выписал один победитель"
         assert local_identity[0][1:] == ("steward_advisor", task_id, 1)
-        assert svc.jobs == [{"version": 3, "timeout_sec": 900, "profile": "advisor"}]
+        assert svc.jobs == [
+            {"version": 3, "timeout_sec": 900, "profile": "advisor", "model": _GLM}
+        ]
         assert "ABCD-2345" in svc.prompts[0] and "steward-evidence" in svc.prompts[0]
         row = await _advisor_row(db, task_id)
         assert row["agent_id"].startswith("local:") and row["started_at"]
@@ -2183,3 +2186,132 @@ async def test_the_cloud_advisor_path_is_unchanged_by_the_local_channel(
         "version": 1,
         "timeout_sec": 60,
     }
+
+
+async def test_the_start_update_binds_generation_approve_and_window(
+    db: aiosqlite.Connection, local_spool, local_identity, local_service, monkeypatch
+):
+    """#1649 (Codex P2-2): переход к запуску — ОДИН условный UPDATE.
+
+    Пересдача, уход из review, пропавший approve или сжавшееся окно между
+    последней проверкой и UPDATE: ни кода, ни задания, и причина названа. А
+    после выпуска кода перед публикацией проверка идёт ещё раз.
+    """
+    from hub.services import steward_advisor_local as local_mod
+    from hub.services.steward_advisor import start_advisor_run
+    from hub.services.steward_advisor_local import wait_for_local_advisors
+
+    svc = local_service()
+    real = local_mod._remaining_sec
+
+    async def _case(slug: str, sql: str) -> dict:
+        task_id, order = await _ordered_advisor(db, slug)
+
+        async def _hook(db_, run_id):
+            left = await real(db_, run_id)
+            await db_.execute(sql, (task_id,))
+            await db_.commit()
+            return left
+
+        monkeypatch.setattr(local_mod, "_remaining_sec", _hook)
+        minted, published = len(local_identity), len(svc.jobs)
+        assert await start_advisor_run(db, dict(order)) is True
+        await wait_for_local_advisors()
+        monkeypatch.setattr(local_mod, "_remaining_sec", real)
+        row = await _advisor_row(db, task_id)
+        assert not row["started_at"], (slug, row)
+        assert len(local_identity) == minted and len(svc.jobs) == published, slug
+        return row
+
+    moved = await _case(
+        "start-gen", "UPDATE tasks SET submission_generation=2 WHERE id=?"
+    )
+    assert moved["status"] == "refused"
+    left_review = await _case(
+        "start-status", "UPDATE tasks SET status='running' WHERE id=?"
+    )
+    assert left_review["status"] == "refused"
+    no_approve = await _case(
+        "start-approve",
+        "UPDATE steward_judgements SET verdict='changes_requested' "
+        "WHERE task_id=? AND kind='verdict'",
+    )
+    assert no_approve["status"] == "refused"
+    short = await _case(
+        "start-window",
+        "UPDATE steward_runs SET deadline_at=datetime('now','+5 minutes') "
+        "WHERE task_id=? AND kind='advisor'",
+    )
+    assert short["status"] == "never_started"
+
+    # --- после выпуска кода, перед публикацией: проверка повторяется
+    task_id, order = await _ordered_advisor(db, "start-after-mint")
+    real_mint = local_mod._mint_code
+
+    async def _mint_then_resubmit(db_, handle):
+        result = await real_mint(db_, handle)
+        await db_.execute(
+            "UPDATE tasks SET submission_generation=2 WHERE id=?", (task_id,)
+        )
+        await db_.commit()
+        return result
+
+    monkeypatch.setattr(local_mod, "_mint_code", _mint_then_resubmit)
+    published = len(svc.jobs)
+    assert await start_advisor_run(db, dict(order)) is True
+    await wait_for_local_advisors()
+    row = await _advisor_row(db, task_id)
+    assert row["agent_id"].startswith("local:") and row["status"] == "refused", row
+    assert len(svc.jobs) == published, "задание опубликовано под старую сдачу"
+
+
+async def test_a_closed_order_is_not_published_while_the_publication_waits_for_the_lock(
+    db: aiosqlite.Connection, local_spool, local_identity, local_service
+):
+    """#1649 (Codex P2-3): заказ закрыт, пока поток ждал .drain.lock, — job.json не пишется."""
+    import fcntl
+
+    from hub.services import steward_advisor_local as local_mod
+    from hub.services.steward_advisor import start_advisor_run
+    from hub.services.steward_advisor_local import wait_for_local_advisors
+
+    svc = local_service()
+    task_id, order = await _ordered_advisor(db, "close-while-publishing")
+    fd = os.open(local_spool / ".drain.lock", os.O_RDWR | os.O_CREAT, 0o660)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        assert await start_advisor_run(db, dict(order)) is True
+        handle = None
+        for _ in range(300):
+            handle = local_mod._HANDLES.get(order["id"])
+            if handle is not None and handle.phase == "running":
+                break
+            await asyncio.sleep(0.02)
+        assert handle is not None and handle.phase == "running"
+        await asyncio.sleep(0.3)  # поток публикации уже крутится на замке
+        await repo.update_task(db, task_id, submission_generation=2)
+        await db.commit()
+        await close_finished_runs(db)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    await wait_for_local_advisors()
+    assert svc.jobs == [] and not list(local_spool.glob("job-*")), "заказ опубликован"
+    assert (await _advisor_row(db, task_id))["status"] == "superseded"
+
+
+async def test_a_finished_supervisor_forgets_only_its_own_handle():
+    """#1649 (Codex P2-5): после возврата заказа новый supervisor не теряет регистрацию."""
+    from hub.services import steward_advisor_local as local_mod
+
+    def _handle() -> local_mod._Handle:
+        return local_mod._Handle(
+            run_id=987001, task_id=1, generation=1, model=_GLM, db_path="", live_db=None
+        )
+
+    old, new = _handle(), _handle()
+    local_mod._HANDLES[987001] = new
+    local_mod._forget_handle(old)  # старый завершается позже нового
+    assert local_mod._HANDLES.get(987001) is new, "стёрт чужой handle"
+    local_mod._forget_handle(new)
+    assert 987001 not in local_mod._HANDLES
