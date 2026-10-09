@@ -59,8 +59,9 @@ async def test_an_inheritance_graph_that_fans_out_is_answered_quickly():
     started = time.monotonic()
     res = await _resolve({_PATH: classes}, [_ac("C35::test_x")])
     assert time.monotonic() - started < 12
-    assert res[0]["status"] in (UNKNOWN, MISSING), res
-    assert res[0]["status"] != RESOLVABLE
+    # Every class is local and clean and none defines test_x: provably absent,
+    # and provable in linear time because each class is examined once.
+    assert res[0]["status"] == MISSING, res
 
 
 # ---- the worker is a real boundary --------------------------------------------------
@@ -179,4 +180,4 @@ async def test_many_locators_on_one_big_file_parse_it_once():
     started = time.monotonic()
     res = await _resolve(files, acs)
     assert time.monotonic() - started < 8
-    assert all(r["status"] in (RESOLVABLE, UNKNOWN) for r in res), res
+    assert all(r["status"] == RESOLVABLE for r in res), res
