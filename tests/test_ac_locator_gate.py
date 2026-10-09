@@ -25,6 +25,7 @@ from hub import config
 from hub import repository as repo
 from hub import services
 from hub.models import AcceptanceCriterion, TaskCreate, TaskRefine
+from tests.branch_code_support import spawn_spy  # noqa: F401 - pytest fixture
 
 BAD = "tests/a.py::test_x, tests/a.py::test_y"
 GOOD = "tests/test_ac_locator_gate.py::test_add_rejects_an_unresolvable_locator"
@@ -371,3 +372,69 @@ async def test_task_level_require_is_unchanged(db: aiosqlite.Connection, require
 
     assert exc.value.status_code == 422
     assert not await repo.list_acceptance_criteria(db, task_id)
+
+
+# --- #1650: the approval reads the clone, it does not run it -----------------
+
+_TWO_KINDS = (
+    "from somewhere import ImportedBase\n\n\n"
+    "class TestA:\n    def test_here(self):\n        assert True\n\n\n"
+    "class TestB(ImportedBase):\n    pass\n"
+)
+
+
+async def test_epic_approve_flags_dead_locators_without_running_pytest(
+    db: aiosqlite.Connection, tmp_path, spawn_spy
+):
+    """#1650 AC-3: a missing locator is named, an unknown one is not, nothing runs.
+
+    The shared clone holds a conftest.py that writes a marker outside the tree
+    of the pytest running this test. TestA::test_gone is provably absent (the
+    class is written out and has no base); TestB::test_x hangs on a base class
+    imported from elsewhere, so nobody can say it is absent.
+    """
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.integrations.registry import plugins
+    from hub.models import TaskApprove
+    from tests.branch_code_support import TEST_FILE, make_clone
+
+    marker = tmp_path / "outside" / "marker"
+    marker.parent.mkdir()
+    workspace, _ = make_clone(
+        tmp_path, marker, test_source=_TWO_KINDS, on_branch=False
+    )
+    plugins.git_ops = GitOpsIntegration()
+    project_id = await repo.create_project(
+        db,
+        slug="clone-proj",
+        name="Clone",
+        repo_name="o/r",
+        workspace_path=str(workspace),
+        default_branch="main",
+    )
+    tv = await services.create_task(db, TaskCreate(title="epic", task_type="epic"))
+    await repo.update_task(db, tv.id, project_id=project_id)
+    for idx, node in ((1, "TestA::test_gone"), (2, "TestB::test_x")):
+        await repo.upsert_acceptance_criterion(
+            db,
+            tv.id,
+            AcceptanceCriterion(
+                id=f"AC-{idx}",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref=f"{TEST_FILE}::{node}",
+            ),
+        )
+    await db.execute("UPDATE tasks SET status='draft' WHERE id=?", (tv.id,))
+    await db.commit()
+
+    view = await services.approve_task(db, tv.id, TaskApprove(force=True))
+
+    assert view.status.value == "open", "the warning must not block the approval"
+    assert not marker.exists(), "the clone's conftest.py ran on the hub host"
+    assert spawn_spy.pytest_runs() == [], "the hub started pytest"
+    alerts = _alerts(await repo.get_task_updates(db, tv.id))
+    assert len(alerts) == 1, alerts
+    assert "AC-1" in alerts[0] and "AC-2" not in alerts[0], alerts[0]

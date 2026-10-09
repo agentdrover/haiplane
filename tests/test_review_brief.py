@@ -28,6 +28,7 @@ from hub.integrations.noop import NoopGitOps
 from hub.integrations.registry import plugins
 from hub.services import review_evidence
 from hub.services.finding_identity import finding_uids
+from tests.branch_code_support import spawn_spy  # noqa: F401 - pytest fixture
 
 
 def _git(repo_dir: Path, *args: str) -> None:
@@ -1669,3 +1670,44 @@ async def test_brief_rejects_foreign_evidence_and_keeps_error_reasons(
     both = await evidence()
     assert both["mutations"]["state"] == "received"
     assert "прогон неизвестен" in both["mutations"]["run"]
+
+
+# ---- #1650: the hub never runs the task branch's code to list its tests ----
+
+
+async def test_brief_never_imports_task_branch_code(
+    db, client: AsyncClient, tmp_path: Path, spawn_spy
+):
+    """#1650 AC-1: the brief and the steward packet read the branch, not run it.
+
+    The branch carries a conftest.py that writes a marker outside the tree of
+    the pytest running this test. HEAD of the clone stands on the task branch,
+    which is exactly the condition under which the old collector ran
+    ``uv run pytest --collect-only`` with the hub's whole environment.
+    """
+    from hub.integrations.git_ops import GitOpsIntegration
+    from hub.services.steward_evidence import build_evidence_packet
+    from tests.branch_code_support import TEST_FILE, make_clone
+
+    marker = tmp_path / "outside" / "marker"
+    marker.parent.mkdir()
+    workspace, tip = make_clone(tmp_path, marker)
+    plugins.git_ops = GitOpsIntegration()
+    task_id = await _task_with_test_ac(
+        db, client, workspace, f"{TEST_FILE}::test_ok"
+    )
+    await repo.update_task(db, task_id, submission_sha=tip)
+    await db.commit()
+
+    brief = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    packet = await build_evidence_packet(db, task_id)
+
+    assert not marker.exists(), "the branch's conftest.py ran on the hub host"
+    assert spawn_spy.pytest_runs() == [], "the hub started pytest"
+    assert packet is not None and packet.brief is not None
+    for resolution in (
+        brief["locator_resolution"][0],
+        packet.brief.locator_resolution[0].model_dump(),
+    ):
+        assert resolution["status"] == "resolvable", resolution
+        assert "without running" in resolution["reason"], resolution
