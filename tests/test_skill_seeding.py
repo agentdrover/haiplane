@@ -28,6 +28,14 @@ from hub.repository import activate_skill_version, get_active_skill
 
 OLD_TEXT = "старый текст без locator"
 
+#: The rule itself, not a pointer to it: a text that keeps "see hub-submit-task"
+#: and drops these has stopped teaching anything (Codex on 97c8e2a).
+RESUBMISSION_CLAIMS = (
+    "новая сдача (новое поколение, прежний вердикт не текущий, #1054)",
+    "повтор из review с тем же sha сохраняет поколение, статус и текущесть вердикта",
+    "finding_outcomes, accept_areas и решение о заказе ревью могут обновиться (#1265)",
+)
+
 
 async def _versions(db: aiosqlite.Connection, name: str) -> list[dict]:
     return [
@@ -392,6 +400,9 @@ async def test_executor_discipline_seed_teaches_resubmission_and_waits_as_draft(
         "an unconditional single-submission rule contradicts the resubmission rule"
     )
     assert "hub-submit-task" in text
+    for claim in RESUBMISSION_CLAIMS:
+        assert claim in flat.lower(), f"seed lost the rule itself: {claim}"
+    assert "только сдай" in flat, "the hub's submit-only order stays an exception"
     # The draft must be the whole active text with the fix on top, not a
     # shorter version a person would lose sections by activating.
     assert "## Вопрос — это стоп" in text
@@ -411,6 +422,8 @@ async def test_executor_discipline_seed_teaches_resubmission_and_waits_as_draft(
     assert "апдейтом, а не пересдачей" not in spec
     assert "ровно одна сдача" not in spec
     assert "hub-submit-task" in spec and "#1054" in spec
+    for claim in RESUBMISSION_CLAIMS:
+        assert claim.lower() in spec, f"spec lost the rule itself: {claim}"
 
     name = "executor-pair-discipline"
     populations = {
