@@ -428,3 +428,62 @@ async def test_mcp_identity_names_policies(monkeypatch):
     assert "worktree_per_task=on" in text
     assert "sekret-cursor-key" not in text
     assert "sekret-cursor-key" not in view.model_dump_json()
+
+
+# --- /health: связь сервера с GitHub (#1645) ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_health_egress_is_typed_offline_and_leaks_nothing(
+    client, db, monkeypatch
+):
+    """AC-4: открытый эпизод виден в публичном /health только типизированными
+    полями; запрос не ходит в сеть; сторож, молчащий дольше трёх интервалов,
+    даёт unknown."""
+    import socket
+    from datetime import UTC, datetime, timedelta
+
+    import httpx
+
+    from hub.services import egress_watch as ew
+
+    monkeypatch.setattr(config, "EGRESS_DOWN_AFTER", 3)
+    secret_text = (
+        "https://deploy:hunter2@evil.example/x?token=abc "  # pragma: allowlist secret
+        "/Users/denis/.ssh/id_ed25519 10.20.30.40:443"
+    )
+    now = datetime.now(UTC)
+
+    def boom(request):
+        raise httpx.ConnectError(secret_text)
+
+    watch = ew.EgressWatch(
+        lambda: ew.probe(transport=httpx.MockTransport(boom)), lambda: now
+    )
+    for _ in range(3):
+        await watch.step(db)
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("/health must not touch the network")
+
+    monkeypatch.setattr(socket.socket, "connect", no_network)
+    monkeypatch.setattr(socket, "getaddrinfo", no_network)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", no_network)
+    monkeypatch.setattr(ew, "probe", no_network)
+    monkeypatch.setattr(config, "HUB_TOKENS", _tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+
+    resp = await client.get("/health")  # no Authorization header: public
+    assert resp.status_code == 200, resp.text
+    egress = resp.json()["egress"]
+    assert set(egress) == {"state", "since", "checked_at", "reason_code"}
+    assert egress["state"] == "down"
+    assert egress["reason_code"] == "connect"
+    assert egress["since"] and egress["checked_at"]
+    for leaked in ("hunter2", "evil.example", "/Users/", "10.20.30.40", "token=abc"):
+        assert leaked not in resp.text
+
+    await ew.record_heartbeat(db, now - timedelta(seconds=3 * 120 + 5), interval=120)
+    await db.commit()
+    stale = (await client.get("/health")).json()["egress"]
+    assert stale["state"] == "unknown"

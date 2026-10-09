@@ -2298,6 +2298,21 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "ON events(kind, project_id, id)",
     ),
     (
+        # #1645: heartbeat of the egress watcher — ONE row, written in the same
+        # transaction as an episode transition. checked_at lives here, not in
+        # memory: a restart keeps it, every process sees the same one, and a
+        # failed write leaves it stale (-> unknown) instead of a false "up".
+        "create_egress_state_table",
+        "CREATE TABLE IF NOT EXISTS egress_state ("
+        "id INTEGER PRIMARY KEY CHECK (id = 1), "
+        "checked_at TEXT NOT NULL, "
+        "interval_seconds INTEGER NOT NULL, "
+        "ok INTEGER NOT NULL, "
+        "reason_code TEXT NOT NULL DEFAULT '', "
+        "streak INTEGER NOT NULL DEFAULT 0, "
+        "first_fail_at TEXT NOT NULL DEFAULT '')",
+    ),
+    (
         # #1413: чем снят provider_tokens. '' — история до задачи (счёт
         # ОДНОГО прогона, переснимается только командой владельца);
         # agent_open — счёт агента, снятый до его конца, свип переснимет;
