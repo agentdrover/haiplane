@@ -2014,6 +2014,38 @@ async def api_task_tree(
     return limited
 
 
+async def _context_path_brief(
+    request: Request,
+    db: aiosqlite.Connection,
+    project_row: Any,
+    breadcrumb: list[dict[str, Any]],
+    siblings: list[dict[str, Any]],
+    children: list[dict[str, Any]],
+    mode: str,
+) -> dict[str, Any]:
+    """Блок «что дальше» для /context (#1643) в границах видимости вызывающего.
+
+    Сессия implementer читает только свою задачу, поэтому ей видно то, что
+    /context и так показывает: задача, предки, соседи, дети. Остальные
+    вызывающие получают блок целиком.
+    """
+    from hub.services import project_path as project_path_service
+
+    identity = getattr(request.state, "identity", None)
+    visible: set[int] | None = None
+    if (
+        identity is not None
+        and identity.auth_source == "chat_pair"
+        and identity.chat_pair_kind == "implementer"
+    ):
+        visible = {
+            int(n["id"]) for n in [*breadcrumb, *siblings, *children] if "id" in n
+        }
+    return await project_path_service.task_path_brief(
+        db, project_row, breadcrumb, summary=mode == "summary", visible=visible
+    )
+
+
 @app.get("/api/tasks/{task_id}/context", response_model=TaskContextView)
 async def api_task_context(
     task_id: int,
@@ -2209,6 +2241,9 @@ async def api_task_context(
         working_rules,
         full_pointer=f'hub_my_context(task_id={task_id}, mode="full")',
     )
+    path_brief = await _context_path_brief(
+        request, db, project_row, breadcrumb, siblings, children, mode
+    )
     if mode == "summary":
         # Сводка стоит в начале: потолок режет хвост, и место под правила
         # занято до сокращения остального контекста.
@@ -2239,6 +2274,7 @@ async def api_task_context(
         "readiness": readiness_summary,
         "parent_goal": parent_goal,
         "working_rules": working_rules,
+        "path_brief": path_brief,
     }
 
 

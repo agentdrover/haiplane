@@ -351,3 +351,154 @@ async def test_path_is_the_same_on_every_surface(
     assert json.loads(capsys.readouterr().out) == rest
     # Строка «что дальше» одна на все поверхности.
     assert project_path.format_path_brief(rest)[0] in text
+
+
+async def test_path_block_is_shown_once_for_a_regular_agent(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, capsys
+):
+    """AC-3 (#1643): обычный агент видит блок «что дальше» ровно один раз, с тем
+    же смыслом, что у /path; /path и CLI path не изменились, а запроса к /path
+    ради блока нет."""
+    pid = await _project(db, "pp43")
+    epic = await _epic(db, pid)
+    first = await _task(db, pid, "first", parent=epic, size="M")
+    second = await _task(db, pid, "second", parent=epic, size="S")
+    await _dep(db, second, first)
+    # get_readiness пересчитывает DoR прочитанной задачи, поэтому читаем не
+    # first, а свою задачу ниже по priority: «следующая» остаётся first.
+    mine = await _task(db, pid, "mine", parent=epic, size="XS", priority="low")
+    rest = (await client.get("/api/projects/pp43/path")).json()
+    calls: list[str] = []
+
+    async def _via_client(path: str, **_: object) -> object:
+        calls.append(path)
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _via_client)
+    out = await mcp_server.hub_my_context(task_id=mine, mode="full")
+    text = json.loads(out.content[0].text)["message"]
+    assert text.count("Next task:") == 1
+    assert text.count(f"#{first} → #{second}") == 1
+    assert project_path.format_path_brief(rest)[0] in text
+    assert not [c for c in calls if "/path" in c], calls
+    # Второе представление блока не тащит: он один и в тексте.
+    assert "path_brief" not in json.dumps(out.structuredContent, ensure_ascii=False)
+
+    # CLI context: тот же блок один раз из того же поля /context.
+    ctx_json = (await client.get(f"/api/tasks/{mine}/context")).json()
+    assert ctx_json["path_brief"]["status"] == "ok"
+    with (
+        patch.object(sys, "argv", ["oc-hub", "context", str(mine)]),
+        patch.object(cli, "_api", return_value=ctx_json),
+    ):
+        cli.main()
+    printed = capsys.readouterr().out
+    assert printed.count("Next task:") == 1
+    assert f"#{first} → #{second}" in printed
+
+    # oc-hub path и REST /path — без изменений.
+    with (
+        patch.object(sys, "argv", ["oc-hub", "path", "pp43", "--json"]),
+        patch.object(cli, "_api", return_value=rest),
+    ):
+        cli.main()
+    assert json.loads(capsys.readouterr().out) == rest
+
+
+async def test_task_context_sql_does_not_grow_with_foreign_tasks(
+    db: aiosqlite.Connection,
+):
+    """#1643 P2: число запросов блока не растёт с числом задач чужого проекта."""
+
+    async def _statements(tag: str, foreign: int) -> int:
+        mine_pid = await _project(db, f"mine-{tag}")
+        other_pid = await _project(db, f"other-{tag}")
+        epic = await _epic(db, mine_pid)
+        await _task(db, mine_pid, "mine", parent=epic, size="XS")
+        foreign_epic = await _epic(db, other_pid, "fe")
+        for i in range(foreign):
+            await _task(db, other_pid, f"f{i}", parent=foreign_epic, size="S")
+        seen: list[str] = []
+        await db.set_trace_callback(seen.append)
+        project = await repo.get_project_by_slug(db, f"mine-{tag}")
+        brief = await project_path.task_path_brief(db, project, [], summary=False)
+        await db.set_trace_callback(None)
+        assert brief["status"] == "ok", brief
+        return len(seen)
+
+    few = await _statements("a", 3)
+    many = await _statements("b", 40)
+    assert many == few, (few, many)
+
+
+async def test_task_path_brief_statuses_are_distinct(db: aiosqlite.Connection):
+    """#1643 P3: нет проекта и сбой расчёта — разные статусы; сбой — «неизвестно»."""
+    no_project = await project_path.task_path_brief(db, None, [], summary=False)
+    assert no_project["status"] == "no_project"
+    assert "нет проекта" in no_project["lines"][0]
+
+    pid = await _project(db, "pp-fail")
+    project = await repo.get_project_by_slug(db, "pp-fail")
+    with patch.object(project_path, "compute", side_effect=RuntimeError("boom")):
+        failed = await project_path.task_path_brief(db, project, [], summary=False)
+    assert pid and failed["status"] == "unavailable"
+    assert "нет проекта" not in " ".join(failed["lines"])
+    assert "не посчитан" in failed["lines"][0]
+
+
+async def test_mcp_goes_to_path_only_for_replies_without_a_block(monkeypatch):
+    """#1643 P3: /path — только когда блока нет; присутствующий блок с пустыми
+    строками обрабатывается локально, без запроса к /path."""
+    calls: list[str] = []
+    path_reply = {
+        "project": "pp9",
+        "next": {"task_id": 7, "title": "t", "reason": "r"},
+        "epics": [],
+    }
+
+    def _api(brief):
+        async def _get(path: str, **_: object) -> object:
+            calls.append(path)
+            if path.startswith("/api/tasks/9/context"):
+                ctx = {"context_text": "Task #9", "task": {"project": {"slug": "pp9"}}}
+                return {**ctx, **brief}
+            return path_reply
+
+        return _get
+
+    async def _text(brief: dict) -> str:
+        calls.clear()
+        monkeypatch.setattr(mcp_server, "_api_get", _api(brief))
+        out = await mcp_server.hub_my_context(task_id=9)
+        return json.loads(out.content[0].text)["message"]
+
+    legacy = await _text({})
+    assert any(c.endswith("/path") for c in calls) and "Next task: #7" in legacy
+
+    unknown = await _text({"path_brief": {"status": "unavailable", "lines": []}})
+    assert not any(c.endswith("/path") for c in calls)
+    assert "неизвестно" in unknown and "нет проекта" not in unknown
+
+    absent = await _text({"path_brief": {"status": "no_project", "lines": []}})
+    assert not any(c.endswith("/path") for c in calls)
+    assert "нет проекта" in absent
+
+
+def test_cli_context_limit_covers_the_final_digest(capsys):
+    """#1643 P3: --max-chars режет итоговый текст вместе с блоком; в summary
+    блок стоит в начале и переживает усечение."""
+    lines = [f"Critical path, epic #{i}: " + "#1 → " * 30 for i in range(5)]
+    reply = {
+        "context_text": "контекст " * 200,
+        "path_brief": {"status": "ok", "project": "p", "lines": lines},
+    }
+    for mode, limit in (("full", 100), ("summary", 100)):
+        argv = ["oc-hub", "context", "9", "--mode", mode, "--max-chars", str(limit)]
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(cli, "_api", return_value=reply),
+        ):
+            cli.main()
+        printed = capsys.readouterr().out.rstrip("\n")
+        assert len(printed) <= limit, (mode, len(printed))
+    assert "Critical path" in printed  # summary: блок в начале
