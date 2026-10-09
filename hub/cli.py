@@ -364,7 +364,20 @@ def cmd_context(args: argparse.Namespace) -> int:
         params["mode"] = args.mode
     query = f"?{urllib.parse.urlencode(params)}" if params else ""
     result = _api("GET", f"/api/tasks/{args.task_id}/context{query}")
-    print(result.get("context_text", ""))
+    text = result.get("context_text", "")
+    # #1643: блок «что дальше» приходит из /context, как в hub_my_context: в
+    # summary он в начале (потолок режет хвост), в full — в конце. Лимит
+    # --max-chars действует на итоговый текст, а не только на context_text.
+    brief = result.get("path_brief") or {}
+    block = "\n".join(brief.get("lines") or [])
+    if block:
+        summary = getattr(args, "mode", "full") == "summary"
+        text = f"{block}\n\n{text}" if summary else f"{text}\n\n{block}"
+    if getattr(args, "max_chars", None) is not None:
+        from hub.services.tree_output import truncate_text
+
+        text, _ = truncate_text(text, args.max_chars)
+    print(text)
     return 0
 
 

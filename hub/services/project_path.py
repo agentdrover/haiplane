@@ -40,7 +40,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import heapq
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -118,24 +120,7 @@ class Reach:
 # --- чтение графа -------------------------------------------------------------
 
 
-def _resolver(projects: list[Any]) -> Any:
-    by_id = {int(p["id"]): p for p in projects}
-    default = next((p for p in projects if p["slug"] == "default"), None)
-
-    def project_of(tasks: dict[int, dict[str, Any]], task_id: int) -> Any:
-        """Как ``resolve_project_for_task`` (#335), но по графу в памяти."""
-        current: int | None = task_id
-        for _ in range(20):
-            row = tasks.get(current) if current is not None else None
-            if row is None:
-                break
-            if row["project_id"] is not None:
-                found = by_id.get(int(row["project_id"]))
-                return found if found and found["status"] == "active" else default
-            current = row["parent_id"]
-        return default
-
-    return project_of
+_resolver = oq.project_resolver
 
 
 async def _load_graph(db: aiosqlite.Connection, project: Any) -> Graph:
@@ -727,9 +712,16 @@ async def compute(
 # --- текст: один на CLI и MCP ----------------------------------------------------
 
 
+HIDDEN_STEP = "(вне вашей сессии)"
+HIDDEN_NEXT = "нет готовой или вне вашей сессии"
+
+
 def _chain_text(chain: list[dict[str, Any]]) -> str:
     parts = []
     for step in chain:
+        if step.get("hidden"):
+            parts.append(HIDDEN_STEP)
+            continue
         tag = f" (проект {step['project']})" if step["foreign"] else ""
         parts.append(f"#{step['task_id']}{tag}")
     return " → ".join(parts)
@@ -773,7 +765,14 @@ def format_path(data: dict[str, Any]) -> list[str]:
 def format_path_brief(data: dict[str, Any], *, limit: int = 5) -> list[str]:
     """Блок «что дальше» для hub_my_context: следующая задача и пути эпиков."""
     nxt = data["next"]
-    if nxt["task_id"] is not None:
+    if nxt.get("scoped"):
+        # Узкая сессия: только своя задача по номеру и названию, иначе пометка.
+        first = (
+            f"Next task: #{nxt['task_id']} {nxt['title']}"
+            if nxt["task_id"] is not None
+            else f"Next task: {HIDDEN_NEXT}"
+        )
+    elif nxt["task_id"] is not None:
         first = f"Next task: #{nxt['task_id']} {nxt['title']} — {nxt['reason']}"
     else:
         first = f"Next task: none — {nxt['reason']}"
@@ -788,3 +787,95 @@ def format_path_brief(data: dict[str, Any], *, limit: int = 5) -> list[str]:
         lines.append(f"…и ещё эпиков: {len(data['epics']) - limit}")
     lines.append(f"Full view: oc-hub path {data['project']}")
     return lines
+
+
+# --- блок для контекста задачи (#1643) ------------------------------------------
+
+BRIEF_EPICS_FULL = 3
+BRIEF_EPICS_SUMMARY = 1
+# Потолок на расчёт блока: асинхронные чтения прерываются, чисто синхронный
+# кусок (порядок узлов) — нет, поэтому главное средство — малое число запросов.
+BRIEF_TIMEOUT_S = 3.0
+
+
+def scope_to_visible(
+    data: dict[str, Any], visible: set[int], breadcrumb_ids: set[int]
+) -> dict[str, Any]:
+    """Оставить в проекции только то, что вызывающая сессия и так видит (#1643).
+
+    Сессия implementer привязана к одной задаче: ей видны эта задача, её
+    предки, соседи и дети. Остальное исключается ДО форматирования: следующая
+    задача, шаги пути и эпики вне видимости заменяются обезличенной пометкой, а
+    чужие проекты не называются вовсе. Эпики берутся только из предков.
+    """
+    # Белый список полей: свободный текст (reason, note, summary) наружу не идёт —
+    # в нём перечислены пропущенные кандидаты, их номера и причины.
+    task_id = data["next"]["task_id"]
+    shown = task_id is not None and task_id in visible
+    nxt = {
+        "task_id": task_id if shown else None,
+        "title": data["next"]["title"] if shown else "",
+        "scoped": True,
+    }
+    epics = []
+    for epic in data["epics"]:
+        if epic["epic_id"] not in breadcrumb_ids:
+            continue
+        chain = [
+            {"task_id": step["task_id"], "foreign": False, "project": ""}
+            if step["task_id"] in visible
+            else {"task_id": None, "foreign": False, "project": "", "hidden": True}
+            for step in epic["chain"]
+        ]
+        epics.append(
+            {
+                "epic_id": epic["epic_id"],
+                "weight_text": epic["weight_text"],
+                "chain": chain,
+            }
+        )
+    return {"project": data["project"], "next": nxt, "epics": epics}
+
+
+async def task_path_brief(
+    db: aiosqlite.Connection,
+    project: Any,
+    breadcrumb: list[dict[str, Any]],
+    *,
+    summary: bool,
+    visible: set[int] | None = None,
+) -> dict[str, Any]:
+    """Компактный блок «что дальше» для сессии одной задачи.
+
+    Тот же расчёт и тот же текст, что у /path и CLI (``compute`` и
+    ``format_path_brief``); сужены только эпики: сначала эпики предков задачи,
+    затем остальные, всего не больше ``BRIEF_EPICS_*``. ``visible`` — границы
+    видимости узкой сессии (implementer): None — полное чтение. Ничего не пишет.
+    """
+    if project is None:
+        return {
+            "status": "no_project",
+            "lines": ["Путь проекта: у задачи нет проекта — блока «что дальше» нет"],
+        }
+    slug = str(project["slug"])
+    try:
+        data = await asyncio.wait_for(compute(db, project), BRIEF_TIMEOUT_S)
+        own = {int(n["id"]) for n in breadcrumb}
+        if visible is not None:
+            data = scope_to_visible(data, visible, own)
+        epics = sorted(data["epics"], key=lambda e: e["epic_id"] not in own)
+        limit = BRIEF_EPICS_SUMMARY if summary else BRIEF_EPICS_FULL
+        lines = format_path_brief({**data, "epics": epics}, limit=limit)
+    except Exception as exc:  # noqa: BLE001 - блок необязателен, контекст важнее
+        logging.getLogger(__name__).warning(
+            "path brief of project %s not computed: %s: %s",
+            slug,
+            type(exc).__name__,
+            exc,
+        )
+        return {
+            "status": "unavailable",
+            "project": slug,
+            "lines": [f"Путь проекта не посчитан: {type(exc).__name__}"],
+        }
+    return {"status": "ok", "project": slug, "lines": lines}

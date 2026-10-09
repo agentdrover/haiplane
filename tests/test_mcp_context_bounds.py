@@ -389,3 +389,25 @@ async def test_working_rules_respect_context_bounds() -> None:
     sc = out.structuredContent["context"]["working_rules"]
     assert sc["repository_rules"]["content"] == body
     assert last_line in _text(out)
+
+
+async def test_path_block_respects_context_bounds() -> None:
+    """AC-4 (#1643): у задачи без проекта summary с малым max_chars называет
+    «нет проекта»; ответ в пределах лимита, усечение обозначено в bounds."""
+    from hub.services.project_path import task_path_brief
+
+    brief = await task_path_brief(None, None, [], summary=True)  # type: ignore[arg-type]
+    assert brief["status"] == "no_project"
+    ctx = _heavy_context()
+    ctx["path_brief"] = brief
+    limit = 1200
+    with patch(
+        "hub.mcp_server._api_get", new=AsyncMock(side_effect=_fake_api([], ctx=ctx))
+    ):
+        out = await hub_my_context(834, mode="summary", max_chars=limit)
+
+    assert _size(out) <= limit, _size(out)
+    assert "нет проекта" in _text(out)
+    assert _text(out).count("нет проекта") == 1
+    bounds = (out.structuredContent or {}).get("bounds")
+    assert bounds and (bounds.get("text_truncated") or bounds.get("dropped")), bounds
