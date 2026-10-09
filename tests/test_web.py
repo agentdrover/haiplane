@@ -7601,3 +7601,42 @@ async def test_web_create_takes_work_type_and_freeze_rationale(client: AsyncClie
     epic = next(t for t in tasks if t["title"] == "Typed epic")
     assert epic["work_type"] == "chore"
     assert epic["freeze_rationale"] == "чистка долга"
+
+
+async def test_web_key_form_can_scope_the_key_to_a_project(
+    client: AsyncClient, db, monkeypatch
+):
+    """#1644: the key form carries a project; an unknown one is refused."""
+    from hub import repository as repo
+    from hub.services import admin as admin_svc
+
+    admin = _admin_headers(monkeypatch)
+    await repo.create_project(
+        db, slug="audit-in", name="audit-in", workspace_path="/tmp/ws"
+    )
+    principal = await admin_svc.create_principal(
+        db, kind="service", username="ci-web-1644", role_slug="ci_runner"
+    )
+    await db.commit()
+
+    ok = await client.post(
+        "/admin/keys/create",
+        data={"principal_id": principal["id"], "name": "scoped", "project": "audit-in"},
+        headers=admin,
+    )
+    assert ok.status_code == 200, ok.text
+    keys = await admin_svc.list_api_keys(db, principal_id=principal["id"])
+    assert [k["name"] for k in keys] == ["scoped"]
+    assert keys[0]["scopes"] == ["project:audit-in"]
+
+    bad = await client.post(
+        "/admin/keys/create",
+        data={"principal_id": principal["id"], "name": "bad", "project": "nope"},
+        headers=admin,
+    )
+    assert "bad" not in [
+        k["name"]
+        for k in await admin_svc.list_api_keys(db, principal_id=principal["id"])
+    ]
+    assert bad.status_code == 422, "same status as the API"
+    assert "nope" in str(dict(bad.headers)), "the refusal names the project"
