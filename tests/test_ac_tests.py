@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import signal
 import stat
 import time
 from pathlib import Path
@@ -387,27 +389,36 @@ async def test_manual_ac_run_has_a_minimal_env_and_kills_its_group(
     monkeypatch.setenv("SSH_AUTH_SOCK", "/synthetic/agent.sock")
     monkeypatch.setattr(ac_tests, "_RUN_TIMEOUT", 1)
 
-    result = await real_default_test_runner(["tests/t.py::test_a"], str(work))
-
-    assert result is None, "a hung run is 'could not run', not a verdict"
-    child_env = (work / "child-env.txt").read_text()
-    for leaked in (
-        "SYNTH_HUB_SIGNING_SALT",
-        "SYNTH_API_TOKEN",
-        "synthetic-plain-secret",
-        "synthetic-token-secret",
-        "SSH_AUTH_SOCK",
-        "/synthetic/agent.sock",
-    ):
-        assert leaked not in child_env, leaked
-    home_line = [ln for ln in child_env.splitlines() if ln.startswith("HOME=")]
-    assert home_line and home_line[0] != f"HOME={real_home}"
-    assert not Path(home_line[0][5:]).exists(), "the temporary HOME is removed"
-    pid = int((work / "child.pid").read_text())
-    deadline = time.monotonic() + 5
-    while _alive(pid) and time.monotonic() < deadline:
-        await asyncio.sleep(0.1)
-    assert not _alive(pid), "the process group survived the timeout"
+    try:
+        # A runner that does not kill the group blocks on the pipe the child
+        # holds: bound the wait so that is a red test, not a hung one.
+        result = await asyncio.wait_for(
+            real_default_test_runner(["tests/t.py::test_a"], str(work)), timeout=15
+        )
+        assert result is None, "a hung run is 'could not run', not a verdict"
+        child_env = (work / "child-env.txt").read_text()
+        for leaked in (
+            "SYNTH_HUB_SIGNING_SALT",
+            "SYNTH_API_TOKEN",
+            "synthetic-plain-secret",
+            "synthetic-token-secret",
+            "SSH_AUTH_SOCK",
+            "/synthetic/agent.sock",
+        ):
+            assert leaked not in child_env, leaked
+        home_line = [ln for ln in child_env.splitlines() if ln.startswith("HOME=")]
+        assert home_line and home_line[0] != f"HOME={real_home}"
+        assert not Path(home_line[0][5:]).exists(), "the temporary HOME is removed"
+        pid = int((work / "child.pid").read_text())
+        deadline = time.monotonic() + 5
+        while _alive(pid) and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        assert not _alive(pid), "the process group survived the timeout"
+    finally:
+        pid_file = work / "child.pid"
+        if pid_file.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
 
 
 async def test_manual_ac_run_output_is_bounded(monkeypatch, tmp_path: Path):
