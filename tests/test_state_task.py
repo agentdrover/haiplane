@@ -1010,6 +1010,25 @@ async def test_a_verdict_outside_review_changes_nothing(
     assert await fingerprint(db, task_id) == before
     assert dict(await repo.get_task(db, task_id))["status"] == "running"
 
+    # Без вердикта на живое поколение держит один статус: задачу вернули в open.
+    other = await make_state_task(db, title="возвращённая")
+    await drive_to_review(client, db, other, headers=headers["impl"])
+    returned = await client.post(
+        f"/api/tasks/{other}/return-to-work",
+        json={"reason": "меняем постановку"},
+        headers=headers["human"],
+    )
+    assert returned.status_code == 200 and returned.json()["status"] == "open"
+    open_before = await fingerprint(db, other)
+    gone = await client.post(
+        f"/api/tasks/{other}/review-verdict",
+        json={"verdict": "approved", "expected_generation": 1},
+        headers=headers["human"],
+    )
+    assert gone.status_code == 409, gone.text
+    assert await fingerprint(db, other) == open_before
+    assert dict(await repo.get_task(db, other))["status"] == "open"
+
 
 async def test_completion_clears_the_claim_and_stamps_the_time(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch
