@@ -7638,4 +7638,5 @@ async def test_web_key_form_can_scope_the_key_to_a_project(
         k["name"]
         for k in await admin_svc.list_api_keys(db, principal_id=principal["id"])
     ]
+    assert bad.status_code == 422, "same status as the API"
     assert "nope" in str(dict(bad.headers)), "the refusal names the project"

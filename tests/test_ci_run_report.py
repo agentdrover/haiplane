@@ -738,3 +738,150 @@ async def test_the_real_reporter_payload_still_passes_for_an_unscoped_key(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["applied"] is True
+
+
+# ---- #1644, round 2: bypasses found by the second review ----
+
+
+async def test_scoped_ci_key_is_confined_to_the_ci_routes(ci_runner_hub, scoped_ci_key):
+    """P1: a bound key must not refine, run commands, or reach MCP/other writes."""
+    hub = ci_runner_hub
+    db = hub.db
+    mine = await _project_task(db, "audit-in")
+    foreign = await _task(db, generation=1, sha="sha-pinned")
+    scoped = await scoped_ci_key('["project:audit-in"]')
+    before = await _snapshot(db, foreign)
+
+    refused = [
+        ("POST", f"/api/tasks/{foreign}/refine", {"affected_areas": ["x"]}),
+        ("POST", "/api/tasks/refine-bulk", {"items": []}),
+        ("POST", f"/api/tasks/{foreign}/run-validation", {}),
+        ("POST", f"/api/tasks/{foreign}/run-ac-tests", {}),
+        ("POST", "/api/tasks", {"title": "drafted by a CI key"}),
+        ("POST", "/mcp", {}),
+    ]
+    for method, path, body in refused:
+        resp = await hub.client.request(method, path, json=body, headers=scoped)
+        assert resp.status_code == 403, (path, resp.status_code, resp.text[:200])
+    assert await _snapshot(db, foreign) == before
+    rows = await db.execute_fetchall("SELECT COUNT(*) FROM tasks")
+    assert rows[0][0] == 3, "no task was created by the bound key"
+
+    # What the real reporter does keeps working.
+    got = await hub.client.get(f"/api/tasks/{mine}", headers=scoped)
+    assert got.status_code == 200, got.text
+    assert (await _post_report(hub.client, scoped, mine))["applied"] is True
+
+
+async def test_empty_or_non_json_scopes_are_damaged_not_unrestricted(
+    ci_runner_hub, scoped_ci_key
+):
+    """P2: only a well-formed ``[]`` means "no restriction"."""
+    from hub.services.admin import parse_key_scopes
+
+    assert parse_key_scopes("[]") == ((), False)
+    for raw in ("", None, "  ", "[ ]x"):
+        assert parse_key_scopes(raw)[1] is True, raw
+    hub = ci_runner_hub
+    task_id = await _task(hub.db, generation=1, sha="sha-pinned")
+    key = await scoped_ci_key("")
+    resp = await hub.client.post(
+        f"/api/tasks/{task_id}/ci-run-report",
+        json={"head_sha": "sha-pinned", "ac_results": {"AC-1": "pass"}},
+        headers=key,
+    )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_a_scope_project_that_is_not_active_stops_the_key(
+    ci_runner_hub, scoped_ci_key
+):
+    """P2: the project was moved to pending after the key was issued."""
+    hub = ci_runner_hub
+    db = hub.db
+    mine = await _project_task(db, "audit-in")
+    scoped = await scoped_ci_key('["project:audit-in"]')
+    await db.execute("UPDATE projects SET status = 'pending' WHERE slug = 'audit-in'")
+    await db.commit()
+    resp = await hub.client.post(
+        f"/api/tasks/{mine}/ci-run-report",
+        json={"head_sha": "sha-pinned", "ac_results": {"AC-1": "pass"}},
+        headers=scoped,
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["reason"] == "ci_key_scope_project_inactive"
+    dep = await hub.client.post(
+        "/api/deploys",
+        json={"sha": "x1", "ref": "main", "status": "success", "project": "audit-in"},
+        headers=scoped,
+    )
+    assert dep.status_code == 403, dep.text
+    assert list(await db.execute_fetchall("SELECT 1 FROM releases")) == []
+
+
+async def test_guard_and_write_of_a_report_share_one_write_transaction(
+    ci_runner_hub, scoped_ci_key, monkeypatch
+):
+    """P2: resolver, scope check and UPSERT run under one BEGIN IMMEDIATE."""
+    from hub import app as hub_app
+    from hub.services import ci_scope
+
+    hub = ci_runner_hub
+    mine = await _project_task(hub.db, "audit-in")
+    scoped = await scoped_ci_key('["project:audit-in"]')
+    seen: dict[str, bool] = {}
+
+    real_resolve = repo.resolve_project_for_task
+    real_enforce = ci_scope.enforce_ci_project_scope
+    real_accept = hub_app.accept_ci_run_report
+
+    async def resolve(db, task_id):
+        seen["resolver"] = db.in_transaction
+        return await real_resolve(db, task_id)
+
+    async def enforce(db, *a, **kw):
+        seen["guard"] = db.in_transaction
+        return await real_enforce(db, *a, **kw)
+
+    async def accept(db, *a, **kw):
+        seen["accept"] = db.in_transaction
+        return await real_accept(db, *a, **kw)
+
+    monkeypatch.setattr(repo, "resolve_project_for_task", resolve)
+    monkeypatch.setattr(ci_scope, "enforce_ci_project_scope", enforce)
+    monkeypatch.setattr(hub_app, "accept_ci_run_report", accept)
+    await _post_report(hub.client, scoped, mine)
+    assert seen == {"resolver": True, "guard": True, "accept": True}, seen
+
+
+async def test_service_principal_has_no_password_and_no_browser_session(
+    ci_runner_hub,
+):
+    """P3: reset-password -> /login -> cookie must not give a CI principal a door."""
+    from hub.services import admin as admin_svc
+
+    hub = ci_runner_hub
+    with pytest.raises(ValueError):
+        await admin_svc.set_password(hub.db, hub.ci_principal["id"], "Str0ng!pass-1")
+    # A credential that got in some other way still opens nothing.
+    await hub.db.execute(
+        "INSERT INTO password_credentials (principal_id, password_hash) VALUES (?, ?)",
+        (hub.ci_principal["id"], admin_svc.hash_password("Str0ng!pass-1")),
+    )
+    await hub.db.commit()
+    assert (
+        await admin_svc.authenticate_password(
+            hub.db, hub.ci_principal["username"], "Str0ng!pass-1"
+        )
+        is None
+    )
+    task_id = await _task(hub.db, generation=1, sha="sha-pinned")
+    for headers in (hub.ci_cookie,):
+        who = await hub.client.get("/api/whoami", headers=headers)
+        assert who.status_code == 401, who.text
+        rep = await hub.client.post(
+            f"/api/tasks/{task_id}/ci-run-report",
+            json={"head_sha": "sha-pinned", "ac_results": {}},
+            headers=headers,
+        )
+        assert rep.status_code == 401, rep.text

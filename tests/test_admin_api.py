@@ -373,3 +373,26 @@ async def test_api_key_can_be_scoped_to_projects(client, db, monkeypatch):
     assert missing.status_code == 422, missing.text
     listed = await client.get("/api/admin/api-keys", headers=admin)
     assert not [k for k in listed.json() if k["name"] == "bad"]
+
+
+@pytest.mark.asyncio
+async def test_blank_or_malformed_projects_are_refused_without_a_key(
+    client, db, monkeypatch
+):
+    """#1644 P2/P3: a blank slug must not issue an unrestricted key; bad types 422."""
+    monkeypatch.setattr(config, "HUB_TOKENS", _admin_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    admin = {"Authorization": "Bearer admin-token"}
+    resp = await client.post(
+        "/api/admin/principals",
+        json={"kind": "service", "username": "ci-bot2", "role": "ci_runner"},
+        headers=admin,
+    )
+    url = f"/api/admin/principals/{resp.json()['id']}/api-keys"
+    for bad in (["  "], [""], [1], "audit-in"):
+        r = await client.post(
+            url, json={"name": "blank", "projects": bad}, headers=admin
+        )
+        assert r.status_code == 422, (bad, r.status_code, r.text[:200])
+    listed = await client.get("/api/admin/api-keys", headers=admin)
+    assert not [k for k in listed.json() if k["name"] == "blank"]
