@@ -907,6 +907,9 @@ async def test_rework_of_a_held_state_task_goes_back_to_open_without_a_job(
     assert _Counting.submitted == 0, "headless-задание заказано для state"
     row = dict(await repo.get_task(db, task_id))
     assert not row["claimed_by"] and not row["job_id"]
+    assert row["unfrozen_generation"] == row["submission_generation"] == 1, (
+        "rework — явный человеческий возврат: постановку снова можно править"
+    )
 
 
 # --- исполнитель: слой брони и выбор кандидата --------------------------------
@@ -1395,7 +1398,9 @@ async def test_claim_and_release_never_touch_git_for_a_state_task(
     # cleanup-хелперы сами отказывают, даже если git_mode остался hub
     from hub.services import lifecycle, orchestration
 
-    await db.execute("UPDATE tasks SET git_mode='hub' WHERE id=?", (task_id,))
+    await db.execute(
+        "UPDATE tasks SET git_mode='hub', branch='task-1/stray' WHERE id=?", (task_id,)
+    )
     await db.commit()
     await lifecycle._try_restore_pair_workspace(db, task_id)
     await lifecycle._try_switch_pair_workspace_to_task(db, task_id)
