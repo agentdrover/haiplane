@@ -41,13 +41,13 @@ from tests.state_support import (
 
 _SECRET_SAMPLES = {
     "openai_style_key": "sk-" + "a1B2c3D4e5F6g7H8i9",
-    "github_token": "ghp_" + "a1B2c3D4e5F6" * 3,
+    "github_token": "ghp_" + "a1B2c3D4e5F6" * 3,  # pragma: allowlist secret
     "github_pat": "github_pat_" + "A1b2C3d4E5f6G7h8I9j0K1",
     "aws_access_key": "AKIA" + "IOSFODNN7EXAMPLE",
     "slack_token": "xoxb-" + "123456789012-abcdefghij",
     "bearer_token": "Authorization: Bearer " + "abcdef0123456789abcdef",
-    "private_key_block": "-----BEGIN RSA PRIVATE KEY-----",
-    "assigned_secret": "API_TOKEN=abc123",
+    "private_key_block": "-----BEGIN RSA PRIVATE KEY-----",  # pragma: allowlist secret
+    "assigned_secret": "API_TOKEN=abc123",  # pragma: allowlist secret
 }
 
 _CLEAN_SAMPLES = (
@@ -134,7 +134,8 @@ def test_the_limits_are_inclusive():
 
 
 def test_an_error_never_carries_a_value_and_names_only_safe_acs():
-    bad = [dict(evidence_for()[0], observed=MARKER + " ghp_" + "a1B2c3D4e5F6" * 3)]
+    token = "ghp_" + "a1B2c3D4e5F6" * 3  # pragma: allowlist secret
+    bad = [dict(evidence_for()[0], observed=f"{MARKER} {token}")]
     err = _kind(bad + evidence_for(("AC-2",)))
     assert err.kind == state_evidence.KIND_CREDENTIAL
     assert err.ac_ids == ["AC-1"] and err.field == "observed"
