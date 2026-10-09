@@ -437,3 +437,22 @@ async def test_epic_approve_flags_dead_locators_without_running_pytest(
     alerts = _alerts(await repo.get_task_updates(db, tv.id))
     assert len(alerts) == 1, alerts
     assert "AC-1" in alerts[0] and "AC-2" not in alerts[0], alerts[0]
+
+
+async def test_epic_approve_does_not_accuse_an_ambiguous_definition(
+    db: aiosqlite.Connection, monkeypatch
+):
+    # #1650 round 2: Base is defined on both branches of an if. Which one the
+    # module ends up with is not decidable without running it, so the locator is
+    # neither found nor dead — and the approval says nothing about it.
+    ambiguous = (
+        "import sys\n\nif sys.platform == 'linux':\n"
+        "    class Base:\n        def test_x(self):\n            pass\n"
+        "else:\n    class Base:\n        pass\n\n\n"
+        "class TestX(Base):\n    pass\n"
+    )
+    task_id = await _draft(db, "epic", "tests/test_api.py::TestX::test_x")
+
+    await _approve_with(db, monkeypatch, task_id, source=ambiguous)
+
+    assert not _alerts(await repo.get_task_updates(db, task_id))

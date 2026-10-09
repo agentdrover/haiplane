@@ -15,6 +15,7 @@ false ``missing``.
 from __future__ import annotations
 
 import ast
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -521,3 +522,35 @@ async def _read(git: Any, repo: str, ref: str, path: str) -> str | None:
     except Exception:  # noqa: BLE001 - one unreadable file is one unknown
         log.warning("locator source read failed: %s", path)
         return None
+
+
+async def resolve_locators_at_ref(
+    git: Any,
+    repo: str | None,
+    acs: Any,
+    *,
+    submission_sha: str = "",
+    branch: str = "",
+    base: str = "",
+) -> list[dict]:
+    """Resolve every test-AC locator of ``acs``: read at one ref, then parse.
+
+    The single door for callers (review brief, epic approve): reading goes
+    through git, parsing runs off the event loop.
+    """
+    evidence = await read_locator_evidence(
+        git,
+        repo,
+        locator_files(acs),
+        submission_sha=submission_sha,
+        branch=branch,
+        base=base,
+    )
+    return await asyncio.to_thread(
+        resolve_ac_locators,
+        acs,
+        evidence.sources,
+        evidence.absent,
+        ref_label=evidence.ref_label,
+        pytest_configured=evidence.pytest_configured,
+    )

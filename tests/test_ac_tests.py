@@ -441,3 +441,108 @@ async def test_manual_ac_run_output_is_bounded(monkeypatch, tmp_path: Path):
 
     # test_b is printed after the cap: read and dropped, not kept in memory.
     assert res == {"tests/t.py::test_a": True}
+
+
+# ---- #1650 round 2: a lost FAILED is not a pass; a group outlives its leader ----
+
+
+def _fake_uv(tmp_path: Path, body: str) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    fake = bin_dir / "uv"
+    fake.write_text("#!/bin/sh\n" + body)
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+
+
+async def test_a_failure_after_the_log_limit_still_fails_the_ac(
+    monkeypatch, tmp_path: Path
+):
+    from hub.services import validation_run
+
+    monkeypatch.setattr(validation_run, "_MAX_OUTPUT", 1000)
+    _fake_uv(
+        tmp_path,
+        "yes 'noise noise noise noise' | head -c 3000000\n"
+        "echo 'tests/t.py::test_a FAILED [100%]'\n",
+    )
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+
+    res = await real_default_test_runner(["tests/t.py::test_a"], str(tmp_path))
+
+    assert res == {"tests/t.py::test_a": False}
+
+
+async def test_incomplete_output_gives_no_positive_result(monkeypatch, tmp_path: Path):
+    # A line longer than the buffer can hide an outcome: nothing may pass on it.
+    _fake_uv(
+        tmp_path,
+        "echo 'tests/t.py::test_a PASSED'\n"
+        "head -c 3000000 /dev/zero | tr '\\0' 'x'\n"
+        "echo\n",
+    )
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+
+    res = await real_default_test_runner(["tests/t.py::test_a"], str(tmp_path))
+
+    assert not res or not any(res.values()), res
+
+
+_LAUNCHER = """sleep 300 &
+echo $! > "$PWD/child.pid"
+exit 0
+"""
+
+
+def _kill_quietly(work: Path) -> None:
+    pid_file = work / "child.pid"
+    if pid_file.exists():
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+
+async def _alive_after(work: Path, seconds: float = 5) -> bool:
+    deadline = time.monotonic() + seconds
+    pid = int((work / "child.pid").read_text())
+    while _alive(pid) and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    return _alive(pid)
+
+
+async def test_the_group_dies_on_timeout_even_if_the_leader_already_exited(
+    monkeypatch, tmp_path: Path
+):
+    from hub.services import ac_tests
+
+    _fake_uv(tmp_path, _LAUNCHER)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+    monkeypatch.setattr(ac_tests, "_RUN_TIMEOUT", 1)
+    try:
+        res = await asyncio.wait_for(
+            real_default_test_runner(["tests/t.py::test_a"], str(tmp_path)), 15
+        )
+        assert res is None or not any(res.values())
+        assert not await _alive_after(tmp_path), "the orphan outlived the run"
+    finally:
+        _kill_quietly(tmp_path)
+
+
+async def test_the_group_dies_on_cancel_even_if_the_leader_already_exited(
+    monkeypatch, tmp_path: Path
+):
+    _fake_uv(tmp_path, _LAUNCHER)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
+    try:
+        task = asyncio.create_task(
+            real_default_test_runner(["tests/t.py::test_a"], str(tmp_path))
+        )
+        for _ in range(100):
+            if (tmp_path / "child.pid").exists():
+                break
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.3)  # the launcher has exited by now
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert not await _alive_after(tmp_path), "the orphan outlived the cancel"
+    finally:
+        _kill_quietly(tmp_path)

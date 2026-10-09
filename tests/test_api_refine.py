@@ -987,7 +987,7 @@ async def test_review_brief_includes_locator_resolution(
     from hub import repository as repo
 
     monkeypatch.setattr(
-        "hub.services.review_brief.read_locator_evidence",
+        "hub.services.test_existence.read_locator_evidence",
         _evidence_of("def test_present():\n    pass\n"),
     )
     task = await _create_task(client)
@@ -1016,7 +1016,7 @@ async def test_review_brief_locator_unknown_when_the_file_cannot_be_read(
     from hub import repository as repo
 
     monkeypatch.setattr(
-        "hub.services.review_brief.read_locator_evidence", _evidence_of(None)
+        "hub.services.test_existence.read_locator_evidence", _evidence_of(None)
     )
     task = await _create_task(client)
     await repo.update_task(db, task["id"], branch="task-x/b")

@@ -238,6 +238,73 @@ _SHAPES = {
 }
 
 
+_ROUND2 = {
+    "imported constant": {
+        "hub/c.py": "PYTEST = 'pytest'\n",
+        "hub/m.py": (
+            "import subprocess\nfrom hub.c import PYTEST\n"
+            "def f():\n    subprocess.run([PYTEST, '-q'])\n"
+        ),
+    },
+    "module attribute": {
+        "hub/cfg.py": "CMD = 'uv run pytest -q'\n",
+        "hub/m.py": (
+            "import subprocess\nfrom hub import cfg\n"
+            "def f():\n    subprocess.run(cfg.CMD, shell=True)\n"
+        ),
+    },
+    "aliased module": {
+        "hub/cfg.py": "CMD = 'uv run pytest -q'\n",
+        "hub/m.py": (
+            "import subprocess\nimport hub.cfg as conf\n"
+            "def f():\n    subprocess.run(conf.CMD, shell=True)\n"
+        ),
+    },
+    "constant chain": {
+        "hub/m.py": (
+            "import subprocess\nPYTEST = 'pytest'\nCMD = ['uv', 'run', PYTEST]\n"
+            "def f():\n    subprocess.run(CMD)\n"
+        ),
+    },
+    "module level call": {
+        "hub/m.py": "import subprocess\nsubprocess.run(['uv', 'run', 'pytest'])\n"
+    },
+    "class body call": {
+        "hub/m.py": (
+            "import subprocess\nclass K:\n    out = subprocess.run(['pytest'])\n"
+        )
+    },
+    "quoted in sh -c": {
+        "hub/m.py": (
+            "import subprocess\n"
+            "def f():\n    subprocess.run(['sh', '-c', \"'pytest' -q\"])\n"
+        )
+    },
+    "multiline shell": {
+        "hub/m.py": (
+            "import os\n"
+            "def f():\n    os.system('set -e\\ncd w\\nuv run pytest -q\\n')\n"
+        )
+    },
+    "line continuation": {
+        "hub/m.py": (
+            "import os\ndef f():\n    os.system('uv run \\\\\\n  pytest -q')\n"
+        )
+    },
+    "env prefix and chain": {
+        "hub/m.py": (
+            "import os\n"
+            "def f():\n    os.system('FOO=1 make lint && FOO=2 python -m pytest')\n"
+        )
+    },
+}
+
+
+def test_the_guard_follows_constants_imports_and_module_level_code():
+    for name, sources in _ROUND2.items():
+        assert scan(sources), f"the guard missed: {name}"
+
+
 def test_the_guard_recognises_every_shape_it_claims_to_cover():
     for name, source in _SHAPES.items():
         assert scan({"m.py": source}), f"the guard missed: {name}"

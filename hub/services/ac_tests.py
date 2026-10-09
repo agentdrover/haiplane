@@ -197,20 +197,13 @@ async def unresolved_locators(
         )
         if ac.id in nodeid_by_ac
     ]
-    evidence = await test_existence.read_locator_evidence(
+    resolutions = await test_existence.resolve_locators_at_ref(
         plugins.git_ops,
         ctx.get("repo"),
-        test_existence.locator_files(acs),
+        acs,
         submission_sha=task.get("submission_sha") or "",
         branch=task.get("branch") or "",
         base=ctx.get("base_branch") or config.PAIR_BASE_BRANCH,
-    )
-    resolutions = test_existence.resolve_ac_locators(
-        acs,
-        evidence.sources,
-        evidence.absent,
-        ref_label=evidence.ref_label,
-        pytest_configured=evidence.pytest_configured,
     )
     if all(r["status"] != test_existence.MISSING for r in resolutions) and all(
         r["status"] in (test_existence.UNKNOWN, test_existence.UNPARSEABLE)

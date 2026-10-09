@@ -133,3 +133,90 @@ def spawn_spy(monkeypatch: pytest.MonkeyPatch) -> SpawnSpy:
     monkeypatch.setattr(asyncio, "create_subprocess_exec", watched_exec)
     monkeypatch.setattr(asyncio, "create_subprocess_shell", watched_shell)
     return spy
+
+
+class FakeGit:
+    """An in-memory git: named refs point at shas, a sha holds a set of files.
+
+    Both the old reads (tree + file) and the new ones (read_file_at_ref,
+    resolve_ref) are served, so one fake can drive the code before and after a
+    change. ``moves`` re-points a ref after that many reads, which is how a
+    branch that advances between two reads is modelled.
+    """
+
+    def __init__(
+        self,
+        files: dict[str, str | bytes],
+        *,
+        refs: dict[str, str] | None = None,
+        trees: dict[str, dict[str, str | bytes]] | None = None,
+    ) -> None:
+        self.tip = "a" * 40
+        self.trees = {self.tip: files, **(trees or {})}
+        self.refs = {"origin/task-42/work": self.tip, **(refs or {})}
+        self.refs_read: list[str] = []
+        self.reads = 0
+        self.moves: dict[int, tuple[str, str]] = {}
+
+    def _sha(self, ref: str) -> str:
+        return self.refs.get(ref) or (ref if ref in self.trees else "")
+
+    def _tree(self, ref: str) -> dict[str, str | bytes] | None:
+        self.refs_read.append(ref)
+        self.reads += 1
+        if self.reads in self.moves:
+            name, sha = self.moves[self.reads]
+            self.refs[name] = sha
+        sha = self._sha(ref)
+        return self.trees.get(sha) if sha else None
+
+    async def head_sha(self, repo: str, base: str) -> str:
+        return self.refs.get(f"origin/{base}", "")
+
+    async def resolve_ref(self, name: str, repo: str) -> tuple[str, str]:
+        sha = self._sha(name) or self._sha(f"origin/{name}")
+        return ("resolved", sha) if sha else ("missing", name)
+
+    async def files_at_ref(self, repo: str, ref: str):
+        tree = self._tree(ref)
+        return None if tree is None else set(tree)
+
+    async def file_at_ref(self, repo: str, ref: str, path: str):
+        tree = self._tree(ref)
+        if tree is None or path not in tree:
+            return None
+        value = tree[path]
+        return value.decode() if isinstance(value, bytes) else value
+
+    async def read_file_at_ref(
+        self, repo: str, ref: str, path: str, *, limit_chars: int = 30000
+    ) -> dict:
+        tree = self._tree(ref)
+        out = {
+            "state": "unreadable",
+            "path": path,
+            "ref": ref,
+            "sha": self._sha(ref),
+            "content": "",
+            "truncated": False,
+            "size": 0,
+            "chars": 0,
+            "reason": "",
+        }
+        if tree is None:
+            out["reason"] = f"ref {ref!r} not read"
+            return out
+        if path not in tree:
+            out["state"] = "missing"
+            return out
+        raw = tree[path]
+        data = raw if isinstance(raw, bytes) else raw.encode()
+        text = data.decode(errors="replace")
+        out.update(
+            state="present",
+            size=len(data),
+            chars=len(text),
+            truncated=len(text) > limit_chars,
+            content=text[:limit_chars],
+        )
+        return out

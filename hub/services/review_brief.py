@@ -57,11 +57,7 @@ from hub.services.ci_report import ci_report_state
 from hub.services.review_availability import generation_review
 from hub.services.rule_catalogue import rules_for_areas
 from hub.services.statement_freshness import statement_freshness
-from hub.services.test_existence import (
-    locator_files,
-    read_locator_evidence,
-    resolve_ac_locators,
-)
+from hub.services.test_existence import resolve_locators_at_ref
 
 log = logging.getLogger("hub")
 
@@ -433,24 +429,17 @@ async def build_review_brief(
     locator_resolution: list[ACLocatorResolution] = []
     if any(a.verifiable_by.value == "test" for a in ac_models):
         ctx = await services.project_git_context(db, task_id)
-        evidence = await read_locator_evidence(
-            plugins.git_ops,
-            ctx.get("repo"),
-            locator_files(ac_models),
-            submission_sha=task_view.submission_sha or "",
-            branch=task_view.branch or "",
-            base=diff_base.get("base")
-            or ctx.get("base_branch")
-            or config.PAIR_BASE_BRANCH,
-        )
         locator_resolution = [
             ACLocatorResolution(**r)
-            for r in resolve_ac_locators(
+            for r in await resolve_locators_at_ref(
+                plugins.git_ops,
+                ctx.get("repo"),
                 ac_models,
-                evidence.sources,
-                evidence.absent,
-                ref_label=evidence.ref_label,
-                pytest_configured=evidence.pytest_configured,
+                submission_sha=task_view.submission_sha or "",
+                branch=task_view.branch or "",
+                base=diff_base.get("base")
+                or ctx.get("base_branch")
+                or config.PAIR_BASE_BRANCH,
             )
         ]
 

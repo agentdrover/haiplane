@@ -123,7 +123,7 @@ def collection(monkeypatch) -> None:
             ref_label="fixture",
         )
 
-    monkeypatch.setattr("hub.services.review_brief.read_locator_evidence", _evidence)
+    monkeypatch.setattr("hub.services.test_existence.read_locator_evidence", _evidence)
     plugins.git_ops = _OnTaskBranch()
 
 
