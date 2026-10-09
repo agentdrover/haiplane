@@ -190,8 +190,9 @@ def _inherited(
     for base in cls.bases:
         if isinstance(base, ast.Name) and base.id == "object":
             continue
-        local = module.defs.get(base.id) if isinstance(base, ast.Name) else None
-        if not isinstance(local, ast.ClassDef) or base.id in module.bound:
+        base_name = base.id if isinstance(base, ast.Name) else ""
+        local = module.defs.get(base_name)
+        if not isinstance(local, ast.ClassDef) or base_name in module.bound:
             shown = ast.unparse(base)
             return _OPAQUE, (
                 f"{cls.name} inherits {shown}, which is not a class written in "
