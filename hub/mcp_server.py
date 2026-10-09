@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -2004,15 +2005,23 @@ async def _release_block_lines() -> list[str]:
     return release_block_lines(blocks)
 
 
+_EGRESS_READ_SECONDS = 2.0
+
+
 async def _egress_lines() -> list[str]:
     """«GitHub недоступен с сервера N мин…» from the public /health, or none."""
     from hub.services.egress_watch import egress_lines
 
+    unread = ["Состояние связи сервера с GitHub не прочитано"]
     try:
-        data = await _api_get("/health")
+        # Short wait: a hub that cannot answer /health in 2 s must not hold
+        # the whole context for the client's full timeout.
+        data = await asyncio.wait_for(_api_get("/health"), timeout=_EGRESS_READ_SECONDS)
     except Exception:  # noqa: BLE001 - context must render without it
-        return []
-    return egress_lines(data.get("egress") if isinstance(data, dict) else None)
+        return unread
+    egress = data.get("egress") if isinstance(data, dict) else None
+    # A hub that predates the field has nothing to say; that is not a failure.
+    return egress_lines(egress) if isinstance(egress, dict) else []
 
 
 async def _general_hub_context(
@@ -2124,6 +2133,10 @@ async def _general_hub_context(
         "\n".join(lines),
         budget,
         shrink="my_tasks",
+        # #1645: under a tight cap the prose must keep its head (title,
+        # instance, the egress alert), so the structured identity — which the
+        # prose already restates in the Identity line — goes before the text is cut.
+        drop_order=("identity",),
         identity=identity,
         my_tasks=my_tasks,
     )

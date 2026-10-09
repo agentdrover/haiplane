@@ -24,21 +24,20 @@ owner learned from commands that "hung". This module is the missing look:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import socket
 import ssl
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
 from hub import config
 from hub import repository as repo
-from hub.db import fetchall, log_activity
+from hub.db import fetchall, log_activity, write_transaction
 from hub.services.release_alert import minutes_since, utc_stamp
 
 log = logging.getLogger("hub")
@@ -86,9 +85,25 @@ def reason_code_of(exc: BaseException) -> str:
     return "other"
 
 
+def _safe_url(raw: str | None) -> str:
+    """The URL if it is plain https with a host and NO userinfo, else the default.
+
+    httpx turns ``a URL with userinfo`` into an ``Authorization: Basic``
+    header, and the probe is defined as unauthenticated.
+    """
+    url = (raw or "").strip()
+    try:
+        parts = urlsplit(url)
+        ok = (
+            parts.scheme == "https" and bool(parts.hostname) and "@" not in parts.netloc
+        )
+    except ValueError:
+        ok = False
+    return url if ok else DEFAULT_URL
+
+
 def probe_url() -> str:
-    url = (config.EGRESS_PROBE_URL or "").strip()
-    return url if url.lower().startswith("https://") else DEFAULT_URL
+    return _safe_url(config.EGRESS_PROBE_URL)
 
 
 def interval_seconds() -> int:
@@ -119,7 +134,7 @@ async def probe(
                 timeout=deadline,
                 verify=True,
             ) as client:
-                await client.head(url or probe_url())
+                await client.head(_safe_url(url) if url else probe_url())
         return ""
     except asyncio.CancelledError:
         raise
@@ -159,46 +174,76 @@ async def active_episode(db: Any) -> dict[str, Any] | None:
     }
 
 
-@dataclass
-class _Snapshot:
-    checked_at: datetime
-    interval: int
+_TS = "%Y-%m-%d %H:%M:%S"
 
 
-_snapshot: _Snapshot | None = None
+def _parse(stamp: Any) -> datetime | None:
+    try:
+        return datetime.strptime(str(stamp), _TS).replace(tzinfo=UTC)
+    except (TypeError, ValueError):
+        return None
 
 
-def reset_snapshot() -> None:
-    global _snapshot
-    _snapshot = None
+async def _heartbeat(db: Any) -> Any:
+    rows = await fetchall(
+        db,
+        "SELECT checked_at, interval_seconds, streak, first_fail_at "
+        "FROM egress_state WHERE id=1",
+    )
+    return rows[0] if rows else None
 
 
-def note_probe(checked_at: datetime, interval: int | None = None) -> None:
-    global _snapshot
-    _snapshot = _Snapshot(checked_at, interval or interval_seconds())
+async def record_heartbeat(
+    db: Any,
+    checked_at: datetime,
+    *,
+    ok: bool = True,
+    reason_code: str = "",
+    streak: int = 0,
+    first_fail_at: str = "",
+    interval: int | None = None,
+) -> None:
+    """Write the single heartbeat row. No commit: the caller's transaction."""
+    await db.execute(
+        "INSERT INTO egress_state (id, checked_at, interval_seconds, ok, "
+        "reason_code, streak, first_fail_at) VALUES (1, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET checked_at=excluded.checked_at, "
+        "interval_seconds=excluded.interval_seconds, ok=excluded.ok, "
+        "reason_code=excluded.reason_code, streak=excluded.streak, "
+        "first_fail_at=excluded.first_fail_at",
+        (
+            utc_stamp(checked_at),
+            interval or interval_seconds(),
+            int(ok),
+            reason_code,
+            streak,
+            first_fail_at,
+        ),
+    )
 
 
 async def egress_status(db: Any, now: datetime | None = None) -> dict[str, Any]:
     """Typed state for /health, prod-state and the context. No network.
 
-    ``unknown`` = the last probe is older than three intervals or there has
-    been none in this process: the watcher is not running. An open episode's
-    ``since`` and ``reason_code`` are still reported then — the last thing the
-    hub knew — but the state does not claim it is current.
+    ``unknown`` = no heartbeat, or the last one is older than three intervals:
+    the watcher is not running, or its writes fail. The heartbeat is stored
+    with the episode transition (same transaction), so it is never fresher than
+    the state it vouches for. An open episode's ``since`` and ``reason_code``
+    are still reported when unknown — the last thing the hub knew — but the
+    state does not claim it is current.
     """
     now = now or datetime.now(UTC)
     episode = await active_episode(db)
-    snap = _snapshot
-    fresh = (
-        snap is not None
-        and (now - snap.checked_at).total_seconds()
-        <= STALE_AFTER_INTERVALS * snap.interval
-    )
+    beat = await _heartbeat(db)
+    seen = _parse(beat["checked_at"]) if beat else None
+    fresh = seen is not None and (
+        now - seen
+    ).total_seconds() <= STALE_AFTER_INTERVALS * int(beat["interval_seconds"])
     state = UNKNOWN if not fresh else (DOWN if episode else UP)
     return {
         "state": state,
         "since": episode["since"] if episode else None,
-        "checked_at": snap.checked_at.strftime("%Y-%m-%d %H:%M:%S") if snap else None,
+        "checked_at": str(beat["checked_at"]) if beat else None,
         "reason_code": episode["reason_code"] if episode else None,
     }
 
@@ -227,7 +272,15 @@ def egress_lines(egress: Any, now: datetime | None = None) -> list[str]:
 
 
 class EgressWatch:
-    """One probe-and-count step; the loop around it lives in the poller."""
+    """One probe-and-count step; the loop around it lives in the poller.
+
+    The count, the episode and the heartbeat all live in the database and move
+    in ONE ``BEGIN IMMEDIATE`` transaction: two workers (or a worker and a
+    restart) cannot both see "no episode" and both open one, and a write that
+    fails leaves the heartbeat stale instead of vouching for a state that was
+    never stored. Every process may run its own watcher; the database, not
+    process ownership, makes that safe.
+    """
 
     def __init__(
         self,
@@ -236,66 +289,92 @@ class EgressWatch:
     ) -> None:
         self._probe = probe_fn or probe
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._streak = 0
-        self._first_fail: datetime | None = None
-        self._last_code = "other"
 
-    async def step(self, db: Any) -> None:
+    async def step(self, db: Any) -> bool:
+        """Probe, then store. True when the result was stored."""
         # The network first, the write transaction after: a probe that hangs
         # for its whole deadline must not hold the database lock.
         code = await self._probe()
         now = self._clock()
-        note_probe(now)
-        if not code:
-            self._streak, self._first_fail = 0, None
-            await self._close_episode(db, now)
-            return
-        code = _safe_code(code)
-        if self._streak == 0:
-            self._first_fail = now
-        self._streak += 1
-        self._last_code = code
-        if self._streak >= down_after():
-            await self._open_episode(db, code)
-
-    async def _write(self, db: Any, kind: str, summary: str, payload: dict) -> bool:
+        code = _safe_code(code) if code else ""
         try:
-            await repo.insert_event(db, kind=kind, actor="hub", payload=payload)
-            await log_activity(db, kind, summary, None)
-            return True
+            if db.in_transaction:
+                await db.commit()  # this connection is the watcher's own
+            async with write_transaction(db):
+                await self._apply(db, code, now)
         except Exception:
-            with contextlib.suppress(Exception):
-                await db.rollback()
-            log.exception("Egress watch: %s not written", kind)
+            log.exception("Egress watch: result not stored")
             return False
+        return True
 
-    async def _open_episode(self, db: Any, code: str) -> None:
-        if await active_episode(db) is not None:
-            return  # one episode, one egress_down — whatever the code now
-        first = self._first_fail or self._clock()
-        since = utc_stamp(first)
-        await self._write(
+    async def _apply(self, db: Any, code: str, now: datetime) -> None:
+        beat = await _heartbeat(db)
+        streak, first = 0, ""
+        seen = _parse(beat["checked_at"]) if beat else None
+        # A count left by a watcher that then went silent is not "in a row".
+        if (
+            beat
+            and seen
+            and (now - seen).total_seconds()
+            <= (STALE_AFTER_INTERVALS * int(beat["interval_seconds"]))
+        ):
+            streak, first = int(beat["streak"]), str(beat["first_fail_at"] or "")
+        episode = await active_episode(db)
+        stamp = utc_stamp(now)
+        if not code:
+            if episode is not None:
+                await self._close(db, episode, now)
+            streak, first = 0, ""
+        else:
+            if streak == 0 or not first:
+                first = stamp
+            streak += 1
+            if streak >= down_after() and episode is None:
+                await self._open(db, code, first)
+        await record_heartbeat(
+            db,
+            now,
+            ok=not code,
+            reason_code=code,
+            streak=streak,
+            first_fail_at=first,
+        )
+
+    async def _open(self, db: Any, code: str, since: str) -> None:
+        # One episode, one egress_down — whatever the code is now.
+        await repo.insert_event(
+            db,
+            kind=KIND_DOWN,
+            actor="hub",
+            payload={"since": since, "reason_code": code},
+        )
+        await log_activity(
             db,
             KIND_DOWN,
             f"авария — GitHub недоступен с сервера ({REASON_TEXT[code]})",
-            {"since": since, "reason_code": code},
+            None,
+            commit=False,
         )
 
-    async def _close_episode(self, db: Any, now: datetime) -> None:
-        episode = await active_episode(db)
-        if episode is None:
-            return
+    async def _close(self, db: Any, episode: dict[str, Any], now: datetime) -> None:
         minutes = minutes_since(episode["since"], now)
         held = "длительность не прочитана" if minutes is None else f"{minutes} мин"
-        await self._write(
+        await repo.insert_event(
             db,
-            KIND_RESTORED,
-            f"связь сервера с GitHub восстановлена, была недоступна {held}",
-            {
+            kind=KIND_RESTORED,
+            actor="hub",
+            payload={
                 "since": episode["since"],
                 "reason_code": episode["reason_code"],
                 "minutes": minutes,
             },
+        )
+        await log_activity(
+            db,
+            KIND_RESTORED,
+            f"связь сервера с GitHub восстановлена, была недоступна {held}",
+            None,
+            commit=False,
         )
 
 

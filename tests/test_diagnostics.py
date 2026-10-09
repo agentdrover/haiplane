@@ -447,7 +447,6 @@ async def test_health_egress_is_typed_offline_and_leaks_nothing(
 
     from hub.services import egress_watch as ew
 
-    ew.reset_snapshot()
     monkeypatch.setattr(config, "EGRESS_DOWN_AFTER", 3)
     secret_text = (
         "https://deploy:hunter2@evil.example/x?token=abc "  # pragma: allowlist secret
@@ -484,7 +483,7 @@ async def test_health_egress_is_typed_offline_and_leaks_nothing(
     for leaked in ("hunter2", "evil.example", "/Users/", "10.20.30.40", "token=abc"):
         assert leaked not in resp.text
 
-    ew.note_probe(now - timedelta(seconds=3 * 120 + 5), interval=120)
+    await ew.record_heartbeat(db, now - timedelta(seconds=3 * 120 + 5), interval=120)
+    await db.commit()
     stale = (await client.get("/health")).json()["egress"]
     assert stale["state"] == "unknown"
-    ew.reset_snapshot()

@@ -352,7 +352,15 @@ async def lifespan(app: FastAPI):
         poll_task.cancel()
         egress_task = getattr(app.state, "egress_task", None)
         if egress_task is not None:
+            # Wait for the watcher to finish unwinding: its connection closes
+            # in its own finally, and the shared one is closed below.
             egress_task.cancel()
+            try:
+                await egress_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("egress watcher ended with an error")
         # #1180: локальные прогоны ревью — чужие процессы, порождённые этим
         # хабом. Уйти, не сняв их, значит оставить агентский CLI сиротой:
         # он доработает, попробует сдать отчёт по прогону, за которым больше
