@@ -17589,3 +17589,41 @@ async def test_no_automation_touches_state_tasks(
     assert stored["status"] == "review" and not stored["review_verdict"]
     assert not await real_auto_verdict(db, cloud_id)
     assert dict(await repo.get_task(db, cloud_id))["status"] == "review"
+
+
+async def test_the_local_door_and_the_ladder_top_up_refuse_a_state_task(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1647: dispatch_local_review и maybe_top_up_incomplete — свои двери."""
+    from hub.services.review_dispatch import (
+        dispatch_local_review,
+        maybe_top_up_incomplete,
+        wait_for_local_runs,
+    )
+
+    recorder = _DispatchRecorder({"agent": {"id": "bc-st2"}, "run": {"id": "r-st2"}})
+    _wire(monkeypatch, recorder)
+    task_id = await _state_with_git_residue(
+        db, "state-ladder", policy={"verdict": "auto"}
+    )
+    await _machine_report(client, task_id, incomplete=True)
+    feed_before = len(await repo.get_task_updates(db, task_id))
+    assert not await maybe_top_up_incomplete(db, task_id)
+    assert len(await repo.get_task_updates(db, task_id)) == feed_before, (
+        "добор лестницы не пишет по state-задаче даже отказов"
+    )
+    assert recorder.calls == []
+
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    local_id = await _state_with_git_residue(
+        db,
+        "state-local-door",
+        policy={"review": "dispatch"},
+        repo_name="mrpda/snip-portal",
+        forge="gitverse",
+    )
+    task = dict(await repo.get_task(db, local_id))
+    assert not await dispatch_local_review(db, task, "gitverse", task["branch"], 1)
+    await wait_for_local_runs()
+    assert await _local_dispatches(db, local_id) == []

@@ -978,3 +978,125 @@ async def test_the_statement_stays_editable_while_running_before_the_first_submi
         },
     )
     assert added.status_code == 201, added.text
+
+
+# --- частности, которые мутации показали незакрытыми --------------------------
+
+
+async def test_a_verdict_outside_review_changes_nothing(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """Условная запись держит статус review сама, а не только проверка выше."""
+    headers = auth(monkeypatch)
+    task_id = await make_state_task(db)
+    await drive_to_review(client, db, task_id, headers=headers["impl"])
+    back = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "comments": "ещё",
+            "expected_generation": 1,
+        },
+        headers=headers["human"],
+    )
+    assert back.status_code == 200 and back.json()["status"] == "running"
+    before = await fingerprint(db, task_id)
+    late = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "expected_generation": 1},
+        headers=headers["human"],
+    )
+    assert late.status_code == 409, late.text
+    assert await fingerprint(db, task_id) == before
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+
+
+async def test_completion_clears_the_claim_and_stamps_the_time(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    headers = auth(monkeypatch)
+    task_id = await make_state_task(db)
+    await drive_to_review(client, db, task_id, headers=headers["impl"])
+    held = dict(await repo.get_task(db, task_id))
+    assert held["claim_session_id"], "до завершения сессия записана"
+    done = await client.post(
+        f"/api/tasks/{task_id}/review-verdict",
+        json={"verdict": "approved", "expected_generation": 1},
+        headers=headers["human"],
+    )
+    assert done.status_code == 200, done.text
+    row = dict(await repo.get_task(db, task_id))
+    assert row["status"] == "completed" and row["completed_at"]
+    assert not row["claim_session_id"] and not row["claimed_by"]
+
+
+async def test_dor_and_pair_start_never_read_git_for_a_state_task(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from hub.services import dor, lifecycle
+    from hub.services.dor import evaluate_dor
+
+    paths = AsyncMock(wraps=dor._statement_paths_checked)
+    monkeypatch.setattr(dor, "_statement_paths_checked", paths)
+    state_id = await make_state_task(db)
+    await evaluate_dor(db, state_id)
+    paths.assert_not_awaited()
+    commit_id = await make_state_task(db, result_kind="commit")
+    await evaluate_dor(db, commit_id)
+    paths.assert_awaited()
+
+    subject = AsyncMock()
+    monkeypatch.setattr(lifecycle, "refuse_opening_without_subject", subject)
+    assert (await pair_start(client, state_id)).status_code == 200
+    subject.assert_not_awaited()
+    other = await make_state_task(db, result_kind="commit")
+    assert (await pair_start(client, other)).status_code == 200
+    subject.assert_awaited()
+
+
+async def test_a_state_task_with_a_job_is_refused_at_submission(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    task_id = await make_state_task(db)
+    assert (await pair_start(client, task_id)).status_code == 200
+    await db.execute("UPDATE tasks SET job_id='stray-job' WHERE id=?", (task_id,))
+    await db.commit()
+    before = await fingerprint(db, task_id)
+    resp = await submit(client, task_id, evidence_for())
+    assert resp.status_code == 400, resp.text
+    assert await fingerprint(db, task_id) == before
+
+
+async def test_the_repair_door_does_not_return_a_state_task_to_work(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """repair_executor возвращает задачу в работу ДО брони: отказ обязан быть раньше."""
+    from hub.models import TaskRefine
+    from hub.services import executor_launch as el
+    from tests.test_executor_dispatch import (
+        _CREATED,
+        _creator,
+        _human,
+        _launch_config,
+        _task_with_findings,
+    )
+
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    _, task_id = await _task_with_findings(db, slug="exec-state-repair")
+    await repo.update_task_structured(
+        db, task_id, TaskRefine(result_kind="state", rollback="откат")
+    )
+    await db.commit()
+    before = await fingerprint(db, task_id)
+
+    result = await el.repair_executor(
+        db, task_id, issuer_principal_id=await _human(db), issuer="owner"
+    )
+
+    assert not result.launched and el.REASON_STATE_TASK in result.reason, result
+    assert await fingerprint(db, task_id) == before, "статус и лента прежние"
+    assert dict(await repo.get_task(db, task_id))["status"] == "review"
+    assert calls == []
