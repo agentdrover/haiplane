@@ -29,6 +29,9 @@ These are the rules most likely to be broken by “small” changes.
   must NOT bump the submission generation (it would invalidate the approval).
 - Review is submission-bound: `hub_submit_for_review` (or a routed done report)
   bumps the submission generation, which makes prior verdicts and reports stale.
+  Exception (#1265): a resubmit from `review` on the SAME non-empty sha keeps the
+  generation, the status and the verdict's currency (`finding_outcomes`,
+  `accept_areas` and the decision to order a review may still update).
   Fixes after `changes_requested` reach review only via a resubmit of the SAME
   task on the SAME branch — pushing commits alone does not re-trigger review.
   A review of task A never sees task B's branch; do not base new task branches

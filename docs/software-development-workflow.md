@@ -193,8 +193,9 @@ APPROVED. Правило применяется в общем service-слое (
 
 1. Разработчик заканчивает итерацию и отправляет работу:
    `hub_submit_for_review` (или done-report — хаб сам маршрутизирует его в
-   `review`, если одобрения ещё нет). Каждая отправка получает новый
-   submission generation.
+   `review`, если одобрения ещё нет). Отправка с новым sha получает новый
+   submission generation; повтор из `review` с тем же sha поколение, статус и
+   текущесть вердикта сохраняет (#1265).
 2. Ревьюер получает полный контекст одним вызовом `hub_get_review_brief`:
    acceptance criteria, scope, validation commands, review checklist,
    branch/PR c advisory diff-командой, последний отчёт разработчика.
