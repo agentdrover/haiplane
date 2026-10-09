@@ -1593,3 +1593,166 @@ async def test_reviewer_brief_without_active_harness_names_the_gap(hub):
         assert harness["version"] is None, setup
         assert harness["reason"], setup
         assert "DRAFT-TEXT" not in brief.text, "draft не подставляется"
+
+
+# ---------------------------------------------------------------------------
+# #1643 hub_my_context у implementer: блок «что дальше» приходит из /context
+# ---------------------------------------------------------------------------
+
+
+def _session_api_get(hub, session: dict[str, str], calls: list[str]):
+    """_api_get как у облачного исполнителя: реальные запросы с его токеном."""
+    from hub.mcp_server import HubApiError
+
+    async def _get(path: str, **_: object):
+        calls.append(path)
+        resp = await hub.client.get(path, headers=session)
+        if resp.status_code >= 400:
+            raise HubApiError({"message": f"HTTP {resp.status_code}", **resp.json()})
+        return resp.json()
+
+    return _get
+
+
+async def _epic_with_queue(hub) -> tuple[int, int, int, int]:
+    """Эпик проекта: цепочка first → second и своя задача сессии (mine).
+
+    mine ниже по priority, поэтому «следующая» — first. Читать контекст mine
+    нельзя заменять чтением first: get_readiness пересчитывает DoR прочитанной
+    задачи, а у задач-заглушек он проставлен руками.
+    """
+    from tests.test_project_path import _dep, _epic, _project, _task
+
+    pid = await _project(hub.db, "cp1643")
+    epic = await _epic(hub.db, pid)
+    first = await _task(hub.db, pid, "first", parent=epic, size="M")
+    second = await _task(hub.db, pid, "second", parent=epic, size="S")
+    await _dep(hub.db, second, first)
+    mine = await _task(hub.db, pid, "mine", parent=epic, size="XS", priority="low")
+    return epic, first, second, mine
+
+
+@pytest.mark.asyncio
+async def test_implementer_context_has_the_path_block_without_calling_path(
+    hub, monkeypatch
+):
+    """AC-1 (#1643): implementer получает следующую задачу и критический путь
+    в hub_my_context(mode=full); к закрытому /path запросов нет, строки
+    «не прочитан» нет."""
+    from hub import mcp_server
+
+    _epic_id, first, second, mine = await _epic_with_queue(hub)
+    session = await _implementer_session(hub, mine)
+    calls: list[str] = []
+    monkeypatch.setattr(mcp_server, "_api_get", _session_api_get(hub, session, calls))
+
+    out = await mcp_server.hub_my_context(task_id=mine, mode="full")
+    text = json.loads(out.content[0].text)["message"]
+
+    assert f"Next task: #{first}" in text
+    assert f"#{first} → #{second}" in text
+    assert "не прочитан" not in text
+    assert not [c for c in calls if "/path" in c], calls
+
+
+@pytest.mark.asyncio
+async def test_implementer_still_cannot_read_path_or_foreign_context(hub):
+    """AC-2 (#1643): allowlist не расширен — прямой /path и /context чужой
+    задачи по-прежнему 403."""
+    _epic_id, first, second, mine = await _epic_with_queue(hub)
+    session = await _implementer_session(hub, mine)
+
+    path = await hub.client.get("/api/projects/cp1643/path", headers=session)
+    assert path.status_code == 403, path.text
+    foreign = await hub.client.get(f"/api/tasks/{second}/context", headers=session)
+    assert foreign.status_code == 403, foreign.text
+    own = await hub.client.get(f"/api/tasks/{mine}/context", headers=session)
+    assert own.status_code == 200, own.text
+
+
+@pytest.mark.asyncio
+async def test_implementer_path_block_names_nothing_outside_the_session(
+    hub, monkeypatch
+):
+    """#1643 P1: блок implementer не называет чужие задачи, эпики и проекты:
+    ни названий, ни номеров, ни slug; вместо них обезличенная пометка."""
+    import re
+
+    from hub import mcp_server
+    from tests.test_project_path import _dep, _epic, _project, _task
+
+    _epic_id, first, second, mine = await _epic_with_queue(hub)
+    pid = await _project(hub.db, "cp1643")
+    other_pid = await _project(hub.db, "tajnyj-proekt")
+    # Следующая задача проекта — из другого эпика, который сессии не виден.
+    foreign_epic = await _epic(hub.db, pid, "tajnyj-epik")
+    foreign_next = await _task(
+        hub.db, pid, "tajnoe-imya", parent=foreign_epic, size="S", priority="critical"
+    )
+    # Цепочка собственного эпика идёт через зависимость из чужого проекта.
+    other_epic = await _epic(hub.db, other_pid, "epik-chuzhogo")
+    foreign_dep = await _task(
+        hub.db, other_pid, "chuzhaya-zavisimost", parent=other_epic
+    )
+    await _dep(hub.db, first, foreign_dep)
+
+    session = await _implementer_session(hub, mine)
+    monkeypatch.setattr(mcp_server, "_api_get", _session_api_get(hub, session, []))
+    out = await mcp_server.hub_my_context(task_id=mine, mode="full")
+    text = json.loads(out.content[0].text)["message"]
+    structured = json.dumps(out.structuredContent, ensure_ascii=False)
+
+    assert "вне вашей сессии" in text
+    for secret in (
+        "tajnoe-imya",
+        "tajnyj-epik",
+        "chuzhaya-zavisimost",
+        "epik-chuzhogo",
+    ):
+        assert secret not in text and secret not in structured, secret
+    assert "tajnyj-proekt" not in text and "tajnyj-proekt" not in structured
+    for hidden_id in (foreign_next, foreign_epic, foreign_dep, other_epic):
+        assert not re.search(rf"#{hidden_id}\b", text), hidden_id
+
+
+@pytest.mark.asyncio
+async def test_implementer_block_without_ready_task_carries_no_skip_reasons(
+    hub, monkeypatch
+):
+    """#1643 (ревью): очередь без готовой задачи, пропущены чужие кандидаты.
+    Свободный reason очереди перечисляет их номера и причины; implementer
+    получает только обезличенную пометку, ни в тексте, ни в structuredContent."""
+    import re
+
+    from hub import mcp_server
+    from tests.test_project_path import _dep, _epic, _project, _task
+
+    pid = await _project(hub.db, "cp-noready")
+    mine_epic = await _epic(hub.db, pid)
+    mine = await _task(hub.db, pid, "mine", parent=mine_epic, size="XS")
+    foreign_epic = await _epic(hub.db, pid, "chuzhoj-epik")
+    blocker = await _task(
+        hub.db, pid, "blokirujushhaja", parent=foreign_epic, size="S", dor=False
+    )
+    skipped = await _task(hub.db, pid, "propushhennaja", parent=foreign_epic, size="S")
+    await _dep(hub.db, skipped, blocker)
+    await _dep(hub.db, mine, blocker)
+
+    # Без фильтра reason называет чужие номера — иначе тест ничего не доказывает.
+    plain = await hub.client.get(
+        "/api/projects/cp-noready/path", headers=hub.human_auth
+    )
+    assert plain.json()["next"]["task_id"] is None
+    assert f"#{skipped}" in plain.json()["next"]["reason"]
+
+    session = await _implementer_session(hub, mine)
+    monkeypatch.setattr(mcp_server, "_api_get", _session_api_get(hub, session, []))
+    out = await mcp_server.hub_my_context(task_id=mine, mode="full")
+    text = json.loads(out.content[0].text)["message"]
+    structured = json.dumps(out.structuredContent, ensure_ascii=False)
+
+    assert "Next task: нет готовой или вне вашей сессии" in text
+    for hidden_id in (skipped, blocker, foreign_epic):
+        assert not re.search(rf"#{hidden_id}\b", text), hidden_id
+        assert not re.search(rf"#{hidden_id}\b", structured), hidden_id
+    assert "propushhennaja" not in text + structured

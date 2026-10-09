@@ -134,6 +134,26 @@ def _sort_key(task: dict[str, Any]) -> tuple[int, int, int]:
     )
 
 
+def project_resolver(projects: list[Any]) -> Any:
+    """``resolve_project_for_task`` (#335) по задачам в памяти, без запросов."""
+    by_id = {int(p["id"]): p for p in projects}
+    default = next((p for p in projects if p["slug"] == "default"), None)
+
+    def project_of(tasks: dict[int, dict[str, Any]], task_id: int) -> Any:
+        current: int | None = task_id
+        for _ in range(20):
+            row = tasks.get(current) if current is not None else None
+            if row is None:
+                break
+            if row["project_id"] is not None:
+                found = by_id.get(int(row["project_id"]))
+                return found if found and found["status"] == "active" else default
+            current = row["parent_id"]
+        return default
+
+    return project_of
+
+
 async def _project_tasks(
     db: aiosqlite.Connection, project_id: int
 ) -> list[dict[str, Any]]:
@@ -153,9 +173,17 @@ async def _project_tasks(
         "ORDER BY id",
         tuple(statuses),
     )
+    # #1643: принадлежность проекту считается в памяти по одному чтению
+    # (id, parent_id, project_id) всех задач: два запроса на каждую живую
+    # задачу хаба делали /context зависимым от чужих проектов.
+    owner_of = project_resolver(await repo.list_projects(db, include_archived=True))
+    ancestry = {
+        int(r["id"]): dict(r)
+        for r in await fetchall(db, "SELECT id, parent_id, project_id FROM tasks")
+    }
     tasks: list[dict[str, Any]] = []
     for row in rows:
-        project = await repo.resolve_project_for_task(db, int(row["id"]))
+        project = owner_of(ancestry, int(row["id"]))
         if project is not None and int(project["id"]) == project_id:
             task = dict(row)
             task["areas"] = [
