@@ -47,6 +47,10 @@ log = logging.getLogger(__name__)
 TOKENS_PENDING = "pending"
 TOKENS_PROVIDER_NO_ANSWER = "provider_no_answer"
 TOKENS_NO_RUN = "no_run"
+# Локальный прогон советника (#1649): расход у провайдера хабу недоступен.
+# Это НЕИЗВЕСТНЫЙ расход, а не бесплатность, и Cursor о нём не спрашивается.
+TOKENS_LOCAL_NO_USAGE = "local_no_provider_usage"
+LOCAL_AGENT_PREFIX = "local:"
 # Сколько ждать usage после записи суждения, прежде чем назвать молчание
 # провайдера окончательным. Usage приходит с задержкой, и прогон может ещё
 # дописывать свой ответ после того, как суждение легло.
@@ -374,7 +378,10 @@ async def _cost_of_the_run(
         )
         ms = dict(rows[0]).get("ms") if rows else None
         duration_ms = max(int(ms), 0) if ms is not None else None
-    return str(run.get("model") or "") or declared_model, duration_ms, TOKENS_PENDING
+    model = str(run.get("model") or "") or declared_model
+    if str(run.get("agent_id") or "").startswith(LOCAL_AGENT_PREFIX):
+        return model, duration_ms, TOKENS_LOCAL_NO_USAGE
+    return model, duration_ms, TOKENS_PENDING
 
 
 async def stamp_judgement_usage(db) -> int:
@@ -401,7 +408,8 @@ async def stamp_judgement_usage(db) -> int:
         "j.created_at <= datetime('now', ?) AS window_over "
         "FROM steward_judgements j JOIN steward_runs r "
         "ON r.task_id=j.task_id AND r.generation=j.generation AND r.kind=j.kind "
-        "WHERE j.tokens_unknown_reason=? AND r.status != 'open'",
+        "WHERE j.tokens_unknown_reason=? AND r.status != 'open' "
+        "AND r.agent_id NOT LIKE 'local:%'",
         (f"-{USAGE_ANSWER_WINDOW_MIN} minutes", TOKENS_PENDING),
     )
     stamped = 0

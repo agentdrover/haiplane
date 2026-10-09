@@ -353,6 +353,13 @@ STEWARD_ADVISOR_MODELS = tuple(
     ).split(",")
     if m.strip()
 )
+# Локальный советник (#1649): ОДНА закреплённая модель, которую служба ревью
+# держит в доверенной конфигурации профиля advisor (файл advisor-model рядом с
+# враппером). Пусто — локального советника нет. Модель запускаема локально,
+# только если служба в heartbeat объявила профиль advisor с ТОЙ ЖЕ моделью и
+# STEWARD_HUB_TOKEN разрешается в принципала; автоподмены модели нет, а
+# самодекларация модели в суждении доказательством не считается.
+STEWARD_ADVISOR_LOCAL_MODEL = env_get("STEWARD_ADVISOR_LOCAL_MODEL", "").strip()
 # The hub token the steward run authenticates with (#1105). Same shape as
 # CURSOR_REVIEWER_HUB_TOKEN: the run reaches the hub's own MCP as the steward
 # principal, whose allowlist is two operations (#1021). Unset means no run —
