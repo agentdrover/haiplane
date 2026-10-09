@@ -413,6 +413,9 @@ _ROUND2 = {
             "def f():\n    subprocess.run(['sh', '-c', \"'pytest' -q\"])\n"
         )
     },
+    "sh -c inside one string": {
+        "hub/m.py": ("import os\ndef f():\n    os.system('sh -c \\'pytest -q\\'')\n")
+    },
     "multiline shell": {
         "hub/m.py": (
             "import os\n"

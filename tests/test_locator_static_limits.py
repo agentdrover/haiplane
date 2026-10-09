@@ -213,3 +213,55 @@ async def test_an_unreadable_config_is_not_taken_for_no_config():
     assert res["status"] == UNKNOWN, res
     res = await _with_config("pytest.ini", b"\xff\xfe\x00 [pytest")
     assert res["status"] == UNKNOWN, res
+
+
+async def test_a_config_that_cannot_be_read_at_all_is_not_taken_for_no_config():
+    class Flaky(FakeGit):
+        async def read_file_at_ref(self, repo, ref, path, **kw):
+            if path == "pyproject.toml":
+                return {"state": "unreadable", "reason": "io", "size": 0}
+            return await super().read_file_at_ref(repo, ref, path, **kw)
+
+    files = {_PATH: "def test_a():\n    pass\n", "pyproject.toml": "[x]\n"}
+    res = await _status(files, "test_a", Flaky(files))
+    assert res["status"] == UNKNOWN, res
+    assert "pyproject.toml" in res["reason"]
+
+    huge = {_PATH: "def test_a():\n    pass\n", "pyproject.toml": "# pad\n" * 60000}
+    res = await _status(huge, "test_a")
+    assert res["status"] == UNKNOWN, res
+
+
+class _AstWithParse:
+    """The ``ast`` module as the reader sees it, with only ``parse`` replaced.
+
+    Patching ``ast.parse`` itself would also break pytest's own reporting.
+    """
+
+    def __init__(self, parse):
+        self.parse = parse
+
+    def __getattr__(self, name):
+        import ast
+
+        return getattr(ast, name)
+
+
+async def test_parser_exhaustion_is_unknown_whatever_raised_it(monkeypatch):
+    from hub.services import test_existence
+
+    source = {_PATH: "def test_a():\n    pass\n"}
+    for exc in (RecursionError, MemoryError):
+
+        def boom(*_a, _exc=exc, **_k):
+            raise _exc()
+
+        monkeypatch.setattr(test_existence, "ast", _AstWithParse(boom))
+        res = await _status(source, "test_a")
+        assert res["status"] == UNKNOWN, (exc, res)
+        monkeypatch.undo()
+
+        monkeypatch.setattr(test_existence, "_resolve_pytest_path", boom)
+        res = await _status(source, "test_a")
+        assert res["status"] == UNKNOWN, (exc, res)
+        monkeypatch.undo()
