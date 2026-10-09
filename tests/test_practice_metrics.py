@@ -2884,7 +2884,13 @@ async def test_metrics_since_days_backward_compatible(db: aiosqlite.Connection):
     assert plain["since_days"] == 30
     assert plain["machine_reviews"]["reviews"] == 1
     assert plain["machine_reviews"]["dispositions"]["judged"] == 2
-    assert plain == await practice_metrics(db, since_days=30, project=None)
+    again = await practice_metrics(db, since_days=30, project=None)
+    # history_from moves with the clock: compare the rest, then the shape.
+    assert (
+        plain.pop("events_history")["windows_beyond_history"]
+        == (again.pop("events_history")["windows_beyond_history"])
+    )
+    assert plain == again
     # The default stays the one named constant.
     assert (await practice_metrics(db))["since_days"] == 90
 
@@ -3479,7 +3485,10 @@ async def test_validation_run_lines_unpinned_submission_is_not_run(
 # известным пределом, а не MIN(created_at): пустые первые часы окна не должны
 # менять ответ.
 
-_EVENTS_NOTE = "окно по events длиннее хранения: данные не раньше "
+_EVENTS_NOTE = (
+    "окно по events длиннее хранения: по политике хранения (14 дн.) данные раньше "
+)
+_EVENTS_TAIL = " не гарантированы; более старые события могут оставаться до очистки"
 
 
 def _eh(body: dict) -> dict:
@@ -3509,10 +3518,19 @@ async def test_events_history_marks_window_beyond_retention(db: aiosqlite.Connec
         "review_model_cascade",
         "review_economy.deep_cap",
         "review_economy.small_delta",
+        "review_economy.runs.by_kind",
         "steward_shadow.human_table",
+        "steward_shadow.false_approve",
+        "steward_shadow.false_approve_tasks",
+        "steward_shadow.act_refusals",
+        "steward_shadow.act_ready",
     } <= set(names)
     assert names["human_touches"] is True
     assert names["steward_shadow.actual_verdicts"] is True
+    # The shadow phase is read whole: the request window does not narrow it.
+    assert names["steward_shadow.human_table"] is True
+    window = {s["name"]: s["window"] for s in history["events_sections"]}
+    assert window["steward_shadow.human_table"] == "окно — вся фаза тени"
     assert names["human_gates"] is False
     assert "task_updates" not in names and "machine_reviews" not in names
 
@@ -3565,7 +3583,7 @@ async def test_events_history_empty_window_uses_retention_only(
     expected = datetime.now(UTC) - timedelta(days=repo.EVENTS_RETENTION_DAYS)
     got = datetime.fromisoformat(history["history_from"])
     assert abs(expected - got) < timedelta(minutes=2)
-    assert history["note"] == _EVENTS_NOTE + history["history_from"]
+    assert history["note"] == _EVENTS_NOTE + history["history_from"] + _EVENTS_TAIL
     assert history["windows_beyond_history"] == ["current"]
 
 
@@ -3577,6 +3595,26 @@ async def test_events_history_is_rendered_on_the_metrics_page(
     from_ = _eh(body)["history_from"]
     page = await client.get("/metrics?since_days=30")
     assert page.status_code == 200
-    assert _EVENTS_NOTE + from_ in page.text
+    assert _EVENTS_NOTE in page.text
+    assert _EVENTS_TAIL in page.text
+    assert from_[:10] in page.text
     clean = await client.get("/metrics?since_days=7")
     assert _EVENTS_NOTE not in clean.text
+
+
+async def test_events_history_boundary_is_exact_and_shadow_ignores_window(
+    db: aiosqlite.Connection,
+):
+    """#1621: 14 дней — внутри хранения, 15 — снаружи, без допуска; секция
+    steward_shadow.human_table от since_days не зависит."""
+    assert (
+        _eh(await practice_metrics(db, since_days=14))["windows_beyond_history"] == []
+    )
+    assert _eh(await practice_metrics(db, since_days=15))["windows_beyond_history"] == [
+        "current"
+    ]
+    short = await practice_metrics(db, since_days=7)
+    long_ = await practice_metrics(db, since_days=90)
+    assert (
+        short["steward_shadow"]["human_table"] == long_["steward_shadow"]["human_table"]
+    )

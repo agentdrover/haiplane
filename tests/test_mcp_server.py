@@ -5799,11 +5799,16 @@ async def test_practice_metrics_text_names_window_beyond_history(
             "history_from": history_from,
             "windows_beyond_history": ["current"],
             "events_sections": [],
-            "note": "окно по events длиннее хранения: данные не раньше " + history_from,
+            "note": "окно по events длиннее хранения: по политике хранения (14 дн.) "
+            f"данные раньше {history_from} не гарантированы; более старые "
+            "события могут оставаться до очистки",
         },
     }
     text = _mcp_text(await hub_practice_metrics(since_days=30))
-    assert f"окно по events длиннее хранения: данные не раньше {history_from}" in text
+    assert (
+        f"данные раньше {history_from} не гарантированы; более старые события "
+        "могут оставаться до очистки"
+    ) in text
     assert "current" in text
 
     mock_api_get.return_value = {

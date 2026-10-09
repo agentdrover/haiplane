@@ -73,26 +73,34 @@ MODEL_INDEPENDENT: tuple[str, ...] = (
 #: Разделы, у которых нет среза по проекту и окну: весь срок фазы.
 UNFILTERED: tuple[str, ...] = ("steward_shadow",)
 
-#: Разделы на таблице ``events`` и признак «своё окно» (#1621). Остальные
-#: (task_updates, machine_reviews, submissions) от хранения events не зависят.
+#: Разделы на таблице ``events`` (#1621): (имя, своё ли окно, пояснение окна).
+#: Остальные (task_updates, machine_reviews, submissions) от хранения events не
+#: зависят. Где окно своё, пометка об окне запроса к разделу применима иначе:
 #: ``human_touches`` режет окно по ``merged_at``, ``actual_verdicts`` — по своим
-#: ``window_days``: пометка об окне запроса к ним применима иначе.
-EVENTS_SECTIONS: tuple[tuple[str, bool], ...] = (
-    ("human_gates", False),
-    ("review_outcomes", False),
-    ("human_touches", True),
-    ("review_model_cascade", False),
-    ("review_economy.deep_cap", False),
-    ("review_economy.small_delta", False),
-    ("steward_shadow.human_table", False),
-    ("steward_shadow.actual_verdicts", True),
+#: ``window_days``, а ``steward_shadow`` целиком считает всю фазу тени и окно
+#: запроса игнорирует. ``review_economy.runs.by_kind`` классифицирует каскад по
+#: events, поэтому после очистки старый заказ переходит из cascade в first.
+EVENTS_SECTIONS: tuple[tuple[str, bool, str], ...] = (
+    ("human_gates", False, ""),
+    ("review_outcomes", False, ""),
+    ("human_touches", True, "окно по merged_at"),
+    ("review_model_cascade", False, ""),
+    ("review_economy.deep_cap", False, ""),
+    ("review_economy.small_delta", False, ""),
+    ("review_economy.runs.by_kind", False, ""),
+    ("steward_shadow.human_table", True, "окно — вся фаза тени"),
+    ("steward_shadow.false_approve", True, "окно — вся фаза тени"),
+    ("steward_shadow.false_approve_tasks", True, "окно — вся фаза тени"),
+    ("steward_shadow.act_refusals", True, "окно — вся фаза тени"),
+    ("steward_shadow.act_ready", True, "окно — вся фаза тени"),
+    ("steward_shadow.actual_verdicts", True, "окно — window_days секции"),
 )
 
-#: Запас на округление отметок до секунды: окно ровно в срок хранения
-#: считается внутри него.
-_RETENTION_SLACK = timedelta(minutes=1)
-
-EVENTS_BEYOND_NOTE = "окно по events длиннее хранения: данные не раньше "
+EVENTS_BEYOND_NOTE = (
+    "окно по events длиннее хранения: по политике хранения ({days} дн.) "
+    "данные раньше {since} не гарантированы; более старые события могут "
+    "оставаться до очистки"
+)
 
 
 def _fmt(moment: datetime) -> str:
@@ -283,12 +291,17 @@ def events_history(
 
     Граница — ``now − EVENTS_RETENTION_DAYS``, известный предел, а не
     ``MIN(events.created_at)``: пустые первые часы окна покрытие не меняют, а
-    окно без событий не выдумывает дату из данных.
+    окно без событий не выдумывает дату из данных. Момент «сейчас» один на
+    весь расчёт: у окна «последние N дней» он восстанавливается из самого
+    окна (``start + N``), поэтому сравнение точное, без допуска.
     """
-    history_from = datetime.now(UTC).replace(microsecond=0) - timedelta(
-        days=repo.EVENTS_RETENTION_DAYS
-    )
-    border = _fmt(history_from.replace(tzinfo=None) - _RETENTION_SLACK)
+    start = datetime.strptime(scope.start, _TS_FORMAT)
+    if scope.window_days is not None:
+        anchor = start + timedelta(days=scope.window_days)
+    else:
+        anchor = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+    history_from = anchor - timedelta(days=repo.EVENTS_RETENTION_DAYS)
+    border = _fmt(history_from)
     windows: list[tuple[str, Scope]] = [(_window_label(scope), scope)]
     if compare:
         windows.append(("previous", scope.previous()))
@@ -296,15 +309,20 @@ def events_history(
         pieces, _ = scope.bucket_plan(series_days)
         windows.extend((f"series:{piece.start[:10]}", piece) for piece in pieces)
     beyond = [label for label, item in windows if item.start < border]
-    iso = history_from.isoformat()
+    iso = history_from.replace(tzinfo=UTC).isoformat()
     return {
         "retention_days": repo.EVENTS_RETENTION_DAYS,
         "history_from": iso,
         "windows_beyond_history": beyond,
         "events_sections": [
-            {"name": name, "own_window": own} for name, own in EVENTS_SECTIONS
+            {"name": name, "own_window": own, "window": note}
+            for name, own, note in EVENTS_SECTIONS
         ],
-        "note": EVENTS_BEYOND_NOTE + iso if beyond else "",
+        "note": (
+            EVENTS_BEYOND_NOTE.format(days=repo.EVENTS_RETENTION_DAYS, since=iso)
+            if beyond
+            else ""
+        ),
     }
 
 
