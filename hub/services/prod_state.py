@@ -30,6 +30,7 @@ import time
 from typing import Any
 
 from hub import repository as repo
+from hub.services.release_alert import minutes_since
 from hub.services.delivery_state import (
     IN_PROD,
     NOT_IN_PROD,
@@ -186,9 +187,14 @@ async def prod_state(db: Any, *, limit: int = DEFAULT_WINDOW) -> dict[str, Any]:
     # #1420: an open release alert is the first thing the steward must read
     # here — «what runs in production» is a stale answer while the release
     # that would change it stands blocked.
+    from hub.services.egress_watch import egress_status
     from hub.services.release_alert import active_release_blocks
 
+    # #1645: can the server reach GitHub — stored state, no network here.
+    egress = await egress_status(db)
+    egress["minutes"] = minutes_since(egress["since"]) if egress["since"] else None
     return {
+        "egress": egress,
         "release_blocks": await active_release_blocks(db),
         "deployed": deployed,
         "in_prod": buckets[IN_PROD],
@@ -206,11 +212,13 @@ def format_prod_state(data: dict[str, Any]) -> str:
     One formatter as well as one builder: two renderings of the same facts
     drift, and then two readers disagree about production.
     """
+    from hub.services.egress_watch import egress_lines
     from hub.services.release_alert import release_block_lines
 
     deployed = data.get("deployed") or {}
     sha = str(deployed.get("sha") or "")
-    lines = release_block_lines(list(data.get("release_blocks") or []))
+    lines = egress_lines(data.get("egress"))
+    lines += release_block_lines(list(data.get("release_blocks") or []))
     if sha:
         where = f" ({deployed.get('ref')})" if deployed.get("ref") else ""
         when = f" от {deployed['at']}" if deployed.get("at") else ""

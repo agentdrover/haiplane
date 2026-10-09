@@ -2004,6 +2004,17 @@ async def _release_block_lines() -> list[str]:
     return release_block_lines(blocks)
 
 
+async def _egress_lines() -> list[str]:
+    """«GitHub недоступен с сервера N мин…» from the public /health, or none."""
+    from hub.services.egress_watch import egress_lines
+
+    try:
+        data = await _api_get("/health")
+    except Exception:  # noqa: BLE001 - context must render without it
+        return []
+    return egress_lines(data.get("egress") if isinstance(data, dict) else None)
+
+
 async def _general_hub_context(
     *, max_chars: int | None, mode: str, project: str = ""
 ) -> CallToolResult:
@@ -2045,6 +2056,10 @@ async def _general_hub_context(
 
     lines = ["## Hub Context (no task)"]
     lines.append(f"Instance: {instance['instance']} ({instance['base_url']})")
+    # #1645: the server cannot reach GitHub — the first thing after the
+    # instance, whoever the caller is: /health is public, so no identity is
+    # needed, and a failed read just leaves no line (never a false "fine").
+    lines.extend(await _egress_lines())
     # #1420: an open release alert comes before identity and tasks — a red
     # develop holds back everything merged, and this is what a session reads
     # first. Best effort: an old hub without the route just has no line, and
@@ -5768,6 +5783,14 @@ def _format_whoami(data: dict[str, Any]) -> str:
 
 
 def _format_health(data: dict[str, Any]) -> str:
+    from hub.services.egress_watch import egress_lines
+
+    egress = data.get("egress")
+    egress_part = (
+        [f"Egress: {egress.get('state', 'unknown')}", *egress_lines(egress)]
+        if isinstance(egress, dict)
+        else []
+    )
     return "\n".join(
         [
             f"Status: {data['status']}",
@@ -5777,6 +5800,7 @@ def _format_health(data: dict[str, Any]) -> str:
             f"Auth disabled: {data['auth_disabled']}",
             f"Env tokens configured: {data['env_tokens_configured']}",
             f"Vast enabled: {data['vast_enabled']}",
+            *egress_part,
         ]
     )
 

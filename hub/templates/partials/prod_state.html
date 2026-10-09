@@ -18,6 +18,14 @@
     {% if prod_state %}
     {# #1420: открытая авария релиза — первой строкой карточки: пока релиз
        заблокирован, «что раскатано» — ответ, который не сдвинется. #}
+    {# #1645: сервер не достаёт GitHub — самая первая строка карточки. #}
+    {% set egress_line = egress_text(prod_state.egress) %}
+    {% if egress_line %}
+    <div class="task-action-note">
+        <span class="badge badge--xs badge-failed">авария</span>
+        <strong>{{ egress_line }}</strong>
+    </div>
+    {% endif %}
     {% for b in prod_state.release_blocks %}
     <div class="task-action-note">
         <span class="badge badge--xs badge-failed">авария</span>

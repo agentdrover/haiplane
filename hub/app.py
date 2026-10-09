@@ -350,6 +350,9 @@ async def lifespan(app: FastAPI):
             yield
     finally:
         poll_task.cancel()
+        egress_task = getattr(app.state, "egress_task", None)
+        if egress_task is not None:
+            egress_task.cancel()
         # #1180: локальные прогоны ревью — чужие процессы, порождённые этим
         # хабом. Уйти, не сняв их, значит оставить агентский CLI сиротой:
         # он доработает, попробует сдать отчёт по прогону, за которым больше
@@ -477,9 +480,14 @@ async def healthz() -> str:
 
 
 @app.get("/health", response_model=HealthView)
-async def health() -> HealthView:
-    """Public service health snapshot without secrets or subprocess checks."""
-    return build_health()
+async def health(request: Request) -> HealthView:
+    """Public service health snapshot without secrets or subprocess checks.
+
+    ``egress`` is read from the stored state — no network at request time.
+    """
+    from hub.services.egress_watch import egress_status
+
+    return build_health(await egress_status(_db(request)))
 
 
 @app.get("/api/whoami", response_model=WhoamiView)

@@ -126,6 +126,16 @@ TEMPLATES.env.globals["default_pr_disposition"] = default_pr_disposition
 # dashboard card, prod_state and hub_my_context.
 TEMPLATES.env.globals["release_ci_text"] = _release_ci_text
 
+
+def _egress_text(egress: Any) -> str:
+    from hub.services.egress_watch import egress_lines
+
+    return next(iter(egress_lines(egress)), "")
+
+
+# #1645: the egress alert line, worded once for every surface.
+TEMPLATES.env.globals["egress_text"] = _egress_text
+
 router = APIRouter()
 
 log = logging.getLogger("hub.web")
