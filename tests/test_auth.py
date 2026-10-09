@@ -1270,3 +1270,193 @@ async def test_agent_bootstrap_role_matrix(client, db, monkeypatch):
         "steward": 403,
         "unknown": 404,
     }
+
+
+# ---------------------------------------------------------------------------
+# run-validation / run-ac-tests: исполнение на хосте только для людей (#1646)
+# ---------------------------------------------------------------------------
+
+_RUN_ROUTES = ("run-validation", "run-ac-tests")
+
+
+@pytest.fixture
+async def run_routes_hub(client, db, monkeypatch):
+    """Closed mode, REAL DB keys of every kind, a task with prior results.
+
+    Both default runners are replaced by recorders: the test never executes a
+    command or a test, and ``calls`` shows whether a route reached the runner.
+    """
+    from types import SimpleNamespace
+
+    from hub import repository as repo
+    from hub.models import AcceptanceCriterion
+    from hub.services import ac_tests, validation_run
+    from hub.services import admin as admin_svc
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {"steward-env": TokenIdentity("stew", "steward")},
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    monkeypatch.delenv("HAIPLANE_HUB_TOKEN", raising=False)
+    calls: list[str] = []
+
+    async def fake_tests(nodeids, repo_path):
+        calls.append("ac-tests")
+        return {n: True for n in nodeids}
+
+    async def fake_validation(commands, repo_path):
+        calls.append("validation")
+        return (0, "ran")
+
+    monkeypatch.setattr(ac_tests, "default_test_runner", fake_tests)
+    monkeypatch.setattr(validation_run, "default_validation_runner", fake_validation)
+
+    keys: dict[str, dict[str, str]] = {}
+    for label, kind, role in (
+        ("human", "human", "operator"),
+        ("agent", "agent", "agent"),
+        ("ci_runner", "service", "ci_runner"),
+        ("watcher", "agent", "watcher"),
+    ):
+        principal = await admin_svc.create_principal(
+            db, kind=kind, username=f"{label}-1646", role_slug=role
+        )
+        key = await admin_svc.create_api_key(db, principal["id"], name=label)
+        keys[label] = {"Authorization": f"Bearer {key['plaintext_key']}"}
+    keys["steward"] = {"Authorization": "Bearer steward-env"}
+
+    task_id = await repo.create_task(
+        db,
+        title="прежние результаты",
+        description="",
+        runtime="auto",
+        source="human",
+        assigned_agent="dev",
+        rationale="",
+        status="running",
+        auto_review=True,
+        task_type="task",
+        parent_id=None,
+        priority="medium",
+    )
+    await repo.bump_submission_generation(db, task_id)
+    await repo.replace_acceptance_criteria(
+        db,
+        task_id,
+        [
+            AcceptanceCriterion(
+                id="AC-1",
+                given="g",
+                when="w",
+                then="t",
+                verifiable_by="test",
+                test_ref="tests/test_x.py::test_a",
+            )
+        ],
+    )
+    await repo.update_task(
+        db,
+        task_id,
+        validation_commands=json.dumps(["echo old"]),
+        validation_generation=1,
+        validation_status="fail",
+        validation_log="old log",
+    )
+    await repo.upsert_ac_test_result(db, task_id, "AC-1", 1, "fail")
+    await db.commit()
+
+    ip = {"x-forwarded-for": "203.0.113.46"}
+    # Pairing is issued only for an open task, so it gets its own.
+    open_task = await client.post(
+        "/api/tasks", json={"title": "для сессии"}, headers=keys["human"]
+    )
+    assert open_task.status_code in (200, 201), open_task.text
+    issued = await client.post(
+        "/api/auth/chat-pair/start",
+        json={"kind": "implementer", "task_id": open_task.json()["id"]},
+        headers={**keys["human"], **ip},
+    )
+    assert issued.status_code == 200, issued.text
+    redeemed = await client.post(
+        "/api/auth/chat-pair/redeem", json={"code": issued.json()["code"]}, headers=ip
+    )
+    assert redeemed.status_code == 200, redeemed.text
+    keys["chat_pair"] = {"Authorization": f"Bearer {redeemed.json()['token']}"}
+    return SimpleNamespace(
+        client=client, db=db, task_id=task_id, keys=keys, calls=calls
+    )
+
+
+async def _run_routes_state(hub) -> str:
+    rows = await hub.db.execute_fetchall(
+        "SELECT validation_commands, validation_generation, validation_status, "
+        "validation_log FROM tasks WHERE id = ?",
+        (hub.task_id,),
+    )
+    results = await hub.db.execute_fetchall(
+        "SELECT ac_id, submission_generation, status, created_at "
+        "FROM ac_test_results WHERE task_id = ? ORDER BY ac_id",
+        (hub.task_id,),
+    )
+    return json.dumps([[tuple(r) for r in rows], [tuple(r) for r in results]])
+
+
+async def test_run_validation_and_ac_tests_refuse_machine_keys(run_routes_hub):
+    """AC-1 (#1646): agent и ci_runner с настоящими ключами получают 403."""
+    hub = run_routes_hub
+    before = await _run_routes_state(hub)
+    for who in ("agent", "ci_runner"):
+        for route in _RUN_ROUTES:
+            resp = await hub.client.post(
+                f"/api/tasks/{hub.task_id}/{route}", headers=hub.keys[who]
+            )
+            assert resp.status_code == 403, (who, route, resp.text)
+            assert "human_only_gate" in resp.text, (who, route, resp.text)
+            # Отказ раньше поиска задачи: чужой/несуществующий id тоже 403, не 404.
+            ghost = await hub.client.post(
+                f"/api/tasks/999999/{route}", headers=hub.keys[who]
+            )
+            assert ghost.status_code == 403, (who, route, ghost.text)
+    assert hub.calls == []
+    assert await _run_routes_state(hub) == before
+
+
+async def test_run_validation_and_ac_tests_keep_middleware_refusals(run_routes_hub):
+    """AC-2 (#1646): steward, watcher, chat-pair режутся своими кодами middleware."""
+    hub = run_routes_hub
+    before = await _run_routes_state(hub)
+    expected = {
+        "steward": "steward_gate_forbidden",
+        "watcher": "watcher_gate_forbidden",
+        "chat_pair": "chat_pair_gate_forbidden",
+    }
+    for who, reason in expected.items():
+        for route in _RUN_ROUTES:
+            resp = await hub.client.post(
+                f"/api/tasks/{hub.task_id}/{route}", headers=hub.keys[who]
+            )
+            assert resp.status_code == 403, (who, route, resp.text)
+            assert resp.json()["detail"]["reason"] == reason, (who, route, resp.text)
+    assert hub.calls == []
+    assert await _run_routes_state(hub) == before
+
+
+async def test_run_validation_and_ac_tests_still_work_for_humans(run_routes_hub):
+    """AC-3 (#1646): человеческий ключ — маршруты работают, runner вызван, результат записан."""
+    hub = run_routes_hub
+    tests = await hub.client.post(
+        f"/api/tasks/{hub.task_id}/run-ac-tests", headers=hub.keys["human"]
+    )
+    assert tests.status_code == 200, tests.text
+    assert [r["status"] for r in tests.json()["results"]] == ["pass"]
+    validation = await hub.client.post(
+        f"/api/tasks/{hub.task_id}/run-validation", headers=hub.keys["human"]
+    )
+    assert validation.status_code == 200, validation.text
+    assert validation.json()["status"] == "pass"
+    assert hub.calls == ["ac-tests", "validation"]
+    state = json.loads(await _run_routes_state(hub))
+    assert tuple(state[0][0][1:]) == (1, "pass", "ran")
+    assert state[1][0][2] == "pass"

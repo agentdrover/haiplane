@@ -2399,11 +2399,17 @@ async def api_review_verdict(
 
 
 @app.post("/api/tasks/{task_id}/run-ac-tests")
-async def api_run_ac_tests(task_id: int, request: Request):
+async def api_run_ac_tests(
+    task_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
     """Run the tests bound to a task's verifiable_by=test AC and record them (#507).
 
     Best-effort: an unavailable workspace records ``not_found`` rather than a
     false ``fail``. Results are stamped with the current submission_generation.
+    Human-only (#1646): it executes test code on the hub host, and the refusal
+    comes before the task lookup, the runner and any write.
     """
     db = _db(request)
     if not await repo.get_task(db, task_id):
@@ -2412,8 +2418,15 @@ async def api_run_ac_tests(task_id: int, request: Request):
 
 
 @app.post("/api/tasks/{task_id}/run-validation")
-async def api_run_validation(task_id: int, request: Request):
-    """Run a task's declared validation_commands and record the result (#509)."""
+async def api_run_validation(
+    task_id: int,
+    request: Request,
+    _identity=Depends(require_human_or_admin),
+):
+    """Run a task's declared validation_commands and record the result (#509).
+
+    Human-only (#1646): the commands run as a shell on the hub host.
+    """
     db = _db(request)
     if not await repo.get_task(db, task_id):
         raise HTTPException(404, "task not found")
