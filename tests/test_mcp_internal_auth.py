@@ -429,3 +429,125 @@ async def test_a_hidden_tool_call_from_an_agent_is_refused_with_the_human_path(
             headers={"Authorization": f"Bearer {agent}"},
         )
         assert resp.status_code == 403, (path, resp.status_code)
+
+
+# ---------------------------------------------------------------------------
+# #1639: a ci_runner DB key is an agent everywhere a human gate is asked
+# ---------------------------------------------------------------------------
+
+
+async def test_ci_runner_key_gets_the_agent_catalog_and_is_refused_human_tools(
+    catalog_hub,
+):
+    """AC-2 (#1639): REAL ci_runner DB principal, closed mode, every other door."""
+    import json
+
+    from hub.services import admin as admin_svc
+    from tests.test_mcp_server import _call_tool, _hub_process, _rpc_result
+
+    hub = catalog_hub
+    db = hub.db
+    human = await admin_svc.create_principal(
+        db, kind="human", username="alice-1639", role_slug="operator"
+    )
+    human_key = (await admin_svc.create_api_key(db, human["id"], name="h"))[
+        "plaintext_key"
+    ]
+    ci = await admin_svc.create_principal(
+        db, kind="service", username="ci-1639", role_slug="ci_runner"
+    )
+    ci_key = (await admin_svc.create_api_key(db, ci["id"], name="ci"))["plaintext_key"]
+    await db.commit()
+    h_ci = {"Authorization": f"Bearer {ci_key}"}
+    h_human = {"Authorization": f"Bearer {human_key}"}
+    client = hub.client
+
+    # REST doors that ask "is this a human?" outside require_human_or_admin.
+    # 1. _human_door: chat-pair code issuing.
+    r = await client.post("/api/auth/chat-pair/start", headers=h_ci)
+    assert r.status_code == 403 and "human_only_gate" in r.text, r.text
+    # 2. _reject_agent_authored_source: a task labelled source=human.
+    r = await client.post(
+        "/api/tasks", json={"title": "from ci", "source": "human"}, headers=h_ci
+    )
+    assert r.status_code == 403, r.text
+    assert "agent_create_forbidden" in r.text, r.text
+    # 3. an active project is a human privilege: the agent's one is pending.
+    r = await client.post(
+        "/api/projects", json={"slug": "ci-proj", "name": "CI"}, headers=h_ci
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "pending", r.json()
+    # 4. skill publication: a draft, never an active version.
+    r = await client.post(
+        "/api/skills", json={"name": "ci-skill", "content": "x"}, headers=h_ci
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "draft", r.json()
+    # 5. somebody else's thread.
+    hub_session = await client.post(
+        "/api/sessions/register",
+        json={"session_id": "s-human", "model": ""},
+        headers=h_human,
+    )
+    assert hub_session.status_code == 200, hub_session.text
+    peer = await client.post(
+        "/api/sessions/register",
+        json={"session_id": "s-peer", "model": ""},
+        headers={"Authorization": f"Bearer {_TOKENS_1624['agent'][0]}"},
+    )
+    assert peer.status_code == 200, peer.text
+    sent = await client.post(
+        "/api/messages",
+        json={
+            "to_kind": "session",
+            "to_ref": "s-peer",
+            "body": "private",
+            "session_id": "s-human",
+        },
+        headers=h_human,
+    )
+    assert sent.status_code == 200, sent.text
+    thread_id = sent.json()["message"]["thread_id"]
+    peek = await client.get(f"/api/messages?thread_id={thread_id}", headers=h_ci)
+    assert peek.status_code == 403 and "foreign_thread" in peek.text, peek.text
+    assert "private" not in peek.text
+    # 6. a web route behind _require_human_web.
+    page = await client.get("/chat-pair", headers=h_ci)
+    assert page.status_code == 403, page.status_code
+    # Identity as the hub resolves it.
+    who = await client.get("/api/whoami", headers=h_ci)
+    assert who.json()["role"] == "agent", who.json()
+
+    # MCP: the agent catalog, and a refused human-only call that runs nothing.
+    created = await client.post(
+        "/api/tasks", json={"title": "mcp probe"}, headers=h_human
+    )
+    tid = created.json()["id"]
+    before = (
+        await db.execute_fetchall("SELECT status FROM tasks WHERE id = ?", (tid,))
+    )[0]["status"]
+    async with _hub_process():
+        names = await _tools_list(client, ci_key)
+        assert names and not (names & (set(_HUMAN_ONLY) | set(_REMOVED))), sorted(
+            names & set(_HUMAN_ONLY)
+        )
+        assert "hub_pair_start" in names
+        assert set(_HUMAN_ONLY) <= await _tools_list(client, human_key)
+        hub.rest_calls.clear()
+        result = _rpc_result(
+            await _call_tool(
+                client,
+                ci_key,
+                "hub_decide_task",
+                {"task_id": tid, "decision": "accept"},
+            )
+        )
+    assert result["isError"] is True, result
+    body = json.loads("".join(p.get("text", "") for p in result["content"]))
+    assert body["reason"] == "human_only_gate", body
+    assert not [c for c in hub.rest_calls if c.startswith("POST /api/tasks")]
+    after = (
+        await db.execute_fetchall("SELECT status FROM tasks WHERE id = ?", (tid,))
+    )[0]["status"]
+    assert after == before

@@ -4691,3 +4691,217 @@ async def test_pair_start_returns_working_rules_layers(client, db, tmp_path):
     assert repo_layer["content"] == rules_text
     # Слои не склеены: текст репозитория не попал в доверенные объекты.
     assert "Правило 1" not in skill["content"] + policy["text"] + block["preamble"]
+
+
+# --- #1631: стартовый пакет проекта GET /api/projects/{slug}/agent-bootstrap ---
+
+
+async def _bootstrap_project(
+    db, slug: str, workspace: str = "", *, policy: dict | None = None
+) -> None:
+    import json as _json
+
+    pid = await repo.create_project(db, slug=slug, name=f"Проект {slug}")
+    fields: dict = {"workspace_path": workspace, "default_branch": "develop"}
+    if policy is not None:
+        fields["gate_policy"] = _json.dumps(policy)
+    await repo.update_project(db, pid, **fields)
+    await db.commit()
+
+
+def _parse_call(line: str) -> tuple[str, list[str]]:
+    import re
+
+    match = re.match(r"(hub_\w+)(?:\((.*?)\))?( — .*)?$", line)
+    assert match, line
+    return match.group(1), re.findall(r"(\w+)=", match.group(2) or "")
+
+
+async def _skill(db, name: str, *, active: bool) -> None:
+    _, version = await repo.create_skill_version(db, name=name, content=f"body {name}")
+    if active:
+        await repo.activate_skill_version(db, name, version, activated_by="test")
+    await db.commit()
+
+
+async def test_agent_bootstrap_has_all_sections(client, db, tmp_path):
+    """AC-1: шесть разделов, URL, только active-навыки, порядок вызовов, без пути."""
+    from hub.hub_instance import hub_base_url
+    from hub.integrations.registry import plugins
+    from tests.working_rules_support import RULES_PATH, ReadingGitOps, make_rules_repo
+
+    ws = make_rules_repo(tmp_path / "secret-ws-dir", {RULES_PATH: "правила\n"})
+    plugins.git_ops = ReadingGitOps()
+    await _bootstrap_project(db, "boot-all", ws, policy={"ci_before_submit": "require"})
+    await _skill(db, "boot-skill-a", active=True)
+    await _skill(db, "boot-skill-b", active=True)
+    await _skill(db, "boot-skill-draft", active=False)
+
+    resp = await client.get("/api/projects/boot-all/agent-bootstrap")
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    text = data["text"]
+    for n in range(1, 7):
+        assert f"## {n}. " in text
+    assert data["mcp"]["url"] == f"{hub_base_url()}/mcp"
+    assert data["mcp"]["transport"] == "streamable-http"
+    assert "Bearer <ТОКЕН АГЕНТА>" in text
+    names = {s["name"] for s in data["skills"]}
+    assert {"boot-skill-a", "boot-skill-b"} <= names
+    assert "boot-skill-draft" not in names
+    assert "boot-skill-draft" not in text and "boot-skill-a v1" in text
+    calls = data["first_calls"]
+    parsed = [_parse_call(c) for c in calls]
+    assert [n for n, _ in parsed] == [
+        "hub_whoami",
+        "hub_my_context",
+        "hub_session_register",
+        "hub_list_tasks",
+        "hub_my_context",
+        "hub_claim_task",
+        "hub_pair_start",
+    ]
+    assert "project" in parsed[1][1] and "mode" in parsed[1][1]
+    assert "task_id" in parsed[4][1] and "project" not in parsed[4][1]
+    assert "project" in parsed[3][1]
+    for key in ("task_id", "agent", "session_id"):
+        assert key in parsed[5][1]
+    for key in ("task_id", "assigned_agent", "session_id", "git_mode"):
+        assert key in parsed[6][1]
+    # Аргументы шагов сверены с реальными сигнатурами MCP-инструментов.
+    from hub import mcp_server
+
+    schemas = {t.name: t.inputSchema for t in await mcp_server.mcp.list_tools()}
+    for name, args in parsed:
+        schema = schemas[name]
+        assert set(schema.get("required", [])) <= set(args), (name, args)
+        assert set(args) <= set(schema["properties"]), (name, args)
+    submit = " ".join(data["submit_order"])
+    assert "одна сдача на коммит" in submit and "hub_task_status" in submit
+    assert "Policy of project boot-all" in text
+    assert RULES_PATH in text and ".hub/REVIEW_RULES.md" in text
+    assert "workspace" not in resp.text and "secret-ws-dir" not in resp.text
+
+
+async def test_agent_bootstrap_never_contains_credentials(
+    client, db, monkeypatch, capsys
+):
+    """AC-2: canary принципала, env-токена и сессии не видны ни в JSON, ни в text."""
+    import json as _json
+    import sys
+
+    from hub import brand, cli, config
+    from hub.config import TokenIdentity
+    from hub.services import admin as admin_svc
+
+    env_canary = "canary-env-token-0001"  # pragma: allowlist secret
+    cookie_canary = "canary-session-cookie-0003"  # pragma: allowlist secret
+    principal = await admin_svc.create_principal(
+        db, kind="agent", username="canary-bot", role_slug="agent"
+    )
+    key = await admin_svc.create_api_key(db, principal["id"], name="canary")
+    principal_canary = key["plaintext_key"]
+    monkeypatch.setattr(
+        config, "HUB_TOKENS", {env_canary: TokenIdentity("env-bot", "agent")}
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    await _bootstrap_project(db, "boot-canary")
+    canaries = (env_canary, principal_canary, cookie_canary)
+
+    bodies = []
+    for headers in (
+        {"Authorization": f"Bearer {principal_canary}"},
+        {
+            "Authorization": f"Bearer {env_canary}",
+            "Cookie": f"hub_session={cookie_canary}",
+        },
+    ):
+        resp = await client.get(
+            "/api/projects/boot-canary/agent-bootstrap", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        bodies.append(resp.text)
+    for body in bodies:
+        for canary in canaries:
+            assert canary not in body
+    data = _json.loads(bodies[0])
+    assert "Bearer <ТОКЕН АГЕНТА>" in data["text"]
+    assert set(data) == {
+        "project_slug", "project_name", "repo", "base_branch", "mcp", "first_calls",
+        "skills", "policy_brief", "rules_files", "ci_before_submit", "submit_order",
+        "human_only", "text",
+    }  # fmt: skip
+
+    agent_auth = {"Authorization": f"Bearer {env_canary}"}
+    # Credential в URL хаба не публикуется: userinfo, query и fragment.
+    url_canary = "canary-url-secret-0004"  # pragma: allowlist secret
+    for bad in (
+        f"https://user:{url_canary}@hub.example",
+        f"https://hub.example/?token={url_canary}",
+        f"https://hub.example/#{url_canary}",
+    ):
+        monkeypatch.setenv(brand.ENV_PREFIX + "HUB_URL", bad)
+        resp = await client.get(
+            "/api/projects/boot-canary/agent-bootstrap", headers=agent_auth
+        )
+        assert resp.status_code == 200, resp.text
+        assert url_canary not in resp.text and "hub.example" not in resp.text
+        assert resp.json()["mcp"]["url"] == ""
+        assert "URL хаба не опубликован" in resp.json()["text"]
+    monkeypatch.delenv(brand.ENV_PREFIX + "HUB_URL")
+
+    # Свободный текст политики (команда ci_runner, путь) не публикуется.
+    await _bootstrap_project(
+        db,
+        "boot-policy-path",
+        policy={
+            "ci_runner": "uv run /opt/hub-private/check.py",
+            "freeze": {"note": "/opt/hub-private/freeze-note"},
+        },
+    )
+    resp = await client.get(
+        "/api/projects/boot-policy-path/agent-bootstrap", headers=agent_auth
+    )
+    assert resp.status_code == 200, resp.text
+    assert "/opt/hub-private" not in resp.text and "check.py" not in resp.text
+    assert "ci_runner = настроен" in resp.json()["text"]
+
+    monkeypatch.setattr(cli, "HUB_TOKEN", env_canary)
+    monkeypatch.setattr(cli, "_api", lambda *a, **k: data)
+    monkeypatch.setattr(
+        sys, "argv", ["oc-hub", "projects", "bootstrap", "boot-canary", "--json"]
+    )
+    rc = cli.main()
+    printed = capsys.readouterr().out
+    assert rc == 0 and _json.loads(printed) == data
+    assert not any(c in printed for c in canaries)
+
+
+async def test_agent_bootstrap_follows_project_policy(client, db, tmp_path):
+    """AC-3: политика и state файлов у каждого проекта свои; строка CI — только у require."""
+    from hub.integrations.registry import plugins
+    from tests.working_rules_support import RULES_PATH, ReadingGitOps, make_rules_repo
+
+    plugins.git_ops = ReadingGitOps()
+    with_rules = make_rules_repo(tmp_path / "a", {RULES_PATH: "x\n"})
+    without = make_rules_repo(tmp_path / "b", {})
+    await _bootstrap_project(
+        db, "boot-req", with_rules, policy={"ci_before_submit": "require"}
+    )
+    await _bootstrap_project(
+        db, "boot-off", without, policy={"ci_before_submit": "off"}
+    )
+    ci_line = "push → зелёный CI на sha → сдача"
+
+    req = (await client.get("/api/projects/boot-req/agent-bootstrap")).json()
+    off = (await client.get("/api/projects/boot-off/agent-bootstrap")).json()
+
+    assert ci_line in req["text"] and ci_line not in off["text"]
+    assert req["ci_before_submit"] == "require" and off["ci_before_submit"] == "off"
+    assert "ci_before_submit = require" in req["text"]
+    assert "ci_before_submit = require" not in off["text"]
+    states = {f["path"]: f["state"] for f in req["rules_files"]}
+    assert states == {RULES_PATH: "present", ".hub/REVIEW_RULES.md": "missing"}
+    states_off = {f["path"]: f["state"] for f in off["rules_files"]}
+    assert states_off[RULES_PATH] == "missing"

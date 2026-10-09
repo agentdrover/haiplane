@@ -153,6 +153,25 @@ curl -sS \
 Если шаги 3.3–3.4 проходят — MCP на этом инстансе **рабочий** (AC-1 для staging:
 повторите с URL staging и выданным оператором токеном).
 
+### Стартовый пакет проекта (#1631)
+
+Первое сообщение агенту нового проекта хаб собирает сам, без credentials:
+
+```bash
+oc-hub projects bootstrap <slug>          # текст, как его отдал сервер
+oc-hub projects bootstrap <slug> --json   # типизированная модель + text
+```
+
+REST: `GET /api/projects/{slug}/agent-bootstrap`. В пакете: конфиг MCP с
+плейсхолдером `<ТОКЕН АГЕНТА>`, последовательность первых вызовов (с
+`hub_session_register` до claim), активные навыки, политика проекта, состояние
+`.hub/AGENT_RULES.md` и `.hub/REVIEW_RULES.md` на базовой ветке, порядок сдачи
+(строка «push → зелёный CI на sha → сдача» — при `ci_before_submit` require или
+warn) и human-only действия. Токен подставляет оператор локально. Доступ: обычный
+агент и watcher — 200; chat-pair и steward — 403; без токена в закрытом режиме
+— 401. MCP-инструмента нет.
+
+
 ---
 
 ## 4. Подключение Cursor

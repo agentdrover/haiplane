@@ -71,6 +71,42 @@ def _one_line(text: str, limit: int = 200) -> str:
     return _MARK_TOKEN.sub("(escaped)", " ".join(text.split()))[:limit]
 
 
+def _unreadable_file(path: str, ref: str = "", reason: str = "") -> dict[str, Any]:
+    return {
+        "state": "unreadable",
+        "path": path,
+        "ref": ref,
+        "sha": "",
+        "content": "",
+        "truncated": False,
+        "size": 0,
+        "chars": 0,
+        "reason": reason,
+    }
+
+
+async def _read_in_context(
+    ctx: dict[str, Any], path: str, limit_chars: int, label: str
+) -> dict[str, Any]:
+    """Чтение файла базовой ветки по git-контексту проекта; не бросает."""
+    unreadable = _unreadable_file(path)
+    try:
+        workspace = (ctx.get("repo") or "").strip()
+        base = (ctx.get("base_branch") or config.PAIR_BASE_BRANCH).strip()
+        unreadable["ref"] = base
+        if not workspace:
+            unreadable["reason"] = "у проекта нет workspace_path"
+            return unreadable
+        result = await plugins.git_ops.read_file_at_ref(
+            workspace, base, path, limit_chars=limit_chars
+        )
+        return dict(result)
+    except Exception as exc:  # noqa: BLE001 - ошибка чтения это данные, не отказ
+        log.warning("could not read %s for %s: %s", path, label, exc)
+        unreadable["reason"] = f"чтение не удалось: {type(exc).__name__}"
+        return unreadable
+
+
 async def read_base_branch_file(
     db: aiosqlite.Connection,
     task_id: int,
@@ -85,35 +121,31 @@ async def read_base_branch_file(
     unreadable с причиной, а не исключение. ``collect_review_rules`` остаётся на
     ``file_at_ref``: рецензенту различие не нужно.
     """
-    unreadable: dict[str, Any] = {
-        "state": "unreadable",
-        "path": path,
-        "ref": "",
-        "sha": "",
-        "content": "",
-        "truncated": False,
-        "size": 0,
-        "chars": 0,
-        "reason": "",
-    }
     try:
         from hub.services.orchestration import project_git_context
 
         ctx = await project_git_context(db, task_id)
-        workspace = (ctx.get("repo") or "").strip()
-        base = (ctx.get("base_branch") or config.PAIR_BASE_BRANCH).strip()
-        unreadable["ref"] = base
-        if not workspace:
-            unreadable["reason"] = "у проекта нет workspace_path"
-            return unreadable
-        result = await plugins.git_ops.read_file_at_ref(
-            workspace, base, path, limit_chars=limit_chars
-        )
-        return dict(result)
-    except Exception as exc:  # noqa: BLE001 - ошибка чтения это данные, не отказ
+    except Exception as exc:  # noqa: BLE001
         log.warning("could not read %s for task #%s: %s", path, task_id, exc)
-        unreadable["reason"] = f"чтение не удалось: {type(exc).__name__}"
-        return unreadable
+        return _unreadable_file(path, reason=f"чтение не удалось: {type(exc).__name__}")
+    return await _read_in_context(ctx, path, limit_chars, f"task #{task_id}")
+
+
+async def read_project_base_file(
+    project: Any, path: str, *, limit_chars: int = 200
+) -> dict[str, Any]:
+    """Тот же reader для проекта без задачи (#1631): стартовый пакет.
+
+    Контекст строится из тех же полей проекта, что ``project_git_context``;
+    возвращается весь словарь reader'а, но вызывающий стартового пакета берёт
+    из него только ``state`` — ``reason`` может нести путь сервера.
+    """
+    ctx: dict[str, Any] = {}
+    if (project["workspace_path"] or "").strip():
+        ctx["repo"] = project["workspace_path"].strip()
+    if (project["default_branch"] or "").strip():
+        ctx["base_branch"] = project["default_branch"].strip()
+    return await _read_in_context(ctx, path, limit_chars, f"project {project['slug']}")
 
 
 async def read_agent_rules(db: aiosqlite.Connection, task_id: int) -> dict[str, Any]:
