@@ -25,7 +25,6 @@ from hub import config
 from hub import repository as repo
 from hub import services
 from hub.models import AcceptanceCriterion, TaskCreate, TaskRefine
-from tests.branch_code_support import spawn_spy  # noqa: F401 - pytest fixture
 
 BAD = "tests/a.py::test_x, tests/a.py::test_y"
 GOOD = "tests/test_ac_locator_gate.py::test_add_rejects_an_unresolvable_locator"
@@ -296,18 +295,15 @@ async def _draft(db: aiosqlite.Connection, task_type: str, locator: str) -> int:
     return tv.id
 
 
-def _collector(found: set[str] | None):
-    async def collect(nodeids, repo_path):
-        return found
-
-    return collect
-
-
-async def _approve_with(db, monkeypatch, task_id: int, found: set[str] | None):
+async def _approve_with(db, monkeypatch, task_id: int, source: str | None):
+    """Approve with every locator file reading as ``source`` (None = unreadable)."""
     from hub.models import TaskApprove
-    from hub.services import ac_tests
+    from hub.services.test_existence import LocatorEvidence
 
-    monkeypatch.setattr(ac_tests, "default_locator_collector", _collector(found))
+    async def _evidence(git, repo_path, files, **_kw):
+        return LocatorEvidence(sources=dict.fromkeys(files, source), ref_label="fx")
+
+    monkeypatch.setattr("hub.services.test_existence.read_locator_evidence", _evidence)
     return await services.approve_task(db, task_id, TaskApprove(force=True))
 
 
@@ -327,7 +323,7 @@ async def test_epic_approval_warns_on_dead_locator(
     dead = "tests/test_api.py::test_worktree_path_only_when_tree_exists"
     task_id = await _draft(db, "epic", dead)
 
-    view = await _approve_with(db, monkeypatch, task_id, found=set())
+    view = await _approve_with(db, monkeypatch, task_id, source="")
 
     assert view.status.value == "open", "the warning must not block the approval"
     alerts = _alerts(await repo.get_task_updates(db, task_id))
@@ -344,7 +340,12 @@ async def test_live_locator_is_silent_on_upper_levels(
     live = "tests/test_ac_locator_gate.py::test_epic_approval_warns_on_dead_locator"
     task_id = await _draft(db, "feature", live)
 
-    await _approve_with(db, monkeypatch, task_id, found={live})
+    await _approve_with(
+        db,
+        monkeypatch,
+        task_id,
+        source="def test_epic_approval_warns_on_dead_locator():\n    pass\n",
+    )
 
     assert not _alerts(await repo.get_task_updates(db, task_id))
 
@@ -356,7 +357,7 @@ async def test_unreadable_collection_says_nothing(
     # clean". A collector that could not run produces no verdict at all.
     task_id = await _draft(db, "epic", "tests/test_api.py::test_gone")
 
-    await _approve_with(db, monkeypatch, task_id, found=None)
+    await _approve_with(db, monkeypatch, task_id, source=None)
 
     assert not _alerts(await repo.get_task_updates(db, task_id))
 
@@ -400,9 +401,7 @@ async def test_epic_approve_flags_dead_locators_without_running_pytest(
 
     marker = tmp_path / "outside" / "marker"
     marker.parent.mkdir()
-    workspace, _ = make_clone(
-        tmp_path, marker, test_source=_TWO_KINDS, on_branch=False
-    )
+    workspace, _ = make_clone(tmp_path, marker, test_source=_TWO_KINDS, on_branch=False)
     plugins.git_ops = GitOpsIntegration()
     project_id = await repo.create_project(
         db,

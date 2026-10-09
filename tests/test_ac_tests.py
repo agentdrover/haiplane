@@ -2,8 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+import stat
+import time
+from pathlib import Path
+
+import pytest
+
 from hub import repository as repo
 from hub.models import AcceptanceCriterion
+from hub.services.ac_tests import default_test_runner as real_default_test_runner
+from tests.test_auth import run_routes_hub  # noqa: F401 - pytest fixture
 from hub.services.ac_tests import (
     FAIL,
     NOT_FOUND,
@@ -101,13 +111,22 @@ async def test_run_ac_tests_not_found_when_runner_unavailable(db):
 # ---- default_test_runner output parsing (#507 machine-review HIGH) ----
 
 
+class _Stream:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    async def read(self, n: int = -1) -> bytes:
+        chunk, self._data = self._data[:n], self._data[n:]
+        return chunk
+
+
 class _FakeProc:
     def __init__(self, out: str, rc: int = 0):
-        self._out = out.encode()
+        self.stdout = _Stream(out.encode())
         self.returncode = rc
 
-    async def communicate(self):
-        return self._out, b""
+    async def wait(self):
+        return self.returncode
 
 
 async def _run_with_output(monkeypatch, nodeids, output):
@@ -314,3 +333,100 @@ async def test_unrunnable_locator_gets_no_recorded_result(db):
     # And the runner was never called with it — not called and told "missing"
     # are different facts, and only one of them is true here.
     assert handed_to_runner == []
+
+
+# ---- #1650: a manual AC run gets a minimal environment and dies as a group ----
+
+_FAKE_UV = """#!/bin/sh
+env > "$PWD/child-env.txt"
+sleep 300 &
+echo $! > "$PWD/child.pid"
+wait
+"""
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.usefixtures("run_routes_hub")
+async def test_manual_ac_run_has_a_minimal_env_and_kills_its_group(
+    tmp_path: Path, monkeypatch, request
+):
+    """#1650 AC-4: no hub secrets reach the child, and the timeout kills the group.
+
+    `uv` here is a stand-in script that records its environment and leaves a
+    `sleep` running — the shape of a hung test with a child. A secret is named
+    with and without TOKEN in it: the old filter let the second one through.
+    """
+    from hub.services import ac_tests
+
+    hub = request.getfixturevalue("run_routes_hub")
+    # Machines still get 403 (#1646): the route is a human's, so the run below
+    # is only ever started by one.
+    denied = await hub.client.post(
+        f"/api/tasks/{hub.task_id}/run-ac-tests", headers=hub.keys["agent"]
+    )
+    assert denied.status_code == 403, denied.text
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "uv"
+    fake.write_text(_FAKE_UV)
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    work = tmp_path / "work"
+    work.mkdir()
+    real_home = os.environ.get("HOME", "")
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setenv("SYNTH_HUB_SIGNING_SALT", "synthetic-plain-secret")
+    monkeypatch.setenv("SYNTH_API_TOKEN", "synthetic-token-secret")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/synthetic/agent.sock")
+    monkeypatch.setattr(ac_tests, "_RUN_TIMEOUT", 1)
+
+    result = await real_default_test_runner(["tests/t.py::test_a"], str(work))
+
+    assert result is None, "a hung run is 'could not run', not a verdict"
+    child_env = (work / "child-env.txt").read_text()
+    for leaked in (
+        "SYNTH_HUB_SIGNING_SALT",
+        "SYNTH_API_TOKEN",
+        "synthetic-plain-secret",
+        "synthetic-token-secret",
+        "SSH_AUTH_SOCK",
+        "/synthetic/agent.sock",
+    ):
+        assert leaked not in child_env, leaked
+    home_line = [ln for ln in child_env.splitlines() if ln.startswith("HOME=")]
+    assert home_line and home_line[0] != f"HOME={real_home}"
+    assert not Path(home_line[0][5:]).exists(), "the temporary HOME is removed"
+    pid = int((work / "child.pid").read_text())
+    deadline = time.monotonic() + 5
+    while _alive(pid) and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    assert not _alive(pid), "the process group survived the timeout"
+
+
+async def test_manual_ac_run_output_is_bounded(monkeypatch, tmp_path: Path):
+    from hub.services import validation_run
+
+    monkeypatch.setattr(validation_run, "_MAX_OUTPUT", 1000)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "uv"
+    fake.write_text(
+        "#!/bin/sh\nyes 'tests/t.py::test_a PASSED' | head -c 5000000\n"
+        "echo 'tests/t.py::test_b PASSED'\n"
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+
+    res = await real_default_test_runner(
+        ["tests/t.py::test_a", "tests/t.py::test_b"], str(tmp_path)
+    )
+
+    # test_b is printed after the cap: read and dropped, not kept in memory.
+    assert res == {"tests/t.py::test_a": True}

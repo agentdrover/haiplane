@@ -11,12 +11,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
+import tempfile
 from typing import Any, Awaitable, Callable
 
+from hub import config
 from hub import repository as repo
+from hub.integrations.registry import plugins
+from hub.process_kill import kill_process_group
+from hub.services import test_existence
 from hub.services.orchestration import project_git_context
 from hub.services.refinement import row_to_ac
 from hub.services.test_locator import PYTEST, parse_test_locator, runner_of
+from hub.services.validation_run import collect_output
 
 log = logging.getLogger("hub")
 
@@ -26,21 +34,48 @@ FAIL = "fail"
 NOT_FOUND = "not_found"
 
 _RUN_TIMEOUT = 180
-# Collection is cheap next to a run, but it still imports the test modules, so
-# it gets its own, shorter budget: this one sits on the approval path.
-_COLLECT_TIMEOUT = 60
+
+# What a manually started AC run may inherit from the hub (#1650). A list of
+# what is allowed, not of what is forbidden: a name filter ("TOKEN", "KEY")
+# lets through every secret that is called something else. HOME is not here on
+# purpose — it is a fresh temporary directory per run. This is about the
+# environment only; the run is still the code of the branch, not a sandbox.
+_RUN_ENV_ALLOW = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "UV_CACHE_DIR",
+    "UV_PYTHON_INSTALL_DIR",
+)
 
 # runner(nodeids, repo_path) -> {nodeid: passed} for the tests it managed to
 # run, or None when it could not run at all.
 TestRunner = Callable[[list[str], str | None], Awaitable[dict[str, bool] | None]]
 
 
+def _run_env(home: str) -> dict[str, str]:
+    """The minimal environment of a manual AC run: the allowlist and a clean HOME."""
+    env = {k: os.environ[k] for k in _RUN_ENV_ALLOW if k in os.environ}
+    env["HOME"] = home
+    return env
+
+
 async def default_test_runner(
     nodeids: list[str], repo_path: str | None
 ) -> dict[str, bool] | None:
-    """Run ``nodeids`` with pytest in ``repo_path`` (best-effort, #507)."""
+    """Run ``nodeids`` with pytest in ``repo_path`` (best-effort, #507).
+
+    The ONE place the hub starts pytest, and only for a human's explicit
+    run-ac-tests (#1646). The child gets the allowlisted environment, its own
+    session — the timeout and a cancelled request kill the whole group, since
+    ``uv`` is only the launcher — and a bounded output buffer (#1650).
+    """
     if not nodeids or not repo_path:
         return None
+    home = tempfile.mkdtemp(prefix="hub-ac-run-")
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "uv",
@@ -52,13 +87,24 @@ async def default_test_runner(
             "-p",
             "no:cacheprovider",
             cwd=repo_path,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=_run_env(home),
+            start_new_session=True,
         )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_RUN_TIMEOUT)
+        out, _dropped = await asyncio.wait_for(
+            collect_output(proc), timeout=_RUN_TIMEOUT
+        )
     except (OSError, TimeoutError, asyncio.TimeoutError):
+        await kill_process_group(proc)
         log.warning("AC test run failed in %s", repo_path)
         return None
+    except asyncio.CancelledError:
+        await kill_process_group(proc)
+        raise
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
     results: dict[str, bool] = {}
     wanted = set(nodeids)
     for raw in out.decode(errors="replace").splitlines():
@@ -118,92 +164,65 @@ async def runnable_ac_nodeids(db: Any, task_id: int) -> dict[str, str]:
     }
 
 
-# collector(nodeids, repo_path) -> the subset pytest could COLLECT, or None
-# when the collection itself could not run. Separate from TestRunner on
-# purpose: this asks whether a test exists, not whether it passes.
-LocatorCollector = Callable[[list[str], str | None], Awaitable[set[str] | None]]
-
-
-async def default_locator_collector(
-    nodeids: list[str], repo_path: str | None
-) -> set[str] | None:
-    """Which of ``nodeids`` pytest can collect in ``repo_path`` (#1032).
-
-    Collection, not execution: the question is whether the test a criterion
-    names exists at all. ``--collect-only -q`` prints one line per collected
-    nodeid and costs a fraction of a run, which is what makes this affordable
-    on the approval path.
-
-    None means "could not look" — no workspace, pytest missing, a timeout.
-    Every caller has to turn that into a stated answer of its own, never into
-    "all locators are fine".
-    """
-    if not nodeids or not repo_path:
-        return None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "uv",
-            "run",
-            "pytest",
-            *nodeids,
-            "--collect-only",
-            "-q",
-            "--no-header",
-            "-p",
-            "no:cacheprovider",
-            cwd=repo_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_COLLECT_TIMEOUT)
-    except (OSError, TimeoutError, asyncio.TimeoutError):
-        log.warning("AC locator collection failed in %s", repo_path)
-        return None
-    wanted = set(nodeids)
-    found: set[str] = set()
-    for raw in out.decode(errors="replace").splitlines():
-        reported = raw.strip()
-        if not reported:
-            continue
-        # Same exact-match rule as the runner: a parametrized case collects as
-        # "…::test_a[case]" and belongs to "…::test_a", but "…::test_a" must
-        # never absorb a different test whose name merely starts the same way.
-        key = reported if reported in wanted else reported.split("[", 1)[0]
-        if key in wanted:
-            found.add(key)
-    return found
-
-
 async def unresolved_locators(
     db: Any,
     task_id: int,
-    collector: LocatorCollector | None = None,
 ) -> tuple[dict[str, str], bool]:
-    """AC whose named test does not exist, and whether the check ran (#1032).
+    """AC whose named test is PROVEN absent, and whether the check ran (#1032).
 
-    Returns ``({ac_id: nodeid}, checked)``. ``checked=False`` means the
-    collection could not run — the empty mapping then says nothing about the
-    locators, which is why the flag travels with it instead of being inferred
-    from an empty result (#725).
+    Returns ``({ac_id: nodeid}, checked)``. The files are read with git at one
+    ref (submission_sha → task branch → project base) and parsed, never
+    imported (#1650): approving an epic must not run code from the clone.
+    Only ``missing`` is a dead locator. ``unknown`` and ``unparseable`` mean
+    the hub could not tell, and ``checked=False`` says the whole look gave no
+    answer at all — the empty mapping then says nothing about the locators,
+    which is why the flag travels with it instead of being inferred from an
+    empty result (#725).
 
     Only well-formed locators are asked about: a malformed ``test_ref`` is a
     different defect, already refused by the refine gate where the policy
     requires it.
     """
-    # Only locators this hub can collect: a foreign one is not "dead", it is
+    # Only locators this hub can read: a foreign one is not "dead", it is
     # unasked, and reporting it here would be an accusation (#1203).
     nodeid_by_ac = await runnable_ac_nodeids(db, task_id)
     if not nodeid_by_ac:
         return {}, True
     ctx = await project_git_context(db, task_id)
-    collector = collector or default_locator_collector
-    found = await collector(list(nodeid_by_ac.values()), ctx.get("repo"))
-    if found is None:
-        return {}, False
-    return (
-        {ac_id: nid for ac_id, nid in nodeid_by_ac.items() if nid not in found},
-        True,
+    task = dict(await repo.get_task(db, task_id) or {})
+    acs = [
+        ac
+        for ac in (
+            row_to_ac(r) for r in await repo.list_acceptance_criteria(db, task_id)
+        )
+        if ac.id in nodeid_by_ac
+    ]
+    evidence = await test_existence.read_locator_evidence(
+        plugins.git_ops,
+        ctx.get("repo"),
+        test_existence.locator_files(acs),
+        submission_sha=task.get("submission_sha") or "",
+        branch=task.get("branch") or "",
+        base=ctx.get("base_branch") or config.PAIR_BASE_BRANCH,
     )
+    resolutions = test_existence.resolve_ac_locators(
+        acs,
+        evidence.sources,
+        evidence.absent,
+        ref_label=evidence.ref_label,
+        pytest_configured=evidence.pytest_configured,
+    )
+    if all(r["status"] != test_existence.MISSING for r in resolutions) and all(
+        r["status"] in (test_existence.UNKNOWN, test_existence.UNPARSEABLE)
+        for r in resolutions
+    ):
+        return {}, False
+    dead = {
+        r["ac_id"]: nodeid_by_ac[r["ac_id"]]
+        for r in resolutions
+        if r["status"] == test_existence.MISSING
+    }
+    return dead, True
 
 
 async def record_ac_test_results(

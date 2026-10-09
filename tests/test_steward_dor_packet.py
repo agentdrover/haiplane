@@ -52,16 +52,15 @@ from hub.services.steward_evidence import (
 )
 from hub.services.test_existence import (
     LOCATOR_STATUSES,
+    LocatorEvidence,
     MISSING,
     NO_VALID_LOCATOR,
-    NOT_COLLECTED,
     RESOLVABLE,
     UNKNOWN,
     UNPARSEABLE,
     resolve_ac_locators,
 )
 
-_COLLECTED = {"tests/test_x.py::test_present"}
 _BRANCH = "task-1158/draft"
 
 
@@ -103,17 +102,28 @@ class _OnTaskBranch(NoopGitOps):
 
 @pytest.fixture
 def collection(monkeypatch) -> None:
-    """Сбор тестов отвечает известным множеством, git молчит.
+    """Файлы тестов читаются из подменённого источника, git молчит.
 
-    Сбор подменён, а не запущен: цель этих тестов — как пакет РАСКЛАДЫВАЕТ
-    ответ существующего расчёта локаторов (#506), а не сам расчёт, у
-    которого свои тесты.
+    Чтение подменено, а не выполнено: цель этих тестов — как пакет РАСКЛАДЫВАЕТ
+    ответ существующего расчёта локаторов (#506), а не сам расчёт, у которого
+    свои тесты. Файл ``tests/test_x.py`` написан и содержит ``test_present``;
+    любой другой .py есть, но пуст; остальные не читаются.
     """
 
-    async def _collect(path):
-        return set(_COLLECTED)
+    async def _evidence(git, repo_path, files, **_kw):
+        return LocatorEvidence(
+            sources={
+                f: (
+                    "def test_present():\n    pass\n"
+                    if f == "tests/test_x.py"
+                    else ("" if f.endswith(".py") else None)
+                )
+                for f in files
+            },
+            ref_label="fixture",
+        )
 
-    monkeypatch.setattr("hub.services.review_brief.collect_test_nodeids", _collect)
+    monkeypatch.setattr("hub.services.review_brief.read_locator_evidence", _evidence)
     plugins.git_ops = _OnTaskBranch()
 
 
@@ -476,7 +486,7 @@ async def test_unparseable_test_ref_is_not_an_accusation(
     Расчёт #506 отвечает ``missing`` на две разные вещи, и разделяет их
     только причина. ``NO_VALID_LOCATOR`` значит, что разбирать было нечего:
     так отвечает и пустое поле, и проза «см. юнит-тесты» — во втором случае
-    хаб не начинал искать. ``NOT_COLLECTED`` значит, что локатор разобран,
+    хаб не начинал искать. ``missing`` с названным файлом значит, что локатор разобран,
     хаб посмотрел и теста не нашёл.
 
     Пакет разбирал их по ПУСТОТЕ поля, и непустая проза уезжала стюарду как
@@ -509,7 +519,7 @@ async def test_unparseable_test_ref_is_not_an_accusation(
     # нечем; а сырой текст сохранён, чтобы автору было видно, что он написал.
     assert by_id["AC-1"]["reason"] == NO_VALID_LOCATOR
     assert by_id["AC-2"]["reason"] == NO_VALID_LOCATOR
-    assert by_id["AC-3"]["reason"] == NOT_COLLECTED
+    assert by_id["AC-3"]["reason"].startswith("tests/test_x.py: ")
     assert by_id["AC-1"]["locator"] == "см. юнит-тесты"
     assert by_id["AC-2"]["locator"] == ""
 
@@ -547,8 +557,7 @@ def test_every_506_status_is_decomposed_by_name():
                 test_ref="tests/test_x.py::test_present",
             )
         ],
-        None,
-        sources={"tests/test_x.py": "def test_present(:\n"},
+        {"tests/test_x.py": "def test_present(:\n"},
     )
     assert real[0]["status"] == UNPARSEABLE
     assert _locator_state(real[0]) == LOCATOR_UNKNOWN

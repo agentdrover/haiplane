@@ -14,6 +14,8 @@ watched, and still performed.
 from __future__ import annotations
 
 import asyncio
+import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -71,8 +73,7 @@ def make_clone(
     if on_branch:
         git(work, "checkout", "-b", BRANCH)
     (work / "pyproject.toml").write_text(
-        '[project]\nname = "branchcode"\nversion = "0"\n'
-        'requires-python = ">=3.10"\n'
+        '[project]\nname = "branchcode"\nversion = "0"\nrequires-python = ">=3.10"\n'
     )
     (work / "conftest.py").write_text(
         "import pathlib\n"
@@ -86,6 +87,20 @@ def make_clone(
     return work, git(work, "rev-parse", "HEAD")
 
 
+def _tokens(argv: list[str]) -> list[str]:
+    out: list[str] = []
+    for part in argv:
+        try:
+            out.extend(shlex.split(part) if " " in part else [part])
+        except ValueError:
+            out.extend(part.split())
+    return out
+
+
+def _is_pytest(token: str) -> bool:
+    return os.path.basename(token) in ("pytest", "py.test")
+
+
 class SpawnSpy:
     """Every process the hub starts, recorded and still started."""
 
@@ -93,7 +108,12 @@ class SpawnSpy:
         self.argv: list[list[str]] = []
 
     def pytest_runs(self) -> list[list[str]]:
-        return [a for a in self.argv if any("pytest" in part for part in a)]
+        """Starts of pytest: a token that IS the command, in any argv or shell line.
+
+        A path that merely contains the word (pytest's own tmp dirs do) is not
+        a start, so a token counts only when its basename is the command.
+        """
+        return [a for a in self.argv if any(_is_pytest(t) for t in _tokens(a))]
 
 
 @pytest.fixture

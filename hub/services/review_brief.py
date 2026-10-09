@@ -58,8 +58,8 @@ from hub.services.review_availability import generation_review
 from hub.services.rule_catalogue import rules_for_areas
 from hub.services.statement_freshness import statement_freshness
 from hub.services.test_existence import (
-    collect_test_nodeids,
-    needs_source_reading,
+    locator_files,
+    read_locator_evidence,
     resolve_ac_locators,
 )
 
@@ -69,50 +69,6 @@ log = logging.getLogger("hub")
 # ever cast in these two, and the assembly costs git work (one branch-tip
 # resolution, one diff read) that a draft's card has no reason to spend.
 GATE_STATUSES = ("review", "fix_requested")
-
-
-async def _locator_sources(
-    db, task_id: int, task_view, ctx: dict, ac_models: list
-) -> tuple[dict[str, str | None], set[str]]:
-    """Locator files as of the submitted commit: ``(texts, absent)`` (#764).
-
-    ``texts`` maps path to file content, with ``None`` where it could not be
-    read; ``absent`` names the files the commit demonstrably does not contain.
-    The two are kept apart because they mean opposite things to a reviewer —
-    "the submission never added this file" is a finding, "I could not look" is
-    not — and #506's rule is that the second must never be dressed as the
-    first. The ref is the pinned submission sha when there is one, so the
-    answer is about the code being judged rather than wherever the branch has
-    since moved.
-    """
-    from hub.services.test_existence import locator_files
-
-    files = locator_files(ac_models)
-    if not files:
-        return {}, set()
-    repo = ctx.get("repo")
-    ref = (task_view.submission_sha or "").strip() or (task_view.branch or "").strip()
-    if not repo or not ref:
-        return dict.fromkeys(files), set()
-    try:
-        in_tree = await plugins.git_ops.files_at_ref(repo, ref)
-    except Exception:  # noqa: BLE001 - the brief must assemble regardless
-        log.warning("locator tree listing failed for task #%s", task_id)
-        in_tree = None
-    absent = {p for p in files if in_tree is not None and p not in in_tree}
-    wanted = [p for p in files if p not in absent]
-    reads = await asyncio.gather(
-        *(plugins.git_ops.file_at_ref(repo, ref, path) for path in wanted),
-        return_exceptions=True,
-    )
-    sources: dict[str, str | None] = dict.fromkeys(files)
-    for path, text in zip(wanted, reads, strict=True):
-        if isinstance(text, BaseException):
-            log.warning("locator source read failed for task #%s: %s", task_id, path)
-            sources[path] = None
-        else:
-            sources[path] = text
-    return sources, absent
 
 
 async def build_call_sites_section(
@@ -467,62 +423,35 @@ async def build_review_brief(
         if stacking:
             stacking_warning = stacking["message"]
 
-    # #506: resolve each verifiable_by=test AC's locator to a real test via
-    # pytest collect-only (best-effort). Only pays the collection cost when the
-    # brief actually has test-AC to check.
+    # #506/#1650: resolve each verifiable_by=test AC's locator by READING the
+    # test file with git at one ref (submission_sha → task branch → project
+    # base) and parsing it — the brief is built on every REST/MCP read and in
+    # the poller's steward path, so it must never import the branch's code
+    # (conftest.py, plugins, the tests themselves). Only pays the git reads
+    # when the brief actually has test-AC to check.
     ac_models = [services.row_to_ac(r) for r in ac_rows]
     locator_resolution: list[ACLocatorResolution] = []
     if any(a.verifiable_by.value == "test" for a in ac_models):
         ctx = await services.project_git_context(db, task_id)
-        # #764: look where the task's code actually is. Before worktree-per-task
-        # (#459) the shared clone was the only candidate; with it on, the clone
-        # sits on the base branch for every task, so the HEAD guard below never
-        # matched and collection was never attempted — which is why every brief
-        # said "test collection unavailable" while pytest ran fine in the
-        # worktree three metres away, and why the log held not one line about a
-        # collection that failed. It never got that far.
-        from hub.services.orchestration import live_pair_worktree_info
-
-        _mode, worktree = await live_pair_worktree_info(db, task_id)
-        # "" when the tree is gone: submit asks for its removal and the
-        # retirement sweep (#1033) clears the rest, so a path that no longer
-        # exists is never read as the task's code. Whether the tree survives
-        # to review time is not something this code should assume either way —
-        # today most do (205 stand on production, because the removal at
-        # submit raises and the exception is swallowed), and the fallback
-        # below is what makes that difference not matter.
-        workspace = worktree or ctx.get("repo")
-        # #506: a working tree can hold another task's branch — the shared
-        # clone is shared, and the pair flow switches it. Collecting there
-        # would report THIS task's tests as missing. Only trust collection
-        # when HEAD matches the task's branch.
-        collected = None
-        if task_view.branch:
-            head = await plugins.git_ops.current_branch(repo=workspace)
-            if head == task_view.branch:
-                collected = await collect_test_nodeids(workspace)
-        # #764: the fallback, for every case where collection could not answer
-        # — the project's dependencies are not installed, the tree was retired,
-        # or no tree ever held this branch. The files are read out of the
-        # submitted commit itself: git hands over the text without a checkout,
-        # ast answers "is this test written here" without imports, and neither
-        # needs the project's dependencies. Weaker evidence than collection,
-        # which is why the reason says which one answered.
-        sources: dict[str, str | None] | None = None
-        absent: set[str] = set()
-        # Not "only when collection failed" (#1203): a collection speaks for
-        # the runner that produced it and for no other, so a locator of any
-        # other runner needs the text even when pytest answered for its own.
-        # The condition is asked of the resolver's own module so the two
-        # cannot drift apart again — they already did once, and the cost was
-        # a "could not read" about a file nobody had opened.
-        if needs_source_reading(ac_models, collected):
-            sources, absent = await _locator_sources(
-                db, task_id, task_view, ctx, ac_models
-            )
+        evidence = await read_locator_evidence(
+            plugins.git_ops,
+            ctx.get("repo"),
+            locator_files(ac_models),
+            submission_sha=task_view.submission_sha or "",
+            branch=task_view.branch or "",
+            base=diff_base.get("base")
+            or ctx.get("base_branch")
+            or config.PAIR_BASE_BRANCH,
+        )
         locator_resolution = [
             ACLocatorResolution(**r)
-            for r in resolve_ac_locators(ac_models, collected, sources, absent)
+            for r in resolve_ac_locators(
+                ac_models,
+                evidence.sources,
+                evidence.absent,
+                ref_label=evidence.ref_label,
+                pytest_configured=evidence.pytest_configured,
+            )
         ]
 
     # #572: does the branch still stand where the submission pinned it? Three

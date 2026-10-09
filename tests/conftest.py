@@ -18,6 +18,7 @@ from hub.db import (
     _table_exists,
 )
 from hub.integrations import git_ops as git_ops_mod
+from tests.branch_code_support import spawn_spy  # noqa: F401 - shared fixture
 from hub.integrations.noop import (
     NoopDispatch,
     NoopGitHub,

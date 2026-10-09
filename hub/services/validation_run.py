@@ -52,7 +52,7 @@ def _safe_env() -> dict[str, str]:
     }
 
 
-async def _collect(proc: Any) -> tuple[bytes, int]:
+async def collect_output(proc: Any) -> tuple[bytes, int]:
     """Read the child's output up to ``_MAX_OUTPUT``, then reap it (#509).
 
     Everything past the cap is read and discarded rather than buffered: we must
@@ -97,7 +97,9 @@ async def default_validation_runner(
                 # rather than just the shell we spawned (#544).
                 start_new_session=True,
             )
-            out, dropped = await asyncio.wait_for(_collect(proc), timeout=_RUN_TIMEOUT)
+            out, dropped = await asyncio.wait_for(
+                collect_output(proc), timeout=_RUN_TIMEOUT
+            )
         except (OSError, TimeoutError, asyncio.TimeoutError):
             # wait_for cancels only the await — the command keeps running in the
             # workspace, and every retry leaks another one. Kill the group: the
