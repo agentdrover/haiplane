@@ -890,3 +890,57 @@ async def test_service_principal_has_no_password_and_no_browser_session(
             headers=headers,
         )
         assert rep.status_code == 401, rep.text
+
+
+# ---- #1644, round 3 ----
+
+
+async def test_default_scoped_key_cannot_report_for_an_inactive_foreign_project(
+    ci_runner_hub, scoped_ci_key
+):
+    """P1: routing falls back to default for a pending project; auth must not."""
+    hub = ci_runner_hub
+    db = hub.db
+    if await repo.get_project_by_slug(db, "default") is None:
+        await repo.create_project(db, slug="default", name="default")
+    foreign = await _project_task(db, "other-co")
+    await db.execute("UPDATE projects SET status = 'pending' WHERE slug = 'other-co'")
+    await db.commit()
+    before = await _snapshot(db, foreign)
+    key = await scoped_ci_key('["project:default"]')
+    resp = await hub.client.post(
+        f"/api/tasks/{foreign}/ci-run-report",
+        json={
+            "head_sha": "sha-pinned",
+            "ac_results": {"AC-1": "pass"},
+            "validation_status": "pass",
+        },
+        headers=key,
+    )
+    assert resp.status_code == 403, resp.text
+    assert await _snapshot(db, foreign) == before
+
+
+async def test_a_failure_after_the_write_rolls_the_report_back(
+    ci_runner_hub, monkeypatch
+):
+    """P3: the handler owns the transaction until the result is read back."""
+    hub = ci_runner_hub
+    task_id = await _task(hub.db, generation=1, sha="sha-pinned")
+
+    async def boom(*a, **kw):
+        raise RuntimeError("read-back failed")
+
+    monkeypatch.setattr(repo, "get_ci_run_report", boom)
+    try:
+        await hub.client.post(
+            f"/api/tasks/{task_id}/ci-run-report",
+            json={"head_sha": "sha-pinned", "ac_results": {"AC-1": "pass"}},
+            headers=hub.ci,
+        )
+    except RuntimeError:
+        pass
+    rows = await hub.db.execute_fetchall(
+        "SELECT 1 FROM ci_run_reports WHERE task_id = ?", (task_id,)
+    )
+    assert list(rows) == [], "the report must not survive a failed request"
