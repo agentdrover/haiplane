@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import ast
 import os
+import re
+import shlex
 from pathlib import Path
 
 HUB = Path(__file__).resolve().parent.parent / "hub"
@@ -55,15 +57,75 @@ _SPAWN = {
     "posix_spawnp",
     "run_in_executor",
 }
-# A real command line is short and on one line; a prompt that merely mentions
-# "uv run pytest" is neither, and is text for an agent, not an argv.
-_MAX_COMMAND_LEN = 300
+# A shell line is short; a prompt that merely mentions "uv run pytest" is long.
+_MAX_COMMAND_LEN = 2000
+# Words that put another command in command position: ``uv run pytest``,
+# ``python -m pytest``, ``env FOO=1 pytest``, ``sudo pytest``...
+_WRAPPERS = {"uv", "run", "python", "python3", "-m", "env", "sudo", "exec", "nohup"}
+_WRAPPERS |= {"time", "poetry", "pipenv", "xargs", "command", "pdm", "hatch"}
+_PYTEST_NAMES = ("pytest", "py.test")
+_SEPARATORS = re.compile(r"&&|\|\||[;|&\n]")
 
 
-def _is_pytest_command(text: str) -> bool:
-    if "\n" in text.strip() or len(text) > _MAX_COMMAND_LEN:
+def _command_words(segment: str) -> list[str]:
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        words = segment.split()
+    return words
+
+
+def _is_pytest_command(text: str, depth: int = 0) -> bool:
+    """Whether ``text`` (an argv word or a shell script) puts pytest in command position."""
+    if len(text) > _MAX_COMMAND_LEN or depth > 3:
         return False
-    return any(os.path.basename(tok) in ("pytest", "py.test") for tok in text.split())
+    text = text.replace("\\\n", " ")
+    for segment in _SEPARATORS.split(text):
+        words = _command_words(segment.strip())
+        while words and ("=" in words[0] and not words[0].startswith("-")):
+            words = words[1:]  # FOO=1 prefix
+        while words and words[0] in _WRAPPERS:
+            words = words[1:]
+            while words and words[0].startswith("-") and words[0] != "-m":
+                words = words[1:]
+        if not words:
+            continue
+        head = os.path.basename(words[0])
+        if head in _PYTEST_NAMES:
+            return True
+        if head in ("sh", "bash", "zsh") and "-c" in words:
+            rest = words[words.index("-c") + 1 :]
+            if rest and _is_pytest_command(rest[0], depth + 1):
+                return True
+        if " " in words[0] and _is_pytest_command(words[0], depth + 1):
+            return True
+    return False
+
+
+class _Module:
+    """What one hub module binds at its top level, for resolving names."""
+
+    def __init__(self, name: str, tree: ast.Module):
+        self.name = name
+        self.tree = tree
+        self.assigns: dict[str, list[ast.expr]] = {}
+        self.imports: dict[str, tuple[str, str]] = {}  # local -> (module, name|"")
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self.assigns.setdefault(target.id, []).append(node.value)
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                if isinstance(node.target, ast.Name):
+                    self.assigns.setdefault(node.target.id, []).append(node.value)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    local = alias.asname or alias.name.split(".")[0]
+                    target = alias.name if alias.asname else alias.name.split(".")[0]
+                    self.imports[local] = (target, "")
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                for alias in node.names:
+                    self.imports[alias.asname or alias.name] = (node.module, alias.name)
 
 
 def _callee(node: ast.Call) -> str:
@@ -75,12 +137,8 @@ def _callee(node: ast.Call) -> str:
     return ""
 
 
-def _literals(node: ast.AST) -> list[str]:
-    return [
-        n.value
-        for n in ast.walk(node)
-        if isinstance(n, ast.Constant) and isinstance(n.value, str)
-    ]
+def _module_name(path: str) -> str:
+    return path[:-3].replace("/", ".").removesuffix(".__init__")
 
 
 def _assigned(body: list[ast.stmt], name: str) -> list[ast.expr]:
@@ -101,8 +159,62 @@ def _assigned(body: list[ast.stmt], name: str) -> list[ast.expr]:
     return out
 
 
+class _Resolver:
+    def __init__(self, modules: dict[str, _Module]):
+        self.modules = modules
+
+    def literals(
+        self,
+        expr: ast.AST,
+        module: _Module,
+        fn_body: list[ast.stmt],
+        seen: frozenset[tuple[str, str]] = frozenset(),
+        depth: int = 0,
+    ) -> list[str]:
+        """Every string an expression may carry, following names across modules."""
+        out: list[str] = []
+        if depth > 8:
+            return out
+        for node in ast.walk(expr):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                out.append(node.value)
+            elif isinstance(node, ast.Name):
+                out += self._name(node.id, module, fn_body, seen, depth)
+            elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                out += self._attribute(node, module, seen, depth)
+        return out
+
+    def _name(self, name, module, fn_body, seen, depth) -> list[str]:
+        key = (module.name, name)
+        if key in seen:
+            return []
+        seen = seen | {key}
+        out: list[str] = []
+        for value in _assigned(fn_body, name):
+            out += self.literals(value, module, fn_body, seen, depth + 1)
+        for value in module.assigns.get(name, []):
+            out += self.literals(value, module, [], seen, depth + 1)
+        if name in module.imports:
+            source, original = module.imports[name]
+            target = self.modules.get(source)
+            if target is not None and original:
+                out += self._name(original, target, [], seen, depth + 1)
+        return out
+
+    def _attribute(self, node: ast.Attribute, module, seen, depth) -> list[str]:
+        local = node.value.id  # type: ignore[attr-defined]
+        if local not in module.imports:
+            return []
+        source, original = module.imports[local]
+        dotted = f"{source}.{original}" if original else source
+        target = self.modules.get(dotted) or self.modules.get(source)
+        if target is None:
+            return []
+        return self._name(node.attr, target, [], seen, depth + 1)
+
+
 def _functions(tree: ast.Module):
-    """``(qualname, node)`` for every function and method."""
+    """``(qualname, body)`` for every function and method, then the module level."""
 
     def walk(body, prefix):
         for node in body:
@@ -113,6 +225,18 @@ def _functions(tree: ast.Module):
                 yield from walk(node.body, f"{prefix}{node.name}.")
 
     yield from walk(tree.body, "")
+
+
+def _calls_outside_functions(tree: ast.Module):
+    """Calls that run at import time: module level and class bodies."""
+    stack: list[ast.AST] = list(tree.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            continue
+        if isinstance(node, ast.Call):
+            yield node
+        stack.extend(ast.iter_child_nodes(node))
 
 
 def _spawn_names(trees: dict[str, ast.Module]) -> set[str]:
@@ -129,31 +253,40 @@ def _spawn_names(trees: dict[str, ast.Module]) -> set[str]:
     return names
 
 
-def _argv_literals(call: ast.Call, fn_body, module_body) -> list[str]:
-    found = []
-    args = [*call.args, *(k.value for k in call.keywords)]
-    for arg in args:
-        found += _literals(arg)
-        for n in ast.walk(arg):
-            if isinstance(n, ast.Name):
-                for value in _assigned(fn_body, n.id) or _assigned(module_body, n.id):
-                    found += _literals(value)
-    return found
-
-
 def scan(sources: dict[str, str]) -> set[str]:
-    """``{"path::function"}`` of every function that starts pytest."""
+    """``{"path::function"}`` of every place that starts pytest (``<module>`` = import time)."""
     trees = {path: ast.parse(text, filename=path) for path, text in sources.items()}
+    modules = {
+        _module_name(path): _Module(_module_name(path), tree)
+        for path, tree in trees.items()
+    }
+    resolver = _Resolver(modules)
     spawners = _spawn_names(trees)
     offenders: set[str] = set()
+
+    def check(call: ast.Call, module: _Module, body: list[ast.stmt]) -> bool:
+        args = [*call.args, *(k.value for k in call.keywords)]
+        return any(
+            _is_pytest_command(lit)
+            for arg in args
+            for lit in resolver.literals(arg, module, body)
+        )
+
     for path, tree in trees.items():
+        module = modules[_module_name(path)]
         for qual, fn in _functions(tree):
-            for node in ast.walk(fn):
-                if not (isinstance(node, ast.Call) and _callee(node) in spawners):
-                    continue
-                literals = _argv_literals(node, fn.body, tree.body)
-                if any(_is_pytest_command(lit) for lit in literals):
-                    offenders.add(f"{path}::{qual}")
+            if any(
+                isinstance(n, ast.Call)
+                and _callee(n) in spawners
+                and check(n, module, fn.body)
+                for n in ast.walk(fn)
+            ):
+                offenders.add(f"{path}::{qual}")
+        if any(
+            _callee(c) in spawners and check(c, module, [])
+            for c in _calls_outside_functions(tree)
+        ):
+            offenders.add(f"{path}::<module>")
     return offenders
 
 
@@ -319,7 +452,7 @@ def test_the_guard_does_not_flag_what_is_not_a_pytest_start():
         '    """Runs `uv run pytest` for you."""\n'
         "    return 'pytest is the runner name'\n"
         "def prompt(p):\n"
-        "    msg = 'Проверь локально:\\nuv run pytest tests/ -x -q\\n'\n"
+        "    msg = 'Проверь локально: uv run pytest tests/ -x -q, потом отпиши'\n"
         "    subprocess.run(['agent', msg])\n"
         "def path():\n"
         "    subprocess.run(['ls', '/tmp/pytest-of-user/pytest-3'])\n"

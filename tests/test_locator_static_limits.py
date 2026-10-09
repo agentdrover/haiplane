@@ -14,6 +14,7 @@ from hub.services.test_existence import (
     MISSING,
     RESOLVABLE,
     UNKNOWN,
+    UNPARSEABLE,
     resolve_locators_at_ref,
 )
 from tests.branch_code_support import FakeGit
@@ -46,10 +47,14 @@ async def test_deep_inheritance_is_unknown_not_a_crash():
 
 
 async def test_a_very_deep_expression_is_unknown_not_a_crash():
-    expr = "x = " + "(" * 400 + "1" + ")" * 400 + "\n" + "y = 1" + "+1" * 6000 + "\n"
-    res = await _status({_PATH: expr + "def test_a():\n    pass\n"}, "test_a")
-    assert res["status"] in (UNKNOWN, RESOLVABLE), res
-    assert res["status"] != MISSING
+    tail = "def test_a():\n    pass\n"
+    nested = "x = " + "(" * 400 + "1" + ")" * 400 + "\n" + tail
+    chain = "y = 1" + "+1" * 6000 + "\n" + tail
+    for source in (nested, chain):
+        res = await _status({_PATH: source}, "test_a")
+        assert res["status"] in (UNKNOWN, UNPARSEABLE, RESOLVABLE), res
+        assert res["status"] != MISSING
+    assert (await _status({_PATH: chain}, "test_a"))["status"] != "crashed"
 
 
 async def test_a_file_over_the_limit_is_unknown_and_never_parsed():

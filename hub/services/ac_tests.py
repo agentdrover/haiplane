@@ -24,7 +24,6 @@ from hub.services import test_existence
 from hub.services.orchestration import project_git_context
 from hub.services.refinement import row_to_ac
 from hub.services.test_locator import PYTEST, parse_test_locator, runner_of
-from hub.services.validation_run import collect_output
 
 log = logging.getLogger("hub")
 
@@ -62,6 +61,71 @@ def _run_env(home: str) -> dict[str, str]:
     return env
 
 
+# One line of pytest -v output is kept up to this many bytes. A nodeid and its
+# outcome sit at the start of the line, so the head is what is read; a longer
+# line makes the whole run INCOMPLETE rather than silently shorter.
+_LINE_CAP = 64 * 1024
+
+
+def _apply_line(raw: bytes, wanted: set[str], results: dict[str, bool]) -> None:
+    parts = raw.decode(errors="replace").strip().split(None, 1)
+    if len(parts) != 2:
+        return
+    reported, rest = parts
+    # pytest -v prints the nodeid first, then the outcome. Match the EXACT
+    # nodeid (or its parametrized base) — substring matching let
+    # "…::test_a" absorb the verdict of "…::test_a_extra", and the last
+    # matching line silently overwrote earlier ones, so a passing AC could
+    # be recorded as failed or vice versa (#507).
+    key = reported if reported in wanted else reported.split("[", 1)[0]
+    if key not in wanted:
+        return
+    if "PASSED" in rest:
+        passed = True
+    elif "FAILED" in rest or "ERROR" in rest:
+        passed = False
+    else:
+        return
+    # Aggregate parametrized cases: any failing case fails the AC.
+    results[key] = results.get(key, True) and passed
+
+
+async def _stream_results(proc: Any, wanted: set[str]) -> tuple[dict[str, bool], bool]:
+    """Results aggregated over the WHOLE output as it streams; memory stays bounded.
+
+    The output used to be cut at a byte limit and parsed afterwards, so a FAILED
+    printed after the limit was lost and the AC read as passed (#1650). Now every
+    complete line is read as it arrives and nothing but the current line is kept.
+    ``incomplete`` is True when a line was too long to be read whole.
+    """
+    results: dict[str, bool] = {}
+    pending = b""
+    skipping = False
+    incomplete = False
+    while True:
+        chunk = await proc.stdout.read(65536)
+        if not chunk:
+            break
+        if skipping:
+            _, newline, chunk = chunk.partition(b"\n")
+            if not newline:
+                continue
+            skipping = False
+        pending += chunk
+        *lines, pending = pending.split(b"\n")
+        for raw in lines:
+            _apply_line(raw[:_LINE_CAP], wanted, results)
+            incomplete = incomplete or len(raw) > _LINE_CAP
+        if len(pending) > _LINE_CAP:
+            _apply_line(pending[:_LINE_CAP], wanted, results)
+            pending, skipping, incomplete = b"", True, True
+    if pending:
+        _apply_line(pending[:_LINE_CAP], wanted, results)
+        incomplete = incomplete or len(pending) > _LINE_CAP
+    await proc.wait()
+    return results, incomplete
+
+
 async def default_test_runner(
     nodeids: list[str], repo_path: str | None
 ) -> dict[str, bool] | None:
@@ -69,13 +133,16 @@ async def default_test_runner(
 
     The ONE place the hub starts pytest, and only for a human's explicit
     run-ac-tests (#1646). The child gets the allowlisted environment, its own
-    session — the timeout and a cancelled request kill the whole group, since
-    ``uv`` is only the launcher — and a bounded output buffer (#1650).
+    session — the timeout and a cancelled request kill the whole group (by the
+    group id saved at spawn, so a launcher that already exited does not hide
+    its children), and results are read as a stream (#1650). Incomplete output
+    yields no positive result.
     """
     if not nodeids or not repo_path:
         return None
     home = tempfile.mkdtemp(prefix="hub-ac-run-")
     proc = None
+    pgid = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "uv",
@@ -93,41 +160,28 @@ async def default_test_runner(
             env=_run_env(home),
             start_new_session=True,
         )
-        out, _dropped = await asyncio.wait_for(
-            collect_output(proc), timeout=_RUN_TIMEOUT
+        # With start_new_session the child leads a group of its own: the group
+        # id is its pid, and it stays the group id after the leader exits.
+        pgid = proc.pid
+        results, incomplete = await asyncio.wait_for(
+            _stream_results(proc, set(nodeids)), timeout=_RUN_TIMEOUT
         )
     except (OSError, TimeoutError, asyncio.TimeoutError):
-        await kill_process_group(proc)
+        await kill_process_group(proc, pgid=pgid)
         log.warning("AC test run failed in %s", repo_path)
         return None
     except asyncio.CancelledError:
-        await kill_process_group(proc)
+        await kill_process_group(proc, pgid=pgid)
         raise
+    else:
+        # The leader is done; whatever it left running in the group goes too.
+        await kill_process_group(proc, pgid=pgid)
     finally:
         shutil.rmtree(home, ignore_errors=True)
-    results: dict[str, bool] = {}
-    wanted = set(nodeids)
-    for raw in out.decode(errors="replace").splitlines():
-        parts = raw.strip().split(None, 1)
-        if len(parts) != 2:
-            continue
-        reported, rest = parts
-        # pytest -v prints the nodeid first, then the outcome. Match the EXACT
-        # nodeid (or its parametrized base) — substring matching let
-        # "…::test_a" absorb the verdict of "…::test_a_extra", and the last
-        # matching line silently overwrote earlier ones, so a passing AC could
-        # be recorded as failed or vice versa (#507).
-        key = reported if reported in wanted else reported.split("[", 1)[0]
-        if key not in wanted:
-            continue
-        if "PASSED" in rest:
-            passed = True
-        elif "FAILED" in rest or "ERROR" in rest:
-            passed = False
-        else:
-            continue
-        # Aggregate parametrized cases: any failing case fails the AC.
-        results[key] = results.get(key, True) and passed
+    if incomplete:
+        # Part of the output was unreadable: a failure may be hiding in it, so
+        # nothing may pass on this run.
+        return {k: v for k, v in results.items() if not v}
     return results
 
 

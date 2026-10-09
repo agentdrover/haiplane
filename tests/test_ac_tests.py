@@ -126,9 +126,13 @@ class _FakeProc:
     def __init__(self, out: str, rc: int = 0):
         self.stdout = _Stream(out.encode())
         self.returncode = rc
+        self.pid = 4_190_001  # not a real process: killing its group is a no-op
 
     async def wait(self):
         return self.returncode
+
+    def kill(self):
+        raise ProcessLookupError
 
 
 async def _run_with_output(monkeypatch, nodeids, output):
@@ -421,26 +425,19 @@ async def test_manual_ac_run_has_a_minimal_env_and_kills_its_group(
                 os.kill(int(pid_file.read_text()), signal.SIGKILL)
 
 
-async def test_manual_ac_run_output_is_bounded(monkeypatch, tmp_path: Path):
-    from hub.services import validation_run
-
-    monkeypatch.setattr(validation_run, "_MAX_OUTPUT", 1000)
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    fake = bin_dir / "uv"
-    fake.write_text(
-        "#!/bin/sh\nyes 'tests/t.py::test_a PASSED' | head -c 5000000\n"
-        "echo 'tests/t.py::test_b PASSED'\n"
+async def test_manual_ac_run_streams_a_long_output(monkeypatch, tmp_path: Path):
+    _fake_uv(
+        tmp_path,
+        "yes 'tests/t.py::test_a PASSED' | head -n 200000\n"
+        "echo 'tests/t.py::test_b PASSED'\n",
     )
-    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
-    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin")
 
     res = await real_default_test_runner(
         ["tests/t.py::test_a", "tests/t.py::test_b"], str(tmp_path)
     )
 
-    # test_b is printed after the cap: read and dropped, not kept in memory.
-    assert res == {"tests/t.py::test_a": True}
+    assert res == {"tests/t.py::test_a": True, "tests/t.py::test_b": True}
 
 
 # ---- #1650 round 2: a lost FAILED is not a pass; a group outlives its leader ----

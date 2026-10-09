@@ -572,6 +572,21 @@ class _RealFiles(NoopGitOps):
 
         return await GitOpsIntegration().files_at_ref(repo, ref)
 
+    async def read_file_at_ref(self, repo: str, ref: str, path: str, **kw):
+        from hub.integrations.git_ops import GitOpsIntegration
+
+        return await GitOpsIntegration().read_file_at_ref(repo, ref, path, **kw)
+
+    async def head_sha(self, repo: str, base: str) -> str:
+        from hub.integrations.git_ops import GitOpsIntegration
+
+        return await GitOpsIntegration().head_sha(repo, base)
+
+    async def resolve_ref(self, name: str, repo: str):
+        from hub.integrations.git_ops import GitOpsIntegration
+
+        return await GitOpsIntegration().resolve_ref(name, repo)
+
 
 async def _task_with_test_ac(db, client: AsyncClient, workspace, locator: str) -> int:
     task_id = await _project_with(db, client, workspace, "main")

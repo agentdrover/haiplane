@@ -333,14 +333,14 @@ def test_what_a_static_reader_cannot_follow_is_unknown_not_missing():
     assert _one("tests/test_p.py::TestX::test_a", marked)["status"] == MISSING
 
     guarded = "if True:\n    def test_a():\n        pass\n"
-    assert _one("tests/test_p.py::test_a", guarded)["status"] == RESOLVABLE
+    assert _one("tests/test_p.py::test_a", guarded)["status"] == UNKNOWN
 
 
-def test_configured_python_options_are_named_on_a_found_test():
+def test_a_config_issue_makes_a_found_pytest_test_unknown():
     res = resolve_ac_locators(
         [_AC("AC-1", "test", "tests/test_p.py::test_only_here")],
         {"tests/test_p.py": _PATH_SOURCE},
-        pytest_configured=True,
+        pytest_config_issue="pyproject.toml sets python_functions",
     )[0]
-    assert res["status"] == RESOLVABLE
-    assert "python_*" in res["reason"]
+    assert res["status"] == UNKNOWN
+    assert "python_functions" in res["reason"]

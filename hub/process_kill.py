@@ -26,23 +26,29 @@ from typing import Any
 log = logging.getLogger("hub")
 
 
-async def kill_process_group(proc: Any) -> None:
+async def kill_process_group(proc: Any, *, pgid: int | None = None) -> None:
     """SIGKILL the child's process group and reap it. Never raises.
 
     Falls back to a single-pid kill when the group cannot be signalled, so the
     outcome is never worse than plain ``proc.kill()``.
+
+    ``pgid`` is the group id the caller saved at spawn time (with
+    ``start_new_session`` it equals the child's pid). Without it the group is
+    looked up through the live leader — and a launcher that has already exited
+    leaves its children running in a group nobody can find any more (#1650).
+    With it, the group is signalled whatever state the leader is in.
     """
-    if proc is None or proc.returncode is not None:
+    if proc is None or (proc.returncode is not None and pgid is None):
         return
 
-    pgid = None
-    with contextlib.suppress(ProcessLookupError, OSError):
-        pgid = os.getpgid(proc.pid)
+    if pgid is None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            pgid = os.getpgid(proc.pid)
 
     # Never signal our own group. Without start_new_session the child shares the
     # hub's process group, and killpg would SIGKILL the hub itself — a far worse
     # outcome than the leak this function exists to prevent.
-    if pgid is not None and pgid != os.getpgid(0):
+    if pgid is not None and pgid > 1 and pgid != os.getpgid(0):
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(pgid, signal.SIGKILL)
     else:
