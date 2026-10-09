@@ -34,6 +34,7 @@ from hub.version import get_app_version
 from hub.integrations.registry import plugins
 from hub.workflow_reference import lifecycle_map_lines
 from hub.models import (
+    AgentBootstrap,
     latest_review_freshness,
     DeliveryAcknowledgement,
     DeliveryObservation,
@@ -1077,6 +1078,20 @@ async def api_effective_policy(slug: str, request: Request) -> dict:
     db = _db(request)
     project = _row_or_404(await repo.get_project_by_slug(db, slug), "project not found")
     return await effective_policy.effective_policy(db, project)
+
+
+@app.get("/api/projects/{slug}/agent-bootstrap", response_model=AgentBootstrap)
+async def api_agent_bootstrap(slug: str, request: Request) -> AgentBootstrap:
+    """Стартовый пакет проекта: первое сообщение агенту без credentials (#1631).
+
+    Запрос здесь не читается — ни bearer, ни cookie: пакет строится из
+    проекта, навыков и политики. Доступ — по существующим гейтам ролей.
+    """
+    from hub.services import agent_bootstrap
+
+    db = _db(request)
+    project = _row_or_404(await repo.get_project_by_slug(db, slug), "project not found")
+    return await agent_bootstrap.build_agent_bootstrap(db, project)
 
 
 async def _project_by_slug_or_404(request: Request, slug: str):

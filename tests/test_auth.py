@@ -1201,3 +1201,74 @@ async def test_ci_runner_may_withdraw_its_own_draft(ci_runner_hub):
     resp = await hub.client.post(f"/api/tasks/{tid}/withdraw", headers=hub.ci)
     assert resp.status_code == 200, resp.text
     assert resp.json()["archived"] is True
+
+
+# ---------------------------------------------------------------------------
+# agent-bootstrap: матрица ролей (#1631)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_bootstrap_role_matrix(client, db, monkeypatch):
+    """AC-4: anonymous 401, агент и watcher 200, implementer и steward 403, нет slug 404."""
+    from hub import repository as repo
+    from hub.services import admin as admin_svc
+
+    monkeypatch.setattr(
+        config,
+        "HUB_TOKENS",
+        {
+            "agent-env": TokenIdentity("bot", "agent"),
+            "steward-env": TokenIdentity("stew", "steward"),
+        },
+    )
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    await repo.create_project(db, slug="matrix", name="Matrix")
+    await db.commit()
+    human = await admin_svc.create_principal(
+        db, kind="human", username="alice-m", role_slug="operator"
+    )
+    human_key = await admin_svc.create_api_key(db, human["id"], name="laptop")
+    watcher = await admin_svc.create_principal(
+        db, kind="agent", username="grok-m", role_slug="watcher"
+    )
+    watcher_key = await admin_svc.create_api_key(db, watcher["id"], name="w")
+    human_auth = {"Authorization": f"Bearer {human_key['plaintext_key']}"}
+    ip = {"x-forwarded-for": "203.0.113.9"}
+    task = await client.post(
+        "/api/tasks", json={"title": "для сессии"}, headers=human_auth
+    )
+    assert task.status_code in (200, 201), task.text
+    issued = await client.post(
+        "/api/auth/chat-pair/start",
+        json={"kind": "implementer", "task_id": task.json()["id"]},
+        headers={**human_auth, **ip},
+    )
+    assert issued.status_code == 200, issued.text
+    redeemed = await client.post(
+        "/api/auth/chat-pair/redeem", json={"code": issued.json()["code"]}, headers=ip
+    )
+    assert redeemed.status_code == 200, redeemed.text
+
+    def bearer(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    url = "/api/projects/matrix/agent-bootstrap"
+    got = {
+        "anonymous": (await client.get(url, headers={"Accept": "application/json"})),
+        "agent": await client.get(url, headers=bearer("agent-env")),
+        "watcher": await client.get(url, headers=bearer(watcher_key["plaintext_key"])),
+        "implementer": await client.get(url, headers=bearer(redeemed.json()["token"])),
+        "steward": await client.get(url, headers=bearer("steward-env")),
+        "unknown": await client.get(
+            "/api/projects/no-such/agent-bootstrap", headers=bearer("agent-env")
+        ),
+    }
+    assert {k: v.status_code for k, v in got.items()} == {
+        "anonymous": 401,
+        "agent": 200,
+        "watcher": 200,
+        "implementer": 403,
+        "steward": 403,
+        "unknown": 404,
+    }

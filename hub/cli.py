@@ -1671,6 +1671,19 @@ def cmd_effective_policy(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_projects_bootstrap(args: argparse.Namespace) -> int:
+    """Стартовый пакет проекта: печатает серверный text, не пересобирает (#1631)."""
+    result = _api(
+        "GET",
+        f"/api/projects/{urllib.parse.quote(args.slug, safe='')}/agent-bootstrap",
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(result["text"])
+    return 0
+
+
 def cmd_policy_schedule(args: argparse.Namespace) -> int:
     """Расписание правок политики проекта — только чтение (#1593)."""
     from hub.services.policy_change import format_schedule
@@ -2040,6 +2053,37 @@ def _add_outcome_debt_parser(sub: Any) -> None:
     p_outcomes.set_defaults(func=cmd_outcome_debt)
 
 
+def _add_projects_parser(sub: Any) -> None:
+    p_projects = sub.add_parser("projects", help="Manage projects (#338)")
+    projects_sub = p_projects.add_subparsers(dest="projects_cmd", required=True)
+    pp_list = projects_sub.add_parser("list", help="List projects")
+    pp_list.add_argument(
+        "--include-archived", dest="include_archived", action="store_true"
+    )
+    pp_list.set_defaults(func=cmd_projects_list)
+    pp_bootstrap = projects_sub.add_parser(
+        "bootstrap", help="First message for an agent of a new project (#1631)"
+    )
+    pp_bootstrap.add_argument("slug")
+    pp_bootstrap.add_argument("--json", action="store_true")
+    pp_bootstrap.set_defaults(func=cmd_projects_bootstrap)
+    pp_create = projects_sub.add_parser("create", help="Create a project (human token)")
+    pp_create.add_argument("slug")
+    pp_create.add_argument("--name", required=True)
+    pp_create.add_argument("--repo", default="")
+    pp_create.add_argument("--workspace-path", dest="workspace_path", default="")
+    pp_create.add_argument(
+        "--default-branch",
+        dest="default_branch",
+        default=config.PAIR_BASE_BRANCH,
+    )
+    # #1114: контракт публикуется трижды — REST, CLI, MCP. Поверхность, где
+    # форж задать нельзя, означает, что GitVerse-проект отсюда не завести —
+    # и молча, потому что умолчание примут за выбор.
+    pp_create.add_argument("--forge", choices=list(FORGES), default=DEFAULT_FORGE)
+    pp_create.set_defaults(func=cmd_projects_create)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hp-hub", description="CLI for Haiplane Hub")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2281,28 +2325,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_answer.add_argument("--note", default="", help="Context or what to do next")
     p_answer.set_defaults(func=cmd_answer_outcome)
 
-    p_projects = sub.add_parser("projects", help="Manage projects (#338)")
-    projects_sub = p_projects.add_subparsers(dest="projects_cmd", required=True)
-    pp_list = projects_sub.add_parser("list", help="List projects")
-    pp_list.add_argument(
-        "--include-archived", dest="include_archived", action="store_true"
-    )
-    pp_list.set_defaults(func=cmd_projects_list)
-    pp_create = projects_sub.add_parser("create", help="Create a project (human token)")
-    pp_create.add_argument("slug")
-    pp_create.add_argument("--name", required=True)
-    pp_create.add_argument("--repo", default="")
-    pp_create.add_argument("--workspace-path", dest="workspace_path", default="")
-    pp_create.add_argument(
-        "--default-branch",
-        dest="default_branch",
-        default=config.PAIR_BASE_BRANCH,
-    )
-    # #1114: контракт публикуется трижды — REST, CLI, MCP. Поверхность, где
-    # форж задать нельзя, означает, что GitVerse-проект отсюда не завести —
-    # и молча, потому что умолчание примут за выбор.
-    pp_create.add_argument("--forge", choices=list(FORGES), default=DEFAULT_FORGE)
-    pp_create.set_defaults(func=cmd_projects_create)
+    _add_projects_parser(sub)
 
     p_approve_batch = sub.add_parser(
         "approve-batch",
