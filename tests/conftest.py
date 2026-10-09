@@ -27,6 +27,11 @@ from hub.integrations.noop import (
     NoopVast,
 )
 from hub.integrations.registry import plugins
+from tests.local_advisor_support import (  # noqa: F401 - фикстуры задачи #1649
+    local_identity,
+    local_service,
+    local_spool,
+)
 
 
 class MockDispatch(NoopDispatch):

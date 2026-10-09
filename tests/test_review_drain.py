@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import fcntl
 import os
 import select
@@ -881,3 +882,104 @@ def test_the_script_is_a_plain_bash_script() -> None:
     assert first == "#!/usr/bin/env bash"
     check = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True)
     assert check.returncode == 0, check.stderr
+
+
+async def test_an_advisor_job_obeys_the_drain_and_the_steward_cap(
+    db, local_spool, local_identity, local_service, bin_dir, monkeypatch
+) -> None:
+    """#1649 AC-7: задание советника — под тем же замком выкладки, что и ревью.
+
+    Свежий маркер: задание не публикуется, код не выпускается, заказ остаётся
+    открытым (это не ошибка готовности и не отказ). Выложенное до маркера
+    задание считает деплой. Суточная квота стюарда общая: исчерпана — отказ
+    ``daily_cap`` с причиной, советник не заказывается.
+    """
+    import json as _json
+
+    from hub import config
+    from hub.db import fetchall
+    from hub.integrations import local_reviewer
+    from hub.services.steward_advisor import order_due_advisors, start_advisor_run
+    from hub.services.steward_advisor_local import wait_for_local_advisors
+    from hub.services.steward_dispatch import close_finished_runs  # noqa: F401
+    from tests.test_steward_advisor import _advisor_row, _ordered_advisor
+
+    monkeypatch.setattr(config, "LOCAL_REVIEWER_HUB_TOKEN", "reviewer-token")
+    svc = local_service()
+    task_id, order = await _ordered_advisor(db, "drain-advisor")
+    spool = local_spool
+    expires = int(time.time()) + 600
+    (spool / "draining").write_text(f"owner=deploy-test\nexpires={expires}\n")
+
+    assert await start_advisor_run(db, dict(order)) is False, "при дренаже не стартует"
+    await wait_for_local_advisors()
+    assert not list(spool.glob("job-*")) and svc.jobs == []
+    assert local_identity == [], "код при дренаже не выпускается"
+    row = await _advisor_row(db, task_id)
+    assert row["status"] == "open" and row["agent_id"] == "", row
+    events = [
+        _json.loads(r["payload"])
+        for r in await fetchall(
+            db,
+            "SELECT payload FROM events WHERE task_id=? AND kind='steward_run_refused'",
+            (task_id,),
+        )
+    ]
+    assert events and events[-1]["retryable"] is True
+    assert "выкладка" in events[-1]["detail"]
+    assert local_reviewer.not_ready() == [], "дренаж — не ошибка готовности"
+
+    # Маркер снят — тот же заказ стартует; задание в очереди деплой считает.
+    (spool / "draining").unlink()
+    svc.hold = True
+    assert await start_advisor_run(db, dict(order)) is True
+    for _ in range(100):
+        if svc.jobs:
+            break
+        await asyncio.sleep(0.02)
+    jobs = list(spool.glob("job-*"))
+    assert len(jobs) == 1 and svc.jobs == [
+        {"version": 3, "timeout_sec": 900, "profile": "advisor", "model": "glm-5.1"}
+    ]
+    counted = _run(["acquire"], spool, bin_dir, DRAIN_BUDGET_SECONDS="1")
+    assert "drain timeout" in counted.stdout and jobs[0].name in counted.stdout
+    _run(["release"], spool, bin_dir)
+    from hub.services.steward_advisor_local import cancel_local_advisors
+
+    await cancel_local_advisors()
+
+    # Маркер появился ПОСЛЕ последней проверки, прямо перед публикацией: замок
+    # при публикации отказывает, заказ возвращается в очередь, задание не
+    # опубликовано (код выписан, но не использован — он истечёт сам).
+    task3, order3 = await _ordered_advisor(db, "drain-at-publish")
+    published_before = len(svc.jobs)
+    dirs_before = {p.name for p in spool.glob("job-*")}
+    (spool / "draining").write_text(f"owner=deploy-test\nexpires={expires}\n")
+    monkeypatch.setattr(local_reviewer, "drain_refusal", lambda: "")
+    assert await start_advisor_run(db, dict(order3)) is True
+    await wait_for_local_advisors()
+    back = await _advisor_row(db, task3)
+    assert back["status"] == "open" and back["agent_id"] == "", back
+    assert not back["started_at"], "started_at снят вместе с возвратом"
+    assert len(svc.jobs) == published_before
+    assert {p.name for p in spool.glob("job-*")} == dirs_before, "новое задание"
+    (spool / "draining").unlink()
+
+    # Общая суточная квота: исчерпана — советник не заказывается, причина названа.
+    from tests.test_steward_shadow import _judge, _judge_run, _project, _task
+
+    monkeypatch.setattr(config, "STEWARD_DAILY_CAP", 1)
+    project_id = await _project(db, "drain-cap")
+    task2 = await _task(db, project_id)
+    await _judge_run(db, task2, model="composer-2.5")
+    await _judge(db, task2)
+    assert await order_due_advisors(db) == 0
+    refused = [
+        _json.loads(r["payload"])
+        for r in await fetchall(
+            db,
+            "SELECT payload FROM events WHERE task_id=? AND kind='steward_run_refused'",
+            (task2,),
+        )
+    ]
+    assert [e["reason"] for e in refused if e.get("kind") == "advisor"] == ["daily_cap"]
