@@ -353,6 +353,13 @@ STEWARD_ADVISOR_MODELS = tuple(
     ).split(",")
     if m.strip()
 )
+# Локальный советник (#1649): ОДНА закреплённая модель, которую служба ревью
+# держит в доверенной конфигурации профиля advisor (файл advisor-model рядом с
+# враппером). Пусто — локального советника нет. Модель запускаема локально,
+# только если служба в heartbeat объявила профиль advisor с ТОЙ ЖЕ моделью и
+# STEWARD_HUB_TOKEN разрешается в принципала; автоподмены модели нет, а
+# самодекларация модели в суждении доказательством не считается.
+STEWARD_ADVISOR_LOCAL_MODEL = env_get("STEWARD_ADVISOR_LOCAL_MODEL", "").strip()
 # The hub token the steward run authenticates with (#1105). Same shape as
 # CURSOR_REVIEWER_HUB_TOKEN: the run reaches the hub's own MCP as the steward
 # principal, whose allowlist is two operations (#1021). Unset means no run —
@@ -1001,3 +1008,17 @@ def validate_network_auth() -> None:
         f"Either set HAIPLANE_HUB_TOKENS, bind to 127.0.0.1, or set "
         f"HAIPLANE_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1 to override."
     )
+
+
+# Egress watch (#1645): the hub's own look at the way out of the server.
+def _int_env(suffix: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(env_get(suffix, str(default)))
+    except ValueError:
+        return default
+    return value if low <= value <= high else default
+
+
+EGRESS_PROBE_URL = env_get("EGRESS_PROBE_URL", "https://api.github.com/")
+EGRESS_PROBE_SECONDS = _int_env("EGRESS_PROBE_SECONDS", 120, 30, 900)
+EGRESS_DOWN_AFTER = _int_env("EGRESS_DOWN_AFTER", 3, 1, 100)

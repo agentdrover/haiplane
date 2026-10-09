@@ -2512,6 +2512,8 @@ class ProdStateView(BaseModel):
     # #1420: open release alerts (project, reason, since, minutes) — empty
     # while every release moves.
     release_blocks: list[dict[str, Any]] = Field(default_factory=list)
+    # #1645: can the server reach GitHub — typed fields, see EgressStatus.
+    egress: dict[str, Any] = Field(default_factory=dict)
     deployed: dict[str, str] = Field(default_factory=dict)
     in_prod: list[ProdStateEntry] = Field(default_factory=list)
     not_in_prod: list[ProdStateEntry] = Field(default_factory=list)
@@ -4572,6 +4574,22 @@ class ChatPairRevoked(BaseModel):
     revoked: int
 
 
+class EgressStatus(BaseModel):
+    """Can the server reach GitHub (#1645): typed fields only, never text.
+
+    ``unknown`` = the watcher has not probed within three intervals.
+    ``reason_code`` is one of a fixed list; exception text and URLs never
+    reach this public model.
+    """
+
+    state: Literal["up", "down", "unknown"] = "unknown"
+    since: str | None = None
+    checked_at: str | None = None
+    reason_code: (
+        Literal["dns", "connect", "tls", "timeout", "proxy", "other"] | None
+    ) = None
+
+
 class HealthView(BaseModel):
     status: str = "ok"
     app_version: str
@@ -4587,6 +4605,7 @@ class HealthView(BaseModel):
     # Имена env-переменных с устаревшим префиксом (#964) — политики, которые
     # оператор считает включёнными, а код не читает. Имена, не значения.
     stale_env: list[str] = Field(default_factory=list)
+    egress: EgressStatus = Field(default_factory=EgressStatus)
 
 
 class EffectivePolicies(BaseModel):

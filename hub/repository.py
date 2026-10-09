@@ -2440,14 +2440,23 @@ async def list_project_events(
 #: берётся отсюда, а не придумывается рядом.
 EVENTS_RETENTION_DAYS = 14
 
+# #1645: the egress alert's open state IS its newest event. Retention must not
+# delete it, or an outage older than the window would vanish from every reader.
+EGRESS_KINDS = ("egress_down", "egress_restored")
+
 
 async def prune_events(
     db: aiosqlite.Connection, *, keep_days: int = EVENTS_RETENTION_DAYS
 ) -> int:
-    """Delete events older than ``keep_days``. Returns rows removed."""
+    """Delete events older than ``keep_days``. Returns rows removed.
+
+    The newest event of the egress pair stays whatever its age (#1645).
+    """
     cur = await db.execute(
-        "DELETE FROM events WHERE created_at < datetime('now', ?)",
-        (f"-{keep_days} days",),
+        "DELETE FROM events WHERE created_at < datetime('now', ?) "
+        "AND NOT (kind IN (?, ?) AND id = "
+        "(SELECT MAX(id) FROM events WHERE kind IN (?, ?)))",
+        (f"-{keep_days} days", *EGRESS_KINDS, *EGRESS_KINDS),
     )
     return cur.rowcount or 0
 

@@ -489,6 +489,13 @@ async def close_run(
         },
     )
     await db.commit()
+    if run.get("kind") == KIND_ADVISOR:
+        # Локальный советник (#1649): за закрытой строкой может стоять живое
+        # задание в службе ревью — просьба снять его идёт отсюда, потому что
+        # ВСЕ закрытия (дедлайн, пересдача, суждение, остановка) проходят здесь.
+        from hub.services.steward_advisor_local import on_run_closed
+
+        await on_run_closed(db, run, status, reason)
     return True
 
 
@@ -1312,6 +1319,14 @@ async def sweep_steward_runs(db: aiosqlite.Connection) -> None:
     from hub.services.steward_shadow import check_escalation_corridor, start_due_runs
 
     await close_finished_runs(db)
+    # #1649: открытые строки локального советника без живого supervisor (авария
+    # хаба): задание отозвать, строку закрыть, повторного запуска не покупать.
+    try:
+        from hub.services.steward_advisor_local import recover_local_advisor_runs
+
+        await recover_local_advisor_runs(db)
+    except Exception as exc:  # noqa: BLE001 - не роняет проход поллера
+        log.warning("local advisor recovery failed: %s", exc)
     # #1601: ошибочные одобрения пары закрепляются КАЖДЫЙ тик и в любом режиме —
     # события возврата чистятся через 14 дней, а запрос act может прийти позже.
     # Best effort: сбой закрепления не должен ронять проход поллера.

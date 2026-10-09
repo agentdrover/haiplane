@@ -28,6 +28,11 @@ _PREFIXES: tuple[tuple[str, str], ...] = (
     ("qwen", "alibaba"),
     ("llama", "meta"),
     ("mistral", "mistral"),
+    # GLM (Z.ai / Zhipu, #1649). Ставится ДО обёрток: «cursor-glm-5» — это GLM.
+    ("glm", "zhipu"),
+    ("chatglm", "zhipu"),
+    ("zai", "zhipu"),
+    ("zhipu", "zhipu"),
     ("composer", "cursor"),
     ("cursor", "cursor"),
 )

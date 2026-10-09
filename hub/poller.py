@@ -2626,9 +2626,26 @@ async def _red_base_watch(app: FastAPI) -> None:
                 log.exception("Red base watch error")
 
 
+async def _egress_watch(app: FastAPI) -> None:
+    """Probe the way out of the server and keep the egress alert (#1645).
+
+    A task of its own, not a sweep: a probe can wait for its whole deadline,
+    and the main cycle must not wait with it. Own connection, and the network
+    is touched before any write (see ``egress_watch.EgressWatch.step``).
+    """
+    from hub.services import egress_watch
+
+    await egress_watch.run_loop(lambda: _own_connection(app))
+
+
 def start_poller(app: FastAPI) -> asyncio.Task[None]:
-    """Create and return the background poller task."""
+    """Create and return the background poller task.
+
+    The egress watcher is kept in ``app.state.egress_task`` — the caller
+    cancels it with the poller on shutdown (``hub.app.lifespan``).
+    """
     task = asyncio.create_task(_poll_running_tasks(app))
+    app.state.egress_task = asyncio.create_task(_egress_watch(app))
     asyncio.create_task(_session_reaper(app))
     asyncio.create_task(_drift_watch(app))
     asyncio.create_task(_red_base_watch(app))

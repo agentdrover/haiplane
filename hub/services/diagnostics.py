@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 from urllib.parse import urlparse
 
 from hub import config
@@ -13,6 +14,7 @@ from hub.hub_instance import instance_echo_fields
 from hub.integrations.registry import plugins
 from hub.models import (
     EffectivePolicies,
+    EgressStatus,
     HealthView,
     IdentityDiagnosticsView,
     WhoamiView,
@@ -137,7 +139,9 @@ async def build_identity_diagnostics(
     )
 
 
-def build_health() -> HealthView:
+def build_health(egress: dict[str, Any] | None = None) -> HealthView:
+    """``egress`` is the stored state (``egress_watch.egress_status``): read by
+    the caller, so building the view itself touches neither db nor network."""
     auth_required = bool(config.HUB_TOKENS) and not config.HUB_AUTH_DISABLED
     return HealthView(
         status="ok",
@@ -150,4 +154,5 @@ def build_health() -> HealthView:
         vast_enabled=config.VAST_ENABLED,
         cursor_cloud_configured=bool(config.CURSOR_API_KEY),
         stale_env=config.stale_env_names(),
+        egress=EgressStatus(**(egress or {})),
     )

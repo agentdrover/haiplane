@@ -117,10 +117,13 @@ def _submit_order(ci_mode: str) -> list[str]:
     if ci_mode in (project_policy.RED_TEST_WARN, project_policy.RED_TEST_REQUIRE):
         steps.append(CI_LINE)
     steps.append(
-        "hub_submit_for_review — одна сдача на коммит; после changes_requested "
-        "исправить, запушить и сдать новый sha; при ошибке транспорта сначала "
-        "hub_task_status, повтор — только если записи нет; после APPROVED хаб "
-        "вливает сам"
+        "hub_submit_for_review — изменение сданного кода: новый коммит, пуш и "
+        "новая сдача (новое поколение, прежний вердикт не текущий, #1054); "
+        "после changes_requested исправить, запушить и сдать новый sha; повтор "
+        "из review с тем же sha сохраняет поколение, статус и текущесть "
+        "вердикта; finding_outcomes, accept_areas и решение о заказе ревью "
+        "могут обновиться (#1265); при ошибке транспорта сначала "
+        "hub_task_status; после APPROVED хаб вливает сам"
     )
     return steps
 
