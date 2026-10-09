@@ -3340,15 +3340,123 @@ async def record_submission(
     generation: int,
     sha: str,
     base_branch: str,
+    state_snapshot: str = "",
 ) -> None:
-    """Remember which commit a submission pinned (#880)."""
+    """Remember which commit a submission pinned (#880).
+
+    ``state_snapshot`` (#1647) — JSON-снимок AC, rollback и result_kind сдачи
+    state-задачи; у сдачи commit-задачи пуст.
+    """
     await db.execute(
-        "INSERT INTO submissions (task_id, generation, sha, base_branch) "
-        "VALUES (?, ?, ?, ?) ON CONFLICT(task_id, generation) DO UPDATE SET "
+        "INSERT INTO submissions (task_id, generation, sha, base_branch, "
+        "state_snapshot) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(task_id, generation) DO UPDATE SET "
         "sha=excluded.sha, base_branch=excluded.base_branch, "
+        "state_snapshot=excluded.state_snapshot, "
         "submitted_at=datetime('now')",
-        (task_id, generation, sha, base_branch),
+        (task_id, generation, sha, base_branch, state_snapshot),
     )
+
+
+async def insert_task_evidence(
+    db: aiosqlite.Connection,
+    *,
+    task_id: int,
+    generation: int,
+    items: list[dict[str, str]],
+    principal_id: int | None,
+    agent: str,
+) -> int:
+    """Записать комплект доказательств поколения (#1647). Только вставка.
+
+    Зовётся внутри транзакции сдачи: комплект и поколение появляются вместе или
+    не появляются. UNIQUE (task_id, generation, ac_id) в схеме — вторая запись
+    на тот же AC того же поколения падает IntegrityError, а не переписывает.
+    """
+    for item in items:
+        await db.execute(
+            "INSERT INTO task_evidence (task_id, generation, ac_id, action, "
+            "observed, target, observed_at, principal_id, agent) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                generation,
+                item["ac_id"],
+                item["action"],
+                item["observed"],
+                item["target"],
+                item["observed_at"],
+                principal_id,
+                agent,
+            ),
+        )
+    return len(items)
+
+
+async def list_task_evidence(
+    db: aiosqlite.Connection, task_id: int, generation: int | None = None
+) -> list[aiosqlite.Row]:
+    """Доказательства задачи, по поколениям и AC; одно поколение или все."""
+    sql = (
+        "SELECT generation, ac_id, action, observed, target, observed_at, "
+        "principal_id, agent, created_at FROM task_evidence WHERE task_id=?"
+    )
+    params: list[Any] = [task_id]
+    if generation is not None:
+        sql += " AND generation=?"
+        params.append(generation)
+    return await fetchall(db, sql + " ORDER BY generation, ac_id", tuple(params))
+
+
+async def record_state_decision(
+    db: aiosqlite.Connection,
+    task_id: int,
+    *,
+    verdict: str,
+    generation: int,
+    findings_json: str,
+    new_status: str,
+) -> bool:
+    """Вердикт state-задачи и переход статуса — ОДНА условная запись (#1647).
+
+    Условие целиком в SQL: задача — state, в review, живое поколение равно
+    названному, и вердикта на него ещё нет. Любое расхождение даёт 0 строк и
+    False — вызывающий откатывает транзакцию (409 без записей). Так запись
+    вердикта, переход и завершение не расходятся между собой: нет момента, где
+    вердикт записан, а статус нет.
+
+    ``new_status='completed'`` ставит ещё и метку завершения, снимает бронь и
+    прод-дефекту проставляет время восстановления — тем же правилом, что
+    ``update_task`` (#517, #916), только условным.
+    """
+    sets = [
+        "review_verdict=?",
+        "review_verdict_generation=submission_generation",
+        "review_findings=?",
+        "review_self_approved=0",
+        "review_verdict_closed_generation=NULL",
+        "status=?",
+        "status_entered_at=datetime('now')",
+        "updated_at=datetime('now')",
+    ]
+    params: list[Any] = [verdict, findings_json, new_status]
+    if new_status == "completed":
+        sets += [
+            "completed_at=datetime('now')",
+            "claimed_by=NULL",
+            "claim_session_id=NULL",
+            "claimed_at=NULL",
+            "resolved_at=CASE WHEN found_in='prod' AND resolved_at IS NULL "
+            "THEN datetime('now') ELSE resolved_at END",
+        ]
+    cursor = await db.execute(
+        "UPDATE tasks SET " + ", ".join(sets) + " WHERE id=? "  # nosec B608 - constants
+        "AND status='review' AND result_kind='state' AND submission_generation=? "
+        "AND NOT (COALESCE(review_verdict,'')!='' "
+        "AND review_verdict_generation=submission_generation)",
+        (*params, task_id, generation),
+    )
+    return (cursor.rowcount or 0) > 0
 
 
 async def get_submission(

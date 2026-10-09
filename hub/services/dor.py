@@ -77,6 +77,20 @@ DOR_ADVISORY_KEYS: frozenset[str] = frozenset(
     }
 )
 
+#: #1647: пункты профиля задачи-состояния. Не входят в DOR_CHECK_KEYS: у
+#: commit-задачи их в таблице нет вовсе (как workspace_missing), у state
+#: добавляются в конец.
+STATE_ROLLBACK_CHECK = "has_rollback"
+STATE_AC_CHECK = "has_state_ac"
+
+#: Проверки по коду, которые к задаче-состоянию неприменимы: у неё нет ни
+#: областей кода, ни команд проверки. Они отдаются как пройденные с пометкой —
+#: так они не штрафуют оценку и не рождают кодовых рекомендаций.
+STATE_INAPPLICABLE: frozenset[str] = frozenset(
+    {"has_affected_areas", "has_validation_commands"}
+)
+STATE_NOT_APPLICABLE_DETAIL = "not applicable to a state task (no code, no commands)"
+
 STATEMENT_PATHS_CHECK = "statement_paths_resolve"
 #: Начало detail при нарушении — по нему approve находит, что записать в карточку.
 STATEMENT_PATHS_MARK = "Путь постановки не найден на базе и не покрыт affected_areas"
@@ -388,6 +402,30 @@ def _workspace_missing_item(gap: WorkspaceGap) -> DoRCheckItem:
     )
 
 
+def _state_items(rollback: str | None, state_ac_count: int) -> list[DoRCheckItem]:
+    """Пункты профиля state: способ отката и AC, проверяемый человеком."""
+    from hub.services.result_kind import STATE_AC_KINDS
+
+    kinds = ", ".join(STATE_AC_KINDS)
+    return [
+        DoRCheckItem(
+            key=STATE_ROLLBACK_CHECK,
+            passed=bool(rollback and rollback.strip()),
+            detail="rollback is filled" if rollback else "rollback is empty",
+        ),
+        DoRCheckItem(
+            key=STATE_AC_CHECK,
+            passed=state_ac_count > 0,
+            detail=(
+                f"{state_ac_count} AC verifiable by {kinds}"
+                if state_ac_count
+                else f"no AC with verifiable_by in ({kinds}): a test AC alone "
+                "does not prove the state of the world"
+            ),
+        ),
+    ]
+
+
 def evaluate_from_data(
     *,
     work_type: str | None,
@@ -405,6 +443,9 @@ def evaluate_from_data(
     agent_fit: str | None = None,
     statement_paths: StatementPathsResult | None = None,
     workspace_gap: WorkspaceGap | None = None,
+    result_kind: str | None = None,
+    rollback: str | None = None,
+    state_ac_count: int = 0,
 ) -> DoREvaluation:
     """Pure, side-effect-free DoR evaluation from explicit data.
 
@@ -492,11 +533,30 @@ def evaluate_from_data(
         STATEMENT_PATHS_CHECK: _statement_paths_item(statement_paths),
     }
 
+    state = (result_kind or "") == "state"
+    if state:
+        # #1647: профиль work_type минус две кодовые проверки, плюс rollback и
+        # AC, которые человек может проверить. Пути постановки и workspace
+        # проекта — тоже про код, и для state не спрашиваются.
+        for key in STATE_INAPPLICABLE:
+            checks_by_key[key] = DoRCheckItem(
+                key=key, passed=True, detail=STATE_NOT_APPLICABLE_DETAIL
+            )
+        checks_by_key[STATEMENT_PATHS_CHECK] = _statement_paths_item(None)
+        statement_paths = None
+        workspace_gap = None
+
     # Stable order — always DOR_CHECK_KEYS — for deterministic UI rendering.
     checks = [checks_by_key[k] for k in DOR_CHECK_KEYS]
     if workspace_gap is not None:
         checks.append(_workspace_missing_item(workspace_gap))
     required = _required_for(work_type)
+    if state:
+        checks += _state_items(rollback, state_ac_count)
+        required = (required - STATE_INAPPLICABLE) | {
+            STATE_ROLLBACK_CHECK,
+            STATE_AC_CHECK,
+        }
     if (
         statement_paths
         and statement_paths.mode == "require"
@@ -663,6 +723,9 @@ async def evaluate_dor(
     if snapshot is None:
         snapshot = await load_dor_snapshot(db, task_id)
     row = snapshot.task
+    from hub.services.result_kind import is_state, qualifying_ac_count
+
+    state = is_state(row)
 
     # Снимок содержит только отпечатываемые поля: чтение чужого - KeyError, а не
     # тихо устаревший DoR (guard #1610). With strict migrations (review I2) it
@@ -681,8 +744,12 @@ async def evaluate_dor(
         outcome_metric=row["outcome_metric"],
         redesign_decision=row["redesign_decision"],
         agent_fit=row["agent_fit"],
-        statement_paths=await _statement_paths_checked(snapshot),
+        # #1647: у задачи-состояния путей постановки нет, и git не читается.
+        statement_paths=(None if state else await _statement_paths_checked(snapshot)),
         workspace_gap=workspace_gap_from_project(snapshot.project, task_id),
+        result_kind=row["result_kind"],
+        rollback=row["rollback"],
+        state_ac_count=qualifying_ac_count(snapshot.acs),
     )
 
 

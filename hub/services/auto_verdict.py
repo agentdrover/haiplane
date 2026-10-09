@@ -49,6 +49,7 @@ from hub import repository as repo
 from hub.models import ReviewVerdict, RiskClass, TaskReviewVerdict, text_origin_of
 from hub.services import gate_grounds as grounds
 from hub.services.ci_report import VALIDATION_PASS
+from hub.services.result_kind import task_automation_not_applicable
 
 log = logging.getLogger(__name__)
 
@@ -666,6 +667,9 @@ async def maybe_auto_verdict(db: aiosqlite.Connection, task_id: int) -> bool:
     Что решать — отвечает ``autopilot_stance`` (его же читает маршрут
     вердикта, #1440); здесь только то, что делают с ответом.
     """
+    if await task_automation_not_applicable(db, task_id):
+        # #1647: автопилот не выносит вердикт по задаче-состоянию.
+        return False
     stance = await autopilot_stance(db, task_id)
     for alert in stance.audit_alerts:
         await repo.add_task_update(

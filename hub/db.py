@@ -2687,6 +2687,61 @@ _MIGRATIONS: list[tuple[str, str]] = [
         "add_tasks_freeze_rationale",
         "ALTER TABLE tasks ADD COLUMN freeze_rationale TEXT NOT NULL DEFAULT ''",
     ),
+    (
+        # #1647: что является результатом работы. ``commit`` — у всех
+        # существующих задач (DEFAULT), ``state`` — состояние мира без ветки,
+        # PR и CI. Меняется только в draft: проверка в refinement под
+        # write-транзакцией, не в схеме.
+        "add_tasks_result_kind",
+        "ALTER TABLE tasks ADD COLUMN result_kind TEXT NOT NULL DEFAULT 'commit'",
+    ),
+    (
+        # #1647: способ отката результата-состояния. Пусто у commit-задач.
+        "add_tasks_rollback",
+        "ALTER TABLE tasks ADD COLUMN rollback TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1647: снимок AC, rollback и result_kind на момент сдачи state-задачи
+        # (JSON). Доказательства относятся к снимку, а не к тому, что AC
+        # скажут потом. Пусто у сдач commit-задач.
+        "add_submissions_state_snapshot",
+        "ALTER TABLE submissions ADD COLUMN state_snapshot TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        # #1647: доказательства сдачи state-задачи. Одна строка на (задача,
+        # поколение, AC). Только вставка: UPDATE запрещён триггером ниже, а
+        # кода, который правит или удаляет строки, нет. principal_id — автор из
+        # идентичности вызывающего; agent — подпись, которую назвал клиент.
+        # Каскад по задаче оставлен: удаление самой задачи уносит и её след.
+        "create_task_evidence",
+        """CREATE TABLE IF NOT EXISTS task_evidence (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id      INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            generation   INTEGER NOT NULL,
+            ac_id        TEXT    NOT NULL,
+            action       TEXT    NOT NULL,
+            observed     TEXT    NOT NULL,
+            target       TEXT    NOT NULL,
+            observed_at  TEXT    NOT NULL,
+            principal_id INTEGER,
+            agent        TEXT    NOT NULL DEFAULT '',
+            created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (task_id, generation, ac_id)
+        )""",
+    ),
+    (
+        "idx_task_evidence_task",
+        "CREATE INDEX IF NOT EXISTS idx_task_evidence_task "
+        "ON task_evidence(task_id, generation)",
+    ),
+    (
+        "task_evidence_no_update",
+        """CREATE TRIGGER IF NOT EXISTS task_evidence_no_update
+        BEFORE UPDATE ON task_evidence
+        BEGIN
+            SELECT RAISE(ABORT, 'task_evidence is insert-only');
+        END""",
+    ),
 ]
 
 
@@ -2786,6 +2841,9 @@ STRUCTURED_TASK_FIELDS: tuple[str, ...] = (
     # #1236: имя объявленного живого зонда. Часть постановки: она говорит, что
     # именно наблюдать после доставки.
     "live_probe",
+    # #1647: результат работы (commit|state) и способ отката state-результата.
+    "result_kind",
+    "rollback",
     # #1594: обоснование допуска при заморозке проекта; чтение и запись.
     "freeze_rationale",
     "risks",

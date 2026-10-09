@@ -3577,3 +3577,99 @@ async def test_skill_read_failure_is_unreadable_not_inactive(
     assert "RuntimeError" in skill["reason"] and "secret" not in skill["reason"]
     ctx = (await client.get(f"/api/tasks/{task_id}/context")).json()
     assert "навык не прочитан" in ctx["context_text"]
+
+
+# ---- #1647: двери headless и облачного исполнителя закрыты для задачи-состояния ----
+
+
+async def test_state_tasks_refuse_headless_and_cloud_executor_doors(
+    client, db, monkeypatch
+):
+    """AC-8: start, run_immediately, approve(run) и пять дверей облака.
+
+    Отказ приходит ДО заказа, брони, кода сессии и смены статуса: провайдер не
+    зван, строк executor_runs и кодов chat-pair не прибавилось, статус прежний,
+    job_id не выдан. Дверь «задача уже state» проверяется на задачах, которые на
+    коде до задачи заказ получают (поэтому тест красный там).
+    """
+    from hub.integrations.noop import NoopDispatch
+    from hub.integrations.registry import plugins
+    from hub.models import TaskRefine
+    from tests.state_support import fingerprint, make_state_task
+
+    class _CountingDispatch(NoopDispatch):
+        def __init__(self) -> None:
+            self.submitted = 0
+
+        def is_available(self):
+            return True
+
+        async def submit_task(self, *args, **kwargs):
+            self.submitted += 1
+            return {"job_id": "job-state"}
+
+    dispatch = _CountingDispatch()
+    plugins.dispatch = dispatch
+
+    async def counts(task_id: int | None = None) -> tuple[int, int, int]:
+        runs = await db.execute_fetchall("SELECT COUNT(*) FROM executor_runs")
+        codes = await db.execute_fetchall("SELECT COUNT(*) FROM chat_pair_codes")
+        tasks = await db.execute_fetchall("SELECT COUNT(*) FROM tasks")
+        return runs[0][0], codes[0][0], tasks[0][0]
+
+    # --- REST и сервисные двери headless ---
+    opened = await make_state_task(db)
+    before = await fingerprint(db, opened)
+    started = await client.post(
+        f"/api/tasks/{opened}/start", json={"plan": "Plan: headless"}
+    )
+    assert started.status_code in (400, 409, 422), started.text
+    assert await fingerprint(db, opened) == before
+    assert dict(await repo.get_task(db, opened))["job_id"] in (None, "")
+
+    tasks_before = (await counts())[2]
+    created = await client.post(
+        "/api/tasks",
+        json={
+            "title": "сразу в работу",
+            "result_kind": "state",
+            "rollback": "откат",
+            "run_immediately": True,
+        },
+    )
+    assert created.status_code == 422, created.text
+    assert (await counts())[2] == tasks_before, "задача не создана"
+
+    draft = await make_state_task(db, title="драфт", status="draft")
+    approve_before = await fingerprint(db, draft)
+    approved = await client.post(f"/api/tasks/{draft}/approve", json={"run": True})
+    assert approved.status_code in (400, 409, 422), approved.text
+    assert await fingerprint(db, draft) == approve_before
+    assert dispatch.submitted == 0, "headless-задание заказано для state"
+
+    # --- пять дверей облачного исполнителя ---
+    _launch_config(monkeypatch)
+    calls = _creator(monkeypatch, [_CREATED])
+    human = await _human(db)
+    for door in (
+        _door_launch,
+        _door_repair,
+        _door_merge,
+        _door_submit_only,
+        _door_continue,
+    ):
+        task_id, run = await door(db, human)
+        await repo.update_task_structured(
+            db, task_id, TaskRefine(result_kind="state", rollback="откат")
+        )
+        await db.commit()
+        status_before = dict(await repo.get_task(db, task_id))["status"]
+        totals_before = await counts()
+
+        result = await run()
+
+        label = door.__name__
+        assert not result.launched, (label, result)
+        assert await counts() == totals_before, (label, "бронь/код/строка прогона")
+        assert dict(await repo.get_task(db, task_id))["status"] == status_before, label
+    assert calls == [], "провайдер зван ради state-задачи"

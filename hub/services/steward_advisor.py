@@ -47,6 +47,11 @@ from hub import repository as repo
 from hub.db import fetchall
 from hub.integrations import cursor_cloud
 from hub.services.model_family import same_family
+from hub.services.result_kind import (
+    AUTOMATION_REFUSAL,
+    automation_not_applicable,
+    task_automation_not_applicable,
+)
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
     KIND_VERDICT,
@@ -184,7 +189,7 @@ async def order_due_advisors(db: aiosqlite.Connection) -> int:
         return 0
     rows = await fetchall(
         db,
-        "SELECT j.task_id, j.generation FROM steward_judgements j "
+        "SELECT j.task_id, j.generation, t.result_kind FROM steward_judgements j "
         "JOIN tasks t ON t.id = j.task_id "
         "WHERE j.kind='verdict' AND j.verdict='approve' AND j.contour=2 "
         "AND t.status='review' AND t.submission_generation = j.generation "
@@ -195,6 +200,8 @@ async def order_due_advisors(db: aiosqlite.Connection) -> int:
     ordered = 0
     for row in rows:
         task_id, generation = int(dict(row)["task_id"]), int(dict(row)["generation"])
+        if automation_not_applicable(dict(row)):
+            continue  # #1647
         project = await repo.resolve_project_for_task(db, task_id)
         if not _policy_wants_steward(project):
             continue
@@ -207,8 +214,8 @@ async def _order_one(db: aiosqlite.Connection, task_id: int, generation: int) ->
     from hub.services.steward_shadow import reviewer_model
 
     task_row = await repo.get_task(db, task_id)
-    if task_row is None:
-        return False
+    if task_row is None or automation_not_applicable(task_row):
+        return False  # #1647: советнику сдача state-задачи не отдаётся
     implementer = (dict(task_row).get("submission_model") or "").strip()
     reviewer = await reviewer_model(db, task_id, generation)
     judge = await judge_model_of(db, task_id, generation)
@@ -292,6 +299,10 @@ async def start_advisor_run(db: aiosqlite.Connection, order: dict) -> bool:
         await close_run(db, order, RUN_REFUSED, "задача исчезла")
         return False
     task = dict(task_row)
+    if automation_not_applicable(task):
+        # #1647: перепроверка перед оплачиваемым стартом.
+        await close_run(db, order, RUN_REFUSED, AUTOMATION_REFUSAL)
+        return False
     judge_row = await repo.get_steward_judgement(db, task_id, generation, "verdict")
     if (
         task.get("status") != "review"
@@ -726,6 +737,8 @@ async def apply_advisor_outcomes(db: aiosqlite.Connection) -> int:
     for row in rows:
         item = dict(row)
         task_id, generation = int(item["task_id"]), int(item["generation"])
+        if await task_automation_not_applicable(db, task_id):
+            continue  # #1647: исход советника к state-задаче не применяется
         state = await advisor_state(db, task_id, generation)
         if state.state in (STATE_NOT_ORDERED, STATE_PENDING, STATE_NOT_APPLICABLE):
             continue

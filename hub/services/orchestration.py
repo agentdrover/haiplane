@@ -23,6 +23,7 @@ from hub import brand, commit_scope, config
 from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
 from hub.services.prevention_gate import hold_completion
+from hub.services.result_kind import automation_not_applicable
 from hub.services.defect_clocks import (
     change_failure_rate,
     shift_left,
@@ -1981,6 +1982,12 @@ async def dispatch_task(
     task: dict[str, Any],
 ) -> dict[str, Any]:
     """Dispatch a task via oc-dev-dispatch, creating a branch if needed."""
+    if automation_not_applicable(task):
+        # #1647: общий затвор headless-запуска (start, approve(run), создание с
+        # run_immediately, решение владельца о rework). До git, брони и job.
+        from hub.services.state_task import refusal_for_door
+
+        raise refusal_for_door("dispatch")
     ctx = await project_git_context(db, task_id)
     local_kw, _ = _split_git_kwargs(ctx)
     branch = task.get("branch") or ""
@@ -5960,6 +5967,14 @@ async def transition_after_agent_done(
     """Post-done lifecycle shared by headless poller and pair mode."""
     task_id = task["id"]
     branch = task.get("branch")
+    if has_done and automation_not_applicable(task):
+        # #1647: страховка. done-отчёт state-задачи отказан раньше, до вставки
+        # строки (state_task.refuse_done_report); сюда он дойти не должен, и
+        # если дошёл, то завершить задачу без вердикта человека — худший исход.
+        log.error(
+            "done report reached the post-done transition of state task #%s", task_id
+        )
+        return str(task.get("status") or "")
 
     if has_done and not completion_requires_review(task):
         # Delivery gate (#605): a task that owns a PR completes only once

@@ -55,6 +55,12 @@ from hub import repository as repo
 from hub.db import fetchall, write_transaction
 from hub.services.gate_events import NON_HUMAN_GATE_ACTORS
 from hub.services.project_policy import gate_policy_of, gate_value_of
+from hub.services.result_kind import (
+    AUTOMATION_REFUSAL,
+    AUTOMATION_REFUSAL_CODE,
+    automation_not_applicable,
+    task_automation_not_applicable,
+)
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +113,8 @@ REFUSED_DAILY_CAP = "daily_cap"
 REFUSED_ALREADY_ORDERED = "already_ordered"
 REFUSED_NO_GENERATION = "no_generation"
 REFUSED_NO_NEW_INFORMATION = "no_new_information"
+#: #1647: сдача задачи-состояния судье и советнику не отдаётся.
+REFUSED_STATE_TASK = AUTOMATION_REFUSAL_CODE
 # Не отказ, а ОТСРОЧКА (#1289): ревью этой сдачи ещё идёт, и судить пока
 # нечего. Слово то же, что бриф даёт этому факту, — чтобы отсрочка здесь и
 # плашка там назывались одинаково, а не походили друг на друга.
@@ -296,6 +304,19 @@ async def order_run(
             task_id,
             REFUSED_MODE_OFF,
             f"STEWARD_MODE={config.STEWARD_MODE!r} — контур закрыт",
+            generation=generation,
+            kind=kind,
+        )
+        return None
+    if kind != KIND_DOR and await task_automation_not_applicable(db, task_id):
+        # #1647: единый предикат. Суждение о ПОСТАНОВКЕ (dor) state-задаче
+        # положено, о сдаче (судья, советник) — нет: сдача state — доказательства
+        # для человека, и платить за прогон с заранее известной эскалацией нечем.
+        await _refuse(
+            db,
+            task_id,
+            REFUSED_STATE_TASK,
+            AUTOMATION_REFUSAL,
             generation=generation,
             kind=kind,
         )
@@ -876,12 +897,14 @@ async def order_due_runs(db: aiosqlite.Connection) -> int:
     ordered = 0
     rows = await fetchall(
         db,
-        "SELECT id, submission_generation FROM tasks "
+        "SELECT id, submission_generation, result_kind FROM tasks "
         "WHERE status='review' AND (review_job_id IS NULL OR review_job_id='') "
         "AND submission_generation > 0",
     )
     for row in rows:
         task = dict(row)
+        if automation_not_applicable(task):
+            continue  # #1647: сдача state-задачи судье не отдаётся
         task_id, generation = task["id"], task["submission_generation"] or 0
         project = await repo.resolve_project_for_task(db, task_id)
         if not _policy_wants_steward(project):

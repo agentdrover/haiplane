@@ -1863,3 +1863,330 @@ async def test_bulk_children_with_too_many_risks_refuse_before_writes(
         json={"items": [{"title": "child", "risks": [risk] * 51}]},
     )
     assert resp.status_code == 422, resp.text
+
+
+# ---- #1647: задача-состояние (result_kind=state) ----
+
+
+async def test_state_pair_start_has_no_git_and_submit_takes_evidence_without_ci(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-2: ни ветки, ни worktree, ни git-вызова; сдача идёт без CI и ревью.
+
+    Три варианта: git_mode hub и remote под шпионом (любое обращение к git
+    записывается) и noop-адаптер. Проект держит ci_before_submit=require и
+    submission_contract=require: на коде до задачи сдача получила бы 422 по CI
+    (пустой sha → NO_REPORT).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from hub.integrations.noop import NoopGitOps
+    from hub.integrations.registry import plugins
+    from tests.state_support import (
+        GitSpy,
+        evidence_for,
+        evidence_rows,
+        events,
+        feed,
+        make_project,
+        make_state_task,
+        pair_start,
+        submit,
+    )
+
+    pid = await make_project(
+        db,
+        "state-ci",
+        {"ci_before_submit": "require", "submission_contract": "require"},
+    )
+    variants = (("hub", GitSpy()), ("remote", GitSpy()), ("hub", NoopGitOps()))
+    for mode, git in variants:
+        task_id = await make_state_task(db, project_id=pid)
+        plugins.git_ops = git
+
+        started = await pair_start(client, task_id, git_mode=mode)
+        assert started.status_code == 200, started.text
+        view = started.json()
+        assert not view["branch"], f"у state-задачи нет ветки: {view['branch']!r}"
+        assert not view.get("worktree_path") and not view.get("worktree_hint"), view
+        assert view["status"] == "running"
+        stored = dict(await repo.get_task(db, task_id))
+        assert not stored["branch"], stored["branch"]
+        if isinstance(git, GitSpy):
+            assert git.calls == [], f"git-вызовы на pair-start: {git.calls}"
+
+        with patch(
+            "hub.services.review_dispatch.maybe_dispatch_review", new=AsyncMock()
+        ) as dispatch:
+            sent = await submit(client, task_id, evidence_for())
+        assert sent.status_code == 200, sent.text
+        done = sent.json()
+        assert done["status"] == "review"
+        assert done["submission_generation"] == 1
+        assert done["submission_sha"] == ""
+        dispatch.assert_not_awaited()
+        if isinstance(git, GitSpy):
+            assert git.calls == [], f"git-вызовы на сдаче: {git.calls}"
+
+        text = " ".join(u["content"] for u in await feed(db, task_id))
+        assert "НЕ закреплена" not in text, (
+            "алерта «вершина не закреплена» быть не должно"
+        )
+        kinds = {e["kind"] for e in await events(db, task_id)}
+        assert "review_ordered_without_ci" not in kinds
+        assert not await db.execute_fetchall(
+            "SELECT 1 FROM review_dispatches WHERE task_id=?", (task_id,)
+        )
+        assert len(await evidence_rows(db, task_id)) == 2
+
+        submission = await repo.get_submission(db, task_id, 1)
+        assert submission is not None
+        snapshot = json.loads(dict(submission).get("state_snapshot") or "{}")
+        assert snapshot.get("result_kind") == "state", snapshot
+        assert snapshot.get("rollback"), snapshot
+        assert [a["id"] for a in snapshot.get("acceptance_criteria", [])] == [
+            "AC-1",
+            "AC-2",
+        ]
+
+
+async def test_state_submit_refuses_bad_evidence_without_side_effects(
+    client: AsyncClient, db: aiosqlite.Connection, caplog
+):
+    """AC-3: каждая ошибка контракта доказательств — 422 без входных значений.
+
+    Названы AC или вид ошибки; ни ответ, ни лог не содержат присланных
+    значений; поколение, статус, сдачи, task_evidence и лента не изменились.
+    """
+    import logging
+
+    from tests.state_support import (
+        MARKER,
+        evidence_for,
+        fingerprint,
+        make_state_task,
+        pair_start,
+        submit,
+    )
+
+    secret = "ghp_" + "aB3dE5gH7jK9" * 3  # pragma: allowlist secret
+    assert len(secret) == 40
+    task_id = await make_state_task(db)
+    assert (await pair_start(client, task_id)).status_code == 200
+
+    def good(**over):
+        return evidence_for(("AC-1", "AC-2"), observed=f"{MARKER} ok", **over)
+
+    cases = [
+        ("missing_ac", good()[:1], "AC-2"),
+        ("duplicate_ac", good() + good()[:1], "AC-1"),
+        ("unknown_ac", good() + [dict(good()[0], ac_id="AC-9")], "AC-9"),
+        ("empty_value", [dict(good()[0], observed=""), good()[1]], "AC-1"),
+        ("empty_value", [dict(good()[0], observed="  \n\t "), good()[1]], "AC-1"),
+        ("empty_set", [], ""),
+        (
+            "too_long",
+            [dict(good()[0], observed=MARKER + "x" * 6000), good()[1]],
+            "AC-1",
+        ),
+        (
+            "secret",
+            [dict(good()[0], observed=f"ответ {secret} получен"), good()[1]],
+            "AC-1",
+        ),
+        (
+            "secret",
+            [dict(good()[0], action=f"curl -H 'X: {secret}'"), good()[1]],
+            "AC-1",
+        ),
+        ("type", [dict(good()[0], observed=12345), good()[1]], "AC-1"),
+    ]
+    caplog.set_level(logging.DEBUG)
+    for kind, payload, ac_name in cases:
+        before = await fingerprint(db, task_id)
+        resp = await submit(client, task_id, payload)
+        label = f"{kind}/{ac_name}"
+        assert resp.status_code == 422, (label, resp.status_code, resp.text)
+        body = resp.text
+        detail = resp.json()["detail"]
+        assert isinstance(detail, dict), (label, detail)
+        assert detail.get("reason") == "state_evidence_invalid", (label, detail)
+        assert detail.get("kind") == kind, (label, detail)
+        if ac_name:
+            assert ac_name in body, (label, "AC не назван", body)
+        for leaked in (MARKER, secret, "12345", "x" * 50):
+            assert leaked not in body, (label, "ответ вернул вход", leaked)
+            assert leaked not in caplog.text, (label, "лог хранит вход", leaked)
+        assert await fingerprint(db, task_id) == before, label
+
+    # Не список и неизвестное поле записи — тоже отказ без входа.
+    for payload in ("текст вместо списка " + MARKER, [dict(good()[0], extra=MARKER)]):
+        before = await fingerprint(db, task_id)
+        resp = await submit(client, task_id, payload)
+        assert resp.status_code == 422, resp.text
+        assert MARKER not in resp.text and MARKER not in caplog.text
+        assert await fingerprint(db, task_id) == before
+
+
+async def test_state_done_report_does_not_complete_without_accepted_evidence(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-5: done-отчёт по state без принятой сдачи — отказ без побочных эффектов.
+
+    При auto_review true и false: ни done-строки, ни bump поколения, ни
+    перехода. /force-complete и /decide accept остаются аудируемыми исключениями.
+    """
+    from tests.state_support import fingerprint, make_state_task, pair_start
+
+    for auto_review in (True, False):
+        task_id = await make_state_task(db)
+        await repo.update_task(db, task_id, auto_review=int(auto_review))
+        await db.commit()
+        assert (await pair_start(client, task_id)).status_code == 200
+        before = await fingerprint(db, task_id)
+
+        resp = await client.post(
+            f"/api/tasks/{task_id}/updates",
+            json={"agent": "dev", "kind": "done", "content": "DNS переключён"},
+        )
+
+        assert resp.status_code in (400, 409, 422), (auto_review, resp.text)
+        after = await fingerprint(db, task_id)
+        assert after == before, (auto_review, before, after)
+        assert after["status"] == "running" and after["generation"] == 0
+        kinds = [u["kind"] for u in await repo.get_task_updates(db, task_id)]
+        assert "done" not in kinds, "отказанный отчёт не оставляет done-строки"
+
+    # Аудируемые исключения остаются.
+    forced_id = await make_state_task(db)
+    assert (await pair_start(client, forced_id)).status_code == 200
+    forced = await client.post(
+        f"/api/tasks/{forced_id}/force-complete",
+        json={"comment": "владелец закрыл вручную: проверено на месте"},
+    )
+    assert forced.status_code == 200, forced.text
+    assert forced.json()["status"] == "completed"
+
+    decided_id = await make_state_task(db)
+    assert (await pair_start(client, decided_id)).status_code == 200
+    await repo.update_task(db, decided_id, status="needs_decision")
+    await db.commit()
+    accepted = await client.post(
+        f"/api/tasks/{decided_id}/decide",
+        json={"action": "accept", "decision_summary": "принято владельцем"},
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["status"] == "completed"
+
+
+async def test_state_statement_is_frozen_between_submission_and_rework(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-6: AC, rollback и result_kind замёрзли после сдачи до возврата в работу.
+
+    В review и в running после сдачи отказывают refine, bulk-refine, весь AC
+    CRUD и смена result_kind; отказ называет путь «возврат в работу и новая
+    сдача». В draft result_kind и AC меняются, после return-to-work — тоже.
+    """
+    from tests.state_support import drive_to_review, fingerprint, make_state_task
+
+    new_ac = {
+        "id": "AC-3",
+        "given": "g",
+        "when": "w",
+        "then": "t",
+        "verifiable_by": "manual",
+    }
+    changed = dict(new_ac, id="AC-1")
+
+    def attempts(tid: int):
+        base = f"/api/tasks/{tid}"
+        return {
+            "refine rollback": lambda: client.post(
+                f"{base}/refine", json={"rollback": "иной откат"}
+            ),
+            "refine ac": lambda: client.post(
+                f"{base}/refine", json={"acceptance_criteria": [new_ac]}
+            ),
+            "refine kind": lambda: client.post(
+                f"{base}/refine", json={"result_kind": "commit"}
+            ),
+            "bulk refine": lambda: client.post(
+                "/api/tasks/refine-bulk",
+                json={"items": [{"task_id": tid, "rollback": "иной откат"}]},
+            ),
+            "ac add": lambda: client.post(f"{base}/acceptance_criteria", json=new_ac),
+            "ac upsert": lambda: client.put(
+                f"{base}/acceptance_criteria/AC-1", json=changed
+            ),
+            "ac replace": lambda: client.put(
+                f"{base}/acceptance_criteria", json=[changed]
+            ),
+            "ac delete": lambda: client.delete(f"{base}/acceptance_criteria/AC-2"),
+        }
+
+    async def assert_all_refused(tid: int, phase: str) -> None:
+        acs = (await client.get(f"/api/tasks/{tid}/acceptance_criteria")).json()
+        before = await fingerprint(db, tid)
+        for name, call in attempts(tid).items():
+            resp = await call()
+            assert resp.status_code in (409, 422), (phase, name, resp.text)
+            assert "возврат в работу" in resp.text, (phase, name, resp.text)
+        assert await fingerprint(db, tid) == before, phase
+        assert (
+            await client.get(f"/api/tasks/{tid}/acceptance_criteria")
+        ).json() == acs, phase
+        stored = dict(await repo.get_task(db, tid))
+        assert (
+            stored.get("rollback") == "Вернуть запись DNS на прежний адрес из карточки"
+        )
+
+    in_review = await make_state_task(db)
+    await drive_to_review(client, db, in_review)
+    await assert_all_refused(in_review, "review")
+
+    sent_back = await client.post(
+        f"/api/tasks/{in_review}/review-verdict",
+        json={
+            "verdict": "changes_requested",
+            "agent": "rev",
+            "comments": "AC-2 снят без оговорки",
+            "expected_generation": 1,
+        },
+    )
+    assert sent_back.status_code == 200, sent_back.text
+    assert sent_back.json()["status"] == "running"
+    await assert_all_refused(in_review, "running после сдачи")
+
+    # Явный возврат в работу размораживает постановку.
+    second = await make_state_task(db, title="вторая")
+    await drive_to_review(client, db, second)
+    returned = await client.post(
+        f"/api/tasks/{second}/return-to-work", json={"reason": "поменялась цель"}
+    )
+    assert returned.status_code == 200, returned.text
+    refined = await client.post(
+        f"/api/tasks/{second}/refine", json={"rollback": "новый откат"}
+    )
+    assert refined.status_code == 200, refined.text
+    added = await client.post(f"/api/tasks/{second}/acceptance_criteria", json=new_ac)
+    assert added.status_code == 201, added.text
+
+    # draft: result_kind и AC меняются; в open result_kind уже не меняется.
+    draft = await make_state_task(db, title="черновик", status="draft")
+    for kind in ("commit", "state"):
+        resp = await client.post(
+            f"/api/tasks/{draft}/refine", json={"result_kind": kind}
+        )
+        assert resp.status_code == 200, (kind, resp.text)
+        assert resp.json()["result_kind"] == kind
+    assert (
+        await client.post(f"/api/tasks/{draft}/acceptance_criteria", json=new_ac)
+    ).status_code == 201
+    opened = await make_state_task(db, title="открытая")
+    resp = await client.post(
+        f"/api/tasks/{opened}/refine", json={"result_kind": "commit"}
+    )
+    assert resp.status_code == 422, resp.text
+    assert "draft" in resp.text
+    assert dict(await repo.get_task(db, opened)).get("result_kind") == "state"

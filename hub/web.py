@@ -3365,6 +3365,16 @@ def _review_form_error(
     )
 
 
+def _is_state_verdict_refusal(exc: HTTPException) -> bool:
+    """403/409 вердикта по задаче-состоянию (#1647) показываются в форме."""
+    detail = exc.detail
+    return (
+        isinstance(detail, dict)
+        and str(detail.get("reason") or "").startswith("state_")
+        and exc.status_code in (403, 409)
+    )
+
+
 @router.post("/tasks/{task_id}/web-review-verdict")
 async def web_review_verdict(
     task_id: int,
@@ -3373,6 +3383,7 @@ async def web_review_verdict(
     comments: str = Form(""),
     findings_text: str = Form(""),
     acknowledge_repeat: str = Form(""),
+    expected_generation: str = Form(""),
 ):
     """Submit a review verdict from the task card panel (#321).
 
@@ -3415,6 +3426,12 @@ async def web_review_verdict(
             # confirmation has to exist here too — a refusal a human cannot
             # answer where he typed is a wall, not a check.
             acknowledge_repeat=bool(acknowledge_repeat),
+            # #1647: скрытое поле формы state-задачи; у commit-задачи пусто.
+            expected_generation=(
+                int(expected_generation)
+                if expected_generation.strip().isdigit()
+                else None
+            ),
         )
     except ValidationError as exc:
         errors = exc.errors()
@@ -3430,9 +3447,10 @@ async def web_review_verdict(
             self_approved=self_approved,
             principal_id=identity.principal_id,
             agent_caller=identity.is_agent,
+            human_caller=identity.is_human,
         )
     except HTTPException as exc:
-        if exc.status_code != 422:
+        if exc.status_code != 422 and not _is_state_verdict_refusal(exc):
             raise
         return _review_form_error(request, task_id, _verdict_refusal_text(exc.detail))
     if _is_htmx(request):

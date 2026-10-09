@@ -110,6 +110,12 @@ async def statement_fingerprint(db: aiosqlite.Connection, task_id: int) -> str:
         return ""
     task = dict(row)
     payload: dict[str, Any] = {f: task.get(f) for f in STATEMENT_FIELDS}
+    if (task.get("result_kind") or "commit") == "state":
+        # #1647: способ отката и вид результата — часть постановки state-задачи.
+        # Ключи кладутся ТОЛЬКО у state: отпечаток commit-задачи не меняется, и
+        # ни одна из них не получает ревизию постановки из-за этой задачи.
+        payload["result_kind"] = "state"
+        payload["rollback"] = task.get("rollback") or ""
 
     ac_rows = await fetchall(
         db,
