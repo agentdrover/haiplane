@@ -2567,6 +2567,23 @@ async def api_deliver_delivery_discrepancy(
         ) from exc
 
 
+async def _enforce_ci_scope(db, identity, project_slug, *, entrance: str) -> None:
+    """403 when the key may not speak for this project (#1644)."""
+    from hub.services import ci_scope
+
+    try:
+        await ci_scope.enforce_ci_project_scope(
+            db, identity, project_slug, entrance=entrance
+        )
+    except ci_scope.CIScopeRefused as exc:
+        raise HTTPException(
+            403,
+            detail=enrich_error_payload(
+                {"reason": exc.reason, "actor_hint": "human", "message": exc.message}
+            ),
+        ) from None
+
+
 @app.post("/api/deploys", response_model=DeployView)
 async def api_record_deploy(
     body: DeployCallback,
@@ -2585,8 +2602,11 @@ async def api_record_deploy(
     redelivers the same callback. Two rows would claim two deploys.
     """
     db = _db(request)
-    project_id = None
     slug = (body.project or "").strip()
+    # #1644: before any lookup or write — a key bound to a project records
+    # deploys of that project only, and must name it.
+    await _enforce_ci_scope(db, identity, slug or None, entrance="deploy")
+    project_id = None
     if slug:
         project = await repo.get_project_by_slug(db, slug)
         if not project:
@@ -2644,6 +2664,15 @@ async def api_ci_run_report(
     row = await repo.get_task(db, task_id)
     if row is None:
         raise HTTPException(404, "task not found")
+    # #1644: the project check comes before the stale check and before every
+    # write — a report from a key of another project changes nothing.
+    project_row = await repo.resolve_project_for_task(db, task_id)
+    await _enforce_ci_scope(
+        db,
+        identity,
+        str(dict(project_row)["slug"]) if project_row is not None else "default",
+        entrance="ci_report",
+    )
     current_generation = dict(row).get("submission_generation") or 0
     if (
         body.submission_generation is not None
@@ -2664,7 +2693,9 @@ async def api_ci_run_report(
             validation_status=body.validation_status,
             validation_log=body.validation_log,
             reason=body.reason,
-            reported_by=body.reported_by or identity.username,
+            # #1644: the name is the key's principal; ``body.reported_by`` is the
+            # client's claim and decides nothing.
+            reported_by=identity.username,
             checks=body.checks,
             # #1606: a key the reporter did not send is NOT an empty object —
             # the step behind it did not run, and what the hub already stored
@@ -3824,13 +3855,17 @@ async def api_admin_create_key(
 
     identity = _identity
     body = ApiKeyCreate(**(await request.json()))
-    key_data = await admin_svc.create_api_key(
-        _db(request),
-        principal_id,
-        name=body.name,
-        expires_days=body.expires_days,
-        created_by=identity.principal_id,
-    )
+    try:
+        key_data = await admin_svc.create_api_key(
+            _db(request),
+            principal_id,
+            name=body.name,
+            expires_days=body.expires_days,
+            created_by=identity.principal_id,
+            projects=body.projects,
+        )
+    except admin_svc.ApiKeyScopeError as exc:
+        raise HTTPException(422, str(exc)) from None
     await admin_svc.write_audit(
         _db(request),
         actor_id=identity.principal_id,

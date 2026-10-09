@@ -4221,6 +4221,7 @@ async def web_admin_create_key(
     principal_id: int = Form(...),
     name: str = Form(...),
     expires_days: int = Form(0),
+    project: str = Form(""),
 ):
     _require_admin_web(request)
     from hub.services import admin as admin_svc
@@ -4232,13 +4233,17 @@ async def web_admin_create_key(
         return await _render_keys_page(
             request, flash_msg="Principal not found", flash_level="error"
         )
-    key_info = await admin_svc.create_api_key(
-        db,
-        principal_id,
-        name=name.strip(),
-        expires_days=expires_days if expires_days > 0 else None,
-        created_by=actor_id,
-    )
+    try:
+        key_info = await admin_svc.create_api_key(
+            db,
+            principal_id,
+            name=name.strip(),
+            expires_days=expires_days if expires_days > 0 else None,
+            created_by=actor_id,
+            projects=[project] if project.strip() else None,
+        )
+    except admin_svc.ApiKeyScopeError as exc:
+        return await _render_keys_page(request, flash_msg=str(exc), flash_level="error")
     await admin_svc.write_audit(
         db,
         actor_id=actor_id,

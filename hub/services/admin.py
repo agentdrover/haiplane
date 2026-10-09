@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -406,6 +407,50 @@ async def set_principal_roles(
 # ---------------------------------------------------------------------------
 
 
+SCOPE_PROJECT_PREFIX = "project:"
+
+
+class ApiKeyScopeError(ValueError):
+    """A key cannot be bound to the named project (unknown or inactive)."""
+
+
+def parse_key_scopes(raw: Any) -> tuple[tuple[str, ...], bool]:
+    """Read ``api_keys.scopes`` (#1644): ``(project slugs, damaged)``.
+
+    ``'[]'`` is the legacy "no restriction" and gives ``((), False)``. Anything
+    that is not a JSON list of ``"project:<slug>"`` strings is damaged: the
+    caller refuses such a key instead of treating it as unrestricted.
+    """
+    try:
+        data = json.loads(raw if raw not in (None, "") else "[]")
+    except (TypeError, ValueError):
+        return (), True
+    if not isinstance(data, list):
+        return (), True
+    slugs: list[str] = []
+    for item in data:
+        if (
+            not isinstance(item, str)
+            or not item.startswith(SCOPE_PROJECT_PREFIX)
+            or not item[len(SCOPE_PROJECT_PREFIX) :].strip()
+        ):
+            return (), True
+        slugs.append(item[len(SCOPE_PROJECT_PREFIX) :].strip())
+    return tuple(slugs), False
+
+
+async def _scope_entries(
+    db: aiosqlite.Connection, projects: list[str] | None
+) -> list[str]:
+    entries: list[str] = []
+    for slug in dict.fromkeys(s.strip() for s in projects or [] if s and s.strip()):
+        rows = await fetchall(db, "SELECT status FROM projects WHERE slug = ?", (slug,))
+        if not rows or dict(rows[0]).get("status") != "active":
+            raise ApiKeyScopeError(f"project {slug!r} not found or not active")
+        entries.append(f"{SCOPE_PROJECT_PREFIX}{slug}")
+    return entries
+
+
 async def create_api_key(
     db: aiosqlite.Connection,
     principal_id: int,
@@ -413,7 +458,9 @@ async def create_api_key(
     name: str,
     expires_days: int | None = None,
     created_by: int | None = None,
+    projects: list[str] | None = None,
 ) -> dict[str, Any]:
+    scopes = await _scope_entries(db, projects)
     plaintext, prefix, key_hash = generate_api_key()
     expires_at: str | None = None
     if expires_days:
@@ -422,9 +469,17 @@ async def create_api_key(
         ).isoformat()
 
     cursor = await db.execute(
-        "INSERT INTO api_keys (principal_id, name, key_prefix, key_hash, expires_at, created_by) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (principal_id, name, prefix, key_hash, expires_at, created_by),
+        "INSERT INTO api_keys (principal_id, name, key_prefix, key_hash, expires_at, "
+        "created_by, scopes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            principal_id,
+            name,
+            prefix,
+            key_hash,
+            expires_at,
+            created_by,
+            json.dumps(scopes),
+        ),
     )
     key_id = cursor.lastrowid
     await db.commit()
@@ -439,6 +494,8 @@ async def create_api_key(
         "created_by": created_by,
         "last_used_at": None,
         "revoked_at": None,
+        "scopes": scopes,
+        "scopes_damaged": False,
         "plaintext_key": plaintext,
     }
 
@@ -456,7 +513,15 @@ async def list_api_keys(
         rows = await fetchall(
             db, "SELECT * FROM api_keys ORDER BY id DESC LIMIT ?", (limit,)
         )
-    return [dict(r) for r in rows]
+    return [_key_view_row(dict(r)) for r in rows]
+
+
+def _key_view_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Replace the raw ``scopes`` text by the list the API and the UI show."""
+    slugs, damaged = parse_key_scopes(row.get("scopes"))
+    row["scopes"] = [f"{SCOPE_PROJECT_PREFIX}{s}" for s in slugs]
+    row["scopes_damaged"] = damaged
+    return row
 
 
 async def revoke_api_key(db: aiosqlite.Connection, key_id: int) -> bool:
@@ -513,6 +578,7 @@ async def resolve_api_key(
 
     perms = await get_principal_permissions(db, row["principal_id"])
     role = await get_effective_role(db, row["principal_id"])
+    slugs, damaged = parse_key_scopes(row.get("scopes"))
     return TokenIdentity(
         username=row["username"],
         role=role,
@@ -520,6 +586,8 @@ async def resolve_api_key(
         permissions=perms,
         auth_source="db_api_key",
         api_key_id=row["id"],
+        scopes=slugs or None,
+        scopes_damaged=damaged,
     )
 
 

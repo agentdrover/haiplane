@@ -395,6 +395,8 @@ def _with_auth_source(
         chat_pair_kind=identity.chat_pair_kind,
         chat_pair_task_id=identity.chat_pair_task_id,
         chat_pair_generation=identity.chat_pair_generation,
+        scopes=identity.scopes,
+        scopes_damaged=identity.scopes_damaged,
     )
 
 

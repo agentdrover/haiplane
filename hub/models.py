@@ -4353,6 +4353,9 @@ class RoleView(BaseModel):
 class ApiKeyCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     expires_days: int | None = Field(default=None, ge=1, le=3650)
+    # #1644: slugs of the projects the key may speak for (CI report, deploy).
+    # Empty = no restriction (legacy).
+    projects: list[str] = Field(default_factory=list, max_length=50)
 
 
 class ApiKeyView(BaseModel):
@@ -4365,6 +4368,9 @@ class ApiKeyView(BaseModel):
     revoked_at: str | None = None
     created_at: str = ""
     created_by: int | None = None
+    # #1644: ``["project:<slug>"]``; empty = not bound to a project (legacy).
+    scopes: list[str] = Field(default_factory=list)
+    scopes_damaged: bool = False
 
     @field_validator(
         "expires_at", "last_used_at", "revoked_at", "created_at", mode="before"

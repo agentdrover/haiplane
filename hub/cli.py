@@ -1889,6 +1889,8 @@ def cmd_admin_keys_create(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {"name": args.name}
     if getattr(args, "expires_days", None):
         body["expires_days"] = args.expires_days
+    if getattr(args, "project", None):
+        body["projects"] = list(args.project)
     result = _api("POST", f"/api/admin/principals/{target['id']}/api-keys", body)
     print(
         f"API key created (id={result.get('id')}, prefix={result.get('key_prefix')}…)"
@@ -3144,6 +3146,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_keys_create.add_argument("--name", required=True, help="Key name/description")
     p_keys_create.add_argument(
         "--expires-days", dest="expires_days", type=int, default=None
+    )
+    p_keys_create.add_argument(
+        "--project",
+        action="append",
+        default=None,
+        help="Bind the key to a project slug (repeatable); CI keys should be bound",
     )
     p_keys_create.set_defaults(func=cmd_admin_keys_create)
 
