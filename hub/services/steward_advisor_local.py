@@ -56,6 +56,11 @@ from hub import config
 from hub import repository as repo
 from hub.db import fetchall
 from hub.integrations import local_reviewer
+from hub.services.result_kind import (
+    AUTOMATION_REFUSAL,
+    automation_not_applicable,
+    task_automation_not_applicable,
+)
 from hub.services.steward_dispatch import (
     KIND_ADVISOR,
     PENDING_PREFIX,
@@ -256,6 +261,11 @@ async def start_local_advisor(db: aiosqlite.Connection, order: dict[str, Any]) -
     """
     from hub.services import steward_shadow as shadow
 
+    if await task_automation_not_applicable(db, int(order["task_id"])):
+        # #1647: единый предикат. Вход сюда один — start_advisor_run, и он уже
+        # отказал бы; но модуль зовётся и напрямую, а захват и код стоят денег.
+        await close_run(db, order, RUN_REFUSED, AUTOMATION_REFUSAL)
+        return False
     problem = await path_problem(db)
     if problem is not None:
         code, text = problem
@@ -419,6 +429,11 @@ async def _remaining_sec(db: aiosqlite.Connection, run_id: int) -> int:
 async def _nothing_to_answer(db: aiosqlite.Connection, handle: _Handle) -> str:
     """Почему отвечать больше не на что (пусто — есть на что), по свежим строкам."""
     task_row = await repo.get_task(db, handle.task_id)
+    if task_row is not None and automation_not_applicable(task_row):
+        # #1647: обе последние проверки (после очереди и перед публикацией)
+        # идут через эту функцию — задача-состояние не получает ни кода, ни
+        # задания, даже если стала такой за время ожидания слота.
+        return AUTOMATION_REFUSAL
     judge = await repo.get_steward_judgement(
         db, handle.task_id, handle.generation, "verdict"
     )
