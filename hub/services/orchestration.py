@@ -6151,11 +6151,25 @@ def review_budget_exhausted(review_cycle: int, max_cycles: int | None = None) ->
     return review_cycle >= max_cycles
 
 
+def _state_task_refused(task: dict[str, Any], what: str) -> bool:
+    """Headless-диспетчеру задача-состояние не отдаётся (#1647): True — отказ.
+
+    Страховка: в эти функции state-задача не попадает по построению (у неё нет
+    job, ветки и ci_check), и если попала, платить заданием нельзя.
+    """
+    if not automation_not_applicable(task):
+        return False
+    log.error("%s refused for state task #%s", what, task.get("id"))
+    return True
+
+
 async def dispatch_review(
     db: aiosqlite.Connection,
     task: dict[str, Any],
 ) -> None:
     """Dispatch a code-review job for a completed task."""
+    if _state_task_refused(task, "dispatch_review"):
+        return
     task_id = task["id"]
     review_cycle = task.get("review_cycle", 0)
     breadcrumb = await get_breadcrumb_str(db, task_id)
@@ -6236,6 +6250,8 @@ async def dispatch_fix(
     review_comments: str,
 ) -> None:
     """Dispatch a fix job back to the developer agent."""
+    if _state_task_refused(task, "dispatch_fix"):
+        return
     task_id = task["id"]
     review_cycle = task.get("review_cycle", 0) + 1
     message = plugins.dispatch.build_fix_message(
@@ -6312,6 +6328,8 @@ async def dispatch_arbiter(
     ``running`` with the job id on success; a crash between submit and job id
     leaves ``dispatching`` for the poller's ambiguity watchdog to resolve.
     """
+    if _state_task_refused(task, "dispatch_arbiter"):
+        return
     task_id = task["id"]
     generation = task.get("submission_generation") or 0
 
@@ -6399,6 +6417,8 @@ async def dispatch_ci_fix(
     ci_failures: dict[str, Any],
 ) -> None:
     """Dispatch developer to fix CI failures."""
+    if _state_task_refused(task, "dispatch_ci_fix"):
+        return
     task_id = task["id"]
     ci_fix_cycle = task.get("ci_fix_cycle", 0)
     message = plugins.dispatch.build_ci_fix_message(

@@ -5388,6 +5388,31 @@ async def return_to_work(
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
 
 
+async def _dispatch_rework(
+    db: aiosqlite.Connection, task_id: int, task: dict[str, Any], instructions: str
+) -> None:
+    """Rework commit-задачи после арбитража: fix-задание или, без него, open."""
+    message = plugins.dispatch.build_fix_message(
+        task_id=task_id,
+        title=task["title"],
+        description=task.get("description", ""),
+        review_comments=instructions,
+        review_cycle=0,
+        max_cycles=config.MAX_REVIEW_CYCLES,
+    )
+    runtime = task.get("runtime", "auto")
+    result = await plugins.dispatch.submit_task(
+        message, runtime=runtime, task_id=task_id
+    )
+    job_id = result.get("job_id")
+    if job_id:
+        await repo.update_task(db, task_id, status="fix_requested", job_id=job_id)
+    else:
+        await repo.update_task(db, task_id, status="open")
+        await reset_mis_issued_assignment(db, task_id, task)
+    await db.commit()
+
+
 async def decide_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -5493,25 +5518,16 @@ async def decide_task(
         )
         await db.commit()
 
-        message = plugins.dispatch.build_fix_message(
-            task_id=task_id,
-            title=task["title"],
-            description=task.get("description", ""),
-            review_comments=instructions,
-            review_cycle=0,
-            max_cycles=config.MAX_REVIEW_CYCLES,
-        )
-        runtime = task.get("runtime", "auto")
-        result = await plugins.dispatch.submit_task(
-            message, runtime=runtime, task_id=task_id
-        )
-        job_id = result.get("job_id")
-        if job_id:
-            await repo.update_task(db, task_id, status="fix_requested", job_id=job_id)
+        if is_state(task):
+            # #1647: rework задачи-состояния не заказывает headless-задание —
+            # её руками делает человек или агент в pair. Задача возвращается в
+            # open (как при return-to-work): постановку можно править, затем
+            # новая сдача.
+            from hub.services.state_task import rework_without_dispatch
+
+            await rework_without_dispatch(db, task_id)
         else:
-            await repo.update_task(db, task_id, status="open")
-            await reset_mis_issued_assignment(db, task_id, task)
-        await db.commit()
+            await _dispatch_rework(db, task_id, task, instructions)
         await log_activity(
             db,
             "task_decided",

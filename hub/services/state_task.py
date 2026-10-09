@@ -635,6 +635,39 @@ async def record_state_verdict(
 # ---------------------------------------------------------------------------
 
 
+async def rework_without_dispatch(db: aiosqlite.Connection, task_id: int) -> None:
+    """Rework state-задачи после арбитража: в open, без задания (#1647).
+
+    Тот же исход, что у fix-пути без job_id, но осознанный: держатель и сессия
+    сняты, чтобы задачу мог взять любой. Коммит — здесь, как у commit-пути.
+    """
+    from hub.services.sessions import note_session_task
+
+    row = await repo.get_task(db, task_id)
+    session = str(dict(row).get("claim_session_id") or "") if row is not None else ""
+    await repo.update_task(
+        db,
+        task_id,
+        status="open",
+        job_id=None,
+        review_job_id=None,
+        claimed_by=None,
+        claim_session_id=None,
+        claimed_at=None,
+        implementer_principal_id=None,
+    )
+    await note_session_task(db, session, None)
+    await repo.add_task_update(
+        db,
+        task_id,
+        "hub",
+        "status",
+        "Rework по решению человека: задача-состояние возвращена в open без "
+        "headless-задания; постановку можно править, затем новая сдача.",
+    )
+    await db.commit()
+
+
 def refuse_done_report(task: dict[str, Any]) -> None:
     """done-отчёт state-задачи не сдача и не завершение (#1647).
 

@@ -625,3 +625,332 @@ def test_a_missing_hub_error_is_an_http_exception_with_a_dict_detail():
     refusal = evidence_refusal(exc)
     assert isinstance(refusal, HTTPException) and refusal.status_code == 422
     assert refusal.detail["kind"] == "secret"
+
+
+# --- двери автоматики: каждая названа и проверена сама по себе -----------------
+
+
+async def _state_in_review(
+    db: aiosqlite.Connection, project_id: int | None = None
+) -> int:
+    """State-задача в review, поколение 1 — без пути через REST."""
+    task_id = await make_state_task(db, project_id=project_id)
+    await db.execute(
+        "UPDATE tasks SET status='review', submission_generation=1, "
+        "submission_model='claude-fable-5' WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    return task_id
+
+
+async def _events_of(db: aiosqlite.Connection, task_id: int) -> int:
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM events WHERE task_id=?", (task_id,)
+    )
+    return int(rows[0][0])
+
+
+async def test_the_paid_start_of_a_judge_and_an_advisor_rechecks_the_task(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Перепроверка перед оплачиваемым стартом: заказ мог лечь мимо order_run."""
+    from unittest.mock import AsyncMock
+
+    from hub import config
+    from hub.integrations import cursor_cloud
+    from hub.services import steward_shadow
+    from hub.services.result_kind import AUTOMATION_REFUSAL
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    provider = AsyncMock(return_value=(None, None))
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", provider)
+    task_id = await _state_in_review(db)
+    for kind in ("verdict", "advisor"):
+        await db.execute(
+            "INSERT INTO steward_runs (task_id, generation, kind, status, deadline_at) "
+            "VALUES (?, 1, ?, 'open', datetime('now', '+30 minutes'))",
+            (task_id, kind),
+        )
+    await db.commit()
+
+    await steward_shadow.start_due_runs(db)
+
+    rows = await db.execute_fetchall(
+        "SELECT kind, status, closed_reason FROM steward_runs WHERE task_id=? ORDER BY kind",
+        (task_id,),
+    )
+    assert [(r["kind"], r["status"]) for r in rows] == [
+        ("advisor", "refused"),
+        ("verdict", "refused"),
+    ]
+    assert all(AUTOMATION_REFUSAL in r["closed_reason"] for r in rows), [
+        dict(r) for r in rows
+    ]
+    provider.assert_not_awaited()
+
+
+async def test_steward_sweeps_leave_a_state_task_without_a_trace(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Свипы стюарда не пишут по state-задаче ни заказа, ни отказа, ни отсрочки."""
+    from hub import config
+    from hub.services import steward_advisor, steward_dispatch
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    monkeypatch.setattr(config, "STEWARD_ADVISOR_MODELS", ("gpt-5.3-codex",))
+    pid = await make_project(db, "st-steward", {"steward_shadow": True})
+    task_id = await _state_in_review(db, project_id=pid)
+    await db.execute(
+        "INSERT INTO steward_judgements (task_id, generation, kind, submitted_verdict, "
+        "verdict, contour) VALUES (?, 1, 'verdict', 'approve', 'approve', 2)",
+        (task_id,),
+    )
+    await db.commit()
+    before = await _events_of(db, task_id)
+
+    assert await steward_dispatch.order_due_runs(db) == 0
+    assert await steward_advisor.order_due_advisors(db) == 0
+    assert not await steward_advisor._order_one(db, task_id, 2)
+
+    assert await _events_of(db, task_id) == before, "свипы оставили след"
+    assert not await db.execute_fetchall(
+        "SELECT 1 FROM steward_runs WHERE task_id=?", (task_id,)
+    )
+
+
+async def test_the_dor_judgement_of_a_state_statement_is_still_ordered(
+    db: aiosqlite.Connection, monkeypatch
+):
+    """Суждение о ПОСТАНОВКЕ положено state-задаче: оно не про сдачу."""
+    from hub import config
+    from hub.services import steward_dispatch
+
+    monkeypatch.setattr(config, "STEWARD_MODE", "shadow")
+    task_id = await make_state_task(db, status="draft")
+    await db.execute(
+        "UPDATE tasks SET statement_fingerprint='abc' WHERE id=?", (task_id,)
+    )
+    await db.commit()
+    order = await steward_dispatch.order_run(db, task_id, 0, steward_dispatch.KIND_DOR)
+    assert order is not None and order["kind"] == "dor"
+
+
+async def test_advisor_outcomes_and_stewards_application_skip_a_state_task(
+    db: aiosqlite.Connection, monkeypatch
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from fastapi import HTTPException
+
+    from hub.models import StewardJudgementSubmit
+    from hub.config import TokenIdentity
+    from hub.services import steward_advisor, steward_applied, steward_judgement
+    from hub.services import steward_shadow
+    from hub.services.result_kind import AUTOMATION_REFUSAL
+
+    monkeypatch.setattr(steward_shadow, "effective_mode", AsyncMock(return_value="act"))
+    pid = await make_project(db, "st-apply", {"verdict": "steward"})
+    task_id = await _state_in_review(db, project_id=pid)
+    await db.execute(
+        "INSERT INTO steward_judgements (task_id, generation, kind, submitted_verdict, "
+        "verdict, contour) VALUES (?, 1, 'verdict', 'approve', 'approve', 2)",
+        (task_id,),
+    )
+    await db.commit()
+
+    # применение исхода советника: чужой «received» не доводит до apply_self_approval
+    applied = AsyncMock(return_value=None)
+    monkeypatch.setattr(steward_applied, "apply_self_approval", applied)
+    monkeypatch.setattr(
+        steward_advisor,
+        "advisor_state",
+        AsyncMock(return_value=SimpleNamespace(state=steward_advisor.STATE_RECEIVED)),
+    )
+    assert await steward_advisor.apply_advisor_outcomes(db) == 0
+    applied.assert_not_awaited()
+    monkeypatch.undo()
+
+    # применение суждения и самоодобрение
+    with pytest.raises(HTTPException) as caught:
+        await steward_applied.apply_judgement(db, task_id, 1)
+    assert caught.value.detail == AUTOMATION_REFUSAL
+    monkeypatch.setattr(steward_shadow, "effective_mode", AsyncMock(return_value="act"))
+    assert await steward_applied.apply_self_approval(db, task_id, 1) is None
+    assert dict(await repo.get_task(db, task_id))["status"] == "review"
+
+    # запись суждения о сдаче; о постановке (dor) — не этим отказом
+    steward = TokenIdentity("steward", "steward", principal_id=3)
+    for kind in ("verdict", "advisor"):
+        with pytest.raises(HTTPException) as caught:
+            await steward_judgement.record_steward_judgement(
+                db,
+                task_id,
+                StewardJudgementSubmit(generation=1, kind=kind, verdict="approve"),
+                steward,
+            )
+        assert (
+            caught.value.status_code == 409
+            and caught.value.detail == AUTOMATION_REFUSAL
+        )
+    try:
+        await steward_judgement.record_steward_judgement(
+            db,
+            task_id,
+            StewardJudgementSubmit(generation=1, kind="dor", verdict="approve"),
+            steward,
+        )
+    except HTTPException as exc:
+        assert exc.detail != AUTOMATION_REFUSAL, "dor-суждение не про сдачу"
+
+
+async def test_the_autopilot_does_not_even_read_a_state_task(
+    db: aiosqlite.Connection, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from hub.services import auto_verdict
+
+    spy = AsyncMock()
+    monkeypatch.setattr(auto_verdict, "autopilot_stance", spy)
+    state_id = await _state_in_review(db)
+    assert not await auto_verdict.maybe_auto_verdict(db, state_id)
+    spy.assert_not_awaited()
+    commit_id = await make_state_task(db, result_kind="commit")
+    spy.return_value = type(
+        "S",
+        (),
+        {"audit_alerts": (), "outcome": "refuse", "feed_note": "", "reason": ""},
+    )()
+    await auto_verdict.maybe_auto_verdict(db, commit_id)
+    spy.assert_awaited_once()
+
+
+async def test_the_headless_gate_and_every_dispatcher_refuse_a_state_task(
+    db: aiosqlite.Connection,
+):
+    """dispatch_task и четыре диспетчера conveyor: ни одного обращения к job."""
+    from hub.integrations.noop import NoopDispatch
+    from hub.integrations.registry import plugins
+    from hub.services import orchestration
+
+    class _Counting(NoopDispatch):
+        submitted = 0
+
+        async def submit_task(self, *args, **kwargs):
+            type(self).submitted += 1
+            return {"job_id": "j"}
+
+    plugins.dispatch = _Counting()
+    task_id = await make_state_task(db)
+    task = dict(await repo.get_task(db, task_id))
+    with pytest.raises(HTTPException) as caught:
+        await orchestration.dispatch_task(db, task_id, task)
+    assert caught.value.status_code == 422
+    await orchestration.dispatch_review(db, task)
+    await orchestration.dispatch_fix(db, task, "правки")
+    await orchestration.dispatch_arbiter(db, task, [])
+    await orchestration.dispatch_ci_fix(db, task, {})
+    assert _Counting.submitted == 0
+    assert dict(await repo.get_task(db, task_id))["status"] == "open"
+    assert dict(await repo.get_task(db, task_id))["job_id"] in (None, "")
+
+
+async def test_the_post_done_transition_never_completes_a_state_task(
+    db: aiosqlite.Connection,
+):
+    from hub.services import orchestration
+
+    task_id = await make_state_task(db)
+    await db.execute(
+        "UPDATE tasks SET status='running', auto_review=0 WHERE id=?", (task_id,)
+    )
+    await db.commit()
+    task = dict(await repo.get_task(db, task_id))
+    assert (
+        await orchestration.transition_after_agent_done(db, task, has_done=True)
+        == "running"
+    )
+    assert dict(await repo.get_task(db, task_id))["status"] == "running"
+
+
+async def test_rework_of_a_held_state_task_goes_back_to_open_without_a_job(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    from hub.integrations.noop import NoopDispatch
+    from hub.integrations.registry import plugins
+
+    class _Counting(NoopDispatch):
+        submitted = 0
+
+        async def submit_task(self, *args, **kwargs):
+            type(self).submitted += 1
+            return {"job_id": "j"}
+
+    plugins.dispatch = _Counting()
+    task_id = await make_state_task(db)
+    await db.execute(
+        "UPDATE tasks SET status='needs_decision', claimed_by='dev', "
+        "claim_session_id='s', submission_generation=1 WHERE id=?",
+        (task_id,),
+    )
+    await db.commit()
+    resp = await client.post(
+        f"/api/tasks/{task_id}/decide",
+        json={"action": "rework", "instructions": "доделать"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "open" and not resp.json()["job_id"]
+    assert _Counting.submitted == 0, "headless-задание заказано для state"
+    row = dict(await repo.get_task(db, task_id))
+    assert not row["claimed_by"] and not row["job_id"]
+
+
+# --- исполнитель: слой брони и выбор кандидата --------------------------------
+
+
+async def test_the_reservation_itself_refuses_a_state_task(db: aiosqlite.Connection):
+    from hub.services import executor_launch as el
+
+    project_id = await make_project(db, "st-reserve")
+    project = dict(await repo.get_project(db, project_id))
+    state_id = await make_state_task(db)
+
+    async def pick(_db, _project):
+        return state_id, ""
+
+    result = await el._reserve(db, project, None, "m", pick)
+    assert isinstance(result, el.LaunchResult) and not result.launched
+    assert el.REASON_STATE_TASK in result.reason
+    assert not await db.execute_fetchall("SELECT 1 FROM executor_runs")
+
+
+async def test_the_queue_hands_a_state_task_to_people_but_not_to_the_executor(
+    db: aiosqlite.Connection,
+):
+    from hub.services import orchestrator_queue as oq
+
+    pid = await make_project(db, "st-queue", {"orchestrator_queue": "shadow"})
+    state_id = await make_state_task(db, project_id=pid)
+    await db.execute(
+        "UPDATE tasks SET dor_passed=1, priority='critical' WHERE id=?", (state_id,)
+    )
+    commit_id = await make_state_task(db, project_id=pid, result_kind="commit")
+    await db.execute(
+        "UPDATE tasks SET dor_passed=1, affected_areas=? WHERE id=?",
+        (json.dumps(["docs/x.md"]), commit_id),
+    )
+    running = await make_state_task(db, project_id=pid, result_kind="commit")
+    await db.execute(
+        "UPDATE tasks SET status='running', affected_areas=? WHERE id=?",
+        (json.dumps(["hub/y.py"]), running),
+    )
+    await db.commit()
+    project = dict(await repo.get_project(db, pid))
+
+    for_people = await oq.next_task(db, project)
+    assert for_people["next_task_id"] == state_id, "state — не неизвестная область"
+    for_executor = await oq.next_task(db, project, exclude_state=True)
+    assert for_executor["next_task_id"] == commit_id
+    assert state_id not in [c["task_id"] for c in for_executor["candidates"]]
