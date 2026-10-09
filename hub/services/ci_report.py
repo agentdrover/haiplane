@@ -82,7 +82,7 @@ def _pinned_sha(task: dict) -> str:
     return (task.get("submission_sha") or "").strip()
 
 
-async def accept_ci_run_report(
+async def _store_ci_run_report(
     db: Any,
     task_id: int,
     *,
@@ -95,7 +95,6 @@ async def accept_ci_run_report(
     checks: dict[str, str] | None = None,
     mutations: dict[str, Any] | None = None,
     baseline: dict[str, Any] | None = None,
-    commit: bool = True,
 ) -> dict:
     """Store a CI run report and stamp it if it covers the pinned commit.
 
@@ -211,9 +210,6 @@ async def accept_ci_run_report(
             validation_status=validation_status,
             validation_log=validation_log or "",
         )
-    if commit:
-        await db.commit()
-
     # What the commit now holds, not what this report carried: a report without
     # the keys leaves the stored blocks, and the answer must say so.
     stored = dict(await repo.get_ci_run_report(db, task_id, head_sha) or {})
@@ -228,6 +224,21 @@ async def accept_ci_run_report(
         "mutations_state": _stored_state(stored.get("mutations")),
         "baseline_state": _stored_state(stored.get("baseline")),
     }
+
+
+async def accept_ci_run_report(
+    db: Any, task_id: int, *, commit: bool = True, **report: Any
+) -> dict:
+    """Store a CI run report (see ``_store_ci_run_report``) and, by default, commit.
+
+    The request handler passes ``commit=False``: it owns the write transaction
+    until the result is read back (#1644), so a failure after the write rolls
+    the report back instead of leaving it behind a 500.
+    """
+    result = await _store_ci_run_report(db, task_id, **report)
+    if commit:
+        await db.commit()
+    return result
 
 
 def _stored_state(raw: str | None) -> str:
