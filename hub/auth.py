@@ -366,6 +366,59 @@ def watcher_route_allowed(
     )
 
 
+# ---------------------------------------------------------------------------
+# Project-bound CI key allowlist (#1644)
+# ---------------------------------------------------------------------------
+#
+# A ci_runner key bound to projects may do exactly what the CI reporter does:
+# read the task it reports on, report, and record a deploy. Everything else —
+# refine (which can move an epic to another project and then report "inside"
+# the scope), run-validation / run-ac-tests (host commands), MCP, drafts — is
+# refused before routing, including routes that do not exist yet.
+CI_SCOPED_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
+    ("GET", "/api/tasks/{task_id}"),
+    ("POST", "/api/tasks/{task_id}/ci-run-report"),
+    ("POST", "/api/deploys"),
+    ("GET", "/api/whoami"),
+)
+_CI_SCOPED_ALLOWED: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
+    (method, _template_to_regex(template)) for method, template in CI_SCOPED_ALLOWLIST
+)
+
+
+def ci_scoped_route_allowed(
+    method: str, path: str, identity: TokenIdentity | None = None
+) -> bool:
+    """Whether a project-bound CI key may reach ``(method, path)`` (#1644)."""
+    if identity is not None and not identity.is_scoped_ci:
+        return False
+    probe = "GET" if method == "HEAD" else method
+    return any(
+        probe == allowed_method and pattern.match(path)
+        for allowed_method, pattern in _CI_SCOPED_ALLOWED
+    )
+
+
+def _ci_scoped_forbidden(method: str, path: str) -> Response:
+    return Response(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content=json.dumps(
+            {
+                "detail": {
+                    "reason": "ci_scoped_route_forbidden",
+                    "actor_hint": "human",
+                    "message": (
+                        f"{method} {path}: ключ CI, привязанный к проекту, "
+                        "может только читать задачу, слать отчёт CI и deploy."
+                    ),
+                }
+            },
+            ensure_ascii=False,
+        ),
+        media_type="application/json",
+    )
+
+
 _PUBLIC_PREFIXES: Final[tuple[str, ...]] = ("/static/",)
 
 _PROTECTED_PREFIXES: Final[tuple[str, ...]] = ("/",)
@@ -395,6 +448,8 @@ def _with_auth_source(
         chat_pair_kind=identity.chat_pair_kind,
         chat_pair_task_id=identity.chat_pair_task_id,
         chat_pair_generation=identity.chat_pair_generation,
+        scopes=identity.scopes,
+        scopes_damaged=identity.scopes_damaged,
     )
 
 
@@ -650,6 +705,10 @@ async def _role_gate(
     if _watcher_refused(identity, request.method, path):
         await _record_watcher_refusal(request, identity, path)
         return _watcher_forbidden(request.method, path)
+    if identity.is_scoped_ci and not ci_scoped_route_allowed(
+        request.method, path, identity
+    ):
+        return _ci_scoped_forbidden(request.method, path)
     return None
 
 

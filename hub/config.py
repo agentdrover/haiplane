@@ -789,6 +789,8 @@ class TokenIdentity:
         "chat_pair_kind",
         "chat_pair_task_id",
         "chat_pair_generation",
+        "scopes",
+        "scopes_damaged",
     )
 
     def __init__(
@@ -802,6 +804,8 @@ class TokenIdentity:
         chat_pair_kind: str | None = None,
         chat_pair_task_id: int | None = None,
         chat_pair_generation: int | None = None,
+        scopes: tuple[str, ...] | None = None,
+        scopes_damaged: bool = False,
     ) -> None:
         self.username = username
         self.role = role
@@ -812,6 +816,11 @@ class TokenIdentity:
         self.chat_pair_kind = chat_pair_kind
         self.chat_pair_task_id = chat_pair_task_id
         self.chat_pair_generation = chat_pair_generation
+        # #1644: project slugs an API key is bound to. ``None`` = the key
+        # carries no scope (legacy, unrestricted); a damaged ``api_keys.scopes``
+        # sets ``scopes_damaged`` so the CI entrances can refuse (fail closed).
+        self.scopes = scopes
+        self.scopes_damaged = scopes_damaged
 
     def __repr__(self) -> str:
         return f"TokenIdentity({self.username!r}, role={self.role!r}, pid={self.principal_id})"
@@ -829,6 +838,20 @@ class TokenIdentity:
     @property
     def is_watcher(self) -> bool:
         return self.role == "watcher"
+
+    @property
+    def is_scoped_ci(self) -> bool:
+        """A CI key bound to projects (#1644): confined to the CI routes.
+
+        Damaged scopes count as bound: a key whose binding cannot be read is
+        refused, never widened. Keys without any scope (legacy) are not
+        confined here; they are flagged by the CI entrances instead.
+        """
+        bound = bool(self.scopes) or self.scopes_damaged
+        return bound and (
+            "tasks.ci_report" in self.permissions
+            or "deploys.record" in self.permissions
+        )
 
     @property
     def is_human(self) -> bool:

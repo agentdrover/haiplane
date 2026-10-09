@@ -2946,3 +2946,26 @@ def test_projects_bootstrap_prints_server_text(capsys) -> None:
 
     rc, _ = _run_main(["projects", "bootstrap", "nope"], api_side_effect=SystemExit(1))
     assert rc == 1
+
+
+def test_admin_keys_create_sends_project_scope():
+    """#1644: ``--project`` (repeatable) becomes the key's ``projects`` list."""
+    rc, api = _run_main(
+        [
+            "admin",
+            "keys",
+            "create",
+            "--principal",
+            "ada",
+            "--name",
+            "ci",
+            "--project",
+            "audit-in",
+        ],
+        api_side_effect=[
+            [{"id": 2, "username": "ada"}],
+            {"id": 4, "key_prefix": "och_", "plaintext_key": "k"},
+        ],
+    )
+    assert rc == 0
+    assert api.call_args_list[1].args[2]["projects"] == ["audit-in"]
