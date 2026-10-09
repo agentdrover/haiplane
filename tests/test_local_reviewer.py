@@ -1778,7 +1778,7 @@ async def test_the_runner_snapshot_survives_install_cancel_and_old_runner(
 
 
 def _runner_unpacker_problem(runner_mod, path: Path, uid: int) -> str:
-    return runner_mod.unpacker_problem(str(path), uid)
+    return runner_mod.read_trusted_source(str(path), uid)[1]
 
 
 def test_the_unpacker_is_trusted_only_in_a_root_owned_unwritable_install(
@@ -1792,7 +1792,7 @@ def test_the_unpacker_is_trusted_only_in_a_root_owned_unwritable_install(
     unpacker.write_bytes(_UNPACK_FILE.read_bytes())
     os.chmod(unpacker, 0o644)
     both = (
-        lambda path, uid: runner_mod.unpacker_problem(str(path), uid),
+        lambda path, uid: runner_mod.read_trusted_source(str(path), uid)[1],
         lambda path, uid: review_snapshot.unpacker_problem(str(path), uid),
     )
     for problem in both:
@@ -2274,7 +2274,7 @@ def test_the_unpacker_path_is_read_without_following_links_and_executed_as_read(
     alias = tmp_path / "alias"
     alias.symlink_to(real)
     for problem in (
-        lambda path: runner_mod.unpacker_problem(str(path), me),
+        lambda path: runner_mod.read_trusted_source(str(path), me)[1],
         lambda path: review_snapshot.unpacker_problem(str(path), me),
     ):
         assert problem(real / "snapshot_unpack.py") == ""

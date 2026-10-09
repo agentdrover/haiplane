@@ -747,11 +747,6 @@ def read_trusted_source(path: str, trusted_uid: int) -> tuple[bytes, str]:
             os.close(fd)
 
 
-def unpacker_problem(path: str, trusted_uid: int) -> str:
-    """Почему этому файлу нельзя доверить проверку чужого tar, или ``""``."""
-    return read_trusted_source(path, trusted_uid)[1]
-
-
 def load_unpacker(path: str, trusted_uid: int = 0):  # noqa: ANN201 - модуль по пути
     """Загрузить распаковщик ПО ЯВНОМУ ПУТИ: исполняется то, что проверено."""
     source, problem = read_trusted_source(path, trusted_uid)

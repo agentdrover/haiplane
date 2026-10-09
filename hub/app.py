@@ -254,6 +254,117 @@ def _register_plugins() -> None:
 _mcp_streamable_app = mcp_server.streamable_http_app()
 
 
+async def _report_stale_env(db: aiosqlite.Connection) -> None:
+    # Мёртвые env-переменные (#964): устаревший префикс — это политика, которую
+    # оператор включил, а код никогда не увидит. Одна запись в ленту на старт,
+    # только имена, и best effort — сигнал не имеет права уронить подъём.
+    stale = config.stale_env_names()
+    if stale:
+        log.warning(
+            "Stale env prefix detected, hub will NOT read: %s", ", ".join(stale)
+        )
+        try:
+            await log_activity(
+                db,
+                "stale_env_detected",
+                "Мёртвые env-переменные: хаб не читает "
+                + ", ".join(stale)
+                + " — политики стоят на дефолтах, мигрируйте префикс",
+            )
+        except Exception:
+            log.exception("stale env activity write failed")
+
+
+async def _recover_after_crash(db: aiosqlite.Connection) -> None:
+    """Захваты и локальные прогоны, оставленные мёртвым процессом (#1195, #1649)."""
+    # Захваты, оставленные мёртвым процессом (#1195). Место — ДО поллера, и
+    # это не вкусовщина: первый же тик читает открытые заказы, и метка,
+    # снятая после него, стоила бы поколению ещё одного круга ожидания.
+    #
+    # Признак точный, а не «наверное»: процесс, который только что поднялся,
+    # не может иметь своих незавершённых вызовов к провайдеру, значит любая
+    # метка захвата в базе оставлена тем, кого больше нет.
+    #
+    # Best effort, как и соседний сигнал о мёртвых env: сигнал не имеет права
+    # уронить подъём. Но молчать нельзя — за меткой стоит, возможно,
+    # оплаченный агент, и лог здесь последняя инстанция, если событие лечь не
+    # смогло.
+    try:
+        from hub.services.steward_shadow import recover_dead_process_claims
+
+        await recover_dead_process_claims(db)
+    except Exception:
+        log.exception("steward claim recovery failed at startup")
+    # #1649: локальные прогоны советника, оставленные умершим хабом: задание
+    # отозвать, строку закрыть с причиной, повторный запуск не покупать.
+    try:
+        from hub.services.steward_advisor_local import recover_local_advisor_runs
+
+        await recover_local_advisor_runs(db)
+    except Exception:
+        log.exception("local advisor recovery failed at startup")
+
+
+async def _startup_checks(db: aiosqlite.Connection) -> None:
+    """Сообщения и проверки подъёма внутри жизни MCP-менеджера."""
+    if config.HUB_TOKENS:
+        log.info(
+            "Hub auth ENABLED (%d token(s) configured)",
+            len(config.HUB_TOKENS),
+        )
+    else:
+        log.info("Hub auth DISABLED (open mode — set HAIPLANE_HUB_TOKENS to enable)")
+
+    # Workspace git health-check (#455): opt-in network probe so a
+    # broken deploy key on the default workspace is loud, not silent.
+    # Off by default to keep startup (and tests) free of network I/O.
+    if config.env_get("WORKSPACE_HEALTHCHECK") == "1":
+        from hub.services.diagnostics import check_default_workspace_origin
+
+        try:
+            await check_default_workspace_origin()
+        except Exception:
+            log.warning("workspace origin health-check failed", exc_info=True)
+
+    # Bootstrap token guard
+    if config.HUB_BOOTSTRAP_TOKEN:
+        from hub.db import has_active_admin
+
+        if await has_active_admin(db):
+            log.warning(
+                "SECURITY: HAIPLANE_HUB_BOOTSTRAP_ADMIN_TOKEN is still set "
+                "but an admin already exists. Remove it from the environment "
+                "to prevent unauthorized bootstrap attempts."
+            )
+
+
+async def _stop_background(app: FastAPI, poll_task: "asyncio.Task[None]") -> None:
+    """Остановка фоновой работы: поллер, наблюдатель egress, локальные прогоны."""
+    poll_task.cancel()
+    egress_task = getattr(app.state, "egress_task", None)
+    if egress_task is not None:
+        # Wait for the watcher to finish unwinding: its connection closes
+        # in its own finally, and the shared one is closed below.
+        egress_task.cancel()
+        try:
+            await egress_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("egress watcher ended with an error")
+
+
+async def _cancel_local_advisors() -> None:
+    # #1649: то же для локальных советников стюарда — задание отзывается,
+    # строка закрывается с причиной, подтверждения хаб не ждёт.
+    try:
+        from hub.services.steward_advisor_local import cancel_local_advisors
+
+        await cancel_local_advisors()
+    except Exception:
+        log.exception("local advisors not cancelled on stop")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config.validate_network_auth()
@@ -271,51 +382,8 @@ async def lifespan(app: FastAPI):
     # not a failure.
     set_telemetry_sink(app.state.db)
 
-    # Мёртвые env-переменные (#964): устаревший префикс — это политика, которую
-    # оператор включил, а код никогда не увидит. Одна запись в ленту на старт,
-    # только имена, и best effort — сигнал не имеет права уронить подъём.
-    stale = config.stale_env_names()
-    if stale:
-        log.warning(
-            "Stale env prefix detected, hub will NOT read: %s", ", ".join(stale)
-        )
-        try:
-            await log_activity(
-                app.state.db,
-                "stale_env_detected",
-                "Мёртвые env-переменные: хаб не читает "
-                + ", ".join(stale)
-                + " — политики стоят на дефолтах, мигрируйте префикс",
-            )
-        except Exception:
-            log.exception("stale env activity write failed")
-
-    # Захваты, оставленные мёртвым процессом (#1195). Место — ДО поллера, и
-    # это не вкусовщина: первый же тик читает открытые заказы, и метка,
-    # снятая после него, стоила бы поколению ещё одного круга ожидания.
-    #
-    # Признак точный, а не «наверное»: процесс, который только что поднялся,
-    # не может иметь своих незавершённых вызовов к провайдеру, значит любая
-    # метка захвата в базе оставлена тем, кого больше нет.
-    #
-    # Best effort, как и соседний сигнал о мёртвых env: сигнал не имеет права
-    # уронить подъём. Но молчать нельзя — за меткой стоит, возможно,
-    # оплаченный агент, и лог здесь последняя инстанция, если событие лечь не
-    # смогло.
-    try:
-        from hub.services.steward_shadow import recover_dead_process_claims
-
-        await recover_dead_process_claims(app.state.db)
-    except Exception:
-        log.exception("steward claim recovery failed at startup")
-    # #1649: локальные прогоны советника, оставленные умершим хабом: задание
-    # отозвать, строку закрыть с причиной, повторный запуск не покупать.
-    try:
-        from hub.services.steward_advisor_local import recover_local_advisor_runs
-
-        await recover_local_advisor_runs(app.state.db)
-    except Exception:
-        log.exception("local advisor recovery failed at startup")
+    await _report_stale_env(app.state.db)
+    await _recover_after_crash(app.state.db)
 
     poll_task = start_poller(app)
 
@@ -324,64 +392,16 @@ async def lifespan(app: FastAPI):
     mcp_lifespan = _mcp_streamable_app.router.lifespan_context(_mcp_streamable_app)
     try:
         async with mcp_lifespan:
-            if config.HUB_TOKENS:
-                log.info(
-                    "Hub auth ENABLED (%d token(s) configured)",
-                    len(config.HUB_TOKENS),
-                )
-            else:
-                log.info(
-                    "Hub auth DISABLED (open mode — set HAIPLANE_HUB_TOKENS to enable)"
-                )
-
-            # Workspace git health-check (#455): opt-in network probe so a
-            # broken deploy key on the default workspace is loud, not silent.
-            # Off by default to keep startup (and tests) free of network I/O.
-            if config.env_get("WORKSPACE_HEALTHCHECK") == "1":
-                from hub.services.diagnostics import check_default_workspace_origin
-
-                try:
-                    await check_default_workspace_origin()
-                except Exception:
-                    log.warning("workspace origin health-check failed", exc_info=True)
-
-            # Bootstrap token guard
-            if config.HUB_BOOTSTRAP_TOKEN:
-                from hub.db import has_active_admin
-
-                if await has_active_admin(app.state.db):
-                    log.warning(
-                        "SECURITY: HAIPLANE_HUB_BOOTSTRAP_ADMIN_TOKEN is still set "
-                        "but an admin already exists. Remove it from the environment "
-                        "to prevent unauthorized bootstrap attempts."
-                    )
+            await _startup_checks(app.state.db)
             yield
     finally:
-        poll_task.cancel()
-        egress_task = getattr(app.state, "egress_task", None)
-        if egress_task is not None:
-            # Wait for the watcher to finish unwinding: its connection closes
-            # in its own finally, and the shared one is closed below.
-            egress_task.cancel()
-            try:
-                await egress_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                log.exception("egress watcher ended with an error")
+        await _stop_background(app, poll_task)
         # #1180: локальные прогоны ревью — чужие процессы, порождённые этим
         # хабом. Уйти, не сняв их, значит оставить агентский CLI сиротой:
         # он доработает, попробует сдать отчёт по прогону, за которым больше
         # некому смотреть, и всё это время будет жечь процессор.
         await cancel_local_runs()
-        # #1649: то же для локальных советников стюарда — задание отзывается,
-        # строка закрывается с причиной, подтверждения хаб не ждёт.
-        try:
-            from hub.services.steward_advisor_local import cancel_local_advisors
-
-            await cancel_local_advisors()
-        except Exception:
-            log.exception("local advisors not cancelled on stop")
+        await _cancel_local_advisors()
         set_telemetry_sink(None)
         await app.state.db.close()
 
