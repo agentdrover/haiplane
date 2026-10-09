@@ -438,3 +438,24 @@ async def ci_runner_hub(client, db, monkeypatch):
         ci_token=ci_key["plaintext_key"],
         human_token=human_key["plaintext_key"],
     )
+
+
+@pytest.fixture
+def scoped_ci_key(ci_runner_hub):
+    """Factory of REAL ci_runner DB keys with a given ``api_keys.scopes`` (#1644).
+
+    The scope is written straight into the column: the tests of the checks must
+    not depend on the issuing path, which has its own tests.
+    """
+    from hub.services import admin as admin_svc
+
+    async def make(scopes_raw: str, name: str = "scoped") -> dict:
+        hub = ci_runner_hub
+        key = await admin_svc.create_api_key(hub.db, hub.ci_principal["id"], name=name)
+        await hub.db.execute(
+            "UPDATE api_keys SET scopes = ? WHERE id = ?", (scopes_raw, key["id"])
+        )
+        await hub.db.commit()
+        return {"Authorization": f"Bearer {key['plaintext_key']}"}
+
+    return make

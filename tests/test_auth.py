@@ -1160,31 +1160,29 @@ async def test_ci_runner_key_is_refused_by_every_human_route(ci_runner_hub):
 
 
 async def test_ci_runner_browser_session_is_not_human(ci_runner_hub):
-    """AC-1 (#1639): the cookie door (resolve_browser_session) gives no human either."""
+    """#1639 -> #1644: the cookie door gives a CI (service) principal nothing."""
     hub = ci_runner_hub
     task = await hub.client.post(
         "/api/tasks", json={"title": "cookie probe"}, headers=hub.human
     )
     tid = task.json()["id"]
     who = await hub.client.get("/api/whoami", headers=hub.ci_cookie)
-    assert who.status_code == 200, who.text
-    assert who.json()["auth_source"] == "db_session", who.json()
-    assert who.json()["role"] == "agent", who.json()
+    assert who.status_code == 401, who.text
 
     from hub.services import admin as admin_svc
 
     token = hub.ci_cookie["Cookie"].split("=", 1)[1]
-    identity = await admin_svc.resolve_browser_session(hub.db, token)
-    assert identity is not None
-    assert identity.is_human is False and identity.is_agent is True
+    assert await admin_svc.resolve_browser_session(hub.db, token) is None
 
     before = await _business_state(hub.db)
     rest = await hub.client.post(
         f"/api/tasks/{tid}/approve", json={}, headers=hub.ci_cookie
     )
-    assert rest.status_code == 403, rest.text
-    web = await hub.client.get("/chat-pair", headers=hub.ci_cookie)
-    assert web.status_code == 403, web.status_code
+    assert rest.status_code in (401, 403), rest.text
+    web = await hub.client.get(
+        "/chat-pair", headers=hub.ci_cookie, follow_redirects=False
+    )
+    assert web.status_code in (303, 401, 403), web.status_code
     assert await _business_state(hub.db) == before
 
 

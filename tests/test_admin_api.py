@@ -336,3 +336,63 @@ async def test_cannot_disable_last_admin_via_api(client, db, monkeypatch):
         headers={"Authorization": "Bearer admin-token"},
     )
     assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_api_key_can_be_scoped_to_projects(client, db, monkeypatch):
+    """AC-5 (#1644): the scope is stored, visible, and an unknown project is 422."""
+    from hub import repository as repo
+
+    monkeypatch.setattr(config, "HUB_TOKENS", _admin_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    admin = {"Authorization": "Bearer admin-token"}
+    await repo.create_project(
+        db, slug="audit-in", name="audit-in", workspace_path="/tmp/ws"
+    )
+    await db.commit()
+    resp = await client.post(
+        "/api/admin/principals",
+        json={"kind": "service", "username": "ci-bot", "role": "ci_runner"},
+        headers=admin,
+    )
+    pid = resp.json()["id"]
+    url = f"/api/admin/principals/{pid}/api-keys"
+
+    created = await client.post(
+        url, json={"name": "scoped", "projects": ["audit-in"]}, headers=admin
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["scopes"] == ["project:audit-in"]
+    listed = await client.get("/api/admin/api-keys", headers=admin)
+    mine = [k for k in listed.json() if k["name"] == "scoped"]
+    assert mine and mine[0]["scopes"] == ["project:audit-in"]
+
+    missing = await client.post(
+        url, json={"name": "bad", "projects": ["no-such-project"]}, headers=admin
+    )
+    assert missing.status_code == 422, missing.text
+    listed = await client.get("/api/admin/api-keys", headers=admin)
+    assert not [k for k in listed.json() if k["name"] == "bad"]
+
+
+@pytest.mark.asyncio
+async def test_blank_or_malformed_projects_are_refused_without_a_key(
+    client, db, monkeypatch
+):
+    """#1644 P2/P3: a blank slug must not issue an unrestricted key; bad types 422."""
+    monkeypatch.setattr(config, "HUB_TOKENS", _admin_tokens())
+    monkeypatch.setattr(config, "HUB_AUTH_DISABLED", False)
+    admin = {"Authorization": "Bearer admin-token"}
+    resp = await client.post(
+        "/api/admin/principals",
+        json={"kind": "service", "username": "ci-bot2", "role": "ci_runner"},
+        headers=admin,
+    )
+    url = f"/api/admin/principals/{resp.json()['id']}/api-keys"
+    for bad in (["  "], [""], [1], "audit-in"):
+        r = await client.post(
+            url, json={"name": "blank", "projects": bad}, headers=admin
+        )
+        assert r.status_code == 422, (bad, r.status_code, r.text[:200])
+    listed = await client.get("/api/admin/api-keys", headers=admin)
+    assert not [k for k in listed.json() if k["name"] == "blank"]

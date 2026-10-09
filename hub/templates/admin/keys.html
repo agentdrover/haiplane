@@ -25,6 +25,10 @@
             <label for="ck-expires">Expires (days, 0 = never)</label>
             <input id="ck-expires" name="expires_days" type="number" value="0" min="0">
         </div>
+        <div>
+            <label for="ck-project">Project (CI keys: bind to one project; empty = unrestricted)</label>
+            <input id="ck-project" name="project" type="text" placeholder="project slug">
+        </div>
         <div class="admin-form-actions">
             <button type="submit" class="admin-btn admin-btn-primary">Create Key</button>
         </div>
@@ -54,7 +58,7 @@
 </div>
 
 <table class="admin-table" id="keys-table">
-    <thead><tr><th>ID</th><th>Owner</th><th>Name</th><th>Prefix</th><th>Expires</th><th>Last Used</th><th>Status</th><th>Actions</th></tr></thead>
+    <thead><tr><th>ID</th><th>Owner</th><th>Name</th><th>Prefix</th><th>Project</th><th>Expires</th><th>Last Used</th><th>Status</th><th>Actions</th></tr></thead>
     <tbody>
     {% for k in keys %}
     <tr id="key-row-{{ k.id }}" class="{% if k.revoked_at %}row-revoked{% endif %}">
@@ -62,6 +66,7 @@
         <td>{{ pid_to_name.get(k.principal_id, '?') }}</td>
         <td>{{ k.name }}</td>
         <td><code>{{ k.key_prefix }}…</code></td>
+        <td>{% if k.scopes_damaged %}<span class="badge badge-disabled">damaged</span>{% elif k.scopes %}{{ k.scopes|join(', ') }}{% else %}—{% endif %}</td>
         <td>{{ k.expires_at or 'Never' }}</td>
         <td>{{ k.last_used_at or '—' }}</td>
         <td>

@@ -1342,6 +1342,33 @@ async def resolve_project_with_source(
     return await get_project_by_slug(db, "default"), None
 
 
+async def resolve_bound_project(
+    db: aiosqlite.Connection, task_id: int
+) -> aiosqlite.Row | None:
+    """The project actually bound to the task or its nearest bound ancestor.
+
+    Unlike ``resolve_project_with_source`` this never substitutes 'default' for
+    an inactive project: it is for AUTHORIZATION, where "routed to default"
+    must not be read as "belongs to default" (#1644). ``None`` = no binding at
+    all (the orphan case), the only one where the caller may assume default.
+    """
+    current_id: int | None = task_id
+    for _ in range(20):  # hierarchy depth guard
+        if current_id is None:
+            return None
+        rows = await fetchall(
+            db,
+            "SELECT parent_id, project_id FROM tasks WHERE id=?",
+            (current_id,),
+        )
+        if not rows:
+            return None
+        if rows[0]["project_id"] is not None:
+            return await get_project(db, rows[0]["project_id"])
+        current_id = rows[0]["parent_id"]
+    return None
+
+
 async def resolve_project_for_task(
     db: aiosqlite.Connection, task_id: int
 ) -> aiosqlite.Row | None:

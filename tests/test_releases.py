@@ -521,3 +521,31 @@ async def test_narrowing_to_empty_never_silently_drops_a_release(
     title = opened.await_args.args[2]
     assert "6 задач(и)" in title, title
     assert 880 in task_ids and 728 in task_ids
+
+
+async def test_scoped_ci_key_records_deploys_only_for_its_project(
+    ci_runner_hub, scoped_ci_key
+):
+    """AC-2 (#1644): a key bound to audit-in records only audit-in deploys."""
+    hub = ci_runner_hub
+    for slug in ("audit-in", "default"):
+        if await repo.get_project_by_slug(hub.db, slug) is None:
+            await repo.create_project(
+                hub.db, slug=slug, name=slug, workspace_path="/tmp/ws"
+            )
+    await hub.db.commit()
+    scoped = await scoped_ci_key('["project:audit-in"]')
+    base = {"sha": "scoped-deploy", "ref": "main", "status": "success"}
+
+    for extra in ({"project": "default"}, {}):
+        resp = await hub.client.post(
+            "/api/deploys", json={**base, **extra}, headers=scoped
+        )
+        assert resp.status_code == 403, (extra, resp.text)
+    assert await _release_rows(hub.db) == [], "a refused call must write nothing"
+
+    ok = await hub.client.post(
+        "/api/deploys", json={**base, "project": "audit-in"}, headers=scoped
+    )
+    assert ok.status_code == 200, ok.text
+    assert len(await _release_rows(hub.db)) == 1
