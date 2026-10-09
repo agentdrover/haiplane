@@ -1008,3 +1008,17 @@ def validate_network_auth() -> None:
         f"Either set HAIPLANE_HUB_TOKENS, bind to 127.0.0.1, or set "
         f"HAIPLANE_HUB_ALLOW_UNAUTHENTICATED_NETWORK=1 to override."
     )
+
+
+# Egress watch (#1645): the hub's own look at the way out of the server.
+def _int_env(suffix: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(env_get(suffix, str(default)))
+    except ValueError:
+        return default
+    return value if low <= value <= high else default
+
+
+EGRESS_PROBE_URL = env_get("EGRESS_PROBE_URL", "https://api.github.com/")
+EGRESS_PROBE_SECONDS = _int_env("EGRESS_PROBE_SECONDS", 120, 30, 900)
+EGRESS_DOWN_AFTER = _int_env("EGRESS_DOWN_AFTER", 3, 1, 100)

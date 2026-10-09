@@ -1809,7 +1809,19 @@ def cmd_health(args: argparse.Namespace) -> int:
     print(f"Auth disabled: {result['auth_disabled']}")
     print(f"Env tokens configured: {result['env_tokens_configured']}")
     print(f"Vast enabled: {result['vast_enabled']}")
+    _print_egress(result.get("egress"))
     return 0
+
+
+def _print_egress(egress: object) -> None:
+    """Egress state of the server (#1645): fixed wording, typed fields only."""
+    from hub.services.egress_watch import egress_lines
+
+    if not isinstance(egress, dict):
+        return
+    print(f"Egress: {egress.get('state', 'unknown')}")
+    for line in egress_lines(egress):
+        print(line)
 
 
 # ---------------------------------------------------------------------------

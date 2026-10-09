@@ -4778,7 +4778,11 @@ async def test_agent_bootstrap_has_all_sections(client, db, tmp_path):
         assert set(schema.get("required", [])) <= set(args), (name, args)
         assert set(args) <= set(schema["properties"]), (name, args)
     submit = " ".join(data["submit_order"])
-    assert "одна сдача на коммит" in submit and "hub_task_status" in submit
+    assert "hub_task_status" in submit
+    from tests.test_skill_seeding import RESUBMISSION_CLAIMS
+
+    for claim in RESUBMISSION_CLAIMS:
+        assert claim in submit, f"bootstrap lost the rule itself: {claim}"
     assert "Policy of project boot-all" in text
     assert RULES_PATH in text and ".hub/REVIEW_RULES.md" in text
     assert "workspace" not in resp.text and "secret-ws-dir" not in resp.text
