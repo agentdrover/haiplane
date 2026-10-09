@@ -422,3 +422,30 @@ async def _vitest(text: str) -> dict:
             base="main",
         )
     )[0]
+
+
+# ---- review of d10bed2: the reason a file could not be read reaches the answer ----------
+
+
+async def _reason(git: FakeGit, repo: str | None, **kw) -> dict:
+    clear_locator_cache()
+    res = await resolve_locators_at_ref(git, repo, [_ac("test_a")], **kw)
+    return res[0]
+
+
+async def test_the_reason_nothing_could_be_read_is_the_published_reason():
+    files = {_PATH: "def test_a():\n    pass\n"}
+
+    no_workspace = await _reason(FakeGit(files), None, branch="b", base="main")
+    assert no_workspace["status"] == UNKNOWN
+    assert "project has no workspace" in no_workspace["reason"], no_workspace
+
+    unresolved = FakeGit(files)
+    unresolved.refs.clear()
+    gone = await _reason(unresolved, "/repo", submission_sha="f" * 40, base="main")
+    assert gone["status"] == UNKNOWN
+    assert "could not resolve submission_sha" in gone["reason"], gone
+
+    nothing = await _reason(FakeGit(files), "/repo")
+    assert nothing["status"] == UNKNOWN
+    assert "no submission_sha, branch or base" in nothing["reason"], nothing

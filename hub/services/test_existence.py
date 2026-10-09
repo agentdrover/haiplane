@@ -527,6 +527,16 @@ def _aux_paths(files: list[str]) -> list[str] | None:
     return paths
 
 
+def _unreadable(files: list[str], why: str) -> LocatorEvidence:
+    """Nothing could be read: every file is ``unknown`` and the reason is HERS."""
+    return LocatorEvidence(
+        sources=dict.fromkeys(files),
+        unread=dict.fromkeys(files, why),
+        why=why,
+        pytest_config_issue=why,
+    )
+
+
 async def read_locator_evidence(
     git: Any,
     repo: str | None,
@@ -552,7 +562,7 @@ async def read_locator_evidence(
         return LocatorEvidence()
     unread = dict.fromkeys(files)
     if not repo:
-        return LocatorEvidence(unread, why="project has no workspace")
+        return _unreadable(files, "project has no workspace")
     if picked is None:
         sha, label, why = await _pick_ref(
             git,
@@ -564,7 +574,7 @@ async def read_locator_evidence(
     else:
         (sha, label), why = picked, ""
     if not sha:
-        return LocatorEvidence(unread, why=why)
+        return _unreadable(files, why)
     evidence = LocatorEvidence(dict(unread), ref_label=label)
     try:
         tree = await git.files_at_ref(repo, sha)
