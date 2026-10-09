@@ -95,6 +95,7 @@ async def accept_ci_run_report(
     checks: dict[str, str] | None = None,
     mutations: dict[str, Any] | None = None,
     baseline: dict[str, Any] | None = None,
+    commit: bool = True,
 ) -> dict:
     """Store a CI run report and stamp it if it covers the pinned commit.
 
@@ -210,7 +211,8 @@ async def accept_ci_run_report(
             validation_status=validation_status,
             validation_log=validation_log or "",
         )
-    await db.commit()
+    if commit:
+        await db.commit()
 
     # What the commit now holds, not what this report carried: a report without
     # the keys leaves the stored blocks, and the answer must say so.

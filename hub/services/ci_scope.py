@@ -29,6 +29,7 @@ REASON_REPORT = "ci_report_out_of_scope"
 REASON_DEPLOY = "ci_deploy_out_of_scope"
 REASON_DAMAGED = "ci_key_scope_damaged"
 REASON_INACTIVE = "ci_key_scope_project_inactive"
+REASON_TARGET_INACTIVE = "ci_report_project_inactive"
 
 
 class CIScopeRefused(Exception):
@@ -41,7 +42,12 @@ class CIScopeRefused(Exception):
 
 
 async def enforce_ci_project_scope(
-    db: Any, identity: Any, project_slug: str | None, *, entrance: str
+    db: Any,
+    identity: Any,
+    project_slug: str | None,
+    *,
+    entrance: str,
+    project_status: str = "active",
 ) -> None:
     """Raise :class:`CIScopeRefused` or return; the only write is the event."""
     out_reason = REASON_DEPLOY if entrance == "deploy" else REASON_REPORT
@@ -57,6 +63,14 @@ async def enforce_ci_project_scope(
             raise CIScopeRefused(
                 out_reason,
                 "ключ привязан к проекту: укажите project, входящий в его scope.",
+            )
+        if project_status != "active":
+            # Routing sends an inactive project's tasks to default; here that
+            # must not make them default's (a "default" key would report for
+            # a project nobody has activated).
+            raise CIScopeRefused(
+                REASON_TARGET_INACTIVE,
+                f"проект {project_slug!r} не активен: отчёт о его задачах не принят.",
             )
         if project_slug not in scopes:
             raise CIScopeRefused(

@@ -836,7 +836,7 @@ async def test_guard_and_write_of_a_report_share_one_write_transaction(
     scoped = await scoped_ci_key('["project:audit-in"]')
     seen: dict[str, bool] = {}
 
-    real_resolve = repo.resolve_project_for_task
+    real_resolve = repo.resolve_bound_project
     real_enforce = ci_scope.enforce_ci_project_scope
     real_accept = hub_app.accept_ci_run_report
 
@@ -852,7 +852,7 @@ async def test_guard_and_write_of_a_report_share_one_write_transaction(
         seen["accept"] = db.in_transaction
         return await real_accept(db, *a, **kw)
 
-    monkeypatch.setattr(repo, "resolve_project_for_task", resolve)
+    monkeypatch.setattr(repo, "resolve_bound_project", resolve)
     monkeypatch.setattr(ci_scope, "enforce_ci_project_scope", enforce)
     monkeypatch.setattr(hub_app, "accept_ci_run_report", accept)
     await _post_report(hub.client, scoped, mine)
