@@ -11,11 +11,13 @@ the library walked into it.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import aiosqlite
 
 from hub.db import (
     _SCHEMA,
+    EXECUTOR_PAIR_DISCIPLINE_SKILL,
     MACHINE_REVIEW_CYCLE_SKILL,
     _migrate,
     fetchall,
@@ -370,3 +372,59 @@ async def test_seeding_is_safe_on_a_parallel_start(tmp_path):
     finally:
         for conn in connections:
             await conn.close()
+
+
+async def test_executor_discipline_seed_teaches_resubmission_and_waits_as_draft(
+    db: aiosqlite.Connection,
+):
+    """The seeded discipline matches lifecycle.submit_for_review (#1054, #1265).
+
+    A fix to submitted code is a new commit, a push and a NEW submission; a
+    feed entry does not move the pinned sha. And the text lands beside, never
+    over, an active version that a person stands behind: both a version a
+    stranger wrote and a seeded draft a person activated.
+    """
+    text = EXECUTOR_PAIR_DISCIPLINE_SKILL
+    flat = " ".join(text.split())  # a phrase wrapped over two lines is still the phrase
+    assert "апдейтом, а не пересдачей" not in flat
+    assert "правки в review — апдейтом" not in flat.lower()
+    assert "ровно одна сдача" not in flat.lower(), (
+        "an unconditional single-submission rule contradicts the resubmission rule"
+    )
+    assert "hub-submit-task" in text
+    assert "#1054" in text and "#1265" in text
+
+    # The spec teaches the same rules to people who write the order; it is the
+    # second place the same two phrases lived.
+    spec = " ".join(
+        (
+            Path(__file__).resolve().parents[1]
+            / "docs/specs/orchestrator-executor-environment.md"
+        )
+        .read_text(encoding="utf-8")
+        .split()
+    ).lower()
+    assert "апдейтом, а не пересдачей" not in spec
+    assert "ровно одна сдача" not in spec
+    assert "hub-submit-task" in spec and "#1054" in spec
+
+    name = "executor-pair-discipline"
+    populations = {
+        "foreign author": (1, OLD_TEXT, "active", "denis", "denis"),
+        "seeded, activated by a person": (1, OLD_TEXT, "active", "seed", "denis"),
+    }
+    for label, active_row in populations.items():
+        await _install(db, name, [active_row])
+        await seed_default_skills(db)
+        await seed_default_skills(db)
+
+        assert await _served(db, name) == OLD_TEXT, label
+        versions = await _versions(db, name)
+        active = [v for v in versions if v["status"] == "active"]
+        assert [(v["version"], v["activated_by"]) for v in active] == [
+            (1, active_row[4])
+        ], label
+        drafts = [v for v in versions if v["status"] == "draft"]
+        assert [d["content"] for d in drafts] == [text], (
+            f"{label}: the new text waits as exactly one draft"
+        )
