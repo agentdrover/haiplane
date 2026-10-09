@@ -4082,6 +4082,15 @@ def _practice_slice_lines(data: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _events_history_lines(history: dict[str, Any]) -> list[str]:
+    """Window beyond the events retention (#1621): the figure covers less."""
+    beyond = history.get("windows_beyond_history") or []
+    if not beyond:
+        return []
+    note = history.get("note") or ""
+    return [f"{note} (окна: {', '.join(str(w) for w in beyond)})"]
+
+
 @mcp.tool()
 async def hub_practice_metrics(
     since_days: int = 90,
@@ -4202,6 +4211,7 @@ async def hub_practice_metrics(
     lines.extend(_shift_left_lines(data.get("shift_left") or {}))
     lines.extend(_rule_breach_lines(data.get("rule_breaches") or {}))
     lines.extend(_practice_slice_lines(data))
+    lines.extend(_events_history_lines(data.get("events_history") or {}))
     recurring = [c for c in data.get("recurring_categories", []) if c.get("recurring")]
     if recurring:
         lines.append(

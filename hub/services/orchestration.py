@@ -1171,7 +1171,9 @@ async def practice_metrics(
     """Practice metrics of a slice: window, project and reviewer model (#1490).
 
     Without the new parameters the answer is what it was: the last
-    ``since_days`` over every project, and no extra keys. ``date_from`` and
+    ``since_days`` over every project, and no extra keys but ``events_history``
+    (#1621: which windows start before the ``events`` retention, so a figure
+    over events is not read as covering the whole window). ``date_from`` and
     ``date_to`` (``YYYY-MM-DD``, the last day included) replace ``since_days``.
     ``project`` is a slug, resolved the way the gates attribute work (#747).
     ``model`` is the REVIEWER model, ``machine_reviews.model`` — the group with
@@ -1185,7 +1187,12 @@ async def practice_metrics(
 
     Raises ``ValueError`` for an unknown project or a malformed date.
     """
-    from hub.services.metrics_scope import MODEL_INDEPENDENT, UNFILTERED, build_scope
+    from hub.services.metrics_scope import (
+        MODEL_INDEPENDENT,
+        UNFILTERED,
+        build_scope,
+        events_history,
+    )
 
     scope = await build_scope(
         db,
@@ -1196,6 +1203,11 @@ async def practice_metrics(
         date_to=date_to,
     )
     result = await _practice_sections(db, scope)
+    # #1621: always present — a 30-day number read as 14 days of events is the
+    # silent case, and it has no flag that would announce it.
+    result["events_history"] = events_history(
+        scope, compare=compare, series=series, series_days=series_days
+    )
     if not (project or model or date_from or date_to or compare or series):
         return result
     description = scope.describe()
