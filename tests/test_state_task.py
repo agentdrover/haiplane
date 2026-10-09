@@ -1407,3 +1407,47 @@ async def test_claim_and_release_never_touch_git_for_a_state_task(
     await orchestration.restore_pair_workspace_base(db, task_id)
     await orchestration.switch_pair_workspace_to_task(db, task_id)
     assert spy.calls == [], f"git у state-задачи: {spy.calls}"
+
+
+# --- отчёт ревью 870 ---------------------------------------------------------
+
+
+async def test_the_published_verdict_contract_names_the_state_completion():
+    """870/1: опубликованные тексты не говорят, что вердикт никогда не завершает."""
+    import inspect
+
+    from hub import app, mcp_server
+    from hub.services import lifecycle
+
+    tools = {t.name: t for t in await mcp_server.mcp.list_tools()}
+    published = tools["hub_submit_review"].description
+    assert "State task" in published and "completes it" in published, published
+    assert "Commit task" in published and "does NOT complete" in published
+    for doc in (
+        inspect.getdoc(app.api_review_verdict),
+        inspect.getdoc(lifecycle.record_review_verdict),
+    ):
+        assert "state" in doc and "never completes a task" not in doc
+        assert "Never a completion path" not in doc
+        assert "state_approved" in doc or "record_state_verdict" in doc
+
+
+async def test_the_rollback_detail_follows_the_same_strip_as_passed(
+    db: aiosqlite.Connection,
+):
+    """870/2: rollback из пробелов — не пройден, и detail не врёт «filled»."""
+    from hub.services.dor import evaluate_dor
+
+    for blank in ("   ", "\n\t "):
+        task_id = await make_state_task(db, rollback=blank)
+        item = next(
+            c
+            for c in (await evaluate_dor(db, task_id)).checks
+            if c.key == "has_rollback"
+        )
+        assert item.passed is False and item.detail == "rollback is empty", item
+    ok = await make_state_task(db)
+    item = next(
+        c for c in (await evaluate_dor(db, ok)).checks if c.key == "has_rollback"
+    )
+    assert item.passed is True and item.detail == "rollback is filled"

@@ -411,7 +411,11 @@ def _state_items(rollback: str | None, state_ac_count: int) -> list[DoRCheckItem
         DoRCheckItem(
             key=STATE_ROLLBACK_CHECK,
             passed=bool(rollback and rollback.strip()),
-            detail="rollback is filled" if rollback else "rollback is empty",
+            detail=(
+                "rollback is filled"
+                if (rollback or "").strip()
+                else "rollback is empty"
+            ),
         ),
         DoRCheckItem(
             key=STATE_AC_CHECK,

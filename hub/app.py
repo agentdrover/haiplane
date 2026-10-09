@@ -2449,7 +2449,9 @@ async def api_review_verdict(
 
     Canonical REST operation behind hub_submit_review and the
     ``oc-hub review-verdict`` CLI. Client-driven review returns the task to
-    ``running``; this endpoint never completes a task.
+    ``running``; for a commit task this endpoint never completes it. A state
+    task (result_kind=state, #1647) is completed by a human APPROVED with the
+    right ``expected_generation`` (event via=state_approved).
 
     Finding scope (#435): each finding carries ``scope``
     (in_scope|out_of_scope, default in_scope) and an optional

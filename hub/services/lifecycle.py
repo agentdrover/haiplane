@@ -4484,7 +4484,9 @@ async def record_review_verdict(
     later resubmission automatically invalidates an APPROVED verdict. For
     client-driven review (status=review, no review_job_id) the task returns
     to ``running`` so the developer can fix findings or report done (#307);
-    headless transitions remain with the poller. Never a completion path.
+    headless transitions remain with the poller. Not a completion path for a
+    commit task; a state task (#1647) is routed to
+    ``state_task.record_state_verdict``, where a human APPROVED completes it.
 
     Content (#1010): ``changes_requested`` is refused without a reason —
     either one finding or a non-empty ``comments``. The refusal happens

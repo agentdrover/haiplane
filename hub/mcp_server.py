@@ -2900,9 +2900,9 @@ async def hub_submit_review(
     """REVIEWER step: record a verdict on someone else's submission (#307).
 
     Not for the task's own implementer — such a verdict is refused. Binds to
-    the current submission generation and does NOT complete the task: it
-    returns to running, where APPROVED lets the author take the done path and
-    CHANGES_REQUESTED sends them back to hub_submit_for_review.
+    the current submission generation. Commit task: does NOT complete it, it
+    returns to running (APPROVED: author takes the done path; CHANGES_REQUESTED:
+    back to hub_submit_for_review). State task: a human APPROVED completes it.
 
     Finding scope (#435): changes_requested with findings needs at least one
     in_scope one — all-out-of-scope means approve and keep them as linked
