@@ -613,7 +613,7 @@ async def test_health_warns_when_the_secret_is_not_from_env(client, monkeypatch)
     monkeypatch.setattr(config, "CSRF_SECRET", "", raising=False)
     csrf.reset_secret_cache()
     health = (await client.get("/health")).json()
-    assert health["csrf_key_source"] in {"file", "ephemeral"}
+    assert health["csrf_key_source"] == "file"
     assert health["csrf_warning"]
     monkeypatch.setattr(config, "CSRF_SECRET", "from-env-value", raising=False)
     csrf.reset_secret_cache()
@@ -657,3 +657,221 @@ async def test_handlers_that_check_the_token_themselves_accept_the_session_token
     # A Bearer caller is never asked.
     bearer = await client.post(start, headers=world.human_bearer)
     assert bearer.status_code == 200, bearer.text
+
+
+# ---------------------------------------------------------------------------
+# Codex review of #1664: public paths, key file, body buffer, /login
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unresolved_bearer_is_refused_on_public_paths_too(world, monkeypatch):
+    """/logout acts on the cookie session; a bad Bearer must not make it anonymous."""
+    _set_mode(monkeypatch, "require")
+    client = world.client
+    for bad in ("Bearer not-a-real-token", "Bearer", "Bearer "):
+        resp = await client.post(
+            "/logout",
+            headers={**_cookie(world.session_a), **world.own, "Authorization": bad},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 401, (bad, resp.status_code, resp.text)
+    token = await _page_token(world, world.session_a)
+    alive = await client.post(
+        "/__csrf_echo",
+        headers={**_cookie(world.session_a), **world.own, "X-CSRF-Token": token},
+    )
+    assert alive.status_code == 200, "the session must not have been revoked"
+
+
+def _key_dir(tmp_path, monkeypatch):
+    from hub import csrf
+
+    monkeypatch.setattr(config, "CSRF_SECRET", "", raising=False)
+    monkeypatch.setattr(config, "HUB_DB_PATH", tmp_path / "hub.db")
+    monkeypatch.setattr(csrf, "_READ_PAUSE", 0)
+    csrf.reset_secret_cache()
+    return csrf, tmp_path / "csrf_secret"
+
+
+def test_concurrent_first_start_yields_one_key(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    csrf, path = _key_dir(tmp_path, monkeypatch)
+    workers = 8
+    barrier = threading.Barrier(workers)
+
+    def start():
+        barrier.wait()
+        return csrf._load_or_create_secret_file()
+
+    with ThreadPoolExecutor(workers) as pool:
+        states = list(pool.map(lambda _: start(), range(workers)))
+    assert {s.source for s in states} == {"file"}
+    assert len({s.value for s in states}) == 1
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["csrf_secret"], "no temp left"
+
+
+def test_a_key_file_that_is_not_complete_yet_is_waited_for(tmp_path, monkeypatch):
+    csrf, path = _key_dir(tmp_path, monkeypatch)
+    path.write_text("")
+    path.chmod(0o600)
+    real_sleep = csrf.time.sleep
+
+    def finish_the_write(_seconds):
+        path.write_text("ab" * 32)
+
+    monkeypatch.setattr(csrf.time, "sleep", finish_the_write)
+    state = csrf._load_or_create_secret_file()
+    monkeypatch.setattr(csrf.time, "sleep", real_sleep)
+    assert state.source == "file" and state.value == b"ab" * 32
+
+
+def test_a_key_file_that_stays_empty_is_unusable_not_ephemeral(tmp_path, monkeypatch):
+    csrf, path = _key_dir(tmp_path, monkeypatch)
+    path.write_text("short")
+    path.chmod(0o600)
+    state = csrf._load_or_create_secret_file()
+    assert state.source == "unusable" and state.value == b""
+    assert csrf.secret_warning(state)
+
+
+@pytest.mark.parametrize("case", ["mode_0644", "symlink", "other_owner"])
+def test_a_key_file_that_is_not_private_is_not_accepted(tmp_path, monkeypatch, case):
+    import os
+
+    csrf, path = _key_dir(tmp_path, monkeypatch)
+    real = tmp_path / "real_key"
+    real.write_text("cd" * 32)
+    if case == "symlink":
+        real.chmod(0o600)
+        path.symlink_to(real)
+    else:
+        path.write_text("cd" * 32)
+        path.chmod(0o644 if case == "mode_0644" else 0o600)
+    if case == "other_owner":
+        monkeypatch.setattr(csrf.os, "getuid", lambda: os.stat(path).st_uid + 1)
+    state = csrf._load_or_create_secret_file()
+    assert state.source == "unusable" and state.value == b"", case
+    assert state.problem
+
+
+@pytest.mark.asyncio
+async def test_health_names_an_unusable_key_and_no_token_is_issued(
+    world, tmp_path, monkeypatch
+):
+    csrf, path = _key_dir(tmp_path, monkeypatch)
+    path.write_text("ef" * 32)
+    path.chmod(0o644)
+    health = (await world.client.get("/health")).json()
+    assert health["csrf_key_source"] == "unusable"
+    assert "unusable" in health["csrf_warning"]
+    page = await world.client.get(
+        "/tasks", headers={**_cookie(world.session_a), "Accept": "text/html"}
+    )
+    assert not META.search(page.text)
+    # With an empty key anyone can compute a token; it must not be accepted.
+    import hashlib
+    import hmac
+
+    forged = hmac.new(
+        b"", hashlib.sha256(world.session_a.encode()).hexdigest().encode(), "sha256"
+    ).hexdigest()
+    _set_mode(monkeypatch, "require")
+    refused = await world.client.post(
+        "/__csrf_echo",
+        headers={**_cookie(world.session_a), **world.own, "X-CSRF-Token": forged},
+    )
+    assert refused.status_code == 403, refused.text
+    csrf.reset_secret_cache()
+
+
+def _form_scope(identity) -> dict:
+    return {
+        "type": "http",
+        "method": "POST",
+        "path": "/x",
+        "raw_path": b"/x",
+        "query_string": b"",
+        "scheme": "http",
+        "server": ("test", 80),
+        "headers": [(b"content-type", b"application/x-www-form-urlencoded")],
+        "state": {"identity": identity},
+    }
+
+
+async def _run_middleware(receive, monkeypatch, mode="warn"):
+    from hub.csrf import CsrfMiddleware
+
+    monkeypatch.setattr(config, "CSRF_MODE", mode, raising=False)
+    seen: list[dict] = []
+
+    async def downstream(scope, rcv, send):
+        while True:
+            message = await rcv()
+            seen.append(message)
+            if message["type"] != "http.request" or not message.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    identity = TokenIdentity("u", "human", transport="cookie")
+    await CsrfMiddleware(downstream)(_form_scope(identity), receive, send)
+    return seen, sent
+
+
+@pytest.mark.asyncio
+async def test_a_body_sent_byte_by_byte_is_buffered_as_one_message(monkeypatch):
+    payload = b"a=" + b"x" * 5000
+    pieces = [payload[i : i + 1] for i in range(len(payload))]
+
+    async def receive():
+        piece = pieces.pop(0)
+        return {"type": "http.request", "body": piece, "more_body": bool(pieces)}
+
+    seen, sent = await _run_middleware(receive, monkeypatch)
+    assert sent[0]["status"] == 204
+    assert len(seen) <= 2, f"{len(seen)} messages kept"
+    assert b"".join(m["body"] for m in seen) == payload
+
+
+@pytest.mark.asyncio
+async def test_a_slow_body_is_refused_at_the_deadline(monkeypatch):
+    from hub import csrf
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(csrf, "_monotonic", lambda: clock["now"])
+    chunks = [b"a=1&", b"b=2&", b"c=3"]
+
+    async def receive():
+        clock["now"] += config.CSRF_BODY_DEADLINE / 2 + 1
+        piece = chunks.pop(0)
+        return {"type": "http.request", "body": piece, "more_body": bool(chunks)}
+
+    seen, sent = await _run_middleware(receive, monkeypatch, mode="require")
+    assert sent[0]["status"] == 403
+    assert seen == [], "a refused request never reaches the handler"
+    assert len(chunks) >= 1, "reading stopped at the deadline"
+
+
+@pytest.mark.asyncio
+async def test_authenticated_login_page_keeps_the_pre_session_token(world):
+    client = world.client
+    client.cookies.set(config.HUB_COOKIE_NAME, world.session_a)
+    page = await client.get("/login", headers={"Accept": "text/html"})
+    assert page.status_code == 200, page.text
+    form_token = re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)
+    sent = await client.post(
+        "/login",
+        data={"username": "nobody", "password": "x", "csrf_token": form_token},
+        headers=world.own,
+        follow_redirects=False,
+    )
+    assert sent.status_code == 303
+    assert "Invalid%20form" not in sent.headers["Location"], sent.headers["Location"]

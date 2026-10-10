@@ -608,6 +608,11 @@ def _bearer_presented(request: Request) -> bool:
     return bool(parts) and parts[0].lower() == "bearer"
 
 
+def _bearer_refused(request: Request) -> bool:
+    """A mutating request that presented a Bearer which did not resolve."""
+    return request.method in MUTATING_METHODS and _bearer_presented(request)
+
+
 async def _resolve_bearer(request: Request, bearer: str) -> TokenIdentity | None:
     identity = await _resolve_chat_pair(request, bearer)
     if identity:
@@ -649,7 +654,7 @@ async def _resolve_identity(request: Request) -> TokenIdentity | None:
         identity = await _resolve_bearer(request, bearer)
         if identity:
             return _stamped(identity, "bearer")
-    if request.method in MUTATING_METHODS and _bearer_presented(request):
+    if _bearer_refused(request):
         return None
 
     cookie = _extract_cookie(request)
@@ -679,7 +684,13 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         try:
             if _looks_public(path):
-                identity = await _resolve_identity(request) or ANONYMOUS_IDENTITY
+                resolved_public = await _resolve_identity(request)
+                if resolved_public is None and _bearer_refused(request):
+                    # #1664: a Bearer that did not resolve must not become an
+                    # anonymous caller on a public path either (/logout acts
+                    # on the cookie session behind it).
+                    return _unauthorized(request)
+                identity = resolved_public or ANONYMOUS_IDENTITY
                 if _chat_pair_refused(identity, request.method, path):
                     return _chat_pair_forbidden(request.method, path)
                 if (blocked := await _role_gate(request, identity, path)) is not None:

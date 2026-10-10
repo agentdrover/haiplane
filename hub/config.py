@@ -697,6 +697,8 @@ CSRF_MODE = _csrf_mode_raw if _csrf_mode_raw in CSRF_MODES else "warn"
 CSRF_SECRET = env_get("HUB_CSRF_SECRET", "")
 # A form body is buffered up to this size to find the csrf_token field.
 CSRF_BODY_LIMIT = 1024 * 1024
+# ... and read for at most this many seconds (a slow body holds a worker).
+CSRF_BODY_DEADLINE = 10.0
 
 
 HUB_BOOTSTRAP_TOKEN = env_get("HUB_BOOTSTRAP_ADMIN_TOKEN", "")

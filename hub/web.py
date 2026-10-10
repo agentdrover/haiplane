@@ -91,7 +91,8 @@ def _user_context(request: Request) -> dict[str, Any]:
     # in base.html). Starlette lets a processor override the view's own context,
     # so the legacy double-submit value of the pages that still mint one is
     # replaced by this one — which their handlers accept too.
-    if token := csrf_token_for_request(request):
+    # /login keeps its pre-session token: its handler verifies that one.
+    if request.url.path != "/login" and (token := csrf_token_for_request(request)):
         context["csrf_token"] = token
     return context
 

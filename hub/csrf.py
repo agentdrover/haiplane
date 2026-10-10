@@ -19,13 +19,17 @@ through and writes ``csrf_would_reject``, ``require`` answers 403.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
 import os
 import secrets
+import stat
+import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Final
 from urllib.parse import urlsplit
 
@@ -71,10 +75,17 @@ _DEFAULT_PORTS: Final[dict[str, int]] = {"http": 80, "https": 443}
 @dataclass(frozen=True)
 class SecretState:
     value: bytes
-    source: str  # env | file | ephemeral
+    source: str  # env | file | unusable
+    problem: str = ""
 
+
+_KEY_HEX_LEN = 64
+_READ_ATTEMPTS = 10
+_READ_PAUSE = 0.05
+_UNUSABLE_RETRY_SECONDS = 30.0
 
 _secret_cache: SecretState | None = None
+_secret_cached_at = 0.0
 
 
 def reset_secret_cache() -> None:
@@ -82,50 +93,112 @@ def reset_secret_cache() -> None:
     _secret_cache = None
 
 
-def _secret_path():
+def _secret_path() -> Path:
     return config.HUB_DB_PATH.parent / "csrf_secret"
+
+
+def _unusable(problem: str) -> SecretState:
+    log.warning("csrf key file unusable: %s", problem)
+    return SecretState(b"", "unusable", problem)
+
+
+def _read_key_file(path: Path) -> SecretState | None:
+    """The published key, ``None`` while the file is empty or short, else unusable.
+
+    No symlink is followed, and the file must be a regular file of this user
+    that nobody else can read or write: a key anyone can read is not a key.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        return _unusable(f"cannot open ({exc.strerror})")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return _unusable("not a regular file")
+        if info.st_uid != os.getuid():
+            return _unusable("owned by another user")
+        if info.st_mode & 0o077:
+            return _unusable("readable or writable by group or others")
+        with os.fdopen(fd, "r", closefd=False) as handle:
+            text = handle.read().strip()
+    finally:
+        os.close(fd)
+    if len(text) < _KEY_HEX_LEN:
+        return None
+    return SecretState(text.encode(), "file")
+
+
+def _publish_key_file(path: Path) -> None:
+    """Write a private temp file, then link it into place; losing the race is fine."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(secrets.token_hex(_KEY_HEX_LEN // 2))
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            pass
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _load_or_create_secret_file() -> SecretState:
     path = _secret_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            existing = path.read_text().strip()
-            if existing:
-                return SecretState(existing.encode(), "file")
-            raise OSError("csrf secret file is empty") from None
-        with os.fdopen(fd, "w") as handle:
-            handle.write(secrets.token_hex(32))
-        return SecretState(path.read_text().strip().encode(), "file")
-    except OSError:
-        log.warning("csrf secret file unusable; tokens will not survive a restart")
-        return SecretState(secrets.token_hex(32).encode(), "ephemeral")
+        if not os.path.lexists(path):
+            _publish_key_file(path)
+    except OSError as exc:
+        return _unusable(f"cannot create ({exc.strerror})")
+    for attempt in range(_READ_ATTEMPTS):
+        state = _read_key_file(path)
+        if state is not None:
+            return state
+        if attempt + 1 < _READ_ATTEMPTS:
+            time.sleep(_READ_PAUSE)
+    return _unusable("empty or short")
 
 
 def secret_state() -> SecretState:
-    """The key and where it came from; ``env`` is preferred, then a 0600 file."""
-    global _secret_cache
+    """The key and where it came from: ``env``, else a private 0600 file.
+
+    When neither works the state is ``unusable`` with an empty key: no token is
+    issued or accepted, so ``require`` refuses cookie mutations and ``/health``
+    says why. A silent per-process key would differ between workers.
+    """
+    global _secret_cache, _secret_cached_at
     if config.CSRF_SECRET:
         return SecretState(config.CSRF_SECRET.encode(), "env")
-    if _secret_cache is None:
+    now = time.monotonic()
+    stale = (
+        _secret_cache is not None
+        and _secret_cache.source == "unusable"
+        and now - _secret_cached_at > _UNUSABLE_RETRY_SECONDS
+    )
+    if _secret_cache is None or stale:
         _secret_cache = _load_or_create_secret_file()
+        _secret_cached_at = now
     return _secret_cache
 
 
 def secret_warning(state: SecretState | None = None) -> str:
     """Text for the public /health: it must not carry the word "secret"."""
-    source = (state or secret_state()).source
-    if source == "env":
+    state = state or secret_state()
+    if state.source == "env":
         return ""
-    if source == "file":
+    if state.source == "file":
         return (
             "CSRF key is read from a file next to the database; "
             "set it in the service environment"
         )
-    return "CSRF key is ephemeral and changes on restart; set it in the service environment"
+    return (
+        f"CSRF key file is unusable ({state.problem}); cookie sessions get no "
+        "CSRF token until it is fixed or the key is set in the service environment"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +215,8 @@ def token_for_session_cookie(cookie_value: str) -> str:
 
 def session_token_ok(presented: str | None, cookie_value: str | None) -> bool:
     if not presented or not cookie_value:
+        return False
+    if secret_state().source == "unusable":
         return False
     expected = token_for_session_cookie(cookie_value)
     return hmac.compare_digest(presented.encode(), expected.encode())
@@ -160,6 +235,8 @@ def token_for_request(request: Request) -> str:
     identity = getattr(request.state, "identity", None)
     cookie = _cookie_value(request)
     if getattr(identity, "transport", "") != "cookie" or not cookie:
+        return ""
+    if secret_state().source == "unusable":
         return ""
     return token_for_session_cookie(cookie)
 
@@ -211,20 +288,49 @@ def _replayer(buffered: list[Message], receive: Receive) -> Receive:
     return replay
 
 
-async def _buffer_body(receive: Receive, limit: int) -> tuple[list[Message], bool]:
-    """Read messages until the body ends or passes ``limit``. (messages, complete)."""
-    messages: list[Message] = []
-    size = 0
-    while True:
-        message = await receive()
-        messages.append(message)
+_monotonic = time.monotonic
+
+
+async def _buffer_body(
+    receive: Receive, limit: int, deadline_seconds: float
+) -> tuple[list[Message], str]:
+    """Read the body into ONE message, up to ``limit`` bytes and a deadline.
+
+    Returns (messages to replay, "" | "body_too_large" | "body_timeout").
+    Fragments are joined into a single ``bytearray``: a dict per ASGI message
+    would cost about 190 times the body for a body sent byte by byte.
+    """
+    body = bytearray()
+    tail: list[Message] = []
+    started = _monotonic()
+    reason = ""
+    more = True
+    while more:
+        remaining = deadline_seconds - (_monotonic() - started)
+        if remaining <= 0:
+            reason = "body_timeout"
+            break
+        try:
+            message = await asyncio.wait_for(receive(), timeout=remaining)
+        except asyncio.TimeoutError:
+            reason = "body_timeout"
+            break
         if message["type"] != "http.request":
-            return messages, False
-        size += len(message.get("body", b""))
-        if size > limit:
-            return messages, False
-        if not message.get("more_body", False):
-            return messages, True
+            tail.append(message)
+            reason = "body_too_large"  # a disconnect: nothing complete to judge
+            break
+        body.extend(message.get("body", b""))
+        more = message.get("more_body", False)
+        if len(body) > limit:
+            reason = "body_too_large"
+            break
+    unfinished = bool(reason) or more
+    head: Message = {
+        "type": "http.request",
+        "body": bytes(body),
+        "more_body": unfinished and not tail,
+    }
+    return [head, *tail], reason
 
 
 async def _form_token(scope: Scope, replay: Receive) -> str | None:
@@ -249,10 +355,12 @@ async def _judge_form(
     declared = request.headers.get("content-length", "")
     if declared.isdigit() and int(declared) > config.CSRF_BODY_LIMIT:
         return "body_too_large", receive
-    buffered, complete = await _buffer_body(receive, config.CSRF_BODY_LIMIT)
+    buffered, reason = await _buffer_body(
+        receive, config.CSRF_BODY_LIMIT, config.CSRF_BODY_DEADLINE
+    )
     passed_on = _replayer(buffered, receive)
-    if not complete:
-        return "body_too_large", passed_on
+    if reason:
+        return reason, passed_on
     token = await _form_token(scope, _replayer(buffered, receive))
     if request_session_token_ok(request, token):
         return "", passed_on
