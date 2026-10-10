@@ -52,7 +52,7 @@ def _safe_env() -> dict[str, str]:
     }
 
 
-async def _collect(proc: Any) -> tuple[bytes, int]:
+async def collect_output(proc: Any) -> tuple[bytes, int]:
     """Read the child's output up to ``_MAX_OUTPUT``, then reap it (#509).
 
     Everything past the cap is read and discarded rather than buffered: we must
@@ -86,6 +86,7 @@ async def default_validation_runner(
     rc = 0
     for cmd in commands:
         proc = None
+        pgid = None
         try:
             proc = await asyncio.create_subprocess_shell(
                 cmd,
@@ -97,13 +98,24 @@ async def default_validation_runner(
                 # rather than just the shell we spawned (#544).
                 start_new_session=True,
             )
-            out, dropped = await asyncio.wait_for(_collect(proc), timeout=_RUN_TIMEOUT)
+            # The shell leads a group of its own (start_new_session): its id is
+            # its pid, saved now so that a leader that already exited does not
+            # hide what it left running.
+            pgid = proc.pid
+            out, dropped = await asyncio.wait_for(
+                collect_output(proc), timeout=_RUN_TIMEOUT
+            )
+        except asyncio.CancelledError:
+            # A cancelled request must not leave the command running: the group
+            # goes first, then the cancellation goes on.
+            await kill_process_group(proc, pgid=pgid)
+            raise
         except (OSError, TimeoutError, asyncio.TimeoutError):
             # wait_for cancels only the await — the command keeps running in the
             # workspace, and every retry leaks another one. Kill the group: the
             # shell may not have exec'd the payload, in which case killing its
             # pid alone leaves the real command alive (#544).
-            await kill_process_group(proc)
+            await kill_process_group(proc, pgid=pgid)
             log.warning("validation command failed to run in %s", repo_path)
             return None
         tail = f"\n[... {dropped} bytes dropped]" if dropped else ""
