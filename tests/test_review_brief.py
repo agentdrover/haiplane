@@ -1701,3 +1701,200 @@ async def test_brief_never_imports_task_branch_code(
     ):
         assert resolution["status"] == "resolvable", resolution
         assert "without running" in resolution["reason"], resolution
+
+
+# ---- #1652: the brief says where its assembly spent the time ----
+
+
+class _FakeClock:
+    """The monotonic clock of the brief, advanced only where a test says so."""
+
+    def __init__(self) -> None:
+        self.ns = 1_000_000_000
+
+    def __call__(self) -> int:
+        return self.ns
+
+    def advance_ms(self, ms: int) -> None:
+        self.ns += ms * 1_000_000
+
+
+def _spend(clock: _FakeClock, ms: int, target):
+    """``target`` wrapped so that calling it costs ``ms`` of fake time."""
+    import inspect
+
+    if inspect.iscoroutinefunction(target):
+
+        async def timed_async(*args, **kwargs):
+            clock.advance_ms(ms)
+            return await target(*args, **kwargs)
+
+        return timed_async
+
+    def timed(*args, **kwargs):
+        clock.advance_ms(ms)
+        return target(*args, **kwargs)
+
+    return timed
+
+
+def _slow_blocks(monkeypatch, clock: _FakeClock) -> None:
+    """Every accounting zone of the brief costs a known, distinct time."""
+    from hub import services
+    from hub.services import review_brief as rb
+
+    monkeypatch.setattr(rb, "_now_ns", clock)
+    costs = [
+        (review_evidence, "resolve_diff_base", 10),
+        (services, "detect_branch_stacking", 20),
+        (rb, "resolve_locators_at_ref", 30),
+        (services, "resolve_branch_tip", 40),
+        (rb, "base_merge_section", 50),
+        (rb, "build_call_sites_section", 60),
+        (rb, "_brief_verdict_route", 70),
+        (repo, "list_ac_test_results", 5),
+        (repo, "get_latest_machine_review", 3),
+        (review_evidence, "evidence_coverage", 7),
+        (services, "row_to_ac", 1),
+        # outside every zone: only the total sees it
+        (review_evidence, "sha_check_of", 4),
+    ]
+    for owner, name, ms in costs:
+        monkeypatch.setattr(owner, name, _spend(clock, ms, getattr(owner, name)))
+
+
+async def test_brief_reports_block_timings(
+    db, client: AsyncClient, workspace, monkeypatch
+):
+    import json
+    from io import StringIO
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from hub import cli
+    from hub.mcp_server import hub_get_review_brief
+    from hub.services import review_brief as rb
+
+    task_id = await _task_with_test_ac(
+        db, client, workspace, "tests/test_a.py::test_ok"
+    )
+    await repo.update_task(
+        db, task_id, status="review", pr_number=7, submission_sha="a" * 40
+    )
+    plain = (await client.post("/api/tasks", json={"title": "No branch"})).json()["id"]
+    await db.commit()
+
+    clock = _FakeClock()
+    _slow_blocks(monkeypatch, clock)
+
+    brief = await rb.build_review_brief(db, task_id)
+    assert brief is not None and brief.timings is not None
+    assert brief.timings.blocks == {
+        "diff_base": 10,
+        "stacking": 20,
+        "test_locators": 30,
+        "branch_tip": 40,
+        "base_merge": 50,
+        "call_sites": 60,
+        "verdict_route": 70,
+        "db_reads": 5 + 3,
+        "assemble": 7 + 1,
+    }
+    # 4 ms spent outside every zone: the total is the interval, not a sum.
+    assert brief.timings.total_ms == 10 + 20 + 30 + 40 + 50 + 60 + 70 + 8 + 8 + 4
+
+    clock.advance_ms(0)
+    second = await rb.build_review_brief(db, plain)
+    assert second is not None and second.timings is not None
+    assert set(second.timings.blocks) == {
+        "diff_base",
+        "call_sites",
+        "db_reads",
+        "assemble",
+    }, "a block that did not apply is absent, not zero"
+    assert "test_locators" not in second.timings.blocks
+    assert "base_merge" not in second.timings.blocks
+
+    # The three readers: REST, MCP structuredContent, CLI.
+    monkeypatch.undo()
+    rest = (await client.get(f"/api/tasks/{task_id}/review-brief")).json()
+    assert set(rest["timings"]) == {"blocks", "total_ms"}
+    assert isinstance(rest["timings"]["total_ms"], int)
+    assert "diff_base" in rest["timings"]["blocks"]
+
+    with patch("hub.mcp_server._api_get", AsyncMock(return_value=rest)):
+        out = await hub_get_review_brief(task_id)
+    assert out.structuredContent["brief"]["timings"] == rest["timings"]
+
+    stdout = StringIO()
+    with (
+        patch.object(cli, "_api", MagicMock(return_value=rest)),
+        patch("sys.stdout", new=stdout),
+    ):
+        cli.cmd_review_brief(MagicMock(task_id=task_id))
+    assert json.loads(stdout.getvalue())["timings"] == rest["timings"]
+
+
+async def _mcp_brief_text(brief: dict) -> str:
+    import json
+    from unittest.mock import AsyncMock, patch
+
+    from hub.mcp_server import hub_get_review_brief
+
+    with patch("hub.mcp_server._api_get", AsyncMock(return_value=brief)):
+        out = await hub_get_review_brief(brief["task_id"])
+    return json.loads(out.content[0].text)["message"]
+
+
+async def test_slow_brief_logs_once_above_threshold(
+    db, client: AsyncClient, workspace, monkeypatch, caplog
+):
+    import logging
+
+    from hub.services import review_brief as rb
+    from hub.services.steward_evidence import EvidencePacket, packet_hash
+
+    task_id = await _task_with_test_ac(
+        db, client, workspace, "tests/test_a.py::test_ok"
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(rb, "_now_ns", clock)
+    real_base = review_evidence.resolve_diff_base
+
+    def costing(ms: int) -> None:
+        monkeypatch.setattr(
+            review_evidence, "resolve_diff_base", _spend(clock, ms, real_base)
+        )
+
+    def slow_records():
+        return [r for r in caplog.records if "slow-brief" in r.getMessage()]
+
+    caplog.set_level(logging.WARNING, logger="hub")
+
+    costing(rb.SLOW_BRIEF_MS)
+    at_threshold = await rb.build_review_brief(db, task_id)
+    assert at_threshold.timings.total_ms == rb.SLOW_BRIEF_MS
+    assert slow_records() == [], "equal to the threshold is not slow"
+    assert "сборка" not in await _mcp_brief_text(at_threshold.model_dump(mode="json"))
+
+    costing(rb.SLOW_BRIEF_MS + 1)
+    slow = await rb.build_review_brief(db, task_id)
+    assert slow.timings.total_ms == rb.SLOW_BRIEF_MS + 1
+    records = slow_records()
+    assert len(records) == 1, "one record per slow assembly"
+    message = records[0].getMessage()
+    assert f"task_id={task_id}" in message
+    assert "diff_base" in message
+    assert records[0].levelno == logging.WARNING
+
+    text = await _mcp_brief_text(slow.model_dump(mode="json"))
+    assert f"сборка {rb.SLOW_BRIEF_MS + 1} мс; самые долгие: diff_base" in text
+
+    # The steward packet hash does not depend on timings.
+    def packet(brief):
+        return EvidencePacket(
+            task_id=task_id, generation=1, brief=brief, facts={}, quotes=()
+        )
+
+    other = slow.model_copy(deep=True)
+    other.timings = at_threshold.timings
+    assert packet_hash(packet(slow)) == packet_hash(packet(other))

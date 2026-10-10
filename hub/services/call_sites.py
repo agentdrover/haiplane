@@ -32,7 +32,10 @@ import ast
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+import subprocess  # nosec B404
+import threading
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace
 
 log = logging.getLogger("hub.call_sites")
 
@@ -249,17 +252,19 @@ def _walk_python(root: str, subdir: str) -> list[str]:
     base = os.path.join(root, subdir)
     out: list[str] = []
     for dirpath, dirnames, filenames in os.walk(base):
-        dirnames[:] = [
-            d for d in dirnames if d not in {"__pycache__", ".venv", "node_modules"}
-        ]
+        dirnames[:] = [d for d in dirnames if d not in _SKIPPED_DIRS]
         for name in filenames:
             if name.endswith(".py"):
                 out.append(os.path.relpath(os.path.join(dirpath, name), root))
     return sorted(out)
 
 
+INDEX_SUBDIRS: tuple[str, ...] = ("hub", "tests")
+_SKIPPED_DIRS = frozenset({"__pycache__", ".venv", "node_modules"})
+
+
 def build_call_index(
-    root: str, subdirs: tuple[str, ...] = ("hub", "tests")
+    root: str, subdirs: tuple[str, ...] = INDEX_SUBDIRS
 ) -> tuple[dict[str, list[CallSite]], list[str]]:
     """Every call by name, and the files that could not be parsed.
 
@@ -334,6 +339,163 @@ def build_call_index(
     return index, unparsed
 
 
+# ---- #1652: the raw index is built once per clean commit, not per request ----
+#
+# ``build_call_index`` reads and parses every .py under hub/ and tests/ — 3.2 s
+# of the 3.8 s ``analyse`` took on a 47-file branch — and the brief asks for it
+# on every REST/MCP read and for every card at the gate. The raw index depends
+# on the tree only, never on the diff, so it is kept per (root, HEAD, subdirs).
+#
+# The cache is allowed ONLY while the indexed .py files are exactly what HEAD
+# holds: a modified, untracked or ignored .py (the walk reads all three) makes
+# any cached index a guess. Cleanliness is asked before a hit is served and
+# around a build; any doubt (git failed, no HEAD, not a repository) means the
+# plain uncached build. A wrong place-of-call in a review brief is worse than
+# a slow one.
+
+INDEX_CACHE_SIZE = 8
+_GIT_TIMEOUT_S = 30
+
+_CacheKey = tuple[str, str, tuple[str, ...]]
+_Index = tuple[dict[str, list[CallSite]], list[str]]
+
+
+class _Flight:
+    """One build in progress; waiters block on ``done`` (thread-safe)."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+
+
+_index_lock = threading.Lock()
+_index_cache: "OrderedDict[_CacheKey, _Index]" = OrderedDict()
+_index_inflight: dict[_CacheKey, _Flight] = {}
+
+
+def clear_index_cache() -> None:
+    """Forget every cached index (tests; also safe in production)."""
+    with _index_lock:
+        _index_cache.clear()
+
+
+def _git(root: str, *args: str) -> str | None:
+    """stdout of a read-only git call, or ``None`` when it did not succeed."""
+    try:
+        done = subprocess.run(  # nosec B603 B607 - fixed argv; "git" from PATH
+            ["git", "-C", root, *args],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_S,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def _head_sha(root: str) -> str | None:
+    out = _git(root, "rev-parse", "--verify", "-q", "HEAD")
+    sha = (out or "").strip()
+    return sha or None
+
+
+def _status_path(line: str) -> str:
+    """The path part of a porcelain v1 line ("XY path" or "XY old -> new")."""
+    path = line[3:].strip()
+    if " -> " in path:
+        path = path.rsplit(" -> ", 1)[1]
+    return path.strip('"')
+
+
+def _indexed_tree_is_clean(root: str, subdirs: tuple[str, ...]) -> bool | None:
+    """True when no .py the walk reads differs from HEAD; None when unknown.
+
+    ``--ignored`` and ``--untracked-files=all`` matter: the walk reads files
+    git does not track, and a changed one of those moves the index too.
+    """
+    out = _git(
+        root,
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--ignored",
+        "--",
+        *subdirs,
+    )
+    if out is None:
+        return None
+    for line in out.splitlines():
+        path = _status_path(line)
+        if not path.endswith(".py"):
+            continue
+        if _SKIPPED_DIRS.intersection(path.split("/")):
+            continue  # the walk never enters these
+        return False
+    return True
+
+
+def _copy_index(index: _Index) -> _Index:
+    return (
+        {name: [replace(site) for site in sites] for name, sites in index[0].items()},
+        list(index[1]),
+    )
+
+
+def _usable_state(root: str, subdirs: tuple[str, ...]) -> str | None:
+    """HEAD when the cache may be used for this tree right now, else None."""
+    head = _head_sha(root)
+    if head is None:
+        return None
+    return head if _indexed_tree_is_clean(root, subdirs) is True else None
+
+
+def _remember(key: _CacheKey, index: _Index) -> None:
+    with _index_lock:
+        _index_cache[key] = index
+        _index_cache.move_to_end(key)
+        while len(_index_cache) > INDEX_CACHE_SIZE:
+            _index_cache.popitem(last=False)
+
+
+def _build_as_owner(root: str, key: _CacheKey, flight: _Flight) -> _Index:
+    """Build outside any lock, cache only if the tree stood still, then release."""
+    try:
+        built = build_call_index(root)
+        if _usable_state(root, key[2]) == key[1]:
+            _remember(key, _copy_index(built))
+        return built
+    finally:
+        with _index_lock:
+            _index_inflight.pop(key, None)
+        flight.done.set()
+
+
+def cached_call_index(root: str) -> _Index:
+    """``build_call_index`` through the process cache; always a private copy."""
+    abs_root = os.path.abspath(root)
+    subdirs = INDEX_SUBDIRS
+    while True:
+        head = _usable_state(abs_root, subdirs)
+        if head is None:
+            return build_call_index(root)
+        key: _CacheKey = (abs_root, head, subdirs)
+        with _index_lock:
+            hit = _index_cache.get(key)
+            if hit is not None:
+                _index_cache.move_to_end(key)
+                return _copy_index(hit)
+            flight = _index_inflight.get(key)
+            owner = flight is None
+            if flight is None:
+                flight = _index_inflight[key] = _Flight()
+        if owner:
+            return _build_as_owner(root, key, flight)
+        # Someone else is building this very key. Wait outside the lock, then
+        # start over: HEAD and cleanliness are asked again, and if the owner
+        # failed or did not cache, this call builds for itself.
+        flight.done.wait()
+
+
 def _is_touched(site: CallSite, changed: set[int]) -> bool:
     """Did this diff put the author in front of THIS call?
 
@@ -367,7 +529,7 @@ def analyse(
     if not ranges:
         return CallSiteReport(UNKNOWN, "the diff named no changed lines")
 
-    index, unparsed = build_call_index(root)
+    index, unparsed = cached_call_index(root)
     if not index:
         # The walk itself failed. Reporting "no callers" for every symbol here
         # would be a green section that proves nothing (#598).
