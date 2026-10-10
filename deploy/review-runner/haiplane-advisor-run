@@ -18,18 +18,27 @@ export HOME=/var/lib/haiplane-review
 CONF=/etc/haiplane-review
 # Единственный допустимый владелец advisor.env — root.
 ENV_UID=0
-# Образ — тот же файл, что у враппера ревью (qwen-code лежит в образе
-# песочницы). Модель и срок — файлы ЭТОЙ обёртки; те же файлы читает служба и
-# объявляет в heartbeat, поэтому объявленное хабу и запущенное не расходятся.
-# Нет файла — отказ (set -e), а не запуск с умолчанием.
-IMAGE=$(cat "$CONF/image")
+# Образ советника — СВОЙ файл advisor-image (рецепт advisor.Containerfile,
+# localhost/haiplane-advisor:1), а не образ ревью: от неописанного образа
+# песочницы советник не зависит. Модель и срок — файлы ЭТОЙ обёртки; те же
+# файлы читает служба и объявляет в heartbeat, поэтому объявленное хабу и
+# запущенное не расходятся. Нет файла или он пуст — явный отказ ДО podman, а не
+# запуск с умолчанием.
+if [ ! -f "$CONF/advisor-image" ] || [ -L "$CONF/advisor-image" ]; then
+    echo "advisor-image: нужен обычный файл с именем образа" >&2
+    exit 65
+fi
+IMAGE=$(cat "$CONF/advisor-image")
+case $IMAGE in
+    '' | *[!A-Za-z0-9._:/@-]*) echo "advisor-image: имя образа пусто или недопустимо" >&2; exit 65 ;;
+esac
 MODEL=$(cat "$CONF/advisor-model")
 TIMEOUT=$(cat "$CONF/advisor-timeout")
 case $TIMEOUT in
     '' | 0 | *[!0-9]*) echo "advisor-timeout: нужно целое число секунд больше нуля" >&2; exit 65 ;;
 esac
 case $MODEL in
-    '' | *[!A-Za-z0-9._/-]*) echo "advisor-model: имя модели недопустимо" >&2; exit 65 ;;
+    '' | */* | *[!A-Za-z0-9._-]*) echo "advisor-model: имя модели недопустимо" >&2; exit 65 ;;
 esac
 # advisor.env — ключ z.ai: обычный файл (не ссылка), владелец root, записи
 # группе и миру нет, миру недоступен, и это НЕ тот же файл, что model.env (иначе
@@ -66,8 +75,13 @@ fi
 # Без монтирований хоста, сокетов и домашнего каталога. Контейнер получает
 # --env-file только с ключом z.ai. --timeout — последний рубеж: хаб и служба
 # снимают прогон просьбой, а контейнер доживает ровно до него.
-# qwen-code: промт читает из stdin; режим yolo разрешает tool calls (redeem,
-# GET evidence, POST judgement) без запроса, потому что вся изоляция — здесь.
+# OpenCode (инструмент из списка подписки z.ai): промт читает из stdin
+# (`opencode run` без аргумента-сообщения, run.ts:416 тега v1.18.35) и НИКОГДА
+# не получает его в argv; `--auto` разрешает tool calls (redeem, GET evidence,
+# POST judgement) без вопроса, потому что вся изоляция — здесь. Провайдер
+# zai-coding-plan — литерал, $MODEL — голое имя из advisor-model. Отключения
+# автообновления, шаринга, загрузки каталога моделей, плагинов и LSP заданы
+# литералами здесь, а не берутся из advisor.env.
 exec /usr/bin/podman run --rm -i \
      --replace --name haiplane-advisor \
      --cgroup-manager=systemd \
@@ -75,4 +89,12 @@ exec /usr/bin/podman run --rm -i \
      --memory=1500m --cpus=1.5 --pids-limit=512 \
      --cap-drop=all --security-opt=no-new-privileges \
      --env-file="$CONF/advisor.env" \
-     "$IMAGE" qwen --model "$MODEL" --approval-mode yolo --output-format text
+     -e OPENCODE_DISABLE_AUTOUPDATE=1 \
+     -e OPENCODE_AUTO_SHARE=false \
+     -e OPENCODE_DISABLE_MODELS_FETCH=1 \
+     -e OPENCODE_PURE=1 \
+     -e OPENCODE_DISABLE_DEFAULT_PLUGINS=1 \
+     -e OPENCODE_DISABLE_LSP_DOWNLOAD=1 \
+     -e OPENCODE_DISABLE_PROJECT_CONFIG=1 \
+     -e OPENCODE_DISABLE_EXTERNAL_SKILLS=1 \
+     "$IMAGE" opencode run --model "zai-coding-plan/$MODEL" --auto

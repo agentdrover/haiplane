@@ -939,7 +939,7 @@ async def test_an_advisor_job_obeys_the_drain_and_the_steward_cap(
         await asyncio.sleep(0.02)
     jobs = list(spool.glob("job-*"))
     assert len(jobs) == 1 and svc.jobs == [
-        {"version": 3, "timeout_sec": 900, "profile": "advisor", "model": "glm-5.1"}
+        {"version": 3, "timeout_sec": 900, "profile": "advisor", "model": "glm-5.3"}
     ]
     counted = _run(["acquire"], spool, bin_dir, DRAIN_BUDGET_SECONDS="1")
     assert "drain timeout" in counted.stdout and jobs[0].name in counted.stdout

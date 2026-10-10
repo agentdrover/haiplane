@@ -22,7 +22,7 @@ from hub.integrations import local_reviewer
 from hub.services import chat_pair
 from hub.services import steward_shadow as sh
 
-GLM = "glm-5.1"
+GLM = "glm-5.3"
 
 
 def capabilities(**over) -> dict:
