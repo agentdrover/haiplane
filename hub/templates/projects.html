@@ -295,6 +295,13 @@
                         <option value="local" {% if stored_policy.get('deep_reviewer') == 'local' %}selected{% endif %}>local — локальный deep первым, при отказе облако</option>
                     </select>
                     {{ cost_now(cost, 'deep_reviewer', 'cloud') }}
+                    <label class="task-action-label">Запасной локальный ревьюер при отказе облака</label>
+                    <select name="gate_policy_local_review_fallback" class="task-action-control">
+                        <option value="" {% if stored_policy.get('local_review_fallback') is none %}selected{% endif %}>наследовать: off</option>
+                        <option value="off" {% if stored_policy.get('local_review_fallback') == 'off' %}selected{% endif %}>off — вердикт остаётся человеку</option>
+                        <option value="on" {% if stored_policy.get('local_review_fallback') == 'on' %}selected{% endif %}>on — локальный ревьюер вместо облака (платный прогон)</option>
+                    </select>
+                    {{ cost_now(cost, 'local_review_fallback', 'off') }}
                     <label class="task-action-label">Потолок deep в сутки (пусто = наследовать)</label>
                     <input type="number" min="0" step="1" name="gate_policy_deep_daily_cap" class="task-action-control" value="{{ stored_policy.get('deep_daily_cap') if stored_policy.get('deep_daily_cap') is not none else '' }}">
                     {{ cost_now(cost, 'deep_daily_cap', 'без потолка') }}
