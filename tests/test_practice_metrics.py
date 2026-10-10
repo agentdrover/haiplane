@@ -2642,6 +2642,7 @@ LEGACY_KEYS = {
     "validation_run_lines",
     "executor_runs",
     "review_economy",
+    "events_history",
 }
 
 
@@ -2883,7 +2884,13 @@ async def test_metrics_since_days_backward_compatible(db: aiosqlite.Connection):
     assert plain["since_days"] == 30
     assert plain["machine_reviews"]["reviews"] == 1
     assert plain["machine_reviews"]["dispositions"]["judged"] == 2
-    assert plain == await practice_metrics(db, since_days=30, project=None)
+    again = await practice_metrics(db, since_days=30, project=None)
+    # history_from moves with the clock: compare the rest, then the shape.
+    assert (
+        plain.pop("events_history")["windows_beyond_history"]
+        == (again.pop("events_history")["windows_beyond_history"])
+    )
+    assert plain == again
     # The default stays the one named constant.
     assert (await practice_metrics(db))["since_days"] == 90
 
@@ -3470,3 +3477,144 @@ async def test_validation_run_lines_unpinned_submission_is_not_run(
     runs = await _run_lines(db)
 
     assert (runs["failed_with_run_lines"], runs["sample"], runs["not_run"]) == (1, 1, 1)
+
+
+# --- events_history: окно длиннее хранения events (#1621) --------------------
+#
+# events чистится на EVENTS_RETENTION_DAYS. Покрытие определяется этим
+# известным пределом, а не MIN(created_at): пустые первые часы окна не должны
+# менять ответ.
+
+_EVENTS_NOTE = (
+    "окно по events длиннее хранения: по политике хранения (14 дн.) данные раньше "
+)
+_EVENTS_TAIL = " не гарантированы; более старые события могут оставаться до очистки"
+
+
+def _eh(body: dict) -> dict:
+    assert "events_history" in body, sorted(body)
+    return body["events_history"]
+
+
+def _today_offset(days: int) -> str:
+    return (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+async def test_events_history_marks_window_beyond_retention(db: aiosqlite.Connection):
+    """AC-1 (#1621): since_days=30 называет current, history_from = now − 14 дней."""
+    before = datetime.now(UTC)
+    out = await practice_metrics(db, since_days=30)
+    history = _eh(out)
+    assert history["retention_days"] == repo.EVENTS_RETENTION_DAYS == 14
+    assert history["windows_beyond_history"] == ["current"]
+    moment = datetime.fromisoformat(history["history_from"])
+    assert moment.utcoffset() == timedelta(0)
+    assert abs((before - timedelta(days=14)) - moment) < timedelta(minutes=2)
+    assert history["note"].startswith(_EVENTS_NOTE)
+    names = {s["name"]: s["own_window"] for s in history["events_sections"]}
+    assert {
+        "human_gates",
+        "review_outcomes",
+        "review_model_cascade",
+        "review_economy.deep_cap",
+        "review_economy.small_delta",
+        "review_economy.runs.by_kind",
+        "steward_shadow.human_table",
+        "steward_shadow.false_approve",
+        "steward_shadow.false_approve_tasks",
+        "steward_shadow.act_refusals",
+        "steward_shadow.act_ready",
+    } <= set(names)
+    assert names["human_touches"] is True
+    assert names["steward_shadow.actual_verdicts"] is True
+    # The shadow phase is read whole: the request window does not narrow it.
+    assert names["steward_shadow.human_table"] is True
+    window = {s["name"]: s["window"] for s in history["events_sections"]}
+    assert window["steward_shadow.human_table"] == "окно — вся фаза тени"
+    assert names["human_gates"] is False
+    assert "task_updates" not in names and "machine_reviews" not in names
+
+
+async def test_events_history_window_inside_retention_is_clean(
+    db: aiosqlite.Connection,
+):
+    """AC-2 (#1621): окно 7 дней без событий в начале — не урезано."""
+    t1 = await _task(db, title="recent")
+    await db.execute(
+        "INSERT INTO events (kind, task_id, created_at) VALUES ('x', ?, ?)",
+        (t1, _ts(1)),
+    )
+    await db.commit()
+    for days in (7, 14):
+        history = _eh(await practice_metrics(db, since_days=days))
+        assert history["windows_beyond_history"] == [], days
+        assert history["note"] == ""
+
+
+async def test_events_history_compare_and_absolute_dates(db: aiosqlite.Connection):
+    """AC-3 (#1621): previous и абсолютные даты попадают в список, current — нет."""
+    out = await practice_metrics(db, since_days=10, compare=True)
+    assert _eh(out)["windows_beyond_history"] == ["previous"]
+
+    inside = await practice_metrics(
+        db, date_from=_today_offset(3), date_to=_today_offset(1)
+    )
+    assert _eh(inside)["windows_beyond_history"] == []
+
+    old = await practice_metrics(db, date_from="2020-01-01", date_to="2020-01-31")
+    assert _eh(old)["windows_beyond_history"] == ["2020-01-01..2020-01-31"]
+
+    straddle = await practice_metrics(db, date_from=_today_offset(20))
+    assert len(_eh(straddle)["windows_beyond_history"]) == 1
+
+    serie = await practice_metrics(db, since_days=20, series=True, series_days=5)
+    beyond = _eh(serie)["windows_beyond_history"]
+    assert "current" in beyond
+    assert any(label.startswith("series:") for label in beyond)
+
+
+async def test_events_history_empty_window_uses_retention_only(
+    db: aiosqlite.Connection,
+):
+    """AC-4 (#1621): без единого события дата — из хранения, не из данных."""
+    count = await db.execute_fetchall("SELECT COUNT(*) FROM events")
+    assert count[0][0] == 0
+    history = _eh(await practice_metrics(db, since_days=30))
+    expected = datetime.now(UTC) - timedelta(days=repo.EVENTS_RETENTION_DAYS)
+    got = datetime.fromisoformat(history["history_from"])
+    assert abs(expected - got) < timedelta(minutes=2)
+    assert history["note"] == _EVENTS_NOTE + history["history_from"] + _EVENTS_TAIL
+    assert history["windows_beyond_history"] == ["current"]
+
+
+async def test_events_history_is_rendered_on_the_metrics_page(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-5 (#1621): на /metrics стоит строка о хранении; REST отдаёт поле."""
+    body = (await client.get("/api/metrics/practices?since_days=30")).json()
+    from_ = _eh(body)["history_from"]
+    page = await client.get("/metrics?since_days=30")
+    assert page.status_code == 200
+    assert _EVENTS_NOTE in page.text
+    assert _EVENTS_TAIL in page.text
+    assert from_[:10] in page.text
+    clean = await client.get("/metrics?since_days=7")
+    assert _EVENTS_NOTE not in clean.text
+
+
+async def test_events_history_boundary_is_exact_and_shadow_ignores_window(
+    db: aiosqlite.Connection,
+):
+    """#1621: 14 дней — внутри хранения, 15 — снаружи, без допуска; секция
+    steward_shadow.human_table от since_days не зависит."""
+    assert (
+        _eh(await practice_metrics(db, since_days=14))["windows_beyond_history"] == []
+    )
+    assert _eh(await practice_metrics(db, since_days=15))["windows_beyond_history"] == [
+        "current"
+    ]
+    short = await practice_metrics(db, since_days=7)
+    long_ = await practice_metrics(db, since_days=90)
+    assert (
+        short["steward_shadow"]["human_table"] == long_["steward_shadow"]["human_table"]
+    )

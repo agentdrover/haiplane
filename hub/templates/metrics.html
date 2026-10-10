@@ -6,6 +6,11 @@
     <h1 class="page-title">Practice Metrics <span class="badge badge-review">last {{ m.since_days }}d</span></h1>
 </header>
 
+{% if m.events_history and m.events_history.note %}
+<p class="muted" data-events-history>{{ m.events_history.note }}
+(окна: {{ m.events_history.windows_beyond_history | join(", ") }}).</p>
+{% endif %}
+
 <p class="muted">Стоимость самого Agent API — популярность инструментов, ошибки,
 latency и размер ответов — на отдельной странице:
 <a href="/metrics/agent-api">Agent API usage</a>.</p>
