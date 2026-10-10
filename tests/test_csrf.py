@@ -13,6 +13,7 @@ running any of the ~120 handlers.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -284,6 +285,13 @@ async def test_bearer_clients_are_exempt_and_never_fall_back_to_cookie(
             headers={**cookie_headers, "Authorization": bad},
         )
         assert resp.status_code == 401, (bad, resp.status_code, resp.text)
+    for method in ("PUT", "PATCH", "DELETE"):
+        resp = await client.request(
+            method,
+            "/__csrf_echo",
+            headers={**cookie_headers, "Authorization": "Bearer not-a-real-token"},
+        )
+        assert resp.status_code == 401, (method, resp.status_code, resp.text)
     titles = await db.execute("SELECT title FROM tasks WHERE title = 'must not exist'")
     assert await titles.fetchall() == []
 
@@ -315,8 +323,14 @@ async def test_bearer_clients_are_exempt_and_never_fall_back_to_cookie(
             json=initialize,
         )
         assert by_bearer.status_code == 200, by_bearer.text
-        cookie_get = await client.get(
-            "/mcp", headers={"Accept": "text/event-stream", **_cookie(world.session_a)}
+        # A cookie GET must be refused at once; if it were let in it would
+        # open an event stream that never ends.
+        cookie_get = await asyncio.wait_for(
+            client.get(
+                "/mcp",
+                headers={"Accept": "text/event-stream", **_cookie(world.session_a)},
+            ),
+            timeout=10,
         )
         assert cookie_get.status_code in (401, 403)
 
