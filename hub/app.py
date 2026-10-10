@@ -1584,7 +1584,10 @@ async def api_practice_metrics(
     day included, replacing ``since_days``), ``compare`` (previous window of
     the same length, deltas, ranked problem spots) and ``series`` (indicators
     per ``series_days`` bucket) are optional (#1490); without them the answer
-    is unchanged.
+    is unchanged. The answer always carries ``events_history`` (#1621):
+    ``retention_days``, ``history_from`` (now − retention, UTC), the windows
+    that start before it (``windows_beyond_history``) and the sections that
+    read ``events`` (``events_sections``, with ``own_window``).
     """
     try:
         return await services.practice_metrics(
