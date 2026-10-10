@@ -115,11 +115,47 @@ async def _own_connection(app: FastAPI):
     if not dsn:
         yield app.state.db
         return
-    conn = await db_connect(dsn)
+    conn = await _open_connection(dsn)
     try:
         yield conn
     finally:
         await conn.close()
+
+
+_LATE_CLOSES: set["asyncio.Task[None]"] = set()
+
+
+def _close_when_opened(opening: "asyncio.Future[Any]") -> None:
+    """Done-callback: the open outlived its owner, so close what it produced."""
+    if opening.cancelled() or opening.exception() is not None:
+        return
+    closing = asyncio.ensure_future(opening.result().close())
+    _LATE_CLOSES.add(closing)
+    closing.add_done_callback(_LATE_CLOSES.discard)
+
+
+async def _open_connection(dsn: str):
+    """Open a connection so that a cancel in the middle of the open leaks nothing.
+
+    The worker thread of an aiosqlite connection is not a daemon: a connection
+    nobody closes keeps the interpreter from exiting (#1667). A plain
+    ``await db_connect(dsn)`` that is cancelled half way leaves exactly that —
+    the owner never receives the connection, so its ``finally`` has nothing to
+    close. The open therefore runs as its own task behind a shield: on cancel
+    the owner waits for the open to end and closes the result itself, and if
+    it is cancelled again the done-callback does the closing.
+    """
+    opening = asyncio.ensure_future(db_connect(dsn))
+    try:
+        return await asyncio.shield(opening)
+    except asyncio.CancelledError:
+        try:
+            late = await asyncio.shield(opening)
+        except BaseException:  # noqa: BLE001 - cancelled again, or the open failed
+            opening.add_done_callback(_close_when_opened)
+        else:
+            await late.close()
+        raise
 
 
 async def _handle_missing_job(db, task: dict, *, reason: str) -> None:
@@ -2641,15 +2677,33 @@ async def _egress_watch(app: FastAPI) -> None:
 def start_poller(app: FastAPI) -> asyncio.Task[None]:
     """Create and return the background poller task.
 
-    The egress watcher is kept in ``app.state.egress_task`` — the caller
-    cancels it with the poller on shutdown (``hub.app.lifespan``).
+    Every task is kept in ``app.state.background_tasks`` (name -> task); the
+    egress watcher also in ``app.state.egress_task`` (``None`` when switched off
+    with ``HAIPLANE_EGRESS_WATCH=off``). The caller stops them all under one
+    limit on shutdown (``hub.app.lifespan``).
     """
-    task = asyncio.create_task(_poll_running_tasks(app))
-    app.state.egress_task = asyncio.create_task(_egress_watch(app))
-    asyncio.create_task(_session_reaper(app))
-    asyncio.create_task(_drift_watch(app))
-    asyncio.create_task(_red_base_watch(app))
-    asyncio.create_task(arm_workspace_hooks(app.state.db))
+    from hub.services import egress_watch
+
+    # A handle for EVERY task (#1667): the stop cancels and awaits them under
+    # one limit and names the one that stays. A task with no handle cannot be
+    # awaited, and its connection stays open when the shared one is closed.
+    handles: dict[str, asyncio.Task[Any]] = {}
+
+    def spawn(name: str, coro: Any) -> asyncio.Task[Any]:
+        handles[name] = asyncio.create_task(coro, name=name)
+        return handles[name]
+
+    task = spawn("hub-poller", _poll_running_tasks(app))
+    app.state.egress_task = (
+        spawn("hub-egress-watch", _egress_watch(app))
+        if egress_watch.watch_enabled()
+        else None
+    )
+    spawn("hub-session-reaper", _session_reaper(app))
+    spawn("hub-drift-watch", _drift_watch(app))
+    spawn("hub-red-base-watch", _red_base_watch(app))
+    spawn("hub-arm-workspace-hooks", arm_workspace_hooks(app.state.db))
+    app.state.background_tasks = handles
     log.info(
         "Background poller started (every %ds; drift check every %ds; "
         "red-base check every %ds)",

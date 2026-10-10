@@ -810,6 +810,9 @@ async def _settle(
 # ---------------------------------------------------------------------------
 
 
+_LATE_STOPS: set[asyncio.Future[None]] = set()
+
+
 async def cancel_local_advisors() -> None:
     """Остановка хаба: отозвать задания и закрыть строки. Ждать подтверждений нельзя."""
     handles = [h for h in _HANDLES.values() if h.task is not None]
@@ -819,9 +822,28 @@ async def cancel_local_advisors() -> None:
             handle.task.cancel()
     if not handles:
         return
-    await asyncio.gather(*[h.task for h in handles if h.task], return_exceptions=True)
-    for handle in handles:
-        await _close_stopped(handle)
+
+    # Одна корутина под shield: и ожидание, и закрытие строк (см. #1667).
+    async def _withdraw_and_close() -> None:
+        # См. cancel_local_runs: отмену этой задачи asyncio.run (#1667) принять,
+        # строки закрыть собственным соединением, отмену поднять заново. Не
+        # закрытую (SIGKILL) строку закрывает recover_local_advisor_runs.
+        interrupted: asyncio.CancelledError | None = None
+        try:
+            await asyncio.gather(
+                *[h.task for h in handles if h.task], return_exceptions=True
+            )
+        except asyncio.CancelledError as exc:
+            interrupted = exc
+        for handle in handles:
+            await _close_stopped(handle)
+        if interrupted is not None:
+            raise interrupted
+
+    closing = asyncio.ensure_future(_withdraw_and_close())
+    _LATE_STOPS.add(closing)
+    closing.add_done_callback(_LATE_STOPS.discard)
+    await asyncio.shield(closing)
 
 
 async def _close_stopped(handle: _Handle) -> None:

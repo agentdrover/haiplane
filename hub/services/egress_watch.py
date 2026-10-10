@@ -28,6 +28,7 @@ import json
 import logging
 import socket
 import ssl
+import threading
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -102,6 +103,16 @@ def _safe_url(raw: str | None) -> str:
     return url if ok else DEFAULT_URL
 
 
+def watch_enabled() -> bool:
+    """``HAIPLANE_EGRESS_WATCH=off`` keeps the watcher from starting (#1667).
+
+    Read at call time, not at import: the switch is for a process that must
+    not touch the network (a test child, a stopped server) and the answer
+    follows the environment the process was started with.
+    """
+    return config.env_get("EGRESS_WATCH", "on").strip().lower() != "off"
+
+
 def probe_url() -> str:
     return _safe_url(config.EGRESS_PROBE_URL)
 
@@ -112,6 +123,58 @@ def interval_seconds() -> int:
 
 def down_after() -> int:
     return config.EGRESS_DOWN_AFTER
+
+
+def _head_in_thread(url: str, deadline: float) -> str:
+    """The probe itself, blocking: runs in a thread of its own, see ``probe``."""
+    try:
+        with httpx.Client(
+            follow_redirects=False, timeout=deadline, verify=True
+        ) as client:
+            client.head(url)
+        return ""
+    except Exception as exc:  # noqa: BLE001 - every failure becomes a code
+        return reason_code_of(exc)
+
+
+_probe_thread: threading.Thread | None = None
+
+
+async def _probe_in_daemon_thread(url: str, deadline: float) -> str:
+    """Run the blocking probe in a DAEMON thread and wait for it cancellably.
+
+    ``getaddrinfo`` cannot be interrupted. In the loop's default executor (or
+    in anyio's worker, which httpx's async client uses and which is not
+    abandoned on cancel) a resolver that does not return holds the wait itself
+    and then the exit of the interpreter (#1667). A daemon thread holds
+    neither: the awaiting side is a plain future, ``asyncio.timeout`` and
+    task cancellation both reach it, and the interpreter leaves without the
+    thread.
+    """
+    global _probe_thread
+    # At most one unfinished worker: a resolver that hangs must not collect a
+    # new thread per interval. While the previous probe is alive the answer
+    # is "timeout" without a new request — the way out did not answer yet.
+    if _probe_thread is not None and _probe_thread.is_alive():
+        log.warning("Egress watch: the previous probe has not finished")
+        return "timeout"
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+
+    def deliver(code: str) -> None:
+        if not future.done():
+            future.set_result(code)
+
+    def work() -> None:
+        code = _head_in_thread(url, deadline)
+        try:
+            loop.call_soon_threadsafe(deliver, code)
+        except RuntimeError:  # the loop is already closed: nobody waits
+            pass
+
+    _probe_thread = threading.Thread(target=work, name="egress-probe", daemon=True)
+    _probe_thread.start()
+    return await future
 
 
 async def probe(
@@ -125,16 +188,24 @@ async def probe(
     The deadline covers DNS, connect, TLS and the answer together (httpx's own
     timeouts apply per phase, so they alone would allow several times that).
     No redirects, no retries. Never raises.
+
+    Without an injected ``transport`` the request goes out from a daemon
+    thread (``_probe_in_daemon_thread``): DNS cannot be cancelled, and a
+    resolver that hangs must neither outlive the deadline nor hold the exit of
+    the process.
     """
+    target = _safe_url(url) if url else probe_url()
     try:
         async with asyncio.timeout(deadline):
+            if transport is None:
+                return await _probe_in_daemon_thread(target, deadline)
             async with httpx.AsyncClient(
                 transport=transport,
                 follow_redirects=False,
                 timeout=deadline,
                 verify=True,
             ) as client:
-                await client.head(_safe_url(url) if url else probe_url())
+                await client.head(target)
         return ""
     except asyncio.CancelledError:
         raise
@@ -383,7 +454,12 @@ async def run_loop(
     watch: EgressWatch | None = None,
     sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
 ) -> None:
-    """The watcher task: first probe at once, then every interval.
+    """The watcher task: sleep one interval, probe, repeat.
+
+    The first probe is NOT at start (#1667): a probe at once put a DNS lookup
+    into the first seconds of every process, including a short-lived one that
+    only starts the app and stops it. ``/health`` reads "unknown" until the
+    first beat, which is the true state of a watcher that has not looked yet.
 
     Sequential by construction — the next probe starts after the previous one
     ended (its deadline bounds it), so runs never overlap.
@@ -391,10 +467,10 @@ async def run_loop(
     watch = watch or EgressWatch()
     async with open_db() as db:
         while True:
+            await sleep(interval_seconds())
             try:
                 await watch.step(db)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("Egress watch error")
-            await sleep(interval_seconds())
