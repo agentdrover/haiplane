@@ -18217,3 +18217,15 @@ async def _late_cloud_report_closes_as_done_when_off(
     cloud = (await _all_dispatches(db, task_id))[0]
     assert cloud["status"] == "done"
     assert await _debts(db, task_id) == []
+
+    # Само закрытие по политике (до разбора свипом) тоже видит собственный
+    # отчёт: долг с лежащим отчётом закрывается в done одной транзакцией.
+    from hub.services import review_dispatch as rd
+
+    await db.execute(
+        "UPDATE review_dispatches SET status='second_door' WHERE id=?", (cloud["id"],)
+    )
+    await db.commit()
+    debt = (await _all_dispatches(db, task_id))[0]
+    await rd._close_second_door_by_policy(db, task_id, 1, debt)
+    assert (await _all_dispatches(db, task_id))[0]["status"] == "done"
