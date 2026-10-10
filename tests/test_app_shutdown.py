@@ -409,3 +409,100 @@ async def test_start_poller_keeps_a_handle_of_every_background_task():
             for t in handles.values():
                 t.cancel()
             await asyncio.gather(*handles.values(), return_exceptions=True)
+
+
+async def _stop_then_cancel_everything(app, poll, steps, order):
+    """Как на проде: предел остановки, закрытие общей БД, затем asyncio.run
+    отменяет ВСЕ оставшиеся задачи (по разу) и ждёт их."""
+    from hub import app as hub_app
+
+    with patch.object(hub_app.config, "STOP_TIMEOUT_SECONDS", 1):
+        await hub_app._stop_background(app, poll, steps=steps)
+    order.append("db-closed")  # lifespan закрывает app.state.db раньше хвоста
+    rest = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for t in rest:
+        t.cancel()
+    await asyncio.gather(*rest, return_exceptions=True)
+
+
+async def test_runs_are_closed_when_asyncio_run_cancels_the_closing_task():
+    """Отзыв 2 с, предел 1 с, затем отмена ВСЕХ задач (и closing): строка закрыта."""
+    from hub.services import review_dispatch as rd
+
+    events: list[str] = []
+    closed: list[int] = []
+    order: list[str] = []
+
+    async def run():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            events.append("withdrawn")  # синхронный отзыв первым делом
+            await asyncio.sleep(2)  # служба подтверждает долго
+            raise
+
+    async def fake_close(h):
+        closed.append(h.dispatch_id)
+
+    async def poll_forever():
+        await asyncio.sleep(60)
+
+    rd._LOCAL_RUNS[77004] = rd._LocalRunHandle(
+        task=asyncio.create_task(run()),
+        db_path="",
+        dispatch_id=77004,
+        task_id=1,
+        generation=1,
+    )
+    poll = asyncio.create_task(poll_forever(), name="hub-poller")
+    await asyncio.sleep(0)
+    app = SimpleNamespace(state=SimpleNamespace(background_tasks={}))
+    try:
+        with patch.object(rd, "_close_cancelled_run", fake_close):
+            await _stop_then_cancel_everything(
+                app, poll, {"local review runs": rd.cancel_local_runs()}, order
+            )
+    finally:
+        rd._LOCAL_RUNS.pop(77004, None)
+    assert events == ["withdrawn"]
+    assert closed == [77004]
+
+
+async def test_advisors_are_closed_when_asyncio_run_cancels_the_closing_task():
+    from hub.services import steward_advisor_local as sal
+
+    events: list[str] = []
+    closed: list[int] = []
+    order: list[str] = []
+
+    async def run():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            events.append("withdrawn")
+            await asyncio.sleep(2)
+            raise
+
+    async def fake_close(h):
+        closed.append(h.run_id)
+
+    async def poll_forever():
+        await asyncio.sleep(60)
+
+    handle = sal._Handle(
+        run_id=77005, task_id=1, generation=1, model="m", db_path="", live_db=None
+    )
+    handle.task = asyncio.create_task(run())
+    sal._HANDLES[77005] = handle
+    poll = asyncio.create_task(poll_forever(), name="hub-poller")
+    await asyncio.sleep(0)
+    app = SimpleNamespace(state=SimpleNamespace(background_tasks={}))
+    try:
+        with patch.object(sal, "_close_stopped", fake_close):
+            await _stop_then_cancel_everything(
+                app, poll, {"local advisors": sal.cancel_local_advisors()}, order
+            )
+    finally:
+        sal._HANDLES.pop(77005, None)
+    assert events == ["withdrawn"]
+    assert closed == [77005]

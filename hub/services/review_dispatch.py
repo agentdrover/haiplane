@@ -5607,9 +5607,21 @@ async def cancel_local_runs() -> None:
     # asyncio.run после lifespan) не должна ни повторно отменить прогоны, пока
     # они отзывают задание у службы, ни пропустить закрытие строк.
     async def _withdraw_and_close() -> None:
-        await asyncio.gather(*[h.task for h in handles], return_exceptions=True)
+        # asyncio.run отменяет и саму эту задачу (один раз): тогда gather
+        # рвётся, но задание уже отозвано синхронно в самих прогонах, а строки
+        # закрываются ВСЁ РАВНО (собственным коротким соединением по пути БД,
+        # не общим app.state.db), и лишь потом отмена поднимается снова.
+        # Строка, которую не удалось закрыть (процесс убит SIGKILL), остаётся
+        # свипу диспетчера.
+        interrupted: asyncio.CancelledError | None = None
+        try:
+            await asyncio.gather(*[h.task for h in handles], return_exceptions=True)
+        except asyncio.CancelledError as exc:
+            interrupted = exc
         for handle in handles:
             await _close_cancelled_run(handle)
+        if interrupted is not None:
+            raise interrupted
 
     closing = asyncio.ensure_future(_withdraw_and_close())
     _LATE_STOPS.add(closing)  # ссылка: задачу не соберёт GC

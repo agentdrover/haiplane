@@ -825,11 +825,20 @@ async def cancel_local_advisors() -> None:
 
     # Одна корутина под shield: и ожидание, и закрытие строк (см. #1667).
     async def _withdraw_and_close() -> None:
-        await asyncio.gather(
-            *[h.task for h in handles if h.task], return_exceptions=True
-        )
+        # См. cancel_local_runs: отмену этой задачи asyncio.run (#1667) принять,
+        # строки закрыть собственным соединением, отмену поднять заново. Не
+        # закрытую (SIGKILL) строку закрывает recover_local_advisor_runs.
+        interrupted: asyncio.CancelledError | None = None
+        try:
+            await asyncio.gather(
+                *[h.task for h in handles if h.task], return_exceptions=True
+            )
+        except asyncio.CancelledError as exc:
+            interrupted = exc
         for handle in handles:
             await _close_stopped(handle)
+        if interrupted is not None:
+            raise interrupted
 
     closing = asyncio.ensure_future(_withdraw_and_close())
     _LATE_STOPS.add(closing)
