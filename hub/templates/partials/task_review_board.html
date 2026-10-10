@@ -647,6 +647,9 @@
         <span class="task-card-header-meta">одобрение уходит в гейт доставки, возврат — исполнителю</span>
     </div>
     <form method="post" action="/tasks/{{ task.id }}/web-review-verdict" class="task-action-stack" id="review-verdict-form">
+        {# #1647: вердикт по задаче-состоянию привязан к поколению сдачи, которое
+           показано на этой странице; расхождение — 409 без записей. #}
+        {% if task.result_kind == 'state' %}<input type="hidden" name="expected_generation" value="{{ task.submission_generation }}">{% endif %}
         <label class="task-action-label" for="review-comments">Review comments</label>
         <textarea id="review-comments" name="comments" class="task-action-control task-action-textarea" placeholder="Summary of the review..."></textarea>
         <label class="task-action-label" for="review-findings">Findings</label>

@@ -49,6 +49,11 @@ from fastapi import HTTPException
 
 from hub import repository as repo
 from hub.models import ReviewVerdict, TaskReviewVerdict
+from hub.services.result_kind import (
+    AUTOMATION_REFUSAL,
+    automation_not_applicable,
+    task_automation_not_applicable,
+)
 from hub.services.steward_evidence import ReviewBrief
 
 log = logging.getLogger(__name__)
@@ -166,6 +171,9 @@ async def apply_judgement(
     if row is None:
         raise HTTPException(404, detail=f"задачи #{task_id} нет")
     task = dict(row)
+    if automation_not_applicable(task):
+        # #1647: единый предикат — суждение стюарда не применяется к state.
+        raise HTTPException(409, detail=AUTOMATION_REFUSAL)
 
     _refuse_if_the_submission_moved(task, generation)
     _refuse_if_the_verdict_is_taken(task, generation)
@@ -937,6 +945,8 @@ async def apply_self_approval(
     from hub.services.steward_dispatch import _policy_wants_steward
     from hub.services.steward_shadow import effective_mode
 
+    if await task_automation_not_applicable(db, task_id):
+        return None  # #1647: контур сюда не дотягивается — state ему не отдают
     if await effective_mode(db) != "act":
         return None
     project = await repo.resolve_project_for_task(db, task_id)

@@ -23,6 +23,7 @@ from hub import brand, commit_scope, config
 from hub import repository as repo
 from hub.db import deserialize_str_list, fetchall, get_breadcrumb, log_activity
 from hub.services.prevention_gate import hold_completion
+from hub.services.result_kind import automation_not_applicable
 from hub.services.defect_clocks import (
     change_failure_rate,
     shift_left,
@@ -1993,6 +1994,12 @@ async def dispatch_task(
     task: dict[str, Any],
 ) -> dict[str, Any]:
     """Dispatch a task via oc-dev-dispatch, creating a branch if needed."""
+    if automation_not_applicable(task):
+        # #1647: общий затвор headless-запуска (start, approve(run), создание с
+        # run_immediately, решение владельца о rework). До git, брони и job.
+        from hub.services.state_task import refusal_for_door
+
+        raise refusal_for_door("dispatch")
     ctx = await project_git_context(db, task_id)
     local_kw, _ = _split_git_kwargs(ctx)
     branch = task.get("branch") or ""
@@ -2261,6 +2268,8 @@ async def restore_pair_workspace_base(
     row = await repo.get_task(db, task_id)
     if row and (dict(row).get("git_mode") or "hub") == "remote":
         return
+    if row and automation_not_applicable(row):
+        return  # #1647: у задачи-состояния нет worktree и рабочей копии
     ctx = await project_git_context(db, task_id)
     local_kw, _ = _split_git_kwargs(ctx)
     if worktree_per_task_enabled():
@@ -2286,8 +2295,8 @@ async def switch_pair_workspace_to_task(
     """
     row = await repo.get_task(db, task_id)
     task = dict(row) if row else {}
-    if (task.get("git_mode") or "hub") == "remote":
-        return
+    if (task.get("git_mode") or "hub") == "remote" or automation_not_applicable(task):
+        return  # #1647: state не переключает рабочую копию
     branch = (task.get("branch") or "").strip()
     if not branch:
         return
@@ -5972,6 +5981,14 @@ async def transition_after_agent_done(
     """Post-done lifecycle shared by headless poller and pair mode."""
     task_id = task["id"]
     branch = task.get("branch")
+    if has_done and automation_not_applicable(task):
+        # #1647: страховка. done-отчёт state-задачи отказан раньше, до вставки
+        # строки (state_task.refuse_done_report); сюда он дойти не должен, и
+        # если дошёл, то завершить задачу без вердикта человека — худший исход.
+        log.error(
+            "done report reached the post-done transition of state task #%s", task_id
+        )
+        return str(task.get("status") or "")
 
     if has_done and not completion_requires_review(task):
         # Delivery gate (#605): a task that owns a PR completes only once
@@ -6148,11 +6165,25 @@ def review_budget_exhausted(review_cycle: int, max_cycles: int | None = None) ->
     return review_cycle >= max_cycles
 
 
+def _state_task_refused(task: dict[str, Any], what: str) -> bool:
+    """Headless-диспетчеру задача-состояние не отдаётся (#1647): True — отказ.
+
+    Страховка: в эти функции state-задача не попадает по построению (у неё нет
+    job, ветки и ci_check), и если попала, платить заданием нельзя.
+    """
+    if not automation_not_applicable(task):
+        return False
+    log.error("%s refused for state task #%s", what, task.get("id"))
+    return True
+
+
 async def dispatch_review(
     db: aiosqlite.Connection,
     task: dict[str, Any],
 ) -> None:
     """Dispatch a code-review job for a completed task."""
+    if _state_task_refused(task, "dispatch_review"):
+        return
     task_id = task["id"]
     review_cycle = task.get("review_cycle", 0)
     breadcrumb = await get_breadcrumb_str(db, task_id)
@@ -6233,6 +6264,8 @@ async def dispatch_fix(
     review_comments: str,
 ) -> None:
     """Dispatch a fix job back to the developer agent."""
+    if _state_task_refused(task, "dispatch_fix"):
+        return
     task_id = task["id"]
     review_cycle = task.get("review_cycle", 0) + 1
     message = plugins.dispatch.build_fix_message(
@@ -6309,6 +6342,8 @@ async def dispatch_arbiter(
     ``running`` with the job id on success; a crash between submit and job id
     leaves ``dispatching`` for the poller's ambiguity watchdog to resolve.
     """
+    if _state_task_refused(task, "dispatch_arbiter"):
+        return
     task_id = task["id"]
     generation = task.get("submission_generation") or 0
 
@@ -6396,6 +6431,8 @@ async def dispatch_ci_fix(
     ci_failures: dict[str, Any],
 ) -> None:
     """Dispatch developer to fix CI failures."""
+    if _state_task_refused(task, "dispatch_ci_fix"):
+        return
     task_id = task["id"]
     ci_fix_cycle = task.get("ci_fix_cycle", 0)
     message = plugins.dispatch.build_ci_fix_message(

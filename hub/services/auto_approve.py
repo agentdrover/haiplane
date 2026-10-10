@@ -31,6 +31,7 @@ from hub import config
 from hub import repository as repo
 from hub.db import deserialize_str_list
 from hub.models import DoRCheckItem, RiskClass
+from hub.services.result_kind import automation_not_applicable
 from hub.services.project_policy import (
     freeze_admission,
     gate_policy_of,
@@ -213,6 +214,11 @@ async def maybe_auto_approve(
 
     row = await repo.get_task(db, task_id)
     if row is None or row["status"] != "draft" or not row["dor_passed"]:
+        return False
+    if automation_not_applicable(row):
+        # #1647: явный запрет по result_kind, независимо от risk_class и
+        # политики. До него state не одобрялась «случайно» — у неё нет
+        # областей, а значит нет класса; теперь это правило, а не следствие.
         return False
 
     raw_class = row["risk_class"]

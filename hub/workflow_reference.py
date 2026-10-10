@@ -51,6 +51,16 @@ LIFECYCLE_TRANSITIONS: list[dict[str, str | None]] = [
         "actor": "agent",
         "gate": "review",
     },
+    # #1647: задача-состояние (result_kind=state). Её APPROVED завершает задачу
+    # той же записью (via=state_approved), без done-отчёта, ветки и доставки;
+    # ставит его только человек и только на названное поколение.
+    {
+        "from": "review",
+        "to": "completed",
+        "tool": "hub_submit_review",
+        "actor": "human",
+        "gate": "review",
+    },
     {
         "from": "running",
         "to": "completed",
@@ -268,6 +278,13 @@ def lifecycle_map_lines() -> list[str]:
             "Reviewer lane, NOT the assigned agent: hub_get_review_brief → "
             "hub_submit_review. A verdict from the task's own implementer is "
             "refused."
+        ),
+        (
+            "State tasks (result_kind=state, #1647): no branch, PR or CI. Submit "
+            "with the evidence field of hub_submit_for_review — one record per "
+            "AC: ac_id, action, observed, target, observed_at. Only a human "
+            "APPROVES, naming expected_generation, and that completes the task "
+            "(via=state_approved); hub_report_done is refused for them."
         ),
         f"Agent completion: {AGENT_COMPLETION_TOOL} only (hub_task_update kind=done = deprecated alias).",
         "Human gates are not in your tool list: a person acts through the hub "

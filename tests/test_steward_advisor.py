@@ -2315,3 +2315,39 @@ async def test_a_finished_supervisor_forgets_only_its_own_handle():
     assert local_mod._HANDLES.get(987001) is new, "стёрт чужой handle"
     local_mod._forget_handle(new)
     assert 987001 not in local_mod._HANDLES
+
+
+async def test_the_local_advisor_doors_refuse_a_state_task(
+    db: aiosqlite.Connection, local_spool, local_identity, local_service
+):
+    """#1647: локальный советник (#1649) не берёт задачу-состояние ни на входе,
+    ни в последних проверках после очереди и перед публикацией."""
+    from hub.services import steward_advisor_local as local_mod
+    from hub.services.result_kind import AUTOMATION_REFUSAL
+
+    svc = local_service()
+    with _cursor_never_called() as cursor_attempt:
+        # --- 1. вход: захвата нет, заказ закрыт названной причиной
+        task_id, order = await _ordered_advisor(db, "state-local-entry")
+        await db.execute("UPDATE tasks SET result_kind='state' WHERE id=?", (task_id,))
+        await db.commit()
+        assert not await local_mod.start_local_advisor(db, dict(order))
+        row = await _advisor_row(db, task_id)
+        assert row["status"] == "refused" and AUTOMATION_REFUSAL in row["closed_reason"]
+        assert not row["agent_id"].startswith(("pending:", "local:")), row
+
+        # --- 2. задача стала state, пока заказ ждал слот: ни кода, ни задания
+        task2, order2 = await _ordered_advisor(db, "state-local-slot")
+        minted, published = len(local_identity), len(svc.jobs)
+        async with local_reviewer._HOST_BUDGET:
+            assert await local_mod.start_local_advisor(db, dict(order2)) is True
+            await asyncio.sleep(0.05)
+            await db.execute(
+                "UPDATE tasks SET result_kind='state' WHERE id=?", (task2,)
+            )
+            await db.commit()
+        await local_mod.wait_for_local_advisors()
+        closed = await _advisor_row(db, task2)
+        assert closed["status"] == "refused" and not closed["started_at"], closed
+        assert len(local_identity) == minted and len(svc.jobs) == published
+    assert cursor_attempt.await_count == 0

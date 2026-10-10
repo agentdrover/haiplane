@@ -31,6 +31,13 @@
 - CLI flags or file import paths in `hub/cli.py`
 - MCP tool arguments if the field must be agent-visible
 
+### Adding a task kind that automation must not touch
+
+- the single predicate in `hub/services/result_kind.py` (`automation_not_applicable`), called by every door listed in `invariants.md` "State task (#1647)"; a new door of automation (review order, steward order, auto-approve, executor order) calls it, it does not compare `result_kind` itself
+- DoR profile in `hub/services/dor.py`, snapshot fields in `hub/services/dor_snapshot.py`
+- submit/verdict branches in `hub/services/lifecycle.py` route to `hub/services/state_task.py`; the commit pipelines (`SUBMIT_STEPS`, `VERDICT_STEPS`) are not edited
+- REST/CLI/MCP: `result_kind`/`rollback` on create and refine, `evidence` on submit-review, `expected_generation` on review-verdict (web: hidden form field); the MCP catalog budget moves only down
+
 ### Adding or changing a status
 
 - `hub/models.py`

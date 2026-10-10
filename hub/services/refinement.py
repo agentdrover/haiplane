@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
+from fastapi import HTTPException
 
 from hub import config
 from hub import repository as repo
@@ -85,6 +86,10 @@ STATEMENT_FIELDS = frozenset(
         # пере-штампует дату постановки по той же причине, что и правка
         # problem_statement: изменилось то, на чём задача стоит.
         "live_probe",
+        # #1647: что считается результатом и как его откатить — часть того, что
+        # задача утверждает; правка двигает дату постановки.
+        "result_kind",
+        "rollback",
         "risks",
         "acceptance_criteria",
     }
@@ -285,6 +290,61 @@ async def _resolve_project_binding(
     return int(project_row["id"])
 
 
+async def _enforce_state_rules(
+    db: aiosqlite.Connection, task_id: int, payload: TaskRefine
+) -> None:
+    """Правила result_kind под write-транзакцией refine (#1647).
+
+    Единая воронка для одиночного и массового refine (оба идут через
+    ``_apply_refine_writes``): задача перечитывается ЗДЕСЬ, под уже взятой
+    транзакцией, а не по строке, прочитанной до неё. Три правила:
+
+    * result_kind меняется только в draft;
+    * state — только у листовых task/subtask (feature/epic — агрегаты, и
+      задача с детьми тоже);
+    * после сдачи state-задачи AC, rollback и result_kind заморожены до
+      возврата в работу.
+    """
+    from hub.services.state_task import refuse_if_frozen
+
+    row = await repo.get_task(db, task_id)
+    if row is None:
+        return
+    task = dict(row)
+    sent = payload.model_fields_set
+    current = task.get("result_kind") or "commit"
+    target = payload.result_kind.value if payload.result_kind is not None else current
+    # Заморозка читается первой: на замороженной задаче причина отказа — «нужен
+    # возврат в работу и новая сдача», а не общее «только в draft».
+    frozen_touch = {"rollback", "acceptance_criteria"} & sent
+    if target != current:
+        frozen_touch.add("result_kind")
+    if frozen_touch:
+        refuse_if_frozen(task, "AC, rollback и result_kind")
+    if target != current and task["status"] != "draft":
+        raise HTTPException(
+            422,
+            "result_kind меняется только в draft: задача уже допущена в работу "
+            f"(статус {task['status']})",
+        )
+    if target == "state":
+        if task["task_type"] not in ("task", "subtask"):
+            raise HTTPException(
+                422,
+                "result_kind=state допустим только у листовых task и subtask: "
+                "feature и epic остаются агрегатами",
+            )
+        children = await fetchall(
+            db, "SELECT 1 FROM tasks WHERE parent_id=? LIMIT 1", (task_id,)
+        )
+        if children:
+            raise HTTPException(
+                422,
+                "result_kind=state допустим только у листовой задачи: "
+                "у этой есть подзадачи",
+            )
+
+
 async def refine_task(
     db: aiosqlite.Connection,
     task_id: int,
@@ -345,6 +405,8 @@ async def _apply_refine_writes(
             payload.acceptance_criteria,
             enforce=config.SDD_AC_LOCATOR == "require",
         )
+
+    await _enforce_state_rules(db, task_id, payload)
 
     if payload.live_probe is not None:
         # #1236: объявление живого зонда проверяется ЗДЕСЬ, а не у исполнителя.
@@ -758,6 +820,17 @@ async def _guard_ac_limit(db: aiosqlite.Connection, task_id: int) -> None:
         )
 
 
+async def _guard_state_ac(db: aiosqlite.Connection, task_id: int) -> None:
+    """AC state-задачи заморожены между сдачей и возвратом в работу (#1647).
+
+    Под уже взятой транзакцией ``_atomic``: статус читается тут, а не до неё.
+    """
+    from hub.services.state_task import refuse_if_frozen
+
+    row = await repo.get_task(db, task_id)
+    refuse_if_frozen(dict(row) if row is not None else None, "AC и rollback")
+
+
 def _guard_ac_locator(ac_or_list: Any) -> None:
     """Apply the locator policy to any AC write.
 
@@ -783,6 +856,7 @@ async def add_acceptance_criterion(
     _guard_ac_locator(ac)
     await _ensure_task_exists(db, task_id)
     async with _atomic(db, "add_ac"):
+        await _guard_state_ac(db, task_id)
         rows = await fetchall(
             db,
             "SELECT * FROM acceptance_criteria WHERE task_id=? AND ac_id=?",
@@ -823,6 +897,7 @@ async def upsert_acceptance_criterion(
     _guard_ac_locator(ac)
     await _ensure_task_exists(db, task_id)
     async with _atomic(db, "upsert_ac"):
+        await _guard_state_ac(db, task_id)
         # Overwriting an existing criterion must keep working at the limit —
         # it does not add a row. Checking unconditionally here would make a
         # task with 50 criteria impossible to edit (#366).
@@ -846,6 +921,7 @@ async def replace_acceptance_criteria(
     _guard_ac_locator(items)
     await _ensure_task_exists(db, task_id)
     async with _atomic(db, "replace_ac"):
+        await _guard_state_ac(db, task_id)
         try:
             await repo.replace_acceptance_criteria(db, task_id, items)
         except ValueError as exc:
@@ -864,6 +940,7 @@ async def delete_acceptance_criterion(
     """
     await _ensure_task_exists(db, task_id)
     async with _atomic(db, "delete_ac"):
+        await _guard_state_ac(db, task_id)
         removed = await repo.delete_acceptance_criterion(db, task_id, ac_id)
         await recalc_readiness_inline(db, task_id)
     return removed
