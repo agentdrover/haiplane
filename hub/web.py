@@ -1374,7 +1374,9 @@ _REVIEW_LIMIT_MODE_FIELD = f"gate_policy_{project_policy.REVIEW_LIMIT_MODE_KEY}"
 #: «число или строка». Как и лимит очереди, они принадлежат форме, только когда
 #: поле пришло в запросе; в _FORM_GATE_POLICY_KEYS их нет намеренно.
 _REVIEW_COST_COUNT_KEYS = ("deep_daily_cap", "small_delta_lines", "circle_deep_stop")
-_REVIEW_COST_KEYS = ("deep_reviewer", *_REVIEW_COST_COUNT_KEYS)
+#: local_review_fallback (#1653) живёт рядом с deep_reviewer: оба решают, куда
+#: уходит платное ревью, и оба — строка «выбор или пусто».
+_REVIEW_COST_KEYS = ("deep_reviewer", "local_review_fallback", *_REVIEW_COST_COUNT_KEYS)
 
 
 # Отказ, привязанный к проекту, показывается У ЕГО КАРТОЧКИ (#1188). Общая

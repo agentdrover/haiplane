@@ -384,6 +384,10 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #1561: кто читает deep первым — cloud (по умолчанию) или local. Не гейт
     # и ничего не делегирует. Читатель: project_policy.deep_reviewer_of.
     "deep_reviewer",
+    # #1653: согласие проекта на локального ревьюера ВМЕСТО отказавшего облака
+    # (вторая дверь): off (по умолчанию) | on. Не гейт и ничего не делегирует.
+    # Читатель: project_policy.local_review_fallback_of.
+    "local_review_fallback",
     # #1572: владелец объявляет «мерж = доставка» (у проекта нет релиз-PR и
     # отдельного выката): срок исхода считается от даты мержа. Не гейт и
     # ничего не делегирует. Читатель: project_policy.merge_is_delivery_of.
@@ -755,6 +759,21 @@ def _validate_deep_reviewer(policy: dict[str, Any]) -> None:
         raise ValueError(
             "gate_policy deep_reviewer must be one of "
             f"{', '.join(DEEP_REVIEWERS)}, got: {policy['deep_reviewer']!r}"
+        )
+
+
+def _validate_local_review_fallback(policy: dict[str, Any]) -> None:
+    """Refuse a fallback value the reader would read as off by accident (#1653)."""
+    from hub.services.project_policy import LOCAL_REVIEW_FALLBACKS
+
+    if (
+        "local_review_fallback" in policy
+        and policy["local_review_fallback"] not in LOCAL_REVIEW_FALLBACKS
+    ):
+        raise ValueError(
+            "gate_policy local_review_fallback must be one of "
+            f"{', '.join(LOCAL_REVIEW_FALLBACKS)}, "
+            f"got: {policy['local_review_fallback']!r}"
         )
 
 
@@ -3333,6 +3352,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_claim_area_check(v)
     _validate_statement_paths(v)
     _validate_deep_reviewer(v)
+    _validate_local_review_fallback(v)
     _validate_slot_dead_minutes(v)
     _validate_executor_launch(v)
     _validate_executor_task_ceilings(v)
