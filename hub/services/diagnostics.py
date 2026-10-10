@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from hub import config
 from hub.config import TokenIdentity, _AGENT_DEFAULT_PERMS, _HUMAN_DEFAULT_PERMS
 from hub.config import WORKSPACE_REPO_LINK
+from hub.csrf import health_fields as csrf_health_fields
 from hub.hub_instance import instance_echo_fields
 from hub.integrations.registry import plugins
 from hub.models import (
@@ -155,4 +156,5 @@ def build_health(egress: dict[str, Any] | None = None) -> HealthView:
         cursor_cloud_configured=bool(config.CURSOR_API_KEY),
         stale_env=config.stale_env_names(),
         egress=EgressStatus(**(egress or {})),
+        **csrf_health_fields(),
     )

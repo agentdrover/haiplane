@@ -10,8 +10,20 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/style.css?v={{ asset_version|default('20260419a') }}">
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    {% if csrf_token %}<meta name="csrf-token" content="{{ csrf_token }}">{% endif %}
+    {# #1664: a refused HTMX request answers 403 with HX-Retarget; htmx drops
+       4xx bodies by default, and then the operator would see nothing. #}
+    <script>
+    document.addEventListener("htmx:beforeSwap", function (e) {
+        var xhr = e.detail.xhr;
+        if (xhr && xhr.status === 403 && xhr.getResponseHeader("HX-Retarget")) {
+            e.detail.shouldSwap = true;
+            e.detail.isError = false;
+        }
+    });
+    </script>
 </head>
-<body>
+<body{% if csrf_token %} hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'{% endif %}>
 {# #623: six sidebar links stood between the keyboard and the content of
    EVERY page — measured, the first focus stop was "Dashboard". The link
    is invisible until focused, which is the point: it costs a sighted
