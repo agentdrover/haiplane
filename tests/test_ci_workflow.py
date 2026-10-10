@@ -136,6 +136,9 @@ def _run(argv: list[str], cwd: Path, env: dict[str, str] | None = None) -> str:
     return done.stdout
 
 
+# #1666: installs the whole lock into a fresh venv (network on a cold runner);
+# 600 s matches the subprocess limit inside, above the 300 s default.
+@pytest.mark.timeout(600)
 def test_the_lock_exports_install_into_a_clean_python311(tmp_path) -> None:
     """AC-4 (#1620): the deploy job's OWN export step runs on a copy of the lock;
     both sets install into a clean Python 3.11 exactly as the server does it
