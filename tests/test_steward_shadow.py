@@ -4714,7 +4714,7 @@ async def test_a_local_advisor_pair_is_applied_and_counted_like_a_cloud_one(
 ):
     """#1649 AC-9: пара с локальным советником применяется и считается как облачная.
 
-    Пара собирается НАСТОЯЩИМ локальным стартом (заказ glm-5.1, служба,
+    Пара собирается НАСТОЯЩИМ локальным стартом (заказ glm-5.3, служба,
     сессия советника), а не строками вручную: проверяется именно то, что
     локальный канал не завёл ни отдельного применения, ни отдельного счёта.
     """
@@ -4747,7 +4747,7 @@ async def test_a_local_advisor_pair_is_applied_and_counted_like_a_cloud_one(
         await _judge(db, task_id)
         assert await order_due_advisors(db) == 1
         order = await _advisor_row(db, task_id)
-        assert order["model"] == "glm-5.1"
+        assert order["model"] == "glm-5.3"
 
         async def _cli() -> None:
             seen = "stale-packet" if stale_packet else real
