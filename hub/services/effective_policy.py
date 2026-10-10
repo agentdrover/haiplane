@@ -164,6 +164,10 @@ REGISTRY: dict[str, PolicyEntry] = {
     "deep_reviewer": PolicyEntry(
         project_policy.deep_reviewer_of, "project_policy.deep_reviewer_of"
     ),
+    "local_review_fallback": PolicyEntry(
+        project_policy.local_review_fallback_of,
+        "project_policy.local_review_fallback_of",
+    ),
     "merge_is_delivery": PolicyEntry(
         project_policy.merge_is_delivery_of, "project_policy.merge_is_delivery_of"
     ),

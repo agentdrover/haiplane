@@ -1168,3 +1168,69 @@ def test_ci_before_submit_reader_modes():
     assert ci_before_submit_of({}) == "off"
     assert ci_before_submit_of({"ci_before_submit": "require"}) == "require"
     assert ci_before_submit_of({"ci_before_submit": "requier"}) == "warn"
+
+
+async def test_local_review_fallback_is_reported_on_every_surface(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, capsys
+):
+    """AC-7 (#1653): ключ принимает off|on, null снимает, REST, CLI и MCP говорят одно."""
+    assert "local_review_fallback" in GATE_POLICY_KEYS
+    pid = await _project(db, "lrf-surfaces", {"verdict": "human"})
+    slug = "lrf-surfaces"
+
+    async def _via_client(path: str, **_: object) -> object:
+        return (await client.get(path)).json()
+
+    monkeypatch.setattr(mcp_server, "_api_get", _via_client)
+
+    async def _surfaces(value: str, source: str) -> None:
+        resp = await client.get(f"/api/projects/{slug}/effective-policy")
+        rest = resp.json()
+        row = _by_key(rest)["local_review_fallback"]
+        assert (row["value"], row["source"]) == (value, source), row
+        assert row["default"] == "off"
+        out = await mcp_server.hub_effective_policy(slug)
+        mcp_row = _by_key(out.structuredContent)["local_review_fallback"]
+        assert (mcp_row["value"], mcp_row["source"]) == (value, source)
+        assert f"local_review_fallback = {value} [{source}]" in _message(out)
+        argv = ["oc-hub", "effective-policy", slug, "--json"]
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(cli, "_api", return_value=rest),
+        ):
+            cli.main()
+        cli_row = _by_key(json.loads(capsys.readouterr().out))["local_review_fallback"]
+        assert (cli_row["value"], cli_row["source"]) == (value, source)
+
+    await _surfaces("off", "default")
+
+    bad = await _patch_policy(client, pid, {"local_review_fallback": "maybe"})
+    assert bad.status_code == 422, bad.text
+    stored = (await repo.get_project(db, pid))["gate_policy"]
+    assert "local_review_fallback" not in json.loads(stored), "БД не изменилась"
+    await _surfaces("off", "default")
+
+    ok = await _patch_policy(client, pid, {"local_review_fallback": "on"})
+    assert ok.status_code == 200, ok.text
+    await _surfaces("on", "project")
+
+    # Пропущенный ключ сохраняется.
+    other = await _patch_policy(client, pid, {"ci_before_submit": "warn"})
+    assert other.status_code == 200, other.text
+    assert other.json()["gate_policy"]["local_review_fallback"] == "on"
+
+    cleared = await _patch_policy(client, pid, {"local_review_fallback": None})
+    assert cleared.status_code == 200, cleared.text
+    assert "local_review_fallback" not in cleared.json()["gate_policy"]
+    await _surfaces("off", "default")
+
+
+def test_local_review_fallback_reader_defaults_to_off():
+    """AC-7 (#1653): нет ключа и нечитаемое значение — off; читатель один."""
+    reader = project_policy.local_review_fallback_of
+    assert reader({}) == "off"
+    assert reader({"local_review_fallback": "on"}) == "on"
+    assert reader({"local_review_fallback": "ON"}) == "off"
+    assert reader({"local_review_fallback": True}) == "off"
+    assert reader({"local_review_fallback": 1}) == "off"
+    assert reader(None) == "off"  # type: ignore[arg-type]

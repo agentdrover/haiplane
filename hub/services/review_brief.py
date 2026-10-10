@@ -57,6 +57,7 @@ from hub.models import (
 from hub.services import call_sites, path_notices, review_evidence
 from hub.services.ac_tests import current_ac_test_results
 from hub.services.ci_report import ci_report_state
+from hub.services.result_kind import automation_not_applicable
 from hub.services.review_availability import generation_review
 from hub.services.rule_catalogue import rules_for_areas
 from hub.services.statement_freshness import statement_freshness
@@ -431,6 +432,15 @@ async def build_review_brief(
     if not row:
         return None
     task_row = dict(row)
+    if automation_not_applicable(task_row):
+        # #1648: у задачи-состояния нет ветки, диффа и CI — вычислять нечего.
+        # Отдельная сборка читает только БД (без git и сети) и отдаёт кодовые
+        # блоки готовым «не применимо», а не unknown/match.
+        from hub.services.state_review import build_state_brief
+
+        state_brief = await build_state_brief(db, task_id, row)
+        state_brief.self_review_warning = self_review_warning
+        return state_brief
     task_view = services.row_to_task(row)
     project_row = await timer.run(
         "db_reads", repo.resolve_project_for_task(db, task_id)

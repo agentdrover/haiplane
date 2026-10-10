@@ -60,6 +60,42 @@ URL» (#1119). Локальный запускает агентский CLI на
 `failed`. Сбой посередине означает повтор на следующем проходе, а не молча
 потерянную вторую дверь; алерт об отказе облака при этом остаётся **одним**.
 
+**Вторая дверь открыта только по согласию проекта (#1653).** Ключ
+`local_review_fallback` в `gate_policy`: `off` (умолчание) или `on`. Нет ключа и
+нечитаемое значение — `off`. Хаб заказывает локальный прогон вместо отказавшего
+облака, только если у проекта (с наследованием от эпика, проект `default`)
+стоит `on`: платный прогон решает политика, а не env хоста. Проверка одним
+читателем в двух местах: на входе `open_second_door` (до `review_reach`: при `off` причина пишется и без
+настроенного локального пути) и повторно в
+`dispatch_local_review` прямо перед вставкой диспетча второй двери — под `BEGIN IMMEDIATE`, отпускаемым
+коммитом вставки, так что PATCH `off` не может встрять между чтением и INSERT;
+так что
+переключение `on` → `off` во время подготовки заказа диспетча не создаёт. Это
+верно для всех входов: обычная сдача, добор лестницы, переспрос, вторая ось и
+облако после отказа local-first. Асинхронный отказ (свип) и синхронный идут
+через ту же развилку.
+
+При запрете долг `second_door` закрывается в **той же транзакции**, что и запись
+причины: событие `local_fallback_off_by_policy` (payload: `reason`,
+`dispatch_id`, `generation`) и алерт «Запасной локальный ревьюер выключен
+политикой проекта (local_review_fallback=off). Вердикт остаётся человеку.».
+Ключ дедупа — метка `local_fallback_off_by_policy` в
+`review_dispatches.second_door_reason` облачной строки: тот же `UPDATE`, что
+закрывает строку, ставит метку, а событие и алерт пишет только тот, у кого
+`rowcount=1`. Параллельное закрытие, повторные свипы, откат при сбое и чистка
+событий (14 дней) второго сообщения не дают. Отчёт ревьюера, пришедший после
+закрытия, возвращает строку в `done` (приём отчёта, `settle_policy_closed_dispatch`, только для строки, которой принадлежит отчёт). Исходный `run_status` облачного
+отказа сохраняется; строка закрывается в `failed`, а если у заказа успел лечь
+собственный отчёт облака — в `done`. Долг `second_door`, записанный до
+обновления, при эффективном `off` закрывается без локального заказа; при явном
+`on` восстанавливается как раньше. Переспрос облака (#1242) идёт как обычно:
+каждый новый отказ получает своё сообщение для своего `dispatch_id`.
+
+Ключ не влияет на: `deep_reviewer=local` (local-first, явный выбор проекта),
+форж без облака (прямой локальный путь), lite, советника стюарда (#1649).
+Включить одним PATCH: `{"gate_policy": {"local_review_fallback": "on"}}`; `null`
+снимает ключ (снова `off`).
+
 Важно про сегодняшний прод: пока `HAIPLANE_LOCAL_REVIEW_CMD` указывает на CLI **того
 же** провайдера с тем же исчерпанным ключом, вторая дверь ведёт в ту же
 стену. Ценность появляется только с выкатом, где второй поставщик —
@@ -1074,14 +1110,14 @@ z.ai; ZCode CLI; **отдельные uid для файлов ключей** (о
 
 | Часть | Что делает |
 |-------|------------|
-| хаб, `HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL` | **одна** закреплённая модель советника (`glm-5.1`). Запускаема локально, только если служба объявила её (см. «Возможности») и `HAIPLANE_STEWARD_HUB_TOKEN` разрешается в действующего принципала (не открытый режим). Несовпадение — отказ с названной причиной; автоподмены модели нет, самодекларация модели в суждении — не доказательство |
+| хаб, `HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL` | **одна** закреплённая модель советника (`glm-5.3`). Запускаема локально, только если служба объявила её (см. «Возможности») и `HAIPLANE_STEWARD_HUB_TOKEN` разрешается в действующего принципала (не открытый режим). Несовпадение — отказ с названной причиной; автоподмены модели нет, самодекларация модели в суждении — не доказательство |
 | хаб, `HAIPLANE_STEWARD_ADVISOR_MODELS` | порядок предпочтения кандидатов; локальная модель допускается в этот список и берётся в своём порядке, а если её там нет — последней. Облачный выбор не изменён |
 | служба-исполнитель | задание `version=3`, закрытое поле `profile=advisor`; своя команда `HAIPLANE_REVIEW_RUNNER_ARGV_ADVISOR`; модель и срок берёт из root-овых файлов врапера |
 | `haiplane-advisor-run` | вторая обёртка: root-owned, argv CLI закреплён в ней, свой `advisor.env`, свой `--timeout`, без монтирований |
 
 ### Протокол: задание v3
 
-`job.json` = `{"version": 3, "timeout_sec": N, "profile": "advisor", "model": "glm-5.1"}`,
+`job.json` = `{"version": 3, "timeout_sec": N, "profile": "advisor", "model": "glm-5.3"}`,
 ровно эти четыре поля. `profile` — закрытое перечисление, не путь и не команда. Служба
 отвергает **до запуска модели**: v3 без `profile` или с `profile=review`; v3 с
 лишним полем; v3 со `src.tar` (снимка у советника нет и не монтируется); срок
@@ -1097,7 +1133,7 @@ z.ai; ZCode CLI; **отдельные uid для файлов ключей** (о
 
 ```json
 {"protocol": 1, "job_versions": [1, 2, 3], "profiles": ["review", "advisor"],
- "advisor_model": "glm-5.1",
+ "advisor_model": "glm-5.3",
  "timeouts": {"max_sec": 1800, "review_sec": 1800, "advisor_sec": 900}}
 ```
 
@@ -1149,18 +1185,27 @@ export HOME=/var/lib/haiplane-review
 CONF=/etc/haiplane-review
 # Единственный допустимый владелец advisor.env — root.
 ENV_UID=0
-# Образ — тот же файл, что у враппера ревью (qwen-code лежит в образе
-# песочницы). Модель и срок — файлы ЭТОЙ обёртки; те же файлы читает служба и
-# объявляет в heartbeat, поэтому объявленное хабу и запущенное не расходятся.
-# Нет файла — отказ (set -e), а не запуск с умолчанием.
-IMAGE=$(cat "$CONF/image")
+# Образ советника — СВОЙ файл advisor-image (рецепт advisor.Containerfile,
+# localhost/haiplane-advisor:1), а не образ ревью: от неописанного образа
+# песочницы советник не зависит. Модель и срок — файлы ЭТОЙ обёртки; те же
+# файлы читает служба и объявляет в heartbeat, поэтому объявленное хабу и
+# запущенное не расходятся. Нет файла или он пуст — явный отказ ДО podman, а не
+# запуск с умолчанием.
+if [ ! -f "$CONF/advisor-image" ] || [ -L "$CONF/advisor-image" ]; then
+    echo "advisor-image: нужен обычный файл с именем образа" >&2
+    exit 65
+fi
+IMAGE=$(cat "$CONF/advisor-image")
+case $IMAGE in
+    '' | *[!A-Za-z0-9._:/@-]*) echo "advisor-image: имя образа пусто или недопустимо" >&2; exit 65 ;;
+esac
 MODEL=$(cat "$CONF/advisor-model")
 TIMEOUT=$(cat "$CONF/advisor-timeout")
 case $TIMEOUT in
     '' | 0 | *[!0-9]*) echo "advisor-timeout: нужно целое число секунд больше нуля" >&2; exit 65 ;;
 esac
 case $MODEL in
-    '' | *[!A-Za-z0-9._/-]*) echo "advisor-model: имя модели недопустимо" >&2; exit 65 ;;
+    '' | */* | *[!A-Za-z0-9._-]*) echo "advisor-model: имя модели недопустимо" >&2; exit 65 ;;
 esac
 # advisor.env — ключ z.ai: обычный файл (не ссылка), владелец root, записи
 # группе и миру нет, миру недоступен, и это НЕ тот же файл, что model.env (иначе
@@ -1197,8 +1242,13 @@ fi
 # Без монтирований хоста, сокетов и домашнего каталога. Контейнер получает
 # --env-file только с ключом z.ai. --timeout — последний рубеж: хаб и служба
 # снимают прогон просьбой, а контейнер доживает ровно до него.
-# qwen-code: промт читает из stdin; режим yolo разрешает tool calls (redeem,
-# GET evidence, POST judgement) без запроса, потому что вся изоляция — здесь.
+# OpenCode (инструмент из списка подписки z.ai): промт читает из stdin
+# (`opencode run` без аргумента-сообщения, run.ts:416 тега v1.18.35) и НИКОГДА
+# не получает его в argv; `--auto` разрешает tool calls (redeem, GET evidence,
+# POST judgement) без вопроса, потому что вся изоляция — здесь. Провайдер
+# zai-coding-plan — литерал, $MODEL — голое имя из advisor-model. Отключения
+# автообновления, шаринга, загрузки каталога моделей, плагинов и LSP заданы
+# литералами здесь, а не берутся из advisor.env.
 exec /usr/bin/podman run --rm -i \
      --replace --name haiplane-advisor \
      --cgroup-manager=systemd \
@@ -1206,23 +1256,65 @@ exec /usr/bin/podman run --rm -i \
      --memory=1500m --cpus=1.5 --pids-limit=512 \
      --cap-drop=all --security-opt=no-new-privileges \
      --env-file="$CONF/advisor.env" \
-     "$IMAGE" qwen --model "$MODEL" --approval-mode yolo --output-format text
+     -e OPENCODE_DISABLE_AUTOUPDATE=1 \
+     -e OPENCODE_AUTO_SHARE=false \
+     -e OPENCODE_DISABLE_MODELS_FETCH=1 \
+     -e OPENCODE_PURE=1 \
+     -e OPENCODE_DISABLE_DEFAULT_PLUGINS=1 \
+     -e OPENCODE_DISABLE_LSP_DOWNLOAD=1 \
+     -e OPENCODE_DISABLE_PROJECT_CONFIG=1 \
+     -e OPENCODE_DISABLE_EXTERNAL_SKILLS=1 \
+     "$IMAGE" opencode run --model "zai-coding-plan/$MODEL" --auto
 ```
 
 Что в ней закреплено и почему.
 
 * **Аргументы от вызывающего не принимаются** (код 64): argv CLI зашит в
-  обёртке — `qwen --model "$MODEL" --approval-mode yolo --output-format text`.
-  Промт qwen-code читает из stdin (headless: `echo … | qwen`), модель — из
-  файла `advisor-model`. Режим `yolo` разрешает инструменты (redeem кода,
-  `GET evidence`, `POST judgement`) без запроса: интерактивного собеседника в
-  контейнере нет, а граница безопасности — не вопрос модели, а изоляция
-  (отдельный env-файл, без монтирований, лимиты, `--cap-drop=all`,
-  `no-new-privileges`, `--timeout`). Источник флагов — документация qwen-code
-  (headless и approval-mode); формат `--approval-mode yolo` и чтение промта из
-  stdin подтверждаются **пробой владельца в контейнере** (ниже), а не чтением.
-* **Свои образ, ключ и срок:** образ — `$CONF/image` (qwen-code лежит в образе
-  песочницы), ключ — `--env-file=$CONF/advisor.env` и больше ничего, срок —
+  обёртке — `opencode run --model "zai-coding-plan/$MODEL" --auto`.
+  **Промт идёт только через stdin и никогда не попадает в argv** (ни хоста, ни
+  контейнера: argv процесса контейнера виден с хоста, а в промте одноразовый
+  код хаба). `sh -c "$(cat)"` и подобное запрещены. Провайдер
+  `zai-coding-plan` — литерал обёртки, модель — голое имя из `advisor-model`.
+  Флаг `--auto` разрешает инструменты (redeem кода, `GET evidence`,
+  `POST judgement`) без вопроса: интерактивного собеседника в контейнере нет, а
+  граница безопасности — не вопрос модели, а изоляция (отдельный env-файл, без
+  монтирований, лимиты, `--cap-drop=all`, `no-new-privileges`, `--timeout`).
+* **Источники флагов** (исходник `anomalyco/opencode`, тег `v1.18.35`, сверен
+  10.10.2026 чтением, не запуском):
+
+  | Что | Где в теге | Как задано |
+  |-----|-----------|------------|
+  | промт из stdin без аргумента-сообщения | `packages/opencode/src/cli/cmd/run.ts:40-50` (`resolveRunInput`), `:416-418` | `-i` у podman, сообщение не передаётся |
+  | `--auto` | `run.ts:242-246` (опция), `:274` (`auto`), `:805-812` (ответ `once` на `permission.asked`) | в argv |
+  | автообновление | `packages/core/src/flag/flag.ts:23` (`OPENCODE_DISABLE_AUTOUPDATE`); `packages/core/src/v1/config/config.ts:64` (`autoupdate`) | `-e OPENCODE_DISABLE_AUTOUPDATE=1` и `autoupdate:false` в конфиге образа |
+  | шаринг | `packages/opencode/src/effect/runtime-flags.ts:17` (`OPENCODE_AUTO_SHARE`); `config.ts:57` (`share`); проверка `run.ts:538` | `-e OPENCODE_AUTO_SHARE=false`; `share:"disabled"` в конфиге образа (одной переменной мало: `share:"auto"` из конфига её перекрывает) |
+  | загрузка каталога моделей | `flag.ts:29` (`OPENCODE_DISABLE_MODELS_FETCH`); `packages/core/src/models-dev.ts:217-222` (диск, встроенный снимок, затем сеть), `:255` (фоновое обновление раз в час) | `-e OPENCODE_DISABLE_MODELS_FETCH=1` |
+  | плагины | `runtime-flags.ts:18-19` (`OPENCODE_PURE`, `OPENCODE_DISABLE_DEFAULT_PLUGINS`); `flag.ts:66` | `-e OPENCODE_PURE=1`, `-e OPENCODE_DISABLE_DEFAULT_PLUGINS=1`; `plugin:[]` в конфиге образа |
+  | LSP | `runtime-flags.ts:22` (`OPENCODE_DISABLE_LSP_DOWNLOAD`); `config.ts:120` (`lsp`) | `-e OPENCODE_DISABLE_LSP_DOWNLOAD=1`; `lsp:false`, `formatter:false`, `mcp:{}` в конфиге образа |
+  | проектная конфигурация и внешние навыки | `flag.ts:54` (`OPENCODE_DISABLE_PROJECT_CONFIG`); `runtime-flags.ts:21` | `-e OPENCODE_DISABLE_PROJECT_CONFIG=1`, `-e OPENCODE_DISABLE_EXTERNAL_SKILLS=1` |
+  | путь конфигурации | `flag.ts:21` (`OPENCODE_CONFIG`) | `ENV OPENCODE_CONFIG=/etc/opencode/opencode.json` в образе |
+
+  Переменные отключений заданы литералами `-e` в обёртке, а не берутся из
+  `advisor.env`. **Не проверено чтением:** есть ли `zai-coding-plan/glm-5.3` во
+  встроенном снимке каталога этой версии — снимок вшивается при сборке пакета
+  (`OPENCODE_MODELS_DEV`, `models-dev.ts:198-200`). Проверяет проба: холодный
+  запуск с `OPENCODE_DISABLE_MODELS_FETCH=1` (шаг 1 пробы ниже). Если модели
+  нет — не обходить, а остановить выкат и править задачу.
+* **Правило подписки z.ai.** GLM Coding Plan разрешено использовать только в
+  официально поддерживаемых инструментах; использование вне списка может урезать
+  льготы подписки и включить меры риск-контроля вплоть до заморозки и бана
+  (https://docs.z.ai/devpack/usage-policy; список инструментов —
+  https://docs.z.ai/devpack/tool/others: ZCode, Claude Code, Codex, OpenCode,
+  Cline, Kilo Code, Roo Code, Goose и др.). Qwen Code в списке нет, поэтому
+  первая редакция обёртки (#1649) заменена на OpenCode (#1654). Подписка
+  даёт GLM-5.3 и GLM-5.3-Flash; запросы на 5.1 и 5.2 z.ai перенаправляет на 5.3
+  (https://docs.z.ai/devpack/overview), поэтому везде закреплено `glm-5.3`.
+  Автоматический запуск с сервера правила прямо не разрешают и прямо не
+  запрещают: решение о допустимости за владельцем.
+* **Свои образ, ключ и срок:** образ — `$CONF/advisor-image`
+  (`localhost/haiplane-advisor:1`, рецепт `deploy/review-runner/advisor.Containerfile`;
+  нет файла или он пуст — отказ ДО podman, код 65; образ ревью не используется),
+  ключ — `--env-file=$CONF/advisor.env` и больше ничего, срок —
   `--timeout` из `$CONF/advisor-timeout` (нет файла — отказ, умолчания нет).
   Каталог настроек закреплён литералом, а не берётся из окружения.
 * **Без монтирований хоста, сокетов и домашнего каталога**; лимиты
@@ -1237,20 +1329,40 @@ exec /usr/bin/podman run --rm -i \
 Файлы настроек (`root:root`, каталог `0755`; ключ — `0640 root:haiplane-reviewer`):
 
 ```bash
-printf 'glm-5.1\n' > /etc/haiplane-review/advisor-model
+printf 'glm-5.3\n' > /etc/haiplane-review/advisor-model
 printf '900\n'    > /etc/haiplane-review/advisor-timeout     # = --timeout контейнера, секунды
-chmod 0644 /etc/haiplane-review/advisor-model /etc/haiplane-review/advisor-timeout
+printf 'localhost/haiplane-advisor:1\n' > /etc/haiplane-review/advisor-image
+chmod 0644 /etc/haiplane-review/advisor-model /etc/haiplane-review/advisor-timeout /etc/haiplane-review/advisor-image
 install -m 0640 -o root -g haiplane-reviewer /dev/null /etc/haiplane-review/advisor.env
 # вписать вручную (ключ в историю не попадает):
-#   OPENAI_API_KEY=<ключ z.ai>
-#   OPENAI_BASE_URL=https://api.z.ai/api/coding/paas/v4
+#   ZHIPU_API_KEY=<ключ API z.ai от аккаунта с действующей подпиской GLM Coding Plan>
 ```
 
-qwen-code берёт OpenAI-совместимого поставщика из `OPENAI_API_KEY`,
-`OPENAI_BASE_URL`, `OPENAI_MODEL`; тип авторизации выбирается самим
-`OPENAI_API_KEY`. Адрес z.ai с хоста прода отвечает 401 без ключа — это **не
-доказывает** доступ из контейнера: сеть контейнера до `api.z.ai` проверяет
-проба владельца.
+Провайдер `zai-coding-plan` читает ключ из `ZHIPU_API_KEY` и ходит на coding
+endpoint `https://api.z.ai/api/coding/paas/v4` (каталог models.dev; отдельная
+переменная адреса не нужна). Адрес z.ai с хоста прода отвечает 401 без ключа —
+это **не доказывает** доступ из контейнера: сеть контейнера до `api.z.ai`
+проверяет проба владельца.
+
+### Образ советника
+
+Образ собирается из `deploy/review-runner/advisor.Containerfile` (debian
+12-slim, Node 22, `opencode-ai@1.18.35` точной версией, чистая конфигурация
+`advisor-opencode.json` по пути из `OPENCODE_CONFIG`, `ENTRYPOINT []`,
+`WORKDIR /work`) и не зависит от неописанного образа ревью:
+
+```text
+# сборка и проверки — под пользователем ревьюера, из корня репозитория;
+# запись в /etc/haiplane-review — от root (каталог и файлы root-овые)
+podman build -t localhost/haiplane-advisor:1 \
+    -f deploy/review-runner/advisor.Containerfile deploy/review-runner
+podman run --rm localhost/haiplane-advisor:1 opencode --version   # 1.18.35
+podman run --rm localhost/haiplane-advisor:1 sh -c 'curl --version | head -1; jq --version'
+printf 'localhost/haiplane-advisor:1\n' > /etc/haiplane-review/advisor-image
+```
+
+Служба и обёртка ревью (`haiplane-reviewer:2`, `haiplane-review-run`) не
+меняются.
 
 ### Правило sudoers
 
@@ -1277,8 +1389,8 @@ haiplane ALL=(haiplane-reviewer) NOPASSWD: /usr/local/bin/haiplane-advisor-run "
 |-----------|-------|
 | `HAIPLANE_REVIEW_RUNNER_ARGV_ADVISOR` | единственная команда профиля: ровно `sudo -n -u <тот же пользователь, что у ревью> /usr/local/bin/haiplane-advisor-run`, без аргументов. Пусто — профиля нет, v3 отвергается |
 
-Хаб (drop-in юнита): `HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL=glm-5.1`,
-`HAIPLANE_STEWARD_ADVISOR_MODELS` (порядок), `HAIPLANE_STEWARD_HUB_TOKEN`
+Хаб (drop-in юнита): `HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL=glm-5.3`,
+`HAIPLANE_STEWARD_ADVISOR_MODELS` (порядок; пример `glm-5.3,grok-4.6,composer-2.5`), `HAIPLANE_STEWARD_HUB_TOKEN`
 (уже есть), транспорт `HAIPLANE_LOCAL_REVIEW_TRANSPORT=runner` и
 `HAIPLANE_LOCAL_REVIEW_SPOOL_DIR`. Токен ревьюера
 (`HAIPLANE_LOCAL_REVIEWER_HUB_TOKEN`) советнику **не нужен**: готовность
@@ -1350,35 +1462,45 @@ haiplane ALL=(haiplane-reviewer) NOPASSWD: /usr/local/bin/haiplane-advisor-run "
 
 ### Выкат (владелец)
 
-Служба — серверная копия под `release_artifacts` (#1591): релиз остановится,
-пока копия не обновлена, и это нужное свойство. Порядок:
+Служба — серверная копия под `release_artifacts` (#1591). Правка #1654 код
+службы (`haiplane-review-runner.py`) не меняет, службу не заменяют. Порядок:
 
-1. `advisor.env` с ключом z.ai, `advisor-model`, `advisor-timeout`; обёртка
+1. Советник **выключен**: `HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL` не задан.
+   Убрать `glm-5.3` только из `HAIPLANE_STEWARD_ADVISOR_MODELS` мало: заданную
+   локальную модель хаб добавляет в кандидаты последней.
+2. Сборка образа под пользователем ревьюера (раздел «Образ советника»), файлы
+   `advisor-image`, `advisor-model` (`glm-5.3`), `advisor-timeout`,
+   `advisor.env` с `ZHIPU_API_KEY`; обёртка
    `/usr/local/bin/haiplane-advisor-run`; правило sudoers (`visudo -cf`).
-2. Новая служба (`haiplane-review-runner.py`), в её env —
-   `HAIPLANE_REVIEW_RUNNER_ARGV_ADVISOR`; рестарт службы; в heartbeat —
-   `capabilities` с `profiles: ["review","advisor"]` и моделью.
-3. Релиз хаба; drop-in: `HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL`,
-   `HAIPLANE_STEWARD_ADVISOR_MODELS`.
-4. Полная проба из контейнера advisor (ниже). **Без неё статус — «не
-   проверено»**, включать советника на живых сдачах нельзя.
+3. Рестарт службы, если её env менялся, и **свежий heartbeat** с
+   `capabilities`: `profiles: ["review","advisor"]`, `advisor_model: "glm-5.3"`.
+   Без совпадения модели в heartbeat переход к `enable` запрещён.
+4. Проба из контейнера advisor (ниже). **Без неё статус — «не проверено»**,
+   включать советника на живых сдачах нельзя.
+5. `enable`: в drop-in хаба `HAIPLANE_STEWARD_ADVISOR_LOCAL_MODEL=glm-5.3` и
+   `HAIPLANE_STEWARD_ADVISOR_MODELS=glm-5.3,grok-4.6,composer-2.5`.
 
 ### Полная проба из контейнера advisor (ручной шаг владельца)
 
 Проба не заменяется чтением конфига и в CI не выполняется — условия подписки и
-сеть до z.ai подтверждает владелец:
+сеть до z.ai подтверждает владелец. Успешный stdout пробой не считается:
+ответом служит запись суждения в хабе.
 
-1. DNS и TLS до `api.z.ai` изнутри контейнера (`getent hosts api.z.ai`,
+1. **Холодный запуск с отключёнными загрузками:** контейнер без сети каталога
+   моделей (с теми же `-e`, что в обёртке) показывает
+   `opencode models zai-coding-plan` со строкой `glm-5.3`, а `opencode --version`
+   даёт `1.18.35`. Нет модели во встроенном снимке — стоп.
+2. DNS и TLS до `api.z.ai` изнутри контейнера (`getent hosts api.z.ai`,
    `curl -sS -o /dev/null -w '%{http_code}' https://api.z.ai/api/coding/paas/v4/models`
    — 401 без ключа допустим, DNS и TLS — нет).
-2. Ответ модели с вызовом инструмента (tool call) в headless-режиме `yolo`.
-3. Обмен кода (`POST /api/auth/chat-pair/redeem`) изнутри контейнера.
-4. Чтение пакета (`GET /api/tasks/<id>/steward-evidence`).
-5. Запись суждения (`POST /api/tasks/<id>/steward-judgement`, `kind=advisor`) на
+3. Ответ модели с вызовом инструмента (tool call) в режиме `opencode run --auto`,
+   промт — через stdin.
+4. Обмен кода (`POST /api/auth/chat-pair/redeem`) изнутри контейнера.
+5. Чтение пакета (`GET /api/tasks/<id>/steward-evidence`).
+6. Запись суждения (`POST /api/tasks/<id>/steward-judgement`, `kind=advisor`) на
    **тестовом** заказе.
-6. Подтвердить, что argv `qwen --approval-mode yolo` принят установленной
-   версией qwen-code и что промт из stdin читается (иначе поправить обёртку и
-   скелет вместе).
+7. Подтвердить, что `ps` на хосте не показывает ни промта, ни ключа в argv
+   процессов `podman` и контейнера.
 
 ### Что видно в карточке
 

@@ -1026,7 +1026,7 @@ async def test_the_local_advisor_exchange_works_over_real_codes_and_http(
     answer = await repo.get_steward_judgement(db, task_id, 1, "advisor")
     assert answer is not None
     answer = dict(answer)
-    assert answer["verdict"] == "concur" and answer["model"] == "glm-5.1"
+    assert answer["verdict"] == "concur" and answer["model"] == "glm-5.3"
     assert answer["principal_id"] == principal_id
     assert answer["tokens_unknown_reason"] == "local_no_provider_usage"
     assert (await advisor_state(db, task_id, 1)).state == "received"

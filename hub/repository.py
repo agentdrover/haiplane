@@ -3740,6 +3740,53 @@ async def set_review_dispatch_status(
     )
 
 
+#: Причина закрытия долга второй двери по политике проекта (#1653). Живёт в
+#: ``review_dispatches.second_door_reason`` облачной строки: это и ключ дедупа
+#: сообщения (событие чистится через 14 дней, строка — нет), и метка, по
+#: которой поздний собственный отчёт облака возвращает строку в ``done``.
+LOCAL_FALLBACK_OFF_REASON = "local_fallback_off_by_policy"
+
+
+async def close_dispatch_by_policy(
+    db: aiosqlite.Connection, dispatch_id: int, status: str
+) -> bool:
+    """Закрыть долг второй двери по политике: True ровно один раз на строку (#1653).
+
+    Условие в самом UPDATE делает закрытие атомарным без отдельного чтения:
+    параллельное второе закрытие и повтор после чистки событий видят метку и
+    получают False. Коммит — за вызывающим: причина, событие и алерт идут в
+    одной транзакции.
+    """
+    cur = await db.execute(
+        "UPDATE review_dispatches SET status=?, second_door_reason=? "
+        "WHERE id=? AND status IN ('active', 'second_door') "
+        "AND coalesce(second_door_reason, '') != ?",
+        (status, LOCAL_FALLBACK_OFF_REASON, dispatch_id, LOCAL_FALLBACK_OFF_REASON),
+    )
+    return cur.rowcount == 1
+
+
+async def settle_policy_closed_dispatch(
+    db: aiosqlite.Connection, dispatch_id: int, principal_id: int | None
+) -> None:
+    """Поздний собственный отчёт облака возвращает закрытое по политике в done (#1653).
+
+    Свипы берут только active и second_door, поэтому строка, закрытая как
+    failed с меткой политики, сама в done не вернётся. Трогается ТОЛЬКО строка,
+    которой отчёт принадлежит (её определяет вызывающий общим правилом
+    ``dispatch_for_report``), и только при совпавшем принципале: строка без
+    принципала не совпадает ни с кем, чужой принципал строку не трогает.
+    """
+    if principal_id is None:
+        return
+    await db.execute(
+        "UPDATE review_dispatches SET status='done' "
+        "WHERE id=? AND channel='cloud' AND status='failed' "
+        "AND second_door_reason=? AND reviewer_principal_id=?",
+        (dispatch_id, LOCAL_FALLBACK_OFF_REASON, principal_id),
+    )
+
+
 async def owe_second_door(
     db: aiosqlite.Connection, dispatch_id: int, run_status: str
 ) -> None:

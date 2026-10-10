@@ -384,6 +384,10 @@ GATE_POLICY_KEYS: tuple[str, ...] = (
     # #1561: кто читает deep первым — cloud (по умолчанию) или local. Не гейт
     # и ничего не делегирует. Читатель: project_policy.deep_reviewer_of.
     "deep_reviewer",
+    # #1653: согласие проекта на локального ревьюера ВМЕСТО отказавшего облака
+    # (вторая дверь): off (по умолчанию) | on. Не гейт и ничего не делегирует.
+    # Читатель: project_policy.local_review_fallback_of.
+    "local_review_fallback",
     # #1572: владелец объявляет «мерж = доставка» (у проекта нет релиз-PR и
     # отдельного выката): срок исхода считается от даты мержа. Не гейт и
     # ничего не делегирует. Читатель: project_policy.merge_is_delivery_of.
@@ -755,6 +759,21 @@ def _validate_deep_reviewer(policy: dict[str, Any]) -> None:
         raise ValueError(
             "gate_policy deep_reviewer must be one of "
             f"{', '.join(DEEP_REVIEWERS)}, got: {policy['deep_reviewer']!r}"
+        )
+
+
+def _validate_local_review_fallback(policy: dict[str, Any]) -> None:
+    """Refuse a fallback value the reader would read as off by accident (#1653)."""
+    from hub.services.project_policy import LOCAL_REVIEW_FALLBACKS
+
+    if (
+        "local_review_fallback" in policy
+        and policy["local_review_fallback"] not in LOCAL_REVIEW_FALLBACKS
+    ):
+        raise ValueError(
+            "gate_policy local_review_fallback must be one of "
+            f"{', '.join(LOCAL_REVIEW_FALLBACKS)}, "
+            f"got: {policy['local_review_fallback']!r}"
         )
 
 
@@ -1690,6 +1709,12 @@ class ReviewQueueRow(BaseModel):
     waiting_minutes: int | None = None
     # ready | ready_sha_unverified | findings | awaiting_report | blocked.
     readiness: str = "awaiting_report"
+    # #1648: commit | state. Для state: sha_check и report_status равны
+    # ``not_applicable`` (ветки и машинного отчёта нет), а готовность к вердикту
+    # определяют доказательства текущего поколения. None — не про эту задачу.
+    result_kind: str = "commit"
+    evidence_count: int | None = None
+    evidence_complete: bool | None = None
 
 
 class ReviewQueueView(BaseModel):
@@ -1949,6 +1974,9 @@ class ReviewBrief(BaseModel):
     # #1589: manual server steps named by the project for the paths this
     # generation touched. None = no rules configured at submission.
     path_notices: PathNoticesView | None = None
+    # #1648: вид результата и, для задачи-состояния, блок «что принимается».
+    result_kind: str = "commit"
+    state_review: "StateReviewView | None" = None
     # #1652: where the assembly spent its time. None = this path did not time it.
     timings: BriefTimings | None = None
 
@@ -2966,6 +2994,43 @@ class TaskEvidenceView(BaseModel):
     created_at: str = ""
 
 
+class StateEvidenceItem(TaskEvidenceView):
+    """Доказательство в брифе и на карточке: плюс читаемый автор (#1648).
+
+    ``author`` — подпись сдачи, а при пустой подписи номер принципала из
+    идентичности вызывающего; подпись клиента доказательством авторства не
+    является, поэтому принципал остаётся рядом в ``principal_id``.
+    """
+
+    author: str = ""
+
+
+class StateReviewView(BaseModel):
+    """Что человек принимает по задаче-состоянию, одним блоком (#1648).
+
+    Один читатель на очередь, входящие, бриф (REST и MCP) и карточку:
+    ``hub.services.state_review``. ``acceptance_criteria`` — СНИМОК AC сдачи
+    (его видел автор), а не живая постановка; ``evidence`` — только
+    поколения ``generation``. ``expected_generation`` — число, которое форма
+    вердикта обязана назвать (устаревшее получает 409). ``not_applicable`` —
+    проверки кода, которых у такой задачи нет: они названы, а не пропущены
+    молча и не выданы за ``unknown``/``match``.
+    """
+
+    result_kind: str = "state"
+    label: str = "результат: состояние"
+    generation: int = 0
+    expected_generation: int = 0
+    rollback: str = ""
+    acceptance_criteria: list[dict[str, Any]] = Field(default_factory=list)
+    evidence: list[StateEvidenceItem] = Field(default_factory=list)
+    evidence_complete: bool = False
+    missing_ac: list[str] = Field(default_factory=list)
+    not_applicable: list[dict[str, str]] = Field(default_factory=list)
+    decider: str = "human"
+    headline: str = ""
+
+
 class TaskView(BaseModel):
     id: int
     title: str
@@ -3333,6 +3398,7 @@ def validated_gate_policy(v: dict[str, Any]) -> dict[str, Any]:
     _validate_claim_area_check(v)
     _validate_statement_paths(v)
     _validate_deep_reviewer(v)
+    _validate_local_review_fallback(v)
     _validate_slot_dead_minutes(v)
     _validate_executor_launch(v)
     _validate_executor_task_ceilings(v)
@@ -4914,5 +4980,6 @@ ProposalView = TaskView
 # which is declared after ReviewBrief (#381).
 ReviewReport.model_rebuild()
 ReviewBrief.model_rebuild()
+StateReviewView.model_rebuild()
 TaskView.model_rebuild()
 ProdDefectFiled.model_rebuild()
