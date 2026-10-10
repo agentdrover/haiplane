@@ -4909,3 +4909,223 @@ async def test_agent_bootstrap_follows_project_policy(client, db, tmp_path):
     assert states == {RULES_PATH: "present", ".hub/REVIEW_RULES.md": "missing"}
     states_off = {f["path"]: f["state"] for f in off["rules_files"]}
     assert states_off[RULES_PATH] == "missing"
+
+
+# ---- #1647: задача-состояние одинакова на REST, в CLI и в MCP ----
+
+
+async def test_state_fields_evidence_and_verdict_parity_across_surfaces(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-10: result_kind/rollback, доказательства и вердикт с поколением.
+
+    CLI проверяется по телу запроса, которое он строит, и это тело
+    проигрывается через REST под теми же токенами; MCP ходит в тот же REST.
+    Авторство доказательств берётся из токена: поле agent — только подпись.
+    """
+    import argparse
+    import json
+    from unittest.mock import patch
+
+    from hub import cli, mcp_server
+    from tests.state_support import (
+        auth,
+        evidence_for,
+        evidence_rows,
+        pair_start,
+    )
+
+    headers = auth(monkeypatch)
+
+    def bridge(who: str):
+        async def _post(path: str, body: dict | None = None, **_):
+            resp = await client.post(path, json=body or {}, headers=headers[who])
+            if resp.status_code >= 400:
+                raise mcp_server.HubApiError(
+                    mcp_server._parse_api_error(resp, resp.status_code)
+                )
+            return resp.json()
+
+        async def _get(path: str, **_):
+            return (await client.get(path, headers=headers[who])).json()
+
+        return _post, _get
+
+    def cli_body(call, **namespace) -> tuple[str, str, dict]:
+        sent: list[tuple] = []
+        with patch.object(
+            cli,
+            "_api",
+            side_effect=lambda m, p, b=None, **k: sent.append((m, p, b)) or {},
+        ):
+            call(argparse.Namespace(**namespace))
+        method, path, body = sent[-1]
+        return method, path, body
+
+    full_form = {
+        "user_story": "Как владелец хочу сменить ключ",
+        "problem_statement": "Ключ скомпрометирован",
+        "business_value": "Закрыт риск",
+    }
+
+    # --- создание: REST, CLI (проигрыш тела), MCP ---
+    rest = await client.post(
+        "/api/tasks",
+        json={
+            "title": "rest",
+            "result_kind": "state",
+            "rollback": "откат REST",
+            **full_form,
+        },
+        headers=headers["human"],
+    )
+    assert rest.status_code in (200, 201), rest.text
+    assert (
+        rest.json()["result_kind"] == "state"
+        and rest.json()["rollback"] == "откат REST"
+    )
+    rest_id = rest.json()["id"]
+
+    _m, path, body = cli_body(
+        cli.cmd_task,
+        title="cli", description="", runtime="auto", run=False, no_review=False,
+        task_type="task", priority="medium", work_type=None, freeze_rationale="",
+        parent=None, owner=None, reviewer=None, request_id="",
+        result_kind="state", rollback="откат CLI",
+    )  # fmt: skip
+    assert body["result_kind"] == "state" and body["rollback"] == "откат CLI"
+    replay = await client.post(path, json=body, headers=headers["human"])
+    assert replay.json()["result_kind"] == "state", replay.text
+    cli_id = replay.json()["id"]
+
+    post, get = bridge("human")
+    monkeypatch.setattr(mcp_server, "_api_post", post)
+    monkeypatch.setattr(mcp_server, "_api_get", get)
+    created = await mcp_server.hub_create_task(
+        "mcp", result_kind="state", rollback="откат MCP"
+    )
+    mcp_id = created.structuredContent["task"]["id"]
+    stored = (await client.get(f"/api/tasks/{mcp_id}", headers=headers["human"])).json()
+    assert (stored["result_kind"], stored["rollback"]) == ("state", "откат MCP")
+
+    # --- уточнение: CLI-тело и MCP-инструмент ---
+    refine_payload = cli._build_refine_payload(
+        argparse.Namespace(rollback="откат CLI 2", result_kind=None)
+    )
+    assert refine_payload == {"rollback": "откат CLI 2"}
+    refined = await client.post(
+        f"/api/tasks/{cli_id}/refine", json=refine_payload, headers=headers["human"]
+    )
+    assert refined.json()["rollback"] == "откат CLI 2", refined.text
+    await mcp_server.hub_refine_task(mcp_id, rollback="откат MCP 2")
+    assert (await client.get(f"/api/tasks/{mcp_id}", headers=headers["human"])).json()[
+        "rollback"
+    ] == "откат MCP 2"
+
+    # --- сдача с доказательствами: REST, CLI-тело, MCP; автор — из токена ---
+    ids = {}
+    for label, task_id in (("rest", rest_id), ("cli", cli_id), ("mcp", mcp_id)):
+        for n, kind in enumerate(("manual", "log_check"), start=1):
+            added = await client.post(
+                f"/api/tasks/{task_id}/acceptance_criteria",
+                json={"id": f"AC-{n}", "given": "g", "when": "w", "then": "t",
+                      "verifiable_by": kind},
+                headers=headers["human"],
+            )  # fmt: skip
+            assert added.status_code == 201, added.text
+        started = await pair_start(client, task_id, headers=headers["impl"])
+        assert started.status_code == 200, started.text
+        ids[label] = task_id
+
+    sent_rest = await client.post(
+        f"/api/tasks/{ids['rest']}/submit-review",
+        json={"agent": "подпись-REST", "summary": "s", "model": "m",
+              "evidence": evidence_for()},
+        headers=headers["impl"],
+    )  # fmt: skip
+    assert sent_rest.status_code == 200, sent_rest.text
+
+    _m, path, body = cli_body(
+        cli.cmd_submit_review,
+        task_id=ids["cli"], agent="подпись-CLI", summary="s", model="m",
+        evidence=json.dumps(evidence_for()),
+    )  # fmt: skip
+    assert body["evidence"] == evidence_for()
+    sent_cli = await client.post(path, json=body, headers=headers["impl"])
+    assert sent_cli.status_code == 200, sent_cli.text
+
+    post, get = bridge("impl")
+    monkeypatch.setattr(mcp_server, "_api_post", post)
+    monkeypatch.setattr(mcp_server, "_api_get", get)
+    await mcp_server.hub_submit_for_review(
+        ids["mcp"], agent="подпись-MCP", summary="s", model="m", evidence=evidence_for()
+    )
+
+    for label, signature in (("rest", "подпись-REST"), ("cli", "подпись-CLI"),
+                             ("mcp", "подпись-MCP")):  # fmt: skip
+        task = (
+            await client.get(f"/api/tasks/{ids[label]}", headers=headers["human"])
+        ).json()
+        assert task["status"] == "review", (label, task["status"])
+        rows = await evidence_rows(db, ids[label])
+        assert len(rows) == 2, (label, rows)
+        assert {r["principal_id"] for r in rows} == {7}, (label, "автор из токена")
+        assert {r["agent"] for r in rows} == {signature}, (label, "agent — подпись")
+
+    # --- вердикт с поколением: REST, CLI-тело, MCP ---
+    no_gen = await client.post(
+        f"/api/tasks/{ids['rest']}/review-verdict",
+        json={"verdict": "changes_requested", "comments": "нужно ещё наблюдение"},
+        headers=headers["human"],
+    )
+    assert no_gen.status_code == 409, "вердикт по state без поколения не принимается"
+    verdict_rest = await client.post(
+        f"/api/tasks/{ids['rest']}/review-verdict",
+        json={"verdict": "changes_requested", "comments": "нужно ещё наблюдение",
+              "expected_generation": 1},
+        headers=headers["human"],
+    )  # fmt: skip
+    assert verdict_rest.status_code == 200, verdict_rest.text
+
+    _m, path, body = cli_body(
+        cli.cmd_review_verdict,
+        task_id=ids["cli"], verdict="changes_requested", comments="нужно ещё",
+        agent="r", findings_json="", create_tasks_for_out_of_scope=False,
+        expected_generation=1,
+    )  # fmt: skip
+    assert body["expected_generation"] == 1
+    verdict_cli = await client.post(path, json=body, headers=headers["human"])
+    assert verdict_cli.status_code == 200, verdict_cli.text
+
+    post, get = bridge("human")
+    monkeypatch.setattr(mcp_server, "_api_post", post)
+    monkeypatch.setattr(mcp_server, "_api_get", get)
+    await mcp_server.hub_submit_review(
+        ids["mcp"], "changes_requested", comments="нужно ещё", expected_generation=1
+    )
+    for label in ("rest", "cli", "mcp"):
+        task = (
+            await client.get(f"/api/tasks/{ids[label]}", headers=headers["human"])
+        ).json()
+        assert task["status"] == "running", (label, task["status"])
+
+    # --- чтение истории: комплект поколения 1 виден на карточке и в MCP ---
+    history = (
+        await client.get(f"/api/tasks/{ids['rest']}/evidence", headers=headers["human"])
+    ).json()
+    assert [(h["generation"], h["ac_id"]) for h in history] == [
+        (1, "AC-1"),
+        (1, "AC-2"),
+    ]
+    card = (
+        await client.get(f"/api/tasks/{ids['rest']}", headers=headers["human"])
+    ).json()
+    assert [e["ac_id"] for e in card["evidence"]] == ["AC-1", "AC-2"]
+    status = await mcp_server.hub_task_status(ids["rest"], full=True)
+    assert "AC-1" in json.dumps(status.structuredContent["task"]["evidence"])
+
+    # Существующие commit-сценарии не ослаблены: commit-задача прежней формы.
+    plain = await client.post(
+        "/api/tasks", json={"title": "commit"}, headers=headers["human"]
+    )
+    assert plain.json()["result_kind"] == "commit" and plain.json()["rollback"] == ""

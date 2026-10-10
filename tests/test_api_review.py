@@ -20,8 +20,12 @@ cheaper verdict anonymous is how a gate quietly softens.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from httpx import AsyncClient
+
+from hub import repository as repo
 
 
 async def _task_in_review(
@@ -379,3 +383,113 @@ async def test_a_verdict_with_no_body_is_not_a_repeat(client: AsyncClient):
     resp = await _verdict(client, task_id, verdict="approved", agent="rev")
 
     assert resp.status_code == 200, resp.text
+
+
+# ---- #1647: вердикт по задаче-состоянию привязан к поколению и к человеку ----
+
+
+async def test_state_approval_is_human_and_bound_to_generation(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-4: APPROVED по state — только is_human и только с верным поколением.
+
+    Агентский APPROVED отказан на default и на другом проекте; человеческий без
+    поколения или с чужим — 409 без записей; верный завершает задачу в одной
+    транзакции (via=state_approved), поколение не растёт, родитель пересчитан.
+    CHANGES_REQUESTED возвращает в running, пересдача — поколение 2 с новым
+    комплектом при сохранённом первом; форма с поколением 1 после этого — 409.
+    """
+    from tests.state_support import (
+        auth,
+        drive_to_review,
+        evidence_rows,
+        events,
+        fingerprint,
+        make_project,
+        make_state_task,
+    )
+
+    headers = auth(monkeypatch)
+    other = await make_project(db, "state-other")
+
+    async def verdict(task_id, who, verdict_name, **body):
+        return await client.post(
+            f"/api/tasks/{task_id}/review-verdict",
+            json={"verdict": verdict_name, "agent": "x", **body},
+            headers=headers[who],
+        )
+
+    scenarios = (
+        ("default", dict(under_feature=True)),
+        ("другой проект", dict(project_id=other)),
+    )
+    for label, kwargs in scenarios:
+        task_id = await make_state_task(db, title=f"state {label}", **kwargs)
+        await drive_to_review(client, db, task_id, headers=headers["impl"])
+        parent_id = dict(await repo.get_task(db, task_id))["parent_id"]
+        before = await fingerprint(db, task_id)
+
+        agent_try = await verdict(task_id, "rev", "approved", expected_generation=1)
+        assert agent_try.status_code == 403, (
+            label,
+            agent_try.status_code,
+            agent_try.text,
+        )
+        for stale in ({}, {"expected_generation": 0}, {"expected_generation": 2}):
+            resp = await verdict(task_id, "human", "approved", **stale)
+            assert resp.status_code == 409, (label, stale, resp.status_code, resp.text)
+        assert await fingerprint(db, task_id) == before, (
+            label,
+            "отказанные вердикты не оставляют записей",
+        )
+
+        ok = await verdict(task_id, "human", "approved", expected_generation=1)
+        assert ok.status_code == 200, (label, ok.text)
+        body = ok.json()
+        assert body["status"] == "completed", (label, body["status"])
+        assert body["submission_generation"] == 1, "поколение не растёт"
+        completed = await events(db, task_id, "task_completed")
+        assert [json.loads(e["payload"]).get("via") for e in completed] == [
+            "state_approved"
+        ], (label, completed)
+        assert dict(await repo.get_task(db, parent_id))["status"] == "completed", (
+            label,
+            "родитель пересчитан",
+        )
+        again = await verdict(task_id, "human", "approved", expected_generation=1)
+        assert again.status_code == 409, "повтор после завершения — 409"
+
+    # CHANGES_REQUESTED и пересдача: поколение 2, комплект 1 сохранён.
+    cycle = await make_state_task(db, title="цикл", project_id=other)
+    await drive_to_review(client, db, cycle, headers=headers["impl"])
+    back = await verdict(
+        cycle,
+        "rev",
+        "changes_requested",
+        comments="AC-2: нет наблюдения с резолвера",
+        expected_generation=1,
+    )
+    assert back.status_code == 200, back.text
+    assert back.json()["status"] == "running"
+    from tests.state_support import evidence_for, submit
+
+    resent = await submit(
+        client,
+        cycle,
+        evidence_for(observed="повторное наблюдение"),
+        headers=headers["impl"],
+    )
+    assert resent.status_code == 200, resent.text
+    assert resent.json()["submission_generation"] == 2
+    rows = await evidence_rows(db, cycle)
+    assert sorted((r["generation"], r["ac_id"]) for r in rows) == [
+        (1, "AC-1"),
+        (1, "AC-2"),
+        (2, "AC-1"),
+        (2, "AC-2"),
+    ]
+    stale_form = await verdict(cycle, "human", "approved", expected_generation=1)
+    assert stale_form.status_code == 409, stale_form.text
+    assert dict(await repo.get_task(db, cycle))["status"] == "review"
+    final = await verdict(cycle, "human", "approved", expected_generation=2)
+    assert final.status_code == 200 and final.json()["status"] == "completed"

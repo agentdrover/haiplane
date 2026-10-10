@@ -22,6 +22,8 @@ from fastapi import (
     status,
 )
 from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -1852,6 +1854,24 @@ async def api_get_task(task_id: int, request: Request):
     return await services.enrich_task_view(db, task_view)
 
 
+@app.get("/api/tasks/{task_id}/evidence", response_model=list[models.TaskEvidenceView])
+async def api_task_evidence(
+    task_id: int, request: Request, generation: int | None = None
+):
+    """Доказательства сдач задачи-состояния по поколениям (#1647).
+
+    Пусто у commit-задачи и у state-задачи, которую ещё не сдавали. Строки
+    только читаются: таблица insert-only, ни правки, ни удаления через API нет.
+    """
+    db = _db(request)
+    if not await repo.get_task(db, task_id):
+        raise HTTPException(404, "task not found")
+    return [
+        models.TaskEvidenceView(**dict(row))
+        for row in await repo.list_task_evidence(db, task_id, generation)
+    ]
+
+
 @app.get("/api/tasks/{task_id}/verdict-route")
 async def api_get_verdict_route(task_id: int, request: Request, observe: bool = False):
     """Who will write the verdict for the current submission (#1440).
@@ -2333,19 +2353,47 @@ async def api_task_context(
     }
 
 
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError):
+    """422 тела запроса. Для сдачи значения запроса в ответ не попадают (#1647).
+
+    Внешнее тело сдачи state-задачи несёт evidence, а в observed может лежать
+    секрет: стандартный ответ pydantic возвращает ``input`` целиком. Для этого
+    маршрута остаются место и вид ошибки; остальные маршруты — как были.
+    """
+    if request.url.path.endswith("/submit-review"):
+        errors = [
+            {
+                "loc": list(e.get("loc", ())),
+                "type": e.get("type", ""),
+                "msg": e.get("msg", ""),
+            }
+            for e in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": errors})
+    return await request_validation_exception_handler(request, exc)
+
+
 @app.post("/api/tasks/{task_id}/submit-review", response_model=TaskView)
 async def api_submit_for_review(
     task_id: int,
     request: Request,
     body: TaskSubmitReview | None = None,
+    identity=Depends(current_identity),
 ):
     """Submit the current work of a pair task for client-driven review (#307).
 
     Canonical REST operation behind hub_submit_for_review and the
     ``oc-hub submit-review`` CLI: running pair task → status=review with a
     bumped submission generation.
+
+    State tasks (#1647) are submitted with ``evidence`` — one record per AC —
+    and their author is the authenticated principal: ``agent`` in the body is
+    only a signature.
     """
-    return await services.submit_for_review(_db(request), task_id, body)
+    return await services.submit_for_review(
+        _db(request), task_id, body, principal_id=identity.principal_id
+    )
 
 
 @app.post("/api/tasks/{task_id}/machine-review", response_model=MachineReviewView)
@@ -2404,7 +2452,9 @@ async def api_review_verdict(
 
     Canonical REST operation behind hub_submit_review and the
     ``oc-hub review-verdict`` CLI. Client-driven review returns the task to
-    ``running``; this endpoint never completes a task.
+    ``running``; for a commit task this endpoint never completes it. A state
+    task (result_kind=state, #1647) is completed by a human APPROVED with the
+    right ``expected_generation`` (event via=state_approved).
 
     Finding scope (#435): each finding carries ``scope``
     (in_scope|out_of_scope, default in_scope) and an optional
@@ -2434,6 +2484,9 @@ async def api_review_verdict(
         self_approved=self_approved,
         principal_id=identity.principal_id,
         agent_caller=identity.is_agent,
+        # #1647: APPROVED по задаче-состоянию — только от человека; признак
+        # берётся из аутентифицированной личности, а не из тела запроса.
+        human_caller=identity.is_human,
     )
 
 

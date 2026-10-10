@@ -1110,3 +1110,75 @@ async def test_record_workspace_missing_does_not_commit_callers_transaction(
     assert _workspace_alerts(await repo.get_task_updates(db, task_id))
     await db.rollback()
     assert not _workspace_alerts(await repo.get_task_updates(db, task_id))
+
+
+# --- #1647 AC-1: профиль DoR задачи-состояния ---
+
+
+async def test_state_task_dor_profile_drops_code_checks_and_requires_rollback(
+    client, db: aiosqlite.Connection
+):
+    """AC-1: state = профиль work_type минус две кодовые проверки плюс две свои.
+
+    Первая задача проходит без affected_areas/validation_commands, без штрафа и
+    без кодовых рекомендаций. Без rollback и с test-AC она не проходит, причина
+    названа. Commit-близнец даёт прежний результат. Feature/epic с
+    result_kind=state отклоняются 422 на создании и на refine.
+    """
+    from hub.services.recommendations import calculate_readiness_with_recommendations
+    from tests.state_support import make_state_task
+
+    ok = await make_state_task(db)
+    result = await evaluate_dor(db, ok)
+    assert result.passed is True, (
+        "state с полной базовой постановкой, rollback и manual/log_check AC обязана "
+        f"проходить без кодовых проверок; не хватает {sorted(result.missing_required)}"
+    )
+    assert not {"has_affected_areas", "has_validation_commands"} & result.required
+    report = await calculate_readiness_with_recommendations(db, ok)
+    assert report.score == 100, f"неприменимые проверки не штрафуют: {report.score}"
+    code_recs = [
+        r.field
+        for r in report.recommendations
+        if r.field in ("affected_areas", "validation_commands")
+    ]
+    assert code_recs == [], f"кодовые рекомендации у state: {code_recs}"
+
+    no_rollback = await make_state_task(db, rollback=None)
+    missing = (await evaluate_dor(db, no_rollback)).missing_required
+    assert "has_rollback" in missing, sorted(missing)
+
+    only_test_ac = await make_state_task(db, kinds=("test",))
+    bad = await evaluate_dor(db, only_test_ac)
+    assert "has_state_ac" in bad.missing_required, sorted(bad.missing_required)
+    detail = next(c.detail for c in bad.checks if c.key == "has_state_ac")
+    assert "manual" in detail and "log_check" in detail and "ui_check" in detail
+
+    commit_twin = await make_state_task(db, result_kind="commit")
+    twin = await evaluate_dor(db, commit_twin)
+    assert {"has_affected_areas", "has_validation_commands"} <= twin.missing_required
+    assert "has_rollback" not in {c.key for c in twin.checks}, (
+        "у commit-задачи пунктов state нет вовсе: прежний результат"
+    )
+
+    for task_type in ("feature", "epic"):
+        created = await client.post(
+            "/api/tasks",
+            json={"title": "агрегат", "task_type": task_type, "result_kind": "state"},
+        )
+        assert created.status_code == 422, (task_type, created.text)
+    epic = await client.post("/api/tasks", json={"title": "эпик", "task_type": "epic"})
+    aggregate = await client.post(
+        "/api/tasks",
+        json={
+            "title": "фича",
+            "task_type": "feature",
+            "parent_id": epic.json()["id"],
+            "source": "agent",
+        },
+    )
+    assert aggregate.json()["status"] == "draft", aggregate.text
+    refined = await client.post(
+        f"/api/tasks/{aggregate.json()['id']}/refine", json={"result_kind": "state"}
+    )
+    assert refined.status_code == 422, refined.text

@@ -805,3 +805,60 @@ async def test_a_deferred_task_is_skipped_until_the_wait_lapses(db):
     )
     await db.commit()
     assert (await oq.next_task(db, project))["next_task_id"] == deferred
+
+
+# ---------------------------------------------------------------------------
+# #1647: задача-состояние не область кода
+# ---------------------------------------------------------------------------
+
+
+async def _as_state(db, task_id: int) -> int:
+    from hub.models import TaskRefine
+
+    await repo.update_task_structured(
+        db, task_id, TaskRefine(result_kind="state", rollback="вернуть как было")
+    )
+    await db.commit()
+    return task_id
+
+
+async def test_state_task_is_not_an_undeclared_code_area(db):
+    """AC-9: claim_area_check=require — state стартует, соседи не блокируются.
+
+    Активная state-задача без affected_areas не считается неизвестной областью
+    кода (active_area_undeclared) для свободной commit-задачи; сама state не
+    сверяется по путям и стартует рядом с активной commit-задачей.
+    """
+    project = await _project(
+        db,
+        "state-area",
+        {"claim_area_check": "require", "orchestrator_queue": "shadow"},
+    )
+    pid = int(project["id"])
+
+    active_state = await _as_state(db, await _task(db, pid, status="running", areas=[]))
+    commit_free = await _task(db, pid, areas=["docs/free.md"], title="commit")
+
+    answer = await oq.next_task(db, project)
+    assert answer["next_task_id"] == commit_free, answer
+    assert not [
+        s for s in answer["skipped"] if s["reason"] == oq.SKIP_ACTIVE_UNDECLARED
+    ], answer["skipped"]
+    claimed = await _claim(db, commit_free)
+    assert claimed.status == "claimed", (
+        "commit-задача не блокируется как active_area_undeclared"
+    )
+
+    # Обратное направление: state старует рядом с активной commit-задачей.
+    other = await _project(
+        db,
+        "state-area-2",
+        {"claim_area_check": "require", "orchestrator_queue": "shadow"},
+    )
+    oid = int(other["id"])
+    await _task(db, oid, status="running", areas=[_A_PATH], title="active commit")
+    candidate = await _as_state(db, await _task(db, oid, areas=[], title="state cand"))
+    assert (await _claim(db, candidate)).status == "claimed"
+    assert (await _pair_start(db, candidate, agent="exec-b")).status == "running"
+    assert await _overlap_records(db, candidate) == []
+    assert await _status(db, active_state) == "running"

@@ -54,6 +54,7 @@ from hub.services import call_sites, project_policy, review_ci_gate
 from hub.services.auto_approve import decider_hits
 from hub.services.metrics_scope import Scope
 from hub.services.model_family import family
+from hub.services.result_kind import automation_not_applicable
 from hub.services.orchestration import ORIGINAL_READ_SQL
 from hub.services.project_policy import gate_policy_of, review_dispatch_enabled
 
@@ -2460,6 +2461,8 @@ async def maybe_top_up_incomplete(db: aiosqlite.Connection, task_id: int) -> boo
     if row is None:
         return False
     task = dict(row)
+    if automation_not_applicable(task):
+        return False  # #1647: добор лестницы к state-задаче не применяется
     generation = task.get("submission_generation") or 0
     if task.get("status") != "review" or generation <= 0:
         return False
@@ -4388,7 +4391,14 @@ async def maybe_dispatch_review(
     if row is None:
         return False
     task = dict(row)
-    if task.get("status") != "review" or task.get("review_job_id"):
+    # #1647: единый предикат первым в том же условии. Все пять входов (сдача,
+    # добор лестницы, повторный заказ, вторая ось, вторая дверь) сходятся сюда.
+    # Раньше state отказывал бы случайно — «нет ветки»; теперь по результату.
+    if (
+        automation_not_applicable(task)
+        or task.get("status") != "review"
+        or task.get("review_job_id")
+    ):
         return False
     generation = task.get("submission_generation") or 0
     branch = (task.get("branch") or "").strip()
@@ -5054,6 +5064,9 @@ async def dispatch_local_review(
     03.10, потолок про деньги Cursor), и не-deep отклоняется молча: lite остаётся в облаке.
     """
     task_id = int(task["id"])
+    if automation_not_applicable(task):
+        # #1647: свой затвор у второй двери — её зовут и мимо maybe_dispatch_review.
+        return False
     reach = await review_reach(db, forge)
     principal_id = await local_reviewer_principal_id(db)
     if LOCAL_CHANNEL not in reach.ways or principal_id is None:

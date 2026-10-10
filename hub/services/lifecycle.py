@@ -37,6 +37,7 @@ from hub.actionable_errors import (
 from hub import repository as repo
 from hub.services.dor_snapshot import DorSnapshot, load_dor_snapshot
 from hub.services.sessions import note_session_task
+from hub.services.result_kind import is_state
 from hub.hub_instance import mutation_activity_detail
 from hub.db import (
     deserialize_str_list,
@@ -226,8 +227,8 @@ async def _try_restore_pair_workspace(
 ) -> None:
     """Best-effort workspace restore; must not break lifecycle transitions (#451)."""
     row = await repo.get_task(db, task_id)
-    if _git_mode_is_remote(row):
-        return
+    if _git_mode_is_remote(row) or is_state(row):
+        return  # #1647: у задачи-состояния рабочей копии нет ни в каком режиме
     try:
         await restore_pair_workspace_base(db, task_id)
     except Exception as exc:
@@ -261,7 +262,7 @@ async def _try_switch_pair_workspace_to_task(
 ) -> None:
     """Best-effort workspace switch to the task branch for rework (#457)."""
     row = await repo.get_task(db, task_id)
-    if _git_mode_is_remote(row):
+    if _git_mode_is_remote(row) or is_state(row):
         return
     try:
         await switch_pair_workspace_to_task(db, task_id)
@@ -449,8 +450,14 @@ async def reset_mis_issued_assignment(
     return True
 
 
-async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
-    """Auto-complete feature/epic when every direct child is terminal (#742)."""
+async def maybe_rollup_parent(
+    db: aiosqlite.Connection, child_id: int, *, commit: bool = True
+) -> None:
+    """Auto-complete feature/epic when every direct child is terminal (#742).
+
+    ``commit=False`` (#1647) — внутри транзакции вызывающего: свёртка не
+    фиксирует её раньше времени, владелец коммитит или откатывает всё сам.
+    """
     row = await repo.get_task(db, child_id)
     if not row:
         return
@@ -488,15 +495,16 @@ async def maybe_rollup_parent(db: aiosqlite.Connection, child_id: int) -> None:
     ):
         refreshed = await repo.get_task(db, parent_id)
         if refreshed and dict(refreshed)["status"] == "completed":
-            await maybe_rollup_parent(db, parent_id)
+            await maybe_rollup_parent(db, parent_id, commit=commit)
         return
 
     await log_activity(
         db,
         "task_completed",
         f"Task #{parent_id} auto-completed: all children done",
+        commit=commit,
     )
-    await maybe_rollup_parent(db, parent_id)
+    await maybe_rollup_parent(db, parent_id, commit=commit)
 
 
 async def repair_stale_parent_completions(db: aiosqlite.Connection) -> int:
@@ -886,6 +894,11 @@ async def enrich_task_view(
     row = await repo.get_task(db, task_view.id)
     if row:
         task_dict = dict(row)
+        if is_state(task_dict):
+            # #1647: доказательства всех поколений — на единичном чтении карточки.
+            from hub.services.state_task import evidence_views
+
+            task_view.evidence = await evidence_views(db, task_view.id)
         task_view.lifecycle_hint = compute_lifecycle_hint(task_dict)
         task_view.outcome_status = await outcome_status_for_task(db, task_dict)
         # #917: single-task read only, and only for a defect with a release —
@@ -1061,6 +1074,12 @@ async def create_task(
                 parent_id=body.parent_id,
             ),
         )
+    if is_state(body) and body.run_immediately:
+        # #1647: до вставки строки — отказ не оставляет задачи, брони и job.
+        from hub.services.state_task import refusal_for_door
+
+        raise refusal_for_door("run_immediately")
+    await _refuse_state_parent(db, body.parent_id)
 
     # Bind an epic to a project at creation (#346). Only epics carry
     # project_id — children resolve it by walking up to the root epic.
@@ -1082,6 +1101,11 @@ async def create_task(
         # пропускала бы работу, запрещённую уже действующей заморозкой.
         if owns_tx:
             await db.execute("BEGIN IMMEDIATE")
+        # #1647: тот же вопрос ещё раз — под замком, которым защищена вставка:
+        # конкурентный refine мог перевести листовой draft в state после первой
+        # проверки. Refine читает детей под своей транзакцией, значит из двух
+        # операций выигрывает одна.
+        await _refuse_state_parent(db, body.parent_id)
         if idem_key:
             existing = await repo.get_task_idempotency_key(db, idem_key)
             if existing:
@@ -1223,6 +1247,19 @@ async def _require_bulk_admission(
         )
 
 
+async def _refuse_state_parent(db: aiosqlite.Connection, parent_id: int | None) -> None:
+    """Задача-состояние — лист: детей у неё не бывает (#1647)."""
+    if parent_id is None:
+        return
+    parent = await repo.get_task(db, parent_id)
+    if parent is not None and is_state(parent):
+        raise HTTPException(
+            422,
+            f"task #{parent_id} is a state task (result_kind=state): it is a "
+            "leaf and cannot have child tasks",
+        )
+
+
 async def create_subtasks_bulk(
     db: aiosqlite.Connection,
     parent_id: int,
@@ -1248,6 +1285,7 @@ async def create_subtasks_bulk(
 
     if await repo.get_task(db, parent_id) is None:
         raise HTTPException(404, "parent task not found")
+    await _refuse_state_parent(db, parent_id)
 
     if body.source == TaskSource.agent:
         initial_status = "draft"
@@ -1272,6 +1310,7 @@ async def create_subtasks_bulk(
 
     created_ids: list[int] = []
     async with write_transaction(db):
+        await _refuse_state_parent(db, parent_id)  # #1647: под замком вставки
         if initial_status != "draft":
             await _require_bulk_admission(db, parent_id, body.items)
         await db.execute("SAVEPOINT bulk_child_tasks")
@@ -1289,6 +1328,8 @@ async def create_subtasks_bulk(
                     run_immediately=False,
                     work_type=item.work_type,
                     freeze_rationale=item.freeze_rationale,
+                    result_kind=item.result_kind,
+                    rollback=item.rollback,
                 )
                 task_id = await repo.create_task_full(
                     db,
@@ -1561,6 +1602,12 @@ async def approve_task(
         )
 
     body = body or TaskApprove()
+    if body.run and is_state(task):
+        # #1647: запуск headless для state отказывает до одобрения, чтобы
+        # отказ не оставил задачу одобренной, но не запущенной.
+        from hub.services.state_task import refusal_for_door
+
+        raise refusal_for_door("approve_run")
     if caller_owns_tx and body.run:
         # Запуск (review_limit, dispatch_task) коммитит сам; внутри чужой
         # транзакции это закоммитило бы её. Ошибка вызывающего, до любой записи.
@@ -1956,6 +2003,11 @@ async def start_task(
             400,
             f"can only start open tasks, current status: {task['status']}",
         )
+    if is_state(task):
+        # #1647: headless для state — до плана, брони и смены статуса.
+        from hub.services.state_task import refusal_for_door
+
+        raise refusal_for_door("start")
     # #1232: before anything is written — the plan update below is a write, and
     # a task refused after it would carry a plan for work it never began.
     await refuse_opening_without_subject(db, task_id, task)
@@ -2043,7 +2095,13 @@ async def _pair_start_write(
 
     git_mode = body.git_mode
     slug = (body.branch_slug or "").strip()
-    if git_mode == PairGitMode.remote:
+    if is_state(task):
+        # #1647: у задачи-состояния нет ни ветки, ни worktree; git не зовётся ни
+        # в одном режиме. Записанный remote держит и последующие места (сдача,
+        # возврат в работу) подальше от git хоста хаба.
+        git_mode = PairGitMode.remote
+        branch = ""
+    elif git_mode == PairGitMode.remote:
         # Record the canonical name only. The caller creates this branch in
         # its own clone; the hub host must not checkout, clean, or worktree.
         branch = canonical_task_branch(task_id, slug, task.get("title") or "")
@@ -2096,6 +2154,11 @@ async def _pair_start_write(
         await note_session_task(db, declared_session, task_id)
     await db.commit()
     return git_mode
+
+
+def _worktree_hint_for(task: dict[str, Any], task_id: int) -> str:
+    """Подсказка worktree; у задачи-состояния её нет (#1647)."""
+    return "" if is_state(task) else _worktree_hint(task_id)
 
 
 def _worktree_hint(task_id: int) -> str:
@@ -2191,7 +2254,10 @@ async def pair_start_task(
     # #1232: here, for the same reason the session check above is here — what
     # follows writes the plan and prepares a branch, and a task refused after
     # that would leave both behind.
-    await refuse_opening_without_subject(db, task_id, task)
+    state_task = is_state(task)
+    if not state_task:
+        # #1647: предмет в базовой ветке — проверка по коду; у state кода нет.
+        await refuse_opening_without_subject(db, task_id, task)
     await refuse_opening_over_review_limit(db, task_id, task)
     # #1433: the same place for the same reason — refused before the plan and
     # the branch are written; the hold lasts until the transition is committed.
@@ -2200,7 +2266,10 @@ async def pair_start_task(
     # Ошибка чтения — данные (unreadable), а не отказ pair_start.
     from hub.services import working_rules
 
-    agent_rules = await working_rules.read_agent_rules(db, task_id)
+    # #1647: правила репозитория читает git; у задачи-состояния git не зовётся.
+    agent_rules = (
+        None if state_task else await working_rules.read_agent_rules(db, task_id)
+    )
     async with capture_areas(db, task_id, starting_status) as area_check:
         git_mode = await _pair_start_write(
             db,
@@ -2230,13 +2299,17 @@ async def pair_start_task(
     # Remote pair-start has no hub-host worktree (#975).
     if git_mode != PairGitMode.remote:
         tv.workspace_mode, tv.worktree_path = await pair_worktree_info(db, task_id)
+    tv.area_check = area_check
+    if state_task:
+        # #1647: ни подсказки worktree, ни правил репозитория, ни сверки с тем,
+        # что уехало в базу: постановка state-задачи не о коде.
+        return tv
     # #615: the statement may be older than the work that invalidated it. Told
     # HERE, on the server, so CLI and REST callers see it too — computing it in
     # the MCP tool would leave every other client blind.
     from hub.services.statement_freshness import statement_freshness
 
     tv.statement_freshness = await statement_freshness(db, dict(row))  # type: ignore[arg-type]
-    tv.area_check = area_check
     tv.worktree_hint = _worktree_hint(task_id)
     tv.working_rules = await working_rules.build_working_rules(db, task_id, agent_rules)
     return tv
@@ -3342,6 +3415,8 @@ async def submit_for_review(
     db: aiosqlite.Connection,
     task_id: int,
     body: TaskSubmitReview | None = None,
+    *,
+    principal_id: int | None = None,
 ) -> TaskView:
     """Submit the current work of a pair task for client-driven review (#305).
 
@@ -3372,6 +3447,13 @@ async def submit_for_review(
         raise HTTPException(404, "task not found")
     task = dict(row)
     body = body or TaskSubmitReview()
+    if is_state(task):
+        # #1647: задача-состояние сдаётся доказательствами, без ветки, CI и
+        # ревью; commit-конвейер ниже её не видит. ``principal_id`` — автор
+        # доказательств из идентичности вызывающего.
+        from hub.services.state_task import submit_state
+
+        return await submit_state(db, task_id, task, body, principal_id=principal_id)
 
     state = SubmitContext(db=db, task_id=task_id, task=task, body=body)
     await run_steps(state, SUBMIT_STEPS_BEFORE_SAME_SHA_CHECK)
@@ -4396,6 +4478,7 @@ async def record_review_verdict(
     claim: tuple[int, str] | None = None,
     agent_caller: bool = False,
     applied_by_steward: bool = False,
+    human_caller: bool = False,
 ) -> TaskView:
     """Record an explicit review verdict for the current submission (#305).
 
@@ -4403,7 +4486,9 @@ async def record_review_verdict(
     later resubmission automatically invalidates an APPROVED verdict. For
     client-driven review (status=review, no review_job_id) the task returns
     to ``running`` so the developer can fix findings or report done (#307);
-    headless transitions remain with the poller. Never a completion path.
+    headless transitions remain with the poller. Not a completion path for a
+    commit task; a state task (#1647) is routed to
+    ``state_task.record_state_verdict``, where a human APPROVED completes it.
 
     Content (#1010): ``changes_requested`` is refused without a reason —
     either one finding or a non-empty ``comments``. The refusal happens
@@ -4433,6 +4518,21 @@ async def record_review_verdict(
     if not row:
         raise HTTPException(404, "task not found")
     task = dict(row)
+    if is_state(task):
+        # #1647: вердикт по задаче-состоянию — только с поколением, APPROVED
+        # только от человека (``human_caller`` ставят REST и веб по личности
+        # вызывающего; стюард и автопилот его не ставят и отказываются здесь,
+        # даже если дверь выше них забыли закрыть).
+        from hub.services.state_task import record_state_verdict
+
+        return await record_state_verdict(
+            db,
+            task_id,
+            task,
+            body,
+            principal_id=principal_id,
+            human_caller=human_caller,
+        )
 
     state = VerdictContext(
         db=db,
@@ -4701,6 +4801,10 @@ async def _claim_write(
         "claimed_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
         "assigned_agent": body.agent,
     }
+    if is_state(await repo.get_task(db, task_id)):
+        # #1647: git_mode=remote уже на claim — release/cleanup до pair-start не
+        # идут в git хоста хаба.
+        claim_fields["git_mode"] = PairGitMode.remote.value
     if implementer_principal_id is not None:
         claim_fields["implementer_principal_id"] = implementer_principal_id
     await repo.update_task(db, task_id, **claim_fields)
@@ -4759,7 +4863,7 @@ async def claim_task(
             row = await repo.get_task(db, task_id)
             updates = await repo.get_task_updates(db, task_id)
             tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
-            tv.worktree_hint = _worktree_hint(task_id)
+            tv.worktree_hint = _worktree_hint_for(task, task_id)
             return tv
         holder = task.get("claimed_by") or "unknown"
         raise HTTPException(
@@ -4780,7 +4884,7 @@ async def claim_task(
             db, task_id, body, implementer_principal_id
         )
     if won_by_same_holder is not None:
-        won_by_same_holder.worktree_hint = _worktree_hint(task_id)
+        won_by_same_holder.worktree_hint = _worktree_hint_for(task, task_id)
         return won_by_same_holder
     await log_activity(
         db,
@@ -4793,7 +4897,7 @@ async def claim_task(
     updates = await repo.get_task_updates(db, task_id)
     tv = row_to_task(row, updates=updates)  # type: ignore[arg-type]
     tv.area_check = area_check
-    tv.worktree_hint = _worktree_hint(task_id)
+    tv.worktree_hint = _worktree_hint_for(task, task_id)
     return tv
 
 
@@ -5227,7 +5331,14 @@ async def return_to_work(
         raise HTTPException(404, "task not found")
     task = dict(row)
     from_status = task["status"]
-    if from_status not in RETURN_TO_WORK_STATUSES:
+    state_task = is_state(task)
+    # #1647: задачу-состояние возвращают и из running после отказного вердикта,
+    # и из needs_info, и из open (ушла по реестру сессий): без этой двери
+    # замороженную постановку нельзя было бы править.
+    allowed = RETURN_TO_WORK_STATUSES | (
+        {"running", "needs_info", "open"} if state_task else frozenset()
+    )
+    if from_status not in allowed:
         raise HTTPException(
             400,
             "can only return review or fix_requested tasks to work, "
@@ -5258,6 +5369,12 @@ async def return_to_work(
         # open task would keep it out of the pair delivery sweep later.
         job_id=None,
         review_job_id=None,
+        # #1647: явный возврат размораживает постановку на этом поколении.
+        **(
+            {"unfrozen_generation": int(task.get("submission_generation") or 0)}
+            if state_task
+            else {}
+        ),
     )
     await note_session_task(db, task.get("claim_session_id") or "", None)
     await repo.add_task_update(
@@ -5303,6 +5420,31 @@ async def return_to_work(
     row = await repo.get_task(db, task_id)
     updates = await repo.get_task_updates(db, task_id)
     return row_to_task(row, updates=updates)  # type: ignore[arg-type]
+
+
+async def _dispatch_rework(
+    db: aiosqlite.Connection, task_id: int, task: dict[str, Any], instructions: str
+) -> None:
+    """Rework commit-задачи после арбитража: fix-задание или, без него, open."""
+    message = plugins.dispatch.build_fix_message(
+        task_id=task_id,
+        title=task["title"],
+        description=task.get("description", ""),
+        review_comments=instructions,
+        review_cycle=0,
+        max_cycles=config.MAX_REVIEW_CYCLES,
+    )
+    runtime = task.get("runtime", "auto")
+    result = await plugins.dispatch.submit_task(
+        message, runtime=runtime, task_id=task_id
+    )
+    job_id = result.get("job_id")
+    if job_id:
+        await repo.update_task(db, task_id, status="fix_requested", job_id=job_id)
+    else:
+        await repo.update_task(db, task_id, status="open")
+        await reset_mis_issued_assignment(db, task_id, task)
+    await db.commit()
 
 
 async def decide_task(
@@ -5410,25 +5552,16 @@ async def decide_task(
         )
         await db.commit()
 
-        message = plugins.dispatch.build_fix_message(
-            task_id=task_id,
-            title=task["title"],
-            description=task.get("description", ""),
-            review_comments=instructions,
-            review_cycle=0,
-            max_cycles=config.MAX_REVIEW_CYCLES,
-        )
-        runtime = task.get("runtime", "auto")
-        result = await plugins.dispatch.submit_task(
-            message, runtime=runtime, task_id=task_id
-        )
-        job_id = result.get("job_id")
-        if job_id:
-            await repo.update_task(db, task_id, status="fix_requested", job_id=job_id)
+        if is_state(task):
+            # #1647: rework задачи-состояния не заказывает headless-задание —
+            # её руками делает человек или агент в pair. Задача возвращается в
+            # open (как при return-to-work): постановку можно править, затем
+            # новая сдача.
+            from hub.services.state_task import rework_without_dispatch
+
+            await rework_without_dispatch(db, task_id)
         else:
-            await repo.update_task(db, task_id, status="open")
-            await reset_mis_issued_assignment(db, task_id, task)
-        await db.commit()
+            await _dispatch_rework(db, task_id, task, instructions)
         await log_activity(
             db,
             "task_decided",
@@ -5575,6 +5708,11 @@ async def add_update(
         ) == "completed" and await repo.completed_by_poller_delivery(db, task_id):
             body = body.model_copy(update={"kind": "status"})
         else:
+            # #1647: done-отчёт state-задачи — не сдача и не завершение.
+            # До вставки строки: отказ не оставляет ни done-строки, ни bump.
+            from hub.services.state_task import refuse_done_report
+
+            refuse_done_report(task)
             _validate_done_report(task)
 
     # #498: work that never started its way out, named while the report is

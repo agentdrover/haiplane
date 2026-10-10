@@ -223,6 +223,34 @@ def _add_freeze_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _put_state_fields(body: dict[str, Any], args: argparse.Namespace) -> None:
+    """result_kind и rollback задачи-состояния (#1647); не заданные не шлются."""
+    if getattr(args, "result_kind", None):
+        body["result_kind"] = args.result_kind
+    if getattr(args, "rollback", None):
+        body["rollback"] = args.rollback
+
+
+def _add_result_kind_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--result-kind",
+        dest="result_kind",
+        choices=("commit", "state"),
+        default=None,
+        help=(
+            "commit (default) or state (#1647): the result is a state of the "
+            "world, submitted with evidence and accepted by a human; leaf "
+            "task/subtask only, changes only in draft"
+        ),
+    )
+    parser.add_argument(
+        "--rollback",
+        dest="rollback",
+        default=None,
+        help="How to undo a state result (required by DoR for state tasks)",
+    )
+
+
 def cmd_task(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {
         "title": args.title,
@@ -235,6 +263,7 @@ def cmd_task(args: argparse.Namespace) -> int:
         "priority": getattr(args, "priority", "medium"),
     }
     _put_freeze_fields(body, args)
+    _put_state_fields(body, args)
     if getattr(args, "parent", None) is not None:
         body["parent_id"] = args.parent
     if getattr(args, "owner", None):
@@ -263,6 +292,7 @@ def _cmd_create_typed(task_type: str) -> Any:
             "source": "human",
         }
         _put_freeze_fields(body, args)
+        _put_state_fields(body, args)
         if getattr(args, "parent", None) is not None:
             body["parent_id"] = args.parent
         if getattr(args, "owner", None):
@@ -787,6 +817,53 @@ def _put_mutations(body: dict[str, Any], args: argparse.Namespace) -> bool:
     return True
 
 
+#: Отказ CLI на битом --evidence (#1647): до сети. Входное значение не печатается.
+EVIDENCE_JSON_ERROR = "--evidence is not a JSON list"
+
+
+def _put_evidence(body: dict[str, Any], args: argparse.Namespace) -> bool:
+    """Положить доказательства задачи-состояния в тело; False — отказ напечатан.
+
+    Текст разбора не печатается: в нём могло быть значение из доказательства.
+    """
+    raw = getattr(args, "evidence", "") or ""
+    if not raw.strip():
+        return True
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        print(EVIDENCE_JSON_ERROR, file=sys.stderr)
+        return False
+    if not isinstance(parsed, list):
+        print(f"{EVIDENCE_JSON_ERROR}: got {type(parsed).__name__}", file=sys.stderr)
+        return False
+    body["evidence"] = parsed
+    return True
+
+
+def _add_state_submit_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--evidence",
+        default="",
+        help=(
+            "State task (#1647): JSON list, one record per AC: "
+            '[{"ac_id": "AC-1", "action": "...", "observed": "...", '
+            '"target": "...", "observed_at": "2026-10-09T12:00:00Z"}]. '
+            "Observations are depersonalised; secrets are refused."
+        ),
+    )
+
+
+def _add_state_verdict_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--expected-generation",
+        dest="expected_generation",
+        type=int,
+        default=None,
+        help="State task (#1647): the submission generation you judge (required)",
+    )
+
+
 def cmd_submit_review(args: argparse.Namespace) -> int:
     body: dict[str, Any] = {}
     if args.agent:
@@ -798,7 +875,7 @@ def cmd_submit_review(args: argparse.Namespace) -> int:
         body["model"] = model
     if not (_put_finding_outcomes(body, args) and _put_prevention(body, args)):
         return 2
-    if not _put_mutations(body, args):
+    if not _put_mutations(body, args) or not _put_evidence(body, args):
         return 2
     result = _api("POST", f"/api/tasks/{args.task_id}/submit-review", body)
     _print_json(result)
@@ -827,6 +904,8 @@ def cmd_review_verdict(args: argparse.Namespace) -> int:
         body["findings"] = findings
     if getattr(args, "create_tasks_for_out_of_scope", False):
         body["create_tasks_for_out_of_scope"] = True
+    if getattr(args, "expected_generation", None) is not None:
+        body["expected_generation"] = args.expected_generation
     result = _api("POST", f"/api/tasks/{args.task_id}/review-verdict", body)
     _print_json(result)
     return 0
@@ -1073,6 +1152,8 @@ _REFINE_SCALAR_FIELDS: tuple[tuple[str, str], ...] = (
     ("title", "title"),
     ("work_type", "work_type"),
     ("freeze_rationale", "freeze_rationale"),
+    ("result_kind", "result_kind"),
+    ("rollback", "rollback"),
     ("class_of_service", "class_of_service"),
     ("size", "size"),
     ("wip_tag", "wip_tag"),
@@ -2143,6 +2224,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Idempotency key for safe retries (maps to X-Client-Request-Id)",
     )
     _add_freeze_args(p_task)
+    _add_result_kind_args(p_task)
     p_task.set_defaults(func=cmd_task, task_type="task")
 
     # epic — create an epic
@@ -2184,6 +2266,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_subtask.add_argument("--owner", default="", help="Human owner")
     p_subtask.add_argument("--reviewer", default="", help="Human reviewer")
     _add_freeze_args(p_subtask)
+    _add_result_kind_args(p_subtask)
     p_subtask.set_defaults(func=_cmd_create_typed("subtask"))
 
     _add_subtasks_bulk_parser(sub)
@@ -2395,6 +2478,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     _done_report_options(p_submit_review)
+    _add_state_submit_args(p_submit_review)
     p_submit_review.set_defaults(func=cmd_submit_review)
 
     p_review_brief = sub.add_parser(
@@ -2434,6 +2518,7 @@ def build_parser() -> argparse.ArgumentParser:
             "without linked_task_id (#436); drafts still need human approval"
         ),
     )
+    _add_state_verdict_args(p_review_verdict)
     p_review_verdict.set_defaults(func=cmd_review_verdict)
 
     p_steward_judgement = sub.add_parser(
@@ -2777,6 +2862,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="As a <role> I want <X> so that <Y>",
     )
+    _add_result_kind_args(p_refine)
     p_refine.add_argument("--problem", dest="problem", default=None)
     p_refine.add_argument("--value", dest="value", default=None, help="Business value")
     p_refine.add_argument(
@@ -3228,6 +3314,14 @@ def build_parser() -> argparse.ArgumentParser:
 def _worktree_refusal(task: dict[str, Any], project: dict[str, Any], clone: str) -> str:
     """Why ``clone`` is not the project's clone; ``""`` when it is (#1515)."""
     import asyncio
+
+    if str(task.get("result_kind") or "") == "state":
+        # #1647: у задачи-состояния нет ветки и worktree; рабочая копия не
+        # создаётся ни при каком клоне.
+        return (
+            f"задача #{task.get('id')} — состояние (result_kind=state): у неё нет "
+            "ветки и worktree, работа идёт в мире, а не в репозитории"
+        )
 
     from hub.integrations.git_ops import origin_url, repo_slug
 

@@ -31,6 +31,7 @@ from hub.models import (
     MachineReviewView,
     claims_text_origin,
 )
+from hub.services.result_kind import automation_not_applicable
 from hub.services.steward_corridor import outcome_label, report_outcome
 
 log = logging.getLogger("hub")
@@ -467,6 +468,24 @@ async def record_machine_review(
     view = MachineReviewView(**dict(saved))
     view.is_current = view.submission_generation == generation
 
+    await _run_report_automation(db, task_id, task)
+
+    return view
+
+
+async def _run_report_automation(
+    db: aiosqlite.Connection, task_id: int, task: dict
+) -> None:
+    """Всё, что вешается на пришедший отчёт: круг ревью, автовердикт, добор.
+
+    Вынесено из ``record_machine_review`` (стоит на потолке по операторам). Для
+    задачи-состояния (#1647) отчёт записан и виден, а автоматику за ним не
+    запускает ничто: ни автовердикта, ни добора лестницы — ручной отчёт
+    человека остаётся справкой, не триггером.
+    """
+    if automation_not_applicable(task):
+        return
+
     # #1235: круг ревью — сколько поколений подряд автор закрывал находки и
     # получал новые. Считается ЗДЕСЬ, потому что заход виден ровно в момент,
     # когда приходит очередной отчёт с новыми находками: раньше его нет, а
@@ -502,5 +521,3 @@ async def record_machine_review(
         await maybe_top_up_incomplete(db, task_id)
     except Exception:  # noqa: BLE001 - degradation is the contract
         log.exception("review top-up failed for task #%s", task_id)
-
-    return view

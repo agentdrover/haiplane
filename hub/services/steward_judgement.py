@@ -31,6 +31,7 @@ from hub.models import (
     StewardJudgementView,
 )
 from hub.services.finding_identity import finding_uids, unresolved_uids
+from hub.services.result_kind import AUTOMATION_REFUSAL, automation_not_applicable
 from hub.services.gate_events import (
     STEWARD_APPLIED,
     STEWARD_ESCALATED,
@@ -226,6 +227,10 @@ async def record_steward_judgement(
     row = await repo.get_task(db, task_id)
     if row is None:
         raise HTTPException(404, "task not found")
+    if body.kind != "dor" and automation_not_applicable(row):
+        # #1647: суждение о СДАЧЕ state-задачи не принимается; о постановке
+        # (kind=dor) — принимается, оно не про сдачу.
+        raise HTTPException(409, AUTOMATION_REFUSAL)
     if expected_generation is not None:
         # The SAME guard the evidence door uses (#1120): one rule, two
         # entrances. A judgement filed for another generation — or for one
