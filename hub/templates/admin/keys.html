@@ -9,6 +9,7 @@
     <form class="admin-form"
           hx-post="/admin/keys/create"
           hx-target="#key-reveal-area" hx-swap="innerHTML">
+      {{ csrf_field() }}
         <div>
             <label for="ck-principal">Owner</label>
             <select id="ck-principal" name="principal_id" required>
