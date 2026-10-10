@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import math
 import os
@@ -31,8 +32,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent_eval import contract as ct
-from hub import config
-from hub.services.steward_canaries import Canary
+from hub.integrations import cursor_cloud
+from hub.services.steward_canaries import VALID_VERDICTS, Canary, evaluate
 
 #: Адрес, который не резолвится (RFC 6761): промпт идёт строго по рабочему
 #: шаблону, но попасть на настоящий хаб не может.
@@ -81,6 +82,9 @@ class Limits:
     call_timeout_s: float = 300.0
     deadline_s: float = 3600.0
     retry_delay_s: float = 1.0
+    #: Сколько токенов бронируется под вызов, пока факт не известен: бюджет
+    #: делится на число case, а не на размер промпта (агент читает репозиторий).
+    call_token_reserve: int = HARD_MAX_TOKENS // HARD_MAX_CASES
 
     def __post_init__(self) -> None:
         for name, ceiling in (
@@ -88,6 +92,7 @@ class Limits:
             ("max_runs_per_task", HARD_MAX_RUNS_PER_TASK),
             ("max_tokens", HARD_MAX_TOKENS),
             ("max_calls", HARD_MAX_CALLS),
+            ("call_token_reserve", HARD_MAX_TOKENS),
         ):
             value = getattr(self, name)
             _positive(name, value)
@@ -112,6 +117,9 @@ class ProviderRequest:
     prompt: str
     params: dict[str, Any]
     attempt: int
+    #: Срок runner-а на вызов: транспорт обязан уложиться раньше и сам остановить
+    #: облачного агента, иначе runner отменит его на ходу.
+    timeout_s: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -119,8 +127,12 @@ class ProviderReply:
     text: str = ""
     usage: dict[str, Any] | None = None
     error: str | None = None
-    #: Повторять можно только то, что заведомо не оставило живого агента.
+    #: Повторять можно только то, что ДОКАЗАННО не создало агента.
     retryable: bool = False
+    #: Доказано, что ничего не списано (отказ до создания).
+    no_charge: bool = False
+    #: Идентификаторы у провайдера — для ручного восстановления.
+    refs: dict[str, str] = field(default_factory=dict)
 
 
 class Transport(Protocol):
@@ -130,28 +142,89 @@ class Transport(Protocol):
     async def complete(self, request: ProviderRequest) -> ProviderReply: ...
 
 
+def default_ledger_path() -> Path:
+    """Общий ledger eval: каталог данных, не зависящий от ``--out``."""
+    base = os.environ.get("HAIPLANE_EVAL_DATA_DIR") or str(
+        Path.home() / ".haiplane-eval"
+    )
+    return Path(base) / "ledger.json"
+
+
 class RunLedger:
-    """Счётчик прогонов на задачу; с ``path`` переживает процесс."""
+    """Постоянный счёт прогонов и токенов под файловой блокировкой.
+
+    Брони делаются ДО платного вызова и под ``flock``, поэтому параллельные
+    процессы и задачи не могут вместе превысить лимиты. Нечитаемый файл —
+    отказ, а не ноль.
+    """
 
     def __init__(self, path: Path | None = None) -> None:
-        self._path = path
-        self._counts: dict[str, int] = {}
-        if path is not None and path.is_file():
+        self._path = Path(path) if path is not None else default_ledger_path()
+
+    def _transact(self, change: Callable[[dict[str, Any]], Any]) -> Any:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._path.with_suffix(".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
             try:
-                raw = json.loads(path.read_text())
-                self._counts = {str(k): int(v) for k, v in raw.items()}
-            except (ValueError, TypeError, AttributeError):
-                # Нечитаемый счёт не равен нулю: лучше отказать, чем сбросить.
-                self._counts = {"*": HARD_MAX_RUNS_PER_TASK}
+                state = self._load()
+                answer = change(state)
+                if not state.get("corrupt"):
+                    tmp = self._path.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(state, sort_keys=True))
+                    os.replace(tmp, self._path)
+                return answer
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
-    def used(self, task_id: int) -> int:
-        return max(self._counts.get(str(task_id), 0), self._counts.get("*", 0))
+    def _load(self) -> dict[str, Any]:
+        if not self._path.is_file():
+            return {"runs": {}, "tokens": 0}
+        try:
+            raw = json.loads(self._path.read_text())
+            return {
+                "runs": {str(k): int(v) for k, v in raw["runs"].items()},
+                "tokens": int(raw["tokens"]),
+            }
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return {"corrupt": True}
 
-    def record(self, task_id: int) -> None:
-        self._counts[str(task_id)] = self._counts.get(str(task_id), 0) + 1
-        if self._path is not None:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(self._counts, sort_keys=True))
+    def reserve_run(self, task_id: int, max_runs: int) -> bool:
+        def change(state: dict[str, Any]) -> bool:
+            if state.get("corrupt"):
+                return False
+            used = state["runs"].get(str(task_id), 0)
+            if used >= max_runs:
+                return False
+            state["runs"][str(task_id)] = used + 1
+            return True
+
+        return self._transact(change)
+
+    def reserve_tokens(self, amount: int, max_tokens: int) -> bool:
+        def change(state: dict[str, Any]) -> bool:
+            if state.get("corrupt") or state["tokens"] + amount > max_tokens:
+                return False
+            state["tokens"] += amount
+            return True
+
+        return self._transact(change)
+
+    def settle_tokens(self, reserved: int, actual: int) -> int:
+        """Бронь заменяется фактом; возвращает общий счёт."""
+
+        def change(state: dict[str, Any]) -> int:
+            if state.get("corrupt"):
+                return HARD_MAX_TOKENS + 1
+            state["tokens"] = max(0, state["tokens"] - reserved + actual)
+            return int(state["tokens"])
+
+        return self._transact(change)
+
+    def runs_used(self, task_id: int) -> int:
+        return int(self._transact(lambda s: s.get("runs", {}).get(str(task_id), 0)))
+
+    def tokens_used(self) -> int:
+        return int(self._transact(lambda s: s.get("tokens", 0)))
 
 
 @dataclass
@@ -179,42 +252,60 @@ def working_prompt_text() -> str:
     return ct.working_prompt_text()
 
 
+def fixed_prompt_text() -> str:
+    """Всё фиксированное, что уходит модели: рабочий шаблон + оценочная вставка."""
+    return working_prompt_text() + _EVAL_SUFFIX
+
+
+def fixed_prompt_hash() -> str:
+    return ct._sha256(fixed_prompt_text())
+
+
 def case_prompt(canary: Canary) -> str:
     facts = json.dumps(canary.facts, ensure_ascii=False, sort_keys=True)
-    return working_prompt_text() + _EVAL_SUFFIX + facts
+    return fixed_prompt_text() + facts
 
 
 def estimate_tokens(prompt: str) -> int:
     return math.ceil(len(prompt) / 3) + TOKEN_RESERVE
 
 
-def parse_judgement(text: str) -> dict[str, Any] | None:
-    """Первый JSON-объект с ``verdict``; из него берутся только verdict/confidence."""
+AMBIGUOUS = "ambiguous_answer"
+
+
+def _json_objects(text: str) -> list[dict[str, Any]]:
+    """Объекты верхнего уровня в тексте; вложенные внутрь найденного не берутся."""
     decoder = json.JSONDecoder()
-    for index, char in enumerate(text or ""):
-        if char != "{":
-            continue
+    found: list[dict[str, Any]] = []
+    index = 0
+    while (index := text.find("{", index)) != -1:
         try:
-            obj, _ = decoder.raw_decode(text[index:])
+            obj, end = decoder.raw_decode(text[index:])
         except ValueError:
+            index += 1
             continue
-        if isinstance(obj, dict) and "verdict" in obj:
-            out = {"verdict": obj.get("verdict")}
-            if "confidence" in obj:
-                out["confidence"] = obj.get("confidence")
-            return out
-    return None
+        if isinstance(obj, dict):
+            found.append(obj)
+        index += end
+    return found
+
+
+def parse_judgement(text: str) -> dict[str, Any] | None:
+    """Суждение из ответа: один вердикт — он; разные — ``ambiguous_answer``."""
+    objects = [o for o in _json_objects(text or "") if "verdict" in o]
+    if not objects:
+        return None
+    verdicts = {json.dumps(o.get("verdict"), sort_keys=True) for o in objects}
+    if len(verdicts) > 1:
+        return {"verdict": AMBIGUOUS}
+    out = {"verdict": objects[0].get("verdict")}
+    if "confidence" in objects[0]:
+        out["confidence"] = objects[0].get("confidence")
+    return out
 
 
 def _known_secrets() -> list[str]:
-    found = {
-        (config.CURSOR_API_KEY or "").strip(),
-        (config.STEWARD_HUB_TOKEN or "").strip(),
-    }
-    for name, value in os.environ.items():
-        if any(part in name.upper() for part in _SECRET_NAME_PARTS):
-            found.add(value.strip())
-    return sorted((s for s in found if len(s) >= 8), key=len, reverse=True)
+    return cursor_cloud.known_secrets()
 
 
 def redact(value: Any, secrets: Iterable[str]) -> Any:
@@ -239,30 +330,54 @@ def redact(value: Any, secrets: Iterable[str]) -> Any:
 
 
 class _Budget:
-    """Общий счёт всего вызова ``run_eval``: вызовы, токены, срок."""
+    """Счёт одного вызова ``run_eval``: вызовы, срок, остановка; токены — в ledger."""
 
-    def __init__(self, limits: Limits, clock: Callable[[], float]) -> None:
+    def __init__(
+        self, limits: Limits, clock: Callable[[], float], ledger: RunLedger
+    ) -> None:
         self.limits = limits
         self.clock = clock
+        self.ledger = ledger
         self.started = clock()
         self.calls = 0
         self.tokens = 0
+        #: (вид, сообщение): после остановки новые платные вызовы не начинаются.
+        self.halt: tuple[str, str] | None = None
 
-    def refusal(self, estimate: int) -> str | None:
+    def refusal(self) -> str | None:
         if self.calls >= self.limits.max_calls:
             return f"max_calls: достигнут лимит {self.limits.max_calls} вызовов"
         if self.clock() - self.started >= self.limits.deadline_s:
             return f"deadline: вышел общий срок {self.limits.deadline_s} с"
-        if self.tokens + estimate > self.limits.max_tokens:
-            return (
-                f"max_tokens: израсходовано {self.tokens}, следующий вызов "
-                f"не укладывается в {self.limits.max_tokens}"
-            )
         return None
 
-    def charge(self, reply: ProviderReply, estimate: int) -> None:
+    def reserve(self, amount: int) -> str | None:
+        if self.ledger.reserve_tokens(amount, self.limits.max_tokens):
+            return None
+        return (
+            f"max_tokens: бронь {amount} не укладывается в общий лимит "
+            f"{self.limits.max_tokens} (учтено {self.ledger.tokens_used()})"
+        )
+
+    def settle(self, reply: ProviderReply, reserved: int) -> int:
+        """Бронь -> факт. Неизвестный расход не бесплатен и останавливает прогон."""
         self.calls += 1
-        self.tokens += _tokens_of(reply.usage) or estimate
+        actual = _tokens_of(reply.usage)
+        proven_free = reply.no_charge or reply.retryable
+        charged = actual if actual is not None else (0 if proven_free else reserved)
+        total = self.ledger.settle_tokens(reserved, charged)
+        self.tokens += charged
+        if total > self.limits.max_tokens:
+            self.halt = (
+                "budget_exceeded",
+                f"израсходовано {total} токенов при лимите {self.limits.max_tokens}",
+            )
+        elif actual is None and not proven_free:
+            self.halt = (
+                "unknown_usage",
+                "провайдер не назвал расход: следующие case не запускаются",
+            )
+        return charged
 
 
 def _tokens_of(usage: dict[str, Any] | None) -> int | None:
@@ -271,30 +386,93 @@ def _tokens_of(usage: dict[str, Any] | None) -> int | None:
     parts = [usage.get(k) for k in ct.USAGE_KEYS]
     if any(not isinstance(p, int) or isinstance(p, bool) or p < 0 for p in parts):
         return None
-    return sum(parts) or None
+    return sum(parts)
 
 
 async def _guarded(
     transport: Transport, request: ProviderRequest, timeout: float
 ) -> ProviderReply:
+    refs = getattr(transport, "refs", None)
+
+    def known() -> dict[str, str]:
+        return dict(refs.get(request.session_id, {})) if isinstance(refs, dict) else {}
+
     try:
         return await asyncio.wait_for(transport.complete(request), timeout)
     except TimeoutError:
-        return ProviderReply(error=f"timeout: провайдер не ответил за {timeout} с")
+        return ProviderReply(
+            error=f"timeout: провайдер не ответил за {timeout} с", refs=known()
+        )
     except Exception as exc:  # noqa: BLE001 - любой сбой транспорта = не суждение
         # Только класс: текст исключения может нести ключ или адрес.
-        return ProviderReply(error=f"transport_error: {type(exc).__name__}")
+        return ProviderReply(
+            error=f"transport_error: {type(exc).__name__}", refs=known()
+        )
 
 
-def _response(case_id: str, reply: ProviderReply, started: float, now: float):
-    judgement = parse_judgement(reply.text)
-    latency = max(0.0, (now - started) * 1000.0)
+@dataclass
+class _Attempt:
+    number: int
+    reply: ProviderReply
+    charged: int
+    latency_ms: float
+
+    def judgement(self) -> dict[str, Any] | None:
+        return parse_judgement(self.reply.text)
+
+    def record(self) -> dict[str, Any]:
+        j = self.judgement()
+        return {
+            "attempt": self.number,
+            "error": self.reply.error,
+            "verdict": (j or {}).get("verdict"),
+            "tokens": self.charged,
+            "refs": self.reply.refs,
+            "no_charge": self.reply.no_charge,
+        }
+
+
+def _missed(canary: Canary, judgement: dict[str, Any] | None) -> bool:
+    """Вердикт из словаря, который оценщик #1108 НЕ засчитывает за поимку."""
+    if judgement is None or judgement.get("verdict") not in VALID_VERDICTS:
+        return False
+    return not evaluate(canary, judgement).caught
+
+
+def _pick(canary: Canary, attempts: list[_Attempt]) -> _Attempt:
+    """Попытка, которая решает case: критический провал не прячется повтором."""
+    for attempt in attempts:
+        if _missed(canary, attempt.judgement()):
+            return attempt
+    for attempt in reversed(attempts):
+        if attempt.judgement() is not None:
+            return attempt
+    return attempts[-1]
+
+
+def _sum_usage(attempts: list[_Attempt]) -> dict[str, Any] | None:
+    totals = {k: 0 for k in ct.USAGE_KEYS}
+    for attempt in attempts:
+        usage = attempt.reply.usage
+        if usage is None and attempt.reply.no_charge:
+            continue
+        if _tokens_of(usage) is None:
+            return None
+        for key in ct.USAGE_KEYS:
+            totals[key] += usage[key]
+    return totals
+
+
+def _aggregate(
+    case_id: str, canary: Canary, attempts: list[_Attempt]
+) -> ct.CaseResponse:
+    chosen = _pick(canary, attempts)
     return ct.CaseResponse(
         case_id=case_id,
-        judgement=judgement,
-        latency_ms=latency,
-        usage=reply.usage if isinstance(reply.usage, dict) else None,
-        error=reply.error or None,
+        judgement=chosen.judgement(),
+        latency_ms=sum(a.latency_ms for a in attempts),
+        usage=_sum_usage(attempts),
+        error=chosen.reply.error or None,
     )
 
 
@@ -303,23 +481,34 @@ async def _call_case(
     transport: Transport,
     budget: _Budget,
     base: ProviderRequest,
+    canary: Canary,
     sleep: Callable[[float], Awaitable[None]],
-) -> ct.CaseResponse:
-    estimate = estimate_tokens(base.prompt)
+) -> tuple[ct.CaseResponse, list[dict[str, Any]]]:
     limits = budget.limits
-    reply = ProviderReply(error="not_called")
-    started = budget.clock()
-    for attempt in range(1, limits.max_retries + 2):
-        why = budget.refusal(estimate)
+    reserve = max(limits.call_token_reserve, estimate_tokens(base.prompt))
+    attempts: list[_Attempt] = []
+    for number in range(1, limits.max_retries + 2):
+        why = budget.refusal() or budget.reserve(reserve)
         if why:
-            return ct.CaseResponse(case_id=base.case_id, error=why)
-        request = ProviderRequest(**{**base.__dict__, "attempt": attempt})
+            if attempts:
+                break
+            return ct.CaseResponse(case_id=base.case_id, error=why), []
+        request = ProviderRequest(
+            **{**base.__dict__, "attempt": number, "timeout_s": limits.call_timeout_s}
+        )
+        started = budget.clock()
         reply = await _guarded(transport, request, limits.call_timeout_s)
-        budget.charge(reply, estimate)
-        if not (reply.error and reply.retryable) or attempt > limits.max_retries:
+        charged = budget.settle(reply, reserve)
+        latency = max(0.0, (budget.clock() - started) * 1000.0)
+        attempts.append(_Attempt(number, reply, charged, latency))
+        if (
+            budget.halt
+            or not (reply.error and reply.retryable)
+            or number > limits.max_retries
+        ):
             break
         await sleep(limits.retry_delay_s)
-    return _response(base.case_id, reply, started, budget.clock())
+    return _aggregate(base.case_id, canary, attempts), [a.record() for a in attempts]
 
 
 def _meta(
@@ -349,18 +538,12 @@ async def _one_run(
     manifest: ct.Manifest,
     meta: ct.RunMeta,
     budget: _Budget,
-    live_opt_in: bool,
+    blocked: str | None,
     sleep: Callable[[float], Awaitable[None]],
     notes: list[str],
-) -> list[ct.CaseResponse]:
+) -> tuple[list[ct.CaseResponse], dict[str, list[dict[str, Any]]]]:
     responses: list[ct.CaseResponse] = []
-    blocked = (
-        "live_opt_in: живой транспорт без явного opt-in не вызывается"
-        if getattr(transport, "live", True) and not live_opt_in
-        else None
-    )
-    if blocked:
-        notes.append(blocked)
+    attempts: dict[str, list[dict[str, Any]]] = {}
     for index, (case, canary) in enumerate(
         zip(manifest.cases, manifest.canaries, strict=True)
     ):
@@ -369,6 +552,8 @@ async def _one_run(
                 f"max_cases: {len(manifest.cases) - index} case не запущено "
                 f"(лимит {budget.limits.max_cases})"
             )
+            break
+        if budget.halt:
             break
         if blocked:
             responses.append(ct.CaseResponse(case_id=case.case_id, error=blocked))
@@ -382,10 +567,28 @@ async def _one_run(
             params=dict(meta.params),
             attempt=1,
         )
-        responses.append(
-            await _call_case(transport=transport, budget=budget, base=base, sleep=sleep)
+        response, log_ = await _call_case(
+            transport=transport, budget=budget, base=base, canary=canary, sleep=sleep
         )
-    return responses
+        responses.append(response)
+        if log_:
+            attempts[case.case_id] = log_
+    return responses, attempts
+
+
+def _seal(
+    run: dict[str, Any],
+    attempts: dict[str, list[dict[str, Any]]],
+    halt: tuple[str, str] | None,
+) -> dict[str, Any]:
+    """Остановка по бюджету делает прогон неполным, а не зелёным."""
+    run["attempts"] = attempts
+    if halt:
+        run["problems"].append(
+            {"kind": halt[0], "case_id": "", "path": "budget", "message": halt[1]}
+        )
+        run["status"] = ct.derive_status(run["summary"], run["problems"])
+    return run
 
 
 async def run_eval(
@@ -405,20 +608,36 @@ async def run_eval(
     limits = limits or Limits()
     ledger = ledger if ledger is not None else RunLedger()
     manifest = ct.build_manifest(canaries)
-    prompt_hash = ct.working_prompt_hash()
+    prompt_hash = fixed_prompt_hash()
     catalog_hash = await ct.working_catalog_hash()
-    budget = _Budget(limits, clock)
+    budget = _Budget(limits, clock, ledger)
     result = EvalResult()
     secrets = _known_secrets()
+    blocked = (
+        "live_opt_in: живой транспорт без явного opt-in не вызывается"
+        if getattr(transport, "live", True) and not live_opt_in
+        else None
+    )
+    if blocked:
+        result.notes.append(blocked)
 
-    room = max(0, limits.max_runs_per_task - ledger.used(task_id))
-    if repeats > room:
-        result.truncated = True
-        result.notes.append(
-            f"max_runs_per_task: запрошено {repeats}, доступно {room} "
-            f"(лимит {limits.max_runs_per_task} на задачу #{task_id})"
-        )
-    for _ in range(min(repeats, room)):
+    for done in range(repeats):
+        if budget.halt:
+            result.truncated = True
+            result.notes.append(f"{budget.halt[0]}: {budget.halt[1]}")
+            break
+        # Слот прогона бронируется ДО первого платного вызова.
+        if (
+            not blocked
+            and manifest.cases
+            and not ledger.reserve_run(task_id, limits.max_runs_per_task)
+        ):
+            result.truncated = True
+            result.notes.append(
+                f"max_runs_per_task: прогон {done + 1} из {repeats} не начат "
+                f"(лимит {limits.max_runs_per_task} на задачу #{task_id})"
+            )
+            break
         run_id = uuid.uuid4().hex
         meta = _meta(
             transport,
@@ -428,19 +647,19 @@ async def run_eval(
             prompt_hash=prompt_hash,
             catalog_hash=catalog_hash,
         )
-        calls_before = budget.calls
-        responses = await _one_run(
+        responses, attempts = await _one_run(
             transport=transport,
             manifest=manifest,
             meta=meta,
             budget=budget,
-            live_opt_in=live_opt_in,
+            blocked=blocked,
             sleep=sleep,
             notes=result.notes,
         )
-        if budget.calls > calls_before:
-            ledger.record(task_id)
-        result.runs.append(redact(ct.build_run(manifest, responses, meta), secrets))
+        run = _seal(ct.build_run(manifest, responses, meta), attempts, budget.halt)
+        result.runs.append(redact(run, secrets))
+    if budget.halt:
+        result.notes.append(f"{budget.halt[0]}: {budget.halt[1]}")
     result.calls, result.tokens_used = budget.calls, budget.tokens
     result.notes = list(dict.fromkeys(result.notes))
     return result
@@ -470,6 +689,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--model", default="")
     parser.add_argument("--repo-url", default="")
+    parser.add_argument(
+        "--allowed-repo",
+        action="append",
+        default=[],
+        help="разрешённый eval-репозиторий owner/name (также HAIPLANE_EVAL_ALLOWED_REPOS)",
+    )
     parser.add_argument("--task-id", type=int, default=0)
     parser.add_argument("--commit", default="")
     parser.add_argument("--repeats", type=int, default=1)
@@ -487,15 +712,22 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     from agent_eval.cursor_adapter import CursorTransport
 
+    try:
+        transport = CursorTransport(
+            repo_url=args.repo_url, allowed_repos=args.allowed_repo or None
+        )
+    except ValueError as exc:
+        print(f"репозиторий отклонён: {exc}", file=sys.stderr)
+        return 2
     result = asyncio.run(
         run_eval(
-            transport=CursorTransport(repo_url=args.repo_url),
+            transport=transport,
             model=args.model,
             commit=args.commit,
             task_id=args.task_id,
             live_opt_in=True,
             repeats=args.repeats,
-            ledger=RunLedger(Path(args.out) / "ledger.json"),
+            ledger=RunLedger(),
         )
     )
     write_artifacts(result, Path(args.out))

@@ -11,7 +11,9 @@ import ast
 import asyncio
 import hashlib
 import json
+import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -28,6 +30,13 @@ from hub.services import steward_shadow  # noqa: E402
 
 COMMIT = "b" * 40
 MODEL = "test-judge-1"
+
+
+@pytest.fixture(autouse=True)
+def _eval_data_dir(tmp_path, monkeypatch):
+    """Ledger по умолчанию живёт в каталоге данных eval — здесь это tmp."""
+    monkeypatch.setenv("HAIPLANE_EVAL_DATA_DIR", str(tmp_path / "evaldata"))
+    monkeypatch.delenv("HAIPLANE_EVAL_ALLOWED_REPOS", raising=False)
 
 
 def _verdict_for(canary: sc.Canary) -> str:
@@ -78,7 +87,24 @@ def _eval(transport, **kw):
     kw.setdefault("model", MODEL)
     kw.setdefault("commit", COMMIT)
     kw.setdefault("task_id", 1222)
+    kw.setdefault("ledger", _scratch_ledger())
     return _run(rn.run_eval(transport=transport, **kw))
+
+
+def _scratch_ledger():
+    import os
+    import uuid
+
+    return rn.RunLedger(
+        Path(os.environ["HAIPLANE_EVAL_DATA_DIR"]) / f"scratch-{uuid.uuid4().hex}.json"
+    )
+
+
+def _fresh(tmp_path):
+    """Чистый ledger на каждый сценарий: счёт токенов общий."""
+    import uuid
+
+    return rn.RunLedger(tmp_path / f"ledger-{uuid.uuid4().hex}.json")
 
 
 def _all_cases(result):
@@ -108,11 +134,16 @@ def test_runner_uses_working_prompt():
         assert request.prompt.startswith(working)
         assert request.model == MODEL
         name = request.case_id.split(":", 1)[1]
-        # фиксированные факты канарейки лежат в промпте дословно
+        # весь промпт = фиксированный текст + факты канарейки, ничего третьего
         facts = json.dumps(by_name[name].facts, ensure_ascii=False, sort_keys=True)
-        assert facts in request.prompt
+        assert request.prompt == rn.fixed_prompt_text() + facts
     meta = result.runs[0]["meta"]
-    assert meta["prompt_hash"] == ct.working_prompt_hash()
+    # хэш покрывает весь фиксированный текст, уходящий модели (шаблон + вставка)
+    assert meta["prompt_hash"] == ct._sha256(rn.fixed_prompt_text())
+    assert meta["prompt_hash"] != ct.working_prompt_hash()
+    assert rn.fixed_prompt_text().startswith(working) and len(
+        rn.fixed_prompt_text()
+    ) > len(working)
     assert meta["catalog_hash"] == _run(ct.working_catalog_hash())
     assert meta["model"] == MODEL and meta["commit"] == COMMIT
 
@@ -145,12 +176,28 @@ def test_runner_uses_working_prompt():
     assert ok.status == ct.PASSED
     assert ct.validate_run(ok.runs[0]) == []
 
+    # несколько разных вердиктов в ответе — не суждение (ambiguous_answer)
+    two = '{"verdict": "escalate"} потом {"verdict": "approve"}'
+    assert rn.parse_judgement(two) == {"verdict": rn.AMBIGUOUS}
+    assert rn.parse_judgement(two + " " + two) == {"verdict": rn.AMBIGUOUS}
+    same = '{"verdict": "escalate", "confidence": "high"} {"verdict": "escalate"}'
+    assert rn.parse_judgement(same) == {"verdict": "escalate", "confidence": "high"}
+    assert rn.parse_judgement("нет json") is None
+
+    async def ambiguous(request, n):
+        return rn.ProviderReply(text=two, usage={"input_tokens": 1, "output_tokens": 1})
+
+    amb = _eval(FakeTransport(script=ambiguous), canaries=canaries[:2])
+    assert amb.status == ct.INCOMPLETE
+    assert all(c["outcome"] == ct.INCOMPLETE for c in _all_cases(amb))
+    assert any(rn.AMBIGUOUS in p["message"] for p in amb.runs[0]["problems"])
+
 
 async def _no_call(request, n):  # pragma: no cover - вызов = провал теста
     raise AssertionError("неразрешённый вызов")
 
 
-def test_live_opt_in_and_limits():
+def test_live_opt_in_and_limits(tmp_path):
     """AC-2: нет opt-in / исчерпан лимит / завис / ошибка — вызова нет, статус честный."""
     canaries = _canaries()
     n = len(canaries)
@@ -182,7 +229,7 @@ def test_live_opt_in_and_limits():
 
     # --- нет opt-in: живой транспорт не вызывается ни разу ---
     live = FakeTransport(live=True, script=_no_call)
-    res = _eval(live, canaries=canaries)
+    res = _eval(live, canaries=canaries, ledger=_fresh(tmp_path))
     assert live.requests == []
     assert res.calls == 0 and res.status == ct.INFRASTRUCTURE_ERROR
     assert all(c["outcome"] == ct.INFRASTRUCTURE_ERROR for c in _all_cases(res))
@@ -194,10 +241,17 @@ def test_live_opt_in_and_limits():
         async def complete(self, request):  # pragma: no cover - вызов = провал
             raise AssertionError("неразрешённый вызов")
 
-    assert _eval(Unmarked(), canaries=canaries[:1]).calls == 0
+    assert _eval(Unmarked(), canaries=canaries[:1], ledger=_fresh(tmp_path)).calls == 0
     # с opt-in тот же транспорт работает
     live2 = FakeTransport(live=True)
-    assert len(_eval(live2, canaries=canaries, live_opt_in=True).runs) == 1
+    assert (
+        len(
+            _eval(
+                live2, canaries=canaries, live_opt_in=True, ledger=_fresh(tmp_path)
+            ).runs
+        )
+        == 1
+    )
     assert len(live2.requests) == n
 
     # --- пустой набор не passed и не вызывает ---
@@ -207,44 +261,119 @@ def test_live_opt_in_and_limits():
 
     # --- лимит case: сверх лимита не вызывается, хвост incomplete ---
     t = FakeTransport()
-    res = _eval(t, canaries=canaries, limits=rn.Limits(max_cases=2))
+    res = _eval(
+        t, canaries=canaries, limits=rn.Limits(max_cases=2), ledger=_fresh(tmp_path)
+    )
     assert len(t.requests) == 2
     assert res.status == ct.INCOMPLETE
     assert res.runs[0]["summary"]["incomplete"] == n - 2
     assert any("max_cases" in note for note in res.notes)
 
-    # --- лимит прогонов на задачу, в том числе между вызовами ---
+    # --- лимит прогонов на задачу: общий постоянный ledger ---
+    ledger_path = tmp_path / "shared-ledger.json"
     t = FakeTransport()
-    ledger = rn.RunLedger()
-    res = _eval(t, canaries=canaries[:2], repeats=4, ledger=ledger)
+    res = _eval(t, canaries=canaries[:2], repeats=4, ledger=rn.RunLedger(ledger_path))
     assert len(res.runs) == 3 and len(t.requests) == 6
     assert res.status == ct.INCOMPLETE
     assert any("max_runs_per_task" in note for note in res.notes)
+    # новый объект (другой процесс) видит тот же счёт
     t2 = FakeTransport(script=_no_call)
-    again = _eval(t2, canaries=canaries[:2], ledger=ledger)
+    again = _eval(t2, canaries=canaries[:2], ledger=rn.RunLedger(ledger_path))
     assert t2.requests == [] and again.runs == [] and again.status == ct.INCOMPLETE
-    other = _eval(FakeTransport(), canaries=canaries[:1], ledger=ledger, task_id=999)
+    other = _eval(
+        FakeTransport(),
+        canaries=canaries[:1],
+        ledger=rn.RunLedger(ledger_path),
+        task_id=999,
+    )
     assert len(other.runs) == 1  # счёт по задаче, не общий
+    # ledger по умолчанию тоже постоянный и не зависит от --out
+    assert rn.RunLedger()._path == rn.default_ledger_path()
+    assert rn.default_ledger_path().parent == tmp_path / "evaldata"
+    for _ in range(4):
+        _eval(FakeTransport(), canaries=canaries[:1], task_id=5, ledger=None)
+    assert rn.RunLedger().runs_used(5) == 3
+    assert rn.default_ledger_path().is_file()
 
-    # --- лимит токенов: новый вызов не начинается, когда бюджета не хватит ---
+    # параллельные резервы: больше трёх слотов не выдаётся никому
+    race = rn.RunLedger(tmp_path / "race.json")
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        got = list(pool.map(lambda _i: race.reserve_run(7, 3), range(12)))
+    assert sum(got) == 3 and race.runs_used(7) == 3
+
+    async def contenders():
+        return await asyncio.gather(
+            *(
+                rn.run_eval(
+                    transport=FakeTransport(),
+                    model=MODEL,
+                    commit=COMMIT,
+                    task_id=8,
+                    canaries=canaries[:1],
+                    ledger=rn.RunLedger(tmp_path / "race2.json"),
+                )
+                for _ in range(6)
+            )
+        )
+
+    outcomes = _run(contenders())
+    assert sum(len(o.runs) for o in outcomes) == 3
+    assert sum(o.truncated for o in outcomes) == 3
+
+    # нечитаемый ledger — отказ, а не ноль
+    broken_path = tmp_path / "broken.json"
+    broken_path.write_text("{не json")
+    t = FakeTransport(script=_no_call)
+    res = _eval(t, canaries=canaries[:1], ledger=rn.RunLedger(broken_path))
+    assert t.requests == [] and res.runs == [] and res.status == ct.INCOMPLETE
+
+    # --- лимит токенов: бронь под вызов, новый вызов не начинается ---
+    small = rn.Limits(max_tokens=50_000, call_token_reserve=20_000)
     t = FakeTransport(usage={"input_tokens": 15_000, "output_tokens": 5_000})
-    res = _eval(t, canaries=canaries, limits=rn.Limits(max_tokens=50_000))
-    assert len(t.requests) == 3 and res.tokens_used == 60_000
+    res = _eval(t, canaries=canaries, limits=small, ledger=_fresh(tmp_path))
+    assert len(t.requests) == 2 and res.tokens_used == 40_000  # 60 000 не допущено
     assert res.status == ct.INFRASTRUCTURE_ERROR
-    tail = _all_cases(res)[3:]
+    tail = _all_cases(res)[2:]
     assert tail and all("max_tokens" in c["error"] for c in tail)
 
-    # неизвестный расход не бесплатен
+    # три запуска по 1 млн: суммарный лимит 2 млн держится между запусками
+    shared = _fresh(tmp_path)
+    million = {"input_tokens": 1_000_000, "output_tokens": 0}
+    firsts = [
+        _eval(FakeTransport(usage=million), canaries=canaries[:1], ledger=shared)
+        for _ in range(2)
+    ]
+    assert all(len(r.runs) == 1 for r in firsts) and shared.tokens_used() == 2_000_000
+    t = FakeTransport(usage=million, script=_no_call)
+    third = _eval(t, canaries=canaries[:1], ledger=shared)
+    assert t.requests == [] and third.status == ct.INFRASTRUCTURE_ERROR
+    assert "max_tokens" in _all_cases(third)[0]["error"]
+
+    # факт сверх лимита после ответа: не passed, причина budget_exceeded
+    t = FakeTransport(usage={"input_tokens": 2_000_001, "output_tokens": 0})
+    res = _eval(t, canaries=canaries, ledger=_fresh(tmp_path))
+    assert len(t.requests) == 1  # дальше не идём
+    assert res.status == ct.INCOMPLETE and res.runs[0]["status"] == ct.INCOMPLETE
+    assert "budget_exceeded" in {p["kind"] for p in res.runs[0]["problems"]}
+    assert ct.validate_run(res.runs[0]) == []
+
+    # неизвестный расход: бронь списана, следующие case не запускаются
     async def silent(request, k):
         return rn.ProviderReply(text=_right_text(request), usage=None)
 
     t = FakeTransport(script=silent)
-    res = _eval(t, canaries=canaries, limits=rn.Limits(max_tokens=10_000))
-    assert 1 <= len(t.requests) < n and res.tokens_used > 0
+    led = _fresh(tmp_path)
+    res = _eval(t, canaries=canaries, ledger=led)
+    assert len(t.requests) == 1 and res.tokens_used == rn.Limits().call_token_reserve
+    assert led.tokens_used() == res.tokens_used
+    assert res.status == ct.INCOMPLETE
+    assert "unknown_usage" in {p["kind"] for p in res.runs[0]["problems"]}
 
     # --- лимит вызовов ---
     t = FakeTransport()
-    res = _eval(t, canaries=canaries, limits=rn.Limits(max_calls=4))
+    res = _eval(
+        t, canaries=canaries, limits=rn.Limits(max_calls=4), ledger=_fresh(tmp_path)
+    )
     assert len(t.requests) == 4 and res.calls == 4
     assert any("max_calls" in c["error"] for c in _all_cases(res)[4:])
 
@@ -256,20 +385,32 @@ def test_live_opt_in_and_limits():
         canaries=canaries,
         limits=rn.Limits(deadline_s=10.0),
         clock=lambda: clock["now"],
+        ledger=_fresh(tmp_path),
     )
     assert len(t.requests) == 2
     assert any("deadline" in c["error"] for c in _all_cases(res)[2:])
     assert res.status == ct.INFRASTRUCTURE_ERROR
 
-    # --- провайдер завис: таймаут, без повтора ---
+    # --- провайдер завис: таймаут, без повтора; расход неизвестен -> стоп ---
     async def hang(request, k):
+        t.refs[request.session_id] = {"agent_id": "a9", "run_id": "r9"}
         await asyncio.sleep(5)
 
     t = FakeTransport(script=hang)
-    res = _eval(t, canaries=canaries[:2], limits=rn.Limits(call_timeout_s=0.05))
-    assert len(t.requests) == 2  # по одному на case, повтора на зависание нет
-    assert all("timeout" in c["error"] for c in _all_cases(res))
-    assert res.status == ct.INFRASTRUCTURE_ERROR
+    t.refs = {}
+    res = _eval(
+        t,
+        canaries=canaries[:2],
+        limits=rn.Limits(call_timeout_s=0.05),
+        ledger=_fresh(tmp_path),
+    )
+    assert len(t.requests) == 1 and t.requests[0].timeout_s == 0.05
+    first = _all_cases(res)[0]
+    assert first["outcome"] == ct.INFRASTRUCTURE_ERROR and "timeout" in first["error"]
+    assert res.status == ct.INCOMPLETE  # второй case не запущен
+    # прогон у провайдера не потерян: id остались в артефакте для ручной отмены
+    kept = res.runs[0]["attempts"][first["case_id"]][0]["refs"]
+    assert kept == {"agent_id": "a9", "run_id": "r9"}
 
     # --- ошибка провайдера: ограниченный повтор, не качество и не успех ---
     async def flaky(request, k):
@@ -281,32 +422,74 @@ def test_live_opt_in_and_limits():
 
     t = FakeTransport(script=flaky)
     res = _eval(
-        t, canaries=canaries[:1], limits=rn.Limits(max_retries=1), sleep=_instant
+        t,
+        canaries=canaries[:1],
+        limits=rn.Limits(max_retries=1),
+        sleep=_instant,
+        ledger=_fresh(tmp_path),
     )
     assert len(t.requests) == 2 and res.calls == 2
     assert [r.attempt for r in t.requests] == [1, 2]
     assert _all_cases(res)[0]["outcome"] != ct.INFRASTRUCTURE_ERROR
+    recorded = res.runs[0]["attempts"][_all_cases(res)[0]["case_id"]]
+    assert [a["attempt"] for a in recorded] == [1, 2]
+    assert recorded[0]["error"] == "http 503" and recorded[1]["error"] is None
 
     async def broken(request, k):
         return rn.ProviderReply(error="http 503", retryable=True)
 
     t = FakeTransport(script=broken)
     res = _eval(
-        t, canaries=canaries[:2], limits=rn.Limits(max_retries=2), sleep=_instant
+        t,
+        canaries=canaries[:2],
+        limits=rn.Limits(max_retries=2),
+        sleep=_instant,
+        ledger=_fresh(tmp_path),
     )
     assert len(t.requests) == 2 * (1 + 2)
     assert res.status == ct.INFRASTRUCTURE_ERROR
     assert all(c["outcome"] == ct.INFRASTRUCTURE_ERROR for c in _all_cases(res))
 
     async def fatal(request, k):
-        return rn.ProviderReply(error="http 401", retryable=False)
+        return rn.ProviderReply(error="http 401", retryable=False, no_charge=True)
 
     t = FakeTransport(script=fatal)
     res = _eval(
-        t, canaries=canaries[:2], limits=rn.Limits(max_retries=2), sleep=_instant
+        t,
+        canaries=canaries[:2],
+        limits=rn.Limits(max_retries=2),
+        sleep=_instant,
+        ledger=_fresh(tmp_path),
     )
     assert len(t.requests) == 2  # нерetryable не повторяется
     assert res.status == ct.INFRASTRUCTURE_ERROR
+
+    # повтор не прячет неверный вердикт первой попытки, расход суммируется
+    bad_canary = next(c for c in canaries if c.expectation == sc.MUST_NOT_APPROVE)
+
+    async def hides(request, k):
+        if k == 1:
+            return rn.ProviderReply(
+                text=_good_text("approve"),
+                usage={"input_tokens": 10, "output_tokens": 0},
+                error="http 503",
+                retryable=True,
+            )
+        return rn.ProviderReply(
+            text=_good_text("escalate"), usage={"input_tokens": 5, "output_tokens": 0}
+        )
+
+    led = _fresh(tmp_path)
+    res = _eval(
+        FakeTransport(script=hides),
+        canaries=[bad_canary],
+        sleep=_instant,
+        ledger=led,
+    )
+    case = _all_cases(res)[0]
+    assert case["outcome"] == ct.QUALITY_FAILED and res.status == ct.QUALITY_FAILED
+    assert case["usage"] == {"input_tokens": 15, "output_tokens": 0}
+    assert res.tokens_used == 15 and led.tokens_used() == 15
 
     # --- мусорный ответ: не успех ---
     async def garbage(request, k):
@@ -314,7 +497,9 @@ def test_live_opt_in_and_limits():
             text="не json вовсе", usage={"input_tokens": 1, "output_tokens": 1}
         )
 
-    res = _eval(FakeTransport(script=garbage), canaries=canaries[:2])
+    res = _eval(
+        FakeTransport(script=garbage), canaries=canaries[:2], ledger=_fresh(tmp_path)
+    )
     assert res.status == ct.INCOMPLETE
     assert all(c["outcome"] == ct.INCOMPLETE for c in _all_cases(res))
 
@@ -330,6 +515,13 @@ def test_case_sessions_cannot_mutate_production(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CURSOR_API_KEY", secret_key)
     monkeypatch.setattr(config, "STEWARD_HUB_TOKEN", secret_hub)
     monkeypatch.setenv("CURSOR_API_KEY", secret_key)
+    # составная настройка: «имя:токен:роль» — секрет это ТОКЕН, а не вся строка
+    composite, short = "TOKcomposite99", "shrt66"
+    monkeypatch.setenv(
+        "HAIPLANE_HUB_TOKENS", f"steward:{composite}:steward,bob:{short}"
+    )
+    known = cursor_cloud.known_secrets()
+    assert composite in known and short in known and "steward" not in known
 
     # «прод»: файл БД и любой исходящий вызов — запрещены
     prod_db = tmp_path / "prod.db"
@@ -356,7 +548,11 @@ def test_case_sessions_cannot_mutate_production(tmp_path, monkeypatch):
         return rn.ProviderReply(
             text=text,
             usage={"input_tokens": 1, "output_tokens": 1},
-            error=f"warn: key {secret_key} / {secret_hub}" if k == 1 else None,
+            error=(
+                f"warn: key {secret_key} / {secret_hub} / {composite} / {short}"
+                if k == 1
+                else None
+            ),
         )
 
     transport = FakeTransport(script=script)
@@ -379,6 +575,7 @@ def test_case_sessions_cannot_mutate_production(tmp_path, monkeypatch):
         "prompt",
         "params",
         "attempt",
+        "timeout_s",
     }
     for r in transport.requests:
         blob = json.dumps(r.__dict__, default=str)
@@ -408,7 +605,8 @@ def test_case_sessions_cannot_mutate_production(tmp_path, monkeypatch):
     assert len(paths) == 2
     for path in paths:
         text = path.read_text()
-        assert secret_key not in text and secret_hub not in text
+        for leaked in (secret_key, secret_hub, composite, short):
+            assert leaked not in text
         run = json.loads(text)
         assert ct.validate_run(run, ct.build_manifest(canaries)) == []
         assert run["meta"]["params"] == {} or secret_key not in json.dumps(
@@ -424,38 +622,209 @@ def test_case_sessions_cannot_mutate_production(tmp_path, monkeypatch):
     assert secret_key not in json.dumps(result.runs)
 
     # CLI без --live не делает ни одного вызова: код 2 даже при полных аргументах
-    full = ["--model", "m", "--repo-url", "u", "--commit", "c", "--task-id", "1"]
-    assert rn.main([*full, "--out", str(tmp_path / "cli")]) == 2
+    full = ["--model", "m", "--repo-url", "org/eval", "--commit", "c", "--task-id", "1"]
+    out = str(tmp_path / "cli")
+    assert rn.main([*full, "--allowed-repo", "org/eval", "--out", out]) == 2
     assert rn.main([]) == 2
+    assert not (tmp_path / "cli").exists()
+    # --live без allowlist или с продовым репозиторием отказывает до любого вызова
+    assert rn.main([*full, "--live", "--out", out]) == 2
+    prod = ["--model", "m", "--repo-url", "agentdrover/haiplane", "--commit", "c"]
+    prod += ["--task-id", "1", "--allowed-repo", "agentdrover/haiplane", "--live"]
+    assert rn.main([*prod, "--out", out]) == 2
     assert not (tmp_path / "cli").exists()
 
 
-def test_cursor_adapter_gives_no_hub_access(monkeypatch):
-    """Адаптер зовёт шов стюарда без MCP и токена хаба; сеть подменена."""
-    from agent_eval.cursor_adapter import CursorTransport
+import httpx  # noqa: E402
 
-    seen: dict = {}
+from agent_eval import cursor_adapter as ca  # noqa: E402
 
-    async def create(**kwargs):
-        seen.update(kwargs)
-        return {"agent": {"id": "a1"}, "run": {"id": "r1"}}, None
+REPO = "org/eval-repo"
 
-    async def get_run(agent_id, run_id):
-        return {"status": "FINISHED", "result": _good_text()}
 
-    async def get_usage(agent_id, run_id=None):
-        return {"totalUsage": {"totalTokens": 42}}
+def _transport(**kw):
+    kw.setdefault("poll_interval_s", 0.01)
+    return ca.CursorTransport(repo_url=REPO, allowed_repos=[REPO], **kw)
 
-    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", create)
-    monkeypatch.setattr(cursor_cloud, "get_run", get_run)
-    monkeypatch.setattr(cursor_cloud, "get_usage", get_usage)
-    request = rn.ProviderRequest("c", "r", "s", MODEL, "prompt", {}, 1)
-    reply = _run(
-        CursorTransport(repo_url="https://example.invalid/r").complete(request)
-    )
+
+def _request(**kw):
+    kw.setdefault("timeout_s", 5.0)
+    return rn.ProviderRequest("c", "r", "sess-1", MODEL, "prompt", {}, 1, **kw)
+
+
+def test_cursor_adapter_http_request_is_isolated(monkeypatch):
+    """Тело HTTP-запроса адаптера: рабочий промпт и модель, без MCP и токена хаба."""
+    key, hub = "sk-live-ADAPTER-123456", "hubtok-ADAPTER-123456"
+    monkeypatch.setattr(config, "CURSOR_API_KEY", key)
+    monkeypatch.setattr(config, "STEWARD_HUB_TOKEN", hub)
+    sent: list[dict] = []
+
+    async def fake(self, method, url, json=None, headers=None, **_):
+        sent.append({"method": method, "url": url, "json": json, "headers": headers})
+        if method == "POST":
+            body = {"agent": {"id": "a1"}, "run": {"id": "r1"}}
+        elif url.endswith("/usage?runId=r1"):
+            body = {"totalUsage": {"totalTokens": 42}}
+        else:
+            body = {"status": "FINISHED", "result": _good_text()}
+        return httpx.Response(200, json=body, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "request", fake)
+    reply = _run(_transport().complete(_request()))
     assert reply.error is None and reply.usage == {
         "input_tokens": 42,
         "output_tokens": 0,
     }
-    assert not seen.get("hub_mcp_url") and not seen.get("reviewer_token")
-    assert seen["model_id"] == MODEL and seen["prompt_text"] == "prompt"
+    create = next(c for c in sent if c["method"] == "POST")
+    body = create["json"]
+    assert body["prompt"] == {"text": "prompt"} and body["model"] == {"id": MODEL}
+    assert body["repos"] == [
+        {"url": f"https://github.com/{REPO}", "startingRef": "HEAD"}
+    ]
+    assert body["name"] == "sess-1"
+    assert "mcpServers" not in body  # доступа к хабу нет
+    assert hub not in json.dumps(body)
+    assert body["autoCreatePR"] is False
+    assert create["headers"]["Authorization"] == f"Bearer {key}"
+
+
+def test_cursor_adapter_repo_allowlist(monkeypatch):
+    """Репозиторий только из явного allowlist; продовые agentdrover/* — никогда."""
+    with pytest.raises(ValueError):  # allowlist пуст
+        ca.CursorTransport(repo_url=REPO)
+    with pytest.raises(ValueError):  # продовый, даже если его вписали
+        ca.CursorTransport(
+            repo_url="agentdrover/haiplane", allowed_repos=["agentdrover/haiplane"]
+        )
+    with pytest.raises(ValueError):
+        ca.CursorTransport(
+            repo_url="https://github.com/AgentDrover/other",
+            allowed_repos=["agentdrover/other"],
+        )
+    with pytest.raises(ValueError):  # не из списка
+        ca.CursorTransport(repo_url="org/another", allowed_repos=[REPO])
+    with pytest.raises(ValueError):  # не GitHub-slug
+        ca.CursorTransport(repo_url="http://evil.example/x", allowed_repos=[REPO])
+    monkeypatch.setenv(ca.ALLOWED_REPOS_ENV, f"https://github.com/{REPO}.git")
+    assert ca.CursorTransport(repo_url=REPO)._slug == REPO
+
+
+def test_cursor_adapter_retry_only_after_proven_refusal(monkeypatch):
+    """Повтор только после доказанного отказа до создания; иначе без повтора."""
+    cases = [
+        (cursor_cloud.Refusal(status=500), False),
+        (cursor_cloud.Refusal(status=503), False),
+        (cursor_cloud.Refusal(status=404), False),
+        (cursor_cloud.Refusal(status=409), False),
+        (cursor_cloud.Refusal(status=408), False),
+        (cursor_cloud.Refusal(status=0, detail="ReadTimeout: "), False),
+        (cursor_cloud.Refusal(status=0, detail="тело не объект"), False),
+        (cursor_cloud.Refusal(status=400, code="usage_limit_exceeded"), True),
+        (cursor_cloud.Refusal(status=429), True),
+        (cursor_cloud.Refusal(status=0, detail="ConnectError: refused"), True),
+    ]
+    for denial, proven in cases:
+
+        async def create(**_kw):
+            return None, denial
+
+        monkeypatch.setattr(cursor_cloud, "create_agent_attempt", create)
+        reply = _run(_transport().complete(_request()))
+        assert reply.retryable is proven and reply.no_charge is proven, denial
+        assert reply.error.startswith("provider_refused")
+
+
+def _run_state(monkeypatch):
+    """Облачный прогон, который не кончается, пока его не отменят."""
+    state = {"cancels": 0, "gets": 0}
+
+    async def create(**_kw):
+        return {"agent": {"id": "a1"}, "run": {"id": "r1"}}, None
+
+    async def get_run(agent_id, run_id):
+        state["gets"] += 1
+        return {"status": "CANCELLED" if state["cancels"] else "RUNNING"}
+
+    async def cancel_run(agent_id, run_id):
+        state["cancels"] += 1
+        return {}, None
+
+    monkeypatch.setattr(cursor_cloud, "create_agent_attempt", create)
+    monkeypatch.setattr(cursor_cloud, "get_run", get_run)
+    monkeypatch.setattr(cursor_cloud, "cancel_run", cancel_run)
+    return state
+
+
+def test_cursor_adapter_cancels_cloud_run_on_timeout(monkeypatch, tmp_path):
+    """Таймаут и отмена: cancel_run ровно один раз, id прогона сохранены."""
+    state = _run_state(monkeypatch)
+    # таймаут адаптера (80% срока runner-а) срабатывает раньше runner-а
+    reply = _run(_transport().complete(_request(timeout_s=0.2)))
+    assert reply.error.startswith("timeout") and "cancel_unconfirmed" not in reply.error
+    assert reply.refs == {"agent_id": "a1", "run_id": "r1"}
+    assert state["cancels"] == 1
+
+    # runner срезал вызов на ходу: finally всё равно останавливает агента
+    state.update(cancels=0, gets=0)
+    transport = _transport()
+
+    async def cut():
+        await asyncio.wait_for(transport.complete(_request(timeout_s=100.0)), 0.05)
+
+    with pytest.raises(TimeoutError):
+        _run(cut())
+    assert state["cancels"] == 1
+    assert transport.refs["sess-1"] == {"agent_id": "a1", "run_id": "r1"}
+
+    # через run_eval: id попадают в артефакт, повторов нет, расход неизвестен -> стоп
+    state.update(cancels=0, gets=0)
+    live = _transport()
+    res = _eval(
+        live,
+        canaries=_canaries(2),
+        limits=rn.Limits(call_timeout_s=0.1),
+        live_opt_in=True,
+    )
+    assert state["cancels"] == 1  # один case, дальше unknown_usage
+    case_id = _all_cases(res)[0]["case_id"]
+    attempt = res.runs[0]["attempts"][case_id][0]
+    assert attempt["refs"] == {"agent_id": "a1", "run_id": "r1"}
+    # адаптер уложился раньше runner-а и остановил агента сам
+    assert "прогон провайдера" in attempt["error"] and res.status == ct.INCOMPLETE
+
+    # отмена не подтвердилась — это видно в ошибке, а не молчит
+    async def stuck(agent_id, run_id):
+        return {"status": "RUNNING"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", stuck)
+    reply = _run(_transport().complete(_request(timeout_s=0.1)))
+    assert "cancel_unconfirmed" in reply.error
+
+
+def test_cursor_cloud_scrubs_secrets_from_logs(monkeypatch, caplog):
+    """Эхо ключа в теле ошибки и в исключении не попадает ни в журнал, ни в Refusal."""
+    key = "sk-live-LOGLEAK-123456"
+    monkeypatch.setattr(config, "CURSOR_API_KEY", key)
+    monkeypatch.setenv("HAIPLANE_HUB_TOKENS", "steward:LOGhubtok99:steward")
+    leak = f"bad key {key} and LOGhubtok99"
+
+    async def http_500(self, method, url, json=None, headers=None, **_):
+        return httpx.Response(500, text=leak, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "request", http_500)
+    with caplog.at_level(logging.DEBUG):
+        body, denial = _run(cursor_cloud._attempt("GET", "/v1/x"))
+    assert body is None and denial.status == 500
+    assert key not in caplog.text and "LOGhubtok99" not in caplog.text
+    assert key not in denial.detail and "LOGhubtok99" not in denial.detail
+    assert "[redacted]" in denial.detail
+
+    async def boom(self, method, url, json=None, headers=None, **_):
+        raise RuntimeError(leak)
+
+    monkeypatch.setattr(httpx.AsyncClient, "request", boom)
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        _, denial = _run(cursor_cloud._attempt("GET", "/v1/x"))
+    assert key not in caplog.text and "LOGhubtok99" not in caplog.text
+    assert key not in denial.detail and "LOGhubtok99" not in denial.detail
