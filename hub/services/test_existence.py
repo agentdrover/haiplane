@@ -391,7 +391,11 @@ class LocatorEvidence:
     names the reason per file that could not be used. ``aux`` holds the pytest
     configuration and conftest files around the locator files (``None`` = not
     collected), and ``pytest_config_issue`` is a fixed reason a positive pytest
-    answer cannot be given.
+    answer cannot be given. ``transient`` is set when something could not be
+    read for a reason that may pass (the tree listing failed, a file or a
+    config/conftest.py was unreadable): such an answer must not be cached. A
+    file that is absent, over a size or budget limit, or unparseable is a fact
+    about the commit and does not set it.
     """
 
     sources: dict[str, str | None] = field(default_factory=dict)
@@ -401,6 +405,7 @@ class LocatorEvidence:
     pytest_config_issue: str = ""
     unread: dict[str, str] = field(default_factory=dict)
     aux: dict[str, dict] | None = None
+    transient: bool = False
 
 
 async def _commit_of(git: Any, repo: str, name: str) -> str:
@@ -585,6 +590,7 @@ async def read_locator_evidence(
         reason = f"could not list the tree of {label}"
         evidence.unread = dict.fromkeys(files, reason)
         evidence.pytest_config_issue = reason
+        evidence.transient = True
         return evidence
     reader = _Reader(git, repo, sha)
     for path in files:
@@ -596,6 +602,7 @@ async def read_locator_evidence(
             evidence.sources[path] = text
         else:
             evidence.unread[path] = reason
+            evidence.transient = evidence.transient or state == "unreadable"
     aux_paths = _aux_paths([p for p in files if p not in evidence.absent])
     if aux_paths is None:
         evidence.pytest_config_issue = (
@@ -610,6 +617,7 @@ async def read_locator_evidence(
             continue
         state, text, _ = await reader.read(full)
         evidence.aux[full] = {"state": state, "text": text}
+        evidence.transient = evidence.transient or state == "unreadable"
     return evidence
 
 
@@ -636,7 +644,12 @@ async def _compute(
     base: str,
     picked: tuple[str, str] | None,
 ) -> tuple[list[dict], bool]:
-    """``(rows, cacheable)``: a failure of the worker or the deadline is not cached."""
+    """``(rows, cacheable)``: only a deterministic answer is cached.
+
+    Not cached: a failure of the worker, the read deadline, and any transient
+    read failure (the tree listing, a locator file, a pytest config or
+    conftest.py that could not be read) even when other files were read fine.
+    """
     try:
         evidence = await asyncio.wait_for(
             read_locator_evidence(
@@ -671,7 +684,8 @@ async def _compute(
         if evidence.aux is not None:
             request["aux"] = evidence.aux
         results = await analyse_in_worker(request)
-    return _finish(rows, results, evidence.ref_label), not todo or results is not None
+    cacheable = not evidence.transient and (not todo or results is not None)
+    return _finish(rows, results, evidence.ref_label), cacheable
 
 
 async def resolve_locators_at_ref(
@@ -690,7 +704,10 @@ async def resolve_locators_at_ref(
     bounded worker process, so a hostile file can cost it its budget and
     nothing else. The commit is resolved first so the answer can be cached by
     (repo, commit, locators, analyser version) and so identical concurrent
-    requests are one computation.
+    requests are one computation. Never cached: no workspace, an unresolvable
+    ref, a failed worker or deadline, and any transient read failure (tree
+    listing, a locator file, a pytest config or conftest.py), so a hiccup of git
+    is not remembered for the commit.
     """
     files = locator_files(acs)
     kw = {"submission_sha": submission_sha, "branch": branch, "base": base}

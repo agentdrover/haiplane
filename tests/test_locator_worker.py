@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from hub.services import test_existence
 from hub.services.test_existence import (
     MISSING,
@@ -348,3 +350,101 @@ async def test_twenty_files_under_one_big_conftest_are_all_resolvable():
     acs = [_ac("test_a", f"tests/t{i}.py", f"AC-{i}") for i in range(20)]
     res = await _resolve(files, acs)
     assert all(r["status"] == RESOLVABLE for r in res), res[:2]
+
+
+# ---- #1651: a failed read is never remembered for the commit ---------------------------
+
+_SECOND = "tests/test_q.py"
+_CONFTEST = "tests/conftest.py"
+
+
+class _FlakyGit(FakeGit):
+    """A FakeGit whose tree listing can be made to fail, and then recovers."""
+
+    def __init__(self, files: dict, tree: str = "ok") -> None:
+        super().__init__(files)
+        self.tree = tree  # ok | none | raise
+
+    async def files_at_ref(self, repo: str, ref: str):
+        if self.tree == "raise":
+            self.calls += 1
+            raise RuntimeError("git ls-tree failed")
+        if self.tree == "none":
+            self.calls += 1
+            return None
+        return await super().files_at_ref(repo, ref)
+
+
+def _break(git: _FlakyGit, how: str) -> None:
+    if how in ("none", "raise"):
+        git.tree = how
+    elif how == "one-source":
+        git.unreadable.add(_SECOND)
+    else:
+        git.unreadable.add(_CONFTEST)
+
+
+def _heal(git: _FlakyGit) -> None:
+    git.tree = "ok"
+    git.unreadable.clear()
+
+
+@pytest.mark.parametrize("how", ["none", "raise", "one-source", "conftest"])
+async def test_a_failed_read_is_never_cached(how: str):
+    code = "def test_a():\n    pass\n"
+    files = {_PATH: code, _SECOND: code, _CONFTEST: ""}
+    git = _FlakyGit(files)
+    acs = [_ac("test_a"), _ac("test_a", _SECOND, "AC-2")]
+    _break(git, how)
+
+    first = await _resolve(files, acs, git)
+    assert any(r["status"] == UNKNOWN for r in first), first
+    if how != "conftest":
+        assert any("could not" in r["reason"] for r in first), first
+
+    _heal(git)
+    second = await _resolve(files, acs, git, fresh=False)
+    assert [r["status"] for r in second] == [RESOLVABLE, RESOLVABLE], second
+
+    calls = git.calls
+    third = await _resolve(files, acs, git, fresh=False)
+    assert third == second
+    assert git.calls - calls <= 2  # only the ref is resolved again
+
+
+async def test_deterministic_outcomes_stay_cached():
+    big = "x = 1\n" * 100000  # over MAX_FILE_BYTES
+    files = {_PATH: "def test_a():\n    pass\n", _SECOND: big}
+    acs = [
+        _ac("test_a"),
+        _ac("test_b", ac_id="AC-2"),  # the file is there, the test is not
+        _ac("test_a", "tests/test_gone.py", "AC-3"),  # the file is not there
+        _ac("test_a", _SECOND, "AC-4"),  # the file is over the limit
+    ]
+    git = FakeGit(files)
+    first = await _resolve(files, acs, git)
+    assert [r["status"] for r in first] == [RESOLVABLE, MISSING, MISSING, UNKNOWN]
+    calls = git.calls
+
+    second = await _resolve(files, acs, git, fresh=False)
+
+    assert second == first
+    assert git.calls - calls <= 2  # no tree listing and no file reads
+
+
+async def test_no_workspace_and_an_unresolvable_ref_bypass_the_cache():
+    files = {_PATH: "def test_a():\n    pass\n"}
+    acs = [_ac("test_a")]
+    git = FakeGit(files)
+    test_existence.clear_locator_cache()
+    for _ in range(2):
+        res = await resolve_locators_at_ref(git, None, acs, branch="b", base="main")
+        assert res[0]["status"] == UNKNOWN
+    assert not test_existence._cache
+
+    for _ in range(2):
+        res = await resolve_locators_at_ref(
+            git, "/repo", acs, branch="no-such-branch", base="main"
+        )
+        assert res[0]["status"] == UNKNOWN
+    assert not test_existence._cache
