@@ -73,6 +73,45 @@ def automation_not_applicable(task: Mapping[str, Any] | Any | None) -> bool:
     return is_state(task)
 
 
+#: Слово «проверка кода не применима» — одно на все читатели (#1648): очередь,
+#: бриф и карточка не пишут своё ``unknown``/``match``/``pass`` про ветку, CI
+#: и тесты AC задачи, у которой их нет.
+NOT_APPLICABLE = "not_applicable"
+
+
+def _text_of(value: Any) -> str:
+    return str(getattr(value, "value", value) or "").strip().lower()
+
+
+def _field(task: Mapping[str, Any] | Any, name: str) -> Any:
+    try:
+        return task[name]
+    except (KeyError, IndexError, TypeError):
+        return getattr(task, name, None)
+
+
+def state_accepted(task: Mapping[str, Any] | Any | None) -> bool:
+    """State-задача ПРИНЯТА на текущем поколении (#1648). Единый признак.
+
+    Принята = ``result_kind=state``, статус ``completed`` и вердикт APPROVED,
+    записанный на ТЕКУЩЕЕ поколение сдачи (так завершает вердикт человека,
+    ``via=state_approved``). Читатели готовности зависимостей зовут ТОЛЬКО это
+    имя: статус сам по себе принятия не доказывает (задачу закрывает и
+    force-complete), а чужое поколение — не принятие сегодняшней сдачи.
+    Возврат в работу меняет статус, и готовность снимается без записи.
+    """
+    if task is None or not is_state(task):
+        return False
+    if _text_of(_field(task, "status")) != "completed":
+        return False
+    if _text_of(_field(task, "review_verdict")) != "approved":
+        return False
+    generation = int(_field(task, "submission_generation") or 0)
+    return generation > 0 and (
+        int(_field(task, "review_verdict_generation") or 0) == generation
+    )
+
+
 def qualifying_ac_count(ac_rows: Any) -> int:
     """Сколько AC годятся для state: verifiable_by из ``STATE_AC_KINDS``."""
     return sum(

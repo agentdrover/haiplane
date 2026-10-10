@@ -811,3 +811,157 @@ async def test_a_rejected_child_does_not_hold_a_delivered_feature(
     assert [b["task_id"] for b in blockers] == [feature]
     assert f"#{broken}" in blockers[0]["reason"]
     assert f"#{discarded}" not in blockers[0]["reason"]
+
+
+# ---- #1648: принятая задача-состояние разблокирует зависимые ----
+
+
+async def test_accepted_state_task_unblocks_dependents_until_reworked(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """AC-4 (#1648): B depends_on state-задачи A. Пока A в review — B ждёт и
+    причина называет принятие, а не «PR не заявлен». Принята (completed,
+    state_approved) — B свободна во всех читателях. Вернули A в работу — снова
+    ждёт. pipeline_merges и releases для A не создаются. Родитель со state- и
+    commit-детьми: state по принятию, commit по доставке. Commit-блокер — как
+    раньше."""
+    from hub.services import orchestrator_queue
+    from tests.state_support import (
+        drive_to_review,
+        human_verdict,
+        make_state_task,
+    )
+
+    a = await make_state_task(db, title="Настроить сервер")
+    b = await _task(db, "Переключить DNS")
+    await repo.add_task_dependency(db, b, a)
+    await db.commit()
+    plugins.git_ops = _AncestorGitOps(False)
+
+    async def readers() -> tuple[bool | None, list[int], list[int], str]:
+        rest = (await client.get(f"/api/tasks/{b}/dependencies")).json()["blocked_by"][
+            0
+        ]
+        warned = await lifecycle.warn_about_undelivered_blockers(db, b)
+        queued = await orchestrator_queue._undelivered_blockers(db, b)
+        return (
+            rest["delivered"],
+            [w["task_id"] for w in warned],
+            [q["task_id"] for q in queued],
+            rest["reason"],
+        )
+
+    delivered, warned, queued, reason = await readers()
+    assert (delivered, warned, queued) == (False, [a], [a])
+    assert "PR не заявлен" not in reason and "принят" in reason, reason
+
+    await drive_to_review(client, db, a)
+    assert (await readers())[0] is False, "в review ещё не принята"
+
+    accepted = await human_verdict(client, a, "approved", generation=1)
+    assert accepted.status_code == 200 and accepted.json()["status"] == "completed"
+    delivered, warned, queued, reason = await readers()
+    assert (delivered, warned, queued) == (True, [], [])
+    entry = (await client.get(f"/api/tasks/{b}/dependencies")).json()["blocked_by"][0]
+    assert entry["delivery_path"] == "state_accepted"
+    context = (await client.get(f"/api/tasks/{b}")).json()["dependencies"]
+    assert context["blocked_by"][0]["delivered"] is True
+
+    merges = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM pipeline_merges WHERE task_id=?", (a,)
+    )
+    assert merges[0][0] == 0
+    assert (await db.execute_fetchall("SELECT COUNT(*) FROM releases"))[0][0] == 0
+
+    # возврат в работу снимает готовность
+    await repo.update_task(db, a, status="running")
+    await db.commit()
+    delivered, warned, queued, reason = await readers()
+    assert (delivered, warned, queued) == (False, [a], [a])
+
+    # commit-блокер без мержа — как раньше
+    c = await _task(db, "commit-блокер")
+    await repo.update_task(db, c, status="completed", pr_number=9)
+    d = await _task(db, "ждёт commit")
+    await repo.add_task_dependency(db, d, c)
+    await db.commit()
+    commit_entry = (await client.get(f"/api/tasks/{d}/dependencies")).json()[
+        "blocked_by"
+    ][0]
+    assert commit_entry["delivered"] is False
+    assert "PR #9 не смержен гейтом" in commit_entry["reason"]
+
+    # родитель со state- и commit-детьми
+    from tests.state_support import make_state_task as _mk
+
+    s = await _mk(db, title="state-ребёнок", under_feature=True)
+    parent = dict(await repo.get_task(db, s))["parent_id"]
+    commit_child = await _task(db, "commit-ребёнок")
+    await repo.update_task(
+        db, commit_child, parent_id=parent, status="completed", pr_number=31
+    )
+    await drive_to_review(client, db, s)
+    assert (await human_verdict(client, s, "approved", generation=1)).status_code == 200
+    await repo.update_task(db, parent, status="completed")
+    waits = await _task(db, "ждёт фичу")
+    await repo.add_task_dependency(db, waits, parent)
+    await db.commit()
+
+    held = await lifecycle.warn_about_undelivered_blockers(db, waits)
+    assert [x["task_id"] for x in held] == [parent]
+    assert f"#{commit_child}" in held[0]["reason"], "commit-ребёнок держит по доставке"
+    assert f"#{s}" not in held[0]["reason"], "принятый state-ребёнок не держит"
+
+    await _pipeline_merge(db, commit_child, 31)
+    assert await lifecycle.warn_about_undelivered_blockers(db, waits) == []
+
+    await repo.update_task(db, s, status="running")
+    await db.commit()
+    held = await lifecycle.warn_about_undelivered_blockers(db, waits)
+    assert [x["task_id"] for x in held] == [parent]
+    assert f"#{s}" in held[0]["reason"], "возвращённый state-ребёнок держит родителя"
+
+
+def test_state_accepted_needs_completed_state_and_a_verdict_of_the_current_generation():
+    """#1648: единый признак принятия — каждое условие названо отдельно."""
+    from hub.services.result_kind import state_accepted
+
+    base = {
+        "result_kind": "state",
+        "status": "completed",
+        "review_verdict": "approved",
+        "review_verdict_generation": 2,
+        "submission_generation": 2,
+    }
+    assert state_accepted(base) is True
+    for change in (
+        {"result_kind": "commit"},
+        {"status": "review"},
+        {"status": "running"},
+        {"review_verdict": "changes_requested"},
+        {"review_verdict": None},
+        {"review_verdict_generation": 1},
+        {"submission_generation": 0, "review_verdict_generation": 0},
+    ):
+        assert state_accepted({**base, **change}) is False, change
+    assert state_accepted(None) is False
+
+
+async def test_force_completed_state_task_does_not_unblock_dependents(
+    client: AsyncClient, db: aiosqlite.Connection
+):
+    """#1648: статус completed без вердикта человека на поколение — не принятие
+    (force-complete закрывает и недоделанное). Зависимая остаётся ждать."""
+    from tests.state_support import drive_to_review, make_state_task
+
+    a = await make_state_task(db, title="state")
+    await drive_to_review(client, db, a)
+    await repo.update_task(db, a, status="completed")
+    b = await _task(db, "ждёт")
+    await repo.add_task_dependency(db, b, a)
+    await db.commit()
+    plugins.git_ops = _AncestorGitOps(False)
+
+    entry = (await client.get(f"/api/tasks/{b}/dependencies")).json()["blocked_by"][0]
+    assert entry["delivered"] is False
+    assert entry["delivery_path"] == "state_pending"

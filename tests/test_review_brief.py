@@ -1701,3 +1701,75 @@ async def test_brief_never_imports_task_branch_code(
     ):
         assert resolution["status"] == "resolvable", resolution
         assert "without running" in resolution["reason"], resolution
+
+
+# --- #1648: бриф задачи-состояния --------------------------------------------
+
+
+async def test_state_brief_shows_generation_evidence_and_marks_code_checks_not_applicable(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-2 (#1648): бриф state-задачи (REST и MCP) показывает снимок AC,
+    rollback, доказательства поколения 2 с автором и observed_at, номер
+    поколения и expected_generation; проверки кода — «не применимо», а не
+    unknown и не match; git при сборке не трогается."""
+    from hub import mcp_server
+    from tests.state_support import (
+        ROLLBACK,
+        GitSpy,
+        drive_to_second_generation,
+        make_state_task,
+    )
+
+    task_id = await make_state_task(db, title="Переключить DNS")
+    await drive_to_second_generation(client, db, task_id)
+    spy = GitSpy()
+    monkeypatch.setattr(plugins, "git_ops", spy)
+
+    resp = await client.get(f"/api/tasks/{task_id}/review-brief")
+    assert resp.status_code == 200, resp.text
+    brief = resp.json()
+
+    assert brief["sha_check"] == "not_applicable", brief["sha_check"]
+    assert brief["ci_run_report"]["state"] == "not_applicable"
+    assert brief["base_merge"]["state"] == "not_applicable"
+    assert brief["call_sites"]["status"] == "not_applicable"
+    assert brief["ac_test_results"] == [] and brief["locator_resolution"] == []
+    assert brief["path_notices"] is None
+    assert brief["evidence_coverage"]["state"] == "complete"
+    missing = {c["check"] for c in brief["evidence_coverage"]["checks_missing"]}
+    assert not missing, "ничего из кода не «отсутствует»: оно не применимо"
+    na = {c["check"] for c in brief["evidence_coverage"]["checks_not_applicable"]}
+    assert {"sha_check", "ci_run_report", "ac_tests", "base_merge"} <= na
+
+    state = brief["state_review"]
+    assert state["generation"] == 2 and state["expected_generation"] == 2
+    assert state["label"] == "результат: состояние"
+    assert state["rollback"] == ROLLBACK
+    assert [a["id"] for a in state["acceptance_criteria"]] == ["AC-1", "AC-2"]
+    assert state["evidence_complete"] is True
+    assert {e["generation"] for e in state["evidence"]} == {2}, "поколение 1 не в брифе"
+    first = state["evidence"][0]
+    assert first["observed"] == "повторное наблюдение, поколение 2"
+    assert first["observed_at"] == "2026-10-09T12:00:00Z"
+    assert first["action"] and first["target"] and first["author"]
+    assert brief["verdict_route"]["final"] == "human"
+    assert brief["verdict_route"]["code"] == "state_task_no_automation"
+    assert spy.calls == [], f"бриф state ходил в git: {spy.calls}"
+
+    async def fake_get(path):
+        return brief
+
+    monkeypatch.setattr(mcp_server, "_api_get", fake_get)
+    text = (await mcp_server.hub_get_review_brief(task_id)).content[0].text
+    for needle in (
+        "результат: состояние",
+        ROLLBACK,
+        "поколение 2",
+        "expected_generation=2",
+        "повторное наблюдение, поколение 2",
+        "2026-10-09T12:00:00Z",
+        "не применимо",
+    ):
+        assert needle in text, needle
+    assert "sha_check: unknown" not in text and "Branch:" not in text

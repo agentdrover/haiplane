@@ -29,6 +29,11 @@ from typing import Any
 import aiosqlite
 
 from hub.mcp_envelope import route_line
+from hub.services.result_kind import (
+    AUTOMATION_REFUSAL,
+    AUTOMATION_REFUSAL_CODE,
+    automation_not_applicable,
+)
 
 DECIDER_POLICY = "policy"
 DECIDER_STEWARD = "steward"
@@ -204,6 +209,12 @@ async def verdict_route(
             DECIDER_NONE, DECIDER_NONE, "", CODE_NOT_IN_REVIEW, "задача не на ревью"
         )
     task = dict(row)
+    if automation_not_applicable(task):
+        # #1648: задача-состояние (#1647) — вердикт ТОЛЬКО человека, и причина
+        # названа тем же текстом, что в отказах дверей автоматики. До стойки
+        # автопилота не доходим: она ищет машинный отчёт, которого у такой
+        # задачи нет, и отвечала бы «нет отчёта» вместо настоящей причины.
+        return _human(AUTOMATION_REFUSAL_CODE, AUTOMATION_REFUSAL)
     stance = await auto_verdict.autopilot_stance(db, task_id, observe=observe)
     if stance.outcome == auto_verdict.OUTCOME_APPROVE:
         return VerdictRoute(

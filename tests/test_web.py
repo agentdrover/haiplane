@@ -7640,3 +7640,69 @@ async def test_web_key_form_can_scope_the_key_to_a_project(
     ]
     assert bad.status_code == 422, "same status as the API"
     assert "nope" in str(dict(bad.headers)), "the refusal names the project"
+
+
+async def test_state_task_card_shows_evidence_and_posts_generation_with_verdict(
+    client: AsyncClient, db
+):
+    """AC-3 (#1648): карточка state-задачи в review — метка «результат:
+    состояние», rollback и таблица доказательств поколения; нет «тесты 0 из 0»
+    и строк про отсутствующий CI; форма несёт expected_generation, форма с
+    устаревшим поколением получает 409 и ничего не записывает."""
+    from tests.state_support import (
+        ROLLBACK,
+        GitSpy,
+        drive_to_second_generation,
+        make_state_task,
+    )
+    from hub.integrations.registry import plugins
+
+    task_id = await make_state_task(db, title="Переключить DNS")
+    await drive_to_second_generation(client, db, task_id)
+    original_git = plugins.git_ops
+    spy = GitSpy()
+    plugins.git_ops = spy
+    try:
+        page = (await client.get(f"/tasks/{task_id}")).text
+    finally:
+        plugins.git_ops = original_git
+
+    text = html.unescape(page)
+    assert "результат: состояние" in text
+    assert ROLLBACK in text
+    assert "повторное наблюдение, поколение 2" in text, "доказательство поколения 2"
+    assert "отвечает 203.0.113.7" not in text, "поколение 1 на карточке не показано"
+    assert "2026-10-09T12:00:00Z" in text
+    for absent in (
+        "0 из 0",
+        "CI по коммиту",
+        "CI по закреплённому коммиту",
+        "нет отчёта",
+    ):
+        assert absent not in text, absent
+    assert 'name="expected_generation" value="2"' in page
+    assert spy.calls == [], f"карточка state ходила в git: {spy.calls}"
+
+    # устаревшая форма: плоский POST — 303 с причиной на карточке, htmx — 409
+    stale = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved", "comments": "", "expected_generation": "1"},
+        follow_redirects=False,
+    )
+    assert stale.status_code == 303 and "review_error=" in stale.headers["location"]
+    stale_htmx = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved", "comments": "", "expected_generation": "1"},
+        headers={"HX-Request": "true"},
+    )
+    assert stale_htmx.status_code == 409, stale_htmx.text
+    assert "поколен" in stale_htmx.text
+    assert dict(await repo.get_task(db, task_id))["status"] == "review"
+
+    ok = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved", "comments": "", "expected_generation": "2"},
+        follow_redirects=False,
+    )
+    assert ok.status_code == 303 and "review_error" not in ok.headers["location"]
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"

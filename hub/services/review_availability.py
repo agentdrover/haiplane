@@ -32,6 +32,7 @@ from hub import repository as repo
 from hub.db import fetchall
 from hub.models import GenerationReview
 from hub.services.orchestration import report_has_evidence
+from hub.services.result_kind import automation_not_applicable
 
 #: Начала алертов ``maybe_dispatch_review``, означающих «провайдер агента не
 #: создал»: прямой отказ и ответ, который не дошёл при подтверждённой пустоте.
@@ -200,6 +201,13 @@ async def _generation_review_since(
     Одно правило на двоих: бриф и сторож очереди читают ответ отсюда, и
     второго определения «у сдачи нет ревью из-за провайдера» не заводится.
     """
+    if automation_not_applicable(task_row):
+        # #1648: машинного ревью у задачи-состояния нет по определению, и
+        # причина — не «не заказано» и не отказ провайдера, а вид задачи.
+        from hub.services import state_review
+
+        state_view = await state_review.state_view_of(db, task_row)
+        return state_review.state_generation_review(task_row, state_view), ""
     task_id = int(task_row["id"])
     generation = int(task_row.get("submission_generation") or 0)
     submission = await repo.get_submission(db, task_id, generation)
@@ -273,6 +281,10 @@ async def _review_queue(
     starts: list[str] = []
     for row in rows:
         task = dict(row)
+        if automation_not_applicable(task):
+            # #1648: сторож провайдера считает ждущие машинное ревью; задача-
+            # состояние его не ждёт и отказов провайдера у неё не бывает.
+            continue
         view, submitted_at = await _generation_review_since(db, task)
         if view.has_review:
             continue

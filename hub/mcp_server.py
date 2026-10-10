@@ -2758,6 +2758,9 @@ def _brief_evidence_lines(brief: dict[str, Any]) -> list[str]:
     they move together, and the base-merge block stays immediately above the
     coverage line that counts it.
     """
+    if brief.get("state_review"):
+        # #1648: у задачи-состояния вместо веток и CI — блок «что принимается».
+        return _state_review_lines(brief["state_review"])
     parts: list[str] = []
     # #1233: расхождение с базой — ДО вердикта. Раньше человек узнавал о нём
     # из отказа доставки, то есть после того, как одобрение уже потрачено.
@@ -2778,6 +2781,40 @@ def _brief_evidence_lines(brief: dict[str, Any]) -> list[str]:
             for miss in coverage.get("checks_missing") or []
         )
     return parts
+
+
+def _state_review_lines(state: dict[str, Any]) -> list[str]:
+    """Блок «что принимается» для задачи-состояния (#1648).
+
+    Вместо веток и CI — вид результата, rollback, доказательства ТЕКУЩЕГО
+    поколения и число, которое вердикт обязан назвать. Проверки кода названы
+    «не применимо» одной строкой, а не пропущены молча.
+    """
+    generation = state.get("generation", 0)
+    parts = [
+        f"\n{state.get('label', 'результат: состояние')} — поколение {generation}",
+        str(state.get("headline") or ""),
+        f"Rollback: {state.get('rollback') or 'не назван'}",
+        "Evidence of the current generation (the author's word, not run by the hub):",
+    ]
+    for ev in state.get("evidence") or []:
+        parts.append(
+            f"  {ev.get('ac_id', '?')} | действие: {ev.get('action', '')} | "
+            f"наблюдение: {ev.get('observed', '')} | над чем: {ev.get('target', '')} "
+            f"| когда: {ev.get('observed_at', '')} | автор: {ev.get('author', '')}"
+        )
+    for ac_id in state.get("missing_ac") or []:
+        parts.append(f"  {ac_id} | записи этого поколения нет")
+    na = state.get("not_applicable") or []
+    if na:
+        parts.append(
+            "Проверки кода — не применимо: "
+            + "; ".join(f"{c.get('check', '?')} ({c.get('reason', '')})" for c in na)
+        )
+    parts.append(
+        f"Verdict: only a human, with expected_generation={state.get('expected_generation', generation)}."
+    )
+    return [line for line in parts if line]
 
 
 @mcp.tool()

@@ -27,7 +27,8 @@ import aiosqlite
 
 from hub import repository as repo
 from hub.db import fetchall
-from hub.services import project_path, review_evidence
+from hub.services import project_path, review_evidence, state_review
+from hub.services.result_kind import automation_not_applicable
 from hub.services.ci_report import (
     VALIDATION_FAIL,
     VALIDATION_PASS,
@@ -149,6 +150,18 @@ async def _verdict_grounds(
     db: aiosqlite.Connection, task: dict[str, Any], route_line: str
 ) -> tuple[str, bool]:
     """(основание, предлагать ли вердикт): только по полному отчёту текущего поколения."""
+    if automation_not_applicable(task):
+        # #1648: у задачи-состояния машинного отчёта не будет — вердикт
+        # предлагается по полному комплекту доказательств ТЕКУЩЕГО поколения.
+        view = await state_review.state_view_of(db, task)
+        if view.evidence_complete:
+            return (
+                f"доказательства поколения {view.generation} по "
+                f"{len(view.evidence)} AC, rollback "
+                f"{'назван' if view.rollback else 'не назван'}; {route_line}",
+                True,
+            )
+        return f"{view.headline}; {route_line}", False
     report = await review_evidence.report_view(
         db, task, await repo.get_latest_machine_review(db, int(task["id"]))
     )
