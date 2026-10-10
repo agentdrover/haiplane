@@ -805,3 +805,47 @@ def test_no_dead_review_agent_wrapper():
         if dead in line
     ]
     assert mentions == []
+
+
+async def test_a_key_across_the_truncation_border_leaves_no_prefix(
+    monkeypatch, _configured, caplog
+):
+    """#1222 P1: очистка идёт ДО обрезки; на границе 300 не остаётся префикса."""
+    import logging
+
+    key = "sk-abcdefghijklmnopqrstu"  # 24 символа
+    assert len(key) == 24
+    monkeypatch.setattr(config, "CURSOR_API_KEY", key)
+    body = "x" * 277 + key + "tail"
+    recorder = _Recorder(httpx.Response(400, text=body))
+    _patch_transport(monkeypatch, recorder)
+
+    with caplog.at_level(logging.WARNING, logger="hub.integrations.cursor_cloud"):
+        _created, refusal = await cursor_cloud.create_agent_attempt(
+            repo_url="https://github.com/o/r",
+            starting_ref="task-1/x",
+            model_id="grok-4",
+            prompt_text="review",
+            hub_mcp_url="https://agenthai.ru/mcp",
+            reviewer_token="t",
+        )
+
+    assert refusal is not None
+    for n in range(6, len(key) + 1):
+        assert key[:n] not in caplog.text
+        assert key[:n] not in refusal.detail
+
+
+def test_an_explicit_short_secret_is_scrubbed(monkeypatch):
+    """#1222 P2: порог длины — только для эвристики, не для явных секретов."""
+    monkeypatch.setenv("HAIPLANE_HUB_TOKENS", "bob:abcde")
+    assert cursor_cloud.scrub_secrets("Bearer abcde") == "Bearer [redacted]"
+
+
+def test_composite_tokens_scrub_only_the_token_field(monkeypatch):
+    """#1222 P2: имя и роль остаются в диагностике, токен вычищен."""
+    monkeypatch.setenv("HAIPLANE_HUB_TOKENS", "invalid_model:TOKsecret99:claude-sonnet")
+    text = "invalid_model claude-sonnet TOKsecret99"
+    out = cursor_cloud.scrub_secrets(text)
+    assert "invalid_model" in out and "claude-sonnet" in out
+    assert "TOKsecret99" not in out
