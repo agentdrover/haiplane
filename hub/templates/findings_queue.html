@@ -52,6 +52,7 @@
         сдача {{ g.generation }} · {{ g.task_status }}{% if g.model %} · {{ g.model }}{% endif %}{% if g.reported_at %} · отчёт от {{ g.reported_at }}{% endif %}
     </div>
     <form method="post" action="/tasks/{{ g.task_id }}/web-finding-dispositions">
+      {{ csrf_field() }}
         {# Возврат в очередь, а не в карточку: иначе разметка второго отчёта
            требует навигации назад, то есть ровно той цены, которую эта
            страница снимает. #}
