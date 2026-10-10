@@ -18388,3 +18388,57 @@ async def test_off_without_a_local_path_still_names_the_policy(
     assert len(events) == 1 and events[0]["reason"] == _POLICY_REASON
     assert len(await _policy_alerts(db, task_id)) == 1
     assert await _local_dispatches(db, task_id) == []
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_a_failed_second_door_insert_releases_the_write_lock(
+    client: AsyncClient,
+    db: aiosqlite.Connection,
+    db_dsn,
+    monkeypatch,
+    tmp_path,
+    failure,
+):
+    """#1653: исключение после BEGIN IMMEDIATE откатывает транзакцию (и CancelledError).
+
+    Брошенная открытая транзакция держала бы write-лок всей базы («database is
+    locked», #1428): второе соединение пишет сразу, строки диспетча нет.
+    """
+    from hub.services.review_dispatch import dispatch_local_review
+
+    _wire(
+        monkeypatch,
+        _DispatchRecorder({"agent": {"id": "bc-lockfree"}, "run": {"id": "r-1"}}),
+    )
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    task_id = await _submitted(
+        client, db, f"fb-rollback-{failure.__name__}",
+        policy=_fallback_policy("on"), diff=_DIFF_506,
+    )  # fmt: skip
+    task = dict(await repo.get_task(db, task_id))
+
+    async def _boom(*args, **kwargs):
+        raise failure()
+
+    monkeypatch.setattr(repo, "create_review_dispatch", _boom)
+    with pytest.raises(failure):
+        await dispatch_local_review(
+            db,
+            task,
+            "github",
+            task["branch"],
+            1,
+            cloud_refusal="usage_limit_exceeded",
+            second_door=True,
+        )
+    assert not db.in_transaction, "транзакция не осталась открытой"
+
+    other = await aiosqlite.connect(db_dsn, uri=True)
+    try:
+        await other.execute("PRAGMA busy_timeout = 100")
+        await other.execute("UPDATE projects SET name = name WHERE id = 1")
+        await other.commit()
+    finally:
+        await other.close()
+    assert await _local_dispatches(db, task_id) == []

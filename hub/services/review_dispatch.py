@@ -5242,62 +5242,11 @@ async def dispatch_local_review(
         await _dispatch_report(db, task_id, generation, late_report_recheck) is not None
     ):
         return False
-    if second_door:
-        # #1653: политика перечитывается ПОД write-локом, взятым здесь и
-        # отпускаемым коммитом вставки ниже: PATCH off не может закоммититься
-        # между этим чтением и INSERT диспетча.
-        await db.commit()
-        await db.execute("BEGIN IMMEDIATE")
-        if await _second_door_forbidden(db, task, generation, late_report_recheck):
-            return False
-    run_id = uuid.uuid4().hex[:12]
-    dispatch_id = await repo.create_review_dispatch(
-        db,
-        task_id=task_id,
-        submission_generation=generation,
-        agent_id=f"local:{run_id}",
-        run_id=run_id,
-        model=order.model,
-        profile=order.profile,
-        profile_assignment=order.profile_assignment,
-        reviewer_principal_id=principal_id,
-        channel=LOCAL_CHANNEL,
-        replaces_dispatch_id=(
-            int(late_report_recheck["id"]) if late_report_recheck is not None else None
-        ),
-        second_door_reason=why,
-        only_tests=order.only_tests,
+    dispatch_id, run_id = await _insert_local_dispatch(
+        db, task, order, why, principal_id, generation, late_report_recheck, second_door
     )
-    await repo.add_task_update(
-        db,
-        task_id,
-        "hub",
-        "status",
-        f"Машинное ревью запущено ЛОКАЛЬНО: {why}, "
-        f"прогон идёт на хосте хаба под песочницей (#1180). "
-        f"Профиль {order.profile}{_named_local_model(order.model)}, "
-        f"прогон {run_id}. Правила репозитория: "
-        f"{order.rules_note} (#873). Предмет ревью: {order.diff_note} (#874). "
-        f"{snapshot_note(order.snapshot)}"
-        "Отчёт придёт по контракту от принципала локального ревьюера — "
-        "его независимость держит токен, а не машина (#728).",
-    )
-    await repo.insert_event(
-        db,
-        kind="review_dispatched",
-        task_id=task_id,
-        actor="policy",
-        payload={
-            "model": order.model,
-            "agent_id": f"local:{run_id}",
-            "run_id": run_id,
-            "generation": generation,
-            "profile": order.profile,
-            "profile_reasons": order.reasons,
-            "channel": LOCAL_CHANNEL,
-        },
-    )
-    await db.commit()
+    if dispatch_id is None:
+        return False
     await _start_local_run(
         db,
         dispatch_id,
@@ -5309,6 +5258,89 @@ async def dispatch_local_review(
         order.snapshot,
     )
     return True
+
+
+async def _insert_local_dispatch(
+    db: aiosqlite.Connection,
+    task: dict[str, Any],
+    order: Any,
+    why: str,
+    principal_id: int,
+    generation: int,
+    late_report_recheck: dict[str, Any] | None,
+    second_door: bool,
+) -> tuple[int | None, str]:
+    """Строка локального заказа, лента и событие — одна транзакция (#1653).
+
+    Для второй двери участок от ``BEGIN IMMEDIATE`` до коммита идёт под
+    write-локом, и при ЛЮБОМ исключении (включая CancelledError) он
+    откатывается: брошенная открытая транзакция держала бы write-лок всей
+    базы хаба («database is locked», #1428). Политика перечитывается под этим
+    локом: PATCH off не может закоммититься между чтением и INSERT. Запрет —
+    ``(None, "")``.
+    """
+    task_id = int(task["id"])
+    try:
+        if second_door:
+            await db.commit()
+            await db.execute("BEGIN IMMEDIATE")
+            if await _second_door_forbidden(db, task, generation, late_report_recheck):
+                return None, ""
+        run_id = uuid.uuid4().hex[:12]
+        dispatch_id = await repo.create_review_dispatch(
+            db,
+            task_id=task_id,
+            submission_generation=generation,
+            agent_id=f"local:{run_id}",
+            run_id=run_id,
+            model=order.model,
+            profile=order.profile,
+            profile_assignment=order.profile_assignment,
+            reviewer_principal_id=principal_id,
+            channel=LOCAL_CHANNEL,
+            replaces_dispatch_id=(
+                int(late_report_recheck["id"])
+                if late_report_recheck is not None
+                else None
+            ),
+            second_door_reason=why,
+            only_tests=order.only_tests,
+        )
+        await repo.add_task_update(
+            db,
+            task_id,
+            "hub",
+            "status",
+            f"Машинное ревью запущено ЛОКАЛЬНО: {why}, "
+            f"прогон идёт на хосте хаба под песочницей (#1180). "
+            f"Профиль {order.profile}{_named_local_model(order.model)}, "
+            f"прогон {run_id}. Правила репозитория: "
+            f"{order.rules_note} (#873). Предмет ревью: {order.diff_note} (#874). "
+            f"{snapshot_note(order.snapshot)}"
+            "Отчёт придёт по контракту от принципала локального ревьюера — "
+            "его независимость держит токен, а не машина (#728).",
+        )
+        await repo.insert_event(
+            db,
+            kind="review_dispatched",
+            task_id=task_id,
+            actor="policy",
+            payload={
+                "model": order.model,
+                "agent_id": f"local:{run_id}",
+                "run_id": run_id,
+                "generation": generation,
+                "profile": order.profile,
+                "profile_reasons": order.reasons,
+                "channel": LOCAL_CHANNEL,
+            },
+        )
+        await db.commit()
+        return dispatch_id, run_id
+    except BaseException:
+        if second_door:
+            await db.rollback()
+        raise
 
 
 class _LocalFirstDeclined(Exception):
