@@ -37,6 +37,7 @@ from hub.models import (
     CIEvidenceBlock,
     CIEvidenceState,
     CIRunReportState,
+    DiffBaseState,
     EvidenceCoverage,
     GenerationReview,
     LiveCheckState,
@@ -63,6 +64,7 @@ NOT_APPLICABLE_CHECKS: tuple[tuple[str, str], ...] = (
     ("sha_check", "у задачи нет ветки и закреплённого коммита: сверять нечего"),
     ("ci_run_report", "кода нет, CI не запускается"),
     ("ac_tests", "AC подтверждаются наблюдениями, а не тестами"),
+    ("diff_base", "дифф не строится: ветки нет, базу сравнения выбирать не от чего"),
     ("base_merge", "мержить нечего: ветки и PR нет"),
     ("path_notices", "диффа нет, пути не проверяются"),
     ("call_sites", "диффа нет, вызовы символов не ищутся"),
@@ -282,6 +284,9 @@ async def build_state_brief(
         live_check=LiveCheckState(
             state=NOT_APPLICABLE, reason="пробы кода не заявлены"
         ),
+        # Дефолт DiffBaseState — unverified с пустой причиной, то есть «не
+        # смогли сверить базу» (#725). Здесь сверять нечего, и это названо.
+        diff_base=DiffBaseState(state=NOT_APPLICABLE, reason=reasons["diff_base"]),
         base_merge=BaseMergeState(state=NOT_APPLICABLE, reason=reasons["base_merge"]),
         scope_in=task_view.scope_in,
         scope_out=task_view.scope_out,

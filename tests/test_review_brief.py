@@ -1707,7 +1707,7 @@ async def test_brief_never_imports_task_branch_code(
 
 
 async def test_state_brief_shows_generation_evidence_and_marks_code_checks_not_applicable(
-    client: AsyncClient, db, monkeypatch
+    client: AsyncClient, db, monkeypatch, capsys
 ):
     """AC-2 (#1648): бриф state-задачи (REST и MCP) показывает снимок AC,
     rollback, доказательства поколения 2 с автором и observed_at, номер
@@ -1736,6 +1736,9 @@ async def test_state_brief_shows_generation_evidence_and_marks_code_checks_not_a
     assert brief["call_sites"]["status"] == "not_applicable"
     assert brief["ac_test_results"] == [] and brief["locator_resolution"] == []
     assert brief["path_notices"] is None
+    # #725: дефолт DiffBaseState — unverified без причины; для state он ложен.
+    assert brief["diff_base"]["state"] == "not_applicable", brief["diff_base"]
+    assert brief["diff_base"]["reason"] and not brief["diff_command"]
     for block in ("mutations", "baseline"):
         ci = brief["ci_evidence"][block]
         assert ci["state"] == "not_applicable", (block, ci)
@@ -1744,7 +1747,27 @@ async def test_state_brief_shows_generation_evidence_and_marks_code_checks_not_a
     missing = {c["check"] for c in brief["evidence_coverage"]["checks_missing"]}
     assert not missing, "ничего из кода не «отсутствует»: оно не применимо"
     na = {c["check"] for c in brief["evidence_coverage"]["checks_not_applicable"]}
-    assert {"sha_check", "ci_run_report", "ac_tests", "base_merge"} <= na
+    assert {"sha_check", "ci_run_report", "ac_tests", "base_merge", "diff_base"} <= na
+
+    # Ни одно поле брифа не остаётся с ложным дефолтом «не смогли узнать»:
+    # проверенные поля (state-блоки, у которых дефолт unverified/unknown/
+    # not_received) либо not_applicable, либо названы в not_applicable выше.
+    for path in (
+        ("sha_check",),
+        ("ci_run_report", "state"),
+        ("ci_evidence", "mutations", "state"),
+        ("ci_evidence", "baseline", "state"),
+        ("prepass", "state"),
+        ("validation", "state"),
+        ("live_check", "state"),
+        ("diff_base", "state"),
+        ("base_merge", "state"),
+        ("call_sites", "status"),
+    ):
+        value = brief
+        for key in path:
+            value = value[key]
+        assert value == "not_applicable", (path, value)
 
     state = brief["state_review"]
     assert state["generation"] == 2 and state["expected_generation"] == 2
@@ -1763,6 +1786,19 @@ async def test_state_brief_shows_generation_evidence_and_marks_code_checks_not_a
 
     async def fake_get(path):
         return brief
+
+    # CLI печатает тот же JSON брифа: diff_base не теряется и там (#725).
+    import argparse
+    import json as _json
+
+    from hub import cli
+
+    monkeypatch.setattr(cli, "_api", lambda *_a, **_k: brief)
+    cli.cmd_review_brief(argparse.Namespace(task_id=task_id))
+    printed = capsys.readouterr().out
+    cli_brief = _json.loads(printed[printed.index("{") :])
+    assert cli_brief["diff_base"]["state"] == "not_applicable"
+    assert cli_brief["diff_base"]["reason"]
 
     monkeypatch.setattr(mcp_server, "_api_get", fake_get)
     text = (await mcp_server.hub_get_review_brief(task_id)).content[0].text
