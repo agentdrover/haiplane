@@ -17816,7 +17816,18 @@ async def test_second_door_stays_closed_when_policy_is_off(
         wait_for_local_runs,
     )
 
+    from hub.services import review_dispatch as rd
+
     launched = _count_local_launches(monkeypatch)
+    local_orders: list[int] = []
+    real_order = rd.prepare_review_order
+
+    async def _count_local_orders(*args, **kwargs):
+        if kwargs.get("principal_id") is not None:
+            local_orders.append(1)  # облачный заказ принципала не несёт
+        return await real_order(*args, **kwargs)
+
+    monkeypatch.setattr(rd, "prepare_review_order", _count_local_orders)
     slug = f"fb-off-{entry}-{fallback}"
     if entry == "sweep":
         recorder = _DispatchRecorder({"agent": {"id": "bc-off"}, "run": {"id": "r-1"}})
@@ -17859,6 +17870,7 @@ async def test_second_door_stays_closed_when_policy_is_off(
     await db.commit()
 
     assert launched == [], "прогон не запущен"
+    assert local_orders == [], "локальный заказ даже не готовился: вход закрыт рано"
     assert await _local_dispatches(db, task_id) == [], "локального диспетча нет"
     assert await _debts(db, task_id) == [], "статус second_door не остаётся"
     rows = await _all_dispatches(db, task_id)
@@ -17921,6 +17933,8 @@ async def test_closed_second_door_survives_a_crash_without_duplicates(
     except RuntimeError:
         pass  # ровно то, что поллер глотает и забывает
     assert crashed["n"] == 1, "предпосылка: сбой случился после записи причины"
+    assert await _policy_events(db, task_id) == [], "полузаписи нет: всё откачено"
+    assert await _policy_alerts(db, task_id) == []
     await sweep_review_dispatches(db)
     await sweep_review_dispatches(db)
     await db.commit()
@@ -17932,6 +17946,13 @@ async def test_closed_second_door_survives_a_crash_without_duplicates(
     events = await _policy_events(db, task_id)
     assert [e["dispatch_id"] for e in events] == [cloud["id"]], events
     assert len(await _policy_alerts(db, task_id)) == 1, "сообщение одно на dispatch_id"
+    # Повторное закрытие того же долга (повторный свип до закрытия) не множит ни
+    # событие, ни сообщение: ключ дедупа — dispatch_id.
+    from hub.services import review_dispatch as rd
+
+    await rd._close_second_door_by_policy(db, task_id, 1, cloud)
+    assert len(await _policy_events(db, task_id)) == 1
+    assert len(await _policy_alerts(db, task_id)) == 1
 
 
 async def test_policy_turned_off_mid_dispatch_inserts_nothing(
@@ -18141,8 +18162,11 @@ async def test_fallback_key_leaves_other_local_paths_alone(
     ).read_text()
     assert "local_review_fallback" not in advisor_src
 
+    # (e) поздний собственный отчёт облака закрывает диспетч в done.
+    await _late_cloud_report_closes_as_done_when_off(client, db, monkeypatch, tmp_path)
 
-async def test_a_late_cloud_report_still_closes_the_dispatch_as_done_when_off(
+
+async def _late_cloud_report_closes_as_done_when_off(
     client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
 ):
     """AC-6 (#1653): поздний собственный отчёт облака закрывает диспетч в done при off."""
@@ -18153,7 +18177,6 @@ async def test_a_late_cloud_report_still_closes_the_dispatch_as_done_when_off(
     recorder = _DispatchRecorder({"agent": {"id": "bc-late-off"}, "run": {"id": "r-1"}})
     _wire(monkeypatch, recorder)
     cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
-    await _local_principal(db, monkeypatch)
     _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
     task_id = await _submitted(
         client, db, "fb-late-off", policy=_fallback_policy(None), diff=_DIFF_506
