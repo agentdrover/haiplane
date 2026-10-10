@@ -38,6 +38,7 @@ from hub.actionable_errors import (
     withdraw_agent_only_detail,
 )
 from hub.config import TokenIdentity
+from hub.csrf import MUTATING_METHODS, request_session_token_ok
 from hub.mcp_internal_auth import (
     bearer_context_reset,
     bearer_context_set,
@@ -113,6 +114,28 @@ def verify_csrf(request_token: str | None, cookie_token: str | None) -> bool:
         hashlib.sha256(request_token.encode()).hexdigest()
         == hashlib.sha256(cookie_token.encode()).hexdigest()
     )
+
+
+def cookie_csrf_ok(request: Request, presented: str | None) -> bool:
+    """Token check for a handler that verifies it itself (#1664).
+
+    Accepts the session-bound token, and — while the pages that still hand out
+    the old double-submit value exist (CSRF B) — that value too.
+    """
+    return request_session_token_ok(request, presented) or verify_csrf(
+        presented, request.cookies.get(CSRF_COOKIE_NAME, "")
+    )
+
+
+def csrf_exempt_transport(request: Request) -> bool:
+    """A Bearer caller is not asked for a token (#1664).
+
+    Open mode is NOT exempt here: before this task the handlers asked it for a
+    token too, and the global middleware is what skips open mode, not the
+    per-handler checks.
+    """
+    identity = getattr(request.state, "identity", None)
+    return getattr(identity, "transport", "") == "bearer"
 
 
 _PUBLIC_PATHS: Final[frozenset[str]] = frozenset(
@@ -428,7 +451,7 @@ ANONYMOUS_IDENTITY: Final[TokenIdentity] = TokenIdentity(
     "anonymous", "human", auth_source="anonymous"
 )
 OPEN_MODE_IDENTITY: Final[TokenIdentity] = TokenIdentity(
-    "anonymous", "human", auth_source="open_mode"
+    "anonymous", "human", auth_source="open_mode", transport="open"
 )
 
 
@@ -552,6 +575,62 @@ async def _resolve_chat_pair(request: Request, token: str) -> TokenIdentity | No
         return None
 
 
+def _stamped(identity: TokenIdentity, transport: str) -> TokenIdentity:
+    """A copy that records how the caller proved who it is (#1664).
+
+    A copy, never the shared object: env identities live in ``config.HUB_TOKENS``
+    and serve Bearer and cookie callers alike.
+    """
+    return TokenIdentity(
+        identity.username,
+        identity.role,
+        identity.principal_id,
+        identity.permissions,
+        auth_source=identity.auth_source,
+        api_key_id=identity.api_key_id,
+        chat_pair_kind=identity.chat_pair_kind,
+        chat_pair_task_id=identity.chat_pair_task_id,
+        chat_pair_generation=identity.chat_pair_generation,
+        scopes=identity.scopes,
+        scopes_damaged=identity.scopes_damaged,
+        transport=transport,
+    )
+
+
+def _bearer_presented(request: Request) -> bool:
+    """Whether the request tried to authenticate with Bearer, valid or not.
+
+    ``_extract_bearer`` returns nothing for an empty token, which is exactly
+    the case that must not be mistaken for "no Bearer at all" (#1664).
+    """
+    header = request.headers.get("authorization") or ""
+    parts = header.split(None, 1)
+    return bool(parts) and parts[0].lower() == "bearer"
+
+
+async def _resolve_bearer(request: Request, bearer: str) -> TokenIdentity | None:
+    identity = await _resolve_chat_pair(request, bearer)
+    if identity:
+        return identity
+    identity = await _resolve_db_bearer(request, bearer)
+    if identity:
+        return identity
+    identity = _resolve_env_token(bearer)
+    if identity:
+        return _with_auth_source(identity, "env")
+    return None
+
+
+async def _resolve_cookie(request: Request, cookie: str) -> TokenIdentity | None:
+    identity = await _resolve_db_session(request, cookie)
+    if identity:
+        return identity
+    identity = _resolve_env_token(cookie)
+    if identity:
+        return _with_auth_source(identity, "env")
+    return None
+
+
 async def _resolve_identity(request: Request) -> TokenIdentity | None:
     """Resolve identity from bearer header or session cookie.
 
@@ -559,27 +638,25 @@ async def _resolve_identity(request: Request) -> TokenIdentity | None:
     cookie DB session > cookie env token. Chat-pair goes first because its
     tokens carry their own prefix — the lookup is one indexed hash, and the
     session must never be mistaken for the API key of the same principal.
+
+    A Bearer that was presented but did not resolve ends the search for a
+    mutating method (#1664): falling through to the cookie would let a stale or
+    empty ``Authorization`` header turn a Bearer client's request into a cookie
+    request, which is the one kind a foreign page can forge.
     """
     bearer = _extract_bearer(request)
     if bearer:
-        identity = await _resolve_chat_pair(request, bearer)
+        identity = await _resolve_bearer(request, bearer)
         if identity:
-            return identity
-        identity = await _resolve_db_bearer(request, bearer)
-        if identity:
-            return identity
-        identity = _resolve_env_token(bearer)
-        if identity:
-            return _with_auth_source(identity, "env")
+            return _stamped(identity, "bearer")
+    if request.method in MUTATING_METHODS and _bearer_presented(request):
+        return None
 
     cookie = _extract_cookie(request)
     if cookie:
-        identity = await _resolve_db_session(request, cookie)
+        identity = await _resolve_cookie(request, cookie)
         if identity:
-            return identity
-        identity = _resolve_env_token(cookie)
-        if identity:
-            return _with_auth_source(identity, "env")
+            return _stamped(identity, "cookie")
 
     return None
 

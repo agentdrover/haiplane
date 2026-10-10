@@ -4696,6 +4696,12 @@ class HealthView(BaseModel):
     # оператор считает включёнными, а код не читает. Имена, не значения.
     stale_env: list[str] = Field(default_factory=list)
     egress: EgressStatus = Field(default_factory=EgressStatus)
+    # CSRF for cookie sessions (#1664): the mode, how many requests warn mode
+    # let through that require would refuse, and where the key comes from.
+    csrf_mode: str = "warn"
+    csrf_would_reject_24h: int = 0
+    csrf_key_source: str = ""
+    csrf_warning: str = ""
 
 
 class EffectivePolicies(BaseModel):

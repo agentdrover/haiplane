@@ -30,6 +30,8 @@ from hub.actionable_errors import (
 from hub.auth import (
     CSRF_COOKIE_NAME,
     client_ip,
+    cookie_csrf_ok,
+    csrf_exempt_transport,
     current_user,
     current_identity,
     require_human_or_admin,
@@ -38,6 +40,7 @@ from hub.auth import (
     require_permission,
     verify_csrf,
 )
+from hub.csrf import token_for_request as csrf_token_for_request
 from hub.integrations.registry import plugins
 from hub.services import admin as admin_svc
 from hub.services import chat_pair as chat_pair_svc
@@ -81,7 +84,16 @@ HERE = Path(__file__).parent
 
 def _user_context(request: Request) -> dict[str, Any]:
     """Inject ``current_user`` into every Jinja template automatically."""
-    return {"current_user": getattr(request.state, "user", "anonymous")}
+    context: dict[str, Any] = {
+        "current_user": getattr(request.state, "user", "anonymous")
+    }
+    # #1664: the session-bound token reaches every page (meta tag and hx-headers
+    # in base.html). Starlette lets a processor override the view's own context,
+    # so the legacy double-submit value of the pages that still mint one is
+    # replaced by this one — which their handlers accept too.
+    if token := csrf_token_for_request(request):
+        context["csrf_token"] = token
+    return context
 
 
 TEMPLATES = Jinja2Templates(
@@ -426,7 +438,8 @@ async def _chat_pair_page(
 
 
 def _check_web_csrf(request: Request, csrf_token: str) -> bool:
-    return verify_csrf(csrf_token, request.cookies.get(CSRF_COOKIE_NAME, ""))
+    """A Bearer caller is not asked for a token (#1664)."""
+    return csrf_exempt_transport(request) or cookie_csrf_ok(request, csrf_token)
 
 
 @router.get("/chat-pair", response_class=HTMLResponse)
