@@ -510,8 +510,8 @@ async def _instant(_delay: float) -> None:
 
 def test_case_sessions_cannot_mutate_production(tmp_path, monkeypatch):
     """AC-3: сессии независимы, прод не тронут, секретов в артефакте нет."""
-    secret_key = "sk-secret-CURSOR-0123456789"
-    secret_hub = "tok-secret-HUB-0123456789"
+    secret_key = "sk-secret-CURSOR-0123456789"  # pragma: allowlist secret
+    secret_hub = "tok-secret-HUB-0123456789"  # pragma: allowlist secret
     monkeypatch.setattr(config, "CURSOR_API_KEY", secret_key)
     monkeypatch.setattr(config, "STEWARD_HUB_TOKEN", secret_hub)
     monkeypatch.setenv("CURSOR_API_KEY", secret_key)
