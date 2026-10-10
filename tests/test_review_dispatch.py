@@ -18442,3 +18442,58 @@ async def test_a_failed_second_door_insert_releases_the_write_lock(
     finally:
         await other.close()
     assert await _local_dispatches(db, task_id) == []
+
+
+@pytest.mark.parametrize(
+    "b_replaces_a", [False, True], ids=["ladder-rung", "ask-again"]
+)
+async def test_a_report_settles_only_the_policy_closed_order_it_belongs_to(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, b_replaces_a
+):
+    """#1653: заказ A закрыт по политике, B активен в том же поколении.
+
+    Без замещения (ступень лестницы) первый отчёт принадлежит A: A done, B
+    active. С замещением (переспрос) отчёт принадлежит B: A не меняется.
+    """
+    from hub.models import MachineReviewSubmit
+    from hub.services.machine_review_intake import record_machine_review
+
+    _wire(
+        monkeypatch,
+        _DispatchRecorder({"agent": {"id": "bc-a"}, "run": {"id": "r-a"}}),
+    )
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(
+        client, db, f"fb-owner-{b_replaces_a}", policy=_fallback_policy(None)
+    )
+    a = (await _all_dispatches(db, task_id))[0]
+    await db.execute(
+        "UPDATE review_dispatches SET status='failed', second_door_reason=? WHERE id=?",
+        (_POLICY_REASON, a["id"]),
+    )
+    b_id = await repo.create_review_dispatch(
+        db,
+        task_id=task_id,
+        submission_generation=1,
+        agent_id="bc-b",
+        run_id="r-b",
+        model=a["model"],
+        profile=a["profile"],
+        reviewer_principal_id=cloud_pid,
+        replaces_dispatch_id=int(a["id"]) if b_replaces_a else None,
+    )
+    await db.commit()
+
+    payload = {**_LOCAL_REPORT}
+    payload.pop("orchestrator", None)
+    await record_machine_review(
+        db,
+        task_id,
+        MachineReviewSubmit(**payload),
+        principal_id=cloud_pid,
+        username="cloud-reviewer",
+    )
+    await db.commit()
+    rows = {r["id"]: r["status"] for r in await _all_dispatches(db, task_id)}
+    assert rows[b_id] == "active", rows
+    assert rows[a["id"]] == ("failed" if b_replaces_a else "done"), rows

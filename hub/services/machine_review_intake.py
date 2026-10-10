@@ -329,9 +329,6 @@ async def record_machine_review(
         principal_id=principal_id,
         username=username,
     )
-    # #1653: отчёт ревьюера строки, закрытой по политике (local_review_fallback
-    # =off), возвращает её в done; свипы такую строку уже не видят.
-    await repo.settle_policy_closed_dispatches(db, task_id, generation, principal_id)
     new_review_id = await repo.insert_machine_review(
         db,
         task_id=task_id,
@@ -382,6 +379,15 @@ async def record_machine_review(
         # matches on this and on nothing self-reported.
         principal_id=principal_id,
     )
+    # #1653: отчёт возвращает в done только ту закрытую по политике строку
+    # (local_review_fallback=off), которой он принадлежит по общему правилу
+    # dispatch_for_report; свипы такую строку уже не видят.
+    from hub.services.review_dispatch import dispatch_for_report
+
+    mine = {"id": new_review_id}
+    owner = await dispatch_for_report(db, task_id, generation, mine)
+    if owner is not None:
+        await repo.settle_policy_closed_dispatch(db, int(owner["id"]), principal_id)
     # #1234: лента приёма — тоже читатель ступени. С одними raw/confirmed/
     # rejected отчёт с нулём подтверждённых и непустым unresolved выглядел в
     # ней ровно как чистый. Ступень — из той же функции, что и на карточке.

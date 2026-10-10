@@ -3766,22 +3766,24 @@ async def close_dispatch_by_policy(
     return cur.rowcount == 1
 
 
-async def settle_policy_closed_dispatches(
-    db: aiosqlite.Connection, task_id: int, generation: int, principal_id: int | None
+async def settle_policy_closed_dispatch(
+    db: aiosqlite.Connection, dispatch_id: int, principal_id: int | None
 ) -> None:
     """Поздний собственный отчёт облака возвращает закрытое по политике в done (#1653).
 
     Свипы берут только active и second_door, поэтому строка, закрытая как
-    failed с меткой политики, сама в done не вернётся. Её ревьюер отчитался —
-    значит заказ был, и он закрывается так же, как закрылся бы без политики.
-    Чужой принципал строку не трогает.
+    failed с меткой политики, сама в done не вернётся. Трогается ТОЛЬКО строка,
+    которой отчёт принадлежит (её определяет вызывающий общим правилом
+    ``dispatch_for_report``), и только при совпавшем принципале: строка без
+    принципала не совпадает ни с кем, чужой принципал строку не трогает.
     """
+    if principal_id is None:
+        return
     await db.execute(
         "UPDATE review_dispatches SET status='done' "
-        "WHERE task_id=? AND submission_generation=? AND channel='cloud' "
-        "AND status='failed' AND second_door_reason=? "
-        "AND (reviewer_principal_id IS NULL OR reviewer_principal_id IS ?)",
-        (task_id, generation, LOCAL_FALLBACK_OFF_REASON, principal_id),
+        "WHERE id=? AND channel='cloud' AND status='failed' "
+        "AND second_door_reason=? AND reviewer_principal_id=?",
+        (dispatch_id, LOCAL_FALLBACK_OFF_REASON, principal_id),
     )
 
 
