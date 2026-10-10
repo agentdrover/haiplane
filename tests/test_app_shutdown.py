@@ -215,18 +215,27 @@ async def test_local_withdrawal_survives_a_second_cancel_of_the_step():
             events.append("withdrawn")
             raise
 
+    closed: list[int] = []
+
+    async def fake_close(h):
+        closed.append(h.dispatch_id)
+
     run_task = asyncio.create_task(run())
     rd._LOCAL_RUNS[77002] = rd._LocalRunHandle(
         task=run_task, db_path="", dispatch_id=77002, task_id=1, generation=1
     )
     await asyncio.sleep(0)
-    step = asyncio.ensure_future(rd.cancel_local_runs())
-    await asyncio.sleep(0.05)
-    step.cancel()  # the second cancel
-    await asyncio.gather(step, return_exceptions=True)
-    await asyncio.sleep(0.5)
-    rd._LOCAL_RUNS.pop(77002, None)
+    try:
+        with patch.object(rd, "_close_cancelled_run", fake_close):
+            step = asyncio.ensure_future(rd.cancel_local_runs())
+            await asyncio.sleep(0.05)
+            step.cancel()  # the second cancel
+            await asyncio.gather(step, return_exceptions=True)
+            await asyncio.sleep(0.6)
+    finally:
+        rd._LOCAL_RUNS.pop(77002, None)
     assert events == ["withdrawn"]
+    assert closed == [77002]  # the dispatcher row is closed after the 2nd cancel
 
 
 async def test_advisor_withdrawal_survives_a_second_cancel_of_the_step():
@@ -259,10 +268,11 @@ async def test_advisor_withdrawal_survives_a_second_cancel_of_the_step():
             await asyncio.sleep(0.05)
             step.cancel()  # the second cancel
             await asyncio.gather(step, return_exceptions=True)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.6)
     finally:
         sal._HANDLES.pop(77003, None)
     assert events == ["withdrawn"]
+    assert closed == [77003]
 
 
 async def test_a_failing_stop_step_is_logged_by_name_and_the_stop_goes_on(caplog):
