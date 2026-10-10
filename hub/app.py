@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -340,20 +341,68 @@ async def _startup_checks(db: aiosqlite.Connection) -> None:
             )
 
 
-async def _stop_background(app: FastAPI, poll_task: "asyncio.Task[None]") -> None:
-    """Остановка фоновой работы: поллер, наблюдатель egress, локальные прогоны."""
-    poll_task.cancel()
+async def _stop_background(
+    app: FastAPI, poll_task: "asyncio.Task[None]", deadline: float | None = None
+) -> None:
+    """Остановка фоновой работы: все задачи отменяются и ожидаются под ОДНИМ пределом.
+
+    Раньше поллер отменялся без ожидания, задачи reaper/drift/red-base не имели
+    handles, а ожидание наблюдателя egress не имело предела (#1667): одна
+    зависшая задача держала выход процесса часами. Теперь предел общий
+    (``config.STOP_TIMEOUT_SECONDS``), не на задачу; не успевшая названа в логе,
+    остановка идёт дальше.
+    """
+    if deadline is None:
+        deadline = time.monotonic() + config.STOP_TIMEOUT_SECONDS
+    handles = dict(getattr(app.state, "background_tasks", None) or {})
     egress_task = getattr(app.state, "egress_task", None)
-    if egress_task is not None:
-        # Wait for the watcher to finish unwinding: its connection closes
-        # in its own finally, and the shared one is closed below.
-        egress_task.cancel()
-        try:
-            await egress_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            log.exception("egress watcher ended with an error")
+    for name, task in (("hub-poller", poll_task), ("hub-egress-watch", egress_task)):
+        if task is not None and task not in handles.values():
+            handles[name] = task
+    loop = asyncio.get_running_loop()
+    # Only live tasks of THIS loop: the state of a long-lived app object can
+    # still hold handles of an earlier run whose loop is gone.
+    tasks = {
+        n: t
+        for n, t in handles.items()
+        if isinstance(t, asyncio.Future) and t.get_loop() is loop
+    }
+    if not isinstance(poll_task, asyncio.Future):
+        poll_task.cancel()  # a stand-in for the poller, not a task
+    running = {t for t in tasks.values() if not t.done()}
+    for task in running:
+        task.cancel()
+    app.state.background_tasks = {}
+    app.state.egress_task = None
+    pending: set[asyncio.Future[Any]] = set()
+    if running:
+        _done, pending = await asyncio.wait(
+            running, timeout=max(0.0, deadline - time.monotonic())
+        )
+    for name, task in tasks.items():
+        if task in pending:
+            log.warning(
+                "background task %s did not stop within %ds",
+                name,
+                config.STOP_TIMEOUT_SECONDS,
+            )
+        elif not task.cancelled() and task.exception() is not None:
+            log.error(
+                "background task %s ended with an error",
+                name,
+                exc_info=task.exception(),
+            )
+
+
+async def _bounded_stop(name: str, coro: Any, deadline: float) -> None:
+    """Шаг остановки под общим пределом: по его истечении назван в логе и брошен."""
+    step = asyncio.ensure_future(coro)
+    _done, pending = await asyncio.wait(
+        {step}, timeout=max(0.0, deadline - time.monotonic())
+    )
+    if pending:
+        log.warning("%s did not stop within the shutdown limit", name)
+        step.cancel()
 
 
 async def _cancel_local_advisors() -> None:
@@ -397,13 +446,14 @@ async def lifespan(app: FastAPI):
             await _startup_checks(app.state.db)
             yield
     finally:
-        await _stop_background(app, poll_task)
+        deadline = time.monotonic() + config.STOP_TIMEOUT_SECONDS
+        await _stop_background(app, poll_task, deadline)
         # #1180: локальные прогоны ревью — чужие процессы, порождённые этим
         # хабом. Уйти, не сняв их, значит оставить агентский CLI сиротой:
         # он доработает, попробует сдать отчёт по прогону, за которым больше
         # некому смотреть, и всё это время будет жечь процессор.
-        await cancel_local_runs()
-        await _cancel_local_advisors()
+        await _bounded_stop("local review runs", cancel_local_runs(), deadline)
+        await _bounded_stop("local advisors", _cancel_local_advisors(), deadline)
         set_telemetry_sink(None)
         await app.state.db.close()
 

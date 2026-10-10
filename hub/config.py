@@ -1022,3 +1022,6 @@ def _int_env(suffix: str, default: int, low: int, high: int) -> int:
 EGRESS_PROBE_URL = env_get("EGRESS_PROBE_URL", "https://api.github.com/")
 EGRESS_PROBE_SECONDS = _int_env("EGRESS_PROBE_SECONDS", 120, 30, 900)
 EGRESS_DOWN_AFTER = _int_env("EGRESS_DOWN_AFTER", 3, 1, 100)
+# One shared limit for stopping every background task (#1667): after it the
+# stop names what did not finish and goes on, instead of waiting for ever.
+STOP_TIMEOUT_SECONDS = _int_env("STOP_TIMEOUT_SECONDS", 10, 1, 120)

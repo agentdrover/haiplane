@@ -615,3 +615,104 @@ async def test_shutdown_survives_a_watcher_that_already_failed():
 
     task = await _run_lifespan_with_watcher(watcher)  # must not raise
     assert task.done()
+
+
+_HANGING_DNS_CHILD = """
+import asyncio, socket, sys, time
+def hanging_getaddrinfo(*a, **k):
+    time.sleep(60)
+socket.getaddrinfo = hanging_getaddrinfo
+from hub.services import egress_watch as ew
+code = asyncio.run(ew.probe(deadline=1.0))
+print("code=" + code, flush=True)
+"""
+
+
+def test_a_hanging_dns_probe_does_not_hold_process_exit(tmp_path):
+    """Резолв, который не возвращается 60 с, не держит выход процесса (#1667)."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HAIPLANE_")}
+    env["PYTHONPATH"] = str(root)
+    started = time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, "-u", "-c", _HANGING_DNS_CHILD],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(root),
+        timeout=40,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "code=timeout" in proc.stdout, proc.stdout + proc.stderr
+    assert time.monotonic() - started < 30
+
+
+async def test_the_watcher_does_not_probe_at_startup():
+    """Первая проба — через интервал, не при старте (#1667)."""
+    probes = []
+
+    async def probe_fn() -> str:
+        probes.append(1)
+        return ""
+
+    class Stop(Exception):
+        pass
+
+    slept = []
+
+    async def first_sleep(seconds):
+        slept.append(seconds)
+        raise Stop
+
+    @asynccontextmanager
+    async def open_db():
+        yield SimpleNamespace(in_transaction=False)
+
+    with pytest.raises(Stop):
+        await ew.run_loop(open_db, ew.EgressWatch(probe_fn), sleep=first_sleep)
+    assert probes == []
+    assert slept == [ew.interval_seconds()]
+
+
+async def test_the_switch_off_keeps_the_watcher_from_starting(monkeypatch):
+    from hub import poller
+
+    async def idle(*_a, **_k):
+        await asyncio.sleep(60)
+
+    loop_mock = AsyncMock(side_effect=idle)
+    monkeypatch.setenv("HAIPLANE_EGRESS_WATCH", "off")
+    app = SimpleNamespace(state=SimpleNamespace(db=None))
+    with (
+        patch.object(poller, "_poll_running_tasks", idle),
+        patch.object(poller, "_session_reaper", idle),
+        patch.object(poller, "_drift_watch", idle),
+        patch.object(poller, "_red_base_watch", idle),
+        patch.object(poller, "arm_workspace_hooks", idle),
+        patch.object(ew, "run_loop", loop_mock),
+    ):
+        main = poller.start_poller(app)
+        await asyncio.sleep(0)
+        loop_mock.assert_not_called()
+        assert app.state.egress_task is None
+        assert "hub-egress-watch" not in app.state.background_tasks
+        for t in app.state.background_tasks.values():
+            t.cancel()
+        main.cancel()
+
+
+@pytest.mark.parametrize("value", ["", "on", "1", "ON"])
+def test_the_watcher_is_on_unless_switched_off(monkeypatch, value):
+    monkeypatch.setenv("HAIPLANE_EGRESS_WATCH", value)
+    assert ew.watch_enabled() is True
+
+
+@pytest.mark.parametrize("value", ["off", "OFF", " Off "])
+def test_the_watcher_off_switch_values(monkeypatch, value):
+    monkeypatch.setenv("HAIPLANE_EGRESS_WATCH", value)
+    assert ew.watch_enabled() is False
