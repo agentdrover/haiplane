@@ -684,53 +684,32 @@ def test_call_index_is_reused_for_the_same_clean_head(committed, monkeypatch):
     assert builder.calls == 1
 
 
-def _new_commit(root: Path):
+def _new_commit(root, monkeypatch, tmp_path):
     (root / "hub" / "extra.py").write_text("def extra():\n    return guard(2)\n")
     _git(root, "add", "-A")
     _git(root, "commit", "-qm", "extra")
+    return root, True
 
 
-def _edit_tracked(root: Path):
+def _edit_tracked(root, monkeypatch, tmp_path):
     (root / "hub" / "bulk.py").write_text("def write_many(values):\n    return []\n")
+    return root, False
 
 
-def _add_untracked(root: Path):
+def _add_untracked(root, monkeypatch, tmp_path):
     (root / "hub" / "fresh.py").write_text("def fresh():\n    return guard(3)\n")
+    return root, False
 
 
-def _add_ignored(root: Path):
+def _add_ignored(root, monkeypatch, tmp_path):
     with open(root / ".git" / "info" / "exclude", "a") as handle:
         handle.write("hub/hidden.py\n")
     (root / "hub" / "hidden.py").write_text("def hidden():\n    return guard(4)\n")
+    return root, False
 
 
-@pytest.mark.parametrize(
-    "change, caches_new_entry",
-    [
-        pytest.param(_new_commit, True, id="new-commit"),
-        pytest.param(_edit_tracked, False, id="modified-tracked"),
-        pytest.param(_add_untracked, False, id="untracked"),
-        pytest.param(_add_ignored, False, id="ignored"),
-    ],
-)
-def test_call_index_cache_never_serves_a_stale_tree(
-    committed, monkeypatch, change, caches_new_entry
-):
-    root, core_diff, _ = committed
-    call_sites.analyse(str(root), core_diff)  # warms the cache
-    assert len(call_sites._index_cache) == 1
-
-    change(root)
-
-    got = call_sites.analyse(str(root), core_diff)
-    assert got == _uncached(monkeypatch, root, core_diff)
-    assert len(call_sites._index_cache) == (2 if caches_new_entry else 1)
-
-
-def test_call_index_cache_never_serves_a_stale_tree_head_moves_mid_build(
-    committed, monkeypatch
-):
-    root, core_diff, _ = committed
+def _head_moves_during_build(root, monkeypatch, tmp_path):
+    call_sites.clear_index_cache()  # the build below must really happen
     real = call_sites.build_call_index
     moved = []
 
@@ -742,30 +721,48 @@ def test_call_index_cache_never_serves_a_stale_tree_head_moves_mid_build(
         return built
 
     monkeypatch.setattr(call_sites, "build_call_index", build_then_move)
-    got = call_sites.analyse(str(root), core_diff)
-
-    assert moved, "the builder ran, so the HEAD really moved under it"
-    assert got == _uncached(monkeypatch, root, core_diff)
-    assert len(call_sites._index_cache) == 0, (
-        "a build that straddled a commit is not kept"
-    )
+    return root, "moved"
 
 
-def test_call_index_cache_never_serves_a_stale_tree_outside_a_repository(
-    committed, tmp_path, monkeypatch
-):
-    root, core_diff, _ = committed
+def _not_a_repository(root, monkeypatch, tmp_path):
     plain = tmp_path / "plain"
     plain.mkdir()
     for sub in ("hub", "tests"):
         (plain / sub).mkdir()
         for src in (root / sub).glob("*.py"):
             (plain / sub / src.name).write_text(src.read_text())
+    return plain, False
 
-    got = call_sites.analyse(str(plain), core_diff)
 
-    assert got == _uncached(monkeypatch, plain, core_diff)
-    assert len(call_sites._index_cache) == 0
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        pytest.param(_new_commit, id="new-commit"),
+        pytest.param(_edit_tracked, id="modified-tracked"),
+        pytest.param(_add_untracked, id="untracked"),
+        pytest.param(_add_ignored, id="ignored"),
+        pytest.param(_head_moves_during_build, id="head-moves-during-build"),
+        pytest.param(_not_a_repository, id="not-a-repository"),
+    ],
+)
+def test_call_index_cache_never_serves_a_stale_tree(
+    committed, monkeypatch, tmp_path, scenario
+):
+    root, core_diff, _ = committed
+    call_sites.analyse(str(root), core_diff)  # warms the cache
+    warm = len(call_sites._index_cache)
+    assert warm == 1
+
+    target, grows = scenario(root, monkeypatch, tmp_path)
+
+    got = call_sites.analyse(str(target), core_diff)
+    assert got == _uncached(monkeypatch, target, core_diff)
+    if scenario is _head_moves_during_build:
+        assert len(call_sites._index_cache) == 0, "a build that straddled a commit"
+    else:
+        assert len(call_sites._index_cache) == (warm + 1 if grows else warm), (
+            "only a new commit on a clean tree adds an entry"
+        )
 
 
 class _SignalEvent(threading.Event):
@@ -890,8 +887,13 @@ def test_call_index_cache_single_flight_and_lru(committed, monkeypatch, flight_p
     call_sites.analyse(str(root), core_diff)
     assert len(calls) == 2, "the next request builds again"
 
+    # LRU of eight: the ninth key evicts the least recently used one.
+    monkeypatch.setattr(call_sites, "build_call_index", real)
+    call_sites.clear_index_cache()
+    _check_lru_keeps_the_eight_most_recent_keys(committed, monkeypatch)
 
-def test_call_index_cache_keeps_the_eight_most_recent_keys(committed, monkeypatch):
+
+def _check_lru_keeps_the_eight_most_recent_keys(committed, monkeypatch):
     root, _, _ = committed
     shas = [_git(root, "rev-parse", "HEAD").stdout.strip()]
     for i in range(8):
