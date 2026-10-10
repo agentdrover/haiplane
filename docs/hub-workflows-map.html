@@ -698,7 +698,7 @@
   <thead><tr><th>Механизм</th><th>Что фиксирует</th><th>Режим</th></tr></thead>
   <tbody>
     <tr><td>Локаторы AC (<code>test_ref</code>)</td><td>pytest nodeid у критерия с <code>verifiable_by=test</code></td><td><code>SDD_AC_LOCATOR</code> (дефолт <code>off</code>)</td></tr>
-    <tr><td>Существование теста</td><td><code>pytest --collect-only</code>: resolvable / missing / unknown</td><td>best-effort, попадает в brief</td></tr>
+    <tr><td>Существование теста</td><td>чтение файла через git без запуска (#1650): resolvable / missing / unknown</td><td>best-effort, попадает в brief</td></tr>
     <tr><td>Прогон AC-тестов</td><td>pass/fail на критерий, штамп текущего поколения</td><td><code>SDD_AC_TESTS</code> (дефолт <code>warn</code>)</td></tr>
     <tr><td>Отчёт прогона CI</td><td><code>POST /api/tasks/{id}/ci-run-report</code>: результаты AC + validation по конкретному sha; усыновляется сдачей</td><td><code>SDD_VALIDATION</code> (дефолт <code>warn</code>)</td></tr>
     <tr><td>Свежесть утверждений</td><td>что доставили в этих областях с момента написания постановки</td><td>блок brief</td></tr>

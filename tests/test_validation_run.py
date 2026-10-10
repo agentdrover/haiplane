@@ -119,3 +119,43 @@ async def test_runner_caps_output_in_memory(monkeypatch, tmp_path):
     assert rc == 0
     assert "bytes dropped" in log_tail
     assert len(log_tail) <= validation_run._LOG_TAIL
+
+
+async def test_a_cancelled_validation_kills_its_group_before_the_cancel_goes_on(
+    tmp_path,
+):
+    # #1650 review: only OSError and TimeoutError were caught, so a cancelled
+    # request left the command (and what it spawned) running.
+    import asyncio
+    import contextlib
+    import os
+    import time
+
+    from hub.services.validation_run import default_validation_runner
+
+    pid_file = tmp_path / "child.pid"
+    command = f"sleep 300 & echo $! > {pid_file}; wait"
+    task = asyncio.create_task(default_validation_runner([command], str(tmp_path)))
+    try:
+        for _ in range(100):
+            if pid_file.exists() and pid_file.read_text().strip():
+                break
+            await asyncio.sleep(0.05)
+        pid = int(pid_file.read_text())
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert task.cancelled(), "the cancellation must be passed on"
+        deadline = time.monotonic() + 3
+        alive = True
+        while alive and time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+                await asyncio.sleep(0.05)
+            except ProcessLookupError:
+                alive = False
+        assert not alive, "the validation command's group outlived the cancel"
+    finally:
+        if pid_file.exists() and pid_file.read_text().strip():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid_file.read_text()), 9)

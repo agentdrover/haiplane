@@ -73,6 +73,35 @@ MODEL_INDEPENDENT: tuple[str, ...] = (
 #: Разделы, у которых нет среза по проекту и окну: весь срок фазы.
 UNFILTERED: tuple[str, ...] = ("steward_shadow",)
 
+#: Разделы на таблице ``events`` (#1621): (имя, своё ли окно, пояснение окна).
+#: Остальные (task_updates, machine_reviews, submissions) от хранения events не
+#: зависят. Где окно своё, пометка об окне запроса к разделу применима иначе:
+#: ``human_touches`` режет окно по ``merged_at``, ``actual_verdicts`` — по своим
+#: ``window_days``, а ``steward_shadow`` целиком считает всю фазу тени и окно
+#: запроса игнорирует. ``review_economy.runs.by_kind`` классифицирует каскад по
+#: events, поэтому после очистки старый заказ переходит из cascade в first.
+EVENTS_SECTIONS: tuple[tuple[str, bool, str], ...] = (
+    ("human_gates", False, ""),
+    ("review_outcomes", False, ""),
+    ("human_touches", True, "окно по merged_at"),
+    ("review_model_cascade", False, ""),
+    ("review_economy.deep_cap", False, ""),
+    ("review_economy.small_delta", False, ""),
+    ("review_economy.runs.by_kind", False, ""),
+    ("steward_shadow.human_table", True, "окно — вся фаза тени"),
+    ("steward_shadow.false_approve", True, "окно — вся фаза тени"),
+    ("steward_shadow.false_approve_tasks", True, "окно — вся фаза тени"),
+    ("steward_shadow.act_refusals", True, "окно — вся фаза тени"),
+    ("steward_shadow.act_ready", True, "окно — вся фаза тени"),
+    ("steward_shadow.actual_verdicts", True, "окно — window_days секции"),
+)
+
+EVENTS_BEYOND_NOTE = (
+    "окно по events длиннее хранения: по политике хранения ({days} дн.) "
+    "данные раньше {since} не гарантированы; более старые события могут "
+    "оставаться до очистки"
+)
+
 
 def _fmt(moment: datetime) -> str:
     return moment.strftime(_TS_FORMAT)
@@ -242,6 +271,59 @@ class Scope:
             "to": self.end,
             "days": self.days,
         }
+
+
+def _window_label(scope: Scope) -> str:
+    """Имя окна для ``windows_beyond_history``: «current» или пара дат."""
+    if scope.window_days is not None:
+        return "current"
+    first = scope.start[:10]
+    if not scope.end:
+        return f"{first}..now"
+    last = (datetime.strptime(scope.end, _TS_FORMAT) - timedelta(days=1)).date()
+    return f"{first}..{last.isoformat()}"
+
+
+def events_history(
+    scope: Scope, *, compare: bool, series: bool, series_days: int
+) -> dict[str, Any]:
+    """Какие окна ответа начинаются раньше хранения ``events`` (#1621).
+
+    Граница — ``now − EVENTS_RETENTION_DAYS``, известный предел, а не
+    ``MIN(events.created_at)``: пустые первые часы окна покрытие не меняют, а
+    окно без событий не выдумывает дату из данных. Момент «сейчас» один на
+    весь расчёт: у окна «последние N дней» он восстанавливается из самого
+    окна (``start + N``), поэтому сравнение точное, без допуска.
+    """
+    start = datetime.strptime(scope.start, _TS_FORMAT)
+    if scope.window_days is not None:
+        anchor = start + timedelta(days=scope.window_days)
+    else:
+        anchor = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+    history_from = anchor - timedelta(days=repo.EVENTS_RETENTION_DAYS)
+    border = _fmt(history_from)
+    windows: list[tuple[str, Scope]] = [(_window_label(scope), scope)]
+    if compare:
+        windows.append(("previous", scope.previous()))
+    if series:
+        pieces, _ = scope.bucket_plan(series_days)
+        windows.extend((f"series:{piece.start[:10]}", piece) for piece in pieces)
+    beyond = [label for label, item in windows if item.start < border]
+    iso = history_from.replace(tzinfo=UTC).isoformat()
+    return {
+        "retention_days": repo.EVENTS_RETENTION_DAYS,
+        "history_from": iso,
+        "windows_beyond_history": beyond,
+        "events_sections": [
+            {"name": name, "own_window": own, "window": note}
+            for name, own, note in EVENTS_SECTIONS
+        ],
+        "note": (
+            EVENTS_BEYOND_NOTE.format(days=repo.EVENTS_RETENTION_DAYS, since=iso)
+            if beyond
+            else ""
+        ),
+    }
 
 
 async def project_task_ids(db: aiosqlite.Connection, slug: str) -> tuple[str, bool]:

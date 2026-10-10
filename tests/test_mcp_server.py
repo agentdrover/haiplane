@@ -5782,3 +5782,45 @@ async def test_submit_for_review_shows_ci_before_submit_refusal(
     err = capsys.readouterr().err
     assert "reason: ci_before_submit_unproven" in err
     assert "Дождитесь отчёта CI" in err
+
+
+async def test_practice_metrics_text_names_window_beyond_history(
+    mock_api_get: AsyncMock,
+) -> None:
+    # #1621: окно длиннее хранения events называется в тексте ответа.
+    from hub.mcp_server import hub_practice_metrics
+
+    history_from = "2026-09-25T10:00:00+00:00"
+    mock_api_get.return_value = {
+        "since_days": 30,
+        "machine_reviews": {},
+        "events_history": {
+            "retention_days": 14,
+            "history_from": history_from,
+            "windows_beyond_history": ["current"],
+            "events_sections": [],
+            "note": "окно по events длиннее хранения: по политике хранения (14 дн.) "
+            f"данные раньше {history_from} не гарантированы; более старые "
+            "события могут оставаться до очистки",
+        },
+    }
+    text = _mcp_text(await hub_practice_metrics(since_days=30))
+    assert (
+        f"данные раньше {history_from} не гарантированы; более старые события "
+        "могут оставаться до очистки"
+    ) in text
+    assert "current" in text
+
+    mock_api_get.return_value = {
+        "since_days": 7,
+        "machine_reviews": {},
+        "events_history": {
+            "retention_days": 14,
+            "history_from": history_from,
+            "windows_beyond_history": [],
+            "events_sections": [],
+            "note": "",
+        },
+    }
+    text = _mcp_text(await hub_practice_metrics(since_days=7))
+    assert "длиннее хранения" not in text
