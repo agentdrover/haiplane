@@ -17966,6 +17966,14 @@ async def test_closed_second_door_survives_a_crash_without_duplicates(
         await other.close()
     assert await _policy_events(db, task_id) == []
     assert len(await _policy_alerts(db, task_id)) == 1
+    # Метка уже стоит, а статус ещё открытый (сбой посреди закрытия другого
+    # писателя): метка одна решает, второго сообщения нет.
+    await db.execute(
+        "UPDATE review_dispatches SET status='second_door' WHERE id=?", (cloud["id"],)
+    )
+    await db.commit()
+    await rd._close_second_door_by_policy(db, task_id, 1, cloud)
+    assert len(await _policy_alerts(db, task_id)) == 1
     # Строка, ещё не закрытая меткой: два параллельных закрытия — одно сообщение.
     await db.execute(
         "UPDATE review_dispatches SET status='second_door', second_door_reason='' "
