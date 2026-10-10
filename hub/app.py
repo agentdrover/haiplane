@@ -134,18 +134,19 @@ from hub.actionable_errors import (
 )
 from hub.auth import (
     AuthMiddleware,
-    CSRF_COOKIE_NAME,
     CSRF_FIELD_NAME,
     CSRF_HEADER_NAME,
     _extract_bearer,
     client_ip,
+    cookie_csrf_ok,
+    csrf_exempt_transport,
     current_identity,
     require_admin,
     require_agent_caller,
     require_human_or_admin,
     require_permission,
-    verify_csrf,
 )
+from hub.csrf import CsrfMiddleware, would_reject_count_24h
 from hub.host_security import HostAllowlistMiddleware
 from hub.mcp_envelope import enrich_error_payload
 from hub.mcp_http_compat import McpStreamableAcceptCompatMiddleware
@@ -465,6 +466,9 @@ app = FastAPI(title=brand.PRODUCT_TITLE, version=get_app_version(), lifespan=lif
 # соединение открывается только для запроса, который дошёл до обработчика, а
 # не для каждого отбитого на пороге (#1065).
 app.add_middleware(RequestConnectionMiddleware)
+# #1664: after authentication (it reads the resolved identity), before the
+# handler and its connection: a refused request never touches the database.
+app.add_middleware(CsrfMiddleware)
 app.add_middleware(AuthMiddleware)
 # After Auth: runs first on the request — fixes MCP clients that omit Accept.
 app.add_middleware(McpStreamableAcceptCompatMiddleware)
@@ -533,7 +537,17 @@ async def health(request: Request) -> HealthView:
     """
     from hub.services.egress_watch import egress_status
 
-    return build_health(await egress_status(_db(request)))
+    view = build_health(await egress_status(_db(request)))
+    count = await would_reject_count_24h(_db(request))
+    view.csrf_would_reject_24h = count
+    if count is None:
+        unknown = (
+            "csrf_would_reject count is unknown: the events table could not be read"
+        )
+        view.csrf_warning = (
+            f"{view.csrf_warning}; {unknown}" if view.csrf_warning else unknown
+        )
+    return view
 
 
 @app.get("/api/whoami", response_model=WhoamiView)
@@ -562,13 +576,13 @@ async def _human_door(request: Request, what: str) -> config.TokenIdentity:
     identity = current_identity(request)
     if not identity.is_human:
         raise HTTPException(403, detail=human_only_gate_detail())
-    if _extract_bearer(request) is None:
+    if not csrf_exempt_transport(request):
         presented = request.headers.get(CSRF_HEADER_NAME)
         if presented is None and "form" in (request.headers.get("content-type") or ""):
             form = await request.form()
             value = form.get(CSRF_FIELD_NAME)
             presented = value if isinstance(value, str) else None
-        if not verify_csrf(presented, request.cookies.get(CSRF_COOKIE_NAME, "")):
+        if not cookie_csrf_ok(request, presented):
             raise HTTPException(
                 403,
                 detail=human_only_gate_detail(
