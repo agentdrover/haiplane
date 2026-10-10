@@ -329,6 +329,9 @@ async def record_machine_review(
         principal_id=principal_id,
         username=username,
     )
+    # #1653: отчёт ревьюера строки, закрытой по политике (local_review_fallback
+    # =off), возвращает её в done; свипы такую строку уже не видят.
+    await repo.settle_policy_closed_dispatches(db, task_id, generation, principal_id)
     new_review_id = await repo.insert_machine_review(
         db,
         task_id=task_id,

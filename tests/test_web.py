@@ -7691,3 +7691,34 @@ async def test_project_form_saves_local_review_fallback(client: AsyncClient):
     policy = await _policy_of(client, pid)
     assert "local_review_fallback" not in policy
     assert {k: policy[k] for k in other} == other
+
+
+async def test_project_form_local_review_fallback_keeps_the_full_form_neighbours(
+    client: AsyncClient,
+):
+    """#1653 P3: полная форма — review, verdict, release и соседние ключи не теряются."""
+    other = {"ci_runner": "make test", "deep_reviewer": "local", "wip_limit": 2}
+    pid = await _project_with_policy(client, "lrf-full", dict(other))
+    full = {
+        "gate_policy_dor": "human",
+        "gate_policy_verdict": "human",
+        "gate_policy_review": "dispatch",
+        "gate_policy_release": "auto",
+        "gate_policy_deep_reviewer": "local",
+    }
+    for value in ("on", "off", ""):
+        resp = await client.post(
+            f"/projects/{pid}/web-edit",
+            data={**full, "gate_policy_local_review_fallback": value},
+            follow_redirects=False,
+        )
+        assert "project_error" not in resp.headers.get("location", ""), resp.headers
+        policy = await _policy_of(client, pid)
+        assert policy.get("local_review_fallback") == (value or None), policy
+        assert policy["review"] == "dispatch" and policy["release"] == "auto"
+        assert policy["verdict"] == "human" and policy["dor"] == "human"
+        assert policy["deep_reviewer"] == "local"
+        assert {k: policy[k] for k in ("ci_runner", "wip_limit")} == {
+            "ci_runner": "make test",
+            "wip_limit": 2,
+        }

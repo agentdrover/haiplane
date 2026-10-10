@@ -4991,14 +4991,14 @@ async def open_second_door(
     """
     if not await _submission_still_live(db, task, branch, generation):
         return False
+    # #1653: первое из двух мест проверки согласия проекта (второе — перед
+    # вставкой в dispatch_local_review). ДО review_reach: при off причина
+    # пишется и без настроенного локального пути, иначе долг и сообщение
+    # зависели бы от env хоста, а не от политики.
+    if await _second_door_forbidden(db, task, generation, late_report_recheck):
+        return False
     reach = await review_reach(db, forge)
     if LOCAL_CHANNEL not in reach.ways:
-        return False
-    # #1653: первое из двух мест проверки согласия проекта (второе — перед
-    # вставкой в dispatch_local_review). После review_reach намеренно:
-    # сообщение «выключено политикой» честно только там, где локальный путь
-    # в самом деле мог быть заказан.
-    if await _second_door_forbidden(db, task, generation, late_report_recheck):
         return False
     return await dispatch_local_review(
         db,
@@ -5014,8 +5014,8 @@ async def open_second_door(
 
 
 #: Причина закрытия долга второй двери по политике проекта (#1653): имя
-#: события в ленте и ``reason`` в его payload.
-LOCAL_FALLBACK_OFF_REASON = "local_fallback_off_by_policy"
+#: события в ленте, ``reason`` в его payload и метка в ``second_door_reason``.
+LOCAL_FALLBACK_OFF_REASON = repo.LOCAL_FALLBACK_OFF_REASON
 
 _LOCAL_FALLBACK_OFF_TEXT = (
     "Запасной локальный ревьюер выключен политикой проекта "
@@ -5061,22 +5061,23 @@ async def _close_second_door_by_policy(
 ) -> None:
     """Причина, сообщение и закрытие долга — ОДНА транзакция (#1653).
 
-    Сбой до коммита откатывает всё: долг остаётся видимым свипу, и следующий
-    проход пишет причину заново; сбой после коммита оставляет долг закрытым.
-    Сообщение — одно на dispatch_id: событие причины и есть ключ дедупа.
-    Исходный ``run_status`` не трогается; своего позднего отчёта у заказа
-    нет — ``failed``, есть — ``done`` (так же, как закрывает _settle_second_door).
+    Ключ дедупа — метка в ``review_dispatches.second_door_reason``, выставляемая
+    тем же UPDATE, что закрывает строку: событие и алерт пишет только тот, у
+    кого ``rowcount=1``, поэтому параллельное закрытие и повтор после чистки
+    событий (их хранят 14 дней) второго сообщения не дают. Сбой до коммита
+    откатывает всё: долг остаётся видимым свипу. Исходный ``run_status`` не
+    трогается; своего позднего отчёта у заказа нет — ``failed``, есть — ``done``.
     """
-    debt_id = int(debt["id"]) if debt is not None else None
+    if not db.in_transaction:
+        await db.execute("BEGIN IMMEDIATE")
     try:
-        told = await fetchall(
-            db,
-            "SELECT 1 FROM events WHERE kind=? AND task_id=? "
-            "AND json_extract(payload, '$.generation')=? "
-            "AND json_extract(payload, '$.dispatch_id') IS ?",
-            (LOCAL_FALLBACK_OFF_REASON, task_id, generation, debt_id),
-        )
-        if not told:
+        first = True
+        if debt is not None:
+            own_report = await _dispatch_report(db, task_id, generation, debt)
+            first = await repo.close_dispatch_by_policy(
+                db, int(debt["id"]), "done" if own_report is not None else "failed"
+            )
+        if first:
             await repo.insert_event(
                 db,
                 kind=LOCAL_FALLBACK_OFF_REASON,
@@ -5084,17 +5085,12 @@ async def _close_second_door_by_policy(
                 actor="policy",
                 payload={
                     "reason": LOCAL_FALLBACK_OFF_REASON,
-                    "dispatch_id": debt_id,
+                    "dispatch_id": int(debt["id"]) if debt is not None else None,
                     "generation": generation,
                 },
             )
             await repo.add_task_update(
                 db, task_id, "hub", "alert", _LOCAL_FALLBACK_OFF_TEXT
-            )
-        if debt is not None and debt_id is not None:
-            own_report = await _dispatch_report(db, task_id, generation, debt)
-            await repo.set_review_dispatch_status(
-                db, debt_id, "done" if own_report is not None else "failed"
             )
         await db.commit()
     except BaseException:
@@ -5246,10 +5242,14 @@ async def dispatch_local_review(
         await _dispatch_report(db, task_id, generation, late_report_recheck) is not None
     ):
         return False
-    if second_door and await _second_door_forbidden(
-        db, task, generation, late_report_recheck
-    ):
-        return False
+    if second_door:
+        # #1653: политика перечитывается ПОД write-локом, взятым здесь и
+        # отпускаемым коммитом вставки ниже: PATCH off не может закоммититься
+        # между этим чтением и INSERT диспетча.
+        await db.commit()
+        await db.execute("BEGIN IMMEDIATE")
+        if await _second_door_forbidden(db, task, generation, late_report_recheck):
+            return False
     run_id = uuid.uuid4().hex[:12]
     dispatch_id = await repo.create_review_dispatch(
         db,

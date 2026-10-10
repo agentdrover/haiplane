@@ -17886,7 +17886,7 @@ async def test_second_door_stays_closed_when_policy_is_off(
 
 
 async def test_closed_second_door_survives_a_crash_without_duplicates(
-    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+    client: AsyncClient, db: aiosqlite.Connection, db_dsn, monkeypatch, tmp_path
 ):
     """AC-2 (#1653): сбой после записи причины, до закрытия долга — два свипа.
 
@@ -17914,20 +17914,17 @@ async def test_closed_second_door_survives_a_crash_without_duplicates(
 
     monkeypatch.setattr(cursor_cloud, "get_run", _errored)
 
-    real_status = repo.set_review_dispatch_status
+    real_update = repo.add_task_update
     crashed = {"n": 0}
 
-    async def _crash_after_the_reason(db_, dispatch_id, status):
-        written = await db_.execute_fetchall(
-            "SELECT 1 FROM events WHERE kind=? AND task_id=?",
-            (_POLICY_REASON, task_id),
-        )
-        if written and not crashed["n"]:
+    async def _crash_after_the_reason(db_, tid, actor, kind, content, *a, **kw):
+        # Причина и закрытие строки уже записаны в этой транзакции.
+        if "local_review_fallback=off" in content and not crashed["n"]:
             crashed["n"] += 1
-            raise RuntimeError("сбой после записи причины, до закрытия долга")
-        await real_status(db_, dispatch_id, status)
+            raise RuntimeError("сбой после записи причины, до коммита")
+        return await real_update(db_, tid, actor, kind, content, *a, **kw)
 
-    monkeypatch.setattr(repo, "set_review_dispatch_status", _crash_after_the_reason)
+    monkeypatch.setattr(repo, "add_task_update", _crash_after_the_reason)
     try:
         await sweep_review_dispatches(db)
     except RuntimeError:
@@ -17935,6 +17932,10 @@ async def test_closed_second_door_survives_a_crash_without_duplicates(
     assert crashed["n"] == 1, "предпосылка: сбой случился после записи причины"
     assert await _policy_events(db, task_id) == [], "полузаписи нет: всё откачено"
     assert await _policy_alerts(db, task_id) == []
+    debt = (await _all_dispatches(db, task_id))[0]
+    assert debt["status"] == "second_door" and not debt["second_door_reason"], (
+        "долг остался видимым свипу, метка откатилась"
+    )
     await sweep_review_dispatches(db)
     await sweep_review_dispatches(db)
     await db.commit()
@@ -17946,13 +17947,44 @@ async def test_closed_second_door_survives_a_crash_without_duplicates(
     events = await _policy_events(db, task_id)
     assert [e["dispatch_id"] for e in events] == [cloud["id"]], events
     assert len(await _policy_alerts(db, task_id)) == 1, "сообщение одно на dispatch_id"
-    # Повторное закрытие того же долга (повторный свип до закрытия) не множит ни
-    # событие, ни сообщение: ключ дедупа — dispatch_id.
+    # Дедуп — метка в строке, а не событие: повтор после чистки событий
+    # (их хранят 14 дней) и параллельное закрытие второго сообщения не дают.
     from hub.services import review_dispatch as rd
 
-    await rd._close_second_door_by_policy(db, task_id, 1, cloud)
-    assert len(await _policy_events(db, task_id)) == 1
+    assert cloud["second_door_reason"] == _POLICY_REASON
+    await db.execute("DELETE FROM events WHERE kind=?", (_POLICY_REASON,))
+    await db.commit()
+    other = await aiosqlite.connect(db_dsn, uri=True)
+    other.row_factory = aiosqlite.Row
+    await other.execute("PRAGMA busy_timeout = 5000")
+    try:
+        await asyncio.gather(
+            rd._close_second_door_by_policy(db, task_id, 1, cloud),
+            rd._close_second_door_by_policy(other, task_id, 1, cloud),
+        )
+    finally:
+        await other.close()
+    assert await _policy_events(db, task_id) == []
     assert len(await _policy_alerts(db, task_id)) == 1
+    # Строка, ещё не закрытая меткой: два параллельных закрытия — одно сообщение.
+    await db.execute(
+        "UPDATE review_dispatches SET status='second_door', second_door_reason='' "
+        "WHERE id=?",
+        (cloud["id"],),
+    )
+    await db.commit()
+    other = await aiosqlite.connect(db_dsn, uri=True)
+    other.row_factory = aiosqlite.Row
+    await other.execute("PRAGMA busy_timeout = 5000")
+    try:
+        await asyncio.gather(
+            rd._close_second_door_by_policy(db, task_id, 1, cloud),
+            rd._close_second_door_by_policy(other, task_id, 1, cloud),
+        )
+    finally:
+        await other.close()
+    assert len(await _policy_events(db, task_id)) == 1
+    assert len(await _policy_alerts(db, task_id)) == 2, "по одному на закрытие строки"
 
 
 async def test_policy_turned_off_mid_dispatch_inserts_nothing(
@@ -18229,3 +18261,122 @@ async def _late_cloud_report_closes_as_done_when_off(
     debt = (await _all_dispatches(db, task_id))[0]
     await rd._close_second_door_by_policy(db, task_id, 1, debt)
     assert (await _all_dispatches(db, task_id))[0]["status"] == "done"
+
+
+async def test_policy_cannot_flip_between_the_last_check_and_the_insert(
+    client: AsyncClient, db: aiosqlite.Connection, db_dsn, monkeypatch, tmp_path
+):
+    """#1653 P1: последняя проверка политики и INSERT — под одним write-локом.
+
+    Второе соединение пытается закоммитить off ровно между проверкой и вставкой:
+    лок держит его снаружи, и вставка законно видит on.
+    """
+    import sqlite3
+
+    from hub.services import review_dispatch as rd
+    from hub.services.review_dispatch import wait_for_local_runs
+
+    _wire(monkeypatch, _DispatchRecorder(None, refusal=_LIMIT_REFUSAL))
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    other = await aiosqlite.connect(db_dsn, uri=True)
+    await other.execute("PRAGMA busy_timeout = 100")
+    raced: list[str] = []
+    real = rd._local_fallback_allowed
+
+    async def _race(db_, task_id):
+        allowed = await real(db_, task_id)
+        if allowed and db_.in_transaction:
+            project = await repo.resolve_project_for_task(db_, task_id)
+            try:
+                await other.execute(
+                    "UPDATE projects SET gate_policy=? WHERE id=?",
+                    (json.dumps({"review": "dispatch"}), dict(project)["id"]),
+                )
+                await other.commit()
+                raced.append("committed")
+            except sqlite3.OperationalError as exc:
+                raced.append(str(exc))
+        return allowed
+
+    monkeypatch.setattr(rd, "_local_fallback_allowed", _race)
+    try:
+        task_id = await _submitted(
+            client, db, "fb-lock", policy=_fallback_policy("on"), diff=_DIFF_506
+        )
+        await wait_for_local_runs()
+        await db.commit()
+    finally:
+        await other.close()
+
+    assert len(raced) == 1 and "locked" in raced[0], raced
+    assert len(await _local_dispatches(db, task_id)) == 1
+
+
+async def test_a_late_cloud_report_after_the_policy_closure_settles_done(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch, tmp_path
+):
+    """#1653 P2-a: отчёт ревьюера после закрытия по политике — строка в done."""
+    from hub.models import MachineReviewSubmit
+    from hub.services.machine_review_intake import record_machine_review
+
+    launched = _count_local_launches(monkeypatch)
+    _wire(
+        monkeypatch,
+        _DispatchRecorder({"agent": {"id": "bc-after-close"}, "run": {"id": "r-1"}}),
+    )
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    await _local_principal(db, monkeypatch)
+    _stub_reviewer(monkeypatch, tmp_path, _reporting_stub())
+    task_id = await _submitted(
+        client, db, "fb-after-close", policy=_fallback_policy(None), diff=_DIFF_506
+    )
+    await db.execute(
+        "UPDATE review_dispatches SET created_at = datetime('now', '-60 minutes')"
+    )
+    await db.commit()
+
+    async def _errored(agent_id, run_id):
+        return {"id": run_id, "status": "ERROR"}
+
+    monkeypatch.setattr(cursor_cloud, "get_run", _errored)
+    await sweep_review_dispatches(db)
+    await db.commit()
+    closed = (await _all_dispatches(db, task_id))[0]
+    assert (
+        closed["status"] == "failed" and closed["second_door_reason"] == _POLICY_REASON
+    )
+
+    payload = {**_LOCAL_REPORT}
+    payload.pop("orchestrator", None)
+    await record_machine_review(
+        db,
+        task_id,
+        MachineReviewSubmit(**payload),
+        principal_id=cloud_pid,
+        username="cloud-reviewer",
+    )
+    await db.commit()
+    await sweep_review_dispatches(db)
+    assert launched == [] and await _local_dispatches(db, task_id) == []
+    settled = (await _all_dispatches(db, task_id))[0]
+    assert settled["status"] == "done", settled
+
+
+async def test_off_without_a_local_path_still_names_the_policy(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1653 P2-c: политика проверяется ДО review_reach — причина пишется и без
+    настроенного локального пути."""
+    _wire(monkeypatch, _DispatchRecorder(None, refusal=_LIMIT_REFUSAL))
+    _no_local_path(monkeypatch)
+    task_id = await _submitted(
+        client, db, "fb-off-nopath", policy=_fallback_policy(None), diff=_DIFF_506
+    )
+    await db.commit()
+
+    assert await _debts(db, task_id) == []
+    events = await _policy_events(db, task_id)
+    assert len(events) == 1 and events[0]["reason"] == _POLICY_REASON
+    assert len(await _policy_alerts(db, task_id)) == 1
+    assert await _local_dispatches(db, task_id) == []
