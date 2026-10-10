@@ -18497,3 +18497,38 @@ async def test_a_report_settles_only_the_policy_closed_order_it_belongs_to(
     rows = {r["id"]: r["status"] for r in await _all_dispatches(db, task_id)}
     assert rows[b_id] == "active", rows
     assert rows[a["id"]] == ("failed" if b_replaces_a else "done"), rows
+
+
+async def test_a_policy_closed_order_without_a_principal_is_not_settled_by_any_report(
+    client: AsyncClient, db: aiosqlite.Connection, monkeypatch
+):
+    """#1653: NULL reviewer_principal_id не совпадает ни с каким принципалом."""
+    from hub.models import MachineReviewSubmit
+    from hub.services.machine_review_intake import record_machine_review
+
+    _wire(
+        monkeypatch,
+        _DispatchRecorder({"agent": {"id": "bc-n"}, "run": {"id": "r-n"}}),
+    )
+    cloud_pid, _, _ = await _pinned_setup(db, monkeypatch)
+    task_id = await _submitted(
+        client, db, "fb-owner-null", policy=_fallback_policy(None)
+    )
+    a = (await _all_dispatches(db, task_id))[0]
+    await db.execute(
+        "UPDATE review_dispatches SET status='failed', second_door_reason=?, "
+        "reviewer_principal_id=NULL WHERE id=?",
+        (_POLICY_REASON, a["id"]),
+    )
+    await db.commit()
+    payload = {**_LOCAL_REPORT}
+    payload.pop("orchestrator", None)
+    await record_machine_review(
+        db,
+        task_id,
+        MachineReviewSubmit(**payload),
+        principal_id=cloud_pid,
+        username="cloud-reviewer",
+    )
+    await db.commit()
+    assert (await _all_dispatches(db, task_id))[0]["status"] == "failed"
