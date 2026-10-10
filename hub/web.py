@@ -2545,6 +2545,26 @@ async def _steward_recommendation(
     return out
 
 
+async def _card_machine_report(
+    db: aiosqlite.Connection, task_id: int, row: dict[str, Any]
+) -> tuple[bool, Any, Any]:
+    """``(state_card, review_report, machine_review)`` для карточки (#381, #808).
+
+    #1648: задача-состояние — без ветки, диффа и машинного отчёта. Карточка
+    читает те же блоки, что бриф, и НЕ ходит за кодом: отчёт, git, дифф, карта
+    изменений, доставка и суждение стюарда для неё не вычисляются.
+    """
+    from hub.services.result_kind import automation_not_applicable
+    from hub.services.review_evidence import review_report
+
+    if automation_not_applicable(row):
+        return True, None, None
+    report = await review_report(
+        db, row, await repo.get_latest_machine_review(db, task_id)
+    )
+    return False, report, report.machine_review
+
+
 async def _web_task_detail_page(
     request: Request,
     task_id: int,
@@ -2570,11 +2590,9 @@ async def _web_task_detail_page(
     # Machine review (#381): summary next to the verdict buttons, assembled
     # by the same builder the review brief uses (#808) — the human at the
     # gate and the reviewing agent must not read two different reports.
-    from hub.services.review_evidence import review_report as _review_report
-
-    mr_row = await repo.get_latest_machine_review(db, task_id)
-    review_report = await _review_report(db, dict(row), mr_row)
-    machine_review = review_report.machine_review
+    state_card, review_report, machine_review = await _card_machine_report(
+        db, task_id, dict(row)
+    )
     # #1012: how much of that report nobody answered — computed by the same
     # helper the verdict itself uses, so the sentence beside the button and
     # the sentence written into the record cannot disagree.
@@ -2592,7 +2610,9 @@ async def _web_task_detail_page(
     evidence = await gate_evidence(db, dict(row))
     review_in_flight = await inflight_view(db, dict(row))
 
-    steward_judgement = await _steward_recommendation(db, task_id, dict(row))
+    steward_judgement = (
+        None if state_card else await _steward_recommendation(db, task_id, dict(row))
+    )
     # #1410: прогоны облачного исполнителя — центы и исход по каждому.
     from hub.services.executor_dispatch import executor_runs_view
 
@@ -2619,7 +2639,11 @@ async def _web_task_detail_page(
     # merge (#534) and the deploy CI reported (#839, #496) — and this compares
     # them. Computed, never stored: the answer changes with every release.
     delivery = None
-    if task.status.value in ("completed", "review", "fix_requested"):
+    if not state_card and task.status.value in (
+        "completed",
+        "review",
+        "fix_requested",
+    ):
         from hub.services.delivery_state import delivery_state
 
         try:
@@ -2632,7 +2656,7 @@ async def _web_task_detail_page(
     # the numstat of the pinned submission — paths, not hunks: the hunks load
     # on demand (#824), and this map only needs to know which files moved.
     change_map = None
-    if evidence is not None:
+    if evidence is not None and not state_card:
         from hub.services import change_map as change_map_service
         from hub.services.task_diff import READ, submission_files
 
@@ -2697,7 +2721,7 @@ async def _web_task_detail_page(
 
     # Machine-review policy gap (#382): warning in the verdict panel.
     machine_review_gap_text = None
-    if task.status.value == "review" and not task.review_job_id:
+    if not state_card and task.status.value == "review" and not task.review_job_id:
         from hub.services.orchestration import machine_review_gap
 
         machine_review_gap_text = await machine_review_gap(db, dict(row))
@@ -3349,7 +3373,7 @@ def _verdict_refusal_text(detail: Any) -> str:
 
 
 def _review_form_error(
-    request: Request, task_id: int, message: str
+    request: Request, task_id: int, message: str, status_code: int = 422
 ) -> HTMLResponse | RedirectResponse:
     """Show a review-form refusal where the reviewer was typing (#1010).
 
@@ -3360,7 +3384,7 @@ def _review_form_error(
     if _is_htmx(request):
         return HTMLResponse(
             f'<div class="task-action-note">{html.escape(message)}</div>',
-            status_code=422,
+            status_code=status_code,
         )
     return RedirectResponse(
         f"/tasks/{task_id}?review_error={quote(message)}", status_code=303
@@ -3454,7 +3478,14 @@ async def web_review_verdict(
     except HTTPException as exc:
         if exc.status_code != 422 and not _is_state_verdict_refusal(exc):
             raise
-        return _review_form_error(request, task_id, _verdict_refusal_text(exc.detail))
+        # #1648: отказ по поколению (409) htmx-форма получает со своим кодом, а
+        # не 422: устаревшая форма — конфликт состояния, не ошибка ввода.
+        return _review_form_error(
+            request,
+            task_id,
+            _verdict_refusal_text(exc.detail),
+            status_code=exc.status_code if exc.status_code in (403, 409) else 422,
+        )
     if _is_htmx(request):
         return await _htmx_task_done_fragment(request, task_id)
     return RedirectResponse(f"/tasks/{task_id}", status_code=303)

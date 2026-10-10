@@ -7642,6 +7642,94 @@ async def test_web_key_form_can_scope_the_key_to_a_project(
     assert "nope" in str(dict(bad.headers)), "the refusal names the project"
 
 
+async def test_state_task_card_shows_evidence_and_posts_generation_with_verdict(
+    client: AsyncClient, db, monkeypatch
+):
+    """AC-3 (#1648): карточка state-задачи в review — метка «результат:
+    состояние», rollback и таблица доказательств поколения; нет «тесты 0 из 0»
+    и строк про отсутствующий CI; форма несёт expected_generation, форма с
+    устаревшим поколением получает 409 и ничего не записывает."""
+    from tests.state_support import (
+        ROLLBACK,
+        GitSpy,
+        drive_to_second_generation,
+        make_state_task,
+    )
+    from hub.integrations.registry import plugins
+
+    task_id = await make_state_task(db, title="Переключить DNS")
+    await drive_to_second_generation(client, db, task_id)
+    # Карточка state не вычисляет блоки кода: ни отчёт, ни дифф, ни доставку,
+    # ни суждение стюарда — любое такое чтение здесь падает.
+    from hub import web
+    from hub.services import delivery_state, review_evidence, task_diff
+
+    def _refuse(name):
+        async def refuse(*_args, **_kwargs):
+            raise AssertionError(f"карточка state вычислила блок кода: {name}")
+
+        return refuse
+
+    monkeypatch.setattr(review_evidence, "review_report", _refuse("review_report"))
+    monkeypatch.setattr(task_diff, "submission_files", _refuse("submission_files"))
+    monkeypatch.setattr(delivery_state, "delivery_state", _refuse("delivery_state"))
+    monkeypatch.setattr(
+        web, "_steward_recommendation", _refuse("_steward_recommendation")
+    )
+    original_git = plugins.git_ops
+    spy = GitSpy()
+    plugins.git_ops = spy
+    try:
+        page = (await client.get(f"/tasks/{task_id}")).text
+    finally:
+        plugins.git_ops = original_git
+
+    text = html.unescape(page)
+    assert "результат: состояние" in text
+    block = text.split('id="state-evidence"', 1)[1]
+    assert ROLLBACK in block.split("<table", 1)[0], "rollback в блоке принятия"
+    assert "task-review-board--review" not in text, "секции машинного ревью нет"
+    assert "повторное наблюдение, поколение 2" in text, "доказательство поколения 2"
+    assert "отвечает 203.0.113.7" not in text, "поколение 1 на карточке не показано"
+    assert "2026-10-09T12:00:00Z" in text
+    for absent in (
+        "Ревью за эту сдачу не проводилось",
+        "Машинное ревью",
+        "Request machine review",
+        "0 из 0",
+        "CI по коммиту",
+        "CI по закреплённому коммиту",
+        "нет отчёта",
+    ):
+        assert absent not in text, absent
+    assert 'name="expected_generation" value="2"' in page
+    assert spy.calls == [], f"карточка state ходила в git: {spy.calls}"
+
+    # устаревшая форма: плоский POST — 303 с причиной на карточке, htmx — 409
+    stale = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved", "comments": "", "expected_generation": "1"},
+        follow_redirects=False,
+    )
+    assert stale.status_code == 303 and "review_error=" in stale.headers["location"]
+    stale_htmx = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved", "comments": "", "expected_generation": "1"},
+        headers={"HX-Request": "true"},
+    )
+    assert stale_htmx.status_code == 409, stale_htmx.text
+    assert "поколен" in stale_htmx.text
+    assert dict(await repo.get_task(db, task_id))["status"] == "review"
+
+    ok = await client.post(
+        f"/tasks/{task_id}/web-review-verdict",
+        data={"verdict": "approved", "comments": "", "expected_generation": "2"},
+        follow_redirects=False,
+    )
+    assert ok.status_code == 303 and "review_error" not in ok.headers["location"]
+    assert dict(await repo.get_task(db, task_id))["status"] == "completed"
+
+
 async def test_project_form_saves_local_review_fallback(client: AsyncClient):
     """AC-8 (#1653): on/off сохранены, нет поля — ключ цел, пусто — снят, мусор — отказ."""
     from urllib.parse import unquote_plus

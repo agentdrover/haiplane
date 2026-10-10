@@ -50,6 +50,7 @@ from hub import repository as repo
 # они разошлись (находка 80fcb9c9).
 from hub.db import MIN_EVIDENCE_CHARS, MIN_SHA_CHARS
 from hub.integrations.registry import plugins
+from hub.services.result_kind import is_state, state_accepted
 
 log = logging.getLogger("hub")
 
@@ -661,6 +662,38 @@ async def _container_delivery(
     }
 
 
+STATE_ACCEPTED_PATH = "state_accepted"
+STATE_PENDING_PATH = "state_pending"
+
+
+def _state_blocker(blocker: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+    """Блокер — задача-состояние: готова по принятию, не по мержу (#1648).
+
+    Правило для зависимых и для родителя-контейнера одно: ``state_accepted``
+    по живой строке. Возврат в работу меняет статус — готовность снимается без
+    записи. Тот же читатель обслуживает детей контейнера (``_container_delivery``
+    зовёт ``blocker_delivery`` на каждого), поэтому состояние потомков-state
+    считается по принятию, а commit-потомков — по доставке.
+    """
+    if state_accepted(task):
+        return {
+            **blocker,
+            "delivered": True,
+            "delivery_path": STATE_ACCEPTED_PATH,
+            "reason": "",
+        }
+    return {
+        **blocker,
+        "delivered": False,
+        "delivery_path": STATE_PENDING_PATH,
+        "reason": (
+            f"задача-состояние #{task['id']} ещё не принята человеком "
+            f"({task.get('status')}); готовность даёт принятая сдача текущего "
+            "поколения, мерж не нужен"
+        ),
+    }
+
+
 async def blocker_delivery(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
     """Fill in ``delivered``/``reason`` for one blocker row (#885).
 
@@ -672,9 +705,16 @@ async def blocker_delivery(db: Any, blocker: dict[str, Any]) -> dict[str, Any]:
     wrong answer for another.
     """
     if blocker.get("delivered"):
+        # Мерж гейта — бесплатный ответ; у задачи-состояния мержей не бывает
+        # (pipeline_merges для неё не создаются), так что сюда она не попадает.
         return {**blocker, "delivery_path": "gate"}
     row = await repo.get_task(db, blocker["task_id"])
     task = dict(row) if row is not None else {}
+    if task and is_state(task):
+        # #1648: у задачи-состояния кода нет, и «доставка» для неё — принятие
+        # человеком на текущем поколении. Решает до git: мержа у неё не бывает,
+        # а ответ «PR не заявлен» был бы ложной причиной.
+        return _state_blocker(blocker, task)
     if task.get("task_type") in CONTAINER_TYPES:
         return await _container_delivery(db, blocker, task)
     reached, note = await merged_into_base_detail(db, task) if task else (None, "")
