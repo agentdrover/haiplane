@@ -188,6 +188,7 @@
               hx-post="/tasks/{{ t.id }}/web-answer"
               hx-target="#inbox-task-{{ t.id }}"
               hx-swap="outerHTML">
+          {{ csrf_field() }}
             <input type="text" name="answer" placeholder="Type your answer…" required class="inbox-answer-input">
             <input type="hidden" name="resume" value="true">
             <button class="btn btn-success btn-xs" type="submit">Answer &amp; Resume</button>

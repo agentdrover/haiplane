@@ -164,25 +164,28 @@
             <div class="project-admin-actions">
                 {% if executor_launch_mode(c.project) == 'manual' and not c.project.archived %}
                 <form method="post" action="/projects/{{ c.project.slug }}/web-executor-launch" class="project-inline-form">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  {{ csrf_field() }}
                     <button class="btn btn-primary" type="submit"
                             onclick="return confirm('Запустить облачного исполнителя на следующую задачу очереди проекта {{ c.project.slug }}? Это платный прогон.')">Запустить исполнителя</button>
                 </form>
                 {% endif %}
                 {% if c.project.repo and not c.project.archived %}
                 <form method="post" action="/projects/{{ c.project.id }}/web-provision" class="project-inline-form">
+                  {{ csrf_field() }}
                     <button class="btn btn-primary" type="submit"
                             onclick="return confirm('Клонировать/проверить workspace проекта {{ c.project.slug }}?')">Проверить workspace</button>
                 </form>
                 {% endif %}
                 {% if c.project.status == 'pending' and not c.project.archived %}
                 <form method="post" action="/projects/{{ c.project.id }}/web-activate" class="project-inline-form">
+                  {{ csrf_field() }}
                     <button class="btn btn-success" type="submit"
                             onclick="return confirm('Активировать проект {{ c.project.slug }}? Он попадёт в git-маршрутизацию.')">Активировать</button>
                 </form>
                 {% endif %}
                 {% if c.project.slug != 'default' %}
                 <form method="post" action="/projects/{{ c.project.id }}/web-archive" class="project-inline-form">
+                  {{ csrf_field() }}
                     <input type="hidden" name="archived" value="{{ 'false' if c.project.archived else 'true' }}">
                     <button class="btn btn-ghost" type="submit"
                             onclick="return confirm('{{ 'Вернуть из архива' if c.project.archived else 'Архивировать' }} проект {{ c.project.slug }}?')">
@@ -204,6 +207,7 @@
             <details class="project-admin-edit" {% if project_error_id == c.project.id %}open{% endif %}>
                 <summary class="project-edit-summary">Изменить</summary>
                 <form method="post" action="/projects/{{ c.project.id }}/web-edit" class="task-action-stack project-form">
+                  {{ csrf_field() }}
                     <input type="hidden" name="policy_version" value="{{ policy_versions.get(c.project.id, '') }}">
                     <label class="task-action-label">Name</label>
                     <input name="name" class="task-action-control" value="{{ c.project.name }}">
@@ -387,6 +391,7 @@
 <details class="task-action-stack project-create">
     <summary class="btn btn-primary">+ Новый проект</summary>
     <form method="post" action="/projects/web-create" class="task-action-stack project-form">
+      {{ csrf_field() }}
         <label class="task-action-label" for="np-slug">Slug (a-z, 0-9, dashes)</label>
         <input id="np-slug" name="slug" class="task-action-control" required pattern="[a-z0-9][a-z0-9-]*" placeholder="calc-kids">
         <label class="task-action-label" for="np-name">Name</label>

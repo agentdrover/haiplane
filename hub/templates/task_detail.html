@@ -486,6 +486,7 @@
                 <span class="task-line-label">Сообщения сессий</span>
                 <span>По этой задаче сессии ещё не переписывались</span>
                 <form method="post" action="/tasks/{{ task.id }}/web-message" class="task-line-form">
+                  {{ csrf_field() }}
                     <input type="text" name="body" placeholder="Написать в канал задачи" required class="task-action-control">
                     <input type="hidden" name="to_kind" value="task">
                     <input type="hidden" name="kind" value="note">
@@ -524,6 +525,7 @@
                 </div>
                 {% endif %}
                 <form method="post" action="/tasks/{{ task.id }}/web-message" class="task-action-stack">
+                  {{ csrf_field() }}
                     <textarea name="body" rows="2" placeholder="Написать в канал задачи" required></textarea>
                     <input type="hidden" name="to_kind" value="task">
                     <input type="hidden" name="kind" value="note">
@@ -608,6 +610,7 @@
                 </div>
                 {% endif %}
                 <form method="post" action="/tasks/{{ task.id }}/web-approve" class="task-action-stack">
+                  {{ csrf_field() }}
                     <label class="task-action-label" for="task-runtime-approve">Runtime</label>
                     <select id="task-runtime-approve" name="runtime" class="task-action-control">
                         <option value="auto" {% if task.runtime.value == 'auto' %}selected{% endif %}>Auto</option>
@@ -619,6 +622,7 @@
                     <button class="btn btn-primary task-action-btn" type="submit">Approve to Backlog</button>
                 </form>
                 <form method="post" action="/tasks/{{ task.id }}/web-reject" class="task-action-stack task-action-stack--separated">
+                  {{ csrf_field() }}
                     <input type="text" name="comment" placeholder="Reason (optional)" class="task-action-control">
                     <button class="btn btn-danger task-action-btn" type="submit">Reject</button>
                 </form>
@@ -626,6 +630,7 @@
                 {% elif task.status.value == 'open' %}
                 <div class="task-action-state">Ready to Run</div>
                 <form method="post" action="/tasks/{{ task.id }}/web-start" class="task-action-stack">
+                  {{ csrf_field() }}
                     <label class="task-action-label" for="task-runtime-start">Runtime</label>
                     <select id="task-runtime-start" name="runtime" class="task-action-control">
                         <option value="auto" {% if task.runtime.value == 'auto' %}selected{% endif %}>Auto</option>
@@ -639,7 +644,7 @@
                     {% endif %}
                 </form>
                 <form method="post" action="/tasks/{{ task.id }}/web-implementer-start" class="task-action-stack task-action-stack--separated">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  {{ csrf_field() }}
                     <button class="btn task-action-btn" type="submit">Передать в облачный чат</button>
                 </form>
 
@@ -653,6 +658,7 @@
                 {% endfor %}
                 {% endif %}
                 <form method="post" action="/tasks/{{ task.id }}/web-answer" class="task-action-stack">
+                  {{ csrf_field() }}
                     <label class="task-action-label" for="task-answer">Your Answer</label>
                     <textarea id="task-answer" name="answer" class="task-action-control task-action-textarea" required placeholder="Type your answer..."></textarea>
                     <button class="btn btn-success task-action-btn" type="submit" name="resume" value="true">Answer &amp; Resume</button>
@@ -669,6 +675,7 @@
                 {% endfor %}
                 {% endif %}
                 <form method="post" action="/tasks/{{ task.id }}/web-decide" class="task-action-stack">
+                  {{ csrf_field() }}
                     <label class="task-action-label" for="task-decision-summary">Decision reason / summary</label>
                     <textarea id="task-decision-summary" name="decision_summary" class="task-action-control task-action-textarea" placeholder="Why you are accepting or sending back for rework..."></textarea>
                     <label class="task-action-checkbox">
@@ -827,7 +834,7 @@
                 {# #1455: человек останавливает идущий прогон — та же отмена с повторами. #}
                 {% if executor_runs.stoppable %}
                 <form method="post" action="/tasks/{{ task.id }}/web-executor-stop" class="project-inline-form">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  {{ csrf_field() }}
                     <button class="btn btn-danger" type="submit"
                             onclick="return confirm('Остановить идущий прогон исполнителя задачи #{{ task.id }}? Хаб отменит его у провайдера с повторами.')">Остановить прогон</button>
                 </form>
@@ -835,7 +842,7 @@
                 {# #1444: круг починки — повторный прогон по находкам ревью. #}
                 {% if repair_offered %}
                 <form method="post" action="/tasks/{{ task.id }}/web-executor-repair" class="project-inline-form">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  {{ csrf_field() }}
                     <button class="btn btn-primary" type="submit"
                             onclick="return confirm('Вернуть задачу #{{ task.id }} в работу и заказать повторный прогон исполнителя по находкам ревью? Это платный прогон.')">Повторный прогон исполнителя</button>
                 </form>
@@ -843,7 +850,7 @@
                 {# #1445: доставка встала на конфликте с базой — прогон слияния. #}
                 {% if merge_offered %}
                 <form method="post" action="/tasks/{{ task.id }}/web-executor-merge" class="project-inline-form">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  {{ csrf_field() }}
                     <button class="btn btn-primary" type="submit"
                             onclick="return confirm('Заказать исполнителя, который сольёт базу в ветку задачи #{{ task.id }} и пересдаст её? Это платный прогон.')">Слить базу и пересдать</button>
                 </form>
@@ -942,10 +949,12 @@
                 {% if task.archived %}
                     {% if can_archive %}
                     <form method="post" action="/tasks/{{ task.id }}/web-unarchive" class="task-action-stack">
+                      {{ csrf_field() }}
                         <input type="hidden" name="cascade" value="true">
                         <button type="submit" class="btn btn-primary task-action-btn">Unarchive subtree</button>
                     </form>
                     <form method="post" action="/tasks/{{ task.id }}/web-unarchive" class="task-action-stack">
+                      {{ csrf_field() }}
                         <input type="hidden" name="cascade" value="false">
                         <button type="submit" class="btn btn-ghost task-action-btn">Unarchive only this</button>
                     </form>
@@ -953,10 +962,12 @@
                 {% else %}
                     {% if can_archive %}
                     <form method="post" action="/tasks/{{ task.id }}/web-archive" class="task-action-stack">
+                      {{ csrf_field() }}
                         <input type="hidden" name="cascade" value="true">
                         <button type="submit" class="btn btn-warning task-action-btn">Archive subtree</button>
                     </form>
                     <form method="post" action="/tasks/{{ task.id }}/web-archive" class="task-action-stack">
+                      {{ csrf_field() }}
                         <input type="hidden" name="cascade" value="false">
                         <button type="submit" class="btn btn-ghost task-action-btn">Archive only this</button>
                     </form>
@@ -966,6 +977,7 @@
                 <form method="post" action="/tasks/{{ task.id }}/web-delete"
                       onsubmit="return confirm('Permanently delete this task and all descendants? This cannot be undone.');"
                       class="task-action-stack task-action-stack--separated">
+                  {{ csrf_field() }}
                     <button type="submit" class="btn btn-danger task-action-btn">Delete subtree permanently</button>
                 </form>
                 {% endif %}
