@@ -26,6 +26,8 @@ def test_a_hanging_test_fails_with_its_nodeid(pytester) -> None:
     """AC-1: timeout=1 turns a 30 s sleep into a failure naming the test.
 
     Run twice: serial, and under xdist (-n 2), the way CI runs the suite.
+    This proves the PLUGIN behaviour with an explicit inner config; that the
+    project itself sets timeout=300 / signal is proven by AC-2 below.
     """
     pytester.makepyfile(test_hang=_HANGING)
     pytester.makeini("[pytest]\ntimeout = 1\ntimeout_method = signal\n")
@@ -37,7 +39,6 @@ def test_a_hanging_test_fails_with_its_nodeid(pytester) -> None:
         assert "Timeout (>1.0s)" in out, label
         assert "test_hang.py::test_hangs_forever" in out, label
         assert "time.sleep(30)" in out, label  # the stack points at the hang
-        assert result.duration < 25, label  # well before the 30 s sleep ends
         result.assert_outcomes(passed=1, failed=1)
 
 

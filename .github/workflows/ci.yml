@@ -35,8 +35,9 @@ jobs:
   test:
     name: Ruff and pytest
     runs-on: ubuntu-latest
-    # #1666: above the sum of the step ceilings (Test 25 + mutations 15 +
-    # baseline 10 + report 20 + the rest), so the job never dies before its steps.
+    # #1666: 90 min = 70 min of explicit step ceilings (Test 25 + mutations 15 +
+    # baseline 10 + report 20) plus headroom for the steps that have no ceiling
+    # of their own (install, lint, type check, scans).
     timeout-minutes: 90
 
     steps:
@@ -283,7 +284,10 @@ jobs:
       - name: Report AC tests and validation to Hub
         if: ${{ always() }}
         continue-on-error: true
-        # #1666: the reporter's own budget is 900 s; 20 min lets it finish.
+        # #1666: the reporter has its own overall deadline (17 min, see
+        # _REPORT_DEADLINE in scripts/ci_report_to_hub.py): past it no command
+        # is launched, the rest is reported as not run, and the report is sent
+        # before this 20 min ceiling can cut the step.
         timeout-minutes: 20
         uses: ./.github/actions/hub-ci-report
         with:
