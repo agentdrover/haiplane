@@ -326,6 +326,11 @@ def test_live_opt_in_and_limits(tmp_path):
     t = FakeTransport(script=_no_call)
     res = _eval(t, canaries=canaries[:1], ledger=rn.RunLedger(broken_path))
     assert t.requests == [] and res.runs == [] and res.status == ct.INCOMPLETE
+    # причина названа честно: не «лимит исчерпан» и не нулевой расход
+    assert any(n.startswith("ledger_unreadable") for n in res.notes)
+    assert not any("max_runs_per_task" in n for n in res.notes)
+    assert rn.RunLedger(broken_path).runs_used(1222) is None
+    assert rn.RunLedger(broken_path).tokens_used() is None
 
     # --- лимит токенов: бронь под вызов, новый вызов не начинается ---
     small = rn.Limits(max_tokens=50_000, call_token_reserve=20_000)

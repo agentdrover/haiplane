@@ -150,6 +150,12 @@ def default_ledger_path() -> Path:
     return Path(base) / "ledger.json"
 
 
+#: Причина отказа, когда файл счёта нечитаем: это не исчерпанный лимит.
+LEDGER_UNREADABLE = (
+    "ledger_unreadable: файл счёта прогонов и токенов нечитаем, расход неизвестен"
+)
+
+
 class RunLedger:
     """Постоянный счёт прогонов и токенов под файловой блокировкой.
 
@@ -220,11 +226,19 @@ class RunLedger:
 
         return self._transact(change)
 
-    def runs_used(self, task_id: int) -> int:
-        return int(self._transact(lambda s: s.get("runs", {}).get(str(task_id), 0)))
+    def unreadable(self) -> bool:
+        """Файл есть, но разобрать его нельзя: счёт неизвестен."""
+        return bool(self._transact(lambda s: bool(s.get("corrupt"))))
 
-    def tokens_used(self) -> int:
-        return int(self._transact(lambda s: s.get("tokens", 0)))
+    def runs_used(self, task_id: int) -> int | None:
+        """Прогонов на задачу; ``None`` — счёт нечитаем (неизвестно, не ноль)."""
+        return self._transact(
+            lambda s: None if s.get("corrupt") else int(s["runs"].get(str(task_id), 0))
+        )
+
+    def tokens_used(self) -> int | None:
+        """Токенов в общем счёте; ``None`` — счёт нечитаем (неизвестно, не ноль)."""
+        return self._transact(lambda s: None if s.get("corrupt") else int(s["tokens"]))
 
 
 @dataclass
@@ -354,6 +368,8 @@ class _Budget:
     def reserve(self, amount: int) -> str | None:
         if self.ledger.reserve_tokens(amount, self.limits.max_tokens):
             return None
+        if self.ledger.unreadable():
+            return LEDGER_UNREADABLE
         return (
             f"max_tokens: бронь {amount} не укладывается в общий лимит "
             f"{self.limits.max_tokens} (учтено {self.ledger.tokens_used()})"
@@ -633,6 +649,9 @@ async def run_eval(
             and not ledger.reserve_run(task_id, limits.max_runs_per_task)
         ):
             result.truncated = True
+            if ledger.unreadable():
+                result.notes.append(LEDGER_UNREADABLE)
+                break
             result.notes.append(
                 f"max_runs_per_task: прогон {done + 1} из {repeats} не начат "
                 f"(лимит {limits.max_runs_per_task} на задачу #{task_id})"
@@ -732,6 +751,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     write_artifacts(result, Path(args.out))
     print(result.status)
+    for note in result.notes:
+        print(note, file=sys.stderr)
     return 0 if result.status == ct.PASSED else 1
 
 
