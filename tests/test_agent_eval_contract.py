@@ -448,3 +448,63 @@ def test_manifest_is_a_snapshot_of_facts():
     run = ct.build_run(manifest, _responses(manifest), META)
     assert run["status"] == "incomplete"
     assert "manifest_tampered" in _problem_kinds(run)
+
+
+# --- Вердикт оценивается всегда (lite-ревью, отчёт 878) --------------------------
+
+
+def _critical_case(manifest):
+    return next(c.case_id for c in manifest.cases if c.critical)
+
+
+def test_critical_approve_with_error_is_quality_failed():
+    """error рядом с вердиктом не отменяет вердикт: approve на дефекте — провал."""
+    manifest = ct.build_manifest()
+    target = _critical_case(manifest)
+    good = [r for r in _responses(manifest) if r.case_id != target]
+    bad = ct.CaseResponse(
+        case_id=target, judgement={"verdict": "approve"}, error="timeout"
+    )
+    run = ct.build_run(manifest, good + [bad], META)
+    assert run["status"] == "quality_failed"
+    assert run["summary"]["critical_failures"] == [target]
+    rec = next(c for c in run["cases"] if c["case_id"] == target)
+    assert rec["outcome"] == "quality_failed"
+    assert rec["verdict"] == "approve" and rec["error"] == "timeout"
+    assert ct.validate_run(run, manifest) == []
+    # безобидный вердикт с error остаётся инфраструктурной ошибкой
+    ok = ct.CaseResponse(
+        case_id=target, judgement={"verdict": "escalate"}, error="timeout"
+    )
+    run = ct.build_run(manifest, good + [ok], META)
+    assert run["status"] == "infrastructure_error"
+    assert ct.validate_run(run, manifest) == []
+
+
+def test_validate_rejects_outcome_downgrade_to_infrastructure():
+    """Подмена quality_failed на infrastructure_error/incomplete не проходит."""
+    manifest = ct.build_manifest()
+    target = _critical_case(manifest)
+    run = ct.build_run(
+        manifest,
+        _responses(manifest, lambda _c: {"verdict": "approve", "confidence": "high"}),
+        META,
+    )
+    assert run["status"] == "quality_failed"
+    for fake in ("infrastructure_error", "incomplete", "passed"):
+        forged = copy.deepcopy(run)
+        next(c for c in forged["cases"] if c["case_id"] == target)["outcome"] = fake
+        forged["summary"] = ct.summarize(forged["cases"])
+        assert ct.validate_run(forged, manifest), fake
+
+
+def test_duplicate_with_critical_approve_is_quality_failed():
+    manifest = ct.build_manifest()
+    target = _critical_case(manifest)
+    base = _responses(manifest)
+    approve = ct.CaseResponse(case_id=target, judgement={"verdict": "approve"})
+    run = ct.build_run(manifest, base + [approve], META)
+    assert run["status"] == "quality_failed"
+    assert run["summary"]["critical_failures"] == [target]
+    assert "duplicate_response" in _problem_kinds(run)
+    assert ct.validate_run(run, manifest) == []

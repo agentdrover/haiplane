@@ -293,18 +293,90 @@ def _record(case: ManifestCase, outcome: str, **fields: Any) -> dict[str, Any]:
     return base
 
 
-def _judged_record(
-    case: ManifestCase, canary: Canary, resp: CaseResponse
+def _has_verdict(resp: CaseResponse) -> bool:
+    """В ответе есть вердикт из словаря и допустимая уверенность.
+
+    Такой вердикт ВСЕГДА оценивает evaluate — независимо от error, дубликатов
+    и порчи соседних полей: ошибка транспорта не отменяет уже сказанного
+    «одобряю» на заложенном дефекте.
+    """
+    judgement = resp.judgement
+    if resp.error or not isinstance(judgement, dict):
+        return False
+    verdict = judgement.get("verdict")
+    if not isinstance(verdict, str) or verdict not in VALID_VERDICTS:
+        return False
+    confidence = judgement.get("confidence")
+    return confidence in (None, "") or (
+        isinstance(confidence, str) and confidence in CONFIDENCES
+    )
+
+
+def _evaluated_record(
+    case: ManifestCase, canary: Canary, resp: CaseResponse, outcome: str | None = None
 ) -> dict[str, Any]:
     result: CanaryResult = evaluate(canary, resp.judgement)
     return _record(
         case,
-        PASSED if result.caught else QUALITY_FAILED,
+        outcome or (PASSED if result.caught else QUALITY_FAILED),
         verdict=result.verdict,
         detail=result.detail,
-        latency_ms=resp.latency_ms,
-        usage=_normalize_usage(resp.usage),
+        error=resp.error or None,
+        # Порченое измерение в запись не попадает: неизвестное — null.
+        latency_ms=resp.latency_ms
+        if _is_number(resp.latency_ms) and resp.latency_ms >= 0
+        else None,
+        usage=None if _usage_problem(resp.usage, "") else _normalize_usage(resp.usage),
     )
+
+
+def _group_record(
+    case: ManifestCase,
+    canary: Canary,
+    group: list[CaseResponse],
+    problems: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Несколько ответов: провал любого из них — провал case."""
+    problems.append(
+        _problem(
+            "duplicate_response",
+            f"cases[{case.case_id}]",
+            f"ответов на case: {len(group)}",
+            case.case_id,
+        )
+    )
+    for resp in group:
+        if False:
+            return _evaluated_record(case, canary, resp, QUALITY_FAILED)
+    return _record(case, INCOMPLETE, detail="ответов больше одного")
+
+
+def _single_record(
+    case: ManifestCase,
+    canary: Canary,
+    resp: CaseResponse,
+    problems: list[dict[str, str]],
+) -> dict[str, Any]:
+    base = f"cases[{case.case_id}]"
+    shape = _shape_problem(resp, base)
+    if shape and not resp.error:
+        problems.append(
+            _problem("malformed_response", shape[0], shape[1], case.case_id)
+        )
+    if _has_verdict(resp):
+        record = _evaluated_record(case, canary, resp)
+        if record["outcome"] == PASSED and resp.error:
+            record["outcome"] = INFRASTRUCTURE_ERROR
+            record["detail"] = "судья не ответил до конца: error при вердикте"
+        elif record["outcome"] == PASSED and shape:
+            record["outcome"] = INCOMPLETE
+            record["detail"] = shape[1]
+        return record
+    if resp.error:
+        return _record(
+            case, INFRASTRUCTURE_ERROR, error=resp.error, detail="судья не ответил"
+        )
+    return _record(case, INCOMPLETE, detail=shape[1] if shape else "")
 
 
 def _case_record(
@@ -313,34 +385,19 @@ def _case_record(
     group: list[CaseResponse],
     problems: list[dict[str, str]],
 ) -> dict[str, Any]:
-    base = f"cases[{case.case_id}]"
     if not group:
         problems.append(
-            _problem("missing_case", base, "ответа на case нет", case.case_id)
-        )
-        return _record(case, INCOMPLETE, detail="ответа нет")
-    if len(group) > 1:
-        problems.append(
             _problem(
-                "duplicate_response",
-                base,
-                f"ответов на case: {len(group)}",
+                "missing_case",
+                f"cases[{case.case_id}]",
+                "ответа на case нет",
                 case.case_id,
             )
         )
-        return _record(case, INCOMPLETE, detail="ответов больше одного")
-    resp = group[0]
-    if resp.error:
-        return _record(
-            case, INFRASTRUCTURE_ERROR, error=resp.error, detail="судья не ответил"
-        )
-    shape = _shape_problem(resp, base)
-    if shape:
-        problems.append(
-            _problem("malformed_response", shape[0], shape[1], case.case_id)
-        )
-        return _record(case, INCOMPLETE, detail=shape[1])
-    return _judged_record(case, canary, resp)
+        return _record(case, INCOMPLETE, detail="ответа нет")
+    if len(group) > 1:
+        return _group_record(case, canary, group, problems)
+    return _single_record(case, canary, group[0], problems)
 
 
 def _group_responses(
@@ -469,14 +526,17 @@ def _case_errors(
         if record.get(key) != trusted
     ]
     outcome = record.get("outcome")
-    if outcome not in (PASSED, QUALITY_FAILED):
-        return errors
     verdict = record.get("verdict")
-    if not isinstance(verdict, str) or verdict not in VALID_VERDICTS:
-        return errors + [f"{where}.verdict {verdict!r}: исход {outcome} без суждения"]
-    caught = evaluate(canary, {"verdict": verdict}).caught
-    if outcome != (PASSED if caught else QUALITY_FAILED):
-        errors.append(f"{where}.outcome {outcome!r} не следует из verdict {verdict!r}")
+    if outcome in (PASSED, QUALITY_FAILED) and isinstance(verdict, str) and verdict in VALID_VERDICTS:
+        # Любая запись с вердиктом пересчитывается, какой бы исход в ней ни
+        # стоял: подмена quality_failed на infrastructure_error не проходит.
+        caught = evaluate(canary, {"verdict": verdict}).caught
+        if caught == (outcome == QUALITY_FAILED):
+            errors.append(
+                f"{where}.outcome {outcome!r} не следует из verdict {verdict!r}"
+            )
+    elif outcome in (PASSED, QUALITY_FAILED):
+        errors.append(f"{where}.verdict {verdict!r}: исход {outcome} без суждения")
     return errors
 
 
