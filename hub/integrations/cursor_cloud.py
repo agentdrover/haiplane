@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import time
 from dataclasses import dataclass
 from typing import Any, NamedTuple, cast
@@ -36,39 +35,41 @@ _CREATE_TIMEOUT = 120.0
 CREATE_TIMEOUT_S = _CREATE_TIMEOUT
 
 
-#: Короче этого значение не считается секретом: иначе вычистятся обычные слова.
+#: Эвристика по env: короче этого значение не считается секретом, иначе
+#: вычистятся обычные слова. Явно объявленные секреты порогу не подчиняются.
 _MIN_SECRET_LEN = 6
-_SECRET_NAME_PARTS = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+_SECRET_NAME_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
 
 
-def _secret_candidates(value: str) -> set[str]:
-    """Само значение и его части: «name:TOKEN:role», список через запятую (#1222).
+def _explicit_secrets() -> set[str]:
+    """Секреты, объявленные настройкой: вычищаются при любой длине (#1222).
 
-    Составная настройка (HAIPLANE_HUB_TOKENS) — не один секрет: в ответе
-    провайдера оказывается отдельный токен, и цельное значение его не найдёт.
+    В составной настройке (``name:token[:role]``) секрет — только поле токена,
+    имя пользователя и роль остаются в диагностике.
     """
-    found = {value.strip()}
-    found.update(config.parse_tokens(value))
-    for part in re.split(r"[,;:\s]+", value):
-        part = part.strip()
-        if part and part not in config.VALID_ROLES:
-            found.add(part)
-    return found
-
-
-def known_secrets() -> list[str]:
-    """Известные секреты процесса, длинные первыми; значения — только для замены."""
     found: set[str] = {
         (config.CURSOR_API_KEY or "").strip(),
         (config.STEWARD_HUB_TOKEN or "").strip(),
     }
     found.update(config.HUB_TOKENS)
-    for name, value in os.environ.items():
-        if any(part in name.upper() for part in _SECRET_NAME_PARTS):
-            found |= _secret_candidates(value)
-    return sorted(
-        (s for s in found if len(s) >= _MIN_SECRET_LEN), key=len, reverse=True
+    found.update(config.parse_tokens(config.HUB_TOKENS_RAW))
+    found.update(
+        config.parse_tokens(os.environ.get(brand.ENV_PREFIX + "HUB_TOKENS", ""))
     )
+    found.discard("")
+    return found
+
+
+def known_secrets() -> list[str]:
+    """Известные секреты процесса, длинные первыми; значения — только для замены."""
+    found = _explicit_secrets()
+    for name, value in os.environ.items():
+        value = value.strip()
+        if len(value) >= _MIN_SECRET_LEN and name.upper().endswith(
+            _SECRET_NAME_SUFFIXES
+        ):
+            found.add(value)
+    return sorted(found, key=len, reverse=True)
 
 
 def scrub_secrets(text: str) -> str:
@@ -160,12 +161,12 @@ async def _attempt(
                 method,
                 path,
                 resp.status_code,
-                scrub_secrets(resp.text[:300]),
+                scrub_secrets(resp.text)[:300],
             )
             return None, Refusal(
                 status=resp.status_code,
                 code=_error_code(resp),
-                detail=scrub_secrets(resp.text[:300]),
+                detail=scrub_secrets(resp.text)[:300],
             )
         body = resp.json()
         if not isinstance(body, dict):
